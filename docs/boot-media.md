@@ -71,20 +71,23 @@ The ESP is derived state. It holds the bootloader (at `\EFI\seraph\boot.efi` and
 fallback path), the kernel (`\EFI\seraph\kernel`), and the bootstrap bundle
 (`\EFI\seraph\bootstrap.bundle`), whose entries are byte copies of installed files chosen by a
 list in configuration. Beside them it holds only the bootloader's presence-only knobs, which
-carry no content ([bootstrap.md](bootstrap.md)).
+carry no content ([bootstrap.md](bootstrap.md)), and, when one is staged, a trust request
+(`\EFI\seraph\trust-request`), which changes the trust store the bootloader keeps in firmware
+storage ([signing.md](signing.md) § Trust Store).
 
 Composing the ESP copies files. It never signs, needs no key, and writes nothing secret: every
-object on the ESP is signed and public, and the trust store the bootloader verifies against is
-built into the bootloader ([signing.md](signing.md) § Trust Store). The build composes the ESP
-this way, and so does any later recomposition on a running system. The list names only objects
-that carry the boot-module role; the bootloader refuses an entry without it, so writing the list
-cannot make an object bootable that its signer did not permit.
+object on the ESP is signed and public, and the trust stores the bootloader verifies against are
+built into it or kept in firmware storage ([signing.md](signing.md) § Trust Store). The build
+composes the ESP this way, and so does any later recomposition on a running system. The list names
+only objects that carry the boot-module role; the bootloader refuses an entry without it, so writing
+the list cannot make an object bootable that its signer did not permit.
 
 An ESP whose objects all equal their installed files verifies as those files do. Composition
 checks that equality once it has written the ESP, and refuses an ESP it cannot establish it for:
 one whose object is missing, differs from its installed file or copies one that is not installed,
 whose bundle holds an entry its list does not name or lacks one it names, or that holds any other
-file than an empty presence-only knob in `\EFI\seraph\`. Once it has written the disk image, the
+file than an empty presence-only knob in `\EFI\seraph\` or a trust request at
+`\EFI\seraph\trust-request`. Once it has written the disk image, the
 pack makes the same check of the image, its ESP against the installed files of its root
 partition, read back by xtask's FAT reader, after `fsck.fat -n` has checked every FAT volume of
 it, so a pack that wrote one side alone, or wrote a volume an independent reader refuses, fails

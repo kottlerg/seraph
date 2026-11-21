@@ -17,15 +17,14 @@
 
 use objsig::{Arch, CertificateCache, Expectation, Role, RoleSet, TrustStore, verify_cached};
 
-use crate::bprintln;
 use crate::error::{BootError, ObjectName};
 
 /// The architecture every object this bootloader loads is signed for.
 #[cfg(target_arch = "riscv64")]
-const ARCH: Arch = Arch::Riscv64;
+pub const ARCH: Arch = Arch::Riscv64;
 /// The architecture every object this bootloader loads is signed for.
 #[cfg(not(target_arch = "riscv64"))]
-const ARCH: Arch = Arch::X86_64;
+pub const ARCH: Arch = Arch::X86_64;
 
 /// The trust store's bytes, from the file the build names.
 #[cfg(not(test))]
@@ -54,37 +53,15 @@ pub fn embedded_store() -> &'static [u8]
     &[]
 }
 
-/// Parse the trust store `bytes` holds, and log each anchor's label and key
-/// id, marking one generated on the build machine (`LOCAL`) as locally
-/// generated.
+/// Parse the built-in trust store `bytes` holds. The store the boot runs
+/// on, this one merged with the enrolled one, is logged once it is settled
+/// (`crate::enrolment::log_store`).
 ///
 /// # Errors
 /// [`BootError::TrustStore`] when the store does not parse.
 pub fn parse_store(bytes: &[u8]) -> Result<TrustStore<'_>, BootError>
 {
-    let store = TrustStore::parse(bytes).map_err(BootError::TrustStore)?;
-    for anchor in store.anchors()
-    {
-        let origin = if anchor.local
-        {
-            " (locally generated)"
-        }
-        else
-        {
-            ""
-        };
-        bprintln!(
-            "[--------] boot: trust anchor \"{}\" key id {}{}",
-            anchor.label,
-            KeyIdHex(&anchor.key_id),
-            origin
-        );
-    }
-    bprintln!(
-        "[--------] boot: trust store: security floor {}",
-        store.security_floor()
-    );
-    Ok(store)
+    TrustStore::parse(bytes).map_err(BootError::TrustStore)
 }
 
 /// The bootloader's verifier: the trust store, and the certificates whose
@@ -138,7 +115,7 @@ impl<'s> Verifier<'s>
 }
 
 /// A key id written as lowercase hex.
-struct KeyIdHex<'a>(&'a objsig::KeyId);
+pub struct KeyIdHex<'a>(pub &'a objsig::KeyId);
 
 impl core::fmt::Display for KeyIdHex<'_>
 {

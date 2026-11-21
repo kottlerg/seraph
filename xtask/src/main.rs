@@ -126,6 +126,7 @@ fn main()
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
         CliCommand::Symbolize(args) => commands::symbolize::run(&ctx, args),
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),
+        CliCommand::TrustRequest(args) => commands::trust_request::run(&ctx, args),
         CliCommand::CaptureAcpi(args) => commands::capture_acpi::run(&ctx, args),
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
         CliCommand::CommitCheck(args) => commands::pr_check::run_commit_check(&ctx, args),

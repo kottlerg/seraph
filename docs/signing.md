@@ -69,7 +69,11 @@ omits a present one; and both indexes tampered with
 security floor in a boot-services-only UEFI variable, raises it, and refuses itself below it
 (§ Rollback Floor); `cargo xtask test rollback` boots the floor written, raised, and refusing an
 older bootloader on both architectures ([testing.md](testing.md) § Gating, Rollback floor). The
-local signer of § Configuration is design intent, not yet implemented.
+bootloader keeps the enrolled trust store in firmware storage and applies trust requests to it
+(§ Trust Store); `cargo xtask test enrolment` boots a root enrolled by a signed request and by
+one confirmed at the console, a request refused at the timeout and by the commit rule, and the
+build's roots revoked, on both architectures ([testing.md](testing.md) § Gating, Root
+enrolment). The local signer of § Configuration is design intent, not yet implemented.
 
 [boot-media.md](boot-media.md) states why one object carries one signature, and how the bundle
 lists in configuration choose the bundle's entries.
@@ -110,11 +114,11 @@ trusted to execute as built.
 | **Signature substitution.** Copy a valid record onto another body. | The record signs the body's hash, so it verifies only over the body it was made for. | None. |
 | **Object swap.** Put one legitimately signed object where another is expected (a signed program in place of a service, `fatfs` in place of `procmgr`). | The signed attributes carry the object's roles and name; the verifier requires a role its caller accepts and the name it is loading. | An image packed with a test harness in its `init` slot carries the harness signed `init` (§ Signing); a system whose store trusts the key that signed that image boots the harness if it is copied into its own `init` slot. |
 | **Replay.** Replace an object with an older, legitimately signed one that has a known vulnerability. | The signed attributes carry a security version; the trust store sets a floor, a key's certificate bounds the versions it may sign, and a compromised key is revoked. | Without Secure Boot, a whole older image boots whose bootloader ignores the machine's floor in firmware storage (§ Rollback Floor); with it, every Seraph bootloader the firmware admits refuses itself below that floor. A platform whose firmware refuses the floor's write keeps the build-time floor alone. |
-| **Key compromise.** Steal a signing key. | A key signs only the object roles and security versions its certificate names; the chain is at most two keys deep; a revoked key id is refused. | Revocation reaches only systems whose bootloader carries the updated trust store. A locally generated root's compromise is its builder's own risk. |
+| **Key compromise.** Steal a signing key. | A key signs only the object roles and security versions its certificate names; the chain is at most two keys deep; a revoked key id is refused. | Revocation reaches a system whose bootloader carries the updated trust store, or that has applied a trust request revoking the key id (§ Trust Store). A key trusted for the enrolment role enrols roots on every system that trusts it, so its compromise is that of the systems' stores. A locally generated root's compromise is its builder's own risk. |
 | **Verifier bypass.** Reach a path that loads without verifying, or that continues after a failed check. | Every check has one exit on failure and no fallback; the verifier returns the body only on success, and loaders read only what it returns. | None. |
 | **Carrier confusion.** Duplicate, nested, truncated or malformed trailers, or bytes after the trailer. | The footer and every record parse strictly; any parse error rejects the whole object; a body that itself ends in a trailer is rejected. | None. |
 | **TOCTOU.** Change the bytes between verification and use. | The verifier reads the object once into memory no other process can write, verifies that copy, and the loader parses and loads only from it. | None. |
-| **Trust-store substitution.** Replace the roots the system trusts. | The trust store is built into the bootloader; replacing it means replacing the bootloader. | Without Secure Boot, an attacker who can write the ESP replaces the bootloader and its roots: the chain is as strong as the ESP's integrity (§ Secure Boot). |
+| **Trust-store substitution.** Replace the roots the system trusts. | The built-in trust store is built into the bootloader; replacing it means replacing the bootloader. The enrolled store lies in a variable boot services alone reach, and changes only by a trust request that a key the store trusts signed in the enrolment role, or that someone at the console confirms after seeing each change (§ Trust Store). | Without Secure Boot, an attacker who can write the ESP replaces the bootloader and its roots: the chain is as strong as the ESP's integrity (§ Secure Boot). Someone at the console who confirms a request an attacker placed on the ESP enrols its roots. An attacker at the firmware's shell can delete the enrolled store, and its revocations with it. |
 | **Configuration tampering.** Change a policy-bearing configuration file (`/config/svcmgr/services/*.svc`) so a verified binary runs under altered policy. | Each policy-bearing file is signed in the configuration role, which no binary is accepted in, and its consumer has procmgr verify it before it parses it (§ Configuration). | None within the chain. |
 | **Configuration removal, addition or mixing.** Delete a recipe from a configuration directory, add one beside the files it holds, or put back an older signed copy of one. | The directory's signed index names each file it held at signing time with the SHA-512 of its body; the consumer reads only the files the index names, refuses a body whose hash is not its line's, and reports a named file that is missing and a file the index does not name (§ Configuration). | A whole older directory with its older index, all signed at a security version the machine's floor admits, verifies: the floor rises only with a revoking release (§ Rollback Floor), so the configuration of any release since the last raise is accepted. An index whose freshness a TPM counter attests is [#1416](https://github.com/kottlerg/seraph/issues/1416). |
 
@@ -227,11 +231,11 @@ one name.
 
 **Role bits.** Every 32-bit set of roles in the system has one numbering: a record's `roles`, and
 the `usage` of a certificate (§ Certificate Format) and of an anchor (§ Trust Store). Bit `n` is
-role `n` of the table below, for bits 1 to 8. Bit 31 is `CERTIFY`, the right to issue
-certificates, valid in a `usage` alone and refused in a record's `roles`. Bit 0 and bits 9 to 30
+role `n` of the table below, for bits 1 to 9. Bit 31 is `CERTIFY`, the right to issue
+certificates, valid in a `usage` alone and refused in a record's `roles`. Bit 0 and bits 10 to 30
 are no role: a set with any of them set is refused wherever it appears, until a role is defined for
-the bit. A record's `roles` has at least one role, and a set that holds kernel or init holds no
-other role.
+the bit. A record's `roles` has at least one role, and a set that holds kernel, init or enrolment
+holds no other role.
 
 | Role `n` | Name | Objects |
 |---|---|---|
@@ -243,21 +247,23 @@ other role.
 | 6 | program | A program image |
 | 7 | data | A data file procmgr verifies for its reader (§ Verifier Discipline) |
 | 8 | configuration | A policy-bearing configuration file, or a configuration directory's index, procmgr verifies for its consumer (§ Configuration) |
+| 9 | enrolment | A trust request the bootloader applies to the enrolled trust store with no one present (§ Trust Store) |
 
 A role is a permission the signer grants, not a place: an installed service the bootstrap needs
 carries service and boot module, and the bundle's copy of it is the same bytes.
 
-The `name` is `kernel` for a set holding kernel, `init` for a set holding init, and for every
-other object its install path from the root of the root filesystem (`/services/svcmgr`),
-wherever the object lies, a bundle entry's included. Names are compared byte for byte, so each has
-one canonical form, in which the signer signs it and procmgr requires a creator to give it: 1 to
-256 bytes of UTF-8, and either one of the two slot names or `/` followed by components separated
-by single `/` (an install path), each component nonempty, holding no `/` and no NUL, and neither
-`.` nor `..`. `objsig::name_is_canonical` is the one check of it, which xtask's signer and
-procmgr both call; procmgr accepts an install path alone. The comparison is case-exact: the root
-filesystem resolves names without regard to letter case, so a path spelled in another case
-reaches the same file, but no signature names that spelling, and procmgr refuses the object
-under it. A creator names an object by its install path as xtask installs it.
+The `name` is `kernel` for a set holding kernel, `init` for a set holding init, `trust-request` for
+a set holding enrolment, and for every other object its install path from the root of the root
+filesystem (`/services/svcmgr`), wherever the object lies, a bundle entry's included. Names are
+compared byte for byte, so each has one canonical form, in which the signer signs it and procmgr
+requires a creator to give it: 1 to 256 bytes of UTF-8, and either one of the three slot names or
+`/` followed by components separated by single `/` (an install path), each component nonempty,
+holding no `/` and no NUL, and neither `.` nor `..`. `objsig::name_is_canonical` is the one check of
+it, which xtask's signer and procmgr both call; procmgr accepts an install path alone. The
+comparison is case-exact: the root filesystem resolves names without regard to letter case, so a
+path spelled in another case reaches the same file, but no signature names that spelling, and
+procmgr refuses the object under it. A creator names an object by its install path as xtask installs
+it.
 
 ### Hashed Bytes
 
@@ -384,12 +390,84 @@ The anchors are sorted by key id, strictly ascending, so no two share one and a 
 search; the revoked key ids are sorted the same way. The blob's length is exactly the sum of its
 parts. A store that breaks any rule of this section is refused whole.
 
-**Where it lives.** The store is built into the bootloader, which firmware Secure Boot covers on a
-platform that enables it. There is one copy: none in firmware storage, whose one Seraph variable is
-the machine's security floor (§ Rollback Floor), and none built into procmgr, which would drift from
-the bootloader's. A deployer replaces or extends the
-store by building the bootloader with their own (§ Signing). Enrolment and rotation of roots
-without a rebuild are [#1074](https://github.com/kottlerg/seraph/issues/1074).
+**Where it lives.** A boot runs on two stores, merged. The built-in store is built into the
+bootloader, which firmware Secure Boot covers on a platform that enables it; a deployer replaces or
+extends it by building the bootloader with their own (§ Signing). The enrolled store lives in
+firmware storage and changes without a rebuild: the bootloader enrols roots into it, and revokes
+key ids through it, by applying a trust request (below). The bootloader verifies the boot with, and
+hands procmgr, the merge of the two: the anchors of both (the built-in anchor kept where both hold a
+key id), the revoked key ids of both, and the built-in store's floor. A revoked key id beats an
+anchor from either store, since § Verification refuses a record whose anchor or signing key is
+revoked, so an enrolled revocation retires a built-in root. No copy is built into procmgr, which
+would drift from the bootloader's.
+
+The enrolled store is the UEFI variable `TrustStore` under the Seraph vendor GUID
+`a53c3964-9d31-4f44-843a-526baa1271b8`, non-volatile and reachable by boot services alone, so
+nothing running after `ExitBootServices` can write it:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | magic `SRPHENRL` |
+| 8 | 2 | `version`: 1 |
+| 10 | 2 | `anchor_count`: 0 to 3 |
+| 12 | 2 | `revoked_count`: 0 to 120 |
+| 14 | 2,024 × `anchor_count` | The anchors, in the trust store's layout |
+| 14 + 2,024 × `anchor_count` | 16 × `revoked_count` | The revoked key ids |
+
+The lists are sorted as the trust store's are, and no anchor's key id is among the revoked ones. It
+carries no floor: the floor is the built-in store's, and the machine's is § Rollback Floor's. A
+later layout, the store spread over several variables among them, takes another version. A variable
+that does not parse, is longer than the bound, carries other attributes, or does not merge with the
+built-in store refuses the boot, since a boot past it would drop the revocations it holds; the fatal
+line names the recovery, deleting the variable from the UEFI shell (`dmpstore -d TrustStore -guid
+a53c3964-9d31-4f44-843a-526baa1271b8`), which drops every enrolment with it. A read the firmware
+fails boots on the built-in store alone and applies no request, with a warning.
+
+**Bound.** The enrolled store holds at most 3 anchors and 120 revoked key ids, 8,006 bytes. The
+bound is set so the store fits in one variable on every firmware met so far: the smallest limit, the
+riscv64 EDK2's, is 8,132 bytes of name and data, which leaves 8,110 bytes of data beside the
+22-byte name. Before it writes, the bootloader asks the firmware's `QueryVariableInfo` for its
+largest variable where the firmware provides it, and refuses a store that would not fit. A request
+whose result would pass the bound is refused whole, the log naming the bound; nothing of it is
+applied.
+
+**Trust requests.** A trust request is the file `\EFI\seraph\trust-request` on the ESP
+([boot-media.md](boot-media.md) § The ESP), at most 64 KiB:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | magic `SRPHTREQ` |
+| 8 | 2 | `version`: 1 |
+| 10 | 2 | `anchor_count`: the roots to enrol |
+| 12 | 2 | `revoked_count`: the key ids to revoke |
+| 14 | 2,024 × `anchor_count` | The anchors, in the trust store's layout |
+| 14 + 2,024 × `anchor_count` | 16 × `revoked_count` | The key ids |
+
+It is sorted as the enrolled store is, and adds an anchor or revokes a key id. A request may end in
+a signature trailer (§ Signed Object Format) over the request, in the enrolment role under the name
+`trust-request`. Applying it to the enrolled store adds each anchor that neither store holds and
+neither has revoked, so a revoked key id is never enrolled again; revokes each key id the enrolled
+store has not; and drops an enrolled anchor it revokes, whose key id stays revoked. On every boot
+that finds a request, the bootloader, once it has read the kernel and the bundle and before it
+verifies either for loading:
+
+1. Skips a request that changes nothing, which every replay of an applied request does, and logs
+   that it was skipped. A request is therefore left on the ESP without harm.
+2. Refuses a request whose result would pass the bound.
+3. Refuses a request under whose resulting store the kernel or a bundle entry would not verify
+   (the commit rule), so no request leaves the machine unbootable.
+4. Applies a request the current store verifies in the enrolment role. Otherwise it shows the
+   request at the console, why no signature authorizes it, each root it adds with its roles and
+   key id, and each key id it revokes, and applies it only when `yes` and Enter are typed within
+   60 seconds; any other answer, no answer, or a console it cannot read refuses it.
+5. Writes the new enrolled store before the security floor (§ Rollback Floor), and boots on the new
+   merged store. A write the firmware refuses refuses the request, and the log reports the
+   firmware's free space and largest variable.
+
+A refused request changes nothing, and the boot runs on the current store. `cargo xtask
+trust-request` writes a request from trust store files and key ids, unsigned or signed by the
+build's identity, into the sysroot's ESP for the next pack or to a file
+([xtask/README.md](../xtask/README.md#cargo-xtask-trust-request)).
 
 **Hand-off.** The bootloader copies the store into a page allocation of its own and exposes it as
 the last boot module of `BootInfo.modules`, named `trust-store`, a name it refuses on a bundle
@@ -398,8 +476,10 @@ alone, in procmgr's bootstrap. procmgr copies the store into its own memory and 
 startup; a store that is missing, or that procmgr cannot parse, stops procmgr, which then creates
 no process.
 
-**On every boot** the bootloader logs each anchor's label and key id, and marks an anchor with
-`LOCAL` as locally generated.
+**On every boot** the bootloader logs what it read of the enrolled store, then each anchor of the
+store it runs on with its label, key id and source (built in, or enrolled), marking an anchor with
+`LOCAL` as locally generated and one whose key id is revoked as revoked, then the store's counts
+and floor.
 
 ---
 
@@ -671,8 +751,8 @@ be readable from that disk: it is held outside the machine or sealed to the meas
 service of the running system signs an edit, and the directory's index, on behalf of a user allowed
 to make it. The index is per directory, so a directory of per-system configuration is signed by a
 local anchor trusted for configuration alone, and one of distributed configuration by the
-distributor's key; a file needs no second signature. Enrolling the local anchor per machine is
-[#1074](https://github.com/kottlerg/seraph/issues/1074)'s mechanism.
+distributor's key; a file needs no second signature. The local anchor is enrolled per machine by a
+trust request (§ Trust Store).
 
 ---
 
@@ -682,14 +762,15 @@ Implemented in xtask; the options are in
 [xtask/README.md](../xtask/README.md#signing) § Signing.
 
 **Keys.** Every builder generates a local root and a signing key on its first build, in a per-user
-directory outside the work tree (`seraph/signing/ed25519-ml-dsa-65-roles-1-8` in the user's data
+directory outside the work tree (`seraph/signing/ed25519-ml-dsa-65-roles-1-9` in the user's data
 directory, or the directory `SERAPH_SIGNING_DIR` names); the root certifies the signing key for
 every role, and the store lists the root with `LOCAL`, trusted for every role. The root's secret key
 certifies the signing key once and is never written: the directory holds the signing key's secret,
 its two seeds (§ Composite Signature), readable by its owner alone, its certificate, and the store
 of the anchors it contributes. The default directory's last component names the signature algorithm
-and the roles, 1 to 8, the key is certified for, so an identity of the earlier Ed25519 format, or
-one certified before the configuration role existed, in the directory it used, is never loaded;
+and the roles, 1 to 9, the key is certified for, so an identity of the earlier Ed25519 format, or
+one certified before the configuration or the enrolment role existed, in the directory it used, is
+never loaded;
 xtask refuses a directory `SERAPH_SIGNING_DIR` names that holds one of another format, saying that
 its format is the reason, and a signing key the build's trust store does not trust for every role,
 naming the roles it lacks. xtask refuses a directory or a key file whose canonical path lies inside

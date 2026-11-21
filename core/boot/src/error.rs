@@ -115,6 +115,12 @@ pub enum BootError
     /// The security floor variable has another length or other attributes
     /// than the bootloader writes (docs/signing.md § Rollback Floor).
     FloorMalformed(crate::rollback::Malformed),
+
+    /// The enrolled trust store variable is malformed: other attributes than
+    /// the bootloader writes, longer than any enrolled store, or bytes that
+    /// do not parse (docs/signing.md § Trust Store). A boot past it would
+    /// drop the revocations it holds.
+    EnrolledMalformed(crate::enrolment::Malformed),
 }
 
 /// The name of an object the verifier refused, copied, so a [`BootError`]
@@ -229,7 +235,8 @@ impl BootError
             | BootError::TrustStore(_)
             | BootError::SignatureRefused { .. }
             | BootError::FloorAboveStore { .. }
-            | BootError::FloorMalformed(_) => None,
+            | BootError::FloorMalformed(_)
+            | BootError::EnrolledMalformed(_) => None,
         }
     }
 
@@ -267,6 +274,11 @@ impl BootError
                 "this bootloader is older than the machine's security floor"
             }
             BootError::FloorMalformed(_) => "the security floor variable is malformed",
+            BootError::EnrolledMalformed(_) =>
+            {
+                "the enrolled trust store variable is malformed (the UEFI shell's dmpstore -d \
+                 TrustStore -guid a53c3964-9d31-4f44-843a-526baa1271b8 deletes it)"
+            }
         }
     }
 }
@@ -301,6 +313,10 @@ impl core::fmt::Display for BootError
             write!(f, ": machine floor {machine}, trust store floor {carried}")?;
         }
         if let BootError::FloorMalformed(how) = self
+        {
+            write!(f, ": {how}")?;
+        }
+        if let BootError::EnrolledMalformed(how) = self
         {
             write!(f, ": {how}")?;
         }
@@ -357,6 +373,7 @@ mod tests
                 carried: 1,
             },
             BootError::FloorMalformed(crate::rollback::Malformed::Length(0)),
+            BootError::EnrolledMalformed(crate::enrolment::Malformed::Length(0)),
         ];
         for v in variants
         {

@@ -531,7 +531,8 @@ override discovery; they are an all-or-nothing pair (setting only one is rejecte
 
 **Variable store:** every launch, on both architectures, boots on a writable variable store of
 its own, a fresh copy of the firmware's template beside the read-only code image, so no launch
-sees a variable another wrote; the `rollback` case keeps one store across its boots
+sees a variable another wrote; the `rollback` and `enrolment` cases keep one store across their
+boots
 ([xtask/README.md](../xtask/README.md#environment-variables)).
 
 **Secure Boot:** the `secureboot` case ([xtask/README.md](../xtask/README.md#the-secureboot-case))

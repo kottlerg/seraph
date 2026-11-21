@@ -18,6 +18,7 @@ mod arch;
 mod console;
 mod dtb;
 mod elf;
+mod enrolment;
 mod error;
 mod firmware;
 mod framebuffer;
@@ -35,9 +36,9 @@ use crate::paging::{PageTableBuilder, build_initial_tables};
 use crate::signing::{Verifier, parse_store};
 use crate::uefi::{
     EFI_RNG_PROTOCOL_GUID, EFI_SUCCESS, EfiBootServices, EfiFileProtocol, EfiGuid, EfiHandle,
-    EfiRngProtocol, EfiSystemTable, FirmwareVariables, allocate_pages, connect_all_controllers,
-    exit_boot_services, file_read, file_size, free_pages, get_loaded_image, get_memory_map,
-    open_esp_volume, open_file, query_gop,
+    EfiRngProtocol, EfiSystemTable, FirmwareConsole, FirmwareVariables, allocate_pages,
+    connect_all_controllers, exit_boot_services, file_read, file_size, free_pages,
+    get_loaded_image, get_memory_map, open_esp_volume, open_file, query_gop,
 };
 use boot_protocol::{
     BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage,
@@ -93,6 +94,20 @@ static MAPREDO_PATH: [u16; 20] = [
     b's' as u16, b'e' as u16, b'r' as u16, b'a' as u16, b'p' as u16,
     b'h' as u16, b'\\' as u16, b'm' as u16, b'a' as u16, b'p' as u16,
     b'r' as u16, b'e' as u16, b'd' as u16, b'o' as u16, 0u16,
+];
+
+/// `\EFI\seraph\trust-request` as a NUL-terminated UTF-16 path: the trust
+/// request a boot decides (docs/signing.md § Trust Store).
+// rustfmt::skip keeps the UTF-16 code units in rows of five, which rustfmt would
+// spread one per line.
+#[rustfmt::skip]
+static TRUST_REQUEST_PATH: [u16; 26] = [
+    b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16, b'\\' as u16,
+    b's' as u16, b'e' as u16, b'r' as u16, b'a' as u16, b'p' as u16,
+    b'h' as u16, b'\\' as u16, b't' as u16, b'r' as u16, b'u' as u16,
+    b's' as u16, b't' as u16, b'-' as u16, b'r' as u16, b'e' as u16,
+    b'q' as u16, b'u' as u16, b'e' as u16, b's' as u16, b't' as u16,
+    0u16,
 ];
 
 /// `\EFI\seraph\bootstrap.bundle` as a NUL-terminated UTF-16 path.
@@ -251,6 +266,146 @@ struct BundleLoad
     pages: usize,
     /// Exact bundle file size in bytes.
     len: u64,
+}
+
+impl BundleLoad
+{
+    /// The bundle's bytes.
+    ///
+    /// # Safety
+    /// The allocation must be live, and nothing may write it while the slice
+    /// is in use.
+    unsafe fn bytes<'a>(&self) -> &'a [u8]
+    {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "usize is 64-bit on every UEFI target Seraph supports, so the len cast is exact"
+        )]
+        // SAFETY: phys names a live identity-mapped allocation of
+        // `pages * 4096 >= len` bytes (caller contract).
+        unsafe {
+            core::slice::from_raw_parts(self.phys as *const u8, self.len as usize)
+        }
+    }
+}
+
+/// A page allocation of the bootloader's own, of which the first `len`
+/// bytes are in use: a file read whole, or the trust store workspace.
+struct PageBuffer
+{
+    /// Physical base of the allocation, identity-mapped by UEFI.
+    phys: u64,
+    /// Its page count.
+    pages: usize,
+    /// The bytes in use.
+    len: usize,
+}
+
+impl PageBuffer
+{
+    /// Allocate pages for `len` bytes.
+    ///
+    /// # Errors
+    /// [`BootError::OutOfMemory`] when the firmware has no such range.
+    ///
+    /// # Safety
+    /// `ctx.bs` must be valid pre-`ExitBootServices`.
+    unsafe fn allocate(ctx: &UefiContext, len: usize) -> Result<Self, BootError>
+    {
+        let pages = len.div_ceil(4096);
+        // SAFETY: bs is valid (caller contract).
+        let phys = unsafe { allocate_pages(ctx.bs, pages)? };
+        Ok(Self { phys, pages, len })
+    }
+
+    /// The bytes in use.
+    ///
+    /// # Safety
+    /// The allocation must be live, and no other view of it may be in use
+    /// while the slice is.
+    unsafe fn bytes_mut<'a>(&self) -> &'a mut [u8]
+    {
+        // SAFETY: phys names a live identity-mapped allocation of
+        // `pages * 4096 >= len` bytes, viewed through this slice alone
+        // (caller contract).
+        unsafe { core::slice::from_raw_parts_mut(self.phys as *mut u8, self.len) }
+    }
+
+    /// Return the pages to the firmware; a refused free leaves them
+    /// allocated, logged under `what`.
+    ///
+    /// # Safety
+    /// `ctx.bs` must be valid pre-`ExitBootServices`, and no view of the
+    /// allocation may be used again.
+    unsafe fn free(self, ctx: &UefiContext, what: &str)
+    {
+        // SAFETY: bs is valid; phys/pages is this bootloader's allocation,
+        // not used again (caller contract).
+        if unsafe { free_pages(ctx.bs, self.phys, self.pages) }.is_err()
+        {
+            bprintln!("[--------] boot: {what} not freed; it stays allocated");
+        }
+    }
+}
+
+/// The one page allocation in which the boot settles its trust store: the
+/// enrolled store as read, a new enrolled store, the current effective
+/// store, and a new effective store, in that order.
+struct TrustWorkspace
+{
+    buffer: PageBuffer,
+    /// The length of each of the two effective-store buffers
+    /// (`enrolment::merged_capacity`).
+    merged: usize,
+}
+
+impl TrustWorkspace
+{
+    /// Allocate the workspace for the built-in store `builtin`.
+    ///
+    /// # Errors
+    /// [`BootError::OutOfMemory`] when the firmware has no such range.
+    ///
+    /// # Safety
+    /// `ctx.bs` must be valid pre-`ExitBootServices`.
+    unsafe fn allocate(
+        ctx: &UefiContext,
+        builtin: &objsig::TrustStore<'_>,
+    ) -> Result<Self, BootError>
+    {
+        let merged = enrolment::merged_capacity(builtin);
+        let len = objsig::enrol::MAX_STORE_LEN
+            .saturating_mul(2)
+            .saturating_add(merged.saturating_mul(2));
+        // SAFETY: caller contract.
+        let buffer = unsafe { PageBuffer::allocate(ctx, len)? };
+        Ok(Self { buffer, merged })
+    }
+
+    /// The four buffers, disjoint.
+    ///
+    /// # Errors
+    /// [`BootError::OutOfMemory`] when the allocation is shorter than the
+    /// four, which [`Self::allocate`] rules out.
+    ///
+    /// # Safety
+    /// The allocation must be live, and no other view of it may be in use
+    /// while the slices are.
+    unsafe fn buffers<'a>(&self) -> Result<[&'a mut [u8]; 4], BootError>
+    {
+        // SAFETY: caller contract.
+        let all = unsafe { self.buffer.bytes_mut() };
+        let (read, rest) = all
+            .split_at_mut_checked(objsig::enrol::MAX_STORE_LEN)
+            .ok_or(BootError::OutOfMemory)?;
+        let (new, rest) = rest
+            .split_at_mut_checked(objsig::enrol::MAX_STORE_LEN)
+            .ok_or(BootError::OutOfMemory)?;
+        let (current, candidate) = rest
+            .split_at_mut_checked(self.merged)
+            .ok_or(BootError::OutOfMemory)?;
+        Ok([read, new, current, candidate])
+    }
 }
 
 /// CPU topology derived from firmware tables (MADT / DTB /cpus).
@@ -457,29 +612,35 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     secure_boot::log_state(secure_boot::read_state(&mut unsafe {
         FirmwareVariables::new(ctx.st)
     }));
-    // The trust store every object is verified against (docs/signing.md
-    // § Trust Store); one that does not parse halts the boot here.
-    let store_bytes = signing::embedded_store();
-    let store = parse_store(store_bytes)?;
+    // The trust store built into this bootloader (docs/signing.md § Trust
+    // Store); one that does not parse halts the boot here.
+    let builtin = parse_store(signing::embedded_store())?;
     // The machine's security floor (docs/signing.md § Rollback Floor): one
     // above the store's refuses this bootloader before it loads anything.
     // SAFETY: ctx.st is the valid system table; boot services have not exited,
     // and the value is dropped at the end of the statement.
     let floor = rollback::read_floor(
         &mut unsafe { FirmwareVariables::new(ctx.st) },
-        store.security_floor(),
+        builtin.security_floor(),
     )?;
-    let mut verifier = Verifier::new(store);
+    // SAFETY: ctx.bs is valid pre-exit.
+    let workspace = unsafe { TrustWorkspace::allocate(&ctx, &builtin)? };
     // SAFETY: ctx.esp_root is a valid FAT directory handle.
     let bundle_load = unsafe { step2_load_bundle(&ctx)? };
     // SAFETY: ctx.bs / esp_root are valid until ExitBootServices.
-    let mut kernel = unsafe { step3_load_kernel(&ctx, &mut verifier)? };
-    // SAFETY: bundle_load.phys/len name a valid identity-mapped UEFI allocation.
-    let (init, mods) =
-        unsafe { step4_parse_bundle(&ctx, &bundle_load, &mut verifier, store_bytes)? };
+    let kernel_file = unsafe { step3_read_kernel(&ctx)? };
+    // SAFETY: the workspace, the bundle and the kernel file are this boot's
+    // live allocations, and boot services have not exited.
+    let (mut kernel, init, mods) =
+        unsafe { verify_and_load(&ctx, &builtin, &workspace, &bundle_load, kernel_file)? };
+    // The effective store is copied into the trust-store module: the
+    // workspace is dead.
+    // SAFETY: ctx.bs is valid pre-exit, and no view of the workspace remains.
+    unsafe { workspace.buffer.free(&ctx, "trust store workspace") };
     // The kernel and every bundle entry have verified: raise the machine's
     // floor to the store's when it is the higher one. The last variable call
-    // of the boot, ahead of the memory-map reads of steps 6 and 7.
+    // of the boot, ahead of the memory-map reads of steps 6 and 7; the
+    // enrolled store, when a trust request changed it, was written before.
     // SAFETY: ctx.st is the valid system table; boot services have not exited,
     // and the value is dropped at the end of the statement.
     rollback::record_floor(&mut unsafe { FirmwareVariables::new(ctx.st) }, floor);
@@ -693,16 +854,14 @@ unsafe fn step2_load_bundle(ctx: &UefiContext) -> Result<BundleLoad, BootError>
 
 // ── Step 3: Load kernel ELF ──────────────────────────────────────────────────
 
-/// Read the kernel whole, verify it through `verifier` as the kernel named
-/// `kernel`, then parse and load its body into UEFI-allocated physical memory.
+/// Read the kernel whole into a page allocation of its own. It is verified
+/// and loaded once the trust store the boot runs on is settled
+/// ([`step3_load_kernel`]).
 ///
 /// # Safety
 /// `ctx.bs` and `ctx.esp_root` must be valid UEFI services and directory
 /// handle respectively.
-unsafe fn step3_load_kernel(
-    ctx: &UefiContext,
-    verifier: &mut Verifier<'_>,
-) -> Result<KernelLoad, BootError>
+unsafe fn step3_read_kernel(ctx: &UefiContext) -> Result<PageBuffer, BootError>
 {
     bprintln!("[--------] boot: step 3/10: load kernel ELF");
     // SAFETY: esp_root is a valid directory handle; path is null-terminated UTF-16.
@@ -715,15 +874,30 @@ unsafe fn step3_load_kernel(
     )]
     // SAFETY: kernel_file is a valid open file handle.
     let kernel_file_sz = unsafe { file_size(kernel_file)? } as usize;
-    let buf_pages = kernel_file_sz.div_ceil(4096);
     // SAFETY: bs is valid.
-    let buf_phys = unsafe { allocate_pages(ctx.bs, buf_pages)? };
-    // SAFETY: buf_phys is a freshly allocated region of buf_pages*4096 bytes,
-    // identity-mapped by UEFI. Slicing to kernel_file_sz is within the allocation.
-    let kernel_buf =
-        unsafe { core::slice::from_raw_parts_mut(buf_phys as *mut u8, kernel_file_sz) };
+    let buffer = unsafe { PageBuffer::allocate(ctx, kernel_file_sz)? };
+    // SAFETY: the allocation was made above, and this is its only view.
+    let kernel_buf = unsafe { buffer.bytes_mut() };
     // SAFETY: kernel_file is open and at position 0; kernel_buf is the correct size.
     unsafe { file_read(kernel_file, kernel_buf)? };
+    Ok(buffer)
+}
+
+/// Verify the kernel file [`step3_read_kernel`] read through `verifier` as
+/// the kernel named `kernel`, then parse and load its body into
+/// UEFI-allocated physical memory, and free the file's pages.
+///
+/// # Safety
+/// `ctx.bs` must be valid pre-`ExitBootServices`, and `file` the live
+/// allocation of [`step3_read_kernel`], no other view of it in use.
+unsafe fn step3_load_kernel(
+    ctx: &UefiContext,
+    file: PageBuffer,
+    verifier: &mut Verifier<'_>,
+) -> Result<KernelLoad, BootError>
+{
+    // SAFETY: caller contract.
+    let kernel_buf = unsafe { file.bytes_mut() };
     // Verify before the ELF header is read: only the verified body is parsed.
     let body = verifier.object(kernel_buf, Role::Kernel, b"kernel")?;
     // SAFETY: bs is valid; body is the complete ELF image.
@@ -733,12 +907,9 @@ unsafe fn step3_load_kernel(
     // bytes do not reach the memory the kernel hands out, then return it to
     // the firmware; a refused free only leaves it allocated.
     kernel_buf.fill(0);
-    // SAFETY: bs is valid pre-exit; buf_phys/buf_pages is the allocation made
-    // above, and kernel_buf, its only view, is not used again.
-    if unsafe { free_pages(ctx.bs, buf_phys, buf_pages) }.is_err()
-    {
-        bprintln!("[--------] boot: kernel ELF read buffer not freed; it stays allocated");
-    }
+    // SAFETY: bs is valid pre-exit; kernel_buf, the allocation's only view,
+    // is not used again.
+    unsafe { file.free(ctx, "kernel ELF read buffer") };
 
     bprintln!(
         "[--------] boot: kernel base={:#018x}  entry={:#018x}  size={:#018x} bytes",
@@ -970,6 +1141,233 @@ unsafe fn copy_trust_store(ctx: &UefiContext, store: &[u8]) -> Result<BootModule
         physical_base: phys,
         size: store.len() as u64,
     })
+}
+
+// ── Steps 3 and 4: the trust store the boot runs on ─────────────────────────
+
+/// Settle the trust store the boot runs on, then verify and load with it:
+/// read the enrolled store, merge it with `builtin` into the current store,
+/// decide the trust request on the ESP against them ([`decide_request`]),
+/// log the effective store, then verify and load the kernel (step 3) and
+/// verify and parse the bundle (step 4), whose trust-store module is a copy
+/// of the effective store (docs/signing.md § Trust Store).
+///
+/// # Safety
+/// `ctx` must be valid pre-`ExitBootServices`; `workspace`, `bundle_load` and
+/// `kernel_file` must be this boot's live allocations, no other view of
+/// them in use.
+unsafe fn verify_and_load(
+    ctx: &UefiContext,
+    builtin: &objsig::TrustStore<'_>,
+    workspace: &TrustWorkspace,
+    bundle_load: &BundleLoad,
+    kernel_file: PageBuffer,
+) -> Result<(KernelLoad, InitLoad, ModulesLoad), BootError>
+{
+    // SAFETY: caller contract; the four buffers are disjoint, and live while
+    // this call runs.
+    let [read_buf, new_buf, current_buf, candidate_buf] = unsafe { workspace.buffers()? };
+    // SAFETY: ctx.st is the valid system table, and boot services do not
+    // exit while this call runs.
+    let mut vars = unsafe { FirmwareVariables::new(ctx.st) };
+    let enrolled = enrolment::read_enrolled(&mut vars, read_buf)?;
+    let (current, current_bytes) =
+        enrolment::merge_current(builtin, &enrolled.store(), current_buf)?;
+    let applied = match enrolled
+    {
+        enrolment::Enrolled::Store(store) =>
+        {
+            // SAFETY: caller contract; it is only read until step 3 below
+            // takes the kernel file.
+            let kernel_bytes: &[u8] = unsafe { kernel_file.bytes_mut() };
+            // SAFETY: caller contract; nothing writes the bundle.
+            let bundle_bytes = unsafe { bundle_load.bytes() };
+            let stores = enrolment::Stores {
+                builtin: *builtin,
+                enrolled: store,
+                current,
+            };
+            let scratch = enrolment::Scratch {
+                enrolled: new_buf,
+                effective: &mut *candidate_buf,
+            };
+            // SAFETY: caller contract.
+            unsafe { decide_request(ctx, &mut vars, stores, scratch, kernel_bytes, bundle_bytes) }
+        }
+        // The enrolled store is unknown: no request is applied on top of it.
+        enrolment::Enrolled::Unavailable(_) => None,
+    };
+    let effective_bytes: &[u8] = match applied
+    {
+        Some(len) => candidate_buf.get(..len).unwrap_or_default(),
+        None => current_bytes,
+    };
+    let effective = parse_store(effective_bytes)?;
+    enrolment::log_store(&effective, builtin);
+    let mut verifier = Verifier::new(effective);
+    // SAFETY: ctx.bs / esp_root are valid until ExitBootServices; the kernel
+    // file's view above is dead.
+    let kernel = unsafe { step3_load_kernel(ctx, kernel_file, &mut verifier)? };
+    // SAFETY: bundle_load.phys/len name a valid identity-mapped UEFI allocation.
+    let (init, mods) =
+        unsafe { step4_parse_bundle(ctx, bundle_load, &mut verifier, effective_bytes)? };
+    Ok((kernel, init, mods))
+}
+
+/// Read `\EFI\seraph\trust-request` when the ESP holds one, and decide it
+/// (`enrolment::decide`), the commit rule verifying `kernel` and every entry of
+/// `bundle` under the store it would give ([`verify_boot_set`]). Returns the
+/// length of the new effective store, at the start of `scratch.effective`,
+/// when the request was applied.
+///
+/// # Safety
+/// `ctx` must be valid pre-`ExitBootServices`.
+unsafe fn decide_request(
+    ctx: &UefiContext,
+    vars: &mut FirmwareVariables,
+    stores: enrolment::Stores<'_>,
+    scratch: enrolment::Scratch<'_>,
+    kernel: &[u8],
+    bundle: &[u8],
+) -> Option<usize>
+{
+    // SAFETY: caller contract.
+    let request = unsafe { read_request(ctx) }?;
+    // SAFETY: ctx.st is the valid system table, and boot services do not
+    // exit while the console lives, this call.
+    let mut console = unsafe { FirmwareConsole::new(ctx.st) };
+    // SAFETY: the request's pages were allocated and read by read_request,
+    // and this is their only view.
+    let file = unsafe { request.bytes_mut() };
+    let outcome = enrolment::decide(file, stores, scratch, vars, &mut console, |store| {
+        verify_boot_set(store, kernel, bundle)
+    });
+    // SAFETY: ctx.bs is valid pre-exit; the request's view is dead.
+    unsafe { request.free(ctx, "trust request read buffer") };
+    match outcome
+    {
+        enrolment::Outcome::Applied { len, .. } => Some(len),
+        enrolment::Outcome::Unchanged | enrolment::Outcome::Refused(_) => None,
+    }
+}
+
+/// The trust request on the ESP, read whole into a page allocation of its
+/// own, or `None` when the ESP holds none. One that is empty, longer than
+/// `enrolment::REQUEST_MAX_LEN`, or not read is logged as refused.
+///
+/// # Safety
+/// `ctx` must be valid pre-`ExitBootServices`.
+unsafe fn read_request(ctx: &UefiContext) -> Option<PageBuffer>
+{
+    // A failed open is a missing request.
+    // SAFETY: esp_root is a valid directory handle; the path is NUL-terminated UTF-16.
+    let file = unsafe {
+        open_file(
+            ctx.esp_root,
+            TRUST_REQUEST_PATH.as_ptr(),
+            "\\EFI\\seraph\\trust-request",
+        )
+    }
+    .ok()?;
+    // SAFETY: file is the open handle above.
+    let read = unsafe { read_request_file(ctx, file) };
+    // SAFETY: `file` was returned by `open_file` above, so the `close` entry is readable.
+    let close_fn = unsafe { (*file).close };
+    // SAFETY: file is a valid open handle, closed once.
+    unsafe {
+        close_fn(file);
+    }
+    match read
+    {
+        Ok(buffer) => Some(buffer),
+        Err(why) =>
+        {
+            bprintln!(
+                "[--------] boot: trust request: refused: {why}; this boot runs on the current \
+                 trust store"
+            );
+            None
+        }
+    }
+}
+
+/// Why [`read_request_file`] did not read the request.
+enum RequestRead
+{
+    /// The file holds this many bytes: none, or more than
+    /// `enrolment::REQUEST_MAX_LEN`.
+    Size(u64),
+    /// A firmware call failed.
+    Firmware(BootError),
+}
+
+impl core::fmt::Display for RequestRead
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match self
+        {
+            RequestRead::Size(size) => write!(
+                f,
+                "\\EFI\\seraph\\trust-request holds {size} bytes, not 1 to {}",
+                enrolment::REQUEST_MAX_LEN
+            ),
+            RequestRead::Firmware(err) =>
+            {
+                write!(f, "\\EFI\\seraph\\trust-request was not read: {err}")
+            }
+        }
+    }
+}
+
+/// Read the open request `file` whole.
+///
+/// # Safety
+/// `ctx.bs` must be valid pre-`ExitBootServices`, and `file` an open handle.
+unsafe fn read_request_file(
+    ctx: &UefiContext,
+    file: *mut EfiFileProtocol,
+) -> Result<PageBuffer, RequestRead>
+{
+    // SAFETY: file is open (caller contract).
+    let size = unsafe { file_size(file) }.map_err(RequestRead::Firmware)?;
+    let len = usize::try_from(size)
+        .ok()
+        .filter(|len| (1..=enrolment::REQUEST_MAX_LEN).contains(len))
+        .ok_or(RequestRead::Size(size))?;
+    // SAFETY: bs is valid (caller contract).
+    let buffer = unsafe { PageBuffer::allocate(ctx, len) }.map_err(RequestRead::Firmware)?;
+    // SAFETY: the allocation was made above, and this is its only view; file
+    // is open at position 0.
+    let bytes = unsafe { buffer.bytes_mut() };
+    // SAFETY: file is open at position 0 (caller contract), and `bytes` is
+    // the buffer's whole extent.
+    if let Err(err) = unsafe { file_read(file, bytes) }
+    {
+        // SAFETY: bs is valid; the view above is dead.
+        unsafe { buffer.free(ctx, "trust request read buffer") };
+        return Err(RequestRead::Firmware(err));
+    }
+    Ok(buffer)
+}
+
+/// The commit rule of a trust request: the kernel and every bundle entry
+/// verify under `store`, the store the request would give, exactly as steps 3
+/// and 4 will verify them (docs/signing.md § Trust Store).
+///
+/// # Errors
+/// The [`BootError`] the first refusal, or a malformed bundle, gives.
+fn verify_boot_set(
+    store: &objsig::TrustStore<'_>,
+    kernel: &[u8],
+    bundle: &[u8],
+) -> Result<(), BootError>
+{
+    let mut verifier = Verifier::new(*store);
+    verifier.object(kernel, Role::Kernel, b"kernel")?;
+    let header = parse_bundle_header(bundle)?;
+    verify_bundle(bundle, header.entry_count, &mut verifier)?;
+    Ok(())
 }
 
 // ── Step 5: Firmware discovery ───────────────────────────────────────────────

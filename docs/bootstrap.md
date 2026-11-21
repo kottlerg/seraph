@@ -10,25 +10,24 @@ the link.
 
 ## Power-on to kernel entry (bootloader)
 
-UEFI firmware loads the bootloader from the EFI System Partition; the
-bootloader reads `\EFI\seraph\bootstrap.bundle` (a Seraph-defined container
-that packs init and every boot module into one file — see
-[`abi/boot-protocol::bundle`](../abi/boot-protocol/src/bundle.rs)), loads
-the kernel from `\EFI\seraph\kernel`, ELF-parses the bundle entry named
-`init` into `BootInfo.init_image`, exposes every other bundle entry as a
-named `BootModule`, builds initial page tables, queries the final UEFI
-memory map (redoing the page-table step with more slack, a bounded number of
-times, when the final map's buffer outgrows the array sized for it), calls
-`ExitBootServices`, populates `BootInfo`, and jumps to the kernel entry point.
-The sequence is specified in ten bootloader steps in
-[`core/boot/docs/boot-flow.md`](../core/boot/docs/boot-flow.md).
-The bootloader verifies the signature of the kernel, `init` and every other bundle entry against
-a trust store built into it, before it parses any of them, and hands the store forward to
-procmgr ([signing.md](signing.md)), which verifies every image it creates against it before it
-parses it. The ESP is derived from the root filesystem: the bundle carries the bootstrap closure,
-what is needed to reach the root filesystem and begin loading from it, and every object on the
-ESP is a copy of an installed file, used during bootstrap alone, apart from the IOMMU driver's
-image, a copy of which devmgr keeps for the driver's restart ([boot-media.md](boot-media.md)).
+UEFI firmware loads the bootloader from the EFI System Partition; the bootloader reads
+`\EFI\seraph\bootstrap.bundle` (a Seraph-defined container that packs init and every boot module
+into one file — see [`abi/boot-protocol::bundle`](../abi/boot-protocol/src/bundle.rs)), loads the
+kernel from `\EFI\seraph\kernel`, ELF-parses the bundle entry named `init` into
+`BootInfo.init_image`, exposes every other bundle entry as a named `BootModule`, builds initial page
+tables, queries the final UEFI memory map (redoing the page-table step with more slack, a bounded
+number of times, when the final map's buffer outgrows the array sized for it), calls
+`ExitBootServices`, populates `BootInfo`, and jumps to the kernel entry point. The sequence is
+specified in ten bootloader steps in
+[`core/boot/docs/boot-flow.md`](../core/boot/docs/boot-flow.md). The bootloader verifies the
+signature of the kernel, `init` and every other bundle entry against the trust store built into it
+merged with the one it keeps in firmware storage, before it parses any of them, and hands that store
+forward to procmgr ([signing.md](signing.md) § Trust Store), which verifies every image it creates
+against it before it parses it. The ESP is derived from the root filesystem: the bundle carries the
+bootstrap closure, what is needed to reach the root filesystem and begin loading from it, and every
+object on the ESP is a copy of an installed file, used during bootstrap alone, apart from the IOMMU
+driver's image, a copy of which devmgr keeps for the driver's restart
+([boot-media.md](boot-media.md)).
 
 Boot-time configuration on disk consists of only the two ESP files
 named above, the optional presence-only `\EFI\seraph\nokaslr` KASLR

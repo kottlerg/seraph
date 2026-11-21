@@ -155,14 +155,22 @@ const RECIPE_REMOVED: &str = "removed.svc";
 const CLASS_TAMPERED: &str = "rtc.class";
 
 /// One boot: the files its images carry in place of the sysroot's, the lines
-/// it owes, and its deadline.
+/// it owes, its deadline, and what it types at the bootloader's console.
 pub(super) struct Case
 {
     pub(super) name: &'static str,
     pub(super) substitutes: Vec<Substitute>,
     pub(super) expect: Vec<String>,
     pub(super) timeout: Duration,
+    /// The line typed, then Enter, once the bootloader asks to confirm a
+    /// trust request ([`CONFIRM_PROMPT`]); `None` types nothing, and the
+    /// boot's console input is closed.
+    pub(super) answer: Option<&'static str>,
 }
+
+/// Text of the bootloader's line asking the console to confirm a trust
+/// request. Kept in sync with `core/boot/src/enrolment.rs`.
+pub(super) const CONFIRM_PROMPT: &str = "type yes and Enter within 60 seconds";
 
 pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
@@ -251,6 +259,7 @@ fn prepare(ctx: &Context, args: &CaseArgs, dir: &Path) -> Result<Vec<Case>>
         )],
         expect: vec![boot_refusal("kernel", "Failed(BodyHash)")],
         timeout: BOOTLOADER_TIMEOUT,
+        answer: None,
     };
     let bundle_case = Case {
         name: "bundle",
@@ -264,6 +273,7 @@ fn prepare(ctx: &Context, args: &CaseArgs, dir: &Path) -> Result<Vec<Case>>
         )],
         expect: vec![boot_refusal(BUNDLE_ENTRY, "Failed(BodyHash)")],
         timeout: BOOTLOADER_TIMEOUT,
+        answer: None,
     };
     Ok(vec![
         kernel_case,
@@ -290,6 +300,7 @@ fn revoked_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> 
         substitutes: bootloader_under(ctx, args, &revoking, &dir.join("boot.efi.revoking"))?,
         expect: vec![boot_refusal("kernel", "Failed(Revoked)")],
         timeout: BOOTLOADER_TIMEOUT,
+        answer: None,
     })
 }
 
@@ -434,6 +445,7 @@ fn configuration_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signe
         substitutes,
         expect: configuration_owed(),
         timeout: ROOTFS_TIMEOUT,
+        answer: None,
     })
 }
 
@@ -520,6 +532,7 @@ fn index_case(ctx: &Context, dir: &Path) -> Result<Case>
         substitutes,
         expect,
         timeout: ROOTFS_TIMEOUT,
+        answer: None,
     })
 }
 
@@ -594,6 +607,7 @@ fn rootfs_case(ctx: &Context, arch: Arch, dir: &Path, signer: &Signer) -> Result
         substitutes,
         expect,
         timeout: ROOTFS_TIMEOUT,
+        answer: None,
     })
 }
 
@@ -624,7 +638,7 @@ pub(super) fn sub(path: &str, source: PathBuf) -> Substitute
 /// A signer of a local identity no anchor of the build's store holds,
 /// generated in a fresh directory outside the work tree, which a signing
 /// identity may not be under, and removed again.
-fn untrusted_signer(ctx: &Context, arch: Arch) -> Result<Signer>
+pub(super) fn untrusted_signer(ctx: &Context, arch: Arch) -> Result<Signer>
 {
     let dir = std::env::temp_dir().join(format!("seraph-test-signing-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -800,8 +814,19 @@ pub(super) fn boot_case(
     let log_path = dir.join(format!("{}.log", case.name));
     let mut log =
         fs::File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
-    let mut child = launch(ctx, args, layout, firmware, vars)?;
+    let input = if case.answer.is_some()
+    {
+        Stdio::piped()
+    }
+    else
+    {
+        Stdio::null()
+    };
+    let mut child = launch(ctx, args, layout, firmware, vars, input)?;
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
+    // The serial console's input, held open until QEMU is killed: the judge
+    // writes the answer once the prompt appears.
+    let mut console = child.stdin.take().zip(case.answer);
     // Serial lines on a worker thread, so the judge has a deadline. Bytes
     // that are not UTF-8 are read lossily rather than ending the stream.
     let (tx, rx) = mpsc::channel::<String>();
@@ -824,7 +849,7 @@ pub(super) fn boot_case(
             }
         }
     });
-    let result = judge_serial(&rx, &mut log, case);
+    let result = judge_serial(&rx, &mut log, case, &mut console);
     let _ = child.kill();
     let _ = child.wait();
     // The rest of the stream, after the kill, still goes to the log.
@@ -837,8 +862,15 @@ pub(super) fn boot_case(
 }
 
 /// Judge the lines `rx` delivers against `case`, copying each to `log`,
-/// until it passes, fails, its deadline passes, or the stream ends.
-fn judge_serial(rx: &mpsc::Receiver<String>, log: &mut fs::File, case: &Case) -> Result<()>
+/// until it passes, fails, its deadline passes, or the stream ends. On the
+/// bootloader's confirmation prompt, write the answer of `console` to its
+/// input, then Enter.
+fn judge_serial(
+    rx: &mpsc::Receiver<String>,
+    log: &mut fs::File,
+    case: &Case,
+    console: &mut Option<(std::process::ChildStdin, &str)>,
+) -> Result<()>
 {
     let mut judge = Judge::new(&case.expect);
     let deadline = Instant::now()
@@ -852,6 +884,15 @@ fn judge_serial(rx: &mpsc::Receiver<String>, log: &mut fs::File, case: &Case) ->
             Ok(line) =>
             {
                 let _ = log.write_all(line.as_bytes());
+                if line.contains(CONFIRM_PROMPT)
+                    && let Some((input, answer)) = console.as_mut()
+                {
+                    // A failed write leaves the prompt unanswered, which the
+                    // judge reports as the line it is then owed.
+                    let _ = input
+                        .write_all(format!("{answer}\r").as_bytes())
+                        .and_then(|()| input.flush());
+                }
                 match judge.line(&line)
                 {
                     Verdict::Pending =>
@@ -877,13 +918,14 @@ fn judge_serial(rx: &mpsc::Receiver<String>, log: &mut fs::File, case: &Case) ->
 }
 
 /// Start QEMU on the images of `layout`, `firmware` and the variable store
-/// `vars`, its serial stream on its stdout.
+/// `vars`, its serial stream on its stdout and its serial input `input`.
 fn launch(
     ctx: &Context,
     args: &CaseArgs,
     layout: DiskLayout,
     firmware: &Firmware,
     vars: &Path,
+    input: Stdio,
 ) -> Result<std::process::Child>
 {
     let disk_path = ctx.disk_image();
@@ -920,7 +962,7 @@ fn launch(
     let qemu_binary = require_tool(args.arch.qemu_binary())?;
     Command::new(&qemu_binary)
         .args(&qemu_args)
-        .stdin(Stdio::null())
+        .stdin(input)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()

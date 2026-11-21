@@ -23,7 +23,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`mmio/`](mmio/README.md) | Architecture-specific MMIO ordering barriers for device drivers |
 | [`namespace-protocol/`](namespace-protocol/README.md) | Cap-native namespace wire format, name validation, rights composition, and per-request `NamespaceBackend` dispatch used by every namespace server |
 | [`ns-client/`](ns-client/README.md) | `no_std` namespace walk helpers for holders of a vfsd namespace cap |
-| [`objsig/`](objsig/README.md) | Codec and verifier of signed objects: signature trailer, certificate, trust store and verification policy, `no_std`, no allocation |
+| [`objsig/`](objsig/README.md) | Codec and verifier of signed objects: signature trailer, certificate, trust store, enrolled trust store and trust request, and verification policy, `no_std`, no allocation |
 | [`process-layout/`](process-layout/README.md) | Per-process bootstrap virtual-address layout for process creators |
 | [`recv-pool/`](recv-pool/README.md) | Worker-pool receive helper: several threads serving one endpoint, each on its own IPC buffer page |
 | [`registry/`](registry/README.md) | Growable name→endpoint-cap registry used by supervisor services |

@@ -350,6 +350,11 @@ mod tests
         {
             panic!("the Secure Boot state is read, never written");
         }
+
+        fn query(&mut self, _: u32) -> Result<crate::uefi::VariableInfo, EfiStatus>
+        {
+            panic!("the Secure Boot state is read, never written");
+        }
     }
 
     fn flag(value: u8) -> (u32, Vec<u8>)

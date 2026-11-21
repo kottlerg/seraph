@@ -16,15 +16,16 @@
 /// Allocate one or more Memory caps covering `want_pages` pages, or fewer
 /// for a best-effort partial grant, whose caller requests the remainder
 /// again; with `REQUIRE_CONTIGUOUS`, exactly one cap covering all
-/// `want_pages`, or a failure. Callable from any badged cap;
+/// `want_pages`, or a failure. Callable from any badged cap but a node
+/// handle, the swap authority or an object handle;
 /// [`super::memmgr_grant_layout`] checks the reply shape. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 1:
 /// `REQUEST_MEMORY_CAPS`. With [`REQUEST_CHARGE_NODE`] the grant is
 /// charged to the node of the node handle in `caps[0]`.
 pub const REQUEST_MEMORY_CAPS: u64 = 1;
 /// Return previously granted regions to the pool mid-life, named by the
-/// opaque region id the grant reply reported, from any badged cap.
-/// Specified in
+/// opaque region id the grant reply reported, from any badged cap but a
+/// node handle, the swap authority or an object handle. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 2:
 /// `RELEASE_MEMORY_CAPS`.
 pub const RELEASE_MEMORY_CAPS: u64 = 2;
@@ -166,7 +167,8 @@ pub const PROCESS_DIED: u64 = 4;
 /// `DONATE_MEMORY_CAPS`.
 pub const DONATE_MEMORY_CAPS: u64 = 5;
 /// Read-only query of the all-RAM-accounted identity. Callable from any
-/// badged cap; returns aggregate counts only — no caps, no state change.
+/// badged cap but a node handle, the swap authority or an object handle;
+/// returns aggregate counts only — no caps, no state change.
 ///
 /// Wire format: request carries no words. Reply (`SUCCESS`):
 ///

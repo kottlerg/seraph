@@ -45,12 +45,12 @@ Two privilege classes:
   `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`, `SHRINK_REGION`,
   `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`, `ATTACH_OBJECT`,
   `REGISTER_DONATION_END`, `FILL_REGION`, `OBJECT_READ`) are callable over any
-  badged cap but a node handle or an object handle, including those memmgr
-  returned from `REGISTER_PROCESS`. `REGISTER_REGION`, `UNREGISTER_REGION`,
-  `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`, `SHRINK_REGION`,
-  `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`, `ATTACH_OBJECT`,
-  `REGISTER_DONATION_END` and `FILL_REGION` are attributed to the caller by
-  its own badge.
+  badged cap but a node handle, the swap authority or an object handle,
+  including those memmgr returned from `REGISTER_PROCESS`. `REGISTER_REGION`,
+  `UNREGISTER_REGION`, `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`,
+  `EXTEND_REGION`, `SHRINK_REGION`, `CREATE_SUB_NODE`, `DISCARD_RANGE`,
+  `SEAL_OBJECT`, `ATTACH_OBJECT`, `REGISTER_DONATION_END` and `FILL_REGION`
+  are attributed to the caller by its own badge.
 - **Node** labels (`NODE_SET_MAX`, `NODE_CREATE`, `NODE_QUERY_USAGE`,
   `NODE_REGISTER_LIMIT`, `NODE_RELEASE`, `NODE_SET_RECLAIM`,
   `NODE_CHARGE_HANDLE`) are callable only over a node handle, and act on the

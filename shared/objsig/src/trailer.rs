@@ -13,6 +13,7 @@
 
 use crate::attrs::Attributes;
 use crate::cert::{self, Certificate};
+use crate::composite;
 use crate::wire::{Reader, Writer};
 use crate::{EncodeError, KeyId, ParseError, Signature};
 
@@ -20,7 +21,7 @@ use crate::{EncodeError, KeyId, ParseError, Signature};
 pub const MAGIC: [u8; 8] = *b"SERAPHSG";
 
 /// The trailer format's version.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// The length of the footer.
 pub const FOOTER_LEN: usize = 16;
@@ -32,8 +33,8 @@ pub const MAX_RECORDS: u16 = 8;
 /// The length of a record's fixed header.
 pub const RECORD_HEADER_LEN: usize = 24;
 
-/// The length of a signature.
-pub const SIGNATURE_LEN: usize = 64;
+/// The length of a record's signature, a composite signature.
+pub const SIGNATURE_LEN: usize = composite::SIGNATURE_LEN;
 
 /// The length of a record with no certificate, less its attributes.
 const RECORD_FIXED_LEN: usize = RECORD_HEADER_LEN + SIGNATURE_LEN;
@@ -41,8 +42,10 @@ const RECORD_FIXED_LEN: usize = RECORD_HEADER_LEN + SIGNATURE_LEN;
 /// The length of a record with a certificate, less its attributes.
 const RECORD_CERT_LEN: usize = RECORD_FIXED_LEN + cert::LEN;
 
-/// The `algorithm` of an Ed25519 record.
-pub const ALGORITHM_ED25519: u8 = 1;
+/// The `algorithm` of a record: the composite of Ed25519 and ML-DSA-65, the
+/// one algorithm a record carries. Value 1, Ed25519 alone, is retired and
+/// refused like any other.
+pub const ALGORITHM_ED25519_ML_DSA_65: u8 = 2;
 
 /// A decoded record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,21 +58,21 @@ pub struct Record<'a>
     /// The encoded signed attributes: the bytes the signature covers.
     pub signed: &'a [u8],
     /// The signing key's certificate, when the key is not a root.
-    pub certificate: Option<Certificate>,
-    /// The Ed25519 signature over [`Self::signed`].
-    pub signature: Signature,
+    pub certificate: Option<Certificate<'a>>,
+    /// The composite signature over [`Self::signed`].
+    pub signature: &'a Signature,
 }
 
 impl<'a> Record<'a>
 {
     /// The record as an encoder input, to write it into another trailer.
     #[must_use]
-    pub const fn spec(&self) -> RecordSpec<'a>
+    pub fn spec(&self) -> RecordSpec<'a>
     {
         RecordSpec {
             signer_key_id: self.signer_key_id,
             attrs: self.attrs,
-            certificate: self.certificate,
+            certificate: self.certificate.map(|certificate| certificate.as_bytes()),
             signature: self.signature,
         }
     }
@@ -83,15 +86,16 @@ pub struct RecordSpec<'a>
     pub signer_key_id: KeyId,
     /// The signed attributes.
     pub attrs: Attributes<'a>,
-    /// The signing key's certificate, when the key is not a root.
-    pub certificate: Option<Certificate>,
-    /// The Ed25519 signature over the encoded [`Self::attrs`].
-    pub signature: Signature,
+    /// The signing key's encoded certificate, when the key is not a root.
+    pub certificate: Option<&'a [u8; cert::LEN]>,
+    /// The composite signature over the encoded [`Self::attrs`].
+    pub signature: &'a Signature,
 }
 
 impl RecordSpec<'_>
 {
-    /// The record's encoded length, 88 + `attrs_len` + 148 × `cert_count`.
+    /// The record's encoded length, 3,397 + `attrs_len` + 5,409 ×
+    /// `cert_count`.
     fn encoded_len(&self) -> Result<usize, EncodeError>
     {
         let fixed = if self.certificate.is_some()
@@ -114,21 +118,23 @@ impl RecordSpec<'_>
         let record_len = u32::try_from(self.encoded_len()?).map_err(|_| EncodeError::TooLong)?;
         let attrs_len =
             u16::try_from(self.attrs.encoded_len()?).map_err(|_| EncodeError::TooLong)?;
-        let certificate = self
-            .certificate
-            .as_ref()
-            .map(Certificate::encode)
-            .transpose()?;
+        if let Some(certificate) = self.certificate
+        {
+            Certificate::parse(certificate).map_err(|_| EncodeError::Certificate)?;
+        }
         writer.put(&record_len.to_le_bytes())?;
-        writer.put(&[ALGORITHM_ED25519, u8::from(certificate.is_some())])?;
+        writer.put(&[
+            ALGORITHM_ED25519_ML_DSA_65,
+            u8::from(self.certificate.is_some()),
+        ])?;
         writer.put(&attrs_len.to_le_bytes())?;
         writer.put(&self.signer_key_id)?;
         self.attrs.write(writer)?;
-        if let Some(certificate) = certificate
+        if let Some(certificate) = self.certificate
         {
-            writer.put(&certificate)?;
+            writer.put(certificate)?;
         }
-        writer.put(&self.signature)
+        writer.put(self.signature)
     }
 }
 
@@ -252,7 +258,7 @@ fn parse_record(block: &[u8]) -> Result<(Record<'_>, &[u8]), ParseError>
     let cert_count = reader.u8().ok_or(short)?;
     let attrs_len = reader.u16().ok_or(short)?;
     let signer_key_id = reader.array().ok_or(short)?;
-    if algorithm != ALGORITHM_ED25519
+    if algorithm != ALGORITHM_ED25519_ML_DSA_65
     {
         return Err(ParseError::Algorithm);
     }
@@ -269,20 +275,20 @@ fn parse_record(block: &[u8]) -> Result<(Record<'_>, &[u8]), ParseError>
     }
     let signed = reader.take(usize::from(attrs_len)).ok_or(short)?;
     let certificate = reader.take(cert_len).ok_or(short)?;
-    let signature = reader.take(SIGNATURE_LEN).ok_or(short)?;
+    let signature = reader.array_ref::<SIGNATURE_LEN>().ok_or(short)?;
     let record = Record {
         signer_key_id,
         attrs: Attributes::parse(signed)?,
         signed,
         certificate: parse_certificate(certificate)?,
-        signature: signature.try_into().map_err(|_| short)?,
+        signature,
     };
     Ok((record, reader.rest()))
 }
 
 /// The certificate a record holds in `bytes`: none in 0 bytes, one in
 /// [`cert::LEN`].
-fn parse_certificate(bytes: &[u8]) -> Result<Option<Certificate>, ParseError>
+fn parse_certificate(bytes: &[u8]) -> Result<Option<Certificate<'_>>, ParseError>
 {
     if bytes.is_empty()
     {
@@ -325,7 +331,8 @@ pub fn trailer_len(records: &[RecordSpec<'_>]) -> Result<usize, EncodeError>
 /// # Errors
 ///
 /// `NestedTrailer` when `body` ends in the footer magic; the errors of
-/// [`trailer_len`] and [`Certificate::encode`]; `BufferTooSmall` when
+/// [`trailer_len`]; `Certificate` for a certificate [`Certificate::parse`]
+/// refuses; `BufferTooSmall` when
 /// `out` is shorter than the trailer.
 pub fn encode_trailer(
     body: &[u8],
@@ -357,14 +364,20 @@ pub fn encode_trailer(
 mod tests
 {
     extern crate std;
+    use std::boxed::Box;
+    use std::sync::OnceLock;
     use std::vec;
     use std::vec::Vec;
 
     use super::*;
     use crate::cert::CertificateBody;
+    use crate::composite::PUBLIC_KEY_LEN;
     use crate::{Arch, Role, RoleSet, Usage};
 
     const BODY: &[u8] = b"\x7fELF and the rest of an image";
+
+    static SUBJECT: crate::PublicKey = [0x55; PUBLIC_KEY_LEN];
+    static SIGNATURE: Signature = [0x99; SIGNATURE_LEN];
 
     fn attrs(name: &[u8]) -> Attributes<'_>
     {
@@ -378,11 +391,12 @@ mod tests
         }
     }
 
-    fn certificate() -> Certificate
+    fn certificate() -> &'static [u8; cert::LEN]
     {
-        Certificate {
-            body: CertificateBody {
-                subject_key: [0x55; 32],
+        static CERT: OnceLock<Box<[u8; cert::LEN]>> = OnceLock::new();
+        CERT.get_or_init(|| {
+            let body = CertificateBody {
+                subject_key: &SUBJECT,
                 issuer_key_id: [0x66; 16],
                 serial: 1,
                 usage: Usage {
@@ -391,18 +405,20 @@ mod tests
                 },
                 min_security_version: 0,
                 max_security_version: u32::MAX,
-            },
-            signature: [0x77; 64],
-        }
+            };
+            let mut out = Box::new([0u8; cert::LEN]);
+            body.encode(&[0x77; SIGNATURE_LEN], &mut out).unwrap();
+            out
+        })
     }
 
-    fn record(name: &[u8], certificate: Option<Certificate>) -> RecordSpec<'_>
+    fn record<'a>(name: &'a [u8], certificate: Option<&'a [u8; cert::LEN]>) -> RecordSpec<'a>
     {
         RecordSpec {
             signer_key_id: [0x88; 16],
             attrs: attrs(name),
             certificate,
-            signature: [0x99; 64],
+            signature: &SIGNATURE,
         }
     }
 
@@ -423,25 +439,26 @@ mod tests
     fn layout_matches_the_specification()
     {
         let bytes = object(&[record(b"kernel", Some(certificate()))]);
-        let record_len = 88 + 96 + 6 + 148;
+        let record_len = 3397 + 99 + 6 + 5409;
+        assert_eq!(record_len, 24 + 105 + cert::LEN + SIGNATURE_LEN);
         assert_eq!(bytes.len(), BODY.len() + record_len + 16);
         let r = &bytes[BODY.len()..];
         assert_eq!(&r[0..4], &u32::try_from(record_len).unwrap().to_le_bytes());
-        assert_eq!(r[4], 1, "algorithm");
+        assert_eq!(r[4], 2, "algorithm");
         assert_eq!(r[5], 1, "cert_count");
-        assert_eq!(&r[6..8], &102u16.to_le_bytes());
+        assert_eq!(&r[6..8], &105u16.to_le_bytes());
         assert_eq!(&r[8..24], &[0x88; 16]);
         assert_eq!(&r[24..40], &crate::attrs::DOMAIN);
-        assert_eq!(&r[120..126], b"kernel");
-        assert_eq!(&r[126..274], &certificate().encode().unwrap());
-        assert_eq!(&r[274..338], &[0x99; 64]);
-        let footer = &r[338..];
+        assert_eq!(&r[123..129], b"kernel");
+        assert_eq!(&r[129..5538], &certificate()[..]);
+        assert_eq!(&r[5538..8911], &SIGNATURE[..]);
+        let footer = &r[8911..];
         assert_eq!(
             &footer[0..4],
             &u32::try_from(record_len).unwrap().to_le_bytes()
         );
         assert_eq!(&footer[4..6], &1u16.to_le_bytes());
-        assert_eq!(&footer[6..8], &1u16.to_le_bytes());
+        assert_eq!(&footer[6..8], &2u16.to_le_bytes());
         assert_eq!(&footer[8..16], b"SERAPHSG");
     }
 
@@ -489,7 +506,9 @@ mod tests
         assert_eq!(split(&good[end - 15..]), Err(ParseError::TooShort));
         assert_eq!(split(&[]), Err(ParseError::TooShort));
         refuse(&|b| b[end - 1] = b'g', ParseError::Magic);
-        refuse(&|b| b[end - 10] = 2, ParseError::Version);
+        // Version 1, the retired Ed25519 format, and a version not defined.
+        refuse(&|b| b[end - 10] = 1, ParseError::Version);
+        refuse(&|b| b[end - 10] = 3, ParseError::Version);
         refuse(
             &|b| b[end - 12..end - 10].copy_from_slice(&0u16.to_le_bytes()),
             ParseError::RecordCount,
@@ -538,6 +557,7 @@ mod tests
     {
         let good = object(&[record(b"kernel", Some(certificate()))]);
         let at = BODY.len();
+        let cert_at = at + 129;
         let refuse = |edit: &dyn Fn(&mut Vec<u8>), error| {
             let mut bytes = good.clone();
             edit(&mut bytes);
@@ -546,11 +566,13 @@ mod tests
         refuse(&|b| b[at] ^= 1, ParseError::RecordLength);
         refuse(&|b| b[at + 3] = 0x80, ParseError::RecordLength);
         refuse(&|b| b[at + 4] = 0, ParseError::Algorithm);
-        refuse(&|b| b[at + 4] = 2, ParseError::Algorithm);
+        // Algorithm 1, Ed25519 alone, is retired.
+        refuse(&|b| b[at + 4] = 1, ParseError::Algorithm);
+        refuse(&|b| b[at + 4] = 3, ParseError::Algorithm);
         refuse(&|b| b[at + 5] = 2, ParseError::CertificateCount);
         refuse(&|b| b[at + 5] = 0, ParseError::RecordLength);
-        // attrs_len one more, record_len to match: the name runs into the
-        // certificate and its length field disagrees.
+        // attrs_len one more, record_len to match: the record overruns the
+        // block by a byte.
         refuse(
             &|b| {
                 b[at + 6] += 1;
@@ -560,14 +582,17 @@ mod tests
         );
         refuse(&|b| b[at + 24] = 0, ParseError::AttributesDomain);
         refuse(&|b| b[at + 24 + 28] = 9, ParseError::Roles);
-        refuse(&|b| b[at + 24 + 29] = 9, ParseError::Arch);
-        refuse(&|b| b[at + 126] = 0, ParseError::CertificateDomain);
-        refuse(&|b| b[at + 126 + 75] = 0x80, ParseError::CertificateCertify);
-        refuse(&|b| b[at + 126 + 72] = 1, ParseError::CertificateUsage);
+        refuse(&|b| b[at + 24 + 98] = 9, ParseError::Arch);
+        refuse(&|b| b[cert_at] = 0, ParseError::CertificateDomain);
+        refuse(
+            &|b| b[cert_at + 2027] = 0x80,
+            ParseError::CertificateCertify,
+        );
+        refuse(&|b| b[cert_at + 2024] = 1, ParseError::CertificateUsage);
         refuse(
             &|b| {
-                b[at + 126 + 76] = 1;
-                b[at + 126 + 80..at + 126 + 84].fill(0);
+                b[cert_at + 2028] = 1;
+                b[cert_at + 2032..cert_at + 2036].fill(0);
             },
             ParseError::CertificateRange,
         );
@@ -599,11 +624,14 @@ mod tests
             trailer_len(&[record(b"", None)]),
             Err(EncodeError::EmptyName)
         );
-        let mut certify = certificate();
-        certify.body.usage.certify = true;
-        let mut out = vec![0u8; 4096];
+        // A certificate whose usage has CERTIFY, which no encoder of a
+        // certificate writes.
+        let mut certify = Box::new(*certificate());
+        certify[2027] |= 0x80;
+        let with_certify = [record(b"kernel", Some(&*certify))];
+        let mut out = vec![0u8; trailer_len(&with_certify).unwrap()];
         assert_eq!(
-            encode_trailer(BODY, &[record(b"kernel", Some(certify))], &mut out),
+            encode_trailer(BODY, &with_certify, &mut out),
             Err(EncodeError::Certificate)
         );
         let len = trailer_len(&one).unwrap();

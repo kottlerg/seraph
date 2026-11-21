@@ -15,11 +15,13 @@ Its dependents are the kernel, whose entropy sponge runs the Keccak-f[1600] perm
 construction); ktest, which runs the known-answer tests on target; and
 [`shared/objsig`](../objsig/README.md), which implements the signature trailer,
 certificate and trust-store codec and the verifier of the per-binary signing
-chain of trust ([docs/signing.md](../../docs/signing.md)) on `ed25519_verify`
-and `sha512`. xtask uses `ed25519_sign` for its key management and signing
-([xtask/README.md](../../xtask/README.md) § Signing), and enables the `sign` feature; core/boot
-enables it as a dev-dependency only, since its host tests sign fixtures. The bootloader verifies the
-kernel and every bundle entry through `objsig`, and procmgr every image it creates.
+chain of trust ([docs/signing.md](../../docs/signing.md)) on `ed25519_verify`,
+`ml_dsa::verify` and `sha512`, and composes the signers into its composite
+signature. xtask uses the composite signer for its key management and signing
+([xtask/README.md](../../xtask/README.md) § Signing), and enables the `sign` feature through
+`objsig`'s; core/boot enables it as a dev-dependency only, since its host tests sign fixtures. The
+bootloader verifies the kernel and every bundle entry through `objsig`, and procmgr every image it
+creates.
 
 ---
 

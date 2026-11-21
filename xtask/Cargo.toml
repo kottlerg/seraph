@@ -40,10 +40,11 @@ restart-budget = { path = "../shared/restart-budget" }
 # tooling's tests read the tables mkdisk writes back through it.
 vfsd-gpt = { path = "../services/vfsd/gpt" }
 # Signing of the objects a build packs (src/signing, docs/signing.md § Signing):
-# the Ed25519 signer, and the trailer, certificate and trust-store codec with
-# the verifier each signed object is checked against before it is written.
-crypto = { path = "../shared/crypto", features = ["sign"] }
-objsig = { path = "../shared/objsig" }
+# the SHA-512 of each body, the composite signer (objsig's `sign`, which
+# enables crypto's), and the trailer, certificate and trust-store codec with the
+# verifier each signed object is checked against before it is written.
+crypto = { path = "../shared/crypto" }
+objsig = { path = "../shared/objsig", features = ["sign"] }
 # init's log-level parser: `mkdisk --log-levels` refuses a configuration with a
 # line init would ignore, and test-log-level's tests run its configuration
 # through it.

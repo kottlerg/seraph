@@ -94,6 +94,66 @@ pub fn has_symbols(data: &[u8]) -> bool
     })
 }
 
+/// The program-header table of the ELF64 image `data`: the `e_phnum`
+/// entries of `e_phentsize` bytes at `e_phoff`; `None` for data that is
+/// not a little-endian ELF64 file or whose table lies past its end.
+pub fn program_headers(data: &[u8]) -> Option<&[u8]>
+{
+    if data.get(..6)? != b"\x7fELF\x02\x01"
+    {
+        return None;
+    }
+    let phoff = u64::from_le_bytes(data.get(0x20..0x28)?.try_into().ok()?);
+    let entsize = u16::from_le_bytes(data.get(0x36..0x38)?.try_into().ok()?);
+    let count = u16::from_le_bytes(data.get(0x38..0x3a)?.try_into().ok()?);
+    let start = usize::try_from(phoff).ok()?;
+    let len = usize::from(entsize).checked_mul(usize::from(count))?;
+    data.get(start..start.checked_add(len)?)
+}
+
+/// Check that the store file `kept` can stand as a debugger's executable
+/// for the installed image `installed`: their program headers are
+/// byte-identical. A debugger relocating a position-independent executable
+/// compares the program headers it reads at the auxiliary vector's
+/// `AT_PHDR`, in the process's memory or a core's copy of it, which are the
+/// installed image's, against the executable's, and applies no displacement
+/// when they differ (`gdb`'s `svr4_exec_displacement`).
+///
+/// # Errors
+///
+/// Either file has no program-header table, the tables' lengths differ, or
+/// an entry differs: the message names the first.
+pub fn same_program_headers(kept: &[u8], installed: &[u8]) -> std::result::Result<(), String>
+{
+    let (Some(ours), Some(theirs)) = (program_headers(kept), program_headers(installed))
+    else
+    {
+        return Err("an image has no program-header table".to_owned());
+    };
+    if ours.len() != theirs.len()
+    {
+        return Err(format!(
+            "the store file's program headers are {} bytes, the installed image's {}",
+            ours.len(),
+            theirs.len()
+        ));
+    }
+    let entsize = kept
+        .get(0x36..0x38)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map_or(1, |bytes| usize::from(u16::from_le_bytes(bytes)).max(1));
+    match ours
+        .chunks(entsize)
+        .zip(theirs.chunks(entsize))
+        .position(|(a, b)| a != b)
+    {
+        None => Ok(()),
+        Some(index) => Err(format!(
+            "program header {index} of the store file differs from the installed image's"
+        )),
+    }
+}
+
 /// The store file name of the ELF image whose build id is `id`.
 pub fn elf_name(id: &str) -> String
 {
@@ -476,6 +536,35 @@ mod tests
         )
         .unwrap_err();
         assert_eq!(err, "denied");
+    }
+
+    #[test]
+    fn program_headers_that_differ_in_one_entry_are_named_by_its_index()
+    {
+        // An ELF64 header with two 56-byte program headers at 64.
+        let mut image = vec![0u8; 64 + 2 * 56];
+        put(&mut image, 0, b"\x7fELF\x02\x01");
+        put(&mut image, 0x20, &64u64.to_le_bytes());
+        put(&mut image, 0x36, &56u16.to_le_bytes());
+        put(&mut image, 0x38, &2u16.to_le_bytes());
+        assert_eq!(program_headers(&image).map(<[u8]>::len), Some(2 * 56));
+        assert_eq!(same_program_headers(&image, &image), Ok(()));
+        let mut moved = image.clone();
+        put(&mut moved, 64 + 56 + 8, &0x10u64.to_le_bytes());
+        assert_eq!(
+            same_program_headers(&image, &moved),
+            Err("program header 1 of the store file differs from the installed image's".to_owned())
+        );
+        let mut short = image.clone();
+        put(&mut short, 0x38, &1u16.to_le_bytes());
+        same_program_headers(&image, &short).unwrap_err();
+        assert_eq!(
+            program_headers(&stripped(Architecture::X86_64)).map(<[u8]>::len),
+            Some(0)
+        );
+        assert_eq!(program_headers(b"not an ELF image"), None);
+        image.truncate(64 + 56);
+        assert_eq!(program_headers(&image), None);
     }
 
     #[test]

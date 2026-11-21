@@ -624,10 +624,7 @@ Death](supervision.md#core-set-and-system-death)).
 ## Out of Scope
 
 Seraph has no `fork()`. A process is always created from an image by `CREATE_PROCESS` or
-`CREATE_FROM_FILE`, with the capabilities its creator gives it and none inherited. A restore of a
-process that quiesced for a checkpoint is such a creation too, from the same signed image, whose
-memory takes the snapshot's bytes and whose capabilities are the new process's alone (design
-intent; [Checkpoint and Restore](checkpoint-restore.md)). The kernel
+`CREATE_FROM_FILE`, with the capabilities its creator gives it and none inherited. The kernel
 implements no copy-on-write. memmgr, as pager, may back pages of several address spaces from one
 immutable memory object and, in a private attachment, gives a process its own copy of such a page
 when it first writes it; the pages of an image that no relocation touches are shared this way

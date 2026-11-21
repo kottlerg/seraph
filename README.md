@@ -86,8 +86,6 @@ Overall project design documents live in [`docs/`](docs/):
   memmgr authority, page-reservation contract
 - [Process Lifecycle](docs/process-lifecycle.md) — userspace boot order,
   ProcessInfo/InitInfo handover, process-death flow
-- [Checkpoint and Restore](docs/checkpoint-restore.md) — the cooperative quiesce point,
-  checkpoint, restore creation and restore entry of a process, within one boot
 - [Supervision](docs/supervision.md) — supervision hierarchy, core set and system death,
   restart shapes, late-launch rule
 - [Session Supervision](docs/session-supervision.md) — sessions as supervision units, sessiond

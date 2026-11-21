@@ -2767,11 +2767,13 @@ pub mod checkpoint {
         fn drop(&mut self) {
             let release = ipc::IpcMessage::builder(ipc::memmgr_labels::OBJECT_RELEASE).build();
             let ipc_buf = super::current_ipc_buf();
-            // Outside any call deadline: nothing else releases the object,
-            // whose frames stay charged to the account until it is released
-            // (`super::with_call_deadline`).
+            // Outside any call deadline and made again while a stop
+            // interrupts it: nothing else releases the object, whose frames
+            // stay charged to the account until it is released
+            // (`super::with_call_deadline`). A repeat after memmgr released it
+            // is refused.
             // SAFETY: the IPC buffer is the calling thread's registered page.
-            let _ = unsafe { super::memmgr_call(self.handle, &release, ipc_buf) };
+            let _ = unsafe { super::memmgr_call_until_answered(self.handle, &release, ipc_buf) };
             let _ = syscall::cap_delete(self.handle);
         }
     }

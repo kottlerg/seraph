@@ -871,7 +871,8 @@ signals no more.
   ([Child process handles](#child-process-handles)), with a copy of the caller's own memmgr
   endpoint as the account the checkpoint is charged to, and returns a `Checkpoint`: the object's
   pages, whether the capture is complete, and its handle, which `into_raw` hands over and a drop
-  releases (`OBJECT_RELEASE`). A process at no quiesce point is refused `ResourceBusy`.
+  releases (`OBJECT_RELEASE`, made again while a stop interrupts it, since nothing else releases
+  it). A process at no quiesce point is refused `ResourceBusy`.
 
 The resources `quiesce` refuses are counted by values that live as long as each resource: a
 thread the application spawned, until its cleanup has run (`src/sys/thread/seraph.rs`), an open

@@ -1147,6 +1147,26 @@ and the attachment's release stay exact. The charge does not move, since the cop
 pages the attachment is charged for. A copy is never evicted, as no page of an attachment is, and
 is freed with its attachment.
 
+**Read and fill.** `OBJECT_READ` ([ipc-interface.md](ipc-interface.md) § Label 35) copies pages of
+an object, over its handle, from memmgr's own view into Memory caps the caller presents, mapped at
+the scrub window only while the copy runs; a process with no pager, procmgr among them, reads an
+object so. `FILL_REGION` (§ Label 36) backs pages of the caller's own demand regions, or of its
+private zero-object attachments, with copies of an object's pages, as a write fault backs a page:
+the run selection, the charge to the caller's budget node, the page-table funding and the chunk
+record are the fault's ([Demand faults](#demand-faults)), with the copy from the own view in place
+of the scrub. A named page that holds data already is left as it is, so a repeated request, after a
+failure part way or a lost reply, backs only the pages still holding none; a chunk the clock has
+taken takes no run, and a request naming a page of it that holds no data is refused. The pages are
+the caller's own, sharing no frame with the object, so the object can be released once the fill
+replies.
+
+**Checkpoint mark.** An object carries a checkpoint mark (`MemObject.checkpoint`) once procmgr's
+`MARK_CHECKPOINT` (§ Label 37) sets it: procmgr marks the object it sealed from a complete
+checkpoint of a quiesced process, presenting the account it sealed it on, and memmgr marks it only
+when that account's badge is the record that sealed it
+([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#checkpoint) § Checkpoint). The
+mark is set once, kept for the object's life, and read by `OBJECT_READ`; no label clears it.
+
 **Zero frames.** A zero frame is a page taken from the free pool when no zero frame's span takes a
 new zero-object attachment, which is refused when the pool cannot spare it, zeroed, and recorded
 in an arena node on the ledger's list of zero frames. A request refused after it took the frame

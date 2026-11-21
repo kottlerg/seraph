@@ -1717,14 +1717,18 @@ debug authority, so a process that declared itself undebuggable (Label 21) can b
 Replies as `SNAPSHOT` does. Once a complete capture's reply is delivered, procmgr signals its copy
 of the Notification (bit 1), which tells the process that its controller holds a checkpoint of the
 point; any other outcome signals nothing and leaves the process at its point, for the controller to
-take again. The copy is deleted on every path. procmgr does not yet mark the object a checkpoint
-with memmgr
-([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#implementation-status)
-§ Implementation Status). Refusals, in order: `UNAUTHORIZED` on a cap that is not a process handle;
-`INVALID_ARGUMENT` without `caps[0]`; `INVALID_BADGE` when no live process carries the badge, or
-the process ended during the capture; `NOT_QUIESCED` (22) when the process is at no quiesce point,
-or left the one procmgr found before the hold; and `SPACE_HELD`, `LIMIT` and `OUT_OF_MEMORY` as for
-`SNAPSHOT`. svctest's `procmgr_checkpoint` phase checkpoints a quiesced child and reads the
+take again. The copy is deleted on every path. Before it replies to a complete capture, procmgr
+has memmgr mark the object a checkpoint (`MARK_CHECKPOINT`,
+[services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 37), on its
+own memmgr endpoint with SEND copies of the object handle and of the account; memmgr marks it only
+when the account is a SEND on memmgr's endpoint whose badge names the process record that sealed
+the object. A refused mark releases the object and refuses the checkpoint `NOT_RESTORABLE` (23),
+signalling nothing; an incomplete capture is not marked. Refusals, in order: `UNAUTHORIZED` on a
+cap that is not a process handle; `INVALID_ARGUMENT` without `caps[0]`; `INVALID_BADGE` when no
+live process carries the badge, or the process ended during the capture; `NOT_QUIESCED` (22) when
+the process is at no quiesce point, or left the one procmgr found before the hold; `SPACE_HELD`,
+`LIMIT` and `OUT_OF_MEMORY` as for `SNAPSHOT`; and `NOT_RESTORABLE` when memmgr refuses the
+mark. svctest's `procmgr_checkpoint` phase checkpoints a quiesced child and reads the
 section back, and checks the refusals of a child at no point, after its point ended and after a
 point that timed out, without an account, on a cap that is no process handle, and of a pinned
 child's `QUIESCE`.

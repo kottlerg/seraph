@@ -333,6 +333,11 @@ pub struct MemObject
     /// Whether its handle state stands: neither released nor gone with its
     /// owner.
     pub live: bool,
+    /// Whether it carries the checkpoint mark: procmgr's complete capture of
+    /// a process at its quiesce point, sealed on an account memmgr verified
+    /// (`services/memmgr/docs/memory-pool.md` § Memory objects, Checkpoint
+    /// mark). Set once, for the object's life.
+    pub checkpoint: bool,
 }
 
 // Hard size budget: a region node and a commitment share the arena slot with

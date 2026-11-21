@@ -36,7 +36,7 @@ Two privilege classes:
 
 - **Procmgr-only** labels (`REGISTER_PROCESS`, `PROCESS_DIED`,
   `DONATE_MEMORY_CAPS`, `DELEGATE_ASPACE`, `MAKE_RESIDENT`,
-  `MAKE_PRIVATE`, `CAPTURE_CHUNKS`) are callable only over the cap
+  `MAKE_PRIVATE`, `CAPTURE_CHUNKS`, `MARK_CHECKPOINT`) are callable only over the cap
   that init transfers to procmgr at procmgr's bootstrap round. memmgr
   identifies this cap by badge and rejects procmgr-only calls received over
   any other badged cap, replying `UNAUTHORIZED`.
@@ -44,13 +44,13 @@ Two privilege classes:
   `QUERY_POOL_STATUS`, `REGISTER_REGION`, `UNREGISTER_REGION`,
   `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
   `SHRINK_REGION`, `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`,
-  `ATTACH_OBJECT`, `REGISTER_DONATION_END`) are callable over any badged cap
-  but a node handle or an object handle, including those memmgr returned from
-  `REGISTER_PROCESS`. `REGISTER_REGION`, `UNREGISTER_REGION`,
+  `ATTACH_OBJECT`, `REGISTER_DONATION_END`, `FILL_REGION`) are callable over
+  any badged cap but a node handle or an object handle, including those memmgr
+  returned from `REGISTER_PROCESS`. `REGISTER_REGION`, `UNREGISTER_REGION`,
   `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
   `SHRINK_REGION`, `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`,
-  `ATTACH_OBJECT` and `REGISTER_DONATION_END` are attributed to the caller by
-  its own badge.
+  `ATTACH_OBJECT`, `REGISTER_DONATION_END` and `FILL_REGION` are attributed
+  to the caller by its own badge.
 - **Node** labels (`NODE_SET_MAX`, `NODE_CREATE`, `NODE_QUERY_USAGE`,
   `NODE_REGISTER_LIMIT`, `NODE_RELEASE`, `NODE_SET_RECLAIM`,
   `NODE_CHARGE_HANDLE`) are callable only over a node handle, and act on the
@@ -61,15 +61,16 @@ Two privilege classes:
   `SEND|GRANT` badged `SWAP_AUTHORITY` (bit 61) alone, which init mints on
   memmgr's endpoint and svcmgr publishes seed-only as `memmgr.swap`: the swap
   service's interface to the disk tier (§ Labels 22 to 26).
-- The **object** label (`OBJECT_RELEASE`) is callable only over an object
-  handle, and acts on the memory object it names (§ Object Handles).
+- The **object** labels (`OBJECT_RELEASE`, `OBJECT_READ`) are callable only
+  over an object handle, and act on the memory object it names (§ Object
+  Handles).
 
 memmgr tells the classes apart by three verb bits, the node-handle bit
 `NODE_HANDLE_TAG` (bit 62), the swap authority's `SWAP_AUTHORITY` (bit 61)
 and the object-handle bit `OBJECT_HANDLE_TAG` (bit 60), the pattern of
 [docs/capability-model.md](../../../docs/capability-model.md) § Verb-bit
 authority pattern: it serves the node labels only on a badge that carries bit
-62, the swap labels only on one that carries bit 61, `OBJECT_RELEASE` only on
+62, the swap labels only on one that carries bit 61, the object labels only on
 one that carries bit 60, and every other label only on one that carries none
 of them, and replies `UNAUTHORIZED` otherwise, deleting any cap the message
 carries. A node handle whose badge also carries the charge-only bit
@@ -178,17 +179,16 @@ pages eviction takes (§ Label 32).
 
 ## Object Handles
 
-An object handle is the authority to attach one memory object and to release
-it ([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects): a
-SEND+GRANT cap on memmgr's endpoint whose badge is `OBJECT_HANDLE_TAG` and a
-key of 58 random bits outside `VERB_BIT_MASK`, drawn as a node handle's key is
-(§ Node Handles). memmgr derives one, in the reply of `SEAL_OBJECT`
-(§ Label 27), for the object it seals. A holder can derive copies of it, which
-carry the same badge, and pass one to any process, which attaches the object
-with it (§ Label 28). The object's handle state belongs to its sealer and goes
-on `OBJECT_RELEASE` (§ Label 29) or the sealer's `PROCESS_DIED`; from then on
-memmgr refuses every handle carrying its key with `INVALID_ARGUMENT`. The
-object outlives its handle state while a region attaches it.
+An object handle is the authority to attach one memory object, to read its pages and to release it
+([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects): a SEND+GRANT cap on memmgr's
+endpoint whose badge is `OBJECT_HANDLE_TAG` and a key of 58 random bits outside `VERB_BIT_MASK`,
+drawn as a node handle's key is (§ Node Handles). memmgr derives one, in the reply of `SEAL_OBJECT`
+(§ Label 27), for the object it seals. A holder can derive copies of it, which carry the same badge,
+and pass one to any process, which attaches the object with it (§ Label 28), reads it over it (§
+Label 35), or presents it to back its own pages with copies of the object's (§ Label 36). The
+object's handle state belongs to its sealer and goes on `OBJECT_RELEASE` (§ Label 29) or the
+sealer's `PROCESS_DIED`; from then on memmgr refuses every handle carrying its key with
+`INVALID_ARGUMENT`. The object outlives its handle state while a region attaches it.
 
 ---
 
@@ -203,10 +203,10 @@ object handle. Every label but the node labels also replies `UNAUTHORIZED`
 over a node handle, every label but `NODE_QUERY_USAGE` and
 `NODE_CHARGE_HANDLE` over a charge-only one, every label but the swap labels
 over the swap authority,
-and every label but `OBJECT_RELEASE` over an object handle (§ Badge
-Discipline); the node labels' tables list the refusal over any other badge, as
-§ Labels 22 to 26 does for the swap labels and § Label 29 for
-`OBJECT_RELEASE`.
+and every label but the object labels (`OBJECT_RELEASE`, `OBJECT_READ`) over
+an object handle (§ Badge Discipline); the node labels' tables list the
+refusal over any other badge, as § Labels 22 to 26 does for the swap labels
+and § Label 29 and § Label 35 for the object labels.
 
 ### Label 1: `REQUEST_MEMORY_CAPS`
 
@@ -1744,6 +1744,124 @@ is not told; its grants keep their charge until it releases them or dies.
 | 4 | `INVALID_ARGUMENT` | Zero `bits`, `cap[0]` missing or not a Notification with Notify rights, or the badge names no process; memmgr deletes the cap, and any earlier registration stays |
 | 5 | `UNAUTHORIZED` | The badge is a node handle, the swap authority or an object handle; memmgr deletes the cap |
 
+### Labels 35 to 37: checkpoint and restore
+
+A checkpoint is a memory object procmgr seals from a quiesced process's capture and marks as one
+([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#checkpoint) § Checkpoint); a
+restore reads the object and backs the new process's memory with copies of its pages
+(§ Restore creation there). Each label reads the object's pages from memmgr's own read-only view
+of it ([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects, Own view).
+
+#### Label 35: `OBJECT_READ`
+
+Copy pages of a memory object into Memory caps the caller presents, and report the object's pages
+and its checkpoint mark. Privilege: an object label, callable only over an object handle, which is
+the authority to read every page of the object (§ Object Handles).
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 35 |
+| data[0] | The first object page to copy |
+| data[1] | The page offset into `cap[0]` at which the destination starts |
+| data[2 + i] | The destination pages of `cap[i]`, counted from the offset for `cap[0]` |
+| cap[*] | Memory caps with the map and write rights, at most `MSG_CAP_SLOTS_MAX` (4); none to read only the reply's words. memmgr deletes them, whatever the reply |
+
+memmgr copies the object's pages from `data[0]` on, in order, into the destination, `cap[0]`'s
+pages first, at most `OBJECT_READ_PAGES` (64) of them and none past the object's end. The
+destination is mapped in memmgr's own address space only while the copy runs. A request with no
+caps reads the object's pages and its mark alone, as procmgr's restore does before it reads the
+layout.
+
+**Reply (success):** label 0, `data[0]` the pages copied, `data[1]` the object's flags
+(`OBJECT_CHECKPOINT`, bit 0: the object carries the checkpoint mark, § Label 37), `data[2]` the
+object's pages; no caps.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A destination page could not be mapped: a cap without the map and write rights, or memmgr's page tables could not be funded |
+| 4 | `INVALID_ARGUMENT` | The handle's state is gone (§ Label 29), `data[0]` is past the object's end, or a destination page count is missing for a cap |
+| 5 | `UNAUTHORIZED` | The badge is not an object handle |
+
+#### Label 36: `FILL_REGION`
+
+Back pages of chunks of the caller's own regions with copies of a memory object's pages, as a
+write fault backs a page. Privilege: universal, attributed to the caller by `recv.badge`; the
+object handle comes as `cap[0]`.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 36 |
+| data[0] | The first object page the copies take |
+| data[1] | `n`, the chunks, 1 to `FILL_CHUNKS` (4) |
+| data[2 + 2i] | Chunk `i`'s base: a demand chunk's base (`DEMAND_CHUNK_BYTES`) in a demand region of the caller, or in a private attachment of the zero object; the chunks in ascending order |
+| data[3 + 2i] | Chunk `i`'s page mask: bit `j` for its page `j`, none past the chunk's pages |
+| cap[0] | The object handle; memmgr reads its badge and deletes it, whatever the reply |
+
+Each page a mask names takes the next object page, in chunk and page order, so the request takes
+as many object pages as its masks name bits, as a snapshot's chunk descriptors lay out the pages
+memmgr wrote (§ Label 31). memmgr backs each run of named pages as a write fault on it backs it
+([`memory-pool.md`](memory-pool.md#demand-faults) § Demand faults): from runs of the pool the
+budget admits, charged to the caller's budget node and, in a committed region, to its commitment,
+written with the object's pages in place of the zeroes, mapped with the region's protection and
+recorded on the chunk. In a private attachment of the zero object it unmaps the zero frame from the
+span first, as the write fault does. A page no mask names stays as it is.
+
+A named page that holds data already, from a fault or an earlier request, is left as it is, its
+object page passed over. A failure part way leaves the pages before it backed and the reply reports
+the failure alone, so a repeat of the request, after a failure or a reply that did not arrive,
+backs the named pages still holding no data, each with the object page it takes, and nothing twice.
+A chunk that is evicting, evicted, compressed or on disk takes no run: when a page its mask names
+holds no data, the request is refused `INVALID_ARGUMENT`, checked before anything is backed. A
+chunk the request's own draws for room evict after that check fails it part way, as a draw the pool
+cannot meet does.
+
+**Reply (success):** label 0, `data[0]` the pages backed; no caps.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | No page of the pool could back a page, a committed region's commitment was spent, a map failed, or the request's own draws evicted a chunk it names |
+| 3 | `QUOTA` | The arena slots recording a run could not be allocated |
+| 4 | `INVALID_ARGUMENT` | The badge names no process, the process has no delegated address space (§ Label 8), `n` is out of range, a base is no chunk's base in such a region or not above the one before, a mask names a page past its chunk, `cap[0]` is missing or no live object handle, the masks name pages past the object's end, or a chunk that is not resident has a named page holding no data |
+| 5 | `UNAUTHORIZED` | The badge is a node handle, the swap authority or an object handle |
+| 8 | `LIMIT` | The max of the caller's budget node or of an ancestor refused a page, as for a fault |
+
+#### Label 37: `MARK_CHECKPOINT`
+
+Mark a memory object as a checkpoint. Privilege: procmgr-only.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 37 |
+| cap[0] | The object handle |
+| cap[1] | The account the checkpoint's capture was sealed on, a SEND on memmgr's endpoint |
+
+memmgr reads both caps' badges (`SYS_ENDPOINT_BADGE`) and deletes both, whatever the reply. It
+marks the object when the handle names a live object and the account's badge is that of the
+process record that sealed it: procmgr seals a checkpoint's capture on the account its caller
+presents, so the mark names that seal, and an account that is not memmgr's own names no record
+([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#checkpoint) § Checkpoint). The
+mark stays with the object for its life, through `OBJECT_RELEASE` while a region attaches it; no
+label clears it. `OBJECT_READ` reports it (§ Label 35).
+
+**Reply (success):** label 0, no words, no caps.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_ARGUMENT` | A cap is missing, the handle names no live object, or the account is no SEND on memmgr's endpoint or names another record than the object's sealer |
+| 5 | `UNAUTHORIZED` | The caller is not procmgr |
+
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
 Not a callable label. When a demand-paged process's thread takes a page fault the kernel cannot
@@ -1923,28 +2041,30 @@ reclaims. `RELEASE_MEMORY_CAPS` names each region by its region id, and
 retained intermediary to the free pool; memmgr does not derive from the
 caller's cap.
 
-Only twelve labels carry caps in their contract: `DONATE_MEMORY_CAPS` and `CAPTURE_CHUNKS` (every
-attached cap), `REQUEST_MEMORY_CAPS` (`cap[0]`), `DELEGATE_ASPACE` (`cap[0]`), `REGISTER_PRESSURE`
-(`cap[0]`), `REGISTER_PROCESS` (`cap[0]`), `NODE_REGISTER_LIMIT` (`cap[0]` and `cap[1]`), the swap
-labels `SWAP_REGISTER` (`cap[0]` and `cap[1]`), `SWAP_TAKE` and `SWAP_RESTORE` (`cap[0]`),
-`ATTACH_OBJECT` (`cap[0]`), and `REGISTER_DONATION_END` (`cap[0]`). memmgr deletes every other cap a
-message carries before it handles the message, whatever the label, the caller, or the reply: the
-caps attached to any other label (a `FAULT_LABEL` message, `SEAL_OBJECT`'s handed-back grants and an
+Only fifteen labels carry caps in their contract: `DONATE_MEMORY_CAPS`, `CAPTURE_CHUNKS` and
+`OBJECT_READ` (every attached cap), `REQUEST_MEMORY_CAPS` (`cap[0]`), `DELEGATE_ASPACE` (`cap[0]`),
+`REGISTER_PRESSURE` (`cap[0]`), `REGISTER_PROCESS` (`cap[0]`), `NODE_REGISTER_LIMIT` (`cap[0]` and
+`cap[1]`), the swap labels `SWAP_REGISTER` (`cap[0]` and `cap[1]`), `SWAP_TAKE` and `SWAP_RESTORE`
+(`cap[0]`), `ATTACH_OBJECT` (`cap[0]`), `REGISTER_DONATION_END` (`cap[0]`), `FILL_REGION`
+(`cap[0]`), and `MARK_CHECKPOINT` (`cap[0]` and `cap[1]`). memmgr deletes every other cap a message
+carries before it handles the message, whatever the label, the caller, or the reply: the caps
+attached to any other label (a `FAULT_LABEL` message, `SEAL_OBJECT`'s handed-back grants and an
 unknown label included), the caps after `cap[0]` on `REQUEST_MEMORY_CAPS`, `DELEGATE_ASPACE`,
-`REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE`, `ATTACH_OBJECT` and
-`REGISTER_DONATION_END`, every cap on `SWAP_DONE` and `SWAP_WANTED`, and the caps after `cap[1]` on
-`NODE_REGISTER_LIMIT` and `SWAP_REGISTER`. It deletes the contract caps as well when a procmgr-only
-label's caller is not procmgr, when a label's class does not match the badge (§ Badge Discipline),
-and in the error cases the labels' sections state. `CAPTURE_CHUNKS` deletes its caps once it has
-served the request, whatever the reply. `SWAP_REGISTER` keeps its `cap[0]` as the swap service's
-endpoint, and its `cap[1]`, when present, as the swap service's want Notification; `SWAP_TAKE` and
-`SWAP_RESTORE` move their `cap[0]` back on every reply, and delete it only when that reply cannot
-reach the caller. `REQUEST_MEMORY_CAPS`, `REGISTER_PROCESS` and `ATTACH_OBJECT` read the badge of
-their `cap[0]` and delete it on every path, and `NODE_REGISTER_LIMIT` its `cap[1]`. An attached cap
-therefore never outlives the call that carried it unless memmgr takes ownership of it, so no client
-can fill memmgr's `CSpace` by attaching caps until its receive loop fails and memmgr exits with
-`EXIT_RECV_WEDGE` (see [docs/ipc-design.md](../../../docs/ipc-design.md#receive-failure-policy)
-§"Receive-Failure Policy").
+`REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE`, `ATTACH_OBJECT`,
+`REGISTER_DONATION_END` and `FILL_REGION`, every cap on `SWAP_DONE` and `SWAP_WANTED`, and the caps
+after `cap[1]` on `NODE_REGISTER_LIMIT`, `SWAP_REGISTER` and `MARK_CHECKPOINT`. It deletes the
+contract caps as well when a procmgr-only label's caller is not procmgr, when a label's class does
+not match the badge (§ Badge Discipline), and in the error cases the labels' sections state.
+`CAPTURE_CHUNKS` and `OBJECT_READ` delete their caps once they have served the request, whatever the
+reply. `SWAP_REGISTER` keeps its `cap[0]` as the swap service's endpoint, and its `cap[1]`, when
+present, as the swap service's want Notification; `SWAP_TAKE` and `SWAP_RESTORE` move their `cap[0]`
+back on every reply, and delete it only when that reply cannot reach the caller.
+`REQUEST_MEMORY_CAPS`, `REGISTER_PROCESS`, `ATTACH_OBJECT` and `FILL_REGION` read the badge of their
+`cap[0]` and delete it on every path, `NODE_REGISTER_LIMIT` its `cap[1]`, and `MARK_CHECKPOINT` both
+of its caps. An attached cap therefore never outlives the call that carried it unless memmgr takes
+ownership of it, so no client can fill memmgr's `CSpace` by attaching caps until its receive loop
+fails and memmgr exits with `EXIT_RECV_WEDGE` (see
+[docs/ipc-design.md](../../../docs/ipc-design.md#receive-failure-policy) §"Receive-Failure Policy").
 
 ---
 

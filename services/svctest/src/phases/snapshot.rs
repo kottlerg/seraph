@@ -21,6 +21,8 @@
 //!   the object's release gives them back;
 //! - the child runs on: its writer passes the value the snapshot holds;
 //! - the header flags are complete and image, and its image has a length;
+//!   memmgr reports the object unmarked (`OBJECT_READ`): a `SNAPSHOT` is no
+//!   checkpoint;
 //! - the regions hold the child's object attachment (class object, three
 //!   pages from object page 0), its private zero attachment (class zero) and
 //!   its demand region (class demand), and at least one image region;
@@ -789,6 +791,11 @@ fn decode_threads(layout: &[u8], header: &Header, phase: &str) -> Vec<Recorded>
 /// pages from it to `values`, detach it and release it.
 fn read_object(authority: u64, handle: u64, pages: u64, child: &Snapped, values: &mut Vec<u64>)
 {
+    assert_eq!(
+        crate::phases::object_io::object_flags(handle, PHASE),
+        (0, pages),
+        "{PHASE}: OBJECT_READ of a SNAPSHOT's object, which carries no checkpoint mark"
+    );
     let object = Attached::attach(handle, pages, PHASE);
     assert_eq!(
         object.header().flags,

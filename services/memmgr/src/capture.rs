@@ -642,12 +642,12 @@ fn place(l: &MemLedger, v: &Visit, dst: &mut [u8], own: u16, objects: u16)
 
 /// A request's destination: its caps, the page offset into the first, the
 /// pages each gives, and the pages written so far.
-struct Dest<'a>
+pub(crate) struct Dest<'a>
 {
-    caps: &'a [u64],
-    offset: u64,
-    pages: &'a [u64],
-    used: u64,
+    pub(crate) caps: &'a [u64],
+    pub(crate) offset: u64,
+    pub(crate) pages: &'a [u64],
+    pub(crate) used: u64,
 }
 
 impl Dest<'_>
@@ -661,7 +661,7 @@ impl Dest<'_>
     /// Map the `count` pages after those written at the scrub window, run
     /// `read` on their bytes, and unmap them. `None`, nothing left mapped,
     /// when a page cannot be mapped; else what `read` returned.
-    fn fill<R>(
+    pub(crate) fn fill<R>(
         &self,
         l: &mut MemLedger,
         count: u64,
@@ -675,8 +675,8 @@ impl Dest<'_>
             let va = SCRUB_VA.saturating_add(mapped.saturating_mul(PAGE_SIZE));
             let cap = self.caps.get(cap).copied().unwrap_or(0);
             // SAFETY: the scrub window is memmgr's own zone, which every use
-            // leaves unmapped, and the `count` pages, at most a chunk's, lie
-            // in it.
+            // leaves unmapped, and the `count` pages, at most a chunk's here
+            // and at most `OBJECT_READ_PAGES` for `OBJECT_READ`, lie in it.
             if unsafe { map_self(l, cap, va, offset, pages) }.is_err()
             {
                 // A map that failed part way leaves the span's first pages

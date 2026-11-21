@@ -30,13 +30,17 @@ memmgr/
 │                               # bounds (`commit.rs`), the compressed
 │                               # store's page codec and chunk stream
 │                               # (`compress.rs`, `store.rs`), the swap
-│                               # slot map and slot sealing (`disk.rs`)
+│                               # slot map and slot sealing (`disk.rs`),
+│                               # a `FILL_REGION` request's chunks (`fill.rs`)
 ├── src/
 │   ├── main.rs                 # _start() entry point, IPC dispatch loop
 │   ├── evict.rs                # Eviction: the clock's slices, the compression
 │                               # worker, the store, restore
 │   ├── capture.rs              # CAPTURE_CHUNKS: a held target's regions described,
 │                               # their content written into procmgr's frames
+│   ├── object.rs               # OBJECT_READ, FILL_REGION, MARK_CHECKPOINT: an
+│                               # object's pages read, copied into the caller's
+│                               # regions, and its checkpoint mark
 │   └── disk.rs                # Disk tier: the swap labels, the per-boot
 │                               # key, the fault redirect to the swap service
 └── docs/
@@ -186,7 +190,13 @@ The full memmgr IPC specification is in
   an immutable memory object
 - `ATTACH_OBJECT(va, len, prot, first_page, flags[, object_handle])` — attach an object, or the
   zero object without a handle, as a region of the caller, shared or `ATTACH_PRIVATE`
-- Over an object handle only: `OBJECT_RELEASE` — drop the object's handle state
+- Over an object handle only: `OBJECT_RELEASE` — drop the object's handle state;
+  `OBJECT_READ(first_page, offset, pages…) → copied, flags, object_pages` — copy pages of the
+  object into the Memory caps the request carries, and report its checkpoint mark
+- `FILL_REGION(first_page, n, (chunk_va, mask)…[, object_handle]) → backed` — back the masked pages
+  of chunks of the caller's own regions with copies of an object's pages, as write faults would
+- `MARK_CHECKPOINT(object_handle, account)` — mark an object sealed on the account as a
+  checkpoint (procmgr-only)
 - `MAKE_PRIVATE(badge, va, len) → reached` — give each page of a range of a process's attachments
   that maps its origin a copy of its own, for a debugger (procmgr-only)
 - `CAPTURE_CHUNKS(badge, cursor, end, flags, offset, pages…) → cursor, written, need, descriptors`

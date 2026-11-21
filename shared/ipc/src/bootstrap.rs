@@ -18,7 +18,8 @@
 //! [`pack_slots`] / [`unpack_slots`] for one round, and [`slot_rounds`] /
 //! [`SlotAccumulator`] / [`request_slots`] for a slot list split over as
 //! many rounds as it needs (the rounds svcmgr serves the children it
-//! launches, and init's `CAPS` endowment of svcmgr).
+//! launches, those std's `Command::spawn` serves a child given bootstrap
+//! caps, and init's `CAPS` endowment of svcmgr).
 
 // When this crate is compiled as a std dep via rustc-dep-of-std, the
 // crate root is `no_core` and the usual prelude is not auto-imported.
@@ -597,7 +598,9 @@ pub enum ServeFailure
 /// The child can die before its request, so the wait for the request is a
 /// receive bounded at `poll_ms` milliseconds, and after each one that expires
 /// `child_death` is read, which gives the child's exit reason once it has died
-/// and `None` while it lives. A dead child ends the wait. A round that fails is
+/// and `None` while it lives. A dead child ends the wait. A receive an upcall
+/// or a thread stop cancels (`Interrupted`) took no request, and is read as
+/// an expiry and received again. A round that fails is
 /// read against `child_death` as well, so a child that died after its request,
 /// before the reply reached it, is a death and not a refusal. A live child that
 /// sends no request is waited for without end, `poll_ms` at a time.
@@ -644,9 +647,10 @@ pub unsafe fn serve_round_watched(
 }
 
 /// The request a watched serve answers: the first message `recv` gives,
-/// reading `child_death` after each `recv` that expires (`WouldBlock`). A
-/// dead child ends the wait with its exit reason. Any other error of `recv`
-/// is [`bootstrap_errors::INVALID`], or the child's death when it has died.
+/// reading `child_death` after each `recv` that expires (`WouldBlock`) or is
+/// cancelled (`Interrupted`, which took no request). A dead child ends the
+/// wait with its exit reason. Any other error of `recv` is
+/// [`bootstrap_errors::INVALID`], or the child's death when it has died.
 fn await_request(
     mut recv: impl FnMut() -> Result<IpcMessage, i64>,
     child_death: &mut impl FnMut() -> Option<u64>,
@@ -657,7 +661,9 @@ fn await_request(
         match recv()
         {
             Ok(request) => return Ok(request),
-            Err(e) if e == SyscallError::WouldBlock as i64 =>
+            Err(e)
+                if e == SyscallError::WouldBlock as i64
+                    || e == SyscallError::Interrupted as i64 =>
             {
                 if let Some(reason) = child_death()
                 {
@@ -879,6 +885,7 @@ mod tests
 
     const EXPIRED: i64 = SyscallError::WouldBlock as i64;
     const INTERRUPTED: i64 = SyscallError::Interrupted as i64;
+    const BAD_CAP: i64 = SyscallError::InvalidCapability as i64;
 
     #[test]
     fn a_request_after_expiries_is_answered_while_the_child_lives()
@@ -910,11 +917,36 @@ mod tests
     #[test]
     fn a_failed_receive_is_a_refusal_unless_the_child_died()
     {
-        let got = await_request(script(&[Err(INTERRUPTED)]), &mut || None);
+        let got = await_request(script(&[Err(BAD_CAP)]), &mut || None);
         assert_eq!(
             got.map(|m| m.label),
             Err(ServeFailure::Refused(bootstrap_errors::INVALID))
         );
+        let got = await_request(script(&[Err(BAD_CAP)]), &mut || Some(0x2000));
+        assert_eq!(got.map(|m| m.label), Err(ServeFailure::ChildDied(0x2000)));
+    }
+
+    // The defect caught: an upcall or a stop that cancelled the creator's
+    // receive failed the round and tore down a live child that had not yet
+    // asked.
+    #[test]
+    fn an_interrupted_receive_is_received_again_while_the_child_lives()
+    {
+        let mut reads = 0u32;
+        let mut alive = || {
+            reads += 1;
+            None
+        };
+        let got = await_request(
+            script(&[Err(INTERRUPTED), Err(EXPIRED), Ok(REQUEST)]),
+            &mut alive,
+        );
+        assert_eq!(got.map(|m| m.label), Ok(REQUEST));
+        assert_eq!(
+            reads, 2,
+            "the child is read once per cancelled or expired receive"
+        );
+
         let got = await_request(script(&[Err(INTERRUPTED)]), &mut || Some(0x2000));
         assert_eq!(got.map(|m| m.label), Err(ServeFailure::ChildDied(0x2000)));
     }

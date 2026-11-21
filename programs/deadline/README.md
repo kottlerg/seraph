@@ -66,7 +66,14 @@ timeout ends it, and bounds calls on it with a call deadline (`std::os::seraph::
    within the same window;
 4. a runtime call under a deadline already passed fails `TimedOut` without waiting, and so does
    `Child::kill` of a child the fixture spawned idle (`deadline idle`), which it then kills and
-   waits for outside the deadline.
+   waits for outside the deadline;
+5. a spawn of the idle child given one bootstrap cap (`CommandExt::bootstrap_caps`, a copy of
+   the endpoint), which it never asks for, under a deadline 2 s ahead fails `TimedOut` after 1 s
+   or more and under 5 s, and the cap it did not deliver is deleted
+   ([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Bootstrap caps).
+
+Before either part, the fixture checks that it holds no creator endpoint: its tester spawns it
+with no bootstrap caps.
 
 The tester passes when the fixture prints `PASS` and exits cleanly; any failed step panics the
 fixture, a non-clean exit.

@@ -94,6 +94,21 @@ program opt in or skip; absence is the default.
   `Stdio::piped()`), argv, environment, filesystem — and asserts whatever
   invariant fits that program.
 
+### Seeds
+
+- A tester that needs an authority no lookup gives (a seed-only name, or a
+  cap with `GRANT`) takes it as a seed of usertest's recipe
+  (`rootfs/config/svcmgr/tests/usertest.svc`): the recipe's `seed` line names
+  it, and its env entry `TESTER_SEEDS` declares the slot for the tester
+  (`<tester>:<slot>[,<slot>...]`, entries joined by `;`; slot 0 is usertest's
+  own `pwrmgr.shutdown`).
+- usertest hands the tester a copy of each declared seed as its bootstrap
+  caps, in the order its entry names them, and the tester takes them with
+  `ipc::bootstrap::request_slots` on its `creator_endpoint` before it writes
+  to its stdout or stderr
+  ([services/usertest/README.md](../services/usertest/README.md) § Seeds).
+- A tester with no entry is spawned with no creator endpoint.
+
 ---
 
 ## Sysroot layout

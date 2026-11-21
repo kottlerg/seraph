@@ -556,6 +556,35 @@ passes it to the thread syscalls that inspect and modify the child
 
 ---
 
+## Bootstrap caps
+
+`std::os::seraph::process::CommandExt::bootstrap_caps` hands a spawned child capabilities over the
+bootstrap protocol (`ipc::bootstrap`), as svcmgr hands a service its recipe's seeds: a list of
+positional caps, `0` for an absent slot, whose ownership moves to the `Command`. The child takes
+them with `ipc::bootstrap::request_slots` on its `creator_endpoint`. usertest hands each tester
+the seeds its recipe declares for it this way
+([docs/testing.md](../../docs/testing.md) § Per-program tester protocol).
+
+`spawn` then creates an endpoint of its own and sends a badged SEND on it at cap[1] of
+`CREATE_FROM_FILE`, which procmgr installs as the child's `creator_endpoint_cap`
+([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md) § Label 1). Once the child
+has started, the spawning thread serves its rounds, one per `MSG_CAP_SLOTS_MAX` slots, with
+`ipc::bootstrap::serve_round_watched`, deletes the endpoint, and returns; no thread of its own is
+started. Each round waits until the child asks, dies, or the calling thread's call deadline
+(§ Call deadline) passes, one `WATCH_POLL_MS` receive late at most. A death, a failed round or
+the deadline fails the spawn (`TimedOut` for the deadline) and tears the child down, and the caps
+no round moved are deleted, as they are when the `Command` is dropped unspawned. With no deadline
+set, a live child that never asks holds the spawner as `Child::wait` would, so a child takes its
+caps before it writes enough to fill a piped stdio stream. A `Command` given no caps, the
+default, sends no cap[1], and the child's `creator_endpoint` is `0`.
+
+The serve is a receive on the calling thread, which releases any reply that thread still owes
+([docs/ipc-design.md](../../docs/ipc-design.md) § The Call/Reply Model), so a server thread replies
+to its caller before it spawns a child with bootstrap caps; a spawn without them only calls. A
+receive an upcall or a thread stop cancels took no request, and is received again.
+
+---
+
 ## Session streams
 
 `std::os::seraph::process::SessionStdio` makes the standard streams of a session's leader for an
@@ -714,8 +743,10 @@ does not trust to answer, as crashd bounds a fault's report and a core dump
   as its API reports a failed call: `io::ErrorKind::TimedOut` where it returns `io::Result`,
   `UNIX_EPOCH` from `SystemTime::now`, `None` from the registry lookup, and a dropped line from
   the log. Such a call may have reached its server, which may have acted on it, and whose reply
-  then finds no caller. A `File` dropped past the deadline sends no `FS_CLOSE`; the driver releases
-  that open once it finds the open's liveness cap gone, which the drop deletes
+  then finds no caller. A spawn's wait for its child's bootstrap requests (§ Bootstrap caps), which
+  is a receive, ends at the deadline too, and fails the spawn `TimedOut`. A `File` dropped past
+  the deadline sends no `FS_CLOSE`; the driver releases that open once it finds the open's
+  liveness cap gone, which the drop deletes
   ([Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md) § Label 18:
   `FS_OPEN`).
 - **Not bounded.** The calls to memmgr (the heap, the stacks, the registration of demand-paged

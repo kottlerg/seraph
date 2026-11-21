@@ -2,8 +2,9 @@
 
 UEFI bootloader for Seraph. Loads the kernel ELF and the
 `\EFI\seraph\bootstrap.bundle` (init plus boot modules) from hardcoded ESP paths,
-verifies the kernel and every bundle entry against the trust store built into it and hands the
-store on as a boot module ([docs/signing.md](../../docs/signing.md)),
+verifies the kernel and every bundle entry against the trust store built into it merged with the
+one enrolled in firmware storage, applies a trust request on the ESP to the enrolled one, and hands
+the merged store on as a boot module ([docs/signing.md](../../docs/signing.md)),
 parses init's ELF into `InitImage`, establishes
 initial page tables with W^X enforcement, discovers firmware table addresses (ACPI
 RSDP / Device Tree blob) for passthrough to userspace, and jumps to the kernel entry
@@ -41,6 +42,7 @@ core/boot/
     ├── paging.rs               # Initial page table construction (arch-neutral)
     ├── error.rs                # Bootloader error type
     ├── signing.rs              # Embedded trust store; signature verification of loaded objects
+    ├── enrolment.rs            # Enrolled trust store in a UEFI variable; trust requests
     ├── rollback.rs             # The machine's security floor in a boot-services UEFI variable
     ├── secure_boot.rs          # The firmware's UEFI Secure Boot state, read and logged
     └── arch/
@@ -157,10 +159,11 @@ The CPU state established at the kernel entry point is specified in
 ## What the Bootloader Does Not Do
 
 - **No UEFI runtime services after `ExitBootServices`.** The bootloader's only
-  runtime-services calls are `GetVariable` and `SetVariable`, for the uses
+  runtime-services calls are `GetVariable`, `SetVariable` and `QueryVariableInfo`, for the uses
   [core/boot/docs/uefi-environment.md](docs/uefi-environment.md) § Variable Services lists (the
-  firmware's Secure Boot state, read; the machine's security floor, read and raised), and every
-  one comes before `ExitBootServices`. UEFI
+  firmware's Secure Boot state, read; the machine's security floor, read and raised; the enrolled
+  trust store, read and, when a trust request is applied, written), and every one comes before
+  `ExitBootServices`. UEFI
   boot services are exited before the kernel runs, and no runtime-services call follows
   the exit ([core/boot/docs/uefi-environment.md](docs/uefi-environment.md)
   § ExitBootServices).
@@ -176,11 +179,12 @@ The CPU state established at the kernel entry point is specified in
   IRQ descriptors, no PCI enumeration. Namespace evaluation and
   device-level assignment are userspace's responsibility. Extraction scope is in
   [core/boot/docs/firmware-parsing.md](docs/firmware-parsing.md).
-- **No boot menu or interactive UI.** The kernel, bundle, `nokaslr` knob, and
-  `mapredo` test knob ESP paths are hardcoded and are the only files the
-  bootloader opens, so there is no boot configuration file beyond the two
-  presence-only knobs
-  ([core/boot/docs/elf-loading.md](docs/elf-loading.md) § File Paths). There is no
+- **No boot menu.** The kernel, bundle, `nokaslr` knob, `mapredo` test knob and trust
+  request ESP paths are hardcoded and are the only files the bootloader opens, so there is no
+  boot configuration file beyond the two presence-only knobs
+  ([core/boot/docs/elf-loading.md](docs/elf-loading.md) § File Paths). The one question the
+  bootloader asks at the console is whether to apply a trust request no signature authorizes
+  ([core/boot/docs/uefi-environment.md](docs/uefi-environment.md) § Console Input). There is no
   kernel command line: `BootInfo` carries no command-line field
   ([abi/boot-protocol/src/lib.rs](../../abi/boot-protocol/src/lib.rs)).
 - **No permanent page tables.** The initial tables are minimal and temporary; the

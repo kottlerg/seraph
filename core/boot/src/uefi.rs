@@ -181,7 +181,7 @@ pub struct EfiSystemTable
     pub firmware_vendor: *mut u16,
     pub firmware_revision: u32,
     pub console_in_handle: EfiHandle,
-    pub con_in: *mut core::ffi::c_void,
+    pub con_in: *mut EfiSimpleTextInput,
     pub console_out_handle: EfiHandle,
     pub con_out: *mut EfiSimpleTextOutput,
     pub standard_error_handle: EfiHandle,
@@ -192,11 +192,14 @@ pub struct EfiSystemTable
     pub configuration_table: *mut EfiConfigurationTable,
 }
 
-/// Leading prefix of the UEFI Runtime Services table, through `SetVariable`:
-/// the six time and virtual-addressing services before `GetVariable` and
-/// `GetNextVariableName` as padding, and the services after `SetVariable`
-/// omitted. The bootloader calls the variable services before
-/// `ExitBootServices` alone ([`get_variable`], [`set_variable`];
+/// Leading prefix of the UEFI Runtime Services table, through
+/// `QueryVariableInfo`: the six time and virtual-addressing services before
+/// `GetVariable`, `GetNextVariableName`, and the four services between
+/// `SetVariable` and `QueryVariableInfo` as padding. `QueryVariableInfo`,
+/// which UEFI 2.0 added, lies inside a table whose header size covers it
+/// alone ([`query_variable_info`]). The bootloader calls the variable
+/// services before `ExitBootServices` alone ([`get_variable`],
+/// [`set_variable`];
 /// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md)
 /// § Variable Services).
 #[repr(C)]
@@ -222,6 +225,40 @@ pub struct EfiRuntimeServices
         data_size: usize,
         data: *const core::ffi::c_void,
     ) -> EfiStatus,
+    // GetNextHighMonotonicCount, ResetSystem, UpdateCapsule and
+    // QueryCapsuleCapabilities, not used by the bootloader.
+    _pad_capsule: [usize; 4],
+    pub query_variable_info: unsafe extern "efiapi" fn(
+        attributes: u32,
+        maximum_variable_storage_size: *mut u64,
+        remaining_variable_storage_size: *mut u64,
+        maximum_variable_size: *mut u64,
+    ) -> EfiStatus,
+}
+
+/// A UEFI event handle.
+pub type EfiEvent = *mut core::ffi::c_void;
+
+/// A keystroke as `ReadKeyStroke` returns it: a scan code for a key with no
+/// character, else the character as UTF-16.
+#[repr(C)]
+pub struct EfiInputKey
+{
+    pub scan_code: u16,
+    pub unicode_char: u16,
+}
+
+/// The UEFI Simple Text Input Protocol (`ConIn`): `Reset`, `ReadKeyStroke`
+/// and the `WaitForKey` event, signalled while a keystroke is waiting. The
+/// bootloader reads it only to ask for the confirmation of a trust request
+/// ([`read_console_line`]).
+#[repr(C)]
+pub struct EfiSimpleTextInput
+{
+    pub reset: unsafe extern "efiapi" fn(this: *mut Self, extended: EfiBool) -> EfiStatus,
+    pub read_key_stroke:
+        unsafe extern "efiapi" fn(this: *mut Self, key: *mut EfiInputKey) -> EfiStatus,
+    pub wait_for_key: EfiEvent,
 }
 
 /// Leading function-pointer prefix of the UEFI Simple Text Output Protocol
@@ -318,8 +355,24 @@ pub struct EfiBootServices
     ) -> EfiStatus,
     pub free_pool: unsafe extern "efiapi" fn(buffer: *mut core::ffi::c_void) -> EfiStatus,
 
-    // Event and timer services (6 entries, unused)
-    _events: [usize; 6],
+    // Event and timer services
+    pub create_event: unsafe extern "efiapi" fn(
+        event_type: u32,
+        notify_tpl: usize,
+        notify_function: usize,
+        notify_context: *mut core::ffi::c_void,
+        event: *mut EfiEvent,
+    ) -> EfiStatus,
+    pub set_timer:
+        unsafe extern "efiapi" fn(event: EfiEvent, timer_type: u32, trigger_time: u64) -> EfiStatus,
+    pub wait_for_event: unsafe extern "efiapi" fn(
+        number_of_events: usize,
+        events: *const EfiEvent,
+        index: *mut usize,
+    ) -> EfiStatus,
+    _signal_event: usize,
+    pub close_event: unsafe extern "efiapi" fn(event: EfiEvent) -> EfiStatus,
+    _check_event: usize,
 
     // Protocol handler services
     pub install_protocol_interface: usize,
@@ -755,6 +808,7 @@ pub unsafe fn file_read(file: *mut EfiFileProtocol, buffer: &mut [u8]) -> Result
 {
     let mut size = buffer.len();
     // SAFETY: `file` is a valid file protocol (caller contract), so the `read` entry is readable.
+    // SAFETY: con_in is the firmware's ConIn, valid before ExitBootServices (caller contract).
     let read_fn = unsafe { (*file).read };
     // SAFETY: file is valid; buffer is a valid writable slice.
     let status = unsafe {
@@ -1652,6 +1706,81 @@ unsafe fn set_variable(
     }
 }
 
+/// What `QueryVariableInfo` reports of the store for one set of attributes,
+/// in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VariableInfo
+{
+    /// The size of the store for variables of these attributes.
+    pub max_storage: u64,
+    /// The room left in it.
+    pub remaining: u64,
+    /// The largest variable, its name and data, the store takes.
+    pub max_variable: u64,
+}
+
+/// The byte offset of `QueryVariableInfo` in the runtime services table: a
+/// table whose header size does not reach past it predates UEFI 2.0 and has
+/// none.
+const QUERY_VARIABLE_INFO_END: usize =
+    core::mem::offset_of!(EfiRuntimeServices, query_variable_info) + core::mem::size_of::<usize>();
+
+/// Ask the firmware's store about variables of `attributes` through
+/// `QueryVariableInfo`: [`FirmwareVariables::query`].
+///
+/// # Errors
+/// The status the firmware failed the call with; `EFI_UNSUPPORTED`, without
+/// a call, for a system table with no runtime services or a runtime services
+/// table too short to hold the service.
+///
+/// # Safety
+/// `st` must be a valid pointer to the UEFI system table, and boot services
+/// must not have exited.
+unsafe fn query_variable_info(
+    st: *mut EfiSystemTable,
+    attributes: u32,
+) -> Result<VariableInfo, EfiStatus>
+{
+    // SAFETY: st is valid (caller contract).
+    let rt = unsafe { (*st).runtime_services };
+    if rt.is_null()
+    {
+        return Err(EFI_UNSUPPORTED);
+    }
+    // SAFETY: `rt` is the firmware's runtime services table, valid before
+    // ExitBootServices (caller contract); its header is always present.
+    let header_size = unsafe { (*rt).hdr.header_size };
+    if usize::try_from(header_size).is_ok_and(|size| size < QUERY_VARIABLE_INFO_END)
+    {
+        return Err(EFI_UNSUPPORTED);
+    }
+    // SAFETY: the table's header size covers the `query_variable_info` entry
+    // (checked above), so it is readable.
+    let query_fn = unsafe { (*rt).query_variable_info };
+    let mut info = VariableInfo {
+        max_storage: 0,
+        remaining: 0,
+        max_variable: 0,
+    };
+    // SAFETY: the three out-pointers name live fields of `info` for the call.
+    let status = unsafe {
+        query_fn(
+            attributes,
+            core::ptr::addr_of_mut!(info.max_storage),
+            core::ptr::addr_of_mut!(info.remaining),
+            core::ptr::addr_of_mut!(info.max_variable),
+        )
+    };
+    if status == EFI_SUCCESS
+    {
+        Ok(info)
+    }
+    else
+    {
+        Err(status)
+    }
+}
+
 /// The UEFI variable services as the bootloader uses them, before
 /// `ExitBootServices` alone: the firmware's ([`FirmwareVariables`]), or a
 /// host test's store. Every Seraph variable is read and written through it
@@ -1676,6 +1805,13 @@ pub trait VariableServices
         attributes: u32,
         data: &[u8],
     ) -> Result<(), EfiStatus>;
+
+    /// What the store reports for variables of `attributes`.
+    ///
+    /// # Errors
+    /// The status the query failed with; `EFI_UNSUPPORTED` where the
+    /// firmware has no such service.
+    fn query(&mut self, attributes: u32) -> Result<VariableInfo, EfiStatus>;
 }
 
 /// The firmware's variable services, reached through the system table's
@@ -1719,6 +1855,263 @@ impl VariableServices for FirmwareVariables
         // SAFETY: self.st is valid and boot services have not exited (the
         // contract of FirmwareVariables::new).
         unsafe { set_variable(self.st, name, vendor, attributes, data) }
+    }
+
+    fn query(&mut self, attributes: u32) -> Result<VariableInfo, EfiStatus>
+    {
+        // SAFETY: self.st is valid and boot services have not exited (the
+        // contract of FirmwareVariables::new).
+        unsafe { query_variable_info(self.st, attributes) }
+    }
+}
+
+/// `EVT_TIMER`: an event a timer signals.
+const EVT_TIMER: u32 = 0x8000_0000;
+
+/// `TimerRelative`: a timer that fires once, its trigger time from now.
+const TIMER_RELATIVE: u32 = 2;
+
+/// A line typed at the console ([`ConsoleInput::read_line`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineRead
+{
+    /// Enter was pressed: the line held `len` characters, of which those
+    /// that fit are at the start of the buffer.
+    Line
+    {
+        len: usize
+    },
+    /// The time ran out before Enter.
+    Timeout,
+    /// The console cannot be read: there is no console input, or a call
+    /// failed with this status.
+    Unavailable(EfiStatus),
+}
+
+/// Console input as the bootloader uses it, before `ExitBootServices`
+/// alone: the firmware's `ConIn` ([`FirmwareConsole`]), or a host test's
+/// script.
+pub trait ConsoleInput
+{
+    /// Discard the keys typed so far, print `prompt` as one line, then read
+    /// one line of typed ASCII into `buffer`, echoing each character, until
+    /// Enter or until `seconds` have passed, whichever comes first.
+    /// Backspace removes the last character; a key with no ASCII character
+    /// is ignored.
+    fn read_line(&mut self, prompt: &str, buffer: &mut [u8], seconds: u64) -> LineRead;
+}
+
+/// The firmware's console input, reached through the system table's `ConIn`
+/// and timed by a timer event of the boot services, never by `Stall`, which
+/// some firmware returns from at once.
+pub struct FirmwareConsole
+{
+    st: *mut EfiSystemTable,
+}
+
+impl FirmwareConsole
+{
+    /// The console input of the system table `st`.
+    ///
+    /// # Safety
+    /// `st` must be a valid pointer to the UEFI system table, and boot
+    /// services must not exit while the value lives.
+    pub const unsafe fn new(st: *mut EfiSystemTable) -> Self
+    {
+        Self { st }
+    }
+}
+
+impl ConsoleInput for FirmwareConsole
+{
+    fn read_line(&mut self, prompt: &str, buffer: &mut [u8], seconds: u64) -> LineRead
+    {
+        // SAFETY: self.st is valid and boot services have not exited (the
+        // contract of FirmwareConsole::new).
+        unsafe { read_console_line(self.st, prompt, buffer, seconds) }
+    }
+}
+
+/// [`ConsoleInput::read_line`] on the firmware's `ConIn`: the keys waiting
+/// from before the prompt are discarded, and the line ends at Enter or at a
+/// one-shot timer event `seconds` from the prompt.
+///
+/// # Safety
+/// `st` must be a valid pointer to the UEFI system table, and boot services
+/// must not have exited.
+unsafe fn read_console_line(
+    st: *mut EfiSystemTable,
+    prompt: &str,
+    buffer: &mut [u8],
+    seconds: u64,
+) -> LineRead
+{
+    // SAFETY: st is valid (caller contract).
+    let con_in = unsafe { (*st).con_in };
+    // SAFETY: st is valid (caller contract).
+    let bs = unsafe { (*st).boot_services };
+    if con_in.is_null()
+    {
+        return LineRead::Unavailable(EFI_UNSUPPORTED);
+    }
+    // SAFETY: con_in is the firmware's ConIn, valid before ExitBootServices (caller contract).
+    let reset_fn = unsafe { (*con_in).reset };
+    // SAFETY: con_in is the firmware's ConIn, valid before ExitBootServices (caller contract).
+    let read_fn = unsafe { (*con_in).read_key_stroke };
+    // SAFETY: con_in is the firmware's ConIn, valid before ExitBootServices (caller contract).
+    let wait_for_key = unsafe { (*con_in).wait_for_key };
+    // SAFETY: bs is the firmware's boot services, valid before ExitBootServices (caller contract).
+    let create_fn = unsafe { (*bs).create_event };
+    // SAFETY: bs is the firmware's boot services, valid before ExitBootServices (caller contract).
+    let set_timer_fn = unsafe { (*bs).set_timer };
+    // SAFETY: bs is the firmware's boot services, valid before ExitBootServices (caller contract).
+    let wait_fn = unsafe { (*bs).wait_for_event };
+    // SAFETY: bs is the firmware's boot services, valid before ExitBootServices (caller contract).
+    let close_fn = unsafe { (*bs).close_event };
+    // Keys typed before the question are no answer to it: discard them, then
+    // ask.
+    // SAFETY: con_in is valid; a failed reset leaves the keys to be read.
+    let _ = unsafe { reset_fn(con_in, 0) };
+    crate::bprintln!("{prompt}");
+    let mut timer: EfiEvent = core::ptr::null_mut();
+    // SAFETY: a timer event with no notification; `timer` is live for the call.
+    let status = unsafe {
+        create_fn(
+            EVT_TIMER,
+            0,
+            0,
+            core::ptr::null_mut(),
+            core::ptr::addr_of_mut!(timer),
+        )
+    };
+    if status != EFI_SUCCESS
+    {
+        return LineRead::Unavailable(status);
+    }
+    // Trigger time in 100 ns units.
+    let trigger = seconds.saturating_mul(10_000_000);
+    // SAFETY: timer is the event created above.
+    let status = unsafe { set_timer_fn(timer, TIMER_RELATIVE, trigger) };
+    let result = if status == EFI_SUCCESS
+    {
+        // SAFETY: con_in is valid; wait_for_key and timer are live events.
+        unsafe { collect_line(con_in, read_fn, wait_fn, [wait_for_key, timer], buffer) }
+    }
+    else
+    {
+        LineRead::Unavailable(status)
+    };
+    // SAFETY: timer is the event created above, closed once; closing a timer
+    // event also cancels it.
+    let _ = unsafe { close_fn(timer) };
+    result
+}
+
+/// The type of `ReadKeyStroke`.
+type ReadKeyStroke =
+    unsafe extern "efiapi" fn(this: *mut EfiSimpleTextInput, key: *mut EfiInputKey) -> EfiStatus;
+
+/// The type of `WaitForEvent`.
+type WaitForEvent = unsafe extern "efiapi" fn(
+    count: usize,
+    events: *const EfiEvent,
+    index: *mut usize,
+) -> EfiStatus;
+
+/// The loop of [`read_console_line`]: wait for a key or the timer, then take
+/// the key.
+///
+/// # Safety
+/// `con_in` must be the firmware's `ConIn`, `read_fn` its `ReadKeyStroke`,
+/// `wait_fn` the boot services' `WaitForEvent`, and `events` its
+/// `WaitForKey` and a live timer event, before `ExitBootServices`.
+unsafe fn collect_line(
+    con_in: *mut EfiSimpleTextInput,
+    read_fn: ReadKeyStroke,
+    wait_fn: WaitForEvent,
+    events: [EfiEvent; 2],
+    buffer: &mut [u8],
+) -> LineRead
+{
+    let mut len = 0usize;
+    loop
+    {
+        let mut index = 0usize;
+        // SAFETY: both events are live (caller contract); index is live.
+        let status = unsafe { wait_fn(2, events.as_ptr(), core::ptr::addr_of_mut!(index)) };
+        if status != EFI_SUCCESS
+        {
+            return LineRead::Unavailable(status);
+        }
+        if index != 0
+        {
+            crate::bprintln!();
+            return LineRead::Timeout;
+        }
+        let mut key = EfiInputKey {
+            scan_code: 0,
+            unicode_char: 0,
+        };
+        // SAFETY: con_in is valid (caller contract); key is live.
+        if unsafe { read_fn(con_in, core::ptr::addr_of_mut!(key)) } != EFI_SUCCESS
+        {
+            // The key event fired for no key (a key another reader took):
+            // wait again.
+            continue;
+        }
+        match line_key(key.unicode_char)
+        {
+            LineKey::Enter =>
+            {
+                crate::bprintln!();
+                return LineRead::Line { len };
+            }
+            LineKey::Backspace =>
+            {
+                if len > 0
+                {
+                    len = len.saturating_sub(1);
+                    crate::bprint!("\x08 \x08");
+                }
+            }
+            LineKey::Char(byte) =>
+            {
+                if let Some(slot) = buffer.get_mut(len)
+                {
+                    *slot = byte;
+                }
+                len = len.saturating_add(1);
+                crate::bprint!("{}", char::from(byte));
+            }
+            LineKey::Other =>
+            {}
+        }
+    }
+}
+
+/// What a keystroke's character does to a line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineKey
+{
+    /// Carriage return or line feed: the line ends.
+    Enter,
+    /// Backspace or DEL: the last character goes.
+    Backspace,
+    /// A printable ASCII character.
+    Char(u8),
+    /// Anything else: ignored.
+    Other,
+}
+
+/// Classify the UTF-16 character `unicode` of a keystroke.
+fn line_key(unicode: u16) -> LineKey
+{
+    match unicode
+    {
+        0x0d | 0x0a => LineKey::Enter,
+        0x08 | 0x7f => LineKey::Backspace,
+        0x20..=0x7e => u8::try_from(unicode).map_or(LineKey::Other, LineKey::Char),
+        _ => LineKey::Other,
     }
 }
 
@@ -1764,6 +2157,77 @@ mod tests
         classify_variable_read, map_buffer_bytes, map_buffer_descriptor_reach,
         variable_name_is_terminated,
     };
+    use super::{EfiBootServices, EfiRuntimeServices, EfiSimpleTextInput, LineKey, line_key};
+
+    // Defect caught: a service called through the wrong slot of its table
+    // (the UEFI specification's order), which calls another service with
+    // the arguments of this one.
+    #[test]
+    fn the_services_lie_at_the_specifications_slots()
+    {
+        let slot = |offset: usize| offset / core::mem::size_of::<usize>();
+        assert_eq!(
+            slot(core::mem::offset_of!(EfiRuntimeServices, get_variable)),
+            9
+        );
+        assert_eq!(
+            slot(core::mem::offset_of!(EfiRuntimeServices, set_variable)),
+            11
+        );
+        assert_eq!(
+            slot(core::mem::offset_of!(
+                EfiRuntimeServices,
+                query_variable_info
+            )),
+            16
+        );
+        assert_eq!(
+            slot(core::mem::offset_of!(EfiBootServices, allocate_pool)),
+            8
+        );
+        assert_eq!(
+            slot(core::mem::offset_of!(EfiBootServices, create_event)),
+            10
+        );
+        assert_eq!(slot(core::mem::offset_of!(EfiBootServices, set_timer)), 11);
+        assert_eq!(
+            slot(core::mem::offset_of!(EfiBootServices, wait_for_event)),
+            12
+        );
+        assert_eq!(
+            slot(core::mem::offset_of!(EfiBootServices, close_event)),
+            14
+        );
+        assert_eq!(
+            slot(core::mem::offset_of!(EfiBootServices, handle_protocol)),
+            19
+        );
+        assert_eq!(
+            slot(core::mem::offset_of!(EfiSimpleTextInput, read_key_stroke)),
+            1
+        );
+        assert_eq!(
+            slot(core::mem::offset_of!(EfiSimpleTextInput, wait_for_key)),
+            2
+        );
+    }
+
+    // Defect caught: Enter from a serial terminal (CR) or a keyboard not
+    // ending the line, or a control character taken into the answer.
+    #[test]
+    fn a_keystroke_is_enter_backspace_a_character_or_nothing()
+    {
+        assert_eq!(line_key(0x0d), LineKey::Enter);
+        assert_eq!(line_key(0x0a), LineKey::Enter);
+        assert_eq!(line_key(0x08), LineKey::Backspace);
+        assert_eq!(line_key(0x7f), LineKey::Backspace);
+        assert_eq!(line_key(u16::from(b'y')), LineKey::Char(b'y'));
+        assert_eq!(line_key(u16::from(b' ')), LineKey::Char(b' '));
+        for other in [0u16, 0x1b, 0x09, 0xe9, 0x4e00]
+        {
+            assert_eq!(line_key(other), LineKey::Other, "{other:#x}");
+        }
+    }
 
     // Defect caught: a GetVariable outcome read as another (a missing
     // variable as a failed read, a variable too large for the buffer as

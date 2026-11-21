@@ -23,3 +23,4 @@ pub mod review;
 pub mod run;
 pub mod symbolize;
 pub mod test;
+pub mod trust_request;

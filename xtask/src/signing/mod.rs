@@ -24,6 +24,7 @@
 //!   store.
 
 mod identity;
+pub mod request;
 mod store;
 
 use std::ffi::OsString;
@@ -48,7 +49,7 @@ pub use store::StoreMode;
 pub const SECURITY_VERSION: u32 = 1;
 
 /// The directory of the signing identity; by default
-/// `seraph/signing/ed25519-ml-dsa-65-roles-1-8` in the user's data directory
+/// `seraph/signing/ed25519-ml-dsa-65-roles-1-9` in the user's data directory
 /// ([`default_dir`]).
 pub const ENV_SIGNING_DIR: &str = "SERAPH_SIGNING_DIR";
 
@@ -66,8 +67,8 @@ pub const ENV_TRUST_STORE_MODE: &str = "SERAPH_TRUST_STORE_MODE";
 
 /// The last component of the default identity directory: the signature
 /// algorithm of the identity it holds, and the roles its key is certified for
-/// (1 to 8, [`Role::ALL`]).
-const IDENTITY_DIR: &str = "ed25519-ml-dsa-65-roles-1-8";
+/// (1 to 9, [`Role::ALL`]).
+const IDENTITY_DIR: &str = "ed25519-ml-dsa-65-roles-1-9";
 
 /// The first four bytes of an ELF image.
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
@@ -1864,7 +1865,7 @@ mod tests
         let home = config_of(&[("HOME", "/home/u"), ("SERAPH_TRUST_STORE", "/s")]).unwrap();
         assert_eq!(
             home.dir,
-            Path::new("/home/u/.local/share/seraph/signing/ed25519-ml-dsa-65-roles-1-8")
+            Path::new("/home/u/.local/share/seraph/signing/ed25519-ml-dsa-65-roles-1-9")
         );
         assert_eq!(
             home.deployer_store,
@@ -1873,7 +1874,7 @@ mod tests
         let xdg = config_of(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/x")]).unwrap();
         assert_eq!(
             xdg.dir,
-            Path::new("/x/seraph/signing/ed25519-ml-dsa-65-roles-1-8")
+            Path::new("/x/seraph/signing/ed25519-ml-dsa-65-roles-1-9")
         );
         let named = config_of(&[("HOME", "/home/u"), ("SERAPH_SIGNING_DIR", "/k")]).unwrap();
         assert_eq!(named.dir, Path::new("/k"));

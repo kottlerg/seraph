@@ -702,6 +702,33 @@ it on demand. See [xtask/README.md § The `rollback` case](../xtask/README.md#th
 for the lines and the logs. CI runs it in each usertest cell after the `signing` case, in the
 cell's profile.
 
+### Root enrolment (`enrolment` case)
+
+The bootloader keeps an enrolled trust store in a boot-services-only UEFI variable and changes it by
+the trust requests it finds on the ESP ([signing.md](signing.md) § Trust Store), which only boots
+after one another on the same variable store can show. `cargo xtask test enrolment [--arch]` (both
+arches) boots the current sysroot six times on one store, a copy of the firmware's template kept
+across the six boots, with two local identities `E` and `F` whose roots the build's store does not
+trust:
+
+1. `signed`: a request adding `E`'s root, signed for enrolment by the build's identity. The
+   bootloader applies it with no one present and boots with `E`'s root enrolled.
+2. `unanswered`: an unsigned request adding `F`'s root. The bootloader shows it and asks the
+   console; no answer comes, and it refuses the request after 60 seconds and boots.
+3. `confirmed`: the same request, answered `yes` at the console. The bootloader applies it.
+4. `commit-refused`: an unsigned request revoking the build's roots, with the sysroot's images. The
+   kernel would not verify under the store it gives, so the bootloader refuses it before asking.
+5. `revoked`: the same revocation signed for enrolment by `E`, with the kernel and every bundle
+   entry signed again by `E`. The bootloader applies it, and boots with the build's roots revoked.
+6. `holds`: the same request again, with the sysroot's images. The request changes nothing and is
+   skipped, and the bootloader refuses the build's kernel.
+
+A boot passes when every line it owes appears; a boot after a failed one is not made. A request past
+the enrolled store's bound, a refused write, and a malformed store are covered by the bootloader's
+host tests, since no QEMU firmware gives them on demand. See
+[xtask/README.md § The `enrolment` case](../xtask/README.md#the-enrolment-case) for the lines and
+the logs. CI runs it in each usertest cell after the `rollback` case.
+
 ### Secure Boot (`secureboot` case)
 
 UEFI Secure Boot of the bootloader ([signing.md](signing.md) § Secure Boot) is the firmware's
@@ -723,7 +750,7 @@ for riscv64 ([build-system.md](build-system.md) § QEMU and Firmware). A firmwar
 enforce Secure Boot fails the case, naming the firmware, so the case never passes on one that boots
 what it should refuse. See
 [xtask/README.md § The `secureboot` case](../xtask/README.md#the-secureboot-case) for the lines,
-the firmware search and the logs. CI runs it in each usertest cell after the `rollback` case.
+the firmware search and the logs. CI runs it in each usertest cell after the `enrolment` case.
 
 ### GDB stub (`debug-port` case)
 
@@ -997,7 +1024,7 @@ CI matrix cells follow these rules per boot. The `usertest` cell runs its boots 
 `usertest` (via `run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the
 default boot (terminal present), `cargo xtask test --cell usertest` runs the cell's cases: the
 `terminal` case's boot, the `signing` case's six boots, the `rollback` case's three boots, the
-`secureboot` case's four boots, the
+`enrolment` case's six boots, the `secureboot` case's four boots, the
 `wedge` case's boot pair, on x86_64 the `vmgenid` case's save/restore boot pair, and the `shutdown`
 case's boots, nine on x86_64 (the reboot, the power button and the seven core deaths) and eight on
 riscv64. The `ktest` cell's cases are the `kaslr` case's three boots; the `svctest` cell has none.
@@ -1068,7 +1095,7 @@ registry runs it on (its `md-test-cells` rule).
 | Cell | Tier | Architectures | Launch | Cases | Covers |
 |---|---|---|---|---|---|
 | `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
-| `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `rollback`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
+| `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |

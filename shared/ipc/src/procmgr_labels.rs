@@ -1010,6 +1010,29 @@ pub const READ_VERIFIED: u64 = 31;
 /// Specified in `services/procmgr/docs/ipc-interface.md` § `MAKE_PRIVATE`.
 pub const MAKE_PRIVATE: u64 = 32;
 
+/// Capture a live process's mapped pages into a memory object for a
+/// debugger or a core writer: procmgr holds the target's address space
+/// (`SYS_ASPACE_HOLD`), so no thread of it runs, whether it registered or
+/// not, copies every page the space maps into frames granted on the
+/// sender's memmgr account, releases the space, and seals the copy into an
+/// immutable memory object on that account (`memmgr_labels::SEAL_OBJECT`),
+/// charged in full to it. Served only on a badge carrying
+/// [`DEBUG_AUTHORITY`]. `data[0]` is the target's process badge;
+/// `caps[0]` the sender's own memmgr SEND, the account procmgr requests the
+/// frames on and seals through, each call on it bounded. The object starts
+/// with a layout of the space's runs, laid out as `crate::procmgr_snapshot`
+/// states. Replies `SUCCESS` with `caps[0]` the object's handle, `data[0]`
+/// the object's pages and `data[1]` `crate::procmgr_snapshot::SNAPSHOT_COMPLETE`
+/// when no run is absent, else `0`; `UNAUTHORIZED` without the authority;
+/// `INVALID_ARGUMENT` without `caps[0]`; `INVALID_BADGE` when no live
+/// process carries the badge, or it ended during the capture;
+/// `NOT_ATTACHABLE` when it declared itself undebuggable; `SPACE_HELD` when
+/// its space is held already; `OUT_OF_MEMORY` when the account refused or
+/// failed a call, granted a run procmgr refuses, or the object would take
+/// more grants than one seal names. Specified in
+/// `services/procmgr/docs/ipc-interface.md` § Label 33: `SNAPSHOT`.
+pub const SNAPSHOT: u64 = 33;
+
 /// The most bytes a [`READ_VERIFIED`] file may hold, its trailer included:
 /// 32 KiB, room for a platform description table
 /// (`MAX_TABLE_BYTES`, 8 KiB) and the other policy-bearing configuration
@@ -1032,7 +1055,7 @@ pub fn read_verified_name(req: &crate::IpcMessage) -> Option<&[u8]>
 
 /// Badge bit on procmgr service caps that authorises
 /// [`REGISTER_CRASH_SERVICE`], [`ATTACH_PROCESS`], [`LIST_PROCESSES`],
-/// [`DETACH_PROCESS`], [`MAKE_RESIDENT`] and [`MAKE_PRIVATE`]. svcmgr mints it for
+/// [`DETACH_PROCESS`], [`MAKE_RESIDENT`], [`MAKE_PRIVATE`] and [`SNAPSHOT`]. svcmgr mints it for
 /// a service whose definition sets `debug_authority = yes`; no other
 /// path mints it. Who holds it is in
 /// `services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`.

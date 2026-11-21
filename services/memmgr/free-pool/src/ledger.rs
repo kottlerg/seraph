@@ -57,9 +57,10 @@
 //! weights).
 
 use crate::arena::{
-    Arena, Attachment, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, LimitReg,
-    MemObject, NO_REGION_ID, NODE_NULL, Node, NodeHandle, NodeIdx, OBJECT_MAX_ATTACHMENTS,
-    ProcessCaps, ProcessRecord, RegionNode, Share, Slot, SlotStore, ZERO_FRAME_SPAN, ZeroFrame,
+    Arena, Attachment, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, HolderLink,
+    LimitReg, MemObject, NO_REGION_ID, NODE_NULL, Node, NodeHandle, NodeIdx,
+    OBJECT_MAX_ATTACHMENTS, ProcessCaps, ProcessRecord, RegionNode, Share, Slot, SlotStore,
+    ZERO_FRAME_SPAN, ZeroFrame,
 };
 use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
 use crate::chunk::{self, ChunkEntry, ChunkError, ChunkState, SealTag};
@@ -650,7 +651,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Disk(_)
             | Node::Object(_)
             | Node::ZeroFrame(_)
-            | Node::Reclaim(_) => None,
+            | Node::Reclaim(_)
+            | Node::Holder(_) => None,
         }
     }
 
@@ -675,7 +677,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Disk(_)
             | Node::Object(_)
             | Node::ZeroFrame(_)
-            | Node::Reclaim(_) => None,
+            | Node::Reclaim(_)
+            | Node::Holder(_) => None,
         }
     }
 
@@ -701,7 +704,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Disk(_)
             | Node::Object(_)
             | Node::ZeroFrame(_)
-            | Node::Reclaim(_) => None,
+            | Node::Reclaim(_)
+            | Node::Holder(_) => None,
         }
     }
 
@@ -751,7 +755,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Disk(_)
             | Node::Object(_)
             | Node::ZeroFrame(_)
-            | Node::Reclaim(_) => None,
+            | Node::Reclaim(_)
+            | Node::Holder(_) => None,
         }
     }
 
@@ -849,6 +854,26 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     ) -> Result<(), ChargeError>
     {
         let node = self.record(rec).ok_or(ChargeError::Limit)?.budget;
+        self.admit_node(node, pages, pending, reserve)
+    }
+
+    /// [`Ledger::admit`] for the budget node `node`: whether `pages` more
+    /// may be charged to it, beside `pending` pages taken from the pool for
+    /// it and not yet charged, against its chain's max and the free pages
+    /// outside `promised`, of which a charge to a node outside the system
+    /// reserve must leave `reserve`. A grant charged to a node handle's node
+    /// is admitted here ([`Ledger::push_grant`]).
+    ///
+    /// # Errors
+    /// [`ChargeError::Limit`] or [`ChargeError::Reserve`].
+    pub fn admit_node(
+        &self,
+        node: NodeIdx,
+        pages: u64,
+        pending: u64,
+        reserve: u64,
+    ) -> Result<(), ChargeError>
+    {
         budget::admit(
             &self.arena,
             node,
@@ -940,7 +965,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Disk(_)
             | Node::Object(_)
             | Node::ZeroFrame(_)
-            | Node::Reclaim(_) => None,
+            | Node::Reclaim(_)
+            | Node::Holder(_) => None,
         }
     }
 
@@ -967,7 +993,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Disk(_)
             | Node::Object(_)
             | Node::ZeroFrame(_)
-            | Node::Reclaim(_) => None,
+            | Node::Reclaim(_)
+            | Node::Holder(_) => None,
         }
     }
 
@@ -1074,6 +1101,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             owner: r.badge,
             limit: NODE_NULL,
             owned_next: caps.handles,
+            holders: NODE_NULL,
         });
         let h = self
             .arena
@@ -1093,13 +1121,21 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// carrying its key is refused from then on, unlink it from its owner's
     /// list, free it, and drop its reference on its node, which frees the node
     /// when no record, child node or charge refers to it any more
-    /// ([`budget::unref`]), with its limit registration. Returns the limit
-    /// cap, `0` for none, for the caller to delete; `None` when `h` holds no
-    /// handle state.
+    /// ([`budget::unref`]), with its limit registration and its holder links.
+    /// A grant charged to the node keeps its charge there, and the node with
+    /// it, until its holder lets it go. Returns the limit cap, `0` for none,
+    /// for the caller to delete; `None` when `h` holds no handle state.
     pub fn drop_handle(&mut self, h: NodeIdx) -> Option<u64>
     {
         let s = self.handle(h)?;
         let limit = self.clear_limit(h);
+        let mut link = s.holders;
+        while let Node::Holder(_) = self.arena.get(link).node
+        {
+            let next = self.arena.get(link).next;
+            self.arena.free(link);
+            link = next;
+        }
         let _ = self.index.remove(&mut self.arena, s.key);
         if let Some(rec) = self.find(s.owner)
         {
@@ -1285,7 +1321,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Drop every limit registration the record `rec` made, on whichever
-    /// handle state it is, calling `release` with each cap.
+    /// handle state it is, and its donation-end registration
+    /// ([`Ledger::set_donation_end`]), calling `release` with each cap.
     pub fn drop_limits(&mut self, rec: NodeIdx, mut release: impl FnMut(u64))
     {
         while let Some(reg) = self
@@ -1295,6 +1332,12 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             match self.limit_reg(reg)
             {
+                Some(l) if l.handle == NODE_NULL =>
+                {
+                    self.update_caps(rec, |c| c.limits = l.by_next);
+                    self.arena.free(reg);
+                    release(l.cap);
+                }
                 Some(l) if self.handle(l.handle).is_some_and(|s| s.limit == reg) =>
                 {
                     release(self.clear_limit(l.handle));
@@ -1308,6 +1351,210 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 }
             }
         }
+    }
+
+    /// Register `cap` as the donation-end Notification of the record `rec`,
+    /// signalled with `bits` when the handle state of a node it holds grants
+    /// charged to ends ([`Ledger::for_each_donation_end`]), in place of any
+    /// earlier one. The registration is a [`LimitReg`] on no handle state, on
+    /// the record's [`ProcessCaps::limits`] list, and goes with the record
+    /// ([`Ledger::drop_limits`]). Returns the cap it replaces, `0` for none,
+    /// for the caller to delete.
+    ///
+    /// # Errors
+    /// [`NodeError::Parent`] when `rec` holds no record;
+    /// [`NodeError::NoSlot`] when it has no registration yet and the arena
+    /// has no free slot outside its reserve. Nothing changes then.
+    pub fn set_donation_end(&mut self, rec: NodeIdx, cap: u64, bits: u64)
+    -> Result<u64, NodeError>
+    {
+        let caps = self.caps(rec).ok_or(NodeError::Parent)?;
+        if let Some((reg, l)) = self.donation_end_reg(rec)
+        {
+            self.arena
+                .set_node(reg, Node::Limit(LimitReg { cap, bits, ..l }));
+            return Ok(l.cap);
+        }
+        let reg = self
+            .arena
+            .alloc(
+                Node::Limit(LimitReg {
+                    cap,
+                    bits,
+                    handle: NODE_NULL,
+                    by: rec,
+                    by_next: caps.limits,
+                }),
+                NODE_NULL,
+            )
+            .ok_or(NodeError::NoSlot)?;
+        self.update_caps(rec, |c| c.limits = reg);
+        Ok(0)
+    }
+
+    /// The donation-end registration of the record `rec`
+    /// ([`Ledger::set_donation_end`]), with its slot.
+    fn donation_end_reg(&self, rec: NodeIdx) -> Option<(NodeIdx, LimitReg)>
+    {
+        let mut cur = self.caps(rec)?.limits;
+        while let Some(l) = self.limit_reg(cur)
+        {
+            if l.handle == NODE_NULL
+            {
+                return Some((cur, l));
+            }
+            cur = l.by_next;
+        }
+        None
+    }
+
+    /// Call `f` with the cap and bits of the donation-end registration of
+    /// each process on the holder list of the handle state `h` that has one
+    /// ([`Ledger::set_donation_end`]): each process holding grants charged to
+    /// its node, once.
+    pub fn for_each_donation_end(&self, h: NodeIdx, mut f: impl FnMut(u64, u64))
+    {
+        let Some(s) = self.handle(h)
+        else
+        {
+            return;
+        };
+        let mut link = s.holders;
+        while let Node::Holder(hl) = self.arena.get(link).node
+        {
+            if let Some((_, l)) = self
+                .find(hl.badge)
+                .and_then(|rec| self.donation_end_reg(rec))
+            {
+                f(l.cap, l.bits);
+            }
+            link = self.arena.get(link).next;
+        }
+    }
+
+    /// [`Ledger::for_each_donation_end`] for every node handle state the
+    /// record `rec` owns.
+    pub fn for_each_owned_donation_end(&self, rec: NodeIdx, mut f: impl FnMut(u64, u64))
+    {
+        let mut cur = self.caps(rec).map_or(NODE_NULL, |c| c.handles);
+        while cur != NODE_NULL
+        {
+            if let Some(s) = self.handle(cur)
+            {
+                self.for_each_donation_end(cur, &mut f);
+                cur = s.owned_next;
+            }
+            else if let Some(o) = self.object(cur)
+            {
+                cur = o.owned_next;
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+
+    /// Count one more frame charged to the budget node `node` held by the
+    /// process `badge` on the holder list of the node's handle state, adding
+    /// a link for a first frame. Returns `false`, changing nothing, when the
+    /// node has no handle state or the link takes a slot the arena has not
+    /// outside its reserve.
+    fn note_holder(&mut self, node: NodeIdx, badge: u64) -> bool
+    {
+        let Some(h) = self.node_handle(node)
+        else
+        {
+            return false;
+        };
+        let Some(mut s) = self.handle(h)
+        else
+        {
+            return false;
+        };
+        if let Some((link, _, hl)) = self.holder_link(s.holders, badge)
+        {
+            self.arena.set_node(
+                link,
+                Node::Holder(HolderLink {
+                    frames: hl.frames.saturating_add(1),
+                    ..hl
+                }),
+            );
+            return true;
+        }
+        let Some(link) = self
+            .arena
+            .alloc(Node::Holder(HolderLink { badge, frames: 1 }), s.holders)
+        else
+        {
+            return false;
+        };
+        s.holders = link;
+        self.arena.set_node(h, Node::Handle(s));
+        true
+    }
+
+    /// Count one frame fewer charged to the budget node `node` held by the
+    /// process `badge` ([`Ledger::note_holder`]), freeing the link with the
+    /// last; nothing when the node's handle state, or the link, is gone.
+    fn drop_holder_frame(&mut self, node: NodeIdx, badge: u64)
+    {
+        let Some(h) = self.node_handle(node)
+        else
+        {
+            return;
+        };
+        let Some(mut s) = self.handle(h)
+        else
+        {
+            return;
+        };
+        let Some((link, prev, hl)) = self.holder_link(s.holders, badge)
+        else
+        {
+            return;
+        };
+        if hl.frames > 1
+        {
+            self.arena.set_node(
+                link,
+                Node::Holder(HolderLink {
+                    frames: hl.frames.saturating_sub(1),
+                    ..hl
+                }),
+            );
+            return;
+        }
+        let next = self.arena.get(link).next;
+        if prev == NODE_NULL
+        {
+            s.holders = next;
+            self.arena.set_node(h, Node::Handle(s));
+        }
+        else
+        {
+            self.arena.set_next(prev, next);
+        }
+        self.arena.free(link);
+    }
+
+    /// The link of the process `badge` on the holder list headed by `head`,
+    /// with its slot and its predecessor's, [`NODE_NULL`] for the head.
+    fn holder_link(&self, head: NodeIdx, badge: u64) -> Option<(NodeIdx, NodeIdx, HolderLink)>
+    {
+        let mut prev = NODE_NULL;
+        let mut cur = head;
+        while let Node::Holder(hl) = self.arena.get(cur).node
+        {
+            if hl.badge == badge
+            {
+                return Some((cur, prev, hl));
+            }
+            prev = cur;
+            cur = self.arena.get(cur).next;
+        }
+        None
     }
 
     /// Set the max of the budget node `node` to `max`, clamped to its
@@ -1417,7 +1664,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Limit(_)
             | Node::Disk(_)
             | Node::ZeroFrame(_)
-            | Node::Reclaim(_) => None,
+            | Node::Reclaim(_)
+            | Node::Holder(_) => None,
         }
     }
 
@@ -1465,7 +1713,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     ///
     /// # Errors
     /// [`SealError::NoRecord`]; [`SealError::Grants`] for no id, an id that
-    /// names no frame of `rec`, or an id named twice;
+    /// names no frame of `rec` or a grant charged to a node handle's node
+    /// ([`FrameDesc::charge`]), whose charge an object could not carry, or an
+    /// id named twice;
     /// [`SealError::NoSlot`] when the arena has no free slot outside its
     /// reserve for the object or the index no bucket storage. Nothing changes
     /// then.
@@ -1486,7 +1736,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         for (i, &id) in region_ids.iter().enumerate()
         {
             let repeated = region_ids.iter().take(i).any(|&before| before == id);
-            if repeated || self.granted_frame(rec, id).is_none()
+            let charged_elsewhere = self
+                .granted_frame(rec, id)
+                .is_none_or(|(_, f)| f.charge != NODE_NULL);
+            if repeated || charged_elsewhere
             {
                 return Err(SealError::Grants);
             }
@@ -2178,12 +2431,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Account a caller-owned grant of `page_count` pages at `phys_base`,
-    /// held by memmgr's `cap_slot`, to `rec` and its budget node, marked with
-    /// `va` (the service's
-    /// caller-owned-mapping marker) and the record's next region id, which
-    /// it returns for the grant reply. `None` when the arena has no free slot
-    /// outside its reserve or the record's id sequence is spent; the record
-    /// is unchanged then.
+    /// held by memmgr's `cap_slot`, to `rec`, marked with `va` (the
+    /// service's caller-owned-mapping marker) and the record's next region
+    /// id, which it returns for the grant reply. The grant is charged to the
+    /// budget node `charge`, a node with handle state, on whose holder list
+    /// `rec` is counted ([`HolderLink`]), or to the record's own node for
+    /// [`NODE_NULL`]. `None` when the arena has no free slot outside its
+    /// reserve, `charge` is a node without handle state, or the record's id
+    /// sequence is spent; nothing changes then.
     pub fn push_grant(
         &mut self,
         rec: NodeIdx,
@@ -2191,6 +2446,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         page_count: u32,
         phys_base: u64,
         va: u64,
+        charge: NodeIdx,
     ) -> Option<u64>
     {
         let mut r = self.record(rec)?;
@@ -2202,13 +2458,48 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             phys_base,
             va,
             region_id,
+            charge,
         };
         let idx = self.arena.alloc(Node::Frame(frame), r.frame_head)?;
+        if charge != NODE_NULL && !self.note_holder(charge, r.badge)
+        {
+            self.arena.free(idx);
+            return None;
+        }
         r.frame_head = idx;
         r.next_region_id = next_region_id;
         self.set_record(rec, r);
-        budget::charge(&mut self.arena, r.budget, u64::from(page_count));
+        let charged = Self::charged_node(&r, &frame);
+        budget::charge(&mut self.arena, charged, u64::from(page_count));
         Some(region_id)
+    }
+
+    /// The budget node the frame `f` of the record `r`'s frame list is
+    /// charged to: its own charge node ([`FrameDesc::charge`]), or the
+    /// record's.
+    fn charged_node(r: &ProcessRecord, f: &FrameDesc) -> NodeIdx
+    {
+        if f.charge == NODE_NULL
+        {
+            r.budget
+        }
+        else
+        {
+            f.charge
+        }
+    }
+
+    /// Take the frame `f` off the count of its holder, the record `r`, on the
+    /// holder list of its charge node ([`Ledger::drop_holder_frame`]), and
+    /// return the node it is charged to ([`Ledger::charged_node`]), for the
+    /// caller to release the charge from.
+    fn unhold(&mut self, r: &ProcessRecord, f: &FrameDesc) -> NodeIdx
+    {
+        if f.charge != NODE_NULL
+        {
+            self.drop_holder_frame(f.charge, r.badge);
+        }
+        Self::charged_node(r, f)
     }
 
     /// Undo the most recent [`Ledger::push_frame`] on `rec`, releasing its
@@ -2226,7 +2517,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.arena.free(r.frame_head);
         r.frame_head = slot.next;
         self.set_record(rec, r);
-        budget::uncharge(&mut self.arena, r.budget, u64::from(f.page_count));
+        let charged = self.unhold(&r, &f);
+        budget::uncharge(&mut self.arena, charged, u64::from(f.page_count));
         Some(f)
     }
 
@@ -4384,13 +4676,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             {
                 self.arena.set_next(prev, next);
             }
+            let charged = self.unhold(&r, &f);
             retire(
                 &mut self.arena,
                 &mut self.pool,
                 &mut self.deferred,
                 cur,
                 &f,
-                r.budget,
+                charged,
                 &mut quiescent,
             );
             // Each pass moves one frame descriptor, so `moved` is below the slot count.
@@ -4688,6 +4981,7 @@ mod tests
             phys_base,
             va,
             region_id: NO_REGION_ID,
+            charge: NODE_NULL,
         }
     }
 
@@ -4863,7 +5157,9 @@ mod tests
         let rec = l.insert_process(7, NodeSpec::TOP).unwrap();
         assert!(l.push_frame(rec, frame(1, 2, 0x1000, UNMAPPED)));
         assert!(l.push_frame(rec, frame(2, 3, 0x8000, UNMAPPED)));
-        let id = l.push_grant(rec, 3, 4, 0x20000, UNMAPPED).unwrap();
+        let id = l
+            .push_grant(rec, 3, 4, 0x20000, UNMAPPED, NODE_NULL)
+            .unwrap();
         // A live process's release of a frame the check refuses leaves the
         // record and parks the frame, out of the pool.
         assert!(l.release_frame_by_region(rec, id, |_| false));
@@ -4899,8 +5195,13 @@ mod tests
     {
         let mut l = ledger();
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
-        let first = l.push_grant(rec, 1, 1, 0x1000, UNMAPPED).unwrap();
-        assert!(l.push_grant(rec, 2, 1, 0x2000, UNMAPPED).is_some());
+        let first = l
+            .push_grant(rec, 1, 1, 0x1000, UNMAPPED, NODE_NULL)
+            .unwrap();
+        assert!(
+            l.push_grant(rec, 2, 1, 0x2000, UNMAPPED, NODE_NULL)
+                .is_some()
+        );
         assert_eq!(l.pop_frame(rec).map(|f| f.cap_slot), Some(2));
         assert!(l.release_frame_by_region(rec, first, pool_all));
         assert!(l.pop_frame(rec).is_none());
@@ -4912,10 +5213,15 @@ mod tests
         let mut l = ledger();
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         let other = l.insert_process(2, NodeSpec::TOP).unwrap();
-        let id = l.push_grant(rec, 1, 4, 0x8000, UNMAPPED).unwrap();
+        let id = l
+            .push_grant(rec, 1, 4, 0x8000, UNMAPPED, NODE_NULL)
+            .unwrap();
         // Records number their grants independently: the same id names
         // another process's grant there.
-        assert_eq!(l.push_grant(other, 3, 8, 0xA000, UNMAPPED), Some(id));
+        assert_eq!(
+            l.push_grant(other, 3, 8, 0xA000, UNMAPPED, NODE_NULL),
+            Some(id)
+        );
         assert!(l.push_frame(rec, frame(2, 16, 0x9000, 0x50_0000)));
         // A demand chunk carries no id, so no release names it.
         assert!(!l.release_frame_by_region(rec, NO_REGION_ID, pool_all));
@@ -4932,11 +5238,15 @@ mod tests
     {
         let mut l = ledger();
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
-        let first = l.push_grant(rec, 1, 1, 0x1000, UNMAPPED).unwrap();
+        let first = l
+            .push_grant(rec, 1, 1, 0x1000, UNMAPPED, NODE_NULL)
+            .unwrap();
         assert!(l.release_frame_by_region(rec, first, pool_all));
         // The same run granted again is a new grant with a new id, so a stale
         // release of the first id leaves it in place.
-        let second = l.push_grant(rec, 1, 1, 0x1000, UNMAPPED).unwrap();
+        let second = l
+            .push_grant(rec, 1, 1, 0x1000, UNMAPPED, NODE_NULL)
+            .unwrap();
         assert_ne!(first, second);
         assert!(!l.release_frame_by_region(rec, first, pool_all));
         assert!(l.release_frame_by_region(rec, second, pool_all));
@@ -4950,14 +5260,17 @@ mod tests
         let mut r = l.record(rec).unwrap();
         r.next_region_id = u64::MAX;
         l.set_record(rec, r);
-        assert_eq!(l.push_grant(rec, 1, 1, 0x1000, UNMAPPED), None);
+        assert_eq!(l.push_grant(rec, 1, 1, 0x1000, UNMAPPED, NODE_NULL), None);
         assert_eq!(l.record(rec), Some(r));
         r.next_region_id = 1;
         l.set_record(rec, r);
         fill_arena(&mut l);
-        assert_eq!(l.push_grant(rec, 1, 1, 0x1000, UNMAPPED), None);
+        assert_eq!(l.push_grant(rec, 1, 1, 0x1000, UNMAPPED, NODE_NULL), None);
         assert_eq!(l.record(rec), Some(r));
-        assert_eq!(l.push_grant(NODE_NULL, 1, 1, 0x1000, UNMAPPED), None);
+        assert_eq!(
+            l.push_grant(NODE_NULL, 1, 1, 0x1000, UNMAPPED, NODE_NULL),
+            None
+        );
     }
 
     #[test]
@@ -4998,7 +5311,8 @@ mod tests
         unsafe { l.arena.add_page() };
         let free = l.arena.free_count();
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
-        l.push_grant(rec, 9, 2, 0x9_0000, UNMAPPED).unwrap();
+        l.push_grant(rec, 9, 2, 0x9_0000, UNMAPPED, NODE_NULL)
+            .unwrap();
         l.add_region(rec, region(BASE, 64 * CHUNK), Commit::Uncommitted)
             .unwrap();
         let reg = l.region_exact(rec, BASE, 64 * CHUNK).unwrap();
@@ -5212,7 +5526,8 @@ mod tests
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         for i in 0..200
         {
-            l.push_grant(rec, i, 1, i * PAGE_SIZE, UNMAPPED).unwrap();
+            l.push_grant(rec, i, 1, i * PAGE_SIZE, UNMAPPED, NODE_NULL)
+                .unwrap();
         }
         // A region of 2^14 chunks: a table of six directory levels.
         let chunks: u64 = 1 << 14;
@@ -5445,7 +5760,9 @@ mod tests
         // A page-table donation is a frame on the record.
         assert!(l.push_frame(rec, frame(5, 4, 0x5_0000, UNMAPPED)));
         assert_eq!(usage(&l, rec), (25, 25));
-        let id = l.push_grant(rec, 6, 8, 0x6_0000, UNMAPPED).unwrap();
+        let id = l
+            .push_grant(rec, 6, 8, 0x6_0000, UNMAPPED, NODE_NULL)
+            .unwrap();
         assert_eq!(usage(&l, rec), (33, 33));
         // Release of a grant, then unregister of the region.
         assert!(l.release_frame_by_region(rec, id, pool_all));
@@ -5453,7 +5770,9 @@ mod tests
         l.remove_region(rec, reg, pool_all).unwrap();
         assert_eq!(usage(&l, rec), (6, 6));
         // A run the check refuses stays charged until a recheck pools it.
-        let id = l.push_grant(rec, 7, 5, 0x7_0000, UNMAPPED).unwrap();
+        let id = l
+            .push_grant(rec, 7, 5, 0x7_0000, UNMAPPED, NODE_NULL)
+            .unwrap();
         assert!(l.release_frame_by_region(rec, id, |_| false));
         assert_eq!(usage(&l, rec), (11, 11));
         l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all);
@@ -5549,7 +5868,10 @@ mod tests
                 },
             )
             .unwrap();
-        assert!(l.push_grant(child, 1, 6, 0x1000, UNMAPPED).is_some());
+        assert!(
+            l.push_grant(child, 1, 6, 0x1000, UNMAPPED, NODE_NULL)
+                .is_some()
+        );
         // The ancestor's max limits the child, which has none of its own.
         assert_eq!(l.admit(child, 4, 0, 0), Ok(()));
         assert_eq!(l.admit(child, 5, 0, 0), Err(ChargeError::Limit));
@@ -5578,7 +5900,8 @@ mod tests
                 })
                 .unwrap();
             let (cap, pages, phys) = grant.entries[0];
-            l.push_grant(rec, cap, pages, phys, UNMAPPED).unwrap();
+            l.push_grant(rec, cap, pages, phys, UNMAPPED, NODE_NULL)
+                .unwrap();
             Ok(())
         };
         assert_eq!(reserve, 10);
@@ -5749,6 +6072,7 @@ mod tests
                 | Node::Object(_)
                 | Node::ZeroFrame(_)
                 | Node::Reclaim(_)
+                | Node::Holder(_)
                 | Node::ChunkDir(_)
                 | Node::Chunk(_) => (),
             }
@@ -7423,6 +7747,199 @@ mod tests
         assert_eq!(limits(&l, 7), [(42, 2), (41, 1)]);
     }
 
+    /// The holder links of the handle state `h`, as (badge, frames).
+    fn holders(l: &Ledger<VecStore, VecWords>, h: NodeIdx) -> Vec<(u64, u64)>
+    {
+        let mut out = Vec::new();
+        let mut cur = l.handle(h).unwrap().holders;
+        while let Node::Holder(hl) = l.arena.get(cur).node
+        {
+            out.push((hl.badge, hl.frames));
+            cur = l.arena.get(cur).next;
+        }
+        out
+    }
+
+    #[test]
+    fn a_charged_grant_lands_on_the_named_node_and_returns_on_release()
+    {
+        let mut l = ledger_with_pool(64);
+        let client = l.insert_process(1, NodeSpec::TOP_RESERVE).unwrap();
+        let server = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let parent = l.record(client).unwrap().budget;
+        let h = l.create_sub_node(client, parent, 8, KEY_A).unwrap();
+        let sub = l.handle(h).unwrap().node;
+        let other = l.create_sub_node(client, parent, 8, KEY_B).unwrap();
+        let other = l.handle(other).unwrap().node;
+
+        let first = l.push_grant(server, 5, 3, 0x5000, UNMAPPED, sub).unwrap();
+        assert_eq!(l.granted_frame(server, first).unwrap().1.charge, sub);
+        // The charge is the node's and its chain's, never the holder's, and
+        // leaves a sibling untouched.
+        assert_eq!(budget::node(&l.arena, sub).unwrap().own, 3);
+        assert_eq!(l.budget(client).unwrap().subtree, 3);
+        assert_eq!(l.budget(server).unwrap().subtree, 0);
+        assert_eq!(budget::node(&l.arena, other).unwrap().subtree, 0);
+        // The node's max admits what it has left and refuses more as a limit.
+        assert_eq!(l.admit_node(sub, 5, 0, 0), Ok(()));
+        assert_eq!(l.admit_node(sub, 6, 0, 0), Err(ChargeError::Limit));
+        assert_eq!(l.admit_node(other, 8, 0, 0), Ok(()));
+        // The growth floor is the named node's: a sub-node is outside the
+        // system reserve, whatever its owner's node is.
+        assert_eq!(l.admit(client, 1, 0, 64), Ok(()));
+        assert_eq!(l.admit_node(sub, 1, 0, 64), Err(ChargeError::Reserve));
+
+        // One link per holder, counting its frames.
+        let second = l.push_grant(server, 6, 2, 0x8000, UNMAPPED, sub).unwrap();
+        assert_eq!(holders(&l, h), [(2, 2)]);
+        assert_eq!(budget::node(&l.arena, sub).unwrap().own, 5);
+
+        assert!(l.release_frame_by_region(server, first, pool_all));
+        assert_eq!(budget::node(&l.arena, sub).unwrap().own, 2);
+        assert_eq!(holders(&l, h), [(2, 1)]);
+        assert_eq!(l.pop_frame(server).map(|f| f.region_id), Some(second));
+        assert_eq!(budget::node(&l.arena, sub).unwrap().own, 0);
+        assert_eq!(l.budget(client).unwrap().subtree, 0);
+        assert_eq!(holders(&l, h), Vec::<(u64, u64)>::new());
+    }
+
+    #[test]
+    fn push_grant_refuses_a_node_without_handle_state_unchanged()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let node = l.record(rec).unwrap().budget;
+        let r = l.record(rec).unwrap();
+        let free = l.arena.free_count();
+        // The record's node has no handle state until one is attached.
+        assert_eq!(l.push_grant(rec, 1, 1, 0x1000, UNMAPPED, node), None);
+        assert_eq!(l.record(rec), Some(r));
+        assert_eq!(l.arena.free_count(), free);
+        assert_eq!(l.budget(rec).unwrap().own, 0);
+    }
+
+    #[test]
+    fn node_release_keeps_the_charge_on_the_node_and_names_each_holder_once()
+    {
+        let mut l = ledger();
+        let client = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let a = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let b = l.insert_process(3, NodeSpec::TOP).unwrap();
+        let unregistered = l.insert_process(4, NodeSpec::TOP).unwrap();
+        let parent = l.record(client).unwrap().budget;
+        let h = l.create_sub_node(client, parent, NO_MAX, KEY_A).unwrap();
+        let sub = l.handle(h).unwrap().node;
+        assert_eq!(l.set_donation_end(a, 50, 4), Ok(0));
+        assert_eq!(l.set_donation_end(b, 60, 8), Ok(0));
+        let a1 = l.push_grant(a, 1, 1, 0x1000, UNMAPPED, sub).unwrap();
+        let a2 = l.push_grant(a, 2, 1, 0x2000, UNMAPPED, sub).unwrap();
+        let b1 = l.push_grant(b, 3, 2, 0x3000, UNMAPPED, sub).unwrap();
+        let u1 = l
+            .push_grant(unregistered, 4, 1, 0x5000, UNMAPPED, sub)
+            .unwrap();
+        let mut seen = Vec::new();
+        l.for_each_donation_end(h, |cap, bits| seen.push((cap, bits)));
+        seen.sort_unstable();
+        assert_eq!(seen, [(50, 4), (60, 8)]);
+
+        // The owner sheds nothing by releasing the node: the charge stays on
+        // it, inside the owner's subtree, until each holder lets go.
+        let free = l.arena.free_count();
+        assert_eq!(l.drop_handle(h), Some(0));
+        // The state's slot and its three holder links.
+        assert_eq!(l.arena.free_count(), free + 4);
+        assert_eq!(l.find_handle(KEY_A), None);
+        assert_eq!(budget::node(&l.arena, sub).unwrap().own, 5);
+        assert_eq!(l.budget(client).unwrap().subtree, 5);
+        for (rec, id) in [(a, a1), (a, a2), (b, b1), (unregistered, u1)]
+        {
+            assert!(l.release_frame_by_region(rec, id, pool_all));
+        }
+        assert!(budget::node(&l.arena, sub).is_none());
+        assert_eq!(l.budget(client).unwrap().subtree, 0);
+    }
+
+    #[test]
+    fn a_charge_outlives_its_nodes_owner_and_returns_at_the_holders_death()
+    {
+        let mut l = ledger();
+        let client = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let server = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let parent = l.record(client).unwrap().budget;
+        let own = l.attach_record_handle(client, KEY_A).unwrap();
+        let h = l.create_sub_node(client, parent, NO_MAX, KEY_B).unwrap();
+        let sub = l.handle(h).unwrap().node;
+        assert_eq!(l.set_donation_end(server, 50, 4), Ok(0));
+        l.push_grant(server, 1, 2, 0x1000, UNMAPPED, sub).unwrap();
+        l.push_grant(server, 2, 3, 0x4000, UNMAPPED, parent)
+            .unwrap();
+        assert_eq!(holders(&l, own), [(2, 1)]);
+        // Each holder of each node the owner's states name, once per state.
+        let mut seen = Vec::new();
+        l.for_each_owned_donation_end(client, |cap, bits| seen.push((cap, bits)));
+        assert_eq!(seen, [(50, 4), (50, 4)]);
+
+        l.remove_process(1, pool_all, |_| {}).unwrap();
+        assert!(!l.key_in_use(KEY_A) && !l.key_in_use(KEY_B));
+        assert_eq!(budget::node(&l.arena, sub).unwrap().own, 2);
+        assert_eq!(budget::node(&l.arena, parent).unwrap().own, 3);
+        assert_eq!(budget::node(&l.arena, parent).unwrap().subtree, 5);
+
+        let mut released = Vec::new();
+        l.remove_process(2, pool_all, |cap| released.push(cap))
+            .unwrap();
+        assert_eq!(released, [50]);
+        assert!(budget::node(&l.arena, sub).is_none());
+        assert!(budget::node(&l.arena, parent).is_none());
+    }
+
+    #[test]
+    fn set_donation_end_replaces_in_place_and_goes_with_its_registrant()
+    {
+        let mut l = ledger();
+        let owner = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let rec = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let parent = l.record(owner).unwrap().budget;
+        let h = l.create_sub_node(owner, parent, NO_MAX, KEY_A).unwrap();
+        assert_eq!(l.set_limit(h, rec, 40, 1), Ok(0));
+        let free = l.arena.free_count();
+        assert_eq!(l.set_donation_end(rec, 50, 4), Ok(0));
+        assert_eq!(l.arena.free_count(), free - 1);
+        assert_eq!(l.set_donation_end(rec, 51, 8), Ok(50));
+        assert_eq!(l.arena.free_count(), free - 1);
+        assert_eq!(l.set_donation_end(NODE_NULL, 52, 8), Err(NodeError::Parent));
+        // A donation-end registration names no handle state; the limit
+        // registration beside it on the list is dropped all the same.
+        let mut released = Vec::new();
+        l.drop_limits(rec, |cap| released.push(cap));
+        released.sort_unstable();
+        assert_eq!(released, [40, 51]);
+        assert_eq!(l.arena.free_count(), free + 1);
+        assert_eq!(l.handle(h).unwrap().limit, NODE_NULL);
+    }
+
+    #[test]
+    fn a_grant_charged_to_another_node_is_never_sealed()
+    {
+        let mut l = ledger();
+        let owner = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let rec = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let parent = l.record(owner).unwrap().budget;
+        let h = l.create_sub_node(owner, parent, NO_MAX, KEY_A).unwrap();
+        let sub = l.handle(h).unwrap().node;
+        let charged = l.push_grant(rec, 1, 1, 0x1000, UNMAPPED, sub).unwrap();
+        let plain = l
+            .push_grant(rec, 2, 1, 0x2000, UNMAPPED, NODE_NULL)
+            .unwrap();
+        assert_eq!(
+            l.seal_object(rec, &[plain, charged], KEY_B, 0x10_0000),
+            Err(SealError::Grants)
+        );
+        assert!(l.granted_frame(rec, charged).is_some());
+        assert!(l.granted_frame(rec, plain).is_some());
+        assert!(!l.key_in_use(KEY_B));
+    }
+
     // Defect guarded: a limit registration filed under the handle state's
     // owner outlives a registrant that is another process, so memmgr's cap
     // keeps that process's Notification, and the memory it was made from,
@@ -8152,7 +8669,8 @@ mod tests
             .map(|_| {
                 let (cap, got, phys) = take(l, pages, crate::Fit::Contiguous);
                 assert_eq!(got, pages);
-                l.push_grant(rec, cap, pages, phys, UNMAPPED).unwrap()
+                l.push_grant(rec, cap, pages, phys, UNMAPPED, NODE_NULL)
+                    .unwrap()
             })
             .collect();
         (rec, ids)

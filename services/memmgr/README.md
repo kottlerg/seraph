@@ -151,8 +151,10 @@ Allocation Contract").
 The full memmgr IPC specification is in
 [`docs/ipc-interface.md`](docs/ipc-interface.md). Key operations:
 
-- `REQUEST_MEMORY_CAPS(want_pages, flags) → memory_caps[..], region_ids[..]` (no physical
-  address; `RIGHTS_MEM_PHYS` only for a phys-class caller)
+- `REQUEST_MEMORY_CAPS(want_pages, flags[, charge_node_handle]) → memory_caps[..], region_ids[..]`
+  (no physical address; `RIGHTS_MEM_PHYS` only for a phys-class caller); with
+  `REQUEST_CHARGE_NODE` the grant is charged to the node of a node handle, full or charge-only,
+  instead of the caller's own
 - `RELEASE_MEMORY_CAPS(region_id[..])` — return granted regions mid-life, named by the
   opaque region ids the grant returned
 - `REGISTER_PROCESS(flags, parent_badge, max[, charge_node_handle])
@@ -178,6 +180,8 @@ The full memmgr IPC specification is in
 - `DELEGATE_ASPACE(child_badge, aspace_cap)` — delegate a demand-paged child's
   address space (procmgr-only)
 - `CREATE_SUB_NODE(max) → max, node_handle` — make a sub-node of the caller's own budget node
+- `REGISTER_DONATION_END(bits, notification_cap)` — register the Notification memmgr signals
+  when the handle state of a node the caller holds grants charged to goes
 - `SEAL_OBJECT(region_id[..]) → pages, object_handle` — seal unmapped grants of the caller into
   an immutable memory object
 - `ATTACH_OBJECT(va, len, prot, first_page, flags[, object_handle])` — attach an object, or the
@@ -190,17 +194,19 @@ The full memmgr IPC specification is in
   request carries, for procmgr's `SNAPSHOT` (procmgr-only)
 - Over a node handle only: `NODE_SET_MAX(max) → max`, `NODE_CREATE(max) → max, node_handle`,
   `NODE_QUERY_USAGE`, `NODE_REGISTER_LIMIT(bits, notification_cap, registrant_send)`,
-  `NODE_SET_RECLAIM(floor, weight) → floor, weight` and `NODE_RELEASE` — set, divide, read and
-  watch the budget node the handle names, set the floor eviction leaves it and the weight that
-  divides eviction between nodes, and drop a sub-node's handle state
+  `NODE_SET_RECLAIM(floor, weight) → floor, weight`, `NODE_RELEASE` and
+  `NODE_CHARGE_HANDLE → charge_only_handle` — set, divide, read and watch the budget node the
+  handle names, set the floor eviction leaves it and the weight that divides eviction between
+  nodes, drop a sub-node's handle state, and derive a charge-only handle, which serves only
+  `NODE_QUERY_USAGE` and `NODE_CHARGE_HANDLE` and charges a grant to the node
 
 ---
 
 ## Sizing constants
 
 memmgr's bookkeeping is RAM-bound, not capped by a constant: free runs,
-process records, their budget nodes and the nodes' reclaim states, node handle states and limit
-registrations, memory
+process records, their budget nodes and the nodes' reclaim states, node handle states, their holder
+links and limit registrations, memory
 objects, per-process region, commitment and frame descriptors, and the regions' chunk-table nodes
 are nodes in a self-hosted metadata arena carved from memmgr's own pool, indexed by `u64` (see
 [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). Records are

@@ -1091,38 +1091,94 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
 }
 
 /// Install `spec`'s link output `cargo_out`, built for `arch`, at `dst`, and
-/// keep the link output in the symbols store as the symbols of its install
-/// path. Every image procmgr loads is installed stripped (`llvm-objcopy
-/// --strip-all`: no symbol table, no DWARF, no `.comment`; its segments, its
-/// notes and its section headers unchanged), since procmgr reads an image
-/// whole through the filesystem to load it; the kernel, under `/boot`, is
-/// installed as linked (docs/build-system.md § Symbols Store).
+/// keep its symbols in the symbols store as those of its install path. Every
+/// image procmgr loads is installed stripped ([`install_stripped`]), since
+/// procmgr reads an image whole through the filesystem to load it; the
+/// kernel, under `/boot`, is installed and kept as linked
+/// (docs/build-system.md § Symbols Store).
 ///
 /// # Errors
 ///
-/// The link output carries no build id, the strip fails or changes the
-/// build id, or a file cannot be read or written.
+/// The link output carries no build id, [`install_stripped`] fails, or a
+/// file cannot be read or written.
 fn install(ctx: &BuildContext, arch: Arch, spec: &Spec, cargo_out: &Path, dst: &Path)
 -> Result<()>
 {
-    let linked = fs::read(cargo_out).with_context(|| format!("reading {}", cargo_out.display()))?;
     let install = format!("/{}", install_relative(spec).display());
-    let kept = Store::at(ctx.symbols_dir()).keep_elf(arch, &install, &linked)?;
+    let store = Store::at(ctx.symbols_dir());
     if matches!(spec.dest, InstallDest::Boot)
     {
+        let linked =
+            fs::read(cargo_out).with_context(|| format!("reading {}", cargo_out.display()))?;
+        store.keep_elf(arch, &install, &linked)?;
         return copy_file(cargo_out, dst);
     }
-    strip(cargo_out, dst)?;
+    let kept = install_stripped(cargo_out, dst)?;
+    store.keep_elf(arch, &install, &kept)?;
+    Ok(())
+}
+
+/// Install the link output `linked` at `dst` stripped, and return the file
+/// the symbols store keeps for it: the link output as `llvm-objcopy` lays it
+/// out, every section kept ([`laid_out`]). The strip ([`strip`]) lays the
+/// segments out the same way, so the kept file's program headers are the
+/// installed image's, which a debugger reading a process or its core finds
+/// at `AT_PHDR` and compares against its executable's before it relocates
+/// the image ([`store::same_program_headers`]).
+///
+/// # Errors
+///
+/// `llvm-objcopy` fails, the strip changes the build id, the kept file's
+/// program headers differ from the installed image's, or a file cannot be
+/// read or written.
+fn install_stripped(linked: &Path, dst: &Path) -> Result<Vec<u8>>
+{
+    let kept = laid_out(linked)?;
+    strip(linked, dst)?;
     let installed = fs::read(dst).with_context(|| format!("reading {}", dst.display()))?;
-    let id = store::build_id(&installed);
-    if id.as_deref().map(store::elf_name).as_deref() != Some(kept.as_str())
+    let (ours, theirs) = (store::build_id(&kept), store::build_id(&installed));
+    if ours != theirs
     {
         bail!(
-            "stripping {} changed its build id: {kept} became {id:?}",
-            cargo_out.display()
+            "stripping {} changed its build id: {ours:?} became {theirs:?}",
+            linked.display()
         );
     }
-    Ok(())
+    if let Err(reason) = store::same_program_headers(&kept, &installed)
+    {
+        bail!(
+            "the symbols store's file of {} cannot stand for its stripped image: {reason}",
+            linked.display()
+        );
+    }
+    Ok(kept)
+}
+
+/// The ELF `src` rewritten by `llvm-objcopy` with no option: every section
+/// kept, the segments laid out as [`strip`] lays them out. lld places
+/// `.comment` between the last `PT_LOAD` and the riscv64
+/// `.riscv.attributes` its `PT_RISCV_ATTRIBUTES` segment covers, and
+/// `llvm-objcopy` places a segment no other contains right after the one
+/// before it, so any rewrite moves that segment's `p_offset`.
+fn laid_out(src: &Path) -> Result<Vec<u8>>
+{
+    let objcopy = find_llvm_objcopy()?;
+    let output = Command::new(&objcopy)
+        .arg(src)
+        .arg("-")
+        .output()
+        .with_context(|| format!("failed to launch {}", objcopy.display()))?;
+    if !output.status.success()
+    {
+        bail!(
+            "{} {} exited with {}: {}",
+            objcopy.display(),
+            src.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
 }
 
 /// Write `src` to `dst` with `llvm-objcopy --strip-all`, which removes the
@@ -1449,6 +1505,142 @@ mod tests
         assert!(stripped.len() < image.len());
         assert!(store::build_id(&image).is_some());
         assert_eq!(store::build_id(&stripped), store::build_id(&image));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A riscv64 position-independent executable laid out as lld lays one
+    /// out: the ELF header, four program headers (`PT_PHDR`, one `PT_LOAD`
+    /// over the headers, the build-id note and `.text`, `PT_NOTE`, and
+    /// `PT_RISCV_ATTRIBUTES`), then `.comment` between the `PT_LOAD`'s end
+    /// and `.riscv.attributes`, then a symbol table.
+    fn linked_pie() -> Vec<u8>
+    {
+        use crate::symbolize::fixture::{FIXTURE_BUILD_ID, build_id_note};
+        fn put(out: &mut Vec<u8>, at: usize, bytes: &[u8])
+        {
+            if out.len() < at + bytes.len()
+            {
+                out.resize(at + bytes.len(), 0);
+            }
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        // (name offset, type, flags, offset, size, link, align, entsize).
+        type Header = (u32, u32, u64, u64, u64, u32, u64, u64);
+        let note = build_id_note(&FIXTURE_BUILD_ID);
+        let (phoff, phnum) = (64u64, 4u16);
+        let note_at = phoff + 56 * u64::from(phnum);
+        let text_at = (note_at + note.len() as u64).next_multiple_of(4);
+        let comment_at = text_at + 0x40;
+        let attributes_at = comment_at + 0x10;
+        let symtab_at = (attributes_at + 0x10).next_multiple_of(8);
+        let strtab_at = symtab_at + 48;
+        let shstrtab_at = strtab_at + 3;
+        let shstrtab = b"\0.note.gnu.build-id\0.text\0.comment\0.riscv.attributes\0.symtab\0.strtab\0.shstrtab\0";
+        let shoff = (shstrtab_at + shstrtab.len() as u64).next_multiple_of(8);
+
+        let mut out = Vec::new();
+        put(&mut out, 0, b"\x7fELF\x02\x01\x01");
+        put(&mut out, 16, &3u16.to_le_bytes()); // ET_DYN
+        put(&mut out, 18, &243u16.to_le_bytes()); // EM_RISCV
+        put(&mut out, 20, &1u32.to_le_bytes());
+        put(&mut out, 24, &text_at.to_le_bytes());
+        put(&mut out, 32, &phoff.to_le_bytes());
+        put(&mut out, 40, &shoff.to_le_bytes());
+        put(&mut out, 52, &64u16.to_le_bytes());
+        put(&mut out, 54, &56u16.to_le_bytes());
+        put(&mut out, 56, &phnum.to_le_bytes());
+        put(&mut out, 58, &64u16.to_le_bytes());
+        put(&mut out, 60, &8u16.to_le_bytes());
+        put(&mut out, 62, &7u16.to_le_bytes());
+        // (type, flags, offset, address, size, align).
+        let segments: [(u32, u32, u64, u64, u64, u64); 4] = [
+            (6, 4, phoff, phoff, 56 * u64::from(phnum), 8),
+            (1, 5, 0, 0, comment_at, 0x1000),
+            (4, 4, note_at, note_at, note.len() as u64, 4),
+            (0x7000_0003, 4, attributes_at, 0, 0x10, 1),
+        ];
+        for (i, (kind, flags, offset, address, size, align)) in segments.into_iter().enumerate()
+        {
+            let at = usize::try_from(phoff).unwrap() + i * 56;
+            put(&mut out, at, &kind.to_le_bytes());
+            put(&mut out, at + 4, &flags.to_le_bytes());
+            for (field, value) in [offset, address, address, size, size, align]
+                .iter()
+                .enumerate()
+            {
+                put(&mut out, at + 8 + field * 8, &value.to_le_bytes());
+            }
+        }
+        put(&mut out, usize::try_from(note_at).unwrap(), &note);
+        put(&mut out, usize::try_from(text_at).unwrap(), &[0x13; 0x40]);
+        put(
+            &mut out,
+            usize::try_from(comment_at).unwrap(),
+            b"Linker: fixture\0",
+        );
+        put(
+            &mut out,
+            usize::try_from(attributes_at).unwrap(),
+            &[0x41; 0x10],
+        );
+        // The null symbol, then `f`, a global function over `.text`.
+        let symbol = usize::try_from(symtab_at).unwrap() + 24;
+        put(&mut out, symbol, &1u32.to_le_bytes());
+        put(&mut out, symbol + 4, &[0x12, 0]);
+        put(&mut out, symbol + 6, &2u16.to_le_bytes());
+        put(&mut out, symbol + 8, &text_at.to_le_bytes());
+        put(&mut out, symbol + 16, &0x40u64.to_le_bytes());
+        put(&mut out, usize::try_from(strtab_at).unwrap(), b"\0f\0");
+        put(&mut out, usize::try_from(shstrtab_at).unwrap(), shstrtab);
+        let sections: [Header; 7] = [
+            (1, 7, 2, note_at, note.len() as u64, 0, 4, 0),
+            (20, 1, 6, text_at, 0x40, 0, 4, 0),
+            (26, 1, 0x30, comment_at, 0x10, 0, 1, 1),
+            (35, 0x7000_0003, 0, attributes_at, 0x10, 0, 1, 0),
+            (53, 2, 0, symtab_at, 48, 6, 8, 24),
+            (61, 3, 0, strtab_at, 3, 0, 1, 0),
+            (69, 3, 0, shstrtab_at, shstrtab.len() as u64, 0, 1, 0),
+        ];
+        let mut at = usize::try_from(shoff).unwrap() + 64;
+        for (name, kind, flags, offset, size, link, align, entsize) in sections
+        {
+            let address = if flags & 2 != 0 { offset } else { 0 };
+            put(&mut out, at, &name.to_le_bytes());
+            put(&mut out, at + 4, &kind.to_le_bytes());
+            put(&mut out, at + 8, &flags.to_le_bytes());
+            put(&mut out, at + 16, &address.to_le_bytes());
+            put(&mut out, at + 24, &offset.to_le_bytes());
+            put(&mut out, at + 32, &size.to_le_bytes());
+            put(&mut out, at + 40, &link.to_le_bytes());
+            put(&mut out, at + 44, &u32::from(kind == 2).to_le_bytes());
+            put(&mut out, at + 48, &align.to_le_bytes());
+            put(&mut out, at + 56, &entsize.to_le_bytes());
+            at += 64;
+        }
+        out
+    }
+
+    /// The file the symbols store keeps for a stripped image has the image's
+    /// program headers and build id and keeps its symbols, where the link
+    /// output's `PT_RISCV_ATTRIBUTES` offset differs from the image's, so a
+    /// debugger comparing them at `AT_PHDR` would not relocate it.
+    #[test]
+    fn the_store_file_of_a_stripped_image_has_its_program_headers()
+    {
+        let dir = std::env::temp_dir().join(format!("seraph-layout-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (linked, installed) = (dir.join("linked"), dir.join("installed"));
+        let image = linked_pie();
+        fs::write(&linked, &image).unwrap();
+        let kept = install_stripped(&linked, &installed).unwrap();
+        let stripped = fs::read(&installed).unwrap();
+        store::same_program_headers(&image, &stripped).unwrap_err();
+        assert_eq!(store::same_program_headers(&kept, &stripped), Ok(()));
+        assert!(store::has_symbols(&kept));
+        assert!(!store::has_symbols(&stripped));
+        assert!(store::build_id(&kept).is_some());
+        assert_eq!(store::build_id(&kept), store::build_id(&stripped));
         fs::remove_dir_all(&dir).unwrap();
     }
 

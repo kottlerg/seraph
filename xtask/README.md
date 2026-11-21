@@ -106,8 +106,10 @@ existing sysroot is an error — run `cargo xtask clean` first (per
 
 The build installs every image under `services/`, `programs/` and `tests/` stripped
 (`llvm-objcopy --strip-all`: no symbol table, no DWARF), and the kernel and the bootloader as
-linked. It keeps the unstripped link output of every installed image in the symbols store
-`symbols/`, beside `sysroot/`, as `<build-id>.elf` with a manifest, and the x86-64 bootloader's PDB
+linked. It keeps the link output of every installed image, its symbols and DWARF with it, in the
+symbols store `symbols/`, beside `sysroot/`, as `<build-id>.elf` with a manifest (a stripped
+image's laid out as the strip lays it out, so the two have the same program headers, which the
+build checks), and the x86-64 bootloader's PDB
 as `<GUID><age>.pdb` ([docs/build-system.md](../docs/build-system.md#symbols-store) § Symbols
 Store).
 

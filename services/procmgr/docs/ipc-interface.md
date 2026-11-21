@@ -368,9 +368,10 @@ creator holds: the request carries a copy of the handle as a cap of its own, aft
 and before the argv/env cap and the relay, and the child's node is made under the handle's node in
 place of the creator's, clamped as above to what that node and every ancestor have left. The
 child's node is outside the reserve: procmgr refuses `CREATE_RESERVE` with the flag, and a charged
-child of the un-badged creator is no reserve node. Two
-children charged to one sub-node share its budget. procmgr passes the handle to memmgr with
-`REGISTER_CHARGE_NODE`
+child of the un-badged creator is no reserve node. A
+charge-only handle is not accepted: memmgr refuses `REGISTER_PROCESS` under it and procmgr
+replies `OUT_OF_MEMORY`. Two children charged to one sub-node share its budget. procmgr passes the
+handle to memmgr with `REGISTER_CHARGE_NODE`
 ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 3), which
 refuses a cap that is no live node handle, and procmgr then fails the create as it does for any
 refused registration. procmgr deletes its copy on every path: memmgr

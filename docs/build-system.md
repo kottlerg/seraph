@@ -468,6 +468,18 @@ symbols/
                       # CodeView record of /boot/boot.efi
 ```
 
+The store file of an image installed stripped is its link output rewritten by `llvm-objcopy` with
+no option: every section kept, and the segments laid out as the strip lays them out, so its
+program headers are byte-identical to the installed image's. A debugger relocating a
+position-independent executable compares the program headers it reads at the auxiliary vector's
+`AT_PHDR`, in the process's memory or a core's copy of the image's first page, against its
+executable's, and applies no displacement when they differ. The link output's own would differ
+on riscv64: lld places `.comment` between the last `PT_LOAD` and the `.riscv.attributes`
+section the `PT_RISCV_ATTRIBUTES` segment covers, and any `llvm-objcopy` rewrite moves that
+segment up to the `PT_LOAD`'s end. The build fails when a store file's program headers or build
+id differ from its stripped image's. The kernel's and the bootloader's store files are their link
+output, as the kernel is installed.
+
 The store holds the files of the images installed now: a rebuild of an image replaces its file.
 No pack reads it, and `cargo xtask clean` removes it with the sysroot.
 

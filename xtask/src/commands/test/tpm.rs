@@ -19,7 +19,7 @@
 //! with the default boot set and a repacked `disk.img`, and `swtpm` on the
 //! host.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,7 @@ use crate::qemu::{
     Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, Tpm, TpmInterface,
     X86Paging, X86ShadowStack, build_qemu_argv_with_tpm, validate_sysroot_for_launch,
 };
+use crate::socket_dir::SocketDir;
 use crate::util::{require_tool, step};
 
 /// The TPM driver's line once its first `READ` is answered with bytes.
@@ -163,21 +164,10 @@ fn launch(
         .args(&qemu_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .context("spawning qemu-system-x86_64")?;
     Ok(Guest::from_child(child)?.holding(vars))
-}
-
-/// The state directory and control socket of the emulator behind
-/// `interface`'s boot, under `work_dir`.
-fn emulator_paths(work_dir: &Path, interface: TpmInterface) -> (PathBuf, PathBuf)
-{
-    let name = interface.device();
-    (
-        work_dir.join(format!("{name}-state")),
-        work_dir.join(format!("{name}.sock")),
-    )
 }
 
 pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
@@ -191,12 +181,14 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
     let work_dir = ctx.target_dir.join("xtask").join("tpm");
     std::fs::create_dir_all(&work_dir)
         .with_context(|| format!("creating {}", work_dir.display()))?;
+    // Declared before the emulators and guests, so it is removed after them.
+    let sockets = SocketDir::create()?;
 
     for interface in [TpmInterface::Fifo, TpmInterface::Crb]
     {
         let device = interface.device();
-        let (state, socket) = emulator_paths(&work_dir, interface);
-        let _ = std::fs::remove_file(&socket);
+        let state = work_dir.join(format!("{device}-state"));
+        let socket = sockets.socket(&format!("{device}.sock"))?;
         step(&format!(
             "tpm test: {device} boot, waiting for the driver's READ and entropyd"
         ));
@@ -214,7 +206,6 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
         );
         guest.shutdown();
         drop(emulator);
-        let _ = std::fs::remove_file(&socket);
         seen.with_context(|| format!("{device} boot"))?;
     }
 

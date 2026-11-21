@@ -81,6 +81,7 @@ use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::disk::{DataPlacement, DiskLayout};
 use crate::error::{Context as _, Result, bail};
+use crate::guest::{QemuStderr, explain_exit};
 use crate::qemu::{
     EDU_DMA_MASK, Firmware, GdbMode, HOTPLUG_DISK_PORT_ID, HOTPLUG_PORT_ID, HotplugControl,
     HotplugPort, Iommu, PORT_DISK_ID, PortDisk, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr,
@@ -88,6 +89,7 @@ use crate::qemu::{
     validate_sysroot_for_launch,
 };
 use crate::qmp::{self, Property};
+use crate::socket_dir::SocketDir;
 use crate::util::{require_tool, step};
 
 /// The fixture's recipe for the device boots, as `cargo xtask build`
@@ -407,11 +409,9 @@ fn boot(
 {
     let firmware = Firmware::prepare(ctx, args.arch)?;
     let vars = firmware.launch_vars()?;
-    let sock_dir = ctx.target_dir.join("xtask");
-    std::fs::create_dir_all(&sock_dir)
-        .with_context(|| format!("creating {}", sock_dir.display()))?;
-    let sock_path = sock_dir.join("hotplug-test-qmp.sock");
-    let _ = std::fs::remove_file(&sock_path);
+    // Removed on every return, after QEMU is reaped below.
+    let sockets = SocketDir::create()?;
+    let sock_path = sockets.socket("hotplug.qmp")?;
     let disk_path = ctx.disk_image();
     let spec = QemuLaunchSpec {
         arch: args.arch,
@@ -455,17 +455,18 @@ fn boot(
         .args(&qemu_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
+    let mut stderr = QemuStderr::take(&mut child);
     let result = child
         .stdout
         .take()
         .context("QEMU stdout unavailable")
-        .and_then(|stdout| check(&mut Lines::read(stdout), &sock_path));
+        .and_then(|stdout| check(&mut Lines::read(stdout), &sock_path))
+        .map_err(|e| explain_exit(e, &mut child, stderr.as_mut()));
     let _ = child.kill();
     let _ = child.wait();
-    let _ = std::fs::remove_file(&sock_path);
     result
 }
 

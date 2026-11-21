@@ -22,12 +22,9 @@
 //! in Phase 1, long before the harness runs, so the test does not depend on
 //! ktest completing.
 
-use std::io::BufReader;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use crate::error::{Context as _, Result, bail};
 
@@ -35,6 +32,7 @@ use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::esp::{Knob, remove_knob, stage_knob};
+use crate::guest::Guest;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
     Firmware, GdbMode, Iommu, QemuLaunchSpec, SecondDisk, build_qemu_argv,
@@ -63,128 +61,71 @@ struct Layout
     dm_base: u64,
 }
 
-struct Guest
+/// Launch QEMU on the current images, with the variable store
+/// `firmware_vars` and the second disk `data_image` when the layout has one.
+fn launch(
+    qemu_binary: &Path,
+    ctx: &Context,
+    args: &CaseArgs,
+    firmware_code: &Path,
+    firmware_vars: &Path,
+    data_image: Option<&Path>,
+) -> Result<Guest>
 {
-    child: Child,
-    lines: mpsc::Receiver<String>,
-    reader: Option<thread::JoinHandle<()>>,
+    let disk_path = ctx.disk_image();
+    let spec = QemuLaunchSpec {
+        arch: args.arch,
+        disk_path: &disk_path,
+        disk_block_size: crate::disk::logical_block_size(&disk_path)?,
+        second_disk: data_image.map(SecondDisk::of_image).transpose()?,
+        firmware_code_path: firmware_code,
+        firmware_vars_path: firmware_vars,
+        smm: false,
+        cpus: args.cpus,
+        threads_per_core: 1,
+        mem_mib: args.mem,
+        display: QemuDisplay::Headless,
+        gdb: GdbMode::Off,
+        qmp_socket: None,
+        // x86-64 launches exercise the snapshot-reseed consumer by default;
+        // irrelevant to KASLR but harmless.
+        vmgenid_guid: if args.arch == Arch::X86_64
+        {
+            Some("auto")
+        }
+        else
+        {
+            None
+        },
+        incoming: None,
+        riscv_mmu: args.riscv_mmu,
+        riscv_zkr: crate::qemu::RiscvZkr::On,
+        x86_paging: args.x86_paging,
+        x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
+        iommu: Iommu::Attached,
+        debug_port: None,
+        test_devices: false,
+        hotplug_port: None,
+    };
+    let qemu_args = build_qemu_argv(&spec)?;
+
+    let child = Command::new(qemu_binary)
+        .args(&qemu_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {}", qemu_binary.display()))?;
+    Guest::from_child(child)
 }
 
-impl Guest
+/// Echo serial lines until one contains `KASLR_MARKER`, parse it, and
+/// return the layout; fail after `timeout`.
+fn scrape_layout(guest: &mut Guest, timeout: Duration) -> Result<Layout>
 {
-    fn launch(
-        qemu_binary: &Path,
-        ctx: &Context,
-        args: &CaseArgs,
-        firmware_code: &Path,
-        firmware_vars: &Path,
-        data_image: Option<&Path>,
-    ) -> Result<Self>
-    {
-        let disk_path = ctx.disk_image();
-        let spec = QemuLaunchSpec {
-            arch: args.arch,
-            disk_path: &disk_path,
-            disk_block_size: crate::disk::logical_block_size(&disk_path)?,
-            second_disk: data_image.map(SecondDisk::of_image).transpose()?,
-            firmware_code_path: firmware_code,
-            firmware_vars_path: firmware_vars,
-            smm: false,
-            cpus: args.cpus,
-            threads_per_core: 1,
-            mem_mib: args.mem,
-            display: QemuDisplay::Headless,
-            gdb: GdbMode::Off,
-            qmp_socket: None,
-            // x86-64 launches exercise the snapshot-reseed consumer by default;
-            // irrelevant to KASLR but harmless.
-            vmgenid_guid: if args.arch == Arch::X86_64
-            {
-                Some("auto")
-            }
-            else
-            {
-                None
-            },
-            incoming: None,
-            riscv_mmu: args.riscv_mmu,
-            riscv_zkr: crate::qemu::RiscvZkr::On,
-            x86_paging: args.x86_paging,
-            x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
-            iommu: Iommu::Attached,
-            debug_port: None,
-            test_devices: false,
-            hotplug_port: None,
-        };
-        let qemu_args = build_qemu_argv(&spec)?;
-
-        let mut child = Command::new(qemu_binary)
-            .args(&qemu_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("spawning {}", qemu_binary.display()))?;
-        let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
-
-        let (tx, rx) = mpsc::channel::<String>();
-        let reader = thread::spawn(move || {
-            let buf = BufReader::new(stdout);
-            for line in std::io::BufRead::lines(buf)
-            {
-                let Ok(l) = line
-                else
-                {
-                    break;
-                };
-                if tx.send(l).is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        Ok(Self {
-            child,
-            lines: rx,
-            reader: Some(reader),
-        })
-    }
-
-    /// Echo serial lines until one contains `KASLR_MARKER`, parse it, and
-    /// return the layout; fail after `timeout`.
-    fn scrape_layout(&mut self, timeout: Duration) -> Result<Layout>
-    {
-        let start = Instant::now();
-        loop
-        {
-            let remaining = timeout.saturating_sub(start.elapsed());
-            if remaining.is_zero()
-            {
-                bail!("timed out waiting for the kaslr line");
-            }
-            let Ok(line) = self.lines.recv_timeout(remaining)
-            else
-            {
-                bail!("serial stream ended before the kaslr line");
-            };
-            println!("{line}");
-            if let Some(layout) = parse_kaslr_line(&line)
-            {
-                return Ok(layout);
-            }
-        }
-    }
-
-    fn shutdown(mut self)
-    {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(r) = self.reader.take()
-        {
-            let _ = r.join();
-        }
-    }
+    let lines = guest.collect_until(KASLR_MARKER, timeout)?;
+    let line = lines.last().context("no serial line")?;
+    parse_kaslr_line(line).with_context(|| format!("the kaslr line does not parse: {line}"))
 }
 
 /// Parse `… kaslr: slide=0x… image_base=0x… dm_base=0x…` into a [`Layout`].
@@ -228,7 +169,7 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
         step(&format!("kaslr test: {label}"));
         // Removed when the scrape returns, after the guest is shut down.
         let vars = firmware.launch_vars()?;
-        let mut guest = Guest::launch(
+        let mut guest = launch(
             &qemu_binary,
             ctx,
             args,
@@ -236,7 +177,7 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
             vars.path(),
             data_image.as_deref(),
         )?;
-        let res = guest.scrape_layout(TIMEOUT);
+        let res = scrape_layout(&mut guest, TIMEOUT);
         guest.shutdown();
         res.with_context(|| label.to_string())
     };

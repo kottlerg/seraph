@@ -7,15 +7,132 @@
 //! output: over QMP, the VMGENID snapshot-resume test and the ACPI table
 //! capture; over the gdbstub, the interrupts-off wedge test and the CET
 //! shadow-stack test.
+//!
+//! It also holds what every harness that spawns QEMU reports when QEMU exits
+//! under it ([`QemuStderr`], [`explain_exit`]): a QEMU that refuses its
+//! command line exits before the first serial line, and the harness's own
+//! error (a marker that never came, a stream that ended) does not name why.
 
+use std::collections::VecDeque;
 use std::io::BufReader;
 use std::process::Child;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::error::{Context as _, Result, bail};
+use crate::error::{Context as _, Error, Result, bail};
 use crate::qemu::LaunchVars;
+
+/// How long [`explain_exit`] waits for QEMU to exit. A stream that ended is
+/// QEMU exiting, which takes it well under this; a QEMU still running past it
+/// failed the harness some other way.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// The most lines of QEMU's stderr [`explain_exit`] quotes: QEMU's refusal
+/// of its command line is one, and a longer stderr is on the terminal.
+const STDERR_TAIL: usize = 10;
+
+/// QEMU's stderr, piped: echoed to the host's stderr as it arrives, as an
+/// inherited stderr would be, with its last [`STDERR_TAIL`] lines kept for
+/// [`explain_exit`].
+pub struct QemuStderr
+{
+    tail: Arc<Mutex<VecDeque<String>>>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+
+impl QemuStderr
+{
+    /// Take `child`'s stderr and start the thread that reads it; `None`
+    /// when the stderr was not piped (inherited, a file, or null).
+    pub fn take(child: &mut Child) -> Option<Self>
+    {
+        let stderr = child.stderr.take()?;
+        let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL)));
+        let kept = Arc::clone(&tail);
+        let reader = thread::spawn(move || {
+            for line in std::io::BufRead::lines(BufReader::new(stderr))
+            {
+                let Ok(l) = line
+                else
+                {
+                    break;
+                };
+                eprintln!("{l}");
+                let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+                if kept.len() == STDERR_TAIL
+                {
+                    kept.pop_front();
+                }
+                kept.push_back(l);
+            }
+        });
+        Some(Self {
+            tail,
+            reader: Some(reader),
+        })
+    }
+
+    /// Join the reader, which returns at the stream's end once QEMU has
+    /// exited, and return the lines kept, oldest first.
+    fn finish(&mut self) -> Vec<String>
+    {
+        if let Some(r) = self.reader.take()
+        {
+            let _ = r.join();
+        }
+        self.tail
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+/// `err`, a harness's failure while `child` (QEMU) ran, with QEMU's exit
+/// added as its context when QEMU exits within [`EXIT_GRACE`]: the exit
+/// status and, from `stderr` when QEMU's stderr was piped, its last lines,
+/// which name why QEMU stopped (a socket path it refused, a device it
+/// lacks). `err` is returned unchanged when QEMU still runs, since its
+/// failure is then the harness's own.
+pub fn explain_exit(err: Error, child: &mut Child, stderr: Option<&mut QemuStderr>) -> Error
+{
+    explain_exit_within(err, child, stderr, EXIT_GRACE)
+}
+
+/// [`explain_exit`], waiting at most `grace` for the exit.
+fn explain_exit_within(
+    err: Error,
+    child: &mut Child,
+    stderr: Option<&mut QemuStderr>,
+    grace: Duration,
+) -> Error
+{
+    let start = Instant::now();
+    let status = loop
+    {
+        match child.try_wait()
+        {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() < grace => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => return err,
+            Err(e) => return err.context(format!("waiting for QEMU's exit failed: {e}")),
+        }
+    };
+    let tail = stderr.map_or_default(QemuStderr::finish);
+    if tail.is_empty()
+    {
+        err.context(format!("QEMU exited ({status})"))
+    }
+    else
+    {
+        err.context(format!(
+            "QEMU exited ({status}); its stderr ends:\n{}",
+            tail.join("\n")
+        ))
+    }
+}
 
 /// One QEMU instance and the thread reading its serial output.
 ///
@@ -31,6 +148,8 @@ pub struct Guest
     child: Child,
     lines: mpsc::Receiver<String>,
     reader: Option<thread::JoinHandle<()>>,
+    /// QEMU's stderr, when the child's was piped.
+    stderr: Option<QemuStderr>,
     /// Declared last: dropped after `Drop::drop` has reaped QEMU.
     vars: Option<LaunchVars>,
 }
@@ -59,10 +178,15 @@ impl Guest
         {
             let _ = r.join();
         }
+        if let Some(stderr) = self.stderr.as_mut()
+        {
+            stderr.finish();
+        }
     }
 
     /// Wrap a spawned child whose stdout is piped, starting the thread that
-    /// reads its serial lines.
+    /// reads its serial lines, and the one that reads its stderr when that is
+    /// piped too ([`QemuStderr`]).
     ///
     /// # Errors
     ///
@@ -98,6 +222,7 @@ impl Guest
         });
 
         Ok(Self {
+            stderr: QemuStderr::take(&mut child),
             child,
             lines: rx,
             reader: Some(reader),
@@ -173,8 +298,9 @@ impl Guest
     }
 
     /// The next serial line, echoed, waiting at most `remaining`; the error
-    /// names the `markers` still awaited.
-    fn next_line(&self, remaining: Duration, markers: &[&str]) -> Result<String>
+    /// names the `markers` still awaited, and QEMU's exit when the stream
+    /// ended with it ([`explain_exit`]).
+    fn next_line(&mut self, remaining: Duration, markers: &[&str]) -> Result<String>
     {
         if remaining.is_zero()
         {
@@ -183,7 +309,8 @@ impl Guest
         let Ok(line) = self.lines.recv_timeout(remaining)
         else
         {
-            bail!("serial stream ended waiting for markers: {markers:?}");
+            let err = crate::error::err!("serial stream ended waiting for markers: {markers:?}");
+            return Err(explain_exit(err, &mut self.child, self.stderr.as_mut()));
         };
         println!("{line}");
         Ok(line)
@@ -345,6 +472,53 @@ mod tests
         guest
             .collect_until("d", Duration::from_millis(200))
             .unwrap_err();
+    }
+
+    /// A stand-in for a QEMU that refuses its command line: `script` run by
+    /// `sh`, its stdout and stderr piped.
+    fn exiting(script: &str) -> Guest
+    {
+        let child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        Guest::from_child(child).unwrap()
+    }
+
+    // Defect caught: a QEMU that exits before its first serial line reported
+    // as a marker that never came, without its exit or its refusal.
+    #[test]
+    fn a_guest_that_exits_before_a_marker_is_reported_with_its_status_and_stderr()
+    {
+        let mut guest = exiting("echo 'UNIX socket path is too long' >&2; exit 3");
+        let err = guest
+            .wait_for_any(&["READY"], Duration::from_secs(30))
+            .unwrap_err();
+        let report = format!("{err:#}");
+        assert!(report.contains("exit status: 3"), "{report}");
+        assert!(report.contains("UNIX socket path is too long"), "{report}");
+        assert!(report.contains("READY"), "{report}");
+    }
+
+    // Defect caught: a harness failure while QEMU still runs (its own
+    // timeout, a refused request) reported as an exit.
+    #[test]
+    fn a_failure_while_qemu_runs_is_left_as_it_is()
+    {
+        // The stand-in cannot exit while the test holds its stdin.
+        let mut child = stand_in(Stdio::null());
+        let err = explain_exit_within(
+            crate::error::err!("no answer"),
+            &mut child,
+            None,
+            Duration::ZERO,
+        );
+        assert_eq!(format!("{err:#}"), "no answer");
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

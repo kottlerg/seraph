@@ -64,6 +64,7 @@ use crate::qemu::{
     X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::{Span, Stub, field_hex, function_path, stop_thread};
+use crate::socket_dir::SocketDir;
 use crate::util::{require_tool, step};
 
 /// The kernel's line once shadow stacks are on (`kernel_entry_post_rebase`).
@@ -397,11 +398,9 @@ fn ktest_boot(ctx: &Context, args: &CaseArgs) -> Result<Attempt>
 /// Boot 2: corrupt a `dispatch` return address and expect the `#CP`.
 fn corrupt_boot(ctx: &Context, args: &CaseArgs, dispatch: Span) -> Result<Attempt>
 {
-    let sock = ctx
-        .target_dir
-        .join("xtask")
-        .join(format!("cet-{}.gdb", std::process::id()));
-    let _ = std::fs::remove_file(&sock);
+    // Declared before the launch, so it is removed after QEMU is reaped.
+    let sockets = SocketDir::create()?;
+    let sock = sockets.socket("cet.gdb")?;
     step(&format!(
         "Launching QEMU for the CET corruption boot (gdbstub on {})",
         sock.display()
@@ -446,7 +445,6 @@ fn corrupt_boot(ctx: &Context, args: &CaseArgs, dispatch: Span) -> Result<Attemp
     })();
     let stderr = run.stderr.clone();
     run.guest.shutdown();
-    let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_file(stderr);
     result
 }

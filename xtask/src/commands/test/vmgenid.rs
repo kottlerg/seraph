@@ -43,6 +43,7 @@ use crate::qemu::{
     build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qmp;
+use crate::socket_dir::SocketDir;
 use crate::util::{require_tool, step};
 
 /// Kernel line proving VGIA discovery reached the entropy subsystem.
@@ -125,7 +126,7 @@ fn launch(
         .args(&qemu_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .context("spawning qemu-system-x86_64")?;
     Ok(Guest::from_child(child)?.holding(vars))
@@ -141,13 +142,13 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
     let work_dir = ctx.target_dir.join("xtask");
     std::fs::create_dir_all(&work_dir)
         .with_context(|| format!("creating {}", work_dir.display()))?;
-    let sock_a = work_dir.join("vmgenid-a-qmp.sock");
-    let sock_b = work_dir.join("vmgenid-b-qmp.sock");
+    // Declared before the guests, so it is removed after their QEMUs are
+    // reaped.
+    let sockets = SocketDir::create()?;
+    let sock_a = sockets.socket("vmgenid-a.qmp")?;
+    let sock_b = sockets.socket("vmgenid-b.qmp")?;
     let state_path = work_dir.join("vmgenid-state.bin");
-    for p in [&sock_a, &sock_b, &state_path]
-    {
-        let _ = std::fs::remove_file(p);
-    }
+    let _ = std::fs::remove_file(&state_path);
 
     // Built before boot A so a path the URI cannot carry fails up front.
     let incoming = qmp::exec_restore_uri(&state_path)?;
@@ -180,10 +181,6 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
     let live = guest_b.wait_for_markers(&[CHILD_LINE], TIMEOUT);
     guest_b.shutdown();
     let _ = std::fs::remove_file(&state_path);
-    for p in [&sock_a, &sock_b]
-    {
-        let _ = std::fs::remove_file(p);
-    }
     live.context("post-resume liveness round")?;
 
     step("vmgenid snapshot-resume test: PASS (detection + post-resume liveness)");

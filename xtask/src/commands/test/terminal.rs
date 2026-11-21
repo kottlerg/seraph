@@ -52,6 +52,7 @@ use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::debug_stub;
+use crate::guest::{QemuStderr, explain_exit};
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
     Firmware, GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
@@ -59,6 +60,7 @@ use crate::qemu::{
 };
 use crate::qemu_gdb::Stub;
 use crate::qmp;
+use crate::socket_dir::SocketDir;
 use crate::util::{require_tool, step};
 
 /// Marker the guest `terminal` prints once it holds every driver cap and the
@@ -181,11 +183,9 @@ fn boot(ctx: &Context, args: &CaseArgs) -> Result<()>
     let vars = firmware.launch_vars()?;
 
     let disk_path = ctx.disk_image();
-    let sock_dir = ctx.target_dir.join("xtask");
-    std::fs::create_dir_all(&sock_dir)
-        .with_context(|| format!("creating {}", sock_dir.display()))?;
-    let sock_path = sock_dir.join("terminal-test-qmp.sock");
-    let _ = std::fs::remove_file(&sock_path);
+    // Removed on every return, after QEMU is reaped below.
+    let sockets = SocketDir::create()?;
+    let sock_path = sockets.socket("terminal.qmp")?;
     let debug_port = crate::util::debug_port_or_free(None)?;
 
     let spec = QemuLaunchSpec {
@@ -221,9 +221,10 @@ fn boot(ctx: &Context, args: &CaseArgs) -> Result<()>
         .args(&qemu_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
+    let mut stderr = QemuStderr::take(&mut child);
 
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     // QEMU stdin feeds the guest UART receive path (`-serial stdio` is
@@ -258,28 +259,18 @@ fn boot(ctx: &Context, args: &CaseArgs) -> Result<()>
         transcript: String::new(),
         stub: None,
     };
-    let driven = test.drive(&rx);
+    let driven = test
+        .drive(&rx)
+        .and_then(|()| test.passed())
+        .map_err(|e| explain_exit(e, &mut child, stderr.as_mut()));
 
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
-    let _ = std::fs::remove_file(&sock_path);
 
     driven?;
-    if test.round == Round::Passed
-    {
-        step("terminal interactive test: PASS (keyboard + serial input, input driver restart)");
-        return Ok(());
-    }
-    let saw_child = test.transcript.contains(CHILD_LINE);
-    let saw_prompt = test.transcript.contains(PROMPT);
-    let saw_echo = is_subsequence(&test.transcript, ECHO_SUBSEQUENCE);
-    bail!(
-        "terminal interactive test: incomplete within {}s (failed at {}; \
-         prompt={saw_prompt}, child output={saw_child}, local echo={saw_echo})",
-        TIMEOUT.as_secs(),
-        test.round.name()
-    )
+    step("terminal interactive test: PASS (keyboard + serial input, input driver restart)");
+    Ok(())
 }
 
 /// One boot's test: its inputs, and where it stands.
@@ -301,6 +292,25 @@ struct Test<'a>
 
 impl Test<'_>
 {
+    /// Whether the rounds passed; the error names the round that did not
+    /// and what its transcript shows.
+    fn passed(&self) -> Result<()>
+    {
+        if self.round == Round::Passed
+        {
+            return Ok(());
+        }
+        let saw_child = self.transcript.contains(CHILD_LINE);
+        let saw_prompt = self.transcript.contains(PROMPT);
+        let saw_echo = is_subsequence(&self.transcript, ECHO_SUBSEQUENCE);
+        bail!(
+            "terminal interactive test: incomplete within {}s (failed at {}; \
+             prompt={saw_prompt}, child output={saw_child}, local echo={saw_echo})",
+            TIMEOUT.as_secs(),
+            self.round.name()
+        )
+    }
+
     /// Take serial lines from `rx` until the rounds pass, the stream ends, or
     /// [`TIMEOUT`] passes. An error is a failed injection or stub request.
     fn drive(&mut self, rx: &mpsc::Receiver<String>) -> Result<()>

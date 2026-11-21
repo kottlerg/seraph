@@ -34,6 +34,7 @@ use crate::qemu::{
     X86ShadowStack, build_qemu_argv,
 };
 use crate::qmp;
+use crate::socket_dir::SocketDir;
 use crate::util::{require_tool, step};
 
 /// vCPUs and RAM of the capture, those of the tree's default boot: the
@@ -145,18 +146,12 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
     let work = ctx.target_dir.join("xtask").join("capture-acpi").join(name);
     fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     let disk = work.join("blank.img");
-    // Beside `work`, not in it: a UNIX socket's path is under 108 bytes.
-    // One per configuration, as `work` is, so captures of two
-    // configurations run side by side never reach each other's QEMU.
-    let sock = ctx
-        .target_dir
-        .join("xtask")
-        .join(format!("acpi-{name}.sock"));
+    // Removed when the capture returns, after QEMU has exited; one per
+    // process, so captures run side by side never reach each other's QEMU.
+    let sockets = SocketDir::create()?;
+    let sock = sockets.socket(&format!("acpi-{name}.qmp"))?;
     let dump = work.join("memory.bin");
-    for p in [&sock, &dump]
-    {
-        let _ = fs::remove_file(p);
-    }
+    let _ = fs::remove_file(&dump);
     fs::File::create(&disk)
         .and_then(|f| f.set_len(BLANK_DISK_BYTES))
         .with_context(|| format!("creating {}", disk.display()))?;
@@ -226,7 +221,7 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
         argv: redact(&qemu_args, &host_paths),
     };
     let written = write_fixtures(&out, &tables, &launch)?;
-    for p in [&dump, &sock, &disk]
+    for p in [&dump, &disk]
     {
         let _ = fs::remove_file(p);
     }
@@ -254,7 +249,7 @@ fn save_ram(
         .args(qemu_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", qemu_binary.display()))?;
     // Every `?` below drops the live `Guest`, which kills and reaps its QEMU.

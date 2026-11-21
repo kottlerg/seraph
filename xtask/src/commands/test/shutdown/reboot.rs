@@ -32,11 +32,13 @@ use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::disk::DiskLayout;
+use crate::guest::{QemuStderr, explain_exit};
 use crate::qemu::{
     Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
     X86Paging, X86ShadowStack, build_qemu_argv,
 };
 use crate::qmp;
+use crate::socket_dir::SocketDir;
 use crate::util::{require_tool, step};
 
 /// The fixture's recipe, as `cargo xtask build` installs it under
@@ -99,13 +101,10 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
 {
     let firmware = Firmware::prepare(ctx, args.arch)?;
     let vars = firmware.launch_vars()?;
-    let sock_dir = ctx.target_dir.join("xtask");
-    std::fs::create_dir_all(&sock_dir)
-        .with_context(|| format!("creating {}", sock_dir.display()))?;
-    // Per architecture, so the two architectures' runs side by side never
-    // reach each other's QEMU.
-    let sock = sock_dir.join(format!("reboot-test-{}.sock", args.arch));
-    let _ = std::fs::remove_file(&sock);
+    // Removed on every return, after QEMU is reaped below; one per run, so
+    // runs side by side never reach each other's QEMU.
+    let sockets = SocketDir::create()?;
+    let sock = sockets.socket("reboot.qmp")?;
     let disk_path = ctx.disk_image();
     let data_image = layout.second_image(ctx);
     let spec = QemuLaunchSpec {
@@ -144,9 +143,10 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
         .args(&qemu_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
+    let mut stderr = QemuStderr::take(&mut child);
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
 
     let seen = Arc::new(Mutex::new(Seen::default()));
@@ -170,13 +170,14 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
         })
     };
 
-    // Connected right after the spawn, long before the guest can reset.
-    let reason = qmp::wait_shutdown(&sock, BOOT_TIMEOUT);
+    // Connected right after the spawn, long before the guest can reset. A
+    // QEMU that exits before its `SHUTDOWN` event fails the wait.
+    let reason = qmp::wait_shutdown(&sock, BOOT_TIMEOUT)
+        .map_err(|e| explain_exit(e, &mut child, stderr.as_mut()));
     let exited = wait_exit(&mut child, EXIT_TIMEOUT);
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
-    let _ = std::fs::remove_file(&sock);
     let seen = seen
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

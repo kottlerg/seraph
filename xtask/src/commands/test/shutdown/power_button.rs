@@ -36,6 +36,7 @@ use crate::qemu::{
     X86ShadowStack, build_qemu_argv,
 };
 use crate::qmp;
+use crate::socket_dir::SocketDir;
 use crate::util::{require_tool, step};
 
 /// acpid's line once the events are armed. Kept in sync with
@@ -76,11 +77,9 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     let qemu_binary = require_tool(Arch::X86_64.qemu_binary())?;
-    let sock_dir = ctx.target_dir.join("xtask");
-    std::fs::create_dir_all(&sock_dir)
-        .with_context(|| format!("creating {}", sock_dir.display()))?;
-    let sock = sock_dir.join("powerbutton-test.sock");
-    let _ = std::fs::remove_file(&sock);
+    // Declared before the guest, so it is removed after QEMU is reaped.
+    let sockets = SocketDir::create()?;
+    let sock = sockets.socket("power-button.qmp")?;
 
     step("power-button test: booting, waiting for the events to be armed");
     // Every `?` below drops the live `Guest`, which kills and reaps its QEMU
@@ -103,7 +102,6 @@ pub(super) fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
         .context("the press")
         .and_then(|()| judge(&reason?))
         .and_then(|()| guest.wait_exit(EXIT_TIMEOUT));
-    let _ = std::fs::remove_file(&sock);
     verdict?;
     step("power-button test: PASS (the press powered the machine off)");
     Ok(())
@@ -145,7 +143,7 @@ fn launch(qemu_binary: &Path, ctx: &Context, args: &CaseArgs, sock: &Path) -> Re
         .args(&qemu_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .context("spawning qemu-system-x86_64")?;
     Ok(Guest::from_child(child)?.holding(vars))

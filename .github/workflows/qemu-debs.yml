@@ -3,7 +3,7 @@
 
 # .github/workflows/qemu-debs.yml
 
-# The QEMU and firmware package download the boot jobs install from.
+# Seeds the QEMU and firmware package cache the boot jobs install from.
 
 name: qemu-debs
 
@@ -11,46 +11,17 @@ name: qemu-debs
 # § Continuous Integration.
 on:
   workflow_call:
-    outputs:
-      key:
-        description: Cache key of the downloaded QEMU and firmware packages
-        value: ${{ jobs.qemu-debs.outputs.key }}
 
 jobs:
   qemu-debs:
-    # Pinned with the booting jobs' image; see docs/build-system.md
+    # The booting jobs' runner label; see docs/build-system.md
     # § Continuous Integration.
     runs-on: ubuntu-26.04
     timeout-minutes: 25
-    outputs:
-      key: ${{ steps.key.outputs.key }}
     steps:
       - uses: actions/checkout@v6
 
-      - name: Compute cache key
-        id: key
+      - name: Seed the QEMU and firmware package entries
         uses: ./.github/actions/qemu-packages
         with:
-          mode: key
-
-      - name: Look up cached packages
-        id: cache
-        uses: actions/cache/restore@v6
-        with:
-          path: qemu-debs
-          key: ${{ steps.key.outputs.key }}
-          lookup-only: true
-
-      - name: Download QEMU and firmware packages
-        if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/qemu-packages
-        with:
-          mode: download
-          dir: qemu-debs
-
-      - name: Save packages
-        if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: qemu-debs
-          key: ${{ steps.key.outputs.key }}
+          mode: cache

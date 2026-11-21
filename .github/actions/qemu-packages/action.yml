@@ -11,47 +11,38 @@ description: >-
   QEMU and firmware packages for the CI jobs that boot under QEMU, and
   dosfstools, whose fsck.fat every disk-image pack runs, with the Secure
   Boot case's host tools and its riscv64 firmware: the install list, the
-  cache key, the bounded download, the offline install with its network
-  fallback, and the checked extraction of the firmware. The mechanism is
-  specified in docs/build-system.md § Continuous Integration.
+  two cache entries (the `.deb` set of one runner image, and the firmware
+  package, which no image changes), the bounded download, the offline
+  install with its network fallback, and the checked extraction of the
+  firmware. The mechanism is specified in docs/build-system.md
+  § Continuous Integration.
 
 inputs:
   mode:
     description: >-
-      `key` outputs the cache key; `download` fetches the packages into
-      `dir`; `install` installs them from `dir`, downloading them into
-      `dir` first when the offline install fails.
+      `cache` makes the cache hold the `.deb` set of this job's runner
+      image and the firmware package, downloading and saving each entry
+      that is absent; `install` restores both entries, installs the set
+      offline, downloads the set (and the firmware package only when its
+      entry is absent or does not match the pin) when the restored set is
+      absent or does not install, and saves each entry it had to fill.
     required: true
-  dir:
-    description: >-
-      Directory of the downloaded `.deb` set and firmware package
-      (`download` and `install`).
-    required: false
-    default: ''
-
-outputs:
-  key:
-    description: Cache key of the downloaded packages (`key` mode).
-    value: ${{ steps.key.outputs.key }}
 
 runs:
   using: composite
   steps:
     - name: Check the inputs
       if: >-
-        !contains(fromJSON('["key", "download", "install"]'), inputs.mode)
-        || (inputs.mode != 'key' && inputs.dir == '')
+        !contains(fromJSON('["cache", "install"]'), inputs.mode)
       shell: sh
       env:
         MODE: ${{ inputs.mode }}
-        DIR: ${{ inputs.dir }}
       run: |
-        echo "::error::usage: mode key | download (with dir) | install (with dir); got mode '$MODE', dir '$DIR'"
+        echo "::error::usage: mode cache | install; got mode '$MODE'"
         exit 2
 
-    - name: Compute the cache key
-      id: key
-      if: inputs.mode == 'key'
+    - name: Name the packages, the apt flags and the cache keys
+      id: apt
       shell: sh
       env:
         # This file holds the install list and the apt flags; its hash
@@ -59,69 +50,84 @@ runs:
         ACTION_HASH: ${{ hashFiles('.github/actions/qemu-packages/action.yml') }}
       run: |
         : "${ImageOS:?}" "${ImageVersion:?}" "${ACTION_HASH:?}"
-        echo "key=qemu-debs-$ImageOS-$ImageVersion-$(echo "$ACTION_HASH" | cut -c1-16)" >> "$GITHUB_OUTPUT"
-
-    - name: Name the packages and the apt flags
-      id: apt
-      if: inputs.mode != 'key'
-      shell: sh
-      run: |
+        # The riscv64 Secure Boot firmware: Ubuntu's qemu-efi-riscv64 is
+        # built without Secure Boot, Arch's edk2-riscv64 with it
+        # (docs/build-system.md § QEMU and Firmware). Pinned by version
+        # and SHA-256, checked before anything is extracted.
+        sb_sha256=333c3404edaabd26a95c4cc7dc3f38eb361be75fb34d71da73319ac51418a4c1
         {
           echo 'packages=qemu-system-x86 qemu-system-riscv ovmf qemu-efi-riscv64 dosfstools sbsigntool openssl python3-virt-firmware'
           echo 'flags=-y --no-install-recommends'
           echo 'offline=-o Dir::Etc::SourceList=/dev/null -o Dir::Etc::SourceParts=-'
-          # The riscv64 Secure Boot firmware: Ubuntu's qemu-efi-riscv64 is
-          # built without Secure Boot, Arch's edk2-riscv64 with it
-          # (docs/build-system.md § QEMU and Firmware). Pinned by version
-          # and SHA-256, checked before anything is extracted.
           echo 'sb_riscv_pkg=edk2-riscv64-202608-1-any.pkg.tar.zst'
           echo 'sb_riscv_url=https://archive.archlinux.org/packages/e/edk2-riscv64/edk2-riscv64-202608-1-any.pkg.tar.zst'
-          echo 'sb_riscv_sha256=333c3404edaabd26a95c4cc7dc3f38eb361be75fb34d71da73319ac51418a4c1'
+          echo "sb_riscv_sha256=$sb_sha256"
+          # The .deb set resolves against the installed packages of the
+          # image it was downloaded on, so its key names that image. The
+          # firmware package is the same file on every image, so its key
+          # names only the pinned hash.
+          echo "debs_key=qemu-debs-$ImageOS-$ImageVersion-$(echo "$ACTION_HASH" | cut -c1-16)"
+          echo "firmware_key=qemu-firmware-$(echo "$sb_sha256" | cut -c1-16)"
         } >> "$GITHUB_OUTPUT"
+
+    # `cache` only looks the entries up; `install` restores them.
+    - name: Restore the .deb set of this runner image
+      id: debs
+      uses: actions/cache/restore@v6
+      with:
+        path: qemu-debs
+        key: ${{ steps.apt.outputs.debs_key }}
+        lookup-only: ${{ inputs.mode == 'cache' }}
+
+    - name: Restore the firmware package
+      id: firmware
+      uses: actions/cache/restore@v6
+      with:
+        path: qemu-firmware
+        key: ${{ steps.apt.outputs.firmware_key }}
+        lookup-only: ${{ inputs.mode == 'cache' }}
 
     - name: Install offline
       id: offline
       if: inputs.mode == 'install'
       shell: sh
       env:
-        DIR: ${{ inputs.dir }}
         FLAGS: ${{ steps.apt.outputs.flags }}
         OFFLINE: ${{ steps.apt.outputs.offline }}
-      # The same install as the last step's, which must stay in step with
-      # it. Its failure is recorded in the `ok` output, not as a failed step,
-      # so a run the fallback recovers carries only the warning.
+      # The same install as the "Install offline after the download"
+      # step's, which must stay in step with it. Its failure is recorded in
+      # the `ok` output, not as a failed step, so the fallback can recover
+      # it.
       run: |
-        if ls "$DIR"/*.deb > /dev/null 2>&1 &&
-            sudo apt-get install $FLAGS $OFFLINE "$(realpath "$DIR")"/*.deb; then
+        if ls qemu-debs/*.deb > /dev/null 2>&1 &&
+            sudo apt-get install $FLAGS $OFFLINE "$(realpath qemu-debs)"/*.deb; then
             echo ok=true >> "$GITHUB_OUTPUT"
         else
             echo ok=false >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Fall back to the network
-      if: inputs.mode == 'install' && steps.offline.outputs.ok == 'false'
+    - name: Download the .deb set
+      if: >-
+        (inputs.mode == 'cache' && steps.debs.outputs.cache-hit != 'true')
+        || steps.offline.outputs.ok == 'false'
       shell: sh
       env:
-        DIR: ${{ inputs.dir }}
-      run: |
-        echo "::warning::offline install from $DIR failed; downloading from the network"
-        sudo rm -rf "$DIR"
-
-    - name: Download
-      if: inputs.mode == 'download' || steps.offline.outputs.ok == 'false'
-      shell: sh
-      env:
-        DIR: ${{ inputs.dir }}
+        MODE: ${{ inputs.mode }}
+        HIT: ${{ steps.debs.outputs.cache-hit }}
+        KEY: ${{ steps.apt.outputs.debs_key }}
         PACKAGES: ${{ steps.apt.outputs.packages }}
         FLAGS: ${{ steps.apt.outputs.flags }}
-        SB_PKG: ${{ steps.apt.outputs.sb_riscv_pkg }}
-        SB_URL: ${{ steps.apt.outputs.sb_riscv_url }}
-        SB_SHA256: ${{ steps.apt.outputs.sb_riscv_sha256 }}
+      # Only the .deb set: the firmware package lives in its own entry and
+      # directory, which this step leaves alone.
       run: |
-        mkdir -p "$DIR/partial"
-        curl -fsSL --retry 3 --max-time 300 -o "$DIR/$SB_PKG" "$SB_URL"
-        echo "$SB_SHA256  $DIR/$SB_PKG" | sha256sum -c -
-        debs=$(realpath "$DIR")
+        if [ "$HIT" = true ] && [ "$MODE" = install ]; then
+            echo "::warning::the restored set of $KEY did not install offline; downloading it from the network"
+        elif [ "$MODE" = install ]; then
+            echo "::notice::no cache entry $KEY for this runner image; downloading the .deb set from the network"
+        fi
+        sudo rm -rf qemu-debs
+        mkdir -p qemu-debs/partial
+        debs=$(realpath qemu-debs)
         fetch="apt-get update && apt-get install $FLAGS --download-only \
             -o Dir::Cache::Archives=$debs $PACKAGES"
         # Download-only under the timeout: killing apt mid-dpkg would leave
@@ -133,25 +139,65 @@ runs:
             sudo timeout 1200 sh -c "$fetch"
         fi
         sudo rm -rf "$debs/partial" "$debs/lock"
-        ls -l "$debs"/*.deb "$debs/$SB_PKG"
+        ls -l "$debs"/*.deb
 
     - name: Install offline after the download
       if: steps.offline.outputs.ok == 'false'
       shell: sh
       env:
-        DIR: ${{ inputs.dir }}
         FLAGS: ${{ steps.apt.outputs.flags }}
         OFFLINE: ${{ steps.apt.outputs.offline }}
       # The same install as the "Install offline" step's.
       run: |
-        ls "$DIR"/*.deb > /dev/null 2>&1
-        sudo apt-get install $FLAGS $OFFLINE "$(realpath "$DIR")"/*.deb
+        ls qemu-debs/*.deb > /dev/null 2>&1
+        sudo apt-get install $FLAGS $OFFLINE "$(realpath qemu-debs)"/*.deb
+
+    - name: Check or fetch the firmware package
+      # `install` checks the restored package against the pin and keeps
+      # it; the package is fetched from the pinned URL only when it is
+      # absent or its hash differs. `cache` fetches it only when its entry
+      # is absent.
+      if: inputs.mode == 'install' || steps.firmware.outputs.cache-hit != 'true'
+      shell: sh
+      env:
+        SB_PKG: ${{ steps.apt.outputs.sb_riscv_pkg }}
+        SB_URL: ${{ steps.apt.outputs.sb_riscv_url }}
+        SB_SHA256: ${{ steps.apt.outputs.sb_riscv_sha256 }}
+      run: |
+        pkg="qemu-firmware/$SB_PKG"
+        if [ -f "$pkg" ] && echo "$SB_SHA256  $pkg" | sha256sum -c -; then
+            echo "keeping the restored $SB_PKG"
+            exit 0
+        fi
+        echo "::warning::$SB_PKG is absent or does not match the pinned SHA-256; fetching it from $SB_URL"
+        rm -rf qemu-firmware
+        mkdir -p qemu-firmware
+        curl -fsSL --retry 3 --max-time 300 -o "$pkg" "$SB_URL"
+        echo "$SB_SHA256  $pkg" | sha256sum -c -
+
+    # A save runs only for an entry the restore missed, after its content
+    # is in place (and, in `install`, after the set installed), so an
+    # entry holds only a set that installed on its image or a package
+    # that matched the pin. Cells of one image that miss together each
+    # try to save; the first save wins and the others end with a warning.
+    - name: Save the .deb set of this runner image
+      if: steps.debs.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: qemu-debs
+        key: ${{ steps.apt.outputs.debs_key }}
+
+    - name: Save the firmware package
+      if: steps.firmware.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: qemu-firmware
+        key: ${{ steps.apt.outputs.firmware_key }}
 
     - name: Extract the riscv64 Secure Boot firmware
       if: inputs.mode == 'install'
       shell: sh
       env:
-        DIR: ${{ inputs.dir }}
         SB_PKG: ${{ steps.apt.outputs.sb_riscv_pkg }}
         SB_SHA256: ${{ steps.apt.outputs.sb_riscv_sha256 }}
       # Checked against the pinned hash before tar reads it; a mismatch
@@ -160,10 +206,10 @@ runs:
       # `SERAPH_RISCV_SECURE_VARS` (docs/build-system.md § QEMU and
       # Firmware).
       run: |
-        echo "$SB_SHA256  $DIR/$SB_PKG" | sha256sum -c -
+        echo "$SB_SHA256  qemu-firmware/$SB_PKG" | sha256sum -c -
         out="$RUNNER_TEMP/edk2-riscv64-secure"
         mkdir -p "$out"
-        tar --zstd -xf "$DIR/$SB_PKG" -C "$out" \
+        tar --zstd -xf "qemu-firmware/$SB_PKG" -C "$out" \
             usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd \
             usr/share/edk2/riscv64/RISCV_VIRT_VARS.fd
         {

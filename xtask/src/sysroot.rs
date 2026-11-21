@@ -29,7 +29,7 @@ const HARNESS_FILE: &str = ".harness";
 
 /// Record `harness` as the one whose bundle every later pack composes
 /// (`crate::disk::create_disk_image`): `build` records the init harness,
-/// `compose-bundle` the one it is given.
+/// `mkdisk --harness` the one it is given.
 ///
 /// # Errors
 ///
@@ -60,7 +60,7 @@ pub fn recorded_harness(ctx: &BuildContext) -> Result<Harness>
     };
     Harness::parse(text.trim()).map_err(|e| {
         crate::error::err!(
-            "{} names no harness ({e}): run `cargo xtask compose-bundle --harness <h>`",
+            "{} names no harness ({e}): run `cargo xtask mkdisk --harness <h>`",
             path.display()
         )
     })
@@ -637,7 +637,7 @@ mod tests
     }
 
     // Defect caught: a pack that composes another harness's bundle than the
-    // one `build` or `compose-bundle` chose, or an unreadable record taken
+    // one `build` or `mkdisk --harness` chose, or an unreadable record taken
     // for the init harness, which would sign and boot the wrong `init`.
     #[test]
     fn the_recorded_harness_is_the_last_one_recorded_and_init_by_default()

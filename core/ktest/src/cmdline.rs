@@ -11,7 +11,7 @@
 //! on completion, and shutdown is immediate. To preserve QEMU for
 //! interactive inspection (or trim the tier set for a focused run),
 //! edit [`KtestConfig::DEFAULT`], run `cargo xtask build --component ktest`,
-//! then `cargo xtask compose-bundle --harness ktest` so the boot bundle
+//! then `cargo xtask mkdisk --harness ktest` so the boot bundle
 //! carries the rebuilt binary.
 
 /// When to perform system shutdown after tests complete. `Pass` and

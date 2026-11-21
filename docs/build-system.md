@@ -43,6 +43,13 @@ they are `qemu-user`, `gcc-riscv64-linux-gnu` and `libc6-dev-riscv64-cross`; on 
 `qemu-user`, `riscv64-linux-gnu-gcc` and `riscv64-linux-gnu-glibc`. The command fails, naming
 them, when one is missing.
 
+Every pack of a disk image (`cargo xtask build`'s, `cargo xtask mkdisk`'s, and each test's that
+repacks) checks the images it wrote with `fsck.fat` from dosfstools
+([xtask/README.md](../xtask/README.md#the-image-check) § The image check), and so do the image
+check's host tests that `cargo xtask test` runs, so both need the `dosfstools` package on the host
+(the same name on Debian, Ubuntu, Fedora, Arch, Homebrew and FreeBSD). A pack fails, naming it,
+when `fsck.fat` is missing.
+
 `cargo xtask symbolize` reads DWARF and symbol tables in Rust, with the `addr2line` and `object`
 crates the toolchain's sysroot ships ([coding-standards.md](coding-standards.md#dependencies)
 § Dependencies), so symbolizing needs no host tool beyond the toolchain. Debugging a guest
@@ -295,7 +302,7 @@ one architecture at a time; the active architecture is recorded in
 `sysroot/.arch`. Switching architectures requires a clean rebuild. The harness
 whose bundle every pack composes, `init` or `ktest`, is recorded in
 `sysroot/.harness`: `cargo xtask build` records `init`, and
-`cargo xtask compose-bundle` the harness it is given.
+`cargo xtask mkdisk --harness` the harness it is given.
 
 ```
 sysroot/
@@ -620,17 +627,17 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages, `cargo xtask test`, which checks the formatting of the Rust source and lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`, `crasher-worker`, `crasher-boot`, `memhog` and `stopsrc` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, checks the staged images with `check-disk` (each FAT volume with `fsck.fat -n`, then that every object on the ESP equals its installed file on the root partition), and runs one `run --runs 1` boot with `--save-logs`, under a per-cell `--timeout`, svctest's with `--crash-reports none` and usertest's with `--crash-reports reports`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes, which a pass taking more than half its budget flags with a warning annotation on the run; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, and usertest cells run `test-log-level`, then re-mirror the default boot (`mkdisk`) and run `test-terminal`, `test-wedge`, `test-reboot`, `test-core-death` and `test-signing`, plus `test-vmgenid` and `test-powerbutton` on x86_64. |
-| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages and dosfstools, `cargo xtask test`, which checks the formatting of the Rust source and lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`, `crasher-worker`, `crasher-boot`, `memhog` and `stopsrc` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `mkdisk --harness ktest`, each pack checking the images it writes (each FAT volume with `fsck.fat -n`, then that every object on the ESP equals its installed file on the root partition), and runs one `run --runs 1` boot with `--save-logs`, under a per-cell `--timeout`, svctest's with `--crash-reports none` and usertest's with `--crash-reports reports`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes, which a pass taking more than half its budget flags with a warning annotation on the run; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, and usertest cells run `test-log-level`, then re-mirror the default boot (`mkdisk`) and run `test-terminal`, `test-wedge`, `test-reboot`, `test-core-death` and `test-signing`, plus `test-vmgenid` and `test-powerbutton` on x86_64. |
+| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `mkdisk --harness ktest`), then burns it in with `run --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
 | `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
-| `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses each and the archive of its build's symbols store (§ Symbols Store) with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
+| `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, installing zstd and the dosfstools whose `fsck.fat` the build's pack runs, compresses each and the archive of its build's symbols store (§ Symbols Store) with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
 
 The jobs that boot under QEMU (`validate` in `build-test.yml` and `burnin`
 in `burnin.yml`) install it and run on the pinned `ubuntu-26.04` runner
 image, whose archive ships `qemu-system-riscv64` in the `qemu-system-riscv`
 package (QEMU 10.2). The composite action
 `.github/actions/qemu-packages/action.yml` holds the install list (QEMU,
-its firmware, and dosfstools, whose `fsck.fat` `check-disk` runs) and the
+its firmware, and dosfstools, whose `fsck.fat` every pack runs) and the
 apt flags (no recommends) once; its `mode` input selects the cache key, the
 download, or the install, and the download and install calls pass the
 package directory as its `dir` input. Every booting cell `needs:` its

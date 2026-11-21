@@ -10700,7 +10700,7 @@ UnknownArgument
 error: unexpected argument '--file' found
 
 ["mkdisk"]
-ok-all mkdisk arch=default["x86_64"] repack_only=default no_kaslr=default block_size=default["512"] split_data=default
+ok-all mkdisk arch=default["x86_64"] repack_only=default block_size=default["512"] split_data=default
 
 ["mkdisk","-h"]
 help xtask mkdisk -h
@@ -10799,20 +10799,21 @@ error: unexpected value 'true' for '--repack-only' found; no more were expected
 TooManyValues
 error: unexpected value 'false' for '--repack-only' found; no more were expected
 
+["mkdisk","--knob","nokaslr"]
+ok mkdisk knob=["nokaslr"]
+
 ["mkdisk","--no-kaslr"]
-ok mkdisk no_kaslr
+UnknownArgument
+error: unexpected argument '--no-kaslr' found
 
-["mkdisk","--no-kaslr","--no-kaslr"]
-ArgumentConflict
-error: the argument '--no-kaslr' cannot be used multiple times
+["mkdisk","--knob","nokaslr","--knob","nokaslr"]
+ok mkdisk knob=["nokaslr","nokaslr"]
 
-["mkdisk","--no-kaslr","--no-kaslr=true"]
-TooManyValues
-error: unexpected value 'true' for '--no-kaslr' found; no more were expected
+["mkdisk","--knob","nokaslr","--knob=nokaslr"]
+ok mkdisk knob=["nokaslr","nokaslr"]
 
-["mkdisk","--no-kaslr=false"]
-TooManyValues
-error: unexpected value 'false' for '--no-kaslr' found; no more were expected
+["mkdisk","--knob=nokaslr"]
+ok mkdisk knob=["nokaslr"]
 
 ["mkdisk","--block-size"]
 InvalidValue
@@ -10885,8 +10886,8 @@ error: unexpected value 'false' for '--split-data' found; no more were expected
 ["mkdisk","--arch","x86_64","--repack-only"]
 ok mkdisk arch=["x86_64"] repack_only
 
-["mkdisk","--arch","x86_64","--no-kaslr"]
-ok mkdisk arch=["x86_64"] no_kaslr
+["mkdisk","--arch","x86_64","--knob","nokaslr"]
+ok mkdisk arch=["x86_64"] knob=["nokaslr"]
 
 ["mkdisk","--arch","x86_64","--block-size","512"]
 ok mkdisk arch=["x86_64"] block_size=["512"]
@@ -10897,8 +10898,8 @@ ok mkdisk arch=["x86_64"] split_data
 ["mkdisk","--repack-only","--arch","x86_64"]
 ok mkdisk arch=["x86_64"] repack_only
 
-["mkdisk","--repack-only","--no-kaslr"]
-ok mkdisk repack_only no_kaslr
+["mkdisk","--repack-only","--knob","nokaslr"]
+ok mkdisk repack_only knob=["nokaslr"]
 
 ["mkdisk","--repack-only","--block-size","512"]
 ok mkdisk repack_only block_size=["512"]
@@ -10906,17 +10907,17 @@ ok mkdisk repack_only block_size=["512"]
 ["mkdisk","--repack-only","--split-data"]
 ok mkdisk repack_only split_data
 
-["mkdisk","--no-kaslr","--arch","x86_64"]
-ok mkdisk arch=["x86_64"] no_kaslr
+["mkdisk","--knob","nokaslr","--arch","x86_64"]
+ok mkdisk arch=["x86_64"] knob=["nokaslr"]
 
-["mkdisk","--no-kaslr","--repack-only"]
-ok mkdisk repack_only no_kaslr
+["mkdisk","--knob","nokaslr","--repack-only"]
+ok mkdisk repack_only knob=["nokaslr"]
 
-["mkdisk","--no-kaslr","--block-size","512"]
-ok mkdisk no_kaslr block_size=["512"]
+["mkdisk","--knob","nokaslr","--block-size","512"]
+ok mkdisk knob=["nokaslr"] block_size=["512"]
 
-["mkdisk","--no-kaslr","--split-data"]
-ok mkdisk no_kaslr split_data
+["mkdisk","--knob","nokaslr","--split-data"]
+ok mkdisk knob=["nokaslr"] split_data
 
 ["mkdisk","--block-size","512","--arch","x86_64"]
 ok mkdisk arch=["x86_64"] block_size=["512"]
@@ -10924,8 +10925,8 @@ ok mkdisk arch=["x86_64"] block_size=["512"]
 ["mkdisk","--block-size","512","--repack-only"]
 ok mkdisk repack_only block_size=["512"]
 
-["mkdisk","--block-size","512","--no-kaslr"]
-ok mkdisk no_kaslr block_size=["512"]
+["mkdisk","--block-size","512","--knob","nokaslr"]
+ok mkdisk knob=["nokaslr"] block_size=["512"]
 
 ["mkdisk","--block-size","512","--split-data"]
 ok mkdisk block_size=["512"] split_data
@@ -10936,193 +10937,112 @@ ok mkdisk arch=["x86_64"] split_data
 ["mkdisk","--split-data","--repack-only"]
 ok mkdisk repack_only split_data
 
-["mkdisk","--split-data","--no-kaslr"]
-ok mkdisk no_kaslr split_data
+["mkdisk","--split-data","--knob","nokaslr"]
+ok mkdisk knob=["nokaslr"] split_data
 
 ["mkdisk","--split-data","--block-size","512"]
 ok mkdisk block_size=["512"] split_data
 
-["mkdisk","--arch","x86_64","--repack-only","--no-kaslr","--block-size","512","--split-data"]
-ok mkdisk arch=["x86_64"] repack_only no_kaslr block_size=["512"] split_data
+["mkdisk","--arch","x86_64","--repack-only","--knob","nokaslr","--block-size","512","--split-data"]
+ok mkdisk arch=["x86_64"] repack_only knob=["nokaslr"] block_size=["512"] split_data
 
 ["check-disk"]
-ok-all check-disk
-
-["check-disk","-h"]
-help xtask check-disk -h
-
-["check-disk","--help"]
-help xtask check-disk -h
-
-["check-disk","bogus"]
-UnknownArgument
-error: unexpected argument 'bogus' found
-
-["check-disk","--bogus"]
-UnknownArgument
-error: unexpected argument '--bogus' found
-
-["check-disk","--","x"]
-UnknownArgument
-error: unexpected argument 'x' found
-
-["check-disk","-h","bogus"]
-help xtask check-disk -h
-
-["check-disk","bogus","-h"]
-UnknownArgument
-error: unexpected argument 'bogus' found
-
-["help","check-disk"]
-help xtask check-disk -h
-
-["help","check-disk","-h"]
 InvalidSubcommand
-error: unrecognized subcommand '-h'
+error: unrecognized subcommand 'check-disk'
 
 ["compose-bundle"]
-ok-all compose-bundle arch=default["x86_64"] harness=default["init"]
-
-["compose-bundle","-h"]
-help xtask compose-bundle -h
-
-["compose-bundle","--help"]
-help xtask compose-bundle --help
-
-["compose-bundle","bogus"]
-UnknownArgument
-error: unexpected argument 'bogus' found
-
-["compose-bundle","--bogus"]
-UnknownArgument
-error: unexpected argument '--bogus' found
-
-["compose-bundle","--","x"]
-UnknownArgument
-error: unexpected argument 'x' found
-
-["compose-bundle","-h","bogus"]
-help xtask compose-bundle -h
-
-["compose-bundle","bogus","-h"]
-UnknownArgument
-error: unexpected argument 'bogus' found
-
-["help","compose-bundle"]
-help xtask compose-bundle --help
-
-["help","compose-bundle","-h"]
 InvalidSubcommand
-error: unrecognized subcommand '-h'
+error: unrecognized subcommand 'compose-bundle'
 
-["compose-bundle","--arch"]
-InvalidValue
-error: a value is required for '--arch <ARCH>' but none was supplied
-  [possible values: x86_64, riscv64]
-
-["compose-bundle","--arch","7"]
-InvalidValue
-error: invalid value '7' for '--arch <ARCH>'
-  [possible values: x86_64, riscv64]
-
-["compose-bundle","--arch","-1"]
-UnknownArgument
-error: unexpected argument '-1' found
-
-["compose-bundle","--arch","x86_64"]
-ok compose-bundle arch=["x86_64"]
-
-["compose-bundle","--arch",""]
-InvalidValue
-error: a value is required for '--arch <ARCH>' but none was supplied
-  [possible values: x86_64, riscv64]
-
-["compose-bundle","--arch","--"]
-InvalidValue
-error: a value is required for '--arch <ARCH>' but none was supplied
-  [possible values: x86_64, riscv64]
-
-["compose-bundle","--arch=--"]
-InvalidValue
-error: invalid value '--' for '--arch <ARCH>'
-  [possible values: x86_64, riscv64]
-
-["compose-bundle","--arch","--x"]
-UnknownArgument
-error: unexpected argument '--x' found
-
-["compose-bundle","--arch=--x"]
-InvalidValue
-error: invalid value '--x' for '--arch <ARCH>'
-  [possible values: x86_64, riscv64]
-
-["compose-bundle","--arch","7","--arch","7"]
-InvalidValue
-error: invalid value '7' for '--arch <ARCH>'
-  [possible values: x86_64, riscv64]
-
-["compose-bundle","--arch","x86_64","--arch","x86_64"]
-ArgumentConflict
-error: the argument '--arch <ARCH>' cannot be used multiple times
-
-["compose-bundle","--harness"]
+["mkdisk","--harness"]
 InvalidValue
 error: a value is required for '--harness <HARNESS>' but none was supplied
   [possible values: init, ktest]
 
-["compose-bundle","--harness","7"]
+["mkdisk","--harness","7"]
 InvalidValue
 error: invalid value '7' for '--harness <HARNESS>'
   [possible values: init, ktest]
 
-["compose-bundle","--harness","-1"]
+["mkdisk","--harness","-1"]
 UnknownArgument
 error: unexpected argument '-1' found
 
-["compose-bundle","--harness",""]
+["mkdisk","--harness",""]
 InvalidValue
 error: a value is required for '--harness <HARNESS>' but none was supplied
   [possible values: init, ktest]
 
-["compose-bundle","--harness","--"]
+["mkdisk","--harness","--"]
 InvalidValue
 error: a value is required for '--harness <HARNESS>' but none was supplied
   [possible values: init, ktest]
 
-["compose-bundle","--harness=--"]
+["mkdisk","--harness=--"]
 InvalidValue
 error: invalid value '--' for '--harness <HARNESS>'
   [possible values: init, ktest]
 
-["compose-bundle","--harness","--x"]
+["mkdisk","--harness","--x"]
 UnknownArgument
 error: unexpected argument '--x' found
 
-["compose-bundle","--harness=--x"]
+["mkdisk","--harness=--x"]
 InvalidValue
 error: invalid value '--x' for '--harness <HARNESS>'
   [possible values: init, ktest]
 
-["compose-bundle","--harness","init"]
-ok compose-bundle harness=["init"]
+["mkdisk","--harness","init"]
+ok mkdisk harness=["init"]
 
-["compose-bundle","--harness","ktest"]
-ok compose-bundle harness=["ktest"]
+["mkdisk","--harness","ktest"]
+ok mkdisk harness=["ktest"]
 
-["compose-bundle","--harness","7","--harness","7"]
+["mkdisk","--harness","7","--harness","7"]
 InvalidValue
 error: invalid value '7' for '--harness <HARNESS>'
   [possible values: init, ktest]
 
-["compose-bundle","--harness","init","--harness","init"]
+["mkdisk","--harness","init","--harness","init"]
 ArgumentConflict
 error: the argument '--harness <HARNESS>' cannot be used multiple times
 
-["compose-bundle","--arch","x86_64","--harness","init"]
-ok compose-bundle arch=["x86_64"] harness=["init"]
+["mkdisk","--arch","x86_64","--harness","init"]
+ok mkdisk arch=["x86_64"] harness=["init"]
 
-["compose-bundle","--harness","init","--arch","x86_64"]
-ok compose-bundle arch=["x86_64"] harness=["init"]
+["mkdisk","--harness","init","--arch","x86_64"]
+ok mkdisk arch=["x86_64"] harness=["init"]
+
+["mkdisk","--knob","mapredo,nokaslr"]
+ok mkdisk knob=["mapredo","nokaslr"]
+
+["mkdisk","--knob","nokaslr","--knob","mapredo"]
+ok mkdisk knob=["nokaslr","mapredo"]
+
+["mkdisk","--knob","bogus"]
+InvalidValue
+error: invalid value 'bogus' for '--knob <KNOB>'
+  [possible values: nokaslr, mapredo]
+
+["mkdisk","--knob"]
+InvalidValue
+error: a value is required for '--knob <KNOB>' but none was supplied
+  [possible values: nokaslr, mapredo]
+
+["mkdisk","--log-levels","levels.conf"]
+ok mkdisk log_levels=["levels.conf"]
+
+["mkdisk","--log-levels"]
+InvalidValue
+error: a value is required for '--log-levels <FILE>' but none was supplied
+
+["mkdisk","--harness","bogus"]
+InvalidValue
+error: invalid value 'bogus' for '--harness <HARNESS>'
+  [possible values: init, ktest]
+
+["mkdisk","--repack-only","--harness","ktest","--knob","mapredo"]
+ok mkdisk repack_only harness=["ktest"] knob=["mapredo"]
 
 ["test-terminal"]
 ok-all test-terminal arch=default["x86_64"] cpus=default["4"] mem=default["512"] host_override=default alone=default timing=default
@@ -34190,9 +34110,6 @@ error: the argument '--gdb' cannot be used with '--debug-listen'
 ArgumentConflict
 error: the argument '--runs <N>' cannot be used with '--verbose'
 
-["run","--display","headless"]
-ok run display=["headless"]
-
 ["run","--runs","1","--display","framebuffer"]
 ok run runs=["1"] display=["framebuffer"]
 
@@ -34213,10 +34130,6 @@ error: invalid value 'bogus' for '--crash-reports <CRASH_REPORTS>'
 MissingRequiredArgument
 error: the following required arguments were not provided:
   --runs <N>
-
-["run","--headless"]
-UnknownArgument
-error: unexpected argument '--headless' found
 
 ["run-parallel","--parallel","1","--runs","1"]
 InvalidSubcommand

@@ -3,11 +3,12 @@
 
 // xtask/src/commands/mkdisk.rs
 
-//! Mkdisk command: re-mirror `rootfs/` into `sysroot/`, re-synthesise
-//! test fixtures, and regenerate `disk.img` (and `disk-data.img` under
-//! `--split-data`) at the requested block size without invoking cargo.
-//! Used to refresh the boot image after `rootfs/` or sysroot files were
-//! edited outside the cargo flow. Hand-staging a test recipe (copying it
+//! Mkdisk command: re-mirror `rootfs/` into `sysroot/`, re-synthesise test
+//! fixtures, choose what the image boots (the harness whose bundle it
+//! composes, the bootloader's knobs, the log-level configuration), and
+//! regenerate `disk.img` (and `disk-data.img` under `--split-data`) at the
+//! requested block size without invoking cargo. The pack checks the images it
+//! writes ([`crate::image_check`]). Hand-staging a test recipe (copying it
 //! from `sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/`)
 //! requires `--repack-only`, since a normal re-mirror is authoritative and
 //! would prune the hand-added file.
@@ -19,37 +20,62 @@
 //! set that diverges from `rootfs/` — e.g. a default recipe removed, or a test
 //! recipe hand-staged — by packing the staged sysroot without that pass.
 
-use crate::error::Result;
+use std::path::Path;
+
+use crate::argparse::ValueEnum as _;
+use crate::error::{Context as _, Result, bail};
 
 use crate::cli::MkdiskArgs;
 use crate::context::Context as BuildContext;
 use crate::disk;
-use crate::sysroot;
+use crate::esp::{self, Knob};
+use crate::sysroot::{self, LOG_LEVELS};
 use crate::util::step;
 
 /// Entry point for `cargo xtask mkdisk`. Re-mirrors `rootfs/` into the
-/// sysroot (including the test-fixture synthesis), then regenerates
-/// `disk.img` (and `disk-data.img` under `--split-data`) at the requested
-/// block size. Cargo is not invoked; the existing per-arch sysroot
+/// sysroot (including the test-fixture synthesis) unless `--repack-only`,
+/// installs the repository's data files in either case, then the log-level
+/// configuration `--log-levels` names over the repository's, records the
+/// harness `--harness` names, stages exactly the knobs `--knob` names, and
+/// regenerates `disk.img` (and `disk-data.img` under `--split-data`) at the
+/// requested block size. Cargo is not invoked; the existing per-arch sysroot
 /// from a prior `cargo xtask build` is reused.
+///
+/// # Errors
+///
+/// When the sysroot was built for another architecture, the `--log-levels`
+/// file cannot be read or holds a line init's parser refuses, and as
+/// [`sysroot::install_rootfs`], [`esp::set_knobs`] and
+/// [`disk::create_disk_image`] fail.
 pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
 {
     sysroot::check_arch(ctx, args.arch)?;
-    if !args.repack_only
+    // Read and checked before anything changes, so a refused file leaves the
+    // sysroot as it was.
+    let levels = args
+        .log_levels
+        .as_deref()
+        .map(read_log_levels)
+        .transpose()?;
+    if args.repack_only
     {
-        sysroot::install_rootfs(ctx, args.arch)?;
-    }
-    if args.no_kaslr
-    {
-        stage_knob(ctx, Knob::NoKaslr)?;
+        sysroot::install_data_files(ctx, args.arch)?;
     }
     else
     {
-        remove_knob(ctx, Knob::NoKaslr)?;
+        sysroot::install_rootfs(ctx, args.arch)?;
     }
-    // The mapredo knob is `test-map-redo`'s alone, which removes it after its
-    // boot; mkdisk's repack never keeps one a stopped run left behind.
-    remove_knob(ctx, Knob::MapRedo)?;
+    if let Some(levels) = &levels
+    {
+        let installed = ctx.sysroot.join(LOG_LEVELS.relative());
+        std::fs::write(&installed, levels)
+            .with_context(|| format!("writing {}", installed.display()))?;
+    }
+    if let Some(harness) = args.harness
+    {
+        sysroot::record_harness(ctx, harness)?;
+    }
+    esp::set_knobs(ctx, &args.knob)?;
     let layout = disk::DiskLayout {
         block_size: args.block_size,
         data: if args.split_data
@@ -62,54 +88,84 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
         },
     };
     disk::create_disk_image(ctx, args.arch, layout)?;
-    step(&format!("mkdisk complete ({})", args.arch));
+    step(&format!(
+        "mkdisk complete ({}, harness={}, knobs={})",
+        args.arch,
+        sysroot::recorded_harness(ctx)?.name(),
+        knob_names(&args.knob)
+    ));
     Ok(())
 }
 
-/// A presence-only bootloader knob: an empty file in the ESP tree's
-/// `\EFI\seraph\` directory, read by the next boot of the `disk.img` packed
-/// with it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Knob
+/// The log-level configuration at `path`, refused unless init's parser
+/// accepts every line of it: init would report and ignore a refused line, so
+/// the boot would run at levels the file does not state.
+///
+/// # Errors
+///
+/// When the file cannot be read, or init's parser refuses a line, naming the
+/// line and why.
+fn read_log_levels(path: &Path) -> Result<Vec<u8>>
 {
-    /// `\EFI\seraph\nokaslr`: the bootloader boots the kernel at its
-    /// deterministic (un-randomized) layout.
-    NoKaslr,
-    /// `\EFI\seraph\mapredo`: the bootloader redoes the first attempt of its
-    /// steps 6 and 7 whatever its memory map's size.
-    MapRedo,
+    let text = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    check_log_levels(&text).with_context(|| format!("checking {}", path.display()))?;
+    Ok(text)
 }
 
-impl Knob
+/// Refuse `text` unless init's log-level parser accepts each of its lines.
+///
+/// # Errors
+///
+/// On the first line the parser refuses, naming it and why.
+fn check_log_levels(text: &[u8]) -> Result<()>
 {
-    /// The knob's file name in `\EFI\seraph\`.
-    fn file_name(self) -> &'static str
+    let mut refused = None;
+    let _levels = init_log_levels::parse(text, |line, error| {
+        refused.get_or_insert_with(|| {
+            format!("{:?}: {}", String::from_utf8_lossy(line), error.describe())
+        });
+    });
+    match refused
     {
-        match self
+        Some(line) => bail!("init's log-level parser refuses the line {line}"),
+        None => Ok(()),
+    }
+}
+
+/// `knobs` by name, comma-separated, or `none`.
+fn knob_names(knobs: &[Knob]) -> String
+{
+    if knobs.is_empty()
+    {
+        return "none".to_owned();
+    }
+    knobs
+        .iter()
+        .map(|knob| knob.name())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    // Defect caught: a configuration with a mistyped service or level packed,
+    // so init ignores that line and the boot runs at levels the file does not
+    // state.
+    #[test]
+    fn a_configuration_with_a_line_init_refuses_is_refused()
+    {
+        check_log_levels(b"# vfsd at debug\nvfsd = debug\n\nprocmgr = info\n").unwrap();
+        for bad in [
+            b"vfs = debug\n".as_slice(),
+            b"vfsd = loud\n",
+            b"vfsd debug\n",
+        ]
         {
-            Knob::NoKaslr => "nokaslr",
-            Knob::MapRedo => "mapredo",
+            let error = format!("{:#}", check_log_levels(bad).unwrap_err());
+            assert!(error.contains("refuses the line"), "{error}");
         }
     }
-}
-
-/// Stage `knob` in the ESP tree so the next `disk.img` carries it.
-/// Idempotent.
-pub fn stage_knob(ctx: &BuildContext, knob: Knob) -> Result<()>
-{
-    std::fs::create_dir_all(ctx.sysroot_efi_seraph())?;
-    std::fs::write(ctx.sysroot_efi_seraph().join(knob.file_name()), b"")?;
-    Ok(())
-}
-
-/// Remove `knob` from the ESP tree so the next `disk.img` lacks it.
-/// Idempotent: an absent knob is left absent.
-pub fn remove_knob(ctx: &BuildContext, knob: Knob) -> Result<()>
-{
-    let path = ctx.sysroot_efi_seraph().join(knob.file_name());
-    if path.exists()
-    {
-        std::fs::remove_file(&path)?;
-    }
-    Ok(())
 }

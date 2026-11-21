@@ -5,8 +5,8 @@
 
 //! A reader of the FAT volumes [`crate::fat::write_volume`] writes, built on `fatfs-parse`'s
 //! decoders as the `fatfs` service reads them, which checks the structure it walks and returns
-//! every file's bytes. `check-disk` reads the ESP and root volumes of `disk.img` with it to
-//! compare the ESP with the installed files (`crate::esp::check`), and the disk tooling's tests
+//! every file's bytes. Every pack reads the ESP and root volumes of the `disk.img` it wrote with
+//! it to compare the ESP with the installed files (`crate::esp::check`), and the disk tooling's tests
 //! read back what they wrote.
 
 use std::collections::{BTreeMap, HashSet};
@@ -376,9 +376,9 @@ mod tests
         ((geo.data_start_sector - root_sectors) * 512) as usize
     }
 
-    // Defect caught: a damaged volume read as a tree (check-disk comparing the ESP with
-    // files the volume does not hold) or a reader that panics on one rather than failing
-    // check-disk with the damage named.
+    // Defect caught: a damaged volume read as a tree (a pack's image check comparing the ESP
+    // with files the volume does not hold) or a reader that panics on one rather than failing
+    // the check with the damage named.
     #[test]
     fn a_damaged_volume_is_an_error_naming_the_damage()
     {
@@ -432,8 +432,8 @@ mod tests
     }
 
     // Defect caught: a fragmented chain, which a booted guest's or the firmware's writes leave
-    // on a volume, refused or read as the clusters that follow its first (check-disk failing,
-    // or comparing the wrong bytes, on an image that has been booted).
+    // on a volume, refused or read as the clusters that follow its first (a read of an image
+    // that has been booted failing, or returning the wrong bytes).
     #[test]
     fn a_fragmented_chain_reads_in_chain_order()
     {

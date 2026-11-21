@@ -215,8 +215,9 @@ fn install_hint_for(name: &str) -> String
             Debian / Ubuntu:  apt install qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross\n  \
             Arch:             pacman -S qemu-user riscv64-linux-gnu-gcc riscv64-linux-gnu-glibc"
             .into(),
-        "fsck.fat" => "`cargo xtask check-disk` checks the disk images' FAT volumes with \
-            dosfstools' fsck.fat. Install with:\n  \
+        "fsck.fat" => "Every pack of the disk images (`cargo xtask build`, `cargo xtask mkdisk` and \
+            the tests that repack) checks their FAT volumes with dosfstools' fsck.fat. \
+            Install with:\n  \
             Fedora:           dnf install dosfstools\n  \
             Debian / Ubuntu:  apt install dosfstools\n  \
             Arch:             pacman -S dosfstools\n  \

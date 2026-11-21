@@ -253,14 +253,10 @@ pub fn compose(ctx: &BuildContext, arch: Arch, harness: Harness, out: &Path) -> 
     let entries = entries(ctx, &list)?;
     let bodies = bodies(&store, arch, &entries)?;
 
-    let parent = out
-        .parent()
-        .context("compose-bundle: bundle path has no parent")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("compose-bundle: create {}", parent.display()))?;
+    let parent = out.parent().context("bundle: bundle path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("bundle: create {}", parent.display()))?;
 
-    let entry_count =
-        u32::try_from(entries.len()).context("compose-bundle: too many entries for u32")?;
+    let entry_count = u32::try_from(entries.len()).context("bundle: too many entries for u32")?;
     write_bundle(out, entry_count, &bodies)?;
 
     step(&format!(
@@ -310,7 +306,7 @@ fn entries(ctx: &BuildContext, list: &BundleList) -> Result<Vec<Entry>>
         if !source.is_file()
         {
             bail!(
-                "compose-bundle: installed file missing at {} (run `cargo xtask build` first)",
+                "bundle: installed file missing at {} (run `cargo xtask build` first)",
                 source.display()
             );
         }
@@ -328,16 +324,16 @@ fn entries(ctx: &BuildContext, list: &BundleList) -> Result<Vec<Entry>>
 fn bodies(store: &[u8], arch: Arch, entries: &[Entry]) -> Result<Vec<(String, Vec<u8>)>>
 {
     let store = TrustStore::parse(store)
-        .map_err(|e| err!("compose-bundle: the installed trust store does not parse ({e:?})"))?;
+        .map_err(|e| err!("bundle: the installed trust store does not parse ({e:?})"))?;
     entries
         .iter()
         .map(|entry| {
             let bytes = fs::read(&entry.source)
-                .with_context(|| format!("compose-bundle: read {}", entry.source.display()))?;
+                .with_context(|| format!("bundle: read {}", entry.source.display()))?;
             check_entry(&store, arch, &entry.name, entry.role(), &bytes).with_context(|| {
                 format!(
-                    "compose-bundle: {} cannot be the bundle's {} entry (sign the sysroot for \
-                     this harness: `cargo xtask build` or `cargo xtask compose-bundle`)",
+                    "bundle: {} cannot be the bundle's {} entry (sign the sysroot for \
+                     this harness: `cargo xtask build` or `cargo xtask mkdisk --harness`)",
                     entry.source.display(),
                     entry.name
                 )
@@ -389,18 +385,18 @@ pub(crate) fn write_bundle(
     entries: &[(String, Vec<u8>)],
 ) -> Result<()>
 {
-    let mut out_file = fs::File::create(out)
-        .with_context(|| format!("compose-bundle: create {}", out.display()))?;
+    let mut out_file =
+        fs::File::create(out).with_context(|| format!("bundle: create {}", out.display()))?;
 
     out_file
         .write_all(&fmt::MAGIC)
-        .context("compose-bundle: write magic")?;
+        .context("bundle: write magic")?;
     out_file
         .write_all(&fmt::VERSION.to_le_bytes())
-        .context("compose-bundle: write version")?;
+        .context("bundle: write version")?;
     out_file
         .write_all(&entry_count.to_le_bytes())
-        .context("compose-bundle: write entry_count")?;
+        .context("bundle: write entry_count")?;
 
     // Compute body offsets up front so the entry header table can be
     // written before the bodies themselves.
@@ -408,22 +404,21 @@ pub(crate) fn write_bundle(
         .len()
         .checked_mul(fmt::ENTRY_HEADER_SIZE)
         .and_then(|len| u64::try_from(len).ok())
-        .context("compose-bundle: entry header table size overflows")?;
+        .context("bundle: entry header table size overflows")?;
     let mut offsets: Vec<u64> = Vec::with_capacity(entries.len());
     let mut cursor = (fmt::HEADER_SIZE as u64)
         .checked_add(header_table_len)
-        .context("compose-bundle: bundle size overflows")?;
+        .context("bundle: bundle size overflows")?;
     let mut sizes: Vec<u64> = Vec::with_capacity(entries.len());
     for (_, body) in entries
     {
-        let size = u64::try_from(body.len()).context("compose-bundle: bundle size overflows")?;
-        cursor = align_up(cursor, fmt::BODY_ALIGNMENT)
-            .context("compose-bundle: bundle size overflows")?;
+        let size = u64::try_from(body.len()).context("bundle: bundle size overflows")?;
+        cursor = align_up(cursor, fmt::BODY_ALIGNMENT).context("bundle: bundle size overflows")?;
         offsets.push(cursor);
         sizes.push(size);
         cursor = cursor
             .checked_add(size)
-            .context("compose-bundle: bundle size overflows")?;
+            .context("bundle: bundle size overflows")?;
     }
 
     // Entry header table.
@@ -435,20 +430,20 @@ pub(crate) fn write_bundle(
         else
         {
             crate::error::bail!(
-                "compose-bundle: entry name `{name}` exceeds {} bytes",
+                "bundle: entry name `{name}` exceeds {} bytes",
                 fmt::ENTRY_NAME_LEN
             );
         };
         name_dst.copy_from_slice(nb);
         out_file
             .write_all(&name_buf)
-            .context("compose-bundle: write entry name")?;
+            .context("bundle: write entry name")?;
         out_file
             .write_all(&offset.to_le_bytes())
-            .context("compose-bundle: write entry offset")?;
+            .context("bundle: write entry offset")?;
         out_file
             .write_all(&size.to_le_bytes())
-            .context("compose-bundle: write entry size")?;
+            .context("bundle: write entry size")?;
     }
 
     // Bodies (aligned).
@@ -456,15 +451,13 @@ pub(crate) fn write_bundle(
     {
         out_file
             .seek(SeekFrom::Start(offset))
-            .context("compose-bundle: seek to body offset")?;
+            .context("bundle: seek to body offset")?;
         out_file
             .write_all(body)
-            .with_context(|| format!("compose-bundle: write body for {name}"))?;
+            .with_context(|| format!("bundle: write body for {name}"))?;
     }
 
-    out_file
-        .sync_all()
-        .context("compose-bundle: sync bundle file")?;
+    out_file.sync_all().context("bundle: sync bundle file")?;
     Ok(())
 }
 

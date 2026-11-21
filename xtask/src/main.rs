@@ -66,6 +66,7 @@ mod gh;
 mod gpt;
 mod guest;
 mod host_lock;
+mod image_check;
 mod qemu;
 mod qemu_gdb;
 mod qmp;
@@ -124,8 +125,6 @@ fn main()
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
         CliCommand::Symbolize(args) => commands::symbolize::run(&ctx, args),
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),
-        CliCommand::CheckDisk(args) => commands::check_disk::run(&ctx, args),
-        CliCommand::ComposeBundle(args) => commands::compose_bundle::run(&ctx, args),
         CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),
         CliCommand::TestVmgenid(args) => commands::test_vmgenid::run(&ctx, args),
         CliCommand::TestTpm(args) => commands::test_tpm::run(&ctx, args),

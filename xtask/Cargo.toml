@@ -35,14 +35,19 @@ procmgr-process-table = { path = "../services/procmgr/process-table" }
 # svcmgr's restart budget (`restart_budget::RESTART_BURST`): test-core-death kills
 # logd once per restart the budget allows, and once more.
 restart-budget = { path = "../shared/restart-budget" }
-# vfsd's GPT parser: `check-disk` finds each image's partitions through it, and
-# the disk tooling's tests read the tables mkdisk writes back through it.
+# vfsd's GPT parser: the check every pack makes of the images it writes
+# (src/image_check.rs) finds each image's partitions through it, and the disk
+# tooling's tests read the tables mkdisk writes back through it.
 vfsd-gpt = { path = "../services/vfsd/gpt" }
 # Signing of the objects a build packs (src/signing, docs/signing.md § Signing):
 # the Ed25519 signer, and the trailer, certificate and trust-store codec with
 # the verifier each signed object is checked against before it is written.
 crypto = { path = "../shared/crypto", features = ["sign"] }
 objsig = { path = "../shared/objsig" }
+# init's log-level parser: `mkdisk --log-levels` refuses a configuration with a
+# line init would ignore, and test-log-level's tests run its configuration
+# through it.
+init-log-levels = { path = "../services/init/log-levels" }
 
 [dev-dependencies]
 # The normalized exception codes crash_check's tests build reports with.
@@ -50,9 +55,8 @@ syscall-abi = { path = "../abi/syscall" }
 # The `test-fault` fixture's role BAR lengths, which the qemu tests check the
 # test launch's `pci-testdev` functions against.
 ipc = { path = "../shared/ipc" }
-# init's log-level parser, which test-log-level's tests run its configuration
-# through, and the level codes it returns.
-init-log-levels = { path = "../services/init/log-levels" }
+# The level codes init's log-level parser returns, which test-log-level's tests
+# check.
 log = { path = "../shared/log" }
 
 [lints]

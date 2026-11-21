@@ -17,6 +17,7 @@ use crate::arch::Arch;
 use crate::bundle::Harness;
 use crate::context::Profile;
 use crate::disk::BlockSize;
+use crate::esp::Knob;
 use crate::qemu::{DiskLine, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack};
 
 args! {
@@ -96,26 +97,16 @@ subcommands! {
         Symbolize(SymbolizeArgs),
 
         /// Mirror `rootfs/` into the sysroot, re-synthesise test fixtures,
-        /// and regenerate `disk.img` without invoking cargo. The mirror is
-        /// authoritative over `config/`+`data/` (deletions in `rootfs/` are
-        /// pruned); use `--repack-only` to pack a hand-staged sysroot as it
-        /// stands. Every pack re-signs the sysroot's signed objects in place.
-        /// Requires an arch-tagged sysroot from a prior `cargo xtask build`.
+        /// choose the harness, the bootloader knobs and the log-level
+        /// configuration the image boots, and regenerate `disk.img` without
+        /// invoking cargo. The mirror is authoritative over `config/`+`data/`
+        /// (deletions in `rootfs/` are pruned); use `--repack-only` to pack a
+        /// hand-staged sysroot as it stands. Every pack re-signs the sysroot's
+        /// signed objects in place, then checks the images it wrote with
+        /// `fsck.fat -n` (dosfstools) and reads their ESP back against the
+        /// root partition. Requires an arch-tagged sysroot from a prior
+        /// `cargo xtask build`.
         Mkdisk(MkdiskArgs),
-
-        /// Check every FAT volume of `disk.img`, and of `disk-data.img` when it
-        /// is there, with `fsck.fat -n` (dosfstools), an independent reader of
-        /// the volumes mkdisk writes, then that every object on the ESP of
-        /// `disk.img` equals its installed file on the root partition. Runs in
-        /// CI's validate job; see xtask/README.md.
-        CheckDisk(CheckDiskArgs),
-
-        /// Record the harness whose bundle every pack composes from the
-        /// installed files its bundle list names, and repack `disk.img`. Use
-        /// `--harness ktest` to run the kernel test harness; the default is
-        /// `--harness init`. Requires a populated sysroot from a prior `cargo
-        /// xtask build`.
-        ComposeBundle(ComposeBundleArgs),
 
         /// Boot the terminal interactive test: launch QEMU with a QMP control
         /// socket, wait for the guest terminal's READY marker, inject a known key
@@ -142,7 +133,7 @@ subcommands! {
 
         /// Boot the KASLR randomization test: boot twice, scrape the kernel's
         /// serial-only `kaslr:` line, and assert the image slide and direct-map
-        /// base differ between boots; then boot once with the `--no-kaslr` knob
+        /// base differ between boots; then boot once with the `nokaslr` knob
         /// staged and assert the deterministic layout. Requires a populated
         /// sysroot with the ktest bundle composed (see xtask/README.md).
         TestKaslr(TestKaslrArgs),
@@ -337,8 +328,6 @@ impl CliCommand
             | Self::KtestTiming(_)
             | Self::Symbolize(_)
             | Self::Mkdisk(_)
-            | Self::CheckDisk(_)
-            | Self::ComposeBundle(_)
             | Self::TestTerminal(_)
             | Self::TestVmgenid(_)
             | Self::TestTpm(_)
@@ -829,8 +818,9 @@ args! {
         pub arch: Arch,
 
         /// Repack `disk.img` from the sysroot as it stands, skipping the
-        /// `rootfs/` re-mirror; the sysroot's signed objects are still
-        /// re-signed in place, as every pack signs them. Use after editing the
+        /// `rootfs/` re-mirror; the repository's data files are still
+        /// installed, and the sysroot's signed objects re-signed in place, as
+        /// every pack signs them. Use after editing the
         /// staged sysroot directly (e.g. adding a test recipe or removing a
         /// default one): a normal re-mirror is authoritative and would restore
         /// `rootfs/`-present recipes and prune `rootfs/`-absent ones, undoing
@@ -838,11 +828,27 @@ args! {
         #[arg(long)]
         pub repack_only: bool,
 
-        /// Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots
-        /// the kernel at its deterministic (un-randomized) layout — for GDB /
-        /// symbolization workflows. Omit to remove the knob and re-enable KASLR.
+        /// Record the harness whose bundle this and every later pack composes
+        /// from the installed files its bundle list names: `init` for the
+        /// userspace init, `ktest` for the kernel-test harness. Omit to keep
+        /// the recorded harness (`init` after `cargo xtask build`).
         #[arg(long)]
-        pub no_kaslr: bool,
+        pub harness: Option<Harness>,
+
+        /// Stage a bootloader knob in `\EFI\seraph\`: `nokaslr` boots the
+        /// kernel at its deterministic (un-randomized) layout, for GDB and
+        /// symbolization; `mapredo` makes the bootloader redo the first
+        /// attempt of its steps 6 and 7. Repeatable, or comma-separated. The
+        /// image carries exactly the knobs named: every other is removed.
+        #[arg(long, value_delimiter = ',')]
+        pub knob: Vec<Knob>,
+
+        /// Install FILE as the log-level configuration init reads
+        /// (`/config/init/log-levels.conf`) in place of the repository's
+        /// `services/init/log-levels.conf`, which mkdisk installs without it.
+        /// Refused unless init's parser accepts every line.
+        #[arg(long, value_name = "FILE")]
+        pub log_levels: Option<PathBuf>,
 
         /// Logical block size of the authored images: the unit of their GPT LBAs
         /// and the sector size of their FAT volumes. `run` and the other
@@ -1377,22 +1383,6 @@ args! {
     }
 }
 
-// ── ComposeBundle ────────────────────────────────────────────────────────────
-
-args! {
-    pub struct ComposeBundleArgs
-    {
-        /// Target architecture — must match the existing sysroot's arch tag.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// Which harness's bundle list composes the bundle, and so which
-        /// object is its `init` entry.
-        #[arg(long, default_value = "init")]
-        pub harness: Harness,
-    }
-}
-
 // ── Clean ─────────────────────────────────────────────────────────────────────
 
 args! {
@@ -1551,12 +1541,6 @@ args! {
 fn parse_hex_arg(text: &str) -> Result<u64, String>
 {
     crate::symbolize::parse_hex(text).map_err(|err| format!("{err:#}"))
-}
-
-// ── CheckDisk ─────────────────────────────────────────────────────────────────
-
-args! {
-    pub struct CheckDiskArgs;
 }
 
 // ── LintDocs ──────────────────────────────────────────────────────────────────

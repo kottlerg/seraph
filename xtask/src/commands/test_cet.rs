@@ -22,7 +22,7 @@
 //! booted: the cet cell (docs/testing.md "Coverage tiers").
 //!
 //! Two boots of the current sysroot, which must hold the composed ktest
-//! bundle (`cargo xtask compose-bundle --harness ktest`):
+//! bundle (`cargo xtask mkdisk --harness ktest`):
 //!
 //! 1. ktest runs to its pass marker, and the kernel reports
 //!    `shadow stacks: on` before it.

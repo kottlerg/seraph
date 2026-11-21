@@ -9,8 +9,9 @@
 name: QEMU packages
 description: >-
   QEMU and firmware packages for the CI jobs that boot under QEMU, and
-  dosfstools for `cargo xtask check-disk`: the install list, the cache key, the bounded download, and the offline
-  install with its network fallback. The mechanism is specified in
+  dosfstools, whose fsck.fat every disk-image pack runs: the install list,
+  the cache key, the bounded download, and the offline install with its
+  network fallback. The mechanism is specified in
   docs/build-system.md § Continuous Integration.
 
 inputs:

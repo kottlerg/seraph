@@ -33,9 +33,9 @@ use crate::cli::{
     DEFAULT_FAIL_GRACE_SECS, DEFAULT_FAIL_REGEX, DEFAULT_PASS_REGEX, LaunchArgs, RunArgs,
     TestMapRedoArgs,
 };
-use crate::commands::mkdisk::{Knob, remove_knob, stage_knob};
 use crate::commands::run::classified::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
 use crate::context::Context;
+use crate::esp::{Knob, remove_knob, stage_knob};
 use crate::regex::Regex;
 use crate::util::step;
 

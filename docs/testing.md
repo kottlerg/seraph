@@ -23,7 +23,7 @@ Three harnesses exercise three surfaces:
 
 | Harness | Surface | Crate | Launch mechanism |
 |---|---|---|---|
-| `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
+| `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask mkdisk --harness ktest`) |
 | `svctest` | Services | [`services/svctest/`](../services/svctest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
 | `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (`cargo xtask test-terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
 
@@ -237,14 +237,14 @@ the bundle's `init` entry:
 
 ```sh
 cargo xtask build
-cargo xtask compose-bundle --harness ktest
+cargo xtask mkdisk --harness ktest
 cargo xtask run
 ```
 
 Reset to the default-init bundle by re-running `cargo xtask build` or
-`compose-bundle --harness init`. ktest's runtime options bake in as
+`mkdisk --harness init`. ktest's runtime options bake in as
 compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`
-(see [xtask/README.md](../xtask/README.md#cargo-xtask-compose-bundle)).
+(see [xtask/README.md](../xtask/README.md#cargo-xtask-mkdisk)).
 
 ### Interactive input (`test-terminal`)
 
@@ -351,7 +351,7 @@ See [xtask/README.md § test-kaslr](../xtask/README.md#cargo-xtask-test-kaslr) f
 the command and [memory-model.md](memory-model.md) for the randomized layout.
 
 Requires a populated sysroot with the ktest bundle composed
-(`cargo xtask compose-bundle --harness ktest`). The `kaslr:` line is emitted only
+(`cargo xtask mkdisk --harness ktest`). The `kaslr:` line is emitted only
 through the kernel's serial-only console class (see
 [cross-boundary-disclosure.md § Kernel console diagnostics](../core/kernel/docs/cross-boundary-disclosure.md#kernel-console-diagnostics)).
 In CI it runs as extra boots inside each `ktest` cell (both arches, both
@@ -1243,7 +1243,7 @@ report below (`--save-logs`).
 # oversubscription; each budget is for HANG classification, see below):
 T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
-cargo xtask compose-bundle --harness ktest --arch riscv64
+cargo xtask mkdisk --harness ktest --arch riscv64
 cargo xtask run --arch riscv64 --cpus 16 --runs 1 --timeout 180 \
     --save-logs $T
 cargo xtask run --arch riscv64 --cpus 128 --runs 1 --timeout 1140 \
@@ -1255,7 +1255,7 @@ cargo xtask run --arch riscv64 --cpus 128 --runs 1 --timeout 1140 \
 # the memory variation below runs on whatever sysroot is current, so it
 # follows a debug-profile build, never the release boots above it):
 cargo xtask build --arch riscv64 --release
-cargo xtask compose-bundle --harness ktest --arch riscv64
+cargo xtask mkdisk --harness ktest --arch riscv64
 cargo xtask run --arch riscv64 --cpus 16 --runs 1 --timeout 180
 cargo xtask run --arch riscv64 --cpus 128 --runs 1 --timeout 1140
 
@@ -1265,7 +1265,7 @@ cargo xtask run --arch riscv64 --cpus 128 --runs 1 --timeout 1140
 # below):
 cargo xtask clean
 cargo xtask build
-cargo xtask compose-bundle --harness ktest
+cargo xtask mkdisk --harness ktest
 cargo xtask run --arch x86_64 --cpus 16 --runs 1 --timeout 180 \
     --save-logs $T
 cargo xtask run --arch x86_64 --cpus 128 --runs 1 --timeout 900 \
@@ -1273,7 +1273,7 @@ cargo xtask run --arch x86_64 --cpus 128 --runs 1 --timeout 900 \
 
 # Release-profile boundary boots, x86_64 (release host runs only, as above):
 cargo xtask build --release
-cargo xtask compose-bundle --harness ktest
+cargo xtask mkdisk --harness ktest
 cargo xtask run --arch x86_64 --cpus 16 --runs 1 --timeout 180
 cargo xtask run --arch x86_64 --cpus 128 --runs 1 --timeout 900
 
@@ -1654,7 +1654,7 @@ boot budget. The pair is the cet device cell (Device surfaces above).
 ```sh
 # CET cell, x86_64 only:
 cargo xtask build --arch x86_64
-cargo xtask compose-bundle --harness ktest
+cargo xtask mkdisk --harness ktest
 cargo xtask test-cet
 ```
 
@@ -1874,9 +1874,9 @@ answering. `cargo xtask run --gdb` starts the guest paused with the stub on `loc
 hung guest alive for attaching
 ([xtask/README.md](../xtask/README.md#classified-boots---runs)). GDB runs in batch mode, so its
 output lands in a file like any log. The kernel is static-PIE, so its symbols load at the KASLR
-slide from the serial-only `kaslr: slide=` line, or at their link addresses in a boot whose disk
-was authored with `cargo xtask mkdisk --no-kaslr`; a userspace image's symbols load at its bias, as
-[xtask/README.md](../xtask/README.md#cargo-xtask-run) describes under `--gdb`. Source lines need
+was authored with `cargo xtask mkdisk --knob nokaslr`; a userspace image's symbols load at its
+bias, as [xtask/README.md](../xtask/README.md#cargo-xtask-run) describes under `--gdb`. Source lines
+need the image built with debug information (`cargo xtask build --debug kernel`,
 the image built with debug information (`cargo xtask build --debug kernel`,
 [docs/build-system.md](build-system.md#debuginfo-is-opt-in)). On riscv64 the GDB must be built for
 that target ([docs/build-system.md](build-system.md#toolchain)).
@@ -1896,7 +1896,7 @@ gdb -batch -ex 'target remote :1234' \
 # KASLR, with source lines (a hardware breakpoint, since the kernel is not yet
 # mapped when the guest starts paused, so a software one cannot be written):
 cargo xtask build --debug kernel
-cargo xtask mkdisk --no-kaslr
+cargo xtask mkdisk --knob nokaslr
 cargo xtask run --gdb --display headless  # in one shell; waits paused
 gdb -batch -ex 'target remote :1234' -ex 'hbreak kernel::panic' -ex continue \
     -ex bt -ex 'info registers' sysroot/esp/EFI/seraph/kernel

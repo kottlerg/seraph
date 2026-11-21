@@ -35,14 +35,19 @@ pub const HEADER_BYTES: usize = 48;
 pub const RUN_BYTES: usize = 32;
 
 /// [`Header::flags`] bit, and `SNAPSHOT` reply `data[1]` bit: no run is
-/// [`RUN_ABSENT`], so every page the space mapped is in the object but
-/// those of [`syscall_abi::PAGE_RUN_NO_COPY`] runs, which no reader copies.
+/// [`RUN_ABSENT`], so every page the space mapped, and every backed page
+/// of its demand chunks memmgr held evicted, is in the object but those of
+/// [`syscall_abi::PAGE_RUN_NO_COPY`] runs, which no reader copies.
 pub const SNAPSHOT_COMPLETE: u64 = 1 << 0;
 
-/// [`Run::flags`] bit: the run's pages were not captured, and the object
-/// holds no bytes of them. The run is a range memmgr could not make resident
-/// (a chunk on disk, a lost chunk, or a restore that failed), or pages the
-/// copy found not present.
+/// [`Run::flags`] bit: the run's pages, mapped or backed at the capture,
+/// were not captured, and the object holds no bytes of them. A page is absent
+/// for one of these reasons only: its demand chunk was on disk and the swap
+/// service did not restore it within the capture's wait (none registered, it
+/// did not answer, or it is the held target or waits on it); its chunk was
+/// lost; its chunk's stored bytes failed to decode; or it is a listed page
+/// outside the chunks whose copy failed
+/// (`services/procmgr/docs/ipc-interface.md` § Snapshot object layout).
 pub const RUN_ABSENT: u64 = 1 << 8;
 
 /// The run flag bits a reader may meet: the `PAGE_RUN_*` protection bits of

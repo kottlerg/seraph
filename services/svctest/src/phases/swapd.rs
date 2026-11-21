@@ -49,6 +49,14 @@
 //!   of its main region, each chunk on disk faulted, redirected to swapd, and
 //!   restored, and none left on disk.
 //!
+//! Part C takes a snapshot of the fixture while chunks of its main region are on
+//! disk (procmgr's `SNAPSHOT`). It requires:
+//!
+//! * the snapshot complete and holding every page's pattern but the hole
+//!   chunk's, those on disk among them;
+//! * no page on disk once it is taken: the capture had swapd restore every chunk
+//!   on disk into the fixture.
+//!
 //! Once the fixture is gone, the phase requires the end of `memmgr_swap`: the
 //! store and the swapped total empty, the identity holding, and memmgr's free
 //! and deferred pages with svctest's own charged pages at least what they were
@@ -68,7 +76,7 @@ use super::process_kill::{IOMMU_NAME, kill};
 use super::swap::{
     CHUNK_LEN, CHUNK_PAGES, Fill, HOG_TICK, Hog, Ready, StackPages, attach, await_swapped,
     baseline_totals, chunk_reads_pattern, detach, main_pages, make_resident, page_present, pool,
-    read_stack, require_stack, settle_resident, start_fixture,
+    read_stack, require_snapshot, require_stack, settle_resident, start_fixture,
 };
 use super::swap_client::{
     Buffer, Slots, await_normal, disk_and_free, done, isolate, restore, stored, take,
@@ -303,11 +311,12 @@ fn part_a(
     free0
 }
 
-/// Part B: write-out, the storage path never evicted, the want path, a
-/// restart, and the fault path (see the module documentation). Returns the
-/// chunks on disk after the write-out.
-fn part_b(
-    caps: &Caps,
+/// Hold the level until swapd has written chunks of the fixture's main region
+/// to disk and every other chunk on disk is restored, requiring each of
+/// `stacks` to read while the level is at `CRITICAL`. Returns the bytes on
+/// disk.
+fn to_disk(
+    authority: u64,
     hog: &mut Hog,
     fixture: &mut super::swap::Fixture,
     ready: &Ready,
@@ -315,7 +324,6 @@ fn part_b(
     stacks: &[(String, StackPages)],
 ) -> u64
 {
-    let authority = caps.debug_authority;
     hog.fill_to_low();
     await_swapped(hog, fixture, 4 * CHUNK_PAGES);
     let _ = hog.fill_to_floor();
@@ -346,6 +354,23 @@ fn part_b(
         disk1 >= CHUNK_LEN,
         "{PHASE}: {disk1} bytes of the fixture's main region on disk once isolated"
     );
+    disk1
+}
+
+/// Part B: write-out, the storage path never evicted, the want path, a
+/// restart, and the fault path (see the module documentation). Returns the
+/// chunks on disk after the write-out.
+fn part_b(
+    caps: &Caps,
+    hog: &mut Hog,
+    fixture: &mut super::swap::Fixture,
+    ready: &Ready,
+    process: u64,
+    stacks: &[(String, StackPages)],
+) -> u64
+{
+    let authority = caps.debug_authority;
+    let disk1 = to_disk(authority, hog, fixture, ready, process, stacks);
 
     // The want path.
     let threads = attach(authority, process, "the fixture");
@@ -404,6 +429,28 @@ fn part_b(
     on_disk / CHUNK_LEN
 }
 
+/// Part C: a snapshot of the fixture with chunks on disk is complete and byte
+/// correct, swapd restoring every chunk into the fixture (see the module
+/// documentation).
+fn part_c(
+    caps: &Caps,
+    hog: &mut Hog,
+    fixture: &mut super::swap::Fixture,
+    ready: &Ready,
+    process: u64,
+)
+{
+    let authority = caps.debug_authority;
+    let on_disk = to_disk(authority, hog, fixture, ready, process, &[]);
+    std::os::seraph::log!("{PHASE}: part C: {on_disk} bytes of the fixture's main region on disk");
+    require_snapshot(authority, process, ready, PHASE);
+    assert_eq!(
+        pool().on_disk,
+        0,
+        "{PHASE}: bytes on disk after the snapshot, which restores every chunk on disk"
+    );
+}
+
 /// The phase (see the module documentation).
 fn swapd_phase(caps: &Caps)
 {
@@ -447,6 +494,7 @@ fn swapd_phase(caps: &Caps)
 
     let free0 = part_a(caps, &mut hog, &mut fixture, &ready, process, swapd);
     let written = part_b(caps, &mut hog, &mut fixture, &ready, process, &stacks);
+    part_c(caps, &mut hog, &mut fixture, &ready, process);
 
     fixture.send("exit");
     let status = fixture.exit_status();

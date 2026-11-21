@@ -514,50 +514,71 @@ pub enum ResidentPath
     /// Passed over: a lost chunk, or a chunk on disk with no swap service to
     /// ask; its pages stay not present.
     PassOver,
-    /// Reported (`ResidentMode::Report`): a chunk on disk or a lost one, which
-    /// the request's turn cannot make resident; the request stops at it and
-    /// names it in its reply, posting nothing to the swap service.
-    Report,
-}
-
-/// How a `MAKE_RESIDENT` request treats the chunks its turn cannot make
-/// resident (`memmgr_labels::RESIDENT_REPORT`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResidentMode
-{
-    /// A chunk on disk is posted to the swap service for the sender to wait
-    /// on, a lost one passed over, and a restore that fails fails the request.
-    Wait,
-    /// The first such chunk, and the first whose restore fails, is reported
-    /// and ends the request's turn: the sender, which holds the target's
-    /// space, waits on no other process.
-    Report,
 }
 
 /// The path `MAKE_RESIDENT` takes for a chunk whose entry is `entry`, with
 /// `wants` saying whether a registered swap service can be asked for a chunk
-/// on disk, in the request's `mode`.
+/// on disk.
 #[must_use]
-pub const fn resident_path(
-    entry: &ChunkEntry,
-    wants: Registered,
-    mode: ResidentMode,
-) -> ResidentPath
+pub const fn resident_path(entry: &ChunkEntry, wants: Registered) -> ResidentPath
 {
-    match (entry.state(), mode)
+    match entry.state()
     {
-        (ChunkState::Unbacked | ChunkState::Resident, _) => ResidentPath::Skip,
-        (
-            ChunkState::Evicting | ChunkState::Compressed | ChunkState::Raw | ChunkState::Writing,
-            _,
-        ) => ResidentPath::Restore,
-        (ChunkState::OnDisk | ChunkState::Lost, ResidentMode::Report) => ResidentPath::Report,
-        (ChunkState::OnDisk, ResidentMode::Wait) => match wants
+        ChunkState::Unbacked | ChunkState::Resident => ResidentPath::Skip,
+        ChunkState::Evicting | ChunkState::Compressed | ChunkState::Raw | ChunkState::Writing =>
+        {
+            ResidentPath::Restore
+        }
+        ChunkState::OnDisk => match wants
         {
             Registered::Yes => ResidentPath::Want,
             Registered::No => ResidentPath::PassOver,
         },
-        (ChunkState::Lost, ResidentMode::Wait) => ResidentPath::PassOver,
+        ChunkState::Lost => ResidentPath::PassOver,
+    }
+}
+
+/// Where `CAPTURE_CHUNKS` reads a chunk's backed pages from, by its state,
+/// with a swap service that registered a want Notification or not
+/// (`services/memmgr/docs/ipc-interface.md` § Label 31: `CAPTURE_CHUNKS`). The
+/// capture reads every chunk where it is, so it maps nothing back and
+/// restores nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureSource
+{
+    /// Nothing: no page of the chunk holds data.
+    Skip,
+    /// Its runs, which hold its backed pages: a resident chunk, one being
+    /// evicted, or a raw one, writing or not.
+    Runs,
+    /// Its store runs, decoded: a compressed chunk, writing or not.
+    Store,
+    /// Posted to the swap service's want list, as `MAKE_RESIDENT` posts it,
+    /// and reported pending: a chunk on disk, with a swap service to ask.
+    Want,
+    /// Reported absent: a lost chunk, or a chunk on disk with no swap service
+    /// to ask.
+    Absent,
+}
+
+/// The source `CAPTURE_CHUNKS` reads a chunk whose entry is `entry` from,
+/// with `wants` saying whether a registered swap service can be asked for a
+/// chunk on disk.
+#[must_use]
+pub const fn capture_source(entry: &ChunkEntry, wants: Registered) -> CaptureSource
+{
+    match entry.state()
+    {
+        ChunkState::Unbacked => CaptureSource::Skip,
+        ChunkState::Resident | ChunkState::Evicting | ChunkState::Raw => CaptureSource::Runs,
+        ChunkState::Writing if entry.is_raw() => CaptureSource::Runs,
+        ChunkState::Compressed | ChunkState::Writing => CaptureSource::Store,
+        ChunkState::OnDisk => match wants
+        {
+            Registered::Yes => CaptureSource::Want,
+            Registered::No => CaptureSource::Absent,
+        },
+        ChunkState::Lost => CaptureSource::Absent,
     }
 }
 
@@ -1008,89 +1029,61 @@ mod tests
             .unwrap();
         let raw_writing = raw.begin_write(6, Some([3; TAG_BYTES])).unwrap();
         let raw_on_disk = raw_writing.finish_write().unwrap();
-        // The path with a swap service registered, without one, and in report
-        // mode, which is the same either way.
-        for (entry, yes, no, report) in [
-            (
-                ChunkEntry::UNBACKED,
-                ResidentPath::Skip,
-                ResidentPath::Skip,
-                ResidentPath::Skip,
-            ),
-            (
-                resident,
-                ResidentPath::Skip,
-                ResidentPath::Skip,
-                ResidentPath::Skip,
-            ),
-            (
-                evicting,
-                ResidentPath::Restore,
-                ResidentPath::Restore,
-                ResidentPath::Restore,
-            ),
-            (
-                compressed,
-                ResidentPath::Restore,
-                ResidentPath::Restore,
-                ResidentPath::Restore,
-            ),
-            (
-                writing,
-                ResidentPath::Restore,
-                ResidentPath::Restore,
-                ResidentPath::Restore,
-            ),
-            (
-                raw,
-                ResidentPath::Restore,
-                ResidentPath::Restore,
-                ResidentPath::Restore,
-            ),
-            (
-                raw_writing,
-                ResidentPath::Restore,
-                ResidentPath::Restore,
-                ResidentPath::Restore,
-            ),
-            (
-                on_disk,
-                ResidentPath::Want,
-                ResidentPath::PassOver,
-                ResidentPath::Report,
-            ),
-            (
-                raw_on_disk,
-                ResidentPath::Want,
-                ResidentPath::PassOver,
-                ResidentPath::Report,
-            ),
-            (
-                lost,
-                ResidentPath::PassOver,
-                ResidentPath::PassOver,
-                ResidentPath::Report,
-            ),
+        for (entry, yes, no) in [
+            (ChunkEntry::UNBACKED, ResidentPath::Skip, ResidentPath::Skip),
+            (resident, ResidentPath::Skip, ResidentPath::Skip),
+            (evicting, ResidentPath::Restore, ResidentPath::Restore),
+            (compressed, ResidentPath::Restore, ResidentPath::Restore),
+            (writing, ResidentPath::Restore, ResidentPath::Restore),
+            (raw, ResidentPath::Restore, ResidentPath::Restore),
+            (raw_writing, ResidentPath::Restore, ResidentPath::Restore),
+            (on_disk, ResidentPath::Want, ResidentPath::PassOver),
+            (raw_on_disk, ResidentPath::Want, ResidentPath::PassOver),
+            (lost, ResidentPath::PassOver, ResidentPath::PassOver),
         ]
         {
-            assert_eq!(
-                resident_path(&entry, Registered::Yes, ResidentMode::Wait),
-                yes,
-                "{entry:?}"
-            );
-            assert_eq!(
-                resident_path(&entry, Registered::No, ResidentMode::Wait),
-                no,
-                "{entry:?}"
-            );
-            for wants in [Registered::Yes, Registered::No]
-            {
-                assert_eq!(
-                    resident_path(&entry, wants, ResidentMode::Report),
-                    report,
-                    "{entry:?}"
-                );
-            }
+            assert_eq!(resident_path(&entry, Registered::Yes), yes, "{entry:?}");
+            assert_eq!(resident_path(&entry, Registered::No), no, "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn capture_reads_runs_and_stores_wants_a_chunk_on_disk_and_reports_a_lost_one()
+    {
+        let resident = ChunkEntry::UNBACKED.back(0, 4, 7).unwrap();
+        let evicting = resident.begin_evict(1).unwrap();
+        let compressed = evicting.finish_evict(9).unwrap();
+        let writing = compressed.begin_write(5, None).unwrap();
+        let on_disk = writing.finish_write().unwrap();
+        let lost = on_disk.lose().unwrap();
+        let raw = ChunkEntry::UNBACKED
+            .back(0, 4, 8)
+            .unwrap()
+            .begin_evict(1)
+            .unwrap()
+            .finish_raw()
+            .unwrap();
+        let raw_writing = raw.begin_write(6, Some([3; TAG_BYTES])).unwrap();
+        let raw_on_disk = raw_writing.finish_write().unwrap();
+        for (entry, yes, no) in [
+            (
+                ChunkEntry::UNBACKED,
+                CaptureSource::Skip,
+                CaptureSource::Skip,
+            ),
+            (resident, CaptureSource::Runs, CaptureSource::Runs),
+            (evicting, CaptureSource::Runs, CaptureSource::Runs),
+            (raw, CaptureSource::Runs, CaptureSource::Runs),
+            (raw_writing, CaptureSource::Runs, CaptureSource::Runs),
+            (compressed, CaptureSource::Store, CaptureSource::Store),
+            (writing, CaptureSource::Store, CaptureSource::Store),
+            (on_disk, CaptureSource::Want, CaptureSource::Absent),
+            (raw_on_disk, CaptureSource::Want, CaptureSource::Absent),
+            (lost, CaptureSource::Absent, CaptureSource::Absent),
+        ]
+        {
+            assert_eq!(capture_source(&entry, Registered::Yes), yes, "{entry:?}");
+            assert_eq!(capture_source(&entry, Registered::No), no, "{entry:?}");
         }
     }
 

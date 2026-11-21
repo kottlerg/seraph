@@ -96,7 +96,8 @@ holds, since a restore can reproduce none of what they exclude:
 
 - the caller is the main thread, and no other thread the application spawned is alive;
 - the process is demand-paged (`ProcessInfo.pager_endpoint_cap` nonzero), so its memory is held
-  in memmgr regions a restore can replay;
+  in memmgr regions a restore can replay, its heap among them: a heap whose demand floor could not
+  be registered grows by grants, which no region holds;
 - no std value that holds a capability of the process is alive, the process's own
   stdio pipes aside, which the restore entry replaces, so no server holds a request or a mapping of
   the process's that a restore would orphan, and no value of the application names a slot the

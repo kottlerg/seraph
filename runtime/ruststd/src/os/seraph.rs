@@ -2687,14 +2687,17 @@ pub mod checkpoint {
     /// docs/checkpoint-restore.md § Quiesce point).
     ///
     /// The call is refused, capturing nothing, unless the caller is the main
-    /// thread, the process is demand-paged, and no std value that holds a
-    /// capability of the process is alive but its stdio pipes: no thread the
-    /// application spawned is alive or unjoined, no `std::fs::File` or
-    /// `std::fs::ReadDir` is open, no `std::process::Child`,
-    /// [`super::VerifiedData`] or [`Checkpoint`] is held, and no other pipe
-    /// is open. While it waits the thread writes no memory but its own stack
-    /// below this call's resume record and its IPC buffer, and it returns
-    /// only after procmgr ended the point.
+    /// thread, the process is demand-paged with its heap in memmgr regions,
+    /// and no std value that holds a capability of the process is alive but
+    /// its stdio pipes: no thread the application spawned is alive or
+    /// unjoined, no `std::fs::File` or `std::fs::ReadDir` is open, no
+    /// `std::process::Child`, [`super::VerifiedData`], [`Checkpoint`],
+    /// [`super::process::ArgvEnvCap`] or [`super::process::SessionStdio`] is
+    /// held, no `std::process::Command` holds a cap it has not sent (a cap
+    /// override or bootstrap caps), and no other pipe is open. While it waits
+    /// the thread writes no memory but its own stack below this call's resume
+    /// record and its IPC buffer, and it returns only after procmgr ended the
+    /// point.
     ///
     /// It returns [`Quiesced::Restored`] in a process restored from a
     /// checkpoint of the point, once the runtime has rebound itself to the
@@ -2703,8 +2706,9 @@ pub mod checkpoint {
     ///
     /// # Errors
     /// `ResourceBusy` when a value above is held; `InvalidInput` off the
-    /// main thread; `Unsupported` for a process that is not demand-paged, or
-    /// that procmgr refuses as one no restore can reproduce (created pinned,
+    /// main thread; `Unsupported` for a process that is not demand-paged or
+    /// whose heap grows by grants, outside the regions a restore makes
+    /// again, or that procmgr refuses as one no restore can reproduce (created pinned,
     /// phys-class or with a DMA hold); `OutOfMemory` when the Notification
     /// cannot be had; a failed call's error.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -2716,7 +2720,7 @@ pub mod checkpoint {
                 "seraph: quiesce off the main thread"
             ));
         }
-        if info.pager_endpoint_cap == 0 {
+        if info.pager_endpoint_cap == 0 || !crate::sys::alloc::seraph::heap_in_regions() {
             return Err(io::const_error!(
                 io::ErrorKind::Unsupported,
                 "seraph: quiesce of a process that is not demand-paged"
@@ -3458,6 +3462,9 @@ pub mod process {
         transfer: u64,
         region_id: u64,
         header: ipc::procmgr_labels::ArgvEnvHeader,
+        /// Counted for a quiesce point to refuse (docs/checkpoint-restore.md
+        /// § Quiesce point); ended before a withheld run is forgotten.
+        held: Option<crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::CAP }>>,
     }
 
     impl ArgvEnvCap {
@@ -3498,13 +3505,20 @@ pub mod process {
                 env_bytes: env.len() as u64,
                 env_count,
             };
-            let mut this = Self { original, transfer: 0, region_id, header };
+            let mut this = Self {
+                original,
+                transfer: 0,
+                region_id,
+                header,
+                held: Some(super::checkpoint::Held::new()),
+            };
             if let Err(still_mapped) = write_argv_env(aspace, original, pages, args, env) {
                 if still_mapped {
                     // A run this process may still have mapped stays charged
                     // to it until it exits, rather than going back to
                     // memmgr's pool.
                     let _ = syscall::cap_delete(this.original);
+                    this.held = None;
                     crate::mem::forget(this);
                 }
                 return Err(crate::io::Error::other("argv/env: mapping the blob pages failed"));
@@ -3536,12 +3550,13 @@ pub mod process {
         /// never returns to memmgr's pool), and otherwise drop it, returning
         /// the run to memmgr.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
-        pub fn settle(self, reply_label: u64) {
+        pub fn settle(mut self, reply_label: u64) {
             if reply_label == ipc::procmgr_errors::ARGV_ENV_STILL_MAPPED {
                 if self.transfer != 0 {
                     let _ = syscall::cap_delete(self.transfer);
                 }
                 let _ = syscall::cap_delete(self.original);
+                self.held = None;
                 crate::mem::forget(self);
             }
         }
@@ -3600,6 +3615,9 @@ pub mod process {
         peer_dead: crate::sync::Arc<crate::sync::atomic::AtomicBool>,
         /// The leader's end, once [`Self::wait`] has read it.
         ended: Option<u64>,
+        /// Counted for a quiesce point to refuse, since the value holds the
+        /// relay queue (docs/checkpoint-restore.md § Quiesce point).
+        _held: crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::CAP }>,
     }
 
     /// Entries the relay queue holds: procmgr's one post of the leader's end,
@@ -3632,6 +3650,7 @@ pub mod process {
                 releases: [None, None, None],
                 peer_dead: crate::sync::Arc::new(crate::sync::atomic::AtomicBool::new(false)),
                 ended: None,
+                _held: super::checkpoint::Held::new(),
             };
             for (index, role) in [Role::Writer, Role::Reader, Role::Reader].into_iter().enumerate() {
                 // An error drops `this` while no release is armed, so each

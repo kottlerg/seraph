@@ -3059,14 +3059,10 @@ pub fn create_process_from_bytes(
     let layout = match restore
     {
         None => choose_child_layout(),
-        Some(source) => restored_layout(
-            source.layout(),
-            image_key,
-            &segments,
-            bias,
-            &tls_template,
-            stack_pages,
-        )?,
+        Some(source) =>
+        {
+            restored_layout(source.layout(), image_key, &segments, bias, &tls_template)?
+        }
     };
 
     // The child's kernel objects and per-child memory caps are guarded from
@@ -3421,8 +3417,7 @@ fn text_spans(segments: &[elf::LoadSegment], bias: u64) -> Option<Vec<(u64, u64)
 
 /// The bootstrap layout of a process restored from `checkpoint`'s layout
 /// into the image `image_key` names, loaded at `bias` from `segments`,
-/// with the TLS template `tls` and a stack of `stack_pages` pages: the
-/// checkpoint's `ProcessInfo` page, stack top and IPC buffer, and the TLS
+/// with the TLS template `tls`: the checkpoint's `ProcessInfo` page, stack top and IPC buffer, and the TLS
 /// block whose thread pointer is the checkpoint's.
 ///
 /// # Errors
@@ -3430,7 +3425,9 @@ fn text_spans(segments: &[elf::LoadSegment], bias: u64) -> Option<Vec<(u64, u64)
 /// executable pages are not all the image's own
 /// (`process_table::restore::Layout::binds`), or its words do not fit the
 /// image: a TLS base without a template or a template without one, a block
-/// base off a page, or a restore stack pointer below the stack;
+/// base off a page, or a restore stack pointer outside the stack's
+/// reservation, the `MAX_PROCESS_STACK_PAGES` pages below its top that hold
+/// its committed pages and its demand growth;
 /// `INVALID_ELF` when a segment's address overflows.
 fn restored_layout(
     checkpoint: &process_table::restore::Layout,
@@ -3438,7 +3435,6 @@ fn restored_layout(
     segments: &[elf::LoadSegment],
     bias: u64,
     tls: &ChildTlsTemplate,
-    stack_pages: u32,
 ) -> Result<ProcessLayout, u64>
 {
     let image = ipc::procmgr_snapshot::Image {
@@ -3450,7 +3446,7 @@ fn restored_layout(
     {
         return Err(procmgr_errors::NOT_RESTORABLE);
     }
-    fitted_layout(checkpoint, tls, stack_pages).ok_or(procmgr_errors::NOT_RESTORABLE)
+    fitted_layout(checkpoint, tls).ok_or(procmgr_errors::NOT_RESTORABLE)
 }
 
 /// [`restored_layout`]'s placement of the checkpoint's words, `None` when
@@ -3458,7 +3454,6 @@ fn restored_layout(
 fn fitted_layout(
     checkpoint: &process_table::restore::Layout,
     tls: &ChildTlsTemplate,
-    stack_pages: u32,
 ) -> Option<ProcessLayout>
 {
     let c = &checkpoint.checkpoint;
@@ -3473,15 +3468,21 @@ fn fitted_layout(
             .checked_sub(offset)
             .filter(|base| *base != 0 && base.is_multiple_of(PAGE_SIZE))?
     };
-    let stack_base = c
+    // The point's frame may lie below the committed pages, in the demand
+    // growth the runtime registers below them, which the restore remakes
+    // with the checkpoint's other regions; the layout leaves the whole
+    // reservation to the stack.
+    let reservation = c
         .stack_top
-        .checked_sub(u64::from(stack_pages).checked_mul(PAGE_SIZE)?)?;
-    (c.restore_sp >= stack_base).then_some(ProcessLayout {
-        process_info_va: c.process_info_va,
-        stack_top: c.stack_top,
-        tls_base,
-        ipc_buffer_va: c.ipc_buffer_va,
-    })
+        .checked_sub(u64::from(process_abi::MAX_PROCESS_STACK_PAGES).checked_mul(PAGE_SIZE)?)?;
+    (reservation..c.stack_top)
+        .contains(&c.restore_sp)
+        .then_some(ProcessLayout {
+            process_info_va: c.process_info_va,
+            stack_top: c.stack_top,
+            tls_base,
+            ipc_buffer_va: c.ipc_buffer_va,
+        })
 }
 
 /// Give the entry of the restored process `badge` its start pointer, the

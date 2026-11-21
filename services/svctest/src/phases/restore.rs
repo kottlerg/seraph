@@ -11,12 +11,13 @@
 //! The phase spawns a `restore-child` and requires:
 //!
 //! - its quiesce is refused `ResourceBusy` while it holds the join handle of
-//!   a thread that has ended, a `std::fs::ReadDir`, a `VerifiedData` or a
-//!   `Checkpoint` (of a grandchild), and ends `NotCaptured` once it has joined
+//!   a thread that has ended, a `std::fs::ReadDir`, a `VerifiedData`, a
+//!   `Checkpoint` (of a grandchild), an `ArgvEnvCap`, a `SessionStdio` or a
+//!   `Command` holding a bootstrap cap, and ends `NotCaptured` once it has joined
 //!   the thread or dropped the value; a thread it detached does not refuse it
 //!   once it has ended;
 //! - a checkpoint of it, quiesced with a heap value, a static and its
-//!   `HashMap` keys set, restored twice by `Command::restore`, gives two new
+//!   `HashMap` keys set, on a frame below its committed stack pages, restored twice by `Command::restore`, gives two new
 //!   processes whose quiesce returns `Restored` with a notice no later than
 //!   now; each holds the captured heap value, static and argv, and through
 //!   the new process's caps reads the time as svctest does, finds a file,
@@ -33,7 +34,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Write};
 use std::os::seraph::checkpoint::{Checkpoint, Quiesced, RollbackNotice, quiesce};
-use std::os::seraph::process::{ChildExt, CommandExt};
+use std::os::seraph::process::{ArgvEnvCap, ChildExt, CommandExt, SessionStdio};
 use std::os::seraph::{
     VerifiedRole, namespace_lookup_file, read_verified, root_dir_cap, startup_info,
 };
@@ -128,6 +129,11 @@ fn child_main() -> !
             "readdir" => held(std::fs::read_dir("/tests")),
             "verified" => held(verified()),
             "checkpoint" => held(grandchild_checkpoint()),
+            "argv-env" => held(argv_env()),
+            "session" => held(
+                SessionStdio::new().unwrap_or_else(|e| panic!("{PHASE}: SessionStdio::new: {e}")),
+            ),
+            "command" => held(command_with_cap()),
             "restore" => restore_point(),
             _ => println!("unknown"),
         }
@@ -186,6 +192,26 @@ fn verified() -> std::os::seraph::VerifiedData
         .unwrap_or_else(|e| panic!("{PHASE}: verified read: {e}"))
 }
 
+/// A packed argv, held unsent.
+fn argv_env() -> ArgvEnvCap
+{
+    ArgvEnvCap::new(b"restore\0", 1, b"", 0)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| panic!("{PHASE}: ArgvEnvCap::new"))
+}
+
+/// A `Command` holding a bootstrap cap it has not sent, a copy of the
+/// process's procmgr SEND, which its drop deletes.
+fn command_with_cap() -> Command
+{
+    let cap = syscall::cap_derive(startup_info().procmgr_endpoint, syscall::RIGHTS_EP_SEND)
+        .unwrap_or_else(|e| panic!("{PHASE}: derive a procmgr SEND: {e:?}"));
+    let mut command = Command::new(BINARY);
+    command.bootstrap_caps(&[cap]);
+    command
+}
+
 /// A checkpoint of a grandchild, which has exited since.
 fn grandchild_checkpoint() -> Checkpoint
 {
@@ -198,10 +224,31 @@ fn grandchild_checkpoint() -> Checkpoint
     checkpoint
 }
 
+/// The bytes the point's frame holds, past the committed main stack, so the
+/// point lies in the stack's demand growth.
+const DEEP_BYTES: usize = (crate::SVCTEST_STACK_PAGES as usize + 4) * 4096;
+
 /// The point the phase checkpoints: the heap value, the static and the
-/// `HashMap` keys set, then a point with no time bound.
+/// `HashMap` keys set, then a point with no time bound, on a frame below the
+/// committed stack pages.
+#[expect(
+    clippy::large_stack_arrays,
+    clippy::large_stack_frames,
+    reason = "the frame is past the committed stack pages on purpose, so the point lies in the \
+              stack's demand growth"
+)]
 fn restore_point()
 {
+    let mut deep = [0u8; DEEP_BYTES];
+    std::hint::black_box(&mut deep);
+    let info = startup_info();
+    let committed = info
+        .stack_top_vaddr
+        .saturating_sub(u64::from(info.stack_pages).saturating_mul(4096));
+    assert!(
+        (deep.as_ptr() as u64) < committed,
+        "{PHASE}: the point's frame lies in the committed stack"
+    );
     let heap = Box::new(HEAP_VALUE);
     STATIC.store(STATIC_VALUE, Ordering::Relaxed);
     let _ = RandomState::new();
@@ -211,6 +258,7 @@ fn restore_point()
         Ok(Quiesced::Restored(notice)) => restored(*heap, notice),
         other => println!("{}", outcome(&other)),
     }
+    std::hint::black_box(&deep);
 }
 
 /// The restored process's report, on its own stdout; see the module
@@ -350,7 +398,15 @@ fn restore_phase(caps: &Caps)
 /// is dropped.
 fn held_refusals(child: &mut Peer)
 {
-    for what in ["thread", "readdir", "verified", "checkpoint"]
+    for what in [
+        "thread",
+        "readdir",
+        "verified",
+        "checkpoint",
+        "argv-env",
+        "session",
+        "command",
+    ]
     {
         assert_eq!(
             child.ask(what),

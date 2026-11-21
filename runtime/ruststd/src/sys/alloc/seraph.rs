@@ -825,6 +825,13 @@ pub fn heap_is_initialized() -> bool {
     BOOTSTRAP.load(Ordering::Acquire) == BOOTSTRAP_READY
 }
 
+/// Whether the heap lives in memmgr regions, its floor demand paged and its
+/// growth one committed region, which a restore makes again; `false` for a
+/// heap whose floor registration failed, which grows by grants.
+pub fn heap_in_regions() -> bool {
+    HEAP.lock().growth_base != 0
+}
+
 // ── Object slabs ────────────────────────────────────────────────────────────
 //
 // Per-process working Memory caps that back kernel-object retypes

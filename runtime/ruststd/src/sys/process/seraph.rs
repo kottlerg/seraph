@@ -186,6 +186,11 @@ pub struct Command {
     /// for an absent slot. Set via `CommandExt::bootstrap_caps`; empty (the
     /// default) gives the child no creator endpoint.
     bootstrap: BootstrapCaps,
+    /// Counted while `namespace_cap` or `cwd_dir_cap` holds a cap this
+    /// `Command` owns, which a quiesce point refuses
+    /// (docs/checkpoint-restore.md § Quiesce point); a spawn ends it once it
+    /// has sent both.
+    overrides_held: Option<crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::CAP }>>,
 }
 
 impl Command {
@@ -205,7 +210,8 @@ impl Command {
             restore: 0,
             priority: 0,
             sched_max: 0,
-            bootstrap: BootstrapCaps(Vec::new()),
+            bootstrap: BootstrapCaps::new(Vec::new()),
+            overrides_held: None,
         }
     }
 
@@ -215,12 +221,22 @@ impl Command {
     /// the cap to this `Command` (consumed by the next `spawn`).
     pub fn set_namespace_cap(&mut self, cap: u64) {
         self.namespace_cap = cap;
+        self.count_overrides();
     }
 
     /// Install a per-spawn override for the child's
     /// `ProcessInfo.current_dir_cap`. Called by `CommandExt::cwd_dir_cap`.
     pub fn set_cwd_dir_cap(&mut self, cap: u64) {
         self.cwd_dir_cap = cap;
+        self.count_overrides();
+    }
+
+    /// Count the cap overrides while either holds a cap (`overrides_held`).
+    fn count_overrides(&mut self) {
+        let owned = self.namespace_cap != 0 || self.cwd_dir_cap != 0;
+        if owned != self.overrides_held.is_some() {
+            self.overrides_held = owned.then(crate::os::seraph::checkpoint::Held::new);
+        }
     }
 
     /// Restore the checkpoint `object` names on the next spawn, or create
@@ -255,7 +271,7 @@ impl Command {
     /// Hand the child `slots` over the bootstrap protocol. Called by
     /// `CommandExt::bootstrap_caps`; the caps of an earlier call are deleted.
     pub fn set_bootstrap_caps(&mut self, slots: &[u64]) {
-        self.bootstrap = BootstrapCaps(slots.to_vec());
+        self.bootstrap = BootstrapCaps::new(slots.to_vec());
     }
 
     pub fn arg(&mut self, arg: &OsStr) {
@@ -356,7 +372,7 @@ impl Command {
 
         // The bootstrap caps leave the `Command` here, so every return below
         // deletes those no round moved to the child, as the guard's drop does.
-        let mut bootstrap = core::mem::replace(&mut self.bootstrap, BootstrapCaps(Vec::new()));
+        let mut bootstrap = core::mem::replace(&mut self.bootstrap, BootstrapCaps::new(Vec::new()));
 
         let path_bytes = self.program.as_encoded_bytes();
         if path_bytes.is_empty() {
@@ -797,6 +813,7 @@ impl Command {
         let ns_cap_to_send: u64 = if self.namespace_cap != 0 {
             let cap = self.namespace_cap;
             self.namespace_cap = 0;
+            self.count_overrides();
             cap
         } else {
             match syscall::cap_copy(parent_root, info.self_cspace, syscall::RIGHTS_EP_SEND) {
@@ -807,6 +824,7 @@ impl Command {
         let cwd_resolution: io::Result<u64> = if self.cwd_dir_cap != 0 {
             let cap = self.cwd_dir_cap;
             self.cwd_dir_cap = 0;
+            self.count_overrides();
             Ok(cap)
         } else if let Some(cwd_os) = self.cwd.as_ref() {
             match cwd_os.to_str() {
@@ -997,8 +1015,16 @@ const BOOTSTRAP_BADGE: u64 = 1;
 /// (`CommandExt::bootstrap_caps`), positional, `0` for an absent slot or
 /// one a round has moved to the child. Dropping it deletes every cap still
 /// held, so caps no round delivered, through a failed spawn or a `Command`
-/// dropped unspawned, are released.
-struct BootstrapCaps(Vec<u64>);
+/// dropped unspawned, are released. A value that holds a cap is counted for a
+/// quiesce point to refuse (docs/checkpoint-restore.md § Quiesce point).
+struct BootstrapCaps(Vec<u64>, Option<crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::CAP }>>);
+
+impl BootstrapCaps {
+    fn new(slots: Vec<u64>) -> Self {
+        let held = slots.iter().any(|&cap| cap != 0).then(crate::os::seraph::checkpoint::Held::new);
+        BootstrapCaps(slots, held)
+    }
+}
 
 impl Drop for BootstrapCaps {
     fn drop(&mut self) {

@@ -858,7 +858,8 @@ signals no more.
 
 - `quiesce(timeout)` quiesces the process at the call, for its controller to take a checkpoint
   of it. It is refused, capturing nothing, off the main thread (`InvalidInput`), in a process that
-  is not demand-paged or that procmgr refuses as one no restore can reproduce (`Unsupported`), and
+  is not demand-paged, whose heap grows by grants since its demand floor could not be registered,
+  or that procmgr refuses as one no restore can reproduce (`Unsupported`), and
   while a value holding a capability of the process is alive (`ResourceBusy`, below). Otherwise it
   saves the caller's callee-saved registers, stack pointer and return address in a resume record
   on its stack, creates a Notification, sends procmgr `QUIESCE` with a Notify-only derivation of
@@ -891,8 +892,8 @@ reproduce. A thread the application spawned, until its cleanup has run (`src/sys
 an open `std::fs::File`, a held `std::process::Child` and an open pipe end are such values, and so
 are, among others, the `JoinHandle` of a thread that has ended until it is joined or dropped, a
 `std::fs::ReadDir`, a `VerifiedData` and a `Checkpoint`. A thread detached by dropping its
-`JoinHandle` holds nothing once it has ended. Each value counts itself through a zero-sized field,
-which adds no bytes to it: the count is taken when the value is made and released when it is
+`JoinHandle` holds nothing once it has ended. Each value counts itself through a field of the
+runtime's `checkpoint::Held` type: the count is taken when the value is made and released when it is
 dropped, so it cannot drift from the values alive. A value the application forgets
 (`mem::forget`) keeps its count, and every later `quiesce` of the process is refused; that is
 accepted, as the leak of the capability is. The runtime's own threads, the fs release handler and

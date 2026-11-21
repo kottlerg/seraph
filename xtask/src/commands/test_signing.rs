@@ -793,7 +793,9 @@ mod tests
         let first = signed(b"\x7fELF first");
         let second = signed(b"\x7fELF second");
         let align = usize::try_from(fmt::BODY_ALIGNMENT).unwrap();
-        let mut bundle = vec![0u8; 3 * align];
+        // Each body in its own aligned slot, after the headers' slot.
+        let slot = first.len().max(second.len()).next_multiple_of(align);
+        let mut bundle = vec![0u8; align + 2 * slot];
         bundle[..8].copy_from_slice(&fmt::MAGIC);
         bundle[8..12].copy_from_slice(&fmt::VERSION.to_le_bytes());
         bundle[12..16].copy_from_slice(&2u32.to_le_bytes());
@@ -803,7 +805,7 @@ mod tests
         {
             let at = fmt::HEADER_SIZE + index * fmt::ENTRY_HEADER_SIZE;
             bundle[at..at + name.len()].copy_from_slice(name.as_bytes());
-            let offset = (index + 1) * align;
+            let offset = align + index * slot;
             let fields = at + fmt::ENTRY_NAME_LEN;
             bundle[fields..fields + 8].copy_from_slice(&(offset as u64).to_le_bytes());
             bundle[fields + 8..fields + 16].copy_from_slice(&(object.len() as u64).to_le_bytes());

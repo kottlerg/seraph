@@ -583,7 +583,7 @@ mod tests
                 name: b"/config/devmgr/platform/qemu-virt.platform",
             },
             certificate: None,
-            signature: [0; 64],
+            signature: &[0; objsig::composite::SIGNATURE_LEN],
         };
         let mut trailer = vec![0u8; objsig::trailer_len(&[record]).unwrap()];
         objsig::encode_trailer(body, &[record], &mut trailer).unwrap();

@@ -10,13 +10,13 @@
 use crate::wire::{Reader, Writer};
 use crate::{Arch, EncodeError, ParseError, RoleSet};
 
-/// The domain tag the attributes begin with: `seraph/obj/v2`, padded with
+/// The domain tag the attributes begin with: `seraph/obj/v3`, padded with
 /// NUL bytes to 16. Attributes of another version carry another tag and do
 /// not parse.
-pub const DOMAIN: [u8; 16] = *b"seraph/obj/v2\0\0\0";
+pub const DOMAIN: [u8; 16] = *b"seraph/obj/v3\0\0\0";
 
 /// The length of the attributes' fixed part, before the name.
-pub const FIXED_LEN: usize = 96;
+pub const FIXED_LEN: usize = 99;
 
 /// The longest attributes a record holds: its `attrs_len` is a `u16`.
 pub const MAX_LEN: usize = u16::MAX as usize;
@@ -63,10 +63,10 @@ impl<'a> Attributes<'a>
         let domain = reader.array::<16>().ok_or(short)?;
         let body_len = reader.u64().ok_or(short)?;
         let security_version = reader.u32().ok_or(short)?;
-        let roles = reader.u8().ok_or(short)?;
-        let arch = reader.u8().ok_or(short)?;
-        let name_len = reader.u16().ok_or(short)?;
+        let roles = reader.u32().ok_or(short)?;
         let body_hash = reader.array::<HASH_LEN>().ok_or(short)?;
+        let name_len = reader.u16().ok_or(short)?;
+        let arch = reader.u8().ok_or(short)?;
         if domain != DOMAIN
         {
             return Err(ParseError::AttributesDomain);
@@ -92,7 +92,7 @@ impl<'a> Attributes<'a>
         })
     }
 
-    /// The length of the encoded attributes, 96 + the name's length.
+    /// The length of the encoded attributes, 99 + the name's length.
     ///
     /// # Errors
     ///
@@ -135,9 +135,10 @@ impl<'a> Attributes<'a>
         writer.put(&DOMAIN)?;
         writer.put(&self.body_len.to_le_bytes())?;
         writer.put(&self.security_version.to_le_bytes())?;
-        writer.put(&[self.roles.bits(), self.arch as u8])?;
-        writer.put(&name_len.to_le_bytes())?;
+        writer.put(&self.roles.bits().to_le_bytes())?;
         writer.put(&self.body_hash)?;
+        writer.put(&name_len.to_le_bytes())?;
+        writer.put(&[self.arch as u8])?;
         writer.put(self.name)?;
         Ok(len)
     }
@@ -176,21 +177,25 @@ mod tests
     fn layout_matches_the_specification()
     {
         let bytes = encoded(&sample(b"/services/svcmgr"));
-        assert_eq!(bytes.len(), 96 + 16);
-        assert_eq!(&bytes[0..16], b"seraph/obj/v2\0\0\0");
+        assert_eq!(bytes.len(), 99 + 16);
+        assert_eq!(&bytes[0..16], b"seraph/obj/v3\0\0\0");
         assert_eq!(&bytes[16..24], &0x0102_0304_0506_0708u64.to_le_bytes());
         assert_eq!(&bytes[24..28], &0x1122_3344u32.to_le_bytes());
-        assert_eq!(bytes[28], 0b0001_1000, "roles boot module and service");
-        assert_eq!(bytes[29], 2, "arch riscv64");
-        assert_eq!(&bytes[30..32], &16u16.to_le_bytes());
+        assert_eq!(
+            &bytes[28..32],
+            &0b0001_1000u32.to_le_bytes(),
+            "roles boot module and service"
+        );
         assert_eq!(&bytes[32..96], &[0xa5; 64]);
-        assert_eq!(&bytes[96..], b"/services/svcmgr");
+        assert_eq!(&bytes[96..98], &16u16.to_le_bytes());
+        assert_eq!(bytes[98], 2, "arch riscv64");
+        assert_eq!(&bytes[99..], b"/services/svcmgr");
     }
 
     #[test]
     fn round_trips()
     {
-        for bits in 0..=u8::MAX
+        for bits in 0..=u32::from(u8::MAX)
         {
             let Some(roles) = RoleSet::from_signed(bits)
             else
@@ -238,44 +243,60 @@ mod tests
         refuse(&|b| b[28] = 0b0000_0110, ParseError::Roles);
         refuse(&|b| b[28] = 0b0001_0010, ParseError::Roles);
         refuse(&|b| b[28] = 0b1000_0100, ParseError::Roles);
-        refuse(&|b| b[29] = 0, ParseError::Arch);
-        refuse(&|b| b[29] = 3, ParseError::Arch);
+        // Bit 8, which no role has yet, and bit 31, CERTIFY in a usage mask.
+        refuse(&|b| b[29] = 1, ParseError::Roles);
+        refuse(&|b| b[31] = 0x80, ParseError::Roles);
+        refuse(&|b| b[30] = 1, ParseError::Roles);
+        refuse(&|b| b[98] = 0, ParseError::Arch);
+        refuse(&|b| b[98] = 3, ParseError::Arch);
         refuse(
             &|b| {
                 b.truncate(FIXED_LEN);
-                b[30] = 0;
+                b[96] = 0;
             },
             ParseError::EmptyName,
         );
     }
 
-    /// The attributes of signed-attributes version 1, whose byte 28 is a
-    /// single kind: their domain tag is not this version's, so they do not
-    /// parse, whatever the byte holds.
+    /// The attributes of an earlier version, version 1's single kind or
+    /// version 2's one-byte role set at byte 28: their domain tag is not this
+    /// version's, so they do not parse, whatever the bytes after it hold.
     #[test]
-    fn refuses_a_version_1_record()
+    fn refuses_an_earlier_version()
     {
-        let mut v1 = encoded(&sample(b"/services/svcmgr"));
-        v1[..16].copy_from_slice(b"seraph/obj/v1\0\0\0");
-        for kind in 1..=7
+        for tag in [b"seraph/obj/v1\0\0\0", b"seraph/obj/v2\0\0\0"]
         {
-            v1[28] = kind;
-            assert_eq!(Attributes::parse(&v1), Err(ParseError::AttributesDomain));
+            let mut old = encoded(&sample(b"/services/svcmgr"));
+            old[..16].copy_from_slice(tag);
+            for kind in 1..=7
+            {
+                old[28] = kind;
+                assert_eq!(Attributes::parse(&old), Err(ParseError::AttributesDomain));
+            }
         }
     }
 
-    /// The parser's rule for the role byte: every set of roles is accepted
-    /// but an empty one, one with bit 0, and one holding kernel or init
-    /// beside another role.
+    /// The parser's rule for the role field: every set of roles is accepted
+    /// but an empty one, one with bit 0 or a bit no role has, and one holding
+    /// kernel or init beside another role.
     #[test]
     fn accepts_exactly_the_signable_role_sets()
     {
-        let accepted = (0..=u8::MAX)
+        let accepted = (0..=0x3ffu32)
             .filter(|bits| RoleSet::from_signed(*bits).is_some())
             .count();
         // The 31 nonempty sets of the five roles past init, and kernel and
         // init alone.
         assert_eq!(accepted, 31 + 2);
+        for bit in 8..32
+        {
+            let service = RoleSet::of(&[Role::Service]).bits();
+            assert_eq!(
+                RoleSet::from_signed(service | (1 << bit)),
+                None,
+                "bit {bit}"
+            );
+        }
         for role in Role::ALL
         {
             assert!(RoleSet::from_signed(RoleSet::of(&[role]).bits()).is_some());

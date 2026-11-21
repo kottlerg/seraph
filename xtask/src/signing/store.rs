@@ -156,8 +156,14 @@ mod tests
 
     use super::*;
 
+    /// The test key whose every byte is `byte`, leaked.
+    fn key(byte: u8) -> &'static PublicKey
+    {
+        Box::leak(Box::new([byte; objsig::composite::PUBLIC_KEY_LEN]))
+    }
+
     /// An anchor of `key` that may certify every kind.
-    fn anchor(key: PublicKey, label: &str) -> AnchorSpec<'_>
+    fn anchor<'a>(key: &'a PublicKey, label: &'a str) -> AnchorSpec<'a>
     {
         AnchorSpec {
             key,
@@ -173,7 +179,7 @@ mod tests
     /// A store of `anchors`, sorted here, and `revoked`.
     fn store_of(floor: u32, mut anchors: Vec<AnchorSpec<'_>>, mut revoked: Vec<KeyId>) -> Vec<u8>
     {
-        anchors.sort_by_key(|spec| key_id(&spec.key));
+        anchors.sort_by_key(|spec| key_id(spec.key));
         revoked.sort_unstable();
         encode(floor, &anchors, &revoked).unwrap()
     }
@@ -200,22 +206,22 @@ mod tests
     #[test]
     fn merging_unites_the_anchors_and_revocations_under_the_highest_floor()
     {
-        let own = store_of(1, vec![anchor([1; 32], "own")], vec![[9; 16]]);
-        let shared = anchor([2; 32], "shared");
+        let own = store_of(1, vec![anchor(key(1), "own")], vec![[9; 16]]);
+        let shared = anchor(key(2), "shared");
         let deployer = store_of(
             5,
-            vec![shared, anchor([3; 32], "deployer")],
+            vec![shared, anchor(key(3), "deployer")],
             vec![[8; 16], [9; 16]],
         );
         let merged = build(&own, Some((&deployer, StoreMode::Merge)), 1).unwrap();
-        let ids = sorted(vec![key_id(&[1; 32]), key_id(&[2; 32]), key_id(&[3; 32])]);
+        let ids = sorted(vec![key_id(key(1)), key_id(key(2)), key_id(key(3))]);
         assert_eq!(contents(&merged), (ids, vec![[8; 16], [9; 16]], 5));
 
         // The tree's version raises a lower floor, and an anchor both stores
         // hold alike is kept once.
         let again = store_of(0, vec![shared], Vec::new());
         let merged = build(&deployer, Some((&again, StoreMode::Merge)), 7).unwrap();
-        let ids = sorted(vec![key_id(&[2; 32]), key_id(&[3; 32])]);
+        let ids = sorted(vec![key_id(key(2)), key_id(key(3))]);
         assert_eq!(contents(&merged), (ids, vec![[8; 16], [9; 16]], 7));
     }
 
@@ -224,12 +230,12 @@ mod tests
     #[test]
     fn replacing_keeps_the_deployers_store_alone()
     {
-        let own = store_of(1, vec![anchor([1; 32], "own")], Vec::new());
-        let deployer = store_of(0, vec![anchor([3; 32], "deployer")], vec![[8; 16]]);
+        let own = store_of(1, vec![anchor(key(1), "own")], Vec::new());
+        let deployer = store_of(0, vec![anchor(key(3), "deployer")], vec![[8; 16]]);
         let replaced = build(&own, Some((&deployer, StoreMode::Replace)), 1).unwrap();
         assert_eq!(
             contents(&replaced),
-            (vec![key_id(&[3; 32])], vec![[8; 16]], 1)
+            (vec![key_id(key(3))], vec![[8; 16]], 1)
         );
     }
 
@@ -238,8 +244,8 @@ mod tests
     #[test]
     fn one_key_anchored_differently_by_two_stores_is_refused()
     {
-        let own = store_of(1, vec![anchor([1; 32], "own")], Vec::new());
-        let mut narrow = anchor([1; 32], "own");
+        let own = store_of(1, vec![anchor(key(1), "own")], Vec::new());
+        let mut narrow = anchor(key(1), "own");
         narrow.usage.certify = false;
         let deployer = store_of(1, vec![narrow], Vec::new());
         build(&own, Some((&deployer, StoreMode::Merge)), 1).unwrap_err();
@@ -250,7 +256,7 @@ mod tests
     #[test]
     fn a_deployer_store_that_does_not_parse_is_refused()
     {
-        let own = store_of(1, vec![anchor([1; 32], "own")], Vec::new());
+        let own = store_of(1, vec![anchor(key(1), "own")], Vec::new());
         build(&own, Some((b"not a store", StoreMode::Merge)), 1).unwrap_err();
         build(&own, Some((b"not a store", StoreMode::Replace)), 1).unwrap_err();
     }

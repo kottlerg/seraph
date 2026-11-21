@@ -204,7 +204,10 @@ fn resolve(table: &Command, words: &[Token]) -> Vec<String>
     let mut at = table;
     // Whether `at` is the command the line names, not one above a placeholder.
     let mut exact = true;
+    let mut lookup: OptionLookup = Command::long_takes_value;
     let mut positional_seen = false;
+    // The index of the next positional of `at` the line gives.
+    let mut positional = 0;
     let mut iter = words.iter();
     while let Some(token) = iter.next()
     {
@@ -213,7 +216,11 @@ fn resolve(table: &Command, words: &[Token]) -> Vec<String>
         {
             if !at.children().is_empty()
             {
-                exact = false;
+                (exact, lookup) = (false, option_below);
+            }
+            else if exact && takes_rest(at, &mut positional)
+            {
+                break;
             }
             positional_seen = true;
             continue;
@@ -233,24 +240,14 @@ fn resolve(table: &Command, words: &[Token]) -> Vec<String>
             {
                 continue;
             }
-            match if exact
+            match long_option(at, lookup, name)
             {
-                at.long_takes_value(name)
-            }
-            else
-            {
-                option_below(at, name)
-            }
-            {
-                None => problems.push(format!(
-                    "`--{name}` is not an option of `cargo {}`",
-                    at.path()
-                )),
-                Some(true) if !attached =>
+                Err(problem) => problems.push(problem),
+                Ok(true) if !attached =>
                 {
                     iter.next();
                 }
-                Some(_) =>
+                Ok(_) =>
                 {}
             }
             continue;
@@ -264,7 +261,7 @@ fn resolve(table: &Command, words: &[Token]) -> Vec<String>
         {
             if !literal
             {
-                exact = false;
+                (exact, lookup) = (false, option_below);
                 continue;
             }
             if word == "help"
@@ -282,6 +279,10 @@ fn resolve(table: &Command, words: &[Token]) -> Vec<String>
             ));
             break;
         }
+        if exact && takes_rest(at, &mut positional)
+        {
+            break;
+        }
         if exact && !positional_seen
         {
             positional_seen = true;
@@ -297,6 +298,29 @@ fn resolve(table: &Command, words: &[Token]) -> Vec<String>
         }
     }
     problems
+}
+
+/// Whether `--name` takes a value, by `lookup` (on the command the line
+/// names, or below a placeholder); the problem when no command it can stand
+/// for has the option.
+fn long_option(at: &Command, lookup: OptionLookup, name: &str) -> Result<bool, String>
+{
+    lookup(at, name).ok_or_else(|| format!("`--{name}` is not an option of `cargo {}`", at.path()))
+}
+
+/// How an option is looked up: `Command::long_takes_value` or `option_below`.
+type OptionLookup = fn(&Command, &str) -> Option<bool>;
+
+/// Whether the next positional of `at` takes the rest of the line, options
+/// included, as the parser reads it; counts the positional otherwise.
+fn takes_rest(at: &Command, positional: &mut usize) -> bool
+{
+    if at.positional_takes_rest(*positional)
+    {
+        return true;
+    }
+    *positional = positional.saturating_add(1);
+    false
 }
 
 /// The problems of every command line in `text` (a span's content or a
@@ -506,6 +530,8 @@ mod tests
             "cargo xtask test <CASE> [--arch x86_64|riscv64] [--cpus N] [case options]",
             "cargo xtask test ${{ matrix.case }} --arch ${{ matrix.arch }}",
             "cargo xtask orch worker W1 --status 'a line --not-an-option'",
+            "cargo xtask orch grant set W2 run --cpus 128 --runs 1",
+            "cargo xtask orch grant set <holder> <commands>... --not-checked",
             "cargo xtask review-ledger 12 --check",
             "cargo xtask",
             "cargo xtask help run",

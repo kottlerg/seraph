@@ -382,6 +382,20 @@ impl Command
         Some((arg.value_name_text(), values))
     }
 
+    /// Whether its positional at `index` (counting from 0; a `Vec` positional
+    /// last also takes every later index) takes the rest of the command line,
+    /// options included: a trailing positional, or one whose values may start
+    /// with a dash.
+    #[must_use]
+    pub fn positional_takes_rest(&self, index: usize) -> bool
+    {
+        let positionals: Vec<&Arg> = self.args.iter().filter(|arg| arg.is_positional()).collect();
+        positionals
+            .get(index)
+            .or_else(|| positionals.last().filter(|arg| arg.kind == Kind::Multi))
+            .is_some_and(|arg| arg.trailing || arg.hyphen_values)
+    }
+
     /// Set each command's path below this one's.
     fn set_paths(&mut self)
     {

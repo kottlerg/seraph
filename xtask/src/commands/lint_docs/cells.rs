@@ -68,13 +68,14 @@ fn row_cells(line: &str) -> Vec<String>
         .collect()
 }
 
-/// The lines of the section `heading` opens in `text` (zero-based index,
-/// line), up to the next heading of its level or above; `None` when no line
-/// is `heading`.
+/// The prose lines of the section `heading` opens in `text` (zero-based
+/// index, line), up to the next heading of its level or above, the lines of
+/// fenced code blocks left out; `None` when no prose line is `heading`.
 fn section<'a>(text: &'a str, heading: &str) -> Option<Vec<(usize, &'a str)>>
 {
     let level = heading.chars().take_while(|&c| c == '#').count();
-    let mut lines = text.lines().enumerate();
+    // A heading is prose: a `#` line in a fenced code block is not one.
+    let mut lines = super::prose_lines(text);
     lines.find(|(_, line)| line.trim_end() == heading)?;
     Some(
         lines
@@ -90,11 +91,12 @@ fn section<'a>(text: &'a str, heading: &str) -> Option<Vec<(usize, &'a str)>>
 fn tables(lines: &[(usize, &str)]) -> Vec<Table>
 {
     let mut out: Vec<Table> = Vec::new();
-    let mut previous_row = false;
+    // The index of the last row seen: a table's rows are consecutive lines.
+    let mut previous_row: Option<usize> = None;
     for &(idx, line) in lines
     {
         let row = line.trim_start().starts_with('|');
-        if row && !previous_row
+        if row && previous_row.is_none_or(|previous| previous.saturating_add(1) != idx)
         {
             out.push(Table {
                 line: one_based(idx),
@@ -113,7 +115,7 @@ fn tables(lines: &[(usize, &str)]) -> Vec<Table>
                 table.rows.push((one_based(idx), cells));
             }
         }
-        previous_row = row;
+        previous_row = row.then_some(idx);
     }
     out
 }
@@ -560,6 +562,20 @@ mod tests
 
     // Defect caught: the rule refusing the documents as the tree holds them,
     // which would fail every CI run.
+    // Defect caught: a `#` comment in a fenced block read as a heading, which
+    // ended the section before its own tables and headings.
+    #[test]
+    fn a_comment_in_a_fenced_block_does_not_end_a_section()
+    {
+        let text = "## Gating\n\n```sh\n# a comment\n```\n\n| A |\n|---|\n| x |\n\n## Next\n";
+        let lines = section(text, "## Gating").unwrap_or_default();
+        let rows: Vec<usize> = tables(&lines)
+            .iter()
+            .map(|table| table.rows.len())
+            .collect();
+        assert_eq!(rows, vec![1]);
+    }
+
     #[test]
     fn the_tracked_documents_state_the_registry()
     {

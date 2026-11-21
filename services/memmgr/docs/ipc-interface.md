@@ -51,8 +51,8 @@ Two privilege classes:
   `DISCARD_RANGE`, `SEAL_OBJECT` and `ATTACH_OBJECT` are attributed to the
   caller by its own badge.
 - **Node** labels (`NODE_SET_MAX`, `NODE_CREATE`, `NODE_QUERY_USAGE`,
-  `NODE_REGISTER_LIMIT`, `NODE_RELEASE`) are callable only over a node
-  handle, and act on the budget node it names (§ Node Handles).
+  `NODE_REGISTER_LIMIT`, `NODE_RELEASE`, `NODE_SET_RECLAIM`) are callable only
+  over a node handle, and act on the budget node it names (§ Node Handles).
 - **Swap** labels (`SWAP_REGISTER`, `SWAP_TAKE`, `SWAP_DONE`,
   `SWAP_RESTORE`, `SWAP_WANTED`) are callable only over the swap authority, a
   `SEND|GRANT` badged `SWAP_AUTHORITY` (bit 61) alone, which init mints on
@@ -137,7 +137,9 @@ which procmgr hands to memmgr with `REGISTER_CHARGE_NODE` (§ Label 3).
 
 No process receives a handle to its own node through these paths, so none can
 raise the max its creator set; the handles it holds name its children's nodes
-and the sub-nodes it made. Nothing is reclaimed or killed through a handle.
+and the sub-nodes it made. Nothing is killed through a handle, and no label of
+it reclaims a page: a floor and a weight set through one steer only which
+pages eviction takes (§ Label 32).
 
 ---
 
@@ -925,8 +927,8 @@ usage signals the node's limit event (§ Label 17).
 
 Make a sub-node under the handle's node and return a handle to it. Privilege:
 node, over a node handle (§ Node Handles). Processes charged to one sub-node
-share its budget; procmgr's charge to a sub-node at process creation is the
-next phase of [#1097](https://github.com/kottlerg/seraph/issues/1097).
+share its budget; procmgr charges a new process to a sub-node when its creator
+passes the sub-node's handle with `CREATE_CHARGE_NODE` (§ Node Handles).
 
 **Request:**
 
@@ -966,7 +968,10 @@ Read-only query of the handle's node. Privilege: node, over a node handle
 
 **Reply (success):** as `QUERY_MEMORY_USAGE` (§ Label 10), for the handle's
 node: `data[0]` `own_pages`, `data[1]` `max_pages` (`u64::MAX` for none),
-`data[2]` `subtree_pages`.
+`data[2]` `subtree_pages`; then `data[3]` the node's floor and `data[4]` its
+weight (§ Label 32), and `data[5]` its subtree's evictable resident pages, the
+pages the floor is held against ([`memory-pool.md`](memory-pool.md)
+§ Distribution policy, Floors and weights).
 
 **Error codes:**
 
@@ -1585,6 +1590,47 @@ could not read.
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A destination page could not be mapped |
 | 4 | `INVALID_ARGUMENT` | Unknown badge, an end not past the cursor, a cursor or end not on a page or inside a region off a chunk's base, a flag bit not defined, `CAPTURE_IMAGE` without a cap or with one that names no object, or a destination page count missing for a cap |
 | 5 | `UNAUTHORIZED` | The caller is not procmgr |
+
+### Label 32: `NODE_SET_RECLAIM`
+
+Set the floor and the weight of the handle's budget node
+([`memory-pool.md`](memory-pool.md) § Distribution policy, Floors and weights). Privilege: node,
+over a node handle (§ Node Handles).
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 32 |
+| data[0] | `floor_pages`: the evictable resident pages of the node's subtree that eviction leaves, 0 for none |
+| data[1] | `weight`: `NODE_WEIGHT_MIN` (1) to `NODE_WEIGHT_MAX` (10000); a node none was set on has `NODE_WEIGHT_DEFAULT` (100) |
+
+The floor is the hard guarantee: memmgr evicts no chunk, in the background or by direct reclaim,
+that would take the evictable resident pages of the node's subtree below it. The weight is the soft
+preference: above their floors, memmgr reclaims from nodes in proportion to the pages each holds
+above its floor over its weight. A floor or a weight covers the node's whole subtree, and the most
+protective of the node and its ancestors holds. Neither reserves a free page or changes what memmgr
+admits: a charge to any node is admitted against the free pages a floor covers, and when every
+evictable page left lies under some floor, eviction finds no victim and the out-of-memory path
+decides. No ancestor bounds either, since a process can exempt any page of its own from eviction
+with `REGION_NO_EVICT` (§ Label 7), and the node's max bounds what a floor withholds as it bounds
+what a no-evict region does. `NODE_QUERY_USAGE` reads both back with the pages the floor is held
+against (§ Label 16).
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 (success) |
+| data[0] | the floor the node took |
+| data[1] | the weight the node took |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state, or the weight is outside `NODE_WEIGHT_MIN` to `NODE_WEIGHT_MAX` |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle |
 
 ### Kernel-origin fault message (`FAULT_LABEL`)
 

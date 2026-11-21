@@ -131,7 +131,9 @@ guarantees an image 128 KiB or more of available stack space during boot service
 calling convention it sets for each of x64 and RISC-V, so 128 KiB bounds the bootloader's
 deepest call chain. A quarter of it, 32768 bytes, is the bootloader's `large_stack_frames`
 threshold (`stack-size-threshold` in `core/boot/clippy.toml`;
-[docs/coding-standards.md](../../../docs/coding-standards.md) § Clippy). The firmware's stack
+[docs/coding-standards.md](../../../docs/coding-standards.md) § Clippy). A signature
+verification, its certificate's included, was measured at under 11 KiB of the 128 KiB
+([docs/signing.md](../../../docs/signing.md) § Composite Signature). The firmware's stack
 lies in `EfiBootServicesData` memory, which the kernel zeroes before minting it to userspace
 ([memory-map.md](memory-map.md)).
 

@@ -40,9 +40,28 @@ pub fn name_is_install_path(name: &[u8]) -> bool
     {
         return false;
     }
-    let component = |c: &[u8]| !c.is_empty() && c != b"." && c != b".." && !c.contains(&0);
     name.strip_prefix(b"/")
-        .is_some_and(|path| path.split(|&b| b == b'/').all(component))
+        .is_some_and(|path| path.split(|&b| b == b'/').all(is_component))
+}
+
+/// Whether `name` is one component of an install path in the canonical
+/// form, as a directory's index names its files (`crate::index`): 1 to
+/// [`NAME_MAX`] bytes of UTF-8 holding no `/` and no NUL, and neither `.`
+/// nor `..`.
+#[must_use]
+pub fn name_is_component(name: &[u8]) -> bool
+{
+    name.len() <= NAME_MAX
+        && core::str::from_utf8(name).is_ok()
+        && is_component(name)
+        && !name.contains(&b'/')
+}
+
+/// The component rule of [`name_is_install_path`] for a component split at
+/// `/`: nonempty, no NUL, and neither `.` nor `..`.
+fn is_component(component: &[u8]) -> bool
+{
+    !component.is_empty() && component != b"." && component != b".." && !component.contains(&0)
 }
 
 #[cfg(test)]
@@ -71,6 +90,23 @@ mod tests
         longest[0] = b'/';
         assert!(name_is_canonical(&longest));
         assert!(name_is_install_path(&longest));
+    }
+
+    // Defect caught: an index entry that reaches outside its directory, names
+    // the directory itself, or is not UTF-8, accepted as a file name.
+    #[test]
+    fn a_component_is_one_name_within_a_directory()
+    {
+        for name in [&b"logd.svc"[..], b"..x", b"index", "\u{e9}".as_bytes()]
+        {
+            assert!(name_is_component(name), "{name:?}");
+        }
+        for name in [&b""[..], b".", b"..", b"a/b", b"/a", b"a\0", b"\xff"]
+        {
+            assert!(!name_is_component(name), "{name:?}");
+        }
+        assert!(name_is_component(&[b'x'; NAME_MAX]));
+        assert!(!name_is_component(&[b'x'; NAME_MAX + 1]));
     }
 
     /// One component that is not a slot name is no name at all: the

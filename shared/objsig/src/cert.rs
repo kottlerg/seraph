@@ -256,7 +256,8 @@ mod tests
         refuse(&|b| b[13] = b'1', ParseError::CertificateDomain);
         refuse(&|b| b[15] = 1, ParseError::CertificateDomain);
         refuse(&|b| b[2024] |= 1, ParseError::CertificateUsage);
-        refuse(&|b| b[2025] |= 1, ParseError::CertificateUsage);
+        // Bit 9, which no role has yet.
+        refuse(&|b| b[2025] |= 2, ParseError::CertificateUsage);
         refuse(&|b| b[2027] |= 0x40, ParseError::CertificateUsage);
         refuse(&|b| b[2027] |= 0x80, ParseError::CertificateCertify);
         refuse(&|b| b[2032] = 2, ParseError::CertificateRange);

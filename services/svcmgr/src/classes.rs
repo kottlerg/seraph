@@ -5,27 +5,29 @@
 
 //! devmgr's device classes, configured from the class files of
 //! `/config/devmgr/classes/` (`services/svcmgr/docs/service-definitions.md`
-//! § Device class files): for each file svcmgr asks devmgr for the SEND of
+//! § Device class files), read through the directory's signed index
+//! (`crate::config`): for each file the index names svcmgr asks devmgr for the SEND of
 //! the class the file configures (`ipc::devmgr_labels::MINT_CLASS_SEND`) and
 //! publishes it seed-only as `devmgr.class.<stem>`, the file's name without
 //! `.class`, so a service reaches a class's drivers only when its definition
 //! seeds that name.
 
-use std::fs;
 use std::ops::ControlFlow;
-use std::os::seraph::fs::DirEntryExt;
 use std::os::seraph::log;
 
 use registry::Visibility;
 use svcmgr_defs::class::{CLASS_FILE_SUFFIX, CLASSES_DIR, class_publication, parse_class};
 
+use crate::config::IndexedDir;
 use crate::definitions::reconcile::PendingRegistration;
 use crate::endowed_servers;
 
 /// Configure devmgr's classes from [`CLASSES_DIR`] through `devmgr_registry`,
 /// the endowed badge-0 devmgr-registry source, and publish each class SEND.
-/// A file that cannot be read or parsed, or whose class devmgr refuses, is
-/// logged and skipped.
+/// The class files are those the directory's signed index names, each read
+/// through procmgr's verified read ([`IndexedDir`]); an index that is missing
+/// or refused configures no class, logged. A file that is missing, refused or
+/// does not parse, or whose class devmgr refuses, is logged and skipped.
 ///
 /// The files are read through vfsd and each class is minted by devmgr, so the
 /// liveness of both is read from their registrations in `pending` before the
@@ -50,15 +52,19 @@ pub fn configure(
     {
         return;
     }
-    let read = match fs::read_dir(CLASSES_DIR)
+    let dir = match IndexedDir::open(CLASSES_DIR)
     {
-        Ok(r) => r,
+        Ok(dir) => dir,
         Err(e) =>
         {
-            log!(warn: "cannot open {CLASSES_DIR}: {e}; no device class configured");
+            log!(
+                warn: "{CLASSES_DIR}/index not read ({:?}); no device class configured",
+                e.kind()
+            );
             return;
         }
     };
+    dir.report_unnamed();
     let Ok(minter) = syscall::cap_derive_badge(
         devmgr_registry,
         syscall::RIGHTS_EP_SEND,
@@ -69,24 +75,15 @@ pub fn configure(
         log!(warn: "CLASS_AUTHORITY derive failed; no device class configured");
         return;
     };
-    for ent in read
+    for filename in dir.names()
     {
-        let Ok(ent) = ent
+        let Some(class) = filename.strip_suffix(CLASS_FILE_SUFFIX)
         else
         {
-            if server_dead(pending, endowed_servers::VFSD, ipc_buf).is_break()
-            {
-                break;
-            }
+            log!(warn: "{CLASSES_DIR}/{filename}: named by the index but not a class file; not read");
             continue;
         };
-        let Some(filename) = ent.file_name_ref().to_str()
-        else
-        {
-            continue;
-        };
-        if let Some(class) = filename.strip_suffix(CLASS_FILE_SUFFIX)
-            && configure_one(registry, minter, class, pending, ipc_buf).is_break()
+        if configure_one(registry, minter, &dir, class, pending, ipc_buf).is_break()
         {
             break;
         }
@@ -110,52 +107,55 @@ fn server_dead(pending: &[PendingRegistration], server: &str, ipc_buf: *mut u64)
 
 /// Configure the class the file `<CLASSES_DIR>/<class>.class` names and
 /// publish its SEND as `devmgr.class.<class>`, through `minter`, a
-/// `CLASS_AUTHORITY` SEND on devmgr's registry. `class` is the file's stem,
+/// `CLASS_AUTHORITY` SEND on devmgr's registry. The file is read from `dir`
+/// through procmgr's verified read. `class` is the file's stem,
 /// which names the class configured only when the file sets no `class` key.
 /// `Break` when the file's read failed and vfsd is dead, or devmgr's mint
 /// failed and devmgr is dead ([`server_dead`]).
 fn configure_one(
     registry: &mut registry::Registry,
     minter: u64,
+    dir: &IndexedDir,
     class: &str,
     pending: &[PendingRegistration],
     ipc_buf: *mut u64,
 ) -> ControlFlow<()>
 {
     // Fallible, as every copy svcmgr makes of configuration text is.
-    let mut path = String::new();
-    if path
-        .try_reserve_exact(
-            CLASSES_DIR
-                .len()
-                .saturating_add(1)
-                .saturating_add(class.len())
-                .saturating_add(CLASS_FILE_SUFFIX.len()),
-        )
+    let mut filename = String::new();
+    if filename
+        .try_reserve_exact(class.len().saturating_add(CLASS_FILE_SUFFIX.len()))
         .is_err()
     {
-        log!(warn: "class {class}: no memory for its path; not configured");
+        log!(warn: "class {class}: no memory for its file name; not configured");
         return ControlFlow::Continue(());
     }
-    path.push_str(CLASSES_DIR);
-    path.push('/');
-    path.push_str(class);
-    path.push_str(CLASS_FILE_SUFFIX);
-    let contents = match fs::read_to_string(&path)
+    filename.push_str(class);
+    filename.push_str(CLASS_FILE_SUFFIX);
+    let verified = match dir.read(&filename)
     {
-        Ok(c) => c,
+        Ok(verified) => verified,
         Err(e) =>
         {
-            log!(warn: "cannot read {path}: {e}; class not configured");
+            log!(
+                warn: "{CLASSES_DIR}/{filename}: named by the index, not read ({:?}); class not configured",
+                e.kind()
+            );
             return server_dead(pending, endowed_servers::VFSD, ipc_buf);
         }
     };
-    let def = match parse_class(class, &contents)
+    let Ok(contents) = core::str::from_utf8(verified.bytes())
+    else
+    {
+        log!(warn: "parse {CLASSES_DIR}/{filename}: not UTF-8; class not configured");
+        return ControlFlow::Continue(());
+    };
+    let def = match parse_class(class, contents)
     {
         Ok(d) => d,
         Err(e) =>
         {
-            log!(warn: "parse {path}: {e}; class not configured");
+            log!(warn: "parse {CLASSES_DIR}/{filename}: {e}; class not configured");
             return ControlFlow::Continue(());
         }
     };

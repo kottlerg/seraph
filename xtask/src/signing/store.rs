@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use objsig::{AnchorSpec, KeyId, TrustStore};
+use objsig::{AnchorSpec, KeyId, RoleSet, TrustStore, Usage};
 
 use crate::error::{Result, bail, err};
 
@@ -124,6 +124,64 @@ pub fn with_revoked(store: &[u8], id: KeyId) -> Result<Vec<u8>>
     encode(parsed.security_floor(), &anchors, &revoked)
 }
 
+/// `store` with the anchors of each store of `scoped` added, each anchor
+/// usable for the roles of its own usage that the paired set holds alone, and
+/// may certify as it could; its floor and revoked key ids unchanged. A store
+/// that trusts another key for some roles only, as a deployer's may.
+///
+/// # Errors
+///
+/// When a store does not parse; when `store` holds an anchor of one of the
+/// keys added; when the result does not encode.
+pub fn with_scoped_anchors(store: &[u8], scoped: &[(&[u8], RoleSet)]) -> Result<Vec<u8>>
+{
+    let parse =
+        |bytes| TrustStore::parse(bytes).map_err(|e| err!("a trust store does not parse ({e:?})"));
+    let base = parse(store)?;
+    let mut anchors: BTreeMap<KeyId, AnchorSpec<'_>> = base
+        .anchors()
+        .map(|anchor| {
+            (
+                anchor.key_id,
+                AnchorSpec {
+                    key: anchor.key,
+                    usage: anchor.usage,
+                    local: anchor.local,
+                    label: anchor.label,
+                },
+            )
+        })
+        .collect();
+    let others = scoped
+        .iter()
+        .map(|(bytes, roles)| parse(bytes).map(|parsed| (parsed, *roles)))
+        .collect::<Result<Vec<_>>>()?;
+    for (other, roles) in &others
+    {
+        for anchor in other.anchors()
+        {
+            let spec = AnchorSpec {
+                key: anchor.key,
+                usage: Usage {
+                    roles: anchor.usage.roles.intersection(*roles),
+                    certify: anchor.usage.certify,
+                },
+                local: anchor.local,
+                label: anchor.label,
+            };
+            if anchors.insert(anchor.key_id, spec).is_some()
+            {
+                bail!(
+                    "the trust store already holds the anchor {}",
+                    hex(&anchor.key_id)
+                );
+            }
+        }
+    }
+    let anchors: Vec<AnchorSpec<'_>> = anchors.into_values().collect();
+    encode(base.security_floor(), &anchors, base.revoked())
+}
+
 /// Encode a store of `anchors`, which are sorted by key id, and `revoked`.
 ///
 /// # Errors
@@ -152,7 +210,7 @@ pub fn hex(id: &KeyId) -> String
 #[cfg(test)]
 mod tests
 {
-    use objsig::{PublicKey, RoleSet, Usage, key_id};
+    use objsig::{PublicKey, Role, key_id};
 
     use super::*;
 
@@ -249,6 +307,31 @@ mod tests
         narrow.usage.certify = false;
         let deployer = store_of(1, vec![narrow], Vec::new());
         build(&own, Some((&deployer, StoreMode::Merge)), 1).unwrap_err();
+    }
+
+    // Defect caught: an added anchor kept with its own usage, so a key the
+    // test means to trust for some roles verifies in every one; or an anchor
+    // of the base store replaced by an added one.
+    #[test]
+    fn scoped_anchors_are_added_for_their_roles_alone()
+    {
+        let base = store_of(3, vec![anchor(key(1), "own")], vec![[9; 16]]);
+        let other = store_of(1, vec![anchor(key(2), "other")], Vec::new());
+        let config = RoleSet::of(&[Role::Configuration]);
+        let scoped = with_scoped_anchors(&base, &[(&other, config)]).unwrap();
+        let parsed = TrustStore::parse(&scoped).unwrap();
+        assert_eq!(
+            (parsed.security_floor(), parsed.revoked()),
+            (3, &[[9; 16]][..])
+        );
+        let added = parsed.anchor(&key_id(key(2))).unwrap();
+        assert_eq!(added.usage.roles, config);
+        assert!(added.usage.certify);
+        assert_eq!(
+            parsed.anchor(&key_id(key(1))).unwrap().usage.roles,
+            RoleSet::ALL
+        );
+        with_scoped_anchors(&base, &[(&base, config)]).unwrap_err();
     }
 
     // Defect caught: a deployer's file that is not a store ignored, so the

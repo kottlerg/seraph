@@ -1,7 +1,7 @@
 # `.svc` Service Definitions
 
 Authoritative spec for the `/config/svcmgr/services/<name>.svc` files
-svcmgr scans at `HANDOVER_COMPLETE` to reconcile the substrate
+svcmgr reads at `HANDOVER_COMPLETE` to reconcile the substrate
 registrations init delivers in the handover endowment with the on-disk
 service recipes.
 
@@ -27,6 +27,11 @@ recipe travels on the wire.
   [Build System](../../../docs/build-system.md#build-output-the-sysroot)). No
   build-system change is required to add a new recipe — drop the
   file in `rootfs/config/svcmgr/services/` and rebuild.
+* Every file is signed in the configuration role under its install path, and the directory's
+  `index` file, which the pack writes from the files the directory holds, is signed under
+  `/config/svcmgr/services/index` ([docs/signing.md](../../../docs/signing.md) § Configuration).
+  A directory holds only `.svc` files and its index. A recipe edited on an image is refused until
+  it is signed again, which the repack path (`cargo xtask mkdisk --repack-only`) does.
 
 ## Grammar
 
@@ -605,16 +610,20 @@ does not affect whether a stop-authority holder may stop the service.
 
 ## Device class files
 
-devmgr's device classes are configured from class files, not from source. svcmgr reads every
-`/config/devmgr/classes/<class>.class` file, shipped from `rootfs/config/devmgr/classes/`, before
-it sends `SET_DRIVERS_DIR`. For each file it sends devmgr `devmgr_labels::MINT_CLASS_SEND`, on a
-`CLASS_AUTHORITY`-badged derivation of its endowed badge-0 devmgr-registry source, and publishes
-the class SEND devmgr replies with seed-only as `devmgr.class.<stem>`, `<stem>` being the file
-name without `.class` (`ipc::published_names::DEVMGR_CLASS_PREFIX`). A service reaches a class
-only when its `seed` line names that publication. A file that cannot be read or parsed, or whose
-class devmgr refuses, is logged and skipped. The files are read through vfsd and the classes
-minted by devmgr, and either found dead ends the pass
-([restart-protocol.md § Death detection](restart-protocol.md#death-detection)).
+devmgr's device classes are configured from class files, not from source. svcmgr reads the signed
+`index` of `/config/devmgr/classes/` and every `<class>.class` file it names, shipped from
+`rootfs/config/devmgr/classes/`, each through procmgr's `READ_VERIFIED` in the configuration role,
+before it sends `SET_DRIVERS_DIR`; it parses only the verified bodies. A named file that is
+missing or refused is reported and passed over, a file of the directory the index does not name
+is reported and not read, and an index that is missing or refused leaves no class configured. The
+files are signed as the recipes are, the index under `/config/devmgr/classes/index`. For each file
+it sends devmgr `devmgr_labels::MINT_CLASS_SEND`, on a `CLASS_AUTHORITY`-badged derivation of its
+endowed badge-0 devmgr-registry source, and publishes the class SEND devmgr replies with seed-only
+as `devmgr.class.<stem>`, `<stem>` being the file name without `.class`
+(`ipc::published_names::DEVMGR_CLASS_PREFIX`). A service reaches a class only when its `seed` line
+names that publication. A file that cannot be parsed, or whose class devmgr refuses, is logged and
+skipped. The files are read through vfsd and the classes minted by devmgr, and either found dead
+ends the pass ([restart-protocol.md § Death detection](restart-protocol.md#death-detection)).
 
 The grammar is the `.svc` grammar: line-oriented `key = value`, `#` comments, an unknown or
 repeated key an error. The class name is the `class` key, or the file stem (the file name without
@@ -644,7 +653,7 @@ init requests the `block` class SEND itself, for vfsd's root mount.
 
 ## Reconciliation
 
-At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
+At `HANDOVER_COMPLETE` svcmgr reads the recipes of `/config/svcmgr/services/`, parses each
 `<name>.svc`, and reconciles against the pending-registration table
 (substrate triples parked from the handover endowment):
 
@@ -653,6 +662,13 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 | present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`, `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop`, `stop_source` and `private_image` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`, `CREATE_PRIVATE_IMAGE`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
+
+svcmgr reads the directory's signed `index` file through procmgr's `READ_VERIFIED` in the
+configuration role, then each file the index names the same way, and parses only the verified
+bodies. It reports and passes over a named file that is missing or refused, as it does a file that
+does not parse, and reports a file of the directory the index does not name without reading it.
+When the index is missing or refused it reads no file of the directory: no recipe is launched, and
+each service init registered is reported as registered without definition.
 
 svcmgr launches the **launching** entries in launch order, which
 `svcmgr_defs::launch_order` computes over every parsed recipe: providers (a non-empty
@@ -664,7 +680,7 @@ nothing. When providers seed each other in a cycle, the first of them in name or
 first, which svcmgr logs (`<name> is in a seed cycle; launched before a provider it seeds from`),
 and its seeds of the others' names resolve to nothing at its launch.
 
-The order promises only which launch is attempted first, within the one scan:
+The order promises only which launch is attempted first, within the one pass:
 
 - A provider launches whether or not the launch of a provider it seeds from succeeded; the seed
   of a provider whose launch failed is unresolved at its launch, as any unresolved seed is.

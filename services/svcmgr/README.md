@@ -55,6 +55,8 @@ svcmgr/
 │   ├── main.rs                    # main() (std runtime), IPC dispatch,
 │   │                              # dispatch_deaths, initiate_graceful_shutdown
 │   ├── classes.rs                 # Device class files configured with devmgr
+│   ├── config.rs                  # A configuration directory read through its
+│   │                              # signed index (procmgr's READ_VERIFIED)
 │   ├── death_queues.rs            # Death-queue ring capacity and first pool
 │   ├── endowed_servers.rs         # Liveness of vfsd and devmgr before
 │   │                              # reconciliation records them
@@ -121,8 +123,9 @@ svcmgr/
   [docs/service-definitions.md](docs/service-definitions.md). The round
   layout is specified in
   [docs/ipc-interface.md](docs/ipc-interface.md#handover-endowment-bootstrap-rounds).
-- **Reconciliation** — at `HANDOVER_COMPLETE` scan
-  `/config/svcmgr/services/`, parse each `<name>.svc`, and pair it
+- **Reconciliation** — at `HANDOVER_COMPLETE` read the
+  signed `index` of `/config/svcmgr/services/` and each `<name>.svc` it names through procmgr's
+  verified read, parse each verified body, and pair it
   with the pending-registration table (substrate triples parked from the
   endowment). Three outcomes: `bind only` (parked AND defined),
   `launching` (defined only), `registered without definition`
@@ -130,7 +133,7 @@ svcmgr/
   list, or for a bind-only entry's record, an endowed service runs on
   unsupervised (logged, not reported as a configuration error); a recipe
   dropped for memory is reported like a malformed one. A vfsd found dead
-  before or during the scan, which reads through it, ends reconciliation
+  before or during the read, which goes through it, ends reconciliation
   with every endowed service unsupervised, and its death is routed as
   system death ([docs/restart-protocol.md](docs/restart-protocol.md)
   § Death detection). See
@@ -193,7 +196,7 @@ Restart-time attenuation reads the same `ServiceEntry`-stored policy that
 reconcile installed ([docs/restart-protocol.md](docs/restart-protocol.md)
 § Recipe storage).
 
-svcmgr scans only `/config/svcmgr/services/`. The sibling directory
+svcmgr reads only `/config/svcmgr/services/`, through its signed index. The sibling directory
 `/config/svcmgr/tests/` holds opt-in test-harness recipes, and
 `/config/svcmgr/debug/` the GDB stub's recipe template
 ([services/gdbstub/README.md](../gdbstub/README.md)); svcmgr never reads

@@ -8,8 +8,9 @@
 //!
 //! Every object is signed once, in the sysroot, under its install path and the
 //! roles it may be loaded in ([`sign_sysroot`]): the kernel, every ELF image
-//! under `services/`, `programs/` and `tests/`, and every other file a
-//! bundle list names. [`crate::disk::create_disk_image`] signs the sysroot as
+//! under `services/`, `programs/` and `tests/`, the data files, the
+//! configuration files with the index of each of their directories, and every
+//! other file a bundle list names. [`crate::disk::create_disk_image`] signs the sysroot as
 //! it packs ([`sign_for_harness`]), before [`crate::esp`] composes the ESP,
 //! which copies installed files and signs nothing. A signed object is its body and a trailer of one record
 //! ([`Signer::sign`]), which [`objsig::verify`] accepts under the build's
@@ -47,7 +48,7 @@ pub use store::StoreMode;
 pub const SECURITY_VERSION: u32 = 1;
 
 /// The directory of the signing identity; by default
-/// `seraph/signing/ed25519-ml-dsa-65` in the user's data directory
+/// `seraph/signing/ed25519-ml-dsa-65-roles-1-8` in the user's data directory
 /// ([`default_dir`]).
 pub const ENV_SIGNING_DIR: &str = "SERAPH_SIGNING_DIR";
 
@@ -64,8 +65,9 @@ pub const ENV_TRUST_STORE: &str = "SERAPH_TRUST_STORE";
 pub const ENV_TRUST_STORE_MODE: &str = "SERAPH_TRUST_STORE_MODE";
 
 /// The last component of the default identity directory: the signature
-/// algorithm of the identity it holds.
-const ALGORITHM_DIR: &str = "ed25519-ml-dsa-65";
+/// algorithm of the identity it holds, and the roles its key is certified for
+/// (1 to 8, [`Role::ALL`]).
+const IDENTITY_DIR: &str = "ed25519-ml-dsa-65-roles-1-8";
 
 /// The first four bytes of an ELF image.
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
@@ -81,6 +83,20 @@ const SIGNED_TREES: &[&str] = &["services", "programs", "tests"];
 /// the platform description tables devmgr reads, and `data/svctest/signed`
 /// svctest's fixture of that read.
 const DATA_TREES: &[&str] = &["config/devmgr/platform", "data/svctest/signed"];
+
+/// The sysroot directories of configuration files a service reads through
+/// the directory's signed index (docs/signing.md § Configuration), each
+/// with the suffix every file in it carries: svcmgr's service recipes and
+/// device class files. [`sign_sysroot`] writes each directory's index and
+/// signs it and every file in it in the configuration role, under its
+/// install path.
+const CONFIG_TREES: &[(&str, &str)] = &[
+    ("config/svcmgr/services", ".svc"),
+    ("config/devmgr/classes", ".class"),
+];
+
+/// The index file name, [`objsig::INDEX_NAME`], as text.
+const INDEX_FILE: &str = "index";
 
 /// The signing configuration a build reads from its environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,11 +165,12 @@ impl Config
 }
 
 /// The default directory of the signing identity, from the variables `var`
-/// returns: `seraph/signing/ed25519-ml-dsa-65` in `XDG_DATA_HOME`, in
+/// returns: `seraph/signing/` and [`IDENTITY_DIR`] in `XDG_DATA_HOME`, in
 /// `.local/share` of `HOME`, or in `LOCALAPPDATA`, the first of them set to
-/// an absolute path. The last component names the signature algorithm, so an
-/// identity of an earlier algorithm, in its own directory, is never loaded as
-/// this one's (docs/signing.md § Signing).
+/// an absolute path. The last component names the signature algorithm and the
+/// roles a generated key is certified for, so an identity of an earlier
+/// algorithm, or one certified before a role existed, in its own directory, is
+/// never loaded as this one's (docs/signing.md § Signing).
 fn default_dir(var: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf>
 {
     let absolute = |name: &str| {
@@ -164,7 +181,7 @@ fn default_dir(var: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf>
     absolute("XDG_DATA_HOME")
         .or_else(|| absolute("HOME").map(|home| home.join(".local").join("share")))
         .or_else(|| absolute("LOCALAPPDATA"))
-        .map(|data| data.join("seraph").join("signing").join(ALGORITHM_DIR))
+        .map(|data| data.join("seraph").join("signing").join(IDENTITY_DIR))
         .with_context(|| format!("no per-user data directory: set {ENV_SIGNING_DIR}"))
 }
 
@@ -214,7 +231,9 @@ impl Signer
     /// # Errors
     ///
     /// The errors of [`Identity::load`] and of building the store; when the
-    /// deployer's store cannot be read.
+    /// deployer's store cannot be read; when the store trusts the signing key
+    /// for some roles but not for every one a build signs in
+    /// ([`missing_roles`]).
     pub fn new(
         config: &Config,
         work_tree: &Path,
@@ -239,6 +258,18 @@ impl Signer
                 .map(|(bytes, mode)| (bytes.as_slice(), *mode)),
             SECURITY_VERSION,
         )?;
+        let missing = missing_roles(&store, identity.public_key(), identity.certificate())?;
+        if !missing.is_empty()
+        {
+            bail!(
+                "the signing identity in {} may not sign the {missing:?} role under the build's \
+                 trust store, and a build signs every role: a key certified before a role existed \
+                 lacks it. Use an identity certified for every role: unset {ENV_SIGNING_DIR} to \
+                 have one generated in the default directory, or have the identity's root certify \
+                 the key again (docs/signing.md § Signing)",
+                config.dir.display()
+            );
+        }
         Ok(Self {
             identity,
             store,
@@ -269,6 +300,23 @@ impl Signer
     pub fn store_revoking_own_key(&self) -> Result<Vec<u8>>
     {
         store::with_revoked(&self.store, self.key_id())
+    }
+
+    /// The build's trust store with the anchors of the identity of each signer
+    /// of `scoped` added, each trusted for the paired roles alone
+    /// (`store::with_scoped_anchors`): a store a test builds a bootloader
+    /// under to have it refuse a key outside the roles it is trusted for.
+    ///
+    /// # Errors
+    ///
+    /// Those of `store::with_scoped_anchors`.
+    pub fn store_trusting(&self, scoped: &[(&Self, RoleSet)]) -> Result<Vec<u8>>
+    {
+        let pairs: Vec<(&[u8], RoleSet)> = scoped
+            .iter()
+            .map(|(signer, roles)| (signer.identity.store(), *roles))
+            .collect();
+        store::with_scoped_anchors(&self.store, &pairs)
     }
 
     /// `object` signed with the role set `roles` under `name`: its body, the
@@ -371,6 +419,52 @@ impl Signer
         fs::write(path, &signed).with_context(|| format!("writing {}", path.display()))?;
         Ok(true)
     }
+}
+
+/// The roles of [`Role::ALL`] the store `store` does not trust the key `key`
+/// to sign in, the key certified by `certificate` when it has one: those the
+/// usage of the anchor (the issuer's, or the key's own when it is a root) or
+/// of the certificate leaves out, as `objsig::verify` refuses them
+/// (`Failed(KeyUsage)`). None when the store holds no anchor for the key or
+/// its issuer, or the issuer's anchor may not certify: the signing check of
+/// every object reports that store as not trusting the key at all.
+///
+/// # Errors
+///
+/// When the store or the certificate does not parse.
+fn missing_roles(
+    store: &[u8],
+    key: &objsig::PublicKey,
+    certificate: Option<&[u8; objsig::cert::LEN]>,
+) -> Result<Vec<Role>>
+{
+    let store = TrustStore::parse(store)
+        .map_err(|e| err!("the build's trust store does not parse ({e:?})"))?;
+    let roles = match certificate
+    {
+        Some(bytes) =>
+        {
+            let cert = objsig::Certificate::parse(bytes)
+                .map_err(|e| err!("the signing key's certificate does not parse ({e:?})"))?;
+            match store.anchor(&cert.body.issuer_key_id)
+            {
+                Some(anchor) if anchor.usage.certify =>
+                {
+                    anchor.usage.roles.intersection(cert.body.usage.roles)
+                }
+                _ => return Ok(Vec::new()),
+            }
+        }
+        None => match store.anchor(&objsig::key_id(key))
+        {
+            Some(anchor) => anchor.usage.roles,
+            None => return Ok(Vec::new()),
+        },
+    };
+    Ok(Role::ALL
+        .into_iter()
+        .filter(|&role| !roles.contains(role))
+        .collect())
 }
 
 /// The body of `object`: the object less its trailer when it ends in one,
@@ -529,7 +623,11 @@ fn install_name(path: &Path) -> Result<String>
 /// kernel role alone; every ELF image under [`SIGNED_TREES`] as
 /// [`image_signature`] says; every regular file under [`DATA_TREES`] under
 /// its install path in the data role, and the boot-module role beside it
-/// when a list names it; and every other installed file a list names,
+/// when a list names it; every regular file of each directory of
+/// [`CONFIG_TREES`] under its install path in the configuration role, and the
+/// boot-module role beside it when a list names it, with the directory's index
+/// written from the files it holds ([`write_index`]) and signed in the
+/// configuration role under `<directory>/index`; and every other installed file a list names,
 /// `init` with the init role alone when it is the object of a signed
 /// `init` slot, under its install path with the boot-module role alone
 /// otherwise. The `init` slot objects signed are the init harness's, always,
@@ -539,9 +637,10 @@ fn install_name(path: &Path) -> Result<String>
 ///
 /// # Errors
 ///
-/// On an I/O failure; the errors of `crate::bundle::read_list` and
-/// [`Signer::sign_file`]; when an object a list puts in the `init` slot is
-/// an entry of a list too, since an object is signed under one name.
+/// On an I/O failure; the errors of `crate::bundle::read_list`,
+/// [`Signer::sign_file`] and [`config_files`]; when an object a list puts in
+/// the `init` slot is an entry of a list too, since an object is signed under
+/// one name.
 pub fn sign_sysroot(
     ctx: &BuildContext,
     signer: &Signer,
@@ -602,6 +701,7 @@ pub fn sign_sysroot(
             done.insert(install);
         }
     }
+    sign_config_trees(ctx, signer, &boot_modules, &mut done, &mut count)?;
     for install in slots.iter().chain(&boot_modules)
     {
         let path = ctx.sysroot.join(install.trim_start_matches('/'));
@@ -620,6 +720,161 @@ pub fn sign_sysroot(
         count(signer.sign_file(&path, RoleSet::of(&[role]), name)?);
     }
     Ok((total, changed))
+}
+
+/// Sign every file of each directory of [`CONFIG_TREES`] in `ctx`'s sysroot
+/// in the configuration role under its install path, with the boot-module
+/// role beside it when `boot_modules` names it, and write the directory's
+/// index ([`write_index`]); each install path signed goes into `done`, and
+/// each object signed to `count`, with whether it changed.
+///
+/// # Errors
+///
+/// Those of [`config_files`], [`Signer::sign_file`] and [`write_index`].
+fn sign_config_trees(
+    ctx: &BuildContext,
+    signer: &Signer,
+    boot_modules: &[String],
+    done: &mut std::collections::HashSet<String>,
+    count: &mut dyn FnMut(bool),
+) -> Result<()>
+{
+    for (tree, suffix) in CONFIG_TREES
+    {
+        let Some(names) = config_files(&ctx.sysroot.join(tree), suffix)?
+        else
+        {
+            continue;
+        };
+        for name in &names
+        {
+            let relative = Path::new(tree).join(name);
+            let install = install_name(&relative)?;
+            let roles = if boot_modules.contains(&install)
+            {
+                RoleSet::of(&[Role::Configuration, Role::BootModule])
+            }
+            else
+            {
+                RoleSet::of(&[Role::Configuration])
+            };
+            count(signer.sign_file(&ctx.sysroot.join(&relative), roles, &install)?);
+            done.insert(install);
+        }
+        let relative = Path::new(tree).join(INDEX_FILE);
+        let install = install_name(&relative)?;
+        count(write_index(
+            signer,
+            &ctx.sysroot.join(&relative),
+            &install,
+            &names,
+        )?);
+        done.insert(install);
+    }
+    Ok(())
+}
+
+/// The names of the files of the configuration directory `dir`, sorted byte
+/// for byte, the order its index holds them in; the index itself, which the
+/// pack writes, is not one. `None` when `dir` is absent.
+///
+/// # Errors
+///
+/// On an I/O failure; when `dir` holds a subdirectory or a link, or a file
+/// whose name does not end in `suffix` or is not a canonical path component
+/// (`objsig::name_is_component`): a consumer reads only the files the index
+/// names, so a file it would pass over is refused here, where it was put.
+pub fn config_files(dir: &Path, suffix: &str) -> Result<Option<Vec<String>>>
+{
+    let entries = match fs::read_dir(dir)
+    {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut names = Vec::new();
+    for entry in entries
+    {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .with_context(|| format!("reading {}", path.display()))?;
+        ensure!(
+            kind.is_file(),
+            "{}: a configuration directory holds regular files alone, each named by the \
+             directory's signed index (docs/signing.md § Configuration)",
+            path.display()
+        );
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| err!("{}: the name is not UTF-8", path.display()))?;
+        if name == INDEX_FILE
+        {
+            continue;
+        }
+        ensure!(
+            name.ends_with(suffix) && objsig::name_is_component(name.as_bytes()),
+            "{}: every file of {} is a `{suffix}` file, the only kind its consumer reads \
+             (docs/signing.md § Configuration)",
+            path.display(),
+            dir.display()
+        );
+        names.push(name);
+    }
+    // Byte order: `str`'s order is its bytes'.
+    names.sort_unstable();
+    Ok(Some(names))
+}
+
+/// The body of the index of `names`, which are sorted ([`config_files`]).
+///
+/// # Errors
+///
+/// When `objsig::index::encode` refuses them.
+pub fn index_body(names: &[String]) -> Result<Vec<u8>>
+{
+    let names: Vec<&[u8]> = names.iter().map(String::as_bytes).collect();
+    let refused = |e| err!("encoding a directory index ({e:?})");
+    let mut body =
+        vec![0u8; objsig::index::encoded_len(&names).context("an index longer than usize")?];
+    objsig::index::encode(&names, &mut body).map_err(refused)?;
+    Ok(body)
+}
+
+/// Write at `path` the index of `names` ([`index_body`]) signed in the
+/// configuration role under `install`, unless the file already holds it;
+/// returns whether its bytes changed.
+///
+/// # Errors
+///
+/// On an I/O failure and the errors of [`index_body`] and [`Signer::sign`].
+fn write_index(signer: &Signer, path: &Path, install: &str, names: &[String]) -> Result<bool>
+{
+    let object = signer
+        .sign(
+            &index_body(names)?,
+            RoleSet::of(&[Role::Configuration]),
+            install,
+        )
+        .with_context(|| format!("signing {}", path.display()))?;
+    if fs::read(path).is_ok_and(|held| held == object)
+    {
+        return Ok(false);
+    }
+    fs::write(path, &object).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+/// The sysroot paths of the index of each directory of [`CONFIG_TREES`],
+/// which every pack writes: the rootfs mirror's prune keeps them.
+pub fn config_indexes(sysroot: &Path) -> Vec<PathBuf>
+{
+    CONFIG_TREES
+        .iter()
+        .map(|(tree, _)| sysroot.join(tree).join(INDEX_FILE))
+        .collect()
 }
 
 /// Sign the sysroot for a pack of `arch` that composes the bundle of
@@ -1326,6 +1581,166 @@ mod tests
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Defect caught: a configuration file left unsigned or signed outside the
+    // configuration role, under a name other than its install path; an index
+    // missing, unsigned, naming a file the directory lacks or omitting one it
+    // holds, or rewritten by a pack of an unchanged directory.
+    #[test]
+    fn a_configuration_directory_is_signed_with_an_index_of_its_files()
+    {
+        let arch = Arch::Riscv64;
+        let services = "config/svcmgr/services";
+        let classes = "config/devmgr/classes";
+        let (root, ctx) = sysroot_of(
+            "config-trees",
+            &[
+                (
+                    "config/svcmgr/services/timed.svc",
+                    b"binary = x\n".as_slice(),
+                ),
+                (
+                    "config/svcmgr/services/crashd.svc",
+                    b"binary = y\n".as_slice(),
+                ),
+                (
+                    "config/devmgr/classes/rtc.class",
+                    b"class = rtc\n".as_slice(),
+                ),
+                // A stale index of an earlier pack, which the pack replaces.
+                ("config/svcmgr/services/index", b"gone.svc\n".as_slice()),
+            ],
+        );
+        testing::install_lists(&ctx);
+        let signer = signer(&root.join("keys"), arch);
+        let (total, _) = sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap();
+        let config = RoleSet::of(&[Role::Configuration]);
+        let read = |relative: String| {
+            let object = fs::read(ctx.sysroot.join(&relative)).unwrap();
+            let attrs = objsig::split(&object)
+                .unwrap()
+                .records()
+                .next()
+                .unwrap()
+                .attrs;
+            assert_eq!(attrs.roles, config, "{relative}");
+            assert!(
+                verifies(
+                    &signer,
+                    &object,
+                    Role::Configuration,
+                    &format!("/{relative}")
+                ),
+                "{relative}"
+            );
+            assert!(!verifies(
+                &signer,
+                &object,
+                Role::Data,
+                &format!("/{relative}")
+            ));
+            objsig::split(&object).unwrap().body().to_vec()
+        };
+        for file in ["timed.svc", "crashd.svc"]
+        {
+            read(format!("{services}/{file}"));
+        }
+        read(format!("{classes}/rtc.class"));
+        assert_eq!(
+            read(format!("{services}/index")),
+            b"crashd.svc\ntimed.svc\n"
+        );
+        assert_eq!(read(format!("{classes}/index")), b"rtc.class\n");
+        // A second pack of an unchanged sysroot changes no file.
+        assert_eq!(
+            sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap(),
+            (total, 0)
+        );
+        // A file added, and one removed, are in the next pack's index.
+        fs::write(ctx.sysroot.join(services).join("oomd.svc"), b"binary = z\n").unwrap();
+        fs::remove_file(ctx.sysroot.join(services).join("timed.svc")).unwrap();
+        sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap();
+        assert_eq!(read(format!("{services}/index")), b"crashd.svc\noomd.svc\n");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: a file a consumer would pass over (another suffix, a
+    // subdirectory) packed silently into a configuration directory.
+    #[test]
+    fn a_configuration_directory_holding_another_kind_of_entry_is_refused()
+    {
+        let arch = Arch::Riscv64;
+        let (root, ctx) = sysroot_of(
+            "config-strays",
+            &[
+                (
+                    "config/svcmgr/services/timed.svc",
+                    b"binary = x\n".as_slice(),
+                ),
+                (
+                    "config/devmgr/classes/rtc.class",
+                    b"class = rtc\n".as_slice(),
+                ),
+            ],
+        );
+        testing::install_lists(&ctx);
+        let signer = signer(&root.join("keys"), arch);
+        sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap();
+        let services = ctx.sysroot.join("config/svcmgr/services");
+        fs::write(services.join("notes.txt"), b"x").unwrap();
+        sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap_err();
+        fs::remove_file(services.join("notes.txt")).unwrap();
+        fs::create_dir(ctx.sysroot.join("config/devmgr/classes/sub.class")).unwrap();
+        sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap_err();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: a signer whose store trusts its key for some roles
+    // accepted, so the first configuration file of a pack fails deep in the
+    // signing, or a key refused for a store that does not trust it at all,
+    // which the signing check names.
+    #[test]
+    fn a_key_the_store_trusts_for_some_roles_alone_is_refused()
+    {
+        let arch = Arch::Riscv64;
+        let dir = scratch("missing-roles");
+        let full = signer(&dir.join("full"), arch);
+        let key = full.identity.public_key();
+        let cert = full.identity.certificate();
+        assert_eq!(missing_roles(full.store(), key, cert).unwrap(), Vec::new());
+        // Seeds other than `signer`'s, so another root and key.
+        let other = Signer::new(
+            &config(&dir.join("other")),
+            &work_tree(),
+            arch,
+            &mut counter(9),
+        )
+        .unwrap();
+        let all_but: Vec<Role> = Role::ALL
+            .into_iter()
+            .filter(|&role| role != Role::Configuration)
+            .collect();
+        let narrowed = other
+            .store_trusting(&[(&full, RoleSet::of(&all_but))])
+            .unwrap();
+        assert_eq!(
+            missing_roles(&narrowed, key, cert).unwrap(),
+            vec![Role::Configuration]
+        );
+        // A store with no anchor of the key's issuer leaves it to the check.
+        assert_eq!(missing_roles(other.store(), key, cert).unwrap(), Vec::new());
+        // Signer::new refuses the narrowed store as a deployer's replacing one.
+        let store = dir.join("narrowed.store");
+        fs::write(&store, &narrowed).unwrap();
+        let mut config = config(&dir.join("full"));
+        config.deployer_store = Some((store, StoreMode::Replace));
+        let refused = Signer::new(&config, &work_tree(), arch, &mut counter(1));
+        assert!(
+            refused.is_err_and(|e| format!("{e:#}").contains("Configuration")),
+            "a narrowed store refused naming the role"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The configuration of the variables `vars` sets.
     fn config_of(vars: &[(&str, &str)]) -> Result<Config>
     {
@@ -1345,14 +1760,17 @@ mod tests
         let home = config_of(&[("HOME", "/home/u"), ("SERAPH_TRUST_STORE", "/s")]).unwrap();
         assert_eq!(
             home.dir,
-            Path::new("/home/u/.local/share/seraph/signing/ed25519-ml-dsa-65")
+            Path::new("/home/u/.local/share/seraph/signing/ed25519-ml-dsa-65-roles-1-8")
         );
         assert_eq!(
             home.deployer_store,
             Some((PathBuf::from("/s"), StoreMode::Merge))
         );
         let xdg = config_of(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/x")]).unwrap();
-        assert_eq!(xdg.dir, Path::new("/x/seraph/signing/ed25519-ml-dsa-65"));
+        assert_eq!(
+            xdg.dir,
+            Path::new("/x/seraph/signing/ed25519-ml-dsa-65-roles-1-8")
+        );
         let named = config_of(&[("HOME", "/home/u"), ("SERAPH_SIGNING_DIR", "/k")]).unwrap();
         assert_eq!(named.dir, Path::new("/k"));
         assert_eq!(named.deployer_store, None);

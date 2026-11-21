@@ -201,7 +201,7 @@ Before signalling `svcmgr_labels::HANDOVER_COMPLETE`, init moves its own
 kernel-object caps (`AddressSpace`, `CSpace`, main `Thread`, init-logd
 `Thread`) to procmgr in the first `procmgr_labels::REGISTER_INIT_TEARDOWN`
 round, so procmgr's death observers are bound before real-logd can release
-init-logd. After the handover reply (svcmgr replies immediately, then scans
+init-logd. After the handover reply (svcmgr replies immediately, then reads the signed recipes of
 `/config/svcmgr/services/`, binds the endowed substrate bind-only, and
 launches every defined-but-unparked service — `logd`, the `timed` and
 `pwrmgr` providers, `entropyd`, and `terminal` on a normal boot, plus any staged test

@@ -24,8 +24,10 @@
 //! impure halves:
 //!
 //! At [`crate::svcmgr_labels::HANDOVER_COMPLETE`] svcmgr calls
-//! [`reconcile::reconcile_and_launch`], which scans [`SERVICES_DIR`], parses
-//! every `.svc` into a [`Definition`], and pairs each with the
+//! [`reconcile::reconcile_and_launch`], which reads [`SERVICES_DIR`] through its
+//! signed index (`crate::config`), parses every `.svc` the index names, each
+//! read through procmgr's verified read, into a [`Definition`], and pairs each
+//! with the
 //! pending-registration table [`crate::service::bootstrap_caps`] populated
 //! from init's endowment; a defined-only service is launched through
 //! [`launch::launch`]. The three reconcile outcomes are specified in

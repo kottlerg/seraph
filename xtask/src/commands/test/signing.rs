@@ -6,7 +6,7 @@
 //! Signature refusal test: each verifier of docs/signing.md refuses an object
 //! that does not verify, and the boot reports the refusal it is owed.
 //!
-//! The case boots the current sysroot four times, each from disk images
+//! The case boots the current sysroot six times, each from disk images
 //! that carry objects no build makes, written in place of the sysroot's
 //! through [`crate::disk::create_disk_image_substituting`]:
 //!
@@ -26,6 +26,25 @@
 //!   `/config/devmgr/platform/qemu-virt.platform` has a body byte flipped
 //!   too: procmgr refuses it at devmgr's verified read (`Failed(BodyHash)`),
 //!   and devmgr passes it over and adds no platform-table record.
+//! - `configuration`: a bootloader built under the build's trust store with
+//!   two more anchors, one trusted for every role but configuration and one
+//!   for configuration alone. In `/config/svcmgr/services/`, `timed.svc` has a
+//!   body byte flipped, `pwrmgr.svc` is unsigned, `crashd.svc` is signed by
+//!   the first anchor's key, and `oomd.svc` by the second's, which signs
+//!   `/services/oomd` as a service too; the directory's index, validly
+//!   signed, names a `removed.svc` the directory lacks and omits the
+//!   `swapd.svc` it holds; `/config/devmgr/classes/rtc.class` has a body byte
+//!   flipped. procmgr refuses each configuration file at svcmgr's verified
+//!   read (`Failed(BodyHash)`, `Parse(Magic)`, `Failed(KeyUsage)`) and svcmgr
+//!   reports it passed over; svcmgr reads `oomd.svc` and procmgr refuses the
+//!   service it names (`Failed(KeyUsage)`); svcmgr reports the file the index
+//!   names but the directory lacks, and the file it does not name; the boot
+//!   reaches the terminal's READY line.
+//! - `index`: the indexes of `/config/svcmgr/services/` and
+//!   `/config/devmgr/classes/` each with a body byte flipped. procmgr refuses
+//!   both (`Failed(BodyHash)`), svcmgr reports that it read no recipe and
+//!   configured no class, and every service init registered as one without a
+//!   definition.
 //!
 //! Every boot packs the default-init harness's bundle, which the pack composes
 //! from the installed files; the substitutes are written in the images alone.
@@ -118,6 +137,19 @@ const NO_TABLE: &str = "no platform description table for this machine; no platf
 
 /// The bundle entry the `bundle` case tampers with.
 const BUNDLE_ENTRY: &str = "/services/drivers/virtio-blk";
+
+/// The configuration directories svcmgr reads through their indexes, and
+/// the files of them the `configuration` case replaces.
+const SERVICES_DIR: &str = "config/svcmgr/services";
+const CLASSES_DIR: &str = "config/devmgr/classes";
+const RECIPE_TAMPERED: &str = "timed.svc";
+const RECIPE_UNSIGNED: &str = "pwrmgr.svc";
+const RECIPE_NOT_CONFIGURATION: &str = "crashd.svc";
+const RECIPE_CONFIGURATION_KEY: &str = "oomd.svc";
+const SERVICE_CONFIGURATION_KEY: &str = "services/oomd";
+const RECIPE_UNINDEXED: &str = "swapd.svc";
+const RECIPE_REMOVED: &str = "removed.svc";
+const CLASS_TAMPERED: &str = "rtc.class";
 
 /// One boot: the files its images carry in place of the sysroot's, the lines
 /// it owes, and its deadline.
@@ -227,6 +259,8 @@ fn prepare(ctx: &Context, args: &CaseArgs, dir: &Path) -> Result<Vec<Case>>
         bundle_case,
         revoked_case(ctx, args, dir, &signer)?,
         rootfs_case(ctx, args.arch, dir, &signer)?,
+        configuration_case(ctx, args, dir, &signer)?,
+        index_case(ctx, dir)?,
     ])
 }
 
@@ -234,12 +268,35 @@ fn prepare(ctx: &Context, args: &CaseArgs, dir: &Path) -> Result<Vec<Case>>
 /// `signer`'s key revoked, in place of both ESP copies of the installed one.
 fn revoked_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> Result<Case>
 {
-    let revoking = stage(
+    step("signature test: building a bootloader under a store revoking the signing key");
+    let substitutes = bootloader_under(
+        ctx,
+        args,
         dir,
-        "trust-store.revoking",
+        "revoking",
         &signer.store_revoking_own_key()?,
     )?;
-    let boot = dir.join("boot.efi.revoking");
+    Ok(Case {
+        name: "revoked",
+        substitutes,
+        expect: vec![boot_refusal("kernel", "Failed(Revoked)")],
+        timeout: BOOTLOADER_TIMEOUT,
+    })
+}
+
+/// A bootloader built under the trust store `store`, staged in `dir` with
+/// `tag` in its name: the substitutes of both ESP copies of the installed
+/// one.
+fn bootloader_under(
+    ctx: &Context,
+    args: &CaseArgs,
+    dir: &Path,
+    tag: &str,
+    store: &[u8],
+) -> Result<Vec<Substitute>>
+{
+    let store = stage(dir, &format!("trust-store.{tag}"), store)?;
+    let boot = dir.join(format!("boot.efi.{tag}"));
     let build = BuildArgs {
         arch: args.arch,
         release: args.release,
@@ -249,11 +306,10 @@ fn revoked_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> 
         skip_lints: true,
         host: args.host.common.clone(),
     };
-    step("signature test: building a bootloader under a store revoking the signing key");
     // The case boots, so `main` admitted no build: the compile is admitted
     // here, as a build.
     crate::host_lock::admit_build(ctx, &args.host.common)?;
-    crate::commands::build::compile_boot(ctx, &build, &revoking, &boot)?;
+    crate::commands::build::compile_boot(ctx, &build, &store, &boot)?;
     let mut substitutes = Vec::new();
     for image in crate::esp::bootloader_copies(ctx, args.arch)
     {
@@ -265,11 +321,172 @@ fn revoked_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> 
             source: boot.clone(),
         });
     }
+    Ok(substitutes)
+}
+
+/// The `configuration` case: a bootloader whose store trusts two more keys,
+/// one for every role but configuration and one for configuration alone;
+/// recipes and a class file refused for a tampered body, no signature, or a
+/// key not trusted for configuration; a recipe signed by the
+/// configuration-only key, accepted, naming a service that key signed,
+/// refused; and the services directory's index, signed by `signer`, naming
+/// a file the directory lacks and omitting one it holds.
+fn configuration_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> Result<Case>
+{
+    let others = untrusted_signer(ctx, args.arch)?;
+    let configuration = untrusted_signer(ctx, args.arch)?;
+    let config_only = RoleSet::of(&[Role::Configuration]);
+    let all_but: Vec<Role> = Role::ALL
+        .into_iter()
+        .filter(|&role| role != Role::Configuration)
+        .collect();
+    let store = signer.store_trusting(&[
+        (&others, RoleSet::of(&all_but)),
+        (&configuration, config_only),
+    ])?;
+    step("signature test: building a bootloader under a store with role-scoped anchors");
+    let mut substitutes = bootloader_under(ctx, args, dir, "role-scoped", &store)?;
+
+    let config_path = |tree: &str, file: &str| format!("{tree}/{file}");
+    let resign = |by: &Signer, relative: &str, roles: RoleSet| -> Result<Vec<u8>> {
+        let object = read_sysroot(ctx, relative)?;
+        by.sign(
+            crate::signing::body_of(&object)?,
+            roles,
+            &install_name(relative),
+        )
+    };
+    let tampered = config_path(SERVICES_DIR, RECIPE_TAMPERED);
+    let unsigned = config_path(SERVICES_DIR, RECIPE_UNSIGNED);
+    let not_configuration = config_path(SERVICES_DIR, RECIPE_NOT_CONFIGURATION);
+    let by_configuration = config_path(SERVICES_DIR, RECIPE_CONFIGURATION_KEY);
+    let class = config_path(CLASSES_DIR, CLASS_TAMPERED);
+    let index = config_path(SERVICES_DIR, "index");
+    let mut names = crate::signing::config_files(&ctx.sysroot.join(SERVICES_DIR), ".svc")?
+        .context("the sysroot holds no service recipes")?;
+    ensure!(
+        names.iter().any(|name| name == RECIPE_UNINDEXED),
+        "the sysroot holds no {SERVICES_DIR}/{RECIPE_UNINDEXED}"
+    );
+    names.retain(|name| name != RECIPE_UNINDEXED);
+    names.push(RECIPE_REMOVED.to_owned());
+    names.sort_unstable();
+    let index_object = signer.sign(
+        &crate::signing::index_body(&names)?,
+        config_only,
+        &install_name(&index),
+    )?;
+    let unsigned_body = crate::signing::body_of(&read_sysroot(ctx, &unsigned)?)?.to_vec();
+    let staged = [
+        (&tampered, flip_body_byte(&read_sysroot(ctx, &tampered)?)?),
+        (&unsigned, unsigned_body),
+        (
+            &not_configuration,
+            resign(&others, &not_configuration, config_only)?,
+        ),
+        (
+            &by_configuration,
+            resign(&configuration, &by_configuration, config_only)?,
+        ),
+        (
+            &SERVICE_CONFIGURATION_KEY.to_owned(),
+            resign(
+                &configuration,
+                SERVICE_CONFIGURATION_KEY,
+                RoleSet::of(&[Role::Service]),
+            )?,
+        ),
+        (&class, flip_body_byte(&read_sysroot(ctx, &class)?)?),
+        (&index, index_object),
+    ];
+    for (relative, bytes) in &staged
+    {
+        let tag = relative.replace('/', "_");
+        substitutes.push(sub(relative, stage(dir, &tag, bytes)?));
+    }
+
     Ok(Case {
-        name: "revoked",
+        name: "configuration",
         substitutes,
-        expect: vec![boot_refusal("kernel", "Failed(Revoked)")],
-        timeout: BOOTLOADER_TIMEOUT,
+        expect: configuration_owed(),
+        timeout: ROOTFS_TIMEOUT,
+    })
+}
+
+/// The lines the `configuration` case owes.
+fn configuration_owed() -> Vec<String>
+{
+    let config_path = |tree: &str, file: &str| format!("{tree}/{file}");
+    let tampered = config_path(SERVICES_DIR, RECIPE_TAMPERED);
+    let unsigned = config_path(SERVICES_DIR, RECIPE_UNSIGNED);
+    let not_configuration = config_path(SERVICES_DIR, RECIPE_NOT_CONFIGURATION);
+    let class = config_path(CLASSES_DIR, CLASS_TAMPERED);
+    let refused = |relative: &str, refusal: &str| {
+        format!(
+            "signature verification refused: {}: {refusal}",
+            install_name(relative)
+        )
+    };
+    let recipe_dropped = |relative: &str, kind: &str| {
+        format!(
+            "{}: named by the index, not read ({kind}); dropped",
+            install_name(relative)
+        )
+    };
+    let service = install_name(SERVICE_CONFIGURATION_KEY);
+    vec![
+        refused(&tampered, "Failed(BodyHash)"),
+        recipe_dropped(&tampered, "InvalidData"),
+        refused(&unsigned, "Parse(Magic)"),
+        recipe_dropped(&unsigned, "InvalidData"),
+        refused(&not_configuration, "Failed(KeyUsage)"),
+        recipe_dropped(&not_configuration, "InvalidData"),
+        refused(SERVICE_CONFIGURATION_KEY, "Failed(KeyUsage)"),
+        format!("create: {service:?} refused: its signature did not verify"),
+        recipe_dropped(&config_path(SERVICES_DIR, RECIPE_REMOVED), "NotFound"),
+        format!(
+            "{}: not named by the directory's index; not read",
+            install_name(&config_path(SERVICES_DIR, RECIPE_UNINDEXED))
+        ),
+        refused(&class, "Failed(BodyHash)"),
+        format!(
+            "{}: named by the index, not read (InvalidData); class not configured",
+            install_name(&class)
+        ),
+        TERMINAL_READY.to_owned(),
+    ]
+}
+
+/// The `index` case: the index of each configuration directory svcmgr reads
+/// with a body byte flipped, so svcmgr reads none of its files, reports so,
+/// and reports every service init registered as one without a definition.
+fn index_case(ctx: &Context, dir: &Path) -> Result<Case>
+{
+    let mut substitutes = Vec::new();
+    let mut expect = Vec::new();
+    for (tree, consequence) in [
+        (SERVICES_DIR, "no recipe is read"),
+        (CLASSES_DIR, "no device class configured"),
+    ]
+    {
+        let index = format!("{tree}/index");
+        let tampered = flip_body_byte(&read_sysroot(ctx, &index)?)?;
+        substitutes.push(sub(
+            &index,
+            stage(dir, &index.replace('/', "_"), &tampered)?,
+        ));
+        let name = install_name(&index);
+        expect.push(format!(
+            "signature verification refused: {name}: Failed(BodyHash)"
+        ));
+        expect.push(format!("{name} not read (InvalidData); {consequence}"));
+    }
+    expect.push("svcmgr: registered without definition: ".to_owned());
+    Ok(Case {
+        name: "index",
+        substitutes,
+        expect,
+        timeout: ROOTFS_TIMEOUT,
     })
 }
 

@@ -18,7 +18,8 @@
 //! [`pack_slots`] / [`unpack_slots`] for one round, and [`slot_rounds`] /
 //! [`SlotAccumulator`] / [`request_slots`] for a slot list split over as
 //! many rounds as it needs (the rounds svcmgr serves the children it
-//! launches, and init's `CAPS` endowment of svcmgr).
+//! launches, those std's `Command::spawn` serves a child given bootstrap
+//! caps, and init's `CAPS` endowment of svcmgr).
 
 // When this crate is compiled as a std dep via rustc-dep-of-std, the
 // crate root is `no_core` and the usual prelude is not auto-imported.

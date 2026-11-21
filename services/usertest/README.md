@@ -12,6 +12,22 @@ waits for the tester's exit status.
 
 ---
 
+## Seeds
+
+usertest takes its recipe's seeds over the bootstrap protocol, up to eight slots. Slot 0 is its
+own, `pwrmgr.shutdown`, with which it powers off at the end of the run. The later seeds are
+authorities testers take: the recipe's env entry `TESTER_SEEDS` declares, per tester, the slots
+usertest hands it (`<tester>:<slot>[,<slot>...]`, entries joined by `;`), and usertest gives that
+tester a copy of each as its bootstrap caps
+([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Bootstrap caps), the tester's slot
+`k` being the `k`-th slot its entry names. A tester with no entry gets no creator endpoint. A
+declaration that names slot 0, a slot past the eight, or a tester twice, or that does not parse,
+fails the run before any tester starts. The recipe declares `hello:1`: the hello tester takes
+`pwrmgr.deny` and checks that pwrmgr refuses it
+([programs/hello/README.md](../../programs/hello/README.md) § Tester).
+
+---
+
 ## Source Layout
 
 ```
@@ -19,7 +35,8 @@ services/usertest/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs   # discovery + spawn loop + summary marker
+    ├── lib.rs    # TESTER_SEEDS declaration parser (host-tested)
+    └── main.rs   # seed bootstrap + discovery + spawn loop + summary marker
 ```
 
 `usertest` ships no per-program testers itself. Each program under

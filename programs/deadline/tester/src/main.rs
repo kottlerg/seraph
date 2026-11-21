@@ -5,8 +5,10 @@
 
 //! Per-program tester for `/programs/deadline`. Spawns it once and asserts
 //! that it printed `PASS` and exited cleanly: its supervisor cancelled the
-//! spinning worker at the deadline with an asynchronous upcall, and a call
-//! deadline ended its calls on an endpoint nobody receives on.
+//! spinning worker at the deadline with an asynchronous upcall, a call
+//! deadline ended its calls on an endpoint nobody receives on and a spawn
+//! whose child never asked for its bootstrap caps, and the fixture, spawned
+//! with none, held no creator endpoint.
 //!
 //! See [docs/testing.md](../../../docs/testing.md) for the protocol.
 

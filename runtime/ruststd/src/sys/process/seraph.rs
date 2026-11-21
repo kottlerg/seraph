@@ -19,6 +19,11 @@
 //!             Parent retains its own Pipe end (the originals).
 //!   * Bind death: syscall::thread_bind_notification(thread_cap, event_queue_cap).
 //!   * Start: ipc_call(process_handle, START_PROCESS, 0, &[]).
+//!   * Bootstrap (only with `CommandExt::bootstrap_caps`): the create
+//!             request carries a badged SEND on a spawn-own endpoint at
+//!             caps[1], the child's creator endpoint; after the start, spawn
+//!             serves the child's `ipc::bootstrap` rounds on it, then
+//!             deletes it.
 //!   * Wait: syscall::event_recv(event_queue_cap) — blocks until kernel posts
 //!           the exit reason on thread exit, encoded as
 //!           docs/process-lifecycle.md § Exit reason defines.
@@ -171,6 +176,10 @@ pub struct Command {
     /// the child inherits a copy of the spawner's band. Set via
     /// `CommandExt::sched_max`.
     sched_max: u8,
+    /// Caps the child takes over the bootstrap protocol, positional, `0`
+    /// for an absent slot. Set via `CommandExt::bootstrap_caps`; empty (the
+    /// default) gives the child no creator endpoint.
+    bootstrap: BootstrapCaps,
 }
 
 impl Command {
@@ -189,6 +198,7 @@ impl Command {
             private_image: false,
             priority: 0,
             sched_max: 0,
+            bootstrap: BootstrapCaps(Vec::new()),
         }
     }
 
@@ -227,6 +237,12 @@ impl Command {
     /// `CommandExt::sched_max`; `0` reverts to a copy of the spawner's band.
     pub fn set_sched_max(&mut self, level: u8) {
         self.sched_max = level;
+    }
+
+    /// Hand the child `slots` over the bootstrap protocol. Called by
+    /// `CommandExt::bootstrap_caps`; the caps of an earlier call are deleted.
+    pub fn set_bootstrap_caps(&mut self, slots: &[u64]) {
+        self.bootstrap = BootstrapCaps(slots.to_vec());
     }
 
     pub fn arg(&mut self, arg: &OsStr) {
@@ -324,6 +340,10 @@ impl Command {
                 "Command priority/sched_max exceeds the create-label field range",
             ));
         }
+
+        // The bootstrap caps leave the `Command` here, so every return below
+        // deletes those no round moved to the child, as the guard's drop does.
+        let mut bootstrap = core::mem::replace(&mut self.bootstrap, BootstrapCaps(Vec::new()));
 
         let path_bytes = self.program.as_encoded_bytes();
         if path_bytes.is_empty() {
@@ -464,10 +484,30 @@ impl Command {
             }
         };
 
-        // Caps: [file_cap, argv_env?, death_relay]. Command-spawned children
-        // skip the creator endpoint slot; the argv/env cap (flagged by
-        // `CREATE_ARGV_ENV`) and the death relay (flagged by
-        // `CREATE_DEATH_RELAY`) are the trailing caps, the relay last.
+        // The creator endpoint of a child given bootstrap caps: its badged
+        // SEND rides at cap[1], and procmgr installs a copy as the child's
+        // `creator_endpoint_cap`. A child given none gets no creator
+        // endpoint, the request carrying no cap[1]. Dropped at the end of
+        // `spawn`, which deletes the endpoint once its rounds are served.
+        let creator = if bootstrap.0.is_empty() {
+            None
+        } else {
+            match CreatorEndpoint::new() {
+                Some(creator) => Some(creator),
+                None => {
+                    let _ = syscall::cap_delete(death_relay);
+                    let _ = syscall::cap_delete(death_eq);
+                    let _ = syscall::cap_delete(file_cap);
+                    return Err(io::Error::other("creator endpoint for child failed"));
+                }
+            }
+        };
+
+        // Caps: [file_cap, creator_endpoint?, argv_env?, death_relay]. The
+        // creator endpoint is present only for a child given bootstrap caps;
+        // the argv/env cap (flagged by `CREATE_ARGV_ENV`) and the death relay
+        // (flagged by `CREATE_DEATH_RELAY`) are the trailing caps, the relay
+        // last.
         let pinned_flag = if self.pinned {
             procmgr_labels::CREATE_PINNED
         } else {
@@ -485,6 +525,10 @@ impl Command {
             | procmgr_labels::create_sched_bits(self.priority, self.sched_max)
             | if argv_env.is_some() { procmgr_labels::CREATE_ARGV_ENV } else { 0 };
         let builder = ipc::IpcMessage::builder(label).word(0, file_size).cap(file_cap);
+        let builder = match &creator {
+            Some(creator) => builder.cap(creator.send),
+            None => builder,
+        };
         let builder = match &argv_env {
             Some(memory) => builder
                 .words(procmgr_labels::CREATE_FIRST_WORD, &memory.header_words())
@@ -862,6 +906,15 @@ impl Command {
             Ok(reply) => Some(map_procmgr_error(reply.label)),
             Err(e) => Some(call_failed(*e, "START_PROCESS syscall failed")),
         };
+        // A started child given bootstrap caps takes them before `spawn`
+        // returns; a child that dies first, or a call deadline that passes
+        // first, fails the spawn as a failed start does.
+        let start_error = match (start_error, &creator) {
+            (None, Some(creator)) => {
+                serve_bootstrap(creator.endpoint, thread_cap, ipc_ptr, &mut bootstrap).err()
+            }
+            (start_error, _) => start_error,
+        };
         if let Some(e) = start_error {
             // If a bridge is running, wake it with the sentinel so it
             // joins cleanly before we delete the caps it holds.
@@ -872,10 +925,10 @@ impl Command {
                 }
                 let _ = syscall::cap_delete(b.completion_notification);
             }
-            // An interrupted or timed-out START_PROCESS may have started the child, so
-            // the rings count as never used only once the teardown has
-            // returned; otherwise their grants stay accounted to this
-            // process, as the death bridge leaves them.
+            // An interrupted or timed-out START_PROCESS, or a failed bootstrap
+            // round, may leave the child started, so the rings count as never
+            // used only once the teardown has returned; otherwise their grants
+            // stay accounted to this process, as the death bridge leaves them.
             if destroy_child(process_handle) {
                 mark_spawn_failure_pipes(
                     child_stdin_pipe.as_deref(),
@@ -904,6 +957,137 @@ impl Command {
             },
         ))
     }
+}
+
+/// The badge of the SEND a child given bootstrap caps holds on its creator
+/// endpoint: the endpoint is the one spawn's own, so any non-zero badge names
+/// the child, and the serve refuses a request without it.
+const BOOTSTRAP_BADGE: u64 = 1;
+
+/// Caps a `Command` hands its child over the bootstrap protocol
+/// (`CommandExt::bootstrap_caps`), positional, `0` for an absent slot or
+/// one a round has moved to the child. Dropping it deletes every cap still
+/// held, so caps no round delivered, through a failed spawn or a `Command`
+/// dropped unspawned, are released.
+struct BootstrapCaps(Vec<u64>);
+
+impl Drop for BootstrapCaps {
+    fn drop(&mut self) {
+        for &cap in self.0.iter().filter(|&&cap| cap != 0) {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+}
+
+/// The creator endpoint of one spawn whose child takes bootstrap caps: the
+/// endpoint the spawner receives the child's requests on, and the badged
+/// SEND `CREATE_FROM_FILE` moves to procmgr. Dropping it deletes both; the
+/// SEND's handle is stale once the create request moved it, and its delete
+/// fails harmlessly. Once the endpoint is deleted, the child's copy of the
+/// SEND reaches no receiver.
+struct CreatorEndpoint {
+    endpoint: u64,
+    send: u64,
+}
+
+impl CreatorEndpoint {
+    fn new() -> Option<CreatorEndpoint> {
+        let endpoint = crate::sys::alloc::seraph::object_slab_retype(
+            syscall_abi::ENDPOINT_RETYPE_BYTES,
+            |slab| syscall::cap_create_endpoint(slab).ok(),
+        )?;
+        match syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, BOOTSTRAP_BADGE) {
+            Ok(send) => Some(CreatorEndpoint { endpoint, send }),
+            Err(_) => {
+                let _ = syscall::cap_delete(endpoint);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for CreatorEndpoint {
+    fn drop(&mut self) {
+        let _ = syscall::cap_delete(self.send);
+        let _ = syscall::cap_delete(self.endpoint);
+    }
+}
+
+/// Serve a started child's bootstrap rounds on `endpoint`: `bootstrap`'s
+/// slots split by `ipc::bootstrap::slot_rounds`, one round per request
+/// (`ceil(slots / MSG_CAP_SLOTS_MAX)` rounds), the last marked done. Each
+/// round moves its caps to the child, whose slots are then cleared.
+///
+/// The calling thread waits for each request in `WATCH_POLL_MS` receives,
+/// and at each one that expires reads whether the child has died, on
+/// `thread_cap`, and whether the thread's call deadline
+/// (`with_call_deadline`) has passed, so a request is waited for until the
+/// child asks, dies, or the deadline passes, the last one poll late at most.
+/// With no deadline set, a live child that never asks holds the spawner as
+/// `Child::wait` would.
+///
+/// # Errors
+/// `TimedOut` when the deadline passed first, `Other` when the child died
+/// or a round failed. The caps of the rounds not delivered stay in
+/// `bootstrap`, whose drop deletes them.
+fn serve_bootstrap(
+    endpoint: u64,
+    thread_cap: u64,
+    ipc_ptr: *mut u64,
+    bootstrap: &mut BootstrapCaps,
+) -> io::Result<()> {
+    use ipc::bootstrap::{
+        ServeFailure, WATCH_POLL_MS, serve_round_watched, slot_rounds, thread_cap_death,
+    };
+    let rounds: Vec<_> = slot_rounds(&bootstrap.0).collect();
+    let count = rounds.len();
+    for (k, packed) in rounds.iter().enumerate() {
+        let mut deadline_passed = false;
+        // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
+        let served = unsafe {
+            serve_round_watched(
+                endpoint,
+                BOOTSTRAP_BADGE,
+                ipc_ptr,
+                k + 1 == count,
+                packed.caps(),
+                &[packed.presence()],
+                WATCH_POLL_MS,
+                || {
+                    thread_cap_death(thread_cap).or_else(|| {
+                        let passed = crate::os::seraph::call_time_left()
+                            == Some(crate::time::Duration::ZERO);
+                        deadline_passed |= passed;
+                        passed.then_some(0)
+                    })
+                },
+            )
+        };
+        match served {
+            Ok(()) => {
+                let window = k * syscall_abi::MSG_CAP_SLOTS_MAX;
+                for slot in bootstrap.0.iter_mut().skip(window).take(syscall_abi::MSG_CAP_SLOTS_MAX)
+                {
+                    *slot = 0;
+                }
+            }
+            Err(_) if deadline_passed => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Command::spawn: call deadline passed before the child took its bootstrap caps",
+                ));
+            }
+            Err(ServeFailure::ChildDied(_)) => {
+                return Err(io::Error::other(
+                    "Command::spawn: child died before taking its bootstrap caps",
+                ));
+            }
+            Err(ServeFailure::Refused(_)) => {
+                return Err(io::Error::other("Command::spawn: bootstrap round failed"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Mark every parent-side pipe end's ring grant releasable on a

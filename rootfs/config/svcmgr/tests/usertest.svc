@@ -4,6 +4,11 @@
 # orchestrator walks /tests/programs/, spawns each per-program tester
 # sequentially, then powers off via the pwrmgr.shutdown seed.
 #
+# The later seeds are authorities testers take: TESTER_SEEDS names, per
+# tester, the seed slots usertest hands it as its bootstrap caps (slot 0,
+# pwrmgr.shutdown, is usertest's own). The hello tester takes pwrmgr.deny to
+# check the delivery. See docs/testing.md § Per-program tester protocol.
+#
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # To enable in a boot, copy this file into /config/svcmgr/services/
 # between `cargo xtask build` and `cargo xtask run`. See docs/testing.md.
@@ -15,4 +20,5 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
+env       = TESTER_SEEDS=hello:1
 seed      = pwrmgr.shutdown pwrmgr.deny

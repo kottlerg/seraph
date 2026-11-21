@@ -320,7 +320,9 @@ static CALL_DEADLINE: Cell<Option<crate::time::Instant>> = Cell::new(None);
 /// `std::os::seraph` file and namespace functions, `std::process`'s
 /// spawn, `std::time::SystemTime::now`, [`registry::lookup`],
 /// [`read_verified`], and the system log ([`log!`](crate::os::seraph::log),
-/// stderr, a panic's message). A call that reaches the deadline fails as the
+/// stderr, a panic's message). A spawn's wait for its child's bootstrap
+/// requests (`process::CommandExt::bootstrap_caps`) ends at the deadline
+/// too. A call that reaches the deadline fails as the
 /// API reports a failed call: an `io::Error` of kind `TimedOut` where it
 /// returns `io::Result`; `UNIX_EPOCH` from `SystemTime::now`, `None` from
 /// [`registry::lookup`], and a dropped line from the log, which report no
@@ -2529,6 +2531,27 @@ pub mod process {
         /// itself with `InvalidInput`.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn sched_max(&mut self, level: u8) -> &mut Self;
+
+        /// Hand the child `slots` over the bootstrap protocol
+        /// (`ipc::bootstrap`): positional caps, `0` for an absent slot,
+        /// which the child takes with `ipc::bootstrap::request_slots` on its
+        /// `creator_endpoint` ([`super::StartupInfo`]), as a child svcmgr
+        /// launches takes its recipe's seeds. The caps' ownership transfers to
+        /// the `Command`: the next `spawn` moves them to the child, and
+        /// deletes those it does not deliver, as dropping the `Command` does;
+        /// a later call replaces the list and deletes the earlier caps.
+        ///
+        /// `spawn` then gives the child a creator endpoint, serves its rounds
+        /// once it has started (one per `MSG_CAP_SLOTS_MAX` slots), and
+        /// returns once the child has taken them all. A child that dies first,
+        /// or a call deadline ([`super::with_call_deadline`]) that passes
+        /// first, fails the spawn (`TimedOut` for the deadline) and tears the
+        /// child down. With no deadline set, `spawn` waits for a live child
+        /// that does not ask, so the child takes its caps before it writes
+        /// enough to fill a piped stdio stream. An empty list, the default,
+        /// gives the child no creator endpoint at all.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn bootstrap_caps(&mut self, slots: &[u64]) -> &mut Self;
     }
 
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -2560,6 +2583,11 @@ pub mod process {
 
         fn sched_max(&mut self, level: u8) -> &mut Command {
             self.as_inner_mut().set_sched_max(level);
+            self
+        }
+
+        fn bootstrap_caps(&mut self, slots: &[u64]) -> &mut Command {
+            self.as_inner_mut().set_bootstrap_caps(slots);
             self
         }
     }

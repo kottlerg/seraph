@@ -571,8 +571,9 @@ cargo xtask crypto-vectors [--check]
 The command builds and runs the testkit's `crypto-reference-vectors` binary for the host, which
 drives the `openssl` command found on `PATH`
 ([shared/crypto/testkit/README.md](../shared/crypto/testkit/README.md)). Without `--check` it
-writes `vectors/reference/ed25519.json` and `sha512.json`; with it, it writes nothing and fails,
-naming each file, unless both regenerate byte-identically. xtask does not depend on the testkit.
+writes every file under `vectors/reference/` (`ed25519.json`, `sha512.json`, `shake.json` and
+`ml_dsa_65.json`); with it, it writes nothing and fails, naming each file, unless every one
+regenerates byte-identically. xtask does not depend on the testkit.
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), and takes
 their `--wait-host` and `--host-override` options.

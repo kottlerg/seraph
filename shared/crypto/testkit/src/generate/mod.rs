@@ -3,17 +3,17 @@
 
 // shared/crypto/testkit/src/generate/mod.rs
 
-//! The generator of the reference vectors, `vectors/reference/ed25519.json`
-//! and `sha512.json`: it builds every input and writes it with the outcome
-//! OpenSSL gives it.
+//! The generator of the reference vectors under `vectors/reference/`
+//! (`ed25519.json`, `sha512.json`, `shake.json` and `ml_dsa_65.json`): it
+//! builds every input and writes it with the outcome OpenSSL gives it.
 //!
 //! OpenSSL is the reference (the [`openssl`] module runs the command). The
 //! generated inputs come from [`Rng`] under fixed seeds, so the files are the
 //! same on every run, and the Ed25519 edge cases are built with the curve
 //! arithmetic of [`edwards`], which is independent of `shared/crypto`.
 //!
-//! The signing section holds a seed, a message, and the public key and
-//! signature OpenSSL derives from them; it fails when OpenSSL's key or
+//! The Ed25519 signing section holds a seed, a message, and the public key
+//! and signature OpenSSL derives from them; it fails when OpenSSL's key or
 //! signature for an RFC 8032 § 7.1 secret differs from the RFC's.
 //!
 //! An Ed25519 verdict names the first RFC 8032 check that fails, in order: S
@@ -24,8 +24,16 @@
 //! S at or above L, which OpenSSL refuses by its own check, when a crafted
 //! case does not reach the outcome it is built for, and when the public key
 //! OpenSSL derives differs from the one [`edwards`] derives.
+//!
+//! An ML-DSA-65 verdict names the first FIPS 204 Algorithm 8 check that
+//! fails: the hint encoding, the norm bound of z, then OpenSSL's
+//! verification. OpenSSL reports only accept or refuse, so the generator
+//! makes the first two checks itself on the signature's bytes (`ml_dsa.rs`),
+//! and fails when OpenSSL accepts a signature they refuse or when a crafted
+//! edit does not reach the verdict it is built for.
 
 pub mod edwards;
+mod ml_dsa;
 pub mod nat;
 mod openssl;
 
@@ -43,6 +51,7 @@ use crate::ed25519::{self, Verdict};
 use crate::hex;
 use crate::rng::Rng;
 use crate::sha512;
+use crate::shake::{self, Function};
 use crate::wycheproof::{self, Case as _, Expected, eddsa};
 
 /// The seed of the generated Ed25519 inputs.
@@ -57,6 +66,12 @@ pub const ED25519_SIGNING_ROUNDS: usize = 48;
 pub const SHA512_SEED: u64 = 0x5e4a_9512;
 /// The number of long SHA-512 messages, beside every length from 0 to 300.
 pub const SHA512_LONG: usize = 64;
+/// The seed of the generated SHAKE messages.
+pub const SHAKE_SEED: u64 = 0x5e4a_5a4e;
+/// The number of long SHAKE messages of each function, beside every length
+/// from 0 to one past the rate.
+pub const SHAKE_LONG: usize = 16;
+pub use self::ml_dsa::{ML_DSA_ROUNDS, ML_DSA_SEED};
 
 /// Why the generator stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +93,7 @@ pub struct Files
     pub files: Vec<(&'static str, String)>,
 }
 
-/// Generate both vector files with OpenSSL, the command's files kept in a
+/// Generate every vector file with OpenSSL, the command's files kept in a
 /// private working directory under the system's temporary directory (see
 /// [`private_dir`]) and removed after.
 ///
@@ -98,13 +113,25 @@ pub fn generate() -> Result<Files, Error>
     let ed25519 = Ed25519 {
         openssl: OpenSsl::new(dir.clone()),
     };
-    let result = ed25519.file().and_then(|ed| Ok((ed, sha512_file()?)));
+    let result = ed25519.file().and_then(|ed| {
+        Ok((
+            ed,
+            sha512_file()?,
+            shake_file()?,
+            ml_dsa::file(&ed25519.openssl)?,
+        ))
+    });
     // A leftover working directory holds nothing secret; a failure to remove
     // it does not fail the run.
     let _ = fs::remove_dir_all(&dir);
-    let (ed, sha) = result?;
+    let (ed, sha, shake, ml) = result?;
     Ok(Files {
-        files: vec![(ed25519::FILE, ed), (sha512::FILE, sha)],
+        files: vec![
+            (ed25519::FILE, ed),
+            (sha512::FILE, sha),
+            (shake::FILE, shake),
+            (crate::ml_dsa::FILE, ml),
+        ],
     })
 }
 
@@ -810,10 +837,82 @@ fn sha512_file() -> Result<String, Error>
     ))
 }
 
+/// Ascending split points of `len` bytes: up to three at random, and the
+/// first block boundary when the data reaches it.
+fn split_points(rng: &mut Rng, len: usize, block: usize) -> Vec<usize>
+{
+    let mut cuts: Vec<usize> = (0..rng.below(4)).map(|_| rng.below(len + 1)).collect();
+    if len >= block
+    {
+        cuts.push(block);
+    }
+    cuts.sort_unstable();
+    cuts
+}
+
+/// The SHAKE file: for SHAKE128 and SHAKE256, every message length from 0
+/// to one byte past the rate and `SHAKE_LONG` messages of up to 2047 bytes,
+/// from seed `SHAKE_SEED`; each with an output length from 1 to two blocks
+/// and more, its message and output split at random offsets and on the
+/// first block boundary they reach, and OpenSSL's output.
+fn shake_file() -> Result<String, Error>
+{
+    let mut rng = Rng::new(SHAKE_SEED);
+    let mut cases = Vec::new();
+    for function in Function::ALL
+    {
+        let rate = function.rate();
+        let mut lengths: Vec<usize> = (0..=rate + 1).collect();
+        lengths.extend((0..SHAKE_LONG).map(|_| rng.below(2048)));
+        for len in lengths
+        {
+            let data = rng.bytes(len);
+            let output_len = rng.below(2 * rate + 8) + 1;
+            let cuts = split_points(&mut rng, len, rate);
+            let output_cuts = split_points(&mut rng, output_len, rate);
+            let output = OpenSsl::shake(&function.name().to_lowercase(), &data, output_len)?;
+            cases.push(json!({
+                "function": function.name(),
+                "message": hex::encode(&data),
+                "cuts": cuts,
+                "outputCuts": output_cuts,
+                "output": hex::encode(&output),
+            }));
+        }
+    }
+    Ok(vector_file(
+        &[
+            ("schema", json!(shake::SCHEMA)),
+            ("seed", json!(SHAKE_SEED)),
+            ("long", json!(SHAKE_LONG)),
+            ("numberOfTests", json!(cases.len())),
+        ],
+        &[("generated", cases)],
+    ))
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn split_points_are_ascending_within_the_data_and_hold_the_block_boundary()
+    {
+        let mut rng = Rng::new(1);
+        for len in [0, 5, 136, 400]
+        {
+            for _ in 0..32
+            {
+                let cuts = split_points(&mut rng, len, 136);
+                assert!(
+                    cuts.is_sorted() && cuts.iter().all(|&c| c <= len),
+                    "{cuts:?}"
+                );
+                assert_eq!(cuts.contains(&136), len >= 136, "{cuts:?}");
+            }
+        }
+    }
 
     #[test]
     fn a_vector_file_reads_back_as_its_header_and_sections()

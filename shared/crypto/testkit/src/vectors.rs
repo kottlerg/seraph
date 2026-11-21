@@ -135,6 +135,51 @@ pub(crate) fn fixed<const N: usize>(value: &Value, key: &str) -> Result<[u8; N],
     <[u8; N]>::try_from(bytes(value, key)?).map_err(|_| bad(key, &format!("{N} bytes of hex")))
 }
 
+/// The hex string member `key`, decoded, or `None` when the member is absent
+/// or null.
+pub(crate) fn optional_bytes(value: &Value, key: &str) -> Result<Option<Vec<u8>>, LoadError>
+{
+    match value.get(key)
+    {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => bytes(value, key).map(Some),
+    }
+}
+
+/// The array member `key` of ascending offsets into `len` bytes: the points
+/// at which an incremental operation splits its input or output.
+pub(crate) fn offsets(value: &Value, key: &str, len: usize) -> Result<Vec<usize>, LoadError>
+{
+    let offsets = array(value, key)?
+        .iter()
+        .map(|offset| offset.as_u64().and_then(|o| usize::try_from(o).ok()))
+        .collect::<Option<Vec<usize>>>()
+        .ok_or_else(|| bad(key, "an array of non-negative integers"))?;
+    if !offsets.is_sorted() || offsets.last().is_some_and(|&last| last > len)
+    {
+        return Err(LoadError::Parse(format!(
+            "field {key:?}: {offsets:?} are not ascending offsets within {len} bytes"
+        )));
+    }
+    Ok(offsets)
+}
+
+/// `data` split at the ascending `offsets`: the pieces an incremental
+/// operation is fed or reads, empty pieces included.
+#[must_use]
+pub fn pieces<'a>(data: &'a [u8], offsets: &[usize]) -> Vec<&'a [u8]>
+{
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for &offset in offsets
+    {
+        pieces.push(data.get(start..offset).unwrap_or_default());
+        start = offset;
+    }
+    pieces.push(data.get(start..).unwrap_or_default());
+    pieces
+}
+
 /// Check that a file declares `schema` and holds as many cases as its
 /// `numberOfTests`.
 pub(crate) fn check_header(document: &Value, schema: &str, found: usize) -> Result<(), LoadError>
@@ -160,8 +205,15 @@ mod tests
     #[test]
     fn a_field_reader_names_a_missing_or_mistyped_field()
     {
-        let value = document(r#"{"s": "ab", "n": 3, "a": ["x"], "neg": -1}"#).unwrap();
+        let value = document(r#"{"s": "ab", "n": 3, "a": ["x"], "neg": -1, "z": null}"#).unwrap();
         assert_eq!(string(&value, "s"), Ok("ab"));
+        assert_eq!(optional_bytes(&value, "s"), Ok(Some(vec![0xab])));
+        assert_eq!(optional_bytes(&value, "missing"), Ok(None));
+        assert_eq!(optional_bytes(&value, "z"), Ok(None));
+        assert!(matches!(
+            optional_bytes(&value, "n"),
+            Err(LoadError::Parse(_))
+        ));
         assert_eq!(count(&value, "n"), Ok(3));
         assert_eq!(strings(&value, "a"), Ok(vec!["x".to_owned()]));
         assert_eq!(fixed::<1>(&value, "s"), Ok([0xab]));
@@ -180,6 +232,25 @@ mod tests
             unreachable!()
         };
         assert!(why.contains("\"n\""), "{why}");
+    }
+
+    #[test]
+    fn offsets_are_ascending_and_within_the_data_and_split_it_in_order()
+    {
+        let value =
+            document(r#"{"ok": [0, 2, 2, 6], "down": [2, 1], "past": [7], "neg": [-1]}"#).unwrap();
+        let cuts = offsets(&value, "ok", 6).unwrap();
+        assert_eq!(
+            pieces(b"abcdef", &cuts),
+            [&b""[..], b"ab", b"", b"cdef", b""]
+        );
+        for key in ["down", "past", "neg", "missing"]
+        {
+            assert!(
+                matches!(offsets(&value, key, 6), Err(LoadError::Parse(_))),
+                "{key}"
+            );
+        }
     }
 
     #[test]

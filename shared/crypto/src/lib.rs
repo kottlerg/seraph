@@ -3,11 +3,11 @@
 
 // shared/crypto/src/lib.rs
 
-//! In-OS cryptographic primitives: SHA-512 hashing, Ed25519 signature
-//! verification and, for the host signer, key generation and signing, and
-//! ChaCha20-Poly1305 authenticated encryption.
+//! In-OS cryptographic primitives: SHA-512 hashing, Keccak-f[1600] and SHAKE,
+//! Ed25519 and ML-DSA-65 signature verification and, for the host signer, key
+//! generation and signing, and ChaCha20-Poly1305 authenticated encryption.
 //!
-//! `no_std`, no allocation, no external dependencies. Four primitives:
+//! `no_std`, no allocation, no external dependencies. Six primitives:
 //!
 //! - [`sha512`] / [`Sha512`] — FIPS 180-4 SHA-512, one-shot and incremental.
 //!   The incremental form hashes large inputs (e.g. boot-module bodies)
@@ -41,7 +41,10 @@
 extern crate std;
 
 pub mod chacha20poly1305;
+pub mod keccak;
+pub mod ml_dsa;
 pub mod sha512;
+pub mod shake;
 
 mod chacha20;
 mod ed25519;
@@ -49,6 +52,7 @@ mod ed25519;
 mod ed25519_sign;
 mod edwards;
 mod field;
+mod kat_hex;
 mod poly1305;
 mod scalar;
 
@@ -56,4 +60,6 @@ pub use chacha20poly1305::run_chacha20_poly1305_kats;
 pub use ed25519::{VerifyError, ed25519_verify, run_ed25519_kats};
 #[cfg(any(test, feature = "sign"))]
 pub use ed25519_sign::{ed25519_public_key, ed25519_sign};
+pub use ml_dsa::run_ml_dsa_kats;
 pub use sha512::{Sha512, run_sha512_kats, sha512};
+pub use shake::run_shake_kats;

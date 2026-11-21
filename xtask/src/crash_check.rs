@@ -7,10 +7,8 @@
 //!
 //! No harness can read the system log from inside the guest, so the reports
 //! crashd logs are checked on the host, in a boot's serial log
-//! (docs/testing.md § Crash reports): by `cargo xtask run --runs N
-//! --crash-reports` on each passing run's log, and by `cargo xtask
-//! run --crash-reports` on a saved one. Every block in the log must be complete
-//! and hold the fields its kind, thread, and status require
+//! (docs/testing.md § Crash reports), by `cargo xtask run --crash-reports` on
+//! each passing run's log. Every block in the log must be complete and hold the fields its kind, thread, and status require
 //! (`crash_report::Block::check`, the parser of the format crashd emits,
 //! services/crashd/docs/block-format.md).
 //!
@@ -23,9 +21,7 @@
 //! the `vm` block, the faulting address that dump prints). A block
 //! is tied to `crashme` through its `badge`, which logd's `reclaim:` line at
 //! the process's death names. With [`CrashReportExpect::None`], the log must
-//! hold no block: the boot of an image that does not stage crashd. A saved log
-//! whose `run` trailer records a `QEMU-CRASH` is skipped, not failed: that
-//! outcome is a host-emulator crash, which `run` itself tolerates.
+//! hold no block: the boot of an image that does not stage crashd.
 
 use std::collections::HashMap;
 
@@ -33,7 +29,6 @@ use crate::error::{Context as _, Result, bail};
 use crash_report::Block;
 
 use crate::cli::CrashReportExpect;
-use crate::commands::run::classified::{QEMU_CRASH_LABEL, saved_log_outcome};
 use crate::crash_log::reclaimed_names;
 
 /// The log name of the fixture whose three reports the usertest boot leaves.
@@ -54,16 +49,6 @@ const FIXTURE_BLOCKS: [(&str, &str); 3] = [
     ("exception", "main"),
     ("exception", "spawned"),
 ];
-
-/// What a log's check found.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Verdict
-{
-    /// Every block checked, and the expectation held; the block count.
-    Pass(usize),
-    /// A host-emulator crash ended the boot; nothing is checked.
-    Skipped(String),
-}
 
 /// The tid of each of the kernel's `fault unhandled` decline lines, by the
 /// decline reason it prints.
@@ -162,14 +147,10 @@ fn check_fixture_block(block: &Block, thread: &str, log: &str) -> Result<()>
     Ok(())
 }
 
-/// Check one boot's serial log against `expect`.
-pub(crate) fn check_log(log: &str, expect: CrashReportExpect) -> Result<Verdict>
+/// Check one boot's serial log against `expect`; the number of blocks it
+/// holds, every one checked.
+pub(crate) fn check_log(log: &str, expect: CrashReportExpect) -> Result<usize>
 {
-    if let Some(outcome) = saved_log_outcome(log)
-        && outcome.starts_with(QEMU_CRASH_LABEL)
-    {
-        return Ok(Verdict::Skipped(outcome.to_string()));
-    }
     let blocks = crash_report::parse(log);
     for block in &blocks
     {
@@ -213,7 +194,7 @@ pub(crate) fn check_log(log: &str, expect: CrashReportExpect) -> Result<Verdict>
             }
         }
     }
-    Ok(Verdict::Pass(blocks.len()))
+    Ok(blocks.len())
 }
 
 #[cfg(test)]
@@ -334,7 +315,7 @@ mod tests
         regs[RSP] = 0x7fff_f000;
         assert_eq!(
             check_log(&fixture_reports(&regs), CrashReportExpect::Reports).unwrap(),
-            Verdict::Pass(3)
+            3
         );
     }
 
@@ -453,24 +434,10 @@ mod tests
     }
 
     #[test]
-    fn a_log_a_host_emulator_crash_ended_is_skipped()
-    {
-        let log = "[1.0] [crashd] CRASH-BEGIN id=00000000000000aa version=1\n\
-                   [run] arch=x86_64 cpus=4 accel=kvm run=1 outcome=QEMU-CRASH_rc=139\n";
-        assert_eq!(
-            check_log(log, CrashReportExpect::Reports).unwrap(),
-            Verdict::Skipped("QEMU-CRASH_rc=139".to_string())
-        );
-    }
-
-    #[test]
     fn expecting_none_passes_a_log_without_blocks_and_fails_one_with_a_block()
     {
         let quiet = "[1.0] kernel: USERSPACE FAULT: tid=27 cpu=1 cause=#PF\n";
-        assert_eq!(
-            check_log(quiet, CrashReportExpect::None).unwrap(),
-            Verdict::Pass(0)
-        );
+        assert_eq!(check_log(quiet, CrashReportExpect::None).unwrap(), 0);
         let regs = [0u64; 21];
         check_log(&fixture_reports(&regs), CrashReportExpect::None).unwrap_err();
     }

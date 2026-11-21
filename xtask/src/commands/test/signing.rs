@@ -36,8 +36,9 @@
 //! from the signing every pack does, and the disk images are packed again in
 //! the layout they had, with the recorded harness's bundle.
 //!
-//! Requires a populated sysroot from `cargo xtask build`, whose recorded
-//! harness may be any.
+//! Requires a populated sysroot from `cargo xtask build` whose recorded
+//! harness is `init` (`cargo xtask mkdisk --harness init`), as the case
+//! registry checks.
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};

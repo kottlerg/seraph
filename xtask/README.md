@@ -704,6 +704,13 @@ options are `--wait-host SECS`, `--host-override`, `--alone`, `--timing` and `--
 case option it does not take, and `--cause`, `--port`, `--gdb`, `--riscv-mmu` and `--x86-paging`
 require a case.
 
+A case or a cell boots images that carry no trust request: when one is staged in the sysroot's ESP
+([`cargo xtask trust-request`](#cargo-xtask-trust-request)), the runner checks that the sysroot was
+built for the architecture, changing nothing when it was not, then removes the request and packs the
+images again before the cases, then stages it and packs them again after them, whatever their
+outcome, since each boot of a case starts on a fresh variable store and would decide the request
+again. The `enrolment` case stages requests of its own for its boots.
+
 The registry is `src/commands/test/cases.rs`. Each case's entry states the architectures it runs
 on with its boots on each, the bundle its image must compose, the cell that runs it, and the case
 options it takes:
@@ -724,16 +731,16 @@ options it takes:
 | `secureboot` | x86_64 (4), riscv64 (4) | init | usertest | none |
 | `hotplug` | x86_64 (4), riscv64 (3) | init | host run | none |
 
-Before a case runs, `test` checks that the case runs on the architecture, that the sysroot was
-built for it, and that the recorded harness is the case's bundle (`ktest` for `kaslr` and `cet`,
-`init` for every other), and when it is not, names the `cargo xtask mkdisk --arch A --harness X`
-that records it. A case is a pure runner: it builds nothing but the `signing` case's revoking
-bootloader and the `rollback` case's raising one, boots the sysroot as the last pack left it,
-stages and removes only what it needs itself, and leaves the images in the layout it found them
-in; the sections below state each one's staging. A new host-driven QEMU test is a case, added to
-the registry and to `TestCase` in `src/cli.rs`, not a command; `cargo xtask lint-docs` fails until
-the table above, a section of its own below, a heading of
-[docs/testing.md](../docs/testing.md#gating) § Gating, and the cell table of its § Coverage tiers
+Before a case runs, `test` checks that the case runs on the architecture, that the sysroot was built
+for it, and that the recorded harness is the case's bundle (`ktest` for `kaslr` and `cet`, `init`
+for every other), and when it is not, names the `cargo xtask mkdisk --arch A --harness X` that
+records it. A case is a pure runner: it builds nothing but the `signing` case's revoking bootloader
+and the `rollback` case's raising one, boots the sysroot as the last pack left it but for a staged
+trust request, which the runner sets aside (above), stages and removes only what it needs itself,
+and leaves the images in the layout it found them in; the sections below state each one's staging. A
+new host-driven QEMU test is a case, added to the registry and to `TestCase` in `src/cli.rs`, not a
+command; `cargo xtask lint-docs` fails until the table above, a section of its own below, a heading
+of [docs/testing.md](../docs/testing.md#gating) § Gating, and the cell table of its § Coverage tiers
 state it (its `md-test-cells` rule, [§ `cargo xtask lint-docs`](#cargo-xtask-lint-docs)). See
 [docs/testing.md](../docs/testing.md) for the harness model.
 
@@ -1292,8 +1299,13 @@ seconds.
 
 The request is staged in the sysroot's ESP as `EFI/seraph/trust-request`, so every later pack's
 image carries it (`mkdisk` keeps it, as it does not a knob) until `--clear` removes it, or, with
-`--out`, written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request`. A request
-left on the ESP once applied changes nothing on later boots, which skip it. The command refuses a
+`--out`, written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request`. On a
+machine whose variable store persists, a request left on the ESP once applied changes nothing on
+later boots, which skip it. Every launch of `cargo xtask run`, `--runs` included, boots a fresh
+copy of the firmware's variable template
+([docs/build-system.md](../docs/build-system.md#qemu-and-firmware)), so each of its boots decides a
+staged request again, and an unsigned one waits at the console prompt for 60 seconds on every boot.
+The cases set a staged request aside while they run ([Cases](#cases)). The command refuses a
 request that adds and revokes nothing, a store file that does not parse, and a key id that is not
 32 hex digits.
 

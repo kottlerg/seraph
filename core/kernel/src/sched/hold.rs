@@ -165,26 +165,28 @@ pub const fn start_decision(space: HoldState, state: ThreadState, mark: HoldMark
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReleaseVisit
 {
-    /// Marked [`HoldMark::Stopped`]: start it (commit `Ready` and link it),
-    /// clearing the mark, once it is settled; an unsettled one waits for the
-    /// walk's next pass.
+    /// `Stopped` and marked [`HoldMark::Stopped`]: start it (commit `Ready`
+    /// and link it), clearing the mark, once it is settled; an unsettled one
+    /// waits for the walk's next pass.
     Start,
     /// Marked [`HoldMark::Pending`]: clear the mark, so the wake of its park
-    /// links it as usual.
+    /// links it as usual. Also a mark found on a thread that is no longer
+    /// `Stopped`: an `Exited` thread a teardown has not yet unregistered is
+    /// never started, since `Exited` is terminal.
     Clear,
     /// Unmarked: nothing.
     Leave,
 }
 
-/// The release walk's decision for a thread carrying `mark`.
+/// The release walk's decision for a thread in `state` carrying `mark`.
 #[must_use]
-pub const fn release_visit(mark: HoldMark) -> ReleaseVisit
+pub const fn release_visit(state: ThreadState, mark: HoldMark) -> ReleaseVisit
 {
-    match mark
+    match (mark, state)
     {
-        HoldMark::Stopped => ReleaseVisit::Start,
-        HoldMark::Pending => ReleaseVisit::Clear,
-        HoldMark::None => ReleaseVisit::Leave,
+        (HoldMark::Stopped, ThreadState::Stopped) => ReleaseVisit::Start,
+        (HoldMark::Stopped | HoldMark::Pending, _) => ReleaseVisit::Clear,
+        (HoldMark::None, _) => ReleaseVisit::Leave,
     }
 }
 
@@ -471,17 +473,17 @@ unsafe fn release_visit_thread(tcb: *mut ThreadControlBlock, aspace: *const Addr
     let f = unsafe { lock.lock_raw() };
     let mut started = None;
     let mut unsettled = false;
-    // SAFETY: tcb valid; the mark is written under its sched_lock, held here.
-    match release_visit(unsafe { (*tcb).hold })
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "both reads are of tcb fields its held sched_lock serialises"
+    )]
+    // SAFETY: tcb valid; its state and mark are written under its sched_lock,
+    // held here.
+    let (state, mark) = unsafe { ((*tcb).state, (*tcb).hold) };
+    match release_visit(state, mark)
     {
         ReleaseVisit::Start =>
         {
-            // SAFETY: tcb valid; state is read under its held sched_lock.
-            let state = unsafe { (*tcb).state };
-            debug_assert!(
-                state == ThreadState::Stopped,
-                "release: a thread marked hold-stopped is not Stopped"
-            );
             // SAFETY: tcb valid; its sched_lock is held and no CPU lock.
             started = unsafe { start_under_cpu_locks(tcb) };
             unsettled = started.is_none();
@@ -783,7 +785,7 @@ mod tests
             {
                 let t = &mut n.threads[i];
                 t.visited = true;
-                match release_visit(t.mark)
+                match release_visit(t.state, t.mark)
                 {
                     ReleaseVisit::Start =>
                     {
@@ -915,6 +917,34 @@ mod tests
                 s.threads.iter().all(|t| t.mark == HoldMark::None),
                 "a mark survived the release"
             );
+        }
+    }
+
+    #[test]
+    fn the_release_starts_only_a_stopped_thread_and_clears_every_other_mark()
+    {
+        // A teardown commits Exited before it unregisters the thread, so a
+        // release walk can meet an Exited thread; Exited is terminal.
+        for state in [
+            ThreadState::Created,
+            ThreadState::Ready,
+            ThreadState::Running,
+            ThreadState::Blocked,
+            ThreadState::Stopped,
+            ThreadState::Exited,
+        ]
+        {
+            let stopped = release_visit(state, HoldMark::Stopped);
+            if state == ThreadState::Stopped
+            {
+                assert_eq!(stopped, ReleaseVisit::Start);
+            }
+            else
+            {
+                assert_eq!(stopped, ReleaseVisit::Clear, "{state:?}");
+            }
+            assert_eq!(release_visit(state, HoldMark::Pending), ReleaseVisit::Clear);
+            assert_eq!(release_visit(state, HoldMark::None), ReleaseVisit::Leave);
         }
     }
 

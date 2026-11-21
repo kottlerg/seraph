@@ -908,6 +908,35 @@ mod tests
         );
     }
 
+    // Defect caught: under a required confinement, a device outside every
+    // unit's scope given its DMA grant, or a device a unit's scope names
+    // refused beside it. devmgr confines a device `unit_for` places in a unit
+    // and runs one it places in none unconfined (`Iommu::confine`).
+    #[test]
+    fn required_confinement_refuses_only_the_device_no_unit_translates()
+    {
+        use crate::dma::{Confinement, admits};
+        use boot_policy::DmaConfinement;
+
+        let disk = scope(SCOPE_PCI_ENDPOINT, 0, &[(3, 0)]);
+        let table = dmar(39, &[drhd(0, 0, 0, 0xfed9_0000, &[disk])]);
+        let confinement = |target| match unit_for(&table, 0, target, no_bridges, no_ranges)
+        {
+            Some(_) => Confinement::Domain {
+                handle: 1,
+                limit: 1 << 39,
+                interrupt_range: true,
+            },
+            None => Confinement::Unconfined,
+        };
+        assert!(admits(DmaConfinement::Required, confinement(bdf(0, 3, 0))));
+        assert!(!admits(DmaConfinement::Required, confinement(bdf(0, 4, 0))));
+        assert!(admits(
+            DmaConfinement::Opportunistic,
+            confinement(bdf(0, 4, 0))
+        ));
+    }
+
     #[test]
     fn a_function_of_another_segment_gets_no_unit()
     {

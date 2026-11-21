@@ -35,7 +35,10 @@
 //! whose `ATTACH` or reserved mapping fails. When no unit is found, no driver
 //! module was delivered, or the driver does not report ready within the
 //! settle bound, devmgr logs once that DMA runs unconfined and every device
-//! runs so; a driver that fails its own setup turns translation off again
+//! runs so, unless the boot-time policy requires DMA confinement, when it
+//! logs that no DMA-capable device is given a driver and the DMA grant
+//! refuses each (`firmware::dma::admits`; `docs/device-management.md` § DMA
+//! Safety Model); a driver that fails its own setup turns translation off again
 //! first, but one that dies or hangs before its ready report after it turned
 //! a unit's translation on leaves that unit blocking the devices behind it,
 //! and devmgr logs as such.
@@ -74,6 +77,7 @@ use std::os::seraph::thread::BuilderExt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
+use boot_policy::DmaConfinement;
 use driver_binding::decl::DriverDecl;
 use driver_binding::resources::{
     IommuUnit, MAX_IOMMU_UNITS, MAX_UNIT_REGISTER_PAGES, MAX_UNIT_SCOPES, Resource, Scope,
@@ -1792,9 +1796,51 @@ fn mark_units_bound(
     }
 }
 
+/// Log, once, why no IOMMU confines DMA, `why`, and what follows under the
+/// boot-time policy's `requirement`: every DMA-capable device runs
+/// unconfined, or, when it requires confinement, none is given a driver
+/// (`crate::bind`'s DMA grant refuses each).
+fn no_confinement(requirement: DmaConfinement, why: &str)
+{
+    match requirement
+    {
+        DmaConfinement::Opportunistic =>
+        {
+            std::os::seraph::log!(warn: "{}: DMA-capable devices run unconfined", why);
+        }
+        DmaConfinement::Required => std::os::seraph::log!(
+            error: "{}: no DMA-capable device is given a driver, as the boot policy sets {} = {}",
+            why,
+            DmaConfinement::KEY,
+            requirement.value()
+        ),
+    }
+}
+
+/// Log, once, that the IOMMU driver did not report ready after its
+/// bootstrap, and what follows under the boot-time policy's `requirement`,
+/// as [`no_confinement`] does, a unit the driver turned translation on for
+/// before it failed blocking the devices behind it either way.
+fn not_ready(requirement: DmaConfinement)
+{
+    match requirement
+    {
+        DmaConfinement::Opportunistic => std::os::seraph::log!(
+            warn: "IOMMU driver not ready after its bootstrap: DMA-capable devices run \
+             unconfined, except those behind a unit it turned translation on for \
+             before it failed, which that unit blocks"
+        ),
+        DmaConfinement::Required =>
+        {
+            no_confinement(requirement, "IOMMU driver not ready after its bootstrap");
+        }
+    }
+}
+
 /// Discover the remapping units, spawn the IOMMU driver over them, and
 /// settle it; the [`Iommu`] once the driver reports ready, else `None`,
-/// logged once, and every device then runs unconfined, except, when the
+/// logged once ([`no_confinement`]), and every device then runs unconfined,
+/// or is refused under a required confinement, except, when the
 /// driver was started but did not report ready, those behind a unit it
 /// turned translation on for before it failed, which that unit blocks.
 /// The units are placed among the PCI `records`, and the record of each
@@ -1821,9 +1867,8 @@ pub fn bring_up(
     ipc_buf: *mut u64,
 ) -> Option<Iommu>
 {
-    let unconfined = |why: &str| {
-        std::os::seraph::log!(warn: "{}: DMA-capable devices run unconfined", why);
-    };
+    let requirement = caps.dma_confinement;
+    let unconfined = |why: &str| no_confinement(requirement, why);
     let family = arch::current::IOMMU_FAMILY;
     let Some(table) = read_units_table(caps, family)
     else
@@ -1912,9 +1957,8 @@ fn launch(
     ipc_buf: *mut u64,
 ) -> Option<Iommu>
 {
-    let unconfined = |why: &str| {
-        std::os::seraph::log!(warn: "{}: DMA-capable devices run unconfined", why);
-    };
+    let requirement = caps.dma_confinement;
+    let unconfined = |why: &str| no_confinement(requirement, why);
     let Launch {
         decl,
         grants,
@@ -1992,11 +2036,7 @@ fn launch(
             {
                 image.release();
             }
-            std::os::seraph::log!(
-                warn: "IOMMU driver not ready after its bootstrap: DMA-capable devices run \
-                 unconfined, except those behind a unit it turned translation on for \
-                 before it failed, which that unit blocks"
-            );
+            not_ready(requirement);
             return None;
         }
     };

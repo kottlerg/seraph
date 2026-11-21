@@ -2,8 +2,9 @@
 # from \EFI\seraph\bootstrap.bundle (docs/boot-media.md § The ESP). Each line
 # names an installed file by its install path, which is also its entry's name;
 # the `init` line names the object of the `init` slot. A pack copies each
-# file into the bundle byte for byte, and signs every entry but `init` with
-# the boot-module role.
+# file into the bundle byte for byte, and signs each entry but `init` in the
+# role the bootloader verifies it in: configuration under `/config/` (a platform
+# table excepted), boot module otherwise.
 #
 # Only the bootstrap closure belongs here (docs/boot-media.md § The Bootstrap
 # Closure): the block and filesystem drivers that read the root filesystem,
@@ -22,3 +23,6 @@ init /services/init
 /services/drivers/iommu-riscv
 # The log-level configuration init reads at boot.
 /config/init/log-levels.conf
+# The boot-time policy devmgr reads before the first driver starts, which
+# the bootloader requires of every bundle (docs/signing.md § Configuration).
+/config/boot/policy.conf

@@ -110,8 +110,14 @@ impl Case
 /// `cargo xtask lint-docs` fails until xtask/README.md § `cargo xtask test`
 /// and docs/testing.md state it (its `md-test-cells` rule).
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the registry is one match arm per case, read as one table; splitting it would \
+              scatter the cases the match must name"
+)]
 pub fn case(case: TestCase) -> Case
 {
+    use super::dma_confinement;
     use super::{
         cet, debug_port, enrolment, hotplug, kaslr, rollback, secureboot, shutdown, signing,
         terminal, tpm, vmgenid, wedge,
@@ -133,13 +139,22 @@ pub fn case(case: TestCase) -> Case
             options: &[CaseOption::RiscvMmu, CaseOption::X86Paging],
             run: kaslr::run,
         },
-        // The kernel, bundle, revoked and rootfs boots.
+        // The kernel, bundle, policy-missing, revoked, rootfs, configuration,
+        // policy-key and index boots.
         TestCase::Signing => Case {
-            arches: &[(Arch::X86_64, 6), (Arch::Riscv64, 6)],
+            arches: &[(Arch::X86_64, 8), (Arch::Riscv64, 8)],
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[CaseOption::Release],
             run: signing::run,
+        },
+        // The boot with no IOMMU, refused, then the boot behind one.
+        TestCase::DmaConfinement => Case {
+            arches: &[(Arch::X86_64, 2), (Arch::Riscv64, 2)],
+            bundle: Harness::Init,
+            cell: Cell::Ci(Tester::Usertest),
+            options: &[],
+            run: dma_confinement::run,
         },
         // The floor written, raised, and refusing the older bootloader, on
         // one variable store.
@@ -594,13 +609,28 @@ mod tests
         assert_eq!(
             cell_cases(Tester::Usertest, Arch::X86_64),
             [
-                Terminal, Signing, Rollback, Enrolment, Secureboot, Wedge, Vmgenid, Shutdown
+                Terminal,
+                Signing,
+                DmaConfinement,
+                Rollback,
+                Enrolment,
+                Secureboot,
+                Wedge,
+                Vmgenid,
+                Shutdown
             ]
         );
         assert_eq!(
             cell_cases(Tester::Usertest, Arch::Riscv64),
             [
-                Terminal, Signing, Rollback, Enrolment, Secureboot, Wedge, Shutdown
+                Terminal,
+                Signing,
+                DmaConfinement,
+                Rollback,
+                Enrolment,
+                Secureboot,
+                Wedge,
+                Shutdown
             ]
         );
         for arch in [Arch::X86_64, Arch::Riscv64]

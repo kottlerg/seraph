@@ -60,18 +60,7 @@ impl Input
     fn from_json(value: &Value) -> Result<Self, LoadError>
     {
         let data = vectors::bytes(value, "message")?;
-        let cuts = vectors::array(value, "cuts")?
-            .iter()
-            .map(|cut| cut.as_u64().and_then(|c| usize::try_from(c).ok()))
-            .collect::<Option<Vec<usize>>>()
-            .ok_or_else(|| LoadError::Parse("a cut is not a non-negative integer".into()))?;
-        if !cuts.is_sorted() || cuts.last().is_some_and(|&last| last > data.len())
-        {
-            return Err(LoadError::Parse(format!(
-                "cuts {cuts:?} are not ascending offsets within {} bytes",
-                data.len()
-            )));
-        }
+        let cuts = vectors::offsets(value, "cuts", data.len())?;
         Ok(Self {
             data,
             cuts,
@@ -84,15 +73,7 @@ impl Input
     #[must_use]
     pub fn pieces(&self) -> Vec<&[u8]>
     {
-        let mut pieces = Vec::new();
-        let mut start = 0;
-        for &cut in &self.cuts
-        {
-            pieces.push(self.data.get(start..cut).unwrap_or_default());
-            start = cut;
-        }
-        pieces.push(self.data.get(start..).unwrap_or_default());
-        pieces
+        vectors::pieces(&self.data, &self.cuts)
     }
 }
 

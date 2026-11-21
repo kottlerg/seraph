@@ -332,7 +332,7 @@ Every entry here is `correct as is`; none is tracked.
 | Boot hardware-RNG draw cap | `core/kernel/src/entropy/mod.rs` | 512 words | provably unreachable (start-up needs 128) | none | correct as is | None |
 | `boot_jitter_scrape` | `core/kernel/src/entropy/mod.rs` | 64 samples | tuning (supplementary source) | none | correct as is | None |
 | Health-test constants (`RCT_CUTOFF`, `APT_WINDOW`, `APT_CUTOFF`, `STARTUP_BYTES`) | `core/kernel/src/entropy/health.rs` | 31 / 512 / 384 / 1024 | hardware spec (NIST SP 800-90B), with `APT_CUTOFF` a stricter tuning than the standard's table | none | correct as is | None |
-| Keccak tables, `LANES`, `RATE` | `core/kernel/src/entropy/keccak.rs`, `sponge.rs` | 24, 25, 136 | hardware spec (Keccak-f[1600], SHAKE256) | rodata | correct as is | None |
+| `RATE` | `core/kernel/src/entropy/sponge.rs` | 136 | hardware spec (SHAKE256) | none | correct as is | None |
 | `RESEED_DRAW_INTERVAL`, `RESEED_TIME_BUDGET_US`, `RESEED_OVERDUE_FACTOR` | `core/kernel/src/entropy/reseed_policy.rs` | 256 / 1 s / 2 | tuning | none | correct as is | None |
 | `RESEED_BYTES`, `CpuRng.guid_seen` | `core/kernel/src/entropy/cpurng.rs` | 32 / 16 | hardware spec (256-bit reseed, 128-bit VMGENID) | per CPU | correct as is | None |
 | `ACC_WORDS` | `core/kernel/src/entropy/jitter.rs` | 4 | encoding artefact (256-bit accumulator) | `cpu_count` x 40 B | correct as is | None |
@@ -547,6 +547,10 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | `Elf64Ehdr.e_phnum`, `e_shnum` | `shared/elf/src/lib.rs` | `u16` | hardware spec (ELF64 header) | none | correct as is | None |
 | ed25519 `MSG_SCRATCH` | `shared/crypto/src/ed25519.rs` | 1024 | provably unreachable (largest RFC 8032 vector 1023 B) | 2 KiB stack | correct as is | None |
 | `Sha512.total_len` | `shared/crypto/src/sha512.rs` | `u128` | hardware spec (FIPS 180-4 length field) | 16 B | correct as is | None |
+| Keccak tables, `LANES` | `shared/crypto/src/keccak.rs` | 24, 25 | hardware spec (Keccak-f[1600]) | rodata | correct as is | None |
+| `SHAKE128_RATE`, `SHAKE256_RATE` | `shared/crypto/src/shake.rs` | 168, 136 | hardware spec (FIPS 202) | none | correct as is | None |
+| ML-DSA-65 parameters (`K`, `L`, `OMEGA`, `TAU`, the key and signature lengths) | `shared/crypto/src/ml_dsa/params.rs` | 6, 5, 55, 49; 1952 B public key, 3309 B signature | format spec (FIPS 204 Table 1 and 2) | none | correct as is | None |
+| ml_dsa `MAX_CONTEXT_LEN` | `shared/crypto/src/ml_dsa/params.rs` | 255 | format spec (FIPS 204 Algorithm 2: one length byte) | none | correct as is | None |
 | `chacha20poly1305::MAX_LEN` | `shared/crypto/src/chacha20poly1305.rs` | `(2^32 - 1) * 64` B = 274 877 906 880 B per sealed buffer | format spec (RFC 8439 § 2.8: the 32-bit block counter, block 0 taken by the Poly1305 key) | none | correct as is | None |
 | chacha20-poly1305 `KAT_SCRATCH` | `shared/crypto/src/chacha20poly1305.rs` | 384 B | provably unreachable (largest RFC 8439 vector 375 B) | 768 B stack | correct as is | None |
 | `FONT_9X20` | `shared/font/src/lib.rs` | 256 glyphs | hardware spec (CP437) | 10 KiB rodata | correct as is | None |

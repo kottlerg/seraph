@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// core/kernel/src/entropy/keccak.rs
+// shared/crypto/src/keccak.rs
 
 //! Keccak-f[1600] permutation (FIPS 202).
 //!
-//! The single cryptographic primitive underlying the entropy subsystem. The
-//! sponge layer in [`super::sponge`] builds the forward-secure duplex PRNG on
-//! top of this permutation (its plumbing is anchored by a test-only SHAKE256),
-//! so correctness here is load-bearing for the whole subsystem and is anchored
-//! by known-answer tests (raw zero-state vector and `SHAKE256("")`).
+//! The permutation under SHAKE128 and SHAKE256 ([`crate::shake`]), which
+//! ML-DSA hashes and samples with, and under the kernel's entropy sponge, which
+//! runs it in duplex mode (core/kernel/docs/entropy.md § Keccak duplex
+//! construction). The permutation is bitwise logic, rotations by constants and
+//! constant lane indices, so its time does not depend on the state: the signer
+//! passes secret values through it, and the kernel's generator its seed.
 //!
 //! The implementation is the canonical compact form (24 rounds; θ, ρ, π, χ, ι),
 //! with the ρ and π lane walk unrolled.

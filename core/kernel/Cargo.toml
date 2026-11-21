@@ -6,6 +6,9 @@ publish.workspace = true
 
 [dependencies]
 boot-protocol = { workspace = true }
+# The Keccak-f[1600] permutation of the entropy sponge. No feature: the kernel
+# links no signing code (shared/crypto/README.md § Design notes).
+crypto = { path = "../../shared/crypto" }
 elf = { workspace = true }
 init-protocol = { workspace = true }
 process-layout = { workspace = true }

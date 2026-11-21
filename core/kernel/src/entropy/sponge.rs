@@ -3,14 +3,15 @@
 
 // core/kernel/src/entropy/sponge.rs
 
-//! Forward-secure duplex PRNG over Keccak-f[1600].
+//! Forward-secure duplex PRNG over Keccak-f[1600], the permutation of
+//! `crypto::keccak`.
 //!
 //! [`Prng`] is a sponge in duplex mode: [`Prng::absorb`] injects entropy;
 //! [`Prng::fill`] squeezes output and then erases it (fast key erasure). The
 //! construction and its forward-secrecy argument are specified in
 //! [entropy.md](../../docs/entropy.md) § Keccak duplex construction.
 
-use super::keccak::{LANES, keccak_f1600};
+use crypto::keccak::{LANES, keccak_f1600};
 
 /// Sponge rate in bytes (SHAKE256: 1088-bit rate, 512-bit capacity).
 pub const RATE: usize = 136;

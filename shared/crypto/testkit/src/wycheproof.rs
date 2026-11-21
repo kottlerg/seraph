@@ -56,6 +56,22 @@ pub const CHACHA20_POLY1305: Source = Source {
     json: include_str!("../vectors/wycheproof/chacha20_poly1305_test.json"),
 };
 
+/// `mldsa_65_verify_test.json`: ML-DSA-65 signature verification
+/// (`MlDsaVerify`).
+pub const MLDSA_65_VERIFY: Source = Source {
+    file: "mldsa_65_verify_test.json",
+    schema: "mldsa_verify_schema.json",
+    json: include_str!("../vectors/wycheproof/mldsa_65_verify_test.json"),
+};
+
+/// `mldsa_65_sign_seed_test.json`: ML-DSA-65 signing from a key-generation
+/// seed (`MlDsaSign`).
+pub const MLDSA_65_SIGN_SEED: Source = Source {
+    file: "mldsa_65_sign_seed_test.json",
+    schema: "mldsa_sign_seed_schema.json",
+    json: include_str!("../vectors/wycheproof/mldsa_65_sign_seed_test.json"),
+};
+
 /// A case's expected result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expected
@@ -478,6 +494,222 @@ pub mod aead
     }
 }
 
+/// The ML-DSA schemas: `MlDsaVerify` (`mldsa_verify_schema.json`), a public
+/// key per group and a message, an optional context and a signature per case;
+/// and `MlDsaSign` (`mldsa_sign_seed_schema.json`), a private seed and its
+/// public key per group, and per case a message or a message representative
+/// mu, an optional context and randomness, and the expected signature.
+pub mod mldsa
+{
+    use super::{Expected, LoadError, Value, vectors};
+
+    /// The members every case of both schemas carries.
+    #[derive(Debug, Clone)]
+    struct Common
+    {
+        tc_id: u64,
+        comment: String,
+        flags: Vec<String>,
+        result: Expected,
+    }
+
+    impl Common
+    {
+        fn from_json(case: &Value) -> Result<Self, LoadError>
+        {
+            Ok(Self {
+                tc_id: vectors::integer(case, "tcId")?,
+                comment: vectors::string(case, "comment")?.to_owned(),
+                flags: vectors::strings(case, "flags")?,
+                result: Expected::from_json(case)?,
+            })
+        }
+    }
+
+    /// An `MlDsaVerify` group.
+    #[derive(Debug, Clone)]
+    pub struct VerifyGroup
+    {
+        kind: String,
+        /// The raw public key, of any length: a group may carry one of
+        /// another size.
+        pub public_key: Vec<u8>,
+        /// The group's cases.
+        pub tests: Vec<VerifyCase>,
+    }
+
+    /// An `MlDsaVerify` case.
+    #[derive(Debug, Clone)]
+    pub struct VerifyCase
+    {
+        common: Common,
+        /// The signed message.
+        pub msg: Vec<u8>,
+        /// The context string; empty when the case has none.
+        pub ctx: Vec<u8>,
+        /// The signature, of any length.
+        pub sig: Vec<u8>,
+    }
+
+    /// An `MlDsaSign` group.
+    #[derive(Debug, Clone)]
+    pub struct SignGroup
+    {
+        kind: String,
+        /// The key-generation seed, of any length: a group may carry one of
+        /// another size.
+        pub private_seed: Vec<u8>,
+        /// The public key the seed derives; `None` for a group whose seed has
+        /// no key, being of another size (the file gives null).
+        pub public_key: Option<Vec<u8>>,
+        /// The group's cases.
+        pub tests: Vec<SignCase>,
+    }
+
+    /// An `MlDsaSign` case: it signs `msg` with context `ctx`, or, when
+    /// `msg` is absent, the message representative `mu` through the
+    /// internal interface.
+    #[derive(Debug, Clone)]
+    pub struct SignCase
+    {
+        common: Common,
+        /// The message, when the case signs one.
+        pub msg: Option<Vec<u8>>,
+        /// The message representative, which a case without `msg` signs.
+        pub mu: Option<Vec<u8>>,
+        /// The context string; empty when the case has none.
+        pub ctx: Vec<u8>,
+        /// The randomness of a hedged signature; `None` for a deterministic
+        /// one.
+        pub rnd: Option<Vec<u8>>,
+        /// The expected signature.
+        pub sig: Vec<u8>,
+    }
+
+    impl VerifyCase
+    {
+        fn from_json(case: &Value) -> Result<Self, LoadError>
+        {
+            Ok(Self {
+                common: Common::from_json(case)?,
+                msg: vectors::bytes(case, "msg")?,
+                ctx: vectors::optional_bytes(case, "ctx")?.unwrap_or_default(),
+                sig: vectors::bytes(case, "sig")?,
+            })
+        }
+    }
+
+    impl SignCase
+    {
+        fn from_json(case: &Value) -> Result<Self, LoadError>
+        {
+            let case = Self {
+                common: Common::from_json(case)?,
+                msg: vectors::optional_bytes(case, "msg")?,
+                mu: vectors::optional_bytes(case, "mu")?,
+                ctx: vectors::optional_bytes(case, "ctx")?.unwrap_or_default(),
+                rnd: vectors::optional_bytes(case, "rnd")?,
+                sig: vectors::bytes(case, "sig")?,
+            };
+            if case.msg.is_none() && case.mu.is_none()
+            {
+                return Err(LoadError::Parse(format!(
+                    "tcId {} has neither msg nor mu",
+                    case.common.tc_id
+                )));
+            }
+            Ok(case)
+        }
+    }
+
+    macro_rules! case_members {
+        ($case:ty) => {
+            impl super::Case for $case
+            {
+                fn id(&self) -> u64
+                {
+                    self.common.tc_id
+                }
+
+                fn expected(&self) -> Expected
+                {
+                    self.common.result
+                }
+
+                fn comment(&self) -> &str
+                {
+                    &self.common.comment
+                }
+
+                fn flags(&self) -> &[String]
+                {
+                    &self.common.flags
+                }
+            }
+        };
+    }
+
+    case_members!(VerifyCase);
+    case_members!(SignCase);
+
+    impl super::Group for VerifyGroup
+    {
+        const TYPE: &'static str = "MlDsaVerify";
+        type Case = VerifyCase;
+
+        fn from_json(group: &Value) -> Result<Self, LoadError>
+        {
+            Ok(Self {
+                kind: vectors::string(group, "type")?.to_owned(),
+                public_key: vectors::bytes(group, "publicKey")?,
+                tests: vectors::array(group, "tests")?
+                    .iter()
+                    .map(VerifyCase::from_json)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+
+        fn group_type(&self) -> &str
+        {
+            &self.kind
+        }
+
+        fn cases(&self) -> &[VerifyCase]
+        {
+            &self.tests
+        }
+    }
+
+    impl super::Group for SignGroup
+    {
+        const TYPE: &'static str = "MlDsaSign";
+        type Case = SignCase;
+
+        fn from_json(group: &Value) -> Result<Self, LoadError>
+        {
+            Ok(Self {
+                kind: vectors::string(group, "type")?.to_owned(),
+                private_seed: vectors::bytes(group, "privateSeed")?,
+                public_key: vectors::optional_bytes(group, "publicKey")?,
+                tests: vectors::array(group, "tests")?
+                    .iter()
+                    .map(SignCase::from_json)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+
+        fn group_type(&self) -> &str
+        {
+            &self.kind
+        }
+
+        fn cases(&self) -> &[SignCase]
+        {
+            &self.tests
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -561,6 +793,35 @@ mod tests
         let text = file(1, &[(1, "maybe")], "EddsaVerify");
         assert!(matches!(
             parse::<eddsa::Group>(&text, SCHEMA),
+            Err(LoadError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn an_mldsa_sign_case_needs_a_message_or_mu_and_reads_its_optional_members()
+    {
+        use json::parse as json;
+        let full = json(r#"{"tcId":1,"comment":"","flags":[],"msg":"01","ctx":"02","rnd":"03","sig":"04","result":"valid"}"#).unwrap();
+        let case = <mldsa::SignGroup as Group>::from_json(
+            &json(&format!(
+                r#"{{"type":"MlDsaSign","privateSeed":"00","publicKey":"00","tests":[{full}]}}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let case = &case.tests[0];
+        assert_eq!(
+            (
+                case.msg.as_deref(),
+                case.mu.as_deref(),
+                case.ctx.as_slice(),
+                case.rnd.as_deref()
+            ),
+            (Some(&[1u8][..]), None, &[2u8][..], Some(&[3u8][..]))
+        );
+        let bare = json(r#"{"type":"MlDsaSign","privateSeed":"00","publicKey":"00","tests":[{"tcId":1,"comment":"","flags":[],"sig":"04","result":"valid"}]}"#).unwrap();
+        assert!(matches!(
+            <mldsa::SignGroup as Group>::from_json(&bare),
             Err(LoadError::Parse(_))
         ));
     }

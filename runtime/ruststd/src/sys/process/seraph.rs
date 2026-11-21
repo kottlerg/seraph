@@ -1204,9 +1204,11 @@ struct Bridge {
 pub struct Process {
     process_handle: u64,
     thread_cap: u64,
-    /// Death-notification queue bound to the child thread. Owned by
-    /// `Process` regardless of stdio mode. With `bridge` present the
-    /// bridge thread consumes the EQ; otherwise `wait` does so directly.
+    /// Per-child death queue, bound to no thread: its POST copy is the
+    /// death relay procmgr posts the process's one exit reason to, and the
+    /// bridge's drop sentinel is its only other poster. Owned by `Process`
+    /// regardless of stdio mode. With `bridge` present the bridge thread
+    /// consumes the EQ; otherwise `wait` does so directly.
     death_eq: u64,
     /// Per-spawn bridge state — only allocated for piped spawns. The
     /// bridge translates a child death into the parent-side `peer_dead`
@@ -1307,9 +1309,8 @@ impl Process {
             if !b.peer_dead.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            // The bridge's remaining work (pipe kicks, the procmgr
-            // teardown call, ring releases, the completion send) is
-            // bounded; join it before reporting.
+            // The bridge's remaining work (pipe kicks, ring releases,
+            // the completion send) is bounded; join it before reporting.
             if let Some(h) = b.handle.take() {
                 let _ = h.join();
             }

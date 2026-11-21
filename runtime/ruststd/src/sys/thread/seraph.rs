@@ -734,8 +734,7 @@ impl Drop for Thread {
 /// and heap/VA resources needs a surviving thread to act *after* the child
 /// leaves user-mode. The kernel already provides that signal —
 /// `SYS_THREAD_BIND_NOTIFICATION` posts a thread's death (exit or fault) to a
-/// bound `EventQueue` — so no new syscall is required; this mirrors how
-/// `std::process::Child` reaps child processes.
+/// bound `EventQueue` — so no new syscall is required.
 ///
 /// Every spawned thread binds a death observer (before `thread_start`) to one
 /// of the process's death `EventQueue`s, with a generation-tagged correlator

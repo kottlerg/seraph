@@ -54,7 +54,7 @@ pub use disk::{
     CaptureSource, FaultPath, Posted, Registered, ResidentPath, SlotError, SwapSlots, WANT_WORDS,
     WantList, capture_source, fault_path, pending_from, resident_path,
 };
-pub use fill::{FILL_CHUNKS, FillChunk, fill_chunks};
+pub use fill::{FILL_CHUNKS, FillChunk, FillPath, fill_chunks, fill_path};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};
 pub use ledger::{
     BackError, ClockHand, Commit, Ledger, RegionError, ResizeError, SWEEP_SPAN_CHUNKS, SealError,

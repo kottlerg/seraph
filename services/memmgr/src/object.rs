@@ -13,7 +13,7 @@
 //! reads the object's pages from memmgr's own read-only view of it
 //! ([`free_pool::MemObject::runs`]), which stays mapped while the turn runs.
 
-use free_pool::{ChunkEntry, FILL_CHUNKS, FillChunk, NodeIdx, chunk_for, fill_chunks};
+use free_pool::{FILL_CHUNKS, FillChunk, FillPath, NodeIdx, chunk_for, fill_chunks, fill_path};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::{MSG_CAP_SLOTS_MAX, PAGE_SIZE};
 
@@ -164,9 +164,9 @@ struct Filled
 }
 
 /// Serve the `FILL_REGION` `req`, whose object handle's badge is `handle`:
-/// check every chunk first, then back each chunk with no entry; returns the
-/// pages backed, or the error label, the chunks before a failure staying
-/// backed.
+/// check every chunk first, then back each named page that holds no data
+/// ([`fill_path`]); returns the pages backed, or the error label, the pages
+/// backed before a failure staying backed, so a repeat backs the rest.
 fn fill_region(req: &IpcMessage, handle: Option<u64>) -> Result<u64, u64>
 {
     let l = ledger_mut();
@@ -193,16 +193,22 @@ fn fill_region(req: &IpcMessage, handle: Option<u64>) -> Result<u64, u64>
     let mut checked: [Option<Filled>; FILL_CHUNKS] = [None, None, None, None];
     for (slot, chunk) in checked.iter_mut().zip(chunks.iter().take(n))
     {
-        *slot = Some(check(l, rec, *chunk).ok_or(memmgr_errors::INVALID_ARGUMENT)?);
+        let f = check(l, rec, *chunk).ok_or(memmgr_errors::INVALID_ARGUMENT)?;
+        if path(l, &f) == FillPath::Refuse
+        {
+            return Err(memmgr_errors::INVALID_ARGUMENT);
+        }
+        *slot = Some(f);
     }
     let mut backed = 0u64;
     for f in checked.iter().flatten()
     {
-        // A chunk with an entry is passed over whole: a page of it is backed
-        // already, by a fault or by this request made before.
-        if l.chunk_at(f.reg, f.chunk.va) != ChunkEntry::UNBACKED
+        match path(l, f)
         {
-            continue;
+            FillPath::Back =>
+            {}
+            FillPath::Skip => continue,
+            FillPath::Refuse => return Err(memmgr_errors::INVALID_ARGUMENT),
         }
         for (start, end, object_page) in f.chunk.runs()
         {
@@ -219,6 +225,13 @@ fn fill_region(req: &IpcMessage, handle: Option<u64>) -> Result<u64, u64>
         }
     }
     Ok(backed)
+}
+
+/// What the request does with the chunk `f`, by its entry now.
+fn path(l: &MemLedger, f: &Filled) -> FillPath
+{
+    let entry = l.chunk_at(f.reg, f.chunk.va);
+    fill_path(entry.state(), entry.backed(), f.chunk.mask)
 }
 
 /// `chunk` checked against the region of `rec` holding it: a demand region
@@ -282,8 +295,8 @@ fn fill_run(
             fault_target(l, rec, f.reg, &f.region, at, aspace_cap).map_err(decline_label)?
         else
         {
-            // The page is backed: nothing passes over it in a chunk with no
-            // entry, but go on past it whatever.
+            // The page holds data already, from a fault or an earlier
+            // request: it is left as it is.
             at = at.saturating_add(PAGE_SIZE);
             continue;
         };
@@ -325,7 +338,15 @@ fn copy_run(l: &mut MemLedger, obj: NodeIdx, first: u64, cap: u64, pages: u32) -
     let pages = u64::from(pages);
     // SAFETY: the scrub window is memmgr's own zone, which every pass leaves
     // unmapped, and a run of at most a chunk's pages lies in it.
-    unsafe { map_self(l, cap, SCRUB_VA, 0, pages) }?;
+    if let Err(e) = unsafe { map_self(l, cap, SCRUB_VA, 0, pages) }
+    {
+        // A map that ran out of page tables part way left the pages before
+        // the failing one mapped: unmap them, so the run that returns to the
+        // pool is mapped nowhere and the window is left unmapped.
+        // SAFETY: as for the unmap below.
+        let _ = unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, pages) };
+        return Err(e);
+    }
     let len = usize::try_from(pages.saturating_mul(PAGE_SIZE)).unwrap_or(0);
     // SAFETY: the window's `pages` pages are mapped read-write above to the
     // run, which nothing else maps yet, and the slice is not used past the

@@ -1520,16 +1520,16 @@ fn mark_checkpoint(ctx: &Context, handle: u64, account: u64) -> Result<(), u64>
         .build();
     // SAFETY: `ipc_buf` is the calling worker's registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(ctx.memmgr_ep, &msg, ctx.ipc_buf) };
+    // The guards delete both copies whatever the outcome: a copy the call
+    // moved to memmgr is stale, its delete failing harmlessly even when its
+    // slot holds another cap by now (docs/capability-model.md), and one a
+    // failed call or a refused transfer left procmgr's is freed.
+    drop((handle, account));
     let Ok(reply) = reply
     else
     {
-        // A call that failed leaves the copies procmgr's: the guards delete
-        // them.
         return Err(procmgr_errors::OUT_OF_MEMORY);
     };
-    // The copies moved to memmgr with the call, and their slots may hold
-    // another worker's caps by now: nothing deletes them here.
-    let _ = (handle.disarm(), account.disarm());
     match reply.label
     {
         memmgr_errors::SUCCESS => Ok(()),

@@ -1154,9 +1154,11 @@ object so. `FILL_REGION` (§ Label 36) backs pages of the caller's own demand re
 private zero-object attachments, with copies of an object's pages, as a write fault backs a page:
 the run selection, the charge to the caller's budget node, the page-table funding and the chunk
 record are the fault's ([Demand faults](#demand-faults)), with the copy from the own view in place
-of the scrub. A chunk any page of which is backed already, or that the clock has taken, is passed
-over whole, so a repeated request backs nothing twice. The pages are the caller's own, sharing no
-frame with the object, so the object can be released once the fill replies.
+of the scrub. A named page that holds data already is left as it is, so a repeated request, after a
+failure part way or a lost reply, backs only the pages still holding none; a chunk the clock has
+taken takes no run, and a request naming a page of it that holds no data is refused. The pages are
+the caller's own, sharing no frame with the object, so the object can be released once the fill
+replies.
 
 **Checkpoint mark.** An object carries a checkpoint mark (`MemObject.checkpoint`) once procmgr's
 `MARK_CHECKPOINT` (§ Label 37) sets it: procmgr marks the object it sealed from a complete

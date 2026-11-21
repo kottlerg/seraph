@@ -292,11 +292,27 @@ fn fill_region(handle: u64)
         filled,
         "{PHASE}: a repeated FILL_REGION moved the usage"
     );
-    assert!(
-        holds(va, 0) && holds(va.wrapping_add(2 * PAGE_SIZE), 1) && holds(next, 2),
-        "{PHASE}: the filled pages do not hold object pages 0 to 2 in mask order"
+    // A request that names filled pages beside an empty one, as a repeat after
+    // a failure part way does, backs the empty one alone, with the object
+    // page it takes in mask order, and leaves the filled ones as they are.
+    assert_eq!(
+        fill(0, &[(va, 0b111)], handle),
+        (memmgr_errors::SUCCESS, 1),
+        "{PHASE}: FILL_REGION over two filled pages and an empty one"
     );
-    let unnamed = va.wrapping_add(PAGE_SIZE);
+    let partial = own_usage();
+    assert!(
+        partial > filled,
+        "{PHASE}: FILL_REGION of one more page moved svctest's usage from {filled} to {partial}"
+    );
+    assert!(
+        holds(va, 0)
+            && holds(va.wrapping_add(PAGE_SIZE), 1)
+            && holds(va.wrapping_add(2 * PAGE_SIZE), 1)
+            && holds(next, 2),
+        "{PHASE}: the filled pages do not hold their object pages in mask order"
+    );
+    let unnamed = va.wrapping_add(3 * PAGE_SIZE);
     assert!(
         read_word(unnamed, 0) == 0 && read_word(unnamed, LAST_WORD) == 0,
         "{PHASE}: a page no mask names is not zero"

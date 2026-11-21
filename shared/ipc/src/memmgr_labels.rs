@@ -846,16 +846,18 @@ pub const OBJECT_CHECKPOINT: u64 = 1 << 0;
 /// Each page a mask names takes the next object page, in chunk and page
 /// order, so the request copies as many object pages as its masks name bits.
 /// The page is backed, charged and mapped as a write fault backs it; a page
-/// no mask names stays as it is. A chunk any page of which is backed already
-/// is passed over whole, its object pages with it, so a repeat of a request
-/// whose reply did not arrive changes nothing. Reply: `SUCCESS` with
+/// no mask names stays as it is, and so does a named page that holds data
+/// already, its object page passed over: a repeat of a request, after a
+/// failure part way or a reply that did not arrive, backs only the named
+/// pages still holding none. Reply: `SUCCESS` with
 /// `data[0]` the pages backed; `INVALID_ARGUMENT` (unknown badge, no
 /// delegated address space, a count out of range, a base off a chunk of such
 /// a region or not above the one before, mask bits past a chunk, a cap that
-/// is no live object handle, or object pages past its end); `UNAUTHORIZED`
+/// is no live object handle, object pages past its end, or a named page
+/// holding no data in a chunk that is not resident); `UNAUTHORIZED`
 /// (a badge that is a handle or the swap authority); `LIMIT`,
 /// `OUT_OF_MEMORY_BEST_EFFORT` or `QUOTA` as for the fault that would back
-/// the page, the chunks before it staying backed. Specified in
+/// the page, the pages before it staying backed. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 36: `FILL_REGION`.
 pub const FILL_REGION: u64 = 36;
 /// The most chunks one [`FILL_REGION`] names: a bound on the pages one

@@ -3,13 +3,15 @@
 
 // services/memmgr/free-pool/src/fill.rs
 
-//! The chunks a `FILL_REGION` request names, and the object page each page
-//! it backs takes (services/memmgr/docs/ipc-interface.md § Label 36:
-//! `FILL_REGION`): each page a chunk's mask names takes the next object page,
-//! in chunk and page order, as a snapshot's chunk descriptors lay out the
-//! pages they wrote.
+//! The chunks a `FILL_REGION` request names, the object page each page it
+//! backs takes, and what the request does with each chunk
+//! (services/memmgr/docs/ipc-interface.md § Label 36: `FILL_REGION`): each
+//! page a chunk's mask names takes the next object page, in chunk and page
+//! order, as a snapshot's chunk descriptors lay out the pages they wrote.
 
 use syscall_abi::PAGE_SIZE;
+
+use crate::chunk::ChunkState;
 
 /// The most chunks one request names (`memmgr_labels::FILL_CHUNKS`, which
 /// memmgr asserts equal).
@@ -52,6 +54,43 @@ impl FillChunk
             at = end;
             Some((first, end, object))
         })
+    }
+}
+
+/// What a `FILL_REGION` does with one chunk it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillPath
+{
+    /// Back the named pages that hold no data, each with its object page;
+    /// a named page that holds data already is left as it is.
+    Back,
+    /// Nothing: every named page holds data already.
+    Skip,
+    /// Refuse the request: a named page holds no data in a chunk that is not
+    /// resident, which no run can be added to until it is.
+    Refuse,
+}
+
+/// The path of a chunk in `state` whose backed mask is `backed`, for the
+/// named pages `mask`. A page that holds data is never written, so a repeat
+/// of a request, whole or after a failure part way, backs only the named
+/// pages still holding none, and each with the object page it takes.
+#[must_use]
+pub const fn fill_path(state: ChunkState, backed: u16, mask: u16) -> FillPath
+{
+    if mask & !backed == 0
+    {
+        return FillPath::Skip;
+    }
+    match state
+    {
+        ChunkState::Unbacked | ChunkState::Resident => FillPath::Back,
+        ChunkState::Evicting
+        | ChunkState::Compressed
+        | ChunkState::Raw
+        | ChunkState::Writing
+        | ChunkState::OnDisk
+        | ChunkState::Lost => FillPath::Refuse,
     }
 }
 
@@ -139,6 +178,39 @@ mod tests
         };
         let runs: Vec<_> = mixed.runs().collect();
         assert_eq!(runs, [(1, 2, 100), (6, 8, 101), (12, 15, 103)]);
+    }
+
+    #[test]
+    fn a_chunk_backs_only_named_pages_holding_no_data_and_only_while_resident()
+    {
+        assert_eq!(fill_path(ChunkState::Unbacked, 0, 0b101), FillPath::Back);
+        // A request that failed part way, or whose reply was lost, left some
+        // named pages backed: the repeat backs the rest.
+        assert_eq!(
+            fill_path(ChunkState::Resident, 0b001, 0b101),
+            FillPath::Back
+        );
+        assert_eq!(
+            fill_path(ChunkState::Resident, 0b101, 0b101),
+            FillPath::Skip
+        );
+        assert_eq!(
+            fill_path(ChunkState::Resident, 0b111, 0b101),
+            FillPath::Skip
+        );
+        assert_eq!(fill_path(ChunkState::Unbacked, 0, 0), FillPath::Skip);
+        for state in [
+            ChunkState::Evicting,
+            ChunkState::Compressed,
+            ChunkState::Raw,
+            ChunkState::Writing,
+            ChunkState::OnDisk,
+            ChunkState::Lost,
+        ]
+        {
+            assert_eq!(fill_path(state, 0b101, 0b101), FillPath::Skip);
+            assert_eq!(fill_path(state, 0b001, 0b101), FillPath::Refuse);
+        }
     }
 
     #[test]

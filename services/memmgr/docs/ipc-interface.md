@@ -1812,10 +1812,12 @@ written with the object's pages in place of the zeroes, mapped with the region's
 recorded on the chunk. In a private attachment of the zero object it unmaps the zero frame from the
 span first, as the write fault does. A page no mask names stays as it is.
 
-A chunk any page of which is backed already, or that is evicted, compressed or on disk, is passed
-over whole, its object pages with it: a repeat of a request whose reply did not arrive backs
-nothing twice. A failure part way leaves the chunks before it backed; the reply then reports the
-failure alone.
+A named page that holds data already, from a fault or an earlier request, is left as it is, its
+object page passed over. A failure part way leaves the pages before it backed and the reply reports
+the failure alone, so a repeat of the request, after a failure or a reply that did not arrive,
+backs the named pages still holding no data, each with the object page it takes, and nothing twice.
+A chunk that is evicting, evicted, compressed or on disk takes no run: when a page its mask names
+holds no data, the request is refused, checked before anything is backed.
 
 **Reply (success):** label 0, `data[0]` the pages backed; no caps.
 
@@ -1825,7 +1827,7 @@ failure alone.
 |---|---|---|
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | No page of the pool could back a page, a committed region's commitment was spent, or a map failed |
 | 3 | `QUOTA` | The arena slots recording a run could not be allocated |
-| 4 | `INVALID_ARGUMENT` | The badge names no process, the process has no delegated address space (§ Label 8), `n` is out of range, a base is no chunk's base in such a region or not above the one before, a mask names a page past its chunk, `cap[0]` is missing or no live object handle, or the masks name pages past the object's end |
+| 4 | `INVALID_ARGUMENT` | The badge names no process, the process has no delegated address space (§ Label 8), `n` is out of range, a base is no chunk's base in such a region or not above the one before, a mask names a page past its chunk, `cap[0]` is missing or no live object handle, the masks name pages past the object's end, or a chunk that is not resident has a named page holding no data |
 | 5 | `UNAUTHORIZED` | The badge is a node handle, the swap authority or an object handle |
 | 8 | `LIMIT` | The max of the caller's budget node or of an ancestor refused a page, as for a fault |
 

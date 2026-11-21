@@ -878,18 +878,22 @@ impl Registry
     /// Stop serving the IOMMU driver instance of device badge `badge`, a
     /// restart's candidate that failed its replay or commit and is being
     /// destroyed, so its death is not taken for the serving instance's. Its
-    /// record holds nothing to release.
+    /// record's copy of the process handle is deleted; the caller destroys
+    /// the instance through its own.
     fn forget_iommu_instance(&self, badge: u64)
     {
-        let _ = self.lock().served.iommu.withdraw(badge);
+        let record = self.lock().served.iommu.withdraw(badge);
+        if let Some(record) = record
+        {
+            let _ = syscall::cap_delete(record.process_handle);
+        }
     }
 
     /// Serve a settled batch: append every driver that reported its device
     /// ready to its class, in spawn order, the order the registry's instance
-    /// ordinals count, releasing its process handle unless it drives a PCI
-    /// device; withdraw every other driver ([`ServedDriver::withdraw`]),
-    /// which destroys one still pending (the settle's bound elapsed before it
-    /// reported ready or died). Each driver is appended in a hold of its own;
+    /// ordinals count, with its process handle; withdraw every other driver
+    /// ([`ServedDriver::withdraw`]), which destroys one still pending (the
+    /// settle's bound elapsed before it reported ready or died). Each driver is appended in a hold of its own;
     /// a query meanwhile sees the batch's drivers appended so far, and one
     /// that finds none waits for the batch's job to be done.
     fn serve(&self, roster: Roster<SpawnedDriver>, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
@@ -931,8 +935,22 @@ impl Registry
     /// job, so a query from then on that would find no driver waits for the
     /// restart; what the withdrawal left is read once it is done
     /// ([`Self::admit_restart`]).
+    ///
+    /// The restart is decided on the reason procmgr gives the driver's
+    /// process (`QUERY_PROCESS` on its process handle,
+    /// [`firmware::restart::Death::reason`]), since the post can be the end
+    /// of its main thread alone. The handle is read in a hold and the call is
+    /// made outside it, since it blocks until procmgr answers; the handle
+    /// stays valid between the holds, since only this thread, the control
+    /// thread, withdraws a served driver and deletes its handle.
     fn withdraw_dead(&self, post: DeathPost, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
     {
+        let handle = self.lock().served.process_handle(post.badge);
+        let death = firmware::restart::Death {
+            posted: post.reason,
+            answer: handle.and_then(|h| spawn::query_process(h, ipc_buf)),
+        };
+        let reason = death.reason();
         let (taken, entry) = {
             let mut state = self.lock();
             let taken = state.served.take_dead(post.badge);
@@ -942,7 +960,7 @@ impl Registry
                 {
                     let path = driver.restart.as_ref().map_or(&[][..], |r| &r.path[..]);
                     firmware::restart::restart_entry(
-                        post.reason,
+                        death,
                         driver.declined,
                         state.drivers_dir(),
                         path,
@@ -959,15 +977,18 @@ impl Registry
         };
         match taken
         {
-            // The IOMMU driver's record holds nothing to release.
-            Some((None, _record)) =>
+            // The IOMMU driver's record holds nothing to release but its
+            // copy of the process handle; the IOMMU driver's restart destroys
+            // the instance through devmgr's own (`iommu::Iommu`).
+            Some((None, record)) =>
             {
+                let _ = syscall::cap_delete(record.process_handle);
                 std::os::seraph::log!(
                     warn: "iommu: served driver of device {} died (reason={:#x})",
                     post.badge,
-                    post.reason
+                    reason
                 );
-                self.iommu_died(post, held, ipc_buf);
+                self.iommu_died(post.badge, death, held, ipc_buf);
             }
             Some((Some(class), mut driver)) =>
             {
@@ -975,7 +996,7 @@ impl Registry
                     warn: "{}: served driver of device {} died (reason={:#x}); withdrawn",
                     class.as_str(),
                     post.badge,
-                    post.reason
+                    reason
                 );
                 // A platform record's caps cannot be carved again once
                 // released, so a restart keeps them, taken from the dead
@@ -1054,27 +1075,33 @@ impl Registry
         Err(firmware::restart::Refusal::NoMemory)
     }
 
-    /// The served IOMMU driver instance the death `post` names died: post
-    /// the restart job ([`Jobs::iommu`]) when the client takes it for the
-    /// instance it serves ([`iommu::IommuClient::begin_restart`]) and the
-    /// death admits one ([`firmware::iommu_restart::after_death`]), else,
-    /// for an exit of its own, fail the driver closed. A restart candidate's
+    /// The served IOMMU driver instance of device badge `badge` died, its end
+    /// `death`: post the restart job ([`Jobs::iommu`]) when the client takes
+    /// it for the instance it serves ([`iommu::IommuClient::begin_restart`])
+    /// and the death admits one ([`firmware::iommu_restart::after_death`]),
+    /// else, for an exit of its own, fail the driver closed. A restart candidate's
     /// death is the restart's own to handle.
-    fn iommu_died(&self, post: DeathPost, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
+    fn iommu_died(
+        &self,
+        badge: u64,
+        death: firmware::restart::Death,
+        held: &mut SpanTable<u64>,
+        ipc_buf: *mut u64,
+    )
     {
         let client = self.lock().served.iommu_client.clone();
-        let Some(client) = client.filter(|c| c.is_instance(post.badge))
+        let Some(client) = client.filter(|c| c.is_instance(badge))
         else
         {
             return;
         };
-        if let Err(why) = firmware::iommu_restart::after_death(post.reason)
+        if let Err(why) = firmware::iommu_restart::after_death(death)
         {
             std::os::seraph::log!(warn: "IOMMU driver not restarted: {}", why);
             self.fail_iommu(held, ipc_buf);
             return;
         }
-        if client.begin_restart(post.badge)
+        if client.begin_restart(badge)
         {
             let posted = Self::post(&mut self.lock(), |j| &mut j.iommu);
             if posted
@@ -2455,7 +2482,7 @@ enum Serves
 
 /// A driver the registry serves: its service endpoint, which devmgr owns,
 /// for a driver bound to a PCI record the device caps devmgr carved for it,
-/// and the driver's process handle while devmgr keeps it.
+/// and the driver's process handle.
 struct ServedDriver
 {
     /// The driver's service endpoint, which [`Self::release`] revokes and
@@ -2468,11 +2495,13 @@ struct ServedDriver
     /// For a driver bound to a platform record, the caps devmgr carved for
     /// it.
     platform_caps: Option<bind::PlatformDeviceCaps>,
-    /// The driver's badged procmgr process handle: kept until its batch
-    /// settles, and for the rest of the boot for a driver bound to a PCI
-    /// record, which devmgr destroys when it withdraws it, and whose memory
-    /// procmgr holds after its death until devmgr releases it when the
-    /// driver performs DMA (`CREATE_DMA_HOLD`); 0 once released.
+    /// The driver's badged procmgr process handle, kept while the driver is
+    /// served, on which devmgr reads the reason procmgr gives the process
+    /// when it dies (`QUERY_PROCESS`) and destroys it when it withdraws it
+    /// (for the IOMMU driver, devmgr's own copy, `iommu::Iommu`, does); for a
+    /// driver bound to a PCI record whose declaration performs DMA, procmgr
+    /// holds its memory after its death until devmgr releases it
+    /// (`CREATE_DMA_HOLD`). Deleted when the driver is withdrawn.
     process_handle: u64,
     /// What devmgr restarts the driver from when it dies; `None` for the
     /// IOMMU driver, which devmgr restarts from what it keeps itself
@@ -2592,9 +2621,10 @@ struct ServedDrivers
     /// The IOMMU driver's instances, each once its batch settles, in spawn
     /// order: the boot instance at ordinal 0, each restarted one after. A
     /// record holds no service endpoint (the endpoints are the client's)
-    /// and, once served, no process handle, which devmgr keeps itself
-    /// (`iommu::Iommu`): the serving instance's death restarts the driver
-    /// ([`Registry::iommu_died`]).
+    /// and a copy of the process handle, for the reason procmgr gives the
+    /// process when it dies, deleted when the record is withdrawn; devmgr
+    /// destroys the instance through its own (`iommu::Iommu`). The serving
+    /// instance's death restarts the driver ([`Registry::iommu_died`]).
     iommu: Served<ServedDriver>,
     /// The client the IOMMU driver is called through, once it is ready.
     iommu_client: Option<Arc<iommu::IommuClient>>,
@@ -2626,7 +2656,7 @@ impl ServedDrivers
     /// Append the ready driver `spawned` to what it is served as. Returns the
     /// driver and why it is not served when it is not: the IOMMU confining
     /// its device has failed, or there is no room for it.
-    fn serve_ready(&mut self, mut spawned: SpawnedDriver) -> Option<(ServedDriver, &'static str)>
+    fn serve_ready(&mut self, spawned: SpawnedDriver) -> Option<(ServedDriver, &'static str)>
     {
         let confined = spawned
             .driver
@@ -2652,11 +2682,6 @@ impl ServedDrivers
         {
             return Some((spawned.driver, "no room to serve the driver; destroyed"));
         }
-        if spawned.driver.dev_caps.is_none()
-        {
-            let _ = syscall::cap_delete(spawned.driver.process_handle);
-            spawned.driver.process_handle = 0;
-        }
         // Room was reserved just above, so the push holds.
         let _ = list.push(spawned.badge, spawned.driver);
         if let Serves::Class(class) = serves
@@ -2676,10 +2701,25 @@ impl ServedDrivers
         Some((client, first))
     }
 
+    /// The process handle of the driver served under device badge `badge`,
+    /// of a class or the IOMMU driver; `None` when none is served under it.
+    fn process_handle(&mut self, badge: u64) -> Option<u64>
+    {
+        if let Some(record) = self.iommu.find(badge)
+        {
+            return Some(record.process_handle);
+        }
+        self.classes
+            .iter_mut()
+            .find_map(|(_, served)| served.find(badge))
+            .map(|d| d.process_handle)
+    }
+
     /// Take out the served driver whose device badge is `badge`, leaving a
     /// tombstone at its ordinal, with its class: `None` for the IOMMU driver,
-    /// whose record holds nothing to release and whose death the caller
-    /// fails the client on; a class's driver the caller withdraws, its
+    /// whose record holds nothing to release but its copy of the process
+    /// handle, which the caller deletes, and whose death the caller fails the
+    /// client on; a class's driver the caller withdraws, its
     /// class's watchers signalled. `None` when no driver is served under
     /// `badge`.
     fn take_dead(&mut self, badge: u64) -> Option<(Option<ClassName>, ServedDriver)>

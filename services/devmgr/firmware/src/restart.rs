@@ -97,28 +97,60 @@ pub fn entry<'a>(dir: &[u8], path: &'a [u8]) -> Option<&'a [u8]>
     (!name.is_empty() && !name.contains(&b'/')).then_some(name)
 }
 
-/// When devmgr takes the death of a served driver installed at `path`, with
-/// exit reason `reason`: the drivers-directory entry it restarts from, or
+/// A served driver's end as devmgr takes it: the exit reason of the death
+/// post that reported it, and procmgr's `QUERY_PROCESS` answer for the
+/// driver's process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Death
+{
+    /// The reason the death post carries.
+    pub posted: u64,
+    /// procmgr's `QUERY_PROCESS` answer for the driver's process: word 0,
+    /// the state, and word 1, the reason; `None` when devmgr holds no process
+    /// handle of the driver, or the call failed or was refused.
+    pub answer: Option<(u64, u64)>,
+}
+
+impl Death
+{
+    /// The exit reason devmgr decides on: the one procmgr gives the process
+    /// when it answers `EXITED`, else the post's
+    /// (`ipc::procmgr_process_state::process_reason`). The post can be the
+    /// end of the driver's main thread alone, which is the process's end only
+    /// when it is the first terminal end of any of its threads
+    /// (`docs/process-lifecycle.md` § Exit reason): a main thread's
+    /// `sys_thread_exit` posts 0 to devmgr's binding on it, and a fault of
+    /// another thread before procmgr reads the process's end is the process's
+    /// reason.
+    #[must_use]
+    pub fn reason(self) -> u64
+    {
+        ipc::procmgr_process_state::process_reason(self.answer, self.posted)
+    }
+}
+
+/// When devmgr takes the death of a served driver installed at `path`,
+/// `death`: the drivers-directory entry it restarts from, or
 /// why it does not restart. `declined` is whether its consumer declined its
 /// restart; `drivers_dir` is the drivers directory's path, `None` before
 /// `SET_DRIVERS_DIR`.
 ///
 /// # Errors
-/// The [`Refusal`], checked in this order: an exit of its own (a reason
-/// below `EXIT_FAULT_BASE`; a fault or a kill restarts), the consumer's
-/// refusal, no drivers directory, a path outside it.
+/// The [`Refusal`], checked in this order: an exit of its own (a reason,
+/// [`Death::reason`], below `EXIT_FAULT_BASE`; a fault or a kill restarts),
+/// the consumer's refusal, no drivers directory, a path outside it.
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "`declined` is data: the mark `DECLINE_RESTART` left on the dead driver"
 )]
 pub fn restart_entry<'a>(
-    reason: u64,
+    death: Death,
     declined: bool,
     drivers_dir: Option<&[u8]>,
     path: &'a [u8],
 ) -> Result<&'a [u8], Refusal>
 {
-    if reason < EXIT_FAULT_BASE
+    if death.reason() < EXIT_FAULT_BASE
     {
         return Err(Refusal::Exited);
     }
@@ -394,6 +426,15 @@ mod tests
     const FAULT: u64 = EXIT_FAULT_BASE + 14;
     const KILLED: u64 = syscall_abi::EXIT_KILLED;
 
+    /// A death whose post carries `reason` and whose query failed.
+    fn posted(reason: u64) -> Death
+    {
+        Death {
+            posted: reason,
+            answer: None,
+        }
+    }
+
     #[test]
     fn an_entry_is_one_name_directly_in_the_directory()
     {
@@ -415,7 +456,12 @@ mod tests
         for reason in [FAULT, KILLED]
         {
             assert_eq!(
-                restart_entry(reason, false, Some(DIR), b"/services/drivers/serial"),
+                restart_entry(
+                    posted(reason),
+                    false,
+                    Some(DIR),
+                    b"/services/drivers/serial"
+                ),
                 Ok(&b"serial"[..])
             );
         }
@@ -426,26 +472,82 @@ mod tests
     {
         let path = b"/services/drivers/serial";
         assert_eq!(
-            restart_entry(0, true, None, b"/x"),
+            restart_entry(posted(0), true, None, b"/x"),
             Err(Refusal::Exited),
             "an exit of its own is not restarted, whatever else holds"
         );
         assert_eq!(
-            restart_entry(EXIT_FAULT_BASE - 1, false, Some(DIR), path),
+            restart_entry(posted(EXIT_FAULT_BASE - 1), false, Some(DIR), path),
             Err(Refusal::Exited)
         );
         assert_eq!(
-            restart_entry(FAULT, true, Some(DIR), path),
+            restart_entry(posted(FAULT), true, Some(DIR), path),
             Err(Refusal::Declined)
         );
         assert_eq!(
-            restart_entry(FAULT, false, None, path),
+            restart_entry(posted(FAULT), false, None, path),
             Err(Refusal::NoDriversDir)
         );
         assert_eq!(
-            restart_entry(FAULT, false, Some(DIR), b"/tests/drivers/test-fault"),
+            restart_entry(
+                posted(FAULT),
+                false,
+                Some(DIR),
+                b"/tests/drivers/test-fault"
+            ),
             Err(Refusal::NotInstalled)
         );
+    }
+
+    #[test]
+    fn the_restart_is_decided_on_the_reason_procmgr_gives_the_process()
+    {
+        use ipc::procmgr_process_state::{ALIVE, CREATED, EXITED, UNKNOWN};
+
+        let path = b"/services/drivers/serial";
+        // The main thread's sys_thread_exit posted 0; another thread's fault
+        // ended the process before procmgr read its end.
+        let worker_fault = Death {
+            posted: 0,
+            answer: Some((EXITED, FAULT)),
+        };
+        assert_eq!(worker_fault.reason(), FAULT);
+        assert_eq!(
+            restart_entry(worker_fault, false, Some(DIR), path),
+            Ok(&b"serial"[..])
+        );
+        // procmgr gives the process an exit of its own over a posted fault.
+        let exited = Death {
+            posted: FAULT,
+            answer: Some((EXITED, 0)),
+        };
+        assert_eq!(
+            restart_entry(exited, false, Some(DIR), path),
+            Err(Refusal::Exited)
+        );
+        // No EXITED answer, or no answer: the post's reason decides.
+        for answer in [
+            None,
+            Some((ALIVE, FAULT)),
+            Some((CREATED, FAULT)),
+            Some((UNKNOWN, FAULT)),
+        ]
+        {
+            let death = Death { posted: 0, answer };
+            assert_eq!(death.reason(), 0);
+            assert_eq!(
+                restart_entry(death, false, Some(DIR), path),
+                Err(Refusal::Exited)
+            );
+            let death = Death {
+                posted: FAULT,
+                answer,
+            };
+            assert_eq!(
+                restart_entry(death, false, Some(DIR), path),
+                Ok(&b"serial"[..])
+            );
+        }
     }
 
     #[test]

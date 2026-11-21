@@ -136,9 +136,18 @@ impl<T> Served<T>
     #[must_use]
     pub fn serves(&self, badge: u64) -> bool
     {
+        self.find(badge).is_some()
+    }
+
+    /// The driver served under `badge`, not withdrawn; `None` when the class
+    /// serves none under it.
+    #[must_use]
+    pub fn find(&self, badge: u64) -> Option<&T>
+    {
         self.slots
             .iter()
-            .any(|s| s.badge == badge && s.driver.is_some())
+            .find(|s| s.badge == badge)
+            .and_then(|s| s.driver.as_ref())
     }
 
     /// The served driver at the lowest ordinal that is not withdrawn, if
@@ -227,9 +236,12 @@ mod tests
     {
         let mut s = serving(&[1, 2]);
         assert!(s.serves(1) && s.serves(2));
+        assert_eq!(s.find(2), Some(&2));
         assert!(!s.serves(3));
+        assert_eq!(s.find(3), None);
         s.withdraw(1);
         assert!(!s.serves(1));
+        assert_eq!(s.find(1), None);
         assert!(s.serves(2));
     }
 

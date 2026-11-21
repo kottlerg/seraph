@@ -2550,6 +2550,12 @@ pub mod process {
         /// that does not ask, so the child takes its caps before it writes
         /// enough to fill a piped stdio stream. An empty list, the default,
         /// gives the child no creator endpoint at all.
+        ///
+        /// The serve receives on the calling thread, and a receive releases
+        /// any reply the thread still owes (docs/ipc-design.md § The
+        /// Call/Reply Model): a server thread replies to its caller before
+        /// it spawns a child with bootstrap caps. A receive an upcall or a
+        /// thread stop cancels is received again.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn bootstrap_caps(&mut self, slots: &[u64]) -> &mut Self;
     }

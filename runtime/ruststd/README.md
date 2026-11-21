@@ -578,6 +578,11 @@ set, a live child that never asks holds the spawner as `Child::wait` would, so a
 caps before it writes enough to fill a piped stdio stream. A `Command` given no caps, the
 default, sends no cap[1], and the child's `creator_endpoint` is `0`.
 
+The serve is a receive on the calling thread, which releases any reply that thread still owes
+([docs/ipc-design.md](../../docs/ipc-design.md) § The Call/Reply Model), so a server thread replies
+to its caller before it spawns a child with bootstrap caps; a spawn without them only calls. A
+receive an upcall or a thread stop cancels took no request, and is received again.
+
 ---
 
 ## Session streams

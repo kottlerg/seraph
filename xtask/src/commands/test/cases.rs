@@ -104,7 +104,7 @@ impl Case
 pub fn case(case: TestCase) -> Case
 {
     use super::{
-        cet, debug_port, hotplug, kaslr, shutdown, signing, terminal, tpm, vmgenid, wedge,
+        cet, debug_port, hotplug, kaslr, rollback, shutdown, signing, terminal, tpm, vmgenid, wedge,
     };
     match case
     {
@@ -130,6 +130,15 @@ pub fn case(case: TestCase) -> Case
             cell: Cell::Ci(Tester::Usertest),
             options: &[CaseOption::Release],
             run: signing::run,
+        },
+        // The floor written, raised, and refusing the older bootloader, on
+        // one variable store.
+        TestCase::Rollback => Case {
+            arches: &[(Arch::X86_64, 3), (Arch::Riscv64, 3)],
+            bundle: Harness::Init,
+            cell: Cell::Ci(Tester::Usertest),
+            options: &[CaseOption::Release],
+            run: rollback::run,
         },
         // An AP, then the BSP.
         TestCase::Wedge => Case {
@@ -353,7 +362,8 @@ pub fn cell_cases(tester: Tester, arch: Arch) -> Vec<TestCase>
 }
 
 /// Refuse a case option `args` gives that a cell does not pass on to its
-/// cases: every one but `--release`, which the `signing` case takes. The
+/// cases: every one but `--release`, which the `signing` and `rollback`
+/// cases take. The
 /// parser does not hold them to a case once `--cell` stands in its place.
 fn check_cell_options(args: &TestArgs) -> Result<()>
 {
@@ -445,11 +455,11 @@ mod tests
         use TestCase::*;
         assert_eq!(
             cell_cases(Tester::Usertest, Arch::X86_64),
-            [Terminal, Signing, Wedge, Vmgenid, Shutdown]
+            [Terminal, Signing, Rollback, Wedge, Vmgenid, Shutdown]
         );
         assert_eq!(
             cell_cases(Tester::Usertest, Arch::Riscv64),
-            [Terminal, Signing, Wedge, Shutdown]
+            [Terminal, Signing, Rollback, Wedge, Shutdown]
         );
         for arch in [Arch::X86_64, Arch::Riscv64]
         {

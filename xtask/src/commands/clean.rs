@@ -3,8 +3,9 @@
 
 // xtask/src/commands/clean.rs
 
-//! Clean command: remove the sysroot, the symbols store and the disk images,
-//! and optionally the cargo target/ directory.
+//! Clean command: remove the sysroot, the symbols store, the disk images and
+//! any per-launch variable store a killed launch left, and optionally the
+//! cargo target/ directory.
 
 use std::process::Command;
 
@@ -45,6 +46,17 @@ pub fn run(ctx: &BuildContext, args: &CleanArgs) -> Result<()>
                 crate::error::err!("failed to remove {}: {}", disk_img.display(), e)
             })?;
         }
+    }
+
+    let vars = crate::qemu::launch_vars_dir(ctx);
+    if vars.exists()
+    {
+        step(&format!(
+            "Removing per-launch variable stores: {}",
+            vars.display()
+        ));
+        std::fs::remove_dir_all(&vars)
+            .map_err(|e| crate::error::err!("failed to remove {}: {}", vars.display(), e))?;
     }
 
     if args.all

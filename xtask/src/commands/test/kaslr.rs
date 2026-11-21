@@ -35,10 +35,9 @@ use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::esp::{Knob, remove_knob, stage_knob};
-use crate::firmware::find_ovmf_code;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    GdbMode, Iommu, QemuLaunchSpec, SecondDisk, build_qemu_argv, prepare_riscv_firmware,
+    Firmware, GdbMode, Iommu, QemuLaunchSpec, SecondDisk, build_qemu_argv,
     validate_sysroot_for_launch,
 };
 use crate::util::{require_tool, step};
@@ -78,7 +77,7 @@ impl Guest
         ctx: &Context,
         args: &CaseArgs,
         firmware_code: &Path,
-        firmware_vars: Option<&Path>,
+        firmware_vars: &Path,
         data_image: Option<&Path>,
     ) -> Result<Self>
     {
@@ -221,26 +220,19 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
     let layout = crate::disk::current_layout(ctx)?;
     let data_image = layout.second_image(ctx);
 
-    // Resolve firmware once; riscv64 needs a writable vars pflash.
-    let (code, vars) = match args.arch
-    {
-        Arch::X86_64 => (find_ovmf_code()?, None),
-        Arch::Riscv64 =>
-        {
-            let (c, v) = prepare_riscv_firmware(ctx)?;
-            (c, Some(v))
-        }
-    };
-    let vars_ref = vars.as_deref();
+    // Resolve firmware once; each boot gets a variable store of its own.
+    let firmware = Firmware::prepare(ctx, args.arch)?;
 
     let scrape = |label: &str| -> Result<Layout> {
         step(&format!("kaslr test: {label}"));
+        // Removed when the scrape returns, after the guest is shut down.
+        let vars = firmware.launch_vars()?;
         let mut guest = Guest::launch(
             &qemu_binary,
             ctx,
             args,
-            &code,
-            vars_ref,
+            &firmware.code,
+            vars.path(),
             data_image.as_deref(),
         )?;
         let res = guest.scrape_layout(TIMEOUT);

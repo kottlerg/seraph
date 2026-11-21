@@ -58,11 +58,10 @@ use crate::context::Context;
 use crate::debug_stub;
 use crate::disk::DiskLayout;
 use crate::error::{Context as _, Result, bail};
-use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
-    X86ShadowStack, build_qemu_argv, prepare_riscv_firmware,
+    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
+    X86Paging, X86ShadowStack, build_qemu_argv,
 };
 use crate::qemu_gdb::{Stub, field_hex};
 use crate::qmp;
@@ -382,15 +381,8 @@ fn launch(
     debug_port: Option<u16>,
 ) -> Result<(Guest, Option<ChildStdin>)>
 {
-    let (firmware_code, firmware_vars) = match args.arch
-    {
-        Arch::X86_64 => (find_ovmf_code()?, None),
-        Arch::Riscv64 =>
-        {
-            let (code, vars) = prepare_riscv_firmware(ctx)?;
-            (code, Some(vars))
-        }
-    };
+    let firmware = Firmware::prepare(ctx, args.arch)?;
+    let vars = firmware.launch_vars()?;
     let disk_path = ctx.disk_image();
     let data_image = layout.second_image(ctx);
     let spec = QemuLaunchSpec {
@@ -401,8 +393,8 @@ fn launch(
             .as_deref()
             .map(SecondDisk::of_image)
             .transpose()?,
-        firmware_code_path: &firmware_code,
-        firmware_vars_path: firmware_vars.as_deref(),
+        firmware_code_path: &firmware.code,
+        firmware_vars_path: vars.path(),
         cpus: args.cpus,
         threads_per_core: 1,
         mem_mib: args.mem,
@@ -430,7 +422,7 @@ fn launch(
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
     let stdin = child.stdin.take();
-    Ok((Guest::from_child(child)?, stdin))
+    Ok((Guest::from_child(child)?.holding(vars), stdin))
 }
 
 /// The verdict on a boot whose `SHUTDOWN` event gave `reason` at

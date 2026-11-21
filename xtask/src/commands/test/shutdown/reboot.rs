@@ -32,10 +32,9 @@ use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::disk::DiskLayout;
-use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
-    X86ShadowStack, build_qemu_argv, prepare_riscv_firmware,
+    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
+    X86Paging, X86ShadowStack, build_qemu_argv,
 };
 use crate::qmp;
 use crate::util::{require_tool, step};
@@ -98,15 +97,8 @@ struct Seen
 /// event and QEMU's exit, and judge them and the serial stream.
 fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
 {
-    let (firmware_code, firmware_vars) = match args.arch
-    {
-        Arch::X86_64 => (find_ovmf_code()?, None),
-        Arch::Riscv64 =>
-        {
-            let (code, vars) = prepare_riscv_firmware(ctx)?;
-            (code, Some(vars))
-        }
-    };
+    let firmware = Firmware::prepare(ctx, args.arch)?;
+    let vars = firmware.launch_vars()?;
     let sock_dir = ctx.target_dir.join("xtask");
     std::fs::create_dir_all(&sock_dir)
         .with_context(|| format!("creating {}", sock_dir.display()))?;
@@ -124,8 +116,8 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
             .as_deref()
             .map(SecondDisk::of_image)
             .transpose()?,
-        firmware_code_path: &firmware_code,
-        firmware_vars_path: firmware_vars.as_deref(),
+        firmware_code_path: &firmware.code,
+        firmware_vars_path: vars.path(),
         cpus: args.cpus,
         threads_per_core: 1,
         mem_mib: args.mem,

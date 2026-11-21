@@ -178,8 +178,9 @@ const EMPTY_DIRS: &[&str] = &["crash"];
 /// data-file or synthesised-fixture origin) are removed, so deleting a file from `rootfs/` is
 /// reflected in the sysroot and the disk image on the next build. Build-owned
 /// subtrees are never touched. `mkdisk --repack-only` bypasses this whole step
-/// to pack a hand-staged sysroot as it stands, its objects re-signed as every
-/// pack signs them.
+/// to pack a hand-staged sysroot as it stands, except for the data files it
+/// still installs ([`install_data_files`]), its objects re-signed as every pack
+/// signs them.
 pub fn install_rootfs(ctx: &BuildContext, arch: Arch) -> Result<()>
 {
     let src_root = ctx.root.join("rootfs");

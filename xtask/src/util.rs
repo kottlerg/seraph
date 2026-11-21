@@ -6,7 +6,7 @@
 //! Shared utilities: step printing, command execution, and tool
 //! discovery. (The terminal-state RAII guard moved to `term::guard`.)
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -116,18 +116,51 @@ pub const CI_CARGO_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
 /// directory" from `Command::spawn`.
 pub fn require_tool(name: &str) -> Result<PathBuf>
 {
-    let path = std::env::var_os("PATH");
+    let path = tool_search_path(std::env::var_os("PATH").as_deref());
     find_executable(
         Path::new(name),
         path.as_deref(),
         std::env::consts::EXE_EXTENSION,
     )
     .ok_or_else(|| {
+        let also = if cfg!(unix)
+        {
+            " or in /usr/local/sbin, /usr/sbin or /sbin"
+        }
+        else
+        {
+            ""
+        };
         crate::error::err!(
-            "{name} not found on PATH\n{hint}",
+            "{name} not found on PATH{also}\n{hint}",
             hint = install_hint_for(name),
         )
     })
+}
+
+/// The system-administration directories a Unix distribution installs some
+/// tools in (dosfstools' `fsck.fat` among them) and may leave off an
+/// unprivileged user's `PATH`, as Debian's default does; [`require_tool`]
+/// searches them after `PATH`.
+const SBIN_DIRS: [&str; 3] = ["/usr/local/sbin", "/usr/sbin", "/sbin"];
+
+/// The directories [`require_tool`] searches: those of `path` (a `PATH`
+/// value) in order, then, on Unix, each of [`SBIN_DIRS`] that `path` does not
+/// already name.
+fn tool_search_path(path: Option<&OsStr>) -> Option<OsString>
+{
+    let mut dirs: Vec<PathBuf> = path.map_or_default(|path| std::env::split_paths(path).collect());
+    if cfg!(unix)
+    {
+        for dir in SBIN_DIRS.map(PathBuf::from)
+        {
+            if !dirs.contains(&dir)
+            {
+                dirs.push(dir);
+            }
+        }
+    }
+    std::env::join_paths(dirs).ok()
 }
 
 /// The executable file `name` names, found as the host's process launcher
@@ -306,6 +339,21 @@ pub fn debug_port_or_free(requested: Option<u16>) -> Result<u16>
 mod tests
 {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sbin_directories_are_searched_after_path_once()
+    {
+        let path = tool_search_path(Some(OsStr::new("/usr/bin:/usr/sbin"))).unwrap();
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(
+            dirs,
+            ["/usr/bin", "/usr/sbin", "/usr/local/sbin", "/sbin"].map(PathBuf::from)
+        );
+        let none = tool_search_path(None).unwrap();
+        let dirs: Vec<PathBuf> = std::env::split_paths(&none).collect();
+        assert_eq!(dirs, SBIN_DIRS.map(PathBuf::from));
+    }
 
     #[test]
     fn a_requested_port_is_kept()

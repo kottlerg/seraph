@@ -48,7 +48,8 @@ repacks) checks the images it wrote with `fsck.fat` from dosfstools
 ([xtask/README.md](../xtask/README.md#the-image-check) § The image check), and so do the image
 check's host tests that `cargo xtask test` runs, so both need the `dosfstools` package on the host
 (the same name on Debian, Ubuntu, Fedora, Arch, Homebrew and FreeBSD). A pack fails, naming it,
-when `fsck.fat` is missing.
+when it finds no `fsck.fat` on `PATH` or, on a Unix host, in `/usr/local/sbin`, `/usr/sbin` or
+`/sbin`, where distributions install it and which an unprivileged user's `PATH` can lack.
 
 `cargo xtask symbolize` reads DWARF and symbol tables in Rust, with the `addr2line` and `object`
 crates the toolchain's sysroot ships ([coding-standards.md](coding-standards.md#dependencies)

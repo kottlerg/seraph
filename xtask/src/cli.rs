@@ -101,11 +101,13 @@ subcommands! {
         /// configuration the image boots, and regenerate `disk.img` without
         /// invoking cargo. The mirror is authoritative over `config/`+`data/`
         /// (deletions in `rootfs/` are pruned); use `--repack-only` to pack a
-        /// hand-staged sysroot as it stands. Every pack re-signs the sysroot's
-        /// signed objects in place, then checks the images it wrote with
-        /// `fsck.fat -n` (dosfstools) and reads their ESP back against the
-        /// root partition. Requires an arch-tagged sysroot from a prior
-        /// `cargo xtask build`.
+        /// hand-staged sysroot without it (the repository's data files, the
+        /// log-level configuration among them, are installed either way; pack
+        /// another configuration with `--log-levels`). Every pack re-signs
+        /// the sysroot's signed objects in place, then checks the images it
+        /// wrote with `fsck.fat -n` (dosfstools) and reads their ESP back
+        /// against the root partition. Requires an arch-tagged sysroot from a
+        /// prior `cargo xtask build`.
         Mkdisk(MkdiskArgs),
 
         /// Boot the terminal interactive test: launch QEMU with a QMP control

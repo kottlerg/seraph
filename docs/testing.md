@@ -1874,10 +1874,10 @@ answering. `cargo xtask run --gdb` starts the guest paused with the stub on `loc
 hung guest alive for attaching
 ([xtask/README.md](../xtask/README.md#classified-boots---runs)). GDB runs in batch mode, so its
 output lands in a file like any log. The kernel is static-PIE, so its symbols load at the KASLR
+slide from the serial-only `kaslr: slide=` line, or at their link addresses in a boot whose disk
 was authored with `cargo xtask mkdisk --knob nokaslr`; a userspace image's symbols load at its
 bias, as [xtask/README.md](../xtask/README.md#cargo-xtask-run) describes under `--gdb`. Source lines
 need the image built with debug information (`cargo xtask build --debug kernel`,
-the image built with debug information (`cargo xtask build --debug kernel`,
 [docs/build-system.md](build-system.md#debuginfo-is-opt-in)). On riscv64 the GDB must be built for
 that target ([docs/build-system.md](build-system.md#toolchain)).
 

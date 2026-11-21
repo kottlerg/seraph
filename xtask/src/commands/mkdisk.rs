@@ -14,9 +14,12 @@
 //! would prune the hand-added file.
 //!
 //! `--repack-only` skips the `rootfs/` re-mirror and packs the sysroot as it
-//! stands. A normal re-mirror is authoritative over the rootfs-managed subtrees
-//! (`config/`, `data/`): it restores recipes that exist in `rootfs/` and removes
-//! sysroot ones that do not. `--repack-only` lets a test boot compose a service
+//! stands, except that the repository's data files (the log-level
+//! configuration, or the file `--log-levels` names, and the platform tables)
+//! are installed over their copies in either case. A normal re-mirror is
+//! authoritative over the rootfs-managed subtrees (`config/`, `data/`): it
+//! restores recipes that exist in `rootfs/` and removes sysroot ones that do
+//! not. `--repack-only` lets a test boot compose a service
 //! set that diverges from `rootfs/` — e.g. a default recipe removed, or a test
 //! recipe hand-staged — by packing the staged sysroot without that pass.
 

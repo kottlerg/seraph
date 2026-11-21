@@ -310,10 +310,11 @@ mod tests
         ];
         for creator in creators
         {
-            // Every defined role is a bit of the low byte (RoleSet::ALL).
-            for bits in 0..=u8::MAX
+            // Every signed set lies within 0..=RoleSet::ALL, whose highest bit is the
+            // highest defined role.
+            for bits in 0..=RoleSet::ALL.bits()
             {
-                let Some(roles) = RoleSet::from_signed(u32::from(bits))
+                let Some(roles) = RoleSet::from_signed(bits)
                 else
                 {
                     continue;

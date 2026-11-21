@@ -857,7 +857,9 @@ pub const OBJECT_CHECKPOINT: u64 = 1 << 0;
 /// holding no data in a chunk that is not resident); `UNAUTHORIZED`
 /// (a badge that is a handle or the swap authority); `LIMIT`,
 /// `OUT_OF_MEMORY_BEST_EFFORT` or `QUOTA` as for the fault that would back
-/// the page, the pages before it staying backed. Specified in
+/// the page, and `OUT_OF_MEMORY_BEST_EFFORT` when the request's own draws
+/// evicted a chunk it names, the pages before staying backed; the
+/// `INVALID_ARGUMENT` refusals come before anything is backed. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 36: `FILL_REGION`.
 pub const FILL_REGION: u64 = 36;
 /// The most chunks one [`FILL_REGION`] names: a bound on the pages one

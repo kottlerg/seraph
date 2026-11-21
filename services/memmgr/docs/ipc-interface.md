@@ -1817,7 +1817,9 @@ object page passed over. A failure part way leaves the pages before it backed an
 the failure alone, so a repeat of the request, after a failure or a reply that did not arrive,
 backs the named pages still holding no data, each with the object page it takes, and nothing twice.
 A chunk that is evicting, evicted, compressed or on disk takes no run: when a page its mask names
-holds no data, the request is refused, checked before anything is backed.
+holds no data, the request is refused `INVALID_ARGUMENT`, checked before anything is backed. A
+chunk the request's own draws for room evict after that check fails it part way, as a draw the pool
+cannot meet does.
 
 **Reply (success):** label 0, `data[0]` the pages backed; no caps.
 
@@ -1825,7 +1827,7 @@ holds no data, the request is refused, checked before anything is backed.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | No page of the pool could back a page, a committed region's commitment was spent, or a map failed |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | No page of the pool could back a page, a committed region's commitment was spent, a map failed, or the request's own draws evicted a chunk it names |
 | 3 | `QUOTA` | The arena slots recording a run could not be allocated |
 | 4 | `INVALID_ARGUMENT` | The badge names no process, the process has no delegated address space (§ Label 8), `n` is out of range, a base is no chunk's base in such a region or not above the one before, a mask names a page past its chunk, `cap[0]` is missing or no live object handle, the masks name pages past the object's end, or a chunk that is not resident has a named page holding no data |
 | 5 | `UNAUTHORIZED` | The badge is a node handle, the swap authority or an object handle |

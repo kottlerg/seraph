@@ -208,7 +208,10 @@ fn fill_region(req: &IpcMessage, handle: Option<u64>) -> Result<u64, u64>
             FillPath::Back =>
             {}
             FillPath::Skip => continue,
-            FillPath::Refuse => return Err(memmgr_errors::INVALID_ARGUMENT),
+            // Resident when checked, the chunk was evicted by this request's
+            // own draws for room: a failure part way, as a draw the pool
+            // could not meet is.
+            FillPath::Refuse => return Err(memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT),
         }
         for (start, end, object_page) in f.chunk.runs()
         {

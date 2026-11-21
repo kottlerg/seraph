@@ -337,8 +337,12 @@ static CALL_DEADLINE: Cell<Option<crate::time::Instant>> = Cell::new(None);
 /// which a spawn that failed tears its child down, and the one with which a
 /// `Child` dropped without a wait tears its child down, which nothing else
 /// can do, so a spawn whose deadline passed, or such a drop, may still wait
-/// for that teardown (`Child::kill` is bounded, and fails `TimedOut`); and
-/// every wait that is not an IPC call (a thread join, a child's
+/// for that teardown (`Child::kill` is bounded, and fails `TimedOut`); the
+/// `QUIESCE` calls with which [`checkpoint::quiesce`] enters and ends its
+/// point, since a call the deadline cut could leave procmgr recording a
+/// point the thread has left, and the release of a [`checkpoint::Checkpoint`]
+/// on its drop, which nothing else releases; and every wait that is not an
+/// IPC call (a thread join, a child's
 /// wait, a pipe, a sleep, a lock). A caller that needs a bound on its own
 /// calls takes [`call_time_left`] for them, as `ipc::ipc_call_within` does.
 ///
@@ -2611,11 +2615,22 @@ pub mod checkpoint {
             .word(0, restore_sp)
             .cap(notify)
             .build();
+        // Outside any call deadline, as the end below: a deadline that cut
+        // the entry's wait for its reply would leave procmgr recording a point
+        // the thread has left.
         // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-        let entered = unsafe { super::deadline_call(info.procmgr_endpoint, &enter, ipc_buf) };
+        let entered = unsafe { quiesce_call(info.procmgr_endpoint, &enter, ipc_buf) };
         match entered {
             Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS => {}
             other => {
+                if other.is_err() {
+                    // The call may have reached procmgr before it failed:
+                    // end any point it recorded. An end with none is
+                    // answered `SUCCESS`.
+                    // SAFETY: ipc_buf is the calling thread's registered IPC
+                    // buffer page.
+                    let _ = unsafe { end_point(info.procmgr_endpoint, ipc_buf) };
+                }
                 // A call refused before procmgr received the cap leaves it
                 // here; procmgr deletes one it received.
                 let _ = syscall::cap_delete(notify);
@@ -2635,11 +2650,8 @@ pub mod checkpoint {
         // At the point: from here to the end's reply nothing but this frame
         // and the IPC buffer is written, and nothing is allocated.
         let signalled = wait_signal(notification, timeout);
-        let end = ipc::IpcMessage::builder(ipc::procmgr_labels::QUIESCE).build();
-        // The end is made outside any call deadline: the thread must not
-        // return while procmgr still records the point.
         // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-        let ended = unsafe { ipc::ipc_call(info.procmgr_endpoint, &end, ipc_buf) };
+        let ended = unsafe { end_point(info.procmgr_endpoint, ipc_buf) };
         let signalled =
             signalled || syscall::notification_try_wait(notification).is_ok_and(|bits| bits != 0);
         let _ = syscall::cap_delete(notification);
@@ -2653,19 +2665,58 @@ pub mod checkpoint {
         Ok(if signalled { Quiesced::Captured } else { Quiesced::NotCaptured })
     }
 
+    /// A `QUIESCE` on the process's own procmgr cap, outside any call
+    /// deadline: the entry of a quiesce point and its end
+    /// (`super::with_call_deadline`).
+    ///
+    /// # Safety
+    /// `ipc_buf` is the calling thread's registered IPC buffer page.
+    unsafe fn quiesce_call(
+        procmgr_ep: u64,
+        msg: &ipc::IpcMessage,
+        ipc_buf: *mut u64,
+    ) -> Result<ipc::IpcMessage, i64> {
+        // SAFETY: the caller passes the registered IPC buffer page.
+        unsafe { ipc::ipc_call(procmgr_ep, msg, ipc_buf) }
+    }
+
+    /// The `QUIESCE` that ends the process's quiesce point, outside any call
+    /// deadline and made again while it is `Interrupted`: the thread must not
+    /// return while procmgr still records the point
+    /// (`super::with_call_deadline`).
+    ///
+    /// # Safety
+    /// `ipc_buf` is the calling thread's registered IPC buffer page.
+    unsafe fn end_point(procmgr_ep: u64, ipc_buf: *mut u64) -> Result<ipc::IpcMessage, i64> {
+        let end = ipc::IpcMessage::builder(ipc::procmgr_labels::QUIESCE).build();
+        loop {
+            // SAFETY: the caller passes the registered IPC buffer page.
+            match unsafe { quiesce_call(procmgr_ep, &end, ipc_buf) } {
+                Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => {}
+                result => return result,
+            }
+        }
+    }
+
     /// Whether `notification` is signalled within `timeout`, an interrupted
     /// wait waiting again for the time left.
     fn wait_signal(notification: u64, timeout: Duration) -> bool {
         let deadline = Instant::now().checked_add(timeout);
         loop {
-            let left = deadline.map_or(u64::MAX, |d| {
-                u64::try_from(d.saturating_duration_since(Instant::now()).as_millis())
-                    .unwrap_or(u64::MAX)
-            });
-            if left == 0 {
-                return false;
-            }
-            match syscall::notification_wait_timeout(notification, left) {
+            // `0` waits without bound and `u64::MAX` is `WAIT_TRY_ONCE`, so a
+            // deadline past `Instant`'s range waits with `0`, and a finite
+            // one waits at most `u64::MAX - 1` ms at a time.
+            let wait_ms = match deadline {
+                None => 0,
+                Some(d) => {
+                    let left = d.saturating_duration_since(Instant::now()).as_millis();
+                    if left == 0 {
+                        return false;
+                    }
+                    u64::try_from(left).unwrap_or(u64::MAX).min(u64::MAX - 1)
+                }
+            };
+            match syscall::notification_wait_timeout(notification, wait_ms) {
                 Ok(bits) if bits != 0 => return true,
                 Ok(_) => {}
                 Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => {}
@@ -2716,8 +2767,11 @@ pub mod checkpoint {
         fn drop(&mut self) {
             let release = ipc::IpcMessage::builder(ipc::memmgr_labels::OBJECT_RELEASE).build();
             let ipc_buf = super::current_ipc_buf();
+            // Outside any call deadline: nothing else releases the object,
+            // whose frames stay charged to the account until it is released
+            // (`super::with_call_deadline`).
             // SAFETY: the IPC buffer is the calling thread's registered page.
-            let _ = unsafe { super::deadline_call(self.handle, &release, ipc_buf) };
+            let _ = unsafe { super::memmgr_call(self.handle, &release, ipc_buf) };
             let _ = syscall::cap_delete(self.handle);
         }
     }

@@ -320,7 +320,10 @@ fn attempt(
             *hint = low;
         }
     }
-    rejected |= exceeds(hint_count, i32::from(OMEGA.to_le_bytes()[0]) + 1);
+    rejected |= exceeds(
+        hint_count,
+        i32::from(OMEGA.to_le_bytes()[0]).wrapping_add(1),
+    );
 
     if rejected != 0
     {

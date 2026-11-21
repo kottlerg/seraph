@@ -44,6 +44,10 @@ const INV_NTT_SCALE: i64 = pow2_mod_q(56);
 
 /// q^-1 mod 2^32 by Newton's iteration: q is 1 mod 2^13, so 1 is its inverse
 /// to 13 bits, and each step doubles the bits that are right.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "evaluated at compile time only, where an overflow is a compile error"
+)]
 const fn q_inverse() -> i32
 {
     let q = Q.cast_unsigned();
@@ -59,6 +63,10 @@ const fn q_inverse() -> i32
 }
 
 /// 2^`exponent` mod q.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "evaluated at compile time only, where an overflow is a compile error"
+)]
 const fn pow2_mod_q(exponent: u32) -> i64
 {
     let mut value: i64 = 1;
@@ -75,6 +83,12 @@ const fn pow2_mod_q(exponent: u32) -> i64
 #[expect(
     clippy::cast_possible_truncation,
     reason = "every value is reduced mod q, which fits an i32"
+)]
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "evaluated at compile time only, where an overflow or an index out of range is a \
+              compile error"
 )]
 const fn zetas() -> [i32; N]
 {
@@ -138,6 +152,7 @@ pub(crate) fn caddq(a: i32) -> i32
 }
 
 /// For a below 2^31 - 2^22 in magnitude, the representative in [0, q).
+#[cfg(any(test, feature = "sign"))]
 pub(crate) fn freeze(a: i32) -> i32
 {
     caddq(reduce32(a))
@@ -145,6 +160,7 @@ pub(crate) fn freeze(a: i32) -> i32
 
 /// For a below 2^31 - 2^22 in magnitude, the centred representative in
 /// [-(q - 1) / 2, (q - 1) / 2].
+#[cfg(any(test, feature = "sign"))]
 pub(crate) fn centre(a: i32) -> i32
 {
     let f = freeze(a);
@@ -205,6 +221,7 @@ pub(crate) fn inv_ntt(a: &mut Poly)
 
 /// a[i] * b[i] * 2^-32 mod q, below q in magnitude, for transformed a and b
 /// whose products are below 2^31 * q in magnitude.
+#[cfg(any(test, feature = "sign"))]
 pub(crate) fn pointwise(a: &Poly, b: &Poly) -> Poly
 {
     let mut out = ZERO;

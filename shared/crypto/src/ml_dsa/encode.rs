@@ -62,7 +62,6 @@ impl Iterator for Unpack<'_>
 /// Pack `values`, each in [0, 2^bits), `bits` bits each, into `out`, which
 /// holds exactly as many bits as the values (FIPS 204 Algorithms 16 and 17;
 /// the callers map their coefficients to these values).
-#[cfg(any(test, feature = "sign"))]
 pub(crate) fn pack(values: impl IntoIterator<Item = i32>, bits: u32, out: &mut [u8])
 {
     let mut held: u64 = 0;

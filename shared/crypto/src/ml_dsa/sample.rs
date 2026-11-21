@@ -24,10 +24,12 @@
 //! it has no rejection.
 
 #[cfg(any(test, feature = "sign"))]
-use super::params::POLY_Z_LEN;
-use super::params::{ETA, GAMMA1, N, Q, RHO_LEN, TAU, Z_BITS};
+use super::params::{ETA, GAMMA1, POLY_Z_LEN, Z_BITS};
+use super::params::{N, Q, RHO_LEN, TAU};
 use super::poly::{Poly, ZERO, montgomery_reduce};
-use crate::shake::{SHAKE128_RATE, SHAKE256_RATE, Shake128, Shake256};
+#[cfg(any(test, feature = "sign"))]
+use crate::shake::SHAKE256_RATE;
+use crate::shake::{SHAKE128_RATE, Shake128, Shake256};
 
 /// `acc[i] += A[row][col][i] * rhs[i] * 2^-32` (Montgomery), with
 /// `A[row][col]` = RejNTTPoly(rho || col || row) of `ExpandA` (FIPS 204

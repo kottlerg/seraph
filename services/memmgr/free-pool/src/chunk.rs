@@ -748,7 +748,8 @@ fn child<S: SlotStore>(arena: &Arena<S>, dir: NodeIdx, pos: usize) -> NodeIdx
         | Node::Limit(_)
         | Node::Disk(_)
         | Node::Object(_)
-        | Node::ZeroFrame(_) => NODE_NULL,
+        | Node::ZeroFrame(_)
+        | Node::Reclaim(_) => NODE_NULL,
     }
 }
 
@@ -805,7 +806,8 @@ pub fn entry<S: SlotStore>(arena: &Arena<S>, root: NodeIdx, height: u32, index: 
             | Node::Limit(_)
             | Node::Disk(_)
             | Node::Object(_)
-            | Node::ZeroFrame(_),
+            | Node::ZeroFrame(_)
+            | Node::Reclaim(_),
         )
         | None => ChunkEntry::UNBACKED,
     }
@@ -943,7 +945,8 @@ pub fn release<S: SlotStore>(
             | Node::Limit(_)
             | Node::Disk(_)
             | Node::Object(_)
-            | Node::ZeroFrame(_) =>
+            | Node::ZeroFrame(_)
+            | Node::Reclaim(_) =>
             {
                 continue;
             }

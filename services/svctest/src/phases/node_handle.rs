@@ -100,7 +100,7 @@ fn node_handles_phase(_: &Caps)
 }
 
 /// Call `target` with `msg` and return memmgr's reply.
-fn call(target: u64, msg: &IpcMessage, what: &str) -> IpcMessage
+pub(super) fn call(target: u64, msg: &IpcMessage, what: &str) -> IpcMessage
 {
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
     unsafe { ipc::ipc_call(target, msg, std::os::seraph::current_ipc_buf()) }
@@ -109,7 +109,7 @@ fn call(target: u64, msg: &IpcMessage, what: &str) -> IpcMessage
 
 /// Call `target` with the label `label` and the words `words`, and assert
 /// memmgr replies `want`; the reply.
-fn expect(target: u64, label: u64, words: &[u64], want: u64, what: &str) -> IpcMessage
+pub(super) fn expect(target: u64, label: u64, words: &[u64], want: u64, what: &str) -> IpcMessage
 {
     let reply = call(
         target,
@@ -134,7 +134,7 @@ fn node_usage(handle: u64, what: &str) -> (u64, u64, u64)
 }
 
 /// The one cap of a reply that carries a node handle.
-fn handle_of(reply: &IpcMessage, what: &str) -> u64
+pub(super) fn handle_of(reply: &IpcMessage, what: &str) -> u64
 {
     match reply.caps()
     {
@@ -343,7 +343,7 @@ fn limit_on_set_max(node: u64)
 
 /// Release the sub-node handle `handle` (`what`, for the messages), check
 /// that it is refused from then on, and delete it.
-fn release_refused(handle: u64, what: &str)
+pub(super) fn release_refused(handle: u64, what: &str)
 {
     let reply = call(
         handle,
@@ -488,7 +488,7 @@ fn shared_at_max(shared: u64, node_a: u64, set_a: u64, set_b: u64)
 }
 
 /// A copy of the node handle `handle`, for a create to carry.
-fn handle_copy(handle: u64) -> u64
+pub(super) fn handle_copy(handle: u64) -> u64
 {
     syscall::cap_copy(handle, startup_info().self_cspace, syscall::RIGHTS_EP_SEND)
         .expect("copying a node handle")

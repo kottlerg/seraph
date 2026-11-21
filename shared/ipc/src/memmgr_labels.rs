@@ -74,15 +74,24 @@ pub const REGISTER_CHARGE_NODE: u64 = 1 << 4;
 pub const PHYS_CLASS_BADGE_BIT: u64 = 1 << 63;
 /// Badge bit of a node handle: a SEND on memmgr's endpoint badged with
 /// this bit and a random key, which names one budget node and is the
-/// authority to serve the node labels ([`NODE_SET_MAX`] to
-/// [`NODE_RELEASE`]) on it. No process badge carries it, so memmgr serves
-/// the node labels only on a badge carrying it and the other labels only
-/// on one without it, and refuses the rest with `UNAUTHORIZED`. Specified
-/// in `services/memmgr/docs/ipc-interface.md` § Node Handles.
+/// authority to serve the node labels ([`is_node_label`]) on it. No process
+/// badge carries it, so memmgr serves the node labels only on a badge
+/// carrying it and the other labels only on one without it, and refuses the
+/// rest with `UNAUTHORIZED`. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Node Handles.
 pub const NODE_HANDLE_TAG: u64 = 1 << 62;
 const _: () = core::assert!(
     NODE_HANDLE_TAG & crate::VERB_BIT_MASK != 0 && NODE_HANDLE_TAG != PHYS_CLASS_BADGE_BIT
 );
+/// Whether `opcode` is a node label, which memmgr serves only on a node
+/// handle ([`NODE_HANDLE_TAG`]): [`NODE_SET_MAX`] to [`NODE_RELEASE`], and
+/// [`NODE_SET_RECLAIM`]. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Badge Discipline.
+#[must_use]
+pub const fn is_node_label(opcode: u64) -> bool
+{
+    core::matches!(opcode, NODE_SET_MAX..=NODE_RELEASE | NODE_SET_RECLAIM)
+}
 /// Badge bit of the swap authority: a SEND on memmgr's endpoint badged with
 /// this bit alone, which init mints, is the authority to serve the swap
 /// labels ([`SWAP_REGISTER`] to [`SWAP_WANTED`]), the swap service's
@@ -391,7 +400,10 @@ pub const NODE_CREATE: u64 = 15;
 
 /// Read the usage of the handle's budget node, on a node handle. Reply
 /// (`SUCCESS`): as [`QUERY_MEMORY_USAGE`], `data[0]` its own pages,
-/// `data[1]` its max, `data[2]` its subtree's pages. Specified in
+/// `data[1]` its max, `data[2]` its subtree's pages; `data[3]` its floor
+/// and `data[4]` its weight ([`NODE_SET_RECLAIM`]), and `data[5]` its
+/// subtree's evictable resident pages, which the floor is held against.
+/// Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 16: `NODE_QUERY_USAGE`.
 pub const NODE_QUERY_USAGE: u64 = 16;
 
@@ -689,6 +701,26 @@ pub const CAPTURE_COUNT: u64 = 1;
 /// pages and does not copy.
 pub const CAPTURE_IMAGE: u64 = 1 << 1;
 
+/// Set the floor and the weight of the handle's budget node, on a node
+/// handle ([`NODE_HANDLE_TAG`]). `data[0]` is the floor in pages, 0 for
+/// none: eviction never takes the evictable resident pages of the node's
+/// subtree below it. `data[1]` is the weight, [`NODE_WEIGHT_MIN`] to
+/// [`NODE_WEIGHT_MAX`]: above its floor the subtree is reclaimed from in
+/// proportion to the pages it holds above the floor over its weight. Neither
+/// reserves a free page or changes admission. Reply (`SUCCESS`): `data[0]`
+/// the floor and `data[1]` the weight the node took. `INVALID_ARGUMENT` (no
+/// live handle state, or a weight out of range). Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 32: `NODE_SET_RECLAIM`.
+pub const NODE_SET_RECLAIM: u64 = 32;
+/// The least weight [`NODE_SET_RECLAIM`] takes: reclaimed from fastest.
+pub const NODE_WEIGHT_MIN: u32 = 1;
+/// The weight of a node none was set on.
+pub const NODE_WEIGHT_DEFAULT: u32 = 100;
+/// The greatest weight [`NODE_SET_RECLAIM`] takes: reclaimed from
+/// `NODE_WEIGHT_MAX` times slower than a node of [`NODE_WEIGHT_MIN`] holding
+/// as much above its floor.
+pub const NODE_WEIGHT_MAX: u32 = 10_000;
+
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or above the low threshold.
 pub const PRESSURE_NORMAL: u64 = 0;
@@ -706,3 +738,29 @@ pub const PRESSURE_CRITICAL: u64 = 2;
 /// `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS`. Bit position 0 within
 /// the flags half of `data[0]`.
 pub const REQUIRE_CONTIGUOUS: u32 = 1 << 0;
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn the_node_labels_are_node_set_max_to_node_release_and_node_set_reclaim()
+    {
+        for op in NODE_SET_MAX..=NODE_RELEASE
+        {
+            assert!(is_node_label(op), "label {op}");
+        }
+        assert!(is_node_label(NODE_SET_RECLAIM));
+        for op in [
+            NODE_SET_MAX - 1,
+            CREATE_SUB_NODE,
+            SWAP_REGISTER,
+            OBJECT_RELEASE,
+            NODE_SET_RECLAIM + 1,
+        ]
+        {
+            assert!(!is_node_label(op), "label {op}");
+        }
+    }
+}

@@ -68,6 +68,9 @@ syscall = { path = "../../shared/syscall" }
 # `PAGE_SIZE`: the argv/env refusal cell declares a header one byte past its
 # one-page cap, and the verified-read phase counts the copy's pages.
 syscall-abi = { path = "../../abi/syscall" }
+# `slot_of_key`: the sessiond_operator phase finds sessiond's line about a
+# session's end by the slot its key names.
+sessiond-table = { path = "../sessiond/table" }
 shmem = { path = "../../shared/shmem" }
 
 [lints]

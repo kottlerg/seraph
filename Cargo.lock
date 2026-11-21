@@ -892,6 +892,7 @@ dependencies = [
  "procmgr-process-table",
  "recv-pool",
  "restart-budget",
+ "sessiond-table",
  "shmem",
  "syscall",
  "syscall-abi",

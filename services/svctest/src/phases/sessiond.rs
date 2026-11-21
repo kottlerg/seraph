@@ -334,6 +334,9 @@ impl Session
 ///   relay gives status 0, and its key is no candidate after.
 /// - `STOP_CANDIDATE` of a second session's key ends it, and its relay
 ///   gives `EXIT_KILLED`.
+/// - A third session's leader ends from its stdin reader thread with an exit
+///   code after its main thread's own exit, and sessiond's line about the
+///   session's end words it by the status its relay gives.
 fn sessiond_phase(caps: &Caps)
 {
     let phase = "sessiond_operator";
@@ -348,10 +351,12 @@ fn sessiond_phase(caps: &Caps)
     cap_checks(operator, phase);
     session_life(operator, send, phase);
     session_stop(operator, send, phase);
+    leader_reason(caps, operator, phase);
     let _ = syscall::cap_delete(send);
     std::os::seraph::log!(
         "sessiond phase passed (gates; caps checked; a session ran, its job was stopped, its \
-         leader exited; a second session was stopped)"
+         leader exited; a second session was stopped; a leader's end was worded by its relay's \
+         status)"
     );
 }
 
@@ -516,6 +521,95 @@ fn session_life(operator: u64, send: u64, phase: &str)
         stop_labels::NO_CANDIDATE,
         "{phase}: STOP_CANDIDATE of the ended session replied {label:#x}"
     );
+}
+
+/// The exit code a third session's leader is ended with, from its stdin
+/// reader thread, after its main thread's own exit.
+const LEADER_EXIT_CODE: u32 = 45;
+
+/// The leader's name: sessiond's default leader, the shell.
+const LEADER_NAME: &[u8] = b"/programs/shell";
+
+/// How long the phase waits, at most, for sessiond's line about a session's
+/// end once the session's relay was posted.
+const END_LINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A leader whose main thread exits first (`SYS_THREAD_EXIT`, reason `0`)
+/// and whose other thread then ends the process with [`LEADER_EXIT_CODE`]
+/// (`thread_exits::end_two`): sessiond's line about the session's end words
+/// it by the reason the relay gives, `exited` for status 0 and `ended
+/// abnormally` otherwise, whichever of the two ends procmgr gives the
+/// process.
+fn leader_reason(caps: &Caps, operator: u64, phase: &str)
+{
+    use super::thread_exits::{End, First, end_two};
+    let authority = caps.debug_authority;
+    assert_ne!(authority, 0, "{phase}: no debug authority");
+    let before = super::crash::badges_named(authority, LEADER_NAME);
+    let mut session = Session::open(operator, phase);
+    session.send(&format!("echo {ECHO_MARKER}"), phase);
+    session.expect(ECHO_MARKER, phase);
+    let leader = super::crash::badges_named(authority, LEADER_NAME)
+        .into_iter()
+        .find(|badge| !before.contains(badge))
+        .unwrap_or_else(|| panic!("{phase}: the session's leader is not listed"));
+    let marker = format!(
+        "session {} ended: ",
+        sessiond_table::slot_of_key(session.key)
+    );
+    let ended_before = end_lines(caps.logd_query, &marker).len();
+    end_two(
+        authority,
+        leader,
+        End::Thread,
+        End::Process(LEADER_EXIT_CODE),
+        First::Main,
+        phase,
+    );
+    let status = session.wait(phase);
+    let want = if status.success()
+    {
+        "its leader exited"
+    }
+    else
+    {
+        assert_eq!(
+            status.code(),
+            Some(i32::try_from(LEADER_EXIT_CODE).unwrap_or(i32::MAX)),
+            "{phase}: the leader's relay gave {status}"
+        );
+        "its leader ended abnormally"
+    };
+    let start = std::time::Instant::now();
+    let line = loop
+    {
+        let lines = end_lines(caps.logd_query, &marker);
+        if lines.len() > ended_before
+            && let Some(newest) = lines.into_iter().next()
+        {
+            break newest;
+        }
+        assert!(
+            start.elapsed() < END_LINE_TIMEOUT,
+            "{phase}: sessiond logged no end of the session within {END_LINE_TIMEOUT:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(
+        line.contains(want),
+        "{phase}: sessiond logged {line:?} for a leader whose relay gave {status}"
+    );
+}
+
+/// The lines in logd's history, through `query`, that hold `marker`, newest
+/// first.
+fn end_lines(query: u64, marker: &str) -> Vec<String>
+{
+    super::procmgr::logd_history(query, None)
+        .into_iter()
+        .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
+        .filter(|line| line.contains(marker))
+        .collect()
 }
 
 /// A session stopped through the stop SEND: its relay gives `EXIT_KILLED`.

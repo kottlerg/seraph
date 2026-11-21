@@ -6,7 +6,7 @@
 //! Signature refusal test: each verifier of docs/signing.md refuses an object
 //! that does not verify, and the boot reports the refusal it is owed.
 //!
-//! The case boots the current sysroot six times, each from disk images
+//! The case boots the current sysroot eight times, each from disk images
 //! that carry objects no build makes, written in place of the sysroot's
 //! through [`crate::disk::create_disk_image_substituting`]:
 //!
@@ -14,6 +14,8 @@
 //!   it (`Failed(BodyHash)`).
 //! - `bundle`: the `/services/drivers/virtio-blk` entry of the bundle with a
 //!   body byte flipped; the bootloader refuses it (`Failed(BodyHash)`).
+//! - `policy-missing`: the bundle without its boot-time policy entry,
+//!   `/config/boot/policy.conf`; the bootloader refuses the bundle.
 //! - `revoked`: a bootloader built under the build's trust store with the
 //!   signing key revoked; it refuses the kernel (`Failed(Revoked)`).
 //! - `rootfs`: `/services/timed` with a body byte flipped, `/services/pwrmgr`
@@ -43,6 +45,9 @@
 //!   the service it names (`Failed(KeyUsage)`); svcmgr reports the file the
 //!   index names but the directory lacks, and the file it does not name; the
 //!   boot reaches the terminal's READY line.
+//! - `policy-key`: the `configuration` case's bootloader, and the bundle's
+//!   policy entry signed by the key its store trusts for every role but
+//!   configuration; the bootloader refuses it (`Failed(KeyUsage)`).
 //! - `index`: the indexes of `/config/svcmgr/services/` and
 //!   `/config/devmgr/classes/` each with a body byte flipped. procmgr refuses
 //!   both (`Failed(BodyHash)`), svcmgr reports that it read no recipe and
@@ -88,15 +93,24 @@ use crate::util::{require_tool, step};
 
 /// The terminal's line once it reads input. Kept in sync with
 /// `programs/terminal/src/main.rs`.
-const TERMINAL_READY: &str = "terminal: READY for injection";
+pub(super) const TERMINAL_READY: &str = "terminal: READY for injection";
 
 /// The prefix of the bootloader's fatal line (`core/boot/src/error.rs`).
 pub(super) const BOOT_FATAL: &str = "SERAPH BOOT FATAL: ";
 
 /// Text of every refusal line a verifier logs: the bootloader's and
 /// procmgr's (`services/procmgr/src/image.rs`), and svcmgr's and init's
-/// reports of a refused launch.
-const REFUSAL_MARKERS: [&str; 2] = ["signature verification refused", "signature did not verify"];
+/// reports of a refused launch; and of devmgr's refusals of DMA under a
+/// required confinement (`services/devmgr/src/bind.rs` and `iommu.rs`).
+const REFUSAL_MARKERS: [&str; 3] = [
+    "signature verification refused",
+    "signature did not verify",
+    DMA_REFUSED,
+];
+
+/// Text of devmgr's lines refusing a device's driver, and every driver,
+/// under the boot policy's required DMA confinement.
+pub(super) const DMA_REFUSED: &str = "the boot policy sets dma-confinement = required";
 
 /// Text of a line that ends a boot in failure: the fatal markers of
 /// `run --runs`'s default fail pattern. A test harness's own verdict is
@@ -115,7 +129,7 @@ const DEATH_MARKERS: [&str; 6] = [
 pub(super) const BOOTLOADER_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Budget for the boot that reaches the terminal.
-const ROOTFS_TIMEOUT: Duration = Duration::from_mins(6);
+pub(super) const ROOTFS_TIMEOUT: Duration = Duration::from_mins(6);
 
 /// The sysroot-relative paths of the objects the cases read or replace: the
 /// installed kernel, its ESP copy, the bundle on the ESP, and installed
@@ -139,6 +153,15 @@ const NO_TABLE: &str = "no platform description table for this machine; no platf
 
 /// The bundle entry the `bundle` case tampers with.
 const BUNDLE_ENTRY: &str = "/services/drivers/virtio-blk";
+
+/// The bundle's boot-time policy entry
+/// (`boot_protocol::bundle::POLICY_ENTRY_NAME`).
+pub(super) const POLICY: &str = "/config/boot/policy.conf";
+
+/// The bootloader's fatal line for a bundle without [`POLICY`]
+/// (`core/boot/src/error.rs` and `verify_bundle` in `core/boot/src/main.rs`).
+const POLICY_MISSING: &str = "SERAPH BOOT FATAL: bootstrap.bundle is malformed or missing: bundle \
+                              missing `/config/boot/policy.conf` entry";
 
 /// The configuration directories svcmgr reads through their indexes, and
 /// the files of them the `configuration` case replaces.
@@ -275,14 +298,128 @@ fn prepare(ctx: &Context, args: &CaseArgs, dir: &Path) -> Result<Vec<Case>>
         timeout: BOOTLOADER_TIMEOUT,
         answer: None,
     };
+    let policy_missing = Case {
+        name: "policy-missing",
+        substitutes: vec![sub(
+            BUNDLE,
+            bundle_with_policy(dir, "bootstrap.bundle.no-policy", &init_bundle, None)?,
+        )],
+        expect: vec![POLICY_MISSING.to_owned()],
+        timeout: BOOTLOADER_TIMEOUT,
+        answer: None,
+    };
+    let scoped = role_scoped(ctx, args, dir, &signer)?;
     Ok(vec![
         kernel_case,
         bundle_case,
+        policy_missing,
         revoked_case(ctx, args, dir, &signer)?,
         rootfs_case(ctx, args.arch, dir, &signer)?,
-        configuration_case(ctx, args, dir, &signer)?,
+        configuration_case(ctx, dir, &signer, &scoped)?,
+        policy_key_case(dir, &init_bundle, &scoped)?,
         index_case(ctx, dir)?,
     ])
+}
+
+/// A bootloader whose store trusts two keys beyond the build's, and those
+/// keys' signers.
+struct RoleScoped
+{
+    /// Trusted for every role but configuration.
+    others: Signer,
+    /// Trusted for configuration alone.
+    configuration: Signer,
+    /// The bootloader, as the substitute of both ESP copies of the
+    /// installed one.
+    bootloader: Vec<Substitute>,
+}
+
+/// Build the [`RoleScoped`] bootloader under the build's store, whose
+/// `signer` signs the store, in `dir`.
+fn role_scoped(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> Result<RoleScoped>
+{
+    let others = untrusted_signer(ctx, args.arch)?;
+    let configuration = untrusted_signer(ctx, args.arch)?;
+    let all_but: Vec<Role> = Role::ALL
+        .into_iter()
+        .filter(|&role| role != Role::Configuration)
+        .collect();
+    let store = signer.store_trusting(&[
+        (&others, RoleSet::of(&all_but)),
+        (&configuration, RoleSet::of(&[Role::Configuration])),
+    ])?;
+    step("signature test: building a bootloader under a store with role-scoped anchors");
+    let store = stage(dir, "trust-store.role-scoped", &store)?;
+    let bootloader = bootloader_under(ctx, args, &store, &dir.join("boot.efi.role-scoped"))?;
+    Ok(RoleScoped {
+        others,
+        configuration,
+        bootloader,
+    })
+}
+
+/// The `policy-key` case: the [`RoleScoped`] bootloader, and `bundle` with
+/// its policy entry signed in the configuration role by the key that
+/// bootloader's store trusts for every role but configuration.
+fn policy_key_case(dir: &Path, bundle: &[u8], scoped: &RoleScoped) -> Result<Case>
+{
+    let entries = crate::bundle::parse_entries(bundle)?;
+    let (_, policy) = entries
+        .iter()
+        .find(|(name, _)| name == POLICY)
+        .with_context(|| format!("the bundle holds no entry {POLICY}"))?;
+    let foreign = scoped.others.sign(
+        crate::signing::body_of(policy)?,
+        RoleSet::of(&[Role::Configuration]),
+        POLICY,
+    )?;
+    let mut substitutes = scoped.bootloader.clone();
+    substitutes.push(sub(
+        BUNDLE,
+        bundle_with_policy(dir, "bootstrap.bundle.policy-key", bundle, Some(&foreign))?,
+    ));
+    Ok(Case {
+        name: "policy-key",
+        substitutes,
+        expect: vec![boot_refusal(POLICY, "Failed(KeyUsage)")],
+        timeout: BOOTLOADER_TIMEOUT,
+        answer: None,
+    })
+}
+
+/// Write to `dir/name` the bundle `bundle` with its [`POLICY`] entry
+/// replaced by `policy`, or left out when `policy` is `None`, every other
+/// entry as it was; returns its path.
+///
+/// # Errors
+/// When `bundle` does not parse or holds no [`POLICY`] entry, or the
+/// write fails.
+pub(super) fn bundle_with_policy(
+    dir: &Path,
+    name: &str,
+    bundle: &[u8],
+    policy: Option<&[u8]>,
+) -> Result<PathBuf>
+{
+    let entries = crate::bundle::parse_entries(bundle)?;
+    ensure!(
+        entries.iter().any(|(entry, _)| entry == POLICY),
+        "the bundle holds no entry {POLICY}"
+    );
+    let kept: Vec<(String, Vec<u8>)> = entries
+        .into_iter()
+        .filter_map(|(entry, body)| {
+            if entry != POLICY
+            {
+                return Some((entry, body.to_vec()));
+            }
+            policy.map(|policy| (entry, policy.to_vec()))
+        })
+        .collect();
+    let count = u32::try_from(kept.len()).context("entry count past u32")?;
+    let path = dir.join(name);
+    crate::bundle::write_bundle(&path, count, &kept)?;
+    Ok(path)
 }
 
 /// The `revoked` case: a bootloader built under the build's store with
@@ -348,22 +485,20 @@ pub(super) fn bootloader_under(
 /// refused; a recipe signed by `signer` over a body other than the one the
 /// index holds, refused; and the services directory's index, signed by
 /// `signer`, naming a file the directory lacks and omitting one it holds.
-fn configuration_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> Result<Case>
+fn configuration_case(
+    ctx: &Context,
+    dir: &Path,
+    signer: &Signer,
+    scoped: &RoleScoped,
+) -> Result<Case>
 {
-    let others = untrusted_signer(ctx, args.arch)?;
-    let configuration = untrusted_signer(ctx, args.arch)?;
+    let RoleScoped {
+        others,
+        configuration,
+        bootloader,
+    } = scoped;
     let config_only = RoleSet::of(&[Role::Configuration]);
-    let all_but: Vec<Role> = Role::ALL
-        .into_iter()
-        .filter(|&role| role != Role::Configuration)
-        .collect();
-    let store = signer.store_trusting(&[
-        (&others, RoleSet::of(&all_but)),
-        (&configuration, config_only),
-    ])?;
-    step("signature test: building a bootloader under a store with role-scoped anchors");
-    let store = stage(dir, "trust-store.role-scoped", &store)?;
-    let mut substitutes = bootloader_under(ctx, args, &store, &dir.join("boot.efi.role-scoped"))?;
+    let mut substitutes = bootloader.clone();
 
     let config_path = |tree: &str, file: &str| format!("{tree}/{file}");
     let resign = |by: &Signer, relative: &str, roles: RoleSet| -> Result<Vec<u8>> {
@@ -414,16 +549,16 @@ fn configuration_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signe
         (&unsigned, unsigned_body),
         (
             &not_configuration,
-            resign(&others, &not_configuration, config_only)?,
+            resign(others, &not_configuration, config_only)?,
         ),
         (
             &by_configuration,
-            resign(&configuration, &by_configuration, config_only)?,
+            resign(configuration, &by_configuration, config_only)?,
         ),
         (
             &SERVICE_CONFIGURATION_KEY.to_owned(),
             resign(
-                &configuration,
+                configuration,
                 SERVICE_CONFIGURATION_KEY,
                 RoleSet::of(&[Role::Service]),
             )?,
@@ -804,6 +939,34 @@ pub(super) fn boot_case(
     vars: &Path,
 ) -> Result<()>
 {
+    boot_case_on(
+        ctx,
+        args,
+        layout,
+        dir,
+        case,
+        firmware,
+        vars,
+        Iommu::Attached,
+    )
+}
+
+/// [`boot_case`] on a machine with the IOMMU `iommu`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "boot_case's arguments and the machine's IOMMU, each a separate input of the launch"
+)]
+pub(super) fn boot_case_on(
+    ctx: &Context,
+    args: &CaseArgs,
+    layout: DiskLayout,
+    dir: &Path,
+    case: &Case,
+    firmware: &Firmware,
+    vars: &Path,
+    iommu: Iommu,
+) -> Result<()>
+{
     crate::disk::create_disk_image_substituting(
         ctx,
         args.arch,
@@ -822,7 +985,7 @@ pub(super) fn boot_case(
     {
         Stdio::null()
     };
-    let mut child = launch(ctx, args, layout, firmware, vars, input)?;
+    let mut child = launch(ctx, args, layout, firmware, vars, input, iommu)?;
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     // The serial console's input, held open until QEMU is killed: the judge
     // writes the answer once the prompt appears.
@@ -917,8 +1080,9 @@ fn judge_serial(
     }
 }
 
-/// Start QEMU on the images of `layout`, `firmware` and the variable store
-/// `vars`, its serial stream on its stdout and its serial input `input`.
+/// Start QEMU on the images of `layout`, `firmware`, the variable store
+/// `vars` and the IOMMU `iommu`, its serial stream on its stdout and its
+/// serial input `input`.
 fn launch(
     ctx: &Context,
     args: &CaseArgs,
@@ -926,6 +1090,7 @@ fn launch(
     firmware: &Firmware,
     vars: &Path,
     input: Stdio,
+    iommu: Iommu,
 ) -> Result<std::process::Child>
 {
     let disk_path = ctx.disk_image();
@@ -953,7 +1118,7 @@ fn launch(
         riscv_zkr: RiscvZkr::On,
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
-        iommu: Iommu::Attached,
+        iommu,
         debug_port: None,
         test_devices: false,
         hotplug_port: None,
@@ -1116,5 +1281,60 @@ mod tests
         assert_eq!(tampered[..start], bundle[..start]);
         assert_eq!(tampered[end..], bundle[end..]);
         flip_bundle_entry(&bundle, "absent").unwrap_err();
+    }
+
+    // Defect caught: the case's policy name drifting from the one the
+    // bootloader requires, so `policy-missing` drops another entry and
+    // `policy-key` signs one the bootloader does not check as the policy.
+    #[test]
+    fn the_policy_name_is_the_bootloader_s()
+    {
+        assert_eq!(POLICY.as_bytes(), boot_protocol::bundle::POLICY_ENTRY_NAME);
+        assert!(POLICY_MISSING.starts_with(BOOT_FATAL));
+        assert!(POLICY_MISSING.ends_with(&format!("bundle missing `{POLICY}` entry")));
+    }
+
+    // Defect caught: a rewritten bundle that loses, reorders or alters an
+    // entry other than the policy, or keeps the policy it was told to drop.
+    #[test]
+    fn a_bundle_with_another_policy_changes_that_entry_alone()
+    {
+        let root = crate::signing::testing::scratch("test-signing-policy");
+        fs::create_dir_all(&root).unwrap();
+        let entries = vec![
+            ("init".to_owned(), signed(b"\x7fELF init")),
+            (
+                POLICY.to_owned(),
+                signed(b"dma-confinement = opportunistic\n"),
+            ),
+            (BUNDLE_ENTRY.to_owned(), signed(b"\x7fELF blk")),
+        ];
+        let path = root.join("bundle");
+        crate::bundle::write_bundle(&path, 3, &entries).unwrap();
+        let bundle = fs::read(&path).unwrap();
+        let owned = |bytes: &[u8]| -> Vec<(String, Vec<u8>)> {
+            crate::bundle::parse_entries(bytes)
+                .unwrap()
+                .into_iter()
+                .map(|(name, body)| (name, body.to_vec()))
+                .collect()
+        };
+
+        let dropped =
+            fs::read(bundle_with_policy(&root, "dropped", &bundle, None).unwrap()).unwrap();
+        let mut without = entries.clone();
+        without.remove(1);
+        assert_eq!(owned(&dropped), without);
+
+        let other = signed(b"dma-confinement = required\n");
+        let replaced =
+            fs::read(bundle_with_policy(&root, "replaced", &bundle, Some(&other)).unwrap())
+                .unwrap();
+        let mut with = entries.clone();
+        with[1].1.clone_from(&other);
+        assert_eq!(owned(&replaced), with);
+
+        bundle_with_policy(&root, "none", &dropped, None).unwrap_err();
+        let _ = fs::remove_dir_all(&root);
     }
 }

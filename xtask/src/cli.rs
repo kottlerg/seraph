@@ -985,9 +985,14 @@ value_enum! {
         /// `nokaslr` knob gives the deterministic one.
         Kaslr,
         /// Each signature verifier refuses a tampered kernel, a tampered bundle
-        /// entry, a revoked key, and tampered, wrong-role and foreign-signed
-        /// rootfs images.
+        /// entry, a bundle without its boot-time policy or with one signed by a
+        /// key not trusted for configuration, a revoked key, and tampered,
+        /// wrong-role and foreign-signed rootfs images.
         Signing,
+        /// With the boot policy requiring DMA confinement, devmgr gives no
+        /// driver to a device no IOMMU unit confines, and the boot set runs
+        /// behind the IOMMU.
+        DmaConfinement,
         /// The bootloader writes the machine's security floor in firmware
         /// storage, raises it, and refuses itself below it.
         Rollback,

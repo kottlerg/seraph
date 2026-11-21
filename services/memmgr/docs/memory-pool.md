@@ -104,11 +104,12 @@ unable to grow.
 
 ## Allocation
 
-`REQUEST_MEMORY_CAPS(want_pages, flags)` first admits `want_pages` against the caller's budget node
-(§ Distribution policy): a request over the max of the node or of an ancestor fails `LIMIT`, and one
-that would leave fewer free pages outside `promised` ([Commit](#commit)) than the growth floor (the
-system reserve and, while chunks are swapped, the restore headroom; § Distribution policy), from a
-caller outside the reserve, or than none, fails with the out-of-memory code of its flags, before any
+`REQUEST_MEMORY_CAPS(want_pages, flags)` first admits `want_pages` against the budget node the grant
+is charged to, the caller's own or, with `REQUEST_CHARGE_NODE`, the handle's (§ Distribution
+policy): a request over the max of the node or of an ancestor fails `LIMIT`, and one that would
+leave fewer free pages outside `promised` ([Commit](#commit)) than the growth floor (the system
+reserve and, while chunks are swapped, the restore headroom; § Distribution policy), charged to a
+node outside the reserve, or than none, fails with the out-of-memory code of its flags, before any
 run leaves the pool. An admitted request then selects:
 
 1. **`REQUIRE_CONTIGUOUS` set.** Select the smallest run that covers
@@ -625,8 +626,8 @@ the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process
 5. Return every chunk-table node, every region node, the commitment node of
    each committed region, the record's own node, and its caps node to the
    arena free list, and drop the record's reference
-   to its budget node, which is freed with it unless a deferred run or a
-   memory object's frames are still charged to it.
+   to its budget node, which is freed with it unless a deferred run, a grant
+   another process holds or a memory object's frames are still charged to it.
 6. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
 
@@ -1510,9 +1511,9 @@ and the slot map's pages are memmgr's metadata.
 
 | Failure | Cause | Caller observation |
 |---|---|---|
-| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take a page `promised` holds, or the growth floor from a caller outside the system reserve | Reply with error label; caller may retry without the flag, or fail |
-| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant, or a committed registration or growth, would take a page `promised` holds, or the growth floor from a caller outside the system reserve ([Commit](#commit)) | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `LIMIT` | `want_pages`, or a committed registration's or growth's charge, would take the subtree of the caller's budget node, or of an ancestor, over its max | Reply with error label; caller treats as its own budget refusing, not as RAM exhaustion |
+| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take a page `promised` holds, or the growth floor by a charge to a node outside the system reserve | Reply with error label; caller may retry without the flag, or fail |
+| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant, or a committed registration or growth, would take a page `promised` holds, or the growth floor by a charge to a node outside the system reserve ([Commit](#commit)) | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `LIMIT` | `want_pages`, or a committed registration's or growth's charge, would take the subtree of the budget node it is charged to (the caller's own, or with `REQUEST_CHARGE_NODE` the handle's), or of an ancestor, over its max | Reply with error label; caller treats as that node's budget refusing, not as RAM exhaustion |
 | `QUOTA` | Tracking-metadata arena could not grow, or a selected run could not be mapped to zero it ([Frame contents](#frame-contents)); either means system RAM exhausted | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `TOO_MANY_PROCESSES` | A process record, its caps node or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 

@@ -296,8 +296,8 @@ charge. The charge stays on the node when the node's handle state goes
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies, or the grant would take the growth floor from a caller outside the system reserve |
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, the grant would take the growth floor from a caller outside the system reserve, or deriving the caller's copy failed |
+| 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies, or the grant, charged to a node outside the system reserve, would take the growth floor |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, the grant, charged to a node outside the system reserve, would take the growth floor, or deriving the caller's copy failed |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), memmgr could not map a selected run to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or the caller's region-id sequence is spent (unreachable: 2^64 − 1 grants) |
 | 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, badge unknown, or, with `REQUEST_CHARGE_NODE`, `cap[0]` missing, not a node handle, or naming no handle state |
 | 8 | `LIMIT` | `want_pages` would take the subtree of the node the grant is charged to, or of an ancestor, over its max |

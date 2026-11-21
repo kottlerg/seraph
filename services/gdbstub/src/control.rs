@@ -10,6 +10,10 @@
 //! and what a resume packet asks of which thread
 //! (`services/gdbstub/README.md` § Stop Model).
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 use gdb_rsp::command::{Resume, ThreadId, VContAction};
 
 /// The tag of a target thread's binding badge: procmgr's debugger tag
@@ -257,8 +261,18 @@ pub fn rewound_pc(
     breakpoint_at(at).then_some(at)
 }
 
-/// What a resume packet asks.
+/// One held thread a continue resumes, and the signal passed to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Release
+{
+    /// The thread, by table index.
+    pub thread: usize,
+    /// The signal, when one is passed (nonzero).
+    pub signal: Option<u8>,
+}
+
+/// What a resume packet asks.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Plan
 {
     /// Run thread `thread` one instruction, the others held.
@@ -267,72 +281,123 @@ pub enum Plan
         /// The thread to step, by table index.
         thread: usize,
     },
-    /// Resume every held thread, passing `signal` to thread `thread`.
+    /// Resume the threads `releases` names, each passed its signal; every
+    /// other thread stays held.
     Continue
     {
-        /// The thread the signal is for, by table index.
+        /// The thread the packet's first action names, whose pointer the
+        /// address of a `c` or `C` packet sets.
         thread: usize,
-        /// The signal, when one is passed (nonzero).
-        signal: Option<u8>,
+        /// The threads to resume, in table order; never empty.
+        releases: Vec<Release>,
     },
     /// Nothing to run: no action names a live thread.
     Nothing,
 }
 
-/// The plan of a `c` or `C` packet on the current thread `current`, passing
-/// `signal` (none when it is zero).
+/// The `vCont` actions a `c`, `C`, `s` or `S` packet stands for:
+/// `resume`, passing `signal`, on `selected`, the thread `Hc` selected
+/// by table index, alone; or, when `Hc` selected every thread (`None`), on
+/// the current thread, with a continue of every other thread. GDB selects a
+/// thread with `Hc` before such a packet to resume it alone.
 #[must_use]
-pub fn plan_continue(signal: Option<u8>, current: usize) -> Plan
+pub fn packet_actions(
+    resume: Resume,
+    signal: Option<u8>,
+    selected: Option<usize>,
+) -> Vec<VContAction>
 {
-    Plan::Continue {
-        thread: current,
-        signal: signal.filter(|&s| s != 0),
-    }
-}
-
-/// The plan of an `s` or `S` packet on the current thread `current`, passing
-/// `signal`. A step that passes a signal is a continue passing it
-/// ([`plan_continue`]): delivering the signal declines the thread's fault,
-/// which then takes its outcome with no handler bound, so the thread runs no
-/// single instruction to stop after.
-#[must_use]
-pub fn plan_step(signal: Option<u8>, current: usize) -> Plan
-{
-    match signal.filter(|&s| s != 0)
+    let thread = selected.map_or(ThreadId::Any, |i| {
+        ThreadId::Id((i as u64).saturating_add(1))
+    });
+    let own = VContAction {
+        resume,
+        signal,
+        thread: Some(thread),
+    };
+    match selected
     {
-        None => Plan::Step { thread: current },
-        Some(_) => plan_continue(signal, current),
+        Some(_) => Vec::from([own]),
+        None => Vec::from([
+            own,
+            VContAction {
+                resume: Resume::Continue,
+                signal: None,
+                thread: None,
+            },
+        ]),
     }
 }
 
-/// The plan of a `vCont` packet's `actions`, with `select` mapping a thread
-/// id to a live thread's table index and `current` the thread "any" and
-/// "all" name. The first step action plans a step of its thread, the others
-/// held; otherwise the first continue action resumes every held thread,
-/// passing its signal to the thread it names. A step action that passes a
-/// signal is a continue, as in [`plan_step`]; a stop action asks nothing.
+/// The plan of a `vCont` packet's `actions` over the live threads `live`,
+/// by table index, with `select` mapping a thread id to a live thread's
+/// index and `current` the thread "any" names.
+///
+/// Each thread takes the leftmost action that names it, an action with no
+/// thread id or with "all" naming every thread, and a thread no action
+/// names stays held, as the remote protocol has it. When a thread's action
+/// is a step, that thread alone is stepped, the current one when its action
+/// is a step, and every other thread stays held, those a continue action
+/// names among them: the riscv64 step plants a breakpoint any thread could
+/// take (`services/gdbstub/README.md` § Stop Model, Single-step), and GDB's
+/// own software step resumes only the stepped thread for the same reason.
+/// Otherwise every thread whose action is a continue is resumed with the
+/// action's signal. A step action that passes a signal is a continue
+/// passing it: delivering the signal declines the thread's fault, which
+/// then takes its outcome with no handler bound, so the thread runs no
+/// single instruction to stop after. A stop action asks nothing.
 #[must_use]
 pub fn plan_vcont(
-    actions: impl Iterator<Item = VContAction> + Clone,
+    mut actions: impl Iterator<Item = VContAction> + Clone,
     current: usize,
+    live: impl Iterator<Item = usize>,
     select: impl Fn(ThreadId) -> Option<usize>,
 ) -> Plan
 {
-    let index = |a: &VContAction| a.thread.map_or(Some(current), &select);
-    let step = actions
-        .clone()
-        .filter(|a| a.resume == Resume::Step)
-        .find_map(|a| index(&a).map(|i| (i, a.signal)));
-    if let Some((thread, signal)) = step
+    let names = |a: &VContAction, i: usize| match a.thread
     {
-        return plan_step(signal, thread);
+        None | Some(ThreadId::All) => true,
+        Some(ThreadId::Any) => i == current,
+        Some(t @ ThreadId::Id(_)) => select(t) == Some(i),
+    };
+    let mut step = None;
+    let mut releases = Vec::new();
+    for i in live
+    {
+        let Some(a) = actions.clone().find(|a| names(a, i))
+        else
+        {
+            continue;
+        };
+        let signal = a.signal.filter(|&s| s != 0);
+        match (a.resume, signal)
+        {
+            (Resume::Step, None) =>
+            {
+                if step.is_none() || i == current
+                {
+                    step = Some(i);
+                }
+            }
+            (Resume::Step | Resume::Continue, _) => releases.push(Release { thread: i, signal }),
+            (Resume::Stop, _) =>
+            {}
+        }
     }
-    actions
-        .filter(|a| a.resume == Resume::Continue)
-        .find_map(|a| index(&a).map(|i| (i, a.signal)))
-        .map_or(Plan::Nothing, |(thread, signal)| {
-            plan_continue(signal, thread)
-        })
+    if let Some(thread) = step
+    {
+        return Plan::Step { thread };
+    }
+    let Some(first) = releases.first().map(|r| r.thread)
+    else
+    {
+        return Plan::Nothing;
+    };
+    let thread = actions
+        .next()
+        .and_then(|a| releases.iter().map(|r| r.thread).find(|&i| names(&a, i)))
+        .unwrap_or(first);
+    Plan::Continue { thread, releases }
 }
 
 #[cfg(test)]
@@ -503,18 +568,37 @@ mod tests
         }
     }
 
+    /// Thread ids 1 to 3 name the live slots 0 to 2; "any" and "all" name
+    /// the current slot, 0.
+    fn select(t: ThreadId) -> Option<usize>
+    {
+        match t
+        {
+            ThreadId::Id(id) if (1..=3).contains(&id) => usize::try_from(id - 1).ok(),
+            ThreadId::Id(_) => None,
+            ThreadId::Any | ThreadId::All => Some(0),
+        }
+    }
+
+    fn plan(actions: &[VContAction]) -> Plan
+    {
+        plan_vcont(actions.iter().copied(), 0, 0..3, select)
+    }
+
+    fn releases(threads: &[(usize, Option<u8>)]) -> Vec<Release>
+    {
+        threads
+            .iter()
+            .map(|&(thread, signal)| Release { thread, signal })
+            .collect()
+    }
+
     // Defect caught: a vCont signal passed to the current thread whatever
     // thread the action names, and a step's signal dropped.
     #[test]
     fn a_resume_plan_follows_the_action_s_thread_and_signal()
     {
-        let select = |t| match t
-        {
-            ThreadId::Id(id) if (1..=3).contains(&id) => usize::try_from(id - 1).ok(),
-            ThreadId::Id(_) => None,
-            ThreadId::Any | ThreadId::All => Some(0),
-        };
-        let one = |a: VContAction| plan_vcont([a].into_iter(), 0, select);
+        let one = |a: VContAction| plan(&[a]);
         assert_eq!(
             one(action(Resume::Step, None, Some(ThreadId::Id(2)))),
             Plan::Step { thread: 1 }
@@ -523,42 +607,164 @@ mod tests
             one(action(Resume::Continue, Some(11), Some(ThreadId::Id(3)))),
             Plan::Continue {
                 thread: 2,
-                signal: Some(11)
+                releases: releases(&[(2, Some(11))])
             }
         );
         assert_eq!(
             one(action(Resume::Step, Some(11), Some(ThreadId::Id(2)))),
             Plan::Continue {
                 thread: 1,
-                signal: Some(11)
+                releases: releases(&[(1, Some(11))])
             }
         );
         assert_eq!(
             one(action(Resume::Continue, None, Some(ThreadId::Id(9)))),
             Plan::Nothing
         );
-        // A step action outranks a continue action before it.
-        let both = [
-            action(Resume::Continue, None, None),
-            action(Resume::Step, None, Some(ThreadId::Id(3))),
-        ];
         assert_eq!(
-            plan_vcont(both.into_iter(), 0, select),
+            one(action(Resume::Stop, None, Some(ThreadId::Id(2)))),
+            Plan::Nothing
+        );
+        assert_eq!(
+            plan(&[
+                action(Resume::Continue, Some(0), Some(ThreadId::Id(2))),
+                action(Resume::Continue, None, None)
+            ]),
+            Plan::Continue {
+                thread: 1,
+                releases: releases(&[(0, None), (1, None), (2, None)])
+            },
+            "a zero signal passes none"
+        );
+    }
+
+    // Defect caught: a continue of one thread resumed every held thread, so
+    // GDB, which had resumed one thread to step it over a breakpoint in
+    // software, was told of another thread's stop (#1426).
+    #[test]
+    fn a_continue_resumes_only_the_threads_its_actions_name()
+    {
+        assert_eq!(
+            plan(&[action(Resume::Continue, None, Some(ThreadId::Id(2)))]),
+            Plan::Continue {
+                thread: 1,
+                releases: releases(&[(1, None)])
+            }
+        );
+        assert_eq!(
+            plan(&[
+                action(Resume::Continue, None, Some(ThreadId::Id(1))),
+                action(Resume::Continue, Some(9), Some(ThreadId::Id(3)))
+            ]),
+            Plan::Continue {
+                thread: 0,
+                releases: releases(&[(0, None), (2, Some(9))])
+            }
+        );
+        // A default action covers the threads no earlier action names.
+        assert_eq!(
+            plan(&[
+                action(Resume::Continue, Some(11), Some(ThreadId::Id(2))),
+                action(Resume::Continue, None, None)
+            ]),
+            Plan::Continue {
+                thread: 1,
+                releases: releases(&[(0, None), (1, Some(11)), (2, None)])
+            }
+        );
+        // "all" names every thread; "any" the current one.
+        assert_eq!(
+            plan(&[action(Resume::Continue, None, Some(ThreadId::All))]),
+            Plan::Continue {
+                thread: 0,
+                releases: releases(&[(0, None), (1, None), (2, None)])
+            }
+        );
+        assert_eq!(
+            plan(&[action(Resume::Continue, None, Some(ThreadId::Any))]),
+            Plan::Continue {
+                thread: 0,
+                releases: releases(&[(0, None)])
+            }
+        );
+        // A stop action leaves its thread held beside a default continue.
+        assert_eq!(
+            plan(&[
+                action(Resume::Stop, None, Some(ThreadId::Id(1))),
+                action(Resume::Continue, None, None)
+            ]),
+            Plan::Continue {
+                thread: 1,
+                releases: releases(&[(1, None), (2, None)])
+            }
+        );
+    }
+
+    // Defect caught: a step action after a default continue stepped its
+    // thread, though the leftmost action naming a thread is the one it
+    // takes; and a step beside a default continue resumed the others, which
+    // can take the riscv64 step's planted breakpoint.
+    #[test]
+    fn each_thread_takes_its_leftmost_action_and_a_step_runs_alone()
+    {
+        assert_eq!(
+            plan(&[
+                action(Resume::Continue, None, None),
+                action(Resume::Step, None, Some(ThreadId::Id(3)))
+            ]),
+            Plan::Continue {
+                thread: 0,
+                releases: releases(&[(0, None), (1, None), (2, None)])
+            }
+        );
+        assert_eq!(
+            plan(&[
+                action(Resume::Step, None, Some(ThreadId::Id(3))),
+                action(Resume::Continue, None, None)
+            ]),
+            Plan::Step { thread: 2 }
+        );
+        // Several threads to step: the current one is.
+        assert_eq!(
+            plan(&[action(Resume::Step, None, None)]),
+            Plan::Step { thread: 0 }
+        );
+    }
+
+    // Defect caught: a `c` or `s` packet resumed every thread after GDB
+    // selected one with `Hc` to resume it alone, or acted on the thread
+    // `Hg` selected in its place.
+    #[test]
+    fn a_c_or_s_packet_resumes_the_thread_hc_selected_alone()
+    {
+        let packet = |resume, signal, selected| {
+            let actions = packet_actions(resume, signal, selected);
+            plan_vcont(actions.iter().copied(), 0, 0..3, select)
+        };
+        assert_eq!(
+            packet(Resume::Continue, None, Some(1)),
+            Plan::Continue {
+                thread: 1,
+                releases: releases(&[(1, None)])
+            }
+        );
+        assert_eq!(
+            packet(Resume::Step, None, Some(2)),
             Plan::Step { thread: 2 }
         );
         assert_eq!(
-            plan_continue(Some(0), 4),
+            packet(Resume::Continue, Some(11), None),
             Plan::Continue {
-                thread: 4,
-                signal: None
+                thread: 0,
+                releases: releases(&[(0, Some(11)), (1, None), (2, None)])
             }
         );
-        assert_eq!(plan_step(Some(0), 4), Plan::Step { thread: 4 });
+        assert_eq!(packet(Resume::Step, None, None), Plan::Step { thread: 0 });
         assert_eq!(
-            plan_step(Some(5), 4),
+            packet(Resume::Step, Some(5), None),
             Plan::Continue {
-                thread: 4,
-                signal: Some(5)
+                thread: 0,
+                releases: releases(&[(0, Some(5)), (1, None), (2, None)])
             }
         );
     }

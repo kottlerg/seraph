@@ -2098,8 +2098,8 @@ themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypt
 `compare-images` and `test` without a case or a cell (the unit tests) as builds
 (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`, and `test` with a case
 or a cell as boots, each boot admitted as above (the `shutdown` case admits once for its boots,
-which it runs one at a time). The `signing` case, which compiles its revoking bootloader before it
-boots, is admitted as a build for that compile and then each boot as a boot.
+which it runs one at a time). The `signing` case, which compiles its revoking and role-scoped
+bootloaders before it boots, is admitted as a build for each compile and then each boot as a boot.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

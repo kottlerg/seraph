@@ -23,7 +23,7 @@ bootloader runs on, memory map acquisition, `ExitBootServices`, and error handli
 | `EFI_RNG_PROTOCOL` | `LocateProtocol` | Draw the 32-byte entropy-pool seed and an independent 16-byte KASLR draw (two words; step 5c) | No |
 | `EFI_RISCV_BOOT_PROTOCOL` | `LocateProtocol` | Read the boot hart ID (RISC-V only; 0 when absent) | No |
 | All handles | `LocateHandleBuffer(AllHandles)` + `ConnectController` | Bind drivers (e.g. virtio-gpu to GOP) not auto-connected during BDS, before the GOP query | No |
-| Variable services | `RuntimeServices->GetVariable` / `SetVariable` | Read and raise the machine's security floor (§ Variable Services) | No |
+| Variable services | `RuntimeServices->GetVariable` / `SetVariable` | Read the firmware's Secure Boot state; read and raise the machine's security floor (§ Variable Services) | No |
 
 `EFI_GRAPHICS_OUTPUT_PROTOCOL` is optional — its absence is handled gracefully by
 zeroing the `framebuffer.physical_base` field in `BootInfo`. A headless system or a

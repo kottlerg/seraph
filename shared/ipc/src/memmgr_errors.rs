@@ -27,8 +27,9 @@ pub const QUOTA: u64 = 3;
 /// or a bad region on `REGISTER_REGION`).
 pub const INVALID_ARGUMENT: u64 = 4;
 /// Procmgr-only label called over a non-procmgr badge, a node label
-/// called over a badge that is no node handle, or another label called
-/// over a node handle.
+/// called over a badge that is no node handle, a node label other than
+/// `NODE_QUERY_USAGE` and `NODE_CHARGE_HANDLE` called over a charge-only
+/// node handle, or another label called over a node handle.
 pub const UNAUTHORIZED: u64 = 5;
 /// `REGISTER_PROCESS` could not complete: the tracking table could not
 /// take a new entry, the badge draw failed, or the reply cap could not

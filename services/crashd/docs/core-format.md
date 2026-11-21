@@ -157,8 +157,12 @@ gdb <binary> <core>
 
 The binary is the symbols-store file of the build id of the image at the path the core's `pr_psargs`
 names (`symbols/manifest` lists `/programs/crashme <file>`); on riscv64, a `gdb` built for x86-64
-hosts needs `set architecture riscv:rv64` before it loads the binary. `gdb` lists every recorded
-thread, the faulting one current, and its stack, registers and floating-point and vector state.
+hosts needs `set architecture riscv:rv64` before it loads the binary. The store file has the
+installed image's program headers, which a crash core's copy of the image's first page holds at
+the auxiliary vector's `AT_PHDR`, so `gdb` relocates it by `AT_ENTRY`
+([build-system.md](../../../docs/build-system.md#symbols-store) § Symbols Store). `gdb` lists
+every recorded thread, the faulting one current, and its stack, registers and floating-point and
+vector state.
 
 The code is `services/crashd/core-file`, host-tested: the notes, the layout and the budget's
 choice of runs, the policy, the directory's names and eviction, and the decoding of a snapshot's

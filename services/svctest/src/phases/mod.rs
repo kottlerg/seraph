@@ -65,6 +65,8 @@ use crate::runner::Phase;
 
 pub mod acpi;
 pub mod budget;
+pub mod charge_node;
+pub mod checkpoint;
 pub mod crash;
 pub mod devmgr;
 pub mod discard;
@@ -137,12 +139,14 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(pager::phases());
     out.extend_from_slice(budget::phases());
     out.extend_from_slice(node_handle::phases());
+    out.extend_from_slice(charge_node::phases());
     out.extend_from_slice(heap_commit::phases());
     out.extend_from_slice(discard::phases());
     out.extend_from_slice(memory_objects::phases());
     out.extend_from_slice(memory_object_text::phases());
     out.extend_from_slice(image_sharing::phases());
     out.extend_from_slice(snapshot::phases());
+    out.extend_from_slice(checkpoint::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());

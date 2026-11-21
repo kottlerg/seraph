@@ -1043,6 +1043,39 @@ pub const MAKE_PRIVATE: u64 = 32;
 /// `SNAPSHOT`.
 pub const SNAPSHOT: u64 = 33;
 
+/// Enter or end the sender's quiesce point, where it consents to a
+/// checkpoint it can be restored from (docs/checkpoint-restore.md § Quiesce
+/// point). Served on the process's own procmgr cap alone. With `data[0]`
+/// nonzero, the restore stack pointer, and `caps[0]` a Notify-only
+/// Notification, procmgr records the point with both, and signals the
+/// Notification once a complete checkpoint of the point has been delivered
+/// to its controller ([`CHECKPOINT`]). With `data[0]` zero and no cap, it
+/// ends the point, if any, and deletes its Notification. Replies `SUCCESS`;
+/// `NOT_RESTORABLE` when the sender was created pinned, phys-class or with a
+/// DMA hold; `INVALID_ARGUMENT` for a stack pointer without a cap, a cap
+/// without a stack pointer, or a point entered while one is recorded;
+/// `INVALID_BADGE` when the badge names no live process or carries
+/// [`PROCESS_HANDLE_TAG`]. Specified in `services/procmgr/docs/ipc-interface.md`
+/// § Label 34: `QUIESCE`.
+pub const QUIESCE: u64 = 34;
+
+/// Capture a process at its quiesce point ([`QUIESCE`]) for its
+/// controller, as [`SNAPSHOT`] captures, with the process's consent in
+/// place of [`DEBUG_AUTHORITY`]. Served on a process handle alone, the
+/// handle naming the target. `caps[0]` is the account, a memmgr SEND the
+/// sender presents. Under the hold procmgr checks that the point it found is
+/// still recorded. The layout carries `crate::procmgr_snapshot::SNAPSHOT_CHECKPOINT`
+/// and a `crate::procmgr_snapshot::Checkpoint` section. Replies as
+/// [`SNAPSHOT`] does, and then signals the process's Notification when the
+/// capture is complete and the reply was delivered; `UNAUTHORIZED` on a cap
+/// other than a process handle; `INVALID_ARGUMENT` without `caps[0]`;
+/// `INVALID_BADGE` when the process ended before or during the capture;
+/// `NOT_QUIESCED` when it is at no quiesce point, or left it before the
+/// hold; `SPACE_HELD`, `LIMIT` and `OUT_OF_MEMORY` as for [`SNAPSHOT`].
+/// Specified in `services/procmgr/docs/ipc-interface.md` § Label 35:
+/// `CHECKPOINT`.
+pub const CHECKPOINT: u64 = 35;
+
 /// The most bytes a [`READ_VERIFIED`] file may hold, its trailer included:
 /// 32 KiB, room for a platform description table
 /// (`MAX_TABLE_BYTES`, 8 KiB) and the other policy-bearing configuration

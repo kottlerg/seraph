@@ -118,7 +118,8 @@ pub(crate) fn run_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<Fre
         | Node::Disk(_)
         | Node::Object(_)
         | Node::ZeroFrame(_)
-        | Node::Reclaim(_) => None,
+        | Node::Reclaim(_)
+        | Node::Holder(_) => None,
     }
 }
 

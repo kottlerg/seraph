@@ -260,7 +260,8 @@ pub fn node<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<BudgetNode>
         | Node::Disk(_)
         | Node::Object(_)
         | Node::ZeroFrame(_)
-        | Node::Reclaim(_) => None,
+        | Node::Reclaim(_)
+        | Node::Holder(_) => None,
     }
 }
 

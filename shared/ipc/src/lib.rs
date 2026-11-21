@@ -157,7 +157,7 @@ pub mod sched_policy;
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 25;
+pub const MEMMGR_LABELS_VERSION: u32 = 26;
 pub mod memmgr_labels;
 
 pub mod memmgr_capture;
@@ -317,7 +317,8 @@ pub mod stream_labels;
 
 /// Badge bits that endpoints gating a label on a verb-bit use for it: each
 /// `*_AUTHORITY` constant in this crate is one of these bits, as are
-/// `procmgr_labels::PROCESS_HANDLE_TAG` and `memmgr_labels::NODE_HANDLE_TAG`.
+/// `procmgr_labels::PROCESS_HANDLE_TAG`, `memmgr_labels::NODE_HANDLE_TAG` and
+/// `memmgr_labels::NODE_CHARGE_ONLY`.
 /// A minter whose badges carry other information onto such an endpoint keeps
 /// them clear — procmgr's random per-process badge, stamped on the child's
 /// svcmgr-registry and procmgr SENDs, and memmgr's per-process badges, which

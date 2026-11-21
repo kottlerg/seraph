@@ -1400,15 +1400,28 @@ impl Firmware
         let path = self
             .vars_dir
             .join(format!("{}-{serial}.fd", std::process::id()));
-        std::fs::copy(&self.vars_template, &path).with_context(|| {
-            format!(
-                "copying vars template {} -> {}",
-                self.vars_template.display(),
-                path.display()
-            )
-        })?;
+        fresh_copy(&self.vars_template, &path)?;
         Ok(LaunchVars { path })
     }
+}
+
+/// `dest`, a new file holding `source`'s bytes, in place of any file of that
+/// name: created with the process's default mode, never the source's, so a
+/// read-only firmware image (a Nix store path) gives a store QEMU can write
+/// and a cache the padding can extend.
+fn fresh_copy(source: &Path, dest: &Path) -> Result<()>
+{
+    match std::fs::remove_file(dest)
+    {
+        Ok(()) =>
+        {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+        {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", dest.display())),
+    }
+    let bytes = std::fs::read(source).with_context(|| format!("reading {}", source.display()))?;
+    std::fs::write(dest, bytes)
+        .with_context(|| format!("copying {} to {}", source.display(), dest.display()))
 }
 
 /// `cached`, a copy of `source` padded to the pflash size, refreshed when
@@ -1417,8 +1430,7 @@ fn padded_copy(source: &Path, cached: &Path) -> Result<PathBuf>
 {
     if pflash_cache_stale(cached, source, PFLASH_SIZE)?
     {
-        std::fs::copy(source, cached)
-            .with_context(|| format!("copying {} to {}", source.display(), cached.display()))?;
+        fresh_copy(source, cached)?;
         pad_file_to(cached, PFLASH_SIZE)?;
     }
     Ok(cached.to_path_buf())
@@ -1830,6 +1842,38 @@ mod tests
         drop(a);
         assert!(!path.exists());
         drop(b);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Defect caught: a store or padded cache that keeps a read-only
+    // template's mode (a Nix store path), which QEMU cannot write the
+    // variables to and the padding cannot extend; or a read-only file a
+    // killed launch left that the next copy cannot replace.
+    #[cfg(unix)]
+    #[test]
+    fn copies_of_a_read_only_template_are_writable()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("xtask-ro-vars-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let read_only = |path: &Path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        };
+        let template = dir.join("template.fd");
+        std::fs::write(&template, b"vars").unwrap();
+        read_only(&template);
+        let stale = dir.join("stale.fd");
+        std::fs::write(&stale, b"left").unwrap();
+        read_only(&stale);
+        fresh_copy(&template, &stale).unwrap();
+        assert_eq!(std::fs::read(&stale).unwrap(), b"vars");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .unwrap();
+        let cached = dir.join("cached.fd");
+        padded_copy(&template, &cached).unwrap();
+        assert_eq!(std::fs::metadata(&cached).unwrap().len(), PFLASH_SIZE);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

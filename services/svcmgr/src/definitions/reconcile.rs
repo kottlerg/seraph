@@ -26,8 +26,6 @@
 //!
 //! After reconciliation the supervision loop runs unchanged.
 
-use std::fs;
-use std::os::seraph::fs::DirEntryExt;
 use std::os::seraph::log;
 
 use super::parse::parse;
@@ -35,6 +33,7 @@ use super::{Definition, NamespaceShape, RestartPolicy, SERVICES_DIR, launch, shu
 use svcmgr_defs::DeathTag;
 use svcmgr_endowment::SubstrateObserver;
 
+use crate::config::IndexedDir;
 use crate::endowed_servers;
 use crate::restart::{DeathOutcome, RestartCtx, bind_fault_observer, handle_death};
 use crate::service::{
@@ -171,8 +170,11 @@ fn is_recipe_name(name: &str) -> bool
 
 /// Top-level entry called from `dispatch_ipc` on `HANDOVER_COMPLETE`.
 ///
-/// Walks `/config/svcmgr/services/`, parses every `.svc` file, and routes each
-/// definition through the right path. `pending` is consumed:
+/// Reads `/config/svcmgr/services/` through its signed index
+/// ([`IndexedDir`]), parses every `.svc` file the index names, and routes each
+/// definition through the right path. An index that is missing or that
+/// procmgr refuses reads no recipe: it is logged, and every pending
+/// registration is reported as one without a definition. `pending` is consumed:
 /// entries that match a definition are marked `consumed`; entries
 /// left unconsumed after the scan are reported as a configuration
 /// error; when the scan has no memory for the parsed recipes they are
@@ -202,45 +204,39 @@ pub fn reconcile_and_launch(
         endowed_servers::death(pending, endowed_servers::VFSD, ctx.ipc_buf).map_or(Ok(()), Err)
     };
     server_death(pending)?;
-    log!("svcmgr: scanning {SERVICES_DIR}");
+    log!("svcmgr: scanning {SERVICES_DIR} through its index");
 
-    let read = match fs::read_dir(SERVICES_DIR)
+    let dir = match IndexedDir::open(SERVICES_DIR)
     {
-        Ok(r) => r,
+        Ok(dir) => dir,
         Err(e) =>
         {
             server_death(pending)?;
-            log!(warn: "svcmgr: cannot open {SERVICES_DIR}: {e}");
-            // Still report pending-without-def errors so a missing
-            // /config/svcmgr/services/ does not silently swallow them.
+            log!(
+                warn: "svcmgr: {SERVICES_DIR}/index not read ({:?}); no recipe is read",
+                e.kind()
+            );
+            // Still report pending-without-def errors so an index that is
+            // missing or refused does not silently swallow them.
             report_orphans(pending);
             return Ok(Reconciled::Running);
         }
     };
+    dir.report_unnamed();
 
     // The copies and collections this scan and `parse` make are fallible, and
-    // both sorts sort in place: a recipe whose name, path or fields the heap
-    // cannot hold is dropped with a log line and the others still launch, and
-    // with no room for the parsed list none launches. Each entry's name is
-    // read borrowed (`DirEntryExt::file_name_ref`); the directory iteration
-    // and `fs::read_to_string`, which returns `OutOfMemory`, allocate inside
-    // std.
+    // the launch-order sort sorts in place: a recipe whose name, path or
+    // fields the heap cannot hold is dropped with a log line and the others
+    // still launch, and with no room for the parsed list none launches. The
+    // index holds the names in byte order, so the parse diagnostics repeat
+    // from boot to boot; the launch order is `svcmgr_defs::launch_order`'s,
+    // below.
     let mut entries: Vec<String> = Vec::new();
-    for ent in read
+    for name in dir.names()
     {
-        let Ok(ent) = ent
-        else
-        {
-            server_death(pending)?;
-            continue;
-        };
-        let Some(name) = ent.file_name_ref().to_str()
-        else
-        {
-            continue;
-        };
         if !is_recipe_name(name)
         {
+            log!(warn: "svcmgr: {SERVICES_DIR}/{name}: named by the index but not a recipe; not read");
             continue;
         }
         if entries.try_reserve(1).is_err()
@@ -257,18 +253,13 @@ pub fn reconcile_and_launch(
         // Within the slot reserved above, so the push cannot grow.
         entries.push(name);
     }
-    // A deterministic scan order, so the parse diagnostics repeat from boot
-    // to boot; the launch order is `svcmgr_defs::launch_order`'s, below.
-    // File names in one directory are unique, so the unstable sort, which
-    // needs no scratch allocation, gives the same order a stable one would.
-    entries.sort_unstable();
 
     // Parse every recipe first, then put them in launch order: providers
     // (services that publish their own endpoint via `provides = ...`) ahead
     // of pure consumers, and a provider after each provider whose name it
     // seeds, so a provided name is in the discovery registry before any
     // service launched here resolves it (`svcmgr_defs::launch_order`).
-    let Some(mut defs) = parse_recipes(&entries, pending, ctx.ipc_buf)?
+    let Some(mut defs) = parse_recipes(&dir, &entries, pending, ctx.ipc_buf)?
     else
     {
         log!(warn: "svcmgr: no memory to parse {} recipes", entries.len());
@@ -326,16 +317,18 @@ pub fn reconcile_and_launch(
     Ok(reconciled)
 }
 
-/// Read and parse the recipe file of each of `entries`, `.svc` file names in
-/// [`SERVICES_DIR`]. A recipe that cannot be read or parsed, or whose path
-/// the heap cannot hold, is dropped with a log line. `None` when the heap
-/// cannot hold the list of parsed recipes. The files are read through vfsd,
-/// whose liveness is read from its registration in `pending` after every read
-/// that fails ([`endowed_servers::death`]).
+/// Read and parse the recipe file of each of `entries`, `.svc` file names
+/// the index of `dir` (the services directory) names, each through procmgr's
+/// verified read ([`IndexedDir::read`]). A recipe that is missing, that
+/// procmgr refuses, or that does not parse is dropped with a log line.
+/// `None` when the heap cannot hold the list of parsed recipes. The files are
+/// read through vfsd, whose liveness is read from its registration in
+/// `pending` after every read that fails ([`endowed_servers::death`]).
 ///
 /// # Errors
 /// vfsd's exit reason when a read failed and vfsd is dead.
 fn parse_recipes(
+    dir: &IndexedDir,
     entries: &[String],
     pending: &[PendingRegistration],
     ipc_buf: *mut u64,
@@ -349,16 +342,9 @@ fn parse_recipes(
     for filename in entries
     {
         let service_name = filename.strip_suffix(".svc").unwrap_or(filename);
-        let Some(path) = recipe_path(filename)
-        else
+        let verified = match dir.read(filename)
         {
-            log!(warn: "svcmgr: no memory for {filename}'s path; dropped");
-            continue;
-        };
-
-        let contents = match fs::read_to_string(&path)
-        {
-            Ok(c) => c,
+            Ok(verified) => verified,
             Err(e) =>
             {
                 if let Some(exit_reason) =
@@ -366,15 +352,25 @@ fn parse_recipes(
                 {
                     return Err(exit_reason);
                 }
-                log!(warn: "svcmgr: cannot read {path}: {e}");
+                log!(
+                    warn: "svcmgr: {}/{filename}: named by the index, not read ({:?}); dropped",
+                    dir.dir(),
+                    e.kind()
+                );
                 continue;
             }
         };
-        match parse(service_name, &contents)
+        let Ok(contents) = core::str::from_utf8(verified.bytes())
+        else
+        {
+            log!(warn: "svcmgr: parse {}/{filename}: not UTF-8", dir.dir());
+            continue;
+        };
+        match parse(service_name, contents)
         {
             // Within the capacity reserved above, so the push cannot grow.
             Ok(d) => defs.push(d),
-            Err(e) => log!(warn: "svcmgr: parse {path}: {e}"),
+            Err(e) => log!(warn: "svcmgr: parse {}/{filename}: {e}", dir.dir()),
         }
     }
     Ok(Some(defs))
@@ -719,23 +715,6 @@ fn try_strings(strings: &[String]) -> Option<Vec<String>>
         out.push(try_string(s)?);
     }
     Some(out)
-}
-
-/// `SERVICES_DIR/<filename>`, or `None` when the heap cannot hold it.
-fn recipe_path(filename: &str) -> Option<String>
-{
-    let mut path = String::new();
-    path.try_reserve_exact(
-        SERVICES_DIR
-            .len()
-            .saturating_add(1)
-            .saturating_add(filename.len()),
-    )
-    .ok()?;
-    path.push_str(SERVICES_DIR);
-    path.push('/');
-    path.push_str(filename);
-    Some(path)
 }
 
 /// Construct a `ServiceEntry` from the parsed definition, with no caps yet:

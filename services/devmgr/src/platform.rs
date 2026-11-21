@@ -306,7 +306,12 @@ fn read_table(
         std::os::seraph::log!(warn: "platform table {}: not opened; passed over", path);
         return None;
     };
-    let data = match std::os::seraph::read_verified(walked.file_cap, walked.size, &path)
+    let data = match std::os::seraph::read_verified(
+        walked.file_cap,
+        walked.size,
+        &path,
+        std::os::seraph::VerifiedRole::Data,
+    )
     {
         Ok(data) => data,
         Err(e) =>

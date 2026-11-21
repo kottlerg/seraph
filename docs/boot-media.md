@@ -44,9 +44,8 @@ IOMMU driver's image, which devmgr keeps for the driver's restart (§ Bootstrap-
 the loss of the root filesystem's driver or of its disk is system death; and the ESP holds no
 secret.
 
-Design intent, not yet implemented: procmgr's verification of the policy-bearing configuration
-files other than the platform description tables
-([#1071](https://github.com/kottlerg/seraph/issues/1071)).
+The policy-bearing configuration files are signed in the configuration role, and svcmgr has procmgr
+verify each before it parses it ([signing.md](signing.md) § Configuration).
 
 ---
 
@@ -113,9 +112,9 @@ filesystem once vfsd has mounted it: by svcmgr from its recipes, by devmgr from
 `/services/fs/`. Each is verified before it is used: an image by procmgr as it creates the process,
 and a data file by procmgr at its reader's request, the platform description tables devmgr reads
 from `/config/devmgr/platform/` among them ([driver-binding.md](driver-binding.md) § Platform
-Description Tables; design intent: [#1071](https://github.com/kottlerg/seraph/issues/1071) for the
-other policy-bearing files). An object outside the closure costs memory on every boot and is a
-second path by which the same object starts.
+Description Tables) and svcmgr's recipes and class files, in the configuration role
+([signing.md](signing.md) § Configuration). An object outside the closure costs memory on every
+boot and is a second path by which the same object starts.
 
 Until the root mount, the only console is init-logd's: it writes the UART directly, and the
 kernel's console stays on a framebuffer, since no driver has claimed it
@@ -179,8 +178,8 @@ The model sets these constraints for work it does not design. Each is met by the
 - **Encryption at rest.** The ESP holds only signed, public objects. An encrypted root is
   unreadable until it is unlocked, so the unlock stage belongs to the bootstrap closure, and its
   key comes from outside the disk (a TPM against the measured chain, the console, a token), never
-  from the ESP. Configuration read before the unlock is on the ESP; its signing is
-  [#1071](https://github.com/kottlerg/seraph/issues/1071).
+  from the ESP. Configuration read before the unlock is on the ESP, a bundle entry the
+  bootloader verifies ([signing.md](signing.md) § Configuration).
 - **Secure Boot.** Firmware verifies the bootloader, the bootloader verifies the kernel and each
   bundle entry, and procmgr verifies every later file; a copied ESP verifies as the installed
   files do ([signing.md](signing.md) § Secure Boot).

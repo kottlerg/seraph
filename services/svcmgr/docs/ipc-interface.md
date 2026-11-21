@@ -156,7 +156,8 @@ honoured call svcmgr replies `SUCCESS` immediately (so init can proceed
 to teardown), then runs
 [`definitions::reconcile::reconcile_and_launch`](../src/definitions/reconcile.rs):
 
-1. Scan `/config/svcmgr/services/`, parse each `.svc` into a
+1. Read the signed `index` of `/config/svcmgr/services/` and each `.svc` it names through
+   procmgr's `READ_VERIFIED` in the configuration role, and parse each verified body into a
    [`Definition`](../src/definitions/mod.rs).
 2. Reconcile against the pending-registration table (the substrate triples
    parked from the endowment):

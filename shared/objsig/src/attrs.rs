@@ -243,8 +243,8 @@ mod tests
         refuse(&|b| b[28] = 0b0000_0110, ParseError::Roles);
         refuse(&|b| b[28] = 0b0001_0010, ParseError::Roles);
         refuse(&|b| b[28] = 0b1000_0100, ParseError::Roles);
-        // Bit 8, which no role has yet, and bit 31, CERTIFY in a usage mask.
-        refuse(&|b| b[29] = 1, ParseError::Roles);
+        // Bit 9, which no role has yet, and bit 31, CERTIFY in a usage mask.
+        refuse(&|b| b[29] = 2, ParseError::Roles);
         refuse(&|b| b[31] = 0x80, ParseError::Roles);
         refuse(&|b| b[30] = 1, ParseError::Roles);
         refuse(&|b| b[98] = 0, ParseError::Arch);
@@ -285,10 +285,10 @@ mod tests
         let accepted = (0..=0x3ffu32)
             .filter(|bits| RoleSet::from_signed(*bits).is_some())
             .count();
-        // The 31 nonempty sets of the five roles past init, and kernel and
+        // The 63 nonempty sets of the six roles past init, and kernel and
         // init alone.
-        assert_eq!(accepted, 31 + 2);
-        for bit in 8..32
+        assert_eq!(accepted, 63 + 2);
+        for bit in 9..32
         {
             let service = RoleSet::of(&[Role::Service]).bits();
             assert_eq!(
@@ -307,6 +307,7 @@ mod tests
             Role::Driver,
             Role::Program,
             Role::Data,
+            Role::Configuration,
         ]);
         assert_eq!(RoleSet::from_signed(all_runtime.bits()), Some(all_runtime));
         assert_eq!(RoleSet::from_signed(RoleSet::ALL.bits()), None);

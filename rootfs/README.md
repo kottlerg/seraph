@@ -24,7 +24,8 @@ rootfs/
     bundle/           # The bundle lists: per harness, and per architecture where
       *.list          #   they differ, the installed files the bootstrap bundle copies
     svcmgr/
-      services/       # `.svc` recipes svcmgr scans at handover
+      services/       # `.svc` recipes svcmgr reads at handover, through the
+                      #   signed index each pack writes
         *.svc
       tests/          # Opt-in test-harness recipes; staged by hand
         *.svc

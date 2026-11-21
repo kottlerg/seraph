@@ -5,12 +5,12 @@
 
 //! procmgr's verified read of a data file (`procmgr_labels::READ_VERIFIED`,
 //! `std::os::seraph::read_verified`): procmgr hands back the body of a file
-//! signed in the data role under the name asked for, charged to the
-//! reader's account while held, and refuses every other file
-//! (docs/signing.md § Verifier Discipline).
+//! signed in the role and under the name asked for, charged to the reader's
+//! account while held, and refuses every other file (docs/signing.md
+//! § Verifier Discipline).
 
 use std::io::ErrorKind;
-use std::os::seraph::{namespace_lookup_file, read_verified, root_dir_cap};
+use std::os::seraph::{VerifiedRole, namespace_lookup_file, read_verified, root_dir_cap};
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -56,13 +56,34 @@ fn own_pages() -> u64
         .0
 }
 
-/// Read `path` through procmgr's verified read under `name`, with the
-/// length `len` (its size hint when `None`), and assert it is refused with
-/// `want`.
-fn expect_refused(path: &str, name: &str, len: Option<u64>, want: ErrorKind, what: &str)
+/// What a refused read asks for: the name, the length (the size hint when
+/// `None`) and the role.
+struct Request<'a>
+{
+    name: &'a str,
+    len: Option<u64>,
+    role: VerifiedRole,
+}
+
+impl<'a> Request<'a>
+{
+    /// A request in the data role for `name`, at the size hint.
+    const fn data(name: &'a str) -> Self
+    {
+        Self {
+            name,
+            len: None,
+            role: VerifiedRole::Data,
+        }
+    }
+}
+
+/// Read `path` through procmgr's verified read as `request` asks, and
+/// assert it is refused with `want`.
+fn expect_refused(path: &str, request: &Request<'_>, want: ErrorKind, what: &str)
 {
     let (cap, size) = lookup(path);
-    match read_verified(cap, len.unwrap_or(size), name)
+    match read_verified(cap, request.len.unwrap_or(size), request.name, request.role)
     {
         Ok(_) => panic!("verified read: {what}: read back, not refused"),
         Err(e) => assert_eq!(e.kind(), want, "verified read: {what}: refused with {e}"),
@@ -71,7 +92,8 @@ fn expect_refused(path: &str, name: &str, len: Option<u64>, want: ErrorKind, wha
 
 /// 1. The fixture reads back its body, and the copy's pages are charged to
 ///    this process while held and leave its account once dropped.
-/// 2. The fixture asked for under another name is refused.
+/// 2. The fixture asked for under another name, or in the configuration
+///    role, is refused.
 /// 3. A copy of it with one body byte flipped, asked for under the
 ///    fixture's name, is refused.
 /// 4. A file with no signature is refused.
@@ -81,7 +103,8 @@ fn procmgr_read_verified_phase(_caps: &Caps)
 {
     let before = own_pages();
     let (cap, size) = lookup(VERIFIED_PATH);
-    let data = read_verified(cap, size, VERIFIED_PATH).expect("verified read: the fixture");
+    let data = read_verified(cap, size, VERIFIED_PATH, VerifiedRole::Data)
+        .expect("verified read: the fixture");
     assert_eq!(
         data.bytes(),
         VERIFIED_BODY,
@@ -102,10 +125,18 @@ fn procmgr_read_verified_phase(_caps: &Caps)
 
     expect_refused(
         VERIFIED_PATH,
-        "/data/svctest/signed/other.dat",
-        None,
+        &Request::data("/data/svctest/signed/other.dat"),
         ErrorKind::InvalidData,
         "the fixture under another name",
+    );
+    expect_refused(
+        VERIFIED_PATH,
+        &Request {
+            role: VerifiedRole::Configuration,
+            ..Request::data(VERIFIED_PATH)
+        },
+        ErrorKind::InvalidData,
+        "the data fixture in the configuration role",
     );
 
     let mut tampered = std::fs::read(VERIFIED_PATH).expect("verified read: read the fixture");
@@ -116,8 +147,7 @@ fn procmgr_read_verified_phase(_caps: &Caps)
     std::fs::write(TAMPERED_PATH, &tampered).expect("verified read: write the tampered copy");
     expect_refused(
         TAMPERED_PATH,
-        VERIFIED_PATH,
-        None,
+        &Request::data(VERIFIED_PATH),
         ErrorKind::InvalidData,
         "a body byte flipped",
     );
@@ -125,23 +155,23 @@ fn procmgr_read_verified_phase(_caps: &Caps)
     std::fs::write(UNSIGNED_PATH, VERIFIED_BODY).expect("verified read: write the unsigned file");
     expect_refused(
         UNSIGNED_PATH,
-        UNSIGNED_PATH,
-        None,
+        &Request::data(UNSIGNED_PATH),
         ErrorKind::InvalidData,
         "an unsigned file",
     );
 
     expect_refused(
         OVERSIZED_PATH,
-        OVERSIZED_PATH,
-        None,
+        &Request::data(OVERSIZED_PATH),
         ErrorKind::InvalidInput,
         "a file past READ_VERIFIED_MAX",
     );
     expect_refused(
         VERIFIED_PATH,
-        VERIFIED_PATH,
-        Some(0),
+        &Request {
+            len: Some(0),
+            ..Request::data(VERIFIED_PATH)
+        },
         ErrorKind::InvalidInput,
         "a length of zero",
     );

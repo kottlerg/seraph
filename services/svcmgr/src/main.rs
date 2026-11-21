@@ -29,6 +29,7 @@
 
 mod arch;
 mod classes;
+mod config;
 mod death_queues;
 mod definitions;
 mod endowed_servers;

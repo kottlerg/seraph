@@ -1477,16 +1477,17 @@ before it parses a file it reads from the root filesystem as trusted input. Its 
 | label | `procmgr_labels::READ_VERIFIED` (31) |
 | caller's cap | The sender's own procmgr cap (`ProcessInfo.procmgr_endpoint_cap`) |
 | `data[0]` | The file's length in bytes, from the caller's `NS_LOOKUP` size hint: 1 to `procmgr_labels::READ_VERIFIED_MAX` (32 KiB) |
-| from `data[1]` | The name block (`procmgr_labels::READ_VERIFIED_NAME_WORD`): the install path the file must be signed under, in the canonical form of § Image Verification |
+| `data[1]` | The role word (`procmgr_labels::READ_VERIFIED_ROLE_WORD`): `READ_VERIFIED_DATA` (7) or `READ_VERIFIED_CONFIGURATION` (8), the role the copy must verify in |
+| from `data[2]` | The name block (`procmgr_labels::READ_VERIFIED_NAME_WORD`): the install path the file must be signed under, in the canonical form of § Image Verification |
 | cap[0] | File cap for the file |
 
 procmgr serves it as follows:
 
-1. **Checks.** A request with no file cap, a length of zero or past `READ_VERIFIED_MAX`, or no name
-   block or a name that is not a canonical install path is refused with `INVALID_ARGUMENT` before
-   procmgr opens the file. A request sent on a process handle, which names another process, is
-   refused with `INVALID_BADGE` (§ Messages), as is one whose badge names no live process. Every cap
-   past cap[0] is deleted at once.
+1. **Checks.** A request with no file cap, a length of zero or past `READ_VERIFIED_MAX`, a role
+   word other than the two, or no name block or a name that is not a canonical install path is
+   refused with `INVALID_ARGUMENT` before procmgr opens the file. A request sent on a process
+   handle, which names another process, is refused with `INVALID_BADGE` (§ Messages), as is one
+   whose badge names no live process. Every cap past cap[0] is deleted at once.
 2. **The account.** Under the table lock procmgr derives a copy of the sender's memmgr SEND from its
    table entry, so the copy is charged to the sender: its budget bounds it, and a teardown of the
    sender that deletes the entry's slot meanwhile cannot hand the request another cap. A sender
@@ -1496,10 +1497,10 @@ procmgr serves it as follows:
    account (`REQUIRE_CONTIGUOUS`) and maps in its own address space alone, and closes it, as
    `CREATE_FROM_FILE` reads an image (§ Label 13, its bounds on every call on the file cap
    included). The file cap is deleted on every path.
-4. **Verify.** procmgr verifies the copy against the trust store in the data role alone, under the
-   requested name, for this build's architecture. A refusal replies `SIGNATURE_REFUSED` and logs one
-   warning naming the name and the verifier's reason, as an image's does; the run returns to the
-   sender's account.
+4. **Verify.** procmgr verifies the copy against the trust store in the role the request names,
+   data or configuration, under the requested name, for this build's architecture. A refusal
+   replies `SIGNATURE_REFUSED` and logs one warning naming the name and the verifier's reason, as
+   an image's does; the run returns to the sender's account.
 5. **Hand over.** procmgr derives a Memory cap on the run carrying `RIGHTS_MEM_MAP` alone, unmaps
    the run from its own address space and deletes its own cap, so no process but memmgr holds a cap
    that can write it, and replies with the derived cap. A reply the sender cannot take (it is gone,
@@ -1518,10 +1519,10 @@ its own memmgr cap; its death releases the run with its record.
 |---|---|---|
 | 2 | `OUT_OF_MEMORY` | The run could not be had on the sender's account for a reason other than a max (`LIMIT`), the sender has no memmgr SEND, or the map-only cap could not be derived |
 | 4 | `INVALID_BADGE` | Sent on a process handle, or no live process carries the badge |
-| 7 | `INVALID_ARGUMENT` | No file cap, a length of zero or past `READ_VERIFIED_MAX`, or no name block or a name not in the canonical form |
+| 7 | `INVALID_ARGUMENT` | No file cap, a length of zero or past `READ_VERIFIED_MAX`, a role word other than the two, or no name block or a name not in the canonical form |
 | 10 | `IO_ERROR` | As for `CREATE_FROM_FILE` (§ Label 13) |
 | 11 | `MAP_FAILED` | The run could not be mapped in procmgr, or its mapping would not come down |
-| 18 | `SIGNATURE_REFUSED` | The copy does not verify in the data role under the name |
+| 18 | `SIGNATURE_REFUSED` | The copy does not verify in the requested role under the name |
 | 21 | `LIMIT` | The max of the sender's budget node or of an ancestor refused the run (`memmgr_errors::LIMIT`) |
 
 svctest's `procmgr_read_verified` phase reads its data-role fixture back and checks the copy's

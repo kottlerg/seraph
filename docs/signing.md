@@ -17,6 +17,8 @@ This document is authoritative for:
   canonical form of the hashed bytes.
 - The verification algorithm and the policy it applies.
 - The verifier discipline every verifying stage follows.
+- The policy-bearing configuration files, their consumers, and the signed index of a configuration
+  directory.
 - Where keys live, how objects are signed, and what the trust store holds.
 
 The cryptographic primitives (SHA-512, Ed25519 verification, key generation and signing) are
@@ -42,24 +44,32 @@ feature, which enables `shared/crypto`'s, composes the signers. xtask, the host 
 feature, and core/boot enables it as a dev-dependency only, since its host tests sign fixtures.
 xtask's keys and signing of § Signing are implemented: every build signs the kernel, every ELF image
 of the root filesystem, the files of its data trees and the data files the bundle lists name, each
-once, in the sysroot, under the role set and the name of § Signed Attributes, composes the ESP by
+once, in the sysroot, under the role set and the name of § Signed Attributes, the configuration
+files of § Configuration with the index of each of their directories, composes the ESP by
 copying the installed files, builds the trust store at the path § Signing names, and embeds it in
 the bootloader. The bootloader verifies the kernel and every bundle entry against that store and
 hands the store to procmgr (§ Trust Store), which parses it and keeps it. procmgr verifies every
 image it creates against that store before it parses it (§ Verifier Discipline), under its creator's
 signature policy and the name the creator gives (§ Signature Policy in procmgr), and verifies a data
-file in the data role at its reader's request (`procmgr_labels::READ_VERIFIED`, § Verifier
-Discipline), which svctest's `procmgr_read_verified` phase exercises on both architectures, and
-which devmgr uses for the platform description tables. The override that § Signature Policy in
+file in the data role, or a configuration file in the configuration role, at its reader's request
+(`procmgr_labels::READ_VERIFIED`, § Verifier Discipline), which svctest's `procmgr_read_verified`
+phase exercises on both architectures, which devmgr uses for the platform description tables, and
+which svcmgr uses for its service recipes and device class files, read through each directory's
+signed index (§ Configuration). The override that § Signature Policy in
 procmgr describes is design intent, not yet implemented: no creator can hold it, so procmgr creates
 no process from an image that does not verify. `cargo xtask test signing` boots each refusal on both
 architectures: a tampered kernel, a tampered bundle entry and a revoked signing key in the
-bootloader, and a tampered service, one signed without a role its creator's policy admits and one
+bootloader; a tampered service, one signed without a role its creator's policy admits and one
 signed by an untrusted key in procmgr, beside a kernel and a program whose untrusted record both
-verifiers skip ([testing.md](testing.md) § Gating, Signature refusals). The bootloader keeps the
-machine's security floor in a boot-services-only UEFI variable, raises it, and refuses itself below
-it (§ Rollback Floor); `cargo xtask test rollback` boots the floor written, raised, and refusing an
-older bootloader on both architectures ([testing.md](testing.md) § Gating, Rollback floor).
+verifiers skip; configuration files tampered with, unsigned, or signed by a key not trusted for the
+configuration role, a service signed by a key trusted for configuration alone, a recipe validly
+signed over a body other than its index line's, and a directory index that names a missing file and
+omits a present one; and both indexes tampered with
+([testing.md](testing.md) § Gating, Signature refusals). The bootloader keeps the machine's
+security floor in a boot-services-only UEFI variable, raises it, and refuses itself below it
+(§ Rollback Floor); `cargo xtask test rollback` boots the floor written, raised, and refusing an
+older bootloader on both architectures ([testing.md](testing.md) § Gating, Rollback floor). The
+local signer of § Configuration is design intent, not yet implemented.
 
 [boot-media.md](boot-media.md) states why one object carries one signature, and how the bundle
 lists in configuration choose the bundle's entries.
@@ -105,7 +115,8 @@ trusted to execute as built.
 | **Carrier confusion.** Duplicate, nested, truncated or malformed trailers, or bytes after the trailer. | The footer and every record parse strictly; any parse error rejects the whole object; a body that itself ends in a trailer is rejected. | None. |
 | **TOCTOU.** Change the bytes between verification and use. | The verifier reads the object once into memory no other process can write, verifies that copy, and the loader parses and loads only from it. | None. |
 | **Trust-store substitution.** Replace the roots the system trusts. | The trust store is built into the bootloader; replacing it means replacing the bootloader. | Without Secure Boot, an attacker who can write the ESP replaces the bootloader and its roots: the chain is as strong as the ESP's integrity (§ Secure Boot). |
-| **Unsigned configuration.** Change a configuration file (`/config/svcmgr/services/*.svc`) that decides what runs. | Not defended. | Configuration is not signed; [#1071](https://github.com/kottlerg/seraph/issues/1071) covers it. |
+| **Configuration tampering.** Change a policy-bearing configuration file (`/config/svcmgr/services/*.svc`) so a verified binary runs under altered policy. | Each policy-bearing file is signed in the configuration role, which no binary is accepted in, and its consumer has procmgr verify it before it parses it (§ Configuration). | None within the chain. |
+| **Configuration removal, addition or mixing.** Delete a recipe from a configuration directory, add one beside the files it holds, or put back an older signed copy of one. | The directory's signed index names each file it held at signing time with the SHA-512 of its body; the consumer reads only the files the index names, refuses a body whose hash is not its line's, and reports a named file that is missing and a file the index does not name (§ Configuration). | A whole older directory with its older index, all signed at a security version the machine's floor admits, verifies: the floor rises only with a revoking release (§ Rollback Floor), so the configuration of any release since the last raise is accepted. An index whose freshness a TPM counter attests is [#1416](https://github.com/kottlerg/seraph/issues/1416). |
 
 ---
 
@@ -121,6 +132,7 @@ trusted to execute as built.
 | memmgr, procmgr | init loads them from boot modules the bootloader verified | Nothing further | Not applicable |
 | Every image procmgr creates, from a file or a Memory cap | procmgr | The store the bootloader hands forward | The roles the creator's policy allows; the name the creator gives, an install path |
 | A data file a process reads from the root filesystem as trusted input (a platform description table devmgr reads) | procmgr, at the reader's request (`procmgr_labels::READ_VERIFIED`) | The same store | data, its install path |
+| A policy-bearing configuration file, and the index of its directory (§ Configuration) | procmgr, at its consumer's request (`procmgr_labels::READ_VERIFIED`) | The same store | configuration, its install path |
 
 The bundle container itself is not signed: the bootloader parses its header with the bounds-checking
 parser of [`abi/boot-protocol::bundle`](../abi/boot-protocol/src/bundle.rs) and verifies each entry
@@ -215,8 +227,8 @@ one name.
 
 **Role bits.** Every 32-bit set of roles in the system has one numbering: a record's `roles`, and
 the `usage` of a certificate (§ Certificate Format) and of an anchor (§ Trust Store). Bit `n` is
-role `n` of the table below, for bits 1 to 7. Bit 31 is `CERTIFY`, the right to issue
-certificates, valid in a `usage` alone and refused in a record's `roles`. Bit 0 and bits 8 to 30
+role `n` of the table below, for bits 1 to 8. Bit 31 is `CERTIFY`, the right to issue
+certificates, valid in a `usage` alone and refused in a record's `roles`. Bit 0 and bits 9 to 30
 are no role: a set with any of them set is refused wherever it appears, until a role is defined for
 the bit. A record's `roles` has at least one role, and a set that holds kernel or init holds no
 other role.
@@ -230,6 +242,7 @@ other role.
 | 5 | driver | A driver image |
 | 6 | program | A program image |
 | 7 | data | A data file procmgr verifies for its reader (§ Verifier Discipline) |
+| 8 | configuration | A policy-bearing configuration file, or a configuration directory's index, procmgr verifies for its consumer (§ Configuration) |
 
 A role is a permission the signer grants, not a place: an installed service the bootstrap needs
 carries service and boot module, and the bundle's copy of it is the same bytes.
@@ -508,7 +521,8 @@ The bootloader and procmgr follow it. procmgr follows it for a data file it veri
 request too (`procmgr_labels::READ_VERIFIED`): it refuses a file past
 `procmgr_labels::READ_VERIFIED_MAX` (32 KiB) before it reads any byte, copies the file once into
 one run of frames it requests on the reader's account and maps in its own address space alone,
-verifies that copy in the data role under the name the reader gives, and gives the reader the run
+verifies that copy in the role the reader names, data or configuration, and under the name the
+reader gives, and gives the reader the run
 through a capability that maps it read-only, keeping none of its own, so the reader parses only the
 verified body, in bytes no process but memmgr can write
 ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 31: `READ_VERIFIED`).
@@ -555,7 +569,8 @@ procmgr requires a verified signature for every image it creates. procmgr's reco
 carries its signature policy, the set of roles its creates may load, and a create's object is
 verified with that set as the roles it accepts. The un-badged creator (init, and svcmgr's mint
 source) loads services, drivers and programs; the kernel and `init` are loaded by the bootloader
-alone, the boot-module role is the bootloader's permission alone, and a data object is never code.
+alone, the boot-module role is the bootloader's permission alone, and a data or configuration object
+is never code.
 So every process procmgr creates, from a bundle entry's Memory cap or from a file, is verified in
 the role it runs in. A child takes its creator's set, narrowed to programs when its object's set
 holds program: a program starts programs and nothing else, and no child holds more than its
@@ -598,22 +613,88 @@ emulator's: the code is the one the target's hardware runs, and no rule bounds t
 
 ---
 
+## Configuration
+
+Implemented, apart from the local signer, which is design intent, not yet implemented.
+
+**Policy-bearing files.** A file is policy-bearing when a process on the running system reads it
+and acts on it with authority. Each is signed, and verified by its consumer before it parses it:
+
+| Files | Consumer | Signed in |
+|---|---|---|
+| `/config/svcmgr/services/*.svc`, the service recipes | svcmgr, at handover | configuration, with the directory's index |
+| `/config/devmgr/classes/*.class`, the device class files | svcmgr, at handover | configuration, with the directory's index |
+| `/config/devmgr/platform/*.platform`, the platform description tables | devmgr | data (§ Verifier Discipline) |
+| `/config/init/log-levels.conf`, the log-level configuration | init, from its boot module | boot module (§ Verifier Discipline) |
+
+No guest reads the other files under `config/`, so none is signed: the bundle lists, which xtask
+reads when it packs, and the recipe and class sources of `/config/svcmgr/debug/`,
+`/config/svcmgr/tests/` and `/config/devmgr/tests/`, which a pack that stages them copies into
+the two indexed directories, where it signs them.
+
+**Directory index.** A per-file signature does not show that a file was removed: a consumer that
+lists a directory starts a system without the recipe an attacker deleted. Each directory svcmgr
+reads therefore holds a file `index` beside the files it names, signed in the configuration role
+under `<directory>/index`: UTF-8 text, one line per file, each ending in `\n`: the file's name,
+one space, and the 128 lowercase hex digits of the SHA-512 of its body, the file less its signature
+trailer, so signing a file again leaves its line unchanged. The names are strictly ascending byte
+for byte, each one path component in the canonical form of § Signed Attributes and none `index`
+(`objsig::index`). An index naming no file is empty. The index binds the set of files the
+directory held when it was signed and the body of each, so an older signed copy of one file under
+the current index is refused. A whole older directory with its older index verifies (§ Threat
+Model, Configuration removal, addition or mixing).
+
+svcmgr reads the index through procmgr's verified read, then each file the index names, refuses a
+body whose SHA-512 is not the one its line holds, and parses only the bodies it accepts. It
+reports, and passes over, a named file that is missing, that procmgr refuses, or whose body does
+not match its line, as it does a file that does not parse; it reports a file of the directory the
+index does not name, and does not read it. When the index is missing or refused, svcmgr reads no
+file of the directory: for `services/` it launches no service from a recipe, and reports each
+service init registered as one without a definition, which it does not supervise; for `classes/`
+it configures no device class. procmgr's refusal and svcmgr's report of each are logged lines on
+the console ([svcmgr Service Definitions](../services/svcmgr/docs/service-definitions.md)
+§ Reconciliation).
+
+**Roles and anchors.** A consumer of configuration accepts a chain to any anchor whose usage holds
+the configuration role, and no binary is accepted in it. An anchor's usage scopes it by role
+(§ Trust Store), so a store can carry, beside the anchors of the system's software, an anchor
+trusted for configuration alone, which signs configuration and no image. A record signed by a key
+whose usage lacks the configuration role is refused for configuration (`Failed(KeyUsage)`), as a
+record of a configuration-only key is for any image.
+
+**Local signer.** Design intent, not yet implemented
+([#1416](https://github.com/kottlerg/seraph/issues/1416)). Some configuration is per system, and
+some is later edited on a running system by a user allowed to edit it. A signature defends against
+an edit made from outside the running system (a powered-off disk, a side channel to the storage);
+an edit from inside is userspace policy. Against a powered-off disk the local signing key MUST NOT
+be readable from that disk: it is held outside the machine or sealed to the measured boot, and a
+service of the running system signs an edit, and the directory's index, on behalf of a user allowed
+to make it. The index is per directory, so a directory of per-system configuration is signed by a
+local anchor trusted for configuration alone, and one of distributed configuration by the
+distributor's key; a file needs no second signature. Enrolling the local anchor per machine is
+[#1074](https://github.com/kottlerg/seraph/issues/1074)'s mechanism.
+
+---
+
 ## Signing
 
 Implemented in xtask; the options are in
 [xtask/README.md](../xtask/README.md#signing) § Signing.
 
 **Keys.** Every builder generates a local root and a signing key on its first build, in a per-user
-directory outside the work tree (`seraph/signing/ed25519-ml-dsa-65` in the user's data directory,
-or the directory `SERAPH_SIGNING_DIR` names); the root certifies the signing key, and the store
-lists the root with `LOCAL`. The root's secret key certifies the signing key once and is never
-written: the directory holds the signing key's secret, its two seeds (§ Composite Signature),
-readable by its owner alone, its certificate, and the store of the anchors it contributes. The
-default directory's last component names the signature algorithm, so an identity of the earlier
-Ed25519 format, in the directory that format used, is never loaded; xtask refuses a directory
-`SERAPH_SIGNING_DIR` names that holds one, saying that its format is the reason. xtask refuses a
-directory or a key file whose canonical path lies inside the work tree, `target/` included. CI
-generates its keys per job in the runner's temporary directory and discards them.
+directory outside the work tree (`seraph/signing/ed25519-ml-dsa-65-roles-1-8` in the user's data
+directory, or the directory `SERAPH_SIGNING_DIR` names); the root certifies the signing key for
+every role, and the store lists the root with `LOCAL`, trusted for every role. The root's secret key
+certifies the signing key once and is never written: the directory holds the signing key's secret,
+its two seeds (§ Composite Signature), readable by its owner alone, its certificate, and the store
+of the anchors it contributes. The default directory's last component names the signature algorithm
+and the roles, 1 to 8, the key is certified for, so an identity of the earlier Ed25519 format, or
+one certified before the configuration role existed, in the directory it used, is never loaded;
+xtask refuses a directory `SERAPH_SIGNING_DIR` names that holds one of another format, saying that
+its format is the reason, and a signing key the build's trust store does not trust for every role,
+naming the roles it lacks. xtask refuses a directory or a key file whose canonical path lies inside
+the work tree, `target/` included. CI generates its keys per job in the runner's temporary directory
+and discards them.
 
 **External signer.** In place of a key file, xtask runs a configured signer command
 (`SERAPH_SIGNER`): it receives the encoded signed attributes on its standard input and writes the
@@ -667,25 +748,30 @@ carries no second object that boots as init. The data file a bundle list names (
 configuration) is an installed file, at `/config/init/log-levels.conf`, signed with the boot-module
 role, and its reader takes the body through the parse-only split (§ Verifier Discipline). A platform
 table, installed at `/config/devmgr/platform/`, is signed with the data role alone, and procmgr
-verifies it for devmgr before devmgr parses it (§ Which Stage Verifies What;
-[#1071](https://github.com/kottlerg/seraph/issues/1071) reuses the verified read for the other
-policy-bearing files). Every regular file under a data tree (`DATA_TREES` in
-`xtask/src/signing/mod.rs`: `/config/devmgr/platform/` and `/data/svctest/signed/`, svctest's
-fixture of the verified read) is signed with the data role under its install path, beside the
-boot-module role when a bundle list names it. The ESP is composed by copying installed files and
-signs nothing, so each object on it, each bundle entry included, is its installed file byte for byte
-([boot-media.md](boot-media.md) § The ESP). The sysroot's objects are signed in place each time a
-disk image is packed, before the pack composes the ESP, for the harness whose bundle it composes.
+verifies it for devmgr before devmgr parses it (§ Which Stage Verifies What). Every regular file
+under a data tree (`DATA_TREES` in `xtask/src/signing/mod.rs`: `/config/devmgr/platform/` and
+`/data/svctest/signed/`, svctest's fixture of the verified read) is signed with the data role under
+its install path, beside the boot-module role when a bundle list names it. Every regular file of a
+configuration directory (`CONFIG_TREES` in `xtask/src/signing/mod.rs`: `/config/svcmgr/services/`,
+whose files are `.svc` recipes, and `/config/devmgr/classes/`, whose files are `.class` files) is
+signed with the configuration role under its install path, and the pack writes the directory's index
+from the files the directory then holds and their bodies, and signs it the same way
+(§ Configuration); a subdirectory, or a file of another suffix, fails the pack. Every path that
+stages a file into a configuration directory (`mkdisk --repack-only`, the debug stub, the harness
+test cases) stages it before the pack, so the pack signs it and names it in the index. The ESP is
+composed by copying installed files and signs nothing, so each object on it, each bundle entry
+included, is its installed file byte for byte ([boot-media.md](boot-media.md) § The ESP). The
+sysroot's objects are signed in place each time
+a disk image is packed, before the pack composes the ESP, for the harness whose bundle it composes.
 The refusal test's pack alone writes objects as it is given them, in place of the sysroot's files in
 the images and never in the sysroot, so no later pack signs a tampered body. Signing replaces a
 trailer the object already carries, and is deterministic, so re-signing an unchanged image writes
-the same bytes. The other files under `config/` and `data/` carry no trailer, since their readers
-take each file whole and configuration is not signed (§ Threat Model), and neither does the
-bootloader, which Secure Boot covers (§ Secure Boot). The security version is one integer in the
-tree (`SECURITY_VERSION` in `xtask/src/signing/mod.rs`), raised by a security fix that MUST make
-older images unbootable; every record carries it, and the store's floor is at least it. A machine
-that boots a bootloader with the raised floor keeps it, and refuses every older bootloader from then
-on (§ Rollback Floor).
+the same bytes. The other files under `config/` and `data/` carry no trailer, since no process reads
+them as trusted input (§ Configuration), and neither does the bootloader, which Secure Boot covers
+(§ Secure Boot). The security version is one integer in the tree (`SECURITY_VERSION` in
+`xtask/src/signing/mod.rs`), raised by a security fix that MUST make older images unbootable; every
+record carries it, and the store's floor is at least it. A machine that boots a bootloader with the
+raised floor keeps it, and refuses every older bootloader from then on (§ Rollback Floor).
 
 **The trust store** is built from public key files: by default the builder's local root. A build
 option (`SERAPH_TRUST_STORE`) names a deployer's store, which is merged with the default or, as

@@ -222,6 +222,9 @@ pub fn install_rootfs(ctx: &BuildContext, arch: Arch) -> Result<()>
     keep.insert(synthesise_svctest_large_bin(ctx)?);
     keep.insert(synthesise_svctest_bench_bin(ctx)?);
     keep.insert(synthesise_svctest_verified(ctx)?);
+    // Each configuration directory's index, which every pack writes afresh
+    // from the files the directory holds then.
+    keep.extend(crate::signing::config_indexes(&ctx.sysroot));
     for dir in EMPTY_DIRS
     {
         let dst = ctx.sysroot.join(dir);

@@ -157,9 +157,10 @@ The CPU state established at the kernel entry point is specified in
 ## What the Bootloader Does Not Do
 
 - **No UEFI runtime services after `ExitBootServices`.** The bootloader's only
-  runtime-services calls are `GetVariable` and `SetVariable`, for the machine's security
-  floor, and both come before `ExitBootServices`
-  ([core/boot/docs/uefi-environment.md](docs/uefi-environment.md) § Variable Services). UEFI
+  runtime-services calls are `GetVariable` and `SetVariable`, for the uses
+  [core/boot/docs/uefi-environment.md](docs/uefi-environment.md) § Variable Services lists (the
+  firmware's Secure Boot state, read; the machine's security floor, read and raised), and every
+  one comes before `ExitBootServices`. UEFI
   boot services are exited before the kernel runs, and no runtime-services call follows
   the exit ([core/boot/docs/uefi-environment.md](docs/uefi-environment.md)
   § ExitBootServices).

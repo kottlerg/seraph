@@ -644,7 +644,7 @@ Options:
 
           Possible values:
           - init:  The userspace init, `/services/init`, with every module the system needs to bootstrap userspace (`init.<arch>.list`)
-          - ktest: The kernel-test harness, `/tests/ktest`, as the `"init"` entry alone: ktest is monolithic and spawns no module (`ktest.list`)
+          - ktest: The kernel-test harness, `/tests/ktest`, as the `"init"` entry, with the boot-time policy every bundle carries: ktest is monolithic and spawns no module (`ktest.list`)
 
       --knob <KNOB>
           Stage a bootloader knob in `\EFI\seraph\`: `nokaslr` boots the kernel at its deterministic (un-randomized) layout, for GDB and symbolization; `mapredo` makes the bootloader redo the first attempt of its steps 6 and 7. Repeatable, or comma-separated. The image carries exactly the knobs named: every other is removed

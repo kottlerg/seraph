@@ -334,7 +334,8 @@ sysroot/
                           # files its list in config/bundle/ names.
                           # Exactly one of {init, ktest} appears as the
                           # bundle's `init` entry; ktest is monolithic
-                          # so its bundle has zero module entries.
+                          # so its bundle holds no module but the
+                          # boot-time policy every bundle carries.
   services/               # Long-running userspace components sourced
                           # from services/ in the repo tree (init,
                           # procmgr, memmgr, devmgr, vfsd, svcmgr, logd,

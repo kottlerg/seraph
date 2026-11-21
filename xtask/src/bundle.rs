@@ -45,8 +45,9 @@ crate::argparse::value_enum! {
         /// system needs to bootstrap userspace (`init.<arch>.list`).
         #[value(name = "init")]
         Init,
-        /// The kernel-test harness, `/tests/ktest`, as the `"init"` entry
-        /// alone: ktest is monolithic and spawns no module (`ktest.list`).
+        /// The kernel-test harness, `/tests/ktest`, as the `"init"` entry,
+        /// with the boot-time policy every bundle carries: ktest is
+        /// monolithic and spawns no module (`ktest.list`).
         #[value(name = "ktest")]
         Ktest,
     }

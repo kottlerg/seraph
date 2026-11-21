@@ -142,10 +142,11 @@ stub's endpoint.
   and restarts every held breakpoint hit or fault GDB has not been told of, since any of them can
   be a new thread's (below). A thread whose upcall does not arrive in time runs on and is not
   reported held. The all-stop's end makes every held stop one GDB has been told of. An upcall that
-  arrives while the target runs was posted to a thread that had stopped on a fault first, or that
-  was held in a call when GDB resumed it; its stop is over, and the stub resumes it at once. The
-  upcall of a thread held in a call that GDB did not resume is held, as GDB holds the thread
-  (**Resuming** below). A thread the upcall finds
+  arrives while the target runs, of a thread GDB resumed, was posted to it when it had stopped on a
+  fault first, or while it was held in a call; its stop is over, and the stub resumes it at once.
+  Any stop of a thread GDB did not resume is held as it arrives, a breakpoint hit set back, as GDB
+  holds the thread: the upcall of one held in a call, and any stop of one the all-stop could not
+  hold (**Resuming** below). A thread the upcall finds
   blocked in any other interruptible syscall returns from it with `Interrupted`
   ([docs/fault-handling.md](../../docs/fault-handling.md) § Asynchronous Upcalls, Blocking
   syscalls), so each all-stop can end a sleep or a wait of the target early, as any stop can. A
@@ -256,15 +257,17 @@ stub's endpoint.
   packet gives becomes that thread's pointer first. `Hc` of a thread `Hg` would refuse is refused
   as `Hg` is. A signal passed to a thread stopped on a fault declines the fault
   (`FAULT_REPLY_KILL`), so a step that passes one is a continue passing it. A thread GDB did not
-  resume stays held while the target runs, and a stop is reported only for a thread GDB resumed, or
-  one spawned while the target ran: a stop GDB did not ask for would break its own run control, as
-  a software step's breakpoint taken by another thread does. GDB's interrupt reports the current
-  thread when GDB resumed it, and otherwise the first thread it resumed. A `vCont` whose actions
-  name no live thread is answered `E01`; a resume with no target, or after which every thread has
-  exited, is answered `W00`, as is a target whose threads all exit while it runs. Once no thread
-  GDB resumed runs on, each having exited, while others are held, the stub stops the target and
-  answers `N` when GDB's `qSupported` offered `no-resumed+`; otherwise the target waits for GDB's
-  interrupt.
+  resume stays held while the target runs, one the all-stop could not hold from its next stop on,
+  and a stop is reported only for a thread GDB resumed, or one spawned while the target ran: a stop
+  GDB did not ask for would break its own run control, as a software step's breakpoint taken by
+  another thread does. GDB's interrupt reports the current thread when GDB resumed it, and
+  otherwise the first thread it resumed, held or else in a call. A `vCont` whose actions name no
+  live thread is answered `E01`; a resume with no target, or after which every thread has exited,
+  is answered `W00`, as is a target whose threads all exit while it runs, but only when the stub's
+  table holds every thread of the target, since threads it could not take may run on. Once no
+  thread GDB resumed runs on, each having exited, while others are held, the stub stops the target
+  and answers `N` when GDB's `qSupported` offered `no-resumed+`; otherwise the target waits for
+  GDB's interrupt.
 - **Memory.** `m`, `M`, and `X` read and write the target's address space through any held
   thread's cap; a write that a read-only page refuses goes through the text route, which reaches
   text, mapped through a capability that carries Execute, but not read-only data such as `.rodata`

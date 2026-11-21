@@ -42,10 +42,12 @@
 //!    crash bindings.
 //! 6. A resume runs only the threads GDB resumed: a thread its plan does not
 //!    name stays held, or held in a call, its upcall at the call's return
-//!    held, and only the stop of a thread GDB resumed is reported, so GDB is
+//!    held, and any stop of one the all-stop could not hold is held as it
+//!    arrives; only the stop of a thread GDB resumed is reported, so GDB is
 //!    never told of a stop it did not ask for. When no thread GDB resumed is
 //!    left running, the session reports that ([`Idle::NoResumed`]), or the
-//!    target's exit once every thread has exited.
+//!    target's exit once every thread has exited and the table holds every
+//!    thread of the target.
 
 extern crate alloc;
 
@@ -1025,12 +1027,15 @@ impl Session
         })
     }
 
-    /// Take the stops that arrive while the target runs: an upcall then was
-    /// posted to a thread that stopped on a fault first, or that was held in
-    /// a call, and is resumed, but the upcall of a thread GDB did not resume,
-    /// held in a call when the target ran, which is held as GDB holds the
-    /// thread; the first other stop held stops the target. Returns the slot
-    /// and stop to report ([`Self::report`]).
+    /// Take the stops that arrive while the target runs. Any stop of a
+    /// thread GDB did not resume, which GDB takes for stopped, is held as a
+    /// stop GDB knows of, the target running on: the upcall of a thread held
+    /// in a call when the target ran, and any stop of one the all-stop could
+    /// not hold, as a thread still masking upcalls. An upcall of a thread
+    /// GDB resumed was posted to it when it stopped on a fault first, or
+    /// while it was held in a call, and is resumed; the first other stop
+    /// held stops the target. Returns the slot and stop to report
+    /// ([`Self::report`]).
     pub fn poll(&mut self, k: &mut impl Kernel) -> Option<(usize, Stop)>
     {
         if !self.running
@@ -1041,19 +1046,17 @@ impl Session
         }
         let now = k.now();
         let stop = self.next_stop(k, now)?;
+        let unresumed = control::thread_index(stop.badge)
+            .and_then(|i| self.threads.get(i))
+            .is_some_and(|t| !t.resumed);
+        if unresumed
+        {
+            let _ = self.hold_known(k, stop);
+            return None;
+        }
         if stop.kind == syscall_abi::FAULT_KIND_UPCALL
         {
-            let unresumed = control::thread_index(stop.badge)
-                .and_then(|i| self.threads.get(i))
-                .is_some_and(|t| t.upcall == Upcall::InCall && !t.resumed);
-            if unresumed
-            {
-                let _ = self.hold_known(k, stop);
-            }
-            else
-            {
-                k.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
-            }
+            k.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
             return None;
         }
         let index = self.hold(k, stop)?;
@@ -1068,8 +1071,8 @@ impl Session
 
     /// Look at a running target that took no stop. While a thread GDB
     /// resumed runs on, nothing: `None`. Once none does, each having exited
-    /// or being held, the target has exited when every thread has
-    /// ([`Idle::Exited`]); otherwise, when GDB takes a report that no
+    /// or being held, the target has exited when every thread has and the
+    /// table holds every thread of the target ([`Idle::Exited`]); otherwise, when GDB takes a report that no
     /// resumed thread is left (`no_resumed`), every thread is stopped and
     /// the stop of a thread spawned meanwhile reported ([`Idle::Stopped`]),
     /// or that none is left ([`Idle::NoResumed`]). Without `no_resumed` the
@@ -1095,8 +1098,11 @@ impl Session
             }
             t.gone = true;
         }
-        // A thread registered since the last refresh runs too.
-        if self.alive_count(k) == 0 && !(self.refresh(k) && self.alive_count(k) != 0)
+        // A thread registered since the last refresh runs too, and one a
+        // table that could not take every thread left out may.
+        if self.complete
+            && self.alive_count(k) == 0
+            && !(self.refresh(k) && self.alive_count(k) != 0)
         {
             return Some(Idle::Exited);
         }
@@ -1144,9 +1150,10 @@ impl Session
 
     /// GDB's interrupt: stop the target when it runs. Returns whether it
     /// ran, so a stop of the current thread is to be reported; `false`
-    /// leaves the session as it is. The current thread is one GDB resumed:
-    /// the one it was when GDB resumed it, or else the first such thread
-    /// held, since GDB is told of no stop of a thread it did not resume.
+    /// leaves the session as it is. The current thread is one GDB resumed,
+    /// since GDB is told of no stop of a thread it did not resume: the one
+    /// it was when GDB resumed it, or else the first such thread held, or
+    /// else the first such thread alive, as one held in a call.
     pub fn interrupt(&mut self, k: &mut impl Kernel) -> bool
     {
         if !self.running
@@ -1154,9 +1161,13 @@ impl Session
             return false;
         }
         self.stop_all(k);
-        let resumed = |t: &Slot| t.resumed && t.live() && t.held.is_some();
+        let resumed = |t: &Slot| t.resumed && t.live();
         if !self.threads.get(self.current).is_some_and(resumed)
-            && let Some(index) = self.threads.iter().position(resumed)
+            && let Some(index) = self
+                .threads
+                .iter()
+                .position(|t| resumed(t) && t.held.is_some())
+                .or_else(|| self.threads.iter().position(resumed))
         {
             self.current = index;
         }
@@ -1241,7 +1252,7 @@ impl Session
             Plan::Continue { releases, .. } =>
             {
                 self.release(k, &releases);
-                if self.alive_count(k) == 0
+                if self.complete && self.alive_count(k) == 0
                 {
                     Resumed::Exited
                 }
@@ -2553,6 +2564,73 @@ mod tests
         assert!(s.interrupt(&mut sim));
         assert_eq!(s.current, 1);
         assert!(s.is_held(0) && s.is_held(1));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a thread the all-stop could not hold, its upcall
+    // masked, ran while GDB resumed another thread alone; its breakpoint hit
+    // stopped the target and was reported as an interrupt of the resumed
+    // thread, the hit itself left past its breakpoint.
+    #[test]
+    fn a_stop_of_a_thread_gdb_did_not_resume_is_held_unreported_and_set_back()
+    {
+        let mut sim = Sim::new();
+        let other = sim.spawn(Some(0), true);
+        let masked = sim.spawn(Some(0), true);
+        sim.deaf.push(masked);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(!s.is_held(masked), "the all-stop cannot hold it");
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        sim.plant(&mut s, 0x100);
+        sim.hit(masked, 0x100);
+        assert_eq!(s.poll(&mut sim), None, "a stop GDB did not ask for");
+        assert!(s.running, "the thread GDB resumed runs on");
+        assert!(s.is_held(masked));
+        assert!(s.threads[masked].held.unwrap().reported);
+        assert_eq!(sim.threads[masked].pc, 0x100, "set back to its breakpoint");
+        assert!(s.is_held(0), "thread 1 stays held");
+        assert!(!s.is_held(other));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a target whose table could not take every thread was
+    // reported exited, and the session dropped, once the threads of the
+    // table had exited, while the others ran on.
+    #[test]
+    fn a_target_beyond_its_table_is_never_reported_exited()
+    {
+        let (mut sim, mut s) = attached();
+        s.complete = false;
+        resume(&mut sim, &mut s);
+        sim.exit(0);
+        assert_eq!(s.poll(&mut sim), None);
+        assert_eq!(s.idle(&mut sim, false), None);
+        assert!(s.running);
+        assert_eq!(s.idle(&mut sim, true), Some(Idle::NoResumed));
+        let (mut sim, mut s) = attached();
+        s.complete = false;
+        sim.exit_on_resume.push(0);
+        assert_eq!(s.resume(&mut sim, continue_all(&s), None), Resumed::Running);
+        sim.assert_sound();
+    }
+
+    // Defect caught: GDB's interrupt kept the current thread, one GDB had
+    // not resumed, when the threads it resumed were all held in calls.
+    #[test]
+    fn an_interrupt_reports_a_resumed_thread_held_in_a_call()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        sim.calls.push((a, 0, STOP_WAIT * 100));
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(!s.is_held(a));
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        assert!(s.interrupt(&mut sim));
+        assert_eq!(s.current, a);
         sim.assert_sound();
     }
 

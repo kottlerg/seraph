@@ -705,7 +705,9 @@ procmgr SEND ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)
 § Messages). memmgr does the same on its endpoint: its per-process badges keep
 bits 58 to 62 clear, bit 63 marking a phys-class process, its node
 handles carry `memmgr_labels::NODE_HANDLE_TAG` (bit 62), which selects the
-labels that act on a budget node ([memmgr IPC
+labels that act on a budget node, and a charge-only node handle also
+`memmgr_labels::NODE_CHARGE_ONLY` (bit 59), which narrows them to
+`NODE_QUERY_USAGE` and `NODE_CHARGE_HANDLE` ([memmgr IPC
 Interface](../services/memmgr/docs/ipc-interface.md) § Node Handles), and its
 object handles `memmgr_labels::OBJECT_HANDLE_TAG` (bit 60), which selects the
 label that releases a memory object (§ Object Handles there). An

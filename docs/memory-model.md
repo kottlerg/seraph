@@ -346,7 +346,7 @@ constraints (e.g. DMA-accessible memory below a certain physical address) are no
 kernel concern: DMA placement and isolation belong to devmgr and the memory authority in
 userspace (see [architecture.md](architecture.md)). Physical-range (DMA-reachable)
 placement by the userspace memory authority is design intent; not yet implemented:
-memmgr's only allocation flag is `REQUIRE_CONTIGUOUS`. IOMMU-based DMA isolation is
+memmgr's only placement flag is `REQUIRE_CONTIGUOUS`. IOMMU-based DMA isolation is
 directed by devmgr and programmed by an IOMMU driver: VT-d on x86-64 and the RISC-V IOMMU
 on riscv64 confine each DMA-capable device a unit translates (see
 [device-management.md](device-management.md) § DMA Safety Model).

@@ -1817,6 +1817,26 @@ fn no_confinement(requirement: DmaConfinement, why: &str)
     }
 }
 
+/// Log, once, that the IOMMU driver did not report ready after its
+/// bootstrap, and what follows under the boot-time policy's `requirement`,
+/// as [`no_confinement`] does, a unit the driver turned translation on for
+/// before it failed blocking the devices behind it either way.
+fn not_ready(requirement: DmaConfinement)
+{
+    match requirement
+    {
+        DmaConfinement::Opportunistic => std::os::seraph::log!(
+            warn: "IOMMU driver not ready after its bootstrap: DMA-capable devices run \
+             unconfined, except those behind a unit it turned translation on for \
+             before it failed, which that unit blocks"
+        ),
+        DmaConfinement::Required =>
+        {
+            no_confinement(requirement, "IOMMU driver not ready after its bootstrap");
+        }
+    }
+}
+
 /// Discover the remapping units, spawn the IOMMU driver over them, and
 /// settle it; the [`Iommu`] once the driver reports ready, else `None`,
 /// logged once ([`no_confinement`]), and every device then runs unconfined,
@@ -2016,18 +2036,7 @@ fn launch(
             {
                 image.release();
             }
-            match requirement
-            {
-                DmaConfinement::Opportunistic => std::os::seraph::log!(
-                    warn: "IOMMU driver not ready after its bootstrap: DMA-capable devices run \
-                     unconfined, except those behind a unit it turned translation on for \
-                     before it failed, which that unit blocks"
-                ),
-                DmaConfinement::Required =>
-                {
-                    no_confinement(requirement, "IOMMU driver not ready after its bootstrap")
-                }
-            }
+            not_ready(requirement);
             return None;
         }
     };

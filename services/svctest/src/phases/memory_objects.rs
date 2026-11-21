@@ -72,7 +72,7 @@ const LIMITED_PRIVATE_ADMITTED: i32 = 3;
 const LIMITED_SHARED_ADMITTED: i32 = 4;
 
 /// Pages of the object: a two-page grant, then a one-page grant.
-const OBJECT_PAGES: u64 = 3;
+pub(super) const OBJECT_PAGES: u64 = 3;
 /// `u64` words in a page.
 const PAGE_WORDS: u64 = PAGE_SIZE / 8;
 /// The value a private write puts in the first word of a page.
@@ -109,7 +109,7 @@ const ZERO_PAGES: u64 = 16 * CHUNK_PAGES;
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The last `u64` word of a page.
-const LAST_WORD: u64 = PAGE_WORDS - 1;
+pub(super) const LAST_WORD: u64 = PAGE_WORDS - 1;
 /// Half the pages of the zero-object attachment, the half [`zero_object`]
 /// writes.
 const ZERO_HALF: u64 = ZERO_PAGES / 2;
@@ -119,7 +119,7 @@ const ZERO_HALF: u64 = ZERO_PAGES / 2;
 const ZERO_QUARTER: u64 = ZERO_PAGES / 4;
 
 /// The value the pattern holds in word `word` of object page `page`.
-const fn pattern(page: u64, word: u64) -> u64
+pub(super) const fn pattern(page: u64, word: u64) -> u64
 {
     0x5EA1_0B1E_0000_0000 ^ page.wrapping_shl(16) ^ word
 }
@@ -210,7 +210,14 @@ fn attach_msg(
 
 /// `ATTACH_OBJECT` over svctest's own memmgr cap, carrying a copy of
 /// `handle` (memmgr deletes it); memmgr's reply label.
-fn attach(va: u64, pages: u64, prot: u64, first_page: u64, flags: u64, handle: Option<u64>) -> u64
+pub(super) fn attach(
+    va: u64,
+    pages: u64,
+    prot: u64,
+    first_page: u64,
+    flags: u64,
+    handle: Option<u64>,
+) -> u64
 {
     let copy = handle.map(handle_copy);
     let msg = attach_msg(va, pages, prot, first_page, flags, copy);
@@ -225,7 +232,7 @@ pub(super) fn handle_copy(handle: u64) -> u64
 }
 
 /// A fresh reservation of `pages` pages.
-fn reserve(pages: u64) -> std::os::seraph::ReservedRange
+pub(super) fn reserve(pages: u64) -> std::os::seraph::ReservedRange
 {
     std::os::seraph::reserve_pages(pages).expect("memory_objects: reserving a range failed")
 }
@@ -263,7 +270,7 @@ fn memory_objects_phase(_: &Caps)
 /// pages and an object handle, and leaves svctest's usage where it was: the
 /// frames stay charged to the sealer. Returns the handle and the sealed
 /// pages.
-fn seal() -> (u64, u64)
+pub(super) fn seal() -> (u64, u64)
 {
     let aspace = startup_info().self_aspace;
     let (first, first_id) = try_request_contiguous(2)

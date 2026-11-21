@@ -19,7 +19,20 @@
 //!   copy made while the writer ran would break;
 //! - svctest's usage grows by the object's pages, the child's does not, and
 //!   the object's release gives them back;
-//! - the child runs on: its writer passes the value the snapshot holds.
+//! - the child runs on: its writer passes the value the snapshot holds;
+//! - the header flags are complete and image, and its image has a length;
+//! - the regions hold the child's object attachment (class object, three
+//!   pages from object page 0), its private zero attachment (class zero) and
+//!   its demand region (class demand), and at least one image region;
+//! - every image run lies in an image region and names the image object's
+//!   page that region's first page and the run's offset in it give;
+//! - the object attachment, which the child never reads, holds the object's
+//!   pattern in the snapshot's own bytes;
+//! - the zero attachment holds the child's one written word in its written
+//!   page, and every page of its untouched first chunk is a zero run, every
+//!   other untouched page a zero run or zero bytes;
+//! - the demand region holds the child's one written word in its first
+//!   page, and every page of its three untouched chunks is a zero run.
 //!
 //! It then requires the refusals ([`refusals`]): `UNAUTHORIZED` without the
 //! debug authority, `INVALID_ARGUMENT` without an account, and
@@ -30,14 +43,19 @@ use std::os::seraph::{current_ipc_buf, startup_info};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ipc::procmgr_snapshot::{Header, NO_OBJECT_PAGE, RUN_ABSENT, Run, SNAPSHOT_COMPLETE};
+use ipc::procmgr_snapshot::{
+    Header, REGION_DEMAND, REGION_IMAGE, REGION_OBJECT, REGION_PRIVATE, REGION_ZERO, RUN_IMAGE,
+    RUN_ZERO, RegionEntry, Run, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE,
+};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
-use syscall_abi::{MAP_READ, PAGE_SIZE};
+use syscall_abi::{MAP_READ, MAP_WRITABLE, PAGE_SIZE};
 
 use crate::bootstrap::Caps;
-use crate::phases::heap_commit::{expect_region_reply, own_usage};
+use crate::phases::heap_commit::{CHUNK_PAGES, expect_region_reply, memmgr_label, own_usage};
 use crate::phases::memmgr::try_request_contiguous;
-use crate::phases::memory_objects::{call, handle_copy};
+use crate::phases::memory_objects::{
+    LAST_WORD, OBJECT_PAGES, attach, call, handle_copy, pattern, reserve, seal,
+};
 use crate::phases::swap::listed_badges;
 use crate::runner::Phase;
 
@@ -70,6 +88,24 @@ const PAGES: usize = 32;
 /// Words in a page.
 const PAGE_WORDS: usize = 512;
 const _: () = assert!(PAGE_WORDS as u64 * 8 == PAGE_SIZE);
+
+/// Pages of the child's zero attachment: two chunks.
+const ZERO_FIXTURE_PAGES: u64 = 2 * CHUNK_PAGES;
+
+/// The page of the zero attachment the child writes.
+const ZERO_WRITTEN_PAGE: u64 = CHUNK_PAGES + 1;
+
+/// What the child writes to the first word of that page.
+const ZERO_WRITTEN: u64 = 0x7A65_726F_5752_4954;
+
+/// Pages of the child's demand region: four chunks.
+const DEMAND_FIXTURE_PAGES: u64 = 4 * CHUNK_PAGES;
+
+/// What the child writes to the first word of the demand region's page 1.
+const DEMAND_WRITTEN: u64 = 0x6465_6D61_6E64_2121;
+
+/// Pages of the zero attachment and the demand region in a chunk.
+const CHUNK: u64 = CHUNK_PAGES;
 
 /// The last of the writer's pages.
 const LAST_PAGE: u64 = PAGES as u64 - 1;
@@ -194,10 +230,69 @@ fn passes(base: u64, value: u64) -> bool
     true
 }
 
-/// The `snapshot-child` role: start the writer, print `ready <base>` once
-/// it has made a pass, and answer the parent's lines until `exit` or the end
-/// of stdin: `usage` prints `usage <own pages>`, `past <value>` prints
-/// `ok` once the writer passes `value`, or `stuck`.
+/// The child's three fixtures: an object attachment it never reads, a
+/// private zero attachment with one page written, and a demand region with
+/// one page written. Returns their addresses.
+fn fixtures() -> (u64, u64, u64)
+{
+    let fail = |what: &str| -> ! {
+        println!("stuck");
+        eprintln!("{PHASE}: child: {what}");
+        std::process::exit(2)
+    };
+    let (handle, pages) = seal();
+    let object = reserve(pages);
+    let object_va = object.va_start();
+    if attach(object_va, pages, MAP_READ, 0, 0, Some(handle)) != memmgr_errors::SUCCESS
+    {
+        fail("the object attachment was refused");
+    }
+
+    let zero = reserve(ZERO_FIXTURE_PAGES);
+    let zero_va = zero.va_start();
+    if attach(
+        zero_va,
+        ZERO_FIXTURE_PAGES,
+        MAP_READ | MAP_WRITABLE,
+        0,
+        memmgr_labels::ATTACH_PRIVATE,
+        None,
+    ) != memmgr_errors::SUCCESS
+    {
+        fail("the zero attachment was refused");
+    }
+    // SAFETY: the page is in the writable private attachment above; no
+    // reference points into it.
+    unsafe {
+        std::ptr::write_volatile(
+            page_at(zero_va, ZERO_WRITTEN_PAGE) as *mut u64,
+            ZERO_WRITTEN,
+        );
+    }
+
+    let demand = reserve(DEMAND_FIXTURE_PAGES);
+    let demand_va = demand.va_start();
+    let register = IpcMessage::builder(memmgr_labels::REGISTER_REGION)
+        .word(0, demand_va)
+        .word(1, DEMAND_FIXTURE_PAGES * PAGE_SIZE)
+        .word(2, syscall::MAP_WRITABLE)
+        .word(3, 0)
+        .build();
+    if memmgr_label(&register, "REGISTER_REGION of the demand fixture") != memmgr_errors::SUCCESS
+    {
+        fail("the demand region was refused");
+    }
+    // SAFETY: the page is in the demand region registered writable above; no
+    // reference points into it.
+    unsafe { std::ptr::write_volatile(page_at(demand_va, 1) as *mut u64, DEMAND_WRITTEN) };
+    (object_va, zero_va, demand_va)
+}
+
+/// The `snapshot-child` role: set up the fixtures, start the writer, print
+/// `ready <base> <object> <zero> <demand>` once it has made a pass, and answer
+/// the parent's lines until `exit` or the end of stdin: `usage` prints
+/// `usage <own pages>`, `past <value>` prints `ok` once the writer passes
+/// `value`, or `stuck`.
 fn child_main() -> !
 {
     let buffer: &'static mut [u64] = Box::leak(vec![0u64; BUFFER_WORDS].into_boxed_slice());
@@ -208,13 +303,14 @@ fn child_main() -> !
         // reference reads; the write makes it present before the writer runs.
         unsafe { std::ptr::write_volatile(page_at(base, page) as *mut u64, 0) };
     }
+    let (object_va, zero_va, demand_va) = fixtures();
     start_writer(base);
     if !passes(base, 0)
     {
         println!("stuck");
         std::process::exit(2);
     }
-    println!("ready {base:x}");
+    println!("ready {base:x} {object_va:x} {zero_va:x} {demand_va:x}");
 
     let mut line = String::new();
     loop
@@ -257,6 +353,12 @@ struct Snapped
     badge: u64,
     /// The first of the writer's pages in the child's space.
     base: u64,
+    /// The child's object attachment.
+    object_va: u64,
+    /// The child's zero attachment.
+    zero_va: u64,
+    /// The child's demand region.
+    demand_va: u64,
 }
 
 impl Snapped
@@ -279,12 +381,25 @@ impl Snapped
             stdout,
             badge: 0,
             base: 0,
+            object_va: 0,
+            zero_va: 0,
+            demand_va: 0,
         };
         let ready = snapped.line("ready");
-        snapped.base = ready
-            .strip_prefix("ready ")
-            .and_then(|w| u64::from_str_radix(w.trim(), 16).ok())
-            .unwrap_or_else(|| panic!("{PHASE}: the child printed {ready:?}"));
+        let parsed: Option<Vec<u64>> = ready.strip_prefix("ready ").and_then(|w| {
+            w.split_ascii_whitespace()
+                .map(|v| u64::from_str_radix(v, 16).ok())
+                .collect()
+        });
+        let Some([base, object_va, zero_va, demand_va]) = parsed.as_deref()
+        else
+        {
+            panic!("{PHASE}: the child printed {ready:?}");
+        };
+        snapped.base = *base;
+        snapped.object_va = *object_va;
+        snapped.zero_va = *zero_va;
+        snapped.demand_va = *demand_va;
         let new: Vec<u64> = listed_badges(authority)
             .into_iter()
             .filter(|badge| !before.contains(badge))
@@ -413,7 +528,7 @@ fn capture(authority: u64, child: &mut Snapped)
         "{PHASE}: the child's usage went from {child_before} to {child_after}"
     );
 
-    read_object(handle, pages, child.base, &mut values);
+    read_object(handle, pages, child, &mut values);
     let released = own_usage();
     assert!(
         released.saturating_add(pages) <= after,
@@ -447,6 +562,7 @@ pub(super) struct Attached
     pages: u64,
     range: std::os::seraph::ReservedRange,
     header: Header,
+    regions: Vec<RegionEntry>,
     runs: Vec<Run>,
     /// The caller's phase, which a failure names.
     phase: String,
@@ -490,9 +606,16 @@ impl Attached
         );
         let layout = page_bytes(va, header.layout_pages);
         let count = usize::try_from(header.run_count).unwrap_or(usize::MAX);
+        let region_count = usize::try_from(header.region_count).unwrap_or(usize::MAX);
+        let regions: Vec<RegionEntry> = (0..region_count)
+            .map(|i| {
+                RegionEntry::decode(layout, i)
+                    .unwrap_or_else(|| panic!("{phase}: region {i} of {header:?} does not decode"))
+            })
+            .collect();
         let runs: Vec<Run> = (0..count)
             .map(|i| {
-                Run::decode(layout, i)
+                Run::decode(layout, header.region_count, i)
                     .unwrap_or_else(|| panic!("{phase}: run {i} of {header:?} does not decode"))
             })
             .collect();
@@ -502,6 +625,7 @@ impl Attached
             pages,
             range,
             header,
+            regions,
             runs,
             phase: phase.to_owned(),
         }
@@ -513,16 +637,28 @@ impl Attached
         &self.header
     }
 
+    /// The object's regions.
+    pub(super) fn regions(&self) -> &[RegionEntry]
+    {
+        &self.regions
+    }
+
+    /// The run covering the target's page at address `at`.
+    pub(super) fn run(&self, at: u64) -> Option<&Run>
+    {
+        self.runs
+            .iter()
+            .find(|r| at >= r.va && at < page_at(r.va, r.pages))
+    }
+
     /// The object page holding the target's page at address `at`: `None` when
-    /// no run covers it, or its run is absent or places no object page. Panics
-    /// when the run places it outside the object's data pages.
+    /// no run covers it, or its run holds no bytes of it (absent, zero, image
+    /// or placing no object page). Panics when the run places it outside the
+    /// object's data pages.
     pub(super) fn page(&self, at: u64) -> Option<&[u8]>
     {
-        let run = self
-            .runs
-            .iter()
-            .find(|r| at >= r.va && at < page_at(r.va, r.pages))?;
-        if run.flags & RUN_ABSENT != 0 || run.object_page == NO_OBJECT_PAGE
+        let run = self.run(at)?;
+        if !run.has_bytes()
         {
             return None;
         }
@@ -572,30 +708,204 @@ impl Attached
     }
 }
 
-/// Attach the `pages`-page object `handle` names, read the writer's pages
-/// from it to `values`, detach it and release it.
-fn read_object(handle: u64, pages: u64, base: u64, values: &mut Vec<u64>)
+/// The first word of an object page's bytes.
+fn word0(bytes: &[u8]) -> u64
+{
+    bytes
+        .first_chunk::<8>()
+        .copied()
+        .map_or(0, u64::from_ne_bytes)
+}
+
+/// The last word of an object page's bytes.
+fn last_word(bytes: &[u8]) -> u64
+{
+    bytes
+        .last_chunk::<8>()
+        .copied()
+        .map_or(0, u64::from_ne_bytes)
+}
+
+/// Attach the `pages`-page object `handle` names, check its header, regions
+/// and runs against the child's fixtures, read the writer's pages from it to
+/// `values`, detach it and release it.
+fn read_object(handle: u64, pages: u64, child: &Snapped, values: &mut Vec<u64>)
 {
     let object = Attached::attach(handle, pages, PHASE);
     assert_eq!(
         object.header().flags,
-        SNAPSHOT_COMPLETE,
-        "{PHASE}: the header {:?} of a complete snapshot",
+        SNAPSHOT_COMPLETE | SNAPSHOT_IMAGE,
+        "{PHASE}: the header {:?} of a complete snapshot with an image",
         object.header()
     );
+    assert!(
+        object.header().image.len > 0,
+        "{PHASE}: the header {:?} names an empty image",
+        object.header()
+    );
+    check_regions(&object, child);
+    check_image(&object);
+    check_object(&object, child.object_va);
+    check_zero(&object, child.zero_va);
+    check_demand(&object, child.demand_va);
     for page in 0..PAGES as u64
     {
-        let at = page_at(base, page);
+        let at = page_at(child.base, page);
         let bytes = object
             .page(at)
             .unwrap_or_else(|| panic!("{PHASE}: the snapshot holds no bytes of {at:#x}"));
-        let word = bytes
-            .first_chunk::<8>()
-            .copied()
-            .map_or(0, u64::from_ne_bytes);
-        values.push(word);
+        values.push(word0(bytes));
     }
     object.release();
+}
+
+/// Require the regions of the fixtures and an image region.
+fn check_regions(object: &Attached, child: &Snapped)
+{
+    let regions = object.regions();
+    for (va, pages, class, what) in [
+        (
+            child.object_va,
+            OBJECT_PAGES,
+            REGION_OBJECT,
+            "object attachment",
+        ),
+        (
+            child.zero_va,
+            ZERO_FIXTURE_PAGES,
+            REGION_ZERO,
+            "zero attachment",
+        ),
+        (
+            child.demand_va,
+            DEMAND_FIXTURE_PAGES,
+            REGION_DEMAND,
+            "demand region",
+        ),
+    ]
+    {
+        let found = regions.iter().find(|r| r.va == va);
+        let ok = found.is_some_and(|r| {
+            r.pages == pages
+                && r.class() == class
+                && match class
+                {
+                    REGION_OBJECT => r.first_page == 0,
+                    REGION_ZERO => r.flags & REGION_PRIVATE != 0,
+                    _ => true,
+                }
+        });
+        assert!(
+            ok,
+            "{PHASE}: the {what} at {va:#x} of {pages} pages is region {found:?} of {regions:?}"
+        );
+    }
+    assert!(
+        regions.iter().any(|r| r.class() == REGION_IMAGE),
+        "{PHASE}: no image region in {regions:?}"
+    );
+}
+
+/// Require every image run to lie in an image region and name the image
+/// object's page that region gives, and at least one image run.
+fn check_image(object: &Attached)
+{
+    let mut seen = false;
+    for run in object.runs.iter().filter(|r| r.flags & RUN_IMAGE != 0)
+    {
+        seen = true;
+        let end = page_at(run.va, run.pages);
+        let region = object
+            .regions()
+            .iter()
+            .find(|r| r.class() == REGION_IMAGE && run.va >= r.va && end <= page_at(r.va, r.pages));
+        let ok = region.is_some_and(|r| {
+            run.object_page
+                == r.first_page
+                    .saturating_add(run.va.wrapping_sub(r.va) / PAGE_SIZE)
+        });
+        assert!(
+            ok,
+            "{PHASE}: the image run {run:?} at {:#x} lies in region {region:?}",
+            run.va
+        );
+    }
+    assert!(seen, "{PHASE}: no image run in {:?}", object.runs);
+}
+
+/// Require the object attachment's pages, which the child never reads, to
+/// hold the pattern in the snapshot's bytes.
+fn check_object(object: &Attached, va: u64)
+{
+    for p in 0..OBJECT_PAGES
+    {
+        let at = page_at(va, p);
+        let bytes = object.page(at).unwrap_or_else(|| {
+            panic!(
+                "{PHASE}: no bytes of the object page at {at:#x}, run {:?}",
+                object.run(at)
+            )
+        });
+        assert!(
+            word0(bytes) == pattern(p, 0) && last_word(bytes) == pattern(p, LAST_WORD),
+            "{PHASE}: the object page at {at:#x} holds {:#x}..{:#x}, run {:?}",
+            word0(bytes),
+            last_word(bytes),
+            object.run(at)
+        );
+    }
+}
+
+/// Require the zero attachment's written page, its zero first chunk and its
+/// other untouched pages.
+fn check_zero(object: &Attached, va: u64)
+{
+    for p in 0..ZERO_FIXTURE_PAGES
+    {
+        let at = page_at(va, p);
+        let run = object.run(at);
+        let is_zero = run.is_some_and(|r| r.flags & RUN_ZERO != 0);
+        let bytes = object.page(at);
+        let ok = if p == ZERO_WRITTEN_PAGE
+        {
+            bytes.is_some_and(|b| word0(b) == ZERO_WRITTEN)
+        }
+        else if p < CHUNK
+        {
+            is_zero
+        }
+        else
+        {
+            is_zero || bytes.is_some_and(|b| word0(b) == 0)
+        };
+        assert!(
+            ok,
+            "{PHASE}: the zero page {p} at {at:#x} is run {run:?}, first word {:?}",
+            bytes.map(word0)
+        );
+    }
+}
+
+/// Require the demand region's written page and its untouched chunks.
+fn check_demand(object: &Attached, va: u64)
+{
+    for p in 0..DEMAND_FIXTURE_PAGES
+    {
+        let at = page_at(va, p);
+        let run = object.run(at);
+        let bytes = object.page(at);
+        let ok = match p
+        {
+            1 => bytes.is_some_and(|b| word0(b) == DEMAND_WRITTEN),
+            p if p >= CHUNK => run.is_some_and(|r| r.flags & RUN_ZERO != 0),
+            _ => true,
+        };
+        assert!(
+            ok,
+            "{PHASE}: the demand page {p} at {at:#x} is run {run:?}, first word {:?}",
+            bytes.map(word0)
+        );
+    }
 }
 
 /// The refusals: `UNAUTHORIZED` over svctest's procmgr cap, which carries no

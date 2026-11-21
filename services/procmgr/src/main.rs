@@ -2427,6 +2427,7 @@ fn handle_snapshot(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     let caps = req.caps();
     let account = process::CapGuard::new(caps.first().copied().unwrap_or(0));
     release_caps(caps.get(1..).unwrap_or(&[]));
+    let mut image_ref = 0;
     let target = {
         let table = &mut ctx.tables.lock().table;
         process_table::snapshot_target(table, req.badge, req.word(0), account.cap())
@@ -2442,13 +2443,29 @@ fn handle_snapshot(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
                 {
                     return Err(procmgr_errors::OUT_OF_MEMORY);
                 }
+                image_ref = entry.image_ref;
                 Ok(snapshot::Target {
                     aspace,
                     thread,
                     memmgr_badge: entry.memmgr_badge,
+                    image: None,
                 })
             })
     };
+    // The image, by the target's reference, under the cache's lock alone: a
+    // teardown meanwhile drops the reference, and the capture then names no
+    // image, memmgr writing the pages it attaches as any other object's.
+    let target = target.map(|mut target| {
+        target.image =
+            image_cache::snapshot_image(image_ref).map(|(handle, key)| snapshot::TargetImage {
+                handle: process::CapGuard::new(handle),
+                image: ipc::procmgr_snapshot::Image {
+                    hash: key.hash,
+                    len: key.len,
+                },
+            });
+        target
+    });
     let capture = snapshot::Context {
         self_aspace: ctx.self_aspace,
         memmgr_ep: ctx.memmgr_ep,

@@ -220,9 +220,11 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  68  SYS_THREAD_READ_EXT_REGS
                                  69  SYS_ENDPOINT_BADGE
                                  70  SYS_MMIO_MERGE
+                                 71  SYS_ASPACE_HOLD
+                                 72  SYS_ASPACE_RELEASE
 ```
 
-**Implementation status.** Every number 0–70 has a handler; unallocated numbers
+**Implementation status.** Every number 0–72 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -1674,6 +1676,8 @@ A stopped thread whose blocked syscall a waker claimed before the stop is restar
 waker's wake has landed, so the resumed syscall returns the delivered result (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol, invariant 4).
+A start of a thread of a held address space returns 0 and is deferred: the release starts it
+(§ `SYS_ASPACE_HOLD` (71)).
 
 **Arguments:**
 
@@ -1701,8 +1705,9 @@ lands first leaves the target other than `Created` and the suspended start is re
 `InvalidCapability`, `InsufficientRights` (cap lacks Control),
 `InvalidArgument` (the target is the caller, is not yet configured, or is not in Created/Stopped
 state under the locked commit — including one a concurrent start already resumed, or one that
-exited or was killed by an object teardown after the first check — or, for a suspended start, is
-not `Created` when it commits), `Interrupted` (the caller was itself stopped while the start waited
+exited or was killed by an object teardown after the first check — or was stopped by an
+address-space hold, § `SYS_ASPACE_HOLD` (71), or, for a suspended start, is not `Created` when it
+commits), `Interrupted` (the caller was itself stopped while the start waited
 for the target to leave its CPU or for an owed wake; never for a suspended start, which waits for
 nothing). Each
 stop admits at most one start commit: absent an intervening stop, exactly one of several
@@ -1794,7 +1799,8 @@ preemption disabled leaves the slice running and adds nothing to that budget.
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidState` (thread not yet started, already stopped, or exited when the call reads it,
+`InvalidState` (thread not yet started, already stopped other than by an address-space hold
+(§ `SYS_ASPACE_HOLD` (71), which a stop overrides), or exited when the call reads it,
 including one killed by an object teardown concurrently with the call; two concurrent stops of one
 running thread can both succeed).
 
@@ -2005,7 +2011,9 @@ bound fault handler inspect the faulting registers (see
 [`docs/fault-handling.md`](../../../docs/fault-handling.md)), or queued for the handler's receive
 (`BlockedOnSend` with the delivery marked), or blocked in a syscall in any other state
 (`THREAD_REGS_SYSCALL`): a call, a receive, a wait, or a sleep. The kernel decides the reported
-state under the same scheduling-lock hold as its copy of the frame, so the two agree. The frame of
+state under the same scheduling-lock hold as its copy of the frame, so the two agree. A thread an
+address-space hold stopped inside a delivery or a syscall is reported as that delivery or syscall,
+which it resumes at the release ([`SYS_ASPACE_HOLD`](#sys_aspace_hold-71)). The frame of
 a thread blocked in a syscall is the one its syscall entry saved: its instruction pointer is as that
 frame holds it, past the `syscall` instruction on x86-64 and at the `ecall` on riscv64, as for a
 fault-blocked thread at a syscall-point upcall
@@ -2061,7 +2069,8 @@ reply (`BlockedOnFault`) — the latter lets a bound fault handler advance the P
 or otherwise edit the faulting thread before replying (see
 [`docs/fault-handling.md`](../../../docs/fault-handling.md)). A thread blocked in a syscall in any
 other state, which `SYS_THREAD_READ_REGS` reads, is refused with `InvalidState`: the syscall's
-return still writes the frame. The kernel sanitizes
+return still writes the frame. So is a thread an address-space hold stopped, which resumes its
+delivery or syscall at the release ([`SYS_ASPACE_HOLD`](#sys_aspace_hold-71)). The kernel sanitizes
 the frame per architecture ([arch-interface.md](arch-interface.md) § `trap_frame` —
 `arch::current::trap_frame`): a non-user instruction pointer (on x86-64, also a non-user
 stack pointer) is rejected with `InvalidArgument`; x86-64 forces ring-3 selectors and
@@ -2084,8 +2093,8 @@ that switch to finish.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState`
 (thread neither stopped and descheduled nor fault-blocked, a thread blocked in a syscall
-included), `InvalidArgument` (buffer too small, null pointer, no register frame, or illegal
-register values), `InvalidAddress` (buffer outside
+included, or stopped by an address-space hold), `InvalidArgument` (buffer too small, null
+pointer, no register frame, or illegal register values), `InvalidAddress` (buffer outside
 the user half, or a fault on it that is unhandled; restartable, § Restartable Syscalls).
 
 ---
@@ -3324,6 +3333,115 @@ the right does not.
 page-aligned, the range not wholly in the user half at or above `USER_VA_FLOOR`, a null bitmap,
 the bitmap not wholly in the user half, or a fault on the bitmap that is unhandled; restartable,
 § Restartable Syscalls). A failed call clears no accessed bit.
+
+---
+
+### `SYS_ASPACE_HOLD` (71)
+
+Hold an address space: stop every thread of it without cancelling any park, and defer every start
+of one, until `SYS_ASPACE_RELEASE`. While the space is held none of its threads executes a user
+instruction, so its memory and its threads' registers can be read as of one point.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `aspace_cap` | AddressSpace capability (Control rights) to hold |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+The kernel finds the space's threads by the thread-registry walk an object teardown makes
+([scheduling-internals.md](scheduling-internals.md) § Thread Registry), so a thread no user-space
+registry knows of is held too. Each thread is decided under its `sched_lock` by its state:
+
+- `Ready`: stopped at once, its run-queue link removed.
+- `Running`: marked, and left running until it next leaves its CPU runnable (its slice expiry, a
+  preemption, or a yield), where it stops instead of being requeued. A marked thread that parks
+  first is then a parked thread.
+- `Blocked` (on IPC, in `SYS_THREAD_SLEEP`, in a fault or an upcall delivery): marked and left
+  parked. Its park is not cancelled: the wake that ends it (a reply, a delivery, a fault reply, a
+  cancellation, an upcall post, or the expiry of its deadline) deposits its outcome in the thread
+  as it would, and leaves the thread stopped instead of runnable. Its syscall returns that outcome
+  after the release; a timed call whose deadline passed during the hold returns `WouldBlock`.
+- `Created`, `Stopped` and `Exited`: left as they are.
+
+A `SYS_THREAD_START` of a thread of a held space, `Created` or stopped by `SYS_THREAD_STOP`,
+returns 0 and is deferred: the thread stays `Stopped` until the release starts it. A suspended
+start (`THREAD_START_SUSPENDED`) is not deferred: it leaves the thread `Stopped`, as it does
+outside a hold, and the release does not start it.
+
+The call returns once no thread of the space is `current` on any CPU and each one's register
+save has published, so `SYS_THREAD_READ_REGS` and `SYS_THREAD_READ_MEM` read the held state. A
+marked thread running on another CPU leaves it at its next slice expiry or its own park or yield,
+so the call takes up to the stop latency of § `SYS_THREAD_STOP` (20), its latency contract, for
+the slowest thread of the space. The caller spins meanwhile, preemption disabled and interrupts
+enabled.
+
+`SYS_THREAD_READ_REGS` reports each thread of a held space as the state it resumes in at the
+release. A marked `Blocked` thread is reported as any `Blocked` thread is. A thread the hold
+stopped inside a fault or an upcall delivery is reported `THREAD_REGS_FAULT`. One it stopped
+inside a syscall (its park's wake came during the hold, or it was runnable in the kernel) is
+reported `THREAD_REGS_SYSCALL`, its result registers unspecified until the syscall returns after
+the release. One it stopped in user mode is reported `THREAD_REGS_STOPPED`.
+`SYS_THREAD_WRITE_REGS` refuses a thread the hold stopped with `InvalidState`, since the
+delivery or syscall it resumes at the release still writes its frame.
+
+No kernel path writes a held space's user memory on behalf of its threads. A wake's deposit stays
+in the thread's kernel state (an IPC reply in its message staging, a fault reply as its fault
+outcome, a timeout or a cancellation as its park disposition), and the thread copies a reply into
+its IPC buffer itself when it resumes after the release. Writes by other agents still land: a
+`SYS_THREAD_WRITE_MEM`, a `SYS_MEM_MAP`, `SYS_MEM_UNMAP` or `SYS_MEM_PROTECT` through a
+capability to the space, and any write to a frame the space shares with another address space
+that is not held too.
+
+**Stops and ends during a hold.** A thread the hold stopped is running to its starter and its
+stopper: `SYS_THREAD_START` of it returns `InvalidArgument`, and `SYS_THREAD_STOP` of it returns
+0 and leaves it stopped for good, so the release does not start it. A thread `SYS_THREAD_STOP`
+stopped before the hold, or during it, stays stopped at the release. A thread that exits or is
+killed during the hold stays `Exited`. Deleting the space's last capability during the hold tears
+it down as any other space, killing its threads (§ `SYS_CAP_DELETE`). A hold has no timeout: the
+space stays held until a holder of a Control capability to it releases it.
+
+**Cost.** The walk holds the thread registry's lock across every live thread of the system, with
+interrupts disabled on the calling CPU, and takes every CPU's scheduler lock once for each `Ready`
+thread of the space, as the teardown walk does: O(threads + Ready threads of the space × CPUs).
+
+**Capability requirement:** `aspace_cap` must have Control rights.
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidArgument` (the
+caller's own address space, whose hold would wait for its caller), `InvalidState` (the space is
+held, or a hold or a release of it is in progress), `Interrupted` (the caller was stopped, killed,
+or marked by a hold of its own space while it waited; the hold was undone, as a release undoes it,
+and the caller left its CPU. Two threads holding each other's spaces cannot wait for each other:
+at least one of them is interrupted).
+
+---
+
+### `SYS_ASPACE_RELEASE` (72)
+
+End the hold of an address space (§ `SYS_ASPACE_HOLD` (71)). The release starts exactly the
+threads the hold stopped, stopped at a wake or at their CPU's reschedule, or whose start it
+deferred; each resumes where it stopped, with the outcome a wake deposited for it during the hold.
+A marked thread still parked is unmarked, and the wake that ends its park makes it runnable as
+usual.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `aspace_cap` | AddressSpace capability (Control rights) to release |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+A thread to start that is still switching out of a CPU, or whose waker has not finished its wake,
+is started once it has; the call waits for it, spinning with interrupts enabled. That wait is the
+tail of a switch or a wake already under way, which no other thread's progress gates. The walk
+costs what the hold's does, with every CPU's scheduler lock taken once for each thread started.
+
+**Capability requirement:** `aspace_cap` must have Control rights.
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState` (the
+space is not held: no hold was made, a release ended it, or a hold of it has not yet returned).
 
 ---
 

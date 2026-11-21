@@ -413,9 +413,9 @@ validates the API once per boot.
   generator as it comes online; after SMP bringup the BSP asserts every sample
   is non-trivial, samples are pairwise distinct (per-CPU independence), and the
   aggregate bit balance is sane. The result prints as `entropy: SELFTEST PASS`
-  or `entropy: SELFTEST FAIL`; the FAIL marker is matched by the run-parallel
+  or `entropy: SELFTEST FAIL`; the FAIL marker is matched by the `run --runs`
   fail-regex
-  ([xtask/README.md § run-parallel](../../../xtask/README.md#cargo-xtask-run-parallel)),
+  ([xtask/README.md § Classified boots](../../../xtask/README.md#classified-boots---runs)),
   turning a QEMU run red on either architecture. Validated on
   x86_64 (firmware-seeded — `entropy: seeded from boot seed` — since OVMF
   implements `EFI_RNG_PROTOCOL`) and riscv64 (firmware-seeded through

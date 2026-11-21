@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 use crate::arch::Arch;
 use crate::breakpoint_kill;
 use crate::cli::{CoreDeathTarget, TestCoreDeathArgs};
-use crate::commands::run_parallel::HANDOVER_MARKER;
+use crate::commands::run::classified::HANDOVER_MARKER;
 use crate::context::Context;
 use crate::debug_stub;
 use crate::disk::DiskLayout;

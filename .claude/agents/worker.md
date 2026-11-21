@@ -315,9 +315,9 @@ signature you cannot explain, record the copied log's path in your status (§ Re
 the re-run.
 
 Run every command through `cargo xtask`. Boot with
-`cargo xtask run-parallel --arch <a> --parallel 1 --runs 1 --timeout <s>`, which boots the same
-sysroot as the `cargo xtask run` that `.claude/CLAUDE.md` § Validation names and judges the same
-pass marker, with a bound. Run `cargo xtask clean` between architectures.
+`cargo xtask run --arch <a> --runs 1 --timeout <s>`, which boots the same sysroot as the
+`cargo xtask run` that `.claude/CLAUDE.md` § Validation names and judges the same pass marker, with
+a bound. Run `cargo xtask clean` between architectures.
 
 Orchestrated:
 

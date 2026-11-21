@@ -487,9 +487,9 @@ spin site; the softlockup watchdog's lock-wait breadcrumb names the lock
 
 ## ThreadState Transitions
 
-Thread lifecycle is `Created → Ready ↔ Running ↔ Blocked → Exited`, with `Stopped` as a
-restartable state entered from `Running`, `Ready` or `Blocked` and left for `Ready` by
-`sys_thread_start`, or for `Exited` by a teardown or, while a thread stopped on another CPU still
+Thread lifecycle is `Created → Ready ↔ Running ↔ Blocked → Exited`, with `Stopped` as a restartable
+state entered from `Running`, `Ready` or `Blocked` and left for `Ready` by `sys_thread_start` or an
+address-space release, or for `Exited` by a teardown or, while a thread stopped on another CPU still
 runs, by its own exit or a terminal fault.
 
 The transition table below pins every ThreadState write to a syscall/event, the CPU performing the
@@ -523,17 +523,23 @@ write, and the canonical helper / locks held. Deviations from this table are bug
 | `*` | `Exited` | object teardown (`stop_threads_bound_to`) | calling CPU | under `THREAD_REGISTRY_LOCK`: `commit_cancelling_park(Exited)` with `EXIT_KILLED` (cancelling a `Blocked` target's park first); waits for marked threads after releasing the registry lock (§ Thread Registry) |
 | `*` | `Exited` | `dealloc_object(Thread)` (refcount → 0) | calling CPU | acquires `(*tcb).sched_lock` (outer), then every CPU's scheduler.lock in ascending order, writes `Exited`, walks `remove_from_queue` for every CPU, releases all; then waits unconditionally for `sched.current != tcb` on *every* CPU *and* `tcb.context_saved == 1` (see Cross-CPU TCB Ownership) before freeing |
 | `Exited` | `*` | any lifecycle write (`sys_thread_start`, `sys_thread_stop`, a second exit) | calling CPU | refused: the all-locks commit (`set_state_under_all_locks`, `exit_under_all_locks`, `commit_cancelling_park`) returns `StateCommit::RefusedExited`, `start_under_all_locks` returns `StartCommit::Refused`, and `enqueue_ready_thread` returns `ReadyLink::Exited` when the target is `Exited` under the held locks — `Exited` is terminal. A lifecycle syscall's unlocked precheck can race an object teardown (§ Thread Registry) or an exit; `sys_thread_start` then returns `InvalidArgument`, `sys_thread_stop` `InvalidState`, and neither revives the thread (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#lifecycle-state-machine)). |
+| `Ready` | `Stopped` | `sys_aspace_hold` on a `Ready` thread of the held space | calling CPU | registry walk (`THREAD_REGISTRY_LOCK`), the thread's `sched_lock`, then every CPU's scheduler.lock ascending: the `Stopped` commit, the hold mark set, and `remove_from_queue` on every CPU (`stop_ready_under_cpu_locks`; [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Address-Space Hold) |
+| `Blocked` | `Stopped` | a wake of a thread an address-space hold marked `Pending` | wake-issuing CPU | `enqueue_and_wake`'s `Blocked` arm under the woken thread's `sched_lock`: commits `Stopped` and moves the mark to `Stopped` instead of linking, clears the park binding, and releases `wake_in_flight`; the waker's deposit is already in the TCB |
+| `Running` | `Stopped` | `schedule()`'s requeue of a runnable `current` an address-space hold marked `Pending` | running CPU | `current.sched_lock`: commits `Stopped` and moves the mark to `Stopped` instead of requeuing, before the cross-CPU affinity branch, so nothing is linked |
+| `Created`, `Stopped` | `Stopped` | `sys_thread_start` of a thread of a held address space | calling CPU | `start_under_all_locks`: the all-locks commit, once the target is settled, writes `Stopped` with the hold mark `Stopped` (`StateCommit::Deferred`) and links nothing |
+| `Stopped` | `Ready` | `sys_aspace_release` of a thread the hold stopped | calling CPU | registry walk, the thread's `sched_lock`, then every CPU's scheduler.lock: the `Ready` commit once `start_ready_to_link` holds, advancing `start_seq` and clearing the mark, then `enqueue_ready_thread(target_cpu, start_seq)` after the unlock |
 
 All `Running→Blocked` parks MUST route through `commit_blocked_under_local_lock` (or
-`commit_reply_rebind_under_local_lock` for the receive's rebind); all `Blocked→Ready` *wakes*
-MUST route through `enqueue_and_wake`. The deliberate `→Ready` *placements* that the caller owns
-(the thread is provably not live) route through `enqueue_ready_thread` instead — currently only
-`sys_thread_start`. Both the all-locks commit and `enqueue_ready_thread` refuse an `Exited`
-target (the terminal row above), so a placement that raced a teardown cannot link a dead thread.
-The link also requires the thread to be still `Ready` at the `start_seq` its commit advanced: a
-stop (and any restart, which links the thread itself) between the commit and the link supersedes
-the start, which then links nothing, so a thread is never linked twice or linked after it ran
-and parked.
+`commit_reply_rebind_under_local_lock` for the receive's rebind); all `Blocked→Ready` *wakes* MUST
+route through `enqueue_and_wake`, whose `Blocked` arm commits `Stopped` instead for a thread an
+address-space hold marked (the hold divert row above). The deliberate `→Ready` *placements* that the
+caller owns (the thread is provably not live) route through `enqueue_ready_thread` instead —
+currently `sys_thread_start` and the address-space release (`release_space`). Both the all-locks
+commit and `enqueue_ready_thread` refuse an `Exited` target (the terminal row above), so a placement
+that raced a teardown cannot link a dead thread. The link also requires the thread to be still
+`Ready` at the `start_seq` its commit advanced: a stop (and any restart, which links the thread
+itself) between the commit and the link supersedes the start, which then links nothing, so a thread
+is never linked twice or linked after it ran and parked.
 Direct `(*tcb).state` writes from an IPC primitive — under the source lock or otherwise — are
 forbidden; they race the all-locks `Stopped` commit and silently clobber Stopped. No IPC primitive
 un-commits a park (rule 8).
@@ -647,6 +653,10 @@ destination scheduler's lock. The known sites are:
   `start_under_all_locks(target, caller)` to commit the state transition and then
   a separate `enqueue_ready_thread(target_cpu, start_seq)` to commit the
   queue link, made only while that commit is still current.
+- `release_space` (`core/kernel/src/sched/hold.rs`), whose release walk commits a
+  thread `Ready` under its `sched_lock` and every CPU lock and links it with
+  `enqueue_ready_thread(target_cpu, start_seq)` after the unlock, as
+  `sys_thread_start` does.
 
 (`dealloc_object(Thread)`'s server-side reply wake is no longer such a
 site: it leaves the bound client `Blocked` and routes the deferred wake
@@ -718,7 +728,8 @@ consistency window as for any other `enqueue_and_wake` racing
 `sys_thread_set_affinity`; see issue #116.
 
 **Enqueue-chokepoint enforcement (issues #244, #289).** Every run-queue
-insertion — `enqueue_and_wake`, `enqueue_ready_thread` (`sys_thread_start`),
+insertion — `enqueue_and_wake`, `enqueue_ready_thread` (`sys_thread_start` and the address-space
+release),
 `schedule()`'s outgoing requeue, `schedule()`'s deferred-dispatch re-link (under
 `next.sched_lock`, at the head of its run queue), `relocate_ready_priority`'s re-enqueue
 (`sys_thread_set_priority`), and `relocate_ready_thread`'s destination link
@@ -1675,9 +1686,11 @@ delivers the source it changed, the wait on that CPU's `irq::DeliveryGate`: `irq
 `schedule:context-saved`, `start:settle` (the
 `sys_thread_start` settle loop of `start_under_all_locks`), `regs:settle` (the register syscalls'
 wait for a `Blocked` thread to finish switching out, `with_held_frame`),
-`stop:save` (the `sys_thread_stop` save wait, `await_stopped_save`), or `fault:rebind` (a
+`stop:save` (the `sys_thread_stop` save wait, `await_stopped_save`), `fault:rebind` (a
 fault-handler binding change's wait for a delivery opened under the old binding to commit its
-park, `ipc::fault::redeliver_in_flight`).
+park, `ipc::fault::redeliver_in_flight`), `hold:settle` (an address-space hold's wait for the
+space's threads to leave their CPUs, `hold_space`), or `release:settle` (a release's wait for a
+thread it starts to settle, `release_space`).
 The `dealloc_object(Thread)` gates carried no overlong-duration warning of
 their own, so a wedge there showed only an opaque `current = Exited` in
 `SYS_CAP_DELETE` (#351); the breadcrumb makes it explicit. The `schedule()`
@@ -1777,10 +1790,13 @@ overhead in healthy paths.
 
 `core/kernel/src/sched/thread_registry.rs` is an intrusive doubly-linked list of
 every live non-idle TCB, threaded through `registry_next` / `registry_prev` and guarded by
-`THREAD_REGISTRY_LOCK` (Lock Hierarchy rule 3). It serves three readers: the
+`THREAD_REGISTRY_LOCK` (Lock Hierarchy rule 3). It serves four readers: the
 softlockup watchdog, which enumerates `Blocked` waiters that the per-CPU
 `current` dump cannot reach; object teardown, which finds every thread bound
-to a dying `CSpace` or `AddressSpace`; and the `IoPort` teardown, which withdraws the
+to a dying `CSpace` or `AddressSpace`; the address-space hold and release, which
+find every thread of the held space
+([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Address-Space Hold); and
+the `IoPort` teardown, which withdraws the
 bindings made through the dying object from every thread's port-binding table
 ([capability-internals.md](capability-internals.md) § IoPort Bindings).
 

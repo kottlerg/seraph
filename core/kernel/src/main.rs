@@ -941,7 +941,7 @@ unsafe fn kernel_entry_post_rebase(
 
     // Validate the entropy subsystem now that every CPU's generator is live:
     // per-CPU independence + sanity (a power-on self-test). The PASS/FAIL marker
-    // is scraped by the run-parallel fail-regex.
+    // is scraped by the `run --runs` fail-regex.
     #[cfg(not(test))]
     entropy::selftest::run(cpu_count as usize);
 
@@ -1624,6 +1624,7 @@ unsafe fn kernel_entry_post_rebase(
                         park_started_tick: 0,
                         park_seq: core::sync::atomic::AtomicU32::new(0),
                         start_seq: 0,
+                        hold: crate::sched::hold::HoldMark::None,
                         ipc_state: sched::thread::IpcThreadState::None,
                         ipc_msg: ipc::message::Message::default(),
                         reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),

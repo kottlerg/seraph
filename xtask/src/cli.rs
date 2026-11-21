@@ -17,7 +17,7 @@ use crate::arch::Arch;
 use crate::bundle::Harness;
 use crate::context::Profile;
 use crate::disk::BlockSize;
-use crate::qemu::{DiskLine, Iommu, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack};
+use crate::qemu::{DiskLine, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack};
 
 args! {
     /// Top-level CLI entry point.
@@ -60,11 +60,13 @@ subcommands! {
         /// Build Seraph components and populate the sysroot.
         Build(BuildArgs),
 
-        /// Launch Seraph under QEMU. Requires a populated sysroot — run
-        /// `cargo xtask build` first.
+        /// Boot Seraph under QEMU against the populated sysroot (run
+        /// `cargo xtask build` first): one interactive boot, or with `--runs N`
+        /// N unattended boots, each classified by its log.
         Run(RunArgs),
 
-        /// Remove the sysroot (and optionally cargo target/).
+        /// Remove the sysroot, the symbols store and the disk images (and with
+        /// `--all` cargo's target/).
         Clean(CleanArgs),
 
         /// Check formatting and lint the test code, then run Seraph unit tests on
@@ -76,12 +78,7 @@ subcommands! {
         /// OpenSSL, or with `--check` fail unless they regenerate identically.
         CryptoVectors(CryptoVectorsArgs),
 
-        /// Launch N QEMU instances in parallel against an already-built image,
-        /// classifying each run's outcome via user-supplied pass/fail regexes.
-        /// Requires a populated sysroot — run `cargo xtask build` first.
-        RunParallel(RunParallelArgs),
-
-        /// Read preserved ktest boot logs (from `run-parallel --save-logs`) and
+        /// Read preserved ktest boot logs (from `run --runs N --save-logs`) and
         /// print per-tier and per-cell wall times; with `--base` and `--wide`,
         /// compare two widths against their width factor; with `--baseline`,
         /// compare one log against a checked-in baseline of the same width; with
@@ -158,14 +155,14 @@ subcommands! {
 
         /// Check that a boot whose bootloader redoes its steps 6 and 7 completes:
         /// stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot
-        /// once through `run-parallel`, assert the bootloader's knob line and the
+        /// once as `run --runs 1` boots it, assert the bootloader's knob line and the
         /// pass marker, and remove the knob again (see xtask/README.md).
         TestMapRedo(TestMapRedoArgs),
 
         /// Check that the log-level configuration reaches the services init
         /// spawns: install a configuration with vfsd set to debug and pack the
-        /// default-init bundle, boot the current sysroot once through
-        /// `run-parallel`, assert that vfsd's and fatfs's debug lines appear and
+        /// default-init bundle, boot the current sysroot once as `run --runs 1`
+        /// boots it, assert that vfsd's and fatfs's debug lines appear and
         /// devmgr's and procmgr's do not, and restore the configuration and the
         /// recorded harness's bundle (see xtask/README.md).
         TestLogLevel(TestLogLevelArgs),
@@ -337,7 +334,6 @@ impl CliCommand
             Self::CompareImages(args) => Some(&args.host),
             Self::TestSigning(args) => Some(&args.host.common),
             Self::Run(_)
-            | Self::RunParallel(_)
             | Self::KtestTiming(_)
             | Self::Symbolize(_)
             | Self::Mkdisk(_)
@@ -411,7 +407,8 @@ args! {
         pub alone: bool,
 
         /// A timing-sensitive measurement: run beside no other QEMU, under the
-        /// large-boot load limit, and refuse builds while it runs.
+        /// load limit of 10 of a boot that needs the host to itself, and refuse
+        /// builds while it runs.
         #[arg(long)]
         pub timing: bool,
 
@@ -542,31 +539,14 @@ fn parse_build_component(text: &str) -> Result<BuildComponent, String>
 // ── Run ───────────────────────────────────────────────────────────────────────
 
 args! {
-    pub struct RunArgs
+    /// The launch configuration of a boot of the sysroot: the machine QEMU
+    /// presents and what is attached to it, the same in both of `run`'s modes.
+    #[derive(Clone, Debug)]
+    pub struct LaunchArgs
     {
         /// Target architecture.
         #[arg(long, default_value = "x86_64")]
         pub arch: Arch,
-
-        /// Start QEMU with a GDB server on localhost:1234 (QEMU pauses at startup).
-        #[arg(long)]
-        pub gdb: bool,
-
-        /// Run without a display window (-display none).
-        #[arg(long)]
-        pub headless: bool,
-
-        /// Show all serial output including pre-boot firmware noise
-        /// (suppressed by default).
-        ///
-        /// By default, output is suppressed until the first line containing
-        /// '[--------] boot:', hiding UEFI/OpenSBI debug spam. The
-        /// control-sequence filter (drops xterm window manipulation,
-        /// alternate-screen toggles, mouse tracking, etc.) is always on in
-        /// both modes — verbose only disables the marker gate, not the
-        /// filter.
-        #[arg(long)]
-        pub verbose: bool,
 
         /// Number of vCPUs to expose to the guest (QEMU -smp).
         #[arg(long, default_value = "4")]
@@ -643,8 +623,8 @@ args! {
         #[arg(long, requires = "second_disk")]
         pub second_disk_shared_line: bool,
 
-        /// Attach the debug port: a `virtio-console` device, which devmgr binds
-        /// as the debug port, its host end a TCP server QEMU listens with on
+        /// Attach the debug port: a `virtio-serial-pci` device with one
+        /// `virtconsole` port, which devmgr binds as the debug port, its host end a TCP server QEMU listens with on
         /// `127.0.0.1:<PORT>` (a debugger connects with `target remote
         /// localhost:<PORT>`). The console keeps the UART.
         #[arg(long, value_name = "PORT")]
@@ -661,15 +641,10 @@ args! {
         /// functions. A svctest boot needs them (docs/testing.md § Gating).
         #[arg(long)]
         pub test_devices: bool,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
     }
 }
 
-impl RunArgs
+impl LaunchArgs
 {
     /// The second disk's `INTx` line `--second-disk-shared-line` selects.
     pub fn second_disk_line(&self) -> DiskLine
@@ -684,6 +659,165 @@ impl RunArgs
         }
     }
 }
+
+args! {
+    pub struct RunArgs
+    {
+        #[command(flatten)]
+        pub launch: LaunchArgs,
+
+        /// Boot N times unattended and classify each run's log as PASS, FAIL,
+        /// HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns,
+        /// failing unless every run passes (a QEMU-CRASH is tolerated). Without
+        /// it, `run` is one interactive boot whose serial output is the
+        /// terminal's.
+        #[arg(long, value_name = "N")]
+        pub runs: Option<u32>,
+
+        /// What the guest presents for display. `window` attaches QEMU std VGA
+        /// and shows it in a window; `framebuffer` attaches it with no window
+        /// (`-display none`), so the framebuffer driver runs on a host without a
+        /// graphical backend: the framebuffer device cell of the local and
+        /// release host runs (docs/testing.md "Coverage tiers"); `headless`
+        /// attaches no adapter, so the bootloader finds no GOP and devmgr
+        /// spawns no framebuffer driver. Default: `window` for the interactive
+        /// boot, `headless` with `--runs`, which refuses `window`.
+        #[arg(long)]
+        pub display: Option<QemuDisplay>,
+
+        /// Start QEMU with a GDB server on localhost:1234, paused at startup
+        /// (QEMU `-s -S`). Interactive boot only.
+        #[arg(long, conflicts_with_all = ["runs", "debug_listen"])]
+        pub gdb: bool,
+
+        /// Expose the guest's gdbstub on localhost:1234 without pausing it
+        /// (QEMU `-s`), so a wedged guest can be attached to post hoc:
+        /// `gdb -ex 'target remote :1234'`. With `--runs`, requires
+        /// `--parallel 1` (one gdbstub port).
+        #[arg(long)]
+        pub debug_listen: bool,
+
+        /// Show all serial output including pre-boot firmware noise
+        /// (suppressed by default). Interactive boot only.
+        ///
+        /// By default, output is suppressed until the first line containing
+        /// '[--------] boot:', hiding UEFI/OpenSBI debug spam. The
+        /// control-sequence filter (drops xterm window manipulation,
+        /// alternate-screen toggles, mouse tracking, etc.) is always on in
+        /// both modes — verbose only disables the marker gate, not the
+        /// filter.
+        #[arg(long, conflicts_with = "runs")]
+        pub verbose: bool,
+
+        /// Concurrency of `--runs`: number of QEMU instances in flight at once;
+        /// the runs are dispatched in waves of this many.
+        #[arg(long, default_value = "1", requires = "runs")]
+        pub parallel: u32,
+
+        /// Per-run timeout of `--runs`, in seconds. A run still alive at this
+        /// point is killed and classified as HANG.
+        #[arg(long, default_value = "30", requires = "runs")]
+        pub timeout: u64,
+
+        /// Regex marking a successful run of `--runs`. On match (and every
+        /// `--require` and `--crash-reports` check holding) the log is
+        /// discarded and the run is classified PASS. The default matches the
+        /// cross-harness terminal marker `[<harness>] ALL TESTS PASSED`
+        /// standardised in [`docs/testing.md`](../../docs/testing.md); override
+        /// for other rootfs configurations.
+        #[arg(long, default_value = DEFAULT_PASS_REGEX, requires = "runs")]
+        pub pass: String,
+
+        /// Regex marking a failed run of `--runs`. On match the log is
+        /// preserved as FAIL-<run>.log. Failure takes precedence over success.
+        /// The default matches the cross-harness terminal marker
+        /// `[<harness>] SOME TESTS FAILED`
+        /// ([`docs/testing.md`](../../docs/testing.md)) plus the kernel's
+        /// own death markers, so a crash classifies as FAIL rather than HANG: a
+        /// hardware trap prints `KERNEL EXCEPTION` then `FATAL:`
+        /// (`core/kernel/src/main.rs` `fatal()`), a Rust `panic!` prints
+        /// `PANIC at`/`PANIC:` (the `#[panic_handler]`), and the scheduler's
+        /// wedge detectors print a dump headed `=== WATCHDOG` (a kernel that
+        /// detected its own stall is a failure, not a hang), and the entropy
+        /// subsystem's boot self-test prints `entropy: SELFTEST FAIL`. The benign
+        /// userspace fault path prints `USERSPACE FAULT`, which none of these
+        /// match. Override with a never-matching pattern (e.g.
+        /// `'$.^'`) to disable.
+        #[arg(long, default_value = DEFAULT_FAIL_REGEX, requires = "runs")]
+        pub fail: String,
+
+        /// A further regex marking a failed run of `--runs`, matched beside
+        /// `--fail` rather than in its place, so the default's death markers
+        /// still apply: a run whose log matches either is FAIL, with the same
+        /// precedence and `--fail-grace-secs` kill. The framebuffer device cell
+        /// passes `'framebuffer case skipped'`, the line svctest logs when no
+        /// framebuffer driver runs.
+        #[arg(long, value_name = "REGEX", requires = "runs")]
+        pub fail_also: Option<String>,
+
+        /// A regex a line of the log must match for a run of `--runs` to pass;
+        /// repeatable, each must match. A run whose `--pass` pattern matched
+        /// but whose log has no line matching one of these is FAIL, naming the
+        /// pattern.
+        #[arg(long, value_name = "REGEX", requires = "runs")]
+        pub require: Vec<String>,
+
+        /// Check the crash service's report blocks in each passing run's log as
+        /// `cargo xtask test-crash-report --expect` checks a saved log: every
+        /// block well-formed, and `reports` the `crashme` fixture's three
+        /// reports, `none` no block at all. A run whose check fails is FAIL; a
+        /// QEMU-CRASH run is not checked.
+        #[arg(long, requires = "runs")]
+        pub crash_reports: Option<CrashReportExpect>,
+
+        /// On a hard-timeout HANG of `--runs`, do not kill the QEMU instance:
+        /// print the attach instructions and block until it is terminated
+        /// externally, preserving the wedged guest for inspection (pair with
+        /// `--debug-listen`). Requires `--parallel 1`.
+        #[arg(long, requires = "runs")]
+        pub hold_on_hang: bool,
+
+        /// Grace window of `--runs`, in seconds, after the first `--fail`
+        /// match before the run is `SIGKILLed`. A kernel fault dump is
+        /// multi-line and may be followed by secondary-CPU faults; killing on
+        /// the first matching byte truncates the diagnostics. The run is killed
+        /// at whichever is first: this window, or the `--timeout` deadline. 0
+        /// kills on the next poll after the match.
+        #[arg(long, default_value_t = DEFAULT_FAIL_GRACE_SECS, requires = "runs")]
+        pub fail_grace_secs: u64,
+
+        /// Also copy every run's log of `--runs`, whatever its outcome, to
+        /// `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run]` trailer
+        /// line that records the run's arch, width, accelerator, outcome, and
+        /// host wall time. DIR is created if absent and never purged; a file of
+        /// the same name is overwritten.
+        #[arg(long, value_name = "DIR", requires = "runs")]
+        pub save_logs: Option<PathBuf>,
+
+        /// The shared host's launch rules (see xtask/README.md "Host launch
+        /// rules").
+        #[command(flatten)]
+        pub host: BootHostArgs,
+    }
+}
+
+// ── Run classification ──────────────────────────────────────────────────────
+
+/// Default `run --fail` regex. Matches the cross-harness
+/// `SOME TESTS FAILED` marker plus the kernel's death markers so a crash is
+/// classified FAIL rather than HANG. `KERNEL EXCEPTION` + `FATAL:` cover the
+/// hardware-trap path; `PANIC( at |: )` covers the Rust `#[panic_handler]`;
+/// `entropy: SELFTEST FAIL` covers the kernel entropy self-test.
+/// The benign `USERSPACE FAULT` path matches none of these.
+pub const DEFAULT_FAIL_REGEX: &str =
+    r"SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL";
+
+/// Default `run --pass` regex: the cross-harness terminal pass
+/// marker `[<harness>] ALL TESTS PASSED` (docs/testing.md § Reporting marker).
+pub const DEFAULT_PASS_REGEX: &str = "ALL TESTS PASSED";
+
+/// Default `run --fail-grace-secs`.
+pub const DEFAULT_FAIL_GRACE_SECS: u64 = 10;
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
 
@@ -842,7 +976,7 @@ value_enum! {
 args! {
     pub struct TestCrashReportArgs
     {
-        /// A boot's saved serial log to check (a `run-parallel --save-logs`
+        /// A boot's saved serial log to check (a `run --runs N --save-logs`
         /// log). Nothing boots.
         #[arg(long, value_name = "FILE")]
         pub log: PathBuf,
@@ -1318,232 +1452,6 @@ value_enum! {
         Kernel,
         Init,
         All,
-    }
-}
-
-// ── RunParallel ───────────────────────────────────────────────────────────────
-
-/// Default `--fail` regex for `run-parallel`. Matches the cross-harness
-/// `SOME TESTS FAILED` marker plus the kernel's death markers so a crash is
-/// classified FAIL rather than HANG. `KERNEL EXCEPTION` + `FATAL:` cover the
-/// hardware-trap path; `PANIC( at |: )` covers the Rust `#[panic_handler]`;
-/// `entropy: SELFTEST FAIL` covers the kernel entropy self-test.
-/// The benign `USERSPACE FAULT` path matches none of these.
-pub const DEFAULT_FAIL_REGEX: &str =
-    r"SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL";
-
-/// Default `run-parallel --pass` regex: the cross-harness terminal pass
-/// marker `[<harness>] ALL TESTS PASSED` (docs/testing.md § Reporting marker).
-pub const DEFAULT_PASS_REGEX: &str = "ALL TESTS PASSED";
-
-/// Default `run-parallel --fail-grace-secs`.
-pub const DEFAULT_FAIL_GRACE_SECS: u64 = 10;
-
-args! {
-    pub struct RunParallelArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// Concurrency: number of QEMU instances in flight at once.
-        #[arg(long)]
-        pub parallel: u32,
-
-        /// Total runs to perform, dispatched in waves of `--parallel`.
-        #[arg(long)]
-        pub runs: u32,
-
-        /// Per-run timeout, in seconds. A run still alive at this point is
-        /// killed and classified as HANG.
-        #[arg(long, default_value = "30")]
-        pub timeout: u64,
-
-        /// Number of vCPUs to expose to each guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Logical CPUs per core in the guest's topology (QEMU
-        /// `-smp <cpus>,threads=<n>`); must divide `--cpus`. 2 presents SMT
-        /// sibling pairs, which the kernel's placement spreads threads across
-        /// (core/kernel/docs/scheduler.md "SMT Awareness"); riscv64 takes each
-        /// hart as a core of its own whatever this says.
-        #[arg(long, default_value = "1")]
-        pub threads_per_core: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// Guest RISC-V paging-mode ceiling (riscv64 only; ignored on `x86_64`).
-        /// The kernel negotiates the highest advertised mode at boot, so this
-        /// selects the mode every run in the batch exercises.
-        #[arg(long, default_value = "sv48")]
-        pub riscv_mmu: RiscvMmu,
-
-        /// Whether the guest RISC-V CPU implements the Zkr entropy source
-        /// (riscv64 only; ignored on `x86_64`), for every run in the batch. `off`
-        /// boots the kernel's hardware-RNG path without a source: its probe of the
-        /// `seed` CSR traps and the pool seeds from the firmware boot seed and
-        /// jitter.
-        #[arg(long, default_value = "on")]
-        pub riscv_zkr: RiscvZkr,
-
-        /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins
-        /// the QEMU CPU's `la57` property; the bootloader enables 5-level paging
-        /// when CPUID reports LA57, so this selects the depth a run exercises.
-        #[arg(long, default_value = "4")]
-        pub x86_paging: X86Paging,
-
-        /// Whether the guest x86-64 CPU offers CET supervisor shadow stacks
-        /// (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss`
-        /// property, so the host's CPU never decides it; a QEMU without the
-        /// property cannot offer them and gets no pin. `on` boots the kernel on
-        /// shadow stacks, or refuses to boot when the accelerator or the QEMU
-        /// cannot offer them; the cet cell (`cargo xtask test-cet`) is where they
-        /// are tested.
-        #[arg(long, default_value = "off")]
-        pub x86_shadow_stack: X86ShadowStack,
-
-        /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
-        /// devices behind it. `absent` boots the no-IOMMU variant, the no-iommu
-        /// device cell of the local and release host runs (docs/testing.md
-        /// "Coverage tiers"), which keeps devmgr's unconfined path covered while
-        /// the attached IOMMU confines every device a driver binds.
-        #[arg(long, default_value = "attached")]
-        pub iommu: Iommu,
-
-        /// What each guest presents for display. `headless` attaches no display
-        /// adapter, so the bootloader finds no GOP and devmgr spawns no
-        /// framebuffer driver; `framebuffer` keeps QEMU std VGA with no display
-        /// window (`-display none`), so the framebuffer driver runs on a host
-        /// without a graphical backend: the framebuffer device cell of the local
-        /// and release host runs (docs/testing.md "Coverage tiers").
-        #[arg(long, default_value = "headless")]
-        pub display: crate::qemu::BatchDisplay,
-
-        /// Regex marking a successful run. On match the log is discarded and
-        /// the run is classified PASS. The default matches the cross-harness
-        /// terminal marker `[<harness>] ALL TESTS PASSED` standardised in
-        /// [`docs/testing.md`](../../docs/testing.md); override for other
-        /// rootfs configurations.
-        #[arg(long, default_value = DEFAULT_PASS_REGEX)]
-        pub pass: String,
-
-        /// Regex marking a failed run. On match the log is preserved as
-        /// FAIL-<run>.log. Failure takes precedence over success. The default
-        /// matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED`
-        /// ([`docs/testing.md`](../../docs/testing.md)) plus the kernel's
-        /// own death markers, so a crash classifies as FAIL rather than HANG: a
-        /// hardware trap prints `KERNEL EXCEPTION` then `FATAL:`
-        /// (`core/kernel/src/main.rs` `fatal()`), a Rust `panic!` prints
-        /// `PANIC at`/`PANIC:` (the `#[panic_handler]`), and the scheduler's
-        /// wedge detectors print a dump headed `=== WATCHDOG` (a kernel that
-        /// detected its own stall is a failure, not a hang), and the entropy
-        /// subsystem's boot self-test prints `entropy: SELFTEST FAIL`. The benign
-        /// userspace fault path prints `USERSPACE FAULT`, which none of these
-        /// match. Override with a never-matching pattern (e.g.
-        /// `'$.^'`) to disable.
-        #[arg(long, default_value = DEFAULT_FAIL_REGEX)]
-        pub fail: String,
-
-        /// A further regex marking a failed run, matched beside `--fail` rather
-        /// than in its place, so the default's death markers still apply: a run
-        /// whose log matches either is FAIL, with the same precedence and
-        /// `--fail-grace-secs` kill. The framebuffer device cell passes
-        /// `'framebuffer case skipped'`, the line svctest logs when no
-        /// framebuffer driver runs.
-        #[arg(long, value_name = "REGEX")]
-        pub fail_also: Option<String>,
-
-        /// Expose each guest's gdbstub without pausing it (QEMU `-s`,
-        /// `tcp::1234`), so a wedged guest can be attached to post-hoc:
-        /// `gdb -ex 'target remote :1234'`. Requires `--parallel 1` (one
-        /// gdbstub port).
-        #[arg(long)]
-        pub debug_listen: bool,
-
-        /// On a hard-timeout HANG, do not kill the QEMU instance: print the
-        /// attach instructions and block until it is terminated externally,
-        /// preserving the wedged guest for inspection (pair with
-        /// `--debug-listen`). Requires `--parallel 1`.
-        #[arg(long)]
-        pub hold_on_hang: bool,
-
-        /// Grace window, in seconds, after the first `--fail` match before the
-        /// run is `SIGKILLed`. A kernel fault dump is multi-line and may be
-        /// followed by secondary-CPU faults; killing on the first matching byte
-        /// truncates the diagnostics. The run is killed at whichever is first:
-        /// this window, or the `--timeout` deadline. 0 kills on the next poll
-        /// after the match.
-        #[arg(long, default_value_t = DEFAULT_FAIL_GRACE_SECS)]
-        pub fail_grace_secs: u64,
-
-        /// Also copy every run's log, whatever its outcome, to
-        /// `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run-parallel]`
-        /// trailer line that records the run's arch, width, accelerator, outcome,
-        /// and host wall time. DIR is created if absent and never purged; a file
-        /// of the same name is overwritten.
-        #[arg(long, value_name = "DIR")]
-        pub save_logs: Option<PathBuf>,
-
-        /// Attach this image as a second disk: its own `virtio-blk-pci` device
-        /// (drive `hd1`) beside `disk.img`, presenting the logical block size of
-        /// the image's GPT unless `--second-disk-block-size` sets it (an image
-        /// with no GPT at 512- or 4096-byte blocks needs it set). `cargo xtask
-        /// mkdisk --split-data` authors `disk-data.img` for it.
-        #[arg(long, value_name = "PATH")]
-        pub second_disk: Option<PathBuf>,
-
-        /// Logical and physical block size, in bytes, of the second disk's
-        /// device, overriding the size read from its image (a power of two of at
-        /// least 512; a size above the guest driver's 4096 stages the boot whose
-        /// second device the driver refuses).
-        #[arg(long, value_name = "BYTES", requires = "second_disk")]
-        pub second_disk_block_size: Option<u32>,
-
-        /// Place the second disk's device on the first disk's `INTx` line; same
-        /// semantics as `cargo xtask run --second-disk-shared-line`.
-        #[arg(long, requires = "second_disk")]
-        pub second_disk_shared_line: bool,
-
-        /// Attach the debug port, served on `127.0.0.1:<PORT>`; same semantics
-        /// as `cargo xtask run --debug-port`. Requires `--parallel 1` (one host
-        /// port).
-        #[arg(long, value_name = "PORT")]
-        pub debug_port: Option<u16>,
-
-        /// Stage the GDB stub for these boots, attached to the process named
-        /// NAME; same semantics as `cargo xtask run --debug-target`. Requires
-        /// `--debug-port`.
-        #[arg(long, value_name = "NAME", requires = "debug_port")]
-        pub debug_target: Option<String>,
-
-        /// Attach the test devices; same semantics as `cargo xtask run
-        /// --test-devices`.
-        #[arg(long)]
-        pub test_devices: bool,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-impl RunParallelArgs
-{
-    /// The second disk's `INTx` line `--second-disk-shared-line` selects.
-    pub fn second_disk_line(&self) -> DiskLine
-    {
-        if self.second_disk_shared_line
-        {
-            DiskLine::Shared
-        }
-        else
-        {
-            DiskLine::Own
-        }
     }
 }
 

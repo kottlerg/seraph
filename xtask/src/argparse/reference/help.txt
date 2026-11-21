@@ -12,12 +12,11 @@ Usage: xtask <COMMAND>
 
 Commands:
   build              Build Seraph components and populate the sysroot
-  run                Launch Seraph under QEMU. Requires a populated sysroot — run `cargo xtask build` first
-  clean              Remove the sysroot (and optionally cargo target/)
+  run                Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
+  clean              Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
   test               Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
   crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
-  run-parallel       Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
-  ktest-timing       Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+  ktest-timing       Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot as it stands. Every pack re-signs the sysroot's signed objects in place. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   check-disk         Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with `fsck.fat -n` (dosfstools), an independent reader of the volumes mkdisk writes, then that every object on the ESP of `disk.img` equals its installed file on the root partition. Runs in CI's validate job; see xtask/README.md
@@ -27,8 +26,8 @@ Commands:
   test-tpm           Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
   test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `--no-kaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
   test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
-  test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
+  test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once as `run --runs 1` boots it, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
+  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once as `run --runs 1` boots it, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
   test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
   test-signing       Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
   test-reboot        Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)
@@ -62,12 +61,11 @@ Usage: xtask <COMMAND>
 
 Commands:
   build              Build Seraph components and populate the sysroot
-  run                Launch Seraph under QEMU. Requires a populated sysroot — run `cargo xtask build` first
-  clean              Remove the sysroot (and optionally cargo target/)
+  run                Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
+  clean              Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
   test               Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
   crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
-  run-parallel       Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
-  ktest-timing       Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+  ktest-timing       Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot as it stands. Every pack re-signs the sysroot's signed objects in place. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   check-disk         Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with `fsck.fat -n` (dosfstools), an independent reader of the volumes mkdisk writes, then that every object on the ESP of `disk.img` equals its installed file on the root partition. Runs in CI's validate job; see xtask/README.md
@@ -77,8 +75,8 @@ Commands:
   test-tpm           Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
   test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `--no-kaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
   test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
-  test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
+  test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once as `run --runs 1` boots it, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
+  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once as `run --runs 1` boots it, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
   test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
   test-signing       Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
   test-reboot        Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)
@@ -153,19 +151,13 @@ Options:
   -h, --help
           Print help (see a summary with '-h')
 === xtask run -h
-Launch Seraph under QEMU. Requires a populated sysroot — run `cargo xtask build` first
+Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
 
 Usage: xtask run [OPTIONS]
 
 Options:
       --arch <ARCH>
           Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --gdb
-          Start QEMU with a GDB server on localhost:1234 (QEMU pauses at startup)
-      --headless
-          Run without a display window (-display none)
-      --verbose
-          Show all serial output including pre-boot firmware noise (suppressed by default)
       --cpus <CPUS>
           Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
       --threads-per-core <THREADS_PER_CORE>
@@ -189,11 +181,41 @@ Options:
       --second-disk-shared-line
           Place the second disk's device on the first disk's `INTx` line (four PCI slots past it, where both machines' interrupt routing puts it on the same line), and launch both disks with no MSI-X, staging the boot in which two virtio-blk devices share one line
       --debug-port <PORT>
-          Attach the debug port: a `virtio-console` device, which devmgr binds as the debug port, its host end a TCP server QEMU listens with on `127.0.0.1:<PORT>` (a debugger connects with `target remote localhost:<PORT>`). The console keeps the UART
+          Attach the debug port: a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port, its host end a TCP server QEMU listens with on `127.0.0.1:<PORT>` (a debugger connects with `target remote localhost:<PORT>`). The console keeps the UART
       --debug-target <NAME>
           Stage the GDB stub for this boot, attached to the process named NAME (its argv[0]), and print the GDB command line that connects to it; the stub is unstaged when QEMU exits. Requires `--debug-port`
       --test-devices
           Attach the test devices svctest's devmgr phases drive through the test-only drivers: QEMU's `edu` device and five `pci-testdev` functions. A svctest boot needs them (docs/testing.md § Gating)
+      --runs <N>
+          Boot N times unattended and classify each run's log as PASS, FAIL, HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns, failing unless every run passes (a QEMU-CRASH is tolerated). Without it, `run` is one interactive boot whose serial output is the terminal's
+      --display <DISPLAY>
+          What the guest presents for display. `window` attaches QEMU std VGA and shows it in a window; `framebuffer` attaches it with no window (`-display none`), so the framebuffer driver runs on a host without a graphical backend: the framebuffer device cell of the local and release host runs (docs/testing.md "Coverage tiers"); `headless` attaches no adapter, so the bootloader finds no GOP and devmgr spawns no framebuffer driver. Default: `window` for the interactive boot, `headless` with `--runs`, which refuses `window` [possible values: window, framebuffer, headless]
+      --gdb
+          Start QEMU with a GDB server on localhost:1234, paused at startup (QEMU `-s -S`). Interactive boot only
+      --debug-listen
+          Expose the guest's gdbstub on localhost:1234 without pausing it (QEMU `-s`), so a wedged guest can be attached to post hoc: `gdb -ex 'target remote :1234'`. With `--runs`, requires `--parallel 1` (one gdbstub port)
+      --verbose
+          Show all serial output including pre-boot firmware noise (suppressed by default). Interactive boot only
+      --parallel <PARALLEL>
+          Concurrency of `--runs`: number of QEMU instances in flight at once; the runs are dispatched in waves of this many [default: 1]
+      --timeout <TIMEOUT>
+          Per-run timeout of `--runs`, in seconds. A run still alive at this point is killed and classified as HANG [default: 30]
+      --pass <PASS>
+          Regex marking a successful run of `--runs`. On match (and every `--require` and `--crash-reports` check holding) the log is discarded and the run is classified PASS. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [`docs/testing.md`](../../docs/testing.md); override for other rootfs configurations [default: "ALL TESTS PASSED"]
+      --fail <FAIL>
+          Regex marking a failed run of `--runs`. On match the log is preserved as FAIL-<run>.log. Failure takes precedence over success. The default matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([`docs/testing.md`](../../docs/testing.md)) plus the kernel's own death markers, so a crash classifies as FAIL rather than HANG: a hardware trap prints `KERNEL EXCEPTION` then `FATAL:` (`core/kernel/src/main.rs` `fatal()`), a Rust `panic!` prints `PANIC at`/`PANIC:` (the `#[panic_handler]`), and the scheduler's wedge detectors print a dump headed `=== WATCHDOG` (a kernel that detected its own stall is a failure, not a hang), and the entropy subsystem's boot self-test prints `entropy: SELFTEST FAIL`. The benign userspace fault path prints `USERSPACE FAULT`, which none of these match. Override with a never-matching pattern (e.g. `'$.^'`) to disable [default: "SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"]
+      --fail-also <REGEX>
+          A further regex marking a failed run of `--runs`, matched beside `--fail` rather than in its place, so the default's death markers still apply: a run whose log matches either is FAIL, with the same precedence and `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, the line svctest logs when no framebuffer driver runs
+      --require <REGEX>
+          A regex a line of the log must match for a run of `--runs` to pass; repeatable, each must match. A run whose `--pass` pattern matched but whose log has no line matching one of these is FAIL, naming the pattern
+      --crash-reports <CRASH_REPORTS>
+          Check the crash service's report blocks in each passing run's log as `cargo xtask test-crash-report --expect` checks a saved log: every block well-formed, and `reports` the `crashme` fixture's three reports, `none` no block at all. A run whose check fails is FAIL; a QEMU-CRASH run is not checked [possible values: reports, none]
+      --hold-on-hang
+          On a hard-timeout HANG of `--runs`, do not kill the QEMU instance: print the attach instructions and block until it is terminated externally, preserving the wedged guest for inspection (pair with `--debug-listen`). Requires `--parallel 1`
+      --fail-grace-secs <FAIL_GRACE_SECS>
+          Grace window of `--runs`, in seconds, after the first `--fail` match before the run is `SIGKILLed`. A kernel fault dump is multi-line and may be followed by secondary-CPU faults; killing on the first matching byte truncates the diagnostics. The run is killed at whichever is first: this window, or the `--timeout` deadline. 0 kills on the next poll after the match [default: 10]
+      --save-logs <DIR>
+          Also copy every run's log of `--runs`, whatever its outcome, to `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run]` trailer line that records the run's arch, width, accelerator, outcome, and host wall time. DIR is created if absent and never purged; a file of the same name is overwritten
       --wait-host <SECS>
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override
@@ -201,13 +223,13 @@ Options:
       --alone
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help
           Print help (see more with '--help')
 === xtask run --help
-Launch Seraph under QEMU. Requires a populated sysroot — run `cargo xtask build` first
+Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
 
 Usage: xtask run [OPTIONS]
 
@@ -220,17 +242,6 @@ Options:
           - riscv64: RISC-V 64-bit
           
           [default: x86_64]
-
-      --gdb
-          Start QEMU with a GDB server on localhost:1234 (QEMU pauses at startup)
-
-      --headless
-          Run without a display window (-display none)
-
-      --verbose
-          Show all serial output including pre-boot firmware noise (suppressed by default).
-          
-          By default, output is suppressed until the first line containing '[--------] boot:', hiding UEFI/OpenSBI debug spam. The control-sequence filter (drops xterm window manipulation, alternate-screen toggles, mouse tracking, etc.) is always on in both modes — verbose only disables the marker gate, not the filter.
 
       --cpus <CPUS>
           Number of vCPUs to expose to the guest (QEMU -smp)
@@ -303,13 +314,79 @@ Options:
           Place the second disk's device on the first disk's `INTx` line (four PCI slots past it, where both machines' interrupt routing puts it on the same line), and launch both disks with no MSI-X, staging the boot in which two virtio-blk devices share one line
 
       --debug-port <PORT>
-          Attach the debug port: a `virtio-console` device, which devmgr binds as the debug port, its host end a TCP server QEMU listens with on `127.0.0.1:<PORT>` (a debugger connects with `target remote localhost:<PORT>`). The console keeps the UART
+          Attach the debug port: a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port, its host end a TCP server QEMU listens with on `127.0.0.1:<PORT>` (a debugger connects with `target remote localhost:<PORT>`). The console keeps the UART
 
       --debug-target <NAME>
           Stage the GDB stub for this boot, attached to the process named NAME (its argv[0]), and print the GDB command line that connects to it; the stub is unstaged when QEMU exits. Requires `--debug-port`
 
       --test-devices
           Attach the test devices svctest's devmgr phases drive through the test-only drivers: QEMU's `edu` device and five `pci-testdev` functions. A svctest boot needs them (docs/testing.md § Gating)
+
+      --runs <N>
+          Boot N times unattended and classify each run's log as PASS, FAIL, HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns, failing unless every run passes (a QEMU-CRASH is tolerated). Without it, `run` is one interactive boot whose serial output is the terminal's
+
+      --display <DISPLAY>
+          What the guest presents for display. `window` attaches QEMU std VGA and shows it in a window; `framebuffer` attaches it with no window (`-display none`), so the framebuffer driver runs on a host without a graphical backend: the framebuffer device cell of the local and release host runs (docs/testing.md "Coverage tiers"); `headless` attaches no adapter, so the bootloader finds no GOP and devmgr spawns no framebuffer driver. Default: `window` for the interactive boot, `headless` with `--runs`, which refuses `window`
+
+          Possible values:
+          - window:      The adapter and a display window: on `x86_64` q35's default adapter with QEMU's default display; on riscv64 `-device VGA` with a `qemu-xhci`/`usb-kbd` pair and the `gtk` or `sdl` backend, added only when one is available (with no graphical backend QEMU would fall back to VNC)
+          - framebuffer: The adapter with no window (`-display none`), so a headless host still boots with a GOP framebuffer and devmgr spawns the framebuffer driver: the framebuffer device cell (docs/testing.md "Coverage tiers")
+          - headless:    No adapter and no window: no GOP, so no framebuffer driver runs
+
+      --gdb
+          Start QEMU with a GDB server on localhost:1234, paused at startup (QEMU `-s -S`). Interactive boot only
+
+      --debug-listen
+          Expose the guest's gdbstub on localhost:1234 without pausing it (QEMU `-s`), so a wedged guest can be attached to post hoc: `gdb -ex 'target remote :1234'`. With `--runs`, requires `--parallel 1` (one gdbstub port)
+
+      --verbose
+          Show all serial output including pre-boot firmware noise (suppressed by default). Interactive boot only.
+          
+          By default, output is suppressed until the first line containing '[--------] boot:', hiding UEFI/OpenSBI debug spam. The control-sequence filter (drops xterm window manipulation, alternate-screen toggles, mouse tracking, etc.) is always on in both modes — verbose only disables the marker gate, not the filter.
+
+      --parallel <PARALLEL>
+          Concurrency of `--runs`: number of QEMU instances in flight at once; the runs are dispatched in waves of this many
+          
+          [default: 1]
+
+      --timeout <TIMEOUT>
+          Per-run timeout of `--runs`, in seconds. A run still alive at this point is killed and classified as HANG
+          
+          [default: 30]
+
+      --pass <PASS>
+          Regex marking a successful run of `--runs`. On match (and every `--require` and `--crash-reports` check holding) the log is discarded and the run is classified PASS. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [`docs/testing.md`](../../docs/testing.md); override for other rootfs configurations
+          
+          [default: "ALL TESTS PASSED"]
+
+      --fail <FAIL>
+          Regex marking a failed run of `--runs`. On match the log is preserved as FAIL-<run>.log. Failure takes precedence over success. The default matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([`docs/testing.md`](../../docs/testing.md)) plus the kernel's own death markers, so a crash classifies as FAIL rather than HANG: a hardware trap prints `KERNEL EXCEPTION` then `FATAL:` (`core/kernel/src/main.rs` `fatal()`), a Rust `panic!` prints `PANIC at`/`PANIC:` (the `#[panic_handler]`), and the scheduler's wedge detectors print a dump headed `=== WATCHDOG` (a kernel that detected its own stall is a failure, not a hang), and the entropy subsystem's boot self-test prints `entropy: SELFTEST FAIL`. The benign userspace fault path prints `USERSPACE FAULT`, which none of these match. Override with a never-matching pattern (e.g. `'$.^'`) to disable
+          
+          [default: "SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"]
+
+      --fail-also <REGEX>
+          A further regex marking a failed run of `--runs`, matched beside `--fail` rather than in its place, so the default's death markers still apply: a run whose log matches either is FAIL, with the same precedence and `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, the line svctest logs when no framebuffer driver runs
+
+      --require <REGEX>
+          A regex a line of the log must match for a run of `--runs` to pass; repeatable, each must match. A run whose `--pass` pattern matched but whose log has no line matching one of these is FAIL, naming the pattern
+
+      --crash-reports <CRASH_REPORTS>
+          Check the crash service's report blocks in each passing run's log as `cargo xtask test-crash-report --expect` checks a saved log: every block well-formed, and `reports` the `crashme` fixture's three reports, `none` no block at all. A run whose check fails is FAIL; a QEMU-CRASH run is not checked
+
+          Possible values:
+          - reports: The `crashme` fixture's `vm` and `exception` reports of its main thread and its `worker` report of a spawned thread: a usertest boot with crashd staged
+          - none:    No report block: a boot of an image that stages no crashd
+
+      --hold-on-hang
+          On a hard-timeout HANG of `--runs`, do not kill the QEMU instance: print the attach instructions and block until it is terminated externally, preserving the wedged guest for inspection (pair with `--debug-listen`). Requires `--parallel 1`
+
+      --fail-grace-secs <FAIL_GRACE_SECS>
+          Grace window of `--runs`, in seconds, after the first `--fail` match before the run is `SIGKILLed`. A kernel fault dump is multi-line and may be followed by secondary-CPU faults; killing on the first matching byte truncates the diagnostics. The run is killed at whichever is first: this window, or the `--timeout` deadline. 0 kills on the next poll after the match
+          
+          [default: 10]
+
+      --save-logs <DIR>
+          Also copy every run's log of `--runs`, whatever its outcome, to `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run]` trailer line that records the run's arch, width, accelerator, outcome, and host wall time. DIR is created if absent and never purged; a file of the same name is overwritten
 
       --wait-host <SECS>
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
@@ -321,7 +398,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -329,7 +406,7 @@ Options:
   -h, --help
           Print help (see a summary with '-h')
 === xtask clean -h
-Remove the sysroot (and optionally cargo target/)
+Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
 
 Usage: xtask clean [OPTIONS]
 
@@ -339,7 +416,7 @@ Options:
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
 === xtask clean --help
-Remove the sysroot (and optionally cargo target/)
+Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
 
 Usage: xtask clean [OPTIONS]
 
@@ -388,236 +465,8 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
-=== xtask run-parallel -h
-Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
-
-Usage: xtask run-parallel [OPTIONS] --parallel <PARALLEL> --runs <RUNS>
-
-Options:
-      --arch <ARCH>
-          Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --parallel <PARALLEL>
-          Concurrency: number of QEMU instances in flight at once
-      --runs <RUNS>
-          Total runs to perform, dispatched in waves of `--parallel`
-      --timeout <TIMEOUT>
-          Per-run timeout, in seconds. A run still alive at this point is killed and classified as HANG [default: 30]
-      --cpus <CPUS>
-          Number of vCPUs to expose to each guest (QEMU -smp) [default: 4]
-      --threads-per-core <THREADS_PER_CORE>
-          Logical CPUs per core in the guest's topology (QEMU `-smp <cpus>,threads=<n>`); must divide `--cpus`. 2 presents SMT sibling pairs, which the kernel's placement spreads threads across (core/kernel/docs/scheduler.md "SMT Awareness"); riscv64 takes each hart as a core of its own whatever this says [default: 1]
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m) [default: 512]
-      --riscv-mmu <RISCV_MMU>
-          Guest RISC-V paging-mode ceiling (riscv64 only; ignored on `x86_64`). The kernel negotiates the highest advertised mode at boot, so this selects the mode every run in the batch exercises [default: sv48] [possible values: sv39, sv48, sv57]
-      --riscv-zkr <RISCV_ZKR>
-          Whether the guest RISC-V CPU implements the Zkr entropy source (riscv64 only; ignored on `x86_64`), for every run in the batch. `off` boots the kernel's hardware-RNG path without a source: its probe of the `seed` CSR traps and the pool seeds from the firmware boot seed and jitter [default: on] [possible values: on, off]
-      --x86-paging <X86_PAGING>
-          Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `la57` property; the bootloader enables 5-level paging when CPUID reports LA57, so this selects the depth a run exercises [default: 4] [possible values: 4, 5]
-      --x86-shadow-stack <X86_SHADOW_STACK>
-          Whether the guest x86-64 CPU offers CET supervisor shadow stacks (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss` property, so the host's CPU never decides it; a QEMU without the property cannot offer them and gets no pin. `on` boots the kernel on shadow stacks, or refuses to boot when the accelerator or the QEMU cannot offer them; the cet cell (`cargo xtask test-cet`) is where they are tested [default: off] [possible values: off, on]
-      --iommu <IOMMU>
-          Whether the machine's IOMMU is attached, with the driven `virtio-pci` devices behind it. `absent` boots the no-IOMMU variant, the no-iommu device cell of the local and release host runs (docs/testing.md "Coverage tiers"), which keeps devmgr's unconfined path covered while the attached IOMMU confines every device a driver binds [default: attached] [possible values: attached, absent]
-      --display <DISPLAY>
-          What each guest presents for display. `headless` attaches no display adapter, so the bootloader finds no GOP and devmgr spawns no framebuffer driver; `framebuffer` keeps QEMU std VGA with no display window (`-display none`), so the framebuffer driver runs on a host without a graphical backend: the framebuffer device cell of the local and release host runs (docs/testing.md "Coverage tiers") [default: headless] [possible values: headless, framebuffer]
-      --pass <PASS>
-          Regex marking a successful run. On match the log is discarded and the run is classified PASS. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [`docs/testing.md`](../../docs/testing.md); override for other rootfs configurations [default: "ALL TESTS PASSED"]
-      --fail <FAIL>
-          Regex marking a failed run. On match the log is preserved as FAIL-<run>.log. Failure takes precedence over success. The default matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([`docs/testing.md`](../../docs/testing.md)) plus the kernel's own death markers, so a crash classifies as FAIL rather than HANG: a hardware trap prints `KERNEL EXCEPTION` then `FATAL:` (`core/kernel/src/main.rs` `fatal()`), a Rust `panic!` prints `PANIC at`/`PANIC:` (the `#[panic_handler]`), and the scheduler's wedge detectors print a dump headed `=== WATCHDOG` (a kernel that detected its own stall is a failure, not a hang), and the entropy subsystem's boot self-test prints `entropy: SELFTEST FAIL`. The benign userspace fault path prints `USERSPACE FAULT`, which none of these match. Override with a never-matching pattern (e.g. `'$.^'`) to disable [default: "SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"]
-      --fail-also <REGEX>
-          A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's death markers still apply: a run whose log matches either is FAIL, with the same precedence and `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, the line svctest logs when no framebuffer driver runs
-      --debug-listen
-          Expose each guest's gdbstub without pausing it (QEMU `-s`, `tcp::1234`), so a wedged guest can be attached to post-hoc: `gdb -ex 'target remote :1234'`. Requires `--parallel 1` (one gdbstub port)
-      --hold-on-hang
-          On a hard-timeout HANG, do not kill the QEMU instance: print the attach instructions and block until it is terminated externally, preserving the wedged guest for inspection (pair with `--debug-listen`). Requires `--parallel 1`
-      --fail-grace-secs <FAIL_GRACE_SECS>
-          Grace window, in seconds, after the first `--fail` match before the run is `SIGKILLed`. A kernel fault dump is multi-line and may be followed by secondary-CPU faults; killing on the first matching byte truncates the diagnostics. The run is killed at whichever is first: this window, or the `--timeout` deadline. 0 kills on the next poll after the match [default: 10]
-      --save-logs <DIR>
-          Also copy every run's log, whatever its outcome, to `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run-parallel]` trailer line that records the run's arch, width, accelerator, outcome, and host wall time. DIR is created if absent and never purged; a file of the same name is overwritten
-      --second-disk <PATH>
-          Attach this image as a second disk: its own `virtio-blk-pci` device (drive `hd1`) beside `disk.img`, presenting the logical block size of the image's GPT unless `--second-disk-block-size` sets it (an image with no GPT at 512- or 4096-byte blocks needs it set). `cargo xtask mkdisk --split-data` authors `disk-data.img` for it
-      --second-disk-block-size <BYTES>
-          Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image (a power of two of at least 512; a size above the guest driver's 4096 stages the boot whose second device the driver refuses)
-      --second-disk-shared-line
-          Place the second disk's device on the first disk's `INTx` line; same semantics as `cargo xtask run --second-disk-shared-line`
-      --debug-port <PORT>
-          Attach the debug port, served on `127.0.0.1:<PORT>`; same semantics as `cargo xtask run --debug-port`. Requires `--parallel 1` (one host port)
-      --debug-target <NAME>
-          Stage the GDB stub for these boots, attached to the process named NAME; same semantics as `cargo xtask run --debug-target`. Requires `--debug-port`
-      --test-devices
-          Attach the test devices; same semantics as `cargo xtask run --test-devices`
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help
-          Print help (see more with '--help')
-=== xtask run-parallel --help
-Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
-
-Usage: xtask run-parallel [OPTIONS] --parallel <PARALLEL> --runs <RUNS>
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --parallel <PARALLEL>
-          Concurrency: number of QEMU instances in flight at once
-
-      --runs <RUNS>
-          Total runs to perform, dispatched in waves of `--parallel`
-
-      --timeout <TIMEOUT>
-          Per-run timeout, in seconds. A run still alive at this point is killed and classified as HANG
-          
-          [default: 30]
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to each guest (QEMU -smp)
-          
-          [default: 4]
-
-      --threads-per-core <THREADS_PER_CORE>
-          Logical CPUs per core in the guest's topology (QEMU `-smp <cpus>,threads=<n>`); must divide `--cpus`. 2 presents SMT sibling pairs, which the kernel's placement spreads threads across (core/kernel/docs/scheduler.md "SMT Awareness"); riscv64 takes each hart as a core of its own whatever this says
-          
-          [default: 1]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --riscv-mmu <RISCV_MMU>
-          Guest RISC-V paging-mode ceiling (riscv64 only; ignored on `x86_64`). The kernel negotiates the highest advertised mode at boot, so this selects the mode every run in the batch exercises
-
-          Possible values:
-          - sv39: Cap the guest at Sv39 (`sv57=off,sv48=off`)
-          - sv48: Cap the guest at Sv48 (`sv57=off`) — the default
-          - sv57: Enable Sv57 (`sv57=on`, explicit against QEMU default drift)
-          
-          [default: sv48]
-
-      --riscv-zkr <RISCV_ZKR>
-          Whether the guest RISC-V CPU implements the Zkr entropy source (riscv64 only; ignored on `x86_64`), for every run in the batch. `off` boots the kernel's hardware-RNG path without a source: its probe of the `seed` CSR traps and the pool seeds from the firmware boot seed and jitter
-
-          Possible values:
-          - on:  Implement `Zkr` (`zkr=on`) — the default
-          - off: Leave `Zkr` out (`zkr=off`)
-          
-          [default: on]
-
-      --x86-paging <X86_PAGING>
-          Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `la57` property; the bootloader enables 5-level paging when CPUID reports LA57, so this selects the depth a run exercises
-
-          Possible values:
-          - 4: 4-level paging (`la57=off`) — the default
-          - 5: 5-level paging (`la57=on`)
-          
-          [default: 4]
-
-      --x86-shadow-stack <X86_SHADOW_STACK>
-          Whether the guest x86-64 CPU offers CET supervisor shadow stacks (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss` property, so the host's CPU never decides it; a QEMU without the property cannot offer them and gets no pin. `on` boots the kernel on shadow stacks, or refuses to boot when the accelerator or the QEMU cannot offer them; the cet cell (`cargo xtask test-cet`) is where they are tested
-
-          Possible values:
-          - off: No `CET_SS` in the guest's CPUID (`cet-ss=off`) — the default
-          - on:  `CET_SS` in the guest's CPUID, or no boot (`cet-ss=on,enforce`): QEMU refuses to start when the accelerator cannot provide it, which TCG never can, rather than booting without it
-          
-          [default: off]
-
-      --iommu <IOMMU>
-          Whether the machine's IOMMU is attached, with the driven `virtio-pci` devices behind it. `absent` boots the no-IOMMU variant, the no-iommu device cell of the local and release host runs (docs/testing.md "Coverage tiers"), which keeps devmgr's unconfined path covered while the attached IOMMU confines every device a driver binds
-
-          Possible values:
-          - attached: `intel-iommu` on q35, `riscv-iommu-pci` on `virt`, with every `virtio-pci` device a driver of the system binds behind it (`iommu_platform=on`) — the default
-          - absent:   No IOMMU: the no-IOMMU variant, the no-iommu device cell of the local and release host runs, in which devmgr runs every device unconfined
-          
-          [default: attached]
-
-      --display <DISPLAY>
-          What each guest presents for display. `headless` attaches no display adapter, so the bootloader finds no GOP and devmgr spawns no framebuffer driver; `framebuffer` keeps QEMU std VGA with no display window (`-display none`), so the framebuffer driver runs on a host without a graphical backend: the framebuffer device cell of the local and release host runs (docs/testing.md "Coverage tiers")
-
-          Possible values:
-          - headless:    No display adapter, the default ([`QemuDisplay::Headless`])
-          - framebuffer: The adapter with no window ([`QemuDisplay::Framebuffer`])
-          
-          [default: headless]
-
-      --pass <PASS>
-          Regex marking a successful run. On match the log is discarded and the run is classified PASS. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [`docs/testing.md`](../../docs/testing.md); override for other rootfs configurations
-          
-          [default: "ALL TESTS PASSED"]
-
-      --fail <FAIL>
-          Regex marking a failed run. On match the log is preserved as FAIL-<run>.log. Failure takes precedence over success. The default matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([`docs/testing.md`](../../docs/testing.md)) plus the kernel's own death markers, so a crash classifies as FAIL rather than HANG: a hardware trap prints `KERNEL EXCEPTION` then `FATAL:` (`core/kernel/src/main.rs` `fatal()`), a Rust `panic!` prints `PANIC at`/`PANIC:` (the `#[panic_handler]`), and the scheduler's wedge detectors print a dump headed `=== WATCHDOG` (a kernel that detected its own stall is a failure, not a hang), and the entropy subsystem's boot self-test prints `entropy: SELFTEST FAIL`. The benign userspace fault path prints `USERSPACE FAULT`, which none of these match. Override with a never-matching pattern (e.g. `'$.^'`) to disable
-          
-          [default: "SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"]
-
-      --fail-also <REGEX>
-          A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's death markers still apply: a run whose log matches either is FAIL, with the same precedence and `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, the line svctest logs when no framebuffer driver runs
-
-      --debug-listen
-          Expose each guest's gdbstub without pausing it (QEMU `-s`, `tcp::1234`), so a wedged guest can be attached to post-hoc: `gdb -ex 'target remote :1234'`. Requires `--parallel 1` (one gdbstub port)
-
-      --hold-on-hang
-          On a hard-timeout HANG, do not kill the QEMU instance: print the attach instructions and block until it is terminated externally, preserving the wedged guest for inspection (pair with `--debug-listen`). Requires `--parallel 1`
-
-      --fail-grace-secs <FAIL_GRACE_SECS>
-          Grace window, in seconds, after the first `--fail` match before the run is `SIGKILLed`. A kernel fault dump is multi-line and may be followed by secondary-CPU faults; killing on the first matching byte truncates the diagnostics. The run is killed at whichever is first: this window, or the `--timeout` deadline. 0 kills on the next poll after the match
-          
-          [default: 10]
-
-      --save-logs <DIR>
-          Also copy every run's log, whatever its outcome, to `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run-parallel]` trailer line that records the run's arch, width, accelerator, outcome, and host wall time. DIR is created if absent and never purged; a file of the same name is overwritten
-
-      --second-disk <PATH>
-          Attach this image as a second disk: its own `virtio-blk-pci` device (drive `hd1`) beside `disk.img`, presenting the logical block size of the image's GPT unless `--second-disk-block-size` sets it (an image with no GPT at 512- or 4096-byte blocks needs it set). `cargo xtask mkdisk --split-data` authors `disk-data.img` for it
-
-      --second-disk-block-size <BYTES>
-          Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image (a power of two of at least 512; a size above the guest driver's 4096 stages the boot whose second device the driver refuses)
-
-      --second-disk-shared-line
-          Place the second disk's device on the first disk's `INTx` line; same semantics as `cargo xtask run --second-disk-shared-line`
-
-      --debug-port <PORT>
-          Attach the debug port, served on `127.0.0.1:<PORT>`; same semantics as `cargo xtask run --debug-port`. Requires `--parallel 1` (one host port)
-
-      --debug-target <NAME>
-          Stage the GDB stub for these boots, attached to the process named NAME; same semantics as `cargo xtask run --debug-target`. Requires `--debug-port`
-
-      --test-devices
-          Attach the test devices; same semantics as `cargo xtask run --test-devices`
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
 === xtask ktest-timing -h
-Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
 
 Usage: xtask ktest-timing [OPTIONS] [LOGS]...
 
@@ -634,7 +483,7 @@ Options:
       --min-secs <MIN_SECS>    Flag a row only when its time exceeds the expected time (F times the base, or the baseline's) by at least this many seconds [default: 1.0]
   -h, --help                   Print help
 === xtask ktest-timing --help
-Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
 
 Usage: xtask ktest-timing [OPTIONS] [LOGS]...
 
@@ -788,7 +637,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help (see more with '--help')
 === xtask test-terminal --help
@@ -826,7 +675,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -844,7 +693,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help
 === xtask test-vmgenid --help
@@ -858,7 +707,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help
 === xtask test-tpm -h
@@ -872,7 +721,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help
 === xtask test-tpm --help
@@ -886,7 +735,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help
 === xtask test-kaslr -h
@@ -903,7 +752,7 @@ Options:
       --wait-host <SECS>         When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override            Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone                    Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing                   A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing                   A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help                     Print help (see more with '--help')
 === xtask test-kaslr --help
@@ -960,7 +809,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -973,7 +822,7 @@ Check the crash service's report blocks in a boot's saved serial log: every bloc
 Usage: xtask test-crash-report [OPTIONS] --log <FILE>
 
 Options:
-      --log <FILE>       A boot's saved serial log to check (a `run-parallel --save-logs` log). Nothing boots
+      --log <FILE>       A boot's saved serial log to check (a `run --runs N --save-logs` log). Nothing boots
       --expect <EXPECT>  What the log must hold beyond well-formed blocks [default: reports] [possible values: reports, none]
   -h, --help             Print help (see more with '--help')
 === xtask test-crash-report --help
@@ -983,7 +832,7 @@ Usage: xtask test-crash-report [OPTIONS] --log <FILE>
 
 Options:
       --log <FILE>
-          A boot's saved serial log to check (a `run-parallel --save-logs` log). Nothing boots
+          A boot's saved serial log to check (a `run --runs N --save-logs` log). Nothing boots
 
       --expect <EXPECT>
           What the log must hold beyond well-formed blocks
@@ -997,7 +846,7 @@ Options:
   -h, --help
           Print help (see a summary with '-h')
 === xtask test-map-redo -h
-Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
+Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once as `run --runs 1` boots it, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
 
 Usage: xtask test-map-redo [OPTIONS]
 
@@ -1012,11 +861,11 @@ Options:
       --wait-host <SECS>         When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override            Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone                    Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing                   A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing                   A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help                     Print help (see more with '--help')
 === xtask test-map-redo --help
-Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
+Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once as `run --runs 1` boots it, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
 
 Usage: xtask test-map-redo [OPTIONS]
 
@@ -1077,7 +926,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -1085,7 +934,7 @@ Options:
   -h, --help
           Print help (see a summary with '-h')
 === xtask test-log-level -h
-Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
+Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once as `run --runs 1` boots it, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
 
 Usage: xtask test-log-level [OPTIONS]
 
@@ -1098,11 +947,11 @@ Options:
       --wait-host <SECS>   When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone              Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing             A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing             A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>     Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help               Print help (see more with '--help')
 === xtask test-log-level --help
-Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
+Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once as `run --runs 1` boots it, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
 
 Usage: xtask test-log-level [OPTIONS]
 
@@ -1144,7 +993,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -1164,7 +1013,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help (see more with '--help')
 === xtask test-debug-port --help
@@ -1205,7 +1054,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -1225,7 +1074,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help (see more with '--help')
 === xtask test-signing --help
@@ -1266,7 +1115,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -1285,7 +1134,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help (see more with '--help')
 === xtask test-reboot --help
@@ -1323,7 +1172,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -1341,7 +1190,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help
 === xtask test-powerbutton --help
@@ -1355,7 +1204,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help
 === xtask test-core-death -h
@@ -1371,7 +1220,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help (see more with '--help')
 === xtask test-core-death --help
@@ -1421,7 +1270,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -1440,7 +1289,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help (see more with '--help')
 === xtask test-hotplug --help
@@ -1478,7 +1327,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -1499,7 +1348,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help (see more with '--help')
 === xtask test-gdb --help
@@ -1545,7 +1394,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -1564,7 +1413,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help (see more with '--help')
 === xtask test-wedge --help
@@ -1602,7 +1451,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -1620,7 +1469,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help
 === xtask test-cet --help
@@ -1634,7 +1483,7 @@ Options:
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help              Print help
 === xtask capture-acpi -h
@@ -1649,7 +1498,7 @@ Options:
       --wait-host <SECS>   When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
       --alone              Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing             A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --timing             A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
       --grant <HOLDER>     Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help               Print help (see more with '--help')
 === xtask capture-acpi --help
@@ -1685,7 +1534,7 @@ Options:
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
 
       --grant <HOLDER>
           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
@@ -2486,12 +2335,11 @@ Usage: xtask help [COMMAND]
 
 Commands:
   build              Build Seraph components and populate the sysroot
-  run                Launch Seraph under QEMU. Requires a populated sysroot — run `cargo xtask build` first
-  clean              Remove the sysroot (and optionally cargo target/)
+  run                Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
+  clean              Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
   test               Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
   crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
-  run-parallel       Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
-  ktest-timing       Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+  ktest-timing       Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot as it stands. Every pack re-signs the sysroot's signed objects in place. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   check-disk         Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with `fsck.fat -n` (dosfstools), an independent reader of the volumes mkdisk writes, then that every object on the ESP of `disk.img` equals its installed file on the root partition. Runs in CI's validate job; see xtask/README.md
@@ -2501,8 +2349,8 @@ Commands:
   test-tpm           Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
   test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `--no-kaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
   test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
-  test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
+  test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once as `run --runs 1` boots it, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
+  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once as `run --runs 1` boots it, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
   test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
   test-signing       Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
   test-reboot        Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)

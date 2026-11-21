@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/run.rs
+// xtask/src/commands/run/mod.rs
 
-//! Run command: launch Seraph under QEMU against an already-built sysroot.
+//! Run command: boot Seraph under QEMU against an already-built sysroot.
+//!
+//! Without `--runs`, one interactive boot whose serial output is the
+//! terminal's (this module); with `--runs N`, N unattended boots, each
+//! classified by its log ([`classified`]). Both launch the machine one
+//! [`crate::cli::LaunchArgs`] describes.
 //!
 //! `run` is a pure runner. It does not invoke the build pipeline; the
 //! sysroot and disk image must already exist (produced by
@@ -31,17 +36,31 @@ use crate::term::guard::TerminalGuard;
 use crate::term::line_gate::LineGate;
 use crate::util::{require_tool, step};
 
+pub mod classified;
+
 /// Marker that opens the default-mode line gate. Emitted by the
 /// bootloader as the first line after firmware exits; everything
 /// before it is firmware chatter that the user almost never wants.
 const BOOT_MARKER: &[u8] = b"[--------] boot:";
 
-/// Entry point for `cargo xtask run`.
+/// Entry point for `cargo xtask run`: the classified boot with `--runs`, the
+/// interactive one without.
 pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
 {
-    validate_sysroot_for_launch(ctx, args.arch)?;
+    match args.runs
+    {
+        Some(runs) => classified::run(ctx, args, runs),
+        None => interactive(ctx, args),
+    }
+}
+
+/// One interactive boot.
+fn interactive(ctx: &BuildContext, args: &RunArgs) -> Result<()>
+{
+    let launch = &args.launch;
+    validate_sysroot_for_launch(ctx, launch.arch)?;
     // Held until the command returns, after its last QEMU has exited.
-    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
+    let _host = crate::host_lock::admit_boot(ctx, &args.host, launch.cpus, 1)?;
 
     if args.gdb
     {
@@ -55,7 +74,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
     // serial during boot; TerminalGuard restores dimensions on drop.
     let _guard = TerminalGuard::capture();
 
-    let (firmware_code, firmware_vars) = match args.arch
+    let (firmware_code, firmware_vars) = match launch.arch
     {
         Arch::X86_64 => (find_ovmf_code()?, None),
         Arch::Riscv64 =>
@@ -67,67 +86,65 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
 
     // The stub is staged, and the images repacked, before the launch reads
     // their block sizes.
-    let staged = match (&args.debug_target, args.debug_port)
+    let staged = match (&launch.debug_target, launch.debug_port)
     {
         (Some(target), Some(port)) =>
         {
-            let layout = crate::debug_stub::stage(ctx, args.arch, target)?;
+            let layout = crate::debug_stub::stage(ctx, launch.arch, target)?;
             let binary = crate::debug_stub::binary_for(ctx, target);
             step(&format!(
                 "GDB stub staged for {target}; connect with:\n    {}",
-                crate::debug_stub::gdb_command(args.arch, port, binary.as_deref())
+                crate::debug_stub::gdb_command(launch.arch, port, binary.as_deref())
             ));
             Some(layout)
         }
         _ => None,
     };
-    let launched = launch(ctx, args, &firmware_code, firmware_vars.as_deref());
+    let launched = boot_qemu(ctx, args, &firmware_code, firmware_vars.as_deref());
     if let Some(layout) = staged
     {
-        crate::debug_stub::unstage(ctx, args.arch, layout)?;
+        crate::debug_stub::unstage(ctx, launch.arch, layout)?;
     }
     launched
 }
 
 /// Build the QEMU command line for the sysroot's images and run it.
-fn launch(
+fn boot_qemu(
     ctx: &BuildContext,
     args: &RunArgs,
     firmware_code: &std::path::Path,
     firmware_vars: Option<&std::path::Path>,
 ) -> Result<()>
 {
+    let launch = &args.launch;
     let disk_path = ctx.disk_image();
-    let second_disk = match &args.second_disk
+    let second_disk = match &launch.second_disk
     {
         Some(path) => Some(SecondDisk {
             path,
-            block_size: second_disk_block_size(path, args.second_disk_block_size)?,
-            line: args.second_disk_line(),
+            block_size: second_disk_block_size(path, launch.second_disk_block_size)?,
+            line: launch.second_disk_line(),
         }),
         None => None,
     };
     let spec = QemuLaunchSpec {
-        arch: args.arch,
+        arch: launch.arch,
         disk_path: &disk_path,
         disk_block_size: logical_block_size(&disk_path)?,
         second_disk,
         firmware_code_path: firmware_code,
         firmware_vars_path: firmware_vars,
-        cpus: args.cpus,
-        threads_per_core: args.threads_per_core,
-        mem_mib: args.mem,
-        display: if args.headless
-        {
-            QemuDisplay::Headless
-        }
-        else
-        {
-            QemuDisplay::Window
-        },
+        cpus: launch.cpus,
+        threads_per_core: launch.threads_per_core,
+        mem_mib: launch.mem,
+        display: args.display.unwrap_or(QemuDisplay::Window),
         gdb: if args.gdb
         {
             GdbMode::Freeze
+        }
+        else if args.debug_listen
+        {
+            GdbMode::Listen
         }
         else
         {
@@ -136,18 +153,18 @@ fn launch(
         qmp_socket: None,
         vmgenid_guid: Some("auto"),
         incoming: None,
-        riscv_mmu: args.riscv_mmu,
-        riscv_zkr: args.riscv_zkr,
-        x86_paging: args.x86_paging,
-        x86_shadow_stack: args.x86_shadow_stack,
-        iommu: args.iommu,
-        debug_port: args.debug_port,
-        test_devices: args.test_devices,
+        riscv_mmu: launch.riscv_mmu,
+        riscv_zkr: launch.riscv_zkr,
+        x86_paging: launch.x86_paging,
+        x86_shadow_stack: launch.x86_shadow_stack,
+        iommu: launch.iommu,
+        debug_port: launch.debug_port,
+        test_devices: launch.test_devices,
         hotplug_port: None,
     };
     let qemu_args = build_qemu_argv(&spec)?;
 
-    let desc = match args.arch
+    let desc = match launch.arch
     {
         Arch::X86_64 => "x86_64, UEFI",
         Arch::Riscv64 => "riscv64, TCG, UEFI",
@@ -160,7 +177,7 @@ fn launch(
     {
         QemuOutput::Filtered
     };
-    launch_qemu(args.arch.qemu_binary(), &qemu_args, desc, output)
+    launch_qemu(launch.arch.qemu_binary(), &qemu_args, desc, output)
 }
 
 /// How QEMU's serial output reaches the host terminal.

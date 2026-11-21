@@ -1316,6 +1316,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 park_started_tick: 0,
                 park_seq: core::sync::atomic::AtomicU32::new(0),
                 start_seq: 0,
+                hold: crate::sched::hold::HoldMark::None,
                 ipc_state: IpcThreadState::None,
                 ipc_msg: Message::default(),
                 reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),

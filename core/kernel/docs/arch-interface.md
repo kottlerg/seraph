@@ -1085,8 +1085,9 @@ faulting CPU from either ring, never a thread kill; see
 **Aliasing model.** While the thread is descheduled inside an entry (blocked in a syscall,
 fault-blocked, or preempted), other paths access its published frame: another thread's
 `SYS_THREAD_READ_REGS` on a `Stopped` or `Blocked` thread reads it, its `SYS_THREAD_WRITE_REGS` on
-a `Stopped` or fault-blocked one writes it (`sched::with_held_frame`), and riscv64's switch-out
-clears its FS/VS bits. No path of the thread itself therefore holds a reference to the frame across
+a `Stopped` (not by an address-space hold) or fault-blocked one writes it
+(`sched::with_held_frame`), and riscv64's switch-out clears its FS/VS bits. No path of the thread
+itself therefore holds a reference to the frame across
 a point where it can be descheduled: every trap entry takes the frame as `*mut TrapFrame` (x86-64's
 trap entries; riscv64's `trap_dispatch`, the `user_exception` and `kernel_exception` paths it
 calls, and `redirect_user_fault`), and the syscall dispatcher hands each handler a

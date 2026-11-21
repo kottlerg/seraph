@@ -785,7 +785,7 @@ extern "C" fn run(info_ptr: u64) -> !
         // QEMU's chardev backend before the shutdown port write tears
         // the VM down. On slow TCG hosts (CI runners with QEMU stdio
         // chardev) the chardev's last-buffer flush is not synchronous
-        // with the VM exit, and without this delay `run-parallel`'s
+        // with the VM exit, and without this delay `run --runs`'s
         // pass-marker regex intermittently misses the terminal line.
         // 100 ms is much more than the chardev's typical flush latency;
         // the operator-set `KtestConfig::DEFAULT.timeout_secs` wait (zero by

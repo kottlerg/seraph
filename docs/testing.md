@@ -184,7 +184,7 @@ rootfs/config/svcmgr/
 │   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
 └── debug/                    # NOT loaded by svcmgr
     └── gdbstub.svc           # GDB stub template; staged, naming its target,
-                              # by run and run-parallel --debug-target, and
+                              # by run --debug-target, and
                               # by test-gdb
 
 rootfs/config/devmgr/
@@ -284,7 +284,7 @@ exercised as in production. All three rounds run on both arches.
 
 The terminal autostarts on a normal boot, and the test stages the GDB stub itself
 and removes it again, so no recipe staging is needed; just build, repack, and run
-the host driver (not `run-parallel`, which cannot inject):
+the host driver (not `run --runs`, which cannot inject):
 
 ```sh
 cargo xtask build
@@ -355,7 +355,7 @@ Requires a populated sysroot with the ktest bundle composed
 through the kernel's serial-only console class (see
 [cross-boundary-disclosure.md § Kernel console diagnostics](../core/kernel/docs/cross-boundary-disclosure.md#kernel-console-diagnostics)).
 In CI it runs as extra boots inside each `ktest` cell (both arches, both
-profiles), after the `ktest` run-parallel boot.
+profiles), after the `ktest` `run --runs` boot.
 
 ### Steps 6 and 7 redo (`test-map-redo`)
 
@@ -366,7 +366,7 @@ outgrows the entry array step 6 sized, which QEMU's firmware never makes it do (
 `cargo xtask test-map-redo [--arch]` (both arches) stages the
 `\EFI\seraph\mapredo` test knob, which makes the first attempt redo whatever
 its map's size, repacks the disk images in the layout they have, and boots the
-current sysroot once through `run-parallel`. It passes when the boot reaches its
+current sysroot once, as `run --runs 1` does. It passes when the boot reaches its
 harness's pass marker and the bootloader logged the knob's redo exactly once;
 the knob is always removed and the images repacked in that layout afterward. See
 [xtask/README.md § test-map-redo](../xtask/README.md#cargo-xtask-test-map-redo)
@@ -374,7 +374,7 @@ for the command.
 
 In CI it runs as an extra boot inside each `ktest` cell (both arches, both
 profiles), after `test-kaslr`, on the ktest bundle the cell composed and under
-the cell's `run-parallel` budget.
+the cell's boot budget.
 
 ### Crash reports (`test-crash-report`)
 
@@ -413,9 +413,10 @@ fills memory down to memmgr's growth floor and has the fixture write a page it h
 the filler gives the memory back within the stall, and the write completes after the hold; once the
 filler keeps it past the stall, and the fixture dies of the fault with no core written.
 
-In CI the usertest cell keeps crashd and runs the first after its `run-parallel` boot; the svctest
-cell drops `crashd.svc` with `terminal.svc` and runs the second, while crasher's faults go
-unreported. Both read the log the cell's boot saved and boot nothing
+In CI the usertest cell keeps crashd, and its boot passes `--crash-reports reports` to
+`cargo xtask run --runs 1`; the svctest cell drops `crashd.svc` with `terminal.svc`, and its boot
+passes `--crash-reports none`, while crasher's faults go unreported. Each makes the first or the
+second check on its boot's own log, as `test-crash-report` makes it on a saved log
 ([xtask/README.md § test-crash-report](../xtask/README.md#cargo-xtask-test-crash-report)).
 
 The crash service cannot cover every process. init, memmgr, and procmgr are not created by procmgr,
@@ -433,7 +434,7 @@ and a driver devmgr spawns and a fatfs instance vfsd spawns inherit their spawne
 committed configuration sets no level, so no default boot shows whether a level reaches its
 service. `cargo xtask test-log-level [--arch]` (both arches) installs a configuration setting vfsd
 to debug, repacks the disk images in the layout they have with the default-init bundle, and boots
-the current sysroot once through `run-parallel`. It passes when the boot reaches its harness's
+the current sysroot once, as `run --runs 1` does. It passes when the boot reaches its harness's
 pass marker, vfsd's and fatfs's debug lines appear, and devmgr's and procmgr's do not; the
 installed configuration is always put back and the images repacked in that layout, with the
 recorded harness's bundle, afterward. See
@@ -441,7 +442,7 @@ recorded harness's bundle, afterward. See
 command.
 
 In CI it runs as an extra boot inside each `usertest` cell (both arches, both profiles), after
-`test-crash-report`, on the cell's usertest staging and under the cell's `run-parallel` budget.
+the cell's `run --runs` boot, on the cell's usertest staging and under the cell's boot budget.
 
 ### Reboot (`test-reboot`)
 
@@ -906,7 +907,7 @@ drops `crashd.svc`, so one boot per cell runs the image without the crash
 service (see Crash reports above).
 
 CI matrix cells follow these rules per boot. The `usertest` cell runs its
-boots in sequence — `usertest` (via `run-parallel`, terminal dropped), then
+boots in sequence — `usertest` (via `run --runs`, terminal dropped), then
 the terminal interactive test (via `test-terminal`) after dropping
 `usertest.svc` and repacking to restore the default boot (terminal present),
 then the `test-wedge` boot pair, then the `test-reboot` boot, then the seven `test-core-death`
@@ -937,8 +938,10 @@ confinement and MSI forge phases drive, and five `pci-testdev` functions, which 
 on-demand-bind phase drives through the test-only test-fault driver; CI boots headless, so no
 framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`,
 the framebuffer boot, `--display framebuffer`, and the debug-port boots, `test-debug-port` and
-`test-gdb`, are device cells, see Device surfaces, Framebuffer cell, Debug-port cell, and Release
-host runs below), filesystem (FAT), riscv64
+`test-gdb`, are device cells (CI's `test-terminal` boots, and `test-core-death`'s boots of the
+targets it kills through the GDB stub, attach the debug port too, to reach the stub over it), see
+Device surfaces, Framebuffer cell, Debug-port cell, and Release host runs below), filesystem
+(FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations), riscv64 Zkr entropy source (on —
 runs without it via `cargo xtask run --riscv-zkr off` are manual, same posture), x86_64
@@ -964,7 +967,7 @@ its own device surface, and variants belong to the tiers below.
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog` and `stopsrc` co-staged in the svctest cell, no host-driven `test-*` boots) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog` and `stopsrc` co-staged in the svctest cell, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, whatever the release's PRs touched (see Release host runs below) |
 
@@ -1021,10 +1024,11 @@ surface.
   (Release host runs below), and burn-in repeats the canonical cells. The framebuffer driver's
   device, QEMU std VGA, is outside the main set because the canonical boots are headless; the
   framebuffer cell (Framebuffer cell below) boots it. The virtio-console driver's device, the debug
-  port, is outside it because only a launch that asks for a debug port attaches it; the
-  debug-port cell (Debug-port cell below) boots it. The TPM driver's device, a TPM 2.0 behind
-  QEMU's `tpm-tis` or `tpm-crb` and backed by `swtpm`, is outside it because only `test-tpm`
-  attaches it; the tpm cell (TPM cell below) boots it.
+  port, is outside it because only a launch that asks for a debug port attaches it: the
+  debug-port cell (Debug-port cell below) boots it, and in CI the `test-terminal` boots and
+  `test-core-death`'s GDB-stub boots attach it to reach the stub over it. The TPM driver's
+  device, a TPM 2.0 behind QEMU's `tpm-tis` or `tpm-crb` and backed by `swtpm`, is outside it
+  because only `test-tpm` attaches it; the tpm cell (TPM cell below) boots it.
 - **Hardware only.** A driver whose device QEMU cannot present has no QEMU cell in either set; its
   README documents a hardware test procedure, and it is exercised on real hardware by that
   procedure. No in-tree driver is in this tier.
@@ -1240,9 +1244,9 @@ report below (`--save-logs`).
 T=target/xtask/ktest-timing
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeout 180 \
+cargo xtask run --arch riscv64 --cpus 16 --runs 1 --timeout 180 \
     --save-logs $T
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1140 \
+cargo xtask run --arch riscv64 --cpus 128 --runs 1 --timeout 1140 \
     --save-logs $T
 
 # Release-profile boundary boots, riscv64 (release host runs only, once each;
@@ -1252,8 +1256,8 @@ cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeo
 # follows a debug-profile build, never the release boots above it):
 cargo xtask build --arch riscv64 --release
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 16 --parallel 1 --runs 1 --timeout 180
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1140
+cargo xtask run --arch riscv64 --cpus 16 --runs 1 --timeout 180
+cargo xtask run --arch riscv64 --cpus 128 --runs 1 --timeout 1140
 
 # Boundary CPU counts, x86_64 (KVM on the 16-core reference host: the 16-vCPU
 # run, at 1x, takes ~40 s; the 128-vCPU run, at 8x vCPU oversubscription,
@@ -1262,16 +1266,16 @@ cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeo
 cargo xtask clean
 cargo xtask build
 cargo xtask compose-bundle --harness ktest
-cargo xtask run-parallel --arch x86_64 --cpus 16 --parallel 1 --runs 1 --timeout 180 \
+cargo xtask run --arch x86_64 --cpus 16 --runs 1 --timeout 180 \
     --save-logs $T
-cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 900 \
+cargo xtask run --arch x86_64 --cpus 128 --runs 1 --timeout 900 \
     --save-logs $T
 
 # Release-profile boundary boots, x86_64 (release host runs only, as above):
 cargo xtask build --release
 cargo xtask compose-bundle --harness ktest
-cargo xtask run-parallel --arch x86_64 --cpus 16 --parallel 1 --runs 1 --timeout 180
-cargo xtask run-parallel --arch x86_64 --cpus 128 --parallel 1 --runs 1 --timeout 900
+cargo xtask run --arch x86_64 --cpus 16 --runs 1 --timeout 180
+cargo xtask run --arch x86_64 --cpus 128 --runs 1 --timeout 900
 
 # Timing report (report only; see below):
 B=xtask/baselines/ktest-timing
@@ -1289,7 +1293,7 @@ outlives one is a HANG to be examined, and its measured time re-derives the budg
 budget is the larger of three times the measured run and the measured run plus the longest failing
 bound ktest stretches at that width
 (`split_delete_race`'s 100 s exit poll, through `scaled_polls`: 100 s at 16 CPUs, 800 s at 128),
-rounded up to a minute, so a stuck cell reaches its own FAIL line before `run-parallel` classifies
+rounded up to a minute, so a stuck cell reaches its own FAIL line before `run --runs` classifies
 the run as a HANG. A change to the measured runs or to the longest stretched bound re-derives the
 budgets.
 
@@ -1357,7 +1361,7 @@ M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER|reserve_frames"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
 
 # Memory variation (either arch; boots the current sysroot, so a debug-profile build):
-cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
+cargo xtask run --arch <arch> --cpus 4 --mem 1024 --runs 1 --timeout 300
 ```
 
 **Device surfaces.** The device cells, the boots of the system's devices that the canonical cells do
@@ -1383,7 +1387,7 @@ or writes one of the type's fields, calls one of its methods, or constructs or m
 names it in another use and stays on the surface. The exemption reaches no listed function
 or constant: each stays on a surface as the sentences above define. The listed
 types are `InterruptObject`, `Iommu`, `SecondDisk`, `DiskLine`, `BlockSize`, `FramebufferInfo`,
-`InitFramebufferInfo`, `QemuDisplay`, `BatchDisplay`, `HotplugControl`, `BootEntropy`, `Tpm`, and
+`InitFramebufferInfo`, `QemuDisplay`, `HotplugControl`, `BootEntropy`, `Tpm`, and
 `TpmInterface`. A PR owes
 the cells of every surface a non-inert line of its own diff is on.
 
@@ -1398,7 +1402,7 @@ the cells of every surface a non-inert line of its own diff is on.
 | virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test_gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module, a file (`shared/ipc/src/test_dma_labels.rs`), the launchers' `edu` attachment (`EDU_DEVICE`), and svctest's DMA confinement, MSI delivery, MSI forge, MSI churn and MSI release checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, `msi_forge_phase`, `msi_churn_phase`, `msi_release_phase`, `iommu_restart_phase`, and `call_test_dma`) | no-iommu, and hotplug |
 | PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test_hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
-| framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
+| framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay` and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | TPM 2.0, and the bootloader's seed of its registers | `services/drivers/tpm/`, its class protocol crate (`shared/hwrng-protocol/`), which the virtio-rng row lists too, the host test that drives it (`xtask/src/commands/test_tpm.rs`), and the launchers' TPM attachment (`Tpm`, `TpmInterface`, and `tpm_args`); and the bootloader's `TPM2` table seed, which only a boot with a TPM takes (`tpm2_register_window`, `tpm_register_window`, `TPM2_OFF_CONTROL_AREA`, `TPM2_OFF_START_METHOD`, `TPM2_MIN_LEN`, `TPM2_START_FIFO`, and `TPM2_START_CRB`) | tpm |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
@@ -1452,7 +1456,7 @@ D="$D|Iommu|virtio_property|RISCV_IOMMU_DEVICE"
 D="$D|X86_IOMMU_DEVICE|X86_MACHINE_SPLIT_IRQCHIP|EDU_DEVICE"
 D="$D|dma_confinement_phase|msi_(delivery|forge|churn|release)_phase|call_test_dma"
 D="$D|hwrng_re(ad|start)_phase|hwrng_read|hwrng_denied"
-D="$D|QemuDisplay|BatchDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
+D="$D|QemuDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
 D="$D|rebase_framebuffer|framebuffer_above|debug_port_args|DEBUG_PORT_CHARDEV"
 D="$D|hotplug_port_args|HOTPLUG_(DISK_)?PORT_(DEVICE|ID)|X86_NATIVE_HOTPLUG_GLOBAL|HotplugControl"
 D="$D|HotplugPort|PortDisk|PORT_DISK_(ID|NODE)|port_disk_(properties|block_size)"
@@ -1492,7 +1496,7 @@ nothing on that account.
 
 **When the runs are owed.** Each local host run a PR owes MUST pass at one
 head that covers the merge head. For every local and release host run, only a `PASS` outcome of
-`run-parallel` ([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the
+`run --runs` ([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the
 host emulator, is run again and the re-run's outcome stands; a run that ran beside another QEMU and
 HANGs or fails a timing check is run again once with no other QEMU beside it (`--alone`), and the
 re-run's outcome stands; `OK` and `ERR` count as failures. The
@@ -1540,7 +1544,7 @@ staged as the canonical cells stage it, and its pass marker passes each boot. Ea
 the larger of three times the slowest of these boots on the reference host (the riscv64 8192-byte
 boot, 133 s) and that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above
 follow; a change to these boots' times re-derives it. Each boot is a storage cell (Device surfaces
-above): in the commands below, 4kn is the first `run-parallel` boot, second-disk the second,
+above): in the commands below, 4kn is the first `run --runs` boot, second-disk the second,
 shared-line the third, and oversize-block the fourth, each after the `mkdisk` before it; a PR that
 owes some of the cells runs those boots, and the release host runs run all four.
 
@@ -1554,23 +1558,23 @@ cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.s
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
-cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
+cargo xtask run --arch <arch> --runs 1 --timeout 420 \
     --test-devices
 cargo xtask mkdisk --arch <arch> --repack-only --split-data
-cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
+cargo xtask run --arch <arch> --runs 1 --timeout 420 \
     --second-disk disk-data.img --test-devices
-cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
+cargo xtask run --arch <arch> --runs 1 --timeout 420 \
     --second-disk disk-data.img --second-disk-shared-line --test-devices
 cargo xtask mkdisk --arch <arch> --repack-only
 cp disk.img target/xtask/second-disk.img
-cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
+cargo xtask run --arch <arch> --runs 1 --timeout 420 \
     --second-disk target/xtask/second-disk.img --second-disk-block-size 8192 \
     --test-devices
 ```
 
 **Framebuffer cell.** One svctest boot, on each architecture, keeps QEMU std VGA with no display
-window (`run-parallel --display framebuffer`,
-[xtask/README.md](../xtask/README.md#cargo-xtask-run-parallel)), so the bootloader hands the
+window (`run --display framebuffer`,
+[xtask/README.md](../xtask/README.md#classified-boots---runs)), so the bootloader hands the
 kernel the adapter's GOP framebuffer, devmgr spawns the framebuffer driver, and svctest's drivers
 and `logd_sinks` phases run their framebuffer cases
 ([services/svctest/README.md](../services/svctest/README.md)) instead of logging
@@ -1592,7 +1596,7 @@ cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.s
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only
-cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 360 \
+cargo xtask run --arch <arch> --runs 1 --timeout 360 \
     --display framebuffer --test-devices --fail-also 'framebuffer case skipped'
 ```
 
@@ -1605,7 +1609,7 @@ passes when both host checks pass; each command stages and unstages its own reci
 current sysroot, a debug-profile build. `test-debug-port` bounds the boot to the fixture's ready
 line by five minutes and each answer by twenty seconds; `test-gdb` bounds the boot to the stub's
 ready line by five minutes, the GDB session by three, and the stub's detach line by 30 s after
-it. Neither has a `run-parallel` budget. The
+it. Neither has a boot budget. The
 two boots are the debug-port device cell (Device surfaces above).
 
 ```sh
@@ -1627,7 +1631,7 @@ resolves the data role across a copy of the disk added beside it, and ends at th
 filesystem's driver and of the boot disk. The command stages and unstages its own files on the
 current sysroot, a debug-profile build. It bounds each boot to its markers by five minutes, the
 fixture's probes and the disk's bind by three minutes after each hot-add, and the removal by one
-minute from `device_del`; it has no `run-parallel` budget. The boots are the hotplug device cell
+minute from `device_del`; it has no boot budget. The boots are the hotplug device cell
 (Device surfaces above).
 
 ```sh
@@ -1645,7 +1649,7 @@ missing, and never passes, so a PR that owes the cell runs it on such a host. On
 itself a guest, a run that ends in the host's loss of the guest's CET state is inconclusive and run
 again, up to four runs of each boot, and the cell passes only on runs without it (CET shadow stacks
 (`test-cet`) above). Each boot is bounded by five minutes and each gdbstub answer by 30 s; it has no
-`run-parallel` budget. The pair is the cet device cell (Device surfaces above).
+boot budget. The pair is the cet device cell (Device surfaces above).
 
 ```sh
 # CET cell, x86_64 only:
@@ -1657,7 +1661,7 @@ cargo xtask test-cet
 **TPM cell.** One boot pair on x86_64, `cargo xtask test-tpm` (TPM (`test-tpm`) above), at 4
 vCPUs, on the default boot set of a debug-profile sysroot, each boot backed by `swtpm`: one with
 `tpm-tis` and one with `tpm-crb`. The command fails before the boots when `swtpm` is not
-installed, naming the package. Each boot is bounded by three minutes; it has no `run-parallel`
+installed, naming the package. Each boot is bounded by three minutes; it has no boot
 budget. The pair is the tpm device cell (Device surfaces above).
 
 ```sh
@@ -1672,7 +1676,7 @@ Release Production, step 4), these MUST be run on the commit to be tagged, or on
 that contains the version bump when the change from it to the commit to be tagged is documentation
 or comments only as this section defines that: the whole boundary set (riscv64 16 and 128 harts,
 x86_64 16 and 128 vCPUs) once each (`--runs 1`) in the debug profile and once each in the release
-profile (`cargo xtask build --release`, then the same `run-parallel` command, per the boundary
+profile (`cargo xtask build --release`, then the same `run` command, per the boundary
 commands above), and the memory variation and every device cell (the disk variations, the no-IOMMU
 variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM
 cell) once each, so every tag boots at each boundary CPU count in both profiles (CI boots release
@@ -1687,7 +1691,7 @@ the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
 
 ```sh
 # No-IOMMU variant, each architecture (svctest staged, debug profile):
-cargo xtask run-parallel --arch <arch> --iommu absent --parallel 1 --runs 1 --timeout 540 \
+cargo xtask run --arch <arch> --iommu absent --runs 1 --timeout 540 \
     --test-devices
 ```
 
@@ -1832,8 +1836,8 @@ A failing boot is diagnosed with the tool that fits its class of defect:
 
 **Races.** A debugger stops the CPUs it inspects and moves the timing a race depends on, so a
 race is chased with log lines placed around the suspect window and with repeated boots, which turn
-a rare failure into a rate: `cargo xtask run-parallel --runs N --parallel P --save-logs DIR`
-([xtask/README.md](../xtask/README.md#cargo-xtask-run-parallel)) keeps the log of every failing
+a rare failure into a rate: `cargo xtask run --runs N --parallel P --save-logs DIR`
+([xtask/README.md](../xtask/README.md#classified-boots---runs)) keeps the log of every failing
 run, and the CPU counts of [Coverage tiers](#coverage-tiers) are where SMP races show first.
 
 **Failures only CI shows.** A defect whose effect depends on where the linker placed a static,
@@ -1855,7 +1859,7 @@ block of a saved serial log with its instruction pointer and stack frames resolv
 file, and line against the symbols of the process's sysroot binary, which the symbols store keeps
 under the binary's build id ([docs/build-system.md](build-system.md#symbols-store) § Symbols
 Store), or to the nearest function symbol in a build without debug information, and
-`run-parallel` writes that report beside each log it keeps that holds a block. A process crashd
+`run --runs` writes that report beside each log it keeps that holds a block. A process crashd
 cannot cover (Crash reports above) leaves only the kernel's `USERSPACE FAULT` dump
 ([docs/fault-handling.md](fault-handling.md)), whose instruction pointer
 (`rip=` on x86_64, `sepc=` on riscv64) is a runtime address in the process's image: with the load
@@ -1866,9 +1870,9 @@ bias from the creator's spawn line
 **Kernel crashes, early failures, and wedged guests.** QEMU's gdbstub reads the machine whatever
 state the guest is in, including before the serial console is up and after the kernel stops
 answering. `cargo xtask run --gdb` starts the guest paused with the stub on `localhost:1234`;
-`cargo xtask run-parallel --parallel 1 --debug-listen --hold-on-hang` runs it unpaused and keeps a
+`cargo xtask run --runs 1 --debug-listen --hold-on-hang` runs it unpaused and keeps a
 hung guest alive for attaching
-([xtask/README.md](../xtask/README.md#cargo-xtask-run-parallel)). GDB runs in batch mode, so its
+([xtask/README.md](../xtask/README.md#classified-boots---runs)). GDB runs in batch mode, so its
 output lands in a file like any log. The kernel is static-PIE, so its symbols load at the KASLR
 slide from the serial-only `kaslr: slide=` line, or at their link addresses in a boot whose disk
 was authored with `cargo xtask mkdisk --no-kaslr`; a userspace image's symbols load at its bias, as
@@ -1882,7 +1886,7 @@ that target ([docs/build-system.md](build-system.md#toolchain)).
 # state (SLIDE from the log's `kaslr: slide=` line; `bt 8` bounds each unwind,
 # which otherwise runs on past a CPU's entry frame into stack words) and end
 # the held guest:
-cargo xtask run-parallel --arch riscv64 --parallel 1 --runs 1 --timeout 300 \
+cargo xtask run --arch riscv64 --runs 1 --timeout 300 \
     --debug-listen --hold-on-hang
 gdb -batch -ex 'target remote :1234' \
     -ex "symbol-file -o $SLIDE sysroot/esp/EFI/seraph/kernel" \
@@ -1893,7 +1897,7 @@ gdb -batch -ex 'target remote :1234' \
 # mapped when the guest starts paused, so a software one cannot be written):
 cargo xtask build --debug kernel
 cargo xtask mkdisk --no-kaslr
-cargo xtask run --gdb --headless          # in one shell; waits paused
+cargo xtask run --gdb --display headless  # in one shell; waits paused
 gdb -batch -ex 'target remote :1234' -ex 'hbreak kernel::panic' -ex continue \
     -ex bt -ex 'info registers' sysroot/esp/EFI/seraph/kernel
 ```

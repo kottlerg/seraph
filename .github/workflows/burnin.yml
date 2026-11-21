@@ -144,7 +144,7 @@ jobs:
           esac
 
       - name: Burn in ${{ matrix.tester }} (20 iterations, 2 parallel)
-        # Per-cell run-parallel budget, for HANG classification, derived as
+        # Per-cell boot budget, for HANG classification, derived as
         # docs/build-system.md § Continuous Integration states from each
         # cell's worst pass over the 20 2-way runs of burn-in run
         # 44345038387 (2026-11-19, the boot image of master 151fedff5's
@@ -174,16 +174,16 @@ jobs:
           if [ "${{ matrix.tester }}" = "svctest" ]; then
             test_devices=--test-devices
           fi
-          cargo xtask run-parallel \
+          cargo xtask run \
             --arch ${{ matrix.arch }} \
             --parallel 2 --runs 20 --timeout "$budget" $test_devices
 
-      - name: Upload run-parallel logs
+      - name: Upload run logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: burnin-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
           path: |
-            target/xtask/run-parallel/**/*.log
-            target/xtask/run-parallel/**/*.crash.txt
+            target/xtask/run/**/*.log
+            target/xtask/run/**/*.crash.txt
           if-no-files-found: ignore

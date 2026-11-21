@@ -10,7 +10,7 @@ and logs `<surface> ok` for each. It then logs `alive` and probes the svcmgr see
 cap is live, and a call that gets no reply is a failed round-trip. Finally it faults on purpose
 (a NULL write) so svcmgr respawns it under `restart = always`. A surface that fails to
 round-trip, such as one dropped on restart, is logged with a `FATAL:` prefix, which the
-`run-parallel` fail regex catches to fail the run. The deliberate `USERSPACE FAULT` does not
+`run --runs` fail regex catches to fail the run. The deliberate `USERSPACE FAULT` does not
 count as a failure.
 
 A second role, selected by argv `crasher worker-fault`, checks that svcmgr routes the fault of a

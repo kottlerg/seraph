@@ -763,7 +763,7 @@ S-mode …" or "senvcfg kept a U-mode environment enable set", from the same cal
 without an ASID-tagged TLB ("RISC-V ASID-tagged TLB unsupported", from
 `paging::enable_tagged_tlb` in `kernel_entry_ap`).
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
-marker is matched by the `run-parallel` fail regex, which turns a QEMU run red
+marker is matched by the `run --runs` fail regex, which turns a QEMU run red
 (see [entropy.md](entropy.md) § Testing).
 
 **Completion criterion:** Per-CPU scheduler state and idle threads are

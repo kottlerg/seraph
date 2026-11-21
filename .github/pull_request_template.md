@@ -16,7 +16,7 @@ this PR fixes); tick items completed by this PR>
 ## Test plan
 - [ ] `cargo xtask lint-docs`
 - [ ] `cargo xtask build` (x86_64)
-- [ ] boot on x86_64 (`cargo xtask run`, or `run-parallel --parallel 1 --runs 1`), terminal pass
+- [ ] boot on x86_64 (`cargo xtask run`, or `run --runs 1`), terminal pass
       marker observed
 - [ ] `cargo xtask build --arch riscv64`
 - [ ] boot on riscv64, terminal pass marker observed

@@ -104,7 +104,16 @@ devmgr's responsibilities are:
   ready within the settle bound, devmgr logs once that DMA runs unconfined and
   every DMA-capable driver runs DMA-unsafe (a driver that died or hung after
   it turned a unit's translation on leaves that unit blocking the devices
-  behind it, which the log line states). A thread of devmgr's
+  behind it, which the log line states). Under the boot-time policy's
+  `dma-confinement = required`, which devmgr reads from the policy boot module
+  before it starts the IOMMU driver (no policy module, or one that does not
+  parse, reads as required), each of these cases refuses the device instead:
+  devmgr logs once that no DMA-capable device is given a driver, refuses each
+  unconfined DMA-capable device at its DMA grant with a line naming the
+  driver, the device and the setting, and starts no driver for it; a machine
+  whose root disk is refused does not boot, and is recovered as
+  [docs/device-management.md § Required DMA Confinement](../../../docs/device-management.md#required-dma-confinement)
+  says. A thread of devmgr's
   takes the driver's recorded faults every second (`TAKE_FAULTS`) and logs
   each against its device. If the driver dies after it reported ready, a death
   watch thread of devmgr's own, which no call of its control thread can delay, marks the
@@ -674,7 +683,7 @@ name, its install path: `BOOT_MODULE_NAME_LEN` (256) bytes, little-endian, NUL-p
 devmgr gives procmgr to verify the module's signature under) carry every boot module outside
 init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, the log-level configuration,
 trust-store),
-untagged: the driver images and any platform description table; a cap-less
+untagged: the driver images, any platform description table, and the boot-time policy; a cap-less
 `FRAMEBUFFER_INFO` round carries the framebuffer geometry (a zero base means no framebuffer); and
 the terminal `SVCMGR_BUNDLE` round carries the svcmgr publish cap and the arch shutdown-authority
 cap (a full-rights derivation of init's root `IoPort` on x86-64, a Reset + Suspend `SbiControl`
@@ -691,7 +700,7 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and acpid's FADT register-block ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only derivation to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
 | Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables via `QUERY_ACPI_TABLE`; read the DMAR's VT-d units, scopes, and RMRRs on x86-64, and the RIMT's PCI IOMMUs and ID mappings on riscv64 |
-| Memory (boot modules, MODULE rounds) | As held by init | Boot-bundle driver images (virtio-blk and the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64) and any platform description table a root mount needs, untagged and held in `DevmgrCaps.modules`; a driver is spawned via `procmgr_labels::CREATE_PROCESS` by the declaration devmgr reads from it (above), a table is parsed; a module that is neither, or that fails to read, is logged and released. The IOMMU driver's module is released once devmgr has copied its image into contiguous pages it allocates, from which every restart spawns the driver |
+| Memory (boot modules, MODULE rounds) | As held by init | Boot-bundle driver images (virtio-blk and the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64) and any platform description table a root mount needs, untagged and held in `DevmgrCaps.modules`, and the boot-time policy (`/config/boot/policy.conf`), told by its name; a driver is spawned via `procmgr_labels::CREATE_PROCESS` by the declaration devmgr reads from it (above), a table is parsed, the policy is read into `DevmgrCaps::dma_confinement` and released; a module that is neither, or that fails to read, is logged and released. The IOMMU driver's module is released once devmgr has copied its image into contiguous pages it allocates, from which every restart spawns the driver |
 | svcmgr publish authority (Endpoint, SVCMGR_BUNDLE round) | Send, Grant (`PUBLISH_AUTHORITY` badge) | Register service caps in svcmgr's registry; held but unused today, reserved for future devmgr publications |
 | SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (each driver of the boot tier from a boot module, the IOMMU driver and each PCI-bound one, at 26; every other driver, the serial, framebuffer and RTC drivers included, at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities (the DMA thread at 26, the IOMMU fault-log thread at 24, through `std::os::seraph::thread::BuilderExt::spawn_at_priority`). Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
 

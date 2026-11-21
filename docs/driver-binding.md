@@ -229,9 +229,11 @@ devmgr collects declarations from two places:
   bootstrap set (init, procmgr, memmgr, devmgr, vfsd, `fatfs`, which init delivers to vfsd until
   filesystem drivers declare themselves, `/config/init/log-levels.conf`, the log-level configuration
   init reads itself, and `trust-store`, which init hands to procmgr), and devmgr tells them apart by
-  content: an ELF image is a driver, whose `.note.seraph.driver` note devmgr decodes; valid UTF-8
-  text is a platform description table (§ Platform Description Tables). A driver image whose note is
-  missing or does not decode, a table that is rejected, and any other module are logged and
+  content, apart from the boot-time policy (`/config/boot/policy.conf`), which it tells by its name
+  and reads ([device-management.md](device-management.md#required-dma-confinement) § Required DMA
+  Confinement): an ELF image is a driver, whose `.note.seraph.driver` note devmgr decodes; valid
+  UTF-8 text is a platform description table (§ Platform Description Tables). A driver image whose
+  note is missing or does not decode, a table that is rejected, and any other module are logged and
   released.
 - **The drivers directory.** On `SET_DRIVERS_DIR` devmgr lists `/services/drivers/`
   (`NS_READDIR`, so svcmgr sends the subtree cap with `READDIR` beside `LOOKUP | READ`) and

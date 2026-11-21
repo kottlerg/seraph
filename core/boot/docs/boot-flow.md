@@ -122,11 +122,14 @@ Detail: [elf-loading.md](elf-loading.md)
 ### Step 4: Parse Bundle (Init ELF + Boot Modules)
 
 The bootloader walks the bundle header from step 2 twice. The first walk verifies every
-entry against the trust store under its entry name, `init` as init and every other entry
-as a boot module ([docs/signing.md](../../../docs/signing.md) § Which Stage Verifies What),
-before any entry is parsed or exposed; a refusal is fatal (`BootError::SignatureRefused`,
-naming the entry), and so is an entry named `trust-store` (`BootError::InvalidBundle`), a
-name the bootloader reserves. The second walk produces both
+entry against the trust store under its entry name, `init` as init, an entry under `/config/`
+(`bundle::is_configuration`) as configuration, and every other entry as a boot module
+([docs/signing.md](../../../docs/signing.md) § Which Stage Verifies What), before any entry is
+parsed or exposed; a refusal is fatal (`BootError::SignatureRefused`, naming the entry), and so
+is an entry named `trust-store` (`BootError::InvalidBundle`), a name the bootloader reserves,
+and a bundle with no boot-time policy entry `/config/boot/policy.conf`
+(`bundle::POLICY_ENTRY_NAME`) or with two (`BootError::InvalidBundle`;
+[docs/signing.md](../../../docs/signing.md) § Configuration). The second walk produces both
 [`InitImage`](../../../abi/boot-protocol/src/lib.rs) and the `BootModule[]` array.
 
 **Init** is the bundle entry whose name (NUL-trimmed) equals
@@ -148,8 +151,9 @@ the bootloader does not inspect module content; what each module does and in wha
 them is init's concern ([elf-loading.md § Boot Module Loading](elf-loading.md#boot-module-loading)).
 Each module is named by its install path: typically `/services/procmgr`, `/services/memmgr`,
 `/services/devmgr`, `/services/vfsd`, `/services/drivers/virtio-blk`, `/services/fs/fatfs`, and
-`/services/drivers/iommu-vtd` on x86-64 or `/services/drivers/iommu-riscv` on riscv64, and the
-log-level configuration `/config/init/log-levels.conf` (the authoritative lists are the init
+`/services/drivers/iommu-vtd` on x86-64 or `/services/drivers/iommu-riscv` on riscv64, the
+log-level configuration `/config/init/log-levels.conf`, and the boot-time policy
+`/config/boot/policy.conf` (the authoritative lists are the init
 harness's bundle lists, `init.x86_64.list` and `init.riscv64.list` in
 [`rootfs/config/bundle/`](../../../rootfs/config/bundle/)).
 

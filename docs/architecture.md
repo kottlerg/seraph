@@ -323,7 +323,8 @@ Each architecture pins a two-layer floor — an instruction baseline (x86-64-v3 
 subset) and a platform/silicon-era floor — and classifies every CPU and platform feature as
 required, opportunistic, or unsupported. A boot-time feature-gate refuses hardware missing a gated
 required feature with a clear diagnostic. The IOMMU is opportunistic with a degraded DMA-unconfined
-mode.
+mode, which a system's signed boot-time policy may refuse
+([device-management.md](device-management.md#required-dma-confinement) § Required DMA Confinement).
 
 ---
 

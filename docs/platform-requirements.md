@@ -342,8 +342,12 @@ in-envelope hardware.
 The IOMMU is discovered by the userspace device manager and programmed by a userspace IOMMU
 driver it directs, not by the kernel: VT-d on x86-64, the RISC-V IOMMU on riscv64. When an
 IOMMU is present and configured, device DMA is confined to explicitly mapped frames; when it is
-absent or unconfigured, DMA is unconfined (a degraded mode). The authoritative DMA safety model is
-in [device-management.md](device-management.md).
+absent or unconfigured, DMA is unconfined (a degraded mode). A system's signed boot-time policy MAY
+make confinement a requirement (`dma-confinement = required`): devmgr then starts no DMA-capable
+driver for a device no IOMMU unit confines, and a machine whose boot device is left unconfined does
+not boot until it is given a confining IOMMU or a policy that does not require one. The
+authoritative DMA safety model, the setting, the refusal and the recovery included, is in
+[device-management.md](device-management.md) (§ DMA Safety Model, § Required DMA Confinement).
 
 ---
 

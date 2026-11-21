@@ -37,7 +37,9 @@ nothing and reads no key; the bundle's entries are chosen by a list per harness 
 checks, once it has composed the ESP, that each object on it equals its installed file, and
 the pack then checks the same of the image it wrote, its ESP against its root partition
 (§ The ESP); the
-bootloader refuses an entry without the boot-module role; the default bundle is the bootstrap
+bootloader refuses an entry without the boot-module role, or, under `/config/`, without the
+configuration role, and a bundle without the boot-time policy `/config/boot/policy.conf`
+([signing.md](signing.md) § Configuration); the default bundle is the bootstrap
 closure, the consoles' drivers and the platform description tables loaded from the root
 filesystem (§ The Bootstrap Closure); the bundle is used during bootstrap alone, apart from the
 IOMMU driver's image, which devmgr keeps for the driver's restart (§ Bootstrap-Only Boot Copies);
@@ -79,8 +81,9 @@ Composing the ESP copies files. It never signs, needs no key, and writes nothing
 object on the ESP is signed and public, and the trust stores the bootloader verifies against are
 built into it or kept in firmware storage ([signing.md](signing.md) § Trust Store). The build
 composes the ESP this way, and so does any later recomposition on a running system. The list names
-only objects that carry the boot-module role; the bootloader refuses an entry without it, so writing
-the list cannot make an object bootable that its signer did not permit.
+only objects that carry the boot-module role, or, under `/config/`, the configuration role; the
+bootloader refuses an entry without it, so writing the list cannot make an object bootable that its
+signer did not permit.
 
 An ESP whose objects all equal their installed files verifies as those files do. Composition
 checks that equality once it has written the ESP, and refuses an ESP it cannot establish it for:

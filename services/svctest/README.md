@@ -522,6 +522,7 @@ through to the normal run.
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
 | `exit-code-thread`          | `exit_code`    | `exit_code_thread` (exit off main)          |
+| `exit-code-thread-race`     | `exit_code`    | `exit_code_thread_race` (main exits after)  |
 | `recv-wedge-thread`         | `recv_guard`   | `recv_wedge_thread` (wedge off main)        |
 | `no-receiver-child`         | `no_receiver`  | `call_no_receiver` (killed, call queued)    |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |

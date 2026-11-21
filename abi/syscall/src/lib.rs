@@ -1275,7 +1275,8 @@ const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 //   | `0x1000 ..0x2000` | Fault               | `EXIT_FAULT_BASE + vector/cause`   |
 //   | `0x2000`          | Killed              | `EXIT_KILLED`: recorded by         |
 //   |                   |                     | object teardown (not posted by     |
-//   |                   |                     | it); posted by a userspace kill    |
+//   |                   |                     | it); posted by procmgr for a       |
+//   |                   |                     | process a destroy tore down        |
 //
 // This is a Seraph-native encoding, not POSIX: exit codes are not 8-bit
 // `WEXITSTATUS`-truncated, and faults are native fault classes, not signals.
@@ -1297,10 +1298,10 @@ pub const EXIT_FAULT_BASE: u64 = 0x1000;
 /// bound before it hears nothing from the kernel, while one bound afterwards
 /// receives the retained reason through the bind. A thread stopped while
 /// already inside its own exit or fault path still posts that path's reason;
-/// `EXIT_KILLED` is then at most the retained value. Userspace posts the same
-/// value (e.g. `std::process::Child::kill`) so a waiter observes a defined
-/// status. Sits just above the fault range so consumers tell a kill from a
-/// hardware fault.
+/// `EXIT_KILLED` is then at most the retained value. procmgr's destroy of a process
+/// it stopped posts the same value to the process's death relay and end queue, so a
+/// waiter observes a defined status. Sits just above the fault range so consumers tell a
+/// kill from a hardware fault.
 pub const EXIT_KILLED: u64 = 0x2000;
 
 // Every exit reason fits below the flag a `CAP_INFO_ASPACE_END` answer sets

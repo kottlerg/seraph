@@ -5,8 +5,8 @@
 
 //! `std::process::Command` for Seraph: spawns the target binary via
 //! `CREATE_FROM_FILE` to procmgr, optionally installs shmem-backed stdio
-//! pipes via `CONFIGURE_PIPE`, binds a death-notification `EventQueue`
-//! to the child's main thread, starts it, and surfaces `Child::wait` /
+//! pipes via `CONFIGURE_PIPE`, hands procmgr a death relay on a per-child
+//! `EventQueue`, starts the child, and surfaces `Child::wait` /
 //! `Child::kill` on top of the resulting caps.
 //!
 //! Wire-up:
@@ -17,24 +17,25 @@
 //!             CONFIGURE_PIPE, data=[direction, ring_capacity],
 //!             caps=[memory_handoff, data_sig_handoff, space_sig_handoff]).
 //!             Parent retains its own Pipe end (the originals).
-//!   * Bind death: syscall::thread_bind_notification(thread_cap, event_queue_cap).
 //!   * Start: ipc_call(process_handle, START_PROCESS, 0, &[]).
 //!   * Bootstrap (only with `CommandExt::bootstrap_caps`): the create
 //!             request carries a badged SEND on a spawn-own endpoint at
 //!             caps[1], the child's creator endpoint; after the start, spawn
 //!             serves the child's `ipc::bootstrap` rounds on it, then
 //!             deletes it.
-//!   * Wait: syscall::event_recv(event_queue_cap) — blocks until kernel posts
-//!           the exit reason on thread exit, encoded as
-//!           docs/process-lifecycle.md § Exit reason defines.
+//!   * Wait: syscall::event_recv(event_queue_cap) — blocks until procmgr
+//!           posts the child's end to the death relay, once, after its
+//!           teardown of the child: the one exit reason procmgr gives the
+//!           process, which `QUERY_PROCESS` and logd read too, encoded as
+//!           docs/process-lifecycle.md § Exit reason defines. Nothing binds
+//!           the child's main thread: its own end is not always the
+//!           process's.
 //!   * Kill: ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
 //!           revokes + deletes the child's kernel objects, with every
 //!           process the child started, and posts the child's end to the
-//!           death relay once — then event_post(event_queue_cap,
-//!           EXIT_KILLED), so `wait` after `kill` reports `EXIT_KILLED`,
-//!           unless the child had already died and its own exit reason,
-//!           posted first, is reported. A failed teardown is returned as
-//!           the error and posts nothing.
+//!           death relay once: `EXIT_KILLED`, or the child's own exit reason
+//!           when it had already died. A failed teardown is returned as the
+//!           error.
 //!
 //! Stdio:
 //!   * `Stdio::Inherit` (default) / `Stdio::Null` — no pipe installed
@@ -446,24 +447,18 @@ impl Command {
 
         // Create the per-child death `EventQueue` BEFORE issuing
         // CREATE_FROM_FILE so a POST-only copy can ride along as the
-        // death-relay cap. procmgr posts the child's end to that copy once,
-        // whoever ends it: the fault class of a terminal fault in *any* of the
-        // child's threads (not just the main thread), its exit reason, or the
-        // reason a destroy tore it down with, and `wait()` returns. Four
-        // covers one post from each source that targets the queue: the main
-        // thread's death, procmgr's post to the relay, `kill`'s
-        // `EXIT_KILLED`, and the bridge's drop sentinel.
-        const DEATH_EQ_CAPACITY: u32 = 4;
-        // One observer node: the main-thread binding below. procmgr's post
-        // to the relay is a post, not a binding, and takes none.
-        const DEATH_EQ_OBSERVERS: u32 = 1;
-        let bytes = syscall_abi::event_queue_retype_bytes(
-            u64::from(DEATH_EQ_CAPACITY),
-            u64::from(DEATH_EQ_OBSERVERS),
-        );
+        // death-relay cap. procmgr holds the relay from the create on, before
+        // the child can run, and posts the child's end to it once, after its
+        // teardown, whoever ends it: the one exit reason it gives the process
+        // (a terminal fault or exit of *any* of the child's threads, the main
+        // thread's end, or the reason a destroy tore it down with), and
+        // `wait()` returns. Two covers each post that targets the queue:
+        // procmgr's, and the bridge's drop sentinel. Nothing binds the queue
+        // as a death observer, so it takes no observer node.
+        const DEATH_EQ_CAPACITY: u32 = 2;
+        let bytes = syscall_abi::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY), 0);
         let death_eq = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
-            syscall::event_queue_create_observed(slab, DEATH_EQ_CAPACITY, DEATH_EQ_OBSERVERS)
-                .ok()
+            syscall::event_queue_create(slab, DEATH_EQ_CAPACITY).ok()
         })
         .ok_or_else(|| {
                 // The child does not exist yet; just drop the file cap we
@@ -585,24 +580,16 @@ impl Command {
         let process_handle = reply_caps[0];
         let thread_cap = reply_caps[1];
 
-        // Bind the death `EventQueue` to the child's main thread BEFORE start,
-        // so a short-lived child cannot exit before the binding lands and
-        // leave `wait()` blocked forever. Correlator 0: the spawner uses a
-        // dedicated per-child EventQueue, so routing is trivial (one thread
-        // per queue) and the payload stays equal to `exit_reason`.
-        if syscall::thread_bind_notification(thread_cap, death_eq, 0).is_err() {
-            let _ = syscall::cap_delete(death_eq);
-            let _ = syscall::cap_delete(thread_cap);
-            destroy_child(process_handle);
-            let _ = syscall::cap_delete(process_handle);
-            return Err(io::Error::other("thread_bind_notification for child failed"));
-        }
-
+        // The death queue is not bound to the child's main thread: that
+        // thread's own end is not the process's when another thread ended the
+        // process first (docs/process-lifecycle.md § Exit reason), and the
+        // kernel would post it ahead of procmgr's relay post. The relay alone
+        // carries the reason procmgr gives the process.
+        //
         // The parent keeps `thread_cap`, a derivation of procmgr's `child_thread`
         // that procmgr IPC-moved here, for `ChildExt::main_thread_cap` (a
         // debugger reaches the child's registers and memory through it,
-        // docs/fault-handling.md § Debugging). The death observer lives on the
-        // child's Thread object, not on the cap. procmgr's reap-time
+        // docs/fault-handling.md § Debugging). procmgr's reap-time
         // `cap_revoke(child_thread)` reaches this copy through the derivation
         // edge, which keeps it load-bearing for the thread-before-aspace
         // teardown order; were the revoke to free this slot and a later spawn
@@ -706,7 +693,6 @@ impl Command {
                 }
 
                 let handles = BridgeHandles {
-                    process_handle,
                     death_eq,
                     completion_notification,
                     pipe_notifications,
@@ -930,7 +916,7 @@ impl Command {
             // An interrupted or timed-out START_PROCESS, or a failed bootstrap
             // round, may leave the child started, so the rings count as never
             // used only once the teardown has returned; otherwise their grants
-            // stay accounted to this process, as the death bridge leaves them.
+            // stay accounted to this process until it exits.
             if destroy_child(process_handle) {
                 mark_spawn_failure_pipes(
                     child_stdin_pipe.as_deref(),
@@ -1221,9 +1207,11 @@ struct Bridge {
 pub struct Process {
     process_handle: u64,
     thread_cap: u64,
-    /// Death-notification queue bound to the child thread. Owned by
-    /// `Process` regardless of stdio mode. With `bridge` present the
-    /// bridge thread consumes the EQ; otherwise `wait` does so directly.
+    /// Per-child death queue, bound to no thread: its POST copy is the
+    /// death relay procmgr posts the process's one exit reason to, and the
+    /// bridge's drop sentinel is its only other poster. Owned by `Process`
+    /// regardless of stdio mode. With `bridge` present the bridge thread
+    /// consumes the EQ; otherwise `wait` does so directly.
     death_eq: u64,
     /// Per-spawn bridge state — only allocated for piped spawns. The
     /// bridge translates a child death into the parent-side `peer_dead`
@@ -1257,17 +1245,16 @@ impl Process {
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        kill_child(self.process_handle)?;
-        // The kernel posts to the main-thread binding only on voluntary
-        // exit (`SYS_THREAD_EXIT`) or fault — cap_revoke-driven teardown is
-        // silent. procmgr posts the child's end to the relay once, at the
-        // teardown, which the bridge (or `wait` directly, for non-piped
-        // spawns) reads when it is first; the event posted here as well
-        // keeps a status after kill independent of when that post lands. Value chosen outside
-        // the kernel fault range (0x1000..0x2000) so callers can tell apart
-        // a user-initiated kill from a hardware fault.
-        let _ = syscall::event_post(self.death_eq, EXIT_KILLED);
-        Ok(())
+        // procmgr's teardown posts the child's end to the relay once, which
+        // the bridge (or `wait` directly, for non-piped spawns) reads:
+        // `EXIT_KILLED` for a child this destroy stopped, outside the fault
+        // range so callers can tell a kill from a hardware fault, or the
+        // child's own reason when it had ended first. A destroy that finds
+        // the child already taken by procmgr's reap of its death leaves the
+        // post to that reap. Nothing is posted here: a second source could
+        // reach the queue ahead of procmgr's post and give `wait` a reason
+        // `QUERY_PROCESS` does not.
+        kill_child(self.process_handle)
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -1297,7 +1284,7 @@ impl Process {
             }
             b.exit_reason.load(Ordering::Acquire)
         } else {
-            // Non-piped: `wait` consumes the kernel's death post on
+            // Non-piped: `wait` consumes procmgr's relay post on
             // `death_eq` directly. No bridge thread allocated. `Interrupted`
             // (this thread was stopped and restarted or interrupted by an
             // upcall, or `death_eq` was destroyed under the wait) waits again;
@@ -1327,16 +1314,15 @@ impl Process {
             if !b.peer_dead.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            // The bridge's remaining work (pipe kicks, the procmgr
-            // teardown call, ring releases, the completion send) is
-            // bounded; join it before reporting.
+            // The bridge's remaining work (pipe kicks, ring releases,
+            // the completion send) is bounded; join it before reporting.
             if let Some(h) = b.handle.take() {
                 let _ = h.join();
             }
             b.exit_reason.load(Ordering::Acquire)
         } else {
             // Non-piped: `event_try_recv` returns `WouldBlock` (-6) if
-            // the kernel hasn't posted yet.
+            // procmgr hasn't posted yet.
             match syscall::event_try_recv(self.death_eq) {
                 Ok(r) => r,
                 Err(-6) => return Ok(None),
@@ -1379,8 +1365,8 @@ impl Drop for Process {
 // ── Death bridge ───────────────────────────────────────────────────────────
 //
 // One thread per piped spawn; non-piped spawns have no bridge, and `wait`
-// consumes `death_eq` directly. Receives the kernel's
-// death notification on `death_eq` and translates it into:
+// consumes `death_eq` directly. Receives procmgr's relay post of the
+// child's end on `death_eq` and translates it into:
 //   * `peer_dead.store(true)` — fired on every child death, clean exit
 //     included. Every parent-side `Pipe` checks this atom before each
 //     ring drain; a reader reports EOF only when a drain performed after
@@ -1390,15 +1376,14 @@ impl Drop for Process {
 //   * `notification_send` on each piped direction's data and space notifications,
 //     so any reader/writer currently parked in `notification_wait` wakes
 //     and re-checks the flag.
-//   * `DESTROY_PROCESS` on the process handle, so the child's address
-//     space is gone before any ring page is returned.
-//   * `RingRelease::on_peer_death` per piped direction, only once that
-//     call succeeded — returns the direction's ring-page grant to memmgr
-//     when the parent end is already dropped; otherwise the parent's later
-//     `Pipe::Drop` sends the release, unless its ring unmap fails, which
-//     keeps the grant until exit. Exactly-once by the shared state
-//     machine. A failed teardown call reports no death, so the grants stay
-//     accounted to the spawner until it exits.
+//   * `RingRelease::on_peer_death` per piped direction — returns the
+//     direction's ring-page grant to memmgr when the parent end is already
+//     dropped; otherwise the parent's later `Pipe::Drop` sends the release,
+//     unless its ring unmap fails, which keeps the grant until exit.
+//     Exactly-once by the shared state machine. procmgr posts to the relay
+//     only after its teardown revoked the child's address space
+//     (docs/process-lifecycle.md § Process Death), so no child thread can
+//     touch a ring by then.
 //   * `exit_reason.store(reason)` + `notification_send(completion_notification)`
 //     — the rendezvous point `Process::wait` blocks on.
 //
@@ -1425,10 +1410,6 @@ struct PipeBridgeNotifications {
 }
 
 struct BridgeHandles {
-    /// Process handle the bridge sends `DESTROY_PROCESS` on before any ring
-    /// release. `Process` deletes it only after the bridge has finished:
-    /// `wait` and `try_wait` join the bridge, and `Drop` joins it first.
-    process_handle: u64,
     death_eq: u64,
     completion_notification: u64,
     pipe_notifications: [Option<PipeBridgeNotifications>; 3],
@@ -1462,24 +1443,15 @@ fn bridge_main(h: BridgeHandles) {
         let _ = syscall::notification_send(sig.data_notification, 1);
         let _ = syscall::notification_send(sig.space_notification, 1);
     }
-    // The death post does not stop the child's other threads, which keep
-    // running until procmgr's teardown (docs/process-lifecycle.md § Exit
-    // reason), so a ring page is not yet safe to return. DESTROY_PROCESS
-    // replies once procmgr has revoked the child's address space
-    // (services/procmgr/docs/ipc-interface.md § Label 8), or at once for a
-    // child procmgr already reaped; after that no child thread can touch a
-    // ring. Without a successful reply the child's death is not reported
-    // to the ring-release state, so its grants stay accounted to this
-    // process until it exits. Kicks first: waking blocked readers/writers
-    // must not wait on the procmgr and memmgr round-trips here.
-    if destroy_child(h.process_handle) {
-        // Report the child's death to each direction's ring-grant release
-        // state; send the release for ends the parent already dropped.
-        for sig in h.pipe_notifications.iter().flatten() {
-            if let Some(rr) = &sig.ring_release {
-                if rr.on_peer_death() {
-                    crate::sys::alloc::seraph::slab_release_fresh(rr.region_id());
-                }
+    // procmgr posted the end after its teardown revoked the child's address
+    // space, so no child thread can touch a ring any more: report the
+    // child's death to each direction's ring-grant release state, and send
+    // the release for ends the parent already dropped. Kicks first: waking
+    // blocked readers/writers must not wait on the memmgr round-trips here.
+    for sig in h.pipe_notifications.iter().flatten() {
+        if let Some(rr) = &sig.ring_release {
+            if rr.on_peer_death() {
+                crate::sys::alloc::seraph::slab_release_fresh(rr.region_id());
             }
         }
     }

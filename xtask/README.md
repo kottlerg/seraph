@@ -503,14 +503,16 @@ path: `/config/bundle/init.x86_64.list` or `init.riscv64.list` for `init`, and
 object of the bundle's `init` slot, and one install path per line for every other entry; `#` starts
 a comment. A harness has either one list for every architecture or one per architecture, never
 both. The bootloader and init address entries by name, so order is not significant. `init`'s
-bundle holds 9 entries: `init`, the 6 boot modules, the IOMMU driver of the architecture's
-family (`iommu-vtd` on x86-64, `iommu-riscv` on riscv64), and the log-level configuration
+bundle holds 10 entries: `init`, the 6 boot modules, the IOMMU driver of the architecture's
+family (`iommu-vtd` on x86-64, `iommu-riscv` on riscv64), the log-level configuration
 `/config/init/log-levels.conf`, installed from the repository's `services/init/log-levels.conf`,
-or from the file `--log-levels` names. The configuration names the log level of each service init
-spawns ([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels); an
-edit to it takes effect at the next `mkdisk` or `build`, with no rebuild of a component, as does
-an edit to a list. `ktest`'s bundle holds the one entry `ktest` as its `init` entry and zero
-modules; ktest is monolithic and does not spawn userspace.
+or from the file `--log-levels` names, and the boot-time policy `/config/boot/policy.conf`, which
+every bundle carries ([docs/signing.md](../docs/signing.md) § Configuration). The log-level
+configuration names the log level of each service init spawns
+([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels); an edit to it
+takes effect at the next `mkdisk` or `build`, with no rebuild of a component, as does an edit to a
+list. `ktest`'s bundle holds 2 entries: `ktest` as its `init` entry and the boot-time
+policy, which ktest does not read; ktest is monolithic and does not spawn userspace.
 
 `disk.img` carries four GPT partitions: the EFI System Partition
 (from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,

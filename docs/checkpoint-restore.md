@@ -57,8 +57,10 @@ the memory objects a snapshot is sealed into are memmgr's
 - **Consent.** A process is captured for a restore only at a quiesce point it entered itself. A
   process that never quiesces cannot be checkpointed, and a snapshot taken without its consent (a
   debugger's `SNAPSHOT`) cannot be restored. Consent is carried by memmgr's checkpoint mark on the
-  object, which only procmgr sets and only on its own complete capture of a quiesce point, never by
-  a value the presenter of the object supplies.
+  object (§ Checkpoint), which only procmgr sets, on its own complete capture of a quiesce point,
+  through an account memmgr has verified is its own. It is never a value in the snapshot: whoever
+  seals an object supplies every byte of it, a checkpoint flag or a completion bit included, while
+  the mark is memmgr's state beside the object's bytes.
 - **The process restores itself.** The kernel restores no register state: procmgr starts the new
   main thread at the image's entry, and the runtime resumes the quiesced context from the memory
   the restore holds.
@@ -107,17 +109,17 @@ it records the quiesce point in the process's entry, the restore stack pointer a
 with it, and replies. The thread then waits on its Notification for at most `timeout`, and writes no
 memory but its stack below the resume record's stack pointer.
 
-procmgr signals the Notification only once it has sealed and marked a complete checkpoint of the
-point (§ Checkpoint). A capture that fails signals nothing and leaves the process at its point, so
-its controller can take the checkpoint again. The process leaves the quiesce point when the
-Notification is signalled, or when the wait times out: the runtime sends `QUIESCE` again with no
-stack pointer, which ends the point, procmgr deletes its Notification, and only after that reply
-does the thread return or write any other memory. The runtime then reads the Notification once
-more without waiting, and deletes it. `quiesce` returns `Captured` when the Notification was
-signalled, and a complete checkpoint of the point then exists. It returns `NotCaptured`
-otherwise, which says only that no checkpoint was sealed before the point ended: a capture whose
-hold began before the end may still seal one (§ Checkpoint). A process's death ends its quiesce
-point.
+procmgr signals the Notification only once a complete, marked checkpoint of the point has been
+delivered to its controller (§ Checkpoint). A capture that fails signals nothing and leaves the
+process at its point, so its controller can take the checkpoint again. The process leaves the
+quiesce point when the Notification is signalled, or when the wait times out: the runtime sends
+`QUIESCE` again with no stack pointer, which ends the point, procmgr deletes its Notification, and
+only after that reply does the thread return or write any other memory. The runtime then reads the
+Notification once more without waiting, and deletes it. `quiesce` returns `Captured` when the
+Notification was signalled: its controller then holds a complete checkpoint of the point. It returns
+`NotCaptured` otherwise, which says only that no checkpoint was delivered before the point ended: a
+capture whose hold began before the end may still deliver one (§ Checkpoint). A process's death ends
+its quiesce point.
 
 The application chooses the point: at the call, its own state is what it accepts to resume from,
 after any number of restores, in a world that has moved on (§ Rollback notice).
@@ -149,13 +151,23 @@ SHA-512 and length) whether or not procmgr shares an image object with it; and t
 declarations that hold no capability (`DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`, and whether its image
 is private). The header marks such a layout as a checkpoint.
 
-When the capture is complete, procmgr sends memmgr `MARK_CHECKPOINT` with the object handle
-(below) while that handle is the only one and procmgr's own, then signals the process through its
-copy of the Notification, deletes the copy, and replies to the controller with the object handle
-and `SNAPSHOT_COMPLETE`. An incomplete capture is a failed checkpoint: procmgr marks nothing and
-signals nothing, the process stays at its point, and the reply carries the handle without
-`SNAPSHOT_COMPLETE`, as `SNAPSHOT`'s does. A checkpoint refused after the hold (a refused
-allocation) leaves the process at its point the same way.
+When the capture is complete, procmgr sends memmgr `MARK_CHECKPOINT` (below) on its own memmgr cap,
+with the object handle and a copy of the account. memmgr marks the object only when the account is
+a SEND on its own endpoint that names a process record, which it reads from the cap's badge
+(`SYS_ENDPOINT_BADGE`) as it reads every handle a client hands it. An account memmgr has verified
+is its own leaves no server between procmgr and memmgr: the frames came from memmgr's grants to
+procmgr alone, memmgr's seal found no other capability or mapping reaching them, and the handle
+came in memmgr's own reply. The marked object is then the copy procmgr wrote, whoever presented
+the account. An account that is not memmgr's is refused the mark, and the checkpoint is refused
+`NOT_RESTORABLE` as a failed one.
+
+procmgr then replies to the controller with the object handle and `SNAPSHOT_COMPLETE`, and signals
+the process through its copy of the Notification only once that reply is delivered, then deletes
+the copy. A reply procmgr cannot deliver releases the object, as `SNAPSHOT`'s does, and signals
+nothing. An incomplete capture is a failed checkpoint: procmgr marks nothing and signals nothing,
+and the reply carries the handle without `SNAPSHOT_COMPLETE`, as `SNAPSHOT`'s does. After a failed
+checkpoint, and a checkpoint refused after the hold (a refused allocation), the process stays at
+its point for the controller to take it again.
 
 The object handle is the authority to read every byte the process held at its quiesce point, its
 secrets included: a process quiesces only for a controller it trusts with its memory. The snapshot
@@ -172,9 +184,9 @@ create does, and reads the snapshot's layout from the object (`OBJECT_READ`, bel
 create with `NOT_RESTORABLE`, having created nothing, unless:
 
 - memmgr reports the object marked as a checkpoint: only procmgr marks an object, only its own
-  complete capture of a quiesce point, and before any other process holds a handle to it, so the
-  layout and every byte are procmgr's capture and the process consented. An object another process
-  sealed, a debugger's `SNAPSHOT`, and a copy of either sealed again carry no mark;
+  complete capture of a quiesce point through an account memmgr verified, so the layout and every
+  byte are procmgr's capture and the process consented. An object another process sealed, a
+  debugger's `SNAPSHOT`, and a copy of either sealed again carry no mark;
 - the verified body's SHA-512 and length are the checkpoint's: the restore binds to the bytes the
   process ran, whatever name the restorer gives them;
 - every executable run lies in the image's executable segments at the snapshot's load bias, so no
@@ -212,9 +224,12 @@ snapshot or with another restore of it, and the snapshot can be released once th
 
 memmgr serves the checkpoint and the restore with three labels:
 
-- **`MARK_CHECKPOINT`**, procmgr-only, over procmgr's own memmgr cap, marks the object whose handle
-  it carries as a checkpoint. memmgr keeps the mark with the object for its life; no other label
-  sets or clears it.
+- **`MARK_CHECKPOINT`**, procmgr-only, marks the object whose handle it carries as a checkpoint,
+  when the account it carries is memmgr's own (§ Checkpoint). memmgr knows the caller is procmgr as
+  for its other procmgr-only labels: the request arrives on the cap init transfers to procmgr at
+  its bootstrap round, which memmgr identifies by badge, and any other badge is refused
+  `UNAUTHORIZED` ([memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md) § Badge
+  Discipline). memmgr keeps the mark with the object for its life; no other label sets or clears it.
 - **`OBJECT_READ`**, open to any process, copies pages of a memory object into Memory caps the
   caller presents, over the object's handle, and its reply says whether the object carries the
   checkpoint mark. procmgr, which has no pager and so cannot attach an object, reads the mark, the
@@ -275,6 +290,11 @@ snapshot taken in it. A snapshot persisted across boots needs keys sealed to the
 measured state, to keep its bytes confidential and bound to the image and the boot policy at rest;
 until such keys exist no snapshot is written to storage.
 
+The checkpoint mark (§ Checkpoint) holds within one boot only: it is memmgr's state in this boot's
+RAM, and no bytes of the object carry it. A snapshot that outlives a boot will need its
+provenance authenticated under the sealed keys, by a tag over its bytes that only the measured
+system can make, which the mark does not replace.
+
 ---
 
 ## Refusals
@@ -283,6 +303,7 @@ until such keys exist no snapshot is written to storage.
 |---|---|---|
 | `NOT_RESTORABLE` | `QUIESCE` | The process is pinned, phys-class or DMA-held |
 | `NOT_QUIESCED` | `CHECKPOINT` | The process is not at a quiesce point, or left it before the hold |
+| `NOT_RESTORABLE` | `CHECKPOINT` | The account is no memmgr account, so memmgr refused the mark |
 | `NOT_RESTORABLE` | `CREATE_RESTORE` | The object carries no checkpoint mark, or is not a checkpoint of the verified body |
 | `INVALID_ARGUMENT` | `CREATE_RESTORE` | The create carries argv and env (`CREATE_ARGV_ENV`) |
 

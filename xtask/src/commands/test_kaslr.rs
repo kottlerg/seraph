@@ -18,7 +18,7 @@
 //!    image at its link base, and the direct map at the mode floor.
 //!
 //! A pure runner: requires a populated sysroot with the ktest bundle composed
-//! (`cargo xtask compose-bundle --harness ktest`). The kaslr line is emitted
+//! (`cargo xtask mkdisk --harness ktest`). The kaslr line is emitted
 //! in Phase 1, long before the harness runs, so the test does not depend on
 //! ktest completing.
 
@@ -33,8 +33,8 @@ use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::cli::TestKaslrArgs;
-use crate::commands::mkdisk::{Knob, remove_knob, stage_knob};
 use crate::context::Context;
+use crate::esp::{Knob, remove_knob, stage_knob};
 use crate::firmware::find_ovmf_code;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
@@ -270,7 +270,7 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
     stage_knob(ctx, Knob::NoKaslr).context("staging nokaslr knob")?;
     let knob_result = crate::disk::create_disk_image(ctx, args.arch, layout)
         .context("repacking disk with knob")
-        .and_then(|()| scrape("boot C (--no-kaslr)"));
+        .and_then(|()| scrape("boot C (nokaslr)"));
     // Always restore first and surface its failure ahead of the boot-C result:
     // leaving the knob staged would silently disable KASLR for later runs, so a
     // failed restore is the more urgent error to report.
@@ -291,7 +291,7 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
             mode_floor(args)
         );
     }
-    step("kaslr test: --no-kaslr deterministic layout OK");
+    step("kaslr test: nokaslr deterministic layout OK");
 
     step("KASLR test: PASS (randomized image + direct-map base; knob deterministic)");
     Ok(())

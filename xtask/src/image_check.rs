@@ -1,22 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/check_disk.rs
+// xtask/src/image_check.rs
 
-//! Check-disk command: check every FAT volume of the authored disk images with an
-//! independent reader, `fsck.fat -n` (dosfstools), which reports any structure it does not
-//! accept and changes nothing.
+//! The check every pack makes of the disk images it has written
+//! (`crate::disk::create_disk_image`): every FAT volume read by an independent
+//! reader, `fsck.fat -n` (dosfstools), which reports any structure it does not
+//! accept and changes nothing, then the ESP of `disk.img` read back against its
+//! root partition. No image a pack writes is left unchecked.
 //!
-//! The command reads the GPT of `disk.img`, and of `disk-data.img` when it is there, through
-//! vfsd's GPT parser, copies each partition other than swap, the one raw partition `mkdisk`
-//! writes, to a file under `target/xtask/check-disk/`, and runs `fsck.fat -n` on the copy. It
-//! fails on the first volume `fsck.fat` does not pass, printing what `fsck.fat` printed.
+//! The check reads the GPT of each image the pack wrote through vfsd's GPT
+//! parser, copies each partition other than swap, the one raw partition a pack
+//! writes, to a file under `target/xtask/image-check/`, and runs `fsck.fat -n`
+//! on the copy. It fails on the first volume `fsck.fat` does not pass, printing
+//! what `fsck.fat` printed.
 //!
-//! It then reads the ESP and the root partition of `disk.img` with xtask's FAT reader
-//! (`crate::fat_read`) and checks that every object on the ESP equals the installed file on the
-//! root partition it copies, as composition checks the ESP it writes (`crate::esp::check`): the
-//! bundle list is read from the root partition's `/config/bundle/`, and the bundle's entries
-//! choose the harness. A repack that changed one side alone fails, naming the object.
+//! It then reads the ESP and the root partition of `disk.img` with xtask's FAT
+//! reader (`crate::fat_read`) and checks that every object on the ESP equals the
+//! installed file on the root partition it copies, as composition checks the ESP
+//! it writes (`crate::esp::check`): the bundle list is read from the root
+//! partition's `/config/bundle/`, and the bundle's entries choose the harness. A
+//! pack that wrote one side alone fails, naming the object. A pack that writes
+//! substitutes in place of installed files (`test-signing`'s refusal images,
+//! `crate::disk::create_disk_image_substituting`) makes the `fsck.fat` check
+//! alone, since its ESP is by design no copy of its root partition.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -30,52 +37,63 @@ use vfsd_gpt::GptEntry;
 use crate::arch::Arch;
 use crate::argparse::ValueEnum as _;
 use crate::bundle::{self, Harness};
-use crate::cli::CheckDiskArgs;
-use crate::context::Context as BuildContext;
 use crate::error::{Context, Result, bail, ensure};
 use crate::fat_read::{self, Node};
 use crate::util::{require_tool, step};
 use crate::{disk, esp, gpt};
 
-/// Entry point for `cargo xtask check-disk`.
+/// What the check of a pack's images reads besides the FAT volumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EspCheck
+{
+    /// The ESP of the main image against its root partition
+    /// ([`check_esp_copies`]).
+    Copies,
+    /// Nothing: the pack wrote substitutes, so its ESP is no copy of its root
+    /// partition by design.
+    Skipped,
+}
+
+/// Check the images a pack wrote: each FAT volume of `main`, and of `data` when
+/// the pack wrote one, with `fsck.fat -n`, copying each volume under `work`
+/// first; then, as `esp` says, the ESP of `main` against its root partition.
 ///
 /// # Errors
-/// Fails when `fsck.fat` is not on `PATH`, `disk.img` is absent, an image's GPT does not
-/// parse, a partition cannot be copied, `fsck.fat` does not pass a volume, or an object on the
-/// ESP of `disk.img` is not its installed file on the root partition ([`check_esp_copies`]).
-pub fn run(ctx: &BuildContext, _args: &CheckDiskArgs) -> Result<()>
+/// Fails when `fsck.fat` is not on `PATH`, an image's GPT does not parse, a
+/// partition cannot be copied, `fsck.fat` does not pass a volume, or an object
+/// on the ESP of `main` is not its installed file on the root partition
+/// ([`check_esp_copies`]).
+pub fn check(main: &Path, data: Option<&Path>, esp: EspCheck, work: &Path) -> Result<()>
 {
     let fsck = require_tool("fsck.fat")?;
-    let main = ctx.disk_image();
-    ensure!(
-        main.is_file(),
-        "{} is absent: run `cargo xtask build` or `cargo xtask mkdisk` first",
-        main.display()
-    );
-    let work = ctx.target_dir.join("xtask").join("check-disk");
-    fs::create_dir_all(&work).with_context(|| format!("failed to create {}", work.display()))?;
-    let data = ctx.data_disk_image();
+    fs::create_dir_all(work).with_context(|| format!("failed to create {}", work.display()))?;
     let mut checked = 0usize;
-    for image in [main, data].iter().filter(|path| path.is_file())
+    for image in std::iter::once(main).chain(data)
     {
-        checked = checked.saturating_add(check_image(&fsck, image, &work)?);
+        checked = checked.saturating_add(check_image(&fsck, image, work)?);
     }
-    step(&format!(
-        "check-disk: fsck.fat passed {checked} FAT volumes"
-    ));
-    let main = ctx.disk_image();
-    check_esp_copies(&main)?;
-    step(&format!(
-        "check-disk: every object on the ESP of {} is its installed file",
-        main.display()
-    ));
+    match esp
+    {
+        EspCheck::Copies =>
+        {
+            check_esp_copies(main)?;
+            step(&format!(
+                "Image check: fsck.fat passed {checked} FAT volumes; every object on the ESP of \
+                 {} is its installed file",
+                main.display()
+            ));
+        }
+        EspCheck::Skipped => step(&format!(
+            "Image check: fsck.fat passed {checked} FAT volumes; the ESP holds substitutes, \
+             so it is not checked against the root partition"
+        )),
+    }
     Ok(())
 }
 
 /// Check that every object on the ESP of the GPT image at `image` equals the installed file on
 /// its root partition that it copies ([`esp::check`]), the root partition's type giving the
-/// architecture and its `/config/bundle/` the bundle lists. The firmware's `/NvVars`
-/// ([`FIRMWARE_VARIABLES`]) is set aside, so an image that has been booted passes.
+/// architecture and its `/config/bundle/` the bundle lists.
 ///
 /// # Errors
 /// When the image's GPT does not parse, it has not one ESP and one Seraph root partition, a
@@ -106,8 +124,7 @@ fn check_esp_copies(image: &Path) -> Result<()>
             .with_context(|| format!("reading the {what} of {}", image.display()))?;
         Ok(files(tree))
     };
-    let mut esp_files = volume(esp_part, "ESP")?;
-    esp_files.remove(FIRMWARE_VARIABLES);
+    let esp_files = volume(esp_part, "ESP")?;
     let root_files = volume(root_part, "root partition")?;
     let lists = Harness::VARIANTS
         .iter()
@@ -123,11 +140,6 @@ fn check_esp_copies(image: &Path) -> Result<()>
         )
     })
 }
-
-/// The file in which OVMF keeps its variables on the ESP it boots from when it is given no
-/// variable store, as every x86_64 launcher gives it none: firmware state a boot of the image
-/// writes, which no pack copies from the sysroot, so it is set aside before the check.
-const FIRMWARE_VARIABLES: &str = "/NvVars";
 
 /// The one partition of `parts` whose type GUID `kind` maps to a value, and that value.
 ///
@@ -247,10 +259,6 @@ fn check_image(fsck: &Path, image: &Path, work: &Path) -> Result<usize>
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        step(&format!(
-            "check-disk: {} partition {number}: clean",
-            image.display()
-        ));
         fs::remove_file(&copy).with_context(|| format!("failed to remove {}", copy.display()))?;
         checked = checked.saturating_add(1);
     }
@@ -379,15 +387,11 @@ mod tests
         }
     }
 
-    // Defect caught: an image whose ESP and root partition disagree (a repack that changed one
-    // side alone) passing check-disk, or an image packed from one sysroot refused: the volumes
-    // read at the wrong partition, the architecture or the bundle list taken from the wrong
-    // place.
-    #[test]
-    fn an_image_whose_esp_differs_from_its_root_partition_is_refused()
+    /// A riscv64 image at `dir/disk.img` of an ESP and a root partition that agree, from the
+    /// trees under `dir/esp` and `dir/root`; returns those three paths.
+    fn fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf)
     {
-        let dir = std::env::temp_dir().join(format!("seraph-check-disk-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(dir);
         let (esp, root, image) = (dir.join("esp"), dir.join("root"), dir.join("disk.img"));
         for (path, bytes) in [
             ("boot/boot.efi", b"MZ bootloader".as_slice()),
@@ -416,9 +420,25 @@ mod tests
             ],
         )
         .unwrap();
-        // The variables OVMF writes on the ESP of an image it boots are no object.
-        put(&esp, "NvVars", b"firmware variables");
         pack(&image, &esp, &root);
+        (esp, root, image)
+    }
+
+    /// A directory under the host's temporary directory, unique to this process and `name`.
+    fn scratch(name: &str) -> PathBuf
+    {
+        std::env::temp_dir().join(format!("seraph-image-check-{name}-{}", std::process::id()))
+    }
+
+    // Defect caught: an image whose ESP and root partition disagree (a repack that changed one
+    // side alone) passing the check, or an image packed from one sysroot refused: the volumes
+    // read at the wrong partition, the architecture or the bundle list taken from the wrong
+    // place.
+    #[test]
+    fn an_image_whose_esp_differs_from_its_root_partition_is_refused()
+    {
+        let dir = scratch("esp");
+        let (esp, root, image) = fixture(&dir);
         check_esp_copies(&image).unwrap();
 
         put(&root, "services/vfsd", b"\x7fELF vfsd, rebuilt");
@@ -433,6 +453,47 @@ mod tests
         pack(&image, &esp, &root);
         let error = format!("{:#}", check_esp_copies(&image).unwrap_err());
         assert!(error.contains("/EFI/seraph/kernel differs"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Defect caught: a pack's check passing a volume the independent reader refuses (fsck.fat
+    // not run on every partition, or its failure taken for a pass).
+    #[test]
+    fn an_image_with_a_volume_fsck_refuses_is_refused()
+    {
+        let dir = scratch("fsck");
+        let (_, _, image) = fixture(&dir);
+        let work = dir.join("work");
+        check(&image, None, EspCheck::Copies, &work).unwrap();
+
+        // The root partition's boot sector claims clusters of no sectors.
+        let mut file = fs::OpenOptions::new().write(true).open(&image).unwrap();
+        file.seek(SeekFrom::Start(MIB + 17 * MIB + 13)).unwrap();
+        std::io::Write::write_all(&mut file, &[0]).unwrap();
+        drop(file);
+        let error = format!(
+            "{:#}",
+            check(&image, None, EspCheck::Skipped, &work).unwrap_err()
+        );
+        assert!(
+            error.contains("fsck.fat -n does not pass partition 2"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Defect caught: a substituting pack (a refusal image of test-signing) refused for the
+    // ESP it writes on purpose, or its volumes left unchecked.
+    #[test]
+    fn a_substituted_image_is_checked_by_fsck_alone()
+    {
+        let dir = scratch("substituted");
+        let (esp, root, image) = fixture(&dir);
+        put(&esp, "EFI/seraph/kernel", b"\x7fELF tampered kernel");
+        pack(&image, &esp, &root);
+        let work = dir.join("work");
+        check(&image, None, EspCheck::Copies, &work).unwrap_err();
+        check(&image, None, EspCheck::Skipped, &work).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }

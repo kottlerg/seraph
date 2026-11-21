@@ -68,7 +68,7 @@ static KERNEL_PATH: [u16; 19] = [
 
 /// `\EFI\seraph\nokaslr` as a NUL-terminated UTF-16 path — the presence of
 /// this file disables KASLR for deterministic debugging (staged by
-/// `cargo xtask mkdisk --no-kaslr`).
+/// `cargo xtask mkdisk --knob nokaslr`).
 // rustfmt::skip keeps the UTF-16 code units in rows of five, which rustfmt would
 // spread one per line.
 #[rustfmt::skip]

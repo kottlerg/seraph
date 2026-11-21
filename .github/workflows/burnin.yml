@@ -102,8 +102,8 @@ jobs:
         # part of the services/programs substrate under test) so the boot is
         # controlled. `--repack-only` makes the removal stick: a normal repack
         # re-mirrors rootfs, which would restore terminal.svc. ktest swaps the
-        # bundle's `init` entry via `cargo xtask compose-bundle --harness
-        # ktest`, which repacks the disk image as part of the compose step.
+        # bundle's `init` entry via `cargo xtask mkdisk --harness ktest`,
+        # which repacks the disk image with the ktest bundle.
         # The svctest cell also stages the test-only device class files of
         # `sysroot/config/devmgr/tests/` into `classes/`, and its boots attach
         # the test devices (`--test-devices`, below) the test-only drivers bind.
@@ -139,7 +139,7 @@ jobs:
               cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
               ;;
             ktest)
-              cargo xtask compose-bundle --arch ${{ matrix.arch }} --harness ktest
+              cargo xtask mkdisk --arch ${{ matrix.arch }} --harness ktest
               ;;
           esac
 

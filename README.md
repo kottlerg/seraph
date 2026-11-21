@@ -57,7 +57,7 @@ cargo xtask build                            # build (defaults: x86_64, debug)
 cargo xtask build --arch riscv64             # build for RISC-V
 cargo xtask build --debug kernel             # build all; debuginfo for kernel only
 cargo xtask mkdisk                           # repack disk.img after rootfs/ edits
-cargo xtask compose-bundle --harness ktest   # swap boot bundle to ktest harness
+cargo xtask mkdisk --harness ktest           # swap boot bundle to ktest harness
 cargo xtask run                              # launch existing sysroot under QEMU
 cargo xtask run --gdb                        # pause at start; GDB on :1234
 cargo xtask run --runs 1 --timeout 300       # one unattended boot, judged by its log

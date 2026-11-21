@@ -12,8 +12,8 @@
 //! (`crate::disk::create_disk_image`), and checks, once it has written it,
 //! that every object on it equals the installed file it copies ([`check`]),
 //! so the ESP of every image equals the installed files it derives from.
-//! `check-disk` makes the same check of a packed image, its ESP against its
-//! root partition.
+//! The pack then makes the same check of the image it wrote, its ESP against
+//! its root partition (`crate::image_check`).
 //!
 //! Composing signs nothing and reads no key: the sysroot is signed first
 //! (`crate::signing::sign_for_harness`), and the composer checks what it
@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use objsig::{Expectation, Role, RoleSet, TrustStore};
 
 use crate::arch::Arch;
+use crate::argparse::ValueEnum as _;
 use crate::bundle::{self, BundleList, Harness};
 use crate::context::Context as BuildContext;
 use crate::error::{Context as _, Result, bail, err};
@@ -60,6 +61,85 @@ fn bootloader_paths(arch: Arch) -> [String; 2]
 fn kernel_path() -> String
 {
     format!("{VENDOR_DIR}/{KERNEL_NAME}")
+}
+
+crate::argparse::value_enum! {
+    /// A presence-only bootloader knob: an empty file in the ESP's
+    /// `\EFI\seraph\`, read by the next boot of an image packed with it
+    /// (docs/boot-media.md § The ESP).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Knob
+    {
+        /// `\EFI\seraph\nokaslr`: the bootloader boots the kernel at its
+        /// deterministic (un-randomized) layout.
+        #[value(name = "nokaslr")]
+        NoKaslr,
+        /// `\EFI\seraph\mapredo`: the bootloader redoes the first attempt of its
+        /// steps 6 and 7 whatever its memory map's size.
+        #[value(name = "mapredo")]
+        MapRedo,
+    }
+}
+
+/// The path of `knob` in the sysroot's ESP.
+fn knob_path(ctx: &BuildContext, knob: Knob) -> PathBuf
+{
+    ctx.sysroot_efi_seraph().join(knob.name())
+}
+
+/// Stage `knob` in the sysroot's ESP so the next pack's image carries it.
+/// Idempotent.
+///
+/// # Errors
+///
+/// On an I/O failure.
+pub fn stage_knob(ctx: &BuildContext, knob: Knob) -> Result<()>
+{
+    let path = knob_path(ctx, knob);
+    if let Some(dir) = path.parent()
+    {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    fs::write(&path, b"").with_context(|| format!("writing {}", path.display()))
+}
+
+/// Remove `knob` from the sysroot's ESP so the next pack's image lacks it.
+/// Idempotent: an absent knob is left absent.
+///
+/// # Errors
+///
+/// On an I/O failure other than the knob's absence.
+pub fn remove_knob(ctx: &BuildContext, knob: Knob) -> Result<()>
+{
+    let path = knob_path(ctx, knob);
+    match fs::remove_file(&path)
+    {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Stage each of `knobs` and remove every other knob, so the next pack's
+/// image carries exactly `knobs`.
+///
+/// # Errors
+///
+/// As [`stage_knob`] and [`remove_knob`].
+pub fn set_knobs(ctx: &BuildContext, knobs: &[Knob]) -> Result<()>
+{
+    for knob in Knob::VARIANTS
+    {
+        if knobs.contains(knob)
+        {
+            stage_knob(ctx, *knob)?;
+        }
+        else
+        {
+            remove_knob(ctx, *knob)?;
+        }
+    }
+    Ok(())
 }
 
 /// The path in the sysroot's ESP of `path`, a path from the ESP's root.
@@ -416,7 +496,6 @@ fn check_kernel(store: &[u8], arch: Arch, kernel: &[u8]) -> Result<()>
 mod tests
 {
     use super::*;
-    use crate::argparse::ValueEnum as _;
     use crate::signing::sign_sysroot;
     use crate::signing::testing::{install_lists, scratch, signer};
     use boot_protocol::bundle as fmt;
@@ -485,8 +564,7 @@ mod tests
     }
 
     // Defect caught: a check that refuses the ESP every pack composes (a knob taken for a stray
-    // object, the bundle's harness not found among the lists), so no image could be packed or
-    // pass check-disk.
+    // object, the bundle's harness not found among the lists), so no image could be packed.
     #[test]
     fn an_esp_of_its_installed_files_passes_the_check()
     {
@@ -713,5 +791,32 @@ mod tests
             .unwrap();
         compose(&ctx, arch, Harness::Init).unwrap_err();
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: a knob an earlier pack staged surviving a pack that did not name it (KASLR
+    // left off, or the map redo left on, for every later boot), or a named knob not staged.
+    #[test]
+    fn the_knobs_staged_are_exactly_the_ones_named()
+    {
+        let dir = scratch("knobs");
+        let ctx = BuildContext {
+            root: dir.clone(),
+            sysroot: dir.join("sysroot"),
+            target_dir: dir.join("target"),
+        };
+        let staged = |ctx: &BuildContext| -> Vec<Knob> {
+            Knob::VARIANTS
+                .iter()
+                .copied()
+                .filter(|knob| knob_path(ctx, *knob).is_file())
+                .collect()
+        };
+        set_knobs(&ctx, &[Knob::NoKaslr, Knob::MapRedo]).unwrap();
+        assert_eq!(staged(&ctx), [Knob::NoKaslr, Knob::MapRedo]);
+        set_knobs(&ctx, &[Knob::MapRedo]).unwrap();
+        assert_eq!(staged(&ctx), [Knob::MapRedo]);
+        set_knobs(&ctx, &[]).unwrap();
+        assert_eq!(staged(&ctx), []);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

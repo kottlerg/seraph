@@ -35,8 +35,8 @@ each object on it is its installed file byte for byte, and the composition copie
 nothing and reads no key; the bundle's entries are chosen by a list per harness in configuration
 (`/config/bundle/`), and every entry other than `init` is named by its install path; every pack
 checks, once it has composed the ESP, that each object on it equals its installed file, and
-`cargo xtask check-disk`, which CI runs, checks the same of a packed image, its ESP against its
-root partition (§ The ESP); the
+the pack then checks the same of the image it wrote, its ESP against its root partition
+(§ The ESP); the
 bootloader refuses an entry without the boot-module role; the default bundle is the bootstrap
 closure, the consoles' drivers and the platform description tables loaded from the root
 filesystem (§ The Bootstrap Closure); the bundle is used during bootstrap alone, apart from the
@@ -85,11 +85,11 @@ An ESP whose objects all equal their installed files verifies as those files do.
 checks that equality once it has written the ESP, and refuses an ESP it cannot establish it for:
 one whose object is missing, differs from its installed file or copies one that is not installed,
 whose bundle holds an entry its list does not name or lacks one it names, or that holds any other
-file than an empty presence-only knob in `\EFI\seraph\`. `cargo xtask check-disk` makes the
-same check of a packed disk image, its ESP against the installed files of its root partition, so
-a repack that changed one side alone is caught; it sets aside the firmware's variable file
-`\NvVars`, which OVMF writes to the ESP of an image it boots without a variable store, as no pack
-copies it ([xtask/README.md](../xtask/README.md#cargo-xtask-check-disk)).
+file than an empty presence-only knob in `\EFI\seraph\`. Once it has written the disk image, the
+pack makes the same check of the image, its ESP against the installed files of its root
+partition, read back by xtask's FAT reader, after `fsck.fat -n` has checked every FAT volume of
+it, so a pack that wrote one side alone, or wrote a volume an independent reader refuses, fails
+([xtask/README.md](../xtask/README.md#the-image-check) § The image check).
 
 ---
 

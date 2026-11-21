@@ -402,14 +402,14 @@ process's entry until `PROCESS_DIED`.
 ## Metadata Arena
 
 All of memmgr's bookkeeping — free runs, deferred runs, process records and
-their budget nodes, node handle states and limit registrations, per-process frame and region
-descriptors, and the regions' chunk tables — is
+their budget nodes and the nodes' reclaim states, node handle states and limit
+registrations, per-process frame and region descriptors, and the regions' chunk tables — is
 nodes drawn from a self-hosted arena rather than fixed `.bss` arrays. memmgr
 is `no_std` and cannot bootstrap
 a general heap against itself, but it *can* host fixed-size nodes in pages
 carved from its own pool:
 
-- Nodes are fixed-size `Slot`s (a tagged run, deferred run, budget, process,
+- Nodes are fixed-size `Slot`s (a tagged run, deferred run, budget, reclaim state, process,
   process caps, node handle, limit registration, memory object, region,
   commitment, frame, chunk-directory, chunk, or free payload plus a `next`
   index)
@@ -783,13 +783,15 @@ endpoint badged with the node-handle verb bit and a random key that names one no
 (`NODE_SET_MAX`), clamped to its usage plus what its parent chain has left, so a max set while
 the process runs never exceeds what its ancestors allow and lowering it reclaims nothing, as
 above; makes sub-nodes under it (`NODE_CREATE`), so siblings charged to one sub-node share its
-budget; reads its usage (`NODE_QUERY_USAGE`); and registers a Notification for its limit event
+budget; reads its usage (`NODE_QUERY_USAGE`); sets its floor and weight (`NODE_SET_RECLAIM`,
+Floors and weights, below); and registers a Notification for its limit event
 (`NODE_REGISTER_LIMIT`). procmgr hands a creator its child's handle on request
 (`CREATE_NODE_HANDLE`), and charges a new child to the node of a handle the creator passes
 (`CREATE_CHARGE_NODE`); a process makes sub-nodes of its own node with `CREATE_SUB_NODE`; no
 process holds a handle to its own node, so none can raise the max its creator set. A node's
 handle state, the key its handles carry and the index of its limit registration, is an arena node
-named by the budget node's slot link and found through the record index by its key; it holds a
+named by the link of the node's reclaim state (Floors and weights, below) and found through the
+record index by its key; it holds a
 reference on its node. It belongs to a process: the node's own process, or for a sub-node the owner
 of the node it was made under, or the process that called `CREATE_SUB_NODE`. It goes when that
 process dies or, for a sub-node, on `NODE_RELEASE`; every handle carrying its key is refused from
@@ -798,6 +800,35 @@ The limit registration, the Notification cap and its bits, is an arena node of i
 of its registrant, the process whose memmgr SEND the request carried: it goes when the registrant
 dies, when a later registration replaces it, or with the handle state, so no holder leaves a cap in
 memmgr past its own life.
+
+**Floors and weights.** A node handle also sets the node's floor and weight (`NODE_SET_RECLAIM`,
+[ipc-interface.md](ipc-interface.md) § Label 32), which divide eviction ([Eviction](#eviction))
+between nodes; admission reads neither. Each node counts its subtree's evictable resident pages R:
+the backed pages of the resident chunks eviction may take ([Eviction](#eviction), Eligible pages),
+counted apart for uncommitted and committed regions, since a committed chunk is evictable only
+while a swap service has registered slots (Committed pages there). Each change of a chunk into or
+out of the resident state updates the counts of its record's node and every ancestor, as a charge
+does. The floor is the hard guarantee: memmgr evicts no chunk, in the background or by direct
+reclaim, that would take R of the node, or of an ancestor with a floor, below that floor. The
+weight, 1 to 10000 and 100 for a node none was set on ([docs/limits.md](../../../docs/limits.md)
+§ memmgr), is the soft preference: above its floor a node's reclaim rate is
+`(R - floor) / (R * weight)`, or `1 / weight` with no floor, and 0 at its floor or below; the
+rate of a process's chunks is the least over its node and every ancestor, so a floor or a weight
+covers the node's whole subtree and the most protective of a chain holds. The clock visits each
+node's records in proportion to that rate (Selection there), so it takes idle pages from a node in
+proportion to `(R - floor) / weight`. With no floor or weight set every rate is equal, and the
+clock sweeps every record every pass, as with no reclaim state at all.
+
+A floor reserves nothing. The free pages it covers are free pages like any others until the
+subtree's own pages take them, and a charge to any node is admitted against them as before. So when
+every evictable page left lies under some floor, reclaim finds no victim and the out-of-memory path
+decides (crashd's hold of a declined fault, oomd's stop of a job), as when nothing is evictable; the
+all-RAM-accounted identity holds throughout, since a floor moves no page. No ancestor bounds the
+floor or the weight set on a node below it: any process can already exempt every page of its own
+from eviction with `REGION_NO_EVICT` ([ipc-interface.md](ipc-interface.md) § Label 7), so a floor or
+a heavy weight gives a subtree nothing its processes could not take without one, and a floored page,
+like a no-evict page, is charged and limited by the node's max and every ancestor's, which bounds
+what either withholds from reclaim.
 
 **Limit event.** After each request memmgr walks the chain from the node the request charged, or
 whose max it set, to the top, and sends each node's registered bits on its Notification when the
@@ -1180,7 +1211,14 @@ reclaim, below), and the pool is otherwise left to the out-of-memory path (crash
 declined fault, oomd's stop of a job). While the level reads `LOW` or `CRITICAL`, the receive loop
 waits for a message a bounded time and, at most once per sweep interval, runs a slice of the clock:
 a hand walks the eligible regions of each process in turn, a bounded number of steps a slice
-([docs/limits.md](../../../docs/limits.md) § memmgr gives the interval and the bounds). For each
+([docs/limits.md](../../../docs/limits.md) § memmgr gives the interval and the bounds). A pass
+sweeps the records of a budget node only as often as the node's reclaim rate allows ([Distribution
+policy](#distribution-policy), Floors and weights): at its first record in a pass the node's credit
+grows by its rate over the greatest rate of a node the previous pass found an idle chunk of, at most
+by a whole sweep, and the pass sweeps the node's records when a whole sweep has built up, spending
+it, and otherwise passes each over in one step, its accessed bits left for its next sweep. A node at
+its floor or below is never swept, and when the previous pass found no idle chunk every other node
+is. For each
 span of up to 256 chunks it reads and clears the accessed bits with one `SYS_ASPACE_HARVEST`, and
 ages each resident chunk of the span with its two-bit age ([Chunk table](#chunk-table)): a chunk
 with no accessed page in two sweeps is cold, and the slice posts one job for each cold chunk whose
@@ -1243,26 +1281,26 @@ corruption of memmgr's memory makes, declines the fault with code 9 and detail 0
 compressed.
 
 **Direct reclaim.** A restore the free pages do not admit evicts victims itself, in its turn, before
-it is declined: the kept victim of the greatest age first, checked again as resident, eligible, and
-unaccessed for at least one sweep, and its pages' accessed bits read once more
-(`SYS_ASPACE_HARVEST`), since its age is the one the last sweep over it recorded: a set bit resets
-its age and passes it over. So a chunk accessed or restored since the last sweep is never taken and
-two processes cannot trade one chunk turn after turn. Any eligible process's chunk may be taken, the
-faulting process's own included. For each, memmgr unmaps the chunk, maps its runs at the input
-window of a synchronous slot of its own, compresses it into that slot's output buffer with a hash
-table of its own, so it shares nothing with the worker, unmaps the window, takes the store pages,
-writes the stream and swaps the chunk, whose runs return to the free pool in the same turn; a stream
-that gains nothing keeps the chunk raw, or maps it back, as above (States). It stops when the
-restore is admitted, or after a bounded number of victims ([docs/limits.md](../../../docs/limits.md)
-§ memmgr), and the restore is then declined with code 7. The store pages a victim takes can dip
-below the reserve for the rest of the turn, where no other admission runs, and each victim kept
-leaves more free pages than it took. Only a restore and a committed draw ([Commit](#commit),
-Overcommit) reclaim directly: a first touch of an unbacked page of an uncommitted region grows its
-node's charge, and at the growth floor that growth stays the out-of-memory path's, while a restore
-returns pages its node is charged for already and a committed draw takes pages its commitment was
-charged and promised. Compression in the loop costs a restore's turn at most that bound's
-compressions, on a fault that would otherwise be declined; background eviction compresses in the
-worker, so its latency lands on no fault or grant.
+it is declined: the kept victim of the greatest age first, checked again as resident, eligible,
+unaccessed for at least one sweep, and above the floors of its node's chain, and its pages' accessed
+bits read once more (`SYS_ASPACE_HARVEST`), since its age is the one the last sweep over it
+recorded: a set bit resets its age and passes it over. So a chunk accessed or restored since the
+last sweep is never taken and two processes cannot trade one chunk turn after turn. Any eligible
+process's chunk may be taken, the faulting process's own included. For each, memmgr unmaps the
+chunk, maps its runs at the input window of a synchronous slot of its own, compresses it into that
+slot's output buffer with a hash table of its own, so it shares nothing with the worker, unmaps the
+window, takes the store pages, writes the stream and swaps the chunk, whose runs return to the free
+pool in the same turn; a stream that gains nothing keeps the chunk raw, or maps it back, as above
+(States). It stops when the restore is admitted, or after a bounded number of victims
+([docs/limits.md](../../../docs/limits.md) § memmgr), and the restore is then declined with code 7.
+The store pages a victim takes can dip below the reserve for the rest of the turn, where no other
+admission runs, and each victim kept leaves more free pages than it took. Only a restore and a
+committed draw ([Commit](#commit), Overcommit) reclaim directly: a first touch of an unbacked page
+of an uncommitted region grows its node's charge, and at the growth floor that growth stays the
+out-of-memory path's, while a restore returns pages its node is charged for already and a committed
+draw takes pages its commitment was charged and promised. Compression in the loop costs a restore's
+turn at most that bound's compressions, on a fault that would otherwise be declined; background
+eviction compresses in the worker, so its latency lands on no fault or grant.
 
 **Restore headroom.** While chunks of uncommitted regions are swapped, a charge to a node outside
 the reserve leaves a restore headroom H free above the reserve R: their swapped pages, and at most

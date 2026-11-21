@@ -22,9 +22,11 @@ tester a copy of each as its bootstrap caps
 ([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Bootstrap caps), the tester's slot
 `k` being the `k`-th slot its entry names. A tester with no entry gets no creator endpoint. A
 declaration that names slot 0, a slot past the eight, or a tester twice, or that does not parse,
-fails the run before any tester starts. The recipe declares `hello:1`: the hello tester takes
-`pwrmgr.deny` and checks that pwrmgr refuses it
-([programs/hello/README.md](../../programs/hello/README.md) § Tester).
+fails the run before any tester starts. The recipe declares `hello:1;crashme:2`: the hello tester
+takes `pwrmgr.deny` and checks that pwrmgr refuses it
+([programs/hello/README.md](../../programs/hello/README.md) § Tester), and the crashme tester takes
+`crashd.core` and asks the crash service for live cores
+([programs/crashme/README.md](../../programs/crashme/README.md)).
 
 ---
 

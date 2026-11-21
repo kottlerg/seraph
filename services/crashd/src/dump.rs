@@ -61,7 +61,7 @@ const CORE_DIR: &str = "/";
 const COPY_BYTES: usize = 16 * MAX_THREAD_MEM_COPY;
 
 /// Bytes of the ELF header read at the load bias for `NT_AUXV`.
-const EHDR_BYTES: usize = 64;
+pub const EHDR_BYTES: usize = 64;
 
 /// The faulting process, as the fault message and the report's attach give
 /// it.
@@ -90,8 +90,12 @@ pub enum Outcome
 {
     /// The policy does not name the process.
     NotNamed,
-    /// The core was written under this name, this many bytes long.
-    Written(String, u64),
+    /// The core was written under `name`, with sequence number `seq`,
+    /// `bytes` long.
+    Written
+    {
+        name: String, seq: u64, bytes: u64
+    },
     /// No core was written, for this reason; a `.part` file may remain.
     Failed(&'static str),
     /// The bound passed; a `.part` file may remain.
@@ -115,7 +119,7 @@ pub fn dump(policy: &Policy, target: &Target, authority: u64, ipc_buf: *mut u64)
     match outcome
     {
         Outcome::Failed(_) | Outcome::Cancelled if cancelled => Outcome::Cancelled,
-        Outcome::Written(..) | Outcome::NotNamed | Outcome::Failed(_) | Outcome::Cancelled =>
+        Outcome::Written { .. } | Outcome::NotNamed | Outcome::Failed(_) | Outcome::Cancelled =>
         {
             outcome
         }
@@ -243,7 +247,9 @@ fn capture(
         authority,
         ipc_buf,
     };
-    write_core(&core, &name, &source, &mut bound)
+    write_core(&core, &name, |file| {
+        write_loads(file, &core, &source, &mut bound)
+    })
 }
 
 /// Have memmgr restore the chunks it evicted of `process` from the page of
@@ -306,7 +312,7 @@ struct Source
 
 /// The name of the process `badge` names, from `LIST_PROCESSES`, sent with
 /// the time left of the dump's deadline as its timeout.
-fn process_name(badge: u64, authority: u64, ipc_buf: *mut u64) -> Result<Vec<u8>, Outcome>
+pub fn process_name(badge: u64, authority: u64, ipc_buf: *mut u64) -> Result<Vec<u8>, Outcome>
 {
     // A page that resumes after `badge - 1` starts at `badge` while it lives.
     let request = IpcMessage::builder(procmgr_labels::LIST_PROCESSES)
@@ -356,7 +362,7 @@ fn hold_threads(
         {
             Ok(reply) => reply,
             Err(AttachFailed::Expired) => return Err(Outcome::Cancelled),
-            Err(AttachFailed::Refused) => return Err(Outcome::Failed("the attach was refused")),
+            Err(AttachFailed::Refused(_)) => return Err(Outcome::Failed("the attach was refused")),
         };
         let count = reply.word(0);
         let named = reply.word(procmgr_labels::ATTACH_WORD_NAMED_THREAD);
@@ -490,14 +496,13 @@ fn list_runs(reader: u64) -> Result<Vec<Run>, Outcome>
     }
 }
 
-/// Write `core` for the process named `name`, reading its pages from
-/// `source` under the dump's `bound`: make room for it, write it under its
+/// Write `core` for the process named `name`, its loads' bytes written by
+/// `write_loads` after the head: make room for it, write it under its
 /// `.part` name, and rename it once complete.
-fn write_core(
+pub fn write_core(
     core: &layout::Core,
     name: &[u8],
-    source: &Source,
-    bound: &mut ipc::ResidentBound<'_>,
+    write_loads: impl FnOnce(&mut File) -> Result<(), Outcome>,
 ) -> Outcome
 {
     let seq = match make_room(core.size)
@@ -523,7 +528,7 @@ fn write_core(
     {
         return outcome;
     }
-    if let Err(outcome) = write_loads(&mut file, core, source, bound)
+    if let Err(outcome) = write_loads(&mut file)
     {
         return outcome;
     }
@@ -536,7 +541,11 @@ fn write_core(
     {
         return Outcome::Failed("the core file was not renamed");
     }
-    Outcome::Written(core_name, core.size)
+    Outcome::Written {
+        name: core_name,
+        seq,
+        bytes: core.size,
+    }
 }
 
 /// Delete the `.part` files earlier dumps left and the oldest cores until a
@@ -671,7 +680,7 @@ fn write_loads(
 /// Write all of `bytes` to `file`, under the dump's deadline: a write the
 /// deadline ends fails `TimedOut` and ends the dump [`Outcome::Cancelled`],
 /// and any other failure ends it too.
-fn write_bounded(file: &mut File, mut bytes: &[u8]) -> Result<(), Outcome>
+pub fn write_bounded(file: &mut File, mut bytes: &[u8]) -> Result<(), Outcome>
 {
     while !bytes.is_empty()
     {

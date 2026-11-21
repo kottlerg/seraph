@@ -46,6 +46,15 @@
 //! among them, and every admission reads the free pool less `promised`, with
 //! the overcommit allowance the free swap slots give for a commitment
 //! ([`commit::allowance`]; `services/memmgr/docs/memory-pool.md` § Commit).
+//!
+//! Every budget node counts, over its subtree, the pages of the resident chunks
+//! eviction may take ([`budget::Reclaim`]), updated at every write of a chunk's
+//! entry that moves the chunk into or out of the resident state and at every
+//! teardown of a resident chunk. The eviction clock reads them: it never
+//! evicts a chunk that would take a node below its floor, and sweeps each
+//! node's records in proportion to its reclaim rate ([`budget::rate`];
+//! `services/memmgr/docs/memory-pool.md` § Distribution policy, Floors and
+//! weights).
 
 use crate::arena::{
     Arena, Attachment, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, LimitReg,
@@ -248,6 +257,13 @@ struct Sweep<'a, H, P>
     found: usize,
     left: u64,
     idle_sweeps: u8,
+    /// The record the clock last decided for ([`budget::visit`]),
+    /// [`NODE_NULL`] before the first.
+    rec: NodeIdx,
+    /// Whether this pass sweeps that record's node.
+    swept: bool,
+    /// That node's reclaim rate ([`budget::rate`]).
+    rate: u64,
 }
 
 /// What a teardown released from the chunks it freed ([`retire_entry`]).
@@ -264,6 +280,8 @@ struct Released
     disk: u64,
     /// Raw chunks freed that were waiting for a slot ([`ChunkState::Raw`]).
     raw: u64,
+    /// Pages of the resident chunks freed ([`resident_pages`]).
+    resident: u64,
 }
 
 /// How many matching frames [`Ledger::return_frames_where`] moves.
@@ -322,6 +340,14 @@ pub struct Ledger<S, W>
     /// wait for memmgr to unmap its own view of them, the others chained
     /// through [`MemObject::owned_next`] ([`Self::retiring_object`]).
     retiring: NodeIdx,
+    /// The eviction clock's passes ended, wrapping: the pass a node's sweep
+    /// is decided for ([`budget::visit`]).
+    pass: u32,
+    /// The greatest reclaim rate of a node the previous pass found an idle
+    /// chunk of, 0 when it found none ([`budget::visit`]).
+    q_max: u64,
+    /// The same, so far, for the pass in progress.
+    q_next: u64,
 }
 
 impl<S: SlotStore, W: WordStore> Ledger<S, W>
@@ -346,6 +372,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             zero_frames: NODE_NULL,
             object_va: ObjectVa::new(),
             retiring: NODE_NULL,
+            pass: 0,
+            q_max: 0,
+            q_next: 0,
         }
     }
 
@@ -444,6 +473,21 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     pub const fn overcommits(&self) -> bool
     {
         self.slots.total() != 0
+    }
+
+    /// The resident pages eviction may take ([`budget::evictable_resident`]):
+    /// those of committed regions too while [`Self::overcommits`].
+    #[must_use]
+    pub const fn evict_scope(&self) -> budget::EvictScope
+    {
+        if self.overcommits()
+        {
+            budget::EvictScope::All
+        }
+        else
+        {
+            budget::EvictScope::Uncommitted
+        }
     }
 
     /// The pages a commitment may still promise: the free pool and the
@@ -605,7 +649,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Limit(_)
             | Node::Disk(_)
             | Node::Object(_)
-            | Node::ZeroFrame(_) => None,
+            | Node::ZeroFrame(_)
+            | Node::Reclaim(_) => None,
         }
     }
 
@@ -629,7 +674,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Limit(_)
             | Node::Disk(_)
             | Node::Object(_)
-            | Node::ZeroFrame(_) => None,
+            | Node::ZeroFrame(_)
+            | Node::Reclaim(_) => None,
         }
     }
 
@@ -654,7 +700,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Limit(_)
             | Node::Disk(_)
             | Node::Object(_)
-            | Node::ZeroFrame(_) => None,
+            | Node::ZeroFrame(_)
+            | Node::Reclaim(_) => None,
         }
     }
 
@@ -703,7 +750,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Limit(_)
             | Node::Disk(_)
             | Node::Object(_)
-            | Node::ZeroFrame(_) => None,
+            | Node::ZeroFrame(_)
+            | Node::Reclaim(_) => None,
         }
     }
 
@@ -726,12 +774,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     ///
     /// # Errors
     /// [`NodeError::Parent`] for a parent the node cannot take;
-    /// [`NodeError::NoSlot`] when the arena has fewer than the three free
-    /// slots outside its reserve the record, its caps and its node take, or
-    /// the index has no bucket storage. Nothing is left allocated then.
+    /// [`NodeError::NoSlot`] when the arena has fewer than the four free
+    /// slots outside its reserve the record, its caps, its node and the node's
+    /// reclaim state take, or the index has no bucket storage. Nothing is left
+    /// allocated then.
     pub fn insert_process(&mut self, badge: u64, spec: NodeSpec) -> Result<NodeIdx, NodeError>
     {
-        if self.arena.available() < 3
+        if self.arena.available() < 4
         {
             return Err(NodeError::NoSlot);
         }
@@ -890,7 +939,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Limit(_)
             | Node::Disk(_)
             | Node::Object(_)
-            | Node::ZeroFrame(_) => None,
+            | Node::ZeroFrame(_)
+            | Node::Reclaim(_) => None,
         }
     }
 
@@ -916,7 +966,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Handle(_)
             | Node::Disk(_)
             | Node::Object(_)
-            | Node::ZeroFrame(_) => None,
+            | Node::ZeroFrame(_)
+            | Node::Reclaim(_) => None,
         }
     }
 
@@ -936,13 +987,12 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.index.find(&self.arena, badge).is_some()
     }
 
-    /// The handle-state slot of the budget node `node`, named by the node's
-    /// slot `next` link, or `None` when it has none.
+    /// The handle-state slot of the budget node `node`, named by its reclaim
+    /// state ([`budget::Reclaim::handle`]), or `None` when it has none.
     #[must_use]
     pub fn node_handle(&self, node: NodeIdx) -> Option<NodeIdx>
     {
-        budget::node(&self.arena, node)?;
-        let h = self.arena.get(node).next;
+        let h = budget::reclaim(&self.arena, node)?.handle;
         self.handle(h).map(|_| h)
     }
 
@@ -979,8 +1029,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// # Errors
     /// [`NodeError::Parent`] when `parent` is not a budget node or `owner`
     /// holds no record; [`NodeError::NoSlot`] when the arena has fewer than
-    /// the two free slots outside its reserve the node and its state take, or
-    /// the index has no bucket storage. Nothing changes then.
+    /// the three free slots outside its reserve the node, its reclaim state and
+    /// its handle state take, or the index has no bucket storage. Nothing
+    /// changes then.
     pub fn create_sub_node(
         &mut self,
         owner: NodeIdx,
@@ -993,7 +1044,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             return Err(NodeError::Parent);
         }
-        if self.arena.available() < 2
+        if self.arena.available() < 3
         {
             return Err(NodeError::NoSlot);
         }
@@ -1011,8 +1062,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Allocate handle state for `node` keyed by `key`, index it, link it
-    /// first on the owner `rec`'s list and name it from the node's slot
-    /// `next`. The reference on the node is the caller's to account.
+    /// first on the owner `rec`'s list and name it from the node's reclaim
+    /// state ([`budget::set_handle`]). The reference on the node is the caller's to account.
     fn attach(&mut self, rec: NodeIdx, node: NodeIdx, key: u64) -> Result<NodeIdx, NodeError>
     {
         let r = self.record(rec).ok_or(NodeError::Parent)?;
@@ -1034,7 +1085,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return Err(NodeError::NoSlot);
         }
         self.update_caps(rec, |c| c.handles = h);
-        self.arena.set_next(node, h);
+        budget::set_handle(&mut self.arena, node, h);
         Ok(h)
     }
 
@@ -1057,7 +1108,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.arena.free(h);
         if budget::node(&self.arena, s.node).is_some()
         {
-            self.arena.set_next(s.node, NODE_NULL);
+            budget::set_handle(&mut self.arena, s.node, NODE_NULL);
             budget::unref(&mut self.arena, s.node);
         }
         Some(limit)
@@ -1270,6 +1321,31 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         Some(max)
     }
 
+    /// Set the floor of the budget node `node` to `floor` pages and its
+    /// weight to `weight`, clamped to the weight range
+    /// ([`budget::set_reclaim`]). Admission is unchanged: the floor reserves
+    /// no free page. Returns the weight it took; `None` when `node` is not a
+    /// budget node.
+    pub fn set_node_reclaim(&mut self, node: NodeIdx, floor: u64, weight: u32) -> Option<u32>
+    {
+        budget::set_reclaim(&mut self.arena, node, floor, weight)
+    }
+
+    /// The floor and weight of the budget node `node`, and the evictable
+    /// resident pages of its subtree the floor is held against
+    /// ([`budget::evictable_resident`]); `None` when `node` is not a budget
+    /// node.
+    #[must_use]
+    pub fn node_reclaim(&self, node: NodeIdx) -> Option<(u64, u32, u64)>
+    {
+        let r = budget::reclaim(&self.arena, node)?;
+        Some((
+            r.floor,
+            r.weight,
+            budget::evictable_resident(&r, self.evict_scope()),
+        ))
+    }
+
     /// Call `f` with the limit cap and bits of each node on the chain from
     /// `node` up that has a limit registration and is at its limit
     /// ([`budget::at_limit`]), `refused` being the pages of a charge just
@@ -1340,7 +1416,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Handle(_)
             | Node::Limit(_)
             | Node::Disk(_)
-            | Node::ZeroFrame(_) => None,
+            | Node::ZeroFrame(_)
+            | Node::Reclaim(_) => None,
         }
     }
 
@@ -2453,6 +2530,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 );
             });
         }
+        self.count_resident(rec, &node, 0, released.resident);
         self.settle(rec, charged, released, Commit::Committed);
         let cut = commit::grow_need(new_len, old_len);
         // The chunks cut lay in the pages cut, so the pages that held data, in
@@ -2634,6 +2712,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             )
         };
         self.arena.set_node(reg, Node::Region(node));
+        self.count_resident(rec, &node, 0, released.resident);
         self.settle(rec, charged, released, Commit::of(committed));
         let run_pages = released.run_pages.saturating_add(released.swapped);
         if let Some(c) = committed
@@ -2937,6 +3016,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return Err(BackError::NoSlot);
         }
         self.arena.set_node(reg, Node::Region(node));
+        self.count_entry(rec, &node, entry, backed);
         if self.commit_at(node.commit).is_some()
         {
             self.promised = self.promised.saturating_sub(u64::from(frame.page_count));
@@ -2962,16 +3042,64 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     #[must_use]
     pub fn evictable(&self, rec: NodeIdx, reg: NodeIdx) -> bool
     {
-        let (Some(r), Some(node)) = (self.record(rec), self.region_node(reg))
+        self.region_node(reg)
+            .and_then(|node| self.resident_class(rec, &node))
+            .is_some_and(|(_, commit)| commit == Commit::Uncommitted || self.overcommits())
+    }
+
+    /// The budget node whose evictable resident pages the resident chunks of
+    /// the region `node` of `rec` count in ([`budget::Reclaim`]), and whether
+    /// they count as committed ([`Commit`]): the record's node, for a region not registered
+    /// no-evict and no memory-object attachment, of a record whose node is
+    /// outside the system reserve. `None` for a region whose chunks count in
+    /// no node, which eviction never takes ([`Ledger::evictable`]).
+    fn resident_class(&self, rec: NodeIdx, node: &RegionNode) -> Option<(NodeIdx, Commit)>
+    {
+        let budget = self.record(rec)?.budget;
+        let commitment = self.commit_at(node.commit);
+        (commitment.is_none_or(|c| c.source.is_none())
+            && node.region.evict == Evict::Allowed
+            && budget::node(&self.arena, budget).is_some_and(|b| !b.reserve()))
+        .then_some((budget, Commit::of(commitment)))
+    }
+
+    /// Count the change of the chunk entry `old` to `new` in the region
+    /// `node` of `rec` in the evictable resident pages of the record's node
+    /// and its ancestors ([`budget::count_resident`]).
+    fn count_entry(&mut self, rec: NodeIdx, node: &RegionNode, old: ChunkEntry, new: ChunkEntry)
+    {
+        self.count_resident(rec, node, resident_pages(new), resident_pages(old));
+    }
+
+    /// Count `gained` resident pages more and `lost` fewer of the region
+    /// `node` of `rec` in the evictable resident pages of the record's node
+    /// and its ancestors; nothing for a region whose chunks count in none
+    /// ([`Ledger::resident_class`]).
+    fn count_resident(&mut self, rec: NodeIdx, node: &RegionNode, gained: u64, lost: u64)
+    {
+        if gained == lost
+        {
+            return;
+        }
+        if let Some((budget, commit)) = self.resident_class(rec, node)
+        {
+            budget::count_resident(&mut self.arena, budget, commit, gained, lost);
+        }
+    }
+
+    /// Whether evicting the chunk holding `page_base` in region `reg` of
+    /// `rec` leaves every budget node of the record's chain at its floor or
+    /// above ([`budget::above_floor`]).
+    #[must_use]
+    pub fn above_floor(&self, rec: NodeIdx, reg: NodeIdx, page_base: u64) -> bool
+    {
+        let Some(r) = self.record(rec)
         else
         {
             return false;
         };
-        let commitment = self.commit_at(node.commit);
-        (commitment.is_none() || self.overcommits())
-            && commitment.is_none_or(|c| c.source.is_none())
-            && node.region.evict == Evict::Allowed
-            && budget::node(&self.arena, r.budget).is_some_and(|b| !b.reserve())
+        let pages = resident_pages(self.chunk_at(reg, page_base));
+        budget::above_floor(&self.arena, r.budget, pages, self.evict_scope())
     }
 
     /// Whether evicting a chunk raises the free pages outside `promised`
@@ -3066,10 +3194,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Write `entry`, the new entry of a chunk that has a leaf, into the table
-    /// of the region `reg`, whose node is `node`. A chunk with a leaf takes no
-    /// slot, so the write does not fail.
+    /// of the region `reg` of `rec`, whose node is `node`, and count the
+    /// change in the record's evictable resident pages
+    /// ([`Ledger::count_entry`]). A chunk with a leaf takes no slot, so the
+    /// write does not fail.
     fn put_chunk(
         &mut self,
+        rec: NodeIdx,
         reg: NodeIdx,
         mut node: RegionNode,
         height: u32,
@@ -3077,9 +3208,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         entry: ChunkEntry,
     )
     {
+        let old = chunk::entry(&self.arena, node.table, height, index);
         let written = chunk::set_entry(&mut self.arena, &mut node.table, height, index, entry);
         debug_assert!(written, "a chunk with a leaf took a slot");
         self.arena.set_node(reg, Node::Region(node));
+        self.count_entry(rec, &node, old, entry);
     }
 
     /// Start evicting the resident chunk holding `page_base` in region `reg` of
@@ -3091,7 +3224,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     ///
     /// # Errors
     /// [`SwapError::NoRegion`], [`SwapError::Ineligible`] when the region's
-    /// chunks may not be evicted ([`Ledger::evictable`]), and
+    /// chunks may not be evicted ([`Ledger::evictable`]) or the eviction would
+    /// take a budget node of the record's chain below its floor
+    /// ([`Ledger::above_floor`]), and
     /// [`SwapError::Chunk`] for a chunk that is not resident, or is pinned.
     /// Nothing changes then.
     pub fn begin_evict(
@@ -3103,12 +3238,12 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     ) -> Result<ChunkEntry, SwapError>
     {
         let (node, height, index, entry) = self.swap_chunk(rec, reg, page_base)?;
-        if !self.evictable(rec, reg)
+        if !self.evictable(rec, reg) || !self.above_floor(rec, reg, page_base)
         {
             return Err(SwapError::Ineligible);
         }
         let evicting = entry.begin_evict(job).map_err(SwapError::Chunk)?;
-        self.put_chunk(reg, node, height, index, evicting);
+        self.put_chunk(rec, reg, node, height, index, evicting);
         self.evictions = self.evictions.wrapping_add(1);
         Ok(evicting)
     }
@@ -3130,7 +3265,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     {
         let (node, height, index, entry) = self.swap_chunk(rec, reg, page_base)?;
         let resident = entry.cancel_evict().map_err(SwapError::Chunk)?;
-        self.put_chunk(reg, node, height, index, resident);
+        self.put_chunk(rec, reg, node, height, index, resident);
         Ok(resident)
     }
 
@@ -3205,7 +3340,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 );
             });
         }
-        self.put_chunk(reg, node, height, index, compressed);
+        self.put_chunk(rec, reg, node, height, index, compressed);
         let pages = u64::from(entry.backed().count_ones());
         if self.commit_at(node.commit).is_some()
         {
@@ -3245,7 +3380,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return Err(SwapError::Stale);
         }
         let raw = entry.finish_raw().map_err(SwapError::Chunk)?;
-        self.put_chunk(reg, node, height, index, raw);
+        self.put_chunk(rec, reg, node, height, index, raw);
         self.raw_chunks = self.raw_chunks.saturating_add(1);
         Ok(())
     }
@@ -3277,7 +3412,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             self.drop_disk(disk, u64::from(entry.backed().count_ones()));
         }
-        self.put_chunk(reg, node, height, index, resident);
+        self.put_chunk(rec, reg, node, height, index, resident);
         if waiting
         {
             self.raw_chunks = self.raw_chunks.saturating_sub(1);
@@ -3425,7 +3560,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             self.drop_disk(disk, pages);
         }
-        self.put_chunk(reg, node, height, index, resident);
+        self.put_chunk(rec, reg, node, height, index, resident);
         if self.commit_at(node.commit).is_some()
         {
             self.promised = self.promised.saturating_sub(pages);
@@ -3616,7 +3751,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         };
         self.arena
             .set_node(idx, Node::Disk(DiskNode { slot, ..disk }));
-        self.put_chunk(reg, node, height, index, writing);
+        self.put_chunk(rec, reg, node, height, index, writing);
         if entry.is_raw()
         {
             self.raw_chunks = self.raw_chunks.saturating_sub(1);
@@ -3707,7 +3842,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 ..n
             }),
         );
-        self.put_chunk(n.reg, node, height, index, on_disk);
+        self.put_chunk(n.rec, n.reg, node, height, index, on_disk);
         self.disk_pages = self.disk_pages.saturating_add(pages);
         Ok(freed)
     }
@@ -3735,7 +3870,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                     return Err(SwapError::NotWriting);
                 }
                 let again = entry.cancel_write().map_err(SwapError::Chunk)?;
-                self.put_chunk(n.reg, node, height, index, again);
+                self.put_chunk(n.rec, n.reg, node, height, index, again);
                 if again.state() == ChunkState::Raw
                 {
                     self.raw_chunks = self.raw_chunks.saturating_add(1);
@@ -3772,7 +3907,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return Err(SwapError::NotWriting);
         }
         let lost = entry.lose().map_err(SwapError::Chunk)?;
-        self.put_chunk(n.reg, node, height, index, lost);
+        self.put_chunk(n.rec, n.reg, node, height, index, lost);
         self.slots.release(slot);
         self.arena.free(idx);
         self.disk_pages = self
@@ -3831,7 +3966,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// One slice of the eviction clock: from `hand`, sweep at most `budget`
     /// steps over the chunks of the eligible regions ([`Ledger::evictable`])
-    /// of every process with a delegated address space, in record order and,
+    /// of every process with a delegated address space whose budget node this
+    /// pass sweeps ([`budget::visit`]: none at its floor or below, and each
+    /// other in proportion to its reclaim rate), in record order and,
     /// within a record, in address order, and write each chunk found idle for
     /// `idle_sweeps` sweeps ([`ChunkEntry::is_idle`]) into `victims` until it
     /// is full ([`Ledger::sweep_preferring`] with no region preferred). A step
@@ -3846,7 +3983,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// entry is aged by it ([`ChunkEntry::sweep`]). Returns the victims
     /// written. A slice ends at the end of a pass, with the hand at the first
     /// record, so no slice sweeps a chunk twice and successive slices visit
-    /// every eligible chunk in turn.
+    /// every eligible chunk of the nodes each pass sweeps in turn. A pass that
+    /// finds an idle chunk of a node notes the node's rate, and the greatest
+    /// it noted scales the next pass's credit.
     pub fn sweep(
         &mut self,
         hand: &mut ClockHand,
@@ -3890,12 +4029,15 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             found: 0,
             left: budget,
             idle_sweeps,
+            rec: NODE_NULL,
+            swept: false,
+            rate: 0,
         };
         while s.left > 0
         {
             s.left = s.left.saturating_sub(1);
             let aspace = self.aspace_cap(rec);
-            let reg = (aspace != 0)
+            let reg = (aspace != 0 && self.sweeps(&mut s, rec))
                 .then(|| self.region_from(rec, hand.va))
                 .flatten();
             let Some((reg, node)) = reg
@@ -3909,6 +4051,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                     rec = next;
                     continue;
                 }
+                self.q_max = self.q_next;
+                self.q_next = 0;
+                self.pass = self.pass.wrapping_add(1);
                 if let Some(first) = self.next_record(None)
                 {
                     rec = first;
@@ -3919,6 +4064,21 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
         hand.badge = self.record(rec).map(|r| r.badge);
         s.found
+    }
+
+    /// Whether this pass of the clock sweeps the records of the budget node
+    /// of `rec` ([`budget::visit`]), at the node's reclaim rate
+    /// ([`budget::rate`]), which `s` keeps for the record's steps.
+    fn sweeps<H, P>(&mut self, s: &mut Sweep<'_, H, P>, rec: NodeIdx) -> bool
+    {
+        if s.rec != rec
+        {
+            let node = self.record(rec).map_or(NODE_NULL, |r| r.budget);
+            s.rec = rec;
+            s.rate = budget::rate(&self.arena, node, self.evict_scope());
+            s.swept = budget::visit(&mut self.arena, node, self.pass, s.rate, self.q_max);
+        }
+        s.swept
     }
 
     /// One step of [`Ledger::sweep`] in the region `reg` of `rec`, whose node
@@ -3992,6 +4152,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             }
             if swept.is_idle(s.idle_sweeps)
             {
+                self.q_next = self.q_next.max(s.rate);
                 let victim = Victim {
                     rec,
                     reg,
@@ -4136,6 +4297,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 );
             });
         }
+        self.count_resident(rec, node, 0, released.resident);
         let commitment = self.commit_at(node.commit);
         self.settle(rec, charged, released, Commit::of(commitment));
         if let Some(c) = commitment
@@ -4344,6 +4506,21 @@ fn retire<S: SlotStore>(
     }
 }
 
+/// The pages of the chunk `entry` that count in its budget node's evictable
+/// resident pages ([`budget::Reclaim`]), when its region's chunks count in
+/// one: its backed pages while it is resident and not pinned, else none.
+fn resident_pages(entry: ChunkEntry) -> u64
+{
+    if entry.state() == ChunkState::Resident && !entry.pinned()
+    {
+        u64::from(entry.backed().count_ones())
+    }
+    else
+    {
+        0
+    }
+}
+
 /// Mark the write in flight of the writing chunk `entry` cancelled, its slot
 /// kept until the swap service ends the write ([`Ledger::finish_write`]);
 /// nothing for a chunk in another state.
@@ -4367,7 +4544,7 @@ fn cancel_write<S: SlotStore>(arena: &mut Arena<S>, entry: ChunkEntry)
 }
 
 /// Take back what the entry `entry` of a chunk being freed holds, adding it to
-/// `released`: each run of a resident, evicting or raw chunk, a raw chunk
+/// `released` with its resident pages ([`resident_pages`]): each run of a resident, evicting or raw chunk, a raw chunk
 /// writing included, as [`retire`] does with its charge on the budget node
 /// `charged`, or each store run of a compressed chunk,
 /// writing or not, which no process ever reached, to `pool`, the chunk's
@@ -4394,6 +4571,7 @@ fn retire_entry<S: SlotStore, W: WordStore>(
 )
 {
     let pages = u64::from(entry.backed().count_ones());
+    released.resident = released.resident.saturating_add(resident_pages(entry));
     match entry.state()
     {
         ChunkState::Compressed | ChunkState::Raw | ChunkState::Writing =>
@@ -4576,11 +4754,11 @@ mod tests
     }
 
     #[test]
-    fn insert_process_takes_three_slots_or_none()
+    fn insert_process_takes_four_slots_or_none()
     {
         let mut l = ledger();
         let mut filler = NODE_NULL;
-        while l.arena.available() > 2
+        while l.arena.available() > 3
         {
             filler = l.arena.alloc(Node::Free, NODE_NULL).unwrap();
         }
@@ -4589,7 +4767,7 @@ mod tests
         assert_eq!(l.arena.free_count(), free);
         l.arena.free(filler);
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
-        assert_eq!(l.arena.free_count(), free - 2);
+        assert_eq!(l.arena.free_count(), free - 3);
         assert_eq!(l.aspace_cap(rec), 0);
         assert_eq!(l.caps(rec).map(|c| c.pressure), Some(0));
     }
@@ -4695,9 +4873,9 @@ mod tests
         assert_eq!((l.pool.free_pages(), l.pool.run_count()), (2, 1));
         assert_eq!((l.deferred.pages(), l.deferred.run_count()), (7, 2));
         // Every frame slot became a run slot, pooled or parked; the record's
-        // slot was freed, and its budget node outlives it while the parked
-        // runs stay charged to it.
-        assert_eq!(l.arena.free_count(), free - 4);
+        // slot was freed, and its budget node and the node's reclaim state
+        // outlive it while the parked runs stay charged to it.
+        assert_eq!(l.arena.free_count(), free - 5);
         assert_eq!(
             l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all),
             7
@@ -5249,9 +5427,10 @@ mod tests
     }
 
     /// The record's node's own and subtree counts, checked against what it
-    /// holds.
+    /// holds, and every node's evictable resident counts ([`check_resident`]).
     fn usage(l: &Ledger<VecStore, VecWords>, rec: NodeIdx) -> (u64, u64)
     {
+        check_resident(l);
         let b = l.budget(rec).unwrap();
         assert_eq!(b.own, held_by(l, l.record(rec).unwrap().budget));
         (b.own, b.subtree)
@@ -5463,14 +5642,78 @@ mod tests
         l
     }
 
+    /// Check every budget node's evictable resident counts
+    /// ([`budget::Reclaim`]) against the resident chunks of the records of its
+    /// subtree.
+    fn check_resident(l: &Ledger<VecStore, VecWords>)
+    {
+        let slots = l.arena.pages() * crate::SLOTS_PER_PAGE;
+        for node in (0..slots).filter(|&i| budget::node(&l.arena, i).is_some())
+        {
+            let mut want = (0, 0);
+            for idx in 0..slots
+            {
+                let Node::Process(r) = l.arena.get(idx).node
+                else
+                {
+                    continue;
+                };
+                if !in_subtree(l, r.budget, node)
+                {
+                    continue;
+                }
+                let mut reg = r.region_head;
+                while let Some(have) = l.region_node(reg)
+                {
+                    if let Some((_, commit)) = l.resident_class(idx, &have)
+                    {
+                        let height = chunk::table_height(chunk_count(&have.region));
+                        let mut pages = 0;
+                        let mut from = 0;
+                        while let Some((i, e)) =
+                            chunk::next_entry(&l.arena, have.table, height, from)
+                        {
+                            pages += resident_pages(e);
+                            from = i + 1;
+                        }
+                        match commit
+                        {
+                            Commit::Committed => want.1 += pages,
+                            Commit::Uncommitted => want.0 += pages,
+                        }
+                    }
+                    reg = l.arena.get(reg).next;
+                }
+            }
+            let r = budget::reclaim(&l.arena, node).unwrap();
+            assert_eq!((r.resident, r.resident_committed), want, "node {node}");
+        }
+    }
+
+    /// Whether the budget node `node` is `cur` or one of its ancestors.
+    fn in_subtree(l: &Ledger<VecStore, VecWords>, mut cur: NodeIdx, node: NodeIdx) -> bool
+    {
+        while let Some(b) = budget::node(&l.arena, cur)
+        {
+            if cur == node
+            {
+                return true;
+            }
+            cur = b.parent;
+        }
+        false
+    }
+
     /// The pool's pages wherever they are: free, in the store, in a run a
     /// record or a chunk holds, or deferred. Every page the tests take comes
     /// from the pool, so this stays the pool's total. Checks `store_pages`
     /// against the store runs of every compressed chunk, `swapped_pages`
-    /// against the pages of every swapped chunk, and `raw_chunks` against the
-    /// raw chunks waiting for a slot.
+    /// against the pages of every swapped chunk, `raw_chunks` against the
+    /// raw chunks waiting for a slot, and every node's evictable resident
+    /// counts ([`check_resident`]).
     fn pool_pages(l: &Ledger<VecStore, VecWords>) -> u64
     {
+        check_resident(l);
         let mut held = 0;
         let mut store = 0;
         let mut swapped = 0;
@@ -5505,6 +5748,7 @@ mod tests
                 | Node::Disk(_)
                 | Node::Object(_)
                 | Node::ZeroFrame(_)
+                | Node::Reclaim(_)
                 | Node::ChunkDir(_)
                 | Node::Chunk(_) => (),
             }
@@ -5914,6 +6158,215 @@ mod tests
         l.begin_evict(rec, open, BASE, 1).unwrap();
         assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, 0), 1);
         assert_eq!(victims[0].page_base, BASE + CHUNK);
+    }
+
+    /// A record of badge `badge` under the budget node `parent` (a top-level
+    /// node for [`NODE_NULL`]), delegated an address space, with an
+    /// uncommitted region of `chunks` chunks at `BASE`, each backed whole
+    /// from the pool. Returns the record, the region and the record's node.
+    fn charged_under(
+        l: &mut Ledger<VecStore, VecWords>,
+        parent: NodeIdx,
+        badge: u64,
+        chunks: u64,
+    ) -> (NodeIdx, NodeIdx, NodeIdx)
+    {
+        let spec = NodeSpec {
+            parent,
+            max: NO_MAX,
+            reserve: false,
+        };
+        let rec = l.insert_process(badge, spec).unwrap();
+        l.set_aspace_cap(rec, badge);
+        let reg = l
+            .add_region(rec, region(BASE, chunks * CHUNK), Commit::Uncommitted)
+            .unwrap();
+        for c in 0..chunks
+        {
+            back_whole(l, rec, reg, c);
+        }
+        (rec, reg, l.record(rec).unwrap().budget)
+    }
+
+    /// The victims of each of `recs` the clock reports over `passes` whole
+    /// passes in which no page is accessed, each chunk a victim when swept.
+    fn victims_per_pass(
+        l: &mut Ledger<VecStore, VecWords>,
+        recs: &[NodeIdx],
+        passes: usize,
+    ) -> Vec<usize>
+    {
+        let mut seen = vec![0; recs.len()];
+        let mut hand = ClockHand::default();
+        let mut victims = [Victim::default(); 64];
+        for _ in 0..passes
+        {
+            let pass = l.pass;
+            let found = l.sweep(&mut hand, 10_000, |_, _, _, _| true, &mut victims, 0);
+            assert_eq!(l.pass, pass + 1, "a slice is one whole pass");
+            for v in &victims[..found]
+            {
+                if let Some(i) = recs.iter().position(|&r| r == v.rec)
+                {
+                    seen[i] += 1;
+                }
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn the_resident_counts_follow_every_chunk_transition_up_the_chain()
+    {
+        let mut l = roomy_ledger(10_000);
+        let top = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let top_node = l.record(top).unwrap().budget;
+        let spec = NodeSpec {
+            parent: top_node,
+            max: NO_MAX,
+            reserve: false,
+        };
+        let rec = l.insert_process(2, spec).unwrap();
+        let node = l.record(rec).unwrap().budget;
+        let open = l
+            .add_region(rec, region(BASE, 4 * CHUNK), Commit::Uncommitted)
+            .unwrap();
+        let com = l
+            .add_region(rec, region(BASE + 8 * CHUNK, 2 * CHUNK), Commit::Committed)
+            .unwrap();
+        let kept = DemandRegion {
+            evict: Evict::Never,
+            ..region(BASE + 16 * CHUNK, CHUNK)
+        };
+        let kept = l.add_region(rec, kept, Commit::Uncommitted).unwrap();
+        for c in 0..3
+        {
+            back_whole(&mut l, rec, open, c);
+        }
+        back_whole(&mut l, rec, com, 8);
+        back_whole(&mut l, rec, com, 9);
+        // A no-evict region's chunks count in no node.
+        back_whole(&mut l, rec, kept, 16);
+        let counts = |l: &Ledger<VecStore, VecWords>, n| {
+            budget::reclaim(&l.arena, n).map(|r| (r.resident, r.resident_committed))
+        };
+        assert_eq!(counts(&l, node), Some((48, 32)));
+        assert_eq!(counts(&l, top_node), Some((48, 32)));
+        // The committed chunks are evictable only once a swap service has
+        // registered slots.
+        assert_eq!(l.node_reclaim(node), Some((0, budget::WEIGHT_DEFAULT, 48)));
+        register_slots(&mut l, 64);
+        assert_eq!(
+            l.node_reclaim(top_node),
+            Some((0, budget::WEIGHT_DEFAULT, 80))
+        );
+        check_resident(&l);
+        // An eviction takes a chunk off the count and a cancel puts it back.
+        l.begin_evict(rec, open, BASE, 1).unwrap();
+        assert_eq!(counts(&l, top_node), Some((32, 32)));
+        l.cancel_evict(rec, open, BASE).unwrap();
+        assert_eq!(counts(&l, top_node), Some((48, 32)));
+        // A chunk evicted whole counts again once restored.
+        swap_out(&mut l, rec, open, 0, 1, 3);
+        assert_eq!(counts(&l, top_node), Some((32, 32)));
+        let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
+        l.restore_chunk(rec, open, BASE, &[frame(cap, pages, phys, BASE)])
+            .unwrap();
+        assert_eq!(counts(&l, top_node), Some((48, 32)));
+        check_resident(&l);
+        // A discard, a cut and an unregister each take their chunks off.
+        l.discard_range(rec, BASE + CHUNK, CHUNK, pool_all).unwrap();
+        assert_eq!(counts(&l, top_node), Some((32, 32)));
+        l.shrink_region(rec, com, CHUNK, pool_all).unwrap();
+        assert_eq!(counts(&l, top_node), Some((32, 16)));
+        l.remove_region(rec, open, pool_all).unwrap();
+        assert_eq!(counts(&l, node), Some((0, 16)));
+        check_resident(&l);
+        // The process's death takes the rest.
+        l.remove_process(2, pool_all, |_| {}).unwrap();
+        assert_eq!(counts(&l, top_node), Some((0, 0)));
+        check_resident(&l);
+    }
+
+    #[test]
+    fn a_floor_keeps_the_clock_and_eviction_off_the_pages_it_covers()
+    {
+        let mut l = roomy_ledger(10_000);
+        let (a, a_reg, a_node) = charged_under(&mut l, NODE_NULL, 1, 4);
+        let (b, _, _) = charged_under(&mut l, NODE_NULL, 2, 4);
+        // A floor of all 64 of a's evictable resident pages keeps the clock
+        // off a; b's chunks are victims all the same.
+        assert_eq!(l.set_node_reclaim(a_node, 64, 100), Some(100));
+        assert_eq!(l.node_reclaim(a_node), Some((64, 100, 64)));
+        assert_eq!(victims_per_pass(&mut l, &[a, b], 4), [0, 16]);
+        assert_eq!(l.begin_evict(a, a_reg, BASE, 1), Err(SwapError::Ineligible));
+        assert!(!l.above_floor(a, a_reg, BASE));
+        // Under a floor of 48 the clock sweeps a again, and one chunk of it may
+        // go, but no second.
+        l.set_node_reclaim(a_node, 48, 100);
+        assert!(victims_per_pass(&mut l, &[a], 8)[0] > 0);
+        l.begin_evict(a, a_reg, BASE, 1).unwrap();
+        assert_eq!(l.node_reclaim(a_node), Some((48, 100, 48)));
+        assert_eq!(
+            l.begin_evict(a, a_reg, BASE + CHUNK, 2),
+            Err(SwapError::Ineligible)
+        );
+        // At its floor again, a is passed over.
+        assert_eq!(victims_per_pass(&mut l, &[a, b], 4), [0, 16]);
+        check_resident(&l);
+    }
+
+    #[test]
+    fn the_clock_reclaims_in_proportion_to_the_pages_above_the_floor_over_the_weight()
+    {
+        let mut l = roomy_ledger(10_000);
+        let (a, _, _) = charged_under(&mut l, NODE_NULL, 1, 8);
+        let (b, _, b_node) = charged_under(&mut l, NODE_NULL, 2, 8);
+        // At equal weights, with no floor, each is swept every pass.
+        assert_eq!(victims_per_pass(&mut l, &[a, b], 8), [64, 64]);
+        // Four times a's weight: b is swept one pass in four.
+        l.set_node_reclaim(b_node, 0, 400);
+        assert_eq!(victims_per_pass(&mut l, &[a, b], 8), [64, 16]);
+        // a's weight, with half of b's 128 pages under its floor: the rate is
+        // (128 - 64) / (128 * 100), half of a's, so one pass in two.
+        l.set_node_reclaim(b_node, 64, 100);
+        assert_eq!(victims_per_pass(&mut l, &[a, b], 8), [64, 32]);
+        // A node's weight covers its subtree: a record under b's node is
+        // swept at b's rate, the least of its chain.
+        l.set_node_reclaim(b_node, 0, 400);
+        let (c, _, _) = charged_under(&mut l, b_node, 3, 8);
+        assert_eq!(victims_per_pass(&mut l, &[a, b, c], 8), [64, 16, 16]);
+        check_resident(&l);
+    }
+
+    #[test]
+    fn a_floor_reserves_no_free_page_and_under_it_reclaim_finds_nothing()
+    {
+        let mut l = roomy_ledger(400);
+        let total = pool_pages(&l);
+        let (a, a_reg, a_node) = charged_under(&mut l, NODE_NULL, 1, 8);
+        let (b, _, b_node) = charged_under(&mut l, NODE_NULL, 2, 8);
+        let c = l.insert_process(3, NodeSpec::TOP).unwrap();
+        let free = l.pool.free_pages();
+        let before = (l.admit(c, free, 0, 0), l.admit(c, free + 1, 0, 0));
+        // Floors over every evictable page leave admission as it was: the
+        // free pages are admitted to another node, and no page more.
+        l.set_node_reclaim(a_node, 128, 100);
+        l.set_node_reclaim(b_node, 128, 100);
+        assert_eq!((l.admit(c, free, 0, 0), l.admit(c, free + 1, 0, 0)), before);
+        assert_eq!(before, (Ok(()), Err(ChargeError::Reserve)));
+        // With every free page taken, the clock finds no victim and eviction
+        // takes nothing, so the next admission fails as it does with nothing
+        // evictable, and every page is still accounted.
+        let (cap, pages, phys) = take(&mut l, u32::try_from(free).unwrap(), crate::Fit::Contiguous);
+        assert!(l.push_frame(c, frame(cap, pages, phys, UNMAPPED)));
+        assert_eq!(victims_per_pass(&mut l, &[a, b], 4), [0, 0]);
+        assert_eq!(l.begin_evict(a, a_reg, BASE, 1), Err(SwapError::Ineligible));
+        assert_eq!(l.admit(c, 1, 0, 0), Err(ChargeError::Reserve));
+        assert_eq!(pool_pages(&l), total);
+        // Lifting a floor lets the clock reclaim again.
+        l.set_node_reclaim(b_node, 0, 100);
+        assert_eq!(victims_per_pass(&mut l, &[a, b], 1), [0, 8]);
     }
 
     #[test]
@@ -6860,7 +7313,7 @@ mod tests
         assert_eq!(l.drop_handle(h), Some(0));
         assert_eq!(l.find_handle(KEY_B), None);
         assert_eq!(budget::node(&l.arena, node).unwrap().own, 3);
-        assert_eq!(l.arena.get(node).next, NODE_NULL);
+        assert_eq!(budget::reclaim(&l.arena, node).unwrap().handle, NODE_NULL);
         budget::uncharge(&mut l.arena, node, 3);
         assert!(budget::node(&l.arena, node).is_none());
         assert_eq!(l.arena.free_count(), free);

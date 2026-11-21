@@ -7,7 +7,9 @@
 # The later seeds are authorities testers take: TESTER_SEEDS names, per
 # tester, the seed slots usertest hands it as its bootstrap caps (slot 0,
 # pwrmgr.shutdown, is usertest's own). The hello tester takes pwrmgr.deny to
-# check the delivery. See docs/testing.md § Per-program tester protocol.
+# check the delivery; the crashme tester takes crashd.core, the authority to
+# ask the crash service for a live core (services/crashd/docs/operation.md
+# § Live Core). See docs/testing.md § Per-program tester protocol.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # To enable in a boot, copy this file into /config/svcmgr/services/
@@ -20,5 +22,5 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-env       = TESTER_SEEDS=hello:1
-seed      = pwrmgr.shutdown pwrmgr.deny
+env       = TESTER_SEEDS=hello:1;crashme:2
+seed      = pwrmgr.shutdown pwrmgr.deny crashd.core

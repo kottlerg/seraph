@@ -67,10 +67,14 @@ const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_ENTRY: u64 = 9;
 
-/// Why the process died, as the fault message gives it.
+/// Why the core was written: the fault the process died of, as the fault
+/// message gives it, or a live process's capture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cause
 {
+    /// A live process captured by `SNAPSHOT`: no signal, so `gdb` reports
+    /// no termination.
+    Live,
     /// A page fault the pager forwarded.
     Vm,
     /// An exception of the normalized class (`FAULT_EXC_*`).
@@ -80,12 +84,13 @@ pub enum Cause
 impl Cause
 {
     /// The signal Linux would have delivered for the fault, which `gdb`
-    /// reports the core as terminated by.
+    /// reports the core as terminated by; 0 for a live process.
     #[must_use]
     pub fn signal(self) -> u16
     {
         match self
         {
+            Self::Live => 0,
             Self::Vm => SIGSEGV,
             Self::Exception(class) => match class
             {
@@ -147,7 +152,7 @@ pub struct Process<'a>
     pub pid: u32,
     /// Its name, the first string of its argv.
     pub name: &'a [u8],
-    /// Why it died.
+    /// Why the core was written.
     pub cause: Cause,
     /// Its image's placement, when its ELF header was read.
     pub auxv: Option<Auxv>,
@@ -602,6 +607,7 @@ mod tests
     #[test]
     fn the_fault_maps_to_the_signal_linux_would_have_sent()
     {
+        assert_eq!(Cause::Live.signal(), 0);
         assert_eq!(Cause::Vm.signal(), SIGSEGV);
         assert_eq!(
             Cause::Exception(FAULT_EXC_ILLEGAL_INSTRUCTION).signal(),

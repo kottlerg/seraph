@@ -87,6 +87,7 @@ pub mod memory_objects;
 pub mod namespace;
 pub mod no_receiver;
 pub mod node_handle;
+pub mod node_reclaim;
 pub mod oom;
 pub mod pager;
 pub mod pipes;
@@ -166,6 +167,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(log_client::phases());
     out.extend_from_slice(logd_restart::phases());
     out.extend_from_slice(swap::phases());
+    out.extend_from_slice(node_reclaim::phases());
     out.extend_from_slice(swap_client::phases());
     out.extend_from_slice(swap_raw::phases());
     out.extend_from_slice(swapd::phases());

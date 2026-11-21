@@ -32,7 +32,11 @@
 //!   page, and every page of its untouched first chunk is a zero run, every
 //!   other untouched page a zero run or zero bytes;
 //! - the demand region holds the child's one written word in its first
-//!   page, and every page of its three untouched chunks is a zero run.
+//!   page, and every page of its three untouched chunks is a zero run;
+//! - the header's load bias is the one `ATTACH_PROCESS` reports, and the
+//!   thread records, which fill the bytes the header counts, start with the
+//!   main thread's at index 0: a whole register file whose stack pointer
+//!   lies in a page the object holds bytes of.
 //!
 //! It then requires the refusals ([`refusals`]): `UNAUTHORIZED` without the
 //! debug authority, `INVALID_ARGUMENT` without an account, and
@@ -45,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use ipc::procmgr_snapshot::{
     Header, REGION_DEMAND, REGION_IMAGE, REGION_OBJECT, REGION_PRIVATE, REGION_ZERO, RUN_IMAGE,
-    RUN_ZERO, RegionEntry, Run, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE,
+    RUN_ZERO, RegionEntry, Run, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE, ThreadRecord, threads_offset,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use syscall_abi::{MAP_READ, MAP_WRITABLE, PAGE_SIZE};
@@ -528,7 +532,7 @@ fn capture(authority: u64, child: &mut Snapped)
         "{PHASE}: the child's usage went from {child_before} to {child_after}"
     );
 
-    read_object(handle, pages, child, &mut values);
+    read_object(authority, handle, pages, child, &mut values);
     let released = own_usage();
     assert!(
         released.saturating_add(pages) <= after,
@@ -564,8 +568,16 @@ pub(super) struct Attached
     header: Header,
     regions: Vec<RegionEntry>,
     runs: Vec<Run>,
+    threads: Vec<Recorded>,
     /// The caller's phase, which a failure names.
     phase: String,
+}
+
+/// A thread record of a snapshot, copied out of the layout.
+pub(super) struct Recorded
+{
+    pub(super) index: u64,
+    pub(super) regs: Vec<u8>,
 }
 
 impl Attached
@@ -619,6 +631,7 @@ impl Attached
                     .unwrap_or_else(|| panic!("{phase}: run {i} of {header:?} does not decode"))
             })
             .collect();
+        let threads = decode_threads(layout, &header, phase);
         Self {
             handle,
             va,
@@ -627,8 +640,15 @@ impl Attached
             header,
             regions,
             runs,
+            threads,
             phase: phase.to_owned(),
         }
+    }
+
+    /// The object's thread records, in the layout's order.
+    pub(super) fn threads(&self) -> &[Recorded]
+    {
+        &self.threads
     }
 
     /// The object's header.
@@ -726,10 +746,37 @@ fn last_word(bytes: &[u8]) -> u64
         .map_or(0, u64::from_ne_bytes)
 }
 
-/// Attach the `pages`-page object `handle` names, check its header, regions
-/// and runs against the child's fixtures, read the writer's pages from it to
-/// `values`, detach it and release it.
-fn read_object(handle: u64, pages: u64, child: &Snapped, values: &mut Vec<u64>)
+/// The thread records of the layout `layout` under `header`, requiring
+/// them to fill the bytes the header counts after the runs.
+fn decode_threads(layout: &[u8], header: &Header, phase: &str) -> Vec<Recorded>
+{
+    let start = threads_offset(header.region_count.saturating_add(header.run_count))
+        .unwrap_or_else(|| panic!("{phase}: the thread records of {header:?} have no offset"));
+    let mut at = start;
+    let threads = (0..header.thread_count)
+        .map(|i| {
+            let (record, next) = ThreadRecord::decode(layout, at).unwrap_or_else(|| {
+                panic!("{phase}: thread record {i} of {header:?} does not decode")
+            });
+            at = next;
+            Recorded {
+                index: record.index,
+                regs: record.regs.to_vec(),
+            }
+        })
+        .collect();
+    assert_eq!(
+        at.saturating_sub(start) as u64,
+        header.thread_bytes,
+        "{phase}: the thread records of {header:?} end at byte {at}"
+    );
+    threads
+}
+
+/// Attach the `pages`-page object `handle` names, check its header, regions,
+/// runs and thread records against the child's fixtures, read the writer's
+/// pages from it to `values`, detach it and release it.
+fn read_object(authority: u64, handle: u64, pages: u64, child: &Snapped, values: &mut Vec<u64>)
 {
     let object = Attached::attach(handle, pages, PHASE);
     assert_eq!(
@@ -748,6 +795,7 @@ fn read_object(handle: u64, pages: u64, child: &Snapped, values: &mut Vec<u64>)
     check_object(&object, child.object_va);
     check_zero(&object, child.zero_va);
     check_demand(&object, child.demand_va);
+    check_threads(&object, authority, child.badge);
     for page in 0..PAGES as u64
     {
         let at = page_at(child.base, page);
@@ -757,6 +805,69 @@ fn read_object(handle: u64, pages: u64, child: &Snapped, values: &mut Vec<u64>)
         values.push(word0(bytes));
     }
     object.release();
+}
+
+/// The register file's bytes and its stack pointer's offset on this
+/// architecture.
+#[cfg(target_arch = "x86_64")]
+const REGS: (usize, usize) = (
+    syscall_abi::REGS_X86_64_SIZE,
+    syscall_abi::REGS_X86_64_SP_OFFSET,
+);
+#[cfg(target_arch = "riscv64")]
+const REGS: (usize, usize) = (
+    syscall_abi::REGS_RISCV64_SIZE,
+    syscall_abi::REGS_RISCV64_SP_OFFSET,
+);
+
+/// Require the header's load bias to be the one `ATTACH_PROCESS` reports
+/// for the process `badge`, and the main thread's record first: index 0, a
+/// whole register file, its stack pointer in a page the object holds bytes
+/// of.
+fn check_threads(object: &Attached, authority: u64, badge: u64)
+{
+    let reply = call(
+        authority,
+        &IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
+            .word(0, badge)
+            .word(1, 0)
+            .build(),
+        "ATTACH_PROCESS",
+    );
+    for &cap in reply.caps()
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "{PHASE}: ATTACH_PROCESS of the child replied {:#x}",
+        reply.label
+    );
+    assert_eq!(
+        object.header().load_bias,
+        reply.word(1),
+        "{PHASE}: the header's load bias is not the child's"
+    );
+    let main = object
+        .threads()
+        .first()
+        .unwrap_or_else(|| panic!("{PHASE}: the snapshot records no thread"));
+    let (size, sp_offset) = REGS;
+    assert_eq!(
+        (main.index, main.regs.len()),
+        (0, size),
+        "{PHASE}: the first thread record is not the main thread's whole file"
+    );
+    let sp = main
+        .regs
+        .get(sp_offset..sp_offset.saturating_add(8))
+        .and_then(|w| w.try_into().ok())
+        .map_or(0, u64::from_le_bytes);
+    assert!(
+        object.page(sp & !(PAGE_SIZE - 1)).is_some(),
+        "{PHASE}: the main thread's stack pointer {sp:#x} is in no page the snapshot holds"
+    );
 }
 
 /// Require the regions of the fixtures and an image region.

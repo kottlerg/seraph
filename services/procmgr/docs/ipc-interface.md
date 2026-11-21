@@ -341,7 +341,8 @@ The label's bit 33 (`CREATE_NODE_HANDLE`) asks for a node handle to the child's 
 reply's last cap. procmgr registers the child with memmgr's `REGISTER_NODE_HANDLE` and passes on
 the handle memmgr returns; without the flag it asks for none, and deletes any handle a reply
 carries unasked. The handle lets the creator set the child's max while it runs, make sub-nodes
-under it, read its usage and register for its limit event
+under it, read its usage, set the floor and the weight that steer eviction from it, and register
+for its limit event
 ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Node Handles). Its
 handle state belongs to the child's memmgr record, so the handle is refused once the child is
 gone, and a failed create, which deletes every cap procmgr holds for the child, leaves none
@@ -1553,17 +1554,19 @@ svctest itself.
 | label | `procmgr_labels::SNAPSHOT` (33) |
 | caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
 | `data[0]` | The target's process badge |
-| `caps[0]` | The sender's own memmgr SEND, the **account**: procmgr requests the snapshot's frames on it and seals them through it. procmgr deletes it, and any further cap the message carried, before it replies |
+| `caps[0]` | A memmgr SEND the sender presents, its own or one handed to it (crashd forwards its live-core requester's, services/crashd/docs/operation.md § Live Core), the **account**: procmgr requests the snapshot's frames on it and seals them through it. procmgr deletes it, and any further cap the message carried, before it replies |
 
 A debugger or a core writer that needs a consistent copy of a live process's memory asks for one
-here. procmgr finds the target under the table lock and derives copies of its `AddressSpace` cap
-and its main thread's cap there, so a teardown meanwhile leaves caps that name the same objects or
-that the kernel refuses. It reads there too the target's reference to its image object, when procmgr
-shares one with it ([README.md](../README.md#image-sharing) § Image Sharing), and after the table
-lock takes, under the image cache's lock, a copy of the object's handle and the key of the binary's
-body: every request to memmgr below names the image with it (`CAPTURE_IMAGE`). A teardown that
-dropped the reference meanwhile leaves a capture that names no image, memmgr then writing the pages
-the target attaches of it as those of any other object. After the locks:
+here. procmgr finds the target under the table lock and derives copies of its `AddressSpace` cap,
+its main thread's cap, and an `OBSERVE` copy of each thread it registered (Label 22) and that has
+not exited there, so a teardown meanwhile leaves caps that name the same objects or that the kernel
+refuses; a registered thread whose cap does not derive is left out. It reads there too the target's
+reference to its image object, when procmgr shares one with it
+([README.md](../README.md#image-sharing) § Image Sharing), and after the table lock takes, under the
+image cache's lock, a copy of the object's handle and the key of the binary's body: every request to
+memmgr below names the image with it (`CAPTURE_IMAGE`). A teardown that dropped the reference
+meanwhile leaves a capture that names no image, memmgr then writing the pages the target attaches of
+it as those of any other object. After the locks:
 
 1. procmgr asks memmgr to count the pages of the target's regions it would write that no mapping
    shows, over the whole user half, and to post each of its chunks on disk to the swap service
@@ -1585,9 +1588,14 @@ the target attaches of it as those of any other object. After the locks:
    has restored it, or `CAPTURE_STALL_PAUSES` pauses in a row restore none. It then copies every
    listed page outside the regions, but those of `PAGE_RUN_NO_COPY` runs, with
    `SYS_THREAD_READ_MEM` into the next data frame, in address order, through a window of 64 pages
-   of its own address space, and releases the space.
-3. It builds the layout (§ Snapshot object layout), returns to the account each data grant the
-   capture did not use, requests frames for the layout on the account, writes it, and seals the
+   of its own address space. It reads the state of each thread it holds a cap to, the main thread
+   and then each registered one, into its heap: the register file and its state word
+   (`SYS_THREAD_READ_REGS`) and the extended state (`SYS_THREAD_READ_EXT_REGS`). A thread whose
+   register file it cannot read has no record, and one whose extended state it cannot read a record
+   without it. It then releases the space.
+3. It builds the layout (§ Snapshot object layout), which holds the thread records and the target's
+   image load bias as `ATTACH_PROCESS` reports it (Label 20), returns to the account each data grant
+   the capture did not use, requests frames for the layout on the account, writes it, and seals the
    layout's grants and then the data grants into one memory object
    ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 27:
    `SEAL_OBJECT`).
@@ -1616,10 +1624,11 @@ it at one point in time only when every space that writes it is held too. A page
 capture could not take is absent (§ Snapshot object layout).
 
 Every frame of the object is granted on the account, so the snapshot is charged in full to the
-sender, as a seal leaves its frames charged to the sealer
+account, as a seal leaves its frames charged to the sealer
 ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#memory-objects) § Memory
-objects), and the target's usage does not change. procmgr's own cost is one capture's listing and
-layout on its heap, a heap refusal failing the capture, and the window's page tables.
+objects), and the target's usage does not change. procmgr's own cost is one capture's listing,
+thread state and layout on its heap, a heap refusal failing the capture, and the window's page
+tables.
 
 Replies `SUCCESS` with `caps[0]` the object's handle, which `ATTACH_OBJECT` and `OBJECT_RELEASE`
 take; `data[0]` the object's pages; and `data[1]` `procmgr_snapshot::SNAPSHOT_COMPLETE` (1) when no
@@ -1639,15 +1648,16 @@ refusals without the authority, without an account, and for an exited child.
 
 The object's first `layout_pages` pages are the layout, its next `data_pages` pages the captured
 bytes; any page past both is padding. The layout is a header at byte 0, then `region_count` region
-entries from byte 128, then `run_count` run entries, each entry 32 bytes, both lists in ascending
-address order. Every field is a little-endian `u64`, the image's hash aside.
+entries from byte 152, then `run_count` run entries, each entry 32 bytes, both lists in ascending
+address order, then `thread_count` thread records, `thread_bytes` long together. Every field is a
+little-endian `u64`, the image's hash and a thread record's state bytes aside.
 [`shared/ipc/src/procmgr_snapshot.rs`](../../../shared/ipc/src/procmgr_snapshot.rs) defines the
 constants and the encoder and decoder procmgr and a reader share.
 
 | Header word | Content |
 |---|---|
 | 0 | `MAGIC`, the bytes `SRPHSNAP` |
-| 1 | `LAYOUT_VERSION`, `2`; a reader refuses any other |
+| 1 | `LAYOUT_VERSION`, `3`; a reader refuses any other |
 | 2 | flags: bit 0 `SNAPSHOT_COMPLETE`, as in the reply's `data[1]`; bit 1 `SNAPSHOT_IMAGE`, the header names the target's image |
 | 3 | `layout_pages`: pages of the layout, at least 1 |
 | 4 | `data_pages`: data pages the runs use, from object page `layout_pages` |
@@ -1655,6 +1665,9 @@ constants and the encoder and decoder procmgr and a reader share.
 | 6 | `run_count`: run entries after the regions |
 | 7 | with `SNAPSHOT_IMAGE`, the length of the image's signed body, else 0 |
 | 8 to 15 | with `SNAPSHOT_IMAGE`, the body's SHA-512, its 64 bytes in order, else zero |
+| 16 | the load bias: what the loader added to every ELF address of the target's image, as `ATTACH_PROCESS` reports it (Label 20), with or without `SNAPSHOT_IMAGE` |
+| 17 | `thread_count`: thread records after the runs |
+| 18 | `thread_bytes`: bytes of the thread records together |
 
 A region entry is one region the target registered (`REGISTER_REGION`) or attached
 (`ATTACH_OBJECT`), by the arguments a restore replays to make it again
@@ -1686,12 +1699,13 @@ protection. A run's pages are one of five forms:
 - **Zero** (`RUN_ZERO`): every byte is zero. A page of a demand region no fault backed, or of a
   zero-object attachment with no copy of its own.
 - **Image** (`RUN_IMAGE`): the page of the image object the header names, at the run's object page,
-  which the target attaches and has no copy of its own of. The image object is sealed, so its
-  pages are the bytes of the binary the header names whatever the target did; a page the target
-  wrote is a copy of its own, and bytes. A reader that has the binary of that SHA-512 and length,
-  in the layout procmgr's image sharing seals it ([README.md](../README.md#image-sharing) § Image
-  Sharing), reads the page there. A reader without it, such as crashd writing a core, records the
-  run's pages with no bytes (`filesz` 0) and names the image.
+  which the target attaches and has no copy of its own of. The image object is sealed, so its pages
+  are the bytes of the binary the header names whatever the target did; a page the target wrote is a
+  copy of its own, and bytes. A reader that has the binary of that SHA-512 and length, in the layout
+  procmgr's image sharing seals it ([README.md](../README.md#image-sharing) § Image Sharing), reads
+  the page there. A reader without it, such as crashd writing a core, lists none of the run's pages,
+  which a debugger then reads from the binary
+  ([services/crashd/docs/core-format.md](../../crashd/docs/core-format.md) § Live cores).
 - **No copy** (`PAGE_RUN_NO_COPY`): device memory `SYS_THREAD_READ_MEM` refuses, outside the
   regions. It has no bytes and is not absent.
 - **Absent** (`RUN_ABSENT`): the target's pages whose content the object does not hold.
@@ -1711,6 +1725,17 @@ A page is absent for one of these reasons, and for no other:
 The capture is complete, `SNAPSHOT_COMPLETE` set, when no run is absent. Adjacent runs of one
 region, or both outside every region, with the same flags whose pages follow one another in the
 object or in the image, or which have none, are one run.
+
+A thread record is one thread's state as the capture read it under the hold (§ Label 33: `SNAPSHOT`,
+step 2), the records in ascending index order. Each is a 32-byte head, then the register file, then
+the extended state, each padded with zeros to a multiple of 8 bytes:
+
+| Thread word | Content |
+|---|---|
+| 0 | the thread's index in the `ATTACH_PROCESS` list as the capture took it: 0 for the main thread, then each registered thread; a thread with no record leaves its index out |
+| 1 | the state word `SYS_THREAD_READ_REGS` returned (`THREAD_REGS_*`) |
+| 2 | the register file's bytes, as `SYS_THREAD_READ_REGS` writes them for the architecture |
+| 3 | the extended state's bytes, as `SYS_THREAD_READ_EXT_REGS` writes them; 0 when it could not be read |
 
 ---
 

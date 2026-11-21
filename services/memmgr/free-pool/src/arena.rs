@@ -17,7 +17,7 @@
 
 use syscall_abi::PAGE_SIZE;
 
-use crate::budget::BudgetNode;
+use crate::budget::{BudgetNode, Reclaim};
 use crate::chunk::{ChunkEntry, DIR_FANOUT};
 use crate::pressure::PressureBits;
 use crate::{DemandRegion, FreeRun};
@@ -109,8 +109,8 @@ pub struct ProcessCaps
 
 /// The handle state of one budget node: the badge its node handles carry,
 /// the node it names, the process that owns it, and the limit-event
-/// registration. A slot of its own, named by the budget node's slot `next`
-/// link and chained in its [`crate::ProcessIndex`] bucket by its own; it
+/// registration. A slot of its own, named by the handle link of the budget
+/// node's reclaim state ([`crate::budget::Reclaim`]) and chained in its [`crate::ProcessIndex`] bucket by its own; it
 /// holds one reference on its node, so a node with handle state is freed only
 /// once that state is dropped ([`crate::Ledger::drop_handle`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,6 +303,7 @@ const _: () = assert!(size_of::<ProcessCaps>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<DiskNode>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<MemObject>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<ZeroFrame>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<Reclaim>() <= size_of::<ProcessRecord>());
 
 /// Where a write stands ([`DiskNode`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -376,6 +377,8 @@ pub enum Node
     Object(MemObject),
     /// A zero frame, on the ledger's list of them.
     ZeroFrame(ZeroFrame),
+    /// The reclaim state of the budget node whose slot names this slot.
+    Reclaim(Reclaim),
 }
 
 /// An arena slot: a payload plus the index of the next slot on whichever

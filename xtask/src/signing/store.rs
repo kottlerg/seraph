@@ -182,6 +182,29 @@ pub fn with_scoped_anchors(store: &[u8], scoped: &[(&[u8], RoleSet)]) -> Result<
     encode(base.security_floor(), &anchors, base.revoked())
 }
 
+/// `store` with its floor set to `security_floor`, its anchors and revoked
+/// key ids unchanged.
+///
+/// # Errors
+///
+/// When `store` does not parse.
+pub fn with_floor(store: &[u8], security_floor: u32) -> Result<Vec<u8>>
+{
+    let parsed =
+        TrustStore::parse(store).map_err(|e| err!("the trust store does not parse ({e:?})"))?;
+    // The parsed anchors come in key-id order, the order encode requires.
+    let anchors: Vec<AnchorSpec<'_>> = parsed
+        .anchors()
+        .map(|anchor| AnchorSpec {
+            key: anchor.key,
+            usage: anchor.usage,
+            local: anchor.local,
+            label: anchor.label,
+        })
+        .collect();
+    encode(security_floor, &anchors, parsed.revoked())
+}
+
 /// Encode a store of `anchors`, which are sorted by key id, and `revoked`.
 ///
 /// # Errors
@@ -281,6 +304,22 @@ mod tests
         let merged = build(&deployer, Some((&again, StoreMode::Merge)), 7).unwrap();
         let ids = sorted(vec![key_id(key(2)), key_id(key(3))]);
         assert_eq!(contents(&merged), (ids, vec![[8; 16], [9; 16]], 7));
+    }
+
+    // Defect caught: a raised store that drops an anchor or a revocation, so
+    // the rollback case's newer bootloader refuses for another reason than
+    // the floor, or one whose floor is not the one asked for.
+    #[test]
+    fn a_store_with_a_floor_keeps_its_anchors_and_revocations()
+    {
+        let ids = sorted(vec![key_id(key(1)), key_id(key(2))]);
+        let store = store_of(
+            1,
+            vec![anchor(key(1), "own"), anchor(key(2), "deployer")],
+            vec![[8; 16], [9; 16]],
+        );
+        let raised = with_floor(&store, 2).unwrap();
+        assert_eq!(contents(&raised), (ids, vec![[8; 16], [9; 16]], 2));
     }
 
     // Defect caught: a replacing store that keeps the builder's own root,

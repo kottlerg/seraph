@@ -65,8 +65,11 @@ verifiers skip; configuration files tampered with, unsigned, or signed by a key 
 configuration role, a service signed by a key trusted for configuration alone, a recipe validly
 signed over a body other than its index line's, and a directory index that names a missing file and
 omits a present one; and both indexes tampered with
-([testing.md](testing.md) § Gating, Signature refusals). The local signer of § Configuration is
-design intent, not yet implemented.
+([testing.md](testing.md) § Gating, Signature refusals). The bootloader keeps the machine's
+security floor in a boot-services-only UEFI variable, raises it, and refuses itself below it
+(§ Rollback Floor); `cargo xtask test rollback` boots the floor written, raised, and refusing an
+older bootloader on both architectures ([testing.md](testing.md) § Gating, Rollback floor). The
+local signer of § Configuration is design intent, not yet implemented.
 
 [boot-media.md](boot-media.md) states why one object carries one signature, and how the bundle
 lists in configuration choose the bundle's entries.
@@ -106,14 +109,14 @@ trusted to execute as built.
 | **Tampering.** Change the bytes of a signed object. | The signed attributes carry the SHA-512 of the body and the body's length; the verifier hashes the bytes it will load. | None within the chain. |
 | **Signature substitution.** Copy a valid record onto another body. | The record signs the body's hash, so it verifies only over the body it was made for. | None. |
 | **Object swap.** Put one legitimately signed object where another is expected (a signed program in place of a service, `fatfs` in place of `procmgr`). | The signed attributes carry the object's roles and name; the verifier requires a role its caller accepts and the name it is loading. | An image packed with a test harness in its `init` slot carries the harness signed `init` (§ Signing); a system whose store trusts the key that signed that image boots the harness if it is copied into its own `init` slot. |
-| **Replay.** Replace an object with an older, legitimately signed one that has a known vulnerability. | The signed attributes carry a security version; the trust store sets a floor, a key's certificate bounds the versions it may sign, and a compromised key is revoked. | A whole older image, bootloader included, boots: its trust store holds the older floor. Persistent anti-rollback is [#1070](https://github.com/kottlerg/seraph/issues/1070). |
+| **Replay.** Replace an object with an older, legitimately signed one that has a known vulnerability. | The signed attributes carry a security version; the trust store sets a floor, a key's certificate bounds the versions it may sign, and a compromised key is revoked. | Without Secure Boot, a whole older image boots whose bootloader ignores the machine's floor in firmware storage (§ Rollback Floor); with it, every Seraph bootloader the firmware admits refuses itself below that floor. A platform whose firmware refuses the floor's write keeps the build-time floor alone. |
 | **Key compromise.** Steal a signing key. | A key signs only the object roles and security versions its certificate names; the chain is at most two keys deep; a revoked key id is refused. | Revocation reaches only systems whose bootloader carries the updated trust store. A locally generated root's compromise is its builder's own risk. |
 | **Verifier bypass.** Reach a path that loads without verifying, or that continues after a failed check. | Every check has one exit on failure and no fallback; the verifier returns the body only on success, and loaders read only what it returns. | None. |
 | **Carrier confusion.** Duplicate, nested, truncated or malformed trailers, or bytes after the trailer. | The footer and every record parse strictly; any parse error rejects the whole object; a body that itself ends in a trailer is rejected. | None. |
 | **TOCTOU.** Change the bytes between verification and use. | The verifier reads the object once into memory no other process can write, verifies that copy, and the loader parses and loads only from it. | None. |
 | **Trust-store substitution.** Replace the roots the system trusts. | The trust store is built into the bootloader; replacing it means replacing the bootloader. | Without Secure Boot, an attacker who can write the ESP replaces the bootloader and its roots: the chain is as strong as the ESP's integrity (§ Secure Boot). |
 | **Configuration tampering.** Change a policy-bearing configuration file (`/config/svcmgr/services/*.svc`) so a verified binary runs under altered policy. | Each policy-bearing file is signed in the configuration role, which no binary is accepted in, and its consumer has procmgr verify it before it parses it (§ Configuration). | None within the chain. |
-| **Configuration removal, addition or mixing.** Delete a recipe from a configuration directory, add one beside the files it holds, or put back an older signed copy of one. | The directory's signed index names each file it held at signing time with the SHA-512 of its body; the consumer reads only the files the index names, refuses a body whose hash is not its line's, and reports a named file that is missing and a file the index does not name (§ Configuration). | A whole older directory with its older index, all validly signed, verifies: every configuration object carries the current security version, which does not tell them apart. Persistent anti-rollback is [#1070](https://github.com/kottlerg/seraph/issues/1070). |
+| **Configuration removal, addition or mixing.** Delete a recipe from a configuration directory, add one beside the files it holds, or put back an older signed copy of one. | The directory's signed index names each file it held at signing time with the SHA-512 of its body; the consumer reads only the files the index names, refuses a body whose hash is not its line's, and reports a named file that is missing and a file the index does not name (§ Configuration). | A whole older directory with its older index, all signed at a security version the machine's floor admits, verifies: the floor rises only with a revoking release (§ Rollback Floor), so the configuration of any release since the last raise is accepted. An index whose freshness a TPM counter attests is [#1416](https://github.com/kottlerg/seraph/issues/1416). |
 
 ---
 
@@ -296,6 +299,19 @@ store version 1), is not read.
   key is derived from the other's, nor from a seed they share. Each half derives its key from its
   seed as its standard specifies (RFC 8032 § 5.1.5, FIPS 204 Algorithm 6).
 
+**Cost.** In the bootloader, the Ed25519 half of a verification takes about 0.9 ms and the
+ML-DSA-65 half about 0.13 ms on x86_64 under KVM, which runs the code at the speed of the host's
+CPU, and about 6.6 to 7.2 ms and 0.7 to 0.8 ms on riscv64 under QEMU's TCG emulation: the
+ML-DSA-65 half is the cheaper on both. The SHA-512 of the body, which every verification adds,
+runs at about 600 MB/s on x86_64 and 120 to 170 MB/s on riscv64. A boot of the default image
+verifies ten objects (the kernel and the bundle's entries) and the signer's certificate once
+(§ Verification), in about 16 to 18 ms on x86_64 and 100 to 120 ms on riscv64, the hashes
+included. A verification with an empty certificate cache, the deepest, uses under 11 KiB of
+stack, against the 128 KiB of firmware stack the bootloader runs on
+([core/boot/docs/uefi-environment.md](../core/boot/docs/uefi-environment.md) § Stack). The
+figures were measured in the debug and the release build, which differ by little here, at
+4 vCPUs beside no other QEMU; the riscv64 figures are the emulator's, and no rule bounds the cost.
+
 The messages are short and carry their own domain tags (`seraph/obj/v3` for a record's signed
 attributes, `seraph/cert/v2` for a certificate's signed bytes), so neither half hashes the message
 first and the Ed25519 half needs no context of its own. Seraph's encoding of the composite is its
@@ -369,8 +385,9 @@ search; the revoked key ids are sorted the same way. The blob's length is exactl
 parts. A store that breaks any rule of this section is refused whole.
 
 **Where it lives.** The store is built into the bootloader, which firmware Secure Boot covers on a
-platform that enables it. There is one copy: no Seraph variable in firmware storage, and no copy
-built into procmgr, which would drift from the bootloader's. A deployer replaces or extends the
+platform that enables it. There is one copy: none in firmware storage, whose one Seraph variable is
+the machine's security floor (§ Rollback Floor), and none built into procmgr, which would drift from
+the bootloader's. A deployer replaces or extends the
 store by building the bootloader with their own (§ Signing). Enrolment and rotation of roots
 without a rebuild are [#1074](https://github.com/kottlerg/seraph/issues/1074).
 
@@ -383,6 +400,65 @@ no process.
 
 **On every boot** the bootloader logs each anchor's label and key id, and marks an anchor with
 `LOCAL` as locally generated.
+
+---
+
+## Rollback Floor
+
+Implemented by the bootloader
+([core/boot/src/rollback.rs](../core/boot/src/rollback.rs)).
+
+The store's floor travels with the bootloader that carries it, so on its own it refuses an older
+object only beside a bootloader as new as the floor: an attacker who writes the ESP installs a whole
+older image, its bootloader and its older floor included. The bootloader therefore keeps the
+highest floor a machine has booted under in firmware storage, in one UEFI variable:
+
+| Property | Value |
+|---|---|
+| Name | `SecurityFloor` |
+| Vendor GUID | `A53C3964-9D31-4F44-843A-526BAA1271B8`, the Seraph vendor GUID |
+| Attributes | `NON_VOLATILE \| BOOTSERVICE_ACCESS` (`0x3`): kept across resets, reachable before `ExitBootServices` alone |
+| Data | 4 bytes: the floor, a `u32`, little-endian |
+
+On every boot:
+
+1. Once the trust store parses, before it loads any object, the bootloader reads the variable. An
+   absent variable is a floor of 0. A floor above the store's refuses the boot
+   (`BootError::FloorAboveStore`): this bootloader is older than one the machine has run. A
+   variable of another length or with other attributes, which no bootloader wrote, refuses the boot
+   as malformed (`BootError::FloorMalformed`). A read the firmware fails (no variable services, a
+   store that fails) is one warning, after which the boot runs on the store's floor and writes
+   none.
+2. Once the kernel and every bundle entry have verified, ahead of the memory-map reads of the steps
+   that lead to `ExitBootServices`, the bootloader writes the store's floor when it is above the
+   variable's, an absent variable included. A write the firmware refuses is one warning: the boot
+   continues on the build-time floor, the store's, and the machine keeps the floor it had.
+
+A bootloader that passes step 1 carries a floor at least the machine's, so the store copy procmgr
+reads (§ Trust Store) already holds the effective floor: `BootInfo`, `shared/objsig`, procmgr and
+the kernel do not read the variable. Both variable calls come before `ExitBootServices` and none
+follows it ([core/boot/docs/uefi-environment.md](../core/boot/docs/uefi-environment.md)
+§ Variable Services); without runtime access, nothing that runs after the exit, the kernel and a
+compromised driver included, can reach the variable.
+
+The floor rises only when a release raises its store's floor (§ Signing), a deliberate revocation,
+and not on every release. Once a bootloader with the raised floor has booted a machine, the earlier
+release no longer boots there: a revoking release cannot be backed out.
+
+**The Secure Boot condition.** Without Secure Boot the floor is no security boundary: an attacker
+who writes the ESP installs a bootloader that ignores the variable, and the floor stops only an
+accidental rollback, such as the reinstall of an older release. Under Secure Boot (§ Secure Boot)
+the firmware admits only a bootloader signed with a key in its db, and every Seraph bootloader so
+signed carries step 1, so an older one refuses itself. No storage
+stronger than the variable store adds a defence: no storage stops an older bootloader from running,
+only firmware does, and Secure Boot's own keys live in the same store. Rollback protection sealed to
+the measured boot with a TPM counter is [#1416](https://github.com/kottlerg/seraph/issues/1416).
+
+**Recovery.** A machine refused for a floor above its bootloader's boots again with a bootloader
+whose store carries at least that floor. Clearing the firmware's variables, from its setup or by
+deleting the variable from the UEFI shell (`dmpstore -d SecurityFloor -guid
+A53C3964-9D31-4F44-843A-526BAA1271B8`), resets the floor to the store's floor of the next bootloader
+to run, and recovers a machine refused for a malformed variable the same way.
 
 ---
 
@@ -521,17 +597,18 @@ Each create therefore costs one composite verification of its image, with the SH
 image, and one more, of the signer's certificate, when procmgr's certificate cache
 (`CERTIFICATE_CACHE_LEN`, 4, the oldest replaced first) does not hold it, or when another create's
 write-back of the cache lost it ([`shared/objsig`](../shared/objsig/README.md)). A composite
-verification is one Ed25519 verification and one ML-DSA-65 verification (§ Composite Signature).
-The ML-DSA-65 half's cost is not yet measured
-([#1076](https://github.com/kottlerg/seraph/issues/1076)). On riscv64 under QEMU's TCG emulation
-the Ed25519 half is several times slower in procmgr than in the bootloader: about 50 to 70 ms per
-verification (a debug build at 4 vCPUs), against about 10 ms for the same code built without the
-vector extension. Userspace is built for
+verification is one Ed25519 verification and one ML-DSA-65 verification (§ Composite Signature
+states their cost in the bootloader). On x86_64 under KVM they cost procmgr about what they cost
+the bootloader: about 0.9 to 1.4 ms and 0.12 to 0.19 ms. On riscv64 under QEMU's TCG emulation
+both are slower in procmgr than in the bootloader, at 4 vCPUs: the Ed25519 half about 50 to 70 ms
+per verification in a debug build and 10 ms in a release build, against about 10 ms for the same
+debug code built without the vector extension, and the ML-DSA-65 half about 1.4 ms in a debug
+build and 3.9 ms in a release build. Userspace is built for
 `xtask/targets/riscv64a23-seraph.json`, which enables the vector extension (`+v`), so LLVM
 vectorizes the field multiplication, the conditional swap and the point addition of
 [`shared/crypto`](../shared/crypto/README.md) with RVV instructions; the bootloader's target has
 no vector extension, and its copy is scalar. TCG emulates each vector instruction element by
-element through helper calls, so the vector code is the slower one there. The figure is the
+element through helper calls, so the vector code is the slower one there. The figures are the
 emulator's: the code is the one the target's hardware runs, and no rule bounds the cost.
 
 ---
@@ -693,7 +770,8 @@ the same bytes. The other files under `config/` and `data/` carry no trailer, si
 them as trusted input (§ Configuration), and neither does the bootloader, which Secure Boot covers
 (§ Secure Boot). The security version is one integer in the tree (`SECURITY_VERSION` in
 `xtask/src/signing/mod.rs`), raised by a security fix that MUST make older images unbootable; every
-record carries it, and the store's floor is at least it.
+record carries it, and the store's floor is at least it. A machine that boots a bootloader with the
+raised floor keeps it, and refuses every older bootloader from then on (§ Rollback Floor).
 
 **The trust store** is built from public key files: by default the builder's local root. A build
 option (`SERAPH_TRUST_STORE`) names a deployer's store, which is merged with the default or, as
@@ -712,6 +790,7 @@ chain is as strong as the ESP's integrity. The project ships no shim and relies 
 certificate authority; a deployer remains free to boot through a shim of their own. The preferred
 path is a bootloader Authenticode-signed with a key the deployer enrols in the firmware's db
 (design intent; not yet implemented, [#1075](https://github.com/kottlerg/seraph/issues/1075)).
+Secure Boot is also what makes the machine's security floor a boundary (§ Rollback Floor).
 
 ---
 

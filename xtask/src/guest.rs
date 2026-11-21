@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{Context as _, Result, bail};
+use crate::qemu::LaunchVars;
 
 /// One QEMU instance and the thread reading its serial output.
 ///
@@ -23,12 +24,15 @@ use crate::error::{Context as _, Result, bail};
 /// process and the raw disk image's write lock it holds; `std::process::Child`
 /// does not kill on drop, and an orphaned QEMU would hold that lock past the
 /// run, blocking the next boot that opens the image. The error paths
-/// therefore return without an explicit shutdown.
+/// therefore return without an explicit shutdown. The launch's variable store
+/// ([`Guest::holding`]) is removed after QEMU is reaped.
 pub struct Guest
 {
     child: Child,
     lines: mpsc::Receiver<String>,
     reader: Option<thread::JoinHandle<()>>,
+    /// Declared last: dropped after `Drop::drop` has reaped QEMU.
+    vars: Option<LaunchVars>,
 }
 
 impl Drop for Guest
@@ -97,7 +101,17 @@ impl Guest
             child,
             lines: rx,
             reader: Some(reader),
+            vars: None,
         })
+    }
+
+    /// Keep `vars`, the variable store QEMU was launched on, until QEMU is
+    /// reaped: QEMU opens it after the spawn returns.
+    #[must_use]
+    pub fn holding(mut self, vars: LaunchVars) -> Self
+    {
+        self.vars = Some(vars);
+        self
     }
 
     /// Echo serial lines until every marker has appeared (in any order) or

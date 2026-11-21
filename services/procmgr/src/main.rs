@@ -426,24 +426,29 @@ pub fn register_with_memmgr(
 }
 
 /// Allocate exactly one page from memmgr. Returns the cap slot of the
-/// (single-page) Memory cap in procmgr's `CSpace`, or zero on any failure
-/// (memmgr not wired, OOM, derive failure). Caller is responsible for
+/// (single-page) Memory cap in procmgr's `CSpace`. Caller is responsible for
 /// `mem_map`-ping it where appropriate.
 ///
 /// Memory caps allocated against `child_send_cap` are accounted to that child's
 /// memmgr record and reclaimed on `PROCESS_DIED`. Memory caps allocated against
 /// procmgr's own `pi.memmgr_endpoint_cap` are accounted to procmgr.
+///
+/// # Errors
+/// `LIMIT` when memmgr refuses the page for the max of the account's budget
+/// node or of an ancestor ([`process_table::memmgr_refusal`]), and
+/// `OUT_OF_MEMORY` on any other failure (memmgr unwired, its other refusals,
+/// a failed call, a malformed reply).
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "procmgr is a binary, not a library, and every caller passes its thread's registered \
               IPC buffer page as `ipc_buf`"
 )]
-pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
+pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Result<u64, u64>
 {
     if memmgr_send == 0
     {
         std::os::seraph::log!(warn: "alloc_page: memmgr_send=0");
-        return None;
+        return Err(procmgr_errors::OUT_OF_MEMORY);
     }
     let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, 1)
@@ -455,7 +460,7 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
         Err(e) =>
         {
             std::os::seraph::log!(warn: "alloc_page: ipc_call err={}", e);
-            return None;
+            return Err(procmgr_errors::OUT_OF_MEMORY);
         }
     };
     if reply.label != memmgr_errors::SUCCESS
@@ -467,7 +472,7 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
             reply.word(1),
             reply.word(2)
         );
-        return None;
+        return Err(process_table::memmgr_refusal(reply.label));
     }
     if reply.word(0) != 1
     {
@@ -477,32 +482,47 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
             reply.caps().len()
         );
         release_grant(memmgr_send, &reply, ipc_buf);
-        return None;
+        return Err(procmgr_errors::OUT_OF_MEMORY);
     }
-    reply.caps().first().copied()
+    reply
+        .caps()
+        .first()
+        .copied()
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)
 }
 
 /// Allocate exactly `pages` contiguous pages from `memmgr_send` as a
-/// single Memory cap. Returns the cap slot in procmgr's `CSpace`, or
-/// `None` on any failure (memmgr unwired, OOM, malformed reply).
+/// single Memory cap. Returns the cap slot in procmgr's `CSpace`.
 ///
 /// Used to back kernel-object retypes whose source Memory cap must be
 /// contiguous (e.g. `Thread`, `AddressSpace`, `CSpace`); as
 /// [`memmgr_alloc_contig_grant`], without the region id.
-pub fn memmgr_alloc_pages_contig(memmgr_send: u64, pages: u64, ipc_buf: *mut u64) -> Option<u64>
+///
+/// # Errors
+/// [`memmgr_alloc_contig_grant`]'s.
+pub fn memmgr_alloc_pages_contig(
+    memmgr_send: u64,
+    pages: u64,
+    ipc_buf: *mut u64,
+) -> Result<u64, u64>
 {
     memmgr_alloc_contig_grant(memmgr_send, pages, ipc_buf).map(|(cap, _)| cap)
 }
 
 /// Allocate exactly `pages` contiguous pages from `memmgr_send` as a
 /// single Memory cap. Returns the cap slot in procmgr's `CSpace` and the
-/// grant's region id, which names the run to `RELEASE_MEMORY_CAPS`, or
-/// `None` on any failure (memmgr unwired, OOM, malformed reply).
+/// grant's region id, which names the run to `RELEASE_MEMORY_CAPS`.
 ///
 /// The request sets `REQUIRE_CONTIGUOUS`, so memmgr answers with one cap of
 /// exactly `pages` pages or an error. A reply of any other shape is refused,
 /// and every cap it carried is returned to memmgr's pool ([`release_grant`])
 /// rather than left billed to the account behind `memmgr_send`.
+///
+/// # Errors
+/// `LIMIT` when memmgr refuses the pages for the max of the account's budget
+/// node or of an ancestor ([`process_table::memmgr_refusal`]), and
+/// `OUT_OF_MEMORY` on any other failure (memmgr unwired, its other refusals,
+/// a failed call, a malformed reply).
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "procmgr is a binary, not a library, and every caller passes its thread's registered \
@@ -512,22 +532,23 @@ pub fn memmgr_alloc_contig_grant(
     memmgr_send: u64,
     pages: u64,
     ipc_buf: *mut u64,
-) -> Option<(u64, u64)>
+) -> Result<(u64, u64), u64>
 {
+    let oom = procmgr_errors::OUT_OF_MEMORY;
     if memmgr_send == 0 || pages == 0 || pages > u64::from(u32::MAX)
     {
-        return None;
+        return Err(oom);
     }
     let flags = u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32;
     let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, pages | flags)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(memmgr_send, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { ipc::ipc_call(memmgr_send, &msg, ipc_buf) }.map_err(|_| oom)?;
     if reply.label != memmgr_errors::SUCCESS
     {
         release_caps(reply.caps());
-        return None;
+        return Err(process_table::memmgr_refusal(reply.label));
     }
     let caps = reply.caps();
     if let Some((_, &[region_id])) = ipc::memmgr_grant_layout(&reply)
@@ -535,10 +556,10 @@ pub fn memmgr_alloc_contig_grant(
         && syscall::cap_info(first_cap, syscall_abi::CAP_INFO_MEMORY_SIZE)
             .is_ok_and(|size| pages.checked_mul(4096) == Some(size))
     {
-        return Some((first_cap, region_id));
+        return Ok((first_cap, region_id));
     }
     release_grant(memmgr_send, &reply, ipc_buf);
-    None
+    Err(oom)
 }
 
 /// Return every cap of a `REQUEST_MEMORY_CAPS` success reply procmgr does not
@@ -2407,12 +2428,13 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 }
 
 /// Handle `SNAPSHOT`: capture the live process `data[0]` names into a memory
-/// object sealed on the account `caps[0]`, the sender's own memmgr SEND
+/// object sealed on the account `caps[0]`, a memmgr SEND the sender presents
 /// ([`snapshot::capture`]; `services/procmgr/docs/ipc-interface.md`
 /// § Label 33: `SNAPSHOT`). Wire layout: [`procmgr_labels::SNAPSHOT`].
 ///
-/// The request is checked, and the target's address-space and main-thread
-/// caps derived, under the table lock, so a teardown of the target meanwhile
+/// The request is checked, and the target's address-space and thread caps
+/// derived (the main thread, then each registered thread the sweep leaves
+/// listed), under the table lock, so a teardown of the target meanwhile
 /// leaves caps that name its objects or that the kernel refuses, never
 /// another cap that took the slot. The capture holds no lock, and takes this
 /// worker for its length. The account cap is deleted on every path, and
@@ -2442,7 +2464,9 @@ fn handle_snapshot(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
                 Ok(snapshot::Target {
                     aspace,
                     thread,
+                    registered: derive_registered(entry)?,
                     memmgr_badge: entry.memmgr_badge,
+                    load_bias: entry.image.load_bias,
                     image: None,
                 })
             })
@@ -2493,6 +2517,41 @@ fn handle_snapshot(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         }
         Err(code) => reply_empty(ipc_buf, code),
     }
+}
+
+/// Observe caps to `entry`'s registered threads, swept first so no thread
+/// that exited is listed, each with its `ATTACH_PROCESS` index, for a
+/// `SNAPSHOT` to record their state. A thread whose cap the runtime revoked
+/// since the sweep has none, as one that exited.
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when the heap refuses the list.
+fn derive_registered(entry: &mut process::ProcessEntry)
+-> Result<Vec<snapshot::TargetThread>, u64>
+{
+    entry.threads.sweep(
+        |t| process::thread_is_listed(t.cap),
+        process::release_registered_thread,
+    );
+    let mut out = Vec::new();
+    out.try_reserve_exact(entry.threads.len())
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    for i in 0..entry.threads.len()
+    {
+        let Some(thread) = entry.threads.get(i)
+        else
+        {
+            break;
+        };
+        if let Ok(cap) = syscall::cap_derive(thread.cap, syscall_abi::RIGHTS_THREAD_OBSERVE)
+        {
+            out.push(snapshot::TargetThread {
+                index: (i as u64).saturating_add(1),
+                cap: process::CapGuard::new(cap),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// What [`create_child`] takes from a checked create request.

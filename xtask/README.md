@@ -323,20 +323,32 @@ and the distro ships standard firmware packages.
 
 | Var | Effect |
 |---|---|
-| `SERAPH_OVMF_CODE` | Direct path to the OVMF code firmware. Skips the per-platform default search. |
+| `SERAPH_OVMF_CODE` | Direct path to the OVMF code firmware. Must be set together with `SERAPH_OVMF_VARS`, as the RISC-V pair is; the two skip the per-platform default search. |
+| `SERAPH_OVMF_VARS` | Direct path to the OVMF variable-store template of the same build (`OVMF_VARS.fd`). See the pairing rule of `SERAPH_RISCV_CODE`. |
 | `SERAPH_RISCV_CODE` | Direct path to `RISCV_VIRT_CODE.fd`. Must be set together with `SERAPH_RISCV_VARS` — partial overrides are rejected (a custom code image paired against the system vars template corrupts NVRAM state). |
 | `SERAPH_RISCV_VARS` | Direct path to `RISCV_VIRT_VARS.fd`. See pairing rule above. |
 | `SERAPH_ACCEL` | One of `auto` / `tcg` / `kvm` / `hvf` / `whpx` / `nvmm`. `auto` (the default) runs per-host detection. Cross-arch guests (e.g. riscv64 on x86) always resolve to `tcg`; an explicit non-`tcg`/`auto` override in that case emits a stderr warning. Unrecognized values also warn and fall through to detection. |
 
 Default firmware search paths per host:
 
-- **Linux** OVMF: `/usr/share/edk2/ovmf/OVMF_CODE.fd`, `/usr/share/OVMF/OVMF_CODE.fd`,
-  `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd`, `/usr/share/ovmf/OVMF.fd`,
-  `/usr/share/edk2/x64/OVMF_CODE.4m.fd`
+- **Linux** OVMF, each a code image with the variable-store template beside it, the first pair
+  whose two files exist: `/usr/share/OVMF/OVMF_CODE_4M.fd` with `OVMF_VARS_4M.fd` (Debian,
+  Ubuntu), `/usr/share/edk2/ovmf/OVMF_CODE.fd` with `OVMF_VARS.fd` (Fedora),
+  `/usr/share/edk2/x64/OVMF_CODE.4m.fd` with `OVMF_VARS.4m.fd` (Arch),
+  `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd` with `OVMF_VARS.fd` (older Arch),
+  `/usr/share/OVMF/OVMF_CODE.fd` with `OVMF_VARS.fd` (older Debian and Ubuntu)
 - **Linux** RISC-V: `/usr/share/edk2/riscv`, `/usr/share/edk2-riscv`, `/usr/share/qemu-efi-riscv64`
-- **macOS** (both): `/opt/homebrew/share/qemu`, `/usr/local/share/qemu`
-- **BSD** (both): `/usr/local/share/qemu`, `/usr/local/share/uefi-firmware`
-- **Windows / other**: no defaults; the relevant `SERAPH_*` env var is required.
+- **macOS** (both): `/opt/homebrew/share/qemu`, `/usr/local/share/qemu`; OVMF is QEMU's
+  `edk2-x86_64-code.fd` with `edk2-i386-vars.fd`
+- **BSD** (both): `/usr/local/share/qemu`, `/usr/local/share/uefi-firmware`; OVMF is QEMU's pair
+  in `/usr/local/share/qemu`
+- **Windows / other**: no defaults; the relevant `SERAPH_*` env var pair is required.
+
+Every launch, on both architectures, boots on a variable store of its own: a fresh copy of the
+firmware's template, `target/xtask/vars/<pid>-<serial>.fd`, writable pflash unit 1 beside the
+read-only code image, removed once its QEMU has exited. A variable the firmware or the bootloader
+writes (the bootloader's security floor, [docs/signing.md](../docs/signing.md) § Rollback Floor)
+is therefore seen by no later launch; the `rollback` case alone boots several times on one store.
 
 
 #### Classified boots (`--runs`)
@@ -592,8 +604,9 @@ contract.
 
 ### `cargo xtask clean`
 
-Remove the sysroot, the symbols store `symbols/`, and the disk images `disk.img` and
-`disk-data.img` (and optionally `target/`).
+Remove the sysroot, the symbols store `symbols/`, the disk images `disk.img` and
+`disk-data.img`, and any per-launch variable store a killed launch left under
+`target/xtask/vars/` (and optionally `target/`).
 
 ```
 cargo xtask clean [--all]
@@ -682,28 +695,30 @@ options it takes:
 | `shutdown` | x86_64 (9), riscv64 (8) | init | usertest | `--cause` |
 | `debug-port` | x86_64 (2), riscv64 (2) | init | host run | `--port`, `--gdb` |
 | `signing` | x86_64 (4), riscv64 (4) | init | usertest | `--release` |
+| `rollback` | x86_64 (3), riscv64 (3) | init | usertest | `--release` |
 | `hotplug` | x86_64 (4), riscv64 (3) | init | host run | none |
 
 Before a case runs, `test` checks that the case runs on the architecture, that the sysroot was
 built for it, and that the recorded harness is the case's bundle (`ktest` for `kaslr` and `cet`,
 `init` for every other), and when it is not, names the `cargo xtask mkdisk --arch A --harness X`
 that records it. A case is a pure runner: it builds nothing but the `signing` case's revoking
-bootloader, boots the sysroot as the last pack left it, stages and removes only what it needs
-itself, and leaves the images in the layout it found them in; the sections below state each one's
-staging. A new host-driven QEMU test is a case, added to the registry and to `TestCase` in
-`src/cli.rs`, not a command. See [docs/testing.md](../docs/testing.md) for the harness model.
+bootloader and the `rollback` case's raising one, boots the sysroot as the last pack left it,
+stages and removes only what it needs itself, and leaves the images in the layout it found them
+in; the sections below state each one's staging. A new host-driven QEMU test is a case, added to
+the registry and to `TestCase` in `src/cli.rs`, not a command; `cargo xtask lint-docs` fails until
+the table above, a section of its own below, a heading of
+[docs/testing.md](../docs/testing.md#gating) § Gating, and the cell table of its § Coverage tiers
+state it (its `md-test-cells` rule, [§ `cargo xtask lint-docs`](#cargo-xtask-lint-docs)). See
+[docs/testing.md](../docs/testing.md) for the harness model.
 
 #### Cells
 
-`cargo xtask test --cell T` runs every case the registry assigns to CI tester T's cells, on the
-architecture and in the registry's order, each whatever another's outcome, and fails naming the
-cases that failed. A cell takes no case option but `--release`, which it passes on to `signing`.
-
-| Tester | Cases |
-|---|---|
-| `usertest` | `terminal`, `signing`, `wedge`, `vmgenid` (x86_64 only), `shutdown` |
-| `ktest` | `kaslr` |
-| `svctest` | none: the command says so and succeeds |
+`cargo xtask test --cell T` runs every case the registry assigns to CI tester T's cells (the Cell
+column above), on the architecture and in the registry's order, each whatever another's outcome,
+and fails naming the cases that failed; for a tester with no case, `svctest` today, it says so and
+succeeds. A cell takes no case option but `--release`, which it passes on to `signing` and
+`rollback`. The cell table of [docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers
+lists every cell with the cases it runs.
 
 CI (`.github/workflows/build-test.yml`) runs, in every cell after the cell's own boot,
 `cargo xtask mkdisk --arch A` (the plain repack: the `rootfs/` re-mirror, the repository's log
@@ -1057,6 +1072,41 @@ cargo xtask test signing [--arch x86_64|riscv64] [--release] [--cpus N] [--mem M
 |---|---|---|
 | `--release` | `false` | Build the `revoked` boot's bootloader in release mode, as the sysroot's was built; a cell passes it on |
 
+#### The `rollback` case
+
+Check that the bootloader keeps the machine's security floor in firmware storage, raises it, and
+refuses itself below it, on either arch ([docs/signing.md](../docs/signing.md) § Rollback Floor).
+The case packs the disk images once with the default-init bundle, so the sysroot is signed; reads
+the floor `F` of the build's trust store; writes the `raised` boot's objects into
+`target/xtask/test/rollback/<arch>/`; and boots the current sysroot three times on one variable
+store, one fresh copy of the firmware's template kept across the three boots and removed after the
+last, so each boot reads the floor the one before it left:
+
+| Boot | Objects in place of the sysroot's | Owed lines |
+|---|---|---|
+| `first` | none | `boot: security floor: machine none, trust store F` and `boot: security floor: machine raised to F` |
+| `raised` | both ESP copies of the bootloader, built under the build's trust store with the floor `F + 1`; the kernel and every bundle entry signed again at security version `F + 1` | `boot: security floor: machine F, trust store F + 1` and `boot: security floor: machine raised to F + 1` |
+| `older` | none | `SERAPH BOOT FATAL: this bootloader is older than the machine's security floor: machine floor F + 1, trust store floor F` |
+
+A boot is judged as the `signing` case judges one, with a deadline of three minutes; a boot after
+a failed one is not made, since it would read a floor its predecessor did not leave. Every boot's
+serial log is saved as `target/xtask/test/rollback/<arch>/<boot>.log`. The images are packed
+again from the sysroot in the layout they had, with the recorded harness's bundle, whatever the
+outcome. A firmware that refuses the floor's write is not reached by any QEMU firmware on demand;
+the bootloader's host tests cover it (`core/boot/src/rollback.rs`).
+
+The case compiles the `raised` boot's bootloader, as the `signing` case compiles its own, and is
+admitted the same way. It requires a populated sysroot of the profile `--release` names:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64] [--release]
+cargo xtask test rollback [--arch x86_64|riscv64] [--release] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--release` | `false` | Build the `raised` boot's bootloader in release mode, as the sysroot's was built; a cell passes it on |
+
 #### The `hotplug` case
 
 Check devmgr's PCI Express hotplug add and removal paths, native and through acpid, and its bind of
@@ -1401,9 +1451,10 @@ cargo xtask lint-docs
 Each violation prints as `<level> <rule>: <path>:<line>: <message>`; any
 error-level diagnostic fails the command. The rules check what a script can
 decide, including that every name the surface list of docs/testing.md
-§ Coverage tiers states still names code, a file, or a directory in the tree; whether a
-passage is a summary, or any other statement matches the code, is the
-pre-merge review's.
+§ Coverage tiers states still names code, a file, or a directory in the tree, that every
+`cargo xtask` command line names a command, case and option the command table has, and that the
+documents stating the case registry state it as it is; whether a passage is a summary, or any other
+statement matches the code, is the pre-merge review's.
 
 | Rule | Level | Check |
 |---|---|---|
@@ -1414,7 +1465,9 @@ pre-merge review's.
 | `md-summarized-by-order` | error | The `## Summarized By` entries are sorted by the repository path each link resolves to, byte by byte, and none is listed twice. |
 | `md-summarized-by-label` | error | Each `## Summarized By` entry for a `README.md` is labelled with its repository path, and each other entry with the linked document's `# Title`. |
 | `md-reachable` | error | Every authoritative document is reachable by links from the root `README.md`; the root README links every `docs/*.md` and every other README links each document in its own `docs/`, per [docs/documentation-standards.md](../docs/documentation-standards.md) § Discoverability and Linking. |
-| `md-coverage-symbols` | error | Every name the surface list of [docs/testing.md](../docs/testing.md) § Coverage tiers states resolves: from the paragraph starting `**Boundary surface.**` up to the one starting `**Repeat count.**`, each code span naming an item, field path, or `_*` family, and each alternative of the `S`, `M`, and `D` screen variables (groups expanded, character classes kept), matches as a whole word in the code of a tracked Rust source outside `xtask/` with `//` comments stripped, or, from the paragraph starting `**Device surfaces.**` on, in that of one inside `xtask/` other than the rule's own `lint_docs.rs`; each listed `.rs` path (`*` within one component; a bare file name in any directory) names a tracked file; and each listed directory, written with a trailing `/` (`*` within one component), has a tracked file beneath it. |
+| `md-coverage-symbols` | error | Every name the surface list of [docs/testing.md](../docs/testing.md) § Coverage tiers states resolves: from the paragraph starting `**Boundary surface.**` up to the one starting `**Repeat count.**`, each code span naming an item, field path, or `_*` family, and each alternative of the `S`, `M`, and `D` screen variables (groups expanded, character classes kept), matches as a whole word in the code of a tracked Rust source outside `xtask/` with `//` comments stripped, or, from the paragraph starting `**Device surfaces.**` on, in that of one inside `xtask/` other than the lint's own `src/commands/lint_docs/`; each listed `.rs` path (`*` within one component; a bare file name in any directory) names a tracked file; and each listed directory, written with a trailing `/` (`*` within one component), has a tracked file beneath it. |
+| `md-test-cells` | error | The documents that state the case registry of `cargo xtask test` (`src/commands/test/cases.rs`) state it as it is: the Cases table of § `cargo xtask test` has one row per case, equal to its registry entry (architectures with their boots, bundle, cell, case options); each case has a ``#### The `<case>` case`` section here and a heading naming ``(`<case>` case)`` in [docs/testing.md](../docs/testing.md) § Gating; and the cell table of docs/testing.md § Coverage tiers (the table whose first column is `Cell`) lists each case once, a CI case in its tester's row and a host-run case in a row of its own, on the architectures the registry runs it on (a parenthesis after the case naming them when they are fewer than the row's). |
+| `xtask-commands` | error | Every `cargo xtask` command line resolves against the command table (`src/cli.rs`): in every tracked `.md` but the per-tag release notes `docs/releases/v*.md`, in code spans and fenced blocks, and on every line of the `.yml`, `.sh`, `.js` and `.json` files under `.github/` and `.claude/`. Its literal words name a command and each sub-command level, a fixed-value first positional (the case of `test`) names one of its values, and each `--option` is one of the command it resolves to, up to a positional that takes the rest of the line (the commands of `orch grant set`), which the rule does not read; a placeholder where a sub-command stands checks the options after it against every command below. A command line ends at the end of its code span or line (a trailing `\` continues it), a shell separator, a redirection, or a `#` comment; in a `.js` or `.json` file, at a quote. |
 | `md-bare-cite` | warning | A `(see <name>.md)` citation outside link syntax. |
 
 The lint treats as authoritative every tracked `.md` except the root `README.md`, `.claude/`,
@@ -1516,13 +1569,20 @@ The command does not judge what needs a reader: whether the body's claims match 
 an acceptance item is delivered, and which local host runs the change owes. Those stay with the
 pre-merge review's audit.
 
-### `cargo xtask review-check`
+### `cargo xtask review-ledger`
 
-Validate the saved run records of a pull request's pre-merge review.
+Validate the saved run records of a review and build its ledger: the findings a later run must
+not re-raise ([docs/conventions.md](../docs/conventions.md) § Ledger).
 
 ```
-cargo xtask review-check <N>
+cargo xtask review-ledger <N> [--check]
+cargo xtask review-ledger --release <X.Y.Z> --from <previous tag> [--file <path>]...
 ```
+
+With a pull request's number it checks every run record of `target/xtask/review/pr<N>/` against
+the record shape below, then writes `ledger.json` beside them. A record that departs from the
+shape fails the command, which then writes nothing, so the ledger and the merge gate read only
+what they expect. With `--check` it validates alone and writes nothing.
 
 A run record is `target/xtask/review/pr<N>/<mode>-<head>.json`, where `<mode>` is `full`, `delta`,
 or `audit` and `<head>` is the head the run reviewed, at least its first 8 hexadecimal digits. A
@@ -1566,20 +1626,9 @@ which only an `audit` record's run kind selects (`.claude/agents/pr-auditor.md` 
 and 12), so the audit of that run with the reviewer is run again with the run-kind line
 `Run kind: with-reviewer` (`.claude/skills/pr-review/SKILL.md` § The record).
 
-### `cargo xtask review-ledger`
-
-Build the ledger of a review: the findings a later run must not re-raise
-([docs/conventions.md](../docs/conventions.md) § Ledger).
-
-```
-cargo xtask review-ledger <N>
-cargo xtask review-ledger --release <X.Y.Z> --from <previous tag> [--file <path>]...
-```
-
-With a pull request's number it reads every run record of `target/xtask/review/pr<N>/` and
-writes `ledger.json` beside them: a sorted list without duplicates of each record's `recorded`
-and `dropped` findings, its `contested` findings, and, in an earlier-form record whose verdict
-is `NON-BLOCKING ISSUES ONLY`, all its `findings`. Each entry carries the finding's fields and
+The ledger is a sorted list without duplicates of each record's `recorded` and `dropped`
+findings, its `contested` findings, and, in an earlier-form record whose verdict is
+`NON-BLOCKING ISSUES ONLY`, all its `findings`. Each entry carries the finding's fields and
 `run`, the first eight digits of the head of the run that reported it.
 
 With `--release` it prints the release review's ledger as JSON on stdout: the entries of every
@@ -1587,10 +1636,12 @@ pull request a first-parent merge `Merge pull request #N` of `<previous tag>..HE
 those of the release's own records in `target/xtask/review/release-v<X.Y.Z>/`, sorted and
 without duplicates, limited to the files `--file` names when it is given. A release record's
 finding the workflow left undecided (one in its `undecided` list, or a `contested` one, whose
-refuters split, in its `findings`) enters only once the maintainer's decision is saved on
-it as `ruling`. Only run records are read
-(`<mode>-<head>[-<n>].json`); a pull request without records adds nothing. The count goes to
-stderr, so stdout holds the JSON alone.
+refuters split, in its `findings`) enters only once the maintainer's decision is saved on it as
+`ruling`. Only run records are read (`<mode>-<head>[-<n>].json`); a pull request without
+records adds nothing. A record that is not a JSON object fails the command, which then prints no
+ledger; the record shape above is not applied, since a release record has its own and an older
+pull request's record has the form of its time. The count goes to stderr, so stdout holds the
+JSON alone.
 
 ### `cargo xtask release-scope`
 

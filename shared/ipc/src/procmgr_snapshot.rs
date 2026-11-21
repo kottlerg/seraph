@@ -11,10 +11,12 @@
 //! The object's first [`Header::layout_pages`] pages are the layout: a
 //! [`Header`] at byte 0, then [`Header::region_count`] [`RegionEntry`]s
 //! from byte [`HEADER_BYTES`], then [`Header::run_count`] [`Run`]s, each
-//! entry [`ENTRY_BYTES`] long, both in ascending address order. Every field
-//! is a little-endian `u64`. The data pages follow the layout: a run with
-//! bytes names its first page's place in the object ([`Run::object_page`]),
-//! and its pages follow one another there.
+//! entry [`ENTRY_BYTES`] long, both in ascending address order, then
+//! [`Header::thread_count`] [`ThreadRecord`]s, [`Header::thread_bytes`]
+//! long together, each a thread's state as the capture's hold left it. Every
+//! field is a little-endian `u64`. The data pages follow the layout: a run
+//! with bytes names its first page's place in the object
+//! ([`Run::object_page`]), and its pages follow one another there.
 //!
 //! Every page of the captured space's user half is either covered by exactly
 //! one run, or outside its content: in no region and not mapped, so that a
@@ -33,13 +35,19 @@ use syscall_abi::PAGE_SIZE;
 pub const MAGIC: u64 = u64::from_le_bytes(*b"SRPHSNAP");
 
 /// [`Header`] word 1: the version of this layout. A reader refuses any other.
-pub const LAYOUT_VERSION: u64 = 2;
+pub const LAYOUT_VERSION: u64 = 3;
 
 /// Bytes of the image's hash in the [`Header`]: a SHA-512.
 pub const IMAGE_HASH_BYTES: usize = 64;
 
-/// Bytes of the [`Header`]: eight words, then the image's hash.
-pub const HEADER_BYTES: usize = 64 + IMAGE_HASH_BYTES;
+/// Bytes of the [`Header`]: eight words, the image's hash, then three words.
+pub const HEADER_BYTES: usize = HASH_END + 24;
+
+/// The byte after the image's hash in the [`Header`].
+const HASH_END: usize = 64 + IMAGE_HASH_BYTES;
+
+/// Bytes of a [`ThreadRecord`]'s head: four words.
+pub const THREAD_HEAD_BYTES: usize = 32;
 
 /// Bytes of one [`RegionEntry`] or [`Run`]: four words.
 pub const ENTRY_BYTES: usize = 32;
@@ -137,6 +145,14 @@ pub struct Header
     pub run_count: u64,
     /// The image, with [`SNAPSHOT_IMAGE`]; else zero.
     pub image: Image,
+    /// The bias the loader added to every ELF address of the process's
+    /// image, as `ATTACH_PROCESS` reports it, with or without
+    /// [`SNAPSHOT_IMAGE`].
+    pub load_bias: u64,
+    /// [`ThreadRecord`]s after the runs.
+    pub thread_count: u64,
+    /// Bytes of the thread records together.
+    pub thread_bytes: u64,
 }
 
 /// One region the process registered with memmgr, by the arguments of the
@@ -184,14 +200,48 @@ pub struct Run
     pub object_page: u64,
 }
 
-/// Pages of a layout of `entries` regions and runs; `None` on overflow.
+/// One thread's state as the capture read it under the hold: the
+/// `SYS_THREAD_READ_REGS` register file and its state word, and the
+/// `SYS_THREAD_READ_EXT_REGS` image.
+///
+/// In the layout a record is [`THREAD_HEAD_BYTES`] of head (the index, the
+/// state, the register file's bytes, the extended state's bytes), then the
+/// register file and the extended state, each padded with zeros to 8 bytes.
+/// The records follow one another in ascending index order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadRecord<'a>
+{
+    /// The thread's index in the `ATTACH_PROCESS` list as the capture took
+    /// it: 0 for the main thread, then each registered thread. A thread whose
+    /// register file could not be read has no record, so the indices can
+    /// skip.
+    pub index: u64,
+    /// `SYS_THREAD_READ_REGS`'s state word (`THREAD_REGS_*`).
+    pub state: u64,
+    /// The register file.
+    pub regs: &'a [u8],
+    /// The extended-state image; empty when it could not be read.
+    pub ext: &'a [u8],
+}
+
+/// Pages of a layout of `entries` regions and runs and `thread_bytes` of
+/// thread records; `None` on overflow.
 #[must_use]
-pub fn layout_pages(entries: u64) -> Option<u64>
+pub fn layout_pages(entries: u64, thread_bytes: u64) -> Option<u64>
 {
     let bytes = entries
         .checked_mul(ENTRY_BYTES as u64)?
-        .checked_add(HEADER_BYTES as u64)?;
+        .checked_add(HEADER_BYTES as u64)?
+        .checked_add(thread_bytes)?;
     Some(bytes.div_ceil(PAGE_SIZE))
+}
+
+/// Byte offset of the first thread record in a layout of `entries` regions
+/// and runs; `None` on overflow.
+#[must_use]
+pub fn threads_offset(entries: u64) -> Option<usize>
+{
+    entry_offset(usize::try_from(entries).ok()?)
 }
 
 /// The little-endian word at byte `at` of `bytes`, if it is all there.
@@ -232,15 +282,18 @@ impl Header
             put(bytes, i.checked_mul(8)?, w)?;
         }
         bytes
-            .get_mut(64..HEADER_BYTES)?
+            .get_mut(64..HASH_END)?
             .copy_from_slice(&self.image.hash);
+        put(bytes, HASH_END, self.load_bias)?;
+        put(bytes, HASH_END.checked_add(8)?, self.thread_count)?;
+        put(bytes, HASH_END.checked_add(16)?, self.thread_bytes)?;
         Some(())
     }
 
     /// The header at the start of `bytes`: `None` when `bytes` is shorter
     /// than [`HEADER_BYTES`], its magic or version is not this layout's, it
     /// sets a flag this layout does not define, it counts no layout page, or
-    /// its regions and runs do not fit its layout pages.
+    /// its regions, runs and thread records do not fit its layout pages.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self>
     {
@@ -256,13 +309,16 @@ impl Header
             run_count: word(bytes, 48)?,
             image: Image {
                 len: word(bytes, 56)?,
-                hash: bytes.get(64..HEADER_BYTES)?.try_into().ok()?,
+                hash: bytes.get(64..HASH_END)?.try_into().ok()?,
             },
+            load_bias: word(bytes, HASH_END)?,
+            thread_count: word(bytes, HASH_END.checked_add(8)?)?,
+            thread_bytes: word(bytes, HASH_END.checked_add(16)?)?,
         };
         let fits = header
             .region_count
             .checked_add(header.run_count)
-            .and_then(layout_pages)
+            .and_then(|entries| layout_pages(entries, header.thread_bytes))
             .is_some_and(|pages| pages <= header.layout_pages && header.layout_pages != 0);
         (fits && header.flags & !SNAPSHOT_FLAGS == 0).then_some(header)
     }
@@ -357,6 +413,82 @@ impl Run
     }
 }
 
+impl<'a> ThreadRecord<'a>
+{
+    /// Bytes of the record in the layout: the head, then the register file
+    /// and the extended state, each padded to 8; `None` on overflow.
+    #[must_use]
+    pub fn bytes(&self) -> Option<u64>
+    {
+        let (_, end) = spans(0, self.regs.len(), self.ext.len())?;
+        u64::try_from(end).ok()
+    }
+
+    /// Write the record at byte `at` of `bytes`, its padding zeroed, and
+    /// return the byte after it; `None` when it does not fit.
+    pub fn encode(&self, bytes: &mut [u8], at: usize) -> Option<usize>
+    {
+        let (ext_at, end) = spans(at, self.regs.len(), self.ext.len())?;
+        bytes.get_mut(at..end)?.fill(0);
+        let head = [
+            self.index,
+            self.state,
+            u64::try_from(self.regs.len()).ok()?,
+            u64::try_from(self.ext.len()).ok()?,
+        ];
+        for (i, w) in head.into_iter().enumerate()
+        {
+            put(bytes, at.checked_add(i.checked_mul(8)?)?, w)?;
+        }
+        let regs_at = at.checked_add(THREAD_HEAD_BYTES)?;
+        bytes
+            .get_mut(regs_at..regs_at.checked_add(self.regs.len())?)?
+            .copy_from_slice(self.regs);
+        bytes
+            .get_mut(ext_at..ext_at.checked_add(self.ext.len())?)?
+            .copy_from_slice(self.ext);
+        Some(end)
+    }
+
+    /// The record at byte `at` of `bytes`, and the byte after it; `None`
+    /// when it is not all in `bytes`.
+    #[must_use]
+    pub fn decode(bytes: &'a [u8], at: usize) -> Option<(Self, usize)>
+    {
+        let index = word(bytes, at)?;
+        let state = word(bytes, at.checked_add(8)?)?;
+        let regs_len = usize::try_from(word(bytes, at.checked_add(16)?)?).ok()?;
+        let ext_len = usize::try_from(word(bytes, at.checked_add(24)?)?).ok()?;
+        let (ext_at, end) = spans(at, regs_len, ext_len)?;
+        if end > bytes.len()
+        {
+            return None;
+        }
+        let regs_at = at.checked_add(THREAD_HEAD_BYTES)?;
+        let record = Self {
+            index,
+            state,
+            regs: bytes.get(regs_at..regs_at.checked_add(regs_len)?)?,
+            ext: bytes.get(ext_at..ext_at.checked_add(ext_len)?)?,
+        };
+        Some((record, end))
+    }
+}
+
+/// Where the extended state of a record at byte `at` with `regs` bytes of
+/// register file and `ext` of extended state starts, and the byte after the
+/// record; `None` on overflow.
+fn spans(at: usize, regs: usize, ext: usize) -> Option<(usize, usize)>
+{
+    let ext_at = at
+        .checked_add(THREAD_HEAD_BYTES)?
+        .checked_add(regs.checked_next_multiple_of(8)?)?;
+    Some((
+        ext_at,
+        ext_at.checked_add(ext.checked_next_multiple_of(8)?)?,
+    ))
+}
+
 /// Byte offset of entry `index` in the layout, regions and runs counted
 /// together.
 fn entry_offset(index: usize) -> Option<usize>
@@ -378,7 +510,7 @@ mod tests
     fn layout_of(regions: &[RegionEntry], runs: &[Run], flags: u64) -> [u8; PAGE_SIZE as usize]
     {
         let entries = (regions.len() + runs.len()) as u64;
-        let pages = layout_pages(entries).unwrap();
+        let pages = layout_pages(entries, 0).unwrap();
         assert_eq!(pages, 1);
         let mut bytes = [0u8; PAGE_SIZE as usize];
         Header {
@@ -388,6 +520,9 @@ mod tests
             region_count: regions.len() as u64,
             run_count: runs.len() as u64,
             image: IMAGE,
+            load_bias: 0x4000_0000,
+            thread_count: 0,
+            thread_bytes: 0,
         }
         .encode(&mut bytes)
         .unwrap();
@@ -436,6 +571,8 @@ mod tests
         assert_eq!(header.flags, SNAPSHOT_COMPLETE | SNAPSHOT_IMAGE);
         assert_eq!((header.region_count, header.run_count), (1, 3));
         assert_eq!((header.data_pages, header.image), (3, IMAGE));
+        assert_eq!(header.load_bias, 0x4000_0000);
+        assert_eq!((header.thread_count, header.thread_bytes), (0, 0));
         assert_eq!(RegionEntry::decode(&bytes, 0), Some(regions[0]));
         assert_eq!(regions[0].class(), REGION_IMAGE);
         for (i, run) in runs.iter().enumerate()
@@ -452,9 +589,13 @@ mod tests
     {
         let mut bytes = layout_of(&[], &[], 0);
         assert!(Header::decode(&bytes).is_some());
-        bytes[8] = 1;
-        assert_eq!(Header::decode(&bytes), None);
-        bytes[8] = 2;
+        // Another version, the one before this layout's among them.
+        for version in [LAYOUT_VERSION - 1, LAYOUT_VERSION + 1]
+        {
+            put(&mut bytes, 8, version).unwrap();
+            assert_eq!(Header::decode(&bytes), None);
+        }
+        put(&mut bytes, 8, LAYOUT_VERSION).unwrap();
         bytes[0] ^= 1;
         assert_eq!(Header::decode(&bytes), None);
         bytes[0] ^= 1;
@@ -466,12 +607,82 @@ mod tests
     fn a_header_whose_entries_overflow_its_layout_pages_is_refused()
     {
         let mut bytes = layout_of(&[], &[], 0);
-        // One page holds (4096 - 128) / 32 = 124 entries, regions and runs.
-        put(&mut bytes, 40, 24).unwrap();
+        // One page holds (4096 - 152) / 32 = 123 entries, regions and runs.
+        put(&mut bytes, 40, 23).unwrap();
         put(&mut bytes, 48, 100).unwrap();
         assert!(Header::decode(&bytes).is_some());
         put(&mut bytes, 48, 101).unwrap();
         assert_eq!(Header::decode(&bytes), None);
+    }
+
+    #[test]
+    fn a_header_whose_thread_records_overflow_its_layout_pages_is_refused()
+    {
+        let mut bytes = layout_of(&[], &[], 0);
+        // One entry leaves 4096 - 152 - 32 = 3912 bytes for the records.
+        put(&mut bytes, 48, 1).unwrap();
+        put(&mut bytes, 136, 2).unwrap();
+        put(&mut bytes, 144, 3912).unwrap();
+        let header = Header::decode(&bytes).unwrap();
+        assert_eq!((header.thread_count, header.thread_bytes), (2, 3912));
+        put(&mut bytes, 144, 3913).unwrap();
+        assert_eq!(Header::decode(&bytes), None);
+        put(&mut bytes, 144, u64::MAX).unwrap();
+        assert_eq!(Header::decode(&bytes), None);
+    }
+
+    #[test]
+    fn thread_records_read_back_in_order_with_their_padding_zeroed()
+    {
+        let regs = [0xa5u8; 13];
+        let ext = [0x3cu8; 9];
+        let first = ThreadRecord {
+            index: 0,
+            state: syscall_abi::THREAD_REGS_SYSCALL,
+            regs: &regs,
+            ext: &ext,
+        };
+        let second = ThreadRecord {
+            index: 2,
+            state: syscall_abi::THREAD_REGS_STOPPED,
+            regs: &regs[..8],
+            ext: &[],
+        };
+        assert_eq!(first.bytes(), Some(32 + 16 + 16));
+        assert_eq!(second.bytes(), Some(32 + 8));
+        let mut bytes = [0xffu8; 256];
+        let at = first.encode(&mut bytes, 16).unwrap();
+        assert_eq!(at, 16 + 64);
+        let end = second.encode(&mut bytes, at).unwrap();
+        assert_eq!(end, at + 40);
+        // The padding after the 13 register bytes and the 9 extended ones.
+        assert_eq!(bytes[16 + 32 + 13..16 + 32 + 16], [0; 3]);
+        assert_eq!(bytes[16 + 48 + 9..16 + 64], [0; 7]);
+        assert_eq!(ThreadRecord::decode(&bytes, 16), Some((first, at)));
+        assert_eq!(ThreadRecord::decode(&bytes, at), Some((second, end)));
+    }
+
+    #[test]
+    fn a_thread_record_past_its_buffer_is_refused()
+    {
+        let regs = [1u8; 16];
+        let record = ThreadRecord {
+            index: 0,
+            state: 0,
+            regs: &regs,
+            ext: &[],
+        };
+        let mut bytes = [0u8; 48];
+        assert_eq!(record.encode(&mut bytes, 0), Some(48));
+        assert_eq!(record.encode(&mut bytes[..47], 0), None);
+        assert_eq!(ThreadRecord::decode(&bytes, 0), Some((record, 48)));
+        assert_eq!(ThreadRecord::decode(&bytes[..47], 0), None);
+        // An extended-state length that reaches past the buffer.
+        put(&mut bytes, 24, 8).unwrap();
+        assert_eq!(ThreadRecord::decode(&bytes, 0), None);
+        // A length no address space holds.
+        put(&mut bytes, 24, u64::MAX).unwrap();
+        assert_eq!(ThreadRecord::decode(&bytes, 0), None);
     }
 
     #[test]
@@ -496,6 +707,9 @@ mod tests
                 region_count: 0,
                 run_count: 0,
                 image: IMAGE,
+                load_bias: 0,
+                thread_count: 0,
+                thread_bytes: 0,
             }
             .encode(&mut short),
             None
@@ -505,9 +719,13 @@ mod tests
     #[test]
     fn layout_pages_grow_at_the_page_boundary()
     {
-        assert_eq!(layout_pages(0), Some(1));
-        assert_eq!(layout_pages(124), Some(1));
-        assert_eq!(layout_pages(125), Some(2));
-        assert_eq!(layout_pages(u64::MAX), None);
+        assert_eq!(layout_pages(0, 0), Some(1));
+        assert_eq!(layout_pages(123, 0), Some(1));
+        assert_eq!(layout_pages(124, 0), Some(2));
+        assert_eq!(layout_pages(123, 8), Some(1));
+        assert_eq!(layout_pages(123, 9), Some(2));
+        assert_eq!(layout_pages(u64::MAX, 0), None);
+        assert_eq!(layout_pages(0, u64::MAX), None);
+        assert_eq!(threads_offset(2), Some(HEADER_BYTES + 64));
     }
 }

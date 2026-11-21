@@ -86,6 +86,9 @@ services/svctest/
         │                      #   while the child runs, LIMIT, limit event, lowering reclaims
         │                      #   nothing, released and dead handles refused; two children
         │                      #   charged to one sub-node share its budget
+        ├── node_reclaim.rs    # memmgr floors and weights: two sub-nodes of differing weight under
+        │                      #   a held `LOW` level, the heavier keeps more resident; weight
+        │                      #   refusals; all-RAM-accounted identity
         ├── heap_commit.rs     # Committed heap growth: max refusal as an allocation error, a grant
         │                      #   past the promised bound, no fault declined, committed region
         │                      #   register, extend, shrink; all-RAM-accounted identity
@@ -213,7 +216,7 @@ swap-partition phase (`caps[14]`), the `memmgr_swap_client`, `memmgr_swap_raw` a
 phases (`caps[18]`), the
 `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]` and `caps[20]`),
 the `crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`, `memmgr_swap`,
-`memmgr_swap_client`, `memmgr_swap_raw`, `swapd`,
+`memmgr_node_reclaim`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd`,
 `vfsd_driver_death`, `rtc_create_retry`, `procmgr_snapshot`, and `timed_rtc_restart` phases, and
 the drivers hwrng restart phase (`caps[19]`), the `svcmgr_stop_service` phase (`caps[20]`, and
 `caps[19]` with `stopsrc` staged), and the no-stop cases of the `oom_policy`, `logd_reserve` and
@@ -259,7 +262,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read, hwrng restart, and stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
 | `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases: memmgr's swap labels, as a second swap client beside swapd, registering nothing, over a RAM slot store |
-| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `rtc_create_retry` phase: finds devmgr and the RTC driver, attaches to devmgr, stops and starts its main thread, and kills the RTC driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `memmgr_swap_raw` phase: the same, and `MAKE_RESIDENT` of one chunk of its fixture child; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; `memmgr_memory_object_text` phase: finds its child and svctest itself, and sends `MAKE_PRIVATE` for each; `procmgr_image_sharing` phase: finds its children, and sends `MAKE_RESIDENT` and `MAKE_PRIVATE` for them; `procmgr_snapshot` phase: finds its child and sends `SNAPSHOT` for it, and for its badge once it has exited; `memmgr_swap` and `swapd` phases: send `SNAPSHOT` for the fixture child; svctest declares itself undebuggable at startup |
+| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `rtc_create_retry` phase: finds devmgr and the RTC driver, attaches to devmgr, stops and starts its main thread, and kills the RTC driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_node_reclaim` phase: sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `memmgr_swap_raw` phase: the same, and `MAKE_RESIDENT` of one chunk of its fixture child; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; `memmgr_memory_object_text` phase: finds its child and svctest itself, and sends `MAKE_PRIVATE` for each; `procmgr_image_sharing` phase: finds its children, and sends `MAKE_RESIDENT` and `MAKE_PRIVATE` for them; `procmgr_snapshot` phase: finds its child and sends `SNAPSHOT` for it, and for its badge once it has exited; `memmgr_swap` and `swapd` phases: send `SNAPSHOT` for the fixture child; svctest declares itself undebuggable at startup |
 | `caps[20]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy`, `logd_reserve` and `rtc_create_retry` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
@@ -488,8 +491,8 @@ a second session stopped whole gives `EXIT_KILLED` ([sessiond](../sessiond/READM
 
 Several phases respawn `/tests/svctest` with a role token as `argv[1]`. `main` hands the token
 to `reentry::dispatch`, which tries each owning module's `reentry_main`; a matching role runs
-its child body and exits (`park-child`, `reclaim-child`, `open-reclaim-child`, and
-`no-receiver-child` park until their spawner tears them down), and an unmatched token falls
+its child body and exits (`park-child`, `reclaim-child`, `open-reclaim-child`, `node-reclaim-child`,
+and `no-receiver-child` park until their spawner tears them down), and an unmatched token falls
 through to the normal run.
 
 | Role                        | Owning module  | Spawned by                                  |
@@ -519,6 +522,7 @@ through to the normal run.
 | `stale-map-child`           | `unmount`      | `vfsd_unmount_stale_mapping` (mapped page)  |
 | `budget-child`              | `budget`       | `procmgr_memory_max` (4096-page max)        |
 | `node-handle-child`         | `node_handle`  | `memmgr_node_handles` (max set by handle)   |
+| `node-reclaim-child`        | `node_reclaim` | `memmgr_node_reclaim` (fills a region, parks) |
 | `heap-commit-limited`       | `heap_commit`  | `memmgr_heap_commit` (4096-page max)        |
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
 | `discard-hog`               | `discard`      | `memmgr_discard_range` (refault at the bound) |

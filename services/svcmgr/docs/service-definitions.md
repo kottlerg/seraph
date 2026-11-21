@@ -280,6 +280,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `vfsd.swap` | svcmgr (endowed `SWAP_AUTHORITY` SEND) | `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, the `GET_SWAP_PARTITION` surface (seeded by swapd's recipe; by svctest's too, to drive only the stale-version refusal of `GET_SWAP_PARTITION`) | no |
 | `memmgr.swap` | svcmgr (endowed `SWAP_AUTHORITY` `SEND\|GRANT`) | `SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint, the swap labels of memmgr's disk tier; its seeds keep `GRANT` (seeded by swapd's recipe; by svctest's too, as a second swap client that registers nothing) | no |
 | `sessiond.operator` | svcmgr (`sessiond.svc` provider) | `:grant`-badged `SEND\|GRANT` on sessiond's service endpoint, the operator authority, which carries no stop bit (seeded by terminal and svctest) | no |
+| `crashd.core` | svcmgr (`crashd.svc` provider) | `:grant`-badged (`LIVE_CORE_AUTHORITY`) `SEND\|GRANT` on crashd's live-core endpoint, the authority to ask for a live core, whose request moves the account the capture is charged to (seeded by usertest only) | no |
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
 
 ## `provides`

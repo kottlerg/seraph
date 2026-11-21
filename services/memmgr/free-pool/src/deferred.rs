@@ -39,7 +39,8 @@ fn deferred_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<DeferredR
         | Node::Limit(_)
         | Node::Disk(_)
         | Node::Object(_)
-        | Node::ZeroFrame(_) => None,
+        | Node::ZeroFrame(_)
+        | Node::Reclaim(_) => None,
     }
 }
 

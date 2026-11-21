@@ -209,10 +209,11 @@ fn release_object(handle: u64, ipc_buf: *mut u64)
 /// pages; nothing is mapped until its first fault there.
 ///
 /// # Errors
+/// `LIMIT` when memmgr refuses the attachment with its `LIMIT` (the max of
+/// the child's budget node or of an ancestor, or the object's mapping bound);
 /// `OUT_OF_MEMORY` when the handle cannot be copied, or memmgr refuses the
-/// attachment for the child's budget, its promise or its metadata (`LIMIT`,
-/// `OUT_OF_MEMORY_BEST_EFFORT`, `QUOTA`) or the call fails; `MAP_FAILED`
-/// for any other refusal.
+/// attachment for its promise or its metadata (`OUT_OF_MEMORY_BEST_EFFORT`,
+/// `QUOTA`) or the call fails; `MAP_FAILED` for any other refusal.
 pub fn attach(
     child_memmgr: u64,
     handle: u64,
@@ -246,6 +247,7 @@ pub fn attach(
     match reply.map(|r| r.label)
     {
         Ok(memmgr_errors::SUCCESS) => Ok(()),
+        Ok(memmgr_errors::LIMIT) => Err(procmgr_errors::LIMIT),
         Ok(memmgr_errors::INVALID_ARGUMENT | memmgr_errors::UNAUTHORIZED) =>
         {
             Err(procmgr_errors::MAP_FAILED)

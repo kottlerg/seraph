@@ -24,8 +24,7 @@ Commands:
   commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
   pr-check        Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
   compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
-  review-check    Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-  review-ledger   Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+  review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
   release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
   issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
   issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
@@ -55,8 +54,7 @@ Commands:
   commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
   pr-check        Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
   compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
-  review-check    Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-  review-ledger   Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+  review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
   release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
   issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
   issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
@@ -395,7 +393,7 @@ Run Seraph's tests: without a case, check formatting and lint the test code, the
 Usage: xtask test [OPTIONS] [CASE]
 
 Arguments:
-  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, rollback, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 Options:
       --cell <TESTER>            Run every case the CI validate cell of TESTER runs on `--arch`, in the registry's order, each whatever another's outcome, and fail when one failed [possible values: svctest, usertest, ktest]
@@ -406,7 +404,7 @@ Options:
       --cause <CAUSE>            The `shutdown` case's causes, one boot each (default: every cause the architecture has). Repeatable, or comma-separated [possible values: reboot, power-button, memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
       --port <PORT>              The `debug-port` case's host TCP port for the debug port; without it, a port free on `127.0.0.1` when each boot starts
       --gdb <GDB>                The host GDB the `debug-port` case runs, which must debug the architecture (default: `gdb`)
-      --release                  Build the `signing` case's revoking bootloader in release mode, as the sysroot's was built (default: debug)
+      --release                  Build the bootloader the `signing` case revokes under, or the `rollback` case raises the floor with, in release mode, as the sysroot's was built (default: debug)
       --riscv-mmu <RISCV_MMU>    The `kaslr` case's riscv64 paging-mode ceiling (default: sv48; ignored on `x86_64`) [possible values: sv39, sv48, sv57]
       --x86-paging <X86_PAGING>  The `kaslr` case's guest x86-64 paging depth (default: 4; ignored on riscv64) [possible values: 4, 5]
       --wait-host <SECS>         When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
@@ -428,6 +426,7 @@ Arguments:
           - terminal:   Keyboard and serial input through the terminal, and keyboard input again after a restart of the input driver
           - kaslr:      The kernel's randomized layout differs between boots, and the `nokaslr` knob gives the deterministic one
           - signing:    Each signature verifier refuses a tampered kernel, a tampered bundle entry, a revoked key, and tampered, wrong-role and foreign-signed rootfs images
+          - rollback:   The bootloader writes the machine's security floor in firmware storage, raises it, and refuses itself below it
           - wedge:      The softlockup watchdog reports a CPU wedged with interrupts off
           - vmgenid:    The kernel detects a VM generation change across a snapshot restore (`x86_64` only)
           - hotplug:    PCI Express hotplug of a device and of a disk behind root ports
@@ -485,7 +484,7 @@ Options:
           The host GDB the `debug-port` case runs, which must debug the architecture (default: `gdb`)
 
       --release
-          Build the `signing` case's revoking bootloader in release mode, as the sysroot's was built (default: debug)
+          Build the bootloader the `signing` case revokes under, or the `rollback` case raises the floor with, in release mode, as the sysroot's was built (default: debug)
 
       --riscv-mmu <RISCV_MMU>
           The `kaslr` case's riscv64 paging-mode ceiling (default: sv48; ignored on `x86_64`)
@@ -828,48 +827,30 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
-=== xtask review-check -h
-Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-
-Usage: xtask review-check <PR>
-
-Arguments:
-  <PR>  The pull request's number
-
-Options:
-  -h, --help  Print help
-=== xtask review-check --help
-Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-
-Usage: xtask review-check <PR>
-
-Arguments:
-  <PR>  The pull request's number
-
-Options:
-  -h, --help  Print help
 === xtask review-ledger -h
-Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
 
 Usage: xtask review-ledger [OPTIONS] [PR]
 
 Arguments:
-  [PR]  The pull request's number: write `ledger.json` beside its records
+  [PR]  The pull request's number: validate its records and write `ledger.json` beside them, or nothing when one is malformed
 
 Options:
+      --check              Validate the pull request's records alone and write nothing
       --release <RELEASE>  The target version `X.Y.Z` of a release review: print its ledger, the entries of the range's pull requests and of the release's own runs
       --from <FROM>        The previous release tag, where the release's range starts
       --file <FILE>        With `--release`, print only the entries for this file; repeatable
   -h, --help               Print help
 === xtask review-ledger --help
-Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
 
 Usage: xtask review-ledger [OPTIONS] [PR]
 
 Arguments:
-  [PR]  The pull request's number: write `ledger.json` beside its records
+  [PR]  The pull request's number: validate its records and write `ledger.json` beside them, or nothing when one is malformed
 
 Options:
+      --check              Validate the pull request's records alone and write nothing
       --release <RELEASE>  The target version `X.Y.Z` of a release review: print its ledger, the entries of the range's pull requests and of the release's own runs
       --from <FROM>        The previous release tag, where the release's range starts
       --file <FILE>        With `--release`, print only the entries for this file; repeatable
@@ -1527,8 +1508,7 @@ Commands:
   commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
   pr-check        Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
   compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
-  review-check    Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-  review-ledger   Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+  review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
   release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
   issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
   issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)

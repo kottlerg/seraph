@@ -69,15 +69,22 @@ impl Policy
         {
             return false;
         };
-        if name.is_empty()
-        {
-            return false;
-        }
-        let base = name.rsplit(|&b| b == b'/').next().unwrap_or(name);
-        names
-            .iter()
-            .any(|n| n.as_bytes() == name || n.as_bytes() == base)
+        names.iter().any(|n| self::names(n.as_bytes(), name))
     }
+}
+
+/// Whether `asked` names the process `listed`, its name as procmgr lists it:
+/// the whole name or its last path component, so `crashme` names a process
+/// listed as `/programs/crashme`. An empty name names no process.
+#[must_use]
+pub fn names(asked: &[u8], listed: &[u8]) -> bool
+{
+    if asked.is_empty() || listed.is_empty()
+    {
+        return false;
+    }
+    let base = listed.rsplit(|&b| b == b'/').next().unwrap_or(listed);
+    asked == listed || asked == base
 }
 
 #[cfg(test)]
@@ -106,6 +113,19 @@ mod tests
         assert!(!policy.dumps(b"crashmex"));
         assert!(!policy.dumps(b"/programs/crash"));
         assert!(!policy.dumps(b""));
+    }
+
+    #[test]
+    fn a_name_names_a_listed_process_whole_or_by_its_last_path_component()
+    {
+        assert!(names(b"crashme", b"crashme"));
+        assert!(names(b"crashme", b"/programs/crashme"));
+        assert!(names(b"/programs/crashme", b"/programs/crashme"));
+        assert!(!names(b"programs/crashme", b"/programs/crashme"));
+        assert!(!names(b"crash", b"/programs/crashme"));
+        assert!(!names(b"crashme", b"/programs/crashme/"));
+        assert!(!names(b"", b"crashme"));
+        assert!(!names(b"crashme", b""));
     }
 
     #[test]

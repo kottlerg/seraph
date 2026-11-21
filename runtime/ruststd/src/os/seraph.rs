@@ -1105,8 +1105,10 @@ impl VerifiedRole {
 /// # Errors
 /// `InvalidInput` for a length of zero or past
 /// `procmgr_labels::READ_VERIFIED_MAX`, or a name procmgr does not take;
-/// `InvalidData` when the file does not verify; `OutOfMemory` when the copy
-/// or its mapping cannot be had; `PermissionDenied` when procmgr does not
+/// `InvalidData` when the file does not verify; `QuotaExceeded` when the max
+/// of this process's budget node or of an ancestor refuses the copy;
+/// `OutOfMemory` when the copy or its mapping cannot be had otherwise;
+/// `PermissionDenied` when procmgr does not
 /// know this process; `Other` for a failed read or IPC.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn read_verified(
@@ -1157,6 +1159,7 @@ pub fn read_verified(
                 ErrorKind::OutOfMemory
             }
             ipc::procmgr_errors::INVALID_BADGE => ErrorKind::PermissionDenied,
+            ipc::procmgr_errors::LIMIT => ErrorKind::QuotaExceeded,
             _ => ErrorKind::Other,
         };
         return Err(Error::new(kind, "seraph: verified read refused"));

@@ -10,6 +10,8 @@
 //! - [`notes`]: the `PT_NOTE` contents, in the Linux layouts host `gdb` reads.
 //! - [`layout`]: the ELF header, the program headers, and which page runs
 //!   fit the per-core byte budget.
+//! - [`snapshot`]: a procmgr `SNAPSHOT` object's layout, checked, as the
+//!   source of a live process's core.
 //! - [`store`]: the core directory's file names and which older cores leave
 //!   it so a new one fits its byte budget.
 //!
@@ -23,6 +25,7 @@ extern crate alloc;
 pub mod layout;
 pub mod notes;
 pub mod policy;
+pub mod snapshot;
 pub mod store;
 
 /// The machine a core describes.

@@ -99,9 +99,11 @@ impl ImageBuffer
     /// grant of every page.
     ///
     /// # Errors
+    /// `LIMIT` when memmgr refuses a request for the max of the account's
+    /// budget node or of an ancestor ([`process_table::memmgr_refusal`]);
     /// `OUT_OF_MEMORY` when `len` is zero or past the address space, no
-    /// reservation of its pages is free, memmgr refuses a request or answers
-    /// one with a malformed grant; `MAP_FAILED` when a grant cannot be
+    /// reservation of its pages is free, memmgr refuses a request otherwise or
+    /// answers one with a malformed grant; `MAP_FAILED` when a grant cannot be
     /// mapped. Every grant taken is returned.
     fn new(
         self_aspace: u64,
@@ -162,8 +164,9 @@ impl ImageBuffer
             if reply.label == memmgr_errors::SUCCESS
             {
                 std::os::seraph::log!(warn: "image buffer: malformed memmgr grant");
+                return Err(procmgr_errors::OUT_OF_MEMORY);
             }
-            return Err(procmgr_errors::OUT_OF_MEMORY);
+            return Err(process_table::memmgr_refusal(reply.label));
         };
         // Every cap and region of the grant is the buffer's to return before
         // any of it is checked or mapped.

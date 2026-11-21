@@ -23,12 +23,13 @@
 //! [`published_names::VFSD_SWAP`](crate::published_names::VFSD_SWAP),
 //! [`published_names::MEMMGR_SWAP`](crate::published_names::MEMMGR_SWAP), [`published_names::LOGD_QUERY`](crate::published_names::LOGD_QUERY), and each provider
 //! name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
-//! `pwrmgr.shutdown` and `acpid.power`) resolve only through a recipe's `seed = ...` line, and
+//! `pwrmgr.shutdown`, `acpid.power`, `sessiond.operator` and `crashd.core`) resolve only through a recipe's `seed = ...` line, and
 //! `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. A name resolves to a SEND
 //! without `GRANT`, apart from [`published_names::DEVMGR_BIND`](crate::published_names::DEVMGR_BIND), which its
 //! seeds receive with `GRANT`, since `devmgr_labels::BIND_DRIVERS` moves a cap
 //! to devmgr, [`published_names::MEMMGR_SWAP`](crate::published_names::MEMMGR_SWAP), whose seeds move caps to memmgr,
-//! and `sessiond.operator` (a `:grant` entry), whose seeds move caps to sessiond;
+//! and `sessiond.operator` and `crashd.core` (`:grant` entries), whose seeds move
+//! caps to sessiond and crashd;
 //! `QUERY_ENDPOINT` never yields `GRANT`.
 //! [`published_names::VFSD_DENY`](crate::published_names::VFSD_DENY) carries no authority but is seed-only
 //! too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `acpid.deny`, `timed`, and any
@@ -150,3 +151,10 @@ pub const LOGD_QUERY: &[u8] = b"logd.query";
 /// (services/sessiond/docs/ipc-interface.md). Seed-only; seeded by the
 /// terminal, and by svctest, whose sessiond phases open sessions through it.
 pub const SESSIOND_OPERATOR: &[u8] = b"sessiond.operator";
+
+/// SEND|GRANT on crashd's live-core endpoint badged
+/// `crashd_labels::LIVE_CORE_AUTHORITY`: the authority to ask crashd for an
+/// ELF core of a live process (services/crashd/docs/operation.md § Live
+/// Core), whose request moves the account the snapshot is charged to.
+/// Seed-only; seeded only by usertest, which hands it to the crashme tester.
+pub const CRASHD_CORE: &[u8] = b"crashd.core";

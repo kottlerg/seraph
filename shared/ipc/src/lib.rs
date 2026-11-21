@@ -91,6 +91,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, S
 //     SERIAL_LABELS_VERSION
 //     FB_LABELS_VERSION
 //     INPUT_LABELS_VERSION
+//     CRASHD_LABELS_VERSION
 //     STREAM_LABELS_VERSION — stream caps arrive pre-installed in
 //                             ProcessInfo.log_send_cap (init derives its
 //                             own), not via a handshake
@@ -156,7 +157,7 @@ pub mod sched_policy;
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 24;
+pub const MEMMGR_LABELS_VERSION: u32 = 25;
 pub mod memmgr_labels;
 
 pub mod memmgr_capture;
@@ -185,6 +186,13 @@ pub mod stop_labels;
 /// above the label modules describes, which also lists its runtime check, if any.
 pub const SESSIOND_LABELS_VERSION: u32 = 1;
 pub mod sessiond_labels;
+
+/// Wire-protocol version of [`crashd_labels`]; bumped as the block comment
+/// above the label modules describes, which also lists its runtime check, if any.
+pub const CRASHD_LABELS_VERSION: u32 = 1;
+pub mod crashd_labels;
+
+pub mod crashd_errors;
 
 pub mod published_names;
 

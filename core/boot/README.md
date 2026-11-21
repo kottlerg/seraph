@@ -41,6 +41,7 @@ core/boot/
     ├── paging.rs               # Initial page table construction (arch-neutral)
     ├── error.rs                # Bootloader error type
     ├── signing.rs              # Embedded trust store; signature verification of loaded objects
+    ├── rollback.rs             # The machine's security floor in a boot-services UEFI variable
     └── arch/
         ├── mod.rs              # Re-exports the active arch module
         ├── x86_64/
@@ -123,7 +124,7 @@ See [core/boot/docs/riscv-uefi-boot.md](docs/riscv-uefi-boot.md) for details.
 |---|---|
 | [core/boot/docs/kernel-handoff.md](docs/kernel-handoff.md) | Kernel entry contract: CPU state, register contents, handoff sequence |
 | [core/boot/docs/boot-flow.md](docs/boot-flow.md) | Ten-step boot sequence, `BootInfo` population, kernel handoff |
-| [core/boot/docs/uefi-environment.md](docs/uefi-environment.md) | UEFI protocols, memory allocation, the stack, `ExitBootServices`, error handling |
+| [core/boot/docs/uefi-environment.md](docs/uefi-environment.md) | UEFI protocols, memory allocation, the stack, variable services, `ExitBootServices`, error handling |
 | [core/boot/docs/elf-loading.md](docs/elf-loading.md) | ELF validation, LOAD segment processing, boot module loading |
 | [core/boot/docs/firmware-parsing.md](docs/firmware-parsing.md) | ACPI and Device Tree extractors: CPU topology, kernel-facing MMIO bases, coarse MMIO apertures, the DTB rng-seed fallback, and the VMGENID GUID address |
 | [core/boot/docs/acpi.md](docs/acpi.md) | ACPI table-walk invariants (RSDP, XSDT, MADT, MCFG, DMAR, TPM2, SPCR, RHCT, SSDT) |
@@ -154,9 +155,13 @@ The CPU state established at the kernel entry point is specified in
 
 ## What the Bootloader Does Not Do
 
-- **No UEFI runtime services.** UEFI boot services are exited before the kernel runs,
-  and Seraph makes no runtime-services calls
-  ([core/boot/docs/uefi-environment.md](docs/uefi-environment.md) § ExitBootServices).
+- **No UEFI runtime services after `ExitBootServices`.** The bootloader's only
+  runtime-services calls are `GetVariable` and `SetVariable`, for the machine's security
+  floor, and both come before `ExitBootServices`
+  ([core/boot/docs/uefi-environment.md](docs/uefi-environment.md) § Variable Services). UEFI
+  boot services are exited before the kernel runs, and no runtime-services call follows
+  the exit ([core/boot/docs/uefi-environment.md](docs/uefi-environment.md)
+  § ExitBootServices).
 - **Narrow firmware extraction only.** The bootloader records the ACPI RSDP
   and Device Tree blob addresses in `BootInfo` so userspace can re-parse
   them, and extracts only the CPU topology (`cpu_count` / `bsp_id` / `cpu_ids`), the

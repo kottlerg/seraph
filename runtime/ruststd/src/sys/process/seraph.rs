@@ -1714,6 +1714,7 @@ fn map_procmgr_error(code: u64) -> io::Error {
         procmgr_errors::OUT_OF_MEMORY => {
             io::Error::new(io::ErrorKind::OutOfMemory, "OUT_OF_MEMORY")
         }
+        procmgr_errors::LIMIT => io::Error::new(io::ErrorKind::QuotaExceeded, "LIMIT"),
         procmgr_errors::INVALID_BADGE => {
             io::Error::new(io::ErrorKind::InvalidInput, "INVALID_BADGE")
         }

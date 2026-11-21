@@ -72,5 +72,12 @@ pub const END_QUEUE_PRESENT: u64 = 19;
 /// already, by another capture of it, or the hold was interrupted; nothing
 /// was captured, and the sender may ask again.
 pub const SPACE_HELD: u64 = 20;
+/// A charge procmgr made for the request on a process's memmgr account (the
+/// child's for a create, the sender's for a request on its own account) was
+/// refused by the max of that account's budget node or of an ancestor
+/// (`memmgr_errors::LIMIT`): the request asks for more than the node the
+/// creator chose allows, where `OUT_OF_MEMORY` is the system's own
+/// shortage. Nothing the request took is kept.
+pub const LIMIT: u64 = 21;
 /// Unknown opcode on procmgr endpoint.
 pub const UNKNOWN_OPCODE: u64 = 0xFFFF;

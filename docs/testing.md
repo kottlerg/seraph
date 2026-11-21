@@ -235,7 +235,8 @@ attaches and no production driver binds. svctest fails, naming the flag, when th
 The usertest recipe also stages crashd's test recipe, `tests/crashd.svc`, over the default one:
 the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death, and
 `CRASHD_OOM_STALL_MS=3000`, so crashd holds a fault declined for want of memory for up to 3 s,
-both of which the fixture's tester checks ([Crash reports](#crash-reports)). A
+both of which the fixture's tester checks ([Crash reports](#crash-reports)). Its `crashd.core`
+name is the authority the usertest recipe seeds to the crashme tester for its live cores. A
 usertest boot without it fails the crashme tester:
 
 ```sh
@@ -418,10 +419,14 @@ must be complete and hold the fields its kind, thread, and status require.
 
 The usertest boot's crashd names `crashme` in its `CORE_DUMP` ([Gating](#gating)), so each of the
 fixture's faulting deaths also leaves an ELF core in `/crash`, which the crashme tester checks in
-the guest: its machine, the faulting thread's signal, instruction pointer and stack pointer
-against the page runs it holds, the illegal instruction's bytes, and the `worker` core's threads
-([programs/crashme/README.md](../programs/crashme/README.md)). A core is checked in the boot, not
-in the log; `gdb` reading one is checked by hand
+the guest: its machine, the faulting thread's signal, instruction pointer and stack pointer against
+the page runs it holds, the illegal instruction's bytes, and the `worker` core's threads
+([programs/crashme/README.md](../programs/crashme/README.md)). The tester also asks crashd for a
+live core of the running fixture and checks that the fixture ran on unchanged and that the core
+records its threads, their stacks and a page it marked, and none of the binary's text, and asks for
+one of a fixture on the core path and checks the refusal released the capture ([crashd Operation §
+Live Core](../services/crashd/docs/operation.md#live-core)). A core is checked in the boot, not in
+the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The usertest boot's crashd also holds a page fault memmgr declined for want of memory, for up to
@@ -676,6 +681,27 @@ its deadline. The images are packed again from the sysroot afterwards, whatever 
 deadlines and the logs. CI runs it in each usertest cell after the `terminal` case, in the cell's
 profile.
 
+### Rollback floor (`rollback` case)
+
+The bootloader keeps the machine's security floor in a boot-services-only UEFI variable
+([signing.md](signing.md) § Rollback Floor), which only a boot after another on the same variable
+store can show. `cargo xtask test rollback [--arch] [--release]` (both arches) boots the current
+sysroot three times on one store, a copy of the firmware's template kept across the three boots,
+with the build's trust store floor `F`:
+
+1. `first`: the sysroot's images. The bootloader finds no floor and writes `F`.
+2. `raised`: a bootloader built under the build's trust store with the floor `F + 1`, with the
+   kernel and every bundle entry signed again at security version `F + 1`. It finds `F` and
+   raises the floor to `F + 1`.
+3. `older`: the sysroot's images again. The bootloader finds `F + 1` above its store's `F` and
+   refuses itself.
+
+A boot passes when every line it owes appears; a boot after a failed one is not made. A firmware
+that refuses the write is covered by the bootloader's host tests, since no QEMU firmware refuses
+it on demand. See [xtask/README.md § The `rollback` case](../xtask/README.md#the-rollback-case)
+for the lines and the logs. CI runs it in each usertest cell after the `signing` case, in the
+cell's profile.
+
 ### GDB stub (`debug-port` case)
 
 The GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) debugs a guest process
@@ -749,7 +775,7 @@ QEMU, as for the `terminal` case. See
 [xtask/README.md § The `wedge` case](../xtask/README.md#the-wedge-case) for the command.
 
 In CI it runs as a boot pair inside each `usertest` cell (both arches, both profiles), after the
-`signing` case, on the default boot the cell's `cargo xtask mkdisk` restored.
+`rollback` case, on the default boot the cell's `cargo xtask mkdisk` restored.
 
 ### CET shadow stacks (`cet` case)
 
@@ -947,15 +973,16 @@ service (see Crash reports above).
 CI matrix cells follow these rules per boot. The `usertest` cell runs its boots in sequence:
 `usertest` (via `run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the
 default boot (terminal present), `cargo xtask test --cell usertest` runs the cell's cases: the
-`terminal` case's boot, the `signing` case's six boots, the `wedge` case's boot pair, on x86_64
-the `vmgenid` case's save/restore boot pair, and the `shutdown` case's boots, nine on x86_64 (the
-reboot, the power button and the seven core deaths) and eight on riscv64. The `ktest` cell's cases
-are the `kaslr` case's three boots; the `svctest` cell has none. The terminal and wedge boots have
-*no* shutdown-invoking harness: the `terminal` and `wedge` cases compute the verdict host-side and
-kill QEMU themselves. The reboot boot's fixture invokes `REBOOT`, the host reads the reset over
-QMP, and QEMU exits on its own. Each core-death boot is powered off by the death it makes, read over
-QMP, and QEMU exits on its own. The power-button boot is powered off by its press: the host presses
-the button over QMP, reads the power-off there, and QEMU exits on its own.
+`terminal` case's boot, the `signing` case's six boots, the `rollback` case's three boots, the
+`wedge` case's boot pair, on x86_64 the `vmgenid` case's save/restore boot pair, and the `shutdown`
+case's boots, nine on x86_64 (the reboot, the power button and the seven core deaths) and eight on
+riscv64. The `ktest` cell's cases are the `kaslr` case's three boots; the `svctest` cell has none.
+The terminal and wedge boots have *no* shutdown-invoking harness: the `terminal` and `wedge` cases
+compute the verdict host-side and kill QEMU themselves. The reboot boot's fixture invokes `REBOOT`,
+the host reads the reset over QMP, and QEMU exits on its own. Each core-death boot is powered off by
+the death it makes, read over QMP, and QEMU exits on its own. The power-button boot is powered off
+by its press: the host presses the button over QMP, reads the power-off there, and QEMU exits on its
+own.
 
 ---
 
@@ -1004,6 +1031,33 @@ to the tiers below.
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, whatever the release's PRs touched (see Release host runs below) |
+
+**Cells.** A cell is one launch configuration and the boots made on it; each differs from every
+other cell in that configuration, which is why it stands alone. The table states every cell, its
+tier, and what it alone covers; the paragraphs below and [Gating](#gating) give each one's
+commands, staging, and budget. Its Cases column lists the `cargo xtask test` cases the cell runs, as
+the case registry assigns them ([xtask/README.md](../xtask/README.md#cases)), a case on fewer
+architectures than its row's carrying them after its name: `cargo xtask lint-docs` fails when a
+registered case is missing, listed in another cell, or listed on other architectures than the
+registry runs it on (its `md-test-cells` rule).
+
+| Cell | Tier | Architectures | Launch | Cases | Covers |
+|---|---|---|---|---|---|
+| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
+| `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `rollback`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
+| `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
+| boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
+| memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |
+| 4kn | Local and release host runs | x86_64, riscv64; debug | svctest from a 4Kn disk (`mkdisk --block-size 4096`) | none | 4096-byte logical blocks (Disk variations below) |
+| second-disk | Local and release host runs | x86_64, riscv64; debug | svctest with `/data` on a second disk (`mkdisk --split-data`, `--second-disk`) | none | the data partition on its own disk |
+| shared-line | Local and release host runs | x86_64, riscv64; debug | as second-disk, both disks on one `INTx` line (`--second-disk-shared-line`) | none | two virtio-blk devices served on one interrupt line |
+| oversize-block | Local and release host runs | x86_64, riscv64; debug | svctest with a second disk at 8192-byte blocks (`--second-disk-block-size 8192`) | none | the refusal of a disk above virtio-blk's largest block size |
+| no-iommu | Local and release host runs | x86_64, riscv64; debug | svctest with the IOMMU detached (`--iommu absent`) | none | devmgr's unconfined path (Release host runs below) |
+| framebuffer | Local and release host runs | x86_64, riscv64; debug | svctest with QEMU std VGA and no window (`--display framebuffer`) | none | the framebuffer driver (Framebuffer cell below) |
+| debug-port | Local and release host runs | x86_64, riscv64; debug | the debug port's `virtio-console` device | `debug-port` | the virtio-console driver, the debug port, and the GDB stub (Debug-port cell below) |
+| hotplug | Local and release host runs | x86_64, riscv64; debug | two empty PCI Express root ports | `hotplug` | PCI Express hotplug (Hotplug cell below) |
+| cet | Local and release host runs | x86_64; debug | KVM on CET shadow stacks, the ktest bundle | `cet` | CET shadow stacks (CET cell below) |
+| tpm | Local and release host runs | x86_64; debug | a TPM 2.0 backed by `swtpm`, behind `tpm-tis` then `tpm-crb` | `tpm` | the TPM driver (TPM cell below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a

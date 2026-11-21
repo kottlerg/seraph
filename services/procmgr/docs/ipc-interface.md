@@ -156,12 +156,13 @@ holds a handle to it.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No module capability, the length is zero or past the cap's pages, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY` or `CREATE_CHARGE_NODE` set without a cap of its own (**Death relay** below), reserved label bits `[37..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process or one a destroy has begun on (§ Process Tree), as when the creator's destroy begins before the child is recorded or before procmgr's reply delivers it, or a destroy marked the child itself (`DESTROY_CHILD`, or a destroy of a subtree it is in) before procmgr's reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (**Memory max and reserve** below) |
 | 11 | `MAP_FAILED` | The module cap, a copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | The module cap lacks the map right, or a rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
 | 18 | `SIGNATURE_REFUSED` | The object does not verify under the name, in a role of the creator's signature policy, for this architecture (§ Image Verification) |
+| 21 | `LIMIT` | The max of the child's budget node or of an ancestor refused a charge procmgr made on the child's account (`memmgr_errors::LIMIT`): a kernel-object slab, a page, the argv and env copy, the copy of the object or a shared attachment, against the node's `CREATE_MEMORY_MAX`, the node a `CREATE_CHARGE_NODE` handle names, or the creator's own node (**Memory max and reserve**, § Label 1); the child is not created and its pages are returned |
 
 **argv and env.** The label's bit 29 (`CREATE_ARGV_ENV`, in the window shared with
 `CREATE_FROM_FILE`) marks a request that carries the child's argv and env in a Memory cap the caller
@@ -181,7 +182,8 @@ blobs' size. That copy also refuses the create with `INVALID_ARGUMENT` when the 
 be mapped (it lacks the map right, or the kernel refuses its pages for a reason other than procmgr's
 memory), and when, on the copy, a blob's NULs disagree with its count or a nonempty blob does not
 end in a NUL; a caller that rewrites its pages meanwhile changes only the copy that is checked. A
-shortfall of procmgr's or the child's memory replies `OUT_OF_MEMORY`. Should procmgr fail to unmap a
+shortfall of procmgr's or the child's memory replies `OUT_OF_MEMORY`, and a refusal by the max of
+the child's node `LIMIT`. Should procmgr fail to unmap a
 copy window, which may then still map the caller's pages read-only and the child's writable, it
 replies `ARGV_ENV_STILL_MAPPED` (14), keeps the window's VA reserved, and withholds the child's
 memmgr record (sends no `PROCESS_DIED` for it); the caller MUST then withhold its run too (not
@@ -312,11 +314,22 @@ procmgr passes the max to memmgr, which clamps it to what the creator's node and
 left, and the reply's data[0] carries the max the node took. Without the flag, or with a max of
 `u64::MAX`, the node has no max of its own, only its ancestors and the system reserve limit it, and
 data[0] is `u64::MAX`. A max too small for the pages procmgr allocates on the child's account fails
-the create with `OUT_OF_MEMORY`, as any failed allocation does. Once the child runs, a grant past
+the create with `LIMIT` (21), as does a max of the node's ancestors (the creator's node, or the node
+a `CREATE_CHARGE_NODE` handle names), so a creator tells its own bound from the system's shortage,
+which replies `OUT_OF_MEMORY`. Once the child runs, a grant past
 the max fails with `memmgr_errors::LIMIT`, and a demand fault past it is declined with code 10,
 which the kernel forwards to the faulting thread's exception handler
 ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md)
 § Kernel-origin fault message).
+
+procmgr's own state for a child is charged to procmgr's node, not to the child's: its process-table
+entry (336 bytes), 6 to 12 capability slots in procmgr's `CSpace` (72 bytes each) and two
+death-observer nodes (24 bytes each), about 0.8 to 1.6 KiB with the growth of their containers, and
+96 bytes for each thread it registers (Label 22). Every page of the child itself, at least 55, is
+charged to the child's node, so that state is at most 0.75% of what the child's node already pays,
+and it goes with the child
+([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md) § Distribution policy,
+Server-side charges).
 
 The label's bit 32 (`CREATE_RESERVE`) makes the child's node a system-reserve node, which may take
 the free pages memmgr keeps in reserve. procmgr honours it only from a creator whose own node is a
@@ -341,7 +354,8 @@ The label's bit 33 (`CREATE_NODE_HANDLE`) asks for a node handle to the child's 
 reply's last cap. procmgr registers the child with memmgr's `REGISTER_NODE_HANDLE` and passes on
 the handle memmgr returns; without the flag it asks for none, and deletes any handle a reply
 carries unasked. The handle lets the creator set the child's max while it runs, make sub-nodes
-under it, read its usage and register for its limit event
+under it, read its usage, set the floor and the weight that steer eviction from it, and register
+for its limit event
 ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Node Handles). Its
 handle state belongs to the child's memmgr record, so the handle is refused once the child is
 gone, and a failed create, which deletes every cap procmgr holds for the child, leaves none
@@ -619,13 +633,14 @@ included, as for `CREATE_PROCESS`.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[37..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process or one a destroy has begun on before the reply delivers the child, a destroy that marked the child itself before the reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`, or the object's bytes did not all arrive: an `FS_READ_MEMORY` against procmgr's open failed, went unanswered for that long or returned zero bytes before `file_size`, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | A copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | As for `CREATE_PROCESS` (§ Label 1, **argv and env**) |
 | 18 | `SIGNATURE_REFUSED` | As for `CREATE_PROCESS` (§ Image Verification) |
+| 21 | `LIMIT` | As for `CREATE_PROCESS` (§ Label 1) |
 
 ### Label 25: `BIND_DEATH_OBSERVER`
 
@@ -1502,12 +1517,13 @@ its own memmgr cap; its death releases the run with its record.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `OUT_OF_MEMORY` | The run could not be had on the sender's account (a max too small for it among the causes), the sender has no memmgr SEND, or the map-only cap could not be derived |
+| 2 | `OUT_OF_MEMORY` | The run could not be had on the sender's account for a reason other than a max (`LIMIT`), the sender has no memmgr SEND, or the map-only cap could not be derived |
 | 4 | `INVALID_BADGE` | Sent on a process handle, or no live process carries the badge |
 | 7 | `INVALID_ARGUMENT` | No file cap, a length of zero or past `READ_VERIFIED_MAX`, a role word other than the two, or no name block or a name not in the canonical form |
 | 10 | `IO_ERROR` | As for `CREATE_FROM_FILE` (§ Label 13) |
 | 11 | `MAP_FAILED` | The run could not be mapped in procmgr, or its mapping would not come down |
 | 18 | `SIGNATURE_REFUSED` | The copy does not verify in the requested role under the name |
+| 21 | `LIMIT` | The max of the sender's budget node or of an ancestor refused the run (`memmgr_errors::LIMIT`) |
 
 svctest's `procmgr_read_verified` phase reads its data-role fixture back and checks the copy's
 charge, and the refusal of the fixture under another name, of a copy with a flipped byte, of an
@@ -1554,17 +1570,19 @@ svctest itself.
 | label | `procmgr_labels::SNAPSHOT` (33) |
 | caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
 | `data[0]` | The target's process badge |
-| `caps[0]` | The sender's own memmgr SEND, the **account**: procmgr requests the snapshot's frames on it and seals them through it. procmgr deletes it, and any further cap the message carried, before it replies |
+| `caps[0]` | A memmgr SEND the sender presents, its own or one handed to it (crashd forwards its live-core requester's, services/crashd/docs/operation.md § Live Core), the **account**: procmgr requests the snapshot's frames on it and seals them through it. procmgr deletes it, and any further cap the message carried, before it replies |
 
 A debugger or a core writer that needs a consistent copy of a live process's memory asks for one
-here. procmgr finds the target under the table lock and derives copies of its `AddressSpace` cap
-and its main thread's cap there, so a teardown meanwhile leaves caps that name the same objects or
-that the kernel refuses. It reads there too the target's reference to its image object, when procmgr
-shares one with it ([README.md](../README.md#image-sharing) § Image Sharing), and after the table
-lock takes, under the image cache's lock, a copy of the object's handle and the key of the binary's
-body: every request to memmgr below names the image with it (`CAPTURE_IMAGE`). A teardown that
-dropped the reference meanwhile leaves a capture that names no image, memmgr then writing the pages
-the target attaches of it as those of any other object. After the locks:
+here. procmgr finds the target under the table lock and derives copies of its `AddressSpace` cap,
+its main thread's cap, and an `OBSERVE` copy of each thread it registered (Label 22) and that has
+not exited there, so a teardown meanwhile leaves caps that name the same objects or that the kernel
+refuses; a registered thread whose cap does not derive is left out. It reads there too the target's
+reference to its image object, when procmgr shares one with it
+([README.md](../README.md#image-sharing) § Image Sharing), and after the table lock takes, under the
+image cache's lock, a copy of the object's handle and the key of the binary's body: every request to
+memmgr below names the image with it (`CAPTURE_IMAGE`). A teardown that dropped the reference
+meanwhile leaves a capture that names no image, memmgr then writing the pages the target attaches of
+it as those of any other object. After the locks:
 
 1. procmgr asks memmgr to count the pages of the target's regions it would write that no mapping
    shows, over the whole user half, and to post each of its chunks on disk to the swap service
@@ -1586,9 +1604,14 @@ the target attaches of it as those of any other object. After the locks:
    has restored it, or `CAPTURE_STALL_PAUSES` pauses in a row restore none. It then copies every
    listed page outside the regions, but those of `PAGE_RUN_NO_COPY` runs, with
    `SYS_THREAD_READ_MEM` into the next data frame, in address order, through a window of 64 pages
-   of its own address space, and releases the space.
-3. It builds the layout (§ Snapshot object layout), returns to the account each data grant the
-   capture did not use, requests frames for the layout on the account, writes it, and seals the
+   of its own address space. It reads the state of each thread it holds a cap to, the main thread
+   and then each registered one, into its heap: the register file and its state word
+   (`SYS_THREAD_READ_REGS`) and the extended state (`SYS_THREAD_READ_EXT_REGS`). A thread whose
+   register file it cannot read has no record, and one whose extended state it cannot read a record
+   without it. It then releases the space.
+3. It builds the layout (§ Snapshot object layout), which holds the thread records and the target's
+   image load bias as `ATTACH_PROCESS` reports it (Label 20), returns to the account each data grant
+   the capture did not use, requests frames for the layout on the account, writes it, and seals the
    layout's grants and then the data grants into one memory object
    ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 27:
    `SEAL_OBJECT`).
@@ -1617,10 +1640,11 @@ it at one point in time only when every space that writes it is held too. A page
 capture could not take is absent (§ Snapshot object layout).
 
 Every frame of the object is granted on the account, so the snapshot is charged in full to the
-sender, as a seal leaves its frames charged to the sealer
+account, as a seal leaves its frames charged to the sealer
 ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#memory-objects) § Memory
-objects), and the target's usage does not change. procmgr's own cost is one capture's listing and
-layout on its heap, a heap refusal failing the capture, and the window's page tables.
+objects), and the target's usage does not change. procmgr's own cost is one capture's listing,
+thread state and layout on its heap, a heap refusal failing the capture, and the window's page
+tables.
 
 Replies `SUCCESS` with `caps[0]` the object's handle, which `ATTACH_OBJECT` and `OBJECT_RELEASE`
 take; `data[0]` the object's pages; and `data[1]` `procmgr_snapshot::SNAPSHOT_COMPLETE` (1) when no
@@ -1629,10 +1653,11 @@ Refusals, in order: `UNAUTHORIZED` without the authority; `INVALID_ARGUMENT` wit
 `INVALID_BADGE` when no live process carries the badge, or the target ended during the capture;
 `NOT_ATTACHABLE` for a process that declared itself undebuggable (Label 21); `SPACE_HELD` (20)
 when the target's space is held already, by another capture of it, or the hold was interrupted,
-when nothing was captured and the sender may ask again; and `OUT_OF_MEMORY` when the account
-refused a request, failed a call or did not answer within the bound, granted a cap whose size is not
-the pages its reply names, or the object would take more than `SEAL_OBJECT_MAX_GRANTS` (63) grants,
-or when procmgr's heap or address space refused the capture's own memory. svctest's
+when nothing was captured and the sender may ask again; `LIMIT` (21) when the max of the account's
+budget node or of an ancestor refused its frames; and `OUT_OF_MEMORY` when the account refused a
+request otherwise, failed a call or did not answer within the bound, granted a cap whose size is
+not the pages its reply names, or the object would take more than `SEAL_OBJECT_MAX_GRANTS` (63)
+grants, or when procmgr's heap or address space refused the capture's own memory. svctest's
 `procmgr_snapshot` phase snapshots a child whose writer thread never registered, and checks the
 refusals without the authority, without an account, and for an exited child.
 
@@ -1640,15 +1665,16 @@ refusals without the authority, without an account, and for an exited child.
 
 The object's first `layout_pages` pages are the layout, its next `data_pages` pages the captured
 bytes; any page past both is padding. The layout is a header at byte 0, then `region_count` region
-entries from byte 128, then `run_count` run entries, each entry 32 bytes, both lists in ascending
-address order. Every field is a little-endian `u64`, the image's hash aside.
+entries from byte 152, then `run_count` run entries, each entry 32 bytes, both lists in ascending
+address order, then `thread_count` thread records, `thread_bytes` long together. Every field is a
+little-endian `u64`, the image's hash and a thread record's state bytes aside.
 [`shared/ipc/src/procmgr_snapshot.rs`](../../../shared/ipc/src/procmgr_snapshot.rs) defines the
 constants and the encoder and decoder procmgr and a reader share.
 
 | Header word | Content |
 |---|---|
 | 0 | `MAGIC`, the bytes `SRPHSNAP` |
-| 1 | `LAYOUT_VERSION`, `2`; a reader refuses any other |
+| 1 | `LAYOUT_VERSION`, `3`; a reader refuses any other |
 | 2 | flags: bit 0 `SNAPSHOT_COMPLETE`, as in the reply's `data[1]`; bit 1 `SNAPSHOT_IMAGE`, the header names the target's image |
 | 3 | `layout_pages`: pages of the layout, at least 1 |
 | 4 | `data_pages`: data pages the runs use, from object page `layout_pages` |
@@ -1656,6 +1682,9 @@ constants and the encoder and decoder procmgr and a reader share.
 | 6 | `run_count`: run entries after the regions |
 | 7 | with `SNAPSHOT_IMAGE`, the length of the image's signed body, else 0 |
 | 8 to 15 | with `SNAPSHOT_IMAGE`, the body's SHA-512, its 64 bytes in order, else zero |
+| 16 | the load bias: what the loader added to every ELF address of the target's image, as `ATTACH_PROCESS` reports it (Label 20), with or without `SNAPSHOT_IMAGE` |
+| 17 | `thread_count`: thread records after the runs |
+| 18 | `thread_bytes`: bytes of the thread records together |
 
 A region entry is one region the target registered (`REGISTER_REGION`) or attached
 (`ATTACH_OBJECT`), by the arguments a restore replays to make it again
@@ -1687,12 +1716,13 @@ protection. A run's pages are one of five forms:
 - **Zero** (`RUN_ZERO`): every byte is zero. A page of a demand region no fault backed, or of a
   zero-object attachment with no copy of its own.
 - **Image** (`RUN_IMAGE`): the page of the image object the header names, at the run's object page,
-  which the target attaches and has no copy of its own of. The image object is sealed, so its
-  pages are the bytes of the binary the header names whatever the target did; a page the target
-  wrote is a copy of its own, and bytes. A reader that has the binary of that SHA-512 and length,
-  in the layout procmgr's image sharing seals it ([README.md](../README.md#image-sharing) § Image
-  Sharing), reads the page there. A reader without it, such as crashd writing a core, records the
-  run's pages with no bytes (`filesz` 0) and names the image.
+  which the target attaches and has no copy of its own of. The image object is sealed, so its pages
+  are the bytes of the binary the header names whatever the target did; a page the target wrote is a
+  copy of its own, and bytes. A reader that has the binary of that SHA-512 and length, in the layout
+  procmgr's image sharing seals it ([README.md](../README.md#image-sharing) § Image Sharing), reads
+  the page there. A reader without it, such as crashd writing a core, lists none of the run's pages,
+  which a debugger then reads from the binary
+  ([services/crashd/docs/core-format.md](../../crashd/docs/core-format.md) § Live cores).
 - **No copy** (`PAGE_RUN_NO_COPY`): device memory `SYS_THREAD_READ_MEM` refuses, outside the
   regions. It has no bytes and is not absent.
 - **Absent** (`RUN_ABSENT`): the target's pages whose content the object does not hold.
@@ -1712,6 +1742,17 @@ A page is absent for one of these reasons, and for no other:
 The capture is complete, `SNAPSHOT_COMPLETE` set, when no run is absent. Adjacent runs of one
 region, or both outside every region, with the same flags whose pages follow one another in the
 object or in the image, or which have none, are one run.
+
+A thread record is one thread's state as the capture read it under the hold (§ Label 33: `SNAPSHOT`,
+step 2), the records in ascending index order. Each is a 32-byte head, then the register file, then
+the extended state, each padded with zeros to a multiple of 8 bytes:
+
+| Thread word | Content |
+|---|---|
+| 0 | the thread's index in the `ATTACH_PROCESS` list as the capture took it: 0 for the main thread, then each registered thread; a thread with no record leaves its index out |
+| 1 | the state word `SYS_THREAD_READ_REGS` returned (`THREAD_REGS_*`) |
+| 2 | the register file's bytes, as `SYS_THREAD_READ_REGS` writes them for the architecture |
+| 3 | the extended state's bytes, as `SYS_THREAD_READ_EXT_REGS` writes them; 0 when it could not be read |
 
 ---
 

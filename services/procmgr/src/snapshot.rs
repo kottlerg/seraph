@@ -24,12 +24,15 @@
 //! capture; a chunk still on disk it posts to the swap service, and procmgr
 //! asks for it again after a pause, waiting a bounded time while the swap
 //! service restores it. procmgr copies every listed page outside the regions
-//! with `SYS_THREAD_READ_MEM` into the next frames and releases the space. After
-//! the release it builds the layout (`process_table::snapshot::layout`),
-//! writes it into frames of its own grant, and seals the layout and the data,
-//! in that order, into one memory object on the account.
+//! with `SYS_THREAD_READ_MEM` into the next frames, reads each thread it holds a
+//! cap to (the main thread, then each registered one) into its heap
+//! (`SYS_THREAD_READ_REGS`, `SYS_THREAD_READ_EXT_REGS`), and releases the
+//! space. After the release it builds the layout
+//! (`process_table::snapshot::layout`), writes it and the thread records into
+//! frames of its own grant, and seals the layout and the data, in that order,
+//! into one memory object on the account.
 //!
-//! The account is the snapshotter's own memmgr SEND, which the request
+//! The account is a memmgr SEND the snapshotter presents, which the request
 //! carries: procmgr cannot tell that it names memmgr, so every call on it
 //! is bounded ([`ACCOUNT_CALL_TIMEOUT_MS`]), and the first failure fails the
 //! capture, releasing the hold and every grant taken. Under the hold procmgr
@@ -42,7 +45,10 @@ use crate::process::CapGuard;
 use ipc::memmgr_capture::{
     Chunk, DESCRIPTOR_WORDS, DESCRIPTORS_MAX, Descriptor, REPLY_WORDS, REQUEST_WORDS,
 };
-use ipc::procmgr_snapshot::{Header, IMAGE_HASH_BYTES, Image, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE};
+use ipc::procmgr_snapshot::{
+    Header, IMAGE_HASH_BYTES, Image, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE, ThreadRecord,
+    threads_offset,
+};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_table::snapshot::{Described, Layout, Listing, Placed, copied_pages, layout, outside};
 use std::collections::TryReserveError;
@@ -50,7 +56,7 @@ use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
 use std::time::Duration;
 use syscall_abi::{
     MAX_PAGE_RUNS, MAX_THREAD_MEM_COPY, MSG_CAP_SLOTS_MAX, PAGE_RUN_NO_COPY, PAGE_SIZE, PageRun,
-    SyscallError,
+    REGS_RISCV64_SIZE, REGS_X86_64_SIZE, SyscallError,
 };
 
 /// How long procmgr waits, at most, on each call it makes on the
@@ -69,6 +75,17 @@ const WINDOW_PAGES: u64 = 64;
 // `SYS_THREAD_READ_MEM` copies at most `MAX_THREAD_MEM_COPY` bytes a call,
 // and the copy reads a page a call.
 const _: () = assert!(MAX_THREAD_MEM_COPY as u64 == PAGE_SIZE);
+
+/// Bytes of the buffer a thread's register file is read into: the larger
+/// architecture's file.
+const REGS_BUF_BYTES: usize = if REGS_X86_64_SIZE > REGS_RISCV64_SIZE
+{
+    REGS_X86_64_SIZE
+}
+else
+{
+    REGS_RISCV64_SIZE
+};
 
 /// Destination caps one `CAPTURE_CHUNKS` request carries at most: all of a
 /// message's cap slots but the last, which carries the image's handle.
@@ -107,12 +124,28 @@ pub struct Target
 {
     /// The target's `AddressSpace`, with the Control right the hold takes.
     pub aspace: CapGuard,
-    /// The target's main thread, through which its space is listed and read.
+    /// The target's main thread, through which its space is listed and read,
+    /// and whose state is recorded at index 0.
     pub thread: CapGuard,
+    /// The target's registered threads whose caps were derived, each with
+    /// its index in the `ATTACH_PROCESS` list, ascending.
+    pub registered: Vec<TargetThread>,
     /// The target's memmgr badge, which names it to `CAPTURE_CHUNKS`.
     pub memmgr_badge: u64,
+    /// The target's image load bias, as `ATTACH_PROCESS` reports it.
+    pub load_bias: u64,
     /// The image the target attaches, when procmgr shares one with it.
     pub image: Option<TargetImage>,
+}
+
+/// A registered thread of the target, whose state a capture records.
+pub struct TargetThread
+{
+    /// The thread's index in the `ATTACH_PROCESS` list: 1 for the first
+    /// registered thread.
+    pub index: u64,
+    /// The thread's cap, with Observe.
+    pub cap: CapGuard,
 }
 
 /// The image a target attaches (services/procmgr/README.md § Image
@@ -137,13 +170,15 @@ pub struct Captured
     pub complete: bool,
 }
 
-/// Capture `target` into a memory object sealed on `account`, the
-/// snapshotter's memmgr SEND, which stays the caller's.
+/// Capture `target` into a memory object sealed on `account`, a memmgr
+/// SEND the snapshotter presents, which stays the caller's.
 ///
 /// # Errors
 /// `SPACE_HELD` when the target's space is held already or the hold was
 /// interrupted; `INVALID_BADGE` when the target ended before or during the
-/// capture; `OUT_OF_MEMORY` when the account refused or failed a call,
+/// capture; `LIMIT` when the max of the account's budget node or of an
+/// ancestor refused its frames ([`Grants::cover`]); `OUT_OF_MEMORY` when
+/// the account refused otherwise or failed a call,
 /// granted a run procmgr refuses, or the object would take more grants than
 /// one seal names, when memmgr failed a request, or when procmgr's heap or
 /// address space refused the capture's own memory.
@@ -180,15 +215,28 @@ pub fn capture(ctx: &Context, target: &Target, account: u64) -> Result<Captured,
         &data,
         &mut window,
     )?;
+    let threads = read_threads(target)?;
     drop(hold);
     drop(window);
 
-    let layout = layout(&outside, inside.filled, &failed, &inside.described).map_err(runs_code)?;
+    let thread_bytes = threads.bytes().ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    let layout = layout(
+        &outside,
+        inside.filled,
+        &failed,
+        &inside.described,
+        thread_bytes,
+    )
+    .map_err(runs_code)?;
     data.keep(layout.data_pages);
     let mut head = Grants::new(&account);
     head.cover(layout.layout_pages)?;
-    let image = target.image.as_ref().map(|i| i.image);
-    write_layout(ctx.self_aspace, &head, &layout, image)?;
+    let about = About {
+        image: target.image.as_ref().map(|i| i.image),
+        load_bias: target.load_bias,
+        threads: &threads,
+    };
+    write_layout(ctx.self_aspace, &head, &layout, &about)?;
     let (handle, pages) = seal(&account, head, data)?;
     Ok(Captured {
         handle,
@@ -356,8 +404,8 @@ impl Capture
     /// each descriptor.
     ///
     /// # Errors
-    /// As [`memmgr_call`]; `OUT_OF_MEMORY` when the account refuses the
-    /// frames, procmgr's heap refuses the descriptors, or memmgr's reply
+    /// As [`memmgr_call`]; [`Grants::cover`]'s code when the account refuses
+    /// the frames; `OUT_OF_MEMORY` when procmgr's heap refuses the descriptors, or memmgr's reply
     /// names one out of order or of no kind, or pages it did not write.
     fn walk(
         &mut self,
@@ -463,8 +511,9 @@ impl Capture
     /// unused in the object.
     ///
     /// # Errors
-    /// `OUT_OF_MEMORY` when the account refuses the frames, or the grants
-    /// would be more than one seal names.
+    /// [`Grants::cover`]'s: `LIMIT` or `OUT_OF_MEMORY` when the account
+    /// refuses the frames, `OUT_OF_MEMORY` when the grants would be more than
+    /// one seal names.
     fn make_room(&mut self, need: u64, data: &mut Grants<'_>) -> Result<(), u64>
     {
         data.cover(self.filled.saturating_add(need))?;
@@ -672,6 +721,118 @@ fn copy(
     Ok(failed)
 }
 
+/// One thread's state as the hold left it, in procmgr's heap.
+struct ThreadState
+{
+    index: u64,
+    state: u64,
+    regs: [u8; REGS_BUF_BYTES],
+    regs_len: usize,
+    ext: Vec<u8>,
+}
+
+impl ThreadState
+{
+    /// The record the layout holds of the thread.
+    fn record(&self) -> ThreadRecord<'_>
+    {
+        ThreadRecord {
+            index: self.index,
+            state: self.state,
+            regs: self.regs.get(..self.regs_len).unwrap_or_default(),
+            ext: &self.ext,
+        }
+    }
+}
+
+/// The threads a capture read, in ascending index order.
+struct Threads(Vec<ThreadState>);
+
+impl Threads
+{
+    /// Bytes of their records together; `None` on overflow.
+    fn bytes(&self) -> Option<u64>
+    {
+        self.0
+            .iter()
+            .try_fold(0u64, |n, t| n.checked_add(t.record().bytes()?))
+    }
+}
+
+/// Under the hold, read the state of each of the target's threads it holds
+/// a cap to: the main thread, then each registered one. A thread whose
+/// register file cannot be read (it exited, or its cap was revoked) has no
+/// record; one whose extended state cannot be read has a record with none.
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when procmgr's heap refuses the states.
+fn read_threads(target: &Target) -> Result<Threads, u64>
+{
+    let mut out = Vec::new();
+    out.try_reserve_exact(target.registered.len().saturating_add(1))
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    let all = core::iter::once((0, target.thread.cap()))
+        .chain(target.registered.iter().map(|t| (t.index, t.cap.cap())));
+    for (index, cap) in all
+    {
+        let mut regs = [0u8; REGS_BUF_BYTES];
+        let Ok((len, state)) = syscall::thread_read_regs(cap, &mut regs)
+        else
+        {
+            continue;
+        };
+        let regs_len = usize::try_from(len)
+            .unwrap_or(usize::MAX)
+            .min(REGS_BUF_BYTES);
+        out.push(ThreadState {
+            index,
+            state,
+            regs,
+            regs_len,
+            ext: read_ext(cap)?,
+        });
+    }
+    Ok(Threads(out))
+}
+
+/// The extended-state image of the thread `cap` names: empty when the
+/// thread has none or it cannot be read whole.
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when procmgr's heap refuses the image.
+fn read_ext(cap: u64) -> Result<Vec<u8>, u64>
+{
+    let mut image = Vec::new();
+    let mut chunk = [0u8; MAX_THREAD_MEM_COPY];
+    loop
+    {
+        let Ok((copied, size)) = syscall::thread_read_ext_regs(cap, image.len() as u64, &mut chunk)
+        else
+        {
+            return Ok(Vec::new());
+        };
+        let part = usize::try_from(copied)
+            .ok()
+            .and_then(|n| chunk.get(..n))
+            .unwrap_or_default();
+        if part.is_empty()
+        {
+            // An offset at the image's end: whole when it is the size.
+            let whole = u64::try_from(image.len()).is_ok_and(|len| len == size);
+            return Ok(if whole { image } else { Vec::new() });
+        }
+        image
+            .try_reserve(part.len())
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        image.extend_from_slice(part);
+        if u64::try_from(image.len()).is_ok_and(|len| len >= size)
+        {
+            image.truncate(usize::try_from(size).unwrap_or(0));
+            return Ok(image);
+        }
+    }
+}
+
 /// The target's space held (`SYS_ASPACE_HOLD`) until the value drops,
 /// which releases it on every path.
 struct Hold
@@ -771,9 +932,11 @@ impl<'a> Grants<'a>
     /// pages, as many runs as memmgr has.
     ///
     /// # Errors
-    /// `OUT_OF_MEMORY` when a call fails, memmgr refuses a request, a grant's
-    /// cap does not cover the pages its reply names, or the grants would be
-    /// more than one seal names.
+    /// `LIMIT` when memmgr refuses a request for the max of the account's
+    /// budget node or of an ancestor ([`process_table::memmgr_refusal`]);
+    /// `OUT_OF_MEMORY` when a call fails, memmgr refuses a request otherwise, a
+    /// grant's cap does not cover the pages its reply names, or the grants would
+    /// be more than one seal names.
     fn cover(&mut self, pages: u64) -> Result<(), u64>
     {
         while self.pages < pages
@@ -783,17 +946,17 @@ impl<'a> Grants<'a>
                 .word(0, want)
                 .build();
             let reply = self.account.call(&msg)?;
+            if reply.label != memmgr_errors::SUCCESS
+            {
+                crate::release_caps(reply.caps());
+                return Err(process_table::memmgr_refusal(reply.label));
+            }
             let Some((counts, regions)) = ipc::memmgr_grant_layout(&reply)
             else
             {
                 crate::release_caps(reply.caps());
                 return Err(procmgr_errors::OUT_OF_MEMORY);
             };
-            if reply.label != memmgr_errors::SUCCESS
-            {
-                crate::release_caps(reply.caps());
-                return Err(procmgr_errors::OUT_OF_MEMORY);
-            }
             if reply.caps().len() != regions.len() || self.list.try_reserve(regions.len()).is_err()
             {
                 // The grants of a reply that is not kept go back at once:
@@ -1054,13 +1217,22 @@ impl Drop for Window
     }
 }
 
-/// Write `layout`, of a capture that names `image`, into the frames of
-/// `head`, mapped together for the write.
+/// What the layout's header and thread records say besides the runs: the
+/// image the capture names, the load bias, and the threads read.
+struct About<'a>
+{
+    image: Option<Image>,
+    load_bias: u64,
+    threads: &'a Threads,
+}
+
+/// Write `layout`, with what `about` says, into the frames of `head`,
+/// mapped together for the write.
 fn write_layout(
     self_aspace: u64,
     head: &Grants<'_>,
     layout: &Layout,
-    image: Option<Image>,
+    about: &About<'_>,
 ) -> Result<(), u64>
 {
     let pages = head.pages;
@@ -1096,7 +1268,7 @@ fn write_layout(
         // SAFETY: the reservation's `pages` pages are mapped writable to frames
         // procmgr alone holds, and the slice ends before they are unmapped.
         let bytes = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, len) };
-        result = encode(bytes, layout, image);
+        result = encode(bytes, layout, about);
     }
     // SAFETY: the span is this reservation, and the slice over it has ended.
     if unsafe { syscall::mem_unmap(self_aspace, va, pages) }.is_ok()
@@ -1110,10 +1282,11 @@ fn write_layout(
     result
 }
 
-/// Encode `layout`, of a capture that names `image`, at the start of
-/// `bytes`.
-fn encode(bytes: &mut [u8], layout: &Layout, image: Option<Image>) -> Result<(), u64>
+/// Encode `layout`, with what `about` says, at the start of `bytes`: the
+/// header, the regions, the runs, then the thread records.
+fn encode(bytes: &mut [u8], layout: &Layout, about: &About<'_>) -> Result<(), u64>
 {
+    let image = about.image;
     let mut flags = if layout.complete
     {
         SNAPSHOT_COMPLETE
@@ -1137,6 +1310,9 @@ fn encode(bytes: &mut [u8], layout: &Layout, image: Option<Image>) -> Result<(),
             hash: [0; IMAGE_HASH_BYTES],
             len: 0,
         }),
+        load_bias: about.load_bias,
+        thread_count: about.threads.0.len() as u64,
+        thread_bytes: about.threads.bytes().ok_or(procmgr_errors::OUT_OF_MEMORY)?,
     };
     header.encode(bytes).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     for (i, region) in layout.regions.iter().enumerate()
@@ -1148,6 +1324,15 @@ fn encode(bytes: &mut [u8], layout: &Layout, image: Option<Image>) -> Result<(),
     for (i, run) in layout.runs.iter().enumerate()
     {
         run.encode(bytes, regions, i)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    }
+    let mut at = threads_offset(regions.saturating_add(layout.runs.len() as u64))
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    for thread in &about.threads.0
+    {
+        at = thread
+            .record()
+            .encode(bytes, at)
             .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     }
     Ok(())

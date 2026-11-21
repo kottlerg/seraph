@@ -12,6 +12,7 @@ mod debug_port;
 mod host;
 mod hotplug;
 mod kaslr;
+mod rollback;
 mod shutdown;
 mod signing;
 mod terminal;

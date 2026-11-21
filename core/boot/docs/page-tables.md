@@ -123,7 +123,7 @@ architecture's module as `arch::current`, whose `mod.rs` re-exports its
 The paging depth is selected at boot, before the tables are built: 5-level paging
 (`CR4.LA57`) when `CPUID.(EAX=07H,ECX=0):ECX[16]` reports LA57, 4-level otherwise. The
 bootloader has no override knob of its own; a test host selects the depth by the CPU it
-presents (`cargo xtask --x86-paging`, [xtask/README.md](../../../xtask/README.md)). The
+presents (`cargo xtask run --x86-paging`, [xtask/README.md](../../../xtask/README.md)). The
 firmware runs one of the two depths itself, which the bootloader reads from its `CR4.LA57`.
 When the negotiated depth differs from the firmware's, the handoff must change `CR4.LA57`,
 which the CPU accepts only outside IA-32e mode; the bootloader then reserves one

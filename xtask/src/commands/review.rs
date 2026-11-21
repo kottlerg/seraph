@@ -3,20 +3,21 @@
 
 // xtask/src/commands/review.rs
 
-//! `review-check` and `review-ledger`: the saved run records of a pull
-//! request's pre-merge review (`target/xtask/review/pr<N>/<mode>-<head>.json`)
-//! and of a release review (`target/xtask/review/release-v<X.Y.Z>/`).
+//! `review-ledger`: the saved run records of a pull request's pre-merge
+//! review (`target/xtask/review/pr<N>/<mode>-<head>.json`) and of a release
+//! review (`target/xtask/review/release-v<X.Y.Z>/`).
 //!
-//! `review-check` validates each record against the record shape
-//! (xtask/README.md § `cargo xtask review-check`), so the ledger and the
-//! merge gate read what they expect. A record states the defect form
-//! (`stats.form` `defects`); one without `stats.form` is of the earlier form,
-//! with its finding classes and buckets, and is still read. `review-ledger`
-//! builds the ledger, the findings a later run must not re-raise
-//! (docs/conventions.md § Ledger): `ledger.json` for a pull request, or, for a
-//! release review, the entries of the range's pull requests and of the
-//! release's own runs, printed for the files a reviewer names. The merge gate
-//! of `pr-check --gate` reads the records through `gate_diags`.
+//! For a pull request it validates each record against the record shape
+//! (xtask/README.md § `cargo xtask review-ledger`), so the ledger and the
+//! merge gate read what they expect, and builds `ledger.json` only when every
+//! record is well-formed; `--check` validates alone. A record states the
+//! defect form (`stats.form` `defects`); one without `stats.form` is of the
+//! earlier form, with its finding classes and buckets, and is still read. The
+//! ledger is the findings a later run must not re-raise (docs/conventions.md
+//! § Ledger): `ledger.json` for a pull request, or, for a release review, the
+//! entries of the range's pull requests and of the release's own runs,
+//! printed for the files a reviewer names. The merge gate of `pr-check
+//! --gate` reads the records through `gate_diags`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,9 +26,9 @@ use std::process::Command;
 use crate::error::{Context, Result, bail};
 use json::{Map, Value, json};
 
-use crate::cli::{ReviewCheckArgs, ReviewLedgerArgs};
+use crate::cli::ReviewLedgerArgs;
 use crate::context::Context as BuildContext;
-use crate::diag::{Diag, Strictness, report};
+use crate::diag::{Diag, Strictness, fails, report};
 use crate::util::{run_cmd_capture, step};
 
 /// The reviewer verdicts of a defect-form record.
@@ -187,7 +188,8 @@ fn name_parts(name: &str) -> Option<(&'static str, &str)>
 }
 
 /// Read every run record in `dir`, sorted by file name. A file that is not
-/// JSON is returned as `Value::Null`, which `check_record` reports.
+/// JSON is returned as `Value::Null`, which `check_record` reports and
+/// `unread` names.
 pub fn read_records(dir: &Path) -> Result<Vec<Record>>
 {
     let entries =
@@ -871,18 +873,30 @@ fn for_files(entries: Vec<Value>, files: &[String]) -> Vec<Value>
         .collect()
 }
 
-/// Entry point for `cargo xtask review-check`.
-pub fn run_check(ctx: &BuildContext, args: &ReviewCheckArgs) -> Result<()>
+/// The ledger of a pull request's records, once every record has the record
+/// shape: the shape errors otherwise, from which no ledger is built.
+fn checked_ledger(records: &[Record]) -> std::result::Result<Value, Vec<Diag>>
 {
-    let dir = record_dir(ctx, args.pr);
-    step(&format!("Checking the run records in {}", dir.display()));
-    let records = read_records(&dir)?;
     let diags: Vec<Diag> = records
         .iter()
         .flat_map(|(name, record)| check_record(name, record))
         .collect();
-    println!("    {} record(s)", records.len());
-    report("review-check", &diags, Strictness::ErrorsOnly)
+    if fails(&diags, Strictness::ErrorsOnly)
+    {
+        return Err(diags);
+    }
+    Ok(ledger(records))
+}
+
+/// The names of the records that are not a JSON object, which a release
+/// ledger refuses rather than reading as empty.
+fn unread(records: &[Record]) -> Vec<&str>
+{
+    records
+        .iter()
+        .filter(|(_, record)| !record.is_object())
+        .map(|(name, _)| name.as_str())
+        .collect()
 }
 
 /// Entry point for `cargo xtask review-ledger`.
@@ -890,7 +904,18 @@ pub fn run_ledger(ctx: &BuildContext, args: &ReviewLedgerArgs) -> Result<()>
 {
     match ledger_target(args)?
     {
-        LedgerTarget::Pr(pr) => write_pr_ledger(ctx, pr),
+        LedgerTarget::Pr(pr) =>
+        {
+            let action = if args.check
+            {
+                PrAction::Check
+            }
+            else
+            {
+                PrAction::Write
+            };
+            write_pr_ledger(ctx, pr, action)
+        }
         LedgerTarget::Release { version, from } =>
         {
             print_release_ledger(ctx, &version, &from, &args.file)
@@ -943,13 +968,34 @@ fn release_version(version: &str) -> Result<String>
     Ok(version.to_owned())
 }
 
-/// Write `ledger.json` beside a pull request's run records.
-fn write_pr_ledger(ctx: &BuildContext, pr: u64) -> Result<()>
+/// What `review-ledger <N>` does once every record has the record shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrAction
+{
+    /// Write `ledger.json`.
+    Write,
+    /// Nothing more: `--check`.
+    Check,
+}
+
+/// Validate a pull request's run records and, for `PrAction::Write`, write
+/// `ledger.json` beside them. A malformed record fails the command before
+/// anything is written.
+fn write_pr_ledger(ctx: &BuildContext, pr: u64, action: PrAction) -> Result<()>
 {
     let dir = record_dir(ctx, pr);
-    step(&format!("Building the ledger in {}", dir.display()));
+    step(&format!("Checking the run records in {}", dir.display()));
     let records = read_records(&dir)?;
-    let ledger = ledger(&records);
+    println!("    {} record(s)", records.len());
+    let ledger = match checked_ledger(&records)
+    {
+        Ok(ledger) => ledger,
+        Err(diags) => return report("review-ledger", &diags, Strictness::ErrorsOnly),
+    };
+    if action == PrAction::Check
+    {
+        return report("review-ledger", &[], Strictness::ErrorsOnly);
+    }
     let path = dir.join("ledger.json");
     fs::write(&path, format!("{}\n", ledger.to_string_pretty()))
         .with_context(|| format!("cannot write {}", path.display()))?;
@@ -992,6 +1038,7 @@ fn print_release_ledger(
         if dir.is_dir()
         {
             let records = read_records(&dir)?;
+            refuse_unread(&dir, &records)?;
             read = read.saturating_add(records.len());
             entries.extend(ledger_of(&records, |_| true));
         }
@@ -1000,6 +1047,7 @@ fn print_release_ledger(
     if release_dir.is_dir()
     {
         let records = read_records(&release_dir)?;
+        refuse_unread(&release_dir, &records)?;
         read = read.saturating_add(records.len());
         entries.extend(release_ledger(&records));
     }
@@ -1013,6 +1061,22 @@ fn print_release_ledger(
         prs.len()
     );
     println!("{}", Value::Array(entries).to_string_pretty());
+    Ok(())
+}
+
+/// Fail when a record in `dir` is not a JSON object: the release ledger
+/// would otherwise read it as one without findings.
+fn refuse_unread(dir: &Path, records: &[Record]) -> Result<()>
+{
+    let names = unread(records);
+    if !names.is_empty()
+    {
+        bail!(
+            "{}: not a JSON object, so no ledger is printed: {}",
+            dir.display(),
+            names.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -1798,6 +1862,7 @@ mod tests
             release: release.map(str::to_owned),
             from: from.map(str::to_owned),
             file: Vec::new(),
+            check: false,
         }
     }
 
@@ -1919,5 +1984,50 @@ mod tests
         let kept = for_files(entries, &["./docs/a.md".to_owned()]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["claim"], "b");
+    }
+    // A malformed record yields no ledger: `review-ledger` writes nothing from
+    // it, where it once read an unparseable file as a record without findings.
+    #[test]
+    fn a_malformed_record_builds_no_ledger()
+    {
+        let mut kept = passing();
+        kept["recorded"] = json!([finding("off the surface", "unverified")]);
+        let ledger = checked_ledger(&[(NAME.to_owned(), kept.clone())]).unwrap();
+        assert_eq!(ledger.as_array().map(Vec::len), Some(1));
+
+        let errors = checked_ledger(&[
+            (NAME.to_owned(), kept),
+            ("full-0a82b0aa.json".to_owned(), Value::Null),
+        ])
+        .unwrap_err();
+        assert_eq!(rules(&errors), ["record-shape"]);
+
+        let mut nameless = passing();
+        nameless["stats"]["mode"] = json!("full");
+        let errors = checked_ledger(&[(NAME.to_owned(), nameless)]).unwrap_err();
+        assert_eq!(rules(&errors), ["record-name"]);
+    }
+
+    // A release ledger names the record files that are not JSON objects, and
+    // refuses them, rather than reading them as records without findings.
+    #[test]
+    fn a_release_ledger_refuses_an_unread_record()
+    {
+        let records = [
+            (NAME.to_owned(), passing()),
+            ("full-1234abcd.json".to_owned(), Value::Null),
+            ("audit-1234abcd.json".to_owned(), json!([])),
+        ];
+        assert_eq!(
+            unread(&records),
+            ["full-1234abcd.json", "audit-1234abcd.json"]
+        );
+        let dir = Path::new("target/xtask/review/release-v0.1.5");
+        let err = refuse_unread(dir, &records).unwrap_err().to_string();
+        assert!(
+            err.contains("full-1234abcd.json, audit-1234abcd.json"),
+            "{err}"
+        );
+        refuse_unread(dir, &records[..1]).unwrap();
     }
 }

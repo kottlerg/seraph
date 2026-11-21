@@ -179,8 +179,9 @@ pub struct Layout
 
 /// The layout of a capture whose listed pages outside every region are
 /// `outside` ([`outside`]), copied from data page `first_copy` on, whose
-/// copy failed for the pages at the addresses `failed` (ascending), and of
-/// whose regions memmgr described `described`.
+/// copy failed for the pages at the addresses `failed` (ascending), of
+/// whose regions memmgr described `described`, and whose thread records
+/// take `thread_bytes` after the runs, in the layout's pages.
 ///
 /// Outside the regions, each page of `outside` that is not
 /// `PAGE_RUN_NO_COPY` and whose copy held takes the next data page, in
@@ -206,6 +207,7 @@ pub fn layout(
     first_copy: u64,
     failed: &[u64],
     described: &Described,
+    thread_bytes: u64,
 ) -> Result<Layout, TryReserveError>
 {
     let mut runs = Runs::default();
@@ -248,7 +250,7 @@ pub fn layout(
         let end = runs.push_region(index as u64, region, described)?;
         data_end = data_end.max(end);
     }
-    runs.finish(regions, data_end)
+    runs.finish(regions, data_end, thread_bytes)
 }
 
 /// The layout entry of `region`.
@@ -463,11 +465,12 @@ impl Runs
 
     /// Sort the runs by address, join each to the one before it where it
     /// continues it in its region, and place their bytes after the layout's
-    /// pages.
+    /// pages, which hold `thread_bytes` of thread records after the runs.
     fn finish(
         mut self,
         regions: Vec<RegionEntry>,
         data_pages: u64,
+        thread_bytes: u64,
     ) -> Result<Layout, TryReserveError>
     {
         self.runs.sort_by_key(|t| t.run.va);
@@ -488,7 +491,7 @@ impl Runs
         runs.try_reserve(joined.len())?;
         // The heap holds the entries, so their layout's bytes fit a `u64`.
         let entries = (regions.len() as u64).saturating_add(joined.len() as u64);
-        let layout_pages = layout_pages(entries).unwrap_or(u64::MAX);
+        let layout_pages = layout_pages(entries, thread_bytes).unwrap_or(u64::MAX);
         for t in joined
         {
             let mut run = t.run;
@@ -582,7 +585,7 @@ mod tests
     /// The layout of `d` with nothing listed outside its regions.
     fn regions_only(d: &Described) -> Layout
     {
-        layout(&[], 0, &[], d).unwrap()
+        layout(&[], 0, &[], d, 0).unwrap()
     }
 
     /// The layout invariant: runs ascending and disjoint, every page of every
@@ -712,7 +715,7 @@ mod tests
             listed(0x1000, 4, RW),
             listed(0x5000, 2, RW | PAGE_RUN_NO_COPY),
         ];
-        let l = layout(&listing, 0, &[0x2000, 0x3000], &Described::default()).unwrap();
+        let l = layout(&listing, 0, &[0x2000, 0x3000], &Described::default(), 0).unwrap();
         assert_eq!(
             l.runs,
             [
@@ -957,7 +960,7 @@ mod tests
         };
         let listing = [listed(0x1000, 2, RW), listed(0x10000, 3, RW)];
         let out = outside(&listing, &d.regions).unwrap();
-        let l = layout(&out, 3, &[], &d).unwrap();
+        let l = layout(&out, 3, &[], &d, 0).unwrap();
         assert_eq!(
             l.runs,
             [
@@ -983,10 +986,24 @@ mod tests
                 )
             })
             .collect();
-        let l = layout(&runs, 0, &[], &Described::default()).unwrap();
+        let l = layout(&runs, 0, &[], &Described::default(), 0).unwrap();
         assert_eq!(l.layout_pages, 2);
         assert_eq!(l.runs.first().map(|r| r.object_page), Some(2));
         assert_eq!(l.runs.last().map(|r| r.object_page), Some(126));
+    }
+
+    #[test]
+    fn thread_records_take_layout_pages_before_the_data()
+    {
+        // One run and the header leave a page's rest for the records; one
+        // byte more takes a second layout page, and moves the run's bytes.
+        let listing = [listed(0x1000, 2, RW)];
+        let room = P - (procmgr_snapshot::HEADER_BYTES + procmgr_snapshot::ENTRY_BYTES) as u64;
+        let l = layout(&listing, 0, &[], &Described::default(), room).unwrap();
+        assert_eq!((l.layout_pages, l.runs[0].object_page), (1, 1));
+        let l = layout(&listing, 0, &[], &Described::default(), room + 1).unwrap();
+        assert_eq!((l.layout_pages, l.runs[0].object_page), (2, 2));
+        assert_eq!(l.data_pages, 2);
     }
 
     /// A small linear congruential generator, so the mixes repeat.
@@ -1074,7 +1091,7 @@ mod tests
                 .filter(|_| rng.next(4) == 0)
                 .map(|r| r.va)
                 .collect();
-            let l = layout(&out, data, &failed, &d).unwrap();
+            let l = layout(&out, data, &failed, &d, 0).unwrap();
             check(&l, &listing);
             let copied = copied_pages(&out) - failed.len() as u64;
             assert_eq!(l.data_pages, data + copied);

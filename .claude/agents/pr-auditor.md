@@ -302,7 +302,7 @@ silent-deferral scan (FAIL on any unreconciled hit); test-plan honesty
 PR-body claims; on the `auditor-only` line, auditor-only checks; on the
 `completing` line, completing-audit checks; and, when the line is absent
 or malformed, run kind (FAIL). A run with the reviewer carries neither the
-auditor-only nor the completing-audit section: `cargo xtask review-check`
+auditor-only nor the completing-audit section: `cargo xtask review-ledger`
 rejects a `full` or `delta` record that does.
 
 **The final line MUST be exactly one of:** `AUDIT PASS`, `AUDIT FAIL`.

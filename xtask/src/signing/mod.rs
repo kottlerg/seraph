@@ -319,6 +319,18 @@ impl Signer
         store::with_scoped_anchors(&self.store, &pairs)
     }
 
+    /// The build's trust store with its floor set to `security_floor`: under
+    /// a higher floor, a store that refuses every record [`Self::sign`] makes
+    /// (`RecordFailure::SecurityFloor`), as a later build's would.
+    ///
+    /// # Errors
+    ///
+    /// When the build's store does not parse.
+    pub fn store_with_floor(&self, security_floor: u32) -> Result<Vec<u8>>
+    {
+        store::with_floor(&self.store, security_floor)
+    }
+
     /// `object` signed with the role set `roles` under `name`: its body, the
     /// object less any trailer it carries, followed by a trailer of one
     /// record of the signing key. The result is verified under the build's
@@ -338,6 +350,25 @@ impl Signer
     /// one of the roles).
     pub fn sign(&self, object: &[u8], roles: RoleSet, name: &str) -> Result<Vec<u8>>
     {
+        self.sign_at(object, roles, name, SECURITY_VERSION)
+    }
+
+    /// [`Self::sign`] with the security version `security_version` in
+    /// place of the tree's [`SECURITY_VERSION`]: the object a later build,
+    /// whose trust store carries a higher floor, makes.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::sign`]; when the signing key's certificate does
+    /// not allow `security_version`, or it is below the build's floor.
+    pub fn sign_at(
+        &self,
+        object: &[u8],
+        roles: RoleSet,
+        name: &str,
+        security_version: u32,
+    ) -> Result<Vec<u8>>
+    {
         if !objsig::name_is_canonical(name.as_bytes())
         {
             bail!(
@@ -348,7 +379,7 @@ impl Signer
         let refused = |e| err!("signing {name}: {e:?}");
         let attrs = Attributes {
             body_len: u64::try_from(body.len()).context("an object longer than u64")?,
-            security_version: SECURITY_VERSION,
+            security_version,
             roles,
             arch: self.arch,
             body_hash: crypto::sha512(body),

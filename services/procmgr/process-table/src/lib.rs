@@ -1417,6 +1417,24 @@ impl ChildBudget
     }
 }
 
+/// The procmgr reply code for memmgr's refusal `label` of a charge procmgr
+/// made on a process's account: `LIMIT` when the max of the account's budget
+/// node or of an ancestor refused it (`memmgr_errors::LIMIT`), so the
+/// requester tells its own node's bound from the system's shortage, and
+/// `OUT_OF_MEMORY` for every other refusal.
+#[must_use]
+pub const fn memmgr_refusal(label: u64) -> u64
+{
+    if label == ipc::memmgr_errors::LIMIT
+    {
+        ipc::procmgr_errors::LIMIT
+    }
+    else
+    {
+        ipc::procmgr_errors::OUT_OF_MEMORY
+    }
+}
+
 /// Why [`child_budget`] or [`decode_memory_max`] refused a create request,
 /// which procmgr answers with `INVALID_ARGUMENT`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3326,6 +3344,39 @@ mod tests
             unbadged: false,
             sign_roles: sign_policy::LOADABLE,
         }
+    }
+
+    /// The sizes services/memmgr/docs/memory-pool.md § Distribution policy
+    /// (Server-side charges) and services/procmgr/docs/ipc-interface.md
+    /// § Label 1 state for procmgr's state per process and per registered
+    /// thread: a change here changes those figures.
+    #[test]
+    fn the_per_process_state_has_the_documented_size()
+    {
+        assert_eq!(core::mem::size_of::<ProcessEntry>(), 336);
+        assert_eq!(core::mem::size_of::<threads::RegisteredThread>(), 24);
+    }
+
+    #[test]
+    fn a_max_refusal_answers_limit_and_every_other_refusal_out_of_memory()
+    {
+        use ipc::{memmgr_errors, procmgr_errors};
+        assert_eq!(memmgr_refusal(memmgr_errors::LIMIT), procmgr_errors::LIMIT);
+        for label in [
+            memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
+            memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT,
+            memmgr_errors::QUOTA,
+            memmgr_errors::INVALID_ARGUMENT,
+            memmgr_errors::UNAUTHORIZED,
+        ]
+        {
+            assert_eq!(
+                memmgr_refusal(label),
+                procmgr_errors::OUT_OF_MEMORY,
+                "memmgr code {label}"
+            );
+        }
+        assert_ne!(procmgr_errors::LIMIT, procmgr_errors::OUT_OF_MEMORY);
     }
 
     #[test]

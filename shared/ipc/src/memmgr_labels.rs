@@ -138,13 +138,14 @@ const _: () = core::assert!(
 /// Badge bit of an object handle: a SEND on memmgr's endpoint badged with
 /// this bit and a random key, which names one memory object
 /// ([`SEAL_OBJECT`]). It is the authority to attach the object
-/// ([`ATTACH_OBJECT`], which takes it as a cap), to back the caller's own
-/// pages with copies of its pages ([`FILL_REGION`], likewise), and to serve
-/// the object labels ([`is_object_label`]: [`OBJECT_RELEASE`],
-/// [`OBJECT_READ`]) on it. No process badge, node handle or swap authority
-/// carries it, so memmgr serves the object labels only on a badge carrying it
-/// and the other labels only on one without it, and refuses the rest with
-/// `UNAUTHORIZED`. Specified in
+/// ([`ATTACH_OBJECT`]), to read its pages ([`OBJECT_READ`]) and to back the
+/// caller's own pages with copies of them ([`FILL_REGION`]), each of which
+/// is sent on the caller's own memmgr SEND and takes the handle as a cap, and
+/// to release the object's handle state ([`OBJECT_RELEASE`], the object label
+/// of [`is_object_label`]), which is sent on the handle itself. No process
+/// badge, node handle or swap authority carries it, so memmgr serves the
+/// object label only on a badge carrying it and the other labels only on one
+/// without it, and refuses the rest with `UNAUTHORIZED`. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Object Handles.
 pub const OBJECT_HANDLE_TAG: u64 = 1 << 60;
 const _: () = core::assert!(

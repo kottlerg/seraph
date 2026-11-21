@@ -42,15 +42,15 @@ Two privilege classes:
   any other badged cap, replying `UNAUTHORIZED`.
 - **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
   `QUERY_POOL_STATUS`, `REGISTER_REGION`, `UNREGISTER_REGION`,
-  `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
-  `SHRINK_REGION`, `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`,
-  `ATTACH_OBJECT`, `REGISTER_DONATION_END`, `FILL_REGION`) are callable over
-  any badged cap but a node handle or an object handle, including those memmgr
+  `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`, `SHRINK_REGION`,
+  `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`, `ATTACH_OBJECT`,
+  `REGISTER_DONATION_END`, `FILL_REGION`, `OBJECT_READ`) are callable over any
+  badged cap but a node handle or an object handle, including those memmgr
   returned from `REGISTER_PROCESS`. `REGISTER_REGION`, `UNREGISTER_REGION`,
-  `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
-  `SHRINK_REGION`, `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`,
-  `ATTACH_OBJECT`, `REGISTER_DONATION_END` and `FILL_REGION` are attributed
-  to the caller by its own badge.
+  `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`, `SHRINK_REGION`,
+  `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`, `ATTACH_OBJECT`,
+  `REGISTER_DONATION_END` and `FILL_REGION` are attributed to the caller by
+  its own badge.
 - **Node** labels (`NODE_SET_MAX`, `NODE_CREATE`, `NODE_QUERY_USAGE`,
   `NODE_REGISTER_LIMIT`, `NODE_RELEASE`, `NODE_SET_RECLAIM`,
   `NODE_CHARGE_HANDLE`) are callable only over a node handle, and act on the
@@ -69,7 +69,7 @@ memmgr tells the classes apart by three verb bits, the node-handle bit
 and the object-handle bit `OBJECT_HANDLE_TAG` (bit 60), the pattern of
 [docs/capability-model.md](../../../docs/capability-model.md) § Verb-bit
 authority pattern: it serves the node labels only on a badge that carries bit
-62, the swap labels only on one that carries bit 61, the object labels only on
+62, the swap labels only on one that carries bit 61, the object label only on
 one that carries bit 60, and every other label only on one that carries none
 of them, and replies `UNAUTHORIZED` otherwise, deleting any cap the message
 carries. A node handle whose badge also carries the charge-only bit

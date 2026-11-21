@@ -240,14 +240,15 @@ fn resolve(table: &Command, words: &[Token]) -> Vec<String>
             {
                 continue;
             }
-            match long_option(at, lookup, name)
+            match long_option(at, lookup, name, exact.then_some(positional))
             {
                 Err(problem) => problems.push(problem),
-                Ok(true) if !attached =>
+                Ok(None) => break,
+                Ok(Some(true)) if !attached =>
                 {
                     iter.next();
                 }
-                Ok(_) =>
+                Ok(Some(_)) =>
                 {}
             }
             continue;
@@ -301,11 +302,30 @@ fn resolve(table: &Command, words: &[Token]) -> Vec<String>
 }
 
 /// Whether `--name` takes a value, by `lookup` (on the command the line
-/// names, or below a placeholder); the problem when no command it can stand
-/// for has the option.
-fn long_option(at: &Command, lookup: OptionLookup, name: &str) -> Result<bool, String>
+/// names, or below a placeholder); `None` when the command the line names
+/// lacks it and its `positional` (given when the line names it) takes the rest
+/// of the line, options included, as the parser reads it; the problem when no
+/// command it can stand for has the option.
+fn long_option(
+    at: &Command,
+    lookup: OptionLookup,
+    name: &str,
+    positional: Option<usize>,
+) -> Result<Option<bool>, String>
 {
-    lookup(at, name).ok_or_else(|| format!("`--{name}` is not an option of `cargo {}`", at.path()))
+    match lookup(at, name)
+    {
+        Some(takes_value) => Ok(Some(takes_value)),
+        None if positional
+            .is_some_and(|index| at.children().is_empty() && at.positional_takes_rest(index)) =>
+        {
+            Ok(None)
+        }
+        None => Err(format!(
+            "`--{name}` is not an option of `cargo {}`",
+            at.path()
+        )),
+    }
 }
 
 /// How an option is looked up: `Command::long_takes_value` or `option_below`.
@@ -531,6 +551,8 @@ mod tests
             "cargo xtask test ${{ matrix.case }} --arch ${{ matrix.arch }}",
             "cargo xtask orch worker W1 --status 'a line --not-an-option'",
             "cargo xtask orch grant set W2 run --cpus 128 --runs 1",
+            "cargo xtask orch ruling add --no-verify is not used",
+            "cargo xtask orch grant set W2 --cpus 128",
             "cargo xtask orch grant set <holder> <commands>... --not-checked",
             "cargo xtask review-ledger 12 --check",
             "cargo xtask",

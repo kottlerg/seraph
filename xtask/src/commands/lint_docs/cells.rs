@@ -560,22 +560,23 @@ mod tests
             .collect()
     }
 
-    // Defect caught: the rule refusing the documents as the tree holds them,
-    // which would fail every CI run.
     // Defect caught: a `#` comment in a fenced block read as a heading, which
-    // ended the section before its own tables and headings.
+    // ended the section before its own tables and headings, or two tables a
+    // fenced block parts read as one.
     #[test]
     fn a_comment_in_a_fenced_block_does_not_end_a_section()
     {
-        let text = "## Gating\n\n```sh\n# a comment\n```\n\n| A |\n|---|\n| x |\n\n## Next\n";
+        let text = "## Gating\n\n```sh\n# a comment\n```\n\n| A |\n|---|\n| x |\n```\ncode\n```\n| B |\n|---|\n| y |\n\n## Next\n";
         let lines = section(text, "## Gating").unwrap_or_default();
         let rows: Vec<usize> = tables(&lines)
             .iter()
             .map(|table| table.rows.len())
             .collect();
-        assert_eq!(rows, vec![1]);
+        assert_eq!(rows, vec![1, 1]);
     }
 
+    // Defect caught: the rule refusing the documents as the tree holds them,
+    // which would fail every CI run.
     #[test]
     fn the_tracked_documents_state_the_registry()
     {

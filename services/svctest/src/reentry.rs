@@ -15,7 +15,8 @@
 //! reply it cannot deliver, procmgr's death forward to logd, procmgr's post
 //! of a process's end to its end queue and, once, to its death relay, the fs
 //! release handler's cookie matching, fatfs's release of the open of a
-//! killed client and of one whose open reply it cannot deliver, memmgr's hold
+//! killed client and of one whose open reply it cannot deliver, fatfs's
+//! return of the session pages of a client that dies holding a session, memmgr's hold
 //! on a dead child's frame that a live kernel object still occupies, memmgr's hold
 //! of a child to the memory max its creator set, its commitment of a heap's
 //! growth, memmgr's eviction of a child's cold pages and their restore, a child's
@@ -47,6 +48,7 @@ pub fn dispatch(role: &str)
     phases::process_tree::reentry_main(role);
     phases::fs_std::reentry_main(role);
     phases::fs_opens::reentry_main(role);
+    phases::fs_sessions::reentry_main(role);
     phases::exit_code::reentry_main(role);
     phases::recv_guard::reentry_main(role);
     phases::no_receiver::reentry_main(role);

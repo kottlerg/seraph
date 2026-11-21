@@ -93,6 +93,8 @@ pub enum Malformed
     Attributes(u32),
     /// Its byte is this value, neither 0 nor 1.
     Value(u8),
+    /// It does not exist, where the variable read before it says it should.
+    Absent,
 }
 
 impl core::fmt::Display for Malformed
@@ -109,6 +111,7 @@ impl core::fmt::Display for Malformed
                  volatile)"
             ),
             Malformed::Value(value) => write!(f, "value {value}, not 0 or 1"),
+            Malformed::Absent => write!(f, "absent"),
         }
     }
 }
@@ -157,7 +160,7 @@ pub fn state(
             Ok(Some(true)) => State::Off(Off::SetupMode),
             Ok(Some(false)) => State::Off(Off::NotEnforced),
             // A firmware that has `SecureBoot` implements `SetupMode` too.
-            Ok(None) => State::Off(Off::SetupModeUnknown(Malformed::Length(0))),
+            Ok(None) => State::Off(Off::SetupModeUnknown(Malformed::Absent)),
             Err(why) => State::Off(Off::SetupModeUnknown(why)),
         },
     }
@@ -259,8 +262,8 @@ mod tests
     }
 
     // Defect caught: an unknown or malformed SecureBoot taken as on, SetupMode
-    // read when SecureBoot already settles the state, or the two off states
-    // confused.
+    // read when SecureBoot already settles the state, the two off states
+    // confused, or a missing SetupMode logged as one of zero bytes.
     #[test]
     fn only_secure_boot_1_is_on()
     {
@@ -283,6 +286,12 @@ mod tests
             state(Ok(Some(false)), || Err(Malformed::Unreadable(DEVICE_ERROR))),
             State::Off(Off::SetupModeUnknown(Malformed::Unreadable(DEVICE_ERROR)))
         );
+        // A missing SetupMode is told apart from one of zero bytes.
+        assert_eq!(
+            state(Ok(Some(false)), || Ok(None)),
+            State::Off(Off::SetupModeUnknown(Malformed::Absent))
+        );
+        assert_ne!(Malformed::Absent, Malformed::Length(0));
     }
 
     // Defect caught: a variable name that differs from the specification's,

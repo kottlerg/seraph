@@ -202,10 +202,11 @@ Every Seraph variable is named under the Seraph vendor GUID (`SERAPH_VENDOR_GUID
 services have exited. The Secure Boot state is the firmware's `SecureBoot` and `SetupMode`,
 under the global variable GUID (`EFI_GLOBAL_VARIABLE_GUID`), each one byte of 0 or 1 with
 `BOOTSERVICE_ACCESS | RUNTIME_ACCESS` and not `NON_VOLATILE`, as the firmware sets them; the
-bootloader reads them and never writes them, and a variable of another shape, a
-non-volatile copy among them, reads as `unknown`, never as `on`
-(`core/boot/src/secure_boot.rs`). Every variable call is made before `ExitBootServices`, and
-none after it: the state is read right after step 1 of [boot-flow.md](boot-flow.md), the floor
+bootloader reads them and never writes them. A `SecureBoot` of another shape, a non-volatile
+copy among them, reads as `unknown`, never as `on`; with `SecureBoot` at 0, a `SetupMode` of
+another shape, or none, reads as `off` with that as its reason
+(`core/boot/src/secure_boot.rs`). Every variable call is made before `ExitBootServices`, and none
+after it: the state is read right after step 1 of [boot-flow.md](boot-flow.md), the floor
 once the trust store parses and written once every object has verified (step 4), ahead of the
 memory-map reads of steps 6 and 7. A variable service the firmware lacks or fails is a warning or
 a logged state, not a halt; only a floor that refuses the bootloader, or a malformed one, is

@@ -813,10 +813,12 @@ admit, a tampered bootloader among them.
 **State.** The bootloader reads the firmware's `SecureBoot` and `SetupMode` variables, under the
 global GUID, and logs the state on every boot: `on`, `off` with its reason (the firmware does
 not implement Secure Boot, setup mode, or keys enrolled with verification off), or `unknown` for
-a variable of another shape. A variable that is not exactly one byte of 0 or 1 with the
-boot-services and runtime attributes is not the firmware's, and never reads as `on`. No state
-stops the boot: that Secure Boot is on is reported, not required. A system's signed configuration
-may require it (design intent; [#1416](https://github.com/kottlerg/seraph/issues/1416)).
+a `SecureBoot` of another shape. A variable that is not exactly one byte of 0 or 1 with the
+boot-services and runtime attributes is not the firmware's, and never reads as `on`: with
+`SecureBoot` at 0, a `SetupMode` of another shape, or none, reads as `off` with that as its
+reason. No state stops the boot: that Secure Boot is on is reported, not required. A system's
+signed configuration may require it (design intent;
+[#1416](https://github.com/kottlerg/seraph/issues/1416)).
 
 **Testing.** `cargo xtask test secureboot` signs the bootloader with development keys, enrols
 them in a variable store, and checks that the firmware boots the signed bootloader and refuses it

@@ -85,8 +85,19 @@ fn try_attach(
         return None;
     }
     let reserved = crate::sys::reserve::reserve_pages(1).ok()?;
-    Pipe::attach_from_caps(memory, data_notification, space_notification, role, aspace, reserved)
-        .ok()
+    let pipe = Pipe::attach_from_caps(
+        memory,
+        data_notification,
+        space_notification,
+        role,
+        aspace,
+        reserved,
+    )
+    .ok()?;
+    // Never dropped: a quiesce point allows it (`os::seraph::checkpoint::STDIO_PIPES`).
+    crate::os::seraph::checkpoint::STDIO_PIPES
+        .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+    Some(pipe)
 }
 
 /// Install the stdio pipe ends from `ProcessInfo` cap triples. Called

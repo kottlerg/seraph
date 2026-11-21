@@ -780,12 +780,12 @@ parent outside the reserve; procmgr relays the max the node took to the creator 
 usage with `QUERY_MEMORY_USAGE`.
 
 **Server-side charges.** Memory a server spends on a client's behalf is charged to the server's
-node, not to the client's. procmgr keeps, for each live process, its process-table entry (336
-bytes), 6 to 12 capability slots in procmgr's `CSpace` (72 bytes each) and two death-observer nodes
-(24 bytes each), about 0.8 to 1.6 KiB with the growth of their containers, and 96 bytes for each
+node, not to the client's. procmgr keeps, for each live process, its process-table entry (440
+bytes), 6 to 13 capability slots in procmgr's `CSpace` (72 bytes each) and two death-observer nodes
+(24 bytes each), about 0.9 to 1.8 KiB with the growth of their containers, and 96 bytes for each
 thread it registers. Every page of the process itself, at least 55 (its address-space and `CSpace`
 slabs, its thread, its `ProcessInfo` page and the rest of its image), is requested on its own
-account and charged to its own node, in its creator's subtree, so procmgr's share is at most 0.75%
+account and charged to its own node, in its creator's subtree, so procmgr's share is at most 0.85%
 of what that node pays, and it goes with the process. A create the max of the child's node or of an
 ancestor refuses fails with procmgr's `LIMIT`
 ([services/procmgr/docs/ipc-interface.md](../../procmgr/docs/ipc-interface.md) § Label 1,

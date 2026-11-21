@@ -719,6 +719,36 @@ impl Paging
     }
 }
 
+/// Whether a child's image may be shared with the binary's other instances
+/// (services/procmgr/README.md § Image Sharing). A child shares by default;
+/// it is loaded private when the caller set
+/// `procmgr_labels::CREATE_PRIVATE_IMAGE`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Sharing
+{
+    /// Attaches the binary's image object where it can.
+    Shared,
+    /// Loaded private whole.
+    Private,
+}
+
+impl Sharing
+{
+    /// The sharing a create request's `label` asks for.
+    #[must_use]
+    pub const fn of_label(label: u64) -> Self
+    {
+        if label & ipc::procmgr_labels::CREATE_PRIVATE_IMAGE == 0
+        {
+            Self::Shared
+        }
+        else
+        {
+            Self::Private
+        }
+    }
+}
+
 /// TLS template metadata extracted from a child's `PT_TLS` segment,
 /// propagated verbatim into `ProcessInfo` for spawned-thread block
 /// population. `memsz == 0` signals "binary has no TLS segment".
@@ -2015,7 +2045,7 @@ fn segment_prot(seg: &elf::LoadSegment) -> u64
 #[expect(
     clippy::too_many_arguments,
     reason = "grouping these into a struct would add complexity without reducing call sites — this \
-              helper is called from exactly two places"
+              helper is called from one place"
 )]
 fn finalize_creation(
     child_aspace: u64,
@@ -2035,6 +2065,7 @@ fn finalize_creation(
     sched: ChildSched,
     image: ImageSpan,
     image_ref: u64,
+    image_key: ImageKey,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
     self_aspace: u64,
@@ -2154,6 +2185,8 @@ fn finalize_creation(
         end_correlator: 0,
         image_ref,
         ended_with: None,
+        image_key,
+        quiesce: process_table::quiesce::Quiesce::for_child(paged, sched.budget.phys),
     });
     if let Err(e) = inserted
     {
@@ -2700,8 +2733,9 @@ fn relro_page_range(va: u64, size: u64, bias: u64) -> Option<(u64, u64)>
 
 /// Create a process from an in-memory ELF byte slice (suspended).
 ///
-/// A demand-paged child of a binary whose body `image_key` names attaches
-/// its segments that are not writable shared from the binary's image object
+/// `image_key` names the binary by its verified body, which the child's
+/// entry keeps. Under [`Sharing::Shared`], a demand-paged child attaches its segments
+/// that are not writable shared from the binary's image object
 /// ([`share_image`]), and has its writable segments loaded private; any
 /// other child, or one whose object cannot be had, has every segment loaded
 /// private (services/procmgr/README.md § Image Sharing).
@@ -2746,7 +2780,8 @@ pub fn create_process_from_bytes(
     deaths: &Mutex<DeathSet>,
     parent_relay_cap: u64,
     sched: ChildSched,
-    image_key: Option<&ImageKey>,
+    image_key: &ImageKey,
+    sharing: Sharing,
     ipc_buf: *mut u64,
 ) -> Result<CreateResult, u64>
 {
@@ -2834,7 +2869,7 @@ pub fn create_process_from_bytes(
         &segments,
         module_bytes,
         bias,
-        image_key,
+        (sharing == Sharing::Shared).then_some(image_key),
         universals.paging,
         ipc_buf,
     );
@@ -3064,6 +3099,7 @@ pub fn create_process_from_bytes(
         sched,
         image,
         shared.as_ref().map_or(0, |s| s.object.id()),
+        *image_key,
         ipc_buf,
         &layout,
         self_aspace,
@@ -3862,6 +3898,11 @@ pub fn teardown_entry(
     if entry.debugger != 0
     {
         let _ = syscall::cap_delete(entry.debugger);
+    }
+    let quiesce_notify = entry.end_quiesce();
+    if quiesce_notify != 0
+    {
+        let _ = syscall::cap_delete(quiesce_notify);
     }
     if entry.tls_memory_cap != 0
     {

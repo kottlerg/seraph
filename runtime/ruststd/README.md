@@ -739,8 +739,9 @@ does not trust to answer, as crashd bounds a fault's report and a core dump
   ([docs/ipc-design.md](../../docs/ipc-design.md)), and none is made once the deadline has passed:
   the calls of `std::fs` and of the `std::os::seraph` file and namespace functions,
   `std::process`'s spawn, `std::time::SystemTime::now`, `std::os::seraph::registry::lookup`,
-  `std::os::seraph::read_verified`, and the system log (`log!`, stderr, a panic's message), whose
-  own bound (`LOG_CALL_TIMEOUT_MS`) the time left shortens. A call that reaches the deadline fails
+  `std::os::seraph::read_verified`, `std::os::seraph::checkpoint::take`, and the system log
+  (`log!`, stderr, a panic's message), whose own bound (`LOG_CALL_TIMEOUT_MS`) the time left
+  shortens. A call that reaches the deadline fails
   as its API reports a failed call: `io::ErrorKind::TimedOut` where it returns `io::Result`,
   `UNIX_EPOCH` from `SystemTime::now`, `None` from the registry lookup, and a dropped line from
   the log. Such a call may have reached its server, which may have acted on it, and whose reply
@@ -757,7 +758,10 @@ does not trust to answer, as crashd bounds a fault's report and a core dump
   child down, which nothing else releases: a call that only gives back what a failed operation
   took is not cut by that operation's deadline, so a spawn whose deadline passed may still wait
   for that teardown. The same teardown of a child whose `Child` is dropped without a wait, which
-  nothing else releases either; `Child::kill` is bounded and fails `TimedOut`. Every wait that is
+  nothing else releases either; `Child::kill` is bounded and fails `TimedOut`. The `QUIESCE` calls
+  with which `checkpoint::quiesce` enters and ends its point (§ Checkpoint): a call the deadline cut
+  could leave procmgr recording a point the thread has left. The release of a `Checkpoint` on its
+  drop, which nothing else releases. Every wait that is
   not an IPC call: a thread's join, a child's wait, a pipe, a sleep, a lock. A caller that needs a
   bound on calls of its own passes `call_time_left` to them, as `ipc::ipc_call_within` takes it.
 - **Scope.** A deadline set inside `f` takes effect only when it is earlier than the one in force.
@@ -767,8 +771,9 @@ does not trust to answer, as crashd bounds a fault's report and a core dump
   procmgr's answer.
 
 The runtime makes each bounded call through one helper that reads the deadline (`deadline_call`),
-and the unbounded ones through two others, one for memmgr (`memmgr_call`) and one for the
-teardown (`destroy_process_call`), all in `src/os/seraph.rs`.
+and the unbounded ones through three others, one for memmgr and the objects it serves
+(`memmgr_call`), one for the teardown (`destroy_process_call`), and one for the quiesce point
+(`checkpoint::quiesce_call`), all in `src/os/seraph.rs`.
 
 ---
 
@@ -842,6 +847,45 @@ pressure):
 
 A process that registers another Notification itself replaces the runtime's, which memmgr then
 signals no more.
+
+---
+
+## Checkpoint
+
+`std::os::seraph::checkpoint` is the process's side of the checkpoint protocol
+([docs/checkpoint-restore.md](../../docs/checkpoint-restore.md) § Quiesce point, § Checkpoint):
+
+- `quiesce(timeout)` quiesces the process at the call, for its controller to take a checkpoint
+  of it. It is refused, capturing nothing, off the main thread (`InvalidInput`), in a process that
+  is not demand-paged or that procmgr refuses as one no restore can reproduce (`Unsupported`), and
+  while a resource a restore cannot reproduce is held (`ResourceBusy`). Otherwise it creates a
+  Notification, sends procmgr `QUIESCE` with a Notify-only derivation of it and an address in its
+  own frame as the restore stack pointer, waits on the Notification for at most `timeout` (without
+  bound for a `timeout` past `Instant`'s range), and then sends the `QUIESCE` that ends the point,
+  made again while it is interrupted, so the thread returns only after procmgr has ended it. Both
+  calls are made outside any call deadline (§ Call deadline), and a failed entry is followed by an
+  end, since it may have reached procmgr. It returns `Quiesced::Captured` when the Notification was
+  signalled, its controller then holding a complete checkpoint of the point, and
+  `Quiesced::NotCaptured` otherwise.
+- `take(process_handle)` sends procmgr `CHECKPOINT` on a process handle
+  ([Child process handles](#child-process-handles)), with a copy of the caller's own memmgr
+  endpoint as the account the checkpoint is charged to, and returns a `Checkpoint`: the object's
+  pages, whether the capture is complete, and its handle, which `into_raw` hands over and a drop
+  releases (`OBJECT_RELEASE`, made again while a stop interrupts it, since nothing else releases
+  it). A process at no quiesce point is refused `ResourceBusy`.
+
+The resources `quiesce` refuses are counted by values that live as long as each resource: a
+thread the application spawned, until its cleanup has run (`src/sys/thread/seraph.rs`), an open
+`std::fs::File`, a held `std::process::Child`, and an open pipe end other than the process's own
+stdio, which `_start` attaches for the life of the process. The counter is a zero-sized field of
+the resource, so it adds no bytes to it. The runtime's own threads, the fs release handler and a
+child's death bridge, are spawned through `thread::runtime_spawn` and not counted: they are idle
+at their wait whenever the counters are zero.
+
+The runtime keeps no resume record yet, and `quiesce` returns no `Restored`: the restore entry
+comes with procmgr's restore creation
+([docs/checkpoint-restore.md](../../docs/checkpoint-restore.md#implementation-status)
+§ Implementation Status).
 
 ---
 

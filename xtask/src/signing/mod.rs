@@ -381,7 +381,7 @@ impl Signer
 /// When `object` ends in the trailer magic but does not parse; a trailer of
 /// another format version is refused naming the version as the reason, since
 /// a sysroot an earlier tree signed holds such objects until a build installs
-/// them again.
+/// them again or a clean removes them.
 pub fn body_of(object: &[u8]) -> Result<&[u8]>
 {
     match objsig::split(object)
@@ -391,7 +391,8 @@ pub fn body_of(object: &[u8]) -> Result<&[u8]>
         Err(ParseError::Version) => bail!(
             "the object ends in a signature trailer of a format version this tree does not \
              read, as an object an earlier tree signed does: run `cargo xtask build` to \
-             install it again (docs/signing.md § Composite Signature)"
+             install it again, or `cargo xtask clean` when no build of this tree installs it \
+             (docs/signing.md § Composite Signature)"
         ),
         Err(e) => bail!("the object ends in a malformed signature trailer ({e:?})"),
     }
@@ -1002,7 +1003,8 @@ mod tests
     // Defect caught: an image ending in a damaged trailer signed whole, so
     // the damaged trailer becomes part of the signed body; an object an
     // earlier tree signed, whose footer carries another format version,
-    // refused without naming the build that installs it again.
+    // refused without naming the build that installs it again or the clean
+    // that removes one no build installs.
     #[test]
     fn an_object_ending_in_a_malformed_trailer_is_refused()
     {
@@ -1021,10 +1023,9 @@ mod tests
             let error = signer
                 .sign(&object, set(&[Role::Service]), "/services/x")
                 .unwrap_err();
-            assert!(
-                format!("{error:#}").contains("cargo xtask build"),
-                "{error:#}"
-            );
+            let error = format!("{error:#}");
+            assert!(error.contains("cargo xtask build"), "{error}");
+            assert!(error.contains("cargo xtask clean"), "{error}");
         }
         let mut object = good;
         object[version - 2] = 0;

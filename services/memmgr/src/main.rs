@@ -22,10 +22,10 @@ use free_pool::{
     ArenaLayout, Attachment, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Evict,
     Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node,
     NodeError, NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureBits, PressureLevel,
-    PressureSignal, RecheckBudget, RegionError, ResidentMode, ResidentPath, ResizeError, SealError,
-    SelectError, Share, SlotStore, WordStore, ZERO_FRAME_SPAN, arena::Slot, chunk::table_height,
-    chunk_count, chunk_for, commit::grow_need, commit::regrow_need, fault_window, pending_from,
-    region_grants, reserve_pages,
+    PressureSignal, RecheckBudget, RegionError, ResidentPath, ResizeError, SealError, SelectError,
+    Share, SlotStore, WordStore, ZERO_FRAME_SPAN, arena::Slot, chunk::table_height, chunk_count,
+    chunk_for, commit::grow_need, commit::regrow_need, fault_window, pending_from, region_grants,
+    reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -33,6 +33,7 @@ use syscall_abi::{
     FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE, SyscallError,
 };
 
+mod capture;
 mod disk;
 mod evict;
 
@@ -2314,7 +2315,7 @@ const MAKE_RESIDENT_VISITS: u32 = 64;
 /// lost one is ([`free_pool::resident_path`]): memmgr reads no slot and waits
 /// on no swap service. procmgr alone sends it, for a holder of its debug
 /// authority. Words are `[badge, va, len]`, the process named by its memmgr
-/// badge, and an optional fourth, the flags. The walk visits only the chunks that have an entry
+/// badge. The walk visits only the chunks that have an entry
 /// ([`free_pool::Ledger::next_chunk_with_entry`]), and an attachment's
 /// chunks in turn, and stops after [`MAKE_RESIDENT_CHUNKS`] chunks made
 /// resident, an origin map counting as one, or [`MAKE_RESIDENT_VISITS`]
@@ -2326,12 +2327,6 @@ const MAKE_RESIDENT_VISITS: u32 = 64;
 /// swap service has had time to restore it. Word 2 is where the walk stopped,
 /// past every chunk it posted, from which a sender that will wait no longer
 /// asks again, leaving the posted chunks not present.
-///
-/// With `memmgr_labels::RESIDENT_REPORT` in the flags ([`ResidentMode::Report`]),
-/// sent by procmgr while it holds the process's space for `SNAPSHOT`, the walk
-/// posts nothing and fails nothing: it stops at the first chunk on disk or lost,
-/// or whose restore or origin map fails, and replies it in words 3 to 5
-/// ([`reply_resident`]), the walk going on from its end at the next request.
 fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
@@ -2341,8 +2336,7 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     }
     let (va, len) = (req.word(1), req.word(2));
     let l = ledger_mut();
-    let (Some(rec), Some(end), Some(resident_mode)) =
-        (l.find(req.word(0)), va.checked_add(len), resident_mode(req))
+    let (Some(rec), Some(end)) = (l.find(req.word(0)), va.checked_add(len))
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -2353,37 +2347,6 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     }
-    match resident_walk(l, rec, va, end, resident_mode)
-    {
-        Some(walk) => reply_resident(ipc_buf, va, walk),
-        None => reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT),
-    }
-}
-
-/// Where a `MAKE_RESIDENT` walk stopped ([`resident_walk`]).
-#[derive(Clone, Copy)]
-struct ResidentWalk
-{
-    /// Where the walk stopped: the range's end when it is all done, else
-    /// where the next request goes on from.
-    reached: u64,
-    /// The base of the first chunk posted to the swap service, if any.
-    pending: Option<u64>,
-    /// The chunk a `RESIDENT_REPORT` request stopped at, if any.
-    reported: Option<Reported>,
-}
-
-/// The walk of a `MAKE_RESIDENT` request of the process `rec` over
-/// `[va, end)` in `resident_mode` ([`handle_make_resident`]); `None` when a
-/// chunk of a waiting request could not be made resident.
-fn resident_walk(
-    l: &mut MemLedger,
-    rec: NodeIdx,
-    va: u64,
-    end: u64,
-    resident_mode: ResidentMode,
-) -> Option<ResidentWalk>
-{
     let aspace = l.aspace_cap(rec);
     let wants = disk::wants_registered();
     let mut at = va & !(PAGE_SIZE - 1);
@@ -2426,15 +2389,17 @@ fn resident_walk(
             break;
         }
         let entry = l.chunk_at(reg, chunk_base);
-        let path = free_pool::resident_path(&entry, wants, resident_mode);
-        // A chunk the walk cannot make resident fails a waiting request and
-        // ends a reporting one, which names it.
-        let mut failed = match path
+        let path = free_pool::resident_path(&entry, wants);
+        match path
         {
             ResidentPath::Restore =>
             {
+                if evict::make_resident(l, rec, reg, &node.region, chunk_base, aspace).is_err()
+                {
+                    reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+                    return;
+                }
                 made = made.saturating_add(1);
-                evict::make_resident(l, rec, reg, &node.region, chunk_base, aspace).is_err()
             }
             // The swap service reads the slot and restores the chunk ahead of
             // a fault; the reply sends the reader back here.
@@ -2444,107 +2409,53 @@ fn resident_walk(
                 {
                     pending.get_or_insert(chunk_base);
                 }
-                false
             }
-            ResidentPath::Report => true,
-            ResidentPath::Skip | ResidentPath::PassOver => false,
-        };
-        let chunk_end = chunk_base.saturating_add(u64::from(chunk_pages).saturating_mul(PAGE_SIZE));
-        at = chunk_end;
+            ResidentPath::Skip | ResidentPath::PassOver =>
+            {}
+        }
+        at = chunk_base.saturating_add(u64::from(chunk_pages).saturating_mul(PAGE_SIZE));
         // In a resident chunk of an attachment, the read maps the origin over
         // the span around `next` no copy backs, and the walk goes on from its
         // end; a page with a copy is passed.
-        if !failed
-            && let Some(att) = attachment
+        if let Some(att) = attachment
             && matches!(path, ResidentPath::Skip | ResidentPath::Restore)
         {
-            match resident_origin(l, rec, reg, &node.region, att, next, aspace)
+            let Ok((resume, mapped)) =
+                resident_origin(l, rec, reg, &node.region, att, next, aspace)
+            else
             {
-                Ok((resume, mapped)) =>
-                {
-                    made = made.saturating_add(u32::from(mapped));
-                    at = resume;
-                }
-                Err(_) => failed = true,
-            }
-        }
-        if failed
-        {
-            if resident_mode == ResidentMode::Wait
-            {
-                return None;
-            }
-            // The chunk within the range, with its region's protection; the
-            // next request goes on from its end.
-            let reported = Reported {
-                va: chunk_base.max(va & !(PAGE_SIZE - 1)),
-                end: chunk_end.min(end),
-                prot: node.region.prot,
+                reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+                return;
             };
-            return Some(ResidentWalk {
-                reached: reported.end,
-                pending,
-                reported: Some(reported),
-            });
+            made = made.saturating_add(u32::from(mapped));
+            at = resume;
         }
     }
     // A walk that ran out of regions, or of the range, is done; one the
     // bounds stopped resumes at `at`.
     let bounded = made >= MAKE_RESIDENT_CHUNKS || visits >= MAKE_RESIDENT_VISITS;
-    Some(ResidentWalk {
-        reached: if bounded { at.min(end) } else { end },
+    reply_resident(
+        ipc_buf,
+        va,
+        if bounded { at.min(end) } else { end },
         pending,
-        reported: None,
-    })
+    );
 }
 
-/// The mode a `MAKE_RESIDENT` request's optional flags word asks for, or
-/// `None` for a flag bit not defined.
-fn resident_mode(req: &IpcMessage) -> Option<ResidentMode>
+/// Reply to a `MAKE_RESIDENT` request from `va` whose walk stopped at
+/// `reached`, `pending` being the base of the first chunk it posted to the
+/// swap service, if any ([`handle_make_resident`]).
+fn reply_resident(ipc_buf: *mut u64, va: u64, reached: u64, pending: Option<u64>)
 {
-    match if req.word_count() > 3 { req.word(3) } else { 0 }
-    {
-        0 => Some(ResidentMode::Wait),
-        memmgr_labels::RESIDENT_REPORT => Some(ResidentMode::Report),
-        _ => None,
-    }
-}
-
-/// A chunk a `RESIDENT_REPORT` request could not make resident: `[va, end)`,
-/// clipped to the request's range, and its region's protection.
-#[derive(Clone, Copy)]
-struct Reported
-{
-    va: u64,
-    end: u64,
-    prot: u64,
-}
-
-/// Reply to a `MAKE_RESIDENT` request from `va` whose walk is `walk`: where
-/// it stopped, the first chunk it posted to the swap service, if any, and the
-/// chunk a `RESIDENT_REPORT` request stopped at, if any, in words 3 to 5
-/// ([`handle_make_resident`]).
-fn reply_resident(ipc_buf: *mut u64, va: u64, walk: ResidentWalk)
-{
-    let ResidentWalk {
-        reached,
-        pending,
-        reported,
-    } = walk;
     let (from, flag) = match pending
     {
         Some(base) => (pending_from(base, va), memmgr_labels::RESIDENT_PENDING),
         None => (reached, 0),
     };
-    let (start, len, prot) =
-        reported.map_or((0, 0, 0), |r| (r.va, r.end.saturating_sub(r.va), r.prot));
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, from)
         .word(1, flag)
         .word(2, reached)
-        .word(3, start)
-        .word(4, len)
-        .word(5, prot)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -4858,16 +4769,17 @@ fn delete_caps(caps: &[u64])
 
 /// Number of attached caps, counted from `caps[0]`, that the contract of the
 /// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
-/// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`, the first two
-/// for `NODE_REGISTER_LIMIT` and `SWAP_REGISTER`, the first for
-/// `DELEGATE_ASPACE`, `REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_TAKE`,
-/// `SWAP_RESTORE` and `ATTACH_OBJECT`, none for any other label.
+/// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS` and
+/// `CAPTURE_CHUNKS`, the first two for `NODE_REGISTER_LIMIT` and
+/// `SWAP_REGISTER`, the first for `DELEGATE_ASPACE`, `REGISTER_PRESSURE`,
+/// `REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE` and `ATTACH_OBJECT`, none
+/// for any other label.
 /// [`dispatch`] deletes the rest.
 fn contract_cap_count(opcode: u64, attached: usize) -> usize
 {
     match opcode
     {
-        memmgr_labels::DONATE_MEMORY_CAPS => attached,
+        memmgr_labels::DONATE_MEMORY_CAPS | memmgr_labels::CAPTURE_CHUNKS => attached,
         memmgr_labels::DELEGATE_ASPACE
         | memmgr_labels::REGISTER_PRESSURE
         | memmgr_labels::REGISTER_PROCESS
@@ -4983,9 +4895,11 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         {
             handle_discard_range(req, ipc_buf);
         }
-        memmgr_labels::MAKE_RESIDENT =>
+        memmgr_labels::MAKE_RESIDENT
+        | memmgr_labels::MAKE_PRIVATE
+        | memmgr_labels::CAPTURE_CHUNKS =>
         {
-            handle_make_resident(req, ipc_buf, boot.procmgr_badge);
+            route_procmgr(opcode, req, kept, ipc_buf, boot.procmgr_badge);
         }
         memmgr_labels::NODE_SET_MAX =>
         {
@@ -5015,14 +4929,22 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         {
             route_object(opcode, req, kept, ipc_buf, boot.service_ep);
         }
-        memmgr_labels::MAKE_PRIVATE =>
-        {
-            handle_make_private(req, ipc_buf, boot.procmgr_badge);
-        }
         _ =>
         {
             reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         }
+    }
+}
+
+/// Hand a request of a label only procmgr's badge may send (`MAKE_RESIDENT`,
+/// `MAKE_PRIVATE`, `CAPTURE_CHUNKS`) to its handler, which checks the badge.
+fn route_procmgr(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, procmgr_badge: u64)
+{
+    match opcode
+    {
+        memmgr_labels::MAKE_RESIDENT => handle_make_resident(req, ipc_buf, procmgr_badge),
+        memmgr_labels::MAKE_PRIVATE => handle_make_private(req, ipc_buf, procmgr_badge),
+        _ => capture::handle_capture_chunks(req, kept, ipc_buf, procmgr_badge),
     }
 }
 

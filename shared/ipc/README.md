@@ -38,6 +38,8 @@ shared/ipc/
     ├── sched_policy.rs ...     # One file per table module: sched_policy, published_names,
     │                           #   log_badges, keysym, memmgr_bootstrap, device_info_kind,
     │                           #   procmgr_process_state
+    ├── memmgr_capture.rs       # CAPTURE_CHUNKS wire format: Descriptor, Supply, dest_spans
+    ├── procmgr_snapshot.rs     # Layout of the memory object procmgr's SNAPSHOT replies with
     ├── devmgr_client.rs        # report_driver_ready, query_device, watch_class,
     │                           #   refresh_device, ...
     ├── devmgr_dma_client.rs    # dma_map, dma_unmap, dma_faults

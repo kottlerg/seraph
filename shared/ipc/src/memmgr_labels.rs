@@ -462,7 +462,6 @@ pub const DISCARD_RANGE: u64 = 20;
 ///   reply).
 /// * `data[1]` — `va`.
 /// * `data[2]` — `len_bytes` (nonzero).
-/// * `data[3]` — optional flags: [`RESIDENT_REPORT`], or 0 when absent.
 ///
 /// memmgr makes at most a few chunks resident per request and walks only
 /// the chunks that have an entry. A chunk on disk it cannot restore itself:
@@ -480,8 +479,8 @@ pub const DISCARD_RANGE: u64 = 20;
 /// else past every chunk on disk memmgr posted, from which a reader that will
 /// wait no longer asks again, passing those chunks over;
 /// `UNAUTHORIZED` (caller is not procmgr);
-/// `INVALID_ARGUMENT` (unknown badge, zero length, a range
-/// past the address space, or a flag bit not defined); or `OUT_OF_MEMORY_BEST_EFFORT` (a chunk could
+/// `INVALID_ARGUMENT` (unknown badge, zero length, or a range
+/// past the address space); or `OUT_OF_MEMORY_BEST_EFFORT` (a chunk could
 /// not be restored, for want of free RAM or a map). Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 21: `MAKE_RESIDENT`.
 pub const MAKE_RESIDENT: u64 = 21;
@@ -489,18 +488,6 @@ pub const MAKE_RESIDENT: u64 = 21;
 /// slot word it posted to the swap service; the sender asks again from
 /// `data[0]` once the swap service has had time to restore it.
 pub const RESIDENT_PENDING: u64 = 1;
-/// [`MAKE_RESIDENT`] request `data[3]` bit: report each chunk memmgr cannot
-/// make resident in the request's turn instead of waiting on it or failing.
-/// memmgr posts no chunk on disk to the swap service and replies no
-/// `OUT_OF_MEMORY_BEST_EFFORT`: it stops at the first chunk of the range that
-/// is on disk or lost, or whose restore or origin map fails, and replies it in
-/// `data[3]` (its first address within the range), `data[4]` (its length in
-/// bytes within the range, nonzero) and `data[5]` (its region's protection,
-/// `MAP_*` bits), with `data[0]` and `data[2]` the chunk's end, from which
-/// the sender asks again; `data[4]` is `0` when no chunk is reported. procmgr
-/// sets it while it holds the target's space for `SNAPSHOT`, which waits on
-/// no other process.
-pub const RESIDENT_REPORT: u64 = 1;
 /// Swap authority only ([`SWAP_AUTHORITY`]): register the swap service.
 /// `caps[0`] is a SEND on the endpoint memmgr redirects each fault on an
 /// on-disk chunk to; `data[0]` the swap slots the service's partition holds,
@@ -644,6 +631,49 @@ pub const OBJECT_RELEASE: u64 = 29;
 /// could not be made or mapped). Specified in `services/memmgr/docs/ipc-interface.md` § Label 30:
 /// `MAKE_PRIVATE`.
 pub const MAKE_PRIVATE: u64 = 30;
+/// Procmgr-only: copy the content of a process's demand chunks into Memory
+/// caps the request carries, wherever memmgr holds it, for `SNAPSHOT`
+/// (`procmgr_labels::SNAPSHOT`). memmgr walks the chunks with an entry of the
+/// process's demand regions in `[cursor, end)`, attachments passed over, and
+/// for each writes its backed pages, in page order, into the next pages of the
+/// destination: from its frames when it is resident, being evicted, or raw,
+/// and decoded from its store when it is compressed. It maps nothing into the
+/// process, draws no frame, and evicts nothing. A chunk on disk it posts to
+/// the swap service, as [`MAKE_RESIDENT`] does, and reports pending; a lost
+/// one, one on disk with no swap service to ask, and one it cannot read (its
+/// stored bytes fail to decode, or its frames or store runs cannot be mapped)
+/// it reports absent.
+///
+/// Wire format (`crate::memmgr_capture`):
+/// * `data[0]` — the process's memmgr badge (from its `REGISTER_PROCESS`
+///   reply).
+/// * `data[1]` — the cursor, where the walk starts.
+/// * `data[2]` — the end, past the cursor.
+/// * `data[3]` — flags: [`CAPTURE_COUNT`], or 0.
+/// * `data[4]` — the page offset into `caps[0]` where the destination starts.
+/// * `data[5 + i]` — the destination pages of `caps[i]`, from that offset for
+///   `caps[0]`.
+/// * `caps[0..4]` — Memory caps with the map and write rights, which memmgr
+///   deletes once it has served the request.
+///
+/// Reply: `memmgr_errors::SUCCESS` with `data[0]` the cursor the next
+/// request goes on from (the end when the walk is done), `data[1]` the
+/// destination pages written, `data[2]` the destination pages the chunk at
+/// `data[0]` needs when the walk stopped for want of them (else 0),
+/// `data[3]` the descriptor count, and the descriptors from `data[4]`
+/// (`memmgr_capture::Descriptor`). With [`CAPTURE_COUNT`]: `data[0]` the
+/// cursor, `data[1]` the backed pages of the evicted chunks walked, lost ones
+/// aside, and `data[2]` the chunks on disk walked whose slot word memmgr
+/// posted. `UNAUTHORIZED` (caller is not procmgr); `INVALID_ARGUMENT`
+/// (unknown badge, an end not past the cursor, a flag bit not defined, or a
+/// page count missing for a cap); `OUT_OF_MEMORY_BEST_EFFORT` (a destination
+/// page could not be mapped). Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 31: `CAPTURE_CHUNKS`.
+pub const CAPTURE_CHUNKS: u64 = 31;
+/// [`CAPTURE_CHUNKS`] request `data[3]` bit: copy nothing, count the backed
+/// pages of the evicted chunks and the chunks on disk, posting each chunk on
+/// disk to the swap service. The request carries no cap.
+pub const CAPTURE_COUNT: u64 = 1;
 
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or above the low threshold.

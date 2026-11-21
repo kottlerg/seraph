@@ -1399,11 +1399,16 @@ pub(crate) fn read_store(l: &mut MemLedger, entry: ChunkEntry, dst: &mut [u8]) -
     copied
 }
 
-/// Copy the backed pages of the raw chunk holding `page_base` in region
-/// `reg` of `rec`, in page order, into `dst`, for its write
-/// (`crate::disk`): its runs mapped at the stream window, each at its offset
-/// in the chunk. Returns the bytes copied, or `None`, nothing copied, when
-/// the chunk has no region, a map fails, or they do not fit `dst`.
+/// Copy the backed pages of the chunk holding `page_base` in region `reg` of
+/// `rec`, whose runs hold them (a resident chunk, one being evicted, or a raw
+/// one), in page order, into `dst`, for a raw chunk's write (`crate::disk`)
+/// or a capture (`crate::capture`): its runs mapped at the stream window,
+/// each at its offset in the chunk. A resident chunk's pages the process maps:
+/// the capture's caller holds its space (`SYS_ASPACE_HOLD`), so no thread of
+/// it writes them, but a device may, and the copy reads each page word by word
+/// with volatile reads, taking what stands. Returns the bytes copied, or
+/// `None`, nothing copied, when the chunk has no region, a map fails, or they
+/// do not fit `dst`.
 pub(crate) fn read_raw(
     l: &mut MemLedger,
     rec: NodeIdx,
@@ -1444,15 +1449,49 @@ pub(crate) fn read_raw(
         for (page, to) in held.zip(out.iter_mut())
         {
             let from = STREAM_VA.saturating_add(u64::from(page).saturating_mul(PAGE_SIZE));
-            // SAFETY: each backed page of the chunk lies in one of its runs,
-            // mapped above at its offset in the stream window; nothing writes
-            // the pages, which no process maps, while they are read.
-            to.copy_from_slice(unsafe { &*(from as *const [u8; PAGE_BYTES]) });
+            for (word, bytes) in to.as_chunks_mut::<8>().0.iter_mut().enumerate()
+            {
+                let at = from.saturating_add((word as u64).saturating_mul(8));
+                // SAFETY: each backed page of the chunk lies in one of its
+                // runs, mapped above at its offset in the stream window, and
+                // `at` is an aligned word of it. A process or a device that
+                // maps the page may write it meanwhile: the volatile read makes
+                // no reference to it and takes the word as it stands.
+                *bytes = unsafe { core::ptr::read_volatile(at as *const u64) }.to_ne_bytes();
+            }
         }
         bytes
     });
     unmap_stream(CHUNK_PAGES);
     copied
+}
+
+/// Decode the stream of the compressed chunk `entry`, writing or not, into
+/// `dst`, a page of it for each of the chunk's backed pages, in page order,
+/// for a capture (`crate::capture`): its store runs mapped at the stream
+/// window meanwhile, as [`fill_runs`] maps them. `false`, `dst` then holding
+/// part of the pages, when the store runs cannot be mapped, `dst` is no whole
+/// number of pages, or the stream does not give each of its pages whole.
+pub(crate) fn decode_store(l: &mut MemLedger, entry: ChunkEntry, dst: &mut [u8]) -> bool
+{
+    let mut store = [FreeRun::default(); CHUNK_RUNS];
+    let n = store_runs(l, entry, &mut store);
+    let Some(pages) = map_stream(l, store.get(..n).unwrap_or(&[]))
+    else
+    {
+        return false;
+    };
+    let bytes = usize::try_from(pages.saturating_mul(PAGE_SIZE)).unwrap_or(0);
+    // SAFETY: `map_stream` mapped `pages` pages at the stream window, which
+    // nothing writes while the stream is read, and the slice is not used past
+    // the unmap below; the empty stream maps none, and a slice of no bytes
+    // reads nothing.
+    let stream = unsafe { core::slice::from_raw_parts(STREAM_VA as *const u8, bytes) };
+    let mut reader = Decoder::new(stream);
+    let (whole, rest) = dst.as_chunks_mut::<PAGE_BYTES>();
+    let decoded = rest.is_empty() && whole.iter_mut().all(|page| reader.next_page(page).is_ok());
+    unmap_stream(pages);
+    decoded
 }
 
 /// Write every byte of every page of `runs`, in page order, from the stream of

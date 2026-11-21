@@ -54,6 +54,7 @@ pub fn dispatch(role: &str)
     phases::memmgr::reentry_main(role);
     phases::budget::reentry_main(role);
     phases::node_handle::reentry_main(role);
+    phases::charge_node::reentry_main(role);
     phases::node_reclaim::reentry_main(role);
     phases::heap_commit::reentry_main(role);
     phases::discard::reentry_main(role);
@@ -61,6 +62,7 @@ pub fn dispatch(role: &str)
     phases::memory_object_text::reentry_main(role);
     phases::image_sharing::reentry_main(role);
     phases::snapshot::reentry_main(role);
+    phases::checkpoint::reentry_main(role);
     phases::swap::reentry_main(role);
     phases::swap_commit::reentry_main(role);
     phases::unmount::reentry_main(role);

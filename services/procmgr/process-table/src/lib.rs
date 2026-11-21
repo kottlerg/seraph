@@ -51,6 +51,7 @@ pub mod fs_reads;
 pub mod image_share;
 pub mod init_reap;
 pub mod names;
+pub mod quiesce;
 pub mod request_caps;
 pub mod sign_policy;
 pub mod snapshot;
@@ -252,6 +253,14 @@ pub struct ProcessEntry
     /// reason, so every answer and post procmgr makes for one process carries
     /// one reason, whatever ended the process after the query read it.
     pub ended_with: Option<u64>,
+    /// The SHA-512 and length of the verified body the child was created
+    /// from, whether its image is shared or private, which a checkpoint
+    /// records (docs/checkpoint-restore.md § Checkpoint).
+    pub image_key: image_share::ImageKey,
+    /// Whether the child may quiesce, and the quiesce point it is at
+    /// (`QUIESCE`, [`quiesce`]). A teardown deletes the point's
+    /// Notification.
+    pub quiesce: quiesce::Quiesce,
 }
 
 /// Where the loader placed a child's image: the load bias it drew and the
@@ -604,6 +613,9 @@ pub struct ProcessTable
     /// The creates in progress ([`Self::reserve_badge`]): few, one per
     /// create a worker is serving.
     pending: Vec<Pending>,
+    /// The number of the last quiesce point recorded
+    /// ([`quiesce::QuiescePoint::generation`]).
+    quiesce_generation: u64,
 }
 
 impl ProcessTable
@@ -618,6 +630,7 @@ impl ProcessTable
             holds: DmaHolds::new(),
             crash_badges: CrashBadges::new(),
             pending: Vec::new(),
+            quiesce_generation: 0,
         }
     }
 
@@ -1559,9 +1572,10 @@ pub fn request_badge(badge: u64) -> (u64, bool)
 
 /// Whether procmgr serves `opcode` (a label's low 16 bits) on a process
 /// handle: every label but `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`,
-/// `REGISTER_THREAD`, `REGISTER_END_QUEUE` and `READ_VERIFIED`, which name
-/// their sender itself (`READ_VERIFIED` charges the copy to the sender's
-/// account) and are served on the process's own procmgr cap alone.
+/// `REGISTER_THREAD`, `REGISTER_END_QUEUE`, `READ_VERIFIED` and `QUIESCE`,
+/// which name their sender itself (`READ_VERIFIED` charges the copy to the
+/// sender's account, and `QUIESCE` is the process's own consent) and are
+/// served on the process's own procmgr cap alone.
 #[must_use]
 pub fn served_on_handle(opcode: u64) -> bool
 {
@@ -1572,14 +1586,16 @@ pub fn served_on_handle(opcode: u64) -> bool
             | ipc::procmgr_labels::REGISTER_THREAD
             | ipc::procmgr_labels::REGISTER_END_QUEUE
             | ipc::procmgr_labels::READ_VERIFIED
+            | ipc::procmgr_labels::QUIESCE
     )
 }
 
 /// Whether procmgr serves `opcode` on a process handle alone:
 /// `BIND_DEATH_OBSERVER`, through which only the child's creator chooses who
-/// observes the child's address space, and `LIST_CHILDREN` and
+/// observes the child's address space, `LIST_CHILDREN` and
 /// `DESTROY_CHILD`, whose authority is the handle's over the process and
-/// everything below it.
+/// everything below it, and `CHECKPOINT`, which only the process's
+/// controller takes.
 #[must_use]
 pub fn served_on_handle_only(opcode: u64) -> bool
 {
@@ -1588,6 +1604,7 @@ pub fn served_on_handle_only(opcode: u64) -> bool
         ipc::procmgr_labels::BIND_DEATH_OBSERVER
             | ipc::procmgr_labels::LIST_CHILDREN
             | ipc::procmgr_labels::DESTROY_CHILD
+            | ipc::procmgr_labels::CHECKPOINT
     )
 }
 
@@ -2104,7 +2121,7 @@ mod tests
         assert_eq!(resync_exit_reason(None, EXITED, None), None);
     }
 
-    fn entry_with_badge(badge: u64) -> ProcessEntry
+    pub(crate) fn entry_with_badge(badge: u64) -> ProcessEntry
     {
         ProcessEntry {
             badge,
@@ -2142,6 +2159,11 @@ mod tests
             end_correlator: 0,
             image_ref: 0,
             ended_with: None,
+            image_key: image_share::ImageKey {
+                hash: [0; 64],
+                len: 0,
+            },
+            quiesce: quiesce::Quiesce::Idle,
         }
     }
 
@@ -2595,6 +2617,20 @@ mod tests
         // The observer bind is the creator's: refused on any other cap.
         assert_eq!(sender_refusal(BIND_DEATH_OBSERVER, handle), None);
         assert_eq!(sender_refusal(BIND_DEATH_OBSERVER, own), Some(UNAUTHORIZED));
+        // Quiescing is the process's own consent, a checkpoint its controller's.
+        assert_eq!(
+            sender_refusal(ipc::procmgr_labels::QUIESCE, handle),
+            Some(INVALID_BADGE)
+        );
+        assert_eq!(sender_refusal(ipc::procmgr_labels::QUIESCE, own), None);
+        assert_eq!(
+            sender_refusal(ipc::procmgr_labels::CHECKPOINT, handle),
+            None
+        );
+        assert_eq!(
+            sender_refusal(ipc::procmgr_labels::CHECKPOINT, own),
+            Some(UNAUTHORIZED)
+        );
         // Every other label is served on both.
         assert_eq!(sender_refusal(QUERY_PROCESS, handle), None);
         assert_eq!(sender_refusal(QUERY_PROCESS, own), None);
@@ -3353,7 +3389,7 @@ mod tests
     #[test]
     fn the_per_process_state_has_the_documented_size()
     {
-        assert_eq!(core::mem::size_of::<ProcessEntry>(), 336);
+        assert_eq!(core::mem::size_of::<ProcessEntry>(), 440);
         assert_eq!(core::mem::size_of::<threads::RegisteredThread>(), 24);
     }
 

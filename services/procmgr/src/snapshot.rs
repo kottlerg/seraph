@@ -3,9 +3,11 @@
 
 // services/procmgr/src/snapshot.rs
 
-//! `SNAPSHOT`: capture a live process's pages into a memory object charged to
-//! the snapshotter (services/procmgr/docs/ipc-interface.md § Label 33:
-//! `SNAPSHOT`).
+//! `SNAPSHOT` and `CHECKPOINT`: capture a live process's pages into a memory
+//! object charged to the snapshotter (services/procmgr/docs/ipc-interface.md
+//! § Label 33: `SNAPSHOT`, § Label 35: `CHECKPOINT`). A checkpoint is the
+//! same capture, with the process's consent checked under the hold and a
+//! checkpoint section in the layout ([`Consent`]).
 //!
 //! Every request to memmgr names the target's image object, when procmgr
 //! shares one with it (`memmgr_labels::CAPTURE_IMAGE`), so memmgr reports the
@@ -46,8 +48,8 @@ use ipc::memmgr_capture::{
     Chunk, DESCRIPTOR_WORDS, DESCRIPTORS_MAX, Descriptor, REPLY_WORDS, REQUEST_WORDS,
 };
 use ipc::procmgr_snapshot::{
-    Header, IMAGE_HASH_BYTES, Image, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE, ThreadRecord,
-    threads_offset,
+    CHECKPOINT_BYTES, Checkpoint, Header, IMAGE_HASH_BYTES, Image, SNAPSHOT_CHECKPOINT,
+    SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE, ThreadRecord, threads_offset,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_table::snapshot::{Described, Layout, Listing, Placed, copied_pages, layout, outside};
@@ -159,6 +161,20 @@ pub struct TargetImage
     pub image: Image,
 }
 
+/// What a `CHECKPOINT` adds to a capture (docs/checkpoint-restore.md
+/// § Checkpoint).
+pub struct Consent<'a>
+{
+    /// Called under the hold: a copy of the Notification of the quiesce point
+    /// the request found, while the process is still at it; `NOT_QUIESCED`
+    /// when it left it, `INVALID_BADGE` when it ended, `OUT_OF_MEMORY` when
+    /// the copy cannot be had.
+    pub check: &'a mut dyn FnMut() -> Result<CapGuard, u64>,
+    /// The checkpoint section from the process's entry; the capture reads
+    /// the words its `ProcessInfo` names under the hold.
+    pub section: Checkpoint,
+}
+
 /// A capture's object: its handle, its pages, and whether no run is absent.
 pub struct Captured
 {
@@ -168,13 +184,19 @@ pub struct Captured
     pub pages: u64,
     /// No run of the layout is absent.
     pub complete: bool,
+    /// For a checkpoint, the copy of the quiesce point's Notification
+    /// ([`Consent::check`]); none for a `SNAPSHOT`.
+    pub notify: CapGuard,
 }
 
 /// Capture `target` into a memory object sealed on `account`, a memmgr
-/// SEND the snapshotter presents, which stays the caller's.
+/// SEND the snapshotter presents, which stays the caller's. With `consent`
+/// the capture is a checkpoint: right after the hold is taken it calls
+/// [`Consent::check`] and reads the target's `ProcessInfo`, and the layout
+/// carries the checkpoint section.
 ///
 /// # Errors
-/// `SPACE_HELD` when the target's space is held already or the hold was
+/// [`Consent::check`]'s code; `SPACE_HELD` when the target's space is held already or the hold was
 /// interrupted; `INVALID_BADGE` when the target ended before or during the
 /// capture; `LIMIT` when the max of the account's budget node or of an
 /// ancestor refused its frames ([`Grants::cover`]); `OUT_OF_MEMORY` when
@@ -182,7 +204,12 @@ pub struct Captured
 /// granted a run procmgr refuses, or the object would take more grants than
 /// one seal names, when memmgr failed a request, or when procmgr's heap or
 /// address space refused the capture's own memory.
-pub fn capture(ctx: &Context, target: &Target, account: u64) -> Result<Captured, u64>
+pub fn capture(
+    ctx: &Context,
+    target: &Target,
+    account: u64,
+    consent: Option<&mut Consent<'_>>,
+) -> Result<Captured, u64>
 {
     let account = Account {
         cap: account,
@@ -202,6 +229,18 @@ pub fn capture(ctx: &Context, target: &Target, account: u64) -> Result<Captured,
     let mut window = Window::new(ctx.self_aspace)?;
 
     let hold = Hold::take(target.aspace.cap())?;
+    // The process cannot leave its quiesce point while held: one that left it
+    // before may have written its memory since.
+    let (notify, checkpoint) = match consent
+    {
+        Some(consent) =>
+        {
+            let notify = (consent.check)()?;
+            let section = read_bootstrap(target.thread.cap(), consent.section)?;
+            (notify, Some(section))
+        }
+        None => (CapGuard::new(0), None),
+    };
     let listing = list(target.thread.cap(), top)?;
     let mut inside = Capture::default();
     inside.walk(ctx, target, (0, top), &mut data)?;
@@ -219,13 +258,24 @@ pub fn capture(ctx: &Context, target: &Target, account: u64) -> Result<Captured,
     drop(hold);
     drop(window);
 
-    let thread_bytes = threads.bytes().ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    let section_bytes = if checkpoint.is_some()
+    {
+        CHECKPOINT_BYTES as u64
+    }
+    else
+    {
+        0
+    };
+    let tail_bytes = threads
+        .bytes()
+        .and_then(|n| n.checked_add(section_bytes))
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let layout = layout(
         &outside,
         inside.filled,
         &failed,
         &inside.described,
-        thread_bytes,
+        tail_bytes,
     )
     .map_err(runs_code)?;
     data.keep(layout.data_pages);
@@ -235,6 +285,7 @@ pub fn capture(ctx: &Context, target: &Target, account: u64) -> Result<Captured,
         image: target.image.as_ref().map(|i| i.image),
         load_bias: target.load_bias,
         threads: &threads,
+        checkpoint,
     };
     write_layout(ctx.self_aspace, &head, &layout, &about)?;
     let (handle, pages) = seal(&account, head, data)?;
@@ -242,6 +293,49 @@ pub fn capture(ctx: &Context, target: &Target, account: u64) -> Result<Captured,
         handle,
         pages,
         complete: layout.complete,
+        notify,
+    })
+}
+
+/// `section` with the words the target's `ProcessInfo` names, read at
+/// `section.process_info_va` through its thread `thread`: its main
+/// thread's IPC buffer and its argv and env header. procmgr alone writes the
+/// page, which the process maps read-only.
+///
+/// # Errors
+/// `INVALID_BADGE` when the target ended; `OUT_OF_MEMORY` when the page
+/// cannot be read otherwise.
+fn read_bootstrap(thread: u64, section: Checkpoint) -> Result<Checkpoint, u64>
+{
+    let mut info = core::mem::MaybeUninit::<process_abi::ProcessInfo>::zeroed();
+    let len = core::mem::size_of::<process_abi::ProcessInfo>();
+    // SAFETY: the span is `info`'s own, `len` bytes, no Rust reference names
+    // it while the kernel writes it, and every field of `ProcessInfo` is an
+    // integer, valid for any byte value.
+    let copied = unsafe {
+        syscall::thread_read_mem_raw(
+            thread,
+            section.process_info_va,
+            info.as_mut_ptr().cast(),
+            len,
+        )
+    }
+    .map_err(target_code)?;
+    if copied != len as u64
+    {
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    }
+    // SAFETY: zeroed, then written in full, and any byte value is valid.
+    let info = unsafe { info.assume_init() };
+    Ok(Checkpoint {
+        ipc_buffer_va: info.ipc_buffer_vaddr,
+        args_offset: info.args_offset,
+        args_bytes: info.args_bytes,
+        args_count: info.args_count,
+        env_offset: info.env_offset,
+        env_bytes: info.env_bytes,
+        env_count: info.env_count,
+        ..section
     })
 }
 
@@ -1217,13 +1311,15 @@ impl Drop for Window
     }
 }
 
-/// What the layout's header and thread records say besides the runs: the
-/// image the capture names, the load bias, and the threads read.
+/// What the layout's header, thread records and checkpoint section say
+/// besides the runs: the image the capture names, the load bias, the threads
+/// read, and a checkpoint's section.
 struct About<'a>
 {
     image: Option<Image>,
     load_bias: u64,
     threads: &'a Threads,
+    checkpoint: Option<Checkpoint>,
 }
 
 /// Write `layout`, with what `about` says, into the frames of `head`,
@@ -1283,7 +1379,8 @@ fn write_layout(
 }
 
 /// Encode `layout`, with what `about` says, at the start of `bytes`: the
-/// header, the regions, the runs, then the thread records.
+/// header, the regions, the runs, the thread records, then a checkpoint's
+/// section.
 fn encode(bytes: &mut [u8], layout: &Layout, about: &About<'_>) -> Result<(), u64>
 {
     let image = about.image;
@@ -1298,6 +1395,10 @@ fn encode(bytes: &mut [u8], layout: &Layout, about: &About<'_>) -> Result<(), u6
     if image.is_some()
     {
         flags |= SNAPSHOT_IMAGE;
+    }
+    if about.checkpoint.is_some()
+    {
+        flags |= SNAPSHOT_CHECKPOINT;
     }
     let regions = layout.regions.len() as u64;
     let header = Header {
@@ -1332,6 +1433,13 @@ fn encode(bytes: &mut [u8], layout: &Layout, about: &About<'_>) -> Result<(), u6
     {
         at = thread
             .record()
+            .encode(bytes, at)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    }
+    // The section follows the thread records (`procmgr_snapshot::checkpoint_offset`).
+    if let Some(section) = about.checkpoint
+    {
+        section
             .encode(bytes, at)
             .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     }

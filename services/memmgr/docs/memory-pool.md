@@ -217,14 +217,16 @@ and never reclaims them. Each entry records:
   ([Memory pressure](#memory-pressure)), the head of the list of node
   handle states and memory objects the process owns
   ([Memory objects](#memory-objects)), and the head of the list of the limit
-  registrations it made ([Distribution policy](#distribution-policy)), and
+  registrations it made and of its donation-end registration
+  ([Distribution policy](#distribution-policy)), and
   the count of its pages that are swapped ([Eviction](#eviction)), all of
   which go with the record.
 - The next region id: a sequence from 1 that numbers the process's grants.
   Each grant's frame node keeps its id, which no later grant of the process
   reuses; bootstrap arenas and demand-fault runs carry none.
 - The index of its budget node (§ Distribution policy), to which every run on
-  the record and on its regions' chunk tables is charged. The three boot
+  the record and on its regions' chunk tables is charged, but a grant charged
+  to a node handle's node, whose frame node names that node instead. The three boot
   records have top-level reserve nodes with no max, so their bootstrap arenas
   are charged too.
 
@@ -402,7 +404,7 @@ process's entry until `PROCESS_DIED`.
 ## Metadata Arena
 
 All of memmgr's bookkeeping — free runs, deferred runs, process records and
-their budget nodes and the nodes' reclaim states, node handle states and limit
+their budget nodes and the nodes' reclaim states, node handle states, their holder links and limit
 registrations, per-process frame and region descriptors, and the regions' chunk tables — is
 nodes drawn from a self-hosted arena rather than fixed `.bss` arrays. memmgr
 is `no_std` and cannot bootstrap
@@ -410,7 +412,7 @@ a general heap against itself, but it *can* host fixed-size nodes in pages
 carved from its own pool:
 
 - Nodes are fixed-size `Slot`s (a tagged run, deferred run, budget, reclaim state, process,
-  process caps, node handle, limit registration, memory object, region,
+  process caps, node handle, holder link, limit registration, memory object, region,
   commitment, frame, chunk-directory, chunk, or free payload plus a `next`
   index)
   reached by a
@@ -608,8 +610,11 @@ the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process
    alive, so it goes before the reclaim: the frame then passes the quiescence
    check of step 4 instead of waiting on the deferred list.
 2. Recheck the deferred list.
-3. Drop the node handle states and memory objects the record owns
-   ([Memory objects](#memory-objects)), then remove the per-process record
+3. Send the donation-end Notification of each process holding grants charged
+   to the node of a node handle state the record owns
+   ([Distribution policy](#distribution-policy)), drop those states and the
+   memory objects the record owns ([Memory objects](#memory-objects)), then
+   remove the per-process record
    from the index. If absent (untracked badge), skip to step 6 — the death
    notification is idempotent.
 4. For each frame node in the record's frame list and on the run lists of
@@ -728,8 +733,9 @@ reservation, charged whole when the region is committed whether or not its pages
 ([Commit](#commit)), and each such run on the deferred list until it rejoins the free pool
 ([Reclamation](#reclamation)). What memmgr draws from the pool for its own metadata (arena and
 index pages, its page tables and its `CSpace` growth) is charged to no node. A node outlives its
-process while a node below it is alive, a run charged to it is on the deferred list, or a memory
-object's frames are charged to it ([Memory objects](#memory-objects)), and its charge stays in its
+process while a node below it is alive, a run charged to it is on the deferred list, a grant another
+process holds is charged to it (Node handles, below), or a memory object's frames are charged to it
+([Memory objects](#memory-objects)), and its charge stays in its
 parent's subtree meanwhile, so a process cannot hand its frames to another
 process, die, and free its subtree's budget while the frames stay held.
 
@@ -772,17 +778,19 @@ parent outside the reserve; procmgr relays the max the node took to the creator 
 usage with `QUERY_MEMORY_USAGE`.
 
 **Server-side charges.** Memory a server spends on a client's behalf is charged to the server's
-node, not to the client's. procmgr keeps, for each live process, its process-table entry (336
-bytes), 6 to 12 capability slots in procmgr's `CSpace` (72 bytes each) and two death-observer nodes
-(24 bytes each), about 0.8 to 1.6 KiB with the growth of their containers, and 96 bytes for each
+node, not to the client's. procmgr keeps, for each live process, its process-table entry (440
+bytes), 6 to 13 capability slots in procmgr's `CSpace` (72 bytes each) and two death-observer nodes
+(24 bytes each), about 0.9 to 1.8 KiB with the growth of their containers, and 96 bytes for each
 thread it registers. Every page of the process itself, at least 55 (its address-space and `CSpace`
 slabs, its thread, its `ProcessInfo` page and the rest of its image), is requested on its own
-account and charged to its own node, in its creator's subtree, so procmgr's share is at most 0.75%
+account and charged to its own node, in its creator's subtree, so procmgr's share is at most 0.85%
 of what that node pays, and it goes with the process. A create the max of the child's node or of an
 ancestor refuses fails with procmgr's `LIMIT`
 ([services/procmgr/docs/ipc-interface.md](../../procmgr/docs/ipc-interface.md) § Label 1,
 **Memory max and reserve**). vfsd keeps no per-client state: the capability a lookup derives
-leaves with its reply. fatfs keeps about 0.3 to 0.4 KiB for each open, and 104 bytes for each page
+leaves with its reply. A server can charge such state to its client instead, with a grant charged
+to the node of a charge-only handle the client hands it (Node handles, below); none does yet. fatfs
+keeps about 0.3 to 0.4 KiB for each open, and 104 bytes for each page
 of an open that is mapped and not yet returned, with no bound for one client; the client pays 144
 bytes of its own `CSpace` for the two capabilities an open hands it. A client can therefore make
 fatfs spend memory beyond the client's own max, bounded only by fatfs's node and the reserve. This
@@ -812,6 +820,22 @@ The limit registration, the Notification cap and its bits, is an arena node of i
 of its registrant, the process whose memmgr SEND the request carried: it goes when the registrant
 dies, when a later registration replaces it, or with the handle state, so no holder leaves a cap in
 memmgr past its own life.
+
+**Charged grants.** A holder of a node handle derives a charge-only handle to the node
+(`NODE_CHARGE_HANDLE`), which serves only that and `NODE_QUERY_USAGE`, and hands it to a server;
+the server charges a grant to the node by passing a copy with `REQUEST_CHARGE_NODE`
+([ipc-interface.md](ipc-interface.md) § Label 1), admitted against the node's chain and refused with
+`LIMIT` at its max. The grant's frame node stays on the server's record and names the node it is
+charged to, so its release, and the server's death, return the charge to that node. The handle
+state counts its holders: a holder link, an arena node on the state's list, names each process
+holding grants charged to the node and how many frame nodes it holds, and goes when the last of them
+returns or with the state. When the state goes, on `NODE_RELEASE` or at its owner's death, memmgr
+sends the donation-end Notification of each process on that list (`REGISTER_DONATION_END`), a
+registration with no handle state on the registrant's limit list, which goes with the registrant;
+the charges stay on the node, which outlives the state while they do, inside its parent's subtree,
+so neither the client nor the owner sheds them by releasing the node or dying, and no server holds
+frames charged to no node. `SEAL_OBJECT` refuses a charged grant, whose charge an object, which
+outlives its sealer, could not return.
 
 **Floors and weights.** A node handle also sets the node's floor and weight (`NODE_SET_RECLAIM`,
 [ipc-interface.md](ipc-interface.md) § Label 32), which divide eviction ([Eviction](#eviction))

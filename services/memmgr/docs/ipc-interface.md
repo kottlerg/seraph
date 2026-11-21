@@ -44,15 +44,18 @@ Two privilege classes:
   `QUERY_POOL_STATUS`, `REGISTER_REGION`, `UNREGISTER_REGION`,
   `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
   `SHRINK_REGION`, `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`,
-  `ATTACH_OBJECT`) are callable over any badged cap but a node handle or an
-  object handle, including those memmgr returned from `REGISTER_PROCESS`.
-  `REGISTER_REGION`, `UNREGISTER_REGION`, `QUERY_MEMORY_USAGE`,
-  `REGISTER_PRESSURE`, `EXTEND_REGION`, `SHRINK_REGION`, `CREATE_SUB_NODE`,
-  `DISCARD_RANGE`, `SEAL_OBJECT` and `ATTACH_OBJECT` are attributed to the
-  caller by its own badge.
+  `ATTACH_OBJECT`, `REGISTER_DONATION_END`) are callable over any badged cap
+  but a node handle or an object handle, including those memmgr returned from
+  `REGISTER_PROCESS`. `REGISTER_REGION`, `UNREGISTER_REGION`,
+  `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
+  `SHRINK_REGION`, `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`,
+  `ATTACH_OBJECT` and `REGISTER_DONATION_END` are attributed to the caller by
+  its own badge.
 - **Node** labels (`NODE_SET_MAX`, `NODE_CREATE`, `NODE_QUERY_USAGE`,
-  `NODE_REGISTER_LIMIT`, `NODE_RELEASE`, `NODE_SET_RECLAIM`) are callable only
-  over a node handle, and act on the budget node it names (§ Node Handles).
+  `NODE_REGISTER_LIMIT`, `NODE_RELEASE`, `NODE_SET_RECLAIM`,
+  `NODE_CHARGE_HANDLE`) are callable only over a node handle, and act on the
+  budget node it names (§ Node Handles); a charge-only handle is served
+  `NODE_QUERY_USAGE` and `NODE_CHARGE_HANDLE` alone.
 - **Swap** labels (`SWAP_REGISTER`, `SWAP_TAKE`, `SWAP_DONE`,
   `SWAP_RESTORE`, `SWAP_WANTED`) are callable only over the swap authority, a
   `SEND|GRANT` badged `SWAP_AUTHORITY` (bit 61) alone, which init mints on
@@ -69,11 +72,14 @@ authority pattern: it serves the node labels only on a badge that carries bit
 62, the swap labels only on one that carries bit 61, `OBJECT_RELEASE` only on
 one that carries bit 60, and every other label only on one that carries none
 of them, and replies `UNAUTHORIZED` otherwise, deleting any cap the message
-carries. No process badge carries any of them: memmgr draws a process badge
-with every verb bit of `ipc::VERB_BIT_MASK` (bits 58 to 63) clear but the
-phys-class bit 63, a node handle's key with them clear but bit 62, and an
-object handle's key with them clear but bit 60, and init mints procmgr's
-badge on memmgr's endpoint with all six clear.
+carries. A node handle whose badge also carries the charge-only bit
+`NODE_CHARGE_ONLY` (bit 59) is served `NODE_QUERY_USAGE` and
+`NODE_CHARGE_HANDLE` alone, and refused every other label the same way. No
+process badge carries any of them: memmgr draws a process badge with every
+verb bit of `ipc::VERB_BIT_MASK` (bits 58 to 63) clear but the phys-class bit
+63, a node handle's key with them clear but bit 62, and bit 59 too for a
+charge-only handle, and an object handle's key with them clear but bit 60, and
+init mints procmgr's badge on memmgr's endpoint with all six clear.
 
 The badge on an ordinary IPC message is the badge of the sender's cap,
 and it cannot be forged: badges are minted by `cap_derive_badge` only
@@ -117,7 +123,9 @@ name, and the cap is the authority. memmgr derives a handle in three places:
   process's node, which procmgr passes to the creator that asked for it
   with `CREATE_NODE_HANDLE`;
 - `NODE_CREATE` (§ Label 15): a sub-node under the handle's node;
-- `CREATE_SUB_NODE` (§ Label 19): a sub-node under the caller's own node.
+- `CREATE_SUB_NODE` (§ Label 19): a sub-node under the caller's own node;
+- `NODE_CHARGE_HANDLE` (§ Label 33): a charge-only handle to the handle's
+  node.
 
 A holder can derive copies of a handle, which carry the same badge. Every
 handle to a node names its handle state, which belongs to one process: the
@@ -134,6 +142,31 @@ A creator that holds a handle can charge a new child to the handle's node by
 passing a copy with `CREATE_CHARGE_NODE`
 ([procmgr IPC interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)),
 which procmgr hands to memmgr with `REGISTER_CHARGE_NODE` (§ Label 3).
+
+A charge-only handle is a node handle whose badge is the key with the
+charge-only bit `NODE_CHARGE_ONLY` (bit 59) added. It names the same handle
+state, so memmgr refuses it once that state goes, and it carries only the
+authority to charge to the node: its holder reads the node's usage with it
+(`NODE_QUERY_USAGE`), derives further charge-only handles
+(`NODE_CHARGE_HANDLE`), and has a grant of its own charged to the node by
+passing a copy with `REQUEST_CHARGE_NODE` (§ Label 1). memmgr refuses it every
+other node label with `UNAUTHORIZED`, and `REGISTER_PROCESS` takes it as no
+charge node, so its holder can neither raise the node's max nor divide, watch,
+steer or release the node, nor charge a process to it. A client hands one to a
+server so that the memory the server spends on the client is charged to the
+client's node: the grant stays on the server's record, with its region id, its
+release and its reclaim at the server's death, as any other grant does; only
+its charge goes to the node, whose max, and its ancestors', refuse it with
+`LIMIT`.
+
+A grant charged to a node keeps its charge there until its holder releases it
+or dies, whatever becomes of the node's handle state: the node lives on with
+the charge, inside its parent's subtree, so neither `NODE_RELEASE` nor the
+death of the state's owner sheds it, and no holder is left with frames charged
+to no node. When the handle state goes, memmgr sends the donation-end
+Notification (§ Label 34) of each process holding grants charged to the node,
+once each, so a server can drop what it kept for the client and release those
+grants; from then on no grant is charged to the node.
 
 No process receives a handle to its own node through these paths, so none can
 raise the max its creator set; the handles it holds name its children's nodes
@@ -167,7 +200,9 @@ carry arguments; the reply carries results. Error codes below are the
 `memmgr_errors` constants in `shared/ipc`. A label memmgr does not define
 replies `INVALID_ARGUMENT`, or `UNAUTHORIZED` over a node handle or an
 object handle. Every label but the node labels also replies `UNAUTHORIZED`
-over a node handle, every label but the swap labels over the swap authority,
+over a node handle, every label but `NODE_QUERY_USAGE` and
+`NODE_CHARGE_HANDLE` over a charge-only one, every label but the swap labels
+over the swap authority,
 and every label but `OBJECT_RELEASE` over an object handle (§ Badge
 Discipline); the node labels' tables list the refusal over any other badge, as
 § Labels 22 to 26 does for the swap labels and § Label 29 for
@@ -184,12 +219,14 @@ for a best-effort partial grant, fewer. Privilege: universal.
 |---|---|
 | label | 1 |
 | data[0] | `want_pages` (u32, low half of word) \| `flags` (u32, high half) |
+| cap[0] | With `REQUEST_CHARGE_NODE`: a copy of a node handle, full or charge-only (§ Node Handles); memmgr reads its badge with `SYS_ENDPOINT_BADGE` and deletes it on every path, as it deletes a `cap[0]` sent without the flag |
 
 `flags` bits:
 
 | Bit | Name | Meaning |
 |---|---|---|
 | 0 | `REQUIRE_CONTIGUOUS` | Reply MUST contain exactly one Memory cap covering all `want_pages`, or fail |
+| 1 | `REQUEST_CHARGE_NODE` | Charge the grant to the node of the node handle in `cap[0]` instead of the caller's own node |
 
 `flags` bits not listed above are reserved and MUST be zero.
 
@@ -233,13 +270,20 @@ There is no fixed ceiling on `returned_cap_count` other than the IPC
 reply-side cap-slot limit (see [`docs/ipc-design.md`](../../../docs/ipc-design.md)).
 Best-effort replies may use the full reply-side capacity.
 
-memmgr admits the whole of `want_pages` against the caller's budget node before it selects a run,
-and charges the node each page it grants ([`memory-pool.md`](memory-pool.md) § Distribution policy).
-A request over the max of the node or of an ancestor fails `LIMIT`, whatever part of it the pool
-could serve; one that would leave fewer free pages outside `promised`
-([`memory-pool.md`](memory-pool.md) § Commit) than the growth floor (the system reserve and, while
-chunks are swapped, the restore headroom; `memory-pool.md` § Distribution policy), from a caller
-outside the reserve, or than none, fails as exhaustion, with code 1 or 2.
+memmgr admits the whole of `want_pages` against the budget node the grant is charged to, the
+caller's own or, with `REQUEST_CHARGE_NODE`, the handle's, before it selects a run, and charges
+the node each page it grants ([`memory-pool.md`](memory-pool.md) § Distribution policy). A request
+over the max of the node or of an ancestor fails `LIMIT`, whatever part of it the pool could serve;
+one that would leave fewer free pages outside `promised` ([`memory-pool.md`](memory-pool.md)
+§ Commit) than the growth floor (the system reserve and, while chunks are swapped, the restore
+headroom; `memory-pool.md` § Distribution policy), charged to a node outside the reserve, or than
+none, fails as exhaustion, with code 1 or 2.
+
+A grant charged to a handle's node is the caller's grant: it takes a region id of the caller's,
+`RELEASE_MEMORY_CAPS` and the caller's `PROCESS_DIED` return it, and each returns its charge to the
+node. `SEAL_OBJECT` refuses it (§ Label 27): an object outlives its sealer and could not return the
+charge. The charge stays on the node when the node's handle state goes
+(§ Node Handles).
 
 **Reply (error):**
 
@@ -255,8 +299,8 @@ outside the reserve, or than none, fails as exhaustion, with code 1 or 2.
 | 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies, or the grant would take the growth floor from a caller outside the system reserve |
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, the grant would take the growth floor from a caller outside the system reserve, or deriving the caller's copy failed |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), memmgr could not map a selected run to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or the caller's region-id sequence is spent (unreachable: 2^64 − 1 grants) |
-| 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
-| 8 | `LIMIT` | `want_pages` would take the subtree of the caller's budget node, or of an ancestor, over its max |
+| 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, badge unknown, or, with `REQUEST_CHARGE_NODE`, `cap[0]` missing, not a node handle, or naming no handle state |
+| 8 | `LIMIT` | `want_pages` would take the subtree of the node the grant is charged to, or of an ancestor, over its max |
 
 ### Label 2: `RELEASE_MEMORY_CAPS`
 
@@ -921,7 +965,7 @@ usage signals the node's limit event (§ Label 17).
 | Code | Name | Meaning |
 |---|---|---|
 | 4 | `INVALID_ARGUMENT` | The handle's key names no handle state (released, or its owner gone) |
-| 5 | `UNAUTHORIZED` | The badge is not a node handle |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle, or is a charge-only one |
 
 ### Label 15: `NODE_CREATE`
 
@@ -957,12 +1001,12 @@ state, so no unnamed sub-node is left behind.
 |---|---|---|
 | 3 | `QUOTA` | The node, its handle state or its index entry could not be allocated (system RAM exhausted), the key draw failed, or the handle could not be derived |
 | 4 | `INVALID_ARGUMENT` | The handle's key names no handle state, or its owner holds no record |
-| 5 | `UNAUTHORIZED` | The badge is not a node handle |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle, or is a charge-only one |
 
 ### Label 16: `NODE_QUERY_USAGE`
 
-Read-only query of the handle's node. Privilege: node, over a node handle
-(§ Node Handles); it changes no state.
+Read-only query of the handle's node. Privilege: node, over a node handle,
+full or charge-only (§ Node Handles); it changes no state.
 
 **Request:** label 16, no words, no caps.
 
@@ -1017,7 +1061,7 @@ want of free RAM, not of a max, signals no node.
 | Code | Name | Meaning |
 |---|---|---|
 | 4 | `INVALID_ARGUMENT` | The handle's key names no handle state, zero `bits`, `cap[0]` missing or not a Notification with Notify rights, or `cap[1]` missing, not a cap on memmgr's endpoint, or a node handle, or its badge names no process; memmgr deletes both caps, and any earlier registration stays |
-| 5 | `UNAUTHORIZED` | The badge is not a node handle; memmgr deletes the caps |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle, or is a charge-only one; memmgr deletes the caps |
 | 6 | `TOO_MANY_PROCESSES` | The registration's arena slot could not be allocated: system RAM exhausted; memmgr deletes both caps, and any earlier registration stays |
 
 ### Label 18: `NODE_RELEASE`
@@ -1027,11 +1071,14 @@ Drop the handle state of a sub-node. Privilege: node, over a node handle
 
 **Request:** label 18, no words, no caps.
 
-memmgr drops the state and deletes its limit cap; every handle carrying its key
-is refused from then on. The sub-node itself lives on while a process, a node
-below it or a charge refers to it, so a process charged to it keeps its
-budget. A process's own node is refused: its handle state goes with the
-process.
+memmgr drops the state and deletes its limit cap; every handle carrying its key,
+full or charge-only, is refused from then on. The sub-node itself lives on while
+a process, a node below it or a charge refers to it, so a process charged to it
+keeps its budget. A grant charged to it through a handle (§ Label 1) keeps its
+charge there, inside the owner's subtree, until its holder releases it or dies,
+so the release sheds none of it; before it drops the state, memmgr sends the
+donation-end Notification of each process holding such grants (§ Label 34). A
+process's own node is refused: its handle state goes with the process.
 
 **Reply (success):** label 0, no words, no caps.
 
@@ -1040,7 +1087,7 @@ process.
 | Code | Name | Meaning |
 |---|---|---|
 | 4 | `INVALID_ARGUMENT` | The handle's key names no handle state, or it names a process's own node |
-| 5 | `UNAUTHORIZED` | The badge is not a node handle |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle, or is a charge-only one |
 
 ### Label 19: `CREATE_SUB_NODE`
 
@@ -1338,7 +1385,9 @@ memmgr seals only grants that pass the quiescence check
 to the frame but memmgr's own, no byte of it retyped, and no address space
 mapping a page of it, so no process can write a frame once it is sealed. The
 caller unmaps each grant and hands its cap back with the request. A grant that
-fails the check refuses the seal whole, and the caller keeps its grants. memmgr
+fails the check, or one charged to a node handle's node (§ Label 1), whose
+charge the object, which outlives the caller, could not return, refuses the
+seal whole, and the caller keeps its grants. memmgr
 then maps its own read-only view of the frames at a span of its object zone,
 which it keeps until the object is freed: the view is the frames' second leaf
 that makes the kernel refuse a text write to an attachment's page
@@ -1357,7 +1406,7 @@ object handle to it.
 |---|---|---|
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | memmgr could not map its own view of the frames |
 | 3 | `QUOTA` | memmgr's metadata arena could not grow, its object zone holds no span of the object's pages, or the handle could not be derived |
-| 4 | `INVALID_ARGUMENT` | Unknown badge, a count out of range or past the words sent, an id that names no grant of the caller or is named twice, or a grant that fails the quiescence check |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, a count out of range or past the words sent, an id that names no grant of the caller or is named twice, a grant charged to a node handle's node, or a grant that fails the quiescence check |
 | 5 | `UNAUTHORIZED` | A phys-class caller, or a badge that is a handle or the swap authority |
 
 #### Label 28: `ATTACH_OBJECT`
@@ -1630,7 +1679,70 @@ against (§ Label 16).
 | Code | Name | Meaning |
 |---|---|---|
 | 4 | `INVALID_ARGUMENT` | The handle's key names no handle state, or the weight is outside `NODE_WEIGHT_MIN` to `NODE_WEIGHT_MAX` |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle, or is a charge-only one |
+
+### Label 33: `NODE_CHARGE_HANDLE`
+
+Return a charge-only handle to the handle's node (§ Node Handles). Privilege:
+node, over a node handle, full or charge-only.
+
+**Request:** label 33, no words, no caps.
+
+The handle's badge is the key of the handle state with `NODE_CHARGE_ONLY`
+(bit 59) added, so every charge-only handle to a node carries the same badge.
+It names the handle state the request's handle names, and is refused once that
+state goes. A reply that does not reach the caller deletes the cap.
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 (success) |
+| cap[0] | a charge-only handle to the node |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 3 | `QUOTA` | The handle could not be derived |
+| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state |
 | 5 | `UNAUTHORIZED` | The badge is not a node handle |
+
+### Label 34: `REGISTER_DONATION_END`
+
+Register the Notification memmgr signals when the handle state of a node the
+caller holds grants charged to goes (§ Node Handles). Privilege: universal,
+attributed to the caller by `recv.badge`.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 34 |
+| data[0] | `bits`: the bits to send on the event; nonzero |
+| cap[0] | a Notification cap with Notify rights; ownership transfers to memmgr |
+
+memmgr keeps one registration per process: a second replaces the first, and
+memmgr deletes the cap the first carried. The registration goes with the
+caller's `PROCESS_DIED`. When the handle state of a node goes, on
+`NODE_RELEASE` (§ Label 18) or at its owner's `PROCESS_DIED`, memmgr sends
+`bits` once, without blocking, to the registration of each process that holds
+grants charged to that node (§ Label 1), before it drops the state. The event
+names no node: a holder with grants charged to several nodes finds the ended
+ones by `NODE_QUERY_USAGE` over its charge-only handles, which an ended state
+refuses with `INVALID_ARGUMENT`. Bits not yet taken coalesce, and a send that
+fails, for a cap the holder revoked, is dropped. A holder with no registration
+is not told; its grants keep their charge until it releases them or dies.
+
+**Reply (success):** label 0, no words, no caps.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 3 | `QUOTA` | The registration's arena slot could not be allocated: system RAM exhausted; memmgr deletes the cap, and any earlier registration stays |
+| 4 | `INVALID_ARGUMENT` | Zero `bits`, `cap[0]` missing or not a Notification with Notify rights, or the badge names no process; memmgr deletes the cap, and any earlier registration stays |
+| 5 | `UNAUTHORIZED` | The badge is a node handle, the swap authority or an object handle; memmgr deletes the cap |
 
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
@@ -1811,29 +1923,28 @@ reclaims. `RELEASE_MEMORY_CAPS` names each region by its region id, and
 retained intermediary to the free pool; memmgr does not derive from the
 caller's cap.
 
-Only ten labels carry caps in their contract: `DONATE_MEMORY_CAPS` and
-`CAPTURE_CHUNKS` (every attached cap), `DELEGATE_ASPACE` (`cap[0]`), `REGISTER_PRESSURE` (`cap[0]`),
-`REGISTER_PROCESS` (`cap[0]`), `NODE_REGISTER_LIMIT` (`cap[0]` and
-`cap[1]`), the swap labels `SWAP_REGISTER` (`cap[0]` and `cap[1]`), `SWAP_TAKE` and
-`SWAP_RESTORE` (`cap[0]`), and `ATTACH_OBJECT` (`cap[0]`). memmgr deletes every other cap a
+Only twelve labels carry caps in their contract: `DONATE_MEMORY_CAPS` and `CAPTURE_CHUNKS` (every
+attached cap), `REQUEST_MEMORY_CAPS` (`cap[0]`), `DELEGATE_ASPACE` (`cap[0]`), `REGISTER_PRESSURE`
+(`cap[0]`), `REGISTER_PROCESS` (`cap[0]`), `NODE_REGISTER_LIMIT` (`cap[0]` and `cap[1]`), the swap
+labels `SWAP_REGISTER` (`cap[0]` and `cap[1]`), `SWAP_TAKE` and `SWAP_RESTORE` (`cap[0]`),
+`ATTACH_OBJECT` (`cap[0]`), and `REGISTER_DONATION_END` (`cap[0]`). memmgr deletes every other cap a
 message carries before it handles the message, whatever the label, the caller, or the reply: the
-caps attached to any other label (a `FAULT_LABEL` message, `SEAL_OBJECT`'s handed-back grants and
-an unknown label included), the caps after `cap[0]` on `DELEGATE_ASPACE`, `REGISTER_PRESSURE`,
-`REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE` and `ATTACH_OBJECT`, every cap on `SWAP_DONE`
-and `SWAP_WANTED`, and the caps after `cap[1]` on `NODE_REGISTER_LIMIT` and
-`SWAP_REGISTER`. It deletes the contract caps as well when a
-procmgr-only label's caller is not procmgr, when a label's class does not
-match the badge (§ Badge Discipline), and in the error cases the labels'
-sections state. `CAPTURE_CHUNKS` deletes its caps once it has served the request, whatever
-the reply. `SWAP_REGISTER` keeps its `cap[0]` as the swap service's
-endpoint, and its `cap[1]`, when present, as the swap service's want Notification;
-`SWAP_TAKE` and `SWAP_RESTORE` move their `cap[0]` back on every reply, and delete it
-only when that reply cannot reach the caller. `REGISTER_PROCESS` and `ATTACH_OBJECT` read the
-badge of their `cap[0]` and delete it on every path, and `NODE_REGISTER_LIMIT` its `cap[1]`. An
-attached cap therefore never outlives the call that carried it unless memmgr takes ownership of it,
-so no client can fill memmgr's `CSpace` by attaching caps until its receive loop fails and memmgr
-exits with `EXIT_RECV_WEDGE` (see
-[docs/ipc-design.md](../../../docs/ipc-design.md#receive-failure-policy) §"Receive-Failure Policy").
+caps attached to any other label (a `FAULT_LABEL` message, `SEAL_OBJECT`'s handed-back grants and an
+unknown label included), the caps after `cap[0]` on `REQUEST_MEMORY_CAPS`, `DELEGATE_ASPACE`,
+`REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE`, `ATTACH_OBJECT` and
+`REGISTER_DONATION_END`, every cap on `SWAP_DONE` and `SWAP_WANTED`, and the caps after `cap[1]` on
+`NODE_REGISTER_LIMIT` and `SWAP_REGISTER`. It deletes the contract caps as well when a procmgr-only
+label's caller is not procmgr, when a label's class does not match the badge (§ Badge Discipline),
+and in the error cases the labels' sections state. `CAPTURE_CHUNKS` deletes its caps once it has
+served the request, whatever the reply. `SWAP_REGISTER` keeps its `cap[0]` as the swap service's
+endpoint, and its `cap[1]`, when present, as the swap service's want Notification; `SWAP_TAKE` and
+`SWAP_RESTORE` move their `cap[0]` back on every reply, and delete it only when that reply cannot
+reach the caller. `REQUEST_MEMORY_CAPS`, `REGISTER_PROCESS` and `ATTACH_OBJECT` read the badge of
+their `cap[0]` and delete it on every path, and `NODE_REGISTER_LIMIT` its `cap[1]`. An attached cap
+therefore never outlives the call that carried it unless memmgr takes ownership of it, so no client
+can fill memmgr's `CSpace` by attaching caps until its receive loop fails and memmgr exits with
+`EXIT_RECV_WEDGE` (see [docs/ipc-design.md](../../../docs/ipc-design.md#receive-failure-policy)
+§"Receive-Failure Policy").
 
 ---
 

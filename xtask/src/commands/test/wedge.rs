@@ -159,7 +159,7 @@ fn boot_once(ctx: &Context, args: &CaseArgs, image: &Image, victim: Victim) -> R
         second_disk: None,
         firmware_code_path: &firmware.code,
         firmware_vars_path: vars.path(),
-        smm: false,
+        smm: firmware.smm,
         cpus: args.cpus,
         threads_per_core: 1,
         mem_mib: args.mem,

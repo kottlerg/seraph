@@ -1721,8 +1721,8 @@ fn end_endowment(bootstrap_ep: u64, child: &BootChild, ipc_buf: *mut u64)
 /// Phase 3: load svcmgr, serve it the handover endowment (its own
 /// endpoints + publish-role source caps + one `(name, thread_cap, observer)`
 /// round per init-bootstrapped substrate service + the reserved log-sink
-/// sources), then notification `HANDOVER_COMPLETE` so svcmgr scans
-/// `/config/svcmgr/services/`. svcmgr owns all post-handover work from the
+/// sources), then notification `HANDOVER_COMPLETE` so svcmgr reads
+/// `/config/svcmgr/services/` through its signed index. svcmgr owns all post-handover work from the
 /// endowment: it publishes the well-known names, installs devmgr's drivers
 /// dir, and launches + supervises the non-bootstrap services. On a normal
 /// boot the defined services are the bind-only substrate plus the

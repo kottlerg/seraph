@@ -26,7 +26,7 @@ stability obligation; internal code reuse only.
 | `encode_trailer`, `TrustStore::encode` | Write a trailer and a store into a caller's buffer, for the host signer |
 | `embed::{MARKER, Embedded, find}` | The layout that embeds a trust store in a bootloader image, `MARKER` (16 bytes) `\|\| len` (`u32` LE) `\|\| store`, and `find`, which locates the one `Embedded` store in an image's bytes |
 | `key_id` | The key id of a composite public key: the first 16 bytes of the SHA-512 of all 1,984 bytes |
-| `index::{Index, encode}` | The signed index of a configuration directory ([docs/signing.md](../../docs/signing.md) § Configuration): `Index::parse` checks the format (one canonical path component per line, `\n`-terminated, strictly ascending byte for byte, never `index` itself) and `encode` writes it, refusing what the parser refuses |
+| `index::{Index, encode}` | The signed index of a configuration directory ([docs/signing.md](../../docs/signing.md) § Configuration): `Index::parse` checks the format (one line per file, `\n`-terminated: a canonical path component, a space and the lowercase hex SHA-512 of the file's body (`body_digest`); names strictly ascending byte for byte, never `index` itself), `Index::matches` compares a body with its line, and `encode` writes it, refusing what the parser refuses |
 
 A `Refusal` is a parse error, `Untrusted` when no record names an anchor of the store (by
 `signer_key_id` without a certificate, by the certificate's `issuer_key_id` with one), or the

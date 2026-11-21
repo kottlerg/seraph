@@ -656,13 +656,15 @@ sysroot itself is never changed:
    trusted for every role but configuration and one for configuration alone, and, in
    `/config/svcmgr/services/`, `timed.svc` with a body byte flipped, `pwrmgr.svc` unsigned,
    `crashd.svc` signed by the first anchor's key, and `oomd.svc` by the second's, which signs
-   `/services/oomd` as a service too; the directory's index, validly signed, names a `removed.svc`
-   the directory lacks and omits the `swapd.svc` it holds; and `/config/devmgr/classes/rtc.class`
-   has a body byte flipped. procmgr refuses each configuration file at svcmgr's verified read
-   (`Failed(BodyHash)`, `Parse(Magic)`, `Failed(KeyUsage)`) and svcmgr reports it passed over;
-   procmgr refuses the service `oomd.svc`'s anchor signs (`Failed(KeyUsage)`); svcmgr reports the
-   file the index names but the directory lacks, and the file it does not name; the boot reaches the
-   terminal's READY line.
+   `/services/oomd` as a service too; `entropyd.svc` validly signed over a body other than the one
+   the index holds, as an older signed copy is; the directory's index, validly signed, names a
+   `removed.svc` the directory lacks and omits the `swapd.svc` it holds; and
+   `/config/devmgr/classes/rtc.class` has a body byte flipped. procmgr refuses each configuration
+   file at svcmgr's verified read (`Failed(BodyHash)`, `Parse(Magic)`, `Failed(KeyUsage)`) and
+   svcmgr reports it passed over; svcmgr refuses `entropyd.svc`, whose body does not match its index
+   line; procmgr refuses the service `oomd.svc`'s anchor signs (`Failed(KeyUsage)`); svcmgr reports
+   the file the index names but the directory lacks, and the file it does not name; the boot reaches
+   the terminal's READY line.
 6. `index`: the indexes of `/config/svcmgr/services/` and `/config/devmgr/classes/` each with a
    body byte flipped. procmgr refuses both (`Failed(BodyHash)`), svcmgr reports that it read no
    recipe and configured no class, and reports every service init registered as one without a

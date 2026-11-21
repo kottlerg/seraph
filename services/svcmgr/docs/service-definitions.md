@@ -664,9 +664,10 @@ At `HANDOVER_COMPLETE` svcmgr reads the recipes of `/config/svcmgr/services/`, p
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 
 svcmgr reads the directory's signed `index` file through procmgr's `READ_VERIFIED` in the
-configuration role, then each file the index names the same way, and parses only the verified
-bodies. It reports and passes over a named file that is missing or refused, as it does a file that
-does not parse, and reports a file of the directory the index does not name without reading it.
+configuration role, then each file the index names the same way, refuses a body whose SHA-512 is
+not the one its index line holds, and parses only the bodies it accepts. It reports and passes over
+a named file that is missing, refused, or whose body does not match its line, as it does a file
+that does not parse, and reports a file of the directory the index does not name without reading it.
 When the index is missing or refused it reads no file of the directory: no recipe is launched, and
 each service init registered is reported as registered without definition.
 

@@ -7,10 +7,11 @@
 //! (docs/signing.md § Configuration): svcmgr reads a configuration
 //! directory's `index` and each file the index names through procmgr's
 //! verified read in the configuration role (`std::os::seraph::read_verified`),
-//! parses only the bodies procmgr returns, and reports, without reading it, a
-//! file of the directory the index does not name. A file the index names but
-//! the directory lacks, or that procmgr refuses, is reported by the caller,
-//! which passes it over.
+//! refuses a body whose SHA-512 is not the one its index line holds, parses
+//! only the bodies it accepts, and reports, without reading it, a file of the
+//! directory the index does not name. A file the index names but the
+//! directory lacks, that procmgr refuses, or whose body does not match its
+//! line, is reported by the caller, which passes it over.
 
 use std::fs;
 use std::io;
@@ -65,14 +66,30 @@ impl IndexedDir
     }
 
     /// Read the file `name` of the directory through procmgr's verified
-    /// read, in the configuration role, under its install path.
+    /// read, in the configuration role, under its install path, and accept
+    /// its body only when its SHA-512 is the one the index holds for `name`:
+    /// a validly signed body other than the one the index was signed with (an
+    /// older signed copy) is refused, and logged.
     ///
     /// # Errors
     /// As [`Self::open`]'s read of the index: `NotFound` for a file the
-    /// directory lacks, `InvalidData` for one procmgr refuses.
+    /// directory lacks, `InvalidData` for one procmgr refuses, one the index
+    /// does not name, or one whose body does not match its line.
     pub fn read(&self, name: &str) -> io::Result<VerifiedData>
     {
-        read(self.dir, name)
+        let data = read(self.dir, name)?;
+        // Parsed in `open`, so this parse succeeds.
+        let matches = Index::parse(self.index.bytes())
+            .is_ok_and(|index| index.matches(name.as_bytes(), data.bytes()));
+        if !matches
+        {
+            log!(
+                warn: "{}/{name}: its body is not the one the directory's index was signed with; refused",
+                self.dir
+            );
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        Ok(data)
     }
 
     /// Log each file of the directory that is neither the index nor named by

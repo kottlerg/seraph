@@ -725,7 +725,8 @@ pub fn sign_sysroot(
 /// Sign every file of each directory of [`CONFIG_TREES`] in `ctx`'s sysroot
 /// in the configuration role under its install path, with the boot-module
 /// role beside it when `boot_modules` names it, and write the directory's
-/// index ([`write_index`]); each install path signed goes into `done`, and
+/// index of their names and body digests ([`write_index`]); each install
+/// path signed goes into `done`, and
 /// each object signed to `count`, with whether it changed.
 ///
 /// # Errors
@@ -761,13 +762,14 @@ fn sign_config_trees(
             count(signer.sign_file(&ctx.sysroot.join(&relative), roles, &install)?);
             done.insert(install);
         }
+        let entries = index_entries(&ctx.sysroot.join(tree), &names)?;
         let relative = Path::new(tree).join(INDEX_FILE);
         let install = install_name(&relative)?;
         count(write_index(
             signer,
             &ctx.sysroot.join(&relative),
             &install,
-            &names,
+            &entries,
         )?);
         done.insert(install);
     }
@@ -828,33 +830,65 @@ pub fn config_files(dir: &Path, suffix: &str) -> Result<Option<Vec<String>>>
     Ok(Some(names))
 }
 
-/// The body of the index of `names`, which are sorted ([`config_files`]).
+/// One line of a directory index: a file's name and the SHA-512 of its body.
+pub type IndexEntry = (String, objsig::index::Digest);
+
+/// The index entries of the files `names` of the configuration directory
+/// `dir`, in the order of `names`: each name with the digest of the file's
+/// body, the file less its signature trailer ([`body_of`]), so signing a
+/// file again leaves its entry unchanged.
+///
+/// # Errors
+///
+/// On an I/O failure, and those of [`body_of`].
+pub fn index_entries(dir: &Path, names: &[String]) -> Result<Vec<IndexEntry>>
+{
+    names
+        .iter()
+        .map(|name| {
+            let path = dir.join(name);
+            let object = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let body = body_of(&object).with_context(|| format!("reading {}", path.display()))?;
+            Ok((name.clone(), objsig::index::body_digest(body)))
+        })
+        .collect()
+}
+
+/// The body of the index of `entries`, which are sorted by name
+/// ([`config_files`]).
 ///
 /// # Errors
 ///
 /// When `objsig::index::encode` refuses them.
-pub fn index_body(names: &[String]) -> Result<Vec<u8>>
+pub fn index_body(entries: &[IndexEntry]) -> Result<Vec<u8>>
 {
-    let names: Vec<&[u8]> = names.iter().map(String::as_bytes).collect();
+    let entries: Vec<objsig::index::Entry<'_>> = entries
+        .iter()
+        .map(|(name, digest)| objsig::index::Entry {
+            name: name.as_bytes(),
+            digest: *digest,
+        })
+        .collect();
     let refused = |e| err!("encoding a directory index ({e:?})");
     let mut body =
-        vec![0u8; objsig::index::encoded_len(&names).context("an index longer than usize")?];
-    objsig::index::encode(&names, &mut body).map_err(refused)?;
+        vec![0u8; objsig::index::encoded_len(&entries).context("an index longer than usize")?];
+    objsig::index::encode(&entries, &mut body).map_err(refused)?;
     Ok(body)
 }
 
-/// Write at `path` the index of `names` ([`index_body`]) signed in the
+/// Write at `path` the index of `entries` ([`index_body`]) signed in the
 /// configuration role under `install`, unless the file already holds it;
 /// returns whether its bytes changed.
 ///
 /// # Errors
 ///
 /// On an I/O failure and the errors of [`index_body`] and [`Signer::sign`].
-fn write_index(signer: &Signer, path: &Path, install: &str, names: &[String]) -> Result<bool>
+fn write_index(signer: &Signer, path: &Path, install: &str, entries: &[IndexEntry])
+-> Result<bool>
 {
     let object = signer
         .sign(
-            &index_body(names)?,
+            &index_body(entries)?,
             RoleSet::of(&[Role::Configuration]),
             install,
         )
@@ -1581,10 +1615,31 @@ mod tests
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The index body of `files`, each a name and its body, in order.
+    fn index_of(files: &[(&str, &[u8])]) -> Vec<u8>
+    {
+        files
+            .iter()
+            .flat_map(|(name, body)| {
+                let line = objsig::index::body_digest(body).iter().fold(
+                    format!("{name} "),
+                    |mut line, byte| {
+                        use std::fmt::Write as _;
+                        let _ = write!(line, "{byte:02x}");
+                        line
+                    },
+                );
+                format!("{line}\n").into_bytes()
+            })
+            .collect()
+    }
+
     // Defect caught: a configuration file left unsigned or signed outside the
     // configuration role, under a name other than its install path; an index
     // missing, unsigned, naming a file the directory lacks or omitting one it
-    // holds, or rewritten by a pack of an unchanged directory.
+    // holds, holding a digest other than its file's body's (the signed file's,
+    // or a stale one after an edit), or rewritten by a pack of an unchanged
+    // directory.
     #[test]
     fn a_configuration_directory_is_signed_with_an_index_of_its_files()
     {
@@ -1647,19 +1702,37 @@ mod tests
         read(format!("{classes}/rtc.class"));
         assert_eq!(
             read(format!("{services}/index")),
-            b"crashd.svc\ntimed.svc\n"
+            index_of(&[
+                ("crashd.svc", b"binary = y\n"),
+                ("timed.svc", b"binary = x\n")
+            ])
         );
-        assert_eq!(read(format!("{classes}/index")), b"rtc.class\n");
+        assert_eq!(
+            read(format!("{classes}/index")),
+            index_of(&[("rtc.class", b"class = rtc\n")])
+        );
         // A second pack of an unchanged sysroot changes no file.
         assert_eq!(
             sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap(),
             (total, 0)
         );
-        // A file added, and one removed, are in the next pack's index.
+        // A file added, one removed, and one edited are in the next pack's
+        // index.
         fs::write(ctx.sysroot.join(services).join("oomd.svc"), b"binary = z\n").unwrap();
         fs::remove_file(ctx.sysroot.join(services).join("timed.svc")).unwrap();
+        fs::write(
+            ctx.sysroot.join(services).join("crashd.svc"),
+            b"binary = w\n",
+        )
+        .unwrap();
         sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap();
-        assert_eq!(read(format!("{services}/index")), b"crashd.svc\noomd.svc\n");
+        assert_eq!(
+            read(format!("{services}/index")),
+            index_of(&[
+                ("crashd.svc", b"binary = w\n"),
+                ("oomd.svc", b"binary = z\n")
+            ])
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

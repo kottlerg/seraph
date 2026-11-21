@@ -137,11 +137,20 @@ pub(super) fn crashd_stall(phase: &str) -> Option<u64>
     })
 }
 
-/// The text of the recipe at `path`; `None` when it is not staged.
+/// The text of the recipe at `path`, read as svcmgr reads it: through
+/// procmgr's verified read in the configuration role, so the body is the
+/// signed recipe less its trailer (docs/signing.md § Configuration); `None`
+/// when it is not staged.
 fn recipe_text(path: &str, phase: &str) -> Option<String>
 {
+    use std::os::seraph::{VerifiedRole, namespace_lookup_file, read_verified, root_dir_cap};
     super::svcmgr::recipe_staged(path, phase).then(|| {
-        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{phase}: read {path}: {e:?}"))
+        let (cap, size) = namespace_lookup_file(root_dir_cap(), path)
+            .unwrap_or_else(|e| panic!("{phase}: look up {path}: {e:?}"));
+        let verified = read_verified(cap, size, path, VerifiedRole::Configuration)
+            .unwrap_or_else(|e| panic!("{phase}: verified read of {path}: {e:?}"));
+        String::from_utf8(verified.bytes().to_vec())
+            .unwrap_or_else(|e| panic!("{phase}: {path} is not UTF-8: {e:?}"))
     })
 }
 

@@ -314,7 +314,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   the call and deletes after; svcmgr honours the label once, and only
   from a badge carrying that bit (see
   [Label 2](../../svcmgr/docs/ipc-interface.md#label-2-handover_complete)).
-  svcmgr scans `/config/svcmgr/services/`,
+  svcmgr reads the recipes the signed index of `/config/svcmgr/services/` names,
   reconciles the parked substrate against the recipes, and launches the
   defined-but-unparked services (`logd`, `timed`, `pwrmgr`, `entropyd`, `terminal`,
   staged harnesses) from disk (see

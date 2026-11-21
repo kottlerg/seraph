@@ -31,15 +31,18 @@
 //!   for configuration alone. In `/config/svcmgr/services/`, `timed.svc` has a
 //!   body byte flipped, `pwrmgr.svc` is unsigned, `crashd.svc` is signed by
 //!   the first anchor's key, and `oomd.svc` by the second's, which signs
-//!   `/services/oomd` as a service too; the directory's index, validly
-//!   signed, names a `removed.svc` the directory lacks and omits the
-//!   `swapd.svc` it holds; `/config/devmgr/classes/rtc.class` has a body byte
-//!   flipped. procmgr refuses each configuration file at svcmgr's verified
-//!   read (`Failed(BodyHash)`, `Parse(Magic)`, `Failed(KeyUsage)`) and svcmgr
-//!   reports it passed over; svcmgr reads `oomd.svc` and procmgr refuses the
-//!   service it names (`Failed(KeyUsage)`); svcmgr reports the file the index
-//!   names but the directory lacks, and the file it does not name; the boot
-//!   reaches the terminal's READY line.
+//!   `/services/oomd` as a service too; `entropyd.svc` is validly signed
+//!   over another body than the one the index holds, as an older signed copy
+//!   is; the directory's index, validly signed, names a `removed.svc` the
+//!   directory lacks and omits the `swapd.svc` it holds;
+//!   `/config/devmgr/classes/rtc.class` has a body byte flipped. procmgr
+//!   refuses each configuration file at svcmgr's verified read
+//!   (`Failed(BodyHash)`, `Parse(Magic)`, `Failed(KeyUsage)`) and svcmgr
+//!   reports it passed over; svcmgr refuses `entropyd.svc`, whose body does
+//!   not match its index line; svcmgr reads `oomd.svc` and procmgr refuses
+//!   the service it names (`Failed(KeyUsage)`); svcmgr reports the file the
+//!   index names but the directory lacks, and the file it does not name; the
+//!   boot reaches the terminal's READY line.
 //! - `index`: the indexes of `/config/svcmgr/services/` and
 //!   `/config/devmgr/classes/` each with a body byte flipped. procmgr refuses
 //!   both (`Failed(BodyHash)`), svcmgr reports that it read no recipe and
@@ -148,6 +151,7 @@ const RECIPE_NOT_CONFIGURATION: &str = "crashd.svc";
 const RECIPE_CONFIGURATION_KEY: &str = "oomd.svc";
 const SERVICE_CONFIGURATION_KEY: &str = "services/oomd";
 const RECIPE_UNINDEXED: &str = "swapd.svc";
+const RECIPE_REPLAYED: &str = "entropyd.svc";
 const RECIPE_REMOVED: &str = "removed.svc";
 const CLASS_TAMPERED: &str = "rtc.class";
 
@@ -329,8 +333,9 @@ fn bootloader_under(
 /// recipes and a class file refused for a tampered body, no signature, or a
 /// key not trusted for configuration; a recipe signed by the
 /// configuration-only key, accepted, naming a service that key signed,
-/// refused; and the services directory's index, signed by `signer`, naming
-/// a file the directory lacks and omitting one it holds.
+/// refused; a recipe signed by `signer` over a body other than the one the
+/// index holds, refused; and the services directory's index, signed by
+/// `signer`, naming a file the directory lacks and omitting one it holds.
 fn configuration_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> Result<Case>
 {
     let others = untrusted_signer(ctx, args.arch)?;
@@ -361,21 +366,35 @@ fn configuration_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signe
     let not_configuration = config_path(SERVICES_DIR, RECIPE_NOT_CONFIGURATION);
     let by_configuration = config_path(SERVICES_DIR, RECIPE_CONFIGURATION_KEY);
     let class = config_path(CLASSES_DIR, CLASS_TAMPERED);
+    let replayed = config_path(SERVICES_DIR, RECIPE_REPLAYED);
     let index = config_path(SERVICES_DIR, "index");
-    let mut names = crate::signing::config_files(&ctx.sysroot.join(SERVICES_DIR), ".svc")?
+    let services = ctx.sysroot.join(SERVICES_DIR);
+    let mut names = crate::signing::config_files(&services, ".svc")?
         .context("the sysroot holds no service recipes")?;
-    ensure!(
-        names.iter().any(|name| name == RECIPE_UNINDEXED),
-        "the sysroot holds no {SERVICES_DIR}/{RECIPE_UNINDEXED}"
-    );
+    for required in [RECIPE_UNINDEXED, RECIPE_REPLAYED]
+    {
+        ensure!(
+            names.iter().any(|name| name == required),
+            "the sysroot holds no {SERVICES_DIR}/{required}"
+        );
+    }
     names.retain(|name| name != RECIPE_UNINDEXED);
-    names.push(RECIPE_REMOVED.to_owned());
-    names.sort_unstable();
+    let mut entries = crate::signing::index_entries(&services, &names)?;
+    // The digest of a file the directory lacks is never compared.
+    entries.push((RECIPE_REMOVED.to_owned(), objsig::index::body_digest(b"")));
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let index_object = signer.sign(
-        &crate::signing::index_body(&names)?,
+        &crate::signing::index_body(&entries)?,
         config_only,
         &install_name(&index),
     )?;
+    // Validly signed, in the configuration role and under its install path,
+    // over a body the index does not hold: an older or altered signed copy.
+    let replayed_object = {
+        let mut body = crate::signing::body_of(&read_sysroot(ctx, &replayed)?)?.to_vec();
+        body.extend_from_slice(b"# a body the index was not signed with\n");
+        signer.sign(&body, config_only, &install_name(&replayed))?
+    };
     let unsigned_body = crate::signing::body_of(&read_sysroot(ctx, &unsigned)?)?.to_vec();
     let staged = [
         (&tampered, flip_body_byte(&read_sysroot(ctx, &tampered)?)?),
@@ -396,12 +415,15 @@ fn configuration_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signe
                 RoleSet::of(&[Role::Service]),
             )?,
         ),
+        (&replayed, replayed_object),
         (&class, flip_body_byte(&read_sysroot(ctx, &class)?)?),
         (&index, index_object),
     ];
     for (relative, bytes) in &staged
     {
-        let tag = relative.replace('/', "_");
+        // Named for the case: the `index` case stages its own index of the
+        // same directory in `dir`.
+        let tag = format!("configuration_{}", relative.replace('/', "_"));
         substitutes.push(sub(relative, stage(dir, &tag, bytes)?));
     }
 
@@ -443,6 +465,11 @@ fn configuration_owed() -> Vec<String>
         recipe_dropped(&not_configuration, "InvalidData"),
         refused(SERVICE_CONFIGURATION_KEY, "Failed(KeyUsage)"),
         format!("create: {service:?} refused: its signature did not verify"),
+        format!(
+            "{}: its body is not the one the directory's index was signed with; refused",
+            install_name(&config_path(SERVICES_DIR, RECIPE_REPLAYED))
+        ),
+        recipe_dropped(&config_path(SERVICES_DIR, RECIPE_REPLAYED), "InvalidData"),
         recipe_dropped(&config_path(SERVICES_DIR, RECIPE_REMOVED), "NotFound"),
         format!(
             "{}: not named by the directory's index; not read",
@@ -473,7 +500,11 @@ fn index_case(ctx: &Context, dir: &Path) -> Result<Case>
         let tampered = flip_body_byte(&read_sysroot(ctx, &index)?)?;
         substitutes.push(sub(
             &index,
-            stage(dir, &index.replace('/', "_"), &tampered)?,
+            stage(
+                dir,
+                &format!("index_{}", index.replace('/', "_")),
+                &tampered,
+            )?,
         ));
         let name = install_name(&index);
         expect.push(format!(

@@ -758,7 +758,7 @@ pub enum SyscallError
     QueueFull = -13,
     // -14 retired (`DmaUnsafe`, removed with `SYS_DMA_GRANT`); never reuse.
     /// The target object is not in the required state for this operation
-    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
+    /// (e.g. a running thread for `read_regs`/`write_regs`).
     InvalidState = -15,
     /// A blocking operation was cancelled: the thread was stopped or
     /// interrupted by an upcall, the notification, event queue, or wait set it
@@ -1543,6 +1543,18 @@ pub const FAULT_CLASS_ALL: u64 = !0u64;
 // byte order. Its size and the offsets userspace edits are fixed here per
 // architecture (both are named on every target, so a consumer selects by its
 // own target); the kernel asserts its `TrapFrame` against them at compile time.
+
+/// `SYS_THREAD_READ_REGS` secondary return: the thread was `Stopped`.
+pub const THREAD_REGS_STOPPED: u64 = 0;
+/// `SYS_THREAD_READ_REGS` secondary return: the thread was blocked in a fault
+/// or an upcall delivery, awaiting its handler's reply or queued for its
+/// handler's receive.
+pub const THREAD_REGS_FAULT: u64 = 1;
+/// `SYS_THREAD_READ_REGS` secondary return: the thread was blocked in a
+/// syscall. The frame is the one its syscall entry built; the result
+/// registers hold what the thread entered with until the syscall returns, and
+/// `SYS_THREAD_WRITE_REGS` refuses the thread.
+pub const THREAD_REGS_SYSCALL: u64 = 2;
 
 /// x86-64 register-file size in bytes.
 pub const REGS_X86_64_SIZE: usize = 168;

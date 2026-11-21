@@ -1329,8 +1329,9 @@ hit by a `hello` the command types at the shell once the terminal's READY line a
 `core-death power-off armed` line have appeared. It passes for a target when QMP's `SHUTDOWN` event,
 after the kill, gives reason `guest-shutdown`, and QEMU exits on its own within two minutes of the
 kill; [docs/testing.md](../docs/testing.md) § Core death (`test-core-death`) says when each target
-is killed and which path powers the system off. A main thread the stub reports held in a call
-(`E06`) has its program counter read again every 100 ms until the call returns, for up to 60 s.
+is killed and which path powers the system off. A main thread whose program-counter write the stub
+refuses as held in a call (`E06`) has its program counter read and written again every 100 ms
+until the call returns, for up to 60 s.
 Every target is tried; the command fails naming each one that failed.
 
 A pure runner; requires a populated sysroot with the default boot set (terminal + shell):

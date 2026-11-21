@@ -153,13 +153,14 @@ else
     REGS_RISCV64_SIZE
 };
 
-/// The register file of a stopped or fault-blocked thread, or `None` when
-/// it cannot be read (the thread runs, or waits elsewhere).
+/// The register file of a stopped or fault-blocked thread, or `None` for
+/// any other: one that runs does not read, and one blocked in a syscall reads
+/// as such.
 fn stopped_regs(thread: u64) -> Option<[u8; REGS_BYTES]>
 {
     let mut file = [0u8; REGS_BYTES];
-    syscall::thread_read_regs(thread, &mut file).ok()?;
-    Some(file)
+    let (_, held) = syscall::thread_read_regs(thread, &mut file).ok()?;
+    (held != syscall_abi::THREAD_REGS_SYSCALL).then_some(file)
 }
 
 /// Spawn `/programs/crashme <mode>`.

@@ -39,7 +39,7 @@ use gdb_rsp::frame::{AckMode, Event, PacketReader, PacketWriter, unescape};
 use gdb_rsp::target::TARGET_XML_ANNEX;
 use gdbstub::breakpoints;
 use gdbstub::control::{self, Plan};
-use gdbstub::session::{self, Kernel, Page, Resumed, Session, Stop};
+use gdbstub::session::{self, Kernel, Page, RegisterAccess, Resumed, Session, Stop};
 use gdbstub::{regs, signal, stop_signal};
 use ipc::{
     IpcMessage, procmgr_errors, procmgr_labels, serial_errors, serial_labels, svcmgr_labels,
@@ -475,8 +475,10 @@ impl Kernel for Sys
         let mut file = [0u8; 512];
         let size = regs::file_size(ARCH);
         let part = file.get_mut(..size)?;
-        syscall::thread_read_regs(cap, part).ok()?;
-        Some(regs::pc(ARCH, part))
+        let (_, held) = syscall::thread_read_regs(cap, part).ok()?;
+        // A thread blocked in a syscall reads too, at that syscall: it is at
+        // no stop, which the session's credit of a stop to it assumes.
+        (held != syscall_abi::THREAD_REGS_SYSCALL).then(|| regs::pc(ARCH, part))
     }
 
     fn set_pc(&mut self, cap: u64, pc: u64) -> bool
@@ -493,9 +495,15 @@ impl Kernel for Sys
             return false;
         }
         regs::set_pc(ARCH, part, pc);
-        // SAFETY: the register file was read from this stopped thread just
-        // above; only its pointer changed.
+        // SAFETY: the register file was read from this thread just above;
+        // only its pointer changed, and the kernel writes it only into a
+        // stopped or fault-blocked thread.
         unsafe { syscall::thread_write_regs(cap, part) }.is_ok()
+    }
+
+    fn read_regs(&mut self, cap: u64, file: &mut [u8]) -> Result<u64, i64>
+    {
+        syscall::thread_read_regs(cap, file).map(|(_, held)| held)
     }
 
     fn alive(&mut self, cap: u64) -> bool
@@ -1208,50 +1216,36 @@ impl Stub
         self.resume(plan, None, ipc_buf);
     }
 
-    /// The current thread's register file, read; `None` without a target or
-    /// when the read fails (the thread exited, or is not held).
-    fn read_file(&self) -> Option<(u64, [u8; 512])>
+    /// The current thread's register file, read for a request that does
+    /// `access` with it ([`Session::read_registers`]), and the thread's cap;
+    /// the error number the request answers when it cannot be read, `E01`
+    /// without a target.
+    fn read_file(&mut self, access: RegisterAccess) -> Result<(u64, [u8; 512]), u8>
     {
-        let session = self.session.as_ref()?;
-        let cap = session.cap(session.current)?;
+        let Some(session) = &mut self.session
+        else
+        {
+            return Err(1);
+        };
+        let current = session.current;
+        let cap = session.cap(current).ok_or(1)?;
         let mut file = [0u8; 512];
-        let part = file.get_mut(..regs::file_size(ARCH))?;
-        syscall::thread_read_regs(cap, part).ok()?;
-        Some((cap, file))
-    }
-
-    /// The error number a failed read of the current thread's register file
-    /// answers ([`Session::register_refusal`]).
-    fn register_refusal(&mut self) -> u8
-    {
-        match &self.session
-        {
-            Some(s) => s.register_refusal(&mut self.sys, s.current),
-            None => 1,
-        }
-    }
-
-    /// Hold the current thread once the call that held it has returned
-    /// ([`Session::await_call`]), so that its registers read.
-    fn await_call(&mut self)
-    {
-        if let Some(s) = &mut self.session
-        {
-            let current = s.current;
-            s.await_call(&mut self.sys, current);
-        }
+        let part = file.get_mut(..regs::file_size(ARCH)).ok_or(1)?;
+        session.read_registers(&mut self.sys, current, part, access)?;
+        Ok((cap, file))
     }
 
     /// `g` (every register, `regnum` `None`) or `p` (one).
     fn read_registers(&mut self, regnum: Option<usize>, ipc_buf: *mut u64)
     {
-        self.await_call();
-        let Some((_, file)) = self.read_file()
-        else
+        let file = match self.read_file(RegisterAccess::Read)
         {
-            let code = self.register_refusal();
-            self.error(ipc_buf, code);
-            return;
+            Ok((_, file)) => file,
+            Err(code) =>
+            {
+                self.error(ipc_buf, code);
+                return;
+            }
         };
         match regnum
         {
@@ -1267,13 +1261,14 @@ impl Stub
     /// `G` (every register, `regnum` `None`) or `P` (one).
     fn write_registers(&mut self, regnum: Option<usize>, hex: &[u8], ipc_buf: *mut u64)
     {
-        self.await_call();
-        let Some((cap, mut file)) = self.read_file()
-        else
+        let (cap, mut file) = match self.read_file(RegisterAccess::Write)
         {
-            let code = self.register_refusal();
-            self.error(ipc_buf, code);
-            return;
+            Ok(read) => read,
+            Err(code) =>
+            {
+                self.error(ipc_buf, code);
+                return;
+            }
         };
         let Some(part) = file.get_mut(..regs::file_size(ARCH))
         else

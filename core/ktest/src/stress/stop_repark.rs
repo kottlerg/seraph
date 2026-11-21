@@ -42,12 +42,20 @@
 //! delay, restart it, wait until it enters its next wait (bounded by
 //! [`ENTRY_WAIT_US`]; a round that times out is tallied), and spin a varying
 //! delay, so stops land on a park with the sender's delivery before, during,
-//! and after the cancellation. After the rounds, with the sender paused, the
-//! controller delivers to A and to B until the waiter has consumed a delivery
-//! on each (bounded by [`FINAL_POLLS`]): a lost wake or a stranded waiter
+//! and after the cancellation. Every second round is checked: after the
+//! entry, the controller waits until the waiter has consumed a delivery since
+//! the stop (bounded by [`DELIVERY_WAIT_US`]) before its spin, and a timeout
+//! pauses the sender, probes the waiter ([`probe_waiter`]) and fails the
+//! cell. A restart that leaves the waiter stopped, undispatched, or parked
+//! where no delivery wakes it makes no progress, and the next stop would
+//! cancel that park and hide it, so the check catches a strand after any
+//! checked restart, not only after the last. The other rounds keep the stop
+//! landing on the first park after the restart. After the rounds, with the
+//! sender paused, the controller delivers to A and to B until the waiter has
+//! consumed a delivery on each (bounded by [`FINAL_POLLS`]): a lost wake or a stranded waiter
 //! makes no progress on one of them. A failed final check logs the rounds'
-//! tallies and probes the waiter ([`probe_waiter`]) before the children end,
-//! so the log names where it was stranded. When a held round or the final
+//! tallies and probes the waiter before the children end, so the log names
+//! where it was stranded. When a checked round, a held round or the final
 //! check fails, a wait that returned a wrong result is reported in its place,
 //! since such a wait consumes a delivery without counting it and sends the
 //! waiter on to the other source, so the round or the check waits for a count
@@ -128,8 +136,9 @@ const VALUES: [u64; SOURCES] = [1 << 0, 1 << 1];
 const ENTRY_WAIT_US: u64 = 100_000;
 const ENTRY_SPINS: u32 = 100_000;
 
-/// Bound on a held round's wait for the waiter to have consumed a delivery
-/// on both sources, in microseconds.
+/// Bound on a checked round's wait for the waiter to have consumed a
+/// delivery since the stop, and on a held round's wait for it to have
+/// consumed a delivery on both sources, in microseconds.
 ///
 /// Applied through [`crate::scaled_bound`], which stretches it past
 /// [`crate::UNSCALED_CPUS`] CPUs.
@@ -311,16 +320,16 @@ fn log_seen(seen: &Seen)
     }
 }
 
-/// After a failed final check, log where the waiter is and what one more
-/// stop and restart of it does, so the failure's log names the strand: the
-/// counters' totals, which the entry count's parity places on a source (the
-/// `n`th wait, counting from 1, is on source `(n - 1) % 2`), the stop's and
-/// the start's results (`InvalidState` from the stop means the waiter was
-/// left `Stopped`), and, once restarted, whether it enters another wait
-/// (bounded by [`EXIT_POLLS`]) and how the stranded wait returned: an
-/// interrupt on its source means it was parked where no delivery reached
-/// it, a delivery means its wake was claimed but never made, and no new
-/// entry means it is not dispatched.
+/// After a failed checked round or final check, log where the waiter is and
+/// what one more stop and restart of it does, so the failure's log names the
+/// strand: the counters' totals, which the entry count's parity places on a
+/// source (the `n`th wait, counting from 1, is on source `(n - 1) % 2`), the
+/// stop's and the start's results (`InvalidState` from the stop means the
+/// waiter was left `Stopped`), and, once restarted, whether it enters
+/// another wait (bounded by [`EXIT_POLLS`]) and how the stranded wait
+/// returned: an interrupt on its source means it was parked where no delivery
+/// reached it, a delivery means its wake was claimed but never made, and no
+/// new entry means it is not dispatched.
 fn probe_waiter(waiter: u64)
 {
     let log_counts = |stage: &str| {
@@ -515,8 +524,10 @@ fn create_thread(
 }
 
 /// Stop and restart the waiter [`CYCLES`] times, waiting after each restart
-/// until it has entered a new wait, then run held rounds ([`held_rounds`]).
-/// Returns the rounds whose entry wait timed out, and the held rounds run.
+/// until it has entered a new wait and, in every second round, until it has
+/// consumed a delivery since the stop ([`require_consumed`]), then run held
+/// rounds ([`held_rounds`]). Returns the rounds whose entry wait timed out,
+/// and the held rounds run.
 fn rounds(waiter: u64) -> Result<(u32, u32), &'static str>
 {
     let mut starved = 0u32;
@@ -526,6 +537,7 @@ fn rounds(waiter: u64) -> Result<(u32, u32), &'static str>
         // Stopped and off its CPU: the waiter's count is stable until the
         // restart.
         let entered = WAITS_ENTERED.load(Ordering::Acquire);
+        let consumed = consumed_total();
         let hash = cycle.wrapping_mul(2_654_435_761);
         // 0 to 4095 spins stopped.
         for _ in 0..(hash >> 20)
@@ -537,6 +549,10 @@ fn rounds(waiter: u64) -> Result<(u32, u32), &'static str>
         {
             starved = starved.saturating_add(1);
         }
+        if cycle % 2 == 0
+        {
+            require_consumed(waiter, consumed)?;
+        }
         // 0 to 1023 spins after the entry, so the stop lands around the
         // sender's delivery.
         for _ in 0..(hash >> 22)
@@ -546,6 +562,45 @@ fn rounds(waiter: u64) -> Result<(u32, u32), &'static str>
     }
     let extra = held_rounds(waiter, &mut starved)?;
     Ok((starved, extra))
+}
+
+/// Deliveries the waiter has consumed on both sources.
+fn consumed_total() -> u32
+{
+    DELIVERED
+        .iter()
+        .fold(0u32, |n, d| n.wrapping_add(d.load(Ordering::Acquire)))
+}
+
+/// A checked round's wait, bounded by [`DELIVERY_WAIT_US`], until the
+/// restarted waiter has consumed a delivery since the stop (the total moved
+/// past `consumed`). On a timeout, pause the sender and probe the waiter
+/// ([`probe_waiter`]), then fail, since a waiter left stopped, undispatched,
+/// or parked where no delivery wakes it makes no progress, and the next stop
+/// would cancel that park and hide it. The sender is paused first, as before
+/// the final check, so the probe's restarted counters show the stranded
+/// wait's own result and no delivery the sender makes after the restart; a
+/// pause that times out is logged before the probe, whose restarted counters
+/// may then include the sender's deliveries.
+fn require_consumed(waiter: u64, consumed: u32) -> TestResult
+{
+    if super::await_within(crate::scaled_bound(DELIVERY_WAIT_US), || {
+        consumed_total() != consumed
+    })?
+    {
+        return Ok(());
+    }
+    // The round's failure is what the phase returns, so a pause that timed
+    // out is logged here, before the probe whose reading it weakens.
+    if let Err(e) = pause_sender()
+    {
+        crate::log_args(format_args!("ktest: {CELL} probe pause failed: {e}"));
+    }
+    probe_waiter(waiter);
+    Err(
+        "stress::stop_repark: the waiter consumed no delivery after a checked round's restart (a \
+         wake was lost, or the waiter is stranded)",
+    )
 }
 
 /// After the fixed rounds, while either source has had no delivery

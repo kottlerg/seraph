@@ -61,6 +61,7 @@ pub mod park_interrupted_stop_start;
 pub mod priority_preemption;
 pub mod queued_waiters_fifo;
 pub mod range_copy_lineage;
+pub mod read_regs_blocked_syscall;
 pub mod reply_binding_displaced;
 pub mod retype_over_mapped_refused;
 pub mod retype_reclaim;
@@ -303,6 +304,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::write_regs_blocked_syscall",
         write_regs_blocked_syscall::run(ctx)
+    );
+    run_integration_test!(
+        "integration::read_regs_blocked_syscall",
+        read_regs_blocked_syscall::run(ctx)
     );
     run_integration_test!(
         "integration::user_mode_controls",

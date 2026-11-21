@@ -36,7 +36,8 @@ services/svctest/
         ├── mod.rs             # Ordered phase registry; one module per surface under test
         ├── startup.rs         # argv, env, stack envelope, TLS at entry; unset cwd path
         ├── memmgr.rs          # Heap; donation; stray caps; retyped grant; CSpace funding;
-        │                      # CSpace low-water hold; object-slab release; deferred
+        │                      # CSpace low-water hold; CSpace funded from no free slot;
+        │                      # object-slab release; deferred
         │                      # reclaim; identity; physical base withheld; frames
         │                      # zeroed at hand-out
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS,

@@ -645,7 +645,10 @@ fn read_thread(
 )
 {
     let mut file = [0u8; arch::current::REGS_SIZE];
-    let stopped_at_ip = syscall::thread_read_regs(thread, &mut file).is_ok()
+    // A thread blocked in a syscall reads too, its frame naming that syscall
+    // rather than a fault, so only a stopped or fault-blocked read counts.
+    let stopped_at_ip = syscall::thread_read_regs(thread, &mut file)
+        .is_ok_and(|(_, held)| held != syscall_abi::THREAD_REGS_SYSCALL)
         && word_at(&file, arch::current::IP_OFFSET) == ip;
     out.code = read_code(thread, ip);
     if !stopped_at_ip

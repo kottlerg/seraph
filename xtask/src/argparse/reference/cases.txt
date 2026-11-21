@@ -178,7 +178,7 @@ error: the following required arguments were not provided:
   <ADDR>...
 
 ["review-ledger"]
-ok-all review-ledger
+ok-all review-ledger check=default
 
 ["review-ledger","--release","0.1.5","--from","v0.1.4","--file","a","--file","b"]
 ok review-ledger release=["0.1.5"] from=["v0.1.4"] file=["a","b"]
@@ -192,11 +192,12 @@ ok review-ledger pr=["5"] check
 
 ["review-ledger","--check"]
 MissingRequiredArgument
-error: x
+error: the following required arguments were not provided:
+  <PR>
 
 ["review-ledger","--check","--release","0.1.5","--from","v0.1.4"]
 ArgumentConflict
-error: x
+error: the argument '--check' cannot be used with '--release <RELEASE>'
 
 ["ktest-timing","--base","a","--wide","b"]
 ok ktest-timing base=["a"] wide=["b"]
@@ -14147,9 +14148,8 @@ ok compare-images wait_host=["7"] host_override
 ok compare-images base=["7"] head=["7"] arch=["x86_64"] profile=["debug","release"] wait_host=["7"] host_override
 
 ["review-check"]
-MissingRequiredArgument
-error: the following required arguments were not provided:
-  <PR>
+InvalidSubcommand
+error: unrecognized subcommand 'review-check'
 
 ["review-ledger","-h"]
 help xtask review-ledger -h

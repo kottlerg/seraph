@@ -904,7 +904,18 @@ pub fn run_ledger(ctx: &BuildContext, args: &ReviewLedgerArgs) -> Result<()>
 {
     match ledger_target(args)?
     {
-        LedgerTarget::Pr(pr) => write_pr_ledger(ctx, pr, args.check),
+        LedgerTarget::Pr(pr) =>
+        {
+            let action = if args.check
+            {
+                PrAction::Check
+            }
+            else
+            {
+                PrAction::Write
+            };
+            write_pr_ledger(ctx, pr, action)
+        }
         LedgerTarget::Release { version, from } =>
         {
             print_release_ledger(ctx, &version, &from, &args.file)
@@ -957,10 +968,20 @@ fn release_version(version: &str) -> Result<String>
     Ok(version.to_owned())
 }
 
-/// Validate a pull request's run records and, unless `check_only`, write
+/// What `review-ledger <N>` does once every record has the record shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrAction
+{
+    /// Write `ledger.json`.
+    Write,
+    /// Nothing more: `--check`.
+    Check,
+}
+
+/// Validate a pull request's run records and, for `PrAction::Write`, write
 /// `ledger.json` beside them. A malformed record fails the command before
 /// anything is written.
-fn write_pr_ledger(ctx: &BuildContext, pr: u64, check_only: bool) -> Result<()>
+fn write_pr_ledger(ctx: &BuildContext, pr: u64, action: PrAction) -> Result<()>
 {
     let dir = record_dir(ctx, pr);
     step(&format!("Checking the run records in {}", dir.display()));
@@ -971,7 +992,7 @@ fn write_pr_ledger(ctx: &BuildContext, pr: u64, check_only: bool) -> Result<()>
         Ok(ledger) => ledger,
         Err(diags) => return report("review-ledger", &diags, Strictness::ErrorsOnly),
     };
-    if check_only
+    if action == PrAction::Check
     {
         return report("review-ledger", &[], Strictness::ErrorsOnly);
     }
@@ -1997,10 +2018,16 @@ mod tests
             ("full-1234abcd.json".to_owned(), Value::Null),
             ("audit-1234abcd.json".to_owned(), json!([])),
         ];
-        assert_eq!(unread(&records), ["full-1234abcd.json", "audit-1234abcd.json"]);
+        assert_eq!(
+            unread(&records),
+            ["full-1234abcd.json", "audit-1234abcd.json"]
+        );
         let dir = Path::new("target/xtask/review/release-v0.1.5");
         let err = refuse_unread(dir, &records).unwrap_err().to_string();
-        assert!(err.contains("full-1234abcd.json, audit-1234abcd.json"), "{err}");
-        assert!(refuse_unread(dir, &records[..1]).is_ok());
+        assert!(
+            err.contains("full-1234abcd.json, audit-1234abcd.json"),
+            "{err}"
+        );
+        refuse_unread(dir, &records[..1]).unwrap();
     }
 }

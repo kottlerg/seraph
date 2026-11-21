@@ -1197,7 +1197,7 @@ args! {
         pub pr: Option<u64>,
 
         /// Validate the pull request's records alone and write nothing.
-        #[arg(long, requires = "pr")]
+        #[arg(long, requires = "pr", conflicts_with = "release")]
         pub check: bool,
 
         /// The target version `X.Y.Z` of a release review: print its ledger, the

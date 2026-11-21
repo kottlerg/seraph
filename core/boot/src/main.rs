@@ -23,6 +23,7 @@ mod firmware;
 mod framebuffer;
 mod memory_map;
 mod paging;
+mod rollback;
 mod signing;
 mod uefi;
 
@@ -33,9 +34,9 @@ use crate::paging::{PageTableBuilder, build_initial_tables};
 use crate::signing::{Verifier, parse_store};
 use crate::uefi::{
     EFI_RNG_PROTOCOL_GUID, EFI_SUCCESS, EfiBootServices, EfiFileProtocol, EfiGuid, EfiHandle,
-    EfiRngProtocol, EfiSystemTable, allocate_pages, connect_all_controllers, exit_boot_services,
-    file_read, file_size, free_pages, get_loaded_image, get_memory_map, open_esp_volume, open_file,
-    query_gop,
+    EfiRngProtocol, EfiSystemTable, FirmwareVariables, allocate_pages, connect_all_controllers,
+    exit_boot_services, file_read, file_size, free_pages, get_loaded_image, get_memory_map,
+    open_esp_volume, open_file, query_gop,
 };
 use boot_protocol::{
     BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage,
@@ -451,7 +452,16 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // The trust store every object is verified against (docs/signing.md
     // § Trust Store); one that does not parse halts the boot here.
     let store_bytes = signing::embedded_store();
-    let mut verifier = Verifier::new(parse_store(store_bytes)?);
+    let store = parse_store(store_bytes)?;
+    // The machine's security floor (docs/signing.md § Rollback Floor): one
+    // above the store's refuses this bootloader before it loads anything.
+    // SAFETY: ctx.st is the valid system table; boot services have not exited,
+    // and the value is dropped at the end of the statement.
+    let floor = rollback::read_floor(
+        &mut unsafe { FirmwareVariables::new(ctx.st) },
+        store.security_floor(),
+    )?;
+    let mut verifier = Verifier::new(store);
     // SAFETY: ctx.esp_root is a valid FAT directory handle.
     let bundle_load = unsafe { step2_load_bundle(&ctx)? };
     // SAFETY: ctx.bs / esp_root are valid until ExitBootServices.
@@ -459,6 +469,12 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // SAFETY: bundle_load.phys/len name a valid identity-mapped UEFI allocation.
     let (init, mods) =
         unsafe { step4_parse_bundle(&ctx, &bundle_load, &mut verifier, store_bytes)? };
+    // The kernel and every bundle entry have verified: raise the machine's
+    // floor to the store's when it is the higher one. The last variable call
+    // of the boot, ahead of the memory-map reads of steps 6 and 7.
+    // SAFETY: ctx.st is the valid system table; boot services have not exited,
+    // and the value is dropped at the end of the statement.
+    rollback::record_floor(&mut unsafe { FirmwareVariables::new(ctx.st) }, floor);
     // SAFETY: ctx.st is a valid UEFI system table.
     let firm = unsafe { step5_discover_firmware(&ctx) };
     // SAFETY: ctx.st is valid; firmware addresses are identity-mapped by UEFI.

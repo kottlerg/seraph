@@ -42,6 +42,12 @@ of one signing key carries is verified once ([docs/signing.md](../../../docs/sig
 § Verification). A store that does not parse
 is fatal (`BootError::TrustStore`).
 
+The bootloader then reads the machine's security floor from its UEFI variable
+([docs/signing.md](../../../docs/signing.md) § Rollback Floor) and logs it beside the store's.
+A machine's floor above the store's is fatal (`BootError::FloorAboveStore`), and so is a
+malformed variable (`BootError::FloorMalformed`), before any object is loaded; a read the
+firmware fails is one warning, and the boot runs on the store's floor.
+
 Detail: [uefi-environment.md](uefi-environment.md)
 
 ### Step 2: Load Bootstrap Bundle
@@ -129,6 +135,11 @@ which step 9 lists after the bundle's modules (docs/signing.md § Trust Store).
 
 Step 6 identity-maps the whole bundle allocation, of which the bundle's module bodies are
 slices, and the `trust-store` module's own pages.
+
+With the kernel and every bundle entry verified, the bootloader writes the store's floor to the
+machine's floor variable when it is the higher one, the boot's last variable call
+([uefi-environment.md](uefi-environment.md) § Variable Services); a write the firmware refuses is
+one warning, and the boot continues on the store's floor.
 
 Detail: [elf-loading.md](elf-loading.md)
 

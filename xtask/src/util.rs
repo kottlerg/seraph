@@ -265,6 +265,19 @@ fn install_hint_for(name: &str) -> String
             Debian / Ubuntu:  apt install swtpm swtpm-tools\n  \
             Arch:             pacman -S swtpm"
             .into(),
+        "sbsign" | "sbverify" => "The bootloader's Authenticode signature (a build with \
+            SERAPH_SECURE_BOOT_KEY set, and `cargo xtask test secureboot`) uses sbsigntools. \
+            Install with:\n  \
+            Fedora:           dnf install sbsigntools\n  \
+            Debian / Ubuntu:  apt install sbsigntool\n  \
+            Arch:             pacman -S sbsigntools"
+            .into(),
+        "virt-fw-vars" => "`cargo xtask test secureboot` enrols its keys in a firmware variable \
+            store with virt-firmware's virt-fw-vars. Install with:\n  \
+            Fedora:           dnf install python3-virt-firmware\n  \
+            Debian / Ubuntu:  apt install python3-virt-firmware\n  \
+            Any host:         pip install virt-firmware"
+            .into(),
         "cargo" | "rustc" => "Install rustup (https://rustup.rs/); xtask requires the toolchain \
              pinned in rust-toolchain.toml. This usually means xtask itself was invoked \
              outside a rustup-managed environment."

@@ -664,6 +664,11 @@ pub struct QemuLaunchSpec<'a>
     pub second_disk: Option<SecondDisk<'a>>,
     pub firmware_code_path: &'a Path,
     pub firmware_vars_path: &'a Path,
+    /// `x86_64`: the firmware requires SMM, as OVMF's Secure Boot build does
+    /// ([`Firmware::smm`]): the machine runs with SMM, and only SMM code
+    /// writes the variable store, so the operating system cannot rewrite the
+    /// enrolled keys. Ignored on riscv64.
+    pub smm: bool,
     pub cpus: u32,
     /// Logical CPUs per core the guest's topology reports (QEMU
     /// `-smp <cpus>,threads=<n>`): 1 makes each vCPU a core of its own, 2 pairs
@@ -1054,6 +1059,19 @@ fn check_x86_paging(paging: X86Paging, accel: Accel, host_has_la57: bool) -> Res
     Ok(())
 }
 
+/// The arguments of an SMM firmware's launch ([`QemuLaunchSpec::smm`]): a
+/// `-machine` option, which QEMU merges into the machine's, and the pflash
+/// devices' `secure` property.
+fn smm_args() -> [String; 4]
+{
+    [
+        "-machine".into(),
+        "smm=on".into(),
+        "-global".into(),
+        "driver=cfi.pflash01,property=secure,value=on".into(),
+    ]
+}
+
 fn extend_x86(
     args: &mut Vec<String>,
     spec: &QemuLaunchSpec,
@@ -1081,6 +1099,10 @@ fn extend_x86(
         "q35"
     };
     args.extend(["-machine".into(), machine.into()]);
+    if spec.smm
+    {
+        args.extend(smm_args());
+    }
 
     // VT-d DMA and interrupt remapping, with 32-bit (x2APIC) destinations
     // offered.
@@ -1310,6 +1332,9 @@ pub struct Firmware
     pub code: PathBuf,
     /// The variable-store template each launch's store is copied from.
     vars_template: PathBuf,
+    /// Whether the code image requires SMM ([`QemuLaunchSpec::smm`]): the
+    /// x86-64 Secure Boot build ([`Firmware::prepare_secure_boot`]).
+    pub smm: bool,
     /// Where the per-launch stores are created.
     vars_dir: PathBuf,
 }
@@ -1388,6 +1413,44 @@ impl Firmware
             code,
             vars_template,
             vars_dir,
+            smm: false,
+        })
+    }
+
+    /// Resolve `arch`'s Secure Boot firmware
+    /// ([`firmware::find_secure_boot_firmware`]): on x86-64 OVMF's SMM build,
+    /// launched with SMM; on riscv64 an EDK2 build with Secure Boot, its two
+    /// images padded as [`Firmware::prepare`] pads the default pair, under
+    /// their own names. Whether it enforces Secure Boot is the caller's to
+    /// test.
+    pub fn prepare_secure_boot(ctx: &Context, arch: Arch) -> Result<Self>
+    {
+        let vars_dir = launch_vars_dir(ctx);
+        std::fs::create_dir_all(&vars_dir)
+            .with_context(|| format!("creating {}", vars_dir.display()))?;
+        let (code, vars_template) = firmware::find_secure_boot_firmware(arch)?;
+        let (code, vars_template) = match arch
+        {
+            Arch::X86_64 => (code, vars_template),
+            Arch::Riscv64 =>
+            {
+                let cache_dir = ctx.target_dir.join("xtask").join("firmware").join("riscv");
+                std::fs::create_dir_all(&cache_dir)
+                    .with_context(|| format!("creating firmware cache {}", cache_dir.display()))?;
+                (
+                    padded_copy(&code, &cache_dir.join("RISCV_VIRT_CODE.secure.32M.fd"))?,
+                    padded_copy(
+                        &vars_template,
+                        &cache_dir.join("RISCV_VIRT_VARS.secure.32M.fd"),
+                    )?,
+                )
+            }
+        };
+        Ok(Self {
+            code,
+            vars_template,
+            vars_dir,
+            smm: arch == Arch::X86_64,
         })
     }
 
@@ -1567,6 +1630,7 @@ mod tests
             second_disk: None,
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: Path::new("vars.fd"),
+            smm: false,
             cpus,
             threads_per_core: 1,
             mem_mib,
@@ -1734,6 +1798,7 @@ mod tests
             second_disk: None,
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: Path::new("vars.fd"),
+            smm: false,
             cpus: 4,
             threads_per_core: 1,
             mem_mib: 512,
@@ -1772,6 +1837,7 @@ mod tests
             second_disk: None,
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: Path::new("vars.fd"),
+            smm: false,
             cpus: 4,
             threads_per_core: 1,
             mem_mib: 512,
@@ -1789,6 +1855,28 @@ mod tests
             test_devices: false,
             hotplug_port: None,
         }
+    }
+
+    // Defect caught: OVMF's Secure Boot build launched without SMM, where it
+    // does not start, or without the secured pflash, where the guest can
+    // rewrite the enrolled keys; or SMM forced on every other launch.
+    #[test]
+    fn only_an_smm_firmware_launches_with_smm_and_a_secured_store()
+    {
+        let secured = |spec: &QemuLaunchSpec| {
+            let argv = build_qemu_argv(spec).unwrap();
+            argv.windows(2).any(|w| w == ["-machine", "smm=on"])
+                && argv
+                    .windows(2)
+                    .any(|w| w == ["-global", "driver=cfi.pflash01,property=secure,value=on"])
+        };
+        let mut spec = x86_spec(X86Paging::Four);
+        assert!(!secured(&spec));
+        spec.smm = true;
+        assert!(secured(&spec));
+        let mut riscv = riscv_spec(4, 512);
+        riscv.smm = true;
+        assert!(!secured(&riscv));
     }
 
     // Defect caught: a launch with no writable variable store (x86-64 ran on
@@ -1830,6 +1918,7 @@ mod tests
             code: dir.join("code.fd"),
             vars_template: template,
             vars_dir: dir.clone(),
+            smm: false,
         };
         let (a, b) = (
             firmware.launch_vars().unwrap(),

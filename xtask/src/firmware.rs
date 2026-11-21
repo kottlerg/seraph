@@ -15,6 +15,12 @@
 //! - **EDK2 RISC-V (riscv64)**: `RISCV_VIRT_CODE.fd` and
 //!   `RISCV_VIRT_VARS.fd`.
 //!
+//! The Secure Boot boots (`cargo xtask test secureboot`) take a pair of their
+//! own ([`find_secure_boot_firmware`]): a build that enforces Secure Boot,
+//! which neither architecture's default pair is on every host (x86-64's
+//! default OVMF is built without Secure Boot, and only some RISC-V EDK2
+//! builds have it; docs/build-system.md § QEMU and Firmware).
+//!
 //! Discovery is env-var-first, then per-`cfg(target_os)` default path
 //! tables, then a structured error that enumerates the tried paths and
 //! the install commands for every supported host. The env vars
@@ -131,6 +137,73 @@ const RISCV_FIRMWARE_DIRS: &[&str] = &["/usr/local/share/qemu", "/usr/local/shar
 )))]
 const RISCV_FIRMWARE_DIRS: &[&str] = &[];
 
+/// OVMF images with Secure Boot (x86-64): the SMM build each distribution
+/// ships beside the default one, which QEMU runs with SMM, and the default
+/// variable-store template. The first entry whose two files exist wins.
+#[cfg(target_os = "linux")]
+const OVMF_SECURE_DEFAULTS: &[(&str, &str)] = &[
+    // Debian and Ubuntu.
+    (
+        "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
+        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+    ),
+    // Fedora.
+    (
+        "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd",
+        "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+    ),
+    // Arch.
+    (
+        "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd",
+        "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+    ),
+];
+
+#[cfg(target_os = "macos")]
+const OVMF_SECURE_DEFAULTS: &[(&str, &str)] = &[
+    (
+        "/opt/homebrew/share/qemu/edk2-x86_64-secure-code.fd",
+        "/opt/homebrew/share/qemu/edk2-i386-vars.fd",
+    ),
+    (
+        "/usr/local/share/qemu/edk2-x86_64-secure-code.fd",
+        "/usr/local/share/qemu/edk2-i386-vars.fd",
+    ),
+];
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+))]
+const OVMF_SECURE_DEFAULTS: &[(&str, &str)] = &[(
+    "/usr/local/share/qemu/edk2-x86_64-secure-code.fd",
+    "/usr/local/share/qemu/edk2-i386-vars.fd",
+)];
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+)))]
+const OVMF_SECURE_DEFAULTS: &[(&str, &str)] = &[];
+
+/// RISC-V EDK2 images with Secure Boot (riscv64): the builds known to enforce
+/// it. Arch's `edk2-riscv64` does; Debian's and Ubuntu's
+/// `qemu-efi-riscv64` and Fedora's `edk2-riscv64` are built without it.
+#[cfg(target_os = "linux")]
+const RISCV_SECURE_DEFAULTS: &[(&str, &str)] = &[(
+    "/usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd",
+    "/usr/share/edk2/riscv64/RISCV_VIRT_VARS.fd",
+)];
+
+#[cfg(not(target_os = "linux"))]
+const RISCV_SECURE_DEFAULTS: &[(&str, &str)] = &[];
+
 // ── Public discovery API ─────────────────────────────────────────────────────
 
 /// Env var that, set together with [`ENV_OVMF_VARS`], names the OVMF code
@@ -148,6 +221,93 @@ pub const ENV_RISCV_CODE: &str = "SERAPH_RISCV_CODE";
 /// Env var that, set together with [`ENV_RISCV_CODE`], names the RISC-V
 /// variable-store template in place of the search.
 pub const ENV_RISCV_VARS: &str = "SERAPH_RISCV_VARS";
+
+/// Env var that, set together with [`ENV_OVMF_SECURE_VARS`], names the OVMF
+/// Secure Boot code image in place of the search.
+pub const ENV_OVMF_SECURE_CODE: &str = "SERAPH_OVMF_SECURE_CODE";
+
+/// Env var that, set together with [`ENV_OVMF_SECURE_CODE`], names its
+/// variable-store template.
+pub const ENV_OVMF_SECURE_VARS: &str = "SERAPH_OVMF_SECURE_VARS";
+
+/// Env var that, set together with [`ENV_RISCV_SECURE_VARS`], names a RISC-V
+/// code image built with Secure Boot in place of the search.
+pub const ENV_RISCV_SECURE_CODE: &str = "SERAPH_RISCV_SECURE_CODE";
+
+/// Env var that, set together with [`ENV_RISCV_SECURE_CODE`], names its
+/// variable-store template.
+pub const ENV_RISCV_SECURE_VARS: &str = "SERAPH_RISCV_SECURE_VARS";
+
+/// Locate `arch`'s Secure Boot firmware, returning `(code, vars)`: on x86-64
+/// an OVMF build that requires SMM, which QEMU must run with SMM
+/// (`QemuLaunchSpec::smm`), and on riscv64 an EDK2 build with Secure Boot.
+///
+/// The env pair (`SERAPH_OVMF_SECURE_CODE` with `SERAPH_OVMF_SECURE_VARS`,
+/// `SERAPH_RISCV_SECURE_CODE` with `SERAPH_RISCV_SECURE_VARS`) is
+/// all-or-nothing, as the default pairs' are; when neither is set, the first
+/// default entry whose two files exist is used. Whether the pair found
+/// enforces Secure Boot is the caller's to test: a firmware built without it
+/// boots any image.
+pub fn find_secure_boot_firmware(arch: crate::arch::Arch) -> Result<(PathBuf, PathBuf)>
+{
+    use crate::arch::Arch;
+    let (code_var, vars_var) = match arch
+    {
+        Arch::X86_64 => (ENV_OVMF_SECURE_CODE, ENV_OVMF_SECURE_VARS),
+        Arch::Riscv64 => (ENV_RISCV_SECURE_CODE, ENV_RISCV_SECURE_VARS),
+    };
+    find_secure_boot_firmware_impl(
+        arch,
+        std::env::var_os(code_var).as_deref(),
+        std::env::var_os(vars_var).as_deref(),
+    )
+}
+
+/// Implementation core of [`find_secure_boot_firmware`], parameterized on the
+/// env values as the others are.
+fn find_secure_boot_firmware_impl(
+    arch: crate::arch::Arch,
+    env_code: Option<&OsStr>,
+    env_vars: Option<&OsStr>,
+) -> Result<(PathBuf, PathBuf)>
+{
+    use crate::arch::Arch;
+    let (label, code_var, vars_var, defaults, hints) = match arch
+    {
+        Arch::X86_64 => (
+            "OVMF firmware with Secure Boot (x86-64)",
+            ENV_OVMF_SECURE_CODE,
+            ENV_OVMF_SECURE_VARS,
+            OVMF_SECURE_DEFAULTS,
+            OVMF_SECURE_INSTALL_HINTS,
+        ),
+        Arch::Riscv64 => (
+            "RISC-V EDK2 firmware with Secure Boot (riscv64)",
+            ENV_RISCV_SECURE_CODE,
+            ENV_RISCV_SECURE_VARS,
+            RISCV_SECURE_DEFAULTS,
+            RISCV_SECURE_INSTALL_HINTS,
+        ),
+    };
+    if let Some(pair) = env_pair(env_code, env_vars, code_var, vars_var)?
+    {
+        return Ok(pair);
+    }
+    for (code, vars) in defaults
+    {
+        let (code, vars) = (PathBuf::from(code), PathBuf::from(vars));
+        if code.is_file() && vars.is_file()
+        {
+            return Ok((code, vars));
+        }
+    }
+    let tried: Vec<String> = defaults
+        .iter()
+        .map(|(code, vars)| format!("{code} with {vars}"))
+        .collect();
+    let tried: Vec<&str> = tried.iter().map(String::as_str).collect();
+    Err(not_found_error(label, code_var, vars_var, &tried, hints))
+}
 
 /// Locate the OVMF images, returning `(code, vars)`.
 ///
@@ -359,6 +519,24 @@ const OVMF_INSTALL_HINTS: &str = "  Fedora:           dnf install edk2-ovmf\n  \
                                   FreeBSD:          pkg install edk2-qemu-x64\n  \
                                   Windows:          set SERAPH_OVMF_CODE and SERAPH_OVMF_VARS\n";
 
+/// Per-platform install hints for the OVMF Secure Boot build.
+const OVMF_SECURE_INSTALL_HINTS: &str = "  The SMM Secure Boot build ships with the default one:\n  \
+                                         Fedora:           dnf install edk2-ovmf\n  \
+                                         Debian / Ubuntu:  apt install ovmf\n  \
+                                         Arch:             pacman -S edk2-ovmf\n  \
+                                         macOS (Homebrew): brew install qemu\n";
+
+/// Per-platform install hints for a RISC-V EDK2 build with Secure Boot.
+const RISCV_SECURE_INSTALL_HINTS: &str = "  Only some builds have Secure Boot (docs/build-system.md § QEMU and \
+                                          Firmware):\n  \
+                                          Arch:      pacman -S edk2-riscv64 (built with it)\n  \
+                                          Any host:  set SERAPH_RISCV_SECURE_CODE and \
+                                          SERAPH_RISCV_SECURE_VARS to the two images of Arch's \
+                                          edk2-riscv64, or of an EDK2 RiscVVirtQemu build with \
+                                          SECURE_BOOT_ENABLE\n  \
+                                          Not these: Debian and Ubuntu qemu-efi-riscv64, Fedora \
+                                          edk2-riscv64 (built without it)\n";
+
 /// Per-platform install hints for the EDK2 RISC-V firmware.
 const RISCV_INSTALL_HINTS: &str = "  Fedora:           dnf install edk2-riscv64\n  \
                                    Debian / Ubuntu:  apt install qemu-efi-riscv64\n  \
@@ -430,6 +608,37 @@ mod tests
             assert!(
                 msg.contains("must be set together"),
                 "expected pairing-error, got: {msg}",
+            );
+        }
+    }
+
+    // Defect caught: a Secure Boot pair taken from one env var and a default
+    // path, or the default (non-enforcing) pair returned in its place, so the
+    // Secure Boot boots run on a firmware that verifies nothing.
+    #[test]
+    fn secure_boot_firmware_takes_its_own_env_pair()
+    {
+        use crate::arch::Arch;
+        let workspace = existing_workspace_file();
+        let os = workspace.as_os_str();
+        for arch in [Arch::X86_64, Arch::Riscv64]
+        {
+            let (code, vars) = find_secure_boot_firmware_impl(arch, Some(os), Some(os)).unwrap();
+            assert_eq!((code, vars), (workspace.clone(), workspace.clone()));
+            for (code, vars) in [(Some(os), None), (None, Some(os))]
+            {
+                let msg = format!(
+                    "{:#}",
+                    find_secure_boot_firmware_impl(arch, code, vars).unwrap_err()
+                );
+                assert!(msg.contains("must be set together"), "{msg}");
+            }
+        }
+        for (code, _) in OVMF_SECURE_DEFAULTS.iter().chain(RISCV_SECURE_DEFAULTS)
+        {
+            assert!(
+                !OVMF_DEFAULTS.iter().any(|(default, _)| default == code),
+                "{code} is a default (non-enforcing) image"
             );
         }
     }

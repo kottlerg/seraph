@@ -420,6 +420,7 @@ fn boot(
         second_disk: second_disk.map(SecondDisk::of_image).transpose()?,
         firmware_code_path: &firmware.code,
         firmware_vars_path: vars.path(),
+        smm: false,
         cpus: args.cpus,
         threads_per_core: 1,
         mem_mib: args.mem,

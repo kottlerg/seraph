@@ -9,10 +9,11 @@
 name: QEMU packages
 description: >-
   QEMU and firmware packages for the CI jobs that boot under QEMU, and
-  dosfstools, whose fsck.fat every disk-image pack runs: the install list,
-  the cache key, the bounded download, and the offline install with its
-  network fallback. The mechanism is specified in
-  docs/build-system.md § Continuous Integration.
+  dosfstools, whose fsck.fat every disk-image pack runs, with the Secure
+  Boot case's host tools and its riscv64 firmware: the install list, the
+  cache key, the bounded download, the offline install with its network
+  fallback, and the checked extraction of the firmware. The mechanism is
+  specified in docs/build-system.md § Continuous Integration.
 
 inputs:
   mode:
@@ -22,7 +23,9 @@ inputs:
       `dir` first when the offline install fails.
     required: true
   dir:
-    description: Directory of the downloaded `.deb` set (`download` and `install`).
+    description: >-
+      Directory of the downloaded `.deb` set and firmware package
+      (`download` and `install`).
     required: false
     default: ''
 
@@ -64,9 +67,16 @@ runs:
       shell: sh
       run: |
         {
-          echo 'packages=qemu-system-x86 qemu-system-riscv ovmf qemu-efi-riscv64 dosfstools'
+          echo 'packages=qemu-system-x86 qemu-system-riscv ovmf qemu-efi-riscv64 dosfstools sbsigntool openssl python3-virt-firmware'
           echo 'flags=-y --no-install-recommends'
           echo 'offline=-o Dir::Etc::SourceList=/dev/null -o Dir::Etc::SourceParts=-'
+          # The riscv64 Secure Boot firmware: Ubuntu's qemu-efi-riscv64 is
+          # built without Secure Boot, Arch's edk2-riscv64 with it
+          # (docs/build-system.md § QEMU and Firmware). Pinned by version
+          # and SHA-256, checked before anything is extracted.
+          echo 'sb_riscv_pkg=edk2-riscv64-202608-1-any.pkg.tar.zst'
+          echo 'sb_riscv_url=https://archive.archlinux.org/packages/e/edk2-riscv64/edk2-riscv64-202608-1-any.pkg.tar.zst'
+          echo 'sb_riscv_sha256=333c3404edaabd26a95c4cc7dc3f38eb361be75fb34d71da73319ac51418a4c1'
         } >> "$GITHUB_OUTPUT"
 
     - name: Install offline
@@ -104,8 +114,13 @@ runs:
         DIR: ${{ inputs.dir }}
         PACKAGES: ${{ steps.apt.outputs.packages }}
         FLAGS: ${{ steps.apt.outputs.flags }}
+        SB_PKG: ${{ steps.apt.outputs.sb_riscv_pkg }}
+        SB_URL: ${{ steps.apt.outputs.sb_riscv_url }}
+        SB_SHA256: ${{ steps.apt.outputs.sb_riscv_sha256 }}
       run: |
         mkdir -p "$DIR/partial"
+        curl -fsSL --retry 3 --max-time 300 -o "$DIR/$SB_PKG" "$SB_URL"
+        echo "$SB_SHA256  $DIR/$SB_PKG" | sha256sum -c -
         debs=$(realpath "$DIR")
         fetch="apt-get update && apt-get install $FLAGS --download-only \
             -o Dir::Cache::Archives=$debs $PACKAGES"
@@ -118,7 +133,7 @@ runs:
             sudo timeout 1200 sh -c "$fetch"
         fi
         sudo rm -rf "$debs/partial" "$debs/lock"
-        ls -l "$debs"/*.deb
+        ls -l "$debs"/*.deb "$debs/$SB_PKG"
 
     - name: Install offline after the download
       if: steps.offline.outputs.ok == 'false'
@@ -131,3 +146,27 @@ runs:
       run: |
         ls "$DIR"/*.deb > /dev/null 2>&1
         sudo apt-get install $FLAGS $OFFLINE "$(realpath "$DIR")"/*.deb
+
+    - name: Extract the riscv64 Secure Boot firmware
+      if: inputs.mode == 'install'
+      shell: sh
+      env:
+        DIR: ${{ inputs.dir }}
+        SB_PKG: ${{ steps.apt.outputs.sb_riscv_pkg }}
+        SB_SHA256: ${{ steps.apt.outputs.sb_riscv_sha256 }}
+      # Checked against the pinned hash before tar reads it; a mismatch
+      # fails the job. The two images go outside the checkout, and the
+      # later steps find them by `SERAPH_RISCV_SECURE_CODE` and
+      # `SERAPH_RISCV_SECURE_VARS` (docs/build-system.md § QEMU and
+      # Firmware).
+      run: |
+        echo "$SB_SHA256  $DIR/$SB_PKG" | sha256sum -c -
+        out="$RUNNER_TEMP/edk2-riscv64-secure"
+        mkdir -p "$out"
+        tar --zstd -xf "$DIR/$SB_PKG" -C "$out" \
+            usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd \
+            usr/share/edk2/riscv64/RISCV_VIRT_VARS.fd
+        {
+          echo "SERAPH_RISCV_SECURE_CODE=$out/usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd"
+          echo "SERAPH_RISCV_SECURE_VARS=$out/usr/share/edk2/riscv64/RISCV_VIRT_VARS.fd"
+        } >> "$GITHUB_ENV"

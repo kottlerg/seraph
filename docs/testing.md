@@ -685,6 +685,29 @@ it on demand. See [xtask/README.md § The `rollback` case](../xtask/README.md#th
 for the lines and the logs. CI runs it in each usertest cell after the `signing` case, in the
 cell's profile.
 
+### Secure Boot (`secureboot` case)
+
+UEFI Secure Boot of the bootloader ([signing.md](signing.md) § Secure Boot) is the firmware's
+check, which only a boot can show. `cargo xtask test secureboot [--arch]` (both arches) generates a
+development PK, KEK and db, signs the installed bootloader with the db key, and boots the current
+sysroot four times, each on a variable store of its own:
+
+1. `enrolled`: the signed bootloader, on the Secure Boot firmware with the three keys enrolled.
+   The firmware boots it, and the bootloader logs `boot: Secure Boot: on`.
+2. `tampered`: the signed bootloader with a byte of its code flipped, on the same firmware and
+   keys. The firmware refuses it.
+3. `unsigned`: the bootloader with no signature, likewise refused.
+4. `default`: the installed bootloader on the default firmware. The bootloader logs
+   `boot: Secure Boot: off`.
+
+The Secure Boot boots run on a firmware pair of their own, since the default pair has no Secure
+Boot on x86_64, and on riscv64 has it only on some distributions; CI takes Arch's `edk2-riscv64`
+for riscv64 ([build-system.md](build-system.md) § QEMU and Firmware). A firmware that does not
+enforce Secure Boot fails the case, naming the firmware, so the case never passes on one that boots
+what it should refuse. See [xtask/README.md § The `secureboot` case](../xtask/README.md#the-secureboot-case)
+for the lines, the firmware search and the logs. CI runs it in each usertest cell after the
+`rollback` case.
+
 ### GDB stub (`debug-port` case)
 
 The GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) debugs a guest process
@@ -957,6 +980,7 @@ CI matrix cells follow these rules per boot. The `usertest` cell runs its boots 
 `usertest` (via `run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the
 default boot (terminal present), `cargo xtask test --cell usertest` runs the cell's cases: the
 `terminal` case's boot, the `signing` case's four boots, the `rollback` case's three boots, the
+`secureboot` case's four boots, the
 `wedge` case's boot pair, on x86_64 the `vmgenid` case's save/restore boot pair, and the `shutdown`
 case's boots, nine on x86_64 (the reboot, the power button and the seven core deaths) and eight on
 riscv64. The `ktest` cell's cases are the `kaslr` case's three boots; the `svctest` cell has none.
@@ -1027,7 +1051,7 @@ registry runs it on (its `md-test-cells` rule).
 | Cell | Tier | Architectures | Launch | Cases | Covers |
 |---|---|---|---|---|---|
 | `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
-| `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `rollback`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
+| `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `rollback`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |

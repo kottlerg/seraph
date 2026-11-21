@@ -106,7 +106,8 @@ impl Case
 pub fn case(case: TestCase) -> Case
 {
     use super::{
-        cet, debug_port, hotplug, kaslr, rollback, shutdown, signing, terminal, tpm, vmgenid, wedge,
+        cet, debug_port, hotplug, kaslr, rollback, secureboot, shutdown, signing, terminal, tpm,
+        vmgenid, wedge,
     };
     match case
     {
@@ -141,6 +142,15 @@ pub fn case(case: TestCase) -> Case
             cell: Cell::Ci(Tester::Usertest),
             options: &[CaseOption::Release],
             run: rollback::run,
+        },
+        // The signed bootloader on enrolled keys, the tampered and the
+        // unsigned one refused, and the default firmware's boot.
+        TestCase::Secureboot => Case {
+            arches: &[(Arch::X86_64, 4), (Arch::Riscv64, 4)],
+            bundle: Harness::Init,
+            cell: Cell::Ci(Tester::Usertest),
+            options: &[],
+            run: secureboot::run,
         },
         // An AP, then the BSP.
         TestCase::Wedge => Case {
@@ -457,11 +467,13 @@ mod tests
         use TestCase::*;
         assert_eq!(
             cell_cases(Tester::Usertest, Arch::X86_64),
-            [Terminal, Signing, Rollback, Wedge, Vmgenid, Shutdown]
+            [
+                Terminal, Signing, Rollback, Secureboot, Wedge, Vmgenid, Shutdown
+            ]
         );
         assert_eq!(
             cell_cases(Tester::Usertest, Arch::Riscv64),
-            [Terminal, Signing, Rollback, Wedge, Shutdown]
+            [Terminal, Signing, Rollback, Secureboot, Wedge, Shutdown]
         );
         for arch in [Arch::X86_64, Arch::Riscv64]
         {

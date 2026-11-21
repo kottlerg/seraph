@@ -301,6 +301,7 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
                     }),
                     firmware_code_path: &firmware.code,
                     firmware_vars_path: vars.path(),
+                    smm: false,
                     cpus,
                     threads_per_core,
                     mem_mib,

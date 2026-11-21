@@ -1330,6 +1330,9 @@ pub struct Firmware
 {
     /// The read-only code image, `-drive if=pflash` unit 0.
     pub code: PathBuf,
+    /// The code image as found, which `code` is a padded copy of on
+    /// riscv64: the firmware a message names.
+    pub source: PathBuf,
     /// The variable-store template each launch's store is copied from.
     vars_template: PathBuf,
     /// Whether the code image requires SMM ([`QemuLaunchSpec::smm`]): the
@@ -1386,35 +1389,17 @@ impl Firmware
     ///
     /// On riscv64, QEMU's `virt` machine needs pflash images of exactly
     /// 32 MiB: the two images are copied padded under
-    /// `target/xtask/firmware/riscv/`, again only when the source is newer or
-    /// the copy is missing or of another size. The x86-64 images are used
+    /// `target/xtask/firmware/riscv/`, again only when the copy is not the
+    /// source padded ([`pflash_cache_stale`]). The x86-64 images are used
     /// where they are installed.
     pub fn prepare(ctx: &Context, arch: Arch) -> Result<Self>
     {
-        let vars_dir = launch_vars_dir(ctx);
-        std::fs::create_dir_all(&vars_dir)
-            .with_context(|| format!("creating {}", vars_dir.display()))?;
-        let (code, vars_template) = match arch
+        let (source, vars) = match arch
         {
             Arch::X86_64 => firmware::find_ovmf_firmware()?,
-            Arch::Riscv64 =>
-            {
-                let (src_code, src_vars) = firmware::find_riscv_firmware()?;
-                let cache_dir = ctx.target_dir.join("xtask").join("firmware").join("riscv");
-                std::fs::create_dir_all(&cache_dir)
-                    .with_context(|| format!("creating firmware cache {}", cache_dir.display()))?;
-                (
-                    padded_copy(&src_code, &cache_dir.join("RISCV_VIRT_CODE.32M.fd"))?,
-                    padded_copy(&src_vars, &cache_dir.join("RISCV_VIRT_VARS.32M.fd"))?,
-                )
-            }
+            Arch::Riscv64 => firmware::find_riscv_firmware()?,
         };
-        Ok(Self {
-            code,
-            vars_template,
-            vars_dir,
-            smm: false,
-        })
+        Self::from_pair(ctx, arch, source, &vars, "")
     }
 
     /// Resolve `arch`'s Secure Boot firmware
@@ -1425,32 +1410,49 @@ impl Firmware
     /// test.
     pub fn prepare_secure_boot(ctx: &Context, arch: Arch) -> Result<Self>
     {
+        let (source, vars) = firmware::find_secure_boot_firmware(arch)?;
+        Ok(Self {
+            smm: arch == Arch::X86_64,
+            ..Self::from_pair(ctx, arch, source, &vars, ".secure")?
+        })
+    }
+
+    /// The firmware of the pair `source` and `vars` found for `arch`: on
+    /// riscv64 both padded under `target/xtask/firmware/riscv/`, named
+    /// `RISCV_VIRT_CODE<tag>.32M.fd` and `RISCV_VIRT_VARS<tag>.32M.fd`;
+    /// launched without SMM.
+    fn from_pair(ctx: &Context, arch: Arch, source: PathBuf, vars: &Path, tag: &str)
+    -> Result<Self>
+    {
         let vars_dir = launch_vars_dir(ctx);
         std::fs::create_dir_all(&vars_dir)
             .with_context(|| format!("creating {}", vars_dir.display()))?;
-        let (code, vars_template) = firmware::find_secure_boot_firmware(arch)?;
         let (code, vars_template) = match arch
         {
-            Arch::X86_64 => (code, vars_template),
+            Arch::X86_64 => (source.clone(), vars.to_path_buf()),
             Arch::Riscv64 =>
             {
                 let cache_dir = ctx.target_dir.join("xtask").join("firmware").join("riscv");
                 std::fs::create_dir_all(&cache_dir)
                     .with_context(|| format!("creating firmware cache {}", cache_dir.display()))?;
                 (
-                    padded_copy(&code, &cache_dir.join("RISCV_VIRT_CODE.secure.32M.fd"))?,
                     padded_copy(
-                        &vars_template,
-                        &cache_dir.join("RISCV_VIRT_VARS.secure.32M.fd"),
+                        &source,
+                        &cache_dir.join(format!("RISCV_VIRT_CODE{tag}.32M.fd")),
+                    )?,
+                    padded_copy(
+                        vars,
+                        &cache_dir.join(format!("RISCV_VIRT_VARS{tag}.32M.fd")),
                     )?,
                 )
             }
         };
         Ok(Self {
             code,
+            source,
             vars_template,
+            smm: false,
             vars_dir,
-            smm: arch == Arch::X86_64,
         })
     }
 
@@ -1920,9 +1922,10 @@ mod tests
         std::fs::write(&template, b"vars").unwrap();
         let firmware = Firmware {
             code: dir.join("code.fd"),
+            source: dir.join("code.fd"),
             vars_template: template,
-            vars_dir: dir.clone(),
             smm: false,
+            vars_dir: dir.clone(),
         };
         let (a, b) = (
             firmware.launch_vars().unwrap(),

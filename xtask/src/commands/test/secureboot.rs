@@ -116,7 +116,7 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
                 let booted = booted.with_context(|| match on
                 {
                     On::SecureBoot => not_enforcing(args.arch, &secure),
-                    On::Default => format!("the default firmware {}", default.code.display()),
+                    On::Default => format!("the default firmware {}", default.source.display()),
                 });
                 (case.name, booted)
             })
@@ -173,7 +173,7 @@ fn not_enforcing(arch: Arch, firmware: &Firmware) -> String
         "on the Secure Boot firmware {}: a firmware built without Secure Boot boots every image; \
          docs/build-system.md § QEMU and Firmware names the builds that enforce it, and {code} \
          with {vars} selects one",
-        firmware.code.display()
+        firmware.source.display()
     )
 }
 

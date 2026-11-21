@@ -185,12 +185,12 @@ fn entry(line: &[u8]) -> Option<Entry<'_>>
 }
 
 /// The value of a lowercase hex digit.
-const fn hex_digit(byte: u8) -> Option<u8>
+fn hex_digit(byte: u8) -> Option<u8>
 {
     match byte
     {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'0'..=b'9' => byte.checked_sub(b'0'),
+        b'a'..=b'f' => byte.checked_sub(b'a')?.checked_add(10),
         _ => None,
     }
 }
@@ -235,8 +235,11 @@ pub fn encode(entries: &[Entry<'_>], out: &mut [u8]) -> Result<usize, EncodeErro
         put(b' ')?;
         for byte in entry.digest
         {
-            put(HEX[usize::from(byte >> 4)])?;
-            put(HEX[usize::from(byte & 0xf)])?;
+            // A nibble is under 16, so `HEX` holds it.
+            for nibble in [byte >> 4, byte & 0xf]
+            {
+                put(*HEX.get(usize::from(nibble)).ok_or(EncodeError::Index)?)?;
+            }
         }
         put(b'\n')?;
     }

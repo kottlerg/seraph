@@ -128,6 +128,29 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
         Some(identifier(idx, generation))
     }
 
+    /// Make room for one new entry: the next [`Self::acquire`] that inserts
+    /// one then neither allocates nor fails, so a caller can reserve before
+    /// a step it cannot undo and insert after it.
+    ///
+    /// Returns `None` when the slab already holds [`MAX_ENTRIES`] entries
+    /// with every freed index retired, or the heap cannot grow the table; no
+    /// entry changes then.
+    pub fn reserve(&mut self) -> Option<()>
+    {
+        // As `acquire` grows the key index and the slots before it inserts.
+        if self.len >= self.buckets.len() / 2
+        {
+            self.grow()?;
+        }
+        if self.free.is_empty()
+        {
+            let (_, new_len) = new_index(self.slots.len(), MAX_ENTRIES)?;
+            self.slots.try_reserve(1).ok()?;
+            self.free.try_reserve(new_len).ok()?;
+        }
+        Some(())
+    }
+
     /// The identifier of `key`'s live entry, without inserting one.
     #[must_use]
     pub fn id_of(&self, key: &K) -> Option<u64>
@@ -478,6 +501,38 @@ mod tests
         assert_eq!(slab.len(), 1);
         slab.remove_key(&4);
         assert_eq!(slab.id_of(&4), None);
+    }
+
+    #[test]
+    fn an_acquire_after_a_reserve_never_grows_the_table()
+    {
+        // Every insert runs through the growth points of the key index and of
+        // the slots; one in four takes a freed index instead of a new one.
+        let mut slab: NodeSlab<u32, u32> = NodeSlab::new();
+        for key in 0..200u32
+        {
+            if key % 4 == 3
+            {
+                assert_eq!(slab.remove_key(&(key - 1)), Some(key - 1));
+            }
+            slab.reserve().expect("room");
+            let shape = (
+                slab.buckets.len(),
+                slab.slots.capacity(),
+                slab.free.capacity(),
+            );
+            let id = slab.acquire(key, || key).expect("room");
+            assert_eq!(
+                (
+                    slab.buckets.len(),
+                    slab.slots.capacity(),
+                    slab.free.capacity()
+                ),
+                shape,
+                "key {key}"
+            );
+            assert_eq!(slab.get(id), Some(&key));
+        }
     }
 
     #[test]

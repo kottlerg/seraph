@@ -127,6 +127,15 @@ impl NodeTable
         self.alloc(node)
     }
 
+    /// Make room for one new node: the next [`Self::alloc_for_dispatch`] of
+    /// an on-disk slot the table does not hold then cannot fail. A create
+    /// reserves before it writes the directory entry, so a full table refuses
+    /// it with no entry made. `false` when the table cannot grow.
+    pub fn reserve(&mut self) -> bool
+    {
+        self.slab.reserve().is_some()
+    }
+
     /// The id of the node for `node`'s on-disk slot, recording `node` when
     /// the slot has none. `None` when the table cannot grow.
     fn alloc(&mut self, node: FatNode) -> Option<NodeId>
@@ -249,7 +258,8 @@ impl<'a> FatfsBackend<'a>
         Ok(node.cluster)
     }
 
-    fn entry_kind(entry: &DirEntry) -> NodeKind
+    /// The kind of node an on-disk entry is, by its directory attribute.
+    pub fn entry_kind(entry: &DirEntry) -> NodeKind
     {
         if entry.attr & 0x10 != 0
         {

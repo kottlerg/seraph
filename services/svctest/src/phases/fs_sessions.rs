@@ -74,7 +74,7 @@ const AT_MAX_ROLE: &str = "fs-create-at-max";
 const AT_MAX_NAME: &str = "atmax.bin";
 /// The max of the [`AT_MAX_ROLE`] child's node, in pages: room for its image,
 /// heap and stacks, and for the grants its fill takes.
-const AT_MAX_PAGES: u64 = 4096;
+pub(super) const AT_MAX_PAGES: u64 = 4096;
 /// Pages of each grant the at-max child's fill asks for while more are left
 /// under the max; halved when memmgr has no contiguous run so long.
 const AT_MAX_GRANT_PAGES: u64 = 256;
@@ -93,7 +93,7 @@ const AT_MAX_NO_WARMUP: i32 = 2;
 const AT_MAX_FILL_FAILED: i32 = 3;
 /// At-max child exit code: a one-page grant past the max was not refused
 /// with `LIMIT`.
-const AT_MAX_NO_LIMIT: i32 = 4;
+pub(super) const AT_MAX_NO_LIMIT: i32 = 4;
 /// At-max child exit code: the create at the max succeeded.
 const AT_MAX_CREATED: i32 = 5;
 /// At-max child exit code: the create was refused with a kind other than
@@ -105,9 +105,9 @@ const CLIENT_ROLE: &str = "fs-session-client";
 const NAME: &str = "sessions.bin";
 /// The max of the node whose session the phase fills, in pages: the session's
 /// first page and one more.
-const SESSION_MAX: u64 = 2;
+pub(super) const SESSION_MAX: u64 = 2;
 /// `max` word of a node with no max.
-const NO_MAX: u64 = u64::MAX;
+pub(super) const NO_MAX: u64 = u64::MAX;
 /// Most opens the phase makes in one session before it expects `LIMIT`, far
 /// above what two pages of records hold. A test bound.
 const OPEN_BOUND: usize = 4096;
@@ -115,7 +115,7 @@ const OPEN_BOUND: usize = 4096;
 /// ends. A test wait bound.
 const SETTLE_WAIT: Duration = Duration::from_secs(60);
 /// A file of the `/esp` driver, which is not the `/data` driver.
-const ESP_PROBE: &str = "/esp/EFI/seraph/bootstrap.bundle";
+pub(super) const ESP_PROBE: &str = "/esp/EFI/seraph/bootstrap.bundle";
 /// Opens the child makes in its session.
 const CLIENT_OPENS: usize = 3;
 
@@ -781,7 +781,7 @@ fn create_at_max_main() -> !
 /// under the max, and for half as many after memmgr finds no run so long. A
 /// grant refused with `LIMIT` before the subtree reaches the max fails the
 /// fill.
-fn at_max_fill()
+pub(super) fn at_max_fill()
 {
     use std::process::exit;
 
@@ -816,7 +816,7 @@ fn at_max_fill()
 /// Write [`AT_MAX_STACK_TOUCH`] bytes of the calling thread's stack, so that
 /// memmgr backs them now.
 #[inline(never)]
-fn at_max_touch_stack()
+pub(super) fn at_max_touch_stack()
 {
     let mut pad = [0u8; AT_MAX_STACK_TOUCH];
     pad.fill(1);

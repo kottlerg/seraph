@@ -602,7 +602,14 @@ only path that installs `ProcessInfo.system_root_cap` and
 | cap[1] | Current-directory cap for the child (optional; absent leaves `current_dir_cap` zero) |
 
 procmgr stores the caps, deletes any previously installed pair, and copies
-them into the child's CSpace at `START_PROCESS`. It does not validate cap shape.
+them into the child's CSpace at `START_PROCESS`, each with the `SEND` and
+`GRANT` rights it carries. The grant right is what a create in the anchor
+directory needs: the create carries the process's filesystem session cap,
+which the kernel moves only through a cap with `GRANT`
+([services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md#label-13-fs_create)
+§ Label 13). A `SEND`-only copy would withhold nothing a lookup does not
+hand back, since every cap a lookup through the anchor returns carries
+`SEND_GRANT`. It does not validate cap shape.
 procmgr consumes the transferred caps on success and failure alike, and deletes
 any cap past cap[1].
 

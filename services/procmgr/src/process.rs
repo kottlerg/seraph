@@ -4454,12 +4454,17 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u64) -> 
         // SAFETY: scratch_va is page-aligned and mapped writable; PI struct
         // lives at offset 0 per the ABI.
         let pi = unsafe { process_abi::process_info_mut(scratch_va) };
+        // The copies keep the endpoint rights of the caps the spawner
+        // installed, `RIGHTS_EP_GRANT` among them when they carry it: a
+        // create in an anchor moves the child's session cap through it
+        // (ipc-interface.md § Label 12). The kernel intersects the mask with
+        // the source's rights.
         if entry.namespace_override != 0
         {
             let slot = syscall::cap_copy(
                 entry.namespace_override,
                 child_cspace,
-                syscall::RIGHTS_EP_SEND,
+                syscall::RIGHTS_EP_SEND_GRANT,
             )
             .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
             pi.system_root_cap = slot;
@@ -4468,8 +4473,12 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u64) -> 
         }
         if entry.cwd_override != 0
         {
-            let slot = syscall::cap_copy(entry.cwd_override, child_cspace, syscall::RIGHTS_EP_SEND)
-                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+            let slot = syscall::cap_copy(
+                entry.cwd_override,
+                child_cspace,
+                syscall::RIGHTS_EP_SEND_GRANT,
+            )
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
             pi.current_dir_cap = slot;
             let _ = syscall::cap_delete(entry.cwd_override);
             entry.cwd_override = 0;

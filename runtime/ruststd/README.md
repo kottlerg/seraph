@@ -494,11 +494,14 @@ together. `std::env::current_dir` returns the recorded path, or
 no path string.
 
 `Command::spawn` defaults the child's root cap to a `cap_copy` of the
-spawner's `root_dir_cap()` (parent-inherit); explicit override via
+spawner's `root_dir_cap()`, and its cwd cap to one of the spawner's
+`current_dir_cap()` (parent-inherit); explicit override via
 `std::os::seraph::process::CommandExt::namespace_cap` or
 `cwd_dir_cap`. `Command::cwd("/data")` walks the spawner's root to the
 path and delivers the resulting cap as the child's initial
-`current_dir_cap`.
+`current_dir_cap`. A copy keeps the source's `RIGHTS_EP_GRANT`, which a
+create in the anchor directory needs (§ Filesystem sessions), as
+procmgr's copy at `START_PROCESS` does.
 
 `Command::spawn` names the binary to procmgr by its path from the spawner's root, with `/` before
 each component, as the caller spells it: a path in another letter case than the install path
@@ -561,7 +564,7 @@ A filesystem driver records each open in pages charged to a node of its client, 
 only in a session, which names that node
 ([services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md) § Label 18,
 § Label 23). std keeps one session per driver it opens files on, in a table
-(`src/sys/fs/session.rs`) that `File::open` consults before each `FS_OPEN`:
+(`src/sys/fs/session.rs`) that `File::open` consults before each `FS_OPEN` and each create:
 
 - **Lookup.** The driver mints each session cap with `RIGHTS_EP_IDENTIFY`, and the table asks the
   kernel, with each session cap as the key, whether the node cap the walk returned names that
@@ -583,6 +586,15 @@ only in a session, which names that node
   `ErrorKind::QuotaExceeded` (the driver's `LIMIT`), and the other clients of the driver go on.
 - **The open.** `FS_OPEN` carries a SEND-only copy of the session cap, without the Identify right,
   in `caps[0]` and the `File`'s release SEND in `caps[1]`; the reply carries the open cap alone.
+- **The create.** `create` and `create_new` send one `FS_CREATE` with `CREATE_OPEN` on the parent
+  directory's cap, carrying the same two caps, with the session taken first; `create` adds
+  `CREATE_OPEN_EXISTING`, so the driver opens a file of that name that already exists. The driver
+  records the open before it writes the entry, so a session start or an open the process's node
+  refuses fails the call with no file created. The kernel moves a cap only through a cap that
+  carries `RIGHTS_EP_GRANT`, so a create through a parent cap without it (an anchor its creator
+  installed `SEND`-only) fails `PermissionDenied` before any request. Every cap a lookup returns
+  carries `SEND_GRANT`, and the anchors std and procmgr install keep the right their source
+  carries.
 - **End.** A session lives for the process's life, which the session's liveness cap keeps: the
   process's death ends it, with every open made in it, and the charge returns to the process's
   node. An entry the table removes (a dead key, or the loser of a start race, which never served

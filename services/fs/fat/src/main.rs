@@ -90,8 +90,9 @@ use backend::{FatfsBackend, NodeTable};
 use bpb::{FatState, MAX_SECTOR_SIZE, sector_buffer};
 use cache::PageCache;
 use dir::{
-    DeviceSlotState, NewEntryKind, RemovedEntry, directory_is_empty, free_entry_data, insert_entry,
-    remove_entry, update_entry_metadata, write_dot_entries,
+    DeviceSlotState, DirEntryLocation, NewEntryKind, RemovedEntry, directory_is_empty,
+    find_in_directory_with_location, free_entry_data, insert_entry, remove_entry,
+    update_entry_metadata, write_dot_entries,
 };
 use eviction::EvictionState;
 use fat::{chain_next, next_cluster, read_file_data};
@@ -741,15 +742,17 @@ fn service_loop(
             }
         };
 
-        // Only FS_SESSION (a charge-only handle), FS_OPEN (a session cap and
-        // a release SEND) and FS_WRITE_MEMORY (the source page) take caps;
-        // their handlers keep, return, or delete each one. Every other
-        // label's caps are deleted here, so no cap a request carries stays in
-        // fatfs's CSpace.
-        if !matches!(
+        // Only FS_SESSION (a charge-only handle), FS_OPEN and FS_CREATE with
+        // CREATE_OPEN (a session cap and a release SEND) and FS_WRITE_MEMORY
+        // (the source page) take caps; their handlers keep, return, or delete
+        // each one. Every other request's caps are deleted here, so no cap a
+        // request carries stays in fatfs's CSpace.
+        let takes_caps = matches!(
             opcode,
             fs_labels::FS_SESSION | fs_labels::FS_OPEN | fs_labels::FS_WRITE_MEMORY
-        )
+        ) || (opcode == fs_labels::FS_CREATE
+            && msg.label & fs_labels::CREATE_OPEN != 0);
+        if !takes_caps
         {
             drop_caps(msg.caps());
         }
@@ -811,12 +814,15 @@ fn service_loop(
             }
             fs_labels::FS_CREATE =>
             {
+                // With CREATE_OPEN, takes the opens' lock itself, as FS_OPEN
+                // does.
                 handle_create_node_cap(
                     node_id,
                     parent_rights,
                     &msg,
                     state,
                     nodes,
+                    opens,
                     cache,
                     caps,
                     ipc_buf,
@@ -1461,11 +1467,9 @@ fn sweep_sessions(opens: &Mutex<Opens>, session_sweeps: &mut SweepSchedule, cach
 }
 
 /// `FS_OPEN` against a file node cap (services/fs/docs/fs-driver-protocol.md
-/// § Label 18). `caps[0]` must be a session cap on the driver's own endpoint:
-/// the open is made in that session ([`open_in_session`]), with the release
-/// SEND `caps[1]` carries. No `caps[0]`, or one on another endpoint, is
-/// refused `INVALID_ARGUMENT`; a cap on the endpoint that names no live
-/// session `INVALID_BADGE`. Caps past those are deleted.
+/// § Label 18). The open is made in the session the request's session cap
+/// names ([`request_session`], [`open_in_session`]), with the release SEND
+/// `caps[1]` carries.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request, its node and rights, and the driver state an open touches (node table, \
@@ -1488,34 +1492,15 @@ fn handle_open_node_cap(
         reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     }
-    let all = msg.caps();
-    // A cap on another endpoint (or none) leaves the badge read refused.
-    let session = all
-        .first()
-        .map(|&cap| syscall::endpoint_badge(caps.service, cap).map(session_id));
-    let id = match session
+    let (id, release_send) = match request_session(msg, caps.service)
     {
-        Some(Ok(Some(id))) => id,
-        // A cap on the driver's endpoint that is no session cap.
-        Some(Ok(None)) =>
+        Ok(session) => session,
+        Err(code) =>
         {
-            reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
-            return;
-        }
-        // No session cap: every open is made in a session.
-        _ =>
-        {
-            reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_ARGUMENT, ipc_buf);
+            reply_dropping_caps(msg, opcode, code, ipc_buf);
             return;
         }
     };
-    let (release_send, rest) = match all.get(1..).and_then(<[u64]>::split_first)
-    {
-        Some((&send, rest)) => (send, rest),
-        None => (0, &[][..]),
-    };
-    let _ = all.first().copied().map(syscall::cap_delete);
-    drop_caps(rest);
     open_in_session(
         id,
         OpenRequest {
@@ -1528,6 +1513,37 @@ fn handle_open_node_cap(
         cache,
         ipc_buf,
     );
+}
+
+/// The session a request's `caps[0]` names, and the release SEND its
+/// `caps[1]` carries (0 for none): the caps of `FS_OPEN` and of `FS_CREATE`
+/// with `CREATE_OPEN`. Every open is made in a session. On success the
+/// session cap and every cap past the release SEND are deleted, and the SEND
+/// is the caller's. On a refusal every cap is left for
+/// [`reply_dropping_caps`], and the error is the `fs_errors` code:
+/// `INVALID_ARGUMENT` for no `caps[0]` or one on another endpoint,
+/// `INVALID_BADGE` for one on the driver's endpoint that is no session cap.
+fn request_session(msg: &IpcMessage, service: u64) -> Result<(u64, u64), u64>
+{
+    let all = msg.caps();
+    // A cap on another endpoint (or none) leaves the badge read refused.
+    let session = all
+        .first()
+        .map(|&cap| syscall::endpoint_badge(service, cap).map(session_id));
+    let id = match session
+    {
+        Some(Ok(Some(id))) => id,
+        Some(Ok(None)) => return Err(ipc::fs_errors::INVALID_BADGE),
+        _ => return Err(ipc::fs_errors::INVALID_ARGUMENT),
+    };
+    let (release_send, rest) = match all.get(1..).and_then(<[u64]>::split_first)
+    {
+        Some((&send, rest)) => (send, rest),
+        None => (0, &[][..]),
+    };
+    let _ = all.first().copied().map(syscall::cap_delete);
+    drop_caps(rest);
+    Ok((id, release_send))
 }
 
 /// What an `FS_OPEN` asks for: the node, the rights the open cap carries,
@@ -1556,16 +1572,22 @@ impl OpenRequest
         }
         reply_err(code, ipc_buf);
     }
+
+    /// Mint the open cap of the open `id`: a badged `SEND_GRANT` whose badge
+    /// names the open and carries the request's rights. `None` when the
+    /// driver cannot derive it.
+    fn mint(self, id: u64) -> Option<u64>
+    {
+        pack_open(id, self.rights).and_then(|badge| {
+            syscall::cap_derive_badge(self.service, syscall::RIGHTS_EP_SEND_GRANT, badge).ok()
+        })
+    }
 }
 
-/// An `FS_OPEN` in the session `session` names: record the open in the
-/// session's pages, taking the session another page when they are full, with
-/// the opens unlocked, since the request calls memmgr; reply with an open cap
-/// whose badge names the open. The open's state lives in pages its client
-/// pays for; what stays on fatfs is the release SEND's slot and the open
-/// cap's. `LIMIT` when the page would exceed the max of the session's node or
-/// an ancestor's; `INVALID_BADGE` when the session has ended. A reply the
-/// client cannot take moves no cap, so the open is closed at once.
+/// An `FS_OPEN` in the session `session` names: record the open
+/// ([`record_open`]) and reply with an open cap whose badge names the open.
+/// A reply the client cannot take moves no cap, so the open is closed at
+/// once.
 fn open_in_session(
     session: u64,
     open: OpenRequest,
@@ -1574,32 +1596,10 @@ fn open_in_session(
     ipc_buf: *mut u64,
 )
 {
-    if !cache.fund_run_time_headroom(startup_info().self_cspace)
+    let Some(id) = record_open(session, open, opens, cache, ipc_buf)
+    else
     {
-        open.refuse(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
         return;
-    }
-    let room = opens
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .room_for_open(session);
-    if let Err(refusal) = room.or_else(|r| take_page(session, r, opens, ipc_buf))
-    {
-        open.refuse(refusal_code(refusal), ipc_buf);
-        return;
-    }
-    let recorded = opens
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .open_in_session(session, open.node_id, open.release_send);
-    let id = match recorded
-    {
-        Ok(id) => id,
-        Err(refusal) =>
-        {
-            open.refuse(refusal_code(refusal), ipc_buf);
-            return;
-        }
     };
     let close = || {
         opens
@@ -1607,10 +1607,7 @@ fn open_in_session(
             .unwrap_or_else(PoisonError::into_inner)
             .close(OpenRef(id), cache);
     };
-    let minted = pack_open(id, open.rights).and_then(|badge| {
-        syscall::cap_derive_badge(open.service, syscall::RIGHTS_EP_SEND_GRANT, badge).ok()
-    });
-    let Some(open_cap) = minted
+    let Some(open_cap) = open.mint(id)
     else
     {
         // Closing the open deletes its release SEND.
@@ -1626,6 +1623,53 @@ fn open_in_session(
     {
         let _ = syscall::cap_delete(open_cap);
         close();
+    }
+}
+
+/// Record an open of `open.node_id` in the session `session` names, with
+/// its release SEND, taking the session another page when its pages are
+/// full, with the opens unlocked, since the request calls memmgr. The open's
+/// state lives in pages its client pays for; what stays on fatfs is the
+/// release SEND's slot and the open cap's. Returns the open's id. On a
+/// refusal the SEND is deleted and the refusal replied, and `None` returned:
+/// `TOO_MANY_OPEN` when the `CSpace` cannot be topped up or the driver is
+/// spent, `LIMIT` when the page would exceed the max of the session's node or
+/// an ancestor's, `INVALID_BADGE` when the session has ended, and memmgr's
+/// other refusals as [`session::request_page`] maps them.
+fn record_open(
+    session: u64,
+    open: OpenRequest,
+    opens: &Mutex<Opens>,
+    cache: &PageCache,
+    ipc_buf: *mut u64,
+) -> Option<u64>
+{
+    if !cache.fund_run_time_headroom(startup_info().self_cspace)
+    {
+        open.refuse(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
+        return None;
+    }
+    let room = opens
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .room_for_open(session);
+    if let Err(refusal) = room.or_else(|r| take_page(session, r, opens, ipc_buf))
+    {
+        open.refuse(refusal_code(refusal), ipc_buf);
+        return None;
+    }
+    let recorded = opens
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .open_in_session(session, open.node_id, open.release_send);
+    match recorded
+    {
+        Ok(id) => Some(id),
+        Err(refusal) =>
+        {
+            open.refuse(refusal_code(refusal), ipc_buf);
+            None
+        }
     }
 }
 
@@ -2435,11 +2479,14 @@ fn self_aspace_cap() -> Option<u64>
 /// `FS_CREATE`: create a new file in a directory. Badge = parent-dir
 /// cap (must carry `MUTATE_DIR`). `label[16..32]` = name length, name
 /// from word 0. `parent_rights` is the caller's effective rights on
-/// the parent dir; the returned child cap is attenuated by it.
+/// the parent dir; the returned cap is attenuated by it. With
+/// `CREATE_OPEN` the file is opened in the same request
+/// ([`create_and_open`]); `CREATE_OPEN_EXISTING` without it is refused
+/// `INVALID_ARGUMENT`, the caps it carried already deleted.
 #[expect(
     clippy::too_many_arguments,
-    reason = "a thin entry point that forwards the request and the driver state to \
-              `create_entry_common` with the file kind"
+    reason = "an entry point that forwards the request and the driver state to \
+              `create_entry_common` or `create_and_open` by the request's flags"
 )]
 fn handle_create_node_cap(
     node_id: NodeId,
@@ -2447,25 +2494,50 @@ fn handle_create_node_cap(
     msg: &IpcMessage,
     state: &mut FatState,
     nodes: &mut NodeTable,
+    opens: &Mutex<Opens>,
     cache: &PageCache,
     caps: &FatCaps,
     ipc_buf: *mut u64,
 )
 {
-    create_entry_common(
-        node_id,
-        parent_rights,
-        msg,
-        NewEntryKind::File,
-        state,
-        nodes,
-        cache,
-        caps,
-        ipc_buf,
-    );
+    let open = msg.label & fs_labels::CREATE_OPEN != 0;
+    let existing = msg.label & fs_labels::CREATE_OPEN_EXISTING != 0;
+    if open
+    {
+        create_and_open(
+            node_id,
+            parent_rights,
+            msg,
+            state,
+            nodes,
+            opens,
+            cache,
+            caps,
+            ipc_buf,
+        );
+    }
+    else if existing
+    {
+        reply_err(ipc::fs_errors::INVALID_ARGUMENT, ipc_buf);
+    }
+    else
+    {
+        create_entry_common(
+            node_id,
+            parent_rights,
+            msg,
+            NewEntryKind::File,
+            state,
+            nodes,
+            cache,
+            caps,
+            ipc_buf,
+        );
+    }
 }
 
-/// `FS_MKDIR`: create a new directory in a directory.
+/// `FS_MKDIR`: create a new directory in a directory. It takes neither
+/// `FS_CREATE` flag: a request carrying one is refused `INVALID_ARGUMENT`.
 #[expect(
     clippy::too_many_arguments,
     reason = "a thin entry point that forwards the request and the driver state to \
@@ -2482,6 +2554,11 @@ fn handle_mkdir_node_cap(
     ipc_buf: *mut u64,
 )
 {
+    if msg.label & (fs_labels::CREATE_OPEN | fs_labels::CREATE_OPEN_EXISTING) != 0
+    {
+        reply_err(ipc::fs_errors::INVALID_ARGUMENT, ipc_buf);
+        return;
+    }
     create_entry_common(
         node_id,
         parent_rights,
@@ -2512,16 +2589,85 @@ fn new_entry_rights_ceiling(kind: NewEntryKind) -> NamespaceRights
     }
 }
 
+/// The name an `FS_CREATE` or `FS_MKDIR` carries: `label[16..32]` bytes
+/// from word 0. `None` when it is empty, longer than the message, or not a
+/// valid name (`namespace_protocol::validate_name`).
+fn create_name(msg: &IpcMessage) -> Option<&[u8]>
+{
+    let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
+    msg.data_bytes()
+        .get(..name_len)
+        .filter(|name| !name.is_empty() && namespace_protocol::validate_name(name).is_ok())
+}
+
+/// Write a new entry `name` of `kind` in the directory at `parent_cluster`:
+/// for a directory, first its cluster, holding `.` and `..`. Returns the
+/// entry's start cluster (0 for a file, which starts empty) and its on-disk
+/// location. A failure leaves no entry and no claimed cluster; the error is
+/// the `fs_errors` code.
+fn make_entry(
+    state: &mut FatState,
+    parent_cluster: u32,
+    name: &[u8],
+    kind: NewEntryKind,
+    cache: &PageCache,
+    caps: &FatCaps,
+    ipc_buf: *mut u64,
+) -> Result<(u32, DirEntryLocation), u64>
+{
+    let start_cluster = match kind
+    {
+        NewEntryKind::File => 0u32,
+        NewEntryKind::Dir =>
+        {
+            // The cluster is written while the FAT still holds it free and
+            // only then claimed, as a growing directory's is: a failed write
+            // changes no FAT entry, so nothing is left to free, and no
+            // claimed cluster ever holds an earlier owner's bytes
+            // (services/fs/fat/docs/crash-safety.md § Write ordering).
+            alloc::find_free_cluster(state, cache, caps.block_dev, ipc_buf)
+                .and_then(|new_cluster| {
+                    write_dot_entries(
+                        state,
+                        new_cluster,
+                        parent_cluster,
+                        cache,
+                        caps.block_dev,
+                        ipc_buf,
+                    )?;
+                    alloc::claim_cluster(state, new_cluster, None, cache, caps.block_dev, ipc_buf)?;
+                    Ok(new_cluster)
+                })
+                .map_err(fat_error_to_wire)?
+        }
+    };
+    insert_entry(
+        state,
+        parent_cluster,
+        name,
+        kind,
+        start_cluster,
+        0,
+        cache,
+        caps.block_dev,
+        ipc_buf,
+    )
+    .map(|loc| (start_cluster, loc))
+    .map_err(|e| {
+        if matches!(kind, NewEntryKind::Dir)
+        {
+            let _ = alloc::free_cluster_chain(state, start_cluster, cache, caps.block_dev, ipc_buf);
+        }
+        fat_error_to_wire(e)
+    })
+}
+
+/// A plain `FS_CREATE` or an `FS_MKDIR`: write the entry and reply with a
+/// node cap on it.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request, the parent node and its rights, the entry kind, and the driver state \
               creation writes through"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "creation is one sequence (settle the child's rights, validate the name, refuse a \
-              taken one, allocate, insert the entry, mint the child cap, reply) whose steps share \
-              the parent cluster and the new entry's state"
 )]
 fn create_entry_common(
     node_id: NodeId,
@@ -2557,80 +2703,35 @@ fn create_entry_common(
             return;
         }
     };
-    let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
-    let Some(name) = msg.data_bytes().get(..name_len).filter(|_| name_len != 0)
+    let Some(name) = create_name(msg)
     else
     {
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
-    if namespace_protocol::validate_name(name).is_err()
+    // The node's slot is taken before the entry is written, so a full node
+    // table refuses the create with no entry made.
+    if !nodes.reserve()
     {
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
         return;
     }
-
-    let (start_cluster, kind_for_node) = match kind
-    {
-        NewEntryKind::File => (0u32, NodeKind::File),
-        NewEntryKind::Dir =>
+    let (start_cluster, loc) =
+        match make_entry(state, parent_cluster, name, kind, cache, caps, ipc_buf)
         {
-            // The cluster is written while the FAT still holds it free and
-            // only then claimed, as a growing directory's is: a failed write
-            // changes no FAT entry, so nothing is left to free, and no
-            // claimed cluster ever holds an earlier owner's bytes
-            // (services/fs/fat/docs/crash-safety.md § Write ordering).
-            let made = alloc::find_free_cluster(state, cache, caps.block_dev, ipc_buf).and_then(
-                |new_cluster| {
-                    write_dot_entries(
-                        state,
-                        new_cluster,
-                        parent_cluster,
-                        cache,
-                        caps.block_dev,
-                        ipc_buf,
-                    )?;
-                    alloc::claim_cluster(state, new_cluster, None, cache, caps.block_dev, ipc_buf)?;
-                    Ok(new_cluster)
-                },
-            );
-            match made
+            Ok(made) => made,
+            Err(code) =>
             {
-                Ok(new_cluster) => (new_cluster, NodeKind::Dir),
-                Err(e) =>
-                {
-                    reply_err(fat_error_to_wire(e), ipc_buf);
-                    return;
-                }
+                reply_err(code, ipc_buf);
+                return;
             }
-        }
-    };
-
-    let loc = match insert_entry(
-        state,
-        parent_cluster,
-        name,
-        kind,
-        start_cluster,
-        0,
-        cache,
-        caps.block_dev,
-        ipc_buf,
-    )
+        };
+    let kind_for_node = match kind
     {
-        Ok(loc) => loc,
-        Err(e) =>
-        {
-            if matches!(kind, NewEntryKind::Dir)
-            {
-                let _ =
-                    alloc::free_cluster_chain(state, start_cluster, cache, caps.block_dev, ipc_buf);
-            }
-            reply_err(fat_error_to_wire(e), ipc_buf);
-            return;
-        }
+        NewEntryKind::File => NodeKind::File,
+        NewEntryKind::Dir => NodeKind::Dir,
     };
-
+    // The reservation leaves room, so the allocation does not fail.
     let Some(new_node_id) = nodes.alloc_for_dispatch(backend::FatNode {
         cluster: start_cluster,
         size: 0,
@@ -2656,6 +2757,264 @@ fn create_entry_common(
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// `FS_CREATE` with `CREATE_OPEN` (services/fs/docs/fs-driver-protocol.md
+/// § Label 13): create the file and open it in the session the request's
+/// `caps[0]` names, or, with `CREATE_OPEN_EXISTING`, open the file of that
+/// name when the directory holds one. Everything that can refuse the open
+/// (the session cap, the name, the session's room and page, the open's
+/// record, the node table's slot, the open cap) is settled before the entry
+/// is written ([`prepare_create_open`]), so a refused open leaves no entry. A
+/// failed write closes the open; a reply the client cannot take closes it
+/// too, and the entry stays, as after a plain `FS_CREATE` whose client died.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, the parent node and its rights, and the driver state a create and \
+              an open touch (FAT state, node table, opens, endpoint caps, cache, IPC buffer)"
+)]
+fn create_and_open(
+    node_id: NodeId,
+    parent_rights: NamespaceRights,
+    msg: &IpcMessage,
+    state: &mut FatState,
+    nodes: &mut NodeTable,
+    opens: &Mutex<Opens>,
+    cache: &PageCache,
+    caps: &FatCaps,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(prepared) = prepare_create_open(
+        node_id,
+        parent_rights,
+        msg,
+        state,
+        nodes,
+        opens,
+        cache,
+        caps,
+        ipc_buf,
+    )
+    else
+    {
+        return;
+    };
+    // Closing the open deletes its release SEND.
+    let refuse = |code: u64| {
+        let _ = syscall::cap_delete(prepared.open_cap);
+        opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .close(OpenRef(prepared.id), cache);
+        reply_err(code, ipc_buf);
+    };
+    let node = match file_to_open(
+        msg,
+        prepared.parent_cluster,
+        prepared.name,
+        state,
+        cache,
+        caps,
+        ipc_buf,
+    )
+    {
+        Ok(node) => node,
+        Err(code) =>
+        {
+            refuse(code);
+            return;
+        }
+    };
+    // The reservation leaves room, so the allocation does not fail.
+    let Some(file_node) = nodes.alloc_for_dispatch(node)
+    else
+    {
+        refuse(ipc::fs_errors::TOO_MANY_OPEN);
+        return;
+    };
+    opens
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_node(OpenRef(prepared.id), file_node);
+    // A file the table already held keeps its node, whose size is the
+    // current one; the entry's may predate a write.
+    let size = nodes.get(file_node).map_or(node.size, |held| held.size);
+    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+        .word(0, NodeKind::File as u64)
+        .word(1, u64::from(size))
+        .cap(prepared.open_cap)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        let _ = syscall::cap_delete(prepared.open_cap);
+        opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .close(OpenRef(prepared.id), cache);
+    }
+}
+
+/// What [`prepare_create_open`] settled before a create that opens its file
+/// writes anything: the parent directory's cluster, the validated name (in
+/// the request), the open's id, and its open cap.
+struct PreparedCreateOpen<'a>
+{
+    parent_cluster: u32,
+    name: &'a [u8],
+    id: u64,
+    open_cap: u64,
+}
+
+/// The steps of [`create_and_open`] that can refuse the open, in the order
+/// fs-driver-protocol.md § Label 13 lists their refusals: the rights the open
+/// cap would carry, the session cap, the parent directory, the name, the
+/// open's record in the session ([`record_open`], which names the root until
+/// the file's node exists), the node table's slot, and the open cap. On a
+/// refusal the request's caps are deleted, an open already recorded is
+/// closed, the refusal is replied, and `None` returned.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, the parent node and its rights, and the driver state an open's \
+              record touches (FAT state, node table, opens, endpoint caps, cache, IPC buffer)"
+)]
+fn prepare_create_open<'a>(
+    node_id: NodeId,
+    parent_rights: NamespaceRights,
+    msg: &'a IpcMessage,
+    state: &FatState,
+    nodes: &mut NodeTable,
+    opens: &Mutex<Opens>,
+    cache: &PageCache,
+    caps: &FatCaps,
+    ipc_buf: *mut u64,
+) -> Option<PreparedCreateOpen<'a>>
+{
+    let opcode = fs_labels::FS_CREATE;
+    // The open cap carries the rights a node cap on the new file would.
+    let rights = parent_rights.intersect(new_entry_rights_ceiling(NewEntryKind::File));
+    if rights.is_empty()
+    {
+        reply_dropping_caps(msg, opcode, ipc::fs_errors::PERMISSION_DENIED, ipc_buf);
+        return None;
+    }
+    let (session, release_send) = match request_session(msg, caps.service)
+    {
+        Ok(session) => session,
+        Err(code) =>
+        {
+            reply_dropping_caps(msg, opcode, code, ipc_buf);
+            return None;
+        }
+    };
+    // The open names the root until the file's node exists; no request can
+    // reach it before then, since its cap is not handed out yet.
+    let open = OpenRequest {
+        node_id: NodeId::ROOT,
+        rights,
+        service: caps.service,
+        release_send,
+    };
+    let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
+    {
+        Ok(cluster) => cluster,
+        Err(code) =>
+        {
+            open.refuse(code, ipc_buf);
+            return None;
+        }
+    };
+    let Some(name) = create_name(msg)
+    else
+    {
+        open.refuse(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return None;
+    };
+    let id = record_open(session, open, opens, cache, ipc_buf)?;
+    let refused = if nodes.reserve()
+    {
+        open.mint(id).ok_or(ipc::fs_errors::IO_ERROR)
+    }
+    else
+    {
+        Err(ipc::fs_errors::TOO_MANY_OPEN)
+    };
+    match refused
+    {
+        Ok(open_cap) => Some(PreparedCreateOpen {
+            parent_cluster,
+            name,
+            id,
+            open_cap,
+        }),
+        Err(code) =>
+        {
+            // Closing the open deletes its release SEND.
+            opens
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .close(OpenRef(id), cache);
+            reply_err(code, ipc_buf);
+            None
+        }
+    }
+}
+
+/// The node a create that opens its file opens: with
+/// `CREATE_OPEN_EXISTING`, the file `name` names in the directory at
+/// `parent_cluster` when it holds one (`IS_A_DIRECTORY` for a directory);
+/// otherwise a new entry, written by [`make_entry`]. The error is the
+/// `fs_errors` code to answer.
+fn file_to_open(
+    msg: &IpcMessage,
+    parent_cluster: u32,
+    name: &[u8],
+    state: &mut FatState,
+    cache: &PageCache,
+    caps: &FatCaps,
+    ipc_buf: *mut u64,
+) -> Result<backend::FatNode, u64>
+{
+    let found = if msg.label & fs_labels::CREATE_OPEN_EXISTING != 0
+    {
+        find_in_directory_with_location(parent_cluster, name, state, cache, caps.block_dev, ipc_buf)
+    }
+    else
+    {
+        None
+    };
+    match found
+    {
+        Some((entry, _)) if FatfsBackend::entry_kind(&entry) == NodeKind::Dir =>
+        {
+            Err(ipc::fs_errors::IS_A_DIRECTORY)
+        }
+        Some((entry, loc)) => Ok(backend::FatNode {
+            cluster: entry.cluster,
+            size: entry.size,
+            kind: NodeKind::File,
+            loc,
+        }),
+        None =>
+        {
+            let (cluster, loc) = make_entry(
+                state,
+                parent_cluster,
+                name,
+                NewEntryKind::File,
+                cache,
+                caps,
+                ipc_buf,
+            )?;
+            Ok(backend::FatNode {
+                cluster,
+                size: 0,
+                kind: NodeKind::File,
+                loc,
+            })
+        }
+    }
 }
 
 /// `FS_REMOVE`: unlink a file or empty directory. Badge = parent-dir

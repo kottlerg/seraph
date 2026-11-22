@@ -236,7 +236,7 @@ pub mod ns_labels;
 
 /// Wire-protocol version of [`fs_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const FS_LABELS_VERSION: u32 = 9;
+pub const FS_LABELS_VERSION: u32 = 10;
 pub mod fs_labels;
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above

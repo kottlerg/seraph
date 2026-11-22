@@ -388,7 +388,8 @@ behind. The child itself receives no handle to its own node.
 
 The label's bit 34 (`CREATE_CHARGE_NODE`) charges the child to the node of a node handle the
 creator holds: the request carries a copy of the handle as a cap of its own, after any extra caps
-and before the argv/env cap and the relay, and the child's node is made under the handle's node in
+and directly before the argv/env cap or the restore's object handle (**Restore** below), and before
+the relay, and the child's node is made under the handle's node in
 place of the creator's, clamped as above to what that node and every ancestor have left. The
 child's node is outside the reserve: procmgr refuses `CREATE_RESERVE` with the flag, and a charged
 child of the un-badged creator is no reserve node. A

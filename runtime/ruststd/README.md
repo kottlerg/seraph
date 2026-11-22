@@ -563,7 +563,9 @@ only in a session, which names that node
   driver's endpoint (`SYS_ENDPOINT_IDENTIFY`). The first match is the node's session. A key whose
   own inquiry fails is dead (vfsd's `UNMOUNT` revokes the driver's endpoint, and every session cap
   with it), and its entry is ended and removed. A failure with a live key is the node cap's, and
-  the open fails with it. The `ruststd-fs-sessions` crate holds this decision.
+  the open fails with it: `StaleNetworkFileHandle` when the node cap's slot is empty, as the
+  `FS_SESSION` on it would fail with no live key (§ Namespace capabilities), `Other` otherwise.
+  The `ruststd-fs-sessions` crate holds this decision.
 - **Start.** No match starts a session: a sub-node of the process's node (`CREATE_SUB_NODE`), a
   charge-only handle to it (`NODE_CHARGE_HANDLE`) moved to the driver in `FS_SESSION` on the node
   cap, and the reply's session cap and liveness cap, kept with the sub-node's handle. It runs with

@@ -238,9 +238,11 @@ fn find(sessions: &mut Vec<Entry>, node_cap: u64, ipc_buf: *mut u64) -> io::Resu
     {
         Found::Session(i) => sessions.get(i).map(|e| send_copy(e.session)).transpose(),
         Found::Missing => Ok(None),
-        Found::NodeError(_) => Err(io::const_error!(
-            io::ErrorKind::InvalidInput,
-            "seraph fs: the node cap names no live capability"
+        // As the `FS_SESSION` a lookup with no live key sends would fail: an
+        // empty slot (a node an unmount revoked) is `StaleNetworkFileHandle`.
+        Found::NodeError(_) => Err(super::call_failed(
+            node_cap,
+            "seraph fs: the node cap names no driver's endpoint",
         )),
     };
     sessions.retain(|e| {

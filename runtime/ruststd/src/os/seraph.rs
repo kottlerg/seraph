@@ -3249,8 +3249,9 @@ pub mod fs {
     /// `QuotaExceeded` when the max of this process's node, or of an
     /// ancestor's, refuses the session's first page; `OutOfMemory` when
     /// memmgr cannot make the session's node; the error of a failed
-    /// `FS_SESSION`, or `InvalidInput` for a `node_cap` that names no live
-    /// capability.
+    /// `FS_SESSION`, or of the kernel's inquiry about `node_cap`:
+    /// `StaleNetworkFileHandle` when its slot holds no capability (a node an
+    /// unmount revoked), `Other` when the cap is live but names no driver.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn session_for(node_cap: u64) -> crate::io::Result<u64> {
         crate::sys::fs::session_copy(node_cap, super::current_ipc_buf())

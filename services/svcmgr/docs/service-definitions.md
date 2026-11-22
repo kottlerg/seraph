@@ -228,8 +228,8 @@ svcmgr-launched services.
 Space-separated discovery-registry names. svcmgr resolves each name to a freshly-derived
 `RIGHTS_EP_SEND` cap on the published endpoint (`RIGHTS_EP_SEND_GRANT` for `devmgr.bind`, whose
 `BIND_DRIVERS` moves a directory cap and so needs `GRANT`, for `memmgr.swap`, whose swap labels
-move caps to memmgr, and for each [`:grant`](#provides) name) and injects them positionally into the
-child's bootstrap rounds:
+move caps to memmgr, for `svcmgr.grant`, whose requests carry caps, and for each
+[`:grant`](#provides) name) and injects them positionally into the child's bootstrap rounds:
 
 ```
 seed = rootfs.root pwrmgr.shutdown pwrmgr.deny
@@ -270,6 +270,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `acpid.deny` | svcmgr (`acpid.svc` provider) | no-authority SEND on acpid's service endpoint (negative-test twin) | yes |
 | `timed` | svcmgr (`timed.svc` provider) | un-badged SEND on timed's service endpoint (wall-clock) | yes |
 | `svcmgr` | svcmgr (its own service endpoint) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
+| `svcmgr.grant` | svcmgr (its own service ep) | `PUBLISHED_SEND_BADGE`-badged `SEND\|GRANT` on svcmgr's own service endpoint (no verb-bit), svctest's test twin for requests that carry caps, which svcmgr deletes; its seeds keep `GRANT` (seeded by svctest only) | no |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
 | `devmgr.bind` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| BIND_AUTHORITY`-badged `SEND\|GRANT` on devmgr's registry endpoint, gating `BIND_DRIVERS`, which moves a directory cap (seeded by svctest only) | no |

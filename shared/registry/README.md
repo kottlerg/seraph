@@ -17,10 +17,10 @@ Each entry is published `Public`, `SeedOnly`, or `SeedOnlyGrant`. A lookup names
 its recipes' seed lists and its own lookups) sees all, so a `SeedOnly` or `SeedOnlyGrant` name
 reaches only the recipes that seed it (per
 [services/svcmgr/docs/ipc-interface.md](../../services/svcmgr/docs/ipc-interface.md) § Label 4:
-`QUERY_ENDPOINT`). A `SeedOnlyGrant` entry (`devmgr.bind`, and each `:grant` provider name such as
-`sessiond.operator`) resolves for `Seed` only, and `lookup` returns `Resolved { cap, grant }` with
-`grant` set for it, so the supervisor derives the seed with `GRANT`; every other entry has `grant`
-false.
+`QUERY_ENDPOINT`). A `SeedOnlyGrant` entry (`devmgr.bind`, `memmgr.swap`, `svcmgr.grant`, and
+each `:grant` provider name such as `sessiond.operator`) resolves for `Seed` only, and
+`lookup` returns `Resolved { cap, grant }` with `grant` set for it, so the supervisor derives
+the seed with `GRANT`; every other entry has `grant` false.
 
 `no_std` outside host tests, with `alloc`; its one dependency is `shared/ipc`, for the name
 limit.

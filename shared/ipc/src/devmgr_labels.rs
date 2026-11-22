@@ -438,39 +438,51 @@ pub const WINDOW_IO: u64 = 1;
 /// [`BRIDGE_WINDOWS`] kind: a bus number range.
 pub const WINDOW_BUS: u64 = 2;
 
-/// Push the interrupt routes of one PCI host bridge's root bus from
-/// acpid: its `_PRT`, each entry's link device resolved to the line its
-/// current resources name.
+/// Push the interrupt routes of one bus from acpid: a `_PRT`, each entry's
+/// link device resolved to the line its current resources name. The bus is a
+/// PCI host bridge's root bus, or the secondary bus of a PCI-to-PCI bridge
+/// below it that the namespace gives a `_PRT` of its own (ACPI 6.5 § 6.2.13).
 ///
 /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
-/// `data[1]` = the bridge's segment; `data[2]` = its bus; `data[3]` =
-/// [`PRT_ROUTES`] or [`PRT_PIC_MODE`]; `data[4..36]` = one word per
+/// `data[1]` = the host bridge's segment; `data[2]` = its bus; `data[3]` =
+/// [`PRT_ROUTES`] or [`PRT_PIC_MODE`]; `data[4]` = [`PRT_ROOT_BUS`] for
+/// the host bridge's own `_PRT`, else the PCI-to-PCI bridge's address,
+/// packed as [`pci_function`] packs it; `data[5..37]` = one word per
 /// device 0 to 31, holding the line of pin `INTA` to `INTD` in its 16-bit
 /// lanes 0 to 3 (bits `16 * pin` up), [`PRT_NO_ROUTE`] for a pin the table
 /// does not route. Caller's badge MUST carry [`ACPI_AUTHORITY`]; the
 /// handler replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
 ///
-/// devmgr checks one mode's table against the boot functions with an
-/// interrupt pin on the buses of the bridge's windows ([`BRIDGE_WINDOWS`]),
-/// each at the root-bus device and pin its interrupt reaches: on x86-64 the
-/// [`PRT_PIC_MODE`] table against each function's Interrupt Line
-/// register, which the firmware programmed in that model; on RISC-V the
-/// [`PRT_ROUTES`] table against the line devmgr gives each function. It
-/// keeps the first table of each bridge and mode that passes, for the
-/// boot, and logs a later push that differs; on x86-64 it keeps a
-/// [`PRT_ROUTES`] table only once it holds the bridge's
-/// [`PRT_PIC_MODE`] table, the same `_PRT` read in the other model,
-/// whose routes it checks only for being routed and reads for nothing else.
-/// On x86-64 it also routes a function whose Interrupt Line is unset (one
-/// hot-added) by the [`PRT_PIC_MODE`] table, at the pin and root-bus device
-/// its interrupt reaches. A refusal is fail-closed:
-/// the bridge has no table of the mode from acpid until a push passes.
+/// A function's interrupt is routed by the table of the nearest PCI-to-PCI
+/// bridge above it that acpid pushed one for, at the device and pin its
+/// interrupt reaches that bridge's secondary bus with (swizzled at each
+/// bridge between), or, with none, by its host bridge's table at the device
+/// and pin its interrupt reaches the root bus with. devmgr checks one mode's
+/// table against the boot functions with an interrupt pin that it routes:
+/// for a host bridge, those on the buses of its windows ([`BRIDGE_WINDOWS`])
+/// that no PCI-to-PCI bridge's table routes, so acpid pushes the tables of
+/// the PCI-to-PCI bridges, the deepest first, before the host bridge's. It
+/// checks, on x86-64, the [`PRT_PIC_MODE`] table against each function's
+/// Interrupt Line register, which the firmware programmed in that model; on
+/// RISC-V the [`PRT_ROUTES`] table against the line devmgr gives each
+/// function. It keeps the first table of each bridge and mode that passes,
+/// for the boot, and logs a later push that differs; on x86-64 it keeps a
+/// [`PRT_ROUTES`] table only once it holds the bridge's [`PRT_PIC_MODE`]
+/// table, the same `_PRT` read in the other model, whose routes it checks
+/// only for being routed and reads for nothing else. On x86-64 it also
+/// routes a function whose Interrupt Line is unset (one hot-added) by the
+/// [`PRT_PIC_MODE`] table that routes it. A refusal is fail-closed: the
+/// bridge has no table of the mode from acpid until a push passes, and a
+/// PCI-to-PCI bridge, which devmgr records at its first push, routes the
+/// functions below it by its own tables alone, so by none until one passes.
 /// Reply: [`super::devmgr_errors::SUCCESS`] when devmgr holds the
 /// bridge's table of the mode; [`super::devmgr_errors::REFUSED`], logged,
-/// for a table that fails the check or comes before the bridge's windows
-/// or the table it waits for; [`super::devmgr_errors::INVALID_REQUEST`] for an unknown mode, a
-/// mode the architecture does not serve, a short push, or a bridge devmgr
-/// cannot record.
+/// for a table that fails the check, a host bridge's that comes before its
+/// windows, one that comes before the table it waits for, or one of a
+/// PCI-to-PCI bridge in another segment or where devmgr records no
+/// configured bridge; [`super::devmgr_errors::INVALID_REQUEST`] for an
+/// unknown mode, a mode the architecture does not serve, a `data[4]` with a
+/// bit above the segment set, a short push, or a bridge devmgr cannot record.
 pub const PRT_TABLE: u64 = 29;
 /// [`PRT_TABLE`] mode: the routes of the interrupt model acpid selected
 /// (`_PIC(1)`, the APIC model, on x86-64; the only model on RISC-V),
@@ -483,9 +495,11 @@ pub const PRT_ROUTES: u64 = 0;
 pub const PRT_PIC_MODE: u64 = 1;
 /// [`PRT_TABLE`] lane value: no route.
 pub const PRT_NO_ROUTE: u64 = 0xFFFF;
+/// [`PRT_TABLE`] `data[4]`: the table is the host bridge's, of its root bus.
+pub const PRT_ROOT_BUS: u64 = u64::MAX;
 /// The `data` words of a [`PRT_TABLE`] push: the header and one word per
 /// device.
-pub const PRT_TABLE_WORDS: usize = 4 + 32;
+pub const PRT_TABLE_WORDS: usize = 5 + 32;
 
 /// Read what devmgr holds for one PCI host bridge from acpid's pushes:
 /// whether the firmware granted the OS native control of each PCI Express

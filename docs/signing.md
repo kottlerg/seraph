@@ -149,8 +149,11 @@ under its entry name before it uses the entry. An entry other than `init` is nam
 install path, which the entry-name field holds whole, up to `objsig::NAME_MAX` (256 bytes) like any
 signed name ([limits.md](limits.md) § Bootloader and boot ABIs), and the bootloader refuses any
 other entry name. An attacker who edits the header can drop an entry, which fails the boot when the
-entry is needed, or rename one, which its signed name refuses. Dropping the boot-time policy fails
-every boot: the bootloader refuses a bundle without it (§ Configuration).
+entry is needed, or rename one, which its signed name refuses. It cannot reorder or duplicate
+entries to give two owners the same memory: the bootloader refuses a header whose entry bodies are
+not in ascending offset order, each starting at or past the page boundary after the one before it.
+Dropping the boot-time policy fails every boot: the bootloader refuses a bundle without it
+(§ Configuration).
 
 ---
 

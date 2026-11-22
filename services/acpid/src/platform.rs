@@ -9,8 +9,9 @@
 //! An I/O access asks devmgr for its operation region's whole span, a
 //! memory access for the page that holds it (`ACPI_REGION_GRANT`), on first
 //! use; acpid binds the `IoPort` to the evaluation thread or maps the
-//! `Mmio`, and keeps the grant. A refused span is kept too, so it is asked
-//! for once. A configuration-space access is one `ACPI_PCI_CONFIG` call.
+//! `Mmio`, and keeps the grant. A refused span, and a page whose map
+//! fails, are kept too, so each is asked for once. A configuration-space
+//! access is one `ACPI_PCI_CONFIG` call.
 //! Each `Notify` of a hotplug event is kept, once per object and event
 //! ([`hotplug::keep`]), for the evaluation thread to act on once the
 //! evaluation ends ([`Platform::take_hotplug_notes`]). acpid holds no
@@ -166,7 +167,22 @@ impl<'a> Platform<'a>
         }
         else
         {
-            self.map(grant.cap, grant.len)?
+            let Ok(va) = self.map(grant.cap, grant.len)
+            else
+            {
+                // The capability and the VA stay with the failed map
+                // (`map_held`), so the page is not asked for again: a
+                // second grant would hold another of each.
+                std::os::seraph::log!(
+                    warn: "region map failed: {} {:#x}+{:#x}",
+                    space_name(space),
+                    region.base,
+                    region.len
+                );
+                self.refused.push((space, region));
+                return Err(HostError::Failed);
+            };
+            va
         };
         self.held.push(Held {
             space,

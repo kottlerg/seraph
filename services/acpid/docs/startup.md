@@ -104,9 +104,9 @@ Every hardware access of the evaluator goes through devmgr ([devmgr.md](devmgr.m
 
 - An I/O field access asks devmgr for its operation region's whole span on first use, a
   memory field access for the page that holds it. acpid binds the `IoPort` to the evaluation
-  thread or maps the `Mmio`, and keeps the grant for acpid's lifetime. A refused span is
-  remembered and not asked for again. A memory write is
-  followed by an MMIO ordering barrier.
+  thread or maps the `Mmio`, and keeps the grant for acpid's lifetime. A refused span, and a
+  page whose map fails, are remembered and not asked for again. A memory write is followed by an
+  MMIO ordering barrier.
 - A configuration-space access is one `ACPI_PCI_CONFIG` call.
 - A `Notify` of a hotplug event is kept, once per object and event, and acted on once the
   evaluation ends: a hotplug event of a slot below a PCI-to-PCI bridge is posted

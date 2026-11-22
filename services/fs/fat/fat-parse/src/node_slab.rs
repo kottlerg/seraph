@@ -362,16 +362,14 @@ fn next_bucket(b: usize, mask: usize) -> usize
 
 /// The index of the slot a slab of `len` slots pushes next, and its length
 /// after that push; `None` when the push would take it past `max` slots.
-/// [`crate::open_slab::OpenSlab`] grows the same way.
-pub(crate) fn new_index(len: usize, max: usize) -> Option<(u32, usize)>
+fn new_index(len: usize, max: usize) -> Option<(u32, usize)>
 {
     let new_len = len.checked_add(1).filter(|&n| n <= max)?;
     Some((u32::try_from(len).ok()?, new_len))
 }
 
 /// The identifier of slab index `idx` at `generation`: never 0, the root's.
-/// [`crate::open_slab::OpenSlab`] issues its identifiers in the same shape.
-pub(crate) fn identifier(idx: u32, generation: u16) -> u64
+fn identifier(idx: u32, generation: u16) -> u64
 {
     (u64::from(generation) << INDEX_BITS) | (u64::from(idx) + 1)
 }

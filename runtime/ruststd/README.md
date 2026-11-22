@@ -33,6 +33,10 @@ ruststd/
 │   └── src/                    #   growth policy and thread-reaper slot registry; a
 │                               #   rustc-dep-of-std dep of overlaid std (not re-exported),
 │                               #   and the policy shared/death-set follows for services
+├── fs-sessions/                # `ruststd-fs-sessions` crate: pure, host-tested lookup of
+│   └── src/lib.rs              #   the filesystem session table (which session serves a node
+│                               #   cap, which entries are dead); a rustc-dep-of-std dep of
+│                               #   overlaid std
 ├── heap-fit/                   # `ruststd-heap-fit` crate: pure, host-tested placement and
 │   └── src/lib.rs              #   release rules of the byte heap (where a request lands in a
 │                               #   free block, what stays free, which chunks of the committed
@@ -90,13 +94,14 @@ closes the stdio pipes, and exits the process with its return code. `std::proces
 the same two steps before its exit syscall, so the fs driver drops the opens, and the release
 SENDs they hold, of `File`s the process never drops
 ([services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md)
-§ Label 18). A crash or a kill runs neither, and sends no `FS_CLOSE`. Each `File` holds its open's
-liveness cap until its close, and the process's `CSpace` takes the cap with it, so the driver
-releases such an open, with its release SEND, at its next sweep. Until then the endpoint that SEND
-names outlives the process, and memmgr holds the frame it lives in out of its pool until the SEND
-goes
-([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md#reclamation)
-§ Reclamation).
+§ Label 18). A crash or a kill runs neither, and sends no `FS_CLOSE`. Each open is made in the
+process's session with its driver, whose liveness cap the process's `CSpace` takes with it, so
+the driver releases such an open, with its release SEND, when it ends the session at the sweep
+memmgr's signal of the process's death starts (§ Filesystem sessions). Until then the endpoint that
+SEND names outlives the process, and memmgr holds the frame it lives in out of its pool until the
+SEND goes
+([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md#reclamation) §
+Reclamation).
 
 `std::os::seraph::StartupInfo` is std's own type, not a re-export of `process_abi::StartupInfo`
 (which only memmgr's bespoke runtime constructs); a binary reads it through
@@ -544,6 +549,46 @@ listing's names through the extension (svcmgr's recipe scan does).
 
 ---
 
+## Filesystem sessions
+
+A filesystem driver records each open in pages charged to a node of its client, and makes an open
+only in a session, which names that node
+([services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md) § Label 18,
+§ Label 23). std keeps one session per driver it opens files on, in a table
+(`src/sys/fs/session.rs`) that `File::open` consults before each `FS_OPEN`:
+
+- **Lookup.** The driver mints each session cap with `RIGHTS_EP_IDENTIFY`, and the table asks the
+  kernel, with each session cap as the key, whether the node cap the walk returned names that
+  driver's endpoint (`SYS_ENDPOINT_IDENTIFY`). The first match is the node's session. A key whose
+  own inquiry fails is dead (vfsd's `UNMOUNT` revokes the driver's endpoint, and every session cap
+  with it), and its entry is ended and removed. A failure with a live key is the node cap's, and
+  the open fails with it. The `ruststd-fs-sessions` crate holds this decision.
+- **Start.** No match starts a session: a sub-node of the process's node (`CREATE_SUB_NODE`), a
+  charge-only handle to it (`NODE_CHARGE_HANDLE`) moved to the driver in `FS_SESSION` on the node
+  cap, and the reply's session cap and liveness cap, kept with the sub-node's handle. It runs with
+  the table unlocked; a thread that finds another's session for the same driver in the table once
+  its own has started ends its own and takes the other.
+- **Charge.** The sub-node has no max of its own, by design: the process's node and its
+  ancestors bound it, as they bound everything else the process spends, and a fixed max
+  would cap the files a process can hold open whatever budget its creator gave it. A session or an
+  open that the max of the process's node, or of an ancestor's, refuses fails with
+  `ErrorKind::QuotaExceeded` (the driver's `LIMIT`), and the other clients of the driver go on.
+- **The open.** `FS_OPEN` carries a SEND-only copy of the session cap, without the Identify right,
+  in `caps[0]` and the `File`'s release SEND in `caps[1]`; the reply carries the open cap alone.
+- **End.** A session lives for the process's life, which the session's liveness cap keeps: the
+  process's death ends it, with every open made in it, and the charge returns to the process's
+  node. An entry the table removes (a dead key, or the loser of a start race, which never served
+  an open) has its liveness cap deleted first, then its sub-node released (`NODE_RELEASE`) and the
+  handle deleted, so the driver ends the session at its next sweep.
+- **Restore.** The table is a `rebound` static (§ Restore classes): the restore entry forgets its
+  entries, whose caps name slots of the captured process, and the next open starts a session.
+
+`std::os::seraph::fs::session_for(node_cap)` returns a SEND-only copy of the process's session cap
+with the driver of `node_cap`, starting the session as `File::open` would, for a client that sends
+`FS_OPEN` itself.
+
+---
+
 ## Child process handles
 
 `std::os::seraph::process::ChildExt::process_handle` returns a spawned child's
@@ -747,10 +792,10 @@ does not trust to answer, as crashd bounds a fault's report and a core dump
   the log. Such a call may have reached its server, which may have acted on it, and whose reply
   then finds no caller. A spawn's wait for its child's bootstrap requests (§ Bootstrap caps), which
   is a receive, ends at the deadline too, and fails the spawn `TimedOut`. A `File` dropped past
-  the deadline sends no `FS_CLOSE`; the driver releases that open once it finds the open's
-  liveness cap gone, which the drop deletes
-  ([Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md) § Label 18:
-  `FS_OPEN`).
+  the deadline sends no `FS_CLOSE`; that open stays in the process's session with its driver,
+  its records charged to the process's node, until the session ends with the process
+  ([Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md) § Label 23:
+  `FS_SESSION`).
 - **Not bounded.** The calls to memmgr (the heap, the stacks, the registration of demand-paged
   regions, frames, the release of a `VerifiedData`): memmgr is the process's pager, so a stuck
   memmgr stops the process at its next page fault whatever a call's bound, and a heap call that
@@ -898,7 +943,9 @@ dropped, so it cannot drift from the values alive. A value the application forge
 (`mem::forget`) keeps its count, and every later `quiesce` of the process is refused; that is
 accepted, as the leak of the capability is. The runtime's own threads, the fs release handler and
 a child's death bridge, are spawned through `thread::runtime_spawn` and not counted: they are idle
-at their wait whenever the counts are zero.
+at their wait whenever the counts are zero. The filesystem session table (§ Filesystem sessions)
+keeps its sessions' caps past a quiesce point in a `rebound` static, which the restore entry
+forgets.
 
 ### Restore classes
 

@@ -340,8 +340,9 @@ crashd's own end `WouldBlock`, and the runtime's file calls fail `TimedOut`. cra
 further request, writes no core, logs `not written: the dump passed its bound`, and declines. What
 the dump leaves: a request the driver had received before the deadline may still be carried out (a
 write lands, a file is created); the core file's close, as it is dropped, is not sent past the
-deadline, and the driver releases that open once it finds the open's liveness cap gone, which the
-drop deletes ([fs driver protocol](../../fs/docs/fs-driver-protocol.md) § Label 18: `FS_OPEN`); the
+deadline, and that open stays in crashd's session with the driver, its records charged to crashd's
+own node, until the session ends with crashd
+([fs driver protocol](../../fs/docs/fs-driver-protocol.md) § Label 23: `FS_SESSION`); the
 `.part` file stays, and the next dump deletes it (step 6 of [Core Dump](#core-dump)); and the
 threads it stopped stay stopped until the decline ends the process. The faulting thread is held
 while the dump runs, so the bound is the most a dump delays the process's teardown and crashd's next

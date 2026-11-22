@@ -12,16 +12,18 @@
 //! its sessions and checks that a session's first page lands on its node;
 //! that opens in the session take further pages there until the node's max
 //! refuses one with `LIMIT`, while a session on a sibling node, and an open
-//! with no session, still open; that the extra page returns when the opens
-//! close and the first when the session ends, which a release of its node
-//! signals to fatfs once the session's liveness cap is gone; and that a
-//! session whose liveness cap is held outlives that sweep. A
-//! `fs-session-client` child ([`session_client_main`]) makes a session on
-//! a node of its own and exits holding it, opens and a held page included:
-//! its death returns the charge. It also checks the refusals: a session with
-//! no handle or with a cap that is no node handle, a first page past the max,
-//! and a session cap or an ended session's opens used as caps of another
-//! kind.
+//! in svctest's own session (the one std keeps), still open; that the extra
+//! page returns when the opens close and the first when the session ends,
+//! which a release of its node signals to fatfs once the session's liveness
+//! cap is gone; and that a session whose liveness cap is held outlives that
+//! sweep. A `fs-session-client` child ([`session_client_main`]) makes a
+//! session on a node of its own and exits holding it, opens and a held page
+//! included: its death returns the charge. It also checks the refusals: a
+//! session with no handle or with a cap that is no node handle, a first page
+//! past the max, an open with no session cap or with a cap that names no live
+//! session, and a session cap used as a node or an open cap; and that std
+//! opens a file across the `/data` mount in its session with the `/data`
+//! driver, which the `/esp` driver does not take, nor the other way round.
 
 use std::os::seraph::{current_ipc_buf, startup_info};
 use std::time::{Duration, Instant};
@@ -71,6 +73,8 @@ const OPEN_BOUND: usize = 4096;
 /// How long the phase waits for a charge to leave a node once its session
 /// ends. A test wait bound.
 const SETTLE_WAIT: Duration = Duration::from_secs(60);
+/// A file of the `/esp` driver, which is not the `/data` driver.
+const ESP_PROBE: &str = "/esp/EFI/seraph/bootstrap.bundle";
 /// Opens the child makes in its session.
 const CLIENT_OPENS: usize = 3;
 
@@ -93,6 +97,7 @@ fn fs_sessions_phase(_: &Caps)
     let ipc_buf = current_ipc_buf();
     let (svctest, node) = scratch_file(ipc_buf);
     let top = sub_node(startup_info().memmgr_endpoint, NO_MAX, "CREATE_SUB_NODE");
+    one_session_per_driver(node, ipc_buf);
     refusals(top, node, ipc_buf);
     charged_to_the_client(top, node, ipc_buf);
     client_death(top);
@@ -123,7 +128,7 @@ fn scratch_file(ipc_buf: *mut u64) -> (u64, u64)
 /// A sub-node with the max `max` under the node `target` names: svctest's
 /// own over its memmgr endpoint (`CREATE_SUB_NODE`), or a node handle's
 /// (`NODE_CREATE`). Its handle.
-fn sub_node(target: u64, max: u64, what: &str) -> u64
+pub(super) fn sub_node(target: u64, max: u64, what: &str) -> u64
 {
     let label = if target == startup_info().memmgr_endpoint
     {
@@ -138,7 +143,7 @@ fn sub_node(target: u64, max: u64, what: &str) -> u64
 }
 
 /// A charge-only handle to the node of the handle `handle`.
-fn charge_handle(handle: u64, what: &str) -> u64
+pub(super) fn charge_handle(handle: u64, what: &str) -> u64
 {
     let reply = expect(
         handle,
@@ -178,9 +183,87 @@ fn open_reads(open: u64, ipc_buf: *mut u64) -> bool
     }
 }
 
+/// std's session with the driver of `node`, a node of `/data` reached across
+/// its mount, opens `node`; its session with the `/esp` driver opens a node
+/// there; and each driver refuses the other's session as a cap on another
+/// endpoint (`INVALID_ARGUMENT`), so the walk's mount decides the session.
+fn one_session_per_driver(node: u64, ipc_buf: *mut u64)
+{
+    let file = std::fs::File::open(format!("/data/svctest/{NAME}"))
+        .expect("fs_sessions: std open across the /data mount");
+    drop(file);
+    let esp = std::os::seraph::root_dir_cap();
+    let mut esp_node = esp;
+    for name in ESP_PROBE.split('/').filter(|n| !n.is_empty())
+    {
+        let (next, _, _) = ns_lookup(esp_node, name.as_bytes(), 0xFFFF, ipc_buf)
+            .unwrap_or_else(|e| panic!("fs_sessions: lookup {name} of {ESP_PROBE}: {e:#x}"));
+        if esp_node != esp
+        {
+            let _ = syscall::cap_delete(esp_node);
+        }
+        esp_node = next;
+    }
+    let session_for = |cap: u64, what: &str| {
+        std::os::seraph::fs::session_for(cap)
+            .unwrap_or_else(|e| panic!("fs_sessions: std's session with {what}: {e}"))
+    };
+    let data_session = session_for(node, "the /data driver");
+    let esp_session = session_for(esp_node, "the /esp driver");
+    for (target, session, what) in [
+        (node, data_session, "/data"),
+        (esp_node, esp_session, "/esp"),
+    ]
+    {
+        let open = fs_open_in(target, session, 0, ipc_buf)
+            .unwrap_or_else(|e| panic!("FS_OPEN of a {what} node in std's session: {e:#x}"));
+        assert_eq!(fs_close(open, ipc_buf), fs_errors::SUCCESS);
+        let _ = syscall::cap_delete(open);
+    }
+    assert_eq!(
+        fs_open_in(node, esp_session, 0, ipc_buf).err(),
+        Some(fs_errors::INVALID_ARGUMENT),
+        "the /data driver took a session of the /esp driver"
+    );
+    assert_eq!(
+        fs_open_in(esp_node, data_session, 0, ipc_buf).err(),
+        Some(fs_errors::INVALID_ARGUMENT),
+        "the /esp driver took a session of the /data driver"
+    );
+    for cap in [data_session, esp_session, esp_node]
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+}
+
+/// `FS_OPEN` on `node` carrying `caps` (moved to fatfs, or deleted when the
+/// call does not move them); the reply's label, every reply cap deleted.
+fn open_carrying(node: u64, caps: &[u64], ipc_buf: *mut u64) -> u64
+{
+    let msg = caps
+        .iter()
+        .fold(IpcMessage::builder(ipc::fs_labels::FS_OPEN), |b, &cap| {
+            b.cap(cap)
+        })
+        .build();
+    // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(node, &msg, ipc_buf) };
+    for &cap in caps
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    let reply = reply.expect("FS_OPEN ipc_call");
+    for &cap in reply.caps()
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    reply.label
+}
+
 /// `FS_SESSION` with no cap, with a cap that is no node handle, and with a
-/// handle whose node's max refuses the first page; a session cap used as a
-/// node or an open cap.
+/// handle whose node's max refuses the first page; `FS_OPEN` with no session
+/// cap, with a cap on another endpoint, and with a cap on the driver's that
+/// names no live session; a session cap used as a node or an open cap.
 fn refusals(top: u64, node: u64, ipc_buf: *mut u64)
 {
     assert_eq!(
@@ -213,8 +296,8 @@ fn refusals(top: u64, node: u64, ipc_buf: *mut u64)
     // A session cap names a session and takes no request of its own; an
     // open cap is no session to open in.
     assert_eq!(
-        fs_open(session, 0, ipc_buf).err(),
-        Some(fs_errors::INVALID_BADGE),
+        open_carrying(session, &[], ipc_buf),
+        fs_errors::INVALID_BADGE,
         "FS_OPEN sent on a session cap"
     );
     assert_eq!(
@@ -227,14 +310,35 @@ fn refusals(top: u64, node: u64, ipc_buf: *mut u64)
         Some(fs_errors::INVALID_BADGE),
         "FS_SESSION sent on a session cap"
     );
-    let unpaid = fs_open(node, 0, ipc_buf).expect("an open with no session");
+
+    // Every open is made in a session: none, or a cap on another endpoint,
+    // is no session; a node or open cap of the driver's names none.
     assert_eq!(
-        fs_open_in(node, unpaid, 0, ipc_buf).err(),
+        open_carrying(node, &[], ipc_buf),
+        fs_errors::INVALID_ARGUMENT,
+        "FS_OPEN with no session cap"
+    );
+    let other = syscall::cap_derive(startup_info().memmgr_endpoint, syscall::RIGHTS_EP_SEND)
+        .expect("cap_derive of the memmgr endpoint");
+    assert_eq!(
+        open_carrying(node, &[other], ipc_buf),
+        fs_errors::INVALID_ARGUMENT,
+        "FS_OPEN carrying a cap on another endpoint"
+    );
+    let node_copy = syscall::cap_derive(node, syscall::RIGHTS_EP_SEND).expect("cap_derive");
+    assert_eq!(
+        open_carrying(node, &[node_copy], ipc_buf),
+        fs_errors::INVALID_BADGE,
+        "FS_OPEN carrying a node cap as its session"
+    );
+    let open = fs_open_in(node, session, 0, ipc_buf).expect("FS_OPEN in the one-page session");
+    assert_eq!(
+        fs_open_in(node, open, 0, ipc_buf).err(),
         Some(fs_errors::INVALID_BADGE),
         "FS_OPEN carrying an open cap as its session"
     );
-    assert_eq!(fs_close(unpaid, ipc_buf), fs_errors::SUCCESS);
-    let _ = syscall::cap_delete(unpaid);
+    assert_eq!(fs_close(open, ipc_buf), fs_errors::SUCCESS);
+    let _ = syscall::cap_delete(open);
 
     end_session(&[], liveness, one, "the one-page node");
     // The session ends in the sweep fatfs makes when memmgr signals the
@@ -274,7 +378,7 @@ fn end_session(opens: &[u64], liveness: u64, node: u64, what: &str)
 
 /// A session charged to node A takes a page there for its first, and opens
 /// in it take one more, until A's max refuses with `LIMIT`; a session on
-/// node B and an open with no session still open. The extra page returns when
+/// node B and svctest's own session still open. The extra page returns when
 /// the opens close, the first when the session ends with its liveness cap and
 /// node, while B's session, whose liveness cap the phase keeps, outlives the
 /// sweep and then ends the same way.
@@ -322,15 +426,14 @@ fn charged_to_the_client(top: u64, node: u64, ipc_buf: *mut u64)
         "a session's pages were charged to svctest's own node"
     );
 
-    // Another client's session, and an open with no session, are not held
-    // to node A.
+    // Another client's session, and svctest's own, are not held to node A.
     let (session_b, live_b) = fs_session(node, charge_handle(b, "NODE_CHARGE_HANDLE"), ipc_buf)
         .expect("FS_SESSION on node B while node A is at its max");
     let open_b = fs_open_in(node, session_b, 0, ipc_buf).expect("FS_OPEN in node B's session");
     assert_eq!(node_usage(b, "NODE_QUERY_USAGE of node B").0, 1);
-    let unpaid = fs_open(node, 0, ipc_buf).expect("an open with no session at node A's max");
-    assert_eq!(fs_close(unpaid, ipc_buf), fs_errors::SUCCESS);
-    let _ = syscall::cap_delete(unpaid);
+    let own_open = fs_open(node, 0, ipc_buf).expect("an open in svctest's session at A's max");
+    assert_eq!(fs_close(own_open, ipc_buf), fs_errors::SUCCESS);
+    let _ = syscall::cap_delete(own_open);
 
     // A session open reads, and holds and releases a page.
     let Some((&first, rest)) = opens.split_first()

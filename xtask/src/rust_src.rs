@@ -680,7 +680,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
 /// name, its path under the project root, and its package name when that
 /// differs from the dependency name (written as the `package` key of its
 /// `library/std/Cargo.toml` line).
-const STD_WORKSPACE_DEPS: [(&str, &str, Option<&str>); 14] = [
+const STD_WORKSPACE_DEPS: [(&str, &str, Option<&str>); 15] = [
     ("syscall-abi", "abi/syscall", None),
     ("syscall", "shared/syscall", None),
     ("ipc", "shared/ipc", None),
@@ -699,6 +699,11 @@ const STD_WORKSPACE_DEPS: [(&str, &str, Option<&str>); 14] = [
         "death-queues",
         "runtime/ruststd/death-queues",
         Some("ruststd-death-queues"),
+    ),
+    (
+        "fs-sessions",
+        "runtime/ruststd/fs-sessions",
+        Some("ruststd-fs-sessions"),
     ),
     (
         "heap-fit",
@@ -1313,9 +1318,9 @@ fn apply_pipe_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 }
 
 /// Route `std::sys::fs` through a seraph module that implements
-/// `std::fs::File` against vfsd / fs-driver IPC. Two source files: the
-/// public `seraph.rs` and an inner `release_handler.rs` (declared from
-/// `seraph.rs::mod release_handler;`). See
+/// `std::fs::File` against vfsd / fs-driver IPC. Three source files: the
+/// public `seraph.rs` and the inner `release_handler.rs` and `session.rs`
+/// (declared from `seraph.rs` as `mod release_handler;` and `mod session;`). See
 /// `runtime/ruststd/src/sys/fs/seraph.rs`.
 fn apply_fs_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 {
@@ -1325,6 +1330,8 @@ fn apply_fs_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
     let seraph_rs_src = overlay_root.join("sys/fs/seraph.rs");
     let release_handler_rs_dst = fs_dir.join("release_handler.rs");
     let release_handler_rs_src = overlay_root.join("sys/fs/release_handler.rs");
+    let session_rs_dst = fs_dir.join("session.rs");
+    let session_rs_src = overlay_root.join("sys/fs/session.rs");
 
     write_if_changed(&seraph_rs_src, &seraph_rs_dst, "sys/fs/seraph.rs")?;
     write_if_changed(
@@ -1332,6 +1339,7 @@ fn apply_fs_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         &release_handler_rs_dst,
         "sys/fs/release_handler.rs",
     )?;
+    write_if_changed(&session_rs_src, &session_rs_dst, "sys/fs/session.rs")?;
 
     patch_file(
         &mod_rs,
@@ -1341,7 +1349,7 @@ fn apply_fs_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
          // seraph-overlay: std::fs::File via vfsd OPEN + fs-driver FS_READ/FS_READ_FRAME\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          use seraph as imp;\n        \
-         pub(crate) use seraph::{close_open_files, rebind_release_handler, walk_path_to_file, walk_path_to_dir, walk_path_to_dir_with_rights, WalkedFile, WalkedDir};\n    }\n",
+         pub(crate) use seraph::{close_open_files, rebind_fs_sessions, rebind_release_handler, session_copy, walk_path_to_file, walk_path_to_dir, walk_path_to_dir_with_rights, WalkedFile, WalkedDir};\n    }\n",
     )
 }
 

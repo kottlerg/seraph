@@ -803,13 +803,19 @@ further page; for each open in a session the 72-byte slot of its release SEND, a
 it holds the slot of the page's capability, each matched by the 72-byte slot the client's own
 `CSpace` gives the capability it receives; and the index from ids to records, at most 8 bytes per
 live session or open, which halves as they go. The page tables that map session pages into fatfs
-stay at the most pages mapped at once, at most 8 bytes per page. An open made without a session,
-fatfs's unpaid path, which std and procmgr still take, keeps about 0.3 to 0.4 KiB on fatfs, and 104
-bytes for each page of the open that is mapped and not yet returned, with no bound for one client;
-the client pays 144 bytes of its own `CSpace` for the two capabilities such an open hands it. A
-client can therefore make fatfs spend memory beyond the client's own max through that path, bounded
-only by fatfs's node and the reserve. This is a known gap until those clients make sessions and
-fatfs refuses an open without one ([#1100](https://github.com/kottlerg/seraph/issues/1100)).
+stay at the most pages mapped at once, at most 8 bytes per page. fatfs refuses an open made without
+a session, so a client can make fatfs spend on its own node only these slots and index entries, each
+beside a record the client's node pays for. std makes one session for each filesystem driver a
+process opens files on, charged to a sub-node of the process's own node with no max of its own, a
+design decision: the process's node bounds what its sessions charge, and a fixed max would cap the
+files the process can hold open whatever memory its creator granted it
+([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Filesystem sessions). procmgr
+makes one session for each image or `READ_VERIFIED` read, charged to a sub-node of the account the
+read's buffer is granted on with a max of one page, a design decision too: that node is not
+procmgr's own but the creator's, charged once per read, and one page holds the session, its one open
+and the one page procmgr holds at a time
+([services/procmgr/docs/ipc-interface.md](../../procmgr/docs/ipc-interface.md) § Label 13, **Read
+session**).
 
 **Node handles.** Authority over a node is a capability: a node handle, a SEND on memmgr's
 endpoint badged with the node-handle verb bit and a random key that names one node

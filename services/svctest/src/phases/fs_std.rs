@@ -570,13 +570,22 @@ type ReleaseReply = (u64, std::time::Duration);
 /// `FAKE_FS_OPEN_BASE + n`.
 const FAKE_FS_OPEN_BASE: u64 = 0x100;
 
+/// Badge of the session cap the fake fs mints for the `release-child`'s
+/// `FS_SESSION`.
+const FAKE_FS_SESSION_BADGE: u64 = 0x200;
+
 /// What the fake fs saw of the `release-child`'s requests, and the replies
 /// to the releases it sent while `/b`'s read was unanswered.
 #[derive(Default)]
 struct FakeFsReport
 {
+    /// `FS_SESSION`s the fake fs answered.
+    sessions: usize,
     /// Caps each node's `FS_OPEN` carried, by node (1 = `/a`, 2 = `/b`).
     open_caps: [Option<usize>; 2],
+    /// Whether each node's `FS_OPEN` carried in `caps[0]` a copy of the
+    /// session cap with `SEND` alone, by node.
+    open_sessions: [Option<bool>; 2],
     /// Caps `/b`'s `FS_READ_MEMORY` carried.
     read_caps: Option<usize>,
     /// A release of `/b`'s mid-read cookie on `/a`'s release SEND.
@@ -588,8 +597,10 @@ struct FakeFsReport
     closes: [usize; 2],
 }
 
-/// The std client hands each `File`'s release SEND to the driver on its
-/// `FS_OPEN` and none on `FS_READ_MEMORY`, and its release handler matches a
+/// The std client starts one session with a driver and opens each `File`
+/// in it, handing a `SEND`-only copy of the session cap and the `File`'s
+/// release SEND to the driver on its `FS_OPEN` and none on
+/// `FS_READ_MEMORY`, and its release handler matches a
 /// driver `FS_RELEASE_MEMORY` against the pages of the `File` whose SEND it
 /// arrived on: it waits out a read of the cookie's page for at most the
 /// driver's release window, waits once per cookie, and discards a read whose
@@ -639,9 +650,18 @@ pub fn std_release_matched_by_open_phase(_: &Caps)
          3 = /b's stalled read did not return Interrupted, 4 = /b's position moved"
     );
     assert_eq!(
+        report.sessions, 1,
+        "std must start one session with the fake fs and open both Files in it"
+    );
+    assert_eq!(
         report.open_caps,
-        [Some(1), Some(1)],
-        "each File's FS_OPEN must carry its release SEND, and only it"
+        [Some(2), Some(2)],
+        "each File's FS_OPEN must carry its session cap and its release SEND, and only them"
+    );
+    assert_eq!(
+        report.open_sessions,
+        [Some(true), Some(true)],
+        "each File's FS_OPEN must carry a SEND-only copy of the session cap"
     );
     assert_eq!(
         report.read_caps,
@@ -719,18 +739,89 @@ fn release_child_main() -> !
     std::process::exit(0);
 }
 
+/// The fake fs's `FS_SESSION` on a node: count it, delete the carried
+/// handle, and reply with a session cap badged [`FAKE_FS_SESSION_BADGE`]
+/// with `IDENTIFY` and a zero-rights liveness cap.
+fn fake_fs_session(ep: u64, msg: &ipc::IpcMessage, report: &mut FakeFsReport) -> ipc::IpcMessage
+{
+    report.sessions = report
+        .sessions
+        .checked_add(1)
+        .expect("fake fs: session counter overflow");
+    for &cap in msg.caps()
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    let session = syscall::cap_derive_badge(
+        ep,
+        syscall::RIGHTS_EP_SEND | syscall::RIGHTS_EP_IDENTIFY,
+        FAKE_FS_SESSION_BADGE,
+    )
+    .expect("fake fs: session cap derive failed");
+    let liveness = syscall::cap_derive(ep, 0).expect("fake fs: liveness cap derive failed");
+    ipc::IpcMessage::builder(ipc::fs_errors::SUCCESS)
+        .cap(session)
+        .cap(liveness)
+        .build()
+}
+
+/// The fake fs's `FS_OPEN` on node 1 or 2 (the badge): record what it
+/// carried, keep its release SEND (`caps[1]`) in `releases`, delete the
+/// rest, and reply with the node's open cap.
+fn fake_fs_open(
+    ep: u64,
+    msg: &ipc::IpcMessage,
+    report: &mut FakeFsReport,
+    releases: &mut [u64; 2],
+) -> ipc::IpcMessage
+{
+    // The badge is 1 or 2, so the node's index is 0 or 1.
+    let idx = usize::from(msg.badge == 2);
+    let carried = msg.caps();
+    *report.open_caps.get_mut(idx).expect("fake fs: node index") = Some(carried.len());
+    let in_session = carried.first().is_some_and(|&cap| {
+        syscall::endpoint_badge(ep, cap) == Ok(FAKE_FS_SESSION_BADGE)
+            && syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS)
+                .is_ok_and(|tag| tag & 0xFFFF_FFFF == syscall::RIGHTS_EP_SEND)
+    });
+    *report
+        .open_sessions
+        .get_mut(idx)
+        .expect("fake fs: node index") = Some(in_session);
+    for (i, &cap) in carried.iter().enumerate()
+    {
+        if i == 1
+        {
+            *releases.get_mut(idx).expect("fake fs: node index") = cap;
+        }
+        else
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+    // The badge (1 or 2) lies below the base's bit, so the OR adds it.
+    let open_badge = FAKE_FS_OPEN_BASE | msg.badge;
+    let open = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, open_badge)
+        .expect("fake fs: open SEND derive failed");
+    ipc::IpcMessage::builder(ipc::fs_errors::SUCCESS)
+        .cap(open)
+        .build()
+}
+
 /// Serve the fake fs on `ep` until the spawner's stop message: each
-/// `NS_LOOKUP` gets a file node SEND badged 1, 2, ... in order, and each
-/// node's `FS_OPEN` an open SEND badged [`FAKE_FS_OPEN_BASE`] plus the node
-/// and a liveness cap (a zero-rights copy of the endpoint, which nothing
-/// sweeps), keeping the release SEND it carries. `/b`'s `FS_READ_MEMORY` is answered,
+/// `NS_LOOKUP` gets a file node SEND badged 1, 2, ... in order, each node's
+/// `FS_SESSION` a session cap badged [`FAKE_FS_SESSION_BADGE`] with
+/// `IDENTIFY` and a liveness cap (a zero-rights copy of the endpoint, which
+/// nothing sweeps), and each node's `FS_OPEN` an open SEND badged
+/// [`FAKE_FS_OPEN_BASE`] plus the node, keeping the release SEND it carries
+/// in `caps[1]`. `/b`'s `FS_READ_MEMORY` is answered,
 /// after one release of its cookie on `/a`'s release SEND and two on
 /// `/b`'s, with a one-page frame (a read-only derivation of a page from
 /// memmgr). Each open's `FS_CLOSE` is counted and answered. Anything else is
 /// refused.
 #[expect(
     clippy::large_stack_frames,
-    reason = "the `reply` and the builder temporaries of its six reply arms (`IpcMessage`s, 568 B \
+    reason = "the `reply` and the builder temporaries of its seven reply arms (`IpcMessage`s, 568 B \
               each); on the stack of the `fake_fs` thread, 64 KiB at the least"
 )]
 fn fake_fs_serve(ep: u64) -> FakeFsReport
@@ -751,8 +842,8 @@ fn fake_fs_serve(ep: u64) -> FakeFsReport
         }
         else if opcode == ipc::ns_labels::NS_LOOKUP
         {
-            // GRANT: the client's FS_OPEN on a node carries its release SEND
-            // in caps[0].
+            // GRANT: the client's FS_SESSION on a node carries its charge
+            // handle, and its FS_OPEN its session cap and release SEND.
             let node = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND_GRANT, next_badge)
                 .expect("fake fs: node SEND derive failed");
             next_badge = next_badge.checked_add(1).expect("fake fs: node badge");
@@ -762,28 +853,13 @@ fn fake_fs_serve(ep: u64) -> FakeFsReport
                 .cap(node)
                 .build()
         }
+        else if opcode == ipc::fs_labels::FS_SESSION && matches!(msg.badge, 1 | 2)
+        {
+            fake_fs_session(ep, &msg, &mut report)
+        }
         else if opcode == ipc::fs_labels::FS_OPEN && matches!(msg.badge, 1 | 2)
         {
-            // The badge is 1 or 2, so the node's index is 0 or 1.
-            let idx = usize::from(msg.badge == 2);
-            *report.open_caps.get_mut(idx).expect("fake fs: node index") = Some(msg.caps().len());
-            if let Some((&send, rest)) = msg.caps().split_first()
-            {
-                *releases.get_mut(idx).expect("fake fs: node index") = send;
-                for &cap in rest
-                {
-                    let _ = syscall::cap_delete(cap);
-                }
-            }
-            // The badge (1 or 2) lies below the base's bit, so the OR adds it.
-            let open_badge = FAKE_FS_OPEN_BASE | msg.badge;
-            let open = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, open_badge)
-                .expect("fake fs: open SEND derive failed");
-            let liveness = syscall::cap_derive(ep, 0).expect("fake fs: liveness cap derive failed");
-            ipc::IpcMessage::builder(ipc::fs_errors::SUCCESS)
-                .cap(open)
-                .cap(liveness)
-                .build()
+            fake_fs_open(ep, &msg, &mut report, &mut releases)
         }
         else if opcode == ipc::fs_labels::FS_CLOSE
             && (msg.badge == FAKE_FS_OPEN_BASE + 1 || msg.badge == FAKE_FS_OPEN_BASE + 2)

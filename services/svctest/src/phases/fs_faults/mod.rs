@@ -41,10 +41,12 @@ use namespace_protocol::{NamespaceRights, NodeId, NsError};
 
 use crate::bootstrap::Caps;
 use crate::ipc_util::fs::{
-    fs_close, fs_create, fs_mkdir, fs_open_live, fs_read_bytes, fs_read_memory, fs_remove,
-    fs_rename, fs_write_inline,
+    fs_close, fs_create, fs_mkdir, fs_open, fs_open_in, fs_read_bytes, fs_read_memory, fs_remove,
+    fs_rename, fs_session, fs_write_inline,
 };
 use crate::ipc_util::ns::ns_lookup;
+use crate::phases::fs_sessions::{charge_handle, sub_node};
+use crate::phases::node_handle::release_refused;
 use crate::runner::Phase;
 use ramdisk::{Fault, RamDisk, SharedDisk, lock};
 
@@ -182,9 +184,27 @@ fn revoked_service_ends_driver()
     fs.stop();
 }
 
+/// A session of `file`'s driver charged to a new sub-node of svctest's:
+/// `(session cap, liveness cap, the sub-node's handle)`.
+fn own_session(file: u64, what: &str) -> (u64, u64, u64)
+{
+    let node = sub_node(
+        std::os::seraph::startup_info().memmgr_endpoint,
+        u64::MAX,
+        what,
+    );
+    let (session, liveness) = fs_session(
+        file,
+        charge_handle(node, what),
+        std::os::seraph::current_ipc_buf(),
+    )
+    .unwrap_or_else(|e| panic!("{what}: FS_SESSION status {e:#x}"));
+    (session, liveness, node)
+}
+
 /// `FS_UNMOUNT` without `UNMOUNT_FORCE` while one open is live is refused
-/// `BUSY` with a count of 1, an open whose client is gone not counted, and
-/// the open keeps working; an `FS_UNMOUNT` of another `FS_LABELS_VERSION` is
+/// `BUSY` with a count of 1, an open in a session whose client is gone not
+/// counted, and the open keeps working; an `FS_UNMOUNT` of another `FS_LABELS_VERSION` is
 /// refused before anything else. Once the open is closed, `FS_UNMOUNT`
 /// succeeds and the driver exits with `fs_labels::EXIT_UNMOUNTED`.
 fn unmount_busy_while_open_live()
@@ -194,11 +214,11 @@ fn unmount_busy_while_open_live()
     let fs = OwnFatfs::start(&disk);
     let live = create_with_content(fs.root, b"U1LIVE.TXT");
     let dead = create_with_content(fs.root, b"U1DEAD.TXT");
-    let (open, liveness) = fs_open_live(live, 0, ipc_buf).expect("U1: FS_OPEN of the live open");
-    let (dead_open, dead_liveness) =
-        fs_open_live(dead, 0, ipc_buf).expect("U1: FS_OPEN of the dead open");
-    // The dead open's client is gone once no copy of its liveness cap is
-    // left outside the driver.
+    let open = fs_open(live, 0, ipc_buf).expect("U1: FS_OPEN of the live open");
+    let (session, dead_liveness, dead_node) = own_session(dead, "U1: the dead session's node");
+    let dead_open = fs_open_in(dead, session, 0, ipc_buf).expect("U1: FS_OPEN of the dead open");
+    // The dead open's client is gone once no copy of its session's liveness
+    // cap is left outside the driver.
     let _ = syscall::cap_delete(dead_liveness);
 
     assert_eq!(
@@ -228,23 +248,25 @@ fn unmount_busy_while_open_live()
         "U1: FS_UNMOUNT with no live open"
     );
     fs.expect_exit(fs_labels::EXIT_UNMOUNTED, "U1: the driver after FS_UNMOUNT");
-    for cap in [open, liveness, dead_open, live, dead]
+    for cap in [open, dead_open, session, live, dead]
     {
         let _ = syscall::cap_delete(cap);
     }
+    release_refused(dead_node, "U1: the dead session's node");
     fs.stop();
 }
 
 /// `FS_UNMOUNT` with `UNMOUNT_FORCE` while an open is live and holds a
-/// page succeeds: before its reply the driver revokes the open's liveness
-/// cap and the page cap, and it then exits with `fs_labels::EXIT_UNMOUNTED`.
+/// page succeeds: before its reply the driver revokes the liveness cap of
+/// the open's session and the page cap, and it then exits with `fs_labels::EXIT_UNMOUNTED`.
 fn unmount_forced_releases_opens()
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let disk = RamDisk::formatted();
     let fs = OwnFatfs::start(&disk);
     let file = create_with_content(fs.root, b"U2.TXT");
-    let (open, liveness) = fs_open_live(file, 0, ipc_buf).expect("U2: FS_OPEN");
+    let (session, liveness, node) = own_session(file, "U2: the session's node");
+    let open = fs_open_in(file, session, 0, ipc_buf).expect("U2: FS_OPEN");
     let (page, _) = fs_read_memory(open, 0, 1, ipc_buf).expect("U2: FS_READ_MEMORY");
     assert_ne!(page, 0, "U2: FS_READ_MEMORY returned no page");
 
@@ -256,7 +278,7 @@ fn unmount_forced_releases_opens()
     );
     assert!(
         !cap_live(liveness),
-        "U2: the open's liveness cap outlived the forced unmount"
+        "U2: the session's liveness cap outlived the forced unmount"
     );
     assert!(
         !cap_live(page),
@@ -266,10 +288,11 @@ fn unmount_forced_releases_opens()
         fs_labels::EXIT_UNMOUNTED,
         "U2: the driver after a forced FS_UNMOUNT",
     );
-    for cap in [page, liveness, open, file]
+    for cap in [page, liveness, open, session, file]
     {
         let _ = syscall::cap_delete(cap);
     }
+    release_refused(node, "U2: the session's node");
     fs.stop();
 }
 

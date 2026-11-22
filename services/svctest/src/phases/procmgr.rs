@@ -1095,14 +1095,15 @@ const STALLED_FILE_SIZE: u64 = 4096;
 /// procmgr serves a create on one request worker while others serve the
 /// rest (services/procmgr/README.md § Concurrency). A thread of svctest
 /// serves an endpoint whose SEND cap is the file cap of a `CREATE_FROM_FILE`
-/// another thread makes, and holds procmgr's `FS_OPEN` unanswered. While
+/// another thread makes, and holds procmgr's first call, the `FS_SESSION` of
+/// the read's session, unanswered. While
 /// it is held, [`CONCURRENT_SPAWNERS`] threads each spawn `/programs/hello`
 /// [`SPAWNS_PER_THREAD`] times, at once, and every child must exit cleanly.
 /// The server never answers, and the stalled create must fail with
 /// `IO_ERROR` once procmgr's bound on the call passes
 /// (`FILE_CAP_CALL_TIMEOUT_MS`, services/procmgr/docs/ipc-interface.md
 /// § Label 13). A second stalled create runs beside it: its file server
-/// answers `FS_OPEN`, lends the first page of `/programs/hello` through
+/// answers `FS_SESSION` and `FS_OPEN`, lends the first page of `/programs/hello` through
 /// `FS_READ_MEMORY`, then leaves the read of the second page unanswered, and
 /// that create must also fail with `IO_ERROR` under the same bound. After the
 /// stall a closer thread answers procmgr's `FS_CLOSE`, so the close does not
@@ -1117,11 +1118,12 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
             syscall::cap_create_endpoint(slab).ok()
         })
         .expect("procmgr_concurrent_spawn: endpoint creation failed");
-    let file = syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND)
+    // With Grant, as a node cap is: procmgr's FS_SESSION moves a cap on it.
+    let file = syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND_GRANT)
         .expect("procmgr_concurrent_spawn: deriving the file cap failed");
 
-    // The stalled file server: receive procmgr's FS_OPEN, report its label,
-    // and never answer it; the thread ends when told to.
+    // The stalled file server: receive procmgr's first call, report its
+    // label, and never answer it; the thread ends when told to.
     let (opened_tx, opened_rx) = mpsc::channel::<u64>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let server = std::thread::Builder::new()
@@ -1166,8 +1168,8 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
         .expect("procmgr_concurrent_spawn: the stalled server never reported");
     assert_eq!(
         label,
-        ipc::fs_labels::FS_OPEN,
-        "the stalled file server received label {label}, not FS_OPEN"
+        ipc::fs_labels::FS_SESSION,
+        "the stalled file server received label {label}, not FS_SESSION"
     );
     let read_stall = read_stall.await_stall();
 
@@ -1205,7 +1207,7 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
     assert_eq!(
         code,
         procmgr_errors::IO_ERROR,
-        "a create whose FS_OPEN went unanswered replied {code}, not IO_ERROR"
+        "a create whose FS_SESSION went unanswered replied {code}, not IO_ERROR"
     );
     read_stall.finish();
     release_tx
@@ -1259,15 +1261,52 @@ fn first_page_of(data: &[u8]) -> (u64, u64, usize)
     (page, region, first_page)
 }
 
+/// Serve a read-stall create's session and open on `endpoint`: answer
+/// procmgr's `FS_SESSION` with `session` and `liveness`, and its `FS_OPEN`,
+/// which must carry the session cap, with `open`; every carried cap is
+/// deleted.
+fn serve_read_session(endpoint: u64, session: u64, liveness: u64, open: u64, ipc_buf: *mut u64)
+{
+    use ipc::IpcMessage;
+
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+    let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+        .expect("read-stall file server: FS_SESSION receive failed");
+    assert_eq!(
+        req.label,
+        ipc::fs_labels::FS_SESSION,
+        "read-stall file server: procmgr's first call is not FS_SESSION"
+    );
+    for &cap in req.caps()
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    let started = IpcMessage::builder(0).cap(session).cap(liveness).build();
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+    unsafe { ipc::ipc_reply(&started, ipc_buf) }
+        .expect("read-stall file server: FS_SESSION reply failed");
+
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+    let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+        .expect("read-stall file server: FS_OPEN receive failed");
+    assert_eq!(
+        (req.label, req.caps().len()),
+        (ipc::fs_labels::FS_OPEN, 1),
+        "read-stall file server: procmgr's open is not FS_OPEN carrying its session"
+    );
+    for &cap in req.caps()
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    let opened = IpcMessage::builder(0).cap(open).build();
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+    unsafe { ipc::ipc_reply(&opened, ipc_buf) }
+        .expect("read-stall file server: FS_OPEN reply failed");
+}
+
 impl ReadStall
 {
     /// Start the file server and the create against it.
-    #[expect(
-        clippy::large_stack_frames,
-        reason = "the closure spawned for the `read-stall-fs` thread: its `req`, `opened` and \
-                  `reply` `IpcMessage`s (568 B each) and the builder copies; on that thread's \
-                  stack, 64 KiB at the least"
-    )]
     fn start() -> Self
     {
         use ipc::{IpcMessage, procmgr_labels};
@@ -1283,13 +1322,16 @@ impl ReadStall
                 syscall::cap_create_endpoint(slab).ok()
             })
             .expect("procmgr_concurrent_spawn: read-stall endpoint creation failed");
-        let derive = || {
-            syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND)
+        let derive = |rights| {
+            syscall::cap_derive(endpoint, rights)
                 .expect("procmgr_concurrent_spawn: deriving a read-stall cap failed")
         };
-        let node = derive();
-        let open = derive();
-        let liveness = derive();
+        // With Grant, as a node cap is: procmgr's FS_SESSION and FS_OPEN move
+        // a cap on it.
+        let node = derive(syscall::RIGHTS_EP_SEND_GRANT);
+        let session = derive(syscall::RIGHTS_EP_SEND);
+        let liveness = derive(syscall::RIGHTS_EP_SEND);
+        let open = derive(syscall::RIGHTS_EP_SEND);
 
         let (stalled_tx, stalled_rx) = mpsc::channel::<(u64, u64)>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -1297,17 +1339,7 @@ impl ReadStall
             .name("read-stall-fs".into())
             .spawn(move || {
                 let ipc_buf = std::os::seraph::current_ipc_buf();
-                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
-                let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
-                    .expect("read-stall file server: FS_OPEN receive failed");
-                for &cap in req.caps()
-                {
-                    let _ = syscall::cap_delete(cap);
-                }
-                let opened = IpcMessage::builder(0).cap(open).cap(liveness).build();
-                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
-                unsafe { ipc::ipc_reply(&opened, ipc_buf) }
-                    .expect("read-stall file server: FS_OPEN reply failed");
+                serve_read_session(endpoint, session, liveness, open, ipc_buf);
 
                 // procmgr's first read: hello's first page, lent from a page
                 // of svctest's own as an fs driver lends a cache page.

@@ -126,6 +126,7 @@ members = [
     "programs/threadstack/tester",
     "runtime/ruststd/argv-env",
     "runtime/ruststd/death-queues",
+    "runtime/ruststd/fs-sessions",
     "runtime/ruststd/heap-fit",
     "runtime/ruststd/pool-funding",
     "runtime/ruststd/spin-wait",

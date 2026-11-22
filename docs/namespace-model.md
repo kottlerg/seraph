@@ -55,7 +55,7 @@ addressed node:
 - **Session capability** — minted by `FS_SESSION`, which any node
   capability of a filesystem driver takes: names one session, whose
   opens' records live in pages charged to a memory node of its client.
-  It carries no request of its own; `FS_OPEN` carries it
+  It carries no request of its own; every `FS_OPEN` carries a copy
   ([services/fs/docs/fs-driver-protocol.md](../services/fs/docs/fs-driver-protocol.md)
   § Label 23).
 

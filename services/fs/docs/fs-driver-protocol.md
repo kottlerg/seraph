@@ -11,14 +11,13 @@ this document covers the labels that remain fs-driver-specific:
 - `FS_UNMOUNT` — vfsd-to-driver unmount, after which the driver exits.
 - `FS_SESSION` — start a session, whose opens' records live in pages
   charged to a node of the client.
-- `FS_OPEN` — mint a per-open cap on a file node cap, in a session or,
-  on the unpaid path, with a liveness cap of its own.
+- `FS_OPEN` — mint a per-open cap on a file node cap, in a session the
+  request names.
 - `FS_READ` — inline read on a file node cap or open cap.
 - `FS_READ_MEMORY` / `FS_RELEASE_MEMORY` / `FS_RELEASE_ACK` — memory-cap
   read protocol with cooperative release, per open.
-- `FS_CLOSE` — release an open's driver-side bookkeeping and, for an
-  unpaid open, revoke its liveness cap; the holder still `cap_delete`s its
-  open cap.
+- `FS_CLOSE` — release an open's driver-side bookkeeping; the holder
+  still `cap_delete`s its open cap.
 - `FS_WRITE` / `FS_WRITE_MEMORY` — inline and memory-cap writes on a
   file node cap or open cap.
 - `FS_CREATE` / `FS_MKDIR` — create a file or an empty directory in a
@@ -39,10 +38,9 @@ driver dispatches incoming requests by their badge shape:
   § Badge shape). Per-node opcodes (`NS_*`, `FS_SESSION`, `FS_OPEN`, `FS_READ`,
   `FS_WRITE`, `FS_WRITE_MEMORY`, `FS_TRUNCATE`, `FS_CREATE`, `FS_REMOVE`,
   `FS_MKDIR`, `FS_RENAME`) are dispatched by label.
-- `badge != 0` with `OPEN_INSTANCE` set — open-cap request: the badge
-  names one open the driver minted at [`FS_OPEN`](#label-18-fs_open), by a
-  40-bit id in its low bits for an unpaid open or, with `SESSION` also set,
-  by a 54-bit id in bits 0..40 and 50..64 for an open in a session.
+- `badge != 0` with `OPEN_INSTANCE` set alone — open-cap request: the
+  badge names one open the driver minted at [`FS_OPEN`](#label-18-fs_open),
+  by a 54-bit id in bits 0..40 and 50..64.
   The open's own opcodes (`FS_READ_MEMORY`, `FS_RELEASE_MEMORY`,
   `FS_CLOSE`) and the stateless file opcodes (`FS_READ`, `FS_WRITE`,
   `FS_WRITE_MEMORY`, `FS_TRUNCATE`) are dispatched by label, the latter on
@@ -51,9 +49,10 @@ driver dispatches incoming requests by their badge shape:
   [`FS_SESSION`](#label-23-fs_session). It carries no request of its own;
   `FS_OPEN` carries a copy of it as a capability.
 
-A label sent on the wrong kind of cap (an open's own label on a node cap,
-`FS_OPEN` or a directory label on an open cap, any label on a session cap)
-is answered `fs_errors::INVALID_BADGE`, as is any request on an open cap
+A badge with both kind bits names nothing. A label sent on such a badge
+or on the wrong kind of cap (an open's own label on a node cap, `FS_OPEN`
+or a directory label on an open cap, any label on a session cap) is
+answered `fs_errors::INVALID_BADGE`, as is any request on an open cap
 whose open is closed, whose node was freed, or whose session ended. `NS_*`
 on an open cap or a session cap is answered `NsError::NotSupported` by the
 namespace dispatch.
@@ -133,15 +132,13 @@ request.
 The request carries no caps; the driver deletes any it carries. The label
 on a node cap or an open cap is answered `UNKNOWN_OPCODE`.
 
-The driver first releases every unpaid open whose client is gone, as the
-sweep of [§ Label 18](#label-18-fs_open) does, and ends every session whose
-client is gone, as the sweep of [§ Label 23](#label-23-fs_session) does;
-every open left is live. Without `UNMOUNT_FORCE`, a live open, unpaid or in
-a session, makes the driver reply `BUSY`, with the number of live opens in
-`data[0]`, and serve on; a session with no open does not count. Otherwise it
-releases every open as [`FS_CLOSE`](#label-3-fs_close) does: it revokes the
-open's outstanding pages and, for an unpaid open, the copies of its liveness
-cap, and deletes its release SEND. It ends every session left, which revokes
+The driver first ends every session whose client is gone, as the sweep of
+[§ Label 23](#label-23-fs_session) does, which releases the opens made in
+it; every open left is live. Without `UNMOUNT_FORCE`, a live open makes the
+driver reply `BUSY`, with the number of live opens in `data[0]`, and serve
+on; a session with no open does not count. Otherwise it releases every open
+as [`FS_CLOSE`](#label-3-fs_close) does: it revokes the open's outstanding
+pages and deletes its release SEND. It ends every session left, which revokes
 the copies of the session's liveness cap and gives its pages back to memmgr.
 It then writes the volume's `FSInfo` hints (FAT32), replies success, and
 exits with `fs_labels::EXIT_UNMOUNTED` ([§ Driver exit](#driver-exit)).
@@ -174,31 +171,21 @@ clear; `data[0]` is their number). The driver serves on after either.
 
 ## Label 18: `FS_OPEN`
 
-Open a file. The driver records a new **open** of the node the file node cap
-names and replies with an **open cap**: a badged SEND on its endpoint whose
-badge names the open, carries the node cap's rights in bits 40..48, and sets
-the `OPEN_INSTANCE` kind bit (48)
+Open a file in a session. The driver records a new **open** of the node the
+file node cap names in the session the request's session cap names
+([§ Label 23](#label-23-fs_session)) and replies with an **open cap**: a
+badged SEND on its endpoint whose badge names the open by a 54-bit id,
+carries the node cap's rights in bits 40..48, and sets the `OPEN_INSTANCE`
+kind bit (48)
 ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
 § Badge shape). Every open is distinct: two opens of one file, by one client
 or two, are two opens, each with its own outstanding pages and release
-endpoint.
-
-An open is made in one of two ways:
-
-- **In a session** ([§ Label 23](#label-23-fs_session)): the request carries
-  the session cap. The open's records live in the session's pages, charged
-  to the client's node, and the open lives no longer than its session. The
-  open cap's badge also sets the `SESSION` kind bit (49) and carries a
-  54-bit open id.
-- **Without a session**, the unpaid path: the driver keeps the open's
-  records in its own memory and hands the client a **liveness cap** of the
-  open's own, which keeps the open alive (below). The open cap's badge
-  carries a 40-bit open id. std and procmgr open this way, so a client can
-  make the driver spend memory beyond the client's own max, a known gap
-  ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#distribution-policy)
-  § Distribution policy) that refusing a session-less open, once those
-  clients make sessions, closes
-  ([#1100](https://github.com/kottlerg/seraph/issues/1100)).
+endpoint. The open's records live in the session's pages, charged to the
+client's node, and the open lives no longer than its session. Every open is
+made in a session, so every record the driver keeps of a client's opens is
+paid for by that client's node, and a client at its node's max is refused
+while other clients' opens go on: an `FS_OPEN` without a session cap is
+refused.
 
 **Request**
 
@@ -206,15 +193,14 @@ An open is made in one of two ways:
 |---|---|
 | `label` | `18` |
 | body | empty (target identified by the node cap's badge) |
-| `caps[0]` | In a session: a copy of the session cap. Without one: optional release-endpoint SEND for the open's cooperative [`FS_RELEASE_MEMORY`](#driver-to-client-release) |
-| `caps[1]` | In a session: optional release-endpoint SEND |
+| `caps[0]` | A copy of the session cap, with any rights (std and procmgr send a `SEND`-only copy) |
+| `caps[1]` | Optional release-endpoint SEND for the open's cooperative [`FS_RELEASE_MEMORY`](#driver-to-client-release) |
 
 The badge must carry a non-empty rights mask and name a file. The driver
-tells the two ways apart by `caps[0]`: a capability on the driver's own
-endpoint, whose badge the driver reads, is a session cap, which it deletes
-once read; any other capability, or none, is the release SEND of an unpaid
-open. A capability on the driver's endpoint whose badge names no live
-session (an ended session's cap, an open cap, a node cap) is refused
+reads the badge of `caps[0]` on its own endpoint and deletes the cap once
+read. No `caps[0]`, or a capability on any other endpoint, is refused
+`INVALID_ARGUMENT`; a capability on the driver's endpoint whose badge names
+no live session (an ended session's cap, an open cap, a node cap) is refused
 `INVALID_BADGE`. The driver records the release SEND on the open and deletes
 every cap beyond those; a client that omits it opts out of cooperative
 release for this open, and eviction then revokes the open's pages without
@@ -226,7 +212,6 @@ the round trip.
 |---|---|
 | `label` | `0` |
 | `caps[0]` | Open cap (`SEND_GRANT`, the node cap's rights) |
-| `caps[1]` | Without a session only: liveness cap (a Notification cap with no rights) |
 
 [`FS_READ_MEMORY`](#label-7-fs_read_memory),
 [`FS_RELEASE_MEMORY`](#client-to-driver-release), and
@@ -239,18 +224,17 @@ open cap, with the rights its badge carries.
 **Reply (error)**: `label = ipc::fs_errors::*`: `INVALID_BADGE` (the badge
 names no node, or a directory, or is an open or session cap; or `caps[0]` is
 a capability on the driver's endpoint that names no live session),
-`PERMISSION_DENIED` (the badge carries no rights), `LIMIT` (in a session:
-the open's record needs another page and the max of the session's node or of
-an ancestor refuses it), `INVALID_ARGUMENT` (in a session: the open's record
-needs another page and memmgr refuses the session's handle, as it does once
-the node's handle state has ended), `TOO_MANY_OPEN` (the unpaid open table
-is full, or the session open ids are spent, or the heap or the driver's
-`CSpace` cannot grow, or the driver cannot create an unpaid open's liveness
-object or map a session's page), `IO_ERROR` (the driver could not mint the
-cap, or memmgr has no page for the session). Every refusal deletes the
-carried caps.
+`PERMISSION_DENIED` (the badge carries no rights), `INVALID_ARGUMENT` (no
+`caps[0]`, or one on another endpoint; or the open's record needs another
+page and memmgr refuses the session's handle, as it does once the node's
+handle state has ended), `LIMIT` (the open's record needs another page and
+the max of the session's node or of an ancestor refuses it),
+`TOO_MANY_OPEN` (the open ids are spent, or the heap or the driver's
+`CSpace` cannot grow, or the driver cannot map a session's page), `IO_ERROR` (the driver could not
+mint the cap, or memmgr has no page for the session). Every refusal deletes
+the carried caps.
 
-**Lifetime and bounds of an open in a session.** It lives until its
+**Lifetime and bounds of an open.** It lives until its
 `FS_CLOSE`, until an [`FS_REMOVE`](#label-14-fs_remove) or
 [`FS_RENAME`](#label-16-fs_rename) frees its node, which releases every open
 of the node, or until its session ends ([§ Label 23](#label-23-fs_session)).
@@ -258,72 +242,29 @@ Its id is drawn from one 54-bit counter, shared with session ids, that never
 repeats in the driver's life, so an open cap kept past its open's end is
 answered `INVALID_BADGE`, never with another open's state; once the counter
 is spent the driver answers `TOO_MANY_OPEN`. Its client pays for its record,
-in its session's pages, and holds it to the session node's max.
+in its session's pages, and holds it to the session node's max. An open cap
+alone does not keep the open alive: its session does (§ Label 23,
+**Delegation**).
 
-**Lifetime and bounds of an unpaid open.** It lives until its `FS_CLOSE`,
-until an `FS_REMOVE` or `FS_RENAME` frees its node, or until no copy of its
-liveness cap is left outside the driver. Its id is generation-checked (a
-24-bit index and a 16-bit generation, retired at wrap), so an open cap kept
-past its open's end is answered `INVALID_BADGE`, never with another open's
-state. The driver holds at most 2^24 - 1 live unpaid opens and answers
-`TOO_MANY_OPEN` past that. No per-client bound is enforceable on this path:
-the driver has no client identity, and an open cap can be delegated.
-
-**Liveness cap of an unpaid open.** For each unpaid open the driver retypes
-one Notification from its own memory, so the driver funds the object, keeps
-a capability to it, and hands the client a derivation of that capability
-with no rights, which can neither signal nor wait. The open lives while any
-copy of the liveness cap lives outside the driver. The holder keeps it for
-the open's life and deletes it after the open's `FS_CLOSE`; a client that
-dies takes its copy with its `CSpace`. Releasing an open, by `FS_CLOSE`, by
-its node's removal, or by the sweep below, revokes every copy of the
-liveness cap still in the subtree of the driver's capability and frees the
-object once no copy is left. The client's own copy stays in that subtree
-wherever an IPC transfer or `SYS_CAP_MOVE` takes it, so it dies exactly when
-the open does. A copy derived from another copy, the client's or any later
-holder's, stays in the subtree wherever its derivation path runs, since
-deleting a capability and tearing down the `CSpace` holding it both hand its
-derivations to the nearest ancestor outside that `CSpace`, as
-[core/kernel/docs/capability-internals.md](../../../core/kernel/docs/capability-internals.md#teardown-drain)
-§ Teardown Drain states. A release or revoke at the driver's capability
-therefore reaches every copy, including one derived through a dead `CSpace`.
-
-A delegated unpaid open cap alone does not keep the open alive: a holder
-other than the client keeps it alive only by also holding a copy of the
-liveness cap, which the delegator hands over beside the open cap. A
-delegator SHOULD move its own copy (an IPC transfer or `SYS_CAP_MOVE`)
-rather than derive one for the holder, so the copy stays one the release
-revokes.
-
-The driver finds the unpaid opens whose client is gone by asking the kernel
-whether its own capability is the only reference left to the open's
-Notification (`SYS_CAP_INFO` `CAP_INFO_SOLE_REFERENCE`,
-[core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md#sys_cap_info-36)
-§ `SYS_CAP_INFO`); once it is, it stays so, since only the driver holds a
-capability through which to add a reference. A **sweep** reads every unpaid
-open so and releases each one whose client is gone as `FS_CLOSE` would: its
-outstanding pages, its release SEND, and its record. The driver sweeps on an
-unpaid `FS_OPEN` once the unpaid opens made since its last sweep reach the
-larger of 64 and the live opens that sweep left, so a sweep costs at most
-two inquiries per open made and the table holds at most twice that interval
-of opens, live and dead, between sweeps; it sweeps again, and retries once,
-when an `FS_OPEN` finds the open table full or its `CSpace` unable to grow.
 An `FS_OPEN` whose reply cannot reach the client (it died mid-call, or its
-`CSpace` cannot take the reply's two caps) moves no cap, and the driver
-releases that open at once.
+`CSpace` cannot take the reply's cap) moves no cap, and the driver releases
+that open at once.
 
-The std client opens without a session and sends `FS_CLOSE` for every open
-`File` when its process exits normally, through `main` returning or
-`std::process::exit`
+The std client opens each file in its process's session with the file's
+driver ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md)
+§ Filesystem sessions), and sends `FS_CLOSE` for every open `File` when its
+process exits normally, through `main` returning or `std::process::exit`
 ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Process
-Entry and `StartupInfo`); a crash or a kill sends none, and the open goes at
-the next sweep after the process's `CSpace` does. Until then its release
-SEND keeps the client's release endpoint alive past the client's death, so
-memmgr holds the frame the endpoint lives in out of its pool until the SEND
-goes
+Entry and `StartupInfo`); a crash or a kill sends none, and the open goes
+when its session ends, at the sweep memmgr's signal of the process's death
+starts (§ Label 23, **Session end**). Until then its release SEND keeps the
+client's release endpoint alive past the client's death, so memmgr holds the
+frame the endpoint lives in out of its pool until the SEND goes
 ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#reclamation)
-§ Reclamation). An open in a session keeps its release SEND the same way
-until its session ends.
+§ Reclamation). procmgr opens the file of each image read in a session of
+its own for that read
+([procmgr IPC interface](../../procmgr/docs/ipc-interface.md#label-13-create_from_file)
+§ Label 13, **Read session**).
 
 ## Label 23: `FS_SESSION`
 
@@ -359,7 +300,7 @@ session is not tied to that node. The driver deletes every cap beyond
 | Field | Value |
 |---|---|
 | `label` | `0` |
-| `caps[0]` | Session cap (`SEND`, no rights): its badge sets the `SESSION` kind bit (49) and carries the session's 54-bit id ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md) § Badge shape) |
+| `caps[0]` | Session cap (`SEND` and `IDENTIFY`, no namespace rights): its badge sets the `SESSION` kind bit (49) and carries the session's 54-bit id ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md) § Badge shape) |
 | `caps[1]` | Liveness cap (a Notification cap with no rights) |
 
 **Reply (error)**: `label = ipc::fs_errors::*`: `INVALID_BADGE` (an open cap
@@ -375,7 +316,12 @@ the page). Every refusal deletes the handle.
 request of its own: a filesystem label sent on it is answered
 `INVALID_BADGE`, and an `NS_*` label `NsError::NotSupported`. Whoever holds
 a copy can open, with any file node cap of the driver it holds, in the
-session, charged to the session's node.
+session, charged to the session's node. Its `IDENTIFY` right lets the client
+ask the kernel whether a node cap it holds is on the same endpoint
+(`SYS_ENDPOINT_IDENTIFY`,
+[core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md#sys_endpoint_identify-73)), so
+a client with sessions on several drivers finds the one a file's driver keeps without asking any
+server; the copy an `FS_OPEN` carries needs only `SEND`.
 
 **Pages and records.** A session's pages hold its records and nothing of the
 driver's own. Each page is 64 slots of 64 bytes, the first a header. The
@@ -397,21 +343,41 @@ slot of the page's capability; and the index from ids to records, at most
 two 4-byte heads per live session or open. The client pays in its own
 `CSpace` for the capabilities it receives.
 
-**Session end.** A session lives while a copy of its liveness cap lives
-outside the driver, as an unpaid open does ([§ Label 18](#label-18-fs_open),
-Liveness cap of an unpaid open): its client keeps the cap for the session's
-life, and a client that dies takes its copy with its `CSpace`. The driver
-ends a session whose client holds no copy any more: it releases every open
-made in it as `FS_CLOSE` would, revokes the copies of the liveness cap,
-deletes the handle, and gives every page back, which returns the session's
-whole charge to its node. It finds such sessions as it finds dead unpaid
-opens, with `CAP_INFO_SOLE_REFERENCE`, in a sweep of every session, which it
-makes when memmgr signals it the end of a donation (`REGISTER_DONATION_END`,
+**Liveness cap.** For each session the driver retypes one Notification
+from its own memory, so the driver funds the object, keeps a capability to
+it, and hands the client a derivation of that capability with no rights,
+which can neither signal nor wait. The session lives while any copy of the
+liveness cap lives outside the driver: its client keeps the cap for the
+session's life, and a client that dies takes its copy with its `CSpace`.
+Ending the session revokes every copy of the liveness cap still in the
+subtree of the driver's capability and frees the object once no copy is
+left. The client's own copy stays in that subtree wherever an IPC transfer
+or `SYS_CAP_MOVE` takes it, so it dies exactly when the session does. A
+copy derived from another copy, the client's or any later holder's, stays in
+the subtree wherever its derivation path runs, since deleting a capability
+and tearing down the `CSpace` holding it both hand its derivations to the
+nearest ancestor outside that `CSpace`, as
+[core/kernel/docs/capability-internals.md](../../../core/kernel/docs/capability-internals.md#teardown-drain)
+§ Teardown Drain states. A revoke at the driver's capability therefore
+reaches every copy, including one derived through a dead `CSpace`.
+
+**Session end.** The driver ends a session whose client holds no copy of its
+liveness cap any more: it releases every open made in it as `FS_CLOSE`
+would, revokes the copies of the liveness cap, deletes the handle, and gives
+every page back, which returns the session's whole charge to its node. It
+finds such sessions by asking the kernel whether its own capability is the
+only reference left to the session's Notification (`SYS_CAP_INFO`
+`CAP_INFO_SOLE_REFERENCE`,
+[core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md#sys_cap_info-36)
+§ `SYS_CAP_INFO`); once it is, it stays so, since only the driver holds a
+capability through which to add a reference. It reads every session so in a
+**sweep**, which it makes when memmgr signals it the end of a donation (`REGISTER_DONATION_END`,
 [§ Label
 34](../../memmgr/docs/ipc-interface.md#label-34-register_donation_end): the
 release of a node the driver holds a charged grant on, or the death of the
 node's owner), on `FS_SESSION` once the sessions made since its last sweep
-reach the larger of 64 and the live sessions that sweep left, and at
+reach the larger of 64 and the live sessions that sweep left, so a sweep
+costs at most two inquiries per session made, and at
 [`FS_UNMOUNT`](#label-19-fs_unmount). A client ends a session by deleting
 its liveness cap and then releasing the session's node (`NODE_RELEASE`),
 which signals the driver; a session whose liveness cap is deleted and whose
@@ -424,9 +390,11 @@ to ([§ Driver exit](#driver-exit)).
 **Delegation.** An open made in a session lives only while a copy of the
 session's liveness cap is held. A holder other than the client keeps a
 delegated open alive only by also holding such a copy, which the delegator
-hands over beside the open cap, as for an unpaid open's liveness cap (§
-Label 18); and that copy keeps the whole session, every open made in it and
-their charge to the creator's node, alive while it lives.
+hands over beside the open cap, and that copy keeps the whole session, every
+open made in it and their charge to the creator's node, alive while it
+lives. A delegator SHOULD move its own copy (an IPC transfer or
+`SYS_CAP_MOVE`) rather than derive one for the holder, so the copy stays
+one the session's end revokes.
 
 ---
 
@@ -722,17 +690,15 @@ reply, or after the window with none, per
 
 End the open the open cap names: the driver revokes that open's
 outstanding [`FS_READ_MEMORY`](#label-7-fs_read_memory) pages, deletes its
-recorded release endpoint, revokes the copies of an unpaid open's liveness cap
-([§ Label 18](#label-18-fs_open)), and retires its id, so the open cap answers
+recorded release endpoint, and retires its id, so the open cap answers
 `INVALID_BADGE` from then on. Other opens of the file, by this client or
 another, keep their pages. The node itself is not freed: every holder of
 the entry shares it, so it lives until
 [`FS_REMOVE`](#label-14-fs_remove) or [`FS_RENAME`](#label-16-fs_rename)
 unlinks the entry, and the node cap the open was made from still reaches
 its file. The open cap is **not** freed here — the holder still
-`cap_delete`s its open cap to free its slot, and deletes an unpaid open's
-liveness cap, which the close revoked. An open in a session leaves its
-session's pages: a page other than the session's first goes back to
+`cap_delete`s its open cap to free its slot. The open leaves its session's
+pages: a page other than the session's first goes back to
 memmgr, its charge with it, when its last record goes
 ([§ Label 23](#label-23-fs_session)); the session lives on with its
 other opens.

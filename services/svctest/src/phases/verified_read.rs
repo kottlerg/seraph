@@ -56,6 +56,20 @@ fn own_pages() -> u64
         .0
 }
 
+/// The pages charged to this process's sub-nodes: its whole subtree less
+/// its own node.
+fn sub_node_pages() -> u64
+{
+    let (own, _, subtree) =
+        crate::phases::budget::memory_usage().expect("verified read: QUERY_MEMORY_USAGE");
+    subtree.saturating_sub(own)
+}
+
+/// How long the phase waits for the charge of procmgr's read session to
+/// leave this process's subtree once the read is answered. A test wait
+/// bound.
+const SESSION_SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// What a refused read asks for: the name, the length (the size hint when
 /// `None`) and the role.
 struct Request<'a>
@@ -91,7 +105,10 @@ fn expect_refused(path: &str, request: &Request<'_>, want: ErrorKind, what: &str
 }
 
 /// 1. The fixture reads back its body, and the copy's pages are charged to
-///    this process while held and leave its account once dropped.
+///    this process while held and leave its account once dropped. The
+///    session procmgr opens the file in is charged to a sub-node of this
+///    process's node, and its charge leaves the subtree once the read ends
+///    (services/procmgr/docs/ipc-interface.md § Label 13).
 /// 2. The fixture asked for under another name, or in the configuration
 ///    role, is refused.
 /// 3. A copy of it with one body byte flipped, asked for under the
@@ -102,6 +119,7 @@ fn expect_refused(path: &str, request: &Request<'_>, want: ErrorKind, what: &str
 fn procmgr_read_verified_phase(_caps: &Caps)
 {
     let before = own_pages();
+    let sessions_before = sub_node_pages();
     let (cap, size) = lookup(VERIFIED_PATH);
     let data = read_verified(cap, size, VERIFIED_PATH, VerifiedRole::Data)
         .expect("verified read: the fixture");
@@ -122,6 +140,22 @@ fn procmgr_read_verified_phase(_caps: &Caps)
         after.saturating_add(pages) <= held,
         "verified read: the copy's {pages} pages not released ({held} -> {after})"
     );
+    let start = std::time::Instant::now();
+    loop
+    {
+        crate::phases::memmgr::recheck_deferred();
+        let now = sub_node_pages();
+        if now == sessions_before
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < SESSION_SETTLE,
+            "verified read: the read session's charge stayed on this process's subtree \
+             ({sessions_before} -> {now} pages)"
+        );
+        std::thread::yield_now();
+    }
 
     expect_refused(
         VERIFIED_PATH,

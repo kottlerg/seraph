@@ -13,9 +13,65 @@
 //! byte (see `services/fs/docs/fs-driver-protocol.md` for what the driver
 //! promises). The driver also controls which caps a reply carries:
 //! [`read_memory_reply_caps`] splits an `FS_READ_MEMORY` reply's caps into
-//! the cache-page cap procmgr keeps and the surplus it deletes.
+//! the cache-page cap procmgr keeps and the surplus it deletes, and
+//! [`session_reply_caps`] and [`open_reply_caps`] do the same for the
+//! `FS_SESSION` and `FS_OPEN` replies of the read's session. The session is
+//! charged to a sub-node of the account the read's buffer is granted on, with
+//! a max of [`READ_SESSION_MAX_PAGES`], and a refusal of its charge is
+//! answered as [`fs_refusal`] says.
 
 use core::ops::Range;
+
+/// The max of the sub-node a file read's session is charged to, in pages.
+/// The driver records the session, the read's one open and the one cache
+/// page procmgr holds at a time in the session's first page
+/// (services/fs/docs/fs-driver-protocol.md § Label 23), so one page is all
+/// a read needs; it also bounds what a file server, which procmgr does not
+/// trust, can charge the account per read. The node is not procmgr's own but
+/// the creator's or the sender's, so procmgr sets the bound rather than
+/// leaving it to that node.
+pub const READ_SESSION_MAX_PAGES: u64 = 1;
+
+/// The procmgr error for an `FS_SESSION` or `FS_OPEN` refusal of the file
+/// server: `LIMIT` when the max of the session's node, or of an ancestor's,
+/// refused the charge (`fs_errors::LIMIT`), `IO_ERROR` otherwise.
+#[must_use]
+pub const fn fs_refusal(label: u64) -> u64
+{
+    if label == ipc::fs_errors::LIMIT
+    {
+        ipc::procmgr_errors::LIMIT
+    }
+    else
+    {
+        ipc::procmgr_errors::IO_ERROR
+    }
+}
+
+/// Split the caps of an `FS_SESSION` reply into the session cap and the
+/// liveness cap procmgr keeps, `caps[0]` and `caps[1]` of a success, and the
+/// surplus it deletes: every other cap, and on a failure every cap.
+#[must_use]
+pub fn session_reply_caps(label: u64, caps: &[u64]) -> (Option<(u64, u64)>, &[u64])
+{
+    match caps
+    {
+        [session, liveness, extra @ ..] if label == 0 => (Some((*session, *liveness)), extra),
+        _ => (None, caps),
+    }
+}
+
+/// Split the caps of an `FS_OPEN` reply into the open cap procmgr keeps,
+/// `caps[0]` of a success, and the surplus it deletes.
+#[must_use]
+pub fn open_reply_caps(label: u64, caps: &[u64]) -> (Option<u64>, &[u64])
+{
+    match caps.split_first()
+    {
+        Some((&open, extra)) if label == 0 => (Some(open), extra),
+        _ => (None, caps),
+    }
+}
 
 /// Split the caps of an `FS_READ_MEMORY` reply into the one procmgr keeps
 /// and the ones it deletes.
@@ -57,6 +113,40 @@ pub fn cache_page_range(
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn a_max_refusal_of_the_read_session_is_procmgr_s_limit()
+    {
+        assert_eq!(
+            fs_refusal(ipc::fs_errors::LIMIT),
+            ipc::procmgr_errors::LIMIT
+        );
+        for label in [
+            ipc::fs_errors::INVALID_BADGE,
+            ipc::fs_errors::INVALID_ARGUMENT,
+            ipc::fs_errors::TOO_MANY_OPEN,
+            ipc::fs_errors::IO_ERROR,
+        ]
+        {
+            assert_eq!(fs_refusal(label), ipc::procmgr_errors::IO_ERROR);
+        }
+    }
+
+    #[test]
+    fn a_session_reply_keeps_its_two_caps_and_drops_the_rest()
+    {
+        assert_eq!(session_reply_caps(0, &[5, 6, 7]), (Some((5, 6)), &[7][..]));
+        assert_eq!(session_reply_caps(0, &[5]), (None, &[5][..]));
+        assert_eq!(session_reply_caps(14, &[5, 6]), (None, &[5, 6][..]));
+    }
+
+    #[test]
+    fn an_open_reply_keeps_its_open_cap_and_drops_the_rest()
+    {
+        assert_eq!(open_reply_caps(0, &[5, 6]), (Some(5), &[6][..]));
+        assert_eq!(open_reply_caps(0, &[]), (None, &[][..]));
+        assert_eq!(open_reply_caps(15, &[5]), (None, &[5][..]));
+    }
 
     #[test]
     fn read_memory_reply_keeps_the_first_cap_of_a_success_and_drops_the_rest()

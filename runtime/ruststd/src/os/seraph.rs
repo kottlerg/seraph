@@ -840,6 +840,7 @@ fn restore_entry(info: &process_abi::ProcessInfo, startup: StartupInfo) -> ! {
     );
     crate::sys::thread::rebind_threads();
     crate::sys::fs::rebind_release_handler();
+    crate::sys::fs::rebind_fs_sessions();
     crate::sys::time::rebind_timed();
     ::log::rebind_log(info.log_send_cap);
     ::registry_client::install_registry_cap(info.service_registry_cap);
@@ -3235,6 +3236,24 @@ pub mod fs {
         fn file_name_ref(&self) -> &OsStr {
             self.as_inner().file_name_ref()
         }
+    }
+
+    /// A SEND-only copy of this process's filesystem session cap with the
+    /// driver of the node cap `node_cap`, starting the session when there is
+    /// none (runtime/ruststd/README.md § Filesystem sessions), for a client
+    /// that sends `FS_OPEN` itself: the request carries it in `caps[0]`
+    /// (services/fs/docs/fs-driver-protocol.md § Label 18). The caller owns
+    /// the copy. `std::fs::File::open` takes the same session.
+    ///
+    /// # Errors
+    /// `QuotaExceeded` when the max of this process's node, or of an
+    /// ancestor's, refuses the session's first page; `OutOfMemory` when
+    /// memmgr cannot make the session's node; the error of a failed
+    /// `FS_SESSION`, or `InvalidInput` for a `node_cap` that names no live
+    /// capability.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn session_for(node_cap: u64) -> crate::io::Result<u64> {
+        crate::sys::fs::session_copy(node_cap, super::current_ipc_buf())
     }
 }
 

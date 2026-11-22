@@ -7,8 +7,8 @@
 //! `FS_OPEN`): two opens of one file are told apart. One open's `FS_CLOSE`
 //! releases only its own pages, a closed open's cap names no open, eviction
 //! sends each page's cooperative release to the release endpoint of the open
-//! that read it, and an open whose client holds no copy of its liveness cap
-//! any more, because the client died or deleted it, is released.
+//! that read it, and an open in a session whose client holds no copy of its
+//! liveness cap any more, because the client died or deleted it, is released.
 
 use std::os::seraph::{current_ipc_buf, startup_info};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,10 +16,12 @@ use std::time::{Duration, Instant};
 
 use crate::bootstrap::Caps;
 use crate::ipc_util::fs::{
-    fs_close, fs_create, fs_open, fs_open_live, fs_read_bytes, fs_read_memory, fs_release_memory,
-    fs_remove, svctest_dir_cap,
+    fs_close, fs_create, fs_open, fs_open_in, fs_read_bytes, fs_read_memory, fs_release_memory,
+    fs_remove, fs_session, svctest_dir_cap,
 };
 use crate::ipc_util::ns::{ns_lookup, ns_stat};
+use crate::phases::fs_sessions::{charge_handle, sub_node};
+use crate::phases::node_handle::release_refused;
 use crate::runner::Phase;
 
 pub fn phases() -> &'static [Phase]
@@ -311,8 +313,8 @@ fn wait_for_releases(log: &ReleaseLog, count: usize) -> Vec<(u64, u64)>
     }
 }
 
-/// Opens of other files that each hold a release SEND and a liveness
-/// Notification in fatfs's `CSpace`, kept across the
+/// Opens of other files that each hold a release SEND in fatfs's `CSpace`,
+/// kept across the
 /// eviction phase's cache fill: more than the init funding's headroom beyond
 /// a full cache's own caps (the quarantine's 32 and 64 more), so the fill
 /// reaches the slots fatfs's `FS_OPEN` top-up keeps free.
@@ -330,7 +332,7 @@ const HELD_FILES: usize = 200;
 ///
 /// The phase runs while fatfs's cache is still cold, and holds
 /// [`HELD_FILES`] `std::fs::File`s open across the fill: each `FS_OPEN` left
-/// a release SEND and a liveness parent in fatfs's `CSpace`, so the fill's slot pages and per-read
+/// a release SEND in fatfs's `CSpace`, so the fill's slot pages and per-read
 /// caps need the slots `FS_OPEN`'s top-up keeps free for every slot not yet
 /// provisioned. fatfs once kept only the per-read caps' worth free, and the
 /// fill exhausted its `CSpace` before the cache filled.
@@ -341,12 +343,11 @@ pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
     const TAG_MASK: u64 = 0xFF << 56;
 
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    // svctest holds an open cap and a liveness cap per held File and a page
-    // cap per held page.
+    // svctest holds an open cap per held File and a page cap per held page.
     assert!(
         std::os::seraph::fund_cspace_slot_budget(
             startup_info().self_cspace,
-            (2 * HELD_FILES)
+            HELD_FILES
                 .checked_add(crate::phases::fs_ipc::fatfs_slot_ceiling(ipc_buf))
                 .and_then(|n| n.checked_add(64))
                 .expect("fs_eviction: CSpace slot budget overflowed") as u64,
@@ -442,8 +443,12 @@ pub fn fs_eviction_routes_release_to_its_open_phase(_: &Caps)
 /// Role token for [`open_reclaim_child_main`].
 const OPEN_RECLAIM_CHILD_ROLE: &str = "open-reclaim-child";
 
-/// Role token for [`open_undeliverable_child_main`].
-const OPEN_UNDELIVERABLE_CHILD_ROLE: &str = "open-undeliverable-child";
+/// Role token for [`session_undeliverable_child_main`].
+const SESSION_UNDELIVERABLE_CHILD_ROLE: &str = "session-undeliverable-child";
+
+/// How long the reclaim phase and its children wait for fatfs to end a
+/// session whose client is gone. A test wait bound.
+const RECLAIM_WAIT: Duration = Duration::from_secs(60);
 
 /// The scratch file the reclaim phase and its children open.
 const RECLAIM_NAME: &str = "reclaim.bin";
@@ -463,8 +468,8 @@ const RECLAIM_HAND_BADGE: u64 = 0x5703;
 const RECLAIM_STOP_BADGE: u64 = 0x5704;
 
 /// Child-mode dispatch for argv tokens this module owns. An
-/// `open-reclaim-child` parks until its spawner kills it, and an
-/// `open-undeliverable-child` exits with its result; on a miss control
+/// `open-reclaim-child` parks until its spawner kills it, and a
+/// `session-undeliverable-child` exits with its result; on a miss control
 /// returns to the caller.
 pub fn reentry_main(role: &str)
 {
@@ -472,17 +477,17 @@ pub fn reentry_main(role: &str)
     {
         open_reclaim_child_main();
     }
-    if role == OPEN_UNDELIVERABLE_CHILD_ROLE
+    if role == SESSION_UNDELIVERABLE_CHILD_ROLE
     {
-        open_undeliverable_child_main();
+        session_undeliverable_child_main();
     }
 }
 
 /// An `open-reclaim-child`: fetch a file node cap, a release SEND, and a
 /// hand-off SEND from the spawner (whose endpoint arrives as this process's
-/// namespace cap), open the file carrying the release SEND, read a page, hand
-/// the spawner a copy of the open cap, and park until killed, keeping the
-/// open's liveness cap. Exit codes: 2 = the fetch failed, 3 = `FS_OPEN`
+/// namespace cap), open the file in this process's session carrying the
+/// release SEND, read a page, hand the spawner a copy of the open cap, and
+/// park until killed. Exit codes: 2 = the fetch failed, 3 = `FS_OPEN`
 /// failed, 4 = `FS_READ_MEMORY` failed, 5 = the open cap's copy failed, 6 =
 /// the hand-off call failed.
 fn open_reclaim_child_main() -> !
@@ -496,7 +501,7 @@ fn open_reclaim_child_main() -> !
     {
         std::process::exit(2)
     };
-    let Ok((open, _liveness)) = fs_open_live(node, release, ipc_buf)
+    let Ok(open) = fs_open(node, release, ipc_buf)
     else
     {
         std::process::exit(3)
@@ -640,78 +645,67 @@ fn sole(cap: u64) -> bool
         == 1
 }
 
-/// fatfs releases an open once no copy of its liveness cap is left outside it
-/// (services/fs/docs/fs-driver-protocol.md § Label 18), and keeps every open
-/// whose liveness cap someone holds. An `open-reclaim-child` opens a file
-/// carrying a release SEND on a svctest endpoint, reads a page, hands svctest
-/// a copy of its open cap, and is killed, sending no `FS_CLOSE`; svctest
-/// opens and closes the file until a sweep falls due. The child's open must
-/// then be gone (its cap copy answers `INVALID_BADGE`), and so must its
-/// release SEND (svctest's endpoint cap is the endpoint's only reference),
-/// as must an open whose liveness cap svctest deleted, while an open whose
-/// liveness cap svctest keeps still reads. An `FS_CLOSE` revokes the open's
-/// liveness cap, and an `open-undeliverable-child`, whose `CSpace` cannot
-/// take the `FS_OPEN` reply, sees fatfs drop the release SEND that open
-/// carried. fatfs once kept a dead client's open, and its release SEND, until
-/// the open's node was removed.
+/// fatfs ends a session, with every open made in it, once its client holds
+/// no copy of the session's liveness cap (services/fs/docs/fs-driver-protocol.md
+/// § Label 23), and keeps every session whose liveness cap someone holds. An
+/// `open-reclaim-child` opens a file in its own session carrying a release
+/// SEND on a svctest endpoint, reads a page, hands svctest a copy of its open
+/// cap, and is killed, sending no `FS_CLOSE`: its death releases its node,
+/// which signals fatfs. The child's open must then be gone (its cap copy
+/// answers `INVALID_BADGE`), and so must its release SEND (svctest's endpoint
+/// cap is the endpoint's only reference). A session whose liveness cap svctest
+/// deleted, its node kept, must end at a scheduled sweep, which svctest brings
+/// on by starting sessions, while an open in svctest's own session still
+/// reads. A `session-undeliverable-child`, whose `CSpace` cannot take the
+/// `FS_SESSION` reply, sees fatfs end the session it started, its page
+/// leaving the child's node. fatfs once kept a dead client's open, and its
+/// release SEND, until the open's node was removed.
 pub fn fs_reclaims_dead_opens_phase(_: &Caps)
 {
     let ipc_buf = current_ipc_buf();
     let (svctest, node) = scratch_file(RECLAIM_NAME, 1, ipc_buf);
 
-    let (kept, _kept_liveness) = fs_open_live(node, 0, ipc_buf).expect("fs_reclaim: FS_OPEN kept");
-    let (dropped, dropped_liveness) =
-        fs_open_live(node, 0, ipc_buf).expect("fs_reclaim: FS_OPEN dropped");
-    syscall::cap_delete(dropped_liveness).expect("fs_reclaim: deleting a liveness cap");
-    close_revokes_liveness(node, ipc_buf);
-
+    let kept = fs_open(node, 0, ipc_buf).expect("fs_reclaim: FS_OPEN kept");
     let (orphan, release_ep) = killed_childs_open(node, ipc_buf);
-    let opens = open_until_released(node, orphan, ipc_buf);
+    let start = Instant::now();
+    while open_live(orphan, ipc_buf)
+    {
+        assert!(
+            start.elapsed() < RECLAIM_WAIT,
+            "fs_reclaim: the dead child's open outlived its death"
+        );
+        std::thread::yield_now();
+    }
     assert!(
         sole(release_ep),
-        "fs_reclaim: the sweep released the dead child's open but kept its release SEND"
+        "fs_reclaim: fatfs ended the dead child's open but kept its release SEND"
     );
-    assert!(
-        !open_live(dropped, ipc_buf),
-        "fs_reclaim: an open whose liveness cap was deleted outlived a sweep"
-    );
+
+    let sessions = dropped_session_swept(node, ipc_buf);
     assert!(
         open_live(kept, ipc_buf),
-        "fs_reclaim: a sweep released an open whose liveness cap is held"
+        "fs_reclaim: a sweep ended svctest's own session"
     );
 
     let status = std::process::Command::new("/tests/svctest")
-        .arg(OPEN_UNDELIVERABLE_CHILD_ROLE)
+        .arg(SESSION_UNDELIVERABLE_CHILD_ROLE)
         .status()
-        .expect("fs_reclaim: spawning open-undeliverable-child failed");
+        .expect("fs_reclaim: spawning session-undeliverable-child failed");
     assert!(
         status.success(),
-        "fs_reclaim: open-undeliverable-child exited {status} (2 = lookup, 3 = release \
-         endpoint, 4 = CSpace exhaustion, 5 = the FS_OPEN reply landed, 6 = the call failed, \
-         7 = fatfs kept the release SEND)"
+        "fs_reclaim: session-undeliverable-child exited {status} (2 = lookup, 3 = node or \
+         handle, 4 = CSpace exhaustion, 5 = the FS_SESSION reply landed, 6 = the call failed, \
+         7 = fatfs kept the session's page)"
     );
 
     assert_eq!(fs_close(kept, ipc_buf), ipc::fs_errors::SUCCESS);
-    for cap in [kept, dropped, orphan, release_ep, node]
+    for cap in [kept, orphan, release_ep, node]
     {
         let _ = syscall::cap_delete(cap);
     }
     fs_remove(svctest, RECLAIM_NAME.as_bytes(), ipc_buf).expect("cleanup reclaim.bin");
     let _ = syscall::cap_delete(svctest);
-    std::os::seraph::log!("fs_reclaims_dead_opens phase passed (swept within {opens} opens)");
-}
-
-/// Open `node` and close the open: its `FS_CLOSE` must revoke the liveness
-/// cap the open's reply carried.
-fn close_revokes_liveness(node: u64, ipc_buf: *mut u64)
-{
-    let (closed, liveness) = fs_open_live(node, 0, ipc_buf).expect("fs_reclaim: FS_OPEN closed");
-    assert_eq!(fs_close(closed, ipc_buf), ipc::fs_errors::SUCCESS);
-    assert!(
-        !cap_live(liveness),
-        "fs_reclaim: FS_CLOSE left the open's liveness cap live"
-    );
-    let _ = syscall::cap_delete(closed);
+    std::os::seraph::log!("fs_reclaims_dead_opens phase passed (swept within {sessions} sessions)");
 }
 
 /// Spawn an `open-reclaim-child` on `node` with a release SEND on a new
@@ -745,43 +739,68 @@ fn killed_childs_open(node: u64, ipc_buf: *mut u64) -> (u64, u64)
     (orphan, release_ep)
 }
 
-/// Open and close `node` until `orphan` names no open, a sweep having
-/// released it, and return the opens it took.
-fn open_until_released(node: u64, orphan: u64, ipc_buf: *mut u64) -> usize
+/// Open `node` in a session on a sub-node of svctest's, delete the session's
+/// liveness cap and keep the node, so only a scheduled sweep can end it, and
+/// start sessions, each dropped the same way, until the open names no open.
+/// Returns the sessions it took; the nodes are released after.
+fn dropped_session_swept(node: u64, ipc_buf: *mut u64) -> usize
 {
-    // A test wait bound: the opens svctest makes before the sweep must have
-    // come. fatfs sweeps within the larger of 64 and the live opens of its
-    // last sweep, far below this in a svctest boot.
-    const SWEEP_BOUND: usize = 1 << 14;
+    // A test bound: the sessions svctest starts before the sweep must have
+    // come. fatfs sweeps within the larger of `fat_parse::sweep::SWEEP_FLOOR`
+    // (64) and the live sessions of its last sweep, far below this in a
+    // svctest boot.
+    const SWEEP_BOUND: usize = 1 << 12;
 
-    let opens = (1..=SWEEP_BOUND).find(|_| {
-        let (open, liveness) = fs_open_live(node, 0, ipc_buf).expect("fs_reclaim: FS_OPEN");
-        assert_eq!(fs_close(open, ipc_buf), ipc::fs_errors::SUCCESS);
-        let _ = syscall::cap_delete(open);
-        let _ = syscall::cap_delete(liveness);
-        !open_live(orphan, ipc_buf)
+    let top = sub_node(
+        startup_info().memmgr_endpoint,
+        u64::MAX,
+        "fs_reclaim: CREATE_SUB_NODE",
+    );
+    let mut nodes = Vec::new();
+    let mut dropped_session = |what: &str| {
+        let held = sub_node(top, u64::MAX, what);
+        nodes.push(held);
+        let (session, liveness) = fs_session(node, charge_handle(held, what), ipc_buf)
+            .unwrap_or_else(|e| panic!("{what}: FS_SESSION status {e:#x}"));
+        syscall::cap_delete(liveness).expect("fs_reclaim: deleting a liveness cap");
+        session
+    };
+    let session = dropped_session("fs_reclaim: the dropped session's node");
+    let dropped = fs_open_in(node, session, 0, ipc_buf).expect("fs_reclaim: FS_OPEN dropped");
+    let sessions = (1..=SWEEP_BOUND).find(|_| {
+        let other = dropped_session("fs_reclaim: a sweep-bringing session's node");
+        let _ = syscall::cap_delete(other);
+        !open_live(dropped, ipc_buf)
     });
-    opens
-        .unwrap_or_else(|| panic!("fs_reclaim: the dead child's open outlived {SWEEP_BOUND} opens"))
+    let sessions = sessions.unwrap_or_else(|| {
+        panic!("fs_reclaim: a session with no liveness cap outlived {SWEEP_BOUND} sessions")
+    });
+    for held in nodes
+    {
+        release_refused(held, "fs_reclaim: a session's node");
+    }
+    release_refused(top, "fs_reclaim: the sessions' parent node");
+    for cap in [dropped, session]
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    sessions
 }
 
-/// An `open-undeliverable-child`: exhaust this process's `CSpace`, its IPC
-/// receive reserve included, so the two-cap `FS_OPEN` reply cannot land,
-/// open [`RECLAIM_NAME`] carrying a release SEND on an endpoint of its own,
-/// and check that the reply transfer fails and that fatfs then deletes the
-/// SEND, leaving this process's endpoint cap the endpoint's only reference.
-/// Allocates nothing on the heap after the exhaustion, since a heap refill
-/// needs a free slot. Exit codes: 0 = the SEND went, 2 = the lookup failed,
-/// 3 = the release endpoint or its SEND could not be made, 4 = a grant
-/// spending the receive reserve neither landed nor failed its transfer, 5 =
-/// the reply landed or fatfs refused the open, 6 = the call failed, 7 =
-/// fatfs kept the SEND past the wait bound.
-fn open_undeliverable_child_main() -> !
+/// A `session-undeliverable-child`: make a sub-node of its own node and a
+/// charge-only handle to it, exhaust this process's `CSpace`, its IPC receive
+/// reserve included, and ask for a session on [`RECLAIM_NAME`]'s node
+/// carrying the handle: moving the handle out frees one slot, so the reply's
+/// session cap and liveness cap cannot both land. Check that the reply
+/// transfer fails and that fatfs then ends the session it started, its page
+/// leaving the sub-node. Allocates nothing on the heap after the exhaustion,
+/// since a heap refill needs a free slot. Exit codes: 0 = the page went, 2 =
+/// the lookup failed, 3 = the sub-node or its handle could not be made, 4 = a
+/// grant spending the receive reserve neither landed nor failed its transfer,
+/// 5 = the reply landed or fatfs refused the session, 6 = the call failed, 7 =
+/// the page stayed charged past the wait bound.
+fn session_undeliverable_child_main() -> !
 {
-    // A test wait bound: how long fatfs may take to release the open after
-    // its reply failed.
-    const RELEASE_WAIT: Duration = Duration::from_secs(5);
-
     let info = startup_info();
     let ipc_buf = current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
@@ -790,15 +809,29 @@ fn open_undeliverable_child_main() -> !
     {
         std::process::exit(2)
     };
-    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    });
-    let Some(release) = ep.and_then(|ep| syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND).ok())
+    let one_cap = |reply: Option<SmallReply>| match reply
+    {
+        Some(r) if r.label == ipc::memmgr_errors::SUCCESS && r.caps == 1 => Some(r.cap),
+        _ => None,
+    };
+    let Some(own) = one_cap(small_call(
+        info.memmgr_endpoint,
+        ipc::memmgr_labels::CREATE_SUB_NODE,
+        Some(u64::MAX),
+    ))
     else
     {
         std::process::exit(3)
     };
-    let ep = ep.unwrap_or_default();
+    let Some(charge) = one_cap(small_call(
+        own,
+        ipc::memmgr_labels::NODE_CHARGE_HANDLE,
+        None,
+    ))
+    else
+    {
+        std::process::exit(3)
+    };
 
     // Fill every general slot with copies of the directory cap, then spend
     // the IPC receive reserve, which general allocations leave free, on
@@ -807,41 +840,84 @@ fn open_undeliverable_child_main() -> !
     {}
     for _ in 0..=syscall_abi::CSPACE_IPC_RECV_RESERVE
     {
-        let grant = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
-            .word(0, 1)
-            .build();
-        // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
-        match unsafe { ipc::ipc_call(info.memmgr_endpoint, &grant, ipc_buf) }
+        match small_call(
+            info.memmgr_endpoint,
+            ipc::memmgr_labels::REQUEST_MEMORY_CAPS,
+            Some(1),
+        )
         {
-            Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED => break,
-            Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS && !reply.caps().is_empty() =>
-            {
-            }
+            Some(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED => break,
+            Some(reply) if reply.label == ipc::memmgr_errors::SUCCESS && reply.caps != 0 =>
+            {}
             _ => std::process::exit(4),
         }
     }
 
-    // The open moves the SEND out, freeing one slot; the reply's open cap
-    // and liveness cap cannot both land.
-    let open = ipc::IpcMessage::builder(ipc::fs_labels::FS_OPEN)
-        .cap(release)
-        .build();
-    // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
-    match unsafe { ipc::ipc_call(node, &open, ipc_buf) }
+    match small_call_carrying(node, ipc::fs_labels::FS_SESSION, charge)
     {
-        Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED =>
+        Some(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED =>
         {}
-        Ok(_) => std::process::exit(5),
-        Err(_) => std::process::exit(6),
+        Some(_) => std::process::exit(5),
+        None => std::process::exit(6),
     }
     let start = Instant::now();
-    while start.elapsed() < RELEASE_WAIT
+    while start.elapsed() < RECLAIM_WAIT
     {
-        if syscall::cap_info(ep, syscall::CAP_INFO_SOLE_REFERENCE) == Ok(1)
+        // A recheck of memmgr's deferred list pools a page fatfs has let go.
+        let _ = small_call(
+            info.memmgr_endpoint,
+            ipc::memmgr_labels::RELEASE_MEMORY_CAPS,
+            Some(0),
+        );
+        if small_call(own, ipc::memmgr_labels::NODE_QUERY_USAGE, None)
+            .is_some_and(|r| r.label == ipc::memmgr_errors::SUCCESS && r.word2 == 0)
         {
             std::process::exit(0);
         }
         let _ = syscall::thread_yield();
     }
     std::process::exit(7);
+}
+
+/// What a [`small_call`] keeps of its reply: the label, the cap count, the
+/// first cap (0 for none) and `data[2]`.
+#[derive(Clone, Copy)]
+struct SmallReply
+{
+    label: u64,
+    caps: usize,
+    cap: u64,
+    word2: u64,
+}
+
+/// Call `target` with `label` and, when given, `data[0]` = `word`, on this
+/// thread's IPC buffer; the reply as [`SmallReply`] keeps it, `None` when
+/// the call fails. Keeps the message off the caller's frame.
+fn small_call(target: u64, label: u64, word: Option<u64>) -> Option<SmallReply>
+{
+    let mut msg = ipc::IpcMessage::builder(label);
+    if let Some(word) = word
+    {
+        msg = msg.word(0, word);
+    }
+    small_reply(target, &msg.build())
+}
+
+/// [`small_call`] of the bare `label` carrying `cap`.
+fn small_call_carrying(target: u64, label: u64, cap: u64) -> Option<SmallReply>
+{
+    small_reply(target, &ipc::IpcMessage::builder(label).cap(cap).build())
+}
+
+/// Send `msg` on `target` and keep the reply as [`SmallReply`].
+fn small_reply(target: u64, msg: &ipc::IpcMessage) -> Option<SmallReply>
+{
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(target, msg, current_ipc_buf()) }.ok()?;
+    Some(SmallReply {
+        label: reply.label,
+        caps: reply.caps().len(),
+        cap: reply.caps().first().copied().unwrap_or(0),
+        word2: reply.word(2),
+    })
 }

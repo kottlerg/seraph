@@ -748,6 +748,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruststd-fs-sessions"
+version = "0.1.4"
+dependencies = [
+ "rustc-std-workspace-core",
+]
+
+[[package]]
 name = "ruststd-heap-fit"
 version = "0.1.4"
 dependencies = [

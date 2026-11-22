@@ -30,7 +30,7 @@ use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
 use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE};
 
 /// How long procmgr waits, at most, on each call it makes on a
-/// caller-supplied file cap (`FS_OPEN`, `FS_READ_MEMORY`,
+/// caller-supplied file cap (`FS_SESSION`, `FS_OPEN`, `FS_READ_MEMORY`,
 /// `FS_RELEASE_MEMORY`, `FS_CLOSE`): 10 s. The cap's server is untrusted,
 /// so a server that never answers fails the create with `IO_ERROR` once the
 /// bound passes instead of holding the request worker for good
@@ -456,15 +456,20 @@ pub fn read_module(
 }
 
 /// Copy the `len`-byte file the caller-transferred node cap `node_cap`
-/// names into a buffer granted on `memmgr` in `shape`: open it (`FS_OPEN`), copy each
-/// cache page `FS_READ_MEMORY` lends (`FS_RELEASE_MEMORY` right after), and
-/// close the open (`FS_CLOSE`). The node cap is deleted, and the open closed
-/// and its caps deleted, on every outcome.
+/// names into a buffer granted on `memmgr` in `shape`: start a session with
+/// the file's server charged to that same account ([`ReadSession`]), open
+/// the file in it (`FS_OPEN`), copy each cache page `FS_READ_MEMORY` lends
+/// (`FS_RELEASE_MEMORY` right after), close the open (`FS_CLOSE`), and end
+/// the session. The node cap is deleted, the open closed and the session
+/// ended, and their caps deleted, on every outcome.
 ///
 /// # Errors
-/// `IO_ERROR` when the open fails, a read fails, is unanswered, or returns
-/// no bytes, ends before `len` bytes, or names a range past the page it
-/// lends; [`ImageBuffer`]'s code when the buffer cannot be had.
+/// `LIMIT` when the max of the account's node, or of an ancestor's, refuses
+/// the session or the open; `IO_ERROR` when the session or the open fails
+/// otherwise, a read fails, is unanswered, or returns no bytes, ends before
+/// `len` bytes, or names a range past the page it lends; [`ImageBuffer`]'s
+/// code when the buffer cannot be had, and `OUT_OF_MEMORY` when memmgr
+/// cannot make the session's node.
 pub fn read_file(
     self_aspace: u64,
     node_cap: u64,
@@ -474,14 +479,26 @@ pub fn read_file(
     shape: Shape,
 ) -> Result<ImageBuffer, u64>
 {
-    let file = vfs_open(node_cap, ipc_buf).ok_or(procmgr_errors::IO_ERROR)?;
+    // Dropped after the open, which closes first: the session ends with no
+    // open in it.
+    let (session, session_cap) = match ReadSession::start(node_cap, memmgr, ipc_buf)
+    {
+        Ok(started) => started,
+        Err(code) =>
+        {
+            let _ = syscall::cap_delete(node_cap);
+            return Err(code);
+        }
+    };
+    let _session = std::mem::DropGuard::new(session, move |s| s.end(ipc_buf));
+    let file = vfs_open(node_cap, session_cap, ipc_buf)?;
     let file = std::mem::DropGuard::new(file, move |file| vfs_close(file, ipc_buf));
     let mut buffer = ImageBuffer::new(self_aspace, memmgr, len, ipc_buf, shape)?;
     let dst = buffer.bytes_mut();
     let mut copied = 0usize;
     while copied < dst.len()
     {
-        let chunk = copy_cache_page(self_aspace, file.cap, ipc_buf, copied as u64, |page| {
+        let chunk = copy_cache_page(self_aspace, *file, ipc_buf, copied as u64, |page| {
             // `copied` is below `dst.len()`.
             let to = dst.get_mut(copied..)?;
             let n = page.len().min(to.len());
@@ -659,48 +676,171 @@ fn vfs_read_memory(
     Some((kept?, bytes_valid, memory_data_offset, cookie))
 }
 
-/// Open the file a caller-transferred file node cap names (`FS_OPEN`, with
-/// no release SEND: procmgr releases each page itself right after its copy,
-/// so it opts out of cooperative release), and delete the node cap. Returns
-/// the open cap every later read and the closing `FS_CLOSE` go to, so
-/// procmgr's pages and close touch no other opener's state, and the open's
-/// liveness cap, which keeps the driver from releasing the open until
-/// [`vfs_close`] deletes it (`fs/docs/fs-driver-protocol.md` § Label 18).
-/// `None` when the call fails or the reply carries no open cap and liveness
-/// cap; every other reply cap is deleted.
-fn vfs_open(node_cap: u64, ipc_buf: *mut u64) -> Option<OpenedFile>
+/// The session one file read opens its file in
+/// (`fs/docs/fs-driver-protocol.md` § Label 23): charged to a sub-node of the
+/// account the read's buffer is granted on, the child's for a create and the
+/// sender's for `READ_VERIFIED`, so the creator pays for the server's records
+/// of the read as for the buffer, with a max of
+/// [`process_table::fs_reads::READ_SESSION_MAX_PAGES`]. It is made on the
+/// node cap the read opens, so it is with that file's server by construction,
+/// and it lives for the one read: procmgr keeps no session across requests.
+struct ReadSession
 {
-    let msg = IpcMessage::new(ipc::fs_labels::FS_OPEN);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { file_call(node_cap, &msg, ipc_buf) };
-    let _ = syscall::cap_delete(node_cap);
-    let reply = reply.ok()?;
-    let (opened, surplus) = match *reply.caps()
-    {
-        [cap, liveness, ref rest @ ..] if reply.label == 0 =>
-        {
-            (Some(OpenedFile { cap, liveness }), rest)
-        }
-        _ => (None, reply.caps()),
-    };
-    // The file cap is client-supplied, so its server is untrusted.
-    crate::release_caps(surplus);
-    opened
-}
-
-/// An open [`vfs_open`] made: its open cap and its liveness cap.
-#[derive(Clone, Copy)]
-struct OpenedFile
-{
-    cap: u64,
+    /// The full handle to the session's sub-node.
+    node: u64,
+    /// The session's liveness cap.
     liveness: u64,
 }
 
-/// Close an open file via its open cap, then delete the open cap and the
-/// liveness cap.
-fn vfs_close(file: OpenedFile, ipc_buf: *mut u64)
+impl ReadSession
 {
-    let file_cap = file.cap;
+    /// Make the sub-node on `memmgr` (`CREATE_SUB_NODE`, attributed by that
+    /// SEND's badge to its account), a charge-only handle to it
+    /// (`NODE_CHARGE_HANDLE`), and send it in `FS_SESSION` on `node_cap`.
+    /// Returns the session and the session cap, which the open moves to the
+    /// server. Every cap of a failure is deleted and the sub-node released.
+    fn start(node_cap: u64, memmgr: u64, ipc_buf: *mut u64) -> Result<(Self, u64), u64>
+    {
+        let node = create_node(memmgr, ipc_buf)?;
+        let mut session = Self { node, liveness: 0 };
+        let Some(charge) = node_call_cap(node, memmgr_labels::NODE_CHARGE_HANDLE, ipc_buf)
+        else
+        {
+            session.end(ipc_buf);
+            return Err(procmgr_errors::OUT_OF_MEMORY);
+        };
+        match request_session(node_cap, charge, ipc_buf)
+        {
+            Ok((session_cap, liveness)) =>
+            {
+                session.liveness = liveness;
+                Ok((session, session_cap))
+            }
+            Err(code) =>
+            {
+                session.end(ipc_buf);
+                Err(code)
+            }
+        }
+    }
+
+    /// End the session: delete its liveness cap, so the server ends it, then
+    /// release the sub-node (`NODE_RELEASE`), which tells a server holding a
+    /// grant charged to it, and delete the handle. The charge returns to the
+    /// account when the server ends the session.
+    fn end(self, ipc_buf: *mut u64)
+    {
+        if self.liveness != 0
+        {
+            let _ = syscall::cap_delete(self.liveness);
+        }
+        let msg = IpcMessage::new(memmgr_labels::NODE_RELEASE);
+        // SAFETY: `ipc_buf` is the calling thread's registered IPC buffer.
+        if let Ok(reply) = unsafe { ipc::ipc_call(self.node, &msg, ipc_buf) }
+        {
+            crate::release_caps(reply.caps());
+        }
+        let _ = syscall::cap_delete(self.node);
+    }
+}
+
+/// Make a sub-node with a max of
+/// [`process_table::fs_reads::READ_SESSION_MAX_PAGES`] on the account of the
+/// memmgr SEND `memmgr` (`CREATE_SUB_NODE`); its full handle. memmgr's
+/// refusal is answered as a refusal of the buffer's pages is.
+fn create_node(memmgr: u64, ipc_buf: *mut u64) -> Result<u64, u64>
+{
+    let msg = IpcMessage::builder(memmgr_labels::CREATE_SUB_NODE)
+        .word(0, process_table::fs_reads::READ_SESSION_MAX_PAGES)
+        .build();
+    // SAFETY: `ipc_buf` is the calling thread's registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(memmgr, &msg, ipc_buf) }
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    match (reply.label, reply.caps())
+    {
+        (memmgr_errors::SUCCESS, &[node]) => Ok(node),
+        (label, caps) =>
+        {
+            crate::release_caps(caps);
+            Err(process_table::memmgr_refusal(label))
+        }
+    }
+}
+
+/// Call the node handle `node` with the bare label `label`; the one cap a
+/// success carries, `None` on any other reply, whose caps are deleted.
+fn node_call_cap(node: u64, label: u64, ipc_buf: *mut u64) -> Option<u64>
+{
+    // SAFETY: `ipc_buf` is the calling thread's registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(node, &IpcMessage::new(label), ipc_buf) }.ok()?;
+    match (reply.label, reply.caps())
+    {
+        (memmgr_errors::SUCCESS, &[cap]) => Some(cap),
+        (_, caps) =>
+        {
+            crate::release_caps(caps);
+            None
+        }
+    }
+}
+
+/// `FS_SESSION` on the caller-supplied node cap `node_cap`, moving the
+/// charge-only handle `charge`: the reply's session cap and liveness cap.
+/// The handle is deleted when the kernel did not move it, and every surplus
+/// reply cap.
+///
+/// # Errors
+/// [`process_table::fs_reads::fs_refusal`] of the server's refusal;
+/// `IO_ERROR` when the call fails or a success carries no two caps.
+fn request_session(node_cap: u64, charge: u64, ipc_buf: *mut u64) -> Result<(u64, u64), u64>
+{
+    let msg = IpcMessage::builder(ipc::fs_labels::FS_SESSION)
+        .cap(charge)
+        .build();
+    // SAFETY: `ipc_buf` is the calling thread's registered IPC buffer.
+    let reply = unsafe { file_call(node_cap, &msg, ipc_buf) };
+    // A handle the kernel did not move (a refused call) is still ours; a
+    // moved one's slot is stale, and the delete is refused.
+    let _ = syscall::cap_delete(charge);
+    let reply = reply.map_err(|_| procmgr_errors::IO_ERROR)?;
+    let (kept, surplus) = process_table::fs_reads::session_reply_caps(reply.label, reply.caps());
+    // The file cap is client-supplied, so its server is untrusted.
+    crate::release_caps(surplus);
+    kept.ok_or(process_table::fs_reads::fs_refusal(reply.label))
+}
+
+/// Open the file a caller-transferred file node cap names in the read's
+/// session (`FS_OPEN`, moving `session_cap` in `caps[0]`, with no release
+/// SEND: procmgr releases each page itself right after its copy, so it opts
+/// out of cooperative release), and delete the node cap. Returns the open
+/// cap every later read and the closing `FS_CLOSE` go to, so procmgr's pages
+/// and close touch no other opener's state (`fs/docs/fs-driver-protocol.md`
+/// § Label 18); every other reply cap is deleted.
+///
+/// # Errors
+/// `LIMIT` when the session's max refuses the open; `IO_ERROR` when the
+/// call fails or the server refuses otherwise, or the reply carries no open
+/// cap.
+fn vfs_open(node_cap: u64, session_cap: u64, ipc_buf: *mut u64) -> Result<u64, u64>
+{
+    let msg = IpcMessage::builder(ipc::fs_labels::FS_OPEN)
+        .cap(session_cap)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { file_call(node_cap, &msg, ipc_buf) };
+    // A session cap the kernel did not move is still procmgr's.
+    let _ = syscall::cap_delete(session_cap);
+    let _ = syscall::cap_delete(node_cap);
+    let reply = reply.map_err(|_| procmgr_errors::IO_ERROR)?;
+    let (opened, surplus) = process_table::fs_reads::open_reply_caps(reply.label, reply.caps());
+    // The file cap is client-supplied, so its server is untrusted.
+    crate::release_caps(surplus);
+    opened.ok_or(process_table::fs_reads::fs_refusal(reply.label))
+}
+
+/// Close an open file via its open cap, then delete the open cap.
+fn vfs_close(file_cap: u64, ipc_buf: *mut u64)
+{
     let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if let Ok(reply) = unsafe { file_call(file_cap, &msg, ipc_buf) }
@@ -709,7 +849,6 @@ fn vfs_close(file: OpenedFile, ipc_buf: *mut u64)
         crate::release_caps(reply.caps());
     }
     let _ = syscall::cap_delete(file_cap);
-    let _ = syscall::cap_delete(file.liveness);
 }
 
 /// Issue `FS_RELEASE_MEMORY` on the file-cap to drop the fs-side cache

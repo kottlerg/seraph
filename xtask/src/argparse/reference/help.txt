@@ -676,7 +676,7 @@ Write a trust request: roots to enrol and key ids to revoke in the trust store t
 Usage: xtask trust-request [OPTIONS]
 
 Options:
-      --arch <ARCH>   Target architecture the request is signed for: the sysroot's [default: x86_64] [possible values: x86_64, riscv64]
+      --arch <ARCH>   Target architecture the request is signed for: the sysroot's, which a signed request staged in the sysroot is checked against [default: x86_64] [possible values: x86_64, riscv64]
       --add <FILE>    Enrol every anchor of the trust store FILE (the format of docs/signing.md § Trust Store), with its roles and label. Repeatable
       --revoke <HEX>  Revoke the key id HEX, 32 hex digits as the bootloader logs it. Repeatable
       --sign          Sign the request with the build's signing identity in the enrolment role, which a bootloader trusting its root applies with no one present. Without it the request is unsigned, and is applied only once confirmed at the console
@@ -690,7 +690,7 @@ Usage: xtask trust-request [OPTIONS]
 
 Options:
       --arch <ARCH>
-          Target architecture the request is signed for: the sysroot's
+          Target architecture the request is signed for: the sysroot's, which a signed request staged in the sysroot is checked against
 
           Possible values:
           - x86_64:  x86-64 (Intel/AMD 64-bit)

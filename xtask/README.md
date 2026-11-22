@@ -1358,8 +1358,8 @@ copy of the firmware's variable template
 ([docs/build-system.md](../docs/build-system.md#qemu-and-firmware)), so each of its boots decides a
 staged request again, and an unsigned one waits at the console prompt for 60 seconds on every boot.
 The cases set a staged request aside while they run ([Cases](#cases)). The command refuses a
-request that adds and revokes nothing, a store file that does not parse, and a key id that is not
-32 hex digits.
+request that adds and revokes nothing, a store file that does not parse, a key id that is not 32
+hex digits, and a signed request to stage for an architecture other than the sysroot's.
 
 ```sh
 cargo xtask trust-request [--arch x86_64|riscv64] [--add FILE]... [--revoke HEX]... [--sign]
@@ -1369,7 +1369,7 @@ cargo xtask trust-request --clear
 
 | Option | Default | Description |
 |---|---|---|
-| `--arch` | `x86_64` | The architecture a signed request is signed for, the sysroot's; an unsigned request names none |
+| `--arch` | `x86_64` | The architecture a signed request is signed for, the sysroot's, which a signed request staged in the sysroot must match (as `mkdisk` checks its own); an unsigned request names none |
 | `--add FILE` | none | Enrol every anchor of the trust store `FILE`; repeatable |
 | `--revoke HEX` | none | Revoke the key id `HEX`; repeatable |
 | `--sign` | `false` | Sign the request with the build's signing identity in the enrolment role |

@@ -759,7 +759,8 @@ args! {
 args! {
     pub struct TrustRequestArgs
     {
-        /// Target architecture the request is signed for: the sysroot's.
+        /// Target architecture the request is signed for: the sysroot's, which
+        /// a signed request staged in the sysroot is checked against.
         #[arg(long, default_value = "x86_64")]
         pub arch: Arch,
 

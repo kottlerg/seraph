@@ -13,10 +13,13 @@
 //! `HANDOVER_AUTHORITY`-badged SEND and exits. svcmgr runs for the lifetime
 //! of the system.
 //!
-//! Every supervised service has two death observers on svcmgr's death queues:
-//! one on its main thread and one on its address space, which a terminal
-//! fault of any of its threads posts. Both post the service's `DeathTag`, its
-//! table slot and instance, as the correlator; a further queue joins when
+//! Every supervised service other than memmgr and procmgr has two death
+//! observers on svcmgr's death queues: one on its main thread and one on its
+//! address space, which posts the first terminal end of any of its threads, a
+//! fault or a `sys_aspace_exit`. memmgr's and procmgr's are on the core-death
+//! queue instead (`observe_core_deaths`), whose entries pwrmgr acts on; only
+//! the resync finds such a death here. Both observers post the service's
+//! `DeathTag`, its table slot and instance, as the correlator; a further queue joins when
 //! every pool is out of nodes. The main wait set, which `death_set::DeathSet`
 //! owns and widens as the queues fill it, holds the service endpoint (badge
 //! 0), every death queue (badge 1) and the memory-pressure Notification

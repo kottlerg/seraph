@@ -16,8 +16,8 @@ use crate::eval::Evaluator;
 use crate::host::{Host, HostError, Width};
 use crate::value::Data;
 use crate::{
-    EVAL_STACK_BYTES, Fault, MAX_CALL_DEPTH, MAX_EVAL_ALLOC, MAX_EVAL_DEPTH, MAX_EVAL_OBJECTS,
-    MAX_EVAL_STEPS, MAX_VALUE_DEPTH, PARSE_STACK_BYTES,
+    EVAL_STACK_BYTES, Fault, MAX_BUFFER_BYTES, MAX_CALL_DEPTH, MAX_EVAL_ALLOC, MAX_EVAL_DEPTH,
+    MAX_EVAL_OBJECTS, MAX_EVAL_STEPS, MAX_VALUE_DEPTH, PARSE_STACK_BYTES,
 };
 
 // ── Assembler ─────────────────────────────────────────────────────────
@@ -1379,15 +1379,19 @@ fn the_values_an_evaluation_makes_are_bounded()
         fault(&[], &store(&pkg_obj(&[0x13], &i(5000)), &l(0))),
         FaultKind::Bound
     );
-    // A string grown past MAX_BUFFER_BYTES.
-    let grow = cat(&[
-        &store(&string(""), &l(0)),
-        &while_(
-            &[0x01],
-            &op(&[0x73], &[&l(0), &string("0123456789abcdef"), &l(0)]),
-        ),
-    ]);
-    assert_eq!(fault(&[], &grow), FaultKind::Bound);
+    // A string doubled by Concatenate: 16 bytes doubled 12 times reaches
+    // MAX_BUFFER_BYTES, which it may, and a 13th passes it, long before
+    // MAX_EVAL_ALLOC or MAX_EVAL_STEPS ends the evaluation.
+    let doubled = |times: usize| {
+        cat(&[
+            &store(&string("0123456789abcdef"), &l(0)),
+            &op(&[0x73], &[&l(0), &l(0), &l(0)]).repeat(times),
+            &ret(&op(&[0x87], &[&l(0)])),
+        ])
+    };
+    assert_eq!(16 << 12, MAX_BUFFER_BYTES);
+    assert_eq!(int_of(&doubled(12)), 65_536);
+    assert_eq!(fault(&[], &doubled(13)), FaultKind::Bound);
 }
 
 #[test]

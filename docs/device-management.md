@@ -424,10 +424,10 @@ pins init's donated pool run, and a read of the binary from the drivers director
 which needs the IOMMU driver; the release token of each instance's DMA hold; each domain's handle,
 which devmgr names in its `ATTACH` from a count it keeps for the boot, so that no instance gives a
 handle a dead one gave, under which a call left pending across the death would reach another
-function's domain, and its domain ID, which `ATTACH` replies; on x86-64 the interrupt remapping table, which devmgr
-allocates and hands to the driver in `REMAP_SETUP`, with every entry it set; and the `DmaTable` (§
-DMA Authorisation), which holds every confined device's domain, reserved ranges, interrupt files and
-mappings.
+function's domain, and its domain ID, which `ATTACH` replies; on x86-64 the interrupt remapping
+table, which devmgr allocates and hands to the driver in `REMAP_SETUP`, with every entry it set; and
+the `DmaTable` (§ DMA Authorisation), which holds every confined device's domain, reserved ranges,
+interrupt files and mappings.
 
 **Death.** Each instance has a death watch thread of devmgr's own, which sees the death at once,
 independent of the control thread, which may be blocked in a call to the dead instance. It marks the
@@ -858,3 +858,4 @@ specified in [`docs/storage.md`](storage.md).
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
 [services/vfsd/README.md](../services/vfsd/README.md), [xtask/README.md](../xtask/README.md)
+

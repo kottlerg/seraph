@@ -40,10 +40,14 @@ header (today: name length for `NS_LOOKUP`); bits 32..64 are zero.
 Error replies use the matching `NsError` discriminant value as the
 reply label; success replies use label `0`.
 
-No request carries a capability. A server deletes every capability a
-request on its namespace endpoint carries, whatever its label and whatever
-it answers: `dispatch_request` neither reads nor deletes them, and one left
-in place holds a slot of the server's `CSpace` for the server's life.
+No `NS_*` request carries a capability. A server deletes every capability
+an `NS_*` request carries, and every one a request carries that it answers
+without taking it, such as one with a label it does not serve:
+`dispatch_request` neither reads nor deletes them, and one left in place
+holds a slot of the server's `CSpace` for the server's life. A label of
+another protocol on the same endpoint keeps the capabilities its own
+protocol gives it (a filesystem driver's `FS_*` labels,
+[`services/fs/docs/fs-driver-protocol.md`](../../services/fs/docs/fs-driver-protocol.md)).
 
 ---
 

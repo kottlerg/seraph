@@ -332,9 +332,10 @@ pub trait NamespaceBackend
 /// arguments.
 ///
 /// No `NS_*` request carries a cap, and this function neither reads nor
-/// deletes the caps `received` carries: the server's receive loop deletes
-/// every cap a request on its namespace endpoint carries, whatever the label
-/// (README § Wire labels).
+/// deletes the caps `received` carries: the server deletes every cap an
+/// `NS_*` request carries, and every cap of a request it answers without
+/// taking it, such as one with a label it does not serve (README § Wire
+/// labels).
 ///
 /// # Safety
 ///

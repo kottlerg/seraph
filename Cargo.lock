@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acpid"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aml",
  "ipc",
@@ -15,15 +15,15 @@ dependencies = [
 
 [[package]]
 name = "aml"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "ansi"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "boot"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "boot-protocol",
  "crypto",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "boot-policy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "objsig",
  "svc-grammar",
@@ -43,11 +43,11 @@ dependencies = [
 
 [[package]]
 name = "boot-protocol"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "capexhaust"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "cmos-rtc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -66,14 +66,14 @@ dependencies = [
 
 [[package]]
 name = "crash-report"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "syscall-abi",
 ]
 
 [[package]]
 name = "crashd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crash-report",
  "crashd-core-file",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "crashd-core-file"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall-abi",
@@ -93,11 +93,11 @@ dependencies = [
 
 [[package]]
 name = "crashd-oom-hold"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "crasher"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "crashme"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "mem-fill",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "crashme-tester"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -123,21 +123,21 @@ dependencies = [
 
 [[package]]
 name = "crypto"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crypto-testkit",
 ]
 
 [[package]]
 name = "crypto-testkit"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "json",
 ]
 
 [[package]]
 name = "deadline"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -146,11 +146,11 @@ dependencies = [
 
 [[package]]
 name = "deadline-tester"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "death-set"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ruststd-death-queues",
  "syscall",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "debug-echo"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "device-tracker",
  "gdb-rsp",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "debugger"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "riscv-step",
@@ -180,11 +180,11 @@ dependencies = [
 
 [[package]]
 name = "debugger-tester"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "demandpaged"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "device-tracker"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "devmgr"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "boot-policy",
  "boot-protocol",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "devmgr-firmware"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aml",
  "boot-policy",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "driver-binding"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "process-abi",
@@ -247,14 +247,14 @@ dependencies = [
 
 [[package]]
 name = "elf"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "process-abi",
 ]
 
 [[package]]
 name = "entropyd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "hwrng-protocol",
  "ipc",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "fatfs"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "fatfs-parse",
  "ipc",
@@ -275,19 +275,19 @@ dependencies = [
 
 [[package]]
 name = "fatfs-parse"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "fb-charset"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "font"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "framebuffer"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "boot-protocol",
  "driver-binding",
@@ -300,18 +300,18 @@ dependencies = [
 
 [[package]]
 name = "fsbench"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "syscall",
 ]
 
 [[package]]
 name = "gdb-rsp"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "gdbstub"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "device-tracker",
  "gdb-rsp",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "goldfish-rtc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -333,18 +333,18 @@ dependencies = [
 
 [[package]]
 name = "hello"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "hello-tester"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
 ]
 
 [[package]]
 name = "hotplug-check"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -354,14 +354,14 @@ dependencies = [
 
 [[package]]
 name = "hwrng-protocol"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "syscall-abi",
 ]
 
 [[package]]
 name = "init"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "boot-protocol",
  "elf",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "init-log-levels"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "log",
  "objsig",
@@ -390,11 +390,11 @@ dependencies = [
 
 [[package]]
 name = "init-protocol"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "init-sender-table"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "logd-codec",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "iommu-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "iommu-riscv"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "iommu-core",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "iommu-store"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "iommu-core",
  "ipc",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "iommu-vtd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "iommu-core",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "ipc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-core",
  "syscall",
@@ -456,11 +456,11 @@ dependencies = [
 
 [[package]]
 name = "json"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "kernel"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "boot-protocol",
  "crypto",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "ktest"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "boot-protocol",
  "crypto",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "rustc-std-workspace-core",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "logd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "death-set",
  "ipc",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "logd-codec"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall-abi",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "logd-slot-table"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "death-set",
  "ipc",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "mem-fill"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall-abi",
@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "memhog"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "mem-fill",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "memmgr"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "memmgr-free-pool",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "memmgr-free-pool"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crypto",
  "ruststd-pool-funding",
@@ -570,11 +570,11 @@ dependencies = [
 
 [[package]]
 name = "mmio"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "namespace-protocol"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "rustc-std-workspace-core",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "ns-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "objsig"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crypto",
  "crypto-testkit",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "oomd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "oomd-policy",
@@ -610,22 +610,22 @@ dependencies = [
 
 [[package]]
 name = "oomd-policy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
 ]
 
 [[package]]
 name = "pipefault"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "pipestress"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "pipestress-tester"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "syscall",
  "syscall-abi",
@@ -633,14 +633,14 @@ dependencies = [
 
 [[package]]
 name = "process-abi"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-core",
 ]
 
 [[package]]
 name = "process-layout"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "process-abi",
  "rustc-std-workspace-core",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "procmgr"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "death-set",
  "elf",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "procmgr-process-table"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "death-set",
  "ipc",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "pwrmgr"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "recv-pool"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -692,14 +692,14 @@ dependencies = [
 
 [[package]]
 name = "registry"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
 ]
 
 [[package]]
 name = "registry-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "rustc-std-workspace-core",
@@ -709,15 +709,15 @@ dependencies = [
 
 [[package]]
 name = "relrofault"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "restart-budget"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "riscv-step"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "rustc-std-workspace-alloc"
@@ -733,14 +733,14 @@ checksum = "aa9c45b374136f52f2d6311062c7146bff20fec063c3f5d46a410bd937746955"
 
 [[package]]
 name = "ruststd-argv-env"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-core",
 ]
 
 [[package]]
 name = "ruststd-death-queues"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-alloc",
  "rustc-std-workspace-core",
@@ -749,21 +749,21 @@ dependencies = [
 
 [[package]]
 name = "ruststd-fs-sessions"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-core",
 ]
 
 [[package]]
 name = "ruststd-heap-fit"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-core",
 ]
 
 [[package]]
 name = "ruststd-pool-funding"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-core",
  "syscall-abi",
@@ -771,18 +771,18 @@ dependencies = [
 
 [[package]]
 name = "ruststd-spin-wait"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-core",
 ]
 
 [[package]]
 name = "seraph-wrapper-shim"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "serial"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "sessiond"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "sessiond-table",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "sessiond-table"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "shell"
@@ -821,7 +821,7 @@ version = "0.0.1"
 
 [[package]]
 name = "shmem"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-core",
  "syscall",
@@ -830,19 +830,19 @@ dependencies = [
 
 [[package]]
 name = "stackoverflow"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "stdiotest"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "stdiotest-tester"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "stopsrc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -851,11 +851,11 @@ dependencies = [
 
 [[package]]
 name = "svc-grammar"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "svcmgr"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "death-set",
  "ipc",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "svcmgr-defs"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "death-set",
  "ipc",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "svcmgr-endowment"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall-abi",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "svctest"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "elf",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "swapd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "swapd-layout",
@@ -927,7 +927,7 @@ dependencies = [
 
 [[package]]
 name = "swapd-layout"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "memmgr-free-pool",
@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "syscall"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-core",
  "syscall-abi",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "syscall-abi"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rustc-std-workspace-core",
 ]
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "test-dma"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -972,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "test-fault"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -981,14 +981,14 @@ dependencies = [
 
 [[package]]
 name = "text"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "font",
 ]
 
 [[package]]
 name = "threadchurn"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "syscall",
  "syscall-abi",
@@ -996,19 +996,19 @@ dependencies = [
 
 [[package]]
 name = "threadchurn-tester"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "threadstack"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "threadstack-tester"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "timed"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "tpm"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "hwrng-protocol",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "usertest"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipc",
  "syscall",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "vfsd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "boot-protocol",
  "ipc",
@@ -1052,11 +1052,11 @@ dependencies = [
 
 [[package]]
 name = "vfsd-gpt"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "vfsd-root-backend"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "namespace-protocol",
  "restart-budget",
@@ -1064,14 +1064,14 @@ dependencies = [
 
 [[package]]
 name = "vfsd-swap"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "vfsd-gpt",
 ]
 
 [[package]]
 name = "virtio-blk"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-console"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-input"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "ipc",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-rng"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "driver-binding",
  "hwrng-protocol",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "boot-policy",
  "boot-protocol",

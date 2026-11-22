@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use ipc::devmgr_labels::{PRT_NO_ROUTE, WINDOW_BUS, WINDOW_IO, WINDOW_MEMORY};
 
 use crate::aml::CrsResource;
-use crate::pci_records::RecordState;
+use crate::pci_records::{RecordState, intx_route};
 use crate::scan::PciDevice;
 
 /// The page size a memory grant is rounded to.
@@ -550,6 +550,9 @@ pub enum Disagreement
     /// bridge's windows, whose bus range names the functions checked, or its
     /// table of the [`PrtRule::after`] mode.
     Order,
+    /// The table is a PCI-to-PCI bridge's, at an address in another segment
+    /// or where devmgr records no configured bridge.
+    NotBridge,
 }
 
 /// A value devmgr holds for a bridge, and the boot functions its check
@@ -584,6 +587,62 @@ impl Bridge
             .as_ref()
             .and_then(|held| bus_range(self.bus, &held.value))
     }
+
+    /// Its root bus's table of `mode`.
+    #[must_use]
+    pub const fn prt(&self, mode: PrtMode) -> &Option<Held<PrtTable>>
+    {
+        match mode
+        {
+            PrtMode::Routes => &self.routes,
+            PrtMode::PicMode => &self.pic,
+        }
+    }
+
+    const fn prt_mut(&mut self, mode: PrtMode) -> &mut Option<Held<PrtTable>>
+    {
+        match mode
+        {
+            PrtMode::Routes => &mut self.routes,
+            PrtMode::PicMode => &mut self.pic,
+        }
+    }
+}
+
+/// What devmgr holds for one PCI-to-PCI bridge acpid pushed a `_PRT` for,
+/// which routes the interrupts of the functions below it (ACPI 6.5
+/// § 6.2.13). It is recorded at its first push, held table or not: a
+/// function below it is routed by its tables alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BridgeRoutes
+{
+    /// The bridge's address.
+    pub address: Address,
+    pub pic: Option<Held<PrtTable>>,
+    pub routes: Option<Held<PrtTable>>,
+}
+
+impl BridgeRoutes
+{
+    /// Its secondary bus's table of `mode`.
+    #[must_use]
+    pub const fn prt(&self, mode: PrtMode) -> &Option<Held<PrtTable>>
+    {
+        match mode
+        {
+            PrtMode::Routes => &self.routes,
+            PrtMode::PicMode => &self.pic,
+        }
+    }
+
+    const fn prt_mut(&mut self, mode: PrtMode) -> &mut Option<Held<PrtTable>>
+    {
+        match mode
+        {
+            PrtMode::Routes => &mut self.routes,
+            PrtMode::PicMode => &mut self.pic,
+        }
+    }
 }
 
 /// How devmgr took a push.
@@ -600,11 +659,14 @@ pub enum Push
     Refused(Disagreement),
 }
 
-/// The bridges acpid pushed results for, in segment, then bus order.
+/// The bridges acpid pushed results for: the host bridges, in segment, then
+/// bus order, and the PCI-to-PCI bridges whose `_PRT` it pushed, in address
+/// order.
 #[derive(Default)]
 pub struct Bridges
 {
     list: Vec<Bridge>,
+    below: Vec<BridgeRoutes>,
 }
 
 impl Bridges
@@ -613,7 +675,10 @@ impl Bridges
     #[must_use]
     pub const fn new() -> Self
     {
-        Self { list: Vec::new() }
+        Self {
+            list: Vec::new(),
+            below: Vec::new(),
+        }
     }
 
     /// The bridge at `ordinal`, in segment, then bus order.
@@ -638,28 +703,64 @@ impl Bridges
             .find(|b| (b.segment, b.bus) == (segment, bus))
     }
 
-    /// The line the table of `mode` devmgr holds routes `function`'s
-    /// interrupt pin to: the table of the bridge whose buses
-    /// ([`Bridge::buses`]) hold the function's bus, at the pin and device
-    /// number its interrupt reaches the root bus with
-    /// (`PciDevice::host_intx`). `None` for a function with no pin, one on
-    /// the buses of no bridge devmgr holds windows for, one whose bridge has
-    /// no table of `mode` held, and one whose pin that table does not route.
+    /// The PCI-to-PCI bridge at `address`, if acpid pushed a `_PRT` for it.
     #[must_use]
-    pub fn line(&self, mode: PrtMode, function: &PciDevice) -> Option<u32>
+    pub fn routes_of(&self, address: Address) -> Option<&BridgeRoutes>
     {
-        let (pin, dev) = function.host_intx?;
-        let bridge = self.list.iter().find(|b| {
-            b.segment == function.segment
-                && b.buses()
-                    .is_some_and(|(first, last)| (first..=last).contains(&function.bus))
-        })?;
-        let held = match mode
+        self.below.iter().find(|b| b.address == address)
+    }
+
+    /// The line the table of `mode` devmgr holds routes `function`'s
+    /// interrupt pin to, walking up from it through `records`
+    /// ([`intx_route`]): the table of the nearest PCI-to-PCI bridge above it
+    /// acpid pushed a `_PRT` for, else that of the host bridge whose buses
+    /// ([`Bridge::buses`]) hold its root bus, at the pin and device number
+    /// its interrupt reaches that bus with. `None` for a function with no
+    /// pin, one routed on the root bus of no bridge devmgr holds windows for,
+    /// one whose bridge has no table of `mode` held, and one whose pin that
+    /// table does not route.
+    #[must_use]
+    pub fn line(&self, mode: PrtMode, records: &[PciDevice], function: &PciDevice) -> Option<u32>
+    {
+        let at = intx_route(records, function, |b| self.routes_of(b).is_some())?;
+        let held = match at.bridge
         {
-            PrtMode::Routes => bridge.routes.as_ref(),
-            PrtMode::PicMode => bridge.pic.as_ref(),
-        }?;
-        route(&held.value, pin, dev).map(u32::from)
+            Some(bridge) => self.routes_of(bridge)?.prt(mode),
+            None => self
+                .list
+                .iter()
+                .find(|b| {
+                    b.segment == function.segment
+                        && b.buses()
+                            .is_some_and(|(first, last)| (first..=last).contains(&at.bus))
+                })?
+                .prt(mode),
+        };
+        route(&held.as_ref()?.value, at.pin, at.dev).map(u32::from)
+    }
+
+    /// The PCI-to-PCI bridge at `address`, made with nothing held when
+    /// absent; `None` when a new one cannot be recorded.
+    fn below_entry(&mut self, address: Address) -> Option<&mut BridgeRoutes>
+    {
+        let at = match self.below.binary_search_by_key(&address, |b| b.address)
+        {
+            Ok(at) => at,
+            Err(at) =>
+            {
+                self.below.try_reserve(1).ok()?;
+                self.below.insert(
+                    at,
+                    BridgeRoutes {
+                        address,
+                        pic: None,
+                        routes: None,
+                    },
+                );
+                at
+            }
+        };
+        self.below.get_mut(at)
     }
 
     /// The bridge at `(segment, bus)`, made with nothing held when absent;
@@ -743,12 +844,21 @@ impl Bridges
         }
     }
 
-    /// Take the bridge's `_PRT` of `mode`, checked by `rule` against the
-    /// functions on its buses ([`Bridge::buses`]), `expected` giving the
-    /// line devmgr gives a function: the first that passes is kept for the
-    /// boot ([`check_prt`]). A table that comes before the bridge's windows,
-    /// or before its table of `rule`'s earlier mode, is refused
-    /// ([`Disagreement::Order`]).
+    /// Take a `_PRT` of `mode` under the host bridge at `(segment, bus)`:
+    /// its root bus's when `bridge` is `None`, else that of the PCI-to-PCI
+    /// bridge at `bridge`, which must be one of `records` (every record,
+    /// for the walk up from each function) in the same segment. It is checked
+    /// by `rule` against `functions` (the records, removed ones left out)
+    /// whose interrupt it routes ([`intx_route`], this bridge counted as
+    /// pushed): those on the host bridge's buses ([`Bridge::buses`]) routed on
+    /// its root bus, or those routed on this bridge's secondary bus;
+    /// `expected` gives the line devmgr gives a function. The first that
+    /// passes is kept for the boot ([`check_prt`]). A host bridge's table
+    /// that comes before its windows, or a table that comes before the same
+    /// bridge's table of `rule`'s earlier mode, is refused
+    /// ([`Disagreement::Order`]). A PCI-to-PCI bridge is recorded at its
+    /// first push whatever the check finds, so that the functions below it are
+    /// routed by its tables alone ([`Bridges::line`]).
     ///
     /// `None` when a new bridge cannot be recorded; nothing is held then.
     #[expect(
@@ -760,18 +870,54 @@ impl Bridges
         &mut self,
         segment: u16,
         bus: u8,
+        bridge: Option<Address>,
         mode: PrtMode,
         table: &PrtTable,
         rule: PrtRule,
+        records: &[PciDevice],
         functions: impl Iterator<Item = &'a PciDevice>,
         expected: impl Fn(&PciDevice) -> Option<u32>,
     ) -> Option<Push>
     {
-        let bridge = self.entry(segment, bus)?;
-        let held = match mode
+        match bridge
         {
-            PrtMode::Routes => &bridge.routes,
-            PrtMode::PicMode => &bridge.pic,
+            None =>
+            {
+                self.entry(segment, bus)?;
+            }
+            Some(at) =>
+            {
+                let configured = at.0 == segment
+                    && records.iter().any(|d| {
+                        address(d) == at
+                            && d.bridge_buses
+                                .is_some_and(|(secondary, _)| secondary > d.bus)
+                    });
+                if !configured
+                {
+                    return Some(Push::Refused(Disagreement::NotBridge));
+                }
+                self.below_entry(at)?;
+            }
+        }
+        let (held, earlier, buses) = match bridge
+        {
+            None =>
+            {
+                let b = self.find(segment, bus)?;
+                (b.prt(mode), rule.after.map(|m| b.prt(m)), b.buses())
+            }
+            Some(at) =>
+            {
+                let b = self.routes_of(at)?;
+                // A bridge's table routes the functions below it, whatever
+                // the host bridge's windows.
+                (
+                    b.prt(mode),
+                    rule.after.map(|m| b.prt(m)),
+                    Some((0, u8::MAX)),
+                )
+            }
         };
         if let Some(held) = held
         {
@@ -786,33 +932,38 @@ impl Bridges
                 },
             );
         }
-        let waiting = match rule.after
-        {
-            Some(PrtMode::Routes) => bridge.routes.is_none(),
-            Some(PrtMode::PicMode) => bridge.pic.is_none(),
-            None => false,
-        };
-        let Some((first, last)) = bridge.buses().filter(|_| !waiting)
+        let waiting = earlier.is_some_and(Option::is_none);
+        let Some((first, last)) = buses.filter(|_| !waiting)
         else
         {
             return Some(Push::Refused(Disagreement::Order));
         };
-        let on_bridge =
-            functions.filter(|f| f.segment == segment && (first..=last).contains(&f.bus));
+        let pushed = |at: Address| Some(at) == bridge || self.routes_of(at).is_some();
+        let routed_here = functions.filter_map(|f| {
+            let at = intx_route(records, f, pushed)?;
+            let here = match (bridge, at.bridge)
+            {
+                (None, None) => f.segment == segment && (first..=last).contains(&at.bus),
+                (Some(this), Some(that)) => this == that,
+                (None, Some(_)) | (Some(_), None) => false,
+            };
+            here.then_some((f, at.pin, at.dev))
+        });
         let expected = |f: &PciDevice| if rule.lines { expected(f) } else { None };
-        match check_prt(table, on_bridge, expected)
+        let checked = check_prt(table, routed_here, expected);
+        let slot = match bridge
+        {
+            None => self.entry(segment, bus)?.prt_mut(mode),
+            Some(at) => self.below_entry(at)?.prt_mut(mode),
+        };
+        match checked
         {
             Ok(covered) =>
             {
-                let held = Some(Held {
+                *slot = Some(Held {
                     value: *table,
                     covered,
                 });
-                match mode
-                {
-                    PrtMode::Routes => bridge.routes = held,
-                    PrtMode::PicMode => bridge.pic = held,
-                }
                 Some(Push::Kept)
             }
             Err(why) => Some(Push::Refused(why)),
@@ -907,28 +1058,23 @@ pub fn check_windows<'a>(
     Ok(covered)
 }
 
-/// Check a root bus's routes against `functions`, those on the bridge's
-/// buses: each function with an interrupt pin must be routed at the pin and
-/// device number its interrupt reaches the root bus with
-/// (`PciDevice::host_intx`), to `expected`'s line for it when that gives
-/// one. Returns the functions checked.
+/// Check a bus's routes against `functions`, those whose interrupt the
+/// table routes, each with the pin and device number its interrupt reaches
+/// the table's bus with ([`intx_route`]): each must be routed there, to
+/// `expected`'s line for it when that gives one. Returns the functions
+/// checked.
 ///
 /// # Errors
 /// The first [`Disagreement`] found.
 pub fn check_prt<'a>(
     table: &PrtTable,
-    functions: impl Iterator<Item = &'a PciDevice>,
+    functions: impl Iterator<Item = (&'a PciDevice, u8, u8)>,
     expected: impl Fn(&PciDevice) -> Option<u32>,
 ) -> Result<u64, Disagreement>
 {
     let mut covered = 0u64;
-    for function in functions
+    for (function, pin, dev) in functions
     {
-        let Some((pin, dev)) = function.host_intx
-        else
-        {
-            continue;
-        };
         let at = address(function);
         let line = route(table, pin, dev).ok_or(Disagreement::Unrouted {
             function: at,
@@ -949,8 +1095,8 @@ pub fn check_prt<'a>(
     Ok(covered)
 }
 
-/// The line `table` routes pin `pin` (`INTA`..=`INTD`, 1..=4) of root-bus
-/// device `dev` to; `None` where it routes none.
+/// The line `table` routes pin `pin` (`INTA`..=`INTD`, 1..=4) of device
+/// `dev` on its bus to; `None` where it routes none.
 fn route(table: &PrtTable, pin: u8, dev: u8) -> Option<u16>
 {
     table
@@ -1243,7 +1389,7 @@ mod tests
             request_words(labels::BRIDGE_WINDOWS, u64::MAX),
             Some(4 + 3 * labels::MAX_BRIDGE_WINDOWS)
         );
-        assert_eq!(request_words(labels::PRT_TABLE, 0), Some(36));
+        assert_eq!(request_words(labels::PRT_TABLE, 0), Some(37));
         assert_eq!(request_words(labels::ACPI_HOTPLUG, 0), Some(3));
         assert_eq!(request_words(labels::QUERY_HOST_BRIDGE, 0), None);
     }
@@ -1395,7 +1541,17 @@ mod tests
         let mut bridges = Bridges::new();
         // Before the windows, no table is taken.
         assert_eq!(
-            bridges.push_prt(0, 0, PrtMode::PicMode, &pic, PIC, functions.iter(), line),
+            bridges.push_prt(
+                0,
+                0,
+                None,
+                PrtMode::PicMode,
+                &pic,
+                PIC,
+                &functions,
+                functions.iter(),
+                line
+            ),
             Some(Push::Refused(Disagreement::Order))
         );
         let windows = vec![window(WindowKind::Bus, 0, 0x100)];
@@ -1404,7 +1560,17 @@ mod tests
             Some(Push::Kept)
         );
         let mut push = |mode, table: &PrtTable, rule| {
-            bridges.push_prt(0, 0, mode, table, rule, functions.iter(), line)
+            bridges.push_prt(
+                0,
+                0,
+                None,
+                mode,
+                table,
+                rule,
+                &functions,
+                functions.iter(),
+                line,
+            )
         };
 
         assert_eq!(
@@ -1461,9 +1627,11 @@ mod tests
     {
         // A function at device 0, pin INTA, on bus 1 behind the root port at
         // device 4: its interrupt reaches the root bus as INTA of device 4.
+        let mut port = function((0, 0, 4, 0), 0);
+        port.bridge_buses = Some((1, 1));
         let mut leaf = function((0, 1, 0, 0), 1);
         leaf.host_intx = Some((1, 4));
-        let functions = [leaf];
+        let functions = [port, leaf];
         let swizzle = |f: &PciDevice| {
             f.host_intx
                 .map(|(pin, dev)| 32 + (u32::from(pin) - 1 + u32::from(dev)) % 4)
@@ -1480,9 +1648,11 @@ mod tests
             bridges.push_prt(
                 0,
                 0,
+                None,
                 PrtMode::Routes,
                 &routes,
                 riscv,
+                &functions,
                 functions.iter(),
                 swizzle
             ),
@@ -1498,9 +1668,11 @@ mod tests
             bridges.push_prt(
                 0,
                 0,
+                None,
                 PrtMode::Routes,
                 &table(&[(4, 1, 33)]),
                 riscv,
+                &functions,
                 functions.iter(),
                 swizzle
             ),
@@ -1514,9 +1686,11 @@ mod tests
             bridges.push_prt(
                 0,
                 0,
+                None,
                 PrtMode::Routes,
                 &routes,
                 riscv,
+                &functions,
                 functions.iter(),
                 swizzle
             ),
@@ -1539,18 +1713,19 @@ mod tests
         // INTB of device 4.
         let mut port = function((0, 0, 4, 0), 1);
         port.irq_line = 10;
-        let mut leaf = function((0, 1, 0, 0), 2);
-        leaf.host_intx = Some((2, 4));
+        port.bridge_buses = Some((1, 1));
+        let leaf = function((0, 1, 0, 0), 2);
         let functions = [port, leaf];
-        let mut unrouted = function((0, 1, 1, 0), 3);
-        unrouted.host_intx = Some((3, 4));
-        let mut elsewhere = function((1, 1, 0, 0), 2);
-        elsewhere.host_intx = Some((2, 4));
+        // INTC of device 1: INTD at the port, which the table leaves unrouted.
+        let unrouted = function((0, 1, 1, 0), 3);
+        let elsewhere = function((1, 1, 0, 0), 2);
         let no_pin = function((0, 1, 2, 0), 0);
+        let records = [port, leaf, unrouted, elsewhere, no_pin];
+        let line = |bridges: &Bridges, mode, f: &PciDevice| bridges.line(mode, &records, f);
         let programmed = |f: &PciDevice| (f.irq_line != 0).then(|| u32::from(f.irq_line));
         let pic = table(&[(4, 1, 10), (4, 2, 11)]);
         let mut bridges = Bridges::new();
-        assert_eq!(bridges.line(PrtMode::PicMode, &leaf), None);
+        assert_eq!(line(&bridges, PrtMode::PicMode, &leaf), None);
 
         let windows = vec![window(WindowKind::Bus, 0, 0x100)];
         assert_eq!(
@@ -1558,27 +1733,211 @@ mod tests
             Some(Push::Kept)
         );
         // Windows alone: no table to route by.
-        assert_eq!(bridges.line(PrtMode::PicMode, &leaf), None);
+        assert_eq!(line(&bridges, PrtMode::PicMode, &leaf), None);
         assert_eq!(
             bridges.push_prt(
                 0,
                 0,
+                None,
                 PrtMode::PicMode,
                 &pic,
                 PIC,
+                &records,
                 functions.iter(),
                 programmed
             ),
             Some(Push::Kept)
         );
-        assert_eq!(bridges.line(PrtMode::PicMode, &leaf), Some(11));
-        assert_eq!(bridges.line(PrtMode::PicMode, &port), Some(10));
+        assert_eq!(line(&bridges, PrtMode::PicMode, &leaf), Some(11));
+        assert_eq!(line(&bridges, PrtMode::PicMode, &port), Some(10));
         // No table of the other mode; a pin the table leaves unrouted; a
         // segment no bridge holds; no pin at all.
-        assert_eq!(bridges.line(PrtMode::Routes, &leaf), None);
-        assert_eq!(bridges.line(PrtMode::PicMode, &unrouted), None);
-        assert_eq!(bridges.line(PrtMode::PicMode, &elsewhere), None);
-        assert_eq!(bridges.line(PrtMode::PicMode, &no_pin), None);
+        assert_eq!(line(&bridges, PrtMode::Routes, &leaf), None);
+        assert_eq!(line(&bridges, PrtMode::PicMode, &unrouted), None);
+        assert_eq!(line(&bridges, PrtMode::PicMode, &elsewhere), None);
+        assert_eq!(line(&bridges, PrtMode::PicMode, &no_pin), None);
+    }
+
+    /// Root port A at 00:1c.0 to buses 1..=3, which has a `_PRT`; on bus 1 a
+    /// switch's upstream port to buses 2..=3; on bus 2 a downstream port at
+    /// device 1 to bus 3; on bus 3, two bridges below A's bus, a function on
+    /// INTA, hot-added (its Interrupt Line unset). Root port B at 00:1c.1 to
+    /// bus 4; on bus 4, a function on INTA. In that order.
+    fn bridge_tree() -> [PciDevice; 6]
+    {
+        let mut a = function((0, 0, 0x1C, 0), 1);
+        a.irq_line = 10;
+        a.bridge_buses = Some((1, 3));
+        let mut b = function((0, 0, 0x1C, 1), 2);
+        b.irq_line = 11;
+        b.bridge_buses = Some((4, 4));
+        let mut up = function((0, 1, 0, 0), 0);
+        up.bridge_buses = Some((2, 3));
+        let mut down = function((0, 2, 1, 0), 0);
+        down.bridge_buses = Some((3, 3));
+        [
+            a,
+            b,
+            up,
+            down,
+            function((0, 3, 0, 0), 1),
+            function((0, 4, 0, 0), 1),
+        ]
+    }
+
+    /// A's PIC-model routes, which rotate with the port: INTA of device 0 on
+    /// bus 1 is line 5, INTB 6, INTC 7, INTD 9.
+    fn a_pic() -> PrtTable
+    {
+        table(&[(0, 1, 5), (0, 2, 6), (0, 3, 7), (0, 4, 9)])
+    }
+
+    /// Push a table of the tree's host bridge, `at` naming its PCI-to-PCI
+    /// bridge, checked against every record of `records` by the line its
+    /// firmware programmed.
+    fn push_tree(
+        bridges: &mut Bridges,
+        records: &[PciDevice],
+        at: Option<Address>,
+        mode: PrtMode,
+        table: &PrtTable,
+        rule: PrtRule,
+    ) -> Option<Push>
+    {
+        let programmed = |f: &PciDevice| (f.irq_line != 0).then(|| u32::from(f.irq_line));
+        bridges.push_prt(
+            0,
+            0,
+            at,
+            mode,
+            table,
+            rule,
+            records,
+            records.iter(),
+            programmed,
+        )
+    }
+
+    #[test]
+    fn a_pci_to_pci_bridge_table_is_checked_against_the_functions_it_routes()
+    {
+        let records = bridge_tree();
+        let [a, _, _, _, deep, _] = records;
+        let a_at = address(&a);
+        let mut bridges = Bridges::new();
+        let mut push = |at, mode, table: &PrtTable, rule| {
+            push_tree(&mut bridges, &records, at, mode, table, rule)
+        };
+        // A table of a function that is no bridge, or of a bridge in another
+        // segment, is refused.
+        let deep_at = Some(address(&deep));
+        assert_eq!(
+            push(deep_at, PrtMode::PicMode, &a_pic(), PIC),
+            Some(Push::Refused(Disagreement::NotBridge))
+        );
+        assert_eq!(
+            push(Some((1, 0, 0x1C, 0)), PrtMode::PicMode, &a_pic(), PIC),
+            Some(Push::Refused(Disagreement::NotBridge))
+        );
+        // The routes wait for the bridge's PIC-model table.
+        assert_eq!(
+            push(Some(a_at), PrtMode::Routes, &a_pic(), APIC),
+            Some(Push::Refused(Disagreement::Order))
+        );
+        // The deep function's INTA is INTA at device 1 on bus 2 and INTB at
+        // device 0 on bus 1, which A's table must route: one that does not is
+        // refused.
+        assert_eq!(
+            push(Some(a_at), PrtMode::PicMode, &table(&[(0, 1, 5)]), PIC),
+            Some(Push::Refused(Disagreement::Unrouted {
+                function: address(&deep),
+                dev: 0,
+                pin: 2
+            }))
+        );
+        assert_eq!(
+            push(Some(a_at), PrtMode::PicMode, &a_pic(), PIC),
+            Some(Push::Kept)
+        );
+        assert!(bridges.routes_of(address(&deep)).is_none());
+        assert_eq!(
+            bridges
+                .routes_of(a_at)
+                .and_then(|r| r.pic.as_ref())
+                .map(|h| h.covered),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_function_takes_the_line_of_the_nearest_bridge_above_it_with_a_table()
+    {
+        let records = bridge_tree();
+        let [a, b, _, _, deep, beside] = records;
+        let mut bridges = Bridges::new();
+        let line = |bridges: &Bridges, f: &PciDevice| bridges.line(PrtMode::PicMode, &records, f);
+        assert_eq!(
+            push_tree(
+                &mut bridges,
+                &records,
+                Some(address(&a)),
+                PrtMode::PicMode,
+                &a_pic(),
+                PIC
+            ),
+            Some(Push::Kept)
+        );
+        // The root bus's table, which gives device 0x1c INTA..INTD lines 10,
+        // 11, 10, 11, checks the root ports and the function behind B, at
+        // INTA of B's device; the function behind A is A's.
+        let root_pic = table(&[(0x1C, 1, 10), (0x1C, 2, 11), (0x1C, 3, 10), (0x1C, 4, 11)]);
+        let windows = vec![window(WindowKind::Bus, 0, 0x100)];
+        assert_eq!(
+            bridges.push_windows(0, 0, windows, records.iter(), &APERTURES),
+            Some(Push::Kept)
+        );
+        assert_eq!(
+            push_tree(
+                &mut bridges,
+                &records,
+                None,
+                PrtMode::PicMode,
+                &root_pic,
+                PIC
+            ),
+            Some(Push::Kept)
+        );
+        assert_eq!(
+            bridges
+                .get(0)
+                .and_then(|h| h.pic.as_ref())
+                .map(|h| h.covered),
+            Some(3)
+        );
+        assert_eq!(line(&bridges, &deep), Some(6));
+        assert_eq!(line(&bridges, &beside), Some(10));
+        assert_eq!(line(&bridges, &a), Some(10));
+        assert_eq!(line(&bridges, &b), Some(11));
+
+        // A table of B that fails its check still marks B as routing its bus:
+        // the function behind it then has no line rather than the root bus's.
+        assert_eq!(
+            push_tree(
+                &mut bridges,
+                &records,
+                Some(address(&b)),
+                PrtMode::PicMode,
+                &table(&[]),
+                PIC
+            ),
+            Some(Push::Refused(Disagreement::Unrouted {
+                function: address(&beside),
+                dev: 0,
+                pin: 1
+            }))
+        );
+        assert_eq!(line(&bridges, &beside), None);
+        assert_eq!(line(&bridges, &deep), Some(6));
     }
 
     #[test]

@@ -7,15 +7,16 @@
 //! sleep and reset registers, load the DSDT and the SSDTs, enable ACPI mode
 //! where the platform has a legacy mode, run the module-level code and the
 //! initialization walk, then evaluate each PCI host bridge's `_PRT`, `_OSC`
-//! and `_CRS` and push the results to devmgr. The event blocks and the SCI
+//! and `_CRS`, and the `_PRT` of each PCI-to-PCI bridge below them that has
+//! one, and push the results to devmgr. The event blocks and the SCI
 //! are acquired at the start, and a start that devmgr does not report as a
 //! restart clears the events there, before anything else can fail and
 //! restart acpid. Every failure is logged and the
 //! sequence goes on with what it has; the thread then arms the events and
 //! serves (`crate::server`).
 
-use acpid::bridge::{self, Bridge, Osc};
-use acpid::hotplug::HotplugSlots;
+use acpid::bridge::{self, Bridge, Osc, PciBridge};
+use acpid::hotplug::{self, HotplugSlots};
 use acpid::{Failure, Why, walk};
 use aml::namespace::NodeId;
 use aml::{Data, Evaluator, Namespace};
@@ -82,9 +83,10 @@ fn fixed_power_button(devmgr: &Devmgr, aspace: u64) -> bool
 }
 
 /// Evaluate the loaded namespace `ns` of `tables` tables: the module-level
-/// code, the initialization walk, and each PCI host bridge's results, pushed
-/// to devmgr. Returns the hotplug slots acpid serves, behind the ports of
-/// the host bridges found ([`HotplugSlots`]).
+/// code, the initialization walk, and each PCI host bridge's results and
+/// each PCI-to-PCI bridge's `_PRT`, pushed to devmgr. Returns the hotplug
+/// slots acpid serves, behind the ports of the host bridges found
+/// ([`HotplugSlots`]).
 fn start(
     ns: &mut Namespace,
     tables: usize,
@@ -92,47 +94,120 @@ fn start(
     platform: &mut Platform<'_>,
 ) -> HotplugSlots
 {
+    let (walk, bridges, below) = {
+        let mut ev = Evaluator::new(ns, platform);
+        let module = ev.run_module_code();
+        if module.faults > 0
+        {
+            std::os::seraph::log!(
+                warn: "module-level code: {} of {} terms faulted, first {:?}",
+                module.faults,
+                module.terms,
+                module.first_fault
+            );
+        }
+        let walk = walk::initialize(&mut ev);
+        log_failures(&ev, &walk.failures);
+        let (bridges, failures) = bridge::host_bridges(&mut ev, &walk.present);
+        log_failures(&ev, &failures);
+        let (below, failures) = bridge::pci_bridges(&mut ev, &bridges, &walk.present);
+        log_failures(&ev, &failures);
+        (walk, bridges, below)
+    };
+    let below = addresses(ns, platform, below);
     let mut ev = Evaluator::new(ns, platform);
-    let module = ev.run_module_code();
-    if module.faults > 0
-    {
-        std::os::seraph::log!(
-            warn: "module-level code: {} of {} terms faulted, first {:?}",
-            module.faults,
-            module.terms,
-            module.first_fault
-        );
-    }
-    let walk = walk::initialize(&mut ev);
-    log_failures(&ev, &walk.failures);
-    let (bridges, failures) = bridge::host_bridges(&mut ev, &walk.present);
-    log_failures(&ev, &failures);
-    // devmgr checks a `_PRT` against the functions on the buses of the
-    // bridge's windows, so the windows go first.
+    // devmgr checks a host bridge's `_PRT` against the functions on the buses
+    // of its windows, so the windows go first; and the functions a
+    // PCI-to-PCI bridge's table routes are not its host bridge's, so the
+    // PCI-to-PCI bridges' tables go before, the deepest first.
     for b in &bridges
     {
         push_windows(&mut ev, devmgr, *b);
     }
     if let Some(model) = arch::current::APIC_MODEL
     {
+        for (p, at) in &below
+        {
+            push_routes(
+                &mut ev,
+                devmgr,
+                p.node,
+                (p.route.segment, p.route.bus, *at),
+                devmgr_labels::PRT_PIC_MODE,
+            );
+        }
         for b in &bridges
         {
-            push_routes(&mut ev, devmgr, *b, devmgr_labels::PRT_PIC_MODE);
+            push_routes(
+                &mut ev,
+                devmgr,
+                b.node,
+                (b.segment, b.bus, devmgr_labels::PRT_ROOT_BUS),
+                devmgr_labels::PRT_PIC_MODE,
+            );
         }
         select_model(&mut ev, model);
+    }
+    for (p, at) in &below
+    {
+        push_routes(
+            &mut ev,
+            devmgr,
+            p.node,
+            (p.route.segment, p.route.bus, *at),
+            devmgr_labels::PRT_ROUTES,
+        );
     }
     for b in &bridges
     {
         push_osc(&mut ev, devmgr, *b);
-        push_routes(&mut ev, devmgr, *b, devmgr_labels::PRT_ROUTES);
+        push_routes(
+            &mut ev,
+            devmgr,
+            b.node,
+            (b.segment, b.bus, devmgr_labels::PRT_ROOT_BUS),
+            devmgr_labels::PRT_ROUTES,
+        );
     }
     std::os::seraph::log!(
-        "ready: {tables} tables, {} devices present, {} _INI run, {} host bridges",
+        "ready: {tables} tables, {} devices present, {} _INI run, {} host bridges, {} PCI-to-PCI bridges with a _PRT",
         walk.present.len(),
         walk.initialized,
-        bridges.len()
+        bridges.len(),
+        below.len()
     );
     HotplugSlots::new(bridges)
+}
+
+/// Each of the PCI-to-PCI bridges `below` with its address, as
+/// `devmgr_labels::pci_function` packs it: each bridge above it read for
+/// its Secondary Bus Number through `platform` (`hotplug::port`). A bridge
+/// whose address cannot be read is left out, logged.
+fn addresses(
+    ns: &Namespace,
+    platform: &mut Platform<'_>,
+    below: Vec<PciBridge>,
+) -> Vec<(PciBridge, u64)>
+{
+    let mut found = Vec::with_capacity(below.len());
+    for p in below
+    {
+        match hotplug::port(&p.route, |f| hotplug::secondary_bus(platform, f))
+        {
+            Some(at) => found.push((
+                p,
+                devmgr_labels::pci_function(at.segment, at.bus, at.device, at.function),
+            )),
+            None =>
+            {
+                std::os::seraph::log!(
+                    warn: "{}: a bridge above it reads no bus; its _PRT is not pushed",
+                    path(ns, p.node)
+                );
+            }
+        }
+    }
+    found
 }
 
 /// Load the DSDT, then each SSDT devmgr serves, and parse their methods; the
@@ -331,19 +406,27 @@ fn push_windows(ev: &mut Evaluator<'_>, devmgr: &Devmgr, b: Bridge)
     );
 }
 
-/// Evaluate `bridge`'s `_PRT` in the model selected now and push it as
-/// `mode`.
-fn push_routes(ev: &mut Evaluator<'_>, devmgr: &Devmgr, b: Bridge, mode: u64)
+/// Evaluate the `_PRT` of `node`, a host bridge or a PCI-to-PCI bridge, in
+/// the model selected now and push it as `mode`, under `(segment, bus,
+/// bridge)`: the host bridge's segment and bus and `PRT_TABLE`'s
+/// `data[4]`, `PRT_ROOT_BUS` or the PCI-to-PCI bridge's address.
+fn push_routes(
+    ev: &mut Evaluator<'_>,
+    devmgr: &Devmgr,
+    node: NodeId,
+    (segment, bus, bridge): (u16, u8, u64),
+    mode: u64,
+)
 {
-    let at = path(ev.namespace(), b.node);
-    let routes = match bridge::routes(ev, b.node)
+    let at = path(ev.namespace(), node);
+    let routes = match bridge::routes(ev, node)
     {
         Ok(Some(routes)) => routes,
         Ok(None) => return std::os::seraph::log!(warn: "{at} has no _PRT"),
         Err(why) => return std::os::seraph::log!(warn: "{at}._PRT failed: {why:?}"),
     };
     log_failures(ev, &routes.failures);
-    let mut words = vec![mode];
+    let mut words = vec![mode, bridge];
     words.extend(routes.lanes);
     let what = if mode == devmgr_labels::PRT_PIC_MODE
     {
@@ -354,7 +437,7 @@ fn push_routes(ev: &mut Evaluator<'_>, devmgr: &Devmgr, b: Bridge, mode: u64)
         "_PRT"
     };
     report(
-        devmgr.push(devmgr_labels::PRT_TABLE, b.segment, b.bus, &words),
+        devmgr.push(devmgr_labels::PRT_TABLE, segment, bus, &words),
         &at,
         what,
     );

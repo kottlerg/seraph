@@ -61,21 +61,23 @@ pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Vtd;
 
 /// GSI for PCI function `function`, whose config-space IRQ line is unset (a
 /// function hot-added after the firmware ran): the line the PIC-model
-/// `_PRT` acpid pushed for its host bridge, which devmgr holds in
-/// `bridges`, routes the `INTx` pin and device number its interrupt
-/// reaches the root bus with to (`PciDevice::host_intx`;
-/// [`firmware::acpid::Bridges::line`]). That is the line the firmware writes
+/// `_PRT` acpid pushed, which devmgr holds in `bridges`, routes its `INTx`
+/// to: that of the nearest PCI-to-PCI bridge above it in `records` acpid
+/// pushed one for, else its host bridge's, at the pin and device number its
+/// interrupt reaches that bridge's bus with
+/// ([`firmware::acpid::Bridges::line`]). That is the line the firmware writes
 /// into a boot function's Interrupt Line register, which devmgr gives a boot
 /// function, so the function shares lines as a boot function at its place
 /// would; the APIC-model routes name other GSIs on the same PIRQ wires.
-/// Returns `None` while devmgr holds no PIC-model table for the bridge, and
+/// Returns `None` while devmgr holds no PIC-model table for that bridge, and
 /// for a pin the table does not route.
 pub fn intx_fallback_gsi(
     function: &firmware::scan::PciDevice,
+    records: &[firmware::scan::PciDevice],
     bridges: &firmware::acpid::Bridges,
 ) -> Option<u32>
 {
-    bridges.line(firmware::acpid::PrtMode::PicMode, function)
+    bridges.line(firmware::acpid::PrtMode::PicMode, records, function)
 }
 
 /// Carve an `IoPort` cap over ports `base..base + count` out of devmgr's

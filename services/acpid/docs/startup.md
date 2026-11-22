@@ -62,15 +62,21 @@ no endpoint parks it.
    functioning has its children walked; one absent and not functioning is skipped with its
    children. A `_STA` that faults or returns no integer counts as absent and not functioning.
 5. **Host bridges**: each present device whose `_HID` or `_CID` is `PNP0A03` or
-   `PNP0A08`, with its `_SEG` and `_BBN` (0 when absent).
-6. **Windows**: each bridge's `_CRS` windows, pushed as `BRIDGE_WINDOWS`. devmgr checks a
-   `_PRT` against the functions on the buses of the windows it holds, so they go first.
-7. **PIC-model routes** (x86-64). acpid evaluates each bridge's `_PRT` and pushes it as
-   `PRT_PIC_MODE`, then selects the APIC model with `\_PIC(1)` (§ Interrupt model).
-8. **Per bridge**: `_OSC`, pushed as `OSC_RESULT`; the `_PRT`, pushed as `PRT_TABLE` mode
-   `PRT_ROUTES` ([devmgr.md](devmgr.md) § Pushes).
+   `PNP0A08`, with its `_SEG` and `_BBN` (0 when absent); and each present device below one
+   that has a `_PRT` and is reached from it through devices with an `_ADR`, a PCI-to-PCI
+   bridge, whose address acpid reads through the Secondary Bus Number of each bridge above it.
+6. **Windows**: each host bridge's `_CRS` windows, pushed as `BRIDGE_WINDOWS`. devmgr checks
+   a host bridge's `_PRT` against the functions on the buses of the windows it holds, so they
+   go first.
+7. **PIC-model routes** (x86-64). acpid evaluates each PCI-to-PCI bridge's `_PRT`, the deepest
+   first, then each host bridge's, and pushes each as `PRT_PIC_MODE`; it then selects the APIC
+   model with `\_PIC(1)` (§ Interrupt model). devmgr checks a table against the functions it
+   routes, those no deeper table routes, so the deeper ones go first.
+8. **Per bridge**: each PCI-to-PCI bridge's `_PRT`, in the same order, pushed as `PRT_TABLE`
+   mode `PRT_ROUTES`; then for each host bridge `_OSC`, pushed as `OSC_RESULT`, and the
+   `_PRT`, pushed as `PRT_TABLE` mode `PRT_ROUTES` ([devmgr.md](devmgr.md) § Pushes).
 9. acpid logs a `ready:` line with the tables loaded, the devices present, the `_INI` methods
-   run and the bridges found.
+   run, the host bridges found and the PCI-to-PCI bridges with a `_PRT`.
 10. **Arm and serve** (§ Threads): on x86-64 the evaluation thread starts the event thread,
     which binds the event blocks and registers the SCI, arms the events and dispatches those a
     restart finds pending ([README.md](../README.md) § Events); without a loaded DSDT no GPE is
@@ -133,7 +139,9 @@ On QEMU q35 these refusals follow, each logged and none fatal:
 
 Evaluation fails closed: a fault or a value of the wrong shape is logged with the object's path
 and the sequence goes on with what it has. A bridge whose `_OSC` fails is pushed as not
-evaluated; one whose `_CRS` or `_PRT` fails or is absent has nothing pushed for it. A `_CRS`
+evaluated; one whose `_CRS` or `_PRT` fails or is absent has nothing pushed for it, and a
+PCI-to-PCI bridge whose `_ADR`, or that of a device above it, fails, or a bridge above which
+reads no Secondary Bus Number, has no `_PRT` pushed. A `_CRS`
 with more windows than devmgr takes (`MAX_BRIDGE_WINDOWS`) is refused by acpid. A `_PRT`
 entry of the wrong shape, or naming a link device that cannot be resolved, is logged and its pin
 left unrouted.

@@ -201,17 +201,45 @@ fn address(device: &PciDevice) -> (u16, u8, u8, u8)
 }
 
 /// The `INTx` pin and device number `function`'s interrupt pin reaches its
-/// root bus with: its own on a root bus; behind bridges, the pin swizzled at
-/// each bridge on the way up by the device number below it, and the device
-/// number of the bridge on the root bus (PCI-to-PCI Bridge Architecture
-/// Specification § 9.1). A bridge is one of `records`, in `function`'s
-/// segment, whose secondary bus is the bus the walk is on; a bus no such
-/// bridge leads to is a root bus. A bridge whose secondary bus is not above
-/// its own bus is not configured and leads nowhere, so every step climbs to a
-/// lower bus and the walk ends. `None` for a function with no pin
-/// (`INTA`..=`INTD`, 1..=4).
+/// root bus with ([`intx_route`] with no bridge routing it).
 #[must_use]
 pub fn host_intx(records: &[PciDevice], function: &PciDevice) -> Option<(u8, u8)>
+{
+    intx_route(records, function, |_| false).map(|route| (route.pin, route.dev))
+}
+
+/// Where a function's `INTx` is routed: on the secondary bus of a
+/// PCI-to-PCI bridge that routes it, or on its root bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntxRoute
+{
+    /// The address (segment, bus, device, function) of the bridge whose
+    /// secondary bus the interrupt is routed on; `None` for the root bus.
+    pub bridge: Option<(u16, u8, u8, u8)>,
+    /// The bus: the bridge's secondary bus, or the root bus.
+    pub bus: u8,
+    /// The pin, `INTA`..=`INTD` (1..=4), the interrupt reaches that bus with.
+    pub pin: u8,
+    /// The device number on that bus it reaches it at.
+    pub dev: u8,
+}
+
+/// Where `function`'s interrupt pin is routed: walking up from its bus, on
+/// the secondary bus of the first bridge `routes` holds for one that routes
+/// its own buses (a PCI-to-PCI bridge with a `_PRT`), else on its root bus;
+/// the pin swizzled at each bridge passed on the way by the device number
+/// below it (PCI-to-PCI Bridge Architecture Specification § 9.1). A bridge is
+/// one of `records`, in `function`'s segment, whose secondary bus is the bus
+/// the walk is on; a bus no such bridge leads to is a root bus. A bridge whose
+/// secondary bus is not above its own bus is not configured and leads
+/// nowhere, so every step climbs to a lower bus and the walk ends. `None` for
+/// a function with no pin (`INTA`..=`INTD`, 1..=4).
+#[must_use]
+pub fn intx_route(
+    records: &[PciDevice],
+    function: &PciDevice,
+    routes: impl Fn((u16, u8, u8, u8)) -> bool,
+) -> Option<IntxRoute>
 {
     if !(1..=4).contains(&function.irq_pin)
     {
@@ -224,11 +252,25 @@ pub fn host_intx(records: &[PciDevice], function: &PciDevice) -> Option<(u8, u8)
                 .is_some_and(|(secondary, _)| secondary == bus && secondary > b.bus)
     })
     {
+        if routes(address(bridge))
+        {
+            return Some(IntxRoute {
+                bridge: Some(address(bridge)),
+                bus,
+                pin,
+                dev,
+            });
+        }
         pin = swizzle(pin, dev);
         dev = bridge.dev;
         bus = bridge.bus;
     }
-    Some((pin, dev))
+    Some(IntxRoute {
+        bridge: None,
+        bus,
+        pin,
+        dev,
+    })
 }
 
 /// The pin on a bridge's primary side that pin `pin` (1..=4) of device
@@ -403,6 +445,57 @@ mod tests
         // The bridges themselves, on their own pins.
         assert_eq!(route((0, 1, 0, 0)), Some((1, 3)));
         assert_eq!(route((0, 0, 3, 0)), Some((1, 3)));
+    }
+
+    #[test]
+    fn a_bridge_that_routes_its_buses_ends_the_walk_at_its_secondary_bus()
+    {
+        // Root port 00:1c.0 to buses 1..=3; on bus 1, a switch's upstream port
+        // 01:00.0 to buses 2..=3; on bus 2, a downstream port 02:01.0 to bus 3;
+        // on bus 3, a function 03:00.0 on INTB.
+        let records = PciRecords::new(vec![
+            function((0, 0, 0x1C, 0), 1, Some((1, 3))),
+            function((0, 1, 0, 0), 1, Some((2, 3))),
+            function((0, 2, 1, 0), 1, Some((3, 3))),
+            function((0, 3, 0, 0), 2, None),
+        ])
+        .expect("allocated");
+        let leaf = records.devices()[3];
+        let route = |routes: &[(u16, u8, u8, u8)]| {
+            intx_route(records.devices(), &leaf, |at| routes.contains(&at))
+        };
+        // No bridge routes: INTB of device 0 on bus 3, INTB at device 1 on
+        // bus 2, INTC at device 0 on bus 1, INTC at the root port 00:1c.
+        assert_eq!(
+            route(&[]),
+            Some(IntxRoute {
+                bridge: None,
+                bus: 0,
+                pin: 3,
+                dev: 0x1C
+            })
+        );
+        // The root port routes its buses: the walk ends on bus 1, the pin
+        // swizzled across the two switch ports only.
+        assert_eq!(
+            route(&[(0, 0, 0x1C, 0)]),
+            Some(IntxRoute {
+                bridge: Some((0, 0, 0x1C, 0)),
+                bus: 1,
+                pin: 3,
+                dev: 0
+            })
+        );
+        // The nearest bridge that routes wins.
+        assert_eq!(
+            route(&[(0, 0, 0x1C, 0), (0, 2, 1, 0)]),
+            Some(IntxRoute {
+                bridge: Some((0, 2, 1, 0)),
+                bus: 3,
+                pin: 2,
+                dev: 0
+            })
+        );
     }
 
     #[test]

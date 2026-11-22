@@ -78,11 +78,12 @@ pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Riscv;
 /// with (`PciDevice::host_intx`: its own on the root bus, swizzled at each
 /// bridge behind it): the QEMU `virt` PCI host's swizzle onto APLIC sources
 /// 32..=35 (firmware leaves the IRQ line 0 there). acpid's `_PRT` routes in
-/// `bridges` are not read: devmgr checks them against this swizzle
+/// `bridges`, and `records`, are not read: devmgr checks them against this swizzle
 /// ([`prt_rule`]). Returns `None` for a function with no pin or a pin
 /// outside `INTA`..=`INTD` (1..=4).
 pub fn intx_fallback_gsi(
     function: &firmware::scan::PciDevice,
+    _records: &[firmware::scan::PciDevice],
     _bridges: &firmware::acpid::Bridges,
 ) -> Option<u32>
 {

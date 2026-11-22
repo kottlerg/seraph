@@ -237,9 +237,10 @@ It takes the next ordinal of its class, and a bound driver signals the class's w
 
 A hot-added function's `INTx` route is computed through the bridges of the records
 (`PciRecords::append`). On x86-64 no firmware programmed its Interrupt Line, so devmgr gives
-it the line that the PIC-model `_PRT` table of its host bridge (`PRT_PIC_MODE`, which acpid reads
-before `_PIC(1)`) routes to the pin and root-bus device number its interrupt reaches the root bus
-with (`firmware::acpid::Bridges::line`). A boot function uses the PIC-model line the firmware
+it the line that the PIC-model `_PRT` table that routes it (`PRT_PIC_MODE`, which acpid reads
+before `_PIC(1)`) gives the pin and device number its interrupt reaches that table's bus with:
+the table of the nearest PCI-to-PCI bridge above it that has one, or its host bridge's
+(`firmware::acpid::Bridges::line`). A boot function uses the PIC-model line the firmware
 programmed, so the hot-added one shares lines as a boot function at its place would. It has no
 wired line when devmgr holds no PIC-model table for the bridge or the table does not route the
 pin; it is then given message-signaled vectors where its driver's declaration takes them, and a

@@ -9,7 +9,7 @@
 //! and the event blocks and the SCI.
 //!
 //! The firmware hands over in the PIC model, with `SCI_EN` possibly clear.
-//! acpid reads each host bridge's `_PRT` in that model first, whose link
+//! acpid reads each bridge's `_PRT`, host or PCI-to-PCI, in that model first, whose link
 //! devices report the PIRQ routing the firmware programmed, then selects the
 //! APIC model with `_PIC(1)` and reads the routes again.
 

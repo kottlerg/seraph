@@ -12,10 +12,12 @@
 use core::prelude::rust_2024::*;
 
 /// Create a new process from a signed object in a Memory cap, a boot
-/// module's. Caps: `[module, creator_endpoint?, charge_node?, argv_env?,
-/// death_relay?]`, `charge_node` present iff [`CREATE_CHARGE_NODE`] is
-/// set, `argv_env` iff [`CREATE_ARGV_ENV`] is set, and `death_relay` iff
-/// [`CREATE_DEATH_RELAY`] is set, as for [`CREATE_FROM_FILE`]. Data word
+/// module's. Caps: `[module, creator_endpoint?, charge_node?, argv_env? |
+/// object?, death_relay?]`, `charge_node` present iff
+/// [`CREATE_CHARGE_NODE`] is set, `argv_env` iff [`CREATE_ARGV_ENV`] is
+/// set, the checkpoint's `object` handle iff [`CREATE_RESTORE`] is set,
+/// and `death_relay` iff [`CREATE_DEATH_RELAY`] is set, placed as for
+/// [`CREATE_FROM_FILE`]. Data word
 /// 0 is the object's exact length in bytes, which the cap, a whole number
 /// of pages, must hold; the words after it are laid out as for
 /// [`CREATE_FROM_FILE`], the name block ([`create_name_word`]) last.
@@ -76,12 +78,15 @@ pub const START_PROCESS: u64 = 2;
 /// Reply: `data[0]` is the max the child's memmgr budget node took after
 /// memmgr's clamp, `u64::MAX` for none.
 ///
-/// Caps: `[file_cap, creator_endpoint?, charge_node?, argv_env?,
+/// Caps: `[file_cap, creator_endpoint?, charge_node?, argv_env? | object?,
 /// death_relay?]`. The `charge_node` handle is present iff
 /// [`CREATE_CHARGE_NODE`] is set, and sits directly before the
-/// `argv_env` cap, or before the relay without one, or last without
-/// either. The `argv_env` Memory cap is present iff [`CREATE_ARGV_ENV`]
-/// is set, and sits directly before the relay, or last without one. `file_cap`
+/// `argv_env` cap or the `object` handle, or before the relay without
+/// either, or last without any of them. The `argv_env` Memory cap is
+/// present iff [`CREATE_ARGV_ENV`] is set, and the checkpoint's `object`
+/// handle iff [`CREATE_RESTORE`] is set; the two flags exclude each other,
+/// and the one present sits directly before the relay, or last without
+/// one. `file_cap`
 /// ownership transfers to procmgr: procmgr opens it (`FS_OPEN`) and
 /// `cap_delete`s it, then `FS_CLOSE`s and deletes its open after the load
 /// (success or failure); a request refused before the open deletes
@@ -223,7 +228,8 @@ pub const CREATE_RESERVE: u64 = 1 << 32;
 pub const CREATE_NODE_HANDLE: u64 = 1 << 33;
 /// Label flag (bit 34) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
 /// request carries a node handle (`memmgr_labels::NODE_HANDLE_TAG`) as a
-/// tail cap, before the argv/env and death-relay caps, and the child's
+/// tail cap, directly before the argv/env cap or the [`CREATE_RESTORE`]
+/// object handle and before the death-relay cap, and the child's
 /// budget node is made under the node it names instead of under the
 /// creator's, so every process created on one handle shares that node's
 /// max. procmgr passes the handle to memmgr with

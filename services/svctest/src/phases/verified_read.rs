@@ -65,11 +65,6 @@ fn sub_node_pages() -> u64
     subtree.saturating_sub(own)
 }
 
-/// How long the phase waits for the charge of procmgr's read session to
-/// leave this process's subtree once the read is answered. A test wait
-/// bound.
-const SESSION_SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// What a refused read asks for: the name, the length (the size hint when
 /// `None`) and the role.
 struct Request<'a>
@@ -140,22 +135,12 @@ fn procmgr_read_verified_phase(_caps: &Caps)
         after.saturating_add(pages) <= held,
         "verified read: the copy's {pages} pages not released ({held} -> {after})"
     );
-    let start = std::time::Instant::now();
-    loop
-    {
-        crate::phases::memmgr::recheck_deferred();
-        let now = sub_node_pages();
-        if now == sessions_before
-        {
-            break;
-        }
-        assert!(
-            start.elapsed() < SESSION_SETTLE,
-            "verified read: the read session's charge stayed on this process's subtree \
-             ({sessions_before} -> {now} pages)"
-        );
-        std::thread::yield_now();
-    }
+    // procmgr's close ended the read session before it answered.
+    let now = sub_node_pages();
+    assert_eq!(
+        now, sessions_before,
+        "verified read: the read session's charge stayed on this process's subtree after the reply"
+    );
 
     expect_refused(
         VERIFIED_PATH,

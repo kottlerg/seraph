@@ -8,7 +8,8 @@
 //! The fs driver evicts cached pages by sending `FS_RELEASE_MEMORY` on
 //! a badged SEND derived from the per-process release endpoint owned
 //! by this module. Each opened file's SEND travels to the driver in
-//! `caps[0]` of the file's [`fs_labels::FS_OPEN`] (see
+//! `caps[1]` of the file's [`fs_labels::FS_OPEN`], after its session cap in
+//! `caps[0]` (see
 //! [`super::File::open`]), and the driver's eviction worker sends each
 //! page's release on the SEND of the open that read it
 //! (services/fs/docs/fs-driver-protocol.md § Label 8), so the handler

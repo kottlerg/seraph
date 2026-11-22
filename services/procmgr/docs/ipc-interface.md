@@ -647,9 +647,12 @@ charged to the opener's client ([fs-driver-protocol.md](../../fs/docs/fs-driver-
 makes a sub-node of the account the copy is granted on (`CREATE_SUB_NODE` on that account's memmgr
 SEND: the child's for a create), with a max of `READ_SESSION_MAX_PAGES` (one page,
 `process-table/src/fs_reads.rs`), sends a charge-only handle to it (`NODE_CHARGE_HANDLE`) in
-`FS_SESSION`, and opens the file with the session cap. After the `FS_CLOSE` it deletes the session's
-liveness cap, releases the sub-node (`NODE_RELEASE`) and deletes its handle, so the server ends the
-session, and the charge returns to the account, at its next sweep. The max is one page by design:
+`FS_SESSION`, and opens the file with the session cap. Once the copy is done it deletes the
+session's liveness cap and then `FS_CLOSE`s the open, the session's last, so the server ends the
+session before it replies (fs-driver-protocol.md § Label 3) and the charge is back on the account
+before procmgr answers the request; it then releases the sub-node (`NODE_RELEASE`) and deletes its
+handle, which ends the session at the server's next sweep when the close did not reach it. The max
+is one page by design:
 the node is not procmgr's own but the creator's, charged per read, and one page holds the session,
 its one open and the one page procmgr holds, while it bounds what a server procmgr does not trust
 can charge the account for a read. A max refusal of the session or the open (`fs_errors::LIMIT`)
@@ -1571,9 +1574,9 @@ its own memmgr cap; its death releases the run with its record.
 | 21 | `LIMIT` | The max of the sender's budget node or of an ancestor refused the run (`memmgr_errors::LIMIT`), or the read session or its open (§ Label 13, **Read session**) |
 
 svctest's `procmgr_read_verified` phase reads its data-role fixture back and checks the copy's
-charge and that the read session's charge leaves the sender's subtree, and the refusal of the
-fixture under another name, of a copy with a flipped byte, of an unsigned file, of a file past the
-bound and of a zero length.
+charge and that the read session's charge has left the sender's subtree when the reply arrives,
+and the refusal of the fixture under another name, of a copy with a flipped byte, of an unsigned
+file, of a file past the bound and of a zero length.
 
 ### Label 32: `MAKE_PRIVATE`
 

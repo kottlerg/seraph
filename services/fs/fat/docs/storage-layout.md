@@ -100,7 +100,8 @@ each mutation in [crash-safety.md](crash-safety.md).
   Notification registered with memmgr (`REGISTER_DONATION_END`) and has the dispatch loop sweep the
   sessions; `FS_SESSION`, on the schedule `fat_parse::sweep::SweepSchedule` sets, and
   `FS_UNMOUNT` sweep them too
-  ([fs-driver-protocol.md § Label 23](../../docs/fs-driver-protocol.md#label-23-fs_session)).
+  ([fs-driver-protocol.md § Label 23](../../docs/fs-driver-protocol.md#label-23-fs_session)),
+  and an `FS_CLOSE` that empties a session whose liveness cap is gone ends that session.
 * **Eviction worker** (`src/eviction.rs`): the read-side cooperative release. It sends
   `FS_RELEASE_MEMORY`, waits up to 100 ms for the ack, then revokes the page's caps and drops the
   slot. The send runs on a watchdog thread, which a client that never replies leaves blocked; with

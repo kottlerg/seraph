@@ -13,8 +13,10 @@ pub const FS_READ: u64 = 2;
 /// outstanding [`FS_READ_MEMORY`] pages, deletes its recorded release
 /// SEND, frees its record in its session's pages, and retires the open,
 /// so the open cap answers `fs_errors::INVALID_BADGE` from then on.
-/// Other opens of the file are untouched. A node cap is answered
-/// `fs_errors::INVALID_BADGE`. The caller still cap-deletes the open cap
+/// Other opens of the file are untouched. A close that leaves its session
+/// with no open, the session's liveness cap held nowhere outside the
+/// driver, ends the session before the reply, its pages given back. A node
+/// cap is answered `fs_errors::INVALID_BADGE`. The caller still cap-deletes the open cap
 /// to drop the kernel-side reference. Specified in `services/fs/docs/fs-driver-protocol.md`
 /// § Label 3: `FS_CLOSE`.
 pub const FS_CLOSE: u64 = 3;

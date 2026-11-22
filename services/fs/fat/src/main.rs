@@ -57,7 +57,9 @@
 //! copy of its liveness cap any more, with one `CAP_INFO_SOLE_REFERENCE`
 //! inquiry per live session, and gives their pages back. Signals that come
 //! while a sweep is pending coalesce into it. Sessions are swept too on a
-//! schedule of `FS_SESSION` requests (`fat_parse::sweep::SweepSchedule`).
+//! schedule of `FS_SESSION` requests (`fat_parse::sweep::SweepSchedule`),
+//! and an `FS_CLOSE` that empties a session ends it when its liveness cap is
+//! gone (`Opens::close`).
 //!
 //! Cache coherence: writes go through write-through
 //! ([`cache::PageCache::write_sector`]) so any outstanding

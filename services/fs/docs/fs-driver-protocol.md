@@ -378,12 +378,16 @@ release of a node the driver holds a charged grant on, or the death of the
 node's owner), on `FS_SESSION` once the sessions made since its last sweep
 reach the larger of 64 and the live sessions that sweep left, so a sweep
 costs at most two inquiries per session made, and at
-[`FS_UNMOUNT`](#label-19-fs_unmount). A client ends a session by deleting
-its liveness cap and then releasing the session's node (`NODE_RELEASE`),
-which signals the driver; a session whose liveness cap is deleted and whose
-node lives on ends at the next sweep. Until the session ends its pages stay
-charged to its node, after the node's release too, and a page it needs then
-is refused with `INVALID_ARGUMENT`. When the driver dies, memmgr returns
+[`FS_UNMOUNT`](#label-19-fs_unmount). It reads one session so at an
+[`FS_CLOSE`](#label-3-fs_close) that closes the session's last open. A client
+ends a session by deleting its liveness cap and then releasing the session's
+node (`NODE_RELEASE`), which signals the driver; a session whose liveness
+cap is deleted and whose node lives on ends at the next sweep, or at the close
+of its last open. A client that deletes its liveness cap before it closes the
+session's last open has the session ended by that close, its charge returned
+before the reply. Until the session ends its pages stay charged to its node,
+after the node's release too, and a page it needs then is refused with
+`INVALID_ARGUMENT`. When the driver dies, memmgr returns
 every page of its sessions, and the charge, to the nodes they were charged
 to ([§ Driver exit](#driver-exit)).
 
@@ -701,7 +705,11 @@ its file. The open cap is **not** freed here — the holder still
 pages: a page other than the session's first goes back to
 memmgr, its charge with it, when its last record goes
 ([§ Label 23](#label-23-fs_session)); the session lives on with its
-other opens.
+other opens. A close that leaves a session with no open, when its client
+holds no copy of the session's liveness cap any more, ends the session as a
+sweep would before the driver replies, so its whole charge is back on its
+node when the reply arrives ([§ Label 23](#label-23-fs_session), Session
+end).
 
 **Request**
 

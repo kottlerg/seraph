@@ -276,8 +276,12 @@ impl Opens
         true
     }
 
-    /// Close the open: release its pages and its release SEND. `false` when
-    /// it is not live.
+    /// Close the open: release its pages and its release SEND. When it was
+    /// the last open of a session whose client holds no copy of its liveness
+    /// cap any more, end that session too, as a sweep would, so its pages
+    /// are given back before the close is answered: one
+    /// `CAP_INFO_SOLE_REFERENCE` inquiry per close that empties a session.
+    /// `false` when the open is not live.
     pub fn close(&mut self, open: OpenRef, cache: &PageCache) -> bool
     {
         let Some(l) = self.sessions.open(open.0)
@@ -285,9 +289,18 @@ impl Opens
         {
             return false;
         };
+        let session = self.sessions.session_of(l);
         if let Some(removed) = self.sessions.remove_open(l)
         {
             self.release_removed(removed, cache);
+        }
+        if let Some(session) = session
+        {
+            let fields = self.sessions.session_fields(session);
+            if fields.opens == 0 && sole_reference(fields.liveness_cap)
+            {
+                self.end_session(session, cache);
+            }
         }
         true
     }

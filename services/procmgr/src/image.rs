@@ -459,9 +459,10 @@ pub fn read_module(
 /// names into a buffer granted on `memmgr` in `shape`: start a session with
 /// the file's server charged to that same account ([`ReadSession`]), open
 /// the file in it (`FS_OPEN`), copy each cache page `FS_READ_MEMORY` lends
-/// (`FS_RELEASE_MEMORY` right after), close the open (`FS_CLOSE`), and end
-/// the session. The node cap is deleted, the open closed and the session
-/// ended, and their caps deleted, on every outcome.
+/// (`FS_RELEASE_MEMORY` right after), delete the session's liveness cap and
+/// close the open (`FS_CLOSE`), which ends the session at the server, and
+/// release the session's node. The node cap is deleted, the open closed and
+/// the session ended, and their caps deleted, on every outcome.
 ///
 /// # Errors
 /// `LIMIT` when the max of the account's node, or of an ancestor's, refuses
@@ -481,7 +482,7 @@ pub fn read_file(
 {
     // Dropped after the open, which closes first: the session ends with no
     // open in it.
-    let (session, session_cap) = match ReadSession::start(node_cap, memmgr, ipc_buf)
+    let (mut session, session_cap) = match ReadSession::start(node_cap, memmgr, ipc_buf)
     {
         Ok(started) => started,
         Err(code) =>
@@ -490,9 +491,24 @@ pub fn read_file(
             return Err(code);
         }
     };
+    let liveness = session.take_liveness();
     let _session = std::mem::DropGuard::new(session, move |s| s.end(ipc_buf));
-    let file = vfs_open(node_cap, session_cap, ipc_buf)?;
+    let file = match vfs_open(node_cap, session_cap, ipc_buf)
+    {
+        Ok(file) => file,
+        Err(code) =>
+        {
+            let _ = syscall::cap_delete(liveness);
+            return Err(code);
+        }
+    };
     let file = std::mem::DropGuard::new(file, move |file| vfs_close(file, ipc_buf));
+    // Dropped before the open: the close then finds the session's liveness
+    // cap gone and ends the session (fs-driver-protocol.md § Label 3), so its
+    // charge has left the account before the read is answered.
+    let liveness = std::mem::DropGuard::new(liveness, |cap| {
+        let _ = syscall::cap_delete(cap);
+    });
     let mut buffer = ImageBuffer::new(self_aspace, memmgr, len, ipc_buf, shape)?;
     let dst = buffer.bytes_mut();
     let mut copied = 0usize;
@@ -507,6 +523,7 @@ pub fn read_file(
         // `chunk` is at most `dst.len() - copied`.
         copied = copied.saturating_add(chunk);
     }
+    drop(liveness);
     drop(file);
     Ok(buffer)
 }
@@ -724,10 +741,18 @@ impl ReadSession
         }
     }
 
-    /// End the session: delete its liveness cap, so the server ends it, then
-    /// release the sub-node (`NODE_RELEASE`), which tells a server holding a
-    /// grant charged to it, and delete the handle. The charge returns to the
-    /// account when the server ends the session.
+    /// The session's liveness cap, which the caller now deletes before it
+    /// closes the session's open, so the close ends the session.
+    fn take_liveness(&mut self) -> u64
+    {
+        std::mem::take(&mut self.liveness)
+    }
+
+    /// End the session: delete its liveness cap, unless the caller took it,
+    /// so the server ends it, then release the sub-node (`NODE_RELEASE`),
+    /// which tells a server holding a grant charged to it, and delete the
+    /// handle. The charge returns to the account when the server ends the
+    /// session: at once when the close of its open already did.
     fn end(self, ipc_buf: *mut u64)
     {
         if self.liveness != 0

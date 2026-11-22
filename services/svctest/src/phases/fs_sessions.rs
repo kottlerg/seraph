@@ -13,10 +13,11 @@
 //! that opens in the session take further pages there until the node's max
 //! refuses one with `LIMIT`, while a session on a sibling node, and an open
 //! in svctest's own session (the one std keeps), still open; that the extra
-//! page returns when the opens close and the first when the session ends,
-//! which a release of its node signals to fatfs once the session's liveness
-//! cap is gone; and that a session whose liveness cap is held outlives that
-//! sweep. A `fs-session-client` child ([`session_client_main`]) makes a
+//! page returns when the opens close, and the first when the close of the
+//! last open finds the session's liveness cap gone, before that close is
+//! answered; that a session whose liveness cap is held outlives that close's
+//! end of another; and that a session whose liveness cap is gone but which
+//! keeps an open ends at the sweep its node's release signals to fatfs. A `fs-session-client` child ([`session_client_main`]) makes a
 //! session on a node of its own and exits holding it, opens and a held page
 //! included: its death returns the charge. It also checks the refusals: a
 //! session with no handle or with a cap that is no node handle, a first page
@@ -379,9 +380,10 @@ fn end_session(opens: &[u64], liveness: u64, node: u64, what: &str)
 /// A session charged to node A takes a page there for its first, and opens
 /// in it take one more, until A's max refuses with `LIMIT`; a session on
 /// node B and svctest's own session still open. The extra page returns when
-/// the opens close, the first when the session ends with its liveness cap and
-/// node, while B's session, whose liveness cap the phase keeps, outlives the
-/// sweep and then ends the same way.
+/// the opens close, the first when the close of the last open finds the
+/// session's liveness cap gone, while B's session, whose liveness cap the
+/// phase keeps, outlives that and the sweep A's release signals, and then
+/// ends at the sweep its own release signals, with its open still in it.
 fn charged_to_the_client(top: u64, node: u64, ipc_buf: *mut u64)
 {
     let a = sub_node(top, SESSION_MAX, "NODE_CREATE of node A");
@@ -473,11 +475,24 @@ fn charged_to_the_client(top: u64, node: u64, ipc_buf: *mut u64)
         let _ = syscall::cap_delete(open);
     }
 
-    // The session ends with its liveness cap and its node, its open with it;
-    // B's session, whose liveness cap is held, stays.
-    end_session(&[first], live_a, a, "node A");
-    assert!(
-        settles_to(top, 1, "NODE_QUERY_USAGE of the phase's node"),
+    // With its liveness cap gone, the close of its last open ends the session
+    // before the reply: its first page is off node A at once. B's session,
+    // whose liveness cap is held, stays.
+    syscall::cap_delete(live_a).expect("deleting node A's session's liveness cap");
+    assert_eq!(
+        fs_close(first, ipc_buf),
+        fs_errors::SUCCESS,
+        "FS_CLOSE of node A's session's last open"
+    );
+    assert_eq!(
+        node_usage(a, "NODE_QUERY_USAGE of node A after its last close").0,
+        0,
+        "the close of the last open of a session with no liveness cap left its page charged"
+    );
+    release_refused(a, "node A");
+    assert_eq!(
+        node_usage(top, "NODE_QUERY_USAGE of the phase's node").2,
+        1,
         "node A's session ended but its page is still charged"
     );
     assert!(

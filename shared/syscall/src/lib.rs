@@ -9,8 +9,10 @@
 //! syscall instruction (`SYSCALL` on x86-64, `ECALL` on RISC-V) and return
 //! the kernel result.
 //!
-//! IPC calls that transfer data words require the caller to have registered an
-//! IPC buffer page via [`ipc_buffer_set`] first.
+//! IPC calls that transfer more than [`MSG_REGS_DATA_MAX`] data words, or any
+//! capability, require the caller to have registered an IPC buffer page via
+//! [`ipc_buffer_set`] first; a message of at most that many words travels in
+//! the message registers ([`MsgRegs`]).
 //!
 //! # ABI
 //! Register assignment follows `core/kernel/docs/syscalls.md` § Calling
@@ -44,24 +46,25 @@ extern crate rustc_std_workspace_core as core;
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{
-    MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_EXIT,
-    SYS_ASPACE_HARVEST, SYS_ASPACE_HOLD, SYS_ASPACE_QUERY, SYS_ASPACE_RELEASE, SYS_CAP_COPY,
-    SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
-    SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
-    SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
-    SYS_ENDPOINT_BADGE, SYS_ENDPOINT_IDENTIFY, SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST,
-    SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
-    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER,
-    SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP,
-    SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT,
-    SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO,
-    SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES,
-    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS,
-    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
-    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
+    MEM_UNMAP_RECLAIM_PTS, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION,
+    SYS_ASPACE_EXIT, SYS_ASPACE_HARVEST, SYS_ASPACE_HOLD, SYS_ASPACE_QUERY, SYS_ASPACE_RELEASE,
+    SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT,
+    SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD,
+    SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
+    SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENDPOINT_BADGE, SYS_ENDPOINT_IDENTIFY,
+    SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND,
+    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
+    SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP,
+    SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
+    SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL,
+    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
+    SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER,
+    SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM,
+    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
+    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
+    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
+    ipc_delivered_cap_count, ipc_delivered_data_count,
 };
 
 pub use syscall_abi::{
@@ -73,16 +76,16 @@ pub use syscall_abi::{
     CAP_TAG_MEMORY, CAP_TAG_NOTIFICATION, EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY,
     IPC_REPLY_TRANSFER_FAILED, IRQ_MODE_ACTIVE_LOW, IRQ_MODE_LEVEL, IRQ_MODE_MASK, MAP_EXECUTABLE,
     MAP_FROM_CAP, MAP_READ, MAP_WRITABLE, MAX_ENTROPY_CONTRIBUTE_LEN, MAX_GETRANDOM_LEN,
-    MAX_HARVEST_PAGES, RIGHTS_ALL, RIGHTS_AS_CONTROL, RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_ALL,
-    RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE,
-    RIGHTS_ENTROPY_CONTRIBUTE, RIGHTS_EP_GRANT, RIGHTS_EP_IDENTIFY, RIGHTS_EP_RECEIVE,
-    RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE,
-    RIGHTS_IRQ_MINT, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP, RIGHTS_MEM_MAP_RW,
-    RIGHTS_MEM_MAP_RX, RIGHTS_MEM_PHYS, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP,
-    RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC,
-    RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_THREAD,
-    RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL, RIGHTS_WS_MODIFY,
-    RIGHTS_WS_WAIT, WAIT_TRY_ONCE,
+    MAX_HARVEST_PAGES, MSG_REGS_DATA_MAX, RIGHTS_ALL, RIGHTS_AS_CONTROL, RIGHTS_AS_MAP,
+    RIGHTS_AS_READ, RIGHTS_CS_ALL, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT,
+    RIGHTS_CS_REVOKE, RIGHTS_ENTROPY_CONTRIBUTE, RIGHTS_EP_GRANT, RIGHTS_EP_IDENTIFY,
+    RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV,
+    RIGHTS_IOPORT_USE, RIGHTS_IRQ_MINT, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP,
+    RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_PHYS, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE,
+    RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE,
+    RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND,
+    RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL,
+    RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT, WAIT_TRY_ONCE,
 };
 pub use syscall_abi::{
     EXT_REGS_RISCV64_F0_OFFSET, EXT_REGS_RISCV64_FCSR_OFFSET, EXT_REGS_RISCV64_V0_OFFSET,
@@ -96,8 +99,8 @@ pub use syscall_abi::{
 mod arch;
 
 use arch::current::{
-    syscall2, syscall2_ret3, syscall2_ret4, syscall3, syscall4, syscall4_any, syscall5,
-    syscall5_ret2, syscall6, syscall6_ret3,
+    syscall_ipc_call, syscall_ipc_recv, syscall_ipc_reply, syscall2, syscall2_ret3, syscall3,
+    syscall4, syscall4_any, syscall5, syscall5_ret2, syscall6,
 };
 
 /// Issue syscall `nr` with three argument registers exactly as given, bypassing
@@ -212,9 +215,10 @@ pub fn process_exit(code: u32) -> !
 /// the alignment and that `virt` lies in the user half; it does not check that
 /// the page is mapped (`core/kernel/docs/syscalls.md` § `SYS_IPC_BUFFER_SET`).
 /// Once registered, the kernel reads the page for every `SYS_IPC_CALL`
-/// request and `SYS_IPC_REPLY` that carries data words or caps, and writes it
-/// on every `SYS_IPC_RECV` delivery and `SYS_IPC_CALL` reply, until the thread
-/// registers another page or 0.
+/// request and `SYS_IPC_REPLY` that carries more than [`MSG_REGS_DATA_MAX`]
+/// data words or any cap, and writes it on every `SYS_IPC_RECV` delivery and
+/// `SYS_IPC_CALL` reply that does, until the thread registers another page
+/// or 0.
 ///
 /// # Safety
 /// A call that registers a page (a non-zero, page-aligned, user-half `virt`;
@@ -241,32 +245,80 @@ pub unsafe fn ipc_buffer_set(virt: u64) -> Result<(), i64>
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Raw `SYS_IPC_CALL` issuing `syscall6_ret3`. Intended for `shared/ipc`'s
+/// The message registers MR0..MR5 of an IPC syscall: the data words of a
+/// message of at most [`MSG_REGS_DATA_MAX`] words. Which machine registers
+/// they are is per architecture (`core/kernel/docs/syscalls.md` § Calling
+/// Convention).
+pub type MsgRegs = [u64; MSG_REGS_DATA_MAX];
+
+/// A message the kernel delivered: a `SYS_IPC_CALL`'s reply or a
+/// `SYS_IPC_RECV`'s message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpcDelivery
+{
+    /// The message label.
+    pub label: u64,
+    /// The sender's badge for a received message; 0 for a call's reply.
+    pub badge: u64,
+    /// Data words delivered, at most `MSG_DATA_WORDS_MAX`: in [`regs`](Self::regs)
+    /// when at most [`MSG_REGS_DATA_MAX`], in the IPC buffer's data words
+    /// otherwise.
+    pub data_count: usize,
+    /// Capabilities delivered, at most `MSG_CAP_SLOTS_MAX`; their handles are
+    /// in the IPC buffer's cap result block, which the kernel writes only when
+    /// this is non-zero.
+    pub cap_count: usize,
+    /// The message registers on return: the data words, when
+    /// [`data_count`](Self::data_count) is at most [`MSG_REGS_DATA_MAX`];
+    /// unspecified past them, and when the buffer carried the words.
+    pub regs: MsgRegs,
+}
+
+impl IpcDelivery
+{
+    /// The delivery a successful return produced, its counts read from the
+    /// delivered count word (`syscall_abi::ipc_delivered_counts`) and each
+    /// clamped to its ABI bound.
+    fn from_return(label: u64, badge: u64, counts: u64, regs: MsgRegs) -> Self
+    {
+        let bounded = |count: u64, max: usize| usize::try_from(count).map_or(max, |n| n.min(max));
+        Self {
+            label,
+            badge,
+            data_count: bounded(ipc_delivered_data_count(counts), MSG_DATA_WORDS_MAX),
+            cap_count: bounded(ipc_delivered_cap_count(counts), MSG_CAP_SLOTS_MAX),
+            regs,
+        }
+    }
+}
+
+/// Raw `SYS_IPC_CALL` issuing `syscall_ipc_call`. Intended for `shared/ipc`'s
 /// `IpcMessage`-snapshot wrapper; other callers should use that higher-level
 /// entry point.
 ///
-/// The `cap_count` cap handles travel in the IPC buffer's cap block (word
-/// `syscall_abi::MSG_CAP_HANDLES_WORD` on), which the caller fills before
-/// the call, as it fills the data words. Returns
-/// `(reply_label, reply_word_count)` on success.
+/// A `data_count` of at most [`MSG_REGS_DATA_MAX`] sends the request's data
+/// words from `mr`; a larger one sends them from the IPC buffer's data words,
+/// which the caller fills before the call, and `mr` is ignored. The
+/// `cap_count` cap handles travel in the IPC buffer's cap block (word
+/// `syscall_abi::MSG_CAP_HANDLES_WORD` on), which the caller fills before the
+/// call. Returns the reply as an [`IpcDelivery`] on success.
 ///
 /// # Errors
 /// Returns a negative `i64` error code, per `SYS_IPC_CALL` in
 /// `core/kernel/docs/syscalls.md`: `InvalidCapability` (`ep` is not a live
 /// Endpoint cap, or a cap slot is stale or Null), `InsufficientRights` (`ep`
 /// lacks Send, or Grant on a cap-bearing call), `InvalidArgument` (a cap
-/// slot repeated in one message, or `data_count > 0` or `cap_count > 0` with
-/// no IPC buffer page registered), `InvalidAddress` (the registered IPC
-/// buffer page is unmapped), `InvalidState` (a cap slot is pinned by an in-flight
-/// `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer),
-/// `NoReceiver` (no capability with the Receive right on the endpoint is
-/// left, at the call or while it was queued), or `Interrupted` (the call was
-/// cancelled while blocked, including by the receiver receiving again before
-/// it replied). A `data_count` above
-/// `MSG_DATA_WORDS_MAX` or a `cap_count` above `MSG_CAP_SLOTS_MAX` is clamped
-/// to the maximum, not rejected.
-/// Cap-slot problems are rejected before the caller blocks; a refusal
-/// arising only afterwards delivers the message with zero caps.
+/// slot repeated in one message, or `data_count > MSG_REGS_DATA_MAX` or
+/// `cap_count > 0` with no IPC buffer page registered), `InvalidAddress` (the
+/// registered IPC buffer page is unmapped), `InvalidState` (a cap slot is
+/// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
+/// transfer), `NoReceiver` (no capability with the Receive right on the
+/// endpoint is left, at the call or while it was queued), or `Interrupted`
+/// (the call was cancelled while blocked, including by the receiver receiving
+/// again before it replied). A `data_count` above `MSG_DATA_WORDS_MAX` or a
+/// `cap_count` above `MSG_CAP_SLOTS_MAX` is clamped to the maximum, not
+/// rejected. Cap-slot problems are rejected before the caller blocks; a
+/// refusal arising only afterwards delivers the message with zero caps.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_call(
@@ -274,9 +326,10 @@ pub fn raw_ipc_call(
     label: u64,
     data_count: usize,
     cap_count: usize,
-) -> Result<(u64, usize), i64>
+    mr: &MsgRegs,
+) -> Result<IpcDelivery, i64>
 {
-    raw_ipc_call_timeout(ep, label, data_count, cap_count, 0)
+    raw_ipc_call_timeout(ep, label, data_count, cap_count, 0, mr)
 }
 
 /// [`raw_ipc_call`] bounded by `timeout_ms` milliseconds over the whole call,
@@ -295,33 +348,29 @@ pub fn raw_ipc_call_timeout(
     data_count: usize,
     cap_count: usize,
     timeout_ms: u32,
-) -> Result<(u64, usize), i64>
+    mr: &MsgRegs,
+) -> Result<IpcDelivery, i64>
 {
     let data_count_u64 = data_count as u64;
     let cap_count_u64 = cap_count as u64;
     let count_arg = syscall_abi::ipc_call_count_arg(data_count_u64, timeout_ms);
-    // SAFETY: syscall6_ret3 issues the raw syscall; every argument is a scalar
-    // the kernel validates, and the two unused argument registers are zero. The
-    // kernel reads the request words and cap handles from, and writes the reply
-    // into, this thread's registered IPC buffer page; registering it
-    // required `ipc_buffer_set`'s contract, under which no Rust reference into
-    // the page is live across this call, which is the raw-wrapper contract's
-    // IPC-buffer clause.
-    let (ret, reply_label, reply_word_count) =
-        unsafe { syscall6_ret3(SYS_IPC_CALL, ep, label, count_arg, cap_count_u64, 0, 0) };
+    // SAFETY: syscall_ipc_call issues the raw syscall; every argument is a
+    // scalar the kernel validates, and the message registers are values. The
+    // kernel reads the request words of a message beyond MSG_REGS_DATA_MAX words
+    // and the cap handles from, and writes such a reply and delivered handles
+    // into, this thread's registered IPC buffer page; registering it required
+    // `ipc_buffer_set`'s contract, under which no Rust reference into the page
+    // is live across this call, which is the raw-wrapper contract's IPC-buffer
+    // clause.
+    let (ret, reply_label, counts, regs) =
+        unsafe { syscall_ipc_call(SYS_IPC_CALL, ep, label, count_arg, cap_count_u64, *mr) };
     if ret < 0
     {
         Err(ret)
     }
     else
     {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "Seraph targets 64-bit only (usize == u64); the kernel clamps \
-                      reply_word_count to MSG_DATA_WORDS_MAX = 64 before write"
-        )]
-        let word_count = (reply_word_count as usize).min(MSG_DATA_WORDS_MAX);
-        Ok((reply_label, word_count))
+        Ok(IpcDelivery::from_return(reply_label, 0, counts, regs))
     }
 }
 
@@ -329,7 +378,9 @@ pub fn raw_ipc_call_timeout(
 /// `IpcMessage`-snapshot wrapper; other callers should use that higher-level
 /// entry point.
 ///
-/// Returns `(label, badge, word_count)` on success.
+/// Returns the message as an [`IpcDelivery`] on success: its data words in
+/// the message registers when at most [`MSG_REGS_DATA_MAX`], in the IPC
+/// buffer otherwise.
 ///
 /// # Errors
 /// Returns a negative `i64` error code, per `SYS_IPC_RECV` in
@@ -344,7 +395,7 @@ pub fn raw_ipc_call_timeout(
 /// before any pending reply is released.
 #[doc(hidden)]
 #[inline]
-pub fn raw_ipc_recv(ep: u64) -> Result<(u64, u64, usize), i64>
+pub fn raw_ipc_recv(ep: u64) -> Result<IpcDelivery, i64>
 {
     raw_ipc_recv_timeout(ep, 0)
 }
@@ -359,64 +410,67 @@ pub fn raw_ipc_recv(ep: u64) -> Result<(u64, u64, usize), i64>
 /// expiry.
 #[doc(hidden)]
 #[inline]
-pub fn raw_ipc_recv_timeout(ep: u64, timeout_ms: u64) -> Result<(u64, u64, usize), i64>
+pub fn raw_ipc_recv_timeout(ep: u64, timeout_ms: u64) -> Result<IpcDelivery, i64>
 {
-    // SAFETY: syscall2_ret4 issues the raw syscall; `ep` and `timeout_ms` are
-    // scalars the kernel validates. The kernel writes the delivered message
-    // into this thread's registered IPC buffer page; registering it required
-    // `ipc_buffer_set`'s contract, under which no Rust reference into the page
-    // is live across this call, which is the raw-wrapper contract's IPC-buffer
-    // clause.
-    let (ret, label, badge, word_count) = unsafe { syscall2_ret4(SYS_IPC_RECV, ep, timeout_ms) };
+    // SAFETY: syscall_ipc_recv issues the raw syscall; `ep` and `timeout_ms`
+    // are scalars the kernel validates. The kernel writes a delivered message
+    // beyond MSG_REGS_DATA_MAX words and delivered handles into this thread's
+    // registered IPC buffer page; registering it required `ipc_buffer_set`'s
+    // contract, under which no Rust reference into the page is live across
+    // this call, which is the raw-wrapper contract's IPC-buffer clause.
+    let (ret, label, badge, counts, regs) =
+        unsafe { syscall_ipc_recv(SYS_IPC_RECV, ep, timeout_ms) };
     if ret < 0
     {
         Err(ret)
     }
     else
     {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "Seraph targets 64-bit only (usize == u64); the kernel clamps word_count to \
-                      MSG_DATA_WORDS_MAX = 64 before write"
-        )]
-        let word_count = (word_count as usize).min(MSG_DATA_WORDS_MAX);
-        Ok((label, badge, word_count))
+        Ok(IpcDelivery::from_return(label, badge, counts, regs))
     }
 }
 
 /// Raw `SYS_IPC_REPLY`. Intended for `shared/ipc`'s `IpcMessage`-snapshot
-/// wrapper; other callers should use that higher-level entry point. The
-/// `cap_count` cap handles travel in the IPC buffer's cap block, as for
+/// wrapper; other callers should use that higher-level entry point. The data
+/// words travel in `mr` or the IPC buffer by `data_count`, and the
+/// `cap_count` cap handles in the IPC buffer's cap block, as for
 /// [`raw_ipc_call`].
 ///
 /// # Errors
 /// Returns a negative `i64` error code, per `SYS_IPC_REPLY` in
 /// `core/kernel/docs/syscalls.md`: `InvalidCapability` (no pending reply, or
 /// a reply cap slot is stale or Null), `InvalidArgument` (a cap slot
-/// repeated in the reply, or `data_count > 0` or `cap_count > 0` with no IPC
-/// buffer page registered), `InvalidAddress` (the registered IPC buffer page is
-/// unmapped), `InvalidState` (a reply cap slot is pinned by an in-flight
-/// `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer), or
-/// `QuotaExceeded` / `OutOfMemory` (the caller's `CSpace` cannot accept the
-/// reply caps). The reply never blocks, so it never returns `Interrupted`. A
-/// `data_count` above `MSG_DATA_WORDS_MAX` or a `cap_count` above
-/// `MSG_CAP_SLOTS_MAX` is clamped to the maximum, not rejected. An error
-/// consumes the pending reply: a caller that was pending has already been
-/// woken with the `IPC_REPLY_TRANSFER_FAILED` label, so the reply must not be
-/// retried.
+/// repeated in the reply, or `data_count > MSG_REGS_DATA_MAX` or
+/// `cap_count > 0` with no IPC buffer page registered), `InvalidAddress` (the
+/// registered IPC buffer page is unmapped), `InvalidState` (a reply cap slot
+/// is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC
+/// capability transfer), or `QuotaExceeded` / `OutOfMemory` (the caller's
+/// `CSpace` cannot accept the reply caps). The reply never blocks, so it never
+/// returns `Interrupted`. A `data_count` above `MSG_DATA_WORDS_MAX` or a
+/// `cap_count` above `MSG_CAP_SLOTS_MAX` is clamped to the maximum, not
+/// rejected. An error consumes the pending reply: a caller that was pending
+/// has already been woken with the `IPC_REPLY_TRANSFER_FAILED` label, so the
+/// reply must not be retried.
 #[doc(hidden)]
 #[inline]
-pub fn raw_ipc_reply(label: u64, data_count: usize, cap_count: usize) -> Result<(), i64>
+pub fn raw_ipc_reply(
+    label: u64,
+    data_count: usize,
+    cap_count: usize,
+    mr: &MsgRegs,
+) -> Result<(), i64>
 {
     let data_count_u64 = data_count as u64;
     let cap_count_u64 = cap_count as u64;
-    // SAFETY: syscall5 issues the raw syscall; every argument is a scalar the
-    // kernel validates, and the two unused argument registers are zero. The
-    // kernel reads the reply words and cap handles from this thread's
-    // registered IPC buffer page; registering it required `ipc_buffer_set`'s
-    // contract, under which no Rust reference into the page is live across this
-    // call, which is the raw-wrapper contract's IPC-buffer clause.
-    let ret = unsafe { syscall5(SYS_IPC_REPLY, label, data_count_u64, cap_count_u64, 0, 0) };
+    // SAFETY: syscall_ipc_reply issues the raw syscall; every argument is a
+    // scalar the kernel validates, and the message registers are values. The
+    // kernel reads the words of a reply beyond MSG_REGS_DATA_MAX words and the
+    // cap handles from this thread's registered IPC buffer page; registering it
+    // required `ipc_buffer_set`'s contract, under which no Rust reference into
+    // the page is live across this call, which is the raw-wrapper contract's
+    // IPC-buffer clause.
+    let ret =
+        unsafe { syscall_ipc_reply(SYS_IPC_REPLY, label, data_count_u64, cap_count_u64, *mr) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 

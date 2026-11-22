@@ -22,7 +22,7 @@
 //! still lands inside the call's bound.
 
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
+    MsgRegs, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
     notification_send, notification_wait_timeout, raw_ipc_call_timeout, raw_ipc_recv_timeout,
     thread_exit, thread_sleep, thread_start, thread_stop, wait_set_add, wait_set_create,
     wait_set_wait_timeout,
@@ -171,7 +171,7 @@ extern "C" fn client_entry(arg: u64) -> !
         thread_exit()
     }
     notification_send(done, BIT_READY).ok();
-    let bit = match raw_ipc_call_timeout(ep, 0x7002, 0, 0, timeout_ms)
+    let bit = match raw_ipc_call_timeout(ep, 0x7002, 0, 0, timeout_ms, &MsgRegs::default())
     {
         Err(e) if e == SyscallError::Interrupted as i64 => BIT_OK,
         _ => BIT_BAD,

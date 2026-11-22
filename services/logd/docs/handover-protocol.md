@@ -76,11 +76,12 @@ Until init-logd acknowledges the release, it writes each line it forwards to the
 by byte, and logd's serial writes go through the serial driver to the same UART; the two share no
 lock, so a line of each written at once interleaves byte by byte, and a reader of the serial stream
 sees neither line whole. logd therefore writes nothing to the serial driver of its own before the
-release. It resolves the serial and framebuffer drivers through devmgr before the pull, writing
-nothing, so that its first write after the release does not call devmgr while the log endpoint has
-no reader. A driver devmgr does not serve by then is resolved later on its class watch, and its
+release. It resolves the serial and framebuffer drivers through devmgr first, before it creates
+its death queue, writing nothing: a halt on a later start step writes its `FATAL` line, and the
+panic sink its output, only to a resolved serial driver, and its first write after the release
+then does not call devmgr while the log endpoint has no reader. A driver devmgr does not serve by then is resolved later on its class watch, and its
 sink queues the lines meanwhile ([`ipc-interface.md`](ipc-interface.md) § Output sinks). It also
-holds each line it self-logs, at most `SELF_LOG_HELD_MAX` (8) of them, and writes
+holds each line it self-logs, at most `SELF_LOG_HELD_MAX` (12) of them, and writes
 them in order, with the time each was logged, once `handover::transfer` returns. A line past that
 bound is dropped and counted, and logd writes the count in one line after the held ones. Init-logd
 writes its last line, `handover complete; init-logd thread exiting`, before it acknowledges the

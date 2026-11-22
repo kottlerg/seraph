@@ -525,6 +525,13 @@ fn install_drivers_dir(
         {
             std::os::seraph::log!(warn: "SET_DRIVERS_DIR {why}; no driver from the drivers dir");
         }
+        drivers_dir::Outcome::Lost =>
+        {
+            std::os::seraph::log!(
+                warn: "SET_DRIVERS_DIR received by devmgr and not answered; no driver from the \
+                       drivers dir"
+            );
+        }
     }
 }
 
@@ -588,9 +595,7 @@ impl drivers_dir::Calls for DriversDirCalls<'_>
         {
             Ok(ipc::devmgr_errors::SUCCESS) => drivers_dir::Sent::Accepted,
             Ok(_) => drivers_dir::Sent::Rejected,
-            // Not sent, or a transport error before the kernel committed the
-            // transfer: the source slots still own the dir caps.
-            Err(why) => drivers_dir::Sent::NotSent(why),
+            Err(failed) => failed,
         }
     }
 
@@ -602,16 +607,18 @@ impl drivers_dir::Calls for DriversDirCalls<'_>
 
 /// Send `SET_DRIVERS_DIR` on `bind_ep`: `drivers_dir`, its path, and
 /// `tables_dir` second when the walk found it. Returns the reply's label;
-/// `Err`, naming why, when the request is not sendable or the call fails
-/// before the kernel moved the caps, which svcmgr then still holds. A
-/// function of its own, so the request and its reply live in this frame
+/// `Err` with `Sent::NotSent`, naming why, when the request is not sendable
+/// or the call fails before devmgr received it, so the kernel did not move
+/// the caps and svcmgr still holds them, and with `Sent::Lost` when the call
+/// fails with `Interrupted`, after devmgr received it and the caps moved
+/// (docs/ipc-design.md § Endpoints). A function of its own, so the request and its reply live in this frame
 /// alone and [`install_drivers_dir`]'s holds neither.
 fn send_drivers_dir(
     bind_ep: u64,
     drivers_dir: u64,
     tables_dir: Option<u64>,
     ipc_buf: *mut u64,
-) -> Result<u64, &'static str>
+) -> Result<u64, drivers_dir::Sent>
 {
     let builder = IpcMessage::builder(ipc::devmgr_labels::SET_DRIVERS_DIR)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
@@ -627,12 +634,21 @@ fn send_drivers_dir(
         DRIVERS_DIR_PATH.as_bytes(),
         ipc::devmgr_labels::DRIVERS_DIR_PATH_MAX,
     )
-    .ok_or("path not sendable")?
+    .ok_or(drivers_dir::Sent::NotSent("path not sendable"))?
     .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     unsafe { ipc::ipc_call(bind_ep, &msg, ipc_buf) }
         .map(|reply| reply.label)
-        .map_err(|_| "ipc error")
+        .map_err(|e| {
+            if e == SyscallError::Interrupted as i64
+            {
+                drivers_dir::Sent::Lost
+            }
+            else
+            {
+                drivers_dir::Sent::NotSent("ipc error")
+            }
+        })
 }
 
 /// `WaitSet` badge for svcmgr's service endpoint.

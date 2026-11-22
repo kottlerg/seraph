@@ -37,9 +37,15 @@ pub enum Sent
     /// devmgr answered with an error; the caps moved with the request and
     /// devmgr released them.
     Rejected,
-    /// The request was not made, or the call failed before the kernel moved
-    /// the caps, which svcmgr still holds; names why.
+    /// The request was not made, or the call failed before devmgr received
+    /// it, so the kernel did not move the caps, which svcmgr still holds;
+    /// names why.
     NotSent(&'static str),
+    /// The call failed after devmgr received the request (`Interrupted`: its
+    /// receiving thread was torn down, or received again, without a
+    /// reply). The caps moved to devmgr when it received the request, so
+    /// svcmgr holds neither.
+    Lost,
 }
 
 /// The calls the step makes, which svcmgr implements.
@@ -86,9 +92,12 @@ pub enum Outcome<E>
     Dead(Server),
     /// The walk of the drivers directory failed with vfsd alive.
     NoDriversDir(E),
-    /// The request was not made, or failed with devmgr alive; the caps are
-    /// released.
+    /// The request was not made, or failed before devmgr received it, with
+    /// devmgr alive; the caps are released.
     NotSent(&'static str),
+    /// devmgr received the request and did not answer it, with devmgr
+    /// alive; the caps went with the request, so the step releases none.
+    Lost,
 }
 
 /// Run the step: read both servers' liveness, walk `drivers_path` and then
@@ -97,7 +106,8 @@ pub enum Outcome<E>
 /// an architecture that installs no platform description table has no such
 /// directory. Every failed call is followed by a read of its server's
 /// liveness, and a dead server ends the step with the caps it holds
-/// released.
+/// released; a request devmgr received took both caps with it, and is
+/// never followed by a release.
 pub fn run<C: Calls>(calls: &mut C, drivers_path: &str, tables_path: &str) -> Outcome<C::Error>
 {
     for server in [Server::Vfsd, Server::Devmgr]
@@ -138,6 +148,14 @@ pub fn run<C: Calls>(calls: &mut C, drivers_path: &str, tables_path: &str) -> Ou
             tables: tables.is_some(),
         },
         Sent::Rejected => Outcome::Rejected,
+        Sent::Lost =>
+        {
+            if calls.dead(Server::Devmgr)
+            {
+                return Outcome::Dead(Server::Devmgr);
+            }
+            Outcome::Lost
+        }
         Sent::NotSent(why) =>
         {
             calls.release(drivers);
@@ -360,6 +378,29 @@ mod tests
                 Call::Send(1, Some(2)),
                 Call::Release(1),
                 Call::Release(2),
+                Call::Dead(Server::Devmgr),
+            ]);
+            assert_eq!(w.calls, want);
+        }
+    }
+
+    #[test]
+    fn a_request_devmgr_received_unanswered_releases_nothing_and_reads_devmgr()
+    {
+        for (dies, outcome) in [
+            (None, Outcome::Lost),
+            (Some((Server::Devmgr, 1)), Outcome::Dead(Server::Devmgr)),
+        ]
+        {
+            let mut w = World::new();
+            w.answer = Sent::Lost;
+            w.dies = dies;
+            assert_eq!(run(&mut w, DRIVERS, TABLES), outcome);
+            let mut want = BOTH_ALIVE.to_vec();
+            want.extend([
+                Call::Walk(DRIVERS),
+                Call::Walk(TABLES),
+                Call::Send(1, Some(2)),
                 Call::Dead(Server::Devmgr),
             ]);
             assert_eq!(w.calls, want);

@@ -10,12 +10,12 @@
 //! A driver records each open in pages charged to a node of its client, and
 //! makes an open only in a session, which names that node. [`session_copy`]
 //! finds this process's session with the driver of a node cap, or starts one,
-//! and returns a SEND-only copy of its session cap for the `FS_OPEN`'s
-//! `caps[0]`. The driver mints the session cap with `RIGHTS_EP_IDENTIFY`, so
-//! the table asks the kernel, with each session cap as the key, whether the
-//! node cap names that driver's endpoint (`SYS_ENDPOINT_IDENTIFY`), and keeps
-//! no other record of which driver a session serves; the copy it sends drops
-//! the right. The decision is the `ruststd-fs-sessions` crate's [`lookup`].
+//! and returns a SEND-only copy of its session cap for the `caps[0]` of an
+//! `FS_OPEN`, or of an `FS_CREATE` that opens the file it creates. The
+//! driver mints the session cap with `RIGHTS_EP_IDENTIFY`, so the table asks
+//! the kernel, with each session cap as the key, whether the node cap names
+//! that driver's endpoint (`SYS_ENDPOINT_IDENTIFY`), and keeps no other record
+//! of which driver a session serves; the copy it sends drops the right. The decision is the `ruststd-fs-sessions` crate's [`lookup`].
 //!
 //! A session is charged to a sub-node of this process's node made for it
 //! (`CREATE_SUB_NODE`) with no max of its own: this process's node and its
@@ -179,7 +179,8 @@ pub(crate) fn rebind_fs_sessions()
 
 /// A SEND-only copy of this process's session cap with the driver of the node
 /// cap `node_cap`, starting the session when there is none, for an
-/// `FS_OPEN` on `node_cap` to carry in `caps[0]`. The caller owns the copy.
+/// `FS_OPEN` on `node_cap`, or an `FS_CREATE` with `CREATE_OPEN` on it, to
+/// carry in `caps[0]`. The caller owns the copy.
 ///
 /// # Errors
 /// `QuotaExceeded` when the max of this process's node, or of an ancestor's,
@@ -230,19 +231,6 @@ pub(crate) fn session_copy(node_cap: u64, ipc_buf: *mut u64) -> io::Result<u64>
             Err(e)
         }
     }
-}
-
-/// A SEND-only copy of this process's session with the driver of
-/// `node_cap` when the table holds one, `None` when it does not: the lookup
-/// of [`session_copy`] without its start, for a node cap that cannot carry
-/// `FS_SESSION`'s charge handle (one without `RIGHTS_EP_GRANT`).
-///
-/// # Errors
-/// `StaleNetworkFileHandle` when `node_cap`'s slot holds no capability;
-/// `OutOfMemory` when the copy cannot be made.
-pub(crate) fn existing_session_copy(node_cap: u64, ipc_buf: *mut u64) -> io::Result<Option<u64>>
-{
-    find(&mut table(), node_cap, ipc_buf)
 }
 
 /// Look `node_cap`'s session up in `sessions`, ending and removing each

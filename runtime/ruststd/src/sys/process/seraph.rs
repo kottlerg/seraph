@@ -808,6 +808,12 @@ impl Command {
         //   1. Explicit override via `CommandExt::namespace_cap`.
         //   2. Parent-inherit default: `cap_copy` of `root_dir_cap()`.
         //
+        // An inherited cap keeps the endpoint rights of the spawner's, with
+        // `RIGHTS_EP_GRANT` when that carries it: a create in an anchor moves
+        // the child's session cap through it (runtime/ruststd/README.md
+        // § Filesystem sessions). The kernel's copy intersects the mask with
+        // the source's rights, so vfsd's `SEND`-only system root stays so.
+        //
         // Cwd cap source priority:
         //   1. Explicit override via `CommandExt::cwd_dir_cap`.
         //   2. Walk parent's root to `self.cwd` (path-based override).
@@ -821,7 +827,7 @@ impl Command {
             self.count_overrides();
             cap
         } else {
-            match syscall::cap_copy(parent_root, info.self_cspace, syscall::RIGHTS_EP_SEND) {
+            match syscall::cap_copy(parent_root, info.self_cspace, syscall::RIGHTS_EP_SEND_GRANT) {
                 Ok(slot) => slot,
                 Err(_) => 0,
             }
@@ -850,7 +856,11 @@ impl Command {
             let parent_cwd = crate::os::seraph::current_dir_cap();
             if parent_cwd != 0 {
                 Ok(
-                    match syscall::cap_copy(parent_cwd, info.self_cspace, syscall::RIGHTS_EP_SEND) {
+                    match syscall::cap_copy(
+                        parent_cwd,
+                        info.self_cspace,
+                        syscall::RIGHTS_EP_SEND_GRANT,
+                    ) {
                         Ok(slot) => slot,
                         Err(_) => 0,
                     },

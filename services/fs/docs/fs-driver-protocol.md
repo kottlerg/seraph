@@ -21,7 +21,8 @@ this document covers the labels that remain fs-driver-specific:
 - `FS_WRITE` / `FS_WRITE_MEMORY` — inline and memory-cap writes on a
   file node cap or open cap.
 - `FS_CREATE` / `FS_MKDIR` — create a file or an empty directory in a
-  directory.
+  directory; a create can open the new file in a session in the same
+  request.
 - `FS_REMOVE` — unlink a file or empty directory.
 - `FS_RENAME` — rename an entry within one directory.
 - `FS_TRUNCATE` — set a file's length.
@@ -47,7 +48,8 @@ driver dispatches incoming requests by their badge shape:
   the open's node.
 - `badge != 0` with `SESSION` set alone — a session cap, minted at
   [`FS_SESSION`](#label-23-fs_session). It carries no request of its own;
-  `FS_OPEN` carries a copy of it as a capability.
+  `FS_OPEN`, and `FS_CREATE` with `CREATE_OPEN`, carry a copy of it as a
+  capability.
 
 A badge with both kind bits names nothing. A label sent on such a badge
 or on the wrong kind of cap (an open's own label on a node cap, `FS_OPEN`
@@ -284,6 +286,7 @@ records of the session's opens, and of the pages they hold, cost the
 client's node and not the driver's: a client at its node's max is refused
 `LIMIT` while other clients' requests go on. The reply carries a **session
 cap**, which every [`FS_OPEN`](#label-18-fs_open) in the session carries,
+as does every [`FS_CREATE`](#label-13-fs_create) that opens its file in it,
 and the session's **liveness cap**.
 
 **Request**
@@ -803,28 +806,82 @@ A write whose offset lies past the file's end leaves the gap reading as zeros, a
 
 ## Label 13: `FS_CREATE`
 
-Create a new file in a directory. Badge = parent-directory cap; the
-badge must carry the `MUTATE_DIR` namespace right.
+Create a new file in a directory, and, with the `CREATE_OPEN` flag, open it
+in the same request. Badge = parent-directory cap; the badge must carry the
+`MUTATE_DIR` namespace right.
 
 **Request**:
 
 | Field | Value |
 |---|---|
-| `label` | `FS_CREATE \| (name_len << 16)` |
+| `label` | `FS_CREATE \| (name_len << 16)`, with the flags below in bits 32 and 33 |
 | `bytes(0, &name)` | Name bytes starting at byte 0 |
+| `caps[0]` | With `CREATE_OPEN` only: a copy of the session cap, as [`FS_OPEN`](#label-18-fs_open) takes it |
+| `caps[1]` | With `CREATE_OPEN` only: optional release-endpoint SEND for the open, as `FS_OPEN` takes it |
 
-**Reply (success)**: `label = 0`, `data[0]` = `NodeKind` (= File),
-`caps[0]` = node cap for the newly-created file. The new file starts
-empty (size 0, no allocated cluster). The cap's rights are the parent
-cap's rights intersected with `STAT | READ | WRITE | EXEC`.
+The flags (`ipc::fs_labels`):
 
-**Errors**: `INVALID_BADGE`, `EXISTS` (the directory already holds an
-entry of that name), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED` (the
-badge lacks `MUTATE_DIR`, or it carries none of `STAT`, `READ`, `WRITE`,
-and `EXEC`, so the new file's cap would carry no rights; the driver
-refuses before writing anything, and no entry is created),
-`TOO_MANY_OPEN` (the driver's node table is full or the heap cannot grow
-it; the entry was created).
+- `CREATE_OPEN` (bit 32): open the new file in the session `caps[0]` names
+  and reply with the open cap instead of a node cap.
+- `CREATE_OPEN_EXISTING` (bit 33), valid only with `CREATE_OPEN`: when the
+  directory already holds a file of that name, open that file instead of
+  answering `EXISTS`. Opening a file found by name resolves the name, so the
+  badge must then carry `LOOKUP` too, as an `NS_LOOKUP` of it would.
+
+A request without `CREATE_OPEN` carries no cap, and the driver deletes any it
+carries.
+
+**Reply (success)**, without `CREATE_OPEN`: `label = 0`, `data[0]` =
+`NodeKind` (= File), `caps[0]` = node cap for the newly-created file. The
+new file starts empty (size 0, no allocated cluster). The cap's rights are
+the parent cap's rights intersected with `STAT | READ | WRITE | EXEC`.
+
+**Reply (success)**, with `CREATE_OPEN`: `label = 0`, `data[0]` =
+`NodeKind` (= File), `data[1]` = the file's size (0 for a new file),
+`caps[0]` = the open cap, as `FS_OPEN` replies it, carrying the rights a
+node cap on the file would; no node cap. The open lives as one `FS_OPEN`
+made, in the session `caps[0]` named.
+
+**Atomic create and open.** With `CREATE_OPEN`, the driver settles
+everything that can refuse the open before it writes the directory entry: it
+reads the session cap, records the open in the session (taking the session
+another page when its pages are full, charged to the session's node), takes
+the new node's slot in its node table, and mints the open cap. An open the
+client's node refuses therefore leaves no entry, and a client needs no
+`FS_REMOVE` to undo a create whose open failed, which would race any other
+process that reached the new file in between. A write of the entry that
+fails closes the open. A reply the client cannot take (it died mid-call, or
+its `CSpace` cannot take the cap) moves no cap; the driver closes the open,
+and the entry stays, as after a plain `FS_CREATE` whose client died.
+
+**Errors**, in the order the driver checks them; each refusal deletes the
+carried caps:
+
+- `INVALID_BADGE` (the badge names no directory), `PERMISSION_DENIED` (the
+  badge lacks `MUTATE_DIR`, or it carries none of `STAT`, `READ`, `WRITE`,
+  and `EXEC`, so the new file's cap would carry no rights).
+- `INVALID_ARGUMENT`: `CREATE_OPEN_EXISTING` without `CREATE_OPEN`; or, with
+  `CREATE_OPEN`, no `caps[0]` or one on another endpoint. `INVALID_BADGE`:
+  a `caps[0]` on the driver's endpoint that names no live session.
+- With `CREATE_OPEN`, the open's refusals as `FS_OPEN` lists them (`LIMIT`,
+  `OUT_OF_MEMORY`, `INVALID_ARGUMENT`, `TOO_MANY_OPEN`, `IO_ERROR`), and
+  `IO_ERROR` when the driver cannot mint the open cap.
+- `TOO_MANY_OPEN`: the driver's node table is full or the heap cannot grow
+  it.
+- With `CREATE_OPEN_EXISTING`, when the directory holds an entry of that
+  name: `PERMISSION_DENIED` (the badge lacks `LOOKUP`), `IS_A_DIRECTORY` (the
+  entry is a directory).
+- `EXISTS` (the directory already holds an entry of that name, and the
+  request does not open an existing file), `NO_SPACE`, `IO_ERROR`: writing
+  the entry failed.
+
+Every refusal but the last group leaves the directory as it was: the driver
+refuses before writing anything, and no entry is created.
+
+The std client creates every file with `CREATE_OPEN`, and opens an existing
+one for `OpenOptions::create` with `CREATE_OPEN_EXISTING`
+([runtime/ruststd/README.md](../../../runtime/ruststd/README.md)
+§ Filesystem sessions).
 
 ---
 
@@ -887,9 +944,12 @@ the directory entry is inserted in the parent.
 `caps[0]` = node cap for the new directory, carrying the parent cap's
 rights.
 
-**Errors**: as `FS_CREATE`, except that `PERMISSION_DENIED` means only a
-missing `MUTATE_DIR`: a directory's cap keeps every parent right, so it
-is never empty.
+It takes neither `FS_CREATE` flag: a request carrying `CREATE_OPEN` or
+`CREATE_OPEN_EXISTING` is refused `INVALID_ARGUMENT`.
+
+**Errors**: as `FS_CREATE` without `CREATE_OPEN`, except that
+`PERMISSION_DENIED` means only a missing `MUTATE_DIR`: a directory's cap
+keeps every parent right, so it is never empty.
 
 ---
 

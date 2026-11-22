@@ -50,15 +50,22 @@
 //! `FileAttr::modified()` surfaces `Unsupported` in that case.
 //!
 //! ## Per-`File` open, session and release endpoint
-//! Every open ends with [`fs_labels::FS_OPEN`] on the file node cap the
-//! walk returned: the driver mints an open cap for this `File` alone, and
-//! the node cap is deleted. Every file-scoped request goes to the open
+//! An open of an existing file ends with [`fs_labels::FS_OPEN`] on the file
+//! node cap the walk returned, and the node cap is deleted. A create
+//! (`create` or `create_new`) is one [`fs_labels::FS_CREATE`] with
+//! [`fs_labels::CREATE_OPEN`] on the parent directory's cap, which the
+//! driver answers with the open alone, and records the open before it
+//! writes the entry, so an open this process's node refuses creates
+//! nothing. Either way the driver mints an open cap for this `File` alone.
+//! Every file-scoped request goes to the open
 //! cap, so the driver keeps this `File`'s outstanding pages apart from
 //! every other opener's, and the `FS_CLOSE` in `Drop` releases only them.
-//! The `FS_OPEN` carries, in `caps[0]`, a SEND-only copy of this process's
+//! The request carries, in `caps[0]`, a SEND-only copy of this process's
 //! session cap with the node's driver ([`session`]; runtime/ruststd/README.md
 //! § Filesystem sessions): the driver records the open in the session's
 //! pages, charged to this process's node, and refuses an open without one.
+//! A create therefore needs a parent cap that carries `RIGHTS_EP_GRANT`,
+//! through which alone the kernel moves the caps.
 //! In `caps[1]` it carries a badged SEND on the per-process release endpoint
 //! owned by [`release_handler`], with a badge drawn for this `File`; the
 //! driver keeps it on the open, and its eviction worker sends each
@@ -551,8 +558,8 @@ const NS_DEFINED_RIGHTS: u64 = {
 /// target rights mask directly.
 ///
 /// A path with no components (e.g. `"/"`) denotes the anchor directory
-/// itself: directory walks (`Dir`/`Any`) return an owned `SEND` copy of
-/// `root_cap` when `requested_rights` includes every right in
+/// itself: directory walks (`Dir`/`Any`) return an owned copy of
+/// `root_cap`, with the endpoint rights it carries, when `requested_rights` includes every right in
 /// [`NS_DEFINED_RIGHTS`], and `InvalidInput` otherwise, since no hop
 /// narrows the anchor; file walks reject it with `InvalidInput`.
 fn walk_components(
@@ -599,7 +606,7 @@ fn walk_components(
             }
             ExpectKind::Dir | ExpectKind::Any =>
             {
-                let dup = syscall::cap_derive(root_cap, syscall_abi::RIGHTS_EP_SEND)
+                let dup = syscall::cap_derive(root_cap, syscall_abi::RIGHTS_EP_SEND_GRANT)
                     .map_err(|_| {
                         call_failed(root_cap, "seraph fs: cap_derive of anchor dir failed")
                     })?;
@@ -1300,96 +1307,112 @@ fn file_truncate_zero(file_cap: u64, ipc_buf: *mut u64) -> io::Result<()>
     Ok(())
 }
 
-/// Create a new file at `path`. Splits to (parent_dir_cap, leaf), takes a
-/// copy of this process's session with the parent's driver, issues
-/// `FS_CREATE`, and returns the new file cap, its size (0), and that session
-/// copy for the new file's `FS_OPEN`. The session is taken before the
-/// directory entry exists, so a session start this process's node refuses
-/// (`QuotaExceeded`, `OutOfMemory`) fails the call with no file created.
-/// It is the new file's session: the session table finds a node's session
-/// by the driver endpoint the node cap names (`SYS_ENDPOINT_IDENTIFY`), any
-/// node cap of a driver starts its session
-/// (services/fs/docs/fs-driver-protocol.md § Label 23), and the driver
-/// mints the node `FS_CREATE` returns on the endpoint the parent cap names.
+/// Create the file at `path` and open it, in one `FS_CREATE` with
+/// `CREATE_OPEN` on the parent directory's cap
+/// (services/fs/docs/fs-driver-protocol.md § Label 13), and return the open
+/// cap and the file's size. The request carries a copy of this process's
+/// session with the parent's driver, taken first, and `release_send`, which
+/// the driver keeps on the open; the caller keeps its own handle to
+/// `release_send` and deletes it. The driver records the open before it
+/// writes the entry, so a session start or an open this process's node
+/// refuses (`QuotaExceeded`, `OutOfMemory`) fails the call with no file
+/// created. The session is the new file's: the session table finds a node's
+/// session by the driver endpoint the node cap names
+/// (`SYS_ENDPOINT_IDENTIFY`), and the parent and the file are nodes of one
+/// driver.
 ///
-/// `FS_SESSION` moves a charge handle, so a session starts only through a
-/// cap that carries `RIGHTS_EP_GRANT`. Through a parent cap without it (an
-/// anchor its creator installed `SEND`-only) the helper takes the table's
-/// session with the driver when there is one, and otherwise returns no
-/// session copy: the caller then starts the session on the new file's node
-/// cap, after `FS_CREATE`.
+/// The kernel moves a capability only through a cap that carries
+/// `RIGHTS_EP_GRANT`, and the request moves the session cap and
+/// `release_send`, so a parent cap without it (an anchor its creator
+/// installed `SEND`-only, or vfsd's synthetic root) is refused
+/// `PermissionDenied` before any request.
 ///
-/// When `allow_existing` is false the helper surfaces `AlreadyExists`
-/// on `fs_errors::EXISTS` (this is the `OpenOptions::create_new`
-/// path). When true, the helper falls back to walking the existing
-/// leaf via `NS_LOOKUP` so the caller can open the existing file
-/// (this is the `OpenOptions::create` path); it then returns no session
-/// copy, and the caller takes the session of the node the walk found.
-fn create_file_at(
+/// When `allow_existing` is false an existing entry of that name is
+/// `AlreadyExists` (the `OpenOptions::create_new` path). When true the
+/// request carries `CREATE_OPEN_EXISTING`, and the driver opens an existing
+/// file of that name in the same request (the `OpenOptions::create` path).
+fn create_and_open_at(
     path: &Path,
     ipc_buf: *mut u64,
     allow_existing: bool,
-) -> io::Result<(u64, u64, Option<u64>)>
+    release_send: u64,
+) -> io::Result<(u64, u64)>
 {
     let split = split_parent_and_leaf(path, ipc_buf)?;
-    let carries_grant = syscall::cap_info(split.parent_cap, syscall::CAP_INFO_TAG_RIGHTS)
-        .is_ok_and(|v| v & syscall::RIGHTS_EP_GRANT != 0);
-    let session = if carries_grant
-    {
-        session_copy(split.parent_cap, ipc_buf).map(Some)
-    }
-    else
-    {
-        session::existing_session_copy(split.parent_cap, ipc_buf)
-    };
-    let session = match session
-    {
-        Ok(c) => c,
-        Err(e) =>
-        {
-            release_split_parent(&split);
-            return Err(e);
-        }
-    };
-
-    let label = fs_labels::FS_CREATE | ((split.leaf.len() as u64) << 16);
-    let msg = IpcMessage::builder(label).bytes(0, &split.leaf).build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let result = match unsafe { deadline_call(split.parent_cap, &msg, ipc_buf) }
-    {
-        Err(e) => Err(call_error(split.parent_cap, e, "seraph fs: FS_CREATE ipc_call failed")),
-        Ok(reply) if reply.label == fs_errors::SUCCESS => match reply.caps().first()
-        {
-            Some(&cap) =>
-            {
-                release_split_parent(&split);
-                return Ok((cap, 0, session));
-            }
-            None => Err(io::Error::other("seraph fs: FS_CREATE reply missing cap")),
-        },
-        // Fall through to open-existing via a one-hop NS_LOOKUP on the
-        // parent cap.
-        Ok(reply) if reply.label == fs_errors::EXISTS && allow_existing => walk_components(
-            split.parent_cap,
-            core::str::from_utf8(&split.leaf).unwrap_or(""),
-            0xFFFF,
-            ipc_buf,
-            ExpectKind::File,
-        )
-        .map(|walked| (walked.cap, walked.size, None)),
-        Ok(reply) => Err(map_fs_error(reply.label)),
-    };
-    if let Some(session) = session
-    {
-        let _ = syscall::cap_delete(session);
-    }
+    let result = create_and_open_in(&split, ipc_buf, allow_existing, release_send);
     release_split_parent(&split);
     result
 }
 
-/// Walk `path` to an existing file: its node cap and size, and no session
-/// copy, for [`File::open`] without `create` or `create_new`.
-fn walk_to_existing(path: &Path, ipc_buf: *mut u64) -> io::Result<(u64, u64, Option<u64>)>
+/// [`create_and_open_at`] in the parent directory `split` names.
+fn create_and_open_in(
+    split: &SplitParent,
+    ipc_buf: *mut u64,
+    allow_existing: bool,
+    release_send: u64,
+) -> io::Result<(u64, u64)>
+{
+    // A parent an unmount revoked reads as dead, as the call on it would
+    // (`call_failed`).
+    let Ok(parent) = syscall::cap_info(split.parent_cap, syscall::CAP_INFO_TAG_RIGHTS)
+    else
+    {
+        return Err(call_failed(split.parent_cap, "seraph fs: the parent directory's cap is gone"));
+    };
+    if parent & syscall::RIGHTS_EP_GRANT == 0
+    {
+        return Err(io::const_error!(
+            io::ErrorKind::PermissionDenied,
+            "seraph fs: the parent directory's cap carries no grant right, \
+             so a create cannot carry its session",
+        ));
+    }
+    let session = session_copy(split.parent_cap, ipc_buf)?;
+    let mut label = fs_labels::FS_CREATE
+        | fs_labels::CREATE_OPEN
+        | ((split.leaf.len() as u64) << 16);
+    if allow_existing
+    {
+        label |= fs_labels::CREATE_OPEN_EXISTING;
+    }
+    let msg = IpcMessage::builder(label)
+        .bytes(0, &split.leaf)
+        .cap(session)
+        .cap(release_send)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { deadline_call(split.parent_cap, &msg, ipc_buf) };
+    // A cap the kernel did not move (a refused call) is still ours and is
+    // deleted here; a moved one's handle is stale, and the kernel's
+    // generation check refuses the delete.
+    let _ = syscall::cap_delete(session);
+    let reply = reply
+        .map_err(|e| call_error(split.parent_cap, e, "seraph fs: FS_CREATE ipc_call failed"))?;
+    let (opened, surplus) = match *reply.caps()
+    {
+        [open, ref rest @ ..] if reply.label == fs_errors::SUCCESS => (Some(open), rest),
+        _ => (None, reply.caps()),
+    };
+    for &cap in surplus
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    if reply.label != fs_errors::SUCCESS
+    {
+        return Err(map_fs_error(reply.label));
+    }
+    let open = opened
+        .ok_or_else(|| io::Error::other("seraph fs: FS_CREATE reply carries no open cap"))?;
+    Ok((open, reply.word(1)))
+}
+
+/// Open the existing file at `path` (`File::open` without `create` or
+/// `create_new`): walk to its node, then `FS_OPEN` it in this process's
+/// session with its driver, handing the driver `release_send`, and return
+/// the open cap and the size the walk reported. The node cap goes once the
+/// open exists: every later file-scoped request goes to the open cap. The
+/// caller keeps its own handle to `release_send` and deletes it.
+fn open_existing(path: &Path, ipc_buf: *mut u64, release_send: u64) -> io::Result<(u64, u64)>
 {
     let path_str = path.to_str().ok_or_else(|| {
         io::const_error!(io::ErrorKind::InvalidInput, "seraph fs: non-UTF-8 path")
@@ -1412,7 +1435,14 @@ fn walk_to_existing(path: &Path, ipc_buf: *mut u64) -> io::Result<(u64, u64, Opt
         ));
     }
     let walked = walk_path_to_file(anchor_cap, path_str, ipc_buf)?;
-    Ok((walked.file_cap, walked.size, None))
+    let opened = session_copy(walked.file_cap, ipc_buf).and_then(|session| {
+        let opened = file_open(walked.file_cap, session, release_send, ipc_buf);
+        // As in `create_and_open_in`: an unmoved cap is still ours.
+        let _ = syscall::cap_delete(session);
+        opened
+    });
+    let _ = syscall::cap_delete(walked.file_cap);
+    Ok((opened?, walked.size))
 }
 
 // ── File ──────────────────────────────────────────────────────────────────
@@ -1513,9 +1543,9 @@ impl File
 
         // ── Release-handler plumbing ─────────────────────────────────
         //
-        // `FS_OPEN` moves a copy of this process's session cap with the
-        // node's driver, and a badged SEND on the release endpoint, to the
-        // driver, which keeps the SEND on this `File`'s open so its eviction
+        // `FS_OPEN`, or the `FS_CREATE` that opens a new file, moves a copy
+        // of this process's session cap with the node's driver, and a badged
+        // SEND on the release endpoint, to the driver, which keeps the SEND on this `File`'s open so its eviction
         // worker can route cooperative `FS_RELEASE_MEMORY` back here.
         // A refused open registers nothing with the release handler. Set up
         // before the file cap is resolved, so that a failure here creates
@@ -1533,56 +1563,23 @@ impl File
             return Err(io::Error::other("seraph fs: cap_derive_badge (release send) failed"));
         };
 
-        // ── Resolve / create the file cap ────────────────────────────
+        // ── Create or open ───────────────────────────────────────
         //
-        // A create returns the session copy it took before `FS_CREATE`
-        // (`create_file_at`), unless its parent cap could not start one; a
-        // node found by a walk has none yet.
-        let resolved = if opts.create_new
+        // A create opens the file in the same request, so an open this
+        // process's node refuses creates nothing (`create_and_open_at`).
+        let opened = if opts.create_new || opts.create
         {
-            // Fail if the leaf already exists.
-            create_file_at(path, ipc_buf, /*allow_existing=*/ false)
-        }
-        else if opts.create
-        {
-            // Create-or-open. On EXISTS we fall back to the existing
-            // file's cap.
-            create_file_at(path, ipc_buf, /*allow_existing=*/ true)
+            // `create_new` fails if the leaf already exists; `create` opens
+            // it then.
+            create_and_open_at(path, ipc_buf, !opts.create_new, release_send)
         }
         else
         {
-            walk_to_existing(path, ipc_buf)
+            open_existing(path, ipc_buf, release_send)
         };
-        let (file_cap, mut size, session) = match resolved
-        {
-            Ok(r) => r,
-            Err(e) =>
-            {
-                let _ = syscall::cap_delete(release_send);
-                return Err(e);
-            }
-        };
-
-        // ── FS_OPEN ──────────────────────────────────────────────────
-        let session = match session.map_or_else(|| session_copy(file_cap, ipc_buf), Ok)
-        {
-            Ok(c) => c,
-            Err(e) =>
-            {
-                let _ = syscall::cap_delete(release_send);
-                let _ = syscall::cap_delete(file_cap);
-                return Err(e);
-            }
-        };
-        let opened = file_open(file_cap, session, release_send, ipc_buf);
-        // A cap the kernel did not move (a refused call) is still ours and
-        // is deleted here; a moved one's handle is stale, and the kernel's
-        // generation check refuses the delete. Every later file-scoped
-        // request goes to the open cap, so the node cap goes too.
-        let _ = syscall::cap_delete(session);
+        // A moved SEND's handle is stale, and the delete is refused.
         let _ = syscall::cap_delete(release_send);
-        let _ = syscall::cap_delete(file_cap);
-        let file_cap = opened?;
+        let (file_cap, mut size) = opened?;
 
         // ── Optional truncate-to-zero on an existing file ────────────
         //

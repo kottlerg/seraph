@@ -52,7 +52,7 @@ Each label's wire shape and error set are specified in
 | `FS_CLOSE` | no | end one open, releasing its pages, its release SEND and its records |
 | `FS_WRITE` | no | inline write on a file cap or open cap |
 | `FS_WRITE_MEMORY` | no | caller-supplied source `Memory` cap |
-| `FS_CREATE` | no | new file in a directory |
+| `FS_CREATE` | no | new file in a directory; with `CREATE_OPEN`, opened in a session in the same request, the open recorded before the entry is written |
 | `FS_REMOVE` | no | unlink a file or empty directory |
 | `FS_MKDIR` | no | new empty directory |
 | `FS_RENAME` | no | rename within a single directory |

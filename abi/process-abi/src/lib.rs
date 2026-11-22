@@ -522,7 +522,9 @@ pub struct ProcessInfo
     ///
     /// Source: the spawner's `procmgr_labels::CONFIGURE_NAMESPACE`
     /// call. Procmgr `cap_copy`s the supplied cap into the child's
-    /// `CSpace` at `START_PROCESS` time. Zero when no spawner-
+    /// `CSpace` at `START_PROCESS` time, keeping its `SEND` and `GRANT`
+    /// rights: a create in the directory moves the process's filesystem
+    /// session cap through it. Zero when no spawner-
     /// supplied cap was delivered — the child has no namespace
     /// authority and consumers (`std::fs`, namespace-walking code)
     /// must tolerate zero by returning `Unsupported`.
@@ -534,7 +536,9 @@ pub struct ProcessInfo
     ///
     /// Independent of [`Self::system_root_cap`] — typically a derivative
     /// of it (e.g. `NS_LOOKUP("/data")` against the root cap), but the
-    /// kernel imposes no relationship. Zero means "no cwd attached";
+    /// kernel imposes no relationship. Delivered as
+    /// [`Self::system_root_cap`] is, with the same rights. Zero means "no
+    /// cwd attached";
     /// std treats relative paths as `Unsupported` until a non-zero cap
     /// is installed (e.g. via `std::env::set_current_dir`).
     pub current_dir_cap: u64,

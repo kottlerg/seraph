@@ -602,7 +602,14 @@ only path that installs `ProcessInfo.system_root_cap` and
 | cap[1] | Current-directory cap for the child (optional; absent leaves `current_dir_cap` zero) |
 
 procmgr stores the caps, deletes any previously installed pair, and copies
-them into the child's CSpace at `START_PROCESS`. It does not validate cap shape.
+them into the child's CSpace at `START_PROCESS`, each with the `SEND` and
+`GRANT` rights it carries. The grant right is what a create in the anchor
+directory needs: the create carries the process's filesystem session cap,
+which the kernel moves only through a cap with `GRANT`
+([services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md#label-13-fs_create)
+§ Label 13). A `SEND`-only copy would withhold nothing a lookup does not
+hand back, since every cap a lookup through the anchor returns carries
+`SEND_GRANT`. It does not validate cap shape.
 procmgr consumes the transferred caps on success and failure alike, and deletes
 any cap past cap[1].
 
@@ -1753,7 +1760,7 @@ the Notification of a refused request.
 |---|---|
 | label | `procmgr_labels::CHECKPOINT` (35) |
 | caller's cap | A process handle (§ Messages), which names the process |
-| `caps[0]` | The **account**, a memmgr SEND as `SNAPSHOT` takes one (§ Label 33). procmgr deletes it, and any further cap the message carried, before it replies |
+| `caps[0]` | The **account**, a memmgr SEND as `SNAPSHOT` takes one (§ Label 33). procmgr deletes any further cap the message carried before it replies, and the account once it has replied |
 
 The process's controller, a holder of its process handle, takes a checkpoint of it at its quiesce
 point here ([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#checkpoint)

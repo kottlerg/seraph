@@ -113,9 +113,28 @@ pub const FS_WRITE_MEMORY: u64 = 12;
 ///
 /// Reply (label `fs_errors::SUCCESS`): `data[0]` = entry kind (per
 /// `namespace_protocol::NodeKind`), `caps[0]` = node cap for the
-/// newly-created file. Errors: as `services/fs/docs/fs-driver-protocol.md`
-/// § Label 13: `FS_CREATE` lists them.
+/// newly-created file. With [`CREATE_OPEN`] the request also carries a
+/// session cap and the reply an open cap instead. Errors: as
+/// `services/fs/docs/fs-driver-protocol.md` § Label 13: `FS_CREATE` lists
+/// them.
 pub const FS_CREATE: u64 = 13;
+/// [`FS_CREATE`] flag (label bit 32): create the file and open it in one
+/// request. `caps[0]` = a copy of the session cap ([`FS_SESSION`]) and
+/// `caps[1]` = an optional release SEND, as [`FS_OPEN`] takes them. The
+/// driver records the open in the session before it writes the directory
+/// entry, so an open the session refuses (`LIMIT`, `OUT_OF_MEMORY`) leaves
+/// no entry. Reply (label `fs_errors::SUCCESS`): `data[0]` = entry kind
+/// (File), `data[1]` = the file's size, `caps[0]` = the open cap, and no
+/// node cap. Specified in `services/fs/docs/fs-driver-protocol.md`
+/// § Label 13: `FS_CREATE`.
+pub const CREATE_OPEN: u64 = 1 << 32;
+/// [`FS_CREATE`] flag (label bit 33), valid only with [`CREATE_OPEN`]:
+/// when the directory already holds a file of that name, open that file
+/// instead of answering `fs_errors::EXISTS`; a directory of that name is
+/// answered `fs_errors::IS_A_DIRECTORY`. Opening a file found by name needs
+/// `LOOKUP` on the badge too: without it an existing entry is answered
+/// `fs_errors::PERMISSION_DENIED`.
+pub const CREATE_OPEN_EXISTING: u64 = 1 << 33;
 /// Remove a file or empty directory from a directory.
 ///
 /// Request: badge = parent-directory cap (must carry `MUTATE_DIR`),
@@ -127,9 +146,10 @@ pub const FS_CREATE: u64 = 13;
 pub const FS_REMOVE: u64 = 14;
 /// Create a new (empty) directory in a directory.
 ///
-/// Request: identical shape to [`FS_CREATE`]. Badge must carry
-/// `MUTATE_DIR`. Allocates one cluster zero-filled with `.` and
-/// `..` entries.
+/// Request: identical shape to [`FS_CREATE`] without its flags
+/// ([`CREATE_OPEN`], [`CREATE_OPEN_EXISTING`]), which are refused
+/// `fs_errors::INVALID_ARGUMENT`. Badge must carry `MUTATE_DIR`.
+/// Allocates one cluster zero-filled with `.` and `..` entries.
 ///
 /// Reply: identical shape to [`FS_CREATE`], `data[0]` = kind (Dir).
 pub const FS_MKDIR: u64 = 15;

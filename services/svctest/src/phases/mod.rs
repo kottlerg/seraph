@@ -12,8 +12,8 @@
 //!
 //! 1. [`startup`] first — argv/env/stack/TLS bring-up before anything
 //!    else touches them.
-//! 2. [`fs_opens`], [`fs_ipc`], [`fs_std`], [`fs_sessions`], and [`fs_faults`] near the end
-//!    (but before [`pwrmgr`]). [`fs_opens`] comes before
+//! 2. [`fs_opens`], [`fs_ipc`], [`fs_std`], [`fs_sessions`], [`fs_create_open`], and
+//!    [`fs_faults`] near the end (but before [`pwrmgr`]). [`fs_opens`] comes before
 //!    [`fs_ipc`]: its eviction phase needs `/data`'s page cache cold (slots
 //!    not yet provisioned), and it writes the slot-reuse file that
 //!    `fs_ipc`'s slot-reuse phase reads and removes.
@@ -75,6 +75,7 @@ pub mod discard;
 pub mod drivers;
 pub mod entropyd;
 pub mod exit_code;
+pub mod fs_create_open;
 pub mod fs_faults;
 pub mod fs_ipc;
 pub mod fs_opens;
@@ -166,6 +167,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(fs_ipc::phases_pre_relative());
     out.extend_from_slice(fs_std::phases());
     out.extend_from_slice(fs_sessions::phases());
+    out.extend_from_slice(fs_create_open::phases());
     out.extend_from_slice(fs_faults::phases());
     out.extend_from_slice(verified_read::phases());
     out.extend_from_slice(namespace::late());

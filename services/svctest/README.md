@@ -151,6 +151,8 @@ services/svctest/
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
         ├── fs_opens.rs        # Per-open fatfs state: dead-open reclaim, close, eviction routing
         ├── fs_sessions.rs     # fatfs sessions: charge on the client's node, LIMIT, return
+        ├── fs_create_open.rs  # A create that opens its file in one request: no entry left at
+        │                      #   the node's max; a create through a grant-less root refused
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
         ├── fs_faults/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
@@ -557,6 +559,9 @@ through to the normal run.
 | `open-reclaim-child`        | `fs_opens`     | `fs_reclaims_dead_opens` (killed client)    |
 | `session-undeliverable-child` | `fs_opens` | `fs_reclaims_dead_opens` (failed session reply) |
 | `fs-session-client`         | `fs_sessions`  | `fs_sessions` (exits holding a session)     |
+| `fs-create-open-full`       | `fs_create_open` | `fs_create_open` (session full at its max) |
+| `fs-create-open-cwd`        | `fs_create_open` | `fs_create_open` (create in the cwd at its max) |
+| `fs-create-open-send-only`  | `fs_create_open` | `fs_create_open` (grant-less root)       |
 | `reclaim-child`             | `memmgr`       | `frame_reclaim_live_object` (held endpoint) |
 | `scrub-child`               | `memmgr`       | `memmgr_frame_scrub` (frames of a death)    |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |

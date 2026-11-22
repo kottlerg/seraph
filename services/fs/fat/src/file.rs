@@ -509,6 +509,22 @@ impl Opens
         }
     }
 
+    /// Name `node` as the node of the open `open`: an `FS_CREATE` with
+    /// `CREATE_OPEN` records its open before the file's entry exists, and
+    /// names the node once it does. `false` when the open is not live.
+    pub fn set_node(&mut self, open: OpenRef, node: NodeId) -> bool
+    {
+        let Some(l) = self.sessions.open(open.0)
+        else
+        {
+            return false;
+        };
+        let mut fields = self.sessions.open_fields(l);
+        fields.node = node.raw();
+        self.sessions.write_open(l, fields);
+        true
+    }
+
     /// End the session `id` names, as the loss of its last liveness copy
     /// would; `false` when it is not live.
     pub fn end_session_by_id(&mut self, id: u64, cache: &PageCache) -> bool

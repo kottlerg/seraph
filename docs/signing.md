@@ -133,7 +133,7 @@ trusted to execute as built.
 | Object | Verified by | Against | Expected role and name |
 |---|---|---|---|
 | Bootloader (PE) | Firmware, when Secure Boot is enabled | The firmware's db (§ Secure Boot) | Not applicable |
-| Kernel (`\EFI\seraph\kernel`) | Bootloader | The trust store built into it | kernel, `kernel` |
+| Kernel (`\EFI\seraph\kernel`) | Bootloader | The store the boot runs on: the one built into it merged with the enrolled one (§ Trust Store) | kernel, `kernel` |
 | The bundle entry `init` | Bootloader | The same store | init, `init` |
 | A bundle entry whose name lies under `/config/`, the boot-time configuration, a platform table excepted (§ Configuration) | Bootloader | The same store | configuration, its entry name: the file's install path |
 | Every other bundle entry | Bootloader | The same store | boot module, its entry name: the object's install path |

@@ -32,6 +32,8 @@ pub const EFI_BUFFER_TOO_SMALL: EfiStatus = 0x8000_0000_0000_0005;
 pub const EFI_INVALID_PARAMETER: EfiStatus = 0x8000_0000_0000_0002;
 pub const EFI_UNSUPPORTED: EfiStatus = 0x8000_0000_0000_0003;
 pub const EFI_NOT_FOUND: EfiStatus = 0x8000_0000_0000_000E;
+/// `EFI_NOT_READY`: `ReadKeyStroke` found no key waiting.
+pub const EFI_NOT_READY: EfiStatus = 0x8000_0000_0000_0006;
 
 /// `EFI_VARIABLE_NON_VOLATILE`: the variable is kept across resets.
 pub const EFI_VARIABLE_NON_VOLATILE: u32 = 0x0000_0001;
@@ -1995,7 +1997,7 @@ unsafe fn read_console_line(
     let result = if status == EFI_SUCCESS
     {
         // SAFETY: con_in is valid; wait_for_key and timer are live events.
-        unsafe { collect_line(con_in, read_fn, wait_fn, [wait_for_key, timer], buffer) }
+        unsafe { collect_line(con_in, read_fn, wait_fn, wait_for_key, timer, buffer) }
     }
     else
     {
@@ -2021,18 +2023,27 @@ type WaitForEvent = unsafe extern "efiapi" fn(
 /// The loop of [`read_console_line`]: wait for a key or the timer, then take
 /// the key.
 ///
+/// The timer is the first event of the wait: `WaitForEvent` returns the
+/// first signalled event in its array's order, so a fired timer ends the wait
+/// even while keys keep arriving. A `ReadKeyStroke` that finds no key
+/// (`EFI_NOT_READY`: the key event fired for a key another reader took)
+/// waits again; any other failure ends the read as
+/// [`LineRead::Unavailable`].
+///
 /// # Safety
 /// `con_in` must be the firmware's `ConIn`, `read_fn` its `ReadKeyStroke`,
-/// `wait_fn` the boot services' `WaitForEvent`, and `events` its
-/// `WaitForKey` and a live timer event, before `ExitBootServices`.
+/// `wait_fn` the boot services' `WaitForEvent`, `wait_for_key` its
+/// `WaitForKey`, and `timer` a live timer event, before `ExitBootServices`.
 unsafe fn collect_line(
     con_in: *mut EfiSimpleTextInput,
     read_fn: ReadKeyStroke,
     wait_fn: WaitForEvent,
-    events: [EfiEvent; 2],
+    wait_for_key: EfiEvent,
+    timer: EfiEvent,
     buffer: &mut [u8],
 ) -> LineRead
 {
+    let events = [timer, wait_for_key];
     let mut len = 0usize;
     loop
     {
@@ -2043,7 +2054,7 @@ unsafe fn collect_line(
         {
             return LineRead::Unavailable(status);
         }
-        if index != 0
+        if index == 0
         {
             crate::bprintln!();
             return LineRead::Timeout;
@@ -2053,11 +2064,14 @@ unsafe fn collect_line(
             unicode_char: 0,
         };
         // SAFETY: con_in is valid (caller contract); key is live.
-        if unsafe { read_fn(con_in, core::ptr::addr_of_mut!(key)) } != EFI_SUCCESS
+        match unsafe { read_fn(con_in, core::ptr::addr_of_mut!(key)) }
         {
+            EFI_SUCCESS =>
+            {}
             // The key event fired for no key (a key another reader took):
             // wait again.
-            continue;
+            EFI_NOT_READY => continue,
+            status => return LineRead::Unavailable(status),
         }
         match line_key(key.unicode_char)
         {
@@ -2157,7 +2171,11 @@ mod tests
         classify_variable_read, map_buffer_bytes, map_buffer_descriptor_reach,
         variable_name_is_terminated,
     };
+    use super::{EFI_NOT_READY, EfiEvent, EfiInputKey, EfiStatus, LineRead, collect_line};
     use super::{EfiBootServices, EfiRuntimeServices, EfiSimpleTextInput, LineKey, line_key};
+
+    /// `EFI_DEVICE_ERROR`.
+    const EFI_DEVICE_ERROR: EfiStatus = 0x8000_0000_0000_0007;
 
     // Defect caught: a service called through the wrong slot of its table
     // (the UEFI specification's order), which calls another service with
@@ -2322,5 +2340,139 @@ mod tests
         }
         check_descriptor_size(full).unwrap();
         check_descriptor_size(full + 8).unwrap();
+    }
+
+    /// The fake firmware of the `collect_line` tests, one per test thread:
+    /// the key event is always signalled, the timer is signalled from the
+    /// `timer_after`-th wait on, and `ReadKeyStroke` returns `reads` in
+    /// turn, then `EFI_NOT_READY`.
+    struct FakeConsole
+    {
+        waits: usize,
+        timer_after: usize,
+        reads: Vec<(EfiStatus, u16)>,
+        next_read: usize,
+    }
+
+    std::thread_local! {
+        static FAKE: core::cell::RefCell<FakeConsole> = const {
+            core::cell::RefCell::new(FakeConsole {
+                waits: 0,
+                timer_after: usize::MAX,
+                reads: Vec::new(),
+                next_read: 0,
+            })
+        };
+    }
+
+    /// The fake key event and timer event.
+    const KEY_EVENT: EfiEvent = core::ptr::without_provenance_mut(1);
+    const TIMER_EVENT: EfiEvent = core::ptr::without_provenance_mut(2);
+    /// Waits after which a test that has not ended the read fails.
+    const WAIT_LIMIT: usize = 1000;
+
+    /// `WaitForEvent` as the UEFI specification gives it: the index of the
+    /// first signalled event in the array's order.
+    unsafe extern "efiapi" fn fake_wait(
+        count: usize,
+        events: *const EfiEvent,
+        index: *mut usize,
+    ) -> EfiStatus
+    {
+        let timer_fired = FAKE.with_borrow_mut(|fake| {
+            fake.waits += 1;
+            assert!(fake.waits < WAIT_LIMIT, "the read never ended");
+            fake.waits >= fake.timer_after
+        });
+        // SAFETY: collect_line passes count live events and a live index.
+        let events = unsafe { core::slice::from_raw_parts(events, count) };
+        let first = events
+            .iter()
+            .position(|&event| event == KEY_EVENT || (event == TIMER_EVENT && timer_fired))
+            .unwrap();
+        // SAFETY: as above.
+        unsafe { index.write(first) };
+        EFI_SUCCESS
+    }
+
+    /// `ReadKeyStroke` returning the scripted statuses and characters.
+    unsafe extern "efiapi" fn fake_read(
+        _: *mut EfiSimpleTextInput,
+        key: *mut EfiInputKey,
+    ) -> EfiStatus
+    {
+        let (status, unicode_char) = FAKE.with_borrow_mut(|fake| {
+            let read = fake.reads.get(fake.next_read).copied();
+            fake.next_read += 1;
+            read.unwrap_or((EFI_NOT_READY, 0))
+        });
+        // SAFETY: collect_line passes a live key.
+        unsafe {
+            key.write(EfiInputKey {
+                scan_code: 0,
+                unicode_char,
+            });
+        }
+        status
+    }
+
+    /// Run `collect_line` on the fake firmware.
+    fn read_fake(timer_after: usize, reads: &[(EfiStatus, u16)]) -> LineRead
+    {
+        FAKE.with_borrow_mut(|fake| {
+            *fake = FakeConsole {
+                waits: 0,
+                timer_after,
+                reads: reads.to_vec(),
+                next_read: 0,
+            };
+        });
+        let mut buffer = [0u8; 8];
+        // SAFETY: the fakes stand for the firmware's functions and events.
+        unsafe {
+            collect_line(
+                core::ptr::null_mut(),
+                fake_read,
+                fake_wait,
+                KEY_EVENT,
+                TIMER_EVENT,
+                &mut buffer,
+            )
+        }
+    }
+
+    // Defect caught: the key event first in the wait's array, so keys that
+    // keep arriving hide a fired timer and the wait never ends.
+    #[test]
+    fn a_fired_timer_ends_the_wait_while_keys_keep_coming()
+    {
+        let keys = [(EFI_SUCCESS, u16::from(b'n')); 64];
+        assert_eq!(read_fake(5, &keys), LineRead::Timeout);
+    }
+
+    // Defect caught: a ReadKeyStroke failure other than EFI_NOT_READY retried
+    // for ever while the key event stays signalled.
+    #[test]
+    fn a_failing_key_read_ends_the_read()
+    {
+        assert_eq!(
+            read_fake(usize::MAX, &[(EFI_DEVICE_ERROR, 0)]),
+            LineRead::Unavailable(EFI_DEVICE_ERROR)
+        );
+    }
+
+    // Defect caught: a key event that fired for a key another reader took
+    // (EFI_NOT_READY) taken as a failure, or the line not read after it.
+    #[test]
+    fn a_key_event_with_no_key_waits_again()
+    {
+        let reads = [
+            (EFI_NOT_READY, 0),
+            (EFI_SUCCESS, u16::from(b'y')),
+            (EFI_SUCCESS, u16::from(b'e')),
+            (EFI_SUCCESS, u16::from(b's')),
+            (EFI_SUCCESS, u16::from(b'\r')),
+        ];
+        assert_eq!(read_fake(usize::MAX, &reads), LineRead::Line { len: 3 });
     }
 }

@@ -226,10 +226,11 @@ Only public names resolve. A name whose cap carries authority is published seed-
 `UNKNOWN_NAME`, as an unknown name does: `rootfs.root`, the five `devmgr.*` names (`devmgr.bind` and
 `devmgr.acpi` included), `vfsd.mount`, `vfsd.swap`, `memmgr.swap`, `logd.query`, and each provider
 name whose badge carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` and `:grant` entries, today
-`pwrmgr.shutdown`, `acpid.power`, `sessiond.operator` and `crashd.core`). `vfsd.deny` carries no
-authority but is seed-only too: it is svctest's test twin, reached only through svctest's recipe. A
-seed-only name reaches a process only through a recipe's `seed = ...` line, which svcmgr resolves
-itself, so its authority stays with the recipes that seed it ([service-definitions.md §
+`pwrmgr.shutdown`, `acpid.power`, `swapd.restore`, `sessiond.operator` and `crashd.core`).
+`vfsd.deny` carries no authority but is seed-only too: it is svctest's test twin, reached only
+through svctest's recipe. A seed-only name reaches a process only through a recipe's `seed = ...`
+line, which svcmgr resolves itself, so its authority stays with the recipes that seed it
+([service-definitions.md §
 `seed`](service-definitions.md#seed)). A seed is `SEND` except `devmgr.bind`, `memmgr.swap` and each
 `:grant` entry (`sessiond.operator`, `crashd.core`), which are `SEND|GRANT`: `BIND_DRIVERS` moves a
 directory cap and the kernel requires `GRANT` for that, the swap labels move caps to memmgr, and a

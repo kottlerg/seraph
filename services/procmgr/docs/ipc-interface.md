@@ -107,7 +107,7 @@ handle (`CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`).
 | the words after them | The name block: the name the object is signed under (§ Image Verification) |
 | cap[0] | Memory capability holding the signed object |
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
-| the cap before the argv/env cap, or before the relay without one, or last without either | When `CREATE_CHARGE_NODE` is set: the node handle the child is charged to (**Memory max and reserve** below) |
+| the cap before the argv/env cap or the checkpoint's object handle, or before the relay without either, or last without any | When `CREATE_CHARGE_NODE` is set: the node handle the child is charged to (**Memory max and reserve** below) |
 | next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: Memory cap holding the argv and env blobs; when `CREATE_RESTORE` is set: the checkpoint's object handle (**Restore** below) |
 | last cap | When `CREATE_DEATH_RELAY` is set: POST-only `EventQueue` cap (**Death relay** below) |
 
@@ -631,7 +631,7 @@ the **Scheduling fields**, and **argv and env** are as for `CREATE_PROCESS`.
 | the words after them | The name block: the file's install path (§ Image Verification) |
 | cap[0] | File cap for the binary, with Grant, as a node cap has it (`SEND_GRANT`): the read session's `FS_SESSION` and `FS_OPEN` move a cap on it (**Read session**), so a cap without Grant fails the create with `IO_ERROR` |
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
-| the cap before the argv/env cap, or before the relay without one, or last without either | When `CREATE_CHARGE_NODE` is set: the charge node's handle, as for `CREATE_PROCESS` |
+| the cap before the argv/env cap or the checkpoint's object handle, or before the relay without either, or last without any | When `CREATE_CHARGE_NODE` is set: the charge node's handle, as for `CREATE_PROCESS` |
 | next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: the argv/env Memory cap; when `CREATE_RESTORE` is set: the checkpoint's object handle; as for `CREATE_PROCESS` |
 | last cap | When `CREATE_DEATH_RELAY` is set: the death-relay cap, as for `CREATE_PROCESS` |
 

@@ -68,6 +68,7 @@ members = [
     "abi/syscall",
     "shared/aml",
     "shared/ansi",
+    "shared/bench",
     "shared/boot-policy",
     "shared/crash-report",
     "shared/crypto",

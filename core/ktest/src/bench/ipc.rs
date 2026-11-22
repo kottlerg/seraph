@@ -7,7 +7,7 @@
 //!
 //! Spawns one child caller that loops `ipc_call`; parent loops
 //! `ipc_recv` / `ipc_reply`. Per-iteration bracketing on the parent
-//! side so min/max/mean are meaningful.
+//! side.
 
 use ipc::IpcMessage;
 use syscall::{
@@ -15,7 +15,7 @@ use syscall::{
     notification_wait, thread_exit,
 };
 
-use super::{cycles_now, log_bench_header};
+use super::Harness;
 use crate::{ChildStack, spawn};
 
 static mut BENCH_IPC_STACK: ChildStack = ChildStack::ZERO;
@@ -71,7 +71,7 @@ extern "C" fn ipc_caller_entry(arg: u64) -> !
     thread_exit()
 }
 
-pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, h: &mut Harness)
 {
     let Ok(ep) = cap_create_endpoint(ctx.memory_base)
     else
@@ -92,7 +92,7 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
         return;
     };
 
-    run_round_trips(ctx, ep, done, &child, iters);
+    run_round_trips(ctx, ep, done, &child, h);
 
     // One cleanup path for every exit: deleting the child's Thread cap also
     // ends a child still parked in `ipc_call` after an early break.
@@ -102,19 +102,19 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
     cap_delete(ep).ok();
 }
 
-/// Start the caller child on `ep`, serve `iters` round trips, and log the
-/// statistics. Returns early, leaving cleanup to the caller, when the child
+/// Start the caller child on `ep`, serve [`Harness::iters`] round trips, and
+/// report the result. Returns early, leaving cleanup to the caller, when the child
 /// cannot be set up.
 fn run_round_trips(
     ctx: &crate::TestContext,
     ep: u64,
     done: u64,
     child: &spawn::SpawnedChild,
-    iters: u32,
+    h: &mut Harness,
 )
 {
     use syscall_abi::RIGHTS_EP_SEND_GRANT;
-    let n = u64::from(iters);
+    let n = u64::from(h.iters());
 
     let Ok(child_ep) = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
     else
@@ -149,13 +149,11 @@ fn run_round_trips(
     }
 
     let reply = IpcMessage::new(0);
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
+    let (mut samples, counters) = h.recorder();
     let mut completed: u64 = 0;
     for _ in 0..n
     {
-        let t0 = cycles_now();
+        let t0 = counters.read();
         // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
         if unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }.is_err()
         {
@@ -166,17 +164,8 @@ fn run_round_trips(
         {
             break;
         }
-        let t1 = cycles_now();
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
+        let t1 = counters.read();
+        samples.record(t1.since(&t0).cycles);
         completed = completed.saturating_add(1);
     }
 
@@ -187,12 +176,7 @@ fn run_round_trips(
     {
         notification_wait(done).ok();
     }
+    let summary = samples.summary();
 
-    log_bench_header("ipc_round_trip", iters);
-    if let Some(mean) = total.checked_div(completed)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    h.report("ipc_round_trip", &[], summary, &[]);
 }

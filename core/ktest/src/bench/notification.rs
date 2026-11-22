@@ -13,7 +13,7 @@ use syscall::{
     thread_exit,
 };
 
-use super::{cycles_now, log_bench_header};
+use super::Harness;
 use crate::{ChildStack, spawn};
 
 static mut BENCH_SIGNAL_STACK: ChildStack = ChildStack::ZERO;
@@ -64,10 +64,11 @@ extern "C" fn notification_pong_entry(arg: u64) -> !
     clippy::similar_names,
     reason = "ping/pong are intentionally paired names for the two directions"
 )]
-pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, h: &mut Harness)
 {
     const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
     const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
+    let iters = h.iters();
     let n = u64::from(iters);
 
     let Ok(ping) = cap_create_notification(ctx.memory_base)
@@ -130,13 +131,10 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
         return;
     }
 
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
-    let mut completed: u64 = 0;
+    let (mut samples, counters) = h.recorder();
     for _ in 0..n
     {
-        let t0 = cycles_now();
+        let t0 = counters.read();
         if notification_send(ping, 1).is_err()
         {
             break;
@@ -145,28 +143,13 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
         {
             break;
         }
-        let t1 = cycles_now();
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
-        completed = completed.saturating_add(1);
+        let t1 = counters.read();
+        samples.record(t1.since(&t0).cycles);
     }
+    let summary = samples.summary();
     notification_wait(done).ok();
 
-    log_bench_header("notification_roundtrip", iters);
-    if let Some(mean) = total.checked_div(completed)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    h.report("notification_roundtrip", &[], summary, &[]);
 
     child.delete_thread().ok();
     cap_delete(ping).ok();

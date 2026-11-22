@@ -5,27 +5,26 @@
 
 //! Tier 3 — Benchmarks / profiling. The file layout and what each benchmark
 //! reports are specified in `core/ktest/README.md` § Source Layout and
-//! § Tier 3; benchmarks log through `crate::log` / `crate::log_u64`.
+//! § Tier 3.
 //!
-//! # Cycle counter access
-//!
-//! Benchmarks read the hardware cycle counter directly — no syscall overhead
-//! on the measurement path:
-//!
-//! - **x86-64**: `rdtsc` (accessible from U-mode: the kernel clears `CR4.TSD`
-//!   on every CPU).
-//! - **RISC-V**: `csrr cycle` (accessible from U-mode: the kernel grants
-//!   `scounteren.CY` on every hart).
+//! Every benchmark reads its thread's counters (`bench::Counters`, from
+//! `shared/bench`) around each measured operation, records one sample per
+//! operation into the one sample buffer, and reports one result line
+//! (`shared/bench/README.md` § Result line) through [`Harness::report`]. The
+//! counter read is an unprivileged instruction, so no syscall sits on the
+//! measurement path: `rdtsc` on x86-64 (the kernel clears `CR4.TSD` on every
+//! CPU) and `csrr cycle` on riscv64 (the kernel sets `scounteren.CY` on every
+//! hart).
 //!
 //! # Adding a new benchmark
 //!
-//! 1. Add a `fn bench_<name>` to the surface's file under `bench/`, placed as
-//!    the README's § Tier 3 layout rule says.
-//! 2. Use `super::cycles_now()` to bracket the measured operation
-//!    per-iteration and accumulate min/mean/max locally, then print the
-//!    header with `super::log_bench_header()` and the three values with
-//!    `crate::log_u64`.
-//! 3. Call it from `run_all` below.
+//! 1. Add a `fn bench_<name>` taking `&mut Harness` to the surface's file
+//!    under `bench/`, placed as the README's § Tier 3 layout rule says.
+//! 2. Take the recorder and the counters with [`Harness::recorder`], run at
+//!    most [`Harness::iters`] iterations, and record each measured
+//!    operation's `Reading::since` cycles.
+//! 3. Report the summary with [`Harness::report`], and call the benchmark
+//!    from [`run_all`] below.
 
 mod cap;
 mod event;
@@ -37,48 +36,171 @@ mod thread;
 mod tlb;
 mod wait_set;
 
-// ── Cycle counter ─────────────────────────────────────────────────────────────
+use ::bench::{Counters, Report, Samples, Summary, Unit, Value};
 
-/// Read the hardware cycle counter (`crate::arch::cycles_now`).
-///
-/// Returns raw cycle counts. Units differ by architecture; use deltas only.
-#[expect(
-    clippy::inline_always,
-    reason = "the counter read must be inlined to avoid call overhead in cycle benchmarks"
-)]
-#[inline(always)]
-pub(super) fn cycles_now() -> u64
+/// Most samples one benchmark records, and so most iterations it runs.
+pub const MAX_ITERS: u32 = 4096;
+
+/// [`MAX_ITERS`] as a buffer length.
+pub(super) const MAX_SAMPLES: usize = MAX_ITERS as usize;
+
+/// The `SYS_THREAD_SET_AFFINITY` argument that clears a thread's hard
+/// affinity.
+const AFFINITY_ANY: u32 = u32::MAX;
+
+/// The sample buffer every benchmark records into in turn (ktest has no heap).
+static mut SAMPLES: [u64; MAX_SAMPLES] = [0; MAX_SAMPLES];
+
+/// What [`run_all`] hands each benchmark: its iteration count, the sample
+/// buffer, ktest's counters and the CPU count its result lines carry.
+pub(super) struct Harness
 {
-    crate::arch::cycles_now()
+    /// Iterations each benchmark runs, at most [`MAX_ITERS`].
+    iters: u32,
+    /// CPUs the system runs (`SystemInfoType::CpuCount`).
+    cpus: u32,
+    /// The counters of ktest's harness thread, opened once.
+    counters: Counters,
+    /// The sample buffer, `SAMPLES`.
+    buf: &'static mut [u64; MAX_SAMPLES],
 }
 
-/// Log the benchmark header line `ktest: bench  <name>  N=<n>`.
-pub(super) fn log_bench_header(name: &str, n: u32)
+impl Harness
 {
-    crate::log_args(format_args!("ktest: bench  {name}  N={n}"));
+    /// Iterations a benchmark runs: the configured count, cut to the samples
+    /// the buffer holds.
+    pub(super) const fn iters(&self) -> u32
+    {
+        self.iters
+    }
+
+    /// An empty recorder over the sample buffer, and the counters to time
+    /// each operation with.
+    pub(super) fn recorder(&mut self) -> (Samples<'_>, &Counters)
+    {
+        (Samples::new(&mut self.buf[..]), &self.counters)
+    }
+
+    /// The whole sample buffer, for a benchmark whose samples other threads
+    /// record (`tlb::bench_tlb_shootdown_concurrent`).
+    pub(super) fn buffer(&mut self) -> &mut [u64]
+    {
+        &mut self.buf[..]
+    }
+
+    /// Log the result line `bench ktest.<name> ...` of `summary`, with its
+    /// variant parameters and extras; a benchmark that recorded no sample
+    /// logs `ktest: bench <name> SKIP` instead. The line is streamed to the
+    /// output channels whole, with no length cut.
+    pub(super) fn report(
+        &self,
+        name: &str,
+        variant: &[(&str, Value<'_>)],
+        summary: Option<Summary>,
+        extras: &[(&str, u64)],
+    )
+    {
+        let Some(summary) = summary
+        else
+        {
+            crate::log_args(format_args!(
+                "ktest: bench {name} SKIP (no sample recorded)"
+            ));
+            return;
+        };
+        let report = Report {
+            suite: "ktest",
+            name,
+            variant,
+            cpus: self.cpus,
+            unit: Unit::Cycles,
+            summary,
+            extras,
+        };
+        if let Err(e) = report.validate()
+        {
+            crate::log_args(format_args!("ktest: bench {name} FAIL (result line: {e})"));
+            return;
+        }
+        // `write` cannot fail after `validate`: the output channels accept
+        // every write.
+        let _ = crate::log_with(|out| report.write(out));
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-/// Run all Tier 3 benchmarks.
+/// Run all Tier 3 benchmarks, `iters` iterations each (cut to
+/// [`MAX_ITERS`]).
 ///
-/// Called from `main.rs` after other tiers complete. Results are logged
-/// directly via `log`/`log_u64`; no PASS/FAIL counters are updated.
+/// Called once, from `main.rs`, after the other tiers complete. Results are
+/// logged as result lines; no PASS/FAIL counters are updated.
 pub fn run_all(ctx: &crate::TestContext, iters: u32)
 {
-    null::bench_null_syscall(ctx, iters);
-    ipc::bench_ipc_round_trip(ctx, iters);
-    notification::bench_notification_roundtrip(ctx, iters);
-    cap::bench_cap_create_delete(ctx, iters);
-    cap::bench_cap_info_lookup(ctx, iters);
-    mm::bench_mem_map_unmap(ctx, iters);
-    mm::bench_mem_protect(ctx, iters);
-    mm::bench_aspace_harvest(ctx, iters);
-    thread::bench_thread_lifecycle(ctx, iters);
-    thread::bench_context_switch(ctx, iters);
-    thread::bench_thread_read_mem(ctx, iters);
-    event::bench_event_post_recv(ctx, iters);
-    wait_set::bench_wait_set(ctx, iters);
-    tlb::bench_tlb_shootdown(ctx, iters);
-    tlb::bench_tlb_shootdown_concurrent(ctx, iters);
+    // SAFETY: `run_all` runs once, on ktest's harness thread, so this is the
+    // only reference to `SAMPLES` there is.
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(SAMPLES) };
+    let cpus = syscall::system_info(syscall_abi::SystemInfoType::CpuCount as u64)
+        .ok()
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(1);
+    // Every benchmark measures on CPU 0, which the workers of the TLB
+    // benchmarks leave to the harness: a counter read is per-CPU, and no two
+    // harts' `cycle` counters are kept in step on riscv64.
+    if !pin_harness(ctx)
+    {
+        crate::log("ktest: bench SKIP (the harness thread did not move to CPU 0)");
+        let _ = syscall::thread_set_affinity(ctx.thread_cap, AFFINITY_ANY);
+        return;
+    }
+    let mut h = Harness {
+        iters: iters.min(MAX_ITERS),
+        cpus,
+        counters: Counters::open(),
+        buf,
+    };
+
+    null::bench_null_syscall(ctx, &mut h);
+    ipc::bench_ipc_round_trip(ctx, &mut h);
+    notification::bench_notification_roundtrip(ctx, &mut h);
+    cap::bench_cap_create_delete(ctx, &mut h);
+    cap::bench_cap_info_lookup(ctx, &mut h);
+    mm::bench_mem_map_unmap(ctx, &mut h);
+    mm::bench_mem_protect(ctx, &mut h);
+    mm::bench_aspace_harvest(ctx, &mut h);
+    thread::bench_thread_lifecycle(ctx, &mut h);
+    thread::bench_context_switch(ctx, &mut h);
+    thread::bench_thread_read_mem(ctx, &mut h);
+    event::bench_event_post_recv(ctx, &mut h);
+    wait_set::bench_wait_set(ctx, &mut h);
+    tlb::bench_tlb_shootdown(ctx, &mut h);
+    tlb::bench_tlb_shootdown_concurrent(ctx, &mut h);
+
+    if syscall::thread_set_affinity(ctx.thread_cap, AFFINITY_ANY).is_err()
+    {
+        crate::log("ktest: bench: restoring the harness thread's affinity failed");
+    }
+}
+
+/// Pin the harness thread to CPU 0 and yield, bounded, until it runs there;
+/// whether it does.
+fn pin_harness(ctx: &crate::TestContext) -> bool
+{
+    /// Yields that give the scheduler the chance to move the thread.
+    const MAX_YIELDS: u32 = 1000;
+
+    if syscall::thread_set_affinity(ctx.thread_cap, 0).is_err()
+    {
+        return false;
+    }
+    let on_cpu0 = || syscall::system_info(syscall_abi::SystemInfoType::CurrentCpu as u64) == Ok(0);
+    for _ in 0..MAX_YIELDS
+    {
+        if on_cpu0()
+        {
+            return true;
+        }
+        let _ = syscall::thread_yield();
+    }
+    on_cpu0()
 }

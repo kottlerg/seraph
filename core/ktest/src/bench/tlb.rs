@@ -13,8 +13,8 @@
 //! call (which triggers an IPI shootdown on every CPU with the aspace
 //! `current`).
 //!
-//! Logs `cpus=N` alongside the result so SMP and UP runs aren't
-//! conflated.
+//! The result line's `cpus=` column and its `workers=` extra (the pinned
+//! workers that ran) keep SMP and UP runs apart.
 //!
 //! ## Worker shutdown contract
 //!
@@ -43,7 +43,9 @@ use syscall::{
 };
 use syscall_abi::SystemInfoType;
 
-use super::{cycles_now, log_bench_header};
+use ::bench::{Counters, Value};
+
+use super::{Harness, MAX_SAMPLES};
 use crate::{ChildStack, spawn};
 
 /// Ceiling on the worker count. CPU 0 is ktest's own; pin children to
@@ -108,18 +110,16 @@ extern "C" fn shootdown_spinner_entry(arg: u64) -> !
     clippy::too_many_lines,
     reason = "setup + measure loop + cooperative teardown form one sequence"
 )]
-pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, h: &mut Harness)
 {
     const BENCH_VA: u64 = 0x1_6200_0000;
 
-    // Print the header up front so failures in the spawn / notification_wait /
+    // Log a start line up front so failures in the spawn / notification_wait /
     // measure loop are bisectable on the boot log instead of looking
-    // like the bench never ran. Min/mean/max are logged after the measure loop
-    // completes at least one iteration, the mean over the iterations completed.
-    log_bench_header("tlb_shootdown_unmap", iters);
+    // like the bench never ran. The result line follows the teardown.
+    crate::log("ktest: bench tlb_shootdown_unmap start");
 
     let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
-    crate::log_u64("ktest: bench  cpus=", cpus);
     #[expect(
         clippy::cast_possible_truncation,
         reason = "usize is 64 bits on every ktest target (x86_64, riscv64), so the u64 CPU count \
@@ -220,12 +220,10 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         spawned = spawned.saturating_add(1);
     }
 
-    crate::log_u64("ktest: bench  pinned_workers=", spawned as u64);
-
     // Wait for every spawned child's unique ready-bit (saturate then drop
     // the loop). Identical bits from N workers would coalesce into one
     // wakeup (docs/ipc-design.md § Notifications), so each worker sends `1 << i`.
-    await_worker_bits(
+    let _ = await_worker_bits(
         ready,
         spawned,
         "ktest: bench  tlb: a worker never reported ready",
@@ -236,19 +234,16 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     {
         // Cooperative teardown even on the early-return path.
         EXIT_REQUESTED.store(true, Ordering::Release);
-        teardown(&mut workers, spawned, ready, done);
+        let _ = teardown(&mut workers, spawned, ready, done);
         return;
     };
 
-    let n = u64::from(iters);
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
-    let mut completed: u64 = 0;
+    let iters = h.iters();
+    let (mut samples, counters) = h.recorder();
     // Whether the frame is left mapped at BENCH_VA (an unmap failed).
     let mut still_mapped = false;
 
-    for _ in 0..n
+    for _ in 0..iters
     {
         // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
@@ -267,28 +262,19 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
             break;
         }
         // Measure the unmap — that's the path that issues the shootdown IPI.
-        let t0 = cycles_now();
+        let t0 = counters.read();
         // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
         let unmapped = unsafe { syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1) }.is_ok();
-        let t1 = cycles_now();
+        let t1 = counters.read();
         if !unmapped
         {
             still_mapped = true;
             break;
         }
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
-        completed = completed.saturating_add(1);
+        samples.record(t1.since(&t0).cycles);
     }
+    let summary = samples.summary();
 
     // A frame still mapped stays out of the pool rather than alias the next
     // test's mapping.
@@ -303,14 +289,14 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     // done bit (bounded), then cap_delete (each Thread is about to exit, or
     // missed the wait; either may still be running).
     EXIT_REQUESTED.store(true, Ordering::Release);
-    teardown(&mut workers, spawned, ready, done);
+    let _ = teardown(&mut workers, spawned, ready, done);
 
-    if let Some(mean) = total.checked_div(completed)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    h.report(
+        "tlb_shootdown_unmap",
+        &[],
+        summary,
+        &[("workers", spawned as u64)],
+    );
 }
 
 /// Wait for every spawned worker's `done` bit, then `cap_delete` all
@@ -320,9 +306,16 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 /// exit, though it may not yet be Exited. If a worker does not report
 /// within the bound, the timeout is logged. Either way a Thread may still
 /// be running when deleted, which the kernel's Thread teardown drains.
-fn teardown(workers: &mut [spawn::SpawnedChild; MAX_PINNED], spawned: usize, ready: u64, done: u64)
+///
+/// Returns the done bits that arrived ([`await_worker_bits`]).
+fn teardown(
+    workers: &mut [spawn::SpawnedChild; MAX_PINNED],
+    spawned: usize,
+    ready: u64,
+    done: u64,
+) -> u64
 {
-    await_worker_bits(
+    let reported = await_worker_bits(
         done,
         spawned,
         "ktest: bench  tlb: a worker never reported done",
@@ -334,17 +327,20 @@ fn teardown(workers: &mut [spawn::SpawnedChild; MAX_PINNED], spawned: usize, rea
     }
     cap_delete(ready).ok();
     cap_delete(done).ok();
+    reported
 }
 
 /// Wait, bounded (`tally::await_all`), for each of the first `spawned`
 /// workers' bit (`1 << i`) on `notif`. On a timeout or a failed wait, log
 /// `label` and return, so a worker that never reports cannot hang the bench
 /// (the benches produce no verdict; their teardown deletes the workers).
-fn await_worker_bits(notif: u64, spawned: usize, label: &'static str)
+///
+/// Returns the worker bits that arrived.
+fn await_worker_bits(notif: u64, spawned: usize, label: &'static str) -> u64
 {
     if spawned == 0
     {
-        return;
+        return 0;
     }
     // `1u64 << spawned` would overflow at `spawned == 64`, but MAX_PINNED
     // caps it well below that.
@@ -355,13 +351,14 @@ fn await_worker_bits(notif: u64, spawned: usize, label: &'static str)
     else
     {
         crate::log(label);
-        return;
+        return 0;
     };
     let mut acc = 0u64;
     if crate::tally::await_all(notif, &mut acc, all, label).is_err()
     {
         crate::log(label);
     }
+    acc
 }
 
 // ── Concurrent-initiator variant ───────────────────────────────────────────────
@@ -371,15 +368,19 @@ fn await_worker_bits(notif: u64, spawned: usize, label: &'static str)
 // loops map/unmap on its own VA and times its own `mem_map` (a Fresh rewrite)
 // and `mem_unmap` (a synchronous shootdown); the shootdown protocol and which
 // rewrites skip it are specified in core/kernel/docs/memory-internals.md § SMP
-// TLB Shootdown. Under that design the concurrent mean tracks the
-// single-initiator mean; this bench is the regression guard for that parity: a
+// TLB Shootdown. Under that design the concurrent unmap latency tracks the
+// single-initiator one; this bench is the regression guard for that parity: a
 // change that reintroduced system-wide shootdown serialization (the issue #188
-// bottleneck) would show up as the concurrent mean diverging above
-// `bench_tlb_shootdown` at the same CPU count.
+// bottleneck) would show up as the concurrent unmap percentiles diverging above
+// `bench_tlb_shootdown`'s at the same CPU count.
 //
-// Workers are pinned (CPUs `1..=W`, matching `bench_tlb_shootdown`) so each
-// `cycles_now()` bracket starts and ends on the same CPU — an unpinned worker
-// could migrate mid-unmap and read two unsynchronized cycle counters.
+// Workers are pinned (CPUs `1..=W`, matching `bench_tlb_shootdown`) and each
+// opens its own counters there, so each bracket starts and ends on the same
+// CPU — an unpinned worker could migrate mid-unmap and read two unsynchronized
+// cycle counters. The workers share the bench's [`Harness::iters`] operations
+// between them, each recording its own stripe of `CONC_MAP_SAMPLES` and
+// `CONC_UNMAP_SAMPLES`; the parent reads the stripes of the workers whose done
+// bit arrived, and reports one line per operation (`op=map`, `op=unmap`).
 
 /// Distinct VA base for the concurrent bench (clear of `BENCH_VA`).
 const CONC_VA_BASE: u64 = 0x1_6400_0000;
@@ -400,7 +401,10 @@ struct ConcArgs
     memory: u64,
     aspace: u64,
     bit_index: usize,
-    iters: u64,
+    /// Iterations this worker runs, and the length of its sample stripe.
+    iters: usize,
+    /// Index of this worker's first sample in the sample arrays.
+    stripe: usize,
 }
 
 static CONC_ARGS: spawn::ArgBlock<ConcArgs, MAX_PINNED> = spawn::ArgBlock::new(ConcArgs {
@@ -410,6 +414,7 @@ static CONC_ARGS: spawn::ArgBlock<ConcArgs, MAX_PINNED> = spawn::ArgBlock::new(C
     aspace: 0,
     bit_index: 0,
     iters: 0,
+    stripe: 0,
 });
 
 /// Release barrier: workers spin here after notifying ready so every worker
@@ -417,44 +422,25 @@ static CONC_ARGS: spawn::ArgBlock<ConcArgs, MAX_PINNED> = spawn::ArgBlock::new(C
 /// the contention the bench measures).
 static CONC_GO: AtomicBool = AtomicBool::new(false);
 
-/// Shared per-unmap latency accumulators (cycles); workers fold via atomic
-/// add / min / max.
-static CONC_LAT_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
-static CONC_LAT_MAX: AtomicU64 = AtomicU64::new(0);
-static CONC_LAT_SUM: AtomicU64 = AtomicU64::new(0);
-static CONC_LAT_CNT: AtomicU64 = AtomicU64::new(0);
+/// The workers' map latencies (cycles), each worker's in its own stripe
+/// ([`ConcArgs::stripe`]). Each loop map is a Fresh rewrite (the VA was just
+/// unmapped), which skips the remote shootdown (see
+/// core/kernel/docs/memory-internals.md § SMP TLB Shootdown), so its cost
+/// stays near a bare syscall's while the unmap still carries the synchronous
+/// shootdown.
+static CONC_MAP_SAMPLES: [AtomicU64; MAX_SAMPLES] = [const { AtomicU64::new(0) }; MAX_SAMPLES];
 
-/// Shared per-map latency accumulators (cycles). Each loop map is a Fresh
-/// rewrite (the VA was just unmapped), which skips the remote shootdown (see
-/// core/kernel/docs/memory-internals.md § SMP TLB Shootdown) — so this mean
-/// drops to ~bare-syscall cost while the unmap mean above still carries the
-/// synchronous shootdown.
-static CONC_MAP_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
-static CONC_MAP_MAX: AtomicU64 = AtomicU64::new(0);
-static CONC_MAP_SUM: AtomicU64 = AtomicU64::new(0);
-static CONC_MAP_CNT: AtomicU64 = AtomicU64::new(0);
+/// The workers' unmap latencies (cycles), striped as [`CONC_MAP_SAMPLES`].
+static CONC_UNMAP_SAMPLES: [AtomicU64; MAX_SAMPLES] = [const { AtomicU64::new(0) }; MAX_SAMPLES];
 
-/// Fold one unmap-latency sample into the shared min/max/sum/count accumulators.
+/// Iterations each worker completed, its map and its unmap sample both
+/// stored.
 ///
-/// Relaxed is sufficient: the parent reads these only after every worker's
-/// `done`-bit handshake, and the `notification_send`/`notification_wait` round-trip
-/// establishes the happens-before that publishes the folds.
-fn conc_fold(d: u64)
-{
-    CONC_LAT_SUM.fetch_add(d, Ordering::Relaxed);
-    CONC_LAT_CNT.fetch_add(1, Ordering::Relaxed);
-    CONC_LAT_MIN.fetch_min(d, Ordering::Relaxed);
-    CONC_LAT_MAX.fetch_max(d, Ordering::Relaxed);
-}
-
-/// Fold one map-latency sample; see [`conc_fold`] for the ordering rationale.
-fn conc_map_fold(d: u64)
-{
-    CONC_MAP_SUM.fetch_add(d, Ordering::Relaxed);
-    CONC_MAP_CNT.fetch_add(1, Ordering::Relaxed);
-    CONC_MAP_MIN.fetch_min(d, Ordering::Relaxed);
-    CONC_MAP_MAX.fetch_max(d, Ordering::Relaxed);
-}
+/// Relaxed is sufficient for the samples and this count: the parent reads them
+/// only for a worker whose `done` bit arrived, and the
+/// `notification_send`/`notification_wait` round-trip establishes the
+/// happens-before that publishes them.
+static CONC_COMPLETED: [AtomicU64; MAX_PINNED] = [const { AtomicU64::new(0) }; MAX_PINNED];
 
 /// Concurrent-initiator worker. `arg`: address of this worker's
 /// [`ConcArgs`].
@@ -472,8 +458,11 @@ extern "C" fn conc_worker_entry(arg: u64) -> !
         aspace,
         bit_index,
         iters,
+        stripe,
     } = unsafe { spawn::child_args(arg) };
     let bit = 1u64 << bit_index;
+    // The worker starts pinned to its CPU, so its counters are that CPU's.
+    let counters = Counters::open();
 
     let Some(va) = (bit_index as u64)
         .checked_mul(CONC_VA_STRIDE)
@@ -491,33 +480,43 @@ extern "C" fn conc_worker_entry(arg: u64) -> !
         let _ = thread_yield();
     }
 
-    for _ in 0..iters
+    let completed = CONC_COMPLETED.get(bit_index);
+    for j in 0..iters
     {
         // Time the map — a Fresh rewrite (the VA is unmapped at loop top); see
         // core/kernel/docs/memory-internals.md § SMP TLB Shootdown.
-        let m0 = cycles_now();
+        let m0 = counters.read();
         // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
         let mr = unsafe { syscall::mem_map(memory, aspace, va, 0, 1, syscall::MAP_WRITABLE) };
-        let m1 = cycles_now();
+        let m1 = counters.read();
         if mr.is_err()
         {
             notification_send(done_slot, bit).ok();
             thread_exit();
         }
-        conc_map_fold(m1.saturating_sub(m0));
         // Time the unmap — the path that issues the shootdown IPI volley.
-        let t0 = cycles_now();
+        let t0 = counters.read();
         // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
         let r = unsafe { syscall::mem_unmap(aspace, va, 1) };
-        let t1 = cycles_now();
+        let t1 = counters.read();
         if r.is_err()
         {
             notification_send(done_slot, bit).ok();
             thread_exit();
         }
-        conc_fold(t1.saturating_sub(t0));
+        let slot = stripe.saturating_add(j);
+        if let (Some(map), Some(unmap), Some(completed)) = (
+            CONC_MAP_SAMPLES.get(slot),
+            CONC_UNMAP_SAMPLES.get(slot),
+            completed,
+        )
+        {
+            map.store(m1.since(&m0).cycles, Ordering::Relaxed);
+            unmap.store(t1.since(&t0).cycles, Ordering::Relaxed);
+            completed.store(j.saturating_add(1) as u64, Ordering::Relaxed);
+        }
     }
 
     notification_send(done_slot, bit).ok();
@@ -529,12 +528,11 @@ extern "C" fn conc_worker_entry(arg: u64) -> !
     clippy::too_many_lines,
     reason = "setup + ready/go barrier + cooperative teardown form one sequence"
 )]
-pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, h: &mut Harness)
 {
-    log_bench_header("tlb_shootdown_concurrent", iters);
+    crate::log("ktest: bench tlb_shootdown_concurrent start");
 
     let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
-    crate::log_u64("ktest: bench  cpus=", cpus);
     #[expect(
         clippy::cast_possible_truncation,
         reason = "usize is 64 bits on every ktest target (x86_64, riscv64), so the u64 CPU count \
@@ -544,20 +542,16 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     if want == 0
     {
         // UP guest: no remote CPU to shoot down, nothing to contend on.
-        crate::log_u64("ktest: bench  conc_workers=", 0);
+        crate::log("ktest: bench tlb_shootdown_concurrent SKIP (one CPU)");
         return;
     }
 
     // Reset shared state so a re-run starts clean.
     CONC_GO.store(false, Ordering::Release);
-    CONC_LAT_MIN.store(u64::MAX, Ordering::Release);
-    CONC_LAT_MAX.store(0, Ordering::Release);
-    CONC_LAT_SUM.store(0, Ordering::Release);
-    CONC_LAT_CNT.store(0, Ordering::Release);
-    CONC_MAP_MIN.store(u64::MAX, Ordering::Release);
-    CONC_MAP_MAX.store(0, Ordering::Release);
-    CONC_MAP_SUM.store(0, Ordering::Release);
-    CONC_MAP_CNT.store(0, Ordering::Release);
+    for completed in &CONC_COMPLETED
+    {
+        completed.store(0, Ordering::Release);
+    }
 
     let Ok(ready) = cap_create_notification(ctx.memory_base)
     else
@@ -586,6 +580,12 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
             None => break,
         }
     }
+
+    // The bench's iterations, shared among the workers, each stripe within the
+    // sample arrays.
+    let per_worker = (h.iters() as usize)
+        .div_ceil(allocated.max(1))
+        .min(MAX_SAMPLES.checked_div(allocated).unwrap_or(0));
 
     let mut workers = [const { spawn::SpawnedChild::EMPTY }; MAX_PINNED];
     let mut spawned = 0usize;
@@ -661,7 +661,8 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
                     memory: child_memory,
                     aspace: child_aspace,
                     bit_index: i,
-                    iters: u64::from(iters),
+                    iters: per_worker,
+                    stripe: i.saturating_mul(per_worker),
                 },
             )
         };
@@ -687,10 +688,8 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         spawned = spawned.saturating_add(1);
     }
 
-    crate::log_u64("ktest: bench  conc_workers=", spawned as u64);
-
     // Wait for every worker's unique ready bit, then release them together.
-    await_worker_bits(
+    let _ = await_worker_bits(
         ready,
         spawned,
         "ktest: bench  tlb: a worker never reported ready",
@@ -700,7 +699,7 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     // Cooperative teardown: wait every worker's done bit (each is about to
     // thread_exit), then delete caps; a worker may still be running when
     // deleted (its bit precedes thread_exit, or it missed the bounded wait).
-    teardown(&mut workers, spawned, ready, done);
+    let reported = teardown(&mut workers, spawned, ready, done);
 
     for (i, fr) in memory_caps.iter().enumerate().take(allocated)
     {
@@ -727,33 +726,60 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         }
     }
 
-    let map_cnt = CONC_MAP_CNT.load(Ordering::Acquire);
-    if let Some(map_mean) = CONC_MAP_SUM.load(Ordering::Acquire).checked_div(map_cnt)
-    {
-        // Fresh-map latency: with the shootdown elided this is ~bare syscall,
-        // well below the unmap (shootdown) mean below.
-        crate::log_u64(
-            "ktest: bench  conc_map_cycles_min=",
-            CONC_MAP_MIN.load(Ordering::Acquire),
-        );
-        crate::log_u64("ktest: bench  conc_map_cycles_mean=", map_mean);
-        crate::log_u64(
-            "ktest: bench  conc_map_cycles_max=",
-            CONC_MAP_MAX.load(Ordering::Acquire),
-        );
-    }
+    let extras = [("workers", spawned as u64)];
+    let map = gather(h.buffer(), &CONC_MAP_SAMPLES, reported, spawned, per_worker);
+    h.report(
+        "tlb_shootdown_concurrent",
+        &[("op", Value::Word("map"))],
+        map,
+        &extras,
+    );
+    let unmap = gather(
+        h.buffer(),
+        &CONC_UNMAP_SAMPLES,
+        reported,
+        spawned,
+        per_worker,
+    );
+    h.report(
+        "tlb_shootdown_concurrent",
+        &[("op", Value::Word("unmap"))],
+        unmap,
+        &extras,
+    );
+}
 
-    let cnt = CONC_LAT_CNT.load(Ordering::Acquire);
-    if let Some(mean) = CONC_LAT_SUM.load(Ordering::Acquire).checked_div(cnt)
+/// Copy into `buf` the samples of `samples` that the first `spawned` workers
+/// whose bit is in `reported` completed, each from its stripe of
+/// `per_worker` entries, and summarise them.
+fn gather(
+    buf: &mut [u64],
+    samples: &[AtomicU64; MAX_SAMPLES],
+    reported: u64,
+    spawned: usize,
+    per_worker: usize,
+) -> Option<::bench::Summary>
+{
+    let mut recorder = ::bench::Samples::new(buf);
+    for (i, completed) in CONC_COMPLETED.iter().enumerate().take(spawned)
     {
-        crate::log_u64(
-            "ktest: bench  conc_cycles_min=",
-            CONC_LAT_MIN.load(Ordering::Acquire),
-        );
-        crate::log_u64("ktest: bench  conc_cycles_mean=", mean);
-        crate::log_u64(
-            "ktest: bench  conc_cycles_max=",
-            CONC_LAT_MAX.load(Ordering::Acquire),
-        );
+        if reported & (1u64 << i) == 0
+        {
+            continue;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "usize is 64 bits on every ktest target (x86_64, riscv64)"
+        )]
+        let count = (completed.load(Ordering::Relaxed) as usize).min(per_worker);
+        let stripe = samples
+            .iter()
+            .skip(i.saturating_mul(per_worker))
+            .take(count);
+        for sample in stripe
+        {
+            recorder.record(sample.load(Ordering::Relaxed));
+        }
     }
+    recorder.summary()
 }

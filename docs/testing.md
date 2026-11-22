@@ -260,7 +260,8 @@ cargo xtask run
 
 Reset to the default-init bundle by re-running `cargo xtask build` or
 `mkdisk --harness init`. ktest's runtime options bake in as
-compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`
+compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`, or
+`KtestConfig::BENCH` in a `cargo xtask build --ktest-bench-only` build
 (see [xtask/README.md](../xtask/README.md#cargo-xtask-mkdisk)).
 
 ### Interactive input (`terminal` case)

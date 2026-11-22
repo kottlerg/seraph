@@ -7,11 +7,11 @@
 
 use syscall::{cap_delete, event_post, event_queue_create, event_recv};
 
-use super::{cycles_now, log_bench_header};
+use super::Harness;
 
-pub(super) fn bench_event_post_recv(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_event_post_recv(ctx: &crate::TestContext, h: &mut Harness)
 {
-    let n = u64::from(iters);
+    let iters = h.iters();
 
     let Ok(eq) = event_queue_create(ctx.memory_base, 4)
     else
@@ -19,13 +19,11 @@ pub(super) fn bench_event_post_recv(ctx: &crate::TestContext, iters: u32)
         return;
     };
 
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
+    let (mut samples, counters) = h.recorder();
 
-    for i in 0..n
+    for i in 0..u64::from(iters)
     {
-        let t0 = cycles_now();
+        let t0 = counters.read();
         if event_post(eq, i).is_err()
         {
             break;
@@ -34,26 +32,12 @@ pub(super) fn bench_event_post_recv(ctx: &crate::TestContext, iters: u32)
         {
             break;
         }
-        let t1 = cycles_now();
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
+        let t1 = counters.read();
+        samples.record(t1.since(&t0).cycles);
     }
 
+    let summary = samples.summary();
     cap_delete(eq).ok();
 
-    log_bench_header("event_post_recv", iters);
-    if let Some(mean) = total.checked_div(n)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    h.report("event_post_recv", &[], summary, &[]);
 }

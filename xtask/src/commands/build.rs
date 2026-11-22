@@ -645,6 +645,15 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         clippy_host(ctx)?;
     }
 
+    if args.ktest_bench_only
+        && !matches!(
+            args.component,
+            BuildComponent::All | BuildComponent::Spec("ktest")
+        )
+    {
+        bail!("--ktest-bench-only builds ktest: give --component all or --component ktest");
+    }
+
     match args.component
     {
         BuildComponent::Boot => build_boot(ctx, args)?,
@@ -903,6 +912,7 @@ fn build_group(
         flags.push("--bin".into());
         flags.push((*name).to_string());
     }
+    flags.extend(feature_flags(args, &names));
     flags.extend([
         "--target".into(),
         triple.into(),
@@ -975,6 +985,21 @@ fn build_group(
     Ok(())
 }
 
+/// The cargo feature flags of a build of the components `names`: ktest's
+/// `bench-only` feature under `--ktest-bench-only` when ktest is among them,
+/// none otherwise.
+fn feature_flags(args: &BuildArgs, names: &[&str]) -> Vec<String>
+{
+    if args.ktest_bench_only && names.contains(&"ktest")
+    {
+        vec!["--features".into(), "ktest/bench-only".into()]
+    }
+    else
+    {
+        Vec::new()
+    }
+}
+
 // ── Single component build ────────────────────────────────────────────────────
 
 /// Why `spec` may not be built for `arch`: it is an [`Spec::arch_only`]
@@ -1017,6 +1042,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
         build_std_flag,
         "-Zbuild-std-features=compiler-builtins-mem".into(),
     ];
+    flags.extend(feature_flags(args, &[spec.name]));
     if args.profile() == Profile::Release
     {
         flags.push("--release".into());
@@ -1474,6 +1500,30 @@ fn debug_config_flags(args: &BuildArgs, pkg: &str) -> Vec<String>
 mod tests
 {
     use super::*;
+
+    // Defect caught: `--ktest-bench-only` building ktest without its
+    // `bench-only` feature, or passing the feature to a build without ktest,
+    // where cargo refuses a feature of a package it does not build.
+    #[test]
+    fn the_bench_only_feature_goes_to_ktest_builds_only()
+    {
+        let build = |ktest_bench_only| BuildArgs {
+            arch: Arch::X86_64,
+            release: false,
+            component: BuildComponent::All,
+            debug: Vec::new(),
+            skip_lints: true,
+            ktest_bench_only,
+            host: crate::cli::HostArgs::default(),
+        };
+        let none: [String; 0] = [];
+        assert_eq!(
+            feature_flags(&build(true), &["init", "ktest"]),
+            ["--features", "ktest/bench-only"]
+        );
+        assert_eq!(feature_flags(&build(true), &["init", "procmgr"]), none);
+        assert_eq!(feature_flags(&build(false), &["ktest"]), none);
+    }
 
     #[test]
     fn every_cargo_command_builds_without_incremental_compilation()

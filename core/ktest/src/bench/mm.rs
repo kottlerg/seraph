@@ -5,29 +5,30 @@
 
 //! Memory-management benchmarks: map/unmap, protect.
 
-use super::{cycles_now, log_bench_header};
+use ::bench::Value;
 
-pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
+use super::Harness;
+
+/// Benchmark: `mem_map` of one page followed by its `mem_unmap`, timed
+/// together.
+pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, h: &mut Harness)
 {
     const BENCH_VA: u64 = 0x1_6000_0000;
 
-    let n = u64::from(iters);
+    let iters = h.iters();
     let Some(memory_cap) = crate::frame_pool::alloc()
     else
     {
         return;
     };
 
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
-    let mut completed: u64 = 0;
+    let (mut samples, counters) = h.recorder();
     // Whether the frame is left mapped at BENCH_VA (an unmap failed).
     let mut still_mapped = false;
 
-    for _ in 0..n
+    for _ in 0..iters
     {
-        let t0 = cycles_now();
+        let t0 = counters.read();
         // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
         if unsafe {
@@ -51,18 +52,7 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
             still_mapped = true;
             break;
         }
-        let t1 = cycles_now();
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
-        completed = completed.saturating_add(1);
+        samples.record(counters.read().since(&t0).cycles);
     }
 
     // A frame still mapped stays out of the pool rather than alias the next
@@ -74,24 +64,18 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
         unsafe { crate::frame_pool::free(memory_cap) };
     }
 
-    log_bench_header("mem_map_unmap", iters);
-    // Averaged over the completed iterations; none completed logs no statistics.
-    if let Some(mean) = total.checked_div(completed)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    let summary = samples.summary();
+    h.report("mem_map_unmap", &[], summary, &[]);
 }
 
 /// Benchmark: alternate `mem_protect(MAP_READ)` (read-only) and
 /// `mem_protect(MAP_WRITABLE)` on a pre-mapped page. Measures the cost of one round-trip permission
 /// flip — relevant for any future mmap-like userspace API.
-pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_mem_protect(ctx: &crate::TestContext, h: &mut Harness)
 {
     const BENCH_VA: u64 = 0x1_6100_0000;
 
-    let n = u64::from(iters);
+    let iters = h.iters();
     let Some(memory_cap) = crate::frame_pool::alloc()
     else
     {
@@ -117,14 +101,10 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
         return;
     }
 
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
-    let mut completed: u64 = 0;
-
-    for _ in 0..n
+    let (mut samples, counters) = h.recorder();
+    for _ in 0..iters
     {
-        let t0 = cycles_now();
+        let t0 = counters.read();
         // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
         if unsafe {
@@ -149,19 +129,9 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
         {
             break;
         }
-        let t1 = cycles_now();
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
-        completed = completed.saturating_add(1);
+        samples.record(counters.read().since(&t0).cycles);
     }
+    let summary = samples.summary();
 
     // A frame whose unmap failed stays out of the pool rather than alias the
     // next test's mapping.
@@ -173,14 +143,7 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
         unsafe { crate::frame_pool::free(memory_cap) };
     }
 
-    log_bench_header("mem_protect_pair", iters);
-    // Averaged over the completed iterations; none completed logs no statistics.
-    if let Some(mean) = total.checked_div(completed)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    h.report("mem_protect_pair", &[], summary, &[]);
 }
 
 /// Scratch VA (crate docs § Scratch VAs) of the harvest benchmarks' pages.
@@ -198,8 +161,8 @@ fn harvest_page(i: usize) -> u64
         .wrapping_add(HARVEST_VA)
 }
 
-/// Benchmark: `SYS_ASPACE_HARVEST` of [`HARVEST_PAGES`] pages, as cycles per
-/// harvested page, in two cases.
+/// Benchmark: one `SYS_ASPACE_HARVEST` call over [`HARVEST_PAGES`] pages
+/// (variant `pages=`), in two cases.
 ///
 /// - `aspace_harvest_all_accessed` re-protects the range with its own rights
 ///   before each timed call, outside the timed region. The rewrite installs
@@ -209,7 +172,7 @@ fn harvest_page(i: usize) -> u64
 ///   setting the bit again.
 /// - `aspace_harvest_none_accessed` times a harvest of pages that nothing
 ///   touches between calls, so every page reads clear after the first call.
-pub(super) fn bench_aspace_harvest(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_aspace_harvest(ctx: &crate::TestContext, h: &mut Harness)
 {
     let mut frames: [Option<crate::frame_pool::FrameGuard>; HARVEST_PAGES] = Default::default();
     for (i, slot) in frames.iter_mut().enumerate()
@@ -248,16 +211,16 @@ pub(super) fn bench_aspace_harvest(ctx: &crate::TestContext, iters: u32)
             )
         };
     };
-    harvest_case(ctx, iters, "aspace_harvest_all_accessed", &reprotect);
-    harvest_case(ctx, iters, "aspace_harvest_none_accessed", &|| {});
+    harvest_case(ctx, h, "aspace_harvest_all_accessed", &reprotect);
+    harvest_case(ctx, h, "aspace_harvest_none_accessed", &|| {});
 }
 
 /// One harvest benchmark case over the pages [`bench_aspace_harvest`] mapped:
-/// `iters` timed harvests, each preceded by `before`, which runs outside the
-/// timed region.
-fn harvest_case(ctx: &crate::TestContext, iters: u32, name: &str, before: &dyn Fn())
+/// [`Harness::iters`] timed harvests, each preceded by `before`, which runs
+/// outside the timed region.
+fn harvest_case(ctx: &crate::TestContext, h: &mut Harness, name: &str, before: &dyn Fn())
 {
-    let n = u64::from(iters);
+    let iters = h.iters();
     let pages = HARVEST_PAGES as u64;
     let mut bitmap = [0u8; HARVEST_PAGES / 8];
     // The first harvest reports every page (the kernel installs leaves
@@ -267,51 +230,20 @@ fn harvest_case(ctx: &crate::TestContext, iters: u32, name: &str, before: &dyn F
         return;
     }
 
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
-    let mut completed: u64 = 0;
-
-    for _ in 0..n
+    let (mut samples, counters) = h.recorder();
+    for _ in 0..iters
     {
         before();
-        let t0 = cycles_now();
+        let t0 = counters.read();
         let harvested = syscall::aspace_harvest(ctx.aspace_cap, HARVEST_VA, pages, &mut bitmap);
-        let t1 = cycles_now();
+        let t1 = counters.read();
         if harvested.is_err()
         {
             break;
         }
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
-        completed = completed.saturating_add(1);
+        samples.record(t1.since(&t0).cycles);
     }
+    let summary = samples.summary();
 
-    log_bench_header(name, iters);
-    // Per page, averaged over the completed iterations; none completed logs no
-    // statistics.
-    if let Some(mean) = total.checked_div(completed)
-    {
-        crate::log_u64("ktest: bench  pages=", pages);
-        crate::log_u64(
-            "ktest: bench  cycles_per_page_min=",
-            min.checked_div(pages).unwrap_or(0),
-        );
-        crate::log_u64(
-            "ktest: bench  cycles_per_page_mean=",
-            mean.checked_div(pages).unwrap_or(0),
-        );
-        crate::log_u64(
-            "ktest: bench  cycles_per_page_max=",
-            max.checked_div(pages).unwrap_or(0),
-        );
-    }
+    h.report(name, &[("pages", Value::Num(pages))], summary, &[]);
 }

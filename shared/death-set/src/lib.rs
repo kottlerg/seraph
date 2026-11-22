@@ -18,6 +18,8 @@
 //! syscalls and funds the objects through `std::os::seraph`, so it is
 //! compiled only for seraph.
 
+#[cfg(any(test, target_os = "seraph"))]
+mod members;
 #[cfg(any(test, feature = "model"))]
 pub mod model;
 pub mod overflow;

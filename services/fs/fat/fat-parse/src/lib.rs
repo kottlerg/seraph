@@ -1146,7 +1146,10 @@ pub fn parse_dir_entry(raw: &[u8; 32]) -> Option<DirEntry>
 /// Check if an 8.3 directory entry name matches a path component.
 ///
 /// The path component is converted to uppercase and compared against
-/// the space-padded 8.3 name in the directory entry.
+/// the space-padded 8.3 name in the directory entry. A component whose
+/// base is longer than 8 bytes or whose extension is longer than 3 spells
+/// no short name and matches none: it names an entry by its long name only,
+/// so a long name never matches another entry's short name by its prefix.
 #[must_use]
 pub fn name_matches(entry_name: &[u8; 11], component: &[u8]) -> bool
 {
@@ -1157,6 +1160,10 @@ pub fn name_matches(entry_name: &[u8; 11], component: &[u8]) -> bool
     let mut parts = component.splitn(2, |&b| b == b'.');
     let base = parts.next().unwrap_or_default();
     let ext = parts.next().unwrap_or_default();
+    if base.len() > 8 || ext.len() > 3
+    {
+        return false;
+    }
     for (dst, &b) in padded[..8].iter_mut().zip(base)
     {
         *dst = to_upper(b);
@@ -2648,10 +2655,15 @@ mod tests
     }
 
     #[test]
-    fn name_matches_truncates_base_and_ext_to_8_and_3()
+    fn a_component_longer_than_8_3_matches_no_short_name()
     {
-        // Only the first 8 base and first 3 ext chars participate (FAT 8.3).
-        assert!(name_matches(b"LONGNAMEEXT", b"longnamethatislong.extra"));
+        // A long name names its entry by the long name alone: its prefix
+        // never matches another entry's short name.
+        assert!(!name_matches(b"LONGNAMEEXT", b"longnamethatislong.extra"));
+        assert!(!name_matches(b"FOOBAR~1   ", b"foobar~1 extra"));
+        assert!(!name_matches(b"FILE    TXT", b"file.txta"));
+        // The longest short-name spelling still matches.
+        assert!(name_matches(b"LONGNAMEEXT", b"longname.ext"));
     }
 
     #[test]

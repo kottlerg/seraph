@@ -990,9 +990,15 @@ passes the sub-node's handle with `CREATE_CHARGE_NODE` (§ Node Handles).
 |---|---|
 | label | 15 |
 | data[0] | `max_pages` — the sub-node's max, `u64::MAX` for none |
+| data[1] | flags: `SUB_NODE_RESERVE` (bit 0) or none |
 
-The sub-node is outside the reserve, and its max is clamped to what the
-handle's node and its ancestors have left. Its handle state belongs to the
+The sub-node is outside the reserve unless `data[1]` sets
+`SUB_NODE_RESERVE`, which memmgr honours only when the handle's node is a
+reserve node and `max_pages` is finite; the sub-node is then a reserve node,
+and its max bounds what its subtree can take of the reserve
+([memory-pool.md](memory-pool.md#distribution-policy) § Distribution policy,
+System reserve). Its max is clamped to what the handle's node and its
+ancestors have left. Its handle state belongs to the
 owner of the handle's state, and goes when that process dies or on
 `NODE_RELEASE` (§ Label 18). A reply that does not reach the caller drops the
 state, so no unnamed sub-node is left behind.
@@ -1010,7 +1016,7 @@ state, so no unnamed sub-node is left behind.
 | Code | Name | Meaning |
 |---|---|---|
 | 3 | `QUOTA` | The node, its handle state or its index entry could not be allocated (system RAM exhausted), the key draw failed, or the handle could not be derived |
-| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state, or its owner holds no record |
+| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state, or its owner holds no record; `data[1]` sets a bit other than `SUB_NODE_RESERVE`; or it sets `SUB_NODE_RESERVE` with `max_pages` `u64::MAX` or under a node outside the reserve |
 | 5 | `UNAUTHORIZED` | The badge is not a node handle, or is a charge-only one |
 
 ### Label 16: `NODE_QUERY_USAGE`
@@ -1111,6 +1117,7 @@ divides its own budget this way; it holds no handle to its own node.
 |---|---|
 | label | 19 |
 | data[0] | `max_pages` — the sub-node's max, `u64::MAX` for none |
+| data[1] | flags, as `NODE_CREATE`'s |
 
 As `NODE_CREATE` (§ Label 15), with the caller's node as the parent and the
 caller as the owner of the sub-node's handle state.
@@ -1123,7 +1130,7 @@ caller as the owner of the sub-node's handle state.
 | Code | Name | Meaning |
 |---|---|---|
 | 3 | `QUOTA` | As `NODE_CREATE` |
-| 4 | `INVALID_ARGUMENT` | Unknown badge |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, or flags `NODE_CREATE` refuses, the caller's node standing for the handle's |
 | 5 | `UNAUTHORIZED` | The badge is a node handle |
 
 ### Label 20: `DISCARD_RANGE`

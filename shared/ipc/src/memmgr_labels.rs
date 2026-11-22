@@ -427,10 +427,20 @@ pub const NODE_SET_MAX: u64 = 14;
 
 /// Create a sub-node under the handle's budget node, on a node handle.
 /// `data[0]` is its max in pages, `u64::MAX` for none, clamped as
-/// [`NODE_SET_MAX`] clamps. Reply (`SUCCESS`): `data[0]` the max it took,
-/// `caps[0]` its node handle. Specified in
+/// [`NODE_SET_MAX`] clamps; `data[1]` its flags, [`SUB_NODE_RESERVE`] or
+/// none, any other bit refused `INVALID_ARGUMENT`. Reply (`SUCCESS`):
+/// `data[0]` the max it took, `caps[0]` its node handle. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 15: `NODE_CREATE`.
 pub const NODE_CREATE: u64 = 15;
+
+/// [`NODE_CREATE`] and [`CREATE_SUB_NODE`] flag (`data[1]`): make the
+/// sub-node in the system reserve, so a charge to it may take the free pages
+/// a node outside the reserve must leave. Honoured only under a reserve
+/// parent and with a finite max, which bounds what the sub-node's subtree can
+/// take of the reserve; refused `INVALID_ARGUMENT` otherwise. Specified in
+/// `services/memmgr/docs/memory-pool.md` § Distribution policy, **System
+/// reserve**.
+pub const SUB_NODE_RESERVE: u64 = 1;
 
 /// Read the usage of the handle's budget node, on a node handle. Reply
 /// (`SUCCESS`): as [`QUERY_MEMORY_USAGE`], `data[0]` its own pages,
@@ -468,7 +478,7 @@ pub const NODE_RELEASE: u64 = 18;
 
 /// Create a sub-node under the caller's own budget node, attributed by
 /// `recv.badge`, so the caller can charge processes it creates to one
-/// budget they share inside its own. `data[0]` and the reply as
+/// budget they share inside its own. `data[0]`, `data[1]` and the reply as
 /// [`NODE_CREATE`]. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 19: `CREATE_SUB_NODE`.
 pub const CREATE_SUB_NODE: u64 = 19;

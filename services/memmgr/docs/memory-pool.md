@@ -761,6 +761,18 @@ growth floor, declined with code 7 when they hold not even the faulting page. A 
 node may take the reserve, but not a page `promised` holds. It is a floor for the core and a limit
 on no process: memmgr's self-funding, which is charged to no node, and the reserve nodes draw on it.
 Reserve membership is an attribute each node takes when it is created, not one its children inherit.
+A sub-node (`NODE_CREATE`, `CREATE_SUB_NODE`) is outside the reserve unless its creator asks with
+`SUB_NODE_RESERVE`, which memmgr honours only under a reserve parent and with a finite max: the
+max bounds what the sub-node's subtree can take of the reserve, so no holder of a reserve node can
+hand the whole reserve to a sub-node. A reserve sub-node may make reserve sub-nodes of its own on
+the same terms, each inside its max. The flag is a decision of the creator of each sub-node: procmgr
+sets it for the one-page node of a read session charged to a reserve account (the create of a
+reserve service, or a `READ_VERIFIED` of a reserve sender), so a reserve service's restart is
+backed from the reserve as its own pages are
+([services/procmgr/docs/ipc-interface.md](../../procmgr/docs/ipc-interface.md) § Label 13, **Read
+session**); every other sub-node in the default image, sessiond's session nodes among them, is made
+without it and stays outside the reserve, since what a session's users charge is not the recovery
+the reserve keeps memory for.
 The nodes of memmgr's boot records (procmgr's, and memmgr's and init's own) and of init's children
 (devmgr, vfsd and svcmgr) are reserve nodes, and so is the node of a process created with procmgr's
 reserve creation flag (`CREATE_RESERVE`), which procmgr honours only from a reserve creator, as it

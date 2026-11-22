@@ -2378,12 +2378,18 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    // The sender's account and whether its node is a reserve node, which the
+    // read session's node then is too (image::read_file).
+    let mut reserve = false;
     let memmgr = {
         let state = ctx.tables.lock();
         state
             .table
             .find_by_badge(req.badge)
-            .map(|entry| entry.memmgr_send_cap)
+            .map(|entry| {
+                reserve = entry.reserve;
+                entry.memmgr_send_cap
+            })
             .map(|cap| {
                 if cap == 0
                 {
@@ -2415,7 +2421,10 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         ctx.self_aspace,
         file_cap,
         read.len,
-        memmgr.cap(),
+        image::Account {
+            memmgr: memmgr.cap(),
+            reserve,
+        },
         ipc_buf,
         image::Shape::Contiguous,
     )
@@ -2902,7 +2911,10 @@ fn create_child(
             ctx.self_aspace,
             request.source_cap.disarm(),
             request.len,
-            mms.cap(),
+            image::Account {
+                memmgr: mms.cap(),
+                reserve: sched.budget.reserve,
+            },
             ipc_buf,
             image::Shape::BestEffort,
         ),

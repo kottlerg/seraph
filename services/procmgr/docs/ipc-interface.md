@@ -359,7 +359,10 @@ The label's bit 32 (`CREATE_RESERVE`) makes the child's node a system-reserve no
 the free pages memmgr keeps in reserve. procmgr honours it only from a creator whose own node is a
 reserve node, and from any other replies `INVALID_ARGUMENT` before any resource is acquired, as for
 `CREATE_PHYS_ACCESS`; it refuses the flag with `CREATE_CHARGE_NODE` in the same way, from any
-creator, since a handle may name a sub-node, which is never in the reserve. A child of the
+creator, since the child's node would sit under the handle's node, whose reserve membership
+procmgr does not know: a sub-node is outside the reserve unless its creator asked for it
+(`SUB_NODE_RESERVE`, [memory-pool.md](../../memmgr/docs/memory-pool.md) § Distribution policy,
+System reserve). A child of the
 un-badged creator that is not charged to a node handle is a reserve node with or without the flag,
 so init's children are, and procmgr records each child's membership for the check on its own
 creates. procmgr trusts the un-badged creator as it does for `CREATE_PHYS_ACCESS`: svcmgr never
@@ -642,22 +645,29 @@ death-relay cap is kept or deleted as for `CREATE_PROCESS` (§ Label 1, **Death 
 cap standing in for cap[0].
 
 **Read session.** A file server records each open, and the page the opener holds, in a session
-charged to the opener's client ([fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md)
-§ Label 23), and procmgr starts one on the file cap for each read and ends it after the read. It
-makes a sub-node of the account the copy is granted on (`CREATE_SUB_NODE` on that account's memmgr
-SEND: the child's for a create), with a max of `READ_SESSION_MAX_PAGES` (one page,
-`process-table/src/fs_reads.rs`), sends a charge-only handle to it (`NODE_CHARGE_HANDLE`) in
+charged to the opener's client ([fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) § Label
+23), and procmgr starts one on the file cap for each read and ends it after the read. It makes a
+sub-node of the account the copy is granted on (`CREATE_SUB_NODE` on that account's memmgr SEND: the
+child's for a create), with a max of `READ_SESSION_MAX_PAGES` (one page,
+`process-table/src/fs_reads.rs`), in the system reserve (`SUB_NODE_RESERVE`) when the account's node
+is a reserve node, a child created with `CREATE_RESERVE` or a reserve sender of `READ_VERIFIED`, so
+the create of a reserve service is backed from the reserve while memory is critical, as its own
+pages are, and outside it otherwise. It sends a charge-only handle to it (`NODE_CHARGE_HANDLE`) in
 `FS_SESSION`, and opens the file with the session cap. Once the copy is done it deletes the
 session's liveness cap and then `FS_CLOSE`s the open, the session's last, so the server ends the
 session before it replies (fs-driver-protocol.md § Label 3) and the charge is back on the account
 before procmgr answers the request; it then releases the sub-node (`NODE_RELEASE`) and deletes its
 handle, which ends the session at the server's next sweep when the close did not reach it. The max
-is one page by design:
-the node is not procmgr's own but the creator's, charged per read, and one page holds the session,
-its one open and the one page procmgr holds, while it bounds what a server procmgr does not trust
-can charge the account for a read. A max refusal of the session or the open (`fs_errors::LIMIT`)
-fails the create with `LIMIT`; a refusal of the sub-node or its handle fails it as a refusal of the
-copy does.
+is one page by design: the node is not procmgr's own but the creator's, charged per read, and one
+page holds the session, its one open and the one page procmgr holds, while it bounds what a server
+procmgr does not trust can charge the account for a read, and so what one read can take of the
+reserve. A max refusal of the session or the open (`fs_errors::LIMIT`) fails the create with
+`LIMIT`; a want of memory (`fs_errors::OUT_OF_MEMORY`, the server's page refused outside the reserve
+while memory is critical) fails it with `OUT_OF_MEMORY`, as a refusal of the copy's own pages would,
+so svcmgr's memory wait holds a restart it refuses
+([services/svcmgr/docs/restart-protocol.md](../../svcmgr/docs/restart-protocol.md) § Decision tree,
+**The memory wait**); a refusal of the sub-node or its handle fails it as a refusal of the copy
+does.
 
 The file cap's server is the caller's to choose, so procmgr bounds each call it makes on the file
 cap and on its open (`FS_SESSION`, `FS_OPEN`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, `FS_CLOSE`) at
@@ -679,9 +689,9 @@ included, as for `CREATE_PROCESS`.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, the file's server refused the read session's page for want of memory (`fs_errors::OUT_OF_MEMORY`, **Read session**), or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[38..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process or one a destroy has begun on before the reply delivers the child, a destroy that marked the child itself before the reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1), `CREATE_RESTORE` comes with `CREATE_ARGV_ENV`, `CREATE_PINNED`, `CREATE_PHYS_ACCESS` or `CREATE_DMA_HOLD`, or memmgr takes its handle for no object handle (**Restore**, § Label 1) |
-| 10 | `IO_ERROR` | The `FS_SESSION` or the `FS_OPEN` of the file cap failed, for a reason other than a max (`LIMIT`), or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`, or the object's bytes did not all arrive: an `FS_READ_MEMORY` against procmgr's open failed, went unanswered for that long or returned zero bytes before `file_size`, its cache page could not be mapped, or its reply named a range past that page |
+| 10 | `IO_ERROR` | The `FS_SESSION` or the `FS_OPEN` of the file cap failed, for a reason other than a max (`LIMIT`) or a want of memory (`OUT_OF_MEMORY`), or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`, or the object's bytes did not all arrive: an `FS_READ_MEMORY` against procmgr's open failed, went unanswered for that long or returned zero bytes before `file_size`, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | A copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | As for `CREATE_PROCESS` (§ Label 1, **argv and env**) |
@@ -1565,7 +1575,7 @@ its own memmgr cap; its death releases the run with its record.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `OUT_OF_MEMORY` | The run could not be had on the sender's account for a reason other than a max (`LIMIT`), the sender has no memmgr SEND, or the map-only cap could not be derived |
+| 2 | `OUT_OF_MEMORY` | The run could not be had on the sender's account for a reason other than a max (`LIMIT`), the file's server refused the read session's page for want of memory (§ Label 13, **Read session**), the sender has no memmgr SEND, or the map-only cap could not be derived |
 | 4 | `INVALID_BADGE` | Sent on a process handle, or no live process carries the badge |
 | 7 | `INVALID_ARGUMENT` | No file cap, a length of zero or past `READ_VERIFIED_MAX`, a role word other than the two, or no name block or a name not in the canonical form |
 | 10 | `IO_ERROR` | As for `CREATE_FROM_FILE` (§ Label 13) |

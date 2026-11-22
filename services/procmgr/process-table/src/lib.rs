@@ -1477,8 +1477,8 @@ pub enum BudgetRefusal
 /// child, honoured only from a phys-class creator ([`Creator::phys_class`]).
 /// `procmgr_labels::CREATE_RESERVE` asks for a reserve node, honoured only
 /// from a creator whose own node is a reserve node and never with
-/// `procmgr_labels::CREATE_CHARGE_NODE`, whose node may be a sub-node, which
-/// is never in the reserve; a child of the un-badged creator not charged to a
+/// `procmgr_labels::CREATE_CHARGE_NODE`, whose node may be a sub-node outside
+/// the reserve, which procmgr cannot tell; a child of the un-badged creator not charged to a
 /// node handle is a reserve node with or without it.
 ///
 /// # Errors
@@ -3510,7 +3510,7 @@ mod tests
     {
         use ipc::procmgr_labels::{CREATE_CHARGE_NODE, CREATE_RESERVE};
         // Not even a reserve creator may ask for a reserve child charged to
-        // a handle: the handle's node may be a sub-node, never in the reserve.
+        // a handle: the handle's node may be a sub-node outside the reserve.
         let svcmgr = entry_creator(0x51);
         assert_eq!(
             child_budget(CREATE_RESERVE | CREATE_CHARGE_NODE, None, &svcmgr),

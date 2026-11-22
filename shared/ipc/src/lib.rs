@@ -157,7 +157,7 @@ pub mod sched_policy;
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 26;
+pub const MEMMGR_LABELS_VERSION: u32 = 27;
 pub mod memmgr_labels;
 
 pub mod memmgr_capture;
@@ -236,7 +236,7 @@ pub mod ns_labels;
 
 /// Wire-protocol version of [`fs_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const FS_LABELS_VERSION: u32 = 8;
+pub const FS_LABELS_VERSION: u32 = 9;
 pub mod fs_labels;
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above

@@ -9,7 +9,8 @@
 pub const SUCCESS: u64 = 0;
 /// File not found, or filesystem failed to validate on mount.
 pub const NOT_FOUND: u64 = 1;
-/// I/O error, or out of memory.
+/// I/O error, or out of memory other than a session's page memmgr refuses
+/// (`OUT_OF_MEMORY`).
 pub const IO_ERROR: u64 = 2;
 /// Out of file-handle slots.
 pub const TOO_MANY_OPEN: u64 = 3;
@@ -57,5 +58,11 @@ pub const LIMIT: u64 = 14;
 /// `FS_OPEN` or `FS_READ_MEMORY` needs a page for, or the handle is
 /// missing.
 pub const INVALID_ARGUMENT: u64 = 15;
+/// Refused for want of memory: memmgr refused the page a session needs
+/// (`FS_SESSION`, `FS_OPEN` and `FS_READ_MEMORY` in a session) as
+/// exhaustion, the free pool at the growth floor its node may not take
+/// (`memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS` or
+/// `OUT_OF_MEMORY_BEST_EFFORT`), not by a max.
+pub const OUT_OF_MEMORY: u64 = 16;
 /// Unknown opcode on fs-driver endpoint.
 pub const UNKNOWN_OPCODE: u64 = 0xFF;

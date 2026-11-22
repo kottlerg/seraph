@@ -402,7 +402,9 @@ fn handle_software_interrupt()
     // enter and find no request (the shootdown store hasn't happened yet),
     // then the shootdown IPI arrives (SSIP already 1, no new edge), and
     // clear_sip_ssip wipes both notifications — the shootdown is never processed.
-    // The initiator's SeqCst fence orders its slot store before the IPI, so
+    // The initiator's slot stores precede the IPI's SSIP-set, since
+    // `sbi_send_ipi_to` issues `fence rw, iorw` before the ecall (a SeqCst
+    // fence, `fence rw, rw`, would not order the firmware's device write), so
     // any IPI whose SSIP-set precedes our clear has a slot store visible to
     // the scan; any later IPI re-triggers via a fresh SSIP edge.
     //

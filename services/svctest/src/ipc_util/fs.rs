@@ -144,36 +144,43 @@ pub fn fs_read_bytes(
     Ok(data.to_vec())
 }
 
-/// `FS_OPEN` on file node cap `node_cap`, carrying `release` (a release
-/// endpoint SEND, moved to fatfs) in `caps[0]` when it is non-zero. Returns
-/// the open cap, or the wire error code. The open's liveness cap stays in
-/// svctest's `CSpace`, keeping the open alive, until the open's `FS_CLOSE`
-/// (or its node's removal) revokes it; [`fs_open_live`] returns it too.
+/// `FS_OPEN` on file node cap `node_cap` in svctest's own session with the
+/// node's driver, the one std keeps (`std::os::seraph::fs::session_for`,
+/// runtime/ruststd/README.md § Filesystem sessions), carrying `release` (a
+/// release endpoint SEND, moved to fatfs) in `caps[1]` when it is non-zero.
+/// Returns the open cap, or the wire error code (`u64::MAX` when the session
+/// cannot be had or the call fails).
 pub fn fs_open(node_cap: u64, release: u64, ipc_buf: *mut u64) -> Result<u64, u64>
 {
-    fs_open_live(node_cap, release, ipc_buf).map(|(open, _liveness)| open)
+    let copy = std::os::seraph::fs::session_for(node_cap).map_err(|_| u64::MAX)?;
+    send_open(node_cap, copy, release, ipc_buf)
 }
 
-/// [`fs_open`], returning `(open cap, liveness cap)`: the reply's `caps[0]`
-/// and `caps[1]` (services/fs/docs/fs-driver-protocol.md § Label 18).
-pub fn fs_open_live(node_cap: u64, release: u64, ipc_buf: *mut u64) -> Result<(u64, u64), u64>
+/// Send `FS_OPEN` on `node_cap` carrying `session`, a session cap copy
+/// moved to the driver, in `caps[0]` and `release` in `caps[1]` when it is
+/// non-zero; the copy is deleted when the kernel did not move it.
+fn send_open(node_cap: u64, session: u64, release: u64, ipc_buf: *mut u64) -> Result<u64, u64>
 {
-    let mut builder = ipc::IpcMessage::builder(ipc::fs_labels::FS_OPEN);
+    let mut builder = ipc::IpcMessage::builder(ipc::fs_labels::FS_OPEN).cap(session);
     if release != 0
     {
         builder = builder.cap(release);
     }
     let msg = builder.build();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) };
+    // A copy the kernel did not move is still svctest's; a moved one's
+    // handle is stale, and the delete is refused.
+    let _ = syscall::cap_delete(session);
+    let reply = reply.map_err(|_| u64::MAX)?;
     if reply.label != ipc::fs_errors::SUCCESS
     {
         return Err(reply.label);
     }
     match *reply.caps()
     {
-        [open, liveness] => Ok((open, liveness)),
-        _ => panic!("FS_OPEN success without an open cap and a liveness cap"),
+        [open] => Ok(open),
+        _ => panic!("FS_OPEN success without exactly one open cap"),
     }
 }
 
@@ -217,23 +224,7 @@ pub fn fs_open_in(node_cap: u64, session: u64, release: u64, ipc_buf: *mut u64)
         syscall::RIGHTS_EP_SEND,
     )
     .map_err(|_| u64::MAX)?;
-    let mut builder = ipc::IpcMessage::builder(ipc::fs_labels::FS_OPEN).cap(copy);
-    if release != 0
-    {
-        builder = builder.cap(release);
-    }
-    let msg = builder.build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
-    if reply.label != ipc::fs_errors::SUCCESS
-    {
-        return Err(reply.label);
-    }
-    match *reply.caps()
-    {
-        [open] => Ok(open),
-        _ => panic!("FS_OPEN in a session succeeded without exactly one open cap"),
-    }
+    send_open(node_cap, copy, release, ipc_buf)
 }
 
 /// `FS_CLOSE` on `cap`; returns the reply label (`u64::MAX` when the call

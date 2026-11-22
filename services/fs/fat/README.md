@@ -13,7 +13,8 @@ fat/
 ├── fat-parse/                  # `fatfs-parse`: BPB/dir decoders, slot scans, cluster bounds,
 │                               #   FAT entries, file positions, name encoding, LFN slots
 │                               #   and tails, node slab, cache bounds and victim pick,
-│                               #   session pool (records in client-paid pages)
+│                               #   session pool (records in client-paid pages),
+│                               #   session sweep schedule
 ├── docs/
 │   ├── crash-safety.md         # Per-op write ordering and post-crash visible states
 │   └── storage-layout.md       # Allocator, directory mutation, page cache, NodeTable, eviction
@@ -26,7 +27,7 @@ fat/
     ├── fat.rs                  # FAT-entry reads and chain walks
     ├── cache.rs                # PageCache: read/write through BLK_*_FROM_MEMORY
     ├── eviction.rs             # Cooperative-release eviction worker
-    ├── file.rs                 # OpenFile / OutstandingPage bookkeeping, unpaid and session opens
+    ├── file.rs                 # Opens: sessions and the opens made in them, held pages
     ├── session.rs              # Session pages: window, memmgr charged grants
     └── backend.rs              # NamespaceBackend impl + NodeTable
 ```
@@ -44,11 +45,11 @@ Each label's wire shape and error set are specified in
 | `FS_UNMOUNT` | yes | vfsd's unmount: refused `BUSY` while an open is live unless forced, else every open released, every session ended, and the driver exits |
 | `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` | no | namespace dispatch |
 | `FS_SESSION` | no | start a session whose records live in pages charged to the client's node, on a node cap |
-| `FS_OPEN` | no | mint a per-open cap on a file cap, in a session, or with a liveness cap of its own on the unpaid path |
+| `FS_OPEN` | no | mint a per-open cap on a file cap, in the session the request's session cap names |
 | `FS_READ` | no | inline read on a file cap or open cap |
 | `FS_READ_MEMORY` | no | zero-copy read via a returned `Memory` cap, on an open cap |
 | `FS_RELEASE_MEMORY` | no | synchronous client release of an `FS_READ_MEMORY` page (the eviction worker sends the cooperative release; fatfs does not receive it) |
-| `FS_CLOSE` | no | end one open, releasing its pages, its release SEND and its records, and revoking an unpaid open's liveness cap |
+| `FS_CLOSE` | no | end one open, releasing its pages, its release SEND and its records |
 | `FS_WRITE` | no | inline write on a file cap or open cap |
 | `FS_WRITE_MEMORY` | no | caller-supplied source `Memory` cap |
 | `FS_CREATE` | no | new file in a directory |
@@ -89,8 +90,8 @@ The driver's storage engine is a cluster allocator (`src/alloc.rs`), directory m
 back under memory pressure, up to 256 or 1/512 of RAM, whichever is more, and which fills a
 sequential scan's miss with a run of up to 16 pages in one block request (`src/cache.rs`), a
 node table that dedupes by on-disk slot and recycles the nodes of removed or renamed entries
-(`src/backend.rs`), the opens, whose records live in pages charged to a node of their client
-when they are made in a session (`src/file.rs`, `src/session.rs`), and a cooperative-release
+(`src/backend.rs`), the sessions and the opens made in them, whose records live in pages charged
+to a node of their client (`src/file.rs`, `src/session.rs`), and a cooperative-release
 eviction worker (`src/eviction.rs`). Sectors are the
 device's logical blocks, 512 to 4096 bytes. Each component's behavior is specified in
 [docs/storage-layout.md](docs/storage-layout.md).

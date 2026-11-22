@@ -90,8 +90,7 @@ static LIVE_WATCHDOGS: AtomicUsize = AtomicUsize::new(0);
 pub struct EvictReq
 {
     /// The open this entry belongs to. Once the open is closed it names no
-    /// open: an unpaid open's id is generation-checked, and a session open's
-    /// id is never reused.
+    /// open, since an open's id is never reused.
     pub open: OpenRef,
     /// Caller-visible cookie originally returned in
     /// `FS_READ_MEMORY`. Carried in `FS_RELEASE_MEMORY`'s `data[0]`

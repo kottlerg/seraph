@@ -28,8 +28,8 @@ pub const MOUNT: u64 = 10;
 /// is at the path or its unmount is already under way.
 pub const UNMOUNT: u64 = 11;
 /// [`UNMOUNT`] flag (label bit 16): unmount even while files are open.
-/// The driver releases every open, which revokes each client's
-/// liveness and cache-page caps.
+/// The driver ends every session, with every open made in it, which
+/// revokes each client's liveness and cache-page caps.
 pub const UNMOUNT_FORCE: u64 = 1 << 16;
 // Label 12 is reserved and MUST NOT be reused for an unrelated request
 // (services/vfsd/docs/vfs-ipc-interface.md).

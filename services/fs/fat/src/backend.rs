@@ -46,8 +46,9 @@ const _: () =
 /// and one outside it, from a corrupt entry, is refused when the node is
 /// used as a directory. Only an empty file reports `cluster == 0`.
 ///
-/// A node holds no open-instance state: each `FS_OPEN` of it is a
-/// [`crate::file::OpenFile`] of its own, naming the node by id.
+/// A node holds no open-instance state: each `FS_OPEN` of it is a record of
+/// its own in a session's pages ([`crate::file::Opens`]), naming the node by
+/// id.
 #[derive(Copy, Clone)]
 pub struct FatNode
 {

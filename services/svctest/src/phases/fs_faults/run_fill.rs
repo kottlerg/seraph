@@ -15,7 +15,7 @@ use ipc::fs_errors;
 use super::ramdisk::{self, DATA_LBA, Fault, RUN_PAGES, RamDisk, SharedDisk, lock};
 use super::{CHUNK, OwnFatfs, slot_cluster};
 use crate::bootstrap::Caps;
-use crate::ipc_util::fs::{fs_close, fs_create, fs_open_live, fs_release_memory, fs_write_inline};
+use crate::ipc_util::fs::{fs_close, fs_create, fs_open, fs_release_memory, fs_write_inline};
 use crate::ipc_util::ns::ns_lookup;
 
 /// The scanned file's name, and its 8.3 entry as the root directory holds it.
@@ -92,7 +92,7 @@ fn sequential_scan(disk: &SharedDisk) -> (usize, usize)
     let fs = OwnFatfs::start(disk);
     let (file, _, _) = ns_lookup(fs.root, NAME, 0xFFFF, ipc_buf)
         .unwrap_or_else(|e| panic!("fs_run_fill: lookup of the file: {e}"));
-    let (open, liveness) = fs_open_live(file, 0, ipc_buf).expect("fs_run_fill: FS_OPEN");
+    let open = fs_open(file, 0, ipc_buf).expect("fs_run_fill: FS_OPEN");
     let mut cookie = 1;
     let end = scan(open, 0, FILE_PAGES * PAGE, 0, &mut cookie);
     assert_eq!(end, FILE_PAGES * PAGE, "fs_run_fill: the scan's end");
@@ -126,7 +126,7 @@ fn sequential_scan(disk: &SharedDisk) -> (usize, usize)
             "fs_run_fill: file sector {lba} lies in no data read: {reads:?}"
         );
     }
-    close_all(fs, open, &[liveness, file]);
+    close_all(fs, open, &[file]);
     (reads.len(), longest)
 }
 
@@ -139,7 +139,7 @@ fn off_sequence_read(disk: &SharedDisk)
     let fs = OwnFatfs::start(disk);
     let (file, _, _) = ns_lookup(fs.root, NAME, 0xFFFF, ipc_buf)
         .unwrap_or_else(|e| panic!("fs_run_fill: lookup of the file: {e}"));
-    let (open, liveness) = fs_open_live(file, 0, ipc_buf).expect("fs_run_fill: FS_OPEN");
+    let open = fs_open(file, 0, ipc_buf).expect("fs_run_fill: FS_OPEN");
     let at = 10 * PAGE;
     let valid = read_check(open, at, 1, 0);
     assert!(
@@ -156,7 +156,7 @@ fn off_sequence_read(disk: &SharedDisk)
         reads.iter().all(|&(_, count)| count <= SECTORS_PER_PAGE),
         "fs_run_fill: the off-sequence read filled more than a page: {reads:?}"
     );
-    close_all(fs, open, &[liveness, file]);
+    close_all(fs, open, &[file]);
 }
 
 /// Case 3: the block server keeps the cap of the scan's first run read, as a
@@ -184,7 +184,7 @@ fn lost_run_cap_ends_runs_only(disk: &SharedDisk)
         let _ = disk.take_reads();
         disk.arm(run_at, 0, Fault::LoseCap);
     }
-    let (open, liveness) = fs_open_live(file, 0, ipc_buf).expect("fs_run_fill: FS_OPEN");
+    let open = fs_open(file, 0, ipc_buf).expect("fs_run_fill: FS_OPEN");
     let mut cookie = 1;
     let end = scan(open, 0, FILE_PAGES * PAGE, 0, &mut cookie);
     assert_eq!(
@@ -209,7 +209,7 @@ fn lost_run_cap_ends_runs_only(disk: &SharedDisk)
     let head: Vec<u8> = (0..64).map(|i| content_byte(i, 0)).collect();
     fs_write_inline(file, 0, &head, ipc_buf)
         .expect("fs_run_fill: FS_WRITE after the run buffer's cap was lost");
-    close_all(fs, open, &[liveness, file]);
+    close_all(fs, open, &[file]);
 }
 
 /// Case 4: an open read to page 20 keeps its cursor there while the file is
@@ -223,7 +223,7 @@ fn cursor_retired_by_fat_change(disk: &SharedDisk)
     let fs = OwnFatfs::start(disk);
     let (file, _, _) = ns_lookup(fs.root, NAME, 0xFFFF, ipc_buf)
         .unwrap_or_else(|e| panic!("fs_run_fill: lookup of the file: {e}"));
-    let (open, liveness) = fs_open_live(file, 0, ipc_buf).expect("fs_run_fill: FS_OPEN");
+    let open = fs_open(file, 0, ipc_buf).expect("fs_run_fill: FS_OPEN");
     let mut cookie = 1;
     let at = scan(open, 0, 20 * PAGE, 0, &mut cookie);
     assert_eq!(at, 20 * PAGE, "fs_run_fill: the first scan's end");
@@ -244,7 +244,7 @@ fn cursor_retired_by_fat_change(disk: &SharedDisk)
     assert_eq!(end, FILE_PAGES * PAGE, "fs_run_fill: the second scan's end");
     let end = scan(open, 0, 20 * PAGE, SHIFT_B, &mut cookie);
     assert_eq!(end, 20 * PAGE, "fs_run_fill: the third scan's end");
-    close_all(fs, open, &[liveness, file, other]);
+    close_all(fs, open, &[file, other]);
 }
 
 /// Close `open`, delete it and `caps`, and stop `fs`.

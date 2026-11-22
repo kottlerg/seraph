@@ -11,10 +11,12 @@
 pub const FS_READ: u64 = 2;
 /// Close an open cap ([`FS_OPEN`]): the driver revokes that open's
 /// outstanding [`FS_READ_MEMORY`] pages, deletes its recorded release
-/// SEND, revokes the copies of its liveness cap, and retires the open,
+/// SEND, frees its record in its session's pages, and retires the open,
 /// so the open cap answers `fs_errors::INVALID_BADGE` from then on.
-/// Other opens of the file are untouched. A node cap is answered
-/// `fs_errors::INVALID_BADGE`. The caller still cap-deletes the open cap
+/// Other opens of the file are untouched. A close that leaves its session
+/// with no open, the session's liveness cap held nowhere outside the
+/// driver, ends the session before the reply, its pages given back. A node
+/// cap is answered `fs_errors::INVALID_BADGE`. The caller still cap-deletes the open cap
 /// to drop the kernel-side reference. Specified in `services/fs/docs/fs-driver-protocol.md`
 /// § Label 3: `FS_CLOSE`.
 pub const FS_CLOSE: u64 = 3;
@@ -160,37 +162,24 @@ pub const FS_RENAME: u64 = 16;
 pub const FS_TRUNCATE: u64 = 17;
 /// Open a file: mint a per-open cap on the driver's endpoint.
 ///
-/// Request: badge = file-node cap (any non-empty rights), empty body. In a
-/// session ([`FS_SESSION`]): `caps[0]` = a copy of the session cap, which
-/// the driver reads and deletes, `caps[1]` = optional release-endpoint SEND
-/// for the open's cooperative [`FS_RELEASE_MEMORY`] (omitted to opt out).
-/// The open's records then live in the session's pages, charged to the
-/// session's node, and the reply carries the open cap alone: the open lives
-/// until its [`FS_CLOSE`], its node's removal, or its session's end.
-/// Without a session (the unpaid path, which a later wire revision
-/// removes): `caps[0]` = the optional release SEND, a cap on another
-/// endpoint. Reply (label `fs_errors::SUCCESS`): `caps[0]` = the open
-/// cap, carrying the node cap's rights; its badge names the open
-/// (`namespace_protocol::OPEN_INSTANCE`, with `namespace_protocol::SESSION`
-/// for an open in a session). Without a session, `caps[1]` = the open's
-/// liveness cap, a zero-rights Notification cap: the open lives while a copy of
-/// it lives outside the driver, and once every copy is gone (deleted, or
-/// with its holder's `CSpace`) the driver may release the open as
-/// [`FS_CLOSE`] would; a release revokes the copies still in the
-/// driver's derivation subtree, which a copy derived from another
-/// holder's copy leaves once a `CSpace` holding a copy on its derivation
-/// path is torn down. The holder keeps it for the open's life and
-/// deletes it after [`FS_CLOSE`].
-/// [`FS_READ_MEMORY`], [`FS_RELEASE_MEMORY`], and [`FS_CLOSE`] go to the
-/// open cap; the stateless file labels accept either cap. Errors:
-/// `INVALID_BADGE` (no such node, a directory, an open cap, or a cap on the
-/// driver's endpoint that names no live session), `PERMISSION_DENIED`,
+/// Request: badge = file-node cap (any non-empty rights), empty body,
+/// `caps[0]` = a copy of the session cap ([`FS_SESSION`]), which the
+/// driver reads and deletes: every open is made in a session. `caps[1]` =
+/// optional release-endpoint SEND for the open's cooperative
+/// [`FS_RELEASE_MEMORY`] (omitted to opt out). The open's records live in
+/// the session's pages, charged to the session's node. Reply (label
+/// `fs_errors::SUCCESS`): `caps[0]` = the open cap, carrying the node cap's
+/// rights; its badge names the open (`namespace_protocol::OPEN_INSTANCE`).
+/// The open lives until its [`FS_CLOSE`], its node's removal, or its
+/// session's end. [`FS_READ_MEMORY`], [`FS_RELEASE_MEMORY`], and
+/// [`FS_CLOSE`] go to the open cap; the stateless file labels accept either
+/// cap. Errors: `INVALID_ARGUMENT` (no `caps[0]`, or one on another
+/// endpoint, or memmgr refuses the session's handle), `INVALID_BADGE` (no such node, a directory, or a `caps[0]` on
+/// the driver's endpoint that names no live session), `PERMISSION_DENIED`,
 /// `LIMIT` (the session needs a page its node's max refuses),
-/// `INVALID_ARGUMENT` (memmgr refuses the session's handle),
-/// `TOO_MANY_OPEN` (the driver's open table is full, its open ids are
-/// spent, or its heap or `CSpace` cannot grow, or it cannot create the
-/// liveness object), `IO_ERROR` (the driver could not mint the open cap,
-/// or memmgr has no page for the session). Every refusal deletes the
+/// `TOO_MANY_OPEN` (the driver's open ids are spent, or its heap or
+/// `CSpace` cannot grow), `IO_ERROR` (the driver could not mint the open
+/// cap, or memmgr has no page for the session). Every refusal deletes the
 /// carried caps. Specified in
 /// `services/fs/docs/fs-driver-protocol.md` § Label 18: `FS_OPEN`.
 pub const FS_OPEN: u64 = 18;
@@ -203,8 +192,10 @@ pub const FS_OPEN: u64 = 18;
 /// driver keeps for the session's life. The driver takes the session's
 /// first page, charged to that node, and holds it until the session ends.
 /// Reply (label `fs_errors::SUCCESS`): `caps[0]` = the session cap, a
-/// SEND on the driver's endpoint whose badge names the session
-/// (`namespace_protocol::SESSION`), which [`FS_OPEN`] carries; `caps[1]`
+/// SEND on the driver's endpoint with `IDENTIFY`, whose badge names the
+/// session (`namespace_protocol::SESSION`): a copy of it is what [`FS_OPEN`]
+/// carries, and the right lets its holder ask the kernel whether a node cap
+/// is on this driver's endpoint (`SYS_ENDPOINT_IDENTIFY`); `caps[1]`
 /// = the session's liveness cap, a zero-rights Notification cap: the
 /// session lives while a copy of it lives outside the driver, and once every
 /// copy is gone the driver may end the session, with every open made in it,
@@ -222,8 +213,8 @@ pub const FS_SESSION: u64 = 23;
 ///
 /// Request: un-badged, on the driver's service endpoint, as [`FS_MOUNT`];
 /// `data[0]` = caller's compiled [`super::FS_LABELS_VERSION`]; the
-/// [`UNMOUNT_FORCE`] flag in the label's flag bits. The driver releases
-/// every open whose client is gone; when live opens remain and the
+/// [`UNMOUNT_FORCE`] flag in the label's flag bits. The driver ends
+/// every session whose client is gone; when live opens remain and the
 /// request is not forced, it replies `fs_errors::BUSY` with `data[0]` =
 /// the live opens and keeps serving. Otherwise it releases every open,
 /// as [`FS_CLOSE`] would, replies `fs_errors::SUCCESS`, and exits with

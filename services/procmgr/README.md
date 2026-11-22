@@ -307,7 +307,8 @@ The full procmgr IPC specification is in
 - `CREATE_FROM_FILE(file_cap, file_size, name, …)` → suspended process handle,
   child `Thread` cap. Caller has already walked its own namespace cap to the
   binary and names it by its install path; procmgr opens the supplied file cap
-  (`FS_OPEN`), copies the signed object through its own open and verifies it.
+  (`FS_OPEN`) in a session charged to the child, copies the signed object
+  through its own open and verifies it.
 - `READ_VERIFIED(file_cap, file_size, role, name)` → the verified body of a data
   or configuration file, read-only, in frames on the sender's account; procmgr verifies the
   copy in the role the request names (data or configuration) under `name`.

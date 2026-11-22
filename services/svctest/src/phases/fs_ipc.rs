@@ -1176,17 +1176,20 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
     // More caps than fatfs's `CSpace` has free slots for. The `CSpace` grows
     // only when fatfs funds it: at cache init, to a page cap and a per-read
     // cap for every slot, the quarantine's replacements, the scratch page, the
-    // run buffer and 64 more, and before each `FS_OPEN`, to the same funding
-    // less the pages the cache already holds. This phase opens nothing before its requests,
-    // so the slots free when they start are at most that funding (about twice
-    // the slot ceiling) plus the few slot pages a funding rounds up to and the
-    // release SEND and liveness parent of each of the opens earlier phases
-    // held and closed (2 x (`fs_opens::HELD_FILES` + 2): the eviction phase
-    // holds two openers beside its Files). Four times the ceiling and 512
-    // more clears that at every RAM size.
+    // run buffer and 64 more, and before each `FS_SESSION` and `FS_OPEN`, to
+    // the same funding less the pages the cache already holds. This phase
+    // opens nothing before its requests, so the slots free when they start are
+    // at most that funding (about twice the slot ceiling) plus the few slot
+    // pages a funding rounds up to, the release SEND of each of the opens
+    // earlier phases held and closed (`fs_opens::HELD_FILES` + 2: the eviction
+    // phase holds two openers beside its Files), and the three slots of each
+    // session earlier phases started and ended (the reclaim phase starts
+    // sessions until a scheduled sweep, at most twice
+    // `fat_parse::sweep::SWEEP_FLOOR` in a svctest boot). Four times the
+    // ceiling and 1024 more clears that at every RAM size.
     let requests = fatfs_slot_ceiling(ipc_buf)
         .checked_mul(4)
-        .and_then(|n| n.checked_add(512))
+        .and_then(|n| n.checked_add(1024))
         .expect("fs_cap_drop: request count overflowed");
 
     let svctest = svctest_dir_cap(ipc_buf);

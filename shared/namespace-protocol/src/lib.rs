@@ -41,8 +41,7 @@ pub mod wire;
 
 pub use badge::{
     KIND_ID_BITS, KIND_ID_MASK, NODE_ID_BITS, NODE_ID_MASK, NodeId, OPEN_INSTANCE, OpenRef,
-    SESSION, is_kind_flagged, is_open_instance, pack, pack_open, pack_session, pack_session_open,
-    session_id,
+    SESSION, is_kind_flagged, is_open_instance, pack, pack_open, pack_session, session_id,
 };
 pub use gate::{GateError, compose_forward_lookup_rights, gate, gate_open};
 pub use name::{MAX_NAME_LEN, MIN_NAME_LEN, NameError, validate_name};

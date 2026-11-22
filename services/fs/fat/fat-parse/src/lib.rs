@@ -18,9 +18,9 @@
 //! [`run_pages`]), encodes
 //! long names ([`encode_lfn`]) and packs their slots ([`pack_lfn_slot`]), picks
 //! short-name numeric tails ([`TailSet`]), and keeps the node table's
-//! recycling identifiers ([`node_slab::NodeSlab`]) and the open-instance
-//! table's ([`open_slab::OpenSlab`]), with the schedule of its sweeps for
-//! opens whose client is gone ([`open_slab::SweepSchedule`]), and picks the
+//! recycling identifiers ([`node_slab::NodeSlab`]), the session pool
+//! ([`session_pool::SessionPool`]) with the schedule of its sweeps for
+//! sessions whose client is gone ([`sweep::SweepSchedule`]), and picks the
 //! page cache's eviction victim ([`lru_victim`]) and the idle pages it keeps
 //! when it gives the others back ([`keep_most_recent`]). This crate
 //! performs no
@@ -38,8 +38,8 @@ extern crate alloc;
 use core::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 
 pub mod node_slab;
-pub mod open_slab;
 pub mod session_pool;
+pub mod sweep;
 
 // ── BIOS Parameter Block ────────────────────────────────────────────────────
 

@@ -17,7 +17,7 @@ use super::ramdisk::{self, Fault, RamDisk, lock};
 use super::{CHUNK, OwnFatfs, slot_cluster};
 use crate::bootstrap::Caps;
 use crate::ipc_util::fs::{
-    fs_close, fs_create, fs_open_live, fs_read_bytes, fs_release_memory, fs_write_inline,
+    fs_close, fs_create, fs_open, fs_read_bytes, fs_release_memory, fs_write_inline,
 };
 use crate::ipc_util::ns::ns_lookup;
 use crate::phases::memmgr::{memory_usage, pool_pressure_status, release_grant, take_pages};
@@ -108,7 +108,7 @@ pub fn fs_pressure_release_phase(_: &Caps)
     assert_eq!(read_file(file), want, "fs_pressure: the file's second read");
 
     // 2. Page A mapped, page B not; both released to fatfs.
-    let (open, liveness) = fs_open_live(file, 0, ipc_buf).expect("fs_pressure: FS_OPEN");
+    let open = fs_open(file, 0, ipc_buf).expect("fs_pressure: FS_OPEN");
     let mapped = expose_pages(open);
     let page_a = page_base(sector_at(&sectors, MAPPED_AT));
     let page_b = page_base(sector_at(&sectors, UNMAPPED_AT));
@@ -151,7 +151,7 @@ pub fn fs_pressure_release_phase(_: &Caps)
         fs_errors::SUCCESS,
         "fs_pressure: FS_CLOSE"
     );
-    for cap in [open, liveness, file]
+    for cap in [open, file]
     {
         let _ = syscall::cap_delete(cap);
     }

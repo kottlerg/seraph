@@ -3,48 +3,32 @@
 
 // services/fs/fat/src/file.rs
 
-//! Open instances of the FAT driver, of both kinds ([`Opens`]).
+//! Open instances of the FAT driver ([`Opens`]).
 //!
-//! An `FS_OPEN` made in a session (services/fs/docs/fs-driver-protocol.md
-//! § Label 23) records the open in the session's pages, which its client pays
-//! for (`fat_parse::session_pool`, `crate::session`): the open's id, from a
-//! counter that never repeats, is the open cap's badge, and its held pages
-//! are records in those pages too. One made without a session, the unpaid
-//! path, inserts one [`OpenFile`] into an [`OpenTable`] on fatfs's own heap,
-//! whose generation-checked identifier is the open cap's badge
-//! (services/fs/docs/fs-driver-protocol.md § Label 18). Either kind is named
-//! by a `namespace_protocol::OpenRef`, and [`Opens`] serves both through one
-//! interface.
+//! Every `FS_OPEN` is made in a session (services/fs/docs/fs-driver-protocol.md
+//! § Label 18, § Label 23) and records the open in the session's pages, which
+//! its client pays for (`fat_parse::session_pool`, `crate::session`): the
+//! open's id, from a counter that never repeats, is the open cap's badge
+//! (`namespace_protocol::OpenRef`), and its held pages are records in those
+//! pages too.
 //!
-//! Two opens of one file are two opens, so each keeps its own outstanding
-//! pages and release SEND, and one open's `FS_CLOSE` touches no other. An
-//! unpaid open carries a table of outstanding cache pages handed out via `FS_READ_MEMORY`, grown
-//! on demand up to the cache's slot ceiling; each entry holds the cookie the
-//! client uses to reference the page, the cache slot the page lives in (so
-//! the slot's refcount can be decremented on release), and an ancestor cap
-//! interposed between the slot's parent cap and the caller-side child cap so
-//! per-cookie revocation is possible. An unpaid open also keeps the parent of
-//! its liveness cap, whose sole remaining reference marks an open whose client is
-//! gone ([`OpenFile::client_gone`]), and where its memory-cap reads stand: the
-//! offset a sequential read takes next and a cursor into the file's cluster
-//! chain.
+//! Two opens of one file are two opens, so each keeps its own held pages and
+//! release SEND, and one open's `FS_CLOSE` touches no other. A held page is
+//! one handed out via `FS_READ_MEMORY` ([`OutstandingPage`]): the cookie the
+//! client uses to reference it, the cache slot it lives in (so the slot's
+//! refcount can be decremented on release), and an ancestor cap interposed
+//! between the slot's parent cap and the caller-side child cap so per-cookie
+//! revocation is possible. An open also keeps where its memory-cap reads
+//! stand: the offset a sequential read takes next and a cursor into the
+//! file's cluster chain.
 
 use fat_parse::ChainCursor;
-use fat_parse::open_slab::{OpenSlab, SweepSchedule};
 use fat_parse::session_pool::{Frame, HeldPage, Link, OpenFields, PoolError, Removed, SessionPool};
 use namespace_protocol::{NodeId, OpenRef};
 
 use crate::cache::PageCache;
 use crate::eviction::EvictReq;
 use crate::session::{self, Grant, SessionPages};
-
-/// The driver's open instances made without a session, keyed by the open id
-/// an open cap's badge carries. At most `node_slab::MAX_ENTRIES` (2^24 - 1)
-/// live opens, the identifier's index field; no per-client bound applies,
-/// since the driver has no client identity and an open cap can be
-/// delegated. Opens whose client is gone are swept out on the schedule
-/// `open_slab::SweepSchedule` sets.
-pub type OpenTable = OpenSlab<OpenFile>;
 
 /// One outstanding page handed to a client via `FS_READ_MEMORY`.
 #[derive(Clone, Copy)]
@@ -69,100 +53,14 @@ pub struct OutstandingPage
     pub eviction_queued: bool,
 }
 
-/// One open instance of a file, minted by `FS_OPEN`.
-///
-/// The file's size and first cluster are not kept here: reads take them
-/// from the node table, which every write and truncate updates.
-pub struct OpenFile
-{
-    /// The node the open was minted on. An `FS_REMOVE` or `FS_RENAME` that
-    /// frees the node releases every open naming it.
-    pub node_id: NodeId,
-    /// Outstanding pages; a `None` entry is a free one, reused before the
-    /// table grows.
-    pub outstanding: Vec<Option<OutstandingPage>>,
-    /// SEND cap on the client's release endpoint, from `caps[0]` of the
-    /// `FS_OPEN` that minted this open (services/fs/docs/fs-driver-protocol.md
-    /// § Label 18); the eviction worker addresses cooperative
-    /// `FS_RELEASE_MEMORY` requests for this open's pages to it. Zero when
-    /// the open carried none; eviction then skips the cooperative
-    /// round-trip and goes straight to the revoke. Deleted from the fs's
-    /// `CSpace` when the open is released.
-    pub release_endpoint_cap: u64,
-    /// The driver's own cap on the open's liveness Notification, the parent
-    /// of the zero-rights liveness cap the `FS_OPEN` reply handed the client
-    /// (services/fs/docs/fs-driver-protocol.md § Label 18). Revoked, which
-    /// kills the client's copy and every copy still in this cap's derivation
-    /// subtree, and deleted when the open is released.
-    pub liveness_cap: u64,
-    /// The file offset an `FS_READ_MEMORY` on a sequential scan asks for
-    /// next: the end of the bytes the open's last one returned, 0 before
-    /// the first. A read at it that misses the cache fills a run of pages
-    /// (services/fs/fat/docs/storage-layout.md, Page cache).
-    pub next_read: u64,
-    /// Where the open's last `FS_READ_MEMORY` stood in the file's cluster
-    /// chain; the next one's walk starts there when it still serves
-    /// (`fat_parse::walk_start`). `None` before the first.
-    pub cursor: Option<ChainCursor>,
-}
-
 /// Whether every copy outside the driver of the liveness cap whose parent
-/// is `liveness` is gone: the driver's own cap is the only reference left to
+/// is `liveness` (a session's) is gone: the driver's own cap is the only reference left to
 /// the Notification (`CAP_INFO_SOLE_REFERENCE`). Once it answers so it keeps
 /// answering so, since only the driver could take a new reference through its
 /// cap. A failed inquiry answers `false`, keeping what the cap guards.
 fn sole_reference(liveness: u64) -> bool
 {
     syscall::cap_info(liveness, syscall::CAP_INFO_SOLE_REFERENCE) == Ok(1)
-}
-
-impl OpenFile
-{
-    pub const fn new(node_id: NodeId, release_endpoint_cap: u64, liveness_cap: u64) -> Self
-    {
-        Self {
-            node_id,
-            outstanding: Vec::new(),
-            release_endpoint_cap,
-            liveness_cap,
-            next_read: 0,
-            cursor: None,
-        }
-    }
-
-    /// Whether every copy of the open's liveness cap outside the driver is
-    /// gone, so no holder keeps the open alive: the driver's own cap is the
-    /// only reference left to the Notification (`CAP_INFO_SOLE_REFERENCE`).
-    /// Once it answers so it keeps answering so, since only the driver could
-    /// take a new reference through its cap. A failed inquiry answers `false`,
-    /// keeping the open.
-    pub fn client_gone(&self) -> bool
-    {
-        sole_reference(self.liveness_cap)
-    }
-
-    /// Insert `entry` into a free outstanding slot, growing the table while
-    /// it holds fewer than `limit` pages, the cache's slot ceiling: each
-    /// outstanding page holds a cache slot, so one open cannot usefully hold
-    /// more pages than the cache has slots, and the bound scales with the
-    /// cache. The per-call ancestor caps live in the fs's `CSpace` until
-    /// released or close; the table grows only with the pages a client
-    /// holds. Returns `false` when the open already holds `limit` pages, or
-    /// the table cannot grow.
-    pub fn track_outstanding(&mut self, entry: OutstandingPage, limit: usize) -> bool
-    {
-        if let Some(slot) = self.outstanding.iter_mut().find(|s| s.is_none())
-        {
-            *slot = Some(entry);
-            return true;
-        }
-        if self.outstanding.len() >= limit || self.outstanding.try_reserve(1).is_err()
-        {
-            return false;
-        }
-        self.outstanding.push(Some(entry));
-        true
-    }
 }
 
 impl OutstandingPage
@@ -223,15 +121,12 @@ pub enum SessionRefusal
     Memmgr(u64),
 }
 
-/// Every open instance of the driver: those made in a session, in the
-/// session's own pages, and those made without one, in an [`OpenTable`].
-/// Shared with the eviction worker under one `Mutex`; each method that
+/// Every session of the driver and every open made in one, in the
+/// session's own pages. Shared with the eviction worker under one `Mutex`; each method that
 /// releases something releases it before it returns, a session page with a
 /// memmgr call.
 pub struct Opens
 {
-    /// The opens made without a session.
-    pub unpaid: OpenTable,
     /// The sessions, their opens, and the pages their opens hold.
     sessions: SessionPool<SessionPages>,
 }
@@ -244,7 +139,6 @@ impl Opens
     pub const fn new(pages: SessionPages) -> Self
     {
         Self {
-            unpaid: OpenTable::new(),
             sessions: SessionPool::with_id_bits(pages, namespace_protocol::KIND_ID_BITS),
         }
     }
@@ -253,28 +147,18 @@ impl Opens
     /// live.
     pub fn node(&self, open: OpenRef) -> Option<NodeId>
     {
-        match open
-        {
-            OpenRef::Unpaid(id) => self.unpaid.get(id).map(|f| f.node_id),
-            OpenRef::Session(id) => self
-                .sessions
-                .open(id)
-                .map(|l| NodeId::from_raw_truncated(self.sessions.open_fields(l).node)),
-        }
+        self.sessions
+            .open(open.0)
+            .map(|l| NodeId::from_raw_truncated(self.sessions.open_fields(l).node))
     }
 
     /// Where the open's last memory-cap read stood in its file's cluster
     /// chain.
     pub fn cursor(&self, open: OpenRef) -> Option<ChainCursor>
     {
-        match open
-        {
-            OpenRef::Unpaid(id) => self.unpaid.get(id).and_then(|f| f.cursor),
-            OpenRef::Session(id) => self
-                .sessions
-                .open(id)
-                .and_then(|l| self.sessions.open_fields(l).cursor),
-        }
+        self.sessions
+            .open(open.0)
+            .and_then(|l| self.sessions.open_fields(l).cursor)
     }
 
     /// Record `cursor` as where the open's read at `offset` stands, and
@@ -282,32 +166,21 @@ impl Opens
     /// where the open's last read ended); `false` when the open is not live.
     pub fn note_read(&mut self, open: OpenRef, cursor: ChainCursor, offset: u64) -> bool
     {
-        match open
+        let Some(l) = self.sessions.open(open.0)
+        else
         {
-            OpenRef::Unpaid(id) => self.unpaid.get_mut(id).is_some_and(|f| {
-                f.cursor = Some(cursor);
-                f.next_read == offset
-            }),
-            OpenRef::Session(id) =>
-            {
-                let Some(l) = self.sessions.open(id)
-                else
-                {
-                    return false;
-                };
-                let mut fields = self.sessions.open_fields(l);
-                fields.cursor = Some(cursor);
-                self.sessions.write_open(l, fields);
-                fields.next_read == offset
-            }
-        }
+            return false;
+        };
+        let mut fields = self.sessions.open_fields(l);
+        fields.cursor = Some(cursor);
+        self.sessions.write_open(l, fields);
+        fields.next_read == offset
     }
 
     /// Record `entry` as held by the open, which holds at most `limit`
     /// pages, and `next_read` as where a sequential read of it goes on.
     /// `false` when the open is not live, already holds `limit` pages, or
-    /// cannot record the page (an unpaid open's heap, or a session's pages,
-    /// full).
+    /// its session's pages cannot record the page.
     pub fn track(
         &mut self,
         open: OpenRef,
@@ -316,74 +189,37 @@ impl Opens
         next_read: u64,
     ) -> bool
     {
-        match open
+        let Some(l) = self.sessions.open(open.0)
+        else
         {
-            OpenRef::Unpaid(id) => self.unpaid.get_mut(id).is_some_and(|f| {
-                let tracked = f.track_outstanding(entry, limit);
-                if tracked
-                {
-                    f.next_read = next_read;
-                }
-                tracked
-            }),
-            OpenRef::Session(id) =>
-            {
-                let Some(l) = self.sessions.open(id)
-                else
-                {
-                    return false;
-                };
-                let limit = u64::try_from(limit).unwrap_or(u64::MAX);
-                if self.sessions.hold(l, entry.held(), limit).is_err()
-                {
-                    return false;
-                }
-                let mut fields = self.sessions.open_fields(l);
-                fields.next_read = next_read;
-                self.sessions.write_open(l, fields);
-                true
-            }
+            return false;
+        };
+        let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+        if self.sessions.hold(l, entry.held(), limit).is_err()
+        {
+            return false;
         }
+        let mut fields = self.sessions.open_fields(l);
+        fields.next_read = next_read;
+        self.sessions.write_open(l, fields);
+        true
     }
 
     /// Release the page the open holds under `cookie`, if any, as
     /// `FS_RELEASE_MEMORY` does. `false` when the open is not live.
     pub fn release_held(&mut self, open: OpenRef, cookie: u64, cache: &PageCache) -> bool
     {
-        match open
+        let Some(l) = self.sessions.open(open.0)
+        else
         {
-            OpenRef::Unpaid(id) =>
-            {
-                let Some(file) = self.unpaid.get_mut(id)
-                else
-                {
-                    return false;
-                };
-                if let Some(slot) = file
-                    .outstanding
-                    .iter_mut()
-                    .find(|s| s.is_some_and(|e| e.cookie == cookie))
-                    && let Some(entry) = slot.take()
-                {
-                    entry.release(cache);
-                }
-                true
-            }
-            OpenRef::Session(id) =>
-            {
-                let Some(l) = self.sessions.open(id)
-                else
-                {
-                    return false;
-                };
-                if let Some((page, emptied)) = self.sessions.unhold(l, |h| h.cookie == cookie)
-                {
-                    OutstandingPage::from_held(page).release(cache);
-                    self.release_frame(emptied);
-                }
-                true
-            }
+            return false;
+        };
+        if let Some((page, emptied)) = self.sessions.unhold(l, |h| h.cookie == cookie)
+        {
+            OutstandingPage::from_held(page).release(cache);
+            self.release_frame(emptied);
         }
+        true
     }
 
     /// Mark one held page not yet queued for eviction as queued and return
@@ -391,18 +227,6 @@ impl Opens
     /// when every held page is queued already, or none is held.
     pub fn pick_eviction_candidate(&mut self) -> Option<EvictReq>
     {
-        for (open_id, file) in self.unpaid.iter_mut()
-        {
-            if let Some(entry) = file
-                .outstanding
-                .iter_mut()
-                .flatten()
-                .find(|e| !e.eviction_queued)
-            {
-                entry.eviction_queued = true;
-                return Some(EvictReq::new(OpenRef::Unpaid(open_id), entry));
-            }
-        }
         for session in self.sessions.sessions()
         {
             for open in self.sessions.opens_of(session)
@@ -411,7 +235,7 @@ impl Opens
                 {
                     let id = self.sessions.id_of(open);
                     return Some(EvictReq::new(
-                        OpenRef::Session(id),
+                        OpenRef(id),
                         &OutstandingPage::from_held(page),
                     ));
                 }
@@ -425,25 +249,10 @@ impl Opens
     /// page was already released.
     pub fn release_endpoint_if_held(&self, req: &EvictReq) -> Option<u64>
     {
-        match req.open
-        {
-            OpenRef::Unpaid(id) =>
-            {
-                let file = self.unpaid.get(id)?;
-                file.outstanding
-                    .iter()
-                    .flatten()
-                    .any(|e| e.is(req))
-                    .then_some(file.release_endpoint_cap)
-            }
-            OpenRef::Session(id) =>
-            {
-                let l = self.sessions.open(id)?;
-                self.sessions
-                    .held_where(l, |h| OutstandingPage::from_held(*h).is(req))?;
-                Some(self.sessions.open_fields(l).release_cap)
-            }
-        }
+        let l = self.sessions.open(req.open.0)?;
+        self.sessions
+            .held_where(l, |h| OutstandingPage::from_held(*h).is(req))?;
+        Some(self.sessions.open_fields(l).release_cap)
     }
 
     /// Take the page `req` was queued for off its open, when it is still
@@ -451,78 +260,54 @@ impl Opens
     /// is given back here.
     pub fn take_held(&mut self, req: &EvictReq) -> bool
     {
-        match req.open
+        let Some(l) = self.sessions.open(req.open.0)
+        else
         {
-            OpenRef::Unpaid(id) =>
-            {
-                let Some(file) = self.unpaid.get_mut(id)
-                else
-                {
-                    return false;
-                };
-                let Some(slot) = file
-                    .outstanding
-                    .iter_mut()
-                    .find(|s| s.is_some_and(|e| e.is(req)))
-                else
-                {
-                    return false;
-                };
-                *slot = None;
-                true
-            }
-            OpenRef::Session(id) =>
-            {
-                let Some(l) = self.sessions.open(id)
-                else
-                {
-                    return false;
-                };
-                let Some((_, emptied)) = self
-                    .sessions
-                    .unhold(l, |h| OutstandingPage::from_held(*h).is(req))
-                else
-                {
-                    return false;
-                };
-                self.release_frame(emptied);
-                true
-            }
-        }
+            return false;
+        };
+        let Some((_, emptied)) = self
+            .sessions
+            .unhold(l, |h| OutstandingPage::from_held(*h).is(req))
+        else
+        {
+            return false;
+        };
+        self.release_frame(emptied);
+        true
     }
 
-    /// Close the open: release its pages and its release SEND, and for an
-    /// unpaid open its liveness cap. `false` when it is not live.
+    /// Close the open: release its pages and its release SEND. When it was
+    /// the last open of a session whose client holds no copy of its liveness
+    /// cap any more, end that session too, as a sweep would, so its pages
+    /// are given back before the close is answered: one
+    /// `CAP_INFO_SOLE_REFERENCE` inquiry per close that empties a session.
+    /// `false` when the open is not live.
     pub fn close(&mut self, open: OpenRef, cache: &PageCache) -> bool
     {
-        match open
+        let Some(l) = self.sessions.open(open.0)
+        else
         {
-            OpenRef::Unpaid(id) => self
-                .unpaid
-                .remove(id)
-                .map(|f| release_open_file(&f, cache))
-                .is_some(),
-            OpenRef::Session(id) =>
+            return false;
+        };
+        let session = self.sessions.session_of(l);
+        if let Some(removed) = self.sessions.remove_open(l)
+        {
+            self.release_removed(removed, cache);
+        }
+        if let Some(session) = session
+        {
+            let fields = self.sessions.session_fields(session);
+            if fields.opens == 0 && sole_reference(fields.liveness_cap)
             {
-                let Some(l) = self.sessions.open(id)
-                else
-                {
-                    return false;
-                };
-                if let Some(removed) = self.sessions.remove_open(l)
-                {
-                    self.release_removed(removed, cache);
-                }
-                true
+                self.end_session(session, cache);
             }
         }
+        true
     }
 
-    /// Close every open of `node`, of either kind.
+    /// Close every open of `node`.
     pub fn close_node(&mut self, node: NodeId, cache: &PageCache)
     {
-        self.unpaid
-            .remove_where(|f| f.node_id == node, |f| release_open_file(&f, cache));
         for session in self.sessions.sessions()
         {
             for open in self.sessions.opens_of(session)
@@ -534,16 +319,6 @@ impl Opens
                 }
             }
         }
-    }
-
-    /// Release every unpaid open whose client holds no copy of its liveness
-    /// cap any more ([`OpenFile::client_gone`]), as `FS_CLOSE` would, and
-    /// restart `sweeps` from the unpaid opens left.
-    pub fn sweep_unpaid(&mut self, sweeps: &mut SweepSchedule, cache: &PageCache)
-    {
-        self.unpaid
-            .remove_where(OpenFile::client_gone, |f| release_open_file(&f, cache));
-        sweeps.swept(self.unpaid.len());
     }
 
     /// End every session whose client holds no copy of its liveness cap any
@@ -566,20 +341,16 @@ impl Opens
         left
     }
 
-    /// Live opens of either kind.
+    /// Live opens, in every session.
     pub fn live_opens(&self) -> usize
     {
         let sessions = self.sessions.sessions().len();
-        self.unpaid
-            .len()
-            .saturating_add(self.sessions.live().saturating_sub(sessions))
+        self.sessions.live().saturating_sub(sessions)
     }
 
     /// Release every open and end every session.
     pub fn release_all(&mut self, cache: &PageCache)
     {
-        self.unpaid
-            .remove_where(|_| true, |f| release_open_file(&f, cache));
         for session in self.sessions.sessions()
         {
             self.end_session(session, cache);
@@ -643,18 +414,12 @@ impl Opens
 
     /// Whether the session of the open `open` names can take a held page's
     /// record now: `Err(NeedPage)` when it needs another page first, `Ok`
-    /// for an unpaid open and for one that is not live, which the read
-    /// refuses later.
+    /// for an open that is not live, which the read refuses later.
     pub fn room_for_held(&self, open: OpenRef) -> Result<(), SessionRefusal>
     {
-        let OpenRef::Session(id) = open
-        else
-        {
-            return Ok(());
-        };
         let Some(session) = self
             .sessions
-            .open(id)
+            .open(open.0)
             .and_then(|l| self.sessions.session_of(l))
         else
         {
@@ -673,17 +438,12 @@ impl Opens
     }
 
     /// The session's id, for the session an open `open` names belongs to;
-    /// `None` for an unpaid or ended open.
+    /// `None` for an ended open.
     pub fn session_of(&self, open: OpenRef) -> Option<u64>
     {
-        let OpenRef::Session(id) = open
-        else
-        {
-            return None;
-        };
         let session = self
             .sessions
-            .open(id)
+            .open(open.0)
             .and_then(|l| self.sessions.session_of(l))?;
         Some(self.sessions.id_of(session))
     }
@@ -805,28 +565,5 @@ impl Opens
         {
             std::os::seraph::log!(warn: "session: a page would not unmap; kept");
         }
-    }
-}
-
-/// Release an unpaid open taken out of the table: revoke and drop each
-/// outstanding page, delete the recorded release SEND (leaving it in the
-/// `CSpace` would accumulate a stale SEND per open across the fs's
-/// lifetime), and revoke the copies of the liveness cap before deleting its
-/// parent, so the client's copy dies with the open and the Notification's
-/// bytes return to fatfs's object slab. A copy derived from another holder's
-/// copy is out of the revoke's reach once a `CSpace` holding a copy on its
-/// derivation path is torn down, and holds the bytes until its holder
-/// deletes it (services/fs/docs/fs-driver-protocol.md § Label 18).
-pub fn release_open_file(file: &OpenFile, cache: &PageCache)
-{
-    let _ = syscall::cap_revoke_all(file.liveness_cap);
-    let _ = syscall::cap_delete(file.liveness_cap);
-    for entry in file.outstanding.iter().flatten()
-    {
-        entry.release(cache);
-    }
-    if file.release_endpoint_cap != 0
-    {
-        let _ = syscall::cap_delete(file.release_endpoint_cap);
     }
 }

@@ -56,6 +56,15 @@ fn own_pages() -> u64
         .0
 }
 
+/// The pages charged to this process's sub-nodes: its whole subtree less
+/// its own node.
+fn sub_node_pages() -> u64
+{
+    let (own, _, subtree) =
+        crate::phases::budget::memory_usage().expect("verified read: QUERY_MEMORY_USAGE");
+    subtree.saturating_sub(own)
+}
+
 /// What a refused read asks for: the name, the length (the size hint when
 /// `None`) and the role.
 struct Request<'a>
@@ -91,7 +100,10 @@ fn expect_refused(path: &str, request: &Request<'_>, want: ErrorKind, what: &str
 }
 
 /// 1. The fixture reads back its body, and the copy's pages are charged to
-///    this process while held and leave its account once dropped.
+///    this process while held and leave its account once dropped. The
+///    session procmgr opens the file in is charged to a sub-node of this
+///    process's node, and its charge leaves the subtree once the read ends
+///    (services/procmgr/docs/ipc-interface.md § Label 13).
 /// 2. The fixture asked for under another name, or in the configuration
 ///    role, is refused.
 /// 3. A copy of it with one body byte flipped, asked for under the
@@ -102,6 +114,7 @@ fn expect_refused(path: &str, request: &Request<'_>, want: ErrorKind, what: &str
 fn procmgr_read_verified_phase(_caps: &Caps)
 {
     let before = own_pages();
+    let sessions_before = sub_node_pages();
     let (cap, size) = lookup(VERIFIED_PATH);
     let data = read_verified(cap, size, VERIFIED_PATH, VerifiedRole::Data)
         .expect("verified read: the fixture");
@@ -121,6 +134,12 @@ fn procmgr_read_verified_phase(_caps: &Caps)
     assert!(
         after.saturating_add(pages) <= held,
         "verified read: the copy's {pages} pages not released ({held} -> {after})"
+    );
+    // procmgr's close ended the read session before it answered.
+    let now = sub_node_pages();
+    assert_eq!(
+        now, sessions_before,
+        "verified read: the read session's charge stayed on this process's subtree after the reply"
     );
 
     expect_refused(

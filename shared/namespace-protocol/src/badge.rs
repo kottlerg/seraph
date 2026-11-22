@@ -88,9 +88,9 @@ pub const fn pack(node_id: NodeId, rights: NamespaceRights) -> u64
 /// Badge bit marking an **open-instance cap**: bit 8 of the rights field
 /// (badge bit 48), the lowest bit [`crate::rights::DEFINED_MASK`] leaves
 /// reserved. It is a badge-kind flag, not a right. On a badge that carries
-/// it the low [`NODE_ID_BITS`] hold a server-private open identifier, not a
-/// [`NodeId`], so [`crate::gate::gate`] and the `NS_*` dispatch refuse it
-/// and only [`crate::gate::gate_open`] decodes it
+/// it the badge holds a [`KIND_ID_BITS`]-bit server-private open
+/// identifier, not a [`NodeId`], so [`crate::gate::gate`] and the `NS_*`
+/// dispatch refuse it and only [`crate::gate::gate_open`] decodes it
 /// (`shared/namespace-protocol/README.md` § Badge shape).
 pub const OPEN_INSTANCE: u64 = 1 << (NODE_ID_BITS + 8);
 
@@ -102,14 +102,14 @@ pub const fn is_open_instance(badge: u64) -> bool
 }
 
 /// Badge bit marking a **session cap**: bit 9 of the rights field (badge bit
-/// 49), a badge-kind flag like [`OPEN_INSTANCE`] and not a right. On its own
-/// it marks a filesystem session cap, which carries no rights; with
-/// [`OPEN_INSTANCE`] it marks an open made in a session. A badge carrying
-/// either flag holds a [`KIND_ID_BITS`]-bit server-private identifier, not a
-/// [`NodeId`] (`shared/namespace-protocol/README.md` § Badge shape).
+/// 49), a badge-kind flag like [`OPEN_INSTANCE`] and not a right. It marks a
+/// filesystem session cap, which carries no rights. A badge carries at most
+/// one of the two flags, and one carrying either holds a [`KIND_ID_BITS`]-bit
+/// server-private identifier, not a [`NodeId`]; a badge with both names
+/// nothing (`shared/namespace-protocol/README.md` § Badge shape).
 pub const SESSION: u64 = 1 << (NODE_ID_BITS + 9);
 
-/// Width of the identifier a session cap, or an open made in a session,
+/// Width of the identifier a session cap, or an open-instance cap,
 /// carries: the low [`NODE_ID_BITS`] of the badge and the fourteen badge bits
 /// above the two kind flags (50..64), which a node cap keeps reserved.
 pub const KIND_ID_BITS: u32 = 54;
@@ -169,60 +169,38 @@ pub const fn session_id(badge: u64) -> Option<u64>
     }
 }
 
-/// Pack `(open_id, rights)` into the badge of an open made in a session:
-/// [`OPEN_INSTANCE`] and [`SESSION`] set. `None` when `open_id` is zero or
-/// does not fit [`KIND_ID_BITS`].
-#[must_use]
-pub const fn pack_session_open(open_id: u64, rights: NamespaceRights) -> Option<u64>
-{
-    if open_id == 0 || (open_id & !KIND_ID_MASK) != 0
-    {
-        return None;
-    }
-    Some(spread_id(open_id) | ((rights.raw() as u64) << NODE_ID_BITS) | OPEN_INSTANCE | SESSION)
-}
-
-/// The open an open-instance badge names, by the kind of open it is.
+/// The open an open-instance badge names: its [`KIND_ID_BITS`]-bit id, which
+/// the server that minted the badge ([`pack_open`]) assigned. Every open is
+/// made in a session, and the server finds the session from the id.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum OpenRef
-{
-    /// An open made without a session ([`pack_open`]), with its
-    /// [`NODE_ID_BITS`]-bit id.
-    Unpaid(u64),
-    /// An open made in a session ([`pack_session_open`]), with its
-    /// [`KIND_ID_BITS`]-bit id.
-    Session(u64),
-}
+pub struct OpenRef(pub u64);
 
-/// The open an open-instance badge names; `None` when `badge` is not one.
+/// The open an open-instance badge names; `None` when `badge` is not one,
+/// including a badge that carries [`SESSION`] beside [`OPEN_INSTANCE`].
 #[must_use]
 pub(crate) const fn open_ref(badge: u64) -> Option<OpenRef>
 {
-    if !is_open_instance(badge)
+    if badge & (SESSION | OPEN_INSTANCE) == OPEN_INSTANCE
     {
-        None
-    }
-    else if badge & SESSION != 0
-    {
-        Some(OpenRef::Session(gather_id(badge)))
+        Some(OpenRef(gather_id(badge)))
     }
     else
     {
-        Some(OpenRef::Unpaid(badge & NODE_ID_MASK))
+        None
     }
 }
 
 /// Pack `(open_id, rights)` into an open-instance cap's badge, with
 /// [`OPEN_INSTANCE`] set. `None` when `open_id` is zero or does not fit
-/// the low [`NODE_ID_BITS`].
+/// [`KIND_ID_BITS`].
 #[must_use]
 pub const fn pack_open(open_id: u64, rights: NamespaceRights) -> Option<u64>
 {
-    if open_id == 0 || (open_id & !NODE_ID_MASK) != 0
+    if open_id == 0 || (open_id & !KIND_ID_MASK) != 0
     {
         return None;
     }
-    Some(open_id | ((rights.raw() as u64) << NODE_ID_BITS) | OPEN_INSTANCE)
+    Some(spread_id(open_id) | ((rights.raw() as u64) << NODE_ID_BITS) | OPEN_INSTANCE)
 }
 
 /// Unpack a node-cap badge into `(node_id, rights)`. `pub(crate)` —
@@ -322,8 +300,8 @@ mod tests
     {
         let rights = NamespaceRights::from_raw(READ);
         assert_eq!(pack_open(0, rights), None);
-        assert_eq!(pack_open(NODE_ID_MASK + 1, rights), None);
-        assert!(pack_open(NODE_ID_MASK, rights).is_some());
+        assert_eq!(pack_open(KIND_ID_MASK + 1, rights), None);
+        assert!(pack_open(KIND_ID_MASK, rights).is_some());
     }
 
     #[test]
@@ -343,27 +321,31 @@ mod tests
     }
 
     #[test]
-    fn a_session_open_badge_keeps_its_full_id_and_its_rights()
+    fn an_open_badge_keeps_its_full_id_and_its_rights()
     {
         let rights = NamespaceRights::ALL;
         for id in [1, NODE_ID_MASK + 1, KIND_ID_MASK]
         {
-            let badge = pack_session_open(id, rights).expect("fits");
-            assert_eq!(open_ref(badge), Some(OpenRef::Session(id)));
+            let badge = pack_open(id, rights).expect("fits");
+            assert_eq!(open_ref(badge), Some(OpenRef(id)));
             assert_eq!(session_id(badge), None);
             assert_eq!(unpack(badge).1, rights);
         }
-        assert_eq!(pack_session_open(0, rights), None);
-        assert_eq!(pack_session_open(KIND_ID_MASK + 1, rights), None);
     }
 
     #[test]
-    fn the_kind_of_an_open_follows_its_session_flag()
+    fn a_badge_with_both_kind_flags_names_nothing()
+    {
+        let both = pack_open(5, NamespaceRights::from_raw(READ)).expect("fits") | SESSION;
+        assert!(is_kind_flagged(both));
+        assert_eq!(open_ref(both), None);
+        assert_eq!(session_id(both), None);
+    }
+
+    #[test]
+    fn a_node_badge_is_neither_an_open_nor_a_session()
     {
         let rights = NamespaceRights::from_raw(READ);
-        let unpaid = pack_open(NODE_ID_MASK, rights).expect("fits");
-        assert_eq!(open_ref(unpaid), Some(OpenRef::Unpaid(NODE_ID_MASK)));
-        assert_eq!(session_id(unpaid), None);
         let node = pack(NodeId::new(5).unwrap(), rights);
         assert!(!is_kind_flagged(node));
         assert_eq!(open_ref(node), None);

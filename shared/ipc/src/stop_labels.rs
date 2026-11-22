@@ -14,7 +14,13 @@
 //!
 //! A source serves both labels only on a badge carrying [`STOP_AUTHORITY`],
 //! and its own labels avoid [`STOP_CANDIDATE`] and [`LIST_CANDIDATES`]. A
-//! key names one candidate and no other while the source runs.
+//! key names one candidate and no other across the source's instances: the
+//! endpoint persists across the source's restarts, and a stopper can hold a
+//! key it listed past one, so a source draws its keys from a value of each
+//! instance's own (svcmgr's carry the service's instance; sessiond seeds its
+//! slot generations, and a job's key is its process badge, which procmgr
+//! never hands out twice), and a key an earlier instance handed out names a
+//! candidate of a later one with a probability of at most about 2^-31.
 
 // Under `rustc-dep-of-std` the crate is `no_core`, so this module, which
 // defines functions, imports the prelude the crate root imports.

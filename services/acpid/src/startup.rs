@@ -47,9 +47,11 @@ pub fn run(devmgr: &Devmgr, aspace: u64, service: u64, ended: &Sender<&'static s
     let mut platform = Platform::new(devmgr, aspace, thread);
     let mut ns = load(devmgr, aspace);
     let mut hotplug_slots = HotplugSlots::default();
+    // Whether or not the DSDT loaded: the fixed power button the events arm
+    // raises the SCI only in ACPI mode, and the switch needs no AML.
+    arch::current::enable_acpi(devmgr, thread, &power);
     if let Some((ns, tables)) = &mut ns
     {
-        arch::current::enable_acpi(devmgr, thread, &power);
         hotplug_slots = start(ns, *tables, devmgr, &mut platform);
     }
     server::serve(

@@ -48,12 +48,14 @@ no endpoint parks it.
    `DSDT`, which devmgr resolves through the FADT), then for SSDT 0, 1, ... until devmgr
    replies `NO_DEVICE`, at most 64 (`MAX_SSDTS`, [docs/limits.md](../../../docs/limits.md)).
    Each table is mapped read-only, loaded into the namespace, and unmapped. A DSDT that cannot
-   be loaded ends the sequence: no AML runs, and acpid goes on to arm and serve (step 10). An SSDT
-   that cannot be loaded is logged and skipped. The method bodies are then parsed.
+   be loaded ends the sequence after step 3: no AML runs, and acpid goes on to arm and serve
+   (step 10). An SSDT that cannot be loaded is logged and skipped. The method bodies are then
+   parsed.
 3. **ACPI mode** (x86-64). acpid reads `SCI_EN` in the PM1a control block of step 1. When it
    is clear, acpid writes the FADT's `ACPI_ENABLE` value to `SMI_CMD` and waits up to 3 s for
-   `SCI_EN`. `SMI_CMD` comes from devmgr too (`QUERY_ACPI_RESOURCES`). RISC-V has no legacy
-   mode.
+   `SCI_EN`. `SMI_CMD` comes from devmgr too (`QUERY_ACPI_RESOURCES`). This step needs no AML,
+   and runs without a loaded DSDT too, since the fixed power button step 10 arms raises the SCI
+   only in ACPI mode. RISC-V has no legacy mode.
 4. **Module-level code**, then the **initialization walk**: `\_SB._INI`, then depth-first
    from the root in the order the tables define the objects, each `Device`, `Processor` and
    `ThermalZone`'s `_STA` and, for a present one, its `_INI`. A device absent but

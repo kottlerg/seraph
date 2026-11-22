@@ -1395,6 +1395,22 @@ fn the_values_an_evaluation_makes_are_bounded()
 }
 
 #[test]
+fn a_scope_over_an_alias_in_a_method_calls_the_targets_methods()
+{
+    // Scope (ALS0) { Local0 = MTH1 (5) }, ALS0 an Alias of DEV0, which holds
+    // MTH1: the call is parsed in DEV0, as it runs, so 5 is its argument.
+    let defs = cat(&[
+        &device("DEV0", &method("MTH1", 1, &ret(&bin(0x72, &a(0), &i(1))))),
+        &cat(&[&[0x06], &name("DEV0"), &name("ALS0")]),
+    ]);
+    let body = cat(&[
+        &scope("ALS0", &store(&cat(&[&n("MTH1"), &i(5)]), &l(0))),
+        &ret(&l(0)),
+    ]);
+    assert_eq!(ok(&defs, &body), Data::Integer(6));
+}
+
+#[test]
 fn package_nesting_is_bounded()
 {
     // Local0 = Package { Local0 }, again and again.

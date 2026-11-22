@@ -330,8 +330,7 @@ jobs:
           path: |
             target/xtask/run/**/*.log
             target/xtask/run/**/*.crash.txt
-            target/xtask/test/signing/*/*.log
-            target/xtask/test/enrolment/*/*.log
+            target/xtask/test/*/*/*.log
           if-no-files-found: ignore
 
       - name: Upload saved run logs

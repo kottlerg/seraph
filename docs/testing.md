@@ -853,7 +853,7 @@ QEMU, as for the `terminal` case. See
 [xtask/README.md § The `wedge` case](../xtask/README.md#the-wedge-case) for the command.
 
 In CI it runs as a boot pair inside each `usertest` cell (both arches, both profiles), after the
-`rollback` case, on the default boot the cell's `cargo xtask mkdisk` restored.
+`secureboot` case, on the default boot the cell's `cargo xtask mkdisk` restored.
 
 ### CET shadow stacks (`cet` case)
 

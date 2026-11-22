@@ -102,6 +102,7 @@ fn fs_sessions_phase(_: &Caps)
     let top = sub_node(startup_info().memmgr_endpoint, NO_MAX, "CREATE_SUB_NODE");
     one_session_per_driver(node, ipc_buf);
     refusals(top, node, ipc_buf);
+    session_on_mount_root(top, ipc_buf);
     charged_to_the_client(top, node, ipc_buf);
     client_death(top);
     assert_eq!(
@@ -368,6 +369,30 @@ fn refusals(top: u64, node: u64, ipc_buf: *mut u64)
         "FS_OPEN in an ended session"
     );
     let _ = syscall::cap_delete(session);
+}
+
+/// `FS_SESSION` on the `/data` mount's root cap, whose badge names the root
+/// (`NodeId(0)`, which no node table entry holds), makes a session as on any
+/// node cap of the driver; its page leaves the phase's node as it ends.
+fn session_on_mount_root(top: u64, ipc_buf: *mut u64)
+{
+    let (root, _kind, _size) = ns_lookup(std::os::seraph::root_dir_cap(), b"data", 0xFFFF, ipc_buf)
+        .unwrap_or_else(|e| panic!("fs_sessions: lookup of the /data mount: {e:#x}"));
+    let before = node_usage(top, "NODE_QUERY_USAGE before the root cap's session").2;
+    let node = sub_node(top, NO_MAX, "NODE_CREATE of the root cap session's node");
+    let (session, liveness) = fs_session(root, charge_handle(node, "NODE_CHARGE_HANDLE"), ipc_buf)
+        .unwrap_or_else(|e| {
+            panic!("fs_sessions: FS_SESSION on the /data mount's root cap: {e:#x}")
+        });
+    end_session(&[], liveness, node, "the /data root cap's session");
+    assert!(
+        settles_to(top, before, "NODE_QUERY_USAGE after the root cap's session"),
+        "the session on the /data mount's root cap kept its page charged"
+    );
+    for cap in [session, root]
+    {
+        let _ = syscall::cap_delete(cap);
+    }
 }
 
 /// End a session: delete its liveness cap `liveness`, then release `node`

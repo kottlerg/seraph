@@ -548,7 +548,9 @@ clusters is FAT32. Each volume's data region starts on a cluster boundary, every
 1980-01-01, and the volume serial number is the first four bytes of the partition's unique GUID.
 A name that is an upper-case 8.3 name is stored as that alone, and any other with a long name;
 mkdisk refuses a host name FAT cannot store (one not UTF-8, one with a reserved character or a
-trailing space or period, or two names of one directory that differ only in case).
+trailing space or period, two names of one directory that differ only in case, or an upper-case
+8.3 name another name of its directory is looked up as), and gives no long name a short name
+another name of its directory is looked up as.
 
 #### The image check
 

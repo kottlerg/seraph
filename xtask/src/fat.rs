@@ -785,13 +785,17 @@ impl Name
 /// The names each of `entries`, one directory's, is stored under, in order. A name that
 /// [`exact_short_name`] gives a short name is stored as that alone. Any other takes a long
 /// name and a short name from its [`basis_name`]: the basis itself when it renders the name
-/// with its case alone changed and no other entry has it, else the basis with the lowest
-/// numeric tail no other entry has.
+/// with its case alone changed and is free, else the basis with the lowest numeric tail that
+/// is free. A short name is free when no other entry has it and no other entry's name is
+/// looked up as it: the `fatfs` service's lookup returns the first entry whose long name or
+/// short name matches (`fat_parse::name_matches`), so such a short name, earlier in the
+/// directory, would open the wrong entry.
 ///
 /// # Errors
 /// Fails when a name is empty, longer than 255 UTF-16 code units, holds a control character
-/// or one of [`LFN_FORBIDDEN`], ends in a space or a period, or equals another of the
-/// directory's names but for case, which FAT's case-insensitive lookup could not tell apart.
+/// or one of [`LFN_FORBIDDEN`], ends in a space or a period, equals another of the
+/// directory's names but for case, or is an 8.3 name another of the directory's names is
+/// looked up as, which FAT's case-insensitive lookup could not tell apart.
 fn short_names(entries: &[Entry]) -> Result<Vec<Name>>
 {
     let mut folded = HashSet::new();
@@ -806,16 +810,32 @@ fn short_names(entries: &[Entry]) -> Result<Vec<Name>>
     }
     let exact: Vec<Option<[u8; 11]>> = entries.iter().map(|e| exact_short_name(&e.name)).collect();
     let mut taken: HashSet<[u8; 11]> = exact.iter().flatten().copied().collect();
+    // The other entry whose name the entry at `own` would shadow with `short`.
+    let shadowed = |short: &[u8; 11], own: usize| {
+        entries
+            .iter()
+            .enumerate()
+            .find(|&(at, other)| at != own && fat_parse::name_matches(short, other.name.as_bytes()))
+            .map(|(_, other)| other.name.as_str())
+    };
     let mut names = Vec::with_capacity(entries.len());
-    for (entry, exact) in entries.iter().zip(exact)
+    for (own, (entry, exact)) in entries.iter().zip(exact).enumerate()
     {
         if let Some(short) = exact
         {
+            if let Some(other) = shadowed(&short, own)
+            {
+                bail!(
+                    "{:?} is the short name {other:?}, of the same directory, is looked up as",
+                    entry.name
+                );
+            }
             names.push(Name { short, long: None });
             continue;
         }
+        let free = |name: &[u8; 11]| !taken.contains(name) && shadowed(name, own).is_none();
         let (basis, lossy) = basis_name(&entry.name);
-        let short = if !lossy && !taken.contains(&basis)
+        let short = if !lossy && free(&basis)
         {
             basis
         }
@@ -823,7 +843,7 @@ fn short_names(entries: &[Entry]) -> Result<Vec<Name>>
         {
             (1..=fat_parse::MAX_NUMERIC_TAIL)
                 .filter_map(|tail| fat_parse::compose_tailed_name(&basis, tail))
-                .find(|name| !taken.contains(name))
+                .find(|name| free(name))
                 .with_context(|| format!("no numeric tail is free for {:?}", entry.name))?
         };
         taken.insert(short);
@@ -1152,6 +1172,37 @@ mod tests
         }
         names(&["Same", "sAME"]).unwrap_err();
         names(&[&"x".repeat(255)]).unwrap();
+    }
+
+    /// Defect caught: a short name that equals the name another entry of the directory is
+    /// looked up as, which `fatfs`'s first-match lookup resolves to the wrong entry when it
+    /// comes first: a generated tail taken from under a later sibling's name, or an exact
+    /// 8.3 name a sibling's name is looked up as.
+    #[test]
+    fn no_short_name_is_one_another_entry_is_looked_up_as()
+    {
+        let list = [
+            "Foo Bar",
+            "foobar~1",
+            "Bar Baz.txt",
+            "BARBAZ~1.TXT",
+            "barbaz~2.txt",
+        ];
+        let got = names(&list).unwrap();
+        for (own, name) in got.iter().enumerate()
+        {
+            for (at, other) in list.iter().enumerate()
+            {
+                assert!(
+                    at == own || !fat_parse::name_matches(&name.short, other.as_bytes()),
+                    "{:?}'s short name {:?} is how {other:?} is looked up",
+                    list[own],
+                    short(name)
+                );
+            }
+        }
+        assert_eq!(short(&got[1]), "FOOBAR~1   ");
+        names(&["FOOBAR~1", "foobar~1 extra"]).unwrap_err();
     }
 
     /// A tree that exercises every path of the writer: nested directories, an empty file, a

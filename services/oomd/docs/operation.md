@@ -105,7 +105,9 @@ the level before oomd stops another. An act:
    its line, so a log write that waits does not delay it.
 
 oomd stops at most one candidate per cooldown and never one no source lists. It holds no fault:
-crashd holds the faults memmgr declines, and resumes them when the level falls below `CRITICAL`.
+crashd holds the faults memmgr declines, and resumes each when the memory it waits for is there: the
+level below `CRITICAL` or, for a fault of a commit overrun or of a restore, memmgr's draw room
+open ([`services/crashd/docs/operation.md`](../../crashd/docs/operation.md) § Hold).
 
 ---
 

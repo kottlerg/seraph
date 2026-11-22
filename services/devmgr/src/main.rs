@@ -240,6 +240,17 @@ fn main() -> !
         );
         acpi.run(&records, &mut caps, &mut irq_range, &hotplug);
         hotplug.grant(acpi.bridges(), &mut records, &mut caps);
+        restart_iommu_if_due(
+            &registry,
+            &mut bind::Carve {
+                caps: &mut caps,
+                irq_range: &mut irq_range,
+                catalog: &mut catalog,
+                bridges: acpi.bridges(),
+            },
+            &mut watch,
+            ipc_buf,
+        );
         hotplug.run(
             &registry,
             &mut records,
@@ -419,6 +430,7 @@ fn run_jobs(
     }
     if jobs.drivers_dir
     {
+        restart_iommu_if_due(registry, tables, watch, ipc_buf);
         let tables_dir_cap = core::mem::take(&mut registry.lock().tables_dir_cap);
         if hotplug.tables_known()
         {
@@ -451,6 +463,7 @@ fn run_jobs(
     {
         for source in restarts
         {
+            restart_iommu_if_due(registry, tables, watch, ipc_buf);
             restart_driver(
                 source,
                 records,
@@ -469,10 +482,12 @@ fn run_jobs(
     let now = now_ns();
     while let Some(retry) = registry.take_due_retry(now)
     {
+        restart_iommu_if_due(registry, tables, watch, ipc_buf);
         retry_driver(retry, records, tables, watch, registry, ipc_buf);
     }
     if jobs.bind
     {
+        restart_iommu_if_due(registry, tables, watch, ipc_buf);
         spawn_dir_drivers(
             "on-demand batch",
             records,
@@ -488,6 +503,26 @@ fn run_jobs(
             state.bind_dir_cap = 0;
             state.bind_dir_path = DirPath::EMPTY;
         });
+    }
+}
+
+/// Run the IOMMU driver's restart when its serving instance's death has
+/// posted it ([`Jobs::iommu`]) since the pass began: a settle takes the deaths
+/// outside its batch, the IOMMU driver's among them, so a death can post the
+/// restart mid-pass. Called before each step that binds or withdraws, each
+/// of which calls the driver, so none runs while the driver restarts.
+fn restart_iommu_if_due(
+    registry: &Registry,
+    tables: &mut bind::Carve,
+    watch: &mut settle::DriverWatch,
+    ipc_buf: *mut u64,
+)
+{
+    let due = core::mem::take(&mut registry.lock().jobs.iommu);
+    if due
+    {
+        restart_iommu(registry, tables, watch, ipc_buf);
+        registry.finish_job(|_| ());
     }
 }
 
@@ -544,7 +579,8 @@ struct Jobs
     restart: bool,
     /// The restart of the IOMMU driver, whose serving instance died
     /// ([`Registry::iommu_died`]); run before every other job, whose binds
-    /// and withdrawals call the driver.
+    /// and withdrawals call the driver, and, when a death posts it mid-pass,
+    /// before the next step that binds ([`restart_iommu_if_due`]).
     iommu: bool,
 }
 

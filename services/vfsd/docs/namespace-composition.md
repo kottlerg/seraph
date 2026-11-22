@@ -162,8 +162,9 @@ the mount at a path in this order:
    delete the process handle and the death queue.
 4. `remove_mount` the record. When the node stays visible because a mount below it remains, it
    is now a synthetic intermediate with no fall-through cap (`needs_fallthrough`); vfsd walks the
-   root mount for it as an install walks for the intermediates it makes visible. Then reply
-   `SUCCESS`.
+   root mount for it as an install walks for the intermediates it makes visible, each lookup
+   bounded by `FALLTHROUGH_TIMEOUT_MS`, since a driver's teardown makes this walk on the watch
+   thread, which a root driver that stops answering must not hold. Then reply `SUCCESS`.
 
 Only the request that began a node's removal ends it, so a concurrent `MOUNT` at the path is
 refused (`TABLE_FULL`) and a concurrent `UNMOUNT` of it finds the removal under way (`NO_MOUNT`)

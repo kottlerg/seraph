@@ -65,7 +65,9 @@ const SERVICE_THREAD_COUNT: usize = 4;
 /// filesystem. The thread serves every walk, so a root fs driver that stops
 /// answering would otherwise hold up every lookup, those into healthy mounts
 /// included; a call that has not returned within the bound is answered
-/// `NsError::IoError`.
+/// `NsError::IoError`. The walk that finds a fall-through directory after an
+/// unmount (`walk_root_mount_path`) takes the same bound, since it can run
+/// on the watch thread.
 const FALLTHROUGH_TIMEOUT_MS: u32 = 10_000;
 
 /// Longest mount path a `MOUNT` or `UNMOUNT` request can name: the bytes
@@ -2155,7 +2157,10 @@ fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates:
 /// component list) via per-component `NS_LOOKUP`. Each intermediate
 /// cap is dropped as the walk descends; only the final cap survives,
 /// returned to the caller. Returns `None` on any walk failure or if
-/// any intermediate is not a directory.
+/// any intermediate is not a directory. Each lookup is bounded by
+/// [`FALLTHROUGH_TIMEOUT_MS`], since the walk also runs on the watch thread
+/// (`finish_unmount` of a driver's teardown), which a root fs that stops
+/// answering must not hold.
 fn walk_root_mount_path(root_mount_cap: u64, path: &[u8], ipc_buf: *mut u64) -> Option<u64>
 {
     let stripped = path.trim_prefix(b"/");
@@ -2181,7 +2186,8 @@ fn walk_root_mount_path(root_mount_cap: u64, path: &[u8], ipc_buf: *mut u64) -> 
             .bytes(1, component)
             .build();
         // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-        let reply = unsafe { ipc::ipc_call(current_cap, &msg, ipc_buf) };
+        let reply =
+            unsafe { ipc::ipc_call_timeout(current_cap, &msg, ipc_buf, FALLTHROUGH_TIMEOUT_MS) };
         if current_owned
         {
             let _ = syscall::cap_delete(current_cap);

@@ -1500,17 +1500,6 @@ impl File
             (walked.file_cap, walked.size)
         };
 
-        // ── Optional truncate-to-zero on an existing file ────────────
-        if opts.truncate && size != 0
-        {
-            if let Err(e) = file_truncate_zero(file_cap, ipc_buf)
-            {
-                let _ = syscall::cap_delete(file_cap);
-                return Err(e);
-            }
-            size = 0;
-        }
-
         // ── Release-handler plumbing and FS_OPEN ─────────────────────
         //
         // `FS_OPEN` moves a copy of this process's session cap with the
@@ -1566,6 +1555,21 @@ impl File
         let _ = syscall::cap_delete(release_send);
         let _ = syscall::cap_delete(file_cap);
         let file_cap = opened?;
+
+        // ── Optional truncate-to-zero on an existing file ────────────
+        //
+        // On the open cap, once the open exists: an open the driver or this
+        // process's node refuses leaves the file as it was.
+        if opts.truncate && size != 0
+        {
+            if let Err(e) = file_truncate_zero(file_cap, ipc_buf)
+            {
+                close_open(file_cap, ipc_buf);
+                return Err(e);
+            }
+            size = 0;
+        }
+
         // Registered once the open exists, so the exit hook
         // (`close_open_files`) closes it; no driver release can name one of
         // its pages before its first read.

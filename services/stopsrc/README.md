@@ -23,8 +23,8 @@ from bootstrap slot 0, touches its stack, logs `serving`, and serves, on any bad
 | `EXIT` (3) | `SUCCESS`, then the fixture exits with status 0, leaving a running job to procmgr, which destroys it with the fixture since svcmgr creates the fixture contained; `restart = always` restarts it |
 | any other | `UNKNOWN_OPCODE` |
 
-and, on a badge carrying `stop_labels::STOP_AUTHORITY`, the shared stop labels in place of its
-own ([svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) § Label 5, § Label 6):
+and, on a badge carrying `stop_labels::STOP_AUTHORITY`, the shared stop labels as well
+([svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) § Label 5, § Label 6):
 
 | Label | Reply |
 |---|---|
@@ -37,8 +37,8 @@ the fixture's own binary run as `stopsrc job <pages>`: it touches that many page
 sleeps until it is destroyed.
 
 svctest's `svcmgr_stop_service` phase reads that svcmgr lists the fixture as a source of the
-program class, that the stop labels answer on the SEND svcmgr hands out and refuse on the
-`:deny` one, and that a job the fixture started is gone once the fixture has exited. Its
+program class, that the stop labels and `PROBE` answer on the SEND svcmgr hands out, that the
+stop labels refuse on the `:deny` one, and that a job the fixture started is gone once the fixture has exited. Its
 `oom_policy` phase has the fixture exit, so the instance svcmgr restarts starts after oomd, and
 start a job before memhog fills memory: oomd stops the job before memhog, and the fixture reports
 it stopped ([services/svctest/README.md](../svctest/README.md)). A fixture that

@@ -38,7 +38,9 @@ Every cap a request carries that sessiond does not keep or move is deleted, what
 - **Key.** A session is named by its key, to its interface and to a stop-authority holder alike: a
   value with bit 63 set, a generation and the session's table slot. A job is named, to a
   stop-authority holder, by its procmgr process badge, which never has bit 63 set. A key names one
-  candidate and no other while sessiond runs.
+  candidate and no other across sessiond's instances: each instance starts its slots' generations
+  at a random draw of its own, so a session key an earlier instance handed out names a session of a
+  later one with a probability of about 2^-31, and procmgr never hands out a process badge twice.
 
 ---
 

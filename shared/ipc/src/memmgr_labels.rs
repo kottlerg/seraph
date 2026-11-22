@@ -253,11 +253,14 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   of `data[10]` in committed regions. An eviction or a restore of such a
 ///   chunk moves `data[8]` and this alike, so `data[8]` less this is the
 ///   promised total net of eviction.
+/// * `data[19]` — `cspace_used_slots`: the used slots of memmgr's own
+///   `CSpace`, a count, not bytes. memmgr funds its `CSpace` from its pool,
+///   so a cap it kept by mistake raises this for good rather than wedge it.
 ///
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
 /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-/// "dark" memory. `data[3]` to `data[18]` are appended fields — readers
+/// "dark" memory. `data[3]` to `data[19]` are appended fields — readers
 /// needing only the identity may ignore them.
 pub const QUERY_POOL_STATUS: u64 = 6;
 /// Register a demand-paged anonymous region for the calling process.

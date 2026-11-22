@@ -307,7 +307,9 @@ session is not tied to that node. The driver deletes every cap beyond
 | `caps[1]` | Liveness cap (a Notification cap with no rights) |
 
 **Reply (error)**: `label = ipc::fs_errors::*`: `INVALID_BADGE` (an open cap
-or a session cap), `PERMISSION_DENIED` (the badge carries no rights),
+or a session cap, or a node cap whose node the driver no longer holds, as
+after an [`FS_REMOVE`](#label-14-fs_remove) of its entry; the mount's root
+cap is always accepted), `PERMISSION_DENIED` (the badge carries no rights),
 `INVALID_ARGUMENT` (`caps[0]` is missing, or memmgr refuses it as a node
 handle), `LIMIT` (the max of the node or of an ancestor refuses the
 session's first page), `OUT_OF_MEMORY` (memmgr refuses that page for want of

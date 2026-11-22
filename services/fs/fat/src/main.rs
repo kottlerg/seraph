@@ -1345,7 +1345,9 @@ fn handle_session_node_cap(
 )
 {
     let opcode = fs_labels::FS_SESSION;
-    if nodes.get(node_id).is_none()
+    // The mount's root cap names `NodeId(0)`, which the node table never
+    // holds; any other id names a node the table must still hold.
+    if node_id.raw() != 0 && nodes.get(node_id).is_none()
     {
         reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;

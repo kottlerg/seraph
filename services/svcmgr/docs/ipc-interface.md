@@ -20,7 +20,8 @@ A SEND on the same endpoint (carrying none of the
 every process via
 [`ProcessInfo.service_registry_cap`](../../../abi/process-abi/README.md#processinfo)
 so userspace consumers can
-`QUERY_ENDPOINT` for the public published names.
+`QUERY_ENDPOINT` for the public published names. Besides devmgr's `PUBLISH_AUTHORITY` SEND, only the
+seeds of `svcmgr.grant` hold a `SEND|GRANT` on the endpoint.
 
 ---
 
@@ -123,7 +124,7 @@ bind devmgr's or vfsd's death-notification at endowment time — the matching `.
 definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
-`svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`, `devmgr.acpi`,
+`svcmgr`, `svcmgr.grant`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`, `devmgr.acpi`,
 `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`) into its own registry,
 configures devmgr's device classes and publishes each as `devmgr.class.<stem>` (the class file's
 name without `.class`), and installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`,
@@ -137,6 +138,10 @@ when either is dead ([restart-protocol.md § Death detection](restart-protocol.m
 
 All requests use `SYS_IPC_CALL` (synchronous call/reply). The message
 label field identifies the operation.
+
+A request's caps arrive in svcmgr's `CSpace` before svcmgr serves it. svcmgr deletes every cap a
+request carries, whatever its label or badge, a label it does not serve (`UNKNOWN_OPCODE`)
+included, apart from `PUBLISH_ENDPOINT`'s `caps[0]`, which it stores or deletes (§ Label 3).
 
 ### Label 2: `HANDOVER_COMPLETE`
 
@@ -227,12 +232,14 @@ Only public names resolve. A name whose cap carries authority is published seed-
 `devmgr.acpi` included), `vfsd.mount`, `vfsd.swap`, `memmgr.swap`, `logd.query`, and each provider
 name whose badge carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` and `:grant` entries, today
 `pwrmgr.shutdown`, `acpid.power`, `swapd.restore`, `sessiond.operator` and `crashd.core`).
-`vfsd.deny` carries no authority but is seed-only too: it is svctest's test twin, reached only
-through svctest's recipe. A seed-only name reaches a process only through a recipe's `seed = ...`
-line, which svcmgr resolves itself, so its authority stays with the recipes that seed it
-([service-definitions.md §
-`seed`](service-definitions.md#seed)). A seed is `SEND` except `devmgr.bind`, `memmgr.swap` and each
-`:grant` entry (`sessiond.operator`, `crashd.core`), which are `SEND|GRANT`: `BIND_DRIVERS` moves a
+`vfsd.deny` and `svcmgr.grant` carry no authority but are seed-only too: they are svctest's test
+twins, reached only through svctest's recipe. `svcmgr.grant` is a `SEND|GRANT` on svcmgr's own
+service endpoint under the published `svcmgr` badge, through which svctest sends requests that
+carry caps, which svcmgr deletes. A seed-only name reaches a process only through a recipe's
+`seed = ...` line, which svcmgr resolves itself, so its authority stays with the recipes that seed
+it ([service-definitions.md § `seed`](service-definitions.md#seed)). A seed is `SEND` except
+`devmgr.bind`, `memmgr.swap`, `svcmgr.grant` and each `:grant` entry (`sessiond.operator`,
+`crashd.core`), which are `SEND|GRANT`: `BIND_DRIVERS` moves a
 directory cap and the kernel requires `GRANT` for that, the swap labels move caps to memmgr, and a
 `:grant` name's seeds move caps to its provider. The public names are `svcmgr`, `pwrmgr.deny`,
 `acpid.deny`, `timed`, and any name published through
@@ -395,8 +402,8 @@ no cap, and svcmgr deletes any it carries.
 `svcmgr_labels::PUBLISH_AUTHORITY` is a verb-bit (the top bit of the
 caller's cap badge) gating `PUBLISH_ENDPOINT` for *external* publishers.
 svcmgr publishes the well-known names it owns (`rootfs.root`, `svcmgr`,
-the four `devmgr.*` names, the three `vfsd.*` names, `logd.query`, and each provider's
-`provides` names) directly into
+`svcmgr.grant`, the four `devmgr.*` names, the three `vfsd.*` names, `logd.query`, and each
+provider's `provides` names) directly into
 its own registry, so those need no badge. The gate exists for a future
 external publisher — devmgr holds a `PUBLISH_AUTHORITY`-badged SEND from
 its bootstrap bundle, reserved for driver registrations. The SEND

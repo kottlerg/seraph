@@ -40,18 +40,6 @@ fn reply(code: u64, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&msg, ipc_buf) };
 }
 
-/// Release every cap a request delivered: no stop label takes one.
-fn release_delivered(msg: &IpcMessage)
-{
-    for &cap in msg.caps()
-    {
-        if cap != 0
-        {
-            let _ = syscall::cap_delete(cap);
-        }
-    }
-}
-
 /// The facts the eligibility rule reads for the service in table slot
 /// `idx`, from its entry, its restart recipe, and whether it is the
 /// shutdown actuator. `None` when `idx` is no slot.
@@ -107,7 +95,6 @@ fn stoppable(state: &SvcmgrState, idx: usize) -> bool
 pub(crate) fn handle_stop_candidate(msg: &IpcMessage, state: &mut SvcmgrState, ctx: &RestartCtx)
 {
     let ipc_buf = ctx.ipc_buf;
-    release_delivered(msg);
     if msg.badge & stop_labels::STOP_AUTHORITY == 0
     {
         reply(stop_labels::UNAUTHORIZED, ipc_buf);
@@ -243,7 +230,6 @@ fn reply_page(
 pub(crate) fn handle_list_candidates(msg: &IpcMessage, state: &SvcmgrState, ctx: &RestartCtx)
 {
     let ipc_buf = ctx.ipc_buf;
-    release_delivered(msg);
     if msg.badge & stop_labels::STOP_AUTHORITY == 0
     {
         reply(stop_labels::UNAUTHORIZED, ipc_buf);
@@ -327,7 +313,6 @@ pub(crate) fn handle_list_candidates(msg: &IpcMessage, state: &SvcmgrState, ctx:
 pub(crate) fn handle_list_stop_sources(msg: &IpcMessage, state: &SvcmgrState, ctx: &RestartCtx)
 {
     let ipc_buf = ctx.ipc_buf;
-    release_delivered(msg);
     if msg.badge & stop_labels::STOP_AUTHORITY == 0
     {
         reply(svcmgr_errors::UNAUTHORIZED, ipc_buf);

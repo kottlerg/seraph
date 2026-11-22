@@ -178,7 +178,8 @@ endpoint, from which svcmgr launches and restarts real logd (per
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)
 § Supervision hierarchy). svcmgr — not init — then publishes the
 well-known names it owns into its own registry
-(`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `DEVMGR_REGISTRY`,
+(`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `SVCMGR_GRANT` (seed-only, its seeds keeping
+`GRANT`), `DEVMGR_REGISTRY`,
 `DEVMGR_SHUTDOWN`, `DEVMGR_BIND` (seed-only, a name whose seeds receive `SEND|GRANT`),
 `DEVMGR_ACPI`, the `DEVMGR_CLASS_PREFIX` class names, `VFSD_MOUNT`, `VFSD_DENY`, `VFSD_SWAP`,
 `MEMMGR_SWAP` (seed-only, its seeds keeping `GRANT`), `LOGD_QUERY`, minted from the endowed

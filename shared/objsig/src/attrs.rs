@@ -38,8 +38,9 @@ pub struct Attributes<'a>
     pub arch: Arch,
     /// The SHA-512 of the body.
     pub body_hash: [u8; HASH_LEN],
-    /// The slot name (`kernel`, `init`) or install path, compared byte for
-    /// byte.
+    /// The slot name (`kernel`, `init`, or `trust-request` for an enrolment
+    /// record) or install path, compared byte for byte
+    /// ([`crate::name_is_canonical`]).
     pub name: &'a [u8],
 }
 
@@ -243,8 +244,10 @@ mod tests
         refuse(&|b| b[28] = 0b0000_0110, ParseError::Roles);
         refuse(&|b| b[28] = 0b0001_0010, ParseError::Roles);
         refuse(&|b| b[28] = 0b1000_0100, ParseError::Roles);
-        // Bit 9, which no role has yet, and bit 31, CERTIFY in a usage mask.
+        // Bit 9, enrolment, beside other roles.
         refuse(&|b| b[29] = 2, ParseError::Roles);
+        // Bit 10, which no role has yet, and bit 31, CERTIFY in a usage mask.
+        refuse(&|b| b[29] = 4, ParseError::Roles);
         refuse(&|b| b[31] = 0x80, ParseError::Roles);
         refuse(&|b| b[30] = 1, ParseError::Roles);
         refuse(&|b| b[98] = 0, ParseError::Arch);

@@ -440,6 +440,12 @@ fn transfer(
         unsafe { std::os::seraph::mem_map_funded(*cap, aspace, va, 0, pages as u64, prot) };
     if let Err(e) = mapped
     {
+        // A map refused part-way can leave the pages before the failing one
+        // mapped (docs/userspace-memory-model.md § Page Reservations), and the
+        // reply moves the cap back to fatfs.
+        // SAFETY: the same `pages` reserved pages, which no Rust reference
+        // reaches.
+        let _ = unsafe { syscall::mem_unmap(aspace, va, pages as u64) };
         return map_refusal_label(e);
     }
     if direction == Direction::Read

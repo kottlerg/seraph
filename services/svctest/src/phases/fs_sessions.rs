@@ -26,7 +26,10 @@
 //! starts on a mount's root cap as on any node cap of the driver; that std's
 //! session lookup on an empty slot fails `StaleNetworkFileHandle`; and that std
 //! opens a file across the `/data` mount in its session with the `/data`
-//! driver, which the `/esp` driver does not take, nor the other way round.
+//! driver, which the `/esp` driver does not take, nor the other way round. A
+//! `fs-create-at-max` child ([`create_at_max_main`]) fills its node to its max
+//! and creates a file with std: the refused session start fails the create,
+//! and no entry is made.
 
 use std::os::seraph::{current_ipc_buf, startup_info};
 use std::time::{Duration, Instant};
@@ -59,8 +62,43 @@ pub fn reentry_main(role: &str)
     {
         session_client_main();
     }
+    if role == AT_MAX_ROLE
+    {
+        create_at_max_main();
+    }
 }
 
+/// argv[1] of the child that creates a file at its node's max.
+const AT_MAX_ROLE: &str = "fs-create-at-max";
+/// The file the [`AT_MAX_ROLE`] child tries to create in `/data/svctest`.
+const AT_MAX_NAME: &str = "atmax.bin";
+/// The max of the [`AT_MAX_ROLE`] child's node, in pages: room for its image,
+/// heap and stacks, and for the grants its fill takes.
+const AT_MAX_PAGES: u64 = 4096;
+/// Pages of each grant the at-max child's fill asks for while more are left
+/// under the max; halved when memmgr has no contiguous run so long.
+const AT_MAX_GRANT_PAGES: u64 = 256;
+/// Grants the at-max child's fill may take before it gives up: far more than
+/// the fill needs on any pool that can hold the child.
+const AT_MAX_GRANTS: u32 = 1024;
+/// Bytes of stack the at-max child touches before its fill, beside the depth
+/// its open of [`ESP_PROBE`] reaches, so that the create grows no stack once
+/// the node is at its max.
+const AT_MAX_STACK_TOUCH: usize = 6 * 1024;
+/// At-max child exit code: the read open of [`ESP_PROBE`] before the fill
+/// failed.
+const AT_MAX_NO_WARMUP: i32 = 2;
+/// At-max child exit code: a usage query failed, a grant under the max
+/// failed, or the fill did not reach the max.
+const AT_MAX_FILL_FAILED: i32 = 3;
+/// At-max child exit code: a one-page grant past the max was not refused
+/// with `LIMIT`.
+const AT_MAX_NO_LIMIT: i32 = 4;
+/// At-max child exit code: the create at the max succeeded.
+const AT_MAX_CREATED: i32 = 5;
+/// At-max child exit code: the create was refused with a kind other than
+/// `QuotaExceeded` or `OutOfMemory`.
+const AT_MAX_WRONG_ERROR: i32 = 6;
 /// argv[1] of the child that exits holding a session.
 const CLIENT_ROLE: &str = "fs-session-client";
 /// The scratch file the phase and its child open.
@@ -105,6 +143,7 @@ fn fs_sessions_phase(_: &Caps)
     session_on_mount_root(top, ipc_buf);
     charged_to_the_client(top, node, ipc_buf);
     client_death(top);
+    create_at_max(svctest, ipc_buf);
     assert_eq!(
         node_usage(top, "NODE_QUERY_USAGE of the phase's node").2,
         0,
@@ -662,4 +701,124 @@ fn session_client_main() -> !
         exit(CLIENT_NOT_CHARGED);
     }
     exit(0);
+}
+
+// ── The fs-create-at-max child ───────────────────────────────────────────────
+
+/// A child whose node is at its max creates [`AT_MAX_NAME`] with std
+/// ([`create_at_max_main`]). It holds no session with the `/data` driver,
+/// so the create's session start is refused, and the create fails before the
+/// directory entry exists. Checks the child's verdict, and that `svctest`,
+/// the `/data/svctest` directory cap, holds no such entry.
+fn create_at_max(svctest: u64, ipc_buf: *mut u64)
+{
+    let what = "the fs-create-at-max child";
+    // A file a failed run left would refuse the create with `AlreadyExists`.
+    let _ = fs_remove(svctest, AT_MAX_NAME.as_bytes(), ipc_buf);
+    let (process, thread) = budget::create_with_max(AT_MAX_ROLE, AT_MAX_PAGES, what);
+    let reason = budget::run_to_exit(process, what);
+    let _ = syscall::cap_delete(thread);
+    let _ = syscall::cap_delete(process);
+    let left = ns_lookup(svctest, AT_MAX_NAME.as_bytes(), 0xFFFF, ipc_buf);
+    if let Ok((node, _, _)) = left
+    {
+        let _ = syscall::cap_delete(node);
+        let _ = fs_remove(svctest, AT_MAX_NAME.as_bytes(), ipc_buf);
+    }
+    assert_eq!(
+        reason, 0,
+        "{what} exit reason {reason:#x}: {AT_MAX_NO_WARMUP}=the open of {ESP_PROBE} failed, \
+         {AT_MAX_FILL_FAILED}=the fill to the max failed, {AT_MAX_NO_LIMIT}=a grant past the max \
+         not refused with LIMIT, {AT_MAX_CREATED}=the create at the max succeeded, \
+         {AT_MAX_WRONG_ERROR}=the create refused with another kind, a fault reason=the child \
+         was killed"
+    );
+    assert!(
+        left.is_err(),
+        "a create whose session the node's max refused left {AT_MAX_NAME} behind"
+    );
+}
+
+/// Child role: open [`ESP_PROBE`] with std, which starts std's release
+/// handler and a session with the `/esp` driver, touch the stack, fill this
+/// process's node to its max ([`at_max_fill`]), check that one page more is
+/// refused with `LIMIT`, and create `/data/svctest/` [`AT_MAX_NAME`] with
+/// `create_new`: std holds no session with the `/data` driver, and the max
+/// refuses the one the create starts. Exit 0 when the create fails with
+/// `QuotaExceeded` or `OutOfMemory`; else exit with the step's code.
+fn create_at_max_main() -> !
+{
+    use std::io::ErrorKind;
+    use std::process::exit;
+
+    let path = format!("/data/svctest/{AT_MAX_NAME}");
+    match std::fs::File::open(ESP_PROBE)
+    {
+        Ok(file) => drop(file),
+        Err(_) => exit(AT_MAX_NO_WARMUP),
+    }
+    at_max_touch_stack();
+    at_max_fill();
+    match crate::phases::memmgr::try_request_contiguous(1)
+    {
+        Err(label) if label == memmgr_errors::LIMIT =>
+        {}
+        _ => exit(AT_MAX_NO_LIMIT),
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(_) => exit(AT_MAX_CREATED),
+        Err(e) if matches!(e.kind(), ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory) => exit(0),
+        Err(_) => exit(AT_MAX_WRONG_ERROR),
+    }
+}
+
+/// Take contiguous grants until this process's subtree reaches its node's
+/// max. Each grant asks for [`AT_MAX_GRANT_PAGES`] pages, or what is left
+/// under the max, and for half as many after memmgr finds no run so long. A
+/// grant refused with `LIMIT` before the subtree reaches the max fails the
+/// fill.
+fn at_max_fill()
+{
+    use std::process::exit;
+
+    let mut ask = AT_MAX_GRANT_PAGES;
+    for _ in 0..AT_MAX_GRANTS
+    {
+        let Some((_, max, subtree)) = budget::memory_usage()
+        else
+        {
+            exit(AT_MAX_FILL_FAILED)
+        };
+        if subtree >= max
+        {
+            return;
+        }
+        let Ok(pages) = u32::try_from(ask.min(max.saturating_sub(subtree)))
+        else
+        {
+            exit(AT_MAX_FILL_FAILED)
+        };
+        match crate::phases::memmgr::try_request_contiguous(pages)
+        {
+            Ok(_) =>
+            {}
+            Err(label) if label != memmgr_errors::LIMIT && ask > 1 => ask /= 2,
+            Err(_) => exit(AT_MAX_FILL_FAILED),
+        }
+    }
+    exit(AT_MAX_FILL_FAILED);
+}
+
+/// Write [`AT_MAX_STACK_TOUCH`] bytes of the calling thread's stack, so that
+/// memmgr backs them now.
+#[inline(never)]
+fn at_max_touch_stack()
+{
+    let mut pad = [0u8; AT_MAX_STACK_TOUCH];
+    pad.fill(1);
+    std::hint::black_box(&mut pad);
 }

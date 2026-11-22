@@ -897,11 +897,17 @@ fn apply_random_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 
     let orig =
         fs::read_to_string(&mod_rs).with_context(|| format!("reading {}", mod_rs.display()))?;
-    if orig.contains(MARKER)
+    if !orig.contains(MARKER)
     {
-        return Ok(());
+        patch_random_mod(&mod_rs, &orig)?;
     }
+    apply_hash_keys_overlay(rust_src)
+}
 
+/// Route `sys/random` to seraph's module, which exports the key cell and its
+/// reseed beside `fill_bytes`.
+fn patch_random_mod(mod_rs: &Path, orig: &str) -> Result<()>
+{
     let a1 = "    target_os = \"zkvm\" => {\n        mod zkvm;\n        pub use zkvm::fill_bytes;\n    }\n";
     let a1r = "    target_os = \"zkvm\" => {\n        mod zkvm;\n        pub use zkvm::fill_bytes;\n    }\n    \
                // seraph-overlay: seraph random via SYS_GETRANDOM (see sys/random/seraph.rs)\n    \
@@ -919,15 +925,25 @@ fn apply_random_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         );
     }
     let patched = orig.replace(a1, a1r).replace(a2, a2r);
-    write_new_file(&mod_rs, &patched)?;
+    write_new_file(mod_rs, &patched)?;
     step(&format!("seraph-toolchain: patched {}", mod_rs.display()));
+    Ok(())
+}
 
-    // `RandomState`'s per-thread key cell becomes seraph's `HASHMAP_KEYS`,
-    // which the restore entry draws again (`reseed_hashmap_keys`), so maps the
-    // restores of one checkpoint create take distinct keys.
+/// Make `RandomState`'s per-thread key cell seraph's `HASHMAP_KEYS`, which
+/// the restore entry draws again (`reseed_hashmap_keys`), so maps the
+/// restores of one checkpoint create take distinct keys. The file carries its
+/// own marker, so a run stopped after `sys/random/mod.rs` was patched still
+/// patches it on the next build.
+fn apply_hash_keys_overlay(rust_src: &Path) -> Result<()>
+{
     let random_rs = rust_src.join("library/std/src/hash/random.rs");
     let text = fs::read_to_string(&random_rs)
         .with_context(|| format!("reading {}", random_rs.display()))?;
+    if text.contains(MARKER)
+    {
+        return Ok(());
+    }
     let k1 = "use crate::cell::Cell;\n";
     let k1r = "#[cfg(not(target_os = \"seraph\"))]\nuse crate::cell::Cell;\n";
     let k2 = "use crate::sys::random::hashmap_random_keys;\n";
@@ -1468,6 +1484,47 @@ fn probe_real_sysroot() -> Result<PathBuf>
 mod tests
 {
     use super::*;
+
+    // Defect caught: `sys/random/mod.rs`'s marker guarding `hash/random.rs`
+    // too, so a run stopped between the two writes left the key cell
+    // upstream's for every later build.
+    #[test]
+    fn the_hash_key_cell_is_patched_after_a_run_that_patched_only_the_random_module()
+    {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "seraph-xtask-rust-src-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let rust_src = root.join("rust-src");
+        let overlay = root.join("overlay");
+        let write = |path: PathBuf, text: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        write(overlay.join("sys/random/seraph.rs"), "// seraph random\n");
+        let module = format!("{MARKER} seraph random via SYS_GETRANDOM\n");
+        write(rust_src.join("library/std/src/sys/random/mod.rs"), &module);
+        let upstream = "use crate::cell::Cell;\n\
+                        use crate::sys::random::hashmap_random_keys;\n\
+                        \x20       thread_local!(static KEYS: Cell<(u64, u64)> = {\n\
+                        \x20           Cell::new(hashmap_random_keys())\n\
+                        \x20       });\n";
+        let random_rs = rust_src.join("library/std/src/hash/random.rs");
+        write(random_rs.clone(), upstream);
+
+        apply_random_overlay(&rust_src, &overlay).unwrap();
+        let patched = fs::read_to_string(&random_rs).unwrap();
+        assert!(
+            patched.contains("use crate::sys::random::HASHMAP_KEYS as KEYS;"),
+            "{patched}"
+        );
+        apply_random_overlay(&rust_src, &overlay).unwrap();
+        assert_eq!(fs::read_to_string(&random_rs).unwrap(), patched);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn the_shim_builds_with_the_ci_cargo_environment()

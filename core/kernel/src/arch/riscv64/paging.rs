@@ -1994,9 +1994,9 @@ pub unsafe fn protect_user_page(
 /// Assumes 4 KiB user leaves: a present R/W/X entry at an intermediate level
 /// (a mega/gigapage leaf) yields `None` rather than a translation. The user
 /// mapping path never installs a large leaf, so this holds for every user
-/// VA — the spurious-fault classifier relies on it. A caller that introduces
-/// user large pages must add a large-leaf branch here. NAPOT members are
-/// still level-0 leaves: the returned physical address is decoded per page
+/// VA; a change that introduces user large pages adds a large-leaf branch
+/// here and in [`user_fault_is_spurious`], which walks the tables itself.
+/// NAPOT members are still level-0 leaves: the returned physical address is decoded per page
 /// ([`leaf_phys`]); the raw PTE bits carry N and the size encoding.
 ///
 /// # Safety
@@ -2139,6 +2139,12 @@ fn svade_update(pte: u64, access: UserAccess) -> Option<u64>
 /// frame holds no valid leaf, so a swap on one fails. A NAPOT member that lacks
 /// A is reported genuine instead: setting one member's bit would diverge the
 /// group, and no live group lacks A ([`clear_user_accessed`]).
+///
+/// Assumes 4 KiB user leaves, as the user mapping path installs no other: the
+/// walk to level 0 ([`descend_existing`]) yields `None` at a mega/gigapage
+/// leaf, which then reads as genuine. A change that introduces user large
+/// pages adds a large-leaf branch here, setting A and D on that leaf as
+/// [`svade_update`] does on a 4 KiB one.
 ///
 /// # Safety
 /// Must run in S-mode in the faulting thread's context, i.e. before `satp` has

@@ -390,7 +390,8 @@ unsafe fn open_redirect(tcb: *mut ThreadControlBlock, class: usize)
 /// for this delivery's (the single wake-claim winner overwrites it), and
 /// `in_fault_delivery`, so a dequeuing `endpoint_recv` parks the thread
 /// `BlockedOnFault` (not `BlockedOnReply`), with `fault_delivery_class`
-/// naming the class.
+/// naming the class, and `fault_rebound` clear, so only a change of the
+/// binding while this delivery is in flight sets it.
 ///
 /// # Safety
 /// `tcb` must be the current CPU's running thread, whose `sched_lock` the
@@ -410,6 +411,7 @@ unsafe fn arm_delivery(tcb: *mut ThreadControlBlock, class: usize)
             .fault_outcome
             .store(FAULT_OUTCOME_PENDING, Ordering::Release);
         (*tcb).in_fault_delivery = true;
+        (*tcb).fault_rebound = false;
         #[expect(clippy::cast_possible_truncation, reason = "class < FAULT_CLASSES (3)")]
         {
             (*tcb).fault_delivery_class = class as u8;
@@ -494,7 +496,9 @@ pub unsafe fn pin_bindings(
 /// class), and the class of a delivery in flight under a replaced binding
 /// that changed (another endpoint or badge), for which the caller then runs
 /// [`redeliver_in_flight`]. A thread has at most one delivery in flight, so
-/// at most one class is returned.
+/// at most one class is returned. The same hold marks that delivery
+/// (`fault_rebound`), so one that ends without a park, its endpoint having no
+/// receiver, is delivered again by the faulting thread itself.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB the caller pins; the caller holds no lock.
@@ -532,6 +536,9 @@ pub unsafe fn publish_bindings(
         // SAFETY: tcb is valid and its sched_lock is held.
         if changed && unsafe { delivery_in_flight(tcb, class) }
         {
+            // SAFETY: tcb is valid; fault_rebound is written under the held
+            // sched_lock.
+            unsafe { (*tcb).fault_rebound = true };
             redeliver = Some(class);
         }
     }
@@ -567,10 +574,11 @@ pub unsafe fn release_endpoints(eps: [*mut EndpointObject; FAULT_CLASSES])
 /// binding change cancelled ([`FAULT_OUTCOME_REDELIVER`]) is made again under
 /// the binding current then, in this loop rather than by a return to user
 /// mode, so a trap-type exception whose saved instruction pointer is already
-/// past the trapping instruction is not lost; a binding found cleared, or an
-/// endpoint with no receiver left ([`FAULT_OUTCOME_NO_RECEIVER`], at once or
-/// while the delivery was queued), returns [`FaultOutcome::Kill`], the
-/// unhandled-fault path. A [`CLASS_VM`] delivery
+/// past the trapping instruction is not lost, as is one whose endpoint had no
+/// receiver left when a binding change had already cancelled it; a binding
+/// found cleared, or an endpoint with no receiver left
+/// ([`FAULT_OUTCOME_NO_RECEIVER`], at once or while the delivery was
+/// queued), returns [`FaultOutcome::Kill`], the unhandled-fault path. A [`CLASS_VM`] delivery
 /// its handler forwarded ([`FAULT_OUTCOME_FORWARDED`]) is made again through
 /// the [`CLASS_EXCEPTION`] binding, which every later pass of the fault uses,
 /// with the forwarder's reason as data word 4; with that binding cleared, or
@@ -785,9 +793,11 @@ unsafe fn reply_reason(tcb: *mut ThreadControlBlock) -> Option<u64>
 /// Make one delivery of `info` by `route`, through `tcb`'s binding for
 /// `class` or to a redirect's endpoint in flight under `class`, and block
 /// until it is given a disposition, which is returned as its `fault_outcome`
-/// value, or return [`DELIVERY_UNBOUND`] when no binding was found, or
-/// [`FAULT_OUTCOME_NO_RECEIVER`], without parking, when the endpoint has no
-/// receiver left. A
+/// value, or return [`DELIVERY_UNBOUND`] when no binding was found, or,
+/// without parking, when the endpoint has no receiver left:
+/// [`FAULT_OUTCOME_REDELIVER`] when a binding change cancelled the delivery
+/// before that ([`close_unparked_delivery`]), and
+/// [`FAULT_OUTCOME_NO_RECEIVER`] otherwise. A
 /// redirected delivery carries the redirector's word as data word
 /// [`syscall::FAULT_REDIRECT_WORD`]; a `forwarded` delivery through a binding
 /// carries the forwarder's reason (`0` for none) as data word
@@ -884,13 +894,20 @@ unsafe fn deliver_once(
 
     if let crate::ipc::endpoint::CallRendezvous::NoReceiver = result
     {
-        // No thread can receive on the endpoint again: the fault is unhandled,
-        // and the thread did not park. The pin goes as below.
+        // No thread can receive on the endpoint again, and the thread did not
+        // park: the fault is unhandled, unless a binding change cancelled the
+        // delivery first. The pin goes as below.
         // SAFETY: as for the release below; the thread has not parked.
         unsafe { crate::cap::object::release_ref(ep_obj.cast::<KernelObjectHeader>()) };
         // SAFETY: tcb is the running thread, with no lock held.
-        unsafe { close_delivery(tcb) };
-        return FAULT_OUTCOME_NO_RECEIVER;
+        return if unsafe { close_unparked_delivery(tcb) }
+        {
+            FAULT_OUTCOME_REDELIVER
+        }
+        else
+        {
+            FAULT_OUTCOME_NO_RECEIVER
+        };
     }
     if let crate::ipc::endpoint::CallRendezvous::Bound(woken_handler) = result
     {
@@ -975,6 +992,38 @@ unsafe fn close_delivery(tcb: *mut ThreadControlBlock)
     unsafe { sched_lock.unlock_raw(saved) };
 }
 
+/// Close `tcb`'s fault delivery that ended without a park, as
+/// [`close_delivery`] does, and return whether a binding change cancelled it
+/// while it was in flight (`fault_rebound`, which [`publish_bindings`] sets
+/// under the same lock). No wake claim can take an unparked delivery, so the
+/// binder's [`redeliver_in_flight`] stamps nothing for it: the faulting
+/// thread itself delivers the fault again under the binding current then.
+///
+/// # Safety
+/// `tcb` must be the current CPU's running thread, with no lock held.
+#[cfg(not(test))]
+unsafe fn close_unparked_delivery(tcb: *mut ThreadControlBlock) -> bool
+{
+    // SAFETY: tcb is the running thread (contract).
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a fault-delivery marker of tcb, which the held sched_lock \
+                  serialises"
+    )]
+    // SAFETY: tcb is valid; both markers are written under the held
+    // sched_lock.
+    let rebound = unsafe {
+        (*tcb).in_fault_delivery = false;
+        (*tcb).fault_rebound
+    };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+    rebound
+}
+
 /// Cancel the fault delivery of `class` in flight on `tcb` for a change of
 /// that class's binding, so the faulting thread delivers it again under the
 /// binding current when it next runs ([`FAULT_OUTCOME_REDELIVER`]). Both
@@ -992,7 +1041,10 @@ unsafe fn close_delivery(tcb: *mut ThreadControlBlock)
 /// committed its park is running on another CPU with interrupts disabled,
 /// inside a delivery that blocks on nothing, so the pass waits for that
 /// commit (interrupts enabled, preemption disabled; spin site
-/// `fault:rebind`).
+/// `fault:rebind`), or for the delivery's end without a park, when its
+/// endpoint has no receiver: the faulting thread then reads the change
+/// [`publish_bindings`] marked and delivers the fault again itself
+/// ([`close_unparked_delivery`]), and the pass finds none in flight.
 ///
 /// A delivery opened under the new binding after the change's hold can be
 /// the one cancelled here, when the old delivery's disposition and a second

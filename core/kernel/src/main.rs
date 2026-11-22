@@ -1653,6 +1653,7 @@ unsafe fn kernel_entry_post_rebase(
                         fault_redirect: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                         in_fault_delivery: false,
                         fault_delivery_class: 0,
+                        fault_rebound: false,
                         upcall_pending: core::sync::atomic::AtomicBool::new(false),
                         upcall_cookie: core::sync::atomic::AtomicU64::new(0),
                         upcall_any_instruction: core::sync::atomic::AtomicBool::new(false),

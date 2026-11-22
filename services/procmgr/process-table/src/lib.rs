@@ -960,10 +960,13 @@ impl ProcessTable
         self.entries.get(idx)
     }
 
-    /// Remove and return the entry whose badge matches. The death dispatch
-    /// resolves a death event's correlator, the full badge, through it; a
-    /// stale correlator (entry already reaped) returns `None`, and the caller
-    /// drops that event.
+    /// Remove and return the entry whose badge matches, `None` when no live
+    /// entry holds it. It keeps no part of the process tree: the entry's
+    /// children and creates keep a parent that names no entry, and a
+    /// contained subtree is not doomed. A test's direct removal; procmgr takes
+    /// an ended entry with [`Self::take_ended`] and a destroyed one with
+    /// [`Self::take_doomed`].
+    #[cfg(test)]
     #[must_use]
     pub fn take_by_badge(&mut self, badge: u64) -> Option<ProcessEntry>
     {
@@ -3324,7 +3327,7 @@ mod tests
             |idx| (idx == 0).then_some(()),
             |()| queue.try_recv(),
             |(badge, exit_reason)| {
-                if table.take_by_badge(badge).is_some()
+                if table.take_ended(badge, |_| {}).is_some()
                 {
                     reaped.push((badge, exit_reason));
                 }
@@ -3348,7 +3351,7 @@ mod tests
         assert!(listed_all);
         for (badge, exit_reason) in dead
         {
-            if table.take_by_badge(badge).is_some()
+            if table.take_ended(badge, |_| {}).is_some()
             {
                 reaped.push((badge, exit_reason));
             }

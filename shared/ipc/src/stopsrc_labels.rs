@@ -10,9 +10,9 @@
 //! program class end to end.
 //!
 //! The fixture serves them on the endpoint of the name its recipe provides,
-//! [`NAME`], on any badge, and serves [`crate::stop_labels`] there on a badge
-//! carrying [`crate::stop_labels::STOP_AUTHORITY`]; its labels avoid the stop
-//! labels' values.
+//! [`NAME`], on any badge, and serves [`crate::stop_labels`] there as well on
+//! a badge carrying [`crate::stop_labels::STOP_AUTHORITY`]; its labels avoid
+//! the stop labels' values.
 
 /// The name the fixture's recipe provides, badged `:deny`
 /// (`rootfs/config/svcmgr/tests/stopsrc.svc`).

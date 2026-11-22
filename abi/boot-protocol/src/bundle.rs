@@ -22,7 +22,10 @@
 //!    file offset its header records and runs for `size` bytes. Body
 //!    placement MUST be 4096-byte aligned ([`BODY_ALIGNMENT`]) so the
 //!    bootloader can map a body slice as a page-aligned region without
-//!    copying.
+//!    copying. Bodies MUST be in entry-header order at strictly ascending
+//!    offsets, each starting at or past the page boundary after the end of
+//!    the body before it, so no two bodies share a page; the bootloader
+//!    refuses any other layout.
 //!
 //! Producers (xtask) and consumers (bootloader) both depend on this module
 //! so the format constants do not drift.

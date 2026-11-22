@@ -128,8 +128,11 @@ tables included, as a boot module
 ([docs/signing.md](../../../docs/signing.md) § Which Stage Verifies What), before any entry is
 parsed or exposed; a refusal is fatal (`BootError::SignatureRefused`, naming the entry), and so
 is an entry named `trust-store` (`BootError::InvalidBundle`), a name the bootloader reserves,
-and a bundle with no boot-time policy entry `/config/boot/policy.conf`
-(`bundle::POLICY_ENTRY_NAME`) or with two (`BootError::InvalidBundle`;
+an entry whose body starts before the page boundary after the previous entry's body
+(`BootError::InvalidBundle`; bodies are in header order, no two on one page,
+[bundle.rs](../../../abi/boot-protocol/src/bundle.rs)), and a bundle with no boot-time policy
+entry `/config/boot/policy.conf` (`bundle::POLICY_ENTRY_NAME`) or with two
+(`BootError::InvalidBundle`;
 [docs/signing.md](../../../docs/signing.md) § Configuration). The second walk produces both
 [`InitImage`](../../../abi/boot-protocol/src/lib.rs) and the `BootModule[]` array.
 

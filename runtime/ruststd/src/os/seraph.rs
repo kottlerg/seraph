@@ -3163,7 +3163,9 @@ pub mod checkpoint {
     /// the cap is not a process handle; `QuotaExceeded` when the account's
     /// max refused the frames; `Unsupported` when memmgr refused the
     /// checkpoint mark, so no restore would accept the object
-    /// (`NOT_RESTORABLE`); `OutOfMemory` otherwise; a failed call's error.
+    /// (`NOT_RESTORABLE`); `WouldBlock` when another capture holds the
+    /// process's space, or the hold was interrupted, so the caller may ask
+    /// again (`SPACE_HELD`); `OutOfMemory` otherwise; a failed call's error.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn take(process_handle: u64) -> io::Result<Checkpoint> {
         use ipc::procmgr_errors as e;
@@ -3191,6 +3193,7 @@ pub mod checkpoint {
             e::UNAUTHORIZED => Some(io::ErrorKind::PermissionDenied),
             e::LIMIT => Some(io::ErrorKind::QuotaExceeded),
             e::NOT_RESTORABLE => Some(io::ErrorKind::Unsupported),
+            e::SPACE_HELD => Some(io::ErrorKind::WouldBlock),
             _ => Some(io::ErrorKind::OutOfMemory),
         };
         match (refused, caps) {
@@ -3249,8 +3252,9 @@ pub mod fs {
     /// `QuotaExceeded` when the max of this process's node, or of an
     /// ancestor's, refuses the session's first page; `OutOfMemory` when
     /// memmgr cannot make the session's node; the error of a failed
-    /// `FS_SESSION`, or `InvalidInput` for a `node_cap` that names no live
-    /// capability.
+    /// `FS_SESSION`, or of the kernel's inquiry about `node_cap`:
+    /// `StaleNetworkFileHandle` when its slot holds no capability (a node an
+    /// unmount revoked), `Other` when the cap is live but names no driver.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn session_for(node_cap: u64) -> crate::io::Result<u64> {
         crate::sys::fs::session_copy(node_cap, super::current_ipc_buf())
@@ -3323,7 +3327,10 @@ pub mod process {
         /// process of the program, which must be the checkpoint's binary; it
         /// takes the checkpoint's argv and env, so the `Command`'s are not
         /// sent, and resumes the quiesce point. `0` (the default) creates
-        /// the child from its binary. A spawn refused because the object is
+        /// the child from its binary. Only the next spawn restores: it takes
+        /// the setting whatever its outcome, so a later spawn of the same
+        /// `Command` creates the child from its binary unless `restore` is
+        /// called again. A spawn refused because the object is
         /// no checkpoint of the program fails `Unsupported`
         /// (`NOT_RESTORABLE`); one that also asks for a pinned child fails
         /// `InvalidInput`.

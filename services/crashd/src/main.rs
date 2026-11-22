@@ -19,7 +19,8 @@
 //! fault memmgr declined for want of memory instead (the `hold` module): it
 //! redirects the fault to one of its hold endpoints, where it waits with its
 //! thread fault-blocked, resumes it when memmgr's memory is there (the level
-//! below `CRITICAL`, or for a commit overrun the draw room open), and reports
+//! below `CRITICAL`, for a commit overrun the draw room open, for a fault no
+//! free page could back either), and reports
 //! and declines it when the stall passes first. The mechanism and its limits
 //! are in services/crashd/docs/operation.md.
 
@@ -200,7 +201,11 @@ fn wait_set_of(endpoint: u64, live: u64) -> Option<u64>
 /// Serve the crash endpoint `endpoint` and the live-core endpoint `live`
 /// from `wait_set`, which holds both, one request at a time, as crashd's
 /// main loop. A live core delays the faults that arrive meanwhile by at most
-/// the dump's bound, as a crash core does.
+/// the dump's bound, as a crash core does. Every receive goes through a
+/// receive guard: the wait set returns a source whose message a failed
+/// receive left queued again at once, so a failure that keeps repeating ends
+/// crashd with `EXIT_RECV_WEDGE` for svcmgr's restart
+/// (docs/ipc-design.md § Receive-Failure Policy).
 fn serve_both(
     wait_set: u64,
     endpoint: u64,
@@ -210,6 +215,7 @@ fn serve_both(
     ipc_buf: *mut u64,
 ) -> !
 {
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         match syscall::wait_set_wait(wait_set)
@@ -217,17 +223,19 @@ fn serve_both(
             Ok(WAKE_FAULT) =>
             {
                 // SAFETY: ipc_buf is the registered IPC buffer page.
-                if let Ok(msg) = unsafe { ipc::ipc_try_recv(endpoint, ipc_buf) }
+                let received = unsafe { ipc::ipc_try_recv(endpoint, ipc_buf) };
+                if let Some(msg) = guarded(&mut guard, &received)
                 {
-                    serve_fault(&msg, policy, authority, ipc_buf);
+                    serve_fault(msg, policy, authority, ipc_buf);
                 }
             }
             Ok(WAKE_LIVE) =>
             {
                 // SAFETY: ipc_buf is the registered IPC buffer page.
-                if let Ok(msg) = unsafe { ipc::ipc_try_recv(live, ipc_buf) }
+                let received = unsafe { ipc::ipc_try_recv(live, ipc_buf) };
+                if let Some(msg) = guarded(&mut guard, &received)
                 {
-                    live::serve(&msg, authority, ipc_buf, Dump::Allowed);
+                    live::serve(msg, authority, ipc_buf, Dump::Allowed);
                 }
             }
             Ok(_) =>
@@ -239,6 +247,30 @@ fn serve_both(
                 bounded(|| std::os::seraph::log!(warn: "wait failed (err={e})"));
                 std::thread::sleep(Duration::from_millis(WAIT_RETRY_MS));
             }
+        }
+    }
+}
+
+/// The message of a try-once receive's result `received`, fed to `guard`:
+/// `None` for nothing queued (`WouldBlock`) and for a failure, after the
+/// guard's backoff; a failure that keeps repeating does not return.
+fn guarded<'a>(
+    guard: &mut ipc::recv_guard::RecvGuard,
+    received: &'a Result<IpcMessage, i64>,
+) -> Option<&'a IpcMessage>
+{
+    match *received
+    {
+        Ok(ref msg) =>
+        {
+            guard.on_success();
+            Some(msg)
+        }
+        Err(e) if e == SyscallError::WouldBlock as i64 => None,
+        Err(e) =>
+        {
+            guard.on_failure(e);
+            None
         }
     }
 }
@@ -394,9 +426,10 @@ enum Dump
 {
     /// As the policy says.
     Allowed,
-    /// None: memory is critical while crashd holds faults, and a dump's
-    /// buffers and file writes would need pages a report's do not.
-    MemoryCritical,
+    /// None: with a stall set, crashd holds a fault, or memmgr's level reads
+    /// `CRITICAL` or its draw room is short (`hold::Hold::dump`), and a
+    /// dump's buffers and file writes would need pages a report's do not.
+    MemoryShort,
 }
 
 /// Report the fault `msg` and decline it: read what the attach request

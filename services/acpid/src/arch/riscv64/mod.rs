@@ -27,8 +27,9 @@ pub fn bind_ports(_thread: u64, _cap: u64) -> bool
     false
 }
 
-/// No sleep or reset register: `QUERY_ACPI_RESOURCES` serves none on
-/// RISC-V.
+/// No sleep or reset register: acpid asks devmgr for none on RISC-V, whose
+/// platforms power off and reset through SBI, which pwrmgr drives, though
+/// `QUERY_ACPI_RESOURCES` serves a register in the memory space there.
 pub struct Power;
 
 impl Power

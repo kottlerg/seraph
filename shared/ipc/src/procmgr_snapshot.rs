@@ -158,7 +158,10 @@ pub struct Image
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header
 {
-    /// [`SNAPSHOT_COMPLETE`], [`SNAPSHOT_IMAGE`], or 0.
+    /// A set of the [`SNAPSHOT_FLAGS`] bits: [`SNAPSHOT_COMPLETE`],
+    /// [`SNAPSHOT_IMAGE`] and [`SNAPSHOT_CHECKPOINT`], the last meaning a
+    /// [`Checkpoint`] section follows the thread records
+    /// ([`checkpoint_offset`]).
     pub flags: u64,
     /// Pages of the layout, from object page 0; the data pages start here.
     pub layout_pages: u64,

@@ -20,8 +20,10 @@ its fill's ballast, touches its stack, logs `serving`, and serves `ipc::memhog_l
 
 The fill is [`mem-fill`](../../shared/mem-fill/README.md)'s, shared with crashme's `oom-fill`
 mode: it commits what memmgr can still promise a process outside the reserve through the heap and
-takes the rest by one-page grants. Once hogging, the fixture tops up every 10 ms between requests,
-so it takes back what another process frees and the level stays `CRITICAL` until it is stopped.
+takes the rest by one-page grants, as many as its `CSpace`'s free general slots hold, so its
+receives keep the IPC receive reserve. Once hogging, the fixture tops up every 10 ms between
+requests, so it takes back what another process frees and the level stays `CRITICAL` until it is
+stopped.
 
 svctest's `oom_policy` phase, which runs when this recipe is staged, has it hog and reads that oomd
 stopped it, or with `OOMD_STOP=no` or no oomd that nothing did, and that its next instance answers

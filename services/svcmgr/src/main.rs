@@ -13,10 +13,13 @@
 //! `HANDOVER_AUTHORITY`-badged SEND and exits. svcmgr runs for the lifetime
 //! of the system.
 //!
-//! Every supervised service has two death observers on svcmgr's death queues:
-//! one on its main thread and one on its address space, which a terminal
-//! fault of any of its threads posts. Both post the service's `DeathTag`, its
-//! table slot and instance, as the correlator; a further queue joins when
+//! Every supervised service other than memmgr and procmgr has two death
+//! observers on svcmgr's death queues: one on its main thread and one on its
+//! address space, which posts the first terminal end of any of its threads, a
+//! fault or a `sys_aspace_exit`. memmgr's and procmgr's are on the core-death
+//! queue instead (`observe_core_deaths`), whose entries pwrmgr acts on; only
+//! the resync finds such a death here. Both observers post the service's
+//! `DeathTag`, its table slot and instance, as the correlator; a further queue joins when
 //! every pool is out of nodes. The main wait set, which `death_set::DeathSet`
 //! owns and widens as the queues fill it, holds the service endpoint (badge
 //! 0), every death queue (badge 1) and the memory-pressure Notification
@@ -522,6 +525,13 @@ fn install_drivers_dir(
         {
             std::os::seraph::log!(warn: "SET_DRIVERS_DIR {why}; no driver from the drivers dir");
         }
+        drivers_dir::Outcome::Lost =>
+        {
+            std::os::seraph::log!(
+                warn: "SET_DRIVERS_DIR received by devmgr and not answered; no driver from the \
+                       drivers dir"
+            );
+        }
     }
 }
 
@@ -585,9 +595,7 @@ impl drivers_dir::Calls for DriversDirCalls<'_>
         {
             Ok(ipc::devmgr_errors::SUCCESS) => drivers_dir::Sent::Accepted,
             Ok(_) => drivers_dir::Sent::Rejected,
-            // Not sent, or a transport error before the kernel committed the
-            // transfer: the source slots still own the dir caps.
-            Err(why) => drivers_dir::Sent::NotSent(why),
+            Err(failed) => failed,
         }
     }
 
@@ -599,16 +607,18 @@ impl drivers_dir::Calls for DriversDirCalls<'_>
 
 /// Send `SET_DRIVERS_DIR` on `bind_ep`: `drivers_dir`, its path, and
 /// `tables_dir` second when the walk found it. Returns the reply's label;
-/// `Err`, naming why, when the request is not sendable or the call fails
-/// before the kernel moved the caps, which svcmgr then still holds. A
-/// function of its own, so the request and its reply live in this frame
+/// `Err` with `Sent::NotSent`, naming why, when the request is not sendable
+/// or the call fails before devmgr received it, so the kernel did not move
+/// the caps and svcmgr still holds them, and with `Sent::Lost` when the call
+/// fails with `Interrupted`, after devmgr received it and the caps moved
+/// (docs/ipc-design.md § Endpoints). A function of its own, so the request and its reply live in this frame
 /// alone and [`install_drivers_dir`]'s holds neither.
 fn send_drivers_dir(
     bind_ep: u64,
     drivers_dir: u64,
     tables_dir: Option<u64>,
     ipc_buf: *mut u64,
-) -> Result<u64, &'static str>
+) -> Result<u64, drivers_dir::Sent>
 {
     let builder = IpcMessage::builder(ipc::devmgr_labels::SET_DRIVERS_DIR)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
@@ -624,12 +634,21 @@ fn send_drivers_dir(
         DRIVERS_DIR_PATH.as_bytes(),
         ipc::devmgr_labels::DRIVERS_DIR_PATH_MAX,
     )
-    .ok_or("path not sendable")?
+    .ok_or(drivers_dir::Sent::NotSent("path not sendable"))?
     .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     unsafe { ipc::ipc_call(bind_ep, &msg, ipc_buf) }
         .map(|reply| reply.label)
-        .map_err(|_| "ipc error")
+        .map_err(|e| {
+            if e == SyscallError::Interrupted as i64
+            {
+                drivers_dir::Sent::Lost
+            }
+            else
+            {
+                drivers_dir::Sent::NotSent("ipc error")
+            }
+        })
 }
 
 /// `WaitSet` badge for svcmgr's service endpoint.
@@ -700,8 +719,8 @@ fn event_loop(
         // The retry timer of the restarts that wait for memory
         // (`MemoryWaits::poll_timer`): its deadline is kept across every
         // wake, so no stream of requests holds a timed retry off, and with no
-        // restart waiting below CRITICAL the wait has no timeout, so svcmgr
-        // makes no idle wake-up.
+        // restart waiting, or no level read, the wait has no timeout, so
+        // svcmgr makes no idle wake-up.
         let waiting = state
             .table
             .services
@@ -781,7 +800,8 @@ fn pressure_member(deaths: &death_set::DeathSet) -> u64
 
 /// Handle `wake` for the restarts that wait for memory: read memmgr's level,
 /// record it (which arms or disarms the retry timer), and when it makes a
-/// retry due (`MemoryWaits::wake`: the level reads below `CRITICAL`) retry
+/// retry due (`MemoryWaits::wake`: a signal read below `CRITICAL`, or the
+/// timer at any level read) retry
 /// the restart of every waiting service (`restart::retry_memory_wait`),
 /// routing each outcome as a death's: an unrecoverable one starts the
 /// graceful shutdown once every retry is made.
@@ -1079,12 +1099,12 @@ fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ip
 /// drain that crosses the capacity then runs [`resync_deaths`].
 ///
 /// A death is routed with the reason procmgr gives the process
-/// ([`posted_death_reason`]), not the post's own.
+/// ([`process_death_reason`]), not the post's own.
 fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
     let full = ctx.deaths.drain(|death| {
         let tag = DeathTag::from_correlator(death.correlator);
-        let exit_reason = posted_death_reason(state, ctx, tag, death.exit_reason);
+        let exit_reason = process_death_reason(state, ctx, tag, death.exit_reason);
         route_death(tag, exit_reason, state, ctx);
     });
     if full
@@ -1094,15 +1114,18 @@ fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
     }
 }
 
-/// The reason to route the death post `posted` of `tag` with: for a
+/// The reason to route a death of `tag` with, which a death post or
+/// svcmgr's own caps ([`observed_death`]) report as `posted`: for a
 /// procmgr-created service whose current instance `tag` names, the reason
-/// procmgr gives the process (`restart::process_reason`), since the post can
-/// be the main thread's own end, which is the process's only when it is the
-/// first (docs/process-lifecycle.md § Exit reason); `posted` when procmgr
-/// does not answer `EXITED`, for a post [`route_death`] drops or a service
-/// svcmgr holds no process handle of, and while the substrate is down
-/// ([`substrate_alive`]), since the call blocks until procmgr answers.
-fn posted_death_reason(
+/// procmgr gives the process (`restart::process_reason`), since the post and
+/// the caps can show the main thread's own end, which is the process's only
+/// when it is the first (docs/process-lifecycle.md § Exit reason); `posted`
+/// when procmgr does not answer `EXITED`, for a death [`route_death`] drops
+/// or a service svcmgr holds no process handle of, and while the substrate is
+/// down ([`substrate_alive`]), since the call blocks until procmgr answers.
+/// Every caller of [`route_death`] but the resync, which chooses the same way
+/// (`svcmgr_defs::death_caps::resync`), routes the reason this gives.
+pub(crate) fn process_death_reason(
     state: &SvcmgrState,
     ctx: &restart::RestartCtx,
     tag: DeathTag,
@@ -1290,6 +1313,11 @@ impl svcmgr_defs::death_caps::ResyncTable for ResyncCtx<'_>
     {
         restart::queried_death(process_handle, self.ctx.ipc_buf)
     }
+
+    fn process_reason(&mut self, process_handle: u64, caps: u64) -> u64
+    {
+        restart::process_reason(process_handle, caps, self.ctx.ipc_buf)
+    }
 }
 
 /// Whether every service whose address space svcmgr holds (memmgr and
@@ -1346,6 +1374,7 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
         && let Some(exit_reason) = observed_death(entry)
         && let Some(tag) = DeathTag::new(actuator.slot, entry.instance)
     {
+        let exit_reason = process_death_reason(state, ctx, tag, exit_reason);
         route_death(tag, exit_reason, state, ctx);
     }
     let Some(entry) = state.table.services.get(actuator.slot)

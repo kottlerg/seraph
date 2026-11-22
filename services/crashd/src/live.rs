@@ -149,8 +149,8 @@ fn check(msg: &IpcMessage, dump: Dump) -> Result<(Vec<u8>, u64), u64>
         })
         .ok_or(crashd_errors::INVALID_ARGUMENT)?;
     // A core's buffers and file writes need pages: none while memory is
-    // critical, as for a crash core.
-    let critical = dump == Dump::MemoryCritical
+    // short, as for a crash core.
+    let critical = dump == Dump::MemoryShort
         || matches!(
             std::os::seraph::memory_pressure(),
             Some(std::os::seraph::MemoryPressure::Critical)

@@ -23,6 +23,8 @@
 //!   the new process's caps reads the time as svctest does, finds a file,
 //!   logs, joins a thread and parks on a channel; the two take distinct
 //!   `HashMap` keys; the original's quiesce returns `Captured`, and all exit 0;
+//!   the `Command` of each restore, spawned again, creates a new child of the
+//!   binary, not another restore;
 //! - a restore request that also carries argv and env (`CREATE_ARGV_ENV`) is
 //!   refused `INVALID_ARGUMENT`, a pinned restore `InvalidInput`, a restore
 //!   under another binary's name `Unsupported` (`NOT_RESTORABLE`), a restore
@@ -425,8 +427,9 @@ fn held_refusals(child: &mut Peer)
 /// answer.
 fn restore(checkpoint: &Checkpoint) -> String
 {
+    let mut command = restore_command(BINARY, checkpoint.handle());
     let mut restored = Peer::new(
-        restore_command(BINARY, checkpoint.handle())
+        command
             .spawn()
             .unwrap_or_else(|e| panic!("{PHASE}: the restore failed: {e}")),
     );
@@ -454,6 +457,20 @@ fn restore(checkpoint: &Checkpoint) -> String
         "{PHASE}: the restored child printed {keys:?}"
     );
     restored.finish();
+    // The restore covered that spawn alone: the same `Command` spawned
+    // again creates a child of the binary, a restore-child by its argv.
+    let mut fresh = Peer::new(
+        command
+            .arg(CHILD_ROLE)
+            .spawn()
+            .unwrap_or_else(|e| panic!("{PHASE}: the spawn after a restore failed: {e}")),
+    );
+    assert_eq!(
+        fresh.line("ready"),
+        "ready",
+        "{PHASE}: a spawn of the `Command` after its restore"
+    );
+    fresh.finish();
     keys
 }
 

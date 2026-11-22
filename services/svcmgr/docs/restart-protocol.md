@@ -75,14 +75,16 @@ dispatches through [`restart::handle_death`](../src/restart.rs). The service
 table grows on the heap and never reuses a slot, so a slot names one
 service for svcmgr's lifetime. `route_death` routes a post only when the
 slot is active and the tag's instance is the slot's current one. The exit reason
-it routes is the one procmgr gives the process, asked through the service's process handle
+it routes, for a post and for a death svcmgr's own caps show alike (the resync below, the
+shutdown actuator's death found before the shutdown call, and a stop's target found already
+dead), is the one procmgr gives the process, asked through the service's process handle
 (`procmgr_labels::QUERY_PROCESS`, while memmgr and procmgr are active and alive), since a post
 of the main thread's own `sys_thread_exit` carries the process's reason only when it is the
 process's first end ([process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)); the
-post's own reason stands when procmgr does not answer `EXITED` and for a service svcmgr holds no
-process handle of. Any other post is dropped: a late post of an instance
-already routed, and the second of the two posts a main-thread fault or exit makes when
-it is the address space's first terminal end.
+post's or the caps' own reason stands when procmgr does not answer `EXITED`, while memmgr or
+procmgr is down, and for a service svcmgr holds no process handle of. Any other post is dropped: a
+late post of an instance already routed, and the second of the two posts a main-thread fault or exit
+makes when it is the address space's first terminal end.
 
 Each death queue has a fixed tuning capacity (`DEATHS_EQ_CAPACITY`, 64),
 not one sized from the service count. The kernel drops a post to a full
@@ -90,7 +92,8 @@ queue, so a drain that takes a full queue's worth of events or more from one
 queue resyncs: it routes a death for every active service whose main thread the kernel reports
 exited (the kernel's reason), whose thread cap no longer resolves (`EXIT_KILLED`: procmgr's teardown
 revokes it), or whose endowed address space has a retained terminal end
-(`CAP_INFO_ASPACE_END`). A dropped post leaves a full queue of events behind it for that
+(`CAP_INFO_ASPACE_END`), each with the reason procmgr gives the process, as above, when svcmgr
+holds its process handle. A dropped post leaves a full queue of events behind it for that
 drain or the next, so the resync runs after the drop.
 
 A worker-thread fault of a service procmgr created shows in svcmgr's caps only once procmgr's
@@ -252,11 +255,13 @@ System Death](../../../docs/supervision.md#core-set-and-system-death)).
 would leave fewer free pages than the growth floor ([memmgr Memory Pool §
 Allocation](../../memmgr/docs/memory-pool.md#allocation)). Its pressure level reads `CRITICAL` at
 or below that floor and leaves it only once the free pool clears it by a hysteresis band
-([§ Memory pressure](../../memmgr/docs/memory-pool.md#memory-pressure)), so a restart made while
-the level reads `CRITICAL`, as when oomd stops a service that is not the one holding the memory,
-has its create refused with `OUT_OF_MEMORY`, and so does one that needs more than the margin above
-the floor below `CRITICAL`. Only memory coming free ends such a refusal, and memmgr signals a
-change of level but not memory coming free otherwise. The
+([§ Memory pressure](../../memmgr/docs/memory-pool.md#memory-pressure)), so a restart whose create
+needs more than the margin of free pages above the floor has its create refused with
+`OUT_OF_MEMORY`, at `CRITICAL` (as when oomd stops a service that is not the one holding the
+memory) or below it. The level reads `CRITICAL` through the band above the floor too, where a
+create smaller than the margin is admitted, so `CRITICAL` is no proof that a retry is refused.
+Only memory coming free ends such a refusal, and memmgr signals a change of level but not memory
+coming free otherwise. The
 wait is one state machine, `svcmgr_defs::memory_wait` (host-tested over every transition), which
 `restart.rs` and the main loop drive:
 
@@ -264,31 +269,35 @@ wait is one state machine, `svcmgr_defs::memory_wait` (host-tested over every tr
 |---|---|---|
 | decided (step 1 charged the death's restart to the budget) | create refused `OUT_OF_MEMORY`, the service outside the reserve and not the log sink, svcmgr holding the pressure Notification | waiting |
 | decided | any other create failure, or one of a reserve service, of the log sink, or with no Notification | down |
-| waiting, level read `CRITICAL` or unread | a signal (a change of level) read below `CRITICAL` | retry (on a signal) |
-| waiting, level read `CRITICAL` or unread | a signal read at `CRITICAL`, or unread | waiting; no timer |
-| waiting, level read below `CRITICAL` | the retry deadline, armed `MEMORY_RETRY_MS` (1 s) ahead and moved by no other event, passes, whatever woke the main loop | retry (timed); the next deadline armed |
-| waiting, level read below `CRITICAL` | a signal read at `CRITICAL` | waiting; deadline cleared |
+| waiting | a signal (a change of level) read below `CRITICAL` | retry (on a signal) |
+| waiting | a signal read at `CRITICAL` | waiting |
+| waiting, level read | the retry deadline, armed `MEMORY_RETRY_MS` (1 s) ahead and moved by no other event, passes, whatever woke the main loop | retry (timed, counted only when the level reads below `CRITICAL`); the next deadline armed |
+| waiting | the level reads unread (memmgr did not answer) | waiting; deadline cleared, no timer |
 | retry | the new instance runs | restarted |
 | retry | the new instance dies during its bootstrap | a new death: step 1, charged |
-| retry | create refused `OUT_OF_MEMORY` | waiting, a timed retry counted; down once the timed retries reach `MEMORY_RETRY_LIMIT` (60) |
+| retry | create refused `OUT_OF_MEMORY` | waiting, a counted retry counted; down once the counted retries reach `MEMORY_RETRY_LIMIT` (60) |
 | retry | any other failure | down |
 
 - **Waiting.** The entry is inactive, holds no instance, and records the death's exit reason and
   its timed retries (`ServiceEntry::memory_wait`); `handle_death` returns `WaitingForMemory`, on
   which the caller does nothing more, `critical = yes` or not. svcmgr logs `restart of <name>
   waits for memory`. svcmgr records memmgr's level after each refusal for want of memory and on
-  each wake. While a restart waits and the level last read is below `CRITICAL`, a retry deadline
+  each wake. While a restart waits and a level has been read, `CRITICAL` included, a retry deadline
   `MEMORY_RETRY_MS` ahead is armed once and kept (`MemoryWaits::poll_timer`): the main loop waits at
   most the time left to it and retries once it has passed, whatever woke it, so no stream of
-  requests on svcmgr's endpoint holds a timed retry off. Otherwise the deadline is cleared and the
-  wait has no timeout, so svcmgr makes no idle wake-up; at `CRITICAL` every such create is refused,
-  and memmgr signals the change.
+  requests on svcmgr's endpoint holds a timed retry off. The timer runs at `CRITICAL` too, since
+  the free pool moves inside the band with no signal. Otherwise (no restart waits, or memmgr did
+  not answer) the deadline is cleared and the wait has no timeout, so svcmgr makes no idle
+  wake-up.
 - **Retry.** Every waiting service is retried on the wake that makes a retry due: its create is made
   again (`restart::retry_memory_wait`), charging the budget nothing, since the budget bounds deaths
   and step 1 charged this one; a retry on a signal is logged `memory level fell; retrying the
-  restart of <name>`. Retries on signals are bounded by the changes of level, and timed retries by
-  `MEMORY_RETRY_LIMIT`, about a minute below `CRITICAL` with memory still short, after which svcmgr
-  logs `restart of <name> given up`.
+  restart of <name>`. Retries on signals are bounded by the changes of level, and timed retries
+  made below `CRITICAL` by `MEMORY_RETRY_LIMIT`, about a minute there with memory still short,
+  after which svcmgr logs `restart of <name> given up`. A timed retry at `CRITICAL` is not
+  counted: an episode oomd has yet to end spends none of the limit. A retry's refusal for want of
+  memory logs nothing, so a wait that holds at `CRITICAL` adds no line per timed retry; the wait's
+  own lines (`waits for memory`, `given up`, `service restarted`) report it.
 - **Down.** `permanent_death_outcome`: `critical` decides the rest, an `Unrecoverable` outcome
   starting the graceful shutdown.
 

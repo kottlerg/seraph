@@ -74,6 +74,7 @@
 //! § IOMMU Driver Restart.
 
 use std::os::seraph::thread::BuilderExt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -180,6 +181,13 @@ fn bdf_word(bus: u8, device: u8, function: u8) -> u16
 /// would against a failed driver.
 const RESTART_WAIT: Duration = settle::SETTLE_TIMEOUT.saturating_mul(3);
 
+/// How long a DMA-thread call that failed with `HARDWARE_TIMEOUT` waits for
+/// the death watch of the instance it was made on to report that instance's
+/// death ([`IommuClient::await_death_report`]). The call fails when the
+/// instance's thread is torn down, which can come before the watch thread
+/// receives the death post; the report itself takes a scheduling turn.
+const DEATH_REPORT_WAIT: Duration = Duration::from_secs(1);
+
 /// The calls a DMA-thread request makes at most ([`crate::dma`]): each
 /// repeat follows the death of the instance the previous one reached, and
 /// devmgr restarts the driver at most [`restart_budget::RESTART_BURST`]
@@ -225,7 +233,8 @@ struct Link
 pub struct IommuClient
 {
     link: Mutex<Link>,
-    /// Signalled whenever the link's phase leaves [`Phase::Restarting`].
+    /// Signalled whenever the link's phase leaves [`Phase::Restarting`], and
+    /// when a death moves it from [`Phase::Ready`] or [`Phase::Starting`].
     phase_changed: Condvar,
     /// Each unit's IOVA width (`QUERY_UNIT`), by unit index; set once the
     /// boot instance is ready. A restarted instance must report the same.
@@ -234,6 +243,12 @@ pub struct IommuClient
     domains: Mutex<Domains>,
     /// The interrupt remapping table and the entries written to it.
     remaps: Mutex<Remaps>,
+    /// The handle the next `ATTACH` names. devmgr names every domain's
+    /// handle, each once in the boot: a restarted instance counts the
+    /// handles it would choose from 1 again, so a handle a dead instance gave
+    /// could otherwise name another function's domain under the instance
+    /// that serves a call left pending across the death.
+    next_handle: AtomicU64,
 }
 
 impl IommuClient
@@ -251,6 +266,7 @@ impl IommuClient
             widths: OnceLock::new(),
             domains: Mutex::new(Domains::new()),
             remaps: Mutex::new(Remaps::new()),
+            next_handle: AtomicU64::new(1),
         }
     }
 
@@ -330,6 +346,35 @@ impl IommuClient
         link.ep == ep && link.phase == Phase::Ready
     }
 
+    /// After a DMA-thread call on `ep` failed with `HARDWARE_TIMEOUT`, wait
+    /// up to [`DEATH_REPORT_WAIT`] while the instance on `ep` still reads as
+    /// serving, so that the death watch of an instance that died with the
+    /// call in flight has reported it ([`Self::died`]) before
+    /// [`Self::serves`] decides whether the failure is the call's outcome.
+    /// An instance that answered `HARDWARE_TIMEOUT` itself, alive, costs the
+    /// call the wait. Made with no lock of the DMA thread's held.
+    pub fn await_death_report(&self, ep: u64)
+    {
+        let deadline = std::time::Instant::now().checked_add(DEATH_REPORT_WAIT);
+        let mut link = self.link();
+        while link.ep == ep && link.phase == Phase::Ready
+        {
+            let Some(left) = deadline
+                .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+                .filter(|left| !left.is_zero())
+            else
+            {
+                return;
+            };
+            link = self
+                .phase_changed
+                .wait_timeout(link, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        drop(link);
+    }
+
     /// Call the driver with `msg` on the instance serving now. `Err` with
     /// the driver's error label, or `HARDWARE_TIMEOUT` when none serves or
     /// the call itself fails (the instance died with it in flight). For the
@@ -342,15 +387,21 @@ impl IommuClient
     }
 
     /// Attach the function `rid` (`iommu_labels::requester_id`) of unit
-    /// `unit` to a domain of its own; its domain handle, recorded with its
+    /// `unit` to a domain of its own, under a handle no domain of the boot
+    /// had ([`Self::next_handle`]); its domain handle, recorded with its
     /// domain ID for a restart.
     ///
     /// # Errors
     /// The driver's error label, or `OUT_OF_RESOURCES` when the record
-    /// cannot grow, the function then blocked again.
+    /// cannot grow, the function then blocked again, or every handle is
+    /// spent.
     pub fn attach(&self, unit: usize, rid: u64) -> Result<u64, u64>
     {
-        let reply = self.call(&attach_msg(unit, rid, 0, 0))?;
+        let handle = self
+            .next_handle
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |h| h.checked_add(1))
+            .map_err(|_| iommu_errors::OUT_OF_RESOURCES)?;
+        let reply = self.call(&attach_msg(unit, rid, handle, 0))?;
         let domain = Domain {
             handle: reply.word(0),
             unit,
@@ -587,9 +638,12 @@ impl IommuClient
         {
             Phase::Starting => link.phase = Phase::Failed,
             Phase::Ready => link.phase = Phase::Restarting,
-            Phase::Restarting | Phase::Failed =>
-            {}
+            Phase::Restarting | Phase::Failed => return,
         }
+        drop(link);
+        // A DMA-thread call whose failure waits for this report
+        // (`Self::await_death_report`) decides now.
+        self.phase_changed.notify_all();
     }
 
     /// The instance of device badge `badge` has died, as devmgr's death watch
@@ -645,13 +699,25 @@ impl IommuClient
 
     /// The restarted instance whose endpoint is `ep` and device badge
     /// `badge` has committed its tables: it serves from now on, and every
-    /// call waiting for the restart is made on it.
-    fn serve_restarted(&self, ep: u64, badge: u64)
+    /// call waiting for the restart is made on it. When its death watch has
+    /// already seen it die (`dead`), after its commit but before this, when
+    /// [`Self::died`] found another endpoint serving, a restart is due
+    /// instead ([`Phase::Restarting`]), which devmgr's death post for
+    /// `badge` then runs. A death watch that sees it die later finds it
+    /// serving.
+    fn serve_restarted(&self, ep: u64, badge: u64, dead: &AtomicBool)
     {
         let mut link = self.link();
         link.ep = ep;
         link.badge = badge;
-        link.phase = Phase::Ready;
+        link.phase = if dead.load(Ordering::SeqCst)
+        {
+            Phase::Restarting
+        }
+        else
+        {
+            Phase::Ready
+        };
         drop(link);
         self.phase_changed.notify_all();
     }
@@ -1970,7 +2036,9 @@ fn launch(
     } = found;
     let started = crate::create_service_endpoint().and_then(|ep| {
         let client = Arc::new(IommuClient::new(ep));
-        let eq = watch_instance(&client, ep);
+        // The boot instance's death before it is ready fails the driver
+        // (`IommuClient::died`), so its watch's flag is not read.
+        let eq = watch_instance(&client, ep).map(|(eq, _)| eq);
         if eq.is_none()
         {
             let _ = syscall::cap_delete(ep);
@@ -2273,11 +2341,13 @@ fn query_widths(ep: u64, units: usize) -> Vec<u8>
 /// thread, which may itself be blocked in a call to the dead instance
 /// (directly, or through a read whose buffer the DMA thread is mapping), and
 /// then answers every call queued on `ep` with an error until devmgr
-/// deletes it ([`drain`]). A post with tag 0, which no death post carries
-/// (the correlator is a nonzero device badge), or the deletion of the queue,
-/// only ends the thread. The queue,
-/// or `None` when it or the thread cannot be created.
-fn watch_instance(client: &Arc<IommuClient>, ep: u64) -> Option<u64>
+/// deletes it ([`drain`]). Before it tells `client` it sets the flag it
+/// returns, which [`IommuClient::serve_restarted`] reads for a death that
+/// came before the instance served. A post with tag 0, which no death post
+/// carries (the correlator is a nonzero device badge), or the deletion of
+/// the queue, only ends the thread. The queue and the flag, or `None` when
+/// the queue or the thread cannot be created.
+fn watch_instance(client: &Arc<IommuClient>, ep: u64) -> Option<(u64, Arc<AtomicBool>)>
 {
     // Two death posts and the ending post; one node per observer.
     const OBSERVERS: u32 = crate::settle::OBSERVERS_PER_DRIVER;
@@ -2286,6 +2356,8 @@ fn watch_instance(client: &Arc<IommuClient>, ep: u64) -> Option<u64>
         |slab| syscall::event_queue_create_observed(slab, OBSERVERS + 1, OBSERVERS).ok(),
     )?;
     let watched = Arc::clone(client);
+    let dead = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&dead);
     let started = std::thread::Builder::new()
         .name("iommu-watch".into())
         .spawn(move || {
@@ -2295,6 +2367,7 @@ fn watch_instance(client: &Arc<IommuClient>, ep: u64) -> Option<u64>
                 {
                     Ok(e) if e.tag != 0 =>
                     {
+                        seen.store(true, Ordering::SeqCst);
                         watched.died(ep);
                         drop(watched);
                         drain(ep);
@@ -2314,7 +2387,7 @@ fn watch_instance(client: &Arc<IommuClient>, ep: u64) -> Option<u64>
         let _ = syscall::cap_delete(eq);
         return None;
     }
-    Some(eq)
+    Some((eq, dead))
 }
 
 /// How the IOMMU driver's spawn and settle ended.
@@ -2534,14 +2607,14 @@ impl Iommu
     ) -> Option<Replayed>
     {
         let started = crate::create_service_endpoint().and_then(|ep| {
-            let eq = watch_instance(&self.client, ep);
-            if eq.is_none()
+            let watch = watch_instance(&self.client, ep);
+            if watch.is_none()
             {
                 let _ = syscall::cap_delete(ep);
             }
-            eq.map(|eq| (ep, eq))
+            watch.map(|(eq, dead)| (ep, eq, dead))
         });
-        let Some((ep, eq)) = started
+        let Some((ep, eq, dead)) = started
         else
         {
             std::os::seraph::log!(warn: "IOMMU restart: no endpoint or death watch");
@@ -2611,7 +2684,7 @@ impl Iommu
             mappings: outcome.mappings,
             failed: outcome.committed(&mut self.client.domains()),
         };
-        self.client.serve_restarted(ep, badge);
+        self.client.serve_restarted(ep, badge, &dead);
         let mut released = 0usize;
         for retired in kit.retired.committed()
         {

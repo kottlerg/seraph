@@ -19,8 +19,10 @@
 //! too, as is one needing a contiguous run memmgr cannot find. Only memory
 //! coming free ends such a refusal. memmgr signals a change of level on the
 //! Notification the std runtime registers for every process, but memory can
-//! come free below `CRITICAL` with no change of level, so svcmgr also retries
-//! on a timer while the level reads below. memmgr also signals an opening of
+//! come free with no change of level, so svcmgr also retries on a timer, at
+//! every level it has read: below `CRITICAL`, and at `CRITICAL` too, which the
+//! level reads through the band above the growth floor, where memmgr admits a
+//! create smaller than the margin above the floor. memmgr also signals an opening of
 //! its draw room there, on a bit of its own, which svcmgr takes and leaves to
 //! the timer ([`Wake::signal`]).
 //!
@@ -33,36 +35,36 @@
 //!   and *down* otherwise.
 //! - **Waiting** ([`MemoryWait`]; the entry is inactive and holds no instance,
 //!   so no death post routes to it and no reader reports it running). svcmgr's
-//!   level ([`MemoryWaits::record_level`]) decides the wake: at `CRITICAL`, or
-//!   unread, nothing retries it and the main loop waits with no timeout; below
-//!   `CRITICAL` a signal of a change of level retries it at once, and a
-//!   deadline [`MEMORY_RETRY_MS`] ahead, which no other event moves, retries
-//!   it when it passes, whatever woke the main loop
-//!   ([`MemoryWaits::wake`], [`MemoryWaits::poll_timer`]).
+//!   level ([`MemoryWaits::record_level`]) decides the wake: unread, nothing
+//!   retries it and the main loop waits with no timeout; read, a deadline
+//!   [`MEMORY_RETRY_MS`] ahead, which no other event moves, retries it when
+//!   it passes, whatever woke the main loop, and below `CRITICAL` a signal of
+//!   a change of level retries it at once too ([`MemoryWaits::wake`],
+//!   [`MemoryWaits::poll_timer`]).
 //! - **Retry**: the create is made again, charging the budget nothing: the
 //!   death it restarts was charged. Success leaves the wait: the service runs.
 //!   A new instance that dies during its bootstrap is a new death, decided
 //!   from the start and charged. A refusal ([`Refused::Retried`]) for want of
-//!   memory moves it back to *waiting*, counting a timed retry, and to *down*
-//!   once the timed retries reach [`MEMORY_RETRY_LIMIT`]; any other failure
-//!   moves it to *down*.
+//!   memory moves it back to *waiting*, counting a timed retry made below
+//!   `CRITICAL`, and to *down* once the counted retries reach
+//!   [`MEMORY_RETRY_LIMIT`]; any other failure moves it to *down*.
 //! - **Down**: permanently down, as for any failure; its `critical` key
 //!   decides the rest.
 
 use ipc::memmgr_labels::PRESSURE_CRITICAL;
 
 /// The interval, in milliseconds, at which svcmgr retries a restart that
-/// waits for memory while memmgr's level reads below `CRITICAL`. A tuning
-/// value that bounds no capacity: it is how late a create that would now
-/// succeed is made, there being no event for memory coming free below
-/// `CRITICAL`.
+/// waits for memory once it has read memmgr's level. A tuning value that
+/// bounds no capacity: it is how late a create that would now succeed is
+/// made, there being no event for memory coming free with no change of
+/// level.
 pub const MEMORY_RETRY_MS: u64 = 1000;
 
 /// The timed retries of one memory wait after which the service is
 /// permanently down: about a minute, at [`MEMORY_RETRY_MS`], of memory too
-/// short for its create while the level reads below `CRITICAL`. Time at
-/// `CRITICAL` takes no timed retry, so an episode oomd has yet to end does not
-/// count. A tuning value.
+/// short for its create while the level reads below `CRITICAL`. A timed retry
+/// made at `CRITICAL` is not counted, so an episode oomd has yet to end does
+/// not count. A tuning value.
 pub const MEMORY_RETRY_LIMIT: u32 = 60;
 
 /// Why a restart's create failed.
@@ -118,10 +120,12 @@ impl Wake
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Retry
 {
-    /// Whether the timer made it; only a timed retry counts against
-    /// [`MEMORY_RETRY_LIMIT`], since signals are bounded by memmgr's changes
-    /// of level.
+    /// Whether the timer made it.
     pub timed: bool,
+    /// Whether it counts against [`MEMORY_RETRY_LIMIT`]: a timed retry made
+    /// while the level reads below `CRITICAL`. Signals are bounded by
+    /// memmgr's changes of level, and time at `CRITICAL` is oomd's to end.
+    pub counted: bool,
 }
 
 /// The restart whose create procmgr refused.
@@ -214,7 +218,7 @@ impl MemoryWaits
 
     /// Where the retry timer stands at `now_ns` (svcmgr's monotonic clock),
     /// which the main loop asks before every wait. While a restart waits
-    /// (`waiting`) and the level last read is below `CRITICAL`, a deadline
+    /// (`waiting`) and a level has been read, `CRITICAL` included, a deadline
     /// [`MEMORY_RETRY_MS`] ahead is armed once and kept: no event before it
     /// moves it, so a stream of requests cannot hold the timed retry off.
     /// [`Timer::Wait`] gives the time left to it, at least 1 ms;
@@ -228,7 +232,7 @@ impl MemoryWaits
     )]
     pub fn poll_timer(&mut self, waiting: bool, now_ns: u64) -> Timer
     {
-        if !(waiting && self.below_critical())
+        if !(waiting && self.level.is_some())
         {
             self.deadline_ns = None;
             return Timer::Off;
@@ -247,14 +251,28 @@ impl MemoryWaits
     }
 
     /// The retry `wake` makes due, read against the level recorded on it:
-    /// one below `CRITICAL`, none at `CRITICAL` (every such create is
-    /// refused there, and memmgr signals the change) or unread.
+    /// none while the level is unread. A signal retries only below
+    /// `CRITICAL`, since one at `CRITICAL` is a rise to it. The timer retries
+    /// at every read level, since `CRITICAL` holds through the hysteresis band
+    /// above the growth floor, where memmgr admits a create smaller than the
+    /// margin (`services/memmgr/docs/memory-pool.md` § Allocation), and
+    /// memmgr signals nothing while the free pool moves inside the band; its
+    /// retry counts only below `CRITICAL`.
     #[must_use]
     pub fn wake(&self, wake: Wake) -> Option<Retry>
     {
-        self.below_critical().then_some(Retry {
-            timed: wake == Wake::Timer,
-        })
+        let below = self.below_critical();
+        match wake
+        {
+            Wake::Signal => below.then_some(Retry {
+                timed: false,
+                counted: false,
+            }),
+            Wake::Timer => self.level.is_some().then_some(Retry {
+                timed: true,
+                counted: below,
+            }),
+        }
     }
 
     /// Where a refused create leaves the restart: `Some` the wait it is in,
@@ -287,7 +305,7 @@ impl MemoryWaits
             }),
             Refused::Retried { mut wait, retry } =>
             {
-                if retry.timed
+                if retry.counted
                 {
                     wait.timed_retries = wait.timed_retries.saturating_add(1);
                 }
@@ -322,8 +340,18 @@ mod tests
         Some(PRESSURE_LOW),
         Some(PRESSURE_NORMAL),
     ];
-    const SIGNAL: Retry = Retry { timed: false };
-    const TIMER: Retry = Retry { timed: true };
+    const SIGNAL: Retry = Retry {
+        timed: false,
+        counted: false,
+    };
+    const TIMER: Retry = Retry {
+        timed: true,
+        counted: true,
+    };
+    const TIMER_AT_CRITICAL: Retry = Retry {
+        timed: true,
+        counted: false,
+    };
 
     fn at(level: Option<u64>) -> MemoryWaits
     {
@@ -412,32 +440,63 @@ mod tests
         assert_eq!(Wake::signal(0, LEVEL), None);
     }
 
+    // The defect caught: a restart that waits at CRITICAL inside the
+    // hysteresis band, where memmgr admits a create smaller than the margin
+    // above the growth floor and signals nothing as the pool moves, never
+    // retried. A tick retries at every read level, counted only below
+    // CRITICAL.
     #[test]
-    fn a_timer_tick_retries_only_below_critical()
+    fn a_timer_tick_retries_at_every_read_level_counted_below_critical()
     {
         assert_eq!(at(None).wake(Wake::Timer), None);
-        assert_eq!(at(Some(PRESSURE_CRITICAL)).wake(Wake::Timer), None);
+        assert_eq!(
+            at(Some(PRESSURE_CRITICAL)).wake(Wake::Timer),
+            Some(TIMER_AT_CRITICAL)
+        );
         assert_eq!(at(Some(PRESSURE_LOW)).wake(Wake::Timer), Some(TIMER));
         assert_eq!(at(Some(PRESSURE_NORMAL)).wake(Wake::Timer), Some(TIMER));
     }
 
-    // No idle wake-up: the timer runs only while a restart waits and the level
-    // reads below CRITICAL, since memory can come free there with no change
-    // of level; at CRITICAL memmgr signals the change.
+    // No idle wake-up: the timer runs only while a restart waits and a level
+    // has been read; at CRITICAL too, since memory can come free inside the
+    // band with no change of level.
     #[test]
-    fn the_timer_is_armed_only_while_a_restart_waits_below_critical()
+    fn the_timer_is_armed_only_while_a_restart_waits_at_a_read_level()
     {
         for level in LEVELS
         {
             assert_eq!(at(level).poll_timer(false, 0), Timer::Off);
         }
         assert_eq!(at(None).poll_timer(true, 0), Timer::Off);
-        assert_eq!(at(Some(PRESSURE_CRITICAL)).poll_timer(true, 0), Timer::Off);
         let full = Timer::Wait {
             ms: MEMORY_RETRY_MS,
         };
+        assert_eq!(at(Some(PRESSURE_CRITICAL)).poll_timer(true, 0), full);
         assert_eq!(at(Some(PRESSURE_LOW)).poll_timer(true, 0), full);
         assert_eq!(at(Some(PRESSURE_NORMAL)).poll_timer(true, 0), full);
+    }
+
+    // A timed retry at CRITICAL refused for want of memory waits again,
+    // uncounted, however many there are: an oomd episode spends no budget.
+    #[test]
+    fn a_timed_retry_at_critical_is_not_counted()
+    {
+        let waits = at(Some(PRESSURE_CRITICAL));
+        let mut wait = waiting();
+        for _ in 0..(2 * MEMORY_RETRY_LIMIT)
+        {
+            wait = waits
+                .on_refusal(
+                    Refused::Retried {
+                        wait,
+                        retry: TIMER_AT_CRITICAL,
+                    },
+                    OutOfMemory,
+                    false,
+                )
+                .expect("a retry at CRITICAL is not counted");
+        }
+        assert_eq!(wait, waiting());
     }
 
     // The deadline is armed once and kept: events that wake the main loop
@@ -462,16 +521,18 @@ mod tests
         assert_eq!(waits.poll_timer(true, 5000 * ms), Timer::Wait { ms: 1000 });
     }
 
-    // The level moves the arming both ways: a rise to CRITICAL clears the
-    // deadline, and a fall below arms a fresh one; so does the end of every
-    // wait.
+    // A level memmgr did not answer clears the deadline, and a read level
+    // arms a fresh one; so does the end of every wait. A change between read
+    // levels keeps it.
     #[test]
-    fn a_change_of_level_or_the_end_of_the_waits_clears_the_deadline()
+    fn an_unread_level_or_the_end_of_the_waits_clears_the_deadline()
     {
         let ms = 1_000_000;
         let mut waits = at(Some(PRESSURE_LOW));
         assert_eq!(waits.poll_timer(true, 0), Timer::Wait { ms: 1000 });
         waits.record_level(Some(PRESSURE_CRITICAL));
+        assert_eq!(waits.poll_timer(true, 300 * ms), Timer::Wait { ms: 700 });
+        waits.record_level(None);
         assert_eq!(waits.poll_timer(true, 500 * ms), Timer::Off);
         waits.record_level(Some(PRESSURE_LOW));
         assert_eq!(waits.poll_timer(true, 700 * ms), Timer::Wait { ms: 1000 });

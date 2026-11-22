@@ -81,9 +81,11 @@ process creation to procmgr IPC.
   of its `SERAPH_LOG` entry in the argv/env region
   (`bootstrap::bootstrap_procmgr` in
   `../src/bootstrap.rs`, called from `run()` in `../src/main.rs`).
-- When the configuration sets the level of devmgr, vfsd, or svcmgr,
-  allocate the page their create requests carry it in
-  (`log_levels::SpawnEnv::new`, `../src/log_levels.rs`).
+- Allocate the page the create requests of devmgr, vfsd, and svcmgr
+  carry their argv and env in: each service's name as its argv, and its
+  `SERAPH_LOG` entry when the configuration sets its level
+  (`log_levels::SpawnEnv::new`, `../src/log_levels.rs`). Without the
+  page, logged, the three are created unnamed and log at info.
 - Move the remaining RAM Memory caps into memmgr's CSpace via
   `finalize_memmgr`, up to the forwarding stop, which ends the forwarded
   prefix at the first cap that has no `InitInfo` descriptor, that comes

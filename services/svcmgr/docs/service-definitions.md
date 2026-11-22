@@ -419,7 +419,7 @@ restart           = on_failure
 critical          = no
 namespace         = none
 provides          = pwrmgr.shutdown:auth pwrmgr.deny:deny
-seed              = devmgr.shutdown
+seed              = devmgr.shutdown acpid.power
 shutdown_actuator = pwrmgr.shutdown
 ```
 
@@ -553,7 +553,10 @@ Eligibility is read from the recipe's keys alone, never from the service's name.
 applies the same rule to a recipe that sets `oom_stop = yes`, as a service svcmgr launches, and
 rejects one the rule refuses (`oom_stop = yes` with `restart = never`, `critical = yes`, or a
 core role), naming the reason, so an opt-in that could never take effect is an error where it is
-written. A recipe of a service init starts that sets the key parses, and svcmgr refuses its stop.
+written. The parser cannot tell a recipe of a service init starts from one svcmgr launches, so it
+applies the rule to that recipe too: each of them sets `restart = never` and `critical = yes`, so
+setting the key there is a parse error, and svcmgr then refuses to bind the service's registration
+as one registered without definition (§ Reconciliation).
 
 A stop is routed as the death `EXIT_KILLED` through the service's restart policy and budget, so
 an `on_failure` or `always` service restarts while its budget lasts

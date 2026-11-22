@@ -75,11 +75,13 @@ pub enum Request
         bus: u8,
         windows: Vec<Window>,
     },
-    /// `PRT_TABLE`.
+    /// `PRT_TABLE`; `bridge` is the PCI-to-PCI bridge whose table it is,
+    /// `None` for the host bridge's root bus.
     Prt
     {
         segment: u16,
         bus: u8,
+        bridge: Option<Address>,
         mode: PrtMode,
         table: Box<PrtTable>,
     },
@@ -237,19 +239,7 @@ pub fn decode(msg: &IpcMessage) -> Result<Request, u64>
         labels::PRT_TABLE =>
         {
             let (segment, bus) = bridge(msg)?;
-            let mode = match msg.word(3)
-            {
-                labels::PRT_ROUTES => PrtMode::Routes,
-                labels::PRT_PIC_MODE => PrtMode::PicMode,
-                _ => return Err(invalid),
-            };
-            let words: Vec<u64> = (4..labels::PRT_TABLE_WORDS).map(|i| msg.word(i)).collect();
-            Request::Prt {
-                segment,
-                bus,
-                mode,
-                table: Box::new(firmware::acpid::prt_from_words(&words).ok_or(invalid)?),
-            }
+            prt_request(msg, segment, bus).ok_or(invalid)?
         }
         labels::QUERY_HOST_BRIDGE => Request::HostBridge {
             ordinal: msg.word(1),
@@ -272,6 +262,31 @@ fn resources_request(which: u64) -> Option<Request>
         labels::ACPI_SLEEP_STATUS => Some(Request::Sleep(SleepRegister::Status)),
         _ => None,
     }
+}
+
+/// `PRT_TABLE` of the host bridge `(segment, bus)`, decoded; `None` for an
+/// unknown mode or a malformed bridge or table.
+fn prt_request(msg: &IpcMessage, segment: u16, bus: u8) -> Option<Request>
+{
+    let mode = match msg.word(3)
+    {
+        labels::PRT_ROUTES => PrtMode::Routes,
+        labels::PRT_PIC_MODE => PrtMode::PicMode,
+        _ => return None,
+    };
+    let bridge = match msg.word(4)
+    {
+        labels::PRT_ROOT_BUS => None,
+        word => Some(unpack_function(word)?),
+    };
+    let words: Vec<u64> = (5..labels::PRT_TABLE_WORDS).map(|i| msg.word(i)).collect();
+    Some(Request::Prt {
+        segment,
+        bus,
+        bridge,
+        mode,
+        table: Box::new(firmware::acpid::prt_from_words(&words)?),
+    })
 }
 
 /// `ACPI_HOTPLUG`, decoded; `Err(INVALID_REQUEST)` for an unknown event or
@@ -594,12 +609,17 @@ impl AcpiService
                     records.live_pci(),
                     &self.boot_apertures,
                 );
-                let covered = |b: &firmware::acpid::Bridge| b.windows.as_ref().map(|h| h.covered);
+                let covered = |b: &firmware::acpid::Bridges| {
+                    b.find(segment, bus)
+                        .and_then(|b| b.windows.as_ref())
+                        .map(|h| h.covered)
+                };
                 self.pushed("_CRS windows", segment, bus, pushed, covered)
             }
             Request::Prt {
                 segment,
                 bus,
+                bridge,
                 mode,
                 table,
             } =>
@@ -613,23 +633,40 @@ impl AcpiService
                 // alone (its Interrupt Line, or the riscv64 swizzle), never
                 // one routed by a table acpid pushed: no bridge's tables.
                 let unrouted = firmware::acpid::Bridges::new();
+                let all = records.pci.devices();
                 let pushed = self.bridges.push_prt(
                     segment,
                     bus,
+                    bridge,
                     mode,
                     &table,
                     rule,
+                    all,
                     records.live_pci(),
-                    |f| bind::device_gsi(f, &unrouted),
+                    |f| bind::device_gsi(f, all, &unrouted),
                 );
-                let (what, covered): (_, fn(&firmware::acpid::Bridge) -> Option<u64>) = match mode
-                {
-                    PrtMode::Routes => ("_PRT routes", |b| b.routes.as_ref().map(|h| h.covered)),
-                    PrtMode::PicMode => ("PIC-mode _PRT routes", |b| {
-                        b.pic.as_ref().map(|h| h.covered)
-                    }),
+                let covered = |b: &firmware::acpid::Bridges| {
+                    let held = match bridge
+                    {
+                        None => b.find(segment, bus)?.prt(mode),
+                        Some(at) => b.routes_of(at)?.prt(mode),
+                    };
+                    held.as_ref().map(|h| h.covered)
                 };
-                self.pushed(what, segment, bus, pushed, covered)
+                let what = match mode
+                {
+                    PrtMode::Routes => "_PRT routes",
+                    PrtMode::PicMode => "PIC-mode _PRT routes",
+                };
+                match bridge
+                {
+                    None => self.pushed(what, segment, bus, pushed, covered),
+                    Some((_, b, d, f)) =>
+                    {
+                        let what = format!("{what} of its PCI-to-PCI bridge {b}:{d}.{f}");
+                        self.pushed(&what, segment, bus, pushed, covered)
+                    }
+                }
             }
             Request::HostBridge { ordinal } => self.host_bridge(ordinal),
             Request::Sci => self.sci(irq_range),
@@ -754,7 +791,14 @@ impl AcpiService
                 .ok()
                 .and_then(|port| arch::current::carve_io_ports(caps, port, 1))
                 .ok_or(errors::NO_DEVICE),
-            Space::Memory => self.memory_cap(&range, caps).map(|(_, cap)| cap),
+            // A page no aperture covers, and a failed carve or derivation,
+            // are each a register devmgr cannot serve: `NO_DEVICE`, as the
+            // label gives it, where `ACPI_REGION_GRANT` replies `memory_cap`'s
+            // own statuses.
+            Space::Memory => self
+                .memory_cap(&range, caps)
+                .map(|(_, cap)| cap)
+                .map_err(|_| errors::NO_DEVICE),
         };
         match cap
         {
@@ -923,18 +967,14 @@ impl AcpiService
         segment: u16,
         bus: u8,
         pushed: Option<Push>,
-        covered: impl Fn(&firmware::acpid::Bridge) -> Option<u64>,
+        covered: impl Fn(&firmware::acpid::Bridges) -> Option<u64>,
     ) -> Reply
     {
         match pushed
         {
             Some(Push::Kept) =>
             {
-                let checked = self
-                    .bridges
-                    .find(segment, bus)
-                    .and_then(covered)
-                    .unwrap_or(0);
+                let checked = covered(&self.bridges).unwrap_or(0);
                 std::os::seraph::log!(
                     "acpid: bridge {}:{} {} agree with {} boot functions; kept",
                     segment,

@@ -96,37 +96,46 @@ interleaves with it.
 
 ## Pushes
 
-acpid pushes three results per PCI host bridge, named by its segment and bus:
+acpid pushes three results per PCI host bridge, named by its segment and bus, and a `PRT_TABLE`
+per PCI-to-PCI bridge below it that the namespace gives a `_PRT` of its own:
 
 - `OSC_RESULT`: whether `_OSC` was evaluated, its status dword, the control dword it granted,
   and the control acpid asked for. devmgr keeps the first for the boot.
 - `BRIDGE_WINDOWS`: the `_CRS` memory, I/O and bus windows, on the bus side of the bridge.
-- `PRT_TABLE`: the routes of the bridge's root bus, one word per device of four 16-bit pin
-  lanes, of the mode `PRT_ROUTES` (the model acpid selected) or, on x86-64, `PRT_PIC_MODE`
-  (read before `_PIC(1)`).
+- `PRT_TABLE`: the routes of one bus, one word per device of four 16-bit pin lanes, of the mode
+  `PRT_ROUTES` (the model acpid selected) or, on x86-64, `PRT_PIC_MODE` (read before
+  `_PIC(1)`). The bus is the host bridge's root bus, or the secondary bus of the PCI-to-PCI
+  bridge the push names by its address, which acpid reads through the Secondary Bus Number of
+  each bridge above it.
 
-devmgr keeps windows and routes only once they agree with its boot records, checked against
-each boot function on the bridge's buses, those of its windows; a `PRT_TABLE` that comes before
-the bridge's windows are held is refused, as acpid pushes the windows first:
+A function's interrupt is routed by the table of the nearest PCI-to-PCI bridge above it that
+has one, or, with none, by its host bridge's (ACPI 6.5 § 6.2.13). devmgr keeps windows and
+routes only once they agree with its boot records, checked against each boot function on the
+bridge's buses, those of its windows, and a table against those functions it routes; a host
+bridge's `PRT_TABLE` that comes before the bridge's windows are held is refused, as acpid pushes
+the windows first, and acpid pushes the PCI-to-PCI bridges' tables, the deepest first, before
+the host bridge's. A PCI-to-PCI bridge's table is refused unless devmgr records a configured
+bridge at its address in the host bridge's segment, and that bridge then routes the functions
+below it by its own tables alone, by none until one passes:
 
 - **Windows.** The windows hold exactly one bus window, which holds the bridge's bus and ends at
   or below bus 255. Each
   memory BAR lies inside a memory window and inside an aperture devmgr was given at boot; each
   I/O BAR lies inside an I/O window. A BAR at address 0, which the firmware left unassigned, is
   not checked.
-- **Routes.** Each function with an interrupt pin is routed at the pin and device its interrupt
-  reaches the root bus with. On x86-64 the `PRT_PIC_MODE` table must route it to the line in
-  its Interrupt Line register, which the firmware programmed in the PIC model, and the
-  `PRT_ROUTES` table is kept only once the `PRT_PIC_MODE` table is held: the same `_PRT`
-  read in the APIC model, whose GSIs no register states, so it is checked for being routed. On
-  RISC-V the `PRT_ROUTES` table must route each function to the line devmgr gives it, the
-  `virt` host's swizzle.
+- **Routes.** Each function with an interrupt pin that falls to the table is routed at the pin
+  and device its interrupt reaches the table's bus with, swizzled at each bridge between. On
+  x86-64 the `PRT_PIC_MODE` table must route it to the line in its Interrupt Line register,
+  which the firmware programmed in the PIC model, and the `PRT_ROUTES` table is kept only once
+  the `PRT_PIC_MODE` table is held: the same `_PRT` read in the APIC model, whose GSIs no
+  register states, so it is checked for being routed. On RISC-V the `PRT_ROUTES` table must
+  route each function to the line devmgr gives it, the `virt` host's swizzle.
 
 A push that disagrees is refused with `REFUSED` and logged with the check it failed. The
 refusal is fail-closed: devmgr holds nothing from it, and the bridge has no windows or routes
 from acpid for the boot unless a later push passes. A consumer then finds them not held
 (`QUERY_HOST_BRIDGE`). On x86-64 devmgr's interrupt routing reads the held `PRT_PIC_MODE` table
-for a function whose Interrupt Line is unset, a hot-added one
+that routes a function whose Interrupt Line is unset, a hot-added one
 ([services/devmgr/docs/hotplug.md](../../devmgr/docs/hotplug.md#binding) § Binding); it reads
 no other table, and its resource placement reads neither. Each check counts the boot functions
 it covered.

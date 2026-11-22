@@ -140,7 +140,7 @@ pub fn name_block(req: &IpcMessage, at: usize, max: usize) -> Option<&[u8]>
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 25;
+pub const PROCMGR_LABELS_VERSION: u32 = 26;
 pub mod procmgr_labels;
 
 pub mod procmgr_snapshot;
@@ -157,7 +157,7 @@ pub mod sched_policy;
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 27;
+pub const MEMMGR_LABELS_VERSION: u32 = 28;
 pub mod memmgr_labels;
 
 pub mod memmgr_capture;
@@ -212,7 +212,7 @@ pub mod timed_errors;
 
 /// Wire-protocol version of [`pwrmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PWRMGR_LABELS_VERSION: u32 = 2;
+pub const PWRMGR_LABELS_VERSION: u32 = 3;
 pub mod pwrmgr_labels;
 
 pub mod pwrmgr_errors;
@@ -241,7 +241,7 @@ pub mod fs_labels;
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 29;
+pub const DEVMGR_LABELS_VERSION: u32 = 30;
 pub mod devmgr_labels;
 
 pub mod test_fault_labels;

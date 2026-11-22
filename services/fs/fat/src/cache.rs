@@ -479,7 +479,11 @@ impl PageCache
     /// Called before `FS_SESSION` records a session's liveness cap and before
     /// `FS_OPEN` records an open's release SEND, which hold slots for the
     /// session's or the open's lifetime, so the `CSpace` grows with the
-    /// sessions and opens instead of starving reads. A no-op beyond reading the
+    /// sessions and opens instead of starving reads; and before each
+    /// `FS_READ_MEMORY`, whose page holds an ancestor for as long as it is
+    /// outstanding: each open holds at most the ceiling, so the pages
+    /// outstanding across opens can outnumber the per-slot ancestors counted
+    /// here, and the top-up keeps the target free whatever they hold. A no-op beyond reading the
     /// `CSpace`'s headroom while it suffices; `false` when memmgr cannot
     /// fund it.
     pub fn fund_run_time_headroom(&self, cspace: u64) -> bool

@@ -77,8 +77,8 @@
 //! replies at once to any caller it receives (the waiter counts a served call
 //! and calls again), and receives again, until a receive meets the deleted
 //! endpoint: `NoReceiver` (the delete of the last Receive right released it
-//! while it was parked) or `InvalidCapability` (the handle was gone at
-//! entry). Its receive can thus
+//! while it was parked, or came between its handle's lookup and its park) or
+//! `InvalidCapability` (the handle was gone at entry). Its receive can thus
 //! dequeue a caller whose stop, or whose Thread delete, commits between the
 //! dequeue and the reply rebind. The controller deletes the endpoint, waits
 //! for the racer and the server, and in the stop phase does not restart the
@@ -88,7 +88,11 @@
 //! tripwire for a binding that outlives the endpoint, and the cell requires
 //! that the race armed (an action landed on a caller inside a call) and that
 //! at least [`MIN_PARKED`] server receives were parked on the endpoint when
-//! it was deleted.
+//! it was deleted. `NoReceiver` alone does not say a receive was parked, so
+//! right before each delete the controller reads the server's state
+//! (`SYS_THREAD_READ_REGS`), and a receive counts as parked only when the
+//! controller read the server blocked in it and it then ended in
+//! `NoReceiver` ([`server_parked_receive`]).
 //!
 //! ## What the host must give
 //!
@@ -153,10 +157,12 @@ use ipc::IpcMessage;
 use syscall::{
     cap_create_endpoint, cap_create_notification, cap_create_thread, cap_delete,
     event_queue_create, event_recv, ipc_buffer_set, notification_wait, system_info,
-    thread_configure, thread_exit, thread_set_affinity, thread_sleep, thread_start, thread_stop,
-    wait_set_add, wait_set_create, wait_set_wait,
+    thread_configure, thread_exit, thread_read_regs, thread_set_affinity, thread_sleep,
+    thread_start, thread_stop, wait_set_add, wait_set_create, wait_set_wait,
 };
-use syscall_abi::{SyscallError, SystemInfoType};
+use syscall_abi::{
+    REGS_RISCV64_SIZE, REGS_X86_64_SIZE, SyscallError, SystemInfoType, THREAD_REGS_SYSCALL,
+};
 
 use crate::tally::{BadTally, log_cell_u64};
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -223,6 +229,11 @@ const EXIT_WAIT_US: u64 = 2_000_000;
 /// Polls a bounded wait spins busily before it polls in 1 ms sleeps.
 const BUSY_POLLS: u32 = 100_000;
 
+/// Size of the buffer [`server_parked_receive`] reads the server's register
+/// file into: at least either architecture's.
+const REGS_BUF_SIZE: usize = 512;
+const _: () = assert!(REGS_BUF_SIZE >= REGS_X86_64_SIZE && REGS_BUF_SIZE >= REGS_RISCV64_SIZE);
+
 /// Label of the served-call server's reply.
 const SERVER_REPLY_LABEL: u64 = 0x5D;
 
@@ -274,9 +285,16 @@ static SERVER_EXITED: AtomicU32 = AtomicU32::new(0);
 /// Served-call phases: server → controller, the round whose first receive
 /// the server is entering, stored just before it.
 static SERVER_ENTERED: AtomicU32 = AtomicU32::new(0);
-/// Served-call phases: receives that ended in `NoReceiver` (parked on the
-/// endpoint when it was deleted).
-static SERVER_PARKED: AtomicU32 = AtomicU32::new(0);
+/// Served-call phases: the server's Thread handle, published before it
+/// starts.
+static SERVER_THREAD: AtomicU64 = AtomicU64::new(0);
+/// Served-call phases: server → controller, the receives the server has
+/// entered, counted from 1 and stored just before each: the number of the
+/// receive it is in.
+static SERVER_RECEIVES: AtomicU32 = AtomicU32::new(0);
+/// Served-call phases: server → controller, the number of the last receive
+/// that ended in `NoReceiver`, stored before [`SERVER_DONE`].
+static SERVER_MISSED: AtomicU32 = AtomicU32::new(0);
 /// Waits that returned anything else (with the wait's value or error).
 static BAD_WAITS: BadTally = BadTally::new();
 /// Racer actions, and restarts, outside the accepted results (with the
@@ -553,7 +571,7 @@ fn log_seen(seen: &Seen)
 /// Check a phase's tallies: nothing failed, and the race armed (a stop or a
 /// Thread delete landed on a waiter inside a wait; a stop phase's restarted
 /// waiters saw `Interrupted` or `NoReceiver`; a served-call phase's server was parked on the
-/// endpoint at [`MIN_PARKED`] deletes).
+/// endpoint at [`MIN_PARKED`] deletes, as [`server_parked_receive`] reads it).
 fn check(seen: &Seen, kind: Kind, race: Race) -> TestResult
 {
     BAD_WAITS.check(
@@ -620,13 +638,15 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str
         &SERVER_DONE,
         &SERVER_EXITED,
         &SERVER_ENTERED,
-        &SERVER_PARKED,
+        &SERVER_RECEIVES,
+        &SERVER_MISSED,
     ]
     {
         counter.store(0, Ordering::Release);
     }
     SOURCE.store(0, Ordering::Release);
     WAITER.store(0, Ordering::Release);
+    SERVER_THREAD.store(0, Ordering::Release);
     RACER_RESULT.store(RESULT_OK, Ordering::Release);
     for tally in [&BAD_WAITS, &BAD_ACTIONS]
     {
@@ -672,7 +692,6 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str
     seen.no_receiver = NO_RECEIVER.load(Ordering::Acquire);
     seen.gone = GONE.load(Ordering::Acquire);
     seen.served = SERVED.load(Ordering::Acquire);
-    seen.server_parked = SERVER_PARKED.load(Ordering::Acquire);
     Ok(seen)
 }
 
@@ -684,6 +703,7 @@ fn start_server(ctx: &TestContext, kind: Kind, server: &mut Option<u64>) -> Test
         return Ok(());
     }
     let th = create_thread(ctx, server, server_entry, SERVER_STACK, 0, SERVER_CPU)?;
+    SERVER_THREAD.store(th, Ordering::Release);
     thread_start(th).map_err(|_| "stress::stop_source_delete: start server failed")
 }
 
@@ -740,9 +760,7 @@ fn rounds(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static st
 
 /// Whether the phase still lacks what [`check`] requires of its race: an
 /// action that landed on a waiter inside a wait, and, in a served-call phase,
-/// [`MIN_PARKED`] server receives parked on a deleted endpoint. The server's
-/// count is stable between rounds: each round waited for its [`SERVER_DONE`],
-/// which the server stores after the count.
+/// [`MIN_PARKED`] server receives parked on a deleted endpoint.
 fn race_unarmed(seen: &Seen, kind: Kind, race: Race) -> bool
 {
     let landed_in_wait = match race
@@ -750,8 +768,7 @@ fn race_unarmed(seen: &Seen, kind: Kind, race: Race) -> bool
         Race::Stop => seen.stopped_in_wait,
         Race::ThreadDelete => seen.died_in_wait,
     };
-    landed_in_wait == 0
-        || (kind == Kind::CallServed && SERVER_PARKED.load(Ordering::Acquire) < MIN_PARKED)
+    landed_in_wait == 0 || (kind == Kind::CallServed && seen.server_parked < MIN_PARKED)
 }
 
 /// Run round `cycle` ([`round`]) and delete what remains of it.
@@ -817,11 +834,52 @@ fn round(
             core::hint::spin_loop();
         }
     }
+    let parked = if kind == Kind::CallServed
+    {
+        server_parked_receive()?
+    }
+    else
+    {
+        0
+    };
     let deleted = cap_delete(source);
     // The source's capability is gone whatever the delete returned.
     parts.source = None;
     deleted.map_err(|_| "stress::stop_source_delete: delete of the source failed")?;
-    settle_round(kind, race, cycle, entered_before, done_before, parts, seen)
+    settle_round(kind, race, cycle, entered_before, done_before, parts, seen)?;
+    // The server stored its last `NoReceiver` receive before the
+    // `SERVER_DONE` that `settle_round` waited for.
+    if parked != 0 && SERVER_MISSED.load(Ordering::Acquire) == parked
+    {
+        seen.server_parked = seen.server_parked.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// The number of the server receive parked on the round's endpoint, or 0 when
+/// none is seen parked: the receive the server last entered
+/// ([`SERVER_RECEIVES`]), when `SYS_THREAD_READ_REGS` reads the server
+/// blocked in a syscall and the server has entered no other receive across
+/// the read. The server's one blocking syscall is its receive (its reply never
+/// blocks), and only a caller, which ends the receive `Ok`, or the endpoint's
+/// delete ends a parked one, so a receive read so before the delete that then
+/// ends in `NoReceiver` ([`SERVER_MISSED`]) was parked on the endpoint when it
+/// was deleted. A server not blocked (running, or ready) is refused the read
+/// with `InvalidState`, which is no failure.
+fn server_parked_receive() -> Result<u32, &'static str>
+{
+    let receive = SERVER_RECEIVES.load(Ordering::Acquire);
+    let mut regs = [0u8; REGS_BUF_SIZE];
+    match thread_read_regs(SERVER_THREAD.load(Ordering::Acquire), &mut regs)
+    {
+        Ok((_, THREAD_REGS_SYSCALL)) if SERVER_RECEIVES.load(Ordering::Acquire) == receive =>
+        {
+            Ok(receive)
+        }
+        Ok(_) => Ok(0),
+        Err(e) if e == SyscallError::InvalidState as i64 => Ok(0),
+        Err(_) => Err("stress::stop_source_delete: read of the server's state failed"),
+    }
 }
 
 /// A held round's wait before the source's delete, bounded by
@@ -1325,10 +1383,12 @@ extern "C" fn racer_entry(arg: u64) -> !
 /// Served-call server: until told to quit, for each round it is armed for,
 /// spin a varying delay (a different hash from the racer's), publish that it
 /// is entering its receive ([`SERVER_ENTERED`]), then receive on the round's
-/// endpoint, replying at once to each caller it receives, until a
-/// receive meets the deleted endpoint (`NoReceiver` if it was parked when the
-/// delete released it, `InvalidCapability` if the handle was gone at entry);
-/// then acknowledge the round. Any other result is recorded as unaccepted.
+/// endpoint, numbering each receive in [`SERVER_RECEIVES`] and replying at
+/// once to each caller it receives, until a receive meets the deleted endpoint
+/// (`NoReceiver` if the delete released it parked or came between its lookup
+/// and its park, recorded in [`SERVER_MISSED`]; `InvalidCapability` if the
+/// handle was gone at entry); then acknowledge the round. Any other result is
+/// recorded as unaccepted.
 extern "C" fn server_entry(_arg: u64) -> !
 {
     // Sole live user of SERVER_IPC_BUF (one server per phase).
@@ -1362,6 +1422,9 @@ extern "C" fn server_entry(_arg: u64) -> !
         SERVER_ENTERED.store(armed, Ordering::Release);
         loop
         {
+            let receive = SERVER_RECEIVES
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
             // SAFETY: buf is this thread's registered IPC buffer.
             match unsafe { ipc::ipc_recv(endpoint, buf) }
             {
@@ -1374,7 +1437,7 @@ extern "C" fn server_entry(_arg: u64) -> !
                 }
                 Err(e) if e == SyscallError::NoReceiver as i64 =>
                 {
-                    SERVER_PARKED.fetch_add(1, Ordering::AcqRel);
+                    SERVER_MISSED.store(receive, Ordering::Release);
                     break;
                 }
                 Err(e) if e == SyscallError::InvalidCapability as i64 => break,

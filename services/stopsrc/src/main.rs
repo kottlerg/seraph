@@ -12,11 +12,12 @@
 //! shared stop labels (`ipc::stop_labels`) at the program class's job rank,
 //! with the pages its subtree holds beyond its own. A stop of the job's key
 //! destroys the child through the process handle the fixture holds as its
-//! creator. It serves `ipc::stopsrc_labels` on the endpoint of the name its
-//! recipe provides, which svcmgr delivers in bootstrap slot 0, and the stop
-//! labels there on a badge carrying `stop_labels::STOP_AUTHORITY`, which only
-//! the SEND svcmgr hands a stop-authority holder carries; on any other badge
-//! they reply `stop_labels::UNAUTHORIZED`.
+//! creator. It serves `ipc::stopsrc_labels` on any badge on the endpoint of
+//! the name its recipe provides, which svcmgr delivers in bootstrap slot 0,
+//! and the stop labels there as well on a badge carrying
+//! `stop_labels::STOP_AUTHORITY`, which only the SEND svcmgr hands a
+//! stop-authority holder carries; on any other badge they reply
+//! `stop_labels::UNAUTHORIZED`.
 
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -95,8 +96,8 @@ fn job(pages: usize) -> !
     }
 }
 
-/// Serve `src`'s labels on `service`, and the stop labels on a badge
-/// carrying the stop bit.
+/// Serve `src`'s labels on `service` on any badge, and the stop labels as
+/// well on a badge carrying the stop bit.
 fn serve(service: u64, nonce: u64, ipc_buf: *mut u64) -> !
 {
     let mut job = Job {
@@ -104,7 +105,10 @@ fn serve(service: u64, nonce: u64, ipc_buf: *mut u64) -> !
         key: 0,
         stopped: false,
     };
-    let mut next_key = 1u64;
+    // Job keys start at the instance's nonce, so a key an earlier instance
+    // handed out names none of this one's jobs but by chance
+    // (`ipc::stop_labels`).
+    let mut next_key = nonce;
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
@@ -126,37 +130,31 @@ fn serve(service: u64, nonce: u64, ipc_buf: *mut u64) -> !
         {
             let _ = syscall::cap_delete(cap);
         }
-        let reply = if msg.badge & stop::STOP_AUTHORITY != 0
+        let authorized = msg.badge & stop::STOP_AUTHORITY != 0;
+        let reply = match msg.label
         {
-            match msg.label
+            stop::LIST_CANDIDATES | stop::STOP_CANDIDATE if !authorized =>
             {
-                stop::LIST_CANDIDATES => list(&mut job, msg.word(0)),
-                stop::STOP_CANDIDATE => stop_job(&mut job, msg.word(0)),
-                _ => IpcMessage::new(src::UNKNOWN_OPCODE),
+                IpcMessage::new(stop::UNAUTHORIZED)
             }
-        }
-        else
-        {
-            match msg.label
+            stop::LIST_CANDIDATES => list(&mut job, msg.word(0)),
+            stop::STOP_CANDIDATE => stop_job(&mut job, msg.word(0)),
+            src::PROBE => IpcMessage::builder(src::SUCCESS)
+                .word(0, nonce)
+                .word(1, state(&mut job))
+                .word(2, if running(&mut job) { job.key } else { 0 })
+                .build(),
+            src::START_JOB => start_job(&mut job, &mut next_key, msg.word(0)),
+            src::EXIT =>
             {
-                src::PROBE => IpcMessage::builder(src::SUCCESS)
-                    .word(0, nonce)
-                    .word(1, state(&mut job))
-                    .word(2, if running(&mut job) { job.key } else { 0 })
-                    .build(),
-                src::START_JOB => start_job(&mut job, &mut next_key, msg.word(0)),
-                stop::LIST_CANDIDATES | stop::STOP_CANDIDATE => IpcMessage::new(stop::UNAUTHORIZED),
-                src::EXIT =>
-                {
-                    // SAFETY: ipc_buf is the registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(src::SUCCESS), ipc_buf) };
-                    // The job is left running: svcmgr creates the fixture
-                    // contained, so procmgr destroys it with this instance.
-                    std::os::seraph::log!("exiting on request");
-                    std::process::exit(0);
-                }
-                _ => IpcMessage::new(src::UNKNOWN_OPCODE),
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(src::SUCCESS), ipc_buf) };
+                // The job is left running: svcmgr creates the fixture
+                // contained, so procmgr destroys it with this instance.
+                std::os::seraph::log!("exiting on request");
+                std::process::exit(0);
             }
+            _ => IpcMessage::new(src::UNKNOWN_OPCODE),
         };
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -254,7 +252,7 @@ fn start_job(job: &mut Job, next_key: &mut u64, pages: u64) -> IpcMessage
     job.child = Some(child);
     job.key = *next_key;
     job.stopped = false;
-    *next_key = next_key.saturating_add(1);
+    *next_key = next_key.wrapping_add(1).max(1);
     std::os::seraph::log!("job {} holds {pages} pages", job.key);
     IpcMessage::builder(src::SUCCESS).word(0, job.key).build()
 }

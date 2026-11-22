@@ -37,16 +37,20 @@ pub const SHUTDOWN: u64 = 1;
 /// machine cold-boots back through the bootloader.
 pub const REBOOT: u64 = 2;
 
-/// The correlator of the death observers on svcmgr's own main thread and
-/// address space, which post to the core-death queue svcmgr serves pwrmgr,
-/// the shutdown actuator, a receive-only derivation of
-/// (`docs/supervision.md` § Core Set and System Death).
+/// The correlator of the death observer on svcmgr's own main thread, and
+/// the base of the one on its address space, which has
+/// [`CORE_DEATH_ADDRESS_SPACE`] set too; both post to the core-death queue
+/// svcmgr serves pwrmgr, the shutdown actuator, a receive-only derivation
+/// of (`docs/supervision.md` § Core Set and System Death). A consumer masks
+/// the flag off before it matches a member.
 pub const CORE_DEATH_SVCMGR: u64 = 0;
-/// The correlator of the death observers svcmgr binds on memmgr's main
-/// thread and address space, on the same queue.
+/// The correlator of the death observer svcmgr binds on memmgr's main
+/// thread, and the base of the one on its address space
+/// ([`CORE_DEATH_ADDRESS_SPACE`] set too), on the same queue.
 pub const CORE_DEATH_MEMMGR: u64 = 1;
-/// The correlator of the death observers svcmgr binds on procmgr's main
-/// thread and address space, on the same queue.
+/// The correlator of the death observer svcmgr binds on procmgr's main
+/// thread, and the base of the one on its address space
+/// ([`CORE_DEATH_ADDRESS_SPACE`] set too), on the same queue.
 pub const CORE_DEATH_PROCMGR: u64 = 2;
 /// The flag svcmgr ORs into a member's correlator for the observer it binds
 /// on the member's address space, and leaves clear for the one on its main

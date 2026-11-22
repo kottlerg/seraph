@@ -30,8 +30,9 @@ pub use current::{
     ARG1_OFFSET, BREAKPOINT_RESUME_ADVANCE, FAULT_REPORTS_PRESENT, FB_WINDOW_END, HAS_IO_PORTS,
     HAS_SPECULATION_CONTROLS, ILLEGAL_INSTRUCTION_VECTOR, IP_OFFSET, MMIO_PROBE_OFFSET,
     MMIO_PROBE_PHYS, MSG_INJECTABLE, PAGE_FAULT_LOAD_VECTOR, PAGE_FAULT_STORE_VECTOR,
-    ROUTABLE_HIGH_IRQ_IDS, SP_OFFSET, SYSCALL_NR_OFFSET, TRAP_FRAME_BYTES, UNROUTABLE_IRQ_IDS,
-    breakpoint_reported_ip, callee_saved, code_stub, core_key, cycles_now, entry_stack_pointer,
-    fpu, fresh_range_root, illegal_instruction, init_io_ports, msi_message_plausible,
-    run_integration, run_unit, serial, shutdown, software_breakpoint, user_controls,
+    ROUTABLE_HIGH_IRQ_IDS, SP_OFFSET, SYSCALL_NR_OFFSET, TLS_OFFSET, TRAP_FRAME_BYTES,
+    UNROUTABLE_IRQ_IDS, breakpoint_reported_ip, callee_saved, code_stub, core_key, cycles_now,
+    entry_stack_pointer, fpu, fresh_range_root, illegal_instruction, init_io_ports,
+    msi_message_plausible, run_integration, run_unit, serial, shutdown, software_breakpoint,
+    user_controls,
 };

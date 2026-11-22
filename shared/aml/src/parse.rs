@@ -908,7 +908,8 @@ impl<'a> Parser<'a>
     /// An object with a `PkgLength`, a name, the operands `args`, and a body
     /// term list: `Scope`, `Method`, `Device`, `Processor`, `PowerResource`,
     /// `ThermalZone`. The body is parsed in the scope the name gives (a
-    /// `Scope`'s name by the search rules, a definition's as a path), or in
+    /// `Scope`'s name by the search rules, through an alias, a definition's
+    /// as a path), or in
     /// the enclosing scope when that node does not exist yet.
     fn scoped(&mut self, op: Op, offset: u32, args: &[Arg]) -> Result<Term, Fault>
     {
@@ -918,7 +919,9 @@ impl<'a> Parser<'a>
             let encoded = p.peek_name()?;
             let found = if op == Op::Scope
             {
+                // Through an alias, as the loader and the evaluator enter it.
                 p.ns.resolve_str(outer, &encoded)
+                    .and_then(|n| p.ns.follow(n))
             }
             else
             {

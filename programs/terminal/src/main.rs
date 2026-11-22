@@ -26,7 +26,9 @@
 //! discipline is why a new input source is just another producer.
 //!
 //! Each driver class is followed by a [`device_tracker::Device`], which keeps its
-//! current driver across devmgr's restart of it, on the class's watch.
+//! current driver across devmgr's restart of it, on the class's watch. Its
+//! tracker thread outlives `main`'s, so a fatal path ends the whole process
+//! (`std::process::exit`), not the main thread alone.
 //!
 //! Remaining deferrals are documented in `README.md`: signals/cooked-raw/
 //! job-control/multi-session (#29) and the real interactive shell (#112).
@@ -70,7 +72,7 @@ fn main() -> !
     else
     {
         std::os::seraph::log!(error: "terminal: a seed is missing; exiting");
-        syscall::thread_exit();
+        std::process::exit(1);
     };
     // SAFETY: ipc_buf is the registered IPC buffer.
     let input = unsafe { device_tracker::Device::start(input_class, "input", ipc_buf) };
@@ -78,7 +80,7 @@ fn main() -> !
     else
     {
         std::os::seraph::log!(error: "terminal: no input device; exiting");
-        syscall::thread_exit();
+        std::process::exit(1);
     };
     // The framebuffer is the primary output but optional: a headless boot has
     // none, and the terminal then mirrors to serial only, until devmgr serves
@@ -95,7 +97,7 @@ fn main() -> !
     else
     {
         std::os::seraph::log!(error: "terminal: no serial device; exiting");
-        syscall::thread_exit();
+        std::process::exit(1);
     };
 
     let (tx, rx) = channel::<Msg>();
@@ -162,7 +164,7 @@ fn run(client: &mut session::Client, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink:
                 Err(_) =>
                 {
                     std::os::seraph::log!(error: "terminal: input channel closed; exiting");
-                    syscall::thread_exit();
+                    std::process::exit(1);
                 }
             }
         }

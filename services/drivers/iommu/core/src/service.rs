@@ -562,8 +562,9 @@ impl<B: Backend, C: CapOps> Service<B, C>
             return Err(exhausted);
         }
         let did = self.take_did(unit, named.1)?;
-        // Handles are never reused, so a driver that has handed out every
-        // one attaches no further domain.
+        // An instance gives a handle once, and devmgr names each handle once
+        // in the boot, across restarts too; a driver that has handed out
+        // every one attaches no further domain.
         let (handle, next_handle) = self.take_handle(named.0)?;
         self.domains.try_reserve(1).map_err(|_| exhausted)?;
         let domain = self

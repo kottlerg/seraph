@@ -27,23 +27,34 @@
 /// `cpu::verify_baseline` and `gdt::load_boot_segments` (the `SBPB` probe
 /// takes its `#GP` through the kernel's code segment), before any AP starts or
 /// any thread enters user mode.
+///
+/// # Safety
+/// Ring 0 on the boot CPU, once, on the kernel's GDT
+/// (`gdt::load_boot_segments`), with interrupts off and before
+/// `shadow_stack::enable`: the `SBPB` probe is
+/// `super::idt::msr_recovering`'s access (`super::vulnerability::sbpb_probe`).
 #[cfg(not(test))]
-pub fn select_mitigations()
+pub unsafe fn select_mitigations()
 {
     use super::mitigation::{FORCED_RETURN, Inputs, install, report, select};
 
-    let cpu = super::vulnerability::enumerate();
+    // SAFETY: the caller's contract, which is `sbpb_probe`'s.
+    let cpu = unsafe { super::vulnerability::enumerate() };
     let table = super::vulnerability::derive(&cpu);
     super::vulnerability::report(&cpu, &table);
     let inputs = Inputs::of(&cpu, &table).forced(FORCED_RETURN);
     let controls = select(inputs);
     install(inputs, controls);
-    report(&cpu, inputs, controls);
+    // SAFETY: the caller's contract, which is `sbpb_probe`'s.
+    unsafe { report(&cpu, inputs, controls) };
 }
 
 /// No-op test stub.
+///
+/// # Safety
+/// No preconditions.
 #[cfg(test)]
-pub fn select_mitigations() {}
+pub unsafe fn select_mitigations() {}
 
 /// Set the calling CPU's per-CPU controls of the selection (enhanced IBRS, or
 /// the kernel's `IA32_SPEC_CTRL` value of IBRS on entry, `BHI_DIS_S`, STIBP,

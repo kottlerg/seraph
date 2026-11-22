@@ -101,8 +101,9 @@ pub fn unpack_name(words: &[u64], len: usize) -> Option<[u8; NAME_MAX]>
 ///
 /// Namespace-policy descriptor: hand the child a `cap_copy` of
 /// svcmgr's own root cap at full rights. Reserved for the services
-/// that need genuine root authority; today the `terminal`, `svctest`,
-/// and `usertest` recipes select it.
+/// that need genuine root authority; today the `sessiond` recipe and the
+/// `svctest`, `usertest`, `stopsrc`, `hotplug-check-disk` and
+/// `reserve-creator` test recipes select it.
 pub const NS_POLICY_UNIVERSAL: u8 = 0;
 /// Namespace-policy descriptor: do not deliver any namespace
 /// cap. The child's `ProcessInfo.system_root_cap` stays zero

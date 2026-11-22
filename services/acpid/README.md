@@ -51,7 +51,8 @@ acpid is a svcmgr service, launched on every boot of both architectures from
 process that evaluates AML: devmgr evaluates none
 ([docs/driver-binding.md](../../docs/driver-binding.md) § Device Records). It loads the DSDT and the
 SSDTs devmgr serves, switches an x86-64 platform into ACPI mode, runs the initialization walk, and
-evaluates each PCI host bridge's `_OSC`, `_CRS` and `_PRT` ([docs/startup.md](docs/startup.md)). It
+evaluates each PCI host bridge's `_OSC`, `_CRS` and `_PRT`, and the `_PRT` of each PCI-to-PCI
+bridge below one that has its own ([docs/startup.md](docs/startup.md)). It
 pushes the results to devmgr, which keeps those that agree with its boot records and serves them per
 bridge with `QUERY_HOST_BRIDGE` ([docs/devmgr.md](docs/devmgr.md) § Pushes). On x86-64 it then takes
 the SCI and handles the ACPI events: the fixed power button, which it reports to pwrmgr, and the
@@ -243,7 +244,8 @@ devmgr keeps a bridge's `_OSC` result as acpid pushes it, the first one for the 
 a bridge's `_CRS` windows and `_PRT` routes only when they agree with its boot records: each
 boot function's bus inside the bus window, its memory BARs inside a memory window and an
 aperture, its I/O BARs inside an I/O window, and its interrupt pin routed (on x86-64 to the line
-the firmware programmed, read in the PIC model; on RISC-V to the `virt` swizzle). A push that
+the firmware programmed, read in the PIC model; on RISC-V to the `virt` swizzle), each function
+by the table of the nearest bridge above it that has one. A push that
 disagrees is refused, fail-closed: the bridge then has no windows or routes from acpid for the
 boot. The checks are [docs/devmgr.md](docs/devmgr.md) § Pushes.
 

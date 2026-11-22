@@ -180,7 +180,9 @@ pub struct Command {
     /// The memmgr object handle of the checkpoint the next spawn restores
     /// (`CREATE_RESTORE`), borrowed: the spawn sends a copy. Zero (the
     /// default) creates the child from its binary. Set via
-    /// `CommandExt::restore`.
+    /// `CommandExt::restore`; the next spawn takes it, whatever its
+    /// outcome, so a later one creates from the binary unless it is set
+    /// again.
     restore: u64,
     /// Caps the child takes over the bootstrap protocol, positional, `0`
     /// for an absent slot. Set via `CommandExt::bootstrap_caps`; empty (the
@@ -373,6 +375,9 @@ impl Command {
         // The bootstrap caps leave the `Command` here, so every return below
         // deletes those no round moved to the child, as the guard's drop does.
         let mut bootstrap = core::mem::replace(&mut self.bootstrap, BootstrapCaps::new(Vec::new()));
+        // So does the restore: one spawn restores the checkpoint, and the
+        // borrowed handle is not used again past it.
+        let restore = core::mem::take(&mut self.restore);
 
         let path_bytes = self.program.as_encoded_bytes();
         if path_bytes.is_empty() {
@@ -448,7 +453,7 @@ impl Command {
         // returns its run to memmgr (procmgr has copied the blobs by then),
         // or withholds it on `ARGV_ENV_STILL_MAPPED`.
         // A restore carries no argv or env: the child takes the checkpoint's.
-        let argv_env = if self.restore == 0 {
+        let argv_env = if restore == 0 {
             crate::os::seraph::process::ArgvEnvCap::new(
                 &args_blob, args_count, &env_blob, env_count,
             )?
@@ -533,7 +538,7 @@ impl Command {
 
         // The copy of the checkpoint's object handle a restore sends, which
         // procmgr owns from the call on.
-        let restore_copy = match self.restore {
+        let restore_copy = match restore {
             0 => 0,
             object => match syscall::cap_derive(object, syscall::RIGHTS_EP_SEND) {
                 Ok(copy) => copy,

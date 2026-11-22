@@ -10,6 +10,7 @@
 //! [`holdable`]) in one of [`SLOTS`] slots for at most its stall
 //! (`CRASHD_OOM_STALL_MS`, [`parse_stall`]), resumes it when the memory it
 //! waits for is there ([`Waits`]: for a commit overrun, code 11, memmgr's draw
+//! room opening; for code 7, the level falling below `CRITICAL` or the draw
 //! room opening; for the others, memmgr's pressure level falling below
 //! `CRITICAL`), and reports and declines it when the stall passes first. A
 //! fault it resumed that faults again at the same page is a repeat: held again
@@ -105,8 +106,22 @@ pub fn parse_stall(value: Option<&str>) -> Result<Stall, NotMilliseconds>
 pub enum Waits
 {
     /// memmgr's pressure level below `CRITICAL`: a fault memmgr declined
-    /// with code 6, 7 or 8, which a page outside the system reserve backs.
+    /// with code 6 or 8, which a page outside the system reserve backs, and
+    /// the repeat of a code-7 fault ([`Waits::LevelOrDrawRoom`]).
     Level,
+    /// Either of the level below `CRITICAL` and the draw room open: a fault
+    /// memmgr declined with code 7. That code is a demand page no free page
+    /// outside `promised` and the growth floor can back, which waits on the
+    /// level, or a restore of an evicted chunk the free frames do not cover
+    /// while swap slots are registered, which the evictions that raise the
+    /// free frames admit while the level, read from the uncommitted free
+    /// pages, stays `CRITICAL` (`services/memmgr/docs/memory-pool.md`
+    /// § Eviction, Restore headroom); an open draw room has room for a
+    /// chunk's restore. The decline word does not tell the two apart, so a
+    /// fault resumed on one of them that repeats waits on the level alone
+    /// ([`Holds::admit`]): a demand page resumed on the draw room is declined
+    /// again at most once per hold.
+    LevelOrDrawRoom,
     /// memmgr's draw room open, at a demand chunk's bytes or more
     /// (`QUERY_POOL_STATUS` `data[16]`, room for any one committed draw): a commit
     /// overrun, code 11, a committed page the free frames outside the system
@@ -121,13 +136,11 @@ pub enum Waits
 #[must_use]
 pub const fn waits_on(reason: u64) -> Waits
 {
-    if reason & 0xffff_ffff == 11
+    match reason & 0xffff_ffff
     {
-        Waits::DrawRoom
-    }
-    else
-    {
-        Waits::Level
+        11 => Waits::DrawRoom,
+        7 => Waits::LevelOrDrawRoom,
+        _ => Waits::Level,
     }
 }
 
@@ -159,10 +172,15 @@ impl Rooms
     #[must_use]
     pub const fn of(self, waits: Waits) -> Room
     {
-        match waits
+        match (waits, self.level, self.draw)
         {
-            Waits::Level => self.level,
-            Waits::DrawRoom => self.draw,
+            (Waits::Level, level, _) => level,
+            (Waits::DrawRoom, _, draw) => draw,
+            (Waits::LevelOrDrawRoom, Room::Open, _) | (Waits::LevelOrDrawRoom, _, Room::Open) =>
+            {
+                Room::Open
+            }
+            (Waits::LevelOrDrawRoom, Room::Short, Room::Short) => Room::Short,
         }
     }
 }
@@ -299,7 +317,10 @@ impl Holds
     /// deadline while its memory is short, and, when it is there, declined
     /// for a fault that waits on the level and resumed again, remembered until
     /// that deadline, for a commit overrun, which another draw may have
-    /// beaten to the draw room. A
+    /// beaten to the draw room. A repeat of a fault that waits on
+    /// [`Waits::LevelOrDrawRoom`] waits on the level alone, so a demand page
+    /// the draw room does not back is resumed into memmgr's decline at most
+    /// once. A
     /// hold takes the slot [`Admit::Hold`] names, which [`Self::end`] frees;
     /// an [`Admit::Resume`] is remembered for the repeat rule.
     pub fn admit(&mut self, now: u64, key: Key, waits: Waits, rooms: Rooms) -> Admit
@@ -309,7 +330,13 @@ impl Holds
             return Admit::Decline(Refusal::NoStall);
         }
         self.forget_expired(now);
-        match (self.take_resumed(key), rooms.of(waits))
+        let repeat = self.take_resumed(key);
+        let waits = match (repeat, waits)
+        {
+            (Some(_), Waits::LevelOrDrawRoom) => Waits::Level,
+            _ => waits,
+        };
+        match (repeat, rooms.of(waits))
         {
             (Some(deadline), Room::Open) if waits == Waits::DrawRoom =>
             {
@@ -891,7 +918,8 @@ mod tests
     {
         assert_eq!(waits_on(11), Waits::DrawRoom);
         assert_eq!(waits_on((1 << 32) + 11), Waits::DrawRoom);
-        for code in [6, 7, 8]
+        assert_eq!(waits_on(7), Waits::LevelOrDrawRoom);
+        for code in [6, 8]
         {
             assert_eq!(waits_on(code), Waits::Level);
         }
@@ -911,11 +939,11 @@ mod tests
             holds.admit(0, key(2), waits_on(7), level_only),
             Admit::Resume
         );
-        // Held at CRITICAL, a fault of code 7 waits on the level alone.
-        let Admit::Hold { slot: level, .. } = holds.admit(1, key(3), waits_on(7), SHORT)
+        // Held at CRITICAL, a fault of code 8 waits on the level alone.
+        let Admit::Hold { slot: level, .. } = holds.admit(1, key(3), waits_on(8), SHORT)
         else
         {
-            panic!("a fault of code 7 at CRITICAL was not held");
+            panic!("a fault of code 8 at CRITICAL was not held");
         };
         holds.arrived(commit);
         holds.arrived(level);
@@ -968,6 +996,64 @@ mod tests
                 slot: again,
                 deadline: STALL + 1 + STALL
             }
+        );
+    }
+    // The defect caught: a fault of code 7 whose chunk's restore memmgr
+    // declined for want of free frames, held on the level alone, which the
+    // evictions that free those frames leave at CRITICAL, so it runs to its
+    // stall and is killed after its frames came back. It waits on either
+    // room; a repeat of one resumed waits on the level alone, so a demand
+    // page the draw room does not back is resumed into memmgr's decline at
+    // most once per hold.
+    #[test]
+    fn a_fault_of_code_7_waits_on_the_level_or_the_draw_room()
+    {
+        let draw_only = Rooms {
+            level: Room::Short,
+            draw: Room::Open,
+        };
+        let level_only = Rooms {
+            level: Room::Open,
+            draw: Room::Short,
+        };
+        assert_eq!(draw_only.of(Waits::LevelOrDrawRoom), Room::Open);
+        assert_eq!(level_only.of(Waits::LevelOrDrawRoom), Room::Open);
+        assert_eq!(SHORT.of(Waits::LevelOrDrawRoom), Room::Short);
+        let mut holds = Holds::new(STALL);
+        let Admit::Hold { slot, deadline } = holds.admit(0, key(1), waits_on(7), SHORT)
+        else
+        {
+            panic!("a fault of code 7 with both rooms short was not held");
+        };
+        holds.arrived(slot);
+        // The draw room opening while the level stays CRITICAL resumes it.
+        assert_eq!(holds.opened(draw_only).collect::<Vec<_>>(), [slot]);
+        assert!(matches!(
+            holds.end(slot, Why::RoomOpened, Found::Fault),
+            Some(Ended::Resume(Held {
+                waits: Waits::LevelOrDrawRoom,
+                ..
+            }))
+        ));
+        // Its repeat, the draw room still open and the level CRITICAL, is a
+        // demand page the draw room does not back: held on the level alone,
+        // until the first hold's deadline.
+        let Admit::Hold {
+            slot: again,
+            deadline: kept,
+        } = holds.admit(10, key(1), waits_on(7), draw_only)
+        else
+        {
+            panic!("a repeat of code 7 at CRITICAL was not held");
+        };
+        assert_eq!(kept, deadline);
+        holds.arrived(again);
+        assert_eq!(holds.opened(draw_only).count(), 0);
+        assert_eq!(holds.opened(level_only).collect::<Vec<_>>(), [again]);
+        // A first fault of code 7 with the draw room open is resumed at once.
+        assert_eq!(
+            holds.admit(20, key(2), waits_on(7), draw_only),
+            Admit::Resume
         );
     }
 }

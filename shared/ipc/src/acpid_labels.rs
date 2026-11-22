@@ -159,8 +159,8 @@ pub const fn sleep_control_value(slp_typ: u16) -> u8
 pub const EVENT_POWER_BUTTON: u64 = 1;
 
 /// Authority bit in the acpid-service-endpoint badge's high u64 bit, set
-/// on `acpid.power`. Without it [`SLEEP`], [`RESET`] and [`WAIT_EVENT`]
-/// reply [`super::acpid_errors::UNAUTHORIZED`].
+/// on `acpid.power`. Without it [`SLEEP`], [`QUERY_SLEEP`], [`RESET`] and
+/// [`WAIT_EVENT`] reply [`super::acpid_errors::UNAUTHORIZED`].
 pub const POWER_AUTHORITY: u64 = 1u64 << 63;
 
 #[cfg(test)]

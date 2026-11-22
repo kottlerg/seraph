@@ -476,8 +476,10 @@ pub fn read_module(
 ///
 /// # Errors
 /// `LIMIT` when the max of the account's node, or of an ancestor's, refuses
-/// the session or the open; `IO_ERROR` when the session or the open fails
-/// otherwise, a read fails, is unanswered, or returns no bytes, ends before
+/// the session or the open; `OUT_OF_MEMORY` when the file server refuses
+/// the session's or the open's page for want of memory
+/// ([`process_table::fs_reads::fs_refusal`]); `IO_ERROR` when the session or
+/// the open fails otherwise, a read fails, is unanswered, or returns no bytes, ends before
 /// `len` bytes, or names a range past the page it lends; [`ImageBuffer`]'s
 /// code when the buffer cannot be had, and `OUT_OF_MEMORY` when memmgr
 /// cannot make the session's node.
@@ -865,9 +867,10 @@ fn request_session(node_cap: u64, charge: u64, ipc_buf: *mut u64) -> Result<(u64
 /// § Label 18); every other reply cap is deleted.
 ///
 /// # Errors
-/// `LIMIT` when the session's max refuses the open; `IO_ERROR` when the
-/// call fails or the server refuses otherwise, or the reply carries no open
-/// cap.
+/// `LIMIT` when the session's max refuses the open; `OUT_OF_MEMORY` when the
+/// server refuses its page for want of memory
+/// ([`process_table::fs_reads::fs_refusal`]); `IO_ERROR` when the call fails
+/// or the server refuses otherwise, or the reply carries no open cap.
 fn vfs_open(node_cap: u64, session_cap: u64, ipc_buf: *mut u64) -> Result<u64, u64>
 {
     let msg = IpcMessage::builder(ipc::fs_labels::FS_OPEN)

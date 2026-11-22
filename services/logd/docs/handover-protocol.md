@@ -76,19 +76,21 @@ Until init-logd acknowledges the release, it writes each line it forwards to the
 by byte, and logd's serial writes go through the serial driver to the same UART; the two share no
 lock, so a line of each written at once interleaves byte by byte, and a reader of the serial stream
 sees neither line whole. logd therefore writes nothing to the serial driver of its own before the
-release. It resolves the serial and framebuffer drivers through devmgr before the pull, writing
-nothing, so that its first write after the release does not call devmgr while the log endpoint has
-no reader. A driver devmgr does not serve by then is resolved later on its class watch, and its
-sink queues the lines meanwhile ([`ipc-interface.md`](ipc-interface.md) § Output sinks). It also
-holds each line it self-logs, at most `SELF_LOG_HELD_MAX` (8) of them, and writes
-them in order, with the time each was logged, once `handover::transfer` returns. A line past that
-bound is dropped and counted, and logd writes the count in one line after the held ones. Init-logd
-writes its last line, `handover complete; init-logd thread exiting`, before it acknowledges the
-release, and nothing after it. Two writes are not held: logd's panic sink, and a `FATAL` line on the
-way to a halt, which writes the held lines first. A restarted logd with no handover source
-(`cap[1] = 0`, minted once init is reaped) holds nothing. When no release reaches init-logd
-(§ Failure modes), logd writes the
-held lines when the attempts end, and its serial writes can then interleave with init-logd's.
+release. It resolves the serial and framebuffer drivers through devmgr first, before it creates
+its death queue, writing nothing: a halt on a later start step writes its `FATAL` line, and the
+panic sink its output, only to a resolved serial driver, and its first write after the release
+then does not call devmgr while the log endpoint has no reader. A driver devmgr does not serve by
+then is resolved later on its class watch, and its sink queues the lines meanwhile
+([`ipc-interface.md`](ipc-interface.md) § Output sinks). It also holds each line it self-logs, at
+most `SELF_LOG_HELD_MAX` (12) of them, and writes them in order, with the time each was logged, once
+`handover::transfer` returns. A line past that bound is dropped and counted, and logd writes the
+count in one line after the held ones. Init-logd writes its last line,
+`handover complete; init-logd thread exiting`, before it acknowledges the release, and nothing
+after it. Two writes are not held: logd's panic sink, and a `FATAL` line on the way to a halt,
+which writes the held lines first. A restarted logd with no handover source (`cap[1] = 0`, minted
+once init is reaped) holds nothing.
+When no release reaches init-logd (§ Failure modes), logd writes the held lines when the attempts
+end, and its serial writes can then interleave with init-logd's.
 
 ## Call shape
 
@@ -236,7 +238,11 @@ the release, as the previous section describes. A call that runs out of
 `HANDOVER_CALL_TIMEOUT_MS` ends the drain as a failed call does; a restarted logd minted the SEND
 after init-logd exited but before procmgr's reap (its receive workers wait behind the receive
 pool's gate, so no thread receives) ends its transfer with nothing pulled, after at most one bound
-on the pull and one on the release.
+on the pull and one on the release. A release that runs out may have been taken, and init-logd
+may have answered it, acknowledged or deferred, after the expiry, so real-logd does not take it as
+unreached: it drains again, and releases again if init-logd answers any call of that drain. An
+init-logd that exited on the release answers none, which ends the transfer after one bound more
+([`run_rounds`](../codec/src/handover.rs)).
 
 In-flight `STREAM_BYTES` and `STREAM_RECORD` sends from other processes queue at the kernel
 endpoint and are drained by real-logd once it enters its main receive
@@ -248,8 +254,8 @@ loop.
 |---|---|---|
 | `HANDOVER_PULL` IPC returns error mid-drain | A kernel IPC rendezvous race on the shared endpoint, or an invalid `log_ep_handover_send` | The drain returns; logd still issues `HANDOVER_RELEASE`, so init-logd is released. At most some pre-handover history is lost. The names of slots not yet sent reach real-logd when each sender's next message is refused for its name and the sender registers again ([`ipc-interface.md`](ipc-interface.md) § `stream_labels::STREAM_REGISTER_NAME`). |
 | `HANDOVER_RELEASE` never delivered (logd never launches, or every instance dies before its release and svcmgr restarts none after the last) | No init-logd→logd channel exists | init-logd keeps serving and procmgr never reaps init; init's memory caps stay held until shutdown — a benign hold, not a wedge. procmgr does not force-stop init-logd (see [procmgr IPC interface](../../procmgr/docs/ipc-interface.md) § `INIT_TEARDOWN_DONE`). |
-| `HANDOVER_RELEASE` retries exhausted (`send_release` retries for `RELEASE_RETRY_BUDGET_US` (1 s), no attempt delivered) | init-logd unreachable on the handover SEND for every attempt | `send_release` returns without an ack and logd deletes `cap[1]` regardless; init-logd keeps serving and procmgr never reaps init, so init's memory caps stay held until shutdown (the same benign hold as the row above, unless a restart of logd releases it). |
-| Handover call runs out (`HANDOVER_CALL_TIMEOUT_MS`) | No init-logd receives (it exited after svcmgr minted the SEND, before procmgr's reap), or init-logd did not answer within the bound | The drain ends as on a failed call, and logd still issues the release, whose attempts are bounded the same way. With no init-logd receiving, the transfer ends after one bound on the pull and one on the release (the first attempt's bound spends `RELEASE_RETRY_BUDGET_US`), and logd serves what it pulled. |
+| `HANDOVER_RELEASE` retries exhausted (`send_release` retries for `RELEASE_RETRY_BUDGET_US` (1 s), no attempt delivered, the last failing other than by running out) | init-logd unreachable on the handover SEND for every attempt | `send_release` returns without an ack and logd deletes `cap[1]` regardless; init-logd keeps serving and procmgr never reaps init, so init's memory caps stay held until shutdown (the same benign hold as the row above, unless a restart of logd releases it). |
+| Handover call runs out (`HANDOVER_CALL_TIMEOUT_MS`) | No init-logd receives (it exited after svcmgr minted the SEND, before procmgr's reap), or init-logd did not answer within the bound | The drain ends as on a failed call, and logd still issues the release, whose attempts are bounded the same way. A release that runs out (the first attempt's bound spends `RELEASE_RETRY_BUDGET_US`) may have been taken and answered after the expiry, so logd drains again and, when init-logd answers that drain, releases again, within the `MAX_RELEASE_DEFERRALS + 1` rounds. With no init-logd receiving, the transfer ends after one bound on the pull and one on the release, and an init-logd that exited on a release it answered late costs one bound more, on the next pull; logd then serves what it pulled. |
 | `HANDOVER_RELEASE` deferred `MAX_RELEASE_DEFERRALS` (8) times | Senders kept registering or changing names through every round | Init-logd acknowledges the next release whatever is pending and exits; a name first registered in that last window reaches real-logd when the sender's next message is refused for it and the sender registers again, and a name changed there reaches it only if its sender registers again. |
 | Reply with unknown `word(0)` kind | Wire-format drift; one side built against an out-of-sync `logd-codec` or `shared/ipc` revision | Real-logd skips the chunk and continues. A bounded iteration cap (`MAX_ITERS`) in `pull_all` guarantees termination on a malformed reply stream. |
 | `SLOT`, `LINE`, or `RECORD` length word larger than the carried payload | A malformed or hostile reply | Real-logd takes the bytes the message carries and ignores the excess; the declared length cannot overflow its bounds arithmetic. |

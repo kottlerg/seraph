@@ -105,8 +105,17 @@ The first managed slot starts the poller, a devmgr thread at devmgr's priority. 
 derivation of each managed port's configuration page and touches only the port's PCI Express
 slot and link registers. At take-over it turns off the slot's event interrupt enables (the
 poller reads the latches instead, so the slot needs no message target, no IOMMU domain and no
-`_PRT`), clears the latches, and holds the slot occupied when a card is present and a live
-record lies behind it, else empty.
+`_PRT`), clears the latches, and holds the slot as what lay behind it when the control thread
+handed it over (`firmware::hotplug::initial`): empty when no live record lies behind it; replaced
+when a recorded function no longer reads as its record, its vendor and device ID, revision, class
+code, or a type-0 header's subsystem vendor and ID differing or the function not answering
+(`firmware::hotplug::same_function`), logged; else occupied, whatever its Slot Status reads. The
+first poll then removes a recorded card that left while the slot's grant waited, removes the
+recorded card of a replaced slot and adds the card present once the removal completes, and brings
+up a card present with nothing recorded. The latches cleared at take-over hold what happened before
+devmgr controlled the slot, which may include the slot's power-on, so no event is read from them: a
+card replaced by one of the same identity is not told apart from it and is held as the recorded
+one, and an attention-button press while the grant waited is lost.
 
 Every `HOTPLUG_POLL_MS` (1000) it reads each slot's Slot Status, clears the event latches it
 holds (Attention Button Pressed, Power Fault Detected, MRL Sensor Changed, Presence Detect
@@ -116,6 +125,7 @@ Changed, Data Link Layer State Changed; all RW1C, so a poll loses no event), and
 | Slot | Slot Status | Action |
 |---|---|---|
 | empty | Presence Detect State set | power up, then post the add job; the slot is occupied, or failed when the link does not come up |
+| replaced | any | post the removal job, asked for when a card is present, so it is powered up after it; the slot is removing |
 | occupied | presence lost or changed, or the link lost | post the removal job; the slot is removing |
 | occupied | Attention Button Pressed | blink the power indicator; the slot is pressed, for the abort window |
 | pressed | Attention Button Pressed again | the power indicator on; the removal is cancelled, and the slot is occupied |
@@ -123,7 +133,7 @@ Changed, Data Link Layer State Changed; all RW1C, so a poll loses no event), and
 | pressed | the abort window ended | post the removal job; the slot is removing |
 | removing | Attention Button Pressed, or Presence Detect Changed, with a card present | nothing until the removal job completes; the slot is powered up after it (§ Removal) |
 | removing | anything else | nothing, until the removal job completes (§ Removal) |
-| off | Attention Button Pressed, or Presence Detect Changed, with a card present | power up, as for an empty slot |
+| off, failed | Attention Button Pressed, or Presence Detect Changed, with a card present | power up, as for an empty slot |
 | off, failed | presence lost | the slot is empty |
 
 The link is lost when the port reports Data Link Layer Link Active, Data Link Layer State Changed
@@ -131,16 +141,16 @@ is latched, and Link Active reads clear. A Slot Status of all ones, from a port 
 answer, changes nothing. The abort window is `ABORT_WINDOW_MS` (5000), `ABORT_POLLS` polls (PCI
 Express Base Specification r4.0 § 6.7.1.5).
 
-Power-up writes Slot Control with the slot's power on where it has a Power Controller and its
-power indicator on where it has one. Where the slot reports Command Completed, each Slot Control
-write clears the latch, writes, and waits up to `SLOT_WAIT_MS` (1000) for it. Where the port
-reports Data Link Layer Link Active, the poller waits up to `SLOT_WAIT_MS` for the link and then
-`LINK_SETTLE_MS` (100) before any configuration request goes below the port (PCI Express Base
-Specification r4.0 § 6.6.1); where it does not report it, it waits `SLOT_WAIT_MS`. A link that
-does not come up is logged, the slot powered off, and the slot held failed until the card is
-removed. A job, add or removal, is posted to the control thread over one channel, with a signal
-of its job notification; the control thread runs the jobs in the order they were posted, each to
-its end before the next.
+Power-up writes Slot Control with the slot's power on where it has a Power Controller and its power
+indicator on where it has one. Where the slot reports Command Completed, each Slot Control write
+clears the latch, writes, and waits up to `SLOT_WAIT_MS` (1000) for it. Where the port reports Data
+Link Layer Link Active, the poller waits up to `SLOT_WAIT_MS` for the link and then `LINK_SETTLE_MS`
+(100) before any configuration request goes below the port (PCI Express Base Specification r4.0 §
+6.6.1); where it does not report it, it waits `SLOT_WAIT_MS`. A link that does not come up is
+logged, the slot powered off, and the slot held failed until the card is removed, replaced, or asked
+for again with the attention button. A job, add or removal, is posted to the control thread over one
+channel, with a signal of its job notification; the control thread runs the jobs in the order they
+were posted, each to its end before the next.
 
 ---
 
@@ -233,9 +243,10 @@ It takes the next ordinal of its class, and a bound driver signals the class's w
 
 A hot-added function's `INTx` route is computed through the bridges of the records
 (`PciRecords::append`). On x86-64 no firmware programmed its Interrupt Line, so devmgr gives
-it the line that the PIC-model `_PRT` table of its host bridge (`PRT_PIC_MODE`, which acpid reads
-before `_PIC(1)`) routes to the pin and root-bus device number its interrupt reaches the root bus
-with (`firmware::acpid::Bridges::line`). A boot function uses the PIC-model line the firmware
+it the line that the PIC-model `_PRT` table that routes it (`PRT_PIC_MODE`, which acpid reads
+before `_PIC(1)`) gives the pin and device number its interrupt reaches that table's bus with:
+the table of the nearest PCI-to-PCI bridge above it that has one, or its host bridge's
+(`firmware::acpid::Bridges::line`). A boot function uses the PIC-model line the firmware
 programmed, so the hot-added one shares lines as a boot function at its place would. It has no
 wired line when devmgr holds no PIC-model table for the bridge or the table does not route the
 pin; it is then given message-signaled vectors where its driver's declaration takes them, and a
@@ -328,3 +339,4 @@ most two spans per BAR placed, and never past one span per page of the windows.
 [Driver Binding](../../../docs/driver-binding.md), [acpid and devmgr](../../acpid/docs/devmgr.md),
 [services/devmgr/README.md](../README.md), [PCI Enumeration](pci-enumeration.md),
 [devmgr Responsibilities and Capabilities](responsibilities.md)
+

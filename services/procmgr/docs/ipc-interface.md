@@ -107,7 +107,7 @@ handle (`CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`).
 | the words after them | The name block: the name the object is signed under (§ Image Verification) |
 | cap[0] | Memory capability holding the signed object |
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
-| the cap before the argv/env cap, or before the relay without one, or last without either | When `CREATE_CHARGE_NODE` is set: the node handle the child is charged to (**Memory max and reserve** below) |
+| the cap before the argv/env cap or the checkpoint's object handle, or before the relay without either, or last without any | When `CREATE_CHARGE_NODE` is set: the node handle the child is charged to (**Memory max and reserve** below) |
 | next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: Memory cap holding the argv and env blobs; when `CREATE_RESTORE` is set: the checkpoint's object handle (**Restore** below) |
 | last cap | When `CREATE_DEATH_RELAY` is set: POST-only `EventQueue` cap (**Death relay** below) |
 
@@ -158,7 +158,7 @@ holds a handle to it.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, the pager of a child that attaches a shared image or is restored could not be bound (**Pinned flag** below), or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No module capability, the length is zero or past the cap's pages, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY` or `CREATE_CHARGE_NODE` set without a cap of its own (**Death relay** below), reserved label bits `[38..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process or one a destroy has begun on (§ Process Tree), as when the creator's destroy begins before the child is recorded or before procmgr's reply delivers it, or a destroy marked the child itself (`DESTROY_CHILD`, or a destroy of a subtree it is in) before procmgr's reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (**Memory max and reserve** below), `CREATE_RESTORE` comes with `CREATE_ARGV_ENV`, `CREATE_PINNED`, `CREATE_PHYS_ACCESS` or `CREATE_DMA_HOLD`, or memmgr takes its handle for no object handle (**Restore** below) |
 | 11 | `MAP_FAILED` | The module cap, a copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | The module cap lacks the map right, or a rights derivation failed during segment load |
@@ -201,27 +201,25 @@ header for a std-built sender.
 
 **Pinned flag.** Demand paging is the default: at finalize procmgr binds every child's main thread
 fault handler to memmgr (the system pager) via `SYS_THREAD_SET_FAULT_HANDLER`, for the
-virtual-memory class (`FAULT_CLASS_VM`; the exception class is bound to the crash endpoint, as
-§ Crash Endpoint and Debug Authority says, and the upcall class stays unbound), delegates the
-child `AddressSpace` to memmgr via `memmgr_labels::DELEGATE_ASPACE`,
-and then sets `ProcessInfo.pager_endpoint_cap` (the child's badged memmgr cap, whose derivation
-badge the kernel stamps on each fault) and `pager_badge` (that badge), which tell the runtime the
-process is demand-paged; the runtime copies the spawning thread's bindings, this one among them,
-onto each thread it
-spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`). The
-child then backs reserved regions lazily via
-`std::os::seraph::register_demand_paged`. The label's bit 16 (`CREATE_PINNED`,
-in the `[16..31]` window shared with `CREATE_FROM_FILE`) opts out: the
-child is left eager-mapped with no pager. Set it only for a process that cannot
-depend on the fault path — a DMA driver, or the shutdown actuator, which svcmgr
-creates pinned. init, memmgr, and procmgr are pre-pager
-and never routed through this path, so they are pinned by construction. See
-[docs/fault-handling.md](../../../docs/fault-handling.md). The binding is
-best-effort: a failure degrades to "no pager" (faults kill), never blocking
-creation. procmgr writes `pager_endpoint_cap` and `pager_badge` only after the
-delegation and the main thread's binding have both taken effect, so the page never
-names a pager the child does not have; a child whose binding failed, or whose page
-procmgr could not map to advertise it, reads zero and keeps its memory eager.
+virtual-memory class (`FAULT_CLASS_VM`; the exception class is bound to the crash endpoint, as §
+Crash Endpoint and Debug Authority says, and the upcall class stays unbound), delegates the child
+`AddressSpace` to memmgr via `memmgr_labels::DELEGATE_ASPACE`, and then sets
+`ProcessInfo.pager_endpoint_cap` (the child's badged memmgr cap, whose derivation badge the kernel
+stamps on each fault) and `pager_badge` (that badge), which tell the runtime the process is
+demand-paged; the runtime copies the spawning thread's bindings, this one among them, onto each
+thread it spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`). The child then backs reserved regions lazily
+via `std::os::seraph::register_demand_paged`. The label's bit 16 (`CREATE_PINNED`, in the `[16..31]`
+window shared with `CREATE_FROM_FILE`) opts out: the child is left eager-mapped with no pager. Set
+it only for a process that cannot depend on the fault path — a DMA driver, or the shutdown actuator,
+which svcmgr creates pinned. init, memmgr, and procmgr are pre-pager and never routed through this
+path, so they are pinned by construction. See
+[docs/fault-handling.md](../../../docs/fault-handling.md). The binding is best-effort: a failure
+degrades to "no pager" (faults kill), never blocking creation, except for a child that attaches a
+shared image or is restored (**Restore** below), which procmgr refuses with `OUT_OF_MEMORY`, since
+only a fault memmgr serves maps its attached image pages or its restored regions. procmgr writes
+`pager_endpoint_cap` and `pager_badge` only after the delegation and the main thread's binding have
+both taken effect, so the page never names a pager the child does not have; a child whose binding
+failed, or whose page procmgr could not map to advertise it, reads zero and keeps its memory eager.
 
 **Death relay.** The label's bit 17 (`CREATE_DEATH_RELAY`, in the window shared with
 `CREATE_FROM_FILE`) marks a request whose last cap is a POST-only `EventQueue` cap, the relay. It is
@@ -390,7 +388,8 @@ behind. The child itself receives no handle to its own node.
 
 The label's bit 34 (`CREATE_CHARGE_NODE`) charges the child to the node of a node handle the
 creator holds: the request carries a copy of the handle as a cap of its own, after any extra caps
-and before the argv/env cap and the relay, and the child's node is made under the handle's node in
+and directly before the argv/env cap or the restore's object handle (**Restore** below), and before
+the relay, and the child's node is made under the handle's node in
 place of the creator's, clamped as above to what that node and every ancestor have left. The
 child's node is outside the reserve: procmgr refuses `CREATE_RESERVE` with the flag, and a charged
 child of the un-badged creator is no reserve node. A
@@ -633,7 +632,7 @@ the **Scheduling fields**, and **argv and env** are as for `CREATE_PROCESS`.
 | the words after them | The name block: the file's install path (§ Image Verification) |
 | cap[0] | File cap for the binary, with Grant, as a node cap has it (`SEND_GRANT`): the read session's `FS_SESSION` and `FS_OPEN` move a cap on it (**Read session**), so a cap without Grant fails the create with `IO_ERROR` |
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
-| the cap before the argv/env cap, or before the relay without one, or last without either | When `CREATE_CHARGE_NODE` is set: the charge node's handle, as for `CREATE_PROCESS` |
+| the cap before the argv/env cap or the checkpoint's object handle, or before the relay without either, or last without any | When `CREATE_CHARGE_NODE` is set: the charge node's handle, as for `CREATE_PROCESS` |
 | next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: the argv/env Memory cap; when `CREATE_RESTORE` is set: the checkpoint's object handle; as for `CREATE_PROCESS` |
 | last cap | When `CREATE_DEATH_RELAY` is set: the death-relay cap, as for `CREATE_PROCESS` |
 
@@ -689,7 +688,7 @@ included, as for `CREATE_PROCESS`.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, the file's server refused the read session's page for want of memory (`fs_errors::OUT_OF_MEMORY`, **Read session**), or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, the pager of a child that attaches a shared image or is restored could not be bound (§ Label 1, **Pinned flag**), the file's server refused the read session's page for want of memory (`fs_errors::OUT_OF_MEMORY`, **Read session**), or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[38..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process or one a destroy has begun on before the reply delivers the child, a destroy that marked the child itself before the reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1), `CREATE_RESTORE` comes with `CREATE_ARGV_ENV`, `CREATE_PINNED`, `CREATE_PHYS_ACCESS` or `CREATE_DMA_HOLD`, or memmgr takes its handle for no object handle (**Restore**, § Label 1) |
 | 10 | `IO_ERROR` | The `FS_SESSION` or the `FS_OPEN` of the file cap failed, for a reason other than a max (`LIMIT`) or a want of memory (`OUT_OF_MEMORY`), or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`, or the object's bytes did not all arrive: an `FS_READ_MEMORY` against procmgr's open failed, went unanswered for that long or returned zero bytes before `file_size`, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | A copy frame or a segment could not be mapped |

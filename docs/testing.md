@@ -853,7 +853,7 @@ QEMU, as for the `terminal` case. See
 [xtask/README.md § The `wedge` case](../xtask/README.md#the-wedge-case) for the command.
 
 In CI it runs as a boot pair inside each `usertest` cell (both arches, both profiles), after the
-`rollback` case, on the default boot the cell's `cargo xtask mkdisk` restored.
+`secureboot` case, on the default boot the cell's `cargo xtask mkdisk` restored.
 
 ### CET shadow stacks (`cet` case)
 
@@ -1036,7 +1036,10 @@ as a stop source of the program class and that a job it started ends with it, an
 phase has it start a job that oomd stops before memhog; both phases pass without it. With
 `sessiond.svc` staged, the `oom_policy` phase also opens an operator session whose shell runs
 `crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's `sessiond_operator` phase
-checks sessiond's operator interface; both pass without it.
+checks sessiond's operator interface; both pass without it. The `reserve-creator` fixture
+(`reserve-creator.svc`, `reserve = yes`) is co-staged beside `memhog` in both cells: svctest's
+`logd_reserve` phase has it make a `CREATE_FROM_FILE | CREATE_RESERVE` of `/programs/hello` while
+memhog holds memory critical, which must succeed, and skips that check without it.
 
 **Test isolation.** The functional harness boots run a controlled substrate:
 they drop the autostarted `terminal` (a user-facing program, not part of the
@@ -1108,7 +1111,7 @@ to the tiers below.
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, whatever the release's PRs touched (see Release host runs below) |
 
@@ -1123,7 +1126,7 @@ registry runs it on (its `md-test-cells` rule).
 
 | Cell | Tier | Architectures | Launch | Cases | Covers |
 |---|---|---|---|---|---|
-| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
+| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |

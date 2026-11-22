@@ -8,7 +8,10 @@
 //!
 //! [`Slots`] is a fixed table whose entries are named by a key of their slot
 //! and a generation, so a key goes stale once its entry is removed and never
-//! names the entry that next takes the slot. sessiond keeps its sessions and
+//! names the entry that next takes the slot. Each instance of sessiond seeds
+//! the generations from a random draw ([`Slots::seeded`]), so a key an earlier
+//! instance handed out names an entry of a later one only with a probability
+//! of about 2^-31. sessiond keeps its sessions and
 //! its interfaces in one each, sized at build time, so no table operation
 //! allocates. [`Key`] tells the two kinds of candidate key sessiond lists
 //! apart: a session's carries [`SESSION_KEY_BIT`], a verb bit no procmgr
@@ -79,6 +82,25 @@ impl<T, const N: usize> Default for Slots<T, N>
 
 impl<T, const N: usize> Slots<T, N>
 {
+    /// An empty table whose slots' generations start at values drawn from
+    /// `seed`, each slot's its own: sessiond passes a random draw, so the
+    /// keys of two instances, and so a stop source's keys across its
+    /// restarts, agree only by chance, about 2^-31 for a key
+    /// (`ipc::stop_labels`).
+    #[must_use]
+    pub fn seeded(seed: u64) -> Self
+    {
+        let mut slots = Self::default();
+        let mut state = seed;
+        for generation in &mut slots.generations
+        {
+            // The draw's high half, which fits a u32 whole.
+            let drawn = (splitmix64(&mut state) >> 32) as u32;
+            *generation = drawn & GENERATION_MASK;
+        }
+        slots
+    }
+
     /// Put `value` in the first free slot, under a generation that slot has
     /// not had since it was last emptied, and return its key; `None`, with
     /// `value` dropped, when every slot is taken.
@@ -164,6 +186,17 @@ impl<T, const N: usize> Slots<T, N>
         let generation = u32::try_from(key >> GENERATION_SHIFT).ok()? & GENERATION_MASK;
         (*self.generations.get(slot)? == generation).then_some(slot)
     }
+}
+
+/// The next value of the `SplitMix64` sequence `state` steps: a bijective mix
+/// of a counter, so every slot of a seeded table draws its own value.
+const fn splitmix64(state: &mut u64) -> u64
+{
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// The slot of a key: the low 32 bits.
@@ -424,5 +457,40 @@ mod tests
         assert_eq!(session_name(0, &mut buf), b"session 0");
         assert_eq!(session_name(15, &mut buf), b"session 15");
         assert_eq!(session_name(u32::MAX, &mut buf), b"session 4294967295");
+    }
+    // The defect caught: every sessiond instance starting each slot at the
+    // same generation, so a stop source's key a stopper read from one
+    // instance names the session a restarted instance opened in that slot,
+    // and the stop ends a session the stopper never listed.
+    #[test]
+    fn two_instances_seeded_differently_give_different_first_keys()
+    {
+        let mut first: Slots<u8, 4> = Slots::seeded(0x1234_5678_9ABC_DEF0);
+        let mut second: Slots<u8, 4> = Slots::seeded(0x0FED_CBA9_8765_4321);
+        let mut again: Slots<u8, 4> = Slots::seeded(0x1234_5678_9ABC_DEF0);
+        for _ in 0..4
+        {
+            let key = first.insert(1).expect("a slot is free");
+            let other = second.insert(1).expect("a slot is free");
+            assert_ne!(key, other);
+            assert_eq!(second.get(key), None);
+            assert_eq!(first.get(other), None);
+            assert_eq!(again.insert(1), Some(key));
+            assert_ne!(key & SESSION_KEY_BIT, 0);
+        }
+        // The slots of one table draw their own generations.
+        let keys: Vec<u64> = first
+            .iter()
+            .map(|(key, _)| key >> GENERATION_SHIFT)
+            .collect();
+        let mut distinct = keys.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), keys.len());
+        // A seeded table's key goes stale on removal as any other.
+        let key = first.key_at(0).expect("slot 0 is taken");
+        assert_eq!(first.remove(key), Some(1));
+        assert_eq!(first.get(key), None);
+        assert_ne!(first.insert(2), Some(key));
     }
 }

@@ -241,10 +241,13 @@ the one class, and sessiond its one source.
   the stop bit; and with `restart = never`, since svcmgr lists only a source it supervises.
 - **Protocol.** Every source serves the same two labels, from one shared label module: a paged list
   of its candidates, each with a key, a rank, a name and the pages of its subtree; and the stop of
-  one candidate, named by its key. A key names one candidate and no other while the source runs;
-  the stop of a candidate that is gone is refused and changes nothing. The source stops through the
-  handles it holds, and oomd holds no process handle. svcmgr serves the shared labels for the
-  service class, a service's key naming its table slot and instance.
+  one candidate, named by its key. A key names one candidate and no other across the source's
+  instances, since the endpoint persists across its restarts and a stopper can hold a listed key
+  past one: each instance draws its keys from a value of its own, so a key an earlier instance
+  handed out names a candidate of a later one with a probability of at most about 2^-31; the stop of
+  a candidate that is gone is refused and changes nothing. The source stops through the handles it
+  holds, and oomd holds no process handle. svcmgr serves the shared labels for the service class, a
+  service's key naming its table slot and instance.
 - **sessiond's candidates.** Each job, ranked job, with the subtree pages procmgr's child list
   gives; and each session, ranked session, with its node's subtree pages. The stop of a job
   destroys that child of the leader with its subtree, and the shell, its creator, sees it end

@@ -7,7 +7,8 @@
 //! the `_OSC` grant of native control of the PCI Express features, the
 //! windows its `_CRS` decodes, and the interrupt routes of its root bus that
 //! its `_PRT` gives, each in the form devmgr's `OSC_RESULT`,
-//! `BRIDGE_WINDOWS` and `PRT_TABLE` carry.
+//! `BRIDGE_WINDOWS` and `PRT_TABLE` carry; and the PCI-to-PCI bridges below
+//! them that have a `_PRT` of their own, whose routes `PRT_TABLE` carries too.
 
 use aml::namespace::NodeId;
 use aml::resource::{self, Resource};
@@ -15,6 +16,7 @@ use aml::value::Base;
 use aml::{Data, Evaluator};
 use ipc::devmgr_labels;
 
+use crate::hotplug::{self, Route, Unresolved};
 use crate::{Failure, Why, child};
 
 /// The EISA id of a PCI host bridge, `PNP0A03`, as a `_HID` integer holds it.
@@ -139,6 +141,54 @@ pub fn host_bridges(ev: &mut Evaluator<'_>, present: &[NodeId]) -> (Vec<Bridge>,
     }
     bridges.sort_by_key(|b| (b.segment, b.bus));
     (bridges, failures)
+}
+
+/// A PCI-to-PCI bridge below a host bridge that the namespace gives a
+/// `_PRT` of its own, which routes the interrupts of the functions below it
+/// (ACPI 6.5 § 6.2.13).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PciBridge
+{
+    /// The bridge's device.
+    pub node: NodeId,
+    /// The way to it from its host bridge's root bus, it last.
+    pub route: Route,
+}
+
+/// The PCI-to-PCI bridges among the devices `present` that have a `_PRT`,
+/// each below one of `bridges` through PCI devices
+/// ([`hotplug::bridge_route`]), the deepest first; and the evaluations that
+/// failed on the way, an `_ADR` of the bridge or of a device above it
+/// recorded against the bridge. A device with a `_PRT` that is a host
+/// bridge, or that is not below one through devices with an `_ADR`, is none.
+pub fn pci_bridges(
+    ev: &mut Evaluator<'_>,
+    bridges: &[Bridge],
+    present: &[NodeId],
+) -> (Vec<PciBridge>, Vec<Failure>)
+{
+    let mut found = Vec::new();
+    let mut failures = Vec::new();
+    for &node in present
+    {
+        if bridges.iter().any(|b| b.node == node) || child(ev.namespace(), node, *b"_PRT").is_none()
+        {
+            continue;
+        }
+        match hotplug::bridge_route(ev, bridges, node)
+        {
+            Ok(route) => found.push(PciBridge { node, route }),
+            Err(Unresolved::Address(why)) => failures.push(Failure {
+                node,
+                name: *b"_ADR",
+                why,
+            }),
+            Err(Unresolved::NotPci | Unresolved::RootBus | Unresolved::NoBridge) =>
+            {}
+        }
+    }
+    found.sort_by_key(|b| core::cmp::Reverse(b.route.hops.len()));
+    (found, failures)
 }
 
 /// The value of the child `name` of `node` as a `T`, 0 when it is absent;
@@ -304,7 +354,8 @@ pub fn windows(ev: &mut Evaluator<'_>, bridge: NodeId) -> Result<Option<Vec<Wind
     Ok(Some(windows))
 }
 
-/// The routes of a host bridge's root bus, in `PRT_TABLE`'s form.
+/// The routes of a bus, a host bridge's root bus or a PCI-to-PCI bridge's
+/// secondary bus, in `PRT_TABLE`'s form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Routes
 {
@@ -751,6 +802,56 @@ mod tests
                 assert_eq!(lane(&routes, device, pin), expected, "{device}/{pin}");
             }
         }
+    }
+
+    #[test]
+    fn the_pci_to_pci_bridges_with_a_prt_are_found_below_the_host_bridges_deepest_first()
+    {
+        let hid = name(b"_HID", &dword(PCI_EXPRESS_HOST_BRIDGE));
+        let adr = |a: u32| name(b"_ADR", &dword(a));
+        let prt = name(b"_PRT", &package(&[]));
+        // Root port RP01 (00:1c.0) with a _PRT; below it a switch's upstream
+        // port SW00 without one, and below that a downstream port DN01 at
+        // device 1 with one. Root port RP02 (00:1c.1) without one. A device
+        // with a _PRT outside any host bridge, and one below the host bridge
+        // with no _ADR.
+        let dn01 = device(b"DN01", &[adr(0x0001_0000), prt.clone()].concat());
+        let sw00 = device(b"SW00", &[adr(0), dn01].concat());
+        let rp01 = device(b"RP01", &[adr(0x001C_0000), prt.clone(), sw00].concat());
+        let rp02 = device(b"RP02", &adr(0x001C_0001));
+        let noad = device(b"NOAD", &prt);
+        let body = [
+            device(
+                &sb(*b"PCI0"),
+                &[hid, prt.clone(), rp01, rp02, noad].concat(),
+            ),
+            device(&sb(*b"OUT_"), &prt),
+        ]
+        .concat();
+        let mut ns = sim::namespace(&[sim::table(&body)]);
+        let mut host = Sim::new();
+        let mut ev = Evaluator::new(&mut ns, &mut host);
+        let bridge = only_bridge(&mut ev);
+        let all: Vec<NodeId> = ev.namespace().nodes().collect();
+        let (found, failures) = pci_bridges(&mut ev, &[bridge], &all);
+        assert_eq!(failures, []);
+        let ns = ev.namespace();
+        let found: Vec<(Seg, Route)> = found
+            .into_iter()
+            .map(|b| (ns.name(b.node).unwrap(), b.route))
+            .collect();
+        let route = |hops: Vec<(u8, u8)>| Route {
+            segment: 0,
+            bus: 0,
+            hops,
+        };
+        assert_eq!(
+            found,
+            [
+                (*b"DN01", route(vec![(0x1C, 0), (0, 0), (1, 0)])),
+                (*b"RP01", route(vec![(0x1C, 0)])),
+            ]
+        );
     }
 
     #[test]

@@ -8,10 +8,12 @@
 //!
 //! pwrmgr is a svcmgr-launched provider. It owns the shutdown policy: on
 //! x86-64 it reaches the ACPI sleep and reset registers through acpid, which
-//! runs the AML and holds the FADT's register blocks, and holds one port
-//! block of its own, for the core-death power-off below; on RISC-V it drives
-//! SBI SRST through a `SbiControl` derivation it acquires from devmgr at
-//! startup. svcmgr
+//! runs the AML and holds the FADT's register blocks, and holds one register
+//! of its own, for the core-death power-off below: `PM1a_CNT`'s port block
+//! or, on a hardware-reduced platform, `SLEEP_CONTROL_REG`, either a port it
+//! binds or a page it maps into its address space for its whole life; on
+//! RISC-V it drives SBI SRST through a `SbiControl` derivation it acquires
+//! from devmgr at startup. svcmgr
 //! publishes a `SHUTDOWN_AUTHORITY`-badged SEND (`pwrmgr.shutdown`) and its
 //! no-auth twin (`pwrmgr.deny`) on pwrmgr's service endpoint; the recipes
 //! that seed `pwrmgr.shutdown` hold the authority, and svcmgr calls it as

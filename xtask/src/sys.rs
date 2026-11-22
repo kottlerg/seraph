@@ -16,11 +16,11 @@
 //! call its C library with a value that may be wrong there.
 
 /// The Unix C library: `signal(2)`, `fcntl(2)`, the terminal attribute and
-/// window-size calls, and `getloadavg(3)`.
+/// window-size calls, `getloadavg(3)`, and `access(2)`.
 #[cfg(unix)]
 pub mod unix
 {
-    use std::ffi::{c_double, c_int};
+    use std::ffi::{c_char, c_double, c_int};
 
     #[cfg(not(any(
         target_os = "linux",
@@ -251,7 +251,16 @@ pub mod unix
         /// `getloadavg(3)`: writes up to `nelem` (at most 3) load
         /// averages to `loadavg` and returns how many it wrote, or -1.
         pub fn getloadavg(loadavg: *mut c_double, nelem: c_int) -> c_int;
+
+        /// `access(2)`: 0 when the calling process may access the file at
+        /// `path`, a NUL-terminated string, as `mode` ([`X_OK`]) asks, as
+        /// the kernel decides it for the process's ids and groups; else -1.
+        pub fn access(path: *const c_char, mode: c_int) -> c_int;
     }
+
+    /// `X_OK`: [`access`]'s test for permission to execute; 1 on every host
+    /// this module names.
+    pub const X_OK: c_int = 1;
 }
 
 /// The Windows API: `SetConsoleCtrlHandler` and the console-mode calls.

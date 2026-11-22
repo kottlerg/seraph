@@ -2883,11 +2883,7 @@ fn create_child(
     let argv_env = match child_argv_env(ctx, &request, source.as_ref(), mms.cap(), ipc_buf)
     {
         Ok(argv_env) => argv_env,
-        Err(e) =>
-        {
-            process::settle_failed_argv_env(mms, e);
-            return Err(e.code());
-        }
+        Err(e) => return Err(refuse_argv_env(source, mms, e)),
     };
 
     // Declared after `mms`, so on every exit the buffer drops first: its
@@ -2980,6 +2976,21 @@ fn create_child(
         return Err(code);
     }
     result
+}
+
+/// Settle a create whose argv and env could not be taken (`e`) and return
+/// its reply code. A restore's window `source` is on the child's account:
+/// it goes back to memmgr, on the registration's SEND, before the
+/// registration `mms` settles and that SEND is deleted.
+fn refuse_argv_env(
+    source: Option<restore::Source>,
+    mms: process::MemmgrSendGuard,
+    e: process::ArgvEnvCopyError,
+) -> u64
+{
+    drop(source);
+    process::settle_failed_argv_env(mms, e);
+    e.code()
 }
 
 /// The child's argv and env, on its account at `child_memmgr`: a restored

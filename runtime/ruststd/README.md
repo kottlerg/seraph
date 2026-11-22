@@ -90,6 +90,7 @@ pager and the image is `ET_DYN`, registers the main-thread stack's demand-growth
 ([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). Last it runs the
 rustc-synthesised `main`, which drives `std::rt::lang_start` and the binary's idiomatic
 `fn main()`; when `main` returns, `_start` sends `FS_CLOSE` for every `std::fs::File` still open,
+and for every open of a `File` dropped past its thread's call deadline (§ Call deadline),
 closes the stdio pipes, and exits the process with its return code. `std::process::exit` runs
 the same two steps before its exit syscall, so the fs driver drops the opens, and the release
 SENDs they hold, of `File`s the process never drops
@@ -513,10 +514,15 @@ driver's endpoint, which frees every cap derived from it in every
 ([`services/vfsd/docs/vfs-ipc-interface.md`](../../services/vfsd/docs/vfs-ipc-interface.md)
 § Label 11). A `std::fs` call whose IPC fails on a cap that `cap_info`
 then finds empty (an open `File`, a `ReadDir`, or a relative path
-through the cwd cap) returns
+through the cwd cap), or whose session lookup (§ Filesystem sessions)
+finds the walked node cap's slot empty, returns
 `ErrorKind::StaleNetworkFileHandle`; the caller resolves the path again,
-and a cwd under the mount is replaced with `set_current_dir`. A call that
-fails on a cap still live returns `ErrorKind::Other`.
+and a cwd under the mount is replaced with `set_current_dir`. A call on a
+cap still live returns `StaleNetworkFileHandle` too when no thread can
+receive on the server's endpoint again (`NoReceiver`: the server is gone),
+`ErrorKind::TimedOut` when the thread's call deadline passed first
+(§ Call deadline), and `ErrorKind::Other` for any other failure of the
+call.
 
 The cap-as-namespace model that defines this surface lives in
 [`docs/namespace-model.md`](../../docs/namespace-model.md); the wire
@@ -562,7 +568,9 @@ only in a session, which names that node
   driver's endpoint (`SYS_ENDPOINT_IDENTIFY`). The first match is the node's session. A key whose
   own inquiry fails is dead (vfsd's `UNMOUNT` revokes the driver's endpoint, and every session cap
   with it), and its entry is ended and removed. A failure with a live key is the node cap's, and
-  the open fails with it. The `ruststd-fs-sessions` crate holds this decision.
+  the open fails with it: `StaleNetworkFileHandle` when the node cap's slot is empty, as the
+  `FS_SESSION` on it would fail with no live key (§ Namespace capabilities), `Other` otherwise.
+  The `ruststd-fs-sessions` crate holds this decision.
 - **Start.** No match starts a session: a sub-node of the process's node (`CREATE_SUB_NODE`), a
   charge-only handle to it (`NODE_CHARGE_HANDLE`) moved to the driver in `FS_SESSION` on the node
   cap, and the reply's session cap and liveness cap, kept with the sub-node's handle. It runs with
@@ -792,8 +800,13 @@ does not trust to answer, as crashd bounds a fault's report and a core dump
   the log. Such a call may have reached its server, which may have acted on it, and whose reply
   then finds no caller. A spawn's wait for its child's bootstrap requests (§ Bootstrap caps), which
   is a receive, ends at the deadline too, and fails the spawn `TimedOut`. A `File` dropped past
-  the deadline sends no `FS_CLOSE`; that open stays in the process's session with its driver,
-  its records charged to the process's node, until the session ends with the process
+  the deadline sends no `FS_CLOSE`: the session table keeps its open cap, and the process's next
+  `File::open`, or its exit hook, sends the close within a bound of its own for the whole drain
+  (`KEPT_CLOSE_DRAIN`) and that thread's deadline, whichever ends first, so a thread with no
+  deadline does not wait without limit on a driver that did not answer; a close the bound stops
+  stays kept. Until then the
+  open stays in the process's session with its driver, its records charged to the process's node,
+  and counts as an open `File` for a quiesce point (§ Checkpoint)
   ([Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md) § Label 23:
   `FS_SESSION`).
 - **Not bounded.** The calls to memmgr (the heap, the stacks, the registration of demand-paged
@@ -922,11 +935,14 @@ signals no more.
   endpoint as the account the checkpoint is charged to, and returns a `Checkpoint`: the object's
   pages, whether the capture is complete, and its handle, which `handle` lends, `into_raw` hands
   over and a drop releases (`OBJECT_RELEASE`, made again while a stop interrupts it, since nothing
-  else releases it). A process at no quiesce point is refused `ResourceBusy`, and one procmgr
-  could not mark (`NOT_RESTORABLE`) `Unsupported`.
-- `CommandExt::restore(object)` makes a `Command` spawn a restore of the checkpoint whose handle
-  `object` is (`CREATE_RESTORE`): the spawn sends a copy of the handle, which procmgr deletes, and
-  no argv or env, since the restored process has its checkpoint's. procmgr refuses a pinned
+  else releases it). A process at no quiesce point is refused `ResourceBusy`, one whose space
+  another capture holds (`SPACE_HELD`, which the caller may ask again on) `WouldBlock`, and one
+  procmgr could not mark (`NOT_RESTORABLE`) `Unsupported`.
+- `CommandExt::restore(object)` makes the next spawn of a `Command` a restore of the checkpoint
+  whose handle `object` is (`CREATE_RESTORE`): the spawn sends a copy of the handle, which procmgr
+  deletes, and no argv or env, since the restored process has its checkpoint's. That spawn takes
+  the setting whatever its outcome, so a later spawn of the `Command` creates the child from its
+  binary unless `restore` is called again. procmgr refuses a pinned
   restore (`InvalidInput`), a handle memmgr does not take (`InvalidInput`), and an object that is
   no checkpoint of the binary (`Unsupported`).
 

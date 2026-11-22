@@ -635,8 +635,11 @@ fn spec_ctrl_values(controls: Controls) -> (u64, u64)
 /// selected controls, a warning when `VERW` is selected on a CPU that does not
 /// enumerate that it clears the buffers, and one line for each class the table
 /// gives kernel action that the selection leaves vulnerable ([`vulnerable`]).
+///
+/// # Safety
+/// As `super::vulnerability::sbpb_probe`, which an `amd` override runs.
 #[cfg(not(test))]
-pub fn report(cpu: &CpuEnumeration, inputs: Inputs, controls: Controls)
+pub unsafe fn report(cpu: &CpuEnumeration, inputs: Inputs, controls: Controls)
 {
     match FORCED_RETURN
     {
@@ -649,7 +652,8 @@ pub fn report(cpu: &CpuEnumeration, inputs: Inputs, controls: Controls)
         ForcedReturn::Amd => crate::kprintln!(
             "x86 mitigations: inputs forced (SERAPH_FORCE_RETURN_MITIGATION=amd): \
              retbleed, spec_rstack_overflow, no rsb_alternate; SBPB probe {}",
-            if super::vulnerability::sbpb_probe()
+            // SAFETY: the caller's contract is `sbpb_probe`'s.
+            if unsafe { super::vulnerability::sbpb_probe() }
             {
                 "accepted"
             }
@@ -897,7 +901,8 @@ static DE_CFG_LOGGED: AtomicBool = AtomicBool::new(false);
 pub unsafe fn apply_this_cpu()
 {
     let controls = selected();
-    let cpu = super::vulnerability::enumerate();
+    // SAFETY: the caller's contract, which is `sbpb_probe`'s.
+    let cpu = unsafe { super::vulnerability::enumerate() };
     if let Some(message) = missing_msr_control(
         controls,
         Inputs::of(&cpu, &super::vulnerability::derive(&cpu)),
@@ -1226,7 +1231,10 @@ pub(super) use ibpb_asm;
 // plain jump on a part that needs the sequence.
 //
 // `seraph_enter_from_user` runs on every entry from user mode, before any
-// indirect branch and any `ret` that its own `call` did not pair. With IBRS on
+// indirect branch and any `ret` that its own `call` did not pair, and after
+// the entry's `cld`, `clac` and swap to the kernel GS base: every caller, the
+// paranoid stubs included, makes those first, so the routine may read per-CPU
+// (`gs:`) memory and use string instructions as other kernel code does. With IBRS on
 // entry selected it first writes the kernel's `IA32_SPEC_CTRL` value, `IBRS`
 // set, so the predictions user mode trained steer no later indirect branch or
 // `ret` (Intel's RSBU guidance). With the IBPB on entry selected it then

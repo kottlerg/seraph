@@ -235,8 +235,10 @@ For each matched device, devmgr:
    firmware-programmed IRQ line, else the arch `INTx` fallback for the pin
    and device number its interrupt reaches the root bus with, the pin
    swizzled at each bridge between, PCI-to-PCI Bridge Architecture
-   Specification § 9.1; on x86-64 the line the host bridge's PIC-model
-   `_PRT` table routes there, on riscv64 the `virt` swizzle). The first
+   Specification § 9.1; on x86-64 the line the PIC-model `_PRT` table
+   routes there of the nearest PCI-to-PCI bridge above it that has one,
+   reached at that bridge's secondary bus, or of the host bridge, on
+   riscv64 the `virt` swizzle). The first
    time any device asks for a GSI, devmgr splits the line's cap off its
    Interrupt range cap and routes the line through it (`SYS_IRQ_ROUTE`, in
    the line's mode, below); the lines below and above it stay in devmgr's

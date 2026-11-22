@@ -2025,7 +2025,8 @@ pub fn aspace_query(aspace_cap: u64, virt: u64) -> Result<u64, i64>
 }
 
 /// Read and clear the accessed bit of each mapped page of the `pages` pages
-/// from `virt` in an address space, writing one bit per page into `bitmap`:
+/// from `virt`, at or above `USER_VA_FLOOR`, in an address space, writing one
+/// bit per page into `bitmap`:
 /// page `i` is bit `i % 8` of `bitmap[i / 8]`, set when the page was accessed
 /// (or mapped, or its rights changed) since its previous harvest, and clear
 /// when it was not or is unmapped. Bytes past `pages.div_ceil(8)` are left as
@@ -2039,9 +2040,10 @@ pub fn aspace_query(aspace_cap: u64, virt: u64) -> Result<u64, i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidArgument` (`pages` zero or
-/// above `MAX_HARVEST_PAGES`, or `bitmap` shorter than `pages.div_ceil(8)`
-/// bytes), `InvalidAddress` (`virt` unaligned or the range outside the user
-/// half), `InvalidCapability`, or `InsufficientRights` (cap lacks MAP).
+/// above `MAX_HARVEST_PAGES`, the range's end overflows, or `bitmap` shorter
+/// than `pages.div_ceil(8)` bytes), `InvalidAddress` (`virt` unaligned or
+/// below `USER_VA_FLOOR`, or the range leaves the user half),
+/// `InvalidCapability`, or `InsufficientRights` (cap lacks MAP).
 #[inline]
 pub fn aspace_harvest(aspace_cap: u64, virt: u64, pages: u64, bitmap: &mut [u8])
 -> Result<u64, i64>

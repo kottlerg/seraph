@@ -16,7 +16,7 @@ pub const SUCCESS: u64 = 0;
 pub const INVALID_REQUEST: u64 = 1;
 /// Caller's badge lacks what the handler requires: an authority bit
 /// (e.g. `CLASS_AUTHORITY` for `MINT_CLASS_SEND`), or, for
-/// `QUERY_DEVICE` and `WATCH_CLASS`, a class slot
+/// `QUERY_DEVICE`, `WATCH_CLASS` and `DECLINE_RESTART`, a class slot
 /// (`devmgr_labels::class_badge`).
 pub const UNAUTHORIZED: u64 = 2;
 /// Caller's compiled `DEVMGR_LABELS_VERSION`, carried in `data[0]` of

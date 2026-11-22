@@ -14,7 +14,8 @@
 //! diagnostics and panic output to the serial driver, in the README's
 //! § Role and `docs/console-model.md`. `main` follows that order: the
 //! core-path declaration (`procmgr_labels::DECLARE_NO_CORE`), bootstrap
-//! caps, the serial sink and panic sink, the dropped `log_send_cap`, the
+//! caps, the panic sink, the dropped `log_send_cap`, the output drivers'
+//! class watches and resolution (the serial sink a halt writes to), the
 //! death EQ and its registration, the wait set, the receive pool's workers
 //! (spawned behind its gate, `services/logd/docs/ipc-interface.md`
 //! § Receive pool), the output sinks' writer threads ([`Sink`]), the handover
@@ -163,6 +164,19 @@ fn main() -> !
     std::os::seraph::set_panic_sink(panic_to_serial);
     let _ = syscall::cap_delete(startup.log_send_cap);
 
+    // Register the serial and framebuffer class watches and resolve both
+    // drivers through devmgr first: a halt on any later step writes its
+    // `FATAL` line and the held self-log lines, and the panic sink its
+    // output, only to a resolved serial driver. This runs while init-logd
+    // still drains the log endpoint: after the release the endpoint has no
+    // reader until the receive pool's gate opens, and devmgr may then be
+    // logging (`services/devmgr/docs/responsibilities.md`, the on-disk
+    // settle). Until a driver is resolved its sink queues the lines, up to
+    // its queue, counts those past it, and writes both to the driver resolved
+    // next (`Sink::offer`), while history still accrues; the main thread
+    // resolves it again when devmgr signals its class's watch.
+    let watches = resolve_output_drivers(caps.serial_class, caps.fb_class, ipc_buf);
+
     let mut table = SlotTable::default();
 
     // Set up the death-notification queue + wait set and register with procmgr
@@ -182,16 +196,6 @@ fn main() -> !
         syscall::thread_exit();
     };
     register_with_procmgr(caps.procmgr_death_auth_send, death_eq, ipc_buf);
-    // Register the serial and framebuffer class watches and resolve both
-    // drivers through devmgr now, while init-logd still drains the log
-    // endpoint: after the release the endpoint has no reader until the
-    // receive pool's gate opens, and devmgr may then be logging
-    // (`services/devmgr/docs/responsibilities.md`, the on-disk settle).
-    // Until a driver is resolved its sink queues the lines, up to its queue,
-    // counts those past it, and writes both to the driver resolved next
-    // (`Sink::offer`), while history still accrues; the main thread
-    // resolves it again when devmgr signals its class's watch.
-    let watches = resolve_output_drivers(caps.serial_class, caps.fb_class, ipc_buf);
     let Some(resync_note) = create_resync_note()
     else
     {
@@ -1892,10 +1896,13 @@ fn self_log(payload: &str)
 
 /// Most self-log lines [`SELF_LOG_HOLD`] keeps until init-logd stops writing
 /// the UART. A line past it is dropped and counted, and [`open_self_log`]
-/// reports the count in one line. A tuning value: logd self-logs at most
-/// three lines before the release (the death-EQ registration's outcome, a
-/// failed wait-set step, and the start of the pull).
-const SELF_LOG_HELD_MAX: usize = 8;
+/// reports the count in one line. A tuning value: logd self-logs at most nine
+/// lines before the release on a start that does not halt (a refused class
+/// watch of each output driver, the death-EQ registration's outcome, a failed
+/// wait-set add of each watch, a partial receive pool, a failed writer spawn
+/// of each sink, and the start of the pull), and a halt writes the held lines
+/// before its own.
+const SELF_LOG_HELD_MAX: usize = 12;
 
 /// One self-log line: when it was logged, and its text.
 struct HeldLine

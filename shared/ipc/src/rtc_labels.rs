@@ -29,11 +29,13 @@
 //! hardware authority cap (ISA `IoPort` for CMOS; MMIO aperture for
 //! goldfish-rtc) through the bootstrap protocol. An `rtc`
 //! [`devmgr_labels::QUERY_DEVICE`](crate::devmgr_labels::QUERY_DEVICE) that would find no driver waits until
-//! the pass and its settle are done. Each spawn is attempted at most once
-//! per boot, apart from devmgr's restart of a served driver that dies, which
+//! the pass and its settle are done. Each spawn is attempted once per boot,
+//! with two exceptions: devmgr's restart of a served driver that dies, which
 //! it serves at the class's next ordinal
-//! (`services/devmgr/docs/responsibilities.md` § Driver Restart): the RTC
-//! at ordinal 0 need not last the boot. A client finds the RTC as it finds
+//! (`services/devmgr/docs/responsibilities.md` § Driver Restart), and its
+//! bounded retry of a create procmgr refused with `IO_ERROR` or
+//! `OUT_OF_MEMORY` (§ Create retry there), so the RTC at ordinal 0 need not
+//! last the boot, and a first create's failure need not be final. A client finds the RTC as it finds
 //! any driver of its class, by probing the ordinals
 //! ([`first_device`](crate::first_device)): the ordinal of a driver that died replies
 //! [`devmgr_errors::WITHDRAWN`](crate::devmgr_errors::WITHDRAWN), and an

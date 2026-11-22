@@ -29,7 +29,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -159,7 +159,7 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
     staged?;
     let session = booted.context("the boot did not run")??;
     expect(&session.gdb)?;
-    expect_restored(session.detached.as_deref())?;
+    expect_restored(&session.detached?)?;
     session.restarted.context("the restart round")?;
     step(
         "gdb stub test: PASS (step from the attach stop, break, memory and register write, step, \
@@ -173,9 +173,9 @@ struct Session
 {
     /// GDB's output.
     gdb: String,
-    /// The stub's [`DETACHED_MARKER`] line, when it appeared within
+    /// The stub's [`DETACHED_MARKER`] line, or why it did not appear within
     /// [`DETACH_TIMEOUT`] of GDB's exit.
-    detached: Option<String>,
+    detached: Result<String>,
     /// The restart round's outcome.
     restarted: Result<()>,
 }
@@ -253,38 +253,73 @@ fn boot(ctx: &Context, args: &CaseArgs, gdb: &Path, layout: DiskLayout) -> Resul
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     let (tx, rx) = mpsc::channel::<Serial>();
     let reader = thread::spawn(move || forward_serial(stdout, &tx));
+    let mut guest = GuestSerial {
+        rx: &rx,
+        child: &mut child,
+        stderr: stderr.as_mut(),
+    };
     let mut bias = None;
     let ready = loop
     {
-        match rx.recv_timeout(BOOT_TIMEOUT)
+        match guest.next(BOOT_TIMEOUT, &format!("the stub's {READY_MARKER:?} line"))
         {
-            Ok(Serial::Ready) => break Ok(()),
-            Ok(Serial::DriverBias(b)) => bias = bias.or(Some(b)),
-            Ok(Serial::Detached(_) | Serial::Followed) =>
+            Ok(Some(Serial::Ready)) => break Ok(()),
+            Ok(Some(Serial::DriverBias(b))) => bias = bias.or(Some(b)),
+            Ok(Some(Serial::Detached(_) | Serial::Followed)) =>
             {}
-            Err(mpsc::RecvTimeoutError::Timeout) =>
+            Ok(None) =>
             {
                 break Err(crate::error::err!(
                     "the stub's {READY_MARKER:?} line did not appear within {}s",
                     BOOT_TIMEOUT.as_secs()
                 ));
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) =>
-            {
-                let err = crate::error::err!(
-                    "the serial stream ended before the stub's {READY_MARKER:?} line"
-                );
-                break Err(explain_exit(err, &mut child, stderr.as_mut()));
-            }
+            Err(err) => break Err(err),
         }
     };
     let result = ready
         .and_then(|()| run_gdb(gdb, args.arch, port, &binary))
-        .map(|output| after_gdb(output, args.arch, port, &gdb_sock, bias, &driver, &rx));
+        .map(|output| {
+            after_gdb(
+                output, args.arch, port, &gdb_sock, bias, &driver, &mut guest,
+            )
+        });
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
     result
+}
+
+/// The lines of the guest's serial output the test waits on, with the QEMU
+/// that writes them, so a stream that ends, QEMU having exited, is reported
+/// with QEMU's exit status and stderr rather than as a line that did not
+/// appear.
+struct GuestSerial<'a>
+{
+    rx: &'a mpsc::Receiver<Serial>,
+    child: &'a mut Child,
+    stderr: Option<&'a mut QemuStderr>,
+}
+
+impl GuestSerial<'_>
+{
+    /// The next line within `timeout`, `None` when none came.
+    ///
+    /// # Errors
+    /// When the stream ended before `what`, explained by QEMU's exit.
+    fn next(&mut self, timeout: Duration, what: &str) -> Result<Option<Serial>>
+    {
+        match self.rx.recv_timeout(timeout)
+        {
+            Ok(line) => Ok(Some(line)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(explain_exit(
+                crate::error::err!("the serial stream ended before {what}"),
+                self.child,
+                self.stderr.as_deref_mut(),
+            )),
+        }
+    }
 }
 
 /// Echo the guest's serial output, and send `tx` each line the test waits
@@ -333,24 +368,31 @@ fn after_gdb(
     gdb_sock: &Path,
     bias: Option<u64>,
     driver: &breakpoint_kill::Function,
-    rx: &mpsc::Receiver<Serial>,
+    guest: &mut GuestSerial<'_>,
 ) -> Session
 {
     let detached = loop
     {
-        match rx.recv_timeout(DETACH_TIMEOUT)
+        match guest.next(DETACH_TIMEOUT, "the stub's detach line")
         {
-            Ok(Serial::Detached(line)) => break Some(line),
-            Ok(Serial::Ready | Serial::DriverBias(_) | Serial::Followed) =>
+            Ok(Some(Serial::Detached(line))) => break Ok(line),
+            Ok(Some(Serial::Ready | Serial::DriverBias(_) | Serial::Followed)) =>
             {}
-            Err(_) => break None,
+            Ok(None) =>
+            {
+                break Err(crate::error::err!(
+                    "the stub's detach line did not appear within {}s",
+                    DETACH_TIMEOUT.as_secs()
+                ));
+            }
+            Err(err) => break Err(err),
         }
     };
     let restarted = bias
         .with_context(|| {
             format!("no procmgr bias line for {PORT_DRIVER_NAME} before the stub's READY")
         })
-        .and_then(|bias| restart_round(arch, port, gdb_sock, bias, driver, rx));
+        .and_then(|bias| restart_round(arch, port, gdb_sock, bias, driver, guest));
     Session {
         gdb: output,
         detached,
@@ -370,7 +412,7 @@ fn restart_round(
     gdb_sock: &Path,
     bias: u64,
     driver: &breakpoint_kill::Function,
-    rx: &mpsc::Receiver<Serial>,
+    guest: &mut GuestSerial<'_>,
 ) -> Result<()>
 {
     let mut stub = Stub::connect_tcp(&format!("127.0.0.1:{port}"), RESTART_ANSWER_TIMEOUT)?;
@@ -385,12 +427,15 @@ fn restart_round(
         .context("the restart's deadline")?;
     loop
     {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        match guest.next(
+            deadline.saturating_duration_since(Instant::now()),
+            &format!("the stub's {FOLLOWED_MARKER:?} line"),
+        )?
         {
-            Ok(Serial::Followed) => break,
-            Ok(Serial::Ready | Serial::Detached(_) | Serial::DriverBias(_)) =>
+            Some(Serial::Followed) => break,
+            Some(Serial::Ready | Serial::Detached(_) | Serial::DriverBias(_)) =>
             {}
-            Err(_) => bail!(
+            None => bail!(
                 "the stub's {FOLLOWED_MARKER:?} did not appear within {}s of the kill",
                 RESTART_TIMEOUT.as_secs()
             ),
@@ -552,17 +597,13 @@ fn expect(output: &str) -> Result<()>
 
 /// Check the stub's detach line: procmgr took the target's crash bindings
 /// back.
-fn expect_restored(line: Option<&str>) -> Result<()>
+fn expect_restored(line: &str) -> Result<()>
 {
-    match line
+    if !line.contains(&format!("{DETACHED_MARKER}true)"))
     {
-        Some(l) if l.contains(&format!("{DETACHED_MARKER}true)")) => Ok(()),
-        Some(l) => bail!("the stub detached without restoring the crash bindings: {l}"),
-        None => bail!(
-            "the stub's detach line did not appear within {}s",
-            DETACH_TIMEOUT.as_secs()
-        ),
+        bail!("the stub detached without restoring the crash bindings: {line}");
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -598,14 +639,48 @@ mod tests
         assert!(expect(&good.replace("2    Thread 2   0x9 in f ()", "")).is_err());
     }
 
+    // Defect caught: a serial stream that ended in one of the case's waits,
+    // QEMU having exited, reported as a line that did not appear within a
+    // timeout that never elapsed, without QEMU's exit status and stderr.
+    #[test]
+    fn a_stream_that_ends_is_reported_with_the_exit_of_qemu()
+    {
+        let mut child = Command::new("sh")
+            .args(["-c", "echo 'gdbstub: Disconnected' >&2; exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stderr = QemuStderr::take(&mut child);
+        let (tx, rx) = mpsc::channel::<Serial>();
+        drop(tx);
+        let mut guest = GuestSerial {
+            rx: &rx,
+            child: &mut child,
+            stderr: stderr.as_mut(),
+        };
+        let Err(err) = guest.next(Duration::from_secs(60), "the stub's detach line")
+        else
+        {
+            panic!("a stream that ended was read as a line");
+        };
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("ended before the stub's detach line"),
+            "{report}"
+        );
+        assert!(report.contains("exit status: 3"), "{report}");
+        assert!(report.contains("gdbstub: Disconnected"), "{report}");
+    }
+
     // Defect caught: a detach that left the target's crash bindings with the
-    // stub, or no detach line at all, passing the test.
+    // stub passing the test.
     #[test]
     fn a_detach_without_the_restored_bindings_fails_the_check()
     {
         let line = "$ [1.7] [gdbstub] detached from gdb-target (crash bindings restored: true)";
-        expect_restored(Some(line)).unwrap();
-        assert!(expect_restored(Some(&line.replace("true", "false"))).is_err());
-        assert!(expect_restored(None).is_err());
+        expect_restored(line).unwrap();
+        assert!(expect_restored(&line.replace("true", "false")).is_err());
     }
 }

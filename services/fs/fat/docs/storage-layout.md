@@ -28,23 +28,23 @@ each mutation in [crash-safety.md](crash-safety.md).
 * **Page cache** (`src/cache.rs`): up to its slot ceiling of single-page slots, fixed at init from
   the RAM memmgr reports (`QUERY_POOL_STATUS`): one slot per `SLOT_RAM_DIVISOR` (512) pages of RAM,
   never fewer than `SLOT_COUNT` (256; `fat_parse::slot_ceiling`). A miss fills its slot with one
-  `BLK_READ_INTO_MEMORY` of the page, except an `FS_READ_MEMORY` miss on a sequential scan (the
-  read starts where the open's last one ended, or at 0 on a fresh open), which fills a run: one
-  `BLK_READ_INTO_MEMORY` of up to `fat_parse::RUN_PAGES` (16) pages from the read's page, bounded
-  by the clusters the file's chain holds at consecutive numbers from the read's cluster, by the
-  file's end, and by the first page already cached, each page then copied into a slot of its own.
-  Each block request pays a fixed cost (devmgr's DMA mapping and unmapping for the driver, the
-  interrupt, the IPC round trips), which a run pays once; the copy is the price, since the slots
-  are separate pages that the cache gives back to memmgr one by one. A run read the device refuses
-  falls back to the page's own fill. Runs land in a process-static run buffer of `RUN_PAGES`
-  contiguous pages, which memmgr may refuse at init (no run fills then), and a run read whose
-  reply loses its cap ends run fills for the mount. A separate process-static scratch page serves
-  single-sector `BLK_WRITE_FROM_MEMORY` writebacks and single-sector device reads, so no data
-  read puts them at risk. A sector is one logical block of the device, whose size `FS_MOUNT` reads
-  with `BLK_GET_GEOMETRY` before the BPB; a page holds `PAGE_SIZE` over it. A slot takes its page
-  from memmgr when a miss finds no slot that holds a page and no sector run, and the cache evicts
-  only once every slot holds a page or memmgr refuses one, so an idle mount pays only for the pages
-  it fills. When memmgr's memory-pressure level turns `Low` or `Critical`, a pressure thread, which
+  `BLK_READ_INTO_MEMORY` of the page, except an `FS_READ_MEMORY` miss on a sequential scan (the read
+  starts where the open's last one ended, or at 0 on a fresh open), which fills a run: one
+  `BLK_READ_INTO_MEMORY` of up to `fat_parse::RUN_PAGES` (16) pages from the read's page, bounded by
+  the clusters the file's chain holds at consecutive numbers from the read's cluster, by the file's
+  end, and by the first page already cached, each page then copied into a slot of its own. Each
+  block request pays a fixed cost (devmgr's DMA mapping and unmapping for the driver, the interrupt,
+  the IPC round trips), which a run pays once; the copy is the price, since the slots are separate
+  pages that the cache gives back to memmgr one by one. A run read the device refuses falls back to
+  the page's own fill. Runs land in a process-static run buffer of `RUN_PAGES` contiguous pages,
+  which memmgr may refuse at init (no run fills then), and a run read whose reply loses its cap ends
+  run fills for the mount. A separate process-static scratch page serves single-sector
+  `BLK_WRITE_FROM_MEMORY` writebacks and single-sector device reads, so no data read puts them at
+  risk. A sector is one logical block of the device, whose size `FS_MOUNT` reads with
+  `BLK_GET_GEOMETRY` before the BPB; a page holds `PAGE_SIZE` over it. A slot takes its page from
+  memmgr when a miss finds no slot that holds a page and no sector run, and the cache evicts only
+  once every slot holds a page or memmgr refuses one, so an idle mount pays only for the pages it
+  fills. When memmgr's memory-pressure level turns `Low` or `Critical`, a pressure thread, which
   waits on the runtime's pressure Notification, wakes the dispatch loop with an unbadged call on the
   service endpoint, and the loop gives memmgr back every page no reference holds and no client maps,
   after the mapping check below for a page that went to a client, but the `RELEASE_KEEP` (4) most
@@ -56,19 +56,22 @@ each mutation in [crash-safety.md](crash-safety.md).
   page holds one), the scratch page, the run buffer, and 64 more
   (`std::os::seraph::fund_cspace_slot_budget`), so growing the cache, or holding every slot
   outstanding, never meets an exhausted `CSpace`; a failed funding fails cache init. Before it
-  records an open's release SEND or a session's caps, each `FS_OPEN` and each `FS_SESSION` tops
-  the `CSpace` up so the same
-  funding stays free, less the slot pages, scratch page and run buffer the cache already holds, so
-  the opens' caps grow it rather than starve reads. Write-through: the cached page is updated in
-  place before the on-disk write so any outstanding `FS_READ_MEMORY` cap aliasing the page observes
-  new bytes immediately, and the sector is put back when the write fails. `reload_sector` reads one
-  sector from the device past the cache and refreshes the cached copy; a failed `FS_REMOVE` or
-  `FS_RENAME` whose 8.3 slot write failed uses it to learn whether that slot was deleted. A slot
-  whose page went to a client through `FS_READ_MEMORY` is reused only once `SYS_CAP_INFO`'s mappings
-  count shows the cache's own mapping alone. A page a client still maps is quarantined, and the slot
-  gets a replacement page. The cache takes at most 32 pages beyond its slots for replacements, past
-  which a still-mapped slot stays out of service (`src/cache.rs` module docs; [fs-driver-protocol.md
-  § Label 8](../../docs/fs-driver-protocol.md#label-8-fs_release_memory)).
+  records an open's release SEND or a session's caps, each `FS_OPEN` and each `FS_SESSION` tops the
+  `CSpace` up so the same funding stays free, less the slot pages, scratch page and run buffer the
+  cache already holds, so the opens' caps grow it rather than starve reads. Each `FS_READ_MEMORY`
+  tops it up the same way before it takes its page's ancestor and, in a session, its record's page:
+  every open may hold the ceiling, so the pages outstanding across opens can outnumber the slots,
+  and the top-up keeps the funding free whatever they hold (`TOO_MANY_OPEN` when memmgr cannot fund
+  it). Write-through: the cached page is updated in place before the on-disk write so any
+  outstanding `FS_READ_MEMORY` cap aliasing the page observes new bytes immediately, and the sector
+  is put back when the write fails. `reload_sector` reads one sector from the device past the cache
+  and refreshes the cached copy; a failed `FS_REMOVE` or `FS_RENAME` whose 8.3 slot write failed
+  uses it to learn whether that slot was deleted. A slot whose page went to a client through
+  `FS_READ_MEMORY` is reused only once `SYS_CAP_INFO`'s mappings count shows the cache's own mapping
+  alone. A page a client still maps is quarantined, and the slot gets a replacement page. The cache
+  takes at most 32 pages beyond its slots for replacements, past which a still-mapped slot stays out
+  of service (`src/cache.rs` module docs; [fs-driver-protocol.md § Label
+  8](../../docs/fs-driver-protocol.md#label-8-fs_release_memory)).
 * **NodeTable** (`src/backend.rs`): dedupes by on-disk slot
   `(sector_lba, offset_in_sector)`; two distinct on-disk entries
   always allocate distinct `NodeId`s, even when both are empty files

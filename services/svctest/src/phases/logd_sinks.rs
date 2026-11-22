@@ -47,8 +47,12 @@
 //!   class watch, its framebuffer writer blocks in a write to it, and a line
 //!   that finds the queue full waits out the stall bound, which a sink that
 //!   resolved no driver never makes a line do. Until then the phase starts
-//!   the instance, waits, and tries again, within a bound. The lines' calls
-//!   stay under the serial-stopped case's bounds, the last is in logd's
+//!   the instance, waits, and tries again, within a bound. A try that logd's
+//!   move to the new instance lands inside, after its first line, can leave
+//!   a later line waiting a whole stall bound from its own call, past the
+//!   bound on such a line; no later try can meet that move, so such a try is
+//!   tried again too, and fails the phase only once the bound has passed.
+//!   The lines' calls stay under the serial-stopped case's bounds, the last is in logd's
 //!   history, and once the instance is started again logd writes it the
 //!   queued lines and the line counting its drops.
 //!
@@ -216,8 +220,9 @@ fn await_restarted(class: u64)
 /// Stop the restarted framebuffer driver `process` and flood logd until a
 /// line waits out the stall bound on it (see the module documentation),
 /// starting the driver again after each try; the longest call of that try.
-/// Each try's calls must stay under the flood's bounds, and the last line
-/// sent must be in logd's history, read through `query`.
+/// The try's calls must stay under the flood's bounds, a failed try being
+/// tried again until [`DEATH_TIMEOUT`] (see the module documentation), and
+/// the last line sent must be in logd's history, read through `query`.
 fn await_stall_on(query: u64, authority: u64, process: u64) -> Duration
 {
     let start_at = Instant::now();
@@ -233,16 +238,20 @@ fn await_stall_on(query: u64, authority: u64, process: u64) -> Duration
         );
         start(&threads, "restarted framebuffer");
         detach(authority, process, threads, "restarted framebuffer");
-        let (lines, longest) = sent.unwrap_or_else(|e| panic!("{e}"));
-        if longest >= STALL_SEEN
+        let in_time = start_at.elapsed() < DEATH_TIMEOUT;
+        match sent
         {
-            check_retained(query, &lines, "restarted framebuffer stopped");
-            return longest;
+            Ok((lines, longest)) if longest >= STALL_SEEN =>
+            {
+                check_retained(query, &lines, "restarted framebuffer stopped");
+                return longest;
+            }
+            Ok(_) => assert!(
+                in_time,
+                "logd_sinks: logd's framebuffer writer did not reach the restarted driver"
+            ),
+            Err(e) => assert!(in_time, "{e}"),
         }
-        assert!(
-            start_at.elapsed() < DEATH_TIMEOUT,
-            "logd_sinks: logd's framebuffer writer did not reach the restarted driver"
-        );
         std::thread::sleep(RESOLVE_RETRY);
     }
 }

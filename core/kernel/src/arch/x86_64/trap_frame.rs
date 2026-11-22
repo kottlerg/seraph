@@ -34,7 +34,7 @@
 //! offset 136: rsp     (user RSP saved before switching to kernel stack)
 //! offset 144: cs      (user code segment selector)
 //! offset 152: ss      (user stack segment selector)
-//! offset 160: fs_base (user FS.base MSR — thread-local pointer)
+//! offset 160: fs_base (zeroed on entry; the TLS base is SavedState.fs_base)
 //! ```
 //!
 //! After `syscall_entry` reserves the frame (`sub rsp, 168`), RSP points at
@@ -101,13 +101,15 @@ pub struct TrapFrame
     pub cs: u64,
     /// User stack segment selector (e.g. 0x1B = `USER_DS`, ring 3).
     pub ss: u64,
-    /// FS.base MSR value — user-mode thread-local-storage pointer.
+    /// Zeroed on every entry: the thread's TLS base is `SavedState.fs_base`,
+    /// which `SYS_THREAD_READ_REGS` reports in this word of the register file.
     pub fs_base: u64,
 }
 
 // ABI contract: `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` copy this struct
-// as the user register file, whose size and IP, SP, flags, rax and rdi
-// offsets `abi/syscall` publishes; userspace edits the frame at those offsets.
+// as the user register file, whose size and IP, SP, flags, rax, rdi and
+// fs_base offsets `abi/syscall` publishes; userspace edits the frame at those
+// offsets.
 const _: () = {
     assert!(core::mem::size_of::<TrapFrame>() == syscall::REGS_X86_64_SIZE);
     assert!(core::mem::offset_of!(TrapFrame, rip) == syscall::REGS_X86_64_IP_OFFSET);
@@ -115,6 +117,7 @@ const _: () = {
     assert!(core::mem::offset_of!(TrapFrame, rflags) == syscall::REGS_X86_64_FLAGS_OFFSET);
     assert!(core::mem::offset_of!(TrapFrame, rax) == syscall::REGS_X86_64_RAX_OFFSET);
     assert!(core::mem::offset_of!(TrapFrame, rdi) == syscall::REGS_X86_64_RDI_OFFSET);
+    assert!(core::mem::offset_of!(TrapFrame, fs_base) == syscall::REGS_X86_64_FS_BASE_OFFSET);
 };
 
 /// Length of the `syscall` instruction (`0F 05`).

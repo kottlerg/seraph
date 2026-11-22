@@ -38,6 +38,7 @@ use death_queues::queues::FIRST_WAIT_SET_MEMBERS;
 use syscall::DeathEvent;
 use syscall_abi::SyscallError;
 
+use crate::members::first_wait_set;
 use crate::overflow::drain_queues;
 
 /// The error a create or a wait-set replacement returns when the service's
@@ -104,10 +105,10 @@ impl DeathSet
         first_observers: u32,
     ) -> Option<Self>
     {
-        let reserved = members.checked_add(1)?;
+        let (reserved, first_members) = first_wait_set(members)?;
         Self::create(
             reserved,
-            FIRST_WAIT_SET_MEMBERS.max(reserved.checked_add(1)?.next_power_of_two()),
+            first_members,
             Some((service_ep, service_badge)),
             death_badge,
             Ring::Fixed(entries),

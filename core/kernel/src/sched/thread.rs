@@ -957,12 +957,15 @@ pub struct ThreadControlBlock
     /// [`crate::ipc::fault::FAULT_OUTCOME_DECLINED`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_FORWARDED`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_REDIRECTED`] /
-    /// [`crate::ipc::fault::FAULT_OUTCOME_REDIRECT_REFUSED`]. Set to `PENDING`
+    /// [`crate::ipc::fault::FAULT_OUTCOME_REDIRECT_REFUSED`] /
+    /// [`crate::ipc::fault::FAULT_OUTCOME_NO_RECEIVER`]. Set to `PENDING`
     /// with the binding read that opens a delivery (under `sched_lock`), and by
     /// the single wake-claim winner: `RESUME`, `DECLINED`, `FORWARDED`,
     /// `REDIRECTED`, or `REDIRECT_REFUSED` by a genuine reply,
     /// `KILL` by handler-thread destruction or cancellation, `REDELIVER` by a
-    /// binding change, so
+    /// binding change, `NO_RECEIVER` by the endpoint's drain
+    /// (`ipc::endpoint::release_waiters`, through [`stamp_no_receiver_deposit`])
+    /// when no Receive-right capability on it is left, so
     /// resume-vs-cancellation is unambiguous. See `docs/fault-handling.md`.
     pub fault_outcome: core::sync::atomic::AtomicU8,
 
@@ -985,11 +988,13 @@ pub struct ThreadControlBlock
     /// Read from another thread under that `sched_lock` (a binder's in-flight
     /// check, `ipc::fault::delivery_in_flight`), or by the claim on that park
     /// (the `ep.lock` dequeue in `endpoint_recv`, a won `reply_tcb` CAS or
-    /// swap, a won send-queue unlink in `cancel_ipc_block`, the endpoint
-    /// dealloc drain's detach), which the park's commit orders after the
-    /// write; the claimants transition a dequeued fault sender to
-    /// `BlockedOnFault` (rather than `BlockedOnReply`) or mark the
-    /// [`fault_outcome`](Self::fault_outcome) `KILL` (the bare-field exception
+    /// swap, a won send-queue unlink in `cancel_ipc_block`, the detach of the
+    /// endpoint's drain, `ipc::endpoint::release_waiters`, which runs when the
+    /// last Receive-right capability goes and at the endpoint's dealloc), which
+    /// the park's commit orders after the write; the claimants transition a
+    /// dequeued fault sender to `BlockedOnFault` (rather than `BlockedOnReply`)
+    /// or mark the [`fault_outcome`](Self::fault_outcome) `KILL`, or
+    /// `NO_RECEIVER` for the drain (the bare-field exception
     /// of docs/coding-standards.md § Concurrency).
     pub in_fault_delivery: bool,
 
@@ -1002,6 +1007,17 @@ pub struct ThreadControlBlock
     /// orders after the write, to honour a forward only from the VM class.
     /// Meaningful only while `in_fault_delivery` is set.
     pub fault_delivery_class: u8,
+
+    /// A binding change cancelled the delivery
+    /// [`in_fault_delivery`](Self::in_fault_delivery) marks. Cleared with the
+    /// binding read that opens a delivery, set by a binder's
+    /// `ipc::fault::publish_bindings` when it changes the binding of a class
+    /// whose delivery is in flight, both under [`sched_lock`](Self::sched_lock),
+    /// and read under that lock by the thread's own close of a delivery that
+    /// ended without a park (its endpoint had no receiver), which then delivers
+    /// the fault again rather than take it as unhandled. A delivery that parked
+    /// is cancelled by the binder's claim instead (`ipc::fault::redeliver_in_flight`).
+    pub fault_rebound: bool,
 
     // === Asynchronous upcall ===
     /// An upcall is posted and not yet delivered (`docs/fault-handling.md`

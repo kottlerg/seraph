@@ -27,14 +27,24 @@
 //! (`NODE_RELEASE`) and its handle deleted, so the driver ends it at its next
 //! sweep and the charge returns to this process's node. The process's death
 //! ends every session the same way.
+//!
+//! An open stays in its session until its `FS_CLOSE` reaches the driver. A
+//! `File` dropped when its thread cannot send the close (its call deadline
+//! has passed, or it has no IPC buffer) leaves the open cap here
+//! ([`keep_unclosed`]), and the next `File::open` or the exit hook sends the
+//! close ([`close_unclosed`]), so a process that goes on opening files does
+//! not accumulate opens it no longer reaches.
 
 use ipc::{IpcMessage, fs_errors, fs_labels, memmgr_errors, memmgr_labels};
+use syscall_abi::SyscallError;
 use fs_sessions::{Found, lookup};
 
 use crate::cell::Cell;
 use crate::io;
-use crate::os::seraph::{deadline_call, memmgr_call, memmgr_call_until_answered};
+use crate::os::seraph::checkpoint::{FILE, Held};
+use crate::os::seraph::{call_time_left, deadline_call, memmgr_call, memmgr_call_until_answered};
 use crate::sync::{Mutex, MutexGuard, PoisonError};
+use crate::time::{Duration, Instant};
 use crate::vec::Vec;
 
 /// One session: its caps, all this process's.
@@ -63,15 +73,108 @@ fn table() -> MutexGuard<'static, Vec<Entry>>
     SESSIONS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The open caps of the `File`s dropped before their `FS_CLOSE` could be
+/// sent, each counted as an open file for a quiesce point until its close is
+/// sent (docs/checkpoint-restore.md § Quiesce point).
+// restore: rebound
+static UNCLOSED: Mutex<Vec<(u64, Held<FILE>)>> = Mutex::new(Vec::new());
+
+fn unclosed() -> MutexGuard<'static, Vec<(u64, Held<FILE>)>>
+{
+    UNCLOSED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Keep `open_cap`, an open cap whose `FS_CLOSE` the dropping thread could
+/// not send, for [`close_unclosed`] to close. When the list cannot grow, the
+/// cap is deleted and the open left to its session, which ends with the
+/// process.
+pub(crate) fn keep_unclosed(open_cap: u64)
+{
+    let mut kept = unclosed();
+    if kept.try_reserve(1).is_ok()
+    {
+        kept.push((open_cap, Held::new()));
+        return;
+    }
+    drop(kept);
+    let _ = syscall::cap_delete(open_cap);
+}
+
+/// The time one drain of the kept closes ([`close_unclosed`]) may take. A
+/// close is kept because its driver did not answer within a thread's call
+/// deadline, so a drain is bounded of its own, whatever the draining thread's
+/// deadline: a thread with none, opening a file on another driver or exiting,
+/// does not wait without limit on a driver that may never answer. A tuning
+/// value, far above a driver's time to answer an `FS_CLOSE`.
+const KEPT_CLOSE_DRAIN: Duration = Duration::from_millis(50);
+
+/// Send `FS_CLOSE` on each open cap [`keep_unclosed`] kept, within
+/// [`KEPT_CLOSE_DRAIN`] for the whole drain and the calling thread's call
+/// deadline, whichever ends first, and delete each cap whose call ended
+/// otherwise than at that bound: a close the driver answered, or one on an
+/// open or a driver that is gone. A close the bound stopped, or reached
+/// before it was sent, stays kept; a repeat of one that did reach the driver
+/// is answered `INVALID_BADGE`, since an open id never repeats
+/// (fs-driver-protocol.md § Label 18).
+pub(crate) fn close_unclosed(ipc_buf: *mut u64)
+{
+    if ipc_buf.is_null()
+    {
+        return;
+    }
+    let mut pending = core::mem::take(&mut *unclosed());
+    if pending.is_empty()
+    {
+        return;
+    }
+    let close = IpcMessage::new(fs_labels::FS_CLOSE);
+    let started = Instant::now();
+    pending.retain(|&(cap, _)| {
+        let drain_left = KEPT_CLOSE_DRAIN.saturating_sub(started.elapsed());
+        let left = call_time_left().map_or(drain_left, |left| left.min(drain_left));
+        // SAFETY: the caller passes the registered IPC buffer page.
+        let sent = unsafe { ipc::ipc_call_within(cap, &close, ipc_buf, Some(left)) };
+        if sent.err() == Some(SyscallError::WouldBlock as i64)
+        {
+            return true;
+        }
+        let _ = syscall::cap_delete(cap);
+        false
+    });
+    if pending.is_empty()
+    {
+        return;
+    }
+    let mut kept = unclosed();
+    if kept.is_empty()
+    {
+        *kept = pending;
+    }
+    else if kept.try_reserve(pending.len()).is_ok()
+    {
+        kept.append(&mut pending);
+    }
+    else
+    {
+        drop(kept);
+        for (cap, _) in pending
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+}
+
 /// Forget the sessions in the process a restore created
 /// (docs/checkpoint-restore.md § Restore entry and handle rebinding): their
 /// caps name slots of the captured process, and their nodes' handle states
 /// went with it. Nothing is deleted or released; the next open starts a new
-/// session.
+/// session. The kept unclosed opens ([`UNCLOSED`]) are forgotten with them,
+/// though a quiesce point leaves none, since each refuses it.
 // restore: reset
 pub(crate) fn rebind_fs_sessions()
 {
     SESSIONS.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    UNCLOSED.lock().unwrap_or_else(PoisonError::into_inner).clear();
 }
 
 /// A SEND-only copy of this process's session cap with the driver of the node
@@ -82,7 +185,8 @@ pub(crate) fn rebind_fs_sessions()
 /// `QuotaExceeded` when the max of this process's node, or of an ancestor's,
 /// refuses the session's first page; `OutOfMemory` when memmgr cannot make
 /// the sub-node; the error of a failed `FS_SESSION`, or of the kernel's
-/// inquiry about `node_cap`.
+/// inquiry about `node_cap`, which is `StaleNetworkFileHandle` when
+/// `node_cap`'s slot holds no capability, whichever of the two fails.
 pub(crate) fn session_copy(node_cap: u64, ipc_buf: *mut u64) -> io::Result<u64>
 {
     if let Some(copy) = find(&mut table(), node_cap, ipc_buf)?
@@ -128,6 +232,19 @@ pub(crate) fn session_copy(node_cap: u64, ipc_buf: *mut u64) -> io::Result<u64>
     }
 }
 
+/// A SEND-only copy of this process's session with the driver of
+/// `node_cap` when the table holds one, `None` when it does not: the lookup
+/// of [`session_copy`] without its start, for a node cap that cannot carry
+/// `FS_SESSION`'s charge handle (one without `RIGHTS_EP_GRANT`).
+///
+/// # Errors
+/// `StaleNetworkFileHandle` when `node_cap`'s slot holds no capability;
+/// `OutOfMemory` when the copy cannot be made.
+pub(crate) fn existing_session_copy(node_cap: u64, ipc_buf: *mut u64) -> io::Result<Option<u64>>
+{
+    find(&mut table(), node_cap, ipc_buf)
+}
+
 /// Look `node_cap`'s session up in `sessions`, ending and removing each
 /// entry whose key is dead: a SEND-only copy of the session cap that serves
 /// `node_cap`, or `None` when none does.
@@ -148,9 +265,11 @@ fn find(sessions: &mut Vec<Entry>, node_cap: u64, ipc_buf: *mut u64) -> io::Resu
     {
         Found::Session(i) => sessions.get(i).map(|e| send_copy(e.session)).transpose(),
         Found::Missing => Ok(None),
-        Found::NodeError(_) => Err(io::const_error!(
-            io::ErrorKind::InvalidInput,
-            "seraph fs: the node cap names no live capability"
+        // As the `FS_SESSION` a lookup with no live key sends would fail: an
+        // empty slot (a node an unmount revoked) is `StaleNetworkFileHandle`.
+        Found::NodeError(_) => Err(super::call_failed(
+            node_cap,
+            "seraph fs: the node cap names no driver's endpoint",
         )),
     };
     sessions.retain(|e| {

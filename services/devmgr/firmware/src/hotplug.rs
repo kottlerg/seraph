@@ -26,7 +26,7 @@ use crate::pci::{
 };
 use crate::pci_records::{AppendError, PciRecords, RecordState};
 use crate::resource::{CarveError, Span, SpanTable, SplitError};
-use crate::scan::{ConfigSpace, MAX_BARS, PciDevice};
+use crate::scan::{ConfigSpace, MAX_BARS, PCI_REVISION_CLASS, PCI_SUBSYSTEM, PciDevice};
 
 /// Offset of the PCI Express Capabilities register in the capability: bits
 /// 7:4 the device/port type, bit 8 Slot Implemented.
@@ -880,6 +880,11 @@ pub enum SlotState
     /// slot is powered off until its attention button is pressed or a card
     /// is inserted again.
     Off,
+    /// Taken over with a function behind the slot that no longer reads as its
+    /// live record ([`Behind::Replaced`]): the first poll posts the removal
+    /// of the recorded card, a card present then asked for, so it is added
+    /// once the removal completes.
+    Replaced,
 }
 
 /// The attention button's abort window, in milliseconds: a second press
@@ -946,6 +951,7 @@ pub const fn next(state: SlotState, status: u16, link_down: bool) -> (SlotState,
     match state
     {
         SlotState::Empty if present => (SlotState::Empty, Action::PowerUp),
+        SlotState::Replaced => (SlotState::Removing { asked: present }, Action::Remove),
         SlotState::Occupied | SlotState::Pressed { .. } if gone => (
             SlotState::Removing {
                 asked: present && (changed || kept),
@@ -975,7 +981,10 @@ pub const fn next(state: SlotState, status: u16, link_down: bool) -> (SlotState,
             },
             Action::None,
         ),
-        SlotState::Off if asks(status) => (SlotState::Off, Action::PowerUp),
+        // A card inserted or swapped, or the attention button pressed, asks
+        // for a card present to be powered up: one in a failed slot is tried
+        // again.
+        SlotState::Off | SlotState::Failed if asks(status) => (state, Action::PowerUp),
         SlotState::Failed | SlotState::Off if !present => (SlotState::Empty, Action::None),
         SlotState::Empty | SlotState::Occupied | SlotState::Failed | SlotState::Off =>
         {
@@ -993,7 +1002,11 @@ pub const fn next(state: SlotState, status: u16, link_down: bool) -> (SlotState,
 )]
 pub const fn removal_cause(state: SlotState, status: u16, link_down: bool) -> &'static str
 {
-    if matches!(state, SlotState::Pressed { .. })
+    if matches!(state, SlotState::Replaced)
+    {
+        "its card was removed or replaced while the slot's grant waited"
+    }
+    else if matches!(state, SlotState::Pressed { .. })
         && status & SLOTSTA_PRESENT != 0
         && status & SLOTSTA_PRESENCE_CHANGED == 0
         && !link_down
@@ -1035,7 +1048,8 @@ pub const fn completed(state: SlotState, status: u16) -> SlotState
         | SlotState::Occupied
         | SlotState::Failed
         | SlotState::Pressed { .. }
-        | SlotState::Off => state,
+        | SlotState::Off
+        | SlotState::Replaced => state,
     }
 }
 
@@ -1054,24 +1068,68 @@ pub const fn link_changed(status: u16) -> bool
     status != u16::MAX && status & SLOTSTA_LINK_CHANGED != 0
 }
 
-/// The state a slot is taken over in: occupied when a card is present and a
-/// live record lies behind the slot (`recorded`), else empty, so a present
-/// card with nothing recorded is brought up on the first poll.
-#[must_use]
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "`recorded` is whether a live record lies behind the slot"
-)]
-pub const fn initial(status: u16, recorded: bool) -> SlotState
+/// What lies behind a slot when it is taken over, as devmgr's records and
+/// the functions' configuration headers tell it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Behind
 {
-    if status != u16::MAX && status & SLOTSTA_PRESENT != 0 && recorded
+    /// No live record lies behind the slot.
+    Nothing,
+    /// Live records lie behind the slot, and each function reads as its
+    /// record ([`same_function`]), or could not be read.
+    Recorded,
+    /// Live records lie behind the slot, and a function no longer reads as
+    /// its record: the card was removed, or replaced by another, while the
+    /// slot's grant waited.
+    Replaced,
+}
+
+/// The state a slot is taken over in: occupied when live records lie behind
+/// the slot and its functions read as recorded, whatever its Slot Status
+/// reads; replaced when a function no longer does; else empty. A recorded
+/// card that left while the slot's grant waited is then removed on the first
+/// poll, a card that replaced it is removed and then added, and a present
+/// card with nothing recorded is brought up on it.
+#[must_use]
+pub const fn initial(behind: Behind) -> SlotState
+{
+    match behind
     {
-        SlotState::Occupied
+        Behind::Nothing => SlotState::Empty,
+        Behind::Recorded => SlotState::Occupied,
+        Behind::Replaced => SlotState::Replaced,
+    }
+}
+
+/// Whether the function at `record`'s address in `cfg` reads as `record`
+/// describes it: the same vendor and device ID, revision and class code,
+/// and, for a type-0 header, subsystem vendor and ID. A function that does
+/// not answer does not; a card replaced by one of the same identity does,
+/// and is not told apart from it.
+#[must_use]
+pub fn same_function(cfg: &impl ConfigSpace, record: &PciDevice) -> bool
+{
+    let (b, d, f) = (record.bus, record.dev, record.func);
+    let revision_class = cfg.read32(b, d, f, PCI_REVISION_CLASS);
+    let [revision, ..] = revision_class.to_le_bytes();
+    // Header layout: the header type without its multi-function bit.
+    let layout = cfg.read8(b, d, f, 0x0E) & 0x7F;
+    let subsystem = if layout == 0
+    {
+        (
+            cfg.read16(b, d, f, PCI_SUBSYSTEM),
+            cfg.read16(b, d, f, PCI_SUBSYSTEM + 2),
+        )
     }
     else
     {
-        SlotState::Empty
-    }
+        (0, 0)
+    };
+    cfg.read16(b, d, f, 0x00) == record.vendor_id
+        && cfg.read16(b, d, f, 0x02) == record.device_id
+        && revision == record.revision
+        && revision_class >> 8 == record.class_code
+        && subsystem == (record.subsystem_vendor, record.subsystem_id)
 }
 
 /// The Slot Control value `control` with the slot's power on where the slot
@@ -2290,12 +2348,102 @@ mod tests
             next(SlotState::Failed, 0, false),
             (SlotState::Empty, Action::None)
         );
-        assert_eq!(initial(present, true), SlotState::Occupied);
-        assert_eq!(initial(present, false), SlotState::Empty);
-        assert_eq!(initial(0, true), SlotState::Empty);
-        assert_eq!(initial(u16::MAX, true), SlotState::Empty);
         assert!(present_reads(present) && !present_reads(0) && !present_reads(u16::MAX));
         assert!(link_changed(SLOTSTA_LINK_CHANGED) && !link_changed(u16::MAX));
+    }
+
+    #[test]
+    fn a_recorded_slot_is_taken_over_occupied_so_a_card_gone_meanwhile_is_removed()
+    {
+        // The recorded card left while the slot's grant waited: the first
+        // poll reads it gone and posts its removal.
+        let recorded = initial(Behind::Recorded);
+        assert_eq!(recorded, SlotState::Occupied);
+        assert_eq!(
+            next(recorded, 0, false),
+            (SlotState::Removing { asked: false }, Action::Remove)
+        );
+        assert_eq!(
+            next(recorded, SLOTSTA_PRESENT, false),
+            (SlotState::Occupied, Action::None)
+        );
+        // Nothing recorded: a card present is brought up on the first poll.
+        assert_eq!(
+            next(initial(Behind::Nothing), SLOTSTA_PRESENT, false),
+            (SlotState::Empty, Action::PowerUp)
+        );
+    }
+
+    #[test]
+    fn a_card_replaced_before_take_over_is_removed_and_then_added()
+    {
+        let space = Space::default();
+        add_edu(&space, (1, 0, 0));
+        let edu = crate::scan::function(&space, 0, 1, 0, 0).unwrap();
+        assert!(same_function(&space, &edu));
+        // Another card in its place: pci-testdev (1b36:0005), of another
+        // identity; then none at all.
+        let other = Space::default();
+        other.add((1, 0, 0), &[0x0005_1b36, 0, 0x00ff_0000, 0]);
+        assert!(!same_function(&other, &edu));
+        assert!(!same_function(&Space::default(), &edu));
+        // The same card of another revision, or of another subsystem.
+        let revised = Space::default();
+        revised.add((1, 0, 0), &[0x11e8_1234, 0, 0x00ff_0011, 0]);
+        assert!(!same_function(&revised, &edu));
+        let mut resold = edu;
+        resold.subsystem_vendor ^= 1;
+        assert!(!same_function(&space, &resold));
+        // A card of the same identity is not told apart from it.
+        let twin = Space::default();
+        add_edu(&twin, (1, 0, 0));
+        assert!(same_function(&twin, &edu));
+
+        // The slot is taken over replaced: the first poll removes the recorded
+        // card, the card present asked for, and once the removal completes
+        // the next poll brings it up. Read gone, it is only removed.
+        let replaced = initial(Behind::Replaced);
+        assert_eq!(replaced, SlotState::Replaced);
+        let (removing, action) = next(replaced, SLOTSTA_PRESENT, false);
+        assert_eq!(
+            (removing, action),
+            (SlotState::Removing { asked: true }, Action::Remove)
+        );
+        assert_eq!(
+            removal_cause(replaced, SLOTSTA_PRESENT, false),
+            "its card was removed or replaced while the slot's grant waited"
+        );
+        let after = completed(removing, SLOTSTA_PRESENT);
+        assert_eq!(after, SlotState::Empty);
+        assert_eq!(
+            next(after, SLOTSTA_PRESENT, false),
+            (SlotState::Empty, Action::PowerUp)
+        );
+        assert_eq!(
+            next(replaced, 0, false),
+            (SlotState::Removing { asked: false }, Action::Remove)
+        );
+        // A port that does not answer changes nothing.
+        assert_eq!(next(replaced, u16::MAX, false), (replaced, Action::None));
+    }
+
+    #[test]
+    fn a_failed_slot_whose_card_is_swapped_or_asked_for_is_powered_up_again()
+    {
+        let present = SLOTSTA_PRESENT;
+        assert_eq!(
+            next(SlotState::Failed, present | SLOTSTA_PRESENCE_CHANGED, false),
+            (SlotState::Failed, Action::PowerUp)
+        );
+        assert_eq!(
+            next(SlotState::Failed, present | SLOTSTA_BUTTON, false),
+            (SlotState::Failed, Action::PowerUp)
+        );
+        // A change that leaves no card present empties the slot.
+        assert_eq!(
+            next(SlotState::Failed, SLOTSTA_PRESENCE_CHANGED, false),
+            (SlotState::Empty, Action::None)
+        );
     }
 
     fn present_reads(status: u16) -> bool

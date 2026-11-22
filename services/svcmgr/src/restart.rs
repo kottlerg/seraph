@@ -234,7 +234,18 @@ pub fn walk_and_create_from_file(
     ipc_buf: *mut u64,
 ) -> Option<CreatedProcess>
 {
-    create_from_file(path, blobs, label_bits, procmgr_ep, bootstrap_ep, ipc_buf).ok()
+    match create_from_file(path, blobs, label_bits, procmgr_ep, bootstrap_ep, ipc_buf)
+    {
+        Ok(created) => Some(created),
+        Err(failure) =>
+        {
+            if failure == CreateFailure::OutOfMemory
+            {
+                std::os::seraph::log!(warn: "create: {path:?} refused for want of memory");
+            }
+            None
+        }
+    }
 }
 
 /// [`walk_and_create_from_file`], telling a create procmgr refused with
@@ -340,7 +351,6 @@ fn create_from_file(
     }
     if reply.label != 0
     {
-        std::os::seraph::log!(warn: "create: CREATE_FROM_FILE returned {:#x}", reply.label);
         delete_caps(&[file_cap, badged_creator]);
         delete_caps(reply.caps());
         return Err(create_refusal(reply.label));
@@ -367,7 +377,11 @@ fn create_from_file(
     })
 }
 
-/// The failure a `CREATE_FROM_FILE` error reply labelled `label` is.
+/// The failure a `CREATE_FROM_FILE` error reply labelled `label` is, the
+/// label logged unless it is `OUT_OF_MEMORY`. A refusal for want of memory
+/// is logged by the caller, once per create it decides and not on each timed
+/// retry of a memory wait, which at `CRITICAL` the retry limit does not
+/// bound.
 fn create_refusal(label: u64) -> CreateFailure
 {
     if label == procmgr_errors::OUT_OF_MEMORY
@@ -376,6 +390,7 @@ fn create_refusal(label: u64) -> CreateFailure
     }
     else
     {
+        std::os::seraph::log!(warn: "create: CREATE_FROM_FILE returned {:#x}", label);
         CreateFailure::Other
     }
 }
@@ -588,19 +603,24 @@ pub fn handle_death(
         {
             svc.active = false;
             let refused = Refused::Decided { exit_reason };
-            return match refused_create(ctx, refused, failure, recipe)
+            let Some(wait) = refused_create(ctx, refused, failure, recipe)
+            else
             {
-                Some(wait) =>
+                if failure == CreateFailure::OutOfMemory
                 {
-                    svc.memory_wait = Some(wait);
                     std::os::seraph::log!(
-                        warn: "restart of {} waits for memory: create refused for want of memory",
+                        warn: "restart of {} refused for want of memory; it does not wait",
                         svc.name_str()
                     );
-                    DeathOutcome::WaitingForMemory
                 }
-                None => permanent_death_outcome(svc, lines),
+                return permanent_death_outcome(svc, lines);
             };
+            svc.memory_wait = Some(wait);
+            std::os::seraph::log!(
+                warn: "restart of {} waits for memory: create refused for want of memory",
+                svc.name_str()
+            );
+            return DeathOutcome::WaitingForMemory;
         }
         // A restart count cannot meaningfully exceed its type, so it
         // saturates; an instance that started counts, whether or not it lived

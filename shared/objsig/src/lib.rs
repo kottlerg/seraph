@@ -96,7 +96,7 @@ pub enum Role
     /// The object of the bundle's `init` slot.
     Init = 2,
     /// An object the bootloader may load as a bundle entry other than
-    /// `init`, whatever its content.
+    /// `init` and outside `/config/`.
     BootModule = 3,
     /// A service image.
     Service = 4,
@@ -107,7 +107,9 @@ pub enum Role
     /// A data file procmgr verifies for its reader.
     Data = 7,
     /// A policy-bearing configuration file procmgr verifies for its
-    /// consumer, or the index of a directory of them.
+    /// consumer, or the index of a directory of them; and a bundle entry
+    /// under `/config/`, a platform table excepted, which the bootloader
+    /// verifies.
     Configuration = 8,
     /// A change request to the trust store enrolled in firmware storage,
     /// which the bootloader applies with no one present

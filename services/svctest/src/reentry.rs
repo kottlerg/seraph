@@ -10,28 +10,34 @@
 //! long argv token) to exercise child-side behaviour: namespace and
 //! `/programs`-subtree attenuation, cwd-cap delivery, argv/env delivery,
 //! exit-code propagation (from the main thread and from a spawned one), a
-//! receive loop's fatal exit on a spawned thread, per-process randomness and ASLR divergence,
-//! `Child` kill and drop teardown, procmgr's teardown of a child whose create
-//! reply it cannot deliver, procmgr's death forward to logd, procmgr's post
-//! of a process's end to its end queue and, once, to its death relay, the fs
-//! release handler's cookie matching, fatfs's release of the open of a
-//! killed client and of one whose open reply it cannot deliver, fatfs's
-//! return of the session pages of a client that dies holding a session, memmgr's hold
-//! on a dead child's frame that a live kernel object still occupies, memmgr's hold
-//! of a child to the memory max its creator set, its commitment of a heap's
-//! growth, memmgr's eviction of a child's cold pages and their restore, a child's
-//! attachment of a memory object, its call of an executable one, procmgr's
-//! snapshot of a live child, and what a mapped cache page reads across a forced
-//! unmount. The
-//! `reboot` role is the one not spawned by a phase: svcmgr launches it from
-//! the `reboot` test recipe the `shutdown` case's reboot boot stages.
+//! receive loop's fatal exit on a spawned thread, per-process randomness and
+//! ASLR divergence, `Child` kill and drop teardown, procmgr's teardown of a
+//! child whose create reply it cannot deliver, procmgr's death forward to
+//! logd, procmgr's post of a process's end to its end queue and, once, to its
+//! death relay, the fs release handler's cookie matching, fatfs's release of
+//! the open of a killed client and of one whose open reply it cannot deliver,
+//! fatfs's return of the session pages of a client that dies holding a
+//! session, memmgr's hold on a dead child's frame that a live kernel object
+//! still occupies, memmgr's hold of a child to the memory max its creator
+//! set, its commitment of a heap's growth, memmgr's eviction of a child's cold
+//! pages and their restore, a child's attachment of a memory object, its call
+//! of an executable one, procmgr's snapshot of a live child, and what a mapped
+//! cache page reads across a forced unmount.
+//!
+//! Two roles are launched by svcmgr from a test recipe, not spawned by a
+//! phase, so each argv token must match its recipe's `argv`: `reboot`, from
+//! the `reboot` recipe the `shutdown` case's reboot boot stages, and
+//! `reserve-creator`, from the `reserve-creator` recipe
+//! (`rootfs/config/svcmgr/tests/`) that the `logd_reserve` phase uses.
+//!
 //! The child-mode function for each role lives in the phase module that
 //! spawns it; `dispatch` consults each module's `reentry_main(role)` so a
 //! new role is registered alongside its phase, not in a central switch.
 //!
 //! A module's `reentry_main` diverges on a matching role, by exiting
 //! (`std::process::exit`) or, for `park-child`, `reclaim-child`, and
-//! `open-reclaim-child`, by parking until its spawner tears it down, and returns on a miss;
+//! `open-reclaim-child`, by parking until its spawner tears it down, and
+//! returns on a miss;
 //! `dispatch` cascades through the modules and returns to its caller only
 //! when no module took control.
 

@@ -1065,7 +1065,8 @@ fn parse_bundle_header(bytes: &[u8]) -> Result<bundle::BundleHeader, BootError>
 /// [`BootError::SignatureRefused`] for the first entry the verifier refuses;
 /// [`BootError::InvalidBundle`] for an entry other than init not named by an
 /// install path, a second `init` entry or none, a second policy entry or none,
-/// or an entry past the end of `bytes`.
+/// an entry past the end of `bytes`, or an entry whose body does not start at
+/// or past the page boundary after the body before it ([`body_layout_end`]).
 fn verify_bundle<'a>(
     bytes: &'a [u8],
     entry_count: u32,
@@ -1074,9 +1075,17 @@ fn verify_bundle<'a>(
 {
     let mut init_body: Option<&[u8]> = None;
     let mut policy = false;
+    let mut layout_end = 0u64;
     for i in 0..entry_count
     {
         let (entry, object) = bundle_entry(bytes, i)?;
+        if entry.offset < layout_end
+        {
+            return Err(BootError::InvalidBundle(
+                "bundle entry bodies out of offset order or sharing a page",
+            ));
+        }
+        layout_end = body_layout_end(entry.offset, entry.size);
         let name = bundle::name_str(&entry.name);
         if name == bundle::INIT_ENTRY_NAME
         {
@@ -1125,6 +1134,21 @@ fn verify_bundle<'a>(
         ));
     }
     Ok(init_body)
+}
+
+/// The end of the pages a bundle entry body of `size` bytes at `offset`
+/// takes, at least one: the offset the next entry's body may start at. The
+/// header is the one unsigned part of the bundle (docs/signing.md § Which
+/// Stage Verifies What), so [`verify_bundle`] holds every body at or past
+/// the end of the one before it: bodies in ascending order on pages of their
+/// own, which step 9's reclaim walk and the kernel's module Memory caps rely
+/// on, an entry duplicated or reordered in the header refused.
+fn body_layout_end(offset: u64, size: u64) -> u64
+{
+    offset
+        .saturating_add(size.max(1))
+        .saturating_add(bundle::BODY_ALIGNMENT - 1)
+        & !(bundle::BODY_ALIGNMENT - 1)
 }
 
 /// The header of bundle entry `index` and its object: the `size` bytes at its
@@ -2766,8 +2790,9 @@ unsafe fn step9_populate_boot_info(
     {
         // Bundle bodies are 4 KiB-aligned per `bundle::BODY_ALIGNMENT`,
         // already enforced (release-mode) by `bundle::parse_header`'s
-        // `EntryMisaligned` check. Only the cursor-ordering invariant
-        // needs an explicit debug guard.
+        // `EntryMisaligned` check, and in ascending order on pages of their
+        // own, enforced by `verify_bundle` (`body_layout_end`) before step 4
+        // lists them; the debug guard restates that order.
         let module_base = module.physical_base;
         let module_end = module
             .physical_base
@@ -3250,6 +3275,60 @@ mod tests
             verified(&[("init", init.clone()), ("init", init)]),
             Err(BootError::InvalidBundle(_))
         ));
+    }
+
+    // Defect caught: an edited header (the one unsigned part of the bundle)
+    // that reorders or duplicates entries passed, so step 9 reclaimed module
+    // bodies and the kernel minted two module caps over the same frames.
+    #[test]
+    fn entry_bodies_out_of_order_or_sharing_pages_are_refused()
+    {
+        let init = signed(&ROOT_SEED, b"init image", &[Role::Init], b"init");
+        let module = |name: &str| {
+            signed(
+                &ROOT_SEED,
+                b"service image",
+                &[Role::Service, Role::BootModule],
+                name.as_bytes(),
+            )
+        };
+        let entries = [
+            ("init", init),
+            ("/services/a", module("/services/a")),
+            ("/services/b", module("/services/b")),
+            policy(&[Role::Configuration]),
+        ];
+        let bytes = bundle_of(&entries);
+        let store = store_of(&ROOT_SEED);
+        let verify = |bytes: &[u8]| {
+            let mut verifier = Verifier::new(TrustStore::parse(&store).unwrap());
+            let header = bundle::parse_header(bytes).unwrap();
+            verify_bundle(bytes, header.entry_count, &mut verifier).map(<[u8]>::to_vec)
+        };
+        assert_eq!(verify(&bytes).unwrap(), b"init image");
+
+        let entry = |index: usize| {
+            let at = bundle::HEADER_SIZE + index * bundle::ENTRY_HEADER_SIZE;
+            at..at + bundle::ENTRY_HEADER_SIZE
+        };
+        let refused = |result: Result<Vec<u8>, BootError>| {
+            matches!(
+                result,
+                Err(BootError::InvalidBundle(
+                    "bundle entry bodies out of offset order or sharing a page"
+                ))
+            )
+        };
+        // The two services' entries swapped: each name still covers its own
+        // signed body, but the bodies run backwards.
+        let mut reordered = bytes.clone();
+        reordered[entry(1)].copy_from_slice(&bytes[entry(2)]);
+        reordered[entry(2)].copy_from_slice(&bytes[entry(1)]);
+        assert!(refused(verify(&reordered)));
+        // The first service's entry duplicated over the second's.
+        let mut duplicated = bytes.clone();
+        duplicated[entry(2)].copy_from_slice(&bytes[entry(1)]);
+        assert!(refused(verify(&duplicated)));
     }
 
     // Defect caught: a bundle that boots without its boot-time policy, or

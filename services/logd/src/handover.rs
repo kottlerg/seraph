@@ -20,52 +20,40 @@
 use ipc::IpcMessage;
 use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
 use ipc::log_record::Record;
-use logd_codec::handover::{self as wire, Chunk};
+use logd_codec::handover::{self as wire, Chunk, Release};
 
 use logd_slot_table::SlotTable;
-
-/// Outcome of [`send_release`].
-enum Release
-{
-    /// Init-logd acknowledged and exits.
-    Acked,
-    /// Init-logd has names to send again and keeps serving; pull again.
-    Pending,
-    /// No attempt was delivered; init-logd keeps serving.
-    Unreached,
-}
 
 /// Run the whole handover: drain init-logd's state into `table`, then
 /// release it, pulling again each time init-logd defers the release.
 ///
 /// Init-logd defers at most [`wire::MAX_RELEASE_DEFERRALS`] times and
 /// acknowledges the release after that, so the
-/// `MAX_RELEASE_DEFERRALS + 1` rounds here end with init-logd released
-/// unless no release attempt reaches it at all. Every call is bounded by
+/// `MAX_RELEASE_DEFERRALS + 1` rounds of [`wire::run_rounds`] end with
+/// init-logd released unless a release attempt fails to reach it. A release
+/// that runs out of its bound may have been taken, so the rounds go on while
+/// init-logd answers the next pull. Every call is bounded by
 /// [`wire::HANDOVER_CALL_TIMEOUT_MS`], so an init-logd that has already
 /// exited costs one bound on the pull and one on the release, and the
-/// transfer returns with nothing pulled.
+/// transfer returns with nothing pulled; one that exits on a release it
+/// answers after the bound costs one bound more, on the next pull.
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
 pub unsafe fn transfer(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTable)
 {
-    for _ in 0..=wire::MAX_RELEASE_DEFERRALS
-    {
+    wire::run_rounds(
         // SAFETY: caller's invariant — ipc_buf is the registered IPC buffer.
-        unsafe { pull_all(handover_send_cap, ipc_buf, table) };
+        || unsafe { pull_all(handover_send_cap, ipc_buf, table) },
         // SAFETY: caller's invariant — ipc_buf is the registered IPC buffer.
-        let outcome = unsafe { send_release(handover_send_cap, ipc_buf) };
-        if !matches!(outcome, Release::Pending)
-        {
-            return;
-        }
-    }
+        || unsafe { send_release(handover_send_cap, ipc_buf) },
+    );
 }
 
 /// Drain init-logd's handover state into `table`, best-effort. Returns
 /// on the `DONE` reply (no more data), on an `ipc_call` error (drain
-/// aborted), or at the iteration cap. `DONE` means only "no more data" —
+/// aborted), or at the iteration cap, with whether init-logd answered any
+/// call. `DONE` means only "no more data" —
 /// init-logd's thread does NOT terminate here; the caller must follow
 /// with [`send_release`], which is what actually releases init-logd. A
 /// dropped data chunk therefore loses at most some boot history; it
@@ -73,7 +61,7 @@ pub unsafe fn transfer(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut Sl
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
-unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTable)
+unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTable) -> bool
 {
     // Bound on chunks per drain. A first drain sends 1 header + up to
     // init-logd's MAX_SENDERS (32) slots + its history ring's entries + 1
@@ -85,7 +73,7 @@ unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTa
     // and also ends a malformed reply stream that never sends DONE.
     const MAX_ITERS: usize = 2048;
 
-    for _ in 0..MAX_ITERS
+    for iter in 0..MAX_ITERS
     {
         let req = IpcMessage::new(HANDOVER_PULL);
         // SAFETY: caller's invariant — ipc_buf is the registered IPC
@@ -105,7 +93,7 @@ unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTa
             // the bound). Non-fatal: the caller still issues HANDOVER_RELEASE,
             // so a living init-logd is released regardless — at most some boot
             // history is not transferred.
-            return;
+            return iter > 0;
         };
         match wire::decode(&reply)
         {
@@ -138,9 +126,10 @@ unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTa
         // a peer that never sends DONE.
         if wire::is_done(reply.label)
         {
-            return;
+            return true;
         }
     }
+    true
 }
 
 /// Ask init-logd to terminate, retrying until a call is delivered or
@@ -163,14 +152,17 @@ unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTa
 /// an unbounded spin here. Each attempt is bounded by
 /// [`wire::HANDOVER_CALL_TIMEOUT_MS`], so a release to an init-logd that has
 /// already exited (a restarted logd minted the SEND before procmgr's reap of
-/// init) ends within the budget and one bound. An attempt that runs out after
-/// init-logd took it may still have released it.
+/// init) ends within the budget and one bound. An attempt that runs out may
+/// have been taken, and init-logd may have answered it either way after the
+/// expiry: [`Release::Unanswered`], which [`wire::run_rounds`] settles by
+/// whether init-logd answers the next pull.
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
 unsafe fn send_release(handover_send_cap: u64, ipc_buf: *mut u64) -> Release
 {
     let req = IpcMessage::new(HANDOVER_RELEASE);
+    let mut last_err = 0;
     let attempt = || {
         // SAFETY: caller's invariant — ipc_buf is the registered IPC buffer.
         unsafe {
@@ -181,6 +173,7 @@ unsafe fn send_release(handover_send_cap: u64, ipc_buf: *mut u64) -> Release
                 wire::HANDOVER_CALL_TIMEOUT_MS,
             )
         }
+        .map_err(|e| last_err = e)
         .ok()
     };
     let delivered = wire::retry_within(
@@ -191,10 +184,5 @@ unsafe fn send_release(handover_send_cap: u64, ipc_buf: *mut u64) -> Release
             let _ = syscall::thread_yield();
         },
     );
-    match delivered
-    {
-        Some(reply) if wire::is_release_pending(reply.label) => Release::Pending,
-        Some(_) => Release::Acked,
-        None => Release::Unreached,
-    }
+    wire::release_outcome(delivered.map(|reply| reply.label), last_err)
 }

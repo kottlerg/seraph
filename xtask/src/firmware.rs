@@ -34,7 +34,7 @@
 
 use std::ffi::OsStr;
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Result, err};
 
@@ -106,9 +106,9 @@ const OVMF_DEFAULTS: &[(&str, &str)] = &[(
 const OVMF_DEFAULTS: &[(&str, &str)] = &[];
 
 /// EDK2 RISC-V firmware directories (riscv64). The first directory
-/// containing `RISCV_VIRT_CODE.fd` is used as the source of both the
-/// code image and the vars template, unless `SERAPH_RISCV_CODE` /
-/// `SERAPH_RISCV_VARS` override per-file.
+/// containing both `RISCV_VIRT_CODE.fd` and `RISCV_VIRT_VARS.fd` is used
+/// as the source of the code image and the vars template, unless
+/// `SERAPH_RISCV_CODE` and `SERAPH_RISCV_VARS` name the pair.
 #[cfg(target_os = "linux")]
 const RISCV_FIRMWARE_DIRS: &[&str] = &[
     "/usr/share/edk2/riscv",
@@ -387,18 +387,22 @@ fn find_riscv_firmware_impl(
     {
         return Ok(pair);
     }
-    let dir = find_riscv_firmware_dir()?;
-    let code = dir.join("RISCV_VIRT_CODE.fd");
-    let vars = dir.join("RISCV_VIRT_VARS.fd");
-    if !code.is_file()
+    if let Some(pair) = riscv_pair_in(RISCV_FIRMWARE_DIRS)
     {
-        return Err(missing_file_error("RISC-V code firmware", &code));
+        return Ok(pair);
     }
-    if !vars.is_file()
-    {
-        return Err(missing_file_error("RISC-V vars template", &vars));
-    }
-    Ok((code, vars))
+    let tried: Vec<String> = RISCV_FIRMWARE_DIRS
+        .iter()
+        .map(|dir| format!("{dir}/RISCV_VIRT_CODE.fd with {dir}/RISCV_VIRT_VARS.fd"))
+        .collect();
+    let tried: Vec<&str> = tried.iter().map(String::as_str).collect();
+    Err(not_found_error(
+        "RISC-V EDK2 firmware",
+        ENV_RISCV_CODE,
+        ENV_RISCV_VARS,
+        &tried,
+        RISCV_INSTALL_HINTS,
+    ))
 }
 
 /// The `(code, vars)` pair the two env values name, `None` when neither is
@@ -440,26 +444,16 @@ fn env_pair(
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-/// Locate the RISC-V firmware *directory* (containing
-/// `RISCV_VIRT_CODE.fd`). Used by `find_riscv_firmware` only when at
-/// least one of the per-file env vars is unset.
-fn find_riscv_firmware_dir() -> Result<PathBuf>
+/// The `(code, vars)` pair of the first of `dirs` that holds both
+/// `RISCV_VIRT_CODE.fd` and `RISCV_VIRT_VARS.fd`, as the OVMF search takes
+/// only a whole pair: a directory with the code image alone is passed over.
+fn riscv_pair_in<D: AsRef<Path>>(dirs: &[D]) -> Option<(PathBuf, PathBuf)>
 {
-    for dir in RISCV_FIRMWARE_DIRS
-    {
-        let candidate = PathBuf::from(dir);
-        if candidate.join("RISCV_VIRT_CODE.fd").is_file()
-        {
-            return Ok(candidate);
-        }
-    }
-    Err(not_found_error(
-        "RISC-V EDK2 firmware directory",
-        ENV_RISCV_CODE,
-        ENV_RISCV_VARS,
-        RISCV_FIRMWARE_DIRS,
-        RISCV_INSTALL_HINTS,
-    ))
+    dirs.iter().find_map(|dir| {
+        let code = dir.as_ref().join("RISCV_VIRT_CODE.fd");
+        let vars = dir.as_ref().join("RISCV_VIRT_VARS.fd");
+        (code.is_file() && vars.is_file()).then_some((code, vars))
+    })
 }
 
 /// Build the standard "not found" error: label, env-var instruction,
@@ -493,12 +487,6 @@ fn not_found_error(
     );
     msg.push_str(hints);
     err!(msg)
-}
-
-/// Build the "discovered file missing" error.
-fn missing_file_error(label: &str, path: &std::path::Path) -> crate::error::Error
-{
-    err!("{label} not found at resolved path: {}", path.display())
 }
 
 /// Build the "env var set to a path that doesn't exist" error.
@@ -551,6 +539,40 @@ const RISCV_INSTALL_HINTS: &str = "  Fedora:           dnf install edk2-riscv64\
 mod tests
 {
     use super::*;
+
+    // Defect caught: the RISC-V search stopping at the first directory with
+    // the code image and failing on its missing vars template, when a later
+    // directory held the whole pair.
+    #[test]
+    fn the_riscv_search_takes_the_first_directory_with_the_whole_pair()
+    {
+        let root =
+            std::env::temp_dir().join(format!("seraph-xtask-firmware-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dirs = [
+            root.join("code-only"),
+            root.join("pair"),
+            root.join("later"),
+        ];
+        for dir in &dirs
+        {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("RISCV_VIRT_CODE.fd"), b"code").unwrap();
+        }
+        for dir in &dirs[1..]
+        {
+            std::fs::write(dir.join("RISCV_VIRT_VARS.fd"), b"vars").unwrap();
+        }
+        assert_eq!(
+            riscv_pair_in(&dirs),
+            Some((
+                dirs[1].join("RISCV_VIRT_CODE.fd"),
+                dirs[1].join("RISCV_VIRT_VARS.fd")
+            ))
+        );
+        assert_eq!(riscv_pair_in(&dirs[..1]), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A known-existing file inside the workspace, used as a stand-in
     /// for a real firmware image in env-override tests.

@@ -415,12 +415,14 @@ pub(crate) fn turn(l: &mut MemLedger)
         return;
     }
     let now = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
-    let ev = evictor();
-    if now.saturating_sub(ev.last_slice_us) < SWEEP_INTERVAL_US
+    // Each reach of `EVICTOR` below ends before the next call of the
+    // accessor, `reclaiming` and `post` among them.
+    let last = &mut evictor().last_slice_us;
+    if now.saturating_sub(*last) < SWEEP_INTERVAL_US
     {
         return;
     }
-    ev.last_slice_us = now;
+    *last = now;
     let background = reclaiming(l);
     let frames = background && frames_short(l);
     let idle = if background
@@ -437,7 +439,7 @@ pub(crate) fn turn(l: &mut MemLedger)
     let total = pool_total_pages();
     let opens = |l: &MemLedger, reg: NodeIdx| frames && l.evicting_opens(reg, total);
     let found = l.sweep_preferring(
-        &mut ev.hand,
+        &mut evictor().hand,
         SWEEP_SLICE_STEPS,
         |aspace, va, pages, bitmap| syscall::aspace_harvest(aspace, va, pages, bitmap).is_ok(),
         &mut victims,
@@ -778,11 +780,14 @@ fn accessed_since_sweep(l: &mut MemLedger, v: &Victim) -> bool
     l.record_access(reg, chunk_base, u16::from_le_bytes(bitmap))
 }
 
-/// Start evicting the victim `v` through slot `slot`: unmap its runs from
-/// the process, mark it evicting, and map its runs at the slot's input
-/// window. Returns its job. A chunk no longer idle for `idle` sweeps, or a
-/// step that fails, leaves the chunk resident and mapped, and returns
-/// `None`.
+/// Start evicting the victim `v` through slot `slot`: mark it evicting,
+/// unmap its runs from the process, and map its runs at the slot's input
+/// window. Returns its job. A chunk no longer idle for `idle` sweeps, or one
+/// the ledger refuses to evict (an ineligible region, a budget node it would
+/// take below its floor, a chunk not resident), is left as it was, resident
+/// and mapped, before any unmap; a later step that fails maps its runs back
+/// and leaves it resident, or evicting when that map fails, so a fault maps
+/// it again ([`cancel`]). Returns `None` then.
 fn begin(l: &mut MemLedger, v: &Victim, slot: usize, idle: u8) -> Option<Job>
 {
     let (reg, region) = l
@@ -798,11 +803,17 @@ fn begin(l: &mut MemLedger, v: &Victim, slot: usize, idle: u8) -> Option<Job>
     let (runs, n) = chunk_runs(l, reg, v.page_base);
     let runs = runs.get(..n).unwrap_or(&[]);
     let target = remap_target(l, v.rec, aspace, (reg, &region), v.page_base, 0);
-    if !unmap_runs(aspace, runs)
-        || l.begin_evict(v.rec, reg, v.page_base, job_id(slot))
-            .is_err()
+    if l.begin_evict(v.rec, reg, v.page_base, job_id(slot))
+        .is_err()
     {
-        let _ = map_runs(l, &target, runs);
+        return None;
+    }
+    if !unmap_runs(aspace, runs)
+    {
+        if map_runs(l, &target, runs).is_ok()
+        {
+            let _ = l.cancel_evict(v.rec, reg, v.page_base);
+        }
         return None;
     }
     let window = input_va(slot);

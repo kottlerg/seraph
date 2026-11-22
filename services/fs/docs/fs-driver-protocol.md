@@ -307,7 +307,9 @@ session is not tied to that node. The driver deletes every cap beyond
 | `caps[1]` | Liveness cap (a Notification cap with no rights) |
 
 **Reply (error)**: `label = ipc::fs_errors::*`: `INVALID_BADGE` (an open cap
-or a session cap), `PERMISSION_DENIED` (the badge carries no rights),
+or a session cap, or a node cap whose node the driver no longer holds, as
+after an [`FS_REMOVE`](#label-14-fs_remove) of its entry; the mount's root
+cap is always accepted), `PERMISSION_DENIED` (the badge carries no rights),
 `INVALID_ARGUMENT` (`caps[0]` is missing, or memmgr refuses it as a node
 handle), `LIMIT` (the max of the node or of an ancestor refuses the
 session's first page), `OUT_OF_MEMORY` (memmgr refuses that page for want of
@@ -502,10 +504,11 @@ most as many outstanding pages as the cache has slots.
 **Reply (error)**: `label = ipc::fs_errors::*`: `PERMISSION_DENIED`
 (the badge lacks `READ`), `INVALID_BADGE` (a node cap, a closed open, or
 an open whose node was freed), `BAD_MEMORY_OFFSET` (cookie zero),
-`TOO_MANY_OPEN` (the open's outstanding-page table is full, or, in a
-session, the page's record needs another session page the driver cannot
-map), `LIMIT`, `OUT_OF_MEMORY` and `INVALID_ARGUMENT` (in a session: the page's record
-needs another session page, refused as for
+`TOO_MANY_OPEN` (the open's outstanding-page table is full, the driver's
+`CSpace` cannot grow, or, in a session, the page's record needs another
+session page the driver cannot map), `LIMIT`, `OUT_OF_MEMORY` and
+`INVALID_ARGUMENT` (in a session: the page's record needs another session
+page, refused as for
 [`FS_OPEN`](#label-18-fs_open)), `IO_ERROR`
 (the file's cluster chain is corrupt, a block read
 failed, or every cache page is held; the client MAY retry, since the

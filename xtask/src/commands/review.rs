@@ -364,24 +364,31 @@ fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
         field(record, "/audit/verdict"),
         AUDIT_VERDICTS,
     );
-    match field(record, "/audit/sections").as_array()
+    if field(record, "/audit/sections").as_array().is_none()
     {
-        Some(sections) => check_run_kind(out, name, record, sections),
-        None => out.push(shape(name, "audit.sections", "is not a list")),
+        out.push(shape(name, "audit.sections", "is not a list"));
     }
 }
 
 /// That the audit of a run with the reviewer (a `full` or `delta` record)
 /// carries no section of another run kind: one there shows the auditor was
 /// not given its run kind, or misread it, and the audit is re-run with the
-/// run-kind line (.claude/skills/pr-review/SKILL.md § The run).
-fn check_run_kind(out: &mut Vec<Diag>, name: &str, record: &Value, sections: &[Value])
+/// run-kind line (.claude/skills/pr-review/SKILL.md § The run). The gate
+/// asks it of the last run at its head, the one audit whose verdict it
+/// relies on and the one that can still be run again; a record at an older
+/// head, or of the earlier form, which audits wrote before the run-kind line
+/// existed, is not asked it.
+fn check_run_kind(name: &str, record: &Value) -> Vec<Diag>
 {
+    let mut out = Vec::new();
     let mode = field(record, "/stats/mode");
-    if mode != "full" && mode != "delta"
+    if (mode != "full" && mode != "delta") || Form::of(record) == Form::Earlier
     {
-        return;
+        return out;
     }
+    let sections = field(record, "/audit/sections")
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
     for (index, section) in sections.iter().enumerate()
     {
         let title = section["name"].as_str().unwrap_or("").to_ascii_lowercase();
@@ -398,6 +405,7 @@ fn check_run_kind(out: &mut Vec<Diag>, name: &str, record: &Value, sections: &[V
             ));
         }
     }
+    out
 }
 
 /// The four finding lists and each finding in them.
@@ -657,6 +665,11 @@ pub fn gate_diags(records: &[Record], head: &str) -> Vec<Diag>
             "the last run at this head is the reviewer alone; the audit is still owed, as an \
              `audit` record at this head with a greater `stats.run`",
         )];
+    }
+    let misled = check_run_kind(name, record);
+    if !misled.is_empty()
+    {
+        return misled;
     }
     if !passes(record)
     {
@@ -1566,22 +1579,34 @@ mod tests
         r
     }
 
+    // Defect caught: a run with the reviewer whose audit applied another run
+    // kind's checks meeting the gate; or a record of an older head, or of the
+    // earlier form, written before the run-kind line existed and past
+    // running again, failing `review-ledger` and its ledger.
     #[test]
-    fn a_run_with_the_reviewer_whose_audit_has_an_audit_only_section_is_reported()
+    fn a_misled_audit_fails_the_gate_at_its_head_and_nothing_else()
     {
         for mode in ["full", "delta"]
         {
             let name = format!("{mode}-0a82b0aa.json");
-            let auditor_only =
-                with_sections(passing(), mode, &["PR-body claims", "Auditor-only checks"]);
-            let found = check_record(&name, &auditor_only);
+            let defects = defect_record(PASS.0, vec![]);
+            let auditor_only = with_sections(
+                defects.clone(),
+                mode,
+                &["PR-body claims", "Auditor-only checks"],
+            );
+            let found = gate_diags(&[(name.clone(), auditor_only.clone())], HEAD);
             assert_eq!(rules(&found), ["record-run-kind"]);
             assert_eq!(found[0].at, format!("{name}: audit.sections[1]"));
-            let completing = with_sections(passing(), mode, &["completing-audit checks"]);
+            let completing = with_sections(defects, mode, &["completing-audit checks"]);
             assert_eq!(
-                rules(&check_record(&name, &completing)),
+                rules(&gate_diags(&[(name.clone(), completing)], HEAD)),
                 ["record-run-kind"]
             );
+            assert_eq!(check_record(&name, &auditor_only), [] as [Diag; 0]);
+            checked_ledger(&[(name.clone(), auditor_only)]).expect("the ledger is built");
+            let earlier = with_sections(passing(), mode, &["Auditor-only checks"]);
+            assert_eq!(gate_diags(&[(name, earlier)], HEAD), [] as [Diag; 0]);
         }
     }
 

@@ -37,7 +37,7 @@
 //! routine (`IBRS`, the IBPB and the fill after it, and the branch history
 //! clearing) before its handler, the paranoid ones the IBPB from ring 0 as well, and
 //! the `IA32_SPEC_CTRL` write and `VERW` before its `iretq`, where the
-//! selection asks for them (`tf_build_asm`, `tf_resume_asm`, `exit_swapgs_asm`,
+//! selection asks for them (`enter_from_user_asm`, `tf_resume_asm`, `exit_swapgs_asm`,
 //! `paranoid_entry_asm`, `paranoid_exit_asm`;
 //! core/kernel/docs/transient-execution.md § Controls).
 //!
@@ -196,15 +196,24 @@ struct Idtr
 /// rsp = `S-168` = `TrapFrame` base; the stub frame sits at `[rsp+168 ..=
 /// rsp+216]`.
 ///
-/// Last, from ring 3 (the saved CS has a non-zero RPL), it calls
-/// `mitigation::seraph_enter_from_user`, which sets `IBRS`, issues the IBPB
-/// and the fill after it, and clears the branch history where the
-/// transient-execution selection asks for them, before the trampoline reaches
-/// any `ret` or indirect branch
-/// (core/kernel/docs/transient-execution.md § Controls). The call clobbers
-/// `rax`, `rcx`, `rdx` and the flags, all saved or dead by then.
+/// Last, it runs the entry routine from ring 3 ([`enter_from_user_asm`]).
+/// A stub that runs it so must have cleared DF and AC and swapped to the
+/// kernel GS base first (`entry_swapgs_asm`, or the ring-3 path of
+/// `common_irq_trampoline`); a paranoid stub, which decides its swap only
+/// after the frame is saved, runs [`tf_save_asm`], [`paranoid_entry_asm`] and
+/// then [`enter_from_user_asm`] instead.
 #[cfg(not(test))]
 macro_rules! tf_build_asm {
+    () => {
+        concat!(tf_save_asm!(), enter_from_user_asm!())
+    };
+}
+
+/// Naked-asm fragment: the frame-saving part of [`tf_build_asm`], every
+/// `mov` of it and nothing else, so it reads no GS-relative memory and no
+/// user memory and runs whatever DF, AC and the GS base are.
+#[cfg(not(test))]
+macro_rules! tf_save_asm {
     () => {
         concat!(
             "sub rsp, 168\n",
@@ -233,7 +242,25 @@ macro_rules! tf_build_asm {
             "mov [rsp + 144], rax\n",
             "mov rax, [rsp + 216]\n", // stub ss
             "mov [rsp + 152], rax\n",
-            "mov qword ptr [rsp + 160], 0\n",   // fs_base
+            "mov qword ptr [rsp + 160], 0\n", // fs_base
+        )
+    };
+}
+
+/// Naked-asm fragment, run with rsp at the `TrapFrame` base: from ring 3 (the
+/// saved CS has a non-zero RPL), call `mitigation::seraph_enter_from_user`,
+/// which sets `IBRS`, issues the IBPB and the fill after it, and clears the
+/// branch history where the transient-execution selection asks for them,
+/// before the trampoline reaches any `ret` or indirect branch
+/// (core/kernel/docs/transient-execution.md § Controls). Every stub runs it
+/// after its `cld`, `clac` and swap to the kernel GS base, so the routine
+/// runs as all kernel code does (§ Entry and exit discipline in the module
+/// docs). The call clobbers `rax`, `rcx`, `rdx` and the flags, all saved or
+/// dead by then.
+#[cfg(not(test))]
+macro_rules! enter_from_user_asm {
+    () => {
+        concat!(
             "test byte ptr [rsp + 144], 0x3\n", // saved CS RPL; 0 => ring 0
             "jz 85f\n",
             "call seraph_enter_from_user\n",
@@ -371,8 +398,9 @@ macro_rules! exit_swapgs_asm {
 }
 
 /// Naked-asm fragment for stubs that can arrive between a ring-3 entry and its
-/// `swapgs` (NMI, `#MC`, `#DF`, `#DB`). Runs after [`tf_build_asm`] (the
-/// registers it clobbers are saved). Decides from the active GS base rather than
+/// `swapgs` (NMI, `#MC`, `#DF`, `#DB`). Runs after [`tf_save_asm`] (the
+/// registers it clobbers are saved) and before [`enter_from_user_asm`], so
+/// the entry routine runs with DF and AC clear and on the kernel GS base. Decides from the active GS base rather than
 /// the saved CS: a user GS base comes only from a flat GDT descriptor (base 0)
 /// and is never a kernel-half address (`cpu::enable_smep_smap` keeps
 /// `CR4.FSGSBASE` clear on every CPU, so ring 3 has no `wrgsbase`), so a clear
@@ -386,7 +414,7 @@ macro_rules! exit_swapgs_asm {
 /// after it where the selection asks for them (`mitigation::ibpb_asm`): the
 /// stub may have interrupted an entry from user mode before its IBPB, and its
 /// handler's returns would otherwise take the predictions user mode trained.
-/// From ring 3, [`tf_build_asm`] has issued them already. The `lfence` after
+/// From ring 3, [`enter_from_user_asm`] after it issues them. The `lfence` after
 /// it keeps a mispredicted test of the saved CS or a flag from running on.
 #[cfg(not(test))]
 macro_rules! paranoid_entry_asm {
@@ -840,7 +868,9 @@ unsafe extern "custom" fn common_exception_trampoline()
 
 /// [`common_exception_trampoline`] for the vectors that can arrive between a
 /// ring-3 entry and its `swapgs` (`#DB`, `#DF`, `#MC`): identical except that the
-/// GS swap is decided by [`paranoid_entry_asm`] / [`paranoid_exit_asm`].
+/// GS swap is decided by [`paranoid_entry_asm`] / [`paranoid_exit_asm`], after
+/// the frame is saved ([`tf_save_asm`]) and before the entry routine
+/// ([`enter_from_user_asm`]).
 ///
 /// # Safety
 /// Reached only as the jump target of a [`paranoid_isr_stub`] stub, with the
@@ -853,8 +883,9 @@ unsafe extern "custom" fn paranoid_exception_trampoline()
 {
     core::arch::naked_asm!(
         concat!(
-            tf_build_asm!(),
+            tf_save_asm!(),
             paranoid_entry_asm!(),
+            enter_from_user_asm!(),
             "mov rdi, rsp\n",          // arg0 = *mut TrapFrame
             "mov rsi, [rsp + 168]\n",  // arg1 = vector
             "mov rdx, [rsp + 176]\n",  // arg2 = error_code
@@ -1721,12 +1752,13 @@ unsafe extern "custom" fn ipi_tlb_shootdown_stub()
 
 /// NMI backtrace stub (vector 2 with IST=2).
 ///
-/// Builds the canonical [`TrapFrame`] (`tf_build_asm`) — unconditionally, since
+/// Saves the canonical [`TrapFrame`] (`tf_save_asm`) — unconditionally, since
 /// an NMI backtraces whatever ran (kernel or user) and the long-mode iret frame is
 /// always present — then enters through [`paranoid_entry_asm`]: an NMI can arrive
 /// between a ring-3 entry and its `swapgs`, so the GS swap is decided from
 /// `IA32_GS_BASE` rather than the saved CS, and whether it swapped is kept in
-/// `r12` (callee-saved) across the call. It calls the returning
+/// `r12` (callee-saved) across the call. From ring 3 it then runs the entry
+/// routine ([`enter_from_user_asm`]). It calls the returning
 /// [`ipi_nmi_backtrace_handler`], then exits through [`paranoid_exit_asm`], which
 /// undoes the swap, writes the frame back (`tf_restore_asm`), and `iretq`s. The
 /// handler decides at runtime whether
@@ -1742,8 +1774,9 @@ unsafe extern "custom" fn ipi_nmi_backtrace_stub()
         concat!(
             "push 0\n", // placeholder (NMI has no error code)
             "push 2\n", // vector
-            tf_build_asm!(),
+            tf_save_asm!(),
             paranoid_entry_asm!(),
+            enter_from_user_asm!(),
             "mov rdi, rsp\n",         // arg0 = *mut TrapFrame
             "mov rsi, [rsp + 168]\n", // arg1 = vector (= 2)
             "mov rdx, [rsp + 176]\n", // arg2 = error_code (= placeholder 0)

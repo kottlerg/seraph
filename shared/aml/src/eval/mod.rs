@@ -765,7 +765,8 @@ impl<'a> Evaluator<'a>
     }
 
     /// The value of `node` read as an operand: a data object's data (each
-    /// name a package holds resolved, from the node's scope, to a reference
+    /// name a package holds resolved, from the scope its definition appeared
+    /// in (`Namespace::scope_of`), to a reference
     /// when it names an object), a field's contents, the result of a method
     /// that takes no argument, or a reference to any other object.
     fn node_value(&mut self, node: NodeId) -> Result<Data, Fault>
@@ -776,7 +777,7 @@ impl<'a> Evaluator<'a>
             Object::Data(d) =>
             {
                 let mut v = d.try_clone().map_err(bare)?;
-                let scope = self.ns.parent(node).unwrap_or(NodeId::ROOT);
+                let scope = self.ns.scope_of(node).unwrap_or(NodeId::ROOT);
                 self.resolve_names(&mut v, scope);
                 v
             }

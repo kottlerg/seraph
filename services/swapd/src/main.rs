@@ -445,19 +445,22 @@ fn serve_faults(swap: &Swap, recv: u64, mut buf: u64, ipc_buf: *mut u64) -> !
     }
 }
 
-/// [`ipc::recv_guard::RecvGuard`] hook of swapd's receive loop: log the first
-/// failure of a streak and the fatal one.
+/// [`ipc::recv_guard::RecvGuard`] hook of swapd's receive and want loops:
+/// log the first failure of a streak, and end swapd with a fault at the fatal
+/// one ([`fail`]), before the guard's voluntary `EXIT_RECV_WEDGE`, which
+/// svcmgr does not restart under `restart = on_failure`
+/// (services/swapd/docs/operation.md § Supervision).
 fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 {
     match stage
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "receive failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
+            fail(format_args!("receive wedged (err={err})"));
         }
     }
 }
@@ -465,16 +468,21 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// The want thread's loop: on each send on `want`, take the slot words
 /// memmgr posted (`SWAP_WANTED`) and restore each chunk, ahead of any fault.
 /// A word whose chunk a fault restored meanwhile is `RESTORE_STALE` there and
-/// changes nothing.
+/// changes nothing. The wait goes through a receive guard
+/// (docs/ipc-design.md § Receive-Failure Policy), so a wait that keeps
+/// failing ends swapd ([`recv_diag`]) instead of spinning.
 fn serve_wants(swap: &Swap, want: u64, mut buf: u64) -> !
 {
     let take = IpcMessage::new(memmgr_labels::SWAP_WANTED);
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
-        if syscall::notification_wait(want).is_err()
+        if let Err(e) = syscall::notification_wait(want)
         {
+            guard.on_failure(e);
             continue;
         }
+        guard.on_success();
         let reply = call(swap.memmgr, &take, "SWAP_WANTED");
         if reply.label != memmgr_errors::SUCCESS
         {

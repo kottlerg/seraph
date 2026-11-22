@@ -464,8 +464,8 @@ yes`), pwrmgr, entropyd and `stopsrc` (core roles), timed (no `oom_stop`) and th
 table. The whole `LIST_STOP_SOURCES` walk must list exactly
 [sessiond](../sessiond/README.md) and [stopsrc](../stopsrc/README.md), each when its recipe is
 staged, both with the program class, and nothing when neither is staged; through the SEND it
-carries, the fixture's `LIST_CANDIDATES` must reply `SUCCESS` and `STOP_CANDIDATE` of a key it never
-gave `NO_CANDIDATE`, and through the fixture's `:deny` SEND,
+carries, the fixture's `LIST_CANDIDATES` must reply `SUCCESS`, `STOP_CANDIDATE` of a key it never
+gave `NO_CANDIDATE`, and stopsrc's `PROBE` `SUCCESS`, and through the fixture's `:deny` SEND,
 which `QUERY_ENDPOINT` resolves, both must reply `UNAUTHORIZED`. With `stopsrc.svc` staged, the
 phase also checks that svcmgr creates the source contained: through `caps[20]`, `LIST_PROCESSES`
 must list one new process named `/tests/stopsrc`, the job's first argv word, after `START_JOB`;

@@ -252,7 +252,7 @@ pub struct Pass<'a>
 
 /// What a bind carves from and records into: devmgr's held caps, its
 /// interrupt lines, and the device catalog; and what it routes a PCI
-/// function's wired line by, the host bridges' results acpid pushed
+/// function's wired line by, the `_PRT` tables acpid pushed
 /// ([`device_gsi`]).
 pub struct Carve<'a>
 {
@@ -478,7 +478,8 @@ pub fn restart(
                     .filter(|d| same(&candidate.decl, &keys(d)))
                     .is_some_and(|pci_dev| {
                         let restart = RestartSource::of(record, &candidate, budget);
-                        bind_pci(pci_dev, &candidate, restart, carve, pass, ipc_buf)
+                        let all = records.pci.devices();
+                        bind_pci(pci_dev, all, &candidate, restart, carve, pass, ipc_buf)
                     }),
                 RecordId::Platform(index) => records
                     .platform
@@ -627,7 +628,8 @@ pub fn retry(
             let bound = records.pci.state(at) == Some(RecordState::Bound);
             if let Some(pci_dev) = records.pci.devices().get(at).filter(|_| bound)
             {
-                bind_pci(pci_dev, &candidate, Some(source), carve, pass, ipc_buf)
+                let all = records.pci.devices();
+                bind_pci(pci_dev, all, &candidate, Some(source), carve, pass, ipc_buf)
             }
             else
             {
@@ -918,7 +920,15 @@ fn bind_pci_records(
                     continue;
                 };
                 let restart = RestartSource::of(RecordId::Pci(at), candidate, RestartBudget::new());
-                if bind_pci(pci_dev, candidate, restart, carve, pass, ipc_buf)
+                if bind_pci(
+                    pci_dev,
+                    records.devices(),
+                    candidate,
+                    restart,
+                    carve,
+                    pass,
+                    ipc_buf,
+                )
                 {
                     records.mark_bound(at);
                     table.note_bound(index);
@@ -1359,6 +1369,7 @@ fn push_bound(resources: &mut Vec<Resource>, resource: Resource) -> bool
 /// or the spawn fails before the start and is not retried.
 fn bind_pci(
     pci_dev: &pci::PciDevice,
+    records: &[pci::PciDevice],
     candidate: &Candidate<Binary>,
     restart: Option<RestartSource>,
     carve: &mut Carve,
@@ -1392,7 +1403,7 @@ fn bind_pci(
         std::os::seraph::log!(warn: "{}: no memory to record the driver; not bound", name);
         return false;
     }
-    let Some(mut dev_caps) = carve_pci_device(name, pci_dev, decl, carve)
+    let Some(mut dev_caps) = carve_pci_device(name, pci_dev, records, decl, carve)
     else
     {
         return false;
@@ -1488,6 +1499,7 @@ fn bind_pci(
 fn carve_pci_device(
     name: &str,
     pci_dev: &pci::PciDevice,
+    records: &[pci::PciDevice],
     decl: &DriverDecl,
     carve: &mut Carve,
 ) -> Option<PciDeviceCaps>
@@ -1512,7 +1524,16 @@ fn carve_pci_device(
         std::os::seraph::log!(warn: "{}: no memory for the device's resources; not bound", name);
         return None;
     };
-    if fill_pci_device(name, pci_dev, decl, virtio.as_ref(), carve, &mut dev).is_none()
+    if fill_pci_device(
+        name,
+        pci_dev,
+        records,
+        decl,
+        virtio.as_ref(),
+        carve,
+        &mut dev,
+    )
+    .is_none()
     {
         dev.release(&mut carve.caps.slot_bars);
         return None;
@@ -1527,6 +1548,7 @@ fn carve_pci_device(
 fn fill_pci_device(
     name: &str,
     pci_dev: &pci::PciDevice,
+    records: &[pci::PciDevice],
     decl: &DriverDecl,
     virtio: Option<&virtio_core::RegisterLayout>,
     carve: &mut Carve,
@@ -1551,7 +1573,7 @@ fn fill_pci_device(
     }
     // After the DMA grant: on riscv64 a message-signaled target's interrupt
     // file enters the device's IOMMU domain before its vectors are enabled.
-    let Ok(given) = give_interrupt(name, pci_dev, (msi, msix), decl, carve, dev)
+    let Ok(given) = give_interrupt(name, (pci_dev, records), (msi, msix), decl, carve, dev)
     else
     {
         std::os::seraph::log!(
@@ -1832,7 +1854,7 @@ fn grant_dma(
 /// the bind, whose release blocks the domain.
 fn give_interrupt(
     name: &str,
-    pci_dev: &pci::PciDevice,
+    (pci_dev, records): (&pci::PciDevice, &[pci::PciDevice]),
     (msi, msix): (Option<Msi>, Option<Msix>),
     decl: &DriverDecl,
     carve: &mut Carve,
@@ -1851,7 +1873,7 @@ fn give_interrupt(
         {
             InterruptPlan::None => return Ok(None),
             InterruptPlan::Wired => (
-                give_wired(pci_dev, carve.irq_range, carve.bridges, dev)
+                give_wired(pci_dev, records, carve.irq_range, carve.bridges, dev)
                     .then_some(InterruptKind::Wired),
                 1,
             ),
@@ -1929,12 +1951,13 @@ fn not_given(widened: bool) -> NotGiven
 /// given.
 fn give_wired(
     pci_dev: &pci::PciDevice,
+    records: &[pci::PciDevice],
     irq_range: &mut IrqRangeAllocator,
     bridges: &firmware::acpid::Bridges,
     dev: &mut PciDeviceCaps,
 ) -> bool
 {
-    let Some(gsi) = device_gsi(pci_dev, bridges)
+    let Some(gsi) = device_gsi(pci_dev, records, bridges)
     else
     {
         std::os::seraph::log!(
@@ -2315,17 +2338,20 @@ fn acquire_single_irq_cap(gsi: u32, irq_range: &mut IrqRangeAllocator) -> Option
 
 /// The GSI of a PCI device: the firmware-programmed config-space IRQ line
 /// when one is set, else the arch `INTx` routing fallback
-/// ([`arch::current::intx_fallback_gsi`]) of the pin and device number its
-/// interrupt reaches its root bus with (`PciDevice::host_intx`), which on
-/// x86-64 reads the route acpid pushed for its host bridge, held in
-/// `bridges`. `None` for a function no line can be found for.
-pub fn device_gsi(pci_dev: &pci::PciDevice, bridges: &firmware::acpid::Bridges) -> Option<u32>
+/// ([`arch::current::intx_fallback_gsi`]), which on x86-64 reads the routes
+/// acpid pushed, held in `bridges`, of the nearest bridge above the device in
+/// `records` that has them. `None` for a function no line can be found for.
+pub fn device_gsi(
+    pci_dev: &pci::PciDevice,
+    records: &[pci::PciDevice],
+    bridges: &firmware::acpid::Bridges,
+) -> Option<u32>
 {
     if pci_dev.irq_line != 0 && pci_dev.irq_line != 0xFF
     {
         return Some(u32::from(pci_dev.irq_line));
     }
-    arch::current::intx_fallback_gsi(pci_dev, bridges)
+    arch::current::intx_fallback_gsi(pci_dev, records, bridges)
 }
 
 /// The `Mmio` cap of the configuration page of the function at `address`

@@ -162,11 +162,14 @@ post-handover.
 Init then serves svcmgr the **handover endowment** (see
 [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md)
 § Handover endowment) over the
-bootstrap-round protocol: the `CAPS` rounds (two rounds for its eight
-slots) carry svcmgr's own endpoints plus the publish-role source caps
-(a `SEND` on vfsd's synthetic root, derived from init's system-root
-cap, a badge-0 `SEND|GRANT` source on devmgr's registry
-endpoint, and three badged SENDs on vfsd's service endpoint); each
+bootstrap-round protocol: the `CAPS` rounds (as many as its slot list
+takes, one per window of `MSG_CAP_SLOTS_MAX` slots) carry svcmgr's own
+endpoints plus the publish-role source caps (a `SEND` on vfsd's synthetic
+root, derived from init's system-root cap, a badge-0 `SEND|GRANT` source
+on devmgr's registry endpoint, three badged SENDs on vfsd's service
+endpoint, and a `SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's
+endpoint) and the `EntropyControl` source svcmgr derives the entropy
+authority service's copy from; each
 subsequent `SUBSTRATE` round carries one `(name, thread_cap, observer)`
 triple for a substrate service init bootstrapped (`memmgr`, `procmgr`,
 `devmgr`, `vfsd`), and a terminal `LOGD_SOURCES` round carries the
@@ -176,9 +179,10 @@ endpoint, from which svcmgr launches and restarts real logd (per
 § Supervision hierarchy). svcmgr — not init — then publishes the
 well-known names it owns into its own registry
 (`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `DEVMGR_REGISTRY`,
-`DEVMGR_SHUTDOWN`, `DEVMGR_BIND` (seed-only, a name whose seeds receive `SEND|GRANT`), the
-`DEVMGR_CLASS_PREFIX` class names, `VFSD_MOUNT`, `VFSD_DENY`, `VFSD_SWAP`, `LOGD_QUERY`, minted
-from the endowed sources) and
+`DEVMGR_SHUTDOWN`, `DEVMGR_BIND` (seed-only, a name whose seeds receive `SEND|GRANT`),
+`DEVMGR_ACPI`, the `DEVMGR_CLASS_PREFIX` class names, `VFSD_MOUNT`, `VFSD_DENY`, `VFSD_SWAP`,
+`MEMMGR_SWAP` (seed-only, its seeds keeping `GRANT`), `LOGD_QUERY`, minted from the endowed
+sources) and
 installs devmgr's `/services/drivers/` cap via
 `devmgr_labels::SET_DRIVERS_DIR`.
 The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`, `acpid.power`, `acpid.deny`) are

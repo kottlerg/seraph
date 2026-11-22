@@ -157,9 +157,7 @@ pub enum Unresolved
 }
 
 /// The route to the port above `target`, a device below a PCI-to-PCI bridge
-/// of one of `bridges`: the target's parent is the port, and each device
-/// above it, up to the host bridge, a PCI-to-PCI bridge, each named by its
-/// `_ADR`.
+/// of one of `bridges`: the target's parent is the port ([`bridge_route`]).
 ///
 /// # Errors
 ///
@@ -174,8 +172,25 @@ pub fn route(
     {
         return Err(Unresolved::NotPci);
     }
+    let port = ev.namespace().parent(target).ok_or(Unresolved::NoBridge)?;
+    bridge_route(ev, bridges, port)
+}
+
+/// The route to `port`, a PCI-to-PCI bridge below one of `bridges`: it and
+/// each device above it, up to the host bridge, a PCI-to-PCI bridge, each
+/// named by its `_ADR`.
+///
+/// # Errors
+///
+/// The [`Unresolved`] that names why `port` has no such route.
+pub fn bridge_route(
+    ev: &mut Evaluator<'_>,
+    bridges: &[Bridge],
+    port: NodeId,
+) -> Result<Route, Unresolved>
+{
     let mut hops = Vec::new();
-    let mut node = ev.namespace().parent(target).ok_or(Unresolved::NoBridge)?;
+    let mut node = port;
     loop
     {
         if let Some(bridge) = bridges.iter().find(|b| b.node == node)

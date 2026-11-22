@@ -157,9 +157,9 @@ fn capture(
     {
         return Outcome::Failed("the process is on the core path");
     }
-    if target.dump == crate::Dump::MemoryCritical
+    if target.dump == crate::Dump::MemoryShort
     {
-        return Outcome::Failed("memory is critical");
+        return Outcome::Failed("memory is short");
     }
     match hold_threads(target, authority, ipc_buf, held)
     {

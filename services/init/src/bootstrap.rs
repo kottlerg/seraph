@@ -180,8 +180,7 @@ fn retype_reserve_pages() -> u64
 /// Bodies init's own `CSpace` arena backs after [`fund_own_cspace`] besides
 /// one per MMIO aperture: the split tails of the four `MemoryAlloc` carves
 /// that follow init's own arena's (memmgr's and procmgr's arenas, the
-/// spawned services' env page when the log-level configuration needs it,
-/// and the phys-table page), the two children of the `SchedControl` split,
+/// spawned services' argv/env page, and the phys-table page), the two children of the `SchedControl` split,
 /// and the derivations of the root `Interrupt` cap and, on x86-64, of the
 /// root `IoPort` cap that init serves devmgr. Fixed by init's own code; the
 /// aperture derivations scale with the hardware and are counted from

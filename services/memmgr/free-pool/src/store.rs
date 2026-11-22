@@ -40,9 +40,10 @@ const HEADER_BYTES: usize = 2;
 /// Encode the pages of a chunk whose backed mask is `backed` into the start of
 /// `out`, reading page `i` through `page(i)` for each bit `i` set, and using
 /// `table` as the compressor's ([`compress::compress`]). Returns the
-/// stream's length, 0 when every page is zero (the empty stream), or `None`
-/// when it does not fit `out`, so a caller that sizes `out` below what the
-/// chunk's pages take in RAM learns that storing them gains nothing.
+/// stream's length, 0 when every page is zero (the empty stream, which fits
+/// any `out`, an empty one too), or `None` when it does not fit `out`, so a
+/// caller that sizes `out` below what the chunk's pages take in RAM learns
+/// that storing them gains nothing.
 pub fn encode_chunk<'a>(
     backed: u16,
     mut page: impl FnMut(u32) -> &'a [u8; PAGE_BYTES],
@@ -77,8 +78,16 @@ pub fn encode_chunk<'a>(
             }
         };
         nonzero |= header != ZERO_PAGE;
-        out.get_mut(len..body)?
-            .copy_from_slice(&header.to_le_bytes());
+        match out.get_mut(len..body)
+        {
+            Some(slot) => slot.copy_from_slice(&header.to_le_bytes()),
+            // While every page so far is zero the stream may still be the
+            // empty one, so a header past `out` is no overflow yet: `len`
+            // then lies past `out`, and a later non-zero page's write fails.
+            None if !nonzero =>
+            {}
+            None => return None,
+        }
         let taken = if header == RAW_PAGE
         {
             PAGE_BYTES
@@ -304,6 +313,43 @@ mod tests
         {
             assert_eq!(p, zero);
         }
+    }
+
+    #[test]
+    fn an_all_zero_chunk_is_the_empty_stream_whatever_the_output_length()
+    {
+        let zero = [0u8; PAGE_BYTES];
+        let mut table = Box::new([0u16; HASH_ENTRIES]);
+        // One backed page, whose gain limit leaves no output byte at all.
+        assert_eq!(encode_chunk(0b1, |_| &zero, &mut [], &mut table), Some(0));
+        // A whole chunk, into less than its pages' headers take.
+        let mut out = [0u8; 3];
+        assert_eq!(
+            encode_chunk(0xFFFF, |_| &zero, &mut out, &mut table),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_zero_page_header_past_the_output_refuses_a_stream_with_data()
+    {
+        let pages = pages();
+        let mut table = Box::new([0u16; HASH_ENTRIES]);
+        // Page 0 is zero and page 3 compressible: the zero page's header fits
+        // no empty output, and the stream is not empty.
+        assert_eq!(
+            encode_chunk(0b1001, |i| &pages[i as usize], &mut [], &mut table),
+            None
+        );
+        // Page 3, then the zero page 4, whose header lands past an output
+        // that holds page 3's stream alone.
+        let mut out = vec![0u8; PAGE_BYTES];
+        let len = encode_chunk(0b1000, |i| &pages[i as usize], &mut out, &mut table).unwrap();
+        let mut out = vec![0u8; len];
+        assert_eq!(
+            encode_chunk(0b1_1000, |i| &pages[i as usize], &mut out, &mut table),
+            None
+        );
     }
 
     #[test]

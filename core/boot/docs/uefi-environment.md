@@ -348,9 +348,12 @@ resets `ConIn`, discarding keys typed before the question, prints the question, 
 `ConIn`'s key event and a relative timer event of 60 seconds with `WaitForEvent`. Each printable key
 read with `ReadKeyStroke` is added to the line and echoed, Backspace removes the last character,
 other keys are ignored, and Enter ends the line, which confirms the request only when it is exactly
-`yes`; the timer's firing ends the wait as no answer. The timer, not `Stall`, bounds the wait, since
-a firmware may run `Stall` on no clock. The timer event is closed on every path. A `ConIn` that is
-absent, or a call that fails, refuses the request.
+`yes`; the timer's firing ends the wait as no answer. The timer is the first event of the wait,
+since `WaitForEvent` returns the first signalled event in its array's order: keys that keep arriving
+do not hold the wait past it. The timer, not `Stall`, bounds the wait, since a firmware may run
+`Stall` on no clock. The timer event is closed on every path. A `ReadKeyStroke` that finds no key
+(`EFI_NOT_READY`) waits again. A `ConIn` that is absent, or any other call that fails, refuses the
+request.
 
 ## Console Output
 

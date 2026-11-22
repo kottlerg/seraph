@@ -106,11 +106,16 @@ a probe, a `BLK_GET_GEOMETRY` that lends no buffer, made until it shows which:
 
 ## Supervision
 
-The recipe sets `restart = on_failure` and `critical = no`. svcmgr creates the endpoint and holds it
-across restarts ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) §
-`provides`), and memmgr's redirect SEND is a derivation of it. While swapd is down, nothing is
-written, and each fault on a chunk on disk waits on the endpoint for the next instance, which
-registers again and serves it; a fault the dead instance held is unhandled, and its thread dies
+The recipe sets `restart = on_failure` and `critical = no`. Every way swapd cannot serve ends it
+with a fault, which `on_failure` restarts, never with a voluntary exit code, which it does not: a
+receive loop or the want thread's wait that wedges ends swapd with a fault from its receive guard's
+fatal hook, before the guard's `EXIT_RECV_WEDGE` ([docs/ipc-design.md](../../../docs/ipc-design.md)
+§ Receive-Failure Policy), so the next instance starts with a fresh `CSpace`. svcmgr creates the
+endpoint and holds it across restarts ([`.svc` Service
+Definitions](../../svcmgr/docs/service-definitions.md) § `provides`), and memmgr's redirect SEND is
+a derivation of it. While swapd is down, nothing is written, and each fault on a chunk on disk waits
+on the endpoint for the next instance, which registers again and serves it; a fault the dead
+instance held is unhandled, and its thread dies
 ([docs/fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and Kill). Once swapd
 is permanently down, its restarts spent, those faults wait for good, and the system runs degraded:
 every `critical = yes` service is a reserve node, which memmgr never evicts, so the core keeps

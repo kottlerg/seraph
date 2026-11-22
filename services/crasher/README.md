@@ -23,13 +23,16 @@ endpoint from bootstrap slot 0, logs `worker-fault: serving`, and serves
 `PROBE_FAULT_WORKER` replies, then receives nothing more while a worker thread takes a terminal
 fault after `FAULT_DELAY_MS` (200 ms), logging `worker-fault: worker thread faulting`. The role
 starts that thread before it serves and lets it go on the request, so the fault takes no memory
-when it is asked for, and one asked for while memory is critical still happens. procmgr
+when it is asked for, and one asked for while memory is critical still happens. An instance that
+cannot start the thread (memmgr refuses its IPC buffer's grant while memory is critical) logs
+`worker-fault: worker thread not started; retrying` at warn level and tries again every 50 ms,
+serving once it runs. procmgr
 tears the process down, and svcmgr restarts it through its address-space observer; svctest's
 `svcmgr_worker_fault_restart` phase, which runs when this recipe is staged, reads a new nonce from
 the restarted instance. `oom_stop = yes` makes it a service of that boot a stop-authority holder may
 stop, as the `memhog` fixture does ([memhog](../memhog/README.md)): svctest's `svcmgr_stop_service`
 phase lists it, has svcmgr stop it, and reads the restarted instance's nonce the same way. A role
-that lacks its endpoint or nonce, or cannot start the worker, logs `FATAL: worker-fault: ...`.
+that lacks its endpoint or nonce logs `FATAL: worker-fault: ...`.
 
 A third role, selected by argv `crasher boot-fault`, checks that svcmgr routes the death of a
 service that dies before its bootstrap request. Its recipe,

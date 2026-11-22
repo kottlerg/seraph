@@ -320,6 +320,43 @@ pub(crate) fn pool_free_and_largest() -> (u64, u64)
     (reply.word(3), reply.word(5))
 }
 
+/// memmgr's pool as a grant to svctest, a node outside the reserve, is
+/// admitted against it, in bytes, from one `QUERY_POOL_STATUS`: the free
+/// bytes outside `promised` (`data[17]`), which the grant and an uncommitted
+/// demand fault draw from, the largest free run (`data[5]`), and the growth
+/// floor (`data[11]`) they may not take (services/memmgr/docs/ipc-interface.md
+/// § Label 6).
+pub(crate) fn pool_admissible() -> PoolAdmissible
+{
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
+    let reply = memmgr_call(&req, "QUERY_POOL_STATUS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "QUERY_POOL_STATUS status"
+    );
+    PoolAdmissible {
+        free: reply.word(3),
+        uncommitted: reply.word(17),
+        largest: reply.word(5),
+        floor: reply.word(11),
+    }
+}
+
+/// What [`pool_admissible`] read, in bytes.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PoolAdmissible
+{
+    /// Free bytes (`data[3]`).
+    pub(crate) free: u64,
+    /// Free bytes outside `promised` (`data[17]`).
+    pub(crate) uncommitted: u64,
+    /// Bytes of the largest free run (`data[5]`).
+    pub(crate) largest: u64,
+    /// The growth floor (`data[11]`).
+    pub(crate) floor: u64,
+}
+
 /// memmgr's growth floor (`QUERY_POOL_STATUS` `data[11]`), in bytes: the free
 /// bytes outside `promised` a grant to svctest, which is outside the reserve,
 /// may not take, the system reserve and, while chunks are swapped, the restore
@@ -792,9 +829,10 @@ struct StrayCapCase
 }
 
 /// Every label whose contract carries no caps, `REQUEST_MEMORY_CAPS` and
-/// `REGISTER_DONATION_END`, whose handlers delete a refused `cap[0]`, the two
-/// procmgr-only cap-carrying labels from a caller that is not procmgr, a forged
-/// `FAULT_LABEL`, and an unknown label. Each request is refused or has no
+/// `REGISTER_DONATION_END`, whose handlers delete a refused `cap[0]`, the
+/// three procmgr-only cap-carrying labels (`REGISTER_PROCESS`,
+/// `DONATE_MEMORY_CAPS` and `DELEGATE_ASPACE`) from a caller that is not
+/// procmgr, a forged `FAULT_LABEL`, and an unknown label. Each request is refused or has no
 /// lasting effect, so the flood changes no memmgr state but its `CSpace`.
 const STRAY_CAP_CASES: [StrayCapCase; 13] = [
     // want_pages == 0: `cap[0]` reaches the handler, which reads its badge
@@ -819,10 +857,12 @@ const STRAY_CAP_CASES: [StrayCapCase; 13] = [
         kept: 0,
         expected: ipc::memmgr_errors::SUCCESS,
     },
+    // `cap[0]` reaches the handler, which reads its badge and deletes it
+    // before it refuses.
     StrayCapCase {
         label: ipc::memmgr_labels::REGISTER_PROCESS,
         words: [0, 0, 0],
-        kept: 0,
+        kept: 1,
         expected: ipc::memmgr_errors::UNAUTHORIZED,
     },
     StrayCapCase {
@@ -892,18 +932,25 @@ const STRAY_CAP_CASES: [StrayCapCase; 13] = [
 /// (services/memmgr/docs/ipc-interface.md § Kernel-origin fault message).
 const DECLINE_NOT_VM: u64 = 1;
 
-/// Stray caps one case must leave behind to overflow memmgr's `CSpace`: more
-/// than the slots it is seeded with (init's `CSPACE_RETYPE_PAGES` slot pages,
-/// about 8 Ki slots), with margin.
+/// Stray caps a case leaves in memmgr's `CSpace` when memmgr keeps those of
+/// either deletion path: far more than the slots memmgr's other work takes
+/// and gives back during a case. memmgr funds its `CSpace` from its own pool
+/// before every receive, so such a leak does not wedge it; the phase reads it
+/// in memmgr's used slots instead.
 const STRAY_CAP_LEAK_BUDGET: usize = 9 * 1024;
+
+/// Used slots of memmgr's `CSpace` a case may leave above where it started:
+/// half of [`STRAY_CAP_LEAK_BUDGET`], so a leak on either path exceeds it and
+/// the runs memmgr's other work splits and joins meanwhile do not.
+const STRAY_CAP_SLACK: u64 = (STRAY_CAP_LEAK_BUDGET / 2) as u64;
 
 /// Calls a case makes so that a leak on either of its two deletion paths alone
 /// reaches [`STRAY_CAP_LEAK_BUDGET`]: `dispatch` deletes the
 /// `MSG_CAP_SLOTS_MAX - kept` caps past the contract, and the handler deletes
 /// the `kept` contract caps it refuses. The smaller nonzero per-call leak of
 /// the two sets the count, so a memmgr that kept either path's caps would
-/// exhaust its `CSpace` during that case, fail its receive, and exit with
-/// `EXIT_RECV_WEDGE`.
+/// leave at least [`STRAY_CAP_LEAK_BUDGET`] more slots of its `CSpace` used
+/// after that case.
 const fn stray_cap_calls(kept: usize) -> usize
 {
     let dispatch_leak = MSG_CAP_SLOTS_MAX
@@ -921,9 +968,11 @@ const fn stray_cap_calls(kept: usize) -> usize
 }
 
 /// Flood memmgr, case by case, with caps attached to messages whose contract
-/// does not keep them, then check it still answers. Every call must also get
-/// its case's normal reply, so deleting the strays changes no label's
-/// behaviour.
+/// does not keep them, and check that each case leaves memmgr's used `CSpace`
+/// slots (`QUERY_POOL_STATUS` `data[19]`) within [`STRAY_CAP_SLACK`] of
+/// where it started, so memmgr deleted the strays, and that it still answers.
+/// Every call must also get its case's normal reply, so deleting the strays
+/// changes no label's behaviour.
 #[expect(
     clippy::large_stack_frames,
     reason = "the `builder`, its built copy and the `reply` `IpcMessage`s (568 B each) of each \
@@ -937,6 +986,7 @@ pub fn stray_cap_flood_phase(_: &Caps)
     for case in &STRAY_CAP_CASES
     {
         let label = case.label;
+        let used_before = memmgr_cspace_used();
         for call in 0..stray_cap_calls(case.kept)
         {
             let mut builder = ipc::IpcMessage::builder(label)
@@ -966,6 +1016,11 @@ pub fn stray_cap_flood_phase(_: &Caps)
                 .checked_add(1)
                 .expect("stray-cap call count overflowed");
         }
+        let kept = memmgr_cspace_used().saturating_sub(used_before);
+        assert!(
+            kept < STRAY_CAP_SLACK,
+            "memmgr kept {kept} more CSpace slots across the stray-cap calls with label {label:#x}"
+        );
     }
 
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
@@ -981,6 +1036,19 @@ pub fn stray_cap_flood_phase(_: &Caps)
             .checked_mul(MSG_CAP_SLOTS_MAX)
             .expect("stray cap total overflowed")
     );
+}
+
+/// The used slots of memmgr's `CSpace`, `QUERY_POOL_STATUS` `data[19]`.
+fn memmgr_cspace_used() -> u64
+{
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
+    let reply = memmgr_call(&req, "QUERY_POOL_STATUS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "QUERY_POOL_STATUS status"
+    );
+    reply.word(19)
 }
 
 /// Assert the all-RAM-accounted identity `system_ram == kernel_reserved +

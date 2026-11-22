@@ -16,8 +16,8 @@ use crate::eval::Evaluator;
 use crate::host::{Host, HostError, Width};
 use crate::value::Data;
 use crate::{
-    EVAL_STACK_BYTES, Fault, MAX_CALL_DEPTH, MAX_EVAL_ALLOC, MAX_EVAL_DEPTH, MAX_EVAL_OBJECTS,
-    MAX_EVAL_STEPS, MAX_VALUE_DEPTH, PARSE_STACK_BYTES,
+    EVAL_STACK_BYTES, Fault, MAX_BUFFER_BYTES, MAX_CALL_DEPTH, MAX_EVAL_ALLOC, MAX_EVAL_DEPTH,
+    MAX_EVAL_OBJECTS, MAX_EVAL_STEPS, MAX_VALUE_DEPTH, PARSE_STACK_BYTES,
 };
 
 // ── Assembler ─────────────────────────────────────────────────────────
@@ -1379,15 +1379,65 @@ fn the_values_an_evaluation_makes_are_bounded()
         fault(&[], &store(&pkg_obj(&[0x13], &i(5000)), &l(0))),
         FaultKind::Bound
     );
-    // A string grown past MAX_BUFFER_BYTES.
-    let grow = cat(&[
-        &store(&string(""), &l(0)),
-        &while_(
-            &[0x01],
-            &op(&[0x73], &[&l(0), &string("0123456789abcdef"), &l(0)]),
-        ),
+    // A string doubled by Concatenate: 16 bytes doubled 12 times reaches
+    // MAX_BUFFER_BYTES, which it may, and a 13th passes it, long before
+    // MAX_EVAL_ALLOC or MAX_EVAL_STEPS ends the evaluation.
+    let doubled = |times: usize| {
+        cat(&[
+            &store(&string("0123456789abcdef"), &l(0)),
+            &op(&[0x73], &[&l(0), &l(0), &l(0)]).repeat(times),
+            &ret(&op(&[0x87], &[&l(0)])),
+        ])
+    };
+    assert_eq!(16 << 12, MAX_BUFFER_BYTES);
+    assert_eq!(int_of(&doubled(12)), 65_536);
+    assert_eq!(fault(&[], &doubled(13)), FaultKind::Bound);
+}
+
+#[test]
+fn a_scope_over_an_alias_in_a_method_calls_the_targets_methods()
+{
+    // Scope (ALS0) { Local0 = MTH1 (5) }, ALS0 an Alias of DEV0, which holds
+    // MTH1: the call is parsed in DEV0, as it runs, so 5 is its argument.
+    let defs = cat(&[
+        &device("DEV0", &method("MTH1", 1, &ret(&bin(0x72, &a(0), &i(1))))),
+        &cat(&[&[0x06], &name("DEV0"), &name("ALS0")]),
     ]);
-    assert_eq!(fault(&[], &grow), FaultKind::Bound);
+    let body = cat(&[
+        &scope("ALS0", &store(&cat(&[&n("MTH1"), &i(5)]), &l(0))),
+        &ret(&l(0)),
+    ]);
+    assert_eq!(ok(&defs, &body), Data::Integer(6));
+}
+
+#[test]
+fn a_definition_by_a_path_resolves_its_names_from_where_it_is_written()
+{
+    // In DEV0: OperationRegion (\XREG, SystemMemory, OFS0, 4) and
+    // Name (\PRT0, Package () { LNKA }), with OFS0 and LNKA DEV0's own: each
+    // name resolves from DEV0, where the definition is written, not from the
+    // root the path places it under.
+    let defs = device(
+        "DEV0",
+        &cat(&[
+            &name_obj("OFS0", &i(0x2000)),
+            &device("LNKA", &[]),
+            &region("\\XREG", 0, &n("OFS0"), &i(4)),
+            &field("\\XREG", 0x01, &[unit("XB00", 8)]),
+            &name_obj("\\PRT0", &package(1, &[n("LNKA")])),
+        ]),
+    );
+    let mut ns = table_of(2, &defs, 0, &store(&i(0x5A), &n("\\DEV0.XB00")));
+    let mut sim = Sim::new();
+    run_on(&mut ns, &mut sim, "\\TEST", vec![]).unwrap();
+    assert_eq!(sim.mem_byte(0x2000), 0x5A);
+    let prt = run_on(&mut ns, &mut sim, "\\PRT0", vec![]).unwrap();
+    let Data::Package(p) = prt
+    else
+    {
+        panic!("{prt:?}");
+    };
+    assert!(matches!(p[0], Data::Ref(_)), "{:?}", p[0]);
 }
 
 #[test]

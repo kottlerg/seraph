@@ -179,6 +179,9 @@ pub const FB_WINDOW_END: u64 = crate::SCRATCH_LOW_BASE;
 /// Byte offset of the stack pointer (`rsp`) in the register file.
 pub const SP_OFFSET: usize = syscall_abi::REGS_X86_64_SP_OFFSET;
 
+/// Byte offset of the TLS base (`fs_base`) in the register file.
+pub const TLS_OFFSET: usize = syscall_abi::REGS_X86_64_FS_BASE_OFFSET;
+
 /// The stack pointer an `extern "C"` function expects on entry, at or below
 /// `sp`: the System V ABI enters a function with `rsp + 8` 16-byte aligned (a
 /// return address just pushed), so a frame redirected into an entry gets

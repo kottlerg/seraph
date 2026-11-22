@@ -4,11 +4,14 @@
 // core/boot/src/signing.rs
 
 //! Signature verification of the kernel and the bundle entries against the
-//! trust store built into the bootloader
+//! store the boot runs on: the trust store built into the bootloader merged
+//! with the one enrolled in firmware storage (`crate::enrolment`), or the
+//! store a trust request gives when the boot applies one
 //! ([docs/signing.md](../../../docs/signing.md) § Trust Store and § Verifier
-//! Discipline).
+//! Discipline). A [`Verifier`] is built from that effective store, never from
+//! the built-in store alone, which would miss an enrolled revocation.
 //!
-//! The store is embedded at build time from the file xtask names in
+//! The built-in store is embedded at build time from the file xtask names in
 //! `SERAPH_BOOT_TRUST_STORE` (xtask/README.md § Signing), in the layout of
 //! `objsig::embed`, through which a pack reads it back out of the installed
 //! image. Every object is verified through [`Verifier::object`], which returns

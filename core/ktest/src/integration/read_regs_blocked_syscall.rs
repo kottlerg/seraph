@@ -20,6 +20,9 @@
 //!   overwrites only on exit; `a7` on riscv64) names the blocking syscall, and
 //!   the stack pointer lies in the child's own stack, so the file is the
 //!   frame the thread entered the syscall with;
+//! - the TLS-base word (`fs_base` on x86-64, which every entry leaves out of
+//!   the frame; `tp` on riscv64) holds the base the child was configured
+//!   with, the receiver's own block and 0 for the client;
 //! - a second read returns the same file, the thread still blocked;
 //! - `SYS_THREAD_READ_EXT_REGS` reads the thread's extended state;
 //! - `SYS_THREAD_WRITE_REGS` of the file is refused `InvalidState`, since the
@@ -35,15 +38,15 @@
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, thread_exit, thread_read_ext_regs, thread_read_regs,
-    thread_sleep, thread_write_regs,
+    notification_send, notification_wait, thread_configure_with_tls, thread_exit,
+    thread_read_ext_regs, thread_read_regs, thread_sleep, thread_start, thread_write_regs,
 };
 use syscall_abi::{
     RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, SYS_IPC_CALL,
     SYS_IPC_RECV, SyscallError, THREAD_REGS_SYSCALL,
 };
 
-use crate::arch::{SP_OFFSET, SYSCALL_NR_OFFSET, TRAP_FRAME_BYTES};
+use crate::arch::{SP_OFFSET, SYSCALL_NR_OFFSET, TLS_OFFSET, TRAP_FRAME_BYTES};
 use crate::spawn::{SpawnedChild, reg_word};
 use crate::tally::await_report;
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -72,6 +75,13 @@ struct IpcBufPage([u64; 512]);
 static mut CLIENT_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 static mut RECEIVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+
+/// The receiver's TLS block, its thread pointer the block's address. No code
+/// of the cell reads thread-local storage; the block only gives the receiver
+/// a base of its own that the register file must report.
+#[repr(C, align(64))]
+struct TlsBlock([u64; 8]);
+static mut RECEIVER_TLS: TlsBlock = TlsBlock([0u64; 8]);
 
 static mut CLIENT_STACK: ChildStack = ChildStack::ZERO;
 static mut SERVER_STACK: ChildStack = ChildStack::ZERO;
@@ -174,12 +184,13 @@ fn scenario(ctx: &TestContext, caps: &mut Caps, children: &mut [SpawnedChild; 3]
     )?;
     // SAFETY: `RECEIVER_STACK` is a static stack, reached only through `addr_of!`.
     let receiver_stack = unsafe { ChildStack::top(core::ptr::addr_of!(RECEIVER_STACK)) };
-    children[RECEIVER] = start(
+    let receiver_tls = core::ptr::addr_of!(RECEIVER_TLS) as u64;
+    children[RECEIVER] = start_with_tls(
         ctx,
         caps,
         RECEIVER,
         receiver_entry,
-        receiver_stack,
+        (receiver_stack, receiver_tls),
         (caps.recv_ep, RIGHTS_EP_RECEIVE),
     )?;
 
@@ -196,8 +207,12 @@ fn scenario(ctx: &TestContext, caps: &mut Caps, children: &mut [SpawnedChild; 3]
         BIT_RECEIVING,
         "integration::read_regs_blocked_syscall: the receiver never reported receiving",
     )?;
-    read_blocked(children[CLIENT].th, SYS_IPC_CALL, client_stack)?;
-    read_blocked(children[RECEIVER].th, SYS_IPC_RECV, receiver_stack)?;
+    read_blocked(children[CLIENT].th, SYS_IPC_CALL, (client_stack, 0))?;
+    read_blocked(
+        children[RECEIVER].th,
+        SYS_IPC_RECV,
+        (receiver_stack, receiver_tls),
+    )?;
     if acc & BIT_RETURNED != 0
     {
         return Err("integration::read_regs_blocked_syscall: a blocking syscall returned");
@@ -214,6 +229,19 @@ fn start(
     slot: usize,
     entry: extern "C" fn(u64) -> !,
     stack_top: u64,
+    ep: (u64, u64),
+) -> Result<SpawnedChild, &'static str>
+{
+    start_with_tls(ctx, caps, slot, entry, (stack_top, 0), ep)
+}
+
+/// [`start`], the child's TLS base `tls` (0 for none).
+fn start_with_tls(
+    ctx: &TestContext,
+    caps: &Caps,
+    slot: usize,
+    entry: extern "C" fn(u64) -> !,
+    (stack_top, tls): (u64, u64),
     (ep, ep_rights): (u64, u64),
 ) -> Result<SpawnedChild, &'static str>
 {
@@ -231,17 +259,21 @@ fn start(
     // SAFETY: slot `slot` is this child's alone, and the child has not
     // started.
     let arg = unsafe { ARGS.publish(slot, args) };
-    // SAFETY: `stack_top` tops the child's own `ChildStack` (`CLIENT_STACK`,
-    // `SERVER_STACK` or `RECEIVER_STACK`), on which no other live thread runs.
-    unsafe { spawn::configure_and_start(&child, entry, stack_top, arg) }
+    // SAFETY: `entry` is an `extern "C" fn(u64) -> !`; `stack_top` tops the
+    // child's own `ChildStack` (`CLIENT_STACK`, `SERVER_STACK` or
+    // `RECEIVER_STACK`), on which no other live thread runs; `tls` is 0 or
+    // `RECEIVER_TLS`, the receiver's alone, which no code of the cell reads.
+    unsafe { thread_configure_with_tls(child.th, entry as *const () as u64, stack_top, arg, tls) }
+        .map_err(|_| "integration::read_regs_blocked_syscall: configure of a child failed")?;
+    thread_start(child.th)
         .map_err(|_| "integration::read_regs_blocked_syscall: start of a child failed")?;
     Ok(child)
 }
 
 /// Read the registers of `th`, blocked (or about to block) in syscall
-/// `nr` on the stack topped by `stack_top`, and check them as the module
-/// says.
-fn read_blocked(th: u64, nr: u64, stack_top: u64) -> TestResult
+/// `nr` on the stack topped by `stack_top`, configured with the TLS base
+/// `tls`, and check them as the module says.
+fn read_blocked(th: u64, nr: u64, (stack_top, tls): (u64, u64)) -> TestResult
 {
     let regs = read_once_blocked(th)?;
     if reg_word(&regs, SYSCALL_NR_OFFSET)? != nr
@@ -262,6 +294,16 @@ fn read_blocked(th: u64, nr: u64, stack_top: u64) -> TestResult
         return Err(
             "integration::read_regs_blocked_syscall: the frame's stack pointer is outside the \
              child's stack",
+        );
+    }
+    if reg_word(&regs, TLS_OFFSET)? != tls
+    {
+        crate::log_u64(
+            "ktest: integration::read_regs_blocked_syscall TLS base=",
+            reg_word(&regs, TLS_OFFSET)?,
+        );
+        return Err(
+            "integration::read_regs_blocked_syscall: the frame's TLS-base word is not the              thread's TLS base",
         );
     }
     unchanged(

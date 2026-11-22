@@ -188,13 +188,20 @@ impl Sessiond
             std::os::seraph::log!(error: "death queue or wait set not made");
             return None;
         }
+        // The keys' generations start at a draw of this instance's own, so a
+        // stop source's key an earlier instance handed out names none of
+        // this one's candidates but by chance (`Slots::seeded`).
+        let seed = syscall::random_u64().unwrap_or_else(|_| {
+            std::os::seraph::log!(warn: "no random draw; session keys start unseeded");
+            0
+        });
         Some(Self {
             endpoint,
             death_queue,
             wait_set,
             leader,
-            sessions: Slots::default(),
-            interfaces: Slots::default(),
+            sessions: Slots::seeded(seed),
+            interfaces: Slots::seeded(seed.rotate_left(32)),
             ipc_buf,
         })
     }

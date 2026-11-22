@@ -12,7 +12,11 @@
 //! A [`Fill`] takes what memmgr can still promise a process outside the
 //! reserve: it commits that much through the heap, halving an attempt memmgr
 //! refuses, then takes what is left a page at a time by `REQUEST_MEMORY_CAPS`
-//! grants, whose caps stay in the process's `CSpace` until it dies.
+//! grants, whose caps stay in the process's `CSpace` until it dies. A grant
+//! is asked only while the `CSpace` has general slots free beyond
+//! [`SPARE_SLOTS`], which [`Fill::new`] funds for [`GRANT_SLOTS`], so no
+//! grant's cap lands in the IPC receive reserve, whose loss would fail the
+//! process's receives (docs/ipc-design.md § Receive-Failure Policy).
 //! [`Fill::to_critical`] does so until nothing is left and the pressure level
 //! has read `CRITICAL` for [`SETTLE_MS`]; [`Fill::top_up`] takes back what
 //! other processes freed since. Neither allocates beyond the blocks it
@@ -41,6 +45,12 @@ const TOP_UP_ROUNDS: usize = 64;
 /// Pages a heap commitment grows by at least (the runtime's heap grows in
 /// 16-page steps); less than this is taken by one-page grants.
 const COMMIT_MIN_PAGES: u64 = 16;
+/// General slots of the process's `CSpace` [`Fill::new`] funds for the caps
+/// of a fill's one-page grants, while memory is not yet scarce: a `CSpace`
+/// cannot grow once the pool is at its growth floor.
+const GRANT_SLOTS: u64 = 1024;
+/// General slots a grant leaves free for the process's other allocations.
+const SPARE_SLOTS: u64 = 16;
 /// Bytes of the ballast: the size of the heap's floor, an uncommitted demand
 /// region whose untouched pages memmgr backs only while it has pages to
 /// spare, so every block a fill commits after lies above it.
@@ -69,7 +79,9 @@ pub struct Fill
 impl Fill
 {
     /// The ballast allocated and the block list's room made, so a fill
-    /// allocates only the blocks it commits; `None` when either fails.
+    /// allocates only the blocks it commits, and the `CSpace` funded for
+    /// [`GRANT_SLOTS`] grants; `None` when the ballast or the room fails. A
+    /// funding that fails only stops the grants sooner.
     #[must_use]
     pub fn new() -> Option<Self>
     {
@@ -78,6 +90,10 @@ impl Fill
         ballast.resize(BALLAST_BYTES, 1);
         let mut blocks = Vec::new();
         blocks.try_reserve_exact(MAX_BLOCKS).ok()?;
+        let _ = std::os::seraph::fund_cspace_slot_budget(
+            std::os::seraph::startup_info().self_cspace,
+            GRANT_SLOTS,
+        );
         Some(Self {
             _ballast: ballast,
             blocks,
@@ -132,8 +148,9 @@ impl Fill
     /// Take what memmgr can still promise: commit it through the heap,
     /// halving an attempt memmgr refuses, while [`COMMIT_MIN_PAGES`] or more
     /// are left and the block list has room, then take what is left a page at
-    /// a time by grants. Returns when nothing is left, a grant is refused, or
-    /// memmgr does not answer.
+    /// a time by grants. Returns when nothing is left, a grant is refused or
+    /// its cap would find no general slot ([`SPARE_SLOTS`]), or memmgr does
+    /// not answer.
     pub fn top_up(&mut self)
     {
         let mut ask = u64::MAX;
@@ -192,9 +209,16 @@ fn available() -> Option<u64>
 }
 
 /// Take one page by a `REQUEST_MEMORY_CAPS` grant, keeping its cap; `false`
-/// when memmgr refuses it.
+/// when memmgr refuses it, or, with no grant asked, when the `CSpace` has no
+/// more than [`SPARE_SLOTS`] general slots free, so the cap would take one
+/// the process needs or land in the IPC receive reserve.
 fn grant_one() -> bool
 {
+    if std::os::seraph::cspace_slot_headroom(std::os::seraph::startup_info().self_cspace)
+        <= SPARE_SLOTS
+    {
+        return false;
+    }
     let grant = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, 1)
         .build();

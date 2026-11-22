@@ -9,11 +9,15 @@
 //!
 //! Three outcomes per `.svc` file:
 //!
-//! 1. **Defined AND registered** — bind death-notification on the
-//!    registered thread cap and on the service's address space, through the
-//!    cap init endowed with it, record the recipe's fixed fields on the
-//!    matching `ServiceEntry` and its argv/env/cwd/seed, log-sink flag,
-//!    and scheduling fields in the parallel `RestartRecipe` table.
+//! 1. **Defined AND registered** — for devmgr and vfsd, bind
+//!    death-notification on the registered thread cap and on the service's
+//!    address space, through the process handle init endowed with it; for
+//!    memmgr and procmgr, whose observers are on the core-death queue
+//!    (`observe_core_deaths` in `main.rs`), bind neither and record the
+//!    endowed thread and address-space caps. Record the recipe's fixed
+//!    fields on the matching `ServiceEntry` and the launch surfaces the
+//!    restart replays ([`recipe_from`]) in the parallel `RestartRecipe`
+//!    table.
 //! 2. **Defined only** — call [`super::launch::launch`] to spawn the
 //!    service (it binds death-notification before `START_PROCESS` when
 //!    `restart != never`), then, for a supervised service, persist a
@@ -673,12 +677,13 @@ fn release_registration(pending: &PendingRegistration)
 
 /// Clone the launch surfaces the restart path replays from a parsed
 /// definition: argv/env/cwd/seed byte-for-byte, the log-sink,
-/// debug-authority, `oom_stop`, stop-authority, entropy-authority and
-/// reserve flags, the
-/// `stop_source` class, and the
-/// scheduling fields. The name, binary, policy and namespace live on the
-/// `ServiceEntry` instead ([`build_entry`]). `None` when the heap cannot hold
-/// the copies.
+/// debug-authority, `oom_stop`, stop-authority, entropy-authority, reserve
+/// and `private_image` flags, the `stop_source` class, and the scheduling
+/// fields. `shutdown_actuator` starts clear; the caller sets it for the
+/// recognised shutdown actuator, and the restart reads it for the pinned
+/// create and the core-death RECV. The name, binary, policy and namespace
+/// live on the `ServiceEntry` instead ([`build_entry`]). `None` when the
+/// heap cannot hold the copies.
 fn recipe_from(def: &Definition) -> Option<RestartRecipe>
 {
     let cwd = match &def.cwd

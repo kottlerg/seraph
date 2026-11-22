@@ -250,7 +250,7 @@ flags (§ Badge shape), and fourteen are reserved.
 | 6 | `MUTATE_DIR` | `FS_CREATE` / `FS_REMOVE` / `FS_MKDIR` / `FS_RENAME` (directory) |
 | 7 | `ADMIN` | Visibility-gating bit |
 | 8 | `OPEN_INSTANCE` | Not a right: marks an open cap's badge (§ Badge shape); never part of a `NamespaceRights` value |
-| 9 | `SESSION` | Not a right: marks a session cap's badge, and with `OPEN_INSTANCE` an open's in a session (§ Badge shape); never part of a `NamespaceRights` value |
+| 9 | `SESSION` | Not a right: marks a session cap's badge (§ Badge shape); a badge with both kind flags names nothing; never part of a `NamespaceRights` value |
 | 10..23 | — | Reserved in a node cap's badge; MUST be zero on derive, ignored on read. A badge with a kind flag holds its identifier's high bits there (§ Badge shape) |
 
 Every node cap is a `SEND` cap from the kernel's perspective; the

@@ -86,6 +86,13 @@ pub trait ResyncTable
     /// names when it reports it dead, else `None`. The call blocks until
     /// procmgr answers.
     fn queried_death(&mut self, process_handle: u64) -> Option<u64>;
+
+    /// The exit reason to route a death the caps show, `caps`, of the
+    /// process `process_handle` names with: the one procmgr gives the
+    /// process when it answers `EXITED`, else `caps`
+    /// (`ipc::procmgr_process_state::process_reason`), as a death post's
+    /// is chosen. The call blocks until procmgr answers.
+    fn process_reason(&mut self, process_handle: u64, caps: u64) -> u64;
 }
 
 /// svcmgr's death resync: route a death for every active service whose
@@ -93,7 +100,13 @@ pub trait ResyncTable
 /// dropped. The kernel records a death before it posts it, so a main-thread
 /// exit, a revoked thread cap, and a fault or process exit of a service whose
 /// address space svcmgr holds show in svcmgr's caps
-/// ([`ResyncTable::caps_death`]), and those deaths are routed first. A
+/// ([`ResyncTable::caps_death`]), and those deaths are routed first. The
+/// caps show the main thread's own reading, which is the process's end only
+/// when it was the first terminal end of any of its threads
+/// (`docs/process-lifecycle.md` § Exit reason), so a death of a service
+/// procmgr created is routed with the reason procmgr gives the process
+/// ([`ResyncTable::process_reason`]) while the substrate is alive, as a
+/// death post's is, and with the caps' reading otherwise. A
 /// worker-thread fault or process exit of a service procmgr created shows
 /// there only once procmgr's teardown revokes the thread cap,
 /// which can follow the resync, so each service the caps showed alive is
@@ -135,6 +148,14 @@ pub fn resync<T: ResyncTable>(table: &mut T)
         else
         {
             continue;
+        };
+        let exit_reason = if slot.process_handle != 0 && table.substrate_alive()
+        {
+            table.process_reason(slot.process_handle, exit_reason)
+        }
+        else
+        {
+            exit_reason
         };
         table.route(tag, exit_reason);
     }
@@ -371,6 +392,11 @@ mod tests
                 .find(|s| s.slot.process_handle == process_handle)
                 .and_then(|s| s.procmgr_dead)
         }
+
+        fn process_reason(&mut self, process_handle: u64, caps: u64) -> u64
+        {
+            self.queried_death(process_handle).unwrap_or(caps)
+        }
     }
 
     // The defect caught: a service whose death post svcmgr's full death
@@ -423,6 +449,27 @@ mod tests
         // instance already routed.
         table.route_post(tag(4), 4);
         assert_eq!(table.routed.len(), 5);
+    }
+
+    // The defect caught: a resync that routes the main thread's own reading
+    // where procmgr gives the process another reason, so one death gets a
+    // different restart decision when a queue overflowed: a main thread that
+    // exited 0 before a worker faulted, and a process a worker ended with
+    // `sys_aspace_exit(5)` whose teardown revoked the main thread's cap
+    // (read `EXIT_KILLED`). A service svcmgr holds no process handle of
+    // keeps its caps' reading.
+    #[test]
+    fn a_resync_routes_procmgrs_reason_for_a_death_the_caps_show()
+    {
+        let mut table = Table::new(4);
+        table.services[1].caps_dead = Some(0);
+        table.services[1].procmgr_dead = Some(0x100E);
+        table.services[2].caps_dead = Some(syscall_abi::EXIT_KILLED);
+        table.services[2].procmgr_dead = Some(5);
+        table.services[3].slot.process_handle = 0;
+        table.services[3].caps_dead = Some(9);
+        resync(&mut table);
+        assert_eq!(table.routed, [(1, 0, 0x100E), (2, 0, 5), (3, 0, 9)]);
     }
 
     // The defect caught: a resync that calls procmgr while memmgr or

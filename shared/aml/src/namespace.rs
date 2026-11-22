@@ -43,7 +43,7 @@ use crate::parse::Parser;
 use crate::term::{Name, Op, Term};
 pub use crate::value::Data;
 use crate::value::Ref;
-use crate::{Fault, FaultKind, push};
+use crate::{Fault, FaultKind, MAX_ALIAS_CHAIN, push};
 
 /// A node of the namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -303,14 +303,13 @@ struct Lent
 /// The `ObjectType` of a method, as `External` gives it.
 const EXTERNAL_METHOD: u8 = 8;
 
-/// The longest alias chain followed.
-const MAX_ALIAS_CHAIN: usize = 8;
-
 #[derive(Clone, Debug)]
 struct Node
 {
     name: Seg,
     parent: NodeId,
+    /// The scope its definition appeared in ([`Namespace::scope_of`]).
+    scope: NodeId,
     child: Option<NodeId>,
     sibling: Option<NodeId>,
     owner: Owner,
@@ -386,6 +385,7 @@ impl Namespace
             Node {
                 name: *b"\\___",
                 parent: NodeId::ROOT,
+                scope: NodeId::ROOT,
                 child: None,
                 sibling: None,
                 owner: Owner::Predefined,
@@ -496,6 +496,17 @@ impl Namespace
         self.node(id).map(|n| n.parent)
     }
 
+    /// The scope the definition of `id` appeared in, from which the names
+    /// of its kept terms (a region's offset and length, a bank field's
+    /// value) and of its package's elements resolve: its parent, but for a
+    /// definition by a path, such as `Name (\_SB.PCI0.PRT0, ...)` in
+    /// `Scope (\_SB)`, which is placed under the path's node.
+    #[must_use]
+    pub fn scope_of(&self, id: NodeId) -> Option<NodeId>
+    {
+        self.node(id).map(|n| n.scope)
+    }
+
     /// The owner of `id`.
     #[must_use]
     pub fn owner(&self, id: NodeId) -> Option<Owner>
@@ -583,6 +594,7 @@ impl Namespace
         let mut node = Node {
             name,
             parent,
+            scope: parent,
             child: None,
             sibling,
             owner,
@@ -628,7 +640,8 @@ impl Namespace
     /// # Errors
     ///
     /// [`FaultKind::NoMemory`] when the free list cannot grow; the nodes
-    /// removed before the failure stay removed.
+    /// removed before the failure stay removed, and each subtree not yet
+    /// removed stays whole and linked.
     pub fn remove_owned(&mut self, owner: Owner) -> Result<usize, FaultKind>
     {
         if owner == Owner::Predefined
@@ -681,7 +694,9 @@ impl Namespace
         given
     }
 
-    /// Unlink `id` from its parent and free it and its subtree.
+    /// Unlink `id` from its parent and free it and its subtree. Every
+    /// allocation comes before the first change, so a failed one leaves the
+    /// subtree whole and linked, and the count of live nodes true.
     fn remove(&mut self, id: NodeId) -> Result<(), FaultKind>
     {
         if id == NodeId::ROOT
@@ -694,6 +709,24 @@ impl Namespace
             return Ok(());
         };
         let (parent, sibling) = (n.parent, n.sibling);
+        // The subtree, each node before its children, and room on the free
+        // list for every node of it.
+        let mut subtree = Vec::new();
+        push(&mut subtree, id)?;
+        let mut at = 0;
+        while let Some(&cur) = subtree.get(at)
+        {
+            let mut next = self.node(cur).and_then(|n| n.child);
+            while let Some(k) = next
+            {
+                next = self.node(k).and_then(|n| n.sibling);
+                push(&mut subtree, k)?;
+            }
+            at = at.saturating_add(1);
+        }
+        self.free
+            .try_reserve(subtree.len())
+            .map_err(|_| FaultKind::NoMemory)?;
         if self.node(parent).and_then(|p| p.child) == Some(id)
         {
             if let Some(p) = self.node_mut(parent)
@@ -711,19 +744,8 @@ impl Namespace
                 prev.sibling = sibling;
             }
         }
-        // Free the subtree with an explicit stack of first children: each
-        // freed node's children are pushed before it is marked dead.
-        let mut stack = Vec::new();
-        push(&mut stack, id)?;
-        while let Some(cur) = stack.pop()
+        for cur in subtree
         {
-            let kids: Option<NodeId> = self.node(cur).and_then(|n| n.child);
-            let mut next = kids;
-            while let Some(k) = next
-            {
-                next = self.node(k).and_then(|n| n.sibling);
-                push(&mut stack, k)?;
-            }
             if let Some(n) = self.node_mut(cur)
             {
                 n.live = false;
@@ -731,7 +753,8 @@ impl Namespace
                 n.object = Object::Scope;
                 n.generation = n.generation.wrapping_add(1);
             }
-            push(&mut self.free, cur.0)?;
+            // Within the room reserved above: no allocation.
+            self.free.push(cur.0);
             self.live = self.live.saturating_sub(1);
         }
         Ok(())
@@ -936,10 +959,16 @@ impl Namespace
             {
                 n.object = object;
                 n.owner = owner;
+                n.scope = scope;
             }
             return Ok(existing);
         }
-        self.add_child(parent, last, object, owner)
+        let id = self.add_child(parent, last, object, owner)?;
+        if let Some(n) = self.node_mut(id)
+        {
+            n.scope = scope;
+        }
+        Ok(id)
     }
 
     /// Create the node `name` declares from `scope` as a placeholder that
@@ -958,7 +987,12 @@ impl Namespace
         {
             return Err(FaultKind::Exists);
         }
-        self.add_child(parent, last, Object::Data(Data::Uninitialized), owner)
+        let id = self.add_child(parent, last, Object::Data(Data::Uninitialized), owner)?;
+        if let Some(n) = self.node_mut(id)
+        {
+            n.scope = scope;
+        }
+        Ok(id)
     }
 
     /// The placeholder [`Namespace::declare`] created for `name` from

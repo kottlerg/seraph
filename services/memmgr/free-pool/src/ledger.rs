@@ -33,9 +33,10 @@
 //! process's swapped count, until a restore maps it again or a teardown frees
 //! its store and releases the charge (`services/memmgr/docs/memory-pool.md`
 //! § Eviction). A compressed chunk the swap service takes is writing while its
-//! write is in flight, its store runs held on its disk node, and on disk once
-//! the write ends, its store runs back in the pool and its pages counted in
-//! `disk_pages` too; it stays in `swapped_pages` and keeps its charge
+//! write is in flight, its store runs still held on its entry
+//! ([`ChunkEntry::store`]) and its disk node holding only the slot, the
+//! nonce and the byte count, and on disk once the write ends, its store runs
+//! back in the pool and its pages counted in `disk_pages` too; it stays in `swapped_pages` and keeps its charge
 //! throughout, and so does a chunk lost to a failed authentication (§ Disk
 //! tier).
 //!
@@ -3555,11 +3556,12 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Start evicting the resident chunk holding `page_base` in region `reg` of
-    /// `rec` under the job slot `job` ([`ChunkEntry::begin_evict`]), once the
-    /// caller has unmapped it from the process: its runs stay on its entry
-    /// until [`Ledger::finish_evict`] stores it or a fault cancels it
-    /// ([`Ledger::cancel_evict`]). Returns the evicting entry, whose runs the
-    /// caller hands the compression worker.
+    /// `rec` under the job slot `job` ([`ChunkEntry::begin_evict`]), before
+    /// the caller unmaps it from the process, so a refusal costs the process no
+    /// mapping: its runs stay on its entry until [`Ledger::finish_evict`]
+    /// stores it or a fault, or the caller's own map back when a later step
+    /// fails, cancels it ([`Ledger::cancel_evict`]). Returns the evicting
+    /// entry, whose runs the caller hands the compression worker.
     ///
     /// # Errors
     /// [`SwapError::NoRegion`], [`SwapError::Ineligible`] when the region's

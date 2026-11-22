@@ -165,8 +165,12 @@ impl CommitNeed
 /// memory-object attachment shared as `share` adds to `promised`: all of it
 /// for a private attachment, whose writes back pages as a committed region's
 /// faults do, and the page-table reservation alone for a shared one, which
-/// maps only the object's own frames and so takes no data page and records no
-/// run (`services/memmgr/docs/memory-pool.md` § Memory objects).
+/// at attach maps only the object's own frames. A shared attachment takes a
+/// data page only for each copy `MAKE_PRIVATE` gives it: the copy promises
+/// and draws its own page ([`crate::Ledger::promise_copy`]) and records a run
+/// on the attachment's chunk, whose metadata the attachment's commitment does
+/// not bound (`services/memmgr/docs/memory-pool.md` § Memory objects, Attach
+/// and Make private).
 #[must_use]
 pub const fn attach_promise(need: CommitNeed, share: Share) -> u64
 {

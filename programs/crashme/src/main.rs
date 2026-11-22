@@ -393,7 +393,8 @@ fn live_no_core()
     .is_ok_and(|r| r.label == procmgr_errors::SUCCESS);
     if !declared
     {
-        fail("live-no-core: DECLARE_NO_CORE was refused");
+        println!("live-no-core: FAIL (DECLARE_NO_CORE was refused)");
+        std::process::exit(1);
     }
     println!("ready");
     let mut line = String::new();

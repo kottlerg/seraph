@@ -464,7 +464,12 @@ impl Matches
     /// Take the subcommand's name and matches.
     ///
     /// # Errors
-    /// [`ErrorKind::MissingSubcommand`] when the command line gave none.
+    /// [`ErrorKind::Internal`] when no subcommand was parsed, a defect of the
+    /// caller: the parser refuses a command line of a command with
+    /// subcommands that names none, with [`ErrorKind::MissingSubcommand`] or
+    /// [`ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand`], before any
+    /// `from_matches` runs, and the matches of a command without
+    /// subcommands hold none.
     pub fn take_subcommand(&mut self) -> Result<(String, Matches), Error>
     {
         self.subcommand

@@ -710,6 +710,10 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     else
     {
         std::os::seraph::log!(warn: "driver create ipc_call failed");
+        // A call refused before delivery moved no cap, so the badged creator
+        // is still devmgr's; after delivery its handle is stale and the
+        // delete fails closed.
+        let _ = syscall::cap_delete(badged_creator);
         return DriverSpawn::Failed;
     };
     // ipc_call returned: the source cap was transferred to procmgr whatever

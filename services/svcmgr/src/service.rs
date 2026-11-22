@@ -172,8 +172,9 @@ impl ServiceEntry
 /// must be replayed on every restart so a
 /// respawned child comes back with the same argv/env/cwd/seed, log-sink
 /// flag, and scheduling fields it got on first launch. Held in a table on
-/// `SvcmgrState` index-aligned with `services[]` via the death correlator
-/// (which is the table index).
+/// `SvcmgrState` index-aligned with `services[]` by slot: a death post's
+/// slot is its `DeathTag`'s index (`DeathTag::from_correlator(..).index()`),
+/// never the raw correlator, which carries the instance above the slot.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each bool is one independent `yes | no` recipe key: `log_sink`, \

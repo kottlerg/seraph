@@ -232,7 +232,10 @@ The restored process is then created as any other, with three differences:
   mapped from a capability.
 - **Entry.** procmgr starts the main thread at the image's entry with the checkpoint's restore stack
   pointer, the TLS base of the checkpoint's TLS block, and the new `ProcessInfo` page, whose restore
-  word is set. It applies the checkpoint's declarations to the new entry before the start.
+  word is set. The new entry holds the checkpoint's declarations from its insert into the table,
+  so no debugger reaches a process its checkpoint declared undebuggable. A restore whose pager
+  binding does not take is refused with `OUT_OF_MEMORY`, since only the faults memmgr serves back
+  the regions made again from the snapshot.
 
 Every page the restore backs is the new process's own, charged to its budget node as its faults
 would be, admitted as `REGISTER_REGION` and a fault admit them; a refusal fails the create with

@@ -133,8 +133,8 @@ pub struct ProcessCaps
 /// The handle state of one budget node: the badge its node handles carry,
 /// the node it names, the process that owns it, and the limit-event
 /// registration. A slot of its own, named by the handle link of the budget
-/// node's reclaim state ([`crate::budget::Reclaim`]) and chained in its [`crate::ProcessIndex`] bucket by its own; it
-/// holds one reference on its node, so a node with handle state is freed only
+/// node's reclaim state ([`crate::budget::Reclaim`]) and chained in its
+/// [`crate::ProcessIndex`] bucket by its own; it holds one reference on its node, so a node with handle state is freed only
 /// once that state is dropped ([`crate::Ledger::drop_handle`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeHandle
@@ -373,8 +373,8 @@ pub enum DiskState
 
 /// One chunk the swap service holds, or is writing, in a swap slot
 /// (`services/memmgr/docs/memory-pool.md` § Disk tier): the chunk, the nonce
-/// its bytes were sealed under, the slot and its byte count. The chunk's entry names this slot; the slot map names it by
-/// its swap slot ([`crate::disk::SwapSlots`]). The chunk fields are stale once
+/// its bytes were sealed under, the slot and its byte count. The chunk's
+/// entry names this slot; the slot map names it by its swap slot ([`crate::disk::SwapSlots`]). The chunk fields are stale once
 /// it is [`DiskState::Cancelled`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiskNode
@@ -411,7 +411,8 @@ pub enum Node
     Caps(ProcessCaps),
     /// The commitment of the committed region whose node names this slot.
     Commit(Commitment),
-    /// The handle state of the budget node whose slot names this slot.
+    /// The handle state of the budget node whose reclaim state's handle link
+    /// names this slot ([`crate::budget::Reclaim::handle`]).
     Handle(NodeHandle),
     /// The limit-event registration the handle state that names this slot
     /// carries.

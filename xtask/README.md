@@ -361,7 +361,8 @@ Default firmware search paths per host:
   `/usr/share/edk2/x64/OVMF_CODE.4m.fd` with `OVMF_VARS.4m.fd` (Arch),
   `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd` with `OVMF_VARS.fd` (older Arch),
   `/usr/share/OVMF/OVMF_CODE.fd` with `OVMF_VARS.fd` (older Debian and Ubuntu)
-- **Linux** RISC-V: `/usr/share/edk2/riscv`, `/usr/share/edk2-riscv`, `/usr/share/qemu-efi-riscv64`
+- **Linux** RISC-V, the first directory holding both `RISCV_VIRT_CODE.fd` and `RISCV_VIRT_VARS.fd`:
+  `/usr/share/edk2/riscv`, `/usr/share/edk2-riscv`, `/usr/share/qemu-efi-riscv64`
 - **Linux** Secure Boot, for the `secureboot` case alone: OVMF's SMM build with the template of
   its default pair, `/usr/share/OVMF/OVMF_CODE_4M.secboot.fd` (Debian, Ubuntu),
   `/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd` (Fedora) or

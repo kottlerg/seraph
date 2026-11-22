@@ -32,16 +32,17 @@ and, on a badge carrying `stop_labels::STOP_AUTHORITY`, the shared stop labels a
 | `LIST_CANDIDATES` (6) | `SUCCESS` with one entry while a job runs, at cursor 0: its key, `RANK_JOB`, the pages the fixture's subtree holds beyond its own node (memmgr's `QUERY_MEMORY_USAGE`), and the name `stopsrc-job`; no entry otherwise |
 
 `STOP_CANDIDATE` and `LIST_CANDIDATES` on any other badge, the `:deny` SEND any process can
-query among them, reply `UNAUTHORIZED`. A job's key is new for each job of an instance. The job is
-the fixture's own binary run as `stopsrc job <pages>`: it touches that many pages of heap and
-sleeps until it is destroyed.
+query among them, reply `UNAUTHORIZED`. A job's key is new for each job of an instance, counted up
+from the instance's nonce, so a key an earlier instance handed out names a later one's job only by
+chance. The job is the fixture's own binary run as `stopsrc job <pages>`: it touches that many pages
+of heap and sleeps until it is destroyed.
 
 svctest's `svcmgr_stop_service` phase reads that svcmgr lists the fixture as a source of the
 program class, that the stop labels and `PROBE` answer on the SEND svcmgr hands out, that the
-stop labels refuse on the `:deny` one, and that a job the fixture started is gone once the fixture has exited. Its
-`oom_policy` phase has the fixture exit, so the instance svcmgr restarts starts after oomd, and
-start a job before memhog fills memory: oomd stops the job before memhog, and the fixture reports
-it stopped ([services/svctest/README.md](../svctest/README.md)). A fixture that
+stop labels refuse on the `:deny` one, and that a job the fixture started is gone once the fixture
+has exited. Its `oom_policy` phase has the fixture exit, so the instance svcmgr restarts starts
+after oomd, and start a job before memhog fills memory: oomd stops the job before memhog, and the
+fixture reports it stopped ([services/svctest/README.md](../svctest/README.md)). A fixture that
 lacks its endpoint or nonce logs an error and exits.
 
 ---

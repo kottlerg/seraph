@@ -105,7 +105,10 @@ fn serve(service: u64, nonce: u64, ipc_buf: *mut u64) -> !
         key: 0,
         stopped: false,
     };
-    let mut next_key = 1u64;
+    // Job keys start at the instance's nonce, so a key an earlier instance
+    // handed out names none of this one's jobs but by chance
+    // (`ipc::stop_labels`).
+    let mut next_key = nonce;
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
@@ -249,7 +252,7 @@ fn start_job(job: &mut Job, next_key: &mut u64, pages: u64) -> IpcMessage
     job.child = Some(child);
     job.key = *next_key;
     job.stopped = false;
-    *next_key = next_key.saturating_add(1);
+    *next_key = next_key.wrapping_add(1).max(1);
     std::os::seraph::log!("job {} holds {pages} pages", job.key);
     IpcMessage::builder(src::SUCCESS).word(0, job.key).build()
 }

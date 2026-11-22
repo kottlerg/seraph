@@ -22,7 +22,9 @@
 //! included: its death returns the charge. It also checks the refusals: a
 //! session with no handle or with a cap that is no node handle, a first page
 //! past the max, an open with no session cap or with a cap that names no live
-//! session, and a session cap used as a node or an open cap; and that std
+//! session, and a session cap used as a node or an open cap; that a session
+//! starts on a mount's root cap as on any node cap of the driver; that std's
+//! session lookup on an empty slot fails `StaleNetworkFileHandle`; and that std
 //! opens a file across the `/data` mount in its session with the `/data`
 //! driver, which the `/esp` driver does not take, nor the other way round.
 
@@ -211,6 +213,17 @@ fn one_session_per_driver(node: u64, ipc_buf: *mut u64)
     };
     let data_session = session_for(node, "the /data driver");
     let esp_session = session_for(esp_node, "the /esp driver");
+    // A node cap that names nothing, with std's sessions live, is a stale
+    // handle, as on a call that reaches no session lookup.
+    let dead = syscall::cap_derive(node, syscall::RIGHTS_EP_SEND).expect("cap_derive");
+    syscall::cap_delete(dead).expect("cap_delete of the derived node cap");
+    assert_eq!(
+        std::os::seraph::fs::session_for(dead)
+            .err()
+            .map(|e| e.kind()),
+        Some(std::io::ErrorKind::StaleNetworkFileHandle),
+        "std's session lookup on an empty slot, with sessions live"
+    );
     for (target, session, what) in [
         (node, data_session, "/data"),
         (esp_node, esp_session, "/esp"),

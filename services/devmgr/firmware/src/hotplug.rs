@@ -975,7 +975,10 @@ pub const fn next(state: SlotState, status: u16, link_down: bool) -> (SlotState,
             },
             Action::None,
         ),
-        SlotState::Off if asks(status) => (SlotState::Off, Action::PowerUp),
+        // A card inserted or swapped, or the attention button pressed, asks
+        // for a card present to be powered up: one in a failed slot is tried
+        // again.
+        SlotState::Off | SlotState::Failed if asks(status) => (state, Action::PowerUp),
         SlotState::Failed | SlotState::Off if !present => (SlotState::Empty, Action::None),
         SlotState::Empty | SlotState::Occupied | SlotState::Failed | SlotState::Off =>
         {
@@ -1054,17 +1057,19 @@ pub const fn link_changed(status: u16) -> bool
     status != u16::MAX && status & SLOTSTA_LINK_CHANGED != 0
 }
 
-/// The state a slot is taken over in: occupied when a card is present and a
-/// live record lies behind the slot (`recorded`), else empty, so a present
-/// card with nothing recorded is brought up on the first poll.
+/// The state a slot is taken over in: occupied when a live record lies
+/// behind the slot (`recorded`), whatever its Slot Status reads, else empty.
+/// A recorded card that left while the slot's grant waited is then removed
+/// on the first poll, which reads it gone, and a present card with nothing
+/// recorded is brought up on it.
 #[must_use]
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "`recorded` is whether a live record lies behind the slot"
 )]
-pub const fn initial(status: u16, recorded: bool) -> SlotState
+pub const fn initial(recorded: bool) -> SlotState
 {
-    if status != u16::MAX && status & SLOTSTA_PRESENT != 0 && recorded
+    if recorded
     {
         SlotState::Occupied
     }
@@ -2290,12 +2295,48 @@ mod tests
             next(SlotState::Failed, 0, false),
             (SlotState::Empty, Action::None)
         );
-        assert_eq!(initial(present, true), SlotState::Occupied);
-        assert_eq!(initial(present, false), SlotState::Empty);
-        assert_eq!(initial(0, true), SlotState::Empty);
-        assert_eq!(initial(u16::MAX, true), SlotState::Empty);
         assert!(present_reads(present) && !present_reads(0) && !present_reads(u16::MAX));
         assert!(link_changed(SLOTSTA_LINK_CHANGED) && !link_changed(u16::MAX));
+    }
+
+    #[test]
+    fn a_recorded_slot_is_taken_over_occupied_so_a_card_gone_meanwhile_is_removed()
+    {
+        // The recorded card left while the slot's grant waited: the first
+        // poll reads it gone and posts its removal.
+        assert_eq!(initial(true), SlotState::Occupied);
+        assert_eq!(
+            next(initial(true), 0, false),
+            (SlotState::Removing { asked: false }, Action::Remove)
+        );
+        assert_eq!(
+            next(initial(true), SLOTSTA_PRESENT, false),
+            (SlotState::Occupied, Action::None)
+        );
+        // Nothing recorded: a card present is brought up on the first poll.
+        assert_eq!(
+            next(initial(false), SLOTSTA_PRESENT, false),
+            (SlotState::Empty, Action::PowerUp)
+        );
+    }
+
+    #[test]
+    fn a_failed_slot_whose_card_is_swapped_or_asked_for_is_powered_up_again()
+    {
+        let present = SLOTSTA_PRESENT;
+        assert_eq!(
+            next(SlotState::Failed, present | SLOTSTA_PRESENCE_CHANGED, false),
+            (SlotState::Failed, Action::PowerUp)
+        );
+        assert_eq!(
+            next(SlotState::Failed, present | SLOTSTA_BUTTON, false),
+            (SlotState::Failed, Action::PowerUp)
+        );
+        // A change that leaves no card present empties the slot.
+        assert_eq!(
+            next(SlotState::Failed, SLOTSTA_PRESENCE_CHANGED, false),
+            (SlotState::Empty, Action::None)
+        );
     }
 
     fn present_reads(status: u16) -> bool

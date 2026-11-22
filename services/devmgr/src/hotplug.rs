@@ -772,20 +772,22 @@ fn with_port<R>(slot: &Polled, aspace: u64, access: impl FnOnce(&ConfigRegs) -> 
 }
 
 /// Take over a slot: turn its event interrupts off (the poller reads the
-/// latches instead), clear its latches, and hold it occupied when a card is
-/// present and recorded, else empty, so an unrecorded card present at
-/// take-over is brought up on the first poll.
+/// latches instead), clear its latches, and hold it occupied when a live
+/// record lies behind it, else empty ([`hp::initial`]): the first poll
+/// removes a recorded card that left before take-over, and brings up an
+/// unrecorded card present.
 fn take_over(slot: &mut Polled, aspace: u64)
 {
     let s = slot.slot;
-    let state = with_port(slot, aspace, |regs| {
+    // A port that cannot be mapped is logged by `with_port`; its state is
+    // still the records'.
+    let _ = with_port(slot, aspace, |regs| {
         let control = regs.read16(s.register(SLOT_CONTROL));
         set_control(regs, &s, control, control & !SLOTCTL_EVENT_ENABLES);
         let status = regs.read16(s.register(SLOT_STATUS));
         clear_latches(regs, &s, status);
-        hp::initial(status, slot.recorded)
     });
-    slot.state = state.unwrap_or(SlotState::Empty);
+    slot.state = hp::initial(slot.recorded);
 }
 
 /// Read a managed slot's Slot Status, clear the latches it holds, and act

@@ -105,8 +105,12 @@ The first managed slot starts the poller, a devmgr thread at devmgr's priority. 
 derivation of each managed port's configuration page and touches only the port's PCI Express
 slot and link registers. At take-over it turns off the slot's event interrupt enables (the
 poller reads the latches instead, so the slot needs no message target, no IOMMU domain and no
-`_PRT`), clears the latches, and holds the slot occupied when a card is present and a live
-record lies behind it, else empty.
+`_PRT`), clears the latches, and holds the slot occupied when a live record lies behind it,
+whatever its Slot Status reads, else empty (`firmware::hotplug::initial`). The first poll then
+removes a recorded card that left while the slot's grant waited, and brings up a card present with
+nothing recorded. The latches cleared at take-over hold what happened before devmgr controlled the
+slot, which may include the slot's power-on, so no event is read from them: a card replaced while
+the grant waited, which reads present, is held as the recorded one.
 
 Every `HOTPLUG_POLL_MS` (1000) it reads each slot's Slot Status, clears the event latches it
 holds (Attention Button Pressed, Power Fault Detected, MRL Sensor Changed, Presence Detect
@@ -123,7 +127,7 @@ Changed, Data Link Layer State Changed; all RW1C, so a poll loses no event), and
 | pressed | the abort window ended | post the removal job; the slot is removing |
 | removing | Attention Button Pressed, or Presence Detect Changed, with a card present | nothing until the removal job completes; the slot is powered up after it (§ Removal) |
 | removing | anything else | nothing, until the removal job completes (§ Removal) |
-| off | Attention Button Pressed, or Presence Detect Changed, with a card present | power up, as for an empty slot |
+| off, failed | Attention Button Pressed, or Presence Detect Changed, with a card present | power up, as for an empty slot |
 | off, failed | presence lost | the slot is empty |
 
 The link is lost when the port reports Data Link Layer Link Active, Data Link Layer State Changed
@@ -138,7 +142,7 @@ reports Data Link Layer Link Active, the poller waits up to `SLOT_WAIT_MS` for t
 `LINK_SETTLE_MS` (100) before any configuration request goes below the port (PCI Express Base
 Specification r4.0 § 6.6.1); where it does not report it, it waits `SLOT_WAIT_MS`. A link that
 does not come up is logged, the slot powered off, and the slot held failed until the card is
-removed. A job, add or removal, is posted to the control thread over one channel, with a signal
+removed, replaced, or asked for again with the attention button. A job, add or removal, is posted to the control thread over one channel, with a signal
 of its job notification; the control thread runs the jobs in the order they were posted, each to
 its end before the next.
 

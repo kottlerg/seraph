@@ -651,9 +651,11 @@ fn faults(shared: &Shared, badge: u64) -> IpcMessage
 /// mapping's cap, and commit it; whether the table still held it (`false`:
 /// the device was withdrawn meanwhile). The outcome is recorded under the
 /// table's lock only while the instance called still serves
-/// ([`IommuClient::serves`]): once a death has moved the client on, the
-/// restart's replay leaves this pending mapping out, so the call is made
-/// again on the instance that serves next, at most
+/// ([`IommuClient::serves`]), a `HARDWARE_TIMEOUT` only once the
+/// instance's death watch has had the time to report it dead
+/// ([`IommuClient::await_death_report`]): once a death has moved the client
+/// on, the restart's replay leaves this pending mapping out, so the call is
+/// made again on the instance that serves next, at most
 /// [`crate::iommu::CALL_ATTEMPTS`] times.
 ///
 /// # Errors
@@ -672,6 +674,10 @@ fn install(shared: &Shared, badge: u64, handle: u64, mapping: &Mapping) -> Resul
                 break;
             };
             let result = IommuClient::map_on(ep, handle, addr, mapping.access, mapping.cap);
+            if result == Err(iommu_errors::HARDWARE_TIMEOUT)
+            {
+                client.await_death_report(ep);
+            }
             let recorded = {
                 let mut table = lock(&shared.table);
                 client.serves(ep).then(|| match result
@@ -767,6 +773,10 @@ fn remove(shared: &Shared, badge: u64, handle: u64, device_addr: u64) -> Removal
                 break;
             };
             let result = IommuClient::unmap_on(ep, handle, device_addr);
+            if result == Err(iommu_errors::HARDWARE_TIMEOUT)
+            {
+                client.await_death_report(ep);
+            }
             let recorded = {
                 let mut table = lock(&shared.table);
                 client.serves(ep).then(|| {

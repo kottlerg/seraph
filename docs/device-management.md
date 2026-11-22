@@ -432,10 +432,15 @@ independent of the control thread, which may be blocked in a call to the dead in
 IOMMU client restarting and answers every call queued on the dead instance's endpoint with an error
 for the rest of the boot. While the driver restarts, the DMA thread's `DMA_MAP` and `DMA_UNMAP` wait
 for it, up to three settle bounds (a settle the control thread may be in, the new instance's, and
-the replay), and the fault-log thread's take fails. A death by a fault or a kill (the process's exit
-reason, as procmgr gives it on devmgr's process handle for the driver, `EXIT_FAULT_BASE` and above)
-is restarted; an exit of its own is the driver's decision to stop serving, and devmgr fails closed
-(below).
+the replay), and the fault-log thread's take fails. A DMA-thread call that fails with
+`HARDWARE_TIMEOUT` while its instance still reads as serving waits up to `DEATH_REPORT_WAIT` (1 s)
+for the watch to report that instance's death, since the call can end before the watch receives the
+death post, and only then decides whether the failure is the call's outcome or the call is made
+again on the restarted instance. An instance that dies after its commit but before devmgr serves it
+is marked so by its watch, and devmgr then marks the client restarting rather than serving it. A
+death by a fault or a kill (the process's exit reason, as procmgr gives it on devmgr's process
+handle for the driver, `EXIT_FAULT_BASE` and above) is restarted; an exit of its own is the
+driver's decision to stop serving, and devmgr fails closed (below).
 
 **Attempt.** The control thread restarts the driver in a settle batch of its own. Each attempt is
 charged to the driver's restart budget (`RESTART_BURST` in `RESTART_WINDOW_NS`,

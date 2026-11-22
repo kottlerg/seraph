@@ -82,14 +82,14 @@ any byte string parses to terms or a `Fault`, never a panic.
 
 ## Namespace
 
-Nodes live in an arena and link to their parent, first child and next sibling, and record the
-scope their definition is written in, from which the names of a region's offset and length, a bank
-field's value and a package's elements resolve: the parent, but for a definition by a path, which
-is placed under the path's node. Every node has an owner: the predefined objects, the table whose load created it, or a method frame of an
-evaluator, whose objects `remove_owned` deletes when the method returns. A removed node's slot
-and id are reused. A node a table created is never removed: a method frame that defines a name a
-table declared `External` holds that node until the method returns, when `remove_owned` gives
-the `External` back to the table, with a new generation.
+Nodes live in an arena and link to their parent, first child and next sibling, and record the scope
+their definition is written in, from which the names of a region's offset and length, a bank field's
+value and a package's elements resolve: the parent, but for a definition by a path, which is placed
+under the path's node. Every node has an owner: the predefined objects, the table whose load created
+it, or a method frame of an evaluator, whose objects `remove_owned` deletes when the method returns.
+A removed node's slot and id are reused. A node a table created is never removed: a method frame
+that defines a name a table declared `External` holds that node until the method returns, when
+`remove_owned` gives the `External` back to the table, with a new generation.
 
 `Namespace::new` creates the predefined objects: `\`, `\_GPE`, `\_PR_`, `\_SB_`, `\_SI_`,
 `\_TZ_`, the Global Lock mutex `\_GL_`, the native method `\_OSI`, and the data objects `\_OS_`
@@ -269,3 +269,4 @@ Firmware tables captured from real hardware are not tracked
 ## Summarized By
 
 [Testing](../../docs/testing.md), [xtask/README.md](../../xtask/README.md)
+

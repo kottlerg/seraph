@@ -172,7 +172,9 @@ services/svctest/
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
         │                      #   fall-through, remount, a mapped page across the unmount,
         │                      #   a killed fs driver, its death's reason from a worker's exit
-        └── vfsd.rs            # `MOUNT` gate: deny, mounted-path and short-path rejections
+        ├── vfsd.rs            # `MOUNT` gate: deny, mounted-path and short-path rejections
+        └── vfsd_caps.rs       # Caps a request on vfsd's namespace endpoint carries, deleted
+                               #   whatever its label, through a synthetic intermediate
 ```
 
 Each module under `phases/` covers one surface and exports its `Phase` entries;
@@ -688,7 +690,10 @@ process's, which procmgr's relay gives. Each time vfsd restarts the driver, a ne
 listed, `/data/test.txt` reads again, `/data` is never not found, and the open file is stale. One
 more kill finds the restart budget spent: vfsd tears the mount down, `/data` falls through and is
 not found, and a fresh `MOUNT` at `/data` succeeds on the same disk. They mount `/data` again and
-set svctest's cwd to it before they end.
+set svctest's cwd to it before they end. The `vfsd_namespace_stray_caps` phase after them mounts
+the data partition over `/config/svcmgr/tests` in place of `/data`, sends requests carrying
+caps through vfsd's synthetic `/config`, and mounts `/data` again and sets the cwd to it before it
+ends.
 The sysroot placement of all of these is listed in [docs/testing.md § Sysroot
 layout](../../docs/testing.md#sysroot-layout).
 

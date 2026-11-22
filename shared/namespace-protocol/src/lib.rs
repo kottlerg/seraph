@@ -331,6 +331,12 @@ pub trait NamespaceBackend
 /// layer — they only see decoded `NodeId` / `&[u8]` / `u64`
 /// arguments.
 ///
+/// No `NS_*` request carries a cap, and this function neither reads nor
+/// deletes the caps `received` carries: the server deletes every cap an
+/// `NS_*` request carries, and every cap of a request it answers without
+/// taking it, such as one with a label it does not serve (README § Wire
+/// labels).
+///
 /// # Safety
 ///
 /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC

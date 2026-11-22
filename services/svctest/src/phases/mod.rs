@@ -68,6 +68,7 @@ pub mod budget;
 pub mod charge_node;
 pub mod checkpoint;
 pub mod crash;
+pub mod critical_creates;
 pub mod devmgr;
 pub mod discard;
 pub mod drivers;
@@ -177,6 +178,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(log_client::phases());
     out.extend_from_slice(logd_restart::phases());
+    out.extend_from_slice(critical_creates::phases());
     out.extend_from_slice(swap::phases());
     out.extend_from_slice(node_reclaim::phases());
     out.extend_from_slice(swap_client::phases());

@@ -162,7 +162,9 @@ jobs:
         # (memhog.svc), the out-of-memory policy service's fixture, which
         # svctest's oom_policy phase has fill memory until oomd stops it,
         # and stopsrc (stopsrc.svc), a stop source of the program class,
-        # whose job oomd stops first and whose source svcmgr lists.
+        # whose job oomd stops first and whose source svcmgr lists. It also
+        # co-stages reserve-creator (reserve-creator.svc), svctest's fixture for
+        # a reserve creator's create while memory is critical.
         #
         # The functional harness boots also drop the autostarted `terminal`
         # (a user-facing program, not part of the services/programs substrate
@@ -203,6 +205,7 @@ jobs:
                  sysroot/config/svcmgr/tests/crasher-worker.svc \
                  sysroot/config/svcmgr/tests/crasher-boot.svc \
                  sysroot/config/svcmgr/tests/memhog.svc \
+                 sysroot/config/svcmgr/tests/reserve-creator.svc \
                  sysroot/config/svcmgr/tests/stopsrc.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc

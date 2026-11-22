@@ -27,6 +27,9 @@ free_pool = { path = "../memmgr/free-pool", package = "memmgr-free-pool" }
 # entropy driver through the `hwrng` class protocol.
 hwrng-protocol = { path = "../../shared/hwrng-protocol" }
 ipc = { path = "../../shared/ipc" }
+# `TICK_MS`: the critical_creates phase waits out memhog's take-back of the
+# pages a destroy freed.
+mem-fill = { path = "../../shared/mem-fill" }
 # `SINK_QUEUE_BYTES` and `SINK_STALL_MS`: the logd_sinks phase sizes its lines
 # past logd's sink queue and bounds its calls by logd's stall bound.
 logd-codec = { path = "../logd/codec" }

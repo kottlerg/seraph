@@ -901,6 +901,7 @@ dependencies = [
  "ipc",
  "log",
  "logd-codec",
+ "mem-fill",
  "memmgr-free-pool",
  "namespace-protocol",
  "oomd-policy",

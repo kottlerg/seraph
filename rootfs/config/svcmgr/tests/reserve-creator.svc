@@ -1,0 +1,22 @@
+# /tests/svctest reserve-creator — svctest's fixture for a reserve creator's
+# create while memory is critical (services/svctest/README.md, phase
+# critical_creates).
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# Co-staged with svctest (services-surface harness) in CI and stageable
+# by hand: copy this file into /config/svcmgr/services/ between
+# `cargo xtask build` and `cargo xtask run`. See docs/testing.md.
+#
+# The fixture is svctest's own binary in its `reserve-creator` role: svctest
+# asks it, on the endpoint it provides, to make a CREATE_FROM_FILE |
+# CREATE_RESERVE of /programs/hello while memhog holds memory critical.
+# `reserve = yes` makes its node, and the node of a child it creates with
+# CREATE_RESERVE, reserve nodes. `restart = on_failure`, `critical = no`: a
+# death restarts it, and the system continues if the restart budget is spent.
+binary    = /tests/svctest
+argv      = svctest reserve-creator
+restart   = on_failure
+critical  = no
+namespace = universal
+provides  = svctest.reserve
+reserve   = yes

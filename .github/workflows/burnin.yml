@@ -111,7 +111,9 @@ jobs:
         # cooldown later and inside crashd's stall, frees memory
         # (services/crashd/docs/operation.md § Hold). It also co-stages
         # stopsrc (stopsrc.svc), a stop source of the program class, whose job
-        # oomd stops first and whose source svcmgr lists.
+        # oomd stops first and whose source svcmgr lists. It also co-stages
+        # reserve-creator (reserve-creator.svc), svctest's fixture for a reserve
+        # creator's create while memory is critical.
         # The usertest cell also stages crashd's test recipe over the default
         # one: its `CORE_DUMP` names crashme, whose tester checks the cores.
         # Unlike build-test.yml's, the usertest and ktest images keep the
@@ -122,6 +124,7 @@ jobs:
             svctest)
               cp sysroot/config/svcmgr/tests/svctest.svc \
                  sysroot/config/svcmgr/tests/memhog.svc \
+                 sysroot/config/svcmgr/tests/reserve-creator.svc \
                  sysroot/config/svcmgr/tests/stopsrc.svc \
                  sysroot/config/svcmgr/services/
               cp sysroot/config/devmgr/tests/*.class \

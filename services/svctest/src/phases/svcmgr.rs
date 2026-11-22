@@ -201,7 +201,7 @@ fn svcmgr_boot_death_phase(_caps: &Caps)
 /// Whether the worker-fault fixture's recipe is staged in
 /// `/config/svcmgr/services/`; a stat error other than "not found" fails
 /// `phase`.
-fn worker_fixture_staged(phase: &str) -> bool
+pub(super) fn worker_fixture_staged(phase: &str) -> bool
 {
     recipe_staged(WORKER_FAULT_RECIPE, phase)
 }
@@ -220,7 +220,7 @@ pub(super) fn recipe_staged(path: &str, phase: &str) -> bool
 
 /// A SEND on the endpoint the worker-fault fixture provides
 /// (`ipc::restart_probe_labels::NAME`), as [`provided_endpoint`] resolves it.
-fn worker_fixture(phase: &str) -> u64
+pub(super) fn worker_fixture(phase: &str) -> u64
 {
     provided_endpoint(ipc::restart_probe_labels::NAME, phase)
 }
@@ -259,7 +259,7 @@ pub(super) fn provided_endpoint(name: &[u8], phase: &str) -> u64
 
 /// The nonce of the worker-fault fixture's running instance, read through
 /// `fixture` with `PROBE_INSTANCE`; `what` names the read in a failure.
-fn probe_nonce(fixture: u64, phase: &str, what: &str) -> u64
+pub(super) fn probe_nonce(fixture: u64, phase: &str, what: &str) -> u64
 {
     use ipc::restart_probe_labels as probe;
     let ipc_buf = std::os::seraph::current_ipc_buf();

@@ -1086,7 +1086,8 @@ impl OwnFatfs
 
     /// Take the service endpoint away: revoke every capability derived from
     /// it, the driver's and the root cap among them, and delete the last.
-    /// [`Self::stop`]'s deletes of the two handles are then refused as stale.
+    /// [`Self::stop`]'s revoke and deletes of the two handles are then refused
+    /// as stale.
     fn revoke_service(&self)
     {
         syscall::cap_revoke_all(self.service)
@@ -1144,7 +1145,11 @@ impl OwnFatfs
     }
 
     /// Destroy the driver, whether or not it has exited, then stop and join
-    /// the block server unless the device was removed.
+    /// the block server unless the device was removed, and take the service
+    /// endpoint away as vfsd's teardown does ([`Self::revoke_service`]): every
+    /// session cap the driver derived from it, the ones std keeps for the
+    /// process's life among them, then names no live endpoint, so std's next
+    /// session lookup ends those sessions and releases their sub-nodes.
     fn stop(self)
     {
         let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -1169,6 +1174,7 @@ impl OwnFatfs
                 .join()
                 .expect("fs_block_faults: block server thread panicked");
         }
+        let _ = syscall::cap_revoke_all(self.service);
         for cap in [
             self.process,
             self.root,

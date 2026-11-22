@@ -126,8 +126,8 @@ struct Polled
     slot: Slot,
     /// A derivation of the port's configuration page cap.
     page: u64,
-    /// Whether a live record lay behind the slot when it was managed.
-    recorded: bool,
+    /// What lay behind the slot when it was managed ([`behind`]).
+    behind: hp::Behind,
     state: SlotState,
 }
 
@@ -420,7 +420,7 @@ impl Hotplug
             index,
             slot,
             page,
-            recorded: records.live_pci().any(|r| slot.holds(address(r))),
+            behind: behind(&slot, records, caps),
             state: SlotState::Empty,
         };
         let sent = self.poller.as_ref().map(|poller| poller.slots.send(polled));
@@ -772,10 +772,10 @@ fn with_port<R>(slot: &Polled, aspace: u64, access: impl FnOnce(&ConfigRegs) -> 
 }
 
 /// Take over a slot: turn its event interrupts off (the poller reads the
-/// latches instead), clear its latches, and hold it occupied when a live
-/// record lies behind it, else empty ([`hp::initial`]): the first poll
-/// removes a recorded card that left before take-over, and brings up an
-/// unrecorded card present.
+/// latches instead), clear its latches, and hold it as what lay behind it
+/// when it was managed ([`hp::initial`]): the first poll removes a recorded
+/// card that left before take-over, removes and then adds a card that
+/// replaced it, and brings up an unrecorded card present.
 fn take_over(slot: &mut Polled, aspace: u64)
 {
     let s = slot.slot;
@@ -787,7 +787,7 @@ fn take_over(slot: &mut Polled, aspace: u64)
         let status = regs.read16(s.register(SLOT_STATUS));
         clear_latches(regs, &s, status);
     });
-    slot.state = hp::initial(slot.recorded);
+    slot.state = hp::initial(slot.behind);
 }
 
 /// Read a managed slot's Slot Status, clear the latches it holds, and act
@@ -1416,6 +1416,41 @@ fn remove(
         returned
     );
     removal.functions
+}
+
+/// What lies behind `slot` as it is managed: nothing when no live record
+/// does; replaced, logged, when a recorded function no longer reads as its
+/// record ([`hp::same_function`]), its card removed or replaced while the
+/// slot's grant waited; else recorded. A function whose configuration page
+/// cannot be read is taken as recorded.
+fn behind(slot: &Slot, records: &bind::Records, caps: &mut caps::DevmgrCaps) -> hp::Behind
+{
+    let mut behind = hp::Behind::Nothing;
+    for record in records.live_pci().filter(|r| slot.holds(address(r)))
+    {
+        let at = address(record);
+        if with_function(caps, at, |cfg| hp::same_function(cfg, record)) == Some(false)
+        {
+            let (s, b, d, f) = slot.port;
+            std::os::seraph::log!(
+                "hotplug: slot {}:{}:{}.{}: {}:{}:{}.{} {:04x}:{:04x} no longer reads as \
+                 recorded; its card is removed, and a card present then added",
+                s,
+                b,
+                d,
+                f,
+                at.0,
+                at.1,
+                at.2,
+                at.3,
+                record.vendor_id,
+                record.device_id
+            );
+            return hp::Behind::Replaced;
+        }
+        behind = hp::Behind::Recorded;
+    }
+    behind
 }
 
 /// Run `access` on the function at `at` (segment, bus, device, function),

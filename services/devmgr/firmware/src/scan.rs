@@ -35,9 +35,9 @@ pub const MAX_BARS: usize = 6;
 const PCI_COMMAND_DECODE: u16 = 0x3;
 /// The revision ID and class code register: revision in bits 7:0, then
 /// programming interface, subclass, and base class.
-const PCI_REVISION_CLASS: u16 = 0x08;
+pub(crate) const PCI_REVISION_CLASS: u16 = 0x08;
 /// A type-0 header's subsystem vendor ID, then subsystem ID at 0x2E.
-const PCI_SUBSYSTEM: u16 = 0x2C;
+pub(crate) const PCI_SUBSYSTEM: u16 = 0x2C;
 /// A type-1 (bridge) header's secondary and subordinate bus numbers.
 const PCI_SECONDARY_BUS: u16 = 0x19;
 const PCI_SUBORDINATE_BUS: u16 = 0x1A;

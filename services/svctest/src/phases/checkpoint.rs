@@ -126,6 +126,17 @@ fn child_main() -> !
                 drop(file);
                 println!("{}", outcome(result));
             }
+            (Some("kept"), None) =>
+            {
+                // A File dropped past its thread's call deadline sends no
+                // FS_CLOSE and keeps its open cap, which still counts as an
+                // open File until the next File::open sends the close.
+                let file = std::fs::File::open("/tests/svctest");
+                with_call_deadline(Instant::now(), || drop(file));
+                println!("{}", outcome(quiesce(Duration::from_millis(50))));
+                drop(std::fs::File::open("/tests/svctest"));
+                println!("{}", outcome(quiesce(Duration::from_millis(50))));
+            }
             (Some("quiesce"), Some(ms)) =>
             {
                 println!("quiescing");
@@ -259,6 +270,21 @@ fn checkpoint_phase(_: &Caps)
         },
         "refused ResourceBusy",
         "{PHASE}: a quiesce with a file open"
+    );
+
+    // A File dropped past the child's call deadline keeps its open cap, which
+    // still refuses a quiesce; the next File::open sends the kept close, and
+    // the next quiesce is not refused (it times out, ending its point).
+    child.say("kept");
+    assert_eq!(
+        child.line("kept refusal"),
+        "refused ResourceBusy",
+        "{PHASE}: a quiesce with a File dropped past its call deadline"
+    );
+    assert_eq!(
+        child.line("kept outcome"),
+        "not-captured",
+        "{PHASE}: a quiesce after the next File::open sent the kept close"
     );
 
     // A point with no time bound, which waits for the checkpoint.

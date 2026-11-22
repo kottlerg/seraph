@@ -1404,6 +1404,94 @@ impl HeldPage
     }
 }
 
+/// `FS_READ_MEMORY` page `index` through the open cap `open` and keep the
+/// returned page cap, sending no `FS_RELEASE_MEMORY`, so the page stays
+/// outstanding on that open. Returns the cap and its release cookie, or
+/// `None` when fatfs refuses the read, logging the label.
+fn take_outstanding(open: u64, index: usize, ipc_buf: *mut u64) -> Option<(u64, u64)>
+{
+    let cookie = 0x5108_0000u64
+        .checked_add(index as u64)
+        .expect("slot reuse: outstanding cookie overflowed");
+    let offset = index
+        .checked_mul(SLOT_REUSE_PAGE)
+        .expect("slot reuse: outstanding offset overflowed");
+    let read = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
+        .word(0, offset as u64)
+        .word(1, cookie)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(open, &read, ipc_buf) }
+        .expect("slot reuse: FS_READ_MEMORY ipc_call");
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        std::os::seraph::log!(
+            "slot reuse: FS_READ_MEMORY {index} refused with label {}",
+            reply.label
+        );
+        return None;
+    }
+    let cap = *reply.caps().first().expect("slot reuse: no page cap");
+    Some((cap, cookie))
+}
+
+/// The cache slots [`opens_outstanding`] leaves without an outstanding
+/// page: one run fill (fatfs `RUN_PAGES`).
+const OUTSTANDING_SPARE_SLOTS: usize = 16;
+
+/// The opens [`opens_outstanding`] holds pages on at once: four times
+/// the slot ceiling's ancestors, well past what fatfs funds without a top-up
+/// per read.
+const OUTSTANDING_OPENS: usize = 4;
+
+/// Several opens of the slot-reuse file (`OUTSTANDING_OPENS`, the phase's
+/// own among them) each hold the same pages outstanding at once, all of the
+/// cache's slot ceiling but one run fill's worth (`OUTSTANDING_SPARE_SLOTS`),
+/// left for the FAT and directory pages and the run fills, so no outstanding
+/// page is evicted. Each outstanding page holds an ancestor cap, and fatfs's
+/// `CSpace` funding counts one per slot, so the opens together hold several
+/// times the ancestors it funds. The other opens are made first, so their
+/// `FS_OPEN` top-ups precede every read. Every read must succeed; then
+/// `FS_RELEASE_MEMORY` releases each page.
+fn opens_outstanding(node_cap: u64, open: u64, slots: usize, ipc_buf: *mut u64)
+{
+    let pages = slots.saturating_sub(OUTSTANDING_SPARE_SLOTS);
+    let others: Vec<u64> = (1..OUTSTANDING_OPENS)
+        .map(|_| fs_open(node_cap, 0, ipc_buf).expect("slot reuse: another FS_OPEN"))
+        .collect();
+    let mut kept: Vec<(u64, u64, u64)> = Vec::new();
+    for (which, &cap) in core::iter::once(&open).chain(others.iter()).enumerate()
+    {
+        for i in 0..pages
+        {
+            let (page, cookie) = take_outstanding(cap, i, ipc_buf).unwrap_or_else(|| {
+                panic!("slot reuse: open {which} was refused outstanding page {i} of {pages}")
+            });
+            kept.push((cap, page, cookie));
+        }
+    }
+    for (cap, page, cookie) in kept
+    {
+        let release = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
+            .word(0, cookie)
+            .build();
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let released = unsafe { ipc::ipc_call(cap, &release, ipc_buf) }
+            .expect("slot reuse: FS_RELEASE_MEMORY ipc_call");
+        assert_eq!(
+            released.label,
+            ipc::fs_errors::SUCCESS,
+            "slot reuse: FS_RELEASE_MEMORY of outstanding cookie {cookie:#x}"
+        );
+        let _ = syscall::cap_delete(page);
+    }
+    for other in others
+    {
+        let _ = fs_close(other, ipc_buf);
+        let _ = syscall::cap_delete(other);
+    }
+}
+
 /// Path and name of the slot-reuse file: more pages than fatfs's cache holds,
 /// page `i` tagged [`page_tag`]`(i)`. Written once per boot and shared by the
 /// per-open eviction phase (`fs_opens`), which runs first and writes it, and
@@ -1554,6 +1642,8 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
         page.release();
     }
     read_slot_reuse_file(path, 0, file_pages);
+
+    opens_outstanding(node_cap, open, slots, ipc_buf);
 
     let _ = fs_close(open, ipc_buf);
     let _ = syscall::cap_delete(open);

@@ -1173,7 +1173,11 @@ impl Session
     /// leaves the session as it is. The current thread is one GDB resumed,
     /// since GDB is told of no stop of a thread it did not resume: the one
     /// it was when GDB resumed it, or else the first such thread held, or
-    /// else the first such thread alive, as one held in a call.
+    /// else the first such thread alive, as one held in a call. When every
+    /// thread GDB resumed has exited, a thread the stop names must still be
+    /// one GDB can select, so it is the first live thread held, or else the
+    /// first live one; with none live, the target has exited, which the
+    /// next look at it reports.
     pub fn interrupt(&mut self, k: &mut impl Kernel) -> bool
     {
         if !self.running
@@ -1188,6 +1192,12 @@ impl Session
                 .iter()
                 .position(|t| resumed(t) && t.held.is_some())
                 .or_else(|| self.threads.iter().position(resumed))
+                .or_else(|| {
+                    self.threads
+                        .iter()
+                        .position(|t| t.live() && t.held.is_some())
+                })
+                .or_else(|| self.threads.iter().position(Slot::live))
         {
             self.current = index;
         }
@@ -2665,6 +2675,29 @@ mod tests
         s.complete = false;
         sim.exit_on_resume.push(0);
         assert_eq!(s.resume(&mut sim, continue_all(&s), None), Resumed::Running);
+        sim.assert_sound();
+    }
+
+    // Defect caught: GDB's interrupt, once the one thread GDB continued had
+    // exited, reported the stop of that exited thread, which GDB then could
+    // not select.
+    #[test]
+    fn an_interrupt_after_every_resumed_thread_exited_names_a_live_thread()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        assert!(s.interrupt(&mut sim));
+        assert_eq!(s.current, a);
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        sim.exit(a);
+        assert!(s.interrupt(&mut sim));
+        assert_eq!(s.current, 0);
+        assert!(s.threads[0].live() && s.is_held(0));
         sim.assert_sound();
     }
 

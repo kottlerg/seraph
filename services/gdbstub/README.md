@@ -262,7 +262,9 @@ stub's endpoint.
   and a stop is reported only for a thread GDB resumed, or one spawned while the target ran: a stop
   GDB did not ask for would break its own run control, as a software step's breakpoint taken by
   another thread does. GDB's interrupt reports the current thread when GDB resumed it, and
-  otherwise the first thread it resumed, held or else in a call. A `vCont` whose actions name no
+  otherwise the first thread it resumed, held or else in a call; when every thread GDB resumed has
+  exited, it reports the first live thread, held or else in a call, since its stop names a thread
+  GDB then selects. A `vCont` whose actions name no
   live thread is answered `E01`; a resume with no target, or after which every thread has exited,
   is answered `W00`, as is a target whose threads all exit while it runs, but only when the stub's
   table holds every thread of the target, since threads it could not take may run on. Once no

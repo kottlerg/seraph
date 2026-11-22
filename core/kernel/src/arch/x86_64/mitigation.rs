@@ -1231,7 +1231,10 @@ pub(super) use ibpb_asm;
 // plain jump on a part that needs the sequence.
 //
 // `seraph_enter_from_user` runs on every entry from user mode, before any
-// indirect branch and any `ret` that its own `call` did not pair. With IBRS on
+// indirect branch and any `ret` that its own `call` did not pair, and after
+// the entry's `cld`, `clac` and swap to the kernel GS base: every caller, the
+// paranoid stubs included, makes those first, so the routine may read per-CPU
+// (`gs:`) memory and use string instructions as other kernel code does. With IBRS on
 // entry selected it first writes the kernel's `IA32_SPEC_CTRL` value, `IBRS`
 // set, so the predictions user mode trained steer no later indirect branch or
 // `ret` (Intel's RSBU guidance). With the IBPB on entry selected it then

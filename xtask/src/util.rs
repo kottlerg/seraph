@@ -175,7 +175,8 @@ fn tool_search_path(path: Option<&OsStr>) -> Option<OsString>
 /// `extension` is the host's executable extension
 /// (`std::env::consts::EXE_EXTENSION`: `exe` on Windows, empty elsewhere),
 /// which a name without it takes, as `Command` gives it. A match is a regular
-/// file (after symlinks) that, on Unix, has an execute permission bit set.
+/// file (after symlinks) that, on Unix, this process may execute: the launcher
+/// passes over one whose exec it is refused and tries the next directory.
 fn find_executable(name: &Path, path: Option<&OsStr>, extension: &str) -> Option<PathBuf>
 {
     let file = with_extension(name, extension);
@@ -209,13 +210,23 @@ fn with_extension(name: &Path, extension: &str) -> PathBuf
     PathBuf::from(file)
 }
 
-/// Whether `path` is a regular file with an execute permission bit set.
+/// Whether `path` is a regular file this process may execute, as the
+/// kernel's exec decides it: by the permission class of the process's ids
+/// and groups, not by whether any execute bit is set (`access(2)` with
+/// `X_OK`).
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool
 {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes())
+    else
+    {
+        return false;
+    };
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call,
+    // which only reads it.
+    let may_execute = unsafe { crate::sys::unix::access(c_path.as_ptr(), crate::sys::unix::X_OK) };
+    may_execute == 0 && std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 /// Whether `path` is a regular file: a host without Unix permission bits
@@ -450,11 +461,26 @@ mod tests
             find_executable(Path::new("tool"), Some(&path), ""),
             Some(exec.join("tool"))
         );
-        // An execute bit for others alone is still an execute bit.
+        // An execute bit for others alone does not let the file's owner
+        // execute it, so the launcher passes over it; root may execute a file
+        // with any execute bit set.
         file_with_mode(&plain.join("tool"), 0o601);
+        let owner = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(plain.join("tool")).unwrap().uid()
+        };
         assert_eq!(
             find_executable(Path::new("tool"), Some(&path), ""),
-            Some(plain.join("tool"))
+            Some(
+                if owner == 0
+                {
+                    plain.join("tool")
+                }
+                else
+                {
+                    exec.join("tool")
+                }
+            )
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

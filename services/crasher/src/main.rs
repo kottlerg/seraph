@@ -247,12 +247,7 @@ fn worker_fault_role(creator_ep: u64, ipc_buf: *mut u64) -> !
         std::os::seraph::log!("FATAL: worker-fault: no service endpoint or nonce");
         syscall::thread_exit();
     }
-    let Some(worker) = start_fault_worker()
-    else
-    {
-        std::os::seraph::log!("FATAL: worker-fault: worker thread not started");
-        syscall::thread_exit();
-    };
+    let worker = start_fault_worker_retrying();
     std::os::seraph::log!("worker-fault: serving");
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
@@ -292,6 +287,34 @@ fn worker_fault_role(creator_ep: u64, ipc_buf: *mut u64) -> !
         {
             fault_worker(&worker);
         }
+    }
+}
+
+/// How long the role sleeps between attempts to start the fault worker.
+const WORKER_RETRY_MS: u64 = 50;
+
+/// Start the fault worker ([`start_fault_worker`]), trying again every
+/// [`WORKER_RETRY_MS`] until it starts. A thread's IPC buffer is a memmgr
+/// grant made at once, which memmgr refuses outside the reserve while memory
+/// is critical, and an instance svcmgr restarts can start in that window:
+/// it waits for the memory, as its held demand faults would, and serves once
+/// the worker runs, so a request queued on the endpoint meanwhile is answered
+/// then. The first refusal is logged.
+fn start_fault_worker_retrying() -> thread::Thread
+{
+    let mut logged = false;
+    loop
+    {
+        if let Some(worker) = start_fault_worker()
+        {
+            return worker;
+        }
+        if !logged
+        {
+            std::os::seraph::log!(warn: "worker-fault: worker thread not started; retrying");
+            logged = true;
+        }
+        let _ = syscall::thread_sleep(WORKER_RETRY_MS);
     }
 }
 

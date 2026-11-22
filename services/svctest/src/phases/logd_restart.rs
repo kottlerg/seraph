@@ -66,6 +66,13 @@
 //! stamps each line while svcmgr's call of it waits, so the order of the two
 //! stamps is the order of the restart and the destroy, however long the
 //! restart takes and whether oomd or svctest asks for the stop.
+//!
+//! In the same window, before the kill, the phase makes the creates of
+//! `super::critical_creates` (svctest's own, refused `OUT_OF_MEMORY`, and a
+//! reserve creator's, which succeeds), and after it faults the `crasher-worker`
+//! fixture's worker, whose restart must be held until the level falls and then
+//! made; the window is shared because svcmgr restarts memhog at most three
+//! times a window and the boot's other memhog windows spend them.
 
 use std::time::{Duration, Instant};
 
@@ -137,10 +144,13 @@ pub fn logd_reserve_phase(caps: &Caps)
         .unwrap_or_else(|| panic!("{phase}: LIST_PROCESSES lists no logd"));
     let (threads, flags) = attach(authority, killed, phase);
     require_reserve(flags, phase, "the running");
+    let mut creates = super::critical_creates::Checks::prepare(phase);
     let mut killed_us = 0;
     super::oom::critical_window(caps, phase, RESERVE_HOLD, || {
+        creates.creates();
         killed_us = super::oom::elapsed_us();
         fault_main(&threads, phase);
+        creates.fault_worker();
     });
     for cap in threads
     {
@@ -169,6 +179,7 @@ pub fn logd_reserve_phase(caps: &Caps)
         "logd_reserve phase passed (logd killed while memory was critical, and restarted and \
          serving {took} ms later, {lead} ms before svcmgr stopped memhog)"
     );
+    creates.finish(phase);
 }
 
 /// Kill logd, wait for its next instance, and check the new instance's

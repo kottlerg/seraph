@@ -6,15 +6,19 @@
 //! Process creation while memory is critical (`services/procmgr/docs/ipc-interface.md` § Label 13,
 //! `services/svcmgr/docs/restart-protocol.md`).
 //!
-//! The `memhog` fixture holds the pool at the system reserve for the window of
-//! [`super::oom::critical_window`], and the phase makes three checks inside it:
+//! Three checks the `logd_reserve` phase makes in its window
+//! (`super::logd_restart`), while the `memhog` fixture holds the pool at the
+//! system reserve ([`super::oom::critical_window`]). They share that window
+//! because svcmgr restarts memhog at most three times a window
+//! (`services/svcmgr/docs/service-definitions.md` § `restart`), and the boot's
+//! other memhog windows spend them.
 //!
 //! 1. svctest's own `CREATE_FROM_FILE` of `/programs/hello`, which is outside
 //!    the reserve, is refused with `OUT_OF_MEMORY`, and no other label:
 //!    svcmgr's memory wait for a restart holds only that label, so a create
 //!    outside the reserve that failed otherwise would be a hard failure there.
-//!    The phase destroys each child it manages to create and waits for
-//!    memhog's next tick to take back the frames the destroy freed, and tries
+//!    The checks destroy each child they manage to create and wait for
+//!    memhog's next tick to take back the frames the destroy freed, and try
 //!    up to [`ATTEMPTS`] times.
 //! 2. A reserve creator's `CREATE_FROM_FILE | CREATE_RESERVE`, made by the
 //!    `reserve-creator` fixture (`reserve-creator.svc`, a service in the
@@ -24,25 +28,11 @@
 //!    after the window with a new nonce.
 //!
 //! Check 2 runs when `reserve-creator.svc` is staged, check 3 when
-//! `crasher-worker.svc` is, and the phase as a whole when `memhog.svc` is.
-//! Everything the window needs is allocated before it, and the window logs
-//! nothing.
-
-use std::time::Duration;
+//! `crasher-worker.svc` is. Everything the window needs is allocated before it
+//! ([`Checks::prepare`]), and the window's steps ([`Checks::creates`],
+//! [`Checks::fault_worker`]) allocate nothing and log nothing.
 
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels, restart_probe_labels as probe};
-
-use crate::bootstrap::Caps;
-use crate::runner::Phase;
-
-/// The phase.
-pub fn phases() -> &'static [Phase]
-{
-    &[Phase {
-        name: "critical_creates",
-        run: critical_creates_phase,
-    }]
-}
 
 /// The recipe that starts the reserve-creator fixture, when it is staged.
 const RESERVE_RECIPE: &str = "/config/svcmgr/services/reserve-creator.svc";
@@ -73,10 +63,6 @@ const NO_REPLY: u64 = u64::MAX;
 /// The file caps of `/programs/hello` each side looks up before the window,
 /// and so the most creates it makes in one.
 const ATTEMPTS: usize = 4;
-
-/// How long the window holds memory critical when no oomd stops memhog. A test
-/// wait bound.
-const CRITICAL_HOLD: Duration = Duration::from_secs(5);
 
 /// The ticks of memhog (`mem_fill::TICK_MS`) the phase sleeps after a destroy,
 /// so memhog takes back what the destroy freed.
@@ -177,103 +163,141 @@ fn own_creates(files: &Files, labels: &mut [u64; ATTEMPTS]) -> usize
     made
 }
 
-/// Run the three checks (see the module documentation).
-fn critical_creates_phase(caps: &Caps)
+/// What the checks hold from before the window to after it.
+pub(super) struct Checks
 {
-    let phase = "critical_creates";
-    if !super::svcmgr::recipe_staged(super::oom::MEMHOG_RECIPE, phase)
-    {
-        std::os::seraph::log!("critical_creates phase passed (memhog.svc not staged)");
-        return;
-    }
-    let files = lookup_files();
-    let creator = super::svcmgr::recipe_staged(RESERVE_RECIPE, phase).then(|| {
-        let fixture = super::svcmgr::provided_endpoint(RESERVE_NAME, phase);
-        let label = call_label(fixture, PREPARE);
-        assert_eq!(
-            label, 0,
-            "{phase}: the reserve creator's PREPARE replied {label:#x}"
-        );
-        fixture
-    });
-    let worker = super::svcmgr::worker_fixture_staged(phase).then(|| {
-        let fixture = super::svcmgr::worker_fixture(phase);
-        let nonce = super::svcmgr::probe_nonce(fixture, phase, "first PROBE_INSTANCE");
-        (fixture, nonce)
-    });
+    /// The file caps of svctest's own creates.
+    files: Files,
+    /// The reserve-creator fixture's endpoint, when it is staged.
+    creator: Option<u64>,
+    /// The worker-fault fixture's endpoint and its first instance's nonce,
+    /// when it is staged.
+    worker: Option<(u64, u64)>,
+    /// The reply label of each of svctest's own creates.
+    labels: [u64; ATTEMPTS],
+    /// How many of svctest's own creates were made.
+    attempts: usize,
+    /// The reserve creator's reply label.
+    creator_label: Option<u64>,
+    /// The worker-fault fixture's reply to `PROBE_FAULT_WORKER`.
+    worker_label: Option<u64>,
+}
 
-    let mut labels = [NO_REPLY; ATTEMPTS];
-    let mut attempts = 0;
-    let mut creator_label = None;
-    let mut worker_label = None;
-    super::oom::critical_window(caps, phase, CRITICAL_HOLD, || {
-        attempts = own_creates(&files, &mut labels);
-        if let Some(fixture) = creator
-        {
-            creator_label = Some(call_label(fixture, CREATE));
-        }
-        if let Some((fixture, _)) = worker
-        {
-            worker_label = Some(call_label(fixture, probe::PROBE_FAULT_WORKER));
-        }
-    });
-    for &(file, _) in files.iter().skip(attempts)
+impl Checks
+{
+    /// Look up the file caps, and reach each staged fixture, before the
+    /// window.
+    pub(super) fn prepare(phase: &str) -> Self
     {
-        let _ = syscall::cap_delete(file);
+        let files = lookup_files();
+        let creator = super::svcmgr::recipe_staged(RESERVE_RECIPE, phase).then(|| {
+            let fixture = super::svcmgr::provided_endpoint(RESERVE_NAME, phase);
+            let label = call_label(fixture, PREPARE);
+            assert_eq!(
+                label, 0,
+                "{phase}: the reserve creator's PREPARE replied {label:#x}"
+            );
+            fixture
+        });
+        let worker = super::svcmgr::worker_fixture_staged(phase).then(|| {
+            let fixture = super::svcmgr::worker_fixture(phase);
+            let nonce = super::svcmgr::probe_nonce(fixture, phase, "first PROBE_INSTANCE");
+            (fixture, nonce)
+        });
+        Self {
+            files,
+            creator,
+            worker,
+            labels: [NO_REPLY; ATTEMPTS],
+            attempts: 0,
+            creator_label: None,
+            worker_label: None,
+        }
     }
 
-    let last = labels
-        .get(attempts.saturating_sub(1))
-        .copied()
-        .unwrap_or(NO_REPLY);
-    assert_ne!(
-        last,
-        procmgr_errors::SUCCESS,
-        "{phase}: memory never ran short of svctest's create ({attempts} created)"
-    );
-    assert_eq!(
-        last,
-        procmgr_errors::OUT_OF_MEMORY,
-        "{phase}: CREATE_FROM_FILE outside the reserve while memory was critical replied \
-         {last:#x}, not OUT_OF_MEMORY (svcmgr's memory wait holds only OUT_OF_MEMORY)"
-    );
-    if let Some(label) = creator_label
+    /// Checks 1 and 2, inside the window. Allocates nothing and logs nothing.
+    pub(super) fn creates(&mut self)
     {
-        assert_eq!(
-            label, 0,
-            "{phase}: a reserve creator's CREATE_FROM_FILE | CREATE_RESERVE while memory was \
-             critical replied {label:#x}"
-        );
+        self.attempts = own_creates(&self.files, &mut self.labels);
+        if let Some(fixture) = self.creator
+        {
+            self.creator_label = Some(call_label(fixture, CREATE));
+        }
     }
-    if let (Some((fixture, first)), Some(label)) = (worker, worker_label)
+
+    /// Check 3's fault, inside the window. Allocates nothing and logs nothing.
+    pub(super) fn fault_worker(&mut self)
     {
-        assert_eq!(
-            label,
-            probe::SUCCESS,
-            "{phase}: PROBE_FAULT_WORKER replied {label:#x}"
-        );
-        std::os::seraph::log!("critical_creates: awaiting crasher-worker's restart");
-        let next = super::svcmgr::probe_nonce(fixture, phase, "PROBE_INSTANCE after the window");
+        if let Some((fixture, _)) = self.worker
+        {
+            self.worker_label = Some(call_label(fixture, probe::PROBE_FAULT_WORKER));
+        }
+    }
+
+    /// Judge the three checks after the window, awaiting the worker-fault
+    /// fixture's next instance, and log the outcome.
+    pub(super) fn finish(self, phase: &str)
+    {
+        for &(file, _) in self.files.iter().skip(self.attempts)
+        {
+            let _ = syscall::cap_delete(file);
+        }
+        let attempts = self.attempts;
+        let last = self
+            .labels
+            .get(attempts.saturating_sub(1))
+            .copied()
+            .unwrap_or(NO_REPLY);
         assert_ne!(
-            next, first,
-            "{phase}: the same crasher-worker instance answered after its worker faulted"
+            last,
+            procmgr_errors::SUCCESS,
+            "{phase}: memory never ran short of svctest's create ({attempts} created)"
+        );
+        assert_eq!(
+            last,
+            procmgr_errors::OUT_OF_MEMORY,
+            "{phase}: CREATE_FROM_FILE outside the reserve while memory was critical replied \
+             {last:#x}, not OUT_OF_MEMORY (svcmgr's memory wait holds only OUT_OF_MEMORY)"
+        );
+        if let Some(label) = self.creator_label
+        {
+            assert_eq!(
+                label, 0,
+                "{phase}: a reserve creator's CREATE_FROM_FILE | CREATE_RESERVE while memory was \
+                 critical replied {label:#x}"
+            );
+        }
+        if let (Some((fixture, first)), Some(label)) = (self.worker, self.worker_label)
+        {
+            assert_eq!(
+                label,
+                probe::SUCCESS,
+                "{phase}: PROBE_FAULT_WORKER replied {label:#x}"
+            );
+            std::os::seraph::log!("{phase}: awaiting crasher-worker's restart");
+            let next =
+                super::svcmgr::probe_nonce(fixture, phase, "PROBE_INSTANCE after the window");
+            assert_ne!(
+                next, first,
+                "{phase}: the same crasher-worker instance answered after its worker faulted"
+            );
+        }
+        if let Some(fixture) = self.creator
+        {
+            let _ = syscall::cap_delete(fixture);
+        }
+        if let Some((fixture, _)) = self.worker
+        {
+            let _ = syscall::cap_delete(fixture);
+        }
+        let shown = |staged: bool| if staged { "ok" } else { "not staged" };
+        std::os::seraph::log!(
+            "{phase}: creates while memory was critical passed (own create refused OUT_OF_MEMORY \
+             after {attempts} attempts; reserve create: {}; worker restart after the window: {})",
+            shown(self.creator.is_some()),
+            shown(self.worker.is_some())
         );
     }
-    if let Some(fixture) = creator
-    {
-        let _ = syscall::cap_delete(fixture);
-    }
-    if let Some((fixture, _)) = worker
-    {
-        let _ = syscall::cap_delete(fixture);
-    }
-    let shown = |staged: bool| if staged { "ok" } else { "not staged" };
-    std::os::seraph::log!(
-        "critical_creates phase passed (own create refused OUT_OF_MEMORY after {attempts} \
-         attempts; reserve create: {}; worker restart after the window: {})",
-        shown(creator.is_some()),
-        shown(worker.is_some())
-    );
 }
 
 /// Child-mode dispatch for this module's role ([`crate::reentry`]).

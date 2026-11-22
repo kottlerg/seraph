@@ -13,6 +13,7 @@
 //! the capability slots are defined in `services/crasher/README.md`.
 
 use std::os::seraph::startup_info;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -246,6 +247,12 @@ fn worker_fault_role(creator_ep: u64, ipc_buf: *mut u64) -> !
         std::os::seraph::log!("FATAL: worker-fault: no service endpoint or nonce");
         syscall::thread_exit();
     }
+    let Some(worker) = start_fault_worker()
+    else
+    {
+        std::os::seraph::log!("FATAL: worker-fault: worker thread not started");
+        syscall::thread_exit();
+    };
     std::os::seraph::log!("worker-fault: serving");
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
@@ -283,20 +290,28 @@ fn worker_fault_role(creator_ep: u64, ipc_buf: *mut u64) -> !
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         if msg.label == restart_probe_labels::PROBE_FAULT_WORKER
         {
-            fault_worker();
+            fault_worker(&worker);
         }
     }
 }
 
-/// Start a thread that takes a terminal fault after
-/// [`restart_probe_labels::FAULT_DELAY_MS`], and park the main thread
-/// without receiving again: only the worker's fault ends the process, through
-/// procmgr's teardown, which posts no death for the main thread.
-fn fault_worker() -> !
+/// Set by the main thread on `PROBE_FAULT_WORKER`: the fault worker's go.
+static FAULT_GO: AtomicBool = AtomicBool::new(false);
+
+/// Start the thread that takes a terminal fault
+/// [`restart_probe_labels::FAULT_DELAY_MS`] after [`FAULT_GO`] is set. The
+/// role starts it before it serves, so the fault takes no memory when it is
+/// asked for: one asked for while memory is critical, when a new thread
+/// could not be made, still happens. `None` when the thread was not started.
+fn start_fault_worker() -> Option<thread::Thread>
 {
-    let spawned = thread::Builder::new()
+    thread::Builder::new()
         .name("fault-worker".into())
         .spawn(|| {
+            while !FAULT_GO.load(Ordering::Acquire)
+            {
+                thread::park();
+            }
             let _ = syscall::thread_sleep(restart_probe_labels::FAULT_DELAY_MS);
             std::os::seraph::log!("worker-fault: worker thread faulting");
             // SAFETY: deliberately invalid: the null write faults, and no
@@ -304,12 +319,18 @@ fn fault_worker() -> !
             unsafe {
                 core::ptr::write_volatile(core::ptr::null_mut::<u8>(), 0x42);
             }
-        });
-    if spawned.is_err()
-    {
-        std::os::seraph::log!("FATAL: worker-fault: worker thread not started");
-        syscall::thread_exit();
-    }
+        })
+        .ok()
+        .map(|handle| handle.thread().clone())
+}
+
+/// Let the fault worker `worker` go, and park the main thread without
+/// receiving again: only the worker's fault ends the process, through
+/// procmgr's teardown, which posts no death for the main thread.
+fn fault_worker(worker: &thread::Thread) -> !
+{
+    FAULT_GO.store(true, Ordering::Release);
+    worker.unpark();
     loop
     {
         let _ = syscall::thread_sleep(u64::from(u32::MAX));

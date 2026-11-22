@@ -1,6 +1,6 @@
 # /tests/svctest reserve-creator — svctest's fixture for a reserve creator's
 # create while memory is critical (services/svctest/README.md, phase
-# critical_creates).
+# logd_reserve).
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # Co-staged with svctest (services-surface harness) in CI and stageable

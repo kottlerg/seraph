@@ -1176,8 +1176,10 @@ mod tests
 
     /// Defect caught: a short name that equals the name another entry of the directory is
     /// looked up as, which `fatfs`'s first-match lookup resolves to the wrong entry when it
-    /// comes first: a generated tail taken from under a later sibling's name, or an exact
-    /// 8.3 name a sibling's name is looked up as.
+    /// comes first: a generated tail taken from under a later sibling's name. An exact 8.3
+    /// name beside a longer name that truncates to it shadows nothing, since a lookup matches
+    /// no short name to a component longer than 8.3: both are stored, the longer under the
+    /// next free tail.
     #[test]
     fn no_short_name_is_one_another_entry_is_looked_up_as()
     {
@@ -1202,7 +1204,9 @@ mod tests
             }
         }
         assert_eq!(short(&got[1]), "FOOBAR~1   ");
-        names(&["FOOBAR~1", "foobar~1 extra"]).unwrap_err();
+        let pair = names(&["FOOBAR~1", "foobar~1 extra"]).unwrap();
+        assert_eq!(short(&pair[0]), "FOOBAR~1   ");
+        assert_eq!(short(&pair[1]), "FOOBAR~2   ");
     }
 
     /// A tree that exercises every path of the writer: nested directories, an empty file, a

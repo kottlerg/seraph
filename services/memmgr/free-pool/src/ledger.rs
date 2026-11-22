@@ -1581,16 +1581,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Set the max of the budget node `node` to `max`, clamped to its
     /// usage plus its parent chain's headroom ([`budget::clamp_max`]).
-    /// Returns the max it took; `None` when `node` is not a budget node, or
-    /// when `max` is [`crate::NO_MAX`] and `node` is a reserve sub-node,
-    /// whose finite max bounds what its subtree can take of the reserve
-    /// ([`Self::create_sub_node`]). Nothing changes then.
+    /// On a reserve sub-node, whose max bounds what its subtree can take of
+    /// the reserve ([`Self::create_sub_node`]), `max` is first clamped to the
+    /// node's current max, so that max only falls. Returns the max it took;
+    /// `None` when `node` is not a budget node.
     pub fn set_node_max(&mut self, node: NodeIdx, max: u64) -> Option<u64>
     {
-        if budget::node(&self.arena, node)?.bounded() && max == crate::NO_MAX
-        {
-            return None;
-        }
+        let b = budget::node(&self.arena, node)?;
+        let max = if b.bounded() { max.min(b.max) } else { max };
         let max = budget::clamp_max(&self.arena, node, max);
         budget::set_max(&mut self.arena, node, max);
         Some(max)
@@ -7768,13 +7766,16 @@ mod tests
             .unwrap();
         let inner = l.handle(inner).unwrap().node;
         assert!(budget::node(&l.arena, inner).unwrap().reserve());
-        // Each keeps a finite max: a later max may move it, not lift it. A
-        // node outside the reserve, and a top-level reserve node, may drop
-        // theirs.
-        assert_eq!(l.set_node_max(node, NO_MAX), None);
-        assert_eq!(l.set_node_max(inner, NO_MAX), None);
-        assert_eq!(budget::node(&l.arena, node).unwrap().max, 4);
+        // Each one's max only falls: a later max may lower it, never raise
+        // it. A node outside the reserve, and a top-level reserve node, may
+        // drop theirs.
+        assert_eq!(l.set_node_max(node, NO_MAX), Some(4));
+        assert_eq!(l.set_node_max(node, NO_MAX - 1), Some(4));
+        assert_eq!(l.set_node_max(node, 1 << 40), Some(4));
+        assert_eq!(l.set_node_max(inner, NO_MAX), Some(2));
         assert_eq!(l.set_node_max(node, 3), Some(3));
+        assert_eq!(l.set_node_max(node, 4), Some(3));
+        assert_eq!(budget::node(&l.arena, node).unwrap().max, 3);
         assert_eq!(l.set_node_max(outside, NO_MAX), Some(NO_MAX));
         assert_eq!(l.set_node_max(core_node, NO_MAX), Some(NO_MAX));
     }

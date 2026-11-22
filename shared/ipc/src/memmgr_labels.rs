@@ -419,8 +419,8 @@ pub const SHRINK_REGION: u64 = 13;
 /// Set the max of the handle's budget node, on a node handle
 /// ([`NODE_HANDLE_TAG`]). `data[0]` is the max in pages, `u64::MAX` for
 /// none; memmgr clamps it to the node's usage plus what its parent chain
-/// has left; `u64::MAX` on a reserve sub-node ([`SUB_NODE_RESERVE`]) is
-/// refused `INVALID_ARGUMENT`. A max below the usage reclaims and kills
+/// has left, and on a reserve sub-node ([`SUB_NODE_RESERVE`]) first to the
+/// node's current max, so that max only falls. A max below the usage reclaims and kills
 /// nothing: it refuses every later charge until the usage falls below it.
 /// Reply (`SUCCESS`): `data[0]` the max the node took. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 14: `NODE_SET_MAX`.
@@ -438,7 +438,7 @@ pub const NODE_CREATE: u64 = 15;
 /// sub-node in the system reserve, so a charge to it may take the free pages
 /// a node outside the reserve must leave. Honoured only under a reserve
 /// parent and with a finite max, which bounds what the sub-node's subtree can
-/// take of the reserve and which [`NODE_SET_MAX`] may move but not lift;
+/// take of the reserve and which [`NODE_SET_MAX`] may lower but never raise;
 /// refused `INVALID_ARGUMENT` otherwise. Specified in
 /// `services/memmgr/docs/memory-pool.md` § Distribution policy, **System
 /// reserve**.

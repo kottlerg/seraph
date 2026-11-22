@@ -956,14 +956,14 @@ over a node handle (§ Node Handles).
 | label | 14 |
 | data[0] | `max_pages` — the max asked for, `u64::MAX` for none |
 
-memmgr clamps the max to the node's subtree usage plus what its parent chain
-has left, as `REGISTER_PROCESS` clamps a new node's, so a node grows only into
-room its ancestors still have; `u64::MAX` stays unbounded, limited by the chain
-at each charge. A reserve sub-node (§ Label 15) keeps a finite max: memmgr
-refuses `u64::MAX` on it, since its max bounds what its subtree can take of the
-reserve. A max below the usage is kept: it reclaims and kills nothing,
-and refuses new charges until the usage falls below it. A max at or below the
-usage signals the node's limit event (§ Label 17).
+memmgr clamps the max to the node's subtree usage plus what its parent chain has
+left, as `REGISTER_PROCESS` clamps a new node's, so a node grows only into room
+its ancestors still have; `u64::MAX` stays unbounded, limited by the chain at
+each charge. On a reserve sub-node (§ Label 15) the max only falls: memmgr first
+clamps the max asked for to the node's current one, since that max bounds what
+its subtree can take of the reserve. A max below the usage is kept: it reclaims
+and kills nothing, and refuses new charges until the usage falls below it. A max
+at or below the usage signals the node's limit event (§ Label 17).
 
 **Reply (success):**
 
@@ -976,7 +976,7 @@ usage signals the node's limit event (§ Label 17).
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state (released, or its owner gone), or `max_pages` is `u64::MAX` and the node is a reserve sub-node |
+| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state (released, or its owner gone) |
 | 5 | `UNAUTHORIZED` | The badge is not a node handle, or is a charge-only one |
 
 ### Label 15: `NODE_CREATE`
@@ -997,7 +997,7 @@ passes the sub-node's handle with `CREATE_CHARGE_NODE` (§ Node Handles).
 The sub-node is outside the reserve unless `data[1]` sets
 `SUB_NODE_RESERVE`, which memmgr honours only when the handle's node is a
 reserve node and `max_pages` is finite; the sub-node is then a reserve node,
-and its max, which `NODE_SET_MAX` may move but not lift (§ Label 14), bounds
+and its max, which `NODE_SET_MAX` may lower but never raise (§ Label 14), bounds
 what its subtree can take of the reserve
 ([memory-pool.md](memory-pool.md#distribution-policy) § Distribution policy,
 System reserve). Its max is clamped to what the handle's node and its

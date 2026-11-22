@@ -421,8 +421,10 @@ state the dead instance wrote is trusted.
 devmgr keeps for the boot what a restart needs: each unit's register cap and anchor; a copy of the
 driver's boot-module image in pages it allocates, since a retained derivation of the module's cap
 pins init's donated pool run, and a read of the binary from the drivers directory needs a `DMA_MAP`,
-which needs the IOMMU driver; the release token of each instance's DMA hold; each domain's handle
-and domain ID, which `ATTACH` replies; on x86-64 the interrupt remapping table, which devmgr
+which needs the IOMMU driver; the release token of each instance's DMA hold; each domain's handle,
+which devmgr names in its `ATTACH` from a count it keeps for the boot, so that no instance gives a
+handle a dead one gave, under which a call left pending across the death would reach another
+function's domain, and its domain ID, which `ATTACH` replies; on x86-64 the interrupt remapping table, which devmgr
 allocates and hands to the driver in `REMAP_SETUP`, with every entry it set; and the `DmaTable` (§
 DMA Authorisation), which holds every confined device's domain, reserved ranges, interrupt files and
 mappings.

@@ -74,7 +74,7 @@
 //! § IOMMU Driver Restart.
 
 use std::os::seraph::thread::BuilderExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -243,6 +243,12 @@ pub struct IommuClient
     domains: Mutex<Domains>,
     /// The interrupt remapping table and the entries written to it.
     remaps: Mutex<Remaps>,
+    /// The handle the next `ATTACH` names. devmgr names every domain's
+    /// handle, each once in the boot: a restarted instance counts the
+    /// handles it would choose from 1 again, so a handle a dead instance gave
+    /// could otherwise name another function's domain under the instance
+    /// that serves a call left pending across the death.
+    next_handle: AtomicU64,
 }
 
 impl IommuClient
@@ -260,6 +266,7 @@ impl IommuClient
             widths: OnceLock::new(),
             domains: Mutex::new(Domains::new()),
             remaps: Mutex::new(Remaps::new()),
+            next_handle: AtomicU64::new(1),
         }
     }
 
@@ -379,15 +386,21 @@ impl IommuClient
     }
 
     /// Attach the function `rid` (`iommu_labels::requester_id`) of unit
-    /// `unit` to a domain of its own; its domain handle, recorded with its
+    /// `unit` to a domain of its own, under a handle no domain of the boot
+    /// had ([`Self::next_handle`]); its domain handle, recorded with its
     /// domain ID for a restart.
     ///
     /// # Errors
     /// The driver's error label, or `OUT_OF_RESOURCES` when the record
-    /// cannot grow, the function then blocked again.
+    /// cannot grow, the function then blocked again, or every handle is
+    /// spent.
     pub fn attach(&self, unit: usize, rid: u64) -> Result<u64, u64>
     {
-        let reply = self.call(&attach_msg(unit, rid, 0, 0))?;
+        let handle = self
+            .next_handle
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| h.checked_add(1))
+            .map_err(|_| iommu_errors::OUT_OF_RESOURCES)?;
+        let reply = self.call(&attach_msg(unit, rid, handle, 0))?;
         let domain = Domain {
             handle: reply.word(0),
             unit,

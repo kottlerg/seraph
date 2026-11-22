@@ -29,7 +29,9 @@
 /// for one the driver chooses; `data[4]` = the domain ID to tag its
 /// translations with on its unit, or 0 for one the driver chooses. A
 /// restarted driver's replay names the handle and domain ID the function
-/// held under the instance before it ([`COMMIT`]). Reply: label `SUCCESS`
+/// held under the instance before it ([`COMMIT`]); devmgr names every
+/// handle, each once in the boot, so that a restarted instance gives none
+/// a dead one gave. Reply: label `SUCCESS`
 /// with `data[0]` = the domain handle every later request for the
 /// function names and `data[1]` = its domain ID; or an error code,
 /// `INVALID_REQUEST` for a named handle or domain ID another domain holds

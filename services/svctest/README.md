@@ -224,18 +224,18 @@ restart phase (`caps[16]` and `caps[21]`), the drivers deny phase (`caps[11]` to
 (`caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`,
 `pwrmgr.deny` and `acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and
 `caps[5]`), the svcmgr stray-cap phase (`caps[20]`), the vfsd and vfsd unmount phases (`caps[4]`,
-`caps[5]`), the `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`,
-`logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`,
-`rtc_create_retry`, `oom_policy`, and `memmgr_swap_commit` phases (`caps[6]`), the
-`rtc_create_retry` phase (`caps[19]`), the vfsd swap-partition phase (`caps[14]`), the
-`memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases (`caps[18]`), the `sessiond_operator`
-phase and the `oom_policy` phase's session case (`caps[15]` and `caps[22]`), the `crash_endpoint`,
-`logd_reserve`, `logd_restart`, `logd_sinks`, `memmgr_swap`, `memmgr_node_reclaim`,
-`memmgr_swap_client`, `memmgr_swap_raw`, `swapd`, `vfsd_driver_death`, `rtc_create_retry`,
-`procmgr_snapshot`, and `timed_rtc_restart` phases, and the drivers hwrng restart phase
-(`caps[21]`), the `svcmgr_stop_service` phase (`caps[22]`, and `caps[21]` with `stopsrc` staged),
-and the no-stop cases of the `oom_policy`, `logd_reserve` and `rtc_create_retry` phases
-(`caps[22]`), instead fail their assertions. The seed-only phase thus fails the run on a zero
+`caps[5]`), the `vfsd_namespace_stray_caps` phase (`caps[4]`), the `logd_death_forward`,
+`logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`,
+`devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry`, `oom_policy`, and
+`memmgr_swap_commit` phases (`caps[6]`), the `rtc_create_retry` phase (`caps[19]`), the vfsd
+swap-partition phase (`caps[14]`), the `memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases
+(`caps[18]`), the `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]`
+and `caps[22]`), the `crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`, `memmgr_swap`,
+`memmgr_node_reclaim`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd`, `vfsd_driver_death`,
+`rtc_create_retry`, `procmgr_snapshot`, and `timed_rtc_restart` phases, and the drivers hwrng
+restart phase (`caps[21]`), the `svcmgr_stop_service` phase (`caps[22]`, and `caps[21]` with
+`stopsrc` staged), and the no-stop cases of the `oom_policy`, `logd_reserve` and `rtc_create_retry`
+phases (`caps[22]`), instead fail their assertions. The seed-only phase thus fails the run on a zero
 `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
 reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
 

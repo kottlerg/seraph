@@ -463,6 +463,7 @@ Every entry here is `correct as is`; none is tracked.
 | Path component limit | `runtime/ruststd/src/sys/fs/seraph.rs` | 255 (`MAX_NAME_LEN`) | ABI width (namespace protocol) | none | correct as is | None |
 | `READ_WAIT` | `runtime/ruststd/src/sys/fs/release_handler.rs` | 100 ms | ABI width (the driver's cooperative-release window) | none | correct as is | None |
 | Filesystem session sub-node max | `runtime/ruststd/src/sys/fs/session.rs` | none (`u64::MAX` at `CREATE_SUB_NODE`): one sub-node of the process's node per filesystem driver it opens files on, charged every page of its session with that driver | policy (a design decision: the process's node, and its ancestors, bound what its sessions charge, so the sub-node needs no max of its own, and a fixed max would cap the files a process can hold open whatever memory its creator granted it) | none up front; the session's first page at the first open on a driver, charged to the process's node | correct as is | None |
+| `KEPT_CLOSE_DRAIN` | `runtime/ruststd/src/sys/fs/session.rs` | 50 ms for one drain of the closes kept for `File`s dropped past their thread's call deadline | tuning (far above a driver's time to answer an `FS_CLOSE`; a close it stops stays kept for the next drain, so it bounds a wait, not a capacity) | none | correct as is | None |
 | `RESOLVE_WAIT_US` | `runtime/ruststd/src/sys/time/seraph.rs` | 100 ms | tuning (many registry round trips, on the kernel's clock) | none | correct as is | None |
 
 ### Shared IPC and protocol crates

@@ -42,8 +42,9 @@ use fs_sessions::{Found, lookup};
 use crate::cell::Cell;
 use crate::io;
 use crate::os::seraph::checkpoint::{FILE, Held};
-use crate::os::seraph::{deadline_call, memmgr_call, memmgr_call_until_answered};
+use crate::os::seraph::{call_time_left, deadline_call, memmgr_call, memmgr_call_until_answered};
 use crate::sync::{Mutex, MutexGuard, PoisonError};
+use crate::time::{Duration, Instant};
 use crate::vec::Vec;
 
 /// One session: its caps, all this process's.
@@ -99,12 +100,22 @@ pub(crate) fn keep_unclosed(open_cap: u64)
     let _ = syscall::cap_delete(open_cap);
 }
 
-/// Send `FS_CLOSE` on each open cap [`keep_unclosed`] kept, under the calling
-/// thread's call deadline, and delete each cap whose call ended otherwise
-/// than at the deadline: a close the driver answered, or one on an open or a
-/// driver that is gone. A close the deadline stopped stays kept; a repeat of
-/// one that did reach the driver is answered `INVALID_BADGE`, since an open
-/// id never repeats (fs-driver-protocol.md § Label 18).
+/// The time one drain of the kept closes ([`close_unclosed`]) may take. A
+/// close is kept because its driver did not answer within a thread's call
+/// deadline, so a drain is bounded of its own, whatever the draining thread's
+/// deadline: a thread with none, opening a file on another driver or exiting,
+/// does not wait without limit on a driver that may never answer. A tuning
+/// value, far above a driver's time to answer an `FS_CLOSE`.
+const KEPT_CLOSE_DRAIN: Duration = Duration::from_millis(50);
+
+/// Send `FS_CLOSE` on each open cap [`keep_unclosed`] kept, within
+/// [`KEPT_CLOSE_DRAIN`] for the whole drain and the calling thread's call
+/// deadline, whichever ends first, and delete each cap whose call ended
+/// otherwise than at that bound: a close the driver answered, or one on an
+/// open or a driver that is gone. A close the bound stopped, or reached
+/// before it was sent, stays kept; a repeat of one that did reach the driver
+/// is answered `INVALID_BADGE`, since an open id never repeats
+/// (fs-driver-protocol.md § Label 18).
 pub(crate) fn close_unclosed(ipc_buf: *mut u64)
 {
     if ipc_buf.is_null()
@@ -117,9 +128,12 @@ pub(crate) fn close_unclosed(ipc_buf: *mut u64)
         return;
     }
     let close = IpcMessage::new(fs_labels::FS_CLOSE);
+    let started = Instant::now();
     pending.retain(|&(cap, _)| {
+        let drain_left = KEPT_CLOSE_DRAIN.saturating_sub(started.elapsed());
+        let left = call_time_left().map_or(drain_left, |left| left.min(drain_left));
         // SAFETY: the caller passes the registered IPC buffer page.
-        let sent = unsafe { deadline_call(cap, &close, ipc_buf) };
+        let sent = unsafe { ipc::ipc_call_within(cap, &close, ipc_buf, Some(left)) };
         if sent.err() == Some(SyscallError::WouldBlock as i64)
         {
             return true;

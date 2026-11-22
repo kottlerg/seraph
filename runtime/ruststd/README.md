@@ -801,7 +801,10 @@ does not trust to answer, as crashd bounds a fault's report and a core dump
   then finds no caller. A spawn's wait for its child's bootstrap requests (§ Bootstrap caps), which
   is a receive, ends at the deadline too, and fails the spawn `TimedOut`. A `File` dropped past
   the deadline sends no `FS_CLOSE`: the session table keeps its open cap, and the process's next
-  `File::open`, or its exit hook, sends the close under its own thread's deadline. Until then the
+  `File::open`, or its exit hook, sends the close within a bound of its own for the whole drain
+  (`KEPT_CLOSE_DRAIN`) and that thread's deadline, whichever ends first, so a thread with no
+  deadline does not wait without limit on a driver that did not answer; a close the bound stops
+  stays kept. Until then the
   open stays in the process's session with its driver, its records charged to the process's node,
   and counts as an open `File` for a quiesce point (§ Checkpoint)
   ([Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md) § Label 23:

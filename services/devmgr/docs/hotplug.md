@@ -135,16 +135,16 @@ is latched, and Link Active reads clear. A Slot Status of all ones, from a port 
 answer, changes nothing. The abort window is `ABORT_WINDOW_MS` (5000), `ABORT_POLLS` polls (PCI
 Express Base Specification r4.0 § 6.7.1.5).
 
-Power-up writes Slot Control with the slot's power on where it has a Power Controller and its
-power indicator on where it has one. Where the slot reports Command Completed, each Slot Control
-write clears the latch, writes, and waits up to `SLOT_WAIT_MS` (1000) for it. Where the port
-reports Data Link Layer Link Active, the poller waits up to `SLOT_WAIT_MS` for the link and then
-`LINK_SETTLE_MS` (100) before any configuration request goes below the port (PCI Express Base
-Specification r4.0 § 6.6.1); where it does not report it, it waits `SLOT_WAIT_MS`. A link that
-does not come up is logged, the slot powered off, and the slot held failed until the card is
-removed, replaced, or asked for again with the attention button. A job, add or removal, is posted to the control thread over one channel, with a signal
-of its job notification; the control thread runs the jobs in the order they were posted, each to
-its end before the next.
+Power-up writes Slot Control with the slot's power on where it has a Power Controller and its power
+indicator on where it has one. Where the slot reports Command Completed, each Slot Control write
+clears the latch, writes, and waits up to `SLOT_WAIT_MS` (1000) for it. Where the port reports Data
+Link Layer Link Active, the poller waits up to `SLOT_WAIT_MS` for the link and then `LINK_SETTLE_MS`
+(100) before any configuration request goes below the port (PCI Express Base Specification r4.0 §
+6.6.1); where it does not report it, it waits `SLOT_WAIT_MS`. A link that does not come up is
+logged, the slot powered off, and the slot held failed until the card is removed, replaced, or asked
+for again with the attention button. A job, add or removal, is posted to the control thread over one
+channel, with a signal of its job notification; the control thread runs the jobs in the order they
+were posted, each to its end before the next.
 
 ---
 
@@ -332,3 +332,4 @@ most two spans per BAR placed, and never past one span per page of the windows.
 [Driver Binding](../../../docs/driver-binding.md), [acpid and devmgr](../../acpid/docs/devmgr.md),
 [services/devmgr/README.md](../README.md), [PCI Enumeration](pci-enumeration.md),
 [devmgr Responsibilities and Capabilities](responsibilities.md)
+

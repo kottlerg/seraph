@@ -358,8 +358,9 @@ crashd's own end `WouldBlock`, and the runtime's file calls fail `TimedOut`. cra
 further request, writes no core, logs `not written: the dump passed its bound`, and declines. What
 the dump leaves: a request the driver had received before the deadline may still be carried out (a
 write lands, a file is created); the core file's close, as it is dropped, is not sent past the
-deadline, and that open stays in crashd's session with the driver, its records charged to crashd's
-own node, until the session ends with crashd
+deadline: the runtime keeps the open and sends its close at crashd's next file open or at its exit
+([runtime/ruststd](../../../runtime/ruststd/README.md) § Call deadline), and until then that open
+stays in crashd's session with the driver, its records charged to crashd's own node
 ([fs driver protocol](../../fs/docs/fs-driver-protocol.md) § Label 23: `FS_SESSION`); the
 `.part` file stays, and the next dump deletes it (step 6 of [Core Dump](#core-dump)); and the
 threads it stopped stay stopped until the decline ends the process. The faulting thread is held

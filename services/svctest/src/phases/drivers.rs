@@ -20,14 +20,18 @@
 //! time, and the terminal keeps a blocking `INPUT_READ_EVENTS` pending, so
 //! svctest's call would wait behind it for a keypress.
 //!
-//! The stray-cap flood phase checks the serial, input, and entropy drivers'
-//! cap hygiene: a cap a request carries that the driver does not keep is
-//! deleted, not left in the driver's `CSpace`, and an accepted serial RX
-//! registration deletes the notification it replaces. It takes granted SENDs
-//! through the `devmgr.class.serial`, `devmgr.class.input`, and
-//! `devmgr.class.hwrng` class SENDs. Under a staged terminal its input case
-//! skips, as the deny phase's does, and so do its serial cases that read the
-//! UART or rebind its interrupt, which would take the terminal's input.
+//! The stray-cap flood phase checks the serial, input, entropy, RTC, and
+//! framebuffer drivers' cap hygiene: a cap a request carries that the driver
+//! does not keep is deleted, not left in the driver's `CSpace`, and an
+//! accepted serial RX registration deletes the notification it replaces. It
+//! takes granted SENDs through the `devmgr.class.serial`,
+//! `devmgr.class.input`, `devmgr.class.hwrng`, and `devmgr.class.rtc` class
+//! SENDs, and the framebuffer driver's through `devmgr.class.framebuffer-deny`,
+//! whose refused badge stands for every label, since the driver checks the
+//! badge first. The framebuffer case skips on a headless boot, as the deny
+//! phase's does. Under a staged terminal its input case skips, as the deny
+//! phase's does, and so do its serial cases that read the UART or rebind its
+//! interrupt, which would take the terminal's input.
 //!
 //! The hwrng read phase reads the entropy driver through a granted SEND on
 //! the `devmgr.class.hwrng` class SEND: a `READ` of the most bytes one reply
@@ -295,6 +299,37 @@ const HWRNG_CASES: [StrayCapCase; 2] = [
     },
 ];
 
+/// The RTC driver's cases (cmos-rtc on x86-64, goldfish-rtc on RISC-V): no
+/// RTC label keeps a cap. The class SEND carries `READ_AUTHORITY`, so a
+/// `RTC_GET_EPOCH_TIME` is served and reads the clock.
+const RTC_CASES: [StrayCapCase; 2] = [
+    StrayCapCase {
+        label: UNKNOWN_LABEL,
+        first: FirstCap::Stray,
+        expected: ipc::rtc_errors::UNKNOWN_OPCODE,
+        uart: false,
+        what: "rtc unknown label",
+    },
+    StrayCapCase {
+        label: ipc::rtc_labels::RTC_GET_EPOCH_TIME,
+        first: FirstCap::Stray,
+        expected: ipc::rtc_errors::SUCCESS,
+        uart: false,
+        what: "RTC_GET_EPOCH_TIME",
+    },
+];
+
+/// The framebuffer driver's case, through a SEND without its verb bits: the
+/// driver refuses the badge before it reads the label, so a write that
+/// would draw stands for every label.
+const FRAMEBUFFER_CASE: StrayCapCase = StrayCapCase {
+    label: ipc::fb_labels::FB_WRITE_BYTES,
+    first: FirstCap::Stray,
+    expected: ipc::fb_errors::UNAUTHORIZED,
+    uart: false,
+    what: "framebuffer refused FB_WRITE_BYTES",
+};
+
 /// The virtio-input driver's case: no input label keeps a cap, and a granted
 /// `INPUT_READ_EVENTS` would block for a key, so the unknown label stands for
 /// every label.
@@ -362,10 +397,10 @@ fn first_cap(driver: u64, first: FirstCap) -> u64
 /// (docs/ipc-design.md § Receive-Failure Policy). devmgr then withdraws it
 /// and revokes its service endpoint, so the call in flight returns an error
 /// and the `ipc_call` check below fails the phase (docs/device-management.md
-/// § Relationship to Other Services): the input and hwrng cases' outcome. The serial
-/// driver also carries logd's writes, which stall on it before then, and
-/// devmgr logs the withdrawal through logd, so the boot stalls instead, and
-/// its run timeout classifies it as a `HANG`.
+/// § Relationship to Other Services): the outcome of every driver's cases but
+/// the serial driver's. The serial driver also carries logd's writes, which
+/// stall on it before then, and devmgr logs the withdrawal through logd, so
+/// the boot stalls instead, and its run timeout classifies it as a `HANG`.
 fn flood(driver: u64, case: &StrayCapCase)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -411,9 +446,13 @@ fn flood(driver: u64, case: &StrayCapCase)
 fn stray_cap_flood_phase(caps: &Caps)
 {
     assert!(
-        caps.serial_class != 0 && caps.input_class != 0 && caps.hwrng_class != 0,
-        "drivers stray caps: no devmgr.class.serial, devmgr.class.input, or \
-         devmgr.class.hwrng cap seeded"
+        caps.serial_class != 0
+            && caps.input_class != 0
+            && caps.hwrng_class != 0
+            && caps.rtc_class != 0
+            && caps.framebuffer_deny_class != 0,
+        "drivers stray caps: no devmgr.class.serial, devmgr.class.input, \
+         devmgr.class.hwrng, devmgr.class.rtc, or devmgr.class.framebuffer-deny cap seeded"
     );
     let staged = terminal_staged();
 
@@ -424,6 +463,26 @@ fn stray_cap_flood_phase(caps: &Caps)
         flood(hwrng, case);
     }
     let _ = syscall::cap_delete(hwrng);
+
+    let rtc = granted_send(caps.rtc_class, "rtc", Some(DEVICE_WAIT_MS))
+        .expect("drivers stray caps: no rtc driver");
+    for case in &RTC_CASES
+    {
+        flood(rtc, case);
+    }
+    let _ = syscall::cap_delete(rtc);
+
+    if let Some(fb) = granted_send(caps.framebuffer_deny_class, "framebuffer-deny", None)
+    {
+        flood(fb, &FRAMEBUFFER_CASE);
+        let _ = syscall::cap_delete(fb);
+    }
+    else
+    {
+        std::os::seraph::log!(
+            "drivers stray caps: framebuffer case skipped: no framebuffer driver"
+        );
+    }
 
     let serial = granted_send(caps.serial_class, "serial", None)
         .expect("drivers stray caps: no serial driver");

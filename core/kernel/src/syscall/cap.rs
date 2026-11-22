@@ -156,8 +156,9 @@ fn slot_field<T>(block_virt: u64, offset: u64) -> *mut T
 /// `EndpointState`, debited as the 128 B `BIN_128` class) of `available_bytes`.
 ///
 /// On success, the wrapper + `EndpointState` are constructed in place inside
-/// the source Memory cap's region; a cap with `SEND | RECEIVE | GRANT` rights
-/// is inserted into the caller's `CSpace`; returns the new cap handle.
+/// the source Memory cap's region; a cap with `SEND | RECEIVE | GRANT |
+/// IDENTIFY` rights is inserted into the caller's `CSpace`; returns the new cap
+/// handle.
 ///
 /// On `dec_ref → 0`, auto-reclaim returns the bytes to the source Memory cap
 /// via [`crate::cap::object::dealloc_object`] consulting `header.ancestor`.
@@ -252,7 +253,7 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
     // insert.
     let idx_res = unsafe {
         (*cspace).insert_cap_handle_typed(
-            EpRights::SEND | EpRights::RECEIVE | EpRights::GRANT,
+            EpRights::SEND | EpRights::RECEIVE | EpRights::GRANT | EpRights::IDENTIFY,
             nonnull,
         )
     };
@@ -3564,6 +3565,56 @@ pub fn sys_endpoint_badge(tf: UserFrame) -> Result<u64, SyscallError>
     }
     tf.set_ipc_return(0, named.badge & mask);
     Ok(0)
+}
+
+/// `SYS_ENDPOINT_IDENTIFY` (73): answer whether a capability the caller holds
+/// names the endpoint of an Endpoint capability carrying `IDENTIFY`.
+///
+/// arg0 = Endpoint cap handle carrying `IDENTIFY` (the key).
+/// arg1 = cap handle of any type, the one asked about.
+///
+/// Returns `1` when arg1's slot names the Endpoint object arg0's slot names,
+/// else `0`: a cap on another endpoint and a cap of another type answer
+/// alike. Nothing else crosses: no badge, rights word, or kernel address
+/// (`core/kernel/docs/cross-boundary-disclosure.md`). The endpoint's creator
+/// alone receives `IDENTIFY` at creation, and a derive or copy only narrows,
+/// so a holder recognizes the endpoint only where its owner consented
+/// (`docs/capability-model.md` § IPC Endpoint).
+///
+/// # Errors
+/// `InvalidCapability` for arg0 when it is null, stale, empty, or not an
+/// Endpoint, and for arg1 when it is null, stale, or empty;
+/// `InsufficientRights` when arg0 lacks `IDENTIFY`.
+#[cfg(not(test))]
+pub fn sys_endpoint_identify(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::slot::EpRights;
+
+    // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null above; cspace field set at thread creation.
+    let cspace = unsafe { (*tcb).cspace };
+    // SAFETY: cspace is the running thread's bound CSpace (or null, refused
+    // there); no lock is held.
+    let key = unsafe { super::lookup_cap(cspace, tf.arg(0), EpRights::IDENTIFY) }?;
+    // SAFETY: as above.
+    let asked = unsafe { super::pin_slot(cspace, tf.arg(1)) }?;
+    // Both pins hold their objects, so neither can be freed and its memory
+    // reused for another object between the lookups and this comparison. A
+    // refused lookup leaves its object `None`, so with both refusals
+    // mispredicted only the `is_some` test keeps `None == None` from
+    // answering `1`.
+    #[expect(
+        clippy::needless_bitwise_bool,
+        reason = "the tests combine with `&`, not `&&`, so each is evaluated as a value with no \
+                  branch a misprediction could take past it"
+    )]
+    let same = key.object.is_some() & (key.object == asked.object);
+    Ok(u64::from(same))
 }
 
 // ── Test stubs ─────────────────────────────────────────────────────────────────

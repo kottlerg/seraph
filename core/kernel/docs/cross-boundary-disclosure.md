@@ -81,6 +81,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |
 | `SYS_THREAD_GET_FAULT_HANDLER` → whether a fault class of a thread the caller holds `CONTROL` on is bound (`0` or `1`), and the bound badge (a derivation badge of a cap a binder held, or its copy); no endpoint, capability, or kernel address | `thread::sys_thread_get_fault_handler` | c/d |
 | `SYS_ENDPOINT_BADGE` → the badge of an Endpoint cap the caller holds, to a caller that holds `RECEIVE` on the same endpoint (a derivation badge the endpoint's server or a minter it trusts chose); no capability or kernel address | `cap::sys_endpoint_badge` | c |
+| `SYS_ENDPOINT_IDENTIFY` → whether a cap the caller holds names the endpoint of a cap it holds with `IDENTIFY` (`0` or `1`), a cap of another type answering as one on another endpoint does; no badge, rights word, capability, or kernel address | `cap::sys_endpoint_identify` | d |
 | `SYS_SBI_CALL` → firmware `sbiret.value` on success, `NotSupported` on any firmware error (RISC-V; args caller-supplied) | `sbi::sys_sbi_call` | d |
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |
 | Cap split / merge / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `hw::sys_mmio_merge`, `cap::sys_cap_derive` | c |

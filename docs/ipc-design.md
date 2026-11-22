@@ -232,8 +232,9 @@ See [syscalls.md § `SYS_WAIT_SET_WAIT`](../core/kernel/docs/syscalls.md#sys_wai
 
 ## Capability Semantics in IPC
 
-IPC capabilities carry three rights — Send (call the endpoint), Receive (accept calls), and Grant
-(pass capabilities in messages) — with scoping rules defined in
+IPC capabilities carry four rights — Send (call the endpoint), Receive (accept calls), Grant (pass
+capabilities in messages), and Identify (recognize another capability on the same endpoint) — with
+scoping rules defined in
 [capability-model.md#ipc-endpoint](capability-model.md#ipc-endpoint).
 Capabilities passed in IPC messages are moved, not copied; see
 [capability-model.md#transfer](capability-model.md#transfer).

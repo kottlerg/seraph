@@ -3140,7 +3140,9 @@ pub fn sys_thread_read_ext_regs(tf: UserFrame) -> Result<u64, RestartableError>
 ///
 /// The thread must be `Stopped` and descheduled, or `Blocked` in any IPC
 /// state (`sched::with_held_frame`, a read). Copies the full `TrapFrame` to
-/// the caller's buffer. Returns the number of bytes written, and in the
+/// the caller's buffer, on x86-64 with its `fs_base` word the thread's TLS
+/// base from its saved switch state, which every entry leaves out of the
+/// frame. Returns the number of bytes written, and in the
 /// secondary return register the state the thread was held in
 /// (`THREAD_REGS_STOPPED`, `THREAD_REGS_FAULT`, `THREAD_REGS_SYSCALL`), which
 /// the same `sched_lock` hold as the snapshot decides. The frame of a thread
@@ -3222,6 +3224,18 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, RestartableError>
                 copy_size,
             );
         };
+        // x86-64 keeps a user thread's TLS base in its saved switch state,
+        // and every entry zeroes the frame's `fs_base` word; the register
+        // file reports the base there.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: target_tcb is valid, and the hold keeps the thread off
+            // every CPU with its last switch save published, so its saved
+            // state does not change under the read.
+            let tls_base = unsafe { (*target_tcb).saved_state.fs_base };
+            // SAFETY: frame was written whole just above.
+            unsafe { (*frame.as_mut_ptr()).fs_base = tls_base };
+        }
         Some(hold)
     };
     // SAFETY: target_tcb validated non-null; the closure only copies the

@@ -164,6 +164,10 @@ pub const FB_WINDOW_END: u64 = serial::SERIAL_VA;
 /// Byte offset of the stack pointer (`sp`) in the register file.
 pub const SP_OFFSET: usize = syscall_abi::REGS_RISCV64_SP_OFFSET;
 
+/// Byte offset of the TLS base (`tp`, `x4`) in the register file: the
+/// integer registers from `x1` on are consecutive words.
+pub const TLS_OFFSET: usize = syscall_abi::REGS_RISCV64_X1_OFFSET + 3 * 8;
+
 /// The stack pointer an `extern "C"` function expects on entry, at or below
 /// `sp`: the RISC-V psABI keeps `sp` 16-byte aligned at every call, so a frame
 /// redirected into an entry gets `sp & !0xF`, at most 15 bytes below `sp`.

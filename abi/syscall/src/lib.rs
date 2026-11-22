@@ -1583,6 +1583,11 @@ pub const REGS_X86_64_RAX_OFFSET: usize = 0;
 /// Byte offset of `rdi` in the x86-64 register file: a syscall's first
 /// argument.
 pub const REGS_X86_64_RDI_OFFSET: usize = 40;
+/// Byte offset of `fs_base` in the x86-64 register file: `SYS_THREAD_READ_REGS`
+/// gives the thread's TLS base there, and `SYS_THREAD_WRITE_REGS` ignores
+/// the word. The user GS base is not thread state: ring 3 cannot change it
+/// from 0.
+pub const REGS_X86_64_FS_BASE_OFFSET: usize = 160;
 /// The x86-64 trap flag in `rflags`. A debugger single-steps a stopped thread
 /// by setting it with `SYS_THREAD_WRITE_REGS`: the thread takes `#DB` after
 /// each instruction, delivered to its exception handler as

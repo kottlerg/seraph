@@ -585,16 +585,17 @@ fn check_source_contained(authority: u64, phase: &str)
 /// with `NO_CANDIDATE` the first instance's key of every slot below
 /// [`UNLISTED_SLOTS`] it does not list: those slots hold the services the
 /// eligibility rule refuses (svctest itself, `restart = never`; the ones init
-/// started; logd, critical; pwrmgr, entropyd and `stopsrc`, core roles; timed, no
-/// `oom_stop`), and past the table, none. The rule's every row is host-tested
+/// started; logd, critical; pwrmgr, entropyd and `stopsrc`, core roles;
+/// timed, no `oom_stop`), and past the table, none. The rule's every row is host-tested
 /// in `svcmgr-defs` (`svcmgr_defs::stop`).
 ///
-/// `LIST_STOP_SOURCES` lists the `stopsrc` fixture alone, with the program
-/// class, when its recipe is staged, and nothing otherwise. The SEND it
-/// carries reaches the fixture's stop labels: its list replies `SUCCESS`,
-/// and a stop of a key it never gave replies `NO_CANDIDATE`. The fixture's
-/// own `:deny` SEND, which any process can query, gets `UNAUTHORIZED` for
-/// both, and the job an instance of it started ends with that instance
+/// `LIST_STOP_SOURCES` lists `sessiond` and the `stopsrc` fixture, each with
+/// the program class and each when its recipe is staged, and nothing else
+/// ([`check_stop_sources`]). The SEND each entry carries reaches that
+/// source's stop labels: its list replies `SUCCESS`, and a stop of a key it
+/// never gave replies `NO_CANDIDATE`. The fixture's own `:deny` SEND, which
+/// any process can query, gets `UNAUTHORIZED` for both, and the job an
+/// instance of the fixture started ends with that instance
 /// ([`check_source_contained`]).
 ///
 /// With `crasher-worker` staged, `STOP_CANDIDATE` of its listed key replies

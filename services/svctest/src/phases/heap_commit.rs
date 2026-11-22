@@ -13,9 +13,11 @@
 //! `heap-commit-limited` child under a max of [`LIMITED_MAX_PAGES`]
 //! ([`limited_child_main`]), whose `try_reserve` past the max returns `Err`
 //! and which keeps running, and a `heap-commit-hog` ([`hog_main`]), which
-//! commits all but [`HOG_MARGIN_PAGES`] of what memmgr can still promise,
-//! sees a grant past that refused although free pages exist, and touches every
-//! page it committed with no fault declined. Each child's charge leaves
+//! commits all but [`HOG_MARGIN_PAGES`] of what the free frames can still
+//! back ([`uncommitted_available`]), sees a best-effort grant of one page past
+//! what memmgr may grant a node outside the reserve ([`grant_room`]) refused
+//! although free pages exist, and touches every page it committed with no
+//! fault declined. Each child's charge leaves
 //! svctest's budget subtree before the phase goes on, memmgr's free and
 //! promised totals, each net of eviction, then return to their levels
 //! ([`PoolLevels`]), and the all-RAM-accounted identity holds.
@@ -658,8 +660,8 @@ fn limited_child_main() -> !
 /// reserve, in pages: memmgr's free pages less `promised` and the growth
 /// floor. While a swap service has registered swap slots memmgr promises past
 /// them (services/memmgr/docs/memory-pool.md § Commit, Overcommit), and a
-/// fault past the free frames waits on eviction; a commitment within them has every
-/// fault backed by a free frame.
+/// fault past the free frames waits on eviction; a commitment within them has
+/// every fault backed by a free frame.
 pub(crate) fn uncommitted_available() -> u64
 {
     let Some((free, promised, floor)) = pool_totals()
@@ -681,8 +683,8 @@ pub(crate) fn uncommitted_available() -> u64
 ///
 /// Other processes free pages while the hog runs (a file system gives back
 /// its cache when the hog's commitment raises memmgr's pressure level), so
-/// what memmgr may grant can grow between the hog's read of it and its grant. memmgr
-/// then admits the grant; the hog gives it back, commits down to its margin
+/// what memmgr may grant can grow between the hog's read of it and its grant.
+/// memmgr then admits the grant; the hog gives it back, commits down to its margin
 /// again and asks again, up to [`HOG_REFUSAL_ATTEMPTS`] times. A memmgr that
 /// admits past what is left, by any number of pages, admits every attempt,
 /// since each gives its grant back before the next read.
@@ -773,8 +775,8 @@ pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u
 /// growth floor (`QUERY_POOL_STATUS` `data[17]` less `data[11]`). Returns
 /// `true` when memmgr refuses it with `OUT_OF_MEMORY_BEST_EFFORT` and counts
 /// more free pages than the grant asked, and `false` when it grants it, once
-/// the grant is given back ([`give_back`]). Exits with [`HOG_NO_FREE_PAGES`] on a refusal that
-/// counts no more free pages than asked, and with [`HOG_GRANT_NOT_REFUSED`] on
+/// the grant is given back ([`give_back`]). Exits with [`HOG_NO_FREE_PAGES`]
+/// on a refusal that counts no more free pages than asked, and with [`HOG_GRANT_NOT_REFUSED`] on
 /// any other reply.
 fn past_grant_refused() -> bool
 {

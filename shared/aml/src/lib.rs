@@ -79,6 +79,14 @@ pub const PARSE_STACK_BYTES: usize = 256 * 1024;
 /// malformed table cannot make the loader allocate gigabytes.
 pub const MAX_BUFFER_BYTES: usize = 65_536;
 
+/// The longest chain of aliases a name is followed through, an `Alias` of
+/// an `Alias` counting two. Past it the name resolves to nothing: a call
+/// through it parses as a reference, and its evaluation faults `NotFound`.
+///
+/// Firmware aliases an object directly, or through one alias; the length of
+/// a chain is the ASL source's, which the machine's size does not lengthen.
+pub const MAX_ALIAS_CHAIN: usize = 8;
+
 /// The largest element count of a package: one a `Name` in a table
 /// declares, and one an evaluation makes.
 ///

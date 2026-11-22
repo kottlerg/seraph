@@ -43,7 +43,7 @@ use crate::parse::Parser;
 use crate::term::{Name, Op, Term};
 pub use crate::value::Data;
 use crate::value::Ref;
-use crate::{Fault, FaultKind, push};
+use crate::{Fault, FaultKind, MAX_ALIAS_CHAIN, push};
 
 /// A node of the namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -302,9 +302,6 @@ struct Lent
 
 /// The `ObjectType` of a method, as `External` gives it.
 const EXTERNAL_METHOD: u8 = 8;
-
-/// The longest alias chain followed.
-const MAX_ALIAS_CHAIN: usize = 8;
 
 #[derive(Clone, Debug)]
 struct Node

@@ -611,6 +611,16 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
         };
         guard.on_success();
 
+        // No request on this endpoint takes a cap: an `NS_*` request carries
+        // none, and a fall-through call forwards none. Every cap a request
+        // carries is deleted here, before it is served or refused, whatever
+        // its label, so a caller cannot fill vfsd's `CSpace` with them
+        // (`dispatch_request` neither reads nor deletes them).
+        for &cap in recv.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+
         // Fall-through delegation: an `NS_LOOKUP` on any synthetic
         // tree node (the synthetic root or a multi-component
         // intermediate) for a name that does not match any local

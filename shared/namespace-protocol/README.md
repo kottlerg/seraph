@@ -40,6 +40,11 @@ header (today: name length for `NS_LOOKUP`); bits 32..64 are zero.
 Error replies use the matching `NsError` discriminant value as the
 reply label; success replies use label `0`.
 
+No request carries a capability. A server deletes every capability a
+request on its namespace endpoint carries, whatever its label and whatever
+it answers: `dispatch_request` neither reads nor deletes them, and one left
+in place holds a slot of the server's `CSpace` for the server's life.
+
 ---
 
 ## Badge shape

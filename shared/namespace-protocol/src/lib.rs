@@ -331,6 +331,11 @@ pub trait NamespaceBackend
 /// layer — they only see decoded `NodeId` / `&[u8]` / `u64`
 /// arguments.
 ///
+/// No `NS_*` request carries a cap, and this function neither reads nor
+/// deletes the caps `received` carries: the server's receive loop deletes
+/// every cap a request on its namespace endpoint carries, whatever the label
+/// (README § Wire labels).
+///
 /// # Safety
 ///
 /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC

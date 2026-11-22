@@ -345,21 +345,29 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
                 // `log_file` is moved into the forwarder thread below.
 
                 let started = Instant::now();
-                let mut child = Command::new(&qemu_binary)
-                    .args(&qemu_args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::from(log_for_stderr))
-                    .spawn()
-                    .with_context(|| format!("spawning {}", arch.qemu_binary()))?;
+                let mut child = Reaped(
+                    Command::new(&qemu_binary)
+                        .args(&qemu_args)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::from(log_for_stderr))
+                        .spawn()
+                        .with_context(|| format!("spawning {}", arch.qemu_binary()))?,
+                );
 
                 let qemu_stdout = child
+                    .0
                     .stdout
                     .take()
                     .context("QEMU stdout was piped but unavailable")?;
                 let forwarder = spawn_stdout_forwarder(qemu_stdout, log_file, slot)?;
 
                 let (exit_rc, hung) = wait_with_timeout(
-                    &mut child, timeout, &log_path, &fail_re, fail_grace, on_hang,
+                    &mut child.0,
+                    timeout,
+                    &log_path,
+                    &fail_re,
+                    fail_grace,
+                    on_hang,
                 )?;
                 // Drain the forwarder before reading the log so classify()
                 // sees the complete byte stream even when the watchdog
@@ -409,15 +417,7 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
             }));
         }
 
-        for handle in handles
-        {
-            match handle.join()
-            {
-                Ok(Ok(outcome)) => outcomes.push(outcome),
-                Ok(Err(err)) => return Err(err),
-                Err(_) => bail!("worker thread panicked"),
-            }
-        }
+        outcomes.extend(join_wave(handles)?);
         dispatched = dispatched.saturating_add(wave_size);
     }
 
@@ -651,6 +651,48 @@ fn spawn_stdout_forwarder(
             Ok(())
         })
         .context("spawning stdout forwarder thread")
+}
+
+/// A spawned QEMU, killed and reaped when it goes out of scope: a worker
+/// that returns an error or panics between the spawn and its watchdog's
+/// verdict leaves no QEMU running past it. Once the watchdog has reaped the
+/// child, the drop does nothing more, since `Child` sends no signal to a
+/// child it has already waited for.
+struct Reaped(Child);
+
+impl Drop for Reaped
+{
+    fn drop(&mut self)
+    {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Join every worker of a wave, and only then return the first error, so no
+/// worker is still running its QEMU when `run` returns.
+fn join_wave<T>(handles: Vec<JoinHandle<Result<T>>>) -> Result<Vec<T>>
+{
+    let mut outcomes = Vec::with_capacity(handles.len());
+    let mut first_error = None;
+    for handle in handles
+    {
+        let joined = match handle.join()
+        {
+            Ok(result) => result,
+            Err(_) => Err(crate::error::Error::msg("worker thread panicked")),
+        };
+        match joined
+        {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(err) => first_error = first_error.or(Some(err)),
+        }
+    }
+    match first_error
+    {
+        Some(err) => Err(err),
+        None => Ok(outcomes),
+    }
 }
 
 /// Join a stdout-forwarder thread. Logs but does not propagate forwarder
@@ -1244,6 +1286,48 @@ mod tests
 {
     use super::*;
     use crate::cli::DEFAULT_FAIL_REGEX;
+
+    // Defect caught: the wave's join returning at its first error, while the
+    // other workers of the wave still ran their QEMUs, unwatched once the
+    // command exited.
+    #[test]
+    fn a_wave_is_joined_whole_before_its_first_error_is_returned()
+    {
+        let finished = Arc::new(AtomicU32::new(0));
+        let mut handles: Vec<JoinHandle<Result<u32>>> =
+            vec![thread::spawn(|| bail!("the first worker failed"))];
+        for n in 0..2
+        {
+            let finished = Arc::clone(&finished);
+            handles.push(thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                finished.fetch_add(1, Ordering::AcqRel);
+                Ok(n)
+            }));
+        }
+        let err = join_wave(handles).unwrap_err();
+        assert_eq!(err.to_string(), "the first worker failed");
+        assert_eq!(finished.load(Ordering::Acquire), 2);
+        let ok: Vec<JoinHandle<Result<u32>>> = vec![thread::spawn(|| Ok(7))];
+        assert_eq!(join_wave(ok).unwrap(), [7]);
+    }
+
+    // Defect caught: a worker's error return between QEMU's spawn and its
+    // watchdog leaving QEMU running.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_qemu_child_is_killed_and_reaped()
+    {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id().to_string();
+        drop(Reaped(child));
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!alive.success(), "pid {pid} still exists");
+    }
 
     #[test]
     fn line_containing_out_of_range_offset_is_empty()

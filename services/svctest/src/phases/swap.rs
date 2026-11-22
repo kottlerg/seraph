@@ -257,6 +257,8 @@ pub(super) struct Pool
     pub(super) allowance: u64,
     /// `data[17]`: the free pages outside `promised`.
     uncommitted: u64,
+    /// `data[18]`: pages of evicted chunks of committed regions.
+    committed_swapped: u64,
 }
 
 impl Pool
@@ -286,12 +288,50 @@ impl Pool
         self.reserve / PAGE_SIZE
     }
 
-    /// Whether the pages free outside `promised` fall short of the reserve and
-    /// a chunk, so no restore of a whole chunk is admitted on the free pages
-    /// alone.
+    /// Whether a swap service has registered swap slots
+    /// (`free_pool::Ledger::overcommits`): a slot is free or holds a chunk on
+    /// disk. A slot whose chunk's write is in flight counts in neither, so
+    /// every slot writing at once would read as none; the phase's chunks take
+    /// a small share of any swap partition.
+    fn overcommits(&self) -> bool
+    {
+        self.free_slots != 0 || self.on_disk != 0
+    }
+
+    /// The pages an uncommitted chunk's restore is admitted against
+    /// (`free_pool::Ledger::restore_fits`; services/memmgr/docs/memory-pool.md
+    /// § Eviction, States): the free frames while swap slots are registered,
+    /// since the pages free outside `promised` can then stand below the
+    /// growth floor while the allowance bounds them and a restore leaves them
+    /// as they were, and those pages otherwise.
+    fn restore_pages(&self) -> u64
+    {
+        if self.overcommits()
+        {
+            self.free / PAGE_SIZE
+        }
+        else
+        {
+            self.available_pages()
+        }
+    }
+
+    /// The restore headroom the growth floor holds above the reserve: the
+    /// pages of evicted chunks of uncommitted regions, up to the reserve
+    /// (services/memmgr/docs/memory-pool.md § Eviction, Restore headroom). A
+    /// committed chunk's restore draws from `promised`, so its pages take
+    /// none.
+    fn headroom_pages(&self) -> u64
+    {
+        (self.swapped.saturating_sub(self.committed_swapped) / PAGE_SIZE).min(self.reserve_pages())
+    }
+
+    /// Whether the pages a restore is admitted against fall short of the
+    /// reserve and a chunk ([`Self::restore_pages`]), so no restore of a whole
+    /// chunk is admitted without direct reclaim.
     fn short_of_a_chunk(&self) -> bool
     {
-        self.available_pages() < self.reserve_pages().saturating_add(CHUNK_PAGES)
+        self.restore_pages() < self.reserve_pages().saturating_add(CHUNK_PAGES)
     }
 }
 
@@ -333,6 +373,7 @@ pub(super) fn pool() -> Pool
         evictions: reply.word(14),
         allowance: reply.word(15),
         uncommitted: reply.word(17),
+        committed_swapped: reply.word(18),
     }
 }
 
@@ -1460,8 +1501,9 @@ fn restore_chunk(authority: u64, process: u64, thread: u64, ready: &Ready, evict
 /// memmgr keeps while pages are swapped (services/memmgr/docs/memory-pool.md
 /// § Eviction, Restore headroom). Swapped chunks of the main region are then
 /// restored with `MAKE_RESIDENT`, one by one, from that headroom, until the
-/// pages free outside `promised` fall short of the reserve and a chunk; one
-/// more is restored there, which the free pages cannot admit, so memmgr's
+/// pages a restore is admitted against ([`Pool::restore_pages`]) fall short
+/// of the reserve and a chunk; one more is restored there, which they cannot
+/// admit, so memmgr's
 /// direct reclaim made the room by evicting idle chunks in its turn. Each
 /// restored page reads its pattern. The hog then gives grants back until the
 /// level leaves `CRITICAL`. Returns the chunks restored from the headroom.
@@ -1470,7 +1512,7 @@ fn critical_restore(hog: &mut Hog, authority: u64, process: u64, thread: u64, re
 {
     let status = hog.fill_to_floor();
     let reserve = status.reserve_pages();
-    let headroom = (status.swapped / PAGE_SIZE).min(reserve);
+    let headroom = status.headroom_pages();
     assert!(
         status.floor / PAGE_SIZE == reserve.saturating_add(headroom)
             && status.available_pages() <= status.floor / PAGE_SIZE,
@@ -1482,9 +1524,9 @@ fn critical_restore(hog: &mut Hog, authority: u64, process: u64, thread: u64, re
     );
     assert!(
         !status.short_of_a_chunk(),
-        "{PHASE}: growth stopped at CRITICAL with {} pages available against a reserve of {} \
-         while {} pages are swapped: no restore headroom",
-        status.available_pages(),
+        "{PHASE}: growth stopped at CRITICAL with {} pages a restore is admitted against and a \
+         reserve of {} while {} pages are swapped: no restore headroom",
+        status.restore_pages(),
         status.reserve_pages(),
         status.swapped / PAGE_SIZE
     );

@@ -372,6 +372,7 @@ impl IommuClient
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
+        drop(link);
     }
 
     /// Call the driver with `msg` on the instance serving now. `Err` with
@@ -398,7 +399,7 @@ impl IommuClient
     {
         let handle = self
             .next_handle
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| h.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |h| h.checked_add(1))
             .map_err(|_| iommu_errors::OUT_OF_RESOURCES)?;
         let reply = self.call(&attach_msg(unit, rid, handle, 0))?;
         let domain = Domain {

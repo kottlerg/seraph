@@ -228,6 +228,7 @@ impl<R: Read + Seek> Volume<'_, R>
     {
         let mut lfn = LfnAccum::new();
         let mut shorts = HashSet::new();
+        let mut names = HashSet::new();
         let mut subdirs = Vec::new();
         let (slots, _) = raw.as_chunks::<ENTRY_BYTES>();
         for (index, slot) in slots.iter().enumerate()
@@ -277,6 +278,13 @@ impl<R: Read + Seek> Volume<'_, R>
             let name = display_name(&lfn, &entry)
                 .with_context(|| format!("{path}/: entry {index} has no UTF-8 name"))?;
             lfn.reset();
+            // The firmware's and the `fatfs` service's lookups take the first entry whose
+            // name matches, case aside, so a name that repeats would leave the tree holding an
+            // entry they never load.
+            ensure!(
+                names.insert(name.to_lowercase()),
+                "{path}/: the name {name:?} repeats"
+            );
             let full = format!("{path}/{name}");
             if entry.attr & ATTR_DIRECTORY != 0
             {
@@ -424,6 +432,17 @@ mod tests
             bytes[at..at + 2].copy_from_slice(&u16::try_from(first).unwrap().to_le_bytes());
         }
         refused(bytes, "in two chains");
+        // A long name that is another entry's name, under a short name of its own.
+        let mut bytes = good.clone();
+        let units: Vec<u16> = "FILE".encode_utf16().collect();
+        let alias = *b"G          ";
+        let slot =
+            fat_parse::pack_lfn_slot(1, true, fat_parse::lfn_checksum(&alias), &units).unwrap();
+        bytes[entry + 32..entry + 64].copy_from_slice(&slot);
+        let copy: Vec<u8> = bytes[entry..entry + 32].to_vec();
+        bytes[entry + 64..entry + 96].copy_from_slice(&copy);
+        bytes[entry + 64..entry + 75].copy_from_slice(&alias);
+        refused(bytes, "the name \"FILE\" repeats");
         // A short name twice in one directory.
         let mut bytes = good;
         let copy: Vec<u8> = bytes[entry..entry + 32].to_vec();

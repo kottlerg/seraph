@@ -232,6 +232,19 @@ pub(crate) fn session_copy(node_cap: u64, ipc_buf: *mut u64) -> io::Result<u64>
     }
 }
 
+/// A SEND-only copy of this process's session with the driver of
+/// `node_cap` when the table holds one, `None` when it does not: the lookup
+/// of [`session_copy`] without its start, for a node cap that cannot carry
+/// `FS_SESSION`'s charge handle (one without `RIGHTS_EP_GRANT`).
+///
+/// # Errors
+/// `StaleNetworkFileHandle` when `node_cap`'s slot holds no capability;
+/// `OutOfMemory` when the copy cannot be made.
+pub(crate) fn existing_session_copy(node_cap: u64, ipc_buf: *mut u64) -> io::Result<Option<u64>>
+{
+    find(&mut table(), node_cap, ipc_buf)
+}
+
 /// Look `node_cap`'s session up in `sessions`, ending and removing each
 /// entry whose key is dead: a SEND-only copy of the session cap that serves
 /// `node_cap`, or `None` when none does.

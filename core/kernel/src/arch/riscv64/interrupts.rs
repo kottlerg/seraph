@@ -419,8 +419,8 @@ fn handle_software_interrupt()
     }
 
     // Wakeup IPIs carry no handler work beyond the SSIP acknowledgement above; the wake's
-    // correctness rests on the producer-side `RESCHEDULE_PENDING` set in `enqueue_and_wake`
-    // and the idle loop's check-and-halt (core/kernel/docs/scheduling-internals.md § Wake
+    // correctness rests on the producer linking its thread before it sends the IPI and on the
+    // idle loop's masked check-and-halt (core/kernel/docs/scheduling-internals.md § Wake
     // Protocol Invariants).
 }
 
@@ -1602,11 +1602,25 @@ pub unsafe fn send_wakeup_ipi(target_hart_id: u32)
 /// Send a supervisor software interrupt to `target_hart_id` via the SBI IPI
 /// extension (EID=0x735049 'sPI', FID=0 `SEND_IPI`).
 ///
+/// The caller's earlier memory accesses (a run-queue link, a shootdown request)
+/// are visible to the target before the interrupt arrives: the SBI
+/// specification states no memory ordering for `SEND_IPI`, and the firmware
+/// raises the interrupt by a device write (an M-mode software-interrupt or
+/// IMSIC register) or, under a hypervisor, by memory writes, neither of which
+/// RVWMO orders after this hart's earlier stores without a fence, so this
+/// function issues `fence rw, iorw` before the call.
+///
 /// # Safety
 /// `target_hart_id` must be a valid hart ID of an online hart.
 unsafe fn sbi_send_ipi_to(target_hart_id: u32)
 {
     let (hart_mask, hart_mask_base) = sbi_hart_mask(target_hart_id);
+    // SAFETY: `fence rw, iorw` orders memory accesses only; it clobbers no
+    // register or flag. Without `nomem` the compiler also keeps earlier memory
+    // accesses ahead of the block.
+    unsafe {
+        core::arch::asm!("fence rw, iorw", options(nostack, preserves_flags));
+    }
     // SAFETY: SBI call with EID=sPI, FID=0; caller guarantees the target hart
     // is online.
     let err = unsafe { sbi_call_2(0x0073_5049, 0, hart_mask, hart_mask_base) };

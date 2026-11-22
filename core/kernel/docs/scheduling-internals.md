@@ -891,13 +891,14 @@ hand their outgoing thread to the other and dispatch the one handed over would e
 publication only the other's `switch()` makes, forever, with interrupts masked (#529). Instead, a
 CPU with a non-idle outgoing thread reads `next.context_saved` under `next.sched_lock` at the
 dispatch flip; on `0` it leaves `next` `Ready`, re-links it at the head of its run queue on its own
-queue (so it keeps the round-robin turn it was dequeued in), sets its own reschedule-pending flag,
-and switches to idle. Idle's next pass of its loop (after its deferred-reclaim drain) calls
-`schedule()`, which dispatches the highest queued thread, through the wait: `next` when nothing of
-higher priority has arrived meanwhile. No CPU waits on an idle thread's publication (an idle thread
-runs only on its own CPU), so every wait in step 3.5 is for a CPU whose outgoing thread is non-idle,
-which does not wait, and every wait ends. A `1` read at the flip stays `1` until `next` runs again:
-`next` is dequeued and `current` nowhere, and only the CPU it is `current` on clears it.
+queue (so it keeps the round-robin turn it was dequeued in), and switches to idle. Idle's next
+pass of its loop (after its deferred-reclaim drain) finds the link in its masked `has_runnable`
+check and calls `schedule()`, which dispatches the highest queued thread, through the wait: `next`
+when nothing of higher priority has arrived meanwhile. No CPU waits on an idle thread's publication
+(an idle thread runs only on its own CPU), so every wait in step 3.5 is for a CPU whose outgoing
+thread is non-idle, which does not wait, and every wait ends. A `1` read at the flip stays `1` until
+`next` runs again: `next` is dequeued and `current` nowhere, and only the CPU it is `current` on
+clears it.
 
 The Release in step 5 pairs with the Acquire in step 6 (cross-CPU dequeue), the Acquire in step 3.5
 (outgoing-CPU dispatch barrier), the Acquire in step 9 (TCB free), and the Acquire in step 11
@@ -1076,11 +1077,9 @@ Producer side (`enqueue_and_wake`, `core/kernel/src/sched/mod.rs`):
    consumers (select_target_cpu's save-window pinning and sticky routing,
    the load balancer) stay coherent with the queue that actually holds the
    thread.
-6. set_reschedule_pending_for(target_cpu).
-   (reschedule_pending().set_cpu(target_cpu, Release).)
-7. Clear wake_in_flight (so a waiting dealloc_object(Thread) may proceed).
-8. Release target scheduler.lock (inner), then (*tcb).sched_lock (outer).
-9. wake_idle_cpu(target_cpu)  →  sends IPI (always; see below). NEVER under
+6. Clear wake_in_flight (so a waiting dealloc_object(Thread) may proceed).
+7. Release target scheduler.lock (inner), then (*tcb).sched_lock (outer).
+8. wake_idle_cpu(target_cpu)  →  sends IPI (always; see below). NEVER under
    sched_lock.
 ```
 
@@ -1142,53 +1141,62 @@ Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
 ```
 0. drain_deferred_reclaim(cpu)                     // interrupts enabled
 1. Mask interrupts.
-2. pending = take_reschedule_pending(cpu)          // reschedule_pending().take_cpu(cpu, AcqRel)
-3. has_work = scheduler_ptr(cpu).has_runnable()    // non_empty.load(Acquire)
-4. if pending || has_work {
+2. has_work = scheduler_ptr(cpu).has_runnable()    // non_empty.load(Acquire)
+3. if has_work {
        enable interrupts;
-       if has_work { schedule(Requeue::Always); }  // pick up the work
+       schedule(Requeue::Always);                  // pick up the work
        continue;
    }
-5. halt_until_interrupt()                          // x86: sti;hlt   riscv: wfi (atomic)
+4. halt_until_interrupt()                          // x86: sti;hlt   riscv: wfi (atomic)
 ```
 
 **Invariants the protocol MUST satisfy:**
 
-1. **The producer's enqueue MUST happen before its `set_reschedule_pending_for` call.** The
-   non_empty Release in producer step 5 establishes happens-before with the consumer's
-   `has_runnable` Acquire in consumer step 3. Reordering producer steps 5 and 6 is forbidden.
+1. **The link's `non_empty` publication MUST precede the wake IPI, and the IPI MUST NOT reach
+   the target before it.** The enqueue's `non_empty` Release `fetch_or` (producer step 5) is
+   made under the target's run-queue lock, and the IPI (producer step 8) is sent after both
+   unlocks; the consumer's `has_runnable` Acquire (consumer step 2) pairs with that Release. The
+   IPI send orders the sender's earlier memory accesses ahead of the interrupt it raises: on
+   x86-64, `apic_send_icr` fences before an x2APIC ICR write (`x2apic_wrmsr_fence`; the MSR
+   write is not serializing), and an xAPIC ICR store is ordered after earlier stores by x86 store
+   ordering; on riscv64, `sbi_send_ipi_to` issues `fence rw, iorw` before the SBI ecall, since
+   the SBI specification states no memory ordering for `SEND_IPI` and the firmware raises the
+   remote interrupt by a device write (or, under a hypervisor, by memory writes) that RVWMO does
+   not order after the sender's stores without a fence.
 
-2. **The consumer MUST mask interrupts before checking `pending` and `has_work`, and MUST unmask
-   only to enter `schedule()`, to loop back and re-check (the pending-only path), or at the
-   atomic-halt instruction.** This closes the window between observing "no work" and halting:
-   every halt is preceded by a fresh masked check.
+2. **The consumer MUST mask interrupts before checking `has_work`, and MUST unmask only to enter
+   `schedule()` or at the atomic-halt instruction.** This closes the window between observing
+   "no work" and halting: every halt is preceded by a fresh masked check.
 
 3. **The atomic-halt instruction MUST be `sti;hlt` (x86) or `wfi` (riscv) issued under the same
-   masked region**, such that an IPI arriving between step 4 and the halt is observed at the halt
+   masked region**, such that an IPI arriving between step 3 and the halt is observed at the halt
    boundary and wakes the CPU immediately.
    `core/kernel/src/arch/{x86_64,riscv64}/cpu.rs::halt_until_interrupt` is responsible for this
    guarantee.
 
 4. **Always-IPI MUST be the policy in `wake_idle_cpu`.** Predicating IPI delivery on a per-CPU "is
    idle" hint is a missed-wakeup race: the producer can observe `running` while the target CPU has
-   just halted in `hlt`/`wfi`, and the producer's enqueue + `RESCHEDULE_PENDING` set sit unobserved
-   until the next interrupt. The IPI MUST be sent for every cross-CPU wake (skipping only
-   self-wakes). Spurious IPIs to running targets cost only a trap entry; the cost is negligible
-   against the missed-wakeup risk.
+   just halted in `hlt`/`wfi`, and the producer's enqueue sits unobserved until the next
+   interrupt. The IPI MUST be sent for every cross-CPU wake (skipping only self-wakes). Spurious
+   IPIs to running targets cost only a trap entry; the cost is negligible against the
+   missed-wakeup risk.
 
-5. **`take_reschedule_pending` MUST use AcqRel** (the Acquire half pairs with the producer's Release
-   `set_cpu`; the Release half is conservative but avoids a separate-fence requirement).
-
-**Why two notifications.** `non_empty` (per-CPU `AtomicU32`, "Ready thread at some
-priority") is updated by enqueue/dequeue and is the dispatcher's notification.
-`RESCHEDULE_PENDING` (a global CPU set, one bit per CPU: `cpu_count.div_ceil(64)` words
-allocated at Phase 4, whose base the `AtomicPtr` publishes with Release, viewed as an
-`AtomicCpuMask` through `reschedule_pending()`, which loads it with Acquire) is set by
-every path that links or nudges work onto a CPU (`enqueue_and_wake`,
-`enqueue_ready_thread`, `relocate_ready_thread`, `schedule()`'s cross-affinity
-requeue, and `sys_thread_set_affinity`) and is consumed only by the idle loop
-(`take_reschedule_pending` in `idle_thread_entry`), where it closes the
-check-to-halt window.
+**Why one notification suffices.** `non_empty` (per-CPU `AtomicU32`, one bit per run queue)
+is the only notification the idle loop reads, and the dispatcher indexes the queues by it. Every
+path that links a thread on another CPU's run queue sets its queue's bit under that CPU's run-queue
+lock and then sends the wake IPI: `enqueue_and_wake`, `enqueue_ready_thread`, `schedule()`'s
+cross-affinity requeue, and `sys_thread_set_affinity`'s `migrate_ready_thread`, whose caller
+prods the destination (`prod_remote_cpu`) after its unlock. A path that links a thread on its own
+CPU (`schedule()`'s deferred-dispatch re-link, and the load balancer's pull, which moves a thread
+onto the pulling CPU from its `timer_tick`) needs no IPI: the link precedes that CPU's next masked
+check in program order, or, made in an interrupt taken during the halt, ends the halt itself. In
+the masked check (consumer step 2), a load that misses a remote link was made before the link was
+visible, so the IPI that invariant 1 orders after the link arrives after the mask, is held
+pending, and ends the atomic halt; a load after it sees the bit. An IPI that finds no work (a
+thread pulled away before the check, or `sys_thread_set_affinity`'s prod of a CPU running its
+target, which observes the change at its next `schedule()` entry) costs one pass of the loop,
+which re-checks and halts. The always-IPI rule and the masked `has_runnable` check therefore
+close the check-to-halt window with `non_empty` alone; no second per-CPU flag is needed.
 
 ---
 
@@ -1259,7 +1267,9 @@ wakeup. The supervisor-mode trap handler distinguishes the two by side-channel s
 path scans the per-CPU TLB shootdown request slots and services any whose pending mask names this
 hart; a wakeup-only IPI finds no slot naming it and falls through with no work, exactly mirroring
 the x86_64 wakeup-vector handler. The request-slot protocol is specified in
-[memory-internals.md](memory-internals.md#smp-tlb-shootdown).
+[memory-internals.md](memory-internals.md#smp-tlb-shootdown). The send (`sbi_send_ipi_to`) issues
+`fence rw, iorw` before the SBI ecall, so the request slot or run-queue link an IPI announces is
+visible to the target before it takes the interrupt (§ Wake Protocol Invariants, invariant 1).
 
 The same correctness rules apply: shootdown is required for TLB coherence; wakeup is required for
 the wake protocol.
@@ -1372,8 +1382,6 @@ the ordering choice is required for correctness; relaxations would introduce a r
 
 | Atomic | Location | Set ordering | Read ordering | Pairing rationale |
 |---|---|---|---|---|
-| `RESCHEDULE_PENDING` (`AtomicPtr<AtomicU64>`, the set's words) | `core/kernel/src/sched/mod.rs` (decl; store in `init_storage`, load in `reschedule_pending`) | Release `store` at Phase 4, once | Acquire `load` in `reschedule_pending` | Publishes the zeroed words before any reader: every reader runs after Phase 4 on the BSP, or on an AP the BSP starts after it. |
-| `RESCHEDULE_PENDING` set words (`AtomicCpuMask` view) | `core/kernel/src/sched/mod.rs` (ops `set_reschedule_pending_for` / `take_reschedule_pending`) | Release on `set_reschedule_pending_for` (`set_cpu`) | AcqRel on `take_reschedule_pending` (`take_cpu`) | Release publishes the producer's prior enqueue; AcqRel ensures the consumer sees the enqueue and synchronises both directions of the bit clear. |
 | `non_empty` (per PerCpuScheduler) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue` and `enqueue_at_head` (their shared `link`), `dequeue_highest`, `remove_from_queue`; read in `has_runnable`) | Release on `link.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and` | Acquire on `has_runnable.load` | Release publishes the queue-mutation stores; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO. |
 | `queued_on` (per TCB, `AtomicI16`) | `core/kernel/src/sched/thread.rs` (decl); writes in `PerCpuScheduler::enqueue` and `enqueue_at_head` (their shared `link`; set to priority), `dequeue_highest` / `remove_from_queue` (set to `-1`); read in the double-link guard of that shared `link`, `schedule()`'s `already_queued` requeue guard, and the `commit_blocked_under_local_lock` debug tripwire | Relaxed `store` | Relaxed `load` | The global single-link tag (#244/#289). Every load-bearing access — set, clear, and the guard reads — is performed under the owning `scheduler.lock` (the `schedule()` guard read under the current CPU's run-queue lock), which supplies all required ordering; the atomic type exists only so a cross-CPU `enqueue_and_wake` guard read of a TCB linked on *another* CPU is well-defined, not for lock-free synchronisation. A `>= 0` value means linked, on the run queue of that level, on the CPU that set it. The `commit_blocked` tripwire reads it Relaxed under `(*tcb).sched_lock` with no run-queue lock — sound because every `-1 → >= 0` writer either classifies the target not-live under that same `sched_lock` (`enqueue_and_wake`, `enqueue_ready_thread` via its not-live caller contract) or runs as / while holding the same lock as the parking thread itself (`schedule()`'s requeue arms and its deferred-dispatch re-link, `relocate_ready_thread`, `relocate_ready_priority`), all excluded while the thread executes its own park commit. (The softlockup-watchdog dump also reads the field, under the walked thread's `sched_lock`; diagnostic-only, not load-bearing.) |
 | `context_saved` (per TCB) | `core/kernel/src/sched/thread.rs` (decl) | Release store of `1` inside `context::switch`, after the rsp/sp swap onto the incoming thread's kstack; **Relaxed clears to `0`** at the park commits (`commit_blocked_under_local_lock` and the IPC pre-clears) and `schedule()`'s switch-away / cross-affinity arms, each performed while the thread is `current` on the storing CPU; **Relaxed restores to `1`** by the IPC primitives when they do not park (payload harvested before parking, or a refused commit's rollback), while the thread is still `current` on the storing CPU | Acquire on the remote-dequeue spin-loop and in `schedule()`'s dispatch-flip read that defers an unpublished `next` when the outgoing thread is not idle (step 3.5); **also Acquire** in the load-balancer liveness gate (`pull_unpinned_ready` / `migrate_ready_thread`, step 11) and the `sys_thread_start` settle loop and commit (`start_under_all_locks`, `start_ready_to_link`) and the register-access gate (`with_held_frame`), and the `sys_thread_stop` drain and save wait (`drain_remote_stopped`, `await_stopped_save`), which pair with the switch-out Release so a stop returns only after the target's save is visible | Closes the partial-`SavedState`-visibility race on RVWMO, and (step 11) gates cross-CPU relocation/resume on a committed save — `cs == 1` ⇒ switched out and `current` nowhere; see [Cross-CPU TCB Ownership](#cross-cpu-tcb-ownership) (steps 5/6/9/11) for the full sequence. The Relaxed `0`-clears are sufficient: every consumer reaches the cleared value transitively through a lock release/acquire chain (the waker/relocator hold `sched_lock` and the run-queue lock), the same argument the pre-existing IPC pre-clears rely on. |

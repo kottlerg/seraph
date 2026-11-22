@@ -1039,8 +1039,8 @@ The capability-revocation deferred-cleanup pattern remains specified in
 
 ### Cross-CPU Wakeup
 
-The wake protocol — producer-side enqueue plus RESCHEDULE_PENDING set, IPI
-delivery, consumer-side atomic check-and-halt — is specified in
+The wake protocol — producer-side enqueue, IPI delivery, consumer-side atomic
+check-and-halt — is specified in
 [scheduling-internals.md § Wake Protocol Invariants](scheduling-internals.md#wake-protocol-invariants).
 The wake-one primitives invoke `enqueue_and_wake` after releasing their source IPC lock;
 `waitset_notify` and `waitset_add`'s ready-at-add wake release `ws.lock` but wake while the

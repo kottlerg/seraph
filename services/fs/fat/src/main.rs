@@ -858,6 +858,17 @@ fn service_loop(
             {}
         }
 
+        // A memory-cap read takes general slots for its page's ancestor and,
+        // in a session, its record's page: top the CSpace up first, as
+        // FS_SESSION and FS_OPEN do, since the pages outstanding across opens,
+        // each open bounded alone by the slot ceiling, can outnumber the
+        // per-slot ancestors the funding counts.
+        if opcode == fs_labels::FS_READ_MEMORY
+            && !cache.fund_run_time_headroom(startup_info().self_cspace)
+        {
+            reply_err(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
+            continue;
+        }
         // A memory-cap read in a session first makes room for the record of
         // the page it holds, taking the session a page with the lock released.
         if opcode == fs_labels::FS_READ_MEMORY

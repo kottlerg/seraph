@@ -504,10 +504,11 @@ most as many outstanding pages as the cache has slots.
 **Reply (error)**: `label = ipc::fs_errors::*`: `PERMISSION_DENIED`
 (the badge lacks `READ`), `INVALID_BADGE` (a node cap, a closed open, or
 an open whose node was freed), `BAD_MEMORY_OFFSET` (cookie zero),
-`TOO_MANY_OPEN` (the open's outstanding-page table is full, or, in a
-session, the page's record needs another session page the driver cannot
-map), `LIMIT`, `OUT_OF_MEMORY` and `INVALID_ARGUMENT` (in a session: the page's record
-needs another session page, refused as for
+`TOO_MANY_OPEN` (the open's outstanding-page table is full, the driver's
+`CSpace` cannot grow, or, in a session, the page's record needs another
+session page the driver cannot map), `LIMIT`, `OUT_OF_MEMORY` and
+`INVALID_ARGUMENT` (in a session: the page's record needs another session
+page, refused as for
 [`FS_OPEN`](#label-18-fs_open)), `IO_ERROR`
 (the file's cluster chain is corrupt, a block read
 failed, or every cache page is held; the client MAY retry, since the

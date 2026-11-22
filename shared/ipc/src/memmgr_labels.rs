@@ -615,11 +615,14 @@ pub const SWAP_WANTED_WORDS: u64 = 8;
 /// hands back the grants' Memory caps with the request, as for
 /// [`RELEASE_MEMORY_CAPS`], and has unmapped them: memmgr seals only grants
 /// no process holds a cap to, maps or has retyped, and otherwise changes
-/// nothing. The frames stay charged to the caller's budget node until the
-/// object is freed. Reply: `SUCCESS` with `data[0]` the object's pages and
-/// `caps[0]` an object handle ([`OBJECT_HANDLE_TAG`]); `INVALID_ARGUMENT`
-/// (unknown badge, a count out of range, an id that names no grant of the
-/// caller or is named twice, or a grant still held, mapped or retyped);
+/// nothing. A grant charged to a node handle's node ([`REQUEST_CHARGE_NODE`]),
+/// whose charge the object, which outlives the caller, could not return,
+/// refuses the seal whole. The frames stay charged to the caller's budget
+/// node until the object is freed. Reply: `SUCCESS` with `data[0]` the
+/// object's pages and `caps[0]` an object handle ([`OBJECT_HANDLE_TAG`]);
+/// `INVALID_ARGUMENT` (unknown badge, a count out of range, an id that names
+/// no grant of the caller or is named twice, a grant charged to a node
+/// handle's node, or a grant still held, mapped or retyped);
 /// `UNAUTHORIZED` (a phys-class caller); `QUOTA` (memmgr's metadata or
 /// `CSpace` is full, or its object zone holds no span of the object's pages);
 /// or `OUT_OF_MEMORY_BEST_EFFORT` (memmgr could not map its own read-only
@@ -645,7 +648,9 @@ pub const SEAL_OBJECT_MAX_GRANTS: u64 = 63;
 /// the object's frame; [`MAKE_PRIVATE`] gives the page a copy first. The
 /// caller's budget node is charged the region's length and its page-table
 /// reservation either way, and a private attachment is committed as
-/// `REGION_COMMIT` commits a region, so no fault in it fails for memory. Reply: `SUCCESS`; `INVALID_ARGUMENT` (unknown
+/// [`REGION_COMMIT`] commits a region, so a fault in it is declined only in
+/// the cases `services/memmgr/docs/ipc-interface.md` § Committed fault
+/// declines lists. Reply: `SUCCESS`; `INVALID_ARGUMENT` (unknown
 /// badge, a bad range, protection or flag, a cap that is no live object
 /// handle, pages past the object's end, or a range overlapping a region of the
 /// caller); `LIMIT` or `OUT_OF_MEMORY_BEST_EFFORT` as for a committed

@@ -165,8 +165,9 @@ struct DeviceBuffer
 
 /// General capability slots the fs keeps free for the caps it takes at run
 /// time beyond the cache's own: a read's transient child derivation,
-/// block-device replies, the eviction worker's release-SEND copies, and the
-/// release SENDs and liveness caps `FS_OPEN` records until
+/// block-device replies, the eviction worker's release-SEND copies, the
+/// liveness cap `FS_SESSION` records for each session and the release SEND
+/// `FS_OPEN` records for each open, until
 /// [`PageCache::fund_run_time_headroom`] next tops the `CSpace` up.
 const RUN_TIME_CSPACE_HEADROOM: usize = 64;
 
@@ -475,9 +476,10 @@ impl PageCache
     /// page, a per-read ancestor for every slot, the quarantine's
     /// replacements, and [`RUN_TIME_CSPACE_HEADROOM`] (the init funding,
     /// less the slot pages, the scratch page and the run buffer already held).
-    /// Called before `FS_OPEN` records a release SEND and a liveness cap,
-    /// which hold slots for the open's lifetime, so the `CSpace` grows with
-    /// the opens instead of starving reads. A no-op beyond reading the
+    /// Called before `FS_SESSION` records a session's liveness cap and before
+    /// `FS_OPEN` records an open's release SEND, which hold slots for the
+    /// session's or the open's lifetime, so the `CSpace` grows with the
+    /// sessions and opens instead of starving reads. A no-op beyond reading the
     /// `CSpace`'s headroom while it suffices; `false` when memmgr cannot
     /// fund it.
     pub fn fund_run_time_headroom(&self, cspace: u64) -> bool

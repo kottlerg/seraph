@@ -230,9 +230,12 @@ page and memmgr refuses the session's handle, as it does once the node's
 handle state has ended), `LIMIT` (the open's record needs another page and
 the max of the session's node or of an ancestor refuses it),
 `TOO_MANY_OPEN` (the open ids are spent, or the heap or the driver's
-`CSpace` cannot grow, or the driver cannot map a session's page), `IO_ERROR` (the driver could not
-mint the cap, or memmgr has no page for the session). Every refusal deletes
-the carried caps.
+`CSpace` cannot grow, or the driver cannot map a session's page),
+`OUT_OF_MEMORY` (the open's record needs another page and memmgr refuses it
+for want of memory: the free pool is at a floor the session's node may not
+take), `IO_ERROR` (the driver could not mint the cap, or memmgr's call fails
+or its reply carries no usable page). Every refusal deletes the carried
+caps.
 
 **Lifetime and bounds of an open.** It lives until its
 `FS_CLOSE`, until an [`FS_REMOVE`](#label-14-fs_remove) or
@@ -307,7 +310,10 @@ session is not tied to that node. The driver deletes every cap beyond
 or a session cap), `PERMISSION_DENIED` (the badge carries no rights),
 `INVALID_ARGUMENT` (`caps[0]` is missing, or memmgr refuses it as a node
 handle), `LIMIT` (the max of the node or of an ancestor refuses the
-session's first page), `IO_ERROR` (memmgr has no page, or the call fails),
+session's first page), `OUT_OF_MEMORY` (memmgr refuses that page for want of
+memory: the free pool is at a floor the node may not take, as outside the
+system reserve while memory is critical), `IO_ERROR` (the call to memmgr
+fails, or its reply carries no usable page),
 `TOO_MANY_OPEN` (the session ids are spent, or the heap or the driver's
 `CSpace` cannot grow, or the driver cannot create the liveness object or map
 the page). Every refusal deletes the handle.
@@ -498,7 +504,7 @@ most as many outstanding pages as the cache has slots.
 an open whose node was freed), `BAD_MEMORY_OFFSET` (cookie zero),
 `TOO_MANY_OPEN` (the open's outstanding-page table is full, or, in a
 session, the page's record needs another session page the driver cannot
-map), `LIMIT` and `INVALID_ARGUMENT` (in a session: the page's record
+map), `LIMIT`, `OUT_OF_MEMORY` and `INVALID_ARGUMENT` (in a session: the page's record
 needs another session page, refused as for
 [`FS_OPEN`](#label-18-fs_open)), `IO_ERROR`
 (the file's cluster chain is corrupt, a block read

@@ -202,8 +202,10 @@ node's handle, and charges the leader to it with `CREATE_CHARGE_NODE`
 Every process of the session is charged within that node's subtree, so a program's pages count in
 its job, its session and sessiond, and never in an interface's subtree: svcmgr's stop list
 never names an interface for a program's memory, and never names sessiond, which holds core roles.
-A sub-node is outside the system reserve, so no process of a session takes the pages memmgr keeps
-in reserve.
+sessiond makes every session node without `SUB_NODE_RESERVE`, and a node under one outside the
+reserve cannot be a reserve node, so no process of a session takes the pages memmgr keeps in
+reserve ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
+§ Distribution policy, **System reserve**).
 
 A session's usage is its node's subtree pages, which sessiond reads with `NODE_QUERY_USAGE`; a
 job's is the subtree pages procmgr's child list reports. In the single-user and multi-user modes

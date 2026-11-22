@@ -34,17 +34,18 @@ pub const READ_SESSION_MAX_PAGES: u64 = 1;
 
 /// The procmgr error for an `FS_SESSION` or `FS_OPEN` refusal of the file
 /// server: `LIMIT` when the max of the session's node, or of an ancestor's,
-/// refused the charge (`fs_errors::LIMIT`), `IO_ERROR` otherwise.
+/// refused the charge (`fs_errors::LIMIT`), `OUT_OF_MEMORY` when memmgr
+/// refused it for want of memory (`fs_errors::OUT_OF_MEMORY`), which a
+/// creator such as svcmgr reads as a refusal its memory wait holds,
+/// `IO_ERROR` otherwise.
 #[must_use]
 pub const fn fs_refusal(label: u64) -> u64
 {
-    if label == ipc::fs_errors::LIMIT
+    match label
     {
-        ipc::procmgr_errors::LIMIT
-    }
-    else
-    {
-        ipc::procmgr_errors::IO_ERROR
+        ipc::fs_errors::LIMIT => ipc::procmgr_errors::LIMIT,
+        ipc::fs_errors::OUT_OF_MEMORY => ipc::procmgr_errors::OUT_OF_MEMORY,
+        _ => ipc::procmgr_errors::IO_ERROR,
     }
 }
 
@@ -130,6 +131,16 @@ mod tests
         {
             assert_eq!(fs_refusal(label), ipc::procmgr_errors::IO_ERROR);
         }
+    }
+
+    #[test]
+    fn a_want_of_memory_at_the_read_session_is_procmgr_s_out_of_memory()
+    {
+        // svcmgr's memory wait holds a restart only on OUT_OF_MEMORY.
+        assert_eq!(
+            fs_refusal(ipc::fs_errors::OUT_OF_MEMORY),
+            ipc::procmgr_errors::OUT_OF_MEMORY
+        );
     }
 
     #[test]

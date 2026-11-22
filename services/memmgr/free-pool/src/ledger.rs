@@ -77,6 +77,17 @@ use crate::{
 
 use syscall_abi::{MAX_HARVEST_PAGES, PAGE_SIZE};
 
+/// Whether [`Ledger::create_sub_node`] makes the sub-node in the system
+/// reserve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Membership
+{
+    /// Outside the reserve: a charge to it leaves the growth floor.
+    Outside,
+    /// In the reserve, under a reserve parent and with a finite max.
+    Reserve,
+}
+
 /// Why registering a region failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionError
@@ -1046,16 +1057,21 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         Ok(h)
     }
 
-    /// Make a sub-node under the budget node `parent`, outside the reserve,
-    /// with the max `max` clamped as [`budget::create`] clamps it, and give
-    /// it handle state keyed by `key` (a badge no slot is keyed by), owned by
-    /// the record `owner`. The node's one reference is its handle state's,
-    /// so it lives until that state is dropped and then while a child node or
-    /// a charge refers to it. Returns the state's slot.
+    /// Make a sub-node under the budget node `parent`, in the system reserve
+    /// when `membership` is [`Membership::Reserve`] and outside it otherwise, with the max `max`
+    /// clamped as [`budget::create`] clamps it, and give it handle state
+    /// keyed by `key` (a badge no slot is keyed by), owned by the record
+    /// `owner`. A reserve sub-node needs a reserve parent and a finite max,
+    /// which bounds what its subtree can take of the reserve and which it
+    /// keeps ([`Self::set_node_max`]). The node's one
+    /// reference is its handle state's, so it lives until that state is
+    /// dropped and then while a child node or a charge refers to it. Returns
+    /// the state's slot.
     ///
     /// # Errors
     /// [`NodeError::Parent`] when `parent` is not a budget node or `owner`
-    /// holds no record; [`NodeError::NoSlot`] when the arena has fewer than
+    /// holds no record, or a reserve sub-node is asked for with no max or
+    /// under a parent outside the reserve; [`NodeError::NoSlot`] when the arena has fewer than
     /// the three free slots outside its reserve the node, its reclaim state and
     /// its handle state take, or the index has no bucket storage. Nothing
     /// changes then.
@@ -1065,9 +1081,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         parent: NodeIdx,
         max: u64,
         key: u64,
+        membership: Membership,
     ) -> Result<NodeIdx, NodeError>
     {
-        if self.record(owner).is_none()
+        let reserve = membership == Membership::Reserve;
+        if self.record(owner).is_none() || (reserve && max == crate::NO_MAX)
         {
             return Err(NodeError::Parent);
         }
@@ -1080,9 +1098,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             NodeSpec {
                 parent,
                 max,
-                reserve: false,
+                reserve,
             },
         )?;
+        if reserve
+        {
+            budget::set_bounded(&mut self.arena, node);
+        }
         self.attach(owner, node, key).inspect_err(|_| {
             budget::unref(&mut self.arena, node);
         })
@@ -1559,10 +1581,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Set the max of the budget node `node` to `max`, clamped to its
     /// usage plus its parent chain's headroom ([`budget::clamp_max`]).
-    /// Returns the max it took; `None` when `node` is not a budget node.
+    /// On a reserve sub-node, whose max bounds what its subtree can take of
+    /// the reserve ([`Self::create_sub_node`]), `max` is first clamped to the
+    /// node's current max, so that max only falls. Returns the max it took;
+    /// `None` when `node` is not a budget node.
     pub fn set_node_max(&mut self, node: NodeIdx, max: u64) -> Option<u64>
     {
-        budget::node(&self.arena, node)?;
+        let b = budget::node(&self.arena, node)?;
+        let max = if b.bounded() { max.min(b.max) } else { max };
         let max = budget::clamp_max(&self.arena, node, max);
         budget::set_max(&mut self.arena, node, max);
         Some(max)
@@ -7641,7 +7667,9 @@ mod tests
         let parent_refs = l.budget(rec).unwrap().refs;
 
         // A sub-node with no charge goes with its handle state.
-        let h = l.create_sub_node(rec, parent, 8, KEY_A).unwrap();
+        let h = l
+            .create_sub_node(rec, parent, 8, KEY_A, Membership::Outside)
+            .unwrap();
         let node = l.handle(h).unwrap().node;
         assert_eq!(budget::node(&l.arena, node).unwrap().refs, 1);
         assert_eq!(l.budget(rec).unwrap().refs, parent_refs + 1);
@@ -7652,7 +7680,9 @@ mod tests
         assert_eq!(l.arena.free_count(), free);
 
         // A charged one outlives it until the charge is released.
-        let h = l.create_sub_node(rec, parent, 8, KEY_B).unwrap();
+        let h = l
+            .create_sub_node(rec, parent, 8, KEY_B, Membership::Outside)
+            .unwrap();
         let node = l.handle(h).unwrap().node;
         budget::charge(&mut l.arena, node, 3);
         assert_eq!(l.drop_handle(h), Some(0));
@@ -7672,16 +7702,82 @@ mod tests
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         let free = l.arena.free_count();
         assert_eq!(
-            l.create_sub_node(rec, rec, NO_MAX, KEY_A),
+            l.create_sub_node(rec, rec, NO_MAX, KEY_A, Membership::Outside),
             Err(NodeError::Parent)
         );
         let parent = l.record(rec).unwrap().budget;
         assert_eq!(
-            l.create_sub_node(parent, parent, NO_MAX, KEY_A),
+            l.create_sub_node(parent, parent, NO_MAX, KEY_A, Membership::Outside),
             Err(NodeError::Parent)
         );
         assert_eq!(l.arena.free_count(), free);
         assert!(!l.key_in_use(KEY_A));
+    }
+
+    #[test]
+    fn a_reserve_sub_node_needs_a_reserve_parent_and_keeps_a_max()
+    {
+        let mut l = ledger();
+        let plain = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let core = l.insert_process(2, NodeSpec::TOP_RESERVE).unwrap();
+        let plain_node = l.record(plain).unwrap().budget;
+        let core_node = l.record(core).unwrap().budget;
+        let free = l.arena.free_count();
+        // Refused under a parent outside the reserve, and without a max.
+        assert_eq!(
+            l.create_sub_node(plain, plain_node, 4, KEY_A, Membership::Reserve),
+            Err(NodeError::Parent)
+        );
+        assert_eq!(
+            l.create_sub_node(core, core_node, NO_MAX, KEY_A, Membership::Reserve),
+            Err(NodeError::Parent)
+        );
+        assert_eq!(l.arena.free_count(), free);
+        assert!(!l.key_in_use(KEY_A));
+        // Under a reserve parent with a max: a reserve node, which may take
+        // the pages a node outside the reserve must leave, up to its max.
+        let h = l
+            .create_sub_node(core, core_node, 4, KEY_A, Membership::Reserve)
+            .unwrap();
+        let node = l.handle(h).unwrap().node;
+        assert!(budget::node(&l.arena, node).unwrap().reserve());
+        assert_eq!(budget::admit(&l.arena, node, 4, 0, 10, 10), Ok(()));
+        assert_eq!(
+            budget::admit(&l.arena, node, 5, 0, 10, 10),
+            Err(ChargeError::Limit)
+        );
+        let outside = l
+            .create_sub_node(core, core_node, 4, KEY_B, Membership::Outside)
+            .unwrap();
+        let outside = l.handle(outside).unwrap().node;
+        assert!(!budget::node(&l.arena, outside).unwrap().reserve());
+        assert_eq!(
+            budget::admit(&l.arena, outside, 1, 0, 10, 10),
+            Err(ChargeError::Reserve)
+        );
+        // A reserve sub-node may hold reserve sub-nodes of its own, each with
+        // a max, inside its own.
+        assert_eq!(
+            l.create_sub_node(core, node, NO_MAX, KEY_C, Membership::Reserve),
+            Err(NodeError::Parent)
+        );
+        let inner = l
+            .create_sub_node(core, node, 2, KEY_C, Membership::Reserve)
+            .unwrap();
+        let inner = l.handle(inner).unwrap().node;
+        assert!(budget::node(&l.arena, inner).unwrap().reserve());
+        // Each one's max only falls: a later max may lower it, never raise
+        // it. A node outside the reserve, and a top-level reserve node, may
+        // drop theirs.
+        assert_eq!(l.set_node_max(node, NO_MAX), Some(4));
+        assert_eq!(l.set_node_max(node, NO_MAX - 1), Some(4));
+        assert_eq!(l.set_node_max(node, 1 << 40), Some(4));
+        assert_eq!(l.set_node_max(inner, NO_MAX), Some(2));
+        assert_eq!(l.set_node_max(node, 3), Some(3));
+        assert_eq!(l.set_node_max(node, 4), Some(3));
+        assert_eq!(budget::node(&l.arena, node).unwrap().max, 3);
+        assert_eq!(l.set_node_max(outside, NO_MAX), Some(NO_MAX));
+        assert_eq!(l.set_node_max(core_node, NO_MAX), Some(NO_MAX));
     }
 
     #[test]
@@ -7694,8 +7790,12 @@ mod tests
         let other_free = l.arena.free_count();
         let parent = l.record(rec).unwrap().budget;
         let own = l.attach_record_handle(rec, KEY_A).unwrap();
-        let a = l.create_sub_node(rec, parent, 8, KEY_B).unwrap();
-        let b = l.create_sub_node(rec, parent, NO_MAX, KEY_C).unwrap();
+        let a = l
+            .create_sub_node(rec, parent, 8, KEY_B, Membership::Outside)
+            .unwrap();
+        let b = l
+            .create_sub_node(rec, parent, NO_MAX, KEY_C, Membership::Outside)
+            .unwrap();
         assert_eq!(l.set_limit(own, rec, 40, 1), Ok(0));
         assert_eq!(l.set_limit(b, rec, 42, 4), Ok(0));
         assert_eq!(l.set_limit(b, rec, 43, 8), Ok(42));
@@ -7725,7 +7825,9 @@ mod tests
         let mut l = ledger();
         let rec = l.insert_process(1, spec_max(10)).unwrap();
         let parent = l.record(rec).unwrap().budget;
-        let h = l.create_sub_node(rec, parent, NO_MAX, KEY_A).unwrap();
+        let h = l
+            .create_sub_node(rec, parent, NO_MAX, KEY_A, Membership::Outside)
+            .unwrap();
         let sub = l.handle(h).unwrap().node;
         budget::charge(&mut l.arena, sub, 2);
         // Usage 2 plus the parent's 8 left.
@@ -7747,7 +7849,9 @@ mod tests
         let rec = l.insert_process(1, spec_max(10)).unwrap();
         let parent = l.record(rec).unwrap().budget;
         let top = l.attach_record_handle(rec, KEY_A).unwrap();
-        let h = l.create_sub_node(rec, parent, 4, KEY_B).unwrap();
+        let h = l
+            .create_sub_node(rec, parent, 4, KEY_B, Membership::Outside)
+            .unwrap();
         let sub = l.handle(h).unwrap().node;
         assert_eq!(l.set_limit(top, rec, 41, 1), Ok(0));
         let limits = |l: &Ledger<VecStore, VecWords>, refused| {
@@ -7788,9 +7892,13 @@ mod tests
         let client = l.insert_process(1, NodeSpec::TOP_RESERVE).unwrap();
         let server = l.insert_process(2, NodeSpec::TOP).unwrap();
         let parent = l.record(client).unwrap().budget;
-        let h = l.create_sub_node(client, parent, 8, KEY_A).unwrap();
+        let h = l
+            .create_sub_node(client, parent, 8, KEY_A, Membership::Outside)
+            .unwrap();
         let sub = l.handle(h).unwrap().node;
-        let other = l.create_sub_node(client, parent, 8, KEY_B).unwrap();
+        let other = l
+            .create_sub_node(client, parent, 8, KEY_B, Membership::Outside)
+            .unwrap();
         let other = l.handle(other).unwrap().node;
 
         let first = l.push_grant(server, 5, 3, 0x5000, UNMAPPED, sub).unwrap();
@@ -7848,7 +7956,9 @@ mod tests
         let b = l.insert_process(3, NodeSpec::TOP).unwrap();
         let unregistered = l.insert_process(4, NodeSpec::TOP).unwrap();
         let parent = l.record(client).unwrap().budget;
-        let h = l.create_sub_node(client, parent, NO_MAX, KEY_A).unwrap();
+        let h = l
+            .create_sub_node(client, parent, NO_MAX, KEY_A, Membership::Outside)
+            .unwrap();
         let sub = l.handle(h).unwrap().node;
         assert_eq!(l.set_donation_end(a, 50, 4), Ok(0));
         assert_eq!(l.set_donation_end(b, 60, 8), Ok(0));
@@ -7888,7 +7998,9 @@ mod tests
         let server = l.insert_process(2, NodeSpec::TOP).unwrap();
         let parent = l.record(client).unwrap().budget;
         let own = l.attach_record_handle(client, KEY_A).unwrap();
-        let h = l.create_sub_node(client, parent, NO_MAX, KEY_B).unwrap();
+        let h = l
+            .create_sub_node(client, parent, NO_MAX, KEY_B, Membership::Outside)
+            .unwrap();
         let sub = l.handle(h).unwrap().node;
         assert_eq!(l.set_donation_end(server, 50, 4), Ok(0));
         l.push_grant(server, 1, 2, 0x1000, UNMAPPED, sub).unwrap();
@@ -7921,7 +8033,9 @@ mod tests
         let owner = l.insert_process(1, NodeSpec::TOP).unwrap();
         let rec = l.insert_process(2, NodeSpec::TOP).unwrap();
         let parent = l.record(owner).unwrap().budget;
-        let h = l.create_sub_node(owner, parent, NO_MAX, KEY_A).unwrap();
+        let h = l
+            .create_sub_node(owner, parent, NO_MAX, KEY_A, Membership::Outside)
+            .unwrap();
         assert_eq!(l.set_limit(h, rec, 40, 1), Ok(0));
         let free = l.arena.free_count();
         assert_eq!(l.set_donation_end(rec, 50, 4), Ok(0));
@@ -7946,7 +8060,9 @@ mod tests
         let owner = l.insert_process(1, NodeSpec::TOP).unwrap();
         let rec = l.insert_process(2, NodeSpec::TOP).unwrap();
         let parent = l.record(owner).unwrap().budget;
-        let h = l.create_sub_node(owner, parent, NO_MAX, KEY_A).unwrap();
+        let h = l
+            .create_sub_node(owner, parent, NO_MAX, KEY_A, Membership::Outside)
+            .unwrap();
         let sub = l.handle(h).unwrap().node;
         let charged = l.push_grant(rec, 1, 1, 0x1000, UNMAPPED, sub).unwrap();
         let plain = l

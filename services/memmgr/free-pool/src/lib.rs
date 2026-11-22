@@ -57,8 +57,8 @@ pub use disk::{
 pub use fill::{FILL_CHUNKS, FillChunk, FillPath, fill_chunks, fill_path};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};
 pub use ledger::{
-    BackError, ClockHand, Commit, Ledger, RegionError, ResizeError, SWEEP_SPAN_CHUNKS, SealError,
-    SwapError, Victim,
+    BackError, ClockHand, Commit, Ledger, Membership, RegionError, ResizeError, SWEEP_SPAN_CHUNKS,
+    SealError, SwapError, Victim,
 };
 pub use object_va::ObjectVa;
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};

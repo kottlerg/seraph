@@ -41,6 +41,9 @@ pub const SYSTEM_RESERVE_DIVISOR: u64 = 64;
 /// [`BudgetNode::flags`] bit: the node is in the system reserve.
 const FLAG_RESERVE: u32 = 1 << 0;
 
+/// [`BudgetNode::flags`] bit: the node keeps a finite max ([`set_bounded`]).
+const FLAG_BOUNDED: u32 = 1 << 1;
+
 /// The least weight a node takes ([`set_reclaim`]): the eviction clock
 /// reclaims from it fastest.
 pub const WEIGHT_MIN: u32 = 1;
@@ -139,7 +142,7 @@ pub struct BudgetNode
     /// slot, and a [`NodeIdx`] is a `u64`, so the count cannot pass
     /// `u64::MAX`.
     pub refs: u64,
-    /// [`FLAG_RESERVE`].
+    /// [`FLAG_RESERVE`] and [`FLAG_BOUNDED`].
     pub flags: u32,
 }
 
@@ -150,6 +153,13 @@ impl BudgetNode
     pub const fn reserve(&self) -> bool
     {
         self.flags & FLAG_RESERVE != 0
+    }
+
+    /// Whether the node keeps a finite max ([`set_bounded`]).
+    #[must_use]
+    pub const fn bounded(&self) -> bool
+    {
+        self.flags & FLAG_BOUNDED != 0
     }
 }
 
@@ -494,6 +504,19 @@ pub fn clamp_max<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx, max: u64) -> u64
 pub const fn at_limit(b: &BudgetNode, refused: u64) -> bool
 {
     b.max != NO_MAX && (b.subtree >= b.max || b.subtree.saturating_add(refused) > b.max)
+}
+
+/// Mark the node `idx` as one that keeps a finite max: a reserve sub-node,
+/// whose max bounds what its subtree can take of the reserve
+/// ([`crate::Ledger::create_sub_node`]), so no later max lifts the bound
+/// ([`crate::Ledger::set_node_max`]).
+pub fn set_bounded<S: SlotStore>(arena: &mut Arena<S>, idx: NodeIdx)
+{
+    if let Some(mut b) = node(arena, idx)
+    {
+        b.flags |= FLAG_BOUNDED;
+        arena.set_node(idx, Node::Budget(b));
+    }
 }
 
 /// Set the max of the node `idx`. A max below the subtree's usage reclaims

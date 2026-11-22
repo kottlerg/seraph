@@ -41,6 +41,16 @@ const FILE_CAP_CALL_TIMEOUT_MS: u32 = 10_000;
 /// count.
 const RELEASE_IDS_PER_CALL: usize = MSG_DATA_WORDS_MAX - 1;
 
+/// The memmgr account a read is granted and charged on.
+#[derive(Clone, Copy)]
+pub struct Account
+{
+    /// A memmgr SEND whose badge names the account's process.
+    pub memmgr: u64,
+    /// Whether that process's budget node is a system-reserve node.
+    pub reserve: bool,
+}
+
 /// How the frames of an [`ImageBuffer`] are granted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Shape
@@ -475,14 +485,15 @@ pub fn read_file(
     self_aspace: u64,
     node_cap: u64,
     len: u64,
-    memmgr: u64,
+    account: Account,
     ipc_buf: *mut u64,
     shape: Shape,
 ) -> Result<ImageBuffer, u64>
 {
+    let memmgr = account.memmgr;
     // Dropped after the open, which closes first: the session ends with no
     // open in it.
-    let (mut session, session_cap) = match ReadSession::start(node_cap, memmgr, ipc_buf)
+    let (mut session, session_cap) = match ReadSession::start(node_cap, account, ipc_buf)
     {
         Ok(started) => started,
         Err(code) =>
@@ -711,14 +722,13 @@ struct ReadSession
 
 impl ReadSession
 {
-    /// Make the sub-node on `memmgr` (`CREATE_SUB_NODE`, attributed by that
-    /// SEND's badge to its account), a charge-only handle to it
+    /// Make the sub-node on `account` ([`create_node`]), a charge-only handle to it
     /// (`NODE_CHARGE_HANDLE`), and send it in `FS_SESSION` on `node_cap`.
     /// Returns the session and the session cap, which the open moves to the
     /// server. Every cap of a failure is deleted and the sub-node released.
-    fn start(node_cap: u64, memmgr: u64, ipc_buf: *mut u64) -> Result<(Self, u64), u64>
+    fn start(node_cap: u64, account: Account, ipc_buf: *mut u64) -> Result<(Self, u64), u64>
     {
-        let node = create_node(memmgr, ipc_buf)?;
+        let node = create_node(account, ipc_buf)?;
         let mut session = Self { node, liveness: 0 };
         let Some(charge) = node_call_cap(node, memmgr_labels::NODE_CHARGE_HANDLE, ipc_buf)
         else
@@ -770,16 +780,28 @@ impl ReadSession
 }
 
 /// Make a sub-node with a max of
-/// [`process_table::fs_reads::READ_SESSION_MAX_PAGES`] on the account of the
-/// memmgr SEND `memmgr` (`CREATE_SUB_NODE`); its full handle. memmgr's
-/// refusal is answered as a refusal of the buffer's pages is.
-fn create_node(memmgr: u64, ipc_buf: *mut u64) -> Result<u64, u64>
+/// [`process_table::fs_reads::READ_SESSION_MAX_PAGES`] on `account`
+/// (`CREATE_SUB_NODE`), in the system reserve when the account's node is a
+/// reserve node (`SUB_NODE_RESERVE`), so a reserve child's create, or a
+/// reserve sender's read, is backed from the reserve as its own pages are;
+/// its full handle. memmgr's refusal is answered as a refusal of the
+/// buffer's pages is.
+fn create_node(account: Account, ipc_buf: *mut u64) -> Result<u64, u64>
 {
+    let flags = if account.reserve
+    {
+        memmgr_labels::SUB_NODE_RESERVE
+    }
+    else
+    {
+        0
+    };
     let msg = IpcMessage::builder(memmgr_labels::CREATE_SUB_NODE)
         .word(0, process_table::fs_reads::READ_SESSION_MAX_PAGES)
+        .word(1, flags)
         .build();
     // SAFETY: `ipc_buf` is the calling thread's registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(memmgr, &msg, ipc_buf) }
+    let reply = unsafe { ipc::ipc_call(account.memmgr, &msg, ipc_buf) }
         .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     match (reply.label, reply.caps())
     {

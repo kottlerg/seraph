@@ -190,6 +190,7 @@ rootfs/config/svcmgr/
 │   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
 │   ├── crasher-boot.svc      # death-before-bootstrap fixture; co-staged with svctest
 │   ├── memhog.svc            # out-of-memory policy fixture; co-staged with svctest
+│   ├── reserve-creator.svc   # reserve-creator fixture; co-staged with svctest
 │   ├── stopsrc.svc           # stop-source fixture; co-staged with svctest
 │   ├── crashd.svc            # crashd naming crashme, holding 3 s; co-staged with usertest
 │   ├── debug-echo.svc        # debug-port fixture; staged by `debug-port` case
@@ -1723,7 +1724,7 @@ cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
     sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/crasher-boot.svc \
     sysroot/config/svcmgr/tests/memhog.svc sysroot/config/svcmgr/tests/stopsrc.svc \
-    sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/reserve-creator.svc sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
@@ -1761,7 +1762,7 @@ cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
     sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/crasher-boot.svc \
     sysroot/config/svcmgr/tests/memhog.svc sysroot/config/svcmgr/tests/stopsrc.svc \
-    sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/reserve-creator.svc sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only

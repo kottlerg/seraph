@@ -240,8 +240,11 @@ impl PageStore for SessionPages
 /// and a copy of the handle). The `fs_errors` code the request that needed
 /// the page is answered when memmgr gives none: `LIMIT` at the max of the
 /// node or an ancestor, `INVALID_ARGUMENT` for a handle memmgr refuses,
-/// `TOO_MANY_OPEN` when fatfs's `CSpace` has no slot for the copy, and
-/// `IO_ERROR` when memmgr has no page or the call fails.
+/// `OUT_OF_MEMORY` when memmgr refuses the page for want of memory (the
+/// free pool at a floor the node may not take, as outside the system reserve
+/// while memory is critical), `TOO_MANY_OPEN` when fatfs's `CSpace` has no
+/// slot for the copy, and `IO_ERROR` when the call fails or the reply
+/// carries no usable page.
 pub fn request_page(handle: u64, ipc_buf: *mut u64) -> Result<Grant, u64>
 {
     let info = startup_info();
@@ -266,6 +269,10 @@ pub fn request_page(handle: u64, ipc_buf: *mut u64) -> Result<Grant, u64>
         {}
         memmgr_errors::LIMIT => return Err(fs_errors::LIMIT),
         memmgr_errors::INVALID_ARGUMENT => return Err(fs_errors::INVALID_ARGUMENT),
+        memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS | memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT =>
+        {
+            return Err(fs_errors::OUT_OF_MEMORY);
+        }
         _ => return Err(fs_errors::IO_ERROR),
     }
     let cap = reply.caps().first().copied();

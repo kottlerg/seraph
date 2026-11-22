@@ -177,10 +177,11 @@ pub const FS_TRUNCATE: u64 = 17;
 /// endpoint, or memmgr refuses the session's handle), `INVALID_BADGE` (no such node, a directory, or a `caps[0]` on
 /// the driver's endpoint that names no live session), `PERMISSION_DENIED`,
 /// `LIMIT` (the session needs a page its node's max refuses),
-/// `TOO_MANY_OPEN` (the driver's open ids are spent, or its heap or
-/// `CSpace` cannot grow), `IO_ERROR` (the driver could not mint the open
-/// cap, or memmgr has no page for the session). Every refusal deletes the
-/// carried caps. Specified in
+/// `OUT_OF_MEMORY` (the session needs a page memmgr refuses for want of
+/// memory), `TOO_MANY_OPEN` (the driver's open ids are spent, or its heap
+/// or `CSpace` cannot grow), `IO_ERROR` (the driver could not mint the open
+/// cap, or memmgr's call fails or its reply carries no usable page). Every
+/// refusal deletes the carried caps. Specified in
 /// `services/fs/docs/fs-driver-protocol.md` § Label 18: `FS_OPEN`.
 pub const FS_OPEN: u64 = 18;
 /// Start a filesystem session: the records of the opens made in it live in
@@ -203,10 +204,11 @@ pub const FS_OPEN: u64 = 18;
 /// while that process, or another, holds a copy of the liveness cap.
 /// Errors: `INVALID_BADGE` (an open cap or a session cap),
 /// `PERMISSION_DENIED`, `INVALID_ARGUMENT` (no handle, or memmgr refuses
-/// it), `LIMIT` (the node's max refuses the first page), `IO_ERROR`
-/// (memmgr has no page), `TOO_MANY_OPEN` (the driver's session ids are
-/// spent, or its heap or `CSpace` cannot grow, or it cannot create the
-/// liveness object). Every refusal deletes the handle. Specified in
+/// it), `LIMIT` (the node's max refuses the first page), `OUT_OF_MEMORY`
+/// (memmgr refuses it for want of memory), `IO_ERROR` (memmgr's call fails
+/// or its reply carries no usable page), `TOO_MANY_OPEN` (the driver's
+/// session ids are spent, or its heap or `CSpace` cannot grow, or it cannot
+/// create the liveness object). Every refusal deletes the handle. Specified in
 /// `services/fs/docs/fs-driver-protocol.md` § Label 23: `FS_SESSION`.
 pub const FS_SESSION: u64 = 23;
 /// Unmount: the driver ends its service and exits.

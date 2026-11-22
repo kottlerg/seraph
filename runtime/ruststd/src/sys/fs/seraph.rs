@@ -2168,6 +2168,8 @@ fn map_fs_error(label: u64) -> io::Error
             io::const_error!(io::ErrorKind::QuotaExceeded, "fs: the memory max refuses"),
         fs_errors::INVALID_ARGUMENT =>
             io::const_error!(io::ErrorKind::InvalidInput, "fs: invalid argument"),
+        fs_errors::OUT_OF_MEMORY =>
+            io::const_error!(io::ErrorKind::OutOfMemory, "fs: memory is short"),
         _ => io::Error::other("fs: unknown error"),
     }
 }

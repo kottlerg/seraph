@@ -21,7 +21,9 @@ co-staged with `svctest` wherever `crasher.svc` is. The role takes the provided 
 endpoint from bootstrap slot 0, logs `worker-fault: serving`, and serves
 `ipc::restart_probe_labels`: `PROBE_INSTANCE` replies a per-instance random nonce in word 0, and
 `PROBE_FAULT_WORKER` replies, then receives nothing more while a worker thread takes a terminal
-fault after `FAULT_DELAY_MS` (200 ms), logging `worker-fault: worker thread faulting`. procmgr
+fault after `FAULT_DELAY_MS` (200 ms), logging `worker-fault: worker thread faulting`. The role
+starts that thread before it serves and lets it go on the request, so the fault takes no memory
+when it is asked for, and one asked for while memory is critical still happens. procmgr
 tears the process down, and svcmgr restarts it through its address-space observer; svctest's
 `svcmgr_worker_fault_restart` phase, which runs when this recipe is staged, reads a new nonce from
 the restarted instance. `oom_stop = yes` makes it a service of that boot a stop-authority holder may

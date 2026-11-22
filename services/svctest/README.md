@@ -410,6 +410,21 @@ destroyed memhog, which frees the memory, and serves a stop and a restart on one
 while it restarts logd waits for the restart, and the order of the two lines is the order of the
 restart and the stop, however long the restart takes.
 
+In the same window the `logd_reserve` phase makes three more checks (`critical_creates.rs`), the
+second and third skipped when their fixture is not staged; they share its window because svcmgr
+restarts memhog at most three times a window and the boot's other memhog windows spend them. Before
+the kill, check 1: svctest's own raw `CREATE_FROM_FILE` of `/programs/hello`, outside the reserve,
+must be refused with `OUT_OF_MEMORY` and no other label, the one label svcmgr's memory wait for a
+restart holds; the phase destroys each child it creates, waits for memhog's next tick to take back
+what the destroy freed, and tries up to four times. Check 2 runs when `reserve-creator.svc` is
+staged: the fixture, a service in the system reserve, makes a `CREATE_FROM_FILE | CREATE_RESERVE` of
+`/programs/hello` inside the window, which must succeed. After the kill, check 3 runs when
+`crasher-worker.svc` is staged: the phase has the fixture's worker fault inside the window and
+requires the fixture's next instance to answer, after the window, with a new nonce. Check 3 passes
+whether or not its restart falls in the gap the killed instances' freed frames open before memhog's
+next tick, as for logd above, so it shows the restart is held and made, not that the refusal was
+`OUT_OF_MEMORY`, which check 1 shows.
+
 Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`

@@ -3988,9 +3988,10 @@ fn charge_handle_of(l: &MemLedger, badge: u64) -> Option<(NodeIdx, NodeHandle)>
 
 /// `NODE_SET_MAX`: set the max of the handle's node to `data[0]`, clamped to
 /// its usage plus its parent chain's headroom, and reply the max it took
-/// (services/memmgr/docs/ipc-interface.md § Label 14). Lowering it reclaims
-/// and kills nothing; a max at or below the usage signals the node's limit
-/// event ([`signal_limits`]).
+/// (services/memmgr/docs/ipc-interface.md § Label 14), and on a reserve
+/// sub-node first to its current max, which keeps its bound on the reserve.
+/// Lowering it reclaims and kills nothing; a max at or below the usage
+/// signals the node's limit event ([`signal_limits`]).
 fn handle_node_set_max(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let l = ledger_mut();
@@ -4052,7 +4053,9 @@ fn handle_node_set_reclaim(req: &IpcMessage, ipc_buf: *mut u64)
 
 /// `NODE_CREATE` on a node handle and `CREATE_SUB_NODE` on a process badge:
 /// make a sub-node, with the max `data[0]` clamped to the parent chain's
-/// headroom, under the handle's node or the caller's own, and reply its max
+/// headroom, under the handle's node or the caller's own, in the system
+/// reserve when `data[1]` sets `SUB_NODE_RESERVE` (a reserve parent and a
+/// finite max required; any other flag bit refused), and reply its max
 /// and a handle to it (services/memmgr/docs/ipc-interface.md § Label 15,
 /// § Label 19). The sub-node's handle state is owned by the owner of the
 /// handle's state, or by the caller, and goes when that process does or on
@@ -4077,7 +4080,8 @@ fn handle_create_sub_node(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
                 .map_or(NODE_NULL, |r| r.budget),
         )
     };
-    let Some(owner) = owner
+    let flags = req.word(1);
+    let Some(owner) = owner.filter(|_| flags & !memmgr_labels::SUB_NODE_RESERVE == 0)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -4095,7 +4099,15 @@ fn handle_create_sub_node(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
         reply_label(ipc_buf, memmgr_errors::QUOTA);
         return;
     }
-    let h = match l.create_sub_node(owner, parent, req.word(0), key)
+    let membership = if flags & memmgr_labels::SUB_NODE_RESERVE == 0
+    {
+        free_pool::Membership::Outside
+    }
+    else
+    {
+        free_pool::Membership::Reserve
+    };
+    let h = match l.create_sub_node(owner, parent, req.word(0), key, membership)
     {
         Ok(h) => h,
         Err(NodeError::Parent) =>

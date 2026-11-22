@@ -68,6 +68,7 @@ pub mod budget;
 pub mod charge_node;
 pub mod checkpoint;
 pub mod crash;
+pub mod critical_creates;
 pub mod devmgr;
 pub mod discard;
 pub mod drivers;

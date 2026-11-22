@@ -23,8 +23,9 @@
 # devmgr.class.test-dma and devmgr.class.test-fault reach the test-only
 # fixtures, and devmgr.class.{serial,input,framebuffer}-deny are SENDs on
 # those classes whose only verb bit (58) no such driver checks, which the
-# drivers deny phase sends the gated labels on, and the logd_sinks phase
-# waits on framebuffer-deny for the killed framebuffer driver's
+# drivers deny phase sends the gated labels on; the drivers stray-cap
+# phase floods the framebuffer driver through framebuffer-deny, and the
+# logd_sinks phase waits on it for the killed framebuffer driver's
 # withdrawal. Their class files live in
 # /config/devmgr/tests/, which svcmgr does not scan, and are copied into
 # /config/devmgr/classes/ with this recipe; the fixtures' devices are
@@ -50,7 +51,11 @@
 # registration would replace swapd's.
 # devmgr.class.rtc is the class SEND the rtc_create_retry phase queries
 # for devmgr's service of the RTC driver its create retry started, before
-# the timed_rtc_restart phase kills that driver.
+# the timed_rtc_restart phase kills that driver, and the drivers stray-cap
+# phase floods the RTC driver through.
+# svcmgr.grant is a SEND|GRANT on svcmgr's own service endpoint with no
+# verb bit, svctest's test twin: the svcmgr_stray_cap_flood phase sends
+# requests carrying caps through it, which svcmgr must delete.
 # svctest resolves the public pwrmgr.deny no-auth twin itself via
 # QUERY_ENDPOINT. debug_authority = yes delivers procmgr's
 # DEBUG_AUTHORITY SEND|GRANT in the slot after the seeds, and svctest,
@@ -84,6 +89,6 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny memmgr.swap devmgr.class.rtc
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny memmgr.swap devmgr.class.rtc svcmgr.grant
 debug_authority = yes
 stop_authority  = yes

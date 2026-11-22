@@ -29,6 +29,10 @@ pub fn phases() -> &'static [Phase]
             run: svcmgr_published_send_badged_phase,
         },
         Phase {
+            name: "svcmgr_stray_cap_flood",
+            run: svcmgr_stray_cap_flood_phase,
+        },
+        Phase {
             name: "svcmgr_seed_only_names_refused",
             run: svcmgr_seed_only_names_refused_phase,
         },
@@ -544,7 +548,7 @@ fn check_source_contained(authority: u64, phase: &str)
     use ipc::stopsrc_labels as src;
     assert_ne!(
         authority, 0,
-        "{phase}: no debug-authority cap in slot 20 (debug_authority = yes)"
+        "{phase}: no debug-authority cap in slot 21 (debug_authority = yes)"
     );
     let fixture = provided_endpoint(src::NAME, phase);
     let before = badges_named(authority, STOPSRC_PATH);
@@ -623,7 +627,7 @@ fn svcmgr_stop_service_phase(caps: &Caps)
     let stop_cap = caps.stop_authority;
     assert_ne!(
         stop_cap, 0,
-        "{phase}: no stop-authority cap in slot 21 (stop_authority = yes)"
+        "{phase}: no stop-authority cap in slot 22 (stop_authority = yes)"
     );
 
     for (label, want, what) in [
@@ -858,6 +862,134 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
     std::os::seraph::log!("svcmgr published-send phase passed (badged, no PUBLISH_AUTHORITY)");
 }
 
+/// Calls of one stray-cap case. Each call through a svcmgr that kept the
+/// caps a request carries leaves `MSG_CAP_SLOTS_MAX` slots taken in its
+/// `CSpace`, so the calls outnumber the slots svcmgr holds free, which it
+/// grows only when it spawns a thread, with margin.
+const STRAY_CAP_CALLS: usize = 512;
+
+/// A request on `svcmgr.grant`, sent with `MSG_CAP_SLOTS_MAX` caps, and the
+/// reply label it must get.
+struct StrayCapCase
+{
+    label: u64,
+    name: &'static [u8],
+    expected: u64,
+    what: &'static str,
+}
+
+/// One case per path that answers without taking a cap: every label
+/// svcmgr serves, through a badge that carries no verb bit, and a label it
+/// does not serve. `PUBLISH_ENDPOINT`, the one label that takes a cap,
+/// refuses the badge and deletes the cap it would have stored.
+const STRAY_CAP_CASES: [StrayCapCase; 7] = [
+    StrayCapCase {
+        label: 0x7FFF,
+        name: b"",
+        expected: ipc::svcmgr_errors::UNKNOWN_OPCODE,
+        what: "unknown label",
+    },
+    StrayCapCase {
+        label: ipc::svcmgr_labels::HANDOVER_COMPLETE,
+        name: b"",
+        expected: ipc::svcmgr_errors::UNAUTHORIZED,
+        what: "HANDOVER_COMPLETE",
+    },
+    StrayCapCase {
+        label: ipc::svcmgr_labels::PUBLISH_ENDPOINT,
+        name: b"svctest.stray",
+        expected: ipc::svcmgr_errors::UNAUTHORIZED,
+        what: "PUBLISH_ENDPOINT",
+    },
+    StrayCapCase {
+        label: ipc::svcmgr_labels::QUERY_ENDPOINT,
+        name: b"svctest.stray",
+        expected: ipc::svcmgr_errors::UNKNOWN_NAME,
+        what: "QUERY_ENDPOINT",
+    },
+    StrayCapCase {
+        label: ipc::stop_labels::STOP_CANDIDATE,
+        name: b"",
+        expected: ipc::stop_labels::UNAUTHORIZED,
+        what: "STOP_CANDIDATE",
+    },
+    StrayCapCase {
+        label: ipc::stop_labels::LIST_CANDIDATES,
+        name: b"",
+        expected: ipc::stop_labels::UNAUTHORIZED,
+        what: "LIST_CANDIDATES",
+    },
+    StrayCapCase {
+        label: ipc::svcmgr_labels::LIST_STOP_SOURCES,
+        name: b"",
+        expected: ipc::svcmgr_errors::UNAUTHORIZED,
+        what: "LIST_STOP_SOURCES",
+    },
+];
+
+/// svcmgr deletes every cap a request carries but the one
+/// `PUBLISH_ENDPOINT` stores: each [`STRAY_CAP_CASES`] case is sent
+/// [`STRAY_CAP_CALLS`] times on the `svcmgr.grant` seed (`caps[20]`), the
+/// one `SEND|GRANT` svctest holds on svcmgr's endpoint, each call carrying
+/// `MSG_CAP_SLOTS_MAX` stray SENDs, and must get the case's reply, carry no
+/// cap back, and move every cap out of svctest's `CSpace`.
+///
+/// A svcmgr that kept them runs out of `CSpace` slots within one case. Its
+/// receive then fails before it parks (`SYS_IPC_RECV`'s `OutOfMemory`), and
+/// its `RecvGuard` ends it (docs/ipc-design.md § Receive-Failure Policy):
+/// the call in flight is never answered, and svcmgr's death is a system
+/// death (docs/supervision.md § Core Set and System Death), so the boot
+/// ends without its pass marker, or its run timeout classifies it a `HANG`.
+fn svcmgr_stray_cap_flood_phase(caps: &Caps)
+{
+    let grant = caps.svcmgr_grant;
+    assert_ne!(grant, 0, "svcmgr stray caps: no svcmgr.grant seed");
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    for case in &STRAY_CAP_CASES
+    {
+        let what = case.what;
+        let label = case.label | ((case.name.len() as u64) << 16);
+        for call in 0..STRAY_CAP_CALLS
+        {
+            let mut sent = [0u64; syscall_abi::MSG_CAP_SLOTS_MAX];
+            for stray in &mut sent
+            {
+                *stray = syscall::cap_derive(grant, syscall::RIGHTS_EP_SEND)
+                    .expect("cap_derive of a stray cap");
+            }
+            let mut builder = ipc::IpcMessage::builder(label).bytes(0, case.name);
+            for &cap in &sent
+            {
+                builder = builder.cap(cap);
+            }
+            // SAFETY: ipc_buf is the registered IPC buffer.
+            let reply = unsafe { ipc::ipc_call(grant, &builder.build(), ipc_buf) }
+                .unwrap_or_else(|_| panic!("svcmgr {what} call {call}: ipc_call failed"));
+            assert_eq!(
+                reply.label, case.expected,
+                "svcmgr {what} call {call}: reply label"
+            );
+            assert!(
+                reply.caps().is_empty(),
+                "svcmgr {what} call {call}: reply carried a cap"
+            );
+            // No cap is created between the call and this check, so an empty
+            // slot is the moved cap, not a reused slot.
+            for &cap in &sent
+            {
+                assert!(
+                    syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS).is_err(),
+                    "svcmgr {what} call {call}: a cap it carried stayed with svctest"
+                );
+            }
+        }
+    }
+    std::os::seraph::log!(
+        "svcmgr stray-cap phase passed ({} cases, {STRAY_CAP_CALLS} calls each)",
+        STRAY_CAP_CASES.len()
+    );
+}
+
 /// The names `svcmgr_seed_only_names_refused_phase` checks `QUERY_ENDPOINT`
 /// refuses: every seed-only name.
 const SEED_ONLY_NAMES: &[&[u8]] = &[
@@ -870,6 +1002,7 @@ const SEED_ONLY_NAMES: &[&[u8]] = &[
     ipc::published_names::DEVMGR_ACPI,
     ipc::published_names::VFSD_MOUNT,
     ipc::published_names::VFSD_DENY,
+    ipc::published_names::SVCMGR_GRANT,
     ipc::published_names::VFSD_SWAP,
     ipc::published_names::MEMMGR_SWAP,
     ipc::published_names::LOGD_QUERY,
@@ -898,7 +1031,7 @@ const PUBLIC_NAMES: &[&[u8]] = &[
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show nineteen of the refused names are
+/// cap. svctest's own non-zero seeds show twenty of the refused names are
 /// published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.acpi`,
 /// which only acpid seeds, are published by the same loop as
 /// `devmgr.registry` and `devmgr.bind`, `acpid.power`,
@@ -931,6 +1064,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         (caps.hwrng_deny_class, "devmgr.class.hwrng-deny"),
         (caps.memmgr_swap, "memmgr.swap"),
         (caps.rtc_class, "devmgr.class.rtc"),
+        (caps.svcmgr_grant, "svcmgr.grant"),
     ]
     {
         assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");

@@ -80,7 +80,9 @@ devmgr creates it with its install path `/services/drivers/framebuffer` as its
 ## Messages
 
 Two synchronous operations. Labels are defined in `shared/ipc::fb_labels`;
-error codes in `shared/ipc::fb_errors`.
+error codes in `shared/ipc::fb_errors`. No label takes a cap: the driver deletes every cap a
+request carries, which the client's `SEND_GRANT` lets it carry, before it serves the request,
+whatever the label or badge.
 
 ### Label 1: `FB_WRITE_BYTES`
 

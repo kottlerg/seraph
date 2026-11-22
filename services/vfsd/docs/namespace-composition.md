@@ -436,7 +436,11 @@ vfsd holds two un-badged endpoints:
   itself. The same endpoint is the kernel-derivation parent for every
   system-root cap vfsd ever
   issues via `cap_derive_badge` (the synthetic root cap, plus a
-  fresh cap per synthetic intermediate descent).
+  fresh cap per synthetic intermediate descent). No request on it
+  carries a cap; the dispatcher deletes every cap a request carries
+  before it serves or refuses it, whatever its label. Such a cap arrives
+  only through a synthetic intermediate's cap, minted `SEND_GRANT`: the
+  system-root cap is `SEND` alone.
 
 At startup vfsd spawns the namespace dispatcher first, then self-mounts
 root, `/esp`, and `/data`, then spawns the service threads, and its

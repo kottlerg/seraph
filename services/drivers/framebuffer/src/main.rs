@@ -260,6 +260,13 @@ fn service_loop(service_ep: u64, mut writer: render::FramebufferWriter, ipc_buf:
             }
         };
         guard.on_success();
+        // No label takes a cap: delete every cap the request carries before
+        // it is served, a refused badge's and an unknown label's included. A
+        // cap left here would take a slot of this driver's `CSpace` for good.
+        for &cap in msg.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
         handle_request(&msg, &mut writer, &mut decoder, ipc_buf);
     }
 }

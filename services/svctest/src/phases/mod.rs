@@ -34,7 +34,8 @@
 //!    die and retire theirs, and polls until logd has drained the death.
 //! 8. [`unmount`] after every phase that uses `/data` or the cwd: it
 //!    unmounts the data partition, killing every cap on it, before it
-//!    mounts it again and sets the cwd to it again.
+//!    mounts it again and sets the cwd to it again. [`vfsd_caps`] after it,
+//!    for the same reason.
 //! 9. [`logd_restart`] after every phase that reads logd's slots or
 //!    history before it ([`procmgr::logd_forward`], [`log_client`]): it
 //!    kills logd, whose next instance holds a fresh table, and runs the
@@ -122,6 +123,7 @@ pub mod timed;
 pub mod unmount;
 pub mod verified_read;
 pub mod vfsd;
+pub mod vfsd_caps;
 
 /// Ordered phase list. Order encodes cross-module dependencies (see
 /// module-level docstring above).
@@ -191,6 +193,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());
     out.extend_from_slice(unmount::phases());
+    out.extend_from_slice(vfsd_caps::phases());
     out.extend_from_slice(procmgr::init_reap());
     out.extend_from_slice(memmgr::identity());
     out

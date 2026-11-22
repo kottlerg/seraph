@@ -74,7 +74,7 @@ const ROLE_DATA: u64 = 1;
 /// A directory of the root filesystem that svcmgr does not scan (its recipes
 /// are staged from it at build time), over which the data partition is
 /// mounted to show the fall-through to a directory that exists.
-const SHADOWED_DIR: &str = "/config/svcmgr/tests";
+pub(super) const SHADOWED_DIR: &str = "/config/svcmgr/tests";
 
 /// A file of [`SHADOWED_DIR`] on the root filesystem.
 const SHADOWED_FILE: &str = "/config/svcmgr/tests/svctest.svc";
@@ -89,7 +89,7 @@ const MAPPED_BYTES: usize = 16;
 const FORCED: u64 = ipc::vfsd_labels::UNMOUNT_FORCE;
 
 /// The label flags of an unforced `UNMOUNT`.
-const UNFORCED: u64 = 0;
+pub(super) const UNFORCED: u64 = 0;
 
 /// An `UNMOUNT` request for `path` with the label flags `flags`
 /// ([`FORCED`] or [`UNFORCED`]), carrying `version` and `path_len` as stated.
@@ -103,7 +103,7 @@ fn unmount_request(path: &[u8], path_len: u64, version: u64, flags: u64) -> ipc:
 }
 
 /// Send `UNMOUNT` of `path` on `cap` and return the reply.
-fn unmount(cap: u64, path: &str, flags: u64) -> ipc::IpcMessage
+pub(super) fn unmount(cap: u64, path: &str, flags: u64) -> ipc::IpcMessage
 {
     let msg = unmount_request(
         path.as_bytes(),
@@ -128,7 +128,7 @@ fn call(cap: u64, msg: &ipc::IpcMessage, what: &str) -> ipc::IpcMessage
 
 /// Mount the data partition at `path` through `caps.vfsd_mount`, asserting
 /// `SUCCESS`, and drop the namespace SEND the reply carries.
-fn mount_data(caps: &Caps, path: &str)
+pub(super) fn mount_data(caps: &Caps, path: &str)
 {
     let msg = ipc::IpcMessage::builder(ipc::vfsd_labels::MOUNT)
         .word(0, ROLE_DATA)
@@ -152,7 +152,7 @@ fn mount_data(caps: &Caps, path: &str)
 }
 
 /// Force-unmount `/data`, asserting `SUCCESS`.
-fn force_unmount_data(caps: &Caps)
+pub(super) fn force_unmount_data(caps: &Caps)
 {
     let reply = unmount(caps.vfsd_mount, "/data", FORCED);
     assert_eq!(

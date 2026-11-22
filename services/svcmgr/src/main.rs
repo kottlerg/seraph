@@ -327,6 +327,20 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
         }
         Err(_) => std::os::seraph::log!(warn: "derive svcmgr SEND failed"),
     }
+    // svcmgr.grant — the published `svcmgr` SEND's badge on a `SEND|GRANT`:
+    // no verb bit, so every label it reaches answers as through `svcmgr`,
+    // but its requests can carry caps, which `dispatch_ipc` deletes.
+    // Seed-only, its seeds keeping `GRANT`, and seeded by svctest alone, as
+    // the test twin that drives that deletion; besides it only devmgr's
+    // `PUBLISH_AUTHORITY` SEND can carry a cap to this endpoint.
+    publish_minted_send(
+        registry,
+        caps.service_ep,
+        "svcmgr service",
+        ipc::published_names::SVCMGR_GRANT,
+        svcmgr_labels::PUBLISHED_SEND_BADGE,
+        Visibility::SeedOnlyGrant,
+    );
 
     // devmgr.registry / devmgr.shutdown / devmgr.bind / devmgr.acpi — badged SENDs minted
     // from the endowed badge-0 `SEND|GRANT` source. The badge bits ride
@@ -882,6 +896,16 @@ fn dispatch_ipc(
     guard.on_success();
 
     let opcode = msg.label & 0xFFFF;
+    // A request delivers caps into svcmgr's `CSpace` before it is served,
+    // whatever its label or badge; a cap left there takes a slot for
+    // svcmgr's lifetime. Delete every cap past those the label takes, here,
+    // so no handler or reply path can keep one: only `PUBLISH_ENDPOINT`
+    // takes a cap (`caps[0]`), which its handler stores or deletes.
+    let taken = usize::from(opcode == svcmgr_labels::PUBLISH_ENDPOINT);
+    for &cap in msg.caps().iter().skip(taken)
+    {
+        let _ = syscall::cap_delete(cap);
+    }
     match opcode
     {
         svcmgr_labels::HANDOVER_COMPLETE =>
@@ -957,23 +981,11 @@ fn dispatch_ipc(
 
 /// Handle `PUBLISH_ENDPOINT`: add a `name → cap` mapping to the discovery
 /// registry. The name is packed into data words 0.. per
-/// [`read_name_from_msg`]; the cap arrives as the first received cap.
+/// [`read_name_from_msg`]; the cap arrives as the first received cap, and
+/// [`dispatch_ipc`] has deleted any past it. Every reject path deletes it.
 fn handle_publish_endpoint(msg: &IpcMessage, registry: &mut registry::Registry) -> u64
 {
-    // IPC delivers caps into svcmgr's CSpace before dispatch — every
-    // reject path must release the delivered value cap, otherwise a
-    // hostile or buggy publisher can leak a cap per call. The wire
-    // only carries one cap; release every trailing slot the caller
-    // may have delivered defensively.
-    let recv_caps = msg.caps();
-    let delivered_cap = recv_caps.first().copied().unwrap_or(0);
-    for &extra in recv_caps.iter().skip(1)
-    {
-        if extra != 0
-        {
-            let _ = syscall::cap_delete(extra);
-        }
-    }
+    let delivered_cap = msg.caps().first().copied().unwrap_or(0);
     let reject = |code: u64| -> u64 {
         if delivered_cap != 0
         {

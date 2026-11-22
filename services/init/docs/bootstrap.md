@@ -243,7 +243,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     added, gating `QUERY_SHUTDOWN_DEVICE`; pwrmgr is the only recipe
     seeding it.
   - `devmgr.bind` — the same SEND with `BIND_AUTHORITY` added, gating `BIND_DRIVERS`; seed-only,
-    and seeded as `SEND|GRANT`, as only it, `memmgr.swap` and each `:grant` name
+    and seeded as `SEND|GRANT`, as only it, `memmgr.swap`, `svcmgr.grant` and each `:grant` name
     (`sessiond.operator`, `crashd.core`) are,
     since `BIND_DRIVERS` moves a directory cap and the kernel requires `GRANT` for a cap
     transfer. svctest is the only recipe seeding it.
@@ -290,8 +290,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   `QUERY_ENDPOINT` refuses them, so each badge reaches only the recipes that seed the name
   ([svcmgr IPC interface § Label 4](../../svcmgr/docs/ipc-interface.md#label-4-query_endpoint)).
   `QUERY_ENDPOINT` never yields `GRANT` for any name; a seed is `SEND` except those of
-  `devmgr.bind` and of each `:grant` name (`sessiond.operator`, `crashd.core`), which are
-  `SEND|GRANT`.
+  `devmgr.bind`, `memmgr.swap`, `svcmgr.grant` and each `:grant` name (`sessiond.operator`,
+  `crashd.core`), which are `SEND|GRANT`.
 
   `pwrmgr.shutdown`, `pwrmgr.deny`, `acpid.power`, `acpid.deny`, and `timed` are published by
   svcmgr's provider path on each provider's launch (see

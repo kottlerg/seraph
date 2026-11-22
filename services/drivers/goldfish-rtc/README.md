@@ -66,6 +66,10 @@ endpoint only after the report, and withdraws it when the driver dies.
   [`rtc_errors`](../../../shared/ipc/src/rtc_errors.rs) status code; on
   `SUCCESS`, `data[0]` is `u64` microseconds since the Unix epoch.
 
+No label takes a cap. devmgr's client SENDs carry `GRANT`, so a request can carry caps; the
+driver deletes every cap a request carries before it serves it, whatever the label or badge, and
+any other label is answered `rtc_errors::UNKNOWN_OPCODE`.
+
 ---
 
 ## Hardware Notes

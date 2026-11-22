@@ -1454,6 +1454,25 @@ pub const fn memmgr_refusal(label: u64) -> u64
     }
 }
 
+/// The create's reply code for a page of the child's stack or IPC buffer
+/// that procmgr could not have or map, given the procmgr code `code` the
+/// allocation or the mapping failed with: `LIMIT` stays, so a creator whose
+/// max is too small for the stack tells that from the system's shortage
+/// ([`memmgr_refusal`]), and every other failure, a refused derivation or
+/// mapping among them, is `OUT_OF_MEMORY`.
+#[must_use]
+pub const fn stack_page_refusal(code: u64) -> u64
+{
+    if code == ipc::procmgr_errors::LIMIT
+    {
+        code
+    }
+    else
+    {
+        ipc::procmgr_errors::OUT_OF_MEMORY
+    }
+}
+
 /// Why [`child_budget`] or [`decode_memory_max`] refused a create request,
 /// which procmgr answers with `INVALID_ARGUMENT`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3420,6 +3439,28 @@ mod tests
             );
         }
         assert_ne!(procmgr_errors::LIMIT, procmgr_errors::OUT_OF_MEMORY);
+    }
+
+    #[test]
+    fn a_stack_page_refused_for_a_max_answers_limit_and_every_other_failure_out_of_memory()
+    {
+        use ipc::{memmgr_errors, procmgr_errors};
+        assert_eq!(
+            stack_page_refusal(memmgr_refusal(memmgr_errors::LIMIT)),
+            procmgr_errors::LIMIT
+        );
+        for code in [
+            procmgr_errors::OUT_OF_MEMORY,
+            procmgr_errors::MAP_FAILED,
+            procmgr_errors::INSUFFICIENT_RIGHTS,
+        ]
+        {
+            assert_eq!(
+                stack_page_refusal(code),
+                procmgr_errors::OUT_OF_MEMORY,
+                "procmgr code {code}"
+            );
+        }
     }
 
     #[test]

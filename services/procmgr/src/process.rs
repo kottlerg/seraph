@@ -2014,9 +2014,10 @@ unsafe fn prepare_main_tls_restored(
 /// at the layout's addresses.
 ///
 /// # Errors
-/// `fill`'s code; `OUT_OF_MEMORY` for a stack or IPC-buffer page that
-/// cannot be had or mapped, as [`map_child_stack_and_ipc`]'s caller
-/// answers it.
+/// `fill`'s code; for a stack or IPC-buffer page that cannot be had or
+/// mapped, `LIMIT` when the max of the child's node or of an ancestor
+/// refused it and `OUT_OF_MEMORY` otherwise
+/// ([`process_table::stack_page_refusal`]).
 ///
 /// # Safety
 /// As [`map_child_stack_and_ipc`]'s.
@@ -2049,7 +2050,7 @@ unsafe fn map_restored_stack_and_ipc(
             |stack| filled = fill(stack_base, stack),
         )
     }
-    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    .map_err(process_table::stack_page_refusal)?;
     filled?;
     // SAFETY: the caller's contract covers `child_aspace`.
     unsafe {
@@ -2060,7 +2061,7 @@ unsafe fn map_restored_stack_and_ipc(
             layout.ipc_buffer_va,
         )
     }
-    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)
+    .map_err(process_table::stack_page_refusal)
 }
 
 /// Map the child's stack and IPC buffer page: a restored process's
@@ -2068,9 +2069,11 @@ unsafe fn map_restored_stack_and_ipc(
 /// fresh process's is zeroed ([`map_child_stack_and_ipc`]).
 ///
 /// # Errors
-/// `OUT_OF_MEMORY` for a page that cannot be had or mapped, whatever cause
-/// the helper reports (§ Label 1 and § Label 13); the checkpoint's code for
-/// a stack it cannot fill.
+/// For a page that cannot be had or mapped, `LIMIT` when the max of the
+/// child's node or of an ancestor refused it and `OUT_OF_MEMORY` for any
+/// other cause the helper reports ([`process_table::stack_page_refusal`];
+/// § Label 1 and § Label 13); the checkpoint's code for a stack it cannot
+/// fill.
 ///
 /// # Safety
 /// As [`map_child_stack_and_ipc`]'s.
@@ -2109,7 +2112,7 @@ unsafe fn map_stack_and_ipc(
                 layout,
             )
         }
-        .map_err(|_| procmgr_errors::OUT_OF_MEMORY),
+        .map_err(process_table::stack_page_refusal),
     }
 }
 

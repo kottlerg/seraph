@@ -240,17 +240,6 @@ fn main() -> !
         );
         acpi.run(&records, &mut caps, &mut irq_range, &hotplug);
         hotplug.grant(acpi.bridges(), &mut records, &mut caps);
-        restart_iommu_if_due(
-            &registry,
-            &mut bind::Carve {
-                caps: &mut caps,
-                irq_range: &mut irq_range,
-                catalog: &mut catalog,
-                bridges: acpi.bridges(),
-            },
-            &mut watch,
-            ipc_buf,
-        );
         hotplug.run(
             &registry,
             &mut records,
@@ -510,7 +499,8 @@ fn run_jobs(
 /// posted it ([`Jobs::iommu`]) since the pass began: a settle takes the deaths
 /// outside its batch, the IOMMU driver's among them, so a death can post the
 /// restart mid-pass. Called before each step that binds or withdraws, each
-/// of which calls the driver, so none runs while the driver restarts.
+/// hotplug job among them ([`hotplug::Hotplug::run`]), each of which calls
+/// the driver, so none runs while the driver restarts.
 fn restart_iommu_if_due(
     registry: &Registry,
     tables: &mut bind::Carve,

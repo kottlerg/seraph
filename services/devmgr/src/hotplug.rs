@@ -482,6 +482,9 @@ impl Hotplug
     {
         while let Ok(job) = self.jobs.try_recv()
         {
+            // A settle of an earlier job's batch can take the IOMMU driver's
+            // death; its restart runs before this job binds or withdraws.
+            crate::restart_iommu_if_due(registry, carve, watch, ipc_buf);
             let (index, owner, removal) = match job
             {
                 Job::Added(index, owner) => (index, owner, false),

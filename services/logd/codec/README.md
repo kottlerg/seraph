@@ -9,8 +9,9 @@ release-status codes, `MAX_RELEASE_DEFERRALS`, `RELEASE_RETRY_BUDGET_US`, and
 (`HistoryRing`, which packs entries, text lines and log
 records, by length and reads them back by absolute push sequence), and record of names to send
 again (`NameResend`), which init-logd
-(`services/init/src/logging.rs`) drives; and the receiver's chunk decoder and time-bounded release
-retry (`retry_within`), which real-logd (`services/logd/src/handover.rs`) drives. It holds
+(`services/init/src/logging.rs`) drives; and the receiver's chunk decoder, time-bounded release
+retry (`retry_within`), release outcome (`release_outcome`) and pull-and-release rounds
+(`run_rounds`), which real-logd (`services/logd/src/handover.rs`) drives. It holds
 real-logd's death-queue resync decisions (`is_resync_candidate`, `decode_live_page`, `evictable`,
 and the `WalkGate` that runs one walk at a time; see
 [`docs/ipc-interface.md`](../docs/ipc-interface.md) § Death-queue resync), and the line real-logd

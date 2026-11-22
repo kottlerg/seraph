@@ -346,6 +346,64 @@ pub fn is_release_pending(label: u64) -> bool
     label & STATUS_MASK == RELEASE_PENDING
 }
 
+/// How real-logd's `HANDOVER_RELEASE` ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Release
+{
+    /// Init-logd acknowledged and exits.
+    Acked,
+    /// Init-logd has names to send again and keeps serving; pull again.
+    Pending,
+    /// The last attempt ran out of [`HANDOVER_CALL_TIMEOUT_MS`]: init-logd
+    /// may have taken it and answered after the expiry, either way, or not
+    /// have taken it yet, so it may still be serving.
+    Unanswered,
+    /// The attempts failed otherwise: no release reached init-logd.
+    Unreached,
+}
+
+/// The outcome of a release whose attempts returned `delivered`, the
+/// reply label of the delivered one, or `None` when none was, the last
+/// attempt then having failed with `last_err`.
+#[must_use]
+pub fn release_outcome(delivered: Option<u64>, last_err: i64) -> Release
+{
+    match delivered
+    {
+        Some(label) if is_release_pending(label) => Release::Pending,
+        Some(_) => Release::Acked,
+        None if last_err == syscall_abi::SyscallError::WouldBlock as i64 => Release::Unanswered,
+        None => Release::Unreached,
+    }
+}
+
+/// Run the handover's pull-and-release rounds, at most
+/// `MAX_RELEASE_DEFERRALS + 1` of them: `pull` drains init-logd and returns
+/// whether init-logd answered any of its calls, and `release` sends the
+/// release. The rounds end on an acknowledged or unreached release, and go
+/// on after a deferred one. After an unanswered release they go on while
+/// init-logd still answers: a pull it answers shows it serving, a deferral
+/// or a release it never took, so the release is sent again; a pull it does
+/// not answer shows it gone, having taken the release, or unreachable.
+pub fn run_rounds(mut pull: impl FnMut() -> bool, mut release: impl FnMut() -> Release)
+{
+    let mut unanswered = false;
+    for _ in 0..=MAX_RELEASE_DEFERRALS
+    {
+        let answered = pull();
+        if unanswered && !answered
+        {
+            return;
+        }
+        match release()
+        {
+            Release::Pending => unanswered = false,
+            Release::Unanswered => unanswered = true,
+            Release::Acked | Release::Unreached => return,
+        }
+    }
+}
+
 /// The payload bytes from data word `start_word`, at most `declared_len` of
 /// them; `None` when the message carries no word at or past `start_word`.
 fn inline_bytes(reply: &IpcMessage, start_word: usize, declared_len: u64) -> Option<&[u8]>
@@ -706,6 +764,77 @@ mod tests
             || {},
         );
         assert_eq!(got, Some(3));
+    }
+
+    /// The rounds `run_rounds` makes when init-logd answers the pulls
+    /// `pulls` says and the releases `releases` says, in order, as
+    /// (pulls made, releases sent).
+    fn rounds(pulls: &[bool], releases: &[Release]) -> (usize, usize)
+    {
+        let (mut p, mut r) = (0, 0);
+        run_rounds(
+            || {
+                p += 1;
+                pulls.get(p - 1).copied().unwrap_or(true)
+            },
+            || {
+                r += 1;
+                releases.get(r - 1).copied().unwrap_or(Release::Pending)
+            },
+        );
+        (p, r)
+    }
+
+    #[test]
+    fn a_release_that_runs_out_is_sent_again_while_init_logd_answers()
+    {
+        // The release timed out after init-logd took it and deferred it:
+        // the next pull is answered, so the release goes again and is acked.
+        assert_eq!(
+            rounds(&[true, true], &[Release::Unanswered, Release::Acked]),
+            (2, 2)
+        );
+    }
+
+    #[test]
+    fn a_release_that_runs_out_ends_the_rounds_once_init_logd_is_gone()
+    {
+        // The release timed out and init-logd exited on it: the next pull
+        // goes unanswered and the rounds end without another release.
+        assert_eq!(rounds(&[true, false], &[Release::Unanswered]), (2, 1));
+    }
+
+    #[test]
+    fn an_unanswered_pull_alone_does_not_end_the_rounds()
+    {
+        // The first drain can fail on a race; the release still goes.
+        assert_eq!(rounds(&[false], &[Release::Acked]), (1, 1));
+        assert_eq!(
+            rounds(&[false, false], &[Release::Pending, Release::Acked]),
+            (2, 2)
+        );
+    }
+
+    #[test]
+    fn rounds_end_on_an_unreached_release_and_are_bounded()
+    {
+        assert_eq!(rounds(&[], &[Release::Unreached]), (1, 1));
+        let all = MAX_RELEASE_DEFERRALS as usize + 1;
+        assert_eq!(rounds(&[], &[]), (all, all));
+        assert_eq!(rounds(&[], &[Release::Unanswered; 16]), (all, all));
+    }
+
+    #[test]
+    fn a_release_that_ran_out_is_unanswered_and_other_failures_unreached()
+    {
+        let would_block = syscall_abi::SyscallError::WouldBlock as i64;
+        assert_eq!(release_outcome(None, would_block), Release::Unanswered);
+        assert_eq!(release_outcome(None, -1), Release::Unreached);
+        assert_eq!(release_outcome(Some(RELEASE_PENDING), 0), Release::Pending);
+        assert_eq!(
+            release_outcome(Some(RELEASE_ACK), would_block),
+            Release::Acked
+        );
     }
 
     #[test]

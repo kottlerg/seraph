@@ -981,7 +981,12 @@ pub fn hide(value: usize) -> usize;
 /// `SERAPH_FORCE_RETURN_MITIGATION` build forces where one does
 /// (transient-execution.md § Controls); RISC-V does nothing, since the RVA23
 /// floor defines no such enumeration or control.
-pub fn select_mitigations();
+///
+/// # Safety
+/// Ring 0 / S-mode on the boot CPU, on the kernel's GDT, with interrupts off
+/// and before shadow stacks are enabled: the x86-64 `SBPB` probe is a
+/// fault-recovering MSR write (`idt::msr_recovering`).
+pub unsafe fn select_mitigations();
 
 /// Set the calling CPU's per-CPU controls of the selection (x86-64:
 /// `IA32_SPEC_CTRL`, `EFER`, `IA32_UARCH_MISC_CTL`, and AMD's `DE_CFG`;

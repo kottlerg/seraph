@@ -266,7 +266,12 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // Log the CPU's transient-execution vulnerability table, select and
     // publish the controls it calls for, and set the boot CPU's per-CPU ones
     // (core/kernel/docs/transient-execution.md).
-    arch::current::speculation::select_mitigations();
+    // SAFETY: ring 0 / S-mode on the boot CPU, once, on the kernel's segment
+    // descriptors (above), with interrupts disabled and shadow stacks not yet
+    // enabled (Phase 5).
+    unsafe {
+        arch::current::speculation::select_mitigations();
+    }
     // SAFETY: ring 0 / S-mode on the boot CPU, on the kernel's segment
     // descriptors (above), after `select_mitigations`, with interrupts disabled
     // and shadow stacks not yet enabled (Phase 5).

@@ -24,7 +24,10 @@
 /// Enumerate the boot hart's transient-execution vulnerabilities and select
 /// their controls. RISC-V defines no architectural enumeration of them and no
 /// control under the RVA23 floor, so there is nothing to read, select or log.
-pub fn select_mitigations() {}
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the x86-64 item.
+pub unsafe fn select_mitigations() {}
 
 /// Set the calling hart's controls of the selection: there are none.
 ///

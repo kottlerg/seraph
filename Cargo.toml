@@ -144,6 +144,10 @@ edition = "2024"
 publish = false
 
 
+[workspace.lints.rust]
+# Kani trial (#756): `cfg(kani)` is set by `cargo kani` only.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [workspace.lints.clippy]
 all      = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

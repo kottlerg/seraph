@@ -920,3 +920,25 @@ mod tests
         );
     }
 }
+
+// Kani trial (#756): one trivial harness and one over the entry parser.
+#[cfg(kani)]
+mod proofs
+{
+    #[kani::proof]
+    fn trivial()
+    {
+        let x: u8 = kani::any();
+        assert!(u16::from(x) < 256);
+    }
+
+    /// `parse_entry` never panics on any 128-byte entry. Its one loop scans
+    /// the 16-byte type GUID, so 17 unwindings cover it.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn parse_entry_never_panics()
+    {
+        let entry: [u8; 128] = kani::any();
+        let _ = super::parse_entry(&entry);
+    }
+}

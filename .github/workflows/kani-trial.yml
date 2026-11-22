@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# .github/workflows/kani-trial.yml
+
+# Temporary feasibility trial for #756: installs Kani on the runner and runs
+# it on one parser crate and on the kernel in its host test configuration.
+# Each run is its own step, so one failure does not hide the others. This
+# workflow is not merged.
+
+name: kani-trial
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kani:
+    runs-on: ubuntu-latest
+    env:
+      KANI_VERSION: 0.68.0
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Runner facts
+        run: |
+          nproc; free -g; df -h ~ | tail -1
+          rustup --version; rustup toolchain list
+
+      # Installed outside the checkout, so the repository's rust-toolchain.toml
+      # does not pick the compiler that builds kani-verifier.
+      - name: Install kani-verifier
+        working-directory: /tmp
+        run: |
+          start=$(date +%s)
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          echo "install wall seconds: $(( $(date +%s) - start ))"
+
+      - name: cargo kani setup
+        working-directory: /tmp
+        run: |
+          start=$(date +%s)
+          cargo kani setup
+          echo "setup wall seconds: $(( $(date +%s) - start ))"
+          cargo kani --version
+          rustup toolchain list
+
+      - name: Installed size
+        if: always()
+        run: |
+          du -sh ~/.kani 2>/dev/null || true
+          ls -la ~/.cargo/bin/kani ~/.cargo/bin/cargo-kani 2>/dev/null || true
+          du -sh ~/.rustup/toolchains/* 2>/dev/null || true
+
+      - name: cargo kani on vfsd-gpt
+        if: always()
+        continue-on-error: true
+        run: |
+          start=$(date +%s)
+          cargo kani --tests -p vfsd-gpt
+          rc=$?
+          echo "vfsd-gpt wall seconds: $(( $(date +%s) - start ))"
+          exit $rc
+
+      - name: cargo kani on kernel (trivial harness)
+        if: always()
+        continue-on-error: true
+        run: |
+          start=$(date +%s)
+          cargo kani --tests -p kernel --harness cpu_mask::proofs::trivial
+          rc=$?
+          echo "kernel trivial wall seconds: $(( $(date +%s) - start ))"
+          exit $rc
+
+      - name: cargo kani on kernel (below_word harness)
+        if: always()
+        continue-on-error: true
+        run: |
+          start=$(date +%s)
+          cargo kani --tests -p kernel --harness cpu_mask::proofs::below_word_and_word_bit_agree
+          rc=$?
+          echo "kernel below_word wall seconds: $(( $(date +%s) - start ))"
+          exit $rc
+
+      - name: Size after the runs
+        if: always()
+        run: |
+          du -sh ~/.kani 2>/dev/null || true
+          du -sh target 2>/dev/null || true

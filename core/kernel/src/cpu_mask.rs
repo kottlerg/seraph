@@ -499,3 +499,38 @@ mod tests
         assert_eq!(m.iter(R).next(), None);
     }
 }
+
+// Kani trial (#756): one trivial harness and one over a real pure function.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{below_word, word_bit, words_for};
+
+    #[kani::proof]
+    fn trivial()
+    {
+        let x: u8 = kani::any();
+        assert!(u16::from(x) < 256);
+    }
+
+    /// `below_word(n, i)` holds exactly the indices of word `i` below `n`,
+    /// and `word_bit` places each index in its word, for every `n`, `i`
+    /// and `cpu`. No loop, so no unwind bound.
+    #[kani::proof]
+    fn below_word_and_word_bit_agree()
+    {
+        let n: usize = kani::any();
+        let i: usize = kani::any();
+        let cpu: usize = kani::any();
+        let (w, bit) = word_bit(cpu);
+        assert_eq!(bit.count_ones(), 1);
+        assert!(w <= words_for(cpu.saturating_add(1)));
+        // cpu is in word w; it lies below n iff its bit is in below_word(n, w).
+        assert_eq!((below_word(n, w) & bit) != 0, cpu < n);
+        // A word whose start overflows usize is empty.
+        if i.checked_mul(64).is_none()
+        {
+            assert_eq!(below_word(n, i), 0);
+        }
+    }
+}

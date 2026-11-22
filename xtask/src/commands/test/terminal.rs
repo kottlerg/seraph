@@ -52,11 +52,12 @@ use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::debug_stub;
+use crate::disk::DiskLayout;
 use crate::guest::{QemuStderr, explain_exit};
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    Firmware, GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
-    build_qemu_argv, validate_sysroot_for_launch,
+    Firmware, GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
+    X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::Stub;
 use crate::qmp;
@@ -170,19 +171,22 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
     // Held until the case returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let layout = debug_stub::stage(ctx, args.arch, INPUT_DRIVER)?;
-    let tested = boot(ctx, args);
+    let tested = boot(ctx, args, layout);
     let unstaged = debug_stub::unstage(ctx, args.arch, layout);
     tested?;
     unstaged
 }
 
-/// Boot the staged images and run the rounds (see the module documentation).
-fn boot(ctx: &Context, args: &CaseArgs) -> Result<()>
+/// Boot the staged images of `layout`, with `disk-data.img` as the second
+/// disk when it holds the data partition, and run the rounds (see the module
+/// documentation).
+fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
 {
     let firmware = Firmware::prepare(ctx, args.arch)?;
     let vars = firmware.launch_vars()?;
 
     let disk_path = ctx.disk_image();
+    let data_image = layout.second_image(ctx);
     // Removed on every return, after QEMU is reaped below.
     let sockets = SocketDir::create()?;
     let sock_path = sockets.socket("terminal.qmp")?;
@@ -192,7 +196,10 @@ fn boot(ctx: &Context, args: &CaseArgs) -> Result<()>
         arch: args.arch,
         disk_path: &disk_path,
         disk_block_size: crate::disk::logical_block_size(&disk_path)?,
-        second_disk: None,
+        second_disk: data_image
+            .as_deref()
+            .map(SecondDisk::of_image)
+            .transpose()?,
         firmware_code_path: &firmware.code,
         firmware_vars_path: vars.path(),
         smm: firmware.smm,

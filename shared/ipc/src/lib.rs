@@ -212,7 +212,7 @@ pub mod timed_errors;
 
 /// Wire-protocol version of [`pwrmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PWRMGR_LABELS_VERSION: u32 = 2;
+pub const PWRMGR_LABELS_VERSION: u32 = 3;
 pub mod pwrmgr_labels;
 
 pub mod pwrmgr_errors;

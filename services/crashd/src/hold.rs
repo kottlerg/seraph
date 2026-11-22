@@ -10,26 +10,34 @@
 //! set of procmgr's crash endpoint, the live-core endpoint and the runtime's
 //! memory-pressure Notification, with a timeout of the earliest hold's
 //! deadline. A fault that
-//! memmgr declined with code 6, 7 or 8 while the level is `CRITICAL`, or with
-//! code 11 while memmgr's draw room is short of a demand chunk, is redirected
+//! memmgr declined with code 6 or 8 while the level is `CRITICAL`, with code
+//! 11 while memmgr's draw room is short of a demand chunk, or with code 7 while
+//! both are short, is redirected
 //! (`FAULT_REPLY_REDIRECT`) to one of [`SLOTS`] endpoints crashd made at
 //! start, where it waits queued, its thread fault-blocked, and no thread of
 //! crashd's waits on it. The fault reaches that endpoint only when its thread
 //! next runs, so the endpoint is in the wait set from the redirect until the
 //! fault arrives, and out of it while the fault waits there. When the memory a
-//! held fault waits for is there (the level below `CRITICAL`, or for code 11
-//! the draw room open, at a demand chunk's bytes or more, each of which
-//! memmgr signals on the Notification), crashd receives each such held fault
+//! held fault waits for is there (the level below `CRITICAL`, for code 11 the
+//! draw room open, at a demand chunk's bytes or more, and for code 7 either,
+//! each of which memmgr signals on the Notification), crashd receives each such held fault
 //! that has arrived from its endpoint and resumes it; when a hold's deadline
 //! passes first, it receives that fault and reports and declines it as any
 //! other, or, when it has not arrived, replaces the slot's endpoint, so a
 //! slot's endpoint only ever queues the one fault crashd holds there. memmgr
 //! signals the draw room's opening and not its closing, so crashd reads the
-//! draw room again for each code-11 fault that reaches it. The decisions are
+//! draw room again for each code-7 or code-11 fault that reaches it. No core
+//! is written while a fault is held or memmgr's memory is short
+//! ([`Hold::dump`]). Every receive crashd makes from the crash and live-core
+//! endpoints and the slots' endpoints goes through one receive guard, so a
+//! receive that keeps failing ends crashd for its restart rather than spinning
+//! on a source the wait set keeps returning
+//! (`docs/ipc-design.md` § Receive-Failure Policy). The decisions are
 //! [`oom_hold`]'s, host-tested.
 
 use core_file::policy::Policy;
 use ipc::IpcMessage;
+use ipc::recv_guard::RecvGuard;
 use oom_hold::{Admit, Ended, Found, Held, Holds, Key, Refusal, Room, Rooms, SLOTS, Waits, Why};
 use syscall_abi::{
     FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL, FAULT_REPLY_REDIRECT,
@@ -37,7 +45,8 @@ use syscall_abi::{
 };
 
 use crate::{
-    Dump, WAIT_RETRY_MS, WAKE_FAULT, WAKE_LIVE, bounded, delete_caps, handle_fault, now_ms,
+    Dump, WAIT_RETRY_MS, WAKE_FAULT, WAKE_LIVE, bounded, delete_caps, guarded, handle_fault,
+    now_ms, recv_diag,
 };
 
 /// The wait-set badge of the memory-pressure Notification.
@@ -125,6 +134,8 @@ struct Hold
     /// bit, and the draw room only while it reads short: a commit overrun
     /// that arrives reads it again ([`Hold::dispatch`]).
     rooms: Rooms,
+    /// The guard of every receive crashd's thread makes.
+    guard: RecvGuard,
 }
 
 /// Serve the crash endpoint `endpoint` with the hold of faults for at most
@@ -210,6 +221,7 @@ impl Hold
             wait_set,
             pressure,
             rooms: read_rooms(),
+            guard: RecvGuard::new(recv_diag),
         })
     }
 
@@ -247,18 +259,20 @@ impl Hold
                 Ok(WAKE_FAULT) =>
                 {
                     // SAFETY: ipc_buf is the registered IPC buffer page.
-                    if let Ok(msg) = unsafe { ipc::ipc_try_recv(endpoint, ipc_buf) }
+                    let received = unsafe { ipc::ipc_try_recv(endpoint, ipc_buf) };
+                    if let Some(msg) = guarded(&mut self.guard, &received)
                     {
-                        self.dispatch(&msg, policy, authority, ipc_buf);
+                        self.dispatch(msg, policy, authority, ipc_buf);
                     }
                 }
                 Ok(WAKE_LIVE) =>
                 {
                     // SAFETY: ipc_buf is the registered IPC buffer page.
-                    if let Ok(msg) = unsafe { ipc::ipc_try_recv(live, ipc_buf) }
+                    let received = unsafe { ipc::ipc_try_recv(live, ipc_buf) };
+                    if let Some(msg) = guarded(&mut self.guard, &received)
                     {
-                        self.refresh_rooms();
-                        crate::live::serve(&msg, authority, ipc_buf, self.dump());
+                        let dump = self.dump();
+                        crate::live::serve(msg, authority, ipc_buf, dump);
                     }
                 }
                 // A held fault reached its slot's endpoint; memory that came
@@ -295,14 +309,25 @@ impl Hold
         }
     }
 
-    /// Whether a report made now may write a core: not while the level is
-    /// `CRITICAL`.
-    fn dump(&self) -> Dump
+    /// Whether a report or a live core made now may write a core: not while
+    /// crashd holds a fault, nor while memmgr's level reads `CRITICAL` or its
+    /// draw room is short, read now, since memmgr does not signal the draw
+    /// room's closing. A dump's buffers and the file system's writes need
+    /// pages, and a fault of the file system's threads memmgr declines for
+    /// want of them comes to crashd, which serves nothing until the dump ends,
+    /// so a held fault would outlast its stall and the dump would wait on it.
+    fn dump(&mut self) -> Dump
     {
-        match self.rooms.level
+        let _ = syscall::notification_try_wait(self.pressure);
+        self.rooms = read_rooms();
+        let short = self.rooms.level == Room::Short || self.rooms.draw == Room::Short;
+        if short || self.holds.held_slots().next().is_some()
         {
-            Room::Short => Dump::MemoryCritical,
-            Room::Open => Dump::Allowed,
+            Dump::MemoryShort
+        }
+        else
+        {
+            Dump::Allowed
         }
     }
 
@@ -323,13 +348,14 @@ impl Hold
         let Some(key) = holdable(msg)
         else
         {
-            handle_fault(msg, policy, authority, ipc_buf, self.dump());
+            let dump = self.dump();
+            handle_fault(msg, policy, authority, ipc_buf, dump);
             return;
         };
         let now = now_ms();
         let fault = Message::of(msg);
         let waits = oom_hold::waits_on(fault.code());
-        if waits == Waits::DrawRoom
+        if waits != Waits::Level
         {
             // memmgr does not signal the draw room's closing, and its decline
             // of this fault may have closed it since the last read; a stale
@@ -371,7 +397,8 @@ impl Hold
                         fault.addr()
                     );
                 });
-                handle_fault(msg, policy, authority, ipc_buf, self.dump());
+                let dump = self.dump();
+                handle_fault(msg, policy, authority, ipc_buf, dump);
             }
         }
     }
@@ -466,8 +493,20 @@ impl Hold
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let found = match unsafe { ipc::ipc_try_recv(target, ipc_buf) }
         {
-            Ok(_) => Found::Fault,
-            Err(_) => Found::Nothing,
+            Ok(_) =>
+            {
+                self.guard.on_success();
+                Found::Fault
+            }
+            Err(e) if e == SyscallError::WouldBlock as i64 => Found::Nothing,
+            // A receive that failed says nothing of the fault, which may
+            // still be queued: the hold stays, and a failure that keeps
+            // repeating ends crashd.
+            Err(e) =>
+            {
+                self.guard.on_failure(e);
+                return;
+            }
         };
         let Some(ended) = self.holds.end(slot, why, found)
         else
@@ -506,7 +545,8 @@ impl Hold
                         held_ms(&held)
                     );
                 });
-                handle_fault(&fault.rebuilt(), policy, authority, ipc_buf, self.dump());
+                let dump = self.dump();
+                handle_fault(&fault.rebuilt(), policy, authority, ipc_buf, dump);
             }
             Ended::Withdrawn(held) =>
             {
@@ -620,6 +660,7 @@ const fn short_of(waits: Waits) -> &'static str
     {
         Waits::Level => "memory critical",
         Waits::DrawRoom => "no commit draw room",
+        Waits::LevelOrDrawRoom => "memory critical and no commit draw room",
     }
 }
 
@@ -631,6 +672,7 @@ const fn came_back(waits: Waits) -> &'static str
     {
         Waits::Level => "memory no longer critical",
         Waits::DrawRoom => "commit draw room open",
+        Waits::LevelOrDrawRoom => "memory no longer critical or commit draw room open",
     }
 }
 

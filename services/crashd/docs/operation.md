@@ -102,29 +102,41 @@ memmgr's pressure-level changes and draw-room openings. It waits on the wait set
 the earliest hold's deadline, and receives from the crash endpoint without blocking when the wait
 set names it. When the endpoints or the wait set cannot be made, or the process has no pressure
 registration, it logs a warning and runs with no hold. It reads memmgr's level and draw room when
-the Notification has signalled since its last read, and the draw room again for each commit overrun
-that reaches it, since memmgr signals the draw room's opening and not its closing. It takes the
-level as `CRITICAL`, and the draw room as short, while memmgr does not answer.
+the Notification has signalled since its last read, and the draw room again for each fault of code
+7 or 11 that reaches it, since memmgr signals the draw room's opening and not its closing. It takes
+the level as `CRITICAL`, and the draw room as short, while memmgr does not answer. Every receive it
+makes, from the crash endpoint, the live-core endpoint and the slots' endpoints, goes through one
+receive guard ([docs/ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy): a
+receive that fails leaves its message queued and the wait set names the source again at once, so a
+failure that keeps repeating ends crashd with `EXIT_RECV_WEDGE` for svcmgr's restart, and one on a
+slot's endpoint leaves that hold as it was.
 
 A fault is holdable when it is a VM fault memmgr forwarded with decline code 7 (no free page can
 back it), 11 (a commit overrun: no free frame for a committed page), 6 (the metadata arena cannot
 grow) or 8 (the region's chunk table cannot record the run)
 ([memmgr IPC Interface](../../memmgr/docs/ipc-interface.md) § Kernel-origin fault message). Code
 10, a budget node's max, is the process's own limit, and a holdable fault is never one of an
-exception class; crashd handles each such fault at once. A fault of code 6, 7 or 8 waits on the
+exception class; crashd handles each such fault at once. A fault of code 6 or 8 waits on the
 level: its memory is short while the level reads `CRITICAL`. A commit overrun waits on memmgr's
 draw room, the free frames a fault on a committed page may take (`QUERY_POOL_STATUS` `data[16]`;
 [memmgr Memory Pool](../../memmgr/docs/memory-pool.md#commit) § Commit, Overcommit): its memory
 is short while the draw room is below a demand chunk's 64 KiB, the most one committed draw takes,
 and the draw room opens at that, which memmgr signals. Write-out to swap brings the draw room back
 while the level stays `CRITICAL`, so a commit overrun waits on the draw room and not on the level.
+A fault of code 7 waits on either, its memory short while both are: the code is a demand page no
+free page outside `promised` and the growth floor can back, which the level tracks, or the restore
+of an evicted chunk the free frames do not cover while swap slots are registered, which the
+evictions that free frames admit while the level stays `CRITICAL`
+([memmgr Memory Pool](../../memmgr/docs/memory-pool.md#eviction) § Eviction, Restore headroom),
+and an open draw room has room for a chunk's restore. The decline word does not tell the two apart.
 A holdable fault that arrives:
 
 - while its memory is short, with a slot free, is redirected (`FAULT_REPLY_REDIRECT`,
   [docs/fault-handling.md](../../../docs/fault-handling.md) § Reply) to that slot's endpoint, with
   the slot as its reason word. crashd keeps the fault's message as it arrived and logs
   `fault badge=<badge> addr=<addr> held: <short> (reason=<code>), up to <stall> ms`, `<short>`
-  being `memory critical` for the level and `no commit draw room` for the draw room. The
+  being `memory critical` for the level, `no commit draw room` for the draw room, and
+  `memory critical and no commit draw room` for either. The
   thread stays fault-blocked, and its fault reaches that endpoint when the thread next runs, to
   wait there queued; no thread of crashd waits on it, so crashd goes on receiving and reporting
   other faults. The endpoint is in crashd's wait set from the redirect until the fault arrives;
@@ -132,8 +144,9 @@ A holdable fault that arrives:
   warning, then reported and declined;
 - with its memory there, the level having fallen below `CRITICAL`, or the draw room having
   opened, between memmgr's decline and crashd's receive, is resumed at once (`FAULT_REPLY_RESUME`),
-  logged `resumed at once: <back>`, `<back>` being `memory no longer critical` for the level and
-  `commit draw room open` for the draw room.
+  logged `resumed at once: <back>`, `<back>` being `memory no longer critical` for the level,
+  `commit draw room open` for the draw room, and `memory no longer critical or commit draw room
+  open` for either.
 When the memory a held fault waits for is there, the level below `CRITICAL` or the draw room open,
 crashd receives each such held fault that has arrived from its endpoint without blocking and resumes
 it, logging `resumed after <ms> ms: <back>`; the thread retries its access, which faults into memmgr
@@ -161,7 +174,9 @@ repeats a resumed fault` as a warning, then reported and declined, so an access 
 once memory is freed is not resumed into a loop. A repeat of a commit overrun with the draw room
 open is resumed again, logged `resumed at once: commit draw room open`, and remembered until the
 same deadline: one opening of the draw room backs one committed draw, and another may have taken
-it between the resume and the retry. The holds of one fault total at most the stall.
+it between the resume and the retry. A repeat of a fault of code 7 waits on the level alone, so a
+demand page that the draw room's opening resumed and memmgr declines again is resumed into that
+decline at most once per hold. The holds of one fault total at most the stall.
 
 **While memory is critical.** crashd runs inside memmgr's system reserve: its recipe's
 `reserve = yes` has svcmgr create it with a reserve budget node
@@ -179,8 +194,10 @@ services, so crashd draws on it as little as it can: with a stall set, crashd to
 buffers, and 32 KiB of its thread's stack (`STACK_TOUCH_BYTES`); its log
 writes format on the stack. A report allocates its block's lines, its stack scan (at most 8 KiB),
 its registers, the bytes at the instruction pointer and its frames, all within that heap. While the
-level reads `CRITICAL` it writes no core, since a core's buffers and the file system's writes need
-pages a report does not: the dump's line is `not written: memory is critical`
+level reads `CRITICAL`, while memmgr's draw room is short, and while it holds a fault, it writes no
+core, since a core's buffers and the file system's writes need pages a report does not, and a fault
+of the file system's threads that memmgr declines for want of them would wait on crashd, which
+serves nothing while it dumps, past its stall: the dump's line is `not written: memory is short`
 ([Core Dump](#core-dump)). A report that needs a page past those takes it from the reserve.
 
 ---
@@ -202,8 +219,9 @@ A dump follows the block when the report attached and read the process within it
 
 1. It reads the process's name from `LIST_PROCESSES`, and ends, with no line, when the policy
    does not name it.
-2. It writes no core while memory is critical, when crashd holds faults and memmgr's level reads
-   `CRITICAL` ([Hold](#hold)).
+2. It writes no core while memory is short, when crashd runs with a stall and holds a fault, or
+   memmgr's level reads `CRITICAL` or its draw room is short, read as the report ends
+   ([Hold](#hold)).
 3. It writes no core of a process that declared itself on the core path (`DECLARE_NO_CORE`, which
    the attach reply's flags word reports): vfsd, the FAT driver, the block driver, devmgr and the
    IOMMU driver, through which the core would be written, and logd, which the outcome line below
@@ -260,8 +278,8 @@ Its steps, in order, under the dump's bound ([Bounds](#bounds)):
 
 1. It refuses an unknown label (`UNKNOWN_OPCODE`), a badge without the authority
    (`UNAUTHORIZED`), a missing, empty or too long name, or a `caps[0]` that is not an endpoint
-   `SEND` (`INVALID_ARGUMENT`), and any request while memory is critical, as for a crash core
-   (`MEMORY_CRITICAL`).
+   `SEND` (`INVALID_ARGUMENT`), and any request while memory is short, as for a crash core, or
+   while memmgr's level reads `CRITICAL` (`MEMORY_CRITICAL`).
 2. It finds the first live process, in badge order, that the name names (`LIST_PROCESSES`), or
    replies `NOT_FOUND`.
 3. It asks procmgr, through its debug authority, for a snapshot of the process charged to the

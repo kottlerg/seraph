@@ -691,8 +691,8 @@ pub const ACPI_AUTHORITY: u64 = 1u64 << 58;
 /// [`QUERY_DEVICE`] replies carry, moved down from
 /// [`crate::VERB_BIT_MASK`] into bits 16..=21. No other bit is set, so a
 /// class badge carries none of the registry's authority bits and reaches
-/// `QUERY_DEVICE` and `WATCH_CLASS` alone, and no registry SEND of an
-/// authority bit reads as a class badge.
+/// `QUERY_DEVICE`, `WATCH_CLASS` and `DECLINE_RESTART` alone, and no
+/// registry SEND of an authority bit reads as a class badge.
 pub mod class_badge
 {
     use core::prelude::rust_2024::*;

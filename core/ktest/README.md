@@ -443,7 +443,9 @@ thread,event,wait_set,tlb}.rs`). Benchmarks log min/mean/max cycle counts
 | Benchmark | What it measures |
 |---|---|
 | `null_syscall_roundtrip` | Kernel entry/exit baseline (`SYS_SYSTEM_INFO`) |
-| `ipc_round_trip` | Synchronous IPC call + reply, per-iteration |
+| `ipc_round_trip` | Synchronous IPC call + reply of an empty message, per-iteration |
+| `ipc_round_trip_6w` | As `ipc_round_trip`, request and reply each carrying 6 data words, the most the message registers carry |
+| `ipc_round_trip_7w` | As `ipc_round_trip`, request and reply each carrying 7 data words, which travel in the IPC buffer page |
 | `notification_roundtrip` | Notification ping-pong between two threads, per-iteration |
 | `cap_create_delete` | `cap_create_notification` + `cap_delete` cycle |
 | `cap_info_lookup` | `cap_info(CAP_INFO_TAG_RIGHTS)` on a held cap: one handle resolution and pin, against the `null_syscall_roundtrip` baseline |

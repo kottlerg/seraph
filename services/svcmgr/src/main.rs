@@ -1098,12 +1098,12 @@ fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ip
 /// drain that crosses the capacity then runs [`resync_deaths`].
 ///
 /// A death is routed with the reason procmgr gives the process
-/// ([`posted_death_reason`]), not the post's own.
+/// ([`process_death_reason`]), not the post's own.
 fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
     let full = ctx.deaths.drain(|death| {
         let tag = DeathTag::from_correlator(death.correlator);
-        let exit_reason = posted_death_reason(state, ctx, tag, death.exit_reason);
+        let exit_reason = process_death_reason(state, ctx, tag, death.exit_reason);
         route_death(tag, exit_reason, state, ctx);
     });
     if full
@@ -1113,15 +1113,18 @@ fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
     }
 }
 
-/// The reason to route the death post `posted` of `tag` with: for a
+/// The reason to route a death of `tag` with, which a death post or
+/// svcmgr's own caps ([`observed_death`]) report as `posted`: for a
 /// procmgr-created service whose current instance `tag` names, the reason
-/// procmgr gives the process (`restart::process_reason`), since the post can
-/// be the main thread's own end, which is the process's only when it is the
-/// first (docs/process-lifecycle.md § Exit reason); `posted` when procmgr
-/// does not answer `EXITED`, for a post [`route_death`] drops or a service
-/// svcmgr holds no process handle of, and while the substrate is down
-/// ([`substrate_alive`]), since the call blocks until procmgr answers.
-fn posted_death_reason(
+/// procmgr gives the process (`restart::process_reason`), since the post and
+/// the caps can show the main thread's own end, which is the process's only
+/// when it is the first (docs/process-lifecycle.md § Exit reason); `posted`
+/// when procmgr does not answer `EXITED`, for a death [`route_death`] drops
+/// or a service svcmgr holds no process handle of, and while the substrate is
+/// down ([`substrate_alive`]), since the call blocks until procmgr answers.
+/// Every caller of [`route_death`] but the resync, which chooses the same way
+/// (`svcmgr_defs::death_caps::resync`), routes the reason this gives.
+pub(crate) fn process_death_reason(
     state: &SvcmgrState,
     ctx: &restart::RestartCtx,
     tag: DeathTag,
@@ -1309,6 +1312,11 @@ impl svcmgr_defs::death_caps::ResyncTable for ResyncCtx<'_>
     {
         restart::queried_death(process_handle, self.ctx.ipc_buf)
     }
+
+    fn process_reason(&mut self, process_handle: u64, caps: u64) -> u64
+    {
+        restart::process_reason(process_handle, caps, self.ctx.ipc_buf)
+    }
 }
 
 /// Whether every service whose address space svcmgr holds (memmgr and
@@ -1365,6 +1373,7 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
         && let Some(exit_reason) = observed_death(entry)
         && let Some(tag) = DeathTag::new(actuator.slot, entry.instance)
     {
+        let exit_reason = process_death_reason(state, ctx, tag, exit_reason);
         route_death(tag, exit_reason, state, ctx);
     }
     let Some(entry) = state.table.services.get(actuator.slot)

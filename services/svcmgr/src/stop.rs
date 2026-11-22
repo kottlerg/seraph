@@ -27,7 +27,10 @@ use svcmgr_defs::stop::{StopFacts, core_role, stop_refusal};
 
 use crate::restart::RestartCtx;
 use crate::service::POLICY_NEVER;
-use crate::{SvcmgrState, observed_death, route_death, service_running, substrate_alive};
+use crate::{
+    SvcmgrState, observed_death, process_death_reason, route_death, service_running,
+    substrate_alive,
+};
 
 /// Reply `code` with no words and no caps.
 fn reply(code: u64, ipc_buf: *mut u64)
@@ -136,6 +139,7 @@ pub(crate) fn handle_stop_candidate(msg: &IpcMessage, state: &mut SvcmgrState, c
             && let Some(exit_reason) = observed_death(svc)
             && let Some(current) = DeathTag::new(idx, svc.instance)
         {
+            let exit_reason = process_death_reason(state, ctx, current, exit_reason);
             route_death(current, exit_reason, state, ctx);
         }
         return;

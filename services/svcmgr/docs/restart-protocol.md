@@ -75,12 +75,14 @@ dispatches through [`restart::handle_death`](../src/restart.rs). The service
 table grows on the heap and never reuses a slot, so a slot names one
 service for svcmgr's lifetime. `route_death` routes a post only when the
 slot is active and the tag's instance is the slot's current one. The exit reason
-it routes is the one procmgr gives the process, asked through the service's process handle
+it routes, for a post and for a death svcmgr's own caps show alike (the resync below, the
+shutdown actuator's death found before the shutdown call, and a stop's target found already
+dead), is the one procmgr gives the process, asked through the service's process handle
 (`procmgr_labels::QUERY_PROCESS`, while memmgr and procmgr are active and alive), since a post
 of the main thread's own `sys_thread_exit` carries the process's reason only when it is the
 process's first end ([process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)); the
-post's own reason stands when procmgr does not answer `EXITED` and for a service svcmgr holds no
-process handle of. Any other post is dropped: a late post of an instance
+post's or the caps' own reason stands when procmgr does not answer `EXITED`, while memmgr or
+procmgr is down, and for a service svcmgr holds no process handle of. Any other post is dropped: a late post of an instance
 already routed, and the second of the two posts a main-thread fault or exit makes when
 it is the address space's first terminal end.
 
@@ -90,7 +92,8 @@ queue, so a drain that takes a full queue's worth of events or more from one
 queue resyncs: it routes a death for every active service whose main thread the kernel reports
 exited (the kernel's reason), whose thread cap no longer resolves (`EXIT_KILLED`: procmgr's teardown
 revokes it), or whose endowed address space has a retained terminal end
-(`CAP_INFO_ASPACE_END`). A dropped post leaves a full queue of events behind it for that
+(`CAP_INFO_ASPACE_END`), each with the reason procmgr gives the process, as above, when svcmgr
+holds its process handle. A dropped post leaves a full queue of events behind it for that
 drain or the next, so the resync runs after the drop.
 
 A worker-thread fault of a service procmgr created shows in svcmgr's caps only once procmgr's

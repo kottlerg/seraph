@@ -262,6 +262,16 @@ fn destroy_partial_child(process_handle: u64, ipc_buf: *mut u64)
     let _ = syscall::cap_delete(process_handle);
 }
 
+/// Delete each non-zero cap of `caps`: copies derived for a child's
+/// bootstrap round that the round did not deliver.
+fn delete_undelivered(caps: &[u64])
+{
+    for &cap in caps.iter().filter(|&&cap| cap != 0)
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+}
+
 /// Start a process by calling `START_PROCESS` on its badged process handle.
 fn start_process(process_handle: u64, ipc_buf: *mut u64, ok_msg: &str, fail_msg: &str) -> bool
 {
@@ -779,8 +789,10 @@ fn serve_region_rounds(
 ///   - `data[2..]` = kind-specific payload:
 ///       - aperture / ACPI: `(base, size)` pairs per cap
 ///       - RAM extent: `(base, size)` pairs, one per extent memmgr pools
-///       - module: each module's size in bytes, one word per cap; each cap
-///         is one boot module, untagged
+///       - module: each module's size in bytes, one word per cap, then
+///         each module's install-path name in `MODULE_NAME_WORDS` words
+///         (little-endian, NUL-padded), in the caps' order; at most
+///         `MODULES_PER_ROUND` caps a round, each one boot module, untagged
 ///   - terminal round has `done = true`.
 ///
 /// The bootstrap layout mirrors `devmgr/src/caps.rs::bootstrap_caps`.
@@ -842,6 +854,7 @@ pub fn create_devmgr_with_caps(
     else
     {
         log("devmgr: registry cap derive failed");
+        destroy_partial_child(process_handle, ipc_buf);
         return None;
     };
 
@@ -875,6 +888,12 @@ pub fn create_devmgr_with_caps(
     // No stdio caps wired: devmgr reaches the system log via the
     // discovery cap procmgr installs in `ProcessInfo`.
 
+    // Until round 1 delivers them the copies are init's, and a failure before
+    // then deletes them: the registry copy carries the Receive right, which
+    // would keep a call on devmgr's registry waiting instead of failing with
+    // `NoReceiver` (`crate::keep_send_rights`).
+    let round1_copies = [registry_copy, irq_copy, rsdp_copy, dtb_copy];
+
     // START_PROCESS.
     if !start_process(
         process_handle,
@@ -883,6 +902,8 @@ pub fn create_devmgr_with_caps(
         "devmgr: START_PROCESS failed",
     )
     {
+        delete_undelivered(&round1_copies);
+        destroy_partial_child(process_handle, ipc_buf);
         return None;
     }
 
@@ -933,6 +954,8 @@ pub fn create_devmgr_with_caps(
         "devmgr: bootstrap round 1 failed",
     )
     {
+        // A failed round moves none of its caps.
+        delete_undelivered(&round1_copies);
         return None;
     }
 
@@ -1172,12 +1195,24 @@ pub fn create_vfsd_with_caps(
         thread: thread_cap,
     };
 
+    let Some(block_class) = request_block_class(spawn.registry_ep, ipc_buf)
+    else
+    {
+        destroy_partial_child(process_handle, ipc_buf);
+        return None;
+    };
+    // Derived last, and deleted on every failure before round 1 delivers it:
+    // it carries the Receive right, which would keep a call on vfsd's service
+    // endpoint waiting instead of failing with `NoReceiver`
+    // (`crate::keep_send_rights`).
     let Ok(service_copy) = syscall::cap_derive(spawn.vfsd_service_ep, syscall::RIGHTS_ALL)
     else
     {
+        let _ = syscall::cap_delete(block_class);
+        destroy_partial_child(process_handle, ipc_buf);
         return None;
     };
-    let block_class = request_block_class(spawn.registry_ep, ipc_buf)?;
+    let round1_caps = [service_copy, block_class];
 
     if !start_process(
         process_handle,
@@ -1186,6 +1221,8 @@ pub fn create_vfsd_with_caps(
         "vfsd: START_PROCESS failed",
     )
     {
+        delete_undelivered(&round1_caps);
+        destroy_partial_child(process_handle, ipc_buf);
         return None;
     }
 
@@ -1196,11 +1233,13 @@ pub fn create_vfsd_with_caps(
         &child,
         ipc_buf,
         false,
-        &[service_copy, block_class],
+        &round1_caps,
         &[],
         "vfsd: bootstrap round 1 failed",
     )
     {
+        // A failed round moves none of its caps.
+        delete_undelivered(&round1_caps);
         return None;
     }
 

@@ -1106,6 +1106,16 @@ fn run(info_ptr: u64) -> !
         logging::log("no devmgr module available");
     }
 
+    // devmgr now holds its own copy of its registry endpoint, and every copy
+    // init derived for it is delivered or deleted. init keeps only the rights
+    // it derives from (svcmgr's `SEND|GRANT` registry source, badged
+    // `SEND`s), so devmgr's copy is the endpoint's only capability with the
+    // Receive right: once devmgr is absent or dead, a call on the endpoint
+    // (vfsd's create asks devmgr for the block class SEND through it) fails
+    // with `NoReceiver` instead of waiting for a receiver that can never come
+    // (docs/ipc-design.md § Endpoints).
+    let devmgr_registry_ep = keep_send_rights(devmgr_registry_ep, syscall::RIGHTS_EP_SEND_GRANT);
+
     if find_module_by_name(info, module_name::VFSD).is_some()
     {
         logging::log("requesting procmgr to create vfsd (with caps)");
@@ -1127,13 +1137,10 @@ fn run(info_ptr: u64) -> !
         logging::log("no vfsd module available");
     }
 
-    // devmgr and vfsd now hold their own copies of the two endpoints they
-    // serve. init keeps only the rights it derives from (svcmgr's `SEND|GRANT`
-    // registry source, badged `SEND`s), so a server's copy is the endpoint's
-    // only capability with the Receive right: once the server dies, a call on
-    // the endpoint fails with `NoReceiver` instead of waiting for a receiver
-    // that can never come (docs/ipc-design.md § Endpoints).
-    let devmgr_registry_ep = keep_send_rights(devmgr_registry_ep, syscall::RIGHTS_EP_SEND_GRANT);
+    // The same for vfsd's service endpoint: init keeps the badged `SEND`s it
+    // derives, so once vfsd is absent or dead, Phase 2's
+    // `GET_SYSTEM_ROOT_CAP` fails with `NoReceiver` and init halts on its
+    // `FATAL` line instead of waiting.
     let vfsd_service_ep = keep_send_rights(vfsd_service_ep, syscall::RIGHTS_EP_SEND);
 
     logging::log("phase 1 bootstrap complete");

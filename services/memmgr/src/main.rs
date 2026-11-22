@@ -3988,9 +3988,10 @@ fn charge_handle_of(l: &MemLedger, badge: u64) -> Option<(NodeIdx, NodeHandle)>
 
 /// `NODE_SET_MAX`: set the max of the handle's node to `data[0]`, clamped to
 /// its usage plus its parent chain's headroom, and reply the max it took
-/// (services/memmgr/docs/ipc-interface.md § Label 14). Lowering it reclaims
-/// and kills nothing; a max at or below the usage signals the node's limit
-/// event ([`signal_limits`]).
+/// (services/memmgr/docs/ipc-interface.md § Label 14); `u64::MAX` on a
+/// reserve sub-node is refused, which keeps its bound on the reserve.
+/// Lowering it reclaims and kills nothing; a max at or below the usage
+/// signals the node's limit event ([`signal_limits`]).
 fn handle_node_set_max(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let l = ledger_mut();

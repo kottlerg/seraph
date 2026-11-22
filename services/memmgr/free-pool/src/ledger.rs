@@ -1062,7 +1062,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// clamped as [`budget::create`] clamps it, and give it handle state
     /// keyed by `key` (a badge no slot is keyed by), owned by the record
     /// `owner`. A reserve sub-node needs a reserve parent and a finite max,
-    /// which bounds what its subtree can take of the reserve. The node's one
+    /// which bounds what its subtree can take of the reserve and which it
+    /// keeps ([`Self::set_node_max`]). The node's one
     /// reference is its handle state's, so it lives until that state is
     /// dropped and then while a child node or a charge refers to it. Returns
     /// the state's slot.
@@ -1100,6 +1101,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 reserve,
             },
         )?;
+        if reserve
+        {
+            budget::set_bounded(&mut self.arena, node);
+        }
         self.attach(owner, node, key).inspect_err(|_| {
             budget::unref(&mut self.arena, node);
         })
@@ -1576,10 +1581,16 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Set the max of the budget node `node` to `max`, clamped to its
     /// usage plus its parent chain's headroom ([`budget::clamp_max`]).
-    /// Returns the max it took; `None` when `node` is not a budget node.
+    /// Returns the max it took; `None` when `node` is not a budget node, or
+    /// when `max` is [`crate::NO_MAX`] and `node` is a reserve sub-node,
+    /// whose finite max bounds what its subtree can take of the reserve
+    /// ([`Self::create_sub_node`]). Nothing changes then.
     pub fn set_node_max(&mut self, node: NodeIdx, max: u64) -> Option<u64>
     {
-        budget::node(&self.arena, node)?;
+        if budget::node(&self.arena, node)?.bounded() && max == crate::NO_MAX
+        {
+            return None;
+        }
         let max = budget::clamp_max(&self.arena, node, max);
         budget::set_max(&mut self.arena, node, max);
         Some(max)
@@ -7706,7 +7717,7 @@ mod tests
     }
 
     #[test]
-    fn a_reserve_sub_node_needs_a_reserve_parent_and_a_max()
+    fn a_reserve_sub_node_needs_a_reserve_parent_and_keeps_a_max()
     {
         let mut l = ledger();
         let plain = l.insert_process(1, NodeSpec::TOP).unwrap();
@@ -7757,6 +7768,15 @@ mod tests
             .unwrap();
         let inner = l.handle(inner).unwrap().node;
         assert!(budget::node(&l.arena, inner).unwrap().reserve());
+        // Each keeps a finite max: a later max may move it, not lift it. A
+        // node outside the reserve, and a top-level reserve node, may drop
+        // theirs.
+        assert_eq!(l.set_node_max(node, NO_MAX), None);
+        assert_eq!(l.set_node_max(inner, NO_MAX), None);
+        assert_eq!(budget::node(&l.arena, node).unwrap().max, 4);
+        assert_eq!(l.set_node_max(node, 3), Some(3));
+        assert_eq!(l.set_node_max(outside, NO_MAX), Some(NO_MAX));
+        assert_eq!(l.set_node_max(core_node, NO_MAX), Some(NO_MAX));
     }
 
     #[test]

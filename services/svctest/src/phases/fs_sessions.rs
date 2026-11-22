@@ -377,13 +377,33 @@ fn end_session(opens: &[u64], liveness: u64, node: u64, what: &str)
     }
 }
 
+/// Delete the liveness cap `liveness` of the session charged to node
+/// `node`, then close `open`, its last open: the close ends the session
+/// before the reply, so its first page is off the node at once. Release the
+/// node.
+fn close_ends_session(open: u64, liveness: u64, node: u64, ipc_buf: *mut u64)
+{
+    syscall::cap_delete(liveness).expect("deleting a session's liveness cap");
+    assert_eq!(
+        fs_close(open, ipc_buf),
+        fs_errors::SUCCESS,
+        "FS_CLOSE of a session's last open"
+    );
+    assert_eq!(
+        node_usage(node, "NODE_QUERY_USAGE after a session's last close").0,
+        0,
+        "the close of the last open of a session with no liveness cap left its page charged"
+    );
+    release_refused(node, "a session's node");
+}
+
 /// A session charged to node A takes a page there for its first, and opens
 /// in it take one more, until A's max refuses with `LIMIT`; a session on
 /// node B and svctest's own session still open. The extra page returns when
 /// the opens close, the first when the close of the last open finds the
 /// session's liveness cap gone, while B's session, whose liveness cap the
-/// phase keeps, outlives that and the sweep A's release signals, and then
-/// ends at the sweep its own release signals, with its open still in it.
+/// phase keeps, outlives that end of A's, and then ends at the sweep its own
+/// release signals, with its open still in it.
 fn charged_to_the_client(top: u64, node: u64, ipc_buf: *mut u64)
 {
     let a = sub_node(top, SESSION_MAX, "NODE_CREATE of node A");
@@ -475,21 +495,8 @@ fn charged_to_the_client(top: u64, node: u64, ipc_buf: *mut u64)
         let _ = syscall::cap_delete(open);
     }
 
-    // With its liveness cap gone, the close of its last open ends the session
-    // before the reply: its first page is off node A at once. B's session,
-    // whose liveness cap is held, stays.
-    syscall::cap_delete(live_a).expect("deleting node A's session's liveness cap");
-    assert_eq!(
-        fs_close(first, ipc_buf),
-        fs_errors::SUCCESS,
-        "FS_CLOSE of node A's session's last open"
-    );
-    assert_eq!(
-        node_usage(a, "NODE_QUERY_USAGE of node A after its last close").0,
-        0,
-        "the close of the last open of a session with no liveness cap left its page charged"
-    );
-    release_refused(a, "node A");
+    // B's session, whose liveness cap is held, stays.
+    close_ends_session(first, live_a, a, ipc_buf);
     assert_eq!(
         node_usage(top, "NODE_QUERY_USAGE of the phase's node").2,
         1,

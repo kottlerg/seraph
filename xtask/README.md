@@ -1768,6 +1768,7 @@ fails the gate.
 | `gate-base-green` | error | For a head that does not contain the base branch's tip, the tip's own CI run has finished green: the newest `build-test.yml` run on the push of the tip commit succeeded (`gh run list --commit`). While it is red or has not finished, only a head that contains the tip merges (docs/conventions.md § CI Gating). A tip with no run, a cancelled or skipped run, and a state that cannot be read are errors. |
 | `gate-base-fresh` | error | The clone's `origin/<base>` is the base branch's tip on GitHub (`gh api`), since the two rules above read that ref: a stale one is refused with the advice to `git fetch origin`. |
 | `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
+| `record-run-kind` | error | The last run record for the PR head, when it is a `full` or `delta` record of the defect form, has no audit section of another run kind (§ `cargo xtask review-ledger`). |
 | `gate-review-record` | error | The last run record for the PR head in `target/xtask/review/pr<N>/` is well-formed and has `AUDIT PASS`, no failed agent, and the reviewer verdict `READY TO MERGE` (or, in a record of the earlier form, `NON-BLOCKING ISSUES ONLY`). The last run at a head is the record there with the greatest `stats.run`; an earlier passing run does not count. When that record is an `audit` record that completes a run of the reviewer alone (the latest `NOT RUN` record at the head with only `audit` records after it), that run must have no failed agent and a passing verdict too. Every record at the head must be well-formed, since a malformed one cannot be placed, and two with one `stats.run` are refused. A record is at the head when its name states the head's first digits; one whose `stats.head` names another commit is refused. |
 | `gate-added-files` | error | The files the PR adds can be read from the clone, which the next rule needs. |
 | `gate-release-approval` | warning | The PR adds no `docs/releases/v<X>.<Y>.<Z>.md`. One that does is the release PR of § Release Production, whose merge needs the maintainer's approval (§ Pre-merge review); the command cannot read an approval, so it names the PR for its reader. |
@@ -1828,12 +1829,16 @@ does not state its record's mode and head, `error record-name`. A record with `a
 record with `NOT RUN` is `error record-audit-shape`; a record without an `audit` key is
 `error record-shape`, since the reviewer-alone form states the `null`.
 
-A `full` or `delta` record whose `audit.sections` holds a section whose name contains
-`auditor-only` or `completing-audit`, in any letter case, is `error record-run-kind`: those are
-the checks of the auditor-only run and of the audit that completes a run of the reviewer alone,
+The gate, not `review-ledger`, judges an audit's run kind, since only the last run at the
+head can still be audited again: when that run is a `full` or `delta` record of the defect
+form whose `audit.sections` holds a section whose name contains `auditor-only` or
+`completing-audit`, in any letter case, the gate reports `error record-run-kind`. Those are the
+checks of the auditor-only run and of the audit that completes a run of the reviewer alone,
 which only an `audit` record's run kind selects (`.claude/agents/pr-auditor.md` steps 2a, 11
 and 12), so the audit of that run with the reviewer is run again with the run-kind line
-`Run kind: with-reviewer` (`.claude/skills/pr-review/SKILL.md` § The record).
+`Run kind: with-reviewer` (`.claude/skills/pr-review/SKILL.md` § The record). A record of the
+earlier form, and one at an older head, are read as they were written, since their audits ran
+before the run-kind line existed or cannot be run again.
 
 The ledger is a sorted list without duplicates of each record's `recorded` and `dropped`
 findings, its `contested` findings, and, in an earlier-form record whose verdict is

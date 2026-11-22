@@ -2270,9 +2270,17 @@ fn finalize_creation(
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
     self_aspace: u64,
+    restored: Option<&ipc::procmgr_snapshot::Checkpoint>,
 ) -> Result<CreateResult, u64>
 {
+    use ipc::procmgr_snapshot::{CHECKPOINT_NO_CORE, CHECKPOINT_NO_DEBUG};
     let badge = process_badge;
+    // A restored process's declarations, as `DECLARE_NO_DEBUG` and
+    // `DECLARE_NO_CORE` give them, hold from its entry's insert, so no
+    // debugger reaches a process its checkpoint declared undebuggable
+    // (docs/checkpoint-restore.md § Restore creation).
+    let declarations = restored.map_or(0, |c| c.declarations);
+    let no_debug = declarations & CHECKPOINT_NO_DEBUG != 0;
     let image_bias = image.load_bias;
     let pi_memory_cap = info_caps.pi_memory.cap();
     // The node handle stays with the caller's `MemmgrSendGuard`, which hands
@@ -2284,33 +2292,7 @@ fn finalize_creation(
         ..
     } = memmgr;
 
-    // Bind a death observer from procmgr's death queues on the child's main
-    // thread. Correlator = the table badge; on death, dispatch_death recovers
-    // the entry via `take_by_badge`. A pool that runs out is followed by a
-    // further queue, so a failure here is procmgr's memory running out.
-    let bound = crate::lock(deaths).bind_thread(child_thread, badge);
-    if let Err(e) = bound
-    {
-        std::os::seraph::log!(warn: "main-thread death bind failed (err={e}); spawn refused");
-        return Err(procmgr_errors::OUT_OF_MEMORY);
-    }
-
-    // Also bind an address-space observer with the SAME correlator, so a
-    // terminal fault or a process exit (`SYS_ASPACE_EXIT`) in a *spawned*
-    // (non-main) thread — which the main-thread binding above does not cover —
-    // still routes into `dispatch_death` → `take_by_badge` → teardown. When
-    // the main thread's fault or exit is its address space's first end, both
-    // observers fire with the same correlator and `take_by_badge` reaps
-    // exactly once (the second event is a stale-correlator no-op). Without it
-    // a worker thread's fault or exit would never reap the process, so its failure refuses
-    // the spawn; the caller's guards destroy the child, which returns the
-    // main-thread observer's node.
-    let bound = crate::lock(deaths).bind_aspace(child_aspace, badge);
-    if let Err(e) = bound
-    {
-        std::os::seraph::log!(warn: "address-space death bind failed (err={e}); spawn refused");
-        return Err(procmgr_errors::OUT_OF_MEMORY);
-    }
+    bind_death_observers(deaths, child_thread, child_aspace, badge)?;
 
     let (process_handle, thread_for_caller) = caller_caps(self_endpoint, child_thread, badge)?;
 
@@ -2321,9 +2303,10 @@ fn finalize_creation(
     // otherwise-complete creation; the advertisement is written last, so the
     // page never names a pager the child does not have. Which processes are
     // exempt from the default pager is in docs/fault-handling.md § Default
-    // System Pager. A child that attaches a shared image (`image_ref`) is
-    // refused without a pager instead: nothing maps its image's attached
-    // pages but a fault memmgr serves.
+    // System Pager. A child that attaches a shared image (`image_ref`), or a
+    // restored one, is refused without a pager instead: nothing maps its
+    // image's attached pages, or the regions remade from its checkpoint, but
+    // a fault memmgr serves.
     let paged = paging == Paging::Demand
         && memmgr_send_cap != 0
         && self_memmgr_ep != 0
@@ -2339,14 +2322,19 @@ fn finalize_creation(
     {
         advertise_pager(self_aspace, pi_memory_cap, memmgr_badge);
     }
-    else if image_ref != 0
+    else if image_ref != 0 || restored.is_some()
     {
-        std::os::seraph::log!(warn: "shared image without a pager; spawn refused");
+        std::os::seraph::log!(warn: "shared image or restore without a pager; spawn refused");
         let _ = syscall::cap_delete(thread_for_caller);
         let _ = syscall::cap_delete(process_handle);
         return Err(procmgr_errors::OUT_OF_MEMORY);
     }
-    bind_crash_endpoint(child_thread, badge);
+    // A declared child is bound to neither the crash endpoint nor a
+    // debugger's (`unbind_declared`).
+    if !no_debug
+    {
+        bind_crash_endpoint(child_thread, badge);
+    }
 
     let inserted = tables.lock().table.insert(ProcessEntry {
         badge,
@@ -2365,14 +2353,13 @@ fn finalize_creation(
         entry_point,
         tls_base_va: main_tls.base_va,
         stack_top_vaddr: layout.stack_top,
-        // A restored process's start pointer is set once the entry exists
-        // (`restore_entry`).
-        start_sp: 0,
+        // A restored process starts at its checkpoint's restore stack pointer.
+        start_sp: restored.map_or(0, |c| c.restore_sp),
         process_info_va: layout.process_info_va,
         started: false,
         dma_hold: false,
-        no_debug: false,
-        no_core: false,
+        no_debug,
+        no_core: declarations & CHECKPOINT_NO_CORE != 0,
         image,
         threads: process_table::ThreadRegistry::new(),
         name: info_caps.name,
@@ -2413,6 +2400,49 @@ fn finalize_creation(
         image_bias,
         name: info_caps.name,
     })
+}
+
+/// Bind death observers from procmgr's death queues, correlator `badge`,
+/// on the child's main thread `child_thread` and on its address space
+/// `child_aspace`.
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when either binding fails: the spawn is refused.
+fn bind_death_observers(
+    deaths: &Mutex<DeathSet>,
+    child_thread: u64,
+    child_aspace: u64,
+    badge: u64,
+) -> Result<(), u64>
+{
+    // Bind a death observer from procmgr's death queues on the child's main
+    // thread. Correlator = the table badge; on death, the reaper takes the
+    // entry it names with `take_ended`. A pool that runs out is followed by a
+    // further queue, so a failure here is procmgr's memory running out.
+    let bound = crate::lock(deaths).bind_thread(child_thread, badge);
+    if let Err(e) = bound
+    {
+        std::os::seraph::log!(warn: "main-thread death bind failed (err={e}); spawn refused");
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    }
+
+    // Also bind an address-space observer with the SAME correlator, so a
+    // terminal fault or a process exit (`SYS_ASPACE_EXIT`) in a *spawned*
+    // (non-main) thread — which the main-thread binding above does not cover —
+    // still reaches the reaper, which takes the entry with `take_ended` and
+    // tears it down. When the main thread's fault or exit is its address
+    // space's first end, both observers fire with the same correlator and the
+    // entry is reaped exactly once (the second event names no entry). Without
+    // it a worker thread's fault or exit would never reap the process, so its
+    // failure refuses the spawn; the caller's guards destroy the child, which
+    // returns the main-thread observer's node.
+    let bound = crate::lock(deaths).bind_aspace(child_aspace, badge);
+    if let Err(e) = bound
+    {
+        std::os::seraph::log!(warn: "address-space death bind failed (err={e}); spawn refused");
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    }
+    Ok(())
 }
 
 /// The caps a create's reply gives its caller, derived for the child `badge`
@@ -3348,16 +3378,13 @@ pub fn create_process_from_bytes(
         ipc_buf,
         &layout,
         self_aspace,
+        restore.map(|source| &source.layout().checkpoint),
     )?;
     let _ = child_objs.disarm();
     info_caps.disarm();
     let _ = main_tls_memory.disarm();
     // The entry holds the reference now; its teardown releases it.
     let _ = shared.map(|s| s.object.into_id());
-    if let Some(source) = restore
-    {
-        restore_entry(tables, result.badge, &source.layout().checkpoint);
-    }
     Ok(result)
 }
 
@@ -3486,33 +3513,6 @@ fn fitted_layout(
             tls_base,
             ipc_buffer_va: c.ipc_buffer_va,
         })
-}
-
-/// Give the entry of the restored process `badge` its start pointer, the
-/// checkpoint's restore stack pointer, and the declarations the checkpoint
-/// records, as `DECLARE_NO_DEBUG` and `DECLARE_NO_CORE` give them
-/// (docs/checkpoint-restore.md § Restore creation). The create still owns
-/// the entry, so it is there and has no debugger and no registered thread.
-fn restore_entry(tables: &Tables, badge: u64, checkpoint: &ipc::procmgr_snapshot::Checkpoint)
-{
-    use ipc::procmgr_snapshot::{CHECKPOINT_NO_CORE, CHECKPOINT_NO_DEBUG};
-    let mut state = tables.lock();
-    let table = &mut state.table;
-    if let Some(entry) = table.find_mut_by_badge(badge)
-    {
-        entry.start_sp = checkpoint.restore_sp;
-    }
-    if checkpoint.declarations & CHECKPOINT_NO_CORE != 0
-    {
-        let _ = table.declare_no_core(badge);
-    }
-    if checkpoint.declarations & CHECKPOINT_NO_DEBUG != 0
-        && let Some(declared) = table.declare_no_debug(badge)
-        && let Some(entry) = table.find_mut_by_badge(badge)
-    {
-        unbind_declared(entry, declared.thread_cap);
-    }
-    drop(state);
 }
 
 /// The image object a child attaches its segments that are not writable

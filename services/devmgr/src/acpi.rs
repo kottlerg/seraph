@@ -754,7 +754,14 @@ impl AcpiService
                 .ok()
                 .and_then(|port| arch::current::carve_io_ports(caps, port, 1))
                 .ok_or(errors::NO_DEVICE),
-            Space::Memory => self.memory_cap(&range, caps).map(|(_, cap)| cap),
+            // A page no aperture covers, and a failed carve or derivation,
+            // are each a register devmgr cannot serve: `NO_DEVICE`, as the
+            // label gives it, where `ACPI_REGION_GRANT` replies `memory_cap`'s
+            // own statuses.
+            Space::Memory => self
+                .memory_cap(&range, caps)
+                .map(|(_, cap)| cap)
+                .map_err(|_| errors::NO_DEVICE),
         };
         match cap
         {

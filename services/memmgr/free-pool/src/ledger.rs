@@ -3556,11 +3556,12 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Start evicting the resident chunk holding `page_base` in region `reg` of
-    /// `rec` under the job slot `job` ([`ChunkEntry::begin_evict`]), once the
-    /// caller has unmapped it from the process: its runs stay on its entry
-    /// until [`Ledger::finish_evict`] stores it or a fault cancels it
-    /// ([`Ledger::cancel_evict`]). Returns the evicting entry, whose runs the
-    /// caller hands the compression worker.
+    /// `rec` under the job slot `job` ([`ChunkEntry::begin_evict`]), before
+    /// the caller unmaps it from the process, so a refusal costs the process no
+    /// mapping: its runs stay on its entry until [`Ledger::finish_evict`]
+    /// stores it or a fault, or the caller's own map back when a later step
+    /// fails, cancels it ([`Ledger::cancel_evict`]). Returns the evicting
+    /// entry, whose runs the caller hands the compression worker.
     ///
     /// # Errors
     /// [`SwapError::NoRegion`], [`SwapError::Ineligible`] when the region's

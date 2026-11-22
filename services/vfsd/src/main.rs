@@ -319,8 +319,9 @@ fn main() -> !
     }
 
     // Main becomes the watch thread: it acts on driver deaths and disk
-    // removals, and ends vfsd at the loss of its root, an exit only the main
-    // thread can make the process's (`watch::root_lost`). A death or a class
+    // removals. The loss of the root ends vfsd from whichever thread finds
+    // it (`watch::root_lost`), since an address-space exit ends the whole
+    // process (docs/process-lifecycle.md § Exit reason). A death or a class
     // change from before the loop starts stays pending in the set, so the
     // loop acts on it once it waits.
     std::os::seraph::log!("entering the watch loop");

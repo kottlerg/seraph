@@ -579,8 +579,8 @@ const LIVE_MARK: u64 = 0x4c49_5645_434f_5245;
 /// Bytes of the marked page.
 const LIVE_MARK_BYTES: usize = 4096;
 
-/// Take the one seed usertest's recipe declares for this tester
-/// (`crashd.core`) over the bootstrap protocol, start `crashme live`, and
+/// With the seed usertest's recipe declares for this tester (`crashd.core`,
+/// [`crashd_seed`]), start `crashme live`, and
 /// ask the crash service for a live core of it, charged to this tester's own
 /// memmgr account. Check the reply, that the fixture then ran on with its
 /// threads and its marked page unchanged and exited cleanly, and the core
@@ -682,7 +682,7 @@ fn crashd_seed() -> u64
     let info = std::os::seraph::startup_info();
     if info.creator_endpoint == 0
     {
-        fail("live: no creator endpoint for the declared seed");
+        fail("no creator endpoint for the declared crashd.core seed");
     }
     #[expect(
         clippy::cast_ptr_alignment,
@@ -695,7 +695,7 @@ fn crashd_seed() -> u64
     {
         Ok([cap]) if cap != 0 => cap,
         other => fail(&format!(
-            "live: the declared seed was not delivered: {other:?}"
+            "the declared crashd.core seed was not delivered: {other:?}"
         )),
     }
 }
@@ -869,12 +869,15 @@ fn check_live_core(core: &[u8], mark: u64) -> Result<(), String>
 
 fn main()
 {
+    // The seed is taken before the first write to stdout: usertest's spawn
+    // returns, and it forwards the tester's output, only once the seed
+    // request has come (docs/testing.md § Per-program tester protocol).
+    let crashd = crashd_seed();
     check("vm");
     check("exception");
     check("worker");
     check_declare();
     check_oom_hold();
-    let crashd = crashd_seed();
     check_live(crashd);
     check_live_no_core(crashd);
     println!("[crashme-tester] PASS");

@@ -82,8 +82,10 @@ any byte string parses to terms or a `Fault`, never a panic.
 
 ## Namespace
 
-Nodes live in an arena and link to their parent, first child and next sibling. Every node has
-an owner: the predefined objects, the table whose load created it, or a method frame of an
+Nodes live in an arena and link to their parent, first child and next sibling, and record the
+scope their definition is written in, from which the names of a region's offset and length, a bank
+field's value and a package's elements resolve: the parent, but for a definition by a path, which
+is placed under the path's node. Every node has an owner: the predefined objects, the table whose load created it, or a method frame of an
 evaluator, whose objects `remove_owned` deletes when the method returns. A removed node's slot
 and id are reused. A node a table created is never removed: a method frame that defines a name a
 table declared `External` holds that node until the method returns, when `remove_owned` gives
@@ -155,7 +157,7 @@ Values own their data: a package holds its elements and a buffer its bytes. An o
 generation, a frame's local or argument, or a temporary it owns) and an index path into it, so a
 store through it changes the object in place, and a reference to a removed node or to a returned
 frame's local resolves to nothing. A package element that is an unresolved name is resolved from
-the scope of the package's `Name` when it is read through `Index`.
+the scope the package's `Name` is written in when it is read, whole or through `Index`.
 
 The store rules are those of ACPI 6.5 § 19.3.5: a store to a named integer, string or buffer
 converts the value to that type, a buffer keeping its length; a store to a named object of any

@@ -311,6 +311,8 @@ struct Node
 {
     name: Seg,
     parent: NodeId,
+    /// The scope its definition appeared in ([`Namespace::scope_of`]).
+    scope: NodeId,
     child: Option<NodeId>,
     sibling: Option<NodeId>,
     owner: Owner,
@@ -386,6 +388,7 @@ impl Namespace
             Node {
                 name: *b"\\___",
                 parent: NodeId::ROOT,
+                scope: NodeId::ROOT,
                 child: None,
                 sibling: None,
                 owner: Owner::Predefined,
@@ -496,6 +499,17 @@ impl Namespace
         self.node(id).map(|n| n.parent)
     }
 
+    /// The scope the definition of `id` appeared in, from which the names
+    /// of its kept terms (a region's offset and length, a bank field's
+    /// value) and of its package's elements resolve: its parent, but for a
+    /// definition by a path, such as `Name (\_SB.PCI0.PRT0, ...)` in
+    /// `Scope (\_SB)`, which is placed under the path's node.
+    #[must_use]
+    pub fn scope_of(&self, id: NodeId) -> Option<NodeId>
+    {
+        self.node(id).map(|n| n.scope)
+    }
+
     /// The owner of `id`.
     #[must_use]
     pub fn owner(&self, id: NodeId) -> Option<Owner>
@@ -583,6 +597,7 @@ impl Namespace
         let mut node = Node {
             name,
             parent,
+            scope: parent,
             child: None,
             sibling,
             owner,
@@ -947,10 +962,16 @@ impl Namespace
             {
                 n.object = object;
                 n.owner = owner;
+                n.scope = scope;
             }
             return Ok(existing);
         }
-        self.add_child(parent, last, object, owner)
+        let id = self.add_child(parent, last, object, owner)?;
+        if let Some(n) = self.node_mut(id)
+        {
+            n.scope = scope;
+        }
+        Ok(id)
     }
 
     /// Create the node `name` declares from `scope` as a placeholder that
@@ -969,7 +990,12 @@ impl Namespace
         {
             return Err(FaultKind::Exists);
         }
-        self.add_child(parent, last, Object::Data(Data::Uninitialized), owner)
+        let id = self.add_child(parent, last, Object::Data(Data::Uninitialized), owner)?;
+        if let Some(n) = self.node_mut(id)
+        {
+            n.scope = scope;
+        }
+        Ok(id)
     }
 
     /// The placeholder [`Namespace::declare`] created for `name` from

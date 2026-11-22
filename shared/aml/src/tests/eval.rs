@@ -1411,6 +1411,36 @@ fn a_scope_over_an_alias_in_a_method_calls_the_targets_methods()
 }
 
 #[test]
+fn a_definition_by_a_path_resolves_its_names_from_where_it_is_written()
+{
+    // In DEV0: OperationRegion (\XREG, SystemMemory, OFS0, 4) and
+    // Name (\PRT0, Package () { LNKA }), with OFS0 and LNKA DEV0's own: each
+    // name resolves from DEV0, where the definition is written, not from the
+    // root the path places it under.
+    let defs = device(
+        "DEV0",
+        &cat(&[
+            &name_obj("OFS0", &i(0x2000)),
+            &device("LNKA", &[]),
+            &region("\\XREG", 0, &n("OFS0"), &i(4)),
+            &field("\\XREG", 0x01, &[unit("XB00", 8)]),
+            &name_obj("\\PRT0", &package(1, &[n("LNKA")])),
+        ]),
+    );
+    let mut ns = table_of(2, &defs, 0, &store(&i(0x5A), &n("\\DEV0.XB00")));
+    let mut sim = Sim::new();
+    run_on(&mut ns, &mut sim, "\\TEST", vec![]).unwrap();
+    assert_eq!(sim.mem_byte(0x2000), 0x5A);
+    let prt = run_on(&mut ns, &mut sim, "\\PRT0", vec![]).unwrap();
+    let Data::Package(p) = prt
+    else
+    {
+        panic!("{prt:?}");
+    };
+    assert!(matches!(p[0], Data::Ref(_)), "{:?}", p[0]);
+}
+
+#[test]
 fn package_nesting_is_bounded()
 {
     // Local0 = Package { Local0 }, again and again.

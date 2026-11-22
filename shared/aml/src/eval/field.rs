@@ -585,7 +585,7 @@ impl Evaluator<'_>
                 value: bank_value,
             } =>
             {
-                let scope = self.ns.parent(node).unwrap_or(NodeId::ROOT);
+                let scope = self.ns.scope_of(node).unwrap_or(NodeId::ROOT);
                 let v = self.operand(bank_value, scope, node)?;
                 self.write_field(bank, Data::Integer(v))?;
                 self.region_io(region, off, width, value)
@@ -645,7 +645,7 @@ impl Evaluator<'_>
             Some(_) => return Err(bare(FaultKind::Type)),
             None => return Err(bare(FaultKind::NotFound)),
         };
-        let scope = self.ns.parent(node).unwrap_or(NodeId::ROOT);
+        let scope = self.ns.scope_of(node).unwrap_or(NodeId::ROOT);
         let base = self.operand(r.offset, scope, node)?;
         let len = self.operand(r.length, scope, node)?;
         if let Some(Object::Region(kept)) = self.ns.object_mut(node)

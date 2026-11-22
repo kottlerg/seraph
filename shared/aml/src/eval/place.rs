@@ -622,7 +622,7 @@ impl Evaluator<'_>
         let mut v = element(navigate(root, prefix).map_err(bare)?, *last).map_err(bare)?;
         if let Base::Node { node, .. } = r.base
         {
-            let scope = self.ns.parent(node).unwrap_or(NodeId::ROOT);
+            let scope = self.ns.scope_of(node).unwrap_or(NodeId::ROOT);
             self.resolve_names(&mut v, scope);
         }
         Ok(v)

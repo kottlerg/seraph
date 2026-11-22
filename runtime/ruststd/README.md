@@ -932,8 +932,9 @@ signals no more.
   endpoint as the account the checkpoint is charged to, and returns a `Checkpoint`: the object's
   pages, whether the capture is complete, and its handle, which `handle` lends, `into_raw` hands
   over and a drop releases (`OBJECT_RELEASE`, made again while a stop interrupts it, since nothing
-  else releases it). A process at no quiesce point is refused `ResourceBusy`, and one procmgr
-  could not mark (`NOT_RESTORABLE`) `Unsupported`.
+  else releases it). A process at no quiesce point is refused `ResourceBusy`, one whose space
+  another capture holds (`SPACE_HELD`, which the caller may ask again on) `WouldBlock`, and one
+  procmgr could not mark (`NOT_RESTORABLE`) `Unsupported`.
 - `CommandExt::restore(object)` makes the next spawn of a `Command` a restore of the checkpoint
   whose handle `object` is (`CREATE_RESTORE`): the spawn sends a copy of the handle, which procmgr
   deletes, and no argv or env, since the restored process has its checkpoint's. That spawn takes

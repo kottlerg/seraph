@@ -3163,7 +3163,9 @@ pub mod checkpoint {
     /// the cap is not a process handle; `QuotaExceeded` when the account's
     /// max refused the frames; `Unsupported` when memmgr refused the
     /// checkpoint mark, so no restore would accept the object
-    /// (`NOT_RESTORABLE`); `OutOfMemory` otherwise; a failed call's error.
+    /// (`NOT_RESTORABLE`); `WouldBlock` when another capture holds the
+    /// process's space, or the hold was interrupted, so the caller may ask
+    /// again (`SPACE_HELD`); `OutOfMemory` otherwise; a failed call's error.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn take(process_handle: u64) -> io::Result<Checkpoint> {
         use ipc::procmgr_errors as e;
@@ -3191,6 +3193,7 @@ pub mod checkpoint {
             e::UNAUTHORIZED => Some(io::ErrorKind::PermissionDenied),
             e::LIMIT => Some(io::ErrorKind::QuotaExceeded),
             e::NOT_RESTORABLE => Some(io::ErrorKind::Unsupported),
+            e::SPACE_HELD => Some(io::ErrorKind::WouldBlock),
             _ => Some(io::ErrorKind::OutOfMemory),
         };
         match (refused, caps) {

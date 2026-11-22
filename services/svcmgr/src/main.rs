@@ -719,8 +719,8 @@ fn event_loop(
         // The retry timer of the restarts that wait for memory
         // (`MemoryWaits::poll_timer`): its deadline is kept across every
         // wake, so no stream of requests holds a timed retry off, and with no
-        // restart waiting below CRITICAL the wait has no timeout, so svcmgr
-        // makes no idle wake-up.
+        // restart waiting, or no level read, the wait has no timeout, so
+        // svcmgr makes no idle wake-up.
         let waiting = state
             .table
             .services
@@ -800,7 +800,8 @@ fn pressure_member(deaths: &death_set::DeathSet) -> u64
 
 /// Handle `wake` for the restarts that wait for memory: read memmgr's level,
 /// record it (which arms or disarms the retry timer), and when it makes a
-/// retry due (`MemoryWaits::wake`: the level reads below `CRITICAL`) retry
+/// retry due (`MemoryWaits::wake`: a signal read below `CRITICAL`, or the
+/// timer at any level read) retry
 /// the restart of every waiting service (`restart::retry_memory_wait`),
 /// routing each outcome as a death's: an unrecoverable one starts the
 /// graceful shutdown once every retry is made.

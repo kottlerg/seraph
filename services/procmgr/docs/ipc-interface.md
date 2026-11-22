@@ -1760,7 +1760,7 @@ the Notification of a refused request.
 |---|---|
 | label | `procmgr_labels::CHECKPOINT` (35) |
 | caller's cap | A process handle (§ Messages), which names the process |
-| `caps[0]` | The **account**, a memmgr SEND as `SNAPSHOT` takes one (§ Label 33). procmgr deletes it, and any further cap the message carried, before it replies |
+| `caps[0]` | The **account**, a memmgr SEND as `SNAPSHOT` takes one (§ Label 33). procmgr deletes any further cap the message carried before it replies, and the account once it has replied |
 
 The process's controller, a holder of its process handle, takes a checkpoint of it at its quiesce
 point here ([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#checkpoint)

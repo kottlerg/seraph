@@ -1352,9 +1352,14 @@ fn create_and_open_in(
     release_send: u64,
 ) -> io::Result<(u64, u64)>
 {
-    let carries_grant = syscall::cap_info(split.parent_cap, syscall::CAP_INFO_TAG_RIGHTS)
-        .is_ok_and(|v| v & syscall::RIGHTS_EP_GRANT != 0);
-    if !carries_grant
+    // A parent an unmount revoked reads as dead, as the call on it would
+    // (`call_failed`).
+    let Ok(parent) = syscall::cap_info(split.parent_cap, syscall::CAP_INFO_TAG_RIGHTS)
+    else
+    {
+        return Err(call_failed(split.parent_cap, "seraph fs: the parent directory's cap is gone"));
+    };
+    if parent & syscall::RIGHTS_EP_GRANT == 0
     {
         return Err(io::const_error!(
             io::ErrorKind::PermissionDenied,

@@ -11,8 +11,9 @@
 //!
 //! The phase drives the request raw: a create opens the new file in the
 //! session its cap names, an existing name is `EXISTS` unless the request
-//! asks to open it (`CREATE_OPEN_EXISTING`), and then opens it, a directory
-//! of that name is `IS_A_DIRECTORY`, a request with no session cap or with
+//! asks to open it (`CREATE_OPEN_EXISTING`), and then opens it unless the
+//! directory's cap lacks `LOOKUP` (`PERMISSION_DENIED`), a directory of that
+//! name is `IS_A_DIRECTORY`, a request with no session cap or with
 //! the second flag alone is `INVALID_ARGUMENT`, and in a session whose node is
 //! at its max a create, and an open of an existing file, are `LIMIT` and make
 //! no entry. Three children drive std's create: a `fs-create-open-full` child
@@ -220,6 +221,23 @@ fn create_in(
     create_open(dir, name, flags, &[session_copy(session)], ipc_buf)
 }
 
+/// A cap on `/data/svctest` with every right but `LOOKUP`.
+fn no_lookup_dir(ipc_buf: *mut u64) -> u64
+{
+    use namespace_protocol::{NamespaceRights, rights};
+
+    let mask = u64::from(
+        NamespaceRights::ALL
+            .difference(NamespaceRights::from_raw(rights::LOOKUP))
+            .raw(),
+    );
+    let (data, _kind, _size) = ns_lookup(std::os::seraph::root_dir_cap(), b"data", 0xFFFF, ipc_buf)
+        .expect("lookup of /data");
+    let dir = ns_lookup(data, b"svctest", mask, ipc_buf);
+    let _ = syscall::cap_delete(data);
+    dir.expect("lookup of /data/svctest without LOOKUP").0
+}
+
 /// The size of the file `name` in `dir`, `None` when `dir` holds no such
 /// entry.
 fn entry_size(dir: u64, name: &str, ipc_buf: *mut u64) -> Option<u64>
@@ -321,6 +339,15 @@ fn raw_creates(svctest: u64, session: u64, ipc_buf: *mut u64)
         "a create that opens the existing directory {DIR}"
     );
     fs_remove(svctest, DIR.as_bytes(), ipc_buf).expect("FS_REMOVE of the directory");
+
+    // Opening a file found by name needs LOOKUP on the directory's cap.
+    let blind = no_lookup_dir(ipc_buf);
+    assert_eq!(
+        create_in(blind, NEW, OPEN_EXISTING, session, ipc_buf).err(),
+        Some(fs_errors::PERMISSION_DENIED),
+        "a create that opens the existing {NEW} through a cap without LOOKUP"
+    );
+    let _ = syscall::cap_delete(blind);
 
     // Malformed requests make no entry.
     assert_eq!(

@@ -131,7 +131,9 @@ pub const CREATE_OPEN: u64 = 1 << 32;
 /// [`FS_CREATE`] flag (label bit 33), valid only with [`CREATE_OPEN`]:
 /// when the directory already holds a file of that name, open that file
 /// instead of answering `fs_errors::EXISTS`; a directory of that name is
-/// answered `fs_errors::IS_A_DIRECTORY`.
+/// answered `fs_errors::IS_A_DIRECTORY`. Opening a file found by name needs
+/// `LOOKUP` on the badge too: without it an existing entry is answered
+/// `fs_errors::PERMISSION_DENIED`.
 pub const CREATE_OPEN_EXISTING: u64 = 1 << 33;
 /// Remove a file or empty directory from a directory.
 ///

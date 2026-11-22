@@ -825,7 +825,8 @@ The flags (`ipc::fs_labels`):
   and reply with the open cap instead of a node cap.
 - `CREATE_OPEN_EXISTING` (bit 33), valid only with `CREATE_OPEN`: when the
   directory already holds a file of that name, open that file instead of
-  answering `EXISTS`.
+  answering `EXISTS`. Opening a file found by name resolves the name, so the
+  badge must then carry `LOOKUP` too, as an `NS_LOOKUP` of it would.
 
 A request without `CREATE_OPEN` carries no cap, and the driver deletes any it
 carries.
@@ -867,8 +868,9 @@ carried caps:
   `IO_ERROR` when the driver cannot mint the open cap.
 - `TOO_MANY_OPEN`: the driver's node table is full or the heap cannot grow
   it.
-- `IS_A_DIRECTORY`: with `CREATE_OPEN_EXISTING`, the directory holds a
-  directory of that name.
+- With `CREATE_OPEN_EXISTING`, when the directory holds an entry of that
+  name: `PERMISSION_DENIED` (the badge lacks `LOOKUP`), `IS_A_DIRECTORY` (the
+  entry is a directory).
 - `EXISTS` (the directory already holds an entry of that name, and the
   request does not open an existing file), `NO_SPACE`, `IO_ERROR`: writing
   the entry failed.

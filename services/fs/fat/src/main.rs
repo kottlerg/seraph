@@ -2809,8 +2809,9 @@ fn create_and_open(
             .close(OpenRef(prepared.id), cache);
         reply_err(code, ipc_buf);
     };
+    let open_existing = (msg.label & fs_labels::CREATE_OPEN_EXISTING != 0).then_some(parent_rights);
     let node = match file_to_open(
-        msg,
+        open_existing,
         prepared.parent_cluster,
         prepared.name,
         state,
@@ -2961,13 +2962,16 @@ fn prepare_create_open<'a>(
     }
 }
 
-/// The node a create that opens its file opens: with
-/// `CREATE_OPEN_EXISTING`, the file `name` names in the directory at
-/// `parent_cluster` when it holds one (`IS_A_DIRECTORY` for a directory);
-/// otherwise a new entry, written by [`make_entry`]. The error is the
-/// `fs_errors` code to answer.
+/// The node a create that opens its file opens. `open_existing` holds the
+/// parent cap's rights when the request carries `CREATE_OPEN_EXISTING`: the
+/// file `name` names in the directory at `parent_cluster` is then opened when
+/// the directory holds one (`IS_A_DIRECTORY` for a directory, and
+/// `PERMISSION_DENIED` when those rights lack `LOOKUP`, without which no
+/// request resolves a name in the directory). Otherwise the node is a new
+/// entry, written by [`make_entry`]. The error is the `fs_errors` code to
+/// answer.
 fn file_to_open(
-    msg: &IpcMessage,
+    open_existing: Option<NamespaceRights>,
     parent_cluster: u32,
     name: &[u8],
     state: &mut FatState,
@@ -2976,21 +2980,21 @@ fn file_to_open(
     ipc_buf: *mut u64,
 ) -> Result<backend::FatNode, u64>
 {
-    let found = if msg.label & fs_labels::CREATE_OPEN_EXISTING != 0
-    {
+    let found = open_existing.and_then(|rights| {
         find_in_directory_with_location(parent_cluster, name, state, cache, caps.block_dev, ipc_buf)
-    }
-    else
-    {
-        None
-    };
+            .map(|found| (rights, found))
+    });
     match found
     {
-        Some((entry, _)) if FatfsBackend::entry_kind(&entry) == NodeKind::Dir =>
+        Some((rights, _)) if !rights.contains(namespace_protocol::rights::LOOKUP) =>
+        {
+            Err(ipc::fs_errors::PERMISSION_DENIED)
+        }
+        Some((_, (entry, _))) if FatfsBackend::entry_kind(&entry) == NodeKind::Dir =>
         {
             Err(ipc::fs_errors::IS_A_DIRECTORY)
         }
-        Some((entry, loc)) => Ok(backend::FatNode {
+        Some((_, (entry, loc))) => Ok(backend::FatNode {
             cluster: entry.cluster,
             size: entry.size,
             kind: NodeKind::File,

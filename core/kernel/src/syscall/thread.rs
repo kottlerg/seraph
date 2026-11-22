@@ -2348,6 +2348,8 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
         (old_prio, state)
     };
 
+    // The CPU whose run queue the relocation re-linked the thread on, if any.
+    let mut relinked_on = None;
     if state == ThreadState::Ready && old_prio != priority
     {
         // A Ready TCB is normally linked on exactly one CPU's run queue, the
@@ -2367,7 +2369,7 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
         };
         // SAFETY: target_tcb is valid and its sched_lock is held; no run-queue
         // lock is held; hint < cpu_count, which CPU_COUNT supplied.
-        let _ = unsafe {
+        relinked_on = unsafe {
             crate::sched::relocate_ready_priority(target_tcb, old_prio, priority, hint, cpu_count)
         };
     }
@@ -2377,6 +2379,16 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
     let lock = unsafe { &(*target_tcb).sched_lock };
     // SAFETY: tcb_sched_saved from the lock_raw above.
     unsafe { lock.unlock_raw(tcb_sched_saved) };
+
+    // The relocation's unlink can empty that CPU's run queues for a moment, and
+    // its idle loop can read them empty then and halt; the re-link, like every
+    // link on another CPU, is followed by the wake IPI, sent after the unlock
+    // (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants).
+    if let Some(cpu) = relinked_on
+    {
+        // SAFETY: relocate_ready_priority returns only a CPU below cpu_count.
+        unsafe { crate::sched::prod_remote_cpu(cpu) };
+    }
 
     Ok(0)
 }

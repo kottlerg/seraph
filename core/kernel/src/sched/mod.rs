@@ -5198,7 +5198,9 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// idle CPU. `sys_thread_set_affinity` also uses it as the wake-protocol prod
 /// of the destination CPU after `migrate_ready_thread` moved a `Ready` thread
 /// there (the move linked the thread on that CPU's run queue; the prod wakes it
-/// from idle to dispatch the thread).
+/// from idle to dispatch the thread), and `sys_thread_set_priority` as the
+/// prod of the CPU on which `relocate_ready_priority` re-linked a `Ready`
+/// thread.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI

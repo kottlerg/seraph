@@ -637,7 +637,10 @@ relocate runs through `sched::relocate_ready_priority`:
 The held `(*tcb).sched_lock` serialises the whole operation against
 `migrate_ready_thread`, `dealloc_object(Thread)`, and
 `set_state_under_all_locks` (all take the same per-TCB lock); the run-queue
-lock(s) cover the intrusive list surgery.
+lock(s) cover the intrusive list surgery. Once it releases `sched_lock`, the syscall prods the
+CPU the entry was re-linked on (`prod_remote_cpu`): the unlink can empty that CPU's run queues for
+a moment, and its idle loop, which reads them without the lock, can halt on that reading
+(§ Wake Protocol Invariants).
 
 The "Ready ⇒ linked on exactly one queue" invariant has a transient
 exception during any window where a caller publishes `state = Ready` on
@@ -1181,22 +1184,24 @@ Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
    IPIs to running targets cost only a trap entry; the cost is negligible against the
    missed-wakeup risk.
 
-**Why one notification suffices.** `non_empty` (per-CPU `AtomicU32`, one bit per run queue)
-is the only notification the idle loop reads, and the dispatcher indexes the queues by it. Every
-path that links a thread on another CPU's run queue sets its queue's bit under that CPU's run-queue
-lock and then sends the wake IPI: `enqueue_and_wake`, `enqueue_ready_thread`, `schedule()`'s
-cross-affinity requeue, and `sys_thread_set_affinity`'s `migrate_ready_thread`, whose caller
-prods the destination (`prod_remote_cpu`) after its unlock. A path that links a thread on its own
-CPU (`schedule()`'s deferred-dispatch re-link, and the load balancer's pull, which moves a thread
-onto the pulling CPU from its `timer_tick`) needs no IPI: the link precedes that CPU's next masked
-check in program order, or, made in an interrupt taken during the halt, ends the halt itself. In
-the masked check (consumer step 2), a load that misses a remote link was made before the link was
-visible, so the IPI that invariant 1 orders after the link arrives after the mask, is held
-pending, and ends the atomic halt; a load after it sees the bit. An IPI that finds no work (a
-thread pulled away before the check, or `sys_thread_set_affinity`'s prod of a CPU running its
-target, which observes the change at its next `schedule()` entry) costs one pass of the loop,
-which re-checks and halts. The always-IPI rule and the masked `has_runnable` check therefore
-close the check-to-halt window with `non_empty` alone; no second per-CPU flag is needed.
+**Why one notification suffices.** `non_empty` (per-CPU `AtomicU32`, one bit per run queue) is the
+only notification the idle loop reads, and the dispatcher indexes the queues by it. Every path that
+links a thread on another CPU's run queue sets its queue's bit under that CPU's run-queue lock and
+then sends the wake IPI: `enqueue_and_wake`, `enqueue_ready_thread`, `schedule()`'s cross-affinity
+requeue, `sys_thread_set_affinity`'s `migrate_ready_thread`, and `sys_thread_set_priority`'s
+`relocate_ready_priority`, whose callers prod the CPU (`prod_remote_cpu`) after their unlock; the
+priority relocation's unlink can empty the queues for a moment, so its re-link is a link like any
+other. A path that links a thread on its own CPU (`schedule()`'s requeue of the outgoing thread and
+its deferred-dispatch re-link, the load balancer's pull, which moves a thread onto the pulling CPU
+from its `timer_tick`, and Phase 9's link of init on the boot CPU) needs no IPI: the link precedes
+that CPU's next masked check in program order, or, made in an interrupt taken during the halt, ends
+the halt itself. In the masked check (consumer step 2), a load that misses a remote link was made
+before the link was visible, so the IPI that invariant 1 orders after the link arrives after the
+mask, is held pending, and ends the atomic halt; a load after it sees the bit. An IPI that finds no
+work (a thread pulled away before the check, or `sys_thread_set_affinity`'s prod of a CPU running
+its target, which observes the change at its next `schedule()` entry) costs one pass of the loop,
+which re-checks and halts. The always-IPI rule and the masked `has_runnable` check therefore close
+the check-to-halt window with `non_empty` alone; no second per-CPU flag is needed.
 
 ---
 

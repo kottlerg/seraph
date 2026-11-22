@@ -295,7 +295,9 @@ wait is one state machine, `svcmgr_defs::memory_wait` (host-tested over every tr
   restart of <name>`. Retries on signals are bounded by the changes of level, and timed retries
   made below `CRITICAL` by `MEMORY_RETRY_LIMIT`, about a minute there with memory still short,
   after which svcmgr logs `restart of <name> given up`. A timed retry at `CRITICAL` is not
-  counted: an episode oomd has yet to end spends none of the limit.
+  counted: an episode oomd has yet to end spends none of the limit. A retry's refusal for want of
+  memory logs nothing, so a wait that holds at `CRITICAL` adds no line per timed retry; the wait's
+  own lines (`waits for memory`, `given up`, `service restarted`) report it.
 - **Down.** `permanent_death_outcome`: `critical` decides the rest, an `Unrecoverable` outcome
   starting the graceful shutdown.
 

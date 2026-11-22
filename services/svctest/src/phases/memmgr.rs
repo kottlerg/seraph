@@ -320,6 +320,43 @@ pub(crate) fn pool_free_and_largest() -> (u64, u64)
     (reply.word(3), reply.word(5))
 }
 
+/// memmgr's pool as a grant to svctest, a node outside the reserve, is
+/// admitted against it, in bytes, from one `QUERY_POOL_STATUS`: the free
+/// bytes outside `promised` (`data[17]`), which the grant and an uncommitted
+/// demand fault draw from, the largest free run (`data[5]`), and the growth
+/// floor (`data[11]`) they may not take (services/memmgr/docs/ipc-interface.md
+/// § Label 6).
+pub(crate) fn pool_admissible() -> PoolAdmissible
+{
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
+    let reply = memmgr_call(&req, "QUERY_POOL_STATUS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "QUERY_POOL_STATUS status"
+    );
+    PoolAdmissible {
+        free: reply.word(3),
+        uncommitted: reply.word(17),
+        largest: reply.word(5),
+        floor: reply.word(11),
+    }
+}
+
+/// What [`pool_admissible`] read, in bytes.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PoolAdmissible
+{
+    /// Free bytes (`data[3]`).
+    pub(crate) free: u64,
+    /// Free bytes outside `promised` (`data[17]`).
+    pub(crate) uncommitted: u64,
+    /// Bytes of the largest free run (`data[5]`).
+    pub(crate) largest: u64,
+    /// The growth floor (`data[11]`).
+    pub(crate) floor: u64,
+}
+
 /// memmgr's growth floor (`QUERY_POOL_STATUS` `data[11]`), in bytes: the free
 /// bytes outside `promised` a grant to svctest, which is outside the reserve,
 /// may not take, the system reserve and, while chunks are swapped, the restore

@@ -614,6 +614,7 @@ fn demand_fault_fragmented_phase(_: &Caps)
         drawn_pages,
         hole_count,
         free,
+        uncommitted,
         largest,
         floor,
     } = fragment_pool(&mut held, &mut holes, target);
@@ -622,11 +623,12 @@ fn demand_fault_fragmented_phase(_: &Caps)
         "demand_fault_fragmented: the pool kept a run of {largest} bytes, a chunk or more"
     );
     assert!(
-        free >= floor
-            .saturating_add(FRAGMENT_HEADROOM_PAGES)
-            .saturating_mul(page),
-        "demand_fault_fragmented: {hole_count} holes left {free} free bytes, too few above the \
-         {floor}-page growth floor for the region"
+        uncommitted
+            >= floor
+                .saturating_add(FRAGMENT_HEADROOM_PAGES)
+                .saturating_mul(page),
+        "demand_fault_fragmented: {hole_count} holes left {uncommitted} free bytes outside \
+         promised, too few above the {floor}-page growth floor for the region"
     );
 
     // SAFETY: the span is a read-write demand region of this process, whose
@@ -657,8 +659,8 @@ fn demand_fault_fragmented_phase(_: &Caps)
     assert_ram_identity();
     std::os::seraph::log!(
         "demand_fault_fragmented: {grants} grants drew {drawn_pages} pages and {hole_count} holes \
-         left {free} free bytes in runs of at most {largest} over a {floor}-page growth floor; \
-         {FRAGMENTED_REGION_PAGES} demand pages backed"
+         left {free} free bytes, {uncommitted} outside promised, in runs of at most {largest} over \
+         a {floor}-page growth floor; {FRAGMENTED_REGION_PAGES} demand pages backed"
     );
 }
 
@@ -697,6 +699,7 @@ fn cspace_topup_fragmented_phase(_: &Caps)
         drawn_pages,
         hole_count,
         free,
+        uncommitted,
         largest,
         floor,
     } = fragment_pool(&mut held, &mut holes, target);
@@ -716,17 +719,18 @@ fn cspace_topup_fragmented_phase(_: &Caps)
         "cspace_topup_fragmented: the pool kept a run of {largest} bytes, a chunk or more"
     );
     assert!(
-        free >= floor
-            .saturating_add(FRAGMENT_HEADROOM_PAGES)
-            .saturating_mul(page),
-        "cspace_topup_fragmented: {hole_count} holes left {free} free bytes, too few above the \
-         {floor}-page growth floor for the top-up"
+        uncommitted
+            >= floor
+                .saturating_add(FRAGMENT_HEADROOM_PAGES)
+                .saturating_mul(page),
+        "cspace_topup_fragmented: {hole_count} holes left {uncommitted} free bytes outside \
+         promised, too few above the {floor}-page growth floor for the top-up"
     );
     assert!(
         funded,
         "cspace_topup_fragmented: a top-up for {want} slots from a headroom of {before} was \
-         refused with {free} bytes free in runs of at most {largest} over a {floor}-page growth \
-         floor"
+         refused with {free} bytes free, {uncommitted} outside promised, in runs of at most \
+         {largest} over a {floor}-page growth floor"
     );
     assert!(
         after >= want,
@@ -736,8 +740,8 @@ fn cspace_topup_fragmented_phase(_: &Caps)
     assert_ram_identity();
     std::os::seraph::log!(
         "cspace_topup_fragmented: {grants} grants drew {drawn_pages} pages and {hole_count} holes \
-         left {free} free bytes in runs of at most {largest} over a {floor}-page growth floor; \
-         headroom {before} -> {after} slots"
+         left {free} free bytes, {uncommitted} outside promised, in runs of at most {largest} over \
+         a {floor}-page growth floor; headroom {before} -> {after} slots"
     );
 }
 
@@ -746,10 +750,13 @@ fn cspace_topup_fragmented_phase(_: &Caps)
 ///
 /// The floor rises while memmgr evicts at `LOW`, which the cut reaches, up to
 /// twice the reserve: at most twice what it is now, since it is never below
-/// the reserve. The cut starts from the target's free pages and ends at the
+/// the reserve. Every count here is of the free pages outside `promised`,
+/// which memmgr admits svctest's grants and its uncommitted demand faults
+/// against (`QUERY_POOL_STATUS` `data[17]`), so the pages `promised` holds
+/// free lie outside them. The cut starts from the target and ends at the
 /// floor, at most `ceiling`, so it takes `target - ceiling` pages or more,
 /// half of them holes. Once the holes are released, the draw of what the cut
-/// left uncut (at most the floor) must still leave the floor and
+/// left uncut (about the floor) must still leave the floor and
 /// [`FRAGMENT_HEADROOM_PAGES`] free.
 fn fragment_bounds(floor: u64) -> (u64, usize)
 {
@@ -770,12 +777,14 @@ fn fragment_bounds(floor: u64) -> (u64, usize)
 
 /// Fragment the pool for [`demand_fault_fragmented_phase`] and
 /// [`cspace_topup_fragmented_phase`] so that no free run
-/// covers a chunk while the free pages exceed memmgr's growth floor
-/// ([`pool_growth_floor`](super::memmgr::pool_growth_floor)). memmgr refuses a
-/// grant to svctest that would leave fewer free pages than the floor, so the
-/// holes svctest makes must hold the floor's pages too:
+/// covers a chunk while the free pages outside `promised` exceed memmgr's
+/// growth floor ([`pool_admissible`](super::memmgr::pool_admissible)). memmgr
+/// refuses a grant to svctest that would leave fewer free pages outside
+/// `promised` than the floor, so the holes svctest makes must hold the
+/// floor's pages too:
 ///
-/// 1. Draw from the largest runs until `target` pages are free.
+/// 1. Draw from the largest runs until `target` pages outside `promised` are
+///    free.
 /// 2. Cut what is free into hole-sized grants (`DEMAND_CHUNK_PAGES - 1`
 ///    pages), the smallest run that fits first and each run front first,
 ///    keeping every other one as a hole, until a grant is refused at the
@@ -792,9 +801,7 @@ fn fragment_bounds(floor: u64) -> (u64, usize)
 fn fragment_pool(held: &mut Vec<(u64, u64)>, holes: &mut Vec<(u64, u64)>, target: u64)
 -> Fragmented
 {
-    use super::memmgr::{
-        pool_free_and_largest, pool_growth_floor, release_grant, try_request_contiguous,
-    };
+    use super::memmgr::{pool_admissible, release_grant, try_request_contiguous};
 
     let page = syscall_abi::PAGE_SIZE;
     let hole_pages = DEMAND_CHUNK_PAGES - 1;
@@ -804,8 +811,10 @@ fn fragment_pool(held: &mut Vec<(u64, u64)>, holes: &mut Vec<(u64, u64)>, target
     let mut reached = false;
     for _ in 0..FRAGMENT_MAX_DRAWS
     {
-        let (free, largest) = pool_free_and_largest();
-        let take = (free / page).saturating_sub(target).min(largest / page);
+        let pool = pool_admissible();
+        let take = (pool.uncommitted / page)
+            .saturating_sub(target)
+            .min(pool.largest / page);
         if take < hole_pages
         {
             reached = true;
@@ -850,19 +859,20 @@ fn fragment_pool(held: &mut Vec<(u64, u64)>, holes: &mut Vec<(u64, u64)>, target
     let mut seen = Fragmented::default();
     for _ in 0..FRAGMENT_MAX_DRAWS
     {
-        let (free, largest) = pool_free_and_largest();
-        let floor = pool_growth_floor() / page;
+        let pool = pool_admissible();
+        let floor = pool.floor / page;
         seen = Fragmented {
             drawn_pages,
             hole_count,
-            free,
-            largest,
+            free: pool.free,
+            uncommitted: pool.uncommitted,
+            largest: pool.largest,
             floor,
         };
-        let run = largest / page;
+        let run = pool.largest / page;
         // A run memmgr would refuse at the floor stays; the phase's check
         // reports it.
-        if run < DEMAND_CHUNK_PAGES || (free / page).saturating_sub(run) < floor
+        if run < DEMAND_CHUNK_PAGES || (pool.uncommitted / page).saturating_sub(run) < floor
         {
             break;
         }
@@ -887,6 +897,9 @@ struct Fragmented
     hole_count: usize,
     /// Free bytes.
     free: u64,
+    /// Free bytes outside `promised`, which memmgr admits a grant to svctest
+    /// and an uncommitted demand fault against.
+    uncommitted: u64,
     /// Bytes of the largest free run.
     largest: u64,
     /// The growth floor, in pages.

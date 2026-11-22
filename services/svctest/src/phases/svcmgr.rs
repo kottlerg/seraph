@@ -499,6 +499,15 @@ fn check_stop_sources(stop_cap: u64, phase: &str)
             label, NO_CANDIDATE,
             "{phase}: STOP_CANDIDATE of a key {name} never gave replied {label:#x}"
         );
+        if name == "stopsrc"
+        {
+            let label = call_label(send, ipc::stopsrc_labels::PROBE, 0, phase);
+            assert_eq!(
+                label,
+                ipc::stopsrc_labels::SUCCESS,
+                "{phase}: PROBE through stopsrc's stop SEND replied {label:#x}"
+            );
+        }
         let _ = syscall::cap_delete(send);
     }
     if stopsrc
@@ -593,9 +602,10 @@ fn check_source_contained(authority: u64, phase: &str)
 /// the program class and each when its recipe is staged, and nothing else
 /// ([`check_stop_sources`]). The SEND each entry carries reaches that
 /// source's stop labels: its list replies `SUCCESS`, and a stop of a key it
-/// never gave replies `NO_CANDIDATE`. The fixture's own `:deny` SEND, which
-/// any process can query, gets `UNAUTHORIZED` for both, and the job an
-/// instance of the fixture started ends with that instance
+/// never gave replies `NO_CANDIDATE`. The fixture's SEND reaches its own
+/// labels too: its `PROBE` replies `SUCCESS`. The fixture's own `:deny`
+/// SEND, which any process can query, gets `UNAUTHORIZED` for both, and the
+/// job an instance of the fixture started ends with that instance
 /// ([`check_source_contained`]).
 ///
 /// With `crasher-worker` staged, `STOP_CANDIDATE` of its listed key replies

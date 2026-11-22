@@ -715,7 +715,7 @@ impl Attached
         })
     }
 
-    /// Detach the object and release it.
+    /// Detach the object, release it, and delete its handle.
     pub(super) fn release(self)
     {
         expect_region_reply(
@@ -738,6 +738,9 @@ impl Attached
             "{}: OBJECT_RELEASE replied {got:#x}",
             self.phase
         );
+        // The handle is this value's own (a checkpoint's through
+        // `Checkpoint::into_raw`), and the release ends its use.
+        let _ = syscall::cap_delete(self.handle);
     }
 }
 

@@ -33,9 +33,10 @@
 //! process's swapped count, until a restore maps it again or a teardown frees
 //! its store and releases the charge (`services/memmgr/docs/memory-pool.md`
 //! § Eviction). A compressed chunk the swap service takes is writing while its
-//! write is in flight, its store runs held on its disk node, and on disk once
-//! the write ends, its store runs back in the pool and its pages counted in
-//! `disk_pages` too; it stays in `swapped_pages` and keeps its charge
+//! write is in flight, its store runs still held on its entry
+//! ([`ChunkEntry::store`]) and its disk node holding only the slot, the
+//! nonce and the byte count, and on disk once the write ends, its store runs
+//! back in the pool and its pages counted in `disk_pages` too; it stays in `swapped_pages` and keeps its charge
 //! throughout, and so does a chunk lost to a failed authentication (§ Disk
 //! tier).
 //!

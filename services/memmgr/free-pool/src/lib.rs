@@ -110,7 +110,10 @@ pub struct DemandRegion
 pub enum Evict
 {
     /// Its cold chunks are evicted under memory pressure, unless its process
-    /// is a reserve node's or the region is committed.
+    /// is a reserve node's or the region is a memory-object attachment; a
+    /// committed region's chunks only while a swap service has registered swap
+    /// slots ([`crate::Ledger::evictable`], [`crate::Ledger::overcommits`];
+    /// `services/memmgr/docs/memory-pool.md` § Eviction, Committed pages).
     Allowed,
     /// Registered no-evict: its chunks stay resident.
     Never,

@@ -1157,11 +1157,14 @@ struct InitBootstrap
     in_use_count: usize,
     system_ram_bytes: u64,
     kernel_reserved_bytes: u64,
+    /// memmgr's own `CSpace`, whose used slots `QUERY_POOL_STATUS` reports.
+    self_cspace: u64,
 }
 
 fn bootstrap_from_init(
     creator_ep: u64,
     self_aspace_cap: u64,
+    self_cspace: u64,
     ipc_buf: *mut u64,
 ) -> Option<InitBootstrap>
 {
@@ -1288,6 +1291,7 @@ fn bootstrap_from_init(
         in_use_count,
         system_ram_bytes,
         kernel_reserved_bytes,
+        self_cspace,
     })
 }
 
@@ -1999,8 +2003,10 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 /// then the reserve, the pressure level, `promised`, the store, the swapped
 /// pages, the growth floor, the pages on disk, the free swap slots, the
 /// evictions begun, the overcommit allowance, the draw room, the free pages
-/// outside `promised`, and the part of `promised` the evicted chunks of
-/// committed regions hold (services/memmgr/docs/ipc-interface.md § Label 6).
+/// outside `promised`, the part of `promised` the evicted chunks of
+/// committed regions hold, and the used slots of memmgr's own `CSpace`, a
+/// count, which a cap memmgr kept by mistake raises for good
+/// (services/memmgr/docs/ipc-interface.md § Label 6).
 /// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
 /// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
 /// the subset currently in free runs (lent to no process), which falls on
@@ -2038,6 +2044,7 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
         draw_room_pages(l).saturating_mul(PAGE_SIZE),
         l.uncommitted_free().saturating_mul(PAGE_SIZE),
         l.committed_swapped().saturating_mul(PAGE_SIZE),
+        syscall::cap_info(boot.self_cspace, syscall_abi::CAP_INFO_CSPACE_USED).unwrap_or(0),
     ];
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .words(0, &words)
@@ -5291,7 +5298,12 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
     )]
     let ipc_buf = startup.ipc_buffer.cast::<u64>();
 
-    let Some(boot) = bootstrap_from_init(startup.creator_endpoint, startup.self_aspace, ipc_buf)
+    let Some(boot) = bootstrap_from_init(
+        startup.creator_endpoint,
+        startup.self_aspace,
+        startup.self_cspace,
+        ipc_buf,
+    )
     else
     {
         syscall::thread_exit();

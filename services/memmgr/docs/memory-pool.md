@@ -524,7 +524,10 @@ budgets). memmgr cannot request memory from anyone else, so it funds its own slo
   receive.
 
 Like arena pages, donated frames leave the free pool for good and stay in `pool_total` as
-memmgr-owned metadata, so the all-RAM-accounted identity is unaffected.
+memmgr-owned metadata, so the all-RAM-accounted identity is unaffected. Nothing bounds the growth
+but the pool, so a cap memmgr kept by mistake would not wedge its receive loop; it shows instead in
+its used slots, which `QUERY_POOL_STATUS` reports in `data[19]`
+([ipc-interface.md](ipc-interface.md) § Label 6).
 
 ---
 

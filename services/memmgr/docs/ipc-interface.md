@@ -614,6 +614,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[16] | `draw_room_bytes` — the free pages a fault on a committed page of a process outside the system reserve may take now: all of `data[3]` while no swap slot is registered or `data[3]` covers `data[8]`, else those above the growth floor, `data[11]`; open at `DEMAND_CHUNK_BYTES` or more, room for any one committed draw ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 | data[17] | `uncommitted_free_bytes` — the free pages outside `promised`, which every admission but a commitment's reads and the pressure level is computed from: the lesser of `data[3]` plus `data[15]` less `data[8]`, and `data[3]`; `data[3]` less `data[8]` while `data[15]` is `0` ([`memory-pool.md`](memory-pool.md#commit) § Commit, Promised) |
 | data[18] | `committed_swapped_bytes` — the part of `data[8]` the evicted chunks of committed regions hold for their restores: the subset of `data[10]` in committed regions, which `promised` holds again once a chunk holds no frame of its own ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit); the rest of `data[8]` is the commitments' pages never backed or discarded and their page-table and metadata bounds |
+| data[19] | `cspace_used_slots` — the used slots of memmgr's own `CSpace` (`CAP_INFO_CSPACE_USED`), a count, not bytes: the caps memmgr holds, its free runs' and grants' among them, so a cap it kept by mistake raises it for good ([`memory-pool.md`](memory-pool.md#cspace-headroom) § CSpace headroom; § Capability Transfer) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -665,7 +666,7 @@ once it holds no frame of its own, and back at its restore, and `data[18]`
 with it, so a caller asserting that a commitment was released compares
 `data[8] - data[18]`, the promised total net of eviction, beside the free
 total net of eviction.
-`data[3]` to `data[18]` are appended after the identity terms;
+`data[3]` to `data[19]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`
@@ -2093,9 +2094,11 @@ back on every reply, and delete it only when that reply cannot reach the caller.
 `REQUEST_MEMORY_CAPS`, `REGISTER_PROCESS`, `ATTACH_OBJECT` and `FILL_REGION` read the badge of their
 `cap[0]` and delete it on every path, `NODE_REGISTER_LIMIT` its `cap[1]`, and `MARK_CHECKPOINT` both
 of its caps. An attached cap therefore never outlives the call that carried it unless memmgr takes
-ownership of it, so no client can fill memmgr's `CSpace` by attaching caps until its receive loop
-fails and memmgr exits with `EXIT_RECV_WEDGE` (see
-[docs/ipc-design.md](../../../docs/ipc-design.md#receive-failure-policy) §"Receive-Failure Policy").
+ownership of it, so no client can grow memmgr's `CSpace` by attaching caps. memmgr funds that growth
+from its own pool before every receive ([`memory-pool.md`](memory-pool.md#cspace-headroom) § CSpace
+headroom), so caps it kept would cost the pool a slot page per `CSPACE_SLOTS_PER_PAGE` of them
+rather than wedge its receive loop; `QUERY_POOL_STATUS` `data[19]` counts its used slots, which
+svctest's stray-cap flood reads around each case.
 
 ---
 

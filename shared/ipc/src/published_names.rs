@@ -19,11 +19,14 @@
 //! derivation, not the published name nor any consumer.
 //!
 //! A name whose cap carries authority is seed-only: `rootfs.root`, the
-//! four `devmgr.*` names, [`published_names::VFSD_MOUNT`](crate::published_names::VFSD_MOUNT),
+//! five `devmgr.*` names, [`published_names::VFSD_MOUNT`](crate::published_names::VFSD_MOUNT),
 //! [`published_names::VFSD_SWAP`](crate::published_names::VFSD_SWAP),
-//! [`published_names::MEMMGR_SWAP`](crate::published_names::MEMMGR_SWAP), [`published_names::LOGD_QUERY`](crate::published_names::LOGD_QUERY), and each provider
-//! name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
-//! `pwrmgr.shutdown`, `acpid.power`, `sessiond.operator` and `crashd.core`) resolve only through a recipe's `seed = ...` line, and
+//! [`published_names::MEMMGR_SWAP`](crate::published_names::MEMMGR_SWAP),
+//! [`published_names::LOGD_QUERY`](crate::published_names::LOGD_QUERY), and each
+//! provider name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; the
+//! `:auth` and `:grant` entries, today `pwrmgr.shutdown`, `acpid.power`,
+//! `swapd.restore`, `sessiond.operator` and `crashd.core`) resolve only
+//! through a recipe's `seed = ...` line, and
 //! `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. A name resolves to a SEND
 //! without `GRANT`, apart from [`published_names::DEVMGR_BIND`](crate::published_names::DEVMGR_BIND), which its
 //! seeds receive with `GRANT`, since `devmgr_labels::BIND_DRIVERS` moves a cap

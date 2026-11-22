@@ -412,17 +412,17 @@ restart and the stop, however long the restart takes.
 
 The `critical_creates` phase runs when `memhog.svc` is staged and passes otherwise. While memhog
 holds memory at the system reserve it makes three checks, the second and third skipped when their
-fixture is not staged. Check 1: svctest's own raw `CREATE_FROM_FILE` of `/programs/hello`, outside the
-reserve, must be refused with `OUT_OF_MEMORY` and no other label, the one label svcmgr's memory wait
-for a restart holds; the phase destroys each child it creates, waits for memhog's next tick to take
-back what the destroy freed, and tries up to four times. Check 2 runs when `reserve-creator.svc` is
-staged: the fixture, a service in the system reserve, makes a `CREATE_FROM_FILE | CREATE_RESERVE`
-of `/programs/hello` inside the window, which must succeed. Check 3 runs when `crasher-worker.svc`
-is staged: the phase has the fixture's worker fault inside the window and requires the fixture's
-next instance to answer, after the window, with a new nonce. Check 3 passes whether or not its
-restart falls in the gap the killed instance's freed frames open before memhog's next tick, as the
-`logd_reserve` paragraph explains, so it shows the restart is held and made, not that the refusal
-was `OUT_OF_MEMORY`, which check 1 shows.
+fixture is not staged. Check 1: svctest's own raw `CREATE_FROM_FILE` of `/programs/hello`, outside
+the reserve, must be refused with `OUT_OF_MEMORY` and no other label, the one label svcmgr's memory
+wait for a restart holds; the phase destroys each child it creates, waits for memhog's next tick to
+take back what the destroy freed, and tries up to four times. Check 2 runs when
+`reserve-creator.svc` is staged: the fixture, a service in the system reserve, makes a
+`CREATE_FROM_FILE | CREATE_RESERVE` of `/programs/hello` inside the window, which must succeed.
+Check 3 runs when `crasher-worker.svc` is staged: the phase has the fixture's worker fault inside
+the window and requires the fixture's next instance to answer, after the window, with a new nonce.
+Check 3 passes whether or not its restart falls in the gap the killed instance's freed frames open
+before memhog's next tick, as the `logd_reserve` paragraph explains, so it shows the restart is held
+and made, not that the refusal was `OUT_OF_MEMORY`, which check 1 shows.
 
 Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`

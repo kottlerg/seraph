@@ -107,6 +107,7 @@ mod session;
 use release_handler::{FileEntry, OutstandingMapping};
 pub(crate) use release_handler::rebind_release_handler;
 pub(crate) use session::{rebind_fs_sessions, session_copy};
+use session::keep_unclosed;
 
 const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 
@@ -1194,8 +1195,9 @@ fn write_frame_chunk(
     Ok(n)
 }
 
-/// Send `FS_CLOSE` on the open cap of every `File` not yet dropped: the
-/// process-exit hook, run by `std::os::seraph::_start` once `main` returns
+/// Send `FS_CLOSE` on the open cap of every `File` not yet dropped, and of
+/// every open the session table keeps unclosed (`session::close_unclosed`):
+/// the process-exit hook, run by `std::os::seraph::_start` once `main` returns
 /// and by `std::process::exit`, before the exit syscall. A `File` the
 /// process never drops would otherwise leave its open, and the release
 /// SEND it handed the driver, in the fs driver past the process's death
@@ -1216,12 +1218,34 @@ pub(crate) fn close_open_files()
     {
         return;
     }
+    session::close_unclosed(ipc_buf);
     let close = IpcMessage::new(fs_labels::FS_CLOSE);
     for cap in release_handler::open_caps(state)
     {
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { deadline_call(cap, &close, ipc_buf) };
     }
+}
+
+/// Send `FS_CLOSE` on `open_cap`, an open cap this process no longer uses,
+/// and delete the cap. A close the calling thread cannot send, past its call
+/// deadline or with no IPC buffer (`ipc_buf` null), leaves the cap to the
+/// session table, which sends the close at the process's next `File::open`
+/// or at its exit (`session::keep_unclosed`).
+fn close_open(open_cap: u64, ipc_buf: *mut u64)
+{
+    if !ipc_buf.is_null()
+    {
+        let close = IpcMessage::new(fs_labels::FS_CLOSE);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let sent = unsafe { deadline_call(open_cap, &close, ipc_buf) };
+        if sent.err() != Some(syscall_abi::SyscallError::WouldBlock as i64)
+        {
+            let _ = syscall::cap_delete(open_cap);
+            return;
+        }
+    }
+    keep_unclosed(open_cap);
 }
 
 /// Send `FS_OPEN` on the file node cap `node_cap`, moving `session` (a
@@ -1433,6 +1457,9 @@ impl File
         {
             return Err(io::Error::other("seraph fs: IPC buffer not registered"));
         }
+        // Close the opens of `File`s dropped past their thread's call
+        // deadline, before this open adds one.
+        session::close_unclosed(ipc_buf);
 
         // ── Resolve / create the file cap ────────────────────────────
         let (file_cap, mut size) = if opts.create_new
@@ -1996,24 +2023,15 @@ impl Drop for File
 {
     fn drop(&mut self)
     {
-        let ipc_buf = crate::os::seraph::current_ipc_buf();
         // FS_CLOSE: fs walks this open's outstanding-page table and
         // revokes every per-cookie ancestor cap, decrementing each
         // cache-slot refcount, and deletes the release SEND the open
-        // kept; other opens of the file keep theirs. A close that never
-        // reached the driver leaves the open to its session, which ends with
-        // the process. The revoke
+        // kept; other opens of the file keep theirs. The revoke
         // invalidates our derived caps but leaves
         // their mappings in place; fs refills none of those pages while we
         // map it, but each held page shrinks its cache, so each VA must
         // still be unmapped, its reservation freed, and its cap deleted.
-        if !ipc_buf.is_null()
-        {
-            let close = IpcMessage::new(fs_labels::FS_CLOSE);
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            let _ = unsafe { deadline_call(self.file_cap, &close, ipc_buf) };
-        }
-        let _ = syscall::cap_delete(self.file_cap);
+        close_open(self.file_cap, crate::os::seraph::current_ipc_buf());
 
         // Drain the registry entry. A driver release that arrives after
         // unregister, on whichever badge, finds no entry and is acked

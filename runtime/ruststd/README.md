@@ -90,6 +90,7 @@ pager and the image is `ET_DYN`, registers the main-thread stack's demand-growth
 ([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). Last it runs the
 rustc-synthesised `main`, which drives `std::rt::lang_start` and the binary's idiomatic
 `fn main()`; when `main` returns, `_start` sends `FS_CLOSE` for every `std::fs::File` still open,
+and for every open of a `File` dropped past its thread's call deadline (§ Call deadline),
 closes the stdio pipes, and exits the process with its return code. `std::process::exit` runs
 the same two steps before its exit syscall, so the fs driver drops the opens, and the release
 SENDs they hold, of `File`s the process never drops
@@ -792,8 +793,10 @@ does not trust to answer, as crashd bounds a fault's report and a core dump
   the log. Such a call may have reached its server, which may have acted on it, and whose reply
   then finds no caller. A spawn's wait for its child's bootstrap requests (§ Bootstrap caps), which
   is a receive, ends at the deadline too, and fails the spawn `TimedOut`. A `File` dropped past
-  the deadline sends no `FS_CLOSE`; that open stays in the process's session with its driver,
-  its records charged to the process's node, until the session ends with the process
+  the deadline sends no `FS_CLOSE`: the session table keeps its open cap, and the process's next
+  `File::open`, or its exit hook, sends the close under its own thread's deadline. Until then the
+  open stays in the process's session with its driver, its records charged to the process's node,
+  and counts as an open `File` for a quiesce point (§ Checkpoint)
   ([Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md) § Label 23:
   `FS_SESSION`).
 - **Not bounded.** The calls to memmgr (the heap, the stacks, the registration of demand-paged

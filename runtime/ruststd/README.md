@@ -924,9 +924,11 @@ signals no more.
   over and a drop releases (`OBJECT_RELEASE`, made again while a stop interrupts it, since nothing
   else releases it). A process at no quiesce point is refused `ResourceBusy`, and one procmgr
   could not mark (`NOT_RESTORABLE`) `Unsupported`.
-- `CommandExt::restore(object)` makes a `Command` spawn a restore of the checkpoint whose handle
-  `object` is (`CREATE_RESTORE`): the spawn sends a copy of the handle, which procmgr deletes, and
-  no argv or env, since the restored process has its checkpoint's. procmgr refuses a pinned
+- `CommandExt::restore(object)` makes the next spawn of a `Command` a restore of the checkpoint
+  whose handle `object` is (`CREATE_RESTORE`): the spawn sends a copy of the handle, which procmgr
+  deletes, and no argv or env, since the restored process has its checkpoint's. That spawn takes
+  the setting whatever its outcome, so a later spawn of the `Command` creates the child from its
+  binary unless `restore` is called again. procmgr refuses a pinned
   restore (`InvalidInput`), a handle memmgr does not take (`InvalidInput`), and an object that is
   no checkpoint of the binary (`Unsupported`).
 

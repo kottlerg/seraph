@@ -3323,7 +3323,10 @@ pub mod process {
         /// process of the program, which must be the checkpoint's binary; it
         /// takes the checkpoint's argv and env, so the `Command`'s are not
         /// sent, and resumes the quiesce point. `0` (the default) creates
-        /// the child from its binary. A spawn refused because the object is
+        /// the child from its binary. Only the next spawn restores: it takes
+        /// the setting whatever its outcome, so a later spawn of the same
+        /// `Command` creates the child from its binary unless `restore` is
+        /// called again. A spawn refused because the object is
         /// no checkpoint of the program fails `Unsupported`
         /// (`NOT_RESTORABLE`); one that also asks for a pinned child fails
         /// `InvalidInput`.

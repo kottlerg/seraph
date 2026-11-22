@@ -16,6 +16,9 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
+// Kani trial (#756): Kani 0.68.0's nightly-2026-08-21 predates the
+// stabilization of `UnsafeCell::as_mut_unchecked` (sched/run_queue.rs).
+#![cfg_attr(kani, feature(unsafe_cell_access))]
 #![cfg_attr(
     test,
     expect(

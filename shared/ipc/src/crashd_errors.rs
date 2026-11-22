@@ -16,8 +16,10 @@ pub const INVALID_ARGUMENT: u64 = 2;
 /// No live process carries the name, or it ended before its snapshot or
 /// before crashd could read its declarations after it.
 pub const NOT_FOUND: u64 = 3;
-/// memmgr's pressure level reads `CRITICAL`: a core's buffers and file
-/// writes would need pages, so crashd writes none.
+/// Memory is short: memmgr's pressure level reads `CRITICAL`, or crashd,
+/// holding faults declined for want of memory, holds one or reads memmgr's
+/// draw room short. A core's buffers and file writes would need pages, so
+/// crashd writes none.
 pub const MEMORY_CRITICAL: u64 = 4;
 /// procmgr refused the snapshot, or the attach crashd makes after it to read
 /// the process's declarations (`NOT_ATTACHABLE` when the process declared

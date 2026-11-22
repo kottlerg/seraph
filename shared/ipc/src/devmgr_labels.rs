@@ -158,14 +158,16 @@ pub const QUERY_DEVICE_INFO: u64 = 2;
 /// sticky-failure state); one that names a driver is answered at
 /// once.
 ///
-/// Each spawn is attempted at most once per boot, a restart after a
-/// served driver's death apart. On failure
-/// (missing binary, ELF corrupt, carve failure, OOM, a driver that
-/// died or did not report ready within the settle bound, etc.),
-/// devmgr marks the driver permanently unavailable for this boot
-/// and replies [`super::devmgr_errors::NO_DEVICE`] to a subsequent
-/// [`QUERY_DEVICE`] for it; the retry rule is
-/// [`super::devmgr_errors::NO_DEVICE`]'s.
+/// Each spawn is attempted once per boot, with two exceptions: a restart
+/// after a served driver's death, and a create procmgr refused with
+/// `IO_ERROR` or `OUT_OF_MEMORY`, which devmgr retries a bounded number
+/// of times (`services/devmgr/docs/responsibilities.md` § Create retry).
+/// On a failure that is not retried (missing binary, ELF corrupt, carve
+/// failure, a refused signature, a driver that died or did not report
+/// ready within the settle bound, etc.), or once the retries are given
+/// up, devmgr marks the driver unavailable for this boot and replies
+/// [`super::devmgr_errors::NO_DEVICE`] to a subsequent [`QUERY_DEVICE`]
+/// for it; the retry rule is [`super::devmgr_errors::NO_DEVICE`]'s.
 pub const SET_DRIVERS_DIR: u64 = 6;
 
 /// The data word of [`SET_DRIVERS_DIR`] and [`BIND_DRIVERS`] that holds

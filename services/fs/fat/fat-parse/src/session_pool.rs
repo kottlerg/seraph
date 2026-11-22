@@ -266,32 +266,6 @@ pub struct Frame
     pub words: [u64; 2],
 }
 
-/// An open taken out of the pool, for the caller to release.
-#[derive(Debug)]
-pub struct Removed
-{
-    /// The open's id.
-    pub id: u64,
-    /// The open's fields.
-    pub fields: OpenFields,
-    /// Every page it held.
-    pub held: Vec<HeldPage>,
-    /// Frames of the session pages its removal emptied.
-    pub frames: Vec<Frame>,
-}
-
-/// A session taken out of the pool, for the caller to release.
-#[derive(Debug)]
-pub struct Ended
-{
-    /// The session's fields.
-    pub session: SessionFields,
-    /// Each of its opens.
-    pub opens: Vec<Removed>,
-    /// The frame of every page it held, the first included.
-    pub frames: Vec<Frame>,
-}
-
 /// Fibonacci hashing of `id` onto a table of `heads` heads, a power of two.
 /// Ids are the pool's own counter, which no client chooses.
 fn bucket(id: u64, heads: usize) -> usize
@@ -316,6 +290,10 @@ pub struct SessionPool<S>
     next_id: u64,
     /// The first id past the counter.
     id_end: u64,
+    /// The first of the pages a removal gave back and the caller has not
+    /// taken yet ([`Self::take_freed`]), chained through their headers'
+    /// next-page word: out of every session, still in the store.
+    freed: Option<u32>,
 }
 
 impl<S: PageStore> SessionPool<S>
@@ -336,6 +314,7 @@ impl<S: PageStore> SessionPool<S>
             heads: Vec::new(),
             live: 0,
             sessions: None,
+            freed: None,
             next_id: 1,
             id_end: match 1u64.checked_shl(bits)
             {
@@ -755,6 +734,36 @@ impl<S: PageStore> SessionPool<S>
         Some(self.frame(page))
     }
 
+    /// Give back the `width` slots at `link` as [`Self::give_slots`] does,
+    /// the page it empties joining the freed pages.
+    fn give_back(&mut self, session: Link, link: Link, width: usize)
+    {
+        if let Some(frame) = self.give_slots(session, link, width)
+        {
+            self.push_freed(frame.page);
+        }
+    }
+
+    /// Put `page`, out of every session, on the freed pages.
+    fn push_freed(&mut self, page: u32)
+    {
+        let next = self.freed.map_or(NO_PAGE, u64::from);
+        self.set_header(page, H_NEXT, next);
+        self.freed = Some(page);
+    }
+
+    /// Take one of the pages a removal gave back ([`Self::remove_open`],
+    /// [`Self::remove_opens_where`], [`Self::end_session`]), for the caller
+    /// to unmap and release; `None` once none is left. The caller takes every
+    /// one after each removal: a freed page stays in the store, its frame
+    /// unreleased, until it is taken.
+    pub fn take_freed(&mut self) -> Option<Frame>
+    {
+        let page = self.freed?;
+        self.freed = self.next_page(page);
+        Some(self.frame(page))
+    }
+
     // ── opens ────────────────────────────────────────────────────────────
 
     /// Record a new open in the session `session`. Returns its link; its id
@@ -876,10 +885,14 @@ impl<S: PageStore> SessionPool<S>
         out
     }
 
-    /// Remove the open `open` names: its id stops resolving. Returns what
-    /// the caller releases: its fields, every page it held, and the frames of
-    /// the session pages that emptied. `None` when it is not a live open.
-    pub fn remove_open(&mut self, open: Link) -> Option<Removed>
+    /// Remove the open `open` names: its id stops resolving. Each page it
+    /// held goes to `held` as its record goes, and each session page the
+    /// removal empties joins the freed pages ([`Self::take_freed`]), so a
+    /// removal takes no memory and gives back everything the open had.
+    /// Returns the open's fields, whose release SEND the caller deletes;
+    /// `None` when it is not a live open.
+    pub fn remove_open(&mut self, open: Link, mut held: impl FnMut(HeldPage))
+    -> Option<OpenFields>
     {
         let id = self.word(open, O_ID);
         if self.open(id) != Some(open)
@@ -887,35 +900,72 @@ impl<S: PageStore> SessionPool<S>
             return None;
         }
         let session = self.session_of(open)?;
-        let mut removed = Removed {
-            id,
-            fields: self.open_fields(open),
-            held: Vec::new(),
-            frames: Vec::new(),
-        };
+        let fields = self.open_fields(open);
         while let Some(l) = Link::from_word(self.word(open, O_HELD))
         {
             self.set_word(open, O_HELD, self.word(l, P_NEXT));
-            if removed.held.try_reserve(1).is_ok()
-            {
-                removed.held.push(self.read_held(l));
-            }
-            if let Some(f) = self.give_slots(session, l, 1)
-            {
-                push_frame(&mut removed.frames, f);
-            }
+            held(self.read_held(l));
+            self.give_back(session, l, 1);
         }
+        self.set_word(open, O_HELD_COUNT, 0);
         self.index_remove(id, open);
         let page = open.page();
         let starts = self.header(page, H_OPENS) & !slot_mask(open.slot(), 1);
         self.set_header(page, H_OPENS, starts);
         let opens = self.word(session, S_OPENS).saturating_sub(1);
         self.set_word(session, S_OPENS, opens);
-        if let Some(f) = self.give_slots(session, open, 2)
+        self.give_back(session, open, 2);
+        Some(fields)
+    }
+
+    /// Remove every open, of every session, whose fields `matches` accepts,
+    /// as [`Self::remove_open`] does: each page one held goes to `held`, and
+    /// each one's fields to `removed`. Takes no memory.
+    pub fn remove_opens_where(
+        &mut self,
+        matches: impl Fn(&OpenFields) -> bool,
+        mut held: impl FnMut(HeldPage),
+        mut removed: impl FnMut(OpenFields),
+    )
+    {
+        let mut at = self.sessions;
+        while let Some(session) = at
         {
-            push_frame(&mut removed.frames, f);
+            while let Some(open) = self.first_open_where(session, &matches)
+            {
+                let Some(fields) = self.remove_open(open, &mut held)
+                else
+                {
+                    break;
+                };
+                removed(fields);
+            }
+            at = Link::from_word(self.word(session, S_NEXT));
         }
-        Some(removed)
+    }
+
+    /// The first open of the session `session`, page by page, whose fields
+    /// `matches` accepts.
+    fn first_open_where(&self, session: Link, matches: impl Fn(&OpenFields) -> bool)
+    -> Option<Link>
+    {
+        let mut at = Some(session.page());
+        while let Some(page) = at
+        {
+            let mut starts = self.header(page, H_OPENS);
+            while starts != 0
+            {
+                let slot = starts.trailing_zeros();
+                starts &= starts.wrapping_sub(1);
+                if let Some(l) = Link::new(page, slot)
+                    && matches(&self.open_fields(l))
+                {
+                    return Some(l);
+                }
+            }
+            at = self.next_page(page);
+        }
+        None
     }
 
     // ── held pages ───────────────────────────────────────────────────────
@@ -1051,47 +1101,33 @@ impl<S: PageStore> SessionPool<S>
 
     // ── session end ──────────────────────────────────────────────────────
 
-    /// End the session `session` names: remove every open of it, then the
-    /// session itself. Returns what the caller releases: each open, the
-    /// session's fields, and the frame of every page, the first included.
-    /// `None` when it is not a live session.
-    pub fn end_session(&mut self, session: Link) -> Option<Ended>
+    /// End the session `session` names: remove every open of it, as
+    /// [`Self::remove_open`] does, each page an open held going to `held`
+    /// and each open's fields to `removed`, then the session itself, every
+    /// page of it, the first included, joining the freed pages
+    /// ([`Self::take_freed`]). Takes no memory. Returns the session's fields
+    /// as they stood before, whose caps the caller releases; `None` when it
+    /// is not a live session.
+    pub fn end_session(
+        &mut self,
+        session: Link,
+        mut held: impl FnMut(HeldPage),
+        mut removed: impl FnMut(OpenFields),
+    ) -> Option<SessionFields>
     {
         let fields = self.session_fields(session);
         if self.session(fields.id) != Some(session)
         {
             return None;
         }
-        let mut ended = Ended {
-            session: fields,
-            opens: Vec::new(),
-            frames: Vec::new(),
-        };
-        // Remove the opens page by page until none is left, so a heap that
-        // cannot hold a whole list still sees every one.
-        loop
+        while let Some(open) = self.first_open_where(session, |_| true)
         {
-            let opens = self.opens_of(session);
-            let mut progress = false;
-            for open in opens
-            {
-                if let Some(mut r) = self.remove_open(open)
-                {
-                    progress = true;
-                    for f in r.frames.drain(..)
-                    {
-                        push_frame(&mut ended.frames, f);
-                    }
-                    if ended.opens.try_reserve(1).is_ok()
-                    {
-                        ended.opens.push(r);
-                    }
-                }
-            }
-            if !progress
+            let Some(open_fields) = self.remove_open(open, &mut held)
+            else
             {
                 break;
-            }
+            };
+            removed(open_fields);
         }
         self.index_remove(fields.id, session);
         let prev = Link::from_word(self.word(session, S_PREV));
@@ -1109,21 +1145,10 @@ impl<S: PageStore> SessionPool<S>
         while let Some(page) = at
         {
             at = self.next_page(page);
-            push_frame(&mut ended.frames, self.frame(page));
             self.set_header(page, H_USED, 0);
+            self.push_freed(page);
         }
-        Some(ended)
-    }
-}
-
-/// Push `frame` onto `frames` when the heap can hold it. A frame the heap
-/// cannot hold is left charged to its session's node, unreleased, until the
-/// driver exits.
-fn push_frame(frames: &mut Vec<Frame>, frame: Frame)
-{
-    if frames.try_reserve(1).is_ok()
-    {
-        frames.push(frame);
+        Some(fields)
     }
 }
 
@@ -1292,12 +1317,13 @@ mod tests
         let later = p.new_open(s, fields(99)).unwrap();
         assert_eq!(later.page(), 1);
         // A record freed in the first page is taken before the later page's.
-        let gone = p.remove_open(first[3]).unwrap();
-        assert_eq!(gone.frames, Vec::<Frame>::new());
+        assert_eq!(p.remove_open(first[3], |_| ()), Some(fields(3)));
+        assert_eq!(p.take_freed(), None);
         let again = p.new_open(s, fields(98)).unwrap();
         assert_eq!(again.page(), 0);
-        let removed = p.remove_open(later).unwrap();
-        assert_eq!(removed.frames, vec![freed(1)]);
+        assert_eq!(p.remove_open(later, |_| ()), Some(fields(99)));
+        assert_eq!(p.take_freed(), Some(freed(1)));
+        assert_eq!(p.take_freed(), None);
         assert_eq!(p.session_fields(s).pages, 1);
     }
 
@@ -1307,7 +1333,8 @@ mod tests
         let mut p = pool(1);
         let s = p.new_session(0, frame(0), 1, 2).unwrap();
         let o = p.new_open(s, fields(1)).unwrap();
-        assert_eq!(p.remove_open(o).unwrap().frames, Vec::<Frame>::new());
+        assert!(p.remove_open(o, |_| ()).is_some());
+        assert_eq!(p.take_freed(), None);
         assert_eq!(p.session(p.id_of(s)), Some(s));
     }
 
@@ -1318,9 +1345,9 @@ mod tests
         let s = p.new_session(0, frame(0), 1, 2).unwrap();
         let o = p.new_open(s, fields(1)).unwrap();
         let id = p.id_of(o);
-        p.remove_open(o).unwrap();
+        p.remove_open(o, |_| ()).unwrap();
         assert_eq!(p.open(id), None);
-        assert!(p.remove_open(o).is_none());
+        assert!(p.remove_open(o, |_| ()).is_none());
         let reused = p.new_open(s, fields(2)).unwrap();
         assert_eq!(reused, o);
         assert_ne!(p.id_of(reused), id);
@@ -1352,8 +1379,13 @@ mod tests
         );
         assert!(p.held_where(o, |h| h.cookie == 2).is_none());
         p.hold(o, held(3), 2).unwrap();
-        let removed = p.remove_open(o).unwrap();
-        assert_eq!(removed.held.len(), 2);
+        let mut given = Vec::new();
+        p.remove_open(o, |h| given.push(h)).unwrap();
+        given.sort_unstable_by_key(|h| h.cookie);
+        assert_eq!(
+            given.iter().map(|h| h.cookie).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
         assert!(p.unhold(o, |h| h.cookie == 3).is_none());
     }
 
@@ -1391,20 +1423,58 @@ mod tests
         p.hold(opens[0], held(7), 4).unwrap();
         let ids: Vec<u64> = opens.iter().map(|&o| p.id_of(o)).collect();
         let sid = p.id_of(s);
-        let ended = p.end_session(s).unwrap();
-        assert_eq!(ended.session.id, sid);
-        assert_eq!(ended.opens.len(), opens.len());
-        assert_eq!(ended.opens.iter().map(|r| r.held.len()).sum::<usize>(), 1);
-        let mut frames = ended.frames.clone();
+        let mut given = Vec::new();
+        let mut gone = Vec::new();
+        let ended = p
+            .end_session(s, |h| given.push(h), |f| gone.push(f))
+            .unwrap();
+        assert_eq!(ended.id, sid);
+        assert_eq!(gone.len(), opens.len());
+        assert_eq!(given, vec![held(7)]);
+        let mut frames: Vec<Frame> = core::iter::from_fn(|| p.take_freed()).collect();
         frames.sort_unstable();
         assert_eq!(frames, vec![freed(0), freed(1)]);
         assert_eq!(p.session(sid), None);
         assert!(ids.iter().all(|&id| p.open(id).is_none()));
-        assert!(p.end_session(s).is_none());
+        assert!(p.end_session(s, |_| (), |_| ()).is_none());
         assert_eq!(p.sessions(), vec![other]);
         assert_eq!(p.open(p.id_of(kept)), Some(kept));
         assert_eq!(p.live(), 2);
         assert_eq!(p.new_open(s, fields(1)), Err(PoolError::Gone));
+    }
+
+    #[test]
+    fn the_opens_of_a_node_go_from_every_session_with_their_pages()
+    {
+        let mut p = pool(3);
+        let a = p.new_session(0, frame(0), 1, 2).unwrap();
+        let b = p.new_session(1, frame(1), 3, 4).unwrap();
+        let spared = p.new_open(a, fields(5)).unwrap();
+        let in_a = p.new_open(a, fields(9)).unwrap();
+        let in_b = p.new_open(b, fields(9)).unwrap();
+        let filler: Vec<Link> = (0..OPENS_PER_PAGE - 1)
+            .map(|_| p.new_open(b, fields(6)).unwrap())
+            .collect();
+        p.add_page(b, 2, frame(2)).unwrap();
+        p.hold(in_b, held(1), 4).unwrap();
+        p.hold(in_a, held(2), 4).unwrap();
+        let (ia, ib) = (p.id_of(in_a), p.id_of(in_b));
+        let mut given = Vec::new();
+        let mut gone = Vec::new();
+        p.remove_opens_where(
+            |f| f.node == 9,
+            |h| given.push(h.cookie),
+            |f| gone.push(f.node),
+        );
+        given.sort_unstable();
+        assert_eq!(given, vec![1, 2]);
+        assert_eq!(gone, vec![9, 9]);
+        assert_eq!((p.open(ia), p.open(ib)), (None, None));
+        // The held page's record was alone in session b's later page.
+        assert_eq!(p.take_freed(), Some(freed(2)));
+        assert_eq!(p.take_freed(), None);
+        assert_eq!(p.open(p.id_of(spared)), Some(spared));
+        assert!(filler.iter().all(|&o| p.open(p.id_of(o)) == Some(o)));
     }
 
     #[test]
@@ -1414,9 +1484,9 @@ mod tests
         let a = p.new_session(0, frame(0), 1, 2).unwrap();
         let b = p.new_session(1, frame(1), 1, 2).unwrap();
         let c = p.new_session(2, frame(2), 1, 2).unwrap();
-        p.end_session(b).unwrap();
+        p.end_session(b, |_| (), |_| ()).unwrap();
         assert_eq!(p.sessions(), vec![c, a]);
-        p.end_session(c).unwrap();
+        p.end_session(c, |_| (), |_| ()).unwrap();
         assert_eq!(p.sessions(), vec![a]);
     }
 
@@ -1444,7 +1514,7 @@ mod tests
         }
         for &s in all.iter().skip(1)
         {
-            p.end_session(s).unwrap();
+            p.end_session(s, |_| (), |_| ()).unwrap();
             assert!(p.index_heads() <= (2 * p.live()).max(MIN_HEADS));
         }
         assert_eq!(p.index_heads(), MIN_HEADS);
@@ -1475,7 +1545,7 @@ mod tests
         assert_eq!(p.live(), 7);
         // Closing frees a record but no id.
         let first = p.open(2).unwrap();
-        p.remove_open(first).unwrap();
+        p.remove_open(first, |_| ()).unwrap();
         assert_eq!(p.new_open(s, fields(9)), Err(PoolError::Exhausted));
     }
 

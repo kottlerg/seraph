@@ -23,7 +23,7 @@
 //! file's cluster chain.
 
 use fat_parse::ChainCursor;
-use fat_parse::session_pool::{Frame, HeldPage, Link, OpenFields, PoolError, Removed, SessionPool};
+use fat_parse::session_pool::{Frame, HeldPage, Link, OpenFields, PoolError, SessionPool};
 use namespace_protocol::{NodeId, OpenRef};
 
 use crate::cache::PageCache;
@@ -61,6 +61,23 @@ pub struct OutstandingPage
 fn sole_reference(liveness: u64) -> bool
 {
     syscall::cap_info(liveness, syscall::CAP_INFO_SOLE_REFERENCE) == Ok(1)
+}
+
+/// Release a page an open held as the pool takes the open out: revoke the
+/// client's cap on it, delete its ancestor, and drop its cache slot's
+/// reference.
+fn release_held(page: HeldPage, cache: &PageCache)
+{
+    OutstandingPage::from_held(page).release(cache);
+}
+
+/// Delete the release SEND of an open the pool took out.
+fn release_open_fields(fields: OpenFields)
+{
+    if fields.release_cap != 0
+    {
+        let _ = syscall::cap_delete(fields.release_cap);
+    }
 }
 
 impl OutstandingPage
@@ -290,10 +307,13 @@ impl Opens
             return false;
         };
         let session = self.sessions.session_of(l);
-        if let Some(removed) = self.sessions.remove_open(l)
+        if let Some(fields) = self
+            .sessions
+            .remove_open(l, |page| release_held(page, cache))
         {
-            self.release_removed(removed, cache);
+            release_open_fields(fields);
         }
+        self.release_freed();
         if let Some(session) = session
         {
             let fields = self.sessions.session_fields(session);
@@ -305,20 +325,16 @@ impl Opens
         true
     }
 
-    /// Close every open of `node`.
+    /// Close every open of `node`, in every session; takes no memory, so
+    /// none is missed.
     pub fn close_node(&mut self, node: NodeId, cache: &PageCache)
     {
-        for session in self.sessions.sessions()
-        {
-            for open in self.sessions.opens_of(session)
-            {
-                if self.sessions.open_fields(open).node == node.raw()
-                    && let Some(removed) = self.sessions.remove_open(open)
-                {
-                    self.release_removed(removed, cache);
-                }
-            }
-        }
+        self.sessions.remove_opens_where(
+            |fields| fields.node == node.raw(),
+            |page| release_held(page, cache),
+            release_open_fields,
+        );
+        self.release_freed();
     }
 
     /// End every session whose client holds no copy of its liveness cap any
@@ -511,37 +527,25 @@ impl Opens
     /// every page.
     fn end_session(&mut self, session: Link, cache: &PageCache)
     {
-        let Some(ended) = self.sessions.end_session(session)
-        else
+        let ended = self.sessions.end_session(
+            session,
+            |page| release_held(page, cache),
+            release_open_fields,
+        );
+        if let Some(fields) = ended
         {
-            return;
-        };
-        for open in ended.opens
-        {
-            self.release_removed(open, cache);
+            let _ = syscall::cap_revoke_all(fields.liveness_cap);
+            let _ = syscall::cap_delete(fields.liveness_cap);
+            let _ = syscall::cap_delete(fields.charge_cap);
         }
-        let _ = syscall::cap_revoke_all(ended.session.liveness_cap);
-        let _ = syscall::cap_delete(ended.session.liveness_cap);
-        let _ = syscall::cap_delete(ended.session.charge_cap);
-        for frame in ended.frames
-        {
-            self.release_frame(Some(frame));
-        }
+        self.release_freed();
     }
 
-    /// Release an open taken out of a session: its held pages, its release
-    /// SEND, and the session pages its removal emptied.
-    fn release_removed(&mut self, removed: Removed, cache: &PageCache)
+    /// Unmap and release every session page the pool gave back
+    /// (`SessionPool::take_freed`).
+    fn release_freed(&mut self)
     {
-        for page in removed.held
-        {
-            OutstandingPage::from_held(page).release(cache);
-        }
-        if removed.fields.release_cap != 0
-        {
-            let _ = syscall::cap_delete(removed.fields.release_cap);
-        }
-        for frame in removed.frames
+        while let Some(frame) = self.sessions.take_freed()
         {
             self.release_frame(Some(frame));
         }

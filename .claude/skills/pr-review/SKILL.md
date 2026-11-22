@@ -106,13 +106,13 @@ statement of a verdict and its use are then separate, visible actions, and the h
 permission check refuses the two bundled in one.
 
 Run `cargo xtask review-ledger <N>` and fix the record until it passes: it writes the ledger only
-from well-formed records, and the gate reads these files. Its `error record-run-kind` means the
-audit of a `full` or `delta` run applied the checks of another run kind: run `pr-auditor` again
-with `Run kind: with-reviewer`, put its result in place of that record's `audit` and
-`audit_verdict`, and append its prose to the record's `.md` under a heading that says why. Then
-give both verdict lines verbatim to the one you report to: a worker records them in its status
-line for its orchestrator (`.claude/agents/worker.md` § Reporting), and a standalone session
-gives them to the maintainer.
+from well-formed records, and the gate reads these files. The gate's `error record-run-kind`
+(`cargo xtask pr-check <N> --gate`) means the audit of a `full` or `delta` run applied the
+checks of another run kind: run `pr-auditor` again with `Run kind: with-reviewer`, put its
+result in place of that record's `audit` and `audit_verdict`, and append its prose to the
+record's `.md` under a heading that says why. Then give both verdict lines verbatim to the one
+you report to: a worker records them in its status line for its orchestrator
+(`.claude/agents/worker.md` § Reporting), and a standalone session gives them to the maintainer.
 
 ## Handling the findings
 

@@ -11,7 +11,8 @@ endowment to either supervise the running instance or launch a fresh
 one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliation).
 
 svcmgr also owns the system-wide discovery registry: it publishes the well-known names it owns
-(`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`, `devmgr.acpi`,
+(`rootfs.root`, `svcmgr`, `svcmgr.grant`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
+`devmgr.acpi`,
 `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`, a `devmgr.class.<stem>` per
 device class file (`<stem>` is the file's name without `.class`), and each provider's `provides`
 names like `pwrmgr.shutdown` / `acpid.power` / `timed`) into the registry itself — from the source
@@ -19,10 +20,9 @@ caps init endows it with at handover, and from each provider's launch. Consumers
 through their `.svc` `seed = ...` line at launch time, and the public names (`svcmgr`,
 `pwrmgr.deny`, `acpid.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority
 is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` never yields `GRANT`;
-a seed is `SEND` except `devmgr.bind`, `memmgr.swap` and each `:grant` name (`sessiond.operator`,
-`crashd.core`),
-which are `SEND|GRANT`. The endowment and registry wire format are in
-[docs/ipc-interface.md](docs/ipc-interface.md).
+a seed is `SEND` except `devmgr.bind`, `memmgr.swap`, `svcmgr.grant` and each `:grant` name
+(`sessiond.operator`, `crashd.core`), which are `SEND|GRANT`. The endowment and registry wire
+format are in [docs/ipc-interface.md](docs/ipc-interface.md).
 
 svcmgr is also the stop authority: a service whose recipe sets `stop_authority = yes` receives a
 `STOP_AUTHORITY` SEND on svcmgr's endpoint, through which it lists the services svcmgr would stop,
@@ -256,6 +256,7 @@ column). The handover endowment and
 |---|---|---|---|
 | `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on vfsd's namespace endpoint at its synthetic root: the namespace root, which crosses mounts | no |
 | `svcmgr` | svcmgr (its own service ep) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
+| `svcmgr.grant` | svcmgr (its own service ep) | `PUBLISHED_SEND_BADGE`-badged `SEND\|GRANT` on svcmgr's own service endpoint (no verb-bit), svctest's test twin for requests that carry caps, which svcmgr deletes; its seeds keep `GRANT` (seeded by svctest only) | no |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
 | `devmgr.bind` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| BIND_AUTHORITY`-badged `SEND\|GRANT` on devmgr's registry endpoint, gating `BIND_DRIVERS`, which moves a directory cap (seeded by svctest only) | no |

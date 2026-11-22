@@ -35,7 +35,9 @@
 //! caps to sessiond and crashd;
 //! `QUERY_ENDPOINT` never yields `GRANT`.
 //! [`published_names::VFSD_DENY`](crate::published_names::VFSD_DENY) carries no authority but is seed-only
-//! too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `acpid.deny`, `timed`, and any
+//! too, as svctest's test twin, and so is
+//! [`published_names::SVCMGR_GRANT`](crate::published_names::SVCMGR_GRANT), whose seeds keep
+//! `GRANT`. `svcmgr`, `pwrmgr.deny`, `acpid.deny`, `timed`, and any
 //! name published through [`svcmgr_labels::PUBLISH_ENDPOINT`](crate::svcmgr_labels::PUBLISH_ENDPOINT) are public
 //! (services/svcmgr/docs/ipc-interface.md § Label 4).
 
@@ -125,6 +127,14 @@ pub const VFSD_MOUNT: &[u8] = b"vfsd.mount";
 /// which carries no verb bit: the negative-test twin of [`VFSD_MOUNT`].
 /// Seed-only and seeded only by svctest.
 pub const VFSD_DENY: &[u8] = b"vfsd.deny";
+
+/// `SEND|GRANT` on svcmgr's service endpoint badged
+/// `svcmgr_labels::PUBLISHED_SEND_BADGE`, the published [`SVCMGR`] SEND's
+/// badge, which carries no verb bit: a request through it can carry caps,
+/// which svcmgr deletes on every label. Seed-only, its seeds keeping
+/// `GRANT`, and seeded only by svctest, whose stray-cap phase drives that
+/// deletion.
+pub const SVCMGR_GRANT: &[u8] = b"svcmgr.grant";
 
 /// SEND on vfsd's service endpoint badged
 /// `vfsd_labels::SWAP_AUTHORITY` alone: the `GET_SWAP_PARTITION`

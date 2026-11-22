@@ -160,8 +160,9 @@ pub const PUBLISH_ENDPOINT: u64 = 3;
 /// [`NAME_MAX`], or the message carries fewer data words than `name_len`
 /// needs; `svcmgr_errors::UNKNOWN_NAME` on miss and for a seed-only name
 /// (one whose cap carries authority, or
-/// [`crate::published_names::VFSD_DENY`], svctest's test twin, which
-/// carries none; a seed-only name reaches only the recipes seeding it;
+/// [`crate::published_names::VFSD_DENY`] or
+/// [`crate::published_names::SVCMGR_GRANT`], svctest's test twins, which
+/// carry none; a seed-only name reaches only the recipes seeding it;
 /// see [`crate::published_names`]);
 /// or `svcmgr_errors::INSUFFICIENT_CAPS` if svcmgr cannot derive a SEND
 /// from the published endpoint, in which case it drops the entry, so a

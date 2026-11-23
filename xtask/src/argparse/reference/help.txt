@@ -16,6 +16,7 @@ Commands:
   clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
   test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
+  fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
   kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
@@ -48,6 +49,7 @@ Commands:
   clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
   test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
+  fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
   kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
@@ -542,6 +544,46 @@ Usage: xtask crypto-vectors [OPTIONS]
 
 Options:
       --check             Regenerate in memory and fail unless the checked-in files are byte-identical, writing nothing
+      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+  -h, --help              Print help
+=== xtask fuzz -h
+Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
+
+Usage: xtask fuzz [OPTIONS] [TARGET]
+
+Arguments:
+  [TARGET]  The fuzz target to run (`--list` names them)
+
+Options:
+      --all               Run every fuzz target in turn, each whatever another's outcome, and fail when one found a failing input
+      --list              Print the fuzz targets' names, building nothing
+      --self-test         Run each planted target of the engine from seed 0 within its budget, twice, and fail unless both runs find its defect at the same execution with the same minimized input
+      --runs <N>          Stop after N executions (default: the count of the gating CI job, 200000). A run from a fixed seed and corpus over a fixed count is reproducible
+      --time <SECS>       Stop after SECS seconds instead of an execution count: a longer campaign, which a fixed seed does not reproduce
+      --seed <SEED>       The seed of the engine's random choices [default: 0]
+      --replay <FILE>     Run the property once on FILE and exit non-zero when it fails: the command a crash report prints
+      --minimize          Reduce the target's working corpus to a subset of its inputs with the same coverage, the shorter inputs kept first
+      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+  -h, --help              Print help
+=== xtask fuzz --help
+Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
+
+Usage: xtask fuzz [OPTIONS] [TARGET]
+
+Arguments:
+  [TARGET]  The fuzz target to run (`--list` names them)
+
+Options:
+      --all               Run every fuzz target in turn, each whatever another's outcome, and fail when one found a failing input
+      --list              Print the fuzz targets' names, building nothing
+      --self-test         Run each planted target of the engine from seed 0 within its budget, twice, and fail unless both runs find its defect at the same execution with the same minimized input
+      --runs <N>          Stop after N executions (default: the count of the gating CI job, 200000). A run from a fixed seed and corpus over a fixed count is reproducible
+      --time <SECS>       Stop after SECS seconds instead of an execution count: a longer campaign, which a fixed seed does not reproduce
+      --seed <SEED>       The seed of the engine's random choices [default: 0]
+      --replay <FILE>     Run the property once on FILE and exit non-zero when it fails: the command a crash report prints
+      --minimize          Reduce the target's working corpus to a subset of its inputs with the same coverage, the shorter inputs kept first
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
@@ -1576,6 +1618,7 @@ Commands:
   clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
   test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
+  fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
   kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md

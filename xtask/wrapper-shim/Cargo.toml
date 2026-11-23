@@ -6,11 +6,11 @@ publish.workspace = true
 
 # Host-target binary. Built once per toolchain mirror by xtask, then
 # installed into target/seraph-toolchain/bin/ as both `rustc` and
-# `ws-clippy`; dispatches on argv[0] basename.
+# `ws-clippy`, and into target/xtask/fuzz-shim/ as `sancov-rustc`;
+# dispatches on argv[0] basename.
 [[bin]]
 name = "seraph-wrapper-shim"
 path = "src/main.rs"
-test = false
 
 # Intentionally no [dependencies] — the shim is on the hot path of
 # every rustc invocation during StdUser builds. Keep the working set

@@ -23,8 +23,9 @@
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_create_endpoint, cap_create_notification, cap_create_thread, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait_timeout, raw_ipc_call, raw_ipc_reply, thread_exit,
+    MsgRegs, cap_create_endpoint, cap_create_notification, cap_create_thread, cap_delete,
+    ipc_buffer_set, notification_send, notification_wait_timeout, raw_ipc_call, raw_ipc_reply,
+    thread_exit,
 };
 use syscall_abi::{
     CAP_GEN_MASK, SyscallError, cap_handle_encode, cap_handle_gen, cap_handle_index,
@@ -125,8 +126,8 @@ fn check_call_paths(ctx: &TestContext, ep: u64, stale: u64) -> TestResult
     // keeps precedence over the missing reply capability.
     // SAFETY: deregistering (0) dedicates no page.
     unsafe { ipc_buffer_set(0) }.map_err(|_| "cap_generation_wide: ipc_buffer_set(0) failed")?;
-    let unbuffered_call = raw_ipc_call(ep, 1, 0, 1);
-    let unbuffered_reply = raw_ipc_reply(1, 0, 1);
+    let unbuffered_call = raw_ipc_call(ep, 1, 0, 1, &MsgRegs::default());
+    let unbuffered_reply = raw_ipc_reply(1, 0, 1, &MsgRegs::default());
     // SAFETY: ctx.ipc_buf is the page ktest registered at startup, dedicated
     // to the kernel's IPC access under the contract it was first registered
     // with; re-registering it restores that state.

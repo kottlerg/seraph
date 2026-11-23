@@ -109,6 +109,9 @@ const fn ep_done_block() -> ArgBlock<EpDoneArgs, 1>
     ArgBlock::new(EpDoneArgs { ep: 0, done: 0 })
 }
 
+/// Label of `call_with_cap_transfer`'s second, capless call.
+const CAPLESS_LABEL: u64 = 0xCA9E;
+
 static CALL_REPLY_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
 static QUEUED_CALLER_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
 static DATA_WORDS_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
@@ -405,11 +408,15 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
 /// IPC call transferring one capability from caller to server.
 ///
 /// The child creates a notification, passes it via the IPC cap transfer mechanism.
-/// The server receives it and verifies it can use the transferred cap.
+/// The server receives it and verifies it can use the transferred cap. The
+/// child then calls once more with no cap, and that message carries none,
+/// although the kernel leaves the server's cap result block as the first
+/// delivery wrote it (core/kernel/docs/syscalls.md § `SYS_IPC_RECV`).
 #[expect(
     clippy::large_stack_frames,
-    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
-              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+    reason = "the received `msg` and `capless` and the reply `IpcMessage`s (568 B each) and \
+              the `Result` temporaries of their `ipc_recv(..)?` (about 576 B each); on init's \
+              16 KiB stack"
 )]
 pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
 {
@@ -474,7 +481,23 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
     unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }
         .map_err(|_| "ipc_reply for cap_xfer test failed")?;
 
+    // The capless call that follows delivers no cap, so the kernel leaves the
+    // cap result block holding the first delivery's handle; the message must
+    // carry no cap all the same.
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let capless = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv of the capless call for cap_xfer test failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }
+        .map_err(|_| "ipc_reply to the capless call for cap_xfer test failed")?;
+
     notification_wait(done).map_err(|_| "notification_wait for cap_xfer test failed")?;
+
+    if capless.label != CAPLESS_LABEL || !capless.caps().is_empty()
+    {
+        cap_delete(transferred_sig).ok();
+        return Err("a capless call after a cap-carrying one delivered a cap");
+    }
 
     if send_result.is_err()
     {
@@ -816,10 +839,21 @@ extern "C" fn cap_xfer_caller_entry(arg: u64) -> !
         thread_exit()
     };
 
-    // Call with 1 cap to transfer.
+    // Call with 1 cap to transfer, then once with none.
     let msg = IpcMessage::builder(0xCAFE).cap(sig).build();
     // SAFETY: buf_addr was registered as this thread's IPC buffer above.
-    match unsafe { ipc::ipc_call(ep_slot, &msg, buf_addr as *mut u64) }
+    let with_cap = unsafe { ipc::ipc_call(ep_slot, &msg, buf_addr as *mut u64) };
+    let capless = with_cap.and_then(|_| {
+        // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+        unsafe {
+            ipc::ipc_call(
+                ep_slot,
+                &IpcMessage::new(CAPLESS_LABEL),
+                buf_addr as *mut u64,
+            )
+        }
+    });
+    match capless
     {
         Ok(_) => notification_send(done_slot, 0xDEAD).ok(),
         Err(_) => notification_send(done_slot, 0xBAD).ok(),
@@ -868,8 +902,9 @@ extern "C" fn badge_caller_entry(arg: u64) -> !
 /// the post-recv / pre-read window: any IPC issued in that window (in a
 /// ruststd process, a `println!` sending `STREAM_BYTES` on its log stream)
 /// would overwrite the received payload. This test locks the snapshot
-/// contract (`ipc::IpcMessage`) in: receive a message with known words,
-/// scribble garbage directly over the IPC buffer (the worst case of any
+/// contract (`ipc::IpcMessage`) in: receive a message with known words, one
+/// longer than `MSG_REGS_DATA_MAX` so that it arrives in the buffer, scribble
+/// garbage directly over the IPC buffer (the worst case of any
 /// nested IPC activity), then verify the message's view is unchanged.
 #[expect(
     clippy::large_stack_frames,
@@ -917,9 +952,9 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
     {
         return Err("snapshot test: ipc_recv returned wrong label");
     }
-    if msg.word_count() < 2
+    if msg.word_count() != syscall_abi::MSG_REGS_DATA_MAX + 1
     {
-        return Err("snapshot test: received fewer than 2 data words");
+        return Err("snapshot test: received a wrong data word count");
     }
 
     // Simulate any nested IPC activity between recv and read: an IPC issued
@@ -964,7 +999,7 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
 }
 
 /// Child for `recv_snapshot_survives_buffer_clobber`: calls with two known
-/// data words and exits.
+/// data words in a message of `MSG_REGS_DATA_MAX + 1` words and exits.
 extern "C" fn snapshot_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the test published for this child.
@@ -983,9 +1018,12 @@ extern "C" fn snapshot_caller_entry(arg: u64) -> !
         thread_exit()
     }
 
+    // One word more than the message registers carry, so the message
+    // travels in the server's IPC buffer, which the test then clobbers.
     let msg = IpcMessage::builder(0x5A15)
         .word(0, 0x1234_5678_9ABC_DEF0)
         .word(1, 0x0FED_CBA9_8765_4321)
+        .word_count(syscall_abi::MSG_REGS_DATA_MAX + 1)
         .build();
 
     // SAFETY: buf_addr was registered as this thread's IPC buffer above.
@@ -1983,6 +2021,10 @@ const WAIT_SLOT_TAKE: usize = 0;
 const WAIT_SLOT_KEEP: usize = 1;
 /// `WaitArgs` slot of `call_timeout_late_reply_refused`.
 const WAIT_SLOT_LATE: usize = 2;
+/// `WaitArgs` slot of `regs_round_trip_no_buffer`'s server.
+const WAIT_SLOT_REGS_SERVER: usize = 3;
+/// `WaitArgs` slot of `regs_and_buffer_delivery`'s caller.
+const WAIT_SLOT_REGS_CALLER: usize = 4;
 
 /// Bound on each wait for a child's report, before `crate::scaled_bound`.
 const WAIT_REPORT_MS: u64 = 5000;
@@ -2014,14 +2056,14 @@ struct WaitArgs
     page: u64,
 }
 
-static WAIT_ARGS: ArgBlock<WaitArgs, 3> = ArgBlock::new(WaitArgs {
+static WAIT_ARGS: ArgBlock<WaitArgs, 5> = ArgBlock::new(WaitArgs {
     ep: 0,
     done: 0,
     go: 0,
     page: 0,
 });
-static mut WAIT_STACKS: [ChildStack; 3] = [ChildStack::ZERO; 3];
-static mut WAIT_PAGES: [crate::IpcPage; 3] = [crate::IpcPage::ZERO; 3];
+static mut WAIT_STACKS: [ChildStack; 5] = [ChildStack::ZERO; 5];
+static mut WAIT_PAGES: [crate::IpcPage; 5] = [crate::IpcPage::ZERO; 5];
 
 /// Microseconds since boot.
 fn now_us() -> Result<u64, &'static str>
@@ -2164,13 +2206,12 @@ pub fn recv_try_once_takes_queued_caller(ctx: &TestContext) -> TestResult
             Err(_) => return Err("ipc::recv_try_once_takes_queued_caller: try-once failed"),
         }
     }
-    let (label, _, _) =
-        got.ok_or("ipc::recv_try_once_takes_queued_caller: no caller was ever taken")?;
-    if label != WAIT_CALL_LABEL
+    let got = got.ok_or("ipc::recv_try_once_takes_queued_caller: no caller was ever taken")?;
+    if got.label != WAIT_CALL_LABEL
     {
         return Err("ipc::recv_try_once_takes_queued_caller: wrong label received");
     }
-    syscall::raw_ipc_reply(0xC0DE, 0, 0)
+    syscall::raw_ipc_reply(0xC0DE, 0, 0, &syscall::MsgRegs::default())
         .map_err(|_| "ipc::recv_try_once_takes_queued_caller: reply failed")?;
     let report = wait_report(done)?;
     if report != 0xC0DE
@@ -2205,9 +2246,9 @@ pub fn recv_try_once_keeps_reply_binding(ctx: &TestContext) -> TestResult
         wait_caller_entry,
     )?;
 
-    let (label, _, _) = syscall::raw_ipc_recv(ep)
+    let received = syscall::raw_ipc_recv(ep)
         .map_err(|_| "ipc::recv_try_once_keeps_reply_binding: recv failed")?;
-    if label != WAIT_CALL_LABEL
+    if received.label != WAIT_CALL_LABEL
     {
         return Err("ipc::recv_try_once_keeps_reply_binding: wrong label received");
     }
@@ -2216,7 +2257,7 @@ pub fn recv_try_once_keeps_reply_binding(ctx: &TestContext) -> TestResult
     {
         return Err("ipc::recv_try_once_keeps_reply_binding: try-once did not WouldBlock");
     }
-    syscall::raw_ipc_reply(0xB10B, 0, 0)
+    syscall::raw_ipc_reply(0xB10B, 0, 0, &syscall::MsgRegs::default())
         .map_err(|_| "ipc::recv_try_once_keeps_reply_binding: reply after the try-once failed")?;
     let report = wait_report(done)?;
     if report != 0xB10B
@@ -2240,7 +2281,8 @@ pub fn call_timeout_no_receiver(ctx: &TestContext) -> TestResult
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "ipc::call_timeout_no_receiver: cap_create_endpoint failed")?;
     let t0 = now_us()?;
-    let r = syscall::raw_ipc_call_timeout(ep, WAIT_CALL_LABEL, 0, 0, 50);
+    let r =
+        syscall::raw_ipc_call_timeout(ep, WAIT_CALL_LABEL, 0, 0, 50, &syscall::MsgRegs::default());
     let t1 = now_us()?;
     if r != Err(syscall_abi::SyscallError::WouldBlock as i64)
     {
@@ -2289,7 +2331,14 @@ pub fn call_timeout_late_reply_refused(ctx: &TestContext) -> TestResult
     let mut received = false;
     for _ in 0..crate::scaled_bound(LATE_CALL_ATTEMPTS)
     {
-        let r = syscall::raw_ipc_call_timeout(ep, WAIT_CALL_LABEL, 0, 0, LATE_CALL_TIMEOUT_MS);
+        let r = syscall::raw_ipc_call_timeout(
+            ep,
+            WAIT_CALL_LABEL,
+            0,
+            0,
+            LATE_CALL_TIMEOUT_MS,
+            &syscall::MsgRegs::default(),
+        );
         if r != Err(syscall_abi::SyscallError::WouldBlock as i64)
         {
             return Err("ipc::call_timeout_late_reply_refused: call did not time out");
@@ -2349,11 +2398,12 @@ extern "C" fn wait_caller_entry(arg: u64) -> !
     {
         wait_child_fail(args)
     }
-    let bits = match syscall::raw_ipc_call(args.ep, WAIT_CALL_LABEL, 0, 0)
-    {
-        Ok((label, _)) => label,
-        Err(_) => WAIT_BAD,
-    };
+    let bits =
+        match syscall::raw_ipc_call(args.ep, WAIT_CALL_LABEL, 0, 0, &syscall::MsgRegs::default())
+        {
+            Ok(reply) => reply.label,
+            Err(_) => WAIT_BAD,
+        };
     notification_send(args.done, bits).ok();
     thread_exit()
 }
@@ -2383,11 +2433,471 @@ extern "C" fn wait_late_server_entry(arg: u64) -> !
     {
         wait_child_fail(args)
     }
-    let bits = match syscall::raw_ipc_reply(1, 0, 0)
+    let bits = match syscall::raw_ipc_reply(1, 0, 0, &syscall::MsgRegs::default())
     {
         Err(e) if e == syscall_abi::SyscallError::InvalidCapability as i64 => WAIT_REFUSED,
         _ => WAIT_BAD,
     };
     notification_send(args.done, bits).ok();
     thread_exit()
+}
+
+// ── Register transport (MSG_REGS_DATA_MAX) ───────────────────────────────────
+
+/// Label of the register-transport calls.
+const REGS_CALL_LABEL: u64 = 0x7E61;
+/// Label of the register-transport replies.
+const REGS_REPLY_LABEL: u64 = 0x7E62;
+/// Report bits of a register-transport child whose every check passed.
+const REGS_OK: u64 = 0x600D;
+/// Data words of a message that fills the message registers.
+const REGS_WORDS: syscall::MsgRegs = [
+    0x0101_0101_0101_0101,
+    0x0202_0202_0202_0202,
+    0x0303_0303_0303_0303,
+    0x0404_0404_0404_0404,
+    0x0505_0505_0505_0505,
+    0x0606_0606_0606_0606,
+];
+/// Data words of a message one word longer than the message registers carry.
+const BUF_WORDS: [u64; syscall_abi::MSG_REGS_DATA_MAX + 1] = [
+    0x7101_0000_0000_0001,
+    0x7102_0000_0000_0002,
+    0x7103_0000_0000_0003,
+    0x7104_0000_0000_0004,
+    0x7105_0000_0000_0005,
+    0x7106_0000_0000_0006,
+    0x7107_0000_0000_0007,
+];
+/// Marks a buffer data word the kernel must leave alone.
+const BUF_SENTINEL: u64 = 0x5E57_1E57_5E57_1E57;
+
+/// The data words of the reply to a message that carried `words`.
+fn reply_words<const N: usize>(words: &[u64; N]) -> [u64; N]
+{
+    words.map(|w| !w)
+}
+
+/// Write `words` over the first data words of the IPC buffer at `buf`.
+///
+/// # Safety
+///
+/// `buf` is the calling thread's registered IPC buffer, and `words` is no
+/// longer than `MSG_DATA_WORDS_MAX`.
+unsafe fn buf_write(buf: *mut u64, words: &[u64])
+{
+    for (i, &word) in words.iter().enumerate()
+    {
+        // SAFETY: i < words.len() <= MSG_DATA_WORDS_MAX, a word inside the
+        // buffer page (this fn's contract).
+        let slot = unsafe { buf.add(i) };
+        // SAFETY: slot is a data word of the caller's own IPC buffer.
+        unsafe { slot.write_volatile(word) };
+    }
+}
+
+/// Whether the first data words of the IPC buffer at `buf` equal `words`.
+///
+/// # Safety
+///
+/// As [`buf_write`].
+unsafe fn buf_holds(buf: *const u64, words: &[u64]) -> bool
+{
+    words.iter().enumerate().all(|(i, &word)| {
+        // SAFETY: i < words.len() <= MSG_DATA_WORDS_MAX, a word inside the
+        // buffer page (this fn's contract).
+        let slot = unsafe { buf.add(i) };
+        // SAFETY: slot is a data word of the caller's own IPC buffer.
+        let value = unsafe { slot.read_volatile() };
+        value == word
+    })
+}
+
+/// A message of `MSG_REGS_DATA_MAX` data words travels with no IPC buffer
+/// registered on either side, as a call and as its reply, and one of a word
+/// more is refused `InvalidArgument` there, as a call and as a reply.
+///
+/// The harness thread deregisters its buffer for the test, and the child
+/// server never registers one.
+pub fn regs_round_trip_no_buffer(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "ipc::regs_round_trip_no_buffer: cap_create_endpoint failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "ipc::regs_round_trip_no_buffer: cap_create_notification failed")?;
+    let result = regs_round_trip_no_buffer_on(ctx, ep, done);
+    cap_delete(ep).ok();
+    cap_delete(done).ok();
+    result
+}
+
+/// The results of [`regs_unbuffered_calls`]: the over-long call and reply,
+/// the round trip's reply, and the server child.
+type UnbufferedCalls = (
+    Result<syscall::IpcDelivery, i64>,
+    Result<(), i64>,
+    Result<syscall::IpcDelivery, i64>,
+    crate::spawn::SpawnedChild,
+);
+
+fn regs_round_trip_no_buffer_on(ctx: &TestContext, ep: u64, done: u64) -> TestResult
+{
+    // SAFETY: deregistering (0) dedicates no page.
+    unsafe { ipc_buffer_set(0) }
+        .map_err(|_| "ipc::regs_round_trip_no_buffer: ipc_buffer_set(0) failed")?;
+    let calls = regs_unbuffered_calls(ctx, ep, done);
+    // SAFETY: ctx.ipc_buf is the page ktest registered at startup, dedicated
+    // to the kernel's IPC access under the contract it was first registered
+    // with; re-registering it restores that state.
+    unsafe { ipc_buffer_set(ctx.ipc_buf as u64) }
+        .map_err(|_| "ipc::regs_round_trip_no_buffer: re-registering the IPC buffer failed")?;
+    let (long_call, long_reply, reply, mut child) = calls?;
+
+    let invalid = Err(syscall_abi::SyscallError::InvalidArgument as i64);
+    if long_call.map(|_| ()) != invalid
+    {
+        return Err("ipc::regs_round_trip_no_buffer: a 7-word call with no buffer was not refused");
+    }
+    if long_reply != invalid
+    {
+        return Err(
+            "ipc::regs_round_trip_no_buffer: a 7-word reply with no buffer was not refused",
+        );
+    }
+    let reply = reply.map_err(|_| "ipc::regs_round_trip_no_buffer: the 6-word call failed")?;
+    if reply.label != REGS_REPLY_LABEL
+        || reply.data_count != syscall_abi::MSG_REGS_DATA_MAX
+        || reply.cap_count != 0
+        || reply.regs != reply_words(&REGS_WORDS)
+    {
+        return Err("ipc::regs_round_trip_no_buffer: the 6-word reply arrived altered");
+    }
+    if wait_report(done)? != REGS_OK
+    {
+        return Err("ipc::regs_round_trip_no_buffer: the server saw the 6-word call altered");
+    }
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
+    Ok(())
+}
+
+/// With the harness thread's buffer deregistered: an over-long call and
+/// reply, then a round trip of `MSG_REGS_DATA_MAX` words with a server child.
+fn regs_unbuffered_calls(
+    ctx: &TestContext,
+    ep: u64,
+    done: u64,
+) -> Result<UnbufferedCalls, &'static str>
+{
+    // Nothing receives yet: a long call that passed its checks would wait
+    // out its bound, and a long reply that did would find no caller.
+    let long_call = syscall::raw_ipc_call_timeout(
+        ep,
+        REGS_CALL_LABEL,
+        syscall_abi::MSG_REGS_DATA_MAX + 1,
+        0,
+        LATE_CALL_TIMEOUT_MS,
+        &REGS_WORDS,
+    );
+    let long_reply = syscall::raw_ipc_reply(
+        REGS_REPLY_LABEL,
+        syscall_abi::MSG_REGS_DATA_MAX + 1,
+        0,
+        &REGS_WORDS,
+    );
+    let child = start_wait_child(
+        ctx,
+        ep,
+        syscall_abi::RIGHTS_EP_RECEIVE,
+        done,
+        0,
+        WAIT_SLOT_REGS_SERVER,
+        regs_server_entry,
+    )?;
+    let bound = u32::try_from(crate::scaled_bound(WAIT_REPORT_MS)).unwrap_or(u32::MAX);
+    let reply = syscall::raw_ipc_call_timeout(
+        ep,
+        REGS_CALL_LABEL,
+        syscall_abi::MSG_REGS_DATA_MAX,
+        0,
+        bound,
+        &REGS_WORDS,
+    );
+    Ok((long_call, long_reply, reply, child))
+}
+
+/// Child server with no IPC buffer: receives one call, replies with its
+/// words inverted, and reports [`REGS_OK`] if the call carried
+/// [`REGS_WORDS`] in registers, [`WAIT_BAD`] otherwise.
+extern "C" fn regs_server_entry(arg: u64) -> !
+{
+    // SAFETY: `arg` is the entry the test published for this child.
+    let args: WaitArgs = unsafe { child_args(arg) };
+    let Ok(call) = syscall::raw_ipc_recv_timeout(args.ep, crate::scaled_bound(WAIT_REPORT_MS))
+    else
+    {
+        wait_child_fail(args)
+    };
+    let intact = call.label == REGS_CALL_LABEL
+        && call.data_count == syscall_abi::MSG_REGS_DATA_MAX
+        && call.cap_count == 0
+        && call.regs == REGS_WORDS;
+    let replied = syscall::raw_ipc_reply(
+        REGS_REPLY_LABEL,
+        syscall_abi::MSG_REGS_DATA_MAX,
+        0,
+        &reply_words(&REGS_WORDS),
+    );
+    let bits = if intact && replied.is_ok()
+    {
+        REGS_OK
+    }
+    else
+    {
+        WAIT_BAD
+    };
+    notification_send(args.done, bits).ok();
+    thread_exit()
+}
+
+/// The data words arrive intact at `MSG_REGS_DATA_MAX` words, in registers,
+/// and at one word more, in the buffer, as a call and as a reply; a message
+/// in registers leaves the receiver's buffer data words as they were.
+///
+/// The child calls with 6 words and the harness replies with 7, then the
+/// child calls with 7 and the harness replies with 6.
+pub fn regs_and_buffer_delivery(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "ipc::regs_and_buffer_delivery: cap_create_endpoint failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "ipc::regs_and_buffer_delivery: cap_create_notification failed")?;
+    let result = regs_and_buffer_delivery_on(ctx, ep, done);
+    cap_delete(ep).ok();
+    cap_delete(done).ok();
+    result
+}
+
+fn regs_and_buffer_delivery_on(ctx: &TestContext, ep: u64, done: u64) -> TestResult
+{
+    let sentinels = [BUF_SENTINEL; syscall_abi::MSG_REGS_DATA_MAX + 1];
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer, and
+    // `sentinels` is 7 words long.
+    unsafe { buf_write(ctx.ipc_buf, &sentinels) };
+    let mut child = start_wait_child(
+        ctx,
+        ep,
+        RIGHTS_EP_SEND_GRANT,
+        done,
+        0,
+        WAIT_SLOT_REGS_CALLER,
+        regs_caller_entry,
+    )?;
+    let bound = crate::scaled_bound(WAIT_REPORT_MS);
+
+    // Round 1: a 6-word call, answered with 7 words through the buffer.
+    let first = syscall::raw_ipc_recv_timeout(ep, bound)
+        .map_err(|_| "ipc::regs_and_buffer_delivery: no 6-word call arrived")?;
+    // SAFETY: as above.
+    let untouched = unsafe { buf_holds(ctx.ipc_buf, &sentinels) };
+    let long_reply = reply_words(&BUF_WORDS);
+    // SAFETY: as above; `long_reply` is 7 words long.
+    unsafe { buf_write(ctx.ipc_buf, &long_reply) };
+    syscall::raw_ipc_reply(
+        REGS_REPLY_LABEL,
+        long_reply.len(),
+        0,
+        &syscall::MsgRegs::default(),
+    )
+    .map_err(|_| "ipc::regs_and_buffer_delivery: the 7-word reply failed")?;
+    if first.label != REGS_CALL_LABEL
+        || first.data_count != syscall_abi::MSG_REGS_DATA_MAX
+        || first.regs != REGS_WORDS
+    {
+        return Err("ipc::regs_and_buffer_delivery: the 6-word call arrived altered");
+    }
+    if !untouched
+    {
+        return Err("ipc::regs_and_buffer_delivery: a 6-word call wrote the receiver's buffer");
+    }
+
+    // Round 2: a 7-word call through the buffer, answered with 6 words.
+    let second = syscall::raw_ipc_recv_timeout(ep, bound)
+        .map_err(|_| "ipc::regs_and_buffer_delivery: no 7-word call arrived")?;
+    // SAFETY: as above.
+    let delivered = unsafe { buf_holds(ctx.ipc_buf, &BUF_WORDS) };
+    syscall::raw_ipc_reply(
+        REGS_REPLY_LABEL,
+        syscall_abi::MSG_REGS_DATA_MAX,
+        0,
+        &reply_words(&REGS_WORDS),
+    )
+    .map_err(|_| "ipc::regs_and_buffer_delivery: the 6-word reply failed")?;
+    if second.label != REGS_CALL_LABEL || second.data_count != BUF_WORDS.len() || !delivered
+    {
+        return Err("ipc::regs_and_buffer_delivery: the 7-word call arrived altered");
+    }
+
+    match wait_report(done)?
+    {
+        REGS_OK => (),
+        WAIT_BAD => return Err("ipc::regs_and_buffer_delivery: a reply arrived altered"),
+        _ => return Err("ipc::regs_and_buffer_delivery: a 6-word reply wrote the caller's buffer"),
+    }
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
+    Ok(())
+}
+
+/// Report bits of [`regs_caller_entry`] when the 6-word reply wrote its
+/// buffer's data words.
+const REGS_BUF_WRITTEN: u64 = 0xB0F;
+
+/// Child for [`regs_and_buffer_delivery`]: calls with [`REGS_WORDS`] in
+/// registers, expects [`BUF_WORDS`] inverted in its buffer, calls with
+/// [`BUF_WORDS`] in its buffer, expects [`REGS_WORDS`] inverted in registers
+/// and its buffer unchanged, and reports [`REGS_OK`], [`REGS_BUF_WRITTEN`] or
+/// [`WAIT_BAD`].
+extern "C" fn regs_caller_entry(arg: u64) -> !
+{
+    // SAFETY: `arg` is the entry the test published for this child.
+    let args: WaitArgs = unsafe { child_args(arg) };
+    // SAFETY: `args.page` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child reaches it
+    // only through the raw address.
+    if unsafe { syscall::ipc_buffer_set(args.page) }.is_err()
+    {
+        wait_child_fail(args)
+    }
+    let buf = args.page as *mut u64;
+
+    let Ok(first) = syscall::raw_ipc_call(
+        args.ep,
+        REGS_CALL_LABEL,
+        syscall_abi::MSG_REGS_DATA_MAX,
+        0,
+        &REGS_WORDS,
+    )
+    else
+    {
+        wait_child_fail(args)
+    };
+    // SAFETY: buf is this thread's registered IPC buffer; the slices are 7
+    // words long.
+    let first_ok = first.label == REGS_REPLY_LABEL
+        && first.data_count == BUF_WORDS.len()
+        && unsafe { buf_holds(buf, &reply_words(&BUF_WORDS)) };
+
+    // SAFETY: as above.
+    unsafe { buf_write(buf, &BUF_WORDS) };
+    let Ok(second) = syscall::raw_ipc_call(
+        args.ep,
+        REGS_CALL_LABEL,
+        BUF_WORDS.len(),
+        0,
+        &syscall::MsgRegs::default(),
+    )
+    else
+    {
+        wait_child_fail(args)
+    };
+    let second_ok = second.label == REGS_REPLY_LABEL
+        && second.data_count == syscall_abi::MSG_REGS_DATA_MAX
+        && second.regs == reply_words(&REGS_WORDS);
+    // SAFETY: as above.
+    let untouched = unsafe { buf_holds(buf, &BUF_WORDS) };
+
+    let bits = match (first_ok && second_ok, untouched)
+    {
+        (true, true) => REGS_OK,
+        (true, false) => REGS_BUF_WRITTEN,
+        (false, _) => WAIT_BAD,
+    };
+    notification_send(args.done, bits).ok();
+    thread_exit()
+}
+
+/// Unmapped VA the fault-message child stores to; no test maps it.
+const FAULT_MSG_VA: u64 = 0x3E_A100_0000;
+/// Badge of the endpoint cap bound as the fault-message child's handler.
+const FAULT_MSG_BADGE: u64 = 0xFA17_0040;
+static mut FAULT_MSG_STACK: ChildStack = ChildStack::ZERO;
+
+/// A kernel-made fault message (4 data words) reaches a handler intact in
+/// the message registers, with no IPC buffer registered on the handler.
+pub fn fault_message_in_registers(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "ipc::fault_message_in_registers: cap_create_endpoint failed")?;
+    let result = fault_message_in_registers_on(ctx, ep);
+    cap_delete(ep).ok();
+    result
+}
+
+fn fault_message_in_registers_on(ctx: &TestContext, ep: u64) -> TestResult
+{
+    let mut child = crate::spawn::new_child(ctx)
+        .map_err(|_| "ipc::fault_message_in_registers: spawn::new_child failed")?;
+    crate::bind_fault_handler(child.th, ep, FAULT_MSG_BADGE)
+        .map_err(|_| "ipc::fault_message_in_registers: bind_fault_handler failed")?;
+    // SAFETY: `FAULT_MSG_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(FAULT_MSG_STACK)) };
+    // SAFETY: the stack is `FAULT_MSG_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, fault_msg_entry, stack_top, 0) }
+        .map_err(|_| "ipc::fault_message_in_registers: configure_and_start failed")?;
+
+    // SAFETY: deregistering (0) dedicates no page.
+    unsafe { ipc_buffer_set(0) }
+        .map_err(|_| "ipc::fault_message_in_registers: ipc_buffer_set(0) failed")?;
+    let fault = syscall::raw_ipc_recv_timeout(ep, crate::scaled_bound(WAIT_REPORT_MS));
+    let killed = fault.as_ref().map_or(Ok(()), |_| {
+        syscall::raw_ipc_reply(
+            syscall_abi::FAULT_REPLY_KILL,
+            0,
+            0,
+            &syscall::MsgRegs::default(),
+        )
+    });
+    // SAFETY: ctx.ipc_buf is the page ktest registered at startup, dedicated
+    // to the kernel's IPC access under the contract it was first registered
+    // with; re-registering it restores that state.
+    unsafe { ipc_buffer_set(ctx.ipc_buf as u64) }
+        .map_err(|_| "ipc::fault_message_in_registers: re-registering the IPC buffer failed")?;
+
+    let fault =
+        fault.map_err(|_| "ipc::fault_message_in_registers: no fault message within the bound")?;
+    killed.map_err(|_| "ipc::fault_message_in_registers: the KILL reply failed")?;
+    if fault.label != syscall_abi::FAULT_LABEL || fault.badge != FAULT_MSG_BADGE
+    {
+        return Err("ipc::fault_message_in_registers: the message is not the child's fault");
+    }
+    if fault.data_count != 4 || fault.cap_count != 0
+    {
+        return Err("ipc::fault_message_in_registers: the fault message has the wrong counts");
+    }
+    let [kind, va, access, ip, ..] = fault.regs;
+    if kind != syscall_abi::FAULT_KIND_VM
+        || va != FAULT_MSG_VA
+        || access & syscall_abi::FAULT_ACCESS_WRITE == 0
+        || ip == 0
+    {
+        return Err("ipc::fault_message_in_registers: the fault message's words arrived altered");
+    }
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
+    Ok(())
+}
+
+/// Child for [`fault_message_in_registers`]: stores to [`FAULT_MSG_VA`],
+/// which faults; the handler's reply kills it.
+extern "C" fn fault_msg_entry(_arg: u64) -> !
+{
+    // SAFETY: FAULT_MSG_VA is unmapped, so the store faults to the bound
+    // handler, which kills this thread; it never completes.
+    unsafe { (FAULT_MSG_VA as *mut u64).write_volatile(1) };
+    loop
+    {
+        core::hint::spin_loop();
+    }
 }

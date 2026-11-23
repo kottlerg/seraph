@@ -10,6 +10,7 @@ pub mod capture_acpi;
 pub mod clean;
 pub mod compare_images;
 pub mod crypto_vectors;
+pub mod fuzz;
 pub mod hook;
 pub mod host;
 pub mod issue;

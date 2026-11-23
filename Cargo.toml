@@ -131,6 +131,8 @@ members = [
     "runtime/ruststd/pool-funding",
     "runtime/ruststd/spin-wait",
     "xtask",
+    "xtask/fuzz/engine",
+    "xtask/fuzz/targets",
     "xtask/wrapper-shim",
 ]
 
@@ -145,8 +147,9 @@ publish = false
 
 
 [workspace.lints.rust]
-# `cargo kani` sets `cfg(kani)` and the fuzzing engine `cfg(fuzzing)`; each
-# gates code no other build compiles (docs/testing.md § Bounded verification).
+# `cargo kani` sets `cfg(kani)` (docs/testing.md § Bounded verification), and
+# `cargo xtask fuzz` alone sets `fuzzing`: the property modules of the parser
+# crates and the fuzz targets compile under it (docs/testing.md § Fuzzing).
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(fuzzing)'] }
 
 [workspace.lints.clippy]
@@ -231,11 +234,11 @@ mmio = { path = "shared/mmio" }
 text = { path = "shared/text" }
 syscall = { path = "abi/syscall", package = "syscall-abi" }
 
-# opt-level = 2 and debug = 0 are unified across both profiles; debuginfo is
-# opt-in per-package via `cargo xtask build --debug <comp>`. dev and release
-# differ only in {debug-assertions, overflow-checks} (iterate) and
+# opt-level = 2 and debug = 0 are unified across dev and release; debuginfo
+# is opt-in per-package via `cargo xtask build --debug <comp>`. dev and
+# release differ only in {debug-assertions, overflow-checks} (iterate) and
 # {lto, codegen-units} (ship). LTO has no per-package form, so two profiles
-# must persist.
+# must persist. A third, fuzz, builds only the fuzz targets.
 [profile.dev]
 panic = "abort"
 opt-level = 2
@@ -249,3 +252,17 @@ opt-level = 2
 debug = 0
 lto = true
 codegen-units = 1
+
+# The fuzz targets' profile (`cargo xtask fuzz`): release code with the checks
+# a fuzz run reports through. The engine catches a panic in-process, so
+# panics unwind; debug assertions and overflow checks turn a silent defect
+# into a panic; line tables give its backtrace. LTO is off: the
+# SanitizerCoverage pass runs again over the merged module of an LTO build,
+# which would instrument the engine's own callbacks.
+[profile.fuzz]
+inherits = "release"
+panic = "unwind"
+debug-assertions = true
+overflow-checks = true
+debug = "line-tables-only"
+lto = false

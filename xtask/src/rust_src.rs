@@ -546,6 +546,32 @@ fn install_wrappers(ctx: &BuildContext, mirror: &Path) -> Result<()>
     Ok(())
 }
 
+/// The shim's install name for the fuzz build's `RUSTC_WORKSPACE_WRAPPER`.
+const SANCOV_WRAPPER: &str = "sancov-rustc";
+
+/// Build the `seraph-wrapper-shim` crate (a no-op when nothing changed) and
+/// install it as `sancov-rustc` in `dir`, for `cargo xtask fuzz`; return the
+/// installed path. The mode needs no toolchain mirror: cargo passes the
+/// wrapper the rustc it runs.
+pub fn install_sancov_wrapper(ctx: &BuildContext, dir: &Path) -> Result<PathBuf>
+{
+    let shim_binary = build_shim_binary(ctx)?;
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let dst = dir.join(install_name_for(SANCOV_WRAPPER));
+    if dst.symlink_metadata().is_ok()
+    {
+        fs::remove_file(&dst).with_context(|| format!("removing {}", dst.display()))?;
+    }
+    fs::copy(&shim_binary, &dst).with_context(|| {
+        format!(
+            "installing wrapper shim {} -> {}",
+            shim_binary.display(),
+            dst.display()
+        )
+    })?;
+    Ok(dst)
+}
+
 /// Cargo builds shims into `target/release/<name><EXE>`. Encode the
 /// per-host exe suffix here so the path lookup is portable.
 fn install_name_for(name: &str) -> String

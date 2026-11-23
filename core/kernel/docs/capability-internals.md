@@ -917,7 +917,8 @@ The mechanism is `cap/sole_reference.rs`.
   a time, before its halt decision (`sole_reference::work_pending`), and every interrupt taken from
   user mode ends with a pass when the table has work (`sole_reference::drain_at_interrupt`, beside
   the upcall interrupt delivery point), so a CPU that runs only user code, makes no syscall and
-  never idles posts the rest within a timer tick. The drain that claims a
+  never idles still makes a pass every timer tick, posting up to the budget each time. The drain
+  that claims a
   post may run on a CPU other than the one whose release made it, so a post can reach its queue
   just after the call that made the release returns.
 - **What a post means.** Every arrival at `REF_OBSERVED | 1` is a decrement from

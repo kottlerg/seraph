@@ -1122,7 +1122,8 @@ on another CPU, so the post can reach the queue just after the call that made th
 a binder waits for it on the queue (`SYS_EVENT_RECV` with a timeout or none), and does not poll
 once. A drain posts at most `POST_BUDGET` (64) bindings; the rest wait for the next drain on any
 CPU, which an idle CPU makes before it halts and a CPU running user code makes at its next
-interrupt, so within a timer tick. A count that falls to one and rises
+interrupt: the next pass comes within a timer tick, and each posts at most `POST_BUDGET` more. A
+count that falls to one and rises
 again before the drain looks is found at its next fall to one or at the object's death, which posts
 every binding the object still has. The binding posts once and then ends. No post is made while a
 copy of the capability is in an IPC transfer: a queued message holds a slot handle, not a

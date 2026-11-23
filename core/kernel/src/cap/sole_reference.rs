@@ -490,8 +490,9 @@ pub fn work_pending() -> bool
 
 /// One [`drain`] pass when the table has work, at the end of an interrupt
 /// taken from user mode. A CPU that runs only user code makes no syscall and
-/// never idles, so this is where it posts what earlier passes left: within one
-/// timer tick. Costs one load when nothing is pending.
+/// never idles, so this is where it posts what earlier passes left: one pass,
+/// at most `POST_BUDGET` posts, per tick. Costs one load when nothing is
+/// pending.
 ///
 /// # Safety
 /// The end of an interrupt handler taken from user mode, the interrupt

@@ -112,7 +112,8 @@ fn remove(path: &Path) -> Result<()>
 }
 
 /// Empty Cargo's profile directories in `target`, the host's
-/// (`target/<profile>/`) and each target's (`target/<triple>/<profile>/`), but
+/// (`target/<profile>/`) and each target's (`target/<triple>/<profile>/`), and
+/// those of the mirror's build directory (`target/seraph-build/`), but
 /// for the build units of `keep`'s packages: only `build/<package>/` of a
 /// kept package stays. The rest of `target`, xtask's own state among it
 /// (`target/xtask/`: the trust store, the logs, the review records), is left
@@ -154,7 +155,13 @@ fn prune_to_std(target: &Path, keep: &BTreeSet<String>) -> Result<()>
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        if PROFILES.contains(&name.as_str()) && path.is_dir()
+        if name == crate::rust_src::BUILD_DIR && path.is_dir() && !path.is_symlink()
+        {
+            // The build directory of the builds the mirror's rustc compiles,
+            // laid out as `target` is.
+            prune_to_std(&path, keep)?;
+        }
+        else if PROFILES.contains(&name.as_str()) && path.is_dir()
         {
             prune_profile(&path)?;
         }
@@ -206,6 +213,11 @@ mod tests
             "x86_64-seraph-none/debug/build/core/3/out",
             "x86_64-seraph-none/debug/build/kernel/4/out",
             "x86_64-seraph-none/release/build/alloc/5",
+            "seraph-build/debug/build/compiler_builtins/6/out",
+            "seraph-build/debug/build/ipc/7/out",
+            "seraph-build/x86_64-seraph/debug/build/std/8/out",
+            "seraph-build/x86_64-seraph/debug/build/syscall/9/out",
+            "seraph-build/x86_64-seraph/debug/deps",
             "seraph-toolchain/lib",
             "xtask/test",
         ]
@@ -221,7 +233,7 @@ mod tests
         {
             fs::write(target.join(file), b"x").unwrap();
         }
-        let keep: BTreeSet<String> = ["core", "alloc", "compiler_builtins"]
+        let keep: BTreeSet<String> = ["core", "alloc", "compiler_builtins", "std"]
             .map(str::to_owned)
             .into();
         prune_to_std(&target, &keep).unwrap();
@@ -248,6 +260,8 @@ mod tests
             [
                 "CACHEDIR.TAG",
                 "debug/build/compiler_builtins/1/out",
+                "seraph-build/debug/build/compiler_builtins/6/out",
+                "seraph-build/x86_64-seraph/debug/build/std/8/out",
                 "seraph-toolchain/lib",
                 "x86_64-seraph-none/debug/build/core/3/out",
                 "x86_64-seraph-none/release/build/alloc/5",

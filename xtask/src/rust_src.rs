@@ -36,7 +36,8 @@
 //!   4. Callers route `cargo build` / `cargo clippy` through the
 //!      mirror by calling `SeraphToolchain::apply_env(&mut cmd)`,
 //!      which sets `RUSTC`, `RUSTC_WORKSPACE_WRAPPER`, the three
-//!      `SERAPH_SHIM_*` config vars, and `RUSTC_BOOTSTRAP=1` in one
+//!      `SERAPH_SHIM_*` config vars, `RUSTC_BOOTSTRAP=1`, and Cargo's
+//!      build directory (`target/seraph-build/`, [`BUILD_DIR`]) in one
 //!      go. No rustup-level state is modified;
 //!      `target/seraph-toolchain/` is a pure build artifact under
 //!      `target/`.
@@ -81,6 +82,13 @@ const MARKER: &str = "// seraph-overlay:";
 /// Name of the toolchain mirror directory under `target/`.
 const MIRROR_DIR: &str = "seraph-toolchain";
 
+/// Cargo's build directory under `target/` for the builds the mirror's
+/// rustc compiles: their host build scripts (`compiler_builtins`'s among them)
+/// are built from the mirror's sources, and sharing `target/<profile>/build/`
+/// with the builds from the toolchain's own sources would make each kind
+/// rebuild what the other built.
+pub(crate) const BUILD_DIR: &str = "seraph-build";
+
 /// Rustc-version stamp: invalidates the mirror if the underlying
 /// toolchain changes (`rustc --version --verbose` output).
 const VERSION_STAMP: &str = ".seraph-toolchain-stamp";
@@ -103,6 +111,7 @@ pub struct SeraphToolchain
     real_rustc: PathBuf,
     real_clippy: PathBuf,
     mirror_sysroot: PathBuf,
+    build_dir: PathBuf,
 }
 
 impl SeraphToolchain
@@ -111,7 +120,8 @@ impl SeraphToolchain
     /// build through the seraph toolchain mirror: `RUSTC` and
     /// `RUSTC_WORKSPACE_WRAPPER` (mirror entry points), the three
     /// `SERAPH_SHIM_*` config vars (so the shim knows what to exec),
-    /// and `RUSTC_BOOTSTRAP=1`.
+    /// `RUSTC_BOOTSTRAP=1`, and `CARGO_BUILD_BUILD_DIR` ([`BUILD_DIR`]):
+    /// the final artifacts still land in `target/<triple>/<profile>/`.
     ///
     /// `RUSTC_BOOTSTRAP=1` unlocks the unstable features that
     /// `-Zbuild-std` and the std overlay's workspace deps
@@ -129,6 +139,7 @@ impl SeraphToolchain
         cmd.env("SERAPH_SHIM_REAL_CLIPPY", &self.real_clippy);
         cmd.env("SERAPH_SHIM_MIRROR_SYSROOT", &self.mirror_sysroot);
         cmd.env("RUSTC_BOOTSTRAP", "1");
+        cmd.env("CARGO_BUILD_BUILD_DIR", &self.build_dir);
     }
 }
 
@@ -190,6 +201,7 @@ pub fn ensure_seraph_toolchain(ctx: &BuildContext) -> Result<SeraphToolchain>
         real_rustc,
         real_clippy,
         mirror_sysroot,
+        build_dir: ctx.target_dir.join(BUILD_DIR),
     })
 }
 
@@ -1510,6 +1522,90 @@ pub(crate) fn probe_real_sysroot() -> Result<PathBuf>
 mod tests
 {
     use super::*;
+
+    /// The path dependencies a crate's `Cargo.toml` names, as directories
+    /// relative to `root`: `path = "..."` from the crate's directory, and a
+    /// `workspace = true` one from the workspace's `Cargo.toml`.
+    fn path_deps(root: &Path, krate: &str) -> Vec<String>
+    {
+        let workspace = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let manifest = fs::read_to_string(root.join(krate).join("Cargo.toml")).unwrap();
+        let path_of = |line: &str| -> Option<String> {
+            let rest = &line[line.find("path = \"")? + "path = \"".len()..];
+            Some(rest[..rest.find('"')?].to_owned())
+        };
+        let mut deps = Vec::new();
+        for line in manifest.lines()
+        {
+            if let Some(rel) = path_of(line)
+            {
+                let dir = root.join(krate).join(rel).canonicalize().unwrap();
+                deps.push(dir.strip_prefix(root).unwrap().display().to_string());
+            }
+            else if line.contains("workspace = true")
+                && let Some(name) = line.split(['=', '.']).next().map(str::trim)
+                && let Some(entry) = workspace
+                    .lines()
+                    .find(|l| l.split('=').next().map(str::trim) == Some(name))
+                && let Some(rel) = path_of(entry)
+            {
+                deps.push(rel);
+            }
+        }
+        deps
+    }
+
+    // Defect caught: a file the seraph std is built from left out of the
+    // standard-library cache's key, so a change to it (one byte of an
+    // overlay source, of a crate std depends on, or of the specs and flags
+    // it is built with) restores the entry of the unchanged tree instead of
+    // missing it. Cargo rebuilds what changed after a restore in any case,
+    // since the checkout gives every file a new modification time; the key
+    // is what keeps an entry to one tree.
+    #[test]
+    fn the_std_cache_key_hashes_every_std_input()
+    {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        let action = fs::read_to_string(root.join(".github/actions/std-cache/action.yml")).unwrap();
+        let call = &action[action.find("hashFiles(").unwrap()..];
+        let call = &call[..call.find(')').unwrap()];
+        let patterns: Vec<&str> = call.split('\'').skip(1).step_by(2).collect();
+        let covered = |path: &str| {
+            patterns.iter().any(|p| {
+                p.strip_suffix("/**").map_or(*p == path, |dir| {
+                    path == dir || path.starts_with(&format!("{dir}/"))
+                })
+            })
+        };
+        let mut inputs: Vec<String> = [
+            "Cargo.toml",
+            ".cargo/config.toml",
+            "xtask/targets",
+            "xtask/src/rust_src.rs",
+            "xtask/src/commands/build.rs",
+            "runtime/ruststd/src",
+        ]
+        .map(str::to_owned)
+        .into();
+        let mut stack: Vec<String> = STD_WORKSPACE_DEPS.iter().map(|d| d.1.to_owned()).collect();
+        while let Some(krate) = stack.pop()
+        {
+            if !inputs.contains(&krate)
+            {
+                stack.extend(path_deps(&root, &krate));
+                inputs.push(krate);
+            }
+        }
+        let missed: Vec<&String> = inputs.iter().filter(|i| !covered(i)).collect();
+        assert!(
+            missed.is_empty(),
+            "the key's hashFiles misses {missed:?}; patterns {patterns:?}"
+        );
+    }
 
     // Defect caught: `sys/random/mod.rs`'s marker guarding `hash/random.rs`
     // too, so a run stopped between the two writes left the key cell

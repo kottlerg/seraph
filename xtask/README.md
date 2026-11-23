@@ -659,7 +659,7 @@ cargo xtask clean [--all | --keep-std]
 | Option | Description |
 |---|---|
 | `--all` | Also run `cargo clean` to remove the `target/` directory |
-| `--keep-std` | Also empty Cargo's profile directories, the host's (`target/<profile>/`) and each target's (`target/<triple>/<profile>/`), but for the build units of the packages the toolchain's `library/Cargo.lock` names (`core`, `alloc`, `compiler_builtins`, `std` and their dependencies): only `build/<package>/` of such a package stays. The rest of `target/`, `target/xtask/` among it, is left alone. CI's standard-library cache saves what is left ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration) |
+| `--keep-std` | Also empty Cargo's profile directories, the host's (`target/<profile>/`) and each target's (`target/<triple>/<profile>/`), and those of `target/seraph-build/`, the Cargo build directory of the builds that compile `std` from the toolchain mirror, but for the build units of the packages the toolchain's `library/Cargo.lock` names (`core`, `alloc`, `compiler_builtins`, `std` and their dependencies): only `build/<package>/` of such a package stays. The rest of `target/`, `target/xtask/` among it, is left alone. CI's standard-library cache saves what is left ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration) |
 
 ---
 

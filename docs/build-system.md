@@ -787,7 +787,8 @@ The jobs that build with `-Z build-std` (`host-tests`, for its riscv64 test buil
 `validate` and `bench` cell) keep a standard-library cache, `.github/actions/std-cache/action.yml`,
 restored before their first build and saved as their last step. Its entry holds the build units of
 the toolchain's library packages alone, what `cargo xtask clean --keep-std` leaves of Cargo's build
-directories (`target/<profile>/build/` and `target/<triple>/<profile>/build/`) ([xtask/README.md §
+directories (`target/<profile>/build/` and `target/<triple>/<profile>/build/`, and the same under
+`target/seraph-build/`, the build directory of the builds of `std`) ([xtask/README.md §
 `cargo xtask clean`](../xtask/README.md#cargo-xtask-clean)): Cargo judges a path source fresh by its
 modification time, and a checkout gives every file of the tree a new one, so a workspace crate's
 unit is rebuilt in every job and is left out, while the library's sources keep the times the

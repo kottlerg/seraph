@@ -65,8 +65,8 @@ pub fn run(ctx: &BuildContext, args: &CleanArgs) -> Result<()>
 
     if args.keep_std
     {
-        let lock = crate::rust_src::probe_real_sysroot()?
-            .join("lib/rustlib/src/rust/library/Cargo.lock");
+        let lock =
+            crate::rust_src::probe_real_sysroot()?.join("lib/rustlib/src/rust/library/Cargo.lock");
         let text =
             fs::read_to_string(&lock).with_context(|| format!("reading {}", lock.display()))?;
         step("Removing cargo target/ but the standard library's build units");
@@ -119,12 +119,14 @@ fn remove(path: &Path) -> Result<()>
 fn prune_to_std(target: &Path, keep: &BTreeSet<String>) -> Result<()>
 {
     let prune_profile = |profile: &Path| -> Result<()> {
-        for entry in fs::read_dir(profile).with_context(|| format!("reading {}", profile.display()))?
+        for entry in
+            fs::read_dir(profile).with_context(|| format!("reading {}", profile.display()))?
         {
             let path = entry.context("reading a directory entry")?.path();
             if path.file_name().is_some_and(|name| name == "build") && path.is_dir()
             {
-                for unit in fs::read_dir(&path).with_context(|| format!("reading {}", path.display()))?
+                for unit in
+                    fs::read_dir(&path).with_context(|| format!("reading {}", path.display()))?
                 {
                     let unit = unit.context("reading a directory entry")?;
                     if !keep.contains(unit.file_name().to_string_lossy().as_ref())
@@ -147,19 +149,23 @@ fn prune_to_std(target: &Path, keep: &BTreeSet<String>) -> Result<()>
     for entry in fs::read_dir(target).with_context(|| format!("reading {}", target.display()))?
     {
         let path = entry.context("reading a directory entry")?.path();
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         if PROFILES.contains(&name.as_str()) && path.is_dir()
         {
             prune_profile(&path)?;
         }
-        else if !path.is_symlink()
-            && PROFILES.iter().any(|p| path.join(p).join("build").is_dir())
+        else if !path.is_symlink() && PROFILES.iter().any(|p| path.join(p).join("build").is_dir())
         {
             // A target's directory: its profile directories and nothing else.
             for sub in fs::read_dir(&path).with_context(|| format!("reading {}", path.display()))?
             {
                 let sub = sub.context("reading a directory entry")?.path();
-                if sub.file_name().is_some_and(|n| PROFILES.iter().any(|p| n == *p)) && sub.is_dir()
+                if sub
+                    .file_name()
+                    .is_some_and(|n| PROFILES.iter().any(|p| n == *p))
+                    && sub.is_dir()
                 {
                     prune_profile(&sub)?;
                 }
@@ -214,12 +220,17 @@ mod tests
         {
             fs::create_dir_all(target.join(dir)).unwrap();
         }
-        for file in ["CACHEDIR.TAG", "debug/xtask", "x86_64-seraph-none/debug/kernel"]
+        for file in [
+            "CACHEDIR.TAG",
+            "debug/xtask",
+            "x86_64-seraph-none/debug/kernel",
+        ]
         {
             fs::write(target.join(file), b"x").unwrap();
         }
-        let keep: BTreeSet<String> =
-            ["core", "alloc", "compiler_builtins"].map(str::to_owned).into();
+        let keep: BTreeSet<String> = ["core", "alloc", "compiler_builtins"]
+            .map(str::to_owned)
+            .into();
         prune_to_std(&target, &keep).unwrap();
         let mut left = Vec::new();
         let mut stack = vec![target.clone()];

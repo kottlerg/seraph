@@ -70,7 +70,7 @@ pub unsafe fn post(
     )]
     // SAFETY: target valid per contract; the upcall fields, the state and the
     // binding are read and written under its sched_lock.
-    let (refusal, masked) = unsafe {
+    let (refusal, masked, running_on) = unsafe {
         let refusal = if matches!((*target).state, ThreadState::Created | ThreadState::Exited)
             || (*target).fault_handlers[CLASS_UPCALL]
                 .load(Ordering::Acquire)
@@ -91,8 +91,36 @@ pub unsafe fn post(
             (*target).upcall_pending.store(true, Ordering::Release);
             None
         };
-        (refusal, (*target).upcall_masked.load(Ordering::Relaxed))
+        // A `Running` thread is `current` on the CPU `preferred_cpu` names,
+        // which the dispatch wrote under this lock; any other thread is
+        // `current` nowhere, and its dispatch, under this lock, reads the
+        // pending upcall and posts it (`sched::schedule`).
+        let running_on =
+            ((*target).state == ThreadState::Running).then(|| (*target).preferred_cpu as usize);
+        (
+            refusal,
+            (*target).upcall_masked.load(Ordering::Relaxed),
+            running_on,
+        )
     };
+    // The CPU running the target owes the upcall at its next return of the
+    // upcall's kind (core/kernel/docs/scheduling-internals.md § Return Work);
+    // a masked upcall is posted by the unmask instead (`set_mask`).
+    if refusal.is_none()
+        && !masked
+        && let Some(cpu) = running_on
+    {
+        let bit = if any_instruction
+        {
+            crate::percpu::return_work::UPCALL_ANY
+        }
+        else
+        {
+            crate::percpu::return_work::UPCALL_SYSCALL
+        };
+        // SAFETY: preferred_cpu of a Running thread names an online CPU.
+        unsafe { crate::percpu::post_return_work_to(cpu, bit) };
+    }
     // SAFETY: paired with the lock_raw above.
     unsafe { sched_lock.unlock_raw(saved) };
     if let Some(e) = refusal
@@ -125,43 +153,56 @@ pub unsafe fn post(
     if any_instruction
     {
         // A target running on another CPU takes the prod's interrupt and
-        // reaches its return to user mode; one waiting on a run queue, which a
-        // return to user mode preempted, passes that return's delivery point
-        // when it runs again (sched::deliver_and_preempt); a fault-blocked one
-        // passes none at its fault's own return, only at a later interrupt or
-        // syscall; and one running on this CPU is the caller, which delivers
-        // at this syscall's return.
-        // SAFETY: target valid; the scan reads each CPU's current under its lock.
-        if let Some(cpu) = unsafe { running_cpu(target) }
+        // reaches its return to user mode, the bit posted above sending it
+        // to the delivery point; one waiting on a run queue, which a return
+        // to user mode preempted, passes that return's delivery point when it
+        // runs again, its dispatch posting the bit (sched::schedule); a
+        // fault-blocked one passes none at its fault's own return, only at a
+        // later interrupt or syscall; and one running on this CPU is the
+        // caller, which delivers at this syscall's return.
+        if let Some(cpu) = running_on
             && cpu != crate::arch::current::cpu::current_cpu() as usize
         {
-            // SAFETY: cpu is an online CPU index the scan found.
+            // SAFETY: preferred_cpu of a Running thread names an online CPU.
             unsafe { crate::sched::prod_remote_cpu(cpu) };
         }
     }
     Ok(())
 }
 
-/// The CPU `tcb` is `current` on at the scan, if any. A snapshot: the thread
-/// may leave or reach a CPU after it.
+/// The return-work bit a thread being dispatched owes the CPU it runs on: its
+/// pending upcall's, unless it masks upcalls, else 0.
 ///
 /// # Safety
-/// `tcb` must be a valid TCB; no scheduler lock is held.
+/// `tcb` must be a valid TCB whose `sched_lock` the caller holds, the lock
+/// the post, the mask and the take write the upcall fields under.
 #[cfg(not(test))]
-unsafe fn running_cpu(tcb: *mut ThreadControlBlock) -> Option<usize>
+pub unsafe fn return_work_of(tcb: *mut ThreadControlBlock) -> u32
 {
-    let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
-    (0..cpu_count).find(|&cpu| {
-        // SAFETY: cpu < cpu_count, and every online CPU's scheduler is
-        // initialised.
-        let s = unsafe { crate::sched::scheduler_for(cpu) };
-        // SAFETY: lock_raw paired with the unlock_raw below.
-        let f = unsafe { s.lock.lock_raw() };
-        let is_cur = core::ptr::eq(s.current(), tcb);
-        // SAFETY: paired with the lock_raw above.
-        unsafe { s.lock.unlock_raw(f) };
-        is_cur
-    })
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access reads an atomic upcall field of tcb under its held sched_lock"
+    )]
+    // SAFETY: tcb valid and its sched_lock held (contract).
+    let (pending, masked, any) = unsafe {
+        (
+            (*tcb).upcall_pending.load(Ordering::Relaxed),
+            (*tcb).upcall_masked.load(Ordering::Relaxed),
+            (*tcb).upcall_any_instruction.load(Ordering::Relaxed),
+        )
+    };
+    if !pending || masked
+    {
+        0
+    }
+    else if any
+    {
+        crate::percpu::return_work::UPCALL_ANY
+    }
+    else
+    {
+        crate::percpu::return_work::UPCALL_SYSCALL
+    }
 }
 
 /// The `CAP_INFO_THREAD_UPCALL` word of `tcb`: its pending, masked, and
@@ -216,7 +257,9 @@ pub unsafe fn info(tcb: *mut ThreadControlBlock) -> u64
 }
 
 /// Set or clear the calling thread's upcall mask; returns the previous mask.
-/// Clearing it leaves a pending upcall to this syscall's own return.
+/// Clearing it leaves a pending upcall to this syscall's own return, which the
+/// clear posts on this CPU (core/kernel/docs/scheduling-internals.md § Return
+/// Work).
 ///
 /// # Safety
 /// `tcb` must be the calling thread's TCB; no lock is held.
@@ -234,6 +277,14 @@ pub unsafe fn set_mask(tcb: *mut ThreadControlBlock, masked: bool) -> bool
     // SAFETY: tcb is the running thread; the mask is written under its
     // sched_lock, the lock a post and the park commit read it under.
     let previous = unsafe { (*tcb).upcall_masked.swap(masked, Ordering::Relaxed) };
+    // SAFETY: tcb is the running thread, whose sched_lock is held.
+    let owed = unsafe { return_work_of(tcb) };
+    if owed != 0
+    {
+        // SAFETY: syscall context on the running thread's CPU, which the held
+        // sched_lock (interrupts disabled) keeps it on.
+        unsafe { crate::percpu::post_return_work(owed) };
+    }
     // SAFETY: paired with the lock_raw above.
     unsafe { sched_lock.unlock_raw(saved) };
     previous
@@ -369,7 +420,7 @@ pub unsafe fn deliver_at_syscall()
 /// `UPCALL_ANY_INSTRUCTION` of the thread an interrupt preempted in user mode,
 /// before the interrupt returns to it, or of a thread the wake preemption
 /// rescheduled at the end of an exception it took in user mode
-/// (`sched::preempt_at_exception_return`).
+/// (`sched::exception_return_work`).
 ///
 /// # Safety
 /// The end of an interrupt handler taken from user mode, the interrupt

@@ -890,6 +890,32 @@ pub fn current_cpu() -> u32
     }
 }
 
+/// Read the 32-bit word at byte `OFFSET` of this CPU's `PerCpuData` with
+/// one GS-relative load. Not `pure`: each call loads again, since other CPUs
+/// write the word.
+///
+/// # Safety
+/// GS-base holds this CPU's `PerCpuData` address (`percpu::init_bsp` or
+/// `percpu::init_ap`), and `OFFSET` is the offset of an aligned 32-bit field
+/// of it.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn read_percpu_u32<const OFFSET: usize>() -> u32
+{
+    let word: u32;
+    // SAFETY: gs:[OFFSET] is the aligned 32-bit field (caller contract), so
+    // the load is one access; it writes no memory and no flag.
+    unsafe {
+        core::arch::asm!(
+            "mov {:e}, dword ptr gs:[{off}]",
+            out(reg) word,
+            off = const OFFSET,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    word
+}
+
 /// Read the pointer at byte `OFFSET` of this CPU's `PerCpuData` with one
 /// GS-relative load.
 ///

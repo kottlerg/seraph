@@ -1116,17 +1116,17 @@ object counts until it returns: when the slot `cap` names is the only other refe
 release is the fall to one, and a drain posts it as for any other release.
 
 **When it posts:** a release that leaves one reference marks the object for the kernel's drain,
-which runs at the end of every syscall, on every CPU, and in the idle loop, after the deferred
-reclaim; the post is made when a drain finds the object still at one reference. That drain may run
-on another CPU, so the post can reach the queue just after the call that made the release returns:
-a binder waits for it on the queue (`SYS_EVENT_RECV` with a timeout or none), and does not poll
-once. A drain posts at most `POST_BUDGET` (64) bindings; the rest wait for the next drain on any
-CPU, which an idle CPU makes before it halts and a CPU running user code makes at its next
-interrupt: the next pass comes within a timer tick, and each posts at most `POST_BUDGET` more. A
-count that falls to one and rises
-again before the drain looks is found at its next fall to one or at the object's death, which posts
-every binding the object still has. The binding posts once and then ends. No post is made while a
-copy of the capability is in an IPC transfer: a queued message holds a slot handle, not a
+which runs at the next return to user mode of the CPU that made the release, when its `SOLE_REF`
+return-work bit is set, and in the idle loop, after the deferred reclaim; the post is made when a
+drain finds the object still at one reference. That drain may run on another CPU, so the post can
+reach the queue just after the call that made the release returns: a binder waits for it on the
+queue (`SYS_EVENT_RECV` with a timeout or none), and does not poll once. A drain posts at most
+`POST_BUDGET` (64) bindings; the rest wait for the next drain, which the CPU that left them makes
+before it halts or at its next return to user mode, an interrupt's at the latest: the next pass
+comes within a timer tick, and each posts at most `POST_BUDGET` more. A count that falls to one and
+rises again before the drain looks is found at its next fall to one or at the object's death, which
+posts every binding the object still has. The binding posts once and then ends. No post is made
+while a copy of the capability is in an IPC transfer: a queued message holds a slot handle, not a
 reference, and the move at rendezvous takes the destination's reference before it frees the source
 ([capability-internals.md](capability-internals.md#sole-reference-observers) § Sole-Reference
 Observers). A post says the object held one reference at some instant; the remaining reference may
@@ -3990,3 +3990,5 @@ source of truth.
 [memmgr Memory Pool](../../../services/memmgr/docs/memory-pool.md),
 [Restart Protocol](../../../services/svcmgr/docs/restart-protocol.md),
 [shared/syscall/README.md](../../../shared/syscall/README.md)
+
+

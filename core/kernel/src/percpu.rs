@@ -44,14 +44,16 @@
 //! | `PERCPU_THIS_OFFSET` | 96 | `this` |
 //! | `PERCPU_CURRENT_OFFSET` | 104 | `current` |
 //! | `PERCPU_DIAG_OFFSET` | 112 | `diag` |
+//! | `PERCPU_RETURN_WORK_OFFSET` | 120 | `return_work` |
 //!
 //! ## This CPU's state
 //!
 //! Every access a CPU makes to its own per-CPU state goes through the per-CPU
-//! register: a pointer field the hot paths read (`scheduler`, `current`,
-//! `diag`) with one GS- or `tp`-relative load ([`current_scheduler`],
-//! [`current_thread`], `sched::this_cpu_diag`), and any other field through
-//! [`this_cpu`], the entry's own address read the same way.
+//! register: a field the hot paths read (`scheduler`, `current`, `diag`,
+//! `return_work`) with one GS- or `tp`-relative load ([`current_scheduler`],
+//! [`current_thread`], `sched::this_cpu_diag`, [`return_work_pending`]), and
+//! any other field through [`this_cpu`], the entry's own address read the same
+//! way.
 //! [`per_cpu_ptr`] and `sched::scheduler_for` index the slabs by CPU for an
 //! access to another CPU's state, and for boot code that runs before the
 //! register is installed.
@@ -64,7 +66,7 @@
 //! operand), and update that assembly; otherwise update only the size
 //! assertion in that test.
 
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::sched::CpuDiag;
 use crate::sched::MAX_CPUS;
@@ -259,6 +261,57 @@ pub const PERCPU_CURRENT_OFFSET: usize = core::mem::offset_of!(PerCpuData, curre
     )
 )]
 pub const PERCPU_DIAG_OFFSET: usize = core::mem::offset_of!(PerCpuData, diag);
+/// Byte offset of `PerCpuData::return_work`, GS- or `tp`-relative: the
+/// [`return_work_pending`] inline asm takes it as a `const` operand.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "read only by `return_work_pending`, which the host test build does not compile"
+    )
+)]
+pub const PERCPU_RETURN_WORK_OFFSET: usize = core::mem::offset_of!(PerCpuData, return_work);
+
+/// The kinds of work a return to user mode owes, one bit each in
+/// [`PerCpuData::return_work`]. A producer sets its kind's bit in the word of
+/// the CPU that will make the return, after it makes the work visible
+/// ([`post_return_work`], [`post_return_work_to`]); each return point tests
+/// the bits it handles with one load and one branch, and only a set bit takes
+/// its out-of-line path, which clears the bits and runs each check in full
+/// (core/kernel/docs/scheduling-internals.md § Return Work).
+pub mod return_work
+{
+    /// The running thread may be `Exited`: a commit of `Exited` found it
+    /// `current` on this CPU (`sched::running_thread_stopped`).
+    pub const STOPPED: u32 = 1 << 0;
+    /// This CPU's deferred-reclaim stack may hold an object
+    /// (`cap::object::push_deferred_reclaim`).
+    pub const RECLAIM: u32 = 1 << 1;
+    /// The sole-reference table may have work this CPU marked or a pass on
+    /// it left (`cap::sole_reference::drain`).
+    pub const SOLE_REF: u32 = 1 << 2;
+    /// The running thread may have an upcall pending for a syscall's return
+    /// (`ipc::upcall::post`).
+    pub const UPCALL_SYSCALL: u32 = 1 << 3;
+    /// The running thread may have an upcall pending for any return to user
+    /// mode, posted with `UPCALL_ANY_INSTRUCTION` (`ipc::upcall::post`).
+    pub const UPCALL_ANY: u32 = 1 << 4;
+    /// A thread queued on this CPU may outrank the running one
+    /// (`sched::preempt_if_outranked`).
+    pub const PREEMPT: u32 = 1 << 5;
+
+    /// The bits a syscall's return handles: every kind.
+    pub const AT_SYSCALL: u32 =
+        STOPPED | RECLAIM | SOLE_REF | UPCALL_SYSCALL | UPCALL_ANY | PREEMPT;
+    /// The bits the return from an interrupt taken in user mode handles: the
+    /// sole-reference pass, the interrupt delivery point and the wake
+    /// preemption. The others wait for the thread's next syscall.
+    pub const AT_INTERRUPT: u32 = SOLE_REF | UPCALL_ANY | PREEMPT;
+    /// The bits the return from an exception taken in user mode handles: the
+    /// wake preemption alone, which leads to the interrupt return's work when
+    /// it reschedules.
+    pub const AT_EXCEPTION: u32 = PREEMPT;
+}
 
 // ── PerCpuData ────────────────────────────────────────────────────────────────
 
@@ -353,6 +406,14 @@ pub struct PerCpuData
     /// (`sched::this_cpu_diag`). Written once by [`init_storage`]; null
     /// before it.
     pub diag: *const CpuDiag,
+    /// The work this CPU's next return to user mode owes, one
+    /// [`return_work`] bit per kind. Set by any CPU with a Release
+    /// `fetch_or` after its producer made the work visible; tested by this
+    /// CPU's return paths with one load ([`return_work_pending`]) and cleared
+    /// by them with an Acquire `fetch_and` ([`take_return_work`]) before they
+    /// run the checks, so a bit set after the clear stays for the next return.
+    pub return_work: AtomicU32,
+    _pad2: u32,
 }
 
 impl PerCpuData
@@ -377,6 +438,8 @@ impl PerCpuData
             this: core::ptr::null_mut(),
             current: AtomicPtr::new(core::ptr::null_mut()),
             diag: core::ptr::null(),
+            return_work: AtomicU32::new(0),
+            _pad2: 0,
         }
     }
 }
@@ -459,6 +522,12 @@ pub fn init_storage(
         // SAFETY: `slot` is an entry of the slab, which nothing else reaches
         // before PER_CPU_PTR publishes it below.
         unsafe { core::ptr::write(slot, entry) };
+        // SAFETY: `slot` was written above, and the slab is never freed.
+        let word: &'static AtomicU32 = unsafe { &(*slot).return_work };
+        // SAFETY: the scheduler slab covers cpu_count initialised entries,
+        // never freed.
+        let sched = unsafe { &*schedulers.wrapping_add(cpu) };
+        sched.set_return_work(word);
     }
     PER_CPU_PTR.store(pc_ptr, Ordering::Release);
 
@@ -735,6 +804,76 @@ pub unsafe fn current_scheduler() -> &'static PerCpuScheduler
     unsafe { &*sched }
 }
 
+/// The [`return_work`] bits set in this CPU's [`PerCpuData::return_work`],
+/// read with one GS- or `tp`-relative load: the test every return to user
+/// mode makes before its out-of-line path. A snapshot: a bit another CPU sets
+/// after it is seen by a later return (core/kernel/docs/scheduling-internals.md
+/// § Return Work).
+///
+/// # Safety
+/// As [`this_cpu`].
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn return_work_pending() -> u32
+{
+    // SAFETY: the per-CPU pointer is installed (caller contract), and the
+    // offset is that of the `return_work` field, an aligned 32-bit atomic.
+    unsafe { crate::arch::current::cpu::read_percpu_u32::<PERCPU_RETURN_WORK_OFFSET>() }
+}
+
+/// Clear the bits of `mask` in this CPU's [`PerCpuData::return_work`] and
+/// return those of them that were set. Acquire: pairs with the producers'
+/// Release `fetch_or`, so the checks that follow see the work a taken bit
+/// announced.
+///
+/// # Safety
+/// As [`this_cpu`], at a return to user mode with interrupts disabled.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn take_return_work(mask: u32) -> u32
+{
+    // SAFETY: the per-CPU pointer is installed and the caller cannot migrate
+    // (contract).
+    let this = unsafe { this_cpu() };
+    // SAFETY: this CPU's own entry, live for the kernel's lifetime.
+    unsafe { (*this).return_work.fetch_and(!mask, Ordering::Acquire) & mask }
+}
+
+/// Set `bits` in this CPU's [`PerCpuData::return_work`], after the caller
+/// made the work they announce visible. A caller that can migrate posts to
+/// the CPU it read the entry on, whose next return makes the checks; the kinds
+/// posted this way (a sole-reference mark) are owed by any CPU.
+///
+/// # Safety
+/// As [`this_cpu`].
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn post_return_work(bits: u32)
+{
+    // SAFETY: the per-CPU pointer is installed (caller contract).
+    let this = unsafe { this_cpu() };
+    // SAFETY: an entry of the slab, live for the kernel's lifetime.
+    unsafe { (*this).return_work.fetch_or(bits, Ordering::Release) };
+}
+
+/// Test stub: the host build has no per-CPU entry.
+#[cfg(test)]
+pub unsafe fn post_return_work(_bits: u32) {}
+
+/// Set `bits` in CPU `cpu`'s [`PerCpuData::return_work`], after the caller
+/// made the work they announce visible: a producer that knows the CPU whose
+/// return owes the work, which may be another CPU.
+///
+/// # Safety
+/// `cpu < CPU_COUNT` and [`init_storage`] has run.
+#[cfg(not(test))]
+pub unsafe fn post_return_work_to(cpu: usize, bits: u32)
+{
+    let entry = per_cpu_ptr(cpu);
+    // SAFETY: cpu < CPU_COUNT and the slab is allocated (contract).
+    unsafe { (*entry).return_work.fetch_or(bits, Ordering::Release) };
+}
+
 /// Returns `true` if preemption is disabled on the current CPU.
 #[cfg(not(test))]
 #[inline]
@@ -855,6 +994,6 @@ mod tests
             PERCPU_PREEMPT_COUNT_OFFSET
         );
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 120);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 128);
     }
 }

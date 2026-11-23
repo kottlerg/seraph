@@ -835,7 +835,8 @@ The handler then drains the target.
    `schedule(Requeue::IfRunnable)` immediately. `schedule()`'s requeue arm never re-enqueues a
    `Stopped` current thread.
 4. **Cross-CPU drain.** If `running_on = Some(run_cpu)` and `run_cpu != current_cpu`:
-   - `prod_remote_cpu(run_cpu)` — sends a wakeup IPI. Its handler does no work
+   - `prod_remote_cpu(run_cpu)` — sends a wakeup IPI. Its handler posts the CPU's `PREEMPT`
+     return-work bit and deschedules nothing
      ([scheduling-internals.md § IPI Taxonomy](scheduling-internals.md#ipi-taxonomy)): the trap it
      forces snapshots the target's user registers into its `TrapFrame` and returns to user mode, and
      the remote CPU drops the `Stopped` target at its next `schedule()`: the
@@ -874,17 +875,17 @@ The handler then drains the target.
 
 **Invariants:**
 
-1. The drain spin in step 4 is the correctness requirement: it returns only once the remote CPU
-   has descheduled the target through a trap, which is what gives `sys_thread_read_regs` a fresh
-   `trap_frame`. The wakeup IPI contributes no descheduling (its handler does no work); it exits a
-   `hlt` on an idle CPU and forces one register snapshot. A stopper restarted after its in-place
-   park upholds this only through the slot it re-resolves: when that slot no longer names the
-   target, the call returns without the drain. `sys_thread_read_regs` and `sys_thread_write_regs`
-   do not rely on the drain: they act only on a thread that is `current` on no CPU with its save
-   published and is `Stopped` (not by an address-space hold, for the write) or `Blocked`
-   (fault-blocked only, for the write), under its
-   `sched_lock` (`sched::with_held_frame`); a `Stopped` thread still on a CPU is refused with
-   `InvalidState`, and a `Blocked` one still switching out is waited for.
+1. The drain spin in step 4 is the correctness requirement: it returns only once the remote CPU has
+   descheduled the target through a trap, which is what gives `sys_thread_read_regs` a fresh
+   `trap_frame`. The wakeup IPI contributes no descheduling (its handler only posts `PREEMPT`); it
+   exits a `hlt` on an idle CPU and forces one register snapshot. A stopper restarted after its
+   in-place park upholds this only through the slot it re-resolves: when that slot no longer names
+   the target, the call returns without the drain. `sys_thread_read_regs` and
+   `sys_thread_write_regs` do not rely on the drain: they act only on a thread that is `current` on
+   no CPU with its save published and is `Stopped` (not by an address-space hold, for the write) or
+   `Blocked` (fault-blocked only, for the write), under its `sched_lock` (`sched::with_held_frame`);
+   a `Stopped` thread still on a CPU is refused with `InvalidState`, and a `Blocked` one still
+   switching out is waited for.
 2. For Ready targets on a remote run queue, no IPI and no drain are needed; the all-locks commit
    unlinks the TCB from every run queue at once, and the `schedule()` skip-loop is only
    defence-in-depth. Any target `current` on no CPU at the commit, `Ready` or `Blocked`, may
@@ -1173,3 +1174,4 @@ wait takes each CPU's scheduler lock, and then the registry lock, one at a time.
 [Capability Model](../../../docs/capability-model.md),
 [Fault Handling](../../../docs/fault-handling.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md)
+

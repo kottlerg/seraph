@@ -857,7 +857,10 @@ thread's level, read under that thread's lock.
 
 A CPU decides at every return to user mode that can follow a link with no wake IPI pending
 (`sched::preempt_if_outranked`), and when a queued thread outranks the running one it calls
-`schedule(Requeue::Preempted)`:
+`schedule(Requeue::Preempted)`. The decision runs when the CPU's `PREEMPT` return-work bit is set,
+which a link leaving a queued thread outranking the running one posts, as do the wake IPI's
+handler and the stale mark of a priority change, so a return with nothing to decide makes one test
+([scheduling-internals.md](scheduling-internals.md#return-work) § Return Work):
 
 - the end of every syscall (`syscall::finish_syscall`), after the syscall delivery point of
   upcalls ([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
@@ -874,12 +877,12 @@ A CPU decides at every return to user mode that can follow a link with no wake I
 
 Where the return is an upcall delivery point, the delivery comes first and the decision after it,
 and a thread the decision preempted passes the delivery point again, then the decision, when it is
-dispatched again (`sched::deliver_and_preempt`). An upcall posted while it waited on the run
+dispatched again (`sched::interrupt_return_work`). An upcall posted while it waited on the run
 queue, for which no CPU is prodded since the thread runs nowhere, is so delivered at this return,
 and a thread a delivery linked on the CPU, or whose wake IPI a delivery absorbed, is decided before
 the thread returns. An exception's return is no delivery point, but a thread preempted there
 passes the interrupt delivery point when it is dispatched again, as a thread an interrupt preempted
-does (`sched::preempt_at_exception_return`;
+does (`sched::exception_return_work`;
 [fault-handling.md](../../../docs/fault-handling.md#delivery-points) § Delivery points).
 
 Two returns to user mode make no decision. The x86-64 `#NM` lazy FPU restore runs with interrupts

@@ -409,6 +409,12 @@ impl KernelObjectHeader
                 // its address goes to the table, which the drain checks under
                 // its lock.
                 table.mark_pending(core::ptr::from_ref(self).addr());
+                // This CPU's next return to user mode makes the drain pass
+                // (core/kernel/docs/scheduling-internals.md § Return Work).
+                // SAFETY: an observed object's decrement runs in kernel
+                // context on a CPU whose per-CPU pointer is installed: a
+                // binding exists only once a user thread made one.
+                unsafe { crate::percpu::post_return_work(crate::percpu::return_work::SOLE_REF) };
                 1
             }
             1 =>
@@ -418,6 +424,8 @@ impl KernelObjectHeader
                 // caller frees it.
                 core::sync::atomic::fence(Ordering::Acquire);
                 table.fire_dying(self);
+                // SAFETY: as for the post above.
+                unsafe { crate::percpu::post_return_work(crate::percpu::return_work::SOLE_REF) };
                 0
             }
             count => count.wrapping_sub(1),
@@ -2996,8 +3004,8 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 ///   releasing an Endpoint, which frees in place and never reaches the push);
 ///   the end of an interrupt taken from user mode, on the interrupted thread's
 ///   kernel stack with interrupts disabled
-///   (`cap::sole_reference::drain_at_interrupt`, releasing an `EventQueue`,
-///   which frees in place and never reaches the push);
+///   (the sole-reference pass of `sched::interrupt_return_work`, releasing an
+///   `EventQueue`, which frees in place and never reaches the push);
 ///   or the idle thread (pinned to its CPU) draining the deferred-reclaim
 ///   stack, which reaches here through an Mmio object's teardown
 ///   (`MmioObject::withdraw_mappings`).
@@ -3110,6 +3118,11 @@ pub(crate) unsafe fn push_deferred_reclaim(ptr: NonNull<KernelObjectHeader>)
             break;
         }
     }
+    // This CPU's next syscall return drains the stack
+    // (core/kernel/docs/scheduling-internals.md § Return Work); the idle loop
+    // drains it on every pass.
+    // SAFETY: as for the scheduler read above.
+    unsafe { crate::percpu::post_return_work(crate::percpu::return_work::RECLAIM) };
 }
 
 /// Drain this CPU's deferred reclaim stack ([`reclaim_deferred_stack`]), then
@@ -5051,7 +5064,10 @@ unsafe fn dealloc_thread(
             // under its sched_lock, held.
             unsafe { (*tcb).hold = crate::sched::hold::HoldMark::None };
 
-            // Remove from whichever queue it's actually in.
+            // Remove from whichever queue it's actually in, and post the
+            // stopped check to the CPU the thread is `current` on, if any, for
+            // its next syscall return (core/kernel/docs/scheduling-internals.md
+            // § Return Work).
             for cpu in 0..cpu_count
             {
                 // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
@@ -5059,6 +5075,17 @@ unsafe fn dealloc_thread(
                 // SAFETY: this CPU's scheduler lock is held (taken above); tcb is a
                 // valid TCB.
                 unsafe { sched.remove_from_queue(tcb, prio) };
+                if core::ptr::eq(sched.current(), tcb)
+                {
+                    // SAFETY: cpu < CPU_COUNT, and per-CPU storage is
+                    // initialised before any thread runs.
+                    unsafe {
+                        crate::percpu::post_return_work_to(
+                            cpu,
+                            crate::percpu::return_work::STOPPED,
+                        );
+                    };
+                }
             }
 
             // A dying server orphans any reply-bound client: claim the reply slot

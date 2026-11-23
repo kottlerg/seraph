@@ -218,7 +218,8 @@ fault in svctest's own process (a stray access, a stack overflow) kills it witho
 hook, so it logs neither marker. The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the
 queried `pwrmgr.deny` cap) log the skip and return when their cap is zero; the devmgr class-deny
 phase (`caps[2]` and `caps[3]`), the bind-deny phase (`caps[2]`), the input-ordinal phase
-(`caps[8]`), the on-demand-bind phase (`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement
+(`caps[8]`), the device-location phase (`caps[7]` and `caps[8]`), the on-demand-bind phase
+(`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement
 and MSI delivery, forge, churn, and release phases (`caps[9]`), the drivers stray-cap phases
 (`caps[7]`, `caps[8]`, `caps[13]`, `caps[16]`, and `caps[19]`), the drivers hwrng read phase
 (`caps[16]`), the drivers hwrng restart phase (`caps[16]` and `caps[21]`), the drivers deny phase
@@ -267,8 +268,8 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT`, the remounts, and the fs-driver death phase's remount; `vfsd_namespace_stray_caps` phase: its `UNMOUNT` and both its `MOUNT`s |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
 | `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry`, `oom_policy`, `memmgr_swap_commit`, `vfsd_driver_death` phases: read logd's slots and history |
-| `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
-| `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
+| `caps[7]` | `devmgr.class.serial` | device-location and drivers stray-cap phases: the `serial` class SEND |
+| `caps[8]` | `devmgr.class.input` | input-ordinal, device-location, and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
 | `caps[10]` | `devmgr.class.test-fault` | on-demand-bind phase: the `test-fault` class SEND |
 | `caps[11]` | `devmgr.class.serial-deny` | drivers deny phase: a `serial` class SEND without the driver's verb bits |
@@ -287,7 +288,8 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the ten `devmgr.class.*` names among them. `caps[2]` carries
 `REGISTRY_QUERY_AUTHORITY` alone, so it drives the devmgr deny phases, which require an
-`UNAUTHORIZED` reply to `QUERY_DEVICE`, `WATCH_CLASS`, and `MINT_CLASS_SEND` (on `caps[2]` and
+`UNAUTHORIZED` reply to `QUERY_DEVICE`, `QUERY_DEVICE_LOCATION`, `WATCH_CLASS`, and
+`MINT_CLASS_SEND` (on `caps[2]` and
 `caps[3]`, neither of whose badges carries a class slot), `QUERY_SHUTDOWN_DEVICE`, and
 `BIND_DRIVERS`. `caps[3]` carries `REGISTRY_QUERY_AUTHORITY | BIND_AUTHORITY` as a `SEND|GRANT`,
 since `BIND_DRIVERS` moves a cap to devmgr; it is the one devmgr seed that arrives with GRANT, and
@@ -295,7 +297,11 @@ the on-demand-bind phase sends `BIND_DRIVERS` on it. `caps[7]` and `caps[8]` are
 `input` class SENDs. The input-ordinal phase waits on a `WATCH_CLASS` watch (bounded by
 `DEVICE_WAIT_MS`) until devmgr serves an input driver, then requires a cap from `QUERY_DEVICE` on
 `caps[8]` at instance ordinal 0 (sent and absent) and `NO_DEVICE` past the one keyboard of every
-boot's device set. The drivers stray-cap phase takes granted SENDs on the serial and input drivers'
+boot's device set. The device-location phase waits, the same way, until devmgr serves an input and
+a serial driver, then requires `QUERY_DEVICE_LOCATION` on `caps[8]` to locate instance ordinal 0, a
+PCI function, and to answer `NO_DEVICE` at ordinal 1, and on `caps[7]` to answer `NO_LOCATION` at
+ordinal 0, the serial driver's UART being a platform device. The drivers stray-cap phase takes
+granted SENDs on the serial and input drivers'
 endpoints through `caps[7]` and `caps[8]` (`QUERY_DEVICE`) and floods each driver with calls
 carrying `MSG_CAP_SLOTS_MAX` caps: an unknown label, a zero-byte `SERIAL_WRITE_BYTES`,
 `SERIAL_READ_BYTES`, a `SERIAL_REGISTER_RX_NOTIFY` whose stray notification `SYS_IRQ_REGISTER`
@@ -619,10 +625,13 @@ drivers-directory pass at boot reads, so devmgr binds the
 [`test-fault`](../drivers/test-fault/README.md) driver to the QEMU `pci-testdev` functions that
 `--test-devices` attaches, one instance each. The
 phase asks `caps[10]` for the fixtures: the two serving instances hold instance ordinals 0 and 1,
-and ordinal 2 answers `NO_DEVICE`, and logd's history (`caps[6]`) holds devmgr's line for the death
+and ordinal 2 answers `NO_DEVICE`; `QUERY_DEVICE_LOCATION` locates ordinals 0 and 1 at the
+`pci-testdev` functions `0000:00:15.0` and `0000:00:16.0` and answers `NO_DEVICE` at ordinal 2; and
+logd's history (`caps[6]`) holds devmgr's line for the death
 of the instance devmgr binds between them, which exits before its next bootstrap request, so devmgr
-abandoned that bind and went on binding; `FAULT_EXIT` on ordinal 0 makes the next query on it answer
-`WITHDRAWN`; `FAULT_WORKER` on ordinal 1, whose worker thread then faults, returns a call queued on
+abandoned that bind and went on binding; `FAULT_EXIT` on ordinal 0 makes the next `QUERY_DEVICE` and
+the next `QUERY_DEVICE_LOCATION` on it answer `WITHDRAWN`; `FAULT_WORKER` on ordinal 1, whose
+worker thread then faults, returns a call queued on
 it and makes the next query on it answer `WITHDRAWN`; the free pool then returns to its size before
 the bind, so the instance that never reports ready and the instance that fails its bootstrap's
 terminal round were destroyed; and a second `BIND_DRIVERS` over the directory binds nothing. The

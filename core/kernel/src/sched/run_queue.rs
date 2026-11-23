@@ -54,6 +54,10 @@ const NUM_RUN_QUEUES: usize = FAIR_QUEUE + 1 + (NUM_PRIORITY_LEVELS - RT_PRIORIT
 // `non_empty` holds one bit per run queue in a `u32`.
 const _: () = assert!(NUM_RUN_QUEUES <= u32::BITS as usize);
 
+/// The `non_empty` bits of every run queue but [`IDLE_QUEUE`]: a set bit is a
+/// queued thread other than the idle thread.
+const QUEUED_THREAD_MASK: u32 = !(1 << IDLE_QUEUE);
+
 /// The `idle_pull_candidate` value that names no CPU; no CPU index reaches it,
 /// since every index is below `MAX_CPUS`.
 const NO_IDLE_PULL_CANDIDATE: usize = usize::MAX;
@@ -484,10 +488,31 @@ pub struct PerCpuScheduler
     /// thread at its previous idle balance tick, or [`NO_IDLE_PULL_CANDIDATE`]:
     /// the confirmation sample of the idle pull
     /// (core/kernel/docs/scheduler.md § Load Balancing), which pulls a backlog
-    /// below the imbalance threshold only once it has outlived one tick.
+    /// below the imbalance threshold only once it has stood for a tick without
+    /// a break (`idle_pull_episode`).
     /// Written and read only by this CPU's `timer_tick`, so Relaxed suffices;
     /// atomic only so a shared reference can reach it.
     idle_pull_candidate: AtomicUsize,
+
+    /// The backlog episode `idle_pull_candidate` was recorded in: the value of
+    /// that CPU's `backlog_episode` the sample read. The idle pull confirms the
+    /// candidate only while that CPU's backlog is still the same episode
+    /// (core/kernel/docs/scheduler.md § Load Balancing). Meaningful only while a
+    /// candidate is set. Written and read only by this CPU's `timer_tick`, so
+    /// Relaxed suffices; atomic only so a shared reference can reach it.
+    idle_pull_episode: AtomicU32,
+
+    /// The number of this CPU's backlog episodes, wrapping: `link` adds one
+    /// each time it makes the run queues hold a thread other than the idle
+    /// thread after they held none, so it is unchanged exactly while a backlog
+    /// stands without a break (core/kernel/docs/scheduler.md § Load Balancing).
+    /// Owned by `lock`: written only under it, by `link`, before the
+    /// `non_empty` Release that publishes the link. Read under `lock` by a
+    /// pull's re-check, and without it by an idle CPU's sample, Relaxed after an
+    /// Acquire load of `non_empty` ([`backlog`](Self::backlog)). A wrap can make
+    /// two samples a tick apart match across a break only after 2^32 episodes
+    /// between them, and would cost one pull the bound already allows.
+    backlog_episode: AtomicU32,
 
     /// Whether this CPU's previous idle balance tick held `idle_pull_candidate`
     /// confirmed for one more tick, because a sibling of this CPU had work
@@ -558,6 +583,8 @@ impl PerCpuScheduler
             lock: crate::sync::Spinlock::new(),
             load: AtomicU32::new(0),
             idle_pull_candidate: AtomicUsize::new(NO_IDLE_PULL_CANDIDATE),
+            idle_pull_episode: AtomicU32::new(0),
+            backlog_episode: AtomicU32::new(0),
             idle_pull_held: AtomicBool::new(false),
             idle_pull_cursor: AtomicUsize::new(0),
             saved_lock_flags: AtomicU64::new(0),
@@ -745,6 +772,17 @@ impl PerCpuScheduler
                 ipc_state: (*tcb).ipc_state,
                 preferred_cpu: (*tcb).preferred_cpu,
             });
+        }
+        // A link that makes the queues hold a thread other than the idle thread
+        // after they held none starts a backlog episode. Every write of
+        // `non_empty` holds `lock`, so this load reads the queues as they were
+        // before the link; the store precedes the Release below, so a sample
+        // that sees this link's bit reads this episode or a later one.
+        if q != IDLE_QUEUE && self.non_empty.load(Ordering::Relaxed) & QUEUED_THREAD_MASK == 0
+        {
+            let episode = self.backlog_episode.load(Ordering::Relaxed);
+            self.backlog_episode
+                .store(episode.wrapping_add(1), Ordering::Relaxed);
         }
         // Release: publishes the queue write and the increment_load store to the
         // lockless `has_runnable` Acquire (core/kernel/docs/scheduling-internals.md
@@ -989,11 +1027,26 @@ impl PerCpuScheduler
 
     /// Whether a run queue other than [`IDLE_QUEUE`] links a thread: a thread
     /// other than the idle thread is queued. Lockless and Relaxed, a snapshot
-    /// for the idle pull (`sched::try_pull_idle`), which decides only whether
-    /// to try a pull; the pull itself re-finds a thread under the lock.
+    /// for [`has_no_work`](Self::has_no_work); the idle pull reads
+    /// [`backlog`](Self::backlog) instead.
     pub fn has_queued_thread(&self) -> bool
     {
-        self.non_empty.load(Ordering::Relaxed) & !(1 << IDLE_QUEUE) != 0
+        self.non_empty.load(Ordering::Relaxed) & QUEUED_THREAD_MASK != 0
+    }
+
+    /// The backlog episode this CPU is in while a run queue other than
+    /// [`IDLE_QUEUE`] links a thread, or `None` when none does (see the
+    /// `backlog_episode` field). Two reads that return the same episode saw one
+    /// backlog that stood without a break between them, since every link that
+    /// ends a break starts a new episode. Under `lock` the answer is exact;
+    /// without it, a sample for the idle pull: the Acquire load of `non_empty`
+    /// pairs with the Release of the link that set the bit it sees, so the
+    /// episode read after it is that link's or a later one, and a sample can
+    /// name a newer episode than the backlog it saw but never an older one.
+    pub fn backlog(&self) -> Option<u32>
+    {
+        let queued = self.non_empty.load(Ordering::Acquire) & QUEUED_THREAD_MASK != 0;
+        queued.then(|| self.backlog_episode.load(Ordering::Relaxed))
     }
 
     /// Whether this CPU has no work: it runs its idle thread and no run queue
@@ -1124,13 +1177,15 @@ impl PerCpuScheduler
         self.load.load(Ordering::Relaxed)
     }
 
-    /// The CPU recorded at this CPU's previous idle balance tick, if any (see
-    /// the `idle_pull_candidate` field).
+    /// The CPU recorded at this CPU's previous idle balance tick and the
+    /// backlog episode it was recorded in, if any (see the
+    /// `idle_pull_candidate` and `idle_pull_episode` fields).
     #[cfg(not(test))]
-    pub fn idle_pull_candidate(&self) -> Option<usize>
+    pub fn idle_pull_candidate(&self) -> Option<(usize, u32)>
     {
         let cpu = self.idle_pull_candidate.load(Ordering::Relaxed);
-        (cpu != NO_IDLE_PULL_CANDIDATE).then_some(cpu)
+        (cpu != NO_IDLE_PULL_CANDIDATE)
+            .then(|| (cpu, self.idle_pull_episode.load(Ordering::Relaxed)))
     }
 
     /// Whether this CPU's previous idle balance tick held its candidate (see
@@ -1141,13 +1196,15 @@ impl PerCpuScheduler
         self.idle_pull_held.load(Ordering::Relaxed)
     }
 
-    /// Record `cpu` as this CPU's idle-pull candidate, not held, or clear it
-    /// (`None`). Called only by this CPU's `timer_tick`.
+    /// Record `candidate`, a CPU and the backlog episode it was sampled in, as
+    /// this CPU's idle-pull candidate, not held, or clear it (`None`). Called
+    /// only by this CPU's `timer_tick`.
     #[cfg(not(test))]
-    pub fn set_idle_pull_candidate(&self, cpu: Option<usize>)
+    pub fn set_idle_pull_candidate(&self, candidate: Option<(usize, u32)>)
     {
-        self.idle_pull_candidate
-            .store(cpu.unwrap_or(NO_IDLE_PULL_CANDIDATE), Ordering::Relaxed);
+        let (cpu, episode) = candidate.unwrap_or((NO_IDLE_PULL_CANDIDATE, 0));
+        self.idle_pull_episode.store(episode, Ordering::Relaxed);
+        self.idle_pull_candidate.store(cpu, Ordering::Relaxed);
         self.idle_pull_held.store(false, Ordering::Relaxed);
     }
 
@@ -1726,6 +1783,42 @@ mod tests
         assert!(!sched.has_queued_thread());
         assert!(enq(&sched, p_fair, syscall::PRIORITY_MIN));
         assert!(sched.has_queued_thread());
+    }
+
+    // The defect caught: a backlog episode that does not change when the
+    // queues drain and refill (an idle CPU then reads a ping-pong pair's
+    // queueings, each far shorter than a tick, as one backlog that outlived
+    // the tick, and pulls the pair apart), or one that changes while a
+    // backlog stands (a thread queued behind one that never yields is then
+    // never pulled), or one that the idle thread's own link starts.
+    #[test]
+    fn a_backlog_episode_starts_only_when_the_queues_gain_a_thread_after_none()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut idle = make_tcb();
+        let mut a = make_tcb();
+        let mut b = make_tcb();
+        let p_idle = &raw mut *idle;
+        let pa = &raw mut *a;
+        let pb = &raw mut *b;
+        sched.set_idle(p_idle);
+
+        assert_eq!(sched.backlog(), None);
+        assert!(enq(&sched, p_idle, IDLE_PRIORITY));
+        assert_eq!(sched.backlog(), None);
+        assert!(enq(&sched, pa, syscall::PRIORITY_MIN));
+        let first = sched.backlog().unwrap();
+        // A second thread queued behind the first, and the first dispatched
+        // while the second stays queued: one backlog, one episode.
+        assert!(enq(&sched, pb, RT_PRIORITY_MIN));
+        assert_eq!(sched.backlog(), Some(first));
+        assert_eq!(deq(&sched), pb);
+        assert_eq!(sched.backlog(), Some(first));
+        // Drained (the idle thread stays linked) and refilled: a new episode.
+        assert_eq!(deq(&sched), pa);
+        assert_eq!(sched.backlog(), None);
+        assert!(enq(&sched, pa, syscall::PRIORITY_MIN));
+        assert_eq!(sched.backlog(), Some(first.wrapping_add(1)));
     }
 
     // The defect caught: a CPU wedged with a thread other than its idle one

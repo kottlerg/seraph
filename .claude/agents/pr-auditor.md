@@ -243,6 +243,18 @@ claims.
    boundary, or that fails with a defect no open Issue for that boundary
    names. A run the PR does not owe that passed is not a FAIL.
 
+   Kani sizing: when the PR's own diff adds a `#[kani::proof]` harness or
+   changes one's body, bounds (the sizes and counts it fixes, as
+   `docs/coding-standards.md` § Proof Harnesses defines them: its
+   `#[kani::unwind]`, its `kani::assume` limits and the constants they
+   read) or `kani::any` sizes, `docs/testing.md` § Bounded verification
+   owes its local sizing run and `docs/conventions.md` § PR-body checklist
+   discipline owns its report. FAIL when `## Validation` does not give, for
+   each such harness, its verification time, the run's peak resident
+   memory, its unwind bounds and the head it ran at, or when the harness's
+   body, bounds or `kani::any` sizes differ between that head and the PR
+   head (a change to its comments alone does not count).
+
    CPU-count width: a non-inert line the PR's own diff adds that introduces
    a structure with one entry or one bit per CPU is on the Boundary surface
    whatever file it is in, so it owes the boundary set; FAIL a "none owed"

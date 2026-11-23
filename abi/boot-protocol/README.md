@@ -108,10 +108,15 @@ A compliant bootloader MUST NOT:
 boot-protocol/
 ├── Cargo.toml
 ├── README.md
+├── fuzz/boot-protocol/  # the fuzz target's checked-in inputs (docs/testing.md § Fuzzing)
 └── src/
     ├── lib.rs           # BootInfo and its types, BOOT_PROTOCOL_VERSION, MAX_CPUS, the
-    │                    #   KernelMmio and HART_CAP_* facts, KASLR_* flags
-    ├── bundle.rs        # bootstrap.bundle wire format (header, entries, INIT_ENTRY_NAME)
+    │                    #   KernelMmio and HART_CAP_* facts, KASLR_* flags; the framebuffer
+    │                    #   record's proof harnesses (docs/testing.md § Bounded verification)
+    ├── bundle.rs        # bootstrap.bundle wire format (header, entries, INIT_ENTRY_NAME) and
+    │                    #   its parser's proof harnesses
+    ├── property.rs      # the parsers' property, which the fuzz target `boot-protocol`, the
+    │                    #   replay test and the proofs drive; test, Kani and fuzz builds only
     ├── layout.rs        # direct-map layout and stack-paint words both bootloader and kernel use
     ├── riscv_paging.rs  # RISC-V paging-mode constants and satp encoding
     ├── role_guids.rs    # GPT partition type GUIDs for role-based discovery

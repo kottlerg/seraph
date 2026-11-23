@@ -79,13 +79,21 @@ impl Context
             .parent()
             .context("xtask manifest dir has no parent — check workspace layout")?
             .to_path_buf();
+        Ok(Self::at(root))
+    }
+
+    /// A Context for the checkout at `root`: a cell's lane runs its cases in
+    /// a private copy of the checkout this way.
+    #[must_use]
+    pub fn at(root: PathBuf) -> Self
+    {
         let sysroot = root.join("sysroot");
         let target_dir = root.join("target");
-        Ok(Context {
+        Context {
             root,
             sysroot,
             target_dir,
-        })
+        }
     }
 
     /// Path to `sysroot/esp/` — ESP partition staging area.

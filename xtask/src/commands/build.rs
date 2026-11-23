@@ -1341,6 +1341,8 @@ pub(crate) fn install_names(arch: Arch) -> Vec<String>
 /// -- -D warnings`, then the
 /// same over the code only `cargo xtask fuzz` compiles: the fuzz engine, the
 /// fuzz targets and the parsers' property modules, with `--cfg fuzzing`.
+/// Clippy lints every workspace crate a named one builds, so naming the
+/// targets crate lints each parser crate it depends on.
 fn clippy_host(ctx: &BuildContext) -> Result<()>
 {
     clippy_check(
@@ -1356,7 +1358,7 @@ fn clippy_host(ctx: &BuildContext) -> Result<()>
     )?;
     clippy_check_ext(
         ctx,
-        &["-p", "fuzz-engine", "-p", "fuzz-targets", "-p", "vfsd-gpt"],
+        &["-p", "fuzz-engine", "-p", "fuzz-targets"],
         &[("RUSTFLAGS", "--cfg fuzzing")],
         None,
     )

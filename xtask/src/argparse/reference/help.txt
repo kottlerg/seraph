@@ -17,7 +17,7 @@ Commands:
   test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
-  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
+  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--pin`, print the pinned release (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
   bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
@@ -54,7 +54,7 @@ Commands:
   test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
-  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
+  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--pin`, print the pinned release (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
   bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
@@ -401,6 +401,7 @@ Usage: xtask clean [OPTIONS]
 
 Options:
       --all               Also remove the cargo target/ directory (full clean)
+      --keep-std          Also empty Cargo's profile directories in target/ but for the build units of the toolchain's library packages (core, alloc, compiler_builtins, std and their dependencies), the part CI caches
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
@@ -411,6 +412,7 @@ Usage: xtask clean [OPTIONS]
 
 Options:
       --all               Also remove the cargo target/ directory (full clean)
+      --keep-std          Also empty Cargo's profile directories in target/ but for the build units of the toolchain's library packages (core, alloc, compiler_builtins, std and their dependencies), the part CI caches
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
@@ -432,6 +434,7 @@ Options:
       --port <PORT>              The `debug-port` case's host TCP port for the debug port; without it, a port free on `127.0.0.1` when each boot starts
       --gdb <GDB>                The host GDB the `debug-port` case runs, which must debug the architecture (default: `gdb`)
       --release                  Build the bootloader the `signing` case revokes under, or the `rollback` case raises the floor with, in release mode, as the sysroot's was built (default: debug)
+      --lanes <N>                Run a cell's cases in up to N lanes side by side, each on a private copy of the checkout (1 to 3; default: 1, the cases one after another in the checkout itself)
       --riscv-mmu <RISCV_MMU>    The `kaslr` case's riscv64 paging-mode ceiling (default: sv48; ignored on `x86_64`) [possible values: sv39, sv48, sv57]
       --x86-paging <X86_PAGING>  The `kaslr` case's guest x86-64 paging depth (default: 4; ignored on riscv64) [possible values: 4, 5]
       --wait-host <SECS>         When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
@@ -515,6 +518,9 @@ Options:
 
       --release
           Build the bootloader the `signing` case revokes under, or the `rollback` case raises the floor with, in release mode, as the sysroot's was built (default: debug)
+
+      --lanes <N>
+          Run a cell's cases in up to N lanes side by side, each on a private copy of the checkout (1 to 3; default: 1, the cases one after another in the checkout itself)
 
       --riscv-mmu <RISCV_MMU>
           The `kaslr` case's riscv64 paging-mode ceiling (default: sv48; ignored on `x86_64`)
@@ -609,24 +615,24 @@ Options:
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
 === xtask kani -h
-Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
+Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--pin`, print the pinned release (see xtask/README.md)
 
 Usage: xtask kani [OPTIONS]
 
 Options:
-      --component <CRATE>  Verify the harnesses of this crate only, by its package name (one `cargo xtask kani` registers)
+      --component <CRATE>  Verify the harnesses of this crate only, by its package name (one that holds a harness)
       --harness <NAME>     Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it
       --pin                Print the pinned Kani release and exit, verifying nothing
       --wait-host <SECS>   When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help               Print help
 === xtask kani --help
-Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
+Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--pin`, print the pinned release (see xtask/README.md)
 
 Usage: xtask kani [OPTIONS]
 
 Options:
-      --component <CRATE>  Verify the harnesses of this crate only, by its package name (one `cargo xtask kani` registers)
+      --component <CRATE>  Verify the harnesses of this crate only, by its package name (one that holds a harness)
       --harness <NAME>     Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it
       --pin                Print the pinned Kani release and exit, verifying nothing
       --wait-host <SECS>   When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
@@ -1835,7 +1841,7 @@ Commands:
   test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
-  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
+  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--pin`, print the pinned release (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
   bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md

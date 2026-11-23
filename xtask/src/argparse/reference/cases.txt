@@ -2734,7 +2734,7 @@ UnknownArgument
 error: unexpected argument '--headless' found
 
 ["clean"]
-ok-all clean all=default host_override=default
+ok-all clean all=default keep_std=default host_override=default
 
 ["clean","-h"]
 help xtask clean -h
@@ -27107,6 +27107,36 @@ help xtask bench-baseline -h
 
 ["run","--icount","--runs","3","--cpus","1"]
 ok run cpus=["1"] icount runs=["3"]
+
+["test","--cell","usertest","--lanes","3"]
+ok test cell=["usertest"] lanes=["3"]
+
+["test","--lanes","3"]
+MissingRequiredArgument
+error: the following required arguments were not provided:
+  --cell <TESTER>
+
+["test","--cell","usertest","--lanes","x"]
+ValueValidation
+error: invalid value 'x' for '--lanes <N>': invalid digit found in string
+
+["test","terminal","--lane-root","/tmp/lane"]
+ok test case=["terminal"] lane_root=["/tmp/lane"]
+
+["test","--lane-root","/tmp/lane"]
+MissingRequiredArgument
+error: the following required arguments were not provided:
+  <CASE>
+
+["test","--cell","usertest","--lane-root","/tmp/lane"]
+ok test cell=["usertest"] lane_root=["/tmp/lane"]
+
+["clean","--keep-std"]
+ok clean keep_std
+
+["clean","--all","--keep-std"]
+ArgumentConflict
+error: the argument '--all' cannot be used with '--keep-std'
 
 ["path-account"]
 help-on-missing xtask path-account -h

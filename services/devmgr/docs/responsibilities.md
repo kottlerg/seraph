@@ -588,6 +588,19 @@ devmgr's responsibilities are:
   Notifications of 64 B each. The handler logs nothing, as the query does
   not.
 
+  `QUERY_DEVICE_LOCATION` on a class SEND answers where the device of the
+  driver at an ordinal sits: the segment, bus, device, and function of the
+  PCI function devmgr bound it to, the address devmgr reads that function's
+  configuration space at ([pci-enumeration.md § ECAM Configuration
+  Space](pci-enumeration.md#ecam-configuration-space)), packed as
+  `devmgr_labels::pci_function` packs it. An ordinal only counts the
+  class's drivers in serving order; the location names the device. A driver
+  of a platform device (the serial, framebuffer, and RTC drivers) gets
+  `NO_LOCATION`. Like the query, it is refused `UNAUTHORIZED` to a SEND
+  without a class slot, answers `WITHDRAWN` and `NO_DEVICE` at the same
+  ordinals, waits for a settle as the query does, and logs nothing. vfsd
+  asks it of each disk it holds ([services/vfsd/README.md](../../vfsd/README.md)).
+
   devmgr mints class SENDs on `MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`
   (badge bit 59), which svcmgr and init each derive from their badge-0
   registry source and no published name carries. The request carries the verbs
@@ -697,7 +710,7 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 
 | Capability | Rights | Purpose |
 |---|---|---|
-| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`, `QUERY_HOST_BRIDGE`), acpid's labels (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`, `ACPI_PCI_CONFIG`, `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`, `ACPI_HOTPLUG`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
+| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `WATCH_CLASS`, `DECLINE_RESTART`, and `QUERY_DEVICE_LOCATION`, on a class SEND; `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`, `QUERY_HOST_BRIDGE`), acpid's labels (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`, `ACPI_PCI_CONFIG`, `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`, `ACPI_HOTPLUG`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
 | Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr delivers to the IOMMU driver, keeping its own for a restart; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify, Mint | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps, each routed with `SYS_IRQ_ROUTE` when carved and kept for the boot, whose derivations are delegated to drivers; mint message-signaled targets with `SYS_IRQ_MSG_ALLOC` through a copy carrying `RIGHTS_IRQ_MINT` alone, derived at startup ([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts) § Message-Signaled Interrupts) |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and acpid's FADT register-block ports |

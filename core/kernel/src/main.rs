@@ -1625,6 +1625,7 @@ unsafe fn kernel_entry_post_rebase(
                         slice_remaining: sched::quantum_ticks(sched::INIT_PRIORITY),
                         cpu_affinity: sched::AFFINITY_ANY,
                         preferred_cpu: 0,
+                        placement: crate::sched::thread::PlacementCounts::new(),
                         run_queue_next: None,
                         queued_on: core::sync::atomic::AtomicI16::new(-1),
                         #[cfg(debug_assertions)]

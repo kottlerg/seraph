@@ -35,7 +35,6 @@
 //! core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership, and the swap claim
 //! in core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes.
 
-use super::message::Message;
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 
 // ── EndpointState ─────────────────────────────────────────────────────────────
@@ -284,6 +283,24 @@ unsafe fn rollback_uncommitted_call(
     }
 }
 
+/// Copy the message staged in `src`'s `ipc_msg` into `dst`'s: its header,
+/// its `data_count` data words, and its `cap_count` handles, never the whole
+/// [`Message`](super::message::Message).
+///
+/// # Safety
+/// `src` and `dst` must be distinct valid TCBs; the caller holds `dst`'s
+/// park claim, which owns its `ipc_msg`, and no thread writes `src`'s
+/// `ipc_msg` during the copy.
+#[cfg(not(test))]
+unsafe fn copy_message(src: *const ThreadControlBlock, dst: *mut ThreadControlBlock)
+{
+    // SAFETY: src is valid and its ipc_msg is not written meanwhile
+    // (contract).
+    let msg = unsafe { &(*src).ipc_msg };
+    // SAFETY: dst is valid, not src, and its ipc_msg is the caller's (contract).
+    unsafe { (*dst).ipc_msg.copy_from(msg) };
+}
+
 /// What [`endpoint_call`] did with a call.
 #[cfg(not(test))]
 pub enum CallRendezvous
@@ -299,14 +316,17 @@ pub enum CallRendezvous
     NoReceiver,
 }
 
-/// Attempt an IPC call on `ep` from `caller` with `msg`.
+/// Attempt an IPC call on `ep` from `caller`, whose message is staged in its
+/// own `ipc_msg`.
 ///
-/// Returns [`CallRendezvous::Bound`] if a receiver was waiting: the calling
+/// Returns [`CallRendezvous::Bound`] if a receiver was waiting: the message is
+/// copied into the receiver's `ipc_msg` ([`copy_message`]), and the calling
 /// thread is committed to `parked_state`, unless the park is refused, in
 /// which case the reply linkage is rolled back. Returns
-/// [`CallRendezvous::Queued`] if no receiver was waiting: the calling thread
-/// is committed `BlockedOnSend` on the send queue, unless the park is
-/// refused, in which case it is unlinked and the call is stamped cancelled.
+/// [`CallRendezvous::Queued`] if no receiver was waiting: the calling thread,
+/// its message left in its `ipc_msg` for the receive that binds it, is
+/// committed `BlockedOnSend` on the send queue, unless the park is refused,
+/// in which case it is unlinked and the call is stamped cancelled.
 /// Returns [`CallRendezvous::NoReceiver`], before touching the caller or
 /// either queue, when no capability with the Receive right on the endpoint is
 /// left.
@@ -325,8 +345,9 @@ pub enum CallRendezvous
 /// (core/kernel/docs/ipc-internals.md § Call Path (Sender)).
 ///
 /// # Safety
-/// `ep` and `caller` must be valid, and `caller` must be the running thread.
-/// Call with no scheduler lock and no `ep.lock` held.
+/// `ep` and `caller` must be valid, and `caller` must be the running thread,
+/// its message staged in its `ipc_msg`. Call with no scheduler lock and no
+/// `ep.lock` held.
 // too_many_lines: one rendezvous under one ep.lock hold, whose two arms (bind
 // a waiting server, or park on the send queue) each commit the caller's park
 // before the lock is released; the TCB accesses take one unsafe operation per
@@ -339,7 +360,6 @@ pub enum CallRendezvous
 pub unsafe fn endpoint_call(
     ep: *mut EndpointState,
     caller: *mut ThreadControlBlock,
-    msg: &Message,
     parked_state: IpcThreadState,
     deadline: u64,
 ) -> CallRendezvous
@@ -385,12 +405,6 @@ pub unsafe fn endpoint_call(
                 unsafe { (*server).state == ThreadState::Blocked },
                 "endpoint_call: server not Blocked"
             );
-        }
-        // SAFETY: server dequeued from recv_head; ipc_msg is a data field
-        // written under ep.lock. State transitions are committed by
-        // enqueue_and_wake.
-        unsafe {
-            (*server).ipc_msg = *msg;
         }
         #[expect(
             clippy::multiple_unsafe_ops_per_block,
@@ -484,6 +498,14 @@ pub unsafe fn endpoint_call(
         }
         // SAFETY: paired with lock_raw above.
         unsafe { ep.lock.unlock_raw(saved) };
+        // The message goes to the server after the lock: the dequeue claimed
+        // the server, and its wake_in_flight pin, which only the caller's
+        // enqueue_and_wake clears, owns its ipc_msg until that wake.
+        // SAFETY: caller is the running thread, whose staged ipc_msg only the
+        // server's reply writes, and the server cannot run before the wake;
+        // server is the live TCB the dequeue claimed, not yet woken, and not
+        // the caller (a running thread is on no receive queue).
+        unsafe { copy_message(caller, server) };
         return CallRendezvous::Bound(server);
     }
 
@@ -496,10 +518,8 @@ pub unsafe fn endpoint_call(
             .context_saved
             .store(0, core::sync::atomic::Ordering::Relaxed);
     }
-    // SAFETY: caller validated by syscall layer.
-    unsafe {
-        (*caller).ipc_msg = *msg;
-    }
+    // The message stays in caller.ipc_msg, which the queue's ep.lock owns from
+    // the push below, for the receive that binds it.
     // SAFETY: caller is the running thread, on no wait queue; ep.lock held.
     unsafe {
         enqueue(&mut ep.send_head, &mut ep.send_tail, caller);
@@ -629,26 +649,28 @@ unsafe fn release_displaced_caller(caller: *mut ThreadControlBlock)
 }
 
 /// What a receive keeps of a sender it bound for its reply
-/// (`bind_next_sender`): `msg`, its message, and `cspace`, its `CSpace`
-/// identity, both copied under `ep.lock`. It carries no pointer to the
-/// sender: once the receive drops the lock, a canceller can claim the reply
-/// binding and wake the sender, which can exit and be freed. The capability
-/// transfer resolves the source `CSpace` from `cspace`.
+/// (`bind_next_sender`): `cspace`, its `CSpace` identity, copied under
+/// `ep.lock` as its message is copied into the receiver's `ipc_msg`. It
+/// carries no pointer to the sender: once the receive drops the lock, a
+/// canceller can claim the reply binding and wake the sender, which can exit
+/// and be freed. The capability transfer resolves the source `CSpace` from
+/// `cspace`.
 #[cfg(not(test))]
 pub struct BoundSender
 {
-    pub msg: Message,
     pub cspace: crate::cap::CSpaceIdentity,
 }
 
 /// Dequeue the first live sender on `ep` and bind it to `server` for the
-/// reply, under `ep.lock`, which the caller holds.
+/// reply, under `ep.lock`, which the caller holds, copying its message into
+/// `server`'s `ipc_msg`.
 ///
 /// Returns `Some((bound, displaced))` when a sender was bound: `displaced` is
 /// the binding the rebind's swap displaced (null when the slot was empty),
 /// which the caller MUST release with [`release_displaced_caller`] once it has
 /// dropped `ep.lock`. Returns `None` when the send queue holds no live sender,
-/// and `server`'s binding is then unchanged.
+/// and `server`'s binding is then unchanged and its `ipc_msg` holds no word of
+/// a skipped sender's message.
 ///
 /// # Safety
 /// `server` must be the running thread's valid TCB, and `ep.lock` held.
@@ -683,8 +705,12 @@ unsafe fn bind_next_sender(
         {
             return None;
         }
-        // SAFETY: caller dequeued from send_head.
-        let msg = unsafe { (*caller).ipc_msg };
+        // The message is copied now, before the commit publishes the binding,
+        // as the CSpace identity below is.
+        // SAFETY: caller was dequeued under the held ep.lock, which owns its
+        // queued ipc_msg; server is the running thread, which owns its own and
+        // is on no send queue, so it is not caller.
+        unsafe { copy_message(caller, server) };
         // The sender's CSpace identity is copied now, before the commit
         // publishes the binding: from that publication a canceller (a stop,
         // a timed call's expiry, a teardown) can claim the binding and wake
@@ -730,7 +756,7 @@ unsafe fn bind_next_sender(
             unsafe { crate::sched::commit_reply_rebind_under_local_lock(caller, parked, server) };
         if let Some(displaced) = committed
         {
-            return Some((BoundSender { msg, cspace }, displaced));
+            return Some((BoundSender { cspace }, displaced));
         }
         // Refused: the caller is dying or stopped, and nothing was published.
         // The send-queue dequeue above is the episode claim (and why a
@@ -754,6 +780,10 @@ unsafe fn bind_next_sender(
                 .wake_in_flight
                 .store(0, core::sync::atomic::Ordering::Release);
         }
+        // The skipped sender's message leaves the receiver, whose resume
+        // could otherwise publish it on a fail-open path.
+        // SAFETY: server is the running thread, which owns its ipc_msg.
+        unsafe { (*server).ipc_msg.begin(0, 0) };
     }
 }
 
@@ -773,8 +803,9 @@ pub enum RecvMiss
 ///
 /// First releases a caller still bound from an earlier unreplied receive
 /// (`release_unreplied_caller`). Returns `Ok(bound)` if a sender was waiting
-/// (server continues running; sender remains blocked on reply, and
-/// [`BoundSender`] holds what the receive keeps of it).
+/// (server continues running with the sender's message in its `ipc_msg`;
+/// sender remains blocked on reply, and [`BoundSender`] holds what the
+/// receive keeps of it).
 /// Returns [`RecvMiss::NoSender`] if no sender was available (the server is
 /// committed `BlockedOnRecv` on the recv queue, unless the park is refused, in
 /// which case it is unlinked and, on a stop-won or upcall refusal, its park is
@@ -903,12 +934,6 @@ pub unsafe fn endpoint_recv(
 /// `ep` and `server` must be valid, and `server` must be the running thread.
 /// Call with no scheduler lock and no `ep.lock` held.
 #[cfg(not(test))]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the received `Message` (576 B), counted once for each move: the binding's \
-              tuple, its destructuring and the returned tuple; on the 16 KiB kernel stack of \
-              `SYS_IPC_RECV`"
-)]
 pub unsafe fn endpoint_try_recv(
     ep: *mut EndpointState,
     server: *mut ThreadControlBlock,

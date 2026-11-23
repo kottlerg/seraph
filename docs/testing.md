@@ -2084,7 +2084,8 @@ per edge and compare tracing) and, where the host target supports it, AddressSan
   fixes it. A `#[cfg(test)]` test of the crate runs the property on every one, so
   `cargo xtask test` replays them on each change, on the host and under riscv64 emulation.
 - Its target: `xtask/fuzz/targets/src/bin/<target>.rs`, which names the property, the inputs'
-  directory, and the longest input the engine makes.
+  directory, and the longest input the engine makes, and one line for it in each of the two
+  name-ordered lists of `xtask/fuzz/targets/Cargo.toml`, the binaries and the parser crates.
 
 **The engine.** Each run is AFL-style: a queue of the inputs that reached a new edge or a new
 hit-count bucket of one; havoc mutations and splices of the queued inputs; a dictionary of the
@@ -2144,18 +2145,21 @@ to the rules of [coding-standards.md](coding-standards.md#proof-harnesses) § Pr
 every crate that holds one, each crate built in its host test configuration, with the pinned Kani
 release ([build-system.md](build-system.md#toolchain) § Toolchain). It fails on any failed,
 undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a
-harness in a crate it does not register. CI's `kani` job runs it on every push and pull request,
-and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
+harness that lies in no package. It finds the crates from their harnesses, so a crate's first
+harness adds it to the run. It holds each process of the run to the address space CI's runner can
+give a harness, so a harness that needs more fails, named as out of memory, and it closes with
+every harness's verdict and verification time. CI's `kani` job runs it on every push and pull
+request, and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
 
 **Local sizing.** A harness is sized on the development host before CI runs it. The author of a
 change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
 with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries
-it, every process of the run limited to an address space of 16 GB, the memory of CI's `kani`
-runner ([GitHub's standard Linux runner for a public
-repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)). On a
-Linux host, `prlimit --as=16000000000 cargo xtask kani ...` sets that limit where the command
-does not set it itself. A run that the limit ends (an allocation failure, or a process killed)
+it, under the limit the command sets on every process of the run: 12 GiB of address space, the share
+of the 16 GB of CI's `kani` runner ([GitHub's standard Linux runner for a public
+repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)) that
+leaves 4 GB to the runner's own processes, so a harness that fits under it locally fits on the
+runner. A run that the limit ends (an allocation failure, or a process killed)
 or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
 still cover the property or by the induction form of the parser proofs below. A failed,
 undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
@@ -2185,10 +2189,9 @@ the harness states, and a step harness, that one step from any state in the inva
 under `kani::assume`) keeps it and does what the property asks of that step, with no loop to
 unwind. Code other than the loops that drive the steps and the reads that feed them MUST NOT lie
 outside the harnesses; the module's comment states how its harnesses compose into the property and
-names those loops and reads, with the drivers that check them. The crate's first harness registers
-it with `cargo xtask kani`. Implemented for the GPT parser
-(`services/vfsd/gpt`); design intent, not yet implemented, for every other parser of hostile input,
-none of which holds a property function yet.
+names those loops and reads, with the drivers that check them. Implemented for the parsers whose
+crates hold a `property` module, each with its fuzz target in `xtask/fuzz/targets`; design
+intent, not yet implemented, for every other parser of hostile input.
 
 ---
 

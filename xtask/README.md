@@ -1511,34 +1511,41 @@ cargo xtask kani --pin
 
 | Flag | Default | Description |
 |---|---|---|
-| `--component <CRATE>` | every registered crate | Verify the harnesses of this crate only, by its package name |
+| `--component <CRATE>` | every crate that holds a harness | Verify the harnesses of this crate only, by its package name |
 | `--harness <NAME>` | every harness | Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`); needs `--component` |
 | `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
 
-The command first checks that every tracked Rust source declaring a `#[kani::proof]` lies in a
-crate `HARNESSED` in `src/commands/kani.rs` registers, the crate being the nearest directory
-above the file that holds a `Cargo.toml`, and fails naming each file that does not: a crate's
-first harness registers it. It then checks that `cargo kani --version` names `KANI_VERSION`, and
+The command first finds the crates to verify, keeping no list of them: the crate of every tracked
+Rust source declaring a `#[kani::proof]`, the crate being the nearest directory above the file
+that holds a `Cargo.toml`, each run once by the package name that manifest gives. It fails
+naming each such source that lies in no crate, or in one whose manifest names no package, so no
+harness is left out of the run. It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
 § Toolchain) on another release or none.
 
 For each selected crate it runs `cargo kani --tests -p <package>` (with `--harness` when given),
-which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies
-each harness with Kani's unwinding assertions on. It prints Kani's output as it comes and judges
-it as well as Kani's verdict: the crate fails when `cargo kani` exits unsuccessfully, when a
-harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED` check or a
-`FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's verdict
-names), and when Kani's closing summary is missing, counts a failure or no harness, or counts
-other harnesses than reported a verdict. Every selected crate runs, and the command fails naming
-each that failed. CI's `kani` job runs the command with no option, after installing the release
-`--pin` prints ([docs/build-system.md](../docs/build-system.md#continuous-integration)
-§ Continuous Integration).
+which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies each
+harness with Kani's unwinding assertions on. It runs `cargo kani` under `prlimit --as` (util-linux),
+which holds each process of the run (`cargo`, the Kani compiler, and the CBMC of each harness, which
+Kani runs one at a time) to 12 GiB of address space (`MEMORY_LIMIT_GIB`). The limit derives from the
+runner CI's `kani` job runs on (`ubuntu-latest` for a public repository: 4 vCPUs, 16 GB), leaving
+4 GB to the runner's own processes, so a harness whose CBMC needs more fails, named as out of memory
+under the limit, where without it the runner would be shut down with no verdict. It prints Kani's
+output as it comes and judges it as well as Kani's verdict: the crate fails when `cargo kani` exits
+unsuccessfully, when a harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED`
+check or a `FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's
+verdict names), and when Kani's closing summary is missing, counts a failure or no harness, or
+counts other harnesses than reported a verdict; a harness that Kani starts and prints no verdict for
+fails too. Every selected crate runs, and the command then prints a table of every harness, by
+package and path, with its verdict and verification time, and fails naming each crate that failed.
+CI's `kani` job runs the command with no option, after installing the release `--pin` prints
+([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
 session runs `cargo xtask kani` there. A session installs nothing (`cargo install` is outside the
 permissions `.claude/settings.json` grants) and does not run `cargo kani` itself, which the
 `bash` hook refuses ([§ `cargo xtask hook`](#cargo-xtask-hook)). A new or changed harness is
-sized there, under the memory of CI's runner, before CI runs it
+sized there, under the limit the command sets, before CI runs it
 ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification).
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`

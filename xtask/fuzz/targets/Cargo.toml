@@ -5,7 +5,20 @@
 # function to the engine. `cargo xtask fuzz` builds them instrumented, with
 # `--cfg fuzzing`; built any other way, each prints that and exits.
 # `cargo xtask fuzz --list` names the binaries of src/bin/ but the planted
-# ones, which only `--self-test` runs.
+# ones, which only `--self-test` runs. A target adds one line to each list
+# below, its parser crate's and its binary's, each in name order.
+# The binaries, as one array rather than `[[bin]]` tables, so each target is
+# one line; a root key, so it comes before the first table.
+bin = [
+    { name = "boot-protocol", path = "src/bin/boot-protocol.rs", test = false },
+    { name = "gpt", path = "src/bin/gpt.rs", test = false },
+    { name = "hwrng-protocol", path = "src/bin/hwrng-protocol.rs", test = false },
+    { name = "init-protocol", path = "src/bin/init-protocol.rs", test = false },
+    { name = "planted-length", path = "src/bin/planted-length.rs", test = false },
+    { name = "planted-magic", path = "src/bin/planted-magic.rs", test = false },
+    { name = "planted-nested", path = "src/bin/planted-nested.rs", test = false },
+]
+
 [package]
 name = "fuzz-targets"
 version.workspace = true
@@ -14,28 +27,11 @@ publish.workspace = true
 autobins = false
 
 [dependencies]
+boot-protocol = { path = "../../../abi/boot-protocol" }
 fuzz-engine = { path = "../engine" }
+hwrng-protocol = { path = "../../../shared/hwrng-protocol" }
+init-protocol = { path = "../../../abi/init-protocol" }
 vfsd-gpt = { path = "../../../services/vfsd/gpt" }
-
-[[bin]]
-name = "gpt"
-path = "src/bin/gpt.rs"
-test = false
-
-[[bin]]
-name = "planted-magic"
-path = "src/bin/planted-magic.rs"
-test = false
-
-[[bin]]
-name = "planted-length"
-path = "src/bin/planted-length.rs"
-test = false
-
-[[bin]]
-name = "planted-nested"
-path = "src/bin/planted-nested.rs"
-test = false
 
 [lints]
 workspace = true

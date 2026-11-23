@@ -2123,11 +2123,13 @@ The command reads the document and the files at `--head` (`HEAD` by default) thr
 section is the one whose `## <name>` heading `--section` names; it is refused unless it holds the
 blocks `**Attacker.**`, `**Assets.**`, `**Assumptions.**`, `**Mitigations.**`,
 `**Fuzz targets and proof harnesses.**` and `**Gaps.**`, in that order, and the error lists the
-sections that do. A block's items are its bullets, each with its indented continuation lines, or
-its paragraph when it has none.
+sections that do. A block's items are its bullets, each with its indented continuation lines, and
+the paragraph before its first bullet, when there is one, as its first item; a block with no bullet
+is one item.
 
-In each item, a backticked span holding a `/` and no whitespace is a path: a tracked file, or a
-tracked directory, which stands for the files under it. Only text files count (git's test: no NUL
+In each item, a backticked span holding a `/` and no whitespace, and not beginning with `/` (a path
+of the running system's namespace), is a path: a tracked file, or a tracked directory, which
+stands for the files under it. Only text files count (git's test: no NUL
 byte in the first 8000 bytes), so binary fuzz seeds drop out. A path that names nothing tracked,
 and a link to a document that does not exist, is `unresolved`. A backticked identifier, or the last
 segment of a `::` path, found as a word in none of its item's files is `unlocated`: a hint for the

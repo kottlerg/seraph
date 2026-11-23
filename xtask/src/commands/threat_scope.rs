@@ -270,10 +270,13 @@ fn link_targets(text: &str) -> Vec<&str>
         .collect()
 }
 
-/// The path a span names: it holds a `/` and no whitespace.
+/// The repository path a span names: it holds a `/` and no whitespace, and
+/// does not begin with `/`, which marks a path of the running system's
+/// namespace (`/services/drivers/`), not of the repository.
 fn path_span(span: &str) -> Option<&str>
 {
-    (span.contains('/') && !span.contains(char::is_whitespace)).then(|| span.trim_end_matches('/'))
+    (span.contains('/') && !span.starts_with('/') && !span.contains(char::is_whitespace))
+        .then(|| span.trim_end_matches('/'))
 }
 
 /// The word a span names when it is an identifier or a path of identifiers
@@ -1078,6 +1081,26 @@ mod tests
         let s = resolved();
         assert_eq!(s.blocks[3].items[0].unlocated, ["gpt::missing_fn"]);
         assert_eq!(s.blocks[3].items[1].unlocated, Vec::<String>::new());
+    }
+
+    // Defect caught: a path of the running system's namespace, which a section
+    // names beside repository paths, taken for a repository file and reported
+    // as a reference to nothing, refusing a correct section.
+    #[test]
+    fn a_namespace_path_is_not_a_repository_reference()
+    {
+        assert_eq!(path_span("/services/drivers/"), None);
+        assert_eq!(path_span("/config/boot.conf"), None);
+        assert_eq!(path_span("a/gpt/"), Some("a/gpt"));
+        assert_eq!(path_span("read or write"), None);
+        let doc = DOC.replace(
+            "- Overlap is unchecked.",
+            "- Overlap in `/services/drivers/` is unchecked.",
+        );
+        let mut s = parse_section(&doc, "Disk Images").unwrap();
+        resolve(&mut s, &tree());
+        assert_eq!(s.blocks[5].items[0].unresolved, Vec::<String>::new());
+        assert_eq!(unresolved(&s), ["Mitigations#3", "Mitigations#4"]);
     }
 
     // Defect caught: a mitigation with no file, or a dangling reference,

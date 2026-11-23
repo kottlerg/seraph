@@ -271,6 +271,15 @@ compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`, or
 `KtestConfig::BENCH` in a `cargo xtask build --ktest-bench-only` build
 (see [xtask/README.md](../xtask/README.md#cargo-xtask-mkdisk)).
 
+CI's ktest boots, the `ktest` cells' own boot and the burn-in's ktest boots, run at the fixed 4
+CPUs on the fixed device set ([Coverage tiers](#coverage-tiers)), where no test's skip condition
+holds: every CPU minimum in ktest is 4 or less, and the launch hands ktest every device and
+capability a test gates on. Each carries `--fail-also ' SKIP '`, so a test that logs its SKIP line
+([core/ktest/README.md](../core/ktest/README.md)) fails the boot, as does a test whose CPU minimum
+is above 4. The `bench` cell's boots carry no such check: its one-CPU boots skip what needs more
+CPUs, a functional ktest boot runs every benchmark at 4 CPUs, and `bench-check` judges the cell's
+counts ([Benchmarks](#benchmarks-bench-cell)). A local boot at fewer CPUs keeps its skips.
+
 ### Interactive input (`terminal` case)
 
 Interactive input cannot be exercised by an autonomous recipe: keysyms must come

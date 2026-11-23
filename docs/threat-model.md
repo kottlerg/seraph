@@ -170,7 +170,8 @@ and proof harnesses for the decoders of `shared/ipc`, `shared/namespace-protocol
   audit of this section ([#680](https://github.com/kottlerg/seraph/issues/680)) is the first.
 - gdbstub's fault receiver retries a failed receive every 10 ms without `RecvGuard`
   (`start_receiver` in `services/gdbstub/src/main.rs`), against [ipc-design.md](ipc-design.md)
-  § Receive-Failure Policy; only kernel-delivered faults reach its endpoint.
+  § Receive-Failure Policy; only kernel-delivered faults reach its endpoint
+  ([#1534](https://github.com/kottlerg/seraph/issues/1534)).
 - No standard governs how a server reads a structure from memory a client lent it and can still
   write, so a check and a later read of the same bytes can see different values.
 
@@ -425,10 +426,11 @@ Wycheproof vectors, `shared/objsig` is host-tested, and the booted `signing`, `r
   the ESP replaces the bootloader and its roots, and a whole older image boots; an image packed with
   a test harness signed `init` boots that harness on a system that trusts its key; a console user
   who confirms an attacker's trust request enrols its roots; an attacker at the firmware's shell can
-  delete the enrolled store; on a platform whose firmware refuses the floor's write, only the
-  build-time floor holds, so an older image signed at or above it boots ([signing.md](signing.md)
-  § Rollback Floor); and an older signed configuration directory at an admitted security version
-  verifies ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
+  delete the enrolled store; on a platform whose firmware refuses the floor's write, the machine's
+  floor never rises, so even under Secure Boot a whole older image boots, its bootloader and older
+  floor included ([signing.md](signing.md) § Rollback Floor); and an older signed configuration
+  directory at an admitted security version verifies
+  ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
 - The parsers of the signature trailer, the certificate, the trust store and the trust request,
   which read bytes before any signature over them is checked, have no fuzz target or proof harness,
   and none is planned.

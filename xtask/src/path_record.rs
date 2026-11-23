@@ -95,7 +95,7 @@ impl Record
                         unretired: std::mem::take(&mut unretired),
                     });
                 }
-                Event::Attempt { pc } | Event::Retry { pc } => unretired.push(pc),
+                Event::Attempt { pc } => unretired.push(pc),
             }
         }
         Ok(Self { arch, hists, reads })
@@ -448,6 +448,27 @@ R 1000 2 23
         assert_eq!(two, BTreeMap::from([(0x1000, 2), (0x1002, 6)]));
         record.retired(1, 1).unwrap_err();
         record.retired(3, 9).unwrap_err();
+    }
+
+    #[test]
+    fn a_read_run_twice_counts_its_attempt_in_the_window_it_opens()
+    {
+        // The read at 1000 opening the window ran twice; its attempt follows
+        // it and the window retires it once.
+        let record = Record::parse(
+            "seraph-path-account 1 x86_64
+H 0 100:5
+R 1000 0 10
+A 1000
+H 1 1000:2 1002:3
+R 1000 1 14
+",
+        )
+        .unwrap();
+        assert_eq!(
+            record.retired(0, 1).unwrap(),
+            BTreeMap::from([(0x1000, 1), (0x1002, 3)])
+        );
     }
 
     #[test]

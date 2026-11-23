@@ -63,9 +63,10 @@ other exception: while the unit is off, QEMU's translator raises the trap when i
 instruction, and icount has counted it, so the counter counted it too. The plugin defers such
 an attempt to the next instruction and reads the unit's state register there (`CR0.TS` and
 `CR0.EM`, `sstatus.FS` and `sstatus.VS`): with the unit off the attempt is not one, with it
-on (a fault of the instruction's memory access) it is. A read begun again before its value was
-read, its first attempt interrupted, is a retry. xtask subtracts both from the window that
-holds them.
+on (a fault of the instruction's memory access) it is. A counter read that runs more than once
+before its value is read (its first execution interrupted) retired once; its other executions
+are attempts, which the record writes after the read, in the segment the read opens and that ran
+them. xtask subtracts the attempts from the window that holds them.
 
 **Record.** One event per line, in the order the guest ran them:
 
@@ -76,7 +77,6 @@ H <id> <pc>:<count> ...            a segment's instructions, by address, the fir
 R <pc> <id> <value>                a user-mode counter read at <pc>, the segment before it
                                    (histogram <id>), its value
 A <pc>                             an attempt at <pc> that a trap ended before it retired
-X <pc>                             a counter read at <pc> begun again before its value was read
 ```
 
 A histogram is written once, keyed by a 128-bit FNV-1a hash of its entries, and a later segment

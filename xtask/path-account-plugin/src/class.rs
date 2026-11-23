@@ -196,10 +196,12 @@ fn x86_rep_string(bytes: &[u8]) -> Option<u8>
 }
 
 /// Whether the x86-64 instruction `bytes` starts with uses the x87, MMX, SSE
-/// or AVX state: an x87 escape, a VEX or EVEX instruction, or a `0x0f` opcode
-/// of the MMX and SSE maps (`fxsave`, `fxrstor`, `ldmxcsr`, `stmxcsr`,
-/// `xsave` and `xrstor` among the `0x0f 0xae` group), after any legacy
-/// prefix and REX.
+/// or AVX state: an x87 escape, a VEX or EVEX instruction other than the
+/// general-purpose ones of BMI1 and BMI2 (the `0x0f38` map's `0xf0..=0xf7`
+/// and the `0x0f3a` map's `0xf0`, which never raise `#NM`), or a `0x0f`
+/// opcode of the MMX and SSE maps (`fxsave`, `fxrstor`, `ldmxcsr`,
+/// `stmxcsr`, `xsave` and `xrstor` among the `0x0f 0xae` group), after
+/// any legacy prefix and REX.
 fn x86_fpu(bytes: &[u8]) -> bool
 {
     let mut rest = bytes;
@@ -216,6 +218,9 @@ fn x86_fpu(bytes: &[u8]) -> bool
     }
     match rest
     {
+        // A three-byte VEX prefix names its map in its second byte's low five
+        // bits (2: 0x0f38, 3: 0x0f3a); the two-byte one implies 0x0f.
+        [0xc4, map, _, op, ..] => !matches!((map & 0x1f, op), (2, 0xf0..=0xf7) | (3, 0xf0)),
         [0xd8..=0xdf | 0xc4 | 0xc5 | 0x62, ..] => true,
         // The 0x38 map less movbe, crc32 and the BMI and ADX opcodes.
         [0x0f, 0x38, op, ..] => *op < 0xf0,
@@ -322,6 +327,16 @@ mod tests
         // movbe eax, [rdi] (0f 38 f0) and popcnt (f3 0f b8) are not.
         assert_eq!(c(&[0x0f, 0x38, 0xf0, 0x07]), Class::Plain);
         assert_eq!(c(&[0xf3, 0x0f, 0xb8, 0xc0]), Class::Plain);
+        // The VEX general-purpose instructions are not: andn eax, ebx, [rdi]
+        // (c4 e2 60 f2 07), pdep (c4 e2 63 f5 07), shlx (c4 e2 61 f7 07), and
+        // rorx eax, [rdi], 5 (c4 e3 7b f0 07 05). vbroadcastss ymm0, [rsi]
+        // (c4 e2 7d 18 06) and vpermq (c4 e3 fd 00 06 1b) are.
+        assert_eq!(c(&[0xc4, 0xe2, 0x60, 0xf2, 0x07]), Class::Plain);
+        assert_eq!(c(&[0xc4, 0xe2, 0x63, 0xf5, 0x07]), Class::Plain);
+        assert_eq!(c(&[0xc4, 0xe2, 0x61, 0xf7, 0x07]), Class::Plain);
+        assert_eq!(c(&[0xc4, 0xe3, 0x7b, 0xf0, 0x07, 0x05]), Class::Plain);
+        assert_eq!(c(&[0xc4, 0xe2, 0x7d, 0x18, 0x06]), fpu);
+        assert_eq!(c(&[0xc4, 0xe3, 0xfd, 0x00, 0x06, 0x1b]), fpu);
     }
 
     #[test]

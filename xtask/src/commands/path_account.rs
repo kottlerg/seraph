@@ -33,8 +33,8 @@ use crate::context::Context;
 use crate::error::{Context as _, Result, bail, ensure};
 use crate::guest::Guest;
 use crate::path_account::{
-    Configuration, KERNEL, OTHER, Path, Place, Placement, Tally, attributed, placements,
-    render_block, replace_block,
+    Configuration, KERNEL, OTHER, Path, Place, Placement, Provenance, Tally, attributed,
+    placements, render_block, replace_block,
 };
 use crate::path_record::{Record, Row, Window, rows, windows};
 use crate::qemu::{
@@ -42,7 +42,7 @@ use crate::qemu::{
     X86Paging, X86ShadowStack, build_qemu_argv_for, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::function_path;
-use crate::symbolize::store::Store;
+use crate::symbolize::store::{Store, build_id};
 use crate::symbolize::{Resolution, Symbolizer, text_span};
 use crate::util::{CI_CARGO_ENV, require_tool, run_cmd, step};
 
@@ -444,6 +444,23 @@ impl Images
             placed: indexed,
         })
     }
+
+    /// Each placed image's build id, by its name (`none` for an image
+    /// without one).
+    fn build_ids(&self) -> BTreeMap<String, String>
+    {
+        self.placed
+            .iter()
+            .map(|(placement, index)| {
+                let id = self
+                    .files
+                    .get(*index)
+                    .and_then(|(_, data)| build_id(data))
+                    .unwrap_or_else(|| "none".to_owned());
+                (placement.name.clone(), id)
+            })
+            .collect()
+    }
 }
 
 /// `path-account trace`.
@@ -460,7 +477,13 @@ fn trace(ctx: &Context, args: &PathAccountTraceArgs) -> Result<()>
     let out_dir = results_root(ctx).join(format!("{}-{arch}-{profile}", account.name));
     let record_path = out_dir.join("record.txt");
     let log_path = out_dir.join("boot.log");
-    if !args.reuse
+    let provenance_path = out_dir.join("provenance.txt");
+    let mut taken = None;
+    if args.reuse
+    {
+        crate::sysroot::check_arch(ctx, arch)?;
+    }
+    else
     {
         validate_sysroot_for_launch(ctx, arch)?;
         if harness == Harness::Init
@@ -476,11 +499,19 @@ fn trace(ctx: &Context, args: &PathAccountTraceArgs) -> Result<()>
         let _host = crate::host_lock::admit_boot(ctx, &args.host, 1, 1)?;
         std::fs::create_dir_all(&out_dir)
             .with_context(|| format!("creating {}", out_dir.display()))?;
-        if record_path.exists()
+        for stale in [&record_path, &provenance_path]
         {
-            std::fs::remove_file(&record_path)
-                .with_context(|| format!("removing {}", record_path.display()))?;
+            if stale.exists()
+            {
+                std::fs::remove_file(stale)
+                    .with_context(|| format!("removing {}", stale.display()))?;
+            }
         }
+        taken = Some((
+            head(ctx),
+            today(),
+            first_line(arch.qemu_binary(), &["--version"]),
+        ));
         boot(
             ctx,
             arch,
@@ -505,14 +536,15 @@ fn trace(ctx: &Context, args: &PathAccountTraceArgs) -> Result<()>
         record.arch.name()
     );
     let images = Images::read(ctx, &placements(&lines, account.init))?;
+    let provenance = provenance(&provenance_path, taken, images.build_ids())?;
     let mut resolver = Resolver::new(&images.files, &images.placed)?;
     let paths = account_boot(&record, &lines, &references.0, &mut resolver, &out_dir)?;
     let config = Configuration {
         arch: arch.to_string(),
         profile: profile.to_owned(),
-        head: head(ctx),
-        date: today(),
-        qemu: first_line(arch.qemu_binary(), &["--version"]),
+        head: provenance.head,
+        date: provenance.date,
+        qemu: provenance.qemu,
         reference: references.1,
         paths,
     };
@@ -525,6 +557,48 @@ fn trace(ctx: &Context, args: &PathAccountTraceArgs) -> Result<()>
         out_dir.display()
     ));
     Ok(())
+}
+
+/// The traced boot's provenance: the one `taken` at its launch with the
+/// images' build ids `ids`, written to `path`; or, for a record accounted
+/// again (`taken` none), the one its trace wrote, checked against `ids`.
+///
+/// # Errors
+/// The file cannot be written, read or parsed, or an image's build id is not
+/// the traced one.
+fn provenance(
+    path: &FsPath,
+    taken: Option<(String, String, String)>,
+    ids: BTreeMap<String, String>,
+) -> Result<Provenance>
+{
+    if let Some((head, date, qemu)) = taken
+    {
+        let provenance = Provenance {
+            head,
+            date,
+            qemu,
+            images: ids,
+        };
+        write_file(path, &provenance.render())?;
+        return Ok(provenance);
+    }
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading {} (a trace leaves it beside its record; trace again)",
+            path.display()
+        )
+    })?;
+    let provenance = Provenance::parse(&text).with_context(|| format!("{}", path.display()))?;
+    let moved = provenance.mismatches(&ids);
+    ensure!(
+        moved.is_empty(),
+        "the sysroot's images are not the traced boot's (build the traced head, {}, again, or \
+         trace again):\n  {}",
+        provenance.head,
+        moved.join("\n  ")
+    );
+    Ok(provenance)
 }
 
 /// Account a traced boot: each program's windows divided among its result

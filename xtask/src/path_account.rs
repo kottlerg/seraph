@@ -587,10 +587,141 @@ pub fn replace_block(doc: &str, block: &str) -> Result<String>
     Ok(format!("{head}{block}{tail}"))
 }
 
+/// The first line of a provenance file.
+const PROVENANCE_HEADER: &str = "# path-account provenance";
+
+/// What a traced boot ran: the tree, the date and the QEMU of the trace, and
+/// the build id of each image the boot placed, by its name. `trace` writes
+/// it beside the plugin's record; `trace --reuse` takes the first three from
+/// it and accounts the record only against the images it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provenance
+{
+    /// The commit traced, `-dirty` appended when the tree differed from it.
+    pub head: String,
+    /// The UTC date of the trace, `YYYY-MM-DD`.
+    pub date: String,
+    /// `qemu-system-<arch> --version`'s first line.
+    pub qemu: String,
+    /// Each placed image's build id (`none` for an image without one).
+    pub images: BTreeMap<String, String>,
+}
+
+impl Provenance
+{
+    /// The provenance file: tab-separated records, one a line.
+    pub fn render(&self) -> String
+    {
+        let mut out = format!("{PROVENANCE_HEADER}\n");
+        for (key, value) in [
+            ("head", &self.head),
+            ("date", &self.date),
+            ("qemu", &self.qemu),
+        ]
+        {
+            let _ = writeln!(out, "{key}\t{value}");
+        }
+        for (name, id) in &self.images
+        {
+            let _ = writeln!(out, "image\t{name}\t{id}");
+        }
+        out
+    }
+
+    /// Read a provenance file.
+    ///
+    /// # Errors
+    ///
+    /// The header is missing, a record is malformed or unknown, or the head,
+    /// date or QEMU record is missing.
+    pub fn parse(text: &str) -> Result<Self>
+    {
+        let mut lines = text.lines();
+        ensure!(
+            lines.next() == Some(PROVENANCE_HEADER),
+            "not a path-account provenance file"
+        );
+        let (mut head, mut date, mut qemu) = (None, None, None);
+        let mut images = BTreeMap::new();
+        for line in lines.filter(|l| !l.is_empty())
+        {
+            match line.split('\t').collect::<Vec<_>>().as_slice()
+            {
+                ["head", value] => head = Some((*value).to_owned()),
+                ["date", value] => date = Some((*value).to_owned()),
+                ["qemu", value] => qemu = Some((*value).to_owned()),
+                ["image", name, id] =>
+                {
+                    images.insert((*name).to_owned(), (*id).to_owned());
+                }
+                _ => bail!("{line:?}: not a provenance record"),
+            }
+        }
+        let (Some(head), Some(date), Some(qemu)) = (head, date, qemu)
+        else
+        {
+            bail!("the provenance file lacks its head, date or QEMU record");
+        };
+        Ok(Self {
+            head,
+            date,
+            qemu,
+            images,
+        })
+    }
+
+    /// Each image whose build id in `now` is not the traced one, or that one
+    /// of the two lacks, as `<name>: traced <id>, now <id>`.
+    pub fn mismatches(&self, now: &BTreeMap<String, String>) -> Vec<String>
+    {
+        let mut names: Vec<&String> = self.images.keys().chain(now.keys()).collect();
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .filter_map(|name| {
+                let traced = self.images.get(name).map_or("absent", String::as_str);
+                let current = now.get(name).map_or("absent", String::as_str);
+                (traced != current).then(|| format!("{name}: traced {traced}, now {current}"))
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn a_provenance_reads_back_and_names_each_image_that_moved()
+    {
+        let traced = Provenance {
+            head: "471226fdaaff".to_owned(),
+            date: "2026-11-23".to_owned(),
+            qemu: "QEMU emulator version 11.1.3".to_owned(),
+            images: BTreeMap::from([
+                ("kernel".to_owned(), "eb1a".to_owned()),
+                ("fatfs:/".to_owned(), "00ff".to_owned()),
+            ]),
+        };
+        assert_eq!(Provenance::parse(&traced.render()).unwrap(), traced);
+        assert_eq!(traced.mismatches(&traced.images), Vec::<String>::new());
+        let now = BTreeMap::from([
+            ("kernel".to_owned(), "eb1b".to_owned()),
+            ("ubench".to_owned(), "0101".to_owned()),
+        ]);
+        assert_eq!(
+            traced.mismatches(&now),
+            [
+                "fatfs:/: traced 00ff, now absent",
+                "kernel: traced eb1a, now eb1b",
+                "ubench: traced absent, now 0101",
+            ]
+        );
+        Provenance::parse("# path-account provenance\nhead\tx\n").unwrap_err();
+        Provenance::parse("head\tx\n").unwrap_err();
+    }
 
     #[test]
     fn library_frames_count_against_their_caller()

@@ -1807,7 +1807,7 @@ cargo xtask path-account write
 | `--release` | off | The sysroot was built with `--release` |
 | `--reference` | | Saved logs of icount boots of the same tree, profile and image built without `--limited-debug`, whose lowest one-CPU p50s are the reference counts |
 | `--timeout` | `3600` | Seconds the whole boot may take |
-| `--reuse` | off | Account the boot log and the record the configuration's last trace left, without booting |
+| `--reuse` | off | Account the boot log and the record the configuration's last trace left, without booting, against the same images |
 
 The host options are `run`'s ([Host launch rules](#host-launch-rules)); a trace is a boot of one
 vCPU. `trace` accounts the harness the disk image records: ktest's bench-only image, or the init
@@ -1898,7 +1898,9 @@ before it.
 it), date, QEMU version and reference, then per path a `path` record (measurement, p50,
 reference, the window's index among the line's samples) and an `fn` record per function (image,
 path, count). Beside it, `<harness>-<arch>-<profile>/` holds the plugin's record
-(`record.txt`), the boot's serial log, and one `.trace` file per path, a line per address: the
+(`record.txt`), the boot's provenance (`provenance.txt`: the head, date and QEMU version of the
+trace and each placed image's build id, which `--reuse` takes, refusing a sysroot whose images
+differ), the boot's serial log, and one `.trace` file per path, a line per address: the
 instructions retired there, its image, and its frames from the outermost in. `write` reads the
 result files of each harness and replaces the block between its document's `path-account`
 markers with a provenance table, each path's totals by image, and per path its functions, a

@@ -40,6 +40,7 @@ struct Slot
 #[derive(Clone, Copy)]
 struct Pending
 {
+    index: u32,
     pc: u64,
     hist: u64,
     dest: Dest,
@@ -187,8 +188,9 @@ impl<W: Write> Recorder<W>
     }
 
     /// The read callback: a user-mode counter read is about to run. It closes
-    /// the open segment, unless the previous read's value is still due (the
-    /// read began again: [`Event::Retry`]).
+    /// the open segment, unless the read's value is still due: the read began
+    /// again, and [`Recorder::value`] counts its executions that did not
+    /// retire.
     pub fn read(&mut self, index: u32)
     {
         let Some(slot) = self.slots.get(index as usize)
@@ -202,13 +204,17 @@ impl<W: Write> Recorder<W>
         {
             return;
         };
-        if let Some(pending) = self.pending
+        if self.pending.is_some()
         {
-            self.emit(&Event::Retry { pc: pending.pc });
             return;
         }
         let hist = self.close();
-        self.pending = Some(Pending { pc, hist, dest });
+        self.pending = Some(Pending {
+            index,
+            pc,
+            hist,
+            dest,
+        });
     }
 
     /// Where the due read left its value, while one is due.
@@ -236,6 +242,20 @@ impl<W: Write> Recorder<W>
                     hist: pending.hist,
                     value,
                 });
+                // The read retired once, and every execution of it since it
+                // closed the segment is in the segment it opened: the others
+                // are attempts, which the record writes after the read, so
+                // that they count against the segment that ran them.
+                let segment = self.segment;
+                let runs = self
+                    .slots
+                    .get(pending.index as usize)
+                    .filter(|s| s.segment == segment)
+                    .map_or(0, |s| s.count);
+                for _ in 1..runs
+                {
+                    self.emit(&Event::Attempt { pc: pending.pc });
+                }
                 // The guest is killed when the trace has what it needs: what a
                 // read completed is on disk.
                 if self.error.is_none()
@@ -287,6 +307,11 @@ impl<W: Write> Recorder<W>
             return;
         };
         self.last = None;
+        // A due read's attempts are counted when its value is read.
+        if self.pending.is_some_and(|p| p.index == index)
+        {
+            return;
+        }
         match class
         {
             Class::Unit(unit) => self.trapped = Some((from, unit)),
@@ -478,10 +503,7 @@ mod tests
             .filter_map(|e| match e
             {
                 Event::Read { hist, .. } => Some(*hist),
-                Event::Header { .. }
-                | Event::Hist { .. }
-                | Event::Attempt { .. }
-                | Event::Retry { .. } => None,
+                Event::Header { .. } | Event::Hist { .. } | Event::Attempt { .. } => None,
             })
             .collect();
         // The first segment is empty; the next two are the read and the nop.
@@ -622,15 +644,23 @@ mod tests
     }
 
     #[test]
-    fn a_read_begun_again_is_a_retry_in_the_same_segment()
+    fn a_read_begun_again_counts_its_attempts_against_the_segment_it_opens()
     {
         let mut r = Recorder::new(Arch::X86_64, Vec::new());
         let (read, _) = r.slot(0x1000, &RDTSC).unwrap();
+        // An interrupt ends the read's first execution, and it runs again.
         r.read(read);
         r.exec(read);
+        r.discon(0x1000);
         r.read(read);
         r.exec(read);
         r.value(Some(5));
+        // Begun again with no discontinuity reported.
+        r.read(read);
+        r.exec(read);
+        r.read(read);
+        r.exec(read);
+        r.value(Some(9));
         assert_eq!(
             events(&mut r),
             [
@@ -639,12 +669,22 @@ mod tests
                     id: 0,
                     entries: Vec::new()
                 },
-                Event::Retry { pc: 0x1000 },
                 Event::Read {
                     pc: 0x1000,
                     hist: 0,
                     value: 5
                 },
+                Event::Attempt { pc: 0x1000 },
+                Event::Hist {
+                    id: 1,
+                    entries: vec![(0x1000, 2)]
+                },
+                Event::Read {
+                    pc: 0x1000,
+                    hist: 1,
+                    value: 9
+                },
+                Event::Attempt { pc: 0x1000 },
             ]
         );
     }

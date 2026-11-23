@@ -57,15 +57,10 @@ pub enum Event
         value: u64,
     },
     /// An instruction a trap interrupted after its execution began: it ran,
-    /// and the segment counted it, but it did not retire.
+    /// and the segment counted it, but it did not retire. It counts against
+    /// the segment the next read ends, so a counter read's own attempts
+    /// follow its `Read`.
     Attempt
-    {
-        /// Its address.
-        pc: u64,
-    },
-    /// A counter read begun again before its value was read: the first
-    /// attempt did not retire, and the segment counted it.
-    Retry
     {
         /// Its address.
         pc: u64,
@@ -90,7 +85,6 @@ impl fmt::Display for Event
             }
             Self::Read { pc, hist, value } => write!(f, "R {pc:x} {hist} {value}"),
             Self::Attempt { pc } => write!(f, "A {pc:x}"),
-            Self::Retry { pc } => write!(f, "X {pc:x}"),
         }
     }
 }
@@ -154,9 +148,6 @@ pub fn parse(line: &str) -> Result<Event, String>
         "A" => Event::Attempt {
             pc: hex(field("address")?)?,
         },
-        "X" => Event::Retry {
-            pc: hex(field("address")?)?,
-        },
         _ => return Err(format!("unknown event {tag:?}")),
     };
     match words.next()
@@ -194,7 +185,6 @@ mod tests
                 value: u64::MAX,
             },
             Event::Attempt { pc: 0x36_e722_0f14 },
-            Event::Retry { pc: 0x36_e722_0f10 },
         ];
         for event in events
         {

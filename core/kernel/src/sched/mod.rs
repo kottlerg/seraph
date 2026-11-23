@@ -320,60 +320,6 @@ pub unsafe fn cpu_shadow_pages(cpu: usize) -> u64
 /// by the scheduler, the IPI paths, and `SYS_SYSTEM_INFO(CpuCount)`.
 pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-// ── Reschedule-pending flag ──────────────────────────────────────────────────
-
-/// The reschedule-pending set's words: one bit per CPU, `mask_words` words
-/// (`crate::cpu_mask`), allocated at Phase 4 by [`init_storage`]. Null before;
-/// no producer runs before Phase 4.
-///
-/// Set by producers before the wake IPI and consumed by the idle loop with
-/// interrupts masked; the protocol and its ordering are specified in
-/// core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants.
-///
-/// This closes the check-to-halt window (core/kernel/docs/scheduling-internals.md
-/// § Wake Protocol Invariants, invariant 2): a wake notification that races between the
-/// consumer's check and its halt lands either as an observed flag (via
-/// `take_reschedule_pending`) or as a pending interrupt that
-/// `halt_until_interrupt` wakes on atomically.
-///
-/// Arch-uniform. On RISC-V the IPI handler does **not** set this flag; the
-/// producer does. On x86-64 the same contract holds.
-static RESCHEDULE_PENDING: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicU64> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-
-/// The reschedule-pending set, a view over [`RESCHEDULE_PENDING`]'s words; the
-/// empty, unattached set before Phase 4.
-fn reschedule_pending() -> crate::cpu_mask::AtomicCpuMask
-{
-    let words = RESCHEDULE_PENDING.load(core::sync::atomic::Ordering::Acquire);
-    if words.is_null()
-    {
-        return crate::cpu_mask::AtomicCpuMask::unattached();
-    }
-    // SAFETY: the words were allocated zeroed for this set at Phase 4 and live
-    // for the kernel's life; every access is through such views.
-    unsafe { crate::cpu_mask::AtomicCpuMask::from_words(words, crate::cpu_mask::mask_words()) }
-}
-
-/// Set the reschedule-pending bit for `cpu` (producer side).
-///
-/// Release ordering ensures the preceding enqueue store is published to
-/// any CPU that subsequently observes this bit via the Acquire/AcqRel in
-/// `take_reschedule_pending`.
-pub fn set_reschedule_pending_for(cpu: usize)
-{
-    reschedule_pending().set_cpu(cpu, core::sync::atomic::Ordering::Release);
-}
-
-/// Check and clear the reschedule-pending flag for a CPU.
-///
-/// Returns `true` if a reschedule was pending (and clears the flag).
-/// `AcqRel`: Acquire side pairs with Release in `set_reschedule_pending_for`.
-pub fn take_reschedule_pending(cpu: usize) -> bool
-{
-    reschedule_pending().take_cpu(cpu, core::sync::atomic::Ordering::AcqRel)
-}
-
 // ── Softlockup watchdog ──────────────────────────────────────────────────────
 //
 // Detects "every CPU stalled in kernel mode" and dumps per-CPU TCB state.
@@ -2733,9 +2679,8 @@ pub fn alloc_thread_id() -> u32
 
 /// Entry function for idle threads.
 ///
-/// Runs at priority 0. Implements the flag-first idle-wake primitive:
-/// each iteration disables interrupts, checks `take_reschedule_pending`
-/// and `has_runnable` together, and halts atomically if neither is set.
+/// Runs at priority 0. Each iteration disables interrupts, checks
+/// `has_runnable`, and halts atomically if the run queues are empty.
 ///
 /// Correctness against racing producers is specified in
 /// core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants.
@@ -2776,36 +2721,32 @@ fn idle_thread_entry(_cpu_id: u64) -> !
                 crate::arch::current::cpu::disable_interrupts();
             }
 
-            // Step 2: atomic check of flag + run queue. Idle state is not
-            // published; the wake protocol always sends a reschedule IPI
-            // rather than consulting a per-CPU idle mask.
+            // Step 2: check the run queues. Idle state is not published; a
+            // producer links its thread before it sends the wake IPI, which it
+            // always sends rather than consulting a per-CPU idle mask.
             // See core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants.
-            let pending = take_reschedule_pending(cpu);
             // SAFETY: cpu is this CPU's index, < CPU_COUNT, and the per-CPU
             // storage is initialised.
             let sched_ptr = unsafe { scheduler_ptr(cpu) };
             // SAFETY: scheduler slot is initialised for this CPU.
             let has_work = unsafe { (*sched_ptr).has_runnable() };
 
-            if pending || has_work
+            if has_work
             {
                 // SAFETY: paired with the `disable_interrupts` above.
                 unsafe {
                     crate::arch::current::interrupts::enable();
                 }
-                if has_work
-                {
-                    // SAFETY: scheduler context on a valid kernel stack;
-                    // Requeue::Always so the idle thread goes back in queue.
-                    unsafe {
-                        schedule(Requeue::Always);
-                    }
+                // SAFETY: scheduler context on a valid kernel stack;
+                // Requeue::Always so the idle thread goes back in queue.
+                unsafe {
+                    schedule(Requeue::Always);
                 }
                 continue;
             }
 
-            // Step 3: no work and no pending flag → halt. Atomic on both
-            // arches: x86 `sti;hlt`, RISC-V `wfi; csrsi sstatus, SIE`.
+            // Step 3: no work → halt. Atomic on both arches: x86
+            // `sti;hlt`, RISC-V `wfi; csrsi sstatus, SIE`.
             // Returns with interrupts enabled; any pending wake interrupt
             // has been recognised.
             halt_until_interrupt();
@@ -2988,9 +2929,8 @@ pub unsafe fn init(cpu_count: u32) -> u32
 }
 
 /// Fix every CPU set's width at `cpu_count` (`cpu_mask::set_boot_cpu_count`),
-/// allocate the reschedule-pending CPU set (`RESCHEDULE_PENDING`) and the
-/// per-CPU storage slabs sized to `cpu_count` (schedulers, idle TCBs, idle
-/// kernel stacks and their tops, watchdog ticks and breadcrumbs (`CPU_DIAG`),
+/// allocate the per-CPU storage slabs sized to `cpu_count` (schedulers, idle
+/// TCBs, idle kernel stacks and their tops, watchdog ticks and breadcrumbs (`CPU_DIAG`),
 /// per-CPU arch data, the TLB-shootdown request slots and their
 /// acknowledgement sets, and the x86 AP GDT/TSS/IST tables and NMI-backtrace
 /// storage), publish `CPU_COUNT`, and arm the BSP boot transient. Must run
@@ -3016,13 +2956,6 @@ pub unsafe fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     CPU_COUNT.store(cpu_count, core::sync::atomic::Ordering::Relaxed);
     // Every CPU set is this boot's width from here on.
     crate::cpu_mask::set_boot_cpu_count(cpu_count as usize);
-    // One CPU set, not a per-CPU slab: at most MAX_MASK_WORDS words (1 KiB).
-    let bytes = crate::cpu_mask::mask_words()
-        .checked_mul(core::mem::size_of::<core::sync::atomic::AtomicU64>())
-        .unwrap_or_else(|| crate::fatal("init_storage: RESCHEDULE_PENDING overflows"));
-    let words =
-        alloc_zeroed_slab::<core::sync::atomic::AtomicU64>(bytes, allocator, "RESCHEDULE_PENDING");
-    RESCHEDULE_PENDING.store(words, core::sync::atomic::Ordering::Release);
     BOOT_TRANSIENT_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
     init_per_cpu_storage(cpu_count, allocator);
 }
@@ -5264,8 +5197,10 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// The callers' drains wait for that; the prod itself only exits a `hlt` on an
 /// idle CPU. `sys_thread_set_affinity` also uses it as the wake-protocol prod
 /// of the destination CPU after `migrate_ready_thread` moved a `Ready` thread
-/// there (the move set that CPU's reschedule-pending flag; the prod wakes it
-/// from idle to dispatch the thread).
+/// there (the move linked the thread on that CPU's run queue; the prod wakes it
+/// from idle to dispatch the thread), and `sys_thread_set_priority` as the
+/// prod of the CPU on which `relocate_ready_priority` re-linked a `Ready`
+/// thread.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI
@@ -5293,8 +5228,7 @@ pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 /// critical section; both scheduler locks are acquired here in **ascending
 /// CPU-id order** (`core/kernel/docs/scheduling-internals.md` § Lock Hierarchy
 /// rule 4) to prevent ABBA deadlock against the load balancer or any
-/// other multi-lock holder. The destination's `set_reschedule_pending`
-/// is published before the unlocks. No IPI is sent: on a `true` return the
+/// other multi-lock holder. No IPI is sent: on a `true` return the
 /// caller prods `dst_cpu` (`prod_remote_cpu`) once it has released
 /// `sched_lock`.
 ///
@@ -5489,9 +5423,6 @@ unsafe fn relocate_ready_thread(
         linked_at == i16::from(priority),
         "relocate_ready_thread: queued_on != priority after enqueue",
     );
-    // Publish reschedule-pending before the caller's unlock so the dst CPU's
-    // idle loop / schedule() observes it via the Release on unlock.
-    set_reschedule_pending_for(dst_cpu);
     true
 }
 
@@ -6639,11 +6570,6 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         unsafe { (*tcb).preferred_cpu = target_cpu as u32 };
     }
 
-    // Release-ordered: the unlock publishes the enqueue + flag to any CPU
-    // observing the bit. See core/kernel/docs/scheduling-internals.md § Wake Protocol
-    // Invariants.
-    set_reschedule_pending_for(target_cpu);
-
     // Wake committed: Ready and enqueued. Clear the wake-in-flight gate so a
     // waiting dealloc_object(Thread) may proceed (it then observes the thread
     // via the run queue / current and applies its removal + context_saved gate).
@@ -6769,8 +6695,6 @@ pub unsafe fn enqueue_ready_thread(
         // SAFETY: both locks held; tcb valid.
         unsafe { (*tcb).preferred_cpu = target_cpu as u32 };
     }
-
-    set_reschedule_pending_for(target_cpu);
 
     // The commit found no wake owed under its locks, and a thread still Ready
     // at that start_seq has not run since: no waker can have claimed it.
@@ -7376,7 +7300,6 @@ pub unsafe fn schedule(requeue: Requeue)
                     // under its sched_lock, held here.
                     unsafe { (*current).preferred_cpu = aff };
                 }
-                set_reschedule_pending_for(aff as usize);
                 // SAFETY: paired with the lock_raw of aff's lock above.
                 unsafe { aff_sched.lock.unlock_raw(aff_saved) };
                 // SAFETY: aff < cpu_count (checked above).
@@ -7656,7 +7579,6 @@ pub unsafe fn schedule(requeue: Requeue)
             // SAFETY: paired with the lock_raw above; interrupts stay disabled.
             unsafe { sched.lock.release_lock_only() };
             let _ = relock;
-            set_reschedule_pending_for(cpu);
         }
         if dispatchable
         {

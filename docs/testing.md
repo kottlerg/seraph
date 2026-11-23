@@ -1306,13 +1306,13 @@ or body):
   `CoreSlot` (the per-CPU core key and index of the SMT topology), and `SyscallScratch` (the
   per-CPU syscall scratch buffer)
   (`git grep -n -E 'alloc_(zeroed|per_cpu)_slab::<|; MAX_CPUS\]' <head>` lists the arrays and
-  slabs, and also the slabs that are not per-CPU: the single-slot entropy pool, the tag pool, the
-  reschedule-pending CPU set, and the RAM-sized chunk tables of `frame_map::init` and
-  `init_cspace_registry`). A change that alters an element type's size is on the surface whether it
-  edits the type's own fields or a type or constant the element holds by value (for example
-  `RunQueue` and `NUM_RUN_QUEUES` inside `PerCpuScheduler`, or `Prng` inside `CpuRng`), and so is a
-  change to a constant that sizes a per-CPU allocation (`KERNEL_STACK_PAGES` for the idle stacks,
-  and `TAG_STATE_BYTES`, the tag-state slab's element size);
+  slabs, and also the slabs that are not per-CPU: the single-slot entropy pool, the tag pool, and
+  the RAM-sized chunk tables of `frame_map::init` and `init_cspace_registry`). A change that
+  alters an element type's size is on the surface whether it edits the type's own fields or a type
+  or constant the element holds by value (for example `RunQueue` and `NUM_RUN_QUEUES` inside
+  `PerCpuScheduler`, or `Prng` inside `CpuRng`), and so is a change to a constant that sizes a
+  per-CPU allocation (`KERNEL_STACK_PAGES` for the idle stacks, and `TAG_STATE_BYTES`, the tag-state
+  slab's element size);
 - CPU enumeration and bringup: in the bootloader, `parse_cpu_topology`, `parse_madt_topology`
   and the MADT walk behind it (`madt_topology`, `madt_cpu_ids`, and the per-CPU
   `record_cpu_id`), `place_cpu_ids`, `parse_cpu_count` and `place_hart_ids`, the sizing of the

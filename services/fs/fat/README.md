@@ -14,7 +14,7 @@ fat/
 │                               #   FAT entries, file positions, name encoding, LFN slots
 │                               #   and tails, node slab, cache bounds and victim pick,
 │                               #   session pool (records in client-paid pages),
-│                               #   session sweep schedule
+│                               #   session sweep schedule, a file write's sector runs
 ├── docs/
 │   ├── crash-safety.md         # Per-op write ordering and post-crash visible states
 │   └── storage-layout.md       # Allocator, directory mutation, page cache, NodeTable, eviction
@@ -88,7 +88,8 @@ carry no rights (a parent with none of the file rights) is refused with
 The driver's storage engine is a cluster allocator (`src/alloc.rs`), directory mutation
 (`src/dir.rs`), a write-through page cache whose slots take pages on demand and give idle ones
 back under memory pressure, up to 256 or 1/512 of RAM, whichever is more, and which fills a
-sequential scan's miss with a run of up to 16 pages in one block request (`src/cache.rs`), a
+sequential scan's miss with a run of up to 16 pages in one block request and writes a file's
+contiguous sectors a page at a time in one block request (`src/cache.rs`), a
 node table that dedupes by on-disk slot and recycles the nodes of removed or renamed entries
 (`src/backend.rs`), the sessions and the opens made in them, whose records live in pages charged
 to a node of their client (`src/file.rs`, `src/session.rs`), and a cooperative-release

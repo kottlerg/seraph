@@ -8,7 +8,8 @@
 //! served over the `BLK_GET_GEOMETRY`, `BLK_READ_INTO_MEMORY`, and
 //! `BLK_WRITE_FROM_MEMORY` requests fatfs issues, with block faults armed by
 //! sector and attempt, or every request failed at once ([`RamDisk::fail_all`]).
-//! The device keeps a log of the reads it served ([`RamDisk::take_reads`]).
+//! The device keeps a log of the reads and of the writes it served
+//! ([`RamDisk::take_reads`], [`RamDisk::take_writes`]).
 //!
 //! A request carries up to [`RUN_PAGES`] pages of Memory cap, the run fill
 //! fatfs issues for a sequential read, and the server maps and copies as many
@@ -122,6 +123,9 @@ pub struct RamDisk
     /// `(first sector, sectors)` of every read served since the last
     /// [`RamDisk::take_reads`].
     reads: Vec<(usize, usize)>,
+    /// `(first sector, sectors)` of every write served since the last
+    /// [`RamDisk::take_writes`].
+    writes: Vec<(usize, usize)>,
 }
 
 /// The disk the phase and the block server thread share.
@@ -168,6 +172,7 @@ impl RamDisk
             rules: Vec::new(),
             failing: false,
             reads: Vec::new(),
+            writes: Vec::new(),
         }))
     }
 
@@ -254,6 +259,14 @@ impl RamDisk
     pub fn take_reads(&mut self) -> Vec<(usize, usize)>
     {
         core::mem::take(&mut self.reads)
+    }
+
+    /// `(first sector, sectors)` of every write the device served, the
+    /// failed-after-landing ones included, since the last call, in order,
+    /// emptying the log.
+    pub fn take_writes(&mut self) -> Vec<(usize, usize)>
+    {
+        core::mem::take(&mut self.writes)
     }
 
     /// The fault that fires on a request starting at `lba`, counting the
@@ -448,9 +461,10 @@ fn transfer(
         let _ = unsafe { syscall::mem_unmap(aspace, va, pages as u64) };
         return map_refusal_label(e);
     }
-    if direction == Direction::Read
+    match direction
     {
-        disk.reads.push((lba, count));
+        Direction::Read => disk.reads.push((lba, count)),
+        Direction::Write => disk.writes.push((lba, count)),
     }
     for i in 0..count
     {

@@ -45,7 +45,7 @@
 //! never marking the cache under pressure. A run read the device refuses
 //! falls back to the single-page fill of the first page; one whose reply
 //! loses the run buffer's cap also ends run fills for the rest of the mount,
-//! and the scratch page that single-sector writebacks and reloads use is a
+//! and the scratch page that writebacks and single-sector reloads use is a
 //! separate buffer, so they go on.
 //!
 //! The cache grows on demand: a slot takes its page from memmgr
@@ -122,15 +122,17 @@ use syscall_abi::{MAP_WRITABLE, MSG_DATA_WORDS_MAX, PAGE_SIZE, SyscallError};
 pub use fat_parse::{QUARANTINE_MAX, SLOT_COUNT, slot_ceiling};
 use fat_parse::{RELEASE_KEEP, RUN_PAGES, VictimView};
 
-/// Process-static scratch page: the device side of single-sector writeback in
-/// [`PageCache::write_sector`] and of single-sector device reads in
+/// Process-static scratch page: the device side of writeback in
+/// [`PageCache::write_run`], a run of at most a page of sectors packed from
+/// offset 0, and of single-sector device reads in
 /// [`PageCache::reload_sector`].
 ///
 /// virtio-blk DMAs sector data starting at offset 0 of the supplied
-/// memory cap, so we cannot pass a cache page directly when only one of its
-/// sectors has been dirtied (the device would over-write the others on
-/// the disk side using whatever happened to be in the page). The page holds
-/// one sector per write or device read and is reused across calls;
+/// memory cap, so we cannot pass a cache page directly when only some of its
+/// sectors have been dirtied (the device would over-write the others on
+/// the disk side using whatever happened to be in the page), and a run that
+/// starts mid-page spans two cache pages. The page holds one run per write
+/// and one sector per device read, and is reused across calls;
 /// [`PageCache::init`] allocates it, and it is held for the process lifetime.
 /// A block call that loses its cap leaves no writeback or reload for the rest
 /// of the mount, so no read of file data uses it: run fills have a buffer of
@@ -150,7 +152,7 @@ static RUN_BUFFER: OnceLock<DeviceBuffer> = OnceLock::new();
 /// A device buffer's cap, the VA it is mapped at, and its length.
 ///
 /// Each buffer is used by one thread only: the dispatch thread calls
-/// [`PageCache::write_sector`], [`PageCache::reload_sector`] and
+/// [`PageCache::write_run`], [`PageCache::reload_sector`] and
 /// [`PageCache::acquire_page_run`], the users of the buffers and their caps,
 /// and the eviction worker touches the cache only through
 /// [`PageCache::release_slot`].
@@ -190,6 +192,35 @@ fn cache_cspace_funding(slots: usize) -> u64
 /// [`PAGE_SIZE`] as a `usize`, the length of one page copy.
 #[expect(clippy::cast_possible_truncation, reason = "PAGE_SIZE is 4096")]
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
+
+/// The most sectors one [`PageCache::write_run`] writes: a page of the
+/// smallest sector size a FAT volume has (512 bytes).
+const MAX_RUN_SECTORS: usize = PAGE_BYTES / 512;
+
+/// The cache pages a [`PageCache::write_run`] holds a reference on while it
+/// writes: `(page-base LBA, slot index)` of each of the first `len` entries.
+struct RunPages
+{
+    pages: [(u64, usize); 2],
+    len: usize,
+}
+
+impl RunPages
+{
+    fn held(&self) -> &[(u64, usize)]
+    {
+        self.pages.get(..self.len).unwrap_or_default()
+    }
+
+    /// Drop the reference on every page held.
+    fn release(&self, cache: &PageCache)
+    {
+        for &(_, idx) in self.held()
+        {
+            cache.release(idx);
+        }
+    }
+}
 
 /// [`RUN_PAGES`] as a `usize`, the length of a run fill's slot list.
 #[expect(clippy::cast_possible_truncation, reason = "RUN_PAGES is 16")]
@@ -385,8 +416,8 @@ impl PageCache
             pressure: AtomicBool::new(false),
         }));
 
-        // Allocate and map the scratch page used for single-sector writeback
-        // in `write_sector` and single-sector reads in `reload_sector`,
+        // Allocate and map the scratch page used for writeback in
+        // `write_run` and single-sector reads in `reload_sector`,
         // then the run buffer, which a refusal of
         // `RUN_PAGES` contiguous pages leaves out (no run fills). Lazy
         // fallback would need to re-do the request/reserve/map dance under an
@@ -663,26 +694,41 @@ impl PageCache
     }
 
     /// Write one sector, the first sector-size bytes of `data`, through the
-    /// cache (write-through).
+    /// cache: [`Self::write_run`] of that one sector.
     ///
-    /// Acquires the page covering `lba`, updates the affected sector in
-    /// place within the cached page (so any outstanding `FS_READ_MEMORY`
-    /// cap aliasing that page observes the new bytes immediately), then
-    /// copies the same sector into the scratch page and
-    /// issues one `BLK_WRITE_FROM_MEMORY` against the block device. When the
-    /// writeback fails, the cached sector is put back to its bytes before
-    /// the call once the reply arrives, so a later read of the cache sees
-    /// no write the device refused; the device may still have taken it,
-    /// which only [`Self::reload_sector`] can tell.
-    ///
-    /// Single-sector writeback only. Multi-sector cache pages cannot be
-    /// flushed as a unit because the unmodified neighbouring sectors
-    /// have no known-good source if the write fails mid-flight.
-    ///
-    /// Returns `false` when `data` is shorter than a sector, when no memory
-    /// holds the sector's prior bytes, on cache acquire failure, missing
-    /// scratch page (cache init never ran), or block-driver error.
+    /// Returns `false` when `data` is shorter than a sector, and as
+    /// [`Self::write_run`] does.
     pub fn write_sector(&self, lba: u64, block_dev: u64, data: &[u8], ipc_buf: *mut u64) -> bool
+    {
+        data.get(..self.sector_bytes())
+            .is_some_and(|sector| self.write_run(lba, block_dev, sector, ipc_buf))
+    }
+
+    /// Write a run of contiguous sectors from `lba` on, `data` holding their
+    /// bytes (whole sectors, at most a page), through the cache
+    /// (write-through), in one block request.
+    ///
+    /// Acquires the one or two cache pages the run covers (a run that starts
+    /// mid-page ends in the next one), saves the cached bytes of its sectors,
+    /// updates them in place within the cached pages (so any outstanding
+    /// `FS_READ_MEMORY` cap aliasing a page observes the new bytes
+    /// immediately), then copies the run packed into the scratch page and
+    /// issues one `BLK_WRITE_FROM_MEMORY` of its sectors against the block
+    /// device. When the write fails, every cached sector of the run is put
+    /// back to its bytes before the call once the reply arrives, so a later
+    /// read of the cache sees no write the device refused; the device may
+    /// still have taken some or all of the run, which only
+    /// [`Self::reload_sector`] can tell.
+    ///
+    /// The device is given the run's sectors only, from the scratch page,
+    /// never a cache page as a unit: a cached page's other sectors have no
+    /// known-good source if the write fails mid-flight.
+    ///
+    /// Returns `false` when `data` is empty, not whole sectors, or longer
+    /// than a page, when no memory holds the run's prior bytes, on cache
+    /// acquire failure, missing scratch page (cache init never ran), or
+    /// block-driver error.
+    pub fn write_run(&self, lba: u64, block_dev: u64, data: &[u8], ipc_buf: *mut u64) -> bool
     {
         let len = self.sector_bytes();
         let Some(scratch) = SCRATCH_MEMORY.get()
@@ -690,68 +736,134 @@ impl PageCache
         {
             return false;
         };
-        if data.len() < len
+        let Some(count) = data
+            .len()
+            .checked_div(len)
+            .filter(|&n| n > 0 && n <= MAX_RUN_SECTORS && data.len() <= PAGE_BYTES)
+            .filter(|&n| n.checked_mul(len) == Some(data.len()))
+        else
         {
             return false;
-        }
-        // The sector's bytes before the write, put back if the device
-        // refuses it.
+        };
+        // The run's bytes before the write, put back if the device refuses
+        // it.
         let mut previous = Vec::new();
-        if previous.try_reserve_exact(len).is_err()
+        if previous.try_reserve_exact(data.len()).is_err()
         {
             return false;
         }
-        previous.resize(len, 0);
-        let (page_base, sector_offset) = self.page_of(lba);
-        let Some(idx) = self.acquire_page(page_base, block_dev, ipc_buf)
+        previous.resize(data.len(), 0);
+        let Some(held) = self.acquire_run_pages(lba, count, block_dev, ipc_buf)
         else
         {
             return false;
         };
-        let Some(sector_va) = self.slot_va(idx, sector_offset)
+        let Some(vas) = self.run_sector_vas(&held, lba, count)
         else
         {
-            self.release(idx);
+            held.release(self);
             return false;
         };
+        let sectors = vas
+            .iter()
+            .zip(data.chunks_exact(len).zip(previous.chunks_exact_mut(len)));
 
         // Each copy below is a sector copy of `len` bytes (at most one page,
         // and the sector lies inside its cache page) between a page this
-        // process owns and a heap or caller buffer at least `len` long.
-        // SAFETY: refcount > 0 for the duration of the borrow, so the cache
-        // page stays mapped; `previous` is a heap buffer of `len` bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(sector_va as *const u8, previous.as_mut_ptr(), len);
+        // process owns and a heap or caller buffer chunk of `len` bytes.
+        for (&sector_va, (new, old)) in sectors
+        {
+            // SAFETY: a reference holds the slot for the duration of the
+            // borrow, so the cache page stays mapped; `old` is a heap chunk
+            // of `len` bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(sector_va as *const u8, old.as_mut_ptr(), len);
+            }
+            // SAFETY: as above, and the cache page is single-process owned and
+            // mapped writable; `new` is a chunk of `len` bytes of `data`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(new.as_ptr(), sector_va as *mut u8, len);
+            }
         }
-        // SAFETY: refcount > 0, and the cache page is single-process owned and
-        // mapped writable; `data` is at least `len` long (checked above).
+        // SAFETY: the scratch page's VA is process-static and mapped writable
+        // for one page; `data` is at most a page long (checked above).
         unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), sector_va as *mut u8, len);
-        }
-        // SAFETY: the scratch page's VA is process-static and mapped
-        // writable for one page; `data` is at least `len` long (checked
-        // above).
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.va as *mut u8, len);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.va as *mut u8, data.len());
         }
 
         let ok = transfer_via_block_dev(
             scratch,
             blk_labels::BLK_WRITE_FROM_MEMORY,
             lba,
-            1,
+            count as u64,
             block_dev,
             ipc_buf,
         );
         if !ok
         {
-            // SAFETY: as above; the slot is still referenced.
-            unsafe {
-                core::ptr::copy_nonoverlapping(previous.as_ptr(), sector_va as *mut u8, len);
+            for (&sector_va, old) in vas.iter().zip(previous.chunks_exact(len))
+            {
+                // SAFETY: as above; the slots are still referenced.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(old.as_ptr(), sector_va as *mut u8, len);
+                }
             }
         }
-        self.release(idx);
+        held.release(self);
         ok
+    }
+
+    /// Acquire the cache pages holding the `count` sectors from `lba` on, at
+    /// most a page of them, so at most two pages; `None`, with no reference
+    /// taken, when a page cannot be acquired or the run's end overflows.
+    fn acquire_run_pages(
+        &self,
+        lba: u64,
+        count: usize,
+        block_dev: u64,
+        ipc_buf: *mut u64,
+    ) -> Option<RunPages>
+    {
+        let last = u64::try_from(count)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|n| lba.checked_add(n))?;
+        let (first_base, _) = self.page_of(lba);
+        let (last_base, _) = self.page_of(last);
+        let first = self.acquire_page(first_base, block_dev, ipc_buf)?;
+        if last_base == first_base
+        {
+            return Some(RunPages {
+                pages: [(first_base, first); 2],
+                len: 1,
+            });
+        }
+        let Some(second) = self.acquire_page(last_base, block_dev, ipc_buf)
+        else
+        {
+            self.release(first);
+            return None;
+        };
+        Some(RunPages {
+            pages: [(first_base, first), (last_base, second)],
+            len: 2,
+        })
+    }
+
+    /// The VA of each of the `count` sectors from `lba` on in the pages
+    /// `held` holds; `None` when a sector lies in none of them, which
+    /// [`Self::acquire_run_pages`] rules out.
+    fn run_sector_vas(&self, held: &RunPages, lba: u64, count: usize) -> Option<Vec<u64>>
+    {
+        let mut vas = Vec::new();
+        vas.try_reserve_exact(count).ok()?;
+        for i in 0..count
+        {
+            let (base, offset) = self.page_of(lba.checked_add(u64::try_from(i).ok()?)?);
+            let &(_, idx) = held.held().iter().find(|&&(b, _)| b == base)?;
+            vas.push(self.slot_va(idx, offset)?);
+        }
+        Some(vas)
     }
 
     /// Read one sector from the block device into `buf`, bypassing
@@ -759,7 +871,7 @@ impl PageCache
     /// is cached.
     ///
     /// The device copy is the one a failed write leaves in doubt: after
-    /// [`Self::write_sector`] returns `false`, the cache holds the bytes
+    /// [`Self::write_run`] returns `false`, the cache holds the bytes
     /// before the write, and the device holds either those or the new ones.
     /// One `BLK_READ_INTO_MEMORY` of one sector lands in the scratch page and
     /// is copied out from there.

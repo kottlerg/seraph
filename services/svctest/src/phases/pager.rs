@@ -438,8 +438,9 @@ const DEMAND_CHUNK_PAGES: u64 = 16;
 
 /// Spawn `/programs/demandpaged bench`, which times the first touch of each
 /// chunk of a demand region and a grant-and-map of the same size and logs
-/// the result line of each (programs/demandpaged/README.md § Bench mode). No bound is asserted: the figures are the measure of a
-/// change to memmgr's work on a fault (services/memmgr/docs/memory-pool.md
+/// the result line of each (programs/demandpaged/README.md § Bench mode). No
+/// bound is asserted: the figures are the measure of a change to memmgr's
+/// work on a fault (services/memmgr/docs/memory-pool.md
 /// § Frame contents). The phase passes when the child exits cleanly and the
 /// RAM identity holds after memmgr reclaims what it was lent.
 fn demand_fault_cost_phase(_: &Caps)

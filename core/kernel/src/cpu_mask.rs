@@ -7,15 +7,13 @@
 //!
 //! [`AtomicCpuMask`] is a concurrently-updated set where one CPU sets or clears
 //! its own bit while another reads, copies, or iterates the whole set: the
-//! TLB-shootdown acknowledgement set, an address space's active-CPU set, and the
-//! reschedule-pending set.
+//! TLB-shootdown acknowledgement set and an address space's active-CPU set.
 //!
 //! Every mask holds [`mask_words`] 64-bit words, `cpu_count.div_ceil(64)`, fixed
 //! at Phase 4 ([`set_boot_cpu_count`]). A mask is a view over storage held with
-//! its object (an address space's wrapper page, a TLB request's slab slot, the
-//! scheduler's Phase 4 slab), so a boot pays only for the CPUs it has. No mask is
-//! held by value on a kernel stack: copies between sets are word by word
-//! ([`AtomicCpuMask::fill_from`]). `MAX_CPUS` bounds the CPU count but sizes no
+//! its object (an address space's wrapper page, a TLB request's slab slot), so a
+//! boot pays only for the CPUs it has. No mask is held by value on a kernel
+//! stack: copies between sets are word by word ([`AtomicCpuMask::fill_from`]). `MAX_CPUS` bounds the CPU count but sizes no
 //! mask. A hierarchical mask is not the design: it still fixes a maximum, and
 //! adds a level to every bit test on the shootdown and context-switch paths.
 
@@ -125,16 +123,6 @@ impl AtomicCpuMask
         Self { words, len }
     }
 
-    /// A view over the `len` words at `words`, keeping the set they hold.
-    ///
-    /// # Safety
-    /// `words` holds `len` initialised, 8-byte aligned atomic words that live
-    /// as long as the view is used and are only accessed through views.
-    pub unsafe fn from_words(words: *const AtomicU64, len: usize) -> Self
-    {
-        Self { words, len }
-    }
-
     /// The mask's words.
     #[inline]
     fn words(&self) -> &[AtomicU64]
@@ -174,14 +162,6 @@ impl AtomicCpuMask
     {
         let (word, b) = self.slot(cpu);
         word.fetch_and(!b, order);
-    }
-
-    /// Remove `cpu` from the set, returning whether it had been present.
-    #[inline]
-    pub fn take_cpu(&self, cpu: usize, order: Ordering) -> bool
-    {
-        let (word, b) = self.slot(cpu);
-        word.fetch_and(!b, order) & b != 0
     }
 
     /// Whether `cpu` is in the set.
@@ -380,7 +360,7 @@ mod tests
     // Defect caught: a bit lost or misplaced at a word edge, or the top CPU of
     // a boot unreachable.
     #[test]
-    fn every_cpu_of_a_boot_sets_tests_takes_and_clears_its_own_bit()
+    fn every_cpu_of_a_boot_sets_tests_and_clears_its_own_bit()
     {
         for cpus in WIDTHS
         {
@@ -390,10 +370,8 @@ mod tests
                 m.set_cpu(cpu, R);
                 assert!(m.test_cpu(cpu, R));
                 assert_eq!(m.iter(R).collect::<Vec<_>>(), [cpu]);
-                assert!(m.take_cpu(cpu, R));
-                assert!(!m.take_cpu(cpu, R));
-                m.set_cpu(cpu, R);
                 m.clear_cpu(cpu, R);
+                assert!(!m.test_cpu(cpu, R));
                 assert!(m.is_empty(R));
             }
         }

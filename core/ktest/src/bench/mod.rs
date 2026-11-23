@@ -99,7 +99,7 @@ impl Harness
         reason = "a method, so that a benchmark logs its SKIP line through the Harness it \
                   reports through"
     )]
-    pub(super) fn skip(&self, name: &str, reason: &str)
+    pub(super) fn skip(&self, name: &str, reason: impl core::fmt::Display)
     {
         crate::log_args(format_args!("ktest: bench {name} SKIP ({reason})"));
     }

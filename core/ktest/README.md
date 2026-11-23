@@ -453,7 +453,7 @@ three. When the harness thread does not move to CPU 0, the tier logs
 | Benchmark | What it measures |
 |---|---|
 | `null_syscall_roundtrip` | Kernel entry/exit baseline (`SYS_SYSTEM_INFO`) |
-| `ipc_round_trip` | Synchronous IPC call + reply, per-iteration |
+| `ipc_round_trip` | Synchronous IPC call + reply, one line per message size, variant `words=`: `0` (an empty message), `6` (the most the message registers carry) and `7` (one word more, which travels in the IPC buffer page), the request and the reply each carrying that many data words. A case that does not complete every round trip ends the benchmark, each later case logging a SKIP line |
 | `notification_roundtrip` | Notification ping-pong between two threads, per-iteration |
 | `cap_create_delete` | `cap_create_notification` + `cap_delete` cycle |
 | `cap_info_lookup` | `cap_info(CAP_INFO_TAG_RIGHTS)` on a held cap: one handle resolution and pin, against the `null_syscall_roundtrip` baseline |

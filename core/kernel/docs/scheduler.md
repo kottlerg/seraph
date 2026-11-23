@@ -575,7 +575,6 @@ pull_unpinned_ready(src, dst, rule):
         src.remove_from_queue(tcb, prio)       // decrements src's load counter
         dst.enqueue(tcb, prio)                 // increments dst's load counter
         tcb.preferred_cpu = dst
-        set_reschedule_pending_for(dst)
         moved = true
     unlock tcb.sched_lock; unlock both
     if moved: wake_idle_cpu(dst)               // always-IPI
@@ -762,9 +761,9 @@ Each CPU has one idle thread (priority 0) that runs when no other thread is read
 
 Each iteration of `idle_thread_entry` first drains this CPU's deferred-reclaim queue
 (`cap::object::drain_deferred_reclaim`) with interrupts enabled. It then masks interrupts
-and checks `take_reschedule_pending` and `has_runnable` together. If either is set, it
-re-enables interrupts and calls `schedule(Requeue::Always)` when the run queue has work, then loops.
-Otherwise it halts through the atomic enable-and-halt `arch::current::cpu::halt_until_interrupt`.
+and checks `has_runnable`. If the run queues hold work, it re-enables interrupts and calls
+`schedule(Requeue::Always)`, then loops. Otherwise it halts through the atomic enable-and-halt
+`arch::current::cpu::halt_until_interrupt`.
 Masking before the check means a wake IPI that lands between the check and the halt stays
 pending and ends the halt. The protocol is specified in
 [scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
@@ -826,16 +825,15 @@ Otherwise, by target state:
   then moves the TCB from the source CPU's run queue to the destination's; on a committed
   move the syscall sends a wakeup IPI to the destination once it has released
   `sched_lock`. A lost race leaves the thread where it is.
-- **Running** thread on a different CPU: the syscall sets the
-  **source** CPU's reschedule-pending flag and sends a wakeup IPI to the
-  **source** CPU (where the thread is currently running). The IPI itself
+- **Running** thread on a different CPU: the syscall sends a wakeup IPI to
+  the **source** CPU (where the thread is currently running). The IPI itself
   does not call `schedule()`; the running thread observes the new
   affinity at its next entry to `schedule()` — preempt-on-slice-expiry,
   a fair-dispatched thread's preemption for RT, voluntary yield, or IPC
   block. The re-enqueue site in `schedule()`
   checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU —
-  linking the thread directly on the destination's run queue, setting its
-  reschedule-pending flag, and IPIing it — instead of doing a local enqueue
+  linking the thread directly on the destination's run queue and IPIing
+  it — instead of doing a local enqueue
   (see [scheduling-internals.md](scheduling-internals.md) § ThreadState Transitions).
   Worst-case latency is therefore one time slice of the thread (its slice
   length × tick period: `TIME_SLICE_TICKS` for a thread dispatched at an

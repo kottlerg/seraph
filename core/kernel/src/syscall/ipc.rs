@@ -10,8 +10,11 @@
 //! calls the corresponding IPC kernel function, and enqueues/dequeues threads
 //! via the scheduler as needed.
 //!
-//! Data words (up to `MSG_DATA_WORDS_MAX`) are read from / written to the
-//! per-thread IPC buffer page registered via `SYS_IPC_BUFFER_SET`.
+//! Data words (up to `MSG_DATA_WORDS_MAX`) travel in the message registers
+//! MR0..MR5 of the sending and the receiving thread's own frames when a
+//! message has at most `MSG_REGS_DATA_MAX` of them, and are otherwise read
+//! from / written to the per-thread IPC buffer page registered via
+//! `SYS_IPC_BUFFER_SET` ([`read_data_words`], [`deliver_data_words`]).
 //!
 //! Capability transfer: up to `MSG_CAP_SLOTS_MAX` capabilities move with a
 //! message, all-or-nothing; a refused transfer does not block delivery (see
@@ -33,7 +36,7 @@ use crate::cap::slot::{CapTag, EpRights, EqRights, NtfRights, WsRights};
 #[cfg(not(test))]
 use crate::ipc::message::Message;
 #[cfg(not(test))]
-use syscall::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
+use syscall::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, MSG_REGS_DATA_MAX};
 
 // ── IPC buffer helpers ────────────────────────────────────────────────────────
 
@@ -125,6 +128,67 @@ unsafe fn write_ipc_buf(buf: u64, count: usize, src: &[u64; MSG_DATA_WORDS_MAX])
     }
 }
 
+/// Read a message's `count` data words into `dst`, by the transport the count
+/// selects (`syscall::MSG_REGS_DATA_MAX`): from the sender's message registers
+/// in `tf` when `count` is at most `MSG_REGS_DATA_MAX`, a read of the
+/// thread's own frame that cannot fault, and otherwise from its IPC buffer
+/// `buf`, whose data words a register message never touches.
+///
+/// # Errors
+/// `read_ipc_buf`'s, for a message the buffer carries.
+///
+/// # Safety
+/// `tf` must be the sending thread's own frame, and `buf` its IPC buffer VA
+/// or 0, as for [`read_ipc_buf`].
+#[cfg(not(test))]
+unsafe fn read_data_words(
+    tf: UserFrame,
+    buf: u64,
+    count: usize,
+    dst: &mut [u64; MSG_DATA_WORDS_MAX],
+) -> Result<(), SyscallError>
+{
+    if count <= MSG_REGS_DATA_MAX
+    {
+        let regs = tf.msg_regs();
+        for (word, &reg) in dst.iter_mut().zip(leading(&regs, count))
+        {
+            *word = reg;
+        }
+        return Ok(());
+    }
+    // SAFETY: buf is the sender's IPC buffer VA or 0 (caller contract).
+    unsafe { read_ipc_buf(buf, count, dst) }
+}
+
+/// Deliver a message's `count` data words to the receiving thread, by the
+/// transport the count selects: into its message registers in `tf` when
+/// `count` is at most `MSG_REGS_DATA_MAX`, leaving its IPC buffer's data
+/// words untouched, and otherwise into its IPC buffer `buf`, leaving its
+/// message registers as they were.
+///
+/// # Safety
+/// `tf` must be the receiving thread's own frame, running in its own address
+/// space, and `buf` its IPC buffer VA or 0, as for [`write_ipc_buf`].
+#[cfg(not(test))]
+unsafe fn deliver_data_words(
+    tf: UserFrame,
+    buf: u64,
+    count: usize,
+    data: &[u64; MSG_DATA_WORDS_MAX],
+)
+{
+    if count <= MSG_REGS_DATA_MAX
+    {
+        tf.set_msg_regs(leading(data, count));
+    }
+    else
+    {
+        // SAFETY: buf is the receiver's IPC buffer VA or 0 (caller contract).
+        unsafe { write_ipc_buf(buf, count, data) };
+    }
+}
+
 /// Read the `count` capability handles a sender placed in its IPC buffer's cap
 /// block (word [`syscall::MSG_CAP_HANDLES_WORD`] on, one full handle per word).
 ///
@@ -171,23 +235,21 @@ unsafe fn read_cap_handles(buf: u64, count: usize)
 /// ...
 /// ```
 ///
-/// Silently skips if `buf == 0`. Matches the layout read by `shared/ipc`
-/// `IpcMessage::from_ipc_buf`.
+/// Silently skips if `buf == 0`, and when no capability was delivered: the
+/// delivered count word in the return registers
+/// (`syscall::ipc_delivered_counts`) carries the capability count, so a
+/// receiver reads the block only when that count is non-zero, and a capless
+/// delivery touches no IPC buffer line. Matches the layout `shared/ipc` reads.
 ///
 /// # Safety
 /// `buf` must be a valid, mapped IPC buffer page VA, or 0.
 #[cfg(not(test))]
 unsafe fn write_cap_results(buf: u64, cap_count: usize, handles: &[u64; MSG_CAP_SLOTS_MAX])
 {
-    if buf == 0
+    if buf == 0 || cap_count == 0
     {
         return;
     }
-    // Always write the cap_count word, even when 0: stale values from a
-    // prior IPC round would otherwise be read by `IpcMessage::from_ipc_buf`,
-    // surface as this delivery's cap results to handlers that loop over
-    // `req.caps()`, and trip `shared/ipc`'s bootstrap `debug_assert_eq!`
-    // against the label-declared cap count.
     let handles = leading(handles.as_slice(), cap_count);
     // Assemble the result block [cap_count, handle0, handle1, ...] in a
     // kernel buffer, then copy it to the user IPC buffer at word offset
@@ -683,9 +745,16 @@ fn call_deadline(timeout_ms: u32) -> u64
 /// the Receive right on the endpoint is left
 /// (`ipc::endpoint::EndpointState::receivers`).
 ///
-/// Blocks caller until a server replies. On return, label and data words are
-/// in the return registers and IPC buffer. Reply-direction cap handles are
-/// written to the IPC buffer at word `MSG_DATA_WORDS_MAX` by the replier.
+/// The `data_count` data words are read from the caller's message registers
+/// MR0..MR5 when `data_count` is at most `MSG_REGS_DATA_MAX`, and from its
+/// IPC buffer otherwise ([`read_data_words`]).
+///
+/// Blocks caller until a server replies. On return, the label and the
+/// delivered count word (`syscall::ipc_delivered_counts`) are in the return
+/// registers, and the reply's data words in the message registers or the IPC
+/// buffer by its count ([`deliver_data_words`]). Reply-direction cap handles
+/// are written to the IPC buffer at word `MSG_DATA_WORDS_MAX` when a cap was
+/// delivered.
 #[cfg(not(test))]
 pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -738,8 +807,8 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
     {
         // SAFETY: tcb validated above; ipc_buffer is user-mapped or 0.
         let buf = unsafe { (*tcb).ipc_buffer };
-        // SAFETY: buf validated by read_ipc_buf.
-        unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }?;
+        // SAFETY: tf is this caller's own frame; buf is its IPC buffer VA or 0.
+        unsafe { read_data_words(tf, buf, data_count, &mut msg.data) }?;
     }
 
     // Populate cap_slots in the message (the caller's full cap handles, copied
@@ -832,10 +901,10 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb still valid after resume.
     unsafe { consume_call_disposition(tcb) }?;
 
-    // Write reply data and cap results to our IPC buffer. We are now running
-    // in the caller's address space, so the VA is valid. Data words and cap
-    // result handles were stored in ipc_msg by the replier (sys_ipc_reply +
-    // endpoint_reply).
+    // Deliver the reply's data words and cap results. We are now running in
+    // the caller's address space, so the IPC buffer VA is valid. Data words
+    // and cap result handles were stored in ipc_msg by the replier
+    // (sys_ipc_reply + endpoint_reply).
     // SAFETY: tcb still valid after resume; ipc_msg populated by replier.
     let reply_label = unsafe { (*tcb).ipc_msg.label };
     // SAFETY: tcb still valid; ipc_msg.data_count set by replier.
@@ -846,12 +915,14 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
 
     if reply_count > 0
     {
-        // SAFETY: tcb validated; data field populated by replier.
-        let data = unsafe { (*tcb).ipc_msg.data };
-        // SAFETY: reply_buf is user-mapped in our address space.
-        unsafe {
-            write_ipc_buf(reply_buf, reply_count, &data);
-        }
+        // SAFETY: tcb still valid; the replier populated the data field
+        // before the REPLY disposition consumed above, and no other thread
+        // writes ipc_msg until this one parks again, so the shared reference
+        // lives through no write.
+        let data = unsafe { &(*tcb).ipc_msg.data };
+        // SAFETY: tf is this thread's own frame and reply_buf its IPC buffer,
+        // in its own address space.
+        unsafe { deliver_data_words(tf, reply_buf, reply_count, data) };
     }
 
     // Write cap transfer results (destination cap handles) to IPC buffer.
@@ -864,7 +935,11 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
         write_cap_results(reply_buf, reply_cap_count, &reply_cap_handles);
     }
 
-    tf.set_ipc_call_return(0, reply_label, reply_count as u64);
+    tf.set_ipc_call_return(
+        0,
+        reply_label,
+        syscall::ipc_delivered_counts(reply_count as u64, reply_cap_count as u64),
+    );
     Ok(0) // primary return; set_ipc_call_return already wrote all three values
 }
 
@@ -968,10 +1043,12 @@ unsafe fn receive_on(
 /// Fails with `NoReceiver`, at once or when parked, once no capability with
 /// the Receive right on the endpoint is left (the caller's own was freed
 /// after its lookup).
-/// Blocks server until a caller sends. On return, the message label and data
-/// words are available in return registers and the server's IPC buffer.
-/// If the message carried capabilities, their delivered handles in the server's
-/// `CSpace` are written to the IPC buffer at word `MSG_DATA_WORDS_MAX`.
+/// Blocks server until a caller sends. On return, the message label, badge,
+/// and delivered count word (`syscall::ipc_delivered_counts`) are in the
+/// return registers, and the data words in the server's message registers or
+/// IPC buffer by their count ([`deliver_data_words`]). If the message carried
+/// capabilities, their delivered handles in the server's `CSpace` are written
+/// to the IPC buffer at word `MSG_DATA_WORDS_MAX`.
 #[cfg(not(test))]
 #[expect(
     clippy::large_stack_frames,
@@ -1082,12 +1159,8 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
             }
             .unwrap_or(0);
         }
-        // Always write cap_count to the receiver's IPC buffer — including
-        // the zero-cap case — so a prior IPC's cap metadata cannot be
-        // mis-read as if it belonged to this delivery. Userspace's
-        // `IpcMessage::from_ipc_buf` reads `cap_count` from a fixed buffer
-        // slot; without an unconditional write here, stale values trip
-        // handlers that loop over `req.caps()`.
+        // The transferred count goes to the return registers, so the result
+        // block is written only when a cap was delivered.
         // SAFETY: server_buf is user-mapped or 0.
         unsafe {
             write_cap_results(server_buf, transferred, &dst_handles);
@@ -1095,12 +1168,16 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
 
         if msg.data_count > 0
         {
-            // SAFETY: server_buf is user-mapped or 0.
-            unsafe {
-                write_ipc_buf(server_buf, msg.data_count, &msg.data);
-            }
+            // SAFETY: tf is this receiver's own frame and server_buf its IPC
+            // buffer, in its own address space.
+            unsafe { deliver_data_words(tf, server_buf, msg.data_count, &msg.data) };
         }
-        tf.set_ipc_recv_return(0, msg.label, msg.badge, msg.data_count as u64);
+        tf.set_ipc_recv_return(
+            0,
+            msg.label,
+            msg.badge,
+            syscall::ipc_delivered_counts(msg.data_count as u64, transferred as u64),
+        );
         return Ok(0);
     }
     // else: No caller; server is now Blocked on recv queue. Yield.
@@ -1147,9 +1224,8 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // own SYS_IPC_BUFFER_SET, so it cannot change during this syscall.
     let server_buf = unsafe { (*tcb).ipc_buffer };
 
-    // Always write the cap_count word (including the zero-cap case) so a prior
-    // IPC's cap metadata cannot be mis-read as this delivery's. cap_slots holds
-    // the destination handles written by the caller's transfer.
+    // cap_slots holds the destination handles written by the caller's
+    // transfer; the result block is written only when a cap was delivered.
     // SAFETY: server_buf is user-mapped or 0.
     unsafe {
         write_cap_results(server_buf, msg.cap_count, &msg.cap_slots);
@@ -1157,12 +1233,16 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
 
     if msg.data_count > 0
     {
-        // SAFETY: server_buf is user-mapped or 0.
-        unsafe {
-            write_ipc_buf(server_buf, msg.data_count, &msg.data);
-        }
+        // SAFETY: tf is this receiver's own frame and server_buf its IPC
+        // buffer, in its own address space.
+        unsafe { deliver_data_words(tf, server_buf, msg.data_count, &msg.data) };
     }
-    tf.set_ipc_recv_return(0, msg.label, msg.badge, msg.data_count as u64);
+    tf.set_ipc_recv_return(
+        0,
+        msg.label,
+        msg.badge,
+        syscall::ipc_delivered_counts(msg.data_count as u64, msg.cap_count as u64),
+    );
     Ok(0)
 }
 
@@ -1204,7 +1284,10 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 /// `SYS_IPC_REPLY` (1): reply to a blocked caller.
 ///
 /// arg0 = label, arg1 = `data_count`,
-/// arg2 = `cap_count` (0-4); the `cap_count` cap handles are read from the
+/// arg2 = `cap_count` (0-4); the data words are read from the server's
+/// message registers MR0..MR5 when `data_count` is at most
+/// `MSG_REGS_DATA_MAX` and from its IPC buffer otherwise
+/// ([`read_data_words`]), and the `cap_count` cap handles from the
 /// server's IPC buffer at word `MSG_CAP_HANDLES_WORD`.
 ///
 /// Capabilities move from the server's `CSpace` to the caller's `CSpace`
@@ -1261,8 +1344,8 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
         // it). A payload or cap check that fails still reports its own error
         // (the documented precedence); otherwise the missing reply capability.
         let mut scratch = Message::new(label);
-        // SAFETY: tcb is the calling thread's valid TCB.
-        unsafe { stage_reply_payload(tcb, data_count, cap_count, &mut scratch) }?;
+        // SAFETY: tcb is the calling thread's valid TCB and tf its frame.
+        unsafe { stage_reply_payload(tf, tcb, data_count, cap_count, &mut scratch) }?;
         return Err(SyscallError::InvalidCapability);
     };
 
@@ -1272,7 +1355,7 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     {
         // SAFETY: tcb is the calling thread's valid TCB; caller is the
         // fault-blocked thread whose reply claim it won; no lock is held.
-        return unsafe { reply_to_fault(tcb, caller, label, data_count, cap_count) };
+        return unsafe { reply_to_fault(tf, tcb, caller, label, data_count, cap_count) };
     }
 
     // A SYS_IPC_CALL caller: read the data words and pre-validate the reply
@@ -1282,9 +1365,9 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     // The synthetic transfer-failed reply goes to the caller and the error to
     // the server.
     let mut msg = Message::new(label);
-    // SAFETY: tcb is the calling thread's valid TCB.
+    // SAFETY: tcb is the calling thread's valid TCB and tf its frame.
     let staged =
-        unsafe { stage_reply_payload(tcb, data_count, cap_count, &mut msg) }.and_then(|()| {
+        unsafe { stage_reply_payload(tf, tcb, data_count, cap_count, &mut msg) }.and_then(|()| {
             if cap_count == 0
             {
                 return Ok(());
@@ -1361,9 +1444,9 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
         };
     }
 
-    // Stage the reply: label and data words for the caller's return
-    // registers and its own IPC buffer write on resume (sys_ipc_call), cap
-    // results for its cap-handle write.
+    // Stage the reply: label and data words for the caller's return and
+    // message registers or its own IPC buffer write on resume (sys_ipc_call),
+    // cap results for its cap-handle write.
     msg.cap_slots = dst_handles;
     msg.cap_count = transferred;
     // Deposit complete: stamp REPLY and wake. Claim = the reply_tcb CAS won
@@ -1415,11 +1498,12 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
 /// with the unhandled outcome first.
 ///
 /// # Safety
-/// `server` must be the calling thread's valid TCB, in syscall context with
-/// no lock held; `caller` is the fault-blocked thread whose reply claim
-/// `server` won inside `endpoint_reply`, pinned by that claim.
+/// `server` must be the calling thread's valid TCB and `tf` its frame, in
+/// syscall context with no lock held; `caller` is the fault-blocked thread
+/// whose reply claim it won inside `endpoint_reply`, pinned by that claim.
 #[cfg(not(test))]
 unsafe fn reply_to_fault(
+    tf: UserFrame,
     server: *mut crate::sched::thread::ThreadControlBlock,
     caller: *mut crate::sched::thread::ThreadControlBlock,
     label: u64,
@@ -1431,7 +1515,7 @@ unsafe fn reply_to_fault(
     let outcome = if label == syscall::FAULT_REPLY_REDIRECT
     {
         // SAFETY: the contract above, which is stage_redirect's.
-        match unsafe { stage_redirect(server, caller, data_count, cap_count) }
+        match unsafe { stage_redirect(tf, server, caller, data_count, cap_count) }
         {
             Ok(()) => crate::ipc::fault::FAULT_OUTCOME_REDIRECTED,
             Err(e) =>
@@ -1444,7 +1528,7 @@ unsafe fn reply_to_fault(
     else if label == syscall::FAULT_REPLY_KILL || label == syscall::FAULT_REPLY_FORWARD
     {
         // SAFETY: the contract above.
-        unsafe { deposit_reply_word(server, caller, label, 0, data_count) };
+        unsafe { deposit_reply_word(tf, server, caller, label, 0, data_count) };
         // SAFETY: caller pinned by the won claim; fault_delivery_class was
         // written under its sched_lock when its delivery opened, before the
         // message this reply answers was sent.
@@ -1479,16 +1563,20 @@ unsafe fn reply_to_fault(
     result
 }
 
-/// Deposit a fault reply's `label` and its data word 0, when sent and
-/// readable from `server`'s IPC buffer, in `caller`'s `ipc_msg`, with `badge`:
-/// the decline reason of a KILL or FORWARD reply, the word of a REDIRECT.
-/// Written in place, so no staged `Message` adds to the reply path's frame.
+/// Deposit a fault reply's `label` and its data word 0, when sent (from
+/// `server`'s MR0 when `data_count` is at most `MSG_REGS_DATA_MAX`, from its
+/// IPC buffer, when readable, otherwise), in `caller`'s `ipc_msg`, with
+/// `badge`: the decline reason of a KILL or FORWARD reply, the word of a
+/// REDIRECT. Written in place, so no staged `Message` adds to the reply
+/// path's frame.
 ///
 /// # Safety
-/// `server` must be the calling thread's valid TCB; `caller` is pinned by
-/// `server`'s won reply claim, which owns its `ipc_msg` until the wake.
+/// `server` must be the calling thread's valid TCB and `tf` its frame;
+/// `caller` is pinned by `server`'s won reply claim, which owns its `ipc_msg`
+/// until the wake.
 #[cfg(not(test))]
 unsafe fn deposit_reply_word(
+    tf: UserFrame,
     server: *mut crate::sched::thread::ThreadControlBlock,
     caller: *mut crate::sched::thread::ThreadControlBlock,
     label: u64,
@@ -1506,29 +1594,43 @@ unsafe fn deposit_reply_word(
     deposit.badge = badge;
     deposit.cap_count = 0;
     deposit.data_count = 0;
+    if data_count == 0
+    {
+        return;
+    }
+    if data_count <= MSG_REGS_DATA_MAX
+    {
+        let [mr0, ..] = tf.msg_regs();
+        let [word0, ..] = &mut deposit.data;
+        *word0 = mr0;
+        deposit.data_count = 1;
+        return;
+    }
     // SAFETY: buf is a user IPC buffer VA or 0, read through copy_from_user
     // (read_ipc_buf's contract).
-    if data_count > 0 && unsafe { read_ipc_buf(buf, 1, &mut deposit.data) }.is_ok()
+    if unsafe { read_ipc_buf(buf, 1, &mut deposit.data) }.is_ok()
     {
         deposit.data_count = 1;
     }
 }
 
-/// Read a reply's data words and its `cap_count` capability handles from the
-/// server's IPC buffer into `msg`, and pre-validate the capability slots in
-/// the server's own `CSpace`.
+/// Read a reply's data words (from the server's message registers or its IPC
+/// buffer, by their count: [`read_data_words`]) and its `cap_count`
+/// capability handles (from its IPC buffer) into `msg`, and pre-validate the
+/// capability slots in the server's own `CSpace`.
 ///
 /// # Errors
-/// `read_ipc_buf`'s errors for the data words, `read_cap_handles`' for the
+/// `read_data_words`' errors for the data words, `read_cap_handles`' for the
 /// handles (`InvalidArgument` with no IPC buffer registered, `InvalidAddress`
 /// when it is unmapped), and `prevalidate_sender_caps`' for the capability
 /// slots: `prevalidate_transfer_slots`' errors, or `QuotaExceeded` when a
 /// cap's object is at the reference ceiling.
 ///
 /// # Safety
-/// `server` must be the calling thread's valid TCB.
+/// `server` must be the calling thread's valid TCB and `tf` its frame.
 #[cfg(not(test))]
 unsafe fn stage_reply_payload(
+    tf: UserFrame,
     server: *mut crate::sched::thread::ThreadControlBlock,
     data_count: usize,
     cap_count: usize,
@@ -1541,8 +1643,8 @@ unsafe fn stage_reply_payload(
     msg.data_count = data_count;
     if data_count > 0
     {
-        // SAFETY: buf validated by read_ipc_buf.
-        unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }?;
+        // SAFETY: tf is the server's own frame; buf is its IPC buffer VA or 0.
+        unsafe { read_data_words(tf, buf, data_count, &mut msg.data) }?;
     }
     if cap_count > 0
     {
@@ -1577,11 +1679,12 @@ unsafe fn stage_reply_payload(
 /// Nothing is deposited on an error.
 ///
 /// # Safety
-/// `server` must be the calling thread's valid TCB, in syscall context with
-/// no lock held; `caller` is pinned by `server`'s won reply claim, which owns
-/// its `ipc_msg` and `fault_redirect` until the wake.
+/// `server` must be the calling thread's valid TCB and `tf` its frame, in
+/// syscall context with no lock held; `caller` is pinned by `server`'s won
+/// reply claim, which owns its `ipc_msg` and `fault_redirect` until the wake.
 #[cfg(not(test))]
 unsafe fn stage_redirect(
+    tf: UserFrame,
     server: *mut crate::sched::thread::ThreadControlBlock,
     caller: *mut crate::sched::thread::ThreadControlBlock,
     data_count: usize,
@@ -1615,6 +1718,7 @@ unsafe fn stage_redirect(
     // SAFETY: server and caller as this fn's contract states.
     unsafe {
         deposit_reply_word(
+            tf,
             server,
             caller,
             syscall::FAULT_REPLY_REDIRECT,

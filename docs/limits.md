@@ -147,7 +147,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | TLB-shootdown acknowledgement sets (`TLB_PENDING_CPUS`) | `core/kernel/src/mm/tlb_shootdown.rs` | one CPU set per request, `cpu_count` sets | derived from `cpu_count` | `cpu_count` x `cpu_count.div_ceil(64)` x 8 B: 2 KiB (one page) at 128 CPUs, 72 KiB at 768, 8 MiB at the 8192 ceiling | correct as is | Already pay-as-you-go; quadratic in the CPU count, as one initiator set per CPU is |
 | `service_shootdowns` acknowledgement batch (`ACK_BATCH`) | `core/kernel/src/mm/tlb_shootdown.rs` | 64 serviced slots per batch | static-footprint budget (a stack array on the IPI handler) | 256 B kernel stack | correct as is | None; a pass with more serviced slots acknowledges in batches |
 | `RANGE_FLUSH_CEILING_PAGES` | `core/kernel/src/mm/tlb_shootdown.rs` | 32 | tuning threshold (bounds no capacity) | none | correct as is | None |
-| CPU set width (`mask_words`, `AtomicCpuMask`) | `core/kernel/src/cpu_mask.rs` | `cpu_count.div_ceil(64)` words, set at Phase 4 | derived from `cpu_count` | 8 B per 64 CPUs, held with each set's object (an address space's wrapper page, a TLB request's slot, the reschedule-pending slab) | correct as is | None; no CPU set is held by value on a kernel stack |
+| CPU set width (`mask_words`, `AtomicCpuMask`) | `core/kernel/src/cpu_mask.rs` | `cpu_count.div_ceil(64)` words, set at Phase 4 | derived from `cpu_count` | 8 B per 64 CPUs, held with each set's object (an address space's wrapper page, a TLB request's slot) | correct as is | None; no CPU set is held by value on a kernel stack |
 | `AddressSpace.death_observers` | `core/kernel/src/mm/address_space.rs` | unbounded chain of queue-funded nodes | none (each node is funded by the observing queue) | 8 B per `AddressSpace` | correct as is | None |
 | `DEFAULT_INIT_INFO_VA`, `DEFAULT_INIT_STACK_TOP` | `core/kernel/src/mm/address_space.rs` | fixed VAs under the Sv39 user top | encoding artefact (fallback layout) | none | correct as is | Not a count |
 | `INIT_MAX_SEGMENTS` RELRO split | `core/kernel/src/mm/init_reloc.rs` | 8 | ABI width (boot protocol) | none | correct as is | A split past 8 is a clean error |
@@ -353,6 +353,8 @@ and the generation) was decided on [#637](https://github.com/kottlerg/seraph/iss
 | `CSPACE_BODIES_PER_PAGE` | `abi/syscall/src/lib.rs` | 31 | encoding artefact (the kernel arena's `CHUNKS_PER_PAGE` less the header chunk, asserted equal) | none | correct as is | None |
 | `IOPORT_BINDING_TABLE_PAGES` | `abi/syscall/src/lib.rs` | 3 | hardware spec (the 8 KiB x86 IOPB plus the record page; the kernel asserts its `TABLE_PAGES` does not exceed it) | none | correct as is | None |
 | `MSG_DATA_WORDS_MAX` | `abi/syscall/src/lib.rs` | 64 | ABI width (IPC buffer layout) | about 550 B per TCB | correct as is | Bulk data moves through Memory caps (#36, #40) |
+| `MSG_REGS_DATA_MAX` | `abi/syscall/src/lib.rs` | 6 | ABI width (the message registers MR0..MR5, six on each architecture) | none (the saved trap-frame registers) | correct as is | None: a longer message travels in the IPC buffer page |
+| Delivered count fields (`ipc_delivered_counts`) | `abi/syscall/src/lib.rs` | 8 bits each, data count and cap count | encoding artefact (`MSG_DATA_WORDS_MAX` and `MSG_CAP_SLOTS_MAX` fit, asserted) | none | correct as is | Keep the assert |
 | IPC buffer layout | `abi/syscall/src/lib.rs` | data words 0..64, delivered cap count at 64, sent and delivered handles 65..69, in one page | ABI width | 4 KiB per thread | correct as is | None |
 | `CAP_INDEX_BITS + CAP_GEN_BITS == 63` assert | `abi/syscall/src/lib.rs` | compile time | ABI width (bit 63 of a handle stays clear) | none | correct as is | Keep |
 | `EVENT_QUEUE_MAX_CAPACITY` | `abi/syscall/src/lib.rs` | 2^20 entries and observer nodes | per-call bound (one create zeroes the ring and links the nodes in the kernel; the queue is caller-funded) | none | correct as is | More is had with more queues |
@@ -510,7 +512,7 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | `LOG_BADGE_FIRST_CHILD` | `shared/ipc/src/log_badges.rs` | 16 | encoding artefact (reserved specials) | none | correct as is | None |
 | `IpcMessage.data`, `cap_slots` | `shared/ipc/src/lib.rs` | `MSG_DATA_WORDS_MAX`, `MSG_CAP_SLOTS_MAX` | ABI width | about 552 B per message on the stack | correct as is | None |
 | `IpcMessage.data_len`, `cap_count` | `shared/ipc/src/lib.rs` | `u8` | provably unreachable (at most 64 and 4) | 2 B | correct as is | Pin both against `u8::MAX` with a const assert |
-| `from_ipc_buf` layout bound | `shared/ipc/src/lib.rs` | 69 words of 512 | ABI width | none | correct as is | Turn the comment into a const assert |
+| `from_delivery` layout bound | `shared/ipc/src/lib.rs` | 69 words of 512 | ABI width | none | correct as is | Turn the comment into a const assert |
 | bootstrap reply-label fields | `shared/ipc/src/bootstrap.rs` | 8-bit base, caps, words | encoding artefact | none | correct as is | Pin against the ABI maxima |
 | `BootstrapRound.caps`, `data` | `shared/ipc/src/bootstrap.rs` | `[u64; 4]`, `[u64; 64]` | ABI width | about 570 B stack | correct as is | None |
 | `PackedSlots.presence` | `shared/ipc/src/bootstrap.rs` | `u64` mask | ABI width (`MSG_CAP_SLOTS_MAX <= 64`) | none | correct as is | Pin with a const assert |

@@ -172,22 +172,49 @@ impl TrapFrame
     }
 
     /// Write `SYS_IPC_CALL` return values: primary in rax, reply label in
-    /// rdx, reply data-word count in r9. Matches `shared/syscall::syscall6_ret3`.
-    pub fn set_ipc_call_return(&mut self, primary: u64, reply_label: u64, reply_word_count: u64)
+    /// rdx, the reply's delivered count word (`syscall::ipc_delivered_counts`)
+    /// in r10. Matches `shared/syscall`'s `syscall_ipc_call`.
+    pub fn set_ipc_call_return(&mut self, primary: u64, reply_label: u64, counts: u64)
     {
         self.rax = primary;
         self.rdx = reply_label;
-        self.r9 = reply_word_count;
+        self.r10 = counts;
     }
 
     /// Write `SYS_IPC_RECV` return values: primary in rax, label in rdx,
-    /// badge in rsi, data-word count in r8. Matches `shared/syscall::syscall2_ret4`.
-    pub fn set_ipc_recv_return(&mut self, primary: u64, label: u64, badge: u64, word_count: u64)
+    /// badge in rsi, the delivered count word (`syscall::ipc_delivered_counts`)
+    /// in r10. Matches `shared/syscall`'s `syscall_ipc_recv`.
+    pub fn set_ipc_recv_return(&mut self, primary: u64, label: u64, badge: u64, counts: u64)
     {
         self.rax = primary;
         self.rdx = label;
         self.rsi = badge;
-        self.r8 = word_count;
+        self.r10 = counts;
+    }
+
+    /// The message registers MR0..MR5 (r8, r9, r12, r13, r14, r15): the data
+    /// words of a message of at most `syscall::MSG_REGS_DATA_MAX` words.
+    pub fn msg_regs(&self) -> [u64; syscall::MSG_REGS_DATA_MAX]
+    {
+        [self.r8, self.r9, self.r12, self.r13, self.r14, self.r15]
+    }
+
+    /// Write `words` to the message registers from MR0 on; a word past MR5 is
+    /// dropped, and a register past the last word keeps its value.
+    pub fn set_msg_regs(&mut self, words: &[u64])
+    {
+        let regs = [
+            &mut self.r8,
+            &mut self.r9,
+            &mut self.r12,
+            &mut self.r13,
+            &mut self.r14,
+            &mut self.r15,
+        ];
+        for (reg, &word) in regs.into_iter().zip(words)
+        {
+            *reg = word;
+        }
     }
 
     /// Initialise the frame for first entry to user mode.

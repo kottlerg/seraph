@@ -223,9 +223,10 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  71  SYS_ASPACE_HOLD
                                  72  SYS_ASPACE_RELEASE
                                  73  SYS_ENDPOINT_IDENTIFY
+                                 74  SYS_CAP_BIND_SOLE_REFERENCE
 ```
 
-**Implementation status.** Every number 0–73 has a handler; unallocated numbers
+**Implementation status.** Every number 0–74 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -300,7 +301,7 @@ pub enum SyscallError
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full, or the object a new capability or a retype would
-    /// reference already holds 2^31 references). Unlike `OutOfMemory`,
+    /// reference already holds 2^30 references). Unlike `OutOfMemory`,
     /// donating memory (augment mode) cannot satisfy the request.
     QuotaExceeded = -17,
     /// No capability with the Receive right on the endpoint is left, so no
@@ -370,7 +371,7 @@ when the message carries capabilities.
 or `cap_count` above its maximum is clamped, not refused),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
 slot is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
-transfer), `QuotaExceeded` (a cap's object has its reference count at its 2^31 ceiling),
+transfer), `QuotaExceeded` (a cap's object has its reference count at its 2^30 ceiling),
 `NoReceiver` (no capability with the Receive right on the endpoint exists when the call
 begins, or the last one goes while the call is queued and not yet received),
 `Interrupted` (the call was cancelled while blocked, including by the receiving thread
@@ -435,7 +436,7 @@ stale), `InvalidArgument` (a cap slot repeated in one reply, or
 pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer),
 `QuotaExceeded` (caller's CSpace
 directory structurally full for reply cap transfer, or a transferred cap's object has its
-reference count at its 2^31 ceiling), `OutOfMemory`
+reference count at its 2^30 ceiling), `OutOfMemory`
 (slot-page pool exhausted); a `data_count` or `cap_count` above its maximum is clamped, not
 refused, and the call never blocks, so it never returns `Interrupted`. Every payload or cap
 failure while
@@ -520,7 +521,7 @@ receive was parked, in any timeout mode), `Interrupted`, `WouldBlock` (a try-onc
 caller, or a bounded wait elapsed). If an
 already-queued sender's cap transfer is refused (a source slot went stale
 or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer, a
-cap's object has its reference count at its 2^31 ceiling, or the server's CSpace cannot supply the
+cap's object has its reference count at its 2^30 ceiling, or the server's CSpace cannot supply the
 destination slots, which the pre-park grow makes unlikely but does not reserve), the message is
 still delivered — with zero caps; the sender keeps its
 capabilities (see [ipc-design.md](../../../docs/ipc-design.md) § Message Format and
@@ -714,7 +715,7 @@ Send + Receive + Grant + Identify rights.
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
 (caller's CSpace directory structurally full, or the Memory object's reference count is at
-its 2^31 ceiling).
+its 2^30 ceiling).
 
 ---
 
@@ -736,14 +737,14 @@ Notify + Wait rights.
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
 (caller's CSpace directory structurally full, or the Memory object's reference count is at
-its 2^31 ceiling).
+its 2^30 ceiling).
 
 ---
 
 ### `SYS_CAP_CREATE_EVENT_Q` (9)
 
 Retype a Memory capability into a new event queue with a fixed capacity and a fixed pool of
-death-observer nodes.
+observer nodes.
 
 **Arguments:**
 
@@ -751,12 +752,12 @@ death-observer nodes.
 |---|---|---|
 | 0 | `memory_cap` | Memory capability (Retype rights) the event queue is carved from |
 | 1 | `capacity` | Ring buffer capacity in entries (1–EVENT_QUEUE_MAX_CAPACITY) |
-| 2 | `observers` | Death-observer nodes in the queue's pool (0–EVENT_QUEUE_MAX_CAPACITY) |
+| 2 | `observers` | Observer nodes in the queue's pool (0–EVENT_QUEUE_MAX_CAPACITY) |
 
 The retype debit is `event_queue_retype_bytes(capacity, observers)`: the ring, and one node per
-observer, live inline in the queue's retype slot. Each `SYS_THREAD_BIND_NOTIFICATION` or
-`SYS_ASPACE_BIND_NOTIFICATION` onto the queue holds one node while its binding lives; a queue that
-receives no death posts takes `observers = 0`.
+observer, live inline in the queue's retype slot. Each `SYS_THREAD_BIND_NOTIFICATION`,
+`SYS_ASPACE_BIND_NOTIFICATION` or `SYS_CAP_BIND_SOLE_REFERENCE` onto the queue holds one node
+while its binding lives; a queue that receives no observer posts takes `observers = 0`.
 
 **Return:** `rax`/`a0`: new capability descriptor (Post + Recv rights) on success;
 `SyscallError` on failure.
@@ -767,7 +768,7 @@ receives no death posts takes `observers = 0`.
 `EVENT_QUEUE_MAX_CAPACITY`, or `observers` exceeds it), `InvalidCapability`,
 `InsufficientRights` (source Memory cap lacks Retype), `OutOfMemory` (Memory cap region
 or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full,
-or the Memory object's reference count is at its 2^31 ceiling).
+or the Memory object's reference count is at its 2^30 ceiling).
 
 ---
 
@@ -809,7 +810,7 @@ respectively, or `priority` is outside `sched_cap`'s band), `InvalidArgument` (n
 (Memory cap region or slot-page pool exhausted, or the kernel's guard-table reserve, which its
 sizing makes unreachable; [memory-internals.md](memory-internals.md) § Kernel Stack Guards),
 `QuotaExceeded` (caller's CSpace
-directory structurally full, or the Memory object's reference count is at its 2^31 ceiling).
+directory structurally full, or the Memory object's reference count is at its 2^30 ceiling).
 
 ---
 
@@ -855,7 +856,7 @@ the pool, so a one-page donation can leave the budget unchanged. Read the budget
 `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype, or augment
 target lacks Map), `OutOfMemory` (Memory cap region or slot-page pool exhausted),
 `QuotaExceeded` (caller's CSpace directory structurally full, or the Memory object's reference
-count is at its 2^31 ceiling).
+count is at its 2^30 ceiling).
 
 ---
 
@@ -890,7 +891,7 @@ in create-mode, every id of the kernel's `CSpace` registry live, which the regis
 one id per DRAM page puts past the memory that pays for the `CSpace`s; see
 [capability-internals.md](capability-internals.md) § CSpace Registry),
 `QuotaExceeded` (caller's CSpace directory structurally full, or the Memory object's reference
-count is at its 2^31 ceiling).
+count is at its 2^30 ceiling).
 
 ---
 
@@ -917,7 +918,7 @@ inline in the set's retype slot. `SYS_WAIT_SET_ADD` past `capacity` members is r
 `WAIT_SET_MAX_MEMBERS`), `InvalidCapability`, `InsufficientRights` (source Memory cap lacks
 Retype), `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
 (caller's CSpace directory structurally full, or the Memory object's reference count is at
-its 2^31 ceiling).
+its 2^30 ceiling).
 
 ---
 
@@ -957,7 +958,7 @@ on the source), `OutOfMemory` (slot-page pool exhausted, or, for an `Mmio`, `IoP
 [capability-internals.md](capability-internals.md) § Body Arena), `QuotaExceeded` (caller's CSpace
 directory structurally full; for an `Mmio`, `IoPort`, or `Interrupt` source, its range already has
 `RANGE_COPY_LIMIT` (2^31 - 1) live copies; for any other source, the object's reference count is
-at its 2^31 ceiling).
+at its 2^30 ceiling).
 
 If the source capability has a non-zero badge, the derived capability inherits it.
 
@@ -1061,6 +1062,54 @@ slot, and returns no badge, rights word, or kernel address (see
 
 **Errors:** `InvalidCapability` (`key` null, stale, empty, or not an Endpoint capability; `cap`
 null, stale, or empty), `InsufficientRights` (`key` lacks Identify).
+
+---
+
+### `SYS_CAP_BIND_SOLE_REFERENCE` (74)
+
+Bind an observer to the object a capability names. The kernel posts the two-word entry
+`(0, correlator)` to the bound event queue once: the first time it finds the object at exactly
+one reference after the bind, or at the object's death.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `cap` | Capability of any type, naming the observed object |
+| 1 | `eventq_cap` | Event queue capability (Post rights) the post goes to |
+| 2 | `correlator` | Caller-chosen `u64` routing tag, delivered unchanged as the tag word |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+**What counts:** a reference is what `CAP_INFO_SOLE_REFERENCE` counts (§ `SYS_CAP_INFO` (36)):
+every slot naming the object in every `CSpace`, and every kernel-internal reference to it. The
+binding binds the object, not the slot, and takes no reference on it. The call's own pin on the
+object counts until it returns: when the slot `cap` names is the only other reference, the pin's
+release is the fall to one, and the post comes at the call's return.
+
+**When it posts:** a release that leaves one reference marks the object for the kernel's drain,
+which runs at the end of every syscall and in the idle loop, after the deferred reclaim; the post
+is made when the drain finds the object still at one reference. A count that falls to one and rises
+again before the drain looks is found at its next fall to one or at the object's death, which posts
+every binding the object still has. The binding posts once and then ends. No post is made while a
+copy of the capability is in an IPC transfer: a queued message holds a slot handle, not a
+reference, and the move at rendezvous takes the destination's reference before it frees the source
+([capability-internals.md](capability-internals.md#sole-reference-observers) § Sole-Reference
+Observers). A post says the object held one reference at some instant; the remaining reference may
+be the binder's slot or any other holder's, so a binder makes `correlator` name its slot and a
+generation, and drops a post for a slot it has since reused.
+
+**Lifetime and nodes:** each binding holds one observer node of `eventq_cap`'s pool
+(§ `SYS_CAP_CREATE_EVENT_Q` (9), argument 2) and a reference on the event queue object until it
+posts, so deleting every capability to the queue leaves it live for the post, and the queue is
+freed after it. Several bindings on one object each post once.
+
+**Capability requirements:** `eventq_cap` (Post); `cap` needs none.
+
+**Errors:** `InvalidCapability` (`cap` null, stale, or empty; `eventq_cap` null, stale, empty,
+or not an event queue capability), `InsufficientRights` (`eventq_cap` lacks Post), `OutOfMemory`
+(the event queue has no free observer node), `QuotaExceeded` (the event queue's reference count
+is at its 2^30 ceiling).
 
 ---
 
@@ -1531,7 +1580,8 @@ object is freed); a retry at the same `virt` reuses the record.
 range leaves the user half), `InvalidCapability`, `InsufficientRights` (a cap lacks Map),
 `InvalidArgument` (MMIO region size zero or not page-aligned, or size overflow), `OutOfMemory`
 (page table allocation failure, or the caller's `CSpace` pool cannot fund a spill chunk for a
-mapping past the inline records).
+mapping past the inline records), `QuotaExceeded` (the address space's reference count is at its
+2^30 ceiling, which the record's reference is checked against; nothing is recorded or mapped).
 
 ---
 
@@ -2596,7 +2646,7 @@ already-exited thread takes none.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (thread lacks Control or event
 queue lacks Post), `OutOfMemory` (the event queue has no free observer node), `QuotaExceeded`
-(the event queue's reference count is at its 2^31 ceiling).
+(the event queue's reference count is at its 2^30 ceiling).
 
 ---
 
@@ -3191,7 +3241,7 @@ capability transfer is in flight on the source), `InsufficientRights` (dst CSpac
 or the dst CSpace pool cannot back an `Mmio`, `IoPort`, or `Interrupt` copy's object),
 `QuotaExceeded` (dst CSpace directory structurally full, an `Mmio`, `IoPort`, or `Interrupt`
 source's range already has `RANGE_COPY_LIMIT` (2^31 - 1) live copies, or any other source's object
-has its reference count at its 2^31 ceiling).
+has its reference count at its 2^30 ceiling).
 
 ---
 
@@ -3246,7 +3296,7 @@ and the call never returns (see
 capability while the move was in flight), `InsufficientRights` (dst CSpace
 lacks Insert), `InvalidArgument` (dst_slot occupied or out of range),
 `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded` (dst CSpace directory
-structurally full, or the object's reference count is at its 2^31 ceiling: the destination takes
+structurally full, or the object's reference count is at its 2^30 ceiling: the destination takes
 its reference before the source releases its own), `InvalidState` (a `SYS_CAP_REVOKE`, another
 `SYS_CAP_MOVE`, or an IPC
 capability transfer is in flight on the source slot; or the destination slot was
@@ -3325,7 +3375,7 @@ already-ended space takes none.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (address space lacks Control or
 event queue lacks Post), `OutOfMemory` (the event queue has no free observer node),
-`QuotaExceeded` (the event queue's reference count is at its 2^31 ceiling).
+`QuotaExceeded` (the event queue's reference count is at its 2^30 ceiling).
 
 ---
 
@@ -3856,7 +3906,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `IOPORT_BINDING_TABLE_PAGES` | 3 | Most CSpace growth-budget pages a thread's first `ioport_bind` takes for its port-binding table |
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
-| `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
+| `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum observer nodes, in an event queue |
 | `MAX_THREAD_MEM_COPY` | 4096 | Most bytes one `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM` or `SYS_THREAD_READ_EXT_REGS` copies |
 | `MAX_PAGE_RUNS` | 128 | Most runs one `SYS_THREAD_LIST_PAGES` writes |
 | `MAX_HARVEST_PAGES` | 4096 | Most pages one `SYS_ASPACE_HARVEST` reports |

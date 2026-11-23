@@ -45,23 +45,24 @@ use core::prelude::rust_2024::*;
 
 use syscall_abi::{
     MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_EXIT,
-    SYS_ASPACE_HARVEST, SYS_ASPACE_HOLD, SYS_ASPACE_QUERY, SYS_ASPACE_RELEASE, SYS_CAP_COPY,
-    SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
-    SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
-    SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
-    SYS_ENDPOINT_BADGE, SYS_ENDPOINT_IDENTIFY, SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST,
-    SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
-    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER,
-    SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP,
-    SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT,
-    SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO,
-    SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES,
-    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS,
-    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
-    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
+    SYS_ASPACE_HARVEST, SYS_ASPACE_HOLD, SYS_ASPACE_QUERY, SYS_ASPACE_RELEASE,
+    SYS_CAP_BIND_SOLE_REFERENCE, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
+    SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
+    SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
+    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENDPOINT_BADGE,
+    SYS_ENDPOINT_IDENTIFY, SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM,
+    SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV,
+    SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE,
+    SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT,
+    SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
+    SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
+    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
+    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL,
+    SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK,
+    SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -508,7 +509,7 @@ pub fn notification_try_wait(sig: u64) -> Result<u64, i64>
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
 /// structural ceiling). `QuotaExceeded` also means the Memory object's reference
-/// count is at its 2^31 ceiling.
+/// count is at its 2^30 ceiling.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
@@ -536,7 +537,7 @@ pub fn cap_create_endpoint(memory_cap: u64) -> Result<u64, i64>
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
 /// structural ceiling). `QuotaExceeded` also means the Memory object's reference
-/// count is at its 2^31 ceiling.
+/// count is at its 2^30 ceiling.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
@@ -581,7 +582,7 @@ pub fn cap_create_notification(memory_cap: u64) -> Result<u64, i64>
 /// augment target lacks Map; `OutOfMemory` if `memory_cap`'s region or the
 /// caller's `CSpace` slot-page pool is exhausted; `QuotaExceeded` if the
 /// caller's `CSpace` directory is structurally full or `memory_cap`'s object has
-/// its reference count at its 2^31 ceiling.
+/// its reference count at its 2^30 ceiling.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is 0 (augment mode) or a non-negative cap handle; the kernel keeps bit 63 of \
@@ -636,7 +637,7 @@ pub fn cap_create_aspace(memory_cap: u64, augment_target: u64, init_pages: u64)
 /// registry is live (the registry holds one id per DRAM page);
 /// `QuotaExceeded` if the caller's `CSpace` directory is
 /// structurally full or `memory_cap`'s object has its reference count at its
-/// 2^31 ceiling. A later cap insert into the new `CSpace` fails with
+/// 2^30 ceiling. A later cap insert into the new `CSpace` fails with
 /// `OutOfMemory` (-8) when the seeded pool is exhausted (refill via augment
 /// mode) and `QuotaExceeded` (-17) at the structural ceiling.
 #[expect(
@@ -707,7 +708,7 @@ pub fn raw_cap_create_cspace(
 /// `PRIORITY_MAX`), `OutOfMemory` (the Memory cap's `available_bytes` or the
 /// caller's `CSpace` slot pool is exhausted), or `QuotaExceeded` (the `CSpace`
 /// directory is structurally full, or the Memory object's reference count is at
-/// its 2^31 ceiling).
+/// its 2^30 ceiling).
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
@@ -1422,7 +1423,7 @@ pub fn thread_start_suspended(thread_cap: u64) -> Result<(), i64>
 /// `IoPort`, or `Interrupt` source, `QuotaExceeded` also means its range
 /// already has 2^31 - 1 live copies, and `OutOfMemory` that the destination
 /// `CSpace`'s pool cannot back the fresh object; for any other source,
-/// `QuotaExceeded` also means the object's reference count is at its 2^31
+/// `QuotaExceeded` also means the object's reference count is at its 2^30
 /// ceiling. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
 /// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
@@ -1456,7 +1457,7 @@ pub fn cap_copy(src_slot: u64, dest_cspace_cap: u64, rights_mask: u64) -> Result
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`;
 /// `QuotaExceeded` at the structural ceiling), or, as for [`cap_copy`],
 /// `QuotaExceeded` past 2^31 - 1 live copies of an `Mmio`, `IoPort`, or
-/// `Interrupt` source's range or at any other source object's 2^31
+/// `Interrupt` source's range or at any other source object's 2^30
 /// reference-count ceiling, and `OutOfMemory` when the caller's `CSpace` pool
 /// cannot back an `Mmio`, `IoPort`, or `Interrupt` object. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
@@ -1490,7 +1491,7 @@ pub fn cap_derive(src_slot: u64, rights_mask: u64) -> Result<u64, i64>
 /// is zero, the source already has a badge, or the `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the structural ceiling),
 /// or as for [`cap_copy`] (the `Mmio`, `IoPort`, and `Interrupt` copy limits, and any other
-/// source object's 2^31 reference-count ceiling).
+/// source object's 2^30 reference-count ceiling).
 /// `InvalidCapability` also covers a source a concurrent delete, move, or
 /// revoke freed before the new slot was linked; `InvalidState` means a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
@@ -1553,6 +1554,42 @@ pub fn endpoint_identify(key: u64, cap: u64) -> Result<bool, i64>
     // handles the kernel validates; it returns 1 or 0, or an error code.
     let ret = unsafe { syscall2(SYS_ENDPOINT_IDENTIFY, key, cap) };
     if ret < 0 { Err(ret) } else { Ok(ret != 0) }
+}
+
+/// Bind `event_queue_cap` to receive `(0, correlator)` once, the first time
+/// the kernel finds the object `cap` names at one reference after the bind,
+/// or at the object's death (`SYS_CAP_BIND_SOLE_REFERENCE`).
+///
+/// A reference is what `CAP_INFO_SOLE_REFERENCE` counts: every slot naming
+/// the object and every kernel-internal one. A lender that keeps one slot and
+/// hands out its copies learns this way that the copies are gone. The binding
+/// is one-shot and binds the object, not the slot: the remaining reference
+/// may be any holder's, so a binder makes `correlator` name its slot and a
+/// generation, and drops a post for a slot it has since reused. Each binding
+/// takes one observer node from `event_queue_cap`'s pool
+/// ([`event_queue_create_observed`]) until it posts.
+///
+/// Requires `POST` on `event_queue_cap`; `cap` may be of any type.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (the event queue lacks Post), `OutOfMemory` (the
+/// event queue has no free observer node), or `QuotaExceeded` (the event
+/// queue's reference count is at its limit).
+#[inline]
+pub fn cap_bind_sole_reference(cap: u64, event_queue_cap: u64, correlator: u64) -> Result<(), i64>
+{
+    // SAFETY: syscall3 issues raw syscall instruction; the cap handles and the
+    // correlator are plain scalar values the kernel validates.
+    let ret = unsafe {
+        syscall3(
+            SYS_CAP_BIND_SOLE_REFERENCE,
+            cap,
+            event_queue_cap,
+            correlator,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
 /// Delete a capability slot in the caller's `CSpace` (`SYS_CAP_DELETE`).
@@ -1668,7 +1705,7 @@ pub fn cap_revoke_all(slot: u64) -> Result<(), i64>
 /// destination's slot pool cannot back the slot (for a non-zero
 /// `dest_index`, every leaf up to that index must be backed;
 /// `QuotaExceeded` at the structural ceiling, or when the object's reference
-/// count is at its 2^31 ceiling, since the destination takes its reference
+/// count is at its 2^30 ceiling, since the destination takes its reference
 /// before the source releases its own);
 /// `InvalidState` if a revoke, another move, or an IPC capability transfer
 /// is in flight on the source, or the destination slot was freed mid-move
@@ -1721,7 +1758,7 @@ pub fn cap_move(src_cap: u64, dest_cspace_cap: u64, dest_index: u32) -> Result<u
 /// returns it for 0 without a syscall), or the destination
 /// `CSpace`'s slot pool cannot back every leaf up to `dest_index`
 /// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling), or as for
-/// [`cap_copy`] (`QuotaExceeded` at the copy limits and the 2^31
+/// [`cap_copy`] (`QuotaExceeded` at the copy limits and the 2^30
 /// reference-count ceiling). `InvalidCapability` also covers a source a
 /// concurrent delete, move, or revoke freed before the copy was linked; `InvalidState` means a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
@@ -2145,7 +2182,7 @@ pub fn aspace_release(aspace_cap: u64) -> Result<(), i64>
 
 /// Retype a Memory cap into a new `EventQueue` with the given capacity
 /// (`1..=EVENT_QUEUE_MAX_CAPACITY`)
-/// and no death-observer nodes; [`event_queue_create_observed`] adds them.
+/// and no observer nodes; [`event_queue_create_observed`] adds them.
 ///
 /// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE`; the wrapper, state, and ring
 /// buffer all live inline in the same retype slot. Sub-page in-place when
@@ -2157,7 +2194,7 @@ pub fn aspace_release(aspace_cap: u64) -> Result<(), i64>
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, `capacity` is out
 /// of range, or the `CSpace`'s slot pool cannot back a fresh slot
 /// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling). `QuotaExceeded`
-/// also means the Memory object's reference count is at its 2^31 ceiling.
+/// also means the Memory object's reference count is at its 2^30 ceiling.
 #[inline]
 pub fn event_queue_create(memory_cap: u64, capacity: u32) -> Result<u64, i64>
 {
@@ -2165,7 +2202,7 @@ pub fn event_queue_create(memory_cap: u64, capacity: u32) -> Result<u64, i64>
 }
 
 /// Retype a Memory cap into a new `EventQueue` with the given capacity and
-/// `observers` death-observer nodes (`0..=EVENT_QUEUE_MAX_CAPACITY`).
+/// `observers` observer nodes (`0..=EVENT_QUEUE_MAX_CAPACITY`).
 ///
 /// Each node funds one binding of this queue as a death observer
 /// ([`thread_bind_notification`], [`aspace_bind_notification`]); a bind
@@ -2360,7 +2397,7 @@ pub fn event_recv_timeout(queue_cap: u64, timeout_ms: u64) -> Result<u64, i64>
 /// `RIGHTS_MEM_RETYPE`, `capacity` is out of range (`InvalidArgument`), or
 /// the `CSpace`'s slot pool cannot back a fresh slot
 /// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling). `QuotaExceeded`
-/// also means the Memory object's reference count is at its 2^31 ceiling.
+/// also means the Memory object's reference count is at its 2^30 ceiling.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \

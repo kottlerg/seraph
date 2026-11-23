@@ -106,6 +106,7 @@ core/kernel/
 │   │   ├── registry.rs         # RAM-sized CSpaceId registry arena (id → CSpace, epoch, free list)
 │   │   ├── retype.rs           # Memory-cap retype allocator (object carving)
 │   │   ├── split.rs            # Shared tail of the range-cap split syscalls
+│   │   ├── sole_reference.rs   # Sole-reference observers: the flagged count's table and drain
 │   │   └── transfer.rs         # Batched capability move (SYS_CAP_MOVE, IPC transfer)
 │   ├── entropy/                # Entropy subsystem and per-CPU CSPRNG
 │   │   ├── mod.rs              # Storage alloc, seeding, draw API (fill_bytes)
@@ -199,6 +200,8 @@ The capability subsystem. `cspace.rs` implements per-process capability spaces.
 bitmask. `derivation.rs` maintains the global derivation tree used for revocation.
 `drain.rs` is the teardown drain that takes a dying `CSpace`'s slots out of the derivation tree
 (see [`docs/capability-internals.md`](docs/capability-internals.md) § Teardown Drain).
+`sole_reference.rs` finds the observers bound to an object whose count falls to one reference and
+posts them (§ Sole-Reference Observers of the same document).
 `object.rs` defines the kernel object headers and wrappers, the page pools that back
 address-space page tables and CSpace slot pages, the CSpace body arena that funds the objects a
 split or a range-capability copy creates (its pure logic in `arena.rs`), and their allocation and

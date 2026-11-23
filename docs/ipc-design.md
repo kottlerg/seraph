@@ -89,7 +89,7 @@ A message consists of:
   begins with the message (the sender loses access as each completes), or none
   does. A refused transfer — a source slot gone stale, repeated within the
   message, or pinned by an in-flight revocation, move, or IPC capability
-  transfer, a capability whose object already holds its ceiling of 2^31
+  transfer, a capability whose object already holds its ceiling of 2^30
   references, a sender's or receiver's CSpace already torn down, or a receiving
   CSpace (the server's on a call, the caller's on a reply) that cannot supply the
   destination slots — never delivers a partial set. On the call/receive
@@ -188,7 +188,7 @@ not how many times or in what order.
 
 An event queue is a fixed-capacity ring buffer. Each entry carries two words, a payload and a
 tag; a death notification carries the exit reason and the observer's correlator. The capacity is
-chosen at creation time and does not change, and so is the queue's pool of death-observer nodes,
+chosen at creation time and does not change, and so is the queue's pool of observer nodes,
 one per thread or address space that may bind the queue as its death observer.
 
 **Delivery:** The sender appends an entry to the ring. If the ring is full, the send

@@ -2735,7 +2735,7 @@ pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
 /// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked;
 ///        must carry `MemRights::RETYPE`).
 /// arg1 = capacity (`1..=EVENT_QUEUE_MAX_CAPACITY`).
-/// arg2 = death-observer node count (`0..=EVENT_QUEUE_MAX_CAPACITY`).
+/// arg2 = observer node count (`0..=EVENT_QUEUE_MAX_CAPACITY`).
 ///
 /// Constructs the `EventQueueObject` wrapper, its `EventQueueState`, the
 /// inline ring, and the observer node pool in place inside the source Memory
@@ -2799,7 +2799,7 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
     //   offset  0: EventQueueObject (24 B)
     //   offset 24: EventQueueState  (64 B)
     //   offset 88: ring buffer ((capacity + 1) * 16 B, one EventEntry each)
-    //   then:      observer node pool (observers * 24 B)
+    //   then:      observer node pool (observers * 40 B)
     let eq_obj_ptr = block_virt as *mut EventQueueObject;
     let state_offset = core::mem::size_of::<EventQueueObject>() as u64;
     let eq_state_ptr = slot_field::<EventQueueState>(block_virt, state_offset);
@@ -2807,7 +2807,7 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
         slot_field::<crate::ipc::event_queue::EventEntry>(block_virt, EVENT_QUEUE_RING_OFFSET);
     // `capacity` is at most EVENT_QUEUE_MAX_CAPACITY, so the sum is exact.
     let ring_len = (capacity as usize).saturating_add(1);
-    let nodes_ptr = slot_field::<crate::sched::thread::DeathObserver>(
+    let nodes_ptr = slot_field::<crate::ipc::event_queue::ObserverNode>(
         block_virt,
         event_queue_observer_offset(u64::from(capacity)),
     );
@@ -3163,7 +3163,8 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // SAFETY: paired with the lock_raw above.
             unsafe { lock.unlock_raw(saved) };
             let count = count.ok_or(SyscallError::InvalidCapability)?;
-            Ok(u64::from(count == 2))
+            // The count without a sole-reference observer's flag.
+            Ok(u64::from(crate::cap::object::references_in(count) == 2))
         }
         CAP_INFO_TLB_ELIDED =>
         {
@@ -3565,6 +3566,98 @@ pub fn sys_endpoint_badge(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
     tf.set_ipc_return(0, named.badge & mask);
+    Ok(0)
+}
+
+/// `SYS_CAP_BIND_SOLE_REFERENCE` (74): post `(0, correlator)` to an event
+/// queue once, the first time the kernel finds the object a capability names
+/// at one reference after the bind, or at the object's death.
+///
+/// arg0 = cap handle of any type, naming the observed object.
+/// arg1 = `EventQueue` cap handle carrying `POST`.
+/// arg2 = correlator, the tag word of the post.
+///
+/// The binding takes one observer node from the queue's pool and a reference
+/// on the queue, both until it posts, and binds the object, not the slot
+/// (core/kernel/docs/capability-internals.md § Sole-Reference Observers). The
+/// bind's own pin counts as a reference until the call returns; when no other
+/// holder than the slot remains, its release is the fall to one reference,
+/// and the post comes at the call's return.
+///
+/// # Errors
+/// `InvalidCapability` for arg0 when it is null, stale, or empty, and for
+/// arg1 when it is null, stale, empty, or not an `EventQueue`;
+/// `InsufficientRights` when arg1 lacks `POST`; `OutOfMemory` when the
+/// queue has no free observer node; `QuotaExceeded` when the queue's
+/// reference count is at `REF_COUNT_LIMIT`.
+#[cfg(not(test))]
+pub fn sys_cap_bind_sole_reference(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::object::EventQueueObject;
+    use crate::cap::slot::EqRights;
+
+    let cap_handle = tf.arg(0);
+    let eq_handle = tf.arg(1);
+    let correlator = tf.arg(2);
+
+    // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null above; cspace field set at thread creation.
+    let cspace = unsafe { (*tcb).cspace };
+    if cspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    // The observed object, pinned for the call: the pin is a reference, so
+    // the object is live and its count at two or more while the bind links.
+    // Dropping `slot` at the return releases the pin through `dec_ref`.
+    // SAFETY: cspace is the running thread's bound CSpace; no lock held.
+    let slot = unsafe { super::pin_slot(cspace, cap_handle) }?;
+    let object = slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: as above.
+    let eq_slot = unsafe { super::lookup_cap(cspace, eq_handle, EqRights::POST) }?;
+    let eq = eq_slot
+        .object
+        .ok_or(SyscallError::InvalidCapability)?
+        .as_ptr()
+        .cast::<EventQueueObject>();
+
+    // SAFETY: eq is the EventQueueObject `eq_slot` pins for the call.
+    let eq_state = unsafe { (*eq).state };
+    // SAFETY: eq_state is the state of the queue `eq_slot` pins for the call;
+    // no lock is held.
+    let node = unsafe { crate::ipc::event_queue::event_queue_take_observer(eq_state) };
+    if node.is_null()
+    {
+        return Err(SyscallError::OutOfMemory);
+    }
+    // The binding's reference is checked against REF_COUNT_LIMIT: the number
+    // of bindings on one queue grows with the nodes its creator funds.
+    // SAFETY: eq is pinned by `eq_slot`; header at offset 0.
+    if let Err(e) = unsafe { (*eq).header.try_inc_ref() }
+    {
+        // SAFETY: the node was never linked and eq is pinned by `eq_slot`.
+        unsafe { crate::ipc::event_queue::event_queue_return_observer(eq_state, node) };
+        return Err(e);
+    }
+    // SAFETY: node is this queue's and on no list, so only this thread reaches
+    // it.
+    unsafe { (*node).correlator = correlator };
+    // SAFETY: `slot` pins the object for the call.
+    let object = unsafe { object.as_ref() };
+    // SAFETY: node is a pool node on no list, with its queue and correlator
+    // set, living in the queue that the reference just taken keeps live until
+    // the drain returns the node; `slot` holds a reference on the object
+    // across the call; no lock is held.
+    unsafe {
+        crate::cap::sole_reference::TABLE
+            .link(node.cast::<crate::ipc::event_queue::ObserverNode>(), object);
+    }
     Ok(0)
 }
 

@@ -919,6 +919,13 @@ space still maps, which memmgr holds out of the pool until none holds (see
 [services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#reclamation)
 § Reclamation and [userspace-memory-model.md](userspace-memory-model.md)).
 
+A holder that needs to learn when every other reference to an object has gone, a server that lent
+a client a derivation, binds a sole-reference observer to the object with
+`SYS_CAP_BIND_SOLE_REFERENCE`: the kernel posts to the holder's event queue once, the first time it
+finds the object at one reference after the bind, or at the object's death
+([syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_CAP_BIND_SOLE_REFERENCE`). It replaces a
+poll of `SYS_CAP_INFO`'s `CAP_INFO_SOLE_REFERENCE`.
+
 ### Address-space and CSpace growth budgets
 
 Page tables and CSpace slot pages are kernel-half memory that grows

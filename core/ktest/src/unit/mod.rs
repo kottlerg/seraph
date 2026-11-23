@@ -24,6 +24,7 @@ pub mod ipc;
 pub mod mm;
 pub mod notification;
 pub mod retype;
+pub mod sole_reference;
 pub mod sysinfo;
 pub mod thread;
 pub mod wait_set;
@@ -464,6 +465,44 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "event::recv_timeout_zero_blocks_forever",
         event::recv_timeout_zero_blocks_forever(ctx)
+    );
+
+    // ── Sole-reference observers (SYS_CAP_BIND_SOLE_REFERENCE) ───────────────
+    run_test!(
+        "sole_reference::other_copy_deleted_posts_once",
+        sole_reference::other_copy_deleted_posts_once(ctx)
+    );
+    run_test!(
+        "sole_reference::bind_on_sole_reference_posts_at_once",
+        sole_reference::bind_on_sole_reference_posts_at_once(ctx)
+    );
+    run_test!(
+        "sole_reference::bind_racing_delete_posts_once",
+        sole_reference::bind_racing_delete_posts_once(ctx)
+    );
+    run_test!(
+        "sole_reference::two_bindings_each_post_once",
+        sole_reference::two_bindings_each_post_once(ctx)
+    );
+    run_test!(
+        "sole_reference::moved_copy_does_not_post",
+        sole_reference::moved_copy_does_not_post(ctx)
+    );
+    run_test!(
+        "sole_reference::queue_outlives_its_capabilities",
+        sole_reference::queue_outlives_its_capabilities(ctx)
+    );
+    run_test!(
+        "sole_reference::death_posts_once",
+        sole_reference::death_posts_once(ctx)
+    );
+    run_test!(
+        "sole_reference::exhausted_pool_out_of_memory",
+        sole_reference::exhausted_pool_out_of_memory(ctx)
+    );
+    run_test!(
+        "sole_reference::bind_argument_errors",
+        sole_reference::bind_argument_errors(ctx)
     );
 
     // ── Wait set syscalls ─────────────────────────────────────────────────────

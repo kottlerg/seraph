@@ -97,10 +97,12 @@ pub enum ObjectType
 #[repr(C)]
 pub struct KernelObjectHeader
 {
-    /// Reference count; starts at 1 when created. Bounded by
-    /// [`REF_COUNT_LIMIT`] for the references userspace can multiply. While
-    /// the object waits on a dealloc cascade ([`CascadeStack`]) its count is
-    /// 0 and this field holds the low 32 bits of the stack link instead.
+    /// Reference count in the low 31 bits, starting at 1 when created and
+    /// bounded by [`REF_COUNT_LIMIT`] for the references userspace can
+    /// multiply; bit 31 is [`REF_OBSERVED`], set while a sole-reference
+    /// observer is bound. While the object waits on a dealloc cascade
+    /// ([`CascadeStack`]) its count is 0, the flag clear, and this field holds
+    /// the low 32 bits of the stack link instead.
     pub ref_count: AtomicU32,
     /// Concrete type, for use during deallocation.
     pub obj_type: ObjectType,
@@ -116,47 +118,67 @@ pub struct KernelObjectHeader
     pub ancestor: AtomicPtr<KernelObjectHeader>,
 }
 
-/// Ceiling on [`KernelObjectHeader::ref_count`] for the references userspace
-/// can multiply without a bound of its own: a new capability slot (copy,
-/// derive, badged derive, a move's destination) refuses at it, and so do a
-/// retype from a Memory object whose count is at it and a death-observer bind
-/// onto an `EventQueue` whose count is at it (its creator funds any number of
-/// observer nodes).
+/// Ceiling on the count [`KernelObjectHeader::ref_count`] holds for the
+/// references userspace can multiply without a bound of its own: a new
+/// capability slot (copy, derive, badged derive, a move's destination) refuses
+/// at it, and so do a retype from a Memory object whose count is at it, an
+/// observer bind onto an `EventQueue` whose count is at it (its creator funds
+/// any number of observer nodes), and an Mmio mapping record onto an
+/// `AddressSpace` whose count is at it (its mapper funds any number of
+/// records).
 ///
 /// The value is correct as is, not a limit a workload meets: every
 /// userspace-amplifiable reference costs a 72-byte capability slot, a retype
-/// child of at least 128 bytes, or a 24-byte death-observer node, so 2^31
-/// references to one object hold at least 48 GiB against that single object,
-/// which no workload does, and reaching the
-/// ceiling refuses the request with `QuotaExceeded` instead of wrapping the
-/// count and freeing a live object.
+/// child of at least 128 bytes, a 40-byte observer node, or a 16-byte Mmio
+/// mapping record beside the page-table entry its mapping holds, so 2^30
+/// references to one object hold at least 16 GiB against that single object,
+/// which no workload does, and reaching the ceiling refuses the request with
+/// `QuotaExceeded` instead of carrying the count into [`REF_OBSERVED`].
 ///
 /// A move's destination slot takes its reference through the same check (a
 /// move its liveness backstop abandons leaves that slot live beside the
 /// source); an IPC transfer checks every cap of its message before its first
 /// move and then takes the destinations' references unchecked.
 ///
-/// The ceiling leaves 2^31 of headroom below `u32::MAX` for every other
+/// The ceiling leaves 2^30 of headroom below [`REF_OBSERVED`] for every other
 /// reference, which the kernel takes unchecked. Each of those is bounded by an
 /// object count, not by a caller's request. Per thread: its syscall pins (a
 /// few), its fault-handler binding (one), the lease of a retype it has in flight
 /// that passed `retype_allocate`'s check before another took the count to the
 /// ceiling (one), and the destinations of an IPC transfer it has in flight that
 /// passed the message check (at most `MSG_CAP_SLOTS_MAX`, four); fewer than 16
-/// in all. Per other object: wait-set membership (one per source), Mmio mapping
-/// records (each 16 bytes of a caller-funded body or spill chunk, so 2^31 of
-/// them hold 32 GiB), SEED leases (the boot mints, bounded by the SEED reserve),
-/// an arena page's chunk references (at most 31, its chunks), the leases of the
-/// arena pages a dead `CSpace` keeps (at most one per page of the donation each
-/// lies in), and the destinations IPC transfers' abandoned moves leave
-/// live: a message check refuses once the count is at the ceiling, and
-/// transfers run one at a time under `DERIVATION_LOCK`, so these keep an
-/// object's slot references within `MSG_CAP_SLOTS_MAX - 1` of the ceiling.
-/// Exhausting the headroom would take some 2^27 threads, each with its own
-/// kernel stack and TCB (at least 2 TiB of kernel stacks), so the count cannot
-/// wrap (core/kernel/docs/capability-internals.md § Kernel Object Reference
+/// in all. Per other object: wait-set membership (one per source), SEED leases
+/// (the boot mints, bounded by the SEED reserve), an arena page's chunk
+/// references (at most 31, its chunks), the leases of the arena pages a dead
+/// `CSpace` keeps (at most one per page of the donation each lies in), and the
+/// destinations IPC transfers' abandoned moves leave live: a message check
+/// refuses once the count is at the ceiling, and transfers run one at a time
+/// under `DERIVATION_LOCK`, so these keep an object's slot references within
+/// `MSG_CAP_SLOTS_MAX - 1` of the ceiling. Exhausting the headroom would take
+/// some 2^26 threads, each with its own kernel stack and TCB (at least 1 TiB of
+/// kernel stacks), so the count cannot reach [`REF_OBSERVED`]
+/// (core/kernel/docs/capability-internals.md § Kernel Object Reference
 /// Counting).
-pub const REF_COUNT_LIMIT: u32 = 1 << 31;
+pub const REF_COUNT_LIMIT: u32 = 1 << 30;
+
+/// The bit of [`KernelObjectHeader::ref_count`] that marks an object a
+/// sole-reference observer is bound to (`SYS_CAP_BIND_SOLE_REFERENCE`); the
+/// count is the word's other 31 bits, which every reader masks it from.
+///
+/// The flag rides in the count word so that [`KernelObjectHeader::dec_ref`]
+/// learns it from the value its decrement returns, with no second load; the
+/// table that finds the bound observers, and the protocol that claims and
+/// clears the flag, are in [`crate::cap::sole_reference`]
+/// (core/kernel/docs/capability-internals.md § Sole-Reference Observers).
+pub const REF_OBSERVED: u32 = 1 << 31;
+
+/// The reference count a [`KernelObjectHeader::ref_count`] word holds: the
+/// word with [`REF_OBSERVED`] masked off.
+#[must_use]
+pub const fn references_in(word: u32) -> u32
+{
+    word & !REF_OBSERVED
+}
 
 // SAFETY: ancestor is a back-pointer to a kernel object whose lifetime is
 // guaranteed by retype's refcount semantics. Send+Sync via the surrounding
@@ -220,8 +242,10 @@ impl KernelObjectHeader
     pub fn inc_ref(&self)
     {
         let prev = self.ref_count.fetch_add(1, Ordering::Relaxed);
+        // The headroom above REF_COUNT_LIMIT keeps the count below
+        // REF_OBSERVED, so the add never reaches the flag.
         debug_assert!(
-            prev < u32::MAX,
+            references_in(prev) < REF_OBSERVED - 1,
             "inc_ref overflow: obj_type={:?} self={:p}",
             self.obj_type,
             self,
@@ -241,11 +265,12 @@ impl KernelObjectHeader
         let mut cur = self.ref_count.load(Ordering::Relaxed);
         loop
         {
-            if cur >= REF_COUNT_LIMIT
+            if references_in(cur) >= REF_COUNT_LIMIT
             {
                 return Err(syscall::SyscallError::QuotaExceeded);
             }
-            // Below REF_COUNT_LIMIT (checked above), so the add never saturates.
+            // Below REF_COUNT_LIMIT (checked above), so the add never saturates
+            // and never reaches REF_OBSERVED.
             match self.ref_count.compare_exchange_weak(
                 cur,
                 cur.saturating_add(1),
@@ -274,7 +299,9 @@ impl KernelObjectHeader
         let mut cur = self.ref_count.load(Ordering::Relaxed);
         loop
         {
-            if cur == 0
+            // A flagged object whose last reference just went reads
+            // REF_OBSERVED until its final decrement clears the word.
+            if references_in(cur) == 0
             {
                 return false;
             }
@@ -297,10 +324,10 @@ impl KernelObjectHeader
     /// userspace-amplifiable reference must be refused.
     pub fn at_ref_limit(&self) -> bool
     {
-        self.ref_count.load(Ordering::Relaxed) >= REF_COUNT_LIMIT
+        references_in(self.ref_count.load(Ordering::Relaxed)) >= REF_COUNT_LIMIT
     }
 
-    /// Decrement the reference count and return the new value.
+    /// Decrement the reference count and return the new count.
     ///
     /// Returns 0 when no capability slot or kernel-internal owner still holds
     /// the object (see core/kernel/docs/capability-internals.md § Kernel Object
@@ -308,21 +335,40 @@ impl KernelObjectHeader
     /// that point. The decrement is a Release, and the one that reaches 0 is
     /// followed by an Acquire fence, so that freer observes every write the
     /// other owners made before releasing theirs.
+    ///
+    /// On an object a sole-reference observer is bound to ([`REF_OBSERVED`]
+    /// set), the decrement to one reference marks the object for the drain
+    /// without reading it again, since it may have released the caller's last
+    /// hold on it, and the decrement to 0, whose caller owns the object, fires
+    /// the bound observers and clears the word before it returns
+    /// ([`crate::cap::sole_reference`]). With no observer bound, the flag test
+    /// reads only the value the decrement returned.
+    pub fn dec_ref(&self) -> u32
+    {
+        self.dec_ref_in(&crate::cap::sole_reference::TABLE)
+    }
+
+    /// [`Self::dec_ref`] against the sole-reference `table` the object's
+    /// observers are bound in: the kernel's one table, or a host test's own.
     #[expect(
         clippy::pointer_format,
         reason = "the object addresses are printed only in an assertion message, which the panic \
                   handler writes through the serial-only `console::panic_write_fmt`"
     )]
-    pub fn dec_ref(&self) -> u32
+    pub(crate) fn dec_ref_in(&self, table: &crate::cap::sole_reference::SoleReferenceTable) -> u32
     {
         let prev = self.ref_count.fetch_sub(1, Ordering::Release);
         debug_assert!(
-            prev != 0,
+            references_in(prev) != 0,
             "dec_ref underflow: obj_type={:?} self={:p} ancestor={:p}",
             self.obj_type,
             self,
             self.ancestor.load(Ordering::Relaxed),
         );
+        if prev & REF_OBSERVED != 0
+        {
+            return self.observed_decrement(prev, table);
+        }
         if prev == 1
         {
             // The last release: pair the Release decrements of every other
@@ -334,6 +380,39 @@ impl KernelObjectHeader
         // above in debug) returns u32::MAX, never 0, so no caller frees the
         // object a second time.
         prev.wrapping_sub(1)
+    }
+
+    /// The rest of a decrement of an observed object, whose word was `prev`
+    /// before it; returns the new count.
+    #[cold]
+    fn observed_decrement(
+        &self,
+        prev: u32,
+        table: &crate::cap::sole_reference::SoleReferenceTable,
+    ) -> u32
+    {
+        match references_in(prev)
+        {
+            2 =>
+            {
+                // Down to one reference. This decrement may have been the
+                // caller's last hold, so the object may already be freed: only
+                // its address goes to the table, which the drain checks under
+                // its lock.
+                table.mark_pending(core::ptr::from_ref(self).addr());
+                1
+            }
+            1 =>
+            {
+                // The last release, as in dec_ref_in; the caller now owns the
+                // object, so its observers fire and its word clears before the
+                // caller frees it.
+                core::sync::atomic::fence(Ordering::Acquire);
+                table.fire_dying(self);
+                0
+            }
+            count => count.wrapping_sub(1),
+        }
     }
 }
 
@@ -864,15 +943,13 @@ impl MmioMapping
             .is_ok()
     }
 
-    /// Fill a claimed record with `va` in `aso`, taking a reference on `aso`.
+    /// Fill a claimed record with `va` in `aso`, handing it a reference on
+    /// `aso` the caller took for it.
     ///
     /// # Safety
-    /// The caller claimed the record; `aso` is a live `AddressSpaceObject` the
-    /// caller holds a reference on.
+    /// The caller claimed the record and took the reference it hands over.
     unsafe fn fill(&self, aso: *mut AddressSpaceObject, va: u64)
     {
-        // SAFETY: aso is live and referenced by the caller (contract).
-        unsafe { (*aso).header.inc_ref() };
         self.va.store(va, Ordering::Relaxed);
         self.aso.store(aso, Ordering::Release);
     }
@@ -956,15 +1033,18 @@ impl MmioObject
     }
 
     /// Record a mapping of this object's region at `va` in `aso`, taking a
-    /// reference on `aso` for the record. A mapping already recorded at the same
+    /// reference on `aso` for the record through the [`REF_COUNT_LIMIT`]
+    /// check: the number of records on one address space grows with the
+    /// mappings its mappers fund. A mapping already recorded at the same
     /// place is not recorded again; two maps racing to record the same place
     /// may each take a record, which costs a record and is otherwise harmless
     /// (the teardown withdraws both). When every record is taken, a spill chunk
     /// from `new_spill` is chained on with this mapping's record in it.
     ///
     /// # Errors
-    /// The error of `new_spill` (`OutOfMemory` when the caller's arena cannot
-    /// fund a chunk), with nothing recorded.
+    /// `QuotaExceeded` when `aso`'s count is at [`REF_COUNT_LIMIT`], and the
+    /// error of `new_spill` (`OutOfMemory` when the caller's arena cannot fund
+    /// a chunk), each with nothing recorded.
     ///
     /// # Safety
     /// `aso` is a live `AddressSpaceObject` the caller holds a reference on, and
@@ -981,13 +1061,26 @@ impl MmioObject
         {
             return Ok(());
         }
+        // SAFETY: aso is live and referenced by the caller (contract).
+        unsafe { (*aso).header.try_inc_ref() }?;
         if let Some(m) = self.records().find(|m| m.claim())
         {
-            // SAFETY: claimed above; aso is live and referenced (contract).
+            // SAFETY: claimed above, with the reference just taken.
             unsafe { m.fill(aso, va) };
             return Ok(());
         }
-        let chunk = new_spill()?;
+        let chunk = match new_spill()
+        {
+            Ok(chunk) => chunk,
+            Err(e) =>
+            {
+                // The caller's own reference keeps the count above 0, so this
+                // release never frees aso.
+                // SAFETY: aso is live and referenced by the caller (contract).
+                unsafe { (*aso).header.dec_ref() };
+                return Err(e);
+            }
+        };
         // SAFETY: a fresh chunk, ours alone until published below.
         let fresh = unsafe { chunk.as_ref() };
         let first = &fresh.records[0];
@@ -1008,7 +1101,7 @@ impl MmioObject
                 Err(now) => head = now,
             }
         }
-        // SAFETY: claimed above; aso is live and referenced (contract).
+        // SAFETY: claimed above, with the reference taken before it.
         unsafe { first.fill(aso, va) };
         Ok(())
     }
@@ -3004,13 +3097,33 @@ pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObject
     }
 }
 
+/// Drain this CPU's deferred reclaim stack ([`reclaim_deferred_stack`]), then
+/// post every sole-reference observer the table has fired
+/// ([`crate::cap::sole_reference::drain`]), so that a release the reclaim
+/// makes posts in the same pass.
+///
+/// Called from the syscall epilogue (when the returning thread is alive) and
+/// the idle loop, with no lock held.
+///
+/// # Safety
+/// The contract of [`reclaim_deferred_stack`].
+#[cfg(not(test))]
+pub unsafe fn drain_deferred_reclaim(cpu: usize)
+{
+    // SAFETY: forwarded caller contract.
+    unsafe { reclaim_deferred_stack(cpu) };
+    // SAFETY: syscall-epilogue context with interrupts disabled, or the idle
+    // thread, holding no lock: the context release_ref allows.
+    unsafe { crate::cap::sole_reference::drain() };
+}
+
 /// Drain this CPU's deferred reclaim stack, completing the free of each
 /// queued object (a `Thread`'s TCB, kstack, retype slot, and ancestor
 /// cascade; a `CSpace`'s or `AddressSpace`'s bound-thread stop, drain, and
 /// storage).
 ///
-/// Called from the syscall epilogue (when the returning thread is alive) and
-/// the idle loop — neither is one of the queued dead threads, so re-entering
+/// Called through [`drain_deferred_reclaim`] from the syscall epilogue (when
+/// the returning thread is alive) and the idle loop — neither is one of the queued dead threads, so re-entering
 /// `dealloc_object` runs the normal arm: the Thread arm's `current`-anywhere
 /// scan and `context_saved` gate pass on the first iteration, and the
 /// `CSpace`/`AddressSpace` arms stop whatever threads are still bound (a
@@ -3035,7 +3148,7 @@ pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObject
               (header at offset 0, 8-byte aligned)"
 )]
 #[cfg(not(test))]
-pub unsafe fn drain_deferred_reclaim(cpu: usize)
+unsafe fn reclaim_deferred_stack(cpu: usize)
 {
     if cpu >= crate::sched::MAX_CPUS
     {

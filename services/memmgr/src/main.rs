@@ -2858,10 +2858,11 @@ enum FaultDecline
     /// A commit overrun: the faulting page lies in a committed region, or its
     /// chunk is an evicted chunk of one, whose pages `promised` holds, and the
     /// free pool has no frame for it even after memmgr evicted victims in its
-    /// turn ([`evict::draw_room`]). Only registered swap slots, or
-    /// memmgr's own metadata taking the free pages `promised` counts, leave
-    /// the pool short of `promised` (services/memmgr/docs/memory-pool.md
-    /// § Commit, Overcommit).
+    /// turn ([`evict::draw_room`]); while a swap service has registered
+    /// swap slots, a process outside the system reserve finds only the frames
+    /// above the growth floor. Only registered swap slots, or memmgr's own
+    /// metadata taking the free pages `promised` counts, make it reachable
+    /// (services/memmgr/docs/memory-pool.md § Commit, Overcommit).
     CommitOverrun = 11,
     /// The faulting page's chunk is on disk, its pages in a swap slot only
     /// (services/memmgr/docs/memory-pool.md § Disk tier): detail
@@ -3884,8 +3885,8 @@ const fn pressure_wire(level: PressureLevel) -> u64
 static mut DRAW_OPEN: bool = true;
 
 /// The pages a committed draw for a budget node outside the system reserve may
-/// take from the free pool now, those above the growth floor while the pool
-/// does not cover `promised` (`QUERY_POOL_STATUS` `data[16]`;
+/// take from the free pool now, those above the growth floor while a swap
+/// service has registered swap slots (`QUERY_POOL_STATUS` `data[16]`;
 /// services/memmgr/docs/memory-pool.md § Commit, Overcommit).
 fn draw_room_pages(l: &MemLedger) -> u64
 {

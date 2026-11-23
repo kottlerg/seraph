@@ -529,42 +529,49 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// The most pages a committed draw (a fault in a committed region, or a
     /// restore of a committed chunk, each drawing from `promised`) may take
     /// from the free pool: every free page while no swap service registered
-    /// slots ([`Self::overcommits`]) or the pool covers `promised`, else
-    /// only those above `floor`, the allowance spent or not: for a budget
-    /// node outside the system reserve, the growth floor
-    /// ([`Self::growth_floor`]), so the draws leave the reserve and the
-    /// restore headroom to the restores of uncommitted chunks; 0 for a
-    /// reserve node. With no slot registered the pool falls short of
-    /// `promised` only by memmgr's own metadata, so a draw takes any free
+    /// slots ([`Self::overcommits`]), else only those above `floor`, the
+    /// allowance spent or not: for a budget node outside the system reserve,
+    /// the growth floor ([`Self::growth_floor`]), so the draws leave the
+    /// reserve to the reserve nodes and the restore headroom to the restores
+    /// of uncommitted chunks; 0 for a reserve node. That holds while the free
+    /// frames cover `promised` too: the allowance lets admission leave fewer
+    /// free frames than `promised` and the floor, so frames that cover
+    /// `promised` can still be the reserve's and the headroom's, which a
+    /// restore of an uncommitted chunk reads as free frames
+    /// ([`Self::restore_fits`]). With no slot registered a draw takes its
+    /// page off the free pool and `promised` alike, so it leaves the free
+    /// pages outside `promised` as they were, the pool falls short of
+    /// `promised` only by memmgr's own metadata, and a draw takes any free
     /// page, as every committed fault did before there was an allowance
     /// (`services/memmgr/docs/memory-pool.md` § Commit, Overcommit).
     #[must_use]
     pub fn draw_room(&self, floor: u64) -> u64
     {
         let free = self.pool.free_pages();
-        if !self.overcommits() || free >= self.promised
+        if self.overcommits()
         {
-            free
+            free.saturating_sub(floor)
         }
         else
         {
-            free.saturating_sub(floor)
+            free
         }
     }
 
     /// Whether memmgr evicts in the background for free frames
     /// (`services/memmgr/docs/memory-pool.md` § Eviction, Selection): the
-    /// free pool does not cover `promised`, so committed draws keep off the
-    /// growth floor `floor` ([`Ledger::draw_room`]), and the free frames
-    /// stand at or below the floor and the hysteresis band `band`. Any
-    /// evictable idle chunk is then a victim, a committed one included, since
-    /// the draws need free frames alone, so write-out has chunks to take and
-    /// frames come back before a committed fault waits on them.
+    /// draw room above the growth floor `floor` ([`Ledger::draw_room`])
+    /// does not cover `promised`, so a committed draw can find none, and the
+    /// free frames stand at or below the floor and the hysteresis band
+    /// `band`. Any evictable idle chunk is then a victim, a committed one
+    /// included, since the draws need free frames alone, so write-out has
+    /// chunks to take and frames come back before a committed fault waits on
+    /// them.
     #[must_use]
     pub fn frames_short(&self, floor: u64, band: u64) -> bool
     {
         let free = self.pool.free_pages();
-        free < self.promised && free <= floor.saturating_add(band)
+        self.draw_room(floor) < self.promised && free <= floor.saturating_add(band)
     }
 
     /// The free pages outside `promised` that a charge to a node outside the
@@ -6972,7 +6979,46 @@ mod tests
         assert_eq!(l.draw_room(16), 1000 - 16 - 16);
         l.remove_region(rec, reg, pool_all).unwrap();
         assert_eq!((promised(&l), l.pool.free_pages()), (0, 1000));
-        assert_eq!(l.draw_room(16), 1000);
+        // With slots registered a draw keeps off the reserve whatever `promised`
+        // holds.
+        assert_eq!(l.draw_room(16), 1000 - 16);
+    }
+
+    #[test]
+    fn a_committed_draw_keeps_off_the_floor_while_the_free_frames_cover_promised()
+    {
+        let mut l = roomy_ledger(1000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        register_slots(&mut l, 625);
+        let reg = l
+            .add_region(rec, region(BASE, 32 * CHUNK), Commit::Committed)
+            .unwrap();
+        // A reserve of 600 pages and a restore headroom of a chunk: the free
+        // frames cover `promised` but not `promised` and the floor, as the
+        // allowance lets admission leave them.
+        let (reserve, floor) = (600, 616);
+        assert!(l.pool.free_pages() >= promised(&l));
+        assert!(l.pool.free_pages() < promised(&l) + floor);
+        assert_eq!(l.draw_room(floor), 1000 - floor);
+        assert!(!l.frames_short(floor, 16));
+        // A reserve node's draw takes any free page.
+        assert_eq!(l.draw_room(0), 1000);
+        // Draws to the end of the draw room leave the floor free, the frames
+        // still covering `promised`: the restore of an uncommitted chunk is
+        // admitted against the reserve, and memmgr evicts for frames.
+        let mut c = 0;
+        while l.draw_room(floor) >= 16
+        {
+            back_whole(&mut l, rec, reg, c);
+            c += 1;
+        }
+        assert_eq!(c, (1000 - floor) / 16);
+        assert_eq!(l.pool.free_pages(), floor);
+        assert!(l.pool.free_pages() >= promised(&l));
+        assert_eq!(l.draw_room(floor), 0);
+        assert!(l.restore_fits(16, reserve));
+        assert!(l.frames_short(floor, 16));
+        l.remove_region(rec, reg, pool_all).unwrap();
     }
 
     #[test]

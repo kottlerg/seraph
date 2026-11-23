@@ -322,8 +322,8 @@ shell (#112), and future consumers — they reuse the runner by swapping the
 terminal's session leader and the expected strings. It subsumes the keysym-decode
 coverage of the former standalone input smoke test: the echoed `help` proves
 lowercase keysym decode, and Return/Backspace prove the named-key decodes. In
-CI the `usertest` cell runs it as the first case of `cargo xtask test --cell usertest`, after the
-cell's own boot, rather than as a separate matrix dimension that would multiply with each arch.
+CI the `usertest` cell runs it as a case of `cargo xtask test --cell usertest`, after the cell's own
+boot, rather than as a separate matrix dimension that would multiply with each arch.
 
 ### Snapshot resume (`vmgenid` case)
 
@@ -352,8 +352,7 @@ for the snapshot-detection design.
 
 Same boot requirements as the `terminal` case (default boot set, terminal
 autostarted); the host computes the verdict and kills QEMU. In CI the x86_64 `usertest` cell's
-`cargo xtask test --cell usertest` runs it after the `terminal`, `signing`, `dma-confinement`,
-`rollback`, `enrolment`, `secureboot` and `wedge` cases and before the `shutdown` case.
+`cargo xtask test --cell usertest` runs it.
 
 ### KASLR randomization (`kaslr` case)
 
@@ -415,7 +414,8 @@ lines that are compared. The userspace paths are measured by the
 recipe (`/config/svcmgr/tests/ubench.svc`) staged and the terminal dropped; it logs its own
 lines and fsbench's.
 
-CI's `bench` cell, one per architecture, boots both (debug) under QEMU's icount
+CI's `bench` cell, one per architecture, builds both in the release profile
+(`cargo xtask build --release --ktest-bench-only`) and boots them under QEMU's icount
 (`cargo xtask run --icount`): one guest clock tick per retired instruction, so a benchmark's
 count is the same in every run of one build, whatever the runner's load. It boots each three times
 at one CPU and once at four, the ubench boots with a framebuffer (`--display framebuffer`) and
@@ -432,6 +432,15 @@ moves a count on purpose rewrites the baselines of the benchmarks it moved from 
 (`cargo xtask bench-baseline --from-run <run id>`) and states the change and its reason in its
 body. The four-CPU counts are reported, not gated: the interleaving of the CPUs moves them.
 
+The cell measures the release profile because hardware runs it, and a count is worth what it
+says about hardware. The debug profile adds debug assertions and overflow checks, and leaves out
+of line the calls the release build's fat LTO inlines, in proportions that differ from path to
+path, so a count moved in the debug profile does not predict the count moved in release. A
+regression that exists only in the debug profile, such as a debug assertion added to a hot path,
+is therefore not gated: it costs nothing on hardware, and the functional cells still boot both
+profiles. [core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md)
+§ Profile gives the counts of both profiles per path.
+
 A one-CPU count gates only when it does not include time blocked on a device completion. The
 completion arrives at host time: a guest blocked on it retires no instructions, and its clock
 advances by timer deadlines until QEMU completes the request, so the count follows the host's I/O
@@ -444,9 +453,9 @@ samples wait on a device joins the set (`ICOUNT_IO_BOUND` in `xtask/src/benchmar
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
-(`--mode host`, x86_64 under KVM, per-measurement bands in
-`xtask/baselines/bench/host/x86_64/BANDS`), and is report-only: no host-mode baseline is checked
-in yet, so no PR owes a host-mode run.
+(`--mode host`, x86_64 under KVM, on the release build the cell measures, per-measurement bands
+in `xtask/baselines/bench/host/x86_64/BANDS`), and is report-only: no host-mode baseline is
+checked in yet, so no PR owes a host-mode run.
 
 ### Crash reports
 
@@ -539,8 +548,8 @@ ends in a power-off instead. `cargo xtask test shutdown --cause reboot [--arch]`
 4. Remove the recipe and repack the images in that layout again, whatever the outcome.
 
 See [xtask/README.md § The `shutdown` case](../xtask/README.md#the-shutdown-case) for the command.
-In CI it is the first boot of the `shutdown` case, the last case of each `usertest` cell (both
-arches, both profiles), on the default boot the cell's `cargo xtask mkdisk` restored.
+In CI it is the first boot of the `shutdown` case, which each `usertest` cell runs (both arches,
+both profiles), on the default boot the cell's `cargo xtask mkdisk` restored.
 
 ### Power button (`shutdown` case)
 
@@ -737,8 +746,7 @@ sysroot itself is never changed:
 A boot passes when every line it owes appears, and fails on any other refusal or fatal line, or at
 its deadline. The images are packed again from the sysroot afterwards, whatever the outcome. See
 [xtask/README.md § The `signing` case](../xtask/README.md#the-signing-case) for the lines, the
-deadlines and the logs. CI runs it in each usertest cell after the `terminal` case, in the cell's
-profile.
+deadlines and the logs. CI runs it in each usertest cell, in the cell's profile.
 
 ### Required DMA confinement (`dma-confinement` case)
 
@@ -760,7 +768,7 @@ refusal among them, a fatal line, or its deadline. A device that no unit transla
 a unit does, and an IOMMU driver not ready within the settle bound or dead, take the same refusal,
 which devmgr's host tests show (`firmware::dma::admits`), since no QEMU machine presents them.
 See [xtask/README.md § The `dma-confinement` case](../xtask/README.md#the-dma-confinement-case)
-for the lines and the logs. CI runs it in each usertest cell after the `signing` case.
+for the lines and the logs. CI runs it in each usertest cell.
 
 ### Rollback floor (`rollback` case)
 
@@ -780,8 +788,7 @@ with the build's trust store floor `F`:
 A boot passes when every line it owes appears; a boot after a failed one is not made. A firmware
 that refuses the write is covered by the bootloader's host tests, since no QEMU firmware refuses
 it on demand. See [xtask/README.md § The `rollback` case](../xtask/README.md#the-rollback-case)
-for the lines and the logs. CI runs it in each usertest cell after the `dma-confinement` case, in
-the cell's profile.
+for the lines and the logs. CI runs it in each usertest cell, in the cell's profile.
 
 ### Root enrolment (`enrolment` case)
 
@@ -808,7 +815,7 @@ A boot passes when every line it owes appears; a boot after a failed one is not 
 the enrolled store's bound, a refused write, and a malformed store are covered by the bootloader's
 host tests, since no QEMU firmware gives them on demand. See
 [xtask/README.md § The `enrolment` case](../xtask/README.md#the-enrolment-case) for the lines and
-the logs. CI runs it in each usertest cell after the `rollback` case.
+the logs. CI runs it in each usertest cell.
 
 ### Secure Boot (`secureboot` case)
 
@@ -831,7 +838,7 @@ for riscv64 ([build-system.md](build-system.md) § QEMU and Firmware). A firmwar
 enforce Secure Boot fails the case, naming the firmware, so the case never passes on one that boots
 what it should refuse. See
 [xtask/README.md § The `secureboot` case](../xtask/README.md#the-secureboot-case) for the lines,
-the firmware search and the logs. CI runs it in each usertest cell after the `enrolment` case.
+the firmware search and the logs. CI runs it in each usertest cell.
 
 ### GDB stub (`debug-port` case)
 
@@ -905,8 +912,8 @@ in the idle halt, or a missing report line fails it. The host computes the verdi
 QEMU, as for the `terminal` case. See
 [xtask/README.md § The `wedge` case](../xtask/README.md#the-wedge-case) for the command.
 
-In CI it runs as a boot pair inside each `usertest` cell (both arches, both profiles), after the
-`secureboot` case, on the default boot the cell's `cargo xtask mkdisk` restored.
+In CI it runs as a boot pair inside each `usertest` cell (both arches, both profiles), on the
+default boot the cell's `cargo xtask mkdisk` restored.
 
 ### CET shadow stacks (`cet` case)
 
@@ -1104,9 +1111,11 @@ which would restore it). The terminal is exercised in its own boot
 drops `crashd.svc`, so one boot per cell runs the image without the crash
 service (see Crash reports above).
 
-CI matrix cells follow these rules per boot. The `usertest` cell runs its boots in sequence:
-`usertest` (via `run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the
-default boot (terminal present), `cargo xtask test --cell usertest` runs the cell's cases: the
+CI matrix cells follow these rules per boot. The `usertest` cell boots `usertest` first (via
+`run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the default boot
+(terminal present), `cargo xtask test --cell usertest --lanes 3` runs the cell's cases in three
+lanes side by side, each lane on its own copy of the checkout and its cases one after another in the
+registry's order ([xtask/README.md § Cells](../xtask/README.md#cells)): the
 `terminal` case's boot, the `signing` case's eight boots, the `dma-confinement` case's two boots,
 the `rollback` case's three boots, the
 `enrolment` case's six boots, the `secureboot` case's four boots, the
@@ -1120,6 +1129,14 @@ the death it makes, read over QMP, and QEMU exits on its own. The power-button b
 by its press: the host presses the button over QMP, reads the power-off there, and QEMU exits on its
 own.
 
+A local run of a cell takes `--lanes` as CI does when the host allows it: each lane's boots are
+small boots of the host launch rules
+([xtask/README.md § Host launch rules](../xtask/README.md#host-launch-rules)), so `--lanes 3` takes
+all three of the host's small-boot places and runs beside no other QEMU, and with `--wait-host` a
+lane's boot waits for a place rather than failing. A run that must be alone or timed (`--alone`,
+`--timing`), such as the re-run alone of Coverage tiers, takes no lanes and runs its cases one after
+another.
+
 ---
 
 ## Coverage tiers
@@ -1130,7 +1147,7 @@ not on every push.
 
 **Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest), and the `bench` cell
-beside them (debug, one CPU and four, under icount; [Benchmarks](#benchmarks-bench-cell)).
+beside them (release, one CPU and four, under icount; [Benchmarks](#benchmarks-bench-cell)).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + virtio-rng + serial + the machine's RTC, the machine's IOMMU
 with the virtio-blk, virtio-keyboard, and virtio-rng devices behind it — `intel-iommu` on x86_64,
@@ -1183,7 +1200,7 @@ registry runs it on (its `md-test-cells` rule).
 | `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
-| `bench` | Canonical | x86_64, riscv64; debug | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
+| `bench` | Canonical | x86_64, riscv64; release | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |
 | 4kn | Local and release host runs | x86_64, riscv64; debug | svctest from a 4Kn disk (`mkdisk --block-size 4096`) | none | 4096-byte logical blocks (Disk variations below) |

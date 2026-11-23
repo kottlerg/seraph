@@ -15,6 +15,8 @@
 //!   the denied user-mode counters).
 //! - `serial`: the UART behind `crate::serial`.
 //! - `init_io_ports`, `shutdown`: harness services.
+//! - `io_port_cap`: an `IoPort` capability to bind, where the architecture has
+//!   ports.
 //! - `core_key`: the core the running CPU reports, for `integration::smt_siblings`.
 //! - `run_unit`, `run_integration`: architecture-only Tier 1 and Tier 2 tests.
 
@@ -32,7 +34,7 @@ pub use current::{
     MMIO_PROBE_PHYS, MSG_INJECTABLE, PAGE_FAULT_LOAD_VECTOR, PAGE_FAULT_STORE_VECTOR,
     ROUTABLE_HIGH_IRQ_IDS, SP_OFFSET, SYSCALL_NR_OFFSET, TLS_OFFSET, TRAP_FRAME_BYTES,
     UNROUTABLE_IRQ_IDS, breakpoint_reported_ip, callee_saved, code_stub, core_key,
-    entry_stack_pointer, fpu, fresh_range_root, illegal_instruction, init_io_ports,
+    entry_stack_pointer, fpu, fresh_range_root, illegal_instruction, init_io_ports, io_port_cap,
     msi_message_plausible, run_integration, run_unit, serial, shutdown, software_breakpoint,
     user_controls,
 };

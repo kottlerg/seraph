@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# .github/actions/std-cache/action.yml
+
+# The composite action behind the standard-library cache of the CI jobs that
+# build with `-Z build-std`; its `description` below states what it does.
+
+name: Standard-library cache
+description: >-
+  The build units of the toolchain's library packages (core, alloc,
+  compiler_builtins, std and their dependencies) for one CI job, kept in
+  one cache entry whose key is a content hash of every input of those
+  units: the installed toolchain, the runner image, the target specs, the
+  workspace and Cargo configuration, xtask's build code, and the std
+  overlay with the tree std is built from. `restore` restores the entry
+  of that exact key, with no partial-match fallback; `save`, on a push to
+  master, prunes target/ to those units (`cargo xtask clean --keep-std`)
+  and saves them. The mechanism is specified in docs/build-system.md
+  § Continuous Integration.
+
+inputs:
+  mode:
+    description: >-
+      `restore` before the job's first build; `save` as its last step.
+    required: true
+  name:
+    description: >-
+      The job's entry, unique per job of the matrix: each job builds its
+      own set of targets and profiles.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Check the inputs
+      if: >-
+        !contains(fromJSON('["restore", "save"]'), inputs.mode)
+      shell: sh
+      env:
+        MODE: ${{ inputs.mode }}
+      run: |
+        echo "::error::usage: mode restore | save; got mode '$MODE'"
+        exit 2
+
+    - name: Name the cache key
+      id: key
+      shell: sh
+      env:
+        NAME: ${{ inputs.name }}
+        # Every file in the tree the cached units are built from or with:
+        # the target specs, the Cargo configuration and profiles, xtask's
+        # build flags and std overlay logic, this action, and the std
+        # overlay with the workspace crates std depends on (shared/, abi/,
+        # runtime/ruststd/; xtask/src/rust_src.rs lists them).
+        TREE_HASH: >-
+          ${{ hashFiles('xtask/targets/**', '.cargo/config.toml', 'Cargo.toml',
+          'xtask/src/commands/build.rs', 'xtask/src/rust_src.rs',
+          '.github/actions/std-cache/action.yml', 'runtime/ruststd/**',
+          'shared/**', 'abi/**') }}
+      # The installed toolchain is named by its full version, the runner
+      # image by its name and version, whose host build scripts the
+      # entry holds.
+      run: |
+        : "${ImageOS:?}" "${ImageVersion:?}" "${TREE_HASH:?}"
+        toolchain=$(rustc -Vv | sha256sum | cut -c1-16)
+        tree=$(echo "$TREE_HASH" | cut -c1-16)
+        echo "key=std-$NAME-$ImageOS-$ImageVersion-$toolchain-$tree" >> "$GITHUB_OUTPUT"
+
+    # The exact key only: a partial match would restore units whose
+    # inputs differ, with modification times Cargo could take as fresh.
+    - name: Restore the standard-library units
+      if: inputs.mode == 'restore'
+      uses: actions/cache/restore@v6
+      with:
+        # Cargo's build directories, host and target, and those of the
+        # mirror's build directory (target/seraph-build/, whose host
+        # directories the target/* globs match), which
+        # `cargo xtask clean --keep-std` prunes.
+        path: |
+          target/debug/build
+          target/release/build
+          target/*/debug/build
+          target/*/release/build
+          target/seraph-build/*/debug/build
+          target/seraph-build/*/release/build
+        key: ${{ steps.key.outputs.key }}
+
+    - name: Keep only the standard-library units
+      if: inputs.mode == 'save' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+      shell: sh
+      run: cargo xtask clean --keep-std
+
+    # Only master's runs save, so a pull request reads entries its base
+    # branch made and never writes one. An entry is immutable: a key
+    # already saved ends this step with a warning.
+    - name: Save the standard-library units
+      if: inputs.mode == 'save' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+      uses: actions/cache/save@v6
+      with:
+        # Cargo's build directories, host and target, and those of the
+        # mirror's build directory (target/seraph-build/, whose host
+        # directories the target/* globs match), which
+        # `cargo xtask clean --keep-std` prunes.
+        path: |
+          target/debug/build
+          target/release/build
+          target/*/debug/build
+          target/*/release/build
+          target/seraph-build/*/debug/build
+          target/seraph-build/*/release/build
+        key: ${{ steps.key.outputs.key }}

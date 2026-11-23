@@ -108,7 +108,8 @@ pub const HAS_SPECULATION_CONTROLS: bool = true;
 /// Whether a user-mode CPU write raises a message-signaled target, as
 /// `stress::msg_inject_delete_race` needs: false, since an MSI is a write to
 /// the local APIC's message window that only a device's bus write reaches, and
-/// a CPU raises a device vector only from ring 0, through the ICR.
+/// a CPU raises a device vector only from ring 0, through the ICR. The cell is
+/// not registered here.
 pub const MSG_INJECTABLE: bool = false;
 
 /// Exception vector a not-present user store faults with (`#PF`), as recorded
@@ -286,6 +287,16 @@ pub fn software_breakpoint() -> u64
 pub fn fresh_range_root(_ctx: &TestContext) -> Option<u64>
 {
     ioport::carve_port_range(0x4E0, 2)
+}
+
+/// An `IoPort` capability ktest holds, for a bind to a thread that never runs
+/// (`integration::arena_reclaim`'s case 5): the wide cap
+/// ([`ioport::wide_cap`]), which a bind leaves in place, so it carves nothing
+/// and moves no later carve. Its handle is the one its split returned, not a
+/// slot index, which names only a slot never recycled.
+pub fn io_port_cap() -> Option<u64>
+{
+    ioport::wide_cap()
 }
 
 /// Seed the I/O port subdivider ([`ioport::init`]) from the root `IoPort` cap

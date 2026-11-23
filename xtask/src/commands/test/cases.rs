@@ -88,6 +88,10 @@ pub struct Case
     pub cell: Cell,
     /// The case options it takes; every other is refused.
     pub options: &'static [CaseOption],
+    /// About how many seconds the case takes in its slowest CI cell: a hint
+    /// that balances a cell's lanes ([`super::lanes`]), which never changes
+    /// which cases run. `None` takes [`super::lanes::DEFAULT_WEIGHT`].
+    pub weight: Option<u32>,
     /// The case itself.
     pub run: fn(&Context, &CaseArgs) -> Result<()>,
 }
@@ -129,6 +133,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[],
+            weight: Some(18),
             run: terminal::run,
         },
         // Two boots with the default layout, a third with the `nokaslr` knob.
@@ -137,6 +142,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Ktest,
             cell: Cell::Ci(Tester::Ktest),
             options: &[CaseOption::RiscvMmu, CaseOption::X86Paging],
+            weight: None,
             run: kaslr::run,
         },
         // The kernel, bundle, policy-missing, revoked, rootfs, configuration,
@@ -146,6 +152,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[CaseOption::Release],
+            weight: Some(95),
             run: signing::run,
         },
         // The boot with no IOMMU, refused, then the boot behind one.
@@ -154,6 +161,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[],
+            weight: Some(28),
             run: dma_confinement::run,
         },
         // The floor written, raised, and refusing the older bootloader, on
@@ -163,6 +171,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[CaseOption::Release],
+            weight: Some(30),
             run: rollback::run,
         },
         // A root enrolled signed, one refused at the timeout then confirmed,
@@ -173,6 +182,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[],
+            weight: Some(112),
             run: enrolment::run,
         },
         // The signed bootloader on enrolled keys, the tampered and the
@@ -182,6 +192,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[],
+            weight: Some(38),
             run: secureboot::run,
         },
         // An AP, then the BSP.
@@ -190,6 +201,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[],
+            weight: Some(50),
             run: wedge::run,
         },
         // The saved boot and its restore.
@@ -198,6 +210,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[],
+            weight: Some(8),
             run: vmgenid::run,
         },
         // Device boots under each hotplug owner the architecture has (two on
@@ -207,6 +220,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Host,
             options: &[],
+            weight: None,
             run: hotplug::run,
         },
         // The ktest boot on shadow stacks, then the corrupted return.
@@ -215,6 +229,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Ktest,
             cell: Cell::Host,
             options: &[],
+            weight: None,
             run: cet::run,
         },
         // `tpm-tis`, then `tpm-crb`.
@@ -223,6 +238,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Host,
             options: &[],
+            weight: None,
             run: tpm::run,
         },
         // One boot per cause the architecture has.
@@ -231,6 +247,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[CaseOption::Cause],
+            weight: Some(135),
             run: shutdown::run,
         },
         // The echo fixture's boot, then the GDB stub's.
@@ -239,6 +256,7 @@ pub fn case(case: TestCase) -> Case
             bundle: Harness::Init,
             cell: Cell::Host,
             options: &[CaseOption::Port, CaseOption::Gdb],
+            weight: None,
             run: debug_port::run,
         },
     }
@@ -544,6 +562,12 @@ pub fn run_cell(ctx: &Context, tester: Tester, args: &TestArgs) -> Result<()>
         ));
         return Ok(());
     }
+    let lanes = check_lanes(args)?;
+    if lanes > 1 && names.len() > 1
+    {
+        let failed = super::lanes::run(ctx, tester, arch, &names, args, lanes)?;
+        return cell_outcome(tester, &names, &failed);
+    }
     let staged = read_staged(ctx)?;
     let mut staging = SysrootStaging::new(ctx, arch);
     let failed = without_staged_request(staged, &mut staging, || {
@@ -562,6 +586,36 @@ pub fn run_cell(ctx: &Context, tester: Tester, args: &TestArgs) -> Result<()>
         }
         Ok(failed)
     })?;
+    cell_outcome(tester, &names, &failed)
+}
+
+/// The lanes `args` asks a cell for (1 without `--lanes`), refused past
+/// [`super::lanes::LANES_MAX`], and beside `--alone` or `--timing`, which
+/// run beside no other QEMU.
+fn check_lanes(args: &TestArgs) -> Result<u32>
+{
+    if args.lane_root.is_some()
+    {
+        bail!("--lane-root runs one case of a cell's lane, and names no cell");
+    }
+    let lanes = args.lanes.unwrap_or(1);
+    if lanes == 0 || lanes > super::lanes::LANES_MAX
+    {
+        bail!(
+            "--lanes takes 1 to {}: the small boots the host launch rules admit side by side",
+            super::lanes::LANES_MAX
+        );
+    }
+    if lanes > 1 && (args.host.alone || args.host.timing)
+    {
+        bail!("--lanes above 1 runs boots side by side, and --alone and --timing run one alone");
+    }
+    Ok(lanes)
+}
+
+/// The outcome of `tester`'s cell, which ran `names` and saw `failed` fail.
+fn cell_outcome(tester: Tester, names: &[TestCase], failed: &[String]) -> Result<()>
+{
     if !failed.is_empty()
     {
         bail!(

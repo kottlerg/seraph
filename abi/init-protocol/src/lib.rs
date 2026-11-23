@@ -517,18 +517,16 @@ pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
 #[must_use]
 pub fn find_module_slot(names: &[InitModuleName], name: &[u8]) -> Option<u64>
 {
-    names
-        .iter()
-        .find(|entry| carries(entry, name))
-        .map(|entry| entry.slot)
+    names.iter().find_map(|entry| slot_if_carries(entry, name))
 }
 
-/// Whether `entry` carries the module name `name`: its name, trimmed at its
-/// first NUL ([`module_name_str`]), is `name` whole. [`find_module_slot`]
-/// takes the first entry of the table for which this holds.
-fn carries(entry: &InitModuleName, name: &[u8]) -> bool
+/// The slot of `entry` when it carries the module name `name`, its name
+/// trimmed at its first NUL ([`module_name_str`]) being `name` whole, and
+/// `None` otherwise. [`find_module_slot`] answers with the first entry of the
+/// table for which this is a slot.
+fn slot_if_carries(entry: &InitModuleName, name: &[u8]) -> Option<u64>
 {
-    module_name_str(&entry.name) == name
+    (module_name_str(&entry.name) == name).then_some(entry.slot)
 }
 
 #[cfg(test)]
@@ -634,15 +632,17 @@ mod tests
 /// Bounded proofs of the module-name table parser's contract (docs/testing.md
 /// § Bounded verification, Parser proofs).
 ///
-/// [`find_module_slot`] is core's `find` over the table's entries with
-/// [`carries`] as its test, which reads one entry and the request alone and
-/// carries nothing to the next entry. The base proof runs the whole function
-/// on the empty table, and the step proof proves the test on every entry and
-/// request; so a lookup finds the slot of the first entry the test takes, or
-/// nothing. The trim proof proves the trim on every name. What lies outside
-/// the proofs is the code that drives the test: `find`, its walk of a table
-/// of any length that stops at the first entry taken, and the loop that hands
-/// the property its entries. The fuzz target `init-protocol` and the replay of
+/// [`find_module_slot`] is core's `find_map` over the table's entries with
+/// [`slot_if_carries`] as its step, which reads one entry and the request
+/// alone and carries nothing to the next entry. The base proof runs the whole
+/// function on the empty table, and the step proof proves the step on every
+/// entry and request: it answers the entry's slot exactly when the entry's
+/// name is the request whole, and nothing otherwise. So a lookup finds the
+/// slot of the first entry whose name is the request, or nothing. The trim
+/// proof proves the trim on every name. What lies outside the proofs is the
+/// code that drives the step: `find_map`, its walk of a table of any length
+/// that stops at the first slot the step answers, and the loop that hands the
+/// property its entries. The fuzz target `init-protocol` and the replay of
 /// the checked-in inputs check them with tables of up to eight entries.
 #[cfg(kani)]
 mod proofs
@@ -666,9 +666,9 @@ mod proofs
         property::lookup_holds(&[], &request[..len]);
     }
 
-    /// Step of the walk: the test of one entry, of any slot and name, takes it
-    /// exactly when its trimmed name is the request whole, for every request
-    /// of up to `MAX_REQUEST` bytes. The longest loops are the trim and
+    /// Step of the walk: the step of one entry, of any slot and name, answers
+    /// its slot exactly when its trimmed name is the request whole, and
+    /// nothing otherwise, for every request of up to `MAX_REQUEST` bytes. The longest loops are the trim and
     /// compare of the 256-byte name and the property's byte-by-byte check of
     /// it, so an unwind bound of 258 covers every loop.
     #[kani::proof]
@@ -682,7 +682,7 @@ mod proofs
         let request: [u8; MAX_REQUEST] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= request.len());
-        property::carries_holds(&entry, &request[..len]);
+        property::slot_holds(&entry, &request[..len]);
     }
 
     /// The trim of a table name holds on every name: it stops at the first

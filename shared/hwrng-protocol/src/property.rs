@@ -15,7 +15,9 @@
 
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
-use crate::{MAX_READ_BYTES, decode_reply, encode_reply, requested_len};
+use crate::{
+    MAX_READ_BYTES, decode_reply, encode_reply, pack_word, reply_count, requested_len, unpack_word,
+};
 
 /// The most words an input is read as: one past what a message carries,
 /// since the decoders take any slice.
@@ -61,6 +63,21 @@ pub fn hwrng_protocol_holds(input: &[u8])
         .unwrap_or_default();
     request_holds(words);
     reply_holds(words, out_len);
+    if let Some((&count, payload)) = words.split_first()
+    {
+        count_holds(count, payload.len(), out_len);
+    }
+    for &word in words
+    {
+        for len in 0..=8
+        {
+            unpack_holds(word, len);
+        }
+    }
+    for chunk in body.chunks(8)
+    {
+        pack_holds(chunk);
+    }
     let mut out = [0u8; MAX_OUT];
     let buffer = out.get_mut(..out_len).unwrap_or_default();
     if let Some(count) = decode_reply(words, buffer)
@@ -130,6 +147,57 @@ pub(crate) fn reply_holds(words: &[u64], out_len: usize)
         {
             assert_eq!(byte, UNWRITTEN, "a byte past the count was written");
         }
+    }
+}
+
+/// [`reply_count`], the check [`decode_reply`] puts to a reply before it
+/// unpacks any word, takes the count word `count` exactly when it counts at
+/// most `out_len` bytes, at most [`MAX_READ_BYTES`], and at most the bytes
+/// `words` words hold, and then names `count` bytes.
+pub(crate) fn count_holds(count: u64, words: usize, out_len: usize)
+{
+    let asked = u128::from(count);
+    let carried = (words as u128).saturating_mul(8);
+    let fits = asked <= out_len as u128 && asked <= MAX_READ_BYTES as u128 && asked <= carried;
+    let expected = fits.then(|| usize::try_from(count).ok()).flatten();
+    assert_eq!(
+        reply_count(count, words, out_len),
+        expected,
+        "a count was taken, or refused, against its checks"
+    );
+}
+
+/// [`unpack_word`] of `word` into a chunk of `len` bytes, at most 8, writes
+/// the word's first `len` bytes in little-endian order, each at its own
+/// index, and nothing past them.
+pub(crate) fn unpack_holds(word: u64, len: usize)
+{
+    let mut chunk = [UNWRITTEN; 8];
+    unpack_word(word, chunk.get_mut(..len).unwrap_or_default());
+    for (at, (&byte, sent)) in chunk.iter().zip(word.to_le_bytes()).enumerate()
+    {
+        if at < len
+        {
+            assert_eq!(byte, sent, "a byte of a word was misread");
+        }
+        else
+        {
+            assert_eq!(byte, UNWRITTEN, "a byte past a chunk was written");
+        }
+    }
+}
+
+/// [`pack_word`] of `chunk`, at most 8 bytes, is the word whose bytes in
+/// little-endian order are the chunk's, then zeros, each at its own index.
+pub(crate) fn pack_holds(chunk: &[u8])
+{
+    for (at, byte) in pack_word(chunk).to_le_bytes().into_iter().enumerate()
+    {
+        assert_eq!(
+            byte,
+            chunk.get(at).copied().unwrap_or(0),
+            "a chunk was packed into another word"
+        );
     }
 }
 

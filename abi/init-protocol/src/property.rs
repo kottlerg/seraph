@@ -12,7 +12,9 @@
 //! [`find_module_slot`] over the table the kernel copies from the boot
 //! modules' names, which the bundle carries.
 
-use crate::{INIT_MODULE_NAME_LEN, InitModuleName, carries, find_module_slot, module_name_str};
+use crate::{
+    INIT_MODULE_NAME_LEN, InitModuleName, find_module_slot, module_name_str, slot_if_carries,
+};
 
 /// The most table entries an input is read as.
 const MAX_NAMES: usize = 8;
@@ -65,7 +67,7 @@ pub fn init_protocol_holds(input: &[u8])
     for entry in names.get(..count).unwrap_or_default()
     {
         name_holds(&entry.name);
-        carries_holds(entry, request);
+        slot_holds(entry, request);
     }
     lookup_holds(names.get(..count).unwrap_or_default(), request);
 }
@@ -121,13 +123,14 @@ pub(crate) fn name_holds(name: &[u8; INIT_MODULE_NAME_LEN])
     }
 }
 
-/// [`carries`], the test [`find_module_slot`] puts to each entry, takes
-/// `entry` exactly when its name stands for `request`.
-pub(crate) fn carries_holds(entry: &InitModuleName, request: &[u8])
+/// [`slot_if_carries`], the step [`find_module_slot`] puts to each entry,
+/// answers `entry`'s slot exactly when its name stands for `request`, and
+/// nothing otherwise.
+pub(crate) fn slot_holds(entry: &InitModuleName, request: &[u8])
 {
     assert_eq!(
-        carries(entry, request),
-        stands_for(&entry.name, request),
+        slot_if_carries(entry, request),
+        stands_for(&entry.name, request).then_some(entry.slot),
         "an entry was taken, or passed over, against its name"
     );
 }

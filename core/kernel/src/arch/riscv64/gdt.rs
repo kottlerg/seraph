@@ -26,6 +26,9 @@ pub struct ThreadIopb
 {
     /// No parts.
     pub parts: [*mut [u8; IOPB_PART_BYTES]; IOPB_PARTS],
+    /// The bitmap's version, as on x86-64, where the context switch compares
+    /// it; set by `cap::ioport_bindings`, which no RISC-V thread reaches.
+    pub generation: u64,
 }
 
 /// Return the BSP TSS pointer. On RISC-V this is always 0 — there is no TSS.

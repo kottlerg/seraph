@@ -2,7 +2,11 @@
 
 The wire protocol of the `hwrng` device class: the one label a hardware random-number generator
 driver serves, its verb bit, its error codes, and the codec of its reply. A driver of the class and
-every consumer of the class compile against this crate. `no_std`; host unit tests cover the codec.
+every consumer of the class compile against this crate. `no_std`; host unit tests cover the codec,
+and its decoders, which read words from across an IPC boundary, have the property in
+`src/property.rs` that the fuzz target `hwrng-protocol`, the replay of its checked-in inputs
+under `fuzz/hwrng-protocol/`, and the proof harnesses in `src/lib.rs` drive
+([docs/testing.md](../../docs/testing.md#fuzzing) § Fuzzing, § Bounded verification).
 
 ---
 

@@ -27,6 +27,9 @@
 
 #![no_std]
 
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
+
 // ── Protocol version ─────────────────────────────────────────────────────────
 
 /// Init protocol version. Incremented on any breaking layout or semantic change.
@@ -117,7 +120,12 @@
 ///     array after them at [`InitInfo::cap_descriptors_offset`]. Every
 ///     field after `init_info_memory_count` moves. A module's name is the
 ///     install path its signature names.
-pub const INIT_PROTOCOL_VERSION: u32 = 19;
+/// v20: Added `boot_device` ([`InitBootDevice`]) before `framebuffer`: the
+///     device the firmware booted from (the boot ESP's GPT `HardDrive`
+///     descriptor and its controller's PCI location), which the kernel checks
+///     and copies from `BootInfo`. `framebuffer` moves 48 bytes on, and the
+///     boot-module name table and the descriptor array after it.
+pub const INIT_PROTOCOL_VERSION: u32 = 20;
 
 /// Length of [`InitModuleName::name`], matching
 /// `boot_protocol::BOOT_MODULE_NAME_LEN` (256, `objsig::NAME_MAX`) so the
@@ -147,7 +155,7 @@ pub const INIT_STACK_PAGES: usize = 4;
 
 /// Ceiling on the 4 KiB pages of the [`InitInfo`] region (the header, the
 /// boot-module name table, then the [`CapDescriptor`] array): 64 pages hold
-/// 7,484 descriptors past the header and a full name table.
+/// 7,482 descriptors past the header and a full name table.
 ///
 /// The kernel sizes each boot's region from that boot's own counts, one
 /// name per boot module, and one descriptor per coalesced RAM extent, ACPI
@@ -325,6 +333,12 @@ pub struct InitInfo
     /// accounting, never itself a capability.
     pub kernel_reserved_bytes: u64,
 
+    // ── Boot device (added in protocol version 20) ─────────────────────
+    /// The device the firmware booted from ([`InitBootDevice`]), as the
+    /// bootloader reported it and the kernel checked it. init passes it to
+    /// vfsd in vfsd's bootstrap.
+    pub boot_device: InitBootDevice,
+
     // ── Framebuffer geometry (added in protocol version 8) ─────────────
     /// Bootloader-discovered framebuffer geometry. `physical_base == 0`
     /// indicates no framebuffer is present and devmgr skips the
@@ -467,6 +481,52 @@ impl InitFramebufferInfo
     }
 }
 
+/// [`InitBootDevice::flags`] bit 0: the `esp_*` fields hold the boot ESP's
+/// GPT `HardDrive` descriptor. Equals `boot_protocol::BOOT_DEVICE_ESP`.
+pub const INIT_BOOT_DEVICE_ESP: u32 = 1 << 0;
+
+/// [`InitBootDevice::flags`] bit 1: the `pci_*` fields hold the PCI location
+/// of the controller beneath the boot ESP. Equals
+/// `boot_protocol::BOOT_DEVICE_PCI`.
+pub const INIT_BOOT_DEVICE_PCI: u32 = 1 << 1;
+
+/// The device the firmware booted from, forwarded to init.
+///
+/// Mirrors `boot_protocol::BootDevice` field for field, redefined here so
+/// `init-protocol` keeps its zero-dependency invariant; the kernel copies the
+/// bootloader's record into it at Phase 9 after checking it with
+/// `boot_protocol::BootDevice::check`, so a record init reads has only the
+/// two flag bits above, zero reserved bytes, and each part either flagged
+/// present or all zero. A present ESP has a nonzero partition number and
+/// size and an extent inside the 64-bit block range; a present PCI location
+/// has a device number of at most 31 and a function number of at most 7.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InitBootDevice
+{
+    /// Which parts are present: [`INIT_BOOT_DEVICE_ESP`],
+    /// [`INIT_BOOT_DEVICE_PCI`].
+    pub flags: u32,
+    /// The boot ESP's 1-based GPT partition number.
+    pub esp_partition_number: u32,
+    /// The boot ESP's first logical block on its disk.
+    pub esp_start_lba: u64,
+    /// The boot ESP's size in logical blocks.
+    pub esp_size_lba: u64,
+    /// The boot ESP's unique partition GUID, in GPT on-disk byte order.
+    pub esp_partition_guid: [u8; 16],
+    /// PCI segment group of the controller.
+    pub pci_segment: u16,
+    /// PCI bus number of the controller, as the firmware numbered the buses.
+    pub pci_bus: u8,
+    /// PCI device number of the controller.
+    pub pci_device: u8,
+    /// PCI function number of the controller.
+    pub pci_function: u8,
+    /// Zero.
+    pub reserved: [u8; 3],
+}
+
 /// Capability type discriminant for [`CapDescriptor`].
 ///
 /// Discriminant values match the kernel's `CapTag` enum for the types that
@@ -514,15 +574,23 @@ pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
 #[must_use]
 pub fn find_module_slot(names: &[InitModuleName], name: &[u8]) -> Option<u64>
 {
-    names
-        .iter()
-        .find(|entry| module_name_str(&entry.name) == name)
-        .map(|entry| entry.slot)
+    names.iter().find_map(|entry| slot_if_carries(entry, name))
+}
+
+/// The slot of `entry` when it carries the module name `name`, its name
+/// trimmed at its first NUL ([`module_name_str`]) being `name` whole, and
+/// `None` otherwise. [`find_module_slot`] answers with the first entry of the
+/// table for which this is a slot.
+fn slot_if_carries(entry: &InitModuleName, name: &[u8]) -> Option<u64>
+{
+    (module_name_str(&entry.name) == name).then_some(entry.slot)
 }
 
 #[cfg(test)]
 mod tests
 {
+    extern crate std;
+
     use super::*;
 
     // ABI contract: the kernel writes these into the region and init reads
@@ -530,7 +598,8 @@ mod tests
     #[test]
     fn init_protocol_struct_sizes_are_stable()
     {
-        assert_eq!(core::mem::size_of::<InitInfo>(), 216);
+        assert_eq!(core::mem::size_of::<InitInfo>(), 264);
+        assert_eq!(core::mem::size_of::<InitBootDevice>(), 48);
         assert_eq!(core::mem::size_of::<InitModuleName>(), 264);
         assert_eq!(core::mem::size_of::<CapDescriptor>(), 32);
     }
@@ -554,5 +623,135 @@ mod tests
         assert_eq!(find_module_slot(&names, &longest), Some(7));
         assert_eq!(find_module_slot(&names, b"/services/mem"), None);
         assert_eq!(find_module_slot(&names, b"memmgr"), None);
+    }
+
+    /// The checked-in inputs of the fuzz target `init-protocol` of the `kinds`
+    /// given (`seeds`, `regressions`).
+    fn fuzz_inputs(kinds: &[&str]) -> std::vec::Vec<std::vec::Vec<u8>>
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/init-protocol");
+        let mut inputs = std::vec::Vec::new();
+        for kind in kinds
+        {
+            let Ok(entries) = std::fs::read_dir(dir.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in entries
+            {
+                inputs.push(std::fs::read(entry.unwrap().path()).unwrap());
+            }
+        }
+        inputs
+    }
+
+    // Defect caught: a parser change that breaks its contract on an input
+    // the fuzz target once found or started from; `cargo xtask test` replays
+    // every checked-in input of fuzz/init-protocol/ on each change.
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_parser_contract()
+    {
+        let inputs = fuzz_inputs(&["seeds", "regressions"]);
+        assert!(
+            !inputs.is_empty(),
+            "no checked-in input under fuzz/init-protocol"
+        );
+        for bytes in &inputs
+        {
+            property::init_protocol_holds(bytes);
+        }
+    }
+
+    // Defect caught: seeds that no longer reach a found module (a request
+    // length that no longer matches its bytes, say), so the fuzz target
+    // starts from misses alone.
+    #[test]
+    fn a_seed_finds_a_module_past_the_first_entry()
+    {
+        let found = fuzz_inputs(&["seeds"]).iter().any(|bytes| {
+            let len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+            let request = &bytes[2..2 + len];
+            let names: std::vec::Vec<InitModuleName> = bytes[2 + len..]
+                .as_chunks::<{ 8 + INIT_MODULE_NAME_LEN }>()
+                .0
+                .iter()
+                .map(|raw| InitModuleName {
+                    slot: u64::from_le_bytes(raw[..8].try_into().unwrap()),
+                    name: raw[8..].try_into().unwrap(),
+                })
+                .collect();
+            find_module_slot(&names, request).is_some_and(|slot| slot != names[0].slot)
+        });
+        assert!(found, "no seed finds a module past the first entry");
+    }
+}
+
+/// Bounded proofs of the module-name table parser's contract (docs/testing.md
+/// § Bounded verification, Parser proofs).
+///
+/// [`find_module_slot`] is core's `find_map` over the table's entries with
+/// [`slot_if_carries`] as its step, which reads one entry and the request
+/// alone and carries nothing to the next entry. The base proof runs the whole
+/// function on the empty table, and the step proof proves the step on every
+/// entry and request: it answers the entry's slot exactly when the entry's
+/// name is the request whole, and nothing otherwise. So a lookup finds the
+/// slot of the first entry whose name is the request, or nothing. The trim
+/// proof proves the trim on every name. What lies outside the proofs is the
+/// code that drives the step: `find_map`, its walk of a table of any length
+/// that stops at the first slot the step answers, and the loop that hands the
+/// property its entries. The fuzz target `init-protocol` and the replay of
+/// the checked-in inputs check them with tables of up to eight entries.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{INIT_MODULE_NAME_LEN, InitModuleName, property};
+
+    /// The longest request the proofs take: one byte past the longest name
+    /// any entry can hold, so a request no name can equal is among them.
+    const MAX_REQUEST: usize = INIT_MODULE_NAME_LEN + 1;
+
+    /// Base of the walk: the empty table finds nothing, for every request.
+    /// The longest loop is the property's, over no entry, so an unwind bound
+    /// of 2 covers every loop.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn the_empty_table_finds_nothing()
+    {
+        let request: [u8; MAX_REQUEST] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= request.len());
+        property::lookup_holds(&[], &request[..len]);
+    }
+
+    /// Step of the walk: the step of one entry, of any slot and name, answers
+    /// its slot exactly when its trimmed name is the request whole, and
+    /// nothing otherwise, for every request of up to `MAX_REQUEST` bytes. The longest loops are the trim and
+    /// compare of the 256-byte name and the property's byte-by-byte check of
+    /// it, so an unwind bound of 258 covers every loop.
+    #[kani::proof]
+    #[kani::unwind(258)]
+    fn each_entry_the_lookup_tests_is_taken_by_its_name()
+    {
+        let entry = InitModuleName {
+            slot: kani::any(),
+            name: kani::any(),
+        };
+        let request: [u8; MAX_REQUEST] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= request.len());
+        property::slot_holds(&entry, &request[..len]);
+    }
+
+    /// The trim of a table name holds on every name: it stops at the first
+    /// NUL and keeps the whole name without one. The longest loops are the
+    /// trim's scan of the 256-byte name and the check of each of its bytes at
+    /// its own index, so an unwind bound of 257 covers them.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn every_name_trims_at_its_first_nul()
+    {
+        let name: [u8; INIT_MODULE_NAME_LEN] = kani::any();
+        property::name_holds(&name);
     }
 }

@@ -7684,14 +7684,17 @@ pub unsafe fn schedule(requeue: Requeue)
     // blocks), it is now off-queue and drained — fall back to idle this cycle
     // (the next tick re-schedules).
     //
-    // A dispatched `next`'s IOPB (its own bitmap, or the all-denied one when
-    // `iopb` is null) is loaded into this CPU's TSS inside the same critical
-    // section: `SYS_IOPORT_BIND` installs and edits the bitmap under that
+    // A dispatched `next`'s IOPB is loaded into this CPU's TSS inside the same
+    // critical section (its own bitmap, copied only when the TSS does not hold
+    // it at its generation, or, when `iopb` is null, the invalid offset and no
+    // byte): `SYS_IOPORT_BIND` installs and edits the bitmap under that
     // `sched_lock` (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
     // Ownership, Address-space / capability row), so an
     // `invalidate_all_iopbs` that a remote bind or withdrawal issues after
-    // this load is never overwritten by it. x86-64 only; `load_iopb` is a
-    // no-op on RISC-V, where `iopb` is always null.
+    // this load is never overwritten by it. An idle `next` loads nothing: it
+    // runs no ring-3 code, and the next non-idle thread's flip sets the TSS for
+    // itself. x86-64 only; `load_iopb` is a no-op on RISC-V, where `iopb` is
+    // always null.
     //
     // Only an idle (or absent) outgoing thread may wait for `next`'s register
     // save to publish (step 3.5 of the `context_saved` protocol in
@@ -7702,8 +7705,6 @@ pub unsafe fn schedule(requeue: Requeue)
     // back to its own run queue and switches to idle, whose `schedule()`
     // dispatches it once published.
     let outgoing_may_wait = current.is_null() || core::ptr::eq(current, sched.idle());
-    #[cfg(not(test))]
-    let mut iopb_loaded = false;
     // The idle-runs-`Ready` invariant: this CPU's idle thread skips the flip
     // below, so it runs `Ready` once its own dispatch has dequeued it (or
     // `Running`, from its construction or a `next == current` re-mark), and no
@@ -7809,7 +7810,6 @@ pub unsafe fn schedule(requeue: Requeue)
                 // SAFETY: interrupts are disabled; the bitmap stays live and
                 // unchanged under next.sched_lock, held here.
                 unsafe { crate::arch::current::gdt::load_iopb(iopb) };
-                iopb_loaded = true;
             }
         }
         // SAFETY: paired with lock_raw above.
@@ -7952,18 +7952,6 @@ pub unsafe fn schedule(requeue: Requeue)
         // SAFETY: the space is marked active on this CPU above; this runs at
         // ring 0 / S-mode, in kernel mappings every address space shares.
         unsafe { nxt_space.activate() };
-    }
-
-    // An idle `next` (dispatched as idle, or the fallback above), whose IOPB
-    // the dispatch flip did not load, runs with the TSS IOPB filled with 0xFF
-    // (deny all). Idle runs no ring-3 code, and the switch to the next user
-    // thread reloads the bitmap under that thread's `sched_lock`.
-    #[cfg(not(test))]
-    if !iopb_loaded
-    {
-        // SAFETY: interrupts are disabled (scheduler path); GS-base names this
-        // CPU's PerCpuData.
-        unsafe { crate::arch::current::gdt::load_iopb(None) };
     }
 
     // FPU context-switch hooks. Both arches use eager save on switch-out,

@@ -105,6 +105,15 @@ Notes on the non-obvious entries:
   re-derived destination handles outbound. Both directions expose only
   values the owning process already holds or is being granted; see
   [syscalls.md](syscalls.md) § Capability Handles.
+- **IPC `data[]` and `cap_slots[]` past the counts.** A message is built and read in place in a
+  TCB's `ipc_msg`, and no path zeroes it, so its arrays keep words of earlier messages past
+  `data_count` and `cap_count`. `Message` keeps the counts and arrays private, and its
+  accessors (`Message::data`, `Message::caps`), the only view of them, return exactly the
+  counted words, so no copy (`Message::copy_from`) or delivery reaches a word past them. A
+  receive that binds no sender after skipping a dead one empties the receiver's message. A receive
+  whose park a coalesced wake refused (`ParkCommit::RefusedWake`) publishes its `ipc_msg` as it
+  stands (fail-open, [ipc-internals.md](ipc-internals.md) § Park Dispositions and Episodes): a
+  message the thread itself sent, received, or staged, never another thread's.
 - **Fault messages** carry, for `FAULT_KIND_VM`, the user faulting address in `d1`
   (`CR2` on x86-64, `stval` on RISC-V), access flags in `d2`, and the user instruction
   pointer from the `TrapFrame` in `ip`; for `FAULT_KIND_EXCEPTION`, a normalized
@@ -163,7 +172,10 @@ Notes on the non-obvious entries:
   accounting facts including `kernel_reserved_bytes` are quantities, not
   addresses (**d**); the only addresses it carries are physical — each
   `CapDescriptor::aux0` for a Memory/Mmio cap and `InitFramebufferInfo::physical_base`
-  (**e**, see "Physical-address surfaces"). No field is a kernel VA.
+  (**e**, see "Physical-address surfaces"). `InitInfo.boot_device` (the boot ESP's partition
+  number, block extent and GUID, and its controller's PCI location) is firmware-reported
+  identification of the boot disk, copied from `BootInfo`: quantities and identifiers (**d**), no
+  address. No field is a kernel VA.
 - **`CAP_INFO_MEMORY_MAPPINGS`** returns a count (**d**). It is the number of user page-table
   leaves, in any address space, that name a frame of the queried window of a Memory region. It
   carries no address, and the kernel answers only through a Memory capability the caller holds, for

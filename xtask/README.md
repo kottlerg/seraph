@@ -803,7 +803,7 @@ tree (`git ls-files`, untracked files not ignored included) and the state the ca
 | `disk.img`, `disk-data.img` | every case, through its packs |
 | `symbols/` | none; a case's crash reports are symbolized against it |
 | `target/xtask/signing/` | every case, whose packs sign under the trust store (with `SERAPH_SIGNING_DIR` set, CI's signing keys are outside the checkout and shared read-only) |
-| `target/x86_64-unknown-uefi/`, `target/riscv64imac-seraph-uefi/` | `signing` and `rollback`, which build their bootloaders there |
+| `target/x86_64-unknown-uefi/`, `target/riscv64imac-seraph-uefi/`, and the host's `target/debug/build/` and `target/release/build/` | `signing` and `rollback`, which build their bootloaders there, with their build scripts |
 | `target/xtask/test/`, `target/xtask/run/` | every case, its logs |
 
 A lane's case boots are admitted against the checkout's own host lock, as small boots

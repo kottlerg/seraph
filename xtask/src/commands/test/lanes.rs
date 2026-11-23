@@ -53,9 +53,10 @@ pub const DEFAULT_WEIGHT: u32 = 60;
 /// stage substitutes and requests on its ESP), the images every pack writes
 /// (`disk.img`, `disk-data.img`), the symbols store crash reports are read
 /// against, the trust store every pack signs under
-/// (`target/xtask/signing`), and the UEFI targets' build output, which the
-/// `signing` and `rollback` cases rebuild their bootloaders into. A path
-/// absent from the checkout is not copied.
+/// (`target/xtask/signing`), and the UEFI targets' build output with the
+/// host's build-script units, which the `signing` and `rollback` cases
+/// rebuild their bootloaders from and into. A path absent from the checkout
+/// is not copied.
 pub const LANE_STATE: &[&str] = &[
     "sysroot",
     "symbols",
@@ -64,6 +65,8 @@ pub const LANE_STATE: &[&str] = &[
     "target/xtask/signing",
     "target/x86_64-unknown-uefi",
     "target/riscv64imac-seraph-uefi",
+    "target/debug/build",
+    "target/release/build",
 ];
 
 /// The state of the checkout that no lane may change: [`LANE_STATE`] but

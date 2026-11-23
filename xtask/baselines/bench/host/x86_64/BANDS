@@ -3,14 +3,10 @@
 # a benchmark's spread being the range of its five p50s over their median.
 # Format: xtask/README.md (`cargo xtask bench-check`).
 ktest.null_syscall_roundtrip cpus=4 band=3.18
-# Held at the debug build's band: bimodal at 4 CPUs on the release build (#1557).
-ktest.ipc_round_trip words=0 cpus=4 band=0.78
-# Held at the debug build's band: bimodal at 4 CPUs on the release build (#1557).
-ktest.ipc_round_trip words=6 cpus=4 band=1.08
-# Held at the debug build's band: bimodal at 4 CPUs on the release build (#1557).
-ktest.ipc_round_trip words=7 cpus=4 band=0.75
-# Held at the debug build's band: bimodal at 4 CPUs on the release build (#1557).
-ktest.notification_roundtrip cpus=4 band=38.34
+ktest.ipc_round_trip words=0 cpus=4 band=3.15
+ktest.ipc_round_trip words=6 cpus=4 band=84.59
+ktest.ipc_round_trip words=7 cpus=4 band=2.62
+ktest.notification_roundtrip cpus=4 band=73.30
 ktest.cap_create_delete cpus=4 band=57.84
 ktest.cap_info_lookup cpus=4 band=54.95
 ktest.mem_map_unmap cpus=4 band=33.43

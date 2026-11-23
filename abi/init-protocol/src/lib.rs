@@ -27,6 +27,9 @@
 
 #![no_std]
 
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
+
 // ── Protocol version ─────────────────────────────────────────────────────────
 
 /// Init protocol version. Incremented on any breaking layout or semantic change.
@@ -571,15 +574,23 @@ pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
 #[must_use]
 pub fn find_module_slot(names: &[InitModuleName], name: &[u8]) -> Option<u64>
 {
-    names
-        .iter()
-        .find(|entry| module_name_str(&entry.name) == name)
-        .map(|entry| entry.slot)
+    names.iter().find_map(|entry| slot_if_carries(entry, name))
+}
+
+/// The slot of `entry` when it carries the module name `name`, its name
+/// trimmed at its first NUL ([`module_name_str`]) being `name` whole, and
+/// `None` otherwise. [`find_module_slot`] answers with the first entry of the
+/// table for which this is a slot.
+fn slot_if_carries(entry: &InitModuleName, name: &[u8]) -> Option<u64>
+{
+    (module_name_str(&entry.name) == name).then_some(entry.slot)
 }
 
 #[cfg(test)]
 mod tests
 {
+    extern crate std;
+
     use super::*;
 
     // ABI contract: the kernel writes these into the region and init reads
@@ -612,5 +623,135 @@ mod tests
         assert_eq!(find_module_slot(&names, &longest), Some(7));
         assert_eq!(find_module_slot(&names, b"/services/mem"), None);
         assert_eq!(find_module_slot(&names, b"memmgr"), None);
+    }
+
+    /// The checked-in inputs of the fuzz target `init-protocol` of the `kinds`
+    /// given (`seeds`, `regressions`).
+    fn fuzz_inputs(kinds: &[&str]) -> std::vec::Vec<std::vec::Vec<u8>>
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/init-protocol");
+        let mut inputs = std::vec::Vec::new();
+        for kind in kinds
+        {
+            let Ok(entries) = std::fs::read_dir(dir.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in entries
+            {
+                inputs.push(std::fs::read(entry.unwrap().path()).unwrap());
+            }
+        }
+        inputs
+    }
+
+    // Defect caught: a parser change that breaks its contract on an input
+    // the fuzz target once found or started from; `cargo xtask test` replays
+    // every checked-in input of fuzz/init-protocol/ on each change.
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_parser_contract()
+    {
+        let inputs = fuzz_inputs(&["seeds", "regressions"]);
+        assert!(
+            !inputs.is_empty(),
+            "no checked-in input under fuzz/init-protocol"
+        );
+        for bytes in &inputs
+        {
+            property::init_protocol_holds(bytes);
+        }
+    }
+
+    // Defect caught: seeds that no longer reach a found module (a request
+    // length that no longer matches its bytes, say), so the fuzz target
+    // starts from misses alone.
+    #[test]
+    fn a_seed_finds_a_module_past_the_first_entry()
+    {
+        let found = fuzz_inputs(&["seeds"]).iter().any(|bytes| {
+            let len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+            let request = &bytes[2..2 + len];
+            let names: std::vec::Vec<InitModuleName> = bytes[2 + len..]
+                .as_chunks::<{ 8 + INIT_MODULE_NAME_LEN }>()
+                .0
+                .iter()
+                .map(|raw| InitModuleName {
+                    slot: u64::from_le_bytes(raw[..8].try_into().unwrap()),
+                    name: raw[8..].try_into().unwrap(),
+                })
+                .collect();
+            find_module_slot(&names, request).is_some_and(|slot| slot != names[0].slot)
+        });
+        assert!(found, "no seed finds a module past the first entry");
+    }
+}
+
+/// Bounded proofs of the module-name table parser's contract (docs/testing.md
+/// § Bounded verification, Parser proofs).
+///
+/// [`find_module_slot`] is core's `find_map` over the table's entries with
+/// [`slot_if_carries`] as its step, which reads one entry and the request
+/// alone and carries nothing to the next entry. The base proof runs the whole
+/// function on the empty table, and the step proof proves the step on every
+/// entry and request: it answers the entry's slot exactly when the entry's
+/// name is the request whole, and nothing otherwise. So a lookup finds the
+/// slot of the first entry whose name is the request, or nothing. The trim
+/// proof proves the trim on every name. What lies outside the proofs is the
+/// code that drives the step: `find_map`, its walk of a table of any length
+/// that stops at the first slot the step answers, and the loop that hands the
+/// property its entries. The fuzz target `init-protocol` and the replay of
+/// the checked-in inputs check them with tables of up to eight entries.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{INIT_MODULE_NAME_LEN, InitModuleName, property};
+
+    /// The longest request the proofs take: one byte past the longest name
+    /// any entry can hold, so a request no name can equal is among them.
+    const MAX_REQUEST: usize = INIT_MODULE_NAME_LEN + 1;
+
+    /// Base of the walk: the empty table finds nothing, for every request.
+    /// The longest loop is the property's, over no entry, so an unwind bound
+    /// of 2 covers every loop.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn the_empty_table_finds_nothing()
+    {
+        let request: [u8; MAX_REQUEST] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= request.len());
+        property::lookup_holds(&[], &request[..len]);
+    }
+
+    /// Step of the walk: the step of one entry, of any slot and name, answers
+    /// its slot exactly when its trimmed name is the request whole, and
+    /// nothing otherwise, for every request of up to `MAX_REQUEST` bytes. The longest loops are the trim and
+    /// compare of the 256-byte name and the property's byte-by-byte check of
+    /// it, so an unwind bound of 258 covers every loop.
+    #[kani::proof]
+    #[kani::unwind(258)]
+    fn each_entry_the_lookup_tests_is_taken_by_its_name()
+    {
+        let entry = InitModuleName {
+            slot: kani::any(),
+            name: kani::any(),
+        };
+        let request: [u8; MAX_REQUEST] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= request.len());
+        property::slot_holds(&entry, &request[..len]);
+    }
+
+    /// The trim of a table name holds on every name: it stops at the first
+    /// NUL and keeps the whole name without one. The longest loops are the
+    /// trim's scan of the 256-byte name and the check of each of its bytes at
+    /// its own index, so an unwind bound of 257 covers them.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn every_name_trims_at_its_first_nul()
+    {
+        let name: [u8; INIT_MODULE_NAME_LEN] = kani::any();
+        property::name_holds(&name);
     }
 }

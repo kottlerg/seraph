@@ -655,15 +655,17 @@ contract.
 
 Remove the sysroot, the symbols store `symbols/`, the disk images `disk.img` and
 `disk-data.img`, and any per-launch variable store a killed launch left under
-`target/xtask/vars/` (and optionally `target/`).
+`target/xtask/vars/` (and optionally `target/`, or Cargo's build output in it but for the standard
+library's build units).
 
 ```
-cargo xtask clean [--all]
+cargo xtask clean [--all | --keep-std]
 ```
 
 | Option | Description |
 |---|---|
 | `--all` | Also run `cargo clean` to remove the `target/` directory |
+| `--keep-std` | Also empty Cargo's profile directories, the host's (`target/<profile>/`) and each target's (`target/<triple>/<profile>/`), and those of `target/seraph-build/`, the Cargo build directory of the builds that compile `std` from the toolchain mirror, but for the build units of the packages the toolchain's `library/Cargo.lock` names (`core`, `alloc`, `compiler_builtins`, `std` and their dependencies): only `build/<package>/` of such a package stays. The rest of `target/`, `target/xtask/` among it, is left alone. CI's standard-library cache saves what is left ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration) |
 
 ---
 
@@ -720,7 +722,7 @@ host, are cases of one registry, not commands of their own:
 ```
 cargo xtask test <CASE> [--arch x86_64|riscv64] [--cpus N] [--mem MIB] [case options] [host options]
 cargo xtask test --cell svctest|usertest|ktest [--arch A] [--cpus N] [--mem MIB] [--release] \
-    [host options]
+    [--lanes N] [host options]
 ```
 
 Without `--arch`, `--cpus` and `--mem` a case boots `x86_64` with 4 vCPUs and 512 MiB. The host
@@ -790,10 +792,42 @@ succeeds. A cell takes no case option but `--release`, which it passes on to `si
 `rollback`. The cell table of [docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers
 lists every cell with the cases it runs.
 
+`--lanes N` (1 to 3; default 1) runs the cell's cases in up to N lanes side by side. The cell
+assigns its cases to the lanes heaviest first, each to the lane with the least weight so far, by the
+weight each registry entry gives (about the seconds the case takes in its slowest CI cell, 60 for an
+entry that gives none); a lane runs its cases in the registry's order. The weights only balance the
+lanes: the cell checks that the lanes hold every case of the cell exactly once before they start and
+that they ran exactly those cases after, and a wrong or missing weight changes only which lane a
+case runs in. Each lane runs in a private copy of the checkout under the host's temporary directory,
+removed when the cell ends, and runs each of its cases as its own `xtask test <CASE>` process in
+that copy, so every path a case reads or writes resolves inside the copy. The copy holds the source
+tree (`git ls-files`, untracked files not ignored included) and the state the cases read or write:
+
+| State | Cases that write it |
+|---|---|
+| `sysroot/` | every case, whose boots repack the images from it; `signing`, `rollback`, `enrolment` and `secureboot` also stage substitutes, requests or knobs on its ESP |
+| `disk.img`, `disk-data.img` | every case, through its packs |
+| `symbols/` | none; a case's crash reports are symbolized against it |
+| `target/xtask/signing/` | every case, whose packs sign under the trust store (with `SERAPH_SIGNING_DIR` set, CI's signing keys are outside the checkout and shared read-only) |
+| `target/x86_64-unknown-uefi/`, `target/riscv64imac-seraph-uefi/`, and the host's `target/debug/build/` and `target/release/build/` | `signing` and `rollback`, which build their bootloaders there, with their build scripts |
+| `target/xtask/test/`, `target/xtask/run/` | every case, its logs |
+
+A lane's case boots are admitted against the checkout's own host lock, as small boots
+([Host launch rules](#host-launch-rules)): its copy is no git checkout, so the cell names the lock
+directory to each case. Each lane's output is echoed prefixed `[lane N]` and kept in
+`target/xtask/lanes/<N>/lane.log`, with the lane's `test/` and `run/` logs copied beside it when
+the lane ends. The cell then reports each case's outcome, wall time and CPU time (its process's and
+its boots', from `/proc`, where the host has it) and each lane's, and fails naming the cases that
+failed. Around the lanes it records `sysroot/`, `symbols/`, the images and `target/xtask/signing/`
+of the checkout itself, and fails, naming each path, when a lane changed one: a case that wrote
+outside its copy fails the cell rather than racing another lane. `--lanes` above 1 refuses
+`--alone` and `--timing`, which run a boot beside no other QEMU.
+
 CI (`.github/workflows/build-test.yml`) runs, in every cell after the cell's own boot,
 `cargo xtask mkdisk --arch A` (the plain repack: the `rootfs/` re-mirror, the repository's log
 levels, no knobs, the recorded harness kept) and then `cargo xtask test --cell <tester> --arch A
-[--release]`. The cases no cell runs, which are host runs
+[--release] --lanes 3`: each boot keeps about one of the runner's four vCPUs busy. The cases no
+cell runs, which are host runs
 ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers), are `hotplug`, `cet`,
 `tpm` and `debug-port`.
 
@@ -1477,32 +1511,42 @@ cargo xtask kani --pin
 
 | Flag | Default | Description |
 |---|---|---|
-| `--component <CRATE>` | every registered crate | Verify the harnesses of this crate only, by its package name |
+| `--component <CRATE>` | every crate that holds a harness | Verify the harnesses of this crate only, by its package name |
 | `--harness <NAME>` | every harness | Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`); needs `--component` |
 | `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
 
-The command first checks that every tracked Rust source declaring a `#[kani::proof]` lies in a
-crate `HARNESSED` in `src/commands/kani.rs` registers, the crate being the nearest directory
-above the file that holds a `Cargo.toml`, and fails naming each file that does not: a crate's
-first harness registers it. It then checks that `cargo kani --version` names `KANI_VERSION`, and
+The command first finds the crates to verify, keeping no list of them: the crate of every tracked
+Rust source declaring a `#[kani::proof]`, the crate being the nearest directory above the file
+that holds a `Cargo.toml`, each run once by the package name that manifest gives. It fails
+naming each such source that lies in no crate, or in one whose manifest names no package, so no
+harness is left out of the run. It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
 § Toolchain) on another release or none.
 
 For each selected crate it runs `cargo kani --tests -p <package>` (with `--harness` when given),
-which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies
-each harness with Kani's unwinding assertions on. It prints Kani's output as it comes and judges
-it as well as Kani's verdict: the crate fails when `cargo kani` exits unsuccessfully, when a
-harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED` check or a
-`FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's verdict
-names), and when Kani's closing summary is missing, counts a failure or no harness, or counts
-other harnesses than reported a verdict. Every selected crate runs, and the command fails naming
-each that failed. CI's `kani` job runs the command with no option, after installing the release
-`--pin` prints ([docs/build-system.md](../docs/build-system.md#continuous-integration)
-§ Continuous Integration).
+which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies each
+harness with Kani's unwinding assertions on. It runs `cargo kani` under `prlimit --as` (util-linux),
+which holds each process of the run (`cargo`, the Kani compiler, and the CBMC of each harness, which
+Kani runs one at a time) to 12 GiB of address space (`MEMORY_LIMIT_GIB`). The limit derives from the
+runner CI's `kani` job runs on (`ubuntu-latest` for a public repository: 4 vCPUs, 16 GB), leaving
+4 GB to the runner's own processes, so a harness whose CBMC needs more fails, named as out of memory
+under the limit, where without it the runner would be shut down with no verdict. It prints Kani's
+output as it comes and judges it as well as Kani's verdict: the crate fails when `cargo kani` exits
+unsuccessfully, when a harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED`
+check or a `FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's
+verdict names), and when Kani's closing summary is missing, counts a failure or no harness, or
+counts other harnesses than reported a verdict; a harness that Kani starts and prints no verdict for
+fails too. Every selected crate runs, and the command then prints a table of every harness, by
+package and path, with its verdict and verification time, and fails naming each crate that failed.
+CI's `kani` job runs the command with no option, after installing the release `--pin` prints
+([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
 
-No assistant session runs Kani: `cargo install` is outside the permissions
-`.claude/settings.json` grants, and the `bash` hook refuses `cargo kani`
-([§ `cargo xtask hook`](#cargo-xtask-hook)).
+The development host carries the pinned release, which the maintainer installs, and an assistant
+session runs `cargo xtask kani` there. A session installs nothing (`cargo install` is outside the
+permissions `.claude/settings.json` grants) and does not run `cargo kani` itself, which the
+`bash` hook refuses ([§ `cargo xtask hook`](#cargo-xtask-hook)). A new or changed harness is
+sized there, under the limit the command sets, before CI runs it
+([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification).
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`
 aside, and takes their `--wait-host` and `--host-override` options.
@@ -2466,7 +2510,9 @@ tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `
 `test` with a case or a cell as boots, each boot admitted as above (the `shutdown` case admits once
 for its boots, which it runs one at a time). The `signing` case, which compiles its revoking and
 role-scoped bootloaders before it boots, is admitted as a build for each compile and then each boot
-as a boot.
+as a boot. A cell's lanes (`test --cell T --lanes N`) start up to N cases side by side, each
+admitting its own boots, so each is a small boot counted with the others, and `--wait-host` lets a
+lane's boot wait for another lane's to end rather than fail.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

@@ -14,6 +14,7 @@ mod enrolment;
 mod host;
 mod hotplug;
 mod kaslr;
+mod lanes;
 mod rollback;
 mod secureboot;
 mod shutdown;
@@ -33,7 +34,11 @@ pub fn run(ctx: &Context, args: &TestArgs) -> Result<()>
 {
     match (args.case, args.cell)
     {
-        (Some(case), _) => cases::run_case(ctx, case, args),
+        (Some(case), _) => match &args.lane_root
+        {
+            Some(root) => run_lane_case(root, case, args),
+            None => cases::run_case(ctx, case, args),
+        },
         (None, Some(tester)) => cases::run_cell(ctx, tester, args),
         (None, None) =>
         {
@@ -41,6 +46,21 @@ pub fn run(ctx: &Context, args: &TestArgs) -> Result<()>
             host::run(ctx, args.component)
         }
     }
+}
+
+/// Run `case` as one case of a cell's lane, in the lane's copy of the
+/// checkout at `root`, and print the CPU time it took, its boots' included,
+/// for the cell's report.
+fn run_lane_case(root: &std::path::Path, case: crate::cli::TestCase, args: &TestArgs)
+-> Result<()>
+{
+    let ctx = Context::at(root.to_path_buf());
+    let result = cases::run_case(&ctx, case, args);
+    if let Some(cpu) = lanes::cpu_seconds()
+    {
+        println!("{}{cpu:.1} s", lanes::CPU_MARK);
+    }
+    result
 }
 
 /// Refuse the options of a case's boots on a command line that runs the unit

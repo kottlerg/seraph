@@ -94,7 +94,7 @@ subcommands! {
         /// Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every
         /// crate that holds one, with the pinned Kani release, and fail on any
         /// failed, undetermined or unwinding-incomplete check, on a Kani release
-        /// other than the pinned one, and on a harness in an unregistered crate;
+        /// other than the pinned one, and on a harness that lies in no package;
         /// with `--pin`, print the pinned release (see xtask/README.md).
         Kani(KaniArgs),
 
@@ -944,6 +944,12 @@ args! {
         #[arg(long)]
         pub all: bool,
 
+        /// Also empty Cargo's profile directories in target/ but for the build
+        /// units of the toolchain's library packages (core, alloc,
+        /// compiler_builtins, std and their dependencies), the part CI caches.
+        #[arg(long, conflicts_with = "all")]
+        pub keep_std: bool,
+
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
         #[command(flatten)]
@@ -1034,7 +1040,7 @@ args! {
     pub struct KaniArgs
     {
         /// Verify the harnesses of this crate only, by its package name (one
-        /// `cargo xtask kani` registers).
+        /// that holds a harness).
         #[arg(long, value_name = "CRATE")]
         pub component: Option<String>,
 
@@ -1108,6 +1114,17 @@ args! {
         /// sysroot's was built (default: debug).
         #[arg(long)]
         pub release: bool,
+
+        /// Run a cell's cases in up to N lanes side by side, each on a private
+        /// copy of the checkout (1 to 3; default: 1, the cases one after
+        /// another in the checkout itself).
+        #[arg(long, value_name = "N", requires = "cell")]
+        pub lanes: Option<u32>,
+
+        /// The private copy of the checkout a lane of a cell runs this case
+        /// in; a cell's lanes set it.
+        #[arg(long, value_name = "DIR", requires = "case", hide = true)]
+        pub lane_root: Option<PathBuf>,
 
         /// The `kaslr` case's riscv64 paging-mode ceiling (default: sv48;
         /// ignored on `x86_64`).

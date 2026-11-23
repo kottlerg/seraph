@@ -142,6 +142,92 @@ impl Harness
     }
 }
 
+// ── Placement ─────────────────────────────────────────────────────────────────
+
+/// The `CAP_INFO_THREAD_PLACEMENT` counts a round-trip benchmark reports, in
+/// the order of their extras in [`Placement::extras`].
+const COUNT_VIEWS: [u64; 4] = [
+    syscall_abi::THREAD_PLACEMENT_REMOTE_WAKES,
+    syscall_abi::THREAD_PLACEMENT_IDLE_WAKES,
+    syscall_abi::THREAD_PLACEMENT_WAKE_MOVES,
+    syscall_abi::THREAD_PLACEMENT_PULLS,
+];
+
+/// Where the two threads of a round trip were, the harness thread and its
+/// child, and their placement counts, read at one end of the timed region
+/// (core/kernel/docs/scheduler.md § Placement Counters). A benchmark reads it
+/// before its first sample and after its last, outside the timed region, and
+/// reports the two through [`Placement::extras`], so its line names whether
+/// the round trips stayed on one CPU or paid a wake of another.
+pub(super) struct Placement
+{
+    /// The harness thread's CPU and the child's (`THREAD_PLACEMENT_CPU`).
+    cpus: [u64; 2],
+    /// Each count of [`COUNT_VIEWS`], summed over the two threads, wrapping as
+    /// the kernel's 32-bit counters do.
+    counts: [u32; COUNT_VIEWS.len()],
+}
+
+impl Placement
+{
+    /// Read the placement of the threads `harness` and `child` name; `None`
+    /// when a read fails.
+    pub(super) fn read(harness: u64, child: u64) -> Option<Self>
+    {
+        let view = |thread: u64, view: u64| syscall::cap_info_thread_placement(thread, view).ok();
+        let mut counts = [0u32; COUNT_VIEWS.len()];
+        for (count, &which) in counts.iter_mut().zip(&COUNT_VIEWS)
+        {
+            for thread in [harness, child]
+            {
+                let one = u32::try_from(view(thread, which)?).ok()?;
+                *count = count.wrapping_add(one);
+            }
+        }
+        Some(Self {
+            cpus: [
+                view(harness, syscall_abi::THREAD_PLACEMENT_CPU)?,
+                view(child, syscall_abi::THREAD_PLACEMENT_CPU)?,
+            ],
+            counts,
+        })
+    }
+
+    /// The extras of a round trip whose timed region this reading began and
+    /// `end` ended: the CPU of the harness thread and of the child at the end,
+    /// the child's at the start, and how much each count grew over the region.
+    pub(super) fn extras(&self, end: &Self) -> [(&'static str, u64); 7]
+    {
+        let [harness_cpu, child_cpu] = end.cpus;
+        let [_, child_cpu_start] = self.cpus;
+        let mut grown = [0u64; COUNT_VIEWS.len()];
+        for ((grew, start), finish) in grown.iter_mut().zip(self.counts).zip(end.counts)
+        {
+            *grew = u64::from(finish.wrapping_sub(start));
+        }
+        let [remote_wakes, idle_wakes, wake_moves, pulls] = grown;
+        [
+            ("harness_cpu", harness_cpu),
+            ("child_cpu_start", child_cpu_start),
+            ("child_cpu", child_cpu),
+            ("remote_wakes", remote_wakes),
+            ("idle_wakes", idle_wakes),
+            ("wake_moves", wake_moves),
+            ("pulls", pulls),
+        ]
+    }
+}
+
+/// The extras of a round trip from the placement read before and after its
+/// timed region: none when either read failed.
+pub(super) fn placement_extras(
+    start: Option<&Placement>,
+    end: Option<&Placement>,
+) -> Option<[(&'static str, u64); 7]>
+{
+    Some(start?.extras(end?))
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Run all Tier 3 benchmarks, `iters` iterations each (cut to

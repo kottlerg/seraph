@@ -23,6 +23,12 @@
 //! every boot's device set carries, and asserts a cap for the first and
 //! `NO_DEVICE` for the second.
 //!
+//! The location phase asks `QUERY_DEVICE_LOCATION` of the same ordinals and
+//! asserts a PCI location for the keyboard, a PCI function, and `NO_DEVICE`
+//! past it, and asks it of the `serial` class (`devmgr.class.serial`),
+//! whose driver serves the machine's UART, a platform device, and asserts
+//! `NO_LOCATION`.
+//!
 //! The on-demand bind phase sends `BIND_DRIVERS` on `devmgr.bind` with a cap
 //! on `/tests/drivers/`, which holds the `test-fault` fixture, whose
 //! declaration matches the five `pci-testdev` functions a test launch
@@ -31,7 +37,8 @@
 //! two, one on which it never reports ready, and one on which it refuses its
 //! bootstrap. It asserts that the registry serves another class while the
 //! bind's settle runs, that the settle ends no earlier than its bound with
-//! the two serving fixtures at ordinals 0 and 1 and no other, that devmgr
+//! the two serving fixtures at ordinals 0 and 1 and no other, located at
+//! the two `pci-testdev` functions the launch attaches with no BAR 2, that devmgr
 //! logged the death of the fixture that exits before its bootstrap request
 //! (read from logd's history through `logd.query`) and went on binding, so
 //! the second serving fixture holds ordinal 1, that a served
@@ -125,6 +132,10 @@ pub fn phases() -> &'static [Phase]
             run: input_instance_ordinal_phase,
         },
         Phase {
+            name: "devmgr_device_location",
+            run: device_location_phase,
+        },
+        Phase {
             name: "devmgr_on_demand_bind",
             run: on_demand_bind_phase,
         },
@@ -196,7 +207,8 @@ fn assert_denies(devmgr: u64, label: u64, label_name: &str, bit_name: &str)
     );
 }
 
-/// `QUERY_DEVICE`, `WATCH_CLASS`, and `MINT_CLASS_SEND` on `devmgr.registry`
+/// `QUERY_DEVICE`, `QUERY_DEVICE_LOCATION`, `WATCH_CLASS`, and
+/// `MINT_CLASS_SEND` on `devmgr.registry`
 /// and on `devmgr.bind`, neither of whose badges carries a class slot or
 /// `CLASS_AUTHORITY`, reply `UNAUTHORIZED`.
 fn class_deny_phase(caps: &Caps)
@@ -217,6 +229,12 @@ fn class_deny_phase(caps: &Caps)
             cap,
             ipc::devmgr_labels::WATCH_CLASS,
             "WATCH_CLASS",
+            "a class slot",
+        );
+        assert_denies(
+            cap,
+            ipc::devmgr_labels::QUERY_DEVICE_LOCATION,
+            "QUERY_DEVICE_LOCATION",
             "a class slot",
         );
         assert_denies(
@@ -298,6 +316,43 @@ fn input_instance_ordinal_phase(caps: &Caps)
     }
 }
 
+/// `QUERY_DEVICE_LOCATION` of the input driver, a PCI function's, at its
+/// ordinal and past it, and of the serial driver, a platform device's.
+fn device_location_phase(caps: &Caps)
+{
+    use ipc::devmgr_errors::{NO_DEVICE, NO_LOCATION};
+
+    let input = caps.input_class;
+    assert!(input != 0, "location: no devmgr.class.input cap seeded");
+    let serial = caps.serial_class;
+    assert!(serial != 0, "location: no devmgr.class.serial cap seeded");
+    for (class, what) in [(input, "input"), (serial, "serial")]
+    {
+        let served = await_class(class, what)
+            .unwrap_or_else(|l| panic!("location: no {what} driver served (status {l:#x})"));
+        let _ = syscall::cap_delete(served);
+    }
+    let keyboard = locate_class(input, 0, "input")
+        .unwrap_or_else(|l| panic!("location: input ordinal 0 status {l:#x}"));
+    assert_eq!(
+        locate_class(input, 1, "input"),
+        Err(NO_DEVICE),
+        "location: input ordinal 1, past the one keyboard"
+    );
+    assert_eq!(
+        locate_class(serial, 0, "serial"),
+        Err(NO_LOCATION),
+        "location: the serial driver's UART is a platform device"
+    );
+    std::os::seraph::log!(
+        "devmgr_device_location passed: keyboard at {:04x}:{:02x}:{:02x}.{}, serial on none",
+        keyboard.segment,
+        keyboard.bus,
+        keyboard.device,
+        keyboard.function
+    );
+}
+
 /// Read memmgr's current free-pool total (`QUERY_POOL_STATUS` `data[3]`).
 fn free_bytes(memmgr_ep: u64, ipc_buf: *mut u64) -> u64
 {
@@ -336,6 +391,24 @@ fn query_class(class: u64, ordinal: u64, what: &str) -> Result<u64, u64>
         Ok(cap) => Ok(cap),
         Err(ipc::ClassCallError::Refused(label)) => Err(label),
         Err(e) => panic!("{what} QUERY_DEVICE ordinal {ordinal} failed: {e:?}"),
+    }
+}
+
+/// `QUERY_DEVICE_LOCATION` on the class SEND `class` at `ordinal`: where the
+/// driver's device sits, or devmgr's refusal label.
+fn locate_class(
+    class: u64,
+    ordinal: u64,
+    what: &str,
+) -> Result<ipc::devmgr_labels::PciLocation, u64>
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    match unsafe { ipc::query_device_location(class, ordinal, ipc_buf) }
+    {
+        Ok(at) => Ok(at),
+        Err(ipc::ClassCallError::Refused(label)) => Err(label),
+        Err(e) => panic!("{what} QUERY_DEVICE_LOCATION ordinal {ordinal} failed: {e:?}"),
     }
 }
 
@@ -486,7 +559,7 @@ fn bind_test_drivers(devmgr_bind: u64)
 /// one dropped for a new one.
 fn on_demand_bind_phase(caps: &Caps)
 {
-    use ipc::devmgr_errors::{NO_DEVICE, SUCCESS, WITHDRAWN};
+    use ipc::devmgr_errors::{NO_DEVICE, SUCCESS};
     use ipc::test_fault_labels::{FAULT_EXIT, FAULT_PING};
 
     let devmgr = caps.devmgr_bind;
@@ -568,6 +641,7 @@ fn on_demand_bind_phase(caps: &Caps)
         Err(NO_DEVICE),
         "devmgr_on_demand_bind: only the two serving fixtures may be served"
     );
+    assert_fixture_locations(fault);
     // Take the bits of the second fixture's serving, which the query above
     // waited for, so the next wait sees the withdrawal's.
     let _ = syscall::notification_try_wait(watch.note);
@@ -584,11 +658,7 @@ fn on_demand_bind_phase(caps: &Caps)
     // The withdrawal signals the watch in the hold that leaves the
     // tombstone, before the revocation that returned the queued call.
     assert_signalled(watch.note, DEVICE_WAIT_MS, "the dead fixture was withdrawn");
-    assert_eq!(
-        query_class(fault, 0, "test-fault"),
-        Err(WITHDRAWN),
-        "the dead fixture's ordinal must reply WITHDRAWN"
-    );
+    assert_ordinal_withdrawn(fault, 0);
 
     // The ordinal after the tombstone keeps its live fixture.
     let again = query_class(fault, 1, "test-fault").unwrap_or_else(|l| {
@@ -656,6 +726,54 @@ fn assert_death_in_bootstrap_logged(query: u64)
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+/// The `test-fault` class's (`fault`) `ordinal`, whose fixture died, replies
+/// `WITHDRAWN` to `QUERY_DEVICE` and to `QUERY_DEVICE_LOCATION`.
+fn assert_ordinal_withdrawn(fault: u64, ordinal: u64)
+{
+    use ipc::devmgr_errors::WITHDRAWN;
+    assert_eq!(
+        query_class(fault, ordinal, "test-fault"),
+        Err(WITHDRAWN),
+        "the dead fixture's ordinal must reply WITHDRAWN"
+    );
+    assert_eq!(
+        locate_class(fault, ordinal, "test-fault"),
+        Err(WITHDRAWN),
+        "the dead fixture's ordinal must reply WITHDRAWN to QUERY_DEVICE_LOCATION"
+    );
+}
+
+/// Where the launch puts the `pci-testdev` functions the `test-fault`
+/// fixture serves, those with no BAR 2 (`TEST_FAULT_DEVICES` in
+/// xtask/src/qemu.rs): slots 0x15 and 0x16 of segment 0's root bus, in the
+/// order devmgr serves them.
+const SERVING_FIXTURE_SLOTS: [u8; 2] = [0x15, 0x16];
+
+/// The `test-fault` class's two served fixtures are located at the
+/// functions they were bound to (`QUERY_DEVICE_LOCATION`), and past them
+/// `NO_DEVICE`.
+fn assert_fixture_locations(fault: u64)
+{
+    for (ordinal, device) in (0u64..).zip(SERVING_FIXTURE_SLOTS)
+    {
+        let expected = ipc::devmgr_labels::PciLocation {
+            segment: 0,
+            bus: 0,
+            device,
+            function: 0,
+        };
+        assert_eq!(
+            locate_class(fault, ordinal, "test-fault"),
+            Ok(expected),
+            "devmgr_on_demand_bind: test-fault ordinal {ordinal} location"
+        );
+    }
+    assert_eq!(
+        locate_class(fault, 2, "test-fault"),
+        Err(ipc::devmgr_errors::NO_DEVICE),
+        "devmgr_on_demand_bind: test-fault ordinal 2 location past the two served"
+    );
 }
 
 /// A fault of a thread other than the main thread of the served fixture at

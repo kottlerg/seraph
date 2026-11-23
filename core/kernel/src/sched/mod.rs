@@ -5625,8 +5625,8 @@ enum PullRule
     Imbalance,
     /// A backlog an idle CPU confirmed across two ticks, in the backlog episode
     /// it carries: the pull from its candidate, which no load decides. The
-    /// source must still be in that episode under its lock, so the backlog has
-    /// stood without a break since the idle CPU sampled it, and the locked
+    /// source must still be in that episode under its lock, so its dispatch has
+    /// not run the backlog dry since the idle CPU sampled it, and the locked
     /// pick of a queued unpinned thread takes from it.
     Backlog(u32),
 }
@@ -5759,8 +5759,8 @@ enum IdlePullStep
 /// The idle pull's decision, the rule core/kernel/docs/scheduler.md § Load
 /// Balancing states, from what an idle CPU read this tick: `scan`, its scan of
 /// the other CPUs, and `candidate`, the backlog it recorded at its previous
-/// idle tick with whether that CPU's backlog is still the same episode, so has
-/// stood without a break since (`None` when none is recorded). `hold` tells
+/// idle tick with whether that CPU's backlog is still the same episode, so its
+/// dispatch has not run it dry since (`None` when none is recorded). `hold` tells
 /// whether the idle CPU keeps a confirmed candidate one more tick rather than
 /// pull it (§ SMT Awareness), and is called only when a candidate is confirmed.
 fn idle_pull_step(
@@ -9726,6 +9726,72 @@ mod idle_pull_tests
         }
         assert_eq!(model.moved_from, Some(1));
         assert!(pulled_at.is_some_and(|tick| tick <= 2 + 2 * 2));
+    }
+
+    // The defect caught: the only thread queued behind one that never yields,
+    // its level changed between every two idle ticks, never pulled: the
+    // priority change's unlink and re-link started a new backlog episode, so
+    // every confirmation found the backlog broken (#1565).
+    #[test]
+    fn a_queued_thread_whose_level_changes_every_tick_is_still_pulled()
+    {
+        use super::run_queue::PerCpuScheduler;
+        use super::thread::{TCB_MAGIC, ThreadControlBlock};
+        use super::{IDLE_PRIORITY, RT_PRIORITY_MIN};
+
+        /// A zeroed, unlinked TCB.
+        fn tcb() -> Box<ThreadControlBlock>
+        {
+            // SAFETY: the run queue reads only `run_queue_next`, `queued_on`,
+            // `last_enqueue`, `ipc_state`, `preferred_cpu`, `thread_id` and
+            // `magic`; every other field stays zero/null, and the debug-only
+            // `last_enqueue` zeroes to `None` through its niche.
+            let mut tcb: ThreadControlBlock = unsafe { core::mem::zeroed() };
+            tcb.magic = TCB_MAGIC;
+            tcb.queued_on = core::sync::atomic::AtomicI16::new(-1);
+            Box::new(tcb)
+        }
+
+        // CPU 1's queues: its idle thread linked (it runs a thread that never
+        // yields) and one queued thread, whose level a priority change moves
+        // between a fair and an RT level after every idle tick of CPU 0.
+        let sched = PerCpuScheduler::new();
+        let mut idle = tcb();
+        let mut queued = tcb();
+        let p_idle = &raw mut *idle;
+        let p_queued = &raw mut *queued;
+        sched.set_idle(p_idle);
+        // SAFETY: single-threaded test, which owns `sched`; p_idle is a live box.
+        assert!(unsafe { sched.enqueue(p_idle, IDLE_PRIORITY) });
+        let mut levels = [syscall::PRIORITY_MIN, RT_PRIORITY_MIN];
+        // SAFETY: as above; p_queued is a live box.
+        assert!(unsafe { sched.enqueue(p_queued, levels[0]) });
+
+        let mut model = Model::new(&[IDLE, busy(0, 1)]);
+        let mut memory = IdlePullMemory {
+            candidate: None,
+            held: false,
+            cursor: 0,
+        };
+        let mut pulled_at = None;
+        for tick in 1..=6u32
+        {
+            model.cpus[1].episode = sched.backlog().unwrap();
+            memory = idle_pull_tick(&mut model, 0, 2, memory);
+            if model.moved_from.is_some()
+            {
+                pulled_at = Some(tick);
+                break;
+            }
+            // `relocate_ready_priority`'s unlink and re-link on the same CPU.
+            // SAFETY: as above.
+            assert!(unsafe { sched.remove_from_queue(p_queued, levels[0]) });
+            // SAFETY: as above.
+            assert!(unsafe { sched.enqueue(p_queued, levels[1]) });
+            levels.swap(0, 1);
+        }
+        assert_eq!(model.moved_from, Some(1));
+        assert!(pulled_at.is_some_and(|tick| tick <= 2));
     }
 }
 

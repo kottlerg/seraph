@@ -176,9 +176,9 @@ pub struct PerCpuScheduler
     /// The backlog episode of that CPU the sample read (§ Load Balancing).
     idle_pull_episode: AtomicU32,
 
-    /// The count of this CPU's backlog episodes, advanced by `link` under `lock`
-    /// when the queues come to hold a thread other than the idle thread after holding
-    /// none (§ Load Balancing).
+    /// This CPU's backlog episode under `lock`: made odd by `dequeue_highest` when it
+    /// runs the queues dry of threads other than the idle thread, even again by the
+    /// `link` that refills them (§ Load Balancing).
     backlog_episode: AtomicU32,
 
     /// Whether the previous idle tick held the candidate one tick more, a sibling of
@@ -499,9 +499,15 @@ Victim selection is mode-dependent:
   with that CPU's backlog episode (`PerCpuScheduler::backlog`), and, at its next idle tick,
   pulls from that CPU if its backlog is still the same episode, else moves its cursor to the CPU
   after that one and records afresh, another CPU's backlog first when there is one. A CPU's
-  backlog episode is a wrapping count that `link` advances under the CPU's run-queue lock
-  each time the queues come to hold a thread other than the idle thread after holding none,
-  so the same episode at both ticks is one backlog that stood between them. Threads
+  backlog episode is a wrapping count, advanced under the CPU's run-queue lock, that ends a
+  backlog only when the CPU's own dispatch (`dequeue_highest`) takes the last thread other than
+  the idle thread: the dispatch makes the count odd, and the link that next queues such a
+  thread makes it even again, so the same episode at both ticks is one backlog that the CPU
+  did not run dry between them. A removal from the queues (`remove_from_queue`) ends no
+  episode: a thread unlinked and linked again without running, as a priority change relocates
+  it (`relocate_ready_priority`), keeps its episode, and a backlog that a pull, a migration or a
+  stop empties and a link refills reads as the one before, which can cost one pull of a
+  backlog that did not stand a tick, a pull the bound below allows. Threads
   time-slicing behind one another on a CPU stay one episode, since `schedule()` requeues
   the outgoing thread before it dequeues the next. An idle CPU with a busy SMT sibling holds a
   confirmed candidate one tick more before it pulls (§ SMT Awareness). A CPU whose queue
@@ -543,8 +549,9 @@ the outcomes that cost no tick still cost none, since a pull above the threshold
   these candidates, a backlog that clears and forms again among them; each moves the cursor
   past its CPU, where the next scan starts, so the cursor only moves forward and r counts at
   most the CPUs ahead of the thread's in the cursor's order. The
-  queued thread the bound is for cannot be one: its CPU's queues hold it, so its backlog stays
-  one episode until it runs.
+  queued thread the bound is for cannot be one: its CPU's queues hold it, so no dispatch runs
+  them dry and its backlog stays one episode until it runs, whatever unlinks and re-links it
+  on that CPU meanwhile.
 - A pull above the threshold that the re-check of its rule refuses
   (`sched::PullOutcome::RuleFailed`) or that finds nothing pullable
   (`sched::PullOutcome::NothingPullable`) costs no tick, since the confirmation rule decides
@@ -673,7 +680,10 @@ Hot-path cost per CPU per tick:
   makes one Relaxed load of each CPU's load, and one load of the victim's run-queue mask and
   backlog episode, for the re-check.
 - `link`, under the run-queue lock it already holds: one Relaxed load of the run-queue mask
-  and, when it starts a backlog episode, one Relaxed load and store of the episode.
+  and, when the queues hold no thread but the idle thread, one Relaxed load of the episode and,
+  when it starts a backlog episode, a Relaxed store of it. `dequeue_highest`, under the same
+  lock: when its dequeue leaves no thread but the idle thread queued, one Relaxed load and
+  store of the episode.
 
 ### Placement Counters
 

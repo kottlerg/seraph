@@ -185,12 +185,11 @@ mod tests
         register(&regions, at(7), at(7));
         let counters = Counters::over(&regions);
         assert_eq!(counters.len(), 7);
-        // SAFETY: both offsets lie inside `arrays`, and no other access to it
-        // is live.
-        unsafe {
-            at(1).write(5);
-            at(6).write(1);
-        }
+        // SAFETY: offset 1 lies inside `arrays`, and no other access to it is
+        // live.
+        unsafe { at(1).write(5) };
+        // SAFETY: as above, for offset 6.
+        unsafe { at(6).write(1) };
         let mut hits = Vec::new();
         counters.for_each_hit(|index, count| hits.push((index, count)));
         assert_eq!(hits, [(1, 5), (6, 1)]);

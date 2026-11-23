@@ -368,7 +368,7 @@ mod tests
                 Ok(())
             }
         });
-        assert!(started.is_ok());
+        started.unwrap();
         assert!(!fixed);
         assert_eq!(asked, [true, false]);
         let not_found = std::io::ErrorKind::NotFound;

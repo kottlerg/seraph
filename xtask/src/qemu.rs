@@ -605,8 +605,9 @@ crate::argparse::value_enum! {
 /// How QEMU executes a launch's machine.
 ///
 /// Not a field of [`QemuLaunchSpec`]: it changes how QEMU runs the machine,
-/// not what the machine is, and `cargo xtask run --icount` is its only
-/// choice of [`Execution::Icount`] ([`build_qemu_argv_for`]).
+/// not what the machine is. `cargo xtask run --icount` and
+/// `cargo xtask path-account trace` choose [`Execution::Icount`]
+/// ([`build_qemu_argv_for`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Execution
 {

@@ -55,11 +55,11 @@ const JOIN_CHURN: u64 = 600;
 /// drive reaper sweeps, not to stress the pool.
 const REAP_CHURN: u64 = 50;
 /// Detached threads spawned in one burst, then reaped by later sweeps: as
-/// many as the held burst, past the first death queue's 99 observer nodes and
+/// many as the held burst, past the first death queue's 71 observer nodes and
 /// 64 slots, on the queues and slot table the held burst already grew.
 const DETACH_BATCH: u64 = 128;
 /// Detached threads held bound at once in the warm-up's held burst: past 64
-/// slots and past the reaper's first death queue's 99 observer nodes, so the
+/// slots and past the reaper's first death queue's 71 observer nodes, so the
 /// burst grows the slot table and binds on a second queue, and every one of
 /// them is then reaped. The fixture does not fund its `CSpace` for the burst:
 /// the burst's caps outgrow the `CSpace` procmgr seeds, so the burst passes

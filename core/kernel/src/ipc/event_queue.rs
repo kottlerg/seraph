@@ -37,13 +37,52 @@ pub struct EventEntry
     pub tag: u64,
 }
 
+// ── ObserverNode ──────────────────────────────────────────────────────────────
+
+/// One node of an event queue's observer pool: a [`DeathObserver`], and the
+/// object and group links of a sole-reference binding.
+///
+/// A death binding (`SYS_THREAD_BIND_NOTIFICATION`,
+/// `SYS_ASPACE_BIND_NOTIFICATION`) uses the `death` prefix alone. A
+/// sole-reference binding (`SYS_CAP_BIND_SOLE_REFERENCE`) names its object in
+/// `object` and links into the sole-reference table: the object's first node
+/// on its bucket's chain through `death.next`, the object's other nodes off
+/// that one through `group` ([`crate::cap::sole_reference`]). Every
+/// `DeathObserver` a pool hands out is the prefix of one of these
+/// (`#[repr(C)]`, offset 0), so a pool pointer casts to the node and back.
+/// `object` and `group` are bare fields owned, like the prefix's link, by the
+/// lock of the list holding the node: the queue's `lock` on its free list
+/// (where both are null), the sole-reference table's lock on a table chain
+/// (the bare-field exception of docs/coding-standards.md § Concurrency).
+///
+/// [`DeathObserver`]: crate::sched::thread::DeathObserver
+#[repr(C)]
+pub struct ObserverNode
+{
+    /// The link, the queue, and the correlator every binding uses.
+    pub death: crate::sched::thread::DeathObserver,
+    /// The object a sole-reference binding observes; null on the free list and
+    /// in a death binding.
+    pub object: *const crate::cap::object::KernelObjectHeader,
+    /// The next node of the same object's group in the sole-reference table;
+    /// null at the end, on the free list, and in a death binding.
+    pub group: *mut ObserverNode,
+}
+
+// SAFETY: the node's fields are written only on no list or under the lock of
+// the list holding it (see the type's rustdoc), and its `eq` is dereferenced
+// only while the binding's reference keeps the queue live.
+unsafe impl Send for ObserverNode {}
+// SAFETY: same rationale as `Send`.
+unsafe impl Sync for ObserverNode {}
+
 // ── EventQueueState ───────────────────────────────────────────────────────────
 
 /// Kernel state backing an `EventQueue` capability.
 ///
 /// The ring buffer body lives inline in the same retype slot — directly
 /// after this struct, at `cap::retype::EVENT_QUEUE_RING_OFFSET` — followed by
-/// the queue's death-observer node pool (the slot size comes from
+/// the queue's observer node pool (the slot size comes from
 /// `cap::retype::event_queue_dispatch(capacity, observers)`). `capacity` is the
 /// user-visible max entry count; the ring has `capacity + 1` slots, and full
 /// and empty are detected from `count`. The ring
@@ -79,10 +118,11 @@ pub struct EventQueueState
     pub wait_set: *mut u8,
     /// Index of this queue's entry in `WaitSetState::members`.
     pub wait_set_member_idx: u16,
-    /// Free death-observer nodes, linked through `DeathObserver::next`; null
-    /// when every node is bound or the queue has none. Protected by `lock`.
+    /// Free observer nodes ([`ObserverNode`]), linked through their
+    /// `DeathObserver` prefix's `next`; null when every node is bound or the
+    /// queue has none. Protected by `lock`.
     pub observer_free: *mut crate::sched::thread::DeathObserver,
-    /// Number of death-observer nodes the queue was created with, inline after
+    /// Number of observer nodes the queue was created with, inline after
     /// the ring. Fixed at construction; the reclaim path sizes the slot by it.
     pub observer_count: u32,
     /// Serialises post/recv across CPUs (see notification.rs for rationale).
@@ -143,17 +183,17 @@ impl EventQueueState
         }
     }
 
-    /// Construct the queue's `count` death-observer nodes at `nodes`, each
+    /// Construct the queue's `count` observer nodes at `nodes`, each
     /// naming `eq` (this queue's object), and put them all on the free list.
     ///
     /// # Safety
     /// Called once, before the queue is reachable by any other path. `nodes`
     /// must be 8-byte aligned, point to writable memory of `count`
-    /// `DeathObserver`s inside this queue's retype slot, and `eq` must be the
+    /// `ObserverNode`s inside this queue's retype slot, and `eq` must be the
     /// object wrapping this state.
     pub unsafe fn init_observer_pool(
         &mut self,
-        nodes: *mut crate::sched::thread::DeathObserver,
+        nodes: *mut ObserverNode,
         count: u32,
         eq: *mut crate::cap::object::EventQueueObject,
     )
@@ -169,23 +209,28 @@ impl EventQueueState
             unsafe {
                 core::ptr::write(
                     node,
-                    crate::sched::thread::DeathObserver {
-                        next: self.observer_free,
-                        eq,
-                        correlator: 0,
+                    ObserverNode {
+                        death: crate::sched::thread::DeathObserver {
+                            next: self.observer_free,
+                            eq,
+                            correlator: 0,
+                        },
+                        object: core::ptr::null(),
+                        group: core::ptr::null_mut(),
                     },
                 );
             }
-            // The node now heads the free list.
-            self.observer_free = node;
+            // The node now heads the free list, through its prefix.
+            self.observer_free = node.cast::<crate::sched::thread::DeathObserver>();
         }
     }
 }
 
-// ── Death-observer node pool ──────────────────────────────────────────────────
+// ── Observer node pool ────────────────────────────────────────────────────────
 
-/// Take a free death-observer node from `eq`'s pool, or null when the pool
-/// is empty (every node bound, or the queue was created with none).
+/// Take a free observer node from `eq`'s pool, as its `DeathObserver`
+/// prefix ([`ObserverNode`]), or null when the pool is empty (every node
+/// bound, or the queue was created with none).
 ///
 /// The node stays the queue's: the binder links it into an owner chain and
 /// the owner's teardown hands it back through [`event_queue_return_observer`].
@@ -222,7 +267,9 @@ pub unsafe fn event_queue_take_observer(
     node
 }
 
-/// Return a death-observer node to the free list of the queue it belongs to.
+/// Return an observer node, as its `DeathObserver` prefix, to the free list of
+/// the queue it belongs to. A sole-reference binding clears the node's
+/// `object` and `group` before it returns the node.
 ///
 /// # Safety
 /// `node` must have come from [`event_queue_take_observer`] on `eq`, be on
@@ -529,14 +576,18 @@ mod tests
 
     /// A capacity-1 queue over a ring the test owns, and `count` nodes for
     /// its pool. The ring is boxed so its address survives the return.
-    fn pool(count: usize) -> (EventQueueState, Vec<DeathObserver>, Box<[EventEntry; 2]>)
+    fn pool(count: usize) -> (EventQueueState, Vec<ObserverNode>, Box<[EventEntry; 2]>)
     {
         let mut ring = Box::new([EventEntry { payload: 0, tag: 0 }; 2]);
         let nodes = (0..count)
-            .map(|_| DeathObserver {
-                next: core::ptr::null_mut(),
-                eq: core::ptr::null_mut(),
-                correlator: 7,
+            .map(|_| ObserverNode {
+                death: DeathObserver {
+                    next: core::ptr::null_mut(),
+                    eq: core::ptr::null_mut(),
+                    correlator: 7,
+                },
+                object: core::ptr::NonNull::dangling().as_ptr(),
+                group: core::ptr::NonNull::dangling().as_ptr(),
             })
             .collect();
         // SAFETY: the boxed ring holds capacity + 1 = 2 aligned, writable
@@ -581,9 +632,11 @@ mod tests
         {
             // SAFETY: n is a node of the live pool, which nothing writes while
             // the test reads it.
-            let node = unsafe { &*n };
-            assert_eq!(node.eq, obj);
-            assert_eq!(node.correlator, 0);
+            let node = unsafe { &*n.cast::<ObserverNode>() };
+            assert_eq!(node.death.eq, obj);
+            assert_eq!(node.death.correlator, 0);
+            assert!(node.object.is_null());
+            assert!(node.group.is_null());
         }
     }
 

@@ -346,7 +346,7 @@ which the kernel forwards to the faulting thread's exception handler
 
 procmgr's own state for a child is charged to procmgr's node, not to the child's: its process-table
 entry (448 bytes), 6 to 13 capability slots in procmgr's `CSpace` (72 bytes each) and two
-death-observer nodes (24 bytes each), about 0.9 to 1.8 KiB with the growth of their containers, and
+observer nodes (40 bytes each), about 0.9 to 1.8 KiB with the growth of their containers, and
 96 bytes for each thread it registers (Label 22). Every page of the child itself, at least 55, is
 charged to the child's node, so that state is at most 0.85% of what the child's node already pays,
 and it goes with the child

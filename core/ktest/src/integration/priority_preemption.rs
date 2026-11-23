@@ -24,12 +24,13 @@
 //! `SchedControl` cap exists in the initial cap set (no elevation path).
 //!
 //! The cell guards the ordering: an RT thread runs ahead of a CPU-bound fair
-//! one within a bounded wait. Its wall-clock budget does not tell the one-tick
-//! preemption apart from the fair thread's slice expiring
+//! one within a bounded wait. Its wall-clock budget does not tell the
+//! preemption at the start's wake apart from the fair thread's slice expiring
 //! (core/kernel/docs/scheduler.md § Time Slice Policy), a difference an
-//! emulated boot's timing cannot resolve; the tick decision is
-//! host-tested instead (`PerCpuScheduler::tick_outcome` and
-//! `TickOutcome::slice_and_reschedule` in `core/kernel/src/sched/run_queue.rs`).
+//! emulated boot's timing cannot resolve; the preemption decision is
+//! host-tested instead (`PerCpuScheduler::outranked` in
+//! `core/kernel/src/sched/run_queue.rs`), and `integration::rt_wake_preempt`
+//! checks the preemption itself.
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait_timeout,

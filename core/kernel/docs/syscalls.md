@@ -1796,8 +1796,9 @@ upcall dropped and resumes;
 [docs/fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
 Upcalls). A thread running on
 another CPU is marked `Stopped` under every CPU's scheduler lock, and the call returns once that
-CPU has descheduled it and published its register save, at its next slice expiry, at a tick
-that preempts it for an RT thread (a target dispatched at a fair level), or at the thread's own
+CPU has descheduled it and published its register save, at its next slice expiry, at its
+preemption by an outranking thread at a return to user mode
+([scheduler.md § Wake Preemption](scheduler.md#wake-preemption)), or at the thread's own
 park or yield, or once an object teardown has committed `Exited` over it; the
 inter-processor interrupt sent to that CPU only forces a trap. A thread left `current` on a CPU that
 `fatal` halted is never descheduled: a stop of it does not return through the drain until a
@@ -1812,21 +1813,20 @@ its CPU with its save published (see [thread-lifecycle-and-sleep.md](thread-life
 § `sys_thread_stop` Cross-CPU Stop Protocol).
 
 **Latency contract:** a stop of a thread running on another CPU completes at the target's next
-slice-expiry `schedule()`, a tick that preempts it for an RT thread queued on its CPU (a target
-dispatched at a fair level), or its own park or yield, not within the inter-processor-interrupt
-latency: no interrupt-return path deschedules a `Stopped` current thread. That is within the
+slice-expiry `schedule()`, its preemption by a thread queued on its CPU that outranks it, at a
+return to user mode, or its own park or yield, not within the inter-processor-interrupt
+latency: the interrupt's return path deschedules a `Stopped` current thread only when a queued
+thread outranks it. That is within the
 target's remaining time slice (at most the longest slice, 20 timer ticks, that of fair level 20;
 `TIME_SLICE_TICKS`, 10, for a target dispatched at an RT level; see
 [scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)), except when the
 slice expires while the target runs a preemption-disabled kernel section with interrupts
 enabled (a TLB-shootdown or drain spin, or a page-pool seeding or teardown window between
 batches, `interrupt_window`): `timer_tick` then refills the slice without rescheduling,
-and `preempt_enable` does not reschedule, so the stop completes at the first later tick that
-decides a reschedule with preemption enabled: a slice expiry, a further slice later at the least,
-or, for a target dispatched at a fair level, a tick that finds an RT thread queued, which can be
-the next tick. Callers that need a bounded stop latency MUST budget a slice for each slice expiry
-the target can spend in such a section; a tick that decides a preemption for RT and finds
-preemption disabled leaves the slice running and adds nothing to that budget.
+and `preempt_enable` does not reschedule, so the stop completes at the first later slice-expiry
+tick with preemption enabled, a further slice later at the least, or at the target's next return
+to user mode when a thread queued on its CPU outranks it. Callers that need a bounded stop latency
+MUST budget a slice for each slice expiry the target can spend in such a section.
 
 **Capability requirement:** `thread_cap` must have Control rights.
 
@@ -1998,8 +1998,8 @@ takes effect immediately:
 - A **Running** thread on a different CPU is notified via a reschedule IPI
   and routed cross-CPU on its next `schedule()` entry. The IPI does not
   itself call `schedule()`; the running thread observes the new affinity
-  at its next slice-expiry, voluntary yield, or IPC block (or, for a fair
-  thread, at the next tick that finds an RT thread queued on its CPU).
+  at its next slice-expiry, voluntary yield, or IPC block, or at its
+  preemption by an outranking thread at a return to user mode.
   Worst-case latency is one time slice of the thread (see
   [scheduler.md](scheduler.md) § Active migration on affinity change).
 - A **Blocked / Stopped / Created** thread observes the new affinity on

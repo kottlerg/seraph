@@ -628,8 +628,8 @@ unsafe fn drain_remote_stopped(
         return;
     }
     // The IPI's trap snapshots the target's user registers; the remote CPU
-    // drops the Stopped target at its next timer_tick reschedule (a slice
-    // expiry, or a fair-dispatched target's preemption for RT) or its own
+    // drops the Stopped target at its next reschedule (a slice expiry, or its
+    // preemption by an outranking thread at a return to user mode) or its own
     // park or yield, whose trap leaves the snapshot sys_thread_read_regs
     // reads once this drain completes.
     // SAFETY: run_cpu < CPU_COUNT per contract.

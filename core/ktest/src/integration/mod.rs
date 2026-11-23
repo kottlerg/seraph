@@ -65,6 +65,7 @@ pub mod read_regs_blocked_syscall;
 pub mod reply_binding_displaced;
 pub mod retype_over_mapped_refused;
 pub mod retype_reclaim;
+pub mod rt_wake_preempt;
 pub mod shared_memory_two_aspaces;
 pub mod smt_siblings;
 pub mod stop_read_regs_remote;
@@ -205,6 +206,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::priority_preemption",
         priority_preemption::run(ctx)
     );
+    run_integration_test!("integration::rt_wake_preempt", rt_wake_preempt::run(ctx));
     run_integration_test!(
         "integration::fair_share_progress",
         fair_share_progress::run(ctx)

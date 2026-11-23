@@ -435,6 +435,13 @@ unsafe fn finish_syscall(exit: SyscallExit) -> SyscallExit
                 .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    // The return to user mode: a thread this syscall linked on this CPU above
+    // the caller (a self-wake), or one whose wake IPI a preemption-disabled
+    // window absorbed, runs now (core/kernel/docs/scheduler.md § Wake
+    // Preemption). The caller resumes here, its frame unchanged.
+    // SAFETY: syscall context on the caller's kernel stack, the frame holding
+    // what the thread resumes with, no lock held and interrupts disabled.
+    unsafe { crate::sched::preempt_if_outranked() };
     exit
 }
 

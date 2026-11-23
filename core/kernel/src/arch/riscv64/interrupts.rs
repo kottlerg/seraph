@@ -443,9 +443,32 @@ unsafe fn clear_sip_ssip()
     }
 }
 
-/// Main trap dispatch routine.
-///
-/// Called with interrupts disabled (sstatus.SIE is cleared on trap entry).
+/// Main trap dispatch routine, called by `trap_entry` with interrupts disabled
+/// (sstatus.SIE is cleared on trap entry): [`handle_trap`], then, for a trap
+/// taken from U-mode other than an ecall, the wake-preemption check
+/// (`sched::preempt_if_outranked`) before the return to U-mode. An ecall's
+/// check is the syscall exit's (`syscall::finish_syscall`), so a syscall makes
+/// it once.
+#[cfg(not(test))]
+extern "C" fn trap_dispatch(frame: *mut TrapFrame)
+{
+    // SAFETY: trap_entry passes this hart's live, valid frame; a single read,
+    // before handle_trap can block.
+    let scause = unsafe { (*frame).scause };
+    // SAFETY: as for the read above.
+    let sstatus_at_entry = unsafe { (*frame).sstatus };
+    handle_trap(frame);
+    // SPP (bit 8) clear: the trap came from U-mode. Cause 8 (interrupt bit
+    // clear) is the U-mode ecall.
+    if sstatus_at_entry & (1 << 8) == 0 && scause != 8
+    {
+        // SAFETY: the end of a trap from U-mode on the running thread's kernel
+        // stack, its frame published; no lock is held, SIE = 0.
+        unsafe { crate::sched::preempt_if_outranked() };
+    }
+}
+
+/// [`trap_dispatch`]'s body: the scause dispatch.
 ///
 /// `frame` is the live frame `trap_entry` built on this hart's kernel stack.
 /// It is held as a raw pointer, and each access derives a reference for that
@@ -462,7 +485,7 @@ unsafe fn clear_sip_ssip()
               kernel exception to `user_exception` or `kernel_exception`) stays one function so \
               the trap-frame ownership and SIE discipline read in one place"
 )]
-extern "C" fn trap_dispatch(frame: *mut TrapFrame)
+fn handle_trap(frame: *mut TrapFrame)
 {
     #[expect(
         clippy::multiple_unsafe_ops_per_block,

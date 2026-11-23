@@ -122,13 +122,6 @@ pub enum TickOutcome
         /// Ticks left in the slice.
         remaining: u32,
     },
-    /// The running thread is fair and an RT thread is queued on this CPU:
-    /// reschedule now, the slice keeping its `remaining` ticks.
-    PreemptForRt
-    {
-        /// Ticks left in the slice.
-        remaining: u32,
-    },
     /// The slice expired: refill it with `quantum` ticks and reschedule.
     Expired
     {
@@ -147,7 +140,6 @@ impl TickOutcome
         {
             Self::Idle => None,
             Self::Continue { remaining } => Some((remaining, false)),
-            Self::PreemptForRt { remaining } => Some((remaining, true)),
             Self::Expired { quantum } => Some((quantum, true)),
         }
     }
@@ -421,9 +413,10 @@ pub struct PerCpuScheduler
     /// interrupts masked, where it dispatches a thread: `schedule()`'s dispatch
     /// flip under the incoming thread's `sched_lock`, its same-thread re-mark
     /// under the running thread's, `IDLE_PRIORITY` when it switches to idle, and
-    /// `sched::enter`'s boot dispatch of init. Read only by this CPU's
-    /// `timer_tick`, through [`tick_outcome`](Self::tick_outcome). It stands in
-    /// for `(*current).priority`, which `timer_tick` may not read without the
+    /// `sched::enter`'s boot dispatch of init. Read only by this CPU: by its
+    /// `timer_tick`, through [`tick_outcome`](Self::tick_outcome), and at its
+    /// returns to user mode, through [`outranked`](Self::outranked). It stands
+    /// in for `(*current).priority`, which neither may read without the
     /// thread's `sched_lock`, so a priority change of a running thread reaches
     /// its slice (bounded by the new level's quantum from the first tick after
     /// it) and its class at its next dispatch. Atomic only so a shared reference can
@@ -813,7 +806,8 @@ impl PerCpuScheduler
     }
 
     /// Record `level` as the level of the thread this CPU is dispatching, for
-    /// [`tick_outcome`](Self::tick_outcome). Called only by this CPU, with
+    /// [`tick_outcome`](Self::tick_outcome) and [`outranked`](Self::outranked).
+    /// Called only by this CPU, with
     /// interrupts masked, at a dispatch (see the `current_level` field).
     pub fn set_current_level(&self, level: u8)
     {
@@ -827,11 +821,9 @@ impl PerCpuScheduler
     /// dispatched at, so a thread whose level changed runs no longer than its
     /// new level's slice from its first tick after the dispatch; then the tick
     /// is taken from it. A slice that reaches zero expires and is refilled with
-    /// that quantum; otherwise a fair thread is preempted while an RT thread is
-    /// queued on this CPU, and any other thread's slice goes on.
-    ///
-    /// Reads `non_empty` Relaxed: the caller, this CPU's `timer_tick`, holds
-    /// `lock`, which every queue change holds.
+    /// that quantum; otherwise it goes on. A thread queued here that outranks
+    /// the running one is left to [`outranked`](Self::outranked), which the same
+    /// interrupt's return to user mode decides.
     pub fn tick_outcome(&self, slice_remaining: u32) -> TickOutcome
     {
         if slice_remaining == 0
@@ -845,17 +837,34 @@ impl PerCpuScheduler
         let remaining = slice_remaining.min(quantum).saturating_sub(1);
         if remaining == 0
         {
-            return TickOutcome::Expired { quantum };
-        }
-        let rt_queued = self.non_empty.load(Ordering::Relaxed) >> (FAIR_QUEUE + 1) != 0;
-        if super::is_fair_level(level) && rt_queued
-        {
-            TickOutcome::PreemptForRt { remaining }
+            TickOutcome::Expired { quantum }
         }
         else
         {
             TickOutcome::Continue { remaining }
         }
+    }
+
+    /// Whether a thread queued on this CPU outranks the running one: the
+    /// highest non-empty run queue other than the idle queue is above the
+    /// queue of `current_level`. Any RT level outranks a fair level and the
+    /// idle level, and a higher RT level a lower one; no level outranks its own,
+    /// so one fair level never outranks another, all of them sharing the fair
+    /// queue (core/kernel/docs/scheduler.md § Wake Preemption).
+    ///
+    /// Reads `non_empty` and `current_level` Relaxed, holding no lock. The
+    /// caller is this CPU, at a return to user mode with interrupts masked: a
+    /// link it made itself precedes the read in program order, and a link
+    /// another CPU makes is followed by the wake IPI, whose own return to user
+    /// mode reads again (core/kernel/docs/scheduling-internals.md § Wake
+    /// Protocol Invariants). `schedule()` then decides under `lock`.
+    pub fn outranked(&self) -> bool
+    {
+        let queued = self.non_empty.load(Ordering::Relaxed) & !(1 << IDLE_QUEUE);
+        // The highest set bit is the highest non-empty queue, as in
+        // `dequeue_highest`.
+        queued != 0
+            && queued.ilog2() as usize > queue_index(self.current_level.load(Ordering::Relaxed))
     }
 
     /// The thread running on this CPU (null before `init`). A read without
@@ -1349,19 +1358,15 @@ mod tests
     }
 
     // Defect caught: `timer_tick` storing the wrong slice for an outcome, or
-    // not rescheduling on a preemption for RT or an expiry (the wiring the
-    // decision feeds), or touching the idle thread's zero slice.
+    // not rescheduling on an expiry (the wiring the decision feeds), or
+    // touching the idle thread's zero slice.
     #[test]
-    fn each_outcome_stores_its_slice_and_only_preemption_and_expiry_reschedule()
+    fn each_outcome_stores_its_slice_and_only_expiry_reschedules()
     {
         assert_eq!(TickOutcome::Idle.slice_and_reschedule(), None);
         assert_eq!(
             TickOutcome::Continue { remaining: 3 }.slice_and_reschedule(),
             Some((3, false))
-        );
-        assert_eq!(
-            TickOutcome::PreemptForRt { remaining: 3 }.slice_and_reschedule(),
-            Some((3, true))
         );
         assert_eq!(
             TickOutcome::Expired { quantum: 7 }.slice_and_reschedule(),
@@ -1395,49 +1400,118 @@ mod tests
         }
     }
 
-    // Defect caught: a fair thread left running out its quantum while an RT
-    // thread waits on its CPU.
+    // Defect caught: the tick deciding a preemption itself, which would
+    // reschedule a second time after the interrupt's return-to-user check, or
+    // preempt from kernel mode where only a slice expiry may.
     #[test]
-    fn a_running_fair_thread_is_preempted_mid_slice_when_an_rt_thread_is_queued()
+    fn a_queued_thread_that_outranks_the_running_one_leaves_its_slice_alone()
     {
         let sched = PerCpuScheduler::new();
         let mut rt = make_tcb();
         let pr = &raw mut *rt;
-        sched.set_current_level(RT_PRIORITY_MIN - 1);
-        assert_eq!(
-            sched.tick_outcome(5),
-            TickOutcome::Continue { remaining: 4 }
-        );
-        assert!(enq(&sched, pr, RT_PRIORITY_MIN));
-        assert_eq!(
-            sched.tick_outcome(5),
-            TickOutcome::PreemptForRt { remaining: 4 }
-        );
+        assert!(enq(&sched, pr, 30));
+        for level in [RT_PRIORITY_MIN - 1, RT_PRIORITY_MIN]
+        {
+            sched.set_current_level(level);
+            assert!(sched.outranked());
+            assert_eq!(
+                sched.tick_outcome(5),
+                TickOutcome::Continue { remaining: 4 },
+                "level {level}"
+            );
+        }
     }
 
-    // Defect caught: the preemption extended to RT threads (an RT thread at a
-    // lower level preempted mid-slice, which the strict class's slice policy
-    // does not do) or to a fair thread over a fair arrival.
+    // ── Wake preemption ───────────────────────────────────────────────────────
+
+    // Defect caught: a running thread left in place while a queued thread of a
+    // higher class or a higher RT level waits behind it on its CPU.
     #[test]
-    fn only_a_fair_thread_with_an_rt_thread_queued_is_preempted_mid_slice()
+    fn an_rt_level_outranks_every_fair_level_the_idle_level_and_every_lower_rt_level()
+    {
+        for queued in [RT_PRIORITY_MIN, 26, 30]
+        {
+            for running in IDLE_PRIORITY..queued
+            {
+                let sched = PerCpuScheduler::new();
+                let mut tcb = make_tcb();
+                assert!(enq(&sched, &raw mut *tcb, queued));
+                sched.set_current_level(running);
+                assert!(sched.outranked(), "queued {queued}, running {running}");
+            }
+        }
+    }
+
+    // Defect caught: a preemption between fair threads, whose level is a
+    // weight and grants no precedence, between threads of one RT level, which
+    // share it round-robin, or of a higher level by a lower one.
+    #[test]
+    fn no_fair_level_outranks_another_and_no_level_outranks_its_own_or_a_higher_one()
+    {
+        let rt_top = 30;
+        for (queued, running) in [
+            (syscall::PRIORITY_MIN, RT_PRIORITY_MIN - 1),
+            (RT_PRIORITY_MIN - 1, syscall::PRIORITY_MIN),
+            (10, 10),
+            (RT_PRIORITY_MIN, RT_PRIORITY_MIN),
+            (26, 26),
+            (22, 26),
+            (RT_PRIORITY_MIN - 1, RT_PRIORITY_MIN),
+            (rt_top - 1, rt_top),
+        ]
+        {
+            let sched = PerCpuScheduler::new();
+            let mut tcb = make_tcb();
+            assert!(enq(&sched, &raw mut *tcb, queued));
+            sched.set_current_level(running);
+            assert!(
+                !sched.outranked(),
+                "queued {queued} outranked running {running}"
+            );
+        }
+    }
+
+    // Defect caught: a fair thread taken as outranking the idle thread only
+    // when it is the highest queue's, or the idle thread's own queue entry
+    // taken as outranking a running thread.
+    #[test]
+    fn a_fair_level_outranks_the_idle_level_and_the_idle_queue_outranks_nothing()
     {
         let sched = PerCpuScheduler::new();
-        let mut rt = make_tcb();
+        sched.set_current_level(IDLE_PRIORITY);
+        assert!(!sched.outranked(), "empty queues");
+        let mut idle = make_tcb();
+        assert!(enq(&sched, &raw mut *idle, IDLE_PRIORITY));
+        assert!(!sched.outranked(), "the idle queue alone");
+        sched.set_current_level(syscall::PRIORITY_MIN);
+        assert!(!sched.outranked(), "the idle queue under a fair thread");
+        sched.set_current_level(IDLE_PRIORITY);
         let mut fair = make_tcb();
-        let pr = &raw mut *rt;
-        let pf = &raw mut *fair;
-        assert!(enq(&sched, pf, RT_PRIORITY_MIN - 1));
-        sched.set_current_level(10);
-        assert_eq!(
-            sched.tick_outcome(5),
-            TickOutcome::Continue { remaining: 4 }
-        );
-        assert!(enq(&sched, pr, 30));
-        sched.set_current_level(RT_PRIORITY_MIN);
-        assert_eq!(
-            sched.tick_outcome(5),
-            TickOutcome::Continue { remaining: 4 }
-        );
+        assert!(enq(&sched, &raw mut *fair, syscall::PRIORITY_MIN));
+        assert!(sched.outranked(), "a fair thread over the idle thread");
+    }
+
+    // Defect caught: the decision kept after the outranking thread left the
+    // queue (dispatched or pulled away), or read from a lower queue than the
+    // highest.
+    #[test]
+    fn the_decision_follows_the_highest_queue_as_it_changes()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut low = make_tcb();
+        let mut high = make_tcb();
+        let pl = &raw mut *low;
+        let ph = &raw mut *high;
+        sched.set_current_level(24);
+        assert!(enq(&sched, pl, 22));
+        assert!(!sched.outranked());
+        assert!(enq(&sched, ph, 26));
+        assert!(sched.outranked());
+        assert_eq!(deq(&sched), ph);
+        assert!(!sched.outranked());
+        assert!(rm(&sched, pl, 22));
+        assert_eq!(sched.non_empty_mask(), 0);
+        assert!(!sched.outranked());
     }
 
     // ── RunQueue tests (exercised through PerCpuScheduler at priority 0) ──────

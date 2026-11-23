@@ -403,15 +403,16 @@ as a lock-free snapshot that a later check re-decides or another edge (`context_
 dispatched at, is written and read only by its own CPU with interrupts masked: written at each
 dispatch (`schedule()`'s dispatch flip under the incoming thread's `sched_lock`, its same-thread
 re-mark under the running thread's, the idle level when it switches to idle, and `sched::enter`'s
-boot dispatch of init), and read by its `timer_tick`, which may not read the running thread's
-`priority` without that thread's `sched_lock`. `saved_lock_flags` is the interrupt word
-an all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_flags`,
-`unlock_saved_flags`). `idle_pull_candidate`, the idle pull's confirmation sample,
-`idle_pull_held`, whether the previous idle tick held it for a busy SMT sibling, and
-`idle_pull_cursor`, where its scan starts ([scheduler.md](scheduler.md) § Load Balancing, § SMT
-Awareness), are written and read only by their own CPU's `timer_tick`. `non_empty`, `load`,
-`idle_pull_candidate`, `idle_pull_held`, `idle_pull_cursor` and the deferred-reclaim head are
-atomics with their own orderings (§ Atomic Ordering Invariants).
+boot dispatch of init), and read by its `timer_tick` and, at its returns to user mode, by
+`outranked` ([scheduler.md](scheduler.md) § Wake Preemption), neither of which may read the
+running thread's `priority` without that thread's `sched_lock`. `saved_lock_flags` is the interrupt
+word an all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_flags`,
+`unlock_saved_flags`). `idle_pull_candidate`, the idle pull's confirmation sample, `idle_pull_held`,
+whether the previous idle tick held it for a busy SMT sibling, and `idle_pull_cursor`, where its
+scan starts ([scheduler.md](scheduler.md) § Load Balancing, § SMT Awareness), are written and read
+only by their own CPU's `timer_tick`. `non_empty`, `load`, `idle_pull_candidate`, `idle_pull_held`,
+`idle_pull_cursor` and the deferred-reclaim head are atomics with their own orderings (§ Atomic
+Ordering Invariants).
 
 **Lock primitive.** All locks above except the derivation tree lock are `crate::sync::Spinlock`
 (IRQ-disabling); the derivation tree lock is a bare spin lock (below). Hold-time MUST be bounded
@@ -445,10 +446,10 @@ thread's deferred reclaim (`drain_deferred_reclaim` from
 `idle_thread_entry`), which runs with interrupts and preemption enabled and
 is sound only because the idle thread's time slice is permanently zero, so
 `timer_tick` returns before `schedule()` for it. Kernel-mode preemption
-exists only at a tick that decides a reschedule (a slice expiry, or a fair
-thread's preemption for RT;
-[scheduler.md § Kernel-Mode Preemption Points](scheduler.md#kernel-mode-preemption-points))
-with preemption enabled, and every kernel
+exists only at a slice-expiry tick with preemption enabled (a wake
+preemption is decided only at a return to user mode;
+[scheduler.md § Kernel-Mode Preemption Points](scheduler.md#kernel-mode-preemption-points)),
+and every kernel
 window that enables interrupts — shootdown ack-waits, the teardown gates,
 the timer-batch quiesce (`sleep_wakeups_quiesce`), the contended `pt_lock`
 path, the `sys_thread_stop` drain and save wait (`await_stopped_save`), the `sys_thread_start`
@@ -1153,6 +1154,24 @@ Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
 4. halt_until_interrupt()                          // x86: sti;hlt   riscv: wfi (atomic)
 ```
 
+Consumer side at a return to user mode (`sched::preempt_if_outranked`,
+`core/kernel/src/sched/mod.rs`; [scheduler.md](scheduler.md) § Wake Preemption):
+
+```
+1. Interrupts are masked: the end of a syscall, or of an interrupt or exception
+   taken from user mode.
+2. outranked = scheduler_ptr(cpu).outranked()  // non_empty, current_level: Relaxed
+3. if outranked: schedule(Requeue::Preempted)   // decides again under the run-queue lock
+```
+
+This consumer relies on invariant 1 as the idle loop does, for producer steps 1 to 5a and 6 to
+8: a remote link's `non_empty` bit is visible before the wake IPI reaches the CPU, and the IPI's
+interrupt, taken in user mode or held pending across a masked window to the next return to user
+mode, ends at this check, which then reads the bit. A miss before the IPI is re-decided at the
+IPI's own return to user mode. The load is Relaxed: it only decides whether to enter
+`schedule()`, which reads the queues under their lock, and a link the CPU made itself precedes it
+in program order.
+
 **Invariants the protocol MUST satisfy:**
 
 1. **The link's `non_empty` publication MUST precede the wake IPI, and the IPI MUST NOT reach
@@ -1192,16 +1211,17 @@ requeue, `sys_thread_set_affinity`'s `migrate_ready_thread`, and `sys_thread_set
 `relocate_ready_priority`, whose callers prod the CPU (`prod_remote_cpu`) after their unlock; the
 priority relocation's unlink can empty the queues for a moment, so its re-link is a link like any
 other. A path that links a thread on its own CPU (`schedule()`'s requeue of the outgoing thread and
-its deferred-dispatch re-link, the load balancer's pull, which moves a thread onto the pulling CPU
-from its `timer_tick`, and Phase 9's link of init on the boot CPU) needs no IPI: the link precedes
-that CPU's next masked check in program order, or, made in an interrupt taken during the halt, ends
-the halt itself. In the masked check (consumer step 2), a load that misses a remote link was made
-before the link was visible, so the IPI that invariant 1 orders after the link arrives after the
-mask, is held pending, and ends the atomic halt; a load after it sees the bit. An IPI that finds no
-work (a thread pulled away before the check, or `sys_thread_set_affinity`'s prod of a CPU running
-its target, which observes the change at its next `schedule()` entry) costs one pass of the loop,
-which re-checks and halts. The always-IPI rule and the masked `has_runnable` check therefore close
-the check-to-halt window with `non_empty` alone; no second per-CPU flag is needed.
+its deferred-dispatch re-link, the wake preemption's requeue of the preempted thread at the head
+of its own queue (`Requeue::Preempted`), the load balancer's pull, which moves a thread onto the
+pulling CPU from its `timer_tick`, and Phase 9's link of init on the boot CPU) needs no IPI: the
+link precedes that CPU's next masked check in program order, or, made in an interrupt taken during
+the halt, ends the halt itself. In the masked check (consumer step 2), a load that misses a remote
+link was made before the link was visible, so the IPI that invariant 1 orders after the link arrives
+after the mask, is held pending, and ends the atomic halt; a load after it sees the bit. An IPI that
+finds no work (a thread pulled away before the check, or `sys_thread_set_affinity`'s prod of a CPU
+running its target, which observes the change at its next `schedule()` entry) costs one pass of the
+loop, which re-checks and halts. The always-IPI rule and the masked `has_runnable` check therefore
+close the check-to-halt window with `non_empty` alone; no second per-CPU flag is needed.
 
 ---
 
@@ -1261,7 +1281,7 @@ a defined purpose and correctness role.
 | Vector | Constant | Purpose | Handler | Correctness role |
 |---|---|---|---|---|
 | 250 | `IPI_VECTOR_TLB_SHOOTDOWN` | TLB invalidation cascade | Flushes per-CPU TLB entries staged by the issuer. | Required for rewrites that could strand a dangerous stale entry — unmap, permission narrowing, or frame replacement — where the stale entry would alias a freed/reused frame or grant revoked rights. Fresh maps and permission widenings skip the IPI and rely instead on the page-fault handler's spurious-fault retry (the live PTE already permits the access). See [memory-internals.md](memory-internals.md#smp-tlb-shootdown). |
-| 251 | `IPI_VECTOR_WAKEUP` | Wake target CPU from `hlt` | EOI only (no work). | Required for the wake protocol's "always-IPI" invariant. The handler does no real work; the IPI's value is the trap entry itself, which exits `hlt` and re-enters the idle loop's check. |
+| 251 | `IPI_VECTOR_WAKEUP` | Wake target CPU from `hlt`, or reach a running CPU's return to user mode | EOI only (no work); `irq_dispatch`'s return to user mode then makes the wake-preemption check. | Required for the wake protocol's "always-IPI" invariant. The handler does no real work; the IPI's value is the trap entry itself, which exits `hlt` and re-enters the idle loop's check, or, taken in user mode, ends at the wake-preemption check (§ Wake Protocol Invariants, consumer side at a return to user mode). |
 
 ### riscv64
 
@@ -1271,7 +1291,8 @@ The riscv64 build uses one SBI IPI extension (EID `0x735049`, FID `0`) for both 
 wakeup. The supervisor-mode trap handler distinguishes the two by side-channel state — the shootdown
 path scans the per-CPU TLB shootdown request slots and services any whose pending mask names this
 hart; a wakeup-only IPI finds no slot naming it and falls through with no work, exactly mirroring
-the x86_64 wakeup-vector handler. The request-slot protocol is specified in
+the x86_64 wakeup-vector handler, and `trap_dispatch` makes the wake-preemption check for a trap
+taken from U-mode. The request-slot protocol is specified in
 [memory-internals.md](memory-internals.md#smp-tlb-shootdown). The send (`sbi_send_ipi_to`) issues
 `fence rw, iorw` before the SBI ecall, so the request slot or run-queue link an IPI announces is
 visible to the target before it takes the interrupt (§ Wake Protocol Invariants, invariant 1).
@@ -1387,7 +1408,7 @@ the ordering choice is required for correctness; relaxations would introduce a r
 
 | Atomic | Location | Set ordering | Read ordering | Pairing rationale |
 |---|---|---|---|---|
-| `non_empty` (per PerCpuScheduler) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue` and `enqueue_at_head` (their shared `link`), `dequeue_highest`, `remove_from_queue`; read in `has_runnable`) | Release on `link.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and` | Acquire on `has_runnable.load` | Release publishes the queue-mutation stores; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO. |
+| `non_empty` (per PerCpuScheduler) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue` and `enqueue_at_head` (their shared `link`), `dequeue_highest`, `remove_from_queue`; read in `has_runnable` and `outranked`) | Release on `link.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and` | Acquire on `has_runnable.load`; Relaxed on `outranked`'s load | Release publishes the queue-mutation stores; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO. `outranked`'s load only decides whether to enter `schedule()`, which reads the queues under their lock; its freshness is invariant 1's (§ Wake Protocol Invariants). |
 | `queued_on` (per TCB, `AtomicI16`) | `core/kernel/src/sched/thread.rs` (decl); writes in `PerCpuScheduler::enqueue` and `enqueue_at_head` (their shared `link`; set to priority), `dequeue_highest` / `remove_from_queue` (set to `-1`); read in the double-link guard of that shared `link`, `schedule()`'s `already_queued` requeue guard, and the `commit_blocked_under_local_lock` debug tripwire | Relaxed `store` | Relaxed `load` | The global single-link tag (#244/#289). Every load-bearing access — set, clear, and the guard reads — is performed under the owning `scheduler.lock` (the `schedule()` guard read under the current CPU's run-queue lock), which supplies all required ordering; the atomic type exists only so a cross-CPU `enqueue_and_wake` guard read of a TCB linked on *another* CPU is well-defined, not for lock-free synchronisation. A `>= 0` value means linked, on the run queue of that level, on the CPU that set it. The `commit_blocked` tripwire reads it Relaxed under `(*tcb).sched_lock` with no run-queue lock — sound because every `-1 → >= 0` writer either classifies the target not-live under that same `sched_lock` (`enqueue_and_wake`, `enqueue_ready_thread` via its not-live caller contract) or runs as / while holding the same lock as the parking thread itself (`schedule()`'s requeue arms and its deferred-dispatch re-link, `relocate_ready_thread`, `relocate_ready_priority`), all excluded while the thread executes its own park commit. (The softlockup-watchdog dump also reads the field, under the walked thread's `sched_lock`; diagnostic-only, not load-bearing.) |
 | `context_saved` (per TCB) | `core/kernel/src/sched/thread.rs` (decl) | Release store of `1` inside `context::switch`, after the rsp/sp swap onto the incoming thread's kstack; **Relaxed clears to `0`** at the park commits (`commit_blocked_under_local_lock` and the IPC pre-clears) and `schedule()`'s switch-away / cross-affinity arms, each performed while the thread is `current` on the storing CPU; **Relaxed restores to `1`** by the IPC primitives when they do not park (payload harvested before parking, or a refused commit's rollback), while the thread is still `current` on the storing CPU | Acquire on the remote-dequeue spin-loop and in `schedule()`'s dispatch-flip read that defers an unpublished `next` when the outgoing thread is not idle (step 3.5); **also Acquire** in the load-balancer liveness gate (`pull_unpinned_ready` / `migrate_ready_thread`, step 11) and the `sys_thread_start` settle loop and commit (`start_under_all_locks`, `start_ready_to_link`) and the register-access gate (`with_held_frame`), and the `sys_thread_stop` drain and save wait (`drain_remote_stopped`, `await_stopped_save`), which pair with the switch-out Release so a stop returns only after the target's save is visible | Closes the partial-`SavedState`-visibility race on RVWMO, and (step 11) gates cross-CPU relocation/resume on a committed save — `cs == 1` ⇒ switched out and `current` nowhere; see [Cross-CPU TCB Ownership](#cross-cpu-tcb-ownership) (steps 5/6/9/11) for the full sequence. The Relaxed `0`-clears are sufficient: every consumer reaches the cleared value transitively through a lock release/acquire chain (the waker/relocator hold `sched_lock` and the run-queue lock), the same argument the pre-existing IPC pre-clears rely on. |
 | `trap_frame` (per TCB, `AtomicPtr<TrapFrame>`) | `core/kernel/src/sched/thread.rs` (decl) | Relaxed `store` by `SYS_THREAD_CONFIGURE` (under the target's `sched_lock`, while `Created`) and `sched::enter`, then by the running thread itself at each user-mode entry that can deschedule it (`publish_user_frame`, the syscall dispatcher) and around a fault block (`redirect_user_fault` stores the live frame and restores the prior pointer, on both arches; `syscall::deliver_copy_fault` republishes the syscall frame before a restartable syscall's copy fault blocks) | Relaxed `load` in `with_held_frame` under the target's `sched_lock`, after its `context_saved` Acquire; `sys_thread_start`'s unlocked precheck, which only refuses a never-configured thread (the pointer is never reset to null once set, and the start's commit takes the `sched_lock` configure holds across its store); the running thread's own loads | The register syscalls read the pointer only once the target is off every CPU with its save published: the store precedes the switch-out's `context_saved` Release, which their Acquire pairs with, so Relaxed suffices. See [arch-interface.md](arch-interface.md) § `trap_frame`. |

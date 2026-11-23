@@ -143,7 +143,7 @@ services/svctest/
         │                      #   next instance; all-RAM-accounted identity
         ├── swap_commit.rs     # Commitment backed by swap slots: admitted past the free pages by
         │                      #   the overcommit allowance and refused past it; with crashd's
-        │                      #   hold, a child writes a commitment past the free frames, its
+        │                      #   hold, a child writes a commitment past the draw room, its
         │                      #   commit overruns held until write-out opens the draw room
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
@@ -595,7 +595,7 @@ through to the normal run.
 | `checkpoint-pinned`         | `checkpoint`   | `procmgr_checkpoint` (pinned; sends `QUIESCE`, reports the reply) |
 | `restore-child`             | `restore`      | `procmgr_restore` (holds each value on command, quiesces, reports its restore) |
 | `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
-| `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the free frames) |
+| `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the draw room) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`shutdown` case) |
 
 ---

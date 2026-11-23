@@ -1096,7 +1096,7 @@ burn-in svctest cell: svctest's `oom_policy` phase runs when it is staged, has i
 oomd stops it, and passes otherwise, and its `logd_reserve` phase has it fill memory while logd is
 killed and restarted. The CI svctest cell drops crashd, so the held-write path of
 that phase (a child's page fault crashd holds until oomd's stop frees memory), and the write part of
-the `memmgr_swap_commit` phase (a child's commitment past the free frames, its commit overruns
+the `memmgr_swap_commit` phase (a child's commitment past the draw room, its commit overruns
 held by crashd until write-out to swap opens memmgr's draw room), run in the burn-in svctest cell,
 which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart = always`,
 `stop_source = program`) is co-staged beside `memhog` in both cells: svctest's

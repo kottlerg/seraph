@@ -3292,8 +3292,8 @@ pub mod pipe {
     }
 
     /// The times the calling thread's pipe ends found their ring empty (a
-    /// reader) or full (a writer) and made ready to block until the peer
-    /// rings (runtime/ruststd/README.md § Pipes). A count that only moves up,
+    /// reader) or full (a writer) and announced a wait for the peer to ring
+    /// (runtime/ruststd/README.md § Pipes), whether or not they then blocked. A count that only moves up,
     /// wrapping, read as [`notification_sends`] is.
     #[must_use]
     #[stable(feature = "seraph_ext", since = "1.0.0")]

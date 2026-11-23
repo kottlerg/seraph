@@ -67,9 +67,11 @@ to peak above `SLOT_SLACK` (8) fails the run.
 Last, the doorbell trial spawns the fixture's `sink` mode with piped stdin and stdout, waits for
 its ready line, makes `DOORBELL_WRITES` (10000) writes of `DOORBELL_WRITE_BYTES` (16) bytes into
 its stdin, reads its own counters, closes the stdin, and reads the sink's report. The trial fails
-when the sink exits non-zero, its report is missing, or it read other than every byte written. Its
-report line gives the time from the first write to the sink's report, the throughput, and both
-ends' sends and waits.
+when the sink exits non-zero, its report is missing, it read other than every byte written, or
+either end sent more notifications than the other announced waits, since a pipe end rings its peer
+only for a wait the peer announced ([shared/shmem/README.md](../../shared/shmem/README.md)
+§ Doorbell protocol). Its report line gives the time from the first write to the sink's report,
+the throughput, and both ends' sends and waits.
 
 All tester output goes to stdout. Every line except the `captured stdout:` line after a
 `FAIL` carries the `[pipestress-tester]` prefix:

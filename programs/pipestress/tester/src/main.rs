@@ -12,9 +12,10 @@
 //! `[pipestress-tester]` line is advisory.
 //!
 //! A doorbell trial follows: the tester writes `DOORBELL_WRITES` small writes
-//! into the stdin of the fixture's `sink` mode and reports the throughput
-//! and both ends' pipe notification sends and waits
-//! (`std::os::seraph::pipe`), which its report line carries for the boot log.
+//! into the stdin of the fixture's `sink` mode, reports the throughput and
+//! both ends' pipe notification sends and waits (`std::os::seraph::pipe`),
+//! and fails when either end sent more notifications than its peer announced
+//! waits: a pipe end rings its peer only for a wait the peer announced.
 //!
 //! The tester is also the #364 long-lived-spawner fixture: each iteration
 //! churns ~5 sub-page retype chunks through this process's pooled object
@@ -233,6 +234,19 @@ fn doorbell_trial()
     {
         fail(
             &format!("doorbell: sink read {bytes} bytes of {sent}"),
+            &report,
+        );
+    }
+    // Each doorbell claims one announced wait of the peer
+    // (shared/shmem/README.md § Doorbell protocol).
+    if writer.sends > reader.waits || reader.sends > writer.waits
+    {
+        fail(
+            &format!(
+                "doorbell: more doorbells than the peer announced waits (writer {} sends for \
+                 {} reader waits, reader {} sends for {} writer waits)",
+                writer.sends, reader.waits, reader.sends, writer.waits
+            ),
             &report,
         );
     }

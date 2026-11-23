@@ -14,7 +14,9 @@
 //! Index ordering is Acquire/Release, which suffices on both x86-64 (TSO)
 //! and RISC-V (RVWMO) for data published before the index store to be
 //! observed after the index load. Blocking and wake-up use a notification
-//! cap out of band (pipes); this crate holds only the mechanism.
+//! cap out of band (pipes); this crate holds the doorbell protocol that says
+//! when an end must ring it (the header's waiter words and a `SeqCst` fence
+//! pair), not the notification itself.
 
 // Under `rustc-dep-of-std` (build-std), use the core facade and no_core
 // so this crate can sit inside std's dep graph. Mirrors abi/syscall,
@@ -37,7 +39,7 @@ extern crate rustc_std_workspace_core as core;
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering, fence};
 
 /// Page size on both supported architectures.
 const PAGE_SIZE: u64 = 4096;
@@ -243,9 +245,10 @@ unsafe fn unmap_range(aspace: u64, vaddr: u64, count: u64)
 /// Fixed in-memory header at the start of an SPSC shared region.
 ///
 /// Two atomic indices plus an atomic `capacity` (byte buffer length, must be a
-/// power of two) and a `closed` flag used by pipe peers to signal EOF.
-/// The byte buffer follows immediately after this struct, at offset
-/// [`SpscHeader::SIZE`].
+/// power of two), a `closed` flag used by pipe peers to signal EOF, and one
+/// waiter word per direction for the doorbell protocol (`shared/shmem/README.md`
+/// § Doorbell protocol). The byte buffer follows immediately after this
+/// struct, at offset [`SpscHeader::SIZE`].
 #[repr(C)]
 pub struct SpscHeader
 {
@@ -273,6 +276,17 @@ pub struct SpscHeader
     /// zero-progress read/write to disambiguate "ring empty/full" from
     /// "peer gone". Reset to 0 by `init`.
     pub closed: AtomicU32,
+    /// The reader's waiter word: set to 1 by a reader that found the ring
+    /// empty and is about to wait for bytes ([`SpscReader::prepare_wait`]);
+    /// cleared by the writer that claims it to ring the reader's doorbell
+    /// ([`SpscWriter::take_waiting_reader`]), or by the reader itself when
+    /// bytes arrived before it blocked or its wait has returned. Reset to 0 by
+    /// `init`.
+    pub reader_waiting: AtomicU32,
+    /// The writer's waiter word: the same for a writer that found the ring
+    /// full and is about to wait for space ([`SpscWriter::prepare_wait`]),
+    /// claimed by the reader ([`SpscReader::take_waiting_writer`]).
+    pub writer_waiting: AtomicU32,
 }
 
 impl SpscHeader
@@ -302,6 +316,8 @@ impl SpscHeader
         header.tail.store(0, Ordering::Relaxed);
         header.capacity.store(capacity, Ordering::Relaxed);
         header.closed.store(0, Ordering::Relaxed);
+        header.reader_waiting.store(0, Ordering::Relaxed);
+        header.writer_waiting.store(0, Ordering::Relaxed);
     }
 
     /// Mark the ring closed. Called by whichever peer drops first.
@@ -470,6 +486,40 @@ impl SpscWriter<'_>
         n as usize
     }
 
+    /// Make ready to wait for space after a [`write`](Self::write) found the
+    /// ring full: set this writer's waiter word, fence, and look again.
+    ///
+    /// Returns `true` when the ring is still full: the caller blocks on the
+    /// notification the reader rings for space, and calls
+    /// [`end_wait`](Self::end_wait) once that wait returns, whatever it
+    /// returned. Returns `false` when the reader freed space meanwhile; the
+    /// word is cleared again and the caller writes instead of waiting.
+    #[must_use]
+    pub fn prepare_wait(&self) -> bool
+    {
+        announce_wait(self)
+    }
+
+    /// Clear this writer's waiter word after its wait returned, so a reader
+    /// that frees space later rings no doorbell for a wait already over.
+    pub fn end_wait(&self)
+    {
+        self.withdraw();
+    }
+
+    /// After a [`write`](Self::write) that stored bytes: fence, then claim the
+    /// reader's waiter word.
+    ///
+    /// Returns `true` when the reader had announced a wait, which this call
+    /// cleared: the caller rings the reader's doorbell (the notification it
+    /// waits on for bytes). `false` means no reader waits, and nothing need
+    /// be rung.
+    #[must_use]
+    pub fn take_waiting_reader(&self) -> bool
+    {
+        take_waiting_peer(self)
+    }
+
     /// How many bytes are currently in the ring (from this writer's view).
     #[must_use]
     pub fn used(&self) -> usize
@@ -546,6 +596,40 @@ impl SpscReader<'_>
         n as usize
     }
 
+    /// Make ready to wait for bytes after a [`read`](Self::read) found the
+    /// ring empty: set this reader's waiter word, fence, and look again.
+    ///
+    /// Returns `true` when the ring is still empty: the caller blocks on the
+    /// notification the writer rings for bytes, and calls
+    /// [`end_wait`](Self::end_wait) once that wait returns, whatever it
+    /// returned. Returns `false` when bytes arrived meanwhile; the word is
+    /// cleared again and the caller reads instead of waiting.
+    #[must_use]
+    pub fn prepare_wait(&self) -> bool
+    {
+        announce_wait(self)
+    }
+
+    /// Clear this reader's waiter word after its wait returned, so a writer
+    /// that stores bytes later rings no doorbell for a wait already over.
+    pub fn end_wait(&self)
+    {
+        self.withdraw();
+    }
+
+    /// After a [`read`](Self::read) that consumed bytes: fence, then claim the
+    /// writer's waiter word.
+    ///
+    /// Returns `true` when the writer had announced a wait, which this call
+    /// cleared: the caller rings the writer's doorbell (the notification it
+    /// waits on for space). `false` means no writer waits, and nothing need
+    /// be rung.
+    #[must_use]
+    pub fn take_waiting_writer(&self) -> bool
+    {
+        take_waiting_peer(self)
+    }
+
     /// Whether the ring currently has any bytes to consume.
     #[must_use]
     pub fn is_empty(&self) -> bool
@@ -553,6 +637,126 @@ impl SpscReader<'_>
         let head = self.header.head.load(Ordering::Relaxed);
         let tail = self.header.tail.load(Ordering::Acquire);
         head == tail
+    }
+}
+
+// ── Doorbell protocol ────────────────────────────────────────────────────────
+//
+// shared/shmem/README.md § Doorbell protocol states the protocol and why the
+// fence pair makes a lost wake impossible. The two steps below are generic over
+// `DoorbellEnd` so the host test runs these same functions over a model memory
+// that reorders a store past a later load, as a store buffer does.
+
+/// One ring end's shared-word operations, as the doorbell protocol uses them.
+trait DoorbellEnd
+{
+    /// Set this end's waiter word.
+    fn announce(&self);
+    /// Clear this end's waiter word.
+    fn withdraw(&self);
+    /// Order this thread's earlier stores before its later loads: a `SeqCst`
+    /// fence, the one store-load barrier the protocol needs.
+    fn fence(&self);
+    /// Whether the peer has made progress this end can use since it last
+    /// looked: bytes to read for a reader, space to write for a writer.
+    fn peer_progressed(&self) -> bool;
+    /// Whether the peer's waiter word is set.
+    fn peer_waiting(&self) -> bool;
+    /// Clear the peer's waiter word, returning whether it was set.
+    fn take_peer_word(&self) -> bool;
+}
+
+/// The waiting side's step: announce the wait, fence, and look again.
+/// Returns `true` when the caller must block, `false` (with the announcement
+/// withdrawn) when the peer's progress arrived first.
+fn announce_wait<E: DoorbellEnd>(end: &E) -> bool
+{
+    end.announce();
+    end.fence();
+    if end.peer_progressed()
+    {
+        end.withdraw();
+        return false;
+    }
+    true
+}
+
+/// The progressing side's step, after it published its index: fence, then
+/// claim the peer's waiter word. Returns `true` when the caller must ring the
+/// peer's doorbell. The plain load first keeps the common case, no waiter, a
+/// read of the line rather than a write to it.
+fn take_waiting_peer<E: DoorbellEnd>(end: &E) -> bool
+{
+    end.fence();
+    end.peer_waiting() && end.take_peer_word()
+}
+
+impl DoorbellEnd for SpscWriter<'_>
+{
+    fn announce(&self)
+    {
+        self.header.writer_waiting.store(1, Ordering::Relaxed);
+    }
+
+    fn withdraw(&self)
+    {
+        self.header.writer_waiting.store(0, Ordering::Relaxed);
+    }
+
+    fn fence(&self)
+    {
+        fence(Ordering::SeqCst);
+    }
+
+    fn peer_progressed(&self) -> bool
+    {
+        // Acquire: a write that follows reuses the slots the reader released.
+        let head = self.header.head.load(Ordering::Acquire);
+        let tail = self.header.tail.load(Ordering::Relaxed);
+        tail.wrapping_sub(head) < self.mask.saturating_add(1)
+    }
+
+    fn peer_waiting(&self) -> bool
+    {
+        self.header.reader_waiting.load(Ordering::Relaxed) != 0
+    }
+
+    fn take_peer_word(&self) -> bool
+    {
+        self.header.reader_waiting.swap(0, Ordering::Relaxed) != 0
+    }
+}
+
+impl DoorbellEnd for SpscReader<'_>
+{
+    fn announce(&self)
+    {
+        self.header.reader_waiting.store(1, Ordering::Relaxed);
+    }
+
+    fn withdraw(&self)
+    {
+        self.header.reader_waiting.store(0, Ordering::Relaxed);
+    }
+
+    fn fence(&self)
+    {
+        fence(Ordering::SeqCst);
+    }
+
+    fn peer_progressed(&self) -> bool
+    {
+        !self.is_empty()
+    }
+
+    fn peer_waiting(&self) -> bool
+    {
+        self.header.writer_waiting.load(Ordering::Relaxed) != 0
+    }
+
+    fn take_peer_word(&self) -> bool
+    {
+        self.header.writer_waiting.swap(0, Ordering::Relaxed) != 0
     }
 }
 
@@ -593,6 +797,8 @@ mod tests
                 tail: AtomicU32::new(0),
                 capacity: AtomicU32::new(0),
                 closed: AtomicU32::new(0),
+                reader_waiting: AtomicU32::new(0),
+                writer_waiting: AtomicU32::new(0),
             },
             body: [0; CAP as usize],
         };
@@ -642,6 +848,489 @@ mod tests
         assert_eq!(rd.read(&mut out), CAP as usize);
         assert!(out.iter().all(|&b| b == 0xAB));
         assert!(rd.is_empty());
+    }
+
+    // ── Doorbell protocol model ──────────────────────────────────────────────
+    //
+    // The explorer below runs the protocol's own steps, `announce_wait` and
+    // `take_waiting_peer`, on a writer and a reader thread over a model memory
+    // with a store buffer per thread (x86-64's TSO, and the store-load reordering
+    // RISC-V's RVWMO also allows: a store stays invisible to the other thread
+    // until its buffer drains, while the thread's later loads go ahead). A fence
+    // drains the issuing thread's buffer, a swap is a locked instruction that does
+    // too, and a notification is the kernel's sticky bit: a send sets it, a wait
+    // takes it, or blocks until a send sets it. Every step waits for a grant from
+    // the explorer, which chooses among the enabled steps and buffer drains, and
+    // runs every schedule depth first, so the exploration is deterministic.
+
+    use std::cell::Cell;
+    use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+
+    const WRITER: usize = 0;
+    const READER: usize = 1;
+
+    /// A shared word of the model.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Var
+    {
+        /// The writer's index: bytes published.
+        Tail,
+        /// The reader's waiter word.
+        ReaderWaiting,
+    }
+
+    /// One step a model thread asks to take.
+    #[derive(Clone, Copy, Debug)]
+    enum Op
+    {
+        Store(Var, u32),
+        Load(Var),
+        Swap(Var, u32),
+        Fence,
+        Send,
+        Wait,
+    }
+
+    /// A move of the explorer: grant a thread its step, or drain the oldest
+    /// store of a thread's buffer to memory.
+    #[derive(Clone, Copy)]
+    enum Move
+    {
+        Step(usize),
+        Drain(usize),
+    }
+
+    /// Whether the model's fence and swap drain the store buffer, as the
+    /// hardware's do, or (the control) leave it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fences
+    {
+        Order,
+        Ignore,
+    }
+
+    #[derive(Default)]
+    struct World
+    {
+        tail: u32,
+        reader_waiting: u32,
+        buffers: [Vec<(Var, u32)>; 2],
+        /// The data notification's pending bit.
+        pending: bool,
+        /// The step each thread waits to take, if it waits for one.
+        parked: [Option<Op>; 2],
+        done: [bool; 2],
+        grant: Option<usize>,
+        /// Set when the explorer ends a run with a thread still parked; its
+        /// steps then return at once and the thread runs to its end.
+        aborted: bool,
+        announces: u32,
+        sends: u32,
+    }
+
+    impl World
+    {
+        fn memory(&mut self, var: Var) -> &mut u32
+        {
+            match var
+            {
+                Var::Tail => &mut self.tail,
+                Var::ReaderWaiting => &mut self.reader_waiting,
+            }
+        }
+
+        fn load(&mut self, me: usize, var: Var) -> u32
+        {
+            let buffered = self.buffers[me].iter().rev().find(|(v, _)| *v == var);
+            match buffered
+            {
+                Some(&(_, value)) => value,
+                None => *self.memory(var),
+            }
+        }
+
+        fn drain_one(&mut self, me: usize)
+        {
+            let (var, value) = self.buffers[me].remove(0);
+            *self.memory(var) = value;
+        }
+
+        fn enabled(&self, me: usize, op: Op, fences: Fences) -> bool
+        {
+            let drained = self.buffers[me].is_empty() || fences == Fences::Ignore;
+            match op
+            {
+                Op::Fence | Op::Swap(..) | Op::Send => drained,
+                Op::Wait => drained && self.pending,
+                Op::Store(..) | Op::Load(_) => true,
+            }
+        }
+
+        fn apply(&mut self, me: usize, op: Op) -> u32
+        {
+            match op
+            {
+                Op::Store(var, value) => self.buffers[me].push((var, value)),
+                Op::Load(var) => return self.load(me, var),
+                Op::Swap(var, value) =>
+                {
+                    let old = self.load(me, var);
+                    *self.memory(var) = value;
+                    return old;
+                }
+                Op::Fence =>
+                {}
+                Op::Send =>
+                {
+                    self.sends += 1;
+                    self.pending = true;
+                }
+                Op::Wait => self.pending = false,
+            }
+            0
+        }
+
+        /// The explorer's moves. A step no other thread can observe, a store
+        /// into the buffer or a fence free to pass, is taken at once, since it
+        /// commutes with every move of the other thread. A drain is offered
+        /// only where it can be seen: when the other thread waits to read a
+        /// word the buffer holds a store to, or when the buffer's own thread
+        /// waits for it to drain. A drain put off to such a point changes
+        /// nothing any thread reads. So every schedule left out is equivalent
+        /// to one kept.
+        fn moves(&self, fences: Fences) -> Vec<Move>
+        {
+            for me in [WRITER, READER]
+            {
+                if let Some(op @ (Op::Store(..) | Op::Fence)) = self.parked[me]
+                    && self.enabled(me, op, fences)
+                {
+                    return vec![Move::Step(me)];
+                }
+            }
+            let mut moves = Vec::new();
+            for me in [WRITER, READER]
+            {
+                let parked = self.parked[me];
+                if let Some(op) = parked
+                    && self.enabled(me, op, fences)
+                {
+                    moves.push(Move::Step(me));
+                }
+                let other = 1 - me;
+                let observed = match self.parked[other]
+                {
+                    Some(Op::Load(var) | Op::Swap(var, _)) =>
+                    {
+                        self.buffers[me].iter().any(|&(v, _)| v == var)
+                    }
+                    _ => false,
+                };
+                let needed = matches!(parked, Some(Op::Fence | Op::Swap(..) | Op::Send | Op::Wait));
+                if !self.buffers[me].is_empty() && (observed || needed)
+                {
+                    moves.push(Move::Drain(me));
+                }
+            }
+            moves
+        }
+
+        fn settled(&self) -> bool
+        {
+            self.grant.is_none() && (0..2).all(|t| self.done[t] || self.parked[t].is_some())
+        }
+    }
+
+    struct Model
+    {
+        world: Mutex<World>,
+        changed: Condvar,
+    }
+
+    impl Model
+    {
+        fn lock(&self) -> MutexGuard<'_, World>
+        {
+            self.world.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn wait<'a>(&self, guard: MutexGuard<'a, World>) -> MutexGuard<'a, World>
+        {
+            self.changed
+                .wait(guard)
+                .unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Take one step as thread `me`, once the explorer grants it.
+        fn step(&self, me: usize, op: Op) -> u32
+        {
+            let mut world = self.lock();
+            world.parked[me] = Some(op);
+            self.changed.notify_all();
+            while world.grant != Some(me) && !world.aborted
+            {
+                world = self.wait(world);
+            }
+            world.parked[me] = None;
+            if world.aborted
+            {
+                return 0;
+            }
+            world.grant = None;
+            let value = world.apply(me, op);
+            drop(world);
+            self.changed.notify_all();
+            value
+        }
+
+        fn finish(&self, me: usize)
+        {
+            self.lock().done[me] = true;
+            self.changed.notify_all();
+        }
+
+        fn aborted(&self) -> bool
+        {
+            self.lock().aborted
+        }
+    }
+
+    /// The writer's end over the model: only the progressing side's operations
+    /// are reached, since a writer that never fills the ring never waits.
+    struct ModelWriter<'a>(&'a Model);
+
+    impl DoorbellEnd for ModelWriter<'_>
+    {
+        fn announce(&self)
+        {
+            unreachable!("the model's writer never waits");
+        }
+
+        fn withdraw(&self)
+        {
+            unreachable!("the model's writer never waits");
+        }
+
+        fn fence(&self)
+        {
+            self.0.step(WRITER, Op::Fence);
+        }
+
+        fn peer_progressed(&self) -> bool
+        {
+            unreachable!("the model's writer never waits");
+        }
+
+        fn peer_waiting(&self) -> bool
+        {
+            self.0.step(WRITER, Op::Load(Var::ReaderWaiting)) != 0
+        }
+
+        fn take_peer_word(&self) -> bool
+        {
+            self.0.step(WRITER, Op::Swap(Var::ReaderWaiting, 0)) != 0
+        }
+    }
+
+    /// The reader's end over the model; `consumed` is its private head.
+    struct ModelReader<'a>
+    {
+        model: &'a Model,
+        consumed: Cell<u32>,
+    }
+
+    impl DoorbellEnd for ModelReader<'_>
+    {
+        fn announce(&self)
+        {
+            self.model.lock().announces += 1;
+            self.model.step(READER, Op::Store(Var::ReaderWaiting, 1));
+        }
+
+        fn withdraw(&self)
+        {
+            self.model.step(READER, Op::Store(Var::ReaderWaiting, 0));
+        }
+
+        fn fence(&self)
+        {
+            self.model.step(READER, Op::Fence);
+        }
+
+        fn peer_progressed(&self) -> bool
+        {
+            self.model.step(READER, Op::Load(Var::Tail)) != self.consumed.get()
+        }
+
+        fn peer_waiting(&self) -> bool
+        {
+            unreachable!("the model's writer never waits");
+        }
+
+        fn take_peer_word(&self) -> bool
+        {
+            unreachable!("the model's writer never waits");
+        }
+    }
+
+    /// The pipe's write loop over the model: publish each of `items` bytes,
+    /// ringing the reader when `take_waiting_peer` says it waits.
+    fn model_writer(model: &Model, items: u32)
+    {
+        let end = ModelWriter(model);
+        for published in 1..=items
+        {
+            model.step(WRITER, Op::Store(Var::Tail, published));
+            if take_waiting_peer(&end)
+            {
+                model.step(WRITER, Op::Send);
+            }
+        }
+        model.finish(WRITER);
+    }
+
+    /// The pipe's read loop over the model: take what the ring holds, and when
+    /// it is empty wait through `announce_wait` until `items` bytes are read.
+    fn model_reader(model: &Model, items: u32)
+    {
+        let end = ModelReader {
+            model,
+            consumed: Cell::new(0),
+        };
+        while end.consumed.get() < items && !model.aborted()
+        {
+            let tail = model.step(READER, Op::Load(Var::Tail));
+            if tail != end.consumed.get()
+            {
+                end.consumed.set(tail);
+                continue;
+            }
+            if announce_wait(&end)
+            {
+                model.step(READER, Op::Wait);
+                end.withdraw();
+            }
+        }
+        model.finish(READER);
+    }
+
+    /// How one schedule ended.
+    struct Outcome
+    {
+        /// Both threads ran to their end.
+        completed: bool,
+        announces: u32,
+        sends: u32,
+    }
+
+    /// Run one schedule: at each decision take `prefix[d]` (0 past its end),
+    /// and record each decision's choice and the number of moves it had.
+    fn run_schedule(prefix: &[usize], items: u32, fences: Fences)
+    -> (Outcome, Vec<(usize, usize)>)
+    {
+        let model = Model {
+            world: Mutex::new(World::default()),
+            changed: Condvar::new(),
+        };
+        let mut taken = Vec::new();
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| model_writer(&model, items));
+            scope.spawn(|| model_reader(&model, items));
+            let mut world = model.lock();
+            loop
+            {
+                while !world.settled()
+                {
+                    world = model.wait(world);
+                }
+                let moves = world.moves(fences);
+                if moves.is_empty()
+                {
+                    break;
+                }
+                let choice = prefix.get(taken.len()).copied().unwrap_or(0);
+                taken.push((choice, moves.len()));
+                match moves[choice]
+                {
+                    Move::Step(thread) => world.grant = Some(thread),
+                    Move::Drain(thread) => world.drain_one(thread),
+                }
+                model.changed.notify_all();
+            }
+            let outcome = Outcome {
+                completed: world.done.iter().all(|&d| d),
+                announces: world.announces,
+                sends: world.sends,
+            };
+            world.aborted = true;
+            drop(world);
+            model.changed.notify_all();
+            outcome
+        });
+        (outcome, taken)
+    }
+
+    /// Run every schedule of a writer publishing `items` bytes one by one and
+    /// a reader taking them, and return the outcomes.
+    fn explore(items: u32, fences: Fences) -> Vec<Outcome>
+    {
+        let mut outcomes = Vec::new();
+        let mut prefix = Vec::new();
+        loop
+        {
+            let (outcome, taken) = run_schedule(&prefix, items, fences);
+            outcomes.push(outcome);
+            // The next schedule: the last decision with a move left untried
+            // takes its next move; the decisions before it are replayed.
+            let Some(depth) = taken
+                .iter()
+                .rposition(|&(choice, count)| choice + 1 < count)
+            else
+            {
+                return outcomes;
+            };
+            prefix = taken[..depth].iter().map(|&(choice, _)| choice).collect();
+            prefix.push(taken[depth].0 + 1);
+        }
+    }
+
+    // Defect guarded: a lost wake, the reader blocked on an empty-looking ring
+    // while the writer, not seeing its waiter word, rang nothing (a fence
+    // missing or out of place in `announce_wait` or `take_waiting_peer`), and
+    // a doorbell rung more often than the reader announced a wait (a waiter
+    // word the writer reads without claiming it).
+    #[test]
+    fn doorbell_protocol_loses_no_wake_in_any_interleaving()
+    {
+        let outcomes = explore(2, Fences::Order);
+        assert!(
+            outcomes.len() > 1000,
+            "explored {} schedules",
+            outcomes.len()
+        );
+        for outcome in &outcomes
+        {
+            assert!(
+                outcome.completed,
+                "a schedule ended with the reader blocked"
+            );
+            assert!(
+                outcome.sends <= outcome.announces,
+                "{} doorbells for {} announced waits",
+                outcome.sends,
+                outcome.announces
+            );
+        }
+    }
+
+    // Defect guarded: a model too weak to see the store-load race, which would
+    // pass the test above whatever the protocol's fences. Without them the
+    // explorer must find the schedule that loses the wake.
+    #[test]
+    fn doorbell_model_finds_the_lost_wake_without_the_fences()
+    {
+        let outcomes = explore(1, Fences::Ignore);
+        assert!(outcomes.iter().any(|outcome| !outcome.completed));
     }
 
     #[test]

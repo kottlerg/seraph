@@ -686,14 +686,18 @@ A pipe, behind `Stdio::piped()`, a child's piped standard streams, or a session 
 both ends map, holding the single-producer, single-consumer byte ring of
 [shared/shmem](../../shared/shmem/README.md), and two notifications: the data notification, which
 a reader that finds the ring empty waits on and the writer rings, and the space notification, which
-a writer that finds the ring full waits on and the reader rings. A write that moves bytes rings the
-data notification, and a read that moves bytes rings the space notification. A close sets the
+a writer that finds the ring full waits on and the reader rings. An end announces its wait in the
+ring header's waiter word before it blocks, and a write or a read that moves bytes rings the peer's
+notification only when the peer announced a wait
+([shared/shmem/README.md](../../shared/shmem/README.md) § Doorbell protocol), so a stream that
+never empties or fills the ring makes no notification syscall. A close sets the
 ring's `closed` flag and rings the peer, and the spawner's death bridge marks the peer dead and
 rings both notifications, so a reader drains the ring to EOF and a writer fails with `BrokenPipe`.
 
 `std::os::seraph::pipe::notification_sends` counts the notifications the calling thread's pipe
 ends have sent, and `std::os::seraph::pipe::waits` the times they found their ring empty or full
-and made ready to wait; the pipestress tester's doorbell trial reports both
+and announced a wait, whether or not they then blocked; the pipestress tester's doorbell trial
+reports both
 ([programs/pipestress/README.md](../../programs/pipestress/README.md) § Tester).
 
 ---

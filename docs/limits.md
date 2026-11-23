@@ -533,7 +533,7 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | log record `RECORD_MAX_BYTES` | `shared/ipc/src/log_record.rs` | 480 | ABI width (one `STREAM_RECORD` payload, and one handover `RECORD` chunk after its 4 header words, const-asserted; the sender cuts a longer record's message, then its values, and drops the fields with no room) | 480 B stack per record sent | correct as is | None |
 | log record `KEY_MAX_LEN` | `shared/ipc/src/log_record.rs` | 32 | wire format (a field key of `[a-z0-9_]`, one length byte; `seraph::log!` checks each key at compile time) | none | correct as is | None |
 | `SharedBuffer.page_count` | `shared/shmem/src/lib.rs` | `u64` | ABI width (`mem_map` page count) | 8 B | correct as is | None |
-| `SpscHeader.head`, `tail` | `shared/shmem/src/lib.rs` | `u32`, free-running | provably unreachable (modular index, correct across wrap for capacity up to 2^31) | 16 B per ring | correct as is | None |
+| `SpscHeader.head`, `tail` | `shared/shmem/src/lib.rs` | `u32`, free-running | provably unreachable (modular index, correct across wrap for capacity up to 2^31) | 24 B per ring (the whole header) | correct as is | None |
 | `SpscHeader.capacity` | `shared/shmem/src/lib.rs` | `u32` power of two | ABI width (shared header layout) | none | correct as is | None |
 | `MAX_NAME_LEN` (`EntryName`) | `shared/namespace-protocol/src/name.rs` | 255 | ABI width (`u8` length; the POSIX `NAME_MAX` convention) | 255 B per name | correct as is | None |
 | `MIN_NAME_LEN` | `shared/namespace-protocol/src/name.rs` | 1 | encoding artefact (an empty name is meaningless) | none | correct as is | None |

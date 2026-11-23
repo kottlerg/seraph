@@ -10,10 +10,15 @@
 //! Each pipe is one 4 KiB shmem page holding a `shmem::SpscHeader` plus
 //! a power-of-two byte ring, plus two notification caps:
 //!
-//!   * data_notification  — writer kicks reader after producing bytes; reader
-//!                    waits on this when the ring is empty.
-//!   * space_notification — reader kicks writer after consuming bytes; writer
-//!                    waits on this when the ring is full.
+//!   * data_notification  — reader waits on this when the ring is empty;
+//!                    the writer rings it after producing bytes.
+//!   * space_notification — writer waits on this when the ring is full; the
+//!                    reader rings it after consuming bytes.
+//!
+//! An end rings its peer's notification only when the peer announced a wait
+//! in the ring header's waiter word, and announces its own before it blocks
+//! (`shared/shmem/README.md` § Doorbell protocol), so a stream of reads and
+//! writes that never empties or fills the ring makes no syscall.
 //!
 //! Each `Pipe` instance represents one end (Reader or Writer). Both ends
 //! hold caps to all three objects (the same memory cap and both notifications
@@ -44,8 +49,8 @@ use crate::sys::reserve::{ReservedRange, reserve_pages, unreserve_pages};
 use shmem::{SpscHeader, SpscReader, SpscWriter};
 use syscall_abi::SyscallError;
 
-/// Ring data byte capacity. One 4 KiB page = 16-byte header + 4080 bytes
-/// data area; largest power of two ≤ 4080 is 2048.
+/// Ring data byte capacity. One 4 KiB page = 24-byte header + 4072 bytes
+/// data area; largest power of two ≤ 4072 is 2048.
 pub const RING_CAPACITY: u32 = 2048;
 
 /// The error a ring half reports when the shared header's capacity is not
@@ -59,7 +64,7 @@ const BAD_RING: io::Error =
 // restore: none
 static NOTIFICATION_SENDS: Cell<u64> = Cell::new(0);
 
-// The waits the calling thread's pipe ends have made ready for ([`waits`]).
+// The waits the calling thread's pipe ends have announced ([`waits`]).
 #[thread_local]
 // restore: none
 static WAITS: Cell<u64> = Cell::new(0);
@@ -72,7 +77,7 @@ pub(crate) fn notification_sends() -> u64 {
 }
 
 /// The times the calling thread's pipe ends found their ring empty (a reader)
-/// or full (a writer) and made ready to block for the peer
+/// or full (a writer) and announced a wait for the peer to ring
 /// (`std::os::seraph::pipe::waits`).
 pub(crate) fn waits() -> u64 {
     WAITS.get()
@@ -84,7 +89,7 @@ fn ring_doorbell(cap: u64) {
     let _ = syscall::notification_send(cap, 1);
 }
 
-/// Count one wait a pipe end made ready for.
+/// Count one wait a pipe end announces.
 fn count_wait() {
     WAITS.set(WAITS.get().wrapping_add(1));
 }
@@ -631,8 +636,10 @@ impl Pipe {
             let mut reader = self.reader()?;
             let n = reader.read(buf);
             if n > 0 {
-                // Wake any blocked writer that's waiting for space.
-                ring_doorbell(self.space_notification);
+                // Ring the writer only when it announced a wait for space.
+                if reader.take_waiting_writer() {
+                    ring_doorbell(self.space_notification);
+                }
                 return Ok(n);
             }
             if eof {
@@ -643,13 +650,20 @@ impl Pipe {
                 // rather than spin (silent-drop init path).
                 return Ok(0);
             }
-            // Block until writer kicks the data notification, peer closes, or
+            // Block until the writer rings the data notification, peer closes, or
             // the death bridge fires. `Interrupted` (this thread was stopped
             // and restarted, or interrupted by an upcall) re-checks the ring.
             // Any other wait error means the notification cap itself is gone
             // (teardown raced us); surface EOF rather than spin on a dead cap.
+            // The wait is announced first, and bytes stored before the writer
+            // could see the announcement are read instead of waited for.
             count_wait();
-            match syscall::notification_wait(self.data_notification) {
+            if !reader.prepare_wait() {
+                continue;
+            }
+            let waited = syscall::notification_wait(self.data_notification);
+            reader.end_wait();
+            match waited {
                 Ok(_) => {}
                 Err(e) if e == SyscallError::Interrupted as i64 => {}
                 Err(_) => return Ok(0),
@@ -721,21 +735,30 @@ impl Pipe {
             let mut writer = self.writer()?;
             let n = writer.write(buf);
             if n > 0 {
-                // Wake any blocked reader.
-                ring_doorbell(self.data_notification);
+                // Ring the reader only when it announced a wait for bytes.
+                if writer.take_waiting_reader() {
+                    ring_doorbell(self.data_notification);
+                }
                 return Ok(n);
             }
             if self.space_notification == 0 {
                 // No wakeup notification — drop bytes silently to avoid spin.
                 return Ok(buf.len());
             }
-            // Block until reader kicks the space notification, peer closes, or
+            // Block until the reader rings the space notification, peer closes, or
             // the death bridge fires. `Interrupted` (this thread was stopped
             // and restarted, or interrupted by an upcall) re-checks the ring.
             // Any other wait error means the notification cap itself is gone;
             // report the pipe as broken rather than spin on a dead cap.
+            // The wait is announced first, and space the reader freed before
+            // it could see the announcement is written instead of waited for.
             count_wait();
-            match syscall::notification_wait(self.space_notification) {
+            if !writer.prepare_wait() {
+                continue;
+            }
+            let waited = syscall::notification_wait(self.space_notification);
+            writer.end_wait();
+            match waited {
                 Ok(_) => {}
                 Err(e) if e == SyscallError::Interrupted as i64 => {}
                 Err(_) => {

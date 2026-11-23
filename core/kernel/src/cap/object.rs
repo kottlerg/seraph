@@ -3098,7 +3098,8 @@ pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObject
 }
 
 /// Drain this CPU's deferred reclaim stack ([`reclaim_deferred_stack`]), then
-/// post every sole-reference observer the table has fired
+/// post the sole-reference observers the table has fired, at most
+/// [`crate::cap::sole_reference::POST_BUDGET`] of them
 /// ([`crate::cap::sole_reference::drain`]), so that a release the reclaim
 /// makes posts in the same pass.
 ///
@@ -3114,7 +3115,7 @@ pub unsafe fn drain_deferred_reclaim(cpu: usize)
     unsafe { reclaim_deferred_stack(cpu) };
     // SAFETY: syscall-epilogue context with interrupts disabled, or the idle
     // thread, holding no lock: the context release_ref allows.
-    unsafe { crate::cap::sole_reference::drain(cpu) };
+    unsafe { crate::cap::sole_reference::drain() };
 }
 
 /// Drain this CPU's deferred reclaim stack, completing the free of each

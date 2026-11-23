@@ -912,8 +912,8 @@ The mechanism is `cap/sole_reference.rs`.
   by its binder's queue, and the drain that takes them runs in whatever thread's syscall return or
   idle-loop iteration comes next, on any CPU. The budget bounds what one pass does for observers
   its thread did not bind. Nodes left on the fired list keep the summary's fired bit set, so the
-  next drain on any CPU continues, and the drain sets its own CPU's reschedule-pending flag, which
-  only the idle loop consumes: an idle CPU drains again before it halts. The drain that claims a
+  next drain on any CPU continues, and an idle CPU whose run queues are empty drains again, a pass
+  at a time, before its halt decision (`sole_reference::work_pending`). The drain that claims a
   post may run on a CPU other than the one whose release made it, so a post can reach its queue
   just after the call that made the release returns.
 - **What a post means.** Every arrival at `REF_OBSERVED | 1` is a decrement from

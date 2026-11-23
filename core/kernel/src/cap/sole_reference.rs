@@ -265,19 +265,26 @@ impl SoleReferenceTable
         unsafe { self.lock.unlock_raw(saved) };
     }
 
+    /// Whether a drain has work: a bucket marked pending, or fired nodes a
+    /// pass left.
+    pub fn work_pending(&self) -> bool
+    {
+        self.summary.load(Ordering::Acquire) != 0
+    }
+
     /// Claim every object of a pending bucket that holds one reference, and
     /// take at most `budget` nodes off the fired list: the nodes to post,
-    /// linked through `group` (null when nothing fired), and whether fired
-    /// nodes remain. The caller owns every node it takes. Nodes that remain
+    /// linked through `group` (null when nothing fired). The caller owns
+    /// every node it takes. Nodes that remain
     /// stay on the fired list, with [`SUMMARY_FIRED`] set, for the next drain
     /// on any CPU.
     ///
     /// Reads one word when nothing is pending.
-    pub fn collect(&self, budget: usize) -> (*mut ObserverNode, bool)
+    pub fn collect(&self, budget: usize) -> *mut ObserverNode
     {
         if self.summary.load(Ordering::Acquire) == 0
         {
-            return (null_mut(), false);
+            return null_mut();
         }
         let summary = self.summary.swap(0, Ordering::AcqRel);
         // SAFETY: paired with the unlock_raw below.
@@ -330,14 +337,13 @@ impl SoleReferenceTable
             }
             count = count.wrapping_add(1);
         }
-        let more = !chains.fired.is_null();
-        if more
+        if !chains.fired.is_null()
         {
             self.summary.fetch_or(SUMMARY_FIRED, Ordering::Release);
         }
         // SAFETY: paired with the lock_raw above.
         unsafe { self.lock.unlock_raw(saved) };
-        (taken, more)
+        taken
     }
 }
 
@@ -416,22 +422,21 @@ fn claim_bucket(chains: &mut Chains, bucket: usize)
 /// has fired: each node back to its pool, then `(0, correlator)` to its
 /// queue, then the queue's reference the binding held released.
 ///
-/// Called by `drain_deferred_reclaim` after its reclaim: on the syscall
-/// epilogue and in the idle loop, with no lock held. Reads one word when
-/// nothing is pending. When fired nodes remain, it sets `cpu`'s
-/// reschedule-pending flag, which only the idle loop consumes: an idle CPU
-/// then drains again before it halts, so the rest are posted without waiting
-/// for another CPU's syscall.
+/// Called by `drain_deferred_reclaim` after its reclaim, on the syscall
+/// epilogue and in the idle loop, and by the idle loop again while
+/// [`work_pending`] holds and its run queues are empty, with no lock held.
+/// Reads one word when nothing is pending. The fired nodes a pass leaves stay
+/// marked for the next drain on any CPU.
 ///
 /// # Safety
 /// No lock is held, and the context is one [`release_ref`] allows: syscall
-/// context with interrupts disabled, or the idle thread. `cpu` is this CPU.
+/// context with interrupts disabled, or the idle thread.
 ///
 /// [`release_ref`]: crate::cap::object::release_ref
 #[cfg(not(test))]
-pub unsafe fn drain(cpu: usize)
+pub unsafe fn drain()
 {
-    let (mut node, more) = TABLE.collect(POST_BUDGET);
+    let mut node = TABLE.collect(POST_BUDGET);
     while !node.is_null()
     {
         #[expect(
@@ -470,10 +475,13 @@ pub unsafe fn drain(cpu: usize)
         }
         node = next;
     }
-    if more
-    {
-        crate::sched::set_reschedule_pending_for(cpu);
-    }
+}
+
+/// Whether a drain has work: a bucket marked pending, or fired nodes a pass
+/// left. One load; the idle loop reads it to keep draining before it halts.
+pub fn work_pending() -> bool
+{
+    TABLE.work_pending()
 }
 
 #[cfg(test)]
@@ -522,11 +530,11 @@ mod tests
     }
 
     /// The correlators of the nodes one collect of `budget` takes, sorted,
-    /// and whether fired nodes remain.
+    /// and whether the table still has work for a drain.
     fn pass(table: &SoleReferenceTable, budget: usize) -> (Vec<u64>, bool)
     {
         let mut out = Vec::new();
-        let (mut node, more) = table.collect(budget);
+        let mut node = table.collect(budget);
         while !node.is_null()
         {
             #[expect(
@@ -541,7 +549,7 @@ mod tests
             }
         }
         out.sort_unstable();
-        (out, more)
+        (out, table.work_pending())
     }
 
     /// The correlators the drain would post now, over as many passes as it

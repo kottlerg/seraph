@@ -303,8 +303,9 @@ bounds of `stop_source_delete`; the held-round stopper-entry bound of `stop_repl
 bound of `mutual_stop`, starter-entry bound of `stop_owed_wake`, checked-round and held-round
 delivery bound of `stop_repark`,
 write bound of `msg_inject_delete_race` and waiter-entry bound of `timed_wait_source_delete`;
-the preemption budget of `integration::priority_preemption`; the median bound and
-acknowledgement wait of `integration::rt_wake_preempt`; the
+the preemption budget of `integration::priority_preemption`; the acknowledgement wait of
+`integration::rt_wake_preempt`, whose median bound applies as written at every width, since the
+slice wait it tells a wake apart from does not grow with the width; the
 progress budget of `integration::fair_share_progress`; the pull budget and the exit polls of
 `integration::idle_pull_starved_ready`; the park and report polls of
 `integration::busy_cpu_placement`; the expiry and report bounds of

@@ -25,10 +25,9 @@
 //! the spinner runs, reads `ElapsedUs` and signals the waiter, which reads it
 //! again as it runs and acknowledges. The wake-to-run latencies are logged as
 //! their median, 99th percentile and worst. The median must stay within
-//! [`MEDIAN_BOUND_US`], stretched past 16 CPUs by the width's
-//! oversubscription factor ([`crate::scaled_bound`]): the wake preempts the
-//! spinner through its IPI, where a wake left to the spinner's slice expiry
-//! waits half an RT slice at the median.
+//! [`MEDIAN_BOUND_US`] at every width: the wake preempts the spinner through
+//! its IPI, where a wake left to the spinner's slice expiry waits half an RT
+//! slice at the median, whatever the width.
 //!
 //! Needs 2 CPUs and the `SchedControl` cap (skips otherwise).
 
@@ -59,10 +58,13 @@ const WAKER_CPU: u32 = 0;
 /// Wake-to-run samples the cross-CPU case takes.
 const SAMPLES: usize = 200;
 
-/// Bound on the median wake-to-run latency (µs), applied through
-/// [`crate::scaled_bound`]: two 1 ms ticks, below the 5 ms median a wait for
-/// the spinner's 10 ms slice gives, with room for an emulated CPU's IPI
-/// delivery.
+/// Bound on the median wake-to-run latency (µs): two 1 ms ticks, below the
+/// 5 ms median a wait for the spinner's 10 ms slice gives, with room for an
+/// emulated CPU's IPI delivery. It applies as written past
+/// [`crate::UNSCALED_CPUS`]: the slice wait it tells the wake apart from does
+/// not grow with the width, so a bound stretched by [`crate::scaled_bound`]
+/// would pass that wait at 128 CPUs, where an emulated boot's median still
+/// stays under a quarter of it.
 const MEDIAN_BOUND_US: u64 = 2_000;
 
 /// Wait for one acknowledgement in the cross-CPU case (ms), applied through
@@ -440,7 +442,7 @@ fn check_latencies() -> TestResult
         at(SAMPLES * 99 / 100),
     );
     crate::log_u64("rt_wake_preempt: wake-to-run worst_us=", at(SAMPLES - 1));
-    if median > crate::scaled_bound(MEDIAN_BOUND_US)
+    if median > MEDIAN_BOUND_US
     {
         return Err("rt_wake_preempt: the median wake-to-run latency exceeds its bound");
     }

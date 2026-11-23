@@ -485,7 +485,7 @@ pub(crate) const INIT_ASPACE_PAGES: u64 = 18;
 /// count: the [`init_protocol::INIT_INFO_MAX_PAGES`] (64) pages of the
 /// protocol's ceiling past the header and a name table of
 /// [`init_protocol::INIT_MAX_NAMED_MODULES`] (85) entries, one
-/// [`CapDescriptor`] slot each, 7,484. Phase 7 sizes each boot's block from
+/// [`CapDescriptor`] slot each, 7,482. Phase 7 sizes each boot's block from
 /// its own counts ([`init_info_descriptor_bound`]), so this binds only a boot
 /// whose counts pass it, which halts by name at the reservation; no platform
 /// comes near it (see the ceiling's rustdoc).
@@ -606,6 +606,11 @@ static INIT_INFO_BLOCK_PAGES: core::sync::atomic::AtomicUsize =
 // as a `BootInfo` can list modules.
 const _: () = assert!(init_protocol::INIT_MODULE_NAME_LEN == boot_protocol::BOOT_MODULE_NAME_LEN);
 const _: () = assert!(init_protocol::INIT_MAX_NAMED_MODULES == boot_protocol::MAX_BOOT_MODULES);
+
+// Phase 9 copies `BootInfo.boot_device` into `InitInfo.boot_device` field for
+// field, so the two records' flag bits are one ABI fact.
+const _: () = assert!(init_protocol::INIT_BOOT_DEVICE_ESP == boot_protocol::BOOT_DEVICE_ESP);
+const _: () = assert!(init_protocol::INIT_BOOT_DEVICE_PCI == boot_protocol::BOOT_DEVICE_PCI);
 
 // The name table starts right after the header and the descriptor array right
 // after the table, each at an offset its element alignment divides.
@@ -3757,7 +3762,7 @@ mod tests
                 assert!(pages <= init_protocol::INIT_INFO_MAX_PAGES);
             }
         }
-        assert_eq!(INIT_INFO_DESCRIPTOR_CAPACITY, 7484);
+        assert_eq!(INIT_INFO_DESCRIPTOR_CAPACITY, 7482);
         assert_eq!(
             init_info_pages(
                 INIT_INFO_DESCRIPTOR_CAPACITY,

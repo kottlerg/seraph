@@ -111,8 +111,9 @@ boot-protocol/
 ├── fuzz/boot-protocol/  # the fuzz target's checked-in inputs (docs/testing.md § Fuzzing)
 └── src/
     ├── lib.rs           # BootInfo and its types, BOOT_PROTOCOL_VERSION, MAX_CPUS, the
-    │                    #   KernelMmio and HART_CAP_* facts, KASLR_* flags; the framebuffer
-    │                    #   record's proof harnesses (docs/testing.md § Bounded verification)
+    │                    #   KernelMmio and HART_CAP_* facts, KASLR_* flags, BootDevice; the
+    │                    #   framebuffer record's proof harnesses (docs/testing.md § Bounded
+    │                    #   verification)
     ├── bundle.rs        # bootstrap.bundle wire format (header, entries, INIT_ENTRY_NAME) and
     │                    #   its parser's proof harnesses
     ├── property.rs      # the parsers' property, which the fuzz target `boot-protocol`, the

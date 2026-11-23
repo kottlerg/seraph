@@ -1194,6 +1194,30 @@ unsafe fn kernel_entry_post_rebase(
                 },
             };
 
+            // Check the bootloader's boot-device record and copy it for
+            // init, which hands it to vfsd. A record no compliant bootloader
+            // writes halts the boot: the kernel refuses a non-compliant
+            // BootInfo everywhere else, and here, unlike at Phase 0, the
+            // console can name the defect.
+            let boot_device_in = boot_info_for_fb.boot_device;
+            if let Err(defect) = boot_device_in.check()
+            {
+                kprintln!("Phase 9: BootInfo.boot_device: {}", defect.as_str());
+                fatal("Phase 9: malformed BootInfo.boot_device");
+            }
+            let init_boot_device = init_protocol::InitBootDevice {
+                flags: boot_device_in.flags,
+                esp_partition_number: boot_device_in.esp_partition_number,
+                esp_start_lba: boot_device_in.esp_start_lba,
+                esp_size_lba: boot_device_in.esp_size_lba,
+                esp_partition_guid: boot_device_in.esp_partition_guid,
+                pci_segment: boot_device_in.pci_segment,
+                pci_bus: boot_device_in.pci_bus,
+                pci_device: boot_device_in.pci_device,
+                pci_function: boot_device_in.pci_function,
+                reserved: boot_device_in.reserved,
+            };
+
             // The descriptors are already in the InitInfo region, written
             // there in Phases 7 and 8 right after the header and the
             // boot-module name table, within the capacity Phase 7 sized the
@@ -1283,6 +1307,7 @@ unsafe fn kernel_entry_post_rebase(
             info.acpi_region_memory_base = u64::from(cspace_layout.acpi_region_memory_base);
             info.acpi_region_memory_count = u64::from(cspace_layout.acpi_region_memory_count);
             info.dtb_memory_cap = u64::from(cspace_layout.dtb_memory_slot);
+            info.boot_device = init_boot_device;
             info.framebuffer = init_framebuffer;
             // Patched below: thread_cap and cspace_cap once those caps are
             // minted, init_stack_memory_* after the stack mint,
@@ -1828,7 +1853,7 @@ unsafe fn kernel_entry_post_rebase(
         }
 
         // Zero every bootloader reclaim range before init can run: the last
-        // kernel read of the BootInfo page (the framebuffer above) and of the
+        // kernel read of the BootInfo page (the framebuffer and the boot device above) and of the
         // reclaim array is behind this point, and the caps Phase 7 and 8 minted
         // over the ranges reach userspace once init is enqueued
         // (core/kernel/docs/initialization.md § Phase 9).

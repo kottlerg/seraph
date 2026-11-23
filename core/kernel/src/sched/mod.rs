@@ -3172,7 +3172,7 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     CPU_DIAG_PTR.store(diag_ptr, core::sync::atomic::Ordering::Release);
 
     // Per-CPU arch data (PerCpuData) and APIC-ID slabs.
-    crate::percpu::init_storage(n, allocator);
+    crate::percpu::init_storage(n, sched_ptr, allocator);
 
     // Arch-specific per-CPU tables (x86-64 per-AP GDT/TSS, AP IST stacks, and
     // NMI-backtrace storage; riscv64 each CPU's IMSIC identity row, which
@@ -5221,7 +5221,8 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// there (the move linked the thread on that CPU's run queue; the prod wakes it
 /// from idle to dispatch the thread), and `sys_thread_set_priority` as the
 /// prod of the CPU on which `relocate_ready_priority` re-linked a `Ready`
-/// thread.
+/// thread, or of the CPU running a `Running` one whose level it marked stale,
+/// whose return to user mode then re-records the level and decides.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI
@@ -8339,16 +8340,45 @@ pub unsafe fn timer_tick()
 /// (core/kernel/docs/scheduler.md § Wake Preemption), through
 /// [`deliver_and_preempt`] where the return is an upcall delivery point.
 ///
-/// Does nothing during the BSP boot transient, as `timer_tick` does, while
+/// The test every return makes is [`run_queue::PerCpuScheduler::outranked`]
+/// on this CPU's scheduler, reached through `PerCpuData::scheduler`
+/// ([`crate::percpu::current_scheduler`]): two loads and a branch past the
+/// per-CPU pointer's. Only a hit takes the rest of the decision, which does
+/// nothing during the BSP boot transient, as `timer_tick` does, while
 /// preemption is disabled, or for the idle thread, whose loop takes queued
-/// work itself.
+/// work itself, and which re-records a level a priority change marked stale
+/// (`PerCpuScheduler::mark_level_stale`) from the running thread's
+/// `priority` under its `sched_lock` before it decides again
+/// (core/kernel/docs/scheduler.md § Wake Preemption).
 ///
 /// # Safety
 /// The end of a syscall, or of an interrupt or exception taken from user mode,
 /// on the running thread's kernel stack with interrupts disabled and no lock
 /// held, the thread's frame holding what it returns to user mode with.
 #[cfg(not(test))]
+#[inline]
 pub unsafe fn preempt_if_outranked() -> bool
+{
+    // SAFETY: a return to user mode runs on a CPU whose per-CPU pointer is
+    // installed, and percpu::init_storage, before it, named its scheduler.
+    let sched = unsafe { crate::percpu::current_scheduler() };
+    if !sched.outranked()
+    {
+        return false;
+    }
+    // SAFETY: the caller's contract is preempt_outranked's.
+    unsafe { preempt_outranked(sched) }
+}
+
+/// The rest of [`preempt_if_outranked`]'s decision, after its test hit: kept
+/// out of line, so each return to user mode inlines only the test.
+///
+/// # Safety
+/// As for [`preempt_if_outranked`]; `sched` is this CPU's scheduler.
+#[cfg(not(test))]
+#[cold]
+#[inline(never)]
+unsafe fn preempt_outranked(sched: &PerCpuScheduler) -> bool
 {
     // See core/kernel/docs/scheduling-internals.md § BSP Boot Transient.
     if BOOT_TRANSIENT_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
@@ -8356,13 +8386,28 @@ pub unsafe fn preempt_if_outranked() -> bool
     {
         return false;
     }
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: cpu is this CPU's index, below CPU_COUNT, and the scheduler slab
-    // is initialised (the boot transient has ended).
-    let sched = unsafe { scheduler_for(cpu) };
-    if core::ptr::eq(sched.current(), sched.idle()) || !sched.outranked()
+    let current = sched.current();
+    if core::ptr::eq(current, sched.idle())
     {
         return false;
+    }
+    if sched.level_stale()
+    {
+        // The running thread's priority changed since its level was recorded:
+        // re-record it under the thread's sched_lock, which the change held,
+        // then decide again.
+        // SAFETY: current is this CPU's running thread, a valid TCB.
+        let lock = unsafe { &(*current).sched_lock };
+        // SAFETY: no lock is held (contract); paired with the unlock_raw below.
+        let saved = unsafe { lock.lock_raw() };
+        // SAFETY: priority is written under the sched_lock held here.
+        sched.set_current_level(unsafe { (*current).priority });
+        // SAFETY: saved is the word the lock_raw above returned.
+        unsafe { lock.unlock_raw(saved) };
+        if !sched.outranked()
+        {
+            return false;
+        }
     }
     // SAFETY: kernel context on the running thread's kernel stack with no lock
     // held (contract); schedule() switches away and returns when this thread

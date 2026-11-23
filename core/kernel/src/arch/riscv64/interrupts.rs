@@ -515,6 +515,12 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
               kernel exception to `user_exception` or `kernel_exception`) stays one function so \
               the trap-frame ownership and SIE discipline read in one place"
 )]
+#[expect(
+    clippy::inline_always,
+    reason = "trap_dispatch is the one caller; left out of line, every trap, each syscall \
+              included, pays a second frame and the callee-saved spills of this large body"
+)]
+#[inline(always)]
 fn handle_trap(frame: *mut TrapFrame)
 {
     #[expect(

@@ -403,9 +403,13 @@ as a lock-free snapshot that a later check re-decides or another edge (`context_
 dispatched at, is written and read only by its own CPU with interrupts masked: written at each
 dispatch (`schedule()`'s dispatch flip under the incoming thread's `sched_lock`, its same-thread
 re-mark under the running thread's, the idle level when it switches to idle, and `sched::enter`'s
-boot dispatch of init), and read by its `timer_tick` and, at its returns to user mode, by
-`outranked` ([scheduler.md](scheduler.md) § Wake Preemption), neither of which may read the
-running thread's `priority` without that thread's `sched_lock`. `saved_lock_flags` is the interrupt
+boot dispatch of init) and at the wake preemption's re-record of a stale level, under the running
+thread's `sched_lock`, and read by its `timer_tick`, which may not read the running thread's
+`priority` without that thread's `sched_lock`. `outranking`, the `non_empty` bits of the queues
+above `current_level`'s, is written with it by the same CPU, and by `sys_thread_set_priority` on
+any CPU, with every bit only, under the running thread's `sched_lock`; it is read only by its
+own CPU, by `outranked` at its returns to user mode ([scheduler.md](scheduler.md) § Wake
+Preemption). `saved_lock_flags` is the interrupt
 word an all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_flags`,
 `unlock_saved_flags`). `idle_pull_candidate`, the idle pull's confirmation sample, `idle_pull_held`,
 whether the previous idle tick held it for a busy SMT sibling, and `idle_pull_cursor`, where its
@@ -1162,7 +1166,7 @@ Consumer side at a return to user mode (`sched::preempt_if_outranked`,
 ```
 1. Interrupts are masked: the end of a syscall, or of an interrupt or exception
    taken from user mode.
-2. outranked = scheduler_ptr(cpu).outranked()  // non_empty, current_level: Relaxed
+2. outranked = percpu.scheduler.outranked()    // non_empty & outranking: Relaxed
 3. if outranked: schedule(Requeue::Preempted)   // decides again under the run-queue lock
 ```
 

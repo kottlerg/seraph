@@ -87,6 +87,27 @@ fn no_run_queue() -> !
     panic!("enqueue: priority names no run queue");
 }
 
+/// The `non_empty` bits of every run queue above the queue of `level`: those
+/// whose threads outrank a thread running at `level`. The highest set bit of
+/// `non_empty` is above `queue_index(level)` exactly when `non_empty` has a
+/// bit here, so [`PerCpuScheduler::outranked`] is an AND with no bit scan. The
+/// idle queue's bit is never set: it is below every queue.
+const fn queues_above(level: u8) -> u32
+{
+    // queue_index(level) < NUM_RUN_QUEUES <= 32, so the narrowing is lossless
+    // and the shift amount at most 32, which checked_shl maps to no bits.
+    match u32::MAX.checked_shl((queue_index(level) as u32).saturating_add(1))
+    {
+        Some(mask) => mask,
+        None => 0,
+    }
+}
+
+/// The `outranking` value of a stale level ([`PerCpuScheduler::mark_level_stale`]):
+/// every bit, which no [`queues_above`] value has, since none has the idle
+/// queue's.
+const LEVEL_STALE: u32 = u32::MAX;
+
 /// A level whose threads link on run queue `index`: the inverse of
 /// [`queue_index`], giving the lowest fair level for the fair queue.
 /// [`PerCpuScheduler::find_runnable`] reports it, so the caller's
@@ -413,15 +434,34 @@ pub struct PerCpuScheduler
     /// interrupts masked, where it dispatches a thread: `schedule()`'s dispatch
     /// flip under the incoming thread's `sched_lock`, its same-thread re-mark
     /// under the running thread's, `IDLE_PRIORITY` when it switches to idle, and
-    /// `sched::enter`'s boot dispatch of init. Read only by this CPU: by its
-    /// `timer_tick`, through [`tick_outcome`](Self::tick_outcome), and at its
-    /// returns to user mode, through [`outranked`](Self::outranked). It stands
+    /// `sched::enter`'s boot dispatch of init; and where a return to user mode
+    /// re-records a stale level (`sched::preempt_if_outranked`), under the
+    /// running thread's `sched_lock`. Read only by this CPU: by its
+    /// `timer_tick`, through [`tick_outcome`](Self::tick_outcome); its returns
+    /// to user mode compare its mask, `outranking`. It stands
     /// in for `(*current).priority`, which neither may read without the
     /// thread's `sched_lock`, so a priority change of a running thread reaches
     /// its slice (bounded by the new level's quantum from the first tick after
-    /// it) and its class at its next dispatch. Atomic only so a shared reference can
+    /// it) and its class at its next dispatch, or at the earlier re-record that
+    /// a stale `outranking` forces. Atomic only so a shared reference can
     /// reach it; Relaxed, since one CPU both writes and reads it.
     current_level: AtomicU8,
+
+    /// The `non_empty` bits of the run queues whose threads outrank the running
+    /// one: every queue above the queue of `current_level`
+    /// ([`queues_above`]), which [`set_current_level`](Self::set_current_level)
+    /// stores beside it, so [`outranked`](Self::outranked) is one AND of two
+    /// words a return to user mode reaches through its CPU's
+    /// `PerCpuData::scheduler`. Or [`LEVEL_STALE`], every bit, which
+    /// [`mark_level_stale`](Self::mark_level_stale) stores when the running
+    /// thread's priority changed: no level's mask has every bit (none has the
+    /// idle queue's), so the next return to user mode with a thread queued
+    /// sees it and re-records the level before it decides
+    /// (`sched::preempt_if_outranked`). Written by this CPU wherever it writes
+    /// `current_level`, and by `sys_thread_set_priority` on any CPU, under the
+    /// running thread's `sched_lock`, with `LEVEL_STALE` only; read by this CPU
+    /// alone, Relaxed, as `non_empty` is.
+    outranking: AtomicU32,
 
     /// Lock protecting the run queues.
     ///
@@ -514,6 +554,7 @@ impl PerCpuScheduler
             current: AtomicPtr::new(core::ptr::null_mut()),
             idle: AtomicPtr::new(core::ptr::null_mut()),
             current_level: AtomicU8::new(IDLE_PRIORITY),
+            outranking: AtomicU32::new(queues_above(IDLE_PRIORITY)),
             lock: crate::sync::Spinlock::new(),
             load: AtomicU32::new(0),
             idle_pull_candidate: AtomicUsize::new(NO_IDLE_PULL_CANDIDATE),
@@ -807,11 +848,32 @@ impl PerCpuScheduler
 
     /// Record `level` as the level of the thread this CPU is dispatching, for
     /// [`tick_outcome`](Self::tick_outcome) and [`outranked`](Self::outranked).
-    /// Called only by this CPU, with
-    /// interrupts masked, at a dispatch (see the `current_level` field).
+    /// Called only by this CPU, with interrupts masked, at a dispatch or at
+    /// the re-record a stale level forces (see the `current_level` field).
     pub fn set_current_level(&self, level: u8)
     {
         self.current_level.store(level, Ordering::Relaxed);
+        self.outranking
+            .store(queues_above(level), Ordering::Relaxed);
+    }
+
+    /// Mark the level recorded for the running thread stale: its priority
+    /// changed, so the next return to user mode on this CPU with a thread
+    /// queued takes the full decision, which re-records the level from the
+    /// thread's `priority` before it compares (`sched::preempt_if_outranked`).
+    /// Called by `sys_thread_set_priority` for a `Running` thread, holding
+    /// that thread's `sched_lock`, on the scheduler of the CPU running it.
+    pub fn mark_level_stale(&self)
+    {
+        self.outranking.store(LEVEL_STALE, Ordering::Relaxed);
+    }
+
+    /// Whether [`mark_level_stale`](Self::mark_level_stale) marked the recorded
+    /// level stale since the last [`set_current_level`](Self::set_current_level).
+    /// Read by this CPU only, Relaxed, as [`outranked`](Self::outranked) is.
+    pub fn level_stale(&self) -> bool
+    {
+        self.outranking.load(Ordering::Relaxed) == LEVEL_STALE
     }
 
     /// Decide what a timer tick does to the running thread, whose slice holds
@@ -852,19 +914,20 @@ impl PerCpuScheduler
     /// so one fair level never outranks another, all of them sharing the fair
     /// queue (core/kernel/docs/scheduler.md § Wake Preemption).
     ///
-    /// Reads `non_empty` and `current_level` Relaxed, holding no lock. The
+    /// One AND of `non_empty` and the `outranking` mask, so the test at every
+    /// return to user mode is two loads and a branch; true for any queued
+    /// thread while the level is [stale](Self::level_stale).
+    ///
+    /// Reads `non_empty` and `outranking` Relaxed, holding no lock. The
     /// caller is this CPU, at a return to user mode with interrupts masked: a
     /// link it made itself precedes the read in program order, and a link
     /// another CPU makes is followed by the wake IPI, whose own return to user
     /// mode reads again (core/kernel/docs/scheduling-internals.md § Wake
     /// Protocol Invariants). `schedule()` then decides under `lock`.
+    #[inline]
     pub fn outranked(&self) -> bool
     {
-        let queued = self.non_empty.load(Ordering::Relaxed) & !(1 << IDLE_QUEUE);
-        // The highest set bit is the highest non-empty queue, as in
-        // `dequeue_highest`.
-        queued != 0
-            && queued.ilog2() as usize > queue_index(self.current_level.load(Ordering::Relaxed))
+        self.non_empty.load(Ordering::Relaxed) & self.outranking.load(Ordering::Relaxed) != 0
     }
 
     /// The thread running on this CPU (null before `init`). A read without
@@ -1512,6 +1575,55 @@ mod tests
         assert!(rm(&sched, pl, 22));
         assert_eq!(sched.non_empty_mask(), 0);
         assert!(!sched.outranked());
+    }
+
+    // Defect caught: a mask that disagrees with the highest-queue comparison
+    // the decision is defined by, for any queue set or running level: a level
+    // whose queue the mask counts as outranking itself, a mask that counts the
+    // idle queue, or a shift past the top queue.
+    #[test]
+    fn the_mask_decides_as_the_highest_queue_comparison_at_every_level()
+    {
+        let sched = PerCpuScheduler::new();
+        for level in 0..=u8::try_from(NUM_PRIORITY_LEVELS - 1).unwrap()
+        {
+            sched.set_current_level(level);
+            assert!(!sched.level_stale(), "level {level}");
+            for ne in 0..(1u32 << NUM_RUN_QUEUES)
+            {
+                let queued = ne & !(1 << IDLE_QUEUE);
+                let reference = queued != 0 && queued.ilog2() as usize > queue_index(level);
+                sched.non_empty.store(ne, Ordering::Relaxed);
+                assert_eq!(
+                    sched.outranked(),
+                    reference,
+                    "non_empty {ne:#x}, level {level}"
+                );
+            }
+        }
+    }
+
+    // Defect caught: a priority change of the running thread that the return
+    // to user mode never sees, so a thread it now ranks below keeps waiting,
+    // or a stale mark that outlives the re-record.
+    #[test]
+    fn a_stale_level_sends_any_queued_thread_to_the_full_decision_until_re_recorded()
+    {
+        let sched = PerCpuScheduler::new();
+        sched.set_current_level(30);
+        let mut low = make_tcb();
+        let pl = &raw mut *low;
+        assert!(enq(&sched, pl, RT_PRIORITY_MIN));
+        assert!(!sched.outranked());
+        sched.mark_level_stale();
+        assert!(sched.level_stale());
+        assert!(sched.outranked(), "a queued thread under a stale level");
+        sched.set_current_level(syscall::PRIORITY_MIN);
+        assert!(!sched.level_stale());
+        assert!(sched.outranked(), "the re-recorded level ranks below it");
+        assert_eq!(deq(&sched), pl);
+        sched.mark_level_stale();
+        assert!(!sched.outranked(), "a stale level with nothing queued");
     }
 
     // ── RunQueue tests (exercised through PerCpuScheduler at priority 0) ──────

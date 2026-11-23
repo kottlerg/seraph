@@ -40,6 +40,7 @@
 //! | `PERCPU_PREEMPT_COUNT_OFFSET` | 40 | `preempt_count` |
 //! | `PERCPU_FPU_OWNER_OFFSET` | 48 | `fpu_owner` |
 //! | `PERCPU_KERNEL_STACK_FLOOR_OFFSET` | 72 | `kernel_stack_floor` |
+//! | `PERCPU_SCHEDULER_OFFSET` | 88 | `scheduler` |
 //!
 //! ## Adding new fields
 //! Append fields at the end of the struct. If assembly reads the field, add
@@ -52,6 +53,7 @@
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::sched::MAX_CPUS;
+use crate::sched::run_queue::PerCpuScheduler;
 use crate::sched::thread::ThreadControlBlock;
 
 // ── APIC ID mapping ───────────────────────────────────────────────────────────
@@ -202,6 +204,16 @@ pub const PERCPU_FPU_OWNER_OFFSET: usize = 48;
 )]
 pub const PERCPU_KERNEL_STACK_FLOOR_OFFSET: usize =
     core::mem::offset_of!(PerCpuData, kernel_stack_floor);
+/// Byte offset of `PerCpuData::scheduler`, GS- or `tp`-relative: the
+/// [`current_scheduler`] inline asm takes it as a `const` operand.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "read only by `current_scheduler`, which the host test build does not compile"
+    )
+)]
+pub const PERCPU_SCHEDULER_OFFSET: usize = core::mem::offset_of!(PerCpuData, scheduler);
 
 // ── PerCpuData ────────────────────────────────────────────────────────────────
 
@@ -268,6 +280,13 @@ pub struct PerCpuData
     /// kernel-stack guards (`mm::stack_guard::flush_before_run`). Written
     /// only by this CPU, at a switch-in or in `sched::enter`.
     pub guard_epoch_flushed: u64,
+    /// This CPU's own entry of the scheduler slab, so a return to user mode
+    /// reaches its run-queue mask with one GS- or `tp`-relative load
+    /// ([`current_scheduler`]) instead of the slab arithmetic of
+    /// `sched::scheduler_for` (core/kernel/docs/scheduler.md § Wake Preemption).
+    /// Written once by [`init_storage`], before the slab is published; null
+    /// before it.
+    pub scheduler: *const PerCpuScheduler,
 }
 
 impl PerCpuData
@@ -288,6 +307,7 @@ impl PerCpuData
             ctxsw_flush_performed: AtomicU64::new(0),
             kernel_stack_floor: 0,
             guard_epoch_flushed: 0,
+            scheduler: core::ptr::null(),
         }
     }
 }
@@ -327,7 +347,9 @@ const _: () = assert!(
 /// Allocate the per-CPU [`PerCpuData`], APIC-ID and TLB-shootdown request
 /// slabs, each sized to `cpu_count`, and publish their base pointers. Called from
 /// `sched::init_per_cpu_storage` (Phase 4), before [`init_bsp`] /
-/// [`init_apic_ids`] and before any SMP startup. The `PerCpuData` slab is
+/// [`init_apic_ids`] and before any SMP startup, with `schedulers` the
+/// published base of the `cpu_count`-entry scheduler slab, whose entry `cpu`
+/// each entry's `scheduler` names. The `PerCpuData` slab is
 /// zero-filled, which equals [`PerCpuData::new`] for every field.
 ///
 /// Sized to the booted `cpu_count`, so the slabs cost only what is used;
@@ -336,7 +358,11 @@ const _: () = assert!(
 /// # Panics
 /// Halts via `crate::fatal` on buddy exhaustion.
 #[cfg(not(test))]
-pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
+pub fn init_storage(
+    cpu_count: usize,
+    schedulers: *const PerCpuScheduler,
+    allocator: &mut crate::mm::BuddyAllocator,
+)
 {
     debug_assert!(
         cpu_count <= MAX_CPUS,
@@ -352,9 +378,13 @@ pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
         // SAFETY: cpu < cpu_count and the slab covers cpu_count PerCpuData
         // entries, so the offset stays inside it.
         let slot = unsafe { pc_ptr.add(cpu) };
+        let mut entry = PerCpuData::new();
+        // The address of scheduler entry `cpu`; wrapping_add computes it
+        // without a dereference, and the slab covers cpu_count entries.
+        entry.scheduler = schedulers.wrapping_add(cpu);
         // SAFETY: `slot` is an entry of the slab, which nothing else reaches
         // before PER_CPU_PTR publishes it below.
-        unsafe { core::ptr::write(slot, PerCpuData::new()) };
+        unsafe { core::ptr::write(slot, entry) };
     }
     PER_CPU_PTR.store(pc_ptr, Ordering::Release);
 
@@ -524,6 +554,26 @@ pub fn preempt_enable()
     }
 }
 
+/// This CPU's scheduler, read through [`PerCpuData::scheduler`] with one
+/// GS-relative (x86-64) or `tp`-relative (RISC-V) load.
+///
+/// # Safety
+/// This CPU's per-CPU pointer is installed ([`init_bsp`] or [`init_ap`]),
+/// which follows [`init_storage`]'s write of the field.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn current_scheduler() -> &'static PerCpuScheduler
+{
+    // SAFETY: the per-CPU pointer is installed (caller contract), and the
+    // offset is that of the `scheduler` field.
+    let sched = unsafe {
+        crate::arch::current::cpu::read_percpu_ptr::<PerCpuScheduler, PERCPU_SCHEDULER_OFFSET>()
+    };
+    // SAFETY: init_storage set the field to this CPU's entry of the scheduler
+    // slab, which is initialised before it and never freed.
+    unsafe { &*sched }
+}
+
 /// Returns `true` if preemption is disabled on the current CPU.
 #[cfg(not(test))]
 #[inline]
@@ -642,6 +692,6 @@ mod tests
             PERCPU_PREEMPT_COUNT_OFFSET
         );
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 88);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 96);
     }
 }

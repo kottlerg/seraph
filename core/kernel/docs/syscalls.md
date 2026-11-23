@@ -2010,10 +2010,14 @@ partition is userspace policy expressed through `SchedControl` band distribution
 Priority 0 (idle) and priority 31 (reserved) cannot be requested. Levels 21–`PRIORITY_MAX`
 are scheduled by strict priority and levels 1–20 fairly, at a weight of the level
 ([scheduler.md § Scheduling Classes](scheduler.md#scheduling-classes)); that split is the
-kernel's scheduling discipline, not an authority boundary. The change takes effect at the next
-scheduler invocation: a `Ready` thread is re-linked at the new level at once, and a running
-thread's class follows the new level from its next dispatch and its slice length from the first
-timer tick after it ([scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)).
+kernel's scheduling discipline, not an authority boundary. A `Ready` thread is re-linked at the
+new level at once. A running thread's CPU records the new level at its first return to user mode
+with a thread queued, or at the thread's next dispatch, whichever comes first: the caller's own
+change at this syscall's return, another CPU's at the return the change's prod forces. From that
+record the thread ranks at the new level, yielding at once to a queued thread that now outranks it
+([scheduler.md § Wake Preemption](scheduler.md#wake-preemption)), and its slice length follows
+from the first timer tick after it
+([scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)).
 
 **Capability requirements:** `thread_cap` (Control rights); `sched_cap` (a
 `SchedControl` whose band covers `priority`).

@@ -154,8 +154,13 @@ pub struct PerCpuScheduler
     idle: AtomicPtr<ThreadControlBlock>,
 
     /// Level of `current` as of its dispatch, which `timer_tick` reads for the slice
-    /// bound and refill and `outranked` for the wake preemption.
+    /// bound and refill.
     current_level: AtomicU8,
+
+    /// The `non_empty` bits of the queues above `current_level`'s, stored with it,
+    /// which `outranked` ANDs with `non_empty` for the wake preemption; every bit
+    /// while a priority change has left `current_level` stale (§ Wake Preemption).
+    outranking: AtomicU32,
 
     /// Lock protecting the run queues. Held briefly during enqueue/dequeue.
     pub lock: Spinlock,
@@ -205,11 +210,12 @@ implementation constants, not part of the ABI.
 CPU records at each dispatch (`PerCpuScheduler::current_level`): it may not read the running
 thread's `priority` without that thread's `sched_lock`. Each tick first cuts the remaining slice
 to that level's quantum, then takes the tick, and an expired slice is refilled with the quantum
-(`PerCpuScheduler::tick_outcome`). A priority change of a running thread therefore reaches its
-class, and the rank a wake preemption compares (§ Wake Preemption), at its next dispatch, and its
-slice at the first tick after that dispatch: until then the
-thread runs out the slice it holds, and from then on a thread lowered from fair 20 to 2 runs at
-most 2 ticks per slice, and one raised from the fair class into the RT class at most
+(`PerCpuScheduler::tick_outcome`). A priority change of a running thread marks the recorded level
+stale, and the CPU records the new one at its first return to user mode with a thread queued
+(§ Wake Preemption) or at the thread's next dispatch, whichever comes first; the thread's class,
+the rank a wake preemption compares, and its slice from the first tick after follow that record:
+until then the thread runs out the slice it holds, and from then on a thread lowered from fair 20
+to 2 runs at most 2 ticks per slice, and one raised from the fair class into the RT class at most
 `TIME_SLICE_TICKS`. A new thread's first slice is its creation level's.
 
 Slice expiry never hands the CPU to a lower RT level, nor from an RT thread to a fair one: the
@@ -744,8 +750,37 @@ other than the idle queue is above the queue of the running thread's level
 (`PerCpuScheduler::outranked`): any RT level outranks a fair level and the idle level, and a
 higher RT level a lower one. No level outranks its own, so one fair level never outranks another,
 all of them sharing the fair queue, and threads of one RT level share it round-robin. The running
-level is the one the CPU recorded at the thread's dispatch (`current_level`, § Time Slice
-Policy).
+level is the one the CPU recorded at the thread's dispatch, or re-recorded after a change of its
+priority (`current_level`, § Time Slice Policy).
+
+The test each return makes is one AND: `PerCpuScheduler::set_current_level` stores, beside the
+level, the `non_empty` bits of every queue above the level's queue (`outranking`), so a queued
+thread outranks the running one exactly when `non_empty & outranking` is not zero. A return
+reaches its CPU's scheduler through `PerCpuData::scheduler`, a pointer to the CPU's own entry of
+the scheduler slab that `percpu::init_storage` sets once: on x86-64 at `gs:[88]`
+(`PERCPU_SCHEDULER_OFFSET`), on riscv64 at `88(tp)`. The test is inlined at each return as one
+load of that pointer, the loads of `non_empty` and `outranking`, an AND and a branch
+(`sched::preempt_if_outranked`); only a hit calls the rest of the decision
+(`sched::preempt_outranked`). Both words are read Relaxed: a link the CPU made itself precedes the
+test in program order, and a link from another CPU is followed by its wake IPI, whose own return
+tests again ([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake
+Protocol Invariants).
+
+A change of a running thread's priority reaches its CPU through that mask.
+`sys_thread_set_priority` writes `priority` and reads `state` under the thread's `sched_lock`,
+and every site that records a level from a thread's `priority` holds the same lock and makes the
+thread `Running` in the same critical section: `schedule()`'s dispatch flip, under the incoming
+thread's lock, and its same-thread re-mark and the decision's re-record below, under the running
+thread's. The other records read no thread's priority: the idle level, and `sched::enter`'s boot
+dispatch of init, before any other thread exists. So a record after the change reads the new
+priority, and a change after a record finds the thread `Running`. The change then marks the
+level of the CPU its `preferred_cpu` names (the CPU running it, written with the flip under the
+same lock) stale before it releases the lock: `PerCpuScheduler::mark_level_stale` stores every
+bit in `outranking`, which no level's mask has. It then prods the CPU, a no-op for the caller's
+own. The next return to user mode there with any thread queued hits. The decision re-records the
+level from `priority` under the thread's `sched_lock` and decides again, so a thread lowered
+below a queued one yields at that return. A later dispatch overwrites the mark with the incoming
+thread's level, read under that thread's lock.
 
 A CPU decides at every return to user mode that can follow a link with no wake IPI pending
 (`sched::preempt_if_outranked`), and when a queued thread outranks the running one it calls

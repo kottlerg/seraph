@@ -890,6 +890,30 @@ pub fn current_cpu() -> u32
     }
 }
 
+/// Read the pointer at byte `OFFSET` of this CPU's `PerCpuData` with one
+/// GS-relative load.
+///
+/// # Safety
+/// GS-base holds this CPU's `PerCpuData` address (`percpu::init_bsp` or
+/// `percpu::init_ap`), and `OFFSET` is the offset of a pointer field of it.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn read_percpu_ptr<T, const OFFSET: usize>() -> *const T
+{
+    let ptr: *const T;
+    // SAFETY: gs:[OFFSET] is the pointer field (caller contract); the load
+    // writes no memory and no flag.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, qword ptr gs:[{off}]",
+            out(reg) ptr,
+            off = const OFFSET,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    ptr
+}
+
 // ── Kernel trap stack ─────────────────────────────────────────────────────────
 
 /// Set the kernel stack pointer used when a trap fires from U-mode.

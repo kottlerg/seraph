@@ -393,7 +393,7 @@ skipping levels, risks deadlock.
 level, of the fair queue, and of the idle level),
 which are its one non-atomic state and are touched only by the methods whose contract is that the
 caller holds that lock (`enqueue`, `enqueue_at_head`, `dequeue_highest`, `remove_from_queue`,
-`find_runnable`; the
+`relink`, `find_runnable`; the
 single-threaded boot link and dispatch of init are the exception the Scheduling row of § Cross-CPU
 TCB Ownership names). `current` is atomic: written by `init` on the boot CPU before any CPU
 schedules, and by `sched::enter` for CPU 0 without `lock` (its boot dispatch of init, before CPU
@@ -415,9 +415,9 @@ word an all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_
 `idle_pull_episode`, the backlog episode that sample read, `idle_pull_held`, whether the previous
 idle tick held it for a busy SMT sibling, and `idle_pull_cursor`, where its scan starts
 ([scheduler.md](scheduler.md) § Load Balancing, § SMT Awareness), are written and read only by
-their own CPU's `timer_tick`. `backlog_episode`, the count of the CPU's backlog episodes, is
-owned by `lock`: written only by `link`, under it, and read under it by a pull's re-check and
-without it by an idle CPU's sample, which the pull re-decides. `non_empty`, `load`,
+their own CPU's `timer_tick`. `backlog_episode`, the CPU's backlog episode, is owned by
+`lock`: written only by `link` and `remove_from_queue`, under it, and read under it by a pull's
+re-check and without it by an idle CPU's sample, which the pull re-decides. `non_empty`, `load`,
 `backlog_episode`, `idle_pull_candidate`, `idle_pull_episode`, `idle_pull_held`,
 `idle_pull_cursor` and the deferred-reclaim head are atomics with their own orderings (§ Atomic
 Ordering Invariants).
@@ -631,24 +631,25 @@ relocate runs through `sched::relocate_ready_priority`:
 - **Hint hit (common, O(1) locks):** `preferred_cpu` names the CPU whose run
   queue links a stable `Ready` thread (every link-creating path retargets it on
   the created link — #359). The relocate locks only that one CPU's `scheduler.lock`
-  and verifies membership with `remove_from_queue(tcb, old_prio)`; on success it
-  re-enqueues at the new priority on the same scheduler via
-  `PerCpuScheduler::enqueue`. A single inner lock under the held `sched_lock`
-  needs no ascending-order coordination.
+  and moves the entry with `PerCpuScheduler::relink(tcb, old_prio, new_prio)`, whose
+  boolean verifies membership, to the new priority's queue on the same scheduler. A
+  single inner lock under the held `sched_lock` needs no ascending-order coordination.
 - **Hint miss (fallback):** the thread migrated between the `preferred_cpu` read
   and the lock, or sits in the transient `Ready`-but-unlinked window (below). The
   hint lock is released and the relocate falls back to the original #122 walk:
-  every CPU's `scheduler.lock` acquired in ascending order, `remove_from_queue`
-  tried on each, re-enqueue on the scheduler that reports `true` (and
-  `preferred_cpu` refreshed to it so the stale hint self-heals). `remove_from_queue`'s
-  boolean is the authoritative home-CPU identification on both paths.
+  every CPU's `scheduler.lock` acquired in ascending order, `relink` tried on
+  each, which moves the entry on the scheduler that reports `true` (and
+  `preferred_cpu` refreshed to it so the stale hint self-heals). `relink`'s boolean
+  is the authoritative home-CPU identification on both paths. `relink` sets the
+  new queue's `non_empty` bit before it clears the old one's and leaves the load
+  and the backlog episode as they are, so no reader without the lock sees the
+  CPU's queues empty, or its backlog broken, between the two.
 
 The held `(*tcb).sched_lock` serialises the whole operation against
 `migrate_ready_thread`, `dealloc_object(Thread)`, and
 `set_state_under_all_locks` (all take the same per-TCB lock); the run-queue
 lock(s) cover the intrusive list surgery. Once it releases `sched_lock`, the syscall prods the
-CPU the entry was re-linked on (`prod_remote_cpu`): the unlink can empty that CPU's run queues for
-a moment, and its idle loop, which reads them without the lock, can halt on that reading
+CPU the entry was moved on (`prod_remote_cpu`), as for any change to another CPU's run queues
 (§ Wake Protocol Invariants).
 
 The "Ready ⇒ linked on exactly one queue" invariant has a transient
@@ -743,8 +744,7 @@ consistency window as for any other `enqueue_and_wake` racing
 insertion — `enqueue_and_wake`, `enqueue_ready_thread` (`sys_thread_start` and the address-space
 release),
 `schedule()`'s outgoing requeue, `schedule()`'s deferred-dispatch re-link (under
-`next.sched_lock`, at the head of its run queue), `relocate_ready_priority`'s re-enqueue
-(`sys_thread_set_priority`), and `relocate_ready_thread`'s destination link
+`next.sched_lock`, at the head of its run queue), and `relocate_ready_thread`'s destination link
 (`migrate_ready_thread` and the load balancer's `pull_unpinned_ready`) — funnels through
 `PerCpuScheduler::enqueue` (the deferred re-link through its head-of-queue form,
 `enqueue_at_head`). That chokepoint refuses a
@@ -1219,11 +1219,12 @@ links a thread on another CPU's run queue sets its queue's bit under that CPU's 
 then sends the wake IPI: `enqueue_and_wake`, `enqueue_ready_thread`, `schedule()`'s cross-affinity
 requeue, `sys_thread_set_affinity`'s `migrate_ready_thread`, and `sys_thread_set_priority`'s
 `relocate_ready_priority`, whose callers prod the CPU (`prod_remote_cpu`) after their unlock; the
-priority relocation's unlink can empty the queues for a moment, so its re-link is a link like any
-other. A path that links a thread on its own CPU (`schedule()`'s requeue of the outgoing thread and
-its deferred-dispatch re-link, the wake preemption's requeue of the preempted thread at the head
-of its own queue (`Requeue::Preempted`), the load balancer's pull, which moves a thread onto the
-pulling CPU from its `timer_tick`, and Phase 9's link of init on the boot CPU) needs no IPI: the
+priority relocation's move (`PerCpuScheduler::relink`) sets the new queue's bit before it clears
+the old one's, so the queues never read empty in between. A path that links a thread on its own
+CPU (`schedule()`'s requeue of the outgoing thread and its deferred-dispatch re-link, the wake
+preemption's requeue of the preempted thread at the head of its own queue (`Requeue::Preempted`),
+the load balancer's pull, which moves a thread onto the pulling CPU from its `timer_tick`, and
+Phase 9's link of init on the boot CPU) needs no IPI: the
 link precedes that CPU's next masked check in program order, or, made in an interrupt taken during
 the halt, ends the halt itself. In the masked check (consumer step 2), a load that misses a remote
 link was made before the link was visible, so the IPI that invariant 1 orders after the link arrives
@@ -1418,8 +1419,8 @@ the ordering choice is required for correctness; relaxations would introduce a r
 
 | Atomic | Location | Set ordering | Read ordering | Pairing rationale |
 |---|---|---|---|---|
-| `non_empty` (per PerCpuScheduler) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue` and `enqueue_at_head` (their shared `link`), `dequeue_highest`, `remove_from_queue`; read in `has_runnable`, `backlog` and `outranked`) | Release on `link.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and` | Acquire on `has_runnable.load` and `backlog.load`; Relaxed on `outranked`'s load | Release publishes the queue-mutation stores, `backlog_episode` among them; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO, and `backlog`'s Acquire orders its read of `backlog_episode` after the link whose bit it saw. `outranked`'s load only decides whether to enter `schedule()`, which reads the queues under their lock; its freshness is invariant 1's (§ Wake Protocol Invariants). |
-| `queued_on` (per TCB, `AtomicI16`) | `core/kernel/src/sched/thread.rs` (decl); writes in `PerCpuScheduler::enqueue` and `enqueue_at_head` (their shared `link`; set to priority), `dequeue_highest` / `remove_from_queue` (set to `-1`); read in the double-link guard of that shared `link`, `schedule()`'s `already_queued` requeue guard, and the `commit_blocked_under_local_lock` debug tripwire | Relaxed `store` | Relaxed `load` | The global single-link tag (#244/#289). Every load-bearing access — set, clear, and the guard reads — is performed under the owning `scheduler.lock` (the `schedule()` guard read under the current CPU's run-queue lock), which supplies all required ordering; the atomic type exists only so a cross-CPU `enqueue_and_wake` guard read of a TCB linked on *another* CPU is well-defined, not for lock-free synchronisation. A `>= 0` value means linked, on the run queue of that level, on the CPU that set it. The `commit_blocked` tripwire reads it Relaxed under `(*tcb).sched_lock` with no run-queue lock — sound because every `-1 → >= 0` writer either classifies the target not-live under that same `sched_lock` (`enqueue_and_wake`, `enqueue_ready_thread` via its not-live caller contract) or runs as / while holding the same lock as the parking thread itself (`schedule()`'s requeue arms and its deferred-dispatch re-link, `relocate_ready_thread`, `relocate_ready_priority`), all excluded while the thread executes its own park commit. (The softlockup-watchdog dump also reads the field, under the walked thread's `sched_lock`; diagnostic-only, not load-bearing.) |
+| `non_empty` (per PerCpuScheduler) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue` and `enqueue_at_head` (their shared `link`), `dequeue_highest`, `remove_from_queue`, `relink`; read in `has_runnable`, `backlog` and `outranked`) | Release on `link.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and`, and `relink`'s `fetch_or` of the new queue's bit before its `fetch_and` of the old one's | Acquire on `has_runnable.load` and `backlog.load`; Relaxed on `outranked`'s load | Release publishes the queue-mutation stores, `backlog_episode` among them; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO, and `backlog`'s Acquire orders its read of `backlog_episode` after the link whose bit it saw. `outranked`'s load only decides whether to enter `schedule()`, which reads the queues under their lock; its freshness is invariant 1's (§ Wake Protocol Invariants). |
+| `queued_on` (per TCB, `AtomicI16`) | `core/kernel/src/sched/thread.rs` (decl); writes in `PerCpuScheduler::enqueue` and `enqueue_at_head` (their shared `link`; set to priority), `relink` (set to the new priority, the link staying on its CPU), `dequeue_highest` / `remove_from_queue` (set to `-1`); read in the double-link guard of that shared `link`, `schedule()`'s `already_queued` requeue guard, and the `commit_blocked_under_local_lock` debug tripwire | Relaxed `store` | Relaxed `load` | The global single-link tag (#244/#289). Every load-bearing access — set, clear, and the guard reads — is performed under the owning `scheduler.lock` (the `schedule()` guard read under the current CPU's run-queue lock), which supplies all required ordering; the atomic type exists only so a cross-CPU `enqueue_and_wake` guard read of a TCB linked on *another* CPU is well-defined, not for lock-free synchronisation. A `>= 0` value means linked, on the run queue of that level, on the CPU that set it. The `commit_blocked` tripwire reads it Relaxed under `(*tcb).sched_lock` with no run-queue lock — sound because every `-1 → >= 0` writer either classifies the target not-live under that same `sched_lock` (`enqueue_and_wake`, `enqueue_ready_thread` via its not-live caller contract) or runs as / while holding the same lock as the parking thread itself (`schedule()`'s requeue arms and its deferred-dispatch re-link, `relocate_ready_thread`), all excluded while the thread executes its own park commit. (The softlockup-watchdog dump also reads the field, under the walked thread's `sched_lock`; diagnostic-only, not load-bearing.) |
 | `context_saved` (per TCB) | `core/kernel/src/sched/thread.rs` (decl) | Release store of `1` inside `context::switch`, after the rsp/sp swap onto the incoming thread's kstack; **Relaxed clears to `0`** at the park commits (`commit_blocked_under_local_lock` and the IPC pre-clears) and `schedule()`'s switch-away / cross-affinity arms, each performed while the thread is `current` on the storing CPU; **Relaxed restores to `1`** by the IPC primitives when they do not park (payload harvested before parking, or a refused commit's rollback), while the thread is still `current` on the storing CPU | Acquire on the remote-dequeue spin-loop and in `schedule()`'s dispatch-flip read that defers an unpublished `next` when the outgoing thread is not idle (step 3.5); **also Acquire** in the load-balancer liveness gate (`pull_unpinned_ready` / `migrate_ready_thread`, step 11) and the `sys_thread_start` settle loop and commit (`start_under_all_locks`, `start_ready_to_link`) and the register-access gate (`with_held_frame`), and the `sys_thread_stop` drain and save wait (`drain_remote_stopped`, `await_stopped_save`), which pair with the switch-out Release so a stop returns only after the target's save is visible | Closes the partial-`SavedState`-visibility race on RVWMO, and (step 11) gates cross-CPU relocation/resume on a committed save — `cs == 1` ⇒ switched out and `current` nowhere; see [Cross-CPU TCB Ownership](#cross-cpu-tcb-ownership) (steps 5/6/9/11) for the full sequence. The Relaxed `0`-clears are sufficient: every consumer reaches the cleared value transitively through a lock release/acquire chain (the waker/relocator hold `sched_lock` and the run-queue lock), the same argument the pre-existing IPC pre-clears rely on. |
 | `trap_frame` (per TCB, `AtomicPtr<TrapFrame>`) | `core/kernel/src/sched/thread.rs` (decl) | Relaxed `store` by `SYS_THREAD_CONFIGURE` (under the target's `sched_lock`, while `Created`) and `sched::enter`, then by the running thread itself at each user-mode entry that can deschedule it (`publish_user_frame`, the syscall dispatcher) and around a fault block (`redirect_user_fault` stores the live frame and restores the prior pointer, on both arches; `syscall::deliver_copy_fault` republishes the syscall frame before a restartable syscall's copy fault blocks) | Relaxed `load` in `with_held_frame` under the target's `sched_lock`, after its `context_saved` Acquire; `sys_thread_start`'s unlocked precheck, which only refuses a never-configured thread (the pointer is never reset to null once set, and the start's commit takes the `sched_lock` configure holds across its store); the running thread's own loads | The register syscalls read the pointer only once the target is off every CPU with its save published: the store precedes the switch-out's `context_saved` Release, which their Acquire pairs with, so Relaxed suffices. See [arch-interface.md](arch-interface.md) § `trap_frame`. |
 | `wake_in_flight` (per TCB) | `core/kernel/src/sched/thread.rs` (decl) | Release `store(1)` by a claimer: under the wait object's lock (notification, endpoint, event queue, wait set), under `SLEEP_LIST_LOCK` at the timer pop of a plain sleeper, by `endpoint_call` before it publishes a reply binding and by the receive's send-queue dequeue (`bind_next_sender`), by a server's `dealloc_object(Thread)` claiming a reply- or fault-bound client, and by an upcall's cancel (`cancel_for_upcall`) or a timer expiry (`cancel_for_timeout`) inside the `sched_lock` hold of the claim it won, which, for a plain sleeper, is the `sleep_list_remove` under `sched_lock` (on the `BlockedOnReply` arm it keeps the store the reply binding made). Release `store(0)` by `enqueue_and_wake` (under `sched_lock` on every arm but `Exited`; after releasing it on `Exited`) and by the path whose `reply_tcb` CAS tears down a binding no wake will follow | Acquire spin in the `dealloc_object(Thread)` wake-in-flight gate (drain step 14) before `retype_free`; Relaxed loads under the target's `sched_lock` in the `sys_thread_start` settle loop (`start_under_all_locks`), re-read under every CPU lock by its commit (`start_ready_to_link`) | The gate's Acquire pairs with the clear's Release, so every access the waker made to the TCB precedes the free; on an `Exited` thread the clear is the waker's last touch. Every other arm clears under `sched_lock`, because once the lock drops the thread can park again and a later claim re-pin it, which a delayed clear would erase. The start's Relaxed loads only decide whether to wait; the commit re-reads them under its locks. See [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `dealloc_object(Thread)` Drain Protocol. |
@@ -1433,7 +1434,7 @@ the ordering choice is required for correctness; relaxations would introduce a r
 | `load` (per `PerCpuScheduler`, `AtomicU32`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `increment_load` / `decrement_load` / `current_load`) | Relaxed `fetch_add` / `fetch_sub` in `increment_load` / `decrement_load` | Relaxed on `current_load` | Advisory: `select_target_cpu` and the periodic load balancer consult this; transient inconsistency does not violate correctness. A lock-free read can see `schedule()`'s momentary count of a requeue of the running thread before its dequeue, so the balancer's pull re-decides its rule on both CPUs' loads under their two run-queue locks, where every change has completed ([scheduler.md § Load Balancing](scheduler.md#load-balancing)). The counter MUST track queue occupancy: every `enqueue` increments, every `dequeue_highest` / `remove_from_queue` decrements, the idle thread's link on the idle queue (by the idle loop's `schedule(Requeue::Always)`) and its dequeue included, so a CPU that left its idle thread for another counts it until it next runs it. |
 | `idle_pull_candidate` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_candidate` / `set_idle_pull_candidate` / `forget_idle_pull_candidate`, called from `try_pull_idle` and `try_pull_balance`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; the candidate CPU's run-queue mask and backlog episode are re-read (`backlog`) and the pull revalidates under the run-queue locks, so a stale candidate costs at most one futile try-lock attempt. |
 | `idle_pull_episode` (per `PerCpuScheduler`, `AtomicU32`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_candidate` / `set_idle_pull_candidate`, called from `try_pull_idle`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state, meaningful only while `idle_pull_candidate` is set: one CPU writes and reads it, so no ordering edge is needed. |
-| `backlog_episode` (per `PerCpuScheduler`, `AtomicU32`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; written in `link`; read in `backlog`, by `idle_scan`, `idle_pull_tick` and `pull_under_cpu_locks`) | Relaxed `load` and `store` in `link`, under `lock`, before its Release `non_empty.fetch_or` | Relaxed `load` in `backlog`, after its Acquire `non_empty` load | Every write holds `lock`, so a reader under it reads the exact episode. A lock-free sample that sees a link's `non_empty` bit reads that link's episode or a later one (the `non_empty` pair), never an older one; a sample is advisory, and the pull re-checks the episode under the lock. The count wraps: a stale match needs 2^32 episodes between two samples a tick apart, and would cost one pull, which the bound already allows. |
+| `backlog_episode` (per `PerCpuScheduler`, `AtomicU32`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; written in `link` and `remove_from_queue`; read in `backlog`, by `idle_scan`, `idle_pull_tick` and `pull_under_cpu_locks`) | Relaxed `load` and `store` in `link`, under `lock`, before its Release `non_empty.fetch_or`, when the queues held no thread but the idle thread (an even count two on, an odd one up to the even count before it), and in `remove_from_queue`, under `lock`, before its Release `non_empty.fetch_and`, when its removal leaves no thread but the idle thread queued (the count one lower, odd) | Relaxed `load` in `backlog`, after its Acquire `non_empty` load, rounded up to even | Every write holds `lock`, so a reader under it reads the exact episode. A lock-free sample that sees a link's `non_empty` bit reads that link's episode or a later one (the `non_empty` pair), never an older one; a sample is advisory, and the pull re-checks the episode under the lock. A sample that reads the odd count of a removal it raced rounds it up to the episode that removal continues. A sample that races a dispatch running the backlog dry and the link that refills the queues can read the new episode for the backlog it saw, which costs one pull of a backlog that did not stand a tick, a pull the bound allows. The count wraps: a stale match needs 2^31 backlogs between two samples a tick apart, and would cost one pull, which the bound already allows. |
 | `idle_pull_held` (per `PerCpuScheduler`, `AtomicBool`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_held` / `set_idle_pull_candidate`, which clears it / `hold_idle_pull_candidate` / `forget_idle_pull_candidate`, called from `try_pull_idle` and `try_pull_balance`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only delays a pull by one tick ([scheduler.md](scheduler.md) § SMT Awareness). |
 | `idle_pull_cursor` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_cursor` / `set_idle_pull_cursor`, called from `try_pull_idle`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only orders the idle scan, which every pull revalidates under the run-queue locks. |
 | `park_disposition` (per TCB, `AtomicU8`) | `core/kernel/src/sched/thread.rs` (decl; ops `open_park_episode`, `stamp_park_deposit`, `consume_park_interrupted`, `consume_park_cancel`; `consume_call_disposition` in `core/kernel/src/syscall/ipc.rs`) | Release `store` of `NONE` by `open_park_episode` (directly or via `open_call_episode`) before the thread becomes claimable; Release `store` of the disposition by the wake-claim winner in `stamp_park_deposit` (directly or via `stamp_cancelled_deposit`) | Acquire `load` on resume in `consume_park_interrupted` / `consume_park_cancel` / `consume_call_disposition` | The claim winner's Release orders its deposit (`ipc_msg`, `wakeup_value`) before the stamp, so a resuming thread whose Acquire load observes the stamp also observes the deposit; see [ipc-internals.md § Park Dispositions and Episodes](ipc-internals.md#park-dispositions-and-episodes) for the episode protocol. |
@@ -1475,6 +1476,63 @@ the ordering choice is required for correctness; relaxations would introduce a r
   "looks fine on x86" is not justification — the riscv64 build is RVWMO and is the binding test.
 - SeqCst is permitted only where a Dekker-style fence pair is the proven pattern; new SeqCst uses
   MUST cite the proof.
+
+### Lock-free readers of a CPU's run queues
+
+A CPU's run queues, its `non_empty` mask and its `backlog_episode` are written only under its
+`scheduler.lock`, by four writers: `link` (behind `enqueue` and `enqueue_at_head`),
+`dequeue_highest`, `remove_from_queue` and `relink`. (`queued_on`, which the same writers set,
+is ordered by the lock alone, as its row above says, and no reader below reads it.) These readers
+take no lock:
+
+- `has_runnable` (Acquire): the owning CPU's idle loop, as a hint before it masks interrupts and
+  as the masked check before it halts.
+- `backlog` (Acquire load of the mask, then a Relaxed load of the episode): another CPU's idle
+  pull, in its scan and its confirmation; its re-check under both CPUs' locks reads it exactly.
+- `outranked` (Relaxed): the owning CPU alone, at a return to user mode with interrupts masked.
+- `has_queued_thread` (Relaxed), through `has_no_work`: the softlockup watchdog's per-tick idle
+  sample (`system_has_no_work`), the SMT core spread, and the idle pull's sibling hold.
+
+Four invariants make their samples sound:
+
+1. **Publication.** A writer whose read-modify-write of `non_empty` changes a bit (`link`
+   setting one, `relink`, and `dequeue_highest` or `remove_from_queue` clearing the bit of the
+   queue they leave empty) makes it Release, after its stores to the queues and, in `link` and
+   `remove_from_queue`, to the episode. An Acquire reader that reads the value such a write made
+   therefore sees those stores: `backlog` reads the episode of the link whose bit it saw, or a
+   later one. The Relaxed readers learn the bits alone and read nothing behind them.
+2. **No false empty.** A bit for a queue holding a thread other than the idle thread is cleared
+   only by `dequeue_highest` or `remove_from_queue` taking that queue's last thread. `relink`,
+   which moves a thread between the CPU's queues, sets the destination's bit before it clears the
+   source's; both are read-modify-writes of one atomic by one CPU, so every value of the mask, in
+   its modification order, names at least one queue while the thread stays queued. A sample that
+   reads no queued-thread bit therefore read a value written while no thread but the idle thread
+   was queued.
+3. **Episodes.** The episode changes only at `link` into queues holding no thread but the idle
+   thread (an even count two on, an odd one back to the even count before it) and at a
+   `remove_from_queue` that leaves no such thread queued (the count one lower, odd). `backlog`
+   rounds an odd count up. Two equal samples are thus one backlog that the CPU's dispatch did not
+   run dry between them, save the one imprecision
+   [scheduler.md § Load Balancing](scheduler.md#load-balancing) states: a sample that races a
+   dispatch running the backlog dry and the link that refills it can read the new episode.
+4. **What a sample decides.** The readers that gate on queued work act on a sample only where a
+   later step closes it. The idle loop's masked check is closed by program order for the CPU's
+   own links and, for a link on another CPU, by the wake IPI that invariant 1 of § Wake Protocol
+   Invariants orders after it; `outranked` is closed the same way, the IPI's own return to user
+   mode reading again, and `schedule()` decides under the lock; the idle pull re-reads the
+   episode and both loads under both CPUs' locks. A stale sample costs them a halt the IPI ends,
+   a return to user mode the IPI's return re-decides, a futile lock round, or one pull the idle
+   pull's bound allows, never a lost thread. `has_no_work`'s consumers act on one sample with no
+   locked step after it: a missed thread makes the watchdog count the tick idle and restart its
+   stall clock (§ Softlockup Watchdog states the cost), and makes the core spread or the sibling
+   hold count the sibling idle ([scheduler.md § SMT Awareness](scheduler.md#smt-awareness)).
+   Invariant 2 keeps `relink` from making any reader miss a thread that stays queued.
+
+A new writer of a CPU's run queues MUST keep all four: in particular, it moves a queued thread
+with `relink`, never by an unlink and a re-link, which shows the queues empty to every reader
+between the two. The host tests `a_relink_never_shows_a_lock_free_reader_the_queues_empty` and
+`a_relink_moves_the_thread_to_the_new_level_and_keeps_its_episode` (`sched::run_queue`) cover
+invariant 2 and the episode half of invariant 3 for `relink`.
 
 ---
 

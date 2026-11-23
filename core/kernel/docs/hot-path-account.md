@@ -66,7 +66,7 @@ the kernel:
 | Finding this CPU's scheduler and thread | 38 | 53 | `scheduler_for`, `scheduler_ptr`, `read_percpu_ptr`, `current_cpu`, `PerCpuScheduler::current`, `current_tcb` |
 | Dispatch and result | 70 | 42 | `dispatch`, `dispatch_in_range`, `index_mask`, `mask_index`, `syscall_nr`, `finish_syscall` |
 | Return-to-user work checks | 40 | 60 | `running_thread_stopped`, `reclaim_deferred_stack`, `drain_deferred_reclaim`, `sole_reference::drain`, `deliver_at_syscall`, `upcall::take`, `upcall::deliver`, `PerCpuScheduler::outranked`, `preempt_if_outranked` |
-| Diagnostic stamps | 13 | 12 | `cpu_diag`, `stamp_syscall_entry`, `note_cpu_syscall` |
+| Diagnostic stamps | 13 | 14 | `cpu_diag`, `stamp_syscall_entry`, `note_cpu_syscall` |
 | The handler | 19 | 19 | `sys_system_info`, `TrapFrame::arg`, `TrapFrame::set_return` |
 
 The current-thread lookup goes through the scheduler table on every access, several times per
@@ -142,9 +142,9 @@ is not taken.
 | 1 | #1539: skip the I/O bitmap reload when the TSS already holds it | local | about 2100 per row that switches twice / none |
 | 2 | #1540: copy user memory a word at a time on riscv64 | local | none / about 24000 on `thread_read_mem_page`, 1300 on IPC with 7 words |
 | 3 | #1541: build IPC messages in place, copying only the valid words (taken: PR #1567) | local | 384 / 1570 per IPC round trip, measured |
-| 4 | #1547: read the current thread and per-CPU state through one per-CPU pointer (after PR #1507) | design | about 45 / 75 per kernel entry |
-| 5 | #1548: test the return-to-user work with one per-CPU word (after PR #1507) | design | about 30 / 50 per return to user |
-| 6 | #1549: dispatch syscalls through one masked table index | design | about 50 / 30 per syscall |
+| 4 | #1548: test the return-to-user work with one per-CPU word (after PR #1507) | design | about 30 / 50 per return to user |
+| 5 | #1549: dispatch syscalls through one masked table index | design | about 50 / 30 per syscall |
+| 6 | #1547: read the current thread and per-CPU state through one per-CPU pointer (after PR #1507) | design | about 28 / 40 per kernel entry, most of the 38 / 53 the lookup costs |
 | 7 | #1542: monomorphise the page-table leaf walker's visitor | local | about 700 / not estimated (no thunk) per harvest of 32 pages |
 | 8 | #1550: serve small kernel entropy draws from one squeezed block | design | about 24000 / 24000 per thread lifecycle |
 | 9 | #1543: scan kernel stacks a line at a time, and paint them with wider stores | local | about 4700 / 12000 per thread lifecycle |
@@ -153,7 +153,7 @@ Not taken:
 
 - The zeroing of memory on retype and free (most of `ktest.thread_lifecycle`'s `memset`):
   it is what keeps one owner's data from the next, and the account shows no excess in it.
-- The entry and exit stubs (70 / 145 per syscall): they save and restore the full trap frame,
+- The entry and exit stubs (70 / 151 per syscall): they save and restore the full trap frame,
   which faults, upcalls and the debugger read; a syscall-only frame changes that contract for a
   saving the account does not yet bound, and is not on this list.
 

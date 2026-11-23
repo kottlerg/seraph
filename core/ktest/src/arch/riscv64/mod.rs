@@ -88,7 +88,7 @@ pub fn fresh_range_root(ctx: &TestContext) -> Option<u64>
 
 /// Whether the architecture has an I/O port space, so `IoPort` capabilities
 /// bind to threads (the kernel's `HAS_IO_PORTS`): none on RISC-V, so
-/// arch-neutral cells that exercise a port binding skip it.
+/// arch-neutral cells that exercise a port binding leave it out.
 pub const HAS_IO_PORTS: bool = false;
 
 /// Whether the kernel reports transient-execution mitigation state
@@ -244,6 +244,12 @@ pub fn software_breakpoint() -> u64
         );
     }
     addr
+}
+
+/// None: RISC-V has no I/O port space, so ktest holds no `IoPort` cap.
+pub fn io_port_cap() -> Option<u64>
+{
+    None
 }
 
 /// No-op: RISC-V has no I/O port space, so there is no `IoPort` cap to seed;

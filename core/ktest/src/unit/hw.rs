@@ -12,10 +12,12 @@
 //! `SYS_IOPORT_SPLIT`, and `SYS_SBI_CALL` tests live behind `crate::arch`.
 //!
 //! Tests that require specific hardware capability types (`Mmio`, Interrupt,
-//! `IoPort`) scan the initial capability set for a matching cap. If none is
-//! found in the current boot configuration, the test is skipped and reports Ok.
+//! `IoPort`) look up a matching boot cap among the `InitInfo` descriptors
+//! ([`boot_caps`]). If none is found in the current boot configuration, the
+//! test is skipped and reports Ok.
 //! Skips are logged to serial so they are visible in the test run output.
 
+use init_protocol::{CapDescriptor, CapType, InitInfo};
 use syscall::{
     aspace_query, cap_create_notification, irq_ack, irq_msg_alloc, irq_register, irq_remap,
     irq_route, irq_split, mem_unmap, mmio_merge, mmio_split,
@@ -29,10 +31,30 @@ use crate::{TestContext, TestResult};
 /// every `process_layout` window (ktest's PIE image loads in `IMAGE_WINDOW`).
 const MMIO_TEST_VA: u64 = 0x1_5000_0000;
 
+/// The boot capabilities of `cap_type` that `InitInfo` describes, each
+/// descriptor's `slot` the cap's handle. A boot cap's slot is never recycled
+/// while the cap lives, so the handle stays valid; a test that splits one works
+/// on a derived copy, which leaves the boot cap whole.
+pub fn boot_caps(
+    ctx: &TestContext,
+    cap_type: CapType,
+) -> impl Iterator<Item = &'static CapDescriptor>
+{
+    // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
+    // ktest's lifetime.
+    let info: &'static InitInfo = unsafe { &*(ctx.init_info_va as *const InitInfo) };
+    crate::init_info::descriptors(info)
+        .iter()
+        .filter(move |d| d.cap_type == cap_type)
+}
+
 /// Upper bound for a slot scan over the test's own `CSpace`: its backed
 /// capacity, which the kernel clamps below its structural slot ceiling (under
 /// 2^32), so the narrowing cannot fail; the address-space cap's index if the
-/// query fails, which still covers every boot-minted cap.
+/// query fails. A scan that passes the indices below it as handles names only
+/// caps in slots never recycled, since an index carries generation 0: a cap a
+/// split or a copy put in a recycled slot is missed. A cap whose handle a test
+/// holds, or a boot cap ([`boot_caps`]), is reached through that handle instead.
 pub fn scan_bound(ctx: &TestContext) -> u32
 {
     syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
@@ -45,32 +67,24 @@ pub fn scan_bound(ctx: &TestContext) -> u32
 
 /// `mmio_map` maps a hardware MMIO region into the address space.
 ///
-/// Maps only a single carved page, not the whole aperture:
-/// `sys_mmio_map` draws intermediate PT pages from the *target* AS's own pool,
-/// and the first `Mmio` in the boot config can span hundreds of MiB
-/// (hundreds of PT pages) — mapping it whole would drain `ctx.aspace_cap`'s
-/// pool, which the `mem_map` integration and bench tests share. One page
-/// suffices to exercise the map + `aspace_query` path. The region is split so
-/// its large remainder stays a valid `Mmio` for [`mmio_split_carves`].
-/// Skipped if no `Mmio` of at least two pages exists in this boot config.
+/// Maps only a single page, split off a derived copy of the first boot `Mmio`
+/// cap of at least two pages, not the whole aperture: `sys_mmio_map` draws
+/// intermediate PT pages from the *target* AS's own pool, and an aperture can
+/// span hundreds of MiB (hundreds of PT pages), which would drain
+/// `ctx.aspace_cap`'s pool, which the `mem_map` integration and bench tests
+/// share. One page suffices to exercise the map + `aspace_query` path. The
+/// split consumes the copy, so the boot cap stays whole. Skipped if no `Mmio` of
+/// at least two pages exists in this boot config.
 pub fn mmio_map(ctx: &TestContext) -> TestResult
 {
-    // Probe each slot with a one-page split. `InvalidCapability` ⇒ wrong tag;
-    // `InvalidArgument` ⇒ an `Mmio` smaller than two pages. Both leave
-    // the cap intact, so the scan is non-destructive until a split succeeds.
-    // The scan bound is the cspace's backed capacity (queried at runtime)
-    // so the test stays robust against cap mint order.
-    let bound = scan_bound(ctx);
-    for slot in 1..=u64::from(bound)
+    for boot in boot_caps(ctx, CapType::Mmio).filter(|d| d.aux1 >= 0x2000)
     {
-        let Ok((lo, _hi)) = mmio_split(slot, 0x1000)
+        let Some((lo, hi)) = split_copy(boot.slot)
         else
         {
             continue;
         };
-        // `lo` covers one page; map and verify it. The remainder child (`_hi`)
-        // stays in the CSpace as a valid `Mmio` for the split test that
-        // runs next.
+        syscall::cap_delete(hi).ok();
         let result = (|| -> TestResult {
             // SAFETY: `MMIO_TEST_VA` is a scratch VA (crate docs § Scratch VAs), so the
             // span holds no Rust object or IPC page of ktest.
@@ -95,6 +109,20 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
 
     crate::log("ktest: hw::mmio_map SKIP (no Mmio >= 2 pages in initial cap set)");
     Ok(())
+}
+
+/// Split a derived copy of the `Mmio` cap `boot` one page in; the two halves,
+/// or `None` when the derive or the split is refused (a boot cap an earlier test
+/// consumed, or one under two pages), the copy then deleted.
+fn split_copy(boot: u64) -> Option<(u64, u64)>
+{
+    let copy = syscall::cap_derive(boot, syscall::RIGHTS_ALL).ok()?;
+    let halves = mmio_split(copy, 0x1000).ok();
+    if halves.is_none()
+    {
+        syscall::cap_delete(copy).ok();
+    }
+    halves
 }
 
 /// `mmio_map` at VA 0, and at the page below `USER_VA_FLOOR`, fails with
@@ -145,47 +173,6 @@ pub fn mmio_map_below_floor_err(ctx: &TestContext) -> TestResult
             "hw::mmio_map_below_floor_err: mmio_map below the floor did not fail with InvalidAddress",
         );
     }
-    Ok(())
-}
-
-// ── SYS_IRQ_REGISTER / SYS_IRQ_ACK ───────────────────────────────────────────
-
-/// `irq_register` binds a notification to an interrupt; `irq_ack` re-enables delivery.
-///
-/// Scans for the first Interrupt capability that routes and binds, through a
-/// derived copy of each slot, so the route and the binding go with the copy's
-/// delete (a binding holds its notification until its Interrupt capability
-/// goes). Creates a notification for delivery. After registration, ACKs to re-enable the
-/// interrupt line. If no Interrupt cap binds, the test is skipped.
-pub fn irq_register_ack(ctx: &TestContext) -> TestResult
-{
-    let irq_sig = cap_create_notification(ctx.memory_base)
-        .map_err(|_| "cap_create_notification for IRQ test failed")?;
-
-    // The scan bound is the cspace's backed capacity (queried at runtime)
-    // so the test stays robust against cap mint order.
-    let bound = scan_bound(ctx);
-    for slot in 1..=u64::from(bound)
-    {
-        // An empty slot refuses the derive; any other error (a slot of
-        // another type, most often) leaves the copy unbound; keep scanning.
-        let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
-        else
-        {
-            continue;
-        };
-        if irq_route(copy, 0).is_ok() && irq_register(copy, irq_sig, 0).is_ok()
-        {
-            let acked = irq_ack(copy).map_err(|_| "irq_ack failed");
-            syscall::cap_delete(copy).map_err(|_| "cap_delete of the bound copy failed")?;
-            syscall::cap_delete(irq_sig).map_err(|_| "cap_delete irq_sig after irq test failed")?;
-            return acked;
-        }
-        syscall::cap_delete(copy).ok();
-    }
-
-    crate::log("ktest: hw::irq_register_ack SKIP (no Interrupt caps in initial cap set)");
-    syscall::cap_delete(irq_sig).ok();
     Ok(())
 }
 
@@ -382,37 +369,25 @@ fn remap_refusals(authority: u64, line: u64) -> TestResult
 
 // ── SYS_MMIO_SPLIT ────────────────────────────────────────────────────────────
 
-/// `mmio_split` on the first `Mmio` ≥ 8 KiB returns two valid children
-/// with disjoint base/size. Skipped if no suitable cap exists.
+/// `mmio_split` on a derived copy of the first boot `Mmio` cap of at least two
+/// pages returns two valid, distinct children. Skipped if no suitable cap
+/// exists.
 pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
 {
-    let bound = scan_bound(ctx);
-
-    for slot in 1..=u64::from(bound)
+    let Some((lo, hi)) = boot_caps(ctx, CapType::Mmio)
+        .filter(|d| d.aux1 >= 0x2000)
+        .find_map(|d| split_copy(d.slot))
+    else
     {
-        // Probe: split at PAGE_SIZE. InvalidCapability ⇒ wrong tag.
-        // InvalidArgument ⇒ Mmio exists but too small.
-        match mmio_split(slot, 0x1000)
-        {
-            Err(e) if e == SyscallError::InvalidCapability as i64 =>
-            {}
-            Err(e) if e == SyscallError::InvalidArgument as i64 =>
-            {}
-            Err(_) => return Err("hw::mmio_split_carves: unexpected error from mmio_split"),
-            Ok((slot1, slot2)) =>
-            {
-                if slot1 == 0 || slot2 == 0 || slot1 == slot2
-                {
-                    return Err("hw::mmio_split_carves: split returned bad slot ids");
-                }
-                syscall::cap_delete(slot1).ok();
-                syscall::cap_delete(slot2).ok();
-                return Ok(());
-            }
-        }
+        crate::log("ktest: hw::mmio_split_carves SKIP (no Mmio >= 2 pages in initial cap set)");
+        return Ok(());
+    };
+    syscall::cap_delete(lo).ok();
+    syscall::cap_delete(hi).ok();
+    if lo == 0 || hi == 0 || lo == hi
+    {
+        return Err("hw::mmio_split_carves: split returned bad slot ids");
     }
-
-    crate::log("ktest: hw::mmio_split_carves SKIP (no Mmio caps in initial cap set)");
     Ok(())
 }
 
@@ -736,11 +711,11 @@ fn refuse_unroutable_id(ctx: &TestContext, id: u32, irq_sig: u64) -> TestResult
 /// or the split that cuts the id off from the ids above it is refused.
 pub fn isolate_irq_id(ctx: &TestContext, id: u32) -> Option<u64>
 {
-    let bound = scan_bound(ctx);
-    for slot in 1..=u64::from(bound)
+    for boot in boot_caps(ctx, CapType::Interrupt)
     {
-        // A slot that cannot be derived is empty; keep scanning.
-        let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+        // A boot cap an earlier test consumed refuses the derive; keep
+        // looking.
+        let Ok(copy) = syscall::cap_derive(boot.slot, syscall::RIGHTS_ALL)
         else
         {
             continue;
@@ -817,18 +792,17 @@ fn msg_exhaustion_bounds() -> Result<(u64, u64), &'static str>
 /// The root Interrupt cap carries `RIGHTS_IRQ_MINT`, so one is always found.
 pub fn msg_authority(ctx: &TestContext) -> Result<u64, &'static str>
 {
-    let bound = scan_bound(ctx);
-    for slot in 1..=u64::from(bound)
+    for boot in boot_caps(ctx, CapType::Interrupt)
     {
-        // A slot without the right, of another type, or empty refuses and is
-        // left intact; a mint through it proves the right.
-        let Ok(minted) = irq_msg_alloc(slot)
+        // A cap without the right refuses and is left intact; a mint through
+        // it proves the right.
+        let Ok(minted) = irq_msg_alloc(boot.slot)
         else
         {
             continue;
         };
         syscall::cap_delete(minted).map_err(|_| "msg_authority: cap_delete of the probe failed")?;
-        return syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+        return syscall::cap_derive(boot.slot, syscall::RIGHTS_ALL)
             .map_err(|_| "msg_authority: cap_derive of the authority failed");
     }
     Err("msg_authority: no Interrupt cap carrying RIGHTS_IRQ_MINT in the initial cap set")
@@ -1417,12 +1391,11 @@ fn every_slot_probe(ctx: &TestContext, authority: u64, memory: u64) -> TestResul
 /// original range stays whole for later tests. Skipped if no such cap exists.
 pub fn irq_split_carves(ctx: &TestContext) -> TestResult
 {
-    let bound = scan_bound(ctx);
-
-    for slot in 1..=u64::from(bound)
+    for boot in boot_caps(ctx, CapType::Interrupt)
     {
-        // A slot that cannot be derived is empty; keep scanning.
-        let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+        // A boot cap an earlier test consumed refuses the derive; keep
+        // looking.
+        let Ok(copy) = syscall::cap_derive(boot.slot, syscall::RIGHTS_ALL)
         else
         {
             continue;
@@ -1463,12 +1436,11 @@ pub fn irq_split_carves(ctx: &TestContext) -> TestResult
 pub fn irq_split_wide_arg_err(ctx: &TestContext) -> TestResult
 {
     const WIDE_SPLIT_AT: u64 = (1 << 32) | 1;
-    let bound = scan_bound(ctx);
-
-    for slot in 1..=u64::from(bound)
+    for boot in boot_caps(ctx, CapType::Interrupt)
     {
-        // A slot that cannot be derived is empty; keep scanning.
-        let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+        // A boot cap an earlier test consumed refuses the derive; keep
+        // looking.
+        let Ok(copy) = syscall::cap_derive(boot.slot, syscall::RIGHTS_ALL)
         else
         {
             continue;

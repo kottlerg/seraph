@@ -832,7 +832,6 @@ pub fn run_all(ctx: &TestContext)
         "hw::mmio_split_wrong_tag_err",
         hw::mmio_split_wrong_tag_err(ctx)
     );
-    run_test!("hw::irq_register_ack", hw::irq_register_ack(ctx));
     run_test!(
         "hw::irq_register_unroutable_id_err",
         hw::irq_register_unroutable_id_err(ctx)

@@ -240,8 +240,13 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  74  SYS_CAP_BIND_SOLE_REFERENCE
 ```
 
-**Implementation status.** Every number 0–74 has a handler; unallocated numbers
-return `UnknownSyscall`.
+**Implementation status.** Every number 0–74 has a handler; every number at or past
+`SYSCALL_NR_BOUND` (75) returns `UnknownSyscall`. The kernel refuses a number at or past the
+bound, then selects the handler with one `match` on the number, clamped as data
+([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and calls
+it directly. The `match` and a build-time check of its numbers come from one list
+(`syscall_handlers!` in `syscall/mod.rs`). A list that leaves a number below the bound without a
+handler, gives one two, or names one at or past the bound fails the kernel's build.
 
 ---
 

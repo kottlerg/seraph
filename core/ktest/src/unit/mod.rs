@@ -15,6 +15,7 @@ pub mod boot_reclaim;
 pub mod cap;
 pub mod cap_info;
 pub mod crypto;
+pub mod dispatch;
 pub mod entropy;
 pub mod event;
 pub mod fpu;
@@ -56,6 +57,20 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "boot_reclaim::drained_ram_frames_are_zero",
         boot_reclaim::drained_ram_frames_are_zero(ctx)
+    );
+
+    // ── Syscall dispatch ──────────────────────────────────────────────────────
+    run_test!(
+        "dispatch::table_edges_reach_their_handlers",
+        dispatch::table_edges_reach_their_handlers(ctx)
+    );
+    run_test!(
+        "dispatch::number_reaches_its_own_handler",
+        dispatch::number_reaches_its_own_handler(ctx)
+    );
+    run_test!(
+        "dispatch::numbers_past_the_bound_are_unknown",
+        dispatch::numbers_past_the_bound_are_unknown(ctx)
     );
 
     // ── Capability syscalls ───────────────────────────────────────────────────

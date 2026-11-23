@@ -17,7 +17,7 @@
 //! 1. Add the constant to `abi/syscall/src/lib.rs`, and raise
 //!    `SYSCALL_NR_BOUND` there when the new number is at or above it.
 //! 2. Add a handler function in the appropriate `syscall/` submodule.
-//! 3. Add a `match` arm in `dispatch_in_range` below.
+//! 3. Add its line to the `syscall_handlers!` list below.
 
 pub mod cap;
 pub mod entropy;
@@ -529,93 +529,162 @@ unsafe fn finish_syscall_work(exit: SyscallExit)
     }
 }
 
-/// The syscall handler table: call the handler of `nr`, which
-/// [`dispatch`] has refused past [`SYSCALL_NR_BOUND`] and clamped as data.
-/// The restartable handlers return their own error type; every other handler's
-/// error is [`RestartableError::Failed`].
+/// The result of one handler call in `dispatch_in_range`: a restartable
+/// handler's as it is, any other's with its error as
+/// [`RestartableError::Failed`].
 #[cfg(not(test))]
-fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, RestartableError>
-{
-    let ret = match nr
-    {
-        SYS_IPC_CALL => ipc::sys_ipc_call(tf),
-        SYS_IPC_REPLY => ipc::sys_ipc_reply(tf),
-        SYS_IPC_RECV => ipc::sys_ipc_recv(tf),
-        SYS_NOTIFICATION_SEND => ipc::sys_notification_send(tf),
-        SYS_NOTIFICATION_WAIT => ipc::sys_notification_wait(tf),
-        SYS_CAP_CREATE_ENDPOINT => cap::sys_cap_create_endpoint(tf),
-        SYS_CAP_CREATE_NOTIFICATION => cap::sys_cap_create_notification(tf),
-        SYS_CAP_CREATE_ASPACE => cap::sys_cap_create_aspace(tf),
-        SYS_CAP_CREATE_CSPACE => cap::sys_cap_create_cspace(tf),
-        SYS_CAP_CREATE_THREAD => cap::sys_cap_create_thread(tf),
-        SYS_CAP_COPY => cap::sys_cap_copy(tf),
-        SYS_CAP_DERIVE => cap::sys_cap_derive(tf),
-        SYS_CAP_DELETE => cap::sys_cap_delete(tf),
-        SYS_CAP_REVOKE => cap::sys_cap_revoke(tf),
-        SYS_CAP_MOVE => cap::sys_cap_move(tf),
-        SYS_MEM_MAP => mem::sys_mem_map(tf),
-        SYS_MEM_UNMAP => mem::sys_mem_unmap(tf),
-        SYS_MEM_PROTECT => mem::sys_mem_protect(tf),
-        SYS_MEMORY_SPLIT => mem::sys_memory_split(tf),
-        SYS_MEMORY_MERGE => mem::sys_memory_merge(tf),
-        SYS_THREAD_CONFIGURE => thread::sys_thread_configure(tf),
-        SYS_THREAD_START => thread::sys_thread_start(tf),
-        SYS_THREAD_STOP => thread::sys_thread_stop(tf),
-        SYS_THREAD_SET_PRIORITY => thread::sys_thread_set_priority(tf),
-        SYS_THREAD_SET_AFFINITY => thread::sys_thread_set_affinity(tf),
-        SYS_THREAD_READ_REGS => return thread::sys_thread_read_regs(tf),
-        SYS_THREAD_WRITE_REGS => return thread::sys_thread_write_regs(tf),
-        SYS_THREAD_READ_MEM => return thread::sys_thread_read_mem(tf),
-        SYS_THREAD_WRITE_MEM => return thread::sys_thread_write_mem(tf),
-        SYS_THREAD_SET_FAULT_HANDLER => thread::sys_thread_set_fault_handler(tf),
-        SYS_THREAD_GET_FAULT_HANDLER => thread::sys_thread_get_fault_handler(tf),
-        SYS_THREAD_INHERIT_FAULT_HANDLER => thread::sys_thread_inherit_fault_handler(tf),
-        SYS_THREAD_POST_UPCALL => thread::sys_thread_post_upcall(tf),
-        SYS_THREAD_SET_UPCALL_MASK => thread::sys_thread_set_upcall_mask(tf),
-        SYS_IPC_BUFFER_SET => sys_ipc_buffer_set(tf),
-        SYS_THREAD_YIELD => sys_yield(tf),
-        SYS_THREAD_EXIT => sys_exit(tf),
-        SYS_ASPACE_EXIT => sys_aspace_exit(tf),
-        SYS_SYSTEM_INFO => sysinfo::sys_system_info(tf),
-        SYS_ASPACE_QUERY => sysinfo::sys_aspace_query(tf),
-        SYS_GETRANDOM => return entropy::sys_getrandom(tf),
-        SYS_EVENT_POST => ipc::sys_event_post(tf),
-        SYS_EVENT_RECV => ipc::sys_event_recv(tf),
-        SYS_CAP_CREATE_EVENT_Q => cap::sys_cap_create_event_queue(tf),
-        SYS_CAP_CREATE_WAIT_SET => cap::sys_cap_create_wait_set(tf),
-        SYS_WAIT_SET_ADD => ipc::sys_wait_set_add(tf),
-        SYS_WAIT_SET_REMOVE => ipc::sys_wait_set_remove(tf),
-        SYS_WAIT_SET_WAIT => ipc::sys_wait_set_wait(tf),
-        SYS_IRQ_ACK => hw::sys_irq_ack(tf),
-        SYS_IRQ_REGISTER => hw::sys_irq_register(tf),
-        SYS_MMIO_MAP => hw::sys_mmio_map(tf),
-        SYS_IOPORT_BIND => hw::sys_ioport_bind(tf),
-        SYS_MMIO_SPLIT => hw::sys_mmio_split(tf),
-        SYS_IRQ_SPLIT => hw::sys_irq_split(tf),
-        SYS_IOPORT_SPLIT => hw::sys_ioport_split(tf),
-        SYS_SCHED_SPLIT => thread::sys_sched_split(tf),
-        SYS_SBI_CALL => sbi::sys_sbi_call(tf),
-        SYS_THREAD_SLEEP => sys_thread_sleep(tf),
-        SYS_THREAD_BIND_NOTIFICATION => sys_thread_bind_notification(tf),
-        SYS_ASPACE_BIND_NOTIFICATION => sys_aspace_bind_notification(tf),
-        SYS_CAP_DERIVE_BADGE => cap::sys_cap_derive_badge(tf),
-        SYS_CAP_INFO => cap::sys_cap_info(tf),
-        SYS_IRQ_MSG_ALLOC => hw::sys_irq_msg_alloc(tf),
-        SYS_IRQ_ROUTE => hw::sys_irq_route(tf),
-        SYS_IRQ_REMAP => hw::sys_irq_remap(tf),
-        SYS_ENTROPY_CONTRIBUTE => return entropy::sys_entropy_contribute(tf),
-        SYS_ASPACE_HARVEST => return mem::sys_aspace_harvest(tf),
-        SYS_THREAD_LIST_PAGES => return thread::sys_thread_list_pages(tf),
-        SYS_THREAD_READ_EXT_REGS => return thread::sys_thread_read_ext_regs(tf),
-        SYS_ENDPOINT_BADGE => cap::sys_endpoint_badge(tf),
-        SYS_MMIO_MERGE => hw::sys_mmio_merge(tf),
-        SYS_ASPACE_HOLD => mem::sys_aspace_hold(tf),
-        SYS_ASPACE_RELEASE => mem::sys_aspace_release(tf),
-        SYS_ENDPOINT_IDENTIFY => cap::sys_endpoint_identify(tf),
-        SYS_CAP_BIND_SOLE_REFERENCE => cap::sys_cap_bind_sole_reference(tf),
-        _ => Err(SyscallError::UnknownSyscall),
+macro_rules! handler_result {
+    (restartable $call:expr) => {
+        $call
     };
-    ret.map_err(RestartableError::Failed)
+    (plain $call:expr) => {
+        $call.map_err(RestartableError::Failed)
+    };
+}
+
+/// The syscall handlers, one `number => kind handler` line each, from which
+/// one list defines `dispatch_in_range` and the build-time check of its
+/// numbers ([`check_syscall_numbers`]).
+#[cfg(not(test))]
+macro_rules! syscall_handlers {
+    ($($nr:ident => $kind:ident $handler:path,)*) => {
+        /// The syscall handler table: call the handler of `nr`, which
+        /// [`dispatch`] has refused past [`SYSCALL_NR_BOUND`] and clamped as
+        /// data. Each handler is a direct call. The restartable handlers return
+        /// their own error type; every other handler's error is
+        /// [`RestartableError::Failed`].
+        fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, RestartableError>
+        {
+            match nr
+            {
+                $($nr => handler_result!($kind $handler(tf)),)*
+                _ => Err(RestartableError::Failed(SyscallError::UnknownSyscall)),
+            }
+        }
+
+        const _: () = check_syscall_numbers(&[$($nr),*], SYSCALL_NR_BOUND);
+    };
+}
+
+#[cfg(not(test))]
+syscall_handlers! {
+    SYS_IPC_CALL => plain ipc::sys_ipc_call,
+    SYS_IPC_REPLY => plain ipc::sys_ipc_reply,
+    SYS_IPC_RECV => plain ipc::sys_ipc_recv,
+    SYS_NOTIFICATION_SEND => plain ipc::sys_notification_send,
+    SYS_NOTIFICATION_WAIT => plain ipc::sys_notification_wait,
+    SYS_CAP_CREATE_ENDPOINT => plain cap::sys_cap_create_endpoint,
+    SYS_CAP_CREATE_NOTIFICATION => plain cap::sys_cap_create_notification,
+    SYS_CAP_CREATE_ASPACE => plain cap::sys_cap_create_aspace,
+    SYS_CAP_CREATE_CSPACE => plain cap::sys_cap_create_cspace,
+    SYS_CAP_CREATE_THREAD => plain cap::sys_cap_create_thread,
+    SYS_CAP_COPY => plain cap::sys_cap_copy,
+    SYS_CAP_DERIVE => plain cap::sys_cap_derive,
+    SYS_CAP_DELETE => plain cap::sys_cap_delete,
+    SYS_CAP_REVOKE => plain cap::sys_cap_revoke,
+    SYS_CAP_MOVE => plain cap::sys_cap_move,
+    SYS_MEM_MAP => plain mem::sys_mem_map,
+    SYS_MEM_UNMAP => plain mem::sys_mem_unmap,
+    SYS_MEM_PROTECT => plain mem::sys_mem_protect,
+    SYS_MEMORY_SPLIT => plain mem::sys_memory_split,
+    SYS_MEMORY_MERGE => plain mem::sys_memory_merge,
+    SYS_THREAD_CONFIGURE => plain thread::sys_thread_configure,
+    SYS_THREAD_START => plain thread::sys_thread_start,
+    SYS_THREAD_STOP => plain thread::sys_thread_stop,
+    SYS_THREAD_SET_PRIORITY => plain thread::sys_thread_set_priority,
+    SYS_THREAD_SET_AFFINITY => plain thread::sys_thread_set_affinity,
+    SYS_THREAD_READ_REGS => restartable thread::sys_thread_read_regs,
+    SYS_THREAD_WRITE_REGS => restartable thread::sys_thread_write_regs,
+    SYS_THREAD_READ_MEM => restartable thread::sys_thread_read_mem,
+    SYS_THREAD_WRITE_MEM => restartable thread::sys_thread_write_mem,
+    SYS_THREAD_SET_FAULT_HANDLER => plain thread::sys_thread_set_fault_handler,
+    SYS_THREAD_GET_FAULT_HANDLER => plain thread::sys_thread_get_fault_handler,
+    SYS_THREAD_INHERIT_FAULT_HANDLER => plain thread::sys_thread_inherit_fault_handler,
+    SYS_THREAD_POST_UPCALL => plain thread::sys_thread_post_upcall,
+    SYS_THREAD_SET_UPCALL_MASK => plain thread::sys_thread_set_upcall_mask,
+    SYS_IPC_BUFFER_SET => plain sys_ipc_buffer_set,
+    SYS_THREAD_YIELD => plain sys_yield,
+    SYS_THREAD_EXIT => plain sys_exit,
+    SYS_ASPACE_EXIT => plain sys_aspace_exit,
+    SYS_SYSTEM_INFO => plain sysinfo::sys_system_info,
+    SYS_ASPACE_QUERY => plain sysinfo::sys_aspace_query,
+    SYS_GETRANDOM => restartable entropy::sys_getrandom,
+    SYS_EVENT_POST => plain ipc::sys_event_post,
+    SYS_EVENT_RECV => plain ipc::sys_event_recv,
+    SYS_CAP_CREATE_EVENT_Q => plain cap::sys_cap_create_event_queue,
+    SYS_CAP_CREATE_WAIT_SET => plain cap::sys_cap_create_wait_set,
+    SYS_WAIT_SET_ADD => plain ipc::sys_wait_set_add,
+    SYS_WAIT_SET_REMOVE => plain ipc::sys_wait_set_remove,
+    SYS_WAIT_SET_WAIT => plain ipc::sys_wait_set_wait,
+    SYS_IRQ_ACK => plain hw::sys_irq_ack,
+    SYS_IRQ_REGISTER => plain hw::sys_irq_register,
+    SYS_MMIO_MAP => plain hw::sys_mmio_map,
+    SYS_IOPORT_BIND => plain hw::sys_ioport_bind,
+    SYS_MMIO_SPLIT => plain hw::sys_mmio_split,
+    SYS_IRQ_SPLIT => plain hw::sys_irq_split,
+    SYS_IOPORT_SPLIT => plain hw::sys_ioport_split,
+    SYS_SCHED_SPLIT => plain thread::sys_sched_split,
+    SYS_SBI_CALL => plain sbi::sys_sbi_call,
+    SYS_THREAD_SLEEP => plain sys_thread_sleep,
+    SYS_THREAD_BIND_NOTIFICATION => plain sys_thread_bind_notification,
+    SYS_ASPACE_BIND_NOTIFICATION => plain sys_aspace_bind_notification,
+    SYS_CAP_DERIVE_BADGE => plain cap::sys_cap_derive_badge,
+    SYS_CAP_INFO => plain cap::sys_cap_info,
+    SYS_IRQ_MSG_ALLOC => plain hw::sys_irq_msg_alloc,
+    SYS_IRQ_ROUTE => plain hw::sys_irq_route,
+    SYS_IRQ_REMAP => plain hw::sys_irq_remap,
+    SYS_ENTROPY_CONTRIBUTE => restartable entropy::sys_entropy_contribute,
+    SYS_ASPACE_HARVEST => restartable mem::sys_aspace_harvest,
+    SYS_THREAD_LIST_PAGES => restartable thread::sys_thread_list_pages,
+    SYS_THREAD_READ_EXT_REGS => restartable thread::sys_thread_read_ext_regs,
+    SYS_ENDPOINT_BADGE => plain cap::sys_endpoint_badge,
+    SYS_MMIO_MERGE => plain hw::sys_mmio_merge,
+    SYS_ASPACE_HOLD => plain mem::sys_aspace_hold,
+    SYS_ASPACE_RELEASE => plain mem::sys_aspace_release,
+    SYS_ENDPOINT_IDENTIFY => plain cap::sys_endpoint_identify,
+    SYS_CAP_BIND_SOLE_REFERENCE => plain cap::sys_cap_bind_sole_reference,
+}
+
+/// Check the numbers of the syscall handler list against `bound`
+/// (`SYSCALL_NR_BOUND`): each is below it, and each number below it appears
+/// once, as abi/syscall assigns every number below the bound.
+///
+/// # Panics
+/// When a number is at or past `bound`, appears twice, or, below `bound`, is
+/// missing; in the `const` item `syscall_handlers!` defines that is a build
+/// error.
+#[expect(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "evaluated at build time, where `.get` and iterators are unavailable in a \
+              `const fn` and a panic is a build error: `i` stays below `numbers.len()`, and \
+              `nr` below `bound`"
+)]
+const fn check_syscall_numbers(numbers: &[u64], bound: u64)
+{
+    let mut i = 0;
+    while i < numbers.len()
+    {
+        assert!(numbers[i] < bound, "syscall number at or past its bound");
+        i += 1;
+    }
+    let mut nr = 0;
+    while nr < bound
+    {
+        let mut count = 0;
+        let mut i = 0;
+        while i < numbers.len()
+        {
+            if numbers[i] == nr
+            {
+                count += 1;
+            }
+            i += 1;
+        }
+        assert!(count != 0, "syscall number below its bound with no handler");
+        assert!(count == 1, "syscall number with two handlers");
+        nr += 1;
+    }
 }
 
 // ── Thread syscall handlers ───────────────────────────────────────────────────
@@ -1554,6 +1623,39 @@ mod exit_code_tests
         assert_eq!(encode_exit_code(u32::MAX), EXIT_FAULT_BASE - 1);
         assert_ne!(encode_exit_code(u32::MAX), EXIT_VOLUNTARY);
         assert!(encode_exit_code(u32::MAX) < EXIT_FAULT_BASE);
+    }
+}
+
+#[cfg(test)]
+mod check_syscall_numbers_tests
+{
+    use super::check_syscall_numbers;
+
+    #[test]
+    fn every_number_below_the_bound_once_passes_in_any_order()
+    {
+        check_syscall_numbers(&[2, 0, 1], 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "syscall number at or past its bound")]
+    fn a_number_at_the_bound_is_refused()
+    {
+        check_syscall_numbers(&[0, 1, 2, 3], 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "syscall number with two handlers")]
+    fn a_number_with_two_handlers_is_refused()
+    {
+        check_syscall_numbers(&[0, 1, 1, 2], 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "syscall number below its bound with no handler")]
+    fn a_number_below_the_bound_with_no_handler_is_refused()
+    {
+        check_syscall_numbers(&[0, 2], 3);
     }
 }
 

@@ -33,6 +33,7 @@
 //! `stdio::stdio_init` build `Pipe` instances directly via
 //! `Pipe::create_for_child` / `Pipe::attach_from_caps`.
 
+use crate::cell::Cell;
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::os::seraph::{current_ipc_buf, try_startup_info};
@@ -51,6 +52,42 @@ pub const RING_CAPACITY: u32 = 2048;
 /// [`RING_CAPACITY`].
 const BAD_RING: io::Error =
     io::const_error!(io::ErrorKind::InvalidData, "seraph pipe: ring header capacity mismatch");
+
+// The notifications the calling thread's pipe ends have sent
+// ([`notification_sends`]).
+#[thread_local]
+// restore: none
+static NOTIFICATION_SENDS: Cell<u64> = Cell::new(0);
+
+// The waits the calling thread's pipe ends have made ready for ([`waits`]).
+#[thread_local]
+// restore: none
+static WAITS: Cell<u64> = Cell::new(0);
+
+/// The notifications the calling thread's pipe ends have sent, a read's or a
+/// write's doorbell and a close's kick alike
+/// (`std::os::seraph::pipe::notification_sends`).
+pub(crate) fn notification_sends() -> u64 {
+    NOTIFICATION_SENDS.get()
+}
+
+/// The times the calling thread's pipe ends found their ring empty (a reader)
+/// or full (a writer) and made ready to block for the peer
+/// (`std::os::seraph::pipe::waits`).
+pub(crate) fn waits() -> u64 {
+    WAITS.get()
+}
+
+/// Send one notification on `cap` for a pipe end, counted.
+fn ring_doorbell(cap: u64) {
+    NOTIFICATION_SENDS.set(NOTIFICATION_SENDS.get().wrapping_add(1));
+    let _ = syscall::notification_send(cap, 1);
+}
+
+/// Count one wait a pipe end made ready for.
+fn count_wait() {
+    WAITS.set(WAITS.get().wrapping_add(1));
+}
 
 // Ring VAs come from the process's page-reservation arena
 // (`sys::reserve::seraph`), so they inherit the arena's per-process
@@ -595,7 +632,7 @@ impl Pipe {
             let n = reader.read(buf);
             if n > 0 {
                 // Wake any blocked writer that's waiting for space.
-                let _ = syscall::notification_send(self.space_notification, 1);
+                ring_doorbell(self.space_notification);
                 return Ok(n);
             }
             if eof {
@@ -611,6 +648,7 @@ impl Pipe {
             // and restarted, or interrupted by an upcall) re-checks the ring.
             // Any other wait error means the notification cap itself is gone
             // (teardown raced us); surface EOF rather than spin on a dead cap.
+            count_wait();
             match syscall::notification_wait(self.data_notification) {
                 Ok(_) => {}
                 Err(e) if e == SyscallError::Interrupted as i64 => {}
@@ -684,7 +722,7 @@ impl Pipe {
             let n = writer.write(buf);
             if n > 0 {
                 // Wake any blocked reader.
-                let _ = syscall::notification_send(self.data_notification, 1);
+                ring_doorbell(self.data_notification);
                 return Ok(n);
             }
             if self.space_notification == 0 {
@@ -696,6 +734,7 @@ impl Pipe {
             // and restarted, or interrupted by an upcall) re-checks the ring.
             // Any other wait error means the notification cap itself is gone;
             // report the pipe as broken rather than spin on a dead cap.
+            count_wait();
             match syscall::notification_wait(self.space_notification) {
                 Ok(_) => {}
                 Err(e) if e == SyscallError::Interrupted as i64 => {}
@@ -737,12 +776,12 @@ impl Pipe {
             Role::Reader =>
             {
                 // Wake writer (it's waiting on space_notification).
-                let _ = syscall::notification_send(self.space_notification, 1);
+                ring_doorbell(self.space_notification);
             }
             Role::Writer =>
             {
                 // Wake reader (it's waiting on data_notification).
-                let _ = syscall::notification_send(self.data_notification, 1);
+                ring_doorbell(self.data_notification);
             }
         }
     }

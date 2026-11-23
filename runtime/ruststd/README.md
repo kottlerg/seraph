@@ -680,6 +680,24 @@ receive an upcall or a thread stop cancels took no request, and is received agai
 
 ---
 
+## Pipes
+
+A pipe, behind `Stdio::piped()`, a child's piped standard streams, or a session stream, is one page
+both ends map, holding the single-producer, single-consumer byte ring of
+[shared/shmem](../../shared/shmem/README.md), and two notifications: the data notification, which
+a reader that finds the ring empty waits on and the writer rings, and the space notification, which
+a writer that finds the ring full waits on and the reader rings. A write that moves bytes rings the
+data notification, and a read that moves bytes rings the space notification. A close sets the
+ring's `closed` flag and rings the peer, and the spawner's death bridge marks the peer dead and
+rings both notifications, so a reader drains the ring to EOF and a writer fails with `BrokenPipe`.
+
+`std::os::seraph::pipe::notification_sends` counts the notifications the calling thread's pipe
+ends have sent, and `std::os::seraph::pipe::waits` the times they found their ring empty or full
+and made ready to wait; the pipestress tester's doorbell trial reports both
+([programs/pipestress/README.md](../../programs/pipestress/README.md) § Tester).
+
+---
+
 ## Session streams
 
 `std::os::seraph::process::SessionStdio` makes the standard streams of a session's leader for an

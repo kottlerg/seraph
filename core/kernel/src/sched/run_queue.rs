@@ -790,14 +790,13 @@ impl PerCpuScheduler
         // the queues as they were before the link; the store precedes the
         // Release below, so a sample that sees this link's bit reads this
         // episode or a later one.
+        // Rounding up to even advances an odd count by one and leaves an even
+        // one as it is, without a branch.
         if q != IDLE_QUEUE && self.non_empty.load(Ordering::Relaxed) & QUEUED_THREAD_MASK == 0
         {
             let episode = self.backlog_episode.load(Ordering::Relaxed);
-            if episode & 1 == 1
-            {
-                self.backlog_episode
-                    .store(episode.wrapping_add(1), Ordering::Relaxed);
-            }
+            self.backlog_episode
+                .store(episode.wrapping_add(1) & !1, Ordering::Relaxed);
         }
         // Release: publishes the queue write and the increment_load store to the
         // lockless `has_runnable` Acquire (core/kernel/docs/scheduling-internals.md
@@ -872,14 +871,12 @@ impl PerCpuScheduler
             // the backlog ran dry, so the next link starts a new episode.
             // `ne`, read under the lock, is exact, and the store precedes the
             // Release below, which publishes it with the dequeue.
+            // Setting the low bit advances an even count by one and leaves an
+            // odd one as it is, without a branch.
             if q != IDLE_QUEUE && ne & !(1 << q) & QUEUED_THREAD_MASK == 0
             {
                 let episode = self.backlog_episode.load(Ordering::Relaxed);
-                if episode & 1 == 0
-                {
-                    self.backlog_episode
-                        .store(episode.wrapping_add(1), Ordering::Relaxed);
-                }
+                self.backlog_episode.store(episode | 1, Ordering::Relaxed);
             }
             // Release: a later Acquire load that sees this bit cleared has
             // also seen the dequeue store above.

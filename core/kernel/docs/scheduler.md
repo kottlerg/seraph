@@ -681,10 +681,10 @@ Hot-path cost per CPU per tick:
   makes one Relaxed load of each CPU's load, and one load of the victim's run-queue mask and
   backlog episode, for the re-check.
 - `link`, under the run-queue lock it already holds: one Relaxed load of the run-queue mask
-  and, when the queues hold no thread but the idle thread, one Relaxed load of the episode and,
-  when it starts a backlog episode, a Relaxed store of it. `dequeue_highest`, under the same
-  lock: when its dequeue leaves no thread but the idle thread queued, one Relaxed load and
-  store of the episode.
+  and, when the queues hold no thread but the idle thread, one Relaxed load and store of the
+  episode, rounded up to even without a branch. `dequeue_highest`, under the same lock: when its
+  dequeue leaves no thread but the idle thread queued, one Relaxed load and store of the
+  episode, its low bit set.
 
 ### Placement Counters
 

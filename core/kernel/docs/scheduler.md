@@ -561,12 +561,13 @@ the outcomes that cost no tick still cost none, since a pull above the threshold
 
 The rule stays bounded: only an idle CPU pulls below the threshold, and a pull leaves it busy, so
 two busy CPUs never trade threads (the steady state the threshold protects); a busy CPU with nothing
-queued but its idle thread draws no attempt; a backlog that clears between two idle ticks, even one
-that forms again, stays with the CPU whose caches hold it; and a backlog of pinned threads, which no
-pull can take, draws at most one try-lock attempt per idle CPU every two ticks (three for an idle
-CPU with a busy SMT sibling) while its load reads at or below the threshold (above it, one per idle
-CPU every tick, and two in a tick whose pull above the threshold moves nothing while a candidate is
-confirmed).
+queued but its idle thread draws no attempt; a backlog its CPU's dispatch runs dry between two idle
+ticks, even one that forms again, stays with the CPU whose caches hold it (one that a removal
+empties and a link refills reads as the one before, above); and a backlog of pinned threads, which
+no pull can take, draws at most one try-lock attempt per idle CPU every two ticks (three for an
+idle CPU with a busy SMT sibling) while its load reads at or below the threshold (above it, one per
+idle CPU every tick, and two in a tick whose pull above the threshold moves nothing while a
+candidate is confirmed).
 
 A backlog that drains within a tick is not the pull's to spread: where its threads run is wake
 placement's ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection

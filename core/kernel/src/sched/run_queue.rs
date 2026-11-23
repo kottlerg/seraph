@@ -868,12 +868,11 @@ impl PerCpuScheduler
         }
         if queue.is_empty()
         {
-            // Release: a later Acquire load that sees this bit cleared has
-            // also seen the dequeue store above.
-            let left = self.non_empty.fetch_and(!(1 << q), Ordering::Release) & !(1 << q);
             // The dispatch took the last thread other than the idle thread:
             // the backlog ran dry, so the next link starts a new episode.
-            if q != IDLE_QUEUE && left & QUEUED_THREAD_MASK == 0
+            // `ne`, read under the lock, is exact, and the store precedes the
+            // Release below, which publishes it with the dequeue.
+            if q != IDLE_QUEUE && ne & !(1 << q) & QUEUED_THREAD_MASK == 0
             {
                 let episode = self.backlog_episode.load(Ordering::Relaxed);
                 if episode & 1 == 0
@@ -882,6 +881,9 @@ impl PerCpuScheduler
                         .store(episode.wrapping_add(1), Ordering::Relaxed);
                 }
             }
+            // Release: a later Acquire load that sees this bit cleared has
+            // also seen the dequeue store above.
+            self.non_empty.fetch_and(!(1 << q), Ordering::Release);
         }
         // Clear the single-link tag: the TCB is no longer on any queue.
         // SAFETY: tcb is a valid TCB; owning scheduler.lock held.

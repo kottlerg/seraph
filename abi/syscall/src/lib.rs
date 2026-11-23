@@ -169,9 +169,9 @@ pub const fn wait_set_retype_bytes(capacity: u64) -> u64
 }
 
 /// Raw retype debit of one `EventQueue` of user-visible `capacity` entries and
-/// `observers` death-observer nodes, in bytes: the 24-byte wrapper, the 64-byte
+/// `observers` observer nodes, in bytes: the 24-byte wrapper, the 64-byte
 /// queue state, `capacity + 1` sixteen-byte ring slots (one two-word entry
-/// each), and one 24-byte node per observer, all inline in the retype slot.
+/// each), and one 40-byte node per observer, all inline in the retype slot.
 /// Both counts are ones the kernel accepts (`capacity` in
 /// `1..=EVENT_QUEUE_MAX_CAPACITY`, `observers` in
 /// `0..=EVENT_QUEUE_MAX_CAPACITY`); larger ones whose debit does not fit a
@@ -182,7 +182,7 @@ pub const fn event_queue_retype_bytes(capacity: u64, observers: u64) -> u64
     // The wrapper and the queue state.
     const FIXED: u64 = 24 + 64;
     let ring = capacity.saturating_add(1).saturating_mul(16);
-    let nodes = observers.saturating_mul(24);
+    let nodes = observers.saturating_mul(40);
     FIXED.saturating_add(ring).saturating_add(nodes)
 }
 
@@ -688,11 +688,16 @@ pub const SYS_ASPACE_RELEASE: u64 = 72;
 /// of a capability carrying [`RIGHTS_EP_IDENTIFY`], and nothing else. See
 /// `core/kernel/docs/syscalls.md` § `SYS_ENDPOINT_IDENTIFY` (73).
 pub const SYS_ENDPOINT_IDENTIFY: u64 = 73;
+/// Capability: post `(0, correlator)` to an event queue once, the first time
+/// the kernel finds the object a capability names at one reference after the
+/// bind, or at the object's death. See `core/kernel/docs/syscalls.md`
+/// § `SYS_CAP_BIND_SOLE_REFERENCE` (74).
+pub const SYS_CAP_BIND_SOLE_REFERENCE: u64 = 74;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_ENDPOINT_IDENTIFY + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_CAP_BIND_SOLE_REFERENCE + 1;
 
 /// [`SYS_IRQ_REMAP`] setting (arg1): compatibility formats, a message or an
 /// I/O APIC entry naming its CPU and vector.
@@ -777,7 +782,7 @@ pub enum SyscallError
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full, or the object a new capability or a retype would
-    /// reference already holds 2^31 references). Unlike `OutOfMemory`,
+    /// reference already holds 2^30 references). Unlike `OutOfMemory`,
     /// donating memory (augment mode) cannot satisfy the request.
     QuotaExceeded = -17,
     /// No capability with the Receive right on the endpoint is left, so no
@@ -816,14 +821,14 @@ pub const THREAD_START_SUSPENDED: u64 = 1 << 0;
 
 // ── Event Queue constants ─────────────────────────────────────────────────────
 
-/// Maximum capacity (entry count), and maximum death-observer node count, for
+/// Maximum capacity (entry count), and maximum observer node count, for
 /// an event queue created via `SYS_CAP_CREATE_EVENT_Q`: capacity in
 /// `1..=EVENT_QUEUE_MAX_CAPACITY`, observers in `0..=EVENT_QUEUE_MAX_CAPACITY`.
 ///
 /// The ring and the node pool are caller-funded per queue, so the ceiling
 /// protects no shared pool. It bounds the work one create does in the kernel
 /// before returning, which zeroes the ring and links every node: at 2^20 that
-/// is at most 16 MiB of ring and 24 MiB of nodes. A supervisor that needs more
+/// is at most 16 MiB of ring and 40 MiB of nodes. A supervisor that needs more
 /// splits its observers across queues, so the bound only splits work.
 pub const EVENT_QUEUE_MAX_CAPACITY: u32 = 1 << 20;
 
@@ -2143,10 +2148,10 @@ mod tests
     {
         assert_eq!(wait_set_retype_bytes(1), 24 + 40 + 24 + 8);
         assert_eq!(wait_set_retype_bytes(4), 24 + 40 + 4 * 24 + 16);
-        assert_eq!(event_queue_retype_bytes(1, 1), 24 + 64 + 2 * 16 + 24);
+        assert_eq!(event_queue_retype_bytes(1, 1), 24 + 64 + 2 * 16 + 40);
         assert_eq!(wait_set_retype_bytes(u64::MAX / 24 + 1), u64::MAX);
         assert_eq!(event_queue_retype_bytes(u64::MAX, 0), u64::MAX);
-        assert_eq!(event_queue_retype_bytes(1, u64::MAX / 24 + 1), u64::MAX);
+        assert_eq!(event_queue_retype_bytes(1, u64::MAX / 40 + 1), u64::MAX);
     }
 
     // The defect caught: a top-up whose slot count overflows to a small one.

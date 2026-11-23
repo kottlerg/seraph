@@ -1144,6 +1144,8 @@ Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
 
 ```
 0. drain_deferred_reclaim(cpu)                     // interrupts enabled
+   while sole_reference::work_pending()
+         && !has_runnable() { sole_reference::drain() }  // unmasked; a hint only
 1. Mask interrupts.
 2. has_work = scheduler_ptr(cpu).has_runnable()    // non_empty.load(Acquire)
 3. if has_work {

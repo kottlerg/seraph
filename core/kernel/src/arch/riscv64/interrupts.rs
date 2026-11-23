@@ -446,8 +446,9 @@ unsafe fn clear_sip_ssip()
 /// Main trap dispatch routine, called by `trap_entry` with interrupts disabled
 /// (sstatus.SIE is cleared on trap entry): [`handle_trap`], then, for a trap
 /// taken from U-mode other than an ecall, the return to U-mode: for an
-/// interrupt, its upcall delivery point and the wake-preemption check
-/// (`sched::deliver_and_preempt`), for an exception the check alone
+/// interrupt, a sole-reference drain pass, its upcall delivery point and the
+/// wake-preemption check (`sched::deliver_and_preempt`), for an exception the
+/// check alone
 /// (`sched::preempt_at_exception_return`). An ecall's return is the syscall
 /// exit's (`syscall::finish_syscall`), so a syscall makes it once.
 #[cfg(not(test))]
@@ -473,6 +474,15 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         };
         if scause >> 63 != 0
         {
+            // A pass of the sole-reference posts earlier drains left, so a
+            // hart that runs only user code still makes a pass of at most
+            // POST_BUDGET posts every tick
+            // (core/kernel/docs/capability-internals.md § Sole-Reference
+            // Observers). Before the delivery point and the check, so a
+            // thread a post wakes on this hart is decided at this return.
+            // SAFETY: U-mode origin: the interrupted thread's kernel stack,
+            // the interrupt handled and completed, no lock is held, SIE = 0.
+            unsafe { crate::cap::sole_reference::drain_at_interrupt() };
             // SAFETY: the end of an interrupt from U-mode on the interrupted
             // thread's kernel stack, its frame published; no lock is held,
             // SIE = 0.
@@ -550,8 +560,9 @@ fn handle_trap(frame: *mut TrapFrame)
                 crate::fatal("unhandled interrupt");
             }
         }
-        // The interrupt delivery point of a trap from U-mode is
-        // trap_dispatch's, with the wake-preemption check.
+        // The end of an interrupt from U-mode (the sole-reference drain pass and
+        // the upcall delivery point, with the wake-preemption check) is
+        // trap_dispatch's.
     }
     else if cause_code == 2
         && (sstatus_at_entry & (1 << 8)) == 0

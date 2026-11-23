@@ -755,9 +755,11 @@ A CPU decides at every return to user mode that can follow a link with no wake I
   upcalls ([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
   Upcalls): a self-wake the syscall made, or a wake IPI a preemption-disabled window absorbed;
 - the end of every interrupt taken from user mode (x86-64 `irq_dispatch`, riscv64
-  `trap_dispatch`), after the handler's acknowledgement and the interrupt delivery point of
-  upcalls: the wake IPI of a cross-CPU wake, and the timer, device and TLB-shootdown interrupts,
-  whose handlers can wake a thread on the CPU themselves;
+  `trap_dispatch`), after the handler's acknowledgement, the sole-reference drain pass
+  ([capability-internals.md](capability-internals.md#sole-reference-observers) § Sole-Reference
+  Observers) and the interrupt delivery point of upcalls: the wake IPI of a cross-CPU wake, the
+  timer, device and TLB-shootdown interrupts, whose handlers can wake a thread on the CPU
+  themselves, and the drain's posts, which can too;
 - the end of every exception taken from user mode that resumes the thread (x86-64
   `exception_handler` and `page_fault_handler`, riscv64 `trap_dispatch`): fault delivery can
   link a thread on the CPU and absorb a wake IPI in a preemption-disabled window.
@@ -831,7 +833,11 @@ numbered ordering rules and the "Lock primitive" and "Bare spin locks" paragraph
 Each CPU has one idle thread (priority 0) that runs when no other thread is ready.
 
 Each iteration of `idle_thread_entry` first drains this CPU's deferred-reclaim queue
-(`cap::object::drain_deferred_reclaim`) with interrupts enabled. It then masks interrupts
+(`cap::object::drain_deferred_reclaim`) with interrupts enabled. While its run queues are empty
+and the sole-reference table still has work, it runs further drain passes
+(`cap::sole_reference::drain`), each bounded by `POST_BUDGET`
+([capability-internals.md](capability-internals.md#sole-reference-observers) § Sole-Reference
+Observers). It then masks interrupts
 and checks `has_runnable`. If the run queues hold work, it re-enables interrupts and calls
 `schedule(Requeue::Always)`, then loops. Otherwise it halts through the atomic enable-and-halt
 `arch::current::cpu::halt_until_interrupt`.

@@ -3259,6 +3259,20 @@ pub mod fs {
     pub fn session_for(node_cap: u64) -> crate::io::Result<u64> {
         crate::sys::fs::session_copy(node_cap, super::current_ipc_buf())
     }
+
+    /// The memmgr calls the calling thread has made for the write frames of
+    /// `std::fs::File`: one `REQUEST_MEMORY_CAPS` for each frame a write took
+    /// and one `RELEASE_MEMORY_CAPS` for each frame returned. A `File` takes
+    /// its frame at its first write larger than the inline `FS_WRITE`
+    /// threshold, keeps it across later writes, and returns it when it drops
+    /// (runtime/ruststd/README.md § File write frames). A count that only
+    /// moves up, wrapping; a caller reads the difference across the writes it
+    /// measures.
+    #[must_use]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn write_frame_memmgr_calls() -> u64 {
+        crate::sys::fs::write_frame_memmgr_calls()
+    }
 }
 
 // ── Per-spawn namespace caps (CommandExt) ───────────────────────────────────

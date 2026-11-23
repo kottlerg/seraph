@@ -151,12 +151,7 @@ fn recv_wedge_phase(_: &Caps)
 )]
 fn recv_wedge_thread_phase(_: &Caps)
 {
-    use std::process::Command;
-
-    let mut child = Command::new("/tests/svctest")
-        .arg("recv-wedge-thread")
-        .spawn()
-        .expect("spawn /tests/svctest recv-wedge-thread failed");
+    let mut child = spawn_recv_wedge_thread();
     let id = child.process_handle();
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // A supervisor's observer, bound through procmgr on the child's address
@@ -215,4 +210,14 @@ fn recv_wedge_thread_phase(_: &Caps)
     drop(child);
 
     std::os::seraph::log!("recv_wedge_thread phase passed (exit_reason={raw:#x})");
+}
+
+/// Spawn the `recv-wedge-thread` child. A function of its own, so the
+/// `Command` and its stdio configuration take no room in the phase's frame.
+fn spawn_recv_wedge_thread() -> std::process::Child
+{
+    std::process::Command::new("/tests/svctest")
+        .arg("recv-wedge-thread")
+        .spawn()
+        .expect("spawn /tests/svctest recv-wedge-thread failed")
 }

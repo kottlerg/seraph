@@ -23,11 +23,15 @@
 //!
 //! ## Write path
 //! - Inline writes carry the payload in the IPC buffer.
-//! - Memory-cap writes: one memmgr-allocated page per
-//!   write is mapped MAP_WRITABLE in the caller's address space, filled
-//!   chunk-by-chunk, and lent to the driver as a DMA source through a
-//!   `MAP`-only derivation per chunk; the page's run goes back to memmgr
-//!   once the write ends (see `release_write_frame`).
+//! - Memory-cap writes: each `File` keeps one write frame, a memmgr page
+//!   mapped MAP_WRITABLE in the caller's address space, taken at its first
+//!   memory-cap write and kept across writes. Each chunk is copied into it and
+//!   lent to the driver as a DMA source through a fresh `MAP`-only derivation,
+//!   which is revoked once the reply settles the chunk. The page's run goes
+//!   back to memmgr when the `File` drops (see `release_write_frame`). A
+//!   chunk the driver may still be copying from when its call ends
+//!   ([`ChunkError::Call`]) leaves the frame mapped and charged to the process
+//!   until it exits, and the next write takes a fresh frame.
 //!
 //! ## Directory mutation
 //! `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME` operate against
@@ -89,8 +93,10 @@ use crate::hash::{Hash, Hasher};
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
 pub use crate::sys::fs::common::{Dir, ExtraHomeDirs, ExtraMediaDirs};
-use crate::sync::Arc;
+use crate::boxed::Box;
+use crate::cell::Cell;
 use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::{Arc, Mutex, PoisonError};
 use crate::vec::Vec;
 use crate::sys::time::SystemTime;
 use crate::sys::{unsupported, unsupported_err};
@@ -918,8 +924,9 @@ fn write_inline(
     Ok(written)
 }
 
-/// One write's source frame: a page from memmgr, mapped writable at a
-/// reserved VA for the length of the write.
+/// A `File`'s write source frame: a page from memmgr, mapped writable at a
+/// reserved VA from the `File`'s first memory-cap write until it drops.
+/// One write at a time holds it ([`File::write_frame`]).
 struct WriteFrame
 {
     cap: u64,
@@ -935,19 +942,47 @@ impl WriteFrame
     }
 }
 
+// The memmgr calls the calling thread has made for write frames
+// ([`write_frame_memmgr_calls`]).
+#[thread_local]
+// restore: none
+static WRITE_FRAME_MEMMGR_CALLS: Cell<u64> = Cell::new(0);
+
+/// The memmgr calls the calling thread has made for `File` write frames: one
+/// `REQUEST_MEMORY_CAPS` for each frame it took and one `RELEASE_MEMORY_CAPS`
+/// for each it returned (`std::os::seraph::fs::write_frame_memmgr_calls`).
+pub(crate) fn write_frame_memmgr_calls() -> u64
+{
+    WRITE_FRAME_MEMMGR_CALLS.get()
+}
+
+/// Count one memmgr call made for a write frame.
+fn count_write_frame_call()
+{
+    WRITE_FRAME_MEMMGR_CALLS.set(WRITE_FRAME_MEMMGR_CALLS.get().wrapping_add(1));
+}
+
+/// Return a write frame's run to memmgr by its region id, counted.
+fn release_frame_run(region_id: u64)
+{
+    count_write_frame_call();
+    crate::sys::alloc::seraph::slab_release_fresh(region_id);
+}
+
 /// Request a source frame from memmgr and map it into this process's own
 /// address space `aspace`, funding the page tables the map needs
 /// (`mem_map_funded`). A frame that fails to map was never shown to a driver,
 /// so its cap is deleted and its run returned.
 fn acquire_write_frame(aspace: u64, memmgr_ep: u64) -> io::Result<WriteFrame>
 {
-    use crate::sys::alloc::seraph::{mem_map_funded, slab_release_fresh, slab_request_pages};
+    use crate::sys::alloc::seraph::{mem_map_funded, slab_request_pages};
 
+    count_write_frame_call();
     let (cap, _, region_id) = slab_request_pages(memmgr_ep, 1)
         .ok_or_else(|| io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS failed"))?;
     let range = crate::sys::reserve::reserve_pages(1).map_err(|_| {
         let _ = syscall::cap_delete(cap);
-        slab_release_fresh(region_id);
+        release_frame_run(region_id);
         io::Error::other("seraph fs: reserve_pages failed for write frame")
     })?;
     // SAFETY: `range` is a fresh reservation from the per-process arena,
@@ -959,7 +994,7 @@ fn acquire_write_frame(aspace: u64, memmgr_ep: u64) -> io::Result<WriteFrame>
         // A one-page map that fails maps nothing, so the reservation is free.
         crate::sys::reserve::unreserve_pages(range);
         let _ = syscall::cap_delete(cap);
-        slab_release_fresh(region_id);
+        release_frame_run(region_id);
         return Err(io::Error::other("seraph fs: mem_map MAP_WRITABLE failed"));
     }
     Ok(WriteFrame { cap, region_id, range })
@@ -1017,7 +1052,9 @@ impl Drop for ReadMark<'_>
 /// of the frame past the copy, which services/fs/docs/fs-driver-protocol.md
 /// § Label 12 requires of it; revocation withdraws a derivation the driver
 /// kept but not a mapping it made. A frame whose unmap fails stays mapped,
-/// reserved, and accounted to this process until it exits.
+/// reserved, and accounted to this process until it exits. Called when the
+/// `File` that holds the frame drops, and for a frame a concurrent write of
+/// the same `File` found the slot already refilled for.
 fn release_write_frame(frame: WriteFrame, aspace: u64)
 {
     // SAFETY: the frame owns its reserved page, which holds no Rust object;
@@ -1030,7 +1067,7 @@ fn release_write_frame(frame: WriteFrame, aspace: u64)
     crate::sys::reserve::unreserve_pages(frame.range);
     let _ = syscall::cap_revoke(frame.cap);
     let _ = syscall::cap_delete(frame.cap);
-    crate::sys::alloc::seraph::slab_release_fresh(frame.region_id);
+    release_frame_run(frame.region_id);
 }
 
 /// How one `FS_WRITE_MEMORY` chunk failed.
@@ -1045,20 +1082,25 @@ enum ChunkError
 }
 
 /// Bulk write via `FS_WRITE_MEMORY`: loop chunks of at most `PAGE_SIZE`
-/// bytes through a [`WriteFrame`] acquired for this write and into the
-/// file, then release the frame with [`release_write_frame`]. After a call
-/// interrupted, or ended by the thread's call deadline, once the driver
-/// received it ([`ChunkError::Call`]) the driver may still be copying from
-/// the frame, so it is left mapped and accounted to this process until it
-/// exits instead. A call that ended before the driver received it, or was
-/// not sent under a deadline already passed, leaves the frame idle, and the
-/// frame is released.
+/// bytes through the `File`'s [`WriteFrame`] and into the file. The write
+/// takes the frame out of `slot`, or acquires one from memmgr when the slot is
+/// empty (the `File`'s first memory-cap write, or one beside another of the
+/// same `File`), and puts it back once the write ends with the frame idle;
+/// a frame that finds the slot refilled by a concurrent write is released
+/// with [`release_write_frame`]. After a call interrupted, or ended by the
+/// thread's call deadline, once the driver received it
+/// ([`ChunkError::Call`]) the driver may still be copying from the frame,
+/// so it is left mapped and accounted to this process until it exits instead,
+/// and the next write takes a fresh one. A call that ended before the driver
+/// received it, or was not sent under a deadline already passed, or that the
+/// driver answered, leaves the frame idle.
 ///
 /// Returns the bytes written. An error after some chunks reached the file
 /// returns their count instead, as a short write, so the caller's position
 /// stays in step with the file; the error recurs on the next call.
 fn write_memory_chunks(
     file_cap: u64,
+    slot: &Mutex<Option<Box<WriteFrame>>>,
     aspace: u64,
     memmgr_ep: u64,
     base_offset: u64,
@@ -1066,7 +1108,12 @@ fn write_memory_chunks(
     ipc_buf: *mut u64,
 ) -> io::Result<usize>
 {
-    let frame = acquire_write_frame(aspace, memmgr_ep)?;
+    let kept = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    let frame = match kept
+    {
+        Some(frame) => frame,
+        None => Box::new(acquire_write_frame(aspace, memmgr_ep)?),
+    };
     let mut total: usize = 0;
     let mut error = None;
     let mut frame_idle = true;
@@ -1100,7 +1147,16 @@ fn write_memory_chunks(
     }
     if frame_idle
     {
-        release_write_frame(frame, aspace);
+        let mut held = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.is_none()
+        {
+            *held = Some(frame);
+        }
+        else
+        {
+            drop(held);
+            release_write_frame(*frame, aspace);
+        }
     }
     match error
     {
@@ -1115,9 +1171,9 @@ fn write_memory_chunks(
 /// The driver receives a `MAP`-only derivation of the frame cap, never the
 /// frame cap itself, and returns it as services/fs/docs/fs-driver-protocol.md
 /// § Label 12 requires. Every cap the reply carries is deleted, and so is
-/// the derivation's handle: a handle the request moved away is stale and its
-/// delete fails harmlessly, as docs/capability-model.md § Capability Handle
-/// Format defines, while one the kernel left here is freed.
+/// the derivation's handle: a delete of a handle the request moved away finds
+/// its slot empty and succeeds doing nothing, while one the kernel left here
+/// is freed.
 ///
 /// Returns the bytes written, or `InvalidData` when the driver reports more
 /// than `chunk` holds.
@@ -1164,9 +1220,20 @@ fn write_frame_chunk(
         }
     }
     // The kernel moves the derivation only when the driver receives the
-    // message, so a delete that succeeds finds it still here: the driver never
-    // had the frame.
-    let lent_kept = syscall::cap_delete(lent).is_ok();
+    // message, so a handle that still resolves finds it here: the driver never
+    // had the frame. The delete cannot tell the two apart, since a delete of
+    // the slot the move emptied succeeds as well.
+    let lent_kept = syscall::cap_info(lent, syscall_abi::CAP_INFO_TAG_RIGHTS).is_ok();
+    let _ = syscall::cap_delete(lent);
+    // The frame outlives this chunk, so a derivation the driver received and
+    // kept in breach of § Label 12 is withdrawn once the reply settles the
+    // chunk: the next chunk lends a fresh one. A reply that settled nothing
+    // (`ChunkError::Call`) abandons the frame, and its derivation is left.
+    let lent_away = !lent_kept && reply.is_ok();
+    if lent_away
+    {
+        let _ = syscall::cap_revoke(frame.cap);
+    }
     // `Interrupted` and `WouldBlock` (the thread's call deadline passed) are
     // the errors a call can return after the driver received the message;
     // every other one ends the call before the driver received it: a refusal
@@ -1465,6 +1532,12 @@ pub struct File
     /// memmgr endpoint cap captured at open; used by the write-frame
     /// path to acquire single-page DMA source frames.
     memmgr_ep: u64,
+    /// The write source frame this `File` keeps between memory-cap writes,
+    /// `None` before its first one, while a write holds it, and after a
+    /// write abandoned it ([`write_memory_chunks`]). Returned to memmgr in
+    /// `Drop`. The lock is held only to take or put the frame, never across
+    /// a call.
+    write_frame: Mutex<Option<Box<WriteFrame>>>,
     /// Per-file outstanding-mappings registration in the handler.
     entry: Arc<FileEntry>,
     /// Current read/write offset; advanced by every successful op.
@@ -1608,6 +1681,7 @@ impl File
             badge,
             aspace: info.self_aspace,
             memmgr_ep: info.memmgr_endpoint,
+            write_frame: Mutex::new(None),
             entry,
             pos: AtomicU64::new(initial_pos),
             size: AtomicU64::new(size),
@@ -1979,6 +2053,7 @@ impl File
         {
             write_memory_chunks(
                 self.file_cap,
+                &self.write_frame,
                 self.aspace,
                 self.memmgr_ep,
                 offset,
@@ -2061,6 +2136,13 @@ impl Drop for File
         // map it, but each held page shrinks its cache, so each VA must
         // still be unmapped, its reservation freed, and its cap deleted.
         close_open(self.file_cap, crate::os::seraph::current_ipc_buf());
+
+        // The kept write frame, idle: every write that held it has ended.
+        if let Some(frame) =
+            self.write_frame.get_mut().unwrap_or_else(PoisonError::into_inner).take()
+        {
+            release_write_frame(*frame, self.aspace);
+        }
 
         // Drain the registry entry. A driver release that arrives after
         // unregister, on whichever badge, finds no entry and is acked

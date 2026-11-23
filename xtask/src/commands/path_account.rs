@@ -495,6 +495,9 @@ fn trace(ctx: &Context, args: &PathAccountTraceArgs) -> Result<()>
                  `cargo xtask mkdisk --repack-only`)"
             );
         }
+        // The trace boots, so `main` admitted no build: the plugin's compile
+        // is admitted here, as a build, and the boot after it as a boot.
+        crate::host_lock::admit_build(ctx, &args.host.common)?;
         let plugin = build_plugin(ctx)?;
         let _host = crate::host_lock::admit_boot(ctx, &args.host, 1, 1)?;
         std::fs::create_dir_all(&out_dir)

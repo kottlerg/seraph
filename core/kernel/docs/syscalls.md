@@ -3950,7 +3950,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `MAX_THREAD_MEM_COPY` | 4096 | Most bytes one `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM` or `SYS_THREAD_READ_EXT_REGS` copies |
 | `MAX_PAGE_RUNS` | 128 | Most runs one `SYS_THREAD_LIST_PAGES` writes |
 | `MAX_HARVEST_PAGES` | 4096 | Most pages one `SYS_ASPACE_HARVEST` reports |
-| `BOOT_PROTOCOL_VERSION` | 23 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 24 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
 [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs) crates, which are the

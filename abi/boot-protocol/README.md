@@ -110,7 +110,7 @@ boot-protocol/
 ├── README.md
 └── src/
     ├── lib.rs           # BootInfo and its types, BOOT_PROTOCOL_VERSION, MAX_CPUS, the
-    │                    #   KernelMmio and HART_CAP_* facts, KASLR_* flags
+    │                    #   KernelMmio and HART_CAP_* facts, KASLR_* flags, BootDevice
     ├── bundle.rs        # bootstrap.bundle wire format (header, entries, INIT_ENTRY_NAME)
     ├── layout.rs        # direct-map layout and stack-paint words both bootloader and kernel use
     ├── riscv_paging.rs  # RISC-V paging-mode constants and satp encoding

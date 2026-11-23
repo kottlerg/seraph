@@ -117,7 +117,12 @@
 ///     array after them at [`InitInfo::cap_descriptors_offset`]. Every
 ///     field after `init_info_memory_count` moves. A module's name is the
 ///     install path its signature names.
-pub const INIT_PROTOCOL_VERSION: u32 = 19;
+/// v20: Added `boot_device` ([`InitBootDevice`]) before `framebuffer`: the
+///     device the firmware booted from (the boot ESP's GPT `HardDrive`
+///     descriptor and its controller's PCI location), which the kernel checks
+///     and copies from `BootInfo`. `framebuffer` moves 48 bytes on, and the
+///     boot-module name table and the descriptor array after it.
+pub const INIT_PROTOCOL_VERSION: u32 = 20;
 
 /// Length of [`InitModuleName::name`], matching
 /// `boot_protocol::BOOT_MODULE_NAME_LEN` (256, `objsig::NAME_MAX`) so the
@@ -147,7 +152,7 @@ pub const INIT_STACK_PAGES: usize = 4;
 
 /// Ceiling on the 4 KiB pages of the [`InitInfo`] region (the header, the
 /// boot-module name table, then the [`CapDescriptor`] array): 64 pages hold
-/// 7,484 descriptors past the header and a full name table.
+/// 7,482 descriptors past the header and a full name table.
 ///
 /// The kernel sizes each boot's region from that boot's own counts, one
 /// name per boot module, and one descriptor per coalesced RAM extent, ACPI
@@ -325,6 +330,12 @@ pub struct InitInfo
     /// accounting, never itself a capability.
     pub kernel_reserved_bytes: u64,
 
+    // ── Boot device (added in protocol version 20) ─────────────────────
+    /// The device the firmware booted from ([`InitBootDevice`]), as the
+    /// bootloader reported it and the kernel checked it. init passes it to
+    /// vfsd in vfsd's bootstrap.
+    pub boot_device: InitBootDevice,
+
     // ── Framebuffer geometry (added in protocol version 8) ─────────────
     /// Bootloader-discovered framebuffer geometry. `physical_base == 0`
     /// indicates no framebuffer is present and devmgr skips the
@@ -467,6 +478,52 @@ impl InitFramebufferInfo
     }
 }
 
+/// [`InitBootDevice::flags`] bit 0: the `esp_*` fields hold the boot ESP's
+/// GPT `HardDrive` descriptor. Equals `boot_protocol::BOOT_DEVICE_ESP`.
+pub const INIT_BOOT_DEVICE_ESP: u32 = 1 << 0;
+
+/// [`InitBootDevice::flags`] bit 1: the `pci_*` fields hold the PCI location
+/// of the controller beneath the boot ESP. Equals
+/// `boot_protocol::BOOT_DEVICE_PCI`.
+pub const INIT_BOOT_DEVICE_PCI: u32 = 1 << 1;
+
+/// The device the firmware booted from, forwarded to init.
+///
+/// Mirrors `boot_protocol::BootDevice` field for field, redefined here so
+/// `init-protocol` keeps its zero-dependency invariant; the kernel copies the
+/// bootloader's record into it at Phase 9 after checking it with
+/// `boot_protocol::BootDevice::check`, so a record init reads has only the
+/// two flag bits above, zero reserved bytes, and each part either flagged
+/// present or all zero. A present ESP has a nonzero partition number and
+/// size and an extent inside the 64-bit block range; a present PCI location
+/// has a device number of at most 31 and a function number of at most 7.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InitBootDevice
+{
+    /// Which parts are present: [`INIT_BOOT_DEVICE_ESP`],
+    /// [`INIT_BOOT_DEVICE_PCI`].
+    pub flags: u32,
+    /// The boot ESP's 1-based GPT partition number.
+    pub esp_partition_number: u32,
+    /// The boot ESP's first logical block on its disk.
+    pub esp_start_lba: u64,
+    /// The boot ESP's size in logical blocks.
+    pub esp_size_lba: u64,
+    /// The boot ESP's unique partition GUID, in GPT on-disk byte order.
+    pub esp_partition_guid: [u8; 16],
+    /// PCI segment group of the controller.
+    pub pci_segment: u16,
+    /// PCI bus number of the controller, as the firmware numbered the buses.
+    pub pci_bus: u8,
+    /// PCI device number of the controller.
+    pub pci_device: u8,
+    /// PCI function number of the controller.
+    pub pci_function: u8,
+    /// Zero.
+    pub reserved: [u8; 3],
+}
+
 /// Capability type discriminant for [`CapDescriptor`].
 ///
 /// Discriminant values match the kernel's `CapTag` enum for the types that
@@ -530,7 +587,8 @@ mod tests
     #[test]
     fn init_protocol_struct_sizes_are_stable()
     {
-        assert_eq!(core::mem::size_of::<InitInfo>(), 216);
+        assert_eq!(core::mem::size_of::<InitInfo>(), 264);
+        assert_eq!(core::mem::size_of::<InitBootDevice>(), 48);
         assert_eq!(core::mem::size_of::<InitModuleName>(), 264);
         assert_eq!(core::mem::size_of::<CapDescriptor>(), 32);
     }

@@ -132,6 +132,7 @@ respectively. Files are grouped by kernel subsystem, mirroring the kernel's own 
 | `sysinfo.rs` | `SYS_SYSTEM_INFO`, including each `StackHighWater` class, the `LiveCSpaceCount` id count across a `CSpace` create and delete, the `InstructionCacheSyncs` count ktest's entry reads before it maps anything, which the Phase-9 sync of ktest's own image makes non-zero, and each `SpeculationControls` view: defined bits only on x86-64, `NotSupported` on riscv64, `InvalidArgument` for an unknown view; `smt_sibling_range`: each CPU's `SmtSibling` below `CpuCount`, `InvalidArgument` at `CpuCount` and at `u64::MAX` |
 | `crypto.rs` | Shared `crypto` crate known-answer tests (SHA-512, Ed25519 verify, ChaCha20-Poly1305, Keccak-f[1600] and SHAKE, ML-DSA-65 verify) run on-target (not a syscall surface) |
 | `init_layout.rs` | Kernel init-bootstrap ASLR draws: the `InitInfo` VA, init stack, and PIE image base lie in their windows |
+| `boot_device.rs` | `InitInfo.boot_device` carries the boot ESP's GPT descriptor and its controller's PCI location, both flagged present and in range (not a syscall surface; runs with the boot handover tests) |
 | `boot_reclaim.rs` | Every reclaimable Memory cap over a bootloader reclaim range (page-table frames, `BootInfo`, descriptor arrays, bundle non-module pages, AP trampoline) reads as zero through `SYS_MEM_MAP`, a single-page cap among them, and so does every frame-pool frame of drained RAM (not a syscall surface; runs first) |
 
 Adding a new syscall means adding a section in the appropriate file here.

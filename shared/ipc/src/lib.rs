@@ -229,8 +229,10 @@ pub mod acpid_errors;
 
 /// Wire-protocol version of [`vfsd_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const VFSD_LABELS_VERSION: u32 = 4;
+pub const VFSD_LABELS_VERSION: u32 = 5;
 pub mod vfsd_labels;
+
+pub mod vfsd_bootstrap;
 
 /// Wire-protocol version of [`ns_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.

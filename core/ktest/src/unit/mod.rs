@@ -11,6 +11,7 @@
 //! architecture-specific tests are dispatched is in its § Test structure.
 
 pub mod aspace_hold;
+pub mod boot_device;
 pub mod boot_reclaim;
 pub mod cap;
 pub mod cap_info;
@@ -56,6 +57,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "boot_reclaim::drained_ram_frames_are_zero",
         boot_reclaim::drained_ram_frames_are_zero(ctx)
+    );
+    run_test!(
+        "boot_device::init_info_carries_the_boot_device",
+        boot_device::init_info_carries_the_boot_device(ctx)
     );
 
     // ── Capability syscalls ───────────────────────────────────────────────────

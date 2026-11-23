@@ -162,7 +162,10 @@ Notes on the non-obvious entries:
   accounting facts including `kernel_reserved_bytes` are quantities, not
   addresses (**d**); the only addresses it carries are physical — each
   `CapDescriptor::aux0` for a Memory/Mmio cap and `InitFramebufferInfo::physical_base`
-  (**e**, see "Physical-address surfaces"). No field is a kernel VA.
+  (**e**, see "Physical-address surfaces"). `InitInfo.boot_device` (the boot ESP's partition
+  number, block extent and GUID, and its controller's PCI location) is firmware-reported
+  identification of the boot disk, copied from `BootInfo`: quantities and identifiers (**d**), no
+  address. No field is a kernel VA.
 - **`CAP_INFO_MEMORY_MAPPINGS`** returns a count (**d**). It is the number of user page-table
   leaves, in any address space, that name a frame of the queried window of a Memory region. It
   carries no address, and the kernel answers only through a Memory capability the caller holds, for

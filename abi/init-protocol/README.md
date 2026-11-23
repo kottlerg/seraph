@@ -35,8 +35,9 @@ init-protocol/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── lib.rs      # InitInfo, CapDescriptor and CapType, InitModuleName, InitFramebufferInfo,
-                    #   INIT_PROTOCOL_VERSION and the page-bound constants, find_module_slot
+    └── lib.rs      # InitInfo, CapDescriptor and CapType, InitModuleName, InitBootDevice,
+                    #   InitFramebufferInfo, INIT_PROTOCOL_VERSION and the page-bound
+                    #   constants, find_module_slot
 ```
 
 ---

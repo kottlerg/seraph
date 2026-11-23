@@ -207,7 +207,8 @@ fn assert_denies(devmgr: u64, label: u64, label_name: &str, bit_name: &str)
     );
 }
 
-/// `QUERY_DEVICE`, `WATCH_CLASS`, and `MINT_CLASS_SEND` on `devmgr.registry`
+/// `QUERY_DEVICE`, `QUERY_DEVICE_LOCATION`, `WATCH_CLASS`, and
+/// `MINT_CLASS_SEND` on `devmgr.registry`
 /// and on `devmgr.bind`, neither of whose badges carries a class slot or
 /// `CLASS_AUTHORITY`, reply `UNAUTHORIZED`.
 fn class_deny_phase(caps: &Caps)

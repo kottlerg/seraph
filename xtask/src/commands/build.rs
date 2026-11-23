@@ -1479,12 +1479,13 @@ fn copy_file(src: &Path, dst: &Path) -> Result<()>
     Ok(())
 }
 
-/// Whether `--debug` selected `pkg` for debuginfo. [`BuildComponent::All`]
-/// selects every package; [`BuildComponent::Boot`] selects only `boot` (which
-/// has no [`Spec`], hence the explicit arm).
-fn debug_includes(args: &BuildArgs, pkg: &str) -> bool
+/// Whether `selected` (the components of `--debug` or `--limited-debug`)
+/// names `pkg`. [`BuildComponent::All`] selects every package;
+/// [`BuildComponent::Boot`] selects only `boot` (which has no [`Spec`], hence
+/// the explicit arm).
+fn selects(selected: &[BuildComponent], pkg: &str) -> bool
 {
-    args.debug.iter().any(|c| match c
+    selected.iter().any(|c| match c
     {
         BuildComponent::All => true,
         BuildComponent::Boot => pkg == "boot",
@@ -1492,23 +1493,33 @@ fn debug_includes(args: &BuildArgs, pkg: &str) -> bool
     })
 }
 
-/// `--config` flags opting `pkg` into debuginfo (`debug = 2`, `opt-level = 1`)
-/// within the active profile. Empty unless `--debug` named `pkg`. The package
-/// segment is quoted so hyphenated names (`virtio-blk`, `cmos-rtc`, `*-tester`)
-/// parse as a single TOML key.
+/// `--config` flags opting `pkg` into debuginfo within the active profile:
+/// `debug = 2` and `opt-level = 1` when `--debug` named it, else
+/// `debug = "limited"` alone when `--limited-debug` named it, which
+/// leaves the code as the profile emits it; empty when neither did. The
+/// package segment is quoted so hyphenated names (`virtio-blk`, `cmos-rtc`,
+/// `*-tester`) parse as a single TOML key.
 fn debug_config_flags(args: &BuildArgs, pkg: &str) -> Vec<String>
 {
-    if !debug_includes(args, pkg)
-    {
-        return Vec::new();
-    }
     let profile = args.profile().cargo_profile();
-    vec![
-        "--config".into(),
-        format!("profile.{profile}.package.\"{pkg}\".debug=2"),
-        "--config".into(),
-        format!("profile.{profile}.package.\"{pkg}\".opt-level=1"),
-    ]
+    let key = format!("profile.{profile}.package.\"{pkg}\"");
+    if selects(&args.debug, pkg)
+    {
+        vec![
+            "--config".into(),
+            format!("{key}.debug=2"),
+            "--config".into(),
+            format!("{key}.opt-level=1"),
+        ]
+    }
+    else if selects(&args.limited_debug, pkg)
+    {
+        vec!["--config".into(), format!("{key}.debug=\"limited\"")]
+    }
+    else
+    {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -1527,6 +1538,7 @@ mod tests
             release: false,
             component: BuildComponent::All,
             debug: Vec::new(),
+            limited_debug: Vec::new(),
             skip_lints: true,
             ktest_bench_only,
             host: crate::cli::HostArgs::default(),

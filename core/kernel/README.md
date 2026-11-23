@@ -148,6 +148,7 @@ core/kernel/
     ├── arch-interface.md       # Architecture abstraction layer and dispatch surface
     ├── initialization.md       # Boot-to-init sequence, phase by phase
     ├── syscalls.md             # Syscall ABI and complete syscall table
+    ├── hot-path-account.md     # Instructions of each benchmarked path by function; ranked cuts
     ├── transient-execution.md  # x86-64 transient-execution table: classes, sources, rules
     ├── return-address-integrity.md # Kernel shadow stacks: threat model, options, direction
     ├── cross-boundary-disclosure.md # Kernel-pointer leak audit of outputs
@@ -257,7 +258,9 @@ See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
 it records the accepted residual of the x86-64 descriptor-table registers on a CPU without
-UMIP.
+UMIP. Where the instructions of the syscall, IPC and context-switch paths go, function by
+function, and the ranked cuts drawn from that are in
+[`docs/hot-path-account.md`](docs/hot-path-account.md).
 
 ---
 

@@ -2720,10 +2720,14 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             // SAFETY: cpu is this CPU's index, < CPU_COUNT, and the per-CPU
             // storage is initialised.
             let idle_sched = unsafe { scheduler_ptr(cpu) };
-            // SAFETY: the scheduler slot is initialised for this CPU.
             while crate::cap::sole_reference::work_pending()
-                && !unsafe { (*idle_sched).has_runnable() }
             {
+                // SAFETY: the scheduler slot is initialised for this CPU.
+                let runnable = unsafe { (*idle_sched).has_runnable() };
+                if runnable
+                {
+                    break;
+                }
                 // SAFETY: the idle thread, holding no lock: the context
                 // drain requires.
                 unsafe { crate::cap::sole_reference::drain() };

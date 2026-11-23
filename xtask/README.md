@@ -649,8 +649,8 @@ contract.
 
 Remove the sysroot, the symbols store `symbols/`, the disk images `disk.img` and
 `disk-data.img`, and any per-launch variable store a killed launch left under
-`target/xtask/vars/` (and optionally `target/`, whole or but for the standard library's build
-units).
+`target/xtask/vars/` (and optionally `target/`, or Cargo's build output in it but for the standard
+library's build units).
 
 ```
 cargo xtask clean [--all | --keep-std]
@@ -659,7 +659,7 @@ cargo xtask clean [--all | --keep-std]
 | Option | Description |
 |---|---|
 | `--all` | Also run `cargo clean` to remove the `target/` directory |
-| `--keep-std` | Also empty `target/` but for the build units of the packages the toolchain's `library/Cargo.lock` names (`core`, `alloc`, `compiler_builtins`, `std` and their dependencies): in each profile directory, the host's and each target's, only `build/<package>/` of such a package stays. CI's standard-library cache saves what is left ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration) |
+| `--keep-std` | Also empty Cargo's profile directories, the host's (`target/<profile>/`) and each target's (`target/<triple>/<profile>/`), but for the build units of the packages the toolchain's `library/Cargo.lock` names (`core`, `alloc`, `compiler_builtins`, `std` and their dependencies): only `build/<package>/` of such a package stays. The rest of `target/`, `target/xtask/` among it, is left alone. CI's standard-library cache saves what is left ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration) |
 
 ---
 

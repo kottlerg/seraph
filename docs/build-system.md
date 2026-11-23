@@ -786,17 +786,18 @@ every later run on that version installs offline.
 The jobs that build with `-Z build-std` (`host-tests`, for its riscv64 test build, and each
 `validate` and `bench` cell) keep a standard-library cache, `.github/actions/std-cache/action.yml`,
 restored before their first build and saved as their last step. Its entry holds the build units of
-the toolchain's library packages alone, what `cargo xtask clean --keep-std` leaves of `target/`
-([xtask/README.md § `cargo xtask clean`](../xtask/README.md#cargo-xtask-clean)): Cargo judges a path
-source fresh by its modification time, and a checkout gives every file of the tree a new one, so a
-workspace crate's unit is rebuilt in every job and is left out, while the library's sources keep the
-times the toolchain's install gave them. The seraph `std`, whose overlaid sources the build writes
-anew in each job, is rebuilt in each too. The key is
+the toolchain's library packages alone, what `cargo xtask clean --keep-std` leaves of Cargo's build
+directories (`target/<profile>/build/` and `target/<triple>/<profile>/build/`) ([xtask/README.md §
+`cargo xtask clean`](../xtask/README.md#cargo-xtask-clean)): Cargo judges a path source fresh by its
+modification time, and a checkout gives every file of the tree a new one, so a workspace crate's
+unit is rebuilt in every job and is left out, while the library's sources keep the times the
+toolchain's install gave them. The seraph `std`, whose overlaid sources the build writes anew in
+each job, is rebuilt in each too. The key is
 `std-<entry>-<ImageOS>-<ImageVersion>-<toolchain>-<tree>`: the job's entry
 (`validate-<arch>-<profile>`, which the three cells of one architecture and profile share,
-`bench-<arch>` or `host-tests`), the runner image, the first 16 hex digits of the SHA-256 of `rustc
--Vv`, and those of the `hashFiles` digest of every file in the tree the units are built from or
-with: the target specs, `.cargo/config.toml`, the workspace `Cargo.toml`,
+`bench-<arch>` or `host-tests`), the runner image, the first 16 hex digits of the SHA-256 of
+`rustc -Vv`, and those of the `hashFiles` digest of every file in the tree the units are built from
+or with: the target specs, `.cargo/config.toml`, the workspace `Cargo.toml`,
 `xtask/src/commands/build.rs`, `xtask/src/rust_src.rs`, the action, `runtime/ruststd/`, `shared/`
 and `abi/`. The restore takes that exact key, with no partial-match fallback: units built from other
 inputs would carry modification times Cargo could take as fresh. Only a push run on `master` saves,

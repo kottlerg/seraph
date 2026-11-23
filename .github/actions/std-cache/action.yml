@@ -73,7 +73,13 @@ runs:
       if: inputs.mode == 'restore'
       uses: actions/cache/restore@v6
       with:
-        path: target
+        # Cargo's build directories, host and target, which
+        # `cargo xtask clean --keep-std` prunes.
+        path: |
+          target/debug/build
+          target/release/build
+          target/*/debug/build
+          target/*/release/build
         key: ${{ steps.key.outputs.key }}
 
     - name: Keep only the standard-library units
@@ -88,5 +94,11 @@ runs:
       if: inputs.mode == 'save' && github.event_name == 'push' && github.ref == 'refs/heads/master'
       uses: actions/cache/save@v6
       with:
-        path: target
+        # Cargo's build directories, host and target, which
+        # `cargo xtask clean --keep-std` prunes.
+        path: |
+          target/debug/build
+          target/release/build
+          target/*/debug/build
+          target/*/release/build
         key: ${{ steps.key.outputs.key }}

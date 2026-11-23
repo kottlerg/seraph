@@ -917,9 +917,9 @@ args! {
         #[arg(long)]
         pub all: bool,
 
-        /// Also empty the cargo target/ directory but for the build units of
-        /// the toolchain's library packages (core, alloc, compiler_builtins,
-        /// std and their dependencies), the part CI caches.
+        /// Also empty Cargo's profile directories in target/ but for the build
+        /// units of the toolchain's library packages (core, alloc,
+        /// compiler_builtins, std and their dependencies), the part CI caches.
         #[arg(long, conflicts_with = "all")]
         pub keep_std: bool,
 

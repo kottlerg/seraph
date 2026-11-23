@@ -111,11 +111,13 @@ fn remove(path: &Path) -> Result<()>
     result.with_context(|| format!("removing {}", path.display()))
 }
 
-/// Empty `target`, a cargo target directory, but for the build units of
-/// `keep`'s packages: in each profile directory, host or target, only
-/// `build/<package>/` of a kept package stays. Cargo checks each unit it
-/// finds kept as it checks every unit, so a kept unit whose inputs changed is
-/// rebuilt.
+/// Empty Cargo's profile directories in `target`, the host's
+/// (`target/<profile>/`) and each target's (`target/<triple>/<profile>/`), but
+/// for the build units of `keep`'s packages: only `build/<package>/` of a
+/// kept package stays. The rest of `target`, xtask's own state among it
+/// (`target/xtask/`: the trust store, the logs, the review records), is left
+/// alone. Cargo checks each unit it finds kept as it checks every unit, so a
+/// kept unit whose inputs changed is rebuilt.
 fn prune_to_std(target: &Path, keep: &BTreeSet<String>) -> Result<()>
 {
     let prune_profile = |profile: &Path| -> Result<()> {
@@ -158,26 +160,15 @@ fn prune_to_std(target: &Path, keep: &BTreeSet<String>) -> Result<()>
         }
         else if !path.is_symlink() && PROFILES.iter().any(|p| path.join(p).join("build").is_dir())
         {
-            // A target's directory: its profile directories and nothing else.
-            for sub in fs::read_dir(&path).with_context(|| format!("reading {}", path.display()))?
+            // A target's directory: its profile directories.
+            for profile in PROFILES
             {
-                let sub = sub.context("reading a directory entry")?.path();
-                if sub
-                    .file_name()
-                    .is_some_and(|n| PROFILES.iter().any(|p| n == *p))
-                    && sub.is_dir()
+                let sub = path.join(profile);
+                if sub.is_dir() && !sub.is_symlink()
                 {
                     prune_profile(&sub)?;
                 }
-                else
-                {
-                    remove(&sub)?;
-                }
             }
-        }
-        else
-        {
-            remove(&path)?;
         }
     }
     Ok(())
@@ -200,8 +191,9 @@ mod tests
     }
 
     // Defect caught: a workspace unit kept in the cache, where its fixed
-    // modification times could pass a changed source as fresh, or a library
-    // unit dropped from it.
+    // modification times could pass a changed source as fresh, a library
+    // unit dropped from it, or xtask's own state in target/ (the trust
+    // store, logs, review records) removed with the build output.
     #[test]
     fn only_the_library_units_stay()
     {
@@ -224,6 +216,7 @@ mod tests
             "CACHEDIR.TAG",
             "debug/xtask",
             "x86_64-seraph-none/debug/kernel",
+            "xtask/signing.toml",
         ]
         {
             fs::write(target.join(file), b"x").unwrap();
@@ -253,9 +246,13 @@ mod tests
         assert_eq!(
             left,
             [
+                "CACHEDIR.TAG",
                 "debug/build/compiler_builtins/1/out",
+                "seraph-toolchain/lib",
                 "x86_64-seraph-none/debug/build/core/3/out",
-                "x86_64-seraph-none/release/build/alloc/5"
+                "x86_64-seraph-none/release/build/alloc/5",
+                "xtask/signing.toml",
+                "xtask/test"
             ]
         );
         fs::remove_dir_all(&target).unwrap();

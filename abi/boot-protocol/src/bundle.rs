@@ -225,7 +225,27 @@ fn parse_file_header(bytes: &[u8]) -> Result<(BundleHeader, u32), BundleError>
     {
         return Err(BundleError::TooSmall);
     };
-    let [magic @ .., v0, v1, v2, v3, c0, c1, c2, c3] = *head;
+    // Bound byte by byte: Kani cannot model a sub-array binding
+    // (`magic @ ..`), which the bounded proofs below reach.
+    let [
+        m0,
+        m1,
+        m2,
+        m3,
+        m4,
+        m5,
+        m6,
+        m7,
+        v0,
+        v1,
+        v2,
+        v3,
+        c0,
+        c1,
+        c2,
+        c3,
+    ] = *head;
+    let magic = [m0, m1, m2, m3, m4, m5, m6, m7];
     if magic != MAGIC
     {
         return Err(BundleError::BadMagic);
@@ -251,7 +271,7 @@ fn parse_file_header(bytes: &[u8]) -> Result<(BundleHeader, u32), BundleError>
 pub fn read_entry_header(bytes: &[u8; ENTRY_HEADER_SIZE]) -> BundleEntryHeader
 {
     let [
-        name @ ..,
+        ..,
         o0,
         o1,
         o2,
@@ -269,6 +289,14 @@ pub fn read_entry_header(bytes: &[u8; ENTRY_HEADER_SIZE]) -> BundleEntryHeader
         s6,
         s7,
     ] = *bytes;
+    // The name is the header's first ENTRY_NAME_LEN bytes, which an
+    // ENTRY_HEADER_SIZE array always holds, so the fallback is never taken.
+    // It is read as a chunk because Kani cannot model a sub-array binding
+    // (`name @ ..`), which the bounded proofs below reach.
+    let name = bytes
+        .first_chunk::<ENTRY_NAME_LEN>()
+        .copied()
+        .unwrap_or([0; ENTRY_NAME_LEN]);
     BundleEntryHeader {
         name,
         offset: u64::from_le_bytes([o0, o1, o2, o3, o4, o5, o6, o7]),
@@ -506,8 +534,9 @@ mod tests
 /// the next, so a run over two entries reaches every refusal an entry can
 /// make, at the first entry and after one that passed; a longer table only
 /// repeats them. The loop that drives [`entry_at`] over every index, and the
-/// one that hands the property each index, lie outside the proofs: the fuzz
-/// target `boot-protocol` and the replay of the checked-in inputs check them.
+/// one that hands the property each index and each entry's name, lie outside
+/// the proofs: the fuzz target `boot-protocol` and the replay of the
+/// checked-in inputs check them.
 #[cfg(kani)]
 mod proofs
 {
@@ -537,10 +566,13 @@ mod proofs
     }
 
     /// The entry contract holds for every index on the first `len` bytes of
-    /// any `MAX_LEN`-byte input, `len` up to it: an index whose entry lies
-    /// past the slice, the two that lie in it, and every count. The entry's
-    /// name is checked by the name proof, which covers every name. The
-    /// longest loop is the compare of the 256-byte name the entry is read
+    /// any `MAX_LEN`-byte input, `len` up to it, with every count. Indices 0
+    /// and 1 are the two entries the input can hold; every index from 2 up
+    /// puts its entry header at or past byte `MAX_LEN`, the input's end, so
+    /// index 2, the first such, and `u32::MAX`, the last, stand for them.
+    /// Each index is a constant, so the entry is read at a fixed offset. The
+    /// entry's name is checked by the name proof, which covers every name.
+    /// The longest loop is the compare of the 256-byte name the entry is read
     /// with, byte by byte at fixed indices, so an unwind bound of 257 covers
     /// every loop.
     #[kani::proof]
@@ -550,7 +582,10 @@ mod proofs
         let bytes: [u8; MAX_LEN] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= MAX_LEN);
-        property::entry_holds(&bytes[..len], kani::any());
+        for index in [0, 1, 2, u32::MAX]
+        {
+            property::entry_holds(&bytes[..len], index);
+        }
     }
 
     /// The name contract holds on every name: the trim stops at the first

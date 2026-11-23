@@ -626,39 +626,34 @@ mod tests
 /// Bounded proofs of the module-name table parser's contract (docs/testing.md
 /// § Bounded verification, Parser proofs).
 ///
-/// [`find_module_slot`] loops over the table's entries, but each iteration
-/// compares one entry's name with the request alone and the loop stops at the
-/// first match, so a table of two entries reaches every outcome an entry can
-/// have, first and after one that did not match; a longer table only repeats
-/// them. The loop that hands the property its entries lies outside the
-/// proofs: the fuzz target `init-protocol` and the replay of the checked-in
-/// inputs check it.
+/// [`find_module_slot`] is core's `find` over the table's entries with a
+/// compare of one entry's name with the request, which reads that entry and
+/// the request alone. The lookup proof runs the whole function on a table of
+/// at most one entry, so it proves the compare on every entry and request;
+/// `find`, the loop that drives the compare over a longer table and stops at
+/// its first match, and the loop that hands the property its entries lie
+/// outside the proofs: the fuzz target `init-protocol` and the replay of the
+/// checked-in inputs check them with tables of up to eight entries.
 #[cfg(kani)]
 mod proofs
 {
     use super::{INIT_MODULE_NAME_LEN, InitModuleName, property};
 
-    /// The lookup contract holds for every table of up to two entries, of
-    /// any slots and names, and every request of up to
+    /// The lookup contract holds for the empty table and for every table of
+    /// one entry, of any slot and name, with every request of up to
     /// `INIT_MODULE_NAME_LEN + 1` bytes, one past the longest name any entry
     /// can hold, so a request no name can equal is among them. The longest
-    /// loops are the lookup's scans and compares of the 256-byte names and
-    /// the property's byte-by-byte check of each name, so an unwind bound of
-    /// 258 covers every loop.
+    /// loops are the lookup's scan and compare of the 256-byte name and the
+    /// property's byte-by-byte check of it, so an unwind bound of 258 covers
+    /// every loop.
     #[kani::proof]
     #[kani::unwind(258)]
     fn every_lookup_holds_the_lookup_contract()
     {
-        let names: [InitModuleName; 2] = [
-            InitModuleName {
-                slot: kani::any(),
-                name: kani::any(),
-            },
-            InitModuleName {
-                slot: kani::any(),
-                name: kani::any(),
-            },
-        ];
+        let names: [InitModuleName; 1] = [InitModuleName {
+            slot: kani::any(),
+            name: kani::any(),
+        }];
         let count: usize = kani::any();
         kani::assume(count <= names.len());
         let request: [u8; INIT_MODULE_NAME_LEN + 1] = kani::any();

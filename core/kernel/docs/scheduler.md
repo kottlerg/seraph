@@ -508,9 +508,16 @@ Victim selection is mode-dependent:
   count alone. A removal ends no episode: a thread unlinked and linked again without running, as
   a priority change relocates it (`relocate_ready_priority`), keeps its episode, and a backlog
   that a pull, a migration or a stop empties and a link refills reads as the one before, which
-  can cost one pull of a backlog that did not stand a tick, a pull the bound below allows; so
-  can a lock-free sample that races a dispatch running the backlog dry and the link that
-  refills it, and so reads the new episode for the backlog it saw. Threads
+  can cost one pull of a backlog that did not stand a tick, a pull the bound below allows. The
+  lock-free sample has one imprecision of its own: a sample whose two loads (the run-queue mask,
+  then the episode) straddle a dispatch running the backlog dry and the link that refills it
+  reads the refilled backlog's episode for the one it saw. The next idle tick confirms it only
+  if that backlog stood unbroken from the refill, inside the sample, to that tick, so the pull
+  takes a backlog that stood a tick less two loads; a pair that runs the queues dry on every
+  round trip has moved its episode on by that tick, and the race never confirms it. The bound
+  still holds: the early pull is a pull of a queued thread by an idle CPU, which leaves that
+  CPU busy, so it adds no tick to any thread's wait and never makes two busy CPUs trade
+  threads. Threads
   time-slicing behind one another on a CPU stay one episode, since `schedule()` requeues
   the outgoing thread before it dequeues the next. An idle CPU with a busy SMT sibling holds a
   confirmed candidate one tick more before it pulls (§ SMT Awareness). A CPU whose queue
@@ -685,9 +692,9 @@ Hot-path cost per CPU per tick:
   backlog episode, for the re-check.
 - `link`, under the run-queue lock it already holds: one Relaxed load of the run-queue mask
   and, when the queues hold no thread but the idle thread, one Relaxed load and store of the
-  episode. `remove_from_queue`, under the same lock: when its removal leaves no thread but the
-  idle thread queued, one Relaxed load of the run-queue mask and one Relaxed load and store of
-  the episode. `dequeue_highest` does not touch the episode.
+  episode. `remove_from_queue`, under the same lock: when its removal empties its queue, one
+  Relaxed load of the run-queue mask, and when no thread but the idle thread is then queued,
+  one Relaxed load and store of the episode. `dequeue_highest` does not touch the episode.
 
 ### Placement Counters
 

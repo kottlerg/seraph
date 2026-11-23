@@ -618,16 +618,19 @@ in the process's own address space. A `File` takes its frame at its first such w
 across later writes, so a write after the first makes no memmgr call. Each chunk of a write is
 copied into the frame and lent to the driver through a fresh `MAP`-only derivation, which is
 deleted once the driver's reply settles the chunk, or revoked when the driver received it, so no
-derivation outlives its chunk. The frame
-is unmapped, its cap deleted and its run returned to memmgr when the `File` drops.
+derivation outlives its chunk. The frame is unmapped, its cap deleted and its run returned to memmgr
+when the `File` drops.
 
 One write holds the frame at a time. A write of the same `File` on another thread that finds it
 held takes a frame of its own, and returns it when it ends if the first is back by then. A chunk
 whose call ends after the driver received it without a reply (interrupted, or past the thread's
 call deadline, [Call deadline](#call-deadline)) leaves the driver free to go on copying from the
 frame, so that frame is abandoned: it stays mapped and charged to the process until it exits, and
-the next write takes a fresh one. A write that fails otherwise leaves the frame idle and the
-`File`'s. The cost is one page for each open `File` that has written through the frame path.
+the next write takes a fresh one. Only the process's budget node bounds the frames so abandoned: a
+driver that receives each call and never replies costs the writer one page per write until memmgr
+refuses the next frame's charge, and that write fails. A write that fails otherwise leaves the frame
+idle and the `File`'s. The cost is one page for each open `File` that has written through the frame
+path.
 
 `std::os::seraph::fs::write_frame_memmgr_calls` counts the memmgr calls the calling thread has
 made for write frames, one for each frame taken and one for each returned; svctest's `std::fs`

@@ -817,7 +817,7 @@ unsafe fn step1_locate_uefi_protocols(
 }
 
 /// The boot device record of `device`, the loaded image's device handle,
-/// logged in one line. A part the firmware does not report is absent from the
+/// logged one line per part. A part the firmware does not report is absent from the
 /// record, and the boot goes on.
 ///
 /// # Safety

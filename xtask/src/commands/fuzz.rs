@@ -498,7 +498,9 @@ mod tests
         for name in names
         {
             assert!(
-                manifest.contains(&format!("name = \"{name}\"\npath = \"src/bin/{name}.rs\"")),
+                manifest.contains(&format!(
+                    "{{ name = \"{name}\", path = \"src/bin/{name}.rs\", test = false }}"
+                )),
                 "{name}"
             );
         }

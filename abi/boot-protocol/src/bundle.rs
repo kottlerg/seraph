@@ -565,27 +565,57 @@ mod proofs
         property::header_holds(&bytes[..len]);
     }
 
-    /// The entry contract holds for every index on the first `len` bytes of
-    /// any `MAX_LEN`-byte input, `len` up to it, with every count. Indices 0
-    /// and 1 are the two entries the input can hold; every index from 2 up
-    /// puts its entry header at or past byte `MAX_LEN`, the input's end, so
-    /// index 2, the first such, and `u32::MAX`, the last, stand for them.
-    /// Each index is a constant, so the entry is read at a fixed offset. The
-    /// entry's name is checked by the name proof, which covers every name.
-    /// The longest loop is the compare of the 256-byte name the entry is read
-    /// with, byte by byte at fixed indices, so an unwind bound of 257 covers
-    /// every loop.
-    #[kani::proof]
-    #[kani::unwind(257)]
-    fn every_entry_holds_the_entry_contract()
+    /// The entry contract holds for entry `index` on the first `len` bytes
+    /// of any `MAX_LEN`-byte input, `len` up to it, with every count. The
+    /// index is a constant of each harness below, so the entry is read at a
+    /// fixed offset, and each harness checks one index, so no harness carries
+    /// another index's state. The entry's name is checked by the name proof,
+    /// which covers every name. The longest loop is the compare of the
+    /// 256-byte name the entry is read with, byte by byte at fixed indices,
+    /// so an unwind bound of 257 covers every loop.
+    fn entry_holds_at(index: u32)
     {
         let bytes: [u8; MAX_LEN] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= MAX_LEN);
-        for index in [0, 1, 2, u32::MAX]
-        {
-            property::entry_holds(&bytes[..len], index);
-        }
+        property::entry_holds(&bytes[..len], index);
+    }
+
+    /// The entry contract holds for the first entry, at byte `HEADER_SIZE`.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn the_first_entry_holds_the_entry_contract()
+    {
+        entry_holds_at(0);
+    }
+
+    /// The entry contract holds for the second entry, after one the input
+    /// can hold whole.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn the_second_entry_holds_the_entry_contract()
+    {
+        entry_holds_at(1);
+    }
+
+    /// The entry contract holds for index 2, the first whose entry header
+    /// starts at or past byte `MAX_LEN`, the input's end. Every index from 2
+    /// up lies past the input, so this harness and the one of `u32::MAX`, the
+    /// last, stand for them.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn the_first_entry_past_the_input_holds_the_entry_contract()
+    {
+        entry_holds_at(2);
+    }
+
+    /// The entry contract holds for `u32::MAX`, the last index, whose offset
+    /// no `usize` arithmetic of the parser may wrap into the input.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn the_last_index_holds_the_entry_contract()
+    {
+        entry_holds_at(u32::MAX);
     }
 
     /// The name contract holds on every name: the trim stops at the first

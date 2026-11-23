@@ -327,7 +327,8 @@ them, `--limited-debug <component>[,<component>…]` injects
 function frames, inlined ones included, at the profile's own opt-level, so the
 instructions are those a build without it emits (the crate hashes it changes can
 reorder functions in the image). `cargo xtask path-account` reads the kernel's
-and ktest's this way ([xtask/README.md](../xtask/README.md#cargo-xtask-path-account)).
+and ktest's this way, and every image's (`all`) for the userspace rows
+([xtask/README.md](../xtask/README.md#cargo-xtask-path-account)).
 A component `--debug` also names takes `--debug`.
 
 ---

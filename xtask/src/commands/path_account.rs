@@ -225,7 +225,7 @@ impl<'a> Resolver<'a>
                 ensure!(
                     a.text.end <= b.text.start,
                     "{} ({:#x}..{:#x}) and {} ({:#x}..{:#x}) overlap at runtime: an address \
-                     would not name its image; boot again, at other load addresses",
+                     would not name its image; run the trace again, which loads them elsewhere",
                     a.name,
                     a.text.start,
                     a.text.end,

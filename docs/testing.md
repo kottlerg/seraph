@@ -439,7 +439,8 @@ of line the calls the release build's fat LTO inlines, in proportions that diffe
 path, so a count moved in the debug profile does not predict the count moved in release. A
 regression that exists only in the debug profile, such as a debug assertion added to a hot path,
 is therefore not gated: it costs nothing on hardware, and the functional cells still boot both
-profiles.
+profiles. [core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md)
+§ Profile gives the counts of both profiles per path.
 
 A one-CPU count gates only when it does not include time blocked on a device completion. The
 completion arrives at host time: a guest blocked on it retires no instructions, and its clock

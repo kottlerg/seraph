@@ -8,7 +8,8 @@
 //! Measures the cycle cost of reading `bench.bin` via the inline `FS_READ`
 //! path and the zero-copy `FS_READ_MEMORY` path across the size grid 16 B,
 //! 1 KiB, 4 KiB, 16 KiB, 64 KiB, and of rewriting 4 KiB and 64 KiB of a
-//! scratch file in place through the `FS_WRITE_MEMORY` path.
+//! scratch file in place through the `FS_WRITE_MEMORY` path, and (the `open`
+//! module) of opening a three-component path in one `NS_LOOKUP`.
 //!
 //! Path forcing is by buffer chunking, since `read()`'s policy at
 //! `runtime/ruststd/src/sys/fs/seraph.rs` is `want <= 504 AND
@@ -28,13 +29,15 @@
 //! Writes go through page-sized `write_all` calls on a page-aligned offset,
 //! which the std client sends as one `FS_WRITE_MEMORY` each.
 //!
-//! Each size and path logs one result line (`shared/bench/README.md`
-//! § Result line), which a host reads back from the serial log:
+//! Each size and path, and the open, logs one result line
+//! (`shared/bench/README.md` § Result line), which a host reads back from the
+//! serial log:
 //!
 //! ```text
 //! bench fsbench.read size=4096 path=inline arch=x86_64 cpus=4 unit=cycles n=256 min=...
 //! bench fsbench.read size=4096 path=frame arch=x86_64 cpus=4 unit=cycles n=256 min=...
 //! bench fsbench.write size=4096 path=frame arch=x86_64 cpus=4 unit=cycles n=64 min=...
+//! bench fsbench.open depth=3 arch=x86_64 cpus=4 unit=cycles n=256 min=...
 //! ```
 
 #![expect(

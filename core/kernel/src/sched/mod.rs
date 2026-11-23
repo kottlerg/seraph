@@ -2921,8 +2921,10 @@ pub unsafe fn init(cpu_count: u32) -> u32
         let s = unsafe { &*sched_ptr };
         s.set_idle(tcb);
         s.set_current(tcb);
-        // SAFETY: cpu < cpu_count, Phase 4 allocated the per-CPU slab, and CPU
-        // `cpu` runs no kernel code yet, or is this boot CPU.
+        // SAFETY: cpu < cpu_count, Phase 4 allocated the per-CPU slab, and
+        // `tcb` is CPU `cpu`'s idle thread, which it runs until its first
+        // dispatch. An AP runs no kernel code yet; the boot CPU's readers before
+        // this store see null (percpu::init_current_thread).
         unsafe { crate::percpu::init_current_thread(cpu, tcb) };
     }
 

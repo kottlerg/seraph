@@ -696,19 +696,22 @@ pub unsafe fn set_current_thread(tcb: *mut ThreadControlBlock)
 
 /// Name `tcb` as CPU `cpu`'s running thread in its [`PerCpuData::current`]
 /// at boot: `sched::init` names each CPU's idle thread, an AP's before the AP
-/// runs, the boot CPU's while its timer tick returns at the boot gate
+/// runs any kernel code, the boot CPU's at Phase 8. Before that store the
+/// boot CPU's readers see null and treat it as no running thread: the
+/// lock-holder stamps and the preemptible-hold tripwire, and a timer tick,
+/// which returns at the boot gate
 /// (core/kernel/docs/scheduling-internals.md § BSP Boot Transient).
 ///
 /// # Safety
-/// `cpu < CPU_COUNT`, [`init_storage`] has run, and no code of CPU `cpu`
-/// that reads the field runs until the store is made (single-threaded boot).
+/// `cpu < CPU_COUNT`, [`init_storage`] has run, and `tcb` is the thread
+/// CPU `cpu` runs until its first dispatch, its idle thread.
 #[cfg(not(test))]
 pub unsafe fn init_current_thread(cpu: usize, tcb: *mut ThreadControlBlock)
 {
     let entry = per_cpu_ptr(cpu);
-    // SAFETY: cpu < CPU_COUNT and the slab is allocated, so `entry` is an
-    // entry of it; the store is atomic, and no reader of it runs yet
-    // (contract).
+    // SAFETY: cpu < CPU_COUNT and the slab is allocated (contract), so
+    // `entry` is an entry of it; the store is atomic, so a reader on the boot
+    // CPU sees null or `tcb`.
     unsafe { (*entry).current.store(tcb, Ordering::Relaxed) };
 }
 

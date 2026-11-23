@@ -190,7 +190,6 @@ version = "0.1.5"
 name = "demandpaged"
 version = "0.1.5"
 dependencies = [
- "bench",
  "ipc",
  "syscall",
  "syscall-abi",
@@ -1043,6 +1042,18 @@ dependencies = [
  "hwrng-protocol",
  "ipc",
  "mmio",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "ubench"
+version = "0.1.5"
+dependencies = [
+ "bench",
+ "device-tracker",
+ "ipc",
+ "shmem",
  "syscall",
  "syscall-abi",
 ]

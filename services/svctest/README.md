@@ -79,7 +79,7 @@ services/svctest/
         │                      #   input, hwrng, RTC, and framebuffer stray caps; hwrng read;
         │                      #   hwrng killed and restarted
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
-        │                      #   refused access; page-table drain; teardown; fault cost;
+        │                      #   refused access; page-table drain; teardown;
         │                      #   faults and a CSpace top-up on a fragmented pool; a
         │                      #   sparse large region
         ├── budget.rs          # Create-time memory max: clamp, grants to it, LIMIT, decline 10,

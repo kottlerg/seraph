@@ -1,0 +1,23 @@
+# /tests/ubench — the userspace benchmark suite (programs/ubench/README.md).
+#
+# One-shot: exits once every benchmark ran; svcmgr never restarts it.
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan. To
+# enable in a boot, copy this file into /config/svcmgr/services/ between
+# `cargo xtask build` and `cargo xtask run`. See docs/testing.md
+# § Benchmarks.
+#
+# devmgr.class.framebuffer is the class SEND console_write draws through; a
+# boot with no framebuffer (headless) leaves it serving no driver, and the
+# benchmark logs a SKIP line. pwrmgr.shutdown is the SHUTDOWN_AUTHORITY SEND
+# ubench powers the system off through once it logged its pass marker.
+# fsbench, which ubench spawns, reads /data/svctest/bench.bin and writes a
+# scratch file beside it, so the namespace is universal.
+binary    = /tests/ubench
+priority  = 10
+sched_max = 10
+argv      = ubench
+restart   = never
+critical  = no
+namespace = universal
+cwd       = /data
+seed      = devmgr.class.framebuffer pwrmgr.shutdown

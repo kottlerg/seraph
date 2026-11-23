@@ -1053,7 +1053,8 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
     if !user_frame.is_null()
     {
         // A pass of the sole-reference posts earlier drains left, so a CPU
-        // that runs only user code posts them within a tick
+        // that runs only user code still makes a pass of at most
+        // POST_BUDGET posts every tick
         // (core/kernel/docs/capability-internals.md § Sole-Reference
         // Observers).
         // SAFETY: ring-3 origin: the interrupted thread's kernel stack, each

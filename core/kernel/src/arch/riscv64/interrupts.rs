@@ -510,7 +510,8 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         if sstatus_at_entry & (1 << 8) == 0
         {
             // A pass of the sole-reference posts earlier drains left, so a
-            // hart that runs only user code posts them within a tick
+            // hart that runs only user code still makes a pass of at most
+            // POST_BUDGET posts every tick
             // (core/kernel/docs/capability-internals.md § Sole-Reference
             // Observers).
             // SAFETY: U-mode origin: the interrupted thread's kernel stack, the

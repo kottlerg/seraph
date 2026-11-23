@@ -444,7 +444,11 @@ each benchmark the one sample buffer of `MAX_ITERS` (4096) samples: a benchmark 
 Each benchmark logs one result line, `bench ktest.<name> ...`, in the form
 [shared/bench/README.md § Result line](../../shared/bench/README.md#result-line) specifies,
 streamed whole to serial and the framebuffer after the timestamp; none produces a PASS/FAIL
-verdict. A benchmark that records no sample logs `ktest: bench <name> SKIP (...)` instead.
+verdict. A benchmark that cannot run, or records no sample, logs
+`ktest: bench <name> SKIP (<reason>)` in place of its line, and one whose line would break a
+rule of the form logs `ktest: bench <name> FAIL (<rule>)`, so every benchmark leaves one of the
+three. When the harness thread does not move to CPU 0, the tier logs
+`ktest: bench SKIP (the harness thread did not move to CPU 0)` and runs no benchmark.
 
 | Benchmark | What it measures |
 |---|---|

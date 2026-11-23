@@ -16,7 +16,7 @@ pub(super) fn bench_event_post_recv(ctx: &crate::TestContext, h: &mut Harness)
     let Ok(eq) = event_queue_create(ctx.memory_base, 4)
     else
     {
-        return;
+        return h.skip("event_post_recv", "event_queue_create failed");
     };
 
     let (mut samples, counters) = h.recorder();

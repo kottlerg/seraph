@@ -38,7 +38,10 @@ mod wait_set;
 
 use ::bench::{Counters, Report, Samples, Summary, Unit, Value};
 
-/// Most samples one benchmark records, and so most iterations it runs.
+/// Most samples one benchmark records, and so most iterations it runs. The
+/// bound limits only how many samples a summary covers, a p99 of 4096
+/// samples resting on its 41 largest; its buffer, [`SAMPLES`], is 32 KiB of
+/// BSS.
 pub const MAX_ITERS: u32 = 4096;
 
 /// [`MAX_ITERS`] as a buffer length.
@@ -88,10 +91,23 @@ impl Harness
         &mut self.buf[..]
     }
 
+    /// Log `ktest: bench <name> SKIP (<reason>)`: the line of a benchmark
+    /// that cannot run, logged in place of its result line, so that every
+    /// benchmark [`run_all`] runs leaves one line or the other.
+    #[expect(
+        clippy::unused_self,
+        reason = "a method, so that a benchmark logs its SKIP line through the Harness it \
+                  reports through"
+    )]
+    pub(super) fn skip(&self, name: &str, reason: &str)
+    {
+        crate::log_args(format_args!("ktest: bench {name} SKIP ({reason})"));
+    }
+
     /// Log the result line `bench ktest.<name> ...` of `summary`, with its
     /// variant parameters and extras; a benchmark that recorded no sample
-    /// logs `ktest: bench <name> SKIP` instead. The line is streamed to the
-    /// output channels whole, with no length cut.
+    /// logs `ktest: bench <name> SKIP (no sample recorded)` instead. The line
+    /// is streamed to the output channels whole, with no length cut.
     pub(super) fn report(
         &self,
         name: &str,
@@ -103,9 +119,7 @@ impl Harness
         let Some(summary) = summary
         else
         {
-            crate::log_args(format_args!(
-                "ktest: bench {name} SKIP (no sample recorded)"
-            ));
+            self.skip(name, "no sample recorded");
             return;
         };
         let report = Report {
@@ -186,7 +200,10 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
 /// whether it does.
 fn pin_harness(ctx: &crate::TestContext) -> bool
 {
-    /// Yields that give the scheduler the chance to move the thread.
+    /// Yields that give the scheduler the chance to move the thread. A
+    /// thread moves at its next pass through the scheduler, so the bound only
+    /// ends the wait of a thread that never moves, whose tier then logs a
+    /// SKIP line.
     const MAX_YIELDS: u32 = 1000;
 
     if syscall::thread_set_affinity(ctx.thread_cap, 0).is_err()

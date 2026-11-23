@@ -19,7 +19,7 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, h: &mut Harness)
     let Some(memory_cap) = crate::frame_pool::alloc()
     else
     {
-        return;
+        return h.skip("mem_map_unmap", "frame_pool alloc failed");
     };
 
     let (mut samples, counters) = h.recorder();
@@ -79,7 +79,7 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, h: &mut Harness)
     let Some(memory_cap) = crate::frame_pool::alloc()
     else
     {
-        return;
+        return h.skip("mem_protect_pair", "frame_pool alloc failed");
     };
 
     // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
@@ -98,7 +98,7 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, h: &mut Harness)
     {
         // SAFETY: memory_cap is from pool and was not mapped (mem_map failed).
         unsafe { crate::frame_pool::free(memory_cap) };
-        return;
+        return h.skip("mem_protect_pair", "mem_map failed");
     }
 
     let (mut samples, counters) = h.recorder();
@@ -180,13 +180,15 @@ pub(super) fn bench_aspace_harvest(ctx: &crate::TestContext, h: &mut Harness)
         let Some(mut frame) = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         else
         {
-            return;
+            h.skip("aspace_harvest_all_accessed", "frame alloc failed");
+            return h.skip("aspace_harvest_none_accessed", "frame alloc failed");
         };
         // SAFETY: the page is a scratch VA (crate docs § Scratch VAs), so it
         // holds no Rust object or IPC page of ktest.
         if unsafe { frame.map(harvest_page(i)) }.is_err()
         {
-            return;
+            h.skip("aspace_harvest_all_accessed", "frame map failed");
+            return h.skip("aspace_harvest_none_accessed", "frame map failed");
         }
         *slot = Some(frame);
     }
@@ -194,7 +196,8 @@ pub(super) fn bench_aspace_harvest(ctx: &crate::TestContext, h: &mut Harness)
     let Some(Some(first)) = frames.first()
     else
     {
-        return;
+        h.skip("aspace_harvest_all_accessed", "no frame");
+        return h.skip("aspace_harvest_none_accessed", "no frame");
     };
     let memory_cap = first.cap();
     let reprotect = || {
@@ -227,7 +230,7 @@ fn harvest_case(ctx: &crate::TestContext, h: &mut Harness, name: &str, before: &
     // accessed); take it outside the timed region.
     if syscall::aspace_harvest(ctx.aspace_cap, HARVEST_VA, pages, &mut bitmap).is_err()
     {
-        return;
+        return h.skip(name, "first harvest failed");
     }
 
     let (mut samples, counters) = h.recorder();

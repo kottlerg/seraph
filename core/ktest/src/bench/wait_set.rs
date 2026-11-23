@@ -27,7 +27,7 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, h: &mut Harness)
     let Ok(sig) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        return h.skip("wait_set_cycle", "cap_create_notification failed");
     };
 
     let (mut samples, counters) = h.recorder();

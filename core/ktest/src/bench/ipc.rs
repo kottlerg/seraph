@@ -76,20 +76,20 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, h: &mut Harness)
     let Ok(ep) = cap_create_endpoint(ctx.memory_base)
     else
     {
-        return;
+        return h.skip("ipc_round_trip", "cap_create_endpoint failed");
     };
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
         cap_delete(ep).ok();
-        return;
+        return h.skip("ipc_round_trip", "cap_create_notification failed");
     };
     let Ok(mut child) = spawn::new_child(ctx)
     else
     {
         cap_delete(done).ok();
         cap_delete(ep).ok();
-        return;
+        return h.skip("ipc_round_trip", "new_child failed");
     };
 
     run_round_trips(ctx, ep, done, &child, h);
@@ -119,12 +119,12 @@ fn run_round_trips(
     let Ok(child_ep) = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
     else
     {
-        return;
+        return h.skip("ipc_round_trip", "cap_copy of endpoint failed");
     };
     let Ok(child_done) = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
     else
     {
-        return;
+        return h.skip("ipc_round_trip", "cap_copy of notification failed");
     };
 
     // SAFETY: the single child has not been started yet.
@@ -145,7 +145,7 @@ fn run_round_trips(
     // on which no other live thread runs (`ChildStack`'s rule).
     if unsafe { spawn::configure_and_start(child, ipc_caller_entry, stack_top, arg) }.is_err()
     {
-        return;
+        return h.skip("ipc_round_trip", "child start failed");
     }
 
     let reply = IpcMessage::new(0);

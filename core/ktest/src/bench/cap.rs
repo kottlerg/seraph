@@ -41,8 +41,7 @@ pub(super) fn bench_cap_info_lookup(ctx: &crate::TestContext, h: &mut Harness)
     let Ok(sig) = cap_create_notification(ctx.memory_base)
     else
     {
-        crate::log("ktest: bench  cap_info_lookup: cap_create_notification failed");
-        return;
+        return h.skip("cap_info_lookup", "cap_create_notification failed");
     };
     let iters = h.iters();
     let (mut samples, counters) = h.recorder();

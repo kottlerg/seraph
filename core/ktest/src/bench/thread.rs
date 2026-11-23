@@ -31,7 +31,7 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, h: &mut Harness)
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        return h.skip("thread_lifecycle", "cap_create_notification failed");
     };
     // SAFETY: `BENCH_LIFECYCLE_STACK` is a static stack, reached only through `addr_of!`.
     let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(BENCH_LIFECYCLE_STACK)) };
@@ -114,10 +114,11 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, h: &mut Harness)
 {
     use crate::spawn;
 
+    const NAME: &str = "context_switch_pair";
+
     if ctx.sched_control_cap == 0
     {
-        crate::log("ktest: bench context_switch_pair SKIP (no SchedControl cap)");
-        return;
+        return h.skip(NAME, "no SchedControl cap");
     }
 
     let n = h.iters();
@@ -126,18 +127,22 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, h: &mut Harness)
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        return h.skip(NAME, "cap_create_notification failed");
     };
     // PRIORITY_MAX == INIT_PRIORITY: the level this (init-loaded) thread runs at.
     let Ok(mut child) = spawn::new_child_at(ctx, ctx.sched_control_cap, syscall_abi::PRIORITY_MAX)
     else
     {
-        return;
+        cap_delete(done).ok();
+        return h.skip(NAME, "the child could not be created");
     };
     let Ok(child_done) = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
     else
     {
-        return;
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
+        cap_delete(done).ok();
+        return h.skip(NAME, "cap_copy into the child failed");
     };
     // SAFETY: `BENCH_CTXSWITCH_STACK` is a static stack, reached only through `addr_of!`.
     let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(BENCH_CTXSWITCH_STACK)) };
@@ -151,7 +156,7 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, h: &mut Harness)
         child.delete_thread().ok();
         child.delete_cspace().ok();
         cap_delete(done).ok();
-        return;
+        return h.skip(NAME, "the child did not start");
     }
 
     let (mut samples, counters) = h.recorder();
@@ -172,7 +177,7 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, h: &mut Harness)
     let performed =
         syscall::cap_info(ctx.memory_base, syscall_abi::CAP_INFO_TLB_PERFORMED).unwrap_or(0);
     h.report(
-        "context_switch_pair",
+        NAME,
         &[],
         summary,
         &[("tlb_elided", elided), ("tlb_performed", performed)],
@@ -208,7 +213,7 @@ pub(super) fn bench_thread_read_mem(ctx: &crate::TestContext, h: &mut Harness)
     let Ok(mut child) = spawn::new_child(ctx)
     else
     {
-        return;
+        return h.skip("thread_read_mem_page", "new_child failed");
     };
     let base = core::ptr::addr_of!(BENCH_READ_MEM_SOURCE) as u64;
     // SAFETY: `BENCH_READ_MEM_SINK` is reached only here, on ktest's one

@@ -134,13 +134,13 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, h: &mut Harness)
     let Ok(ready) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        return h.skip("tlb_shootdown_unmap", "cap_create_notification failed");
     };
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
         cap_delete(ready).ok();
-        return;
+        return h.skip("tlb_shootdown_unmap", "cap_create_notification failed");
     };
 
     let mut workers = [const { spawn::SpawnedChild::EMPTY }; MAX_PINNED];
@@ -235,7 +235,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, h: &mut Harness)
         // Cooperative teardown even on the early-return path.
         EXIT_REQUESTED.store(true, Ordering::Release);
         let _ = teardown(&mut workers, spawned, ready, done);
-        return;
+        return h.skip("tlb_shootdown_unmap", "worker setup failed");
     };
 
     let iters = h.iters();
@@ -542,8 +542,7 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, h: &mut H
     if want == 0
     {
         // UP guest: no remote CPU to shoot down, nothing to contend on.
-        crate::log("ktest: bench tlb_shootdown_concurrent SKIP (one CPU)");
-        return;
+        return h.skip("tlb_shootdown_concurrent", "one CPU");
     }
 
     // Reset shared state so a re-run starts clean.
@@ -556,13 +555,13 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, h: &mut H
     let Ok(ready) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        return h.skip("tlb_shootdown_concurrent", "cap_create_notification failed");
     };
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
         cap_delete(ready).ok();
-        return;
+        return h.skip("tlb_shootdown_concurrent", "cap_create_notification failed");
     };
 
     // One pool frame per worker.

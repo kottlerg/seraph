@@ -17,7 +17,9 @@ use core::marker::PhantomData;
 
 use crate::arch::current;
 
-/// Programmable event counters a [`Reading`] has room for.
+/// Programmable event counters a [`Reading`] has room for. The bound limits
+/// only what one reading reports: a benchmark that counts more events runs
+/// once for each group of them.
 pub const EVENT_SLOTS: usize = 4;
 
 /// One read of a thread's counters. Subtract two readings on one CPU with

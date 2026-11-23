@@ -111,5 +111,5 @@ whole log can be scanned. A program logs no other text of the form `bench <word>
 ## Summarized By
 
 [core/ktest/README.md](../../core/ktest/README.md),
-[programs/fsbench/README.md](../../programs/fsbench/README.md),
-[programs/demandpaged/README.md](../../programs/demandpaged/README.md)
+[programs/demandpaged/README.md](../../programs/demandpaged/README.md),
+[programs/fsbench/README.md](../../programs/fsbench/README.md)

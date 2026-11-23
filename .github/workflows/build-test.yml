@@ -471,8 +471,8 @@ jobs:
 
       - name: Stage the ubench suite (${{ matrix.arch }})
         # The init harness's image with ubench's recipe staged and the
-        # terminal dropped, so no other client draws on the framebuffer
-        # console_write measures; `--repack-only` keeps the staging, as the
+        # terminal dropped, so it adds no output of its own to the framebuffer
+        # console_write measures (logd's mirror of the log lines still does); `--repack-only` keeps the staging, as the
         # functional harness cells' staging does (programs/ubench/README.md
         # § Running).
         run: |

@@ -13,7 +13,8 @@ cell boots it under icount beside the ktest benchmarks
 svcmgr spawns ubench from
 [`rootfs/config/svcmgr/tests/ubench.svc`](../../rootfs/config/svcmgr/tests/ubench.svc), which
 svcmgr does not scan. To run it, stage the recipe as svctest's is, with the terminal dropped so
-that no other client draws on the framebuffer `console_write` measures:
+that it adds no output of its own to the framebuffer `console_write` measures; logd's mirror of
+the log lines still draws through the same driver:
 
 ```sh
 cargo xtask build --arch x86_64

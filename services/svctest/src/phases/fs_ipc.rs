@@ -266,9 +266,10 @@ pub fn fs_removed_node_id_stays_dead_phase(_: &Caps)
     std::os::seraph::log!("fs_removed_node_id_stays_dead phase passed");
 }
 
-/// Timed iterations the `fs_crossover_bench` phase asks of `fsbench`: enough
-/// to drive both read paths at every size. The phase proves the paths work;
-/// the full 256-iteration count is for a manual benchmark run.
+/// Timed iterations the `fs_crossover_bench` phase asks of `fsbench`, of every
+/// case: enough to drive both read paths and the write path at every size.
+/// The phase proves the paths work; the full benchmark, whose counts the
+/// `bench` cell compares, is ubench's (programs/ubench/README.md).
 const FSBENCH_PHASE_ITERS: &str = "8";
 
 pub fn fs_crossover_bench_phase(_: &Caps)

@@ -697,7 +697,8 @@ the file the same first cluster and different later links. The FS,
 namespace, and procmgr phases read `/data/test.txt`; the FS phases also read the build-synthesised
 `/data/svctest/large.bin` and write their scratch files under `/data/svctest/`; `fsbench`, spawned
 by the `fs_crossover_bench` phase, reads the build-synthesised `/data/svctest/bench.bin`, which the
-`fs_eviction_routes_release_to_its_open` phase also holds open.
+`fs_eviction_routes_release_to_its_open` phase also holds open, and creates, rewrites and removes
+the scratch file `/data/svctest/fsbench-write.bin`.
 The vfsd unmount phases hold `/data/test.txt` and `/data/svctest/large.bin` open across an
 unforced and a forced unmount of `/data`, and a `stale-map-child` maps a cache page of
 `/data/test.txt`; while `/data` is unmounted they mount the data partition over

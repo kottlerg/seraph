@@ -198,22 +198,34 @@ pub fn parse_header(bytes: &[u8]) -> Result<BundleHeader, BundleError>
     let (headers, _) = entries.as_chunks::<ENTRY_HEADER_SIZE>();
     for raw in headers
     {
-        let entry = read_entry_header(raw);
-        if !entry.offset.is_multiple_of(BODY_ALIGNMENT)
-        {
-            return Err(BundleError::EntryMisaligned);
-        }
-        let body_end = entry
-            .offset
-            .checked_add(entry.size)
-            .ok_or(BundleError::EntryOutOfBounds)?;
-        if body_end > bytes.len() as u64
-        {
-            return Err(BundleError::EntryOutOfBounds);
-        }
+        check_entry(&read_entry_header(raw), bytes.len())?;
     }
 
     Ok(header)
+}
+
+/// One step of [`parse_header`]'s walk of the entry headers: refuse `entry`
+/// when its `offset` is not a multiple of [`BODY_ALIGNMENT`]
+/// (`EntryMisaligned`) or its body `[offset, offset + size)` does not lie
+/// inside a bundle of `len` bytes (`EntryOutOfBounds`). The step reads
+/// one entry and the bundle's length alone and carries nothing to the next,
+/// so the bounded proofs prove it on any entry (docs/testing.md § Bounded
+/// verification, Parser proofs).
+pub(crate) fn check_entry(entry: &BundleEntryHeader, len: usize) -> Result<(), BundleError>
+{
+    if !entry.offset.is_multiple_of(BODY_ALIGNMENT)
+    {
+        return Err(BundleError::EntryMisaligned);
+    }
+    let body_end = entry
+        .offset
+        .checked_add(entry.size)
+        .ok_or(BundleError::EntryOutOfBounds)?;
+    if body_end > len as u64
+    {
+        return Err(BundleError::EntryOutOfBounds);
+    }
+    Ok(())
 }
 
 /// Read the file header (magic + version + `entry_count`) without validating
@@ -529,18 +541,24 @@ mod tests
 /// verification, Parser proofs).
 ///
 /// Each proof runs one of the property's checks on every input up to its
-/// bound. [`parse_header`] loops over its entry headers, but each iteration
-/// checks one entry against the slice's length alone and carries nothing to
-/// the next, so a run over two entries reaches every refusal an entry can
-/// make, at the first entry and after one that passed; a longer table only
-/// repeats them. The loop that drives [`entry_at`] over every index, and the
-/// one that hands the property each index and each entry's name, lie outside
-/// the proofs: the fuzz target `boot-protocol` and the replay of the
-/// checked-in inputs check them.
+/// bound. [`parse_header`]'s walk of the entry headers is the one loop over
+/// input of any length, and each of its steps, [`check_entry`], reads one
+/// entry and the bundle's length alone and carries nothing to the next: the
+/// walk's state is only that no entry was refused yet, which it starts in.
+/// The step proof proves the step on any entry in a bundle of any length, so
+/// by induction the walk refuses at the first entry the step refuses, over a
+/// table of any length. The header proof runs the whole parse, file header,
+/// count bound and walk, on inputs of up to two entries, which reach the
+/// walk's start, a step after one that passed, and every refusal. What lies
+/// outside the proofs is the code that drives the steps and feeds them: the
+/// loop of `parse_header` over the `as_chunks` of the entry array, the loop
+/// that drives [`entry_at`] over every index, and the one that hands the
+/// property each index and each entry's name. The fuzz target
+/// `boot-protocol` and the replay of the checked-in inputs check them.
 #[cfg(kani)]
 mod proofs
 {
-    use super::{ENTRY_HEADER_SIZE, ENTRY_NAME_LEN, HEADER_SIZE};
+    use super::{BundleEntryHeader, ENTRY_HEADER_SIZE, ENTRY_NAME_LEN, HEADER_SIZE};
     use crate::property;
 
     /// The longest input the proofs read: the file header and two entry
@@ -563,6 +581,20 @@ mod proofs
         let len: usize = kani::any();
         kani::assume(len <= MAX_LEN);
         property::header_holds(&bytes[..len]);
+    }
+
+    /// Step of the entry walk: [`super::check_entry`] keeps its contract on
+    /// any entry, of any offset and size, in a bundle of any length up to
+    /// `usize::MAX`. No loop.
+    #[kani::proof]
+    fn each_entry_the_walk_checks_holds_the_step_contract()
+    {
+        let entry = BundleEntryHeader {
+            name: kani::any(),
+            offset: kani::any(),
+            size: kani::any(),
+        };
+        property::entry_check_holds(&entry, kani::any());
     }
 
     /// The entry contract holds for entry `index` on the first `len` bytes

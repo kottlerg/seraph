@@ -18,8 +18,8 @@
 
 use crate::FramebufferInfo;
 use crate::bundle::{
-    BODY_ALIGNMENT, BundleError, ENTRY_HEADER_SIZE, ENTRY_NAME_LEN, HEADER_SIZE, MAGIC, VERSION,
-    entry_at, name_str, parse_header,
+    BODY_ALIGNMENT, BundleEntryHeader, BundleError, ENTRY_HEADER_SIZE, ENTRY_NAME_LEN, HEADER_SIZE,
+    MAGIC, VERSION, check_entry, entry_at, name_str, parse_header,
 };
 
 /// The most entry indices past the last one the slice can hold that the
@@ -53,6 +53,7 @@ pub fn boot_protocol_holds(input: &[u8])
             if let Some(entry) = entry_at(input, index)
             {
                 name_holds(&entry.name);
+                entry_check_holds(&entry, input.len());
             }
         }
     }
@@ -163,6 +164,35 @@ pub(crate) fn header_holds(bytes: &[u8])
             "a header was taken with another count"
         );
     }
+}
+
+/// [`check_entry`], the step of [`parse_header`]'s walk of the entry
+/// headers, keeps its contract (its doc and [`BundleError`]) on `entry` in a
+/// bundle of `len` bytes: it refuses an `offset` that is not a multiple of
+/// [`BODY_ALIGNMENT`] as `EntryMisaligned`, then a body
+/// `[offset, offset + size)` that does not lie inside the bundle as
+/// `EntryOutOfBounds`, and takes every other entry. Its arithmetic here is
+/// in `u128`, which no field overflows, so a step that wraps a body end into
+/// range is caught.
+pub(crate) fn entry_check_holds(entry: &BundleEntryHeader, len: usize)
+{
+    let expected = if !entry.offset.is_multiple_of(BODY_ALIGNMENT)
+    {
+        Err(BundleError::EntryMisaligned)
+    }
+    else if u128::from(entry.offset).saturating_add(u128::from(entry.size)) > len as u128
+    {
+        Err(BundleError::EntryOutOfBounds)
+    }
+    else
+    {
+        Ok(())
+    };
+    assert_eq!(
+        check_entry(entry, len),
+        expected,
+        "an entry was refused, or taken, against its checks"
+    );
 }
 
 /// [`entry_at`] of entry `index` of `bytes` keeps its contract (its doc):

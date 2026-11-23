@@ -105,6 +105,15 @@ Notes on the non-obvious entries:
   re-derived destination handles outbound. Both directions expose only
   values the owning process already holds or is being granted; see
   [syscalls.md](syscalls.md) § Capability Handles.
+- **IPC `data[]` and `cap_slots[]` past the counts.** A message is built and read in place in a
+  TCB's `ipc_msg`, and no path zeroes it, so its arrays keep words of earlier messages past
+  `data_count` and `cap_count`. `Message` keeps the counts and arrays private, and its
+  accessors (`Message::data`, `Message::caps`), the only view of them, return exactly the
+  counted words, so no copy (`Message::copy_from`) or delivery reaches a word past them. A
+  receive that binds no sender after skipping a dead one empties the receiver's message. A receive
+  whose park a coalesced wake refused (`ParkCommit::RefusedWake`) publishes its `ipc_msg` as it
+  stands (fail-open, [ipc-internals.md](ipc-internals.md) § Park Dispositions and Episodes): a
+  message the thread itself sent, received, or staged, never another thread's.
 - **Fault messages** carry, for `FAULT_KIND_VM`, the user faulting address in `d1`
   (`CR2` on x86-64, `stval` on RISC-V), access flags in `d2`, and the user instruction
   pointer from the `TrapFrame` in `ip`; for `FAULT_KIND_EXCEPTION`, a normalized

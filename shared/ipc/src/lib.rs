@@ -244,7 +244,7 @@ pub mod fs_labels;
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 30;
+pub const DEVMGR_LABELS_VERSION: u32 = 31;
 pub mod devmgr_labels;
 
 pub mod test_fault_labels;
@@ -261,8 +261,8 @@ mod devmgr_client;
 
 pub use devmgr_client::{
     ClassCallError, ClassWatch, ReadyError, Refresh, await_device, class_name_of, decline_restart,
-    first_device, first_device_from, mint_class_send, query_device, refresh_device,
-    report_driver_ready, watch_class,
+    first_device, first_device_from, mint_class_send, query_device, query_device_location,
+    refresh_device, report_driver_ready, watch_class,
 };
 
 pub mod device_info_kind;

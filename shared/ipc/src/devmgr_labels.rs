@@ -9,6 +9,11 @@
 //! `data[0]`; after any badge check the label makes, devmgr replies
 //! [`devmgr_errors::LABEL_VERSION_MISMATCH`](crate::devmgr_errors::LABEL_VERSION_MISMATCH) when it differs.
 
+// Under `rustc-dep-of-std` the crate root is `no_core`, and a submodule needs
+// its own prelude import (see `recv_guard.rs`).
+#[cfg(feature = "rustc-dep-of-std")]
+use core::prelude::rust_2024::*;
+
 /// Query the served driver of a device class: the one class SEND
 /// ([`MINT_CLASS_SEND`]) reaches.
 ///
@@ -374,9 +379,10 @@ pub const ACPI_CONFIG_READ: u64 = 0;
 /// [`ACPI_PCI_CONFIG`] operation: write.
 pub const ACPI_CONFIG_WRITE: u64 = 1;
 
-/// The word [`ACPI_PCI_CONFIG`] names a function by: the segment in bits
+/// The word devmgr's labels name a PCI function by ([`ACPI_PCI_CONFIG`],
+/// [`QUERY_DEVICE_LOCATION`]'s reply, among others): the segment in bits
 /// 16..=31, the bus in bits 8..=15, the device in bits 3..=7 and the
-/// function in bits 0..=2.
+/// function in bits 0..=2. [`PciLocation::from_word`] reads it.
 #[must_use]
 pub const fn pci_function(segment: u16, bus: u8, device: u8, function: u8) -> u64
 {
@@ -384,6 +390,51 @@ pub const fn pci_function(segment: u16, bus: u8, device: u8, function: u8) -> u6
         | ((bus as u64) << 8)
         | (((device & 0x1F) as u64) << 3)
         | ((function & 0x7) as u64)
+}
+
+/// Where a PCI function sits: its segment group, bus, device and function,
+/// the address devmgr reads its configuration space at
+/// (services/devmgr/docs/pci-enumeration.md § ECAM Configuration Space).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciLocation
+{
+    /// The PCI segment group.
+    pub segment: u16,
+    /// The bus number.
+    pub bus: u8,
+    /// The device number, 0 to 31.
+    pub device: u8,
+    /// The function number, 0 to 7.
+    pub function: u8,
+}
+
+impl PciLocation
+{
+    /// The location packed as [`pci_function`] packs it, which keeps the
+    /// device's low 5 bits and the function's low 3.
+    #[must_use]
+    pub const fn word(self) -> u64
+    {
+        pci_function(self.segment, self.bus, self.device, self.function)
+    }
+
+    /// The location [`pci_function`] packed into `word`; `None` when a bit
+    /// above the segment is set, which no packing sets.
+    #[must_use]
+    pub fn from_word(word: u64) -> Option<Self>
+    {
+        if word >> 32 != 0
+        {
+            return None;
+        }
+        let field = |shift: u32, mask: u64| (word >> shift) & mask;
+        Some(Self {
+            segment: u16::try_from(field(16, 0xFFFF)).ok()?,
+            bus: u8::try_from(field(8, 0xFF)).ok()?,
+            device: u8::try_from(field(3, 0x1F)).ok()?,
+            function: u8::try_from(field(0, 0x7)).ok()?,
+        })
+    }
 }
 
 /// Push the `_OSC` result of one PCI host bridge from acpid.
@@ -634,6 +685,27 @@ pub const BIND_DRIVERS: u64 = 22;
 /// mark lasts as long as the driver it marks. The handler logs nothing, as
 /// [`QUERY_DEVICE`]'s does not.
 pub const DECLINE_RESTART: u64 = 32;
+/// Query where the device of a class's served driver sits: the
+/// [`PciLocation`] of the PCI function devmgr bound the driver to. An
+/// instance ordinal only counts the class's drivers in the order devmgr
+/// served them; the location names the device itself. vfsd asks it of each
+/// disk it holds (services/vfsd/README.md).
+///
+/// Served on a class SEND ([`MINT_CLASS_SEND`]) alone, as [`QUERY_DEVICE`]
+/// is; a SEND badged otherwise gets
+/// [`super::devmgr_errors::UNAUTHORIZED`]. Request: `data[0]` = caller's
+/// compiled [`super::DEVMGR_LABELS_VERSION`]; `data[1]`, when sent, the
+/// instance ordinal, an absent one being 0. Reply
+/// ([`super::devmgr_errors::SUCCESS`]): `data[0]` = the location, packed
+/// as [`pci_function`] packs it ([`PciLocation::from_word`]); no cap.
+/// [`super::devmgr_errors::NO_LOCATION`] for a driver devmgr bound to a
+/// platform device, which the firmware tables describe and which is no PCI
+/// function (the serial, framebuffer and RTC drivers' devices);
+/// [`super::devmgr_errors::WITHDRAWN`] at a withdrawn driver's ordinal; and
+/// [`super::devmgr_errors::NO_DEVICE`] past the last served driver. A query
+/// whose answer would name no driver waits as [`QUERY_DEVICE`]'s does. The
+/// handler logs nothing, as [`QUERY_DEVICE`]'s does not.
+pub const QUERY_DEVICE_LOCATION: u64 = 33;
 /// The bound of a bind pass's settle, in milliseconds: how long devmgr
 /// waits, from the start of a batch's settle (after its last spawn), for
 /// each of the batch's drivers to report ready or die before it destroys
@@ -707,7 +779,8 @@ pub const ACPI_AUTHORITY: u64 = 1u64 << 58;
 /// [`QUERY_DEVICE`] replies carry, moved down from
 /// [`crate::VERB_BIT_MASK`] into bits 16..=21. No other bit is set, so a
 /// class badge carries none of the registry's authority bits and reaches
-/// `QUERY_DEVICE`, `WATCH_CLASS` and `DECLINE_RESTART` alone, and no
+/// `QUERY_DEVICE`, `WATCH_CLASS`, `DECLINE_RESTART` and
+/// `QUERY_DEVICE_LOCATION` alone, and no
 /// registry SEND of an authority bit reads as a class badge.
 pub mod class_badge
 {
@@ -763,6 +836,31 @@ pub mod class_badge
 mod tests
 {
     use crate::{VERB_BIT_MASK, blk_labels, devmgr_labels, serial_labels};
+
+    #[test]
+    fn a_pci_location_round_trips_through_its_word()
+    {
+        use devmgr_labels::PciLocation;
+        let location = PciLocation {
+            segment: 0xABCD,
+            bus: 0xEF,
+            device: 0x15,
+            function: 6,
+        };
+        assert_eq!(PciLocation::from_word(location.word()), Some(location));
+    }
+
+    #[test]
+    fn a_word_with_a_bit_above_the_segment_is_no_pci_location()
+    {
+        use devmgr_labels::{PciLocation, pci_function};
+        let word = pci_function(0xFFFF, 0xFF, 31, 7);
+        assert!(PciLocation::from_word(word).is_some());
+        for bit in [32, 63]
+        {
+            assert_eq!(PciLocation::from_word(word | (1 << bit)), None, "bit {bit}");
+        }
+    }
 
     #[test]
     fn a_class_badge_round_trips_and_carries_no_authority_bit()

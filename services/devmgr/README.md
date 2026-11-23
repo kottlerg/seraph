@@ -32,7 +32,8 @@ devmgr/
 ├── platform/                       # Platform description tables, one `<machine>.platform` each
 ├── src/
 │   ├── main.rs                     # Bootstrap, the registry's workers and control thread,
-│   │                               #   QUERY_DEVICE and WATCH_CLASS handlers, device catalog
+│   │                               #   class SEND handlers (QUERY_DEVICE, WATCH_CLASS,
+│   │                               #   DECLINE_RESTART, QUERY_DEVICE_LOCATION), device catalog
 │   ├── acpi.rs                     # acpid's requests: region grants, configuration access, pushes
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, port carves, shutdown
 │   │   ├── mod.rs                  # `arch::current` re-export (the only cfg(target_arch) site)

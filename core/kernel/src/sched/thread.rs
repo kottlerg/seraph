@@ -49,7 +49,9 @@ use crate::arch::current::context::SavedState;
 /// `next` and `correlator` are bare fields owned by the lock of the list
 /// holding the node: the queue's `lock` while the node is on its free list,
 /// the owner thread's `sched_lock` or the owner address space's `death_lock`
-/// while it is bound (the bare-field exception of docs/coding-standards.md
+/// while it is bound to an owner, the sole-reference table's lock
+/// (`cap::sole_reference::SoleReferenceTable`) while it is on a table chain
+/// (the bare-field exception of docs/coding-standards.md
 /// § Concurrency; core/kernel/docs/ipc-internals.md § Event Queue). A death
 /// walk reads a bound node's fields without the lock, after reading the chain
 /// head under it, because a linked node is never rewritten until the owner's
@@ -71,9 +73,9 @@ pub struct DeathObserver
 // SAFETY: a node is a (link, queue, correlator) triple. It is written only on
 // no list or under the lock of the list holding it (the queue's `lock` on its
 // free list, the thread's `sched_lock` or the address space's `death_lock` on
-// an owner chain), and read by a death walk only after the owner's lock
-// published it; `eq` is dereferenced only while the node's reference keeps
-// the queue live.
+// an owner chain, the sole-reference table's lock on a table chain), and read
+// by a death walk only after the owner's lock published it; `eq` is
+// dereferenced only while the node's reference keeps the queue live.
 unsafe impl Send for DeathObserver {}
 // SAFETY: same rationale as `Send`.
 unsafe impl Sync for DeathObserver {}

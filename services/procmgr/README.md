@@ -352,7 +352,7 @@ observer, with the child's full `u64` badge as the correlator, on one of procmgr
 procmgr keeps a growable set of queues: a bind tries the newest queue first, then the older ones,
 whose nodes return as their processes are destroyed, and only when every queue is out of nodes
 creates a further queue, funded from procmgr's own memory, with twice the last pool (64 nodes first,
-up to `EVENT_QUEUE_MAX_CAPACITY`). A further queue is one contiguous grant from memmgr (about 24 MiB
+up to `EVENT_QUEUE_MAX_CAPACITY`). A further queue is one contiguous grant from memmgr (about 40 MiB
 once a pool reaches the kernel maximum); when memmgr refuses it, procmgr retries at half the pool,
 down to the first pool's size, whose request is three pages.
 

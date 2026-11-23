@@ -1534,9 +1534,12 @@ each that failed. CI's `kani` job runs the command with no option, after install
 `--pin` prints ([docs/build-system.md](../docs/build-system.md#continuous-integration)
 § Continuous Integration).
 
-No assistant session runs Kani: `cargo install` is outside the permissions
-`.claude/settings.json` grants, and the `bash` hook refuses `cargo kani`
-([§ `cargo xtask hook`](#cargo-xtask-hook)).
+The development host carries the pinned release, which the maintainer installs, and an assistant
+session runs `cargo xtask kani` there. A session installs nothing (`cargo install` is outside the
+permissions `.claude/settings.json` grants) and does not run `cargo kani` itself, which the
+`bash` hook refuses ([§ `cargo xtask hook`](#cargo-xtask-hook)). A new or changed harness is
+sized there, under the memory of CI's runner, before CI runs it
+([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification).
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`
 aside, and takes their `--wait-host` and `--host-override` options.

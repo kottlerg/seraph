@@ -1277,7 +1277,8 @@ surface.
   procedure. No in-tree driver is in this tier.
 
 **Inert changes.** A change that alters only the following cannot change behaviour at any CPU count,
-memory size, or device set, and owes no local host run, whatever file it is in:
+memory size, or device set, and owes no local host run of this section, whatever file it is in (a
+new or changed proof harness still owes its local sizing, § Bounded verification):
 
 - Markdown, and comment lines in source files, build scripts, and linker scripts;
 - lint attributes: `#[allow(...)]`, `#[expect(...)]`, `#[warn(...)]`, `#[deny(...)]`, their inner
@@ -1333,8 +1334,8 @@ of them, so identical images are no evidence about them. The verdict does not co
 - what no loader reads: the symbol tables, the debug information, and the size of a file, which
   can move where the bootloader and procmgr place later data but no byte a loaded image holds.
 
-A PR whose changes outside Markdown are all inert owes no local host run, whatever purpose it
-states. The surfaces below, and Repeat count, are judged on the non-inert lines only.
+A PR whose changes outside Markdown are all inert owes no local host run of this section, whatever
+purpose it states. The surfaces below, and Repeat count, are judged on the non-inert lines only.
 
 **Boundary surface.** The boundary set below is owed when, and only when, the PR's own diff (see
 When the runs are owed below) makes a non-inert change to the CPU-count surface; a stated
@@ -2137,6 +2138,23 @@ undetermined or unwinding-incomplete check, on a Kani release other than the pin
 harness in a crate it does not register. CI's `kani` job runs it on every push and pull request,
 and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
+
+**Local sizing.** A harness is sized on the development host before CI runs it. The author of a
+change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
+with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries
+it, every process of the run limited to an address space of 16 GB, the memory of CI's `kani`
+runner ([GitHub's standard Linux runner for a public
+repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)). On a
+Linux host, `prlimit --as=16000000000 cargo xtask kani ...` sets that limit where the command
+does not set it itself. A run that the limit ends (an allocation failure, or a process killed)
+or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
+still cover the property or by the induction form of the parser proofs below. A failed,
+undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
+or the harness, fixed as such, and MUST NOT be bounded away. The PR body's `## Validation`
+section states, for each such harness, the verification time Kani reports, the peak resident
+memory of the run (the maximum resident set size of its largest process, as GNU `time -v`
+reports it), and the unwind bounds the harness carries. This run is owed whatever § Coverage
+tiers owes, since a harness change is inert there.
 
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
 tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches

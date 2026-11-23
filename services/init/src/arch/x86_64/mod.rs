@@ -19,7 +19,7 @@ const COM1: u16 = 0x3F8;
 /// the port is programmed, and cleared by [`serial_unbound`] when init-logd's
 /// bind fails. Until it is set, and after it is cleared, serial writes are
 /// dropped, as riscv64 drops them before its UART is mapped: a port access
-/// without the binding raises #GP under the all-denied I/O bitmap.
+/// raises #GP when the thread holds no binding for the port.
 static PORTS_BOUND: AtomicBool = AtomicBool::new(false);
 
 /// Initialise COM1 serial output at 115200 8N1.

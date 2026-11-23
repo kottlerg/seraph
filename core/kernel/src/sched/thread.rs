@@ -1231,8 +1231,10 @@ pub struct ThreadControlBlock
     /// `SYS_IOPORT_BIND`), which also records the `IoPort` object behind each
     /// binding. Null if this thread has no port bindings.
     ///
-    /// On context switch, if non-null, this bitmap is copied into the TSS
-    /// IOPB region so `in`/`out` instructions work for this thread.
+    /// A context switch into this thread makes the CPU's TSS IOPB region hold
+    /// this bitmap (a copy, unless the TSS already holds it at its generation)
+    /// so `in`/`out` instructions work for this thread; while it is null the
+    /// TSS's bitmap offset is out of limit, denying every port.
     ///
     /// Owned, pointer and bytes, by this TCB's `sched_lock`: `sys_ioport_bind`
     /// installs and edits it, an `IoPort` teardown's withdrawal rebuilds it,

@@ -175,9 +175,16 @@ jobs:
           if [ "${{ matrix.tester }}" = "svctest" ]; then
             test_devices=--test-devices
           fi
+          # The ktest boots fail on a SKIP line, as the validate job's ktest
+          # boot does (docs/testing.md § Gating).
+          checks=()
+          if [ "${{ matrix.tester }}" = "ktest" ]; then
+            checks=(--fail-also ' SKIP ')
+          fi
           cargo xtask run \
             --arch ${{ matrix.arch }} \
-            --parallel 2 --runs 20 --timeout "$budget" $test_devices
+            --parallel 2 --runs 20 --timeout "$budget" $test_devices \
+            "${checks[@]}"
 
       - name: Upload run logs
         if: always()

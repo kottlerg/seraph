@@ -132,21 +132,21 @@ to release, with its baselines and its host-mode bands re-taken on the release b
 ## Ranked Cuts
 
 Ranked on the release account by the instructions each removes from the gated rows. Each cut is
-its own Issue, under #1531. A design change goes to the maintainer as a pick before it is built,
-and its Issue is filed once approved; a local cut does not wait. Each reports the host-mode
-figure under KVM beside its counts, and a cut that saves instructions but costs time is not
-taken.
+its own Issue, under #1531. A design change went to the maintainer as a pick before its Issue
+was filed, and each of the four here is approved; a local cut needs no pick. Each reports the
+host-mode figure under KVM beside its counts, and a cut that saves instructions but costs time
+is not taken.
 
 | Rank | Cut | Kind | Expected saving (release, x86_64 / riscv64) |
 |---:|---|---|---|
 | 1 | #1539: skip the I/O bitmap reload when the TSS already holds it | local | about 2100 per row that switches twice / none |
 | 2 | #1540: copy user memory a word at a time on riscv64 | local | none / about 24000 on `thread_read_mem_page`, 1300 on IPC with 7 words |
 | 3 | #1541: build IPC messages in place, copying only the valid words | local | about 440 / 1600 per IPC round trip |
-| 4 | Read the current thread and per-CPU state through one per-CPU pointer (after PR #1507) | design, awaiting approval | about 45 / 75 per kernel entry |
-| 5 | Test the return-to-user work with one per-CPU word (after PR #1507) | design, awaiting approval | about 30 / 50 per return to user |
-| 6 | Dispatch syscalls through one masked table index | design, awaiting approval | about 50 / 30 per syscall |
+| 4 | #1547: read the current thread and per-CPU state through one per-CPU pointer (after PR #1507) | design | about 45 / 75 per kernel entry |
+| 5 | #1548: test the return-to-user work with one per-CPU word (after PR #1507) | design | about 30 / 50 per return to user |
+| 6 | #1549: dispatch syscalls through one masked table index | design | about 50 / 30 per syscall |
 | 7 | #1542: monomorphise the page-table leaf walker's visitor | local | about 700 / not estimated (no thunk) per harvest of 32 pages |
-| 8 | Serve small kernel entropy draws from one squeezed block | design, awaiting approval | about 24000 / 24000 per thread lifecycle |
+| 8 | #1550: serve small kernel entropy draws from one squeezed block | design | about 24000 / 24000 per thread lifecycle |
 | 9 | #1543: scan kernel stacks a line at a time, and paint them with wider stores | local | about 4700 / 12000 per thread lifecycle |
 
 Not taken:

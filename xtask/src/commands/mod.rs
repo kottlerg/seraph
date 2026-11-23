@@ -27,4 +27,5 @@ pub mod review;
 pub mod run;
 pub mod symbolize;
 pub mod test;
+pub mod threat_scope;
 pub mod trust_request;

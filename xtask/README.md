@@ -65,7 +65,8 @@ xtask/
 │   │   │                       #   ktest_timing, bench_check, bench_baseline, symbolize,
 │   │   │                       #   mkdisk, clean, crypto_vectors, fuzz, kani,
 │   │   │                       #   compare_images, lint_docs, pr_check, review,
-│   │   │                       #   release_scope, issue, orch, hook, host, trust_request)
+│   │   │                       #   release_scope, threat_scope, issue, orch, hook, host,
+│   │   │                       #   trust_request)
 │   │   └── test/               # `test`: the unit tests, the cases, the cells
 │   │       ├── mod.rs          # Dispatch: the unit tests, a case, a cell
 │   │       ├── cases.rs        # The case registry; the runners of a case and of a cell
@@ -2106,6 +2107,63 @@ own digest, and a list joined from its pages must match the summary's count and 
 short, empty, or altered unit list ends the run with an error instead of a plan. The command's
 test `the_digest_of_the_shared_vector_is_pinned` and the workflow's self-test pin the digest of
 the same fields to the same value.
+
+### `cargo xtask threat-scope`
+
+Print the scope of a threat audit of one section of `docs/threat-model.md` as JSON, for the
+`threat-audit` workflow (`.claude/workflows/threat-audit.js`), which, like the release review, has
+no file or process access of its own ([conventions.md](../docs/conventions.md) § Threat audit).
+
+```
+cargo xtask threat-scope --section <name> [--head <rev>] [--page-entries <n>] [--allow-incomplete]
+cargo xtask threat-scope --section <name> --head <sha> [--page-entries <n>] --page issues:<n>
+```
+
+The command reads the document and the files at `--head` (`HEAD` by default) through git. The
+section is the one whose `## <name>` heading `--section` names; it is refused unless it holds the
+blocks `**Attacker.**`, `**Assets.**`, `**Assumptions.**`, `**Mitigations.**`,
+`**Fuzz targets and proof harnesses.**` and `**Gaps.**`, in that order, and the error lists the
+sections that do. A block's items are its bullets, each with its indented continuation lines, or
+its paragraph when it has none.
+
+In each item, a backticked span holding a `/` and no whitespace is a path: a tracked file, or a
+tracked directory, which stands for the files under it. Only text files count (git's test: no NUL
+byte in the first 8000 bytes), so binary fuzz seeds drop out. A path that names nothing tracked,
+and a link to a document that does not exist, is `unresolved`. A backticked identifier, or the last
+segment of a `::` path, found as a word in none of its item's files is `unlocated`: a hint for the
+document lens, not an error. The audit's scope is the files of the Mitigations and Fuzz targets
+and proof harnesses items, in order of first reference. A Mitigations item that names no file is
+`unanchored`. A section with an unanchored or unresolved item is incomplete, and the command
+refuses to print its summary without `--allow-incomplete`.
+
+The files are packed into shards in that order, never split: a shard holds at most 6 files
+(`MAX_SHARD_FILES`) and 2500 lines (`MAX_SHARD_LINES`), a file that does not fit opens the next
+shard, and a file longer than the line bound takes a shard of its own. Each shard lists the scoped
+items (`<label>#<n>`, 1-based) that name one of its files.
+
+Without `--page` the command prints the summary: `head`, `repo_root`, `tree_at_head` (the
+working tree is clean and checked out at the head), `document`, `section`, `slug` (the name's
+ASCII letters and digits in lower case, each other run one hyphen), `system_assumptions` (the
+document's `### System-wide assumptions`, verbatim), `blocks` (each `label`, its raw `text`, and
+its `items` with `text`, `files`, `unresolved` and `unlocated`), `documents` (the existing
+documents the section links), `unanchored`, `unresolved` (item ids), `complete`, `shards` (each
+`lines`, `files` with `path` and `lines`, and `items`), `page_entries`, `open_issue_count`,
+`open_issue_pages`, `open_issues_digest`, and `digest`. With `--page issues:<n>` it prints page
+`n` (1-based) of the open Issues, at most `--page-entries` (200 by default) a page: `list`, `head`,
+`page`, `pages`, `page_entries`, `items` (`number` and `title`), and `digest`.
+
+Each `digest` is the FNV-1a 64 of `cargo xtask release-scope`, over these fields:
+
+| Digest | Fields, in order |
+|---|---|
+| the summary | `threat-summary`, `head`, `repo_root`, `tree_at_head`, `document`, `section`, `slug`, `system_assumptions`, the number of blocks, then each block's `label`, `text` and number of items, then each item's `text` and its `files`, `unresolved` and `unlocated` lists; the `documents`, `unanchored` and `unresolved` lists; `complete`, the number of shards, then each shard's `lines`, number of files, each file's `path` and `lines`, and its `items` list; `page_entries`, `open_issue_count`, `open_issue_pages`, `open_issues_digest` |
+| a list in the summary | its length, then each entry |
+| a page | `threat-issues`, `head`, `page`, `pages`, `page_entries`, then each Issue's `number` and `title` |
+| the whole open-Issue list | `issues`, then each Issue's `number` and `title` (the release scope's digest of the list) |
+
+The workflow recomputes each digest, so a section text an agent altered or cut ends the run with
+an error before any reviewer runs, and the reviewers read the attacker model as the document
+states it.
 
 ### `cargo xtask issue-edit`
 

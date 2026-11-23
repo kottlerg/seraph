@@ -31,6 +31,7 @@ Commands:
   compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
   review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
   release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
+  threat-scope    Print the scope of a threat audit of one section of `docs/threat-model.md` as JSON with a digest: the section's blocks verbatim, the files its mitigations and coverage name, the references that resolve to nothing, the reviewer shards, and the open Issues in pages (see xtask/README.md)
   issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
   issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
   orch            Keep the on-disk state of an orchestration batch (`target/xtask/orchestration/state.json`) and its log: the orchestrator, the exclusive grant, the workers, the merge order, the open questions and the rulings in force. `orch state` prints it (see xtask/README.md)
@@ -66,6 +67,7 @@ Commands:
   compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
   review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
   release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
+  threat-scope    Print the scope of a threat audit of one section of `docs/threat-model.md` as JSON with a digest: the section's blocks verbatim, the files its mitigations and coverage name, the references that resolve to nothing, the reviewer shards, and the open Issues in pages (see xtask/README.md)
   issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
   issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
   orch            Keep the on-disk state of an orchestration batch (`target/xtask/orchestration/state.json`) and its log: the orchestrator, the exclusive grant, the workers, the merge order, the open questions and the rulings in force. `orch state` prints it (see xtask/README.md)
@@ -1076,6 +1078,30 @@ Options:
       --page-entries <PAGE_ENTRIES>  The most entries one page holds: a range file, an open Issue, or a file of a unit (a unit with no file counts one) [default: 200]
       --page <LIST:N>                Print page `<list>:<n>` (1-based) of `files`, `units`, or `issues` instead of the summary
   -h, --help                         Print help
+=== xtask threat-scope -h
+Print the scope of a threat audit of one section of `docs/threat-model.md` as JSON with a digest: the section's blocks verbatim, the files its mitigations and coverage name, the references that resolve to nothing, the reviewer shards, and the open Issues in pages (see xtask/README.md)
+
+Usage: xtask threat-scope [OPTIONS] --section <SECTION>
+
+Options:
+      --section <SECTION>            The section of `docs/threat-model.md` to scope, as its `##` heading names it
+      --head <HEAD>                  The commit the document and the files are read at [default: HEAD]
+      --page-entries <PAGE_ENTRIES>  The most open Issues one page holds [default: 200]
+      --page <issues:N>              Print page `issues:<n>` (1-based) of the open Issues instead of the summary
+      --allow-incomplete             Print the summary of a section whose scope is incomplete (a Mitigations item naming no file, or a reference resolving to nothing) instead of refusing it
+  -h, --help                         Print help
+=== xtask threat-scope --help
+Print the scope of a threat audit of one section of `docs/threat-model.md` as JSON with a digest: the section's blocks verbatim, the files its mitigations and coverage name, the references that resolve to nothing, the reviewer shards, and the open Issues in pages (see xtask/README.md)
+
+Usage: xtask threat-scope [OPTIONS] --section <SECTION>
+
+Options:
+      --section <SECTION>            The section of `docs/threat-model.md` to scope, as its `##` heading names it
+      --head <HEAD>                  The commit the document and the files are read at [default: HEAD]
+      --page-entries <PAGE_ENTRIES>  The most open Issues one page holds [default: 200]
+      --page <issues:N>              Print page `issues:<n>` (1-based) of the open Issues instead of the summary
+      --allow-incomplete             Print the summary of a section whose scope is incomplete (a Mitigations item naming no file, or a reference resolving to nothing) instead of refusing it
+  -h, --help                         Print help
 === xtask issue-edit -h
 Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
 
@@ -1714,6 +1740,7 @@ Commands:
   compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
   review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
   release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
+  threat-scope    Print the scope of a threat audit of one section of `docs/threat-model.md` as JSON with a digest: the section's blocks verbatim, the files its mitigations and coverage name, the references that resolve to nothing, the reviewer shards, and the open Issues in pages (see xtask/README.md)
   issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
   issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
   orch            Keep the on-disk state of an orchestration batch (`target/xtask/orchestration/state.json`) and its log: the orchestrator, the exclusive grant, the workers, the merge order, the open questions and the rulings in force. `orch state` prints it (see xtask/README.md)

@@ -558,9 +558,13 @@ A pending upcall is delivered at the first delivery point the thread reaches aft
   of its user copy ([Kernel Copies](#kernel-copies)) has no return to deliver at until its
   re-execution returns.
 - **Interrupt point** (`UPCALL_POINT_INTERRUPT`): only for an `UPCALL_ANY_INSTRUCTION` post. This
-  is the return to user mode of an interrupt that preempted the thread, so it reaches a thread
-  that makes no syscall. The post prods a CPU running the thread, so the thread takes an
-  interrupt.
+  is the return to user mode of an interrupt that preempted the thread, or of an exception at
+  whose end the kernel preempted it for a higher-priority thread, so it reaches a thread that makes
+  no syscall. The post prods a CPU running the thread, so the thread takes an interrupt. A thread
+  the kernel preempted at a return to user mode, waiting on a run queue, passes that return's
+  delivery point when it runs again
+  ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md#wake-preemption) § Wake
+  Preemption); a fault-blocked thread passes none at its fault's own return (§ Nesting).
 
 A thread at neither point keeps the upcall pending. Such a thread spins without syscalls, or was
 posted to without `UPCALL_ANY_INSTRUCTION`.

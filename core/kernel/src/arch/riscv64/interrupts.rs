@@ -443,9 +443,62 @@ unsafe fn clear_sip_ssip()
     }
 }
 
-/// Main trap dispatch routine.
-///
-/// Called with interrupts disabled (sstatus.SIE is cleared on trap entry).
+/// Main trap dispatch routine, called by `trap_entry` with interrupts disabled
+/// (sstatus.SIE is cleared on trap entry): [`handle_trap`], then, for a trap
+/// taken from U-mode other than an ecall, the return to U-mode: for an
+/// interrupt, a sole-reference drain pass, its upcall delivery point and the
+/// wake-preemption check (`sched::deliver_and_preempt`), for an exception the
+/// check alone
+/// (`sched::preempt_at_exception_return`). An ecall's return is the syscall
+/// exit's (`syscall::finish_syscall`), so a syscall makes it once.
+#[cfg(not(test))]
+extern "C" fn trap_dispatch(frame: *mut TrapFrame)
+{
+    // SAFETY: trap_entry passes this hart's live, valid frame; a single read,
+    // before handle_trap can block.
+    let scause = unsafe { (*frame).scause };
+    // SAFETY: as for the read above.
+    let sstatus_at_entry = unsafe { (*frame).sstatus };
+    handle_trap(frame);
+    // SPP (bit 8) clear: the trap came from U-mode. Cause 8 (interrupt bit
+    // clear) is the U-mode ecall.
+    if sstatus_at_entry & (1 << 8) == 0 && scause != 8
+    {
+        let deliver = || {
+            // The interrupt delivery point of an upcall posted with
+            // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
+            // Upcalls): the trap is handled and completed.
+            // SAFETY: U-mode origin, so frame is the thread's live frame on
+            // its kernel stack; no lock is held, SIE = 0.
+            unsafe { crate::ipc::upcall::deliver_at_interrupt(frame) };
+        };
+        if scause >> 63 != 0
+        {
+            // A pass of the sole-reference posts earlier drains left, so a
+            // hart that runs only user code still makes a pass of at most
+            // POST_BUDGET posts every tick
+            // (core/kernel/docs/capability-internals.md § Sole-Reference
+            // Observers). Before the delivery point and the check, so a
+            // thread a post wakes on this hart is decided at this return.
+            // SAFETY: U-mode origin: the interrupted thread's kernel stack,
+            // the interrupt handled and completed, no lock is held, SIE = 0.
+            unsafe { crate::cap::sole_reference::drain_at_interrupt() };
+            // SAFETY: the end of an interrupt from U-mode on the interrupted
+            // thread's kernel stack, its frame published; no lock is held,
+            // SIE = 0.
+            unsafe { crate::sched::deliver_and_preempt(deliver) };
+        }
+        else
+        {
+            // SAFETY: the end of an exception from U-mode that handle_trap
+            // resumed, on the thread's kernel stack, its frame published; no
+            // lock is held, SIE = 0.
+            unsafe { crate::sched::preempt_at_exception_return(deliver) };
+        }
+    }
+}
+
+/// [`trap_dispatch`]'s body: the scause dispatch.
 ///
 /// `frame` is the live frame `trap_entry` built on this hart's kernel stack.
 /// It is held as a raw pointer, and each access derives a reference for that
@@ -462,7 +515,13 @@ unsafe fn clear_sip_ssip()
               kernel exception to `user_exception` or `kernel_exception`) stays one function so \
               the trap-frame ownership and SIE discipline read in one place"
 )]
-extern "C" fn trap_dispatch(frame: *mut TrapFrame)
+#[expect(
+    clippy::inline_always,
+    reason = "trap_dispatch is the one caller; left out of line, every trap, each syscall \
+              included, pays a second frame and the callee-saved spills of this large body"
+)]
+#[inline(always)]
+fn handle_trap(frame: *mut TrapFrame)
 {
     #[expect(
         clippy::multiple_unsafe_ops_per_block,
@@ -507,24 +566,9 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 crate::fatal("unhandled interrupt");
             }
         }
-        if sstatus_at_entry & (1 << 8) == 0
-        {
-            // A pass of the sole-reference posts earlier drains left, so a
-            // hart that runs only user code still makes a pass of at most
-            // POST_BUDGET posts every tick
-            // (core/kernel/docs/capability-internals.md § Sole-Reference
-            // Observers).
-            // SAFETY: U-mode origin: the interrupted thread's kernel stack, the
-            // interrupt handled and completed, no lock is held, SIE = 0.
-            unsafe { crate::cap::sole_reference::drain_at_interrupt() };
-            // The interrupt delivery point of an upcall posted with
-            // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
-            // Upcalls): the interrupt is handled and completed, and the thread
-            // it preempted (SPP = 0, U-mode) is about to return to U-mode.
-            // SAFETY: U-mode origin, so frame is the interrupted thread's live
-            // frame on its kernel stack; no lock is held, SIE = 0.
-            unsafe { crate::ipc::upcall::deliver_at_interrupt(frame) };
-        }
+        // The end of an interrupt from U-mode (the sole-reference drain pass and
+        // the upcall delivery point, with the wake-preemption check) is
+        // trap_dispatch's.
     }
     else if cause_code == 2
         && (sstatus_at_entry & (1 << 8)) == 0

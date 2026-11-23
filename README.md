@@ -110,6 +110,8 @@ Overall project design documents live in [`docs/`](docs/):
   required/opportunistic/unsupported CPU and platform feature baseline; boot-time feature-gate
 - [Signing and Chain of Trust](docs/signing.md) — threat model, signed-object, certificate and
   trust-store formats, which stage verifies what, verifier discipline
+- [Threat Model](docs/threat-model.md) — trust boundaries, the attacker each faces, its
+  mitigations, fuzz and proof coverage, and gaps (provisional until v0.13.0)
 - [Boot Media](docs/boot-media.md) — installed copies, the ESP as derived state, the bootstrap
   closure, and the bootstrap-only use of boot copies
 - [Limits](docs/limits.md) — catalogue of every in-tree bound, classified against

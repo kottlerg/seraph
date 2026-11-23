@@ -865,8 +865,8 @@ fn pin_self(cpu: u32)
 ///
 /// The kernel runs a CPU's strict-priority thread before any fair one
 /// (core/kernel/docs/scheduler.md § Scheduling Classes). Each time the
-/// waiter wakes from its sleep, it preempts the allocating thread at the
-/// next tick, often while that thread holds the heap lock. The holder can
+/// waiter wakes from its sleep, it preempts the allocating thread at that
+/// thread's next return to user mode, often while it holds the heap lock. The holder can
 /// release the lock only if the waiter leaves the CPU, which std's
 /// `SpinMutex` does by sleeping once its spin bound is spent. A waiter that
 /// only spun would hold the CPU forever, and this phase would never end.

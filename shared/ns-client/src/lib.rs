@@ -14,17 +14,22 @@
 //!   * derive attenuated subtree / cwd caps to install on children via
 //!     `procmgr_labels::CONFIGURE_NAMESPACE` ([`walk_to_dir`]).
 //!
-//! Both helpers mirror the per-component `NS_LOOKUP` walk std performs
-//! in `runtime/ruststd/src/sys/fs/seraph.rs`, reduced to `no_std`
-//! primitives. `requested_rights` is the rights word sent on every hop;
-//! the server composes each hop's rights from the parent cap, the entry, and
-//! the request (`shared/namespace-protocol/README.md` § `NS_LOOKUP`), so the
-//! returned cap carries at most `requested_rights` on every bit. `0xFFFF`
-//! requests everything the caller is allowed.
+//! Both helpers walk as std does in `runtime/ruststd/src/sys/fs/seraph.rs`,
+//! through the same [`namespace_protocol::client::PathWalk`]: each
+//! `NS_LOOKUP` carries as many of the remaining components as fit one
+//! request, the server walks as many of them as it owns, and the walk
+//! continues from the returned cap with the rest.
+//! `requested_rights` is the rights word sent on every request; the
+//! server composes each component's rights from its parent's, the entry,
+//! and the request (`shared/namespace-protocol/README.md` § `NS_LOOKUP`), so
+//! the returned cap carries at most `requested_rights` on every bit.
+//! `0xFFFF` requests everything the caller is allowed.
 
 #![no_std]
 
-use ipc::{IpcMessage, ns_labels};
+use ipc::IpcMessage;
+use namespace_protocol::client::PathWalk;
+use namespace_protocol::validate_name;
 
 /// Result of [`walk_to_file`].
 pub struct WalkedFile
@@ -36,16 +41,17 @@ pub struct WalkedFile
     pub size: u64,
 }
 
-/// Walk `path` from `root_cap` requesting `requested_rights` per hop
-/// and return the resolved file cap.
+/// Walk `path` from `root_cap` requesting `requested_rights` at every
+/// component and return the resolved file cap.
 ///
-/// Each non-final hop must resolve to a directory; the final hop must
-/// resolve to a file (kind 0).
+/// Each non-final component must resolve to a directory; the final one
+/// must resolve to a file (kind 0).
 ///
 /// - `root_cap`: badged SEND addressing the directory the walk starts from.
-/// - `path`: `/`-separated components, resolved one `NS_LOOKUP` per component.
-/// - `requested_rights`: the rights word sent on every hop (`0xFFFF` asks for
-///   everything the server allows).
+/// - `path`: `/`-separated components, resolved by as few `NS_LOOKUP`s as
+///   the servers that own them allow.
+/// - `requested_rights`: the rights word sent on every request (`0xFFFF` asks
+///   for everything the server allows).
 /// - `ipc_buf`: the calling thread's registered IPC buffer.
 ///
 /// Returns `None` on any failure. On error, any partially-derived cap
@@ -54,7 +60,7 @@ pub struct WalkedFile
 /// # Safety
 /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer page
 /// as registered via `syscall::ipc_buffer_set` (the contract of
-/// `ipc::ipc_call`, which each hop issues through it).
+/// `ipc::ipc_call`, which each request is issued through).
 pub unsafe fn walk_to_file(
     root_cap: u64,
     path: &[u8],
@@ -76,17 +82,18 @@ pub unsafe fn walk_to_file(
     })
 }
 
-/// Walk `path` from `root_cap` requesting `requested_rights` per hop
-/// and return the resolved directory cap.
+/// Walk `path` from `root_cap` requesting `requested_rights` at every
+/// component and return the resolved directory cap.
 ///
-/// Every hop (including the final) must resolve to a directory
+/// Every component (including the final) must resolve to a directory
 /// (kind 1). Used to derive attenuated subtree / cwd caps for
 /// `CONFIGURE_NAMESPACE`.
 ///
 /// - `root_cap`: badged SEND addressing the directory the walk starts from.
-/// - `path`: `/`-separated components, resolved one `NS_LOOKUP` per component.
-/// - `requested_rights`: the rights word sent on every hop (`0xFFFF` asks for
-///   everything the server allows).
+/// - `path`: `/`-separated components, resolved by as few `NS_LOOKUP`s as
+///   the servers that own them allow.
+/// - `requested_rights`: the rights word sent on every request (`0xFFFF` asks
+///   for everything the server allows).
 /// - `ipc_buf`: the calling thread's registered IPC buffer.
 ///
 /// Returns `None` on any failure. On error, any partially-derived cap
@@ -95,7 +102,7 @@ pub unsafe fn walk_to_file(
 /// # Safety
 /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer page
 /// as registered via `syscall::ipc_buffer_set` (the contract of
-/// `ipc::ipc_call`, which each hop issues through it).
+/// `ipc::ipc_call`, which each request is issued through).
 pub unsafe fn walk_to_dir(
     root_cap: u64,
     path: &[u8],
@@ -120,17 +127,18 @@ struct WalkResult
     size: u64,
 }
 
-/// Shared per-component walk used by [`walk_to_file`] and [`walk_to_dir`].
-/// Returns the cap, kind, and size hint reported by the final hop.
-/// Refuses empty paths (an empty walk would hand back the caller's
-/// own input cap, which the helper does not own).
+/// Shared walk used by [`walk_to_file`] and [`walk_to_dir`]. Returns the
+/// cap, kind, and size hint the final reply reports. Refuses an empty path
+/// (an empty walk would hand back the caller's own input cap, which the
+/// helper does not own) and a component that fails [`validate_name`],
+/// before any request.
 ///
 /// # Safety
 /// The contract of [`walk_to_file`] for `ipc_buf`.
 #[expect(
     clippy::large_stack_frames,
-    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy, one set per \
-              path component; on its caller's stack, 16 KiB at the smallest (init's)"
+    reason = "the request and reply `IpcMessage`s (568 B each), the builder's copy, and the \
+              `LookupRequest` (520 B); on its caller's stack, 16 KiB at the smallest (init's)"
 )]
 unsafe fn walk(
     root_cap: u64,
@@ -139,94 +147,59 @@ unsafe fn walk(
     ipc_buf: *mut u64,
 ) -> Option<WalkResult>
 {
-    let mut current_cap = root_cap;
-    let mut current_owns = false;
-    let mut last_kind: u64 = 0;
-    let mut size_hint: u64 = 0;
-    // Counts hops only to detect an empty path; it cannot exceed the number
-    // of components in `path`.
-    let mut walked = false;
-
-    // Components split on `/`, skipping empty segments.
-    for name in path.split(|&b| b == b'/').filter(|c| !c.is_empty())
+    let mut walk = PathWalk::new(path);
+    if walk.is_finished() || walk.components().any(|name| validate_name(name).is_err())
     {
-        // 255 is `namespace_protocol::MAX_NAME_LEN`, the per-component limit
-        // the server enforces; a longer name cannot resolve.
-        if name.is_empty() || name.len() > 255
-        {
-            if current_owns
-            {
-                let _ = syscall::cap_delete(current_cap);
-            }
-            return None;
-        }
-        // Reject `.`, `..`, `/`, NUL.
-        if name == b"." || name == b".." || name.iter().any(|&b| b == b'/' || b == 0)
-        {
-            if current_owns
-            {
-                let _ = syscall::cap_delete(current_cap);
-            }
-            return None;
-        }
+        return None;
+    }
 
-        let label = ns_labels::NS_LOOKUP | ((name.len() as u64) << 16);
-        let msg = IpcMessage::builder(label)
+    let mut current = WalkResult {
+        cap: root_cap,
+        kind: 0,
+        size: 0,
+    };
+    // `current.cap` is the caller's `root_cap` until the first reply, and
+    // a cap this walk owns from then on.
+    let mut current_owns = false;
+    while let Some(request) = walk.request()
+    {
+        let msg = IpcMessage::builder(request.label())
             .word(0, requested_rights)
-            .bytes(1, name)
+            .bytes(1, request.path())
             .build();
 
         // SAFETY: the caller's contract makes ipc_buf this thread's
         // registered IPC buffer page.
-        let Ok(reply) = (unsafe { ipc::ipc_call(current_cap, &msg, ipc_buf) })
-        else
-        {
-            if current_owns
-            {
-                let _ = syscall::cap_delete(current_cap);
-            }
-            return None;
-        };
-        if reply.label != 0
-        {
-            if current_owns
-            {
-                let _ = syscall::cap_delete(current_cap);
-            }
-            return None;
-        }
-        last_kind = reply.word(0);
-        size_hint = reply.word(1);
-        let Some(&next_cap) = reply.caps().first()
-        else
-        {
-            if current_owns
-            {
-                let _ = syscall::cap_delete(current_cap);
-            }
-            return None;
-        };
-
+        let reply = unsafe { ipc::ipc_call(current.cap, &msg, ipc_buf) }
+            .ok()
+            .filter(|reply| reply.label == 0);
+        let next_cap = reply
+            .as_ref()
+            .and_then(|reply| reply.caps().first().copied());
         if current_owns
         {
-            let _ = syscall::cap_delete(current_cap);
+            let _ = syscall::cap_delete(current.cap);
         }
-        current_cap = next_cap;
+        let (Some(reply), Some(next_cap)) = (reply, next_cap)
+        else
+        {
+            return None;
+        };
+        current = WalkResult {
+            cap: next_cap,
+            kind: reply.word(0),
+            size: reply.word(1),
+        };
         current_owns = true;
-        walked = true;
+        // A malformed consumed count, or a file with components after it.
+        if walk.advance(&request, reply.word(2), current.kind).is_err()
+        {
+            let _ = syscall::cap_delete(current.cap);
+            return None;
+        }
     }
 
-    if !walked
-    {
-        // Empty path — `current_cap` is still the input `root_cap` and
-        // not owned. Refuse rather than handing the caller someone
-        // else's slot.
-        return None;
-    }
-
-    Some(WalkResult {
-        cap: current_cap,
-        kind: last_kind,
-        size: size_hint,
-    })
+    // Every component passed `validate_name`, so each fits a request and
+    // the loop ends only with the walk finished, after one reply at least.
+    Some(current)
 }

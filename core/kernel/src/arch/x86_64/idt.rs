@@ -665,9 +665,35 @@ pub(super) unsafe extern "C" fn common_exception_handler(
 /// Mirrors the call-from-naked-asm pattern of [`page_fault_handler`]: the
 /// trampoline upholds the precondition that `tf` is a valid, writable
 /// [`TrapFrame`] on the current stack, so this is a safe `extern "C"` fn.
-/// `vector`/`error_code` are the trap metadata from the stub frame.
+/// `vector`/`error_code` are the trap metadata from the stub frame. A return
+/// to ring 3 runs the wake-preemption check after [`resolve_exception`]
+/// (`sched::preempt_at_exception_return`), since fault delivery can link a
+/// thread on this CPU and absorb a wake IPI in a preemption-disabled window.
 #[cfg(not(test))]
 extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64)
+{
+    // SAFETY: tf is constructed by common_exception_trampoline or
+    // paranoid_exception_trampoline on this stack; a single read.
+    let from_user = (unsafe { (*tf).cs } & 3) != 0;
+    resolve_exception(tf, vector, error_code);
+    if from_user
+    {
+        let deliver = || {
+            // SAFETY: ring-3 origin, so tf is the thread's live user frame
+            // on its kernel stack; no lock is held, IF=0.
+            unsafe { crate::ipc::upcall::deliver_at_interrupt(tf) };
+        };
+        // SAFETY: the end of an exception from ring 3 that resolve_exception
+        // resumed, on the thread's kernel stack (#DF and #MC, on IST1, never
+        // return), its frame published; no lock is held, IF=0.
+        unsafe { crate::sched::preempt_at_exception_return(deliver) };
+    }
+}
+
+/// [`exception_handler`]'s body: returns only when the thread resumes at the
+/// frame, every other case diverging.
+#[cfg(not(test))]
+fn resolve_exception(tf: *mut TrapFrame, vector: u64, error_code: u64)
 {
     super::cpu::debug_assert_kernel_entry_flags();
     // SAFETY: tf is constructed by common_exception_trampoline or
@@ -1005,7 +1031,8 @@ pub(super) unsafe fn publish_user_frame(frame: *mut TrapFrame)
 /// it publishes as the thread's `trap_frame` first ([`publish_user_frame`]).
 /// Each handler performs its own EOI; this only dispatches, then, for an
 /// interrupt from user mode, makes the interrupt delivery point of a pending
-/// upcall (`ipc::upcall::deliver_at_interrupt`). A device vector's slot entry
+/// upcall (`ipc::upcall::deliver_at_interrupt`) and the wake-preemption check
+/// (`sched::preempt_if_outranked`). A device vector's slot entry
 /// in this CPU's vector row (`ioapic::slot_for_vector`), which names a GSI the
 /// I/O APIC routes, a message-signaled target, or no source, is passed to
 /// `irq::dispatch_device_irq`; an entry with no source (an interrupt latched
@@ -1056,17 +1083,27 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
         // that runs only user code still makes a pass of at most
         // POST_BUDGET posts every tick
         // (core/kernel/docs/capability-internals.md § Sole-Reference
-        // Observers).
+        // Observers). Before the delivery point and the check, so a thread a
+        // post wakes on this CPU is decided at this return.
         // SAFETY: ring-3 origin: the interrupted thread's kernel stack, each
         // handler above has sent its EOI, no lock is held, IF=0.
         unsafe { crate::cap::sole_reference::drain_at_interrupt() };
-        // The interrupt delivery point of an upcall posted with
-        // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
-        // Upcalls): each handler above has sent its EOI, and the thread the
-        // interrupt preempted is about to return to ring 3.
-        // SAFETY: ring-3 origin, so user_frame is the interrupted thread's
-        // live frame on its kernel stack; no lock is held, IF=0.
-        unsafe { crate::ipc::upcall::deliver_at_interrupt(user_frame) };
+        // The return to ring 3: the interrupt delivery point of an upcall
+        // posted with UPCALL_ANY_INSTRUCTION (docs/fault-handling.md
+        // § Asynchronous Upcalls), each handler above having sent its EOI;
+        // then the wake preemption of a thread the handler, or a wake IPI's
+        // sender, linked on this CPU above the interrupted one
+        // (core/kernel/docs/scheduler.md § Wake Preemption); both again after
+        // a preemption.
+        let deliver = || {
+            // SAFETY: ring-3 origin, so user_frame is the interrupted
+            // thread's live frame on its kernel stack; no lock is held,
+            // IF=0.
+            unsafe { crate::ipc::upcall::deliver_at_interrupt(user_frame) };
+        };
+        // SAFETY: the end of an interrupt from ring 3 on the interrupted
+        // thread's kernel stack, its frame published; no lock is held, IF=0.
+        unsafe { crate::sched::deliver_and_preempt(deliver) };
     }
 }
 
@@ -1405,7 +1442,7 @@ unsafe extern "custom" fn isr_page_fault()
     );
 }
 
-/// Page-fault (`#PF`, vector 14) handler body.
+/// Page-fault (`#PF`, vector 14) handler.
 ///
 /// Classifies the fault before the diverging common handler runs: a userspace
 /// fault whose faulting address (CR2) is mapped with permissions covering the
@@ -1421,9 +1458,34 @@ unsafe extern "custom" fn isr_page_fault()
 /// bytes not copied, `rcx` is set to 0, and `rip` is left as it was, since a
 /// ring-0 `iretq` to another address raises `#CP` while shadow stacks are on.
 /// Every other fault is handed to [`common_exception_handler`], which never
-/// returns.
+/// returns. A return to ring 3 runs the wake-preemption check after
+/// [`resolve_page_fault`] (`sched::preempt_at_exception_return`), since
+/// fault delivery can link a thread on this CPU and absorb a wake IPI in a
+/// preemption-disabled window.
 #[cfg(not(test))]
 extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
+{
+    // SAFETY: tf is constructed by isr_page_fault on this stack; a single read.
+    let from_user = (unsafe { (*tf).cs } & 3) != 0;
+    resolve_page_fault(tf, error_code);
+    if from_user
+    {
+        let deliver = || {
+            // SAFETY: ring-3 origin, so tf is the thread's live user frame
+            // on its kernel stack; no lock is held, IF=0.
+            unsafe { crate::ipc::upcall::deliver_at_interrupt(tf) };
+        };
+        // SAFETY: the end of a page fault from ring 3 that resolve_page_fault
+        // resumed, on the thread's kernel stack, its frame published; no lock
+        // is held, IF=0.
+        unsafe { crate::sched::preempt_at_exception_return(deliver) };
+    }
+}
+
+/// [`page_fault_handler`]'s body: returns only when the faulting context
+/// resumes at the frame, every other case diverging.
+#[cfg(not(test))]
+fn resolve_page_fault(tf: *mut TrapFrame, error_code: u64)
 {
     /// `#PF` error-code bits (Intel SDM Vol 3 §4.7).
     const ERR_PRESENT: u64 = 1 << 0;

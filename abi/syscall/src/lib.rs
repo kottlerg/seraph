@@ -1472,8 +1472,9 @@ pub const FAULT_KIND_UPCALL: u64 = 2;
 pub const UPCALL_POINT_SYSCALL: u64 = 0;
 
 /// Upcall delivery point (`FAULT_KIND_UPCALL` data word 2): the return to user
-/// mode from an interrupt that preempted the thread, which only a post with
-/// [`UPCALL_ANY_INSTRUCTION`] delivers at.
+/// mode from an interrupt that preempted the thread, or from an exception at
+/// whose end the kernel preempted it for a higher-priority thread, which only a
+/// post with [`UPCALL_ANY_INSTRUCTION`] delivers at.
 pub const UPCALL_POINT_INTERRUPT: u64 = 1;
 
 /// `SYS_THREAD_POST_UPCALL` flag: deliver at any return to user mode, an

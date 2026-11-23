@@ -47,15 +47,15 @@ const OTHER_FILE_NAMES: &[&str] = &[
 /// FNV-1a 64 over a sequence of fields, each the field's UTF-8 bytes followed
 /// by a NUL byte. The workflow script computes the same function; the test
 /// `the_digest_of_the_shared_vector_is_pinned` pins the value the script's
-/// self-test also pins.
-struct Digest(u64);
+/// self-test also pins. `threat-scope` digests with it too.
+pub(super) struct Digest(u64);
 
 impl Digest
 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 
-    fn new() -> Self
+    pub(super) fn new() -> Self
     {
         Digest(Self::OFFSET)
     }
@@ -65,7 +65,7 @@ impl Digest
         self.0 = (self.0 ^ u64::from(b)).wrapping_mul(Self::PRIME);
     }
 
-    fn field(&mut self, value: &str) -> &mut Self
+    pub(super) fn field(&mut self, value: &str) -> &mut Self
     {
         for b in value.bytes()
         {
@@ -75,7 +75,7 @@ impl Digest
         self
     }
 
-    fn hex(&self) -> String
+    pub(super) fn hex(&self) -> String
     {
         format!("{:016x}", self.0)
     }
@@ -108,10 +108,10 @@ struct Unit
 
 /// One open Issue.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Issue
+pub(super) struct Issue
 {
-    number: u64,
-    title: String,
+    pub(super) number: u64,
+    pub(super) title: String,
 }
 
 /// The three paged lists.
@@ -381,7 +381,7 @@ fn chunk_fields(d: &mut Digest, c: &UnitChunk<'_>)
     }
 }
 
-fn issue_fields(d: &mut Digest, i: &Issue)
+pub(super) fn issue_fields(d: &mut Digest, i: &Issue)
 {
     d.field(&i.number.to_string()).field(&i.title);
 }
@@ -396,6 +396,12 @@ fn list_digest<T>(list: List, items: &[T], fields: fn(&mut Digest, &T)) -> Strin
         fields(&mut d, item);
     }
     d.hex()
+}
+
+/// The digest of the whole open-Issue list.
+pub(super) fn issues_digest(issues: &[Issue]) -> String
+{
+    list_digest(List::Issues, issues, issue_fields)
 }
 
 fn file_json(f: &RangeFile) -> Value
@@ -533,7 +539,7 @@ impl Scope
         let issues = (
             self.issues.len(),
             page_count(self.issues.len(), per_page),
-            list_digest(List::Issues, &self.issues, issue_fields),
+            issues_digest(&self.issues),
         );
         let unit_file_entries: usize = self.units.iter().map(|u| u.files.len()).sum();
         let mut d = Digest::new();
@@ -700,7 +706,8 @@ fn read_files(root: &Path, from_sha: &str, head: &str) -> Result<Vec<RangeFile>>
         .collect())
 }
 
-fn read_issues(root: &Path) -> Result<Vec<Issue>>
+/// Every open Issue, in ascending number.
+pub(super) fn read_issues(root: &Path) -> Result<Vec<Issue>>
 {
     let limit = ISSUE_LIMIT.to_string();
     let list = gh::json(

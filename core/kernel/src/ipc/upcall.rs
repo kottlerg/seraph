@@ -125,9 +125,12 @@ pub unsafe fn post(
     if any_instruction
     {
         // A target running on another CPU takes the prod's interrupt and
-        // reaches its return to user mode; one running nowhere reaches a
-        // delivery point when it next returns to user mode, and one running on
-        // this CPU is the caller, which delivers at this syscall's return.
+        // reaches its return to user mode; one waiting on a run queue, which a
+        // return to user mode preempted, passes that return's delivery point
+        // when it runs again (sched::deliver_and_preempt); a fault-blocked one
+        // passes none at its fault's own return, only at a later interrupt or
+        // syscall; and one running on this CPU is the caller, which delivers
+        // at this syscall's return.
         // SAFETY: target valid; the scan reads each CPU's current under its lock.
         if let Some(cpu) = unsafe { running_cpu(target) }
             && cpu != crate::arch::current::cpu::current_cpu() as usize
@@ -364,12 +367,15 @@ pub unsafe fn deliver_at_syscall()
 
 /// The interrupt delivery point: deliver the pending upcalls posted with
 /// `UPCALL_ANY_INSTRUCTION` of the thread an interrupt preempted in user mode,
-/// before the interrupt returns to it.
+/// before the interrupt returns to it, or of a thread the wake preemption
+/// rescheduled at the end of an exception it took in user mode
+/// (`sched::preempt_at_exception_return`).
 ///
 /// # Safety
 /// The end of an interrupt handler taken from user mode, the interrupt
-/// acknowledged, on the interrupted thread's kernel stack with `frame` its
-/// live user frame; no lock is held, interrupts disabled.
+/// acknowledged, or of an exception taken from user mode that resumes the
+/// thread, on the thread's kernel stack with `frame` its live user frame; no
+/// lock is held, interrupts disabled.
 #[cfg(not(test))]
 pub unsafe fn deliver_at_interrupt(frame: *mut crate::arch::current::trap_frame::TrapFrame)
 {

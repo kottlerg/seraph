@@ -973,5 +973,5 @@ it trusts. On-box key enrolment for self-hosted builds is
 
 ## Summarized By
 
-[Boot Media](boot-media.md), [System Bootstrap](bootstrap.md),
+[Boot Media](boot-media.md), [System Bootstrap](bootstrap.md), [Threat Model](threat-model.md),
 [shared/objsig/README.md](../shared/objsig/README.md)

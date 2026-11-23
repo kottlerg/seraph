@@ -527,6 +527,31 @@ pub fn current_cpu() -> u32
     }
 }
 
+/// Read the pointer at byte `OFFSET` of this CPU's `PerCpuData` with one
+/// `tp`-relative load.
+///
+/// # Safety
+/// `tp` holds this CPU's `PerCpuData` address (`install_percpu`), and
+/// `OFFSET` is the offset of a pointer field of it, below the 2 KiB reach of
+/// a load's immediate.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn read_percpu_ptr<T, const OFFSET: usize>() -> *const T
+{
+    let ptr: *const T;
+    // SAFETY: OFFSET(tp) is the pointer field (caller contract); the load
+    // writes no memory.
+    unsafe {
+        core::arch::asm!(
+            "ld {}, {off}(tp)",
+            out(reg) ptr,
+            off = const OFFSET,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    ptr
+}
+
 // ── Core topology ─────────────────────────────────────────────────────────────
 
 /// The key of the core logical CPU `cpu` runs on: equal for exactly the CPUs

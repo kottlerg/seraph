@@ -5,9 +5,9 @@
 
 //! The filesystem benchmarks: `/programs/fsbench` run at its full counts.
 //!
-//! fsbench measures `std::fs::File`'s read and write paths and logs its own
-//! result lines, `fsbench.read` and `fsbench.write`
-//! (programs/fsbench/README.md § Output); the suite runs it as it is, so one
+//! fsbench measures `std::fs::File`'s read and write paths and the open of a
+//! three-component path, and logs its own result lines, `fsbench.read`,
+//! `fsbench.write` and `fsbench.open` (programs/fsbench/README.md § Output); the suite runs it as it is, so one
 //! program owns the method whichever harness runs it.
 
 use crate::harness::Outcome;

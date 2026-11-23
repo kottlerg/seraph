@@ -76,12 +76,13 @@ install it with `cargo install --locked kani-verifier --version <pin>`, then
 `cargo kani setup`. `cargo xtask kani` checks `cargo kani --version` against the pin and fails,
 naming these commands, on another release or none.
 
-The crates Kani verifies, each in its test configuration, build with both nightlies, the tree's
-and the pin's. A crate that uses a library API stable on the tree's nightly but not yet on the
-pin's carries `#![cfg_attr(kani, feature(<name>))]`, the one feature-gate attribute this
+The crates Kani verifies, each in its test configuration, and every crate they depend on build with
+both nightlies, the tree's and the pin's, since `cargo kani` builds the whole dependency graph with
+the pin's. A crate of that graph that uses a library API stable on the tree's nightly but not yet on
+the pin's carries `#![cfg_attr(kani, feature(<name>))]`, the one feature-gate attribute this
 permits, and drops it once the pin's nightly has the API stable (the kernel carries
-`unsafe_cell_access`). A toolchain bump runs `cargo xtask kani` too, and moves the pin to the
-newest Kani release that builds the tree; until one does, the bump waits.
+`unsafe_cell_access`). A toolchain bump runs `cargo xtask kani` too, and moves the pin to the newest
+Kani release that builds the tree; until one does, the bump waits.
 
 ---
 

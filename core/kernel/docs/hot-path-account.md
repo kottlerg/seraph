@@ -142,9 +142,9 @@ is not taken.
 | 1 | #1539: skip the I/O bitmap reload when the TSS already holds it | local | about 2100 per row that switches twice / none |
 | 2 | #1540: copy user memory a word at a time on riscv64 | local | none / about 24000 on `thread_read_mem_page`, 1300 on IPC with 7 words |
 | 3 | #1541: build IPC messages in place, copying only the valid words (taken: PR #1567) | local | 384 / 1570 per IPC round trip, measured |
-| 4 | #1548: test the return-to-user work with one per-CPU word (after PR #1507) | design | about 30 / 50 per return to user |
-| 5 | #1549: dispatch syscalls through one masked table index | design | about 50 / 30 per syscall |
-| 6 | #1547: read the current thread and per-CPU state through one per-CPU pointer (after PR #1507) | design | about 28 / 40 per kernel entry, most of the 38 / 53 the lookup costs |
+| 4 | #1547: read the current thread and per-CPU state through one per-CPU pointer (after PR #1507) | design | about 39 / 53 per kernel entry, three quarters of the 52 / 70 the lookup costs per entry across the gated rows |
+| 5 | #1548: test the return-to-user work with one per-CPU word (after PR #1507) | design | about 30 / 50 per return to user |
+| 6 | #1549: dispatch syscalls through one masked table index | design | about 50 / 30 per syscall |
 | 7 | #1542: monomorphise the page-table leaf walker's visitor | local | about 700 / not estimated (no thunk) per harvest of 32 pages |
 | 8 | #1550: serve small kernel entropy draws from one squeezed block | design | about 24000 / 24000 per thread lifecycle |
 | 9 | #1543: scan kernel stacks a line at a time, and paint them with wider stores | local | about 4700 / 12000 per thread lifecycle |

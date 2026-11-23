@@ -5,16 +5,15 @@ protocol, the sysroot layout for test binaries, the gating mechanism
 that determines which harnesses run in a given boot, and the tools that
 diagnose a failing boot.
 
-This document covers booted functional testing, and the fuzzing tier of the
-parsers of hostile input (§ Fuzzing). Host-side `#[cfg(test)]` unit
-tests — their quality rules and the boundary between host-unit and booted
-testing — are governed by
-[coding-standards.md](coding-standards.md#d-testing-invariants). `cargo xtask test` runs them on
-the host and again built for riscv64 under QEMU's user-mode emulator, which needs the packages
-[build-system.md](build-system.md#toolchain) § Toolchain lists. The ACPI tables the
-[`shared/aml`](../shared/aml/README.md) host tests load are QEMU's, captured by
-`cargo xtask capture-acpi`. Firmware tables captured from real hardware are not tracked; a
-defect found on one is reduced to a hand-written test case.
+This document covers booted functional testing, the fuzzing tier of the parsers of hostile input (§
+Fuzzing), and the bounded proofs of pure, sequential code (§ Bounded verification). Host-side
+`#[cfg(test)]` unit tests — their quality rules and the boundary between host-unit and booted
+testing — are governed by [coding-standards.md](coding-standards.md#d-testing-invariants). `cargo
+xtask test` runs them on the host and again built for riscv64 under QEMU's user-mode emulator, which
+needs the packages [build-system.md](build-system.md#toolchain) § Toolchain lists. The ACPI tables
+the [`shared/aml`](../shared/aml/README.md) host tests load are QEMU's, captured by `cargo xtask
+capture-acpi`. Firmware tables captured from real hardware are not tracked; a defect found on one is
+reduced to a hand-written test case.
 
 ---
 
@@ -1212,8 +1211,9 @@ memory size, or device set, and owes no local host run, whatever file it is in:
 - lint attributes: `#[allow(...)]`, `#[expect(...)]`, `#[warn(...)]`, `#[deny(...)]`, their inner
   `#![...]` forms, and a `#[cfg_attr(<predicate>, <lint attribute>)]`;
 - code compiled only for host tests, proofs, or fuzzing: a module or item under `#[cfg(test)]`,
-  `#[cfg(fuzzing)]`, or a `#[cfg(any(...))]` of no predicate but `test`, `kani`, and `fuzzing`
-  (§ Fuzzing), or a `#[test]` function;
+  `#[cfg(kani)]`, `#[cfg(fuzzing)]`, or a `#[cfg(any(...))]` of no predicate but `test`, `kani`,
+  and `fuzzing` (§ Fuzzing), a `#[test]` function, or an attribute applied only under `cfg(kani)`
+  (`#[cfg_attr(kani, ...)]`, § Bounded verification);
 - checked-in fuzz inputs: the files under a crate's `fuzz/` directory (§ Fuzzing), which only its
   replay test and its fuzz target read;
 - the deletion of a named function, constant, static, or type (not an `impl` block or a
@@ -1989,8 +1989,9 @@ per edge and compare tracing) and, where the host target supports it, AddressSan
 **Layout.** A fuzzed parser has three parts:
 
 - Its property: `pub fn <parser>_holds(input: &[u8])` in the parser crate's `property` module,
-  compiled under `#[cfg(any(test, fuzzing))]`, so no image carries it. It panics when the parser
-  breaks its contract on the input, and asserts that contract, not only that the parser returns:
+  compiled under `#[cfg(any(test, kani, fuzzing))]`, so no image carries it. It panics when the
+  parser breaks its contract on the input, and asserts that contract, not only that the parser
+  returns:
   for the GPT parser (`services/vfsd/gpt`), that an accepted header's entry array lies between
   LBA 2 and the first usable LBA, that the partition walk reads exactly the array's blocks inside
   the disk, and that each decoded entry re-encodes to its own bytes.
@@ -2042,7 +2043,40 @@ in the same one, as a red `master` is ([conventions.md](conventions.md#ci-gating
 
 **Parser rule.** A parser of hostile input (bytes from a disk image, a device, the network, or
 another process across an IPC boundary) MUST land with its property function, its seeds, its replay
-test, and its fuzz target, as Layout above describes.
+test, and its fuzz target, as Layout above describes, and with the proof harness of its property
+([Bounded verification](#bounded-verification), Parser proofs).
+
+---
+
+## Bounded verification
+
+Kani, a bounded model checker for Rust, proves a property of pure, sequential code for every input
+up to the bounds a proof harness states, where a host unit test checks the inputs it names. It
+covers the kernel's pure, sequential logic and the parsers of input from outside a component's
+trust boundary. A harness is a `#[kani::proof]` function in a `#[cfg(kani)] mod proofs`, written
+to the rules of [coding-standards.md](coding-standards.md#proof-harnesses) § Proof Harnesses.
+
+`cargo xtask kani` ([xtask/README.md](../xtask/README.md#cargo-xtask-kani)) runs every harness of
+every crate that holds one, each crate built in its host test configuration, with the pinned Kani
+release ([build-system.md](build-system.md#toolchain) § Toolchain). It fails on any failed,
+undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a
+harness in a crate it does not register. CI's `kani` job runs it on every push and pull request,
+and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
+§ Continuous Integration).
+
+Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
+tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches
+one; its loops are bounded; and it does not detect every aliasing or provenance violation
+([Kani's limitations](https://model-checking.github.io/kani/limitations.html),
+[supported Rust features](https://model-checking.github.io/kani/rust-feature-support.html)).
+
+**Parser proofs.** The property function of a parser of hostile input (§ Fuzzing, Layout) has a
+third driver beside its replay test and its fuzz target: a `#[kani::proof]` in the parser crate's
+`#[cfg(kani)] mod proofs` that runs the property on the first `len` bytes of
+`kani::any::<[u8; N]>()`, `len` itself any value up to N, so the contract holds for every input of
+at most N bytes, not only for the inputs a search reached. Its comment states N and why inputs of
+that length cover the format. The crate's first harness registers it with `cargo xtask kani`.
+Design intent; not yet implemented: no parser crate holds a proof harness yet.
 
 ---
 

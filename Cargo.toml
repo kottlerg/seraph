@@ -146,11 +146,11 @@ edition = "2024"
 publish = false
 
 
-# `fuzzing` is set by `cargo xtask fuzz` alone: the property modules of the
-# parser crates and the fuzz targets compile under it (docs/testing.md
-# § Fuzzing).
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+# `cargo kani` sets `cfg(kani)` (docs/testing.md § Bounded verification), and
+# `cargo xtask fuzz` alone sets `fuzzing`: the property modules of the parser
+# crates and the fuzz targets compile under it (docs/testing.md § Fuzzing).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(fuzzing)'] }
 
 [workspace.lints.clippy]
 all      = { level = "warn", priority = -1 }

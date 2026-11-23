@@ -5,7 +5,8 @@ protocol, the sysroot layout for test binaries, the gating mechanism
 that determines which harnesses run in a given boot, and the tools that
 diagnose a failing boot.
 
-This document covers booted functional testing. Host-side `#[cfg(test)]` unit
+This document covers booted functional testing, and the fuzzing tier of the
+parsers of hostile input (§ Fuzzing). Host-side `#[cfg(test)]` unit
 tests — their quality rules and the boundary between host-unit and booted
 testing — are governed by
 [coding-standards.md](coding-standards.md#d-testing-invariants). `cargo xtask test` runs them on
@@ -1210,7 +1211,9 @@ memory size, or device set, and owes no local host run, whatever file it is in:
 - Markdown, and comment lines in source files, build scripts, and linker scripts;
 - lint attributes: `#[allow(...)]`, `#[expect(...)]`, `#[warn(...)]`, `#[deny(...)]`, their inner
   `#![...]` forms, and a `#[cfg_attr(<predicate>, <lint attribute>)]`;
-- code compiled only for host tests: a `#[cfg(test)]` module or item, or a `#[test]` function;
+- code compiled only for host tests, proofs, or fuzzing: a module or item under `#[cfg(test)]`,
+  `#[cfg(fuzzing)]`, or a `#[cfg(any(...))]` of no predicate but `test`, `kani`, and `fuzzing`
+  (§ Fuzzing), or a `#[test]` function;
 - the deletion of a named function, constant, static, or type (not an `impl` block or a
   trait-method implementation; a module is the next item) that nothing names at the PR head
   outside comments and Markdown (`git grep -w <name> <head>` finds no other use) and that carries
@@ -1967,6 +1970,75 @@ list as the tracking Issues move):
   region's descriptor capacity before fatal-ing, so any residual overflow on a
   pathologically fragmented map is diagnosable rather than bare. Verified booting
   clean to the ktest pass marker on both arches at `--mem 4096`.
+
+---
+
+## Fuzzing
+
+The parsers of hostile input are fuzzed on the host by an in-tree coverage-guided engine,
+`xtask/fuzz/engine`, which uses no registry crate and no external tool
+([coding-standards.md](coding-standards.md#dependencies) § Dependencies). `cargo xtask fuzz`
+([xtask/README.md](../xtask/README.md#cargo-xtask-fuzz)) builds the fuzz targets of
+`xtask/fuzz/targets` with the pinned rustc's SanitizerCoverage instrumentation (an 8-bit counter
+per edge and compare tracing) and, where the host target supports it, AddressSanitizer, in the
+`fuzz` profile, which keeps panics unwinding, debug assertions, and overflow checks
+([build-system.md](build-system.md#build-profiles) § Build Profiles).
+
+**Layout.** A fuzzed parser has three parts:
+
+- Its property: `pub fn <parser>_holds(input: &[u8])` in the parser crate's `property` module,
+  compiled under `#[cfg(any(test, fuzzing))]`, so no image carries it. It panics when the parser
+  breaks its contract on the input, and asserts that contract, not only that the parser returns:
+  for the GPT parser (`services/vfsd/gpt`), that an accepted header's entry array lies between
+  LBA 2 and the first usable LBA, that the partition walk reads exactly the array's blocks inside
+  the disk, and that each decoded entry re-encodes to its own bytes.
+- Its checked-in inputs, under `<crate>/fuzz/<target>/`: `seeds/`, inputs that reach the parser's
+  paths, and `regressions/`, each failing input a fuzz run found, minimized, added by the PR that
+  fixes it. A `#[cfg(test)]` test of the crate runs the property on every one, so
+  `cargo xtask test` replays them on each change, on the host and under riscv64 emulation.
+- Its target: `xtask/fuzz/targets/src/bin/<target>.rs`, which names the property, the inputs'
+  directory, and the longest input the engine makes.
+
+**The engine.** Each run is AFL-style: a queue of the inputs that reached a new edge or a new
+hit-count bucket of one; havoc mutations and splices of the queued inputs; a dictionary of the
+constants the target compares against; and input-to-state replacement, which writes one operand
+of a comparison the parent input executed where the input holds the other. Every choice comes from
+one generator seeded by `--seed`, and a supervising process runs the search with address-space
+randomization off on a Linux host, since compare operands include addresses: a run of a fixed
+execution count from a fixed seed, over the same checked-in inputs and working corpus, is
+reproduced by the same command on the same host. The property runs under a panic catch; the
+supervisor catches what no catch can: a signal, an AddressSanitizer report, an allocation over the
+cap, and an input that runs over the time limit.
+
+**Triage.** A failing input is minimized while it fails at the same location, and written with
+its report under `target/xtask/fuzz/<target>/crashes/`: the panic message, its location, the
+execution that found it, the seed, a symbolized backtrace, and the replay command
+(`cargo xtask fuzz <target> --replay <file>`), which runs the property once on the input and
+fails as the search did, on any host. The run exits non-zero.
+
+**Cadence.**
+
+| Tier | Where | When | Runs |
+|---|---|---|---|
+| Gating | CI, the `fuzz` job of `build-test.yml` | every push and pull request | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
+| Campaign | CI, `fuzz.yml` | weekly, and on a manual dispatch | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
+| Local | developer host | at will | `cargo xtask fuzz <target>` with `--runs` or `--time` |
+
+The self-test runs the engine on planted defects in `xtask/fuzz/targets` (an eight-byte magic
+compared as one integer, a length field whose add overflows, and a state reached only through
+three nested records with no checksum) and fails unless each is found within its execution budget
+from seed 0, twice, at the same execution with the same minimized input.
+
+The campaign gates nothing. A red campaign run is a finding, recorded as
+[conventions.md](conventions.md#recording-findings) § Recording findings says.
+
+**Predating defects.** A failing input the gating job finds on a pull request whose own diff does
+not introduce the defect (the same run fails at the merge base) is fixed first, in its own PR or
+in the same one, as a red `master` is ([conventions.md](conventions.md#ci-gating) § CI Gating).
+
+**Parser rule.** A parser of hostile input (bytes from a disk image, a device, the network, or
+another process across an IPC boundary) MUST land with its property function, its seeds, its replay
+test, and its fuzz target, as Layout above describes.
 
 ---
 

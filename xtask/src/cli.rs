@@ -81,6 +81,14 @@ subcommands! {
         /// OpenSSL, or with `--check` fail unless they regenerate identically.
         CryptoVectors(CryptoVectorsArgs),
 
+        /// Build the fuzz targets with coverage instrumentation and run one, or
+        /// with `--all` each, under the in-tree engine for an execution budget
+        /// or a time; replay one input, minimize a corpus, list the targets, or
+        /// with `--self-test` check that the engine finds its planted defects
+        /// reproducibly. Exits non-zero when an input fails, with its report
+        /// under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md).
+        Fuzz(FuzzArgs),
+
         /// Read preserved ktest boot logs (from `run --runs N --save-logs`) and
         /// print per-tier and per-cell wall times; with `--base` and `--wide`,
         /// compare two widths against their width factor; with `--baseline`,
@@ -212,6 +220,7 @@ impl CliCommand
             Self::Clean(args) => Some(&args.host),
             Self::Test(args) => args.unit_tests().then_some(&args.host.common),
             Self::CryptoVectors(args) => Some(&args.host),
+            Self::Fuzz(args) => (!args.list).then_some(&args.host),
             Self::CompareImages(args) => Some(&args.host),
             Self::Run(_)
             | Self::KtestTiming(_)
@@ -866,6 +875,66 @@ args! {
         /// byte-identical, writing nothing.
         #[arg(long)]
         pub check: bool,
+
+        /// The shared host's launch rules (see xtask/README.md "Host launch
+        /// rules").
+        #[command(flatten)]
+        pub host: HostArgs,
+    }
+}
+
+// ── Fuzz ──────────────────────────────────────────────────────────────────────
+
+args! {
+    pub struct FuzzArgs
+    {
+        /// The fuzz target to run (`--list` names them).
+        #[arg(
+            value_name = "TARGET",
+            required_unless_present_any = ["all", "list", "self_test"],
+            conflicts_with_all = ["all", "list", "self_test"]
+        )]
+        pub target: Option<String>,
+
+        /// Run every fuzz target in turn, each whatever another's outcome, and
+        /// fail when one found a failing input.
+        #[arg(long, conflicts_with_all = ["list", "self_test", "replay"])]
+        pub all: bool,
+
+        /// Print the fuzz targets' names, building nothing.
+        #[arg(long, conflicts_with_all = ["self_test", "runs", "time", "replay", "minimize"])]
+        pub list: bool,
+
+        /// Run each planted target of the engine from seed 0 within its
+        /// budget, twice, and fail unless both runs find its defect at the
+        /// same execution with the same minimized input.
+        #[arg(long, conflicts_with_all = ["runs", "time", "replay", "minimize"])]
+        pub self_test: bool,
+
+        /// Stop after N executions (default: the count of the gating CI job,
+        /// 200000). A run from a fixed seed and corpus over a fixed count is
+        /// reproducible.
+        #[arg(long, value_name = "N", conflicts_with_all = ["time", "replay", "minimize"])]
+        pub runs: Option<u64>,
+
+        /// Stop after SECS seconds instead of an execution count: a longer
+        /// campaign, which a fixed seed does not reproduce.
+        #[arg(long, value_name = "SECS", conflicts_with_all = ["replay", "minimize"])]
+        pub time: Option<u64>,
+
+        /// The seed of the engine's random choices.
+        #[arg(long, default_value = "0")]
+        pub seed: u64,
+
+        /// Run the property once on FILE and exit non-zero when it fails: the
+        /// command a crash report prints.
+        #[arg(long, value_name = "FILE", conflicts_with = "minimize")]
+        pub replay: Option<PathBuf>,
+
+        /// Reduce the target's working corpus to a subset of its inputs with the
+        /// same coverage, the shorter inputs kept first.
+        #[arg(long)]
+        pub minimize: bool,
 
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
@@ -1662,6 +1731,9 @@ mod tests
             assert_eq!(host.wait_host, Some(30), "{command}");
             assert!(!host.host_override, "{command}");
         }
+        let fuzz = build_host_of(&["xtask", "fuzz", "--all", "--wait-host", "30"])
+            .expect("`fuzz` is not admitted as a build");
+        assert_eq!(fuzz.wait_host, Some(30));
         let overridden = build_host_of(&["xtask", "test", "--host-override"]).unwrap();
         assert!(overridden.host_override);
     }
@@ -1672,6 +1744,7 @@ mod tests
         assert!(build_host_of(&["xtask", "run"]).is_none());
         assert!(build_host_of(&["xtask", "lint-docs"]).is_none());
         assert!(build_host_of(&["xtask", "host", "status"]).is_none());
+        assert!(build_host_of(&["xtask", "fuzz", "--list"]).is_none());
         // A case or a cell boots, and admits each boot itself.
         assert!(build_host_of(&["xtask", "test", "kaslr"]).is_none());
         assert!(build_host_of(&["xtask", "test", "--cell", "usertest"]).is_none());

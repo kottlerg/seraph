@@ -3897,6 +3897,108 @@ ok crypto-vectors wait_host=["7"] host_override
 ["crypto-vectors","--check","--wait-host","7","--host-override"]
 ok crypto-vectors check wait_host=["7"] host_override
 
+["fuzz","gpt"]
+ok-all fuzz target=["gpt"] all=default list=default self_test=default seed=default["0"] minimize=default host_override=default
+
+["fuzz"]
+MissingRequiredArgument
+error: the following required arguments were not provided:
+  <TARGET>
+
+["fuzz","-h"]
+help xtask fuzz -h
+
+["help","fuzz"]
+help xtask fuzz -h
+
+["fuzz","--bogus"]
+UnknownArgument
+error: unexpected argument '--bogus' found
+
+["fuzz","--all"]
+ok fuzz all
+
+["fuzz","--list"]
+ok fuzz list
+
+["fuzz","--self-test"]
+ok fuzz self_test
+
+["fuzz","gpt","--runs","5"]
+ok fuzz target=["gpt"] runs=["5"]
+
+["fuzz","gpt","--time","60"]
+ok fuzz target=["gpt"] time=["60"]
+
+["fuzz","gpt","--seed","3"]
+ok fuzz target=["gpt"] seed=["3"]
+
+["fuzz","gpt","--seed","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["fuzz","gpt","--replay","crash"]
+ok fuzz target=["gpt"] replay=["crash"]
+
+["fuzz","gpt","--minimize"]
+ok fuzz target=["gpt"] minimize
+
+["fuzz","--all","--minimize"]
+ok fuzz all minimize
+
+["fuzz","--all","--time","60","--seed","9"]
+ok fuzz all time=["60"] seed=["9"]
+
+["fuzz","gpt","--all"]
+ArgumentConflict
+error: the argument '[TARGET]' cannot be used with '--all'
+
+["fuzz","gpt","--list"]
+ArgumentConflict
+error: the argument '[TARGET]' cannot be used with '--list'
+
+["fuzz","gpt","--self-test"]
+ArgumentConflict
+error: the argument '[TARGET]' cannot be used with '--self-test'
+
+["fuzz","--list","--runs","5"]
+ArgumentConflict
+error: the argument '--list' cannot be used with '--runs <N>'
+
+["fuzz","--self-test","--time","5"]
+ArgumentConflict
+error: the argument '--self-test' cannot be used with '--time <SECS>'
+
+["fuzz","--self-test","--all"]
+ArgumentConflict
+error: the argument '--self-test' cannot be used with '--all'
+
+["fuzz","gpt","--runs","5","--time","5"]
+ArgumentConflict
+error: the argument '--runs <N>' cannot be used with '--time <SECS>'
+
+["fuzz","gpt","--replay","crash","--minimize"]
+ArgumentConflict
+error: the argument '--replay <FILE>' cannot be used with '--minimize'
+
+["fuzz","gpt","--runs","5","--replay","crash"]
+ArgumentConflict
+error: the argument '--runs <N>' cannot be used with '--replay <FILE>'
+
+["fuzz","--all","--replay","crash"]
+ArgumentConflict
+error: the argument '--all' cannot be used with '--replay <FILE>'
+
+["fuzz","--all","--wait-host","7"]
+ok fuzz all wait_host=["7"]
+
+["fuzz","--list","--host-override"]
+ok fuzz list host_override
+
+["fuzz","gpt","extra"]
+UnknownArgument
+error: unexpected argument 'extra' found
+
 ["run","--parallel","1","--runs","1"]
 ok-all run arch=default["x86_64"] cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default runs=["1"] gdb=default debug_listen=default verbose=default parallel=["1"] timeout=default["30"] pass=default["ALL TESTS PASSED"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] hold_on_hang=default fail_grace_secs=default["10"] host_override=default alone=default timing=default
 

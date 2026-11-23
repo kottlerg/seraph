@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# The in-tree coverage-guided fuzzing engine: a host library each fuzz target
+# of xtask/fuzz/targets links. `cargo xtask fuzz` builds it without
+# SanitizerCoverage (the wrapper shim's `sancov-rustc` mode), so the callbacks
+# it defines are never instrumented themselves.
+[package]
+name = "fuzz-engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# No dependencies: docs/coding-standards.md § Dependencies.
+
+[lints]
+workspace = true

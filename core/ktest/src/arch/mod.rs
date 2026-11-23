@@ -14,7 +14,7 @@
 //!   halves of arch-neutral tests (register-file probes, machine-code stubs,
 //!   the denied user-mode counters).
 //! - `serial`: the UART behind `crate::serial`.
-//! - `init_io_ports`, `shutdown`, `cycles_now`: harness services.
+//! - `init_io_ports`, `shutdown`: harness services.
 //! - `core_key`: the core the running CPU reports, for `integration::smt_siblings`.
 //! - `run_unit`, `run_integration`: architecture-only Tier 1 and Tier 2 tests.
 
@@ -31,7 +31,7 @@ pub use current::{
     HAS_SPECULATION_CONTROLS, ILLEGAL_INSTRUCTION_VECTOR, IP_OFFSET, MMIO_PROBE_OFFSET,
     MMIO_PROBE_PHYS, MSG_INJECTABLE, PAGE_FAULT_LOAD_VECTOR, PAGE_FAULT_STORE_VECTOR,
     ROUTABLE_HIGH_IRQ_IDS, SP_OFFSET, SYSCALL_NR_OFFSET, TLS_OFFSET, TRAP_FRAME_BYTES,
-    UNROUTABLE_IRQ_IDS, breakpoint_reported_ip, callee_saved, code_stub, core_key, cycles_now,
+    UNROUTABLE_IRQ_IDS, breakpoint_reported_ip, callee_saved, code_stub, core_key,
     entry_stack_pointer, fpu, fresh_range_root, illegal_instruction, init_io_ports,
     msi_message_plausible, run_integration, run_unit, serial, shutdown, software_breakpoint,
     user_controls,

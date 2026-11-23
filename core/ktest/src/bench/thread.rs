@@ -10,7 +10,7 @@ use syscall::{
     thread_exit,
 };
 
-use super::{cycles_now, log_bench_header};
+use super::Harness;
 use crate::{ChildStack, spawn};
 
 static mut BENCH_LIFECYCLE_STACK: ChildStack = ChildStack::ZERO;
@@ -21,27 +21,25 @@ extern "C" fn lifecycle_entry(done_slot: u64) -> !
     thread_exit()
 }
 
-pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
+/// Benchmark: one child thread's whole life, timed from its creation to the
+/// deletion of its caps after it exits.
+pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, h: &mut Harness)
 {
     // Use fewer iterations for this heavier benchmark.
-    let n = iters.min(100);
+    let n = h.iters().min(100);
 
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        return h.skip("thread_lifecycle", "cap_create_notification failed");
     };
     // SAFETY: `BENCH_LIFECYCLE_STACK` is a static stack, reached only through `addr_of!`.
     let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(BENCH_LIFECYCLE_STACK)) };
 
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
-    let mut completed: u64 = 0;
-
+    let (mut samples, counters) = h.recorder();
     for _ in 0..n
     {
-        let t0 = cycles_now();
+        let t0 = counters.read();
 
         let Ok(mut child) = spawn::new_child(ctx)
         else
@@ -64,31 +62,13 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
         child.delete_thread().ok();
         child.delete_cspace().ok();
 
-        let t1 = cycles_now();
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
-        completed = completed.saturating_add(1);
+        samples.record(counters.read().since(&t0).cycles);
     }
+    let summary = samples.summary();
 
     cap_delete(done).ok();
 
-    log_bench_header("thread_lifecycle", n);
-    // The `checked_div(completed)` below guards against no successful
-    // iteration, so a u64::MAX min is never logged.
-    if let Some(mean) = total.checked_div(completed)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    h.report("thread_lifecycle", &[], summary, &[]);
 }
 
 // ── Context-switch latency ────────────────────────────────────────────────────
@@ -112,45 +92,57 @@ extern "C" fn ctxswitch_child_entry(done_slot: u64) -> !
 }
 
 /// Benchmark: context-switch latency via parent/child `thread_yield`
-/// ping-pong. The child is pinned to CPU 0; the parent (ktest's init
-/// thread) is not pinned, so the ping-pong measures a real context switch
-/// only while the parent also runs on CPU 0.
+/// ping-pong on CPU 0, where the child is pinned and `run_all` pins the
+/// parent (ktest's harness thread).
 ///
 /// The yield ping-pong requires the child at the parent's own level
 /// (`INIT_PRIORITY`; see `core/kernel/docs/scheduler.md` § Time Slice Policy),
 /// so the child is created at that level via the root `SchedControl` band.
 /// Skipped when the initial cap set has no `SchedControl` cap.
 ///
-/// Cost-per-switch = total wall cycles / (2 * N) — each iteration is two
-/// switches (parent → child, child → parent).
-pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
+/// Each sample is one parent `thread_yield` call: two switches, parent →
+/// child and child → parent, so the benchmark is `context_switch_pair`.
+///
+/// The extras `tlb_elided` and `tlb_performed` are the tagged-TLB flush
+/// counters, the cumulative system-wide elided and performed context-switch
+/// activations since boot (see docs/memory-model.md § TLB Management; both are
+/// 0 without hardware tagging). The ping-pong shares one address space, so it
+/// adds no tagged activation of its own; the totals count every cross-space
+/// and post-block re-activation since boot. QEMU TCG does not model
+/// TLB-refill timing, so its cycles are no measure of that cost.
+pub(super) fn bench_context_switch(ctx: &crate::TestContext, h: &mut Harness)
 {
     use crate::spawn;
 
+    const NAME: &str = "context_switch_pair";
+
     if ctx.sched_control_cap == 0
     {
-        crate::log("ktest: bench context_switch SKIP (no SchedControl cap)");
-        return;
+        return h.skip(NAME, "no SchedControl cap");
     }
 
-    let n = u64::from(iters);
-    BENCH_CTXSWITCH_ITERS.store(n, core::sync::atomic::Ordering::Release);
+    let n = h.iters();
+    BENCH_CTXSWITCH_ITERS.store(u64::from(n), core::sync::atomic::Ordering::Release);
 
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        return h.skip(NAME, "cap_create_notification failed");
     };
     // PRIORITY_MAX == INIT_PRIORITY: the level this (init-loaded) thread runs at.
     let Ok(mut child) = spawn::new_child_at(ctx, ctx.sched_control_cap, syscall_abi::PRIORITY_MAX)
     else
     {
-        return;
+        cap_delete(done).ok();
+        return h.skip(NAME, "the child could not be created");
     };
     let Ok(child_done) = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
     else
     {
-        return;
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
+        cap_delete(done).ok();
+        return h.skip(NAME, "cap_copy into the child failed");
     };
     // SAFETY: `BENCH_CTXSWITCH_STACK` is a static stack, reached only through `addr_of!`.
     let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(BENCH_CTXSWITCH_STACK)) };
@@ -164,43 +156,32 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
         child.delete_thread().ok();
         child.delete_cspace().ok();
         cap_delete(done).ok();
-        return;
+        return h.skip(NAME, "the child did not start");
     }
 
-    let t0 = cycles_now();
+    let (mut samples, counters) = h.recorder();
     for _ in 0..n
     {
+        let t0 = counters.read();
         let _ = syscall::thread_yield();
+        samples.record(counters.read().since(&t0).cycles);
     }
-    let t1 = cycles_now();
+    let summary = samples.summary();
 
     notification_wait(done).ok();
     child.delete_thread().ok();
     child.delete_cspace().ok();
     cap_delete(done).ok();
 
-    let total = t1.saturating_sub(t0);
-    // Two switches per iteration: parent → child and child → parent.
-    let per_switch = total.checked_div(n.saturating_mul(2));
-
-    log_bench_header("context_switch", iters);
-    if let Some(per) = per_switch
-    {
-        crate::log_u64("ktest: bench  cycles_per_switch=", per);
-    }
-
-    // Tagged-TLB flush counters: cumulative system-wide elided/performed
-    // context-switch activations (see docs/memory-model.md § TLB Management;
-    // both are 0 without hardware tagging). QEMU TCG does not model
-    // TLB-refill timing, so cycles_per_switch above is not a faithful cost
-    // measure. The parent⇄child ping-pong above shares an address space, so it
-    // adds no tagged activations of its own; the totals reflect every
-    // cross-space and post-block re-activation since boot.
     let elided = syscall::cap_info(ctx.memory_base, syscall_abi::CAP_INFO_TLB_ELIDED).unwrap_or(0);
     let performed =
         syscall::cap_info(ctx.memory_base, syscall_abi::CAP_INFO_TLB_PERFORMED).unwrap_or(0);
-    crate::log_u64("ktest: bench  ctxsw_flush_elided_total=", elided);
-    crate::log_u64("ktest: bench  ctxsw_flush_performed_total=", performed);
+    h.report(
+        NAME,
+        &[],
+        summary,
+        &[("tlb_elided", elided), ("tlb_performed", performed)],
+    );
 }
 
 // ── SYS_THREAD_READ_MEM throughput ────────────────────────────────────────────
@@ -225,49 +206,38 @@ static mut BENCH_READ_MEM_SINK: ReadMemSink = ReadMemSink([0; 4096]);
 /// through a never-started thread of ktest's own address space, cycling over
 /// [`READ_MEM_PAGES`] resident pages: the per-page cost a debugger pays to
 /// copy a process's memory (docs/fault-handling.md § Debugging).
-pub(super) fn bench_thread_read_mem(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_thread_read_mem(ctx: &crate::TestContext, h: &mut Harness)
 {
     use crate::spawn;
 
     let Ok(mut child) = spawn::new_child(ctx)
     else
     {
-        return;
+        return h.skip("thread_read_mem_page", "new_child failed");
     };
     let base = core::ptr::addr_of!(BENCH_READ_MEM_SOURCE) as u64;
     // SAFETY: `BENCH_READ_MEM_SINK` is reached only here, on ktest's one
     // thread, and the reference is the only one alive while the loop runs.
     let sink = unsafe { &mut (*core::ptr::addr_of_mut!(BENCH_READ_MEM_SINK)).0 };
 
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
-    let mut completed: u64 = 0;
+    let iters = h.iters();
+    let (mut samples, counters) = h.recorder();
     for i in 0..iters
     {
         let page = (i as usize) % READ_MEM_PAGES;
         let va = base.wrapping_add((page as u64).wrapping_mul(4096));
-        let t0 = cycles_now();
+        let t0 = counters.read();
         let read = syscall::thread_read_mem(child.th, va, sink);
-        let t1 = cycles_now();
+        let t1 = counters.read();
         if read != Ok(4096)
         {
             break;
         }
-        let delta = t1.saturating_sub(t0);
-        min = min.min(delta);
-        max = max.max(delta);
-        total = total.saturating_add(delta);
-        completed = completed.saturating_add(1);
+        samples.record(t1.since(&t0).cycles);
     }
+    let summary = samples.summary();
     child.delete_thread().ok();
     child.delete_cspace().ok();
 
-    log_bench_header("thread_read_mem_page", iters);
-    if let Some(mean) = total.checked_div(completed)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    h.report("thread_read_mem_page", &[], summary, &[]);
 }

@@ -125,6 +125,7 @@ fn main()
         CliCommand::Test(args) => commands::test::run(&ctx, args),
         CliCommand::CryptoVectors(args) => commands::crypto_vectors::run(&ctx, args),
         CliCommand::Fuzz(args) => commands::fuzz::run(&ctx, args),
+        CliCommand::Kani(args) => commands::kani::run(&ctx, args),
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
         CliCommand::Symbolize(args) => commands::symbolize::run(&ctx, args),
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),

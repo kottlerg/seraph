@@ -717,7 +717,7 @@ extern "C" fn run(info_ptr: u64) -> !
         init_info_va: info_ptr,
     };
 
-    let config = cmdline::KtestConfig::DEFAULT;
+    let config = cmdline::KtestConfig::BUILT;
 
     // ── Tier 1: per-syscall isolation ─────────────────────────────────────────
     if config.run_unit
@@ -911,6 +911,32 @@ pub fn log_args(args: core::fmt::Arguments<'_>)
     // `Line` cuts rather than fails, so the write cannot fail.
     let _ = core::fmt::Write::write_fmt(&mut line, args);
     log(line.as_str());
+}
+
+/// The output channels (serial and framebuffer) as one `fmt::Write` sink
+/// that takes text of any length.
+struct Channels;
+
+impl core::fmt::Write for Channels
+{
+    fn write_str(&mut self, s: &str) -> core::fmt::Result
+    {
+        serial::write_str(s);
+        framebuffer::write_str(s);
+        Ok(())
+    }
+}
+
+/// Log the line `write` writes, streamed to the output channels as it is
+/// written, so no length cut applies (a [`Line`] cuts at [`LINE_BYTES`]).
+/// The line takes the timestamp prefix and the line end [`log`] gives it.
+pub fn log_with<R>(write: impl FnOnce(&mut dyn core::fmt::Write) -> R) -> R
+{
+    write_timestamp();
+    let result = write(&mut Channels);
+    serial::write_byte(b'\n');
+    framebuffer::newline();
+    result
 }
 
 /// Log a decimal `u64` value prefixed by a static string.

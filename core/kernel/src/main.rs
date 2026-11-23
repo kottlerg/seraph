@@ -16,6 +16,11 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
+// `UnsafeCell::as_mut_unchecked` (sched/run_queue.rs) is stable on the
+// toolchain the tree pins and unstable on the nightly of the pinned Kani
+// release, which the bounded proofs build on (docs/build-system.md
+// § Toolchain); removed once that nightly has it stable.
+#![cfg_attr(kani, feature(unsafe_cell_access))]
 #![cfg_attr(
     test,
     expect(

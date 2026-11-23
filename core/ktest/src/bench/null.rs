@@ -11,37 +11,21 @@
 
 use syscall_abi::SystemInfoType;
 
-use super::{cycles_now, log_bench_header};
+use super::Harness;
 
-pub(super) fn bench_null_syscall(_ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_null_syscall(_ctx: &crate::TestContext, h: &mut Harness)
 {
-    let n = u64::from(iters);
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
+    let iters = h.iters();
+    let (mut samples, counters) = h.recorder();
 
-    for _ in 0..n
+    for _ in 0..iters
     {
-        let t0 = cycles_now();
+        let t0 = counters.read();
         let _ = syscall::system_info(SystemInfoType::KernelVersion as u64);
-        let t1 = cycles_now();
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
+        let t1 = counters.read();
+        samples.record(t1.since(&t0).cycles);
     }
 
-    log_bench_header("null_syscall_roundtrip", iters);
-    if let Some(mean) = total.checked_div(n)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    let summary = samples.summary();
+    h.report("null_syscall_roundtrip", &[], summary, &[]);
 }

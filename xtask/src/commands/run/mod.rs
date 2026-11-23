@@ -27,7 +27,7 @@ use crate::context::Context as BuildContext;
 use crate::disk::{logical_block_size, second_disk_block_size};
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, validate_sysroot_for_launch,
+    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv_for, validate_sysroot_for_launch,
 };
 use crate::term::filter::FilterWriter;
 use crate::term::guard::TerminalGuard;
@@ -155,7 +155,7 @@ fn boot_qemu(
         test_devices: launch.test_devices,
         hotplug_port: None,
     };
-    let qemu_args = build_qemu_argv(&spec)?;
+    let qemu_args = build_qemu_argv_for(&spec, launch.execution())?;
 
     let desc = match launch.arch
     {

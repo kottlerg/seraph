@@ -1,0 +1,4 @@
+# bench environment, written by `cargo xtask bench-check --write-env` or
+# `cargo xtask bench-baseline`. Format: xtask/README.md (`cargo xtask bench-check`).
+rustc	rustc 1.102.0-nightly (ac8310ba6 2026-11-09)
+qemu	QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.3)

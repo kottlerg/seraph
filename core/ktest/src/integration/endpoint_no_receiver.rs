@@ -29,7 +29,7 @@
 //! are timer-preempted peers).
 
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, cap_revoke,
+    MsgRegs, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, cap_revoke,
     notification_send, notification_wait_timeout, raw_ipc_call, raw_ipc_recv, thread_exit,
     thread_sleep, wait_set_add, wait_set_create, wait_set_wait_timeout,
 };
@@ -443,8 +443,8 @@ extern "C" fn client_entry(arg: u64) -> !
     // SAFETY: `arg` is the entry `start_child` published for this child.
     let ChildArgs { ep, done, shift } = unsafe { spawn::child_args(arg) };
     notification_send(done, BIT_READY << shift).ok();
-    let queued = raw_ipc_call(ep, 0x7185, 0, 0);
-    let later = raw_ipc_call(ep, 0x7185, 0, 0);
+    let queued = raw_ipc_call(ep, 0x7185, 0, 0, &MsgRegs::default());
+    let later = raw_ipc_call(ep, 0x7185, 0, 0, &MsgRegs::default());
     let bit = if no_receiver(&queued) && no_receiver(&later)
     {
         BIT_OK

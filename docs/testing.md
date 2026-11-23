@@ -2072,10 +2072,11 @@ one; its loops are bounded; and it does not detect every aliasing or provenance 
 
 **Parser proofs.** The property function of a parser of hostile input (§ Fuzzing, Layout) has a
 third driver beside its replay test and its fuzz target: a `#[kani::proof]` in the parser crate's
-`#[cfg(kani)] mod proofs` that runs the property on `kani::any::<[u8; N]>()`, its comment stating
-N and why that length covers the format, so the contract holds for every input up to N bytes, not
-only for the inputs a search reached. The crate's first harness registers it with
-`cargo xtask kani`. Design intent; not yet implemented: no parser crate holds a proof harness yet.
+`#[cfg(kani)] mod proofs` that runs the property on the first `len` bytes of
+`kani::any::<[u8; N]>()`, `len` itself any value up to N, so the contract holds for every input of
+at most N bytes, not only for the inputs a search reached. Its comment states N and why inputs of
+that length cover the format. The crate's first harness registers it with `cargo xtask kani`.
+Design intent; not yet implemented: no parser crate holds a proof harness yet.
 
 ---
 

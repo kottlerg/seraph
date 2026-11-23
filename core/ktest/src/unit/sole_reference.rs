@@ -506,7 +506,8 @@ fn start_spinners(
         let child = crate::spawn::new_child(ctx).map_err(|_| "busy_cpu: new_child failed")?;
         let cpu = u32::try_from(index)
             .ok()
-            .and_then(|i| i.checked_add(BUSY_CASE_CPU + 1))
+            .and_then(|i| i.checked_add(1))
+            .and_then(|i| i.checked_add(BUSY_CASE_CPU))
             .ok_or("busy_cpu: spinner CPU out of range")?;
         // SAFETY: SPIN_STACKS is a static array reached only through
         // addr_of!; each spinner runs on its own element, and the case waits

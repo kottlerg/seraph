@@ -270,6 +270,9 @@ pub struct ThreadControlBlock
     /// Soft affinity: preferred CPU (hint only; overridden by load balancing).
     preferred_cpu: u32,
 
+    /// How wakes and the load balancer placed this thread (§ Placement Counters).
+    placement: PlacementCounts,
+
     /// Intrusive run-queue link (next TCB in the same run queue).
     run_queue_next: Option<*mut ThreadControlBlock>,
 
@@ -629,6 +632,32 @@ Hot-path cost per CPU per tick:
   above decides a pull (a second time in the tick when a pull above the threshold moves
   nothing and the confirmation rule pulls the candidate). Under both locks the pull
   makes one Relaxed load of each CPU's load for the re-check.
+
+### Placement Counters
+
+Each thread carries four counters of how its wakes and the load balancer placed it
+(`thread::PlacementCounts`, the TCB's `placement`), which `SYS_CAP_INFO`'s
+`CAP_INFO_THREAD_PLACEMENT` reads with the thread's CPU
+([syscalls.md](syscalls.md#sys_cap_info-36) § `SYS_CAP_INFO` (36)). They are diagnostics: no
+kernel path reads them to decide. ktest's round-trip benchmarks report them for the two threads of
+each round trip, so a result line names whether the round trips stayed on one CPU or paid a wake
+of another ([core/ktest/README.md](../../ktest/README.md)).
+
+| Counter | Counts |
+|---|---|
+| `remote_wakes` | Wakes (`enqueue_and_wake`) that linked the thread on a CPU other than the waker's, each of which sent that CPU a wake IPI ([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol Invariants) |
+| `idle_wakes` | Of those, the wakes whose CPU ran its idle thread at the link, which halts while it has no work, so that the thread waited for the CPU to leave its halt |
+| `wake_moves` | Wakes that linked the thread on a CPU other than its `preferred_cpu` |
+| `pulls` | Load-balancer pulls that moved the thread (`pull_unpinned_ready`, § Load Balancing) |
+
+A wake counts only when it links the thread: a wake that finds it running, already linked, stopped
+or exited counts nothing. A thread's start, an affinity migration and a requeue of the running
+thread are not wakes. Every increment holds the thread's `sched_lock`, so each counter has one
+writer at a time and a load and a store make the increment; a reader takes no lock and reads each
+counter `Relaxed`, a snapshot. Each counter is a free-running 32-bit count that wraps, so a reader
+takes the wrapping difference of two reads. The CPU the selector reports is `preferred_cpu`, read
+under the thread's `sched_lock`: the CPU the thread was last linked on or dispatched on.
+
 
 ---
 

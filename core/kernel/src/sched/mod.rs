@@ -2859,6 +2859,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     slice_remaining: 0,
                     cpu_affinity: cpu as u32,
                     preferred_cpu: cpu as u32,
+                    placement: crate::sched::thread::PlacementCounts::new(),
                     run_queue_next: None,
                     queued_on: core::sync::atomic::AtomicI16::new(-1),
                     #[cfg(debug_assertions)]
@@ -6368,6 +6369,12 @@ unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -
     // its write, so a re-pin between the predicate and here refuses the move.
     // SAFETY: sched_lock + both run-queue locks held.
     let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
+    if moved
+    {
+        // SAFETY: tcb valid (linked on dst under its held lock); its sched_lock,
+        // held, serialises the counter's writers.
+        thread::PlacementCounts::count(unsafe { &(*tcb).placement.pulls });
+    }
 
     // SAFETY: paired with try_lock_raw above; released before the caller
     // releases the run-queue locks.
@@ -6584,6 +6591,10 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
     let linked = unsafe { sched.enqueue(tcb, priority) };
     if linked
     {
+        // Count the wake's placement against the CPU the thread was last on,
+        // before the retarget below overwrites it.
+        // SAFETY: both locks held; tcb valid; sched is target_cpu's scheduler.
+        unsafe { count_wake_placement(tcb, sched, target_cpu) };
         // Retarget preferred_cpu only when this call created the link, so the
         // field always names the surviving link's CPU (#359). Its consumers —
         // select_target_cpu's save-window pinning and sticky routing, the load
@@ -6616,6 +6627,84 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 /// Test stub for `enqueue_and_wake` (no-op in test mode).
 #[cfg(test)]
 pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
+
+/// Count in `tcb`'s placement counters a wake that has just linked it on
+/// `target_cpu`, whose scheduler is `target` (core/kernel/docs/scheduler.md
+/// § Placement Counters): a move when the CPU is not the one the thread was
+/// last on, a remote wake when it is not this CPU, and an idle wake when that
+/// remote CPU runs its idle thread. Called before the link's retarget of
+/// `preferred_cpu`, which it reads.
+///
+/// # Safety
+/// `tcb` is a valid TCB whose `sched_lock` the caller holds, and the caller
+/// holds `target.lock`.
+#[cfg(not(test))]
+unsafe fn count_wake_placement(
+    tcb: *mut ThreadControlBlock,
+    target: &PerCpuScheduler,
+    target_cpu: usize,
+)
+{
+    // SAFETY: tcb is valid (the caller's contract); the counters are atomics.
+    let counts = unsafe { &(*tcb).placement };
+    // SAFETY: preferred_cpu is owned by the sched_lock the caller holds.
+    if unsafe { (*tcb).preferred_cpu } as usize != target_cpu
+    {
+        thread::PlacementCounts::count(&counts.wake_moves);
+    }
+    if target_cpu == crate::arch::current::cpu::current_cpu() as usize
+    {
+        return;
+    }
+    thread::PlacementCounts::count(&counts.remote_wakes);
+    // A snapshot under the target's run-queue lock, held: the target runs its
+    // idle thread, and so halts or is about to, until the wake IPI that
+    // `enqueue_and_wake` sends after the unlock.
+    if core::ptr::eq(target.current(), target.idle())
+    {
+        thread::PlacementCounts::count(&counts.idle_wakes);
+    }
+}
+
+/// The `CAP_INFO_THREAD_PLACEMENT` answer for `tcb` and `view`, one of the
+/// `syscall::THREAD_PLACEMENT_*` views, or `None` for an unknown view
+/// (core/kernel/docs/scheduler.md § Placement Counters). The CPU is read under
+/// the thread's `sched_lock`, which owns `preferred_cpu`; a count is a
+/// `Relaxed` snapshot, read without it.
+///
+/// # Safety
+/// `tcb` is a valid TCB that stays valid for the call (the caller pins its
+/// Thread object), and the caller holds no lock.
+#[cfg(not(test))]
+pub unsafe fn placement_view(tcb: *mut ThreadControlBlock, view: u64) -> Option<u64>
+{
+    // SAFETY: tcb is valid (the caller's contract); the counters are atomics.
+    let counts = unsafe { &(*tcb).placement };
+    let counter = match view
+    {
+        syscall::THREAD_PLACEMENT_CPU =>
+        {
+            // SAFETY: tcb is valid (the caller's contract).
+            let lock = unsafe { &(*tcb).sched_lock };
+            // SAFETY: the caller holds no lock, so sched_lock is the outermost;
+            // paired with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: preferred_cpu is owned by the sched_lock held here.
+            let cpu = unsafe { (*tcb).preferred_cpu };
+            // SAFETY: saved is the word the lock_raw above returned.
+            unsafe { lock.unlock_raw(saved) };
+            return Some(u64::from(cpu));
+        }
+        syscall::THREAD_PLACEMENT_REMOTE_WAKES => &counts.remote_wakes,
+        syscall::THREAD_PLACEMENT_IDLE_WAKES => &counts.idle_wakes,
+        syscall::THREAD_PLACEMENT_WAKE_MOVES => &counts.wake_moves,
+        syscall::THREAD_PLACEMENT_PULLS => &counts.pulls,
+        _ => return None,
+    };
+    Some(u64::from(
+        counter.load(core::sync::atomic::Ordering::Relaxed),
+    ))
+}
 
 /// Make `tcb` `Ready` and link it on `target_cpu`'s run queue, under the
 /// per-TCB `sched_lock` — the DELIBERATE-placement primitive.

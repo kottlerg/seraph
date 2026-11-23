@@ -335,6 +335,54 @@ pub struct EnqueueBreadcrumb
     pub preferred_cpu: u32,
 }
 
+// ── Placement counters ────────────────────────────────────────────────────────
+
+/// A thread's placement counters, the counts `SYS_CAP_INFO`'s
+/// `CAP_INFO_THREAD_PLACEMENT` reads (core/kernel/docs/scheduler.md
+/// § Placement Counters). Diagnostics: no kernel path reads them to decide.
+///
+/// Every increment holds the thread's `sched_lock` ([`Self::count`]), so each
+/// counter has one writer at a time and a load and a store make the increment;
+/// a reader takes no lock and reads each counter `Relaxed`, a snapshot. Each
+/// counter is free-running and wraps.
+pub struct PlacementCounts
+{
+    /// Wakes that linked the thread on a CPU other than the waker's.
+    pub remote_wakes: core::sync::atomic::AtomicU32,
+    /// Remote wakes that found their CPU running its idle thread.
+    pub idle_wakes: core::sync::atomic::AtomicU32,
+    /// Wakes that linked the thread on a CPU other than its `preferred_cpu`.
+    pub wake_moves: core::sync::atomic::AtomicU32,
+    /// Load-balancer pulls that moved the thread to another CPU.
+    pub pulls: core::sync::atomic::AtomicU32,
+}
+
+impl PlacementCounts
+{
+    /// Every counter at zero, a new thread's.
+    pub const fn new() -> Self
+    {
+        Self {
+            remote_wakes: core::sync::atomic::AtomicU32::new(0),
+            idle_wakes: core::sync::atomic::AtomicU32::new(0),
+            wake_moves: core::sync::atomic::AtomicU32::new(0),
+            pulls: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Add one to `counter`, a counter of this set, wrapping. The caller holds
+    /// the `sched_lock` of the thread the set belongs to, which serialises every
+    /// increment, so the load and the store need no atomic read-modify-write.
+    pub fn count(counter: &core::sync::atomic::AtomicU32)
+    {
+        use core::sync::atomic::Ordering;
+        counter.store(
+            counter.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
+    }
+}
+
 // ── Park disposition ──────────────────────────────────────────────────────────
 
 /// No deposit yet for the current park episode. A `sys_ipc_call` resume
@@ -748,6 +796,11 @@ pub struct ThreadControlBlock
     /// Owned by [`sched_lock`](Self::sched_lock), which each of those writers
     /// holds.
     pub preferred_cpu: u32,
+
+    /// How wakes and the load balancer placed this thread
+    /// ([`PlacementCounts`]). Each counter is written under
+    /// [`sched_lock`](Self::sched_lock), and read without it.
+    pub placement: PlacementCounts,
 
     /// Intrusive run-queue link — next TCB in the same run queue.
     /// `None` when not on any run queue. Owned by the `scheduler.lock` of the

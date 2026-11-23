@@ -247,6 +247,7 @@ fn run_round_trips(
     }
 
     let reply = payload(0, words);
+    let start = super::Placement::read(ctx.thread_cap, child.th);
     let (mut samples, counters) = h.recorder();
     let mut completed: u64 = 0;
     for _ in 0..n
@@ -266,6 +267,7 @@ fn run_round_trips(
         samples.record(t1.since(&t0).cycles);
         completed = completed.saturating_add(1);
     }
+    let end = super::Placement::read(ctx.thread_cap, child.th);
 
     // After every round trip the child's last call has returned and it is on
     // its way to `done`; after an early break it may be parked in `ipc_call`
@@ -276,6 +278,12 @@ fn run_round_trips(
     }
     let summary = samples.summary();
 
-    h.report(NAME, &[("words", Value::Num(words as u64))], summary, &[]);
+    let extras = super::placement_extras(start.as_ref(), end.as_ref());
+    h.report(
+        NAME,
+        &[("words", Value::Num(words as u64))],
+        summary,
+        extras.as_ref().map_or(&[], |e| &e[..]),
+    );
     completed == n
 }

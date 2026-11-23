@@ -531,6 +531,35 @@ pub const THREAD_UPCALL_MASKED: u64 = 1 << 1;
 /// call's return.
 pub const THREAD_UPCALL_IN_CALL: u64 = 1 << 2;
 
+/// Thread only — one value of the thread's placement on the CPUs, the view
+/// named in argument 2 (one of the `THREAD_PLACEMENT_*` constants): the CPU
+/// it was last linked or dispatched on, or one of four counts of how its wakes
+/// and migrations placed it (core/kernel/docs/scheduler.md § Placement
+/// Counters). A diagnostic that decides nothing, read by a benchmark to name
+/// where its threads ran and what their wakes cost. Each count is the thread's
+/// own since its creation, a free-running 32-bit counter that wraps, so a
+/// reader takes the wrapping difference of two reads. Holding the slot
+/// suffices, as for [`CAP_INFO_THREAD_STATE`]. Calling on a non-Thread slot,
+/// or naming an unknown view, returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_THREAD_PLACEMENT: u64 = 20;
+
+/// [`CAP_INFO_THREAD_PLACEMENT`] view: the CPU the thread was last linked on
+/// a run queue of, or dispatched on, the one a wake of it next prefers.
+pub const THREAD_PLACEMENT_CPU: u64 = 0;
+/// [`CAP_INFO_THREAD_PLACEMENT`] view: wakes of the thread that linked it on
+/// a CPU other than the waker's, each of which sent that CPU a wake IPI.
+pub const THREAD_PLACEMENT_REMOTE_WAKES: u64 = 1;
+/// [`CAP_INFO_THREAD_PLACEMENT`] view: of the remote wakes, those that found
+/// their CPU running its idle thread, which halts while it has no work, so
+/// that the thread waited for the CPU to leave its halt.
+pub const THREAD_PLACEMENT_IDLE_WAKES: u64 = 2;
+/// [`CAP_INFO_THREAD_PLACEMENT`] view: wakes that linked the thread on a CPU
+/// other than the one it was last on.
+pub const THREAD_PLACEMENT_WAKE_MOVES: u64 = 3;
+/// [`CAP_INFO_THREAD_PLACEMENT`] view: times the load balancer moved the
+/// thread, queued, to another CPU.
+pub const THREAD_PLACEMENT_PULLS: u64 = 4;
+
 /// The word [`CAP_INFO_IRQ_REMAP_ENTRY`] answers, from a remapping entry's
 /// handle, the vector it delivers, and its destination APIC id.
 #[must_use]

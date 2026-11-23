@@ -313,8 +313,13 @@ struct FrameCharge
 /// after a warm-up `File` wrote the file once and dropped, and measure
 /// svctest's charge and write-frame memmgr calls around them as
 /// [`std_frame_write_pool_phase`] describes; the file is removed again.
-fn measure_frame_writes(path: &str, mut write: impl FnMut(&mut std::fs::File, &[u8]))
--> FrameCharge
+/// After the drop the file must hold the last measured write's bytes when
+/// `writes_land`, else the warm-up's.
+fn measure_frame_writes(
+    path: &str,
+    writes_land: bool,
+    mut write: impl FnMut(&mut std::fs::File, &[u8]),
+) -> FrameCharge
 {
     use std::io::{Seek, SeekFrom, Write};
 
@@ -364,8 +369,9 @@ fn measure_frame_writes(path: &str, mut write: impl FnMut(&mut std::fs::File, &[
     }
     assert_eq!(
         std::fs::read(path).expect("read back frame-pool file"),
-        last,
-        "the file must hold the last frame-path write's bytes"
+        if writes_land { last } else { chunk },
+        "the file must hold the last frame-path write's bytes, or the warm-up's when no write \
+         was sent"
     );
     std::fs::remove_file(path).expect("cleanup");
     FrameCharge {
@@ -416,7 +422,7 @@ pub fn std_frame_write_pool_phase(_: &Caps)
         rechecks,
         calls_written,
         calls_dropped,
-    } = measure_frame_writes("/data/svctest/std_frame_pool.bin", |f, chunk| {
+    } = measure_frame_writes("/data/svctest/std_frame_pool.bin", true, |f, chunk| {
         f.write_all(chunk).expect("frame write");
     });
     assert_eq!(
@@ -458,7 +464,7 @@ pub fn std_frame_write_past_deadline_phase(_: &Caps)
         rechecks,
         calls_written,
         calls_dropped,
-    } = measure_frame_writes("/data/svctest/std_frame_deadline.bin", |f, chunk| {
+    } = measure_frame_writes("/data/svctest/std_frame_deadline.bin", false, |f, chunk| {
         let wrote =
             std::os::seraph::with_call_deadline(std::time::Instant::now(), || f.write(chunk));
         let err = wrote.expect_err("a frame write under a passed call deadline was sent");

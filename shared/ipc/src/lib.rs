@@ -891,7 +891,7 @@ impl IpcMessageBuilder
 /// a cap slot is stale or Null (`InvalidCapability`), a cap slot is
 /// repeated in the message (`InvalidArgument`), a cap slot is pinned by an
 /// in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer
-/// (`InvalidState`), a cap's object has its reference count at its 2^31
+/// (`InvalidState`), a cap's object has its reference count at its 2^30
 /// ceiling (`QuotaExceeded`), no capability with the Receive right on the
 /// endpoint is left, at the call or while it was queued (`NoReceiver`), or the
 /// call is interrupted (`Interrupted`: the caller is stopped, or the server
@@ -1117,7 +1117,7 @@ pub unsafe fn ipc_try_recv(ep: u64, ipc_buf: *mut u64) -> Result<IpcMessage, i64
 /// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
 /// transfer), `QuotaExceeded` (the caller's `CSpace` directory cannot accept
 /// the reply caps, or a reply cap's object has its reference count at its
-/// 2^31 ceiling), or `OutOfMemory` (the caller's `CSpace` slot pool cannot
+/// 2^30 ceiling), or `OutOfMemory` (the caller's `CSpace` slot pool cannot
 /// back them). The reply never blocks, so it never returns
 /// `Interrupted`; the message's counts are within the kernel's maxima by
 /// construction (the kernel clamps larger ones rather than rejecting them).

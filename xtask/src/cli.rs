@@ -14,11 +14,14 @@ use std::path::PathBuf;
 use crate::argparse::{Command, Leaf, args, plain_field, subcommands, value_enum};
 
 use crate::arch::Arch;
+use crate::benchmark::BenchMode;
 use crate::bundle::Harness;
 use crate::context::Profile;
 use crate::disk::BlockSize;
 use crate::esp::Knob;
-use crate::qemu::{DiskLine, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack};
+use crate::qemu::{
+    DiskLine, Execution, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
+};
 
 args! {
     /// Top-level CLI entry point.
@@ -102,6 +105,22 @@ subcommands! {
         /// `--write-baseline`, write one. Report-only: a flagged row never fails
         /// the command. See xtask/README.md for the tables and the baseline format.
         KtestTiming(KtestTimingArgs),
+
+        /// Compare the benchmark result lines of saved run logs (from
+        /// `run --runs N --save-logs`) with the checked-in baselines of their
+        /// mode and architecture: each measurement's lowest p50 over the runs
+        /// against its stored p50 and band. Icount mode fails on a one-CPU
+        /// measurement past its band in either direction, one with no
+        /// baseline or no run, and a benchmark's FAIL line; host mode reports
+        /// only. See xtask/README.md for the rules and the file formats.
+        BenchCheck(BenchCheckArgs),
+
+        /// Rewrite the benchmark baselines from the bench cell's artifacts of
+        /// a CI run (icount mode), or from saved logs of this host (host
+        /// mode): each baseline file whose measurements moved past their
+        /// bands, appeared or went, or every file with `--all`. See
+        /// xtask/README.md.
+        BenchBaseline(BenchBaselineArgs),
 
         /// Resolve runtime addresses in a loaded ELF image (a binary, or the
         /// sysroot's kernel) to function, file, and line from its DWARF, or to the
@@ -231,6 +250,8 @@ impl CliCommand
             Self::CompareImages(args) => Some(&args.host),
             Self::Run(_)
             | Self::KtestTiming(_)
+            | Self::BenchCheck(_)
+            | Self::BenchBaseline(_)
             | Self::Symbolize(_)
             | Self::Mkdisk(_)
             | Self::TrustRequest(_)
@@ -349,6 +370,13 @@ args! {
         /// Use `cargo xtask build` without it for the full lint pass.
         #[arg(long, hide = true)]
         pub skip_lints: bool,
+
+        /// Build ktest with its `bench-only` feature: the benchmark tier
+        /// alone, each benchmark at its full iteration count, for a run whose
+        /// result lines are compared (core/ktest/README.md "Tier 3"). Needs a
+        /// build that includes ktest (`--component all` or `ktest`).
+        #[arg(long)]
+        pub ktest_bench_only: bool,
 
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
@@ -521,11 +549,33 @@ args! {
         /// functions. A svctest boot needs them (docs/testing.md § Gating).
         #[arg(long)]
         pub test_devices: bool,
+
+        /// Count instructions: run the machine on single-threaded TCG with
+        /// QEMU's `-icount shift=0,sleep=off,align=off`, so the guest's clock
+        /// and cycle counters advance one tick per retired instruction, the
+        /// deterministic measure `bench-check --mode icount` compares. Always
+        /// TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount
+        /// cannot serve, so the kernel runs its xAPIC paths.
+        #[arg(long)]
+        pub icount: bool,
     }
 }
 
 impl LaunchArgs
 {
+    /// How QEMU executes the machine: under icount with `--icount`.
+    pub fn execution(&self) -> Execution
+    {
+        if self.icount
+        {
+            Execution::Icount
+        }
+        else
+        {
+            Execution::Standard
+        }
+    }
+
     /// The second disk's `INTx` line `--second-disk-shared-line` selects.
     pub fn second_disk_line(&self) -> DiskLine
     {
@@ -667,9 +717,10 @@ args! {
 
         /// Also copy every run's log of `--runs`, whatever its outcome, to
         /// `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run]` trailer
-        /// line that records the run's arch, width, accelerator, outcome, and
-        /// host wall time. DIR is created if absent and never purged; a file of
-        /// the same name is overwritten.
+        /// line that records the run's arch, width, accelerator, whether it
+        /// counted instructions (`icount=`), outcome, and host wall time. DIR is
+        /// created if absent and never purged; a file of the same name is
+        /// overwritten.
         #[arg(long, value_name = "DIR", requires = "runs")]
         pub save_logs: Option<PathBuf>,
 
@@ -1220,6 +1271,60 @@ args! {
         /// base, or the baseline's) by at least this many seconds.
         #[arg(long, default_value = "1.0")]
         pub min_secs: f64,
+    }
+}
+
+// ── BenchCheck ────────────────────────────────────────────────────────────────
+
+args! {
+    pub struct BenchCheckArgs
+    {
+        /// What the runs measured: `icount` for instruction counts under
+        /// `run --icount`, `host` for time on this host's native accelerator.
+        #[arg(long, value_name = "MODE")]
+        pub mode: BenchMode,
+
+        /// The baselines root, which holds `<mode>/<arch>/`.
+        #[arg(long, value_name = "DIR", default_value = "xtask/baselines/bench")]
+        pub baselines: PathBuf,
+
+        /// Write this host's environment (the ENV file's keys) to FILE.
+        #[arg(long, value_name = "FILE")]
+        pub write_env: Option<PathBuf>,
+
+        /// The saved run logs, one per run, all of one architecture.
+        #[arg(required = true, value_name = "LOG")]
+        pub logs: Vec<PathBuf>,
+    }
+}
+
+// ── BenchBaseline ─────────────────────────────────────────────────────────────
+
+args! {
+    pub struct BenchBaselineArgs
+    {
+        /// The CI run whose bench cell artifacts (`bench-x86_64`,
+        /// `bench-riscv64`) give the icount baselines of both architectures.
+        #[arg(long, value_name = "ID", required_unless_present = "host", conflicts_with = "host")]
+        pub from_run: Option<u64>,
+
+        /// Give the host-mode baselines from LOG..., saved run logs of this
+        /// host's `x86_64` boots under a native accelerator.
+        #[arg(long, requires = "logs")]
+        pub host: bool,
+
+        /// Rewrite every baseline file and the ENV file, not only those whose
+        /// measurements moved.
+        #[arg(long)]
+        pub all: bool,
+
+        /// The baselines root, which holds `<mode>/<arch>/`.
+        #[arg(long, value_name = "DIR", default_value = "xtask/baselines/bench")]
+        pub baselines: PathBuf,
+
+        /// The saved run logs `--host` takes, one per run.
+        #[arg(value_name = "LOG", requires = "host")]
+        pub logs: Vec<PathBuf>,
     }
 }
 

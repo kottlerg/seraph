@@ -19,6 +19,8 @@ Commands:
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
   kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+  bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
+  bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   trust-request   Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)
@@ -52,6 +54,8 @@ Commands:
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
   kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+  bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
+  bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   trust-request   Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)
@@ -81,6 +85,7 @@ Options:
       --release                Build in release mode (default: debug)
       --component <COMPONENT>  Build only one component (default: all): `boot`, or the crate name of any component the build installs [default: all]
       --debug <DEBUG>          Emit debuginfo (`debug = 2`, `opt-level = 1`) for the named component(s) only, within the active profile (default or `--release`). Comma-separated, e.g. `--debug kernel,procmgr`; names match `--component`. Only components in the current build are affected
+      --ktest-bench-only       Build ktest with its `bench-only` feature: the benchmark tier alone, each benchmark at its full iteration count, for a run whose result lines are compared (core/ktest/README.md "Tier 3"). Needs a build that includes ktest (`--component all` or `ktest`)
       --wait-host <SECS>       When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help                   Print help (see more with '--help')
@@ -109,6 +114,9 @@ Options:
 
       --debug <DEBUG>
           Emit debuginfo (`debug = 2`, `opt-level = 1`) for the named component(s) only, within the active profile (default or `--release`). Comma-separated, e.g. `--debug kernel,procmgr`; names match `--component`. Only components in the current build are affected
+
+      --ktest-bench-only
+          Build ktest with its `bench-only` feature: the benchmark tier alone, each benchmark at its full iteration count, for a run whose result lines are compared (core/ktest/README.md "Tier 3"). Needs a build that includes ktest (`--component all` or `ktest`)
 
       --wait-host <SECS>
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
@@ -154,6 +162,8 @@ Options:
           Stage the GDB stub for this boot, attached to the process named NAME (its argv[0]), and print the GDB command line that connects to it; the stub is unstaged when QEMU exits. Requires `--debug-port`
       --test-devices
           Attach the test devices svctest's devmgr phases drive through the test-only drivers: QEMU's `edu` device and five `pci-testdev` functions. A svctest boot needs them (docs/testing.md § Gating)
+      --icount
+          Count instructions: run the machine on single-threaded TCG with QEMU's `-icount shift=0,sleep=off,align=off`, so the guest's clock and cycle counters advance one tick per retired instruction, the deterministic measure `bench-check --mode icount` compares. Always TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount cannot serve, so the kernel runs its xAPIC paths
       --runs <N>
           Boot N times unattended and classify each run's log as PASS, FAIL, HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns, failing unless every run passes (a QEMU-CRASH is tolerated). Without it, `run` is one interactive boot whose serial output is the terminal's
       --display <DISPLAY>
@@ -183,7 +193,7 @@ Options:
       --fail-grace-secs <FAIL_GRACE_SECS>
           Grace window of `--runs`, in seconds, after the first `--fail` match before the run is `SIGKILLed`. A kernel fault dump is multi-line and may be followed by secondary-CPU faults; killing on the first matching byte truncates the diagnostics. The run is killed at whichever is first: this window, or the `--timeout` deadline. 0 kills on the next poll after the match [default: 10]
       --save-logs <DIR>
-          Also copy every run's log of `--runs`, whatever its outcome, to `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run]` trailer line that records the run's arch, width, accelerator, outcome, and host wall time. DIR is created if absent and never purged; a file of the same name is overwritten
+          Also copy every run's log of `--runs`, whatever its outcome, to `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run]` trailer line that records the run's arch, width, accelerator, whether it counted instructions (`icount=`), outcome, and host wall time. DIR is created if absent and never purged; a file of the same name is overwritten
       --wait-host <SECS>
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override
@@ -290,6 +300,9 @@ Options:
       --test-devices
           Attach the test devices svctest's devmgr phases drive through the test-only drivers: QEMU's `edu` device and five `pci-testdev` functions. A svctest boot needs them (docs/testing.md § Gating)
 
+      --icount
+          Count instructions: run the machine on single-threaded TCG with QEMU's `-icount shift=0,sleep=off,align=off`, so the guest's clock and cycle counters advance one tick per retired instruction, the deterministic measure `bench-check --mode icount` compares. Always TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount cannot serve, so the kernel runs its xAPIC paths
+
       --runs <N>
           Boot N times unattended and classify each run's log as PASS, FAIL, HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns, failing unless every run passes (a QEMU-CRASH is tolerated). Without it, `run` is one interactive boot whose serial output is the terminal's
 
@@ -354,7 +367,7 @@ Options:
           [default: 10]
 
       --save-logs <DIR>
-          Also copy every run's log of `--runs`, whatever its outcome, to `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run]` trailer line that records the run's arch, width, accelerator, outcome, and host wall time. DIR is created if absent and never purged; a file of the same name is overwritten
+          Also copy every run's log of `--runs`, whatever its outcome, to `<DIR>/<arch>-<cpus>cpu-<run>.log`, ending with a `[run]` trailer line that records the run's arch, width, accelerator, whether it counted instructions (`icount=`), outcome, and host wall time. DIR is created if absent and never purged; a file of the same name is overwritten
 
       --wait-host <SECS>
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
@@ -645,6 +658,74 @@ Options:
       --threshold <THRESHOLD>  Flag a row whose normalised ratio exceeds this (R/F across widths, the plain ratio against a baseline) [default: 1.5]
       --min-secs <MIN_SECS>    Flag a row only when its time exceeds the expected time (F times the base, or the baseline's) by at least this many seconds [default: 1.0]
   -h, --help                   Print help
+=== xtask bench-check -h
+Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
+
+Usage: xtask bench-check [OPTIONS] --mode <MODE> <LOG>...
+
+Arguments:
+  <LOG>...  The saved run logs, one per run, all of one architecture
+
+Options:
+      --mode <MODE>       What the runs measured: `icount` for instruction counts under `run --icount`, `host` for time on this host's native accelerator [possible values: icount, host]
+      --baselines <DIR>   The baselines root, which holds `<mode>/<arch>/` [default: xtask/baselines/bench]
+      --write-env <FILE>  Write this host's environment (the ENV file's keys) to FILE
+  -h, --help              Print help (see more with '--help')
+=== xtask bench-check --help
+Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
+
+Usage: xtask bench-check [OPTIONS] --mode <MODE> <LOG>...
+
+Arguments:
+  <LOG>...
+          The saved run logs, one per run, all of one architecture
+
+Options:
+      --mode <MODE>
+          What the runs measured: `icount` for instruction counts under `run --icount`, `host` for time on this host's native accelerator
+
+          Possible values:
+          - icount: Instructions: boots under QEMU's icount (`run --icount`), whose counts repeat, so the gate holds them to a fixed band
+          - host:   Time on the reference host: `x86_64` boots under a native accelerator, reported against per-measurement bands and never gated
+
+      --baselines <DIR>
+          The baselines root, which holds `<mode>/<arch>/`
+          
+          [default: xtask/baselines/bench]
+
+      --write-env <FILE>
+          Write this host's environment (the ENV file's keys) to FILE
+
+  -h, --help
+          Print help (see a summary with '-h')
+=== xtask bench-baseline -h
+Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
+
+Usage: xtask bench-baseline [OPTIONS] [LOG]...
+
+Arguments:
+  [LOG]...  The saved run logs `--host` takes, one per run
+
+Options:
+      --from-run <ID>    The CI run whose bench cell artifacts (`bench-x86_64`, `bench-riscv64`) give the icount baselines of both architectures
+      --host             Give the host-mode baselines from LOG..., saved run logs of this host's `x86_64` boots under a native accelerator
+      --all              Rewrite every baseline file and the ENV file, not only those whose measurements moved
+      --baselines <DIR>  The baselines root, which holds `<mode>/<arch>/` [default: xtask/baselines/bench]
+  -h, --help             Print help
+=== xtask bench-baseline --help
+Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
+
+Usage: xtask bench-baseline [OPTIONS] [LOG]...
+
+Arguments:
+  [LOG]...  The saved run logs `--host` takes, one per run
+
+Options:
+      --from-run <ID>    The CI run whose bench cell artifacts (`bench-x86_64`, `bench-riscv64`) give the icount baselines of both architectures
+      --host             Give the host-mode baselines from LOG..., saved run logs of this host's `x86_64` boots under a native accelerator
+      --all              Rewrite every baseline file and the ENV file, not only those whose measurements moved
+      --baselines <DIR>  The baselines root, which holds `<mode>/<arch>/` [default: xtask/baselines/bench]
+  -h, --help             Print help
 === xtask symbolize -h
 Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
 
@@ -1621,6 +1702,8 @@ Commands:
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
   kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness in an unregistered crate; with `--pin`, print the pinned release (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+  bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
+  bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   trust-request   Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)

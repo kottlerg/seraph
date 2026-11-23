@@ -735,33 +735,35 @@ a revoke's `dealloc_revoked`, `release_moved_object`, and a dying `CSpace`'s dro
 `release_if_unreceivable` releases the endpoint's queued callers and parked receivers before the
 reference goes ([ipc-internals.md](ipc-internals.md) § Endpoint).
 
-The count is 32 bits wide and cannot wrap. The references userspace can multiply without a bound of
-their own, new capability slots, retype leases, death-observer bindings, and interrupt bindings, are
-refused at
-`REF_COUNT_LIMIT` (2^31) with `QuotaExceeded`: a copy, derivation, badged derivation, or move takes
-its new slot's reference through `KernelObjectHeader::try_inc_ref`, the one checked increment (a
-move's destination counts because a move its liveness backstop abandons leaves both slots live; an
-IPC transfer instead checks every cap of its message before its first move, so it refuses all or
-none, and its moves take their references unchecked), and `retype_allocate` refuses a retype from a
-Memory object whose count is at the limit, before the new object takes its lease; a death-observer
-bind takes its reference on the queue through `try_inc_ref` too, since the queue's creator funds any
-number of observer nodes, and `SYS_IRQ_REGISTER` takes a binding's reference on its Notification
-the same way. The limit is correct as is, not one a workload meets: each such reference
-costs a 72-byte slot, a retype child of at least 128 bytes, or a 24-byte observer node, so 2^31 of
-them hold at least 48 GiB against one object, and reaching it refuses instead of corrupting. Every
-other reference is taken unchecked, in the 2^31 of headroom between the limit and `u32::MAX`,
+The count is the low 31 bits of the 32-bit word and cannot wrap; bit 31 is `REF_OBSERVED`, set while
+a sole-reference observer is bound (§ Sole-Reference Observers), and every reader masks it
+(`references_in`). The references userspace can multiply without a bound of their own, new
+capability slots, retype leases, death-observer and sole-reference bindings, Mmio mapping records,
+and interrupt bindings, are refused at `REF_COUNT_LIMIT` (2^30) with `QuotaExceeded`: a copy,
+derivation, badged derivation, or move takes its new slot's reference through
+`KernelObjectHeader::try_inc_ref`, the one checked increment (a move's destination counts because a
+move its liveness backstop abandons leaves both slots live; an IPC transfer instead checks every cap
+of its message before its first move, so it refuses all or none, and its moves take their
+references unchecked), and `retype_allocate` refuses a retype from a Memory object whose count is
+at the limit, before the new object takes its lease; an observer bind takes its reference on the
+queue through `try_inc_ref` too, since the queue's creator funds any number of observer nodes,
+`SYS_MMIO_MAP` takes a mapping record's reference on the address space the same way, since its
+mappers fund any number of records, and `SYS_IRQ_REGISTER` takes a binding's reference on its
+Notification the same way. The limit is correct as is, not one a workload meets: each such
+reference costs a 72-byte slot, a retype child of at least 128 bytes, a 40-byte observer node, or a
+16-byte mapping record beside the page-table entry its mapping holds, so 2^30 of them hold at least
+16 GiB against one object, and reaching it refuses instead of carrying the count into the flag.
+Every other reference is taken unchecked, in the 2^30 of headroom between the limit and the flag,
 because each kind is bounded by an object count rather than by a request. Per thread: its syscall
 pins (a few), its fault-handler binding (one), its fault redirect (one), the lease of a retype it
 has in flight that passed `retype_allocate`'s check just before the count reached the limit (one),
-and the destinations of an
-IPC transfer it has in flight that passed the message check (at most `MSG_CAP_SLOTS_MAX`, four);
-fewer than 16 in all. Per other object: wait-set membership (one per source), Mmio mapping records
-(each 16 bytes of a caller-funded body or spill chunk, so 2^31 of them hold 32 GiB), SEED leases
-(the boot mints, bounded by the SEED reserve), and
-the destinations IPC transfers' abandoned moves leave live (a message check refuses once the count
-is at the limit and transfers run one at a time under the derivation lock, so these keep an object's
-slot references within `MSG_CAP_SLOTS_MAX - 1` of the limit). Exhausting the headroom would take
-some 2^27 threads, each with its own kernel stack and TCB (at least 2 TiB of kernel stacks).
+and the destinations of an IPC transfer it has in flight that passed the message check (at most
+`MSG_CAP_SLOTS_MAX`, four); fewer than 16 in all. Per other object: wait-set membership (one per
+source), SEED leases (the boot mints, bounded by the SEED reserve), and the destinations IPC
+transfers' abandoned moves leave live (a message check refuses once the count is at the limit and
+transfers run one at a time under the derivation lock, so these keep an object's slot references
+within `MSG_CAP_SLOTS_MAX - 1` of the limit). Exhausting the headroom would take some 2^26 threads,
+each with its own kernel stack and TCB (at least 1 TiB of kernel stacks).
 
 The principal kernel-internal owners:
 
@@ -778,8 +780,8 @@ The principal kernel-internal owners:
   a lease on the Memory object its donation came from until its last chunk goes
   ([§ Body Arena](#body-arena)).
 - **Mmio mapping records.** Each `SYS_MMIO_MAP` mapping an Mmio object records holds a
-  reference on the target `AddressSpace`, released when the object is freed and the
-  mapping withdrawn ([§ Mmio Mappings](#mmio-mappings)), so an address space outlives
+  reference on the target `AddressSpace`, taken through `try_inc_ref`, released when the object is
+  freed and the mapping withdrawn ([§ Mmio Mappings](#mmio-mappings)), so an address space outlives
   its last capability while an Mmio capability mapped into it lives.
 - **Kernel-lifetime pins.** The SEED reserve holds a reference the kernel never releases
   (the SEED pin from `install_seed_memory`), so it is never freed. No other object is
@@ -813,6 +815,10 @@ The principal kernel-internal owners:
   thread or on a faulting thread of the live address space, so the owner, and with it every observer
   reference, outlives every post. A bind after the death posts at once under the binder's
   syscall pin and takes no reference.
+- **Sole-reference bindings.** `SYS_CAP_BIND_SOLE_REFERENCE` takes a reference on the bound
+  EventQueue through `try_inc_ref`, held until the binding posts: the drain returns the node to
+  its queue's pool and then releases the reference (§ Sole-Reference Observers). The binding holds
+  no reference on the object it observes.
 - **Interrupt bindings.** A bound `Interrupt` binding holds a reference on its Notification's
   object, taken by `SYS_IRQ_REGISTER` through `try_inc_ref` and released only by the change that
   takes the notification from the binding (a rebind to another notification, or the binding's
@@ -856,6 +862,83 @@ under the lock therefore still holds its reference, and the increment lands befo
 reach zero. The one release that clears no slot, the dying CSpace's `for_each_object` drop in its
 `dealloc_object` arm, runs only after every thread bound to the CSpace is stopped and off every CPU
 and the CSpace is unregistered, so no `pin_slot` can be reading it.
+
+
+### Sole-Reference Observers
+
+`SYS_CAP_BIND_SOLE_REFERENCE` binds an observer node to the object a capability names, and the
+kernel posts `(0, correlator)` through it once: the first time the drain finds the object at one
+reference after the bind, or at the object's death
+([syscalls.md](syscalls.md) § `SYS_CAP_BIND_SOLE_REFERENCE`). A server that lends a client a
+derivation learns this way that the client's copies are gone, with no query of its own to prompt.
+The mechanism is `cap/sole_reference.rs`.
+
+- **The flag.** Bit 31 of the count word, `REF_OBSERVED`, marks an observed object. It rides in
+  the word so that `dec_ref` learns it from the value its `fetch_sub` returns: one signed compare
+  of that value passes every decrement that leaves two or more references and finds the flagged
+  words, the last release and an underflow, so with no observer bound the decrement costs what it
+  did before the flag, with no memory access and no lock. Increments never
+  read it, and the limit and the headroom above keep the count below it (§ Kernel Object Reference
+  Counting).
+- **The table.** One leaf spinlock, 256 chains keyed by a hash of the object address, and a
+  pending mask with a bit per chain. A chain holds one node per observed object, the object's
+  other nodes hanging off it through `ObserverNode::group`, so the work under the lock grows with
+  the observed objects of a chain, not with their observers. The node is a queue's observer-pool
+  node (`ipc::event_queue::ObserverNode`, a `DeathObserver` with the object and group links),
+  charged to the queue's retype debit. Nothing is acquired and no reference is released under the
+  lock, and it serialises every change to the flag and the chains, so the flag is set exactly while
+  the object's nodes are on its chain.
+- **The bind.** Under the syscall's pin on the object, the bind takes a node from the queue's pool
+  and a reference on the queue, then, under the table lock, links the node and sets the flag. Its
+  pin release is an ordinary decrement: when the slot is the only other holder, that release is the
+  fall to one reference, which the next drain posts.
+- **The fall to one.** The decrement from `REF_OBSERVED | 2` sets the pending bit of the object's
+  chain, computed from the address alone. It reads the object no further: that decrement may have
+  released the decrementer's last hold on it, so another CPU may already have freed it.
+- **The death.** The decrement from `REF_OBSERVED | 1` leaves no reference, so its caller owns the
+  object. Under the table lock it moves the object's nodes from the chain to the fired list and
+  clears the word, before the caller's dealloc cascade reuses it as a link. A flagged object
+  reaches zero only this way, so no binding ends without a post.
+- **The drain.** `drain_deferred_reclaim`, after its reclaim, on the syscall epilogue and in the
+  idle loop, and `drain_at_interrupt` at the end of an interrupt taken from user mode, read one
+  summary word when nothing is pending: `sole_reference::drain` is inline, a load and a branch on
+  every syscall, and its pass is out of line. That load is Relaxed. An ordering would not make it
+  see a newer value, only order the accesses after it, and the pass orders its own through its
+  Acquire load and AcqRel swap of the summary. A bit the CPU set itself, by a release or by a pass
+  that left fired nodes, is seen by its own later load unless a pass that cleared the bit, on any
+  CPU, took its work, so the release is claimed by this CPU's next pass or by that one; either
+  pass may post after the call that made the release returns, and the budget may leave the post
+  to a later pass, as The budget says. A bit set by another CPU that the load misses is drained
+  by that CPU at its own next drain point (its syscall return, its next interrupt from user mode,
+  or its idle loop), so the bound under The budget holds. Otherwise, under the table lock, it
+  claims each object of a pending chain whose word is `REF_OBSERVED | 1` by a compare-and-swap to
+  1, moving its nodes to the fired list, and takes at most `POST_BUDGET` (64) nodes off the fired
+  list. An object on a chain is live,
+  since its death takes it off the chain under the same lock before its memory can be reused. A
+  compare-and-swap that races an increment either fails, and the object stays bound, or wins, and
+  the count was one. After the unlock the drain returns each node to its pool, posts through
+  `sched::post_one_death_event`, and releases the binding's queue reference, so no post is made
+  under `DERIVATION_LOCK` or a CSpace lock, and a binder that receives a post finds its node
+  free.
+- **The budget.** A death fires every node bound to the object, any number of them, each funded
+  by its binder's queue, and the drain that takes them runs in whatever thread's syscall return or
+  idle-loop iteration comes next, on any CPU. The budget bounds what one pass does for observers
+  its thread did not bind. Nodes left on the fired list keep the summary's fired bit set, so the
+  next drain on any CPU continues. An idle CPU whose run queues are empty drains again, a pass at
+  a time, before its halt decision (`sole_reference::work_pending`), and every interrupt taken from
+  user mode ends with a pass when the table has work (`sole_reference::drain_at_interrupt`, beside
+  the upcall interrupt delivery point), so a CPU that runs only user code, makes no syscall and
+  never idles still makes a pass every timer tick, posting up to the budget each time. The drain
+  that claims a
+  post may run on a CPU other than the one whose release made it, so a post can reach its queue
+  just after the call that made the release returns.
+- **What a post means.** Every arrival at `REF_OBSERVED | 1` is a decrement from
+  `REF_OBSERVED | 2`, which marks the chain, so a count that rests at one is always found. A count
+  that falls to one and rises again before the drain looks is not claimed, and is found at its next
+  fall to one or at the object's death. A bind on an object already observed links a second node,
+  and each node posts once. The remaining reference may be any holder's, the binder's or another
+  kernel owner's; a move, the one an IPC transfer makes at rendezvous, takes its destination's
+  reference before it frees its source, so a capability in transit never dips the count.
 
 ---
 

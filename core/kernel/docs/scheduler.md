@@ -760,7 +760,11 @@ numbered ordering rules and the "Lock primitive" and "Bare spin locks" paragraph
 Each CPU has one idle thread (priority 0) that runs when no other thread is ready.
 
 Each iteration of `idle_thread_entry` first drains this CPU's deferred-reclaim queue
-(`cap::object::drain_deferred_reclaim`) with interrupts enabled. It then masks interrupts
+(`cap::object::drain_deferred_reclaim`) with interrupts enabled. While its run queues are empty
+and the sole-reference table still has work, it runs further drain passes
+(`cap::sole_reference::drain`), each bounded by `POST_BUDGET`
+([capability-internals.md](capability-internals.md#sole-reference-observers) § Sole-Reference
+Observers). It then masks interrupts
 and checks `has_runnable`. If the run queues hold work, it re-enables interrupts and calls
 `schedule(Requeue::Always)`, then loops. Otherwise it halts through the atomic enable-and-halt
 `arch::current::cpu::halt_until_interrupt`.

@@ -6,7 +6,9 @@
 //! Compile-time ktest configuration.
 //!
 //! The boot protocol carries no kernel command line, so every ktest run
-//! uses the same [`KtestConfig::DEFAULT`] baked in at build time. The
+//! uses the configuration baked in at build time, [`KtestConfig::BUILT`]:
+//! [`KtestConfig::DEFAULT`], or [`KtestConfig::BENCH`] in a build with the
+//! `bench-only` feature (`cargo xtask build --ktest-bench-only`). The
 //! defaults are picked for CI: every tier runs, the VM auto-shuts down
 //! on completion, and shutdown is immediate. To preserve QEMU for
 //! interactive inspection (or trim the tier set for a focused run),
@@ -62,6 +64,30 @@ impl KtestConfig
         run_integration: true,
         run_stress: true,
         run_bench: true,
-        bench_iters: 1000,
+        // A smoke run: each benchmark runs and logs its line, which no
+        // functional boot compares; the benchmark image (`BENCH`) measures.
+        bench_iters: 8,
+    };
+
+    /// The benchmark image's configuration: Tier 3 alone, each benchmark at
+    /// the most samples it records (`bench::MAX_ITERS`), for a run whose
+    /// result lines are compared (`core/ktest/README.md` § Tier 3).
+    pub const BENCH: KtestConfig = KtestConfig {
+        run_unit: false,
+        run_integration: false,
+        run_stress: false,
+        bench_iters: crate::bench::MAX_ITERS,
+        ..Self::DEFAULT
+    };
+
+    /// The configuration this build runs: [`KtestConfig::BENCH`] with the
+    /// `bench-only` feature, [`KtestConfig::DEFAULT`] without it.
+    pub const BUILT: KtestConfig = if cfg!(feature = "bench-only")
+    {
+        Self::BENCH
+    }
+    else
+    {
+        Self::DEFAULT
     };
 }

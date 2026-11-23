@@ -13,7 +13,7 @@ use syscall::{
     thread_exit,
 };
 
-use super::{cycles_now, log_bench_header};
+use super::Harness;
 use crate::{ChildStack, spawn};
 
 static mut BENCH_SIGNAL_STACK: ChildStack = ChildStack::ZERO;
@@ -60,51 +60,74 @@ extern "C" fn notification_pong_entry(arg: u64) -> !
     thread_exit()
 }
 
+/// The name of [`bench_notification_roundtrip`]'s result line.
+const NAME: &str = "notification_roundtrip";
+
 #[expect(
     clippy::similar_names,
     reason = "ping/pong are intentionally paired names for the two directions"
 )]
-pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, h: &mut Harness)
 {
-    const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
-    const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
-    let n = u64::from(iters);
-
     let Ok(ping) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        return h.skip(NAME, "cap_create_notification failed");
     };
     let Ok(pong) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        cap_delete(ping).ok();
+        return h.skip(NAME, "cap_create_notification failed");
     };
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        cap_delete(pong).ok();
+        cap_delete(ping).ok();
+        return h.skip(NAME, "cap_create_notification failed");
     };
-
     let Ok(mut child) = spawn::new_child(ctx)
     else
     {
-        return;
+        cap_delete(done).ok();
+        cap_delete(pong).ok();
+        cap_delete(ping).ok();
+        return h.skip(NAME, "the child could not be created");
     };
-    let Ok(child_ping) = cap_copy(ping, child.cs, RIGHTS_WAIT)
+
+    run_ping_pong([ping, pong, done], &child, h);
+
+    // One cleanup path for every exit: deleting the child's Thread cap also
+    // ends a child still parked in `notification_wait` after an early break.
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
+    cap_delete(done).ok();
+    cap_delete(pong).ok();
+    cap_delete(ping).ok();
+}
+
+/// Start the pong child on `[ping, pong, done]`, time [`Harness::iters`]
+/// round trips, and report the result. Returns early, leaving cleanup to the
+/// caller, when the child cannot be set up.
+#[expect(
+    clippy::similar_names,
+    reason = "ping/pong are intentionally paired names for the two directions"
+)]
+fn run_ping_pong([ping, pong, done]: [u64; 3], child: &spawn::SpawnedChild, h: &mut Harness)
+{
+    const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+    const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
+    let n = u64::from(h.iters());
+
+    let (Ok(child_ping), Ok(child_pong), Ok(child_done)) = (
+        cap_copy(ping, child.cs, RIGHTS_WAIT),
+        cap_copy(pong, child.cs, RIGHTS_NOTIFY),
+        cap_copy(done, child.cs, RIGHTS_NOTIFY),
+    )
     else
     {
-        return;
-    };
-    let Ok(child_pong) = cap_copy(pong, child.cs, RIGHTS_NOTIFY)
-    else
-    {
-        return;
-    };
-    let Ok(child_done) = cap_copy(done, child.cs, RIGHTS_NOTIFY)
-    else
-    {
-        return;
+        return h.skip(NAME, "cap_copy into the child failed");
     };
 
     // SAFETY: the single child has not been started yet.
@@ -124,19 +147,17 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
 
     // SAFETY: the stack is `BENCH_SIGNAL_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
-    if unsafe { spawn::configure_and_start(&child, notification_pong_entry, stack_top, arg) }
+    if unsafe { spawn::configure_and_start(child, notification_pong_entry, stack_top, arg) }
         .is_err()
     {
-        return;
+        return h.skip(NAME, "the child did not start");
     }
 
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
+    let (mut samples, counters) = h.recorder();
     let mut completed: u64 = 0;
     for _ in 0..n
     {
-        let t0 = cycles_now();
+        let t0 = counters.read();
         if notification_send(ping, 1).is_err()
         {
             break;
@@ -145,32 +166,19 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
         {
             break;
         }
-        let t1 = cycles_now();
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
+        let t1 = counters.read();
+        samples.record(t1.since(&t0).cycles);
         completed = completed.saturating_add(1);
     }
-    notification_wait(done).ok();
 
-    log_bench_header("notification_roundtrip", iters);
-    if let Some(mean) = total.checked_div(completed)
+    // After every round trip the child has sent its last pong and is on its
+    // way to `done`; after an early break it may wait for a ping for good, so
+    // the caller's Thread-cap delete ends it instead of a wait.
+    if completed == n
     {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
+        notification_wait(done).ok();
     }
+    let summary = samples.summary();
 
-    child.delete_thread().ok();
-    cap_delete(ping).ok();
-    cap_delete(pong).ok();
-    cap_delete(done).ok();
-    child.delete_cspace().ok();
+    h.report(NAME, &[], summary, &[]);
 }

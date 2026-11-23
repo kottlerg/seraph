@@ -1052,6 +1052,14 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
     }
     if !user_frame.is_null()
     {
+        // A pass of the sole-reference posts earlier drains left, so a CPU
+        // that runs only user code still makes a pass of at most
+        // POST_BUDGET posts every tick
+        // (core/kernel/docs/capability-internals.md § Sole-Reference
+        // Observers).
+        // SAFETY: ring-3 origin: the interrupted thread's kernel stack, each
+        // handler above has sent its EOI, no lock is held, IF=0.
+        unsafe { crate::cap::sole_reference::drain_at_interrupt() };
         // The interrupt delivery point of an upcall posted with
         // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
         // Upcalls): each handler above has sent its EOI, and the thread the

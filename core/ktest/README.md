@@ -85,8 +85,8 @@ and callee-saved-register tests are `crate::arch::fpu` and
 `crate::arch::callee_saved`, the machine-code stubs of `unit::retype`,
 `integration::aspace_exit_notification` and `integration::aspace_hold` `crate::arch::code_stub`,
 and the harness's UART, I/O
-port seed, shutdown, and cycle counter `crate::arch::serial`, `init_io_ports`, `shutdown`, and
-`cycles_now`.
+port seed and shutdown `crate::arch::serial`, `init_io_ports` and `shutdown`. The benchmarks'
+cycle counter is `bench::Counters` ([shared/bench](../../shared/bench/README.md)).
 
 ### Tier 1 — `src/unit/`
 
@@ -433,33 +433,41 @@ is not a stall to the all-idle detector.
 
 ### Tier 3 — `src/bench/`
 
-Cycle-accurate benchmarks using `rdtsc` (x86-64) or `csrr cycle` (RISC-V).
-Each kernel surface measured has its own file under `bench/` (a file may hold several
-benchmarks), mirroring
-`unit/`'s one-file-per-surface rule (`bench/{null,ipc,notification,cap,mm,
-thread,event,wait_set,tlb}.rs`). Benchmarks log min/mean/max cycle counts
-(`context_switch` logs cycles per switch); none produces a PASS/FAIL verdict.
+Cycle-accurate benchmarks, read through [shared/bench](../../shared/bench/README.md)'s
+`Counters`: `rdtsc` on x86-64, `csrr cycle` on RISC-V. Each kernel surface measured has its own
+file under `bench/` (a file may hold several benchmarks), mirroring `unit/`'s one-file-per-surface
+rule (`bench/{null,ipc,notification,cap,mm,thread,event,wait_set,tlb}.rs`). `bench::run_all` pins
+the harness thread to CPU 0 for the tier, which the TLB benchmarks' workers leave to it, and hands
+each benchmark the one sample buffer of `MAX_ITERS` (4096) samples: a benchmark runs
+`bench_iters` iterations, cut to that, and records one sample per measured operation.
+
+Each benchmark logs one result line, `bench ktest.<name> ...`, in the form
+[shared/bench/README.md § Result line](../../shared/bench/README.md#result-line) specifies,
+streamed whole to serial and the framebuffer after the timestamp; none produces a PASS/FAIL
+verdict. A benchmark that cannot run, or records no sample, logs
+`ktest: bench <name> SKIP (<reason>)` in place of its line, and one whose line would break a
+rule of the form logs `ktest: bench <name> FAIL (<rule>)`, so every benchmark leaves one of the
+three. When the harness thread does not move to CPU 0, the tier logs
+`ktest: bench SKIP (the harness thread did not move to CPU 0)` and runs no benchmark.
 
 | Benchmark | What it measures |
 |---|---|
 | `null_syscall_roundtrip` | Kernel entry/exit baseline (`SYS_SYSTEM_INFO`) |
-| `ipc_round_trip` | Synchronous IPC call + reply of an empty message, per-iteration |
-| `ipc_round_trip_6w` | As `ipc_round_trip`, request and reply each carrying 6 data words, the most the message registers carry |
-| `ipc_round_trip_7w` | As `ipc_round_trip`, request and reply each carrying 7 data words, which travel in the IPC buffer page |
+| `ipc_round_trip` | Synchronous IPC call + reply, one line per message size, variant `words=`: `0` (an empty message), `6` (the most the message registers carry) and `7` (one word more, which travels in the IPC buffer page), the request and the reply each carrying that many data words. A case that does not complete every round trip ends the benchmark, each later case logging a SKIP line |
 | `notification_roundtrip` | Notification ping-pong between two threads, per-iteration |
 | `cap_create_delete` | `cap_create_notification` + `cap_delete` cycle |
 | `cap_info_lookup` | `cap_info(CAP_INFO_TAG_RIGHTS)` on a held cap: one handle resolution and pin, against the `null_syscall_roundtrip` baseline |
 | `mem_map_unmap` | `mem_map` + `mem_unmap` cycle |
 | `mem_protect_pair` | `mem_protect(READ)` + `mem_protect(WRITABLE)` round trip |
-| `aspace_harvest_all_accessed` | `SYS_ASPACE_HARVEST` of 32 pages that a same-rights `mem_protect`, outside the timed region, leaves accessed; logs cycles per harvested page |
-| `aspace_harvest_none_accessed` | `SYS_ASPACE_HARVEST` of 32 pages nothing touches between calls; logs cycles per harvested page |
-| `thread_lifecycle` | Full thread create → start → exit → cleanup |
-| `context_switch` | Parent/child `thread_yield` ping-pong on one CPU; reports cycles per switch |
+| `aspace_harvest_all_accessed` | One `SYS_ASPACE_HARVEST` call over `pages=32` pages that a same-rights `mem_protect`, outside the timed region, leaves accessed |
+| `aspace_harvest_none_accessed` | One `SYS_ASPACE_HARVEST` call over `pages=32` pages nothing touches between calls |
+| `thread_lifecycle` | Full thread create → start → exit → cleanup, at most 100 iterations |
+| `context_switch_pair` | One parent `thread_yield` of a parent/child ping-pong on CPU 0: two switches. Extras `tlb_elided` and `tlb_performed`: the tagged-TLB flush counters since boot |
 | `thread_read_mem_page` | `SYS_THREAD_READ_MEM` of one whole page through a never-started thread of ktest's own address space, cycling over 16 resident pages |
 | `event_post_recv` | `event_post` + `event_recv` on a pre-created queue |
-| `wait_set_cycle` | Wait set create → add → wait → remove → delete |
-| `tlb_shootdown_unmap` | `mem_unmap` cost when ktest's aspace is `current` on every CPU (spinners pinned per CPU); logs `cpus=N` |
-| `tlb_shootdown_concurrent` | Every pinned worker is a concurrent `mem_map` + `mem_unmap` initiator; logs `cpus=N`, `conc_workers=`, and fresh-map and unmap cycle stats |
+| `wait_set_cycle` | Wait set create → add → wait → remove → delete, at most 100 iterations |
+| `tlb_shootdown_unmap` | `mem_unmap` cost when ktest's aspace is `current` on every CPU (spinners pinned per CPU). Extra `workers`: the spinners that ran |
+| `tlb_shootdown_concurrent` | Every pinned worker is a concurrent `mem_map` + `mem_unmap` initiator, the iterations shared among them; one line per operation, variant `op=map` (a fresh map) and `op=unmap`. Extra `workers`: the initiators that ran |
 
 ## Test infrastructure
 
@@ -563,7 +571,10 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
 The boot protocol carries no kernel command line
 ([core/boot/README.md](../boot/README.md) § What the Bootloader Does Not Do); ktest's runtime
 knobs live in `KtestConfig::DEFAULT` in [`src/cmdline.rs`](src/cmdline.rs) and are baked in at
-compile time. To flip them, edit the constant, rebuild ktest
+compile time. A build with the `bench-only` cargo feature, which
+`cargo xtask build --ktest-bench-only` sets, bakes in `KtestConfig::BENCH` instead: `DEFAULT`
+with Tier 3 alone, at 4096 iterations per benchmark, for a run whose result lines are compared.
+To flip them, edit the constant, rebuild ktest
 (`cargo xtask build --component ktest`), then re-compose the bundle
 (`cargo xtask mkdisk --harness ktest`, per [§ Activating ktest](#activating-ktest))
 before `cargo xtask run`; a single-component build does not re-compose the bundle (per
@@ -579,7 +590,7 @@ until it is re-composed.
 | `run_integration` | `bool` | `true` | Run Tier 2 (`src/integration/`) |
 | `run_stress` | `bool` | `true` | Run Tier S (`src/stress/`) |
 | `run_bench` | `bool` | `true` | Run Tier 3 (`src/bench/`) |
-| `bench_iters` | `u32` | `1000` | Number of iterations per benchmark |
+| `bench_iters` | `u32` | `8` | Number of iterations per benchmark, cut to `MAX_ITERS` (4096, [`src/bench/mod.rs`](src/bench/mod.rs)): a functional boot's Tier 3 is a smoke run that no check compares; `KtestConfig::BENCH` sets `MAX_ITERS` |
 
 The defaults are picked for CI: every tier runs, the VM exits cleanly
 on completion, and no human-watch grace period is added. To keep QEMU

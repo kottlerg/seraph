@@ -3259,6 +3259,47 @@ pub mod fs {
     pub fn session_for(node_cap: u64) -> crate::io::Result<u64> {
         crate::sys::fs::session_copy(node_cap, super::current_ipc_buf())
     }
+
+    /// The memmgr calls the calling thread has made for the write frames of
+    /// `std::fs::File`: one `REQUEST_MEMORY_CAPS` for each frame a write took
+    /// and one `RELEASE_MEMORY_CAPS` for each frame returned. A `File` takes
+    /// its frame at its first write larger than the inline `FS_WRITE`
+    /// threshold, keeps it across later writes, and returns it when it drops
+    /// (runtime/ruststd/README.md § File write frames). A count that only
+    /// moves up, wrapping; a caller reads the difference across the writes it
+    /// measures.
+    #[must_use]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn write_frame_memmgr_calls() -> u64 {
+        crate::sys::fs::write_frame_memmgr_calls()
+    }
+}
+
+// ── Pipe counters ───────────────────────────────────────────────────────────
+
+/// Seraph-specific counters of the pipes behind `Stdio::piped()`.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub mod pipe {
+    /// The notifications the calling thread's pipe ends have sent: a write's
+    /// doorbell to a reader, a read's to a writer, and a close's kick to the
+    /// peer (runtime/ruststd/README.md § Pipes). A count that only moves up,
+    /// wrapping; a caller reads the difference across the operations it
+    /// measures.
+    #[must_use]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn notification_sends() -> u64 {
+        crate::sys::pipe::seraph::notification_sends()
+    }
+
+    /// The times the calling thread's pipe ends found their ring empty (a
+    /// reader) or full (a writer) and announced a wait for the peer to ring
+    /// (runtime/ruststd/README.md § Pipes), whether or not they then blocked. A count that only moves up,
+    /// wrapping, read as [`notification_sends`] is.
+    #[must_use]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn waits() -> u64 {
+        crate::sys::pipe::seraph::waits()
+    }
 }
 
 // ── Per-spawn namespace caps (CommandExt) ───────────────────────────────────

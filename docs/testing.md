@@ -260,7 +260,8 @@ cargo xtask run
 
 Reset to the default-init bundle by re-running `cargo xtask build` or
 `mkdisk --harness init`. ktest's runtime options bake in as
-compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`
+compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`, or
+`KtestConfig::BENCH` in a `cargo xtask build --ktest-bench-only` build
 (see [xtask/README.md](../xtask/README.md#cargo-xtask-mkdisk)).
 
 ### Interactive input (`terminal` case)
@@ -394,6 +395,34 @@ cargo xtask run --arch <arch> --runs 1 --timeout <seconds> \
 ```
 
 A plain `cargo xtask mkdisk` removes the knob.
+
+### Benchmarks (`bench` cell)
+
+Each kernel benchmark of ktest's Tier 3 ([core/ktest/README.md](../core/ktest/README.md)) logs one
+result line, its samples' summary in the form
+[shared/bench/README.md § Result line](../shared/bench/README.md#result-line) gives. A functional
+ktest boot runs every benchmark 8 times, a smoke run whose lines no check compares; the bench-only
+image (`cargo xtask build --ktest-bench-only`) runs Tier 3 alone, 4096 iterations each, for the
+lines that are compared. CI's `bench` cell, one per architecture, boots that image (debug) under
+QEMU's icount (`cargo xtask run --icount`): one guest clock tick per retired instruction, so a
+benchmark's count is the same in every run of one build, whatever the runner's load. It boots
+three times at one CPU and once at four, and `cargo xtask bench-check --mode icount` compares
+each measurement's lowest p50 over the runs with its baseline under `xtask/baselines/bench/icount/`
+([xtask/README.md § `cargo xtask bench-check`](../xtask/README.md#cargo-xtask-bench-check)).
+
+The one-CPU counts gate: a count further from its baseline than the larger of 1% of it and 8
+instructions, in either direction, fails the cell, as does a measurement with no baseline, a
+baseline no run measured, and a benchmark's `FAIL` line. A count that fell past its band fails
+too, since the stale baseline would let a later regression of the same size through. A PR that
+moves a count on purpose rewrites the baselines of the benchmarks it moved from its own CI run
+(`cargo xtask bench-baseline --from-run <run id>`) and states the change and its reason in its
+body. The four-CPU counts are reported, not gated: the interleaving of the CPUs moves them.
+
+Icount counts instructions, not time: a change that costs cycles without instructions (a cache
+miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
+(`--mode host`, x86_64 under KVM, per-measurement bands in
+`xtask/baselines/bench/host/x86_64/BANDS`), and is report-only: no host-mode baseline is checked
+in yet, so no PR owes a host-mode run.
 
 ### Crash reports
 
@@ -1076,7 +1105,8 @@ rest. Coverage is tiered so the fixed dimensions still get exercised — just
 not on every push.
 
 **Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
-riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
+riscv64) × profile (debug, release) × harness (ktest, svctest, usertest), and the `bench` cell
+beside them (debug, one CPU and four, under icount; [Benchmarks](#benchmarks-bench-cell)).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + virtio-rng + serial + the machine's RTC, the machine's IOMMU
 with the virtio-blk, virtio-keyboard, and virtio-rng devices behind it — `intel-iommu` on x86_64,
@@ -1110,7 +1140,7 @@ to the tiers below.
 
 | Tier | Where | When | Coverage |
 |---|---|---|---|
-| Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
+| Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, whatever the release's PRs touched (see Release host runs below) |
@@ -1129,6 +1159,7 @@ registry runs it on (its `md-test-cells` rule).
 | `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
+| `bench` | Canonical | x86_64, riscv64; debug | the bench-only ktest bundle under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |
 | 4kn | Local and release host runs | x86_64, riscv64; debug | svctest from a 4Kn disk (`mkdisk --block-size 4096`) | none | 4096-byte logical blocks (Disk variations below) |

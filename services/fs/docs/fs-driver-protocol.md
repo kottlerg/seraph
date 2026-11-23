@@ -552,8 +552,9 @@ Source: [programs/fsbench/README.md](../../../programs/fsbench/README.md), which
 method. The full benchmark (`fsbench` with no iteration argument) loops 256 timed
 iterations of "seek to 0; read N bytes via the chosen path" against a 64 KiB fixture
 (`/data/svctest/bench.bin`); the per-path buffer sizes and cycle sources are in that
-README's [§ Method](../../../programs/fsbench/README.md#method). Numbers below are
-`cycles_mean`.
+README's [§ Method](../../../programs/fsbench/README.md#method). Numbers below are the mean
+cycles of the timed iterations of one size and path; `fsbench` reports their percentiles
+([§ Output](../../../programs/fsbench/README.md#output)).
 
 **x86_64 (KVM-accelerated, TSC = hardware cycles)**
 
@@ -792,8 +793,9 @@ The driver mem-maps the source memory cap read-only into its own address
 space for the duration of the copy. The cap returns to the caller in
 every outcome (mirror of the read-memory ownership discipline). The
 driver MUST NOT keep a mapping of the source page, or any capability to
-it, past its reply: once the reply arrives the caller may return the
-page to memmgr's pool, which another process can then be granted.
+it, past its reply: once the reply arrives the caller may write the page
+again and lend it for its next write, or return it to memmgr's pool,
+which another process can then be granted.
 
 A write whose offset lies past the file's end leaves the gap reading as zeros, as for
 [`FS_WRITE`](#label-4-fs_write).

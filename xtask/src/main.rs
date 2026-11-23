@@ -46,6 +46,7 @@ extern crate rustc_demangle;
 mod accel;
 mod arch;
 mod argparse;
+mod benchmark;
 mod breakpoint_kill;
 mod bundle;
 mod cli;
@@ -127,6 +128,8 @@ fn main()
         CliCommand::Fuzz(args) => commands::fuzz::run(&ctx, args),
         CliCommand::Kani(args) => commands::kani::run(&ctx, args),
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
+        CliCommand::BenchCheck(args) => commands::bench_check::run(&ctx, args),
+        CliCommand::BenchBaseline(args) => commands::bench_baseline::run(&ctx, args),
         CliCommand::Symbolize(args) => commands::symbolize::run(&ctx, args),
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),
         CliCommand::TrustRequest(args) => commands::trust_request::run(&ctx, args),

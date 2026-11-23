@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# `no_std`, no allocation, no dependency: the sample statistics, the counter
+# reads and the one result line every benchmark reports through.
+[lib]
+doctest = false
+
+[features]
+# The counter reads (`Counters`, `Reading`, `ARCH`), which exist only on the
+# architectures Seraph runs on. A host tool that reads result lines alone
+# (xtask's `bench-check`) builds without them, so it builds on any host.
+default = ["counters"]
+counters = []
+
+[lints]
+workspace = true

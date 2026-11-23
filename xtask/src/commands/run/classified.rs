@@ -29,15 +29,14 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Context as _, Result, bail};
 
-use crate::accel::detect_for_arch;
 use crate::arch::Arch;
 use crate::cli::{CrashReportExpect, RunArgs};
 use crate::context::Context as BuildContext;
 use crate::crash_log::{SysrootImages, symbolize_log};
 use crate::disk::{logical_block_size, second_disk_block_size};
-use crate::qemu::QemuDisplay;
+use crate::qemu::{Execution, QemuDisplay};
 use crate::qemu::{
-    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, validate_sysroot_for_launch,
+    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv_for, validate_sysroot_for_launch,
 };
 use crate::regex::Regex;
 use crate::term::filter::FilterWriter;
@@ -191,7 +190,8 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating --save-logs dir {}", dir.display()))?;
     }
-    let accel = detect_for_arch(args.launch.arch).name();
+    let execution = args.launch.execution();
+    let accel = execution.accel(args.launch.arch).name();
 
     step(&format!(
         "Starting run: arch={:?} parallel={} runs={} timeout={}s workdir={}",
@@ -326,7 +326,7 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
                     test_devices,
                     hotplug_port: None,
                 };
-                let qemu_args = build_qemu_argv(&spec)?;
+                let qemu_args = build_qemu_argv_for(&spec, execution)?;
 
                 // O_APPEND on the log fds so the kernel writes atomically
                 // at end-of-file. Both the per-slot stdout-forwarder thread
@@ -394,6 +394,7 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
                         arch,
                         cpus,
                         accel,
+                        execution,
                         run: run_id,
                     };
                     save_log(dir, &log_path, &saved, &outcome)?;
@@ -996,6 +997,9 @@ struct SavedRun
     arch: Arch,
     cpus: u32,
     accel: &'static str,
+    /// Whether the run counted instructions (`run --icount`), which the
+    /// trailer records as `icount=on` or `icount=off`.
+    execution: Execution,
     run: u32,
 }
 
@@ -1016,11 +1020,16 @@ pub(crate) fn saved_log_file(arch: Arch, cpus: u32, run: u32) -> String
 fn trailer_line(saved: &SavedRun, outcome: &RunOutcome) -> String
 {
     format!(
-        "{}arch={} cpus={} accel={} run={} outcome={} wall_s={:.3}",
+        "{}arch={} cpus={} accel={} icount={} run={} outcome={} wall_s={:.3}",
         crate::timing::TRAILER_PREFIX,
         saved.arch,
         saved.cpus,
         saved.accel,
+        match saved.execution
+        {
+            Execution::Standard => "off",
+            Execution::Icount => "on",
+        },
         saved.run,
         outcome.status.label().replace(' ', "_"),
         outcome.elapsed.as_secs_f64()
@@ -1614,6 +1623,7 @@ mod tests
             arch: Arch::Riscv64,
             cpus: 65,
             accel: "tcg",
+            execution: Execution::Icount,
             run: 2,
         };
         let outcome = RunOutcome {

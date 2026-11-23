@@ -19,17 +19,17 @@
 //!   4096 which exceeds 504). Each `read` returns up to one page. For
 //!   `size < 4096` the call still pays the full single-page frame cost.
 //!
-//! The thread is pinned to CPU 0 before it reads anything: each timed read
-//! blocks on the filesystem driver, and a thread woken on another CPU would
-//! subtract one CPU's cycle counter from another's, which riscv64 does not
-//! keep in step.
+//! The thread is pinned to CPU 0 before it reads anything, and opens its
+//! counters there: each timed read blocks on the filesystem driver, and a
+//! thread woken on another CPU would subtract one CPU's cycle counter from
+//! another's, which riscv64 does not keep in step.
 //!
-//! Output is line-oriented and machine-parseable so the host can scrape
-//! it from the serial log:
+//! Each size and path logs one result line (`shared/bench/README.md`
+//! § Result line), which a host reads back from the serial log:
 //!
 //! ```text
-//! fsbench: arch=x86_64 size=4096 path=inline iters=256 cycles_min=...
-//! fsbench: arch=x86_64 size=4096 path=frame  iters=256 cycles_min=...
+//! bench fsbench.read size=4096 path=inline arch=x86_64 cpus=4 unit=cycles n=256 min=...
+//! bench fsbench.read size=4096 path=frame arch=x86_64 cpus=4 unit=cycles n=256 min=...
 //! ```
 
 #![expect(
@@ -42,6 +42,8 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
+use bench::{Counters, Report, Unit, Value};
+
 const PAGE_SIZE: u64 = 4096;
 const PAGE_SIZE_USIZE: usize = 4096;
 const INLINE_CHUNK: u64 = 504;
@@ -53,54 +55,6 @@ const MEASURE_ITERS: u32 = 256;
 const FIXTURE_PATH: &str = "/data/svctest/bench.bin";
 /// The CPU the benchmark thread is pinned to: CPU 0 is online on every boot.
 const BENCH_CPU: u32 = 0;
-
-/// The calling CPU's cycle counter. Units differ by architecture, and only
-/// two reads on one CPU compare: riscv64 keeps no two harts' counters in
-/// step.
-fn cycles_now() -> u64
-{
-    #[cfg(target_arch = "x86_64")]
-    {
-        let lo: u32;
-        let hi: u32;
-        // SAFETY: rdtsc is unprivileged on x86_64; reads TSC into edx:eax.
-        unsafe {
-            core::arch::asm!(
-                "rdtsc",
-                out("eax") lo,
-                out("edx") hi,
-                options(nostack, nomem, preserves_flags),
-            );
-        }
-        (u64::from(hi) << 32) | u64::from(lo)
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let c: u64;
-        // SAFETY: `csrr cycle` is unprivileged when scounteren.CY = 1,
-        // which the kernel sets in BSP and AP init
-        // (`core/kernel/src/arch/riscv64/interrupts.rs`).
-        unsafe {
-            core::arch::asm!(
-                "csrr {}, cycle",
-                out(reg) c,
-                options(nostack, nomem),
-            );
-        }
-        c
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
-    {
-        0
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-const ARCH_TAG: &str = "x86_64";
-#[cfg(target_arch = "riscv64")]
-const ARCH_TAG: &str = "riscv64";
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
-const ARCH_TAG: &str = "unknown";
 
 /// Read `size` bytes from `f` starting at offset 0, chunking into
 /// <= 504-byte reads that don't cross a page tail so std picks the
@@ -200,7 +154,18 @@ impl ReadPath
     }
 }
 
-fn measure(f: &mut File, size: u64, read_path: ReadPath, buf: &mut [u8], iters: u32)
+/// The benchmark's fixed context: its counters, the CPU count its result
+/// lines carry, and the timed iteration count.
+struct Bench
+{
+    counters: Counters,
+    cpus: u32,
+    iters: u32,
+}
+
+/// Time `iters` reads of `size` bytes on `read_path`, after
+/// [`WARMUP_ITERS`] untimed ones, and log their result line.
+fn measure(f: &mut File, size: u64, read_path: ReadPath, buf: &mut [u8], run: &Bench)
 {
     let runner = read_path.runner();
     let path = read_path.name();
@@ -210,37 +175,42 @@ fn measure(f: &mut File, size: u64, read_path: ReadPath, buf: &mut [u8], iters: 
         let _ = runner(f, size, buf);
     }
 
-    let mut min_c = u64::MAX;
-    let mut max_c = 0u64;
-    let mut sum_c: u64 = 0;
-    for _ in 0..iters
+    let mut samples = Vec::with_capacity(run.iters as usize);
+    for _ in 0..run.iters
     {
-        let start = cycles_now();
+        let start = run.counters.read();
         let got = runner(f, size, buf);
-        let elapsed = cycles_now().wrapping_sub(start);
+        let elapsed = run.counters.read().since(&start).cycles;
         assert!(
             got >= size.min(65536),
             "fsbench: short read on path={path} size={size}: got {got}"
         );
-        if elapsed < min_c
-        {
-            min_c = elapsed;
-        }
-        if elapsed > max_c
-        {
-            max_c = elapsed;
-        }
-        sum_c = sum_c.wrapping_add(elapsed);
+        samples.push(elapsed);
     }
-    let mean_c = sum_c
-        .checked_div(u64::from(iters))
-        .expect("measure_iters returns a positive count");
+    let summary = bench::summarize(&mut samples).expect("measure_iters returns a positive count");
 
-    let arch = ARCH_TAG;
-    std::os::seraph::log!(
-        "arch={arch} size={size} path={path} iters={iters} \
-         cycles_min={min_c} cycles_mean={mean_c} cycles_max={max_c}"
-    );
+    let report = Report {
+        suite: "fsbench",
+        name: "read",
+        variant: &[("size", Value::Num(size)), ("path", Value::Word(path))],
+        cpus: run.cpus,
+        unit: Unit::Cycles,
+        summary,
+        extras: &[],
+    };
+    let mut line = String::new();
+    report
+        .write(&mut line)
+        .unwrap_or_else(|e| panic!("fsbench: result line of path={path} size={size}: {e}"));
+    std::os::seraph::log!("{line}");
+}
+
+/// CPUs the system runs (`SystemInfoType::CpuCount`).
+fn cpu_count() -> u32
+{
+    let count = syscall::system_info(syscall_abi::SystemInfoType::CpuCount as u64)
+        .unwrap_or_else(|e| panic!("fsbench: CPU count: error {e}"));
+    u32::try_from(count).expect("the CPU count fits in u32")
 }
 
 /// Sanity-check the fixture: byte i must equal `(i & 0xFF) as u8` for
@@ -313,6 +283,11 @@ fn main()
     std::os::seraph::log::register_name(b"fsbench");
     let iters = measure_iters();
     pin_to_bench_cpu();
+    let run = Bench {
+        counters: Counters::open(),
+        cpus: cpu_count(),
+        iters,
+    };
     std::os::seraph::log!("starting, fixture={FIXTURE_PATH} iters={iters}");
 
     let mut f =
@@ -322,8 +297,8 @@ fn main()
     let mut buf = vec![0u8; PAGE_SIZE_USIZE];
     for &size in SIZES
     {
-        measure(&mut f, size, ReadPath::Inline, &mut buf, iters);
-        measure(&mut f, size, ReadPath::Frame, &mut buf, iters);
+        measure(&mut f, size, ReadPath::Inline, &mut buf, &run);
+        measure(&mut f, size, ReadPath::Frame, &mut buf, &run);
     }
 
     std::os::seraph::log!("done");

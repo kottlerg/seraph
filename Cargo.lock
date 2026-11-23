@@ -22,6 +22,10 @@ name = "ansi"
 version = "0.1.5"
 
 [[package]]
+name = "bench"
+version = "0.1.5"
+
+[[package]]
 name = "boot"
 version = "0.1.5"
 dependencies = [
@@ -186,6 +190,7 @@ version = "0.1.5"
 name = "demandpaged"
 version = "0.1.5"
 dependencies = [
+ "bench",
  "ipc",
  "syscall",
  "syscall-abi",
@@ -302,7 +307,9 @@ dependencies = [
 name = "fsbench"
 version = "0.1.5"
 dependencies = [
+ "bench",
  "syscall",
+ "syscall-abi",
 ]
 
 [[package]]
@@ -489,6 +496,7 @@ dependencies = [
 name = "ktest"
 version = "0.1.5"
 dependencies = [
+ "bench",
  "boot-protocol",
  "crypto",
  "font",
@@ -1141,6 +1149,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.5"
 dependencies = [
+ "bench",
  "boot-policy",
  "boot-protocol",
  "crash-report",

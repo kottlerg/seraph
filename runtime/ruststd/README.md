@@ -609,6 +609,35 @@ with the driver of `node_cap`, starting the session as `File::open` would, for a
 
 ---
 
+## File write frames
+
+A `std::fs::File` write larger than the inline `FS_WRITE` threshold (504 bytes) goes through
+`FS_WRITE_MEMORY` ([Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md)
+§ Label 12) from a write frame: a page from memmgr, charged to the process's node, mapped writable
+in the process's own address space. A `File` takes its frame at its first such write and keeps it
+across later writes, so a write after the first makes no memmgr call. Each chunk of a write is
+copied into the frame and lent to the driver through a fresh `MAP`-only derivation, which is
+deleted once the driver's reply settles the chunk, or revoked when the driver received it, so no
+derivation outlives its chunk. The frame is unmapped, its cap deleted and its run returned to memmgr
+when the `File` drops.
+
+One write holds the frame at a time. A write of the same `File` on another thread that finds it
+held takes a frame of its own, and returns it when it ends if the first is back by then. A chunk
+whose call ends after the driver received it without a reply (interrupted, or past the thread's
+call deadline, [Call deadline](#call-deadline)) leaves the driver free to go on copying from the
+frame, so that frame is abandoned: it stays mapped and charged to the process until it exits, and
+the next write takes a fresh one. Only the process's budget node bounds the frames so abandoned: a
+driver that receives each call and never replies costs the writer one page per write until memmgr
+refuses the next frame's charge, and that write fails. A write that fails otherwise leaves the frame
+idle and the `File`'s. The cost is one page for each open `File` that has written through the frame
+path.
+
+`std::os::seraph::fs::write_frame_memmgr_calls` counts the memmgr calls the calling thread has
+made for write frames, one for each frame taken and one for each returned; svctest's `std::fs`
+frame-write phases assert on it.
+
+---
+
 ## Child process handles
 
 `std::os::seraph::process::ChildExt::process_handle` returns a spawned child's
@@ -648,6 +677,28 @@ The serve is a receive on the calling thread, which releases any reply that thre
 ([docs/ipc-design.md](../../docs/ipc-design.md) § The Call/Reply Model), so a server thread replies
 to its caller before it spawns a child with bootstrap caps; a spawn without them only calls. A
 receive an upcall or a thread stop cancels took no request, and is received again.
+
+---
+
+## Pipes
+
+A pipe, behind `Stdio::piped()`, a child's piped standard streams, or a session stream, is one page
+both ends map, holding the single-producer, single-consumer byte ring of
+[shared/shmem](../../shared/shmem/README.md), and two notifications: the data notification, which
+a reader that finds the ring empty waits on and the writer rings, and the space notification, which
+a writer that finds the ring full waits on and the reader rings. An end announces its wait in the
+ring header's waiter word before it blocks, and a write or a read that moves bytes rings the peer's
+notification only when the peer announced a wait
+([shared/shmem/README.md](../../shared/shmem/README.md) § Doorbell protocol), so a stream that
+never empties or fills the ring makes no notification syscall. A close sets the
+ring's `closed` flag and rings the peer, and the spawner's death bridge marks the peer dead and
+rings both notifications, so a reader drains the ring to EOF and a writer fails with `BrokenPipe`.
+
+`std::os::seraph::pipe::notification_sends` counts the notifications the calling thread's pipe
+ends have sent, and `std::os::seraph::pipe::waits` the times they found their ring empty or full
+and announced a wait, whether or not they then blocked; the pipestress tester's doorbell trial
+reports both
+([programs/pipestress/README.md](../../programs/pipestress/README.md) § Tester).
 
 ---
 

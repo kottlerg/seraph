@@ -903,13 +903,19 @@ pub struct ThreadControlBlock
     /// claim (the IPC blocking row of § Cross-CPU TCB Ownership).
     pub ipc_state: IpcThreadState,
 
-    /// Inline message buffer for in-flight IPC data. Owned by the holder of
-    /// this thread's park claim: the source's `ep.lock` while the thread is
-    /// queued on it (the thread fills it before it enqueues itself; the party
-    /// that dequeues it reads or fills it under the same lock, and may finish
-    /// the capability-transfer results after releasing it while it still holds
-    /// the dequeue claim, the `wake_in_flight` pin that lasts until its
-    /// `enqueue_and_wake`: `deliver_call_caps`), and the won `reply_tcb` claim
+    /// The thread's IPC message, built and read in place (no IPC path builds
+    /// a `Message` elsewhere or copies one whole; core/kernel/src/ipc/message.rs).
+    /// Owned by the thread itself while it runs outside a park: it stages the
+    /// message it sends here, and a receive or a resume delivers the one it
+    /// received from here. Otherwise owned by the holder of this thread's park
+    /// claim: the source's `ep.lock` while the thread is queued on it (the
+    /// thread stages its message before it enqueues itself; a receive that
+    /// dequeues it copies the message into its own `ipc_msg` under the same
+    /// lock), the dequeue claim, the `wake_in_flight` pin that lasts until
+    /// the thread's `enqueue_and_wake`, once a call dequeued it from a
+    /// receive queue (the caller copies its message in and finishes the
+    /// capability-transfer results after releasing the lock:
+    /// `endpoint_call`, `deliver_call_caps`), and the won `reply_tcb` claim
     /// once the thread is bound for reply (the reply, or the failed-transfer
     /// sentinel, is written by that claim's winner). The resuming thread reads
     /// it with no lock (the bare-field exception of docs/coding-standards.md
@@ -1225,8 +1231,10 @@ pub struct ThreadControlBlock
     /// `SYS_IOPORT_BIND`), which also records the `IoPort` object behind each
     /// binding. Null if this thread has no port bindings.
     ///
-    /// On context switch, if non-null, this bitmap is copied into the TSS
-    /// IOPB region so `in`/`out` instructions work for this thread.
+    /// A context switch into this thread makes the CPU's TSS IOPB region hold
+    /// this bitmap (a copy, unless the TSS already holds it at its generation)
+    /// so `in`/`out` instructions work for this thread; while it is null the
+    /// TSS's bitmap offset is out of limit, denying every port.
     ///
     /// Owned, pointer and bytes, by this TCB's `sched_lock`: `sys_ioport_bind`
     /// installs and edits it, an `IoPort` teardown's withdrawal rebuilds it,

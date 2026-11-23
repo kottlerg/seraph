@@ -93,9 +93,11 @@ every earlier waiter and a later one finds the queues empty.
 
 ```
 1. Resolve endpoint_cap → verify Send rights
-2. Read the data words, from the sender's message registers in its saved
-   frame (data_count <= MSG_REGS_DATA_MAX) or its IPC buffer page (above),
-   pre-validate the cap slots, open the park episode (open_call_episode);
+2. Stage the message in current_tcb.ipc_msg, in place: the label and the
+   badge, the data words, read from the sender's message registers in its
+   saved frame (data_count <= MSG_REGS_DATA_MAX) or its IPC buffer page
+   (above), and the cap handles; pre-validate the cap slots, open the park
+   episode (open_call_episode);
    a non-zero timeout_ms (arg 2's high half) gives the call's deadline
 3. Acquire endpoint lock; if receivers == 0, release it and return NoReceiver
    (endpoint_call returns CallRendezvous::NoReceiver before touching the caller or
@@ -105,23 +107,26 @@ every earlier waiter and a later one finds the queues empty.
    a. recv_tcb = head of the endpoint's recv queue (dequeued); the dequeue
       claims its receive, so a timed receive's sleep-list entry is removed
       (cancel_timed_entry)
-   b. Stage the message in recv_tcb.ipc_msg: label/counts/badge from the
-      sender's saved register state, data words read at step 2 (the receiver
-      writes them to its own message registers or page when it resumes)
-   c. Pin current_tcb for its eventual reply wake (wake_in_flight = 1),
+   b. Pin current_tcb for its eventual reply wake (wake_in_flight = 1),
       store a timed call's sleep_deadline, publish the caller binding (the
       server's reply capability): recv_tcb.reply_tcb = current_tcb (Release
       store into an empty slot; the server's receive released any earlier
       binding), then claim recv_tcb for its wake (recv_tcb.wake_in_flight = 1)
-   d. commit_blocked_under_local_lock(current_tcb, BlockedOnReply or
+   c. commit_blocked_under_local_lock(current_tcb, BlockedOnReply or
       BlockedOnFault, recv_tcb); on a refusal, roll the binding back
       (rollback_uncommitted_call, which clears the deadline on its win); on
       a commit of a timed call, sleep_list_add, which refuses when a claim
       of the binding since the publish already cleared the deadline
       (thread-lifecycle-and-sleep.md § Sleep List Invariants, invariant 8)
-   e. Release endpoint lock
-   f. Transfer capability slots in the caller's context (deliver_call_caps; a
-      refusal delivers zero caps; see capability-internals.md)
+   d. Release endpoint lock
+   e. Copy the staged message into recv_tcb.ipc_msg (copy_message), which
+      the dequeue claim (recv_tcb's wake_in_flight pin) owns until the wake:
+      the label, the badge, the counts, and the counted data words and
+      handles (the receiver writes the words to its own message registers or
+      page when it resumes)
+   f. Transfer capability slots in the caller's context, replacing the
+      handles in recv_tcb.ipc_msg with the delivered ones (deliver_call_caps;
+      a refusal delivers zero caps; see capability-internals.md)
    g. enqueue_and_wake(recv_tcb) on its selected CPU
    h. Call the scheduler whether the park committed or was refused (a
       refused park that left the thread runnable is requeued), then
@@ -129,7 +134,8 @@ every earlier waiter and a later one finds the queues empty.
 
 5. else (no receiver yet):
    // Slow path, all under the endpoint lock until step e
-   a. Store the message in current_tcb.ipc_msg
+   a. Leave the message staged in current_tcb.ipc_msg, which the endpoint
+      lock owns from the append, for the receive that binds the caller
    b. Append current_tcb to the endpoint's send queue (send_nonempty = 1)
    c. commit_blocked_under_local_lock(current_tcb, BlockedOnSend, ep);
       on a refusal, unlink current_tcb from the send queue and stamp the
@@ -148,9 +154,15 @@ every earlier waiter and a later one finds the queues empty.
 **Message copy:** The label, counts, and badge travel in saved register state
 (message format per
 [docs/ipc-design.md § Message Format](../../../docs/ipc-design.md#message-format)).
+In the kernel a message is built and read in place in a TCB's `ipc_msg`: the sender stages it in
+its own, a rendezvous copies only its valid part (header, counts, and the counted data words and
+handles: `Message::copy_from`) into the receiver's, and a reply is read straight into the
+caller's. No path builds a `Message` on the stack or copies one whole; the words past the counts
+are left from earlier messages, and `Message`'s accessors, the only view of its arrays, expose
+none of them.
 The data-word count selects the data words' transport. At most `MSG_REGS_DATA_MAX` words
 travel in the message registers: `read_data_words` copies them from the sender's saved frame
-(`UserFrame::msg_regs`) into `Message::data`, a read that cannot fault, and
+(`UserFrame::msg_regs`) into the message's data words, a read that cannot fault, and
 `deliver_data_words` writes exactly the delivered count into the receiver's saved frame
 (`UserFrame::set_msg_regs`), so the registers past it keep the receiver's values and no word
 of another message reaches them. More words travel through the per-thread IPC buffer pages:
@@ -185,7 +197,8 @@ no syscall on either side. Nothing is allocated on the path.
 4. if the send queue is non-empty (bind_next_sender):
    // Fast path: a sender is waiting
    a. sender_tcb = head of the send queue (dequeued); copy its staged
-      message (ipc_msg) and its CSpace identity (cspace_id, cspace_epoch)
+      message into current_tcb.ipc_msg (copy_message, as in the Call Path)
+      and keep its CSpace identity (cspace_id, cspace_epoch)
    b. if the send queue is now empty: send_nonempty = 0
    c. Claim sender_tcb for the reply wake (wake_in_flight = 1)
    d. commit_reply_rebind_under_local_lock(sender_tcb, BlockedOnReply or
@@ -196,12 +209,15 @@ no syscall on either side. Nothing is allocated on the path.
       too. If the sender died or was stopped meanwhile, nothing is
       published: the commit removes a timed call's entry, and the receive,
       whose dequeue claimed the episode, stamps the sender cancelled,
-      clears its wake_in_flight, and retries from a with the next sender
+      clears its wake_in_flight, and retries from a with the next sender;
+      with none left, it empties current_tcb.ipc_msg, so no word of the
+      skipped sender's message stays in the server
    e. Release endpoint lock. From here sender_tcb is not read: once the
       binding is published, a stop, a timed call's expiry, or a teardown can
       claim it and wake the sender, which can exit and be freed
-   f. Copy the message copied in a (label/counts plus the data words read at
-      call time) into the server's trap frame (its message registers within
+   f. Deliver the message copied in a from current_tcb.ipc_msg
+      (label/counts plus the data words read at call time) into the
+      server's trap frame (its message registers within
       MSG_REGS_DATA_MAX words) or IPC buffer page (above), and
       transfer capability slots from the CSpace the identity copied in a
       names
@@ -259,7 +275,9 @@ released.
    word, when sent and readable, by `deposit_reply_word`, from MR0 within
    MSG_REGS_DATA_MAX words), with the named
    cap's badge for REDIRECTED, in caller_tcb's ipc_msg; stamp the episode, and go to step 6
-3. Read the data words and pre-validate the reply cap slots; when caps are
+3. Stage the reply in caller_tcb.ipc_msg, which the won claim owns: its
+   label, its data words and its cap handles; pre-validate the reply cap
+   slots; when caps are
    attached, pre-allocate the slots in the caller's CSpace (resolved
    through the registry from caller_tcb's cspace_id/epoch); on any of these
    failures, deposit the IPC_REPLY_TRANSFER_FAILED reply instead, wake the
@@ -267,9 +285,10 @@ released.
 4. Transfer reply capability slots; if the transfer fails, deposit the
    IPC_REPLY_TRANSFER_FAILED reply instead, wake the caller (step 6), and
    return the error to the server
-5. Stage the reply in caller_tcb.ipc_msg (label/count for the caller's
-   return registers, data words for the caller to write to its own message
-   registers or IPC buffer page when it resumes, cap results) and stamp REPLY
+5. Replace the handles in caller_tcb.ipc_msg with the cap results (the
+   label and count for the caller's return registers and the data words
+   for it to write to its own message registers or IPC buffer page when it
+   resumes are already there) and stamp REPLY
 6. enqueue_and_wake(caller_tcb) on its selected CPU; return to the server
 ```
 

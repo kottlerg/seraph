@@ -96,14 +96,18 @@ pub struct VfsdCaps
     /// thread is spawned. Main derives badged SEND caps on this slot to hand
     /// to each fatfs child as its creator endpoint.
     pub bootstrap_ep: u64,
+    /// The device the firmware booted from, from round 1
+    /// (`ipc::vfsd_bootstrap`).
+    pub boot_device: ipc::vfsd_bootstrap::BootDevice,
 }
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 //
 // init → vfsd bootstrap plan:
-//   Round 1 (2 caps, 0 data words):
+//   Round 1 (2 caps, ipc::vfsd_bootstrap::BOOT_DEVICE_WORDS data words):
 //     caps[0]: service endpoint (vfsd receives on this)
 //     caps[1]: the `block` class SEND on devmgr's registry endpoint
+//     data:    the boot device record, laid out by `ipc::vfsd_bootstrap`
 //   Round 2 (1 cap, 1 data word):
 //     caps[0]: fatfs module memory cap
 //     data[0]: the module's size in bytes, the signed object's length
@@ -123,6 +127,8 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
     {
         return None;
     }
+    let boot_device =
+        ipc::vfsd_bootstrap::BootDevice::from_words(round1.data.get(..round1.data_words)?)?;
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let round2 = unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) }.ok()?;
     if round2.cap_count < 1 || !round2.done || round2.data_words < 1 || round2.data[0] == 0
@@ -139,7 +145,34 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
         fatfs_module_len: round2.data[0],
         self_aspace: info.self_aspace,
         bootstrap_ep: 0,
+        boot_device,
     })
+}
+
+/// Log the boot device init handed over, one line per part.
+fn log_boot_device(device: &ipc::vfsd_bootstrap::BootDevice)
+{
+    match device.esp
+    {
+        Some(esp) => std::os::seraph::log!(
+            "boot ESP: GPT partition {} at block {} ({} blocks)",
+            esp.partition_number,
+            esp.start_lba,
+            esp.size_lba
+        ),
+        None => std::os::seraph::log!("boot ESP: not reported"),
+    }
+    match device.location
+    {
+        Some(pci) => std::os::seraph::log!(
+            "boot controller: PCI {:04x}:{:02x}:{:02x}.{}",
+            pci.segment,
+            pci.bus,
+            pci.device,
+            pci.function
+        ),
+        None => std::os::seraph::log!("boot controller: not reported"),
+    }
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -185,6 +218,7 @@ fn main() -> !
     };
 
     std::os::seraph::log!("starting");
+    log_boot_device(&caps.boot_device);
 
     if caps.service_ep == 0 || caps.block_class == 0
     {

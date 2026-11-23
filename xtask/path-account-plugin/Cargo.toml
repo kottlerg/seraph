@@ -1,0 +1,19 @@
+[package]
+name = "seraph-path-account-plugin"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The QEMU TCG plugin `cargo xtask path-account trace` loads into the guest's
+# QEMU (the cdylib), and the format of the record it writes, which xtask reads
+# through this crate (the rlib). xtask builds the cdylib with
+# `cargo build --release -p seraph-path-account-plugin` before a trace.
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+# No dependencies: the plugin resolves QEMU's plugin API, and the GLib
+# functions it needs, in the QEMU process that loads it (src/qemu.rs).
+
+[lints]
+workspace = true

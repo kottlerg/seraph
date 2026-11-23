@@ -166,15 +166,24 @@ service executes as built, since procmgr verified it.
   `shared/ipc` (`log_record.rs`, `log_query.rs`, `procmgr_snapshot.rs`, `memmgr_capture.rs` and the
   label modules), `shared/namespace-protocol` and `shared/hwrng-protocol`.
 
-**Fuzz targets and proof harnesses.** None on `master`. Planned: property functions, fuzz targets
-and proof harnesses for the decoders of `shared/ipc`, `shared/namespace-protocol` (`gate_open`,
-`compose_forward_lookup_rights`, `validate_name`) and `shared/hwrng-protocol` (`decode_reply`,
-`requested_len`), in [#680](https://github.com/kottlerg/seraph/issues/680) and
-[#756](https://github.com/kottlerg/seraph/issues/756).
+**Fuzz targets and proof harnesses.**
+
+- `hwrng-protocol` (`xtask/fuzz/targets/src/bin/hwrng-protocol.rs`) drives
+  `hwrng_protocol::property::hwrng_protocol_holds` over a request and a reply, from the seeds in
+  `shared/hwrng-protocol/fuzz/hwrng-protocol/seeds/`; CI's gating `fuzz` job runs it on every pull
+  request and the weekly campaign for 30 minutes.
+- The `proofs` module of `shared/hwrng-protocol/src/lib.rs` proves `requested_len` on every request
+  and, by induction over a reply's words, `decode_reply` and `encode_reply`
+  ([testing.md](testing.md) § Bounded verification); CI's `kani` job runs them.
+- Planned: property functions, fuzz targets and proof harnesses for the decoders of `shared/ipc` and
+  `shared/namespace-protocol` (`gate_open`, `compose_forward_lookup_rights`, `validate_name`), in
+  [#680](https://github.com/kottlerg/seraph/issues/680) and
+  [#756](https://github.com/kottlerg/seraph/issues/756).
 
 **Gaps.**
 
-- No decoder of this boundary has a property function, a fuzz target or a proof harness yet.
+- No decoder of `shared/ipc` or `shared/namespace-protocol` has a property function, a fuzz target
+  or a proof harness yet.
 - Each server's dispatcher checks its own labels, word counts, versions and badges; no shared layer
   checks them, and no review has yet covered every label of every service against this attacker. The
   audit of this section ([#680](https://github.com/kottlerg/seraph/issues/680)) is the first.
@@ -329,10 +338,20 @@ is.
 - The kernel hands init its `InitInfo` in read-only pages, and init refuses one of another protocol
   version (`services/init/src/main.rs`).
 
-**Fuzz targets and proof harnesses.** None on `master`. Planned: property functions, fuzz targets
-and proof harnesses for `FramebufferInfo::from_bytes`, the bundle's `parse_header` and `entry_at`,
-and `find_module_slot` ([#680](https://github.com/kottlerg/seraph/issues/680),
-[#756](https://github.com/kottlerg/seraph/issues/756)).
+**Fuzz targets and proof harnesses.**
+
+- `boot-protocol` (`xtask/fuzz/targets/src/bin/boot-protocol.rs`) drives
+  `boot_protocol::property::boot_protocol_holds` over a bundle and a framebuffer record, from the
+  seeds in `abi/boot-protocol/fuzz/boot-protocol/seeds/`, and `init-protocol`
+  (`xtask/fuzz/targets/src/bin/init-protocol.rs`) drives
+  `init_protocol::property::init_protocol_holds` over a request and a module-name table, from the
+  seeds in `abi/init-protocol/fuzz/init-protocol/seeds/`; CI's gating `fuzz` job runs them on every
+  pull request and the weekly campaign for 30 minutes each.
+- The `proofs` modules of `abi/boot-protocol/src/lib.rs` and `abi/boot-protocol/src/bundle.rs` prove
+  `FramebufferInfo::from_bytes` on every record, the bundle's `parse_header` and `entry_at` on every
+  input of up to two entries, and, by induction, the walk of the entry headers; that of
+  `abi/init-protocol/src/lib.rs` proves the trim of every name and, by induction, `find_module_slot`
+  ([testing.md](testing.md) § Bounded verification). CI's `kani` job runs them.
 
 **Gaps.**
 

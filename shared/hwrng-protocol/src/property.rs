@@ -61,6 +61,12 @@ pub fn hwrng_protocol_holds(input: &[u8])
         .unwrap_or_default();
     request_holds(words);
     reply_holds(words, out_len);
+    let mut out = [0u8; MAX_OUT];
+    let buffer = out.get_mut(..out_len).unwrap_or_default();
+    if let Some(count) = decode_reply(words, buffer)
+    {
+        encode_holds(buffer.get(..count).unwrap_or_default());
+    }
     encode_holds(body);
 }
 
@@ -83,8 +89,7 @@ pub(crate) fn request_holds(words: &[u64])
 /// [`MAX_READ_BYTES`], or one whose words after the count hold fewer bytes
 /// than it counts, and only those; otherwise it writes the counted bytes,
 /// little-endian from the word after the count, to the buffer's front and
-/// nothing past them, and the bytes encode back to a reply that decodes to
-/// them.
+/// nothing past them. Each byte is checked at its own index.
 pub(crate) fn reply_holds(words: &[u64], out_len: usize)
 {
     let mut out = [UNWRITTEN; MAX_OUT];
@@ -124,13 +129,14 @@ pub(crate) fn reply_holds(words: &[u64], out_len: usize)
             assert_eq!(byte, UNWRITTEN, "a byte past the count was written");
         }
     }
-    encode_holds(out.get(..count).unwrap_or_default());
 }
 
 /// [`encode_reply`] of `bytes` keeps its contract (its doc): it refuses
 /// more than [`MAX_READ_BYTES`], and only that; otherwise it writes the
-/// count word and the bytes after it, the last word zero-padded, returns
-/// the words written, and [`decode_reply`] reads the bytes back.
+/// count word and the bytes after it, the last word zero-padded, and returns
+/// the words written. With [`reply_holds`], which checks that
+/// [`decode_reply`] reads such words back to exactly their bytes, an
+/// encoded reply decodes to its bytes.
 pub(crate) fn encode_holds(bytes: &[u8])
 {
     let mut words = [0u64; MSG_DATA_WORDS_MAX];
@@ -167,11 +173,4 @@ pub(crate) fn encode_holds(bytes: &[u8])
             "a word holds other bytes or padding"
         );
     }
-    let mut back = [UNWRITTEN; MAX_READ_BYTES];
-    let back = back.get_mut(..bytes.len()).unwrap_or_default();
-    assert_eq!(decode_reply(sent, back), Some(bytes.len()));
-    assert_eq!(
-        &*back, bytes,
-        "an encoded reply does not decode to its bytes"
-    );
 }

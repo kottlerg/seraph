@@ -642,8 +642,9 @@ mod proofs
     /// any slots and names, and every request of up to
     /// `INIT_MODULE_NAME_LEN + 1` bytes, one past the longest name any entry
     /// can hold, so a request no name can equal is among them. The longest
-    /// loops are the scans and compares of the 256-byte names, so an unwind
-    /// bound of 258 covers every loop.
+    /// loops are the lookup's scans and compares of the 256-byte names and
+    /// the property's byte-by-byte check of each name, so an unwind bound of
+    /// 258 covers every loop.
     #[kani::proof]
     #[kani::unwind(258)]
     fn every_lookup_holds_the_lookup_contract()
@@ -667,8 +668,9 @@ mod proofs
     }
 
     /// The trim of a table name holds on every name: it stops at the first
-    /// NUL and keeps the whole name without one. The longest loop is the
-    /// scan of the 256-byte name, so an unwind bound of 257 covers it.
+    /// NUL and keeps the whole name without one. The longest loops are the
+    /// trim's scan of the 256-byte name and the check of each of its bytes at
+    /// its own index, so an unwind bound of 257 covers them.
     #[kani::proof]
     #[kani::unwind(257)]
     fn every_name_trims_at_its_first_nul()

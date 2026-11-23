@@ -328,12 +328,14 @@ mod proofs
 
     /// The encode contract holds on every byte string of up to
     /// `MAX_READ_BYTES + 1` bytes, the longest a reply carries and one past
-    /// it, which the encoder refuses as it refuses any longer. The longest
-    /// loop is the compare of the decoded bytes, so an unwind bound of 506
-    /// covers every loop.
+    /// it, which the encoder refuses as it refuses any longer, before any
+    /// loop. With the reply proof, which covers the words an encode writes,
+    /// every encoded reply decodes to its bytes. The longest loops are the
+    /// encoder's and the check's walks of the at most `MSG_DATA_WORDS_MAX - 1`
+    /// (63) words after the count, so an unwind bound of 65 covers every loop.
     #[kani::proof]
-    #[kani::unwind(506)]
-    fn every_reply_encodes_and_decodes_back()
+    #[kani::unwind(65)]
+    fn every_reply_encodes_to_its_words()
     {
         let bytes: [u8; MAX_READ_BYTES + 1] = kani::any();
         let len: usize = kani::any();

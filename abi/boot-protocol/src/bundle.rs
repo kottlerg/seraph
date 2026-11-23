@@ -538,9 +538,11 @@ mod proofs
 
     /// The entry contract holds for every index on the first `len` bytes of
     /// any `MAX_LEN`-byte input, `len` up to it: an index whose entry lies
-    /// past the slice, the two that lie in it, and every count. The longest
-    /// loop is the compare of the 256-byte name the entry is read with, so an
-    /// unwind bound of 257 covers every loop.
+    /// past the slice, the two that lie in it, and every count. The entry's
+    /// name is checked by the name proof, which covers every name. The
+    /// longest loop is the compare of the 256-byte name the entry is read
+    /// with, byte by byte at fixed indices, so an unwind bound of 257 covers
+    /// every loop.
     #[kani::proof]
     #[kani::unwind(257)]
     fn every_entry_holds_the_entry_contract()
@@ -552,8 +554,9 @@ mod proofs
     }
 
     /// The name contract holds on every name: the trim stops at the first
-    /// NUL and keeps the whole name without one. The longest loop is the
-    /// scan of the 256-byte name, so an unwind bound of 257 covers it.
+    /// NUL and keeps the whole name without one. The longest loops are the
+    /// trim's scan of the 256-byte name and the check of each of its bytes at
+    /// its own index, so an unwind bound of 257 covers them.
     #[kani::proof]
     #[kani::unwind(257)]
     fn every_name_holds_the_name_contract()

@@ -69,25 +69,55 @@ pub fn init_protocol_holds(input: &[u8])
     lookup_holds(names.get(..count).unwrap_or_default(), request);
 }
 
-/// The name a NUL-padded table name stands for: its bytes before the first
-/// NUL, or the whole name when it holds none ([`InitModuleName::name`]).
-fn trimmed(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
+/// Whether the NUL-padded table name `name` stands for `request`: its bytes
+/// before the first NUL, or the whole name when it holds none
+/// ([`InitModuleName::name`]), are `request`'s. Each byte is compared at its
+/// own index, so the check makes no search or compare of a length the
+/// input decides.
+fn stands_for(name: &[u8; INIT_MODULE_NAME_LEN], request: &[u8]) -> bool
 {
-    let end = name
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(INIT_MODULE_NAME_LEN);
-    name.get(..end).unwrap_or(name)
+    let mut ended = false;
+    let mut same = request.len() <= INIT_MODULE_NAME_LEN;
+    for (at, &byte) in name.iter().enumerate()
+    {
+        ended = ended || byte == 0;
+        let asked = request.get(at).copied();
+        same = same
+            && if ended
+            {
+                asked.is_none()
+            }
+            else
+            {
+                asked == Some(byte)
+            };
+    }
+    same
 }
 
-/// [`module_name_str`] of `name` is the name it stands for.
+/// [`module_name_str`] of `name` is its bytes before the first NUL, or the
+/// whole name when it holds none ([`InitModuleName::name`]): a prefix of the
+/// name itself, with no NUL before its end and a NUL, or the name's end, at
+/// it. Each byte is checked at its own index.
 pub(crate) fn name_holds(name: &[u8; INIT_MODULE_NAME_LEN])
 {
-    assert_eq!(
-        module_name_str(name),
-        trimmed(name),
+    let trimmed = module_name_str(name);
+    let end = trimmed.len();
+    assert!(
+        trimmed.as_ptr() == name.as_ptr() && end <= INIT_MODULE_NAME_LEN,
         "a name was trimmed to other bytes"
     );
+    for (at, &byte) in name.iter().enumerate()
+    {
+        if at < end
+        {
+            assert_ne!(byte, 0, "a trimmed name holds a NUL");
+        }
+        else if at == end
+        {
+            assert_eq!(byte, 0, "a name was trimmed short of its first NUL");
+        }
+    }
 }
 
 /// [`find_module_slot`] over `names` keeps its contract (its doc): it finds
@@ -97,7 +127,7 @@ pub(crate) fn lookup_holds(names: &[InitModuleName], request: &[u8])
 {
     let expected = names
         .iter()
-        .find(|entry| trimmed(&entry.name) == request)
+        .find(|entry| stands_for(&entry.name, request))
         .map(|entry| entry.slot);
     assert_eq!(
         find_module_slot(names, request),

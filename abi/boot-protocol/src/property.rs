@@ -50,6 +50,10 @@ pub fn boot_protocol_holds(input: &[u8])
         if let Ok(index) = u32::try_from(index)
         {
             entry_holds(input, index);
+            if let Some(entry) = entry_at(input, index)
+            {
+                name_holds(&entry.name);
+            }
         }
     }
     entry_holds(input, u32::MAX);
@@ -166,7 +170,7 @@ pub(crate) fn header_holds(bytes: &[u8])
 /// `entry_count` whose entry header lies whole in the slice, and that entry
 /// is the [`ENTRY_HEADER_SIZE`] bytes at `HEADER_SIZE + index *
 /// ENTRY_HEADER_SIZE`: its name, then its offset and size, little-endian,
-/// with nothing left over; its name keeps [`name_holds`].
+/// with nothing left over.
 pub(crate) fn entry_holds(bytes: &[u8], index: u32)
 {
     let at = entry_offset(u64::from(index));
@@ -187,38 +191,50 @@ pub(crate) fn entry_holds(bytes: &[u8], index: u32)
     );
     let at = usize::try_from(at).unwrap_or(usize::MAX);
     let raw = bytes
-        .get(at..at.saturating_add(ENTRY_HEADER_SIZE))
-        .unwrap_or_default();
-    assert_eq!(
-        raw.get(..ENTRY_NAME_LEN),
-        Some(&entry.name[..]),
-        "the name was misread"
-    );
+        .get(at..)
+        .and_then(<[u8]>::first_chunk::<ENTRY_HEADER_SIZE>);
+    assert!(raw.is_some(), "an entry was read past the slice");
+    let Some(raw) = raw
+    else
+    {
+        return;
+    };
+    for (&read, &held) in entry.name.iter().zip(raw)
+    {
+        assert_eq!(read, held, "the name was misread");
+    }
     assert_eq!(
         le64(raw, OFFSET_AT),
         Some(entry.offset),
         "the offset was misread"
     );
     assert_eq!(le64(raw, SIZE_AT), Some(entry.size), "the size was misread");
-    name_holds(&entry.name);
 }
 
 /// [`name_str`] of `name` is its bytes before the first NUL, or the whole
-/// name when it holds none ([`crate::bundle::BundleEntryHeader::name`]).
+/// name when it holds none ([`crate::bundle::BundleEntryHeader::name`]):
+/// a prefix of the name itself, with no NUL before its end and a NUL, or
+/// the name's end, at it. Each byte is checked at its own index, so the
+/// check makes no search or compare of a length the name decides.
 pub(crate) fn name_holds(name: &[u8; ENTRY_NAME_LEN])
 {
     let trimmed = name_str(name);
     let end = trimmed.len();
-    assert_eq!(
-        name.get(..end),
-        Some(trimmed),
+    assert!(
+        trimmed.as_ptr() == name.as_ptr() && end <= ENTRY_NAME_LEN,
         "a name was trimmed to other bytes"
     );
-    assert!(!trimmed.contains(&0), "a trimmed name holds a NUL");
-    assert!(
-        name.get(end).is_none_or(|&byte| byte == 0),
-        "a name was trimmed short of its first NUL"
-    );
+    for (at, &byte) in name.iter().enumerate()
+    {
+        if at < end
+        {
+            assert_ne!(byte, 0, "a trimmed name holds a NUL");
+        }
+        else if at == end
+        {
+            assert_eq!(byte, 0, "a name was trimmed short of its first NUL");
+        }
+    }
 }
 
 /// [`FramebufferInfo::from_bytes`] of `bytes` keeps its contract (its doc):

@@ -218,13 +218,13 @@ mod tests
         assert_eq!(requested_len(&[u64::MAX]), MAX_READ_BYTES);
     }
 
-    /// The checked-in inputs of the fuzz target `hwrng-protocol`, seeds and
-    /// regressions.
-    fn fuzz_inputs() -> Vec<Vec<u8>>
+    /// The checked-in inputs of the fuzz target `hwrng-protocol` of the `kinds`
+    /// given (`seeds`, `regressions`).
+    fn fuzz_inputs(kinds: &[&str]) -> Vec<Vec<u8>>
     {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/hwrng-protocol");
         let mut inputs = Vec::new();
-        for kind in ["seeds", "regressions"]
+        for kind in kinds
         {
             let Ok(entries) = std::fs::read_dir(dir.join(kind))
             else
@@ -245,7 +245,7 @@ mod tests
     #[test]
     fn every_checked_in_fuzz_input_holds_the_parser_contract()
     {
-        let inputs = fuzz_inputs();
+        let inputs = fuzz_inputs(&["seeds", "regressions"]);
         assert!(
             !inputs.is_empty(),
             "no checked-in input under fuzz/hwrng-protocol"
@@ -262,7 +262,7 @@ mod tests
     #[test]
     fn a_seed_decodes_as_a_reply_of_a_partial_last_word()
     {
-        let decoded = fuzz_inputs().iter().any(|bytes| {
+        let decoded = fuzz_inputs(&["seeds"]).iter().any(|bytes| {
             let out_len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
             let words: Vec<u64> = bytes[2..]
                 .as_chunks::<8>()

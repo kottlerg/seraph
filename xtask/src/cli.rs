@@ -94,7 +94,7 @@ subcommands! {
         /// Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every
         /// crate that holds one, with the pinned Kani release, and fail on any
         /// failed, undetermined or unwinding-incomplete check, on a Kani release
-        /// other than the pinned one, and on a harness in an unregistered crate;
+        /// other than the pinned one, and on a harness that lies in no package;
         /// with `--pin`, print the pinned release (see xtask/README.md).
         Kani(KaniArgs),
 
@@ -1007,7 +1007,7 @@ args! {
     pub struct KaniArgs
     {
         /// Verify the harnesses of this crate only, by its package name (one
-        /// `cargo xtask kani` registers).
+        /// that holds a harness).
         #[arg(long, value_name = "CRATE")]
         pub component: Option<String>,
 

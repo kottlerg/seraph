@@ -2118,7 +2118,7 @@ to the rules of [coding-standards.md](coding-standards.md#proof-harnesses) § Pr
 every crate that holds one, each crate built in its host test configuration, with the pinned Kani
 release ([build-system.md](build-system.md#toolchain) § Toolchain). It fails on any failed,
 undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a
-harness that lies in no crate. It finds the crates from their harnesses, so a crate's
+harness that lies in no package. It finds the crates from their harnesses, so a crate's
 first harness adds it to the run. CI's `kani` job runs it on every push and pull request,
 and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).

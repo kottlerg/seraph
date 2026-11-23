@@ -561,13 +561,13 @@ mod tests
         assert_eq!(find_module_slot(&names, b"memmgr"), None);
     }
 
-    /// The checked-in inputs of the fuzz target `init-protocol`, seeds and
-    /// regressions.
-    fn fuzz_inputs() -> std::vec::Vec<std::vec::Vec<u8>>
+    /// The checked-in inputs of the fuzz target `init-protocol` of the `kinds`
+    /// given (`seeds`, `regressions`).
+    fn fuzz_inputs(kinds: &[&str]) -> std::vec::Vec<std::vec::Vec<u8>>
     {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/init-protocol");
         let mut inputs = std::vec::Vec::new();
-        for kind in ["seeds", "regressions"]
+        for kind in kinds
         {
             let Ok(entries) = std::fs::read_dir(dir.join(kind))
             else
@@ -588,7 +588,7 @@ mod tests
     #[test]
     fn every_checked_in_fuzz_input_holds_the_parser_contract()
     {
-        let inputs = fuzz_inputs();
+        let inputs = fuzz_inputs(&["seeds", "regressions"]);
         assert!(
             !inputs.is_empty(),
             "no checked-in input under fuzz/init-protocol"
@@ -605,7 +605,7 @@ mod tests
     #[test]
     fn a_seed_finds_a_module_past_the_first_entry()
     {
-        let found = fuzz_inputs().iter().any(|bytes| {
+        let found = fuzz_inputs(&["seeds"]).iter().any(|bytes| {
             let len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
             let request = &bytes[2..2 + len];
             let names: std::vec::Vec<InitModuleName> = bytes[2 + len..]

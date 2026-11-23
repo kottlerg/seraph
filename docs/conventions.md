@@ -584,6 +584,11 @@ gives the PR-level linear view.
   `cargo xtask compare-images` and gives the head it ran at and the path of
   the report the command wrote; the pre-merge audit reads that report and
   checks its base, its head, its four cells, and its verdict.
+- Every PR body whose diff adds a proof harness or changes one's body, bounds or `kani::any`
+  sizes MUST report, in its `## Validation` section, the local sizing run of each such harness
+  that [testing.md](testing.md#bounded-verification) § Bounded verification owes: its
+  verification time, the peak resident memory of the run, its unwind bounds, and the head it
+  ran at.
 
 ## CI Gating
 

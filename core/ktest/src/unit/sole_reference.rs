@@ -13,10 +13,13 @@
 //! another CPU may finish waits for the post, bounded. Every case ends by
 //! checking that its queue's observer pool has every node back.
 
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 use syscall::{
     RIGHTS_ALL, RIGHTS_EQ_RECV, cap_bind_sole_reference, cap_copy, cap_create_cspace,
     cap_create_notification, cap_delete, cap_derive, cap_info, cap_move,
-    event_queue_create_observed, event_recv_entry, system_info, thread_exit,
+    event_queue_create_observed, event_recv_entry, system_info, thread_exit, thread_set_affinity,
+    thread_sleep,
 };
 use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, SyscallError, SystemInfoType};
 
@@ -309,6 +312,231 @@ fn past_budget_round(ctx: &TestContext, eq: u64) -> TestResult
     })();
     cap_delete(object).ok();
     result
+}
+
+/// The bindings one drain pass posts: the kernel's `POST_BUDGET`.
+const FIRST_PASS_NODES: u32 = 64;
+
+/// The bindings [`leftover_posts_reach_a_busy_cpu`] leaves past the first
+/// pass.
+const LEFTOVER_NODES: u32 = 16;
+
+/// Spinner threads that keep the CPUs other than the case's busy in user mode;
+/// at most three, so the case's work stops growing at four CPUs. On more
+/// CPUs an idle one may post the leftovers first, which the case accepts.
+const BUSY_SPINNERS: usize = 3;
+
+/// Length, in milliseconds, of the window in which no thread of the case makes
+/// a syscall: many timer ticks.
+const BUSY_WINDOW_MS: u64 = 200;
+
+/// The CPU the case pins its own thread to; the spinners take the next ones.
+const BUSY_CASE_CPU: u32 = 0;
+
+// Child stacks of the spinners.
+static mut SPIN_STACKS: [ChildStack; BUSY_SPINNERS] = [ChildStack::ZERO; BUSY_SPINNERS];
+
+/// Set to end the spinners' loops.
+static SPIN_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Spinners that have started their loops.
+static SPIN_READY: AtomicU32 = AtomicU32::new(0);
+
+/// Spin in user mode, with no syscall, until [`SPIN_STOP`] is set, then exit.
+extern "C" fn busy_spinner_entry(_arg: u64) -> !
+{
+    SPIN_READY.fetch_add(1, Ordering::AcqRel);
+    while !SPIN_STOP.load(Ordering::Acquire)
+    {
+        core::hint::spin_loop();
+    }
+    thread_exit()
+}
+
+/// Cycle-counter ticks per millisecond on this CPU, measured over a 20 ms
+/// sleep against the kernel's elapsed-microseconds clock.
+fn cycles_per_ms() -> Result<u64, &'static str>
+{
+    let elapsed = || system_info(SystemInfoType::ElapsedUs as u64);
+    let us0 = elapsed().map_err(|_| "busy_cpu: system_info(ElapsedUs) failed")?;
+    let c0 = crate::arch::cycles_now();
+    thread_sleep(20).map_err(|_| "busy_cpu: thread_sleep failed")?;
+    let c1 = crate::arch::cycles_now();
+    let us1 = elapsed().map_err(|_| "busy_cpu: system_info(ElapsedUs) failed")?;
+    let us = us1.saturating_sub(us0).max(1);
+    let per_ms = u128::from(c1.wrapping_sub(c0)).saturating_mul(1000) / u128::from(us);
+    u64::try_from(per_ms)
+        .ok()
+        .filter(|&r| r > 0)
+        .ok_or("busy_cpu: the cycle counter did not advance")
+}
+
+/// The leftovers of a drain pass reach their queue while every CPU the case
+/// occupies runs user code that makes no syscall: the kernel posts them at an
+/// interrupt's return to user mode, within a tick. The case binds one pass's
+/// worth of bindings to one queue and sixteen more to another, the latter
+/// first so that the pass takes the former, keeps the other CPUs busy with
+/// spinners, makes the fall to one, and spins with no syscall; its next syscall
+/// finds a leftover already posted. Fails if the leftovers wait for a syscall
+/// or an idle CPU.
+pub fn leftover_posts_reach_a_busy_cpu(ctx: &TestContext) -> TestResult
+{
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "busy_cpu: system_info(CpuCount) failed")?;
+    let spinners = usize::try_from(cpus.saturating_sub(1))
+        .unwrap_or(BUSY_SPINNERS)
+        .min(BUSY_SPINNERS);
+    let first = event_queue_create_observed(ctx.memory_base, FIRST_PASS_NODES, FIRST_PASS_NODES)
+        .map_err(|_| "busy_cpu: event_queue_create_observed failed")?;
+    let result = event_queue_create_observed(ctx.memory_base, LEFTOVER_NODES, LEFTOVER_NODES)
+        .map_err(|_| "busy_cpu: event_queue_create_observed failed")
+        .and_then(|rest| {
+            let result = thread_set_affinity(ctx.thread_cap, BUSY_CASE_CPU)
+                .map_err(|_| "busy_cpu: pin failed")
+                .and_then(|()| {
+                    let result = busy_window(ctx, first, rest, spinners);
+                    let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
+                        .map_err(|_| "busy_cpu: restore affinity failed");
+                    result.and(restore)
+                })
+                .and_then(|()| pool_restored(ctx, first, u64::from(FIRST_PASS_NODES)))
+                .and_then(|()| pool_restored(ctx, rest, u64::from(LEFTOVER_NODES)));
+            cap_delete(rest).ok();
+            result
+        });
+    cap_delete(first).ok();
+    result
+}
+
+/// Body of [`leftover_posts_reach_a_busy_cpu`], with its thread pinned to
+/// [`BUSY_CASE_CPU`].
+fn busy_window(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> TestResult
+{
+    let object = cap_create_notification(ctx.memory_base).map_err(|_| "busy_cpu: create failed")?;
+    let mut children: [Option<crate::spawn::SpawnedChild>; BUSY_SPINNERS] =
+        core::array::from_fn(|_| None);
+    SPIN_STOP.store(false, Ordering::Release);
+    SPIN_READY.store(0, Ordering::Release);
+    let result = (|| {
+        let copy = cap_derive(object, RIGHTS_ALL).map_err(|_| "busy_cpu: derive failed")?;
+        // The pass takes an object's newest bindings first and its first
+        // binding last: the leftover queue's go first.
+        for i in 0..u64::from(LEFTOVER_NODES)
+        {
+            cap_bind_sole_reference(object, rest, CORRELATOR | 0x80 | i)
+                .map_err(|_| "busy_cpu: a leftover bind failed")?;
+        }
+        for i in 0..u64::from(FIRST_PASS_NODES)
+        {
+            cap_bind_sole_reference(object, first, CORRELATOR | i)
+                .map_err(|_| "busy_cpu: a first-pass bind failed")?;
+        }
+        let per_ms = cycles_per_ms()?;
+        start_spinners(ctx, &mut children, spinners)?;
+        let ready_wait = per_ms.saturating_mul(post_wait());
+        let start = crate::arch::cycles_now();
+        while SPIN_READY.load(Ordering::Acquire) < u32::try_from(spinners).unwrap_or(u32::MAX)
+        {
+            if crate::arch::cycles_now().wrapping_sub(start) > ready_wait
+            {
+                return Err("busy_cpu: the spinners did not start");
+            }
+            core::hint::spin_loop();
+        }
+        // The fall to one; this delete's own drain posts the first pass.
+        cap_delete(copy).map_err(|_| "busy_cpu: delete failed")?;
+        let window = per_ms.saturating_mul(BUSY_WINDOW_MS);
+        let start = crate::arch::cycles_now();
+        while crate::arch::cycles_now().wrapping_sub(start) < window
+        {
+            core::hint::spin_loop();
+        }
+        // The first syscall since the window: a drain at its return would
+        // come too late for this receive.
+        let leftover = event_recv_entry(rest, TRY_ONCE);
+        SPIN_STOP.store(true, Ordering::Release);
+        let leftover = leftover.map_err(|_| "busy_cpu: no leftover posted within the window")?;
+        let mut seen_rest = [false; LEFTOVER_NODES as usize];
+        mark_post(
+            &mut seen_rest,
+            leftover.tag ^ (CORRELATOR | 0x80),
+            leftover.payload,
+        )?;
+        for _ in 1..LEFTOVER_NODES
+        {
+            let entry = event_recv_entry(rest, post_wait())
+                .map_err(|_| "busy_cpu: a leftover binding did not post")?;
+            mark_post(
+                &mut seen_rest,
+                entry.tag ^ (CORRELATOR | 0x80),
+                entry.payload,
+            )?;
+        }
+        let mut seen_first = [false; FIRST_PASS_NODES as usize];
+        for _ in 0..FIRST_PASS_NODES
+        {
+            let entry = event_recv_entry(first, post_wait())
+                .map_err(|_| "busy_cpu: a first-pass binding did not post")?;
+            mark_post(&mut seen_first, entry.tag ^ CORRELATOR, entry.payload)?;
+        }
+        expect_none(rest, "busy_cpu: a leftover binding posted twice")?;
+        expect_none(first, "busy_cpu: a first-pass binding posted twice")
+    })();
+    SPIN_STOP.store(true, Ordering::Release);
+    for child in children.iter_mut().flatten()
+    {
+        crate::spawn::wait_until_exited(child.th, crate::scaled_polls(2000)).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
+    }
+    cap_delete(object).ok();
+    result
+}
+
+/// Start `spinners` spinner threads, each pinned to its own CPU after
+/// [`BUSY_CASE_CPU`], into `children`.
+fn start_spinners(
+    ctx: &TestContext,
+    children: &mut [Option<crate::spawn::SpawnedChild>; BUSY_SPINNERS],
+    spinners: usize,
+) -> TestResult
+{
+    for (index, slot) in children.iter_mut().enumerate().take(spinners)
+    {
+        let child = crate::spawn::new_child(ctx).map_err(|_| "busy_cpu: new_child failed")?;
+        let cpu = u32::try_from(index)
+            .ok()
+            .and_then(|i| i.checked_add(BUSY_CASE_CPU + 1))
+            .ok_or("busy_cpu: spinner CPU out of range")?;
+        // SAFETY: SPIN_STACKS is a static array reached only through
+        // addr_of!; each spinner runs on its own element, and the case waits
+        // for every spinner to exit before the array is used again.
+        let stack_top = unsafe { ChildStack::top_at(core::ptr::addr_of!(SPIN_STACKS), index) }?;
+        // SAFETY: stack_top's stack is this spinner's alone (above).
+        let started = unsafe {
+            crate::spawn::configure_and_start_pinned(&child, busy_spinner_entry, stack_top, 0, cpu)
+        };
+        *slot = Some(child);
+        started?;
+    }
+    Ok(())
+}
+
+/// Mark the post at `index` in `seen`, checking its payload and that it
+/// is the first.
+fn mark_post(seen: &mut [bool], index: u64, payload: u64) -> TestResult
+{
+    let slot = usize::try_from(index)
+        .ok()
+        .and_then(|i| seen.get_mut(i))
+        .filter(|taken| !**taken)
+        .ok_or("busy_cpu: wrong or duplicate post")?;
+    if payload != 0
+    {
+        return Err("busy_cpu: wrong payload");
+    }
+    *slot = true;
+    Ok(())
 }
 
 /// A copy moved into another `CSpace`, the move an IPC transfer makes at

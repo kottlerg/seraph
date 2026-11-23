@@ -509,6 +509,13 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         }
         if sstatus_at_entry & (1 << 8) == 0
         {
+            // A pass of the sole-reference posts earlier drains left, so a
+            // hart that runs only user code posts them within a tick
+            // (core/kernel/docs/capability-internals.md § Sole-Reference
+            // Observers).
+            // SAFETY: U-mode origin: the interrupted thread's kernel stack, the
+            // interrupt handled and completed, no lock is held, SIE = 0.
+            unsafe { crate::cap::sole_reference::drain_at_interrupt() };
             // The interrupt delivery point of an upcall posted with
             // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
             // Upcalls): the interrupt is handled and completed, and the thread

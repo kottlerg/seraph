@@ -489,6 +489,10 @@ pub fn run_all(ctx: &TestContext)
         sole_reference::bindings_past_the_budget_each_post_once(ctx)
     );
     run_test!(
+        "sole_reference::leftover_posts_reach_a_busy_cpu",
+        sole_reference::leftover_posts_reach_a_busy_cpu(ctx)
+    );
+    run_test!(
         "sole_reference::moved_copy_does_not_post",
         sole_reference::moved_copy_does_not_post(ctx)
     );

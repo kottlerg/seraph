@@ -423,14 +423,18 @@ fn claim_bucket(chains: &mut Chains, bucket: usize)
 /// queue, then the queue's reference the binding held released.
 ///
 /// Called by `drain_deferred_reclaim` after its reclaim, on the syscall
-/// epilogue and in the idle loop, and by the idle loop again while
-/// [`work_pending`] holds and its run queues are empty, with no lock held.
-/// Reads one word when nothing is pending. The fired nodes a pass leaves stay
-/// marked for the next drain on any CPU.
+/// epilogue and in the idle loop; by the idle loop again while
+/// [`work_pending`] holds and its run queues are empty; and by
+/// [`drain_at_interrupt`] at the end of every interrupt taken from user mode;
+/// with no lock held. Reads one word when nothing is pending. The fired nodes
+/// a pass leaves stay marked for the next drain on any CPU, which a CPU
+/// running user code reaches at its next interrupt at the latest.
 ///
 /// # Safety
 /// No lock is held, and the context is one [`release_ref`] allows: syscall
-/// context with interrupts disabled, or the idle thread.
+/// context with interrupts disabled, the end of an interrupt taken from user
+/// mode on the interrupted thread's kernel stack with interrupts disabled, or
+/// the idle thread.
 ///
 /// [`release_ref`]: crate::cap::object::release_ref
 #[cfg(not(test))]
@@ -482,6 +486,26 @@ pub unsafe fn drain()
 pub fn work_pending() -> bool
 {
     TABLE.work_pending()
+}
+
+/// One [`drain`] pass when the table has work, at the end of an interrupt
+/// taken from user mode. A CPU that runs only user code makes no syscall and
+/// never idles, so this is where it posts what earlier passes left: within one
+/// timer tick. Costs one load when nothing is pending.
+///
+/// # Safety
+/// The end of an interrupt handler taken from user mode, the interrupt
+/// acknowledged, on the interrupted thread's kernel stack; no lock is held,
+/// interrupts disabled.
+#[cfg(not(test))]
+pub unsafe fn drain_at_interrupt()
+{
+    if work_pending()
+    {
+        // SAFETY: an interrupt's end on the interrupted thread's kernel stack,
+        // no lock held, interrupts disabled (contract): a context drain allows.
+        unsafe { drain() };
+    }
 }
 
 #[cfg(test)]

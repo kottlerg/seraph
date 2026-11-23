@@ -2985,6 +2985,10 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 ///   context with interrupts disabled; fault delivery on the faulting thread
 ///   with interrupts disabled, before its park (`ipc::fault::fault_dispatch`,
 ///   releasing an Endpoint, which frees in place and never reaches the push);
+///   the end of an interrupt taken from user mode, on the interrupted thread's
+///   kernel stack with interrupts disabled
+///   (`cap::sole_reference::drain_at_interrupt`, releasing an `EventQueue`,
+///   which frees in place and never reaches the push);
 ///   or the idle thread (pinned to its CPU) draining the deferred-reclaim
 ///   stack, which reaches here through an Mmio object's teardown
 ///   (`MmioObject::withdraw_mappings`).

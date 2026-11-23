@@ -496,3 +496,69 @@ mod tests
         assert_eq!(name_str(&name), b"init");
     }
 }
+
+/// Bounded proofs of the bundle parsers' contract (docs/testing.md § Bounded
+/// verification, Parser proofs).
+///
+/// Each proof runs one of the property's checks on every input up to its
+/// bound. [`parse_header`] loops over its entry headers, but each iteration
+/// checks one entry against the slice's length alone and carries nothing to
+/// the next, so a run over two entries reaches every refusal an entry can
+/// make, at the first entry and after one that passed; a longer table only
+/// repeats them. The loop that drives [`entry_at`] over every index, and the
+/// one that hands the property each index, lie outside the proofs: the fuzz
+/// target `boot-protocol` and the replay of the checked-in inputs check them.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{ENTRY_HEADER_SIZE, ENTRY_NAME_LEN, HEADER_SIZE};
+    use crate::property;
+
+    /// The longest input the proofs read: the file header and two entry
+    /// headers.
+    const MAX_LEN: usize = HEADER_SIZE + 2 * ENTRY_HEADER_SIZE;
+
+    /// The header contract holds on the first `len` bytes of any
+    /// `MAX_LEN`-byte input, for every `len` up to it and so every
+    /// `entry_count` the slice can hold, with every offset and size: a body
+    /// aligned to `BODY_ALIGNMENT` lies inside such a slice only at offset 0,
+    /// and every other one is refused, so both outcomes of each entry's
+    /// checks are reached. The longest loops are the compare of the 8-byte
+    /// magic and the walk of at most two entries, so an unwind bound of 9
+    /// covers them.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_bundle_holds_the_header_contract()
+    {
+        let bytes: [u8; MAX_LEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_LEN);
+        property::header_holds(&bytes[..len]);
+    }
+
+    /// The entry contract holds for every index on the first `len` bytes of
+    /// any `MAX_LEN`-byte input, `len` up to it: an index whose entry lies
+    /// past the slice, the two that lie in it, and every count. The longest
+    /// loop is the compare of the 256-byte name the entry is read with, so an
+    /// unwind bound of 257 covers every loop.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn every_entry_holds_the_entry_contract()
+    {
+        let bytes: [u8; MAX_LEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_LEN);
+        property::entry_holds(&bytes[..len], kani::any());
+    }
+
+    /// The name contract holds on every name: the trim stops at the first
+    /// NUL and keeps the whole name without one. The longest loop is the
+    /// scan of the 256-byte name, so an unwind bound of 257 covers it.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn every_name_holds_the_name_contract()
+    {
+        let name: [u8; ENTRY_NAME_LEN] = kani::any();
+        property::name_holds(&name);
+    }
+}

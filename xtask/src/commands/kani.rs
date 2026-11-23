@@ -7,8 +7,8 @@
 //! (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned
 //! Kani release (docs/testing.md § Bounded verification).
 //!
-//! The command checks that every crate holding a harness is in [`HARNESSED`],
-//! checks `cargo kani --version` against [`KANI_VERSION`], then runs
+//! The command finds every crate holding a harness ([`harnessed`]), checks
+//! `cargo kani --version` against [`KANI_VERSION`], then runs
 //! `cargo kani --tests -p <package>` for each selected crate, which builds it in
 //! the host test configuration. It streams Kani's output and judges each
 //! harness's checks itself as well as Kani's verdict ([`Judge`]), so that an
@@ -29,28 +29,14 @@ use crate::util::step;
 pub const KANI_VERSION: &str = "0.68.0";
 
 /// A crate whose proof harnesses the command runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Harnessed
 {
     /// Its package name, which `cargo kani -p` takes.
-    package: &'static str,
+    package: String,
     /// Its directory, relative to the workspace root.
-    dir: &'static str,
+    dir: String,
 }
-
-/// Every crate that holds a proof harness. A crate gains its entry in the
-/// change that adds its first harness; the command fails while a harness lies
-/// in a crate not listed here ([`unregistered`]).
-const HARNESSED: &[Harnessed] = &[
-    Harnessed {
-        package: "kernel",
-        dir: "core/kernel",
-    },
-    Harnessed {
-        package: "vfsd-gpt",
-        dir: "services/vfsd/gpt",
-    },
-];
 
 /// The `git grep -E` pattern of a line that declares a proof harness.
 const HARNESS_PATTERN: &str = r"^[[:space:]]*#\[kani::proof\]";
@@ -63,11 +49,10 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
         println!("{KANI_VERSION}");
         return Ok(());
     }
-    let crates = selected(args.component.as_deref())?;
-    check_registry(&ctx.root)?;
+    let crates = selected(harnessed(&ctx.root)?, args.component.as_deref())?;
     check_version(&ctx.root)?;
     let mut failed = Vec::new();
-    for harnessed in crates
+    for harnessed in &crates
     {
         if let Err(e) = verify(&ctx.root, harnessed, args.harness.as_deref())
         {
@@ -81,27 +66,27 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
     Ok(())
 }
 
-/// The crates a run verifies: every registered one, or the one `--component`
-/// names.
-fn selected(component: Option<&str>) -> Result<Vec<&'static Harnessed>>
+/// The crates a run verifies: every crate that holds a harness, or the one
+/// `--component` names.
+fn selected(crates: Vec<Harnessed>, component: Option<&str>) -> Result<Vec<Harnessed>>
 {
     let Some(name) = component
     else
     {
-        return Ok(HARNESSED.iter().collect());
+        return Ok(crates);
     };
-    HARNESSED
+    let names = crates
         .iter()
+        .map(|h| h.package.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    crates
+        .into_iter()
         .find(|h| h.package == name)
         .map(|h| vec![h])
         .ok_or_else(|| {
             err!(
-                "`{name}` is not a crate with proof harnesses; the registered crates are {}",
-                HARNESSED
-                    .iter()
-                    .map(|h| h.package)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "`{name}` is not a crate with proof harnesses; the crates that hold one are {names}"
             )
         })
 }
@@ -168,11 +153,13 @@ fn version_mismatch(output: &str) -> Option<String>
     }
 }
 
-// ── The registry ──────────────────────────────────────────────────────────────
+// ── The harnessed crates ──────────────────────────────────────────────────────
 
-/// Fail when a tracked source declares a proof harness in a crate
-/// [`HARNESSED`] does not list, whose harnesses no run would verify.
-fn check_registry(root: &Path) -> Result<()>
+/// Every crate that holds a proof harness: the crate of each tracked Rust
+/// source that declares one, so a harness needs no registration to be run.
+/// Fails when such a source lies in no crate, or in a crate whose manifest
+/// names no package, since no run could verify it.
+fn harnessed(root: &Path) -> Result<Vec<Harnessed>>
 {
     let output = Command::new("git")
         .args(["grep", "-l", "-E", HARNESS_PATTERN, "--", "*.rs"])
@@ -190,53 +177,96 @@ fn check_registry(root: &Path) -> Result<()>
         ),
     };
     let files: Vec<&str> = files.lines().filter(|l| !l.is_empty()).collect();
-    let missing = unregistered(&files, HARNESSED, |dir| {
-        root.join(dir).join("Cargo.toml").is_file()
-    });
-    if !missing.is_empty()
-    {
-        bail!(
-            "proof harnesses in crates `HARNESSED` (xtask/src/commands/kani.rs) does not list, \
-             which no run would verify:\n  {}",
-            missing.join("\n  ")
-        );
-    }
-    Ok(())
+    harnessed_crates(&files, |dir| {
+        std::fs::read_to_string(root.join(dir).join("Cargo.toml")).ok()
+    })
+    .map_err(|unplaced| {
+        err!(
+            "proof harnesses that no run would verify:\n  {}",
+            unplaced.join("\n  ")
+        )
+    })
 }
 
-/// The directory of the crate `file` (a path relative to the workspace root)
-/// belongs to: its nearest ancestor that `has_manifest`.
-fn crate_dir(file: &str, has_manifest: impl Fn(&str) -> bool) -> Option<&str>
+/// The crates of `files` (paths relative to the workspace root), each once,
+/// in the order of their directories, read through `manifest`, which gives a
+/// directory's `Cargo.toml` when it has one; or each file that lies in no
+/// crate, or in one whose manifest names no package.
+fn harnessed_crates(
+    files: &[&str],
+    manifest: impl Fn(&str) -> Option<String>,
+) -> core::result::Result<Vec<Harnessed>, Vec<String>>
 {
-    let mut dir = file;
-    while let Some((parent, _)) = dir.rsplit_once('/')
+    let mut crates: Vec<Harnessed> = Vec::new();
+    let mut unplaced = Vec::new();
+    for file in files
     {
-        if has_manifest(parent)
+        let Some((dir, text)) = crate_dir(file, &manifest)
+        else
         {
-            return Some(parent);
+            unplaced.push(format!("{file} (in no crate)"));
+            continue;
+        };
+        if crates.iter().any(|h| h.dir == dir)
+        {
+            continue;
         }
-        dir = parent;
+        match package_name(&text)
+        {
+            Some(package) => crates.push(Harnessed {
+                package: package.to_owned(),
+                dir: dir.to_owned(),
+            }),
+            None => unplaced.push(format!("{file} (crate {dir} names no package)")),
+        }
+    }
+    crates.sort_by(|a, b| a.dir.cmp(&b.dir));
+    if unplaced.is_empty()
+    {
+        Ok(crates)
+    }
+    else
+    {
+        Err(unplaced)
+    }
+}
+
+/// The `name` of a manifest's `[package]` table.
+fn package_name(manifest: &str) -> Option<&str>
+{
+    let mut in_package = false;
+    for line in manifest.lines().map(str::trim)
+    {
+        if line.starts_with('[')
+        {
+            in_package = line == "[package]";
+        }
+        else if in_package
+            && let Some(value) = line
+                .strip_prefix("name")
+                .map(str::trim_start)
+                .and_then(|rest| rest.strip_prefix('='))
+        {
+            return value.trim().strip_prefix('"')?.strip_suffix('"');
+        }
     }
     None
 }
 
-/// The files of `files` whose crate `registry` does not list, each with the
-/// crate directory it belongs to.
-fn unregistered(
-    files: &[&str],
-    registry: &[Harnessed],
-    has_manifest: impl Fn(&str) -> bool,
-) -> Vec<String>
+/// The directory of the crate `file` (a path relative to the workspace root)
+/// belongs to, its nearest ancestor with a manifest, and that manifest.
+fn crate_dir(file: &str, manifest: impl Fn(&str) -> Option<String>) -> Option<(&str, String)>
 {
-    files
-        .iter()
-        .filter_map(|file| match crate_dir(file, &has_manifest)
+    let mut dir = file;
+    while let Some((parent, _)) = dir.rsplit_once('/')
+    {
+        if let Some(text) = manifest(parent)
         {
-            Some(dir) if registry.iter().any(|h| h.dir == dir) => None,
-            Some(dir) => Some(format!("{file} (crate {dir})")),
-            None => Some(format!("{file} (in no crate)")),
-        })
-        .collect()
+            return Some((parent, text));
+        }
+        dir = parent;
+    }
+    None
 }
 
 // ── One crate's run ───────────────────────────────────────────────────────────
@@ -261,7 +291,7 @@ fn verify(root: &Path, harnessed: &Harnessed, harness: Option<&str>) -> Result<(
 {
     step(&format!("Kani: {}", harnessed.package));
     let mut child = Command::new("cargo")
-        .args(kani_args(harnessed.package, harness))
+        .args(kani_args(&harnessed.package, harness))
         .current_dir(root)
         .stdout(Stdio::piped())
         .spawn()
@@ -560,25 +590,73 @@ mod tests
         assert!(version_mismatch("cargo 1.0\n").is_some());
     }
 
-    // Defect caught: a harness in a crate the registry does not list, which no
-    // run verifies, accepted; or one attributed to an enclosing crate.
+    // Defect caught: a crate holding a harness left out of the run, which
+    // no run then verifies; a harness attributed to an enclosing crate; a
+    // crate run once per harness file; or a harness outside any crate
+    // accepted.
     #[test]
-    fn a_harness_outside_the_registered_crates_is_reported()
+    fn every_crate_holding_a_harness_is_run_once_by_its_package()
     {
-        let registry = [Harnessed {
-            package: "outer",
-            dir: "a/outer",
-        }];
-        let manifests = ["a/outer", "a/outer/inner"];
-        let has_manifest = |dir: &str| manifests.contains(&dir);
-        let files = ["a/outer/src/x.rs", "a/outer/inner/src/y.rs", "a/loose.rs"];
+        let manifest = |dir: &str| match dir
+        {
+            "a/outer" => Some("[package]\nname = \"outer\"\n".to_owned()),
+            "a/outer/inner" => Some(
+                "# c\n[lib]\nname = \"lib\"\n\n[package]\nname    =   \"inner-pkg\"\n".to_owned(),
+            ),
+            "b" => Some("[workspace]\nmembers = []\n".to_owned()),
+            _ => None,
+        };
+        let files = [
+            "a/outer/src/x.rs",
+            "a/outer/inner/src/y.rs",
+            "a/outer/src/z.rs",
+        ];
         assert_eq!(
-            unregistered(&files, &registry, has_manifest),
-            [
-                "a/outer/inner/src/y.rs (crate a/outer/inner)",
-                "a/loose.rs (in no crate)"
-            ]
+            harnessed_crates(&files, manifest),
+            Ok(vec![
+                Harnessed {
+                    package: "outer".to_owned(),
+                    dir: "a/outer".to_owned(),
+                },
+                Harnessed {
+                    package: "inner-pkg".to_owned(),
+                    dir: "a/outer/inner".to_owned(),
+                },
+            ])
         );
+        assert_eq!(
+            harnessed_crates(&["a/outer/src/x.rs", "loose.rs", "b/src/w.rs"], manifest),
+            Err(vec![
+                "loose.rs (in no crate)".to_owned(),
+                "b/src/w.rs (crate b names no package)".to_owned(),
+            ])
+        );
+    }
+
+    // Defect caught: `--component` running another crate than it names, or
+    // accepting a crate that holds no harness.
+    #[test]
+    fn a_component_selects_its_crate_alone()
+    {
+        let crates = || {
+            vec![
+                Harnessed {
+                    package: "kernel".to_owned(),
+                    dir: "core/kernel".to_owned(),
+                },
+                Harnessed {
+                    package: "vfsd-gpt".to_owned(),
+                    dir: "services/vfsd/gpt".to_owned(),
+                },
+            ]
+        };
+        assert_eq!(selected(crates(), None).unwrap(), crates());
+        assert_eq!(
+            selected(crates(), Some("vfsd-gpt")).unwrap(),
+            [crates().remove(1)]
+        );
+        let refused = selected(crates(), Some("elf")).unwrap_err().to_string();
+        assert!(refused.contains("kernel, vfsd-gpt"), "{refused}");
     }
 
     // Defect caught: a run that turned the unwinding assertions off, so a

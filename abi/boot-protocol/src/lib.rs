@@ -23,6 +23,8 @@
 
 pub mod bundle;
 pub mod layout;
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
 pub mod riscv_paging;
 pub mod role_guids;
 pub mod x86_paging;
@@ -1209,6 +1211,8 @@ pub const KASLR_DM_WINDOW_LIMITED: u32 = 1 << 5;
 #[cfg(test)]
 mod tests
 {
+    extern crate std;
+
     use super::*;
 
     // FramebufferInfo::empty() is the "no framebuffer" sentinel: the kernel treats
@@ -1389,5 +1393,88 @@ mod tests
         let fb = FramebufferInfo::empty();
         let mut short = [0u8; FramebufferInfo::SIZE - 1];
         assert!(fb.to_bytes(&mut short).is_none());
+    }
+
+    /// The checked-in inputs of the fuzz target `boot-protocol`, seeds and
+    /// regressions, each with its path.
+    fn fuzz_inputs() -> std::vec::Vec<(std::path::PathBuf, std::vec::Vec<u8>)>
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/boot-protocol");
+        let mut inputs = std::vec::Vec::new();
+        for kind in ["seeds", "regressions"]
+        {
+            let Ok(entries) = std::fs::read_dir(dir.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in entries
+            {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                inputs.push((path, bytes));
+            }
+        }
+        inputs
+    }
+
+    // Defect caught: a parser change that breaks its contract on an input
+    // the fuzz target once found or started from; `cargo xtask test` replays
+    // every checked-in input of fuzz/boot-protocol/ on each change.
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_parser_contract()
+    {
+        let inputs = fuzz_inputs();
+        assert!(
+            !inputs.is_empty(),
+            "no checked-in input under fuzz/boot-protocol"
+        );
+        for (_, bytes) in &inputs
+        {
+            property::boot_protocol_holds(bytes);
+        }
+    }
+
+    // Defect caught: seeds that no longer reach the paths they were written
+    // for (an edited magic or a misplaced body, say), so the fuzz target
+    // starts from the refusals alone.
+    #[test]
+    fn the_seeds_reach_an_accepted_bundle_and_a_decoded_record()
+    {
+        let inputs = fuzz_inputs();
+        let accepted = inputs
+            .iter()
+            .filter(|(_, bytes)| bundle::parse_header(bytes).is_ok_and(|h| h.entry_count > 1))
+            .count();
+        assert!(accepted > 0, "no seed is a bundle of two or more entries");
+        let decoded = inputs
+            .iter()
+            .filter(|(_, bytes)| FramebufferInfo::from_bytes(bytes).is_some())
+            .count();
+        assert!(decoded > 0, "no seed is a framebuffer record");
+    }
+}
+
+/// Bounded proofs of the framebuffer record's contract (docs/testing.md
+/// § Bounded verification, Parser proofs). The bundle's are in `bundle.rs`.
+#[cfg(kani)]
+mod proofs
+{
+    use super::property;
+
+    /// The framebuffer record contract holds on the first `len` bytes of any
+    /// 32-byte input, for every `len` up to 32: the decoder reads only the
+    /// first `FramebufferInfo::SIZE` (24) bytes and refuses a shorter slice,
+    /// so these are every input it reads, short ones included. The longest
+    /// loop is the compare of the 24 bytes a record re-encodes to, so an
+    /// unwind bound of 33 covers every loop.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn every_record_holds_the_framebuffer_contract()
+    {
+        let bytes: [u8; 32] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        property::framebuffer_info_holds(&bytes[..len]);
     }
 }

@@ -319,7 +319,10 @@ version = "0.1.5"
 name = "fuzz-targets"
 version = "0.1.5"
 dependencies = [
+ "boot-protocol",
  "fuzz-engine",
+ "hwrng-protocol",
+ "init-protocol",
  "vfsd-gpt",
 ]
 

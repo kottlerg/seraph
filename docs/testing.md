@@ -2057,7 +2057,8 @@ per edge and compare tracing) and, where the host target supports it, AddressSan
   fixes it. A `#[cfg(test)]` test of the crate runs the property on every one, so
   `cargo xtask test` replays them on each change, on the host and under riscv64 emulation.
 - Its target: `xtask/fuzz/targets/src/bin/<target>.rs`, which names the property, the inputs'
-  directory, and the longest input the engine makes.
+  directory, and the longest input the engine makes, and one line for it in each of the two
+  name-ordered lists of `xtask/fuzz/targets/Cargo.toml`, the binaries and the parser crates.
 
 **The engine.** Each run is AFL-style: a queue of the inputs that reached a new edge or a new
 hit-count bucket of one; havoc mutations and splices of the queued inputs; a dictionary of the
@@ -2117,7 +2118,8 @@ to the rules of [coding-standards.md](coding-standards.md#proof-harnesses) § Pr
 every crate that holds one, each crate built in its host test configuration, with the pinned Kani
 release ([build-system.md](build-system.md#toolchain) § Toolchain). It fails on any failed,
 undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a
-harness in a crate it does not register. CI's `kani` job runs it on every push and pull request,
+harness that lies in no crate. It finds the crates from their harnesses, so a crate's
+first harness adds it to the run. CI's `kani` job runs it on every push and pull request,
 and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
 
@@ -2141,10 +2143,9 @@ the harness states, and a step harness, that one step from any state in the inva
 under `kani::assume`) keeps it and does what the property asks of that step, with no loop to
 unwind. Code other than the loops that drive the steps and the reads that feed them MUST NOT lie
 outside the harnesses; the module's comment states how its harnesses compose into the property and
-names those loops and reads, with the drivers that check them. The crate's first harness registers
-it with `cargo xtask kani`. Implemented for the GPT parser
-(`services/vfsd/gpt`); design intent, not yet implemented, for every other parser of hostile input,
-none of which holds a property function yet.
+names those loops and reads, with the drivers that check them. Implemented for the parsers whose
+crates hold a `property` module, each with its fuzz target in `xtask/fuzz/targets`; design
+intent, not yet implemented, for every other parser of hostile input.
 
 ---
 

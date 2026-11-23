@@ -34,9 +34,15 @@ authoritative description of the userspace boot order.
 init-protocol/
 ├── Cargo.toml
 ├── README.md
+├── fuzz/init-protocol/  # the fuzz target's checked-in inputs (docs/testing.md § Fuzzing)
 └── src/
-    └── lib.rs      # InitInfo, CapDescriptor and CapType, InitModuleName, InitFramebufferInfo,
-                    #   INIT_PROTOCOL_VERSION and the page-bound constants, find_module_slot
+    ├── lib.rs           # InitInfo, CapDescriptor and CapType, InitModuleName,
+    │                    #   InitFramebufferInfo, INIT_PROTOCOL_VERSION and the page-bound
+    │                    #   constants, find_module_slot; its proof harnesses (docs/testing.md
+    │                    #   § Bounded verification)
+    └── property.rs      # the module-name lookup's property, which the fuzz target
+                         #   `init-protocol`, the replay test and the proofs drive; test, Kani
+                         #   and fuzz builds only
 ```
 
 ---

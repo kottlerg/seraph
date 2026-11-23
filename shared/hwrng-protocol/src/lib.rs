@@ -22,6 +22,9 @@
 
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
+
 /// Wire-protocol version of the class. Marker-only, as the RTC class's is:
 /// no request carries it, and `PROCESS_ABI_VERSION`, checked at process
 /// start, covers the driver and its consumers, which build together. Bumped
@@ -213,5 +216,128 @@ mod tests
         assert_eq!(requested_len(&[]), 0);
         assert_eq!(requested_len(&[17]), 17);
         assert_eq!(requested_len(&[u64::MAX]), MAX_READ_BYTES);
+    }
+
+    /// The checked-in inputs of the fuzz target `hwrng-protocol`, seeds and
+    /// regressions.
+    fn fuzz_inputs() -> Vec<Vec<u8>>
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/hwrng-protocol");
+        let mut inputs = Vec::new();
+        for kind in ["seeds", "regressions"]
+        {
+            let Ok(entries) = std::fs::read_dir(dir.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in entries
+            {
+                inputs.push(std::fs::read(entry.unwrap().path()).unwrap());
+            }
+        }
+        inputs
+    }
+
+    // Defect caught: a parser change that breaks its contract on an input
+    // the fuzz target once found or started from; `cargo xtask test` replays
+    // every checked-in input of fuzz/hwrng-protocol/ on each change.
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_parser_contract()
+    {
+        let inputs = fuzz_inputs();
+        assert!(
+            !inputs.is_empty(),
+            "no checked-in input under fuzz/hwrng-protocol"
+        );
+        for bytes in &inputs
+        {
+            property::hwrng_protocol_holds(bytes);
+        }
+    }
+
+    // Defect caught: seeds that no longer reach a decoded reply (a count
+    // past its words after an edit, say), so the fuzz target starts from
+    // the refusals alone.
+    #[test]
+    fn a_seed_decodes_as_a_reply_of_a_partial_last_word()
+    {
+        let decoded = fuzz_inputs().iter().any(|bytes| {
+            let out_len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+            let words: Vec<u64> = bytes[2..]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| u64::from_le_bytes(*w))
+                .collect();
+            let mut out = vec![0u8; out_len];
+            decode_reply(&words, &mut out).is_some_and(|count| count % 8 != 0)
+        });
+        assert!(decoded, "no seed decodes as a reply of a partial last word");
+    }
+}
+
+/// Bounded proofs of the parsers' contract (docs/testing.md § Bounded
+/// verification, Parser proofs).
+///
+/// Each proof runs one of the property's checks on every input up to its
+/// bound, and the bounds hold every input the parsers distinguish: a reply's
+/// count word admits at most `MAX_READ_BYTES` bytes, which the
+/// `MSG_DATA_WORDS_MAX - 1` words after it carry, so the decoder reads no
+/// word past those and takes a longer slice as it takes one of
+/// `MSG_DATA_WORDS_MAX + 1` words; it writes no byte past the count, so a
+/// buffer longer than `MAX_READ_BYTES + 1` bytes is refused or filled as
+/// one of that length is; and a request's first word is all
+/// `requested_len` reads. The loop that hands the property its words lies
+/// outside the proofs: the fuzz target `hwrng-protocol` and the replay of the
+/// checked-in inputs check it.
+#[cfg(kani)]
+mod proofs
+{
+    use super::MAX_READ_BYTES;
+    use super::property::{self, MAX_OUT, MAX_WORDS};
+
+    /// The request contract holds on every request: none, or a first word of
+    /// any value. No loop.
+    #[kani::proof]
+    fn every_request_holds_the_request_contract()
+    {
+        let words: [u64; 1] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= words.len());
+        property::request_holds(&words[..len]);
+    }
+
+    /// The reply contract holds on the first `len` of any `MAX_WORDS` words,
+    /// decoded into a buffer of every length up to `MAX_OUT`: every count,
+    /// every number of words after it, and a buffer short of, at, and past
+    /// the count. The longest loop is the check of the `MAX_OUT` bytes of the
+    /// buffer, so an unwind bound of `MAX_OUT + 1` (506) covers every loop.
+    #[kani::proof]
+    #[kani::unwind(506)]
+    fn every_reply_holds_the_reply_contract()
+    {
+        const _: () = assert!(MAX_OUT + 1 == 506);
+        let words: [u64; MAX_WORDS] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= words.len());
+        let out_len: usize = kani::any();
+        kani::assume(out_len <= MAX_OUT);
+        property::reply_holds(&words[..len], out_len);
+    }
+
+    /// The encode contract holds on every byte string of up to
+    /// `MAX_READ_BYTES + 1` bytes, the longest a reply carries and one past
+    /// it, which the encoder refuses as it refuses any longer. The longest
+    /// loop is the compare of the decoded bytes, so an unwind bound of 506
+    /// covers every loop.
+    #[kani::proof]
+    #[kani::unwind(506)]
+    fn every_reply_encodes_and_decodes_back()
+    {
+        let bytes: [u8; MAX_READ_BYTES + 1] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        property::encode_holds(&bytes[..len]);
     }
 }

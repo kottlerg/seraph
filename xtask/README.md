@@ -1471,14 +1471,15 @@ cargo xtask kani --pin
 
 | Flag | Default | Description |
 |---|---|---|
-| `--component <CRATE>` | every registered crate | Verify the harnesses of this crate only, by its package name |
+| `--component <CRATE>` | every crate that holds a harness | Verify the harnesses of this crate only, by its package name |
 | `--harness <NAME>` | every harness | Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`); needs `--component` |
 | `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
 
-The command first checks that every tracked Rust source declaring a `#[kani::proof]` lies in a
-crate `HARNESSED` in `src/commands/kani.rs` registers, the crate being the nearest directory
-above the file that holds a `Cargo.toml`, and fails naming each file that does not: a crate's
-first harness registers it. It then checks that `cargo kani --version` names `KANI_VERSION`, and
+The command first finds the crates to verify, keeping no list of them: the crate of every tracked
+Rust source declaring a `#[kani::proof]`, the crate being the nearest directory above the file
+that holds a `Cargo.toml`, each run once by the package name that manifest gives. It fails
+naming each such source that lies in no crate, or in one whose manifest names no package, so no
+harness is left out of the run. It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
 § Toolchain) on another release or none.
 

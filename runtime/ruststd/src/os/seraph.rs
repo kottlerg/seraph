@@ -3290,6 +3290,33 @@ pub mod fs {
     }
 }
 
+// ── Pipe counters ───────────────────────────────────────────────────────────
+
+/// Seraph-specific counters of the pipes behind `Stdio::piped()`.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub mod pipe {
+    /// The notifications the calling thread's pipe ends have sent: a write's
+    /// doorbell to a reader, a read's to a writer, and a close's kick to the
+    /// peer (runtime/ruststd/README.md § Pipes). A count that only moves up,
+    /// wrapping; a caller reads the difference across the operations it
+    /// measures.
+    #[must_use]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn notification_sends() -> u64 {
+        crate::sys::pipe::seraph::notification_sends()
+    }
+
+    /// The times the calling thread's pipe ends found their ring empty (a
+    /// reader) or full (a writer) and announced a wait for the peer to ring
+    /// (runtime/ruststd/README.md § Pipes), whether or not they then blocked. A count that only moves up,
+    /// wrapping, read as [`notification_sends`] is.
+    #[must_use]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn waits() -> u64 {
+        crate::sys::pipe::seraph::waits()
+    }
+}
+
 // ── Per-spawn namespace caps (CommandExt) ───────────────────────────────────
 //
 // Sandboxed spawns: caller walks-and-attenuates a namespace cap into a

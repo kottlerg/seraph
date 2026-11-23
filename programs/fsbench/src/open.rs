@@ -24,7 +24,7 @@ const OPEN_PATH: &str = "/services/fs/fatfs";
 /// The number of components of [`OPEN_PATH`], the `depth=` of the result line.
 const OPEN_DEPTH: u64 = 3;
 
-/// Time `run.iters` opens of [`OPEN_PATH`], after [`WARMUP_ITERS`] untimed
+/// Time `run.read_iters` opens of [`OPEN_PATH`], after [`WARMUP_ITERS`] untimed
 /// ones, each file closed outside its sample, and log their result line.
 /// Panics when an open's walk makes other than one `NS_LOOKUP` call.
 pub(crate) fn measure(run: &Bench)
@@ -34,8 +34,8 @@ pub(crate) fn measure(run: &Bench)
         drop(open());
     }
 
-    let mut samples = Vec::with_capacity(run.iters as usize);
-    for _ in 0..run.iters
+    let mut samples = Vec::with_capacity(run.read_iters as usize);
+    for _ in 0..run.read_iters
     {
         let lookups = std::os::seraph::fs::ns_lookup_calls();
         let start = run.counters.read();

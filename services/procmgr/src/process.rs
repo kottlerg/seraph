@@ -316,9 +316,10 @@ impl TableExt for ProcessTable
     /// `PIPE_DIR_STDOUT`, `PIPE_DIR_STDERR`. The three caps are
     /// `cap_copy`'d into the child's `CSpace` with `RIGHTS_MEM_MAP_RW` for
     /// the memory cap and `RIGHTS_ALL` for the two notifications. Per pipe,
-    /// each end kicks one notification and waits on the other (the writer
-    /// kicks `data` and waits on `space`, the reader the reverse; the
-    /// parent's death bridge kicks both), and both ends hold both caps with
+    /// each end rings one notification and waits on the other (the writer
+    /// rings `data` and waits on `space`, the reader the reverse, each
+    /// ringing only for a wait its peer announced in the ring header; the
+    /// parent's death bridge rings both), and both ends hold both caps with
     /// Notify and Wait rights (`abi/process-abi` `ProcessInfo` pipe fields),
     /// so the child's copies carry Notify and Wait whichever end it holds.
     /// The resulting slot indices are written into the matching

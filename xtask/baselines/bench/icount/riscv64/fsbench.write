@@ -1,0 +1,6 @@
+# bench baseline, written by `cargo xtask bench-baseline`
+# Format: xtask/README.md (`cargo xtask bench-check`).
+size=4096 path=frame cpus=1 unit=cycles p50=1999881
+size=4096 path=frame cpus=4 unit=cycles p50=803301
+size=65536 path=frame cpus=1 unit=cycles p50=36004477
+size=65536 path=frame cpus=4 unit=cycles p50=14996904

@@ -1665,14 +1665,15 @@ cargo xtask bench-check --mode icount|host [--baselines DIR] [--write-env FILE] 
 | `--mode` | | `icount`: instruction counts, from boots under `run --icount`; `host`: time, from x86_64 boots under a native accelerator |
 | `--baselines` | `xtask/baselines/bench` | The baselines root, which holds `<mode>/<arch>/` |
 | `--write-env` | | Write this host's environment to `FILE`, in the `ENV` file's format below |
-| `LOG...` | | The saved logs, one per run, all of one architecture; each must carry the trailer of a passing run of the mode (`icount=on` for `icount`; `icount=off` and an accelerator other than `tcg` for `host`) |
+| `LOG...` | | The saved logs, one per run, all of one architecture, of any boot that logs result lines (ktest's bench-only image, the ubench suite's); each must carry the trailer of a passing run of the mode (`icount=on` for `icount`; `icount=off` and an accelerator other than `tcg` for `host`) |
 
 A measurement is a result line's `<suite>.<name>` and variant parameters
 ([shared/bench/README.md § Result line](../shared/bench/README.md#result-line)) at one CPU count.
 Its value over the logs is the lowest of their p50s, so one slow run never moves it. Each is
 compared with its baseline's p50 and given a verdict: `ok` within its band, `REGRESSED` or
 `IMPROVED` past it, `NEW` with no baseline, `MISSING` with a baseline no log measured,
-`PARTIAL` when some of the logs at its CPU count lack it, `UNIT` when its unit is not its
+`PARTIAL` when some of the logs at its CPU count that report its suite lack it (a log of another
+boot, which reports other suites, is not expected to carry it), `UNIT` when its unit is not its
 baseline's, `NO-BAND` in host mode when `BANDS` has no line for it. The report is a table of
 every measurement, its verdict, whether it gates, its baseline, its lowest p50, the change, and
 its band, then one `FAIL:` line per gating measurement whose verdict is not `ok`, with its remedy,
@@ -1680,9 +1681,15 @@ then a `WARNING:` line per key of the stored `ENV` whose value differs here.
 
 - **icount.** The band is the larger of 1% of the baseline (rounded up) and 8 instructions. A
   one-CPU measurement gates; a measurement at more CPUs is reported only, since the interleaving
-  of its CPUs moves its count. The command fails when a gating measurement's verdict is not `ok`
-  (an `IMPROVED` count included: its stale baseline would pass a later regression of the same
-  size) or a benchmark logged a `ktest: bench <name> FAIL` line.
+  of its CPUs moves its count. So is a benchmark of `ICOUNT_IO_BOUND` (`src/benchmark.rs`),
+  `fsbench.write`, whose count includes time blocked on a device completion: the completion
+  arrives at host time, and the guest's clock advances by timer deadlines while it waits, so the
+  count follows the host's I/O latency. `fsbench.read` gates, since its untimed warm-up fills the
+  filesystem's page cache and no timed read waits on the disk; a benchmark whose timed samples
+  wait on a device joins the set. The command fails when a gating measurement's verdict is not
+  `ok` (an `IMPROVED` count included: its stale baseline would pass a later regression of the
+  same size) or a benchmark logged a `FAIL` line: ktest's `ktest: bench <name> FAIL`, or a
+  userspace suite's `[<suite>] bench <name> FAIL`.
 - **host.** Each measurement's band is its line in `BANDS`, a percentage of its baseline,
   calibrated on the reference host (`<suite>.<name> [<variant> ...] cpus=<k> band=<percent>`).
   Nothing gates: the command reports and succeeds.
@@ -1717,11 +1724,13 @@ cargo xtask bench-baseline --host [--all] [--baselines DIR] LOG...
 
 The logs are read as `bench-check` reads them, and must be complete: a benchmark's `FAIL` line or a
 `PARTIAL` measurement refuses the rewrite. Without `--all`, a benchmark's file is rewritten when
-one of its gating measurements (in host mode, any of them) is past its band, has no baseline, or is
-no longer measured, and is removed when none of its measurements remains; each rewritten file holds
-every measurement of its benchmark at its lowest p50. The `ENV` file is written when `--all` is
-given or it does not exist: the cell's own, from its artifact, with `--from-run`; this host's with
-`--host`. The command prints each file it wrote or removed.
+one of its measurements has no baseline or is no longer measured, or one of its gating
+measurements (in host mode, any of them) is past its band, and is removed when none of its
+measurements remains; each rewritten file holds every measurement of its benchmark at its lowest
+p50. The `ENV` file is written when `--all` is given or it does not exist: the cell's own, from its
+artifact, with `--from-run`; this host's with `--host`. The command prints each file it wrote or
+removed. An artifact's logs are those at its top level and those one directory down, where the
+`bench` cell saves its ubench boots'.
 
 ---
 

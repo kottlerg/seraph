@@ -5471,10 +5471,13 @@ pub unsafe fn migrate_ready_thread(
 /// (the thread migrated between the caller's `preferred_cpu` read and this lock,
 /// or is in the transient `Ready`-but-unlinked publication window) it falls back
 /// to the ascending all-CPU-locks walk — the #122 correctness path — taking every
-/// run-queue lock in ascending-CPU order and trying `remove_from_queue` on each.
+/// run-queue lock in ascending-CPU order and trying [`PerCpuScheduler::relink`]
+/// on each.
 ///
-/// `remove_from_queue`'s boolean is the authoritative "located here at `old_prio`"
-/// check on both paths, mirroring [`relocate_ready_thread`]. A thread linked
+/// `relink`'s boolean is the authoritative "located here at `old_prio`" check on
+/// both paths, as `remove_from_queue`'s is for [`relocate_ready_thread`], and a
+/// hit moves the entry between that CPU's run queues as one step to the
+/// lock-free readers of its queues. A thread linked
 /// nowhere is left for its pending link to place at the already-committed
 /// priority (returns `None`). On a walk hit the thread's `preferred_cpu` is
 /// refreshed to the located CPU so a stale hint self-heals.
@@ -5504,22 +5507,13 @@ pub unsafe fn relocate_ready_priority(
     let hint_sched = unsafe { scheduler_for(hint_cpu) };
     // SAFETY: lock_raw paired with the unlock_raw below.
     let saved = unsafe { hint_sched.lock.lock_raw() };
-    // `remove_from_queue` is the authoritative located-on-hint check at
-    // `old_prio`; the held hint run-queue lock pins the list.
+    // `relink` is the authoritative located-on-hint check at `old_prio`, and
+    // on a hit moves the entry to `new_prio` on the same CPU without the
+    // queues reading empty to a lock-free reader; the held hint run-queue lock
+    // pins the list. `preferred_cpu` already names `hint_cpu`, so no retarget
+    // is needed.
     // SAFETY: the hint CPU's lock is held; tcb valid per contract.
-    let hit = unsafe { hint_sched.remove_from_queue(tcb, old_prio) };
-    if hit
-    {
-        // Skip impossible: `remove_from_queue` just cleared `queued_on` under
-        // this lock. Re-link at `new_prio` on the same CPU; `preferred_cpu`
-        // already names `hint_cpu`, so no retarget is needed.
-        // SAFETY: as above.
-        let linked = unsafe { hint_sched.enqueue(tcb, new_prio) };
-        debug_assert!(
-            linked,
-            "relocate_ready_priority: re-enqueue skipped after hint hit"
-        );
-    }
+    let hit = unsafe { hint_sched.relink(tcb, old_prio, new_prio) };
     // SAFETY: paired with the lock_raw above.
     unsafe { hint_sched.lock.unlock_raw(saved) };
     if hit
@@ -5545,25 +5539,16 @@ pub unsafe fn relocate_ready_priority(
     {
         // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
         let sched = unsafe { scheduler_for(cpu) };
-        // All run-queue locks held; `remove_from_queue` is the authoritative
-        // located-on-cpu check at `old_prio`.
+        // All run-queue locks held; `relink` is the authoritative
+        // located-on-cpu check at `old_prio`, and moves the entry on a hit.
         // SAFETY: every CPU's lock is held; tcb valid per contract.
-        if unsafe { sched.remove_from_queue(tcb, old_prio) }
+        if unsafe { sched.relink(tcb, old_prio, new_prio) }
         {
-            // SAFETY: as above.
-            let linked = unsafe { sched.enqueue(tcb, new_prio) };
-            debug_assert!(
-                linked,
-                "relocate_ready_priority: re-enqueue skipped after walk hit"
-            );
-            if linked
-            {
-                // Found on `cpu`, not `hint_cpu`: the hint was stale (a migration
-                // raced the read). Refresh it so the next priority/affinity
-                // change hits. Gated on the created link (#359).
-                // SAFETY: tcb valid; all run-queue locks + sched_lock held.
-                unsafe { (*tcb).preferred_cpu = cpu as u32 };
-            }
+            // Found on `cpu`, not `hint_cpu`: the hint was stale (a migration
+            // raced the read). Refresh it so the next priority/affinity
+            // change hits; the link it names is the one just moved (#359).
+            // SAFETY: tcb valid; all run-queue locks + sched_lock held.
+            unsafe { (*tcb).preferred_cpu = cpu as u32 };
             located = Some(cpu);
             break;
         }
@@ -9730,8 +9715,8 @@ mod idle_pull_tests
 
     // The defect caught: the only thread queued behind one that never yields,
     // its level changed between every two idle ticks, never pulled: the
-    // priority change's unlink and re-link started a new backlog episode, so
-    // every confirmation found the backlog broken (#1565).
+    // priority change's move started a new backlog episode, so every
+    // confirmation found the backlog broken (#1565).
     #[test]
     fn a_queued_thread_whose_level_changes_every_tick_is_still_pulled()
     {
@@ -9783,11 +9768,9 @@ mod idle_pull_tests
                 pulled_at = Some(tick);
                 break;
             }
-            // `relocate_ready_priority`'s unlink and re-link on the same CPU.
+            // `relocate_ready_priority`'s move on the same CPU.
             // SAFETY: as above.
-            assert!(unsafe { sched.remove_from_queue(p_queued, levels[0]) });
-            // SAFETY: as above.
-            assert!(unsafe { sched.enqueue(p_queued, levels[1]) });
+            assert!(unsafe { sched.relink(p_queued, levels[0], levels[1]) });
             levels.swap(0, 1);
         }
         assert_eq!(model.moved_from, Some(1));

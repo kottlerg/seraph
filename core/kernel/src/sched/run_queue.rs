@@ -510,9 +510,9 @@ pub struct PerCpuScheduler
     /// odd one up to the even count it had before the removal: a backlog that its
     /// CPU's dispatch runs dry is followed by a new episode, and one a removal
     /// empties and a link refills reads as the one before, so a thread
-    /// unlinked and linked again without running, as a priority change
-    /// relocates it, keeps its episode (core/kernel/docs/scheduler.md § Load
-    /// Balancing). `dequeue_highest` never writes it, so the dispatch path
+    /// unlinked and linked again without running keeps its episode (a priority
+    /// change moves it with [`relink`](Self::relink), which leaves the count
+    /// alone; core/kernel/docs/scheduler.md § Load Balancing). `dequeue_highest` never writes it, so the dispatch path
     /// pays for it only at the link. Owned by `lock`: written only under it,
     /// by `link` and `remove_from_queue`, each before the `non_empty` Release
     /// that publishes its change. Read under `lock` by a pull's re-check, and
@@ -1083,14 +1083,12 @@ impl PerCpuScheduler
 
     /// Remove `tcb` from the run queue of level `priority`. No-op if not found.
     ///
-    /// Used by `dealloc_object(Thread)`, `commit_state_under_all_locks`,
-    /// `relocate_ready_priority`, and `relocate_ready_thread` (for
-    /// `migrate_ready_thread` and `pull_unpinned_ready`) to relocate or destroy
-    /// a queued thread. The
-    /// boolean return is the authoritative "located here" check: it identifies
-    /// the home scheduler for a `preferred_cpu` hint hit (one lock) and, on a
-    /// miss, inside the all-CPU-locks walk (`relocate_ready_priority` re-enqueues
-    /// at the new priority on the scheduler that reported `true`).
+    /// Used by `dealloc_object(Thread)`, `commit_state_under_all_locks`, and
+    /// `relocate_ready_thread` (for `migrate_ready_thread` and
+    /// `pull_unpinned_ready`) to move a queued thread to another CPU or destroy
+    /// it; a move between this CPU's own queues is [`relink`](Self::relink)'s,
+    /// which no lock-free reader sees empty the queues. The boolean return is
+    /// the authoritative "located here" check.
     ///
     /// Decrements the load counter iff the remove succeeded — the load
     /// counter MUST match the actual queue contents. Callers that pair this
@@ -1139,6 +1137,73 @@ impl PerCpuScheduler
             }
         }
         removed
+    }
+
+    /// Move `tcb`, queued on this CPU at `old_priority`, to the tail of the run
+    /// queue of `new_priority` on this CPU, as one step to every reader that
+    /// does not hold `lock`. No-op returning `false` if `tcb` is not on the
+    /// `old_priority` queue.
+    ///
+    /// Used by `relocate_ready_priority` for a priority change of a queued
+    /// thread; its boolean is that function's authoritative "located here"
+    /// check, as [`remove_from_queue`](Self::remove_from_queue)'s is for a
+    /// removal. Unlike that removal and a link after it, the move sets the new
+    /// queue's `non_empty` bit before it clears the old one's, so a lock-free
+    /// reader (the idle loop's `has_runnable`, the idle pull's
+    /// [`backlog`](Self::backlog)) never sees the queues empty in between, and it
+    /// changes neither the load nor the backlog episode: the thread never left
+    /// this CPU's queues (core/kernel/docs/scheduler.md § Load Balancing).
+    ///
+    /// A `new_priority` at or above `NUM_PRIORITY_LEVELS` names no run queue
+    /// and halts the kernel, as for [`enqueue`](Self::enqueue).
+    ///
+    /// # Safety
+    /// The caller holds `self.lock`; `tcb` is a valid TCB.
+    #[must_use]
+    #[track_caller]
+    pub unsafe fn relink(
+        &self,
+        tcb: *mut ThreadControlBlock,
+        old_priority: u8,
+        new_priority: u8,
+    ) -> bool
+    {
+        if old_priority as usize >= NUM_PRIORITY_LEVELS
+        {
+            return false;
+        }
+        let from = queue_index(old_priority);
+        let to = queue_index(new_priority);
+        // SAFETY: the caller holds `self.lock` (contract), so no other
+        // reference to the queues is live.
+        let queues = unsafe { self.queues.as_mut_unchecked() };
+        if !queues.get_mut(from).is_some_and(|queue| queue.remove(tcb))
+        {
+            return false;
+        }
+        let Some(queue) = queues.get_mut(to)
+        else
+        {
+            no_run_queue()
+        };
+        queue.enqueue(tcb);
+        let left_empty = queues.get(from).is_some_and(RunQueue::is_empty);
+        // The link's tag, now naming the new level; the TCB stays on this
+        // scheduler, so the single-link guard's reading is unchanged.
+        // `new_priority` is a u8 in [0, NUM_PRIORITY_LEVELS), so the widening
+        // to i16 is lossless.
+        let tag = i16::from(new_priority);
+        // SAFETY: tcb valid; owning scheduler.lock held.
+        unsafe { (*tcb).queued_on.store(tag, Ordering::Relaxed) };
+        // Set before clear: every intermediate value of `non_empty` still
+        // names a queue that holds a thread. Release, as for `link` and
+        // `remove_from_queue`: publishes the queue writes above.
+        self.non_empty.fetch_or(1 << to, Ordering::Release);
+        if left_empty
+        {
+            self.non_empty.fetch_and(!(1 << from), Ordering::Release);
+        }
+        true
     }
 
     /// Scan all run queues from highest to lowest and return the first queued
@@ -1346,6 +1411,12 @@ mod tests
     {
         // SAFETY: single-threaded test; tcb is a live boxed TCB.
         unsafe { s.remove_from_queue(tcb, prio) }
+    }
+
+    fn mv(s: &PerCpuScheduler, tcb: *mut ThreadControlBlock, old: u8, new: u8) -> bool
+    {
+        // SAFETY: single-threaded test; tcb is a live boxed TCB.
+        unsafe { s.relink(tcb, old, new) }
     }
 
     /// The `non_empty` bit of the run queue threads at `level` link on.
@@ -1849,10 +1920,9 @@ mod tests
         assert_eq!(sched.backlog(), Some(first.wrapping_add(2)));
     }
 
-    // The defect caught: a priority change of the only queued thread, which
-    // unlinks it and links it again at its new level without its running,
-    // started a new backlog episode, so an idle CPU never confirmed a backlog
-    // whose thread changed level once a tick (#1565).
+    // The defect caught: an unlink and re-link of a CPU's only queued thread,
+    // without its running, started a new backlog episode, so an idle CPU never
+    // confirmed a backlog whose thread was so moved once a tick (#1565).
     #[test]
     fn a_thread_unlinked_and_linked_again_without_running_keeps_its_episode()
     {
@@ -1883,6 +1953,103 @@ mod tests
         assert_eq!(deq(&sched), pb);
         assert!(enq(&sched, pa, syscall::PRIORITY_MIN));
         assert_eq!(sched.backlog(), Some(episode.wrapping_add(2)));
+    }
+
+    // The defect caught: a priority change's move of a queued thread to
+    // another level that left the old queue's bit set, set no bit for the
+    // new one, or tagged the link with the old level, so the dispatcher or
+    // the single-link guard read the thread where it no longer is.
+    #[test]
+    fn a_relink_moves_the_thread_to_the_new_level_and_keeps_its_episode()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut idle = make_tcb();
+        let mut a = make_tcb();
+        let mut b = make_tcb();
+        let p_idle = &raw mut *idle;
+        let pa = &raw mut *a;
+        let pb = &raw mut *b;
+        sched.set_idle(p_idle);
+
+        assert!(enq(&sched, p_idle, IDLE_PRIORITY));
+        assert!(enq(&sched, pa, syscall::PRIORITY_MIN));
+        assert!(enq(&sched, pb, syscall::PRIORITY_MIN));
+        let episode = sched.backlog().unwrap();
+        // Not linked at the level named: no move.
+        assert!(!mv(&sched, pa, RT_PRIORITY_MIN, syscall::PRIORITY_MIN));
+        // To an RT level: the RT queue's bit set, the fair queue's kept for b.
+        assert!(mv(&sched, pa, syscall::PRIORITY_MIN, RT_PRIORITY_MIN));
+        assert_eq!(
+            sched.non_empty.load(Ordering::Relaxed),
+            bit(IDLE_PRIORITY) | bit(syscall::PRIORITY_MIN) | bit(RT_PRIORITY_MIN)
+        );
+        // SAFETY: pa valid.
+        let tag = unsafe { (*pa).queued_on.load(Ordering::Relaxed) };
+        assert_eq!(tag, i16::from(RT_PRIORITY_MIN));
+        assert_eq!(sched.backlog(), Some(episode));
+        // Back to the fair queue, at its tail behind b: the RT bit cleared.
+        assert!(mv(&sched, pa, RT_PRIORITY_MIN, syscall::PRIORITY_MIN));
+        assert_eq!(
+            sched.non_empty.load(Ordering::Relaxed),
+            bit(IDLE_PRIORITY) | bit(syscall::PRIORITY_MIN)
+        );
+        assert_eq!(sched.backlog(), Some(episode));
+        assert_eq!(deq(&sched), pb);
+        assert_eq!(deq(&sched), pa);
+        assert_eq!(deq(&sched), p_idle);
+    }
+
+    // The defect caught: a priority change of the only queued thread unlinked
+    // it and linked it again, so between the two a reader without the lock
+    // saw no thread queued: an idle CPU's backlog sample read `None`, and its
+    // confirmation failed or its scan passed the CPU, at every tick that fell
+    // in the window (#1565).
+    #[test]
+    fn a_relink_never_shows_a_lock_free_reader_the_queues_empty()
+    {
+        /// The moved TCB, handed to the moving thread.
+        struct Moved(*mut ThreadControlBlock);
+        // SAFETY: only the moving thread dereferences the pointer, and the
+        // boxed TCB outlives the scope that joins it.
+        unsafe impl Send for Moved {}
+
+        let sched = PerCpuScheduler::new();
+        let mut idle = make_tcb();
+        let mut a = make_tcb();
+        let p_idle = &raw mut *idle;
+        let pa = &raw mut *a;
+        sched.set_idle(p_idle);
+        assert!(enq(&sched, p_idle, IDLE_PRIORITY));
+        assert!(enq(&sched, pa, syscall::PRIORITY_MIN));
+        let episode = sched.backlog().unwrap();
+
+        let done = core::sync::atomic::AtomicBool::new(false);
+        let misses = std::thread::scope(|scope| {
+            let moved = Moved(pa);
+            let (sched, done) = (&sched, &done);
+            scope.spawn(move || {
+                let moved = moved;
+                let mut levels = [syscall::PRIORITY_MIN, RT_PRIORITY_MIN];
+                for _ in 0..200_000
+                {
+                    // SAFETY: this thread is the scheduler's only writer, so it
+                    // stands in for the holder of its lock; the TCB is live.
+                    assert!(unsafe { sched.relink(moved.0, levels[0], levels[1]) });
+                    levels.swap(0, 1);
+                }
+                done.store(true, Ordering::Release);
+            });
+            let mut misses = 0u64;
+            while !done.load(Ordering::Acquire)
+            {
+                if sched.backlog() != Some(episode)
+                {
+                    misses = misses.saturating_add(1);
+                }
+            }
+            misses
+        });
+        assert_eq!(misses, 0);
     }
 
     // The defect caught: a CPU wedged with a thread other than its idle one
@@ -2108,12 +2275,11 @@ mod tests
     // `crate::sched::relocate_ready_priority` orchestrates for
     // `sys_thread_set_priority`. The production function layers the per-CPU
     // run-queue locking (one lock on a `preferred_cpu` hint hit; all locks
-    // ascending on a miss) on top of this same `remove_from_queue` / `enqueue`
-    // sequence. That locking is host-untestable (the syscall is
+    // ascending on a miss) on top of this same `relink` call. That locking is host-untestable (the syscall is
     // `#[cfg(not(test))]` and `scheduler_for` reads global per-CPU state) and is
     // covered by the two-arch ktest stress suite (`double_enqueue_storm`,
-    // `priority_dealloc_race`). Here we validate that `remove_from_queue`'s
-    // boolean drives the relink to the correct scheduler at the new priority on
+    // `priority_dealloc_race`). Here we validate that `relink`'s
+    // boolean drives the move to the correct scheduler at the new priority on
     // both the hit and miss paths.
 
     /// Mirror of `relocate_ready_priority`'s locate logic over a scheduler slice,
@@ -2128,16 +2294,14 @@ mod tests
         hint: usize,
     ) -> Option<usize>
     {
-        if rm(&scheds[hint], tcb, old)
+        if mv(&scheds[hint], tcb, old, new)
         {
-            assert!(enq(&scheds[hint], tcb, new));
             return Some(hint);
         }
         for (cpu, sched) in scheds.iter().enumerate()
         {
-            if rm(sched, tcb, old)
+            if mv(sched, tcb, old, new)
             {
-                assert!(enq(sched, tcb, new));
                 // SAFETY: tcb valid for the test's lifetime.
                 unsafe { (*tcb).preferred_cpu = cpu as u32 };
                 return Some(cpu);

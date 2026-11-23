@@ -505,10 +505,13 @@ Victim selection is mode-dependent:
   queues (`remove_from_queue`) emptied them, which makes the count odd so that the link
   restores the episode the removal broke off. So the same episode at both ticks is one backlog
   that the CPU did not run dry between them, and the dispatch (`dequeue_highest`) leaves the
-  count alone. A removal ends no episode: a thread unlinked and linked again without running, as
-  a priority change relocates it (`relocate_ready_priority`), keeps its episode, and a backlog
-  that a pull, a migration or a stop empties and a link refills reads as the one before, which
-  can cost one pull of a backlog that did not stand a tick, a pull the bound below allows. The
+  count alone. A priority change moves a queued thread between its CPU's run queues
+  (`relocate_ready_priority`) with `PerCpuScheduler::relink`, which sets the new queue's bit
+  before it clears the old one's and changes neither the load nor the episode, so no reader,
+  the lock-free sample included, sees that backlog break. A removal ends no episode either: a
+  thread unlinked and linked again without running keeps its episode, and a backlog that a
+  pull, a migration or a stop empties and a link refills reads as the one before, which can
+  cost one pull of a backlog that did not stand a tick, a pull the bound below allows. The
   lock-free sample has one imprecision of its own: a sample whose two loads (the run-queue mask,
   then the episode) straddle a dispatch running the backlog dry and the link that refills it
   reads the refilled backlog's episode for the one it saw. The next idle tick confirms it only
@@ -560,8 +563,9 @@ the outcomes that cost no tick still cost none, since a pull above the threshold
   past its CPU, where the next scan starts, so the cursor only moves forward and r counts at
   most the CPUs ahead of the thread's in the cursor's order. The
   queued thread the bound is for cannot be one: its CPU's queues hold it, so no dispatch runs
-  them dry and its backlog stays one episode until it runs, whatever unlinks and re-links it
-  on that CPU meanwhile.
+  them dry, and its backlog stays one episode, with a queued-thread bit set, until it runs; a
+  priority change meanwhile moves it with `relink`, which neither empties the queues to the
+  lock-free sample nor changes the episode.
 - A pull above the threshold that the re-check of its rule refuses
   (`sched::PullOutcome::RuleFailed`) or that finds nothing pullable
   (`sched::PullOutcome::NothingPullable`) costs no tick, since the confirmation rule decides

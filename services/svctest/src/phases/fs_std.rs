@@ -337,10 +337,14 @@ fn measure_frame_writes(path: &str, mut write: impl FnMut(&mut std::fs::File, &[
         .write(true)
         .open(path)
         .expect("reopen frame-pool file");
-    for _ in 0..FRAME_WRITES
+    // Each write's bytes differ from the one before, so a reused frame that
+    // still lent an earlier write's bytes leaves the file other than the last.
+    let mut last = chunk.clone();
+    for i in 0..FRAME_WRITES
     {
+        last.fill(0x60u8.wrapping_add(u8::try_from(i & 0xF).unwrap_or(0)));
         f.seek(SeekFrom::Start(0)).expect("seek to start");
-        write(&mut f, &chunk);
+        write(&mut f, &last);
     }
     let (written, _, _) = super::memmgr::memory_usage();
     let calls_written = calls().wrapping_sub(start);
@@ -358,6 +362,11 @@ fn measure_frame_writes(path: &str, mut write: impl FnMut(&mut std::fs::File, &[
         rechecks = round;
         (now, _, _) = super::memmgr::memory_usage();
     }
+    assert_eq!(
+        std::fs::read(path).expect("read back frame-pool file"),
+        last,
+        "the file must hold the last frame-path write's bytes"
+    );
     std::fs::remove_file(path).expect("cleanup");
     FrameCharge {
         base,
@@ -1039,6 +1048,52 @@ struct FakeWriteReport
     first_revoked: Option<bool>,
     /// `FS_CLOSE`s the open received.
     closes: usize,
+    /// Whether each `FS_WRITE_MEMORY`'s page held that write's bytes
+    /// ([`write_fill`]) and zeros after them, in order.
+    contents: Vec<bool>,
+}
+
+/// The byte the `write-child`'s `index`-th write (from 0) fills its chunk
+/// with: a different one per write, so a page that still held an earlier
+/// write's bytes is told apart.
+fn write_fill(index: usize) -> u8
+{
+    0xA0u8.wrapping_add(u8::try_from(index & 0xF).unwrap_or(0))
+}
+
+/// Map the page `cap` names read-only into svctest's own address space and
+/// report whether it holds [`FRAME_CHUNK_LEN`] bytes of `fill` and zeros
+/// after them, as the fs driver would read a write's chunk from it.
+fn lent_page_holds(cap: u64, fill: u8) -> bool
+{
+    let aspace = std::os::seraph::startup_info().self_aspace;
+    let range = std::os::seraph::reserve_pages(1).expect("fake fs: reserve_pages failed");
+    let va = range.va_start();
+    // SAFETY: `range` is a fresh page reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    let mapped =
+        unsafe { std::os::seraph::mem_map_funded(cap, aspace, va, 0, 1, syscall::MAP_READ) }
+            .is_ok();
+    let holds = mapped && {
+        // SAFETY: `va` was just mapped readable for one page, which nothing
+        // writes while this shared view of it lives: its owner is blocked in
+        // the call this fake has not answered.
+        let page = unsafe {
+            core::slice::from_raw_parts(
+                va as *const u8,
+                usize::try_from(syscall_abi::PAGE_SIZE).unwrap_or(0),
+            )
+        };
+        let (chunk, tail) = page.split_at(FRAME_CHUNK_LEN);
+        chunk.iter().all(|&b| b == fill) && tail.iter().all(|&b| b == 0)
+    };
+    if mapped
+    {
+        // SAFETY: `va` is the page mapped above; the slice into it is dead.
+        let _ = unsafe { syscall::mem_unmap(aspace, va, 1) };
+    }
+    std::os::seraph::unreserve_pages(range);
+    holds
 }
 
 /// A `File` keeps its write frame across writes, lends each write a fresh
@@ -1051,7 +1106,8 @@ struct FakeWriteReport
 /// `Interrupted` (core/kernel/docs/ipc-internals.md,
 /// `release_unreplied_caller`), after the driver received it; the
 /// child checks its write-frame memmgr calls after each step
-/// ([`write_child_main`]).
+/// ([`write_child_main`]). The fake also maps each write's page and checks
+/// that it holds that write's bytes, the reused frame's and the fresh one's.
 pub fn std_frame_write_interrupted_phase(_: &Caps)
 {
     use std::os::seraph::process::CommandExt;
@@ -1102,6 +1158,11 @@ pub fn std_frame_write_interrupted_phase(_: &Caps)
         Some(true),
         "the derivation a write lent must be revoked once its reply settles it"
     );
+    assert_eq!(
+        report.contents,
+        [true, true, true, true],
+        "each FS_WRITE_MEMORY's page must hold that write's bytes and zeros after them"
+    );
     assert_eq!(report.closes, 1, "the File's drop must send one FS_CLOSE");
     std::os::seraph::log!("std_frame_write_interrupted phase passed");
 }
@@ -1124,10 +1185,12 @@ fn write_child_main() -> !
         .write(true)
         .open("/a")
         .unwrap_or_else(|_| std::process::exit(2));
-    let chunk = vec![0xA5u8; FRAME_CHUNK_LEN];
     let start = calls();
     let made = || calls().wrapping_sub(start);
-    let wrote = |f: &mut std::fs::File| matches!(f.write(&chunk), Ok(n) if n == FRAME_CHUNK_LEN);
+    let wrote = |f: &mut std::fs::File, index: usize| {
+        let chunk = vec![write_fill(index); FRAME_CHUNK_LEN];
+        matches!(f.write(&chunk), Ok(n) if n == FRAME_CHUNK_LEN)
+    };
     // Per write: whether the fake answers it, the exit code of a write that
     // went otherwise, the calls wanted after it, and the exit code of a count
     // that differs.
@@ -1137,9 +1200,9 @@ fn write_child_main() -> !
         (false, 7, 1, 8),
         (true, 9, 2, 10),
     ];
-    for (answered, write_code, want, count_code) in steps
+    for (index, (answered, write_code, want, count_code)) in steps.into_iter().enumerate()
     {
-        if wrote(&mut f) != answered
+        if wrote(&mut f, index) != answered
         {
             std::process::exit(write_code);
         }
@@ -1168,6 +1231,11 @@ fn fake_write_memory(
 {
     let index = report.write_caps.len();
     report.write_caps.push(msg.caps().len());
+    report.contents.push(
+        msg.caps()
+            .first()
+            .is_some_and(|&cap| lent_page_holds(cap, write_fill(index))),
+    );
     for (i, &cap) in msg.caps().iter().enumerate()
     {
         if index == 0 && i == 0

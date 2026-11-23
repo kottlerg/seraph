@@ -5,7 +5,8 @@ protocol, the sysroot layout for test binaries, the gating mechanism
 that determines which harnesses run in a given boot, and the tools that
 diagnose a failing boot.
 
-This document covers booted functional testing. Host-side `#[cfg(test)]` unit
+This document covers booted functional testing, and the bounded proofs of pure, sequential code
+([Bounded verification](#bounded-verification)). Host-side `#[cfg(test)]` unit
 tests — their quality rules and the boundary between host-unit and booted
 testing — are governed by
 [coding-standards.md](coding-standards.md#d-testing-invariants). `cargo xtask test` runs them on
@@ -1210,7 +1211,10 @@ memory size, or device set, and owes no local host run, whatever file it is in:
 - Markdown, and comment lines in source files, build scripts, and linker scripts;
 - lint attributes: `#[allow(...)]`, `#[expect(...)]`, `#[warn(...)]`, `#[deny(...)]`, their inner
   `#![...]` forms, and a `#[cfg_attr(<predicate>, <lint attribute>)]`;
-- code compiled only for host tests: a `#[cfg(test)]` module or item, or a `#[test]` function;
+- code compiled only for host tests, bounded proofs or the fuzzing engine: a `#[cfg(test)]`,
+  `#[cfg(kani)]` or `#[cfg(fuzzing)]` module or item, a module compiled only under
+  `cfg(any(test, kani, fuzzing))`, a `#[test]` function, and an attribute applied only under
+  `cfg(kani)` (`#[cfg_attr(kani, ...)]`);
 - the deletion of a named function, constant, static, or type (not an `impl` block or a
   trait-method implementation; a module is the next item) that nothing names at the PR head
   outside comments and Markdown (`git grep -w <name> <head>` finds no other use) and that carries
@@ -1967,6 +1971,39 @@ list as the tracking Issues move):
   region's descriptor capacity before fatal-ing, so any residual overflow on a
   pathologically fragmented map is diagnosable rather than bare. Verified booting
   clean to the ktest pass marker on both arches at `--mem 4096`.
+
+---
+
+## Bounded verification
+
+Kani, a bounded model checker for Rust, proves a property of pure, sequential code for every input
+up to the bounds a proof harness states, where a host unit test checks the inputs it names. It
+covers the kernel's pure, sequential logic and the parsers of input from outside a component's
+trust boundary. A harness is a `#[kani::proof]` function in a `#[cfg(kani)] mod proofs`, written
+to the rules of [coding-standards.md](coding-standards.md#proof-harnesses) § Proof Harnesses.
+
+`cargo xtask kani` ([xtask/README.md](../xtask/README.md#cargo-xtask-kani)) runs every harness of
+every crate that holds one, each crate built in its host test configuration, with the pinned Kani
+release ([build-system.md](build-system.md#toolchain) § Toolchain). It fails on any failed,
+undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a
+harness in a crate it does not register. CI's `kani` job runs it on every push and pull request,
+and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
+§ Continuous Integration).
+
+Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
+tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches
+one; its loops are bounded; and it does not detect every aliasing or provenance violation
+([Kani's limitations](https://model-checking.github.io/kani/limitations.html),
+[supported Rust features](https://model-checking.github.io/kani/rust-feature-support.html)).
+
+Each parser crate holds one property function per parser, `pub fn <parser>_holds(input: &[u8])`,
+in a module compiled only under `cfg(any(test, kani, fuzzing))`. It runs the parser on `input` and
+asserts the parser's contract, not only that it does not panic: an accepted GPT header's partition
+table lies inside the disk, and decoding what an encoder wrote returns the encoded value. Three
+drivers call it: a Kani harness over `kani::any::<[u8; N]>()`, whose comment states N and why it
+covers the format; the crate's fuzz target; and a `#[cfg(test)]` replay of the crate's checked-in
+seeds and regressions. Design intent; not yet implemented: no parser crate holds a property
+function yet.
 
 ---
 

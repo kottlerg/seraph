@@ -13,6 +13,7 @@ pub mod crypto_vectors;
 pub mod hook;
 pub mod host;
 pub mod issue;
+pub mod kani;
 pub mod ktest_timing;
 pub mod lint_docs;
 pub mod mkdisk;

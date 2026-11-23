@@ -13,8 +13,8 @@
 //! at Phase 4 ([`set_boot_cpu_count`]). A mask is a view over storage held with
 //! its object (an address space's wrapper page, a TLB request's slab slot), so a
 //! boot pays only for the CPUs it has. No mask is held by value on a kernel
-//! stack: copies between sets are word by word ([`AtomicCpuMask::fill_from`]). `MAX_CPUS` bounds the CPU count but sizes no
-//! mask. A hierarchical mask is not the design: it still fixes a maximum, and
+//! stack: copies between sets are word by word ([`AtomicCpuMask::fill_from`]).
+//! `MAX_CPUS` bounds the CPU count but sizes no mask. A hierarchical mask is not the design: it still fixes a maximum, and
 //! adds a level to every bit test on the shootdown and context-switch paths.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -475,5 +475,233 @@ mod tests
         assert!(m.is_empty(R));
         assert_eq!(m.first(R), None);
         assert_eq!(m.iter(R).next(), None);
+    }
+}
+
+/// Bounded proofs of the mask's set algebra (docs/testing.md § Bounded
+/// verification). Every mask here spans `WORDS` words, 128 CPUs: each
+/// operation acts on the one word `cpu / 64` selects, and two words hold the
+/// one cross-word behaviour, the step from a word to the next. Contents,
+/// indices and counts are symbolic over every value.
+#[cfg(kani)]
+mod proofs
+{
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{AtomicCpuMask, AtomicCpuMaskIter, MaskSource, below_word};
+
+    const R: Ordering = Ordering::Relaxed;
+
+    /// Words of every mask the proofs build.
+    const WORDS: usize = 2;
+
+    /// CPUs a mask of `WORDS` words holds.
+    const CPUS: usize = WORDS * 64;
+
+    /// Storage for a mask of `WORDS` words.
+    fn storage() -> [AtomicU64; WORDS]
+    {
+        [AtomicU64::new(0), AtomicU64::new(0)]
+    }
+
+    /// A view over `words` holding any set.
+    fn any_mask(words: &[AtomicU64; WORDS]) -> AtomicCpuMask
+    {
+        // SAFETY: `words` is `WORDS` aligned atomic words, which the calling
+        // proof keeps alive as long as it uses the view and accesses only
+        // through atomics; an atomic word's value is an `UnsafeCell`, so the
+        // view may write it through a pointer derived from the shared borrow.
+        let mask = unsafe { AtomicCpuMask::attach(words.as_ptr().cast_mut(), WORDS) };
+        words[0].store(kani::any(), R);
+        words[1].store(kani::any(), R);
+        mask
+    }
+
+    /// The bits of `word` at or above `bit`; none when `bit` is 64.
+    fn at_or_above(word: u64, bit: usize) -> u64
+    {
+        if bit >= 64
+        {
+            0
+        }
+        else
+        {
+            word & (u64::MAX << bit)
+        }
+    }
+
+    /// Setting and clearing an index inside the mask act on its own bit
+    /// alone: testing reads each change back, and every other index keeps its
+    /// membership. The one loop is `attach`'s, over the `WORDS` words, so an
+    /// unwind bound of `WORDS + 1` covers it.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn an_index_in_the_mask_sets_and_clears_its_own_bit_alone()
+    {
+        let words = storage();
+        let mask = any_mask(&words);
+        let cpu: usize = kani::any();
+        let other: usize = kani::any();
+        kani::assume(cpu < CPUS && other < CPUS && other != cpu);
+        let other_was = mask.test_cpu(other, R);
+        mask.set_cpu(cpu, R);
+        assert!(mask.test_cpu(cpu, R));
+        mask.clear_cpu(cpu, R);
+        assert!(!mask.test_cpu(cpu, R));
+        mask.set_cpu(cpu, R);
+        assert!(mask.test_cpu(cpu, R));
+        assert_eq!(mask.test_cpu(other, R), other_was);
+    }
+
+    /// An index past the mask's words stops (`cpu_past_mask`, which panics in
+    /// the test configuration Kani builds) rather than reach memory past them.
+    /// The one loop is `attach`'s, over the `WORDS` words, so an unwind bound
+    /// of `WORDS + 1` covers it.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    #[kani::should_panic]
+    fn an_index_past_the_mask_stops()
+    {
+        let words = storage();
+        let mask = any_mask(&words);
+        let cpu: usize = kani::any();
+        kani::assume(cpu >= CPUS);
+        mask.set_cpu(cpu, R);
+    }
+
+    /// One step of an iteration, from any point of it, yields the lowest CPU
+    /// of the set at or above its cursor and leaves the cursor just past that
+    /// CPU, or yields none and stays ended when no CPU of the set lies there.
+    /// An iteration starts with its cursor at CPU 0 (`iter`: word 0, nothing
+    /// loaded), so by induction over its steps it yields exactly the CPUs of
+    /// the set, ascending, and then ends.
+    ///
+    /// A cursor is a word below `WORDS` with either nothing loaded or the
+    /// word's bits at or above `bit` loaded, `bit` up to 64 (a word wholly
+    /// consumed). The step's loop advances over at most the `WORDS` words and
+    /// then finds none, `WORDS + 1` iterations, and `attach`'s runs `WORDS`,
+    /// so an unwind bound of `WORDS + 2` covers both; the end check's second
+    /// step runs the first once more, inside the same bound.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn each_step_of_an_iteration_yields_the_next_cpu_of_the_set()
+    {
+        let words = storage();
+        let mask = any_mask(&words);
+        let word: usize = kani::any();
+        let bit: usize = kani::any();
+        let loaded: bool = kani::any();
+        kani::assume(word < WORDS && bit <= 64 && (loaded || bit == 0));
+        let mut it = AtomicCpuMaskIter {
+            words: mask.words(),
+            order: R,
+            word,
+            bits: if loaded
+            {
+                at_or_above(words[word].load(R), bit)
+            }
+            else
+            {
+                0
+            },
+            loaded,
+        };
+        let cursor = word * 64 + bit;
+        let next = it.next();
+        // No CPU of the set lies between the cursor and what the step yields.
+        let skipped: usize = kani::any();
+        if cursor <= skipped && skipped < next.unwrap_or(CPUS)
+        {
+            assert!(!mask.test_cpu(skipped, R));
+        }
+        match next
+        {
+            Some(cpu) =>
+            {
+                assert!(cursor <= cpu && cpu < CPUS);
+                assert!(mask.test_cpu(cpu, R));
+                // The cursor now stands just past `cpu`.
+                let (w, b) = (cpu / 64, cpu % 64 + 1);
+                assert_eq!(it.word, w);
+                assert!(it.loaded);
+                assert_eq!(it.bits, at_or_above(words[w].load(R), b));
+            }
+            None =>
+            {
+                assert_eq!(it.next(), None);
+            }
+        }
+    }
+
+    /// Bit `b` of word `i` of the set of every CPU below `n` is set exactly
+    /// when CPU `i * 64 + b` lies below `n`, for every `n`, `i` and `b`; a
+    /// word whose indices do not fit a `usize` holds none. No loop.
+    #[kani::proof]
+    fn a_word_of_the_cpus_below_a_count_holds_exactly_those_cpus()
+    {
+        let n: usize = kani::any();
+        let i: usize = kani::any();
+        let b: usize = kani::any();
+        kani::assume(b < 64);
+        let set = below_word(n, i) & (1u64 << b) != 0;
+        match i.checked_mul(64).and_then(|start| start.checked_add(b))
+        {
+            Some(cpu) => assert_eq!(set, cpu < n),
+            None => assert!(!set),
+        }
+    }
+
+    /// Filling from the CPUs below any count, or from another mask, less any
+    /// excepted index, leaves exactly that set: every index of the mask is in
+    /// it exactly when the source holds it and it is not the excepted one. The
+    /// fill reports whether the result is non-empty, and
+    /// `fill_would_be_nonempty` predicts the report.
+    ///
+    /// `attach`, the fill, the prediction and `first` each loop over the
+    /// `WORDS` words, at most `WORDS + 1` iterations, so an unwind bound of `WORDS + 2`
+    /// covers them.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn filling_leaves_exactly_the_source_less_the_excepted_cpu()
+    {
+        let src_words = storage();
+        let src = any_mask(&src_words);
+        let dst_words = storage();
+        let dst = any_mask(&dst_words);
+        let n: usize = kani::any();
+        let except: usize = kani::any();
+        let source = if kani::any()
+        {
+            MaskSource::Below(n)
+        }
+        else
+        {
+            MaskSource::Mask(&src, R)
+        };
+        let predicted = dst.fill_would_be_nonempty(&source, except);
+        let non_empty = dst.fill_from(&source, except, R);
+        assert_eq!(predicted, non_empty);
+        let cpu: usize = kani::any();
+        kani::assume(cpu < CPUS);
+        let in_source = match &source
+        {
+            MaskSource::Below(n) => cpu < *n,
+            MaskSource::Mask(mask, order) => mask.test_cpu(cpu, *order),
+        };
+        assert_eq!(dst.test_cpu(cpu, R), in_source && cpu != except);
+        // The report is whether the set holds a CPU.
+        match dst.first(R)
+        {
+            Some(member) =>
+            {
+                assert!(non_empty);
+                assert!(dst.test_cpu(member, R));
+            }
+            None =>
+            {
+                assert!(!non_empty);
+                assert!(!dst.test_cpu(cpu, R));
+            }
+        }
     }
 }

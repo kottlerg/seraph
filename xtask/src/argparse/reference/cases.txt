@@ -26891,3 +26891,55 @@ ok trust-request clear
 
 ["trust-request","--add","s","--revoke","00","--sign","--out","f","--arch","riscv64"]
 ok trust-request arch=["riscv64"] add=["s"] revoke=["00"] sign out=["f"]
+
+["kani"]
+ok-all kani pin=default host_override=default
+
+["kani","-h"]
+help xtask kani -h
+
+["kani","--help"]
+help xtask kani -h
+
+["help","kani"]
+help xtask kani -h
+
+["kani","bogus"]
+UnknownArgument
+error: unexpected argument 'bogus' found
+
+["kani","--pin"]
+ok kani pin
+
+["kani","--pin","--component","kernel"]
+ArgumentConflict
+error: the argument '--pin' cannot be used with '--component <CRATE>'
+
+["kani","--component","kernel"]
+ok kani component=["kernel"]
+
+["kani","--component"]
+InvalidValue
+error: a value is required for '--component <CRATE>' but none was supplied
+
+["kani","--harness","cpu_mask::proofs::x"]
+MissingRequiredArgument
+error: the following required arguments were not provided:
+  --component <CRATE>
+
+["kani","--component","kernel","--harness","cpu_mask::proofs::x"]
+ok kani component=["kernel"] harness=["cpu_mask::proofs::x"]
+
+["kani","--pin","--harness","x"]
+ArgumentConflict
+error: the argument '--pin' cannot be used with '--harness <NAME>'
+
+["kani","--wait-host","30"]
+ok kani wait_host=["30"]
+
+["kani","--host-override"]
+ok kani host_override
+
+["kani","--pin","--pin"]
+ArgumentConflict
+error: the argument '--pin' cannot be used multiple times

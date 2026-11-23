@@ -81,6 +81,13 @@ subcommands! {
         /// OpenSSL, or with `--check` fail unless they regenerate identically.
         CryptoVectors(CryptoVectorsArgs),
 
+        /// Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every
+        /// crate that holds one, with the pinned Kani release, and fail on any
+        /// failed, undetermined or unwinding-incomplete check, on a Kani release
+        /// other than the pinned one, and on a harness in an unregistered crate;
+        /// with `--pin`, print the pinned release (see xtask/README.md).
+        Kani(KaniArgs),
+
         /// Read preserved ktest boot logs (from `run --runs N --save-logs`) and
         /// print per-tier and per-cell wall times; with `--base` and `--wide`,
         /// compare two widths against their width factor; with `--baseline`,
@@ -212,6 +219,7 @@ impl CliCommand
             Self::Clean(args) => Some(&args.host),
             Self::Test(args) => args.unit_tests().then_some(&args.host.common),
             Self::CryptoVectors(args) => Some(&args.host),
+            Self::Kani(args) => (!args.pin).then_some(&args.host),
             Self::CompareImages(args) => Some(&args.host),
             Self::Run(_)
             | Self::KtestTiming(_)
@@ -866,6 +874,32 @@ args! {
         /// byte-identical, writing nothing.
         #[arg(long)]
         pub check: bool,
+
+        /// The shared host's launch rules (see xtask/README.md "Host launch
+        /// rules").
+        #[command(flatten)]
+        pub host: HostArgs,
+    }
+}
+
+// ── Kani ──────────────────────────────────────────────────────────────────────
+
+args! {
+    pub struct KaniArgs
+    {
+        /// Verify the harnesses of this crate only, by its package name (one
+        /// `cargo xtask kani` registers).
+        #[arg(long, value_name = "CRATE")]
+        pub component: Option<String>,
+
+        /// Verify this harness only, by its path in the crate
+        /// (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it.
+        #[arg(long, value_name = "NAME", requires = "component")]
+        pub harness: Option<String>,
+
+        /// Print the pinned Kani release and exit, verifying nothing.
+        #[arg(long, conflicts_with_all = ["component", "harness"])]
+        pub pin: bool,
 
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
@@ -1655,7 +1689,14 @@ mod tests
     #[test]
     fn each_command_that_compiles_is_admitted_as_a_build_with_its_host_options()
     {
-        for command in ["build", "clean", "test", "crypto-vectors", "compare-images"]
+        for command in [
+            "build",
+            "clean",
+            "test",
+            "crypto-vectors",
+            "kani",
+            "compare-images",
+        ]
         {
             let host = build_host_of(&["xtask", command, "--wait-host", "30"])
                 .unwrap_or_else(|| panic!("`{command}` is not admitted as a build"));
@@ -1672,6 +1713,8 @@ mod tests
         assert!(build_host_of(&["xtask", "run"]).is_none());
         assert!(build_host_of(&["xtask", "lint-docs"]).is_none());
         assert!(build_host_of(&["xtask", "host", "status"]).is_none());
+        // Printing the pinned Kani release compiles nothing.
+        assert!(build_host_of(&["xtask", "kani", "--pin"]).is_none());
         // A case or a cell boots, and admits each boot itself.
         assert!(build_host_of(&["xtask", "test", "kaslr"]).is_none());
         assert!(build_host_of(&["xtask", "test", "--cell", "usertest"]).is_none());

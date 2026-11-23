@@ -144,6 +144,11 @@ edition = "2024"
 publish = false
 
 
+[workspace.lints.rust]
+# `cargo kani` sets `cfg(kani)` and the fuzzing engine `cfg(fuzzing)`; each
+# gates code no other build compiles (docs/testing.md § Bounded verification).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(fuzzing)'] }
+
 [workspace.lints.clippy]
 all      = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

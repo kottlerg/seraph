@@ -1553,9 +1553,14 @@ args! {
         pub page_entries: u64,
 
         /// Print page `issues:<n>` (1-based) of the open Issues instead of the
-        /// summary.
-        #[arg(long, value_name = "issues:N")]
+        /// summary, from the list `--issues` names.
+        #[arg(long, value_name = "issues:N", requires = "issues")]
         pub page: Option<String>,
+
+        /// The open Issues' digest a summary printed: a page is cut from the
+        /// list that summary saved, not from the tracker as it stands.
+        #[arg(long, value_name = "DIGEST")]
+        pub issues: Option<String>,
 
         /// Print the summary of a section whose scope is incomplete (a
         /// Mitigations item naming no file, or a reference resolving to

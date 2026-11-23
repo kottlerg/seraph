@@ -2116,7 +2116,8 @@ no file or process access of its own ([conventions.md](../docs/conventions.md) Â
 
 ```
 cargo xtask threat-scope --section <name> [--head <rev>] [--page-entries <n>] [--allow-incomplete]
-cargo xtask threat-scope --section <name> --head <sha> [--page-entries <n>] --page issues:<n>
+cargo xtask threat-scope --section <name> --head <sha> [--page-entries <n>] --page issues:<n> \
+    --issues <digest>
 ```
 
 The command reads the document and the files at `--head` (`HEAD` by default) through git. The
@@ -2150,15 +2151,23 @@ document's `### System-wide assumptions`, verbatim), `blocks` (each `label`, its
 its `items` with `text`, `files`, `unresolved` and `unlocated`), `documents` (the existing
 documents the section links), `unanchored`, `unresolved` (item ids), `complete`, `shards` (each
 `lines`, `files` with `path` and `lines`, and `items`), `page_entries`, `open_issue_count`,
-`open_issue_pages`, `open_issues_digest`, and `digest`. With `--page issues:<n>` it prints page
-`n` (1-based) of the open Issues, at most `--page-entries` (200 by default) a page: `list`, `head`,
-`page`, `pages`, `page_entries`, `items` (`number` and `title`), and `digest`.
+`open_issue_pages`, `open_issues_digest`, `issues_as_of` (when the list was read from GitHub, UTC to
+the minute), and `digest`. With `--page issues:<n>` it prints page `n` (1-based) of the open
+Issues, at most `--page-entries` (200 by default) a page: `list`, `head`, `page`, `pages`,
+`page_entries`, `items` (`number` and `title`), and `digest`.
+
+The summary saves the open Issues it read, with `issues_as_of`, as
+`target/xtask/threat-scope/issues-<open_issues_digest>.json`, and a page is cut from the list that
+`--issues <open_issues_digest>` names, never from GitHub: an Issue filed or closed while the
+workflow fetches the pages changes nothing it receives, so a run does not depend on a quiet
+tracker. A page asked for without `--issues`, or under a digest with no saved list or a saved list
+that does not digest to it, is refused.
 
 Each `digest` is the FNV-1a 64 of `cargo xtask release-scope`, over these fields:
 
 | Digest | Fields, in order |
 |---|---|
-| the summary | `threat-summary`, `head`, `repo_root`, `tree_at_head`, `document`, `section`, `slug`, `system_assumptions`, the number of blocks, then each block's `label`, `text` and number of items, then each item's `text` and its `files`, `unresolved` and `unlocated` lists; the `documents`, `unanchored` and `unresolved` lists; `complete`, the number of shards, then each shard's `lines`, number of files, each file's `path` and `lines`, and its `items` list; `page_entries`, `open_issue_count`, `open_issue_pages`, `open_issues_digest` |
+| the summary | `threat-summary`, `head`, `repo_root`, `tree_at_head`, `document`, `section`, `slug`, `system_assumptions`, the number of blocks, then each block's `label`, `text` and number of items, then each item's `text` and its `files`, `unresolved` and `unlocated` lists; the `documents`, `unanchored` and `unresolved` lists; `complete`, the number of shards, then each shard's `lines`, number of files, each file's `path` and `lines`, and its `items` list; `page_entries`, `open_issue_count`, `open_issue_pages`, `open_issues_digest`, `issues_as_of` |
 | a list in the summary | its length, then each entry |
 | a page | `threat-issues`, `head`, `page`, `pages`, `page_entries`, then each Issue's `number` and `title` |
 | the whole open-Issue list | `issues`, then each Issue's `number` and `title` (the release scope's digest of the list) |

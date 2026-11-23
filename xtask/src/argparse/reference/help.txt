@@ -1087,7 +1087,8 @@ Options:
       --section <SECTION>            The section of `docs/threat-model.md` to scope, as its `##` heading names it
       --head <HEAD>                  The commit the document and the files are read at [default: HEAD]
       --page-entries <PAGE_ENTRIES>  The most open Issues one page holds [default: 200]
-      --page <issues:N>              Print page `issues:<n>` (1-based) of the open Issues instead of the summary
+      --page <issues:N>              Print page `issues:<n>` (1-based) of the open Issues instead of the summary, from the list `--issues` names
+      --issues <DIGEST>              The open Issues' digest a summary printed: a page is cut from the list that summary saved, not from the tracker as it stands
       --allow-incomplete             Print the summary of a section whose scope is incomplete (a Mitigations item naming no file, or a reference resolving to nothing) instead of refusing it
   -h, --help                         Print help
 === xtask threat-scope --help
@@ -1099,7 +1100,8 @@ Options:
       --section <SECTION>            The section of `docs/threat-model.md` to scope, as its `##` heading names it
       --head <HEAD>                  The commit the document and the files are read at [default: HEAD]
       --page-entries <PAGE_ENTRIES>  The most open Issues one page holds [default: 200]
-      --page <issues:N>              Print page `issues:<n>` (1-based) of the open Issues instead of the summary
+      --page <issues:N>              Print page `issues:<n>` (1-based) of the open Issues instead of the summary, from the list `--issues` names
+      --issues <DIGEST>              The open Issues' digest a summary printed: a page is cut from the list that summary saved, not from the tracker as it stands
       --allow-incomplete             Print the summary of a section whose scope is incomplete (a Mitigations item naming no file, or a reference resolving to nothing) instead of refusing it
   -h, --help                         Print help
 === xtask issue-edit -h

@@ -16,12 +16,13 @@
 //! § `cargo xtask threat-scope` states the format and the encoding).
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{Context, Result, bail};
 use json::{Value, json};
 
+use super::orch::{now_secs, timestamp};
 use super::release_scope::{Digest, Issue, issue_fields, issues_digest, read_issues};
 use crate::cli::ThreatScopeArgs;
 use crate::context::Context as BuildContext;
@@ -615,6 +616,8 @@ struct Scope
     unresolved: Vec<String>,
     shards: Vec<Shard>,
     issues: Vec<Issue>,
+    /// When the open Issues were read from the tracker, UTC.
+    issues_as_of: String,
 }
 
 /// A list as digest fields: its length, then each entry.
@@ -685,7 +688,8 @@ impl Scope
         d.field(&per_page.to_string())
             .field(&self.issues.len().to_string())
             .field(&pages.to_string())
-            .field(&issues);
+            .field(&issues)
+            .field(&self.issues_as_of);
         let blocks: Vec<Value> = self
             .section
             .blocks
@@ -736,6 +740,7 @@ impl Scope
             "open_issue_count": self.issues.len(),
             "open_issue_pages": pages,
             "open_issues_digest": issues,
+            "issues_as_of": self.issues_as_of,
             "digest": d.hex(),
         })
     }
@@ -777,6 +782,106 @@ impl Scope
             "digest": d.hex(),
         }))
     }
+}
+
+// ── The open Issues ───────────────────────────────────────────────────────────
+
+/// Where a summary saves the open Issues it read, by their digest, for the
+/// pages cut from them: a tracker that moves while the workflow fetches the
+/// pages then changes nothing it receives.
+const SNAPSHOT_DIR: &str = "target/xtask/threat-scope";
+
+/// The open Issues one summary read, and when.
+#[derive(Debug)]
+struct Snapshot
+{
+    as_of: String,
+    issues: Vec<Issue>,
+}
+
+fn snapshot_path(root: &Path, digest: &str) -> PathBuf
+{
+    root.join(SNAPSHOT_DIR)
+        .join(format!("issues-{digest}.json"))
+}
+
+fn snapshot_json(as_of: &str, issues: &[Issue]) -> Value
+{
+    let items: Vec<Value> = issues
+        .iter()
+        .map(|i| json!({ "number": i.number, "title": i.title }))
+        .collect();
+    json!({ "as_of": as_of, "issues": items })
+}
+
+/// The snapshot saved as `text`, refused unless its Issues digest to
+/// `digest`, the name it was asked for by.
+fn parse_snapshot(text: &str, digest: &str) -> Result<Snapshot>
+{
+    let v = json::parse(text).context("parsing the saved open-Issue list")?;
+    let as_of = v["as_of"]
+        .as_str()
+        .context("the saved open-Issue list has no as_of")?
+        .to_owned();
+    let issues = v["issues"]
+        .as_array()
+        .context("the saved open-Issue list has no issues")?
+        .iter()
+        .map(|i| {
+            Ok(Issue {
+                number: i["number"]
+                    .as_u64()
+                    .context("a saved Issue without a number")?,
+                title: i["title"]
+                    .as_str()
+                    .context("a saved Issue without a title")?
+                    .to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if issues_digest(&issues) != digest
+    {
+        bail!("the open-Issue list saved under {digest} does not digest to it");
+    }
+    Ok(Snapshot { as_of, issues })
+}
+
+/// The open Issues: the list saved under `digest`, or the tracker's now.
+fn open_issues(root: &Path, digest: Option<&str>) -> Result<Snapshot>
+{
+    match digest
+    {
+        Some(d) =>
+        {
+            let path = snapshot_path(root, d);
+            let text = std::fs::read_to_string(&path).with_context(|| {
+                format!(
+                    "no open-Issue list is saved under {d} ({}); a summary saves it",
+                    path.display()
+                )
+            })?;
+            parse_snapshot(&text, d)
+        }
+        None => Ok(Snapshot {
+            issues: read_issues(root)?,
+            as_of: timestamp(now_secs()?),
+        }),
+    }
+}
+
+/// Save the summary's open Issues under their digest.
+fn save_snapshot(root: &Path, scope: &Scope) -> Result<()>
+{
+    let path = snapshot_path(root, &issues_digest(&scope.issues));
+    if let Some(dir) = path.parent()
+    {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(
+        &path,
+        snapshot_json(&scope.issues_as_of, &scope.issues).to_string_pretty(),
+    )
+    .with_context(|| format!("writing {}", path.display()))
 }
 
 // ── Reading ───────────────────────────────────────────────────────────────────
@@ -847,6 +952,7 @@ fn read_scope(root: &Path, args: &ThreatScopeArgs) -> Result<Scope>
     };
     let mut section = parse_section(&doc, &args.section)?;
     resolve(&mut section, &tree);
+    let issues = open_issues(root, args.issues.as_deref())?;
     let files = scope_files(&section, &tree);
     Ok(Scope {
         repo_root: git(root, &["rev-parse", "--show-toplevel"])?
@@ -857,7 +963,8 @@ fn read_scope(root: &Path, args: &ThreatScopeArgs) -> Result<Scope>
         unanchored: unanchored(&section),
         unresolved: unresolved(&section),
         shards: shards_of(&section, files),
-        issues: read_issues(root)?,
+        issues: issues.issues,
+        issues_as_of: issues.as_of,
         section,
         head,
     })
@@ -888,10 +995,17 @@ pub fn run(ctx: &BuildContext, args: &ThreatScopeArgs) -> Result<()>
             scope.unresolved
         );
     }
-    let out = match page
+    let out = if let Some(n) = page
     {
-        Some(n) => scope.issue_page(n, per_page)?,
-        None => scope.summary(per_page),
+        scope.issue_page(n, per_page)?
+    }
+    else
+    {
+        if args.issues.is_none()
+        {
+            save_snapshot(&ctx.root, &scope)?;
+        }
+        scope.summary(per_page)
     };
     println!("{}", out.to_string_pretty());
     Ok(())
@@ -1008,6 +1122,7 @@ mod tests
                     title: format!("issue {number}"),
                 })
                 .collect(),
+            issues_as_of: "2026-11-23T10:00Z".to_owned(),
             section,
         }
     }
@@ -1175,6 +1290,24 @@ mod tests
         assert_eq!(a["documents"], json!(["docs/signing.md"]));
         assert_eq!(a["complete"], json!(false));
         assert_eq!(a["open_issue_pages"], json!(1));
+    }
+
+    // Defect caught: a page cut from the tracker as it stands when the page is
+    // asked for, not from the list its summary counted, so an Issue filed
+    // between the two fails the run; or a saved list read back altered.
+    #[test]
+    fn a_saved_open_issue_list_reads_back_only_under_its_digest()
+    {
+        let s = scope(DOC);
+        let digest = issues_digest(&s.issues);
+        let text = snapshot_json(&s.issues_as_of, &s.issues).to_string_pretty();
+        let back = parse_snapshot(&text, &digest).unwrap();
+        assert_eq!(back.issues, s.issues);
+        assert_eq!(back.as_of, s.issues_as_of);
+        let altered = text.replace("issue 3", "issue three");
+        let err = parse_snapshot(&altered, &digest).unwrap_err().to_string();
+        assert!(err.contains("does not digest"), "{err}");
+        assert_eq!(s.summary(200)["issues_as_of"], json!("2026-11-23T10:00Z"));
     }
 
     // Defect caught: an Issue page past the list, or pages that drop an Issue.

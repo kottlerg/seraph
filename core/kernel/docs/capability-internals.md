@@ -905,10 +905,12 @@ The mechanism is `cap/sole_reference.rs`.
   every syscall, and its pass is out of line. That load is Relaxed. An ordering would not make it
   see a newer value, only order the accesses after it, and the pass orders its own through its
   Acquire load and AcqRel swap of the summary. A bit the CPU set itself, by a release or by a pass
-  that left fired nodes, is always seen by its own later load, so a release a syscall makes is
-  drained on that syscall's return. A bit set by another CPU that the load misses is drained by
-  that CPU at its own next drain point (its syscall return, its next interrupt from user mode, or
-  its idle loop), so the bound under The budget holds. Otherwise, under the table lock, it
+  that left fired nodes, is seen by its own later load unless a pass that cleared the bit, on any
+  CPU, took its work, so the release is claimed by this CPU's next pass or by that one; either
+  pass may post after the call that made the release returns, and the budget may leave the post
+  to a later pass, as The budget says. A bit set by another CPU that the load misses is drained
+  by that CPU at its own next drain point (its syscall return, its next interrupt from user mode,
+  or its idle loop), so the bound under The budget holds. Otherwise, under the table lock, it
   claims each object of a pending chain whose word is `REF_OBSERVED | 1` by a compare-and-swap to
   1, moving its nodes to the fired list, and takes at most `POST_BUDGET` (64) nodes off the fired
   list. An object on a chain is live,

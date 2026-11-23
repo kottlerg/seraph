@@ -449,15 +449,16 @@ pub unsafe fn drain()
     // orders the accesses after it, and the pass orders its own through
     // collect's Acquire load and AcqRel swap of the summary. Which values the
     // load can return is what loses no post. A bit this CPU set (a release of
-    // its own, or a pass that left fired nodes) is always seen here, since a
-    // load reads its own CPU's earlier store to the same word, or a later
-    // value, and the pass that cleared the bit took its work; so the release
-    // a syscall makes is drained on that syscall's return. A bit another CPU
-    // set and this load misses is drained by that CPU, whose next drain point
-    // (its own syscall return, its next interrupt from user mode, or its idle
-    // loop) sees its own store. So every leftover is drained within the bound
-    // core/kernel/docs/capability-internals.md § Sole-Reference Observers
-    // states under The budget.
+    // its own, or a pass that left fired nodes) is seen here unless a pass that
+    // cleared it, on any CPU, took its work, since a load reads its own CPU's
+    // earlier store to the same word or a later value; so the release is
+    // claimed by this CPU's pass or by that one, either of which may post after
+    // the releasing call returns, and the budget may leave the post to a later
+    // pass. A bit another CPU set and this load misses is drained by that CPU,
+    // whose next drain point (its own syscall return, its next interrupt from
+    // user mode, or its idle loop) sees its own store. So every leftover is
+    // drained within the bound that core/kernel/docs/capability-internals.md
+    // § Sole-Reference Observers states under The budget.
     if TABLE.summary.load(Ordering::Relaxed) != 0
     {
         // SAFETY: forwarded caller contract.

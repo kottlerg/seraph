@@ -62,11 +62,11 @@ the kernel:
 
 | Part | x86_64 | riscv64 | Functions |
 |---|---:|---:|---|
-| Entry and exit stubs | 74 | 153 | `syscall_entry`, `seraph_enter_from_user`; `trap_entry`, `trap_dispatch`, `handle_trap` |
+| Entry and exit stubs | 70 | 151 | `syscall_entry`, `seraph_enter_from_user`; `trap_entry`, `trap_dispatch`, `handle_trap` |
 | Finding this CPU's scheduler and thread | 8 | 8 | `read_percpu_ptr` of `PerCpuData::current` and `PerCpuData::scheduler` |
 | Dispatch and result | 73 | 39 | `dispatch`, `dispatch_in_range`, `index_mask`, `mask_index`, `syscall_nr`, `finish_syscall` |
 | Return-to-user work checks | 28 | 58 | `running_thread_stopped`, `reclaim_deferred_stack`, `drain_deferred_reclaim`, `sole_reference::drain`, `deliver_at_syscall`, `upcall::take`, `upcall::deliver`, `PerCpuScheduler::outranked`, `preempt_if_outranked` |
-| Diagnostic stamps | 2 | 3 | `stamp_syscall_entry`, `note_cpu_syscall`, the read of `PerCpuData::diag` |
+| Diagnostic stamps | 6 | 5 | `stamp_syscall_entry`, `note_cpu_syscall`, the read of `PerCpuData::diag` |
 | The handler | 19 | 19 | `sys_system_info`, `TrapFrame::arg`, `TrapFrame::set_return` |
 
 The current thread, this CPU's scheduler and its diagnostic record are each one load relative to
@@ -152,7 +152,7 @@ Not taken:
 
 - The zeroing of memory on retype and free (most of `ktest.thread_lifecycle`'s `memset`):
   it is what keeps one owner's data from the next, and the account shows no excess in it.
-- The entry and exit stubs (74 / 153 per syscall): they save and restore the full trap frame,
+- The entry and exit stubs (70 / 151 per syscall): they save and restore the full trap frame,
   which faults, upcalls and the debugger read; a syscall-only frame changes that contract for a
   saving the account does not yet bound, and is not on this list.
 

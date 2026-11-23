@@ -122,13 +122,13 @@ subcommands! {
         /// xtask/README.md.
         BenchBaseline(BenchBaselineArgs),
 
-        /// Account for every instruction of each kernel benchmark's measured
-        /// window: `trace` boots the bench-only ktest image at one CPU under
-        /// icount with QEMU's gdbstub, single-steps one iteration of each
-        /// benchmark, checks it against the counts, and attributes each
-        /// instruction to its function; `write` sets the traced
-        /// configurations side by side in the account document. See
-        /// xtask/README.md.
+        /// Account for every instruction of each gated benchmark's measured
+        /// window: `trace` boots a benchmark image (ktest's bench-only image,
+        /// or the init image with ubench) at one CPU under icount with a QEMU
+        /// plugin that counts every instruction, checks each window against
+        /// its sample and the counts, and attributes each instruction to its
+        /// function; `write` sets the traced configurations side by side in
+        /// the account documents. See xtask/README.md.
         PathAccount(PathAccountArgs),
 
         /// Resolve runtime addresses in a loaded ELF image (a binary, or the
@@ -1289,16 +1289,17 @@ args! {
 subcommands! {
     pub enum PathAccountCommand
     {
-        /// Boot the sysroot's bench-only ktest image (`build --ktest-bench-only
-        /// --limited-debug kernel,ktest`, `mkdisk --harness ktest`) at one CPU
-        /// under icount, trace one iteration of each benchmark, check each
-        /// window against the counts, and write the configuration's result
-        /// under target/xtask/path-account/.
+        /// Boot the sysroot's benchmark image, built with `--limited-debug
+        /// all` (ktest's bench-only image, `mkdisk --harness ktest`; or the init
+        /// image with ubench staged), at one CPU under icount with the
+        /// path-account plugin counting every instruction, check each gated
+        /// measurement's windows against their samples and the counts, and
+        /// write the configuration's result under target/xtask/path-account/.
         Trace(PathAccountTraceArgs),
 
-        /// Write the generated block of the account document from the result
+        /// Write the generated block of each account document from the result
         /// files of every configuration traced.
-        Write(PathAccountWriteArgs),
+        Write,
     }
 }
 
@@ -1313,17 +1314,10 @@ args! {
         #[arg(long)]
         pub release: bool,
 
-        /// The first sample index traced in each benchmark: the iteration
-        /// that records it and the 7 after it are stepped. From 1 to 92, so
-        /// the last stepped index stays below the smallest sample count of a
-        /// benchmark (100).
-        #[arg(long, default_value_t = 64)]
-        pub iteration: u32,
-
-        /// Saved logs of icount boots of the same tree and profile's bench-only
-        /// image built without `--limited-debug` (`run --icount --save-logs`),
-        /// whose lowest p50s are the reference counts each traced window must
-        /// equal.
+        /// Saved logs of icount boots of the same tree, profile and image
+        /// built without `--limited-debug` (`run --icount --save-logs`), whose
+        /// lowest p50s are the reference counts each traced p50 must lie within
+        /// the gate's band of.
         #[arg(long, value_name = "LOG", required = true)]
         pub reference: Vec<PathBuf>,
 
@@ -1331,17 +1325,13 @@ args! {
         #[arg(long, default_value_t = 3600)]
         pub timeout: u64,
 
+        /// Account the boot log and record the configuration's last trace
+        /// left under target/xtask/path-account/, without booting.
+        #[arg(long)]
+        pub reuse: bool,
+
         #[command(flatten)]
         pub host: BootHostArgs,
-    }
-}
-
-args! {
-    pub struct PathAccountWriteArgs
-    {
-        /// The account document, whose generated block is replaced.
-        #[arg(long, default_value = "core/kernel/docs/hot-path-account.md")]
-        pub doc: PathBuf,
     }
 }
 

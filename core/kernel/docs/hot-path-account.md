@@ -13,12 +13,14 @@ makes, and the closing counter read. Under QEMU's icount the counter advances by
 instruction, so the benchmark's sample is that path's instruction count, and the benchmark
 cell gates it ([docs/testing.md](../../../docs/testing.md) § Gating).
 
-The account steps one CPU through eight consecutive iterations of each benchmark under QEMU's
-gdbstub and attributes every instruction between the two counter reads to a function. An
-iteration whose stepped count differs from the sample it recorded, or a benchmark whose p50
-differs from the reference boot's, fails the run, so each table below sums to the count the
-benchmark cell sees for that tree and profile. The method, its checks and its limits are in
-[xtask/README.md](../../../xtask/README.md) § `cargo xtask path-account`.
+The account boots the image at one CPU under icount with a QEMU plugin that counts every
+instruction the guest runs, and attributes every instruction between each pair of counter reads
+to a function. A window whose instructions differ from the sample the benchmark recorded, or a
+p50 outside the gate's band of the reference boot's, fails the run, so each table below sums to
+the count the benchmark cell sees for that tree and profile. The method, its checks and its
+limits are in [xtask/README.md](../../../xtask/README.md) § `cargo xtask path-account`. The
+ubench and fsbench rows, whose paths cross the kernel and several processes, are accounted the
+same way in [hot-path-account-userspace.md](hot-path-account-userspace.md).
 
 An x86_64 `rep` string instruction counts once per iteration under icount, in the benchmark
 and in the account alike. A `memset` or `memcpy` row on x86_64 is therefore the iterations
@@ -34,7 +36,9 @@ regenerate one configuration are in [xtask/README.md](../../../xtask/README.md)
 § `cargo xtask path-account`. The block's first table names, for each configuration, the head
 of the tree it was taken at, the date, the QEMU version, and the reference it was checked
 against. A change to a kernel path regenerates the four configurations, rewrites the block,
-and revises the prose below where its numbers moved.
+and revises the prose below where its numbers moved. A kernel path the ubench or fsbench rows
+also run owes their account too, as
+[hot-path-account-userspace.md](hot-path-account-userspace.md) § Regenerating It says.
 
 ## Reading the Tables
 

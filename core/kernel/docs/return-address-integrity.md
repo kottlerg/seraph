@@ -412,4 +412,5 @@ published in November 2026.
 ## Summarized By
 
 [core/kernel/README.md](../README.md),
-[Platform Requirements](../../../docs/platform-requirements.md)
+[Platform Requirements](../../../docs/platform-requirements.md),
+[Threat Model](../../../docs/threat-model.md)

@@ -448,6 +448,6 @@ validates the API once per boot.
 [Architecture Abstraction Layer](arch-interface.md),
 [Kernel Initialization Sequence](initialization.md), [Syscall Interface Specification](syscalls.md),
 [Platform Requirements](../../../docs/platform-requirements.md),
-[Testing](../../../docs/testing.md),
+[Testing](../../../docs/testing.md), [Threat Model](../../../docs/threat-model.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
 [xtask/README.md](../../../xtask/README.md)

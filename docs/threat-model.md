@@ -25,7 +25,10 @@ Each boundary's section names its **Attacker**, its **Assets**, its **Assumption
 (`cargo xtask fuzz` and `cargo xtask kani`, [testing.md](testing.md) § Fuzzing and § Bounded
 verification), and its **Gaps**. A gap is a way the attacker can still reach an asset, or a part of
 the boundary that no test or proof covers. § Attackers Out of Scope lists the attackers no section
-is held against yet.
+is held against yet. The files a section's Mitigations and Fuzz targets and proof harnesses name
+in backticks, and the files under a directory they name, are the scope of the section's threat
+audit ([conventions.md](conventions.md) § Threat audit); a mitigation that names no file is a
+defect of this document.
 
 Implementation status: every section is provisional until the hardening milestone, v0.13.0
 ([#686](https://github.com/kottlerg/seraph/issues/686)), audits the whole attack surface against

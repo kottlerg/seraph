@@ -194,11 +194,13 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
 
 **Mitigations.**
 
-- The GUID Partition Table is decoded by a pure crate, `services/vfsd/gpt`: `parse_header` refuses a
-  block size, an entry size or an entry array outside the header's own layout (the array between LBA
-  2 and `first_usable_lba`), `parse_entry` refuses an inverted or overflowing range, and
-  `collect_partitions` checks exactly the header's entry count and stops at a failed read or a
-  failed allocation.
+- The GUID Partition Table is decoded by a pure crate, `services/vfsd/gpt`: `parse_header` checks a
+  header's signature, size, CRC32 and `MyLBA`, and refuses a block size, an entry size, or an entry
+  array outside the space the GPT gives it (from LBA 2 to `first_usable_lba` for the primary, after
+  `last_usable_lba` and before the header for the backup); `parse_entry` refuses an inverted or
+  overflowing range; `collect_partitions` checks exactly the header's entry count and the array's
+  CRC32, and stops at a failed read; `read_gpt` reads the backup GPT at the disk's last LBA only
+  when the primary fails. A CRC32 detects a corrupt table, not this attacker, who recomputes it.
 - A filesystem driver reaches its disk through a block-device capability badged for its partition:
   the block driver refuses every transfer outside the partition or past the device's capacity, and
   refuses to register a partition past that capacity (`resolve_lba`, `handle_register_partition` in
@@ -215,16 +217,19 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
 - `gpt` (`xtask/fuzz/targets/src/bin/gpt.rs`) drives `vfsd_gpt::property::gpt_holds` over a header
   block and a whole disk, from the seeds in `services/vfsd/gpt/fuzz/gpt/seeds/`; CI's gating `fuzz`
   job runs it on every pull request and the weekly campaign for 30 minutes.
-- Planned: the GPT parser's proof harness ([#756](https://github.com/kottlerg/seraph/issues/756));
-  the FAT decoders' property function, fuzz target and proof harness (`parse_bpb_geometry`,
+- The `proofs` module of `services/vfsd/gpt/src/lib.rs` proves the property's check of a header and
+  of an entry over every input, the choice between the two copies, and, by induction, the CRC32, the
+  entry-array walk and the lookup ([testing.md](testing.md) § Bounded verification); CI's `kani` job
+  runs them.
+- Planned: the FAT decoders' property function, fuzz target and proof harness (`parse_bpb_geometry`,
   `read_fat_entry`, `parse_dir_entry`; [#680](https://github.com/kottlerg/seraph/issues/680),
   [#756](https://github.com/kottlerg/seraph/issues/756)).
 
 **Gaps.**
 
-- The GPT header's and entry array's CRC32s are not checked, and `first_usable_lba` is taken from
-  the header it bounds: an inflated value lengthens the entry walk, which the device's capacity and
-  memory then bound.
+- A header's fields bound one another: `first_usable_lba` bounds the entry array the same header
+  places, so an attacker who sets both, and recomputes the CRC32s, lengthens the entry walk to the
+  entries `num_parts` declares, which the device's capacity then bounds.
 - No check compares one partition entry with another, so two partitions can overlap, and a
   filesystem driver given one reaches the other's blocks in the overlap.
 - The FAT decoders have no fuzz target or proof harness yet, and no target drives fatfs's own logic

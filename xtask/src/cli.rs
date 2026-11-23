@@ -122,6 +122,15 @@ subcommands! {
         /// xtask/README.md.
         BenchBaseline(BenchBaselineArgs),
 
+        /// Account for every instruction of each kernel benchmark's measured
+        /// window: `trace` boots the bench-only ktest image at one CPU under
+        /// icount with QEMU's gdbstub, single-steps one iteration of each
+        /// benchmark, checks it against the counts, and attributes each
+        /// instruction to its function; `write` sets the traced
+        /// configurations side by side in the account document. See
+        /// xtask/README.md.
+        PathAccount(PathAccountArgs),
+
         /// Resolve runtime addresses in a loaded ELF image (a binary, or the
         /// sysroot's kernel) to function, file, and line from its DWARF, or to the
         /// nearest function symbol when no DWARF covers an address; a stripped
@@ -252,6 +261,7 @@ impl CliCommand
             | Self::KtestTiming(_)
             | Self::BenchCheck(_)
             | Self::BenchBaseline(_)
+            | Self::PathAccount(_)
             | Self::Symbolize(_)
             | Self::Mkdisk(_)
             | Self::TrustRequest(_)
@@ -361,6 +371,15 @@ args! {
         /// `--component`. Only components in the current build are affected.
         #[arg(long, value_delimiter = ',', value_parser = parse_build_component)]
         pub debug: Vec<BuildComponent>,
+
+        /// Emit limited debuginfo (`debug = "limited"`: line tables and function
+        /// frames, inlined ones included, without types or variables) for the
+        /// named component(s), at the active profile's own opt-level, so the
+        /// code is the code a build without it emits; a component `--debug`
+        /// also names takes `--debug`. Comma-separated, names as for
+        /// `--debug`. `cargo xtask path-account` reads the kernel's and ktest's.
+        #[arg(long, value_delimiter = ',', value_parser = parse_build_component)]
+        pub limited_debug: Vec<BuildComponent>,
 
         /// Skip the formatting check (`cargo fmt --check`) and the
         /// per-component `cargo check` (clippy), which would otherwise double
@@ -1229,6 +1248,74 @@ impl ShutdownCause
     pub fn on(self, arch: Arch) -> bool
     {
         self != Self::PowerButton || arch == Arch::X86_64
+    }
+}
+
+// ── PathAccount ───────────────────────────────────────────────────────────────
+
+args! {
+    pub struct PathAccountArgs
+    {
+        #[command(subcommand)]
+        pub command: PathAccountCommand,
+    }
+}
+
+subcommands! {
+    pub enum PathAccountCommand
+    {
+        /// Boot the sysroot's bench-only ktest image (`build --ktest-bench-only
+        /// --limited-debug kernel,ktest`, `mkdisk --harness ktest`) at one CPU
+        /// under icount, trace one iteration of each benchmark, check each
+        /// window against the counts, and write the configuration's result
+        /// under target/xtask/path-account/.
+        Trace(PathAccountTraceArgs),
+
+        /// Write the generated block of the account document from the result
+        /// files of every configuration traced.
+        Write(PathAccountWriteArgs),
+    }
+}
+
+args! {
+    pub struct PathAccountTraceArgs
+    {
+        /// Target architecture: the sysroot's.
+        #[arg(long, default_value = "x86_64")]
+        pub arch: Arch,
+
+        /// The sysroot was built with `--release` (default: the dev profile).
+        #[arg(long)]
+        pub release: bool,
+
+        /// The sample index traced in each benchmark: the iteration that
+        /// records it is stepped. Below the smallest sample count of a
+        /// benchmark (100), so every benchmark records it.
+        #[arg(long, default_value_t = 64)]
+        pub iteration: u32,
+
+        /// Saved logs of icount boots of the same tree and profile's bench-only
+        /// image built without `--limited-debug` (`run --icount --save-logs`),
+        /// whose lowest p50s are the reference counts each traced window must
+        /// equal.
+        #[arg(long, value_name = "LOG", required = true)]
+        pub reference: Vec<PathBuf>,
+
+        /// Seconds the whole boot may take.
+        #[arg(long, default_value_t = 3600)]
+        pub timeout: u64,
+
+        #[command(flatten)]
+        pub host: BootHostArgs,
+    }
+}
+
+args! {
+    pub struct PathAccountWriteArgs
+    {
+        /// The account document, whose generated block is replaced.
+        #[arg(long, default_value = "core/kernel/docs/hot-path-account.md")]
+        pub doc: PathBuf,
     }
 }
 

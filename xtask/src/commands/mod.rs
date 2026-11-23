@@ -21,6 +21,7 @@ pub mod ktest_timing;
 pub mod lint_docs;
 pub mod mkdisk;
 pub mod orch;
+pub mod path_account;
 pub mod pr_check;
 pub mod release_scope;
 pub mod review;

@@ -319,6 +319,13 @@ impl Guest
         }
     }
 
+    /// Every serial line that has arrived and no wait has taken, without
+    /// waiting.
+    pub fn take_lines(&mut self) -> Vec<String>
+    {
+        self.lines.try_iter().collect()
+    }
+
     /// Wait until the serial stream ends, as QEMU's exit ends it, or
     /// `timeout` passes; whether it ended.
     pub fn wait_until_end(&mut self, timeout: Duration) -> bool

@@ -168,6 +168,10 @@ pub struct Stub
 {
     stream: Stream,
     reader: PacketReader<PACKET_SIZE>,
+    /// The wait for each reply but a resume's.
+    answer_timeout: Duration,
+    /// The packet of a resume whose stop reply is still owed.
+    pending: Option<Vec<u8>>,
 }
 
 impl Stub
@@ -195,6 +199,8 @@ impl Stub
         Ok(Self {
             stream,
             reader: PacketReader::new(),
+            answer_timeout,
+            pending: None,
         })
     }
 
@@ -202,6 +208,7 @@ impl Stub
     /// reply comes only when the target stops.
     pub fn set_answer_timeout(&mut self, timeout: Duration) -> Result<()>
     {
+        self.answer_timeout = timeout;
         self.stream
             .set_read_timeout(timeout)
             .context("setting the reply timeout")
@@ -234,24 +241,84 @@ impl Stub
     /// acknowledging it.
     pub fn exchange(&mut self, body: &[u8]) -> Result<Vec<u8>>
     {
+        let packet = self.send(body)?;
+        let what = String::from_utf8_lossy(body).into_owned();
+        self.receive(&packet, &what)?
+            .with_context(|| format!("the gdbstub did not reply to `{what}` in time"))
+    }
+
+    /// Send `body` without waiting for its reply: a resume (`c`), whose stop
+    /// reply comes only when the target stops ([`Stub::wait_stop`]).
+    pub fn resume(&mut self, body: &[u8]) -> Result<()>
+    {
+        let packet = self.send(body)?;
+        self.pending = Some(packet);
+        Ok(())
+    }
+
+    /// The stop reply owed to the last [`Stub::resume`], waiting at most
+    /// `timeout`; `None` when none came in that time, the reply still owed.
+    pub fn wait_stop(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>>
+    {
+        let packet = self
+            .pending
+            .clone()
+            .context("no resume is waiting for its stop reply")?;
+        self.stream.set_read_timeout(timeout)?;
+        let reply = self.receive(&packet, "the resume");
+        self.stream.set_read_timeout(self.answer_timeout)?;
+        let reply = reply?;
+        if reply.is_some()
+        {
+            self.pending = None;
+        }
+        Ok(reply)
+    }
+
+    /// Frame `body` as a packet and send it; return the packet, which a
+    /// negative acknowledgement has sent again.
+    fn send(&mut self, body: &[u8]) -> Result<Vec<u8>>
+    {
         let mut buf = vec![0u8; 2 * PACKET_SIZE];
         let mut w = PacketWriter::new(&mut buf);
         w.bytes(body);
         let len = w
             .finish()
             .map_err(|e| crate::error::err!("packet past the buffer: {e:?}"))?;
-        let packet = buf.get(..len).context("packet length past the buffer")?;
-        let what = String::from_utf8_lossy(body).into_owned();
+        let packet = buf
+            .get(..len)
+            .context("packet length past the buffer")?
+            .to_vec();
         self.stream
-            .write_all(packet)
-            .with_context(|| format!("sending `{what}`"))?;
+            .write_all(&packet)
+            .with_context(|| format!("sending `{}`", String::from_utf8_lossy(body)))?;
+        Ok(packet)
+    }
+
+    /// Read the reply to `packet`, sent for `what`, and acknowledge it;
+    /// `None` when the read timeout passed first.
+    fn receive(&mut self, packet: &[u8], what: &str) -> Result<Option<Vec<u8>>>
+    {
         let mut byte = [0u8; 1];
         loop
         {
-            let n = self
-                .stream
-                .read(&mut byte)
-                .with_context(|| format!("reading the reply to `{what}`"))?;
+            let n = match self.stream.read(&mut byte)
+            {
+                Ok(n) => n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(e) =>
+                {
+                    return Err(crate::error::Error::from(e)
+                        .context(format!("reading the reply to `{what}`")));
+                }
+            };
             if n == 0
             {
                 bail!("the gdbstub closed the connection before replying to `{what}`");
@@ -265,7 +332,7 @@ impl Stub
                 {
                     let reply = reply.to_vec();
                     self.stream.write_all(b"+")?;
-                    return Ok(reply);
+                    return Ok(Some(reply));
                 }
                 Some(other) => bail!("unexpected {other:?} replying to `{what}`"),
             }

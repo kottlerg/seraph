@@ -874,8 +874,10 @@ derivation learns this way that the client's copies are gone, with no query of i
 The mechanism is `cap/sole_reference.rs`.
 
 - **The flag.** Bit 31 of the count word, `REF_OBSERVED`, marks an observed object. It rides in
-  the word so that `dec_ref` learns it from the value its `fetch_sub` returns: with no observer
-  bound, the decrement costs a test of a register, no memory access and no lock. Increments never
+  the word so that `dec_ref` learns it from the value its `fetch_sub` returns: one signed compare
+  of that value passes every decrement that leaves two or more references and finds the flagged
+  words, the last release and an underflow, so with no observer bound the decrement costs what it
+  did before the flag, with no memory access and no lock. Increments never
   read it, and the limit and the headroom above keep the count below it (§ Kernel Object Reference
   Counting).
 - **The table.** One leaf spinlock, 256 chains keyed by a hash of the object address, and a
@@ -899,7 +901,16 @@ The mechanism is `cap/sole_reference.rs`.
   reaches zero only this way, so no binding ends without a post.
 - **The drain.** `drain_deferred_reclaim`, after its reclaim, on the syscall epilogue and in the
   idle loop, and `drain_at_interrupt` at the end of an interrupt taken from user mode, read one
-  summary word when nothing is pending. Otherwise, under the table lock, it
+  summary word when nothing is pending: `sole_reference::drain` is inline, a load and a branch on
+  every syscall, and its pass is out of line. That load is Relaxed. An ordering would not make it
+  see a newer value, only order the accesses after it, and the pass orders its own through its
+  Acquire load and AcqRel swap of the summary. A bit the CPU set itself, by a release or by a pass
+  that left fired nodes, is seen by its own later load unless a pass that cleared the bit, on any
+  CPU, took its work, so the release is claimed by this CPU's next pass or by that one; either
+  pass may post after the call that made the release returns, and the budget may leave the post
+  to a later pass, as The budget says. A bit set by another CPU that the load misses is drained
+  by that CPU at its own next drain point (its syscall return, its next interrupt from user mode,
+  or its idle loop), so the bound under The budget holds. Otherwise, under the table lock, it
   claims each object of a pending chain whose word is `REF_OBSERVED | 1` by a compare-and-swap to
   1, moving its nodes to the fired list, and takes at most `POST_BUDGET` (64) nodes off the fired
   list. An object on a chain is live,

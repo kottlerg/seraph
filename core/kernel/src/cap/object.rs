@@ -358,6 +358,14 @@ impl KernelObjectHeader
     pub(crate) fn dec_ref_in(&self, table: &crate::cap::sole_reference::SoleReferenceTable) -> u32
     {
         let prev = self.ref_count.fetch_sub(1, Ordering::Release);
+        // One signed compare passes every common word and finds every rare
+        // one: a word with REF_OBSERVED set reads negative, the last release
+        // reads 1, and an underflow reads 0. A word of 2 or more returns here,
+        // its new count known non-zero, so a caller's test for 0 folds away.
+        if prev.cast_signed() > 1
+        {
+            return prev.wrapping_sub(1);
+        }
         debug_assert!(
             references_in(prev) != 0,
             "dec_ref underflow: obj_type={:?} self={:p} ancestor={:p}",
@@ -375,10 +383,11 @@ impl KernelObjectHeader
             // owner with an Acquire, so the caller that frees the object
             // observes every write those owners made before releasing.
             core::sync::atomic::fence(Ordering::Acquire);
+            return 0;
         }
-        // Wrapping, as the atomic did: an underflow (caught by the assert
-        // above in debug) returns u32::MAX, never 0, so no caller frees the
-        // object a second time.
+        // An underflow (caught by the assert above in debug) returns u32::MAX,
+        // as the wrapping atomic did, never 0, so no caller frees the object a
+        // second time.
         prev.wrapping_sub(1)
     }
 
@@ -3108,11 +3117,14 @@ pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObject
 /// makes posts in the same pass.
 ///
 /// Called from the syscall epilogue (when the returning thread is alive) and
-/// the idle loop, with no lock held.
+/// the idle loop, with no lock held. Inline, so that the epilogue pays only the
+/// two empty checks, the stack's and the table's, on a syscall that has
+/// neither to do.
 ///
 /// # Safety
 /// The contract of [`reclaim_deferred_stack`].
 #[cfg(not(test))]
+#[inline]
 pub unsafe fn drain_deferred_reclaim(cpu: usize)
 {
     // SAFETY: forwarded caller contract.

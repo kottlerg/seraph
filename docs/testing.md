@@ -31,6 +31,11 @@ Three harnesses exercise three surfaces:
 itself owns its phases. `usertest` is an orchestrator that runs per-program
 tester binaries discovered under `/tests/programs/`.
 
+[`ubench`](../programs/ubench/README.md), the userspace benchmark suite, is launched as
+`svctest` is, from a recipe staged into `/config/svcmgr/services/`, and measures rather than
+tests: it logs result lines, and passes when every benchmark ran
+([Benchmarks](#benchmarks-bench-cell)).
+
 ---
 
 ## Reporting marker
@@ -132,6 +137,7 @@ sysroot/
     ├── ktest                 # kernel-surface harness (bootloader-loaded)
     ├── svctest               # services-surface harness
     ├── usertest              # programs-surface orchestrator
+    ├── ubench                # userspace benchmark suite
     ├── crasher               # svcmgr restart-path fixture
     ├── debug-echo            # debug-port fixture (`debug-port` case)
     ├── hotplug-check         # PCI Express hotplug fixture (`hotplug` case)
@@ -186,6 +192,7 @@ rootfs/config/svcmgr/
 ├── tests/                    # NOT loaded by svcmgr
 │   ├── svctest.svc
 │   ├── usertest.svc
+│   ├── ubench.svc            # userspace benchmark suite; staged by the `bench` cell
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
 │   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
 │   ├── crasher-boot.svc      # death-before-bootstrap fixture; co-staged with svctest
@@ -403,11 +410,18 @@ result line, its samples' summary in the form
 [shared/bench/README.md § Result line](../shared/bench/README.md#result-line) gives. A functional
 ktest boot runs every benchmark 8 times, a smoke run whose lines no check compares; the bench-only
 image (`cargo xtask build --ktest-bench-only`) runs Tier 3 alone, 4096 iterations each, for the
-lines that are compared. CI's `bench` cell, one per architecture, boots that image (debug) under
-QEMU's icount (`cargo xtask run --icount`): one guest clock tick per retired instruction, so a
-benchmark's count is the same in every run of one build, whatever the runner's load. It boots
-three times at one CPU and once at four, and `cargo xtask bench-check --mode icount` compares
-each measurement's lowest p50 over the runs with its baseline under `xtask/baselines/bench/icount/`
+lines that are compared. The userspace paths are measured by the
+[`ubench`](../programs/ubench/README.md) suite, in a boot of the regular init image with its
+recipe (`/config/svcmgr/tests/ubench.svc`) staged and the terminal dropped; it logs its own
+lines and fsbench's.
+
+CI's `bench` cell, one per architecture, boots both (debug) under QEMU's icount
+(`cargo xtask run --icount`): one guest clock tick per retired instruction, so a benchmark's
+count is the same in every run of one build, whatever the runner's load. It boots each three times
+at one CPU and once at four, the ubench boots with a framebuffer (`--display framebuffer`) and
+their logs saved in `ubench/` beside the ktest boots', and one
+`cargo xtask bench-check --mode icount` over both sets compares each measurement's lowest p50
+over the runs that reported its suite with its baseline under `xtask/baselines/bench/icount/`
 ([xtask/README.md § `cargo xtask bench-check`](../xtask/README.md#cargo-xtask-bench-check)).
 
 The one-CPU counts gate: a count further from its baseline than the larger of 1% of it and 8
@@ -417,6 +431,16 @@ too, since the stale baseline would let a later regression of the same size thro
 moves a count on purpose rewrites the baselines of the benchmarks it moved from its own CI run
 (`cargo xtask bench-baseline --from-run <run id>`) and states the change and its reason in its
 body. The four-CPU counts are reported, not gated: the interleaving of the CPUs moves them.
+
+A one-CPU count gates only when it does not include time blocked on a device completion. The
+completion arrives at host time: a guest blocked on it retires no instructions, and its clock
+advances by timer deadlines until QEMU completes the request, so the count follows the host's I/O
+latency. `fsbench.write`, which writes through the filesystem's page cache to the disk, is such a
+benchmark at every size, and is reported, not gated; a regression of the write path's
+instructions shows in the cell's report and in host mode, not as a failure. `fsbench.read` gates:
+its untimed open, fixture check and warm-up reads fill the filesystem's page cache with the file,
+so no timed read waits on the disk. A benchmark is classified by the same test: one whose timed
+samples wait on a device joins the set (`ICOUNT_IO_BOUND` in `xtask/src/benchmark.rs`).
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
@@ -1159,7 +1183,7 @@ registry runs it on (its `md-test-cells` rule).
 | `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
-| `bench` | Canonical | x86_64, riscv64; debug | the bench-only ktest bundle under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
+| `bench` | Canonical | x86_64, riscv64; debug | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |
 | 4kn | Local and release host runs | x86_64, riscv64; debug | svctest from a 4Kn disk (`mkdisk --block-size 4096`) | none | 4096-byte logical blocks (Disk variations below) |
@@ -2279,6 +2303,7 @@ note in full.
 [programs/terminal/README.md](../programs/terminal/README.md),
 [programs/threadchurn/README.md](../programs/threadchurn/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
+[programs/ubench/README.md](../programs/ubench/README.md),
 [services/crashd/README.md](../services/crashd/README.md),
 [services/crasher/README.md](../services/crasher/README.md),
 [services/debug-echo/README.md](../services/debug-echo/README.md),

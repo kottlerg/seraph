@@ -64,4 +64,4 @@ selected by argv: any argument equal to `oor` selects the out-of-region mode, an
 
 ## Summarized By
 
-[memmgr Memory Pool](../../services/memmgr/docs/memory-pool.md)
+None

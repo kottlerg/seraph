@@ -819,12 +819,14 @@ fn snapshot_json(as_of: &str, issues: &[Issue]) -> Value
 fn parse_snapshot(text: &str, digest: &str) -> Result<Snapshot>
 {
     let v = json::parse(text).context("parsing the saved open-Issue list")?;
-    let as_of = v["as_of"]
-        .as_str()
+    let as_of = v
+        .get("as_of")
+        .and_then(Value::as_str)
         .context("the saved open-Issue list has no as_of")?
         .to_owned();
-    let issues = v["issues"]
-        .as_array()
+    let issues = v
+        .get("issues")
+        .and_then(Value::as_array)
         .context("the saved open-Issue list has no issues")?
         .iter()
         .map(|i| {

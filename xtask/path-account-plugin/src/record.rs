@@ -11,12 +11,12 @@
 //! H <id> <pc>:<count> ...            a segment's instructions, by address, the first time a segment held them
 //! R <pc> <id> <value>                a user-mode counter read at <pc>, the segment before it (histogram <id>), its value
 //! A <pc>                             an attempt at <pc> that a trap ended before it retired
-//! X <pc>                             a counter read at <pc> begun again before its value was read
 //! ```
 //!
 //! A segment is the instructions executed from one user-mode counter read,
 //! itself included, to the next, excluded, in every privilege mode and address
-//! space. Addresses are hexadecimal, without a prefix; counts, identifiers and
+//! space. An attempt counts against the segment the next read ends, so a
+//! counter read's own attempts follow its `R`. Addresses are hexadecimal, without a prefix; counts, identifiers and
 //! values are decimal.
 
 use std::fmt;

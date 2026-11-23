@@ -17,6 +17,8 @@ bootloader runs on, memory map acquisition, `ExitBootServices`, and error handli
 | `EFI_LOADED_IMAGE_PROTOCOL` | `OpenProtocol(image_handle, BY_HANDLE_PROTOCOL)` | Obtain device handle for the boot volume | Yes |
 | `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` | `HandleProtocol(device_handle)` | Open the ESP root directory | Yes |
 | `EFI_GRAPHICS_OUTPUT_PROTOCOL` | `LocateHandleBuffer(ByProtocol)` | Select a fixed mode; record framebuffer address, dimensions, format | No |
+| `EFI_DEVICE_PATH_PROTOCOL` | `HandleProtocol(device_handle)` | Read the boot ESP's GPT `HardDrive` node from the device path (bounded at 4096 bytes) | No |
+| `EFI_PCI_IO_PROTOCOL` | `LocateDevicePath` on that path, then `GetLocation` | Read the PCI segment, bus, device and function of the boot controller | No |
 | `EFI_GET_MEMORY_MAP` | `BootServices->GetMemoryMap` | Query physical memory layout | Yes |
 | `EFI_ALLOCATE_PAGES` | `BootServices->AllocatePages` | Allocate physical memory for all loaded data | Yes |
 | `EFI_CONFIGURATION_TABLE` | `SystemTable->ConfigurationTable` | Locate the ACPI RSDP and/or Device Tree blob (both GUIDs searched on both architectures) | No (each table optional) |

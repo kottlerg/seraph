@@ -85,9 +85,10 @@ pub struct Tss
     _reserved2: u64,
     _reserved3: u16,
     /// I/O permission bitmap offset: [`IOPB_OFFSET_VALID`] (104, the offset of
-    /// `TssWithIopb::iopb`) while this CPU's bitmap is current, which makes the
-    /// bitmap live, and [`IOPB_OFFSET_INVALID`] (past the TSS limit, every
-    /// ring-3 port access denied) after [`invalidate_all_iopbs`].
+    /// `TssWithIopb::iopb`) while the bitmap is the running thread's current
+    /// one, which makes the bitmap live, and [`IOPB_OFFSET_INVALID`] (past the
+    /// TSS limit, every ring-3 port access denied) while a thread without port
+    /// bindings runs and after [`invalidate_all_iopbs`].
     pub iopb_offset: u16,
 }
 
@@ -105,21 +106,28 @@ const _: () = assert!(IOPB_PARTS * IOPB_PART_BYTES == IOPB_SIZE);
 /// A thread's I/O permission bitmap, held as [`IOPB_PARTS`] page-sized parts
 /// in separately allocated pages: part `i` covers ports
 /// `i * 8 * IOPB_PART_BYTES` onward. Bit N of the whole is port N; 0 permits,
-/// 1 denies. [`load_iopb`] copies the parts into the TSS in order.
+/// 1 denies. [`load_iopb`] copies the parts into the TSS in order, unless the
+/// TSS already holds them at [`ThreadIopb::generation`].
 #[repr(C)]
 pub struct ThreadIopb
 {
     /// The parts, each a page-aligned [`IOPB_PART_BYTES`]-byte block.
     pub parts: [*mut [u8; IOPB_PART_BYTES]; IOPB_PARTS],
+    /// The version of the parts' bytes: a value drawn from one kernel-wide
+    /// counter (`cap::ioport_bindings`) each time the bytes change, so no two
+    /// bitmap states of any threads, over the kernel's life, share one, and
+    /// never 0. Written with the bytes, under the owning thread's `sched_lock`.
+    pub generation: u64,
 }
 
-/// `Tss::iopb_offset` while the CPU's TSS bitmap is current: the offset of
-/// `TssWithIopb::iopb`.
+/// `Tss::iopb_offset` while the CPU's TSS bitmap is the running thread's
+/// current one: the offset of `TssWithIopb::iopb`.
 const IOPB_OFFSET_VALID: u16 = core::mem::size_of::<Tss>() as u16;
 
 /// `Tss::iopb_offset` that places the bitmap past the TSS limit, so every
-/// ring-3 port access raises `#GP` until the CPU reloads its bitmap
-/// ([`reload_invalidated_iopb`]).
+/// ring-3 port access raises `#GP`: the offset of a thread without port
+/// bindings, and of every CPU after [`invalidate_all_iopbs`] until it reloads
+/// its running thread's bitmap ([`reload_invalidated_iopb`]).
 const IOPB_OFFSET_INVALID: u16 = u16::MAX;
 
 /// TSS extended with an I/O Permission Bitmap.
@@ -133,12 +141,16 @@ const IOPB_OFFSET_INVALID: u16 = u16::MAX;
 ///   limit = `offset_of!(TssWithIopb, terminator)`
 ///
 /// `iopb_offset` in the `Tss` is [`IOPB_OFFSET_VALID`] (104, the offset of
-/// `iopb` within this struct) while the CPU's bitmap is current, and
-/// [`IOPB_OFFSET_INVALID`] after [`invalidate_all_iopbs`] until the CPU reloads
-/// it. Every field has alignment 1 (`Tss` is packed), so `repr(C)` lays them
-/// out with no padding; `align(2)` makes every instance, the per-CPU slab's
-/// elements included, 2-byte aligned, so `iopb_offset` (at offset 102) is a
-/// naturally aligned `u16` that another CPU can store atomically.
+/// `iopb` within this struct) while the bitmap is the running thread's current
+/// one, and [`IOPB_OFFSET_INVALID`] while a thread without port bindings runs,
+/// and after [`invalidate_all_iopbs`] until the CPU reloads its running
+/// thread's bitmap. The hardware part, `tss` to `terminator`, has alignment 1
+/// (`Tss` is packed), so `repr(C)` lays it out with no padding;
+/// `held_generation` follows it, past the descriptor limit, where the CPU never
+/// reads. `align(2)` (and `held_generation`'s own alignment) makes every
+/// instance, the per-CPU slab's elements included, 2-byte aligned, so
+/// `iopb_offset` (at offset 102) is a naturally aligned `u16` that another CPU
+/// can store atomically.
 #[repr(C, align(2))]
 pub struct TssWithIopb
 {
@@ -149,6 +161,11 @@ pub struct TssWithIopb
     pub iopb: [u8; IOPB_SIZE],
     /// Mandatory terminator byte (must always be 0xFF per Intel SDM).
     pub terminator: u8,
+    /// The [`ThreadIopb::generation`] of the bitmap `iopb` holds, or 0 before
+    /// it holds any thread's: [`load_iopb`] copies a bound thread's parts only
+    /// when this differs from their generation. Read and written only by this
+    /// CPU, with interrupts disabled.
+    pub held_generation: u64,
 }
 
 /// The BSP's extended TSS + IOPB. Its static initializer fills the IOPB and
@@ -179,6 +196,7 @@ static mut TSS: TssWithIopb = TssWithIopb {
     },
     iopb: [0xFF; IOPB_SIZE], // all ports denied by default
     terminator: 0xFF,
+    held_generation: 0,
 };
 
 /// GDT: 7 × 64-bit descriptors, in BSS. Seven is the fixed layout the module
@@ -692,54 +710,88 @@ unsafe fn iopb_offset_of<'a>(tss: *mut TssWithIopb) -> &'a core::sync::atomic::A
     unsafe { &*field.cast::<core::sync::atomic::AtomicU16>() }
 }
 
-/// Copy `iopb` into the TSS I/O Permission Bitmap for the current CPU and
-/// mark the bitmap current.
+/// Make the current CPU's TSS run a thread with I/O permission bitmap `iopb`.
 ///
-/// If `iopb` is `Some`, the bitmap is copied from the thread's per-thread IOPB,
-/// part by part. If `None`, the bitmap is filled with 0xFF (all ports denied).
+/// `None`, a thread without port bindings, stores [`IOPB_OFFSET_INVALID`],
+/// which denies every port, and writes no byte of the bitmap. `Some` makes the
+/// TSS bitmap hold the thread's ([`refresh_bitmap`]: a copy of its parts
+/// unless the TSS already holds them at their generation) and stores
+/// [`IOPB_OFFSET_VALID`].
 ///
-/// Called on every context switch: for an incoming non-idle thread under its
-/// `sched_lock`, in the hold that marks it running (with `None` when it has
-/// no port bindings), and with `None` for the idle thread, which runs no
-/// ring-3 code. Also called by the I/O-port bind syscall when it binds the
-/// calling thread, and by [`reload_invalidated_iopb`].
+/// Called by `schedule()`'s dispatch flip for every incoming non-idle thread,
+/// under its `sched_lock`, in the hold that marks it running (the idle thread
+/// runs no ring-3 code and loads nothing); by the I/O-port bind syscall when it
+/// binds the calling thread; and by [`reload_invalidated_iopb`].
 ///
 /// # Safety
 /// Must be called with interrupts disabled or from a single-CPU context.
 /// GS-base must point to a valid `PerCpuData` with `tss_ptr` set. Each part of
 /// `iopb` is a live [`IOPB_PART_BYTES`]-byte block that no other CPU writes for
-/// the duration (the thread's `sched_lock` is held, or the thread is the
-/// caller's own and only it binds itself).
+/// the duration, and its generation names its bytes: the thread's `sched_lock`
+/// is held, which is what serialises every change of a bitmap's bytes and
+/// generation (a bind of the thread, or a withdrawal from any CPU).
 #[cfg(not(test))]
 pub unsafe fn load_iopb(iopb: Option<&ThreadIopb>)
 {
+    use core::sync::atomic::Ordering;
+
     // SAFETY: caller contract.
     let tss = unsafe { current_tss() };
-    // SAFETY: tss points to the current CPU's live TssWithIopb (contract).
-    let iopb_ptr = unsafe { core::ptr::addr_of_mut!((*tss).iopb) };
-    // SAFETY: interrupts disabled by caller, so this CPU does not reload the
-    // bitmap concurrently; other CPUs only store `iopb_offset`, atomically.
-    let tss_iopb = unsafe { &mut *iopb_ptr };
-    match iopb
+    let Some(src) = iopb
+    else
     {
-        Some(src) =>
-        {
-            for (dst, &part) in tss_iopb
-                .as_chunks_mut::<IOPB_PART_BYTES>()
-                .0
-                .iter_mut()
-                .zip(src.parts.iter())
-            {
-                // SAFETY: each part is a live IOPB_PART_BYTES block no other
-                // CPU writes meanwhile (caller contract).
-                dst.copy_from_slice(unsafe { &*part });
-            }
-        }
-        None => tss_iopb.fill(0xFF),
-    }
+        // No byte to publish: another CPU only ever stores this value too.
+        // SAFETY: tss is live.
+        unsafe { iopb_offset_of(tss) }.store(IOPB_OFFSET_INVALID, Ordering::Relaxed);
+        return;
+    };
+    // SAFETY: tss points to the current CPU's live TssWithIopb (contract).
+    let bitmap_ptr = unsafe { core::ptr::addr_of_mut!((*tss).iopb) };
+    // SAFETY: as above.
+    let held_ptr = unsafe { core::ptr::addr_of_mut!((*tss).held_generation) };
+    // SAFETY: interrupts disabled by caller, so this CPU does not reload the
+    // bitmap concurrently, and no other CPU writes the bitmap (they only store
+    // `iopb_offset`, atomically).
+    let bitmap = unsafe { &mut *bitmap_ptr };
+    // SAFETY: as for the bitmap: only this CPU, with interrupts disabled,
+    // reads or writes `held_generation`, which does not overlap it.
+    let held = unsafe { &mut *held_ptr };
+    // SAFETY: each part of src is live and unwritten meanwhile (contract).
+    unsafe { refresh_bitmap(bitmap, held, src) };
     // Release: the bitmap bytes precede the offset that makes them live.
     // SAFETY: tss is live.
-    unsafe { iopb_offset_of(tss) }.store(IOPB_OFFSET_VALID, core::sync::atomic::Ordering::Release);
+    unsafe { iopb_offset_of(tss) }.store(IOPB_OFFSET_VALID, Ordering::Release);
+}
+
+/// Make `bitmap`, a TSS bitmap last copied at generation `held` (0 for
+/// none), hold `src`: copy `src`'s parts into it, in order, unless `held` is
+/// already `src`'s generation, and record that generation in `held`.
+///
+/// A generation names one state of one thread's bitmap and is never reused or
+/// 0 ([`ThreadIopb::generation`]), so an equal `held` means `bitmap` already
+/// holds exactly `src`'s current bytes, and a reused thread or table address
+/// never matches a stale copy.
+///
+/// # Safety
+/// Each part of `src` is a live [`IOPB_PART_BYTES`]-byte block that nothing
+/// writes for the duration.
+unsafe fn refresh_bitmap(bitmap: &mut [u8; IOPB_SIZE], held: &mut u64, src: &ThreadIopb)
+{
+    if *held == src.generation
+    {
+        return;
+    }
+    for (dst, &part) in bitmap
+        .as_chunks_mut::<IOPB_PART_BYTES>()
+        .0
+        .iter_mut()
+        .zip(src.parts.iter())
+    {
+        // SAFETY: each part is a live IOPB_PART_BYTES block nothing writes
+        // meanwhile (caller contract).
+        dst.copy_from_slice(unsafe { &*part });
+    }
+    *held = src.generation;
 }
 
 /// Make every CPU reload its TSS I/O permission bitmap before its next ring-3
@@ -752,11 +804,12 @@ pub unsafe fn load_iopb(iopb: Option<&ThreadIopb>)
 /// `iopb_offset` to [`IOPB_OFFSET_INVALID`], so the next port access on each
 /// raises `#GP`, whose handler reloads the running thread's current bitmap
 /// ([`reload_invalidated_iopb`]) and retries the instruction. A CPU that
-/// context-switches in the meantime loads its incoming thread's bitmap (the
-/// all-denied one for a thread with no bindings) under that thread's
-/// `sched_lock` and marks it current, which is equally fresh; only the idle
-/// thread, which runs no ring-3 code, gets its all-denied bitmap outside a
-/// thread lock.
+/// context-switches in the meantime loads its incoming thread's bitmap under
+/// that thread's `sched_lock` and marks it current, which is equally fresh,
+/// or, for a thread with no bindings, leaves the offset invalid. Each CPU's
+/// copy is checked against the thread's bitmap generation, which every change
+/// of the bitmap advances under the same lock, so the reload copies a changed
+/// bitmap and only re-marks an unchanged one.
 /// The trailing fence makes the stores visible to every CPU before this
 /// returns, so no port access after the return reads a stale bitmap.
 #[cfg(not(test))]
@@ -817,22 +870,21 @@ pub unsafe fn reload_invalidated_iopb() -> bool
     // SAFETY: no lock is held (contract); the flags go to the unlock_raw below.
     let saved = unsafe { sched_lock.lock_raw() };
     // SAFETY: tcb is live, and its sched_lock, held, serialises the pointer
-    // against the withdrawal walk.
+    // against the bind and the withdrawal walk.
     let iopb = unsafe { (*tcb).iopb };
-    let reloaded = !iopb.is_null();
-    let bitmap = if reloaded
+    // A thread without port bindings runs with the offset invalid: its fault
+    // is genuine, and nothing is loaded.
+    // SAFETY: a non-null iopb is the thread's live bitmap, which no CPU
+    // rebuilds while its sched_lock is held.
+    let bitmap = unsafe { iopb.as_ref() };
+    let reloaded = bitmap.is_some();
+    if reloaded
     {
-        // SAFETY: a non-null iopb is the thread's live bitmap, which no CPU
-        // rebuilds while its sched_lock is held.
-        Some(unsafe { &*iopb })
+        // SAFETY: interrupts disabled (#GP context and the held lock); GS-base
+        // is valid; the bitmap's parts and generation are not written while
+        // the lock is held.
+        unsafe { load_iopb(bitmap) };
     }
-    else
-    {
-        None
-    };
-    // SAFETY: interrupts disabled (#GP context and the held lock); GS-base is
-    // valid; the bitmap's parts are not written while the lock is held.
-    unsafe { load_iopb(bitmap) };
     // SAFETY: paired with the lock_raw above.
     unsafe { sched_lock.unlock_raw(saved) };
     reloaded
@@ -911,6 +963,99 @@ mod tests
         assert!(u64::from(IOPB_OFFSET_INVALID) > limit);
         assert_eq!(core::mem::align_of::<TssWithIopb>() % 2, 0);
         assert_eq!(core::mem::offset_of!(Tss, iopb_offset) % 2, 0);
+    }
+
+    // Defect caught: the generation record placed inside the descriptor limit,
+    // where the CPU would read it as bitmap bytes or the terminator.
+    #[test]
+    fn held_generation_lies_past_the_descriptor_limit()
+    {
+        assert!(
+            core::mem::offset_of!(TssWithIopb, held_generation)
+                > core::mem::offset_of!(TssWithIopb, terminator)
+        );
+    }
+
+    /// A two-part bitmap whose bytes are `fill`, kept alive by the returned
+    /// parts.
+    fn thread_bitmap(fill: u8, generation: u64) -> (ThreadIopb, Vec<Box<[u8; IOPB_PART_BYTES]>>)
+    {
+        let mut parts: Vec<Box<[u8; IOPB_PART_BYTES]>> = (0..IOPB_PARTS)
+            .map(|_| Box::new([fill; IOPB_PART_BYTES]))
+            .collect();
+        let mut ptrs = [core::ptr::null_mut(); IOPB_PARTS];
+        for (p, b) in ptrs.iter_mut().zip(parts.iter_mut())
+        {
+            *p = core::ptr::from_mut(&mut **b);
+        }
+        (
+            ThreadIopb {
+                parts: ptrs,
+                generation,
+            },
+            parts,
+        )
+    }
+
+    // Defects caught: a copy skipped for a bitmap the TSS does not hold (a
+    // first load, or a changed generation), and a copy made for one it holds.
+    #[test]
+    fn refresh_bitmap_copies_only_a_generation_the_tss_does_not_hold()
+    {
+        let mut tss = Box::new([0xFFu8; IOPB_SIZE]);
+        let mut held = 0u64;
+        let (a, mut a_parts) = thread_bitmap(0x0F, 5);
+        // SAFETY: a's parts are live, written only below between calls.
+        unsafe { refresh_bitmap(&mut tss, &mut held, &a) };
+        assert!(tss.iter().all(|&b| b == 0x0F), "first load copies");
+        assert_eq!(held, 5);
+
+        // The same generation: the TSS bytes are left as they are, so a
+        // marker written into them survives.
+        tss[0] = 0xAA;
+        // SAFETY: as above.
+        unsafe { refresh_bitmap(&mut tss, &mut held, &a) };
+        assert_eq!(tss[0], 0xAA, "a held generation copies nothing");
+
+        // The bitmap changes, with a new generation: copied.
+        a_parts[1][7] = 0x00;
+        let a = ThreadIopb {
+            parts: a.parts,
+            generation: 6,
+        };
+        // SAFETY: as above.
+        unsafe { refresh_bitmap(&mut tss, &mut held, &a) };
+        assert_eq!(tss[0], 0x0F);
+        assert_eq!(tss[IOPB_PART_BYTES + 7], 0x00);
+        assert_eq!(held, 6);
+    }
+
+    // Defect caught (#1512, #1539): a stale TSS copy matched by a thread whose
+    // bitmap merely reuses an address. The key is the generation alone, so
+    // another bitmap at the same part addresses, with a generation of its own,
+    // is copied.
+    #[test]
+    fn refresh_bitmap_copies_another_bitmap_at_the_same_addresses()
+    {
+        let mut tss = Box::new([0xFFu8; IOPB_SIZE]);
+        let mut held = 0u64;
+        let (old, mut parts) = thread_bitmap(0x00, 7);
+        // SAFETY: the parts are live, written only below between calls.
+        unsafe { refresh_bitmap(&mut tss, &mut held, &old) };
+        for part in &mut parts
+        {
+            part.fill(0xFF);
+        }
+        let reused = ThreadIopb {
+            parts: old.parts,
+            generation: 8,
+        };
+        // SAFETY: as above.
+        unsafe { refresh_bitmap(&mut tss, &mut held, &reused) };
+        assert!(
+            tss.iter().all(|&b| b == 0xFF),
+            "the reused address's bitmap"
+        );
     }
 
     #[test]

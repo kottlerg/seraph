@@ -36,7 +36,7 @@ init-protocol/
 ├── README.md
 ├── fuzz/init-protocol/  # the fuzz target's checked-in inputs (docs/testing.md § Fuzzing)
 └── src/
-    ├── lib.rs           # InitInfo, CapDescriptor and CapType, InitModuleName,
+    ├── lib.rs           # InitInfo, CapDescriptor and CapType, InitModuleName, InitBootDevice,
     │                    #   InitFramebufferInfo, INIT_PROTOCOL_VERSION and the page-bound
     │                    #   constants, find_module_slot; its proof harnesses (docs/testing.md
     │                    #   § Bounded verification)

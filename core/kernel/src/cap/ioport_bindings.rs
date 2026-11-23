@@ -22,10 +22,29 @@
 //! that pool: the thread's dealloc returns it, and if the `CSpace` dies first
 //! its teardown does ([`free_tables_bound_to`]), each under the thread's
 //! `sched_lock`. The bitmap sits at offset 0,
-//! so the TCB's `iopb` pointer is the bitmap the context switch loads. On
-//! RISC-V the bitmap has no part and no thread ever binds.
+//! so the TCB's `iopb` pointer is the bitmap the context switch loads. Every
+//! change of the bitmap's bytes gives it a new generation ([`next_generation`]),
+//! which the context switch compares with the one its CPU's TSS holds to skip
+//! the copy of an unchanged bitmap. On RISC-V the bitmap has no part and no
+//! thread ever binds.
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::current::{IOPB_PART_BYTES, IOPB_PARTS, ThreadIopb};
+
+/// The last bitmap generation handed out ([`next_generation`]).
+static GENERATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// A bitmap generation no bitmap state has had: one past the last handed out,
+/// from 1. A TSS records generation 0 before it holds any thread's bitmap, and
+/// a 64-bit count taken once per bitmap change does not wrap back to it within
+/// a kernel's life, so a generation names one state of one bitmap for good: a
+/// thread or table freed and reallocated at the same address takes a fresh one
+/// with its first bitmap, and never matches a CPU's record of the old.
+fn next_generation() -> u64
+{
+    GENERATIONS.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+}
 
 /// One recorded binding: the `IoPort` object it was made through (its address,
 /// compared but never dereferenced) and the ports it grants.
@@ -83,9 +102,10 @@ pub struct TableFull;
 
 impl IoPortBindings
 {
-    /// Initialise a table in place: every port denied, no bindings, the
-    /// bitmap held in `parts`, all funded by `funder`, with the donation record
-    /// cells of the table's page and the parts' in `page_cells`.
+    /// Initialise a table in place: every port denied, at a fresh generation,
+    /// no bindings, the bitmap held in `parts`, all funded by `funder`, with the
+    /// donation record cells of the table's page and the parts' in
+    /// `page_cells`.
     ///
     /// # Safety
     /// `table` points at a writable page and each of `parts` at a writable
@@ -111,7 +131,10 @@ impl IoPortBindings
         // SAFETY: caller contract: `table` points at a writable page that
         // nothing else references; the fields are plain data.
         unsafe {
-            core::ptr::addr_of_mut!((*table).bitmap).write(ThreadIopb { parts });
+            core::ptr::addr_of_mut!((*table).bitmap).write(ThreadIopb {
+                parts,
+                generation: next_generation(),
+            });
             core::ptr::addr_of_mut!((*table).funder).write(funder);
             core::ptr::addr_of_mut!((*table).page_cells).write(page_cells);
             core::ptr::addr_of_mut!((*table).count).write(0);
@@ -153,8 +176,8 @@ impl IoPortBindings
     }
 
     /// Record a binding of `count` ports from `base` through `object` and
-    /// permit them. A binding already recorded for `object` is not recorded
-    /// twice.
+    /// permit them, at a new generation. A binding already recorded for
+    /// `object` is not recorded twice, and changes nothing.
     ///
     /// # Errors
     /// [`TableFull`] when [`MAX_IOPORT_BINDINGS`] bindings are already recorded.
@@ -178,11 +201,13 @@ impl IoPortBindings
         // `MAX_IOPORT_BINDINGS`.
         self.count = self.count.saturating_add(1);
         self.permit(base, count);
+        self.bitmap.generation = next_generation();
         Ok(())
     }
 
     /// Drop every binding made through `object` and rebuild the bitmap from
-    /// those that remain. Returns whether any binding was dropped.
+    /// those that remain, at a new generation. Returns whether any binding was
+    /// dropped; when none was, nothing changes.
     pub fn withdraw(&mut self, object: usize) -> bool
     {
         let before = self.count;
@@ -222,6 +247,7 @@ impl IoPortBindings
                 self.permit(r.base, r.count);
             }
         }
+        self.bitmap.generation = next_generation();
         true
     }
 }
@@ -426,6 +452,34 @@ mod tests
             permitted(t, 0xFFFF),
             "the other binding survives the rebuild"
         );
+    }
+
+    // Defects caught: a bitmap change that keeps its generation, which a CPU
+    // holding the old bytes would then take as current (a withdrawn port
+    // still permitted), and two tables sharing one, as a table reallocated at
+    // a freed one's address would.
+    #[test]
+    fn every_bitmap_change_and_every_table_takes_a_fresh_generation()
+    {
+        let mut a = table();
+        let mut b = table();
+        let a = &mut *a.table;
+        let b = &mut *b.table;
+        assert_ne!(a.bitmap.generation, 0);
+        assert_ne!(a.bitmap.generation, b.bitmap.generation);
+
+        let fresh = a.bitmap.generation;
+        a.bind(0xA000, 0x60, 1).unwrap();
+        let bound = a.bitmap.generation;
+        assert_ne!(bound, fresh, "a bind changes the generation");
+        a.bind(0xA000, 0x60, 1).unwrap();
+        assert_eq!(a.bitmap.generation, bound, "a rebind changes nothing");
+        assert!(!a.withdraw(0xB000));
+        assert_eq!(a.bitmap.generation, bound, "a no-op withdrawal neither");
+        assert!(a.withdraw(0xA000));
+        assert_ne!(a.bitmap.generation, bound, "a withdrawal changes it");
+        assert_ne!(a.bitmap.generation, fresh, "and never back to an old one");
+        assert_ne!(a.bitmap.generation, b.bitmap.generation);
     }
 
     #[test]

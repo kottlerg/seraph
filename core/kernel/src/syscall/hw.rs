@@ -738,8 +738,10 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// each binding) is taken from the pool of the target thread's own `CSpace`,
 /// three pages in all. The bind records the `IoPort` object it is
 /// made through and clears the range's bits (0 = allowed); freeing that object
-/// withdraws the binding (docs/capability-model.md § `IoPort`). On context
-/// switch the bitmap is copied into the TSS IOPB region. The install and the
+/// withdraws the binding (docs/capability-model.md § `IoPort`). A context
+/// switch into the thread copies the bitmap into the CPU's TSS IOPB region
+/// unless the TSS already holds it at its generation, which every bind that
+/// records a binding advances. The install and the
 /// edit run under the target's `sched_lock`, which the context-switch load
 /// also holds, so concurrent binds on one thread accumulate their permits and
 /// leak no table.

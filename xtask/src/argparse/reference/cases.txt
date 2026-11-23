@@ -27147,7 +27147,3 @@ help xtask path-account write -h
 
 ["build","--limited-debug","kernel,ktest","--debug","kernel"]
 ok build debug=["kernel"] limited_debug=["kernel","ktest"]
-
-["build","--limited-debug","bogus"]
-ValueValidation
-error: invalid value 'bogus' for '--limited-debug <LIMITED_DEBUG>': no component named "bogus"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, tpm, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, swapd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, entropyd, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester

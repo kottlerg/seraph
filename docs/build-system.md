@@ -334,6 +334,17 @@ whose bundle every pack composes, `init` or `ktest`, is recorded in
 `sysroot/.harness`: `cargo xtask build` records `init`, and
 `cargo xtask mkdisk --harness` the harness it is given.
 
+Cargo's own output stays in `target/`. The builds of the std-user programs compile `std`, with
+`core` and `alloc`, from the seraph toolchain mirror, `target/seraph-toolchain/`, which carries
+the `std` overlay ([`xtask/src/rust_src.rs`](../xtask/src/rust_src.rs)); every other build
+compiles `core` and `alloc` from the toolchain's own `rust-src`. The mirror's builds take
+`target/seraph-build/` as Cargo's build directory, and their binaries still land in
+`target/<triple>/<profile>/` with every other build's. Two builds of one library package from
+two source paths cannot share a build directory: a host build script, `compiler_builtins`'s among
+them, is one unit for every target, its fingerprint records the path it was built from, and each
+kind of build would find the other's path there and rebuild the script, `compiler_builtins` and
+`alloc` for every target. `cargo xtask clean --all` removes `target/`, both directories with it.
+
 ```
 sysroot/
   .arch                   # "x86_64" or "riscv64"

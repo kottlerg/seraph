@@ -19,7 +19,7 @@
 use crate::FramebufferInfo;
 use crate::bundle::{
     BODY_ALIGNMENT, BundleEntryHeader, BundleError, ENTRY_HEADER_SIZE, ENTRY_NAME_LEN, HEADER_SIZE,
-    MAGIC, VERSION, check_entry, entry_at, name_str, parse_header,
+    MAGIC, VERSION, check_entry, entry_at, name_str, parse_header, read_entry_header,
 };
 
 /// The most entry indices past the last one the slice can hold that the
@@ -50,8 +50,9 @@ pub fn boot_protocol_holds(input: &[u8])
         if let Ok(index) = u32::try_from(index)
         {
             entry_holds(input, index);
-            if let Some(entry) = entry_at(input, index)
+            if let Some((entry, raw)) = entry_place_holds(input, index)
             {
+                entry_header_holds(raw);
                 name_holds(&entry.name);
                 entry_check_holds(&entry, input.len());
             }
@@ -203,6 +204,28 @@ pub(crate) fn entry_check_holds(entry: &BundleEntryHeader, len: usize)
 /// with nothing left over.
 pub(crate) fn entry_holds(bytes: &[u8], index: u32)
 {
+    let Some((entry, raw)) = entry_place_holds(bytes, index)
+    else
+    {
+        return;
+    };
+    for (&read, &held) in entry.name.iter().zip(raw)
+    {
+        assert_eq!(read, held, "the name was misread");
+    }
+}
+
+/// The part of [`entry_holds`] that places the entry: [`entry_at`] answers
+/// exactly for an index below `entry_count` whose entry header lies whole in
+/// the slice, and the offset and size it reads are the little-endian words
+/// at that header's place. Returns the entry read and the
+/// [`ENTRY_HEADER_SIZE`] bytes at its place. [`entry_header_holds`] checks
+/// the decode of those bytes, the name's among them, on any bytes.
+pub(crate) fn entry_place_holds(
+    bytes: &[u8],
+    index: u32,
+) -> Option<(BundleEntryHeader, &[u8; ENTRY_HEADER_SIZE])>
+{
     let at = entry_offset(u64::from(index));
     let inside = at.saturating_add(ENTRY_HEADER_SIZE as u128) <= bytes.len() as u128;
     let listed = file_header(bytes).is_ok_and(|count| index < count);
@@ -213,7 +236,7 @@ pub(crate) fn entry_holds(bytes: &[u8], index: u32)
             !(listed && inside),
             "a listed entry inside the slice was not read"
         );
-        return;
+        return None;
     };
     assert!(
         listed && inside,
@@ -224,21 +247,37 @@ pub(crate) fn entry_holds(bytes: &[u8], index: u32)
         .get(at..)
         .and_then(<[u8]>::first_chunk::<ENTRY_HEADER_SIZE>);
     assert!(raw.is_some(), "an entry was read past the slice");
-    let Some(raw) = raw
-    else
-    {
-        return;
-    };
-    for (&read, &held) in entry.name.iter().zip(raw)
-    {
-        assert_eq!(read, held, "the name was misread");
-    }
+    let raw = raw?;
     assert_eq!(
         le64(raw, OFFSET_AT),
         Some(entry.offset),
         "the offset was misread"
     );
     assert_eq!(le64(raw, SIZE_AT), Some(entry.size), "the size was misread");
+    Some((entry, raw))
+}
+
+/// [`read_entry_header`] of any [`ENTRY_HEADER_SIZE`] bytes keeps its
+/// contract ([`BundleEntryHeader`]'s layout): the name is the first
+/// [`ENTRY_NAME_LEN`] bytes, each checked at its own index, then the offset
+/// and the size, little-endian.
+pub(crate) fn entry_header_holds(raw: &[u8; ENTRY_HEADER_SIZE])
+{
+    let entry = read_entry_header(raw);
+    for (&read, &held) in entry.name.iter().zip(raw)
+    {
+        assert_eq!(read, held, "the name was misdecoded");
+    }
+    assert_eq!(
+        le64(raw, OFFSET_AT),
+        Some(entry.offset),
+        "the offset was misdecoded"
+    );
+    assert_eq!(
+        le64(raw, SIZE_AT),
+        Some(entry.size),
+        "the size was misdecoded"
+    );
 }
 
 /// [`name_str`] of `name` is its bytes before the first NUL, or the whole

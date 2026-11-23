@@ -517,38 +517,18 @@ pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
 #[must_use]
 pub fn find_module_slot(names: &[InitModuleName], name: &[u8]) -> Option<u64>
 {
-    let mut lookup = Lookup::default();
-    for entry in names
-    {
-        lookup.consider(entry, name);
-    }
-    lookup.found
+    names
+        .iter()
+        .find(|entry| carries(entry, name))
+        .map(|entry| entry.slot)
 }
 
-/// The state of [`find_module_slot`]'s walk of a name table: the slot of the
-/// first entry so far that carries the requested name, if any. Each entry is
-/// one step ([`Lookup::consider`]), so the bounded proofs prove the walk by
-/// induction over the table (docs/testing.md § Bounded verification, Parser
-/// proofs).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Lookup
+/// Whether `entry` carries the module name `name`: its name, trimmed at its
+/// first NUL ([`module_name_str`]), is `name` whole. [`find_module_slot`]
+/// takes the first entry of the table for which this holds.
+fn carries(entry: &InitModuleName, name: &[u8]) -> bool
 {
-    /// The slot of the first entry considered whose name is the request.
-    found: Option<u64>,
-}
-
-impl Lookup
-{
-    /// Take one more entry: keep the slot already found, or take `entry`'s
-    /// when its name, trimmed at its first NUL ([`module_name_str`]), is
-    /// `name` whole.
-    fn consider(&mut self, entry: &InitModuleName, name: &[u8])
-    {
-        if self.found.is_none() && module_name_str(&entry.name) == name
-        {
-            self.found = Some(entry.slot);
-        }
-    }
+    module_name_str(&entry.name) == name
 }
 
 #[cfg(test)]
@@ -654,49 +634,55 @@ mod tests
 /// Bounded proofs of the module-name table parser's contract (docs/testing.md
 /// § Bounded verification, Parser proofs).
 ///
-/// [`find_module_slot`] walks a table of any length, so its walk is proven by
-/// induction: a base proof that it starts with nothing found, and a step
-/// proof that one [`Lookup::consider`] from any state keeps a slot already
-/// found and otherwise finds the entry's slot exactly when its name, trimmed
-/// at its first NUL, is the request whole. By induction from the base, the
-/// walk ends with the slot of the first entry named the request, or nothing,
-/// over a table of any length. The trim proof proves the trim on every name.
-/// What lies outside the proofs is the code that drives the steps: the loop
-/// of `find_module_slot` over the table, and the loop that hands the property
-/// its entries. The fuzz target `init-protocol` and the replay of the
-/// checked-in inputs check them with tables of up to eight entries.
+/// [`find_module_slot`] is core's `find` over the table's entries with
+/// [`carries`] as its test, which reads one entry and the request alone and
+/// carries nothing to the next entry. The base proof runs the whole function
+/// on the empty table, and the step proof proves the test on every entry and
+/// request; so a lookup finds the slot of the first entry the test takes, or
+/// nothing. The trim proof proves the trim on every name. What lies outside
+/// the proofs is the code that drives the test: `find`, its walk of a table
+/// of any length that stops at the first entry taken, and the loop that hands
+/// the property its entries. The fuzz target `init-protocol` and the replay of
+/// the checked-in inputs check them with tables of up to eight entries.
 #[cfg(kani)]
 mod proofs
 {
-    use super::{INIT_MODULE_NAME_LEN, InitModuleName, Lookup, property};
+    use super::{INIT_MODULE_NAME_LEN, InitModuleName, property};
 
-    /// Base of the walk: a lookup starts with nothing found. No loop.
+    /// The longest request the proofs take: one byte past the longest name
+    /// any entry can hold, so a request no name can equal is among them.
+    const MAX_REQUEST: usize = INIT_MODULE_NAME_LEN + 1;
+
+    /// Base of the walk: the empty table finds nothing, for every request.
+    /// The longest loop is the property's, over no entry, so an unwind bound
+    /// of 2 covers every loop.
     #[kani::proof]
-    fn a_lookup_starts_with_nothing_found()
+    #[kani::unwind(2)]
+    fn the_empty_table_finds_nothing()
     {
-        assert_eq!(Lookup::default(), Lookup { found: None });
+        let request: [u8; MAX_REQUEST] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= request.len());
+        property::lookup_holds(&[], &request[..len]);
     }
 
-    /// Step of the walk: from any state, nothing found or any slot, one more
-    /// entry of any slot and name, with every request of up to
-    /// `INIT_MODULE_NAME_LEN + 1` bytes, one past the longest name any entry
-    /// can hold, so a request no name can equal is among them, keeps the
-    /// step's contract. The longest loops are the step's trim and compare of
-    /// the 256-byte name and the property's byte-by-byte check of it, so an
-    /// unwind bound of 258 covers every loop.
+    /// Step of the walk: the test of one entry, of any slot and name, takes it
+    /// exactly when its trimmed name is the request whole, for every request
+    /// of up to `MAX_REQUEST` bytes. The longest loops are the trim and
+    /// compare of the 256-byte name and the property's byte-by-byte check of
+    /// it, so an unwind bound of 258 covers every loop.
     #[kani::proof]
     #[kani::unwind(258)]
-    fn each_entry_a_lookup_considers_keeps_the_first_match()
+    fn each_entry_the_lookup_tests_is_taken_by_its_name()
     {
-        let lookup = Lookup { found: kani::any() };
         let entry = InitModuleName {
             slot: kani::any(),
             name: kani::any(),
         };
-        let request: [u8; INIT_MODULE_NAME_LEN + 1] = kani::any();
+        let request: [u8; MAX_REQUEST] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= request.len());
-        property::step_holds(lookup, &entry, &request[..len]);
+        property::carries_holds(&entry, &request[..len]);
     }
 
     /// The trim of a table name holds on every name: it stops at the first

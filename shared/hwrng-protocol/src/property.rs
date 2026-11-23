@@ -89,7 +89,9 @@ pub(crate) fn request_holds(words: &[u64])
 /// [`MAX_READ_BYTES`], or one whose words after the count hold fewer bytes
 /// than it counts, and only those; otherwise it writes the counted bytes,
 /// little-endian from the word after the count, to the buffer's front and
-/// nothing past them. Each byte is checked at its own index.
+/// nothing past them. Each byte of the buffer is checked at its own index;
+/// no decode can reach a byte past the buffer, which is a slice of
+/// `out_len` bytes.
 pub(crate) fn reply_holds(words: &[u64], out_len: usize)
 {
     let mut out = [UNWRITTEN; MAX_OUT];
@@ -113,7 +115,7 @@ pub(crate) fn reply_holds(words: &[u64], out_len: usize)
         return;
     };
     let payload = words.get(1..).unwrap_or_default();
-    for (at, &byte) in out.iter().enumerate()
+    for (at, &byte) in out.get(..out_len).unwrap_or_default().iter().enumerate()
     {
         let word = at.checked_div(8).and_then(|index| payload.get(index));
         let sent = word.map(|word| word.to_le_bytes()).and_then(|bytes| {

@@ -597,57 +597,72 @@ mod proofs
         property::entry_check_holds(&entry, kani::any());
     }
 
-    /// The entry contract holds for entry `index` on the first `len` bytes
-    /// of any `MAX_LEN`-byte input, `len` up to it, with every count. The
-    /// index is a constant of each harness below, so the entry is read at a
-    /// fixed offset, and each harness checks one index, so no harness carries
-    /// another index's state. The entry's name is checked by the name proof,
-    /// which covers every name. The longest loop is the compare of the
-    /// 256-byte name the entry is read with, byte by byte at fixed indices,
-    /// so an unwind bound of 257 covers every loop.
-    fn entry_holds_at(index: u32)
+    /// The entry's place holds for entry `index` on the first `len` bytes of
+    /// any `MAX_LEN`-byte input, `len` up to it, with every count:
+    /// [`super::entry_at`] answers exactly when the index is listed and its
+    /// header lies whole in the slice, and reads the offset and size at that
+    /// header's place. The index is a constant of each harness below, so the
+    /// entry is read at a fixed offset, and each harness checks one index, so
+    /// no harness carries another index's state. The decode of the header's
+    /// bytes, its name among them, is the header-decode proof's, on any bytes;
+    /// `entry_at` hands that decode the one chunk whose offset and size words
+    /// this proof places. The longest loops are the compares of the 8-byte
+    /// magic, so an unwind bound of 9 covers every loop.
+    fn entry_place_holds_at(index: u32)
     {
         let bytes: [u8; MAX_LEN] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= MAX_LEN);
-        property::entry_holds(&bytes[..len], index);
+        let _ = property::entry_place_holds(&bytes[..len], index);
     }
 
-    /// The entry contract holds for the first entry, at byte `HEADER_SIZE`.
+    /// An entry header decodes from any [`ENTRY_HEADER_SIZE`] bytes as its
+    /// layout says: the name its first `ENTRY_NAME_LEN` bytes, then the offset
+    /// and the size, little-endian. The longest loop is the check of the
+    /// 256-byte name at fixed indices, so an unwind bound of 257 covers it.
     #[kani::proof]
     #[kani::unwind(257)]
+    fn every_entry_header_decodes_as_its_layout()
+    {
+        let raw: [u8; ENTRY_HEADER_SIZE] = kani::any();
+        property::entry_header_holds(&raw);
+    }
+
+    /// The entry's place holds for the first entry, at byte `HEADER_SIZE`.
+    #[kani::proof]
+    #[kani::unwind(9)]
     fn the_first_entry_holds_the_entry_contract()
     {
-        entry_holds_at(0);
+        entry_place_holds_at(0);
     }
 
-    /// The entry contract holds for the second entry, after one the input
+    /// The entry's place holds for the second entry, after one the input
     /// can hold whole.
     #[kani::proof]
-    #[kani::unwind(257)]
+    #[kani::unwind(9)]
     fn the_second_entry_holds_the_entry_contract()
     {
-        entry_holds_at(1);
+        entry_place_holds_at(1);
     }
 
-    /// The entry contract holds for index 2, the first whose entry header
+    /// The entry's place holds for index 2, the first whose entry header
     /// starts at or past byte `MAX_LEN`, the input's end. Every index from 2
     /// up lies past the input, so this harness and the one of `u32::MAX`, the
     /// last, stand for them.
     #[kani::proof]
-    #[kani::unwind(257)]
+    #[kani::unwind(9)]
     fn the_first_entry_past_the_input_holds_the_entry_contract()
     {
-        entry_holds_at(2);
+        entry_place_holds_at(2);
     }
 
-    /// The entry contract holds for `u32::MAX`, the last index, whose offset
+    /// The entry's place holds for `u32::MAX`, the last index, whose offset
     /// no `usize` arithmetic of the parser may wrap into the input.
     #[kani::proof]
-    #[kani::unwind(257)]
+    #[kani::unwind(9)]
     fn the_last_index_holds_the_entry_contract()
     {
-        entry_holds_at(u32::MAX);
+        entry_place_holds_at(u32::MAX);
     }
 
     /// The name contract holds on every name: the trim stops at the first

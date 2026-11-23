@@ -281,21 +281,37 @@ mod tests
 /// verification, Parser proofs).
 ///
 /// Each proof runs one of the property's checks on every input up to its
-/// bound, and the bounds hold every input the parsers distinguish: a reply's
-/// count word admits at most `MAX_READ_BYTES` bytes, which the
-/// `MSG_DATA_WORDS_MAX - 1` words after it carry, so the decoder reads no
-/// word past those and takes a longer slice as it takes one of
-/// `MSG_DATA_WORDS_MAX + 1` words; it writes no byte past the count, so a
-/// buffer longer than `MAX_READ_BYTES + 1` bytes is refused or filled as
-/// one of that length is; and a request's first word is all
-/// `requested_len` reads. The loop that hands the property its words lies
-/// outside the proofs: the fuzz target `hwrng-protocol` and the replay of the
-/// checked-in inputs check it.
+/// bound. The request proof covers every request: `requested_len` reads the
+/// first word alone. The decoder and the encoder walk a reply's words one at
+/// a time, and their proofs bound the walk: the decoder's at two words after
+/// the count, a whole word and a partial last one, with every count word (so
+/// a count past the buffer, past the words, and past `MAX_READ_BYTES` among
+/// them) and every buffer of up to one byte past those two words; the
+/// encoder's at every byte string of that length or shorter, three words
+/// after the count at most. Each word's bytes are packed and unpacked by the
+/// same code whatever its index, so the bounds leave out only the walks'
+/// longer runs: replies of three to `MSG_DATA_WORDS_MAX - 1` words after the
+/// count, buffers of 18 to `MAX_OUT` bytes, and byte strings of 18 to
+/// `MAX_READ_BYTES` bytes. Those, and the loop that hands the property its
+/// words, the fuzz target `hwrng-protocol` and the replay of the checked-in
+/// inputs check. The whole proofs of the longest reply run out of the memory
+/// `cargo xtask kani` gives a proof, and the inductive form over the words
+/// would need each word's packing and unpacking as a function of its own,
+/// a change to the parsers for the prover alone. The encoder's refusal of an
+/// over-long reply comes before any loop and is proven at its threshold.
 #[cfg(kani)]
 mod proofs
 {
     use super::MAX_READ_BYTES;
-    use super::property::{self, MAX_OUT, MAX_WORDS};
+    use super::property;
+
+    /// The most words after the count a bounded reply holds: a whole word and
+    /// a partial last one.
+    const WORDS_AFTER_COUNT: usize = 2;
+
+    /// The longest buffer a bounded reply is decoded into: one byte past the
+    /// bytes `WORDS_AFTER_COUNT` words carry.
+    const OUT_BOUND: usize = WORDS_AFTER_COUNT * 8 + 1;
 
     /// The request contract holds on every request: none, or a first word of
     /// any value. No loop.
@@ -308,38 +324,47 @@ mod proofs
         property::request_holds(&words[..len]);
     }
 
-    /// The reply contract holds on the first `len` of any `MAX_WORDS` words,
-    /// decoded into a buffer of every length up to `MAX_OUT`: every count,
-    /// every number of words after it, and a buffer short of, at, and past
-    /// the count. The longest loop is the check of the `MAX_OUT` bytes of the
-    /// buffer, so an unwind bound of `MAX_OUT + 1` (506) covers every loop.
+    /// The reply contract holds on the first `len` of any count word and
+    /// `WORDS_AFTER_COUNT` words after it, decoded into a buffer of every
+    /// length up to `OUT_BOUND`. The longest loop is the check of the
+    /// `OUT_BOUND` bytes of the buffer, so an unwind bound of
+    /// `OUT_BOUND + 1` (18) covers every loop.
     #[kani::proof]
-    #[kani::unwind(506)]
-    fn every_reply_holds_the_reply_contract()
+    #[kani::unwind(18)]
+    fn every_bounded_reply_holds_the_reply_contract()
     {
-        const _: () = assert!(MAX_OUT + 1 == 506);
-        let words: [u64; MAX_WORDS] = kani::any();
+        const _: () = assert!(OUT_BOUND + 1 == 18);
+        let words: [u64; WORDS_AFTER_COUNT + 1] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= words.len());
         let out_len: usize = kani::any();
-        kani::assume(out_len <= MAX_OUT);
+        kani::assume(out_len <= OUT_BOUND);
         property::reply_holds(&words[..len], out_len);
     }
 
     /// The encode contract holds on every byte string of up to
-    /// `MAX_READ_BYTES + 1` bytes, the longest a reply carries and one past
-    /// it, which the encoder refuses as it refuses any longer, before any
-    /// loop. With the reply proof, which covers the words an encode writes,
-    /// every encoded reply decodes to its bytes. The longest loops are the
-    /// encoder's and the check's walks of the at most `MSG_DATA_WORDS_MAX - 1`
-    /// (63) words after the count, so an unwind bound of 65 covers every loop.
+    /// `OUT_BOUND` bytes, which the encoder packs into at most
+    /// `WORDS_AFTER_COUNT + 1` words after the count, the last partial. With
+    /// the reply proof, every such encoded reply decodes to its bytes. The
+    /// longest loops are the packing of a word's 8 bytes, so an unwind bound
+    /// of 9 covers every loop.
     #[kani::proof]
-    #[kani::unwind(65)]
-    fn every_reply_encodes_to_its_words()
+    #[kani::unwind(9)]
+    fn every_bounded_reply_encodes_to_its_words()
     {
-        let bytes: [u8; MAX_READ_BYTES + 1] = kani::any();
+        let bytes: [u8; OUT_BOUND] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= bytes.len());
         property::encode_holds(&bytes[..len]);
+    }
+
+    /// The encoder refuses a reply one byte longer than `MAX_READ_BYTES`, of
+    /// any bytes, as it refuses every longer one: on its length alone, before
+    /// any loop.
+    #[kani::proof]
+    fn a_reply_past_the_largest_is_refused()
+    {
+        let bytes: [u8; MAX_READ_BYTES + 1] = kani::any();
+        property::encode_holds(&bytes);
     }
 }

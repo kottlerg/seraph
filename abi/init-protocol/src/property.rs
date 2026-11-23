@@ -12,7 +12,7 @@
 //! [`find_module_slot`] over the table the kernel copies from the boot
 //! modules' names, which the bundle carries.
 
-use crate::{INIT_MODULE_NAME_LEN, InitModuleName, Lookup, find_module_slot, module_name_str};
+use crate::{INIT_MODULE_NAME_LEN, InitModuleName, carries, find_module_slot, module_name_str};
 
 /// The most table entries an input is read as.
 const MAX_NAMES: usize = 8;
@@ -62,11 +62,10 @@ pub fn init_protocol_holds(input: &[u8])
         entry.slot = slot.try_into().map_or(0, u64::from_le_bytes);
         entry.name.copy_from_slice(name);
     }
-    let mut lookup = Lookup::default();
     for entry in names.get(..count).unwrap_or_default()
     {
         name_holds(&entry.name);
-        lookup = step_holds(lookup, entry, request);
+        carries_holds(entry, request);
     }
     lookup_holds(names.get(..count).unwrap_or_default(), request);
 }
@@ -122,24 +121,15 @@ pub(crate) fn name_holds(name: &[u8; INIT_MODULE_NAME_LEN])
     }
 }
 
-/// One step of [`find_module_slot`]'s walk keeps its contract
-/// ([`Lookup::consider`]'s doc): from `lookup`, taking `entry` keeps a slot
-/// already found, and otherwise finds `entry`'s slot exactly when its name
-/// stands for `request`. Returns the state after the step.
-pub(crate) fn step_holds(lookup: Lookup, entry: &InitModuleName, request: &[u8]) -> Lookup
+/// [`carries`], the test [`find_module_slot`] puts to each entry, takes
+/// `entry` exactly when its name stands for `request`.
+pub(crate) fn carries_holds(entry: &InitModuleName, request: &[u8])
 {
-    let expected = Lookup {
-        found: lookup
-            .found
-            .or_else(|| stands_for(&entry.name, request).then_some(entry.slot)),
-    };
-    let mut after = lookup;
-    after.consider(entry, request);
     assert_eq!(
-        after, expected,
-        "a step lost the first match or took another entry"
+        carries(entry, request),
+        stands_for(&entry.name, request),
+        "an entry was taken, or passed over, against its name"
     );
-    after
 }
 
 /// [`find_module_slot`] over `names` keeps its contract (its doc): it finds

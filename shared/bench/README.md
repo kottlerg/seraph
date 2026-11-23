@@ -25,6 +25,12 @@ bench/
 
 `no_std`, no allocation, no dependency. Host-tested (`cargo xtask test`).
 
+The counters, the architecture's name (`ARCH`) and `Report::write`, which writes that name,
+exist only on the architectures Seraph runs on and come with the default `counters` feature. A
+reader of result lines builds without it, on any host: xtask's `bench-check` and `bench-baseline`
+([xtask/README.md](../../xtask/README.md#cargo-xtask-bench-check)) take the crate with
+`default-features = false`.
+
 ---
 
 ## Counters

@@ -592,7 +592,7 @@ until it is re-composed.
 | `run_integration` | `bool` | `true` | Run Tier 2 (`src/integration/`) |
 | `run_stress` | `bool` | `true` | Run Tier S (`src/stress/`) |
 | `run_bench` | `bool` | `true` | Run Tier 3 (`src/bench/`) |
-| `bench_iters` | `u32` | `1000` | Number of iterations per benchmark, cut to `MAX_ITERS` (4096, [`src/bench/mod.rs`](src/bench/mod.rs)) |
+| `bench_iters` | `u32` | `8` | Number of iterations per benchmark, cut to `MAX_ITERS` (4096, [`src/bench/mod.rs`](src/bench/mod.rs)): a functional boot's Tier 3 is a smoke run that no check compares; `KtestConfig::BENCH` sets `MAX_ITERS` |
 
 The defaults are picked for CI: every tier runs, the VM exits cleanly
 on completion, and no human-watch grace period is added. To keep QEMU

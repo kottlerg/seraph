@@ -12,6 +12,7 @@ xtask/
 ├── clippy.toml                 # Clippy settings; frame threshold of a host thread's stack
 ├── README.md
 ├── baselines/
+│   ├── bench/                  # Checked-in benchmark baselines and bands (see bench-check)
 │   └── ktest-timing/           # Checked-in ktest timing baselines (see ktest-timing)
 ├── fuzz/                       # The fuzzing engine (engine/) and the fuzz targets (targets/);
 │                               #   see Sub-crates and § `cargo xtask fuzz`
@@ -27,6 +28,8 @@ xtask/
 │   ├── diag.rs                 # Diagnostics of the pull-request, record, and Issue checks
 │   ├── arch.rs                 # Supported architectures and per-arch constants
 │   ├── accel.rs                # Per-host QEMU acceleration-backend selection
+│   ├── benchmark.rs            # Benchmark runs, baselines, bands and their comparison
+│   │                           #   (bench-check, bench-baseline)
 │   ├── bundle.rs               # Bootloader bundle composition from the installed bundle lists
 │   ├── disk.rs                 # GPT disk-image construction from the sysroot
 │   ├── error.rs                # Error type with its context chain; Context, err!, bail!, ensure!
@@ -59,8 +62,9 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # Subcommand modules (build, capture_acpi, run (the
 │   │   │                       #   interactive boot; run/classified.rs, --runs),
-│   │   │                       #   ktest_timing, symbolize, mkdisk, clean, crypto_vectors, fuzz,
-│   │   │                       #   kani, compare_images, lint_docs, pr_check, review,
+│   │   │                       #   ktest_timing, bench_check, bench_baseline, symbolize,
+│   │   │                       #   mkdisk, clean, crypto_vectors, fuzz, kani,
+│   │   │                       #   compare_images, lint_docs, pr_check, review,
 │   │   │                       #   release_scope, issue, orch, hook, host, trust_request)
 │   │   └── test/               # `test`: the unit tests, the cases, the cells
 │   │       ├── mod.rs          # Dispatch: the unit tests, a case, a cell
@@ -229,7 +233,7 @@ cargo xtask run [--arch x86_64|riscv64] \
     [--riscv-zkr on|off] [--x86-paging 4|5] [--x86-shadow-stack off|on] \
     [--iommu attached|absent] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
-    [--debug-port PORT [--debug-target NAME]] [--test-devices] \
+    [--debug-port PORT [--debug-target NAME]] [--test-devices] [--icount] \
     [--display window|framebuffer|headless] [--debug-listen] [--gdb] [--verbose]
 
 cargo xtask run --runs N [launch options] [--display framebuffer|headless] [--debug-listen] \
@@ -257,6 +261,7 @@ The launch options, the same in both modes:
 | `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
 | `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the store file of the process binary's build id (`symbols/<build-id>.elf`) for symbols when a staged recipe or `programs/`/`services/` names it; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
 | `--test-devices` | Attach the test devices (see Attached devices): `edu` and five `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
+| `--icount` | Count instructions: QEMU runs the machine on single-threaded TCG (`-accel tcg,thread=single`) with `-icount shift=0,sleep=off,align=off`, so the guest's clock, and the cycle counters the benchmarks read, advance one tick per retired instruction and never with the host's time, and a benchmark's count repeats from run to run. Always TCG, whatever `SERAPH_ACCEL` says. On x86_64 the `-cpu` model also takes `-x2apic`: QEMU's icount cannot serve the x2APIC timer (`Bad icount read` once the kernel arms it), so the kernel runs its xAPIC paths. The bench cell's boots ([§ `cargo xtask bench-check`](#cargo-xtask-bench-check)); a functional boot does not take it |
 | `--display` | What the guest presents for display (see Attached devices): `window`, QEMU std VGA in a display window; `framebuffer`, the adapter with no window (`-display none`), on a host with or without a graphical backend, so the bootloader hands the kernel a GOP framebuffer and devmgr spawns the framebuffer driver: the framebuffer device cell ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers); `headless`, no adapter, so devmgr spawns no framebuffer driver. Default: `window` for the interactive boot, `headless` with `--runs`, which refuses `window` |
 | `--debug-listen` | Expose the guest's gdbstub without pausing it (QEMU `-s`, tcp::1234), so a wedged guest can be attached to post hoc: `gdb -ex 'target remote :1234'`. With `--runs`, requires `--parallel 1` (one gdbstub port). Conflicts with `--gdb` |
 
@@ -407,7 +412,7 @@ before the runs copy them, and removes it after the last run.
 | `--crash-reports` | (none) | Check the crash service's report blocks in each passing run's log: every block must be complete and hold the fields its kind, thread, and status require, read with `shared/crash-report`, the crate crashd emits them with ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)). `reports` also requires one `vm` and one `exception` block of the `crashme` fixture's main thread and one `exception` block of a `spawned` thread (its `worker` mode), found through the badge logd's `reclaim:` line names it by, each complete, its walk starting at its instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the block read the thread the kernel killed; the `vm` block's `addr` must also be the faulting address that dump prints (`cr2` on x86_64, `stval` on riscv64). `none` requires no block at all. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `none`, its usertest boot `reports`; the model is in [docs/testing.md](../docs/testing.md) § Crash reports |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
-| `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing` reads |
+| `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> icount=<on\|off> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing`, `bench-check` and `bench-baseline` read |
 
 The default `--fail` regex matches the cross-harness terminal marker
 `[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the
@@ -1645,6 +1650,81 @@ its log.
 
 ---
 
+### `cargo xtask bench-check`
+
+Compare the benchmark result lines of logs saved by `run --runs --save-logs` with the checked-in
+baselines of their mode and architecture: CI's `bench` cell's gate
+([docs/testing.md](../docs/testing.md#benchmarks-bench-cell) § Benchmarks).
+
+```
+cargo xtask bench-check --mode icount|host [--baselines DIR] [--write-env FILE] LOG...
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--mode` | | `icount`: instruction counts, from boots under `run --icount`; `host`: time, from x86_64 boots under a native accelerator |
+| `--baselines` | `xtask/baselines/bench` | The baselines root, which holds `<mode>/<arch>/` |
+| `--write-env` | | Write this host's environment to `FILE`, in the `ENV` file's format below |
+| `LOG...` | | The saved logs, one per run, all of one architecture; each must carry the trailer of a passing run of the mode (`icount=on` for `icount`; `icount=off` and an accelerator other than `tcg` for `host`) |
+
+A measurement is a result line's `<suite>.<name>` and variant parameters
+([shared/bench/README.md § Result line](../shared/bench/README.md#result-line)) at one CPU count.
+Its value over the logs is the lowest of their p50s, so one slow run never moves it. Each is
+compared with its baseline's p50 and given a verdict: `ok` within its band, `REGRESSED` or
+`IMPROVED` past it, `NEW` with no baseline, `MISSING` with a baseline no log measured,
+`PARTIAL` when some of the logs at its CPU count lack it, `UNIT` when its unit is not its
+baseline's, `NO-BAND` in host mode when `BANDS` has no line for it. The report is a table of
+every measurement, its verdict, whether it gates, its baseline, its lowest p50, the change, and
+its band, then one `FAIL:` line per gating measurement whose verdict is not `ok`, with its remedy,
+then a `WARNING:` line per key of the stored `ENV` whose value differs here.
+
+- **icount.** The band is the larger of 1% of the baseline (rounded up) and 8 instructions. A
+  one-CPU measurement gates; a measurement at more CPUs is reported only, since the interleaving
+  of its CPUs moves its count. The command fails when a gating measurement's verdict is not `ok`
+  (an `IMPROVED` count included: its stale baseline would pass a later regression of the same
+  size) or a benchmark logged a `ktest: bench <name> FAIL` line.
+- **host.** Each measurement's band is its line in `BANDS`, a percentage of its baseline,
+  calibrated on the reference host (`<suite>.<name> [<variant> ...] cpus=<k> band=<percent>`).
+  Nothing gates: the command reports and succeeds.
+
+**Baseline format.** `xtask/baselines/bench/<mode>/<arch>/<suite>.<name>`, one file per
+benchmark: `#` comment lines, then one line per measurement,
+`[<key>=<word> ...] cpus=<k> unit=<cycles|insns> p50=<v>`, the variant parameters first in their
+line's order. Beside them, `ENV` records the environment the counts were measured in as
+`key<TAB>value` lines: `rustc` (`rustc -V`) and `qemu` (the first line of
+`qemu-system-<arch> --version`), and in host mode `host-cpu`, `host-kernel` and `accel` as
+`ktest-timing`'s baseline records them. A baseline is never edited by hand:
+`cargo xtask bench-baseline` writes it.
+
+---
+
+### `cargo xtask bench-baseline`
+
+Rewrite the benchmark baselines: the icount baselines of both architectures from the `bench`
+cell's artifacts of a CI run, or the host-mode baselines from saved logs of this host.
+
+```
+cargo xtask bench-baseline --from-run ID [--all] [--baselines DIR]
+cargo xtask bench-baseline --host [--all] [--baselines DIR] LOG...
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--from-run` | | Download the artifacts `bench-x86_64` and `bench-riscv64` of CI run `ID` (`gh run download`, into `target/xtask/bench-baseline/<ID>/`) and rewrite each architecture's icount baselines from its logs |
+| `--host` | | Rewrite the host-mode baselines of the logs' architecture from `LOG...` |
+| `--all` | off | Rewrite every baseline file of the mode and architecture, and its `ENV` |
+| `--baselines` | `xtask/baselines/bench` | The baselines root |
+
+The logs are read as `bench-check` reads them, and must be complete: a benchmark's `FAIL` line or a
+`PARTIAL` measurement refuses the rewrite. Without `--all`, a benchmark's file is rewritten when
+one of its gating measurements (in host mode, any of them) is past its band, has no baseline, or is
+no longer measured, and is removed when none of its measurements remains; each rewritten file holds
+every measurement of its benchmark at its lowest p50. The `ENV` file is written when `--all` is
+given or it does not exist: the cell's own, from its artifact, with `--from-run`; this host's with
+`--host`. The command prints each file it wrote or removed.
+
+---
+
 ### `cargo xtask symbolize`
 
 Resolve runtime addresses in a loaded ELF image to function, file, and line, without a debugger.
@@ -2346,7 +2426,7 @@ error prints no `tip:` lines. An argument that is not valid UTF-8 is refused wit
 `InvalidUtf8` error wherever it stands, a path value among them, which clap passed on as its
 bytes.
 
-`src/argparse/reference/` holds the evidence: every help screen of the table (95), and 7244 command
+`src/argparse/reference/` holds the evidence: every help screen of the table (99), and 7260 command
 lines with their outcome (the command and the values parsed, or the error's kind and message),
 recorded from clap 4.6 before the parser replaced it. `cargo xtask test` parses each command line
 and prints each screen through the table, and fails on any difference. A change to the table that

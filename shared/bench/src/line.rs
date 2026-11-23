@@ -27,6 +27,7 @@
 
 use core::fmt;
 
+#[cfg(feature = "counters")]
 use crate::arch::current::ARCH;
 use crate::stats::Summary;
 
@@ -255,7 +256,9 @@ impl Report<'_>
     ///
     /// The rule the report breaks ([`Report::validate`]), or
     /// [`LineError::Write`] when `out` fails, which can leave part of the
-    /// line written.
+    /// line written. Built with the `counters` feature, which gives the
+    /// architecture the line names.
+    #[cfg(feature = "counters")]
     pub fn write<W: fmt::Write + ?Sized>(&self, out: &mut W) -> Result<(), LineError>
     {
         self.validate()?;
@@ -263,6 +266,7 @@ impl Report<'_>
     }
 
     /// Write the line of a validated report.
+    #[cfg(feature = "counters")]
     fn write_unchecked<W: fmt::Write + ?Sized>(&self, out: &mut W) -> fmt::Result
     {
         write!(out, "{TAG} {}.{}", self.suite, self.name)?;

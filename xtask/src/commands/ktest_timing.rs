@@ -192,7 +192,7 @@ fn host_headers(timing: &Timing) -> Result<Vec<(String, String)>>
     ])
 }
 
-fn first_line(program: &str, args: &[&str]) -> String
+pub(crate) fn first_line(program: &str, args: &[&str]) -> String
 {
     Command::new(program)
         .args(args)
@@ -207,7 +207,7 @@ fn first_line(program: &str, args: &[&str]) -> String
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn host_cpu() -> String
+pub(crate) fn host_cpu() -> String
 {
     let model = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
@@ -225,7 +225,7 @@ fn host_cpu() -> String
 /// The KVM module parameters that move cross-CPU timing (interrupt
 /// virtualisation, pause-loop exiting, halt polling), appended to `kvm`; any
 /// other accelerator by name alone.
-fn accel_settings(accel: &str) -> String
+pub(crate) fn accel_settings(accel: &str) -> String
 {
     if accel != "kvm"
     {

@@ -5,6 +5,8 @@
 
 //! Re-exports all subcommand modules.
 
+pub mod bench_baseline;
+pub mod bench_check;
 pub mod build;
 pub mod capture_acpi;
 pub mod clean;

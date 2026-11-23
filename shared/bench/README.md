@@ -77,7 +77,7 @@ The line is a single line of space-separated tokens, wrapped above for width onl
 
 | Part | Meaning |
 |---|---|
-| `<suite>` | The program that ran the benchmark: `ktest`, `fsbench`, `demandpaged` |
+| `<suite>` | The program that ran the benchmark: `ktest`, `fsbench`, `ubench` |
 | `<name>` | The benchmark within the suite |
 | Variant parameters | The case of the benchmark that ran (`pages=32`, `op=unmap`); before `arch=` |
 | `arch=` | The architecture the reporting program is built for: `x86_64` or `riscv64` |

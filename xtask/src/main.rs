@@ -69,6 +69,7 @@ mod guest;
 mod host_lock;
 mod image_check;
 mod path_account;
+mod path_record;
 mod qemu;
 mod qemu_gdb;
 mod qmp;

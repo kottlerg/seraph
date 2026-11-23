@@ -1332,16 +1332,28 @@ pub(crate) fn install_names(arch: Arch) -> Vec<String>
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Clippy-gate the host crates (`xtask`, `seraph-wrapper-shim`) under the
+/// Clippy-gate the host crates (`xtask`, `seraph-wrapper-shim`,
+/// `seraph-path-account-plugin`) under the
 /// workspace deny-lints. The sysroot crates are linted per-component via the
 /// seraph-toolchain path in `clippy_check_ext`; the host crates build with the
 /// plain host toolchain, which a rustc-only build never clippy-checks. Runs
-/// `cargo clippy -p xtask -p seraph-wrapper-shim -- -D warnings`, then the
+/// `cargo clippy -p xtask -p seraph-wrapper-shim -p seraph-path-account-plugin
+/// -- -D warnings`, then the
 /// same over the code only `cargo xtask fuzz` compiles: the fuzz engine, the
 /// fuzz targets and the parsers' property modules, with `--cfg fuzzing`.
 fn clippy_host(ctx: &BuildContext) -> Result<()>
 {
-    clippy_check(ctx, &["-p", "xtask", "-p", "seraph-wrapper-shim"])?;
+    clippy_check(
+        ctx,
+        &[
+            "-p",
+            "xtask",
+            "-p",
+            "seraph-wrapper-shim",
+            "-p",
+            "seraph-path-account-plugin",
+        ],
+    )?;
     clippy_check_ext(
         ctx,
         &["-p", "fuzz-engine", "-p", "fuzz-targets", "-p", "vfsd-gpt"],

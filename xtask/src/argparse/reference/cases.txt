@@ -27112,10 +27112,11 @@ ok run cpus=["1"] icount runs=["3"]
 help-on-missing xtask path-account -h
 
 ["path-account","trace","--reference","a.log"]
-ok-all path-account trace arch=default["x86_64"] release=default iteration=default["64"] reference=["a.log"] timeout=default["3600"] host_override=default alone=default timing=default
+ok-all path-account trace arch=default["x86_64"] release=default reference=["a.log"] timeout=default["3600"] reuse=default host_override=default alone=default timing=default
 
 ["path-account","trace","--arch","riscv64","--release","--iteration","32","--timeout","600","--wait-host","1800","--alone","--reference","a","--reference","b"]
-ok path-account trace arch=["riscv64"] release iteration=["32"] reference=["a","b"] timeout=["600"] wait_host=["1800"] alone
+UnknownArgument
+error: unexpected argument '--iteration' found
 
 ["path-account","trace"]
 MissingRequiredArgument
@@ -27123,18 +27124,19 @@ error: the following required arguments were not provided:
   --reference <LOG>
 
 ["path-account","trace","--reference","a","--iteration","x"]
-ValueValidation
-error: invalid value 'x' for '--iteration <ITERATION>': invalid digit found in string
+UnknownArgument
+error: unexpected argument '--iteration' found
 
 ["path-account","trace","--reference","a","--timing","--alone"]
 ArgumentConflict
 error: the argument '--timing' cannot be used with '--alone'
 
 ["path-account","write"]
-ok-all path-account write doc=default["core/kernel/docs/hot-path-account.md"]
+ok-all path-account write
 
 ["path-account","write","--doc","d.md"]
-ok path-account write doc=["d.md"]
+UnknownArgument
+error: unexpected argument '--doc' found
 
 ["path-account","-h"]
 help xtask path-account -h

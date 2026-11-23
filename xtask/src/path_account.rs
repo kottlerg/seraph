@@ -4,56 +4,18 @@
 // xtask/src/path_account.rs
 
 //! The per-path instruction account's logic, for `cargo xtask path-account`:
-//! the counter reads a stepped trace holds, the window between the two whose
-//! difference is the sample ktest recorded, the attribution of the window's
+//! the images a traced boot placed and where, the attribution of a window's
 //! instructions to functions, the result file of one configuration, and the
 //! Markdown block that sets the configurations side by side.
 //!
 //! xtask/README.md (`cargo xtask path-account`) states the method and its
-//! checks; `commands::path_account` drives the boot and reads the files.
+//! checks; `crate::path_record` reads the plugin's record into windows, and
+//! `commands::path_account` drives the boot and reads the files.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::ops::Range;
 
-use crate::arch::Arch;
 use crate::error::{Result, bail, ensure};
-
-/// Where a counter read leaves the counter: `rdtsc` in EDX:EAX, `csrr cycle`
-/// in one integer register.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CounterDest
-{
-    /// x86-64 `rdtsc`: the high half in EDX, the low half in EAX.
-    EdxEax,
-    /// riscv64 `csrr rd, cycle`: the whole counter in `x<rd>`.
-    Register(u8),
-}
-
-/// The counter read the instruction whose first bytes are `bytes` makes, if
-/// it is one: `rdtsc` (`0f 31`) on x86-64, `csrrs rd, cycle, x0` on riscv64,
-/// the two reads `shared/bench` makes. `bytes` starts at an instruction
-/// boundary, as a stepped program counter does.
-pub fn counter_read(arch: Arch, bytes: &[u8]) -> Option<CounterDest>
-{
-    match arch
-    {
-        Arch::X86_64 => bytes
-            .starts_with(&[0x0f, 0x31])
-            .then_some(CounterDest::EdxEax),
-        Arch::Riscv64 =>
-        {
-            let word = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
-            let opcode = word & 0x7f;
-            let funct3 = (word >> 12) & 0x7;
-            let rs1 = (word >> 15) & 0x1f;
-            let csr = word >> 20;
-            let rd = u8::try_from((word >> 7) & 0x1f).ok()?;
-            (opcode == 0x73 && funct3 == 0b010 && rs1 == 0 && csr == 0xc00 && rd != 0)
-                .then_some(CounterDest::Register(rd))
-        }
-    }
-}
 
 /// The frame an instruction is counted against: the innermost of `frames`
 /// (innermost first) that is not the standard library's, so an inlined
@@ -94,102 +56,87 @@ pub fn is_library(path: &str) -> bool
     PRIMITIVES.contains(&ty)
 }
 
-/// One stepped instruction: its program counter, and the counter value it
-/// read when it is a counter read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Step
+/// The image name of the kernel's instructions.
+pub const KERNEL: &str = "kernel";
+
+/// The image name of an instruction no image covers.
+pub const OTHER: &str = "other";
+
+/// One image a boot placed: the name its placement line gives it, and the
+/// offset of its runtime addresses from its link addresses (the kernel's
+/// KASLR slide, a process's load bias).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placement
 {
-    pub pc: u64,
-    pub counter: Option<u64>,
+    pub name: String,
+    pub bias: u64,
 }
 
-/// The steps of the measured window: from the counter read that opened it to
-/// the one that closed it, the closing read excluded, so the window holds the
-/// instructions the counter advanced over.
-///
-/// The window is the one pair of counter reads in `steps` whose values differ
-/// by `sample`, the value ktest recorded for the iteration.
-///
-/// # Errors
-///
-/// No pair or several pairs differ by `sample`; or the pair that does lies a
-/// different number of steps apart than the counter advanced, so the stepped
-/// path is not the one the counter measured.
-pub fn window(steps: &[Step], sample: u64) -> Result<Range<usize>>
+/// The hexadecimal number after `field` in `line`, up to the next space.
+fn hex_after(line: &str, field: &str) -> Option<u64>
 {
-    let reads: Vec<(usize, u64)> = steps
-        .iter()
-        .enumerate()
-        .filter_map(|(at, step)| Some((at, step.counter?)))
-        .collect();
-    let mut found = Vec::new();
-    for (n, &(open, from)) in reads.iter().enumerate()
-    {
-        for &(close, to) in reads.iter().skip(n.saturating_add(1))
-        {
-            if to.wrapping_sub(from) == sample
-            {
-                found.push(open..close);
-            }
-        }
-    }
-    let window = match found.as_slice()
-    {
-        [one] => one.clone(),
-        [] => bail!(
-            "no two of the {} counter reads stepped differ by the sample {sample}",
-            reads.len()
-        ),
-        several => bail!(
-            "{} pairs of counter reads differ by the sample {sample}",
-            several.len()
-        ),
-    };
-    let stepped = u64::try_from(window.len())?;
-    ensure!(
-        stepped == sample,
-        "{stepped} instructions were stepped between the counter reads, which advanced by \
-         {sample}: the stepped path is not the measured one"
-    );
-    Ok(window)
+    let (_, rest) = line.split_once(field)?;
+    let digits = rest.split_whitespace().next()?;
+    u64::from_str_radix(digits.trim_start_matches("0x"), 16).ok()
 }
 
-/// The image an instruction lies in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Image
+/// The images a boot's serial log places, in the order it placed them: the
+/// kernel at its slide (`kaslr: slide=`), the init image (`init: PIE bias=`),
+/// named `init` (ktest, in the ktest harness), memmgr and procmgr, which init
+/// loads, and each process procmgr creates (`spawn image bias=0x.. (<name>)`).
+/// A process created without a name takes the name of the service svcmgr
+/// logged it was launching (`svcmgr: launching: <name>`) just before; one
+/// with neither has no placement, and its instructions are no image's.
+pub fn placements(lines: &[String], init: &str) -> Vec<Placement>
 {
-    /// The kernel.
-    Kernel,
-    /// ktest, the benchmark program: its loop, the syscall wrappers and the
-    /// counter reads.
-    Ktest,
-    /// Neither: the firmware, or code no image covers.
-    Other,
-}
-
-impl Image
-{
-    /// The image's name in the result file and the account.
-    pub const fn name(self) -> &'static str
+    let mut out = Vec::new();
+    let mut launching: Option<String> = None;
+    for line in lines
     {
-        match self
+        let named = |name: &str, field: &str| {
+            hex_after(line, field).map(|bias| Placement {
+                name: name.to_owned(),
+                bias,
+            })
+        };
+        let found = if line.contains("kaslr: slide=")
         {
-            Self::Kernel => "kernel",
-            Self::Ktest => "ktest",
-            Self::Other => "other",
+            named(KERNEL, "slide=")
         }
-    }
-
-    fn from_name(name: &str) -> Option<Self>
-    {
-        match name
+        else if line.contains("init: PIE bias=")
         {
-            "kernel" => Some(Self::Kernel),
-            "ktest" => Some(Self::Ktest),
-            "other" => Some(Self::Other),
-            _ => None,
+            named(init, "bias=")
         }
+        else if line.contains("init: memmgr image bias=")
+        {
+            named("memmgr", "bias=")
+        }
+        else if line.contains("init: procmgr image bias=")
+        {
+            named("procmgr", "bias=")
+        }
+        else if let Some((_, service)) = line.split_once("svcmgr: launching: ")
+        {
+            launching = Some(service.trim().to_owned());
+            None
+        }
+        else if line.contains("spawn image bias=")
+        {
+            let pending = launching.take();
+            line.rsplit_once(" (")
+                .and_then(|(_, name)| name.strip_suffix(')'))
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .or(pending)
+                .and_then(|name| named(&name, "bias="))
+        }
+        else
+        {
+            None
+        };
+        out.extend(found);
     }
+    out
 }
 
 /// The function an instruction belongs to: its image, and the innermost
@@ -197,7 +144,8 @@ impl Image
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Place
 {
-    pub image: Image,
+    /// [`KERNEL`], [`OTHER`], or the name of the process image.
+    pub image: String,
     pub function: String,
 }
 
@@ -211,27 +159,36 @@ pub struct Tally
 
 impl Tally
 {
-    /// Tally the program counters `pcs`, each attributed by `place`.
-    pub fn of(pcs: impl IntoIterator<Item = u64>, mut place: impl FnMut(u64) -> Place) -> Self
+    /// Tally `(address, count)` pairs, each address attributed by `place`.
+    pub fn of(
+        counts: impl IntoIterator<Item = (u64, u64)>,
+        mut place: impl FnMut(u64) -> Place,
+    ) -> Self
     {
         let mut tally = Self::default();
-        for pc in pcs
+        for (pc, n) in counts
         {
-            tally.total = tally.total.saturating_add(1);
+            tally.total = tally.total.saturating_add(n);
             let count = tally.by_place.entry(place(pc)).or_insert(0);
-            *count = count.saturating_add(1);
+            *count = count.saturating_add(n);
         }
         tally
     }
 
     /// The instructions of `image`.
-    pub fn of_image(&self, image: Image) -> u64
+    pub fn of_image(&self, image: &str) -> u64
     {
         self.by_place
             .iter()
             .filter(|(place, _)| place.image == image)
             .map(|(_, &count)| count)
             .fold(0, u64::saturating_add)
+    }
+
+    /// The images of the tally.
+    fn images(&self) -> impl Iterator<Item = &str>
+    {
+        self.by_place.keys().map(|p| p.image.as_str())
     }
 }
 
@@ -240,13 +197,14 @@ impl Tally
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Path
 {
-    /// The measurement, as `bench-check` names it (`ktest.<name> [variant] cpus=1`).
+    /// The measurement, as `bench-check` names it (`<suite>.<name> [variant] cpus=1`).
     pub key: String,
     /// The p50 of the boot that was traced.
     pub p50: u64,
     /// The reference count: the lowest p50 of the reference logs.
     pub reference: u64,
-    /// The sample index traced.
+    /// The sample traced: its index, from 0, among the measurement's samples
+    /// in the order the benchmark took them.
     pub iteration: u32,
     pub tally: Tally,
 }
@@ -303,12 +261,7 @@ impl Configuration
             );
             for (place, count) in &path.tally.by_place
             {
-                let _ = writeln!(
-                    out,
-                    "fn\t{}\t{}\t{count}",
-                    place.image.name(),
-                    place.function
-                );
+                let _ = writeln!(out, "fn\t{}\t{}\t{count}", place.image, place.function);
             }
         }
         out
@@ -351,16 +304,12 @@ impl Configuration
                     {
                         bail!("{line:?}: a function before any path");
                     };
-                    let Some(image) = Image::from_name(image)
-                    else
-                    {
-                        bail!("{line:?}: unknown image");
-                    };
+                    ensure!(!image.is_empty(), "{line:?}: no image");
                     let count = number(count, line)?;
                     path.tally.total = path.tally.total.saturating_add(count);
                     path.tally.by_place.insert(
                         Place {
-                            image,
+                            image: (*image).to_owned(),
                             function: (*function).to_owned(),
                         },
                         count,
@@ -432,12 +381,8 @@ pub fn render_block(configs: &[Configuration]) -> String
     header(&mut out, "Path", "Image", configs);
     for key in &keys
     {
-        for image in [
-            None,
-            Some(Image::Ktest),
-            Some(Image::Kernel),
-            Some(Image::Other),
-        ]
+        let images = total_images(configs, key);
+        for image in std::iter::once(None).chain(images.iter().map(|i| Some(i.as_str())))
         {
             let cells: Vec<Option<u64>> = configs
                 .iter()
@@ -446,12 +391,12 @@ pub fn render_block(configs: &[Configuration]) -> String
                     Some(image.map_or(path.tally.total, |i| path.tally.of_image(i)))
                 })
                 .collect();
-            if image == Some(Image::Other) && cells.iter().all(|c| matches!(c, None | Some(0)))
-            {
-                continue;
-            }
-            let label = image.map_or("all", Image::name);
-            row(&mut out, &format!("`{key}`"), label, &cells);
+            row(
+                &mut out,
+                &format!("`{key}`"),
+                image.unwrap_or("all"),
+                &cells,
+            );
         }
     }
     for key in &keys
@@ -475,7 +420,7 @@ pub fn render_block(configs: &[Configuration]) -> String
                 row(
                     &mut out,
                     &format!("`{}`", place.function),
-                    place.image.name(),
+                    &place.image,
                     &cells,
                 );
                 continue;
@@ -517,6 +462,30 @@ fn path_keys(configs: &[Configuration]) -> Vec<String>
         }
     }
     keys
+}
+
+/// The images of path `key`'s totals, after its row of all instructions:
+/// the benchmark program's (the image named as the key's suite), the other
+/// processes' by name, the kernel's, then the instructions no image covers;
+/// each only when some configuration ran an instruction in it.
+fn total_images(configs: &[Configuration], key: &str) -> Vec<String>
+{
+    let suite = key.split('.').next().unwrap_or_default();
+    let present: std::collections::BTreeSet<&str> = configs
+        .iter()
+        .filter_map(|c| c.paths.iter().find(|p| p.key == key))
+        .flat_map(|p| p.tally.images())
+        .collect();
+    let rank = |image: &str| match image
+    {
+        i if i == suite => 0,
+        KERNEL => 2,
+        OTHER => 3,
+        _ => 1,
+    };
+    let mut images: Vec<&str> = present.into_iter().collect();
+    images.sort_by_key(|i| (rank(i), *i));
+    images.into_iter().map(str::to_owned).collect()
 }
 
 /// The functions of path `key` with each configuration's count, the largest
@@ -623,77 +592,6 @@ mod tests
 {
     use super::*;
 
-    fn step(pc: u64, counter: Option<u64>) -> Step
-    {
-        Step { pc, counter }
-    }
-
-    /// Steps 0..n, with counter reads at the given indices and values.
-    fn steps(n: u64, reads: &[(u64, u64)]) -> Vec<Step>
-    {
-        (0..n)
-            .map(|i| step(i, reads.iter().find(|(at, _)| *at == i).map(|(_, v)| *v)))
-            .collect()
-    }
-
-    #[test]
-    fn rdtsc_is_a_counter_read_on_x86_64_only()
-    {
-        assert_eq!(
-            counter_read(Arch::X86_64, &[0x0f, 0x31, 0x48, 0x89]),
-            Some(CounterDest::EdxEax)
-        );
-        assert_eq!(counter_read(Arch::X86_64, &[0x0f, 0x05]), None);
-        assert_eq!(counter_read(Arch::Riscv64, &[0x0f, 0x31, 0x00, 0x00]), None);
-    }
-
-    #[test]
-    fn csrr_cycle_is_a_counter_read_on_riscv64()
-    {
-        // csrr a0, cycle = csrrs x10, 0xc00, x0.
-        let word: u32 = (0xc00 << 20) | (0b010 << 12) | (10 << 7) | 0x73;
-        assert_eq!(
-            counter_read(Arch::Riscv64, &word.to_le_bytes()),
-            Some(CounterDest::Register(10))
-        );
-        // csrr a0, time (0xc01) is not the cycle counter.
-        let time: u32 = (0xc01 << 20) | (0b010 << 12) | (10 << 7) | 0x73;
-        assert_eq!(counter_read(Arch::Riscv64, &time.to_le_bytes()), None);
-        // A read into x0 is discarded.
-        let zero: u32 = (0xc00 << 20) | (0b010 << 12) | 0x73;
-        assert_eq!(counter_read(Arch::Riscv64, &zero.to_le_bytes()), None);
-        // A csrrs that sets bits (rs1 != x0) is not a plain read.
-        let set: u32 = (0xc00 << 20) | (5 << 15) | (0b010 << 12) | (10 << 7) | 0x73;
-        assert_eq!(counter_read(Arch::Riscv64, &set.to_le_bytes()), None);
-        assert_eq!(counter_read(Arch::Riscv64, &[0x73, 0x00]), None);
-    }
-
-    #[test]
-    fn the_window_is_the_pair_that_differs_by_the_sample()
-    {
-        // Reads at 2 (100) and 9 (107): 7 instructions, 2..9.
-        let trace = steps(12, &[(2, 100), (9, 107), (11, 200)]);
-        assert_eq!(window(&trace, 7).unwrap(), 2..9);
-    }
-
-    #[test]
-    fn a_window_whose_steps_differ_from_the_sample_is_rejected()
-    {
-        // The counter advanced by 5 over 7 stepped instructions.
-        let trace = steps(12, &[(2, 100), (9, 105)]);
-        let err = window(&trace, 5).unwrap_err().to_string();
-        assert!(err.contains("not the measured one"), "{err}");
-    }
-
-    #[test]
-    fn no_pair_or_several_pairs_are_rejected()
-    {
-        let trace = steps(12, &[(1, 100), (4, 103), (7, 106)]);
-        window(&trace, 4).unwrap_err();
-        let err = window(&trace, 3).unwrap_err().to_string();
-        assert!(err.contains("2 pairs"), "{err}");
-    }
-
     #[test]
     fn library_frames_count_against_their_caller()
     {
@@ -733,21 +631,21 @@ mod tests
         assert_eq!(attributed(&[]), "");
     }
 
-    fn place(image: Image, function: &str) -> Place
+    fn place(image: &str, function: &str) -> Place
     {
         Place {
-            image,
+            image: image.to_owned(),
             function: function.to_owned(),
         }
     }
 
     fn config(arch: &str, profile: &str, null: u64) -> Configuration
     {
-        let tally = Tally::of(0..null, |pc| match pc
+        let tally = Tally::of([(0, 4), (4, 1), (5, null - 5)], |pc| match pc
         {
-            0..=3 => place(Image::Ktest, "bench::arch::current::cycles"),
-            4 => place(Image::Kernel, "kernel::cap::sole_reference::drain"),
-            _ => place(Image::Kernel, "kernel::syscall::dispatch"),
+            0 => place("ktest", "bench::arch::current::cycles"),
+            4 => place(KERNEL, "kernel::cap::sole_reference::drain"),
+            _ => place(KERNEL, "kernel::syscall::dispatch"),
         });
         Configuration {
             arch: arch.to_owned(),
@@ -772,9 +670,9 @@ mod tests
         let c = config("x86_64", "dev", 20);
         let tally = &c.paths[0].tally;
         assert_eq!(tally.total, 20);
-        assert_eq!(tally.of_image(Image::Ktest), 4);
-        assert_eq!(tally.of_image(Image::Kernel), 16);
-        assert_eq!(tally.of_image(Image::Other), 0);
+        assert_eq!(tally.of_image("ktest"), 4);
+        assert_eq!(tally.of_image(KERNEL), 16);
+        assert_eq!(tally.of_image(OTHER), 0);
     }
 
     #[test]
@@ -808,7 +706,7 @@ arch	x86_64
         let text = format!(
             "{RESULT_HEADER}
 path	k	1	1	64
-fn	firmware	f	1
+fn		f	1
 "
         );
         Configuration::parse(&text).unwrap_err();
@@ -834,6 +732,79 @@ fn	firmware	f	1
         assert!(block.contains("| 1 functions below 3 each |  | 1 | 1 |"));
         // A configuration without "other" instructions gets no such row.
         assert!(!block.contains("| other |"));
+        // The program's row comes before the kernel's.
+        let ktest = block
+            .find("| `ktest.null_syscall_roundtrip cpus=1` | ktest | 4 | 4 |")
+            .unwrap();
+        let kernel = block
+            .find("| `ktest.null_syscall_roundtrip cpus=1` | kernel |")
+            .unwrap();
+        assert!(ktest < kernel);
+    }
+
+    #[test]
+    fn a_userspace_path_totals_each_process_between_its_program_and_the_kernel()
+    {
+        let mut c = config("riscv64", "release", 20);
+        let path = c.paths.first_mut().unwrap();
+        path.key = "ubench.fault_fill path=fault pages=16 cpus=1".to_owned();
+        path.tally = Tally::of([(0, 5), (1, 3), (2, 7), (3, 2), (4, 1)], |pc| match pc
+        {
+            0 => place("ubench", "ubench::fault::run"),
+            1 => place("vfsd", "vfsd::serve"),
+            2 => place(KERNEL, "kernel::mm::fault"),
+            3 => place("memmgr", "memmgr::fill"),
+            _ => place(OTHER, "<page 0x1000>"),
+        });
+        let block = render_block(&[c]);
+        let order: Vec<usize> = ["ubench", "memmgr", "vfsd", "kernel", "other"]
+            .iter()
+            .map(|i| {
+                block
+                    .find(&format!(
+                        "| `ubench.fault_fill path=fault pages=16 cpus=1` | {i} |"
+                    ))
+                    .unwrap()
+            })
+            .collect();
+        assert!(order.is_sorted(), "{block}");
+    }
+
+    #[test]
+    fn a_serial_log_places_the_kernel_and_each_named_process()
+    {
+        let lines: Vec<String> = [
+            "[--------] kernel: kaslr: slide=0x7fa00000 image_base=0xffffffffffa00000",
+            "[0.253334] kernel: init: PIE bias=0x339d749000 (20 relocations)",
+            "[0.282779] [init] init: memmgr image bias=0x36fde57000",
+            "[0.283550] [init] init: procmgr image bias=0x30c0606000",
+            "[0.350848] [procmgr] spawn image bias=0x34aeaa4000 (devmgr)",
+            "[0.502772] [procmgr] spawn image bias=0x37036e3000 (/services/drivers/virtio-blk)",
+            "[0.641718] [procmgr] spawn image bias=0x36c6f02000 (fatfs:/data)",
+            "[0.900000] [svcmgr] svcmgr: launching: acpid",
+            "[1.000000] [procmgr] spawn image bias=0x30c0dc6000 ()",
+            "[1.050000] [procmgr] spawn image bias=0x30c0dc7000 ()",
+            "[1.060000] [svcmgr] svcmgr: launching: sessiond",
+            "[1.070000] [procmgr] spawn image bias=0x30d55da000 (sessiond)",
+            "[1.100000] [ubench] bench ubench.ipc_rt words=0 arch=riscv64",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let got = placements(&lines, "init");
+        let want: Vec<(&str, u64)> = vec![
+            (KERNEL, 0x7fa0_0000),
+            ("init", 0x33_9d74_9000),
+            ("memmgr", 0x36_fde5_7000),
+            ("procmgr", 0x30_c060_6000),
+            ("devmgr", 0x34_aeaa_4000),
+            ("/services/drivers/virtio-blk", 0x37_036e_3000),
+            ("fatfs:/data", 0x36_c6f0_2000),
+            // Unnamed: named by svcmgr's launch line, once.
+            ("acpid", 0x30_c0dc_6000),
+            ("sessiond", 0x30_d55d_a000),
+        ];
+        let got: Vec<(&str, u64)> = got.iter().map(|p| (p.name.as_str(), p.bias)).collect();
+        assert_eq!(got, want);
     }
 
     #[test]

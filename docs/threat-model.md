@@ -196,11 +196,12 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
 
 - The GUID Partition Table is decoded by a pure crate, `services/vfsd/gpt`: `parse_header` checks a
   header's signature, size, CRC32 and `MyLBA`, and refuses a block size, an entry size, or an entry
-  array outside the space the GPT gives it (from LBA 2 to `first_usable_lba` for the primary, after
-  `last_usable_lba` and before the header for the backup); `parse_entry` refuses an inverted or
-  overflowing range; `collect_partitions` checks exactly the header's entry count and the array's
-  CRC32, and stops at a failed read; `read_gpt` reads the backup GPT at the disk's last LBA only
-  when the primary fails. A CRC32 detects a corrupt table, not this attacker, who recomputes it.
+  array that neither starts at LBA 2 or later and ends by `first_usable_lba` nor starts after
+  `last_usable_lba` and ends by the header's own LBA, for either copy; `parse_entry` refuses an
+  inverted or overflowing range; `collect_partitions` checks exactly the header's entry count and
+  the array's CRC32, and stops at a failed read; `read_gpt` reads the backup GPT at the disk's last
+  LBA only when the primary fails. A CRC32 detects a corrupt table, not this attacker, who
+  recomputes it.
 - A filesystem driver reaches its disk through a block-device capability badged for its partition:
   the block driver refuses every transfer outside the partition or past the device's capacity, and
   refuses to register a partition past that capacity (`resolve_lba`, `handle_register_partition` in

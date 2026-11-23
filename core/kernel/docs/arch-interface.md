@@ -675,7 +675,9 @@ pub fn remap_entry(target: irq::Target) -> Result<u64, irq::RemapError>;
 pub fn remap_handles() -> Result<u64, irq::RemapError>;
 
 /// Send a TLB-shootdown or wakeup IPI to the CPU with the given hardware id
-/// (APIC id on x86-64; hart id on RISC-V).
+/// (APIC id on x86-64; hart id on RISC-V). The caller's earlier memory accesses
+/// are visible to the target before the interrupt arrives (x86-64: fenced before
+/// an x2APIC ICR write; RISC-V: `fence rw, iorw` before the SBI call).
 pub unsafe fn send_tlb_shootdown_ipi(target_hw_id: u32);
 pub unsafe fn send_wakeup_ipi(target_hw_id: u32);
 

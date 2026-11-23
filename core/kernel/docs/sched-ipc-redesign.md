@@ -266,7 +266,7 @@ each change; the binding statement of the resulting invariants is
   - `Blocked|Created` → link: acquire the target run-queue lock (`sched_lock`
     outer → CPU lock inner), set `Ready`/`ipc_state = None`/`blocked_on_object = null`,
     clear `wake_pending` (defensive), `sched.enqueue` (the `queued_on` guard intact), set
-    `preferred_cpu` only when the enqueue created the link (#359), reschedule-pending,
+    `preferred_cpu` only when the enqueue created the link (#359),
     clear `wake_in_flight`, release the CPU lock, release
     `sched_lock`, then `wake_idle_cpu` (never IPI under `sched_lock`).
 
@@ -334,9 +334,9 @@ each change; the binding statement of the resulting invariants is
     cycle; the next tick re-schedules. A `Ready` `next` whose `context_saved` is
     still `0` while `current` is not idle is deferred instead: re-linked `Ready`
     at the head of its run queue under a re-taken CPU lock (nested in
-    `next.sched_lock`), `idle` claimed, and this CPU's reschedule flag set, so
-    idle dispatches it and only an idle outgoing thread waits in the
-    `context_saved` spin (scheduling-internals.md § Cross-CPU TCB Ownership,
+    `next.sched_lock`) and `idle` claimed, so idle's masked `has_runnable`
+    check finds it and idle dispatches it, and only an idle outgoing thread
+    waits in the `context_saved` spin (scheduling-internals.md § Cross-CPU TCB Ownership,
     step 3.5). Release `next.sched_lock`.
   - THEN trap-stack / AS-switch / idle-IOPB / FPU for the final `next` (all CPU-local,
     safe with the CPU lock released, IRQs still off), the `next_state` pointer,

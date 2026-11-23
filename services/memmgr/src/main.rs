@@ -3918,6 +3918,11 @@ fn signal_pressure()
     let prev = current_pressure();
     let level = l.pressure_level(prev, pool_total_pages());
     let open = draw_open(l);
+    if open
+    {
+        // A committed draw short from here on is noted again.
+        l.clear_short_draw();
+    }
     // SAFETY: only the receive loop's thread reaches this; no concurrent access.
     let opened = open && !unsafe { DRAW_OPEN };
     // SAFETY: as above.

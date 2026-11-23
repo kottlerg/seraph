@@ -1010,11 +1010,11 @@ node outside the reserve, and any for a reserve node, whether or not the free po
 floor, and the frames that cover `promised` can then be the reserve's and the restore headroom's.
 That is the draw room, which `QUERY_POOL_STATUS` reports in `data[16]` for a node outside the
 reserve. So an overcommitted pool leaves the reserve to the reserve nodes and the restore headroom
-to the restores of uncommitted chunks. While the draw room (the free pages above the growth floor
-while swap slots are registered, every free page while none is) does not cover `promised` and the
-free frames stand at or below the growth floor and the hysteresis band, memmgr evicts for frames in
-the background ([Eviction](#eviction), Selection), so write-out to swap brings the draw room back
-while the level stays `CRITICAL`. When a draw finds no page, memmgr also evicts victims in its turn
+to the restores of uncommitted chunks. While the free pool does not cover `promised`, or a
+committed draw has found too few free pages since the draw room last opened, and the free frames
+stand at or below the growth floor and the hysteresis band, memmgr evicts for frames in the
+background ([Eviction](#eviction), Selection), so write-out to swap brings the draw room back while
+the level stays `CRITICAL`. When a draw finds no page, memmgr also evicts victims in its turn
 as a restore's direct reclaim does ([Eviction](#eviction), Direct reclaim), each evictable chunk
 whose eviction frees a page above the growth floor (a committed chunk, or an uncommitted one once H
 reaches R) for a node outside the reserve, any for a reserve node, never the one the fault backs, up
@@ -1289,13 +1289,16 @@ page above the growth floor (Selection, below).
 
 **Selection.** While the pool's pressure level reads `LOW` ([Memory pressure](#memory-pressure)),
 memmgr reclaims in the background until it reads `NORMAL`, and stops there. It also evicts for
-frames: while the draw room (the free pages above the growth floor while swap slots are registered,
-every free page while none is) does not cover `promised` and the free frames stand at or below the
-growth floor and the hysteresis band (or a demand chunk's pages, when the band is less), it evicts
-in the background at either level, each evictable idle chunk whose eviction frees a page above the
-growth floor a victim (a committed chunk, or an uncommitted one once the restore headroom has
-reached the reserve), since the frames go to the committed draws, which `promised` keeps them for,
-and to the restores, and not to the next admission ([Commit](#commit), Overcommit). Otherwise it
+frames: while the free pool does not cover `promised`, or a committed draw has found too few free
+pages since the draw room last opened ([Commit](#commit), Overcommit), and the free frames stand at
+or below the growth floor and the hysteresis band (or a demand chunk's pages, when the band is
+less), it evicts in the background at either level, each evictable idle chunk whose eviction frees
+a page above the growth floor a victim (a committed chunk, or an uncommitted one once the restore
+headroom has reached the reserve), since the frames go to the committed draws, which `promised`
+keeps them for or which wait for them, and to the restores. While the free pool covers `promised`
+only the growth floor keeps a draw short, and a frame an eviction frees above the floor can go to
+the next admission as well, so memmgr waits for a draw that found too few and stops when the draw
+room opens. Otherwise it
 does not reclaim in the background at `CRITICAL`: the free pages above the growth floor are gone, so
 every frame an eviction frees past the restore headroom goes to the next admission, which a process
 draining the pool makes before any victim faults. Eviction makes room for the processes that run

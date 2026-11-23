@@ -338,6 +338,10 @@ pub struct Ledger<S, W>
     /// The subset of `swapped_pages` in the chunks of committed regions,
     /// which `promised` holds again ([`commit::allowance`]).
     committed_swapped: u64,
+    /// Whether a committed draw found too few free pages since the draw room
+    /// last opened ([`Self::note_short_draw`], [`Self::clear_short_draw`]),
+    /// which makes memmgr evict for frames ([`Self::frames_short`]).
+    short_draw: bool,
     /// Evictions begun ([`Ledger::begin_evict`]), a count that only moves up,
     /// wrapping: every eviction, background or direct, ending compressed, raw
     /// or cancelled, starts there.
@@ -381,6 +385,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             slots: SwapSlots::new(swap_words),
             disk_pages: 0,
             committed_swapped: 0,
+            short_draw: false,
             evictions: 0,
             zero_frames: NODE_NULL,
             object_va: ObjectVa::new(),
@@ -560,18 +565,38 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Whether memmgr evicts in the background for free frames
     /// (`services/memmgr/docs/memory-pool.md` § Eviction, Selection): the
-    /// draw room above the growth floor `floor` ([`Ledger::draw_room`])
-    /// does not cover `promised`, so a committed draw can find none, and the
-    /// free frames stand at or below the floor and the hysteresis band
-    /// `band`. Any evictable idle chunk is then a victim, a committed one
-    /// included, since the draws need free frames alone, so write-out has
-    /// chunks to take and frames come back before a committed fault waits on
-    /// them.
+    /// committed draws are short, the free pool not covering `promised` or a
+    /// committed draw having found too few free pages since the draw room last
+    /// opened ([`Self::note_short_draw`]), and the free frames stand at or
+    /// below the growth floor `floor` and the hysteresis band `band`. Any
+    /// evictable idle chunk is then a victim, a committed one included, since
+    /// the draws need free frames alone, so write-out has chunks to take and
+    /// frames come back for the committed draws. While the free pool covers
+    /// `promised` only the growth floor keeps a draw short
+    /// ([`Self::draw_room`]), and a frame eviction frees above it can go to
+    /// the next admission as well, which a process draining the pool makes
+    /// first; so eviction waits for a draw that found too few, and ends when
+    /// the draw room opens.
     #[must_use]
     pub fn frames_short(&self, floor: u64, band: u64) -> bool
     {
         let free = self.pool.free_pages();
-        self.draw_room(floor) < self.promised && free <= floor.saturating_add(band)
+        (free < self.promised || self.short_draw) && free <= floor.saturating_add(band)
+    }
+
+    /// Record that a committed draw found too few free pages, so memmgr
+    /// evicts for frames until the draw room opens ([`Self::frames_short`]).
+    pub fn note_short_draw(&mut self)
+    {
+        self.short_draw = true;
+    }
+
+    /// Record that the draw room opened, room for any one committed draw
+    /// (`ipc::memmgr_labels::QUERY_POOL_STATUS` `data[16]`): a committed
+    /// draw short since is noted again ([`Self::note_short_draw`]).
+    pub fn clear_short_draw(&mut self)
+    {
+        self.short_draw = false;
     }
 
     /// The free pages outside `promised` that a charge to a node outside the
@@ -7017,7 +7042,14 @@ mod tests
         assert!(l.pool.free_pages() >= promised(&l));
         assert_eq!(l.draw_room(floor), 0);
         assert!(l.restore_fits(16, reserve));
+        // With the frames covering `promised`, memmgr evicts for frames only
+        // once a draw found too few, and until the draw room opens.
+        assert!(!l.frames_short(floor, 16));
+        l.note_short_draw();
         assert!(l.frames_short(floor, 16));
+        assert!(!l.frames_short(floor - 1, 0));
+        l.clear_short_draw();
+        assert!(!l.frames_short(floor, 16));
         l.remove_region(rec, reg, pool_all).unwrap();
     }
 

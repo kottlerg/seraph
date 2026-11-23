@@ -533,7 +533,8 @@ mod tests
         assert_eq!(model.runs, Vec::new());
 
         // The chain ends after the first cluster and no cluster is free: the
-        // first cluster's run is written, then the allocation fails.
+        // allocation at the boundary fails before the first cluster's run,
+        // still pending, is written.
         let mut model = Model::new(1, 512, &[2]);
         assert_eq!(
             run(&mut model, 2, 0, 0, &pattern(1024), 4096),

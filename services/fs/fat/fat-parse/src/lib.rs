@@ -130,9 +130,10 @@ pub fn lru_victim(slots: impl IntoIterator<Item = VictimView>) -> Option<usize>
 
 /// Idle pages a `fatfs` cache keeps when it gives its idle pages back under
 /// memory pressure: the most recently used ones ([`keep_most_recent`]). A
-/// request holds one slot reference at a time, so one kept page lets a miss
-/// evict when memmgr refuses the cache a page at `Critical`; four keep the
-/// FAT, directory and data pages one request walks. Shared with svctest as
+/// request holds at most two slot references at a time (a run write over two
+/// cache pages), so two kept pages let a miss evict when memmgr refuses the
+/// cache a page at `Critical`; four keep the FAT, directory and data pages
+/// one request walks. Shared with svctest as
 /// [`slot_ceiling`] is.
 pub const RELEASE_KEEP: usize = 4;
 

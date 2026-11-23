@@ -70,7 +70,8 @@
 //! are what a miss evicts when memmgr refuses the fs a page, as it does at
 //! `Critical`, at or below its growth floor, to a grant charged to a node
 //! outside the system reserve, as the fs's grants are, so the fs keeps
-//! serving: a request holds one slot reference at a time. The cache is
+//! serving: a request holds at most two slot references at a time (a run
+//! write over two cache pages), and four are kept. The cache is
 //! write-through, so an idle page holds nothing the device lacks and goes back
 //! without a write. A slot whose page went to a client passes the check of
 //! § Reuse of a page a client mapped first: its page is kept or goes back only

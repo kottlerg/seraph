@@ -170,7 +170,14 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     so [`BootModule`] grew from 48 to 272 bytes and the module array
 ///     spans the pages its entries need. A bundle module's name is the
 ///     install path its signature names. [`MAX_BOOT_MODULES`] stays 85.
-pub const BOOT_PROTOCOL_VERSION: u32 = 23;
+/// v24: Added `boot_device` ([`BootDevice`]), appended to `BootInfo`: the
+///     boot ESP's GPT `HardDrive` descriptor (partition number, start LBA, size
+///     and unique partition GUID) and the PCI location (segment, bus, device,
+///     function) of the controller beneath it, which the bootloader reads from
+///     the loaded image's device path while boot services run. Each part is
+///     flagged present or all zero; the kernel checks the record and carries
+///     it to init.
+pub const BOOT_PROTOCOL_VERSION: u32 = 24;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -964,6 +971,182 @@ unsafe impl Send for ReclaimSlice {}
 // SAFETY: Same rationale as MemoryMapSlice.
 unsafe impl Sync for ReclaimSlice {}
 
+// ── Boot device ──────────────────────────────────────────────────────────────
+
+/// [`BootDevice::flags`] bit 0: the `esp_*` fields hold the boot ESP's GPT
+/// `HardDrive` descriptor.
+pub const BOOT_DEVICE_ESP: u32 = 1 << 0;
+
+/// [`BootDevice::flags`] bit 1: the `pci_*` fields hold the PCI location of
+/// the controller beneath the boot ESP.
+pub const BOOT_DEVICE_PCI: u32 = 1 << 1;
+
+/// The device the firmware booted from, as the bootloader read it from the
+/// device path of its own loaded image while boot services ran
+/// (`core/boot/docs/boot-flow.md` § Step 1): the boot ESP's GPT `HardDrive`
+/// descriptor, and the PCI location of the controller that serves the disk
+/// holding it, from `EFI_PCI_IO_PROTOCOL.GetLocation`.
+///
+/// The two parts are independent: each is reported when the firmware
+/// reports it, with its bit of [`Self::flags`] set, and is otherwise all
+/// zero, its bit clear. Every byte is a field's, [`Self::reserved`] included,
+/// so the record has no implicit padding. A compliant bootloader writes a
+/// record [`Self::check`] accepts; the kernel halts on any other.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootDevice
+{
+    /// Which parts are present: [`BOOT_DEVICE_ESP`], [`BOOT_DEVICE_PCI`].
+    /// Every other bit is zero.
+    pub flags: u32,
+    /// The boot ESP's partition number, its 1-based index in the disk's GPT
+    /// partition entry array.
+    pub esp_partition_number: u32,
+    /// The boot ESP's first logical block on its disk.
+    pub esp_start_lba: u64,
+    /// The boot ESP's size in logical blocks.
+    pub esp_size_lba: u64,
+    /// The boot ESP's unique partition GUID, in the byte order of its GPT
+    /// partition entry, which the `HardDrive` node carries unchanged.
+    pub esp_partition_guid: [u8; 16],
+    /// PCI segment group of the controller.
+    pub pci_segment: u16,
+    /// PCI bus number of the controller, as the firmware numbered the buses.
+    pub pci_bus: u8,
+    /// PCI device number of the controller, at most 31.
+    pub pci_device: u8,
+    /// PCI function number of the controller, at most 7.
+    pub pci_function: u8,
+    /// Zero.
+    pub reserved: [u8; 3],
+}
+
+/// Why [`BootDevice::check`] refuses a record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootDeviceDefect
+{
+    /// A bit of [`BootDevice::flags`] other than [`BOOT_DEVICE_ESP`] and
+    /// [`BOOT_DEVICE_PCI`] is set.
+    UnknownFlags,
+    /// A byte of [`BootDevice::reserved`] is not zero.
+    ReservedNonzero,
+    /// [`BOOT_DEVICE_ESP`] is clear and an `esp_*` field is not zero.
+    AbsentEspNonzero,
+    /// [`BOOT_DEVICE_PCI`] is clear and a `pci_*` field is not zero.
+    AbsentPciNonzero,
+    /// The ESP's partition number is zero; GPT partition numbers start at 1.
+    EspPartitionZero,
+    /// The ESP's size is zero.
+    EspEmpty,
+    /// The ESP's last block lies past the 64-bit block range.
+    EspWraps,
+    /// The PCI device number is above 31 or the function number above 7.
+    PciOutOfRange,
+}
+
+impl BootDeviceDefect
+{
+    /// The defect as a fixed phrase, for the kernel's fatal message.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str
+    {
+        match self
+        {
+            Self::UnknownFlags => "unknown flag bits",
+            Self::ReservedNonzero => "nonzero reserved bytes",
+            Self::AbsentEspNonzero => "ESP fields set without the ESP flag",
+            Self::AbsentPciNonzero => "PCI fields set without the PCI flag",
+            Self::EspPartitionZero => "ESP partition number zero",
+            Self::EspEmpty => "ESP size zero",
+            Self::EspWraps => "ESP extent wraps",
+            Self::PciOutOfRange => "PCI device or function out of range",
+        }
+    }
+}
+
+impl BootDevice
+{
+    /// The record of a boot whose firmware reported neither part.
+    #[must_use]
+    pub const fn none() -> Self
+    {
+        Self {
+            flags: 0,
+            esp_partition_number: 0,
+            esp_start_lba: 0,
+            esp_size_lba: 0,
+            esp_partition_guid: [0; 16],
+            pci_segment: 0,
+            pci_bus: 0,
+            pci_device: 0,
+            pci_function: 0,
+            reserved: [0; 3],
+        }
+    }
+
+    /// Whether the record is one a compliant bootloader writes: only the two
+    /// known flag bits, zero reserved bytes, an absent part all zero, a
+    /// present ESP of a nonzero partition number and size whose extent fits
+    /// the 64-bit block range, and a present PCI location whose device and
+    /// function numbers lie within the PCI ranges.
+    ///
+    /// # Errors
+    /// The first [`BootDeviceDefect`] the record carries, in the order the
+    /// variants are declared.
+    pub fn check(&self) -> Result<(), BootDeviceDefect>
+    {
+        if self.flags & !(BOOT_DEVICE_ESP | BOOT_DEVICE_PCI) != 0
+        {
+            return Err(BootDeviceDefect::UnknownFlags);
+        }
+        if self.reserved != [0; 3]
+        {
+            return Err(BootDeviceDefect::ReservedNonzero);
+        }
+        let esp_zero = self.esp_partition_number == 0
+            && self.esp_start_lba == 0
+            && self.esp_size_lba == 0
+            && self.esp_partition_guid == [0; 16];
+        if self.flags & BOOT_DEVICE_ESP == 0 && !esp_zero
+        {
+            return Err(BootDeviceDefect::AbsentEspNonzero);
+        }
+        let pci_zero = self.pci_segment == 0
+            && self.pci_bus == 0
+            && self.pci_device == 0
+            && self.pci_function == 0;
+        if self.flags & BOOT_DEVICE_PCI == 0 && !pci_zero
+        {
+            return Err(BootDeviceDefect::AbsentPciNonzero);
+        }
+        if self.flags & BOOT_DEVICE_ESP != 0
+        {
+            if self.esp_partition_number == 0
+            {
+                return Err(BootDeviceDefect::EspPartitionZero);
+            }
+            if self.esp_size_lba == 0
+            {
+                return Err(BootDeviceDefect::EspEmpty);
+            }
+            // The last block, start + size - 1, must be a 64-bit LBA.
+            let last = self
+                .esp_size_lba
+                .checked_sub(1)
+                .and_then(|blocks| self.esp_start_lba.checked_add(blocks));
+            if last.is_none()
+            {
+                return Err(BootDeviceDefect::EspWraps);
+            }
+        }
+        if self.flags & BOOT_DEVICE_PCI != 0 && (self.pci_device > 31 || self.pci_function > 7)
+        {
+            return Err(BootDeviceDefect::PciOutOfRange);
+        }
+        Ok(())
+    }
+}
+
 // ── BootInfo ─────────────────────────────────────────────────────────────────
 
 /// Boot information structure populated by the bootloader and passed to the
@@ -1168,6 +1351,15 @@ pub struct BootInfo
     /// means an entirely un-randomized layout (no KASLR entropy and no override
     /// knob); a pool seed may still be present in `boot_entropy_seed`.
     pub kaslr_flags: u32,
+
+    // ── Boot device (added in protocol version 24) ────────────────────────────
+    /// The device the firmware booted from ([`BootDevice`]): the boot ESP's
+    /// GPT `HardDrive` descriptor and its controller's PCI location, each
+    /// flagged present or all zero. The kernel checks it at Phase 9
+    /// ([`BootDevice::check`]), halting on a record no compliant bootloader
+    /// writes, and carries it to init unchanged; the kernel itself acts on
+    /// none of it.
+    pub boot_device: BootDevice,
 }
 
 // Hard size budget: the bootloader writes `BootInfo` into one page, and the
@@ -1241,6 +1433,118 @@ mod tests
         assert_eq!(core::mem::size_of::<AplicDomain>(), 24);
         assert_eq!(core::mem::size_of::<ImsicLayout>(), 16);
         assert_eq!(core::mem::size_of::<BootModule>(), 272);
+        assert_eq!(core::mem::size_of::<BootDevice>(), 48);
+    }
+
+    /// A record with both parts present, as QEMU's virtio-blk boot reports it.
+    fn both_parts() -> BootDevice
+    {
+        BootDevice {
+            flags: BOOT_DEVICE_ESP | BOOT_DEVICE_PCI,
+            esp_partition_number: 1,
+            esp_start_lba: 2048,
+            esp_size_lba: 131_072,
+            esp_partition_guid: [0xA5; 16],
+            pci_segment: 0,
+            pci_bus: 0,
+            pci_device: 3,
+            pci_function: 0,
+            reserved: [0; 3],
+        }
+    }
+
+    // Defect caught: a well-formed record, or the record of a boot that
+    // reported nothing, refused, which halts every such boot.
+    #[test]
+    fn check_accepts_present_and_absent_parts()
+    {
+        assert_eq!(both_parts().check(), Ok(()));
+        assert_eq!(BootDevice::none().check(), Ok(()));
+        let esp_only = BootDevice {
+            flags: BOOT_DEVICE_ESP,
+            pci_device: 0,
+            ..both_parts()
+        };
+        assert_eq!(esp_only.check(), Ok(()));
+        // The last block at the top of the 64-bit range still fits.
+        let at_top = BootDevice {
+            esp_start_lba: u64::MAX,
+            esp_size_lba: 1,
+            ..both_parts()
+        };
+        assert_eq!(at_top.check(), Ok(()));
+    }
+
+    // Defect caught: a bit no version defines, or a reserved byte, passed to
+    // init as if it meant nothing.
+    #[test]
+    fn check_refuses_unknown_flags_and_reserved_bytes()
+    {
+        let flags = BootDevice {
+            flags: BOOT_DEVICE_ESP | BOOT_DEVICE_PCI | (1 << 2),
+            ..both_parts()
+        };
+        assert_eq!(flags.check(), Err(BootDeviceDefect::UnknownFlags));
+        let reserved = BootDevice {
+            reserved: [0, 0, 1],
+            ..both_parts()
+        };
+        assert_eq!(reserved.check(), Err(BootDeviceDefect::ReservedNonzero));
+    }
+
+    // Defect caught: a part whose flag is clear but whose fields carry a
+    // value, which a consumer reading the fields would take for a report.
+    #[test]
+    fn check_refuses_fields_of_an_absent_part()
+    {
+        let esp = BootDevice {
+            flags: BOOT_DEVICE_PCI,
+            ..both_parts()
+        };
+        assert_eq!(esp.check(), Err(BootDeviceDefect::AbsentEspNonzero));
+        let guid_only = BootDevice {
+            esp_partition_guid: [1; 16],
+            ..BootDevice::none()
+        };
+        assert_eq!(guid_only.check(), Err(BootDeviceDefect::AbsentEspNonzero));
+        let pci = BootDevice {
+            flags: BOOT_DEVICE_ESP,
+            ..both_parts()
+        };
+        assert_eq!(pci.check(), Err(BootDeviceDefect::AbsentPciNonzero));
+    }
+
+    // Defect caught: a present ESP no GPT partition can be, or a PCI location
+    // no PCI function can have, passed on as the boot device.
+    #[test]
+    fn check_refuses_impossible_present_parts()
+    {
+        let partition = BootDevice {
+            esp_partition_number: 0,
+            ..both_parts()
+        };
+        assert_eq!(partition.check(), Err(BootDeviceDefect::EspPartitionZero));
+        let empty = BootDevice {
+            esp_size_lba: 0,
+            ..both_parts()
+        };
+        assert_eq!(empty.check(), Err(BootDeviceDefect::EspEmpty));
+        let wraps = BootDevice {
+            esp_start_lba: u64::MAX,
+            esp_size_lba: 2,
+            ..both_parts()
+        };
+        assert_eq!(wraps.check(), Err(BootDeviceDefect::EspWraps));
+        let device = BootDevice {
+            pci_device: 32,
+            ..both_parts()
+        };
+        assert_eq!(device.check(), Err(BootDeviceDefect::PciOutOfRange));
+        let function = BootDevice {
+            pci_function: 8,
+            ..both_parts()
+        };
+        assert_eq!(function.check(), Err(BootDeviceDefect::PciOutOfRange));
     }
 
     /// QEMU `virt`'s supervisor-level IMSIC layout with `aia=aplic-imsic`

@@ -2121,6 +2121,20 @@ harness in a crate it does not register. CI's `kani` job runs it on every push a
 and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
 
+**Local sizing.** A harness is sized on the development host before CI runs it. The author of a
+change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
+with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries
+it, every process of the run limited to an address space of 16 GB, the memory of CI's `kani`
+runner ([GitHub's standard Linux runner for a public
+repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)); on a
+Linux host, `prlimit --as=16000000000` before the command sets that limit where the command
+does not set it itself. A harness that fails or does not finish under the limit MUST be reduced
+before it is pushed, to smaller bounds that still cover the property or to the induction form of
+the parser proofs below. The PR body's `## Validation` section states, for each such harness,
+the verification time Kani reports, the peak resident memory of the run (the maximum resident
+set size of its largest process, as GNU `time -v` reports it), and the unwind bounds the harness
+carries.
+
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
 tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches
 one; its loops are bounded; and it does not detect every aliasing or provenance violation

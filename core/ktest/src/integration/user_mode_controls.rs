@@ -9,7 +9,7 @@
 //! the counters).
 //!
 //! The kernel grants the cycle counter (`RDTSC` on x86-64, `csrr cycle` on
-//! riscv64, as `crate::arch::cycles_now` reads it) and denies the other
+//! riscv64, as `bench::Counters` reads it) and denies the other
 //! counters and the other user-mode controls an architecture half lists: the
 //! boot CPU starts from the firmware's controls and each AP from its own reset
 //! or firmware state, so a control the kernel leaves alone can differ between
@@ -216,7 +216,7 @@ fn expect_denied(
 /// to the handler.
 extern "C" fn reader(which: u64) -> !
 {
-    core::hint::black_box(crate::arch::cycles_now());
+    core::hint::black_box(::bench::Counters::open().read());
     if let Some(wrong) = STATE_CHECKS.iter().position(|check| !(check.holds)())
     {
         STATE_WRONG.store(

@@ -101,21 +101,23 @@ are refused as for any slot still waiting (§ ACPI Hotplug).
 
 ### Poller
 
-The first managed slot starts the poller, a devmgr thread at devmgr's priority. It holds a
-derivation of each managed port's configuration page and touches only the port's PCI Express
-slot and link registers. At take-over it turns off the slot's event interrupt enables (the
-poller reads the latches instead, so the slot needs no message target, no IOMMU domain and no
-`_PRT`), clears the latches, and holds the slot as what lay behind it when the control thread
-handed it over (`firmware::hotplug::initial`): empty when no live record lies behind it; replaced
-when a recorded function no longer reads as its record, its vendor and device ID, revision, class
-code, or a type-0 header's subsystem vendor and ID differing or the function not answering
-(`firmware::hotplug::same_function`), logged; else occupied, whatever its Slot Status reads. The
-first poll then removes a recorded card that left while the slot's grant waited, removes the
-recorded card of a replaced slot and adds the card present once the removal completes, and brings
-up a card present with nothing recorded. The latches cleared at take-over hold what happened before
-devmgr controlled the slot, which may include the slot's power-on, so no event is read from them: a
-card replaced by one of the same identity is not told apart from it and is held as the recorded
-one, and an attention-button press while the grant waited is lost.
+The first managed slot starts the poller, a devmgr thread at devmgr's priority, which waits for
+that slot rather than polling none. It holds a derivation of each managed port's configuration
+page and touches only the port's PCI Express slot and link registers. The control thread takes
+each slot over before it hands the slot to the poller and logs it managed, so every event latched
+after that line is the poller's to act on, whichever thread runs first. At take-over it turns off
+the slot's event interrupt enables (the poller reads the latches instead, so the slot needs no
+message target, no IOMMU domain and no `_PRT`), clears the latches, and holds the slot as what lay
+behind it when it was managed (`firmware::hotplug::initial`): empty when no live record lies
+behind it; replaced when a recorded function no longer reads as its record, its vendor and device
+ID, revision, class code, or a type-0 header's subsystem vendor and ID differing or the function
+not answering (`firmware::hotplug::same_function`), logged; else occupied, whatever its Slot
+Status reads. The first poll then removes a recorded card that left while the slot's grant waited,
+removes the recorded card of a replaced slot and adds the card present once the removal completes,
+and brings up a card present with nothing recorded. The latches cleared at take-over hold what
+happened before devmgr controlled the slot, which may include the slot's power-on, so no event is
+read from them: a card replaced by one of the same identity is not told apart from it and is held
+as the recorded one, and an attention-button press while the grant waited is lost.
 
 Every `HOTPLUG_POLL_MS` (1000) it reads each slot's Slot Status, clears the event latches it
 holds (Attention Button Pressed, Power Fault Detected, MRL Sensor Changed, Presence Detect

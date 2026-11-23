@@ -13,7 +13,10 @@
 //! failed (services/fs/docs/fs-driver-protocol.md § Label 14: `FS_REMOVE`
 //! and § Label 16: `FS_RENAME`), and a directory grows, and `FS_MKDIR`
 //! claims a cluster, only once the cluster is written
-//! (services/fs/fat/docs/crash-safety.md § Write ordering). A write past a
+//! (services/fs/fat/docs/crash-safety.md § Write ordering). A rewrite of a
+//! page over consecutive clusters is one block write of its sectors, and one
+//! the device drops leaves every cached sector of the run as it was
+//! (`run_write`). A write past a
 //! file's end over a removed file's clusters reads zeros in its gap (§ Label
 //! 4: `FS_WRITE`). Each case lives in its own directory, and its faults are
 //! armed on that directory's single sector, on its file's data sector, or on
@@ -33,6 +36,7 @@
 mod pressure;
 mod ramdisk;
 mod run_fill;
+mod run_write;
 
 use std::sync::Arc;
 
@@ -91,6 +95,7 @@ pub fn fs_block_faults_phase(_: &Caps)
     let disk = RamDisk::formatted();
     let mut fs = OwnFatfs::start(&disk);
 
+    run_write::run_write_is_one_request_and_rolls_back(&fs, &disk);
     rename_undone_when_sfn_write_dropped(&fs, &disk);
     rename_undone_when_lfn_write_dropped(&fs, &disk);
     rename_done_when_failed_sfn_write_landed(&fs, &disk);

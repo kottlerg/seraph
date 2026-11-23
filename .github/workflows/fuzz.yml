@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# .github/workflows/fuzz.yml
+
+# The campaign fuzz tier: every target for a fixed time from a seed that
+# changes each run, growing a working corpus this workflow's cache carries
+# from run to run, weekly and on a manual dispatch (docs/testing.md
+# § Fuzzing). It gates nothing: a failing input it finds is uploaded, and its
+# fix lands with the minimized input under the target's regressions/.
+
+name: fuzz
+
+on:
+  schedule:
+    # Mondays, 04:17 UTC.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds each target runs
+        default: '1800'
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-10
+          components: rust-src,rustfmt,clippy,llvm-tools
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz-campaign
+
+      # Each run saves its corpus under a new key and restores the newest
+      # earlier one, so the corpus grows across runs.
+      - name: Restore the working corpora
+        uses: actions/cache@v6
+        with:
+          path: target/xtask/fuzz/*/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: cargo xtask fuzz --all
+        run: >-
+          cargo xtask fuzz --all
+          --time ${{ inputs.seconds || '1800' }}
+          --seed ${{ github.run_number }}
+
+      - name: Minimize the working corpora
+        if: success()
+        run: |
+          for target in $(cargo xtask fuzz --list); do
+            cargo xtask fuzz "$target" --minimize
+          done
+
+      - name: Upload the failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashes-${{ github.run_number }}
+          path: target/xtask/fuzz/*/crashes/
+          if-no-files-found: ignore

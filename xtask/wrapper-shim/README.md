@@ -3,7 +3,9 @@
 Tiny native binary installed into the seraph toolchain mirror at
 `target/seraph-toolchain/bin/` as both `rustc` and `ws-clippy`, dispatching on
 argv[0] basename to exec the real rustc or clippy-driver with the flags
-`-Z build-std` needs to read the overlaid `std::sys::seraph`.
+`-Z build-std` needs to read the overlaid `std::sys::seraph`; and, for
+`cargo xtask fuzz`, at `target/xtask/fuzz-shim/` as `sancov-rustc`, which
+compiles the fuzzing engine without coverage instrumentation.
 
 ---
 
@@ -18,9 +20,10 @@ crate eliminates them.
 
 ## Scope
 
-This crate exists exclusively to back the toolchain mirror. It is not a
-user-facing tool. The user never invokes it directly; xtask builds it,
-copies it, and arranges for cargo to spawn it as part of StdUser builds.
+This crate exists to back the toolchain mirror and the fuzz build. It is
+not a user-facing tool. The user never invokes it directly; xtask builds
+it, copies it, and arranges for cargo to spawn it as part of StdUser
+builds and of `cargo xtask fuzz`.
 See [xtask/src/rust_src.rs](../src/rust_src.rs) for the install
 mechanism and [xtask/README.md](../README.md) for how the toolchain
 mirror fits into the wider build flow.
@@ -32,7 +35,7 @@ wrapper-shim/
 ├── Cargo.toml      Dep-less host-target binary package.
 ├── README.md       This file.
 └── src/
-    └── main.rs     argv[0]-dispatched shim: rustc or ws-clippy mode.
+    └── main.rs     argv[0]-dispatched shim: rustc, ws-clippy or sancov-rustc mode.
 ```
 
 ## Behavior
@@ -43,6 +46,7 @@ Dispatch is by argv[0] basename:
 |---|---|
 | `rustc`     | Exec the real rustc with `--sysroot=<mirror>` prepended, unless the caller already supplied `--sysroot`. Lets cargo's internal invocations pick up the overlay while letting an explicit `rustc --sysroot=…` caller bypass. |
 | `ws-clippy` | Cargo invokes `RUSTC_WORKSPACE_WRAPPER` as `<wrapper> <rustc_path> <args...>`. Drop the cargo-prepended `<rustc_path>`, set `SYSROOT=<mirror>` in the env, and re-drive clippy-driver with `<mirror>/bin/rustc` and an explicit `--sysroot=<mirror>` arg. clippy-driver bakes its rustup env vars at compile time, so both the env and the flag are required to override its baked-in sysroot view. |
+| `sancov-rustc` | The `RUSTC_WORKSPACE_WRAPPER` of `cargo xtask fuzz`, whose `RUSTFLAGS` carry the SanitizerCoverage flags for every unit. Drop the cargo-prepended `<rustc_path>` and exec it with the unit's args, less every `-Cpasses=sancov-module` and `-Cllvm-args=-sanitizer-coverage-*` arg when the unit's `--crate-name` is one `SERAPH_SHIM_UNINSTRUMENTED` names: the engine, whose callbacks the instrumentation calls. |
 
 Unknown install names produce a clear error and exit 2.
 
@@ -53,7 +57,8 @@ mirrors the child's exit code.
 
 ## Configuration
 
-Three env vars set by xtask before invoking cargo:
+Three env vars set by xtask before invoking cargo, for the `rustc` and
+`ws-clippy` modes:
 
 | Env var | Purpose |
 |---|---|
@@ -69,6 +74,10 @@ shim to die with a clear message naming the missing var.
 The values are wired into a single cargo `Command` by
 [`SeraphToolchain::apply_env`](../src/rust_src.rs); callers route
 through that helper rather than setting any of these vars directly.
+
+The `sancov-rustc` mode reads one, which `cargo xtask fuzz` sets:
+`SERAPH_SHIM_UNINSTRUMENTED`, the comma-separated crate names it compiles
+without coverage flags (unset: none).
 
 ## Dependencies
 
@@ -93,7 +102,9 @@ The release binary lands at `target/release/seraph-wrapper-shim` (with
 `.exe` on Windows). xtask copies it into
 `target/seraph-toolchain/bin/rustc` and
 `target/seraph-toolchain/bin/ws-clippy` (same physical file, two
-install names, dispatch by argv[0] basename).
+install names, dispatch by argv[0] basename), and `cargo xtask fuzz`
+copies it to `target/xtask/fuzz-shim/sancov-rustc`. Its unit tests run
+under `cargo xtask test`.
 
 ## Relevant Design Documents
 

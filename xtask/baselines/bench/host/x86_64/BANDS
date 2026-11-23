@@ -1,22 +1,27 @@
-# Host-mode bands of the x86_64 benchmarks at 4 CPUs (KVM, debug build): three times
-# the larger spread of each benchmark's p50 over two 5-run calibrations on the
-# reference host. Format: xtask/README.md (`cargo xtask bench-check`).
-ktest.null_syscall_roundtrip cpus=4 band=4.53
+# Host-mode bands of the x86_64 benchmarks at 4 CPUs (KVM, release build): three times
+# the larger spread of each benchmark's p50 over two 5-run calibrations on the reference host,
+# a benchmark's spread being the range of its five p50s over their median.
+# Format: xtask/README.md (`cargo xtask bench-check`).
+ktest.null_syscall_roundtrip cpus=4 band=3.18
+# Held at the debug build's band: bimodal at 4 CPUs on the release build (#1557).
 ktest.ipc_round_trip words=0 cpus=4 band=0.78
+# Held at the debug build's band: bimodal at 4 CPUs on the release build (#1557).
 ktest.ipc_round_trip words=6 cpus=4 band=1.08
+# Held at the debug build's band: bimodal at 4 CPUs on the release build (#1557).
 ktest.ipc_round_trip words=7 cpus=4 band=0.75
+# Held at the debug build's band: bimodal at 4 CPUs on the release build (#1557).
 ktest.notification_roundtrip cpus=4 band=38.34
-ktest.cap_create_delete cpus=4 band=2.25
-ktest.cap_info_lookup cpus=4 band=34.11
-ktest.mem_map_unmap cpus=4 band=18.24
-ktest.mem_protect_pair cpus=4 band=23.70
-ktest.aspace_harvest_all_accessed pages=32 cpus=4 band=3.03
-ktest.aspace_harvest_none_accessed pages=32 cpus=4 band=2.10
-ktest.thread_lifecycle cpus=4 band=7.71
-ktest.context_switch_pair cpus=4 band=0.54
-ktest.thread_read_mem_page cpus=4 band=5.31
-ktest.event_post_recv cpus=4 band=8.61
-ktest.wait_set_cycle cpus=4 band=2.25
-ktest.tlb_shootdown_unmap cpus=4 band=10.26
-ktest.tlb_shootdown_concurrent op=map cpus=4 band=45.63
-ktest.tlb_shootdown_concurrent op=unmap cpus=4 band=32.01
+ktest.cap_create_delete cpus=4 band=57.84
+ktest.cap_info_lookup cpus=4 band=54.95
+ktest.mem_map_unmap cpus=4 band=33.43
+ktest.mem_protect_pair cpus=4 band=24.78
+ktest.aspace_harvest_all_accessed pages=32 cpus=4 band=38.80
+ktest.aspace_harvest_none_accessed pages=32 cpus=4 band=12.15
+ktest.thread_lifecycle cpus=4 band=16.28
+ktest.context_switch_pair cpus=4 band=1.08
+ktest.thread_read_mem_page cpus=4 band=2.07
+ktest.event_post_recv cpus=4 band=0.94
+ktest.wait_set_cycle cpus=4 band=68.78
+ktest.tlb_shootdown_unmap cpus=4 band=78.82
+ktest.tlb_shootdown_concurrent op=map cpus=4 band=46.27
+ktest.tlb_shootdown_concurrent op=unmap cpus=4 band=48.92

@@ -103,6 +103,16 @@ better, or a test the surrounding pattern would add.
     the findings the range's PRs and the release's earlier runs settled, and
     its schema defines each field.
 
+    A threat audit (the `threat-audit` workflow, `docs/conventions.md`
+    § Threat audit) names a section of `docs/threat-model.md` and a shard of
+    files, or the section itself as a lens, instead of a PR. It has no diff,
+    no review surface and no ledger: read each file whole as the head holds
+    it, take the section's attacker, assets and assumptions, which the
+    prompt quotes from the document, as the lens, and apply steps 3 to 6 to
+    the path from the attacker's input to each file. The gaps and open
+    Issues the prompt lists name known defects; its schema defines each
+    field.
+
     When the parent supplies no open-Issue list, run
     `gh issue list --state open --limit 500 --json number,title` and read
     the body of any Issue whose title matches the area.
@@ -186,10 +196,10 @@ a hunk unchanged since the run the entry names, when that run resolves in
 the clone. A follow-up Issue takes nothing off the surface: a defect one
 already holds is reported where the surface puts it.
 
-When invoked with a structured-output schema (the `release-review`
-workflow), fill it instead of the prose list: one entry per defect, each
-field as the schema describes it, with `file` (repository-relative) and
-`line`. A follow-up Issue (title `<scope>: defects found by review`, or
+When invoked with a structured-output schema (the `release-review` or
+`threat-audit` workflow), fill it instead of the prose list: one entry per
+defect, each field as the schema describes it, with `file`
+(repository-relative) and `line`. A follow-up Issue (title `<scope>: defects found by review`, or
 beginning with the earlier `<scope>: defects found by PR #<N>'s review`)
 names a defect when one of its items states it, as does any Issue whose
 body or comment states it. There is no final line in schema mode; the

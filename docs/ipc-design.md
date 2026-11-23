@@ -336,7 +336,7 @@ The kernel does not provide:
 [Thread Lifecycle and Sleep List Invariants](../core/kernel/docs/thread-lifecycle-and-sleep.md),
 [core/ktest/README.md](../core/ktest/README.md),
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),
-[Fault Handling](fault-handling.md),
+[Fault Handling](fault-handling.md), [Threat Model](threat-model.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
 [logd IPC interface](../services/logd/docs/ipc-interface.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),

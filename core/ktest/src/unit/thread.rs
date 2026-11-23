@@ -2020,12 +2020,31 @@ pub fn sleep_blocks_ms(_ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `thread_sleep(0)` is a no-op — returns immediately with `Ok(())`.
+/// `thread_sleep(0)` returns `Ok(())` at once, without blocking:
+/// [`ZERO_SLEEPS`] calls in a row take less than half as many timer ticks
+/// (1 ms each), where calls that each waited for the next tick would take about
+/// one tick each.
 pub fn sleep_zero_is_noop(_ctx: &TestContext) -> TestResult
 {
-    thread_sleep(0).map_err(|_| "thread::sleep_zero_is_noop: thread_sleep(0) returned error")?;
+    let t0 = system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "thread::sleep_zero_is_noop: system_info(ElapsedUs) before failed")?;
+    for _ in 0..ZERO_SLEEPS
+    {
+        thread_sleep(0)
+            .map_err(|_| "thread::sleep_zero_is_noop: thread_sleep(0) returned error")?;
+    }
+    let t1 = system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "thread::sleep_zero_is_noop: system_info(ElapsedUs) after failed")?;
+    if t1.wrapping_sub(t0) >= ZERO_SLEEPS * 1000 / 2
+    {
+        return Err("thread::sleep_zero_is_noop: thread_sleep(0) blocked");
+    }
     Ok(())
 }
+
+/// The `thread_sleep(0)` calls [`sleep_zero_is_noop`] makes: enough that sleeps
+/// that each waited for the next 1 ms tick would take about a second.
+const ZERO_SLEEPS: u64 = 1000;
 
 // ── SYS_THREAD_BIND_NOTIFICATION ─────────────────────────────────────────────
 

@@ -17,7 +17,7 @@ that it adds no output of its own to the framebuffer `console_write` measures; l
 the log lines still draws through the same driver:
 
 ```sh
-cargo xtask build --arch x86_64
+cargo xtask build --arch x86_64 --release
 cp sysroot/config/svcmgr/tests/ubench.svc sysroot/config/svcmgr/services/
 rm -f sysroot/config/svcmgr/services/terminal.svc
 cargo xtask mkdisk --arch x86_64 --repack-only
@@ -25,10 +25,12 @@ cargo xtask run --arch x86_64 --icount --cpus 1 --display framebuffer --runs 1 -
     --save-logs target/xtask/bench/ubench
 ```
 
-`--icount` gives the counts the `bench` cell compares; without it the counts are time on the
-host. A boot without `--display framebuffer` has no framebuffer, and `console_write` logs a SKIP
-line. The recipe seeds `devmgr.class.framebuffer`, the class `console_write` writes through, and
-`pwrmgr.shutdown`, through which ubench powers the system off once it logged its pass marker.
+`--icount` on the release build gives the counts the `bench` cell compares, since the cell builds
+the release profile ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell));
+without `--icount` the counts are time on the host. A boot without `--display framebuffer` has no
+framebuffer, and `console_write` logs a SKIP line. The recipe seeds `devmgr.class.framebuffer`, the
+class `console_write` writes through, and `pwrmgr.shutdown`, through which ubench powers the system
+off once it logged its pass marker.
 
 ---
 
@@ -66,7 +68,7 @@ its timed ones.
 | `fault_scaling` | `threads=1\|2\|4\|8 pages=16` | The `fault` sample of `fault_fill`, taken by k threads at once: thread i is pinned to CPU i, opens its own counters there and registers its own region, and all start their timed stores together. The line of k holds every thread's samples. A count above the CPUs online logs a SKIP line | 64 per thread, after 4 |
 | `shmem_ring` | `bytes=64\|512\|4096\|65536` | `bytes` moved through a byte ring of the stdio pipe's capacity, 2048 bytes ([shared/shmem](../../shared/shmem/README.md), `runtime/ruststd/src/sys/pipe/seraph.rs`): `SpscWriter::write` of what fits, `SpscReader::read` of it, until every byte passed, as a pipe's writer and reader take turns. One thread does both, so a sample is the copies and the index updates, with no notification or IPC | 256 per size, after 16 |
 | `console_write` | `bytes=64\|4096` | `bytes` of text, lines of 63 letters and a newline, sent to the framebuffer driver as `FB_WRITE_BYTES` calls of at most 512 bytes each, as the terminal sends its child's output (`programs/terminal/src/output.rs`). The warm-up fills the screen, so every timed write of 4096 bytes scrolls it | 64 per size, after 16 |
-| `fsbench` | — | [`/programs/fsbench`](../fsbench/README.md) spawned with no iteration count, its full benchmark, which logs its own `fsbench.read` and `fsbench.write` lines | as fsbench's |
+| `fsbench` | — | [`/programs/fsbench`](../fsbench/README.md) spawned with no iteration count, its full benchmark, which logs its own `fsbench.read`, `fsbench.write` and `fsbench.open` lines | as fsbench's |
 
 The `fault` line of `fault_fill` carries two extras, read outside the timed window from ubench's
 own charge, `QUERY_MEMORY_USAGE` before and after each store: `faults=`, the timed stores memmgr

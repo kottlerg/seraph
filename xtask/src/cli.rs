@@ -122,6 +122,15 @@ subcommands! {
         /// xtask/README.md.
         BenchBaseline(BenchBaselineArgs),
 
+        /// Account for every instruction of each kernel benchmark's measured
+        /// window: `trace` boots the bench-only ktest image at one CPU under
+        /// icount with QEMU's gdbstub, single-steps one iteration of each
+        /// benchmark, checks it against the counts, and attributes each
+        /// instruction to its function; `write` sets the traced
+        /// configurations side by side in the account document. See
+        /// xtask/README.md.
+        PathAccount(PathAccountArgs),
+
         /// Resolve runtime addresses in a loaded ELF image (a binary, or the
         /// sysroot's kernel) to function, file, and line from its DWARF, or to the
         /// nearest function symbol when no DWARF covers an address; a stripped
@@ -199,6 +208,13 @@ subcommands! {
         /// and their files, and the open Issues (see xtask/README.md).
         ReleaseScope(ReleaseScopeArgs),
 
+        /// Print the scope of a threat audit of one section of
+        /// `docs/threat-model.md` as JSON with a digest: the section's blocks
+        /// verbatim, the files its mitigations and coverage name, the
+        /// references that resolve to nothing, the reviewer shards, and the
+        /// open Issues in pages (see xtask/README.md).
+        ThreatScope(ThreatScopeArgs),
+
         /// Replace a GitHub Issue's body from a file, refusing an empty body or
         /// one that lost task-list items, keeping a backup, and verifying the
         /// edit (see xtask/README.md).
@@ -252,6 +268,7 @@ impl CliCommand
             | Self::KtestTiming(_)
             | Self::BenchCheck(_)
             | Self::BenchBaseline(_)
+            | Self::PathAccount(_)
             | Self::Symbolize(_)
             | Self::Mkdisk(_)
             | Self::TrustRequest(_)
@@ -261,6 +278,7 @@ impl CliCommand
             | Self::PrCheck(_)
             | Self::ReviewLedger(_)
             | Self::ReleaseScope(_)
+            | Self::ThreatScope(_)
             | Self::IssueEdit(_)
             | Self::IssueFile(_)
             | Self::Orch(_)
@@ -361,6 +379,15 @@ args! {
         /// `--component`. Only components in the current build are affected.
         #[arg(long, value_delimiter = ',', value_parser = parse_build_component)]
         pub debug: Vec<BuildComponent>,
+
+        /// Emit limited debuginfo (`debug = "limited"`: line tables and function
+        /// frames, inlined ones included, without types or variables) for the
+        /// named component(s), at the active profile's own opt-level, so the
+        /// code is the code a build without it emits; a component `--debug`
+        /// also names takes `--debug`. Comma-separated, names as for
+        /// `--debug`. `cargo xtask path-account` reads the kernel's and ktest's.
+        #[arg(long, value_delimiter = ',', value_parser = parse_build_component)]
+        pub limited_debug: Vec<BuildComponent>,
 
         /// Skip the formatting check (`cargo fmt --check`) and the
         /// per-component `cargo check` (clippy), which would otherwise double
@@ -917,6 +944,12 @@ args! {
         #[arg(long)]
         pub all: bool,
 
+        /// Also empty Cargo's profile directories in target/ but for the build
+        /// units of the toolchain's library packages (core, alloc,
+        /// compiler_builtins, std and their dependencies), the part CI caches.
+        #[arg(long, conflicts_with = "all")]
+        pub keep_std: bool,
+
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
         #[command(flatten)]
@@ -1082,6 +1115,17 @@ args! {
         #[arg(long)]
         pub release: bool,
 
+        /// Run a cell's cases in up to N lanes side by side, each on a private
+        /// copy of the checkout (1 to 3; default: 1, the cases one after
+        /// another in the checkout itself).
+        #[arg(long, value_name = "N", requires = "cell")]
+        pub lanes: Option<u32>,
+
+        /// The private copy of the checkout a lane of a cell runs this case
+        /// in; a cell's lanes set it.
+        #[arg(long, value_name = "DIR", requires = "case", hide = true)]
+        pub lane_root: Option<PathBuf>,
+
         /// The `kaslr` case's riscv64 paging-mode ceiling (default: sv48;
         /// ignored on `x86_64`).
         #[arg(long, requires = "case")]
@@ -1229,6 +1273,75 @@ impl ShutdownCause
     pub fn on(self, arch: Arch) -> bool
     {
         self != Self::PowerButton || arch == Arch::X86_64
+    }
+}
+
+// ── PathAccount ───────────────────────────────────────────────────────────────
+
+args! {
+    pub struct PathAccountArgs
+    {
+        #[command(subcommand)]
+        pub command: PathAccountCommand,
+    }
+}
+
+subcommands! {
+    pub enum PathAccountCommand
+    {
+        /// Boot the sysroot's bench-only ktest image (`build --ktest-bench-only
+        /// --limited-debug kernel,ktest`, `mkdisk --harness ktest`) at one CPU
+        /// under icount, trace one iteration of each benchmark, check each
+        /// window against the counts, and write the configuration's result
+        /// under target/xtask/path-account/.
+        Trace(PathAccountTraceArgs),
+
+        /// Write the generated block of the account document from the result
+        /// files of every configuration traced.
+        Write(PathAccountWriteArgs),
+    }
+}
+
+args! {
+    pub struct PathAccountTraceArgs
+    {
+        /// Target architecture: the sysroot's.
+        #[arg(long, default_value = "x86_64")]
+        pub arch: Arch,
+
+        /// The sysroot was built with `--release` (default: the dev profile).
+        #[arg(long)]
+        pub release: bool,
+
+        /// The first sample index traced in each benchmark: the iteration
+        /// that records it and the 7 after it are stepped. From 1 to 92, so
+        /// the last stepped index stays below the smallest sample count of a
+        /// benchmark (100).
+        #[arg(long, default_value_t = 64)]
+        pub iteration: u32,
+
+        /// Saved logs of icount boots of the same tree and profile's bench-only
+        /// image built without `--limited-debug` (`run --icount --save-logs`),
+        /// whose lowest p50s are the reference counts each traced window must
+        /// equal.
+        #[arg(long, value_name = "LOG", required = true)]
+        pub reference: Vec<PathBuf>,
+
+        /// Seconds the whole boot may take.
+        #[arg(long, default_value_t = 3600)]
+        pub timeout: u64,
+
+        #[command(flatten)]
+        pub host: BootHostArgs,
+    }
+}
+
+args! {
+    pub struct PathAccountWriteArgs
+    {
+        /// The account document, whose generated block is replaced.
+        #[arg(long, default_value = "core/kernel/docs/hot-path-account.md")]
+        pub doc: PathBuf,
     }
 }
 
@@ -1524,6 +1637,42 @@ fn parse_page_entries(text: &str) -> Result<u64, String>
         return Err(format!("{value} is not in 1..{}", u64::MAX));
     }
     Ok(value)
+}
+
+// ── ThreatScope ───────────────────────────────────────────────────────────────
+
+args! {
+    pub struct ThreatScopeArgs
+    {
+        /// The section of `docs/threat-model.md` to scope, as its `##` heading
+        /// names it.
+        #[arg(long)]
+        pub section: String,
+
+        /// The commit the document and the files are read at.
+        #[arg(long, default_value = "HEAD")]
+        pub head: String,
+
+        /// The most open Issues one page holds.
+        #[arg(long, default_value_t = 200, value_parser = parse_page_entries)]
+        pub page_entries: u64,
+
+        /// Print page `issues:<n>` (1-based) of the open Issues instead of the
+        /// summary, from the list `--issues` names.
+        #[arg(long, value_name = "issues:N", requires = "issues")]
+        pub page: Option<String>,
+
+        /// The open Issues' digest a summary printed: a page is cut from the
+        /// list that summary saved, not from the tracker as it stands.
+        #[arg(long, value_name = "DIGEST")]
+        pub issues: Option<String>,
+
+        /// Print the summary of a section whose scope is incomplete (a
+        /// Mitigations item naming no file, or a reference resolving to
+        /// nothing) instead of refusing it.
+        #[arg(long)]
+        pub allow_incomplete: bool,
+    }
 }
 
 // ── IssueEdit / IssueFile ─────────────────────────────────────────────────────

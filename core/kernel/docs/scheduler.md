@@ -4,9 +4,10 @@ The Seraph kernel scheduler is preemptive, priority-based, and SMP-aware, with t
 classes (§ Scheduling Classes): the top levels are scheduled by strict fixed priority (RT), the
 lower ones fairly, by weight. Whenever a CPU schedules (block, yield, slice expiry, or idle
 wake), it selects the highest-level runnable RT thread, else the next thread of its fair queue. A
-wake does not preempt a running thread, with one exception: a running fair thread is preempted at
-the next timer tick while an RT thread is queued on its CPU. Otherwise a newly runnable thread
-waits until the running thread blocks or yields or its slice expires. Among CPUs of equal load,
+wake preempts the running thread of its CPU when the woken thread outranks it (an RT level outranks
+a fair one, and a higher RT level a lower one), at that CPU's next return to user mode
+(§ Wake Preemption). Otherwise a newly runnable thread waits until the running thread blocks or
+yields or its slice expires. Among CPUs of equal load,
 placement prefers one whose SMT siblings are idle, so threads spread across physical cores
 before they share one (§ SMT Awareness).
 
@@ -115,12 +116,10 @@ applications in the fair one (`shared/ipc`'s `sched_policy`).
   over another fair thread's.
 
 Between the classes, RT always wins. Every scheduling decision takes a ready RT thread before
-any fair one. A fair thread that is running when an RT thread is queued on its CPU is preempted
-at the next timer tick (§ Timer-Driven Preemption), and goes back to the tail of the fair queue
-with the rest of its slice. A wake itself does not preempt: an RT thread woken onto a CPU that
-runs a fair thread waits for the next tick, or, when that tick finds preemption disabled
-(§ Kernel-Mode Preemption Points), for the first later tick that finds it enabled. Immediate
-preemption at the wake is not implemented.
+any fair one, and a running fair thread is preempted for an RT thread queued on its CPU at the
+CPU's next return to user mode, as a running RT thread is for a higher RT level
+(§ Wake Preemption). The preempted thread goes back to the head of its queue with the rest of
+its slice, keeping its turn.
 
 The fair accounting is per CPU: each thread's remaining slice in its TCB, and its place in its
 CPU's fair queue. There is no global virtual time to keep in step across CPUs, and a migrated
@@ -155,8 +154,13 @@ pub struct PerCpuScheduler
     idle: AtomicPtr<ThreadControlBlock>,
 
     /// Level of `current` as of its dispatch, which `timer_tick` reads for the slice
-    /// bound and refill and the RT-over-fair preemption.
+    /// bound and refill.
     current_level: AtomicU8,
+
+    /// The `non_empty` bits of the queues above `current_level`'s, stored with it,
+    /// which `outranked` ANDs with `non_empty` for the wake preemption; every bit
+    /// while a priority change has left `current_level` stale (§ Wake Preemption).
+    outranking: AtomicU32,
 
     /// Lock protecting the run queues. Held briefly during enqueue/dequeue.
     pub lock: Spinlock,
@@ -206,16 +210,19 @@ implementation constants, not part of the ABI.
 CPU records at each dispatch (`PerCpuScheduler::current_level`): it may not read the running
 thread's `priority` without that thread's `sched_lock`. Each tick first cuts the remaining slice
 to that level's quantum, then takes the tick, and an expired slice is refilled with the quantum
-(`PerCpuScheduler::tick_outcome`). A priority change of a running thread therefore reaches its
-class at its next dispatch, and its slice at the first tick after that dispatch: until then the
-thread runs out the slice it holds, and from then on a thread lowered from fair 20 to 2 runs at
-most 2 ticks per slice, and one raised from the fair class into the RT class at most
+(`PerCpuScheduler::tick_outcome`). A priority change of a running thread marks the recorded level
+stale, and the CPU records the new one at its first return to user mode with a thread queued
+(§ Wake Preemption) or at the thread's next dispatch, whichever comes first; the thread's class,
+the rank a wake preemption compares, and its slice from the first tick after follow that record:
+until then the thread runs out the slice it holds, and from then on a thread lowered from fair 20
+to 2 runs at most 2 ticks per slice, and one raised from the fair class into the RT class at most
 `TIME_SLICE_TICKS`. A new thread's first slice is its creation level's.
 
 Slice expiry never hands the CPU to a lower RT level, nor from an RT thread to a fair one: the
 expiring thread is requeued at its run queue's tail and the highest non-empty queue runs next.
 Within an RT level, and within the fair queue, threads share the CPU in round-robin order (FIFO
-queue drained cyclically).
+queue drained cyclically). A thread preempted by an outranking one is requeued at its queue's
+head instead, so the preemption costs it no turn (§ Wake Preemption).
 
 ### Selection
 
@@ -531,7 +538,7 @@ while a candidate is confirmed).
 
 The loads that choose a pull are read without the CPUs' locks, and a CPU's `schedule()`
 raises its own load for a moment under its lock: it counts every requeue of the running
-thread on its own queues (such as a slice expiry, a yield, a preemption for RT, the idle loop
+thread on its own queues (such as a slice expiry, a yield, a wake preemption, the idle loop
 leaving its idle thread, or a park a wake overtook, which `Requeue::IfRunnable` requeues)
 before the dequeue that follows (a requeue its affinity routes to another CPU raises that
 CPU's load instead, as a wake there would). A reading taken while the load is raised can pass the
@@ -713,8 +720,6 @@ timer_tick():
             try_pull_idle(cpu); return
         Continue(remaining):
             current.slice_remaining = remaining; reschedule = false
-        PreemptForRt(remaining):              // fair current, RT thread queued here
-            current.slice_remaining = remaining; reschedule = true
         Expired:
             current.slice_remaining = quantum_ticks(current_level); reschedule = true
     try_pull_balance(cpu)
@@ -735,20 +740,126 @@ context switch, even though its slice expired.
 This ensures that a thread alone at the highest non-empty queue is never preempted needlessly
 — only when a peer or superior competitor exists.
 
-A fair thread is also preempted before its slice expires, at any tick that finds an RT thread
-queued on its CPU (`PreemptForRt`). It goes back to the fair queue's tail keeping the rest of its
-slice, and the RT thread runs. RT threads are not preempted mid-slice: among them a newly
-runnable higher level waits for the running thread to block, yield or expire, as above.
+The tick does not decide a preemption by a queued thread that outranks the running one: that is
+decided at the interrupt's return to user mode, as at every other (§ Wake Preemption).
+
+### Wake Preemption
+
+A thread queued on a CPU outranks the CPU's running thread when the highest non-empty run queue
+other than the idle queue is above the queue of the running thread's level
+(`PerCpuScheduler::outranked`): any RT level outranks a fair level and the idle level, and a
+higher RT level a lower one. No level outranks its own, so one fair level never outranks another,
+all of them sharing the fair queue, and threads of one RT level share it round-robin. The running
+level is the one the CPU recorded at the thread's dispatch, or re-recorded after a change of its
+priority (`current_level`, § Time Slice Policy).
+
+The test each return makes is one AND: `PerCpuScheduler::set_current_level` stores, beside the
+level, the `non_empty` bits of every queue above the level's queue (`outranking`), so a queued
+thread outranks the running one exactly when `non_empty & outranking` is not zero. A return
+reaches its CPU's scheduler through `PerCpuData::scheduler`, a pointer to the CPU's own entry of
+the scheduler slab that `percpu::init_storage` sets once: on x86-64 at `gs:[88]`
+(`PERCPU_SCHEDULER_OFFSET`), on riscv64 at `88(tp)`. The test is inlined at each return as one
+load of that pointer, the loads of `non_empty` and `outranking`, an AND and a branch
+(`sched::preempt_if_outranked`); only a hit calls the rest of the decision
+(`sched::preempt_outranked`). Counted under icount at one CPU, the test adds 6 instructions to
+a syscall on x86-64 and 5 on riscv64 in the release profile, 10 and 8 in the debug profile, whose
+checks of the pointer's alignment and nullness the release profile drops. Both words are read
+Relaxed: a link the CPU made itself precedes the test in program order, and a link from another
+CPU is followed by its wake IPI, whose own return tests again
+([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
+Invariants).
+
+A change of a running thread's priority reaches its CPU through that mask.
+`sys_thread_set_priority` writes `priority` and reads `state` under the thread's `sched_lock`,
+and every site that records a level from a thread's `priority` holds the same lock and makes the
+thread `Running` in the same critical section: `schedule()`'s dispatch flip, under the incoming
+thread's lock, and its same-thread re-mark and the decision's re-record below, under the running
+thread's. The other records read no thread's priority: the idle level, and `sched::enter`'s boot
+dispatch of init, before any other thread exists. So a record after the change reads the new
+priority, and a change after a record finds the thread `Running`. The change then marks the
+level of the CPU its `preferred_cpu` names (the CPU running it, written with the flip under the
+same lock) stale before it releases the lock: `PerCpuScheduler::mark_level_stale` stores every
+bit in `outranking`, which no level's mask has. It then prods the CPU, a no-op for the caller's
+own. The next return to user mode there with any thread queued hits. The decision re-records the
+level from `priority` under the thread's `sched_lock` and decides again, so a thread lowered
+below a queued one yields at that return. A later dispatch overwrites the mark with the incoming
+thread's level, read under that thread's lock.
+
+A CPU decides at every return to user mode that can follow a link with no wake IPI pending
+(`sched::preempt_if_outranked`), and when a queued thread outranks the running one it calls
+`schedule(Requeue::Preempted)`:
+
+- the end of every syscall (`syscall::finish_syscall`), after the syscall delivery point of
+  upcalls ([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
+  Upcalls): a self-wake the syscall made, or a wake IPI a preemption-disabled window absorbed;
+- the end of every interrupt taken from user mode (x86-64 `irq_dispatch`, riscv64
+  `trap_dispatch`), after the handler's acknowledgement, the sole-reference drain pass
+  ([capability-internals.md](capability-internals.md#sole-reference-observers) § Sole-Reference
+  Observers) and the interrupt delivery point of upcalls: the wake IPI of a cross-CPU wake, the
+  timer, device and TLB-shootdown interrupts, whose handlers can wake a thread on the CPU
+  themselves, and the drain's posts, which can too;
+- the end of every exception taken from user mode that resumes the thread (x86-64
+  `exception_handler` and `page_fault_handler`, riscv64 `trap_dispatch`): fault delivery can
+  link a thread on the CPU and absorb a wake IPI in a preemption-disabled window.
+
+Where the return is an upcall delivery point, the delivery comes first and the decision after it,
+and a thread the decision preempted passes the delivery point again, then the decision, when it is
+dispatched again (`sched::deliver_and_preempt`). An upcall posted while it waited on the run
+queue, for which no CPU is prodded since the thread runs nowhere, is so delivered at this return,
+and a thread a delivery linked on the CPU, or whose wake IPI a delivery absorbed, is decided before
+the thread returns. An exception's return is no delivery point, but a thread preempted there
+passes the interrupt delivery point when it is dispatched again, as a thread an interrupt preempted
+does (`sched::preempt_at_exception_return`;
+[fault-handling.md](../../../docs/fault-handling.md#delivery-points) § Delivery points).
+
+Two returns to user mode make no decision. The x86-64 `#NM` lazy FPU restore runs with interrupts
+masked and preemption disabled throughout and links nothing, so an IPI raised meanwhile is taken
+in user mode as it returns. A new thread's first entry to user mode follows the dispatch that
+chose it as its CPU's highest, with interrupts masked until it reaches user mode, where a later
+link's IPI is taken. The decision is skipped during the BSP boot transient, while preemption is
+disabled, and for the idle thread, whose loop takes queued work itself (§ Idle Thread). Syscall
+context stays non-preemptible (§ Kernel-Mode Preemption Points): a wake made or absorbed inside a
+syscall takes effect at its exit.
+
+`Requeue::Preempted` links the preempted thread at the head of its own queue, keeping its
+remaining slice, in both classes: it has not finished its turn, and at the tail every peer of its
+level would overtake it, costing it a turn per outranking wake and, for a fair thread, breaking
+the one-turn bound of § Scheduling Classes. Slice expiry and a yield requeue at the tail
+(`Requeue::Always`). A preempted thread whose hard affinity now names another CPU is linked at
+that CPU's tail, as any requeue its affinity routes there (§ Active migration on affinity change).
+
+**Latency bound.** A cross-CPU wake of an RT thread onto a CPU whose running thread it outranks
+runs within the waker's release of the thread's `sched_lock` and of the target's run-queue lock,
+the wake IPI's delivery, the target's longest interval with interrupts masked or preemption
+disabled (bounded by
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) and by the
+length of the syscall the target is in), and `schedule()` with its switch; there is no tick term.
+A self-wake runs at the waker's syscall or interrupt exit. A timed wake adds the rounding of its
+deadline to CPU 0's next tick (at most one tick), CPU 0's own interval with interrupts masked,
+and the sleep batch's claims ahead of it
+([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants) § Sleep List
+Invariants, invariant 6). The bound holds for the CPU the wake's placement chose. Placement does not
+weigh levels (§ Soft Affinity), so an RT wake can be placed behind a running thread of its own or a
+higher level and wait for it to block, yield or expire. Two wakes placed on one CPU at once can
+likewise leave the lower waiting until the higher blocks or expires; closing that residual needs an
+RT pull (a CPU running a lower level taking a waiting RT thread at its tick), which is not
+implemented.
+
+**Timed wakes** stay on CPU 0's tick (§ Timer-Driven Preemption): every ABI timeout is in
+milliseconds and the tick is 1 ms, so a one-shot timer buys no resolution the ABI can ask for, and
+one sleep list serviced by one CPU keeps its batch and quiesce invariants
+([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants) § Sleep List
+Invariants). The wake that CPU 0's tick makes preempts wherever it is placed, as any other wake.
 
 ### Kernel-Mode Preemption Points
 
 Syscall context is not preemptible. Syscall entry masks interrupts, and they stay masked
 for the whole syscall except in bounded preempt-disabled, interrupt-enabled windows. When
 `timer_tick` reaches a slice expiry while `percpu::preemption_disabled()` holds, it resets
-the slice and skips the switch, and the thread is rescheduled at its next slice expiry (a fair
-thread with an RT thread queued, at the next tick that finds preemption enabled). Kernel-mode
-preemption therefore happens only at a tick that decides a reschedule, a slice expiry or a fair
-thread's preemption for RT, with preemption enabled.
+the slice and skips the switch, and the thread is rescheduled at its next slice expiry, or at its
+next return to user mode when a queued thread outranks it (§ Wake Preemption), which is decided
+only there. Kernel-mode preemption therefore happens only at a slice-expiry tick with preemption
+enabled.
 The model, the spinlock hold-time bound, and lock ordering are specified in
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) (its
 numbered ordering rules and the "Lock primitive" and "Bare spin locks" paragraphs).
@@ -772,6 +883,10 @@ Masking before the check means a wake IPI that lands between the check and the h
 pending and ends the halt. The protocol is specified in
 [scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
 Invariants.
+
+The idle thread makes no wake-preemption decision of its own (§ Wake Preemption): for the idle
+level every queued thread outranks the running one, so the loop's `has_runnable` check is that
+decision.
 
 The timer never preempts the idle thread. Its `slice_remaining` is fixed at 0, and
 `timer_tick` returns before the decrement for a zero slice; the check keys on the zero
@@ -833,8 +948,8 @@ Otherwise, by target state:
   the **source** CPU (where the thread is currently running). The IPI itself
   does not call `schedule()`; the running thread observes the new
   affinity at its next entry to `schedule()` — preempt-on-slice-expiry,
-  a fair-dispatched thread's preemption for RT, voluntary yield, or IPC
-  block. The re-enqueue site in `schedule()`
+  a preemption by an outranking thread (§ Wake Preemption), voluntary
+  yield, or IPC block. The re-enqueue site in `schedule()`
   checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU —
   linking the thread directly on the destination's run queue and IPIing
   it — instead of doing a local enqueue

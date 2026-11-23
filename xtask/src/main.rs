@@ -68,6 +68,7 @@ mod gpt;
 mod guest;
 mod host_lock;
 mod image_check;
+mod path_account;
 mod qemu;
 mod qemu_gdb;
 mod qmp;
@@ -128,6 +129,7 @@ fn main()
         CliCommand::Fuzz(args) => commands::fuzz::run(&ctx, args),
         CliCommand::Kani(args) => commands::kani::run(&ctx, args),
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
+        CliCommand::PathAccount(args) => commands::path_account::run(&ctx, args),
         CliCommand::BenchCheck(args) => commands::bench_check::run(&ctx, args),
         CliCommand::BenchBaseline(args) => commands::bench_baseline::run(&ctx, args),
         CliCommand::Symbolize(args) => commands::symbolize::run(&ctx, args),
@@ -140,6 +142,7 @@ fn main()
         CliCommand::CompareImages(args) => commands::compare_images::run(&ctx, args),
         CliCommand::ReviewLedger(args) => commands::review::run_ledger(&ctx, args),
         CliCommand::ReleaseScope(args) => commands::release_scope::run(&ctx, args),
+        CliCommand::ThreatScope(args) => commands::threat_scope::run(&ctx, args),
         CliCommand::IssueEdit(args) => commands::issue::run_edit(&ctx, args),
         CliCommand::IssueFile(args) => commands::issue::run_file(&ctx, args),
         CliCommand::Orch(args) => commands::orch::run(&ctx, args),

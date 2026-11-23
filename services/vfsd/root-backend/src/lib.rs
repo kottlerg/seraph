@@ -985,6 +985,17 @@ impl NamespaceBackend for VfsdRootBackend
         false
     }
 
+    fn continues_walk(&mut self, dir: NodeId) -> bool
+    {
+        // A name that misses the synthetic children of a node with a
+        // fall-through is answered by the root filesystem, through the
+        // dispatcher's forward, which only a request addressed to that node
+        // reaches. The walk ends there and the client sends the rest of its
+        // path to the node's cap.
+        self.resolve(dir)
+            .is_some_and(|idx| self.fallthrough_of(idx) == 0)
+    }
+
     fn stat(&mut self, node: NodeId) -> Result<NodeStat, NsError>
     {
         if self.resolve(node).is_none()
@@ -1505,6 +1516,20 @@ mod tests
             view.target,
             EntryTarget::Local(NodeId::from_raw_truncated(u64::from(a)))
         );
+    }
+
+    #[test]
+    fn a_walk_continues_only_into_a_synthetic_node_without_a_fall_through()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        let node = NodeId::from_raw_truncated(u64::from(a));
+        assert!(b.needs_fallthrough(a));
+        assert!(b.continues_walk(node));
+        assert!(b.set_fallthrough_cap(a, CAP));
+        assert!(!b.continues_walk(node));
+        let unused = NodeId::from_raw_truncated(u64::from(UNUSED_IDX));
+        assert!(!b.continues_walk(unused));
     }
 
     #[test]

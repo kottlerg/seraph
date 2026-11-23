@@ -456,6 +456,7 @@ pub(super) fn bootloader_under(
         release: args.release,
         component: BuildComponent::Boot,
         debug: Vec::new(),
+        limited_debug: Vec::new(),
         // The lint pass is the build's; this compiles the tree it checked.
         skip_lints: true,
         ktest_bench_only: false,

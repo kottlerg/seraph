@@ -31,6 +31,34 @@ pub fn ns_lookup(
     Ok((cap, kind, size))
 }
 
+/// Issue one `NS_LOOKUP` of the `/`-separated `path` against `dir_cap` and
+/// return `(node_cap, kind, consumed)`, `consumed` being the number of
+/// components the server walked; on an error reply, `(label, index)`, the
+/// index naming the component that failed
+/// (shared/namespace-protocol/README.md § `NS_LOOKUP`).
+pub fn ns_lookup_path(
+    dir_cap: u64,
+    path: &[u8],
+    requested_rights: u64,
+    ipc_buf: *mut u64,
+) -> Result<(u64, u64, u64), (u64, u64)>
+{
+    let label = ipc::ns_labels::NS_LOOKUP | ((path.len() as u64) << 16);
+    let msg = ipc::IpcMessage::builder(label)
+        .word(0, requested_rights)
+        .bytes(1, path)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(dir_cap, &msg, ipc_buf) }
+        .map_err(|_| (namespace_protocol::NsError::IoError.as_label(), 0))?;
+    if reply.label != 0
+    {
+        return Err((reply.label, reply.word(0)));
+    }
+    let cap = *reply.caps().first().ok_or((0u64, 0u64))?;
+    Ok((cap, reply.word(0), reply.word(2)))
+}
+
 /// Issue `NS_STAT` against `node_cap` and return `(size, mtime, kind)`.
 pub fn ns_stat(node_cap: u64, ipc_buf: *mut u64) -> Result<(u64, u64, u64), u64>
 {

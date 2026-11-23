@@ -10,7 +10,7 @@
 //! `ns_programs_subtree_phase` respectively.
 
 use crate::bootstrap::Caps;
-use crate::ipc_util::ns::{ns_lookup, ns_readdir, ns_stat};
+use crate::ipc_util::ns::{ns_lookup, ns_lookup_path, ns_readdir, ns_stat};
 use crate::runner::Phase;
 
 /// Phases that run before the FS-IPC and FS-std clusters.
@@ -430,6 +430,8 @@ pub fn ns_multi_component_phase(_: &Caps)
     let _ = syscall::cap_delete(esp_cap);
     std::os::seraph::log!("ns_multi_component: NS_LOOKUP /esp/EFI (terminal contents) ok");
 
+    multi_component_lookups(system_root_cap, ipc_buf);
+
     // `/data/test.txt` resolves through the SERAPH_DATA partition vfsd
     // auto-mounts at `/data`; the in-tree image carries the fixture there.
     // The marker check is content-only.
@@ -440,6 +442,65 @@ pub fn ns_multi_component_phase(_: &Caps)
         "ns_multi_component: marker missing from /data/test.txt body: {body:?}"
     );
     std::os::seraph::log!("ns_multi_component phase passed");
+}
+
+/// One `NS_LOOKUP` of several components walks as far as the server that
+/// answers it owns them (shared/namespace-protocol/README.md § `NS_LOOKUP`):
+/// at the system root, vfsd stops at a mount and forwards a root-fs path
+/// whole to the root fs, which walks all of it; and std's walk of a path the
+/// root fs owns costs one call.
+fn multi_component_lookups(system_root_cap: u64, ipc_buf: *mut u64)
+{
+    use namespace_protocol::{NodeKind, NsError};
+
+    let dir = NodeKind::Dir as u64;
+    // `esp` is a mount: the walk stops there, and `EFI` is the mount's.
+    let (esp_cap, kind, consumed) = ns_lookup_path(system_root_cap, b"esp/EFI", 0xFFFF, ipc_buf)
+        .expect("ns_multi_component: NS_LOOKUP(/, esp/EFI) failed");
+    assert_eq!(
+        (kind, consumed),
+        (dir, 1),
+        "ns_multi_component: esp/EFI must stop at the /esp mount"
+    );
+    let (efi_cap, kind, consumed) = ns_lookup_path(esp_cap, b"EFI", 0xFFFF, ipc_buf)
+        .expect("ns_multi_component: NS_LOOKUP(/esp, EFI) after the stop failed");
+    assert_eq!((kind, consumed), (dir, 1));
+    let _ = syscall::cap_delete(efi_cap);
+    let _ = syscall::cap_delete(esp_cap);
+    std::os::seraph::log!("ns_multi_component: NS_LOOKUP esp/EFI stops at the mount ok");
+
+    // `services` is the root fs's: vfsd forwards the whole path, which the
+    // root fs walks in the one call.
+    let (fs_cap, kind, consumed) = ns_lookup_path(system_root_cap, b"services/fs", 0xFFFF, ipc_buf)
+        .expect("ns_multi_component: NS_LOOKUP(/, services/fs) failed");
+    assert_eq!(
+        (kind, consumed),
+        (dir, 2),
+        "ns_multi_component: services/fs must resolve in one request"
+    );
+    let _ = syscall::cap_delete(fs_cap);
+
+    let missing = ns_lookup_path(system_root_cap, b"services/no_such/x", 0xFFFF, ipc_buf);
+    assert_eq!(
+        missing.err(),
+        Some((NsError::NotFound.as_label(), 1)),
+        "ns_multi_component: services/no_such/x must fail at component 1"
+    );
+    std::os::seraph::log!("ns_multi_component: NS_LOOKUP through the root-fs forward ok");
+
+    let before = std::os::seraph::fs::ns_lookup_calls();
+    let meta = std::fs::metadata("/services/fs/fatfs")
+        .expect("ns_multi_component: std::fs::metadata(/services/fs/fatfs) failed");
+    let calls = std::os::seraph::fs::ns_lookup_calls().wrapping_sub(before);
+    assert!(
+        meta.is_file(),
+        "ns_multi_component: /services/fs/fatfs must be a file"
+    );
+    assert_eq!(
+        calls, 1,
+        "ns_multi_component: std's walk of /services/fs/fatfs must make one NS_LOOKUP"
+    );
+    std::os::seraph::log!("ns_multi_component: std walks /services/fs/fatfs in one NS_LOOKUP ok");
 }
 
 pub fn ns_sandbox_phase(_: &Caps)

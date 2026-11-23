@@ -9,11 +9,12 @@ endpoint.
 
 `walk_to_file` resolves a path to a per-file cap, for example before
 `procmgr_labels::CREATE_FROM_FILE`; `walk_to_dir` derives an attenuated subtree or cwd cap to
-install on a child through `procmgr_labels::CONFIGURE_NAMESPACE`. Both issue one `NS_LOOKUP`
-per path component, mirroring the walk in `runtime/ruststd/src/sys/fs/seraph.rs`, and send
-`requested_rights` on every hop, so the returned cap carries at most those rights. The
-sentinel `0xFFFF` requests "everything the caller is allowed", so each hop carries the
-rights the server composes from the parent cap and the entry
+install on a child through `procmgr_labels::CONFIGURE_NAMESPACE`. Both issue `NS_LOOKUP` requests
+through `namespace_protocol::client::PathWalk`, each carrying as many whole remaining components as
+fit `MAX_LOOKUP_PATH_LEN` and continuing from the returned cap, as std's walk in
+`runtime/ruststd/src/sys/fs/seraph.rs` does, and send `requested_rights` for every component, so the
+returned cap carries at most those rights. The sentinel `0xFFFF` requests "everything the caller is
+allowed", so each component carries the rights the server composes from the parent cap and the entry
 ([shared/namespace-protocol/README.md](../namespace-protocol/README.md) § NS_LOOKUP).
 
 ---

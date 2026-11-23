@@ -606,6 +606,7 @@ name = "ns-client"
 version = "0.1.5"
 dependencies = [
  "ipc",
+ "namespace-protocol",
  "syscall",
 ]
 

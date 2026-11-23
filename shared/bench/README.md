@@ -77,7 +77,7 @@ The line is a single line of space-separated tokens, wrapped above for width onl
 
 | Part | Meaning |
 |---|---|
-| `<suite>` | The program that ran the benchmark: `ktest`, `fsbench`, `demandpaged` |
+| `<suite>` | The program that ran the benchmark: `ktest`, `fsbench`, `ubench` |
 | `<name>` | The benchmark within the suite |
 | Variant parameters | The case of the benchmark that ran (`pages=32`, `op=unmap`); before `arch=` |
 | `arch=` | The architecture the reporting program is built for: `x86_64` or `riscv64` |
@@ -109,7 +109,7 @@ whole log can be scanned. A program logs no other text of the form `bench <word>
 | Consumer | Suite | What it reports |
 |---|---|---|
 | [`core/ktest`](../../core/ktest/README.md) | `ktest` | Tier 3, one line per kernel benchmark (§ Tier 3) |
-| [`programs/fsbench`](../../programs/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size |
+| [`programs/fsbench`](../../programs/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3` |
 | [`programs/ubench`](../../programs/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring` and `ubench.console_write`, per variant |
 
 ---

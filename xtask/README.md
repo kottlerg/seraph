@@ -1484,16 +1484,22 @@ fails naming the install commands ([docs/build-system.md](../docs/build-system.m
 § Toolchain) on another release or none.
 
 For each selected crate it runs `cargo kani --tests -p <package>` (with `--harness` when given),
-which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies
-each harness with Kani's unwinding assertions on. It prints Kani's output as it comes and judges
-it as well as Kani's verdict: the crate fails when `cargo kani` exits unsuccessfully, when a
-harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED` check or a
-`FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's verdict
-names), and when Kani's closing summary is missing, counts a failure or no harness, or counts
-other harnesses than reported a verdict. Every selected crate runs, and the command fails naming
-each that failed. CI's `kani` job runs the command with no option, after installing the release
-`--pin` prints ([docs/build-system.md](../docs/build-system.md#continuous-integration)
-§ Continuous Integration).
+which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies each
+harness with Kani's unwinding assertions on. It runs `cargo kani` under `prlimit --as` (util-linux),
+which holds each process of the run (`cargo`, the Kani compiler, and the CBMC of each harness, which
+Kani runs one at a time) to 12 GiB of address space (`MEMORY_LIMIT_GIB`). The limit derives from the
+runner CI's `kani` job runs on (`ubuntu-latest` for a public repository: 4 vCPUs, 16 GB), leaving
+4 GB to the runner's own processes, so a harness whose CBMC needs more fails, named as out of memory
+under the limit, where without it the runner would be shut down with no verdict. It prints Kani's
+output as it comes and judges it as well as Kani's verdict: the crate fails when `cargo kani` exits
+unsuccessfully, when a harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED`
+check or a `FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's
+verdict names), and when Kani's closing summary is missing, counts a failure or no harness, or
+counts other harnesses than reported a verdict; a harness that Kani starts and prints no verdict for
+fails too. Every selected crate runs, and the command then prints a table of every harness, by
+package and path, with its verdict and verification time, and fails naming each crate that failed.
+CI's `kani` job runs the command with no option, after installing the release `--pin` prints
+([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
 
 No assistant session runs Kani: `cargo install` is outside the permissions
 `.claude/settings.json` grants, and the `bash` hook refuses `cargo kani`

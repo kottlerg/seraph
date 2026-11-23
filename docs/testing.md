@@ -2118,9 +2118,11 @@ to the rules of [coding-standards.md](coding-standards.md#proof-harnesses) § Pr
 every crate that holds one, each crate built in its host test configuration, with the pinned Kani
 release ([build-system.md](build-system.md#toolchain) § Toolchain). It fails on any failed,
 undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a
-harness that lies in no package. It finds the crates from their harnesses, so a crate's
-first harness adds it to the run. CI's `kani` job runs it on every push and pull request,
-and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
+harness that lies in no package. It finds the crates from their harnesses, so a crate's first
+harness adds it to the run. It holds each process of the run to the address space CI's runner can
+give a harness, so a harness that needs more fails, named as out of memory, and it closes with
+every harness's verdict and verification time. CI's `kani` job runs it on every push and pull
+request, and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
 
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage

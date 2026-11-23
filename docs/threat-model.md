@@ -279,8 +279,8 @@ and proof harnesses for `validate`, `validate_executable`, `parse_stack_note`, `
   `elf::validate_executable`, `elf::find_note_streaming` and the declaration decoder with bytes no
   key signed. procmgr still refuses to run such a file
   ([#1533](https://github.com/kottlerg/seraph/issues/1533)).
-- No fuzz target or proof harness covers `shared/elf` yet, and none is planned for
-  `find_note_streaming` or the declaration decoder.
+- No fuzz target or proof harness covers `shared/elf` yet. Those for `find_note_streaming` and the
+  declaration decoder are planned ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---
 
@@ -323,7 +323,8 @@ and `find_module_slot` ([#680](https://github.com/kottlerg/seraph/issues/680),
 - The bundle header is unsigned, so the attacker can drop an entry, which fails the boot when it is
   needed ([signing.md](signing.md) § Which Stage Verifies What).
 - The firmware-table parsers (the bootloader's `core/boot/src/acpi.rs` and `core/boot/src/dtb.rs`,
-  and devmgr's `firmware` crate) have no fuzz target or proof harness, and none is planned.
+  and devmgr's `firmware` crate) have no fuzz target or proof harness yet; they are planned
+  ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---
 
@@ -384,7 +385,8 @@ the confinement policy and hot-add ([testing.md](testing.md) § Gating).
   block device reach a registered client region from its registration to its unregistration, not
   only during one request; design intent, not yet implemented.
 - No fuzz target or proof harness covers a driver's decoding of what its device writes (VirtIO used
-  rings, configuration space), and none is planned.
+  rings, configuration space) yet; one is planned
+  ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---
 
@@ -432,8 +434,8 @@ Wycheproof vectors, `shared/objsig` is host-tested, and the booted `signing`, `r
   directory at an admitted security version verifies
   ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
 - The parsers of the signature trailer, the certificate, the trust store and the trust request,
-  which read bytes before any signature over them is checked, have no fuzz target or proof harness,
-  and none is planned.
+  which read bytes before any signature over them is checked, have no fuzz target or proof harness
+  yet; they are planned ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 - devmgr parses drivers-directory files before procmgr verifies them (§ ELF Loading,
   [#1533](https://github.com/kottlerg/seraph/issues/1533)).
 - Secure Boot and a TPM are not required by the platform floor

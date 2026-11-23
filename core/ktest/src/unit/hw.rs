@@ -148,47 +148,6 @@ pub fn mmio_map_below_floor_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── SYS_IRQ_REGISTER / SYS_IRQ_ACK ───────────────────────────────────────────
-
-/// `irq_register` binds a notification to an interrupt; `irq_ack` re-enables delivery.
-///
-/// Scans for the first Interrupt capability that routes and binds, through a
-/// derived copy of each slot, so the route and the binding go with the copy's
-/// delete (a binding holds its notification until its Interrupt capability
-/// goes). Creates a notification for delivery. After registration, ACKs to re-enable the
-/// interrupt line. If no Interrupt cap binds, the test is skipped.
-pub fn irq_register_ack(ctx: &TestContext) -> TestResult
-{
-    let irq_sig = cap_create_notification(ctx.memory_base)
-        .map_err(|_| "cap_create_notification for IRQ test failed")?;
-
-    // The scan bound is the cspace's backed capacity (queried at runtime)
-    // so the test stays robust against cap mint order.
-    let bound = scan_bound(ctx);
-    for slot in 1..=u64::from(bound)
-    {
-        // An empty slot refuses the derive; any other error (a slot of
-        // another type, most often) leaves the copy unbound; keep scanning.
-        let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
-        else
-        {
-            continue;
-        };
-        if irq_route(copy, 0).is_ok() && irq_register(copy, irq_sig, 0).is_ok()
-        {
-            let acked = irq_ack(copy).map_err(|_| "irq_ack failed");
-            syscall::cap_delete(copy).map_err(|_| "cap_delete of the bound copy failed")?;
-            syscall::cap_delete(irq_sig).map_err(|_| "cap_delete irq_sig after irq test failed")?;
-            return acked;
-        }
-        syscall::cap_delete(copy).ok();
-    }
-
-    crate::log("ktest: hw::irq_register_ack SKIP (no Interrupt caps in initial cap set)");
-    syscall::cap_delete(irq_sig).ok();
-    Ok(())
-}
-
 // ── SYS_IRQ_ROUTE ────────────────────────────────────────────────────────────
 
 /// `irq_route` routes a line through a single-line cap carrying

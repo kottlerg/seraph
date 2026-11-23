@@ -126,14 +126,6 @@ enum Timing
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    if !crate::arch::MSG_INJECTABLE
-    {
-        crate::log(
-            "ktest: stress::msg_inject_delete_race SKIP (no user-mode message write on this \
-             architecture; the irq.rs host tests cover the race)",
-        );
-        return Ok(());
-    }
     let cpus = system_info(SystemInfoType::CpuCount as u64)
         .map_err(|_| "stress::msg_inject_delete_race: system_info(CpuCount) failed")?;
     if cpus < MIN_CPUS

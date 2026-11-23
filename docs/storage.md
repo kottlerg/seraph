@@ -106,8 +106,9 @@ badge. See
 
 ## GPT Role-GUID Discovery
 
-Partition identity in Seraph is a GPT type GUID, not a position, label,
-or on-disk UUID. The model is:
+Partition identity in Seraph is a GPT type GUID on the boot disk, and a
+unique partition GUID a signed statement names on any other disk; never a
+position, a label, or a filesystem UUID. The model is:
 
 - **Seraph-minted root GUIDs are arch-distinguished**, following the
   Discoverable Partitions Specification convention. A single disk
@@ -119,30 +120,73 @@ or on-disk UUID. The model is:
   and the arch-neutral [`SERAPH_DATA`](../abi/boot-protocol/src/role_guids.rs)
   and [`SERAPH_SWAP`](../abi/boot-protocol/src/role_guids.rs)
   in [`abi/boot-protocol/src/role_guids.rs`](../abi/boot-protocol/src/role_guids.rs).
-- **The EFI System Partition is auto-mounted at `/esp`** immediately
-  after the root self-mount, using the standard ESP type GUID
-  `c12a7328-f81f-11d2-ba4b-00a0c93ec93b`. No caller issues a
-  `MOUNT` for `/esp`; vfsd does so internally at startup. ESP mount
-  is best-effort and failure is non-fatal.
-- **The Seraph data partition is auto-mounted at `/data`** immediately
-  after the ESP, using the arch-neutral `SERAPH_DATA` type GUID. vfsd
-  mounts it internally at startup, like the ESP. The mount is
-  best-effort: when no `SERAPH_DATA` partition is present — or its
-  lookup is ambiguous (duplicate tied priority) — vfsd skips the mount
-  and `/data` falls through to the root partition, serving any `/data`
-  tree present there (or resolving as absent if none). Unlike the root
-  self-mount, an absent or ambiguous data partition is never fatal.
-  Whether `/data` is a dedicated partition or a root-fs directory is
-  therefore a disk-authoring choice, not a vfsd concern; the in-tree
-  image (see [build-system.md](build-system.md)) carries the tree on the
-  partition only.
+- **The boot disk is the disk the firmware booted from.** The bootloader
+  reports the boot ESP's GPT descriptor (partition number, first LBA,
+  size, unique partition GUID) and the PCI location of the controller
+  beneath it, which reach vfsd in init's bootstrap round
+  ([boot-flow.md](../core/boot/docs/boot-flow.md#step-1-uefi-protocol-discovery),
+  [vfs-ipc-interface.md](../services/vfsd/docs/vfs-ipc-interface.md)). After its startup discovery
+  (below), vfsd takes as the boot disk the one held disk at that
+  location, compared whole, segment included, that carries an
+  ESP-type partition matching the descriptor. With no location reported
+  (a controller that is no PCI function; the tree has none), the boot disk
+  is the one held disk carrying the descriptor. No disk at the location,
+  none there carrying the descriptor, or two or more carrying it, and there
+  is no boot disk: vfsd logs `no boot disk:` with the reason, the
+  reported location and descriptor and each held disk's location, no
+  partition takes any role, and the root self-mount fails. The boot disk is
+  fixed for the boot.
+- **The root and `/esp` resolve on the boot disk alone.** The root is the
+  boot disk's partition of the arch root type GUID of the highest
+  priority (below); a tie there is a fatal boot error that must be
+  repaired, and only the boot disk's own writer can make one. The EFI
+  System Partition is the descriptor's partition, auto-mounted at `/esp`
+  immediately after the root self-mount and the statement's read; the
+  mount is best-effort and its failure non-fatal.
+- **Another disk takes a role only by the storage statement.** The
+  statement is `/config/vfsd/storage.conf` on the root filesystem
+  ([`shared/storage-statement`](../shared/storage-statement/README.md)
+  owns its format), signed in the configuration role under its install
+  path ([signing.md](signing.md#configuration)). vfsd reads it once per
+  boot, through procmgr's verified read, after the root self-mount and
+  before the `/esp` and data auto-mounts. Each line names a role's
+  partition by its unique partition GUID: `data <mount path> <GUID>`, any
+  number at distinct paths, and `swap <GUID>`, at most one. A statement
+  that is missing, refused by the verified read, or refused whole by the
+  parser is logged and names nothing: every role then resolves on the
+  boot disk. A named role takes the named partition only, and only when
+  it carries the role's type GUID: the boot disk's when the boot disk
+  holds it, else the one other held disk's that carries it. On no disk it
+  is not found; on two or more disks other than the boot disk, or with
+  another type, it is not taken; each is logged and never fatal. A role
+  the statement does not name resolves on the boot disk by type GUID and
+  priority.
+- **A disk neither the boot disk nor named takes no role**, at any
+  priority. vfsd still holds it and parses its GPT, since a partition the
+  statement names, or one on a disk added later, may be on it. A copy of
+  a named partition on a second disk other than the boot disk denies that
+  role, skipped and logged; a copy of the boot disk is not at the boot
+  controller's location and takes nothing.
+- **Data partitions are auto-mounted.** After `/esp`, vfsd mounts each data
+  partition the statement names at its path, then, unless the statement
+  names one for `/data`, the boot disk's `SERAPH_DATA` partition at
+  `/data`. Each mount is best-effort: when no partition resolves (none
+  present, a tie, or a named partition not taken), vfsd skips the mount and
+  the path falls through to the root partition, serving any tree present
+  there (or resolving as absent if none); never fatal. Whether `/data` is
+  a dedicated partition or a root-fs directory is therefore a
+  disk-authoring choice, not a vfsd concern; the in-tree image (see
+  [build-system.md](build-system.md)) carries the tree on the partition
+  only.
 - **The swap partition is never mounted.** It carries no filesystem: vfsd
-  looks it up by the arch-neutral `SERAPH_SWAP` type GUID on the first
+  resolves it, by the statement's `swap` line or else on the boot disk by
+  the arch-neutral `SERAPH_SWAP` type GUID, on the first
   `GET_SWAP_PARTITION` request, not at startup, and hands the swap
-  service a raw partition cap on it. A disk with no swap partition boots
+  service a raw partition cap on it. A boot with no swap partition boots
   as one with: the request then replies `NO_MOUNT`. The in-tree image
-  carries one, the last partition of `disk.img`.
-- **Every disk is searched.** At startup vfsd sends `QUERY_DEVICE` on the block class SEND
+  carries one, the last partition of `disk.img`, or of `disk-data.img`
+  in the split layout, where the staged statement names it.
+- **Every disk is held.** At startup vfsd sends `QUERY_DEVICE` on the block class SEND
   at instance ordinals 0, 1, …, passing a `WITHDRAWN` one (a disk whose
   driver devmgr withdrew when it died), until another reply is not
   `SUCCESS`, holds the whole-disk cap of every block driver devmgr
@@ -150,33 +194,42 @@ or on-disk UUID. The model is:
   (`QUERY_DEVICE_LOCATION`), and parses each disk's GPT: the primary, or, when the primary's
   header or entry array fails its CRC32 or `MyLBA` check or cannot be read, the backup at the
   disk's last LBA, as UEFI 2.10 § 5.3.2 directs; vfsd writes neither copy. Before a runtime
-  `MOUNT` and the first `GET_SWAP_PARTITION` look their role up, vfsd queries again from
+  `MOUNT` and the first `GET_SWAP_PARTITION` resolve their role, vfsd queries again from
   the first ordinal not yet queried and holds each disk devmgr served
-  since, a disk added or inserted again after startup among them. A role
-  lookup, at the root self-mount, the auto-mounts, a runtime `MOUNT`,
-  and the first `GET_SWAP_PARTITION`, so considers the partitions of
-  every disk devmgr serves, under the priority and tie rules below; a
-  disk neither of whose GPT copies can be read and validated contributes none. The
-  partition's `REGISTER_PARTITION` goes
-  to the block driver of the disk that holds it.
-- **DPS-style priority tie-break.** Where multiple partitions match
-  a role GUID, on one disk or across disks, GPT attribute bits 48–63 are
-  compared as an unsigned priority; the highest wins, whichever disk holds
-  it. A tie at the highest priority is ambiguous whether the tied
-  partitions share a disk or not: the instance ordinal follows PCI order
-  and is not stable across boots
-  ([device-management.md](device-management.md#relationship-to-other-services)),
-  so disk order never breaks a tie. For the root role an ambiguity is a
-  fatal boot error that must be repaired; the `/esp` and `/data`
-  auto-mounts skip the mount, and `GET_SWAP_PARTITION` replies
-  `NO_MOUNT`.
+  since, a disk added or inserted again after startup among them, so a
+  partition the statement names on such a disk is found. A disk neither
+  of whose GPT copies can be read and validated contributes no partition.
+  The partition's `REGISTER_PARTITION` goes to the block driver of the
+  disk that holds it, and each mount and hand-out logs that disk's
+  location.
+- **DPS-style priority.** Where several of the boot disk's partitions
+  carry a role's type GUID, GPT attribute bits 48–63 are compared as an
+  unsigned priority; the highest wins. A tie at the highest priority is
+  ambiguous: for the root role a fatal boot error that must be repaired;
+  the `/data` auto-mount skips the mount, and `GET_SWAP_PARTITION`
+  replies `NO_MOUNT`. Priority is read on the boot disk alone: no
+  partition of another disk is ranked against the boot disk's.
 - **Nothing else binds.** There is no `mounts.conf`, no `/etc/fstab`,
   no kernel command line carrying mount config, no on-disk
-  filesystem label or UUID consulted by vfsd. The GUID is the
-  binding.
+  filesystem label or filesystem UUID consulted by vfsd. The boot disk's
+  type GUIDs and the signed statement's partition GUIDs are the binding.
 
-The role-GUID model is the only mount-discovery mechanism. The
-`MOUNT` request's wire shape (a `MountRole` byte mapped to a type GUID)
+**Known limit: the PCI segment.** Bus, device and function agree between
+the bootloader's report and devmgr's on every platform: devmgr keeps the
+bus numbers the firmware assigned
+([pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md)). The
+segment is a software number on both sides, the firmware root bridge's
+and the one devmgr gives each ECAM range, and the two can differ on a
+platform described by a Device Tree alone with more than one ECAM host
+bridge whose nodes carry no `linux,pci-domain`. There no disk is at the
+reported location, so there is no boot disk and the boot halts. The fix
+belongs in how devmgr numbers segments, not in a wider match in vfsd,
+which would let a disk at another location stand in for the boot disk.
+QEMU `q35` and `virt` under EDK2 describe PCI by MCFG with one segment
+and cannot hit it.
+
+The boot disk and the statement are the only mount-discovery mechanism. The
+`MOUNT` request's wire shape (a `MountRole` byte and a mount path)
 is owned by [`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md).
 
 ---
@@ -189,7 +242,8 @@ Three actors cooperate to bring a filesystem online:
 `SEED_AUTHORITY`-badged SEND derived from it (required by the
 `GET_SYSTEM_ROOT_CAP` gate). Init issues no `MOUNT` — vfsd
 self-mounts root; the `vfsd_labels::MOUNT_AUTHORITY`-badged SEND it endows svcmgr
-with (published as `vfsd.mount`) reaches only svctest. Init pulls the system root via
+with (published as `vfsd.mount`) reaches only test fixtures, svctest and the
+`hotplug-check` disk fixture, each staged by its case. Init pulls the system root via
 `GET_SYSTEM_ROOT_CAP` (which vfsd serves only once root is mounted, so
 the call blocks until the root filesystem is up, and replies `NO_MOUNT`
 if the root self-mount failed), then distributes
@@ -199,18 +253,19 @@ filesystem access of its own. The `GET_SYSTEM_ROOT_CAP` contract is
 owned by
 [`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md).
 
-**vfsd** parses every held disk's GPT once at startup, then self-mounts
-the root partition: it resolves the arch root GUID, looks the partition
-up across the parsed tables, registers the partition bound with the
-virtio-blk instance of the disk that holds it,
+**vfsd** parses every held disk's GPT once at startup, identifies the
+boot disk among them, then self-mounts the root partition: it resolves
+the arch root GUID on the boot disk's parsed table, registers the
+partition bound with the virtio-blk instance of the boot disk,
 spawns the fs driver, sends `FS_MOUNT` to validate the BPB, and
 captures the driver's root cap into the synthetic root (see
 [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)).
-It then auto-mounts the ESP at `/esp` and the data partition at
-`/data`. All three run before any service thread serves a request, so
-`GET_SYSTEM_ROOT_CAP` never observes an unmounted root. The runtime
-`MOUNT` label carries a `MountRole` byte (`Root` or `Data`; any other
-byte is rejected) and shares this resolution path.
+It then reads the storage statement and auto-mounts the ESP at `/esp`
+and the data partitions (§ GPT Role-GUID Discovery). All of these run
+before any service thread serves a request, so `GET_SYSTEM_ROOT_CAP`
+never observes an unmounted root. The runtime `MOUNT` label carries a
+`MountRole` byte (`Root` or `Data`; any other byte is rejected) and a
+mount path, and shares this resolution path.
 
 **fs driver** runs as a separate process. After `FS_MOUNT` succeeds,
 it serves the cap-native `NS_*` protocol plus the surviving
@@ -392,13 +447,18 @@ To prevent inference of behavior that does not exist:
   inheritance, no kernel mount-table syscall. Mounts are entries in
   vfsd's synthetic root, reachable only via a held cap on vfsd's
   namespace endpoint.
-- **No filesystem labels or on-disk UUIDs as identity.** Partition
-  identity is the GPT type GUID plus DPS attribute-bit priority.
-  Filesystem-level labels (FAT volume label, ext4 superblock UUID,
-  etc.) are not consulted by vfsd.
-- **No boot-time mount configuration file.** Discovery is GPT-driven
-  and arch-conditional; there is no `mounts.conf`, no `/etc/fstab`,
+- **No filesystem labels or filesystem UUIDs as identity.** Partition
+  identity is the GPT type GUID plus DPS attribute-bit priority on the
+  boot disk, and the GPT unique partition GUID the signed statement names
+  on another disk. Filesystem-level labels (FAT volume label, ext4
+  superblock UUID, etc.) are not consulted by vfsd.
+- **No unsigned mount configuration.** The one configuration file is the
+  storage statement, signed in the configuration role, which only names
+  partitions for roles; there is no `mounts.conf`, no `/etc/fstab`,
   and no kernel command line carrying mount config.
+- **No role from a disk's own say-so.** A disk other than the boot disk
+  takes no role by its type GUIDs or priority bits, whatever they are;
+  only the statement gives it one.
 - **No process-global filesystem authority.** A process delivered no
   namespace cap has no filesystem access; `std::fs` returns
   `Unsupported`. There is no fallback to a system identity. See

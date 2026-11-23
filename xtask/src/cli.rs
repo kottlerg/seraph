@@ -1208,6 +1208,10 @@ value_enum! {
         Vmgenid,
         /// PCI Express hotplug of a device and of a disk behind root ports.
         Hotplug,
+        /// vfsd gives each storage role to the boot disk or to the partition
+        /// the signed storage statement names, and none to a foreign disk or a
+        /// copy of the boot disk.
+        StorageRoles,
         /// The kernel's CET supervisor shadow stacks, under KVM (`x86_64`
         /// only).
         Cet,

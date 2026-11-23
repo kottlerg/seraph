@@ -323,6 +323,7 @@ dependencies = [
  "fuzz-engine",
  "hwrng-protocol",
  "init-protocol",
+ "storage-statement",
  "vfsd-gpt",
 ]
 
@@ -873,6 +874,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "storage-statement"
+version = "0.1.5"
+dependencies = [
+ "boot-protocol",
+]
+
+[[package]]
 name = "svc-grammar"
 version = "0.1.5"
 
@@ -934,6 +942,7 @@ dependencies = [
  "recv-pool",
  "restart-budget",
  "shmem",
+ "storage-statement",
  "syscall",
  "syscall-abi",
 ]
@@ -1078,6 +1087,8 @@ dependencies = [
  "boot-protocol",
  "ipc",
  "namespace-protocol",
+ "ns-client",
+ "storage-statement",
  "syscall",
  "syscall-abi",
  "vfsd-gpt",
@@ -1178,6 +1189,7 @@ dependencies = [
  "objsig",
  "procmgr-process-table",
  "restart-budget",
+ "storage-statement",
  "syscall-abi",
  "vfsd-gpt",
 ]

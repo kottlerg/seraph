@@ -535,13 +535,16 @@ policy, which ktest does not read; ktest is monolithic and does not spawn usersp
 (from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
 excluding `esp/` and `data/`), an arch-neutral `SERAPH_DATA`
 partition (from `sysroot/data/`), and a 64 MiB raw swap partition of the arch-neutral
-`SERAPH_SWAP` type GUID (no filesystem, left zero), always the last partition of `disk.img`. The
-data partition is authored unconditionally; `mkdisk --split-data` authors it alone on a second
-image, `disk-data.img` beside `disk.img`, which then carries the ESP, root and swap, for a
-boot that attaches the pair (`run --second-disk disk-data.img`), and every
-other authoring removes a `disk-data.img` left beside it. vfsd auto-mounts
-the data partition at `/data`, on whichever disk holds it; the data tree
-lives only on this partition, not on root. Every GUID the images carry is fixed (each
+`SERAPH_SWAP` type GUID (no filesystem, left zero), always the last partition of its image. The
+data partition is authored unconditionally; `mkdisk --split-data` authors it and the swap
+partition on a second image, `disk-data.img` beside `disk.img`, which then carries the ESP and
+root, for a boot that attaches the pair (`run --second-disk disk-data.img`), and stages the storage
+statement naming the two by their unique GUIDs at `sysroot/config/vfsd/storage.conf`, which the
+pack signs in the configuration role under `/config/vfsd/storage.conf`: vfsd gives a disk other
+than the boot disk a role only where the statement names its partition. Every other authoring
+removes a `disk-data.img` left beside it, and a statement whose body is the staged one. vfsd
+auto-mounts the data partition at `/data`; the data tree lives only on this partition, not on
+root. Every GUID the images carry is fixed (each
 image's disk GUID and each partition's unique GUID), and so is every FAT volume's metadata, so
 two authorings of one layout from one sysroot write identical images.
 (vfsd's fall-through would also serve `/data` from a root-fs directory,
@@ -604,7 +607,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest
 | `--knob` | none | Stage a presence-only bootloader knob in `\EFI\seraph\`, repeatable or comma-separated: `nokaslr` boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; `mapredo` makes the first attempt of the bootloader's steps 6 and 7 redo whatever its memory map's size ([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md) § Sizing the Entry Array). Every knob not named is removed |
 | `--log-levels` | the repository's | Install `FILE` at `/config/init/log-levels.conf` in place of `services/init/log-levels.conf`; refused, before anything changes, unless init's parser (`services/init/log-levels`) accepts every line, since init ignores a line it refuses |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
-| `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP, root and swap on `disk.img`, both at `--block-size`; omit to author all four on `disk.img` and remove a stale `disk-data.img` |
+| `--split-data` | `false` | Author the data and swap partitions on `disk-data.img` and the ESP and root on `disk.img`, both at `--block-size`, and stage the storage statement naming the two; omit to author all four on `disk.img` and remove a stale `disk-data.img` and the staged statement |
 
 A boot that redoes the bootloader's steps 6 and 7 logs `boot: memory map: mapredo knob present;
 redoing steps 6 and 7`, which `run --runs --require` matches, once in the run
@@ -758,6 +761,7 @@ options it takes:
 | `enrolment` | x86_64 (6), riscv64 (6) | init | usertest | none |
 | `secureboot` | x86_64 (4), riscv64 (4) | init | usertest | none |
 | `hotplug` | x86_64 (4), riscv64 (3) | init | host run | none |
+| `storage-roles` | x86_64 (4), riscv64 (4) | init | usertest | none |
 
 Before a case runs, `test` checks that the case runs on the architecture, that the sysroot was built
 for it, and that the recorded harness is the case's bundle (`ktest` for `kaslr` and `cet`, `init`
@@ -1385,6 +1389,35 @@ cargo xtask test hotplug [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
 Each boot to its markers is bounded by five minutes, and the fixture's verdict and the disk's bind
 by three minutes after their hot-add. The boots are the hotplug device cell of the local and release
 host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
+
+#### The `storage-roles` case
+
+Check that vfsd gives each storage role to the boot disk or to the partition the storage statement
+names, and none to another disk, on either arch. Boots the default boot set headless four times,
+each with a second disk (`virtio-blk-pci`, drive `hd1`), to the terminal's `terminal: READY for
+injection` line and swapd's `swap partition:` line, and reads vfsd's `boot controller:`, `boot
+disk:` and role lines (`root:`, `/esp:`, `/data:`, `swap:`, each naming its disk's location):
+
+1. the images repacked in the split-data layout, `disk-data.img` on the second slot: the root and
+   `/esp` on the boot disk, `/data` and swap named by the staged statement on the second disk;
+2. the single image, and a foreign disk (`target/xtask/storage-roles/foreign.img`, authored by
+   `disk::create_foreign_image`) on the second slot whose four partitions carry priority `0xFFFF`
+   under unique GUIDs of their own: every role on the boot disk;
+3. the same at priority 0, the boot disk's: every role on the boot disk;
+4. a copy of `disk.img` (`target/xtask/storage-roles/disk-copy.img`) on the second slot: the boot
+   disk at the boot controller's location, and every role on it.
+
+A `no boot disk:` line, a role on another disk than the boot says, or a missing line fails the boot.
+The scratch images are removed, and the images repacked in the layout they had, whatever the
+outcome. Each boot to its markers is bounded by four minutes. It requires a populated sysroot:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test storage-roles [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
+
+See [docs/testing.md](../docs/testing.md#storage-roles-storage-roles-case) § Storage roles for what
+each boot covers.
 
 ---
 

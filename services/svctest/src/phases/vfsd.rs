@@ -16,6 +16,7 @@
 //! path) install nothing and spawn no driver, which each checks through the
 //! replies and the mounted filesystems afterwards.
 
+use super::unmount::data_named_for_data_path;
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -151,7 +152,11 @@ fn mount_rejects_mounted_paths_phase(caps: &Caps)
 /// mounted at `/data`, replies `TABLE_FULL` in every one of
 /// `REJECT_ROUNDS` rounds and installs nothing: one driver serves a
 /// partition (vfs-ipc-interface.md § Label 10). A second driver over the
-/// partition would show as `SUCCESS` and a path that resolves.
+/// partition would show as `SUCCESS` and a path that resolves. With the
+/// data partition named for `/data` alone ([`data_named_for_data_path`])
+/// the fresh path resolves on the boot disk, which carries no data
+/// partition, and each round replies `NO_MOUNT` instead: a partition the
+/// statement names takes the role at its own path only.
 fn mount_rejects_mounted_partition_phase(caps: &Caps)
 {
     const FRESH: &str = "/svctest-data-again";
@@ -159,15 +164,22 @@ fn mount_rejects_mounted_partition_phase(caps: &Caps)
         caps.vfsd_mount, 0,
         "vfsd_mount_rejects_partition: no vfsd.mount seed"
     );
+    let (expected, name) = if data_named_for_data_path()
+    {
+        (ipc::vfsd_errors::NO_MOUNT, "NO_MOUNT")
+    }
+    else
+    {
+        (ipc::vfsd_errors::TABLE_FULL, "TABLE_FULL")
+    };
     for round in 0..REJECT_ROUNDS
     {
         let msg = mount_request(ROLE_DATA, FRESH.as_bytes(), FRESH.len() as u64);
         let label = mount_reply(caps.vfsd_mount, &msg, "vfsd_mount_rejects_partition");
         assert_eq!(
-            label,
-            ipc::vfsd_errors::TABLE_FULL,
-            "MOUNT of the mounted data partition at {FRESH} (round {round}) must reply \
-             TABLE_FULL (got {label:#x})"
+            label, expected,
+            "MOUNT of the data role at {FRESH} (round {round}) must reply {name} (got \
+             {label:#x})"
         );
     }
     assert!(
@@ -176,8 +188,8 @@ fn mount_rejects_mounted_partition_phase(caps: &Caps)
     );
     assert_mounts_answer("vfsd_mount_rejects_partition");
     std::os::seraph::log!(
-        "vfsd mounted-partition phase passed ({REJECT_ROUNDS} rounds of TABLE_FULL, \
-         nothing mounted)"
+        "vfsd mounted-partition phase passed ({REJECT_ROUNDS} rounds of {name}, nothing \
+         mounted)"
     );
 }
 

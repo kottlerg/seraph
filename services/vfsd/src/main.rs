@@ -31,7 +31,7 @@ mod worker;
 mod worker_pool;
 
 use std::os::seraph::startup_info;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use ipc::{IpcMessage, blk_labels, ns_labels};
 use namespace_protocol::{GateError, NsError, compose_forward_lookup_rights, gate};
@@ -49,7 +49,10 @@ use worker_pool::WorkerPool;
 /// within `driver::PROBE_TIMEOUT_MS`) and what an `UNMOUNT` handler blocks on (the
 /// driver's `FS_UNMOUNT` and its death, each within a bound, procmgr's
 /// `DESTROY_PROCESS`, and the `NS_LOOKUP` walk for a fall-through cap)
-/// never calls the service endpoint, and neither does the discovery of new
+/// never calls the service endpoint, and neither does the read of the
+/// storage statement after a runtime root `MOUNT` (the `NS_LOOKUP` walk to
+/// it and procmgr's `READ_VERIFIED`, whose read goes to the root fs
+/// driver) nor the discovery of new
 /// disks a `MOUNT` and the first `GET_SWAP_PARTITION` run before their role
 /// lookup: devmgr's `QUERY_DEVICE`, the GPT reads of each new disk, a
 /// scratch page from memmgr when a failed read lost the one held, and the
@@ -75,6 +78,9 @@ const FALLTHROUGH_TIMEOUT_MS: u32 = 10_000;
 /// message size, not a table; vfsd's only path limit, with each component
 /// bounded by `namespace_protocol::MAX_NAME_LEN`.
 const MAX_MOUNT_PATH_LEN: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 2) * 8;
+
+// Every path the storage statement names is one vfsd mounts at.
+const _: () = assert!(storage_statement::MAX_PATH_LEN <= MAX_MOUNT_PATH_LEN);
 
 // ── Data structures ────────────────────────────────────────────────────────
 
@@ -175,6 +181,99 @@ fn log_boot_device(device: &ipc::vfsd_bootstrap::BootDevice)
     }
 }
 
+/// The boot disk among `disks`, the disks held at startup: the one at the
+/// location the firmware reported, compared whole, that carries the boot ESP
+/// its device path describes (`gpt::find_boot_disk`). With none, logs why,
+/// with what the firmware reported and where each held disk sits, and
+/// returns `None`: then no role resolves on any disk, and the root
+/// self-mount fails.
+fn identify_boot_disk(
+    device: &ipc::vfsd_bootstrap::BootDevice,
+    disks: &[partition::Disk],
+) -> Option<BootDisk>
+{
+    let esp = device.esp.map(|esp| gpt::PartitionDescriptor {
+        type_guid: role_guids::EFI_SYSTEM_PARTITION,
+        unique_guid: esp.partition_guid,
+        number: esp.partition_number,
+        first_lba: esp.start_lba,
+        length_lba: esp.size_lba,
+    });
+    let found = match &esp
+    {
+        None => Err(String::from("the boot ESP was not reported")),
+        Some(esp) =>
+        {
+            let held = disks
+                .iter()
+                .map(|d| (d.location.as_ref(), d.partitions.as_slice()));
+            gpt::find_boot_disk(device.location.as_ref(), esp, held)
+                .map(|index| BootDisk { index, esp: *esp })
+                .map_err(|e| e.to_string())
+        }
+    };
+    match found
+    {
+        Ok(boot) =>
+        {
+            let disk = disks.get(boot.index);
+            std::os::seraph::log!(
+                "boot disk: disk {} at {}",
+                disk.map_or(0, |d| d.ordinal),
+                Where(disk.and_then(|d| d.location))
+            );
+            Some(boot)
+        }
+        Err(why) =>
+        {
+            std::os::seraph::log!(
+                error: "no boot disk: {why}; no disk takes a storage role (reported: controller at {})",
+                Where(device.location)
+            );
+            if let Some(esp) = &esp
+            {
+                let guid = storage_statement::format_guid(&esp.unique_guid);
+                std::os::seraph::log!(
+                    error: "no boot disk: reported ESP: partition {}, GUID {}, blocks {}+{}",
+                    esp.number,
+                    core::str::from_utf8(&guid).unwrap_or_default(),
+                    esp.first_lba,
+                    esp.length_lba
+                );
+            }
+            for d in disks
+            {
+                std::os::seraph::log!(
+                    error: "no boot disk: held disk {} at {}, {} partitions",
+                    d.ordinal,
+                    Where(d.location),
+                    d.partitions.len()
+                );
+            }
+            None
+        }
+    }
+}
+
+/// A disk's or a controller's location, as the log lines write it.
+struct Where(Option<ipc::vfsd_bootstrap::PciLocation>);
+
+impl core::fmt::Display for Where
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match self.0
+        {
+            Some(pci) => write!(
+                f,
+                "PCI {:04x}:{:02x}:{:02x}.{}",
+                pci.segment, pci.bus, pci.device, pci.function
+            ),
+            None => f.write_str("no PCI location"),
+        }
+    }
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────
 
 #[expect(
@@ -258,8 +357,9 @@ fn main() -> !
         idle_loop();
     };
 
-    // Hold every block device devmgr serves and parse each one's GPT; role
-    // lookups on MOUNT consider the partitions of all of them.
+    // Hold every block device devmgr serves and parse each one's GPT: the
+    // boot disk is found among them, and a statement may name a partition on
+    // any of them.
     std::os::seraph::log!("querying devmgr for block devices");
     let disks = discovery.discover(ipc_buf);
     if disks.is_empty()
@@ -267,6 +367,11 @@ fn main() -> !
         std::os::seraph::log!(error: "no block device available");
         idle_loop();
     }
+    // The boot disk is fixed from the disks held now: the root and `/esp`
+    // resolve on it alone, and every other role on it unless the storage
+    // statement names its partition (docs/storage.md § GPT Role-GUID
+    // Discovery).
+    let boot_disk = identify_boot_disk(&caps.boot_device, &disks);
 
     // Namespace endpoint: separate recv surface for the cap-native
     // protocol (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR`) against vfsd's
@@ -313,6 +418,8 @@ fn main() -> !
         system_root_cap,
         root_backend: Mutex::new(VfsdRootBackend::new()),
         swap: Mutex::new(swap::SwapPartition::new()),
+        boot_disk,
+        statement: OnceLock::new(),
     }));
 
     // Spawn the namespace dispatcher first: the `/esp` self-mount below
@@ -406,6 +513,35 @@ pub struct VfsdRuntime
     /// across a whole hand-out, so the first request's registration and a
     /// later request's revoke never interleave.
     pub swap: Mutex<swap::SwapPartition>,
+    /// The disk the firmware booted from, identified once at startup
+    /// ([`identify_boot_disk`]); `None` when there is none, and then no
+    /// role resolves on any disk. A disk index in `disks`, which keeps a
+    /// removed disk, so it names the same disk for the rest of the boot.
+    pub boot_disk: Option<BootDisk>,
+    /// The storage statement (`storage_statement::PATH`), read once after
+    /// the root mount ([`read_statement`]); unset until then, and read as
+    /// naming nothing ([`VfsdRuntime::statement`]).
+    pub statement: OnceLock<storage_statement::Statement>,
+}
+
+impl VfsdRuntime
+{
+    /// The storage statement read after the root mount, or the statement
+    /// that names nothing before it, or when none was taken.
+    fn statement(&self) -> &storage_statement::Statement
+    {
+        static NOTHING: storage_statement::Statement = storage_statement::Statement::new();
+        self.statement.get().unwrap_or(&NOTHING)
+    }
+}
+
+/// The boot disk: its index in `VfsdRuntime::disks` and the boot ESP the
+/// firmware's device path describes, which it carries.
+#[derive(Clone, Copy, Debug)]
+pub struct BootDisk
+{
+    pub index: usize,
+    pub esp: gpt::PartitionDescriptor,
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────
@@ -1044,15 +1180,12 @@ impl swap::SwapOps for SwapIo<'_>
 {
     fn lookup(&mut self) -> Result<gpt::PartitionLocation, gpt::GptLookupError>
     {
-        // The role resolves across every disk devmgr serves, as a mount role
-        // does (docs/storage.md § GPT Role-GUID Discovery): the discovery
-        // first holds each disk served since the last one.
+        // The role resolves as a mount role does (docs/storage.md § GPT
+        // Role-GUID Discovery): the partition the statement names, on any
+        // disk devmgr serves, so the discovery first holds each disk served
+        // since the last one; else the boot disk's by type and priority.
         discover_new_disks(self.rt, self.ipc_buf);
-        let disks = self.rt.disks.lock().unwrap_or_else(PoisonError::into_inner);
-        let disk_parts = disks.iter().map(|d| d.partitions.as_slice());
-        let found = gpt::lookup_partition_by_type_guid(&role_guids::SERAPH_SWAP, disk_parts);
-        drop(disks);
-        found
+        resolve_role(self.rt, Want::Swap).map(|(location, _)| location)
     }
 
     fn register(&mut self, location: &gpt::PartitionLocation) -> Option<u64>
@@ -1094,10 +1227,11 @@ impl swap::SwapOps for SwapIo<'_>
 /// hand-out returned ([`swap::SwapPartition::hand_out`]).
 ///
 /// The dispatcher admits only a `SWAP_AUTHORITY` badge. The partition is
-/// looked up and registered on the first request, never at startup, across
-/// every disk devmgr serves then ([`discover_new_disks`] first), so a disk
-/// with no swap partition changes nothing until a request, which then
-/// replies [`vfsd_errors::NO_MOUNT`]; so does a tie between swap partitions.
+/// resolved and registered on the first request, never at startup
+/// ([`resolve_role`], after [`discover_new_disks`]): the one the storage
+/// statement names, else the boot disk's by type and priority. With none,
+/// the request replies [`vfsd_errors::NO_MOUNT`]; so does a tie, and a
+/// named partition that is no swap partition.
 /// A failed registration, revoke or derivation replies
 /// [`vfsd_errors::IO_ERROR`].
 fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime)
@@ -1134,17 +1268,18 @@ fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime)
 
 // ── MOUNT handler ──────────────────────────────────────────────────────────
 
-/// Mount role decoded from the MOUNT IPC wire byte. The producer
-/// (init) declares which partition role it wants; vfsd resolves the
-/// role to a GPT type-GUID via [`MountRole::type_guid`] and then to a
-/// partition entry via [`gpt::lookup_partition_by_type_guid`].
+/// Mount role decoded from the MOUNT IPC wire byte. The holder of the
+/// `vfsd.mount` SEND, a test fixture, names the role it wants a partition of; vfsd resolves it to a partition with
+/// [`resolve_role`] (docs/storage.md § GPT Role-GUID Discovery).
 #[derive(Clone, Copy, Debug)]
 enum MountRole
 {
-    /// Seraph rootfs (`role_guids::SERAPH_ROOT`).
+    /// The Seraph root partition (`role_guids::SERAPH_ROOT`), on the boot
+    /// disk.
     Root,
-    /// Seraph data partition (`role_guids::SERAPH_DATA`), auto-mounted at
-    /// `/data`.
+    /// A Seraph data partition (`role_guids::SERAPH_DATA`) at the request's
+    /// path: the one the storage statement names for that path, else the
+    /// boot disk's by type and priority.
     Data,
 }
 
@@ -1160,29 +1295,178 @@ impl MountRole
         }
     }
 
-    fn type_guid(self) -> &'static [u8; 16]
+    /// What a mount of the role at `path` asks [`resolve_role`] for.
+    fn want(self, path: &[u8]) -> Want<'_>
     {
         match self
         {
-            MountRole::Root => &role_guids::SERAPH_ROOT,
-            MountRole::Data => &role_guids::SERAPH_DATA,
+            MountRole::Root => Want::Root,
+            MountRole::Data => Want::Data(path),
         }
     }
 }
 
-/// Mount the Seraph root partition at `/`, then auto-mount the ESP at
-/// `/esp` and the data partition at `/data`, during vfsd startup.
+/// A partition vfsd mounts or hands out, as [`resolve_role`] resolves it.
+#[derive(Clone, Copy, Debug)]
+enum Want<'a>
+{
+    /// The root partition: the boot disk's by type and priority.
+    Root,
+    /// The boot ESP the firmware's device path describes, on the boot disk.
+    Esp,
+    /// A data partition mounted at the path: the one the statement names
+    /// for the path, else the boot disk's by type and priority.
+    Data(&'a [u8]),
+    /// The swap partition: the one the statement names, else the boot
+    /// disk's by type and priority.
+    Swap,
+}
+
+impl Want<'_>
+{
+    /// The GPT partition type GUID the partition carries.
+    fn type_guid(self) -> [u8; 16]
+    {
+        match self
+        {
+            Want::Root => role_guids::SERAPH_ROOT,
+            Want::Esp => role_guids::EFI_SYSTEM_PARTITION,
+            Want::Data(_) => role_guids::SERAPH_DATA,
+            Want::Swap => role_guids::SERAPH_SWAP,
+        }
+    }
+
+    /// The unique GUID of the partition the statement names for it.
+    fn named(self, statement: &storage_statement::Statement) -> Option<[u8; 16]>
+    {
+        match self
+        {
+            Want::Root | Want::Esp => None,
+            Want::Data(path) => statement.named(storage_statement::Role::Data, Some(path)),
+            Want::Swap => statement.named(storage_statement::Role::Swap, None),
+        }
+    }
+}
+
+impl core::fmt::Display for Want<'_>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match self
+        {
+            Want::Root => f.write_str("root"),
+            Want::Esp => f.write_str("/esp"),
+            Want::Data(path) =>
+            {
+                f.write_str(core::str::from_utf8(path).unwrap_or("<non-UTF-8 path>"))
+            }
+            Want::Swap => f.write_str("swap"),
+        }
+    }
+}
+
+/// Resolve `want` to a partition and its disk's whole-disk cap, over the
+/// held disks (docs/storage.md § GPT Role-GUID Discovery). With no boot
+/// disk nothing resolves. The root resolves on the boot disk by type and
+/// priority, `/esp` is the boot ESP on the boot disk, and a role the
+/// statement names resolves to the named partition only
+/// (`gpt::resolve_named`: the boot disk's when it holds it, else the one
+/// other disk's); a role not named resolves on the boot disk by type and
+/// priority. A disk neither the boot disk nor named takes no role. Logs the
+/// partition it resolved, with its disk's location, or why none.
+fn resolve_role(
+    rt: &VfsdRuntime,
+    want: Want<'_>,
+) -> Result<(gpt::PartitionLocation, u64), gpt::GptLookupError>
+{
+    let Some(boot) = rt.boot_disk
+    else
+    {
+        std::os::seraph::log!(warn: "{want}: no boot disk, so no partition takes the role");
+        return Err(gpt::GptLookupError::NotFound);
+    };
+    let named = want.named(rt.statement());
+    let disks = rt.disks.lock().unwrap_or_else(PoisonError::into_inner);
+    let on_boot = disks
+        .get(boot.index)
+        .map_or(&[][..], |d| d.partitions.as_slice());
+    let found = match (want, named)
+    {
+        (Want::Esp, _) if boot.esp.on(on_boot) => Ok(gpt::PartitionLocation {
+            disk: boot.index,
+            first_lba: boot.esp.first_lba,
+            length_lba: boot.esp.length_lba,
+        }),
+        (Want::Esp, _) => Err(gpt::GptLookupError::NotFound),
+        (_, Some(guid)) => gpt::resolve_named(
+            &want.type_guid(),
+            &guid,
+            boot.index,
+            disks.iter().map(|d| d.partitions.as_slice()),
+        ),
+        (_, None) => gpt::lookup_on_disk(boot.index, &want.type_guid(), on_boot),
+    };
+    let held = found.map(|location| {
+        let disk = disks.get(location.disk);
+        (
+            location,
+            disk.map_or(0, |d| d.blk_ep),
+            disk.map_or(0, |d| d.ordinal),
+            disk.and_then(|d| d.location),
+        )
+    });
+    drop(disks);
+    let how = if named.is_some()
+    {
+        "named by the storage statement"
+    }
+    else
+    {
+        "on the boot disk"
+    };
+    match held
+    {
+        Ok((location, blk_ep, ordinal, at)) =>
+        {
+            std::os::seraph::log!(
+                "{want}: partition {how} at block {} on disk {ordinal} at {}",
+                location.first_lba,
+                Where(at)
+            );
+            Ok((location, blk_ep))
+        }
+        Err(e) =>
+        {
+            let why = match e
+            {
+                gpt::GptLookupError::NotFound => "none found",
+                gpt::GptLookupError::DuplicateTie => "two or more answer equally; none taken",
+                gpt::GptLookupError::WrongType =>
+                {
+                    "the named partition is of another type; not taken"
+                }
+            };
+            std::os::seraph::log!(warn: "{want}: no partition {how}: {why}");
+            Err(e)
+        }
+    }
+}
+
+/// Mount the Seraph root partition at `/` during vfsd startup, then read
+/// the storage statement and auto-mount the ESP and the data partitions
+/// ([`after_root_mount`]).
 ///
 /// Runs on the main thread before any service handler exists, so a
 /// `GET_SYSTEM_ROOT_CAP` request can never observe an unmounted root.
-/// The namespace dispatcher must already be running: the `/esp` and
-/// `/data` mounts take the VFS spawn path, which re-enters vfsd's
-/// namespace endpoint to resolve `/services/fs/fatfs`. Returns whether
-/// the root mount succeeded; `/esp` and `/data` are best-effort and never
-/// gate the return value.
+/// The namespace dispatcher must already be running: the walk to the
+/// statement, and the `/esp` and data mounts, which take the VFS spawn
+/// path to resolve `/services/fs/fatfs`, re-enter vfsd's namespace
+/// endpoint. Returns whether the root mount succeeded; the auto-mounts are
+/// best-effort and never gate the return value. With no boot disk the root
+/// resolves on no disk and the mount fails.
 fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 {
-    match do_mount_internal(rt, ipc_buf, &role_guids::SERAPH_ROOT, b"/", Discover::No)
+    match do_mount_internal(rt, ipc_buf, Want::Root, b"/", Discover::No)
     {
         Ok(caller_root_cap) =>
         {
@@ -1200,9 +1484,108 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
         }
     }
 
-    auto_mount_role(rt, ipc_buf, &role_guids::EFI_SYSTEM_PARTITION, "/esp");
-    auto_mount_role(rt, ipc_buf, &role_guids::SERAPH_DATA, "/data");
+    after_root_mount(rt, ipc_buf);
     true
+}
+
+/// Once the root is mounted: read the storage statement, if it has not
+/// been read, then auto-mount the boot ESP at `/esp`, each data partition
+/// the statement names at its path, and, unless the statement names one for
+/// `/data`, the boot disk's data partition there. Each auto-mount is
+/// best-effort ([`auto_mount_role`]).
+fn after_root_mount(rt: &VfsdRuntime, ipc_buf: *mut u64)
+{
+    if rt.statement.get().is_none()
+    {
+        // Only the thread that mounted the root reads it; a second root
+        // mount is refused, so no other sets it.
+        let _ = rt
+            .statement
+            .set(read_statement(rt.system_root_cap, ipc_buf));
+    }
+    auto_mount_role(rt, ipc_buf, Want::Esp, b"/esp");
+    let statement = rt.statement();
+    for entry in statement.entries()
+    {
+        if let (storage_statement::Role::Data, Some(path)) = (entry.role, &entry.path)
+        {
+            auto_mount_role(rt, ipc_buf, Want::Data(path.as_bytes()), path.as_bytes());
+        }
+    }
+    if statement
+        .named(storage_statement::Role::Data, Some(b"/data"))
+        .is_none()
+    {
+        auto_mount_role(rt, ipc_buf, Want::Data(b"/data"), b"/data");
+    }
+}
+
+/// The storage statement at `storage_statement::PATH`, walked from
+/// `root_cap` and read through procmgr's verified read in the configuration
+/// role under that path (docs/signing.md § Configuration). A statement that
+/// is missing, that procmgr refuses, or that does not parse is logged and
+/// names nothing: every role then resolves on the boot disk.
+fn read_statement(root_cap: u64, ipc_buf: *mut u64) -> storage_statement::Statement
+{
+    let path = storage_statement::PATH;
+    let rights = u64::from(namespace_protocol::rights::READ);
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let walked = unsafe {
+        ns_client::walk_to_file(
+            root_cap,
+            path.trim_start_matches('/').as_bytes(),
+            rights,
+            ipc_buf,
+        )
+    };
+    let Some(walked) = walked
+    else
+    {
+        std::os::seraph::log!("storage statement {path}: none; no partition named");
+        return storage_statement::Statement::new();
+    };
+    let data = match std::os::seraph::read_verified(
+        walked.file_cap,
+        walked.size,
+        path,
+        std::os::seraph::VerifiedRole::Configuration,
+    )
+    {
+        Ok(data) => data,
+        Err(e) =>
+        {
+            std::os::seraph::log!(
+                warn: "storage statement {path}: procmgr's verified read refused it ({:?}); no partition named",
+                e.kind()
+            );
+            return storage_statement::Statement::new();
+        }
+    };
+    match storage_statement::parse(data.bytes())
+    {
+        Ok(statement) =>
+        {
+            for entry in statement.entries()
+            {
+                let guid = storage_statement::format_guid(&entry.guid);
+                std::os::seraph::log!(
+                    "storage statement {path}: {} {}names partition {}",
+                    entry.role.keyword(),
+                    entry
+                        .path
+                        .as_deref()
+                        .map_or(String::new(), |p| format!("{p} ")),
+                    core::str::from_utf8(&guid).unwrap_or_default()
+                );
+            }
+            statement
+        }
+        Err(e) =>
+        {
+            std::os::seraph::log!(warn: "storage statement {path}: refused, {e}; no partition named");
+            storage_statement::Statement::new()
+        }
+    }
 }
 
 /// Decline devmgr's restart of the driver of the disk the root filesystem
@@ -1246,21 +1629,21 @@ fn decline_root_disk_restart(rt: &VfsdRuntime, ipc_buf: *mut u64)
 
 /// Handle a runtime MOUNT request from an authorized client.
 ///
-/// vfsd self-mounts root, `/esp`, and `/data` at startup ([`self_mount`]);
-/// MOUNT remains the explicit / runtime-mount surface (foreign-GUID disks,
-/// user-invoked mounts), and svctest is its only in-tree caller. The
-/// service loop admits a request here only when the caller's badge carries
-/// `vfsd_labels::MOUNT_AUTHORITY`.
+/// vfsd self-mounts the root, `/esp` and the data partitions at startup
+/// ([`self_mount`]); `MOUNT` mounts the root or the data role at a path at
+/// runtime. Its in-tree callers are test fixtures alone: svctest and the
+/// `hotplug-check` disk fixture. The service loop admits a request here
+/// only when the caller's badge carries `vfsd_labels::MOUNT_AUTHORITY`.
 ///
-/// IPC data layout (boot protocol v8+):
+/// IPC data layout (services/vfsd/docs/vfs-ipc-interface.md, `MOUNT`):
 /// - `data[0]` low byte: [`MountRole`] discriminant
 /// - `data[1]`: mount path length
 /// - `data[2..]`: mount path bytes (packed into u64 words)
 ///
 /// Decodes the wire payload and delegates to [`do_mount`] for the
 /// real work. When the requested role is [`MountRole::Root`], vfsd
-/// additionally auto-mounts the EFI System Partition at `/esp` and the
-/// data partition at `/data`.
+/// then reads the storage statement and auto-mounts as the self-mount does
+/// ([`after_root_mount`]).
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the role byte is the low byte of data[0] by wire contract, so the `as` keeps the \
@@ -1297,14 +1680,12 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
         Err(label) => IpcMessage::new(label),
     };
 
-    // Auto-mount the EFI System Partition at /esp and the data partition
-    // at /data once root is up, so userspace can read kernel + bundle +
-    // bootloader and the data tree without a separate MOUNT call.
-    // Best-effort — failure does not propagate into the root mount's reply.
+    // Once a root is up, read the storage statement and auto-mount the ESP
+    // and the data partitions, as the self-mount does. Best-effort: a
+    // failure does not propagate into the root mount's reply.
     if matches!(role, MountRole::Root) && reply.label == ipc::vfsd_errors::SUCCESS
     {
-        auto_mount_role(rt, ipc_buf, &role_guids::EFI_SYSTEM_PARTITION, "/esp");
-        auto_mount_role(rt, ipc_buf, &role_guids::SERAPH_DATA, "/data");
+        after_root_mount(rt, ipc_buf);
     }
 
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -1645,41 +2026,28 @@ fn destroy_driver(mount: &Mount, ipc_buf: *mut u64)
     log_cap_delete("driver death queue", mount.death_queue);
 }
 
-/// One-shot best-effort mount of the partition tagged `type_guid` at
-/// `mount_path`. Scans every held disk's parsed GPT for a matching
-/// partition; if none is present (or its role lookup is ambiguous), logs
-/// a diagnostic and returns without mounting, leaving `mount_path` to
-/// resolve through the root-fs fall-through. On a match, runs the mount
-/// transaction and logs the outcome. Never fatal — distinct from the root
-/// self-mount, whose failure gates boot. Idempotent if invoked twice: a
-/// mount on an already-terminal mount path is rejected by
+/// One-shot best-effort mount of the partition `want` resolves to at
+/// `mount_path` ([`resolve_role`]). When none resolves, the resolution
+/// logs why and `mount_path` resolves through the root-fs fall-through. On
+/// a match, runs the mount transaction and logs the outcome. Never fatal,
+/// unlike the root self-mount, whose failure gates boot. Idempotent if
+/// invoked twice: a mount on an already-terminal mount path is rejected by
 /// [`VfsdRootBackend::can_install`] before any partition is registered or
 /// driver spawned.
-fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mount_path: &str)
+fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, want: Want<'_>, mount_path: &[u8])
 {
-    let present = rt
-        .disks
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .flat_map(|d| &d.partitions)
-        .any(|p| &p.type_guid == type_guid);
-    if !present
-    {
-        std::os::seraph::log!(warn: "MOUNT: no partition for {mount_path}; skipping auto-mount");
-        return;
-    }
-    match do_mount_internal(rt, ipc_buf, type_guid, mount_path.as_bytes(), Discover::No)
+    let shown = core::str::from_utf8(mount_path).unwrap_or("<non-UTF-8 path>");
+    match do_mount_internal(rt, ipc_buf, want, mount_path, Discover::No)
     {
         Ok(caller_cap) =>
         {
             // The auto-mount has no IPC caller for the returned badged SEND;
             // vfsd reaches the mount through its synthetic backend.
             log_cap_delete("auto-mount caller cap", caller_cap);
-            std::os::seraph::log!("MOUNT: {mount_path} auto-mounted");
+            std::os::seraph::log!("MOUNT: {shown} auto-mounted");
         }
         Err(code) => std::os::seraph::log!(
-            warn: "MOUNT: {mount_path} auto-mount failed: code={code:#x}"
+            warn: "MOUNT: {shown} not auto-mounted: code={code:#x}"
         ),
     }
 }
@@ -1716,9 +2084,8 @@ fn mount_path_is_root(path: &[u8]) -> bool
 
 /// Mount the partition `role` names at `path`.
 ///
-/// Looks the role's type GUID up across every held disk's GPT, after
-/// discovering the disks devmgr served since the last discovery
-/// ([`find_partition`]), registers
+/// Resolves the role ([`resolve_role`]) after discovering the disks devmgr
+/// served since the last discovery ([`find_partition`]), registers
 /// the partition bound with the block driver of the disk that holds it,
 /// spawns a fatfs driver, and stores the mount's record in
 /// [`VfsdRootBackend`]: the driver's namespace endpoint (terminal mounts)
@@ -1736,7 +2103,7 @@ pub(crate) fn do_mount(
     path: &[u8],
 ) -> Result<u64, u64>
 {
-    do_mount_internal(rt, ipc_buf, role.type_guid(), path, Discover::First)
+    do_mount_internal(rt, ipc_buf, role.want(path), path, Discover::First)
 }
 
 /// Whether a mount's role lookup first discovers the disks devmgr served
@@ -1744,24 +2111,24 @@ pub(crate) fn do_mount(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Discover
 {
-    /// Look up over the held disks alone: the startup self-mount and the
-    /// auto-mounts after a root mount, which a discovery just preceded.
+    /// Resolve over the held disks alone: the startup self-mount and the
+    /// auto-mounts after a root mount.
     No,
     /// Discover first ([`discover_new_disks`]): a runtime `MOUNT`.
     First,
 }
 
-/// The partition `type_guid` names across every held disk's GPT, and the
-/// whole-disk cap of the disk that holds it. On [`Discover::First`] the
-/// disks devmgr served since the last discovery are held first, so the role
-/// resolves across every disk devmgr serves, as at startup: a disk added or
-/// inserted again after startup is found, and its partition wins or ties by
-/// priority against those of the disks held before it. Logs a failure and
-/// returns `vfsd_errors::NO_MOUNT`.
+/// The partition `want` resolves to ([`resolve_role`]), and the whole-disk
+/// cap of the disk that holds it. On [`Discover::First`] the disks devmgr
+/// served since the last discovery are held first, so a partition the
+/// statement names on a disk added after startup is found. A failure,
+/// which the resolution logs, returns `vfsd_errors::NO_MOUNT`; the caller
+/// decides what it means (the root self-mount treats it as fatal, an
+/// auto-mount skips its path).
 fn find_partition(
     rt: &VfsdRuntime,
     ipc_buf: *mut u64,
-    type_guid: &[u8; 16],
+    want: Want<'_>,
     discover: Discover,
 ) -> Result<(gpt::PartitionLocation, u64), u64>
 {
@@ -1769,45 +2136,7 @@ fn find_partition(
     {
         discover_new_disks(rt, ipc_buf);
     }
-    match lookup_role(rt, type_guid)
-    {
-        Ok(found) => Ok(found),
-        Err(gpt::GptLookupError::NotFound) =>
-        {
-            std::os::seraph::log!(warn: "MOUNT: partition role GUID not found on any disk");
-            Err(ipc::vfsd_errors::NO_MOUNT)
-        }
-        Err(gpt::GptLookupError::DuplicateTie) =>
-        {
-            // Non-fatal here; the caller decides (root self-mount treats
-            // the returned error as fatal, the /esp and /data auto-mounts
-            // skip and fall through).
-            std::os::seraph::log!(
-                warn: "MOUNT: role GUID matched by multiple tied-priority partitions; not mounting"
-            );
-            Err(ipc::vfsd_errors::NO_MOUNT)
-        }
-    }
-}
-
-/// The role lookup over the held disks (docs/storage.md § GPT Role-GUID
-/// Discovery): a tie at the top priority is ambiguous whether the tied
-/// partitions share a disk or not, and a removed disk has no partitions.
-/// Returns the partition and its disk's whole-disk cap.
-fn lookup_role(
-    rt: &VfsdRuntime,
-    type_guid: &[u8; 16],
-) -> Result<(gpt::PartitionLocation, u64), gpt::GptLookupError>
-{
-    let disks = rt.disks.lock().unwrap_or_else(PoisonError::into_inner);
-    let location = gpt::lookup_partition_by_type_guid(
-        type_guid,
-        disks.iter().map(|d| d.partitions.as_slice()),
-    )?;
-    // The lookup ran over `disks`, so its index is in range.
-    let blk_ep = disks.get(location.disk).map_or(0, |d| d.blk_ep);
-    drop(disks);
-    Ok((location, blk_ep))
+    resolve_role(rt, want).map_err(|_| ipc::vfsd_errors::NO_MOUNT)
 }
 
 /// The whole-disk cap of the held disk at `disk`; `None` once it is
@@ -1880,8 +2209,8 @@ fn hold_new_disks(
 }
 
 /// Shared implementation for both role-driven (`do_mount`) and
-/// internally-triggered (`auto_mount_role`) mounts. Takes a type-GUID
-/// directly so callers without a [`MountRole`] (the `/esp` and `/data`
+/// internally-triggered (`auto_mount_role`) mounts. Takes a [`Want`]
+/// directly so callers without a [`MountRole`] (the `/esp` and data
 /// auto-mounts) can reuse the transaction body.
 #[expect(
     clippy::too_many_lines,
@@ -1895,12 +2224,12 @@ fn hold_new_disks(
 fn do_mount_internal(
     rt: &VfsdRuntime,
     ipc_buf: *mut u64,
-    type_guid: &[u8; 16],
+    want: Want<'_>,
     path: &[u8],
     discover: Discover,
 ) -> Result<u64, u64>
 {
-    let (location, blk_ep) = find_partition(rt, ipc_buf, type_guid, discover)?;
+    let (location, blk_ep) = find_partition(rt, ipc_buf, want, discover)?;
     let (partition_lba, partition_len) = (location.first_lba, location.length_lba);
     std::os::seraph::log!(
         debug: "MOUNT: partition on disk {} LBA={partition_lba:#018x} length={partition_len:#018x}",

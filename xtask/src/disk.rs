@@ -21,7 +21,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::error::{Context, Result};
+use crate::error::{Context, Result, err};
 use boot_protocol::role_guids;
 
 use crate::arch::Arch;
@@ -121,8 +121,10 @@ pub enum DataPlacement
     /// `disk.img` carries all four partitions — the default.
     #[default]
     MainImage,
-    /// `disk.img` carries the ESP, root and swap; `disk-data.img` carries the data
-    /// partition alone, for a boot that attaches it as a second disk.
+    /// `disk.img` carries the ESP and root; `disk-data.img` carries the data
+    /// and swap partitions, for a boot that attaches it as a second disk, and
+    /// the root partition the storage statement that names them
+    /// ([`STATEMENT`]).
     SecondImage,
 }
 
@@ -156,6 +158,8 @@ struct Volume
     type_guid: Guid,
     unique_guid: Guid,
     bytes: u64,
+    /// The entry's attribute bits ([`gpt::Partition::attributes`]).
+    attributes: u64,
     contents: Contents,
 }
 
@@ -214,11 +218,13 @@ struct Sources
 /// - DATA ([`DATA_PARTITION_SIZE`]): populated from `sysroot/data/`
 /// - SWAP ([`SWAP_PARTITION_SIZE`]): raw, left zero
 ///
-/// `disk.img` carries the ESP, ROOT, and SWAP, and DATA too unless
-/// `layout.data` is [`DataPlacement::SecondImage`], which puts DATA alone on
-/// `disk-data.img`. SWAP is the last partition of `disk.img` in both layouts,
-/// so it moves no other partition's LBAs.
-/// Authoring with DATA on `disk.img` removes a `disk-data.img` an earlier
+/// `disk.img` carries the ESP and ROOT, and DATA and SWAP too unless
+/// `layout.data` is [`DataPlacement::SecondImage`], which puts DATA and SWAP on
+/// `disk-data.img`, in that order, and stages the storage statement naming
+/// them on ROOT ([`stage_statement`]): vfsd gives a disk other than the boot
+/// disk a role only where the statement names its partition (docs/storage.md
+/// § GPT Role-GUID Discovery). Authoring with DATA on `disk.img` removes a
+/// `disk-data.img` an earlier
 /// authoring left, so a stale second copy of the data partition cannot be
 /// attached. Every image's GPT LBAs and FAT sectors are `layout.block_size`
 /// bytes.
@@ -229,8 +235,9 @@ struct Sources
 /// ROOT's GPT type-GUID is the arch-specific Seraph root GUID, DATA's the
 /// arch-neutral Seraph data GUID, and SWAP's the arch-neutral Seraph swap
 /// GUID (see [`boot_protocol::role_guids`]) so vfsd can identify each by
-/// role, on whichever disk holds it, without consulting a config file. vfsd
-/// auto-mounts the data partition at `/data`. The data tree is placed only on the data partition, not
+/// role on the boot disk, and the statement can name DATA and SWAP on
+/// `disk-data.img` by their unique GUIDs. vfsd auto-mounts the data
+/// partition at `/data`. The data tree is placed only on the data partition, not
 /// duplicated onto root; vfsd's fall-through still serves `/data` from
 /// root on images that choose to carry it there instead.
 pub fn create_disk_image(ctx: &BuildContext, arch: Arch, layout: DiskLayout) -> Result<()>
@@ -296,6 +303,7 @@ fn pack(
         layout.block_size.bytes()
     ));
 
+    stage_statement(&ctx.sysroot, layout.data)?;
     // Every pack signs what it packs, so no path writes an unsigned image,
     // and composes the ESP from what it signed, so the ESP of every image is
     // copies of the installed files: `build`, `mkdisk` and every harness that
@@ -359,6 +367,7 @@ fn author_images(
         type_guid: gpt::EFI_SYSTEM_PARTITION,
         unique_guid: ESP_UNIQUE_GUID,
         bytes: ESP_PARTITION_SIZE,
+        attributes: 0,
         contents: fat(&sources.esp, on_esp),
     };
     let root = Volume {
@@ -366,6 +375,7 @@ fn author_images(
         type_guid: seraph_root_type(arch),
         unique_guid: ROOT_UNIQUE_GUID,
         bytes: ROOT_PARTITION_SIZE,
+        attributes: 0,
         contents: fat(&sources.root, on_root),
     };
     // The data tree is not also written to the root partition
@@ -375,6 +385,7 @@ fn author_images(
         type_guid: role_guids::SERAPH_DATA,
         unique_guid: DATA_UNIQUE_GUID,
         bytes: DATA_PARTITION_SIZE,
+        attributes: 0,
         contents: fat(&sources.data, on_data),
     };
     let swap = Volume {
@@ -382,6 +393,7 @@ fn author_images(
         type_guid: role_guids::SERAPH_SWAP,
         unique_guid: SWAP_UNIQUE_GUID,
         bytes: SWAP_PARTITION_SIZE,
+        attributes: 0,
         contents: Contents::Raw,
     };
 
@@ -403,16 +415,137 @@ fn author_images(
         }
         DataPlacement::SecondImage =>
         {
-            write_image(
-                main_image,
-                layout.block_size,
-                MAIN_DISK_GUID,
-                &[esp, root, swap],
-            )?;
-            write_image(data_image, layout.block_size, DATA_DISK_GUID, &[data])?;
+            write_image(main_image, layout.block_size, MAIN_DISK_GUID, &[esp, root])?;
+            write_image(data_image, layout.block_size, DATA_DISK_GUID, &[data, swap])?;
         }
     }
     Ok(())
+}
+
+/// The unique GUIDs of a foreign disk's ESP, ROOT, DATA and SWAP
+/// ([`create_foreign_image`]): none is a partition of `disk.img` or
+/// `disk-data.img`.
+const FOREIGN_UNIQUE_GUIDS: [Guid; 4] = [
+    guid(0xf0e1_0001, 0x5eed, 0x4bad, [0x8a, 0x11, 0, 0, 0, 0, 0, 1]),
+    guid(0xf0e1_0002, 0x5eed, 0x4bad, [0x8a, 0x11, 0, 0, 0, 0, 0, 2]),
+    guid(0xf0e1_0003, 0x5eed, 0x4bad, [0x8a, 0x11, 0, 0, 0, 0, 0, 3]),
+    guid(0xf0e1_0004, 0x5eed, 0x4bad, [0x8a, 0x11, 0, 0, 0, 0, 0, 4]),
+];
+
+/// The disk GUID of a foreign disk ([`create_foreign_image`]).
+const FOREIGN_DISK_GUID: Guid = guid(0xf0e1_0000, 0x5eed, 0x4bad, [0x8a, 0x11, 0, 0, 0, 0, 0, 0]);
+
+/// Author at `path` a foreign disk, as an attacker's or a stray disk
+/// attached beside the boot disk carries: an ESP, a ROOT of `arch`, a DATA
+/// and a SWAP, of `disk.img`'s sizes and so at its LBAs, each with the
+/// partition priority `priority` (attribute bits 48-63) and a unique GUID
+/// of its own ([`FOREIGN_UNIQUE_GUIDS`]), and no filesystem. vfsd must give
+/// none of them a role: the disk is not the boot disk, and the storage
+/// statement names none of its partitions.
+///
+/// # Errors
+/// Fails when the image cannot be written.
+pub fn create_foreign_image(
+    path: &Path,
+    arch: Arch,
+    block_size: BlockSize,
+    priority: u16,
+) -> Result<()>
+{
+    let attributes = u64::from(priority) << 48;
+    let [esp, root, data, swap] = FOREIGN_UNIQUE_GUIDS;
+    let volume = |name, type_guid, unique_guid, bytes| Volume {
+        name,
+        type_guid,
+        unique_guid,
+        bytes,
+        attributes,
+        contents: Contents::Raw,
+    };
+    write_image(
+        path,
+        block_size,
+        FOREIGN_DISK_GUID,
+        &[
+            volume("ESP", gpt::EFI_SYSTEM_PARTITION, esp, ESP_PARTITION_SIZE),
+            volume("ROOT", seraph_root_type(arch), root, ROOT_PARTITION_SIZE),
+            volume("DATA", role_guids::SERAPH_DATA, data, DATA_PARTITION_SIZE),
+            volume("SWAP", role_guids::SERAPH_SWAP, swap, SWAP_PARTITION_SIZE),
+        ],
+    )
+}
+
+/// The storage statement the split layout stages, at
+/// `storage_statement::PATH` on the root partition: the data partition at
+/// `/data` and the swap partition, each by its unique GUID, both on
+/// `disk-data.img`.
+pub static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let mut statement = storage_statement::Statement::new();
+    let named = [
+        storage_statement::Named::new(
+            storage_statement::Role::Data,
+            Some("/data"),
+            DATA_UNIQUE_GUID,
+        ),
+        storage_statement::Named::new(storage_statement::Role::Swap, None, SWAP_UNIQUE_GUID),
+    ];
+    // Two distinct GUIDs, one data path and one swap: the parser's grammar
+    // takes both (the statement_parses test).
+    for entry in named.into_iter().flatten()
+    {
+        let _ = statement.push(entry);
+    }
+    statement.render()
+});
+
+/// Stage the storage statement in `sysroot` for a pack whose data
+/// placement is `data`: [`STATEMENT`] at `storage_statement::PATH` for
+/// [`DataPlacement::SecondImage`], which the pack then signs
+/// (`crate::signing::sign_sysroot`); for [`DataPlacement::MainImage`], a
+/// statement there whose bytes are [`STATEMENT`]'s is removed, since its
+/// partitions are on `disk.img`, and any other statement is the deployer's
+/// and is left. Fails when the staged text is one vfsd's parser refuses.
+fn stage_statement(sysroot: &Path, data: DataPlacement) -> Result<()>
+{
+    let path = sysroot.join(storage_statement::PATH.trim_start_matches('/'));
+    match data
+    {
+        DataPlacement::SecondImage =>
+        {
+            storage_statement::parse(STATEMENT.as_bytes())
+                .map_err(|e| err!("the staged storage statement is refused: {e}"))?;
+            if let Some(dir) = path.parent()
+            {
+                fs::create_dir_all(dir)
+                    .with_context(|| format!("failed to create {}", dir.display()))?;
+            }
+            // A statement already staged keeps its signature when its body
+            // is the one staged.
+            if !holds_statement(&path)
+            {
+                fs::write(&path, STATEMENT.as_bytes())
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+            }
+        }
+        DataPlacement::MainImage =>
+        {
+            if holds_statement(&path)
+            {
+                fs::remove_file(&path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the file at `path` is [`STATEMENT`], signed or not
+/// (`crate::signing::body_of`).
+fn holds_statement(path: &Path) -> bool
+{
+    fs::read(path).is_ok_and(|bytes| {
+        crate::signing::body_of(&bytes).is_ok_and(|body| body == STATEMENT.as_bytes())
+    })
 }
 
 /// Start LBA of each of `volumes`, laid end to end after [`IMAGE_MARGIN`],
@@ -641,6 +774,7 @@ fn write_gpt(
             unique_guid: volume.unique_guid,
             first_lba,
             blocks: block_size.blocks(volume.bytes),
+            attributes: volume.attributes,
         })
         .collect();
     let regions = gpt::encode(&gpt::Table {
@@ -1129,7 +1263,7 @@ mod tests
     }
 
     #[test]
-    fn split_layout_puts_the_data_partition_alone_on_the_second_image()
+    fn split_layout_puts_the_data_and_swap_partitions_on_the_second_image()
     {
         let scratch = Scratch::new("split");
         let main = scratch.0.join("disk.img");
@@ -1155,19 +1289,92 @@ mod tests
         };
         assert_eq!(
             types(&main),
-            [
-                gpt::EFI_SYSTEM_PARTITION,
-                role_guids::SERAPH_ROOT_RISCV64,
-                role_guids::SERAPH_SWAP
-            ]
+            [gpt::EFI_SYSTEM_PARTITION, role_guids::SERAPH_ROOT_RISCV64]
         );
-        assert_eq!(types(&data_image), [role_guids::SERAPH_DATA]);
+        assert_eq!(
+            types(&data_image),
+            [role_guids::SERAPH_DATA, role_guids::SERAPH_SWAP]
+        );
         assert_eq!(logical_block_size(&data_image).unwrap(), 4096);
         // A boot attaches both images, so each carries its own disk GUID.
         assert_ne!(
             disk_guid(&main, BlockSize::B4096),
             disk_guid(&data_image, BlockSize::B4096)
         );
+    }
+
+    // Defect caught: a split layout with no statement naming its second
+    // image's partitions, so vfsd gives them no role and the boot has no
+    // `/data` and no swap; a statement vfsd's parser refuses; or a single
+    // image left with a statement naming partitions it carries, or with a
+    // deployer's statement removed.
+    #[test]
+    fn the_split_layout_stages_the_statement_and_the_single_image_removes_it()
+    {
+        let scratch = Scratch::new("statement");
+        let sysroot = scratch.0.join("sysroot");
+        let path = sysroot.join(storage_statement::PATH.trim_start_matches('/'));
+        stage_statement(&sysroot, DataPlacement::SecondImage).unwrap();
+        let staged = fs::read(&path).unwrap();
+        assert_eq!(staged, STATEMENT.as_bytes());
+        let statement = storage_statement::parse(&staged).unwrap();
+        assert_eq!(
+            statement.named(storage_statement::Role::Data, Some(b"/data")),
+            Some(DATA_UNIQUE_GUID)
+        );
+        assert_eq!(
+            statement.named(storage_statement::Role::Swap, None),
+            Some(SWAP_UNIQUE_GUID)
+        );
+        assert_eq!(statement.entries().len(), 2);
+        stage_statement(&sysroot, DataPlacement::MainImage).unwrap();
+        assert!(!path.exists());
+        // A statement of other bytes is the deployer's: it stays.
+        let own = b"swap 00000000-0000-0000-0000-000000000001\n";
+        fs::write(&path, own).unwrap();
+        stage_statement(&sysroot, DataPlacement::MainImage).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), own);
+    }
+
+    // Defect caught: a foreign disk whose partitions are not each role's at
+    // the priority asked for, or that share a unique GUID with disk.img's, so
+    // the storage-roles case tests another disk than it says.
+    #[test]
+    fn a_foreign_image_carries_every_role_at_its_priority_under_its_own_guids()
+    {
+        let scratch = Scratch::new("foreign");
+        let main = scratch.0.join("disk.img");
+        let foreign = scratch.0.join("foreign.img");
+        author_images(
+            &main,
+            &scratch.0.join("disk-data.img"),
+            Arch::X86_64,
+            DiskLayout::default(),
+            &scratch.sources(),
+        )
+        .unwrap();
+        create_foreign_image(&foreign, Arch::X86_64, BlockSize::B512, 0xFFFF).unwrap();
+        let entries = |path: &Path| {
+            let size = BlockSize::B512.bytes();
+            let header = vfsd_gpt::parse_header(&read_range(path, size, size), 1).unwrap();
+            vfsd_gpt::collect_partitions(&header, |lba, buf| {
+                buf.copy_from_slice(&read_range(path, lba * size, size));
+                true
+            })
+            .entries
+        };
+        let (ours, theirs) = (entries(&main), entries(&foreign));
+        assert_eq!(theirs.len(), ours.len());
+        for (their, our) in theirs.iter().zip(&ours)
+        {
+            assert_eq!(their.type_guid, our.type_guid);
+            assert_eq!(
+                (their.first_lba, their.length_lba),
+                (our.first_lba, our.length_lba)
+            );
+            assert_eq!(their.attributes >> 48, 0xFFFF);
+            assert!(ours.iter().all(|o| o.uuid != their.uuid));
+        }
     }
 
     #[test]

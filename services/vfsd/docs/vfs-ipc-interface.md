@@ -78,12 +78,14 @@ Mount the partition identified by a Seraph-minted GPT type GUID at the
 given path. vfsd resolves the role byte to a type GUID (arch-conditional
 for the root role, arch-neutral for data; see
 [`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
-looks the partition up across the parsed GPT tables of every disk it
-holds and has not marked removed via
-[`gpt::lookup_partition_by_type_guid`](../gpt/src/lib.rs)
-(DPS-style priority tie-break on attribute bits 48-63, run across disks;
-a tie at the highest priority, on one disk or across disks, is rejected
-with `NO_MOUNT` (fatal only for the root self-mount); see
+resolves the partition with `resolve_role` in
+[`services/vfsd/src/main.rs`](../src/main.rs): the partition the signed
+storage statement names for the role on a disk it holds and has not marked
+removed ([`gpt::resolve_named`](../gpt/src/lib.rs)), else the boot disk's
+partition of the type GUID
+([`gpt::lookup_on_disk`](../gpt/src/lib.rs); DPS-style priority
+tie-break on attribute bits 48-63, on the boot disk alone; a tie at the
+highest priority is rejected with `NO_MOUNT` (fatal only for the root self-mount); see
 [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)),
 registers the partition bound with the virtio-blk instance of the disk
 that holds it, spawns a fatfs driver, sends `FS_MOUNT` (see
@@ -98,11 +100,11 @@ point, or on a path with a component the namespace protocol cannot name, is
 rejected (`TABLE_FULL`) before any partition is registered or driver
 spawned. Before the role lookup vfsd queries devmgr for the block devices
 it served since vfsd's last query (from the first instance ordinal not yet
-queried) and holds them, so the role resolves across every disk devmgr
-serves, under the priority and tie rules of
+queried) and holds them, so a partition the statement names resolves on
+any disk devmgr serves, under the rules of
 [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery): a disk
-added or inserted again after startup is found, and its partition wins or
-ties against those of the disks held before it. A partition is mounted
+added or inserted again after startup is found, and takes a role only by
+the statement; it is not ranked against the boot disk's partitions. A partition is mounted
 once: a mount of a partition a mount holds, at another path, one
 restarting or whose removal is under way included, is rejected (`TABLE_FULL`) before any
 driver is spawned, so no two drivers serve one partition. A mount that
@@ -253,8 +255,9 @@ reads and writes the partition's blocks, and no block outside it
 MUST carry `SWAP_AUTHORITY`: vfsd replies `UNAUTHORIZED` otherwise, before it checks the version
 word.
 
-The first request that finds the partition looks the role up across every held disk (the same
-lookup and tie-break as `MOUNT`), registers the partition's range with that disk's block driver,
+The first request that finds the partition resolves the role (the same
+resolution as `MOUNT`: the statement's `swap` line, else the boot disk by type GUID and
+priority), registers the partition's range with that disk's block driver,
 and keeps the partition cap the driver returns for vfsd's life. vfsd's startup does none of this,
 so a disk with no swap partition is a supported configuration: vfsd boots and mounts as it would
 otherwise, and each request then replies `NO_MOUNT`. A lookup or registration that fails keeps

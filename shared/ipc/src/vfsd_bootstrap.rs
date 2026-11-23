@@ -59,19 +59,9 @@ pub struct EspDescriptor
     pub partition_guid: [u8; 16],
 }
 
-/// The PCI location of the controller beneath the boot ESP.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PciLocation
-{
-    /// Segment group.
-    pub segment: u16,
-    /// Bus number, as the firmware numbered the buses.
-    pub bus: u8,
-    /// Device number, at most 31.
-    pub device: u8,
-    /// Function number, at most 7.
-    pub function: u8,
-}
+/// The PCI location of the controller beneath the boot ESP: the type devmgr
+/// labels a block instance with, so vfsd compares the two whole.
+pub use crate::devmgr_labels::PciLocation;
 
 /// The device the firmware booted from: each part the firmware reported.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

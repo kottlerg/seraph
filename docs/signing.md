@@ -724,6 +724,7 @@ and acts on it with authority. Each is signed, and verified by its consumer befo
 | `/config/devmgr/platform/*.platform`, the platform description tables | devmgr | data (§ Verifier Discipline) |
 | `/config/init/log-levels.conf`, the log-level configuration | init, from its boot module | configuration, verified by the bootloader (below) |
 | `/config/boot/policy.conf`, the boot-time policy | devmgr, from its boot module | configuration, verified by the bootloader (below) |
+| `/config/vfsd/storage.conf`, the storage statement | vfsd, through procmgr's verified read | configuration, under its install path; no index, since its removal withdraws the roles it gives and grants none ([storage.md](storage.md) § GPT Role-GUID Discovery) |
 
 No guest reads the other files under `config/`, so none is signed: the bundle lists, which xtask
 reads when it packs, and the recipe and class sources of `/config/svcmgr/debug/`,

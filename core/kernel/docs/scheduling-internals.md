@@ -1479,17 +1479,28 @@ the ordering choice is required for correctness; relaxations would introduce a r
 
 ### Lock-free readers of a CPU's run queues
 
-A CPU's run queues, its `non_empty` mask, its `backlog_episode` and each linked TCB's
-`queued_on` are written only under its `scheduler.lock`, by four writers: `link` (behind
-`enqueue` and `enqueue_at_head`), `dequeue_highest`, `remove_from_queue` and `relink`. Other
-CPUs, and the owning CPU's idle loop, read the mask and the episode without the lock:
-`has_runnable`, `has_queued_thread`, `has_no_work` and `outranked` read the mask, and `backlog`
-reads the mask (Acquire) and then the episode. Four invariants make those samples sound:
+A CPU's run queues, its `non_empty` mask and its `backlog_episode` are written only under its
+`scheduler.lock`, by four writers: `link` (behind `enqueue` and `enqueue_at_head`),
+`dequeue_highest`, `remove_from_queue` and `relink`. (`queued_on`, which the same writers set,
+is ordered by the lock alone, as its row above says, and no reader below reads it.) These readers
+take no lock:
 
-1. **Publication.** Each writer makes every store to the queues, the episode and `queued_on`
-   before the Release read-modify-write of `non_empty` that ends its write, so a sample that sees
-   a bit change also sees the writes behind it (§ Atomic Ordering Invariants, the `non_empty`
-   and `backlog_episode` rows).
+- `has_runnable` (Acquire): the owning CPU's idle loop, as a hint before it masks interrupts and
+  as the masked check before it halts.
+- `backlog` (Acquire load of the mask, then a Relaxed load of the episode): another CPU's idle
+  pull, in its scan and its confirmation; its re-check under both CPUs' locks reads it exactly.
+- `outranked` (Relaxed): the owning CPU alone, at a return to user mode with interrupts masked.
+- `has_queued_thread` (Relaxed), through `has_no_work`: the softlockup watchdog's per-tick idle
+  sample (`system_has_no_work`), the SMT core spread, and the idle pull's sibling hold.
+
+Four invariants make their samples sound:
+
+1. **Publication.** A writer whose read-modify-write of `non_empty` changes a bit (`link`
+   setting one, `relink`, and `dequeue_highest` or `remove_from_queue` clearing the bit of the
+   queue they leave empty) makes it Release, after its stores to the queues and, in `link` and
+   `remove_from_queue`, to the episode. An Acquire reader that reads the value such a write made
+   therefore sees those stores: `backlog` reads the episode of the link whose bit it saw, or a
+   later one. The Relaxed readers learn the bits alone and read nothing behind them.
 2. **No false empty.** A bit for a queue holding a thread other than the idle thread is cleared
    only by `dequeue_highest` or `remove_from_queue` taking that queue's last thread. `relink`,
    which moves a thread between the CPU's queues, sets the destination's bit before it clears the
@@ -1504,11 +1515,18 @@ reads the mask (Acquire) and then the episode. Four invariants make those sample
    run dry between them, save the one imprecision
    [scheduler.md § Load Balancing](scheduler.md#load-balancing) states: a sample that races a
    dispatch running the backlog dry and the link that refills it can read the new episode.
-4. **Samples only choose.** No reader acts on a sample alone: `schedule()` reads the queues under
-   the lock, a pull re-reads the episode and the queues under both CPUs' locks, and the idle
-   loop's halt decision is closed by the wake IPI that invariant 1 of § Wake Protocol Invariants
-   orders after every link on another CPU. A stale sample costs a futile lock round, a halt the
-   IPI ends, or one pull the idle pull's bound allows, never a lost thread.
+4. **What a sample decides.** The readers that gate on queued work act on a sample only where a
+   later step closes it. The idle loop's masked check is closed by program order for the CPU's
+   own links and, for a link on another CPU, by the wake IPI that invariant 1 of § Wake Protocol
+   Invariants orders after it; `outranked` is closed the same way, the IPI's own return to user
+   mode reading again, and `schedule()` decides under the lock; the idle pull re-reads the
+   episode and both loads under both CPUs' locks. A stale sample costs them a halt the IPI ends,
+   a return to user mode the IPI's return re-decides, a futile lock round, or one pull the idle
+   pull's bound allows, never a lost thread. `has_no_work`'s consumers act on one sample with no
+   locked step after it: a missed thread makes the watchdog count the tick idle and restart its
+   stall clock (§ Softlockup Watchdog states the cost), and makes the core spread or the sibling
+   hold count the sibling idle ([scheduler.md § SMT Awareness](scheduler.md#smt-awareness)).
+   Invariant 2 keeps `relink` from making any reader miss a thread that stays queued.
 
 A new writer of a CPU's run queues MUST keep all four: in particular, it moves a queued thread
 with `relink`, never by an unlink and a re-link, which shows the queues empty to every reader

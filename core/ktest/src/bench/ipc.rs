@@ -3,30 +3,31 @@
 
 // core/ktest/src/bench/ipc.rs
 
-//! Synchronous IPC round-trip benchmarks.
+//! Synchronous IPC round-trip benchmark, in three message sizes.
 //!
 //! Each case spawns one child caller that loops `ipc_call`; the parent loops
 //! `ipc_recv` / `ipc_reply`, the request and the reply carrying the case's
-//! number of data words. Per-iteration bracketing on the parent side so
-//! min/max/mean are meaningful. The cases are an empty message, the largest
-//! message the message registers carry, and one word more, which travels in
-//! the IPC buffer page (docs/ipc-design.md § Message Format).
+//! number of data words. Per-iteration bracketing on the parent side. The
+//! cases, the variant `words=` of the `ipc_round_trip` line, are an empty
+//! message, the largest message the message registers carry, and one word
+//! more, which travels in the IPC buffer page (docs/ipc-design.md § Message
+//! Format).
 
+use bench::Value;
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
     notification_wait, thread_exit,
 };
 
-use super::{cycles_now, log_bench_header};
+use super::Harness;
 use crate::{ChildStack, spawn};
 
-/// The cases: the log name and the data words of the request and the reply.
-const CASES: [(&str, usize); 3] = [
-    ("ipc_round_trip", 0),
-    ("ipc_round_trip_6w", REG_WORDS),
-    ("ipc_round_trip_7w", REG_WORDS + 1),
-];
+/// The benchmark's name; each case's line carries its `words=`.
+const NAME: &str = "ipc_round_trip";
+
+/// The cases: the data words of the request and the reply.
+const CASES: [usize; 3] = [0, REG_WORDS, REG_WORDS + 1];
 
 /// The largest message the message registers carry. A literal, so the bench
 /// builds unchanged at a head before `MSG_REGS_DATA_MAX` existed, for a
@@ -115,30 +116,47 @@ extern "C" fn ipc_caller_entry(arg: u64) -> !
     thread_exit()
 }
 
-pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
+/// Run every case of [`CASES`] in turn. A case that does not complete every
+/// round trip ends the benchmark: each later case logs a SKIP line.
+pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, h: &mut Harness)
 {
-    for (case, &(name, words)) in CASES.iter().enumerate()
+    let mut failed = false;
+    for (case, &words) in CASES.iter().enumerate()
     {
-        if !bench_case(ctx, iters, case, name, words)
+        if failed
         {
-            break;
+            h.skip(
+                NAME,
+                format_args!("words={words}: an earlier case did not complete"),
+            );
+            continue;
         }
+        failed = !bench_case(ctx, h, case, words);
     }
 }
 
-/// Run one case of [`CASES`]. Returns whether every round trip completed,
-/// which leaves its child on its way to exit, never parked in `ipc_call`.
-fn bench_case(ctx: &crate::TestContext, iters: u32, case: usize, name: &str, words: usize) -> bool
+/// Run case `case` of [`CASES`], `words` data words each way. Returns whether
+/// every round trip completed, which leaves its child on its way to exit,
+/// never parked in `ipc_call`.
+fn bench_case(ctx: &crate::TestContext, h: &mut Harness, case: usize, words: usize) -> bool
 {
     let Ok(ep) = cap_create_endpoint(ctx.memory_base)
     else
     {
+        h.skip(
+            NAME,
+            format_args!("words={words}: cap_create_endpoint failed"),
+        );
         return false;
     };
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
         cap_delete(ep).ok();
+        h.skip(
+            NAME,
+            format_args!("words={words}: cap_create_notification failed"),
+        );
         return false;
     };
     let Ok(mut child) = spawn::new_child(ctx)
@@ -146,10 +164,11 @@ fn bench_case(ctx: &crate::TestContext, iters: u32, case: usize, name: &str, wor
     {
         cap_delete(done).ok();
         cap_delete(ep).ok();
+        h.skip(NAME, format_args!("words={words}: new_child failed"));
         return false;
     };
 
-    let completed = run_round_trips(ctx, ep, done, &child, iters, case, name, words);
+    let completed = run_round_trips(ctx, ep, done, &child, h, case, words);
 
     // One cleanup path for every exit: deleting the child's Thread cap also
     // ends a child still parked in `ipc_call` after an early break.
@@ -160,37 +179,39 @@ fn bench_case(ctx: &crate::TestContext, iters: u32, case: usize, name: &str, wor
     completed
 }
 
-/// Start case `case`'s caller child on `ep`, serve `iters` round trips of
-/// `words` data words each way, and log the statistics under `name`.
-/// Returns whether every round trip completed; returns `false` early,
-/// leaving cleanup to the caller, when the child cannot be set up.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one case's endpoint, notification, child, and its three case fields; a struct \
-              for one private call site adds only names"
-)]
+/// Start case `case`'s caller child on `ep`, serve [`Harness::iters`] round
+/// trips of `words` data words each way, and report the result. Returns
+/// whether every round trip completed; returns `false` early, leaving cleanup
+/// to the caller, when the child cannot be set up.
 fn run_round_trips(
     ctx: &crate::TestContext,
     ep: u64,
     done: u64,
     child: &spawn::SpawnedChild,
-    iters: u32,
+    h: &mut Harness,
     case: usize,
-    name: &str,
     words: usize,
 ) -> bool
 {
     use syscall_abi::RIGHTS_EP_SEND_GRANT;
-    let n = u64::from(iters);
+    let n = u64::from(h.iters());
 
     let Ok(child_ep) = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
     else
     {
+        h.skip(
+            NAME,
+            format_args!("words={words}: cap_copy of endpoint failed"),
+        );
         return false;
     };
     let Ok(child_done) = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
     else
     {
+        h.skip(
+            NAME,
+            format_args!("words={words}: cap_copy of notification failed"),
+        );
         return false;
     };
 
@@ -213,6 +234,7 @@ fn run_round_trips(
         (unsafe { ChildStack::top_at(core::ptr::addr_of!(BENCH_IPC_STACKS), case) })
     else
     {
+        h.skip(NAME, format_args!("words={words}: no child stack"));
         return false;
     };
 
@@ -220,17 +242,16 @@ fn run_round_trips(
     // `ChildStack`, on which no other live thread runs (`ChildStack`'s rule).
     if unsafe { spawn::configure_and_start(child, ipc_caller_entry, stack_top, arg) }.is_err()
     {
+        h.skip(NAME, format_args!("words={words}: child start failed"));
         return false;
     }
 
     let reply = payload(0, words);
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
+    let (mut samples, counters) = h.recorder();
     let mut completed: u64 = 0;
     for _ in 0..n
     {
-        let t0 = cycles_now();
+        let t0 = counters.read();
         // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
         if unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }.is_err()
         {
@@ -241,17 +262,8 @@ fn run_round_trips(
         {
             break;
         }
-        let t1 = cycles_now();
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
+        let t1 = counters.read();
+        samples.record(t1.since(&t0).cycles);
         completed = completed.saturating_add(1);
     }
 
@@ -262,13 +274,8 @@ fn run_round_trips(
     {
         notification_wait(done).ok();
     }
+    let summary = samples.summary();
 
-    log_bench_header(name, iters);
-    if let Some(mean) = total.checked_div(completed)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    h.report(NAME, &[("words", Value::Num(words as u64))], summary, &[]);
     completed == n
 }

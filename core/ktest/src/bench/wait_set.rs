@@ -10,7 +10,7 @@ use syscall::{
     wait_set_remove, wait_set_wait,
 };
 
-use super::{cycles_now, log_bench_header};
+use super::Harness;
 
 // Thin wrapper — same as `cap_create_wait_set` in core/ktest/src/unit/cap.rs.
 fn cap_create_wait_set(memory_cap: u64) -> Result<u64, i64>
@@ -18,29 +18,26 @@ fn cap_create_wait_set(memory_cap: u64) -> Result<u64, i64>
     syscall::wait_set_create(memory_cap, crate::WS_CAPACITY)
 }
 
-pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_wait_set(ctx: &crate::TestContext, h: &mut Harness)
 {
     // Cap this benchmark at 100 iterations; each cycle retypes a wait set out
     // of `ctx.memory_base` and frees it on `cap_delete`.
-    let n = u64::from(iters.min(100));
+    let n = u64::from(h.iters().min(100));
 
     let Ok(sig) = cap_create_notification(ctx.memory_base)
     else
     {
-        return;
+        return h.skip("wait_set_cycle", "cap_create_notification failed");
     };
 
-    let mut min = u64::MAX;
-    let mut max = 0u64;
-    let mut total = 0u64;
-    let mut completed: u64 = 0;
+    let (mut samples, counters) = h.recorder();
 
     for _ in 0..n
     {
         // Pre-arm the notification so wait_set_wait returns immediately.
         notification_send(sig, 0x1).ok();
 
-        let t0 = cycles_now();
+        let t0 = counters.read();
         let Ok(ws) = cap_create_wait_set(ctx.memory_base)
         else
         {
@@ -54,38 +51,16 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
         let _ = wait_set_wait(ws);
         let _ = wait_set_remove(ws, sig);
         cap_delete(ws).ok();
-        let t1 = cycles_now();
+        let t1 = counters.read();
 
         // Drain bits left by notification_send.
         notification_wait(sig).ok();
 
-        let delta = t1.saturating_sub(t0);
-        if delta < min
-        {
-            min = delta;
-        }
-        if delta > max
-        {
-            max = delta;
-        }
-        total = total.saturating_add(delta);
-        completed = completed.saturating_add(1);
+        samples.record(t1.since(&t0).cycles);
     }
 
+    let summary = samples.summary();
     cap_delete(sig).ok();
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "n is capped at 100; fits in u32"
-    )]
-    let actual_n = n as u32;
-    log_bench_header("wait_set_cycle", actual_n);
-    // A loop that broke early is averaged over the iterations it completed,
-    // and one that completed none logs no statistics.
-    if let Some(mean) = total.checked_div(completed)
-    {
-        crate::log_u64("ktest: bench  cycles_min=", min);
-        crate::log_u64("ktest: bench  cycles_mean=", mean);
-        crate::log_u64("ktest: bench  cycles_max=", max);
-    }
+    h.report("wait_set_cycle", &[], summary, &[]);
 }

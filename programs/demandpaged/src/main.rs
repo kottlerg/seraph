@@ -35,8 +35,8 @@
 //!     The second region is filled, read back and torn down the same way.
 //!     Exits `SUCCESS` when both rounds pass.
 //!   * `bench [CHUNKS]` — time, in cycles, the first touch of each chunk of a
-//!     demand region and a grant-and-map of the same size, and log the min,
-//!     mean and max of each (programs/demandpaged/README.md § Bench mode). It
+//!     demand region and a grant-and-map of the same size, and log the result
+//!     line of each (programs/demandpaged/README.md § Bench mode). It
 //!     reports and asserts no bound; exits `SUCCESS` when every touch, grant
 //!     and map succeeded.
 //!
@@ -46,6 +46,8 @@ use std::os::seraph::{
     register_demand_paged, reserve_pages, startup_info, unregister_demand_paged,
 };
 use std::process::ExitCode;
+
+use bench::{Counters, Report, Unit, Value};
 
 use syscall_abi::{CAP_INFO_ASPACE_PT_BUDGET, MAP_READ, MAP_WRITABLE, PAGE_SIZE, SyscallError};
 
@@ -338,84 +340,35 @@ const BENCH_CHUNKS: u64 = 64;
 /// times a path.
 const BENCH_WARMUP: u64 = 4;
 
-#[cfg(target_arch = "x86_64")]
-const ARCH_TAG: &str = "x86_64";
-#[cfg(target_arch = "riscv64")]
-const ARCH_TAG: &str = "riscv64";
-
-/// The hardware cycle counter. Units differ by architecture; only deltas on
-/// one architecture compare.
-fn cycles_now() -> u64
+/// The result line of one path's timed samples, `bench demandpaged.chunk_backing
+/// path=<path> pages=16 ...`, logged; `false` when there is no sample or the
+/// line cannot be written.
+fn report(path: &str, samples: &mut [u64], cpus: u32) -> bool
 {
-    #[cfg(target_arch = "x86_64")]
+    let Some(summary) = bench::summarize(samples)
+    else
     {
-        let lo: u32;
-        let hi: u32;
-        // SAFETY: `rdtsc` is unprivileged on x86_64 (the kernel leaves
-        // CR4.TSD clear) and writes only edx:eax.
-        unsafe {
-            core::arch::asm!(
-                "rdtsc",
-                out("eax") lo,
-                out("edx") hi,
-                options(nostack, nomem, preserves_flags),
-            );
-        }
-        (u64::from(hi) << 32) | u64::from(lo)
-    }
-    #[cfg(target_arch = "riscv64")]
+        return false;
+    };
+    let report = Report {
+        suite: "demandpaged",
+        name: "chunk_backing",
+        variant: &[
+            ("path", Value::Word(path)),
+            ("pages", Value::Num(CHUNK_PAGES)),
+        ],
+        cpus,
+        unit: Unit::Cycles,
+        summary,
+        extras: &[],
+    };
+    let mut line = String::new();
+    if report.write(&mut line).is_err()
     {
-        let c: u64;
-        // SAFETY: `csrr cycle` is unprivileged once the kernel sets
-        // `scounteren.CY`, which it does on every hart
-        // (core/kernel/src/arch/riscv64/interrupts.rs).
-        unsafe {
-            core::arch::asm!("csrr {}, cycle", out(reg) c, options(nostack, nomem));
-        }
-        c
+        return false;
     }
-}
-
-/// Running min, sum and max of one path's timed samples.
-struct Samples
-{
-    min: u64,
-    sum: u64,
-    max: u64,
-    count: u64,
-}
-
-impl Samples
-{
-    const fn new() -> Self
-    {
-        Self {
-            min: u64::MAX,
-            sum: 0,
-            max: 0,
-            count: 0,
-        }
-    }
-
-    fn add(&mut self, cycles: u64)
-    {
-        self.min = self.min.min(cycles);
-        self.max = self.max.max(cycles);
-        self.sum = self.sum.saturating_add(cycles);
-        self.count = self.count.saturating_add(1);
-    }
-
-    fn log(&self, path: &str)
-    {
-        let mean = self.sum.checked_div(self.count).unwrap_or(0);
-        std::os::seraph::log!(
-            "arch={ARCH_TAG} path={path} chunk_pages={CHUNK_PAGES} chunks={} cycles_min={} \
-             cycles_mean={mean} cycles_max={}",
-            self.count,
-            self.min,
-            self.max
-        );
-    }
+    std::os::seraph::log!("{line}");
+    true
 }
 
 /// The `bench` mode: the cycles of a demand chunk's first touch against those
@@ -423,7 +376,8 @@ impl Samples
 /// `2` if the registration or the reservation fails, a region too large for
 /// the address space included; `4` if a grant or its map fails; `6` if the
 /// chunk count is not a positive integer that fits in 64 bits; `7` if the
-/// thread cannot be pinned to one CPU. A fault memmgr declines kills the
+/// thread cannot be pinned to one CPU; `8` if the CPU count cannot be read or
+/// a result line cannot be written. A fault memmgr declines kills the
 /// process.
 ///
 /// The thread is pinned to CPU 0 before it times anything: each sample spans
@@ -462,6 +416,15 @@ fn bench() -> ExitCode
     {
         return ExitCode::from(7);
     }
+    let counters = Counters::open();
+    let Some(cpus) = syscall::system_info(syscall_abi::SystemInfoType::CpuCount as u64)
+        .ok()
+        .and_then(|n| u32::try_from(n).ok())
+    else
+    {
+        return ExitCode::from(8);
+    };
+    let capacity = usize::try_from(chunks).unwrap_or(usize::MAX);
 
     // Fault path: the first store into each chunk of a demand region is one
     // fault, which memmgr backs with the whole chunk when a free run covers
@@ -472,21 +435,21 @@ fn bench() -> ExitCode
     {
         return ExitCode::from(2);
     };
-    let mut fault = Samples::new();
+    let mut fault = Vec::with_capacity(capacity);
     for chunk in 0..total
     {
         let va = region
             .va_start()
             .saturating_add(chunk.saturating_mul(chunk_bytes));
-        let start = cycles_now();
+        let start = counters.read();
         // SAFETY: `va` starts a chunk of a read-write demand region this
         // process registered, which holds no Rust object; the store's fault
         // is backed by the pager.
         unsafe { core::ptr::write_volatile(va as *mut u64, 1) };
-        let cycles = cycles_now().wrapping_sub(start);
+        let cycles = counters.read().since(&start).cycles;
         if chunk >= BENCH_WARMUP
         {
-            fault.add(cycles);
+            fault.push(cycles);
         }
     }
 
@@ -499,13 +462,13 @@ fn bench() -> ExitCode
         return ExitCode::from(2);
     };
     let info = startup_info();
-    let mut grant = Samples::new();
+    let mut grant = Vec::with_capacity(capacity);
     for chunk in 0..total
     {
         let va = reservation
             .va_start()
             .saturating_add(chunk.saturating_mul(chunk_bytes));
-        let start = cycles_now();
+        let start = counters.read();
         let Some(cap) = request_contiguous(info.memmgr_endpoint, CHUNK_PAGES)
         else
         {
@@ -523,15 +486,17 @@ fn bench() -> ExitCode
         // SAFETY: the page was just mapped read-write in this process's own
         // reservation and holds no Rust object.
         unsafe { core::ptr::write_volatile(va as *mut u64, 1) };
-        let cycles = cycles_now().wrapping_sub(start);
+        let cycles = counters.read().since(&start).cycles;
         if chunk >= BENCH_WARMUP
         {
-            grant.add(cycles);
+            grant.push(cycles);
         }
     }
 
-    fault.log("fault");
-    grant.log("grant");
+    if !report("fault", &mut fault, cpus) || !report("grant", &mut grant, cpus)
+    {
+        return ExitCode::from(8);
+    }
     ExitCode::SUCCESS
 }
 

@@ -303,32 +303,6 @@ pub fn shutdown(info: &InitInfo)
     acpi_shutdown::shutdown(info);
 }
 
-/// Read the hardware cycle counter with `rdtsc`.
-///
-/// Returns raw cycle counts; use deltas only.
-#[expect(
-    clippy::inline_always,
-    reason = "the counter read must be inlined to avoid call overhead in cycle benchmarks"
-)]
-#[inline(always)]
-pub fn cycles_now() -> u64
-{
-    let lo: u32;
-    let hi: u32;
-    // SAFETY: rdtsc is a user-mode instruction when CR4.TSD = 0, which the
-    // kernel clears on every CPU. preserves_flags: rdtsc does not modify
-    // RFLAGS, only EAX/EDX.
-    unsafe {
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nostack, nomem, preserves_flags),
-        );
-    }
-    (u64::from(hi) << 32) | u64::from(lo)
-}
-
 /// Run every x86-64-specific Tier 1 test.
 pub fn run_unit(ctx: &TestContext)
 {

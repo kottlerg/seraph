@@ -253,7 +253,7 @@ InvalidSubcommand
 error: unrecognized subcommand '-h'
 
 ["build"]
-ok-all build arch=default["x86_64"] release=default component=default["all"] skip_lints=default host_override=default
+ok-all build arch=default["x86_64"] release=default component=default["all"] skip_lints=default ktest_bench_only=default host_override=default
 
 ["build","-h"]
 help xtask build -h

@@ -88,7 +88,7 @@ Build Seraph components and populate `sysroot/`.
 
 ```
 cargo xtask build [--arch x86_64|riscv64] [--release] \
-    [--component <name>|all] [--debug <comp>[,...]]
+    [--component <name>|all] [--debug <comp>[,...]] [--ktest-bench-only]
 ```
 
 | Option | Default | Description |
@@ -97,6 +97,7 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 | `--release` | off | Build in release mode |
 | `--component` | `all` | Build a single component: `boot`, the crate name of any component the build installs (an entry of the `SPECS` table in `xtask/src/commands/build.rs`: `kernel`, `init`, `ktest`, each service, driver, program, fixture, and tester crate), or `all` |
 | `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, each named as `--component` names it, e.g. `--debug kernel,crashme`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
+| `--ktest-bench-only` | off | Build ktest with its `bench-only` feature, which runs Tier 3 alone at its benchmark iteration count ([core/ktest/README.md](../core/ktest/README.md#compile-time-options) § Compile-time options); refused with a `--component` other than `ktest` or `all` |
 
 Before it compiles, the build checks that the workspace's Rust source is formatted as
 `cargo fmt` formats it (`cargo fmt --all --check`) and fails on a file that is not, printing
@@ -2345,7 +2346,7 @@ error prints no `tip:` lines. An argument that is not valid UTF-8 is refused wit
 `InvalidUtf8` error wherever it stands, a path value among them, which clap passed on as its
 bytes.
 
-`src/argparse/reference/` holds the evidence: every help screen of the table (93), and 7229 command
+`src/argparse/reference/` holds the evidence: every help screen of the table (95), and 7244 command
 lines with their outcome (the command and the values parsed, or the error's kind and message),
 recorded from clap 4.6 before the parser replaced it. `cargo xtask test` parses each command line
 and prints each screen through the table, and fails on any difference. A change to the table that

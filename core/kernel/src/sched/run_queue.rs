@@ -503,24 +503,24 @@ pub struct PerCpuScheduler
     idle_pull_episode: AtomicU32,
 
     /// This CPU's backlog episode, a wrapping count that is even while a
-    /// backlog stands and odd from the moment this CPU's own dispatch empties
-    /// its run queues of every thread other than the idle thread until a link
-    /// refills them: `dequeue_highest` adds one when it takes the last such
-    /// thread, and `link` adds one when it queues one into queues that hold
-    /// none while the count is odd. So the count is unchanged exactly while a
-    /// backlog stands without its CPU running it dry
-    /// (core/kernel/docs/scheduler.md § Load Balancing). No removal
-    /// (`remove_from_queue`) changes it: a thread unlinked and linked again
-    /// without running, as a priority change relocates it, keeps its
-    /// episode, and a backlog a removal empties and a link refills reads as the
-    /// one before. Owned by `lock`: written only under it, by `dequeue_highest`
-    /// and by `link` before the `non_empty` Release that publishes the link.
-    /// Read under `lock` by a pull's re-check, and without it by an idle CPU's
-    /// sample, Relaxed after an Acquire load of `non_empty`
-    /// ([`backlog`](Self::backlog)); a sample that reads the odd count of a
-    /// dispatch it raced matches no later backlog, whose count is even. A wrap can make two samples a tick apart
-    /// match across a break only after 2^31 backlogs between them, and would
-    /// cost one pull the bound already allows.
+    /// thread other than the idle thread is queued, and odd from a removal
+    /// (`remove_from_queue`) that empties the run queues of every such thread
+    /// until the link that refills them. `link` into queues holding no such
+    /// thread advances an even count by two, starting an episode, and takes an
+    /// odd one up to the even count it had before the removal: a backlog that its
+    /// CPU's dispatch runs dry is followed by a new episode, and one a removal
+    /// empties and a link refills reads as the one before, so a thread
+    /// unlinked and linked again without running, as a priority change
+    /// relocates it, keeps its episode (core/kernel/docs/scheduler.md § Load
+    /// Balancing). `dequeue_highest` never writes it, so the dispatch path
+    /// pays for it only at the link. Owned by `lock`: written only under it,
+    /// by `link` and `remove_from_queue`, each before the `non_empty` Release
+    /// that publishes its change. Read under `lock` by a pull's re-check, and
+    /// without it by an idle CPU's sample, Relaxed after an Acquire load of
+    /// `non_empty`, both through [`backlog`](Self::backlog), which rounds an
+    /// odd count up to the even count of the episode it continues. A wrap can
+    /// make two samples a tick apart match across a break only after 2^31
+    /// backlogs between them, and would cost one pull the bound already allows.
     backlog_episode: AtomicU32,
 
     /// Whether this CPU's previous idle balance tick held `idle_pull_candidate`
@@ -783,20 +783,20 @@ impl PerCpuScheduler
             });
         }
         // A link that makes the queues hold a thread other than the idle thread
-        // after this CPU's dispatch ran them dry (an odd episode) starts a
-        // backlog episode; one after a removal emptied them continues the
-        // episode, so an unlink and re-link of a thread that never ran is no
-        // break. Every write of `non_empty` holds `lock`, so this load reads
-        // the queues as they were before the link; the store precedes the
-        // Release below, so a sample that sees this link's bit reads this
-        // episode or a later one.
-        // Rounding up to even advances an odd count by one and leaves an even
-        // one as it is, without a branch.
+        // after they held none starts a backlog episode, unless a removal
+        // emptied them (an odd count): then it continues the episode the
+        // removal broke off, so an unlink and re-link of a thread that never
+        // ran is no break. `(episode | 1) + 1` takes an even count two on and
+        // an odd one up to the even count before the removal, without a branch.
+        // Every write of `non_empty` holds `lock`, so this load reads the
+        // queues as they were before the link; the store precedes the Release
+        // below, so a sample that sees this link's bit reads this episode or a
+        // later one.
         if q != IDLE_QUEUE && self.non_empty.load(Ordering::Relaxed) & QUEUED_THREAD_MASK == 0
         {
             let episode = self.backlog_episode.load(Ordering::Relaxed);
             self.backlog_episode
-                .store(episode.wrapping_add(1) & !1, Ordering::Relaxed);
+                .store((episode | 1).wrapping_add(1), Ordering::Relaxed);
         }
         // Release: publishes the queue write and the increment_load store to the
         // lockless `has_runnable` Acquire (core/kernel/docs/scheduling-internals.md
@@ -809,9 +809,7 @@ impl PerCpuScheduler
     /// level with a ready thread, else the fair queue), or return `idle` if all
     /// queues are empty.
     ///
-    /// Clears the `non_empty` bit if that queue becomes empty, and when that
-    /// leaves no thread other than the idle thread queued, makes the backlog
-    /// episode odd (the `backlog_episode` field): this CPU ran its backlog dry.
+    /// Clears the `non_empty` bit if that queue becomes empty.
     /// Decrements the load counter when it dequeues a linked TCB, the idle
     /// thread included when [`IDLE_QUEUE`] links it; returning the unlinked idle
     /// TCB leaves the counter as it is.
@@ -867,17 +865,6 @@ impl PerCpuScheduler
         }
         if queue.is_empty()
         {
-            // The dispatch took the last thread other than the idle thread:
-            // the backlog ran dry, so the next link starts a new episode.
-            // `ne`, read under the lock, is exact, and the store precedes the
-            // Release below, which publishes it with the dequeue.
-            // Setting the low bit advances an even count by one and leaves an
-            // odd one as it is, without a branch.
-            if q != IDLE_QUEUE && ne & !(1 << q) & QUEUED_THREAD_MASK == 0
-            {
-                let episode = self.backlog_episode.load(Ordering::Relaxed);
-                self.backlog_episode.store(episode | 1, Ordering::Relaxed);
-            }
             // Release: a later Acquire load that sees this bit cleared has
             // also seen the dequeue store above.
             self.non_empty.fetch_and(!(1 << q), Ordering::Release);
@@ -1064,16 +1051,18 @@ impl PerCpuScheduler
     /// The backlog episode this CPU is in while a run queue other than
     /// [`IDLE_QUEUE`] links a thread, or `None` when none does (see the
     /// `backlog_episode` field). Two reads that return the same episode saw no
-    /// dispatch run this CPU's backlog dry between them, since every such
-    /// dispatch ends its episode. Under `lock` the answer is exact; without
-    /// it, a sample for the idle pull: the Acquire load of `non_empty` pairs
-    /// with the Release of the link that set the bit it sees, so the episode
-    /// read after it is that link's or a later one, and a sample can name a
-    /// newer episode than the backlog it saw but never an older one.
+    /// dispatch run this CPU's backlog dry between them, since the link after
+    /// every such dispatch starts a new episode. Under `lock` the answer is
+    /// exact; without it, a sample for the idle pull: the Acquire load of
+    /// `non_empty` pairs with the Release of the link that set the bit it
+    /// sees, so the episode read after it is that link's or a later one, and a
+    /// sample can name a newer episode than the backlog it saw but never an
+    /// older one. A sample that reads the odd count of a removal it raced
+    /// rounds it up to the episode that removal continues.
     pub fn backlog(&self) -> Option<u32>
     {
         let queued = self.non_empty.load(Ordering::Acquire) & QUEUED_THREAD_MASK != 0;
-        queued.then(|| self.backlog_episode.load(Ordering::Relaxed))
+        queued.then(|| self.backlog_episode.load(Ordering::Relaxed).wrapping_add(1) & !1)
     }
 
     /// Whether this CPU has no work: it runs its idle thread and no run queue
@@ -1134,6 +1123,18 @@ impl PerCpuScheduler
             self.decrement_load();
             if queue.is_empty()
             {
+                // The removal took the last thread other than the idle thread
+                // without its running: make the episode odd, one below it, so
+                // the link that refills the queues continues it (`link`). Every
+                // write of `non_empty` holds `lock`, so the load is exact, and
+                // the store precedes the Release below.
+                let ne = self.non_empty.load(Ordering::Relaxed);
+                if q != IDLE_QUEUE && ne & !(1 << q) & QUEUED_THREAD_MASK == 0
+                {
+                    let episode = self.backlog_episode.load(Ordering::Relaxed);
+                    self.backlog_episode
+                        .store(episode.wrapping_sub(1), Ordering::Relaxed);
+                }
                 self.non_empty.fetch_and(!(1 << q), Ordering::Release);
             }
         }

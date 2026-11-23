@@ -588,6 +588,19 @@ devmgr's responsibilities are:
   Notifications of 64 B each. The handler logs nothing, as the query does
   not.
 
+  `QUERY_DEVICE_LOCATION` on a class SEND answers where the device of the
+  driver at an ordinal sits: the segment, bus, device, and function of the
+  PCI function devmgr bound it to, the address devmgr reads that function's
+  configuration space at ([pci-enumeration.md § ECAM Configuration
+  Space](pci-enumeration.md#ecam-configuration-space)), packed as
+  `devmgr_labels::pci_function` packs it. An ordinal only counts the
+  class's drivers in serving order; the location names the device. A driver
+  of a platform device (the serial, framebuffer, and RTC drivers) gets
+  `NO_LOCATION`. Like the query, it is refused `UNAUTHORIZED` to a SEND
+  without a class slot, answers `WITHDRAWN` and `NO_DEVICE` at the same
+  ordinals, waits for a settle as the query does, and logs nothing. vfsd
+  asks it of each disk it holds ([services/vfsd/README.md](../../vfsd/README.md)).
+
   devmgr mints class SENDs on `MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`
   (badge bit 59), which svcmgr and init each derive from their badge-0
   registry source and no published name carries. The request carries the verbs

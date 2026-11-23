@@ -10,7 +10,8 @@
 //! format parser on each disk found, and the probe that tells a held disk
 //! present from removed.
 //!
-//! This module owns the IPC — querying devmgr for each block driver,
+//! This module owns the IPC — querying devmgr for each block driver and where
+//! its device sits,
 //! allocating a scratch page, moving a Memory cap to the block driver and
 //! back, and copying the returned sector — and delegates every decode of the
 //! (untrusted) on-disk GPT structures, and the role lookup across disks, to
@@ -31,6 +32,7 @@
 use std::os::seraph::reserve_pages;
 
 use gpt::{GptCopy, GptEntry, ScanStop, read_gpt};
+use ipc::devmgr_labels::PciLocation;
 use ipc::{
     ClassCallError, IpcMessage, blk_errors, blk_labels, devmgr_errors, memmgr_errors, memmgr_labels,
 };
@@ -41,7 +43,8 @@ use syscall_abi::MAP_WRITABLE;
 const SECTOR_OFFSET_IN_MEMORY: u64 = 0;
 
 /// One block device vfsd holds: devmgr's whole-disk cap on its driver, the
-/// used partitions of its GPT, and the ordinal devmgr serves it at. A disk
+/// used partitions of its GPT, the ordinal devmgr serves it at, and where
+/// its device sits. A disk
 /// devmgr withdrew is kept, marked removed, so the disk indices mount
 /// records carry stay valid.
 pub struct Disk
@@ -58,6 +61,11 @@ pub struct Disk
     /// The `block` class ordinal devmgr serves the disk's driver at, which
     /// [`probe`] asks about.
     pub ordinal: u64,
+    /// Where the disk's device sits, the PCI function devmgr bound its driver
+    /// to (`QUERY_DEVICE_LOCATION` on the `block` class), asked once when the
+    /// disk is found; `None` when devmgr names none (a disk that is no PCI
+    /// function) or the query failed, both logged.
+    pub location: Option<PciLocation>,
     /// Whether devmgr withdrew the disk's driver: the disk is gone for the
     /// rest of the boot, and a disk inserted again is a new ordinal.
     pub removed: bool,
@@ -255,11 +263,12 @@ impl Discovery
         self.next_ordinal = self.next_ordinal.min(ordinal);
     }
 
-    /// The disk devmgr serves at `ordinal` through `blk_ep`, with its GPT
-    /// parsed.
+    /// The disk devmgr serves at `ordinal` through `blk_ep`, with where its
+    /// device sits and its GPT parsed.
     fn read_disk(&mut self, ordinal: u64, blk_ep: u64, ipc_buf: *mut u64) -> Disk
     {
         std::os::seraph::log!(debug: "disk {ordinal}: block device endpoint acquired");
+        let location = locate_disk(self.block_class, ordinal, ipc_buf);
         if self.scratch_cap == 0
         {
             replace_scratch(
@@ -278,11 +287,45 @@ impl Discovery
             &mut self.scratch_cap,
             self.scratch_va,
         );
-        Disk {
+        let disk = Disk {
             blk_ep,
             partitions,
             ordinal,
+            location,
             removed: false,
+        };
+        if let Some(at) = disk.location
+        {
+            std::os::seraph::log!(
+                "disk {ordinal}: at PCI {:04x}:{:02x}:{:02x}.{}",
+                at.segment,
+                at.bus,
+                at.device,
+                at.function
+            );
+        }
+        disk
+    }
+}
+
+/// Where devmgr says the device of the disk it serves at `ordinal` sits
+/// (`QUERY_DEVICE_LOCATION` on `block_class`); `None`, logged, when it is
+/// no PCI function or the query fails.
+fn locate_disk(block_class: u64, ordinal: u64, ipc_buf: *mut u64) -> Option<PciLocation>
+{
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    match unsafe { ipc::query_device_location(block_class, ordinal, ipc_buf) }
+    {
+        Ok(at) => Some(at),
+        Err(ClassCallError::Refused(devmgr_errors::NO_LOCATION)) =>
+        {
+            std::os::seraph::log!("disk {ordinal}: on no PCI function");
+            None
+        }
+        Err(e) =>
+        {
+            std::os::seraph::log!(warn: "disk {ordinal}: QUERY_DEVICE_LOCATION failed: {e:?}");
+            None
         }
     }
 }

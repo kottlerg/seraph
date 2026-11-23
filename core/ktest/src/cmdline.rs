@@ -64,7 +64,9 @@ impl KtestConfig
         run_integration: true,
         run_stress: true,
         run_bench: true,
-        bench_iters: 1000,
+        // A smoke run: each benchmark runs and logs its line, which no
+        // functional boot compares; the benchmark image (`BENCH`) measures.
+        bench_iters: 8,
     };
 
     /// The benchmark image's configuration: Tier 3 alone, each benchmark at

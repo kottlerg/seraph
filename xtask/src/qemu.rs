@@ -602,6 +602,65 @@ crate::argparse::value_enum! {
     }
 }
 
+/// How QEMU executes a launch's machine.
+///
+/// Not a field of [`QemuLaunchSpec`]: it changes how QEMU runs the machine,
+/// not what the machine is, and `cargo xtask run --icount` is its only
+/// choice of [`Execution::Icount`] ([`build_qemu_argv_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Execution
+{
+    /// The host's accelerator ([`accel::detect_for_arch`]), multi-threaded
+    /// under TCG.
+    Standard,
+    /// Deterministic instruction counting: single-threaded TCG with
+    /// `-icount shift=0,sleep=off,align=off`, so the guest's clock, and the
+    /// cycle counters read from it, advance one tick per retired instruction
+    /// and never with the host's time. On `x86_64` the CPU model drops x2APIC,
+    /// since QEMU aborts with `Bad icount read` once the kernel arms its
+    /// x2APIC timer; the kernel then runs its xAPIC paths.
+    Icount,
+}
+
+impl Execution
+{
+    /// The accelerator a launch of `arch` runs on: TCG under icount, which
+    /// only TCG implements, whatever `SERAPH_ACCEL` says.
+    pub fn accel(self, arch: Arch) -> Accel
+    {
+        match self
+        {
+            Self::Standard => accel::detect_for_arch(arch),
+            Self::Icount => Accel::Tcg,
+        }
+    }
+
+    /// The TCG `-accel` value and the arguments after it.
+    fn tcg_args(self) -> Vec<String>
+    {
+        match self
+        {
+            Self::Standard => vec!["-accel".into(), "tcg,thread=multi".into()],
+            Self::Icount => vec![
+                "-accel".into(),
+                "tcg,thread=single".into(),
+                "-icount".into(),
+                "shift=0,sleep=off,align=off".into(),
+            ],
+        }
+    }
+
+    /// The `-cpu` property the execution adds to the `x86_64` TCG model.
+    const fn x86_cpu_prop(self) -> &'static str
+    {
+        match self
+        {
+            Self::Standard => "",
+            Self::Icount => ",-x2apic",
+        }
+    }
+}
+
 /// The second disk's `INTx` line: its own slot's line, or the first disk's
 /// line (the `--second-disk-shared-line` launch).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -775,7 +834,13 @@ fn smp_arg(cpus: u32, threads_per_core: u32) -> Result<String>
 /// is suitable for `Command::new(binary).args(&argv)`.
 pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 {
-    build_qemu_argv_with_tpm(spec, None)
+    build_argv(spec, None, Execution::Standard)
+}
+
+/// [`build_qemu_argv`], with QEMU executing the machine as `execution` says.
+pub fn build_qemu_argv_for(spec: &QemuLaunchSpec, execution: Execution) -> Result<Vec<String>>
+{
+    build_argv(spec, None, execution)
 }
 
 /// [`build_qemu_argv`], with `tpm` attached when it is set (the `tpm` case
@@ -784,6 +849,17 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 /// PC Client TPM range, which the riscv64 `virt` machine does not decode.
 pub fn build_qemu_argv_with_tpm(spec: &QemuLaunchSpec, tpm: Option<Tpm<'_>>)
 -> Result<Vec<String>>
+{
+    build_argv(spec, tpm, Execution::Standard)
+}
+
+/// The argv of a launch: `spec`'s machine, `tpm` attached when it is set, run
+/// as `execution` says.
+fn build_argv(
+    spec: &QemuLaunchSpec,
+    tpm: Option<Tpm<'_>>,
+    execution: Execution,
+) -> Result<Vec<String>>
 {
     if tpm.is_some() && spec.arch != Arch::X86_64
     {
@@ -900,11 +976,11 @@ pub fn build_qemu_argv_with_tpm(spec: &QemuLaunchSpec, tpm: Option<Tpm<'_>>)
 
     args.extend(gdb_args(spec.gdb));
 
-    let accel = accel::detect_for_arch(spec.arch);
+    let accel = execution.accel(spec.arch);
     match spec.arch
     {
-        Arch::X86_64 => extend_x86(&mut args, spec, accel, X86Host::probe())?,
-        Arch::Riscv64 => extend_riscv(&mut args, spec),
+        Arch::X86_64 => extend_x86(&mut args, spec, accel, execution, X86Host::probe())?,
+        Arch::Riscv64 => extend_riscv(&mut args, spec, execution),
     }
 
     Ok(args)
@@ -1076,6 +1152,7 @@ fn extend_x86(
     args: &mut Vec<String>,
     spec: &QemuLaunchSpec,
     accel: Accel,
+    execution: Execution,
     host: X86Host,
 ) -> Result<()>
 {
@@ -1171,12 +1248,12 @@ fn extend_x86(
             // TCG fallback: `-cpu max,migratable=no` advertises every
             // feature QEMU can emulate (including x86-64-v3) so userspace
             // SIMD codegen executes correctly under non-KVM runs (CI,
-            // KVM-less containers).
+            // KVM-less containers). Under icount the model drops x2APIC
+            // (`Execution::Icount`).
+            args.extend(execution.tcg_args());
             args.extend([
-                "-accel".into(),
-                "tcg,thread=multi".into(),
                 "-cpu".into(),
-                format!("max,migratable=no{props}"),
+                format!("max,migratable=no{props}{}", execution.x86_cpu_prop()),
             ]);
         }
     }
@@ -1198,7 +1275,7 @@ fn extend_x86(
     Ok(())
 }
 
-fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec)
+fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec, execution: Execution)
 {
     // AIA is the only interrupt controller the kernel drives: `aia=aplic-imsic`
     // gives the machine an APLIC (MSI delivery) and per-hart IMSIC files in
@@ -1241,8 +1318,9 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec)
     // Explicit multi-threaded TCG: `-smp 4` without this falls back to the
     // per-arch default, which can be single-threaded round-robin. SMP
     // correctness under real parallel execution needs genuine
-    // multi-threaded emulation.
-    args.extend(["-accel".into(), "tcg,thread=multi".into()]);
+    // multi-threaded emulation. Icount runs single-threaded TCG
+    // (`Execution::Icount`).
+    args.extend(execution.tcg_args());
     args.extend([
         "-drive".into(),
         format!(
@@ -2043,7 +2121,7 @@ mod tests
                 let mut spec = x86_spec(X86Paging::Four);
                 spec.iommu = iommu;
                 let mut argv = Vec::new();
-                extend_x86(&mut argv, &spec, accel, HOST).unwrap();
+                extend_x86(&mut argv, &spec, accel, Execution::Standard, HOST).unwrap();
                 let split = accel == Accel::Kvm && iommu == Iommu::Attached;
                 let expected = if split
                 {
@@ -2075,7 +2153,14 @@ mod tests
             ]
             {
                 let mut argv = Vec::new();
-                extend_x86(&mut argv, &x86_spec(paging), accel, HOST).unwrap();
+                extend_x86(
+                    &mut argv,
+                    &x86_spec(paging),
+                    accel,
+                    Execution::Standard,
+                    HOST,
+                )
+                .unwrap();
                 assert!(cpu_arg(&argv).contains(prop), "{accel:?} {paging:?}");
             }
         }
@@ -2098,7 +2183,7 @@ mod tests
                 let mut spec = x86_spec(X86Paging::Four);
                 spec.x86_shadow_stack = shadow_stack;
                 let mut argv = Vec::new();
-                extend_x86(&mut argv, &spec, accel, HOST).unwrap();
+                extend_x86(&mut argv, &spec, accel, Execution::Standard, HOST).unwrap();
                 assert!(
                     cpu_arg(&argv).ends_with(props),
                     "{accel:?} {shadow_stack:?}: {}",
@@ -2122,7 +2207,14 @@ mod tests
         for accel in [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm, Accel::Tcg]
         {
             let mut argv = Vec::new();
-            extend_x86(&mut argv, &x86_spec(X86Paging::Four), accel, host).unwrap();
+            extend_x86(
+                &mut argv,
+                &x86_spec(X86Paging::Four),
+                accel,
+                Execution::Standard,
+                host,
+            )
+            .unwrap();
             assert!(
                 cpu_arg(&argv).ends_with(",la57=off"),
                 "{accel:?}: {}",
@@ -2132,7 +2224,8 @@ mod tests
 
             let mut spec = x86_spec(X86Paging::Four);
             spec.x86_shadow_stack = X86ShadowStack::On;
-            let err = extend_x86(&mut Vec::new(), &spec, accel, host).unwrap_err();
+            let err =
+                extend_x86(&mut Vec::new(), &spec, accel, Execution::Standard, host).unwrap_err();
             assert!(err.to_string().contains("cet-ss"), "{accel:?}: {err}");
         }
     }
@@ -2637,5 +2730,52 @@ mod tests
         let argv = build_qemu_argv(&x86_spec(X86Paging::Four)).unwrap();
         assert!(has_pair(&argv, "-vga", "none"));
         assert!(has_pair(&argv, "-display", "none"));
+    }
+
+    #[test]
+    fn an_icount_launch_runs_single_threaded_tcg_counting_instructions_on_both_machines()
+    {
+        for spec in [riscv_spec(4, 512), x86_spec(X86Paging::Four)]
+        {
+            let argv = build_qemu_argv_for(&spec, Execution::Icount).unwrap();
+            assert!(has_pair(&argv, "-accel", "tcg,thread=single"), "{argv:?}");
+            assert!(
+                has_pair(&argv, "-icount", "shift=0,sleep=off,align=off"),
+                "{argv:?}"
+            );
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a == "-enable-kvm" || a == "tcg,thread=multi")
+            );
+
+            let argv = build_qemu_argv_for(&spec, Execution::Standard).unwrap();
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a == "-icount" || a == "tcg,thread=single")
+            );
+        }
+    }
+
+    #[test]
+    fn an_icount_x86_launch_drops_x2apic_and_no_other_launch_does()
+    {
+        let argv = build_qemu_argv_for(&x86_spec(X86Paging::Four), Execution::Icount).unwrap();
+        assert!(cpu_arg(&argv).starts_with("max,migratable=no"));
+        assert!(cpu_arg(&argv).ends_with(",-x2apic"));
+
+        let mut argv = Vec::new();
+        extend_x86(
+            &mut argv,
+            &x86_spec(X86Paging::Four),
+            Accel::Tcg,
+            Execution::Standard,
+            HOST,
+        )
+        .unwrap();
+        assert!(!cpu_arg(&argv).contains("x2apic"));
+        let argv = build_qemu_argv_for(&riscv_spec(1, 512), Execution::Icount).unwrap();
+        assert!(!cpu_arg(&argv).contains("x2apic"));
     }
 }

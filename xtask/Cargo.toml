@@ -47,6 +47,10 @@ vfsd-gpt = { path = "../services/vfsd/gpt" }
 # verifier each signed object is checked against before it is written.
 crypto = { path = "../shared/crypto" }
 objsig = { path = "../shared/objsig", features = ["sign"] }
+# The benchmark result line's parser (`bench::parse_line`): `bench-check` and
+# `bench-baseline` read the lines with the crate every benchmark writes them
+# with. Without its counters, which exist only on Seraph's architectures.
+bench = { path = "../shared/bench", default-features = false }
 # init's log-level parser: `mkdisk --log-levels` refuses a configuration with a
 # line init would ignore.
 init-log-levels = { path = "../services/init/log-levels" }

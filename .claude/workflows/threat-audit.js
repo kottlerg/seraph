@@ -13,7 +13,8 @@
 //
 // Scope reads the section from `cargo xtask threat-scope` (xtask/README.md),
 // never from an agent's own reading of the document: one agent returns the
-// command's summary and one each of its pages of open Issues, and the script
+// command's summary and one each of its pages of open Issues, cut from the
+// list the summary saved (the report states when it was read), and the script
 // recomputes the digest each carries, so the attacker, the assets, the
 // assumptions and every claim reach the reviewers byte for byte as the
 // document states them; the script frames them and never rewrites them. The
@@ -124,7 +125,7 @@ const SUMMARY_SCHEMA = {
         'head', 'repo_root', 'tree_at_head', 'document', 'section', 'slug',
         'system_assumptions', 'blocks', 'documents', 'unanchored', 'unresolved', 'complete',
         'shards', 'page_entries', 'open_issue_count', 'open_issue_pages',
-        'open_issues_digest', 'digest',
+        'open_issues_digest', 'issues_as_of', 'digest',
     ],
     properties: {
         head: { type: 'string' },
@@ -185,6 +186,7 @@ const SUMMARY_SCHEMA = {
         open_issue_count: COUNT,
         open_issue_pages: COUNT,
         open_issues_digest: DIGEST,
+        issues_as_of: { type: 'string' },
         digest: DIGEST,
     },
 }
@@ -350,6 +352,7 @@ const summary_digest = (s) =>
             ...list_fields(sh.items),
         ]),
         s.page_entries, s.open_issue_count, s.open_issue_pages, s.open_issues_digest,
+        s.issues_as_of,
     ])
 const page_digest = (p) =>
     digest([
@@ -433,7 +436,8 @@ if (scope.shards.length === 0) {
 const page_jobs = Array.from({ length: scope.open_issue_pages }, (_, i) => i + 1)
 const pages = await parallel(page_jobs.map((page) => () => transported(
     transport_prompt(
-        SCOPE_COMMAND + ' --head ' + scope.head + ' --page issues:' + page,
+        SCOPE_COMMAND + ' --head ' + scope.head + ' --page issues:' + page + ' --issues ' +
+            scope.open_issues_digest,
         'page ' + page + ' of ' + scope.open_issue_pages + ' of its open Issues',
     ),
     'scope:issues#' + page, PAGE_SCHEMA,
@@ -450,9 +454,9 @@ if (
     issues_digest(open_issues) !== scope.open_issues_digest
 ) {
     return {
-        error: 'the scope returned ' + open_issues.length + ' open Issues of ' +
-            scope.open_issue_count + ', or an Issue differs (an Issue filed, closed, or renamed ' +
-            'while the scope ran changes the list: run again)',
+        error: 'the pages returned ' + open_issues.length + ' open Issues of the ' +
+            scope.open_issue_count + ' the summary saved, or an Issue differs: the pages are ' +
+            'cut from that saved list, so the transport altered one',
     }
 }
 const open_issue_numbers = new Set(open_issues.map((i) => i.number))
@@ -908,7 +912,9 @@ const drafts = [...reachable, ...reach_unjudged, ...unreachable, ...document_def
 const report = [
     '# Threat audit: ' + TARGET,
     '',
-    'Head ' + scope.head + ', tree ' + scope.repo_root + '. ' + scope.shards.length +
+    'Head ' + scope.head + ', tree ' + scope.repo_root + '. Open Issues as of ' +
+        scope.issues_as_of + ' (' + scope.open_issue_count + ', the list the scope saved). ' +
+        scope.shards.length +
         ' shards and the ' +
         'document lens; ' + agent_calls + ' agents. ' + all.length + ' defects: ' +
         reachable.length + ' confirmed and reachable, ' + reach_unjudged.length +

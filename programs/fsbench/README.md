@@ -1,16 +1,17 @@
 # fsbench
 
 Test fixture that measures the cycles `std::fs::File` takes to read each of several sizes
-through its two read paths, inline `FS_READ` and memory-cap `FS_READ_MEMORY`, and to rewrite
-4 KiB and 64 KiB of a file in place through its memory-cap write path, `FS_WRITE_MEMORY`.
+through its two read paths, inline `FS_READ` and memory-cap `FS_READ_MEMORY`, to rewrite 4 KiB
+and 64 KiB of a file in place through its memory-cap write path, `FS_WRITE_MEMORY`, and to open a
+three-component path.
 
 ---
 
 ## Invocation
 
 `fsbench [ITERS]` runs `ITERS` timed iterations per size and path of every case (a positive
-integer). When it is omitted, the full benchmark runs 256 per read and 64 per write, since every
-write goes through to the disk. The [`svctest`](../../services/svctest/README.md) phase
+integer). When it is omitted, the full benchmark runs 256 per read and per open and 64 per write,
+since every write goes through to the disk. The [`svctest`](../../services/svctest/README.md) phase
 `fs_crossover_bench` ([fs_ipc.rs](../../services/svctest/src/phases/fs_ipc.rs)) spawns
 `fsbench 8` from `/programs/fsbench`, enough to exercise every path at every size, and passes
 when it exits cleanly. The [`ubench`](../ubench/README.md) suite spawns `fsbench` with no
@@ -27,8 +28,9 @@ programs/fsbench/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # Fixture check, the timed inline and memory-cap read loops, then the
-                           # timed write loops and their read-back
+    ├── main.rs            # Fixture check, the timed inline and memory-cap read loops, then the
+    │                      # timed write loops and their read-back
+    └── open.rs            # The timed open of /services/fs/fatfs and its NS_LOOKUP count
 ```
 
 ---
@@ -83,13 +85,23 @@ through to the disk, so a sample includes the wait for the device's completions.
 writes end, `fsbench` reads the 64 KiB back and panics on any page that differs from what it
 wrote.
 
+The `open` case then opens `/services/fs/fatfs`, a file three components deep that the root
+filesystem owns, after 8 untimed warm-up opens, the timed ones (as many as each read size: 256, or
+`ITERS`). Each sample is one `File::open`: vfsd forwards the whole path to the root filesystem,
+which walks all three components in one `NS_LOOKUP`
+([shared/namespace-protocol/README.md](../../shared/namespace-protocol/README.md#ns_lookup)
+§ NS_LOOKUP), and the open's `FS_OPEN`; the file is closed outside the sample. An open whose
+walk made other than one `NS_LOOKUP` call, by std's count
+(`std::os::seraph::fs::ns_lookup_calls`), panics.
+
 ---
 
 ## Output
 
 Lines are logged under the name `fsbench`. The run opens with
 `starting, fixture=/data/svctest/bench.bin read_iters=<n> write_iters=<n>`, emits one result line
-per size and path of each case, and closes with `done`. Each result line has the form
+per size and path of each case, then the `open` case's, and closes with `done`. Each result line
+has the form
 [shared/bench/README.md § Result line](../../shared/bench/README.md#result-line) specifies, where
 `<bytes>` is the size, `<path>` is `inline` or `frame` for a read and `frame` for a write, and
 `n=` is the case's iteration count:
@@ -101,15 +113,23 @@ bench fsbench.write size=<bytes> path=frame arch=<arch> cpus=<k> unit=cycles
     n=<n> min=<v> p50=<v> p90=<v> p99=<v> max=<v>
 ```
 
-Each line is one line, wrapped above for width only.
+Each line is one line, wrapped above for width only. The `open` case's line has the same form,
+with `depth=3`, the path's component count, in place of the size and path:
 
-Each sample is one timed iteration, which covers all the `read` or `write_all` calls that one
-size needs, not a single call.
+```text
+bench fsbench.open depth=3 arch=<arch> cpus=<k> unit=cycles
+    n=<n> min=<v> p50=<v> p90=<v> p99=<v> max=<v>
+```
+
+Each `read` or `write` sample is one timed iteration, which covers all the `read` or
+`write_all` calls that one size needs, not a single call; each `open` sample is one
+`File::open`.
 
 A failed pin, CPU-count read, open, fixture check, seek, read, create, write, write read-back, or
-removal of the scratch file, or an `ITERS` that is not a positive integer, panics, so the process
-exits unsuccessfully and the `fs_crossover_bench` phase fails, as does ubench's `fsbench`
-benchmark; a memory-cap `read` that returns `Interrupted` is retried, not a failure.
+removal of the scratch file, an `open` case walk of other than one `NS_LOOKUP`, or an `ITERS`
+that is not a positive integer, panics, so the process exits unsuccessfully and the
+`fs_crossover_bench` phase fails, as does ubench's `fsbench` benchmark; a memory-cap `read`
+that returns `Interrupted` is retried, not a failure.
 
 ---
 

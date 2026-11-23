@@ -539,12 +539,11 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | `SpscHeader.capacity` | `shared/shmem/src/lib.rs` | `u32` power of two | ABI width (shared header layout) | none | correct as is | None |
 | `MAX_NAME_LEN` (`EntryName`) | `shared/namespace-protocol/src/name.rs` | 255 | ABI width (`u8` length; the POSIX `NAME_MAX` convention) | 255 B per name | correct as is | None |
 | `MIN_NAME_LEN` | `shared/namespace-protocol/src/name.rs` | 1 | encoding artefact (an empty name is meaningless) | none | correct as is | None |
+| `MAX_LOOKUP_PATH_LEN` | `shared/namespace-protocol/src/lib.rs` | 504 bytes, `(MSG_DATA_WORDS_MAX - 1) * 8`: the data words after the rights word | ABI width (`MSG_DATA_WORDS_MAX`) | none | correct as is | None; a client splits a longer path at a component boundary |
 | `NODE_ID_BITS` | `shared/namespace-protocol/src/badge.rs` | 40 | encoding artefact (40 node plus 24 rights bits in a `u64` badge) | none | correct as is | Safe while backends never recycle a live `NodeId` (#27) |
 | `RIGHTS_BITS` | `shared/namespace-protocol/src/rights.rs` | 24 | encoding artefact | none | correct as is | None |
 | readdir index, `nth_visible_entry` | `shared/namespace-protocol/src/lib.rs` | `u32` | provably unreachable (no directory holds 2^32 entries) | none | correct as is | None |
 | `MemoryReply.bytes_valid`, `memory_data_offset` | `shared/namespace-protocol/src/lib.rs` | `u32` | provably unreachable (at most a page) | none | correct as is | None |
-| ns-client component bound | `shared/ns-client/src/lib.rs` | literal 255 | copy of `MAX_NAME_LEN` | none | correct as is | Import the constant |
-| ns-client `hop_count` | `shared/ns-client/src/lib.rs` | unbounded `usize` | provably unreachable (bounded by the path length) | none | correct as is | None |
 | `cap_revoke_all` `MAX_RETRIES` | `shared/syscall/src/lib.rs` | 4096 | provably unreachable (only an adversarial deriver exhausts it) | none | correct as is | None |
 | syscall wrapper argument widths | `shared/syscall/src/lib.rs` | `u32`, `u16`, `u8` | ABI width (syscall ABI) | none | correct as is | None |
 | `MAX_RELA_TABLE_SIZE` | `shared/elf/src/lib.rs` | 4 MiB, applied only by the kernel to init's table | provably unreachable (init is an in-tree binary with a few thousand relocations; its table size arrives from the bootloader) | none | correct as is | None: the table locator bounds a table by its `PT_LOAD` file data and the file instead |

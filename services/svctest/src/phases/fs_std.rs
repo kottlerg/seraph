@@ -289,6 +289,17 @@ const FRAME_POOL_RECHECKS: u32 = 16;
 /// one page.
 const FRAME_CHUNK_LEN: usize = 2048;
 
+/// What a file [`measure_frame_writes`] wrote must hold once its `File`
+/// dropped.
+#[derive(Clone, Copy)]
+enum ReadBack
+{
+    /// The last measured write's bytes: every write reached the file.
+    LastWrite,
+    /// The warm-up's bytes: no measured write was sent.
+    WarmUp,
+}
+
 /// svctest's charge, in pages, and its write-frame memmgr calls
 /// (`std::os::seraph::fs::write_frame_memmgr_calls`) around
 /// [`FRAME_WRITES`] frame-path writes on one `File`.
@@ -314,10 +325,10 @@ struct FrameCharge
 /// svctest's charge and write-frame memmgr calls around them as
 /// [`std_frame_write_pool_phase`] describes; the file is removed again.
 /// After the drop the file must hold the last measured write's bytes when
-/// `writes_land`, else the warm-up's.
+/// `read_back` is [`ReadBack::LastWrite`], else the warm-up's.
 fn measure_frame_writes(
     path: &str,
-    writes_land: bool,
+    read_back: ReadBack,
     mut write: impl FnMut(&mut std::fs::File, &[u8]),
 ) -> FrameCharge
 {
@@ -369,7 +380,11 @@ fn measure_frame_writes(
     }
     assert_eq!(
         std::fs::read(path).expect("read back frame-pool file"),
-        if writes_land { last } else { chunk },
+        match read_back
+        {
+            ReadBack::LastWrite => last,
+            ReadBack::WarmUp => chunk,
+        },
         "the file must hold the last frame-path write's bytes, or the warm-up's when no write \
          was sent"
     );
@@ -422,9 +437,13 @@ pub fn std_frame_write_pool_phase(_: &Caps)
         rechecks,
         calls_written,
         calls_dropped,
-    } = measure_frame_writes("/data/svctest/std_frame_pool.bin", true, |f, chunk| {
-        f.write_all(chunk).expect("frame write");
-    });
+    } = measure_frame_writes(
+        "/data/svctest/std_frame_pool.bin",
+        ReadBack::LastWrite,
+        |f, chunk| {
+            f.write_all(chunk).expect("frame write");
+        },
+    );
     assert_eq!(
         (calls_written, calls_dropped),
         (1, 2),
@@ -464,16 +483,20 @@ pub fn std_frame_write_past_deadline_phase(_: &Caps)
         rechecks,
         calls_written,
         calls_dropped,
-    } = measure_frame_writes("/data/svctest/std_frame_deadline.bin", false, |f, chunk| {
-        let wrote =
-            std::os::seraph::with_call_deadline(std::time::Instant::now(), || f.write(chunk));
-        let err = wrote.expect_err("a frame write under a passed call deadline was sent");
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::TimedOut,
-            "std_frame_write_past_deadline: the write failed {err}"
-        );
-    });
+    } = measure_frame_writes(
+        "/data/svctest/std_frame_deadline.bin",
+        ReadBack::WarmUp,
+        |f, chunk| {
+            let wrote =
+                std::os::seraph::with_call_deadline(std::time::Instant::now(), || f.write(chunk));
+            let err = wrote.expect_err("a frame write under a passed call deadline was sent");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut,
+                "std_frame_write_past_deadline: the write failed {err}"
+            );
+        },
+    );
     assert_eq!(
         (calls_written, calls_dropped),
         (1, 2),

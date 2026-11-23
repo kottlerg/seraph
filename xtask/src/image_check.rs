@@ -195,7 +195,7 @@ fn installed_list(
 fn partitions(file: &mut File, image: &Path, block: u64) -> Result<Vec<GptEntry>>
 {
     let header_block = read_at(file, block, block)?;
-    let Ok(header) = vfsd_gpt::parse_header(&header_block)
+    let Ok(header) = vfsd_gpt::parse_header(&header_block, 1)
     else
     {
         bail!("{} has a GPT header vfsd's parser refuses", image.display());

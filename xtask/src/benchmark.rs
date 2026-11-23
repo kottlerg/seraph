@@ -185,12 +185,23 @@ pub fn parse_run(text: &str) -> Result<RunLog>
     Ok(run)
 }
 
-/// The benchmark a `ktest: bench <name> FAIL (...)` line names, if `line` is one.
+/// The benchmark a `FAIL` line names, if `line` is one: ktest's
+/// `ktest: bench <name> FAIL (...)`, or a userspace suite's
+/// `[<suite>] bench <name> FAIL (...)`, the form a program's log line takes
+/// (programs/ubench/README.md § Output).
 fn failed_bench(line: &str) -> Option<&str>
 {
-    let (_, rest) = line.split_once("ktest: bench ")?;
+    let (_, rest) = line
+        .split_once("ktest: bench ")
+        .or_else(|| line.split_once("] bench "))?;
     let (name, after) = rest.split_once(' ')?;
     after.starts_with("FAIL (").then_some(name)
+}
+
+/// The suite of a measurement's benchmark, `<suite>` of `<suite>.<name>`.
+fn suite_of(bench: &str) -> &str
+{
+    bench.split_once('.').map_or(bench, |(suite, _)| suite)
 }
 
 /// One measurement over a set of runs.
@@ -203,7 +214,10 @@ pub struct Measured
     pub lowest: u64,
     /// The runs that reported it.
     pub runs: usize,
-    /// The runs at its CPU count, every one of which must report it.
+    /// The runs at its CPU count that reported its suite, every one of which
+    /// must report it. A suite's lines come from its own boot (ktest's from
+    /// the kernel test image, ubench's from the userspace one), so a run of
+    /// the other boot is not expected to report them.
     pub expected: usize,
 }
 
@@ -233,7 +247,8 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
     {
         bail!("no run log given");
     };
-    let mut runs_at: BTreeMap<u32, usize> = BTreeMap::new();
+    // The runs that reported each suite, at each CPU count.
+    let mut runs_at: BTreeMap<(u32, &str), usize> = BTreeMap::new();
     for (i, run) in runs.iter().enumerate()
     {
         let n = i.saturating_add(1);
@@ -265,8 +280,16 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
                 ensure!(run.arch == "x86_64", "host mode measures x86_64 only");
             }
         }
-        let at = runs_at.entry(run.cpus).or_insert(0);
-        *at = at.saturating_add(1);
+        let suites: BTreeSet<&str> = run
+            .lines
+            .iter()
+            .map(|(key, _, _)| suite_of(&key.bench))
+            .collect();
+        for suite in suites
+        {
+            let at = runs_at.entry((run.cpus, suite)).or_insert(0);
+            *at = at.saturating_add(1);
+        }
     }
     let mut measured: BTreeMap<Key, Measured> = BTreeMap::new();
     let mut failed = Vec::new();
@@ -279,7 +302,10 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
         );
         for (key, unit, p50) in &run.lines
         {
-            let expected = runs_at.get(&key.cpus).copied().unwrap_or(0);
+            let expected = runs_at
+                .get(&(key.cpus, suite_of(&key.bench)))
+                .copied()
+                .unwrap_or(0);
             let entry = measured.entry(key.clone()).or_insert(Measured {
                 unit: *unit,
                 lowest: *p50,
@@ -515,12 +541,27 @@ pub fn band(mode: BenchMode, base: u64, hundredths: Option<u64>) -> Option<u64>
     }
 }
 
-/// Whether a measurement gates: an icount measurement at one CPU. A
-/// multi-CPU icount measurement's count moves with the interleaving of its
-/// CPUs, and host mode is report-only.
-pub const fn gates(mode: BenchMode, key_cpus: u32) -> bool
+/// The benchmarks whose count includes time blocked on a device completion.
+/// The completion arrives at host time: under icount a guest blocked on it
+/// runs no instructions, and its clock advances by timer deadlines until
+/// QEMU completes the request, so the count follows the host's I/O latency,
+/// which no band bounds. `fsbench.write` writes through the filesystem's
+/// page cache to the disk (services/fs/fat/docs/crash-safety.md), every size
+/// of it. `fsbench.read` is not here: its timed reads find the file in that
+/// cache, which its untimed open, check and warm-up filled, so no timed sample
+/// waits on the disk. A benchmark whose timed samples wait on a device joins
+/// this set.
+pub const ICOUNT_IO_BOUND: [&str; 1] = ["fsbench.write"];
+
+/// Whether a measurement gates: an icount measurement at one CPU of a
+/// benchmark not in [`ICOUNT_IO_BOUND`]. A multi-CPU icount measurement's
+/// count moves with the interleaving of its CPUs, an I/O-bound one's with the
+/// host's I/O, and host mode is report-only.
+pub fn gates(mode: BenchMode, key: &Key) -> bool
 {
-    matches!(mode, BenchMode::Icount) && key_cpus == 1
+    matches!(mode, BenchMode::Icount)
+        && key.cpus == 1
+        && !ICOUNT_IO_BOUND.contains(&key.bench.as_str())
 }
 
 /// The outcome of one measurement against its baseline.
@@ -622,7 +663,7 @@ pub fn compare(
                 measured,
                 band,
                 verdict,
-                gated: gates(mode, key.cpus),
+                gated: gates(mode, key),
             }
         })
         .collect()
@@ -1050,6 +1091,134 @@ mod tests
             Rewrite::All,
         )
         .unwrap_err();
+    }
+
+    /// A userspace result line: `[<ts>] [<suite>] bench <suite>.<name> ...`.
+    fn user_line(suite: &str, name: &str, cpus: u32, p50: u64) -> String
+    {
+        format!(
+            "[1.000000] [{suite}] bench {suite}.{name} arch=riscv64 cpus={cpus} unit=cycles \
+             n=8 min={p50} p50={p50} p90={p50} p99={p50} max={p50}"
+        )
+    }
+
+    #[test]
+    fn a_userspace_fail_line_is_a_failed_benchmark_and_a_skip_line_is_not()
+    {
+        let run = log(
+            1,
+            "on",
+            &[
+                "[2.0] [ubench] bench fault_fill FAIL (path=grant: map: error -3)".to_string(),
+                "[2.1] [ubench] bench fault_scaling SKIP (threads=2: needs 2 CPUs, 1 online)"
+                    .to_string(),
+                user_line("ubench", "ipc_rt", 1, 7),
+            ],
+        );
+        assert_eq!(run.failed, ["fault_fill"]);
+        assert_eq!(run.lines.len(), 1);
+    }
+
+    #[test]
+    fn a_suite_is_expected_only_in_the_runs_that_reported_it()
+    {
+        let runs = [
+            log(1, "on", &[line("a", 1, 100)]),
+            log(1, "on", &[line("a", 1, 100)]),
+            log(1, "on", &[user_line("ubench", "b", 1, 50)]),
+            log(
+                1,
+                "on",
+                &[
+                    user_line("ubench", "b", 1, 50),
+                    user_line("fsbench", "c", 1, 9),
+                ],
+            ),
+        ];
+        let set = gather(BenchMode::Icount, &runs).unwrap();
+        let a = set.measured[&key("a", "", 1)];
+        assert_eq!((a.runs, a.expected), (2, 2));
+        let b = &set.measured[&Key {
+            bench: "ubench.b".to_string(),
+            variant: String::new(),
+            cpus: 1,
+        }];
+        assert_eq!((b.runs, b.expected), (2, 2));
+        let c = &set.measured[&Key {
+            bench: "fsbench.c".to_string(),
+            variant: String::new(),
+            cpus: 1,
+        }];
+        assert_eq!((c.runs, c.expected), (1, 1));
+        let missed = gather(
+            BenchMode::Icount,
+            &[
+                log(
+                    1,
+                    "on",
+                    &[
+                        user_line("ubench", "b", 1, 50),
+                        user_line("ubench", "d", 1, 5),
+                    ],
+                ),
+                log(1, "on", &[user_line("ubench", "b", 1, 50)]),
+            ],
+        )
+        .unwrap();
+        let d = missed.measured[&Key {
+            bench: "ubench.d".to_string(),
+            variant: String::new(),
+            cpus: 1,
+        }];
+        assert_eq!((d.runs, d.expected), (1, 2));
+    }
+
+    #[test]
+    fn an_io_bound_measurement_at_one_cpu_reports_under_icount_and_others_gate()
+    {
+        let write = Key {
+            bench: "fsbench.write".to_string(),
+            variant: "size=4096 path=frame".to_string(),
+            cpus: 1,
+        };
+        let read = Key {
+            bench: "fsbench.read".to_string(),
+            variant: "size=4096 path=frame".to_string(),
+            cpus: 1,
+        };
+        assert!(!gates(BenchMode::Icount, &write));
+        assert!(gates(BenchMode::Icount, &read));
+        assert!(!gates(BenchMode::Host, &read));
+        let base: BTreeMap<Key, Stored> = [(write.clone(), 100_000), (read.clone(), 100_000)]
+            .into_iter()
+            .map(|(k, p50)| {
+                (
+                    k,
+                    Stored {
+                        unit: Unit::Cycles,
+                        p50,
+                    },
+                )
+            })
+            .collect();
+        let run = log(
+            1,
+            "on",
+            &[
+                "[1.0] [fsbench] bench fsbench.write size=4096 path=frame arch=riscv64 cpus=1 \
+                 unit=cycles n=8 min=1 p50=170000 p90=170000 p99=170000 max=170000"
+                    .to_string(),
+                "[1.0] [fsbench] bench fsbench.read size=4096 path=frame arch=riscv64 cpus=1 \
+                 unit=cycles n=8 min=1 p50=170000 p90=170000 p99=170000 max=170000"
+                    .to_string(),
+            ],
+        );
+        let set = gather(BenchMode::Icount, &[run]).unwrap();
+        let rows = compare(BenchMode::Icount, &set, &base, &BTreeMap::new());
+        let row = |k: &Key| rows.iter().find(|r| &r.key == k).unwrap();
+        assert_eq!(row(&write).verdict, Verdict::Regressed);
+        assert!(!fails(row(&write)));
+        assert!(fails(row(&read)));
     }
 
     #[test]

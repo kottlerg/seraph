@@ -50,7 +50,7 @@ The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 The authoritative field list, with per-field doc comments and exact order, is
 [`src/lib.rs`](src/lib.rs) (`struct ProcessInfo`). This README summarises the
 field groups rather than mirroring every field, so the two cannot drift. As of
-`PROCESS_ABI_VERSION` 25 the groups are (every `*_cap` field a `u64` capability
+`PROCESS_ABI_VERSION` 26 the groups are (every `*_cap` field a `u64` capability
 handle):
 
 - **Process identity** — `version`, `self_thread_cap`, `self_aspace_cap`,
@@ -64,7 +64,10 @@ handle):
 - **Universal service endpoints** — `procmgr_endpoint_cap`, `memmgr_endpoint_cap`,
   `service_registry_cap` (the single system-wide service-discovery handle).
 - **Stdio rings** — `stdin_memory_cap`, `stdout_memory_cap`, `stderr_memory_cap`
-  and their six `*_data_notification_cap` / `*_space_notification_cap` wakeup slots.
+  and their six `*_data_notification_cap` / `*_space_notification_cap` wakeup slots. Each
+  ring's header carries a waiter word per direction, and an end rings its peer's notification
+  only when the peer announced a wait there
+  ([shared/shmem/README.md](../../shared/shmem/README.md) § Doorbell protocol).
 - **TLS template** — `tls_template_vaddr`, `tls_template_filesz`,
   `tls_template_memsz`, `tls_template_align`.
 - **argv / env blobs** — `args_offset`, `args_bytes`, `args_count`,

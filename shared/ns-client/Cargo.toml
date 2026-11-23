@@ -16,6 +16,7 @@ doctest = false
 
 [dependencies]
 ipc = { path = "../ipc" }
+namespace-protocol = { path = "../namespace-protocol" }
 syscall = { path = "../syscall" }
 
 [lints]

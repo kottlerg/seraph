@@ -623,8 +623,8 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
 
         // Fall-through delegation: an `NS_LOOKUP` on any synthetic
         // tree node (the synthetic root or a multi-component
-        // intermediate) for a name that does not match any local
-        // child forwards verbatim to that node's `fallthrough_cap`.
+        // intermediate) for a path whose first component does not match
+        // any local child forwards to that node's `fallthrough_cap`.
         // The cap addresses the corresponding directory in the root
         // filesystem, captured at install time. This preserves the
         // namespace-model invariant that root-fs entries remain
@@ -657,12 +657,22 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
 }
 
 /// If `recv` is an `NS_LOOKUP` whose parent `NodeId` resolves to a
-/// synthetic tree node that has no local child matching the requested
-/// name, forward the request to that node's `fallthrough_cap` and
-/// reply with the upstream response. Returns `true` when the request
-/// was handled (caller skips normal dispatch).
+/// synthetic tree node that has no local child matching the first
+/// component of the requested path, forward the request to that node's
+/// `fallthrough_cap` and reply with the upstream response. Returns `true`
+/// when the request was handled (caller skips normal dispatch).
 ///
-/// The outbound message is rebuilt with the same label, name bytes,
+/// The whole path is forwarded: every component of it lies under the
+/// first, in the root filesystem, which walks as many of them as it owns
+/// in the one call (`shared/namespace-protocol/README.md` § `NS_LOOKUP`).
+/// The reply's consumed count and failing-component index count the
+/// components of that same path, so they reach the caller unchanged. The
+/// local dispatch does not walk past a synthetic node with a
+/// fall-through (`VfsdRootBackend::continues_walk`), so a path whose
+/// later component falls through reaches this function in a request of
+/// its own.
+///
+/// The outbound message is rebuilt with the same label, path bytes,
 /// and shape, but its `caller_requested` word (`word(0)`) is replaced
 /// by the intersection of the caller's parent rights (extracted from
 /// `recv.badge`) with the caller's original `caller_requested` —
@@ -700,18 +710,22 @@ fn try_forward_lookup_fallthrough(
             return false;
         }
     };
-    // Cast is range-safe: name_len lives in bits 16..32 of the label.
-    let name_len = ((recv.label >> 16) & 0xFFFF) as usize;
+    // Cast is range-safe: path_len lives in bits 16..32 of the label.
+    let path_len = ((recv.label >> 16) & 0xFFFF) as usize;
     let data_bytes = recv.data_bytes();
-    if name_len == 0
+    if path_len == 0
     {
         return false;
     }
-    let Some(name) = data_bytes.get(8..).and_then(|d| d.get(..name_len))
+    let Some(path) = data_bytes.get(8..).and_then(|d| d.get(..path_len))
     else
     {
         return false;
     };
+    // `split` yields at least one item; an empty first component (a
+    // malformed path) matches no local child and is forwarded, and the
+    // driver answers it `InvalidName` as the local dispatch would.
+    let first = path.split(|&b| b == b'/').next().unwrap_or(path);
 
     let backend = rt
         .root_backend
@@ -722,7 +736,7 @@ fn try_forward_lookup_fallthrough(
     {
         return false;
     };
-    if backend.has_local_child(parent_idx, name)
+    if backend.has_local_child(parent_idx, first)
     {
         return false;
     }
@@ -742,7 +756,7 @@ fn try_forward_lookup_fallthrough(
     let composed_rights = compose_forward_lookup_rights(recv.badge, recv.word(0));
     let forward = IpcMessage::builder(recv.label)
         .word(0, u64::from(composed_rights))
-        .bytes(1, name)
+        .bytes(1, path)
         .build();
 
     let Some(reply) = fallthrough_call(fallthrough, &forward, ipc_buf)

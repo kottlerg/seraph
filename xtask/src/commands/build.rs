@@ -426,6 +426,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "ubench",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Tests,
+        arch_only: None,
+    },
+    Spec {
         name: "hello",
         install_name: None,
         profile: BuildProfile::StdUser,

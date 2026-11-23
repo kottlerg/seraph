@@ -142,6 +142,7 @@ fn main()
         CliCommand::CompareImages(args) => commands::compare_images::run(&ctx, args),
         CliCommand::ReviewLedger(args) => commands::review::run_ledger(&ctx, args),
         CliCommand::ReleaseScope(args) => commands::release_scope::run(&ctx, args),
+        CliCommand::ThreatScope(args) => commands::threat_scope::run(&ctx, args),
         CliCommand::IssueEdit(args) => commands::issue::run_edit(&ctx, args),
         CliCommand::IssueFile(args) => commands::issue::run_file(&ctx, args),
         CliCommand::Orch(args) => commands::orch::run(&ctx, args),

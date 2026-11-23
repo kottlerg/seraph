@@ -23,15 +23,14 @@
 //! ([`Discovery::discover`]). The
 //! block lands at offset 0 of the scratch page per the wire contract; vfsd
 //! copies one logical block from there into a stack buffer. The logical
-//! block size, the unit of every GPT LBA, comes from the driver's
+//! block size, the unit of every GPT LBA, and the device's length, whose last
+//! LBA holds the backup GPT header, come from the driver's
 //! [`BLK_GET_GEOMETRY`](ipc::blk_labels::BLK_GET_GEOMETRY) before the header
 //! is read.
 
 use std::os::seraph::reserve_pages;
 
-use gpt::{
-    GptEntry, GptError, GptHeader, MAX_BLOCK_SIZE, ScanStop, collect_partitions, parse_header,
-};
+use gpt::{GptCopy, GptEntry, ScanStop, read_gpt};
 use ipc::{
     ClassCallError, IpcMessage, blk_errors, blk_labels, devmgr_errors, memmgr_errors, memmgr_labels,
 };
@@ -272,21 +271,13 @@ impl Discovery
                 &mut self.scratch_va,
             );
         }
-        let partitions = match parse_gpt(
+        let partitions = parse_gpt(
             ordinal,
             blk_ep,
             ipc_buf,
             &mut self.scratch_cap,
             self.scratch_va,
-        )
-        {
-            Ok(parts) => parts,
-            Err(e) =>
-            {
-                log_gpt_error(ordinal, &e);
-                Vec::new()
-            }
-        };
+        );
         Disk {
             blk_ep,
             partitions,
@@ -359,20 +350,6 @@ fn query_block_device(block_class: u64, ordinal: u64, ipc_buf: *mut u64) -> Bloc
     }
 }
 
-/// Log why the GPT of disk `ordinal` could not be parsed.
-fn log_gpt_error(ordinal: u64, e: &GptError)
-{
-    let why = match e
-    {
-        GptError::IoError => "I/O error",
-        GptError::InvalidSignature => "invalid signature",
-        GptError::InvalidBlockSize => "unsupported logical block size",
-        GptError::InvalidEntrySize => "invalid entry size",
-        GptError::InvalidEntryArray => "entry array outside LBA 2..first_usable_lba",
-    };
-    std::os::seraph::log!(warn: "disk {ordinal}: GPT parse failed: {why}; no partitions");
-}
-
 /// Allocate one scratch Memory cap from memmgr, reserve a 1-page VA window,
 /// and map the memory cap into vfsd's AS at that VA.
 ///
@@ -415,10 +392,10 @@ fn request_one_page(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<u64>
     reply.caps().first().copied()
 }
 
-/// The device's logical block size, from `BLK_GET_GEOMETRY` on the
-/// whole-disk cap, or `None` when the driver refuses or replies a size the
-/// GPT parser does not take.
-fn query_block_size(blk_ep: u64, ipc_buf: *mut u64) -> Option<usize>
+/// The device's logical block size and its length in those blocks, from
+/// `BLK_GET_GEOMETRY` on the whole-disk cap, or `None` when the driver
+/// refuses or replies a size the GPT parser does not take.
+fn query_geometry(blk_ep: u64, ipc_buf: *mut u64) -> Option<(usize, u64)>
 {
     let msg = IpcMessage::builder(blk_labels::BLK_GET_GEOMETRY)
         .word(0, u64::from(ipc::BLK_LABELS_VERSION))
@@ -434,7 +411,7 @@ fn query_block_size(blk_ep: u64, ipc_buf: *mut u64) -> Option<usize>
         return None;
     }
     let size = usize::try_from(reply.word(0)).ok()?;
-    gpt::is_block_size(size).then_some(size)
+    gpt::is_block_size(size).then_some((size, reply.word(1)))
 }
 
 /// Read one logical block, `buf.len()` bytes, from the block device via
@@ -489,31 +466,14 @@ fn read_block_sector(
     true
 }
 
-/// Read the GPT header at LBA 1, one logical block of the device's size, and
-/// validate it via the pure parser.
-fn read_and_validate_header(
-    blk_ep: u64,
-    scratch_cap: &mut u64,
-    scratch_va: u64,
-    ipc_buf: *mut u64,
-) -> Result<GptHeader, GptError>
-{
-    let block_size = query_block_size(blk_ep, ipc_buf).ok_or(GptError::IoError)?;
-    let mut block = [0u8; MAX_BLOCK_SIZE];
-    let block = block.get_mut(..block_size).ok_or(GptError::IoError)?;
-    if !read_block_sector(blk_ep, 1, block, scratch_cap, scratch_va, ipc_buf)
-    {
-        return Err(GptError::IoError);
-    }
-    parse_header(block)
-}
-
-/// Parse the GPT of disk `ordinal` (the ordinal only labels the log lines)
-/// and return every used partition entry, in on-disk order.
-/// The list holds as many entries as the header's `num_parts` array has
-/// used ones; a walk that stops early (a failed sector read, or no memory
-/// for the list) is logged and returns the partitions found before it.
-/// Returns an error if the header cannot be read or validated.
+/// Read the GPT of disk `ordinal` (the ordinal only labels the log lines)
+/// and return every used partition entry, in on-disk order: the primary
+/// GPT's, or the backup's when the primary fails its checks
+/// ([`gpt::read_gpt`], UEFI 2.10 § 5.3.2). The list holds as many entries as
+/// the header's `num_parts` array has used ones; a list that runs out of
+/// memory is logged and returns the partitions before it. A disk whose
+/// geometry cannot be read, or neither of whose GPT copies verifies, is
+/// logged and has no partitions.
 ///
 /// `scratch_cap` and `scratch_va` describe a single-page Memory cap allocated
 /// via [`alloc_scratch`]. The cap is moved through IPC on every block read;
@@ -525,13 +485,37 @@ fn parse_gpt(
     ipc_buf: *mut u64,
     scratch_cap: &mut u64,
     scratch_va: u64,
-) -> Result<Vec<GptEntry>, GptError>
+) -> Vec<GptEntry>
 {
-    let header = read_and_validate_header(blk_ep, scratch_cap, scratch_va, ipc_buf)?;
-    let scan = collect_partitions(&header, |lba, sector| {
-        read_block_sector(blk_ep, lba, sector, scratch_cap, scratch_va, ipc_buf)
-    });
-    for entry in &scan.entries
+    let Some((block_size, blocks)) = query_geometry(blk_ep, ipc_buf)
+    else
+    {
+        std::os::seraph::log!(
+            warn: "disk {ordinal}: GPT parse failed: no supported block geometry; no partitions"
+        );
+        return Vec::new();
+    };
+    let gpt = match read_gpt(block_size, blocks, |lba, block| {
+        read_block_sector(blk_ep, lba, block, scratch_cap, scratch_va, ipc_buf)
+    })
+    {
+        Ok(gpt) => gpt,
+        Err([primary, backup]) =>
+        {
+            std::os::seraph::log!(
+                warn: "disk {ordinal}: GPT parse failed: primary {primary}; backup {backup}; \
+                 no partitions"
+            );
+            return Vec::new();
+        }
+    };
+    if let (GptCopy::Backup, Some(fault)) = (gpt.copy, gpt.primary_fault)
+    {
+        std::os::seraph::log!(
+            warn: "disk {ordinal}: GPT: primary invalid ({fault}); using the backup GPT"
+        );
+    }
+    for entry in &gpt.scan.entries
     {
         std::os::seraph::log!(
             debug: "disk {ordinal}: GPT: partition at LBA {:#018x} length {:#018x}",
@@ -539,23 +523,17 @@ fn parse_gpt(
             entry.length_lba
         );
     }
-    match scan.stop
+    if gpt.scan.stop == Some(ScanStop::OutOfMemory)
     {
-        None =>
-        {}
-        Some(ScanStop::ReadFailed { lba }) => std::os::seraph::log!(
-            warn: "disk {ordinal}: GPT: entry-array read at LBA {lba:#018x} failed; \
-             later partitions are not visible"
-        ),
-        Some(ScanStop::OutOfMemory) => std::os::seraph::log!(
+        std::os::seraph::log!(
             warn: "disk {ordinal}: GPT: no memory for the partition list; \
              later partitions are not visible"
-        ),
+        );
     }
     std::os::seraph::log!(
         "disk {ordinal}: GPT: partitions found: {} of {} entries",
-        scan.entries.len(),
-        header.num_parts
+        gpt.scan.entries.len(),
+        gpt.header.num_parts
     );
-    Ok(scan.entries)
+    gpt.scan.entries
 }

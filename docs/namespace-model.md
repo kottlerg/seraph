@@ -152,9 +152,15 @@ This composition is what gives the namespace its security properties:
 ## Walking
 
 Path resolution is client-side. A client holding a directory capability
-walks a multi-component name by issuing one `NS_LOOKUP` per component
-against the capability returned by the previous step. The client drops
-intermediate capabilities as it advances.
+walks a multi-component name by sending its components in `NS_LOOKUP`
+requests, each against the capability the previous one returned. A server
+walks as many of a request's components as it owns, with the checks a
+request per component would apply at each, and returns the capability of
+the last one it walked and the number it consumed; the walk stops at a
+mount, whose server takes the rest. The client continues from that
+capability with the remaining components and drops intermediate
+capabilities as it advances. The wire form is
+[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md) § `NS_LOOKUP`.
 
 There is no `..` operation. Walking up requires a separately held
 capability for the parent. There is no kernel-level "absolute path";
@@ -182,7 +188,8 @@ relative-path resolution fails until the child obtains one (typically
 by walking its root cap to a directory). The convention in std is
 that `File::open` resolves a leading-`/` path against the root cap
 and any other path against the cwd cap, but this is a userspace
-convention — the namespace protocol does not interpret path strings.
+convention — the namespace protocol interprets no path string beyond the
+`/`-separated components of an `NS_LOOKUP` request.
 The std bindings are specified in
 [runtime/ruststd/README.md](../runtime/ruststd/README.md).
 

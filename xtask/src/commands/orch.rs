@@ -117,7 +117,7 @@ fn date(secs: u64) -> String
 
 /// The UTC time of `secs` seconds after the Unix epoch, as
 /// `YYYY-MM-DDTHH:MMZ`.
-fn timestamp(secs: u64) -> String
+pub(super) fn timestamp(secs: u64) -> String
 {
     let of_day = secs % 86_400;
     format!(
@@ -128,7 +128,7 @@ fn timestamp(secs: u64) -> String
     )
 }
 
-fn now_secs() -> Result<u64>
+pub(super) fn now_secs() -> Result<u64>
 {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)

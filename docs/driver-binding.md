@@ -517,7 +517,8 @@ attaches (`cargo xtask run --test-devices`), like any driver, and a test reaches
 ## Summarized By
 
 [Architecture Overview](architecture.md), [Boot Media](boot-media.md),
-[Device Management](device-management.md), [services/acpid/README.md](../services/acpid/README.md),
+[Device Management](device-management.md), [Threat Model](threat-model.md),
+[services/acpid/README.md](../services/acpid/README.md),
 [PCI Enumeration](../services/devmgr/docs/pci-enumeration.md),
 [devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),
 [services/drivers/README.md](../services/drivers/README.md),

@@ -725,4 +725,5 @@ Intel pages are under
 [Kernel Initialization Sequence](initialization.md),
 [Capability Model](../../../docs/capability-model.md),
 [Platform Requirements](../../../docs/platform-requirements.md),
+[Threat Model](../../../docs/threat-model.md),
 [shared/crypto/README.md](../../../shared/crypto/README.md)

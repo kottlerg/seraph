@@ -473,4 +473,5 @@ identifier observed across the boundary is drawn from the entropy root
 [Capability Model](../../../docs/capability-model.md),
 [Console Model](../../../docs/console-model.md),
 [Device Management](../../../docs/device-management.md),
-[Platform Requirements](../../../docs/platform-requirements.md), [Testing](../../../docs/testing.md)
+[Platform Requirements](../../../docs/platform-requirements.md),
+[Testing](../../../docs/testing.md), [Threat Model](../../../docs/threat-model.md)

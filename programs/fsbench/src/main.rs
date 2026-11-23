@@ -3,11 +3,13 @@
 
 // programs/fsbench/src/main.rs
 
-//! `FS_READ` vs `FS_READ_MEMORY` crossover benchmark.
+//! `std::fs::File` read and write benchmark.
 //!
-//! Measures wall-clock cycle cost of reading `bench.bin` via the inline
-//! `FS_READ` path and the zero-copy `FS_READ_MEMORY` path across the size
-//! grid 16 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB.
+//! Measures the cycle cost of reading `bench.bin` via the inline `FS_READ`
+//! path and the zero-copy `FS_READ_MEMORY` path across the size grid 16 B,
+//! 1 KiB, 4 KiB, 16 KiB, 64 KiB, and of rewriting 4 KiB and 64 KiB of a
+//! scratch file in place through the `FS_WRITE_MEMORY` path, and (the `open`
+//! module) of opening a three-component path in one `NS_LOOKUP`.
 //!
 //! Path forcing is by buffer chunking, since `read()`'s policy at
 //! `runtime/ruststd/src/sys/fs/seraph.rs` is `want <= 504 AND
@@ -24,12 +26,18 @@
 //! thread woken on another CPU would subtract one CPU's cycle counter from
 //! another's, which riscv64 does not keep in step.
 //!
-//! Each size and path logs one result line (`shared/bench/README.md`
-//! § Result line), which a host reads back from the serial log:
+//! Writes go through page-sized `write_all` calls on a page-aligned offset,
+//! which the std client sends as one `FS_WRITE_MEMORY` each.
+//!
+//! Each size and path, and the open, logs one result line
+//! (`shared/bench/README.md` § Result line), which a host reads back from the
+//! serial log:
 //!
 //! ```text
 //! bench fsbench.read size=4096 path=inline arch=x86_64 cpus=4 unit=cycles n=256 min=...
 //! bench fsbench.read size=4096 path=frame arch=x86_64 cpus=4 unit=cycles n=256 min=...
+//! bench fsbench.write size=4096 path=frame arch=x86_64 cpus=4 unit=cycles n=64 min=...
+//! bench fsbench.open depth=3 arch=x86_64 cpus=4 unit=cycles n=256 min=...
 //! ```
 
 #![expect(
@@ -40,19 +48,29 @@
 )]
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use bench::{Counters, Report, Unit, Value};
+
+mod open;
 
 const PAGE_SIZE: u64 = 4096;
 const PAGE_SIZE_USIZE: usize = 4096;
 const INLINE_CHUNK: u64 = 504;
 const SIZES: &[u64] = &[16, 1024, 4096, 16384, 65536];
 const WARMUP_ITERS: u32 = 8;
-/// Timed iterations per size and path when no count is given on the command
-/// line: the full benchmark.
+/// Timed read iterations per size and path when no count is given on the
+/// command line: the full benchmark.
 const MEASURE_ITERS: u32 = 256;
+/// Timed write iterations per size when no count is given on the command
+/// line. Each writes through to the disk, so fewer than the reads.
+const WRITE_ITERS: u32 = 64;
 const FIXTURE_PATH: &str = "/data/svctest/bench.bin";
+/// The scratch file the writes rewrite, created at the largest write size
+/// before the first timed write and removed after the last.
+const WRITE_PATH: &str = "/data/svctest/fsbench-write.bin";
+/// Write sizes: one page, and the read grid's largest size.
+const WRITE_SIZES: &[u64] = &[4096, 65536];
 /// The CPU the benchmark thread is pinned to: CPU 0 is online on every boot.
 const BENCH_CPU: u32 = 0;
 
@@ -155,12 +173,13 @@ impl ReadPath
 }
 
 /// The benchmark's fixed context: its counters, the CPU count its result
-/// lines carry, and the timed iteration count.
+/// lines carry, and the timed iteration counts of the reads and the writes.
 struct Bench
 {
     counters: Counters,
     cpus: u32,
-    iters: u32,
+    read_iters: u32,
+    write_iters: u32,
 }
 
 /// Time `iters` reads of `size` bytes on `read_path`, after
@@ -175,8 +194,8 @@ fn measure(f: &mut File, size: u64, read_path: ReadPath, buf: &mut [u8], run: &B
         let _ = runner(f, size, buf);
     }
 
-    let mut samples = Vec::with_capacity(run.iters as usize);
-    for _ in 0..run.iters
+    let mut samples = Vec::with_capacity(run.read_iters as usize);
+    for _ in 0..run.read_iters
     {
         let start = run.counters.read();
         let got = runner(f, size, buf);
@@ -187,11 +206,16 @@ fn measure(f: &mut File, size: u64, read_path: ReadPath, buf: &mut [u8], run: &B
         );
         samples.push(elapsed);
     }
-    let summary = bench::summarize(&mut samples).expect("measure_iters returns a positive count");
+    let summary = bench::summarize(&mut samples).expect("the iteration count is positive");
+    log_line("read", size, path, run, summary);
+}
 
+/// Log the result line of `fsbench.<name> size=<size> path=<path>`.
+fn log_line(name: &str, size: u64, path: &str, run: &Bench, summary: bench::Summary)
+{
     let report = Report {
         suite: "fsbench",
-        name: "read",
+        name,
         variant: &[("size", Value::Num(size)), ("path", Value::Word(path))],
         cpus: run.cpus,
         unit: Unit::Cycles,
@@ -201,8 +225,81 @@ fn measure(f: &mut File, size: u64, read_path: ReadPath, buf: &mut [u8], run: &B
     let mut line = String::new();
     report
         .write(&mut line)
-        .unwrap_or_else(|e| panic!("fsbench: result line of path={path} size={size}: {e}"));
+        .unwrap_or_else(|e| panic!("fsbench: result line of {name} path={path} size={size}: {e}"));
     std::os::seraph::log!("{line}");
+}
+
+/// Rewrite `size` bytes of `f` from offset 0 with `page`, one
+/// `write_all` of a page at a time, so std sends each as one
+/// `FS_WRITE_MEMORY`. `size` is a whole number of pages.
+fn write_pages(f: &mut File, size: u64, page: &[u8])
+{
+    f.seek(SeekFrom::Start(0)).expect("write: seek failed");
+    for _ in 0..size / PAGE_SIZE
+    {
+        f.write_all(page).expect("write: write_all failed");
+    }
+}
+
+/// Time `run.write_iters` rewrites of each of [`WRITE_SIZES`], after
+/// [`WARMUP_ITERS`] untimed ones, and log their result lines.
+///
+/// The scratch file is written to the largest size first, so no timed write
+/// extends it: each sample is the rewrite of allocated clusters alone. Its
+/// content is read back once the timed writes end.
+fn measure_writes(page: &[u8], run: &Bench)
+{
+    let mut f = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(WRITE_PATH)
+        .unwrap_or_else(|e| panic!("fsbench: create {WRITE_PATH}: {e}"));
+    let largest = WRITE_SIZES.iter().copied().max().unwrap_or(PAGE_SIZE);
+    write_pages(&mut f, largest, page);
+
+    for &size in WRITE_SIZES
+    {
+        for _ in 0..WARMUP_ITERS
+        {
+            write_pages(&mut f, size, page);
+        }
+        let mut samples = Vec::with_capacity(run.write_iters as usize);
+        for _ in 0..run.write_iters
+        {
+            let start = run.counters.read();
+            write_pages(&mut f, size, page);
+            samples.push(run.counters.read().since(&start).cycles);
+        }
+        let summary = bench::summarize(&mut samples).expect("the iteration count is positive");
+        log_line("write", size, "frame", run, summary);
+    }
+
+    verify_written(&mut f, largest, page);
+    drop(f);
+    std::fs::remove_file(WRITE_PATH)
+        .unwrap_or_else(|e| panic!("fsbench: remove {WRITE_PATH}: {e}"));
+}
+
+/// Check that every page of the first `size` bytes of `f` reads back as
+/// `page`: a write path that lost or misplaced data fails the run rather
+/// than time it.
+fn verify_written(f: &mut File, size: u64, page: &[u8])
+{
+    let mut back = vec![0u8; page.len()];
+    f.seek(SeekFrom::Start(0))
+        .expect("write verify: seek failed");
+    for n in 0..size / PAGE_SIZE
+    {
+        back.fill(0);
+        f.read_exact(&mut back)
+            .unwrap_or_else(|e| panic!("fsbench: write verify: read page {n}: {e}"));
+        assert!(
+            back == page,
+            "fsbench: write verify: page {n} differs from what was written"
+        );
+    }
 }
 
 /// CPUs the system runs (`SystemInfoType::CpuCount`).
@@ -250,19 +347,17 @@ fn verify_fixture(f: &mut File)
     );
 }
 
-/// The timed iteration count: `argv[1]` when given (a positive integer, so a
-/// harness can exercise both read paths in a few iterations), else
-/// [`MEASURE_ITERS`].
-fn measure_iters() -> u32
+/// The timed iteration count given on the command line: `argv[1]` when
+/// given (a positive integer, so a harness can exercise every path in a few
+/// iterations), which then sets every case's count; `None` for the full
+/// benchmark, [`MEASURE_ITERS`] reads and [`WRITE_ITERS`] writes.
+fn iters_arg() -> Option<u32>
 {
-    match std::env::args().nth(1)
+    let arg = std::env::args().nth(1)?;
+    match arg.parse::<u32>()
     {
-        None => MEASURE_ITERS,
-        Some(arg) => match arg.parse::<u32>()
-        {
-            Ok(n) if n > 0 => n,
-            _ => panic!("fsbench: iteration count {arg:?} is not a positive integer"),
-        },
+        Ok(n) if n > 0 => Some(n),
+        _ => panic!("fsbench: iteration count {arg:?} is not a positive integer"),
     }
 }
 
@@ -281,14 +376,19 @@ fn pin_to_bench_cpu()
 fn main()
 {
     std::os::seraph::log::register_name(b"fsbench");
-    let iters = measure_iters();
+    let iters = iters_arg();
     pin_to_bench_cpu();
     let run = Bench {
         counters: Counters::open(),
         cpus: cpu_count(),
-        iters,
+        read_iters: iters.unwrap_or(MEASURE_ITERS),
+        write_iters: iters.unwrap_or(WRITE_ITERS),
     };
-    std::os::seraph::log!("starting, fixture={FIXTURE_PATH} iters={iters}");
+    std::os::seraph::log!(
+        "starting, fixture={FIXTURE_PATH} read_iters={} write_iters={}",
+        run.read_iters,
+        run.write_iters
+    );
 
     let mut f =
         File::open(FIXTURE_PATH).unwrap_or_else(|e| panic!("fsbench: open {FIXTURE_PATH}: {e}"));
@@ -300,6 +400,15 @@ fn main()
         measure(&mut f, size, ReadPath::Inline, &mut buf, &run);
         measure(&mut f, size, ReadPath::Frame, &mut buf, &run);
     }
+    drop(f);
+
+    // The write pattern differs from every fixture page's, so a write that
+    // reached the fixture instead would fail its check.
+    let page: Vec<u8> = (0..PAGE_SIZE_USIZE)
+        .map(|i| u8::try_from(i % 251).expect("the remainder is below 251"))
+        .collect();
+    measure_writes(&page, &run);
+    open::measure(&run);
 
     std::os::seraph::log!("done");
 }

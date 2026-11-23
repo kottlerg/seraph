@@ -234,7 +234,7 @@ pub mod vfsd_labels;
 
 /// Wire-protocol version of [`ns_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const NS_LABELS_VERSION: u32 = 1;
+pub const NS_LABELS_VERSION: u32 = 2;
 pub mod ns_labels;
 
 /// Wire-protocol version of [`fs_labels`]; bumped as the block comment above

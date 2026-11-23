@@ -1843,7 +1843,12 @@ which stage ubench and boot it as the benchmark cell does
 ([docs/testing.md](../docs/testing.md#benchmarks-bench-cell) § Benchmarks), and the documents
 from every configuration traced with `cargo xtask path-account write` (`cargo xtask clean`
 between architectures). A trace runs every instruction of the boot through the plugin and takes
-several minutes.
+several minutes. The userspace rows of both architectures take about 30 minutes of the host,
+builds included: per architecture two builds, the reference boot and the trace, each boot of
+one vCPU and so needing no grant. A kernel change on a path those rows run owes them as well as
+ktest's configurations
+([hot-path-account-userspace.md](../core/kernel/docs/hot-path-account-userspace.md#regenerating-it)
+§ Regenerating It).
 
 **Method.** `trace` builds the path-account plugin
 ([path-account-plugin/](path-account-plugin/README.md)) for the host and boots the sysroot's

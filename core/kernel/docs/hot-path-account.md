@@ -36,7 +36,9 @@ regenerate one configuration are in [xtask/README.md](../../../xtask/README.md)
 § `cargo xtask path-account`. The block's first table names, for each configuration, the head
 of the tree it was taken at, the date, the QEMU version, and the reference it was checked
 against. A change to a kernel path regenerates the four configurations, rewrites the block,
-and revises the prose below where its numbers moved.
+and revises the prose below where its numbers moved. A kernel path the ubench or fsbench rows
+also run owes their account too, as
+[hot-path-account-userspace.md](hot-path-account-userspace.md) § Regenerating It says.
 
 ## Reading the Tables
 

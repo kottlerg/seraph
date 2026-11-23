@@ -28,9 +28,14 @@ The generated block below is written by `cargo xtask path-account write` from th
 result files of `cargo xtask path-account trace`, one per architecture; the commands that
 regenerate one are in [xtask/README.md](../../../xtask/README.md) § `cargo xtask path-account`.
 The block's first table names, for each configuration, the head of the tree it was taken at,
-the date, the QEMU version, and the reference it was checked against. A change to a gated
-userspace path regenerates both architectures, rewrites the block, and revises the prose below
-where its numbers moved.
+the date, the QEMU version, and the reference it was checked against. A change to the code of a
+function a gated window runs regenerates both architectures, rewrites the block, and revises
+the prose below where its numbers moved. Beside ubench's and fsbench's own code, the windows
+run the kernel's syscall, IPC, page-fault and scheduling paths, memmgr, vfsd, both fatfs
+instances, the framebuffer driver and the IOMMU driver (the Totals table gives each image's
+share), so a kernel change on those paths owes this account as well as the four configurations
+of [hot-path-account.md](hot-path-account.md). The commands and their host time are in
+[xtask/README.md](../../../xtask/README.md) § `cargo xtask path-account`.
 
 ## Reading the Tables
 

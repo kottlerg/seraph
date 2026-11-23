@@ -307,17 +307,7 @@ fn hotplug_request(msg: &IpcMessage) -> Result<Request, u64>
 /// bit above the segment is set.
 fn unpack_function(word: u64) -> Option<Address>
 {
-    if word >> 32 != 0
-    {
-        return None;
-    }
-    let field = |shift: u32, mask: u64| (word >> shift) & mask;
-    Some((
-        u16::try_from(field(16, 0xFFFF)).ok()?,
-        u8::try_from(field(8, 0xFF)).ok()?,
-        u8::try_from(field(3, 0x1F)).ok()?,
-        u8::try_from(field(0, 0x7)).ok()?,
-    ))
+    labels::PciLocation::from_word(word).map(|at| (at.segment, at.bus, at.device, at.function))
 }
 
 /// Post `request` to the control thread through `jobs`, wake it with

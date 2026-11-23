@@ -10,11 +10,13 @@ name: QEMU packages
 description: >-
   QEMU and firmware packages for the CI jobs that boot under QEMU, and
   dosfstools, whose fsck.fat every disk-image pack runs, with the Secure
-  Boot case's host tools and its riscv64 firmware: the install list, the
-  two cache entries (the `.deb` set of one runner image, and the firmware
-  package, which no image changes), the bounded download, the offline
-  install with its network fallback, and the checked extraction of the
-  firmware. The mechanism is specified in docs/build-system.md
+  Boot case's host tools and its riscv64 firmware; or, as the `host-tests`
+  set, the riscv64 user-mode emulator, cross compiler and C library and
+  dosfstools the host-tests job's `cargo xtask test` needs: the install
+  lists, the cache entries (the `.deb` set of one runner image, and the
+  firmware package, which no image changes), the bounded download, the
+  offline install with its network fallback, and the checked extraction of
+  the firmware. The mechanism is specified in docs/build-system.md
   § Continuous Integration.
 
 inputs:
@@ -27,6 +29,13 @@ inputs:
       entry is absent or does not match the pin) when the restored set is
       absent or does not install, and saves each entry it had to fill.
     required: true
+  set:
+    description: >-
+      `qemu` (the default), the QEMU packages and the riscv64 Secure Boot
+      firmware; `host-tests`, the host-tests job's packages, with no
+      firmware. Each set has its own `.deb` entry.
+    required: false
+    default: qemu
 
 runs:
   using: composite
@@ -34,19 +43,22 @@ runs:
     - name: Check the inputs
       if: >-
         !contains(fromJSON('["cache", "install"]'), inputs.mode)
+        || !contains(fromJSON('["qemu", "host-tests"]'), inputs.set)
       shell: sh
       env:
         MODE: ${{ inputs.mode }}
+        SET: ${{ inputs.set }}
       run: |
-        echo "::error::usage: mode cache | install; got mode '$MODE'"
+        echo "::error::usage: mode cache | install, set qemu | host-tests; got mode '$MODE', set '$SET'"
         exit 2
 
     - name: Name the packages, the apt flags and the cache keys
       id: apt
       shell: sh
       env:
-        # This file holds the install list and the apt flags; its hash
-        # covers both.
+        SET: ${{ inputs.set }}
+        # This file holds the install lists and the apt flags; its hash
+        # covers them.
         ACTION_HASH: ${{ hashFiles('.github/actions/qemu-packages/action.yml') }}
       run: |
         : "${ImageOS:?}" "${ImageVersion:?}" "${ACTION_HASH:?}"
@@ -56,7 +68,11 @@ runs:
         # and SHA-256, checked before anything is extracted.
         sb_sha256=333c3404edaabd26a95c4cc7dc3f38eb361be75fb34d71da73319ac51418a4c1
         {
-          echo 'packages=qemu-system-x86 qemu-system-riscv ovmf qemu-efi-riscv64 dosfstools sbsigntool openssl python3-virt-firmware'
+          if [ "$SET" = host-tests ]; then
+            echo 'packages=qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross dosfstools'
+          else
+            echo 'packages=qemu-system-x86 qemu-system-riscv ovmf qemu-efi-riscv64 dosfstools sbsigntool openssl python3-virt-firmware'
+          fi
           echo 'flags=-y --no-install-recommends'
           echo 'offline=-o Dir::Etc::SourceList=/dev/null -o Dir::Etc::SourceParts=-'
           echo 'sb_riscv_pkg=edk2-riscv64-202608-1-any.pkg.tar.zst'
@@ -66,10 +82,10 @@ runs:
           echo 'sb_riscv_urls=https://geo.mirror.pkgbuild.com/extra/os/x86_64/edk2-riscv64-202608-1-any.pkg.tar.zst https://archive.archlinux.org/packages/e/edk2-riscv64/edk2-riscv64-202608-1-any.pkg.tar.zst'
           echo "sb_riscv_sha256=$sb_sha256"
           # The .deb set resolves against the installed packages of the
-          # image it was downloaded on, so its key names that image. The
-          # firmware package is the same file on every image, so its key
-          # names only the pinned hash.
-          echo "debs_key=qemu-debs-$ImageOS-$ImageVersion-$(echo "$ACTION_HASH" | cut -c1-16)"
+          # image it was downloaded on, so its key names that image and the
+          # set (`qemu-debs-` for the QEMU set). The firmware package is the
+          # same file on every image, so its key names only the pinned hash.
+          echo "debs_key=$SET-debs-$ImageOS-$ImageVersion-$(echo "$ACTION_HASH" | cut -c1-16)"
           echo "firmware_key=qemu-firmware-$(echo "$sb_sha256" | cut -c1-16)"
         } >> "$GITHUB_OUTPUT"
 
@@ -84,6 +100,7 @@ runs:
 
     - name: Restore the firmware package
       id: firmware
+      if: inputs.set == 'qemu'
       uses: actions/cache/restore@v6
       with:
         path: qemu-firmware
@@ -161,7 +178,9 @@ runs:
       # absent or its hash differs, and the first one whose package
       # matches the pin serves. `cache` fetches it only when its entry
       # is absent.
-      if: inputs.mode == 'install' || steps.firmware.outputs.cache-hit != 'true'
+      if: >-
+        inputs.set == 'qemu'
+        && (inputs.mode == 'install' || steps.firmware.outputs.cache-hit != 'true')
       shell: sh
       env:
         SB_PKG: ${{ steps.apt.outputs.sb_riscv_pkg }}
@@ -200,14 +219,14 @@ runs:
         key: ${{ steps.apt.outputs.debs_key }}
 
     - name: Save the firmware package
-      if: steps.firmware.outputs.cache-hit != 'true'
+      if: inputs.set == 'qemu' && steps.firmware.outputs.cache-hit != 'true'
       uses: actions/cache/save@v6
       with:
         path: qemu-firmware
         key: ${{ steps.apt.outputs.firmware_key }}
 
     - name: Extract the riscv64 Secure Boot firmware
-      if: inputs.mode == 'install'
+      if: inputs.set == 'qemu' && inputs.mode == 'install'
       shell: sh
       env:
         SB_PKG: ${{ steps.apt.outputs.sb_riscv_pkg }}

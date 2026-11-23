@@ -271,6 +271,15 @@ compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`, or
 `KtestConfig::BENCH` in a `cargo xtask build --ktest-bench-only` build
 (see [xtask/README.md](../xtask/README.md#cargo-xtask-mkdisk)).
 
+CI's ktest boots, the `ktest` cells' own boot and the burn-in's ktest boots, run at the fixed 4
+CPUs on the fixed device set ([Coverage tiers](#coverage-tiers)), where no test's skip condition
+holds: every CPU minimum in ktest is 4 or less, and the launch hands ktest every device and
+capability a test gates on. Each carries `--fail-also ' SKIP '`, so a test that logs its SKIP line
+([core/ktest/README.md](../core/ktest/README.md)) fails the boot, as does a test whose CPU minimum
+is above 4. The `bench` cell's boots carry no such check: its one-CPU boots skip what needs more
+CPUs, a functional ktest boot runs every benchmark at 4 CPUs, and `bench-check` judges the cell's
+counts ([Benchmarks](#benchmarks-bench-cell)). A local boot at fewer CPUs keeps its skips.
+
 ### Interactive input (`terminal` case)
 
 Interactive input cannot be exercised by an autonomous recipe: keysyms must come
@@ -322,8 +331,8 @@ shell (#112), and future consumers — they reuse the runner by swapping the
 terminal's session leader and the expected strings. It subsumes the keysym-decode
 coverage of the former standalone input smoke test: the echoed `help` proves
 lowercase keysym decode, and Return/Backspace prove the named-key decodes. In
-CI the `usertest` cell runs it as the first case of `cargo xtask test --cell usertest`, after the
-cell's own boot, rather than as a separate matrix dimension that would multiply with each arch.
+CI the `usertest` cell runs it as a case of `cargo xtask test --cell usertest`, after the cell's own
+boot, rather than as a separate matrix dimension that would multiply with each arch.
 
 ### Snapshot resume (`vmgenid` case)
 
@@ -352,8 +361,7 @@ for the snapshot-detection design.
 
 Same boot requirements as the `terminal` case (default boot set, terminal
 autostarted); the host computes the verdict and kills QEMU. In CI the x86_64 `usertest` cell's
-`cargo xtask test --cell usertest` runs it after the `terminal`, `signing`, `dma-confinement`,
-`rollback`, `enrolment`, `secureboot` and `wedge` cases and before the `shutdown` case.
+`cargo xtask test --cell usertest` runs it.
 
 ### KASLR randomization (`kaslr` case)
 
@@ -549,8 +557,8 @@ ends in a power-off instead. `cargo xtask test shutdown --cause reboot [--arch]`
 4. Remove the recipe and repack the images in that layout again, whatever the outcome.
 
 See [xtask/README.md § The `shutdown` case](../xtask/README.md#the-shutdown-case) for the command.
-In CI it is the first boot of the `shutdown` case, the last case of each `usertest` cell (both
-arches, both profiles), on the default boot the cell's `cargo xtask mkdisk` restored.
+In CI it is the first boot of the `shutdown` case, which each `usertest` cell runs (both arches,
+both profiles), on the default boot the cell's `cargo xtask mkdisk` restored.
 
 ### Power button (`shutdown` case)
 
@@ -747,8 +755,7 @@ sysroot itself is never changed:
 A boot passes when every line it owes appears, and fails on any other refusal or fatal line, or at
 its deadline. The images are packed again from the sysroot afterwards, whatever the outcome. See
 [xtask/README.md § The `signing` case](../xtask/README.md#the-signing-case) for the lines, the
-deadlines and the logs. CI runs it in each usertest cell after the `terminal` case, in the cell's
-profile.
+deadlines and the logs. CI runs it in each usertest cell, in the cell's profile.
 
 ### Required DMA confinement (`dma-confinement` case)
 
@@ -770,7 +777,7 @@ refusal among them, a fatal line, or its deadline. A device that no unit transla
 a unit does, and an IOMMU driver not ready within the settle bound or dead, take the same refusal,
 which devmgr's host tests show (`firmware::dma::admits`), since no QEMU machine presents them.
 See [xtask/README.md § The `dma-confinement` case](../xtask/README.md#the-dma-confinement-case)
-for the lines and the logs. CI runs it in each usertest cell after the `signing` case.
+for the lines and the logs. CI runs it in each usertest cell.
 
 ### Rollback floor (`rollback` case)
 
@@ -790,8 +797,7 @@ with the build's trust store floor `F`:
 A boot passes when every line it owes appears; a boot after a failed one is not made. A firmware
 that refuses the write is covered by the bootloader's host tests, since no QEMU firmware refuses
 it on demand. See [xtask/README.md § The `rollback` case](../xtask/README.md#the-rollback-case)
-for the lines and the logs. CI runs it in each usertest cell after the `dma-confinement` case, in
-the cell's profile.
+for the lines and the logs. CI runs it in each usertest cell, in the cell's profile.
 
 ### Root enrolment (`enrolment` case)
 
@@ -818,7 +824,7 @@ A boot passes when every line it owes appears; a boot after a failed one is not 
 the enrolled store's bound, a refused write, and a malformed store are covered by the bootloader's
 host tests, since no QEMU firmware gives them on demand. See
 [xtask/README.md § The `enrolment` case](../xtask/README.md#the-enrolment-case) for the lines and
-the logs. CI runs it in each usertest cell after the `rollback` case.
+the logs. CI runs it in each usertest cell.
 
 ### Secure Boot (`secureboot` case)
 
@@ -841,7 +847,7 @@ for riscv64 ([build-system.md](build-system.md) § QEMU and Firmware). A firmwar
 enforce Secure Boot fails the case, naming the firmware, so the case never passes on one that boots
 what it should refuse. See
 [xtask/README.md § The `secureboot` case](../xtask/README.md#the-secureboot-case) for the lines,
-the firmware search and the logs. CI runs it in each usertest cell after the `enrolment` case.
+the firmware search and the logs. CI runs it in each usertest cell.
 
 ### GDB stub (`debug-port` case)
 
@@ -915,8 +921,8 @@ in the idle halt, or a missing report line fails it. The host computes the verdi
 QEMU, as for the `terminal` case. See
 [xtask/README.md § The `wedge` case](../xtask/README.md#the-wedge-case) for the command.
 
-In CI it runs as a boot pair inside each `usertest` cell (both arches, both profiles), after the
-`secureboot` case, on the default boot the cell's `cargo xtask mkdisk` restored.
+In CI it runs as a boot pair inside each `usertest` cell (both arches, both profiles), on the
+default boot the cell's `cargo xtask mkdisk` restored.
 
 ### CET shadow stacks (`cet` case)
 
@@ -1114,9 +1120,11 @@ which would restore it). The terminal is exercised in its own boot
 drops `crashd.svc`, so one boot per cell runs the image without the crash
 service (see Crash reports above).
 
-CI matrix cells follow these rules per boot. The `usertest` cell runs its boots in sequence:
-`usertest` (via `run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the
-default boot (terminal present), `cargo xtask test --cell usertest` runs the cell's cases: the
+CI matrix cells follow these rules per boot. The `usertest` cell boots `usertest` first (via
+`run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the default boot
+(terminal present), `cargo xtask test --cell usertest --lanes 3` runs the cell's cases in three
+lanes side by side, each lane on its own copy of the checkout and its cases one after another in the
+registry's order ([xtask/README.md § Cells](../xtask/README.md#cells)): the
 `terminal` case's boot, the `signing` case's eight boots, the `dma-confinement` case's two boots,
 the `rollback` case's three boots, the
 `enrolment` case's six boots, the `secureboot` case's four boots, the
@@ -1129,6 +1137,14 @@ the host reads the reset over QMP, and QEMU exits on its own. Each core-death bo
 the death it makes, read over QMP, and QEMU exits on its own. The power-button boot is powered off
 by its press: the host presses the button over QMP, reads the power-off there, and QEMU exits on its
 own.
+
+A local run of a cell takes `--lanes` as CI does when the host allows it: each lane's boots are
+small boots of the host launch rules
+([xtask/README.md § Host launch rules](../xtask/README.md#host-launch-rules)), so `--lanes 3` takes
+all three of the host's small-boot places and runs beside no other QEMU, and with `--wait-host` a
+lane's boot waits for a place rather than failing. A run that must be alone or timed (`--alone`,
+`--timing`), such as the re-run alone of Coverage tiers, takes no lanes and runs its cases one after
+another.
 
 ---
 
@@ -1270,7 +1286,8 @@ surface.
   procedure. No in-tree driver is in this tier.
 
 **Inert changes.** A change that alters only the following cannot change behaviour at any CPU count,
-memory size, or device set, and owes no local host run, whatever file it is in:
+memory size, or device set, and owes no local host run of this section, whatever file it is in (a
+new or changed proof harness still owes its local sizing, § Bounded verification):
 
 - Markdown, and comment lines in source files, build scripts, and linker scripts;
 - lint attributes: `#[allow(...)]`, `#[expect(...)]`, `#[warn(...)]`, `#[deny(...)]`, their inner
@@ -1326,8 +1343,8 @@ of them, so identical images are no evidence about them. The verdict does not co
 - what no loader reads: the symbol tables, the debug information, and the size of a file, which
   can move where the bootloader and procmgr place later data but no byte a loaded image holds.
 
-A PR whose changes outside Markdown are all inert owes no local host run, whatever purpose it
-states. The surfaces below, and Repeat count, are judged on the non-inert lines only.
+A PR whose changes outside Markdown are all inert owes no local host run of this section, whatever
+purpose it states. The surfaces below, and Repeat count, are judged on the non-inert lines only.
 
 **Boundary surface.** The boundary set below is owed when, and only when, the PR's own diff (see
 When the runs are owed below) makes a non-inert change to the CPU-count surface; a stated
@@ -2130,6 +2147,23 @@ undetermined or unwinding-incomplete check, on a Kani release other than the pin
 harness in a crate it does not register. CI's `kani` job runs it on every push and pull request,
 and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
+
+**Local sizing.** A harness is sized on the development host before CI runs it. The author of a
+change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
+with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries
+it, every process of the run limited to an address space of 16 GB, the memory of CI's `kani`
+runner ([GitHub's standard Linux runner for a public
+repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)). On a
+Linux host, `prlimit --as=16000000000 cargo xtask kani ...` sets that limit where the command
+does not set it itself. A run that the limit ends (an allocation failure, or a process killed)
+or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
+still cover the property or by the induction form of the parser proofs below. A failed,
+undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
+or the harness, fixed as such, and MUST NOT be bounded away. The PR body's `## Validation`
+section states, for each such harness, the verification time Kani reports, the peak resident
+memory of the run (the maximum resident set size of its largest process, as GNU `time -v`
+reports it), and the unwind bounds the harness carries. This run is owed whatever § Coverage
+tiers owes, since a harness change is inert there.
 
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
 tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches

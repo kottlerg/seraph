@@ -1372,6 +1372,7 @@ impl Registry
             ipc::devmgr_labels::BIND_DRIVERS => self.bind_drivers(msg, ipc_buf),
             ipc::devmgr_labels::WATCH_CLASS => self.watch_class(msg, ipc_buf),
             ipc::devmgr_labels::DECLINE_RESTART => self.decline_restart(msg, ipc_buf),
+            ipc::devmgr_labels::QUERY_DEVICE_LOCATION => self.query_device_location(msg, ipc_buf),
             // QUERY_DEVICE_INFO and DRIVER_READY included: drivers send both
             // on their settle batch's private endpoint, never here.
             _ => reply_status(ipc::devmgr_errors::UNKNOWN_OPCODE, ipc_buf),
@@ -1622,6 +1623,59 @@ impl Registry
             },
             ipc_buf,
         );
+    }
+
+    /// `QUERY_DEVICE_LOCATION`: reply where the device of the driver at the
+    /// requested ordinal of the class the caller's class badge names sits,
+    /// the address of the PCI function devmgr bound it to, or why there is
+    /// none. A query whose answer would name no driver waits as
+    /// `QUERY_DEVICE`'s does. Logs nothing, as `QUERY_DEVICE` does not.
+    fn query_device_location(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    {
+        let class = ipc::devmgr_labels::class_badge::decode(msg.badge)
+            .map(|(slot, _)| slot)
+            .filter(|&slot| self.lock().served.classes.get_slot(slot).is_some());
+        let Some(slot) = class
+        else
+        {
+            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            return;
+        };
+        if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+        {
+            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            return;
+        }
+        let ordinal = instance_ordinal(msg);
+        let located = {
+            let state = self
+                .lock_settled(|s| matches!(s.served.slot_lookup(slot, ordinal), Lookup::Absent));
+            match state.served.slot_lookup(slot, ordinal)
+            {
+                Lookup::Live(driver) => driver
+                    .dev_caps
+                    .as_ref()
+                    .map(|caps| caps.address)
+                    .ok_or(ipc::devmgr_errors::NO_LOCATION),
+                Lookup::Withdrawn => Err(ipc::devmgr_errors::WITHDRAWN),
+                Lookup::Absent => Err(ipc::devmgr_errors::NO_DEVICE),
+            }
+        };
+        match located
+        {
+            Ok((segment, bus, device, function)) =>
+            {
+                let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                    .word(
+                        0,
+                        ipc::devmgr_labels::pci_function(segment, bus, device, function),
+                    )
+                    .build();
+                // SAFETY: ipc_buf is this worker's registered IPC buffer.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            }
+            Err(code) => reply_status(code, ipc_buf),
+        }
     }
 
     /// `BIND_DRIVERS`: keep the directory cap it carries and the directory's

@@ -423,7 +423,7 @@ vfsd holds two un-badged endpoints:
   for a fall-through cap) never calls the service endpoint, and neither
   does the discovery of new disks a `MOUNT` and the first
   `GET_SWAP_PARTITION` run before their role lookup: devmgr's
-  `QUERY_DEVICE`, the GPT reads of each new disk on its block driver, a
+  `QUERY_DEVICE` and `QUERY_DEVICE_LOCATION`, the GPT reads of each new disk on its block driver, a
   scratch page from memmgr when a failed read lost the one held, and
   the forced unmount of a mount on a new disk found withdrawn, which
   blocks as an `UNMOUNT` does. A `GET_SWAP_PARTITION` also waits for

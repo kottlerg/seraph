@@ -145,6 +145,9 @@ vfsd/
   1, …, passing a `WITHDRAWN` one, until another reply is not
   `SUCCESS`), and again from the first ordinal not yet queried before
   each runtime role lookup (a `MOUNT`, the first `GET_SWAP_PARTITION`),
+  asks devmgr where each new disk's device sits (`QUERY_DEVICE_LOCATION`
+  on the same SEND: the PCI function devmgr bound its driver to, kept with
+  the disk and logged; no role lookup reads it),
   and parses each disk's GPT
   partition table through one scratch memory cap reused across the reads (replaced from memmgr
   before the next disk when a failed read left it lost), keeping every

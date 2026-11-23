@@ -16,7 +16,8 @@ pub const SUCCESS: u64 = 0;
 pub const INVALID_REQUEST: u64 = 1;
 /// Caller's badge lacks what the handler requires: an authority bit
 /// (e.g. `CLASS_AUTHORITY` for `MINT_CLASS_SEND`), or, for
-/// `QUERY_DEVICE`, `WATCH_CLASS` and `DECLINE_RESTART`, a class slot
+/// `QUERY_DEVICE`, `WATCH_CLASS`, `DECLINE_RESTART` and
+/// `QUERY_DEVICE_LOCATION`, a class slot
 /// (`devmgr_labels::class_badge`).
 pub const UNAUTHORIZED: u64 = 2;
 /// Caller's compiled `DEVMGR_LABELS_VERSION`, carried in `data[0]` of
@@ -43,13 +44,14 @@ pub const LABEL_VERSION_MISMATCH: u64 = 3;
 /// that path, and a client that cannot proceed without the device
 /// waits on a `WATCH_CLASS` watch and queries again when it is
 /// signalled ([`super::await_device`]), never polling `QUERY_DEVICE`.
-/// Also returned by `QUERY_ACPI_TABLE` (table not found) and
-/// `QUERY_SHUTDOWN_DEVICE` (no SBI authority to serve; always on x86-64).
+/// `QUERY_DEVICE_LOCATION` returns it at the same ordinals. Also returned
+/// by `QUERY_ACPI_TABLE` (table not found) and `QUERY_SHUTDOWN_DEVICE` (no
+/// SBI authority to serve; always on x86-64).
 pub const NO_DEVICE: u64 = 4;
 /// The driver the query names was served and has since died, so devmgr
 /// withdrew it: its service endpoint is revoked, and callers queued on
-/// it returned. Returned by `QUERY_DEVICE` at the withdrawn driver's
-/// instance ordinal, which stays held for the rest of the boot so the
+/// it returned. Returned by `QUERY_DEVICE` and `QUERY_DEVICE_LOCATION` at
+/// the withdrawn driver's instance ordinal, which stays held for the rest of the boot so the
 /// ordinals after it keep their drivers (a client probing ordinals
 /// continues at the next one). Sticky for the boot: a driver devmgr
 /// restarts after its death is a new instance, served at the class's next
@@ -69,5 +71,9 @@ pub const REFUSED: u64 = 7;
 /// allocation failed. Not a policy refusal and not permanent: the caller may
 /// send the request again. Returned by `WATCH_CLASS`.
 pub const OUT_OF_RESOURCES: u64 = 8;
+/// The driver a `QUERY_DEVICE_LOCATION` names serves a platform device,
+/// one the firmware tables describe, which is no PCI function and so has no
+/// PCI location.
+pub const NO_LOCATION: u64 = 9;
 /// Unknown opcode on devmgr endpoint.
 pub const UNKNOWN_OPCODE: u64 = 0xFF;

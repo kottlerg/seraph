@@ -43,10 +43,13 @@ jobs:
           toolchain: nightly-2026-11-10
           components: rust-src,rustfmt,clippy,llvm-tools
 
-      - name: Cache cargo and target
-        uses: Swatinem/rust-cache@v2
+      - name: Restore the standard-library units
+        # Of the riscv64 test build's `-Z build-std`; see
+        # docs/build-system.md § Continuous Integration.
+        uses: ./.github/actions/std-cache
         with:
-          shared-key: host-tests
+          mode: restore
+          name: host-tests
 
       - name: cargo xtask lint-docs
         run: cargo xtask lint-docs
@@ -63,14 +66,23 @@ jobs:
       # its C library (xtask/README.md § `cargo xtask test`), and the image
       # check's tests run dosfstools' fsck.fat (xtask/README.md § The image
       # check).
+      # The packages come from the cache entry of this job's runner image,
+      # downloaded under a bound when it is absent (docs/build-system.md
+      # § Continuous Integration).
       - name: Install the riscv64 test emulation and dosfstools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross dosfstools
+        uses: ./.github/actions/qemu-packages
+        with:
+          mode: install
+          set: host-tests
 
       - name: cargo xtask test
         run: cargo xtask test
+
+      - name: Save the standard-library units
+        uses: ./.github/actions/std-cache
+        with:
+          mode: save
+          name: host-tests
 
   kani:
     # Every bounded proof, with the Kani release xtask pins (docs/testing.md
@@ -189,10 +201,14 @@ jobs:
           toolchain: nightly-2026-11-10
           components: rust-src,rustfmt,clippy,llvm-tools
 
-      - name: Cache cargo and target
-        uses: Swatinem/rust-cache@v2
+      - name: Restore the standard-library units
+        # See docs/build-system.md § Continuous Integration. The cells of one
+        # architecture and profile build the same units, so they share one
+        # entry.
+        uses: ./.github/actions/std-cache
         with:
-          shared-key: validate-${{ matrix.arch }}-${{ matrix.profile }}
+          mode: restore
+          name: validate-${{ matrix.arch }}-${{ matrix.profile }}
 
       - name: Place the signing keys outside the checkout
         # The job's first build generates a local root and a signing key in
@@ -356,14 +372,17 @@ jobs:
           # The usertest boot also checks the log-level configuration its
           # staging packed: a debug line of vfsd and of the fatfs vfsd spawns,
           # and none of devmgr or procmgr. The ktest boot also checks the
-          # bootloader's line for the mapredo knob its staging staged.
+          # bootloader's line for the mapredo knob its staging staged, and fails
+          # on a SKIP line: at the cell's 4 CPUs and initial capability set no
+          # test's skip condition holds (docs/testing.md § Gating).
           checks=()
           case "${{ matrix.tester }}" in
             usertest)
               checks=(--require '\[vfsd\] DEBUG ' --require '\[fatfs\] DEBUG '
                       --fail-also '\[(devmgr|procmgr)\] DEBUG ') ;;
             ktest)
-              checks=(--require 'mapredo knob present; redoing steps 6 and 7') ;;
+              checks=(--require 'mapredo knob present; redoing steps 6 and 7'
+                      --fail-also ' SKIP ') ;;
           esac
           budgeted cargo xtask run \
             --arch ${{ matrix.arch }} \
@@ -382,14 +401,19 @@ jobs:
         # log-level configuration, and removes the knobs, keeping the
         # recorded harness. The signing and rollback cases build their
         # bootloaders in the cell's profile. Each case runs whatever another's outcome,
-        # and the step fails naming the cases that failed.
+        # and the step fails naming the cases that failed. The cases run in
+        # three lanes side by side, each on its own copy of the checkout,
+        # since each boot keeps about one of the runner's four vCPUs busy
+        # (xtask/README.md § Cells); the step reports each case's and each
+        # lane's wall and CPU time.
         run: |
           cargo xtask mkdisk --arch ${{ matrix.arch }}
           release=
           if [ "${{ matrix.profile }}" = "release" ]; then
             release=--release
           fi
-          cargo xtask test --cell ${{ matrix.tester }} --arch ${{ matrix.arch }} $release
+          cargo xtask test --cell ${{ matrix.tester }} --arch ${{ matrix.arch }} $release \
+            --lanes 3
 
       - name: Upload run logs
         if: always()
@@ -400,6 +424,8 @@ jobs:
             target/xtask/run/**/*.log
             target/xtask/run/**/*.crash.txt
             target/xtask/test/*/*/*.log
+            target/xtask/lanes/**/*.log
+            target/xtask/lanes/**/*.crash.txt
           if-no-files-found: ignore
 
       - name: Upload saved run logs
@@ -415,6 +441,13 @@ jobs:
             target/xtask/run-saved/*.crash.txt
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Save the standard-library units
+        # Last, since it empties Cargo's build directories but for those units.
+        uses: ./.github/actions/std-cache
+        with:
+          mode: save
+          name: validate-${{ matrix.arch }}-${{ matrix.profile }}
 
   bench:
     # The benchmark cell: the bench-only ktest image and the userspace ubench
@@ -444,10 +477,12 @@ jobs:
           toolchain: nightly-2026-11-10
           components: rust-src,rustfmt,clippy,llvm-tools
 
-      - name: Cache cargo and target
-        uses: Swatinem/rust-cache@v2
+      - name: Restore the standard-library units
+        # As validate's step of the same name.
+        uses: ./.github/actions/std-cache
         with:
-          shared-key: bench-${{ matrix.arch }}
+          mode: restore
+          name: bench-${{ matrix.arch }}
 
       - name: Place the signing keys outside the checkout
         # As validate's step of the same name.
@@ -514,3 +549,10 @@ jobs:
             target/xtask/bench/ubench/*.log
             target/xtask/bench/ENV
           if-no-files-found: ignore
+
+      - name: Save the standard-library units
+        # As validate's step of the same name.
+        uses: ./.github/actions/std-cache
+        with:
+          mode: save
+          name: bench-${{ matrix.arch }}

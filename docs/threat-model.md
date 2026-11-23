@@ -291,10 +291,20 @@ loader reached only through such an image is a defect, not an attack.
   bootloader located (refusing a record of another type, or a table over 4 MiB) at a randomized bias
   (`pie_rebase_init_image` in `core/kernel/src/main.rs`, `core/kernel/src/mm/init_reloc.rs`).
 
-**Fuzz targets and proof harnesses.** None on `master`. Planned: property functions, fuzz targets
-and proof harnesses for `validate`, `validate_executable`, `parse_stack_note`, `decode_rela` and
-`validate_relative_relocs` ([#680](https://github.com/kottlerg/seraph/issues/680),
-[#756](https://github.com/kottlerg/seraph/issues/756)).
+**Fuzz targets and proof harnesses.**
+
+- `elf` (`xtask/fuzz/targets/src/bin/elf.rs`) drives `elf::property::elf_holds` over an image and
+  over a raw relocation table, from the seeds in `shared/elf/fuzz/elf/seeds/`: the header checks,
+  `load_segments`, `tls_segment`, `load_span`, `relro_span`, `rela_table`, the relocation
+  decode, validation and application, `find_note`, `parse_stack_note` and `find_note_streaming`.
+  CI's gating `fuzz` job runs it on every pull request and the weekly campaign for 30 minutes.
+- The `proofs` module of `shared/elf/src/lib.rs` proves the same property on every image up to its
+  bounds (two program headers, two dynamic entries, two relocation records, two section headers),
+  the program-header read at any place, and the note walk and the section-name compare on any
+  bytes ([testing.md](testing.md) § Bounded verification); CI's `kani` job runs them. The note
+  locators are proved for a short section name and owner, which the name compare and the walk
+  proofs stand behind for the stack note's, and `parse_stack_note`'s read of the descriptor on any
+  descriptor of up to 12 bytes.
 
 **Gaps.**
 
@@ -304,8 +314,8 @@ and proof harnesses for `validate`, `validate_executable`, `parse_stack_note`, `
   `elf::validate_executable`, `elf::find_note_streaming` and the declaration decoder with bytes no
   key signed. procmgr still refuses to run such a file
   ([#1533](https://github.com/kottlerg/seraph/issues/1533)).
-- No fuzz target or proof harness covers `shared/elf` yet. Those for `find_note_streaming` and the
-  declaration decoder are planned ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
+- No fuzz target or proof harness covers the declaration decoder yet; they are planned
+  ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---
 

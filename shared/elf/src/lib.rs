@@ -23,6 +23,9 @@
 
 use core::mem::size_of;
 
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
+
 // ── ELF identification constants ─────────────────────────────────────────────
 
 const ELFMAG0: u8 = 0x7F;
@@ -697,6 +700,40 @@ pub fn find_note_streaming<F>(
     owner: &[u8],
     ntype: u32,
     buf: &mut [u8],
+    read_at: F,
+) -> Option<core::ops::Range<usize>>
+where
+    F: FnMut(u64, &mut [u8]) -> Option<usize>,
+{
+    let mut strtab_buf = [0u8; MAX_STREAMING_STRTAB];
+    note_streaming(
+        ehdr,
+        file_size,
+        section,
+        owner,
+        ntype,
+        buf,
+        &mut strtab_buf,
+        read_at,
+    )
+}
+
+/// [`find_note_streaming`] reading the section-name table into `strtab_buf`,
+/// a larger table refused. The buffer is a parameter so a proof runs the
+/// locator with a table small enough to verify; every caller outside the
+/// proofs goes through [`find_note_streaming`], which owns the buffer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "find_note_streaming's seven and the section-name table buffer it owns"
+)]
+pub(crate) fn note_streaming<F>(
+    ehdr: &Elf64Ehdr,
+    file_size: u64,
+    section: &str,
+    owner: &[u8],
+    ntype: u32,
+    buf: &mut [u8],
+    strtab_buf: &mut [u8],
     mut read_at: F,
 ) -> Option<core::ops::Range<usize>>
 where
@@ -723,11 +760,10 @@ where
 
     let strtab_shdr = read_shdr_streaming(shoff, shentsize, strtab_idx, &mut read_at)?;
     let strtab_size = usize::try_from(strtab_shdr.sh_size).ok()?;
-    if strtab_size == 0 || strtab_size > MAX_STREAMING_STRTAB
+    if strtab_size == 0
     {
         return None;
     }
-    let mut strtab_buf = [0u8; MAX_STREAMING_STRTAB];
     let strtab_bytes = strtab_buf.get_mut(..strtab_size)?;
     read_exact_at(strtab_shdr.sh_offset, strtab_bytes, file_size, &mut read_at)?;
 
@@ -1354,8 +1390,9 @@ pub fn validate_relative_relocs(
 /// outside the span are skipped. Returns the number applied.
 ///
 /// Records should have been pre-validated by [`validate_relative_relocs`];
-/// a decode error stops the walk early, and the caller's applied-count
-/// check (sum over all spans == validated count) then rejects the image.
+/// a record that is not the machine's `RELATIVE` type, or names a symbol, is
+/// skipped and not counted, and the caller's applied-count check (sum over
+/// all spans == validated count) then rejects the image.
 pub fn apply_relative_relocs(
     table: &[u8],
     machine: u16,
@@ -2376,5 +2413,445 @@ mod tests
         );
         let (ehdr, _) = valid_executable(&img);
         assert_eq!(parse_stack_note(&ehdr, &img), None);
+    }
+
+    /// The checked-in inputs of the fuzz target `elf` of the `kinds` given
+    /// (`seeds`, `regressions`).
+    fn fuzz_inputs(kinds: &[&str]) -> Vec<Vec<u8>>
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/elf");
+        let mut inputs = Vec::new();
+        for kind in kinds
+        {
+            let Ok(entries) = std::fs::read_dir(dir.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in entries
+            {
+                inputs.push(std::fs::read(entry.unwrap().path()).unwrap());
+            }
+        }
+        inputs
+    }
+
+    // Defect caught: a parser change that breaks its contract on an input
+    // the fuzz target once found or started from; `cargo xtask test` replays
+    // every checked-in input of fuzz/elf/ on each change.
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_parser_contract()
+    {
+        let inputs = fuzz_inputs(&["seeds", "regressions"]);
+        assert!(!inputs.is_empty(), "no checked-in input under fuzz/elf");
+        for bytes in &inputs
+        {
+            property::elf_holds(bytes);
+        }
+    }
+
+    // Defect caught: seeds that no longer reach the end of the parsers'
+    // paths (a table that no longer validates, a stack note no longer read,
+    // after an edit), so the fuzz target starts from the refusals alone.
+    #[test]
+    fn the_seeds_reach_a_validated_table_and_a_stack_note_on_each_machine()
+    {
+        for machine in [EM_X86_64, EM_RISCV]
+        {
+            let reached = fuzz_inputs(&["seeds"]).iter().any(|img| {
+                let Ok((ehdr, ElfKind::Dyn)) = validate_executable(img, machine)
+                else
+                {
+                    return false;
+                };
+                let Ok(Some(table)) = rela_table(&ehdr, img)
+                else
+                {
+                    return false;
+                };
+                let (min, end) = load_span(&ehdr, img).unwrap();
+                let start = table.file_offset as usize;
+                let records = &img[start..start + table.size as usize];
+                validate_relative_relocs(records, machine, min, end).is_ok_and(|n| n > 1)
+                    && parse_stack_note(&ehdr, img).is_some()
+                    && tls_segment(&ehdr, img).is_ok_and(|t| t.is_some())
+                    && relro_span(&ehdr, img).is_ok_and(|r| r.is_some())
+            });
+            assert!(
+                reached,
+                "no seed reaches the parsers' ends for machine {machine:#x}"
+            );
+        }
+    }
+
+    // Defect caught: a property that refuses the images the unit tests above
+    // hold the parsers to, which would make it judge them wrongly.
+    #[test]
+    fn the_unit_tests_images_hold_the_property()
+    {
+        property::elf_holds(&build_image(ET_DYN, &std_dynamic()));
+        property::elf_holds(&build_image(ET_EXEC, &[]));
+        property::elf_holds(&image_with_notes(
+            STACK_NAME,
+            &note_record(
+                b"seraph",
+                process_abi::NT_SERAPH_STACK,
+                &[4, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ));
+        property::elf_holds(&image_with_notes(
+            DRIVER_NAME,
+            &note_record(b"seraph", NT_DRIVER, b"declared"),
+        ));
+    }
+}
+
+/// The proofs of the property of `property.rs` (docs/testing.md § Bounded
+/// verification, Parser proofs), each on every input up to the bounds its
+/// comment states.
+///
+/// How they compose into the property. The header proof covers the header
+/// checks whole. Every program-header fold reads its headers only through
+/// `read_phdr_at`, which one proof covers for any table place, index and
+/// data; the fold proofs then fix the table at offset 64, right after the
+/// header, so each read is at a constant offset, and run each fold whole on a
+/// table of at most two headers (a first and a later one of its type). The
+/// table proof runs `rela_table` whole on such a table with the dynamic
+/// segment fixed after it, holding at most two entries. The record proofs
+/// run the decode on any record, and the validation and the application
+/// whole on tables of at most two records. The note proofs run the note walk
+/// on records of at most 48 bytes and the section-name compare on a 24-byte
+/// name table at any offset, each whole, for the stack note; and
+/// `find_note` and `find_note_streaming` whole on a table of at most two
+/// section headers at offset 64, the 8-byte name table and the 24-byte note
+/// section fixed after them, for a note of a two-byte section name and a
+/// one-byte owner.
+/// The locators take the names as arguments and reach their bytes only
+/// through the walk and the compare the first two proofs cover, so a short
+/// name stands for the stack note's, and keeps the section's walk within its
+/// bound. `parse_stack_note` is `find_note` for the stack note and
+/// `stack_pages_of`, which a proof covers on any descriptor of up to 12 bytes. What lies outside the proofs is the length of the
+/// walks: the loops over more program headers, dynamic entries, records,
+/// section headers and note records than the bounds, and the chunked read of
+/// a longer table. The fuzz target `elf` and the replay of the checked-in
+/// inputs check them on images of every length.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{
+        EM_RISCV, EM_X86_64, PT_DYNAMIC, RELA_ENTRY_SIZE, decode_ehdr, property,
+        validate_executable,
+    };
+
+    /// An ELF header and two program headers.
+    const IMAGE: usize = 64 + 2 * 56;
+
+    /// Two relocation records: a first and a later one, after either of which
+    /// a walk may stop.
+    const RECORDS: usize = 2 * RELA_ENTRY_SIZE;
+
+    /// Either supported machine.
+    fn machine() -> u16
+    {
+        if kani::any() { EM_X86_64 } else { EM_RISCV }
+    }
+
+    /// Any `N` bytes, the program-header table placed at offset 64.
+    fn image<const N: usize>() -> [u8; N]
+    {
+        let mut data: [u8; N] = kani::any();
+        data[32..40].copy_from_slice(&64u64.to_le_bytes());
+        data
+    }
+
+    /// The header checks hold on the first `len` of any `IMAGE` bytes, for
+    /// either machine: every check, and a table of up to two headers at any
+    /// place. The longest loop is the check of the 16 identification bytes,
+    /// so an unwind bound of 17 covers it.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_header_is_judged_by_its_checks()
+    {
+        let data: [u8; IMAGE] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= IMAGE);
+        property::header_holds(&data[..len], machine());
+    }
+
+    /// A program header at any place and index is read from its 56 bytes
+    /// when they lie inside the data, of up to two headers' bytes and 8 more,
+    /// and refused otherwise. No loop.
+    #[kani::proof]
+    fn every_program_header_is_read_at_its_place()
+    {
+        let data: [u8; 2 * 56 + 8] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= data.len());
+        property::phdr_read_holds(&data[..len], kani::any(), kani::any());
+    }
+
+    /// The first `len` of any `IMAGE` bytes with the table at offset 64,
+    /// when the header is accepted: a table of at most two headers.
+    fn accepted(data: &[u8; IMAGE]) -> Option<(super::Elf64Ehdr, &[u8])>
+    {
+        let len: usize = kani::any();
+        kani::assume(len <= IMAGE);
+        let data = &data[..len];
+        validate_executable(data, machine())
+            .ok()
+            .map(|(ehdr, _)| (ehdr, data))
+    }
+
+    /// `load_segments` yields each `PT_LOAD` header of a table of at most two.
+    /// The longest loop is the walk of the two, so an unwind bound of 3 covers
+    /// it.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn every_load_segment_is_its_header()
+    {
+        let data = image::<IMAGE>();
+        if let Some((ehdr, data)) = accepted(&data)
+        {
+            property::segments_holds(&ehdr, data);
+        }
+    }
+
+    /// `tls_segment` is the first `PT_TLS` header of a table of at most two.
+    /// Unwind bound 3, as above.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn the_tls_template_is_the_first_tls_header()
+    {
+        let data = image::<IMAGE>();
+        if let Some((ehdr, data)) = accepted(&data)
+        {
+            property::tls_holds(&ehdr, data);
+        }
+    }
+
+    /// `load_span` is the bounds of the `PT_LOAD` headers of a table of at most
+    /// two. Unwind bound 3, as above.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn the_load_span_is_its_segments_bounds()
+    {
+        let data = image::<IMAGE>();
+        if let Some((ehdr, data)) = accepted(&data)
+        {
+            property::span_holds(&ehdr, data);
+        }
+    }
+
+    /// `relro_span` is the first `PT_GNU_RELRO` header of a table of at most
+    /// two. Unwind bound 3, as above.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn the_relro_span_is_the_first_relro_header()
+    {
+        let data = image::<IMAGE>();
+        if let Some((ehdr, data)) = accepted(&data)
+        {
+            property::relro_holds(&ehdr, data);
+        }
+    }
+
+    /// `rela_table` locates the table its tags and `PT_LOAD` headers say, on
+    /// a table of at most two headers whose `PT_DYNAMIC` segment starts right
+    /// after it and holds at most two 16-byte entries: a tag, and a later one
+    /// that replaces it or ends the walk. Every other field is any value. The
+    /// longest loops are the walks of the two headers and the two entries, so
+    /// an unwind bound of 3 covers them.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn the_relocation_table_is_located_as_its_tags_say()
+    {
+        let data = image::<{ IMAGE + 32 }>();
+        for at in [64, 64 + 56]
+        {
+            let ty = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+            let offset = u64::from_le_bytes(data[at + 8..at + 16].try_into().unwrap());
+            kani::assume(ty != PT_DYNAMIC || offset == IMAGE as u64);
+        }
+        let len: usize = kani::any();
+        kani::assume(len <= data.len());
+        let data = &data[..len];
+        if let Ok((ehdr, _)) = validate_executable(data, machine())
+        {
+            property::dynamic_holds(&ehdr, data);
+        }
+    }
+
+    /// Any record decodes to the fields at its offsets. No loop.
+    #[kani::proof]
+    fn every_record_decodes_to_its_fields()
+    {
+        property::decode_holds(&kani::any());
+    }
+
+    /// The record walk and its validation hold on the first `len` of any
+    /// `RECORDS` bytes, for any machine and span. The longest loop is the
+    /// walk of the two records, so an unwind bound of 3 covers it.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn every_bounded_table_is_validated_by_its_records()
+    {
+        let table: [u8; RECORDS] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= RECORDS);
+        property::relocs_holds(&table[..len], kani::any(), kani::any(), kani::any());
+    }
+
+    /// The application holds on the first `len` of any `RECORDS` bytes, for
+    /// any machine and bias, into a span of any link VA and up to `SPAN` (16)
+    /// bytes: room for a target inside, one across its end, one past it, and
+    /// two that overlap. The longest loops are the walk of the two records
+    /// and the compare of the span's two words, so an unwind bound of 3
+    /// covers them.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn every_bounded_table_is_applied_as_its_records_say()
+    {
+        const SPAN: usize = 16;
+        let table: [u8; RECORDS] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= RECORDS);
+        property::apply_holds::<SPAN>(
+            &table[..len],
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+        );
+    }
+
+    /// The note walk finds the stack note in the first `len` of any 48 bytes:
+    /// up to four records of a bare 12-byte header, or two of the stack
+    /// note's 28 bytes. The longest loops are the walk of four records and
+    /// the compare of the owner's 6 bytes, so an unwind bound of 7 covers
+    /// them.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn every_bounded_note_walk_finds_its_note()
+    {
+        let notes: [u8; 48] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= notes.len());
+        property::note_walk_holds(&notes[..len], &property::STACK);
+    }
+
+    /// The section name at any offset of the first `len` of any 24 bytes,
+    /// room for the 18-byte name and its NUL at offsets 0 to 5, is compared
+    /// with the stack note's section name byte for byte. The longest loop is
+    /// the compare of its 19 bytes, so an unwind bound of 20 covers it.
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn every_section_name_is_compared_at_its_place()
+    {
+        let strtab: [u8; 24] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= strtab.len());
+        property::section_name_holds(&strtab[..len], kani::any(), &property::STACK);
+    }
+
+    /// An image of a header, at most two section headers at offset 64, an
+    /// 8-byte region for the name table and a 24-byte one for the note section
+    /// after them, each section header placing its section within its region;
+    /// every other field any value. A section's walk is then one record of
+    /// `SHORT` or two bare headers long; a longer walk, at any place, is
+    /// `every_bounded_note_walk_finds_its_note`'s.
+    const NOTE_IMAGE: usize = 64 + 2 * 64 + 8 + 24;
+
+    /// The first `len` of any `NOTE_IMAGE` bytes so placed, and the header
+    /// they decode to, accepted or not, since the locators read any header.
+    fn note_image(data: &mut [u8; NOTE_IMAGE]) -> Option<(super::Elf64Ehdr, &[u8])>
+    {
+        data[40..48].copy_from_slice(&64u64.to_le_bytes());
+        data[58..60].copy_from_slice(&64u16.to_le_bytes());
+        kani::assume(u16::from_le_bytes([data[60], data[61]]) <= 2);
+        let strndx = u16::from_le_bytes([data[62], data[63]]);
+        for (index, at) in [(0u16, 64usize), (1, 128)]
+        {
+            let offset = u64::from_le_bytes(data[at + 24..at + 32].try_into().unwrap());
+            let size = u64::from_le_bytes(data[at + 32..at + 40].try_into().unwrap());
+            let (region, room): (u64, u64) = if index == strndx { (192, 8) } else { (200, 24) };
+            kani::assume(offset == region && size <= room);
+        }
+        let len: usize = kani::any();
+        kani::assume(len <= NOTE_IMAGE);
+        let data = &data[..len];
+        decode_ehdr(data).map(|ehdr| (ehdr, data))
+    }
+
+    /// The descriptor check of `parse_stack_note` reads the page count of an
+    /// eight-byte descriptor and nothing of a descriptor of any other length
+    /// up to 12 bytes, past the eight. No loop.
+    #[kani::proof]
+    fn every_stack_descriptor_is_read_by_its_length()
+    {
+        let desc: [u8; 12] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= desc.len());
+        property::stack_pages_holds(&desc[..len]);
+    }
+
+    /// The note the locator proofs look for: the stack note's type under a
+    /// two-byte section name and a one-byte owner.
+    const SHORT: property::Note = property::Note {
+        section: ".n",
+        owner: b"o",
+        ntype: property::STACK.ntype,
+    };
+
+    /// `find_note` finds the note the walk finds. The longest loops are the
+    /// walk of two records and the two section headers, so an unwind bound of
+    /// 3 covers every loop.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    #[kani::solver(cadical)]
+    fn the_note_is_located_as_the_walk_finds_it()
+    {
+        let mut data: [u8; NOTE_IMAGE] = kani::any();
+        if let Some((ehdr, data)) = note_image(&mut data)
+        {
+            property::notes_holds(&ehdr, data, &SHORT);
+        }
+    }
+
+    /// The note-section buffer of the streaming proofs: smaller than the
+    /// note region, so a section that fills it and one that does not are both
+    /// within the bounds.
+    const PROOF_BUF: usize = 16;
+
+    /// The section-name table buffer of the streaming proofs: room for the
+    /// 8-byte name table region, so a table that fits and one that does not
+    /// are both within the bounds.
+    const PROOF_STRTAB: usize = 4;
+
+    /// `find_note_streaming` finds the note the walk finds. Unwind bound 3, as
+    /// above.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    #[kani::solver(cadical)]
+    fn the_streamed_note_is_located_as_the_walk_finds_it()
+    {
+        let mut data: [u8; NOTE_IMAGE] = kani::any();
+        if let Some((ehdr, data)) = note_image(&mut data)
+        {
+            property::streaming_holds::<PROOF_BUF, PROOF_STRTAB>(&ehdr, data, &SHORT);
+        }
+    }
+
+    /// `find_note_streaming` finds nothing through a failed or a short read.
+    /// Unwind bound 3, as above.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    #[kani::solver(cadical)]
+    fn no_note_is_streamed_through_a_failed_read()
+    {
+        let mut data: [u8; NOTE_IMAGE] = kani::any();
+        if let Some((ehdr, data)) = note_image(&mut data)
+        {
+            property::failed_reads_hold::<PROOF_BUF, PROOF_STRTAB>(&ehdr, data, &SHORT);
+        }
     }
 }

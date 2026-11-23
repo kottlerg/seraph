@@ -41,10 +41,16 @@ struct Harnessed
 /// Every crate that holds a proof harness. A crate gains its entry in the
 /// change that adds its first harness; the command fails while a harness lies
 /// in a crate not listed here ([`unregistered`]).
-const HARNESSED: &[Harnessed] = &[Harnessed {
-    package: "kernel",
-    dir: "core/kernel",
-}];
+const HARNESSED: &[Harnessed] = &[
+    Harnessed {
+        package: "kernel",
+        dir: "core/kernel",
+    },
+    Harnessed {
+        package: "vfsd-gpt",
+        dir: "services/vfsd/gpt",
+    },
+];
 
 /// The `git grep -E` pattern of a line that declares a proof harness.
 const HARNESS_PATTERN: &str = r"^[[:space:]]*#\[kani::proof\]";

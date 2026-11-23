@@ -3582,7 +3582,7 @@ pub fn sys_endpoint_badge(tf: UserFrame) -> Result<u64, SyscallError>
 /// (core/kernel/docs/capability-internals.md § Sole-Reference Observers). The
 /// bind's own pin counts as a reference until the call returns; when no other
 /// holder than the slot remains, its release is the fall to one reference,
-/// and the post comes at the call's return.
+/// which the next drain posts, as for any release.
 ///
 /// # Errors
 /// `InvalidCapability` for arg0 when it is null, stale, or empty, and for

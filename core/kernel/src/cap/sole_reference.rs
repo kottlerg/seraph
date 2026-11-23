@@ -37,6 +37,12 @@ use crate::sync::Spinlock;
 /// Number of chains in the table, keyed by a hash of the object address.
 pub const BUCKETS: usize = 256;
 
+/// The most nodes one drain pass posts. A death can fire any number of
+/// nodes, each funded by its binder's queue; the drain posts them a pass at a
+/// time, so one pass bounds the work a syscall return or an idle-loop
+/// iteration does for observers it did not bind.
+pub const POST_BUDGET: usize = 64;
+
 /// Number of 64-bit words in the pending-bucket mask.
 const PENDING_WORDS: usize = BUCKETS / 64;
 
@@ -49,8 +55,8 @@ const SUMMARY_FIRED: u64 = 1 << PENDING_WORDS;
 /// A bucket's chain links one primary node per observed object, through the
 /// node's `death.next`; the primary names the object in `object`, and the
 /// object's other nodes hang off it through `group`. The fired list links the
-/// primaries of the groups the claims took off their chains, the same way,
-/// until the drain takes it.
+/// primaries of the groups the claims and deaths took off their chains, the
+/// same way, until the drain has taken every node of them.
 struct Chains
 {
     heads: [*mut ObserverNode; BUCKETS],
@@ -260,16 +266,18 @@ impl SoleReferenceTable
     }
 
     /// Claim every object of a pending bucket that holds one reference, and
-    /// take the fired list: the groups to post, their primaries linked through
-    /// `death.next` and each group's other nodes through `group`; null when
-    /// nothing fired. The caller owns every node of the list.
+    /// take at most `budget` nodes off the fired list: the nodes to post,
+    /// linked through `group` (null when nothing fired), and whether fired
+    /// nodes remain. The caller owns every node it takes. Nodes that remain
+    /// stay on the fired list, with [`SUMMARY_FIRED`] set, for the next drain
+    /// on any CPU.
     ///
     /// Reads one word when nothing is pending.
-    pub fn collect(&self) -> *mut ObserverNode
+    pub fn collect(&self, budget: usize) -> (*mut ObserverNode, bool)
     {
         if self.summary.load(Ordering::Acquire) == 0
         {
-            return null_mut();
+            return (null_mut(), false);
         }
         let summary = self.summary.swap(0, Ordering::AcqRel);
         // SAFETY: paired with the unlock_raw below.
@@ -292,11 +300,44 @@ impl SoleReferenceTable
                 claim_bucket(chains, bucket);
             }
         }
-        let fired = chains.fired;
-        chains.fired = null_mut();
+        let mut taken: *mut ObserverNode = null_mut();
+        let mut count = 0;
+        while count < budget && !chains.fired.is_null()
+        {
+            let primary = chains.fired;
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every access is to a field of primary or of its group's first member, \
+                          both on the fired list the held lock owns"
+            )]
+            // SAFETY: primary heads the fired list and member, when non-null,
+            // hangs off it; the held lock owns both. The node taken leaves the
+            // list for the caller's, which only this thread reaches.
+            unsafe {
+                let member = (*primary).group;
+                let node = if member.is_null()
+                {
+                    chains.fired = (*primary).death.next.cast();
+                    primary
+                }
+                else
+                {
+                    (*primary).group = (*member).group;
+                    member
+                };
+                (*node).group = taken;
+                taken = node;
+            }
+            count = count.wrapping_add(1);
+        }
+        let more = !chains.fired.is_null();
+        if more
+        {
+            self.summary.fetch_or(SUMMARY_FIRED, Ordering::Release);
+        }
         // SAFETY: paired with the lock_raw above.
         unsafe { self.lock.unlock_raw(saved) };
-        fired
+        (taken, more)
     }
 }
 
@@ -371,64 +412,64 @@ fn claim_bucket(chains: &mut Chains, bucket: usize)
     }
 }
 
-/// Post every sole-reference observer the table has fired: `(0, correlator)`
-/// to each node's queue, the node back to its pool, and the queue's reference
-/// the binding held released.
+/// Post at most [`POST_BUDGET`] of the sole-reference observers the table
+/// has fired: `(0, correlator)` to each node's queue, the node back to its
+/// pool, and the queue's reference the binding held released.
 ///
 /// Called by `drain_deferred_reclaim` after its reclaim: on the syscall
-/// epilogue and in the idle loop, with no lock held. Reads one word when nothing is
-/// pending.
+/// epilogue and in the idle loop, with no lock held. Reads one word when
+/// nothing is pending. When fired nodes remain, it sets `cpu`'s
+/// reschedule-pending flag, which only the idle loop consumes: an idle CPU
+/// then drains again before it halts, so the rest are posted without waiting
+/// for another CPU's syscall.
 ///
 /// # Safety
 /// No lock is held, and the context is one [`release_ref`] allows: syscall
-/// context with interrupts disabled, or the idle thread.
+/// context with interrupts disabled, or the idle thread. `cpu` is this CPU.
 ///
 /// [`release_ref`]: crate::cap::object::release_ref
 #[cfg(not(test))]
-pub unsafe fn drain()
+pub unsafe fn drain(cpu: usize)
 {
-    let mut group = TABLE.collect();
-    while !group.is_null()
+    let (mut node, more) = TABLE.collect(POST_BUDGET);
+    while !node.is_null()
     {
-        // SAFETY: collect handed this thread every node of the list.
-        let next_group = unsafe { (*group).death.next }.cast::<ObserverNode>();
-        let mut node = group;
-        while !node.is_null()
-        {
-            #[expect(
-                clippy::multiple_unsafe_ops_per_block,
-                reason = "every access is to a field of node, which collect handed this thread"
-            )]
-            // SAFETY: collect handed this thread node; it lives in its queue,
-            // which the binding's reference keeps live until the release below.
-            let (next, eq, correlator) = unsafe {
-                let fields = ((*node).group, (*node).death.eq, (*node).death.correlator);
-                (*node).object = core::ptr::null();
-                (*node).group = null_mut();
-                (*node).death.next = null_mut();
-                fields
-            };
-            // SAFETY: the binding's reference keeps eq live; no lock is held.
-            unsafe { crate::sched::post_one_death_event(eq, correlator, 0) };
-            // SAFETY: as above.
-            let eq_state = unsafe { (*eq).state };
-            // SAFETY: node came from this queue's pool and is on no list; the
-            // binding's reference keeps eq live; no lock is held.
-            unsafe {
-                crate::ipc::event_queue::event_queue_return_observer(
-                    eq_state,
-                    node.cast::<crate::sched::thread::DeathObserver>(),
-                );
-            }
-            if let Some(eq) = core::ptr::NonNull::new(eq.cast::<KernelObjectHeader>())
-            {
-                // SAFETY: the binding's reference, which this consumes; the
-                // context is one release_ref allows (contract).
-                unsafe { crate::cap::object::release_ref(eq) };
-            }
-            node = next;
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to a field of node, which collect handed this thread"
+        )]
+        // SAFETY: collect handed this thread node; it lives in its queue,
+        // which the binding's reference keeps live until the release below.
+        let (next, eq, correlator) = unsafe {
+            let fields = ((*node).group, (*node).death.eq, (*node).death.correlator);
+            (*node).object = core::ptr::null();
+            (*node).group = null_mut();
+            (*node).death.next = null_mut();
+            fields
+        };
+        // SAFETY: the binding's reference keeps eq live; no lock is held.
+        unsafe { crate::sched::post_one_death_event(eq, correlator, 0) };
+        // SAFETY: as above.
+        let eq_state = unsafe { (*eq).state };
+        // SAFETY: node came from this queue's pool and is on no list; the
+        // binding's reference keeps eq live; no lock is held.
+        unsafe {
+            crate::ipc::event_queue::event_queue_return_observer(
+                eq_state,
+                node.cast::<crate::sched::thread::DeathObserver>(),
+            );
         }
-        group = next_group;
+        if let Some(eq) = core::ptr::NonNull::new(eq.cast::<KernelObjectHeader>())
+        {
+            // SAFETY: the binding's reference, which this consumes; the
+            // context is one release_ref allows (contract).
+            unsafe { crate::cap::object::release_ref(eq) };
+        }
+        node = next;
+    }
+    if more
+    {
+        crate::sched::set_reschedule_pending_for(cpu);
     }
 }
 
@@ -477,30 +518,39 @@ mod tests
         obj.dec_ref_in(table);
     }
 
-    /// The correlators the drain would post now, sorted.
-    fn posted(table: &SoleReferenceTable) -> Vec<u64>
+    /// The correlators of the nodes one collect of `budget` takes, sorted,
+    /// and whether fired nodes remain.
+    fn pass(table: &SoleReferenceTable, budget: usize) -> (Vec<u64>, bool)
     {
         let mut out = Vec::new();
-        let mut group = table.collect();
-        while !group.is_null()
+        let (mut node, more) = table.collect(budget);
+        while !node.is_null()
         {
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "both reads are of fields of node, which collect handed the test"
+            )]
             // SAFETY: collect handed the test every node of the list; each is
             // a node of a test vector still live.
-            let next = unsafe { (*group).death.next }.cast::<ObserverNode>();
-            let mut node = group;
-            while !node.is_null()
-            {
-                #[expect(
-                    clippy::multiple_unsafe_ops_per_block,
-                    reason = "both reads are of fields of node, which collect handed the test"
-                )]
-                // SAFETY: as above.
-                unsafe {
-                    out.push((*node).death.correlator);
-                    node = (*node).group;
-                }
+            unsafe {
+                out.push((*node).death.correlator);
+                node = (*node).group;
             }
-            group = next;
+        }
+        out.sort_unstable();
+        (out, more)
+    }
+
+    /// The correlators the drain would post now, over as many passes as it
+    /// takes, sorted.
+    fn posted(table: &SoleReferenceTable) -> Vec<u64>
+    {
+        let (mut out, mut more) = pass(table, POST_BUDGET);
+        while more
+        {
+            let (next, again) = pass(table, POST_BUDGET);
+            out.extend(next);
+            more = again;
         }
         out.sort_unstable();
         out
@@ -664,7 +714,40 @@ mod tests
         obj.dec_ref_in(&table);
         assert_eq!(obj.dec_ref_in(&table), 0);
         assert_eq!(table.summary.load(Ordering::Relaxed), 0);
-        assert!(table.collect().is_null());
+        assert!(table.collect(POST_BUDGET).0.is_null());
+    }
+
+    // Defect guarded: one pass must post no more than its budget, however many
+    // nodes a death fires, and must leave the rest marked for the next pass, so
+    // no drain does unbounded work for observers it did not bind.
+    #[test]
+    fn a_pass_posts_at_most_its_budget_and_leaves_the_rest_marked()
+    {
+        let table = SoleReferenceTable::new();
+        let a = object();
+        let b = object();
+        a.inc_ref();
+        let mut n = nodes(1, 4);
+        let (first, rest) = n.split_at_mut(3);
+        for node in first
+        {
+            bind(&table, node, &a);
+        }
+        bind(&table, &mut rest[0], &b);
+        assert_eq!(b.dec_ref_in(&table), 0);
+        assert_eq!(a.dec_ref_in(&table), 1);
+        assert_eq!(a.dec_ref_in(&table), 0);
+        let (one, more) = pass(&table, 3);
+        assert_eq!(one.len(), 3);
+        assert!(more, "a fired node remains");
+        assert_ne!(table.summary.load(Ordering::Relaxed) & SUMMARY_FIRED, 0);
+        let (two, more) = pass(&table, 3);
+        assert_eq!(two.len(), 1);
+        assert!(!more);
+        let mut all = [one, two].concat();
+        all.sort_unstable();
+        assert_eq!(all, [1, 2, 3, 4], "every node posts once");
+        assert_eq!(table.summary.load(Ordering::Relaxed), 0);
     }
 
     // Defect guarded: the limit and the live tests must read the count without

@@ -3114,7 +3114,7 @@ pub unsafe fn drain_deferred_reclaim(cpu: usize)
     unsafe { reclaim_deferred_stack(cpu) };
     // SAFETY: syscall-epilogue context with interrupts disabled, or the idle
     // thread, holding no lock: the context release_ref allows.
-    unsafe { crate::cap::sole_reference::drain() };
+    unsafe { crate::cap::sole_reference::drain(cpu) };
 }
 
 /// Drain this CPU's deferred reclaim stack, completing the free of each

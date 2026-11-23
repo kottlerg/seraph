@@ -485,6 +485,10 @@ pub fn run_all(ctx: &TestContext)
         sole_reference::two_bindings_each_post_once(ctx)
     );
     run_test!(
+        "sole_reference::bindings_past_the_budget_each_post_once",
+        sole_reference::bindings_past_the_budget_each_post_once(ctx)
+    );
+    run_test!(
         "sole_reference::moved_copy_does_not_post",
         sole_reference::moved_copy_does_not_post(ctx)
     );

@@ -33,6 +33,13 @@ const POST_WAIT_MS: u64 = 2000;
 /// `event_recv_entry`'s non-blocking poll.
 const TRY_ONCE: u64 = u64::MAX;
 
+/// The wait for a post that is due: the drain that makes it may run on
+/// another CPU, after the call whose release made it has returned.
+fn post_wait() -> u64
+{
+    crate::scaled_bound(POST_WAIT_MS)
+}
+
 // Child stack for the racing-delete case.
 static mut RACE_STACK: ChildStack = ChildStack::ZERO;
 
@@ -91,7 +98,7 @@ fn pool_restored_on(eq: u64, nodes: u64, object: u64) -> TestResult
     let mut seen = 0u64;
     for _ in 0..nodes
     {
-        let entry = event_recv_entry(eq, TRY_ONCE)
+        let entry = event_recv_entry(eq, post_wait())
             .map_err(|_| "pool_restored: a binding did not post at one reference")?;
         let i = entry.tag ^ CORRELATOR;
         if entry.payload != 0 || i >= nodes || seen & (1 << i) != 0
@@ -114,8 +121,8 @@ fn with_queue(ctx: &TestContext, nodes: u32, f: impl FnOnce(u64) -> TestResult) 
     result
 }
 
-/// Bind, then delete the other copy: one post, with the correlator, at the
-/// delete's return, and none while two references remain. Fails if the fall
+/// Bind, then delete the other copy: one post, with the correlator, after
+/// the delete, and none while two references remain. Fails if the fall
 /// to one reference is missed, posted twice, or posted early.
 pub fn other_copy_deleted_posts_once(ctx: &TestContext) -> TestResult
 {
@@ -129,8 +136,8 @@ pub fn other_copy_deleted_posts_once(ctx: &TestContext) -> TestResult
         expect_post(
             eq,
             CORRELATOR,
-            TRY_ONCE,
-            "other_copy: no post at the delete's return",
+            post_wait(),
+            "other_copy: no post after the delete",
         )?;
         cap_delete(object).map_err(|_| "other_copy: delete of the last copy failed")?;
         expect_none(eq, "other_copy: a second post")
@@ -138,7 +145,7 @@ pub fn other_copy_deleted_posts_once(ctx: &TestContext) -> TestResult
 }
 
 /// Bind on the only reference: the bind's own pin release is the fall to one,
-/// so the post comes at the bind's return. Fails if the pin release is not
+/// so the post follows the bind. Fails if the pin release is not
 /// observed.
 pub fn bind_on_sole_reference_posts_at_once(ctx: &TestContext) -> TestResult
 {
@@ -149,8 +156,8 @@ pub fn bind_on_sole_reference_posts_at_once(ctx: &TestContext) -> TestResult
         let posted = expect_post(
             eq,
             CORRELATOR,
-            TRY_ONCE,
-            "sole_bind: no post at the bind's return",
+            post_wait(),
+            "sole_bind: no post after the bind",
         );
         cap_delete(object).ok();
         bound.map_err(|_| "sole_bind: bind failed")?;
@@ -213,7 +220,7 @@ fn race_once(ctx: &TestContext, eq: u64, cpu: u32, correlator: u64) -> TestResul
         expect_post(
             eq,
             correlator,
-            crate::scaled_bound(POST_WAIT_MS),
+            post_wait(),
             "racing_delete: no post",
         )?;
         expect_none(eq, "racing_delete: a second post")
@@ -237,8 +244,10 @@ pub fn two_bindings_each_post_once(ctx: &TestContext) -> TestResult
         cap_bind_sole_reference(copy, eq, CORRELATOR | 1)
             .map_err(|_| "two_bindings: second bind failed")?;
         cap_delete(copy).map_err(|_| "two_bindings: delete failed")?;
-        let first = event_recv_entry(eq, TRY_ONCE).map_err(|_| "two_bindings: no first post")?;
-        let second = event_recv_entry(eq, TRY_ONCE).map_err(|_| "two_bindings: no second post")?;
+        let first =
+            event_recv_entry(eq, post_wait()).map_err(|_| "two_bindings: no first post")?;
+        let second =
+            event_recv_entry(eq, post_wait()).map_err(|_| "two_bindings: no second post")?;
         cap_delete(object).ok();
         let mut tags = [first.tag, second.tag];
         tags.sort_unstable();
@@ -248,6 +257,64 @@ pub fn two_bindings_each_post_once(ctx: &TestContext) -> TestResult
         }
         expect_none(eq, "two_bindings: a third post")
     })
+}
+
+/// Observer nodes bound to one object for [`bindings_past_the_budget_each_post_once`],
+/// more than one drain pass posts (the kernel's `POST_BUDGET`, 64).
+const PAST_BUDGET_NODES: u32 = 80;
+
+/// More bindings on one object than one drain pass posts: at the fall to one,
+/// every binding posts once, over several passes, and every node comes back,
+/// which a second round of as many bindings shows. Fails if the nodes a pass
+/// leaves on the fired list are lost, posted twice, or not returned.
+pub fn bindings_past_the_budget_each_post_once(ctx: &TestContext) -> TestResult
+{
+    let eq = event_queue_create_observed(ctx.memory_base, PAST_BUDGET_NODES, PAST_BUDGET_NODES)
+        .map_err(|_| "past_budget: event_queue_create_observed failed")?;
+    let result = (|| {
+        for _round in 0..2
+        {
+            past_budget_round(ctx, eq)?;
+        }
+        Ok(())
+    })();
+    cap_delete(eq).ok();
+    result
+}
+
+/// One round of [`bindings_past_the_budget_each_post_once`].
+fn past_budget_round(ctx: &TestContext, eq: u64) -> TestResult
+{
+    let object =
+        cap_create_notification(ctx.memory_base).map_err(|_| "past_budget: create failed")?;
+    let result = (|| {
+        let copy = cap_derive(object, RIGHTS_ALL).map_err(|_| "past_budget: derive failed")?;
+        for i in 0..u64::from(PAST_BUDGET_NODES)
+        {
+            cap_bind_sole_reference(object, eq, CORRELATOR | i)
+                .map_err(|_| "past_budget: a bind failed (a node did not come back)")?;
+        }
+        cap_delete(copy).map_err(|_| "past_budget: delete failed")?;
+        let mut seen = [false; PAST_BUDGET_NODES as usize];
+        for _ in 0..PAST_BUDGET_NODES
+        {
+            let entry = event_recv_entry(eq, post_wait())
+                .map_err(|_| "past_budget: a binding did not post")?;
+            let slot = usize::try_from(entry.tag ^ CORRELATOR)
+                .ok()
+                .and_then(|i| seen.get_mut(i))
+                .filter(|taken| !**taken)
+                .ok_or("past_budget: wrong or duplicate post")?;
+            if entry.payload != 0
+            {
+                return Err("past_budget: wrong payload");
+            }
+            *slot = true;
+        }
+        expect_none(eq, "past_budget: a binding posted twice")
+    })();
+    cap_delete(object).ok();
+    result
 }
 
 /// A copy moved into another `CSpace`, the move an IPC transfer makes at
@@ -364,7 +431,7 @@ pub fn exhausted_pool_out_of_memory(ctx: &TestContext) -> TestResult
         let posted = expect_post(
             eq,
             CORRELATOR,
-            TRY_ONCE,
+            post_wait(),
             "exhausted: the bound node did not post",
         );
         cap_delete(object).ok();

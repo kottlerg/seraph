@@ -1085,11 +1085,15 @@ one reference after the bind, or at the object's death.
 every slot naming the object in every `CSpace`, and every kernel-internal reference to it. The
 binding binds the object, not the slot, and takes no reference on it. The call's own pin on the
 object counts until it returns: when the slot `cap` names is the only other reference, the pin's
-release is the fall to one, and the post comes at the call's return.
+release is the fall to one, and a drain posts it as for any other release.
 
 **When it posts:** a release that leaves one reference marks the object for the kernel's drain,
-which runs at the end of every syscall and in the idle loop, after the deferred reclaim; the post
-is made when the drain finds the object still at one reference. A count that falls to one and rises
+which runs at the end of every syscall, on every CPU, and in the idle loop, after the deferred
+reclaim; the post is made when a drain finds the object still at one reference. That drain may run
+on another CPU, so the post can reach the queue just after the call that made the release returns:
+a binder waits for it on the queue (`SYS_EVENT_RECV` with a timeout or none), and does not poll
+once. A drain posts at most `POST_BUDGET` (64) bindings; the rest wait for the next drain on any
+CPU, which an idle CPU makes before it halts. A count that falls to one and rises
 again before the drain looks is found at its next fall to one or at the object's death, which posts
 every binding the object still has. The binding posts once and then ends. No post is made while a
 copy of the capability is in an IPC transfer: a queued message holds a slot handle, not a

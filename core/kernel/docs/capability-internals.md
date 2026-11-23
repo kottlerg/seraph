@@ -889,7 +889,7 @@ The mechanism is `cap/sole_reference.rs`.
 - **The bind.** Under the syscall's pin on the object, the bind takes a node from the queue's pool
   and a reference on the queue, then, under the table lock, links the node and sets the flag. Its
   pin release is an ordinary decrement: when the slot is the only other holder, that release is the
-  fall to one reference, and the post comes at the bind's return.
+  fall to one reference, which the next drain posts.
 - **The fall to one.** The decrement from `REF_OBSERVED | 2` sets the pending bit of the object's
   chain, computed from the address alone. It reads the object no further: that decrement may have
   released the decrementer's last hold on it, so another CPU may already have freed it.
@@ -900,12 +900,21 @@ The mechanism is `cap/sole_reference.rs`.
 - **The drain.** `drain_deferred_reclaim`, after its reclaim, on the syscall epilogue and in the
   idle loop, reads one summary word when nothing is pending. Otherwise, under the table lock, it
   claims each object of a pending chain whose word is `REF_OBSERVED | 1` by a compare-and-swap to
-  1, moving its nodes to the fired list, and takes the fired list. An object on a chain is live,
+  1, moving its nodes to the fired list, and takes at most `POST_BUDGET` (64) nodes off the fired
+  list. An object on a chain is live,
   since its death takes it off the chain under the same lock before its memory can be reused. A
   compare-and-swap that races an increment either fails, and the object stays bound, or wins, and
   the count was one. After the unlock the drain posts each node through
   `sched::post_one_death_event`, returns it to its pool, and releases the binding's queue
   reference, so no post is made under `DERIVATION_LOCK` or a CSpace lock.
+- **The budget.** A death fires every node bound to the object, any number of them, each funded
+  by its binder's queue, and the drain that takes them runs in whatever thread's syscall return or
+  idle-loop iteration comes next, on any CPU. The budget bounds what one pass does for observers
+  its thread did not bind. Nodes left on the fired list keep the summary's fired bit set, so the
+  next drain on any CPU continues, and the drain sets its own CPU's reschedule-pending flag, which
+  only the idle loop consumes: an idle CPU drains again before it halts. The drain that claims a
+  post may run on a CPU other than the one whose release made it, so a post can reach its queue
+  just after the call that made the release returns.
 - **What a post means.** Every arrival at `REF_OBSERVED | 1` is a decrement from
   `REF_OBSERVED | 2`, which marks the chain, so a count that rests at one is always found. A count
   that falls to one and rises again before the drain looks is not claimed, and is found at its next

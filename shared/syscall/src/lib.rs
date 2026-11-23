@@ -1567,7 +1567,9 @@ pub fn endpoint_identify(key: u64, cap: u64) -> Result<bool, i64>
 /// may be any holder's, so a binder makes `correlator` name its slot and a
 /// generation, and drops a post for a slot it has since reused. Each binding
 /// takes one observer node from `event_queue_cap`'s pool
-/// ([`event_queue_create_observed`]) until it posts.
+/// ([`event_queue_create_observed`]) until it posts. The post can reach the
+/// queue just after the call whose release made it returns, this one
+/// included, so a binder waits for it on the queue and does not poll once.
 ///
 /// Requires `POST` on `event_queue_cap`; `cap` may be of any type.
 ///
@@ -2660,12 +2662,15 @@ pub fn irq_remap(authority: u64, setting: u64) -> Result<(), i64>
 /// non-canonical or below `USER_VA_FLOOR`, or the range leaves the user
 /// half), `InvalidCapability`,
 /// `InsufficientRights` (a cap lacks Map), `InvalidArgument` (MMIO region
-/// size zero, unaligned, or overflowing), or `OutOfMemory` (page-table growth
+/// size zero, unaligned, or overflowing), `OutOfMemory` (page-table growth
 /// pool exhausted; refill with [`cap_create_aspace`] in augment mode; or, for a
 /// mapping past the object's four inline records, the caller's `CSpace` pool
-/// cannot fund a spill chunk; refill with [`cap_create_cspace`]). An
-/// `OutOfMemory` failure keeps the mapping's record and the pages already
-/// mapped; a retry at the same `virt` reuses the record.
+/// cannot fund a spill chunk; refill with [`cap_create_cspace`]), or
+/// `QuotaExceeded` (the address space's reference count is at its 2^30
+/// ceiling, which the mapping's record is checked against; nothing is
+/// recorded or mapped). An `OutOfMemory` failure keeps the mapping's record
+/// and the pages already mapped; a retry at the same `virt` reuses the
+/// record.
 #[inline]
 pub unsafe fn mmio_map(aspace_cap: u64, mmio_cap: u64, virt: u64, flags: u64) -> Result<(), i64>
 {

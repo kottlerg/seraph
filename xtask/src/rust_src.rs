@@ -1391,7 +1391,7 @@ fn apply_fs_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
          // seraph-overlay: std::fs::File via vfsd OPEN + fs-driver FS_READ/FS_READ_FRAME\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          use seraph as imp;\n        \
-         pub(crate) use seraph::{close_open_files, rebind_fs_sessions, rebind_release_handler, session_copy, walk_path_to_file, walk_path_to_dir, walk_path_to_dir_with_rights, WalkedFile, WalkedDir};\n    }\n",
+         pub(crate) use seraph::{close_open_files, rebind_fs_sessions, rebind_release_handler, session_copy, walk_path_to_file, write_frame_memmgr_calls, walk_path_to_dir, walk_path_to_dir_with_rights, WalkedFile, WalkedDir};\n    }\n",
     )
 }
 

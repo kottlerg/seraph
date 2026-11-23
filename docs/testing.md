@@ -415,7 +415,8 @@ lines that are compared. The userspace paths are measured by the
 recipe (`/config/svcmgr/tests/ubench.svc`) staged and the terminal dropped; it logs its own
 lines and fsbench's.
 
-CI's `bench` cell, one per architecture, boots both (debug) under QEMU's icount
+CI's `bench` cell, one per architecture, builds both in the release profile
+(`cargo xtask build --release --ktest-bench-only`) and boots them under QEMU's icount
 (`cargo xtask run --icount`): one guest clock tick per retired instruction, so a benchmark's
 count is the same in every run of one build, whatever the runner's load. It boots each three times
 at one CPU and once at four, the ubench boots with a framebuffer (`--display framebuffer`) and
@@ -432,6 +433,14 @@ moves a count on purpose rewrites the baselines of the benchmarks it moved from 
 (`cargo xtask bench-baseline --from-run <run id>`) and states the change and its reason in its
 body. The four-CPU counts are reported, not gated: the interleaving of the CPUs moves them.
 
+The cell measures the release profile because hardware runs it, and a count is worth what it
+says about hardware. The debug profile adds debug assertions and overflow checks, and leaves out
+of line the calls the release build's fat LTO inlines, in proportions that differ from path to
+path, so a count moved in the debug profile does not predict the count moved in release. A
+regression that exists only in the debug profile, such as a debug assertion added to a hot path,
+is therefore not gated: it costs nothing on hardware, and the functional cells still boot both
+profiles.
+
 A one-CPU count gates only when it does not include time blocked on a device completion. The
 completion arrives at host time: a guest blocked on it retires no instructions, and its clock
 advances by timer deadlines until QEMU completes the request, so the count follows the host's I/O
@@ -444,9 +453,9 @@ samples wait on a device joins the set (`ICOUNT_IO_BOUND` in `xtask/src/benchmar
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
-(`--mode host`, x86_64 under KVM, per-measurement bands in
-`xtask/baselines/bench/host/x86_64/BANDS`), and is report-only: no host-mode baseline is checked
-in yet, so no PR owes a host-mode run.
+(`--mode host`, x86_64 under KVM, on the release build the cell measures, per-measurement bands
+in `xtask/baselines/bench/host/x86_64/BANDS`), and is report-only: no host-mode baseline is
+checked in yet, so no PR owes a host-mode run.
 
 ### Crash reports
 
@@ -1130,7 +1139,7 @@ not on every push.
 
 **Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest), and the `bench` cell
-beside them (debug, one CPU and four, under icount; [Benchmarks](#benchmarks-bench-cell)).
+beside them (release, one CPU and four, under icount; [Benchmarks](#benchmarks-bench-cell)).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + virtio-rng + serial + the machine's RTC, the machine's IOMMU
 with the virtio-blk, virtio-keyboard, and virtio-rng devices behind it — `intel-iommu` on x86_64,
@@ -1183,7 +1192,7 @@ registry runs it on (its `md-test-cells` rule).
 | `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
-| `bench` | Canonical | x86_64, riscv64; debug | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
+| `bench` | Canonical | x86_64, riscv64; release | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |
 | 4kn | Local and release host runs | x86_64, riscv64; debug | svctest from a 4Kn disk (`mkdisk --block-size 4096`) | none | 4096-byte logical blocks (Disk variations below) |

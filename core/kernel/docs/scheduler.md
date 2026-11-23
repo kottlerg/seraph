@@ -567,8 +567,14 @@ placement's ([scheduling-internals.md](scheduling-internals.md) § Target CPU se
 could run in parallel. Two threads that hand work to one another in turns, each queued behind
 the other for far less than a tick, so stay on one CPU, and their round trips wake no halted
 CPU; an asynchronous producer and consumer whose every handoff drains within a tick stay
-there too, since the pull does not spread them either. Whether a wake should place either kind
-of pair by its waker is open (#1560).
+there too, since the pull does not spread them either. Two unpinned threads that each wait on a
+thread of another CPU, such as the clients of two servers, can likewise come to share one CPU
+while another idles, and stay there while each wake keeps them there (the sticky preferred CPU of
+`select_target_cpu` stays within the threshold of the least-loaded CPU). What the episode leaves
+is bounded by the threshold: a load above it is pulled at once, so a backlog the pull leaves to
+break and re-form is one at a load of at most `LOAD_BALANCE_IMBALANCE_THRESHOLD` (2), the
+running thread and one queued behind it. Whether a wake should place any of these by its waker,
+or away from it, is open (#1560).
 
 The loads that choose a pull are read without the CPUs' locks, and a CPU's `schedule()`
 raises its own load for a moment under its lock: it counts every requeue of the running

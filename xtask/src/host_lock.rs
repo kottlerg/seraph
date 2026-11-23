@@ -372,11 +372,22 @@ pub fn probe_host() -> Probe
 
 // ── The lock directory ────────────────────────────────────────────────────────
 
+/// The variable a cell's lanes set for each case they run, to the lock
+/// directory of the checkout the cell runs in, so the case's boots in a
+/// lane's copy, which is no git checkout, are admitted against that
+/// checkout's lock as the checkout's own boots are.
+pub const LANE_LOCK_DIR_ENV: &str = "XTASK_LANE_LOCK_DIR";
+
 /// The lock directory of the checkout `ctx` belongs to: `seraph-host/` in
 /// its git common directory, which every worktree of the checkout shares, or
-/// `target/xtask/host/` outside a git checkout.
+/// `target/xtask/host/` outside a git checkout; in a lane's case, the one
+/// [`LANE_LOCK_DIR_ENV`] names.
 pub fn lock_dir(ctx: &Context) -> PathBuf
 {
+    if let Some(dir) = std::env::var_os(LANE_LOCK_DIR_ENV)
+    {
+        return PathBuf::from(dir);
+    }
     match git_common_dir(&ctx.root)
     {
         Some(common) => common.join(LOCK_DIR_NAME),

@@ -655,15 +655,17 @@ contract.
 
 Remove the sysroot, the symbols store `symbols/`, the disk images `disk.img` and
 `disk-data.img`, and any per-launch variable store a killed launch left under
-`target/xtask/vars/` (and optionally `target/`).
+`target/xtask/vars/` (and optionally `target/`, or Cargo's build output in it but for the standard
+library's build units).
 
 ```
-cargo xtask clean [--all]
+cargo xtask clean [--all | --keep-std]
 ```
 
 | Option | Description |
 |---|---|
 | `--all` | Also run `cargo clean` to remove the `target/` directory |
+| `--keep-std` | Also empty Cargo's profile directories, the host's (`target/<profile>/`) and each target's (`target/<triple>/<profile>/`), and those of `target/seraph-build/`, the Cargo build directory of the builds that compile `std` from the toolchain mirror, but for the build units of the packages the toolchain's `library/Cargo.lock` names (`core`, `alloc`, `compiler_builtins`, `std` and their dependencies): only `build/<package>/` of such a package stays. The rest of `target/`, `target/xtask/` among it, is left alone. CI's standard-library cache saves what is left ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration) |
 
 ---
 
@@ -720,7 +722,7 @@ host, are cases of one registry, not commands of their own:
 ```
 cargo xtask test <CASE> [--arch x86_64|riscv64] [--cpus N] [--mem MIB] [case options] [host options]
 cargo xtask test --cell svctest|usertest|ktest [--arch A] [--cpus N] [--mem MIB] [--release] \
-    [host options]
+    [--lanes N] [host options]
 ```
 
 Without `--arch`, `--cpus` and `--mem` a case boots `x86_64` with 4 vCPUs and 512 MiB. The host
@@ -790,10 +792,42 @@ succeeds. A cell takes no case option but `--release`, which it passes on to `si
 `rollback`. The cell table of [docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers
 lists every cell with the cases it runs.
 
+`--lanes N` (1 to 3; default 1) runs the cell's cases in up to N lanes side by side. The cell
+assigns its cases to the lanes heaviest first, each to the lane with the least weight so far, by the
+weight each registry entry gives (about the seconds the case takes in its slowest CI cell, 60 for an
+entry that gives none); a lane runs its cases in the registry's order. The weights only balance the
+lanes: the cell checks that the lanes hold every case of the cell exactly once before they start and
+that they ran exactly those cases after, and a wrong or missing weight changes only which lane a
+case runs in. Each lane runs in a private copy of the checkout under the host's temporary directory,
+removed when the cell ends, and runs each of its cases as its own `xtask test <CASE>` process in
+that copy, so every path a case reads or writes resolves inside the copy. The copy holds the source
+tree (`git ls-files`, untracked files not ignored included) and the state the cases read or write:
+
+| State | Cases that write it |
+|---|---|
+| `sysroot/` | every case, whose boots repack the images from it; `signing`, `rollback`, `enrolment` and `secureboot` also stage substitutes, requests or knobs on its ESP |
+| `disk.img`, `disk-data.img` | every case, through its packs |
+| `symbols/` | none; a case's crash reports are symbolized against it |
+| `target/xtask/signing/` | every case, whose packs sign under the trust store (with `SERAPH_SIGNING_DIR` set, CI's signing keys are outside the checkout and shared read-only) |
+| `target/x86_64-unknown-uefi/`, `target/riscv64imac-seraph-uefi/`, and the host's `target/debug/build/` and `target/release/build/` | `signing` and `rollback`, which build their bootloaders there, with their build scripts |
+| `target/xtask/test/`, `target/xtask/run/` | every case, its logs |
+
+A lane's case boots are admitted against the checkout's own host lock, as small boots
+([Host launch rules](#host-launch-rules)): its copy is no git checkout, so the cell names the lock
+directory to each case. Each lane's output is echoed prefixed `[lane N]` and kept in
+`target/xtask/lanes/<N>/lane.log`, with the lane's `test/` and `run/` logs copied beside it when
+the lane ends. The cell then reports each case's outcome, wall time and CPU time (its process's and
+its boots', from `/proc`, where the host has it) and each lane's, and fails naming the cases that
+failed. Around the lanes it records `sysroot/`, `symbols/`, the images and `target/xtask/signing/`
+of the checkout itself, and fails, naming each path, when a lane changed one: a case that wrote
+outside its copy fails the cell rather than racing another lane. `--lanes` above 1 refuses
+`--alone` and `--timing`, which run a boot beside no other QEMU.
+
 CI (`.github/workflows/build-test.yml`) runs, in every cell after the cell's own boot,
 `cargo xtask mkdisk --arch A` (the plain repack: the `rootfs/` re-mirror, the repository's log
 levels, no knobs, the recorded harness kept) and then `cargo xtask test --cell <tester> --arch A
-[--release]`. The cases no cell runs, which are host runs
+[--release] --lanes 3`: each boot keeps about one of the runner's four vCPUs busy. The cases no
+cell runs, which are host runs
 ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers), are `hotplug`, `cet`,
 `tpm` and `debug-port`.
 
@@ -2466,7 +2500,9 @@ tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `
 `test` with a case or a cell as boots, each boot admitted as above (the `shutdown` case admits once
 for its boots, which it runs one at a time). The `signing` case, which compiles its revoking and
 role-scoped bootloaders before it boots, is admitted as a build for each compile and then each boot
-as a boot.
+as a boot. A cell's lanes (`test --cell T --lanes N`) start up to N cases side by side, each
+admitting its own boots, so each is a small boot counted with the others, and `--wait-host` lets a
+lane's boot wait for another lane's to end rather than fail.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

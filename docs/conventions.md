@@ -506,6 +506,25 @@ defect it finds goes to the worker of the merged PR while it still holds the con
 fixed in a new PR; a defect in work an open Issue names is recorded there. The run's report
 is saved as `target/xtask/review/pr<N>/composition-<merge>.md`.
 
+### Threat audit
+
+The threat audit reviews the code one section of [threat-model.md](threat-model.md) names against
+that section's attacker. It is the `threat-audit` workflow (`.claude/workflows/threat-audit.js`),
+run on the section an Issue's acceptance or the maintainer names. Its scope is the files the
+section's Mitigations and Fuzz targets and proof harnesses name, as `cargo xtask threat-scope`
+([xtask/README.md](../xtask/README.md)) resolves them, and it reviews them as `master` holds
+them, not a diff. Its `scope` mode states the shards and the agent count first; a `full` run
+follows on the maintainer's approval of that count, or the orchestrator's within a batch.
+
+Its reviewers report defects only (§ Findings). Each defect that no open Issue and no gap of the
+section names is put to two independent refuters, and one both refute is dropped. The session that
+ran it saves the report under `target/xtask/review/threat-<section>/` and records each confirmed
+defect as § Recording findings says, the audit and the head it ran at standing in for the PR and
+head. A finding one refuter refutes, or none could judge, is decided as § Contested findings
+says, the session that ran the audit standing as the author. A defect of the section itself (a
+mitigation that names no file, or a statement the code contradicts) is recorded on the `docs`
+rolling Issue unless the running PR fixes it. The workflow files no Issue.
+
 ### Branch naming
 
 `feature/<slug>`, `fix/<slug>`, `cleanup/<slug>`, `audit/<slug>`.

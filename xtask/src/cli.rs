@@ -199,6 +199,13 @@ subcommands! {
         /// and their files, and the open Issues (see xtask/README.md).
         ReleaseScope(ReleaseScopeArgs),
 
+        /// Print the scope of a threat audit of one section of
+        /// `docs/threat-model.md` as JSON with a digest: the section's blocks
+        /// verbatim, the files its mitigations and coverage name, the
+        /// references that resolve to nothing, the reviewer shards, and the
+        /// open Issues in pages (see xtask/README.md).
+        ThreatScope(ThreatScopeArgs),
+
         /// Replace a GitHub Issue's body from a file, refusing an empty body or
         /// one that lost task-list items, keeping a backup, and verifying the
         /// edit (see xtask/README.md).
@@ -261,6 +268,7 @@ impl CliCommand
             | Self::PrCheck(_)
             | Self::ReviewLedger(_)
             | Self::ReleaseScope(_)
+            | Self::ThreatScope(_)
             | Self::IssueEdit(_)
             | Self::IssueFile(_)
             | Self::Orch(_)
@@ -1524,6 +1532,42 @@ fn parse_page_entries(text: &str) -> Result<u64, String>
         return Err(format!("{value} is not in 1..{}", u64::MAX));
     }
     Ok(value)
+}
+
+// ── ThreatScope ───────────────────────────────────────────────────────────────
+
+args! {
+    pub struct ThreatScopeArgs
+    {
+        /// The section of `docs/threat-model.md` to scope, as its `##` heading
+        /// names it.
+        #[arg(long)]
+        pub section: String,
+
+        /// The commit the document and the files are read at.
+        #[arg(long, default_value = "HEAD")]
+        pub head: String,
+
+        /// The most open Issues one page holds.
+        #[arg(long, default_value_t = 200, value_parser = parse_page_entries)]
+        pub page_entries: u64,
+
+        /// Print page `issues:<n>` (1-based) of the open Issues instead of the
+        /// summary, from the list `--issues` names.
+        #[arg(long, value_name = "issues:N", requires = "issues")]
+        pub page: Option<String>,
+
+        /// The open Issues' digest a summary printed: a page is cut from the
+        /// list that summary saved, not from the tracker as it stands.
+        #[arg(long, value_name = "DIGEST")]
+        pub issues: Option<String>,
+
+        /// Print the summary of a section whose scope is incomplete (a
+        /// Mitigations item naming no file, or a reference resolving to
+        /// nothing) instead of refusing it.
+        #[arg(long)]
+        pub allow_incomplete: bool,
+    }
 }
 
 // ── IssueEdit / IssueFile ─────────────────────────────────────────────────────

@@ -25,7 +25,10 @@ Each boundary's section names its **Attacker**, its **Assets**, its **Assumption
 (`cargo xtask fuzz` and `cargo xtask kani`, [testing.md](testing.md) § Fuzzing and § Bounded
 verification), and its **Gaps**. A gap is a way the attacker can still reach an asset, or a part of
 the boundary that no test or proof covers. § Attackers Out of Scope lists the attackers no section
-is held against yet.
+is held against yet. The files a section's Mitigations and Fuzz targets and proof harnesses name
+in backticks, and the files under a directory they name, are the scope of the section's threat
+audit ([conventions.md](conventions.md) § Threat audit); a mitigation that names no file is a
+defect of this document.
 
 Implementation status: every section is provisional until the hardening milestone, v0.13.0
 ([#686](https://github.com/kottlerg/seraph/issues/686)), audits the whole attack surface against
@@ -68,7 +71,9 @@ controls below as specified.
   and Attenuation, § Badges; `core/kernel/src/cap/`).
 - A capability lookup's index bound, occupancy, generation, type and rights are enforced as data as
   well as by branch, so a mispredicted path resolves no object it should not
-  ([capability-model.md](capability-model.md) § Capability Spaces, Bounded under speculation).
+  ([capability-model.md](capability-model.md) § Capability Spaces, Bounded under speculation;
+  `nospec::index_mask` in `core/kernel/src/cap/cspace.rs`, `pin_checked` in
+  `core/kernel/src/syscall/mod.rs`, `core/kernel/src/arch/nospec.rs`).
 - User memory is reached only through the fault-recovering copies of `core/kernel/src/uaccess.rs`,
   which open the SMAP window on x86-64 and `sstatus.SUM` on riscv64 for the copy alone; outside them
   the kernel can neither execute nor access user pages ([memory-model.md](memory-model.md) § Kernel
@@ -80,10 +85,14 @@ controls below as specified.
   (`core/kernel/src/mm/mod.rs`) is the matching check of the page range a memory syscall maps,
   unmaps, protects or harvests.
 - No page is writable and executable at once, kernel image included, apart from the AP trampoline
-  page during bring-up ([memory-model.md](memory-model.md) § W^X Enforcement).
+  page during bring-up ([memory-model.md](memory-model.md) § W^X Enforcement; `map_permissions` in
+  `core/kernel/src/syscall/mem.rs`, `map_kernel_image` and `map_ap_trampoline` in
+  `core/kernel/src/mm/paging.rs`).
 - The kernel's virtual layout is randomized, and no value the kernel emits carries a kernel virtual
   address; the accepted residual is the descriptor-table registers on an x86-64 CPU without UMIP
-  ([Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md)).
+  ([Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md);
+  the bootloader chooses and applies the layout, `choose_kaslr_layout` and
+  `step5d_apply_kaslr_slide` in `core/boot/src/main.rs`).
 - On x86-64 the kernel enumerates the running CPU's exposure to each transient-execution class at
   the user-to-kernel boundary and applies the entry and exit controls it selects; a class the
   selection leaves open is logged as vulnerable
@@ -143,7 +152,8 @@ service executes as built, since procmgr verified it.
 - A message is a label, at most `MSG_DATA_WORDS_MAX` data words and at most `MSG_CAP_SLOTS_MAX`
   capabilities, copied by the kernel from the sender's registers or IPC buffer page into the
   receiver's: a received message does not change under the server ([ipc-design.md](ipc-design.md)
-  § Message Format).
+  § Message Format; `read_data_words`, `deliver_data_words` and `transfer_caps` in
+  `core/kernel/src/syscall/ipc.rs`).
 - A server identifies a client by the kernel-delivered badge, which only the server and its trusted
   minters choose, and gates its privileged labels on verb bits of that badge; an un-badged source
   stays with the server and its trusted minters ([capability-model.md](capability-model.md)
@@ -369,7 +379,9 @@ describes the remapping units truly.
   MSI-X table; with VT-d interrupt remapping on, a device's interrupt write is delivered only
   through an entry written for its own requester ID, and on riscv64 a confined device reaches only
   the interrupt files its domain maps ([device-management.md](device-management.md) § IOMMU
-  Discovery and Programming, § Interrupt Delivery).
+  Discovery and Programming, § Interrupt Delivery; `carve_pci_device` and `give_msix` in
+  `services/devmgr/src/bind.rs`, `services/devmgr/src/intremap.rs`, `reach_interrupt_file` in
+  `services/devmgr/src/dma.rs`).
 - A block driver that loses a request resets its device before it gives the client's memory back,
   and exits without replying when the device does not acknowledge the reset (`quiesce_device` in
   `services/drivers/virtio/blk/src/main.rs`).

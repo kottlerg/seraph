@@ -40,7 +40,10 @@ use core::prelude::rust_2024::*;
 
 use core::time::Duration;
 
-use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SyscallError};
+use syscall::MsgRegs;
+use syscall_abi::{
+    MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, MSG_REGS_DATA_MAX, SyscallError,
+};
 
 // ── IPC label constants ─────────────────────────────────────────────────────
 //
@@ -409,9 +412,9 @@ pub const MAX_PATH_LEN: usize = 4096;
 ///
 /// `ipc_recv` and the reply path of `ipc_call` return an `IpcMessage`;
 /// `ipc_call` and `ipc_reply` consume one built via [`IpcMessageBuilder`].
-/// Received data is copied out of the per-thread IPC buffer before the
-/// wrapper returns, which leaves the buffer as pure scratch at the syscall
-/// boundary — nested IPC (stdio, logging, any IPC-using helper) is safe by
+/// Received data is copied out of the message registers or the per-thread
+/// IPC buffer before the wrapper returns, which leaves the buffer as pure
+/// scratch at the syscall boundary — nested IPC (stdio, logging, any IPC-using helper) is safe by
 /// construction.
 ///
 /// Fixed-size inline payload (`MSG_DATA_WORDS_MAX` = 64 data words, 512 B)
@@ -429,7 +432,7 @@ pub struct IpcMessage
     /// Number of valid `u64` words in `data`. `<= MSG_DATA_WORDS_MAX`: every
     /// [`IpcMessageBuilder`] setter panics past the bound in every build (an
     /// empty source at an out-of-range start included), and
-    /// [`IpcMessage::from_ipc_buf`] requires it of its caller. That bound
+    /// [`IpcMessage::from_delivery`] clamps a delivered count to it. That bound
     /// (64) is far below `u8::MAX`, so the width never truncates.
     data_len: u8,
     /// Number of valid slots in `cap_slots`. `<= MSG_CAP_SLOTS_MAX` (4), far
@@ -530,105 +533,133 @@ impl IpcMessage
             .unwrap_or_default()
     }
 
-    /// Snapshot the IPC buffer into an owned `IpcMessage`.
+    /// Stage this message for `SYS_IPC_CALL` or `SYS_IPC_REPLY` by the
+    /// transport its word count selects (`syscall_abi::MSG_REGS_DATA_MAX`),
+    /// and return the message registers to send.
     ///
-    /// Reads `word_count` data words plus cap metadata from the registered
-    /// IPC buffer page. Used by the `ipc_recv` / `ipc_call` wrappers after
-    /// the kernel returns.
-    ///
-    /// # Safety
-    /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC
-    /// buffer page as registered via `ipc_buffer_set`. `word_count` must
-    /// be `<= MSG_DATA_WORDS_MAX`.
-    #[must_use]
-    pub unsafe fn from_ipc_buf(
-        ipc_buf: *const u64,
-        label: u64,
-        badge: u64,
-        word_count: usize,
-    ) -> Self
-    {
-        debug_assert!(word_count <= MSG_DATA_WORDS_MAX);
-        let mut data = [0u64; MSG_DATA_WORDS_MAX];
-        for (i, slot) in data.iter_mut().take(word_count).enumerate()
-        {
-            // SAFETY: `i < word_count <= MSG_DATA_WORDS_MAX`, so the offset
-            // stays inside the 4 KiB buffer the caller's contract names.
-            let word = unsafe { ipc_buf.add(i) };
-            // SAFETY: the caller guarantees `ipc_buf` is its mapped,
-            // page-aligned IPC buffer, and `word` lies inside it. Volatile
-            // because the kernel writes the page.
-            *slot = unsafe { core::ptr::read_volatile(word) };
-        }
-        // Cap metadata: cap_count at word[MSG_DATA_WORDS_MAX], delivered
-        // cap handles at word[MSG_CAP_HANDLES_WORD ..].
-        // SAFETY: `syscall_abi` asserts that the cap block, which follows
-        // word `MSG_DATA_WORDS_MAX`, ends inside the 4 KiB buffer.
-        let cap_count_word = unsafe { ipc_buf.add(MSG_DATA_WORDS_MAX) };
-        // SAFETY: the caller guarantees `ipc_buf` is its mapped,
-        // page-aligned IPC buffer, and `cap_count_word` lies inside it.
-        let cap_count_raw = unsafe { core::ptr::read_volatile(cap_count_word) };
-        let cap_count = (cap_count_raw as usize).min(MSG_CAP_SLOTS_MAX);
-        let mut cap_slots = [0u64; MSG_CAP_SLOTS_MAX];
-        // SAFETY: `syscall_abi` asserts that the cap block, which starts at
-        // word `MSG_CAP_HANDLES_WORD`, ends inside the 4 KiB buffer.
-        let cap_block = unsafe { ipc_buf.add(MSG_CAP_HANDLES_WORD) };
-        for (i, slot) in cap_slots.iter_mut().take(cap_count).enumerate()
-        {
-            // SAFETY: `i < cap_count <= MSG_CAP_SLOTS_MAX`, the cap block's
-            // length, so the offset stays inside the block.
-            let word = unsafe { cap_block.add(i) };
-            // SAFETY: the caller guarantees `ipc_buf` is its mapped,
-            // page-aligned IPC buffer, and `word` lies inside it.
-            *slot = unsafe { core::ptr::read_volatile(word) };
-        }
-        Self {
-            label,
-            badge,
-            data,
-            data_len: word_count as u8,
-            cap_count: cap_count as u8,
-            cap_slots,
-        }
-    }
-
-    /// Write the populated data words and the cap handles to transfer into
-    /// the IPC buffer.
-    ///
-    /// Used by the `ipc_call` / `ipc_reply` wrappers before issuing the
-    /// syscall. The handles go to the cap block (word
-    /// `MSG_CAP_HANDLES_WORD` on), where the kernel reads the `cap_count`
-    /// the syscall names; the count itself travels in a register. The
-    /// kernel installs the caps in the receiver and writes the
-    /// receiver-side handles into the receiver's buffer.
+    /// A message of at most `MSG_REGS_DATA_MAX` data words carries them in the
+    /// returned registers and writes no data word of the IPC buffer; a longer
+    /// one writes them to the buffer's data words and returns zeroed
+    /// registers, which the kernel ignores. The cap handles to transfer go to
+    /// the buffer's cap block (word `MSG_CAP_HANDLES_WORD` on), where the
+    /// kernel reads the `cap_count` the syscall names; the count itself
+    /// travels in a register. A message within the registers with no caps
+    /// writes nothing to the buffer.
     ///
     /// # Safety
     /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC
     /// buffer page as registered via `ipc_buffer_set`.
-    pub unsafe fn write_to_ipc_buf(&self, ipc_buf: *mut u64)
+    #[must_use]
+    pub unsafe fn stage_send(&self, ipc_buf: *mut u64) -> MsgRegs
     {
-        for (i, &val) in self.words().iter().enumerate()
+        let mut regs = [0u64; MSG_REGS_DATA_MAX];
+        if self.word_count() <= MSG_REGS_DATA_MAX
         {
-            // SAFETY: `words()` is a bounds-checked sub-slice of the
-            // `MSG_DATA_WORDS_MAX`-word `data` array, so
-            // `i < MSG_DATA_WORDS_MAX` and the offset is within the
-            // 4 KiB buffer.
-            let word = unsafe { ipc_buf.add(i) };
-            // SAFETY: the caller guarantees `ipc_buf` is its mapped,
-            // page-aligned IPC buffer, and `word` lies inside it.
-            unsafe { core::ptr::write_volatile(word, val) };
+            for (reg, &val) in regs.iter_mut().zip(self.words())
+            {
+                *reg = val;
+            }
         }
-        // SAFETY: `syscall_abi` asserts that the cap block, which starts at
-        // word `MSG_CAP_HANDLES_WORD`, ends inside the 4 KiB buffer.
-        let cap_block = unsafe { ipc_buf.add(MSG_CAP_HANDLES_WORD) };
-        for (i, &handle) in self.caps().iter().enumerate()
+        else
         {
-            // SAFETY: `caps()` holds at most MSG_CAP_SLOTS_MAX handles, the
-            // cap block's length, so the offset stays inside the block.
-            let word = unsafe { cap_block.add(i) };
-            // SAFETY: the caller guarantees `ipc_buf` is its mapped,
-            // page-aligned IPC buffer, and `word` lies inside it.
-            unsafe { core::ptr::write_volatile(word, handle) };
+            for (i, &val) in self.words().iter().enumerate()
+            {
+                // SAFETY: `words()` is a bounds-checked sub-slice of the
+                // `MSG_DATA_WORDS_MAX`-word `data` array, so
+                // `i < MSG_DATA_WORDS_MAX` and the offset is within the
+                // 4 KiB buffer.
+                let word = unsafe { ipc_buf.add(i) };
+                // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+                // page-aligned IPC buffer, and `word` lies inside it.
+                unsafe { core::ptr::write_volatile(word, val) };
+            }
+        }
+        if !self.caps().is_empty()
+        {
+            // SAFETY: `syscall_abi` asserts that the cap block, which starts
+            // at word `MSG_CAP_HANDLES_WORD`, ends inside the 4 KiB buffer.
+            let cap_block = unsafe { ipc_buf.add(MSG_CAP_HANDLES_WORD) };
+            for (i, &handle) in self.caps().iter().enumerate()
+            {
+                // SAFETY: `caps()` holds at most MSG_CAP_SLOTS_MAX handles,
+                // the cap block's length, so the offset stays inside the
+                // block.
+                let word = unsafe { cap_block.add(i) };
+                // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+                // page-aligned IPC buffer, and `word` lies inside it.
+                unsafe { core::ptr::write_volatile(word, handle) };
+            }
+        }
+        regs
+    }
+
+    /// Snapshot a delivered message (`SYS_IPC_CALL`'s reply or
+    /// `SYS_IPC_RECV`'s message) into an owned `IpcMessage`.
+    ///
+    /// The data words come from the delivery's message registers when it
+    /// has at most `MSG_REGS_DATA_MAX` of them, and from the IPC buffer's
+    /// data words otherwise. The delivered cap handles are read from the
+    /// buffer's cap result block only when the delivery's capability count,
+    /// carried in its count register, is non-zero: the kernel writes the
+    /// block only then, so the block of an earlier delivery is never read as
+    /// this one's. Used by the `ipc_recv` / `ipc_call` wrappers after the
+    /// kernel returns.
+    ///
+    /// # Safety
+    /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC
+    /// buffer page as registered via `ipc_buffer_set`.
+    #[must_use]
+    pub unsafe fn from_delivery(ipc_buf: *const u64, delivery: &syscall::IpcDelivery) -> Self
+    {
+        let word_count = delivery.data_count.min(MSG_DATA_WORDS_MAX);
+        let mut data = [0u64; MSG_DATA_WORDS_MAX];
+        if word_count <= MSG_REGS_DATA_MAX
+        {
+            for (slot, &reg) in data.iter_mut().zip(delivery.regs.iter().take(word_count))
+            {
+                *slot = reg;
+            }
+        }
+        else
+        {
+            for (i, slot) in data.iter_mut().take(word_count).enumerate()
+            {
+                // SAFETY: `i < word_count <= MSG_DATA_WORDS_MAX`, so the
+                // offset stays inside the 4 KiB buffer the caller's contract
+                // names.
+                let word = unsafe { ipc_buf.add(i) };
+                // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+                // page-aligned IPC buffer, and `word` lies inside it.
+                // Volatile because the kernel writes the page.
+                *slot = unsafe { core::ptr::read_volatile(word) };
+            }
+        }
+        let cap_count = delivery.cap_count.min(MSG_CAP_SLOTS_MAX);
+        let mut cap_slots = [0u64; MSG_CAP_SLOTS_MAX];
+        if cap_count > 0
+        {
+            // Delivered cap handles at word[MSG_CAP_HANDLES_WORD ..].
+            // SAFETY: `syscall_abi` asserts that the cap block, which starts
+            // at word `MSG_CAP_HANDLES_WORD`, ends inside the 4 KiB buffer.
+            let cap_block = unsafe { ipc_buf.add(MSG_CAP_HANDLES_WORD) };
+            for (i, slot) in cap_slots.iter_mut().take(cap_count).enumerate()
+            {
+                // SAFETY: `i < cap_count <= MSG_CAP_SLOTS_MAX`, the cap
+                // block's length, so the offset stays inside the block.
+                let word = unsafe { cap_block.add(i) };
+                // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+                // page-aligned IPC buffer, and `word` lies inside it.
+                *slot = unsafe { core::ptr::read_volatile(word) };
+            }
+        }
+        Self {
+            label: delivery.label,
+            badge: delivery.badge,
+            data,
+            // Both counts are clamped above to bounds far below `u8::MAX`.
+            data_len: u8::try_from(word_count).unwrap_or(u8::MAX),
+            cap_count: u8::try_from(cap_count).unwrap_or(u8::MAX),
+            cap_slots,
         }
     }
 }
@@ -840,10 +871,12 @@ impl IpcMessageBuilder
 
 /// Synchronous IPC call on an endpoint, returning a stack-owned reply snapshot.
 ///
-/// Writes `msg`'s payload into the registered IPC buffer, issues
-/// `SYS_IPC_CALL`, then copies the reply (label + data words + cap metadata)
-/// back out of the buffer into a fresh [`IpcMessage`]. After return the IPC
-/// buffer is scratch — nested IPC (stdio, logging, any IPC-using helper)
+/// Stages `msg`'s payload ([`IpcMessage::stage_send`]: data words in the
+/// message registers or the registered IPC buffer by their count, cap
+/// handles in the buffer), issues `SYS_IPC_CALL`, then copies the reply
+/// (label + data words + cap handles) out of the registers and the buffer
+/// into a fresh [`IpcMessage`] ([`IpcMessage::from_delivery`]). After return
+/// the IPC buffer is scratch — nested IPC (stdio, logging, any IPC-using helper)
 /// cannot clobber the returned message.
 ///
 /// The endpoint cap must have `EpRights::GRANT` when `msg.caps()` is non-empty.
@@ -895,20 +928,19 @@ pub unsafe fn ipc_call_timeout(
 ) -> Result<IpcMessage, i64>
 {
     // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
-    unsafe {
-        msg.write_to_ipc_buf(ipc_buf);
-    }
-    let (reply_label, reply_word_count) = syscall::raw_ipc_call_timeout(
+    let regs = unsafe { msg.stage_send(ipc_buf) };
+    let reply = syscall::raw_ipc_call_timeout(
         ep,
         msg.label,
         msg.word_count(),
         msg.caps().len(),
         timeout_ms,
+        &regs,
     )?;
-    // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote the
-    // reply (data + cap metadata) into it before return. `reply_word_count`
-    // is already clamped to MSG_DATA_WORDS_MAX by `raw_ipc_call`.
-    Ok(unsafe { IpcMessage::from_ipc_buf(ipc_buf, reply_label, 0, reply_word_count) })
+    // SAFETY: `ipc_buf` is the registered IPC buffer; the kernel wrote a
+    // reply beyond MSG_REGS_DATA_MAX words and any delivered cap handles into
+    // it before return.
+    Ok(unsafe { IpcMessage::from_delivery(ipc_buf, &reply) })
 }
 
 /// The `SYS_IPC_CALL` timeout of a call made with `left` of its caller's
@@ -978,8 +1010,9 @@ pub unsafe fn ipc_call_within(
 /// Receive on an endpoint cap, returning a stack-owned message snapshot.
 ///
 /// Blocks until a caller sends. Copies the message (label, badge, data
-/// words, cap metadata) from the registered IPC buffer into a fresh
-/// [`IpcMessage`] before returning. After return the IPC buffer is scratch
+/// words, cap handles) out of the message registers and the registered IPC
+/// buffer into a fresh [`IpcMessage`] ([`IpcMessage::from_delivery`]) before
+/// returning. After return the IPC buffer is scratch
 /// — nested IPC between `ipc_recv` and reading the message is safe.
 ///
 /// A reply still pending from an earlier receive is released once the
@@ -1036,11 +1069,11 @@ pub unsafe fn ipc_recv_timeout(
     timeout_ms: u64,
 ) -> Result<IpcMessage, i64>
 {
-    let (label, badge, word_count) = syscall::raw_ipc_recv_timeout(ep, timeout_ms)?;
-    // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote data +
-    // cap metadata there before return. `word_count` is already clamped to
-    // MSG_DATA_WORDS_MAX by `raw_ipc_recv_timeout`.
-    Ok(unsafe { IpcMessage::from_ipc_buf(ipc_buf, label, badge, word_count) })
+    let delivery = syscall::raw_ipc_recv_timeout(ep, timeout_ms)?;
+    // SAFETY: `ipc_buf` is the registered IPC buffer; the kernel wrote a
+    // message beyond MSG_REGS_DATA_MAX words and any delivered cap handles
+    // there before return.
+    Ok(unsafe { IpcMessage::from_delivery(ipc_buf, &delivery) })
 }
 
 /// Receive a call already waiting on `ep` without blocking
@@ -1060,8 +1093,10 @@ pub unsafe fn ipc_try_recv(ep: u64, ipc_buf: *mut u64) -> Result<IpcMessage, i64
 
 /// Reply to the current thread's pending caller with `msg`.
 ///
-/// Writes `msg`'s data words into the registered IPC buffer, then issues
-/// `SYS_IPC_REPLY` with `msg.word_count()` words and `msg.caps()` cap slots.
+/// Stages `msg`'s payload ([`IpcMessage::stage_send`]: data words in the
+/// message registers or the registered IPC buffer by their count, cap
+/// handles in the buffer), then issues `SYS_IPC_REPLY` with
+/// `msg.word_count()` words and `msg.caps()` cap slots.
 /// Cap slots move from the server's `CSpace` to the caller's `CSpace`
 /// all-or-nothing with the reply. An `Err` return consumes the pending
 /// reply either way: when a caller was claimed it has already been woken
@@ -1090,16 +1125,168 @@ pub unsafe fn ipc_try_recv(ep: u64, ipc_buf: *mut u64) -> Result<IpcMessage, i64
 pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 {
     // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
-    unsafe {
-        msg.write_to_ipc_buf(ipc_buf);
-    }
-    syscall::raw_ipc_reply(msg.label, msg.word_count(), msg.caps().len())
+    let regs = unsafe { msg.stage_send(ipc_buf) };
+    syscall::raw_ipc_reply(msg.label, msg.word_count(), msg.caps().len(), &regs)
 }
 
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    /// A 4 KiB-aligned stand-in for a thread's IPC buffer page.
+    #[repr(C, align(4096))]
+    struct FakePage([u64; 512]);
+
+    /// A word no staging or delivery writes, to show which words were left alone.
+    const SENTINEL: u64 = 0x5E5E_5E5E_5E5E_5E5E;
+
+    /// A message of `words` data words `0x100 + i` and one cap.
+    fn message_of(words: usize) -> IpcMessage
+    {
+        let msg = (0..words).fold(IpcMessage::builder(7), |b, i| b.word(i, 0x100 + i as u64));
+        msg.cap(0xCA9).build()
+    }
+
+    // The defects caught: a short message that still writes the buffer's data
+    // words (or a long one that sends them in registers, which the kernel
+    // ignores past MSG_REGS_DATA_MAX), registers that carry a word past the
+    // count, and cap handles that miss the cap block on either transport.
+    #[test]
+    fn staging_selects_the_transport_by_word_count()
+    {
+        for words in [
+            0,
+            MSG_REGS_DATA_MAX,
+            MSG_REGS_DATA_MAX + 1,
+            MSG_DATA_WORDS_MAX,
+        ]
+        {
+            let msg = message_of(words);
+            let mut page = FakePage([SENTINEL; 512]);
+            // SAFETY: `page` is a 4 KiB-aligned page no Rust reference covers
+            // during the call.
+            let regs = unsafe { msg.stage_send(core::ptr::addr_of_mut!(page.0).cast::<u64>()) };
+            let data = page.0.get(..MSG_DATA_WORDS_MAX).unwrap_or_default();
+            if words <= MSG_REGS_DATA_MAX
+            {
+                assert_eq!(
+                    regs.get(..words),
+                    Some(msg.words()),
+                    "{words} words in registers"
+                );
+                assert!(
+                    regs.iter().skip(words).all(|&r| r == 0),
+                    "{words}: no word past the count"
+                );
+                assert!(
+                    data.iter().all(|&w| w == SENTINEL),
+                    "{words}: buffer data words untouched"
+                );
+            }
+            else
+            {
+                assert_eq!(regs, [0; MSG_REGS_DATA_MAX], "{words}: registers unused");
+                assert_eq!(
+                    data.get(..words),
+                    Some(msg.words()),
+                    "{words} words in the buffer"
+                );
+                assert!(
+                    data.iter().skip(words).all(|&w| w == SENTINEL),
+                    "{words}: no word past the count"
+                );
+            }
+            assert_eq!(
+                page.0.get(MSG_CAP_HANDLES_WORD),
+                Some(&0xCA9),
+                "{words}: cap block"
+            );
+        }
+    }
+
+    // The defects caught: a delivery read from the wrong transport for its
+    // count (a short message read from a stale buffer, a long one from the
+    // registers) or past its count.
+    #[test]
+    fn a_delivery_reads_its_words_from_the_transport_its_count_selects()
+    {
+        let mut page = FakePage([SENTINEL; 512]);
+        for (i, word) in page.0.iter_mut().take(MSG_DATA_WORDS_MAX).enumerate()
+        {
+            *word = 0x200 + i as u64;
+        }
+        let regs: MsgRegs = core::array::from_fn(|i| 0x300 + i as u64);
+        for words in [
+            0,
+            MSG_REGS_DATA_MAX,
+            MSG_REGS_DATA_MAX + 1,
+            MSG_DATA_WORDS_MAX,
+        ]
+        {
+            let delivery = syscall::IpcDelivery {
+                label: 9,
+                badge: 3,
+                data_count: words,
+                cap_count: 0,
+                regs,
+            };
+            // SAFETY: `page` is a 4 KiB-aligned page no Rust reference covers
+            // during the call.
+            let msg = unsafe {
+                IpcMessage::from_delivery(core::ptr::addr_of!(page.0).cast::<u64>(), &delivery)
+            };
+            assert_eq!((msg.label, msg.badge, msg.word_count()), (9, 3, words));
+            let expected = if words <= MSG_REGS_DATA_MAX
+            {
+                regs.get(..words)
+            }
+            else
+            {
+                page.0.get(..words)
+            };
+            assert_eq!(
+                Some(msg.words()),
+                expected,
+                "{words} words from their transport"
+            );
+            if words < MSG_DATA_WORDS_MAX
+            {
+                assert_eq!(msg.word(words), 0, "{words}: nothing read past the count");
+            }
+        }
+    }
+
+    // The defect caught: a capless delivery that reads the cap result block a
+    // cap-carrying delivery left in the buffer, so stale handles surface as
+    // this message's caps.
+    #[test]
+    fn a_capless_delivery_ignores_a_stale_cap_result_block()
+    {
+        let mut page = FakePage([SENTINEL; 512]);
+        if let Some(block) = page.0.get_mut(MSG_DATA_WORDS_MAX..MSG_CAP_HANDLES_WORD + 2)
+        {
+            block.copy_from_slice(&[2, 0xA1, 0xA2]);
+        }
+        let delivery = |cap_count| syscall::IpcDelivery {
+            label: 1,
+            badge: 0,
+            data_count: 0,
+            cap_count,
+            regs: [0; MSG_REGS_DATA_MAX],
+        };
+        let buf = core::ptr::addr_of!(page.0).cast::<u64>();
+        // SAFETY: `buf` is a 4 KiB-aligned page no Rust reference covers
+        // during the call.
+        let with = unsafe { IpcMessage::from_delivery(buf, &delivery(2)) };
+        // SAFETY: as for the call above.
+        let without = unsafe { IpcMessage::from_delivery(buf, &delivery(0)) };
+        assert_eq!(with.caps(), &[0xA1, 0xA2]);
+        assert!(
+            without.caps().is_empty(),
+            "a stale block is not this delivery's"
+        );
+    }
 
     // The defect caught: a call that ends before its caller's deadline (a
     // time left rounded down, or under a millisecond read as no timeout at

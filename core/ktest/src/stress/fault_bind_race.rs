@@ -43,9 +43,9 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use syscall::{
-    RIGHTS_ALL, cap_create_endpoint, cap_create_thread, cap_delete, cap_derive_badge, raw_ipc_call,
-    raw_ipc_recv, raw_ipc_reply, system_info, thread_configure, thread_exit, thread_set_affinity,
-    thread_set_fault_handler, thread_start,
+    IpcDelivery, MsgRegs, RIGHTS_ALL, cap_create_endpoint, cap_create_thread, cap_delete,
+    cap_derive_badge, raw_ipc_call, raw_ipc_recv, raw_ipc_reply, system_info, thread_configure,
+    thread_exit, thread_set_affinity, thread_set_fault_handler, thread_start,
 };
 use syscall_abi::{
     EXIT_FAULT_BASE, FAULT_CLASS_ALL, FAULT_LABEL, FAULT_REPLY_RESUME, SyscallError, SystemInfoType,
@@ -122,7 +122,7 @@ impl Parts
         {
             if let (Some(cap), Some(_)) = (badged, handler)
             {
-                raw_ipc_call(*cap, QUIT_LABEL, 0, 0).ok();
+                raw_ipc_call(*cap, QUIT_LABEL, 0, 0, &MsgRegs::default()).ok();
             }
         }
         for cap in [self.faulter.take()]
@@ -347,7 +347,7 @@ extern "C" fn handler_entry(arg: u64) -> !
     {
         match raw_ipc_recv(args.ep)
         {
-            Ok((label, badge, _)) if label == FAULT_LABEL =>
+            Ok(IpcDelivery { label, badge, .. }) if label == FAULT_LABEL =>
             {
                 if badge != args.badge
                 {
@@ -356,11 +356,11 @@ extern "C" fn handler_entry(arg: u64) -> !
                 served.fetch_add(1, Ordering::AcqRel);
                 // A reply that fails found the fault cancelled (its faulter
                 // killed), which this test causes by design.
-                raw_ipc_reply(FAULT_REPLY_RESUME, 0, 0).ok();
+                raw_ipc_reply(FAULT_REPLY_RESUME, 0, 0, &MsgRegs::default()).ok();
             }
-            Ok((label, _, _)) =>
+            Ok(IpcDelivery { label, .. }) =>
             {
-                raw_ipc_reply(label, 0, 0).ok();
+                raw_ipc_reply(label, 0, 0, &MsgRegs::default()).ok();
                 if label == QUIT_LABEL
                 {
                     break;

@@ -564,6 +564,18 @@ pub fn run_all(ctx: &TestContext)
     );
     run_test!("ipc::call_with_data_words", ipc::call_with_data_words(ctx));
     run_test!(
+        "ipc::regs_round_trip_no_buffer",
+        ipc::regs_round_trip_no_buffer(ctx)
+    );
+    run_test!(
+        "ipc::regs_and_buffer_delivery",
+        ipc::regs_and_buffer_delivery(ctx)
+    );
+    run_test!(
+        "ipc::fault_message_in_registers",
+        ipc::fault_message_in_registers(ctx)
+    );
+    run_test!(
         "ipc::call_with_cap_transfer",
         ipc::call_with_cap_transfer(ctx)
     );

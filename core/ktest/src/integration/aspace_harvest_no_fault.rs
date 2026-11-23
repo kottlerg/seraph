@@ -16,8 +16,9 @@
 //!   - stores to pages 1 and 3 and loads from page 4;
 //!   - calls `SYS_GETRANDOM` into page 5, a kernel copy into a page with A
 //!     clear;
-//!   - receives the harness's call, whose data words the kernel writes into
-//!     its IPC buffer on page 7, another such page, and checks them.
+//!   - receives the harness's call, whose data words, more than travel in the
+//!     message registers, the kernel writes into its IPC buffer on page 7,
+//!     another such page, and checks them.
 //!
 //! On riscv64 under Svade each of those accesses to a page with A clear faults
 //! into the kernel, which sets A and retries without delivering the fault to
@@ -35,7 +36,7 @@ use syscall::{
     notification_wait, notification_wait_timeout, thread_exit, wait_set_add, wait_set_create,
     wait_set_try_wait, wait_set_wait_timeout,
 };
-use syscall_abi::{PAGE_SIZE, RIGHTS_ALL};
+use syscall_abi::{MSG_REGS_DATA_MAX, PAGE_SIZE, RIGHTS_ALL};
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -68,12 +69,16 @@ const WAIT_MS: u64 = 2000;
 /// Bytes the child asks `SYS_GETRANDOM` for.
 const RANDOM_LEN: usize = 32;
 
-/// The data words the harness sends and the child checks.
-const PATTERN: [u64; 4] = [
+/// The data words the harness sends and the child checks:
+/// `MSG_REGS_DATA_MAX + 1` of them, so the message travels in the IPC buffer.
+const PATTERN: [u64; MSG_REGS_DATA_MAX + 1] = [
     0x1111_1111_1111_1111,
     0x2222_2222_2222_2222,
     0x3333_3333_3333_3333,
     0x4444_4444_4444_4444,
+    0x5555_5555_5555_5555,
+    0x6666_6666_6666_6666,
+    0x7777_7777_7777_7777,
 ];
 
 /// The child's arguments, by address.

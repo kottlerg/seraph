@@ -143,12 +143,15 @@ impl Record
 }
 
 /// One measured window: an opening and a closing read of a program, as
-/// indices into the record's reads, and the sample their values make.
+/// indices into the record's reads, the addresses of the two reads (the
+/// window's site: the measurement loop that read them), and the sample their
+/// values make.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Window
 {
     pub open: usize,
     pub close: usize,
+    pub site: (u64, u64),
     pub sample: u64,
 }
 
@@ -181,6 +184,7 @@ pub fn windows(record: &Record, in_program: impl Fn(u64) -> bool) -> Result<Vec<
         out.push(Window {
             open,
             close,
+            site: (a.pc, b.pc),
             sample,
         });
     }
@@ -193,48 +197,187 @@ pub struct Row
 {
     pub key: Key,
     pub summary: Summary,
+    /// The warm-up windows before the row's samples, which the benchmark
+    /// read and did not keep.
+    pub warm_up: usize,
     /// Indices into the program's windows.
     pub windows: Range<usize>,
 }
 
-/// Divide a program's windows among its result lines, in order: each line
-/// takes the next `n` windows, and their samples must summarize to the
-/// line's.
+/// The line a division of the windows got furthest to and why it failed
+/// there.
+#[derive(Default)]
+struct Miss
+{
+    line: usize,
+    why: String,
+}
+
+/// Divide a program's windows among its result lines, in order.
+///
+/// A benchmark measures in a loop that reads the counter at the same two
+/// addresses on every iteration, and runs a fixed number of warm-up
+/// iterations, read as its samples are but not kept, before the `n` samples
+/// of each line. The windows therefore fall into runs of one site, each the
+/// windows of one or more consecutive lines (`ubench.ipc_rt`'s four lines
+/// share one loop). A run of `T` windows taken by `k` lines of `n_1..n_k`
+/// samples gives each line `(T - Σn) / k` warm-up windows, then its samples.
+/// The division is the one in which every line's samples summarize to the
+/// line's own summary, trying for each run the most lines first.
 ///
 /// # Errors
-/// Too few windows for the lines, or a line whose windows' summary is not
-/// its own: the pairing of the reads is not the program's.
+/// No division of the windows into the lines' samples summarizes to every
+/// line: the pairing of the reads is not the program's, or a benchmark does
+/// not keep the last `n` windows of its loop.
 pub fn rows(lines: &[(Key, Summary)], windows: &[Window]) -> Result<Vec<Row>>
 {
-    let mut out = Vec::with_capacity(lines.len());
-    let mut next = 0usize;
-    for (key, summary) in lines
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    for (i, w) in windows.iter().enumerate()
     {
-        let n = usize::try_from(summary.n)?;
-        let end = next.checked_add(n).context("a sample count out of range")?;
-        let Some(taken) = windows.get(next..end)
+        let same = runs
+            .last()
+            .and_then(|run| windows.get(run.start))
+            .is_some_and(|first| first.site == w.site);
+        match runs.last_mut()
+        {
+            Some(run) if same => run.end = i.saturating_add(1),
+            _ => runs.push(i..i.saturating_add(1)),
+        }
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    let mut miss = Miss::default();
+    if divide(lines, 0, windows, &runs, &mut out, &mut miss)?
+    {
+        return Ok(out);
+    }
+    let at = lines
+        .get(miss.line)
+        .map_or_else(|| "the lines".to_owned(), |(key, _)| key.to_string());
+    bail!(
+        "{at}: no division of the program's {} windows ({} runs of one site) among its {} lines \
+         summarizes to every line: {}",
+        windows.len(),
+        runs.len(),
+        lines.len(),
+        miss.why
+    )
+}
+
+impl Miss
+{
+    /// Note that line `line` failed for `why`, unless a division got further.
+    fn note(&mut self, line: usize, why: impl FnOnce() -> String)
+    {
+        if line >= self.line
+        {
+            *self = Self { line, why: why() };
+        }
+    }
+}
+
+/// Give the first of `runs` to the most of `lines` (the program's lines
+/// from index `first`) whose samples it holds, then the rest in turn.
+fn divide(
+    lines: &[(Key, Summary)],
+    first: usize,
+    windows: &[Window],
+    runs: &[Range<usize>],
+    out: &mut Vec<Row>,
+    miss: &mut Miss,
+) -> Result<bool>
+{
+    let Some((run, rest)) = runs.split_first()
+    else
+    {
+        if lines.is_empty()
+        {
+            return Ok(true);
+        }
+        miss.note(first, || "no windows are left for it".to_owned());
+        return Ok(false);
+    };
+    // The line counts whose samples fit the run with an equal warm-up each,
+    // and that warm-up.
+    let mut fits = Vec::new();
+    let mut need = 0usize;
+    for (taken, (_, summary)) in (1usize..).zip(lines)
+    {
+        need = need
+            .checked_add(usize::try_from(summary.n)?)
+            .context("a sample count out of range")?;
+        let Some(spare) = run.len().checked_sub(need)
         else
         {
-            bail!(
-                "{key}: {n} samples, but {} windows are left of the program's reads",
-                windows.len().saturating_sub(next)
-            );
+            break;
         };
-        let mut samples: Vec<u64> = taken.iter().map(|w| w.sample).collect();
-        let got = bench::summarize(&mut samples);
-        ensure!(
-            got.as_ref() == Some(summary),
-            "{key}: the windows read for its {n} samples summarize to {got:?}, not to the \
-             line's {summary:?}: the reads are not paired as the benchmark paired them"
-        );
-        out.push(Row {
-            key: key.clone(),
-            summary: *summary,
-            windows: next..end,
-        });
-        next = end;
+        if spare.is_multiple_of(taken)
+        {
+            fits.push((taken, spare.checked_div(taken).unwrap_or(0)));
+        }
     }
-    Ok(out)
+    if fits.is_empty()
+    {
+        miss.note(first, || {
+            format!(
+                "the run of windows {}..{} holds too few for its samples",
+                run.start, run.end
+            )
+        });
+    }
+    for &(taken, warm_up) in fits.iter().rev()
+    {
+        let mark = out.len();
+        let mut next = run.start;
+        let mut kept = true;
+        for (line, (key, summary)) in (first..).zip(lines.iter().take(taken))
+        {
+            let start = next
+                .checked_add(warm_up)
+                .context("a window index out of range")?;
+            let end = start
+                .checked_add(usize::try_from(summary.n)?)
+                .context("a window index out of range")?;
+            let mut samples: Vec<u64> = windows
+                .get(start..end)
+                .context("a run past the windows")?
+                .iter()
+                .map(|w| w.sample)
+                .collect();
+            let got = bench::summarize(&mut samples);
+            if got.as_ref() != Some(summary)
+            {
+                miss.note(line, || {
+                    format!(
+                        "after {warm_up} warm-up windows, windows {start}..{end} summarize to \
+                         {got:?}, not to the line's {summary:?}"
+                    )
+                });
+                kept = false;
+                break;
+            }
+            out.push(Row {
+                key: key.clone(),
+                summary: *summary,
+                warm_up,
+                windows: start..end,
+            });
+            next = end;
+        }
+        if kept
+            && divide(
+                lines.get(taken..).unwrap_or_default(),
+                first.saturating_add(taken),
+                windows,
+                rest,
+                out,
+                miss,
+            )?
+        {
+            return Ok(true);
+        }
+        out.truncate(mark);
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -277,11 +420,13 @@ R 1000 2 23
                 Window {
                     open: 0,
                     close: 1,
+                    site: (0x1000, 0x1000),
                     sample: 5
                 },
                 Window {
                     open: 2,
                     close: 4,
+                    site: (0x1000, 0x1000),
                     sample: 4
                 },
             ]
@@ -329,11 +474,12 @@ R 1000 2 23
         windows(&record, |_| true).unwrap_err();
     }
 
-    fn window(sample: u64) -> Window
+    fn window(site: u64, sample: u64) -> Window
     {
         Window {
             open: 0,
             close: 1,
+            site: (site, site + 8),
             sample,
         }
     }
@@ -343,10 +489,15 @@ R 1000 2 23
         bench::summarize(&mut samples.to_vec()).unwrap()
     }
 
+    fn at(site: u64, samples: &[u64]) -> Vec<Window>
+    {
+        samples.iter().map(|&s| window(site, s)).collect()
+    }
+
     #[test]
     fn rows_take_their_windows_in_turn()
     {
-        let ws: Vec<Window> = [5, 6, 5, 9, 9].into_iter().map(window).collect();
+        let ws = [at(1, &[5, 6, 5]), at(2, &[9, 9])].concat();
         let lines = [
             (key("a"), summary(&[5, 6, 5])),
             (key("b"), summary(&[9, 9])),
@@ -358,17 +509,39 @@ R 1000 2 23
     }
 
     #[test]
+    fn rows_of_one_loop_skip_an_equal_warm_up_each()
+    {
+        // Two lines of one site, two warm-up windows before each line's
+        // samples, then a line of its own site with none.
+        let ws = [at(1, &[90, 80, 5, 6, 5, 70, 60, 7, 8]), at(2, &[9, 9])].concat();
+        let lines = [
+            (key("a"), summary(&[5, 6, 5])),
+            (key("b"), summary(&[7, 8])),
+            (key("c"), summary(&[9, 9])),
+        ];
+        let got = rows(&lines, &ws).unwrap();
+        let spans: Vec<(usize, Range<usize>)> =
+            got.iter().map(|r| (r.warm_up, r.windows.clone())).collect();
+        assert_eq!(spans, [(2, 2..5), (2, 7..9), (0, 9..11)]);
+    }
+
+    #[test]
     fn rows_whose_windows_do_not_summarize_to_the_line_are_refused()
     {
-        let ws: Vec<Window> = [5, 6, 5, 9].into_iter().map(window).collect();
         // One window short.
+        let ws = [at(1, &[5, 6, 5]), at(2, &[9])].concat();
         let lines = [
             (key("a"), summary(&[5, 6, 5])),
             (key("b"), summary(&[9, 9])),
         ];
         rows(&lines, &ws).unwrap_err();
-        // Misaligned: the first line's samples are not the first windows'.
+        // Misaligned: the line's samples are not the run's last windows.
+        let ws = at(1, &[6, 5, 9, 1]);
         let lines = [(key("a"), summary(&[6, 5, 9]))];
+        rows(&lines, &ws).unwrap_err();
+        // A run that no line takes.
+        let ws = [at(1, &[5, 6, 5]), at(2, &[9, 9])].concat();
+        let lines = [(key("a"), summary(&[5, 6, 5]))];
         rows(&lines, &ws).unwrap_err();
     }
 }

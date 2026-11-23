@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 
-use crate::class::{Arch, Class, Dest, classify, user_half};
+use crate::class::{Arch, Class, Dest, Unit, classify, user_half};
 use crate::record::Event;
 
 /// The longest instruction a slot's key holds: x86-64's.
@@ -59,6 +59,9 @@ pub struct Recorder<W: Write>
     /// The slot executed last, until a trap's discontinuity is seen.
     last: Option<u32>,
     pending: Option<Pending>,
+    /// An instruction of a unit the kernel can turn off that trapped, and
+    /// the unit, until the unit's state is read at the next instruction.
+    trapped: Option<(u64, Unit)>,
     /// Each histogram written, by the hash of its entries.
     hists: HashMap<u128, u64>,
     /// The first write error; nothing is written after it.
@@ -97,6 +100,7 @@ impl<W: Write> Recorder<W>
             touched: Vec::new(),
             last: None,
             pending: None,
+            trapped: None,
             hists: HashMap::new(),
             error: None,
         };
@@ -243,11 +247,17 @@ impl<W: Write> Recorder<W>
 
     /// The discontinuity callback: control left the instruction stream from
     /// `from`. When `from` is the instruction executed last and it does not
-    /// trap by design, a trap interrupted it: [`Event::Attempt`]. The next
-    /// attempt then needs a new execution, so a trap that QEMU reports twice
-    /// from the instruction is one attempt; a report from another address (a
-    /// block's start, or the next instruction, which an interrupt between
-    /// instructions names) leaves the instruction executed last as it was.
+    /// trap by design, a trap interrupted it. The next attempt then needs a
+    /// new execution, so a trap that QEMU reports twice from the instruction
+    /// is one attempt; a report from another address (a block's start, or the
+    /// next instruction, which an interrupt between instructions names) leaves
+    /// the instruction executed last as it was.
+    ///
+    /// The counter did not count the attempt ([`Event::Attempt`]) unless
+    /// QEMU's translator refused the instruction: one of a unit the kernel had
+    /// turned off, whose trap the translator raises at the end of a block
+    /// whose instructions icount has already counted. Such an attempt waits
+    /// for [`Recorder::state`].
     pub fn discon(&mut self, from: u64)
     {
         let Some(index) = self.last
@@ -255,14 +265,59 @@ impl<W: Write> Recorder<W>
         {
             return;
         };
-        let attempt = self
+        let Some(class) = self
             .slots
             .get(index as usize)
-            .is_some_and(|s| s.pc == from && s.class != Class::Trap);
-        if attempt
+            .filter(|s| s.pc == from && s.class != Class::Trap)
+            .map(|s| s.class)
+        else
         {
-            self.last = None;
+            return;
+        };
+        self.last = None;
+        if let Class::Unit(unit) = class
+        {
+            self.trapped = Some((from, unit));
+        }
+        else
+        {
             self.emit(&Event::Attempt { pc: from });
+        }
+    }
+
+    /// The unit of an instruction that trapped, while its state is due.
+    #[must_use]
+    pub fn trapped(&self) -> Option<Unit>
+    {
+        self.trapped.map(|(_, unit)| unit)
+    }
+
+    /// The state callback, at the instruction after the trap: `state` is the
+    /// trapped unit's [`Unit::state_register`] (`None` when the plugin could
+    /// not read it, which ends the record with the error). An attempt made
+    /// while its unit was on (a fault of its memory access) is
+    /// [`Event::Attempt`]; one the unit's being off refused was counted.
+    pub fn state(&mut self, state: Option<u64>)
+    {
+        let Some((pc, unit)) = self.trapped.take()
+        else
+        {
+            return;
+        };
+        match state
+        {
+            Some(state) if unit.off(state) =>
+            {}
+            Some(_) => self.emit(&Event::Attempt { pc }),
+            None =>
+            {
+                if self.error.is_none()
+                {
+                    self.error = Some(io::Error::other(format!(
+                        "the state of the unit of the instruction at {pc:#x} could not be read"
+                    )));
+                }
+            }
         }
     }
 
@@ -321,7 +376,7 @@ impl<W: Write> Recorder<W>
 mod tests
 {
     use super::Recorder;
-    use crate::class::{Arch, Class, Dest};
+    use crate::class::{Arch, Class, Dest, Unit};
     use crate::record::{Event, parse};
 
     /// The events `recorder` wrote, header first.
@@ -483,6 +538,39 @@ mod tests
                 Event::Attempt { pc: 0x1004 },
             ]
         );
+    }
+
+    #[test]
+    fn a_unit_instruction_refused_while_its_unit_is_off_was_counted()
+    {
+        let mut r = Recorder::new(Arch::Riscv64, Vec::new());
+        // vl1re64.v v8, (a4).
+        let (load, class) = r.slot(0x1000, &0x0287_7407u32.to_le_bytes()).unwrap();
+        assert_eq!(class, Class::Unit(Unit::Vector));
+        // Refused while sstatus.VS is 0: counted, no event.
+        r.exec(load);
+        r.discon(0x1000);
+        assert_eq!(r.trapped(), Some(Unit::Vector));
+        r.state(Some(0));
+        assert_eq!(r.trapped(), None);
+        // A page fault with the unit on: an attempt the counter did not count.
+        r.exec(load);
+        r.discon(0x1000);
+        r.state(Some(1 << 9));
+        assert_eq!(
+            events(&mut r),
+            [
+                Event::Header {
+                    arch: Arch::Riscv64
+                },
+                Event::Attempt { pc: 0x1000 },
+            ]
+        );
+        // A state that could not be read ends the record.
+        r.exec(load);
+        r.discon(0x1000);
+        r.state(None);
+        assert!(r.finish().is_err());
     }
 
     #[test]

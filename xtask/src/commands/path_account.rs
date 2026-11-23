@@ -242,10 +242,14 @@ impl<'a> Resolver<'a>
         })
     }
 
-    /// The runtime text of the image named `name`, placed once.
+    /// The text of the image of program `name`: the placed image of that
+    /// name, or of a path whose file is that name (`/programs/fsbench`).
     fn text_of(&self, name: &str) -> Result<Range<u64>>
     {
-        let mut found = self.mapped.iter().filter(|m| m.name == name);
+        let mut found = self
+            .mapped
+            .iter()
+            .filter(|m| m.name == name || m.name.rsplit_once('/').map(|(_, f)| f) == Some(name));
         let (Some(one), None) = (found.next(), found.next())
         else
         {
@@ -729,6 +733,21 @@ fn build_plugin(ctx: &Context) -> Result<PathBuf>
     Ok(object)
 }
 
+/// Whether the QEMU binary `qemu` takes `-plugin`: it was built with TCG
+/// plugins.
+fn takes_plugins(qemu: &FsPath) -> bool
+{
+    Command::new(qemu)
+        .arg("--help")
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.starts_with("-plugin "))
+        })
+}
+
 /// A booted guest with the plugin recording, and the serial lines it logged.
 struct Boot
 {
@@ -781,6 +800,12 @@ impl Boot
         qemu_args.push("-plugin".to_owned());
         qemu_args.push(format!("{},out={}", plugin.display(), record.display()));
         let qemu = require_tool(arch.qemu_binary())?;
+        ensure!(
+            takes_plugins(&qemu),
+            "{} takes no -plugin: it was built without TCG plugins (QEMU's configure \
+             --enable-plugins), and the trace records through one",
+            qemu.display()
+        );
         step(&format!(
             "Launching QEMU for the path account ({arch}, {}, 1 CPU, icount, record {})",
             account.name,

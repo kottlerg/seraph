@@ -214,8 +214,8 @@ struct Plugin
 {
     api: Api,
     recorder: Recorder<BufWriter<File>>,
-    /// The scoreboard whose one `u64` is set while a read's value is due:
-    /// the value callback's condition.
+    /// The scoreboard whose one `u64` is set while a read's value, or a
+    /// trapped unit's state, is due: the value callback's condition.
     due: U64Entry,
     /// The vCPU's registers, by the name QEMU gives them.
     registers: Vec<(String, *mut Register)>,
@@ -562,7 +562,9 @@ unsafe extern "C" fn read(_vcpu: c_uint, userdata: *mut c_void)
     });
 }
 
-/// The instruction after a read runs: the read's value is in its registers.
+/// The instruction after a read, or after a trap of a unit's instruction,
+/// runs: the read's value is in its registers, the unit's state in its
+/// register.
 unsafe extern "C" fn value(_vcpu: c_uint, _userdata: *mut c_void)
 {
     with_plugin(|p| {
@@ -571,6 +573,11 @@ unsafe extern "C" fn value(_vcpu: c_uint, _userdata: *mut c_void)
         {
             let value = p.value(dest);
             p.recorder.value(value);
+        }
+        if let Some(unit) = p.recorder.trapped()
+        {
+            let state = p.register(unit.state_register());
+            p.recorder.state(state);
         }
     });
 }
@@ -584,7 +591,13 @@ unsafe extern "C" fn discon(
     _userdata: *mut c_void,
 )
 {
-    with_plugin(|p| p.recorder.discon(from));
+    with_plugin(|p| {
+        p.recorder.discon(from);
+        if p.recorder.trapped().is_some()
+        {
+            p.set_due(1);
+        }
+    });
 }
 
 /// QEMU exits: flush the record, and report the first error writing it.

@@ -16,6 +16,7 @@ xtask/
 │   └── ktest-timing/           # Checked-in ktest timing baselines (see ktest-timing)
 ├── fuzz/                       # The fuzzing engine (engine/) and the fuzz targets (targets/);
 │                               #   see Sub-crates and § `cargo xtask fuzz`
+├── path-account-plugin/        # The QEMU TCG plugin of `path-account trace` (see Sub-crates)
 ├── src/
 │   ├── main.rs                 # Entry point; dispatches CliCommand
 │   ├── cli.rs                  # The command table: every command's arguments
@@ -43,8 +44,9 @@ xtask/
 │   │                           #   and the report of QEMU's exit under a harness
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── image_check.rs          # The check every pack makes of the images it wrote (fsck.fat, ESP)
-│   ├── path_account.rs         # The per-path instruction account: counter reads, the window,
-│   │                           #   attribution, the result file, the document's block
+│   ├── path_account.rs         # The per-path instruction account: the images a boot placed,
+│   │                           #   attribution, the result file, the documents' blocks
+│   ├── path_record.rs          # The path-account plugin's record: reads, windows, rows
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
 │   ├── qemu_gdb.rs             # GDB remote client: QEMU's gdbstub and the GDB stub service
@@ -1742,27 +1744,31 @@ removed. An artifact's logs are those at its top level and those one directory d
 
 ### `cargo xtask path-account`
 
-Account for every instruction of each kernel benchmark's measured window by the function it
-belongs to, on the architecture and profile of the sysroot, and write the accounts into
-[core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md).
+Account for every instruction of each gated benchmark's measured window by the function it
+belongs to, on the architecture and profile of the sysroot, and write the accounts into the
+hot-path documents: ktest's rows into
+[core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md), the ubench and
+fsbench rows into
+[core/kernel/docs/hot-path-account-userspace.md](../core/kernel/docs/hot-path-account-userspace.md).
 
 ```
-cargo xtask path-account trace [--arch x86_64|riscv64] [--release] [--iteration K] \
+cargo xtask path-account trace [--arch x86_64|riscv64] [--release] [--reuse] \
     [--timeout SECS] [--wait-host SECS] [--alone] [--grant HOLDER] --reference LOG...
-cargo xtask path-account write [--doc FILE]
+cargo xtask path-account write
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | The sysroot's architecture |
 | `--release` | off | The sysroot was built with `--release` |
-| `--iteration` | `64` | The first sample index stepped, from 1 to 92: it and the 7 iterations after it stay below the smallest sample count of a benchmark (100) |
-| `--reference` | | Saved logs of icount boots of the same tree and profile's bench-only image built without `--limited-debug`, whose lowest one-CPU p50s are the reference counts |
+| `--reference` | | Saved logs of icount boots of the same tree, profile and image built without `--limited-debug`, whose lowest one-CPU p50s are the reference counts |
 | `--timeout` | `3600` | Seconds the whole boot may take |
-| `--doc` | `core/kernel/docs/hot-path-account.md` | (`write`) The document whose generated block is replaced |
+| `--reuse` | off | Account the boot log and the record the configuration's last trace left, without booting |
 
 The host options are `run`'s ([Host launch rules](#host-launch-rules)); a trace is a boot of one
-vCPU. One configuration is regenerated with:
+vCPU. `trace` accounts the harness the disk image records: ktest's bench-only image, or the init
+image with ubench staged as a service, as the benchmark cell boots it. One configuration of
+ktest is regenerated with:
 
 ```
 cargo xtask build --arch <a> [--release] --ktest-bench-only
@@ -1773,51 +1779,87 @@ cargo xtask mkdisk --arch <a> --harness ktest
 cargo xtask path-account trace --arch <a> [--release] --reference target/pa-ref/<a>-<profile>/*.log
 ```
 
-and the document from every configuration traced with `cargo xtask path-account write`
-(`cargo xtask clean` between architectures). A trace takes about two minutes.
+and one of the userspace rows with:
 
-**Method.** `trace` boots the sysroot's image at one CPU under icount, as `run --icount` does,
-with QEMU's gdbstub on a unix socket, and drives the stub as the guest runs:
+```
+cargo xtask build --arch <a> [--release]
+cargo xtask mkdisk --arch <a> --harness init
+cp sysroot/config/svcmgr/tests/ubench.svc sysroot/config/svcmgr/services/
+rm sysroot/config/svcmgr/services/terminal.svc
+cargo xtask mkdisk --arch <a> --repack-only
+cargo xtask run --arch <a> --icount --cpus 1 --runs 1 --display framebuffer \
+    --save-logs target/pa-ref/user-<a>-<profile>
+cargo xtask build --arch <a> [--release] --limited-debug all
+(the same mkdisk and staging)
+cargo xtask path-account trace --arch <a> [--release] \
+    --reference target/pa-ref/user-<a>-<profile>/*.log
+```
 
-1. It reads the kernel's KASLR slide from the serial log, stops the guest, and stops it again
-   where the kernel hands the CPU to init (`kernel::sched::enter`), after the kernel has logged
-   ktest's load bias, which it then reads.
-2. It sets a write watchpoint on sample `K-1` of ktest's sample buffer (`ktest::bench::SAMPLES`),
-   into which every benchmark records from index 0. A stop whose frames do not include
-   `Samples::record` (the summary's in-place sort) is stepped over.
-3. At a benchmark's recording of sample `K-1`, it steps past the store (x86_64 stops after it,
-   riscv64 before it), then single-steps, with interrupts and timers masked for each step
-   (`Qqemu.sstep=0x7`), until the program counter is back at that address: one iteration, the
-   store of the next sample among its instructions. It steps 8 iterations in turn.
-4. In each iteration, the window is the pair of counter reads (`rdtsc`, `csrr cycle`, decoded at
-   each address stepped) whose values differ by the sample the iteration stored: the opening read
-   and every instruction up to the closing read.
-5. The benchmark's next result line names it and gives the boot's p50; the account takes the
-   first of its 8 iterations whose window ran the p50.
+which stage ubench and boot it as the benchmark cell does
+([docs/testing.md](../docs/testing.md#benchmarks-bench-cell) § Benchmarks), and the documents
+from every configuration traced with `cargo xtask path-account write` (`cargo xtask clean`
+between architectures). A trace runs every instruction of the boot through the plugin and takes
+several minutes.
 
-Each check is a failure of the command: a window whose stepped instructions are not the counter's
-difference (the stepped path is not the measured one); a benchmark none of whose 8 iterations ran
-its p50; a p50 that is not the reference count; a one-CPU measurement of the reference logs left
+**Method.** `trace` builds the path-account plugin
+([path-account-plugin/](path-account-plugin/README.md)) for the host and boots the sysroot's
+image at one CPU under icount, as `run --icount` does, with the plugin loaded (`-plugin`); the
+host's QEMU must be built with TCG plugins and take the plugin's API version (7), and `trace`
+says so when it does not. The plugin never stops the guest: a stop of the debug stub under
+icount moves the virtual clock to the next timer deadline, which would corrupt every sample
+taken across it. It writes a record, in the order the guest ran: every instruction executed
+between two user-mode counter reads (`rdtsc`, `csrr cycle`), by address, in every privilege
+mode and address space; each read's value; and each attempt a trap ended before it retired
+that the counter did not count. `trace` reads the boot's serial log until the harness's last
+line (`[ktest] ALL` or `SOME`, `[ubench] ALL TESTS PASSED` or `SOME TESTS FAILED`), then
+accounts the record offline:
+
+1. **Images.** The log places each image the boot ran: the kernel at its KASLR slide, init,
+   memmgr and procmgr at the biases the kernel and init log, and each process procmgr spawns at
+   the bias it logs (a spawn logged without a name takes the one svcmgr logged launching it).
+   The texts of two placed images must not overlap at run time, so that an address names one
+   image; process ASLR overlaps two of them in fewer than one boot in 400, and `trace` refuses
+   such a boot, to be booted again.
+2. **Windows.** A program's reads are those in its image's text, and pair in turn into windows,
+   an opening read and a closing one, whose values' difference is the window's sample. A
+   benchmark loop reads the counter at the same two addresses on every iteration, its warm-up
+   iterations included, which it does not keep: the windows of one loop are divided among its
+   result lines in order, each line taking an equal warm-up and then its `n` samples, and the
+   division must give each line exactly its summary (`n`, `min`, `p50`, `p90`, `p99`,
+   `max`).
+3. **Checks.** Each window of a gated line (`bench-check`'s gating rows of the icount mode)
+   must retire exactly its sample: its instructions, less the attempts the counter did not
+   count. Its p50 must lie within the gate's band of the reference count. The account takes the
+   first window that ran the p50.
+
+Each check is a failure of the command, listed with every other: a window that retired other
+than its sample (the traced path is not the measured one); a line none of whose windows ran its
+p50; a p50 outside the reference's band; a gated measurement of the reference logs left
 untraced; a benchmark's `FAIL` line. The reference is a count of the image without debuginfo
 because limited debuginfo changes the crates' hashes, and with them the order the linker lays
-functions out in: the instructions are a plain build's, which the equal counts confirm.
+functions out in: the instructions are a plain build's, which the counts within the band
+confirm.
 
 **Attribution.** An address is the kernel's when, less the slide, it lies in the kernel's text,
-and ktest's when, less the bias, it lies in ktest's (the symbols store's file, which keeps its
-DWARF). Each instruction counts against the innermost function of its DWARF frames, inlined ones
-included, that is not the standard library's (`core`, `alloc`, `compiler_builtins`, or a
-primitive type's method), so an inlined helper counts against its caller; an instruction no DWARF
-covers (assembly) counts against the nearest text symbol at or before it.
+and a process's when, less its bias, it lies in its image's (the symbols store's file of the
+image, which keeps its DWARF); an address in no placed image (a page the kernel or firmware
+mapped) counts against `<page …>`. Each instruction counts against the innermost function of
+its DWARF frames, inlined ones included, that is not the standard library's (`core`, `alloc`,
+`compiler_builtins`, or a primitive type's method), so an inlined helper counts against its
+caller; an instruction no DWARF covers (assembly) counts against the nearest text symbol at or
+before it.
 
-**Output.** `target/xtask/path-account/<arch>-<profile>.tsv`, the result file: the
-configuration's head (`-dirty` when the tree differed from it), date, QEMU version and reference,
-then per path a `path` record (measurement, p50, reference, iteration) and an `fn` record per
-function (image, path, count). Beside it, `<arch>-<profile>/` holds the boot's serial log and one
-`.trace` file per path, a line per instruction: its address, its image, and its frames from the
-outermost in. `write` reads the result file of each configuration traced and replaces the block
-between the document's `path-account` markers with a provenance table, each path's totals by
-image, and per path its functions, a column per configuration; a function below 3 instructions,
-or below half a percent of the path when that is more, shares one closing row.
+**Output.** `target/xtask/path-account/<harness>-<arch>-<profile>.tsv` (`ktest` or
+`userspace`), the result file: the configuration's head (`-dirty` when the tree differed from
+it), date, QEMU version and reference, then per path a `path` record (measurement, p50,
+reference, the window's index among the line's samples) and an `fn` record per function (image,
+path, count). Beside it, `<harness>-<arch>-<profile>/` holds the plugin's record
+(`record.txt`), the boot's serial log, and one `.trace` file per path, a line per address: the
+instructions retired there, its image, and its frames from the outermost in. `write` reads the
+result files of each harness and replaces the block between its document's `path-account`
+markers with a provenance table, each path's totals by image, and per path its functions, a
+column per configuration; a function below 3 instructions, or below half a percent of the path
+when that is more, shares one closing row.
 
 ---
 
@@ -2607,6 +2649,7 @@ command line, for the review to read.
 |---|---|
 | `fuzz/engine/` (`fuzz-engine`) | The coverage-guided fuzzing engine: the SanitizerCoverage callbacks, the queue, the mutator, the minimizer, the supervisor and the reports. A host library the fuzz targets link; built without coverage instrumentation. Its unit tests run under `cargo xtask test`. See § `cargo xtask fuzz`. |
 | `fuzz/targets/` (`fuzz-targets`) | One binary per fuzz target, each handing a parser crate's property function to the engine, and the self-test's planted targets. Built only by `cargo xtask fuzz`. |
+| [path-account-plugin/](path-account-plugin/README.md) (`seraph-path-account-plugin`) | The QEMU TCG plugin `cargo xtask path-account trace` loads into the guest's QEMU, which records every instruction between user-mode counter reads, and the record's format, which xtask links. A host artifact, built by `trace` when it boots and never part of an image. Its unit tests run under `cargo xtask test`. See § `cargo xtask path-account`. |
 | [wrapper-shim/](wrapper-shim/README.md) | Tiny native binary installed into the seraph toolchain mirror as both `rustc` and `ws-clippy`, and for `cargo xtask fuzz` as `sancov-rustc`. Dispatches by argv[0] basename to exec the real rustc / clippy-driver with overlay-aware `--sysroot` flags, or the real rustc without the coverage flags for the fuzzing engine's units. Built by `cargo xtask build` as part of StdUser builds, and by `cargo xtask fuzz`; never invoked directly. |
 
 ---

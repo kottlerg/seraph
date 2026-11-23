@@ -701,6 +701,14 @@ interface; invoke it with `cargo xtask <command>`.
 See [`xtask/README.md`](../xtask/README.md) for the full command reference and
 [`xtask/src/main.rs`](../xtask/src/main.rs) for the dispatch entry point.
 
+xtask's sub-crates ([xtask/README.md](../xtask/README.md#sub-crates) § Sub-crates) are host
+artifacts, each built by the command that needs it and never part of an image. One of them,
+[`xtask/path-account-plugin`](../xtask/path-account-plugin/README.md), is a QEMU TCG plugin:
+`cargo xtask path-account trace` builds it as a host shared object and loads it into the
+guest's QEMU with `-plugin`. That command alone needs a QEMU built with TCG plugins (QEMU's
+`--enable-plugins`) whose plugin API accepts version 7; it refuses a QEMU
+that takes no `-plugin`, and reports QEMU's own refusal of the plugin's version.
+
 ---
 
 ## Continuous Integration

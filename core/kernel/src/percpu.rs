@@ -326,10 +326,11 @@ pub struct PerCpuData
     /// only by this CPU, at a switch-in or in `sched::enter`.
     pub guard_epoch_flushed: u64,
     /// This CPU's own entry of the scheduler slab, so a return to user mode
-    /// reaches its run-queue mask, and `syscall::current_tcb` the running
-    /// thread, with one GS- or `tp`-relative load ([`current_scheduler`])
-    /// instead of the slab arithmetic of `sched::scheduler_for`
-    /// (core/kernel/docs/scheduler.md § Wake Preemption).
+    /// reaches its run-queue mask, and the CPU's own code its scheduler, with
+    /// one GS- or `tp`-relative load ([`current_scheduler`]) instead of the
+    /// slab arithmetic of `sched::scheduler_for`
+    /// (core/kernel/docs/scheduler.md § Wake Preemption). The running thread
+    /// is read from [`PerCpuData::current`], not through this pointer.
     /// Written once by [`init_storage`], before the slab is published; null
     /// before it.
     pub scheduler: *const PerCpuScheduler,
@@ -694,17 +695,20 @@ pub unsafe fn set_current_thread(tcb: *mut ThreadControlBlock)
 }
 
 /// Name `tcb` as CPU `cpu`'s running thread in its [`PerCpuData::current`]
-/// before that CPU runs: `sched::init` names each CPU's idle thread.
+/// at boot: `sched::init` names each CPU's idle thread, an AP's before the AP
+/// runs, the boot CPU's while its timer tick returns at the boot gate
+/// (core/kernel/docs/scheduling-internals.md § BSP Boot Transient).
 ///
 /// # Safety
-/// `cpu < CPU_COUNT`, [`init_storage`] has run, and CPU `cpu` does not yet
-/// run kernel code that reads the field (single-threaded boot).
+/// `cpu < CPU_COUNT`, [`init_storage`] has run, and no code of CPU `cpu`
+/// that reads the field runs until the store is made (single-threaded boot).
 #[cfg(not(test))]
 pub unsafe fn init_current_thread(cpu: usize, tcb: *mut ThreadControlBlock)
 {
     let entry = per_cpu_ptr(cpu);
     // SAFETY: cpu < CPU_COUNT and the slab is allocated, so `entry` is an
-    // entry of it, which no CPU reads concurrently here (contract).
+    // entry of it; the store is atomic, and no reader of it runs yet
+    // (contract).
     unsafe { (*entry).current.store(tcb, Ordering::Relaxed) };
 }
 

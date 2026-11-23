@@ -1061,10 +1061,11 @@ Rules:
    `current`. After boot the one writer is `sched::set_running`, which stores the scheduler's
    `current` and then `PerCpuData::current` with interrupts disabled: under the CPU's
    `scheduler.lock` at `schedule()`'s dispatch and at its fall back to the idle thread, and at
-   `sched::enter`'s dispatch of init, before the CPU takes any interrupt. `sched::init` writes
-   both for each CPU's idle thread before that CPU runs kernel code
-   (`percpu::init_current_thread`). No code of the CPU runs between the two stores, so both name
-   the same thread whenever the CPU's own code reads either.
+   `sched::enter`'s dispatch of init, after it disables interrupts. `sched::init` writes both
+   for each CPU's idle thread (`percpu::init_current_thread`): an AP's before the AP runs kernel
+   code, and the boot CPU's while its `timer_tick` returns at the boot gate (§ BSP Boot
+   Transient). No code of the CPU that reads either runs between the two stores, so both name the
+   same thread whenever the CPU's own code reads either.
 2. The stores precede `release_lock_only` and `switch()`, as the `context_saved` protocol of
    § Cross-CPU TCB Ownership requires of the scheduler's `current`. The rest of `schedule()`, which
    runs on the outgoing thread's stack after them, reads neither.
@@ -1191,11 +1192,11 @@ Protocol.
 Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
 
 ```
-0. drain_deferred_reclaim(cpu)                     // interrupts enabled
+0. drain_deferred_reclaim()                        // interrupts enabled
    while sole_reference::work_pending()
          && !has_runnable() { sole_reference::drain() }  // unmasked; a hint only
 1. Mask interrupts.
-2. has_work = scheduler_ptr(cpu).has_runnable()    // non_empty.load(Acquire)
+2. has_work = current_scheduler().has_runnable()   // non_empty.load(Acquire)
 3. if has_work {
        enable interrupts;
        schedule(Requeue::Always);                  // pick up the work
@@ -1296,9 +1297,12 @@ The window during which the BSP is live but SMP state is not yet steady. Begins 
 1. `init_storage` MUST run before the timer is armed. The timer ISR reads `SCHEDULERS_PTR`; an
    unarmed-storage tick dereferences `null`.
 
-2. Every CPU's `current`, its scheduler's and its `PerCpuData`'s, MUST be non-null before
-   interrupts are enabled on that CPU. `sched::init` sets both to its idle TCB per CPU
-   (§ Per-CPU Current Thread).
+2. An AP's `current`, its scheduler's and its `PerCpuData`'s, MUST be non-null before the AP
+   enables interrupts: `sched::init` sets both to its idle TCB before any AP starts
+   (§ Per-CPU Current Thread). The boot CPU enables interrupts at Phase 5 (`timer::init`), and
+   `sched::init` names its idle thread at Phase 8, so both may be null on it in between: its
+   `timer_tick` returns at the `BOOT_TRANSIENT_ACTIVE` gate (invariant 4), and no other handler
+   reads the current thread for an entry from kernel mode.
 
 3. Idle threads run with `slice_remaining = 0`; `timer_tick` treats this as "do not preempt".
 
@@ -1491,7 +1495,7 @@ the ordering choice is required for correctness; relaxations would introduce a r
 | `upcall_pending` (per TCB) | `core/kernel/src/sched/thread.rs` (decl) | Release `store` of `true` in `ipc::upcall::post` under the target's `sched_lock`, after the Relaxed stores of `upcall_cookie` and `upcall_any_instruction`; Relaxed `store` of `false` in the take (`ipc::upcall::take`) under the thread's own `sched_lock` | Acquire `load` lock-free in the take's pre-check, which decides nothing; Relaxed `load` under `sched_lock` in the take, the post's pending check, `cancel_for_upcall`'s snapshot, and `commit_blocked_under_local_lock` | Every decision reads it under `sched_lock`, which orders it with the cookie and flag; the Acquire pre-check only lets a delivery point skip the lock when nothing is pending, and a post it misses is taken at the next delivery point, or refuses the next park. |
 | `LOAD_BALANCE_TICK` | `core/kernel/src/sched/mod.rs` (decl, balancer) | Relaxed on `fetch_add` (sole writer is the loaded-path victim selection in `try_pull_balance`) | Relaxed on the same `fetch_add` (consumes the previous value) | Advisory random-victim seed; correctness does not depend on ordering — a stale value just biases victim selection slightly. |
 | `CPU_COUNT` | `core/kernel/src/sched/mod.rs` (decl) | Relaxed on store (`init_storage`) | Relaxed on every read | Single-writer at boot; the SCHEDULERS_PTR Release publishes the storage; readers establish happens-before via the pointer load, not via CPU_COUNT itself. |
-| `SCHEDULERS_PTR`, `IDLE_TCBS_PTR`, `IDLE_STACK_TOPS_PTR`, `LAST_NON_IDLE_TICK_PTR`, `AP_TSS_PTR`, `AP_GDT_PTR`, `AP_IST_STACKS_PTR`, `PER_CPU_PTR`, `CPU_APIC_IDS_PTR` | per-`AtomicPtr` declaration sites | Release on `store` in `init_storage` (including `percpu::init_storage`) and per-arch initialisers | Acquire on `load` in `scheduler_ptr`, `idle_tcb_ptr`, `running_tcb_raw`, `per_cpu_ptr`, `apic_id_for`, AP startup helpers | Publishes the zeroed and constructed slab to every CPU; the Acquire establishes happens-before with the storage construction. |
+| `SCHEDULERS_PTR`, `IDLE_TCBS_PTR`, `IDLE_STACK_TOPS_PTR`, `LAST_NON_IDLE_TICK_PTR`, `AP_TSS_PTR`, `AP_GDT_PTR`, `AP_IST_STACKS_PTR`, `PER_CPU_PTR`, `CPU_APIC_IDS_PTR` | per-`AtomicPtr` declaration sites | Release on `store` in `init_storage` (including `percpu::init_storage`) and per-arch initialisers | Acquire on `load` in `scheduler_ptr`, `idle_tcb_ptr`, `per_cpu_ptr`, `apic_id_for`, AP startup helpers | Publishes the zeroed and constructed slab to every CPU; the Acquire establishes happens-before with the storage construction. |
 | `CORE_SLOTS_PTR`, `SIBLING_RING_PTR` | `core/kernel/src/topology.rs` (decl) | Release `store` in `topology::init_storage` (`CORE_SLOTS_PTR`) and in `topology::build_sibling_rings` (`SIBLING_RING_PTR`, Phase 8, once every AP is online) | Acquire `load` in `record_this_cpu`, `build_sibling_rings`, `sibling_after`, `busy_siblings` | Publishes the slab; for `SIBLING_RING_PTR`, every link written before the publication. A null `SIBLING_RING_PTR` reads as no siblings. |
 
 **Rules:**

@@ -8694,10 +8694,21 @@ pub unsafe fn enter() -> !
     {
         crate::fatal("sched::enter: run queue empty — init TCB not enqueued");
     }
+    // Disable interrupts before naming init the running thread, so no
+    // interrupt runs between set_running's two stores, and before entering
+    // user mode.
+    // On x86-64: `cli`; iretq restores IF from the frame's rflags.
+    // On RISC-V: return_to_user sets sstatus to SPP=0/SPIE=1/SIE=0 before
+    // sret; SIE is re-enabled atomically by sret. Disabling here prevents any
+    // stray interrupt from arriving before return_to_user arms sscratch.
+    // SAFETY: single-boot-thread; prevents race before user mode entry.
+    unsafe {
+        crate::arch::current::cpu::disable_interrupts();
+    }
     // Mark as the currently running thread so syscall handlers that call
     // current_tcb() find the correct TCB while init is executing.
-    // SAFETY: `sched` is this CPU's (the BSP's) scheduler; the boot runs with
-    // interrupts disabled.
+    // SAFETY: `sched` is this CPU's (the BSP's) scheduler, and interrupts are
+    // disabled above.
     unsafe { set_running(sched, tcb) };
     // SAFETY: tcb is the non-null init TCB dequeued above, which nothing else
     // references in this once-only boot context.
@@ -8713,16 +8724,6 @@ pub unsafe fn enter() -> !
 
     // Retrieve the user entry point stored in saved_state at TCB creation.
     let entry_point = init_tcb.saved_state.entry_point();
-
-    // Disable interrupts before entering user mode.
-    // On x86-64: `cli`; iretq restores IF from the frame's rflags.
-    // On RISC-V: return_to_user sets sstatus to SPP=0/SPIE=1/SIE=0 before
-    // sret; SIE is re-enabled atomically by sret. Disabling here prevents any
-    // stray interrupt from arriving before return_to_user arms sscratch.
-    // SAFETY: single-boot-thread; prevents race before user mode entry.
-    unsafe {
-        crate::arch::current::cpu::disable_interrupts();
-    }
 
     // Init's first run here is not a schedule() switch-in, so drop any stale
     // translation of its guard page as one would (`mm::stack_guard`).

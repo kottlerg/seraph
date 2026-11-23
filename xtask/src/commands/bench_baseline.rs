@@ -77,14 +77,31 @@ fn from_run(ctx: &BuildContext, args: &BenchBaselineArgs, id: u64) -> Result<()>
     Ok(())
 }
 
-/// The `.log` files directly in `dir`, sorted.
+/// The `.log` files in `dir` and in each directory directly in it, sorted:
+/// the cell saves its ktest boots' logs in its log directory and its ubench
+/// boots' in `ubench/` there, since both name a log by its architecture, CPU
+/// count and run.
 fn logs_in(dir: &Path) -> Result<Vec<PathBuf>>
 {
-    let mut logs: Vec<PathBuf> = std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "log"))
-        .collect();
+    let entries = |d: &Path| -> Result<Vec<PathBuf>> {
+        Ok(std::fs::read_dir(d)
+            .with_context(|| format!("reading {}", d.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect())
+    };
+    let is_log = |p: &Path| p.is_file() && p.extension().is_some_and(|x| x == "log");
+    let mut logs = Vec::new();
+    for path in entries(dir)?
+    {
+        if path.is_dir()
+        {
+            logs.extend(entries(&path)?.into_iter().filter(|p| is_log(p)));
+        }
+        else if is_log(&path)
+        {
+            logs.push(path);
+        }
+    }
     logs.sort();
     Ok(logs)
 }
@@ -150,4 +167,42 @@ fn rewrite(
         println!("wrote {}", env_path.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn the_logs_of_an_artifact_are_those_at_its_top_and_one_directory_down()
+    {
+        let root = std::env::temp_dir().join(format!(
+            "xtask-bench-logs-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let ubench = root.join("ubench");
+        let deeper = ubench.join("deeper");
+        std::fs::create_dir_all(&deeper).unwrap();
+        for path in [
+            root.join("x86_64-1cpu-1.log"),
+            root.join("ENV"),
+            ubench.join("x86_64-1cpu-1.log"),
+            deeper.join("x86_64-1cpu-2.log"),
+        ]
+        {
+            std::fs::write(path, "").unwrap();
+        }
+        let logs = logs_in(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            logs,
+            [
+                root.join("ubench/x86_64-1cpu-1.log"),
+                root.join("x86_64-1cpu-1.log")
+            ]
+        );
+    }
 }

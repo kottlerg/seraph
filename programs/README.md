@@ -10,7 +10,7 @@ General-purpose userspace applications, utilities, and the test fixtures the har
 | [`debugger/`](debugger/README.md) | Debugger fixture for the usertest `debugger` tester: breakpoint, single-step, memory inspection, and async break |
 | [`demandpaged/`](demandpaged/README.md) | Demand-paging fixture for the svctest pager phase |
 | [`fb-charset/`](fb-charset/README.md) | Framebuffer character-set demo program |
-| [`fsbench/`](fsbench/README.md) | `FS_READ` vs `FS_READ_MEMORY` crossover benchmark |
+| [`fsbench/`](fsbench/README.md) | `std::fs::File` read and write benchmark: the `FS_READ` vs `FS_READ_MEMORY` crossover, and `FS_WRITE_MEMORY` rewrites |
 | [`hello/`](hello/README.md) | Hello-world program; std-only, no Seraph cap awareness |
 | [`pipefault/`](pipefault/README.md) | Piped-stdio fault fixture for the pipe death-bridge regression test |
 | [`pipestress/`](pipestress/README.md) | Spawn-exit-drain stress fixture for the pipe EOF-drain regression test |
@@ -21,6 +21,7 @@ General-purpose userspace applications, utilities, and the test fixtures the har
 | [`terminal/`](terminal/README.md) | Terminal: relays a byte stream between hardware drivers and a child's stdio |
 | [`threadchurn/`](threadchurn/README.md) | CSpace-slot and memmgr-pool reclaim fixture for the usertest `threadchurn` tester |
 | [`threadstack/`](threadstack/README.md) | Guarded thread-stack fixture, demand-paged and pinned, for the usertest `threadstack` tester |
+| [`ubench/`](ubench/README.md) | Userspace benchmark suite, installed as `/tests/ubench`: IPC, demand faults, the pipe ring, console output, and fsbench |
 
 ---
 

@@ -405,7 +405,7 @@ mod tests
     /// The used entries of the table whose header is at `lba`, read by vfsd's parser.
     fn vfsd_entries(disk: &[u8], block_size: u64, lba: u64) -> Vec<vfsd_gpt::GptEntry>
     {
-        let Ok(header) = vfsd_gpt::parse_header(block(disk, block_size, lba))
+        let Ok(header) = vfsd_gpt::parse_header(block(disk, block_size, lba), lba)
         else
         {
             panic!("vfsd-gpt refused the header at LBA {lba}");
@@ -463,6 +463,26 @@ mod tests
                 })
                 .collect();
             assert_eq!(vfsd_entries(&disk, block_size, 1), expected, "{block_size}");
+
+            // vfsd reads the primary GPT whole, and the backup alone when the
+            // primary header is damaged, each with its CRC32s and MyLBA
+            // accepted.
+            let blocks = disk.len() as u64 / block_size;
+            let read = |disk: &[u8]| {
+                vfsd_gpt::read_gpt(usize::try_from(block_size).unwrap(), blocks, |lba, buf| {
+                    buf.copy_from_slice(block(disk, block_size, lba));
+                    true
+                })
+                .unwrap_or_else(|faults| panic!("vfsd refused both GPTs: {faults:?}"))
+            };
+            let primary = read(&disk);
+            assert_eq!(primary.copy, vfsd_gpt::GptCopy::Primary, "{block_size}");
+            assert_eq!(primary.scan.entries, expected, "{block_size}");
+            let mut damaged = disk.clone();
+            damaged[usize::try_from(block_size).unwrap() + 16] ^= 1;
+            let backup = read(&damaged);
+            assert_eq!(backup.copy, vfsd_gpt::GptCopy::Backup, "{block_size}");
+            assert_eq!(backup.scan.entries, expected, "{block_size}");
 
             // The second entry's name, in UTF-16LE, zero-padded.
             let entries = block(&disk, block_size, 2);

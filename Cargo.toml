@@ -123,6 +123,7 @@ members = [
     "programs/terminal",
     "programs/threadchurn",
     "programs/threadchurn/tester",
+    "programs/ubench",
     "programs/threadstack",
     "programs/threadstack/tester",
     "runtime/ruststd/argv-env",

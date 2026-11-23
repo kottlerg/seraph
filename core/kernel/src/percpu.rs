@@ -41,6 +41,20 @@
 //! | `PERCPU_FPU_OWNER_OFFSET` | 48 | `fpu_owner` |
 //! | `PERCPU_KERNEL_STACK_FLOOR_OFFSET` | 72 | `kernel_stack_floor` |
 //! | `PERCPU_SCHEDULER_OFFSET` | 88 | `scheduler` |
+//! | `PERCPU_THIS_OFFSET` | 96 | `this` |
+//! | `PERCPU_CURRENT_OFFSET` | 104 | `current` |
+//! | `PERCPU_DIAG_OFFSET` | 112 | `diag` |
+//!
+//! ## This CPU's state
+//!
+//! Every access a CPU makes to its own per-CPU state goes through the per-CPU
+//! register: a pointer field the hot paths read (`scheduler`, `current`,
+//! `diag`) with one GS- or `tp`-relative load ([`current_scheduler`],
+//! [`current_thread`], `sched::this_cpu_diag`), and any other field through
+//! [`this_cpu`], the entry's own address read the same way.
+//! [`per_cpu_ptr`] and `sched::scheduler_for` index the slabs by CPU for an
+//! access to another CPU's state, and for boot code that runs before the
+//! register is installed.
 //!
 //! ## Adding new fields
 //! Append fields at the end of the struct. If assembly reads the field, add
@@ -52,6 +66,7 @@
 
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
+use crate::sched::CpuDiag;
 use crate::sched::MAX_CPUS;
 use crate::sched::run_queue::PerCpuScheduler;
 use crate::sched::thread::ThreadControlBlock;
@@ -214,6 +229,36 @@ pub const PERCPU_KERNEL_STACK_FLOOR_OFFSET: usize =
     )
 )]
 pub const PERCPU_SCHEDULER_OFFSET: usize = core::mem::offset_of!(PerCpuData, scheduler);
+/// Byte offset of `PerCpuData::this`, GS- or `tp`-relative: the [`this_cpu`]
+/// inline asm takes it as a `const` operand.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "read only by `this_cpu`, which the host test build does not compile"
+    )
+)]
+pub const PERCPU_THIS_OFFSET: usize = core::mem::offset_of!(PerCpuData, this);
+/// Byte offset of `PerCpuData::current`, GS- or `tp`-relative: the
+/// [`current_thread`] inline asm takes it as a `const` operand.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "read only by `current_thread`, which the host test build does not compile"
+    )
+)]
+pub const PERCPU_CURRENT_OFFSET: usize = core::mem::offset_of!(PerCpuData, current);
+/// Byte offset of `PerCpuData::diag`, GS- or `tp`-relative: the
+/// `sched::this_cpu_diag` inline asm takes it as a `const` operand.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "read only by `sched::this_cpu_diag`, which the host test build does not compile"
+    )
+)]
+pub const PERCPU_DIAG_OFFSET: usize = core::mem::offset_of!(PerCpuData, diag);
 
 // ── PerCpuData ────────────────────────────────────────────────────────────────
 
@@ -288,6 +333,25 @@ pub struct PerCpuData
     /// Written once by [`init_storage`], before the slab is published; null
     /// before it.
     pub scheduler: *const PerCpuScheduler,
+    /// This entry's own address, so [`this_cpu`] reaches any field of this
+    /// CPU's entry with one GS- or `tp`-relative load: x86-64 cannot read the
+    /// GS base as an address without an MSR read. Written once by
+    /// [`init_storage`].
+    pub this: *mut PerCpuData,
+    /// The thread running on this CPU, the copy of its scheduler's `current`
+    /// that this CPU's own reads take ([`current_thread`], one load in place
+    /// of two). Written only by this CPU, at each change of its scheduler's
+    /// `current` and in program order with it (`sched::set_running`), and by
+    /// the boot CPU for every CPU in `sched::init`, before that CPU runs; read
+    /// only by this CPU. Other CPUs read `PerCpuScheduler::current`
+    /// (core/kernel/docs/scheduling-internals.md § Per-CPU Current Thread).
+    /// Null until `sched::init` names the CPU's idle thread.
+    pub current: AtomicPtr<ThreadControlBlock>,
+    /// This CPU's record of the `CPU_DIAG` slab, so a stamp on an entry or a
+    /// spin path reaches it with one GS- or `tp`-relative load
+    /// (`sched::this_cpu_diag`). Written once by [`init_storage`]; null
+    /// before it.
+    pub diag: *const CpuDiag,
 }
 
 impl PerCpuData
@@ -309,6 +373,9 @@ impl PerCpuData
             kernel_stack_floor: 0,
             guard_epoch_flushed: 0,
             scheduler: core::ptr::null(),
+            this: core::ptr::null_mut(),
+            current: AtomicPtr::new(core::ptr::null_mut()),
+            diag: core::ptr::null(),
         }
     }
 }
@@ -348,9 +415,10 @@ const _: () = assert!(
 /// Allocate the per-CPU [`PerCpuData`], APIC-ID and TLB-shootdown request
 /// slabs, each sized to `cpu_count`, and publish their base pointers. Called from
 /// `sched::init_per_cpu_storage` (Phase 4), before [`init_bsp`] /
-/// [`init_apic_ids`] and before any SMP startup, with `schedulers` the
-/// published base of the `cpu_count`-entry scheduler slab, whose entry `cpu`
-/// each entry's `scheduler` names. The `PerCpuData` slab is
+/// [`init_apic_ids`] and before any SMP startup, with `schedulers` and
+/// `diags` the published bases of the `cpu_count`-entry scheduler and
+/// `CPU_DIAG` slabs, whose entry `cpu` each entry's `scheduler` and `diag`
+/// name; each entry's `this` names the entry. The `PerCpuData` slab is
 /// zero-filled, which equals [`PerCpuData::new`] for every field.
 ///
 /// Sized to the booted `cpu_count`, so the slabs cost only what is used;
@@ -362,6 +430,7 @@ const _: () = assert!(
 pub fn init_storage(
     cpu_count: usize,
     schedulers: *const PerCpuScheduler,
+    diags: *const CpuDiag,
     allocator: &mut crate::mm::BuddyAllocator,
 )
 {
@@ -380,9 +449,12 @@ pub fn init_storage(
         // entries, so the offset stays inside it.
         let slot = unsafe { pc_ptr.add(cpu) };
         let mut entry = PerCpuData::new();
-        // The address of scheduler entry `cpu`; wrapping_add computes it
-        // without a dereference, and the slab covers cpu_count entries.
+        // The addresses of scheduler and diagnostic entry `cpu`; wrapping_add
+        // computes them without a dereference, and each slab covers cpu_count
+        // entries.
         entry.scheduler = schedulers.wrapping_add(cpu);
+        entry.diag = diags.wrapping_add(cpu);
+        entry.this = slot;
         // SAFETY: `slot` is an entry of the slab, which nothing else reaches
         // before PER_CPU_PTR publishes it below.
         unsafe { core::ptr::write(slot, entry) };
@@ -475,7 +547,8 @@ pub unsafe fn init_ap(cpu_id: u32)
 #[cfg(not(test))]
 pub unsafe fn set_kernel_stack_floor(floor: u64)
 {
-    let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
+    // SAFETY: the per-CPU pointer is installed (caller contract).
+    let ptr = unsafe { this_cpu() };
     // SAFETY: the entry is this CPU's own, written only by it (caller
     // contract).
     unsafe { (*ptr).kernel_stack_floor = floor };
@@ -490,7 +563,8 @@ pub unsafe fn set_kernel_stack_floor(floor: u64)
 #[cfg(not(test))]
 pub unsafe fn guard_epoch_flushed() -> u64
 {
-    let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
+    // SAFETY: the per-CPU pointer is installed (caller contract).
+    let ptr = unsafe { this_cpu() };
     // SAFETY: this CPU's own entry (caller contract), written only by this
     // CPU.
     unsafe { (*ptr).guard_epoch_flushed }
@@ -504,7 +578,8 @@ pub unsafe fn guard_epoch_flushed() -> u64
 #[cfg(not(test))]
 pub unsafe fn set_guard_epoch_flushed(epoch: u64)
 {
-    let ptr = per_cpu_ptr(crate::arch::current::cpu::current_cpu() as usize);
+    // SAFETY: the per-CPU pointer is installed (caller contract).
+    let ptr = unsafe { this_cpu() };
     // SAFETY: this CPU's own entry (caller contract), written only by this
     // CPU.
     unsafe { (*ptr).guard_epoch_flushed = epoch };
@@ -522,7 +597,9 @@ pub unsafe fn set_guard_epoch_flushed(epoch: u64)
 #[inline]
 pub fn preempt_disable()
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: the kernel calls this only on a CPU whose per-CPU pointer is
+    // installed, as it does `current_cpu`.
+    let this = unsafe { this_cpu() };
     #[expect(
         clippy::multiple_unsafe_ops_per_block,
         reason = "every access is to this CPU's own preempt_count, which only this CPU touches"
@@ -530,7 +607,7 @@ pub fn preempt_disable()
     // SAFETY: preempt_count is exclusively owned by this CPU after init; no
     // concurrent access from other CPUs.
     unsafe {
-        let ptr = core::ptr::addr_of_mut!((*per_cpu_ptr(cpu)).preempt_count);
+        let ptr = core::ptr::addr_of_mut!((*this).preempt_count);
         *ptr = (*ptr).wrapping_add(1);
     }
 }
@@ -542,17 +619,93 @@ pub fn preempt_disable()
 #[inline]
 pub fn preempt_enable()
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: as in preempt_disable.
+    let this = unsafe { this_cpu() };
     #[expect(
         clippy::multiple_unsafe_ops_per_block,
         reason = "every access is to this CPU's own preempt_count, which only this CPU touches"
     )]
     // SAFETY: same as preempt_disable — per-CPU exclusive access.
     unsafe {
-        let ptr = core::ptr::addr_of_mut!((*per_cpu_ptr(cpu)).preempt_count);
-        debug_assert!(*ptr > 0, "preempt_enable: underflow on cpu {cpu}");
+        let ptr = core::ptr::addr_of_mut!((*this).preempt_count);
+        debug_assert!(
+            *ptr > 0,
+            "preempt_enable: underflow on cpu {}",
+            (*this).cpu_id
+        );
         *ptr = (*ptr).wrapping_sub(1);
     }
+}
+
+/// This CPU's [`PerCpuData`] entry, read through [`PerCpuData::this`] with one
+/// GS-relative (x86-64) or `tp`-relative (RISC-V) load: the access to any of
+/// its fields that has no one-load reader of its own.
+///
+/// # Safety
+/// This CPU's per-CPU pointer is installed ([`init_bsp`] or [`init_ap`]),
+/// which follows [`init_storage`]'s write of the field. The entry stays this
+/// CPU's only while the caller cannot migrate (interrupts or preemption
+/// disabled, or the idle thread).
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn this_cpu() -> *mut PerCpuData
+{
+    // SAFETY: the per-CPU pointer is installed (caller contract), and the
+    // offset is that of the `this` field.
+    unsafe {
+        crate::arch::current::cpu::read_percpu_ptr::<PerCpuData, PERCPU_THIS_OFFSET>().cast_mut()
+    }
+}
+
+/// The thread running on this CPU, read through [`PerCpuData::current`] with
+/// one GS- or `tp`-relative load: null until `sched::init` names this CPU's
+/// idle thread.
+///
+/// # Safety
+/// As [`this_cpu`].
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn current_thread() -> *mut ThreadControlBlock
+{
+    // SAFETY: the per-CPU pointer is installed (caller contract), and the
+    // offset is that of the `current` field, which only this CPU writes.
+    unsafe {
+        crate::arch::current::cpu::read_percpu_ptr::<ThreadControlBlock, PERCPU_CURRENT_OFFSET>()
+            .cast_mut()
+    }
+}
+
+/// Name `tcb` as the thread running on this CPU in [`PerCpuData::current`].
+/// Called only by `sched::set_running`, with the same store to this CPU's
+/// scheduler.
+///
+/// # Safety
+/// As [`this_cpu`], with interrupts disabled.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn set_current_thread(tcb: *mut ThreadControlBlock)
+{
+    // SAFETY: the per-CPU pointer is installed and the caller cannot migrate
+    // (contract).
+    let this = unsafe { this_cpu() };
+    // SAFETY: this CPU's own entry, whose `current` only this CPU writes once
+    // it runs.
+    unsafe { (*this).current.store(tcb, Ordering::Relaxed) };
+}
+
+/// Name `tcb` as CPU `cpu`'s running thread in its [`PerCpuData::current`]
+/// before that CPU runs: `sched::init` names each CPU's idle thread.
+///
+/// # Safety
+/// `cpu < CPU_COUNT`, [`init_storage`] has run, and CPU `cpu` does not yet
+/// run kernel code that reads the field (single-threaded boot).
+#[cfg(not(test))]
+pub unsafe fn init_current_thread(cpu: usize, tcb: *mut ThreadControlBlock)
+{
+    let entry = per_cpu_ptr(cpu);
+    // SAFETY: cpu < CPU_COUNT and the slab is allocated, so `entry` is an
+    // entry of it, which no CPU reads concurrently here (contract).
+    unsafe { (*entry).current.store(tcb, Ordering::Relaxed) };
 }
 
 /// This CPU's scheduler, read through [`PerCpuData::scheduler`] with one
@@ -580,9 +733,10 @@ pub unsafe fn current_scheduler() -> &'static PerCpuScheduler
 #[inline]
 pub fn preemption_disabled() -> bool
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: as in preempt_disable.
+    let this = unsafe { this_cpu() };
     // SAFETY: preempt_count is per-CPU, read-only here.
-    unsafe { (*per_cpu_ptr(cpu)).preempt_count > 0 }
+    unsafe { (*this).preempt_count > 0 }
 }
 
 // ── FPU owner cache (x86-64) ─────────────────────────────────────────────────
@@ -631,10 +785,11 @@ pub unsafe fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock
 #[cfg(not(test))]
 pub fn record_ctxsw_flush(elided: bool)
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: cpu is the current CPU (< CPU_COUNT); the PER_CPU slab is
-    // initialised before any tagged activate (Phase 5).
-    let pc = unsafe { &*per_cpu_ptr(cpu) };
+    // SAFETY: the per-CPU pointer is installed before any tagged activate
+    // (Phase 5).
+    let this = unsafe { this_cpu() };
+    // SAFETY: this CPU's own entry, live for the kernel's lifetime.
+    let pc = unsafe { &*this };
     let counter = if elided
     {
         &pc.ctxsw_flush_elided
@@ -693,6 +848,6 @@ mod tests
             PERCPU_PREEMPT_COUNT_OFFSET
         );
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 96);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 120);
     }
 }

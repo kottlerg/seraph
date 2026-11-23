@@ -860,7 +860,7 @@ lifetime against `dealloc_object(Thread)`:
 ```
 Outgoing CPU (in schedule()):
   1. context_saved.store(0, Relaxed)               // before unlock
-  2. sched.set_current(next)                       // sched.current = next
+  2. set_running(sched, next)                      // sched.current = PerCpuData::current = next
   3. sched.lock.release_lock_only()                // remote dequeue / dealloc can now observe
   3.5. if out is idle or null:
          while next.context_saved.load(Acquire) == 0 { spin_loop() }  // LOCKLESS
@@ -1042,6 +1042,46 @@ faulting at `RIP = 0` (`#PF`, `cs = 0x8`). **Kernel threads (idle) take the othe
 `interrupts::enable()` in its entry. This mirrors the #117 invariant (interrupts must not be live on
 a kstack a thread does not exclusively own) but on the *first-run* path rather than the steady-state
 switch.
+
+---
+
+## Per-CPU Current Thread
+
+Each CPU names the thread it runs in two places. Its scheduler's `current`
+(`PerCpuScheduler::current`) is the one other CPUs read: the teardown scan of
+§ Cross-CPU TCB Ownership, the stop protocol, the watchdogs. Its `PerCpuData::current` is the one
+the CPU's own code reads: `percpu::current_thread` is one load relative to the per-CPU pointer, at
+`gs:[104]` on x86-64 and `104(tp)` on riscv64 (`PERCPU_CURRENT_OFFSET`). `syscall::current_tcb`,
+the lock-holder stamps (`holder_info`), `running_thread_stopped`, and the self-teardown checks of
+`dealloc_thread`, `defer_self_teardown` and `mark_bound_threads` read it.
+
+Rules:
+
+1. Only the CPU itself writes its `PerCpuData::current`, and always beside its scheduler's
+   `current`. After boot the one writer is `sched::set_running`, which stores the scheduler's
+   `current` and then `PerCpuData::current` with interrupts disabled: under the CPU's
+   `scheduler.lock` at `schedule()`'s dispatch and at its fall back to the idle thread, and at
+   `sched::enter`'s dispatch of init, before the CPU takes any interrupt. `sched::init` writes
+   both for each CPU's idle thread before that CPU runs kernel code
+   (`percpu::init_current_thread`). No code of the CPU runs between the two stores, so both name
+   the same thread whenever the CPU's own code reads either.
+2. The stores precede `release_lock_only` and `switch()`, as the `context_saved` protocol of
+   § Cross-CPU TCB Ownership requires of the scheduler's `current`. The rest of `schedule()`, which
+   runs on the outgoing thread's stack after them, reads neither.
+3. The read needs no guard against preemption. A thread preempted after the load and resumed on
+   another CPU still holds its own TCB, and its next read on that CPU finds itself, since the
+   resuming CPU's dispatch stored it before switching to it.
+4. The field is an `AtomicPtr` accessed `Relaxed`: its CPU is its only reader and writer, and
+   program order orders those accesses. A cross-CPU reader reads the scheduler's `current`
+   instead, under the rules that field carries.
+
+The same per-CPU pointer reaches the CPU's other own state in one load: `PerCpuData::this`
+(`percpu::this_cpu`, offset 96) is the address of the CPU's own entry, through which the
+preemption count, the stack floor, the guard epoch and the flush counters are reached;
+`PerCpuData::scheduler` (offset 88) is its scheduler; and `PerCpuData::diag` (offset 112) is its
+`CpuDiag` breadcrumb record (`sched::this_cpu_diag`). `percpu::init_storage` writes all three
+before any CPU installs its per-CPU pointer. A read of another CPU's entry indexes the slab
+(`percpu::per_cpu_ptr`, `sched::scheduler_for`, `sched::cpu_diag`).
 
 ---
 
@@ -1256,8 +1296,9 @@ The window during which the BSP is live but SMP state is not yet steady. Begins 
 1. `init_storage` MUST run before the timer is armed. The timer ISR reads `SCHEDULERS_PTR`; an
    unarmed-storage tick dereferences `null`.
 
-2. Every CPU's `current` MUST be non-null before interrupts are enabled on that CPU. `sched::init`
-   sets `current = idle_tcb` per CPU.
+2. Every CPU's `current`, its scheduler's and its `PerCpuData`'s, MUST be non-null before
+   interrupts are enabled on that CPU. `sched::init` sets both to its idle TCB per CPU
+   (§ Per-CPU Current Thread).
 
 3. Idle threads run with `slice_remaining = 0`; `timer_tick` treats this as "do not preempt".
 

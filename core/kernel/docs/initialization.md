@@ -670,8 +670,8 @@ The scratch pages and bundle layout are described in
         ThreadKind::Kernel)
       - Idle thread entry calls cpu::halt_until_interrupt() in a loop,
         checking for pending work before each halt
-   c. Register the idle TCB as the CPU scheduler's idle and current thread (set_idle,
-      set_current)
+   c. Register the idle TCB as the CPU scheduler's idle and current thread and as the CPU's
+      PerCpuData::current (set_idle, set_current, percpu::init_current_thread)
 3. Emit: "scheduler initialised, N CPUs"
 3a. Record the boot CPU's core key (`topology::record_this_cpu(0)`) before starting the APs
 4. For each AP listed in BootInfo.cpu_ids[1..cpu_count]:
@@ -893,7 +893,7 @@ the reap-time donation of the segment, InitInfo, and stack pages in
 [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap).
 
 **Implementation notes:**
-- CSpace hand-off (step 5f): `sched::enter()` calls `set_current(init_tcb)` so
+- CSpace hand-off (step 5f): `sched::enter()` calls `set_running(sched, init_tcb)` so
   `current_tcb()` returns the init TCB during init's syscalls; init's TCB holds the former
   root CSpace (step 5f).
 - The x86-64 `switch_and_enter_user` function switches the stack pointer to init's kernel

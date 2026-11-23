@@ -3294,9 +3294,9 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // our acquire here provides the matching Acquire — so the
             // (`exit_reason`, `state`) pair written before the all-CPU
             // release is visible coherently.
-            let cpu = crate::arch::current::cpu::current_cpu() as usize;
-            // SAFETY: cpu is the running CPU; scheduler slab is initialised.
-            let sched = unsafe { crate::sched::scheduler_for(cpu) };
+            // SAFETY: syscall context on a CPU whose per-CPU pointer is
+            // installed; its scheduler is initialised.
+            let sched = unsafe { crate::percpu::current_scheduler() };
             // SAFETY: lock_raw / unlock_raw paired below.
             let saved = unsafe { sched.lock.lock_raw() };
             // SAFETY: target_tcb is the TCB of the Thread object `slot` pins

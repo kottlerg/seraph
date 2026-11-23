@@ -410,18 +410,17 @@ unsafe fn finish_syscall(exit: SyscallExit) -> SyscallExit
     // Syscall context on the caller's kernel stack with interrupts disabled
     // (the drain re-enables them only with preemption disabled), so this CPU
     // and its `current` are stable across both checks.
-    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: the caller is the thread running on `this_cpu`, which cannot
-    // migrate with interrupts disabled, and holds no scheduler lock.
-    if !unsafe { crate::sched::running_thread_stopped(this_cpu) }
+    // SAFETY: the caller is the thread running on this CPU, which it cannot
+    // leave with interrupts disabled, and holds no scheduler lock.
+    if !unsafe { crate::sched::running_thread_stopped() }
     {
         // SAFETY: the running thread is alive (not stopped, checked above) and
         // on its own kernel stack.
-        unsafe { crate::cap::object::drain_deferred_reclaim(this_cpu) };
+        unsafe { crate::cap::object::drain_deferred_reclaim() };
     }
     // SAFETY: as for the check above; the drain returns with this CPU and its
     // `current` unchanged.
-    if unsafe { crate::sched::running_thread_stopped(this_cpu) }
+    if unsafe { crate::sched::running_thread_stopped() }
     {
         // SAFETY: syscall context on the caller's valid kernel stack.
         unsafe { crate::sched::schedule(crate::sched::Requeue::IfRunnable) };
@@ -1096,11 +1095,12 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// Get the current thread's TCB pointer for the executing CPU: null until
 /// `sched::init` names one.
 ///
-/// Read through `PerCpuData::scheduler` ([`crate::percpu::current_scheduler`]),
-/// one GS- or `tp`-relative load. Phase 4 (`sched::init_storage`) initialises
-/// every scheduler entry and names it in its CPU's `PerCpuData` before any CPU
-/// installs its per-CPU pointer, so wherever [`current_cpu`] reads, this
-/// reads an initialised entry.
+/// Read through `PerCpuData::current` ([`crate::percpu::current_thread`]),
+/// one GS- or `tp`-relative load. Phase 4 (`sched::init_storage`) allocates
+/// every CPU's `PerCpuData` before any CPU installs its per-CPU pointer, and
+/// `sched::init` names each CPU's idle thread in it, so wherever
+/// [`current_cpu`] reads, this reads a pointer this CPU's scheduler also
+/// holds, or null.
 ///
 /// [`current_cpu`]: crate::arch::current::cpu::current_cpu
 ///
@@ -1111,9 +1111,8 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 #[inline]
 pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBlock
 {
-    // SAFETY: the per-CPU pointer is installed (contract), and init_storage
-    // named this CPU's scheduler entry before any CPU installed one.
-    unsafe { crate::percpu::current_scheduler().current() }
+    // SAFETY: the per-CPU pointer is installed (contract).
+    unsafe { crate::percpu::current_thread() }
 }
 
 /// A capability resolved from a user handle, with the object it names pinned

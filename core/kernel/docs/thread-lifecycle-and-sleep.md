@@ -452,7 +452,7 @@ disabled, so the thread never reschedules). Running steps 8-20 inline would wedg
 that CPU (#341).
 
 `dealloc_thread` detects this case
-(`tcb == scheduler_for(this_cpu).current()`) and splits the protocol:
+(`tcb == percpu::current_thread()`) and splits the protocol:
 
 - **Inline, on the dying thread:** steps 1-4 only, via
   `set_state_under_all_locks(tcb, Exited)` (mark Exited + drain every run queue).
@@ -531,12 +531,13 @@ Registry).
    would deadlock.
 
 5. **Step 9's `context_saved` spin is the load-bearing UAF gate, and is unconditional.** On both
-   arches, `schedule()` calls `set_current(next)` and `release_lock_only(sched.lock)` *before*
-   `switch()` saves the dying thread's registers into `tcb.saved_state`. A peer CPU acquiring the
-   same lock at any moment after the release can therefore observe `sched.current = idle` while
-   `switch()` is still mid-save into `tcb.saved_state`. Freeing the TCB at that point lets the next
-   allocation reuse the memory; `switch()` then corrupts the new allocation, producing hangs
-   (`stress::thread_churn`, `bench thread_lifecycle`) or worse. Step 9 closes the window:
+   arches, `schedule()` calls `set_running(sched, next)` and `release_lock_only(sched.lock)`
+   *before* `switch()` saves the dying thread's registers into `tcb.saved_state`. A peer CPU
+   acquiring the same lock at any moment after the release can therefore observe
+   `sched.current = idle` while `switch()` is still mid-save into `tcb.saved_state`. Freeing the
+   TCB at that point lets the next allocation reuse the memory; `switch()` then corrupts the new
+   allocation, producing hangs (`stress::thread_churn`, `bench thread_lifecycle`) or worse. Step 9
+   closes the window:
    `context_saved` is cleared by `schedule()` *before* the save and written `1` (Release) by
    `switch()` *after* the save; spinning on the Acquire load until it observes `1` guarantees the
    save has fully published (the `context_saved` protocol of

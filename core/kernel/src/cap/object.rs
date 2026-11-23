@@ -3020,13 +3020,12 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
     {
         ObjectType::Thread | ObjectType::CSpaceObj | ObjectType::AddressSpace =>
         {
-            let cpu = crate::arch::current::cpu::current_cpu() as usize;
             // SAFETY: refcount 0, exclusively owned (but for a `CSpace`
             // wrapper's arena-page `owner` back-pointer, which
-            // `push_deferred_reclaim` allows), a linkable type; the CPU index
-            // is stable (syscall context with interrupts disabled, or the
+            // `push_deferred_reclaim` allows), a linkable type; the CPU is
+            // stable (syscall context with interrupts disabled, or the
             // pinned idle thread's drain, per the contract).
-            unsafe { push_deferred_reclaim(cpu, obj) };
+            unsafe { push_deferred_reclaim(obj) };
         }
         ObjectType::Memory
         | ObjectType::Mmio
@@ -3078,19 +3077,22 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
 /// self-teardown is already `Exited` and unlinked from every run queue; one
 /// pushed by `release_ref` may be in any state, and the drain's Thread arm
 /// then runs `dealloc_object`'s ordinary stop-and-drain — or its self net
-/// when the draining thread is that thread. `cpu` is the local CPU index
-/// (`< MAX_CPUS`) and its scheduler is initialised.
+/// when the draining thread is that thread. The caller cannot migrate
+/// (interrupts disabled, or the idle thread), and the object is queued on
+/// the stack of the CPU it runs on, reached through `PerCpuData::scheduler`.
 #[expect(
     clippy::cast_ptr_alignment,
     reason = "the `*mut u8` head only ever holds an object pointer stored by this function (header \
               at offset 0, 8-byte aligned)"
 )]
 #[cfg(not(test))]
-pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObjectHeader>)
+pub(crate) unsafe fn push_deferred_reclaim(ptr: NonNull<KernelObjectHeader>)
 {
     let node = ptr.as_ptr();
-    // SAFETY: cpu < MAX_CPUS; scheduler initialised by sched::init.
-    let sched = unsafe { crate::sched::scheduler_for(cpu) };
+    // SAFETY: kernel context on a CPU whose per-CPU pointer is installed and
+    // which the caller cannot leave (contract); its scheduler is initialised
+    // by sched::init.
+    let sched = unsafe { crate::percpu::current_scheduler() };
     let slot = &sched.deferred_reclaim_head;
     // SAFETY: ptr is a valid object of a linkable type per contract.
     let link = unsafe { deferred_link(ptr) };
@@ -3125,10 +3127,10 @@ pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObject
 /// The contract of [`reclaim_deferred_stack`].
 #[cfg(not(test))]
 #[inline]
-pub unsafe fn drain_deferred_reclaim(cpu: usize)
+pub unsafe fn drain_deferred_reclaim()
 {
     // SAFETY: forwarded caller contract.
-    unsafe { reclaim_deferred_stack(cpu) };
+    unsafe { reclaim_deferred_stack() };
     // SAFETY: syscall-epilogue context with interrupts disabled, or the idle
     // thread, holding no lock: the context release_ref allows.
     unsafe { crate::cap::sole_reference::drain() };
@@ -3165,14 +3167,11 @@ pub unsafe fn drain_deferred_reclaim(cpu: usize)
               (header at offset 0, 8-byte aligned)"
 )]
 #[cfg(not(test))]
-unsafe fn reclaim_deferred_stack(cpu: usize)
+unsafe fn reclaim_deferred_stack()
 {
-    if cpu >= crate::sched::MAX_CPUS
-    {
-        return;
-    }
-    // SAFETY: cpu < MAX_CPUS; scheduler initialised by sched::init.
-    let sched = unsafe { crate::sched::scheduler_for(cpu) };
+    // SAFETY: the running thread on a CPU whose per-CPU pointer is installed
+    // (contract); its scheduler is initialised by sched::init.
+    let sched = unsafe { crate::percpu::current_scheduler() };
     // Fast path: the stack is empty on virtually every call (self-teardown is
     // rare), so avoid the swap's RMW. Acquire pairs with the push's release CAS.
     if sched
@@ -3222,10 +3221,10 @@ unsafe fn reclaim_deferred_stack(cpu: usize)
 #[cfg(not(test))]
 unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
 {
-    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: this_cpu < MAX_CPUS; `current` is written only by this CPU at
-    // dispatch, and per contract we are that running thread.
-    let cur = unsafe { crate::sched::scheduler_for(this_cpu).current() };
+    // SAFETY: `current` is written only by this CPU at dispatch, and per
+    // contract we are that running thread, on a CPU whose per-CPU pointer is
+    // installed.
+    let cur = unsafe { crate::percpu::current_thread() };
     // Tripwire for the contract above: the caller observed its own `Exited`
     // state under the scheduler lock, so the read here is stable.
     // SAFETY: cur is this CPU's `current`, valid while installed.
@@ -3242,7 +3241,7 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
     // SAFETY: refcount 0, exclusively owned but for a `CSpace` wrapper's
     // arena-page `owner` back-pointer, which `push_deferred_reclaim` allows,
     // and of a linkable type; queued for off-CPU reclaim on this CPU.
-    unsafe { push_deferred_reclaim(this_cpu, ptr) };
+    unsafe { push_deferred_reclaim(ptr) };
 }
 
 /// Unlink a dying thread from the source queue its park binding names, under
@@ -4953,13 +4952,10 @@ unsafe fn dealloc_thread(
     // with the thread off-CPU, where the gate passes immediately.
     if !tcb.is_null()
     {
-        let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
-        // SAFETY: this_cpu < MAX_CPUS; scheduler initialised. Reading our
-        // own CPU's `current` needs no lock — only this CPU writes it at
-        // dispatch, and we are that running thread.
-        let is_self = core::ptr::eq(tcb, unsafe {
-            crate::sched::scheduler_for(this_cpu).current()
-        });
+        // SAFETY: reading our own CPU's `current` needs no lock — only this
+        // CPU writes it at dispatch, and we are that running thread, on a CPU
+        // whose per-CPU pointer is installed.
+        let is_self = core::ptr::eq(tcb, unsafe { crate::percpu::current_thread() });
         if is_self
         {
             log_self_teardown(tcb, "Thread");
@@ -4987,7 +4983,7 @@ unsafe fn dealloc_thread(
             }
             // SAFETY: object exclusively owned (refcount 0), now Exited
             // and drained; queue it for off-CPU reclaim on this CPU.
-            unsafe { push_deferred_reclaim(this_cpu, ptr) };
+            unsafe { push_deferred_reclaim(ptr) };
             return;
         }
     }

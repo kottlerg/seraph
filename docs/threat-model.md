@@ -73,9 +73,12 @@ controls below as specified.
   which open the SMAP window on x86-64 and `sstatus.SUM` on riscv64 for the copy alone; outside them
   the kernel can neither execute nor access user pages ([memory-model.md](memory-model.md) § Kernel
   Isolation — SMEP and SMAP; `core/kernel/src/arch/x86_64/cpu.rs`,
-  `core/kernel/src/arch/riscv64/cpu.rs`). Each handler checks that a user span lies in the user half
-  before its copy (the memory syscalls through `mm::user_page_range` in
-  `core/kernel/src/mm/mod.rs`).
+  `core/kernel/src/arch/riscv64/cpu.rs`). Each handler checks, in its own code, that the user span
+  it copies lies in the user half: against `mm::user_va_top()` before the copy (for example the
+  bitmap of `sys_aspace_harvest` in `core/kernel/src/syscall/mem.rs`), or, for the IPC buffer, when
+  `SYS_IPC_BUFFER_SET` registers it (`core/kernel/src/syscall/mod.rs`). `mm::user_page_range`
+  (`core/kernel/src/mm/mod.rs`) is the matching check of the page range a memory syscall maps,
+  unmaps, protects or harvests.
 - No page is writable and executable at once, kernel image included, apart from the AP trampoline
   page during bring-up ([memory-model.md](memory-model.md) § W^X Enforcement).
 - The kernel's virtual layout is randomized, and no value the kernel emits carries a kernel virtual
@@ -101,9 +104,9 @@ and no proof harness covers a syscall's argument checks or a capability lookup.
 
 **Gaps.**
 
-- The user-half check of a user span is a step each handler takes before its copy; no type carries a
-  checked span, and the copies themselves do not check it (`core/kernel/src/uaccess.rs`). SMAP and
-  `SUM` do not stop a kernel-half address, so a handler that omits the check copies kernel memory.
+- The user-half check of a copied span is made in each handler's own code; no type carries a checked
+  span, and the copies themselves do not check it (`core/kernel/src/uaccess.rs`). SMAP and `SUM` do
+  not stop a kernel-half address, so a handler that omits the check copies kernel memory.
 - On riscv64 the data bounds of the capability lookup are the only transient-execution defence: the
   RVA23 floor defines no speculation control
   ([core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md) § Scope).
@@ -146,8 +149,8 @@ service executes as built, since procmgr verified it.
   stays with the server and its trusted minters ([capability-model.md](capability-model.md)
   § Badges). A partition's block-device badge, for example, bounds every transfer to the partition
   (`resolve_lba` in `services/drivers/virtio/blk/src/main.rs`).
-- Every blocking receive loop routes its failures through `ipc::recv_guard::RecvGuard`, which backs
-  off and ends the process when a failure persists, so a wedged receive cannot spin
+- A service's blocking receive loop routes its failures through `ipc::recv_guard::RecvGuard`, which
+  backs off and ends the process when a failure persists, so a wedged receive cannot spin
   ([ipc-design.md](ipc-design.md) § Receive-Failure Policy; `shared/ipc/src/recv_guard.rs`).
 - The variable-length wire formats are decoded by code the sender and the receiver share, in
   `shared/ipc` (`log_record.rs`, `log_query.rs`, `procmgr_snapshot.rs`, `memmgr_capture.rs` and the
@@ -165,6 +168,9 @@ and proof harnesses for the decoders of `shared/ipc`, `shared/namespace-protocol
 - Each server's dispatcher checks its own labels, word counts, versions and badges; no shared layer
   checks them, and no review has yet covered every label of every service against this attacker. The
   audit of this section ([#680](https://github.com/kottlerg/seraph/issues/680)) is the first.
+- gdbstub's fault receiver retries a failed receive every 10 ms without `RecvGuard`
+  (`start_receiver` in `services/gdbstub/src/main.rs`), against [ipc-design.md](ipc-design.md)
+  § Receive-Failure Policy; only kernel-delivered faults reach its endpoint.
 - No standard governs how a server reads a structure from memory a client lent it and can still
   write, so a check and a later read of the same bytes can see different values.
 
@@ -270,7 +276,8 @@ and proof harnesses for `validate`, `validate_executable`, `parse_stack_note`, `
   `/services/drivers/` before any verification, to choose the driver a device binds (`file_decl`,
   `read_decl` in `services/devmgr/src/decls.rs`), so the storage writer reaches
   `elf::validate_executable`, `elf::find_note_streaming` and the declaration decoder with bytes no
-  key signed. procmgr still refuses to run such a file.
+  key signed. procmgr still refuses to run such a file
+  ([#1533](https://github.com/kottlerg/seraph/issues/1533)).
 - No fuzz target or proof harness covers `shared/elf` yet, and none is planned for
   `find_note_streaming` or the declaration decoder.
 
@@ -418,12 +425,15 @@ Wycheproof vectors, `shared/objsig` is host-tested, and the booted `signing`, `r
   the ESP replaces the bootloader and its roots, and a whole older image boots; an image packed with
   a test harness signed `init` boots that harness on a system that trusts its key; a console user
   who confirms an attacker's trust request enrols its roots; an attacker at the firmware's shell can
-  delete the enrolled store; and an older signed configuration directory at an admitted security
-  version verifies ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
+  delete the enrolled store; on a platform whose firmware refuses the floor's write, only the
+  build-time floor holds, so an older image signed at or above it boots ([signing.md](signing.md)
+  § Rollback Floor); and an older signed configuration directory at an admitted security version
+  verifies ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
 - The parsers of the signature trailer, the certificate, the trust store and the trust request,
   which read bytes before any signature over them is checked, have no fuzz target or proof harness,
   and none is planned.
-- devmgr parses drivers-directory files before procmgr verifies them (§ ELF Loading).
+- devmgr parses drivers-directory files before procmgr verifies them (§ ELF Loading,
+  [#1533](https://github.com/kottlerg/seraph/issues/1533)).
 - Secure Boot and a TPM are not required by the platform floor
   ([#1420](https://github.com/kottlerg/seraph/issues/1420)), and no project root key signs releases
   yet ([#1073](https://github.com/kottlerg/seraph/issues/1073)).

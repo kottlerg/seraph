@@ -31,7 +31,8 @@
 // refuter whether it is a defect at all and whether the section's attacker,
 // under its assumptions, can reach it. A defect both refute is dropped; one
 // refuted once is contested. A confirmed defect the attacker cannot reach is
-// still a defect and is reported, apart.
+// still a defect and is reported, apart, and so is one whose reach refuter
+// returned no result, since no one judged its reach.
 //
 // The script renders the report and the draft items in the form of
 // docs/conventions.md § Recording findings itself; no agent renders, so no
@@ -837,7 +838,9 @@ const confirmed = all.filter((f) => f.status === 'confirmed')
 const document_defects = confirmed.filter((f) => f.kind === 'document')
 const code_defects = confirmed.filter((f) => f.kind !== 'document')
 const reachable = code_defects.filter((f) => f.reachable === true)
-const unreachable = code_defects.filter((f) => f.reachable !== true)
+const unreachable = code_defects.filter((f) => f.reachable === false)
+// A confirmed defect whose reach refuter returned nothing: no one judged its reach.
+const reach_unjudged = code_defects.filter((f) => f.reachable === null)
 const undecided = all.filter((f) => f.status === 'contested' || f.status === 'unverified')
 const known = all.filter((f) => f.status === 'known')
 const dropped = all.filter((f) => f.status === 'dropped')
@@ -901,15 +904,17 @@ if (!scope.complete) {
         JSON.stringify(scope.unanchored) + ', unresolved ' + JSON.stringify(scope.unresolved) + '.')
 }
 
-const drafts = [...reachable, ...unreachable, ...document_defects].map(draft)
+const drafts = [...reachable, ...reach_unjudged, ...unreachable, ...document_defects].map(draft)
 const report = [
     '# Threat audit: ' + TARGET,
     '',
     'Head ' + scope.head + ', tree ' + scope.repo_root + '. ' + scope.shards.length +
         ' shards and the ' +
         'document lens; ' + agent_calls + ' agents. ' + all.length + ' defects: ' +
-        reachable.length + ' confirmed and reachable, ' + unreachable.length + ' confirmed and ' +
-        'not reachable, ' + document_defects.length + ' confirmed in the section itself, ' +
+        reachable.length + ' confirmed and reachable, ' + reach_unjudged.length +
+        ' confirmed with reach not judged, ' + unreachable.length +
+        ' confirmed and not reachable, ' + document_defects.length +
+        ' confirmed in the section itself, ' +
         undecided.length + ' contested or unverified, ' + known.length +
         ' known, ' + dropped.length + ' dropped.',
     '',
@@ -919,6 +924,9 @@ const report = [
         '; ' + s.items.join(', ')).join('\n'),
     '',
     section_of('Confirmed, reachable by the section\'s attacker', reachable, true),
+    '',
+    section_of('Confirmed, reach not judged (its reach refuter returned no result)', reach_unjudged,
+        true),
     '',
     section_of('Confirmed, not reachable by the section\'s attacker', unreachable, true),
     '',
@@ -952,6 +960,7 @@ return {
     save_as: { report: short(scope.head) + '.md', json: short(scope.head) + '.json' },
     drafts,
     reachable: reachable.map(plain),
+    reach_unjudged: reach_unjudged.map(plain),
     unreachable: unreachable.map(plain),
     document: document_defects.map(plain),
     undecided: undecided.map(plain),

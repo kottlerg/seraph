@@ -1268,7 +1268,7 @@ selected by a field code. Read-only inquiry.
 |---|---|---|
 | 0 | `cap` | Capability handle to inspect |
 | 1 | `field` | Field selector (`CAP_INFO_*` constant) |
-| 2 | `first_page` / `credential` | `CAP_INFO_MEMORY_MAPPINGS`: first page of the window, from the region's base. `CAP_INFO_MEMORY_PHYS_BASE`: a Memory cap of the caller's carrying the `Phys` right, presented for a `cap` that lacks it, or `0` for none |
+| 2 | `first_page` / `credential` / `view` | `CAP_INFO_MEMORY_MAPPINGS`: first page of the window, from the region's base. `CAP_INFO_MEMORY_PHYS_BASE`: a Memory cap of the caller's carrying the `Phys` right, presented for a `cap` that lacks it, or `0` for none. `CAP_INFO_THREAD_PLACEMENT`: the view (`THREAD_PLACEMENT_*`) |
 | 3 | `pages` | `CAP_INFO_MEMORY_MAPPINGS` only: window length in pages (1–`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES`) |
 
 **Return:** `rax`/`a0`: the requested field value on success; `SyscallError` on failure.
@@ -1368,18 +1368,29 @@ Blocking syscalls), so a thread read with `IN_CALL` and `PENDING` and not `MASKE
 instruction before its upcall is delivered at the call's return; a debugger counts it stopped. The
 flags are a snapshot: the next post, unmask, delivery or return can change them.
 
+`CAP_INFO_THREAD_PLACEMENT` (20) returns, for a Thread cap, the view of the thread's placement that
+argument 2 names: `THREAD_PLACEMENT_CPU` (0), the CPU the thread was last linked on a run queue of
+or dispatched on, the one a wake of it next prefers, read under its scheduling lock; or one of its
+placement counters ([scheduler.md](scheduler.md#placement-counters) § Placement Counters):
+`THREAD_PLACEMENT_REMOTE_WAKES` (1), `THREAD_PLACEMENT_IDLE_WAKES` (2),
+`THREAD_PLACEMENT_WAKE_MOVES` (3) and `THREAD_PLACEMENT_PULLS` (4). A counter is a free-running
+32-bit count that wraps, read without a lock, a snapshot, so a reader takes the wrapping difference
+of two reads. They are diagnostics: ktest's round-trip benchmarks read them to report where their
+two threads ran ([core/ktest/README.md](../../ktest/README.md)). An unknown view answers
+`InvalidArgument`.
+
 **Capability requirement:** None for every selector but `CAP_INFO_MEMORY_PHYS_BASE`, which
 needs the Memory `Phys` right on the queried cap or the credential; `cap_info` otherwise reads
 the slot without a rights check.
 
-**Errors:** `InvalidCapability` (null/stale handle, empty slot, a referenced target
-object is gone, or a `CAP_INFO_MEMORY_PHYS_BASE` credential that is not a live Memory cap),
-`InsufficientRights` (`CAP_INFO_MEMORY_PHYS_BASE` with neither the queried cap nor the
-credential carrying `Phys`), `InvalidArgument` (field requires a different capability type, the
-selector is unknown, a `CAP_INFO_MEMORY_MAPPINGS` window is empty, longer than
-`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages, or runs past the region, or a
-`CAP_INFO_IRQ_MSG_ADDRESS` or `CAP_INFO_IRQ_MSG_DATA` cap names no message-signaled target, or a
-`CAP_INFO_IRQ_REMAP_ENTRY` cap is a range), `InvalidState` (`CAP_INFO_IRQ_REMAP_ENTRY` with
+**Errors:** `InvalidCapability` (null/stale handle, empty slot, a referenced target object is gone,
+or a `CAP_INFO_MEMORY_PHYS_BASE` credential that is not a live Memory cap), `InsufficientRights`
+(`CAP_INFO_MEMORY_PHYS_BASE` with neither the queried cap nor the credential carrying `Phys`),
+`InvalidArgument` (field requires a different capability type, the selector is unknown, a
+`CAP_INFO_MEMORY_MAPPINGS` window is empty, longer than `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages,
+or runs past the region, or a `CAP_INFO_IRQ_MSG_ADDRESS` or `CAP_INFO_IRQ_MSG_DATA` cap names no
+message-signaled target, a `CAP_INFO_IRQ_REMAP_ENTRY` cap is a range, or a
+`CAP_INFO_THREAD_PLACEMENT` view is unknown), `InvalidState` (`CAP_INFO_IRQ_REMAP_ENTRY` with
 remapping off or on a line not routed), `NotSupported` (either `CAP_INFO_IRQ_REMAP_*` selector on
 RISC-V).
 

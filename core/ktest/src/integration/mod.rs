@@ -73,6 +73,7 @@ pub mod thread_ext_regs;
 pub mod thread_lifecycle;
 pub mod thread_list_pages;
 pub mod thread_memory;
+pub mod thread_placement;
 pub mod thread_upcall;
 pub mod tlb_coherency;
 pub mod tlb_widen_retry;
@@ -220,6 +221,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::busy_cpu_placement",
         busy_cpu_placement::run(ctx)
     );
+    run_integration_test!("integration::thread_placement", thread_placement::run(ctx));
     run_integration_test!(
         "integration::shared_memory_two_aspaces",
         shared_memory_two_aspaces::run(ctx)

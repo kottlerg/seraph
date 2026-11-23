@@ -96,7 +96,7 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, h: &mut Har
         return h.skip(NAME, "the child could not be created");
     };
 
-    run_ping_pong([ping, pong, done], &child, h);
+    run_ping_pong([ping, pong, done], ctx.thread_cap, &child, h);
 
     // One cleanup path for every exit: deleting the child's Thread cap also
     // ends a child still parked in `notification_wait` after an early break.
@@ -108,13 +108,19 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, h: &mut Har
 }
 
 /// Start the pong child on `[ping, pong, done]`, time [`Harness::iters`]
-/// round trips, and report the result. Returns early, leaving cleanup to the
-/// caller, when the child cannot be set up.
+/// round trips against the harness thread `ctx_thread` names, and report the
+/// result with the placement of the two threads. Returns early, leaving
+/// cleanup to the caller, when the child cannot be set up.
 #[expect(
     clippy::similar_names,
     reason = "ping/pong are intentionally paired names for the two directions"
 )]
-fn run_ping_pong([ping, pong, done]: [u64; 3], child: &spawn::SpawnedChild, h: &mut Harness)
+fn run_ping_pong(
+    [ping, pong, done]: [u64; 3],
+    ctx_thread: u64,
+    child: &spawn::SpawnedChild,
+    h: &mut Harness,
+)
 {
     const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
     const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
@@ -153,6 +159,7 @@ fn run_ping_pong([ping, pong, done]: [u64; 3], child: &spawn::SpawnedChild, h: &
         return h.skip(NAME, "the child did not start");
     }
 
+    let start = super::Placement::read(ctx_thread, child.th);
     let (mut samples, counters) = h.recorder();
     let mut completed: u64 = 0;
     for _ in 0..n
@@ -170,6 +177,7 @@ fn run_ping_pong([ping, pong, done]: [u64; 3], child: &spawn::SpawnedChild, h: &
         samples.record(t1.since(&t0).cycles);
         completed = completed.saturating_add(1);
     }
+    let end = super::Placement::read(ctx_thread, child.th);
 
     // After every round trip the child has sent its last pong and is on its
     // way to `done`; after an early break it may wait for a ping for good, so
@@ -180,5 +188,6 @@ fn run_ping_pong([ping, pong, done]: [u64; 3], child: &spawn::SpawnedChild, h: &
     }
     let summary = samples.summary();
 
-    h.report(NAME, &[], summary, &[]);
+    let extras = super::placement_extras(start.as_ref(), end.as_ref());
+    h.report(NAME, &[], summary, extras.as_ref().map_or(&[], |e| &e[..]));
 }

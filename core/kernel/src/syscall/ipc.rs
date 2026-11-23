@@ -599,8 +599,8 @@ unsafe fn deliver_call_caps(
     unsafe {
         (*server_tcb)
             .ipc_msg
-            .set_caps(leading(&dst_handles, transferred))
-    };
+            .set_caps(leading(&dst_handles, transferred));
+    }
 }
 
 /// Open a `sys_ipc_call` park episode: reset the reply disposition and
@@ -1248,8 +1248,8 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
     unsafe {
         (*caller)
             .ipc_msg
-            .begin(syscall::IPC_REPLY_TRANSFER_FAILED, 0)
-    };
+            .begin(syscall::IPC_REPLY_TRANSFER_FAILED, 0);
+    }
     // SAFETY: caller is a valid parked TCB whose episode the invoking path
     // has exclusively claimed (caller contract).
     unsafe {
@@ -1331,7 +1331,7 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
         // thread owns and whose last message it has already delivered.
         // SAFETY: tcb is the calling thread's valid TCB and tf its frame;
         // the running thread owns its ipc_msg.
-        unsafe { stage_reply_payload(tf, tcb, label, data_count, cap_count, &mut (*tcb).ipc_msg) }?;
+        unsafe { stage_reply_payload(tf, tcb, label, data_count, cap_count, tcb) }?;
         return Err(SyscallError::InvalidCapability);
     };
 
@@ -1353,52 +1353,43 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     // transfer-failed reply goes to the caller and the error to the server.
     // SAFETY: tcb is the calling thread's valid TCB and tf its frame; caller
     // is pinned by the won claim, which owns its ipc_msg until the wake.
-    let staged = unsafe {
-        stage_reply_payload(
-            tf,
-            tcb,
-            label,
-            data_count,
-            cap_count,
-            &mut (*caller).ipc_msg,
-        )
-    }
-    .and_then(|()| {
-        if cap_count == 0
-        {
-            return Ok(());
-        }
-        // Pre-allocating here keeps OOM out of the transfer below;
-        // `transfer_caps` pre-allocates again under the locks it moves
-        // under, so a slot consumed meanwhile is still caught. The caller's
-        // CSpace is resolved through the registry
-        // (core/kernel/docs/capability-internals.md § Move).
-        crate::cap::DERIVATION_LOCK.write_lock();
-        // SAFETY: caller is pinned by the won claim, so its TCB is live.
-        let caller_cspace = unsafe { crate::cap::CSpaceIdentity::of_thread(caller) };
-        let r = match caller_cspace.lookup()
-        {
-            Some(cs) =>
+    let staged = unsafe { stage_reply_payload(tf, tcb, label, data_count, cap_count, caller) }
+        .and_then(|()| {
+            if cap_count == 0
             {
-                // SAFETY: cs is registry-resolved under the derivation
-                // lock, so live.
-                let lock = unsafe { &(*cs).lock };
-                // SAFETY: lock_raw pairs with the unlock_raw below.
-                let saved = unsafe { lock.lock_raw() };
-                // SAFETY: cs is live (as above), and its held lock
-                // serialises its slots.
-                let r = unsafe { (*cs).pre_allocate(cap_count) };
-                // SAFETY: cs is live (as above).
-                let lock = unsafe { &(*cs).lock };
-                // SAFETY: paired with the lock_raw above.
-                unsafe { lock.unlock_raw(saved) };
-                r.map_err(SyscallError::from)
+                return Ok(());
             }
-            None => Err(SyscallError::InvalidCapability),
-        };
-        crate::cap::DERIVATION_LOCK.write_unlock();
-        r
-    });
+            // Pre-allocating here keeps OOM out of the transfer below;
+            // `transfer_caps` pre-allocates again under the locks it moves
+            // under, so a slot consumed meanwhile is still caught. The caller's
+            // CSpace is resolved through the registry
+            // (core/kernel/docs/capability-internals.md § Move).
+            crate::cap::DERIVATION_LOCK.write_lock();
+            // SAFETY: caller is pinned by the won claim, so its TCB is live.
+            let caller_cspace = unsafe { crate::cap::CSpaceIdentity::of_thread(caller) };
+            let r = match caller_cspace.lookup()
+            {
+                Some(cs) =>
+                {
+                    // SAFETY: cs is registry-resolved under the derivation
+                    // lock, so live.
+                    let lock = unsafe { &(*cs).lock };
+                    // SAFETY: lock_raw pairs with the unlock_raw below.
+                    let saved = unsafe { lock.lock_raw() };
+                    // SAFETY: cs is live (as above), and its held lock
+                    // serialises its slots.
+                    let r = unsafe { (*cs).pre_allocate(cap_count) };
+                    // SAFETY: cs is live (as above).
+                    let lock = unsafe { &(*cs).lock };
+                    // SAFETY: paired with the lock_raw above.
+                    unsafe { lock.unlock_raw(saved) };
+                    r.map_err(SyscallError::from)
+                }
+                None => Err(SyscallError::InvalidCapability),
+            };
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            r
+        });
     if let Err(e) = staged
     {
         // SAFETY: caller is the parked TCB whose episode the claim won.
@@ -1437,8 +1428,8 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
         unsafe {
             (*caller)
                 .ipc_msg
-                .set_caps(leading(&dst_handles, transferred))
-        };
+                .set_caps(leading(&dst_handles, transferred));
+        }
     }
 
     // Deposit complete (label and data words for the caller's return and
@@ -1600,11 +1591,11 @@ unsafe fn deposit_reply_word(
     let _ = deposit.fill_data(1, |word| unsafe { read_ipc_buf(buf, word) });
 }
 
-/// Start `msg` as a reply with `label` and no badge, read the reply's data
-/// words (from the server's message registers or its IPC buffer, by their
-/// count: [`read_data_words`]) and its `cap_count` capability handles (from
-/// its IPC buffer) into it, and pre-validate the capability slots in the
-/// server's own `CSpace`.
+/// Start a reply with `label` and no badge in `into`'s `ipc_msg`, read the
+/// reply's data words (from the server's message registers or its IPC
+/// buffer, by their count: [`read_data_words`]) and its `cap_count`
+/// capability handles (from its IPC buffer) into it, and pre-validate the
+/// capability slots in the server's own `CSpace`.
 ///
 /// # Errors
 /// `read_data_words`' errors for the data words, `read_cap_handles`' for the
@@ -1614,7 +1605,9 @@ unsafe fn deposit_reply_word(
 /// cap's object is at the reference ceiling.
 ///
 /// # Safety
-/// `server` must be the calling thread's valid TCB and `tf` its frame.
+/// `server` must be the calling thread's valid TCB and `tf` its frame;
+/// `into` a valid TCB whose `ipc_msg` the caller owns: `server` itself, or
+/// the caller whose reply claim it won.
 #[cfg(not(test))]
 unsafe fn stage_reply_payload(
     tf: UserFrame,
@@ -1622,12 +1615,15 @@ unsafe fn stage_reply_payload(
     label: u64,
     data_count: usize,
     cap_count: usize,
-    msg: &mut Message,
+    into: *mut crate::sched::thread::ThreadControlBlock,
 ) -> Result<(), SyscallError>
 {
     // SAFETY: server is the running thread; ipc_buffer is written only by
     // its own SYS_IPC_BUFFER_SET.
     let buf = unsafe { (*server).ipc_buffer };
+    // SAFETY: the caller owns into's ipc_msg (contract); the reads through
+    // server below are of other fields.
+    let msg = unsafe { &mut (*into).ipc_msg };
     msg.begin(label, 0);
     if data_count > 0
     {

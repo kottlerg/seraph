@@ -426,9 +426,13 @@ fn claim_bucket(chains: &mut Chains, bucket: usize)
 /// epilogue and in the idle loop; by the idle loop again while
 /// [`work_pending`] holds and its run queues are empty; and by
 /// [`drain_at_interrupt`] at the end of every interrupt taken from user mode;
-/// with no lock held. Reads one word when nothing is pending. The fired nodes
-/// a pass leaves stay marked for the next drain on any CPU, which a CPU
-/// running user code reaches at its next interrupt at the latest.
+/// with no lock held. The fired nodes a pass leaves stay marked for the next
+/// drain on any CPU, which a CPU running user code reaches at its next
+/// interrupt at the latest.
+///
+/// Inline, it is one load and a branch when nothing is pending, since the
+/// syscall epilogue runs it on every syscall; the pass is [`drain_pass`],
+/// out of line.
 ///
 /// # Safety
 /// No lock is held, and the context is one [`release_ref`] allows: syscall
@@ -438,7 +442,36 @@ fn claim_bucket(chains: &mut Chains, bucket: usize)
 ///
 /// [`release_ref`]: crate::cap::object::release_ref
 #[cfg(not(test))]
+#[inline]
 pub unsafe fn drain()
+{
+    // Relaxed: an Acquire load can return no value this one cannot, it only
+    // orders the accesses after it, and the pass orders its own through
+    // collect's Acquire load and AcqRel swap of the summary. Which values the
+    // load can return is what loses no post. A bit this CPU set (a release of
+    // its own, or a pass that left fired nodes) is always seen here, since a
+    // load reads its own CPU's earlier store to the same word, or a later
+    // value, and the pass that cleared the bit took its work; so the release
+    // a syscall makes is drained on that syscall's return. A bit another CPU
+    // set and this load misses is drained by that CPU, whose next drain point
+    // (its own syscall return, its next interrupt from user mode, or its idle
+    // loop) sees its own store. So every leftover is drained within the bound
+    // core/kernel/docs/capability-internals.md § Sole-Reference Observers
+    // states under The budget.
+    if TABLE.summary.load(Ordering::Relaxed) != 0
+    {
+        // SAFETY: forwarded caller contract.
+        unsafe { drain_pass() };
+    }
+}
+
+/// One pass of [`drain`], which found the summary non-zero.
+///
+/// # Safety
+/// The contract of [`drain`].
+#[cfg(not(test))]
+#[inline(never)]
+unsafe fn drain_pass()
 {
     let mut node = TABLE.collect(POST_BUDGET);
     while !node.is_null()
@@ -491,22 +524,20 @@ pub fn work_pending() -> bool
 /// One [`drain`] pass when the table has work, at the end of an interrupt
 /// taken from user mode. A CPU that runs only user code makes no syscall and
 /// never idles, so this is where it posts what earlier passes left: one pass,
-/// at most `POST_BUDGET` posts, per tick. Costs one load when nothing is
-/// pending.
+/// at most `POST_BUDGET` posts, per tick. Costs [`drain`]'s one load when
+/// nothing is pending.
 ///
 /// # Safety
 /// The end of an interrupt handler taken from user mode, the interrupt
 /// acknowledged, on the interrupted thread's kernel stack; no lock is held,
 /// interrupts disabled.
 #[cfg(not(test))]
+#[inline]
 pub unsafe fn drain_at_interrupt()
 {
-    if work_pending()
-    {
-        // SAFETY: an interrupt's end on the interrupted thread's kernel stack,
-        // no lock held, interrupts disabled (contract): a context drain allows.
-        unsafe { drain() };
-    }
+    // SAFETY: an interrupt's end on the interrupted thread's kernel stack, no
+    // lock held, interrupts disabled (contract): a context drain allows.
+    unsafe { drain() };
 }
 
 #[cfg(test)]

@@ -364,10 +364,11 @@ fn cycles_per_ms() -> Result<u64, &'static str>
     let c1 = crate::arch::cycles_now();
     let us1 = elapsed().map_err(|_| "busy_cpu: system_info(ElapsedUs) failed")?;
     let us = us1.saturating_sub(us0).max(1);
-    let per_ms = u128::from(c1.wrapping_sub(c0)).saturating_mul(1000) / u128::from(us);
-    u64::try_from(per_ms)
-        .ok()
-        .filter(|&r| r > 0)
+    u128::from(c1.wrapping_sub(c0))
+        .saturating_mul(1000)
+        .checked_div(u128::from(us))
+        .and_then(|per_ms| u64::try_from(per_ms).ok())
+        .filter(|&per_ms| per_ms > 0)
         .ok_or("busy_cpu: the cycle counter did not advance")
 }
 

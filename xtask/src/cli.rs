@@ -350,6 +350,13 @@ args! {
         #[arg(long, hide = true)]
         pub skip_lints: bool,
 
+        /// Build ktest with its `bench-only` feature: the benchmark tier
+        /// alone, each benchmark at its full iteration count, for a run whose
+        /// result lines are compared (core/ktest/README.md "Tier 3"). Needs a
+        /// build that includes ktest (`--component all` or `ktest`).
+        #[arg(long)]
+        pub ktest_bench_only: bool,
+
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
         #[command(flatten)]

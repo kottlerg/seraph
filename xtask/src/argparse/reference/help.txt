@@ -81,6 +81,7 @@ Options:
       --release                Build in release mode (default: debug)
       --component <COMPONENT>  Build only one component (default: all): `boot`, or the crate name of any component the build installs [default: all]
       --debug <DEBUG>          Emit debuginfo (`debug = 2`, `opt-level = 1`) for the named component(s) only, within the active profile (default or `--release`). Comma-separated, e.g. `--debug kernel,procmgr`; names match `--component`. Only components in the current build are affected
+      --ktest-bench-only       Build ktest with its `bench-only` feature: the benchmark tier alone, each benchmark at its full iteration count, for a run whose result lines are compared (core/ktest/README.md "Tier 3"). Needs a build that includes ktest (`--component all` or `ktest`)
       --wait-host <SECS>       When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help                   Print help (see more with '--help')
@@ -109,6 +110,9 @@ Options:
 
       --debug <DEBUG>
           Emit debuginfo (`debug = 2`, `opt-level = 1`) for the named component(s) only, within the active profile (default or `--release`). Comma-separated, e.g. `--debug kernel,procmgr`; names match `--component`. Only components in the current build are affected
+
+      --ktest-bench-only
+          Build ktest with its `bench-only` feature: the benchmark tier alone, each benchmark at its full iteration count, for a run whose result lines are compared (core/ktest/README.md "Tier 3"). Needs a build that includes ktest (`--component all` or `ktest`)
 
       --wait-host <SECS>
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal

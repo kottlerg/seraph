@@ -125,9 +125,12 @@ pub unsafe fn post(
     if any_instruction
     {
         // A target running on another CPU takes the prod's interrupt and
-        // reaches its return to user mode; one running nowhere reaches a
-        // delivery point when it next returns to user mode, and one running on
-        // this CPU is the caller, which delivers at this syscall's return.
+        // reaches its return to user mode; one waiting on a run queue, which a
+        // return to user mode preempted, passes that return's delivery point
+        // when it runs again (sched::deliver_and_preempt); a fault-blocked one
+        // passes none at its fault's own return, only at a later interrupt or
+        // syscall; and one running on this CPU is the caller, which delivers
+        // at this syscall's return.
         // SAFETY: target valid; the scan reads each CPU's current under its lock.
         if let Some(cpu) = unsafe { running_cpu(target) }
             && cpu != crate::arch::current::cpu::current_cpu() as usize

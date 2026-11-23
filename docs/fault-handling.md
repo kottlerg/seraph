@@ -561,10 +561,10 @@ A pending upcall is delivered at the first delivery point the thread reaches aft
   is the return to user mode of an interrupt that preempted the thread, or of an exception at
   whose end the kernel preempted it for a higher-priority thread, so it reaches a thread that makes
   no syscall. The post prods a CPU running the thread, so the thread takes an interrupt. A thread
-  running on no CPU reaches a point when it next returns to user mode: one preempted at a return
-  passes that return's delivery point when it runs again
+  the kernel preempted at a return to user mode, waiting on a run queue, passes that return's
+  delivery point when it runs again
   ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md#wake-preemption) § Wake
-  Preemption).
+  Preemption); a fault-blocked thread passes none at its fault's own return (§ Nesting).
 
 A thread at neither point keeps the upcall pending. Such a thread spins without syscalls, or was
 posted to without `UPCALL_ANY_INSTRUCTION`.

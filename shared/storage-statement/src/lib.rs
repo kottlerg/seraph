@@ -715,18 +715,41 @@ mod proofs
 {
     use super::{ErrorKind, Key, Role, conflict, property};
 
-    /// Every line of at most 46 bytes holds the line contract. 46 bytes
-    /// hold a `data` line with a one-byte component (44 bytes) and a `swap`
-    /// line (41) with room for a field too many, so each refusal and each
-    /// acceptance of both roles is reached.
+    /// Every line of at most 12 bytes holds the line contract: each
+    /// refusal of a line's shape for both roles (an unknown keyword, a field
+    /// missing, extra or empty, a path out of its form) and of a GUID too
+    /// short to be one.
     #[kani::proof]
-    #[kani::unwind(48)]
-    fn every_line_holds_the_line_contract()
+    #[kani::unwind(14)]
+    fn every_short_line_holds_the_line_contract()
     {
-        let bytes: [u8; 46] = kani::any();
+        let bytes: [u8; 12] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= bytes.len());
         property::line_holds(&bytes[..len]);
+    }
+
+    /// Every line made of any head of at most 10 bytes, a space and a
+    /// canonical GUID whose first digit is any byte holds the line contract:
+    /// both roles' acceptance, a `data` line's path of up to three bytes, a
+    /// field too many before the GUID, and a GUID digit out of its form. The
+    /// GUID text's own contract is
+    /// [`every_guid_text_holds_the_guid_contract`]'s; a line of every byte
+    /// symbolic up to an accepted length does not fit the runner's memory.
+    #[kani::proof]
+    #[kani::unwind(49)]
+    fn every_line_ending_in_a_guid_holds_the_line_contract()
+    {
+        const GUID: &[u8; 36] = b"00000000-0000-0000-0000-000000000000";
+        let head: [u8; 10] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= head.len());
+        let mut line = [0u8; 47];
+        line[..len].copy_from_slice(&head[..len]);
+        line[len] = b' ';
+        line[len + 1..len + 37].copy_from_slice(GUID);
+        line[len + 1] = kani::any();
+        property::line_holds(&line[..len + 37]);
     }
 
     /// Every text of at most 37 bytes holds the GUID contract: the canonical

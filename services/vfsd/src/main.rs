@@ -1528,7 +1528,8 @@ fn after_root_mount(rt: &VfsdRuntime, ipc_buf: *mut u64)
 fn read_statement(root_cap: u64, ipc_buf: *mut u64) -> storage_statement::Statement
 {
     let path = storage_statement::PATH;
-    let rights = u64::from(namespace_protocol::rights::READ);
+    // LOOKUP on each directory the walk passes, READ on the file.
+    let rights = u64::from(namespace_protocol::rights::LOOKUP | namespace_protocol::rights::READ);
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let walked = unsafe {
         ns_client::walk_to_file(

@@ -176,9 +176,16 @@ pub(crate) fn line_holds(line: &[u8])
             );
             let mut written = String::new();
             crate::render_line(&entry, &mut written);
+            // The GUID is written in lowercase; the rest of the line, its
+            // path among it, keeps its case.
+            let kept = line
+                .get(..line.len().saturating_sub(text.len()))
+                .unwrap_or_default();
+            let mut expected = kept.to_vec();
+            expected.extend_from_slice(&text.to_ascii_lowercase());
             assert_eq!(
                 written.as_bytes(),
-                &line.to_ascii_lowercase()[..],
+                &expected[..],
                 "a line taken does not write back as itself"
             );
         }

@@ -59,8 +59,9 @@
 //! x86-64 has no counterpart: a message there is a write to the local APIC's
 //! message window, which only a device's bus write reaches, and a CPU raises a
 //! device vector only from ring 0, through the ICR. The same interleavings are
-//! driven there by the host tests of `core/kernel/src/irq.rs`. The cell skips
-//! where `crate::arch::MSG_INJECTABLE` is false.
+//! driven there by the host tests of `core/kernel/src/irq.rs`. The cell has no
+//! arch check of its own: `stress::run_irq` registers it only where
+//! `crate::arch::MSG_INJECTABLE` holds.
 //!
 //! Needs **≥ 2 CPUs**.
 

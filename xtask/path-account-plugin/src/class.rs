@@ -120,6 +120,10 @@ pub enum Class
     Unit(Unit),
     /// A read of the cycle counter: `rdtsc`, or `csrr rd, cycle`.
     Read(Dest),
+    /// An x86-64 `rep` string instruction, and the memory accesses each of
+    /// its iterations makes: it runs once per iteration, and an interrupt
+    /// between two iterations is reported from its own address.
+    RepString(u8),
 }
 
 /// The class of the instruction whose bytes `bytes` starts with, on `arch`.
@@ -134,7 +138,7 @@ pub fn classify(arch: Arch, bytes: &[u8]) -> Class
             // syscall, sysenter, int3, int imm8, int1.
             [0x0f, 0x05 | 0x34, ..] | [0xcc | 0xcd | 0xf1, ..] => Class::Trap,
             _ if x86_fpu(bytes) => Class::Unit(Unit::X86Fpu),
-            _ => Class::Plain,
+            _ => x86_rep_string(bytes).map_or(Class::Plain, Class::RepString),
         },
         Arch::Riscv64 => match bytes
         {
@@ -160,6 +164,34 @@ pub fn classify(arch: Arch, bytes: &[u8]) -> Class
             }
             _ => Class::Plain,
         },
+    }
+}
+
+/// The memory accesses of one iteration of the x86-64 instruction `bytes`
+/// starts with when it is a `rep`, `repe` or `repne` string instruction
+/// (`movs` and `cmps` two, `stos`, `lods` and `scas` one), after any
+/// legacy prefix and REX; `None` for any other instruction.
+fn x86_rep_string(bytes: &[u8]) -> Option<u8>
+{
+    let mut rest = bytes;
+    let mut rep = false;
+    while let [
+        prefix @ (0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3),
+        tail @ ..,
+    ] = rest
+    {
+        rep |= matches!(prefix, 0xf2 | 0xf3);
+        rest = tail;
+    }
+    if let [0x40..=0x4f, tail @ ..] = rest
+    {
+        rest = tail;
+    }
+    match rest
+    {
+        [0xa4..=0xa7, ..] if rep => Some(2),
+        [0xaa..=0xaf, ..] if rep => Some(1),
+        _ => None,
     }
 }
 
@@ -238,6 +270,11 @@ mod tests
         assert_eq!(c(&[0x0f, 0x34]), Class::Trap);
         assert_eq!(c(&[0xcc]), Class::Trap);
         assert_eq!(c(&[0xcd, 0x80]), Class::Trap);
+        // rep stosb, rep movsq, repne scasb; a movsb without rep.
+        assert_eq!(c(&[0xf3, 0xaa]), Class::RepString(1));
+        assert_eq!(c(&[0xf3, 0x48, 0xa5]), Class::RepString(2));
+        assert_eq!(c(&[0xf2, 0xae]), Class::RepString(1));
+        assert_eq!(c(&[0xa4]), Class::Plain);
         assert_eq!(c(&[0x0f, 0x01, 0xf9]), Class::Plain);
         assert_eq!(c(&[0x48, 0x89, 0xc3]), Class::Plain);
         assert_eq!(c(&[0x0f]), Class::Plain);

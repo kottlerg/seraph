@@ -25,7 +25,7 @@ path-account-plugin/
 ├── README.md
 └── src/
     ├── lib.rs        The crate's modules
-    ├── class.rs      The instruction classes: a counter read and where it leaves its value, a trap
+    ├── class.rs      The instruction classes: counter reads, traps, lazy units' and rep strings
     ├── record.rs     The record's events, written and parsed
     ├── recorder.rs   The recorder: slots, segments, histograms, attempts (host-tested)
     └── qemu.rs       The plugin API's side: install, and the callbacks that drive the recorder
@@ -49,25 +49,32 @@ an instruction's callbacks before it executes, so a read closes the segment befo
 value callback, conditional on a scoreboard flag the read sets and registered with register
 access, reads EDX:EAX or `x<rd>`.
 
-**Attempts.** Under icount an instruction that a trap interrupts has been counted by its
+**Attempts.** Under icount an instruction that an exception ends has been counted by its
 execution callback but did not retire, and the counter did not count it. The plugin notes such an
 attempt from QEMU's discontinuity callback: a discontinuity from the address of the instruction
 executed last, when that instruction does not trap by design (`syscall`, `ecall`, `ebreak`),
-is an attempt. An instruction of a unit the kernel turns on lazily (x86_64's FPU and vector
-state, riscv64's floating-point and vector units) is the exception: while the unit is off,
-QEMU's translator raises the trap when it decodes the instruction, and icount has counted it, so
-the counter counted it too. The plugin defers such an attempt to the next instruction and reads
-the unit's state register there (`CR0.TS` and `CR0.EM`, `sstatus.FS` and `sstatus.VS`): with
-the unit off the attempt is not one, with it on (a fault of the instruction's memory access) it
-is. A read begun again before its value was read, its first attempt interrupted, is a retry.
-xtask subtracts both from the window that holds them.
+is an attempt. An interrupt comes between two instructions, from the address of the next one,
+except between two iterations of an x86 `rep` string instruction, which runs once per
+iteration: the plugin watches its memory accesses, which QEMU reports once each completed, and
+an iteration whose accesses all completed retired. (The discontinuity's kind does not tell them
+apart: x86_64 reports a page fault as an interrupt.) An instruction of a unit the kernel turns
+on lazily (x86_64's FPU and vector state, riscv64's floating-point and vector units) is the
+other exception: while the unit is off, QEMU's translator raises the trap when it decodes the
+instruction, and icount has counted it, so the counter counted it too. The plugin defers such
+an attempt to the next instruction and reads the unit's state register there (`CR0.TS` and
+`CR0.EM`, `sstatus.FS` and `sstatus.VS`): with the unit off the attempt is not one, with it
+on (a fault of the instruction's memory access) it is. A read begun again before its value was
+read, its first attempt interrupted, is a retry. xtask subtracts both from the window that
+holds them.
 
 **Record.** One event per line, in the order the guest ran them:
 
 ```text
 seraph-path-account 1 <arch>       the header: the format's version, the guest's architecture
-H <id> <pc>:<count> ...            a segment's instructions, by address, the first time a segment held them
-R <pc> <id> <value>                a user-mode counter read at <pc>, the segment before it (histogram <id>), its value
+H <id> <pc>:<count> ...            a segment's instructions, by address, the first time a
+                                   segment held them
+R <pc> <id> <value>                a user-mode counter read at <pc>, the segment before it
+                                   (histogram <id>), its value
 A <pc>                             an attempt at <pc> that a trap ended before it retired
 X <pc>                             a counter read at <pc> begun again before its value was read
 ```
@@ -77,3 +84,9 @@ with the same entries names it, so a benchmark's repeated iterations cost one li
 record is flushed after each read, since xtask kills QEMU once the benchmark program has ended; a
 last line without its newline is one QEMU was killed in the middle of writing, which the reader
 leaves out.
+
+---
+
+## Summarized By
+
+[xtask/README.md](../README.md)

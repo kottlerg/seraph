@@ -62,6 +62,9 @@ pub struct Recorder<W: Write>
     /// An instruction of a unit the kernel can turn off that trapped, and
     /// the unit, until the unit's state is read at the next instruction.
     trapped: Option<(u64, Unit)>,
+    /// The memory accesses the slot executed last has completed: counted
+    /// only for a [`Class::RepString`], whose accesses the plugin watches.
+    accesses: u8,
     /// Each histogram written, by the hash of its entries.
     hists: HashMap<u128, u64>,
     /// The first write error; nothing is written after it.
@@ -101,6 +104,7 @@ impl<W: Write> Recorder<W>
             last: None,
             pending: None,
             trapped: None,
+            accesses: 0,
             hists: HashMap::new(),
             error: None,
         };
@@ -171,7 +175,15 @@ impl<W: Write> Recorder<W>
             }
             slot.count = slot.count.wrapping_add(1);
             self.last = Some(index);
+            self.accesses = 0;
         }
+    }
+
+    /// The memory callback of a [`Class::RepString`]: one of its iteration's
+    /// accesses completed.
+    pub fn access(&mut self)
+    {
+        self.accesses = self.accesses.saturating_add(1);
     }
 
     /// The read callback: a user-mode counter read is about to run. It closes
@@ -275,13 +287,17 @@ impl<W: Write> Recorder<W>
             return;
         };
         self.last = None;
-        if let Class::Unit(unit) = class
+        match class
         {
-            self.trapped = Some((from, unit));
-        }
-        else
-        {
-            self.emit(&Event::Attempt { pc: from });
+            Class::Unit(unit) => self.trapped = Some((from, unit)),
+            // Every access of the iteration completed: it retired, and an
+            // interrupt came between it and the next.
+            Class::RepString(n) if self.accesses >= n =>
+            {}
+            Class::Plain | Class::Trap | Class::Read(_) | Class::RepString(_) =>
+            {
+                self.emit(&Event::Attempt { pc: from });
+            }
         }
     }
 
@@ -507,6 +523,38 @@ mod tests
             id: 0,
             entries: vec![(0x2000, 3)]
         }));
+    }
+
+    #[test]
+    fn a_rep_iteration_is_an_attempt_only_before_its_accesses_completed()
+    {
+        let mut r = Recorder::new(Arch::X86_64, Vec::new());
+        // rep movsq: a read and a write per iteration.
+        let (movs, class) = r.slot(0x1000, &[0xf3, 0x48, 0xa5]).unwrap();
+        assert_eq!(class, Class::RepString(2));
+        // An interrupt between two iterations: the last one retired.
+        r.exec(movs);
+        r.access();
+        r.access();
+        r.discon(0x1000);
+        // A fault of the write: the iteration did not retire.
+        r.exec(movs);
+        r.access();
+        r.discon(0x1000);
+        // A fault of the read, after an iteration that completed.
+        r.exec(movs);
+        r.access();
+        r.access();
+        r.exec(movs);
+        r.discon(0x1000);
+        assert_eq!(
+            events(&mut r),
+            [
+                Event::Header { arch: Arch::X86_64 },
+                Event::Attempt { pc: 0x1000 },
+                Event::Attempt { pc: 0x1000 },
+            ]
+        );
     }
 
     #[test]

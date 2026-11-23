@@ -59,4 +59,4 @@ TODO
 
 ## Summarized By
 
-[core/kernel/README.md](../README.md), [core/kernel/docs/hot-path-account.md](hot-path-account.md)
+[core/kernel/README.md](../README.md), [Kernel Hot-Path Instruction Account](hot-path-account.md)

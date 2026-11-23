@@ -117,6 +117,9 @@ type TbTransCb = unsafe extern "C" fn(*mut Tb, *mut c_void);
 type VcpuUdataCb = unsafe extern "C" fn(c_uint, *mut c_void);
 /// `qemu_plugin_vcpu_discon_cb_t`.
 type DisconCb = unsafe extern "C" fn(c_uint, c_int, u64, u64, *mut c_void);
+/// `qemu_plugin_vcpu_mem_cb_t`: the vCPU, the access's `qemu_plugin_meminfo_t`,
+/// its address, the user data.
+type MemCb = unsafe extern "C" fn(c_uint, u32, u64, *mut c_void);
 /// `qemu_plugin_udata_cb_t`.
 type UdataCb = unsafe extern "C" fn(*mut c_void);
 
@@ -126,8 +129,12 @@ const CB_NO_REGS: c_int = 0;
 const CB_R_REGS: c_int = 1;
 /// `QEMU_PLUGIN_COND_NE`.
 const COND_NE: c_int = 3;
-/// `QEMU_PLUGIN_DISCON_ALL`.
+/// `QEMU_PLUGIN_DISCON_ALL`: x86-64 reports a page fault as an interrupt, so
+/// the kind does not tell an attempt; the recorder does
+/// (`crate::recorder::Recorder::discon`).
 const DISCON_ALL: c_int = -1;
+/// `QEMU_PLUGIN_MEM_RW`.
+const MEM_RW: c_int = 3;
 
 unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
@@ -179,6 +186,8 @@ api! {
     insn_vaddr = c"qemu_plugin_insn_vaddr": fn(*const Insn) -> u64;
     register_vcpu_insn_exec_cb = c"qemu_plugin_register_vcpu_insn_exec_cb":
         fn(*mut Insn, VcpuUdataCb, c_int, *mut c_void);
+    register_vcpu_mem_cb = c"qemu_plugin_register_vcpu_mem_cb":
+        fn(*mut Insn, MemCb, c_int, c_int, *mut c_void);
     register_vcpu_insn_exec_cond_cb = c"qemu_plugin_register_vcpu_insn_exec_cond_cb":
         fn(*mut Insn, VcpuUdataCb, c_int, c_int, U64Entry, u64, *mut c_void);
     scoreboard_new = c"qemu_plugin_scoreboard_new": fn(usize) -> *mut Scoreboard;
@@ -543,6 +552,14 @@ unsafe extern "C" fn tb_trans(tb: *mut Tb, _userdata: *mut c_void)
             // SAFETY: `insn` is an instruction of the block being translated,
             // and `exec` is a `qemu_plugin_vcpu_udata_cb_t`.
             unsafe { (p.api.register_vcpu_insn_exec_cb)(insn, exec, CB_NO_REGS, userdata) };
+            if matches!(class, Class::RepString(_))
+            {
+                // SAFETY: `insn` is an instruction of the block being
+                // translated, and `access` is a `qemu_plugin_vcpu_mem_cb_t`.
+                unsafe {
+                    (p.api.register_vcpu_mem_cb)(insn, access, CB_NO_REGS, MEM_RW, ptr::null_mut());
+                };
+            }
         }
     });
 }
@@ -551,6 +568,13 @@ unsafe extern "C" fn tb_trans(tb: *mut Tb, _userdata: *mut c_void)
 unsafe extern "C" fn exec(_vcpu: c_uint, userdata: *mut c_void)
 {
     with_plugin(|p| p.recorder.exec(slot_of(userdata)));
+}
+
+/// A memory access of a `rep` string instruction completed: QEMU calls a
+/// memory callback after the access, and not for one that faulted.
+unsafe extern "C" fn access(_vcpu: c_uint, _info: u32, _vaddr: u64, _userdata: *mut c_void)
+{
+    with_plugin(|p| p.recorder.access());
 }
 
 /// A user-mode counter read runs.

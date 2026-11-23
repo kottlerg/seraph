@@ -725,7 +725,7 @@ mod tests
         obj.dec_ref_in(&table);
         assert_eq!(obj.dec_ref_in(&table), 0);
         assert_eq!(table.summary.load(Ordering::Relaxed), 0);
-        assert!(table.collect(POST_BUDGET).0.is_null());
+        assert!(table.collect(POST_BUDGET).is_null());
     }
 
     // Defect guarded: one pass must post no more than its budget, however many

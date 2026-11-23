@@ -440,7 +440,7 @@ jobs:
           retention-days: 14
 
       - name: Save the standard-library units
-        # After the uploads, since it empties target/ but for those units.
+        # Last, since it empties Cargo's build directories but for those units.
         uses: ./.github/actions/std-cache
         with:
           mode: save

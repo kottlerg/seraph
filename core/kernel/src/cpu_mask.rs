@@ -14,8 +14,9 @@
 //! its object (an address space's wrapper page, a TLB request's slab slot), so a
 //! boot pays only for the CPUs it has. No mask is held by value on a kernel
 //! stack: copies between sets are word by word ([`AtomicCpuMask::fill_from`]).
-//! `MAX_CPUS` bounds the CPU count but sizes no mask. A hierarchical mask is not the design: it still fixes a maximum, and
-//! adds a level to every bit test on the shootdown and context-switch paths.
+//! `MAX_CPUS` bounds the CPU count but sizes no mask. A hierarchical mask is
+//! not the design: it still fixes a maximum, and adds a level to every bit test
+//! on the shootdown and context-switch paths.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

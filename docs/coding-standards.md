@@ -698,6 +698,24 @@ two sides agree), never a re-stated literal, so that drift on either side trips 
 mirror and is forbidden; `assert_eq!(KernelTag::X as u8, abi::Tag::X as u8)` is the legitimate
 form.
 
+### Proof Harnesses
+
+A bounded proof ([testing.md](testing.md#bounded-verification) § Bounded verification) is a
+`#[kani::proof]` function in a `#[cfg(kani)] mod proofs` at the bottom of the source file whose
+code it verifies, beside the file's `#[cfg(test)] mod tests`. It covers the code § Scope gives
+host unit tests, where that code is sequential.
+
+- A harness that reaches a loop MUST carry an explicit `#[kani::unwind(N)]` and a comment stating
+  its bounds (the sizes and counts it fixes) and why they cover the property. Kani's unwinding
+  assertions stay on, so a loop the bound does not cover fails the harness; `cargo xtask kani`
+  passes no `--default-unwind`.
+- `kani::stub` MAY replace only a leaf Kani cannot model, inline assembly or a read of hardware or
+  MMIO, and the stub returns a nondeterministic value over every value the hardware can return. A
+  stub MUST NOT stand in for the behaviour of code under verification, as § Scope forbids a mock
+  of the kernel ABI.
+
+Only `cargo kani` sets `cfg(kani)`, so no Clippy pass compiles a proof module.
+
 ---
 
 ## E. Exception Policy

@@ -15,8 +15,8 @@ they may observe after an interrupted operation.
 
 | Operation | Per-block order | Post-crash visible states |
 |---|---|---|
-| `FS_WRITE` (extending) | per new cluster: mark it end-of-chain, then link it after the chain's last cluster (a file with no chain takes its first cluster unlinked) → in file order, the sectors from the old size (or from the offset, when lower) to the write's end: zeros up to the offset, then the data → directory `first_cluster` and `size` | (a) old size, nothing changed; (b) old size, new clusters past EOF holding an earlier owner's bytes, zeros, or part of the new data, in an orphan cluster (no chain before) or an orphaned chain past EOF, and data sectors below the old size possibly already rewritten; (c) new size, the gap between the old size and the offset zeroed, new data |
-| `FS_WRITE` (in-place) | data cluster sector | (a) old bytes; (b) new bytes. Single-sector RMW; partial sector writes never observed because the cache page is updated in place before the on-disk write. |
+| `FS_WRITE` (extending) | per new cluster: mark it end-of-chain, then link it after the chain's last cluster (a file with no chain takes its first cluster unlinked) → in file order, the sectors from the old size (or from the offset, when lower) to the write's end: zeros up to the offset, then the data, in runs of up to a page of sectors that follow each other on the device, one device write each; at each cluster boundary the next cluster is allocated and linked (or read from the chain) before the run ending at the previous cluster is written, so that run joins the next cluster when it follows on the device, and a failed allocation or sector read leaves the pending run unwritten → directory `first_cluster` and `size` | (a) old size, nothing changed; (b) old size, new clusters past EOF holding an earlier owner's bytes, zeros, or part of the new data, in an orphan cluster (no chain before) or an orphaned chain past EOF, and data sectors below the old size possibly already rewritten; (c) new size, the gap between the old size and the offset zeroed, new data |
+| `FS_WRITE` (in-place) | data cluster sectors, in runs of up to a page of contiguous sectors, one device write each | (a) old bytes; (b) new bytes; (c) within one run, some sectors new and the rest old, in any pattern, since the device may land a request's sectors in any order. A partial sector is read-modify-written: each sector holds its old bytes or its new ones, never a mix. |
 | `FS_CREATE` | (none yet — first cluster allocated lazily by the first `FS_WRITE`) → directory entry | (a) no entry; (b) entry present with `first_cluster = 0`, `size = 0` |
 | `FS_MKDIR` | write "."/".." in a free cluster's first sector → zero its other sectors → mark it end-of-chain → directory entry | (a) no entry; (b) orphaned cluster holding "."/".." and zeros (looks like a stray empty directory by inode); (c) entry present pointing at the new cluster. A failed sector write leaves the FAT unchanged, so a failed request claims no cluster |
 | `FS_REMOVE` | LFN slots → `0xE5`; 8.3 entry → `0xE5`; FAT chain → free; on a failed slot write with the 8.3 entry still live on the device: restore the LFN slots' first bytes | (a) entry present; (b) LFN run deleted, 8.3 entry present (visible only under its short alias); (c) entry deleted, chain still linked → orphan cluster chain; (d) entry deleted, chain freed |
@@ -89,8 +89,9 @@ process.
 device that drops chosen sector writes, or lands them and reports them
 failed, and fails chosen reads. It confirms that a failed `FS_WRITE`
 leaves the cached sector as it was, so a later `FS_READ` returns the old
-bytes, and that a failed `FS_REMOVE` or `FS_RENAME` is settled by where
-it left the 8.3 slot
+bytes, and that a dropped run write of a 4 KiB `FS_WRITE_MEMORY` leaves
+every cached sector of the run as it was. It confirms that a failed
+`FS_REMOVE` or `FS_RENAME` is settled by where it left the 8.3 slot
 ([fs-driver-protocol.md](../../docs/fs-driver-protocol.md) § Label 14
 and § Label 16). A failure before the 8.3 slot's write (a dropped LFN
 write) leaves the entry live, so the operation is undone, with the

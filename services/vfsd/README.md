@@ -17,7 +17,9 @@ the I/O path after the walk. vfsd self-mounts the Seraph root partition
 vfsd/
 ├── Cargo.toml
 ├── README.md
-├── gpt/                     # `vfsd-gpt` crate: pure host-tested GPT-format parser
+├── gpt/                     # `vfsd-gpt` crate: pure host-tested GPT-format parser; its
+│                            # property (src/property.rs) and fuzz inputs (fuzz/gpt/), the
+│                            # fuzz target `gpt` (docs/testing.md § Fuzzing)
 ├── root-backend/            # `vfsd-root-backend` crate: VfsdRootBackend (NamespaceBackend impl)
 ├── swap/                    # `vfsd-swap` crate: pure host-tested swap-partition hand-out
 ├── src/

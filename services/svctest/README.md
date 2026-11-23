@@ -676,7 +676,10 @@ phase that ends the run asserts the identity again after it. The release phase r
 phases that use the fixture, since no fixture serves the class again in that boot.
 The `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it down
-with `DESTROY_PROCESS`. Its last cases end their driver themselves, each observed through an event
+with `DESTROY_PROCESS`. Its first case checks from the block server's log of writes that a 4 KiB
+`FS_WRITE_MEMORY` over consecutive clusters is one `BLK_WRITE_FROM_MEMORY` of its sectors, and
+that a run write the server drops fails the write and leaves the run's cached sectors as they
+were. Its last cases end their driver themselves, each observed through an event
 queue bound to the driver's main thread: the block server revokes every capability derived from
 its endpoint, two more drivers, each on a volume of its own, take `FS_UNMOUNT`, and a fourth loses
 its service endpoint as vfsd ends a driver it cannot use and must exit at its next receive. The

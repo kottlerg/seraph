@@ -62,7 +62,7 @@
 //! gone (`Opens::close`).
 //!
 //! Cache coherence: writes go through write-through
-//! ([`cache::PageCache::write_sector`]) so any outstanding
+//! ([`cache::PageCache::write_run`]) so any outstanding
 //! `FS_READ_MEMORY` cap aliasing the same page observes new bytes
 //! immediately. FAT-entry mutations invalidate the per-`FatState`
 //! private `cached_fat_sector` to prevent stale FAT chain walks.
@@ -87,7 +87,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use alloc::{FatError, allocate_cluster};
 use backend::{FatfsBackend, NodeTable};
-use bpb::{FatState, MAX_SECTOR_SIZE, sector_buffer};
+use bpb::{FatState, MAX_SECTOR_SIZE};
 use cache::PageCache;
 use dir::{
     DeviceSlotState, DirEntryLocation, NewEntryKind, RemovedEntry, directory_is_empty,
@@ -2014,11 +2014,12 @@ fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> 
 /// Common cluster-walk-and-write engine used by `FS_WRITE` and
 /// `FS_WRITE_MEMORY`. Walks the file's cluster chain from `offset`, or
 /// from the file's old size when that is lower, allocating new clusters as
-/// needed, and writes zeros up to `offset`, then `data`, sector by sector
-/// through [`PageCache::write_sector`] (read-modify-write for a sector
-/// holding old bytes of the file the write leaves,
-/// [`fat_parse::sector_write`]). Returns the file's (possibly-updated)
-/// first cluster and its new size.
+/// needed, and writes zeros up to `offset`, then `data`, in runs of
+/// contiguous sectors of at most a page, one block write each, through
+/// [`PageCache::write_run`] (read-modify-write for a sector holding old
+/// bytes of the file the write leaves, [`fat_parse::sector_write`]; the
+/// sector walk is [`fat_parse::file_write::write_range`]). Returns the
+/// file's (possibly-updated) first cluster and its new size.
 ///
 /// The chain is extended only at its end-of-chain marker: a failed FAT
 /// read or a corrupt link is an error, never a place to link a new
@@ -2084,87 +2085,126 @@ fn write_file_bytes(
 
     // Walk to the cluster holding `start`. When we hit EOC, the current
     // `cluster` is the terminal one — `allocate_cluster(Some(cluster))`
-    // links the new cluster after it. (A previous version threaded a
-    // separate `prev` that was updated after `cluster`, so on
-    // append-past-EOC it linked the new cluster behind the prior
-    // terminal, overwriting that terminal's existing forward link and
-    // orphaning the original tail.) `end` fits a `u32`, so the walk ends
+    // links the new cluster after it. `end` fits a `u32`, so the walk ends
     // within `u32::MAX / cluster_size` steps even on a cyclic chain.
     for _ in 0..first.cluster_index
     {
-        cluster = match chain_next(state, cluster, cache, block_dev, ipc_buf)?
-        {
-            Some(c) => c,
-            None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
-        };
+        cluster = next_or_new_cluster(state, cluster, cache, block_dev, ipc_buf)?;
     }
 
-    let mut cluster_index = first.cluster_index;
-    let mut rest = data;
-    let mut cur_offset = start;
-    while cur_offset < u64::from(end)
-    {
-        let pos = state.file_position(cur_offset).ok_or(FatError::Corrupt)?;
-        // The previous sector ended its cluster: move on to the next one.
-        if pos.cluster_index != cluster_index
+    // The run buffer: a page, the most one run write carries
+    // (`PageCache::write_run`). Heap-allocated to keep the write-path frame
+    // within the default 32 KiB stack envelope when release LTO inlines the
+    // nested helpers.
+    let mut run = Vec::new();
+    run.try_reserve_exact(PAGE_BYTES)
+        .map_err(|_| FatError::Io)?;
+    run.resize(PAGE_BYTES, 0);
+    let geometry = fat_parse::file_write::Geometry {
+        sectors_per_cluster: state.sectors_per_cluster,
+        bytes_per_sector: state.bytes_per_sector,
+    };
+    let write = fat_parse::file_write::FileWrite {
+        offset,
+        old_size: u64::from(file_size),
+        data,
+    };
+    let mut io = CacheIo {
+        state,
+        cache,
+        block_dev,
+        ipc_buf,
+    };
+    fat_parse::file_write::write_range(&mut io, geometry, cluster, &write, &mut run).map_err(
+        |e| match e
         {
-            cluster = match chain_next(state, cluster, cache, block_dev, ipc_buf)?
-            {
-                Some(c) => c,
-                None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
-            };
-            cluster_index = pos.cluster_index;
-        }
-        let sector_lba = state
-            .cluster_to_sector(cluster)
-            .saturating_add(pos.sector_in_cluster);
-        let share = fat_parse::sector_write(
-            &pos,
-            cur_offset,
-            offset,
-            u64::from(end),
-            u64::from(file_size),
-        )
-        .ok_or(FatError::Corrupt)?;
-        let (chunk, tail) = rest.split_at_checked(share.data).unwrap_or((rest, &[]));
+            fat_parse::file_write::WriteError::Geometry => FatError::Corrupt,
+            fat_parse::file_write::WriteError::Io(e) => e,
+        },
+    )?;
 
-        // Read-modify-write the sector only when it holds old bytes of the
-        // file the share leaves; any other sector is written from zeros.
-        // Heap-allocated to keep the write-path frame within the default
-        // 32 KiB stack envelope when release LTO inlines the nested helpers
-        // (`insert_entry → write_dir_slot → ...`).
-        let mut sector_buf = sector_buffer()?;
-        if share.read_first
-            && !cache.read_sector(u64::from(sector_lba), block_dev, &mut *sector_buf, ipc_buf)
-        {
-            return Err(FatError::Io);
-        }
-        // The share ends at or before the sector's end.
-        let (gap, payload) = state
-            .sector_mut(&mut sector_buf)
-            .get_mut(pos.offset_in_sector..)
-            .and_then(|dst| dst.split_at_mut_checked(share.zeros))
-            .ok_or(FatError::Corrupt)?;
-        gap.fill(0);
-        for (d, &b) in payload.iter_mut().zip(chunk)
-        {
-            *d = b;
-        }
-        if !cache.write_sector(u64::from(sector_lba), block_dev, &*sector_buf, ipc_buf)
-        {
-            return Err(FatError::Io);
-        }
-
-        rest = tail;
-        // Bounded by `end`, a `u32`, so neither step saturates.
-        cur_offset = cur_offset
-            .saturating_add(share.zeros as u64)
-            .saturating_add(chunk.len() as u64);
-    }
-
-    debug_assert_eq!(cur_offset, u64::from(end));
     let new_size = file_size.max(end);
     Ok((chain_head, new_size))
+}
+
+/// The cluster after `cluster` in its chain, or a cluster allocated and
+/// linked after it when `cluster` ends the chain.
+///
+/// # Errors
+/// As [`chain_next`] and [`allocate_cluster`].
+fn next_or_new_cluster(
+    state: &mut FatState,
+    cluster: u32,
+    cache: &PageCache,
+    block_dev: u64,
+    ipc_buf: *mut u64,
+) -> Result<u32, FatError>
+{
+    match chain_next(state, cluster, cache, block_dev, ipc_buf)?
+    {
+        Some(next) => Ok(next),
+        None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf),
+    }
+}
+
+/// The driver's side of a file write's sector walk
+/// ([`fat_parse::file_write::write_range`]): the chain and the allocator
+/// through `state`, the sectors through the page cache.
+struct CacheIo<'s>
+{
+    state: &'s mut FatState,
+    cache: &'s PageCache,
+    block_dev: u64,
+    ipc_buf: *mut u64,
+}
+
+impl fat_parse::file_write::SectorIo for CacheIo<'_>
+{
+    type Error = FatError;
+
+    fn next_cluster(&mut self, cluster: u32) -> Result<u32, FatError>
+    {
+        next_or_new_cluster(
+            self.state,
+            cluster,
+            self.cache,
+            self.block_dev,
+            self.ipc_buf,
+        )
+    }
+
+    fn cluster_sector(&self, cluster: u32) -> u64
+    {
+        u64::from(self.state.cluster_to_sector(cluster))
+    }
+
+    fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), FatError>
+    {
+        if self
+            .cache
+            .read_sector(lba, self.block_dev, buf, self.ipc_buf)
+        {
+            Ok(())
+        }
+        else
+        {
+            Err(FatError::Io)
+        }
+    }
+
+    fn write_run(&mut self, lba: u64, sectors: &[u8]) -> Result<(), FatError>
+    {
+        if self
+            .cache
+            .write_run(lba, self.block_dev, sectors, self.ipc_buf)
+        {
+            Ok(())
+        }
+        else
+        {
+            Err(FatError::Io)
+        }
+    }
 }
 
 /// `FS_WRITE` inline write. Badge = file node cap or open cap (must carry

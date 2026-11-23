@@ -7,6 +7,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 |---|---|
 | [`ansi/`](ansi/README.md) | Incremental ANSI SGR colour parser for the terminal output path |
 | [`aml/`](aml/README.md) | ACPI Machine Language encodings, resource-template decoder, term parser, namespace and evaluator, host-tested over QEMU's tables |
+| [`bench/`](bench/README.md) | Benchmark counters, sample statistics, and the one result line every benchmark reports, with its parser; `no_std`, no allocation |
 | [`boot-policy/`](boot-policy/README.md) | Parser of the boot-time policy, `/config/boot/policy.conf`, shared by devmgr and xtask, `no_std`, no allocation |
 | [`crash-report/`](crash-report/README.md) | Crash-report block emitter and parser, shared by crashd and xtask |
 | [`crypto/`](crypto/README.md) | In-OS crypto primitives — SHA-512 hashing, Ed25519 and ML-DSA-65 signature verification, Ed25519 and ML-DSA-65 key generation and signing for the host signer, and ChaCha20-Poly1305 AEAD, `no_std`, zero-dependency |

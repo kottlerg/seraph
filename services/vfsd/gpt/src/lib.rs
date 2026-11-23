@@ -17,6 +17,9 @@
 
 extern crate alloc;
 
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
+
 use alloc::vec::Vec;
 
 /// Largest logical block size the parser takes. A GPT's LBAs are in the
@@ -899,6 +902,31 @@ mod tests
         });
         assert_eq!(scan.stop, None);
         scan.entries
+    }
+
+    // Defect caught: a parser change that breaks its contract on an input
+    // the fuzz target once found or started from; `cargo xtask test` replays
+    // every checked-in input of fuzz/gpt/ on each change.
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_parser_contract()
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/gpt");
+        let mut replayed = 0;
+        for kind in ["seeds", "regressions"]
+        {
+            let Ok(entries) = std::fs::read_dir(dir.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in entries
+            {
+                let path = entry.unwrap().path();
+                property::gpt_holds(&std::fs::read(&path).unwrap());
+                replayed += 1;
+            }
+        }
+        assert!(replayed > 0, "no checked-in input under {}", dir.display());
     }
 
     #[test]

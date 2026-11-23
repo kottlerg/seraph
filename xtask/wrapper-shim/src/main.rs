@@ -4,7 +4,8 @@
 // xtask/wrapper-shim/src/main.rs
 
 //! Tiny native binary installed into the seraph toolchain mirror as
-//! both `rustc` and `ws-clippy`. Replaces the previous `#!/bin/sh`
+//! both `rustc` and `ws-clippy`, and for the fuzz build as
+//! `sancov-rustc`. Replaces the previous `#!/bin/sh`
 //! wrapper scripts so the toolchain mirror works on every host with a
 //! native executable format — no shebang interpretation, no POSIX
 //! shell, no Unix permission bits beyond what the file system already
@@ -26,8 +27,14 @@
 //!   vars at compile time, so both the env var and the flag are
 //!   required to override its baked-in sysroot view.
 //!
-//! Configuration is read from three env vars set by xtask before it
-//! invokes cargo. xtask is always the root of the process tree, so
+//! - **`sancov-rustc`**: the `RUSTC_WORKSPACE_WRAPPER` of `cargo xtask
+//!   fuzz`, whose `RUSTFLAGS` carry the `SanitizerCoverage` flags for every
+//!   unit. Drop the cargo-prepended `rustc_path` and exec it, without
+//!   those flags for a crate `SERAPH_SHIM_UNINSTRUMENTED` names (the
+//!   fuzzing engine, whose callbacks the instrumentation calls).
+//!
+//! The first two modes read their configuration from three env vars set
+//! by xtask before it invokes cargo. xtask is always the root of the process tree, so
 //! the vars propagate naturally to every child cargo and rustc
 //! spawn:
 //!
@@ -52,6 +59,10 @@ const ENV_REAL_CLIPPY: &str = "SERAPH_SHIM_REAL_CLIPPY";
 /// Env var: absolute path to the seraph toolchain mirror root.
 const ENV_MIRROR_SYSROOT: &str = "SERAPH_SHIM_MIRROR_SYSROOT";
 
+/// Env var: comma-separated crate names `sancov-rustc` compiles without
+/// `SanitizerCoverage`.
+const ENV_UNINSTRUMENTED: &str = "SERAPH_SHIM_UNINSTRUMENTED";
+
 fn main() -> !
 {
     let mut argv = env::args_os();
@@ -71,9 +82,10 @@ fn main() -> !
     {
         "rustc" => exec_rustc(argv_rest),
         "ws-clippy" => exec_ws_clippy(argv_rest),
+        "sancov-rustc" => exec_sancov_rustc(argv_rest),
         other => die(&format!(
             "seraph-wrapper-shim: unknown install name {other:?} \
-             (expected 'rustc' or 'ws-clippy')"
+             (expected 'rustc', 'ws-clippy' or 'sancov-rustc')"
         )),
     }
 }
@@ -127,6 +139,50 @@ fn exec_ws_clippy(mut args: Vec<OsString>) -> !
     run_or_exec(cmd, "clippy-driver")
 }
 
+/// Drop cargo's prepended `rustc_path` arg and exec it, without the
+/// `SanitizerCoverage` flags when the unit's crate is one
+/// `SERAPH_SHIM_UNINSTRUMENTED` names. Never returns on success.
+fn exec_sancov_rustc(mut args: Vec<OsString>) -> !
+{
+    if args.is_empty()
+    {
+        die(
+            "sancov-rustc: expected at least one arg (rustc_path injected by cargo's \
+             RUSTC_WORKSPACE_WRAPPER)",
+        );
+    }
+    let rustc = args.remove(0);
+    let uninstrumented = env::var(ENV_UNINSTRUMENTED).unwrap_or_default();
+    let mut cmd = Command::new(&rustc);
+    cmd.args(unit_args(args, &uninstrumented));
+    run_or_exec(cmd, "rustc")
+}
+
+/// The rustc arguments of a unit: `args` unchanged, or without the
+/// `SanitizerCoverage` flags when `--crate-name` names a crate of the
+/// comma-separated list `uninstrumented`.
+fn unit_args(args: Vec<OsString>, uninstrumented: &str) -> Vec<OsString>
+{
+    let mut rest = args.iter();
+    let crate_name = rest
+        .by_ref()
+        .find(|arg| *arg == "--crate-name")
+        .and_then(|_| rest.next())
+        .and_then(|name| name.to_str());
+    let skip = crate_name.is_some_and(|name| uninstrumented.split(',').any(|s| s == name));
+    if !skip
+    {
+        return args;
+    }
+    args.into_iter()
+        .filter(|arg| {
+            let bytes = arg.as_encoded_bytes();
+            bytes != b"-Cpasses=sancov-module"
+                && !bytes.starts_with(b"-Cllvm-args=-sanitizer-coverage-")
+        })
+        .collect()
+}
+
 /// Read a required env var and return it as a `PathBuf`. Dies with
 /// a clear message naming the missing var if unset.
 fn required_env_path(name: &str) -> PathBuf
@@ -165,4 +221,46 @@ fn die(msg: &str) -> !
 {
     eprintln!("{msg}");
     exit(2);
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn words(args: &[&str]) -> Vec<OsString>
+    {
+        args.iter().map(OsString::from).collect()
+    }
+
+    // Defect caught: the engine compiled with SanitizerCoverage, whose
+    // callbacks would then call themselves, or a crate under test compiled
+    // without it.
+    #[test]
+    fn only_a_listed_crate_loses_the_coverage_flags()
+    {
+        let unit = |name| {
+            words(&[
+                "--crate-name",
+                name,
+                "-Cpasses=sancov-module",
+                "-Cllvm-args=-sanitizer-coverage-level=3",
+                "-Cllvm-args=-other",
+                "src/lib.rs",
+            ])
+        };
+        let list = "fuzz_engine,___";
+        assert_eq!(
+            unit_args(unit("fuzz_engine"), list),
+            words(&[
+                "--crate-name",
+                "fuzz_engine",
+                "-Cllvm-args=-other",
+                "src/lib.rs"
+            ])
+        );
+        assert_eq!(unit_args(unit("vfsd_gpt"), list), unit("vfsd_gpt"));
+        assert_eq!(unit_args(unit("fuzz"), list), unit("fuzz"));
+        assert_eq!(unit_args(words(&["-vV"]), list), words(&["-vV"]));
+    }
 }

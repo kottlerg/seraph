@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# The fuzz targets: one binary each, which hands its crate's property
+# function to the engine. `cargo xtask fuzz` builds them instrumented, with
+# `--cfg fuzzing`; built any other way, each prints that and exits.
+# `cargo xtask fuzz --list` names the binaries of src/bin/ but the planted
+# ones, which only `--self-test` runs.
+[package]
+name = "fuzz-targets"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+autobins = false
+
+[dependencies]
+fuzz-engine = { path = "../engine" }
+vfsd-gpt = { path = "../../../services/vfsd/gpt" }
+
+[[bin]]
+name = "gpt"
+path = "src/bin/gpt.rs"
+test = false
+
+[[bin]]
+name = "planted-magic"
+path = "src/bin/planted-magic.rs"
+test = false
+
+[[bin]]
+name = "planted-length"
+path = "src/bin/planted-length.rs"
+test = false
+
+[[bin]]
+name = "planted-nested"
+path = "src/bin/planted-nested.rs"
+test = false
+
+[lints]
+workspace = true

@@ -27,7 +27,7 @@
 //! faults, not which control faulted it. The instructions are written as bytes,
 //! since the assembler accepts their mnemonics only under target features
 //! ktest is not built with. The granted timestamp counter (`CR4.TSD` clear) is
-//! the read `crate::arch::cycles_now` makes; [`STATE_CHECKS`] checks the
+//! the read `bench::Counters` makes; [`STATE_CHECKS`] checks the
 //! controls the kernel sets in `cpu::set_user_msr_controls` and
 //! `fpu::enable_xsave`.
 

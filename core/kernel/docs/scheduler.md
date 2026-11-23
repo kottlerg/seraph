@@ -761,10 +761,13 @@ the scheduler slab that `percpu::init_storage` sets once: on x86-64 at `gs:[88]`
 (`PERCPU_SCHEDULER_OFFSET`), on riscv64 at `88(tp)`. The test is inlined at each return as one
 load of that pointer, the loads of `non_empty` and `outranking`, an AND and a branch
 (`sched::preempt_if_outranked`); only a hit calls the rest of the decision
-(`sched::preempt_outranked`). Both words are read Relaxed: a link the CPU made itself precedes the
-test in program order, and a link from another CPU is followed by its wake IPI, whose own return
-tests again ([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake
-Protocol Invariants).
+(`sched::preempt_outranked`). Counted under icount at one CPU, the test adds 6 instructions to
+a syscall on x86-64 and 5 on riscv64 in the release profile, 10 and 8 in the debug profile, whose
+checks of the pointer's alignment and nullness the release profile drops. Both words are read
+Relaxed: a link the CPU made itself precedes the test in program order, and a link from another
+CPU is followed by its wake IPI, whose own return tests again
+([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
+Invariants).
 
 A change of a running thread's priority reaches its CPU through that mask.
 `sys_thread_set_priority` writes `priority` and reads `state` under the thread's `sched_lock`,

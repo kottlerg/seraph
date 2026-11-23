@@ -8428,6 +8428,11 @@ unsafe fn preempt_outranked(sched: &PerCpuScheduler) -> bool
 /// As for [`preempt_if_outranked`]; `deliver` makes the delivery point of this
 /// return, on that contract.
 #[cfg(not(test))]
+#[expect(
+    clippy::inline_always,
+    reason = "every syscall's return runs it; the dev profile CI's bench cell counts otherwise keeps it out of line in syscall::dispatch, a call and a frame per syscall"
+)]
+#[inline(always)]
 pub unsafe fn deliver_and_preempt(deliver: impl FnMut())
 {
     deliver_then_preempt(deliver, || {
@@ -8460,6 +8465,11 @@ pub unsafe fn preempt_at_exception_return(deliver: impl FnMut())
 /// [`deliver_and_preempt`]'s order: `deliver`, then `preempt`, both again while
 /// `preempt` reports a reschedule, so the last step before the return is a
 /// `preempt` that kept the thread and a `deliver` follows every reschedule.
+#[expect(
+    clippy::inline_always,
+    reason = "inlined with deliver_and_preempt into every return to user mode, for the reason given there"
+)]
+#[inline(always)]
 fn deliver_then_preempt(mut deliver: impl FnMut(), mut preempt: impl FnMut() -> bool)
 {
     loop

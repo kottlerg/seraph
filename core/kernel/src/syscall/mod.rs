@@ -1093,17 +1093,27 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
 // ── Scheduler / IPC helpers ───────────────────────────────────────────────────
 
-/// Get the current thread's TCB pointer for the executing CPU.
+/// Get the current thread's TCB pointer for the executing CPU: null until
+/// `sched::init` names one.
+///
+/// Read through `PerCpuData::scheduler` ([`crate::percpu::current_scheduler`]),
+/// one GS- or `tp`-relative load. Phase 4 (`sched::init_storage`) initialises
+/// every scheduler entry and names it in its CPU's `PerCpuData` before any CPU
+/// installs its per-CPU pointer, so wherever [`current_cpu`] reads, this
+/// reads an initialised entry.
+///
+/// [`current_cpu`]: crate::arch::current::cpu::current_cpu
 ///
 /// # Safety
-/// Must be called from a kernel context. The current CPU's scheduler must have
-/// been initialised by `sched::init`.
+/// Must be called from a kernel context on a CPU whose per-CPU pointer is
+/// installed (`percpu::init_bsp` or `percpu::init_ap`).
 #[cfg(not(test))]
+#[inline]
 pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBlock
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: SCHEDULERS[cpu] is initialised for all online CPUs; per-CPU data indexed by CPU ID.
-    unsafe { crate::sched::scheduler_for(cpu).current() }
+    // SAFETY: the per-CPU pointer is installed (contract), and init_storage
+    // named this CPU's scheduler entry before any CPU installed one.
+    unsafe { crate::percpu::current_scheduler().current() }
 }
 
 /// A capability resolved from a user handle, with the object it names pinned

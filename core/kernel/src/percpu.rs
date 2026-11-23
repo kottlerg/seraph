@@ -281,9 +281,10 @@ pub struct PerCpuData
     /// only by this CPU, at a switch-in or in `sched::enter`.
     pub guard_epoch_flushed: u64,
     /// This CPU's own entry of the scheduler slab, so a return to user mode
-    /// reaches its run-queue mask with one GS- or `tp`-relative load
-    /// ([`current_scheduler`]) instead of the slab arithmetic of
-    /// `sched::scheduler_for` (core/kernel/docs/scheduler.md § Wake Preemption).
+    /// reaches its run-queue mask, and `syscall::current_tcb` the running
+    /// thread, with one GS- or `tp`-relative load ([`current_scheduler`])
+    /// instead of the slab arithmetic of `sched::scheduler_for`
+    /// (core/kernel/docs/scheduler.md § Wake Preemption).
     /// Written once by [`init_storage`], before the slab is published; null
     /// before it.
     pub scheduler: *const PerCpuScheduler,

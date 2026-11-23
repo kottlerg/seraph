@@ -12,7 +12,9 @@
 //! ([`FreeRunScan`]), bounds cluster numbers to the data region
 //! ([`is_data_cluster`]), locates, reads and writes FAT entries
 //! ([`fat_entry_location`], [`read_fat_entry`], [`write_fat_entry`]),
-//! places a file offset in its cluster chain ([`file_position`]), resumes a
+//! places a file offset in its cluster chain ([`file_position`]), walks a
+//! file write's sectors and gathers them into runs of contiguous sectors
+//! ([`file_write::write_range`], through the driver's I/O), resumes a
 //! sequential reader's chain walk ([`walk_start`]) and sizes its cache fills
 //! ([`run_cluster_bound`], [`contiguous_clusters`], [`file_end_sector`],
 //! [`run_pages`]), encodes
@@ -37,6 +39,7 @@ extern crate alloc;
 
 use core::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 
+pub mod file_write;
 pub mod node_slab;
 pub mod session_pool;
 pub mod sweep;
@@ -127,9 +130,10 @@ pub fn lru_victim(slots: impl IntoIterator<Item = VictimView>) -> Option<usize>
 
 /// Idle pages a `fatfs` cache keeps when it gives its idle pages back under
 /// memory pressure: the most recently used ones ([`keep_most_recent`]). A
-/// request holds one slot reference at a time, so one kept page lets a miss
-/// evict when memmgr refuses the cache a page at `Critical`; four keep the
-/// FAT, directory and data pages one request walks. Shared with svctest as
+/// request holds at most two slot references at a time (a run write over two
+/// cache pages), so two kept pages let a miss evict when memmgr refuses the
+/// cache a page at `Critical`; four keep the FAT, directory and data pages
+/// one request walks. Shared with svctest as
 /// [`slot_ceiling`] is.
 pub const RELEASE_KEEP: usize = 4;
 

@@ -47,8 +47,8 @@ use syscall::{
     thread_read_regs, thread_sleep, thread_start, thread_stop, thread_write_regs,
 };
 use syscall_abi::{
-    EXIT_KILLED, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_RESUME, MAP_WRITABLE, RIGHTS_ALL,
-    SYS_ASPACE_HOLD, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SyscallError, THREAD_REGS_FAULT,
+    EXIT_KILLED, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_RESUME, MAP_WRITABLE, MSG_REGS_DATA_MAX,
+    RIGHTS_ALL, SYS_ASPACE_HOLD, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SyscallError, THREAD_REGS_FAULT,
     THREAD_REGS_SYSCALL, ipc_call_count_arg,
 };
 
@@ -86,10 +86,14 @@ const SENTINEL: u64 = 0x5EED_5EED_5EED_5EED;
 const TERMINATOR: u64 = u64::MAX;
 
 /// Label of the calls, the request and reply words, and the fault badge.
+/// The request and the reply carry `BUF_WORDS` data words, word 0 the one
+/// checked, so both travel in the IPC buffer, whose frame ktest reads.
 const CALL_LABEL: u64 = 0x4801;
 const REQUEST_WORD: u64 = 0xCA11_0000_0000_0001;
 const REPLY_WORD: u64 = 0x4E91_0000_0000_0002;
 const FAULT_BADGE: u64 = 0xA5E7_0000_0000_0010;
+/// Data words of the request and the reply: one past the message registers.
+const BUF_WORDS: usize = MSG_REGS_DATA_MAX + 1;
 
 /// Milliseconds a "stays unchanged" check sleeps before it compares.
 const SETTLE_MS: u64 = 10;
@@ -531,7 +535,7 @@ fn reply_during_hold(ctx: &TestContext) -> TestResult
                 SYS_IPC_CALL,
                 handle,
                 CALL_LABEL,
-                ipc_call_count_arg(1, 0),
+                ipc_call_count_arg(BUF_WORDS as u64, 0),
                 0,
             ],
         ],
@@ -589,19 +593,23 @@ fn receive_request(ctx: &TestContext, ep: u64) -> TestResult
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     let msg =
         unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }.map_err(|_| "aspace_hold: ipc_recv failed")?;
-    if msg.label != CALL_LABEL || msg.word_count() != 1 || msg.word(0) != REQUEST_WORD
+    if msg.label != CALL_LABEL || msg.word_count() != BUF_WORDS || msg.word(0) != REQUEST_WORD
     {
         return Err("aspace_hold: the received call is not the child's request");
     }
     Ok(())
 }
 
-/// Reply to the call received last, with `word` as its one data word.
+/// Reply to the call received last with `BUF_WORDS` data words, `word` the
+/// first.
 fn send_reply(ctx: &TestContext, word: u64) -> TestResult
 {
+    let reply = IpcMessage::builder(0)
+        .word(0, word)
+        .word(BUF_WORDS - 1, 0)
+        .build();
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    unsafe { ipc::ipc_reply(&IpcMessage::builder(0).word(0, word).build(), ctx.ipc_buf) }
-        .map_err(|_| "aspace_hold: ipc_reply failed")
+    unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }.map_err(|_| "aspace_hold: ipc_reply failed")
 }
 
 /// E: a fault resumed during the hold leaves the thread stopped until the

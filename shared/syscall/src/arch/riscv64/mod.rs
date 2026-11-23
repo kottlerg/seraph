@@ -179,8 +179,8 @@ pub unsafe fn syscall4_any(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
     // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
     // args in a0-a3 (a4-a5 zero); every argument register and the message registers
     // a6/t0-t2 are declared clobbered because the kernel may write return values into any
-    // of them. `nomem` is omitted as
-    // in `syscall3`; `nostack` holds because the asm itself does not use the Rust stack.
+    // of them. `nomem` is omitted as in `syscall3`; `nostack` holds because the asm itself
+    // does not use the Rust stack.
     unsafe {
         core::arch::asm!(
             "ecall",

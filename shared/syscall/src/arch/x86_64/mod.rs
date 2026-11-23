@@ -193,8 +193,8 @@ pub unsafe fn syscall4_any(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
     // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
     // args in rdi/rsi/rdx/r10 (r8/r9 zero); every argument register and the message
     // registers r12-r15 are declared clobbered because the kernel may write return values
-    // into any of them, and rcx/r11 are clobbered by SYSCALL. `nomem` is omitted as in `syscall3`; `nostack`
-    // holds because the asm itself does not use the Rust stack.
+    // into any of them, and rcx/r11 are clobbered by SYSCALL. `nomem` is omitted as in
+    // `syscall3`; `nostack` holds because the asm itself does not use the Rust stack.
     unsafe {
         core::arch::asm!(
             "syscall",

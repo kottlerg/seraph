@@ -28,8 +28,11 @@ const CASES: [(&str, usize); 3] = [
     ("ipc_round_trip_7w", REG_WORDS + 1),
 ];
 
-/// The largest message the message registers carry.
+/// The largest message the message registers carry. A literal, so the bench
+/// builds unchanged at a head before `MSG_REGS_DATA_MAX` existed, for a
+/// before-and-after comparison; the assertion keeps the two equal.
 const REG_WORDS: usize = 6;
+const _: () = assert!(REG_WORDS == syscall_abi::MSG_REGS_DATA_MAX);
 
 /// One caller child's stack per case, so a case's child never shares a stack
 /// with the previous case's, which may still be on its way to exit.

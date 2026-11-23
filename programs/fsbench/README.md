@@ -1,7 +1,8 @@
 # fsbench
 
 Test fixture that measures the cycles `std::fs::File` takes to read each of several sizes
-through its two read paths, inline `FS_READ` and memory-cap `FS_READ_MEMORY`.
+through its two read paths, inline `FS_READ` and memory-cap `FS_READ_MEMORY`, and to open a
+three-component path.
 
 ---
 
@@ -24,7 +25,8 @@ programs/fsbench/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # Fixture check, then the timed inline and memory-cap read loops
+    ├── main.rs            # Fixture check, then the timed inline and memory-cap read loops
+    └── open.rs            # The timed open of /services/fs/fatfs and its NS_LOOKUP count
 ```
 
 ---
@@ -64,13 +66,22 @@ blocks on the filesystem driver, and riscv64 keeps no two harts' `cycle` counter
 warm-up iterations, which block on the driver too, leave it running there. A timed iteration that
 reads fewer bytes than the size panics.
 
+The `open` case then opens `/services/fs/fatfs`, a file three components deep that the root
+filesystem owns, after 8 untimed warm-up opens, the timed ones (256, or `ITERS`). Each sample is
+one `File::open`: vfsd forwards the whole path to the root filesystem, which walks all three
+components in one `NS_LOOKUP`
+([shared/namespace-protocol/README.md](../../shared/namespace-protocol/README.md#ns_lookup)
+§ NS_LOOKUP),
+and the open's `FS_OPEN`; the file is closed outside the sample. An open whose walk made other
+than one `NS_LOOKUP` call, by std's count (`std::os::seraph::fs::ns_lookup_calls`), panics.
+
 ---
 
 ## Output
 
 Lines are logged under the name `fsbench`. The run opens with
-`starting, fixture=/data/svctest/bench.bin iters=<n>`, emits one result line per size and path, and
-closes with `done`. Each result line has the form
+`starting, fixture=/data/svctest/bench.bin iters=<n>`, emits one result line per size and path, then
+the `open` case's, and closes with `done`. Each result line has the form
 [shared/bench/README.md § Result line](../../shared/bench/README.md#result-line) specifies, where
 `<bytes>` is the size, `<path>` is `inline` or `frame`, and `n=` is `ITERS`:
 
@@ -79,14 +90,21 @@ bench fsbench.read size=<bytes> path=<path> arch=<arch> cpus=<k> unit=cycles
     n=<n> min=<v> p50=<v> p90=<v> p99=<v> max=<v>
 ```
 
-The line is one line, wrapped above for width only.
+The line is one line, wrapped above for width only. The `open` case's line has the same form, with
+`depth=3`, the path's component count, in place of the size and path:
 
-Each sample is one timed iteration, which covers all the `read` calls that one size needs, not a
-single call.
+```text
+bench fsbench.open depth=3 arch=<arch> cpus=<k> unit=cycles
+    n=<n> min=<v> p50=<v> p90=<v> p99=<v> max=<v>
+```
 
-A failed pin, CPU-count read, open, fixture check, seek, or read, or an `ITERS` that is not a
-positive integer, panics, so the process exits unsuccessfully and the `fs_crossover_bench` phase
-fails; a memory-cap `read` that returns `Interrupted` is retried, not a failure.
+Each `read` sample is one timed iteration, which covers all the `read` calls that one size needs,
+not a single call.
+
+A failed pin, CPU-count read, open, fixture check, seek, or read, an `open` case walk of other than
+one `NS_LOOKUP`, or an `ITERS` that is not a positive integer, panics, so the process exits
+unsuccessfully and the `fs_crossover_bench` phase fails; a memory-cap `read` that returns
+`Interrupted` is retried, not a failure.
 
 ---
 

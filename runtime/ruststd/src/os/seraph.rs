@@ -3273,6 +3273,21 @@ pub mod fs {
     pub fn write_frame_memmgr_calls() -> u64 {
         crate::sys::fs::write_frame_memmgr_calls()
     }
+
+    /// The `NS_LOOKUP` calls the calling thread's path walks have made:
+    /// `std::fs` opens, metadata, removals and directory walks, and the
+    /// binary and directory walks of `std::process::Command::spawn`. A walk
+    /// sends as many of its path's remaining components as one request
+    /// carries, and the server walks every one it owns
+    /// (shared/namespace-protocol/README.md § `NS_LOOKUP`), so a path whose
+    /// components one server owns costs one call. A count that only moves
+    /// up, wrapping; a caller reads the difference across the walks it
+    /// measures.
+    #[must_use]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn ns_lookup_calls() -> u64 {
+        crate::sys::fs::ns_lookup_calls()
+    }
 }
 
 // ── Per-spawn namespace caps (CommandExt) ───────────────────────────────────

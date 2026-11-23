@@ -103,6 +103,7 @@ use crate::sys::{unsupported, unsupported_err};
 
 use crate::os::seraph::deadline_call;
 use ipc::{IpcMessage, fs_errors, fs_labels, ns_labels};
+use namespace_protocol::client::{PathWalk, StepError};
 use namespace_protocol::{NodeKind, NsError, validate_name};
 use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE};
 
@@ -465,7 +466,8 @@ pub(crate) struct WalkedDir
     pub dir_cap: u64,
 }
 
-/// Walk `path_str` from `root_cap` via per-component `NS_LOOKUP`.
+/// Walk `path_str` from `root_cap` via `NS_LOOKUP`, sending as many whole components per request
+/// as fit `MAX_LOOKUP_PATH_LEN`.
 ///
 /// Splits on `/`, drops empty segments, validates component names per
 /// the namespace-protocol rules. Every hop (including the final) must
@@ -505,7 +507,8 @@ pub(crate) fn walk_path_to_dir_with_rights(
     Ok(WalkedDir { dir_cap: walked.cap })
 }
 
-/// Walk `path_str` from `root_cap` via per-component `NS_LOOKUP`.
+/// Walk `path_str` from `root_cap` via `NS_LOOKUP`, sending as many whole components per request
+/// as fit `MAX_LOOKUP_PATH_LEN`.
 ///
 /// Splits on `/`, drops empty segments, validates component names per
 /// the namespace-protocol rules. Each non-final hop must resolve to a
@@ -576,12 +579,8 @@ fn walk_components(
     expect_kind: ExpectKind,
 ) -> io::Result<WalkedNode>
 {
-    let path_bytes = path_str.as_bytes();
-    let components: Vec<&[u8]> = path_bytes
-        .split(|&b| b == b'/')
-        .filter(|c| !c.is_empty())
-        .collect();
-    if components.is_empty()
+    let mut walk = PathWalk::new(path_str.as_bytes());
+    if walk.is_finished()
     {
         // A path with no components (e.g. "/") denotes the anchor
         // directory itself. Directory walks resolve it to the anchor;
@@ -624,7 +623,7 @@ fn walk_components(
             }
         };
     }
-    for c in &components
+    for c in walk.components()
     {
         if validate_name(c).is_err()
         {
@@ -636,30 +635,31 @@ fn walk_components(
     }
 
     // Walk: hold one cap at a time. `current_cap` starts as the
-    // shared root cap (do not delete on advance). After the first hop
-    // it points at a freshly-derived child cap that we own and must
-    // `cap_delete` when we move past it.
+    // shared root cap (do not delete on advance). After the first
+    // request it points at a freshly-derived child cap that we own and
+    // must `cap_delete` when we move past it. Each request carries as
+    // many of the remaining components as fit one message; the server
+    // walks as many of them as it owns and its reply says how many it
+    // consumed (shared/namespace-protocol/README.md § `NS_LOOKUP`).
     let mut current_cap = root_cap;
     let mut current_owns = false;
     let mut size_hint: u64 = 0;
     let mut leaf_kind = NodeKind::Dir;
 
-    let last_idx = components.len() - 1;
-    for (i, &name) in components.iter().enumerate()
+    while let Some(request) = walk.request()
     {
-        let is_last = i == last_idx;
         // Cap-native rights model: server intersects
-        // `parent_rights & entry.max_rights & caller_requested`.
-        // `requested_rights` is the mask the caller wants on every
-        // hop; `0xFFFF` is the "everything I'm allowed" sentinel
-        // used by `File::open` and friends, and an explicit narrow
-        // mask is used by walk-and-attenuate spawners.
-        let label = ns_labels::NS_LOOKUP | ((name.len() as u64) << 16);
-        let msg = IpcMessage::builder(label)
+        // `parent_rights & entry.max_rights & caller_requested` at every
+        // component it walks. `requested_rights` is the mask the caller
+        // wants on every component; `0xFFFF` is the "everything I'm
+        // allowed" sentinel used by `File::open` and friends, and an
+        // explicit narrow mask is used by walk-and-attenuate spawners.
+        let msg = IpcMessage::builder(request.label())
             .word(0, requested_rights)
-            .bytes(1, name)
+            .bytes(1, request.path())
             .build();
 
+        count_ns_lookup_call();
         // SAFETY: ipc_buf is the registered IPC buffer for this thread.
         let reply = match unsafe { deadline_call(current_cap, &msg, ipc_buf) }
         {
@@ -681,6 +681,9 @@ fn walk_components(
                 let _ = syscall::cap_delete(current_cap);
             }
             let base = ns_error_to_io(reply.label);
+            // An error reply names the failing component by its index in
+            // the request's path.
+            let name = walk.component(reply.word(0)).unwrap_or(b"<unknown>");
             let name_str = core::str::from_utf8(name).unwrap_or("<non-utf8>");
             return Err(io::Error::new(
                 base.kind(),
@@ -689,6 +692,7 @@ fn walk_components(
         }
         let kind = reply.word(0);
         let entry_size = reply.word(1);
+        let consumed = reply.word(2);
         let next_cap = match reply.caps().first()
         {
             Some(&c) => c,
@@ -703,30 +707,40 @@ fn walk_components(
                 ));
             }
         };
-
-        if !is_last && kind != NodeKind::Dir as u64
+        if current_owns
         {
-            let _ = syscall::cap_delete(next_cap);
-            if current_owns
+            let _ = syscall::cap_delete(current_cap);
+        }
+        current_cap = next_cap;
+        current_owns = true;
+
+        match walk.advance(&request, consumed, kind)
+        {
+            Ok(()) => {}
+            Err(StepError::ConsumedOutOfRange) =>
             {
                 let _ = syscall::cap_delete(current_cap);
+                return Err(io::const_error!(
+                    io::ErrorKind::InvalidData,
+                    "seraph fs: NS_LOOKUP reply consumed no component, or more than were sent",
+                ));
             }
-            return Err(io::const_error!(
-                io::ErrorKind::NotADirectory,
-                "seraph fs: non-final path component is not a directory",
-            ));
+            Err(StepError::NotADirectory) =>
+            {
+                let _ = syscall::cap_delete(current_cap);
+                return Err(io::const_error!(
+                    io::ErrorKind::NotADirectory,
+                    "seraph fs: non-final path component is not a directory",
+                ));
+            }
         }
-        if is_last
+        if walk.is_finished()
         {
             match expect_kind
             {
                 ExpectKind::File if kind == NodeKind::Dir as u64 =>
                 {
-                    let _ = syscall::cap_delete(next_cap);
-                    if current_owns
-                    {
-                        let _ = syscall::cap_delete(current_cap);
-                    }
+                    let _ = syscall::cap_delete(current_cap);
                     return Err(io::const_error!(
                         io::ErrorKind::IsADirectory,
                         "seraph fs: target path is a directory",
@@ -734,11 +748,7 @@ fn walk_components(
                 }
                 ExpectKind::Dir if kind != NodeKind::Dir as u64 =>
                 {
-                    let _ = syscall::cap_delete(next_cap);
-                    if current_owns
-                    {
-                        let _ = syscall::cap_delete(current_cap);
-                    }
+                    let _ = syscall::cap_delete(current_cap);
                     return Err(io::const_error!(
                         io::ErrorKind::NotADirectory,
                         "seraph fs: target path is not a directory",
@@ -755,16 +765,11 @@ fn walk_components(
                 NodeKind::File
             };
         }
-
-        if current_owns
-        {
-            let _ = syscall::cap_delete(current_cap);
-        }
-        current_cap = next_cap;
-        current_owns = true;
         size_hint = entry_size;
     }
 
+    // Every component passed `validate_name`, so each fits a request and
+    // the loop ends only with the walk finished.
     Ok(WalkedNode {
         cap: current_cap,
         size: size_hint,
@@ -960,6 +965,25 @@ pub(crate) fn write_frame_memmgr_calls() -> u64
 fn count_write_frame_call()
 {
     WRITE_FRAME_MEMMGR_CALLS.set(WRITE_FRAME_MEMMGR_CALLS.get().wrapping_add(1));
+}
+
+// The `NS_LOOKUP` calls the calling thread's path walks have made
+// ([`ns_lookup_calls`]).
+#[thread_local]
+// restore: none
+static NS_LOOKUP_CALLS: Cell<u64> = Cell::new(0);
+
+/// The `NS_LOOKUP` calls the calling thread's path walks have made
+/// (`std::os::seraph::fs::ns_lookup_calls`).
+pub(crate) fn ns_lookup_calls() -> u64
+{
+    NS_LOOKUP_CALLS.get()
+}
+
+/// Count one `NS_LOOKUP` call a path walk makes.
+fn count_ns_lookup_call()
+{
+    NS_LOOKUP_CALLS.set(NS_LOOKUP_CALLS.get().wrapping_add(1));
 }
 
 /// Return a write frame's run to memmgr by its region id, counted.

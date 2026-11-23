@@ -18,17 +18,20 @@
 //! `NamespaceBackend` trait, run their own receive loop, and route each
 //! `NS_*` message through `dispatch_request` for reply.
 
-/// Walk one path component within a directory cap.
+/// Walk a relative path of one or more components from a directory cap,
+/// as far as the answering server owns the entries.
 ///
-/// Request label encodes name length in bits 16..32; the field exceeds
-/// `namespace_protocol::MAX_NAME_LEN`, which bounds a name. Request data:
-/// `data[0]` = caller-requested namespace rights (low 24 bits;
-/// `0xFFFF` is interpreted as "everything I'm allowed"); subsequent
-/// data words carry the name bytes packed little-endian, length
-/// taken from the label. No request caps. Reply on success: label =
-/// 0, `data[0]` = entry kind (0 = File, 1 = Dir), `data[1]` =
-/// cached size hint, `caps[0]` = derived child node cap. On error
-/// the label is the matching `NsError` wire code with no caps.
+/// Request label encodes the path length in bits 16..32, at most
+/// `namespace_protocol::MAX_LOOKUP_PATH_LEN`. Request data: `data[0]` =
+/// caller-requested namespace rights (low 24 bits; `0xFFFF` is
+/// interpreted as "everything I'm allowed"); subsequent data words carry
+/// the path bytes packed little-endian, components joined by single `/`,
+/// length taken from the label. No request caps. Reply on success: label
+/// = 0, `data[0]` = kind of the last entry walked (0 = File, 1 = Dir),
+/// `data[1]` = its cached size hint, `data[2]` = components consumed,
+/// `caps[0]` = derived node cap of that entry. On error the label is the
+/// matching `NsError` wire code, `data[0]` the zero-based index of the
+/// failing component, with no caps.
 pub const NS_LOOKUP: u64 = 20;
 /// Attribute snapshot for the node addressed by the caller's badge.
 ///

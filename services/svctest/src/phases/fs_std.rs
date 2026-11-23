@@ -949,6 +949,8 @@ fn fake_fs_serve(ep: u64) -> FakeFsReport
             ipc::IpcMessage::builder(0)
                 .word(0, namespace_protocol::NodeKind::File as u64)
                 .word(1, FAKE_FS_FILE_SIZE)
+                // Every path opened here (`/a`, `/b`) has one component.
+                .word(2, 1)
                 .cap(node)
                 .build()
         }
@@ -1318,6 +1320,8 @@ fn fake_write_fs_serve(ep: u64) -> FakeWriteReport
             ipc::IpcMessage::builder(0)
                 .word(0, namespace_protocol::NodeKind::File as u64)
                 .word(1, FAKE_FS_FILE_SIZE)
+                // The one path opened here, `/a`, has one component.
+                .word(2, 1)
                 .cap(node)
                 .build()
         }

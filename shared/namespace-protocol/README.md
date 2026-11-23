@@ -30,12 +30,12 @@ capability slots ([docs/ipc-design.md](../../docs/ipc-design.md)
 
 | Opcode | Label | Direction | Purpose |
 |---:|---|---|---|
-| 20 | `NS_LOOKUP` | client → server | Walk one path component within a directory cap |
+| 20 | `NS_LOOKUP` | client → server | Walk a path of one or more components from a directory cap |
 | 21 | `NS_STAT` | client → server | Attribute snapshot for the addressed node |
 | 22 | `NS_READDIR` | client → server | Enumerate one entry of a directory by index |
 
 Label bits 0..16 carry the opcode; bits 16..32 carry an opcode-defined
-header (today: name length for `NS_LOOKUP`); bits 32..64 are zero.
+header (today: path length for `NS_LOOKUP`); bits 32..64 are zero.
 
 Error replies use the matching `NsError` discriminant value as the
 reply label; success replies use label `0`.
@@ -100,59 +100,96 @@ open's (`OpenRef`). `gate` refuses every badge with a kind flag
 
 ## NS_LOOKUP
 
-Walk one component within the directory addressed by the caller's
-badge.
+Walk a relative path of one or more components from the directory
+addressed by the caller's badge, as far as the server that answers it owns
+the entries.
 
 **Request**
 
 | Field | Value |
 |---|---|
 | `label` bits 0..16 | `20` |
-| `label` bits 16..32 | `name_len` (1..=255) |
+| `label` bits 16..32 | `path_len` (1..=504, `MAX_LOOKUP_PATH_LEN`: the data words after `data[0]`) |
 | `data[0]` | Caller-requested rights (low 24 bits; sentinel `0xFFFF` requests "everything I am allowed") |
-| `data[1..]` | Name bytes packed little-endian, `name_len` bytes total |
+| `data[1..]` | Path bytes packed little-endian, `path_len` bytes total: one or more components joined by single `/` |
 | `caps` | empty |
+
+A path of one component is a single name.
 
 **Reply (success)**
 
 | Field | Value |
 |---|---|
 | `label` | `0` |
-| `data[0]` | Entry kind: `0 = File`, `1 = Dir` |
-| `data[1]` | Cached size hint in bytes (zero for directories) |
-| `caps[0]` | Badged SEND on the owning server's namespace endpoint (with GRANT, for a local entry and across a mount alike) |
+| `data[0]` | Kind of the last entry walked: `0 = File`, `1 = Dir` |
+| `data[1]` | Its cached size hint in bytes (zero for directories) |
+| `data[2]` | Components consumed, `1` up to the number the request carried |
+| `caps[0]` | Badged SEND on the owning server's namespace endpoint for the last entry walked (with GRANT, for a local entry and across a mount alike) |
 
-**Reply (error)** — label is the matching `NsError` code (no caps).
+**Reply (error)**: label is the matching `NsError` code, `data[0]` the
+zero-based index in the request's path of the component that failed, and
+no caps.
 
 The server MUST:
 
 1. Reject with `PermissionDenied` if the caller's badge lacks the
    `LOOKUP` rights bit.
-2. Reject with `InvalidName` if the requested name fails
-   `validate_name`.
-3. Resolve `(parent_node, name)` via `NamespaceBackend::lookup`.
-4. Reject with `NotFound` for hidden entries per the rule
-   `parent_rights & entry.visible_requires == entry.visible_requires`.
-   Hidden and absent MUST be indistinguishable to the caller
-   ([docs/namespace-model.md](../../docs/namespace-model.md) § Per-Entry Rights and Visibility).
-5. Compute returned rights as
-   `parent_rights ∩ entry.max_rights ∩ caller_requested`
-   ([docs/namespace-model.md](../../docs/namespace-model.md) § Per-Entry Rights and Visibility).
-   Reject with `PermissionDenied` if the returned rights are empty,
-   whatever the entry's node: a cap with no rights can do nothing.
-6. Mint the child cap carrying the returned rights via
-   `cap_derive_badge`: for `EntryTarget::Local`, on the server's own
-   namespace endpoint at the entry's `NodeId`; for
-   `EntryTarget::External` (mount points and other cross-server
-   entries), on the peer server's namespace endpoint at the peer node.
-   External mints afresh from the peer's *unbadged* endpoint — rather
-   than copying a stored cap — because the kernel forbids re-badging an
-   already-badged cap ([docs/capability-model.md](../../docs/capability-model.md)
+2. Reject with `InvalidName` if `path_len` is zero, larger than
+   `MAX_LOOKUP_PATH_LEN`, or larger than the request's data, or if a
+   component (an empty one, from a leading, trailing or doubled `/`,
+   included) fails `validate_name`.
+3. Walk the components in order from the caller's node, each with the
+   checks a separate request for it would apply, against the node and the
+   rights the previous component reached (for the first, the caller's
+   badge):
+   1. Reject with `PermissionDenied` if those rights lack `LOOKUP` (for a
+      component after the first).
+   2. Resolve `(parent_node, name)` via `NamespaceBackend::lookup`.
+   3. Reject with `NotFound` for hidden entries per the rule
+      `parent_rights & entry.visible_requires == entry.visible_requires`.
+      Hidden and absent MUST be indistinguishable to the caller
+      ([docs/namespace-model.md](../../docs/namespace-model.md) § Per-Entry Rights and Visibility).
+   4. Compute the entry's rights as
+      `parent_rights ∩ entry.max_rights ∩ caller_requested`
+      ([docs/namespace-model.md](../../docs/namespace-model.md) § Per-Entry Rights and Visibility).
+      Reject with `PermissionDenied` if they are empty, whatever the
+      entry's node: a cap with no rights can do nothing.
+4. Stop the walk at the last component; at an entry that is not
+   `EntryTarget::Local` (a mount point or another cross-server entry,
+   whose components another server resolves); and at a local directory
+   for which `NamespaceBackend::continues_walk` returns `false`. Reject
+   with `NotADirectory` a local entry that is not a directory with
+   components after it.
+5. Mint the cap of the entry the walk stopped at, and no other, carrying
+   that entry's rights via `cap_derive_badge`: for `EntryTarget::Local`,
+   on the server's own namespace endpoint at the entry's `NodeId`; for
+   `EntryTarget::External`, on the peer server's namespace endpoint at
+   the peer node. External mints afresh from the peer's *unbadged*
+   endpoint — rather than copying a stored cap — because the kernel
+   forbids re-badging an already-badged cap
+   ([docs/capability-model.md](../../docs/capability-model.md)
    § Badges), so attenuation can only cross the boundary by a fresh mint
    ([docs/namespace-model.md](../../docs/namespace-model.md) § Cross-server entries).
 
+An error names the component it failed at: steps 1 and 2 name component
+0 or the failing one, step 3 and step 4's `NotADirectory` the component
+being walked, and a failed mint the last component consumed.
+
+Each component is checked against exactly the node and rights the cap of
+the previous one would carry, so the walk reaches the cap, the rights and
+the error a walk of one request per component reaches, and the client
+gets no authority that walk would not give it.
+
 The dispatch crate's `dispatch_request` enforces all of the above;
 backends own only the storage lookup.
+
+**The client's walk.** A client sends the components of its path it has
+not yet walked, as many whole ones as fit `MAX_LOOKUP_PATH_LEN`, and
+continues from the returned cap with the components the reply did not
+consume, until none are left. It refuses a reply whose consumed count is
+zero or more than the request carried, and one that reached a file with
+components after it. `client::PathWalk` holds that state, for std's walk
+and `shared/ns-client`'s alike.
 
 ---
 
@@ -224,7 +261,7 @@ to obtain a node cap for an entry of interest.
 
 ## Names
 
-A name accepted by `NS_LOOKUP` MUST satisfy `validate_name`:
+Each component of an `NS_LOOKUP` path MUST satisfy `validate_name`:
 
 - UTF-8 encoded.
 - Length 1..=255 bytes (`MAX_NAME_LEN`).
@@ -232,8 +269,9 @@ A name accepted by `NS_LOOKUP` MUST satisfy `validate_name`:
 - MUST NOT be `.` or `..`.
 
 Path resolution is client-side ([docs/namespace-model.md](../../docs/namespace-model.md)
-§ Walking): a multi-component name is one `NS_LOOKUP` per component
-against the cap returned by the previous step. There is no `..`
+§ Walking): a client sends the components of its path in `NS_LOOKUP`
+requests (§ `NS_LOOKUP`), each against the cap the previous one returned,
+and each server walks as many of them as it owns. There is no `..`
 operation; walking up requires a separately-held parent cap.
 
 Backends MAY further restrict (reserved words, on-disk encoding
@@ -315,12 +353,13 @@ composing servers (`vfsd`'s synthetic root) embed this crate: they implement
 security-relevant code path. `dispatch_request` decodes each request and
 runs the caller-rights checks (and, for `NS_LOOKUP`, the name validation)
 before it calls a trait method; it then filters what `lookup` and
-`readdir_entry` return by visibility and, for a lookup, composes the minted
-cap's rights. Backends never re-implement those checks.
+`readdir_entry` return by visibility and, for a lookup, composes the
+rights of each component it walks and of the minted cap. Backends never re-implement those checks.
 
 | Method | Called from |
 |---|---|
-| `lookup` | `NS_LOOKUP` |
+| `lookup` | `NS_LOOKUP`, once per component walked |
+| `continues_walk` | `NS_LOOKUP`, at a local directory with components after it |
 | `readdir_entry` | `NS_READDIR` |
 | `may_hide_entries` | `NS_READDIR` |
 | `stat` | `NS_STAT` |
@@ -335,6 +374,14 @@ client's index with one `readdir_entry` call; otherwise the crate scans
 the directory from index 0 on each request, skipping hidden entries. A
 hidden entry returned on the direct path makes the crate fall back to that
 filtered scan, so a wrong `false` cannot reveal a hidden name.
+
+`continues_walk` (default `true`) reports whether an `NS_LOOKUP` walk that
+reached a local directory may look its next component up there. A backend
+returns `false` for a directory whose lookups another dispatcher may answer:
+vfsd's synthetic nodes with a fall-through
+([services/vfsd/docs/namespace-composition.md](../../services/vfsd/docs/namespace-composition.md)).
+The walk then stops at the directory and the client sends the rest of its
+path to the directory's cap, where that dispatcher sees it.
 
 Memory-cap reads continue to use the `ipc::fs_labels::FS_READ_MEMORY`
 surface today; they are documented in
@@ -364,8 +411,9 @@ namespace-protocol/
 ├── README.md
 └── src/
     ├── lib.rs      # NodeKind, NodeStat, EntryName, EntryTarget, EntryView, MemoryReply,
-    │               #   NamespaceBackend, dispatch_request
+    │               #   NamespaceBackend, dispatch_request, the NS_LOOKUP walk, MAX_LOOKUP_PATH_LEN
     ├── badge.rs    # NodeId and badge packing (pack)
+    ├── client.rs   # PathWalk: the client's NS_LOOKUP requests and continuation
     ├── gate.rs     # gate, GateError, compose_forward_lookup_rights, the per-label table
     ├── name.rs     # validate_name, MAX_NAME_LEN
     ├── rights.rs   # NamespaceRights and the bit constants

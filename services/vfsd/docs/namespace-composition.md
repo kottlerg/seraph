@@ -279,12 +279,13 @@ the last query and holds them, so a `MOUNT` resolves its role across every disk 
 
 ## NS_LOOKUP composition
 
-`NS_LOOKUP(parent, name)` against any cap on vfsd's namespace
+`NS_LOOKUP(parent, path)` against any cap on vfsd's namespace
 endpoint dispatches in two stages, from `vfsd::namespace_loop`:
 
-1. **Local-child match.** `VfsdRootBackend::lookup` walks the
-   parent node's visible children (§ Mount record). A match on a child
-   whose mount is restarting is answered `IoError` (§ Driver restart). A
+1. **Local-child match.** The namespace-protocol crate walks the path's
+   components, calling `VfsdRootBackend::lookup`, which searches a node's
+   visible children (§ Mount record), for each. A match on a child whose
+   mount is restarting is answered `IoError` (§ Driver restart). A
    match on a *terminal* child returns
    an `EntryTarget::External` view carrying the driver's unbadged
    endpoint and the peer root node; the namespace-protocol crate
@@ -292,14 +293,19 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
    § NS_LOOKUP) mints a fresh `cap_derive_badge` on that endpoint carrying the
    composed `parent_rights ∩ entry.max_rights ∩ caller_requested` rights. The
    reply cap belongs to the underlying filesystem driver's namespace
-   endpoint; subsequent walks bypass vfsd entirely. A match on a
-   *synthetic intermediate* child returns an `EntryTarget::Local`
-   view; the protocol crate mints a `cap_derive_badge` on
-   `namespace_ep` addressing the intermediate's `NodeId`, so the next
-   `NS_LOOKUP` lands back on vfsd.
+   endpoint; subsequent walks bypass vfsd entirely, and the walk stops
+   there, the reply's consumed count telling the client how many
+   components remain for the driver. A match on a *synthetic
+   intermediate* child returns an `EntryTarget::Local` view; the walk
+   goes on to the next component in that node unless the node has a
+   `fallthrough_cap` (`VfsdRootBackend::continues_walk`), in which case
+   it stops there: the protocol crate mints a `cap_derive_badge` on
+   `namespace_ep` addressing the intermediate's `NodeId`, so the
+   client's next `NS_LOOKUP`, carrying the rest of the path, lands back
+   on vfsd, where stage 2 can forward it.
 
-2. **Fall-through.** If no local child matches and the parent has a
-   `fallthrough_cap`, vfsd's dispatcher (`try_forward_lookup_fallthrough`
+2. **Fall-through.** If the path's first component matches no local
+   child and the parent has a `fallthrough_cap`, vfsd's dispatcher (`try_forward_lookup_fallthrough`
    in `services/vfsd/src/main.rs`) forwards the `NS_LOOKUP` to the
    fall-through cap and replies with the upstream response, or with
    `IoError` when the call has not returned within `FALLTHROUGH_TIMEOUT_MS`
@@ -309,8 +315,9 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
    them with the request's `caller_requested` word
    (via `namespace_protocol::compose_forward_lookup_rights`), and
    writes the resulting mask into the outbound message's `word(0)`.
-   The label, name bytes, and overall shape are preserved; the reply
-   travels back unchanged. This is required because the fall-through
+   The label, path bytes, and overall shape are preserved, so the root
+   filesystem walks the whole path; the reply travels back unchanged.
+   This is required because the fall-through
    cap was minted by vfsd's own walk and carries full namespace
    rights — the receiving fs driver composes its returned rights
    against the destination cap's badge

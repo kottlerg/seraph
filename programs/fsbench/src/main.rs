@@ -44,6 +44,8 @@ use std::io::{Read, Seek, SeekFrom};
 
 use bench::{Counters, Report, Unit, Value};
 
+mod open;
+
 const PAGE_SIZE: u64 = 4096;
 const PAGE_SIZE_USIZE: usize = 4096;
 const INLINE_CHUNK: u64 = 504;
@@ -300,6 +302,7 @@ fn main()
         measure(&mut f, size, ReadPath::Inline, &mut buf, &run);
         measure(&mut f, size, ReadPath::Frame, &mut buf, &run);
     }
+    open::measure(&run);
 
     std::os::seraph::log!("done");
 }

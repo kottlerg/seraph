@@ -34,6 +34,7 @@ extern crate rustc_std_workspace_core as core;
 use core::prelude::rust_2024::*;
 
 pub mod badge;
+pub mod client;
 pub mod gate;
 pub mod name;
 pub mod rights;
@@ -47,6 +48,12 @@ pub use gate::{GateError, compose_forward_lookup_rights, gate, gate_open};
 pub use name::{MAX_NAME_LEN, MIN_NAME_LEN, NameError, validate_name};
 pub use rights::{NamespaceRights, RIGHTS_BITS, RIGHTS_MASK};
 pub use wire::NsError;
+
+/// Longest path, in bytes, one `NS_LOOKUP` request carries: the request's
+/// data words after its rights word (`README.md` § `NS_LOOKUP`). A client
+/// walking a longer path splits it at a component boundary
+/// ([`client::PathWalk`]).
+pub const MAX_LOOKUP_PATH_LEN: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 1) * 8;
 
 /// Whether a node is a directory or a regular file.
 ///
@@ -258,6 +265,19 @@ pub trait NamespaceBackend
         true
     }
 
+    /// Whether an `NS_LOOKUP` walk that reached `dir` through one of this
+    /// backend's own entries may look the walk's next component up in `dir`.
+    /// A backend returns `false` for a directory whose lookups another
+    /// dispatcher may answer, such as a vfsd synthetic node with a
+    /// fall-through: the walk then ends at `dir` and returns its cap, and the
+    /// client sends the rest of its path to that cap, as a separate request
+    /// would reach it. The default, `true`, is correct for a backend that
+    /// serves every lookup in each of its directories itself.
+    fn continues_walk(&mut self, _dir: NodeId) -> bool
+    {
+        true
+    }
+
     /// Return attribute snapshot for `node` (file or directory).
     ///
     /// # Errors
@@ -404,6 +424,38 @@ pub(crate) fn decode_caller_requested(raw_req: u64) -> NamespaceRights
     }
 }
 
+/// Where an `NS_LOOKUP` walk ended: the entry its last consumed component
+/// names, the rights composed for that entry, and the number of components
+/// consumed.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct WalkEnd
+{
+    entry: EntryView,
+    rights: NamespaceRights,
+    consumed: u64,
+}
+
+/// A failed `NS_LOOKUP`: the error and the zero-based index, in the
+/// request's path, of the component it failed at.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct WalkError
+{
+    error: NsError,
+    component: u64,
+}
+
+impl WalkError
+{
+    /// The error reply: the error's label, and the component's index in
+    /// `data[0]`.
+    fn reply(self) -> ipc::IpcMessage
+    {
+        ipc::IpcMessage::builder(self.error.as_label())
+            .word(0, self.component)
+            .build()
+    }
+}
+
 fn handle_lookup<B: NamespaceBackend>(
     backend: &mut B,
     msg: &ipc::IpcMessage,
@@ -415,88 +467,180 @@ fn handle_lookup<B: NamespaceBackend>(
     {
         return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());
     }
-
-    let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
-    let data_bytes = msg.data_bytes();
-    // First data word carries caller-requested rights; name bytes start
-    // at byte 8.
-    let name = data_bytes
-        .get(8..)
-        .and_then(|rest| rest.get(..name_len))
-        .filter(|_| name_len != 0 && name_len <= MAX_NAME_LEN);
-    let Some(name) = name
-    else
-    {
-        return ipc::IpcMessage::new(NsError::InvalidName.as_label());
-    };
-    if validate_name(name).is_err()
-    {
-        return ipc::IpcMessage::new(NsError::InvalidName.as_label());
-    }
-
     let caller_requested = decode_caller_requested(msg.word(0));
-
-    let entry = match backend.lookup(parent, name)
+    let walked = lookup_path(msg)
+        .and_then(|path| walk_path(backend, parent, parent_rights, path, caller_requested));
+    let end = match walked
     {
-        Ok(e) => e,
-        Err(err) => return ipc::IpcMessage::new(err.as_label()),
+        Ok(end) => end,
+        Err(err) => return err.reply(),
     };
-
-    let returned_rights = match compose_lookup_rights(parent_rights, &entry, caller_requested)
+    let child_cap = match mint_entry_cap(end.entry.target, end.rights, namespace_endpoint)
     {
-        Ok(r) => r,
-        Err(err) => return ipc::IpcMessage::new(err.as_label()),
-    };
-
-    let child_cap = match entry.target
-    {
-        EntryTarget::Local(node) =>
+        Ok(cap) => cap,
+        Err(error) =>
         {
-            let badge = pack(node, returned_rights);
-            // SEND_GRANT lets the holder attach caps to IPC requests
-            // through this node cap (e.g. the release-endpoint SEND that
-            // travels in `caps[0]` of `FS_OPEN`, or `FS_WRITE_MEMORY`'s
-            // source page). It does not widen authority — the
-            // recipient still validates every received cap. SEND-only
-            // would force the kernel to reject any cap-bearing IPC.
-            match syscall::cap_derive_badge(
-                namespace_endpoint,
-                syscall_abi::RIGHTS_EP_SEND_GRANT,
-                badge,
-            )
-            {
-                Ok(slot) => slot,
-                Err(_) => return ipc::IpcMessage::new(NsError::OutOfResources.as_label()),
-            }
-        }
-        EntryTarget::External { endpoint, node } =>
-        {
-            // Mount-boundary crossing: mint a fresh badged SEND on the
-            // peer server's endpoint carrying the composed rights, as the
-            // `Local` arm does on this server's own endpoint. Deriving the
-            // badge from the (unbadged) peer endpoint, rather than copying
-            // a pre-badged mount cap, is what lets attenuation cross the
-            // mount: the kernel forbids re-badging an already-badged cap
-            // (`SYS_CAP_DERIVE_BADGE` rejects a badged source), so a
-            // stored badged cap could only ever be copied at its original
-            // full rights. GRANT is carried for the same reason as in the
-            // `Local` arm: a node cap across a mount must still be able to
-            // attach caps (the release-endpoint SEND of `FS_OPEN`) to its
-            // requests.
-            let badge = pack(node, returned_rights);
-            match syscall::cap_derive_badge(endpoint, syscall_abi::RIGHTS_EP_SEND_GRANT, badge)
-            {
-                Ok(slot) => slot,
-                Err(_) => return ipc::IpcMessage::new(NsError::OutOfResources.as_label()),
-            }
+            let component = end.consumed.saturating_sub(1);
+            return WalkError { error, component }.reply();
         }
     };
 
     ipc::IpcMessage::builder(0)
-        .word(0, entry.kind as u64)
-        .word(1, entry.size_hint)
+        .word(0, end.entry.kind as u64)
+        .word(1, end.entry.size_hint)
+        .word(2, end.consumed)
         .cap(child_cap)
         .build()
+}
+
+/// The path of an `NS_LOOKUP` request: its `/`-separated components, each
+/// of which passes [`validate_name`].
+///
+/// # Errors
+///
+/// [`NsError::InvalidName`] at component 0 when the label's length is zero,
+/// longer than [`MAX_LOOKUP_PATH_LEN`], or longer than the request's data;
+/// at the first component that fails [`validate_name`] (an empty one, from a
+/// leading, trailing or doubled `/`, included) otherwise.
+fn lookup_path(msg: &ipc::IpcMessage) -> Result<&[u8], WalkError>
+{
+    let path_len = ((msg.label >> 16) & 0xFFFF) as usize;
+    // The rights word takes data bytes 0..8; the path starts at byte 8.
+    let path = msg
+        .data_bytes()
+        .get(8..)
+        .and_then(|rest| rest.get(..path_len))
+        .filter(|_| path_len != 0 && path_len <= MAX_LOOKUP_PATH_LEN)
+        .ok_or(WalkError {
+            error: NsError::InvalidName,
+            component: 0,
+        })?;
+    for (component, name) in (0u64..).zip(path.split(|&b| b == b'/'))
+    {
+        if validate_name(name).is_err()
+        {
+            return Err(WalkError {
+                error: NsError::InvalidName,
+                component,
+            });
+        }
+    }
+    Ok(path)
+}
+
+/// Walk `path` from directory `dir`, which the caller holds with
+/// `dir_rights`, applying at each component the checks a separate
+/// `NS_LOOKUP` of that component applies: the parent must hold `LOOKUP`,
+/// the backend resolves the name, and [`compose_lookup_rights`] filters
+/// visibility and composes the entry's rights, which are the parent rights of
+/// the next component.
+///
+/// The walk ends at the last component; at an entry that is not
+/// [`EntryTarget::Local`], whose next components another server resolves;
+/// and at a directory the backend does not continue walks into
+/// ([`NamespaceBackend::continues_walk`]). A local entry that is not a
+/// directory, with components left after it, fails the walk.
+///
+/// # Errors
+///
+/// The [`WalkError`] of the first component that fails:
+/// [`NsError::PermissionDenied`] when its parent lacks `LOOKUP` or its
+/// composed rights are empty, [`NsError::NotFound`] when it is absent or
+/// hidden, [`NsError::NotADirectory`] when it is a local file with
+/// components after it, and the backend's own error from
+/// [`NamespaceBackend::lookup`].
+fn walk_path<B: NamespaceBackend>(
+    backend: &mut B,
+    dir: NodeId,
+    dir_rights: NamespaceRights,
+    path: &[u8],
+    caller_requested: NamespaceRights,
+) -> Result<WalkEnd, WalkError>
+{
+    let mut parent = dir;
+    let mut parent_rights = dir_rights;
+    let mut component = 0u64;
+    let mut names = path.split(|&b| b == b'/').peekable();
+    while let Some(name) = names.next()
+    {
+        let at = |error| WalkError { error, component };
+        if !parent_rights.contains(rights::LOOKUP)
+        {
+            return Err(at(NsError::PermissionDenied));
+        }
+        let entry = backend.lookup(parent, name).map_err(at)?;
+        let rights = compose_lookup_rights(parent_rights, &entry, caller_requested).map_err(at)?;
+        // A path holds at most `MAX_LOOKUP_PATH_LEN` components, so the count
+        // does not saturate.
+        let consumed = component.saturating_add(1);
+        let end = WalkEnd {
+            entry,
+            rights,
+            consumed,
+        };
+        let EntryTarget::Local(node) = entry.target
+        else
+        {
+            return Ok(end);
+        };
+        if names.peek().is_none()
+        {
+            return Ok(end);
+        }
+        if entry.kind != NodeKind::Dir
+        {
+            return Err(at(NsError::NotADirectory));
+        }
+        if !backend.continues_walk(node)
+        {
+            return Ok(end);
+        }
+        parent = node;
+        parent_rights = rights;
+        component = consumed;
+    }
+    // `split` yields at least one item, so the loop returns before this.
+    Err(WalkError {
+        error: NsError::InvalidName,
+        component: 0,
+    })
+}
+
+/// Mint the cap an `NS_LOOKUP` returns for an entry at `target`, carrying
+/// `rights`: on this server's `namespace_endpoint` for a local entry, on the
+/// peer's unbadged endpoint for an external one.
+///
+/// # Errors
+///
+/// [`NsError::OutOfResources`] when `cap_derive_badge` fails.
+fn mint_entry_cap(
+    target: EntryTarget,
+    rights: NamespaceRights,
+    namespace_endpoint: u64,
+) -> Result<u64, NsError>
+{
+    let (endpoint, node) = match target
+    {
+        EntryTarget::Local(node) => (namespace_endpoint, node),
+        // Mount-boundary crossing: the badge is derived from the peer's
+        // unbadged endpoint, rather than copied from a pre-badged mount cap,
+        // because the kernel forbids re-badging an already-badged cap
+        // (`SYS_CAP_DERIVE_BADGE` rejects a badged source), so a stored badged
+        // cap could only ever be copied at its original full rights.
+        EntryTarget::External { endpoint, node } => (endpoint, node),
+    };
+    // SEND_GRANT lets the holder attach caps to IPC requests through the
+    // node cap (e.g. the release-endpoint SEND that travels in `caps[0]` of
+    // `FS_OPEN`, or `FS_WRITE_MEMORY`'s source page), across a mount as on
+    // this server. It does not widen authority: the recipient still
+    // validates every received cap. SEND-only would force the kernel to
+    // reject any cap-bearing IPC.
+    syscall::cap_derive_badge(
+        endpoint,
+        syscall_abi::RIGHTS_EP_SEND_GRANT,
+        pack(node, rights),
+    )
+    .map_err(|_| NsError::OutOfResources)
 }
 
 /// Visibility check and rights composition for an `NS_LOOKUP` hit.
@@ -956,5 +1100,414 @@ mod tests
             nth_visible_entry(&mut dir, NodeId::ROOT, r, 2),
             Err(NsError::IoError)
         );
+    }
+
+    // ── NS_LOOKUP walks ──────────────────────────────────────────────────
+
+    const ALL: u32 = rights::DEFINED_MASK;
+    const PEER_ENDPOINT: u64 = 99;
+    const LONG: &[u8] = &[b'l'; 200];
+
+    const fn local(node: u64, kind: NodeKind, max: u32, visible_requires: u32) -> EntryView
+    {
+        EntryView {
+            target: EntryTarget::Local(NodeId::from_raw_truncated(node)),
+            kind,
+            size_hint: node,
+            max_rights: NamespaceRights::from_raw(max),
+            visible_requires: NamespaceRights::from_raw(visible_requires),
+        }
+    }
+
+    const fn dir(node: u64, max: u32) -> EntryView
+    {
+        local(node, NodeKind::Dir, max, 0)
+    }
+
+    const fn file(node: u64, max: u32) -> EntryView
+    {
+        local(node, NodeKind::File, max, 0)
+    }
+
+    /// `(parent, name, entry)`: every entry of the walk tests' tree.
+    const TREE: &[(u64, &[u8], EntryView)] = &[
+        (0, b"a", dir(1, ALL)),
+        (1, b"b", dir(7, ALL & !rights::WRITE)),
+        (
+            7,
+            b"f",
+            file(8, rights::READ | rights::WRITE | rights::STAT),
+        ),
+        (
+            0,
+            b"ro",
+            dir(
+                2,
+                rights::LOOKUP | rights::READDIR | rights::STAT | rights::READ,
+            ),
+        ),
+        (2, b"w", file(9, rights::WRITE)),
+        (2, b"x", dir(10, ALL)),
+        (10, b"y", file(14, ALL)),
+        (0, b"secret", local(3, NodeKind::Dir, ALL, rights::ADMIN)),
+        (3, b"s", file(11, ALL)),
+        (0, b"f", file(4, ALL)),
+        (
+            0,
+            b"mnt",
+            EntryView {
+                target: EntryTarget::External {
+                    endpoint: PEER_ENDPOINT,
+                    node: NodeId::ROOT,
+                },
+                kind: NodeKind::Dir,
+                size_hint: 0,
+                max_rights: NamespaceRights::ALL,
+                visible_requires: NamespaceRights::NONE,
+            },
+        ),
+        (0, b"nolook", dir(5, rights::STAT | rights::READ)),
+        (5, b"x", file(12, ALL)),
+        (0, b"syn", dir(6, ALL)),
+        (6, b"x", dir(13, ALL)),
+        (0, LONG, dir(20, ALL)),
+        (20, LONG, dir(21, ALL)),
+        (21, LONG, file(22, ALL)),
+    ];
+
+    /// Node 6 is answered by another dispatcher, as a vfsd synthetic node
+    /// with a fall-through is.
+    const STOP_NODE: u64 = 6;
+
+    struct Tree;
+
+    impl NamespaceBackend for Tree
+    {
+        fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Result<EntryView, NsError>
+        {
+            TREE.iter()
+                .find(|(parent, n, _)| *parent == dir.raw() && *n == name)
+                .map(|&(_, _, entry)| entry)
+                .ok_or(NsError::NotFound)
+        }
+
+        fn readdir_entry(&mut self, _dir: NodeId, _idx: u32) -> Result<Option<EntryName>, NsError>
+        {
+            Err(NsError::NotSupported)
+        }
+
+        fn continues_walk(&mut self, dir: NodeId) -> bool
+        {
+            dir.raw() != STOP_NODE
+        }
+
+        fn stat(&mut self, _node: NodeId) -> Result<NodeStat, NsError>
+        {
+            Err(NsError::NotSupported)
+        }
+
+        fn read_inline(
+            &mut self,
+            _file: NodeId,
+            _offset: u64,
+            _max_len: usize,
+            _dst: &mut [u8],
+        ) -> Result<usize, NsError>
+        {
+            Err(NsError::NotSupported)
+        }
+
+        fn read_memory(
+            &mut self,
+            _file: NodeId,
+            _offset: u64,
+            _cookie: u64,
+        ) -> Result<MemoryReply, NsError>
+        {
+            Err(NsError::NotSupported)
+        }
+
+        fn release_memory(&mut self, _file: NodeId, _cookie: u64) {}
+
+        fn close(&mut self, _node: NodeId) {}
+    }
+
+    /// Where a client walk ended: the entry reached with its rights, or the
+    /// error and the index of the failing component in the whole path.
+    type Outcome = Result<(EntryView, NamespaceRights), (NsError, u64)>;
+
+    /// The walk one component per request: each request's server checks
+    /// `LOOKUP` on the badge of the cap it is sent to, looks the name up and
+    /// composes its rights; the client refuses a non-final entry that is not
+    /// a directory and sends the next component to the minted cap. A cap
+    /// minted on another server ends the walk within this backend.
+    fn per_component(dir_rights: u32, path: &[u8], requested: u32) -> Outcome
+    {
+        let requested = NamespaceRights::from_raw(requested);
+        let mut node = NodeId::ROOT;
+        let mut parent_rights = NamespaceRights::from_raw(dir_rights);
+        let mut names = path.split(|&b| b == b'/').peekable();
+        let mut index = 0u64;
+        while let Some(name) = names.next()
+        {
+            if !parent_rights.contains(rights::LOOKUP)
+            {
+                return Err((NsError::PermissionDenied, index));
+            }
+            let entry = Tree.lookup(node, name).map_err(|e| (e, index))?;
+            let got =
+                compose_lookup_rights(parent_rights, &entry, requested).map_err(|e| (e, index))?;
+            if names.peek().is_none()
+            {
+                return Ok((entry, got));
+            }
+            let EntryTarget::Local(next) = entry.target
+            else
+            {
+                return Ok((entry, got));
+            };
+            if entry.kind != NodeKind::Dir
+            {
+                return Err((NsError::NotADirectory, index));
+            }
+            node = next;
+            parent_rights = got;
+            index += 1;
+        }
+        unreachable!("split yields a component")
+    }
+
+    /// The walk a client makes with [`client::PathWalk`]: each request
+    /// carries the components that fit, the server walks them with
+    /// [`walk_path`], and the client continues from the reached entry. Also
+    /// returns the number of requests made.
+    fn multi_component(dir_rights: u32, path: &[u8], requested: u32) -> (Outcome, u32)
+    {
+        let requested = NamespaceRights::from_raw(requested);
+        let mut walk = client::PathWalk::new(path);
+        let mut node = NodeId::ROOT;
+        let mut parent_rights = NamespaceRights::from_raw(dir_rights);
+        let mut done = 0u64;
+        let mut requests = 0u32;
+        let mut reached = None;
+        while let Some(request) = walk.request()
+        {
+            requests += 1;
+            let end = match walk_path(&mut Tree, node, parent_rights, request.path(), requested)
+            {
+                Ok(end) => end,
+                Err(e) => return (Err((e.error, done + e.component)), requests),
+            };
+            match walk.advance(&request, end.consumed, end.entry.kind as u64)
+            {
+                Ok(()) =>
+                {}
+                Err(client::StepError::NotADirectory) =>
+                {
+                    return (
+                        Err((NsError::NotADirectory, done + end.consumed - 1)),
+                        requests,
+                    );
+                }
+                Err(client::StepError::ConsumedOutOfRange) => panic!("consumed out of range"),
+            }
+            done += end.consumed;
+            reached = Some((end.entry, end.rights));
+            match end.entry.target
+            {
+                EntryTarget::Local(next) =>
+                {
+                    node = next;
+                    parent_rights = end.rights;
+                }
+                EntryTarget::External { .. } => break,
+            }
+        }
+        (reached.ok_or((NsError::InvalidName, 0)), requests)
+    }
+
+    /// Assert that the multi-component walk of `path` ends as the
+    /// per-component walk does, and return that outcome.
+    fn assert_same_walk(dir_rights: u32, path: &[u8], requested: u32) -> Outcome
+    {
+        let one = per_component(dir_rights, path, requested);
+        let (multi, _) = multi_component(dir_rights, path, requested);
+        assert_eq!(multi, one, "path {:?}", core::str::from_utf8(path));
+        one
+    }
+
+    #[test]
+    fn a_multi_component_lookup_narrows_rights_at_every_step_as_separate_lookups_do()
+    {
+        let (entry, got) = assert_same_walk(ALL, b"a/b/f", ALL).unwrap();
+        assert_eq!(entry.target, EntryTarget::Local(NodeId::new(8).unwrap()));
+        assert_eq!(got, NamespaceRights::from_raw(rights::READ | rights::STAT));
+        assert_same_walk(ALL, b"a/b/f", rights::LOOKUP | rights::READ).unwrap();
+        assert_same_walk(ALL, b"ro/x/y", ALL).unwrap();
+        // The whole path is one request.
+        assert_eq!(multi_component(ALL, b"a/b/f", ALL).1, 1);
+    }
+
+    #[test]
+    fn a_hidden_component_fails_a_multi_component_lookup_as_an_absent_one()
+    {
+        assert_eq!(
+            assert_same_walk(ALL & !rights::ADMIN, b"secret/s", ALL),
+            Err((NsError::NotFound, 0))
+        );
+        assert_same_walk(ALL, b"secret/s", ALL).unwrap();
+    }
+
+    #[test]
+    fn a_missing_component_is_reported_at_its_index()
+    {
+        assert_eq!(
+            assert_same_walk(ALL, b"a/b/zz", ALL),
+            Err((NsError::NotFound, 2))
+        );
+    }
+
+    #[test]
+    fn a_multi_component_lookup_ends_at_a_mount_with_the_cap_a_separate_lookup_mints()
+    {
+        let end = walk_path(
+            &mut Tree,
+            NodeId::ROOT,
+            NamespaceRights::ALL,
+            b"mnt/x/y",
+            NamespaceRights::ALL,
+        )
+        .unwrap();
+        assert_eq!(end.consumed, 1);
+        assert_eq!(
+            end.entry.target,
+            EntryTarget::External {
+                endpoint: PEER_ENDPOINT,
+                node: NodeId::ROOT
+            }
+        );
+        assert_same_walk(rights::LOOKUP | rights::READ, b"mnt/x/y", ALL).unwrap();
+    }
+
+    #[test]
+    fn a_file_before_the_last_component_is_not_a_directory()
+    {
+        assert_eq!(
+            assert_same_walk(ALL, b"f/x", ALL),
+            Err((NsError::NotADirectory, 0))
+        );
+        assert_eq!(
+            assert_same_walk(ALL, b"a/b/f/x", ALL),
+            Err((NsError::NotADirectory, 2))
+        );
+    }
+
+    #[test]
+    fn a_directory_reached_without_lookup_refuses_the_next_component()
+    {
+        assert_eq!(
+            assert_same_walk(ALL, b"nolook/x", ALL),
+            Err((NsError::PermissionDenied, 1))
+        );
+    }
+
+    #[test]
+    fn a_component_whose_composed_rights_are_empty_is_refused()
+    {
+        assert_eq!(
+            assert_same_walk(ALL, b"ro/w", ALL),
+            Err((NsError::PermissionDenied, 1))
+        );
+    }
+
+    #[test]
+    fn a_walk_ends_at_a_directory_the_backend_does_not_continue_into()
+    {
+        let end = walk_path(
+            &mut Tree,
+            NodeId::ROOT,
+            NamespaceRights::ALL,
+            b"syn/x",
+            NamespaceRights::ALL,
+        )
+        .unwrap();
+        assert_eq!(end.consumed, 1);
+        assert_eq!(
+            end.entry.target,
+            EntryTarget::Local(NodeId::new(STOP_NODE).unwrap())
+        );
+        // The client continues from the returned cap.
+        assert_same_walk(ALL, b"syn/x", ALL).unwrap();
+        assert_eq!(multi_component(ALL, b"syn/x", ALL).1, 2);
+    }
+
+    #[test]
+    fn a_path_longer_than_one_request_walks_as_separate_lookups_do()
+    {
+        let mut path = [b'l'; 3 * 201 - 1];
+        path[200] = b'/';
+        path[401] = b'/';
+        let (entry, _) = assert_same_walk(ALL, &path, ALL).unwrap();
+        assert_eq!(entry.target, EntryTarget::Local(NodeId::new(22).unwrap()));
+        assert_eq!(multi_component(ALL, &path, ALL).1, 2);
+        // A failure in the second request names its index in the whole path.
+        path[598] = b'z';
+        assert_eq!(
+            assert_same_walk(ALL, &path, ALL),
+            Err((NsError::NotFound, 2))
+        );
+    }
+
+    /// An `NS_LOOKUP` request for `path` on a root cap holding `rights`.
+    fn lookup_request(path: &[u8], len: u64, rights: u32) -> ipc::IpcMessage
+    {
+        let mut msg = ipc::IpcMessage::builder(ipc::ns_labels::NS_LOOKUP | (len << 16))
+            .word(0, 0xFFFF)
+            .bytes(1, path)
+            .build();
+        msg.badge = pack(NodeId::ROOT, NamespaceRights::from_raw(rights));
+        msg
+    }
+
+    #[test]
+    fn an_ns_lookup_error_reply_names_the_failing_component()
+    {
+        let reply = request_reply(&mut Tree, &lookup_request(b"a/b/zz", 6, ALL), 0);
+        assert_eq!(reply.label, NsError::NotFound.as_label());
+        assert_eq!(reply.word(0), 2);
+        assert_eq!(reply.caps(), &[] as &[u64]);
+    }
+
+    #[test]
+    fn an_ns_lookup_path_with_an_empty_component_is_an_invalid_name()
+    {
+        for (path, index) in [(&b"a//b"[..], 1), (b"/a", 0), (b"a/", 1), (b"a/../b", 1)]
+        {
+            let reply = request_reply(&mut Tree, &lookup_request(path, path.len() as u64, ALL), 0);
+            assert_eq!(reply.label, NsError::InvalidName.as_label(), "{path:?}");
+            assert_eq!(reply.word(0), index, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn an_ns_lookup_length_outside_the_request_is_an_invalid_name()
+    {
+        let too_long = (MAX_LOOKUP_PATH_LEN + 1) as u64;
+        for len in [0, 7, too_long]
+        {
+            let reply = request_reply(&mut Tree, &lookup_request(b"a/b/f", len, ALL), 0);
+            assert_eq!(reply.label, NsError::InvalidName.as_label(), "len {len}");
+        }
+    }
+
+    #[test]
+    fn an_ns_lookup_without_lookup_is_refused_before_its_path_is_read()
+    {
+        let reply = request_reply(
+            &mut Tree,
+            &lookup_request(b"a//b", 4, ALL & !rights::LOOKUP),
+            0,
+        );
+        assert_eq!(reply.label, NsError::PermissionDenied.as_label());
     }
 }

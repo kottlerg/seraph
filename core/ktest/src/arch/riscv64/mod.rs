@@ -257,30 +257,6 @@ pub fn shutdown(info: &InitInfo)
     sbi_shutdown::shutdown(info);
 }
 
-/// Read the hardware cycle counter with `csrr cycle`; requires the kernel to
-/// have set `scounteren.CY = 1`.
-///
-/// Returns raw cycle counts; use deltas only.
-#[expect(
-    clippy::inline_always,
-    reason = "the counter read must be inlined to avoid call overhead in cycle benchmarks"
-)]
-#[inline(always)]
-pub fn cycles_now() -> u64
-{
-    let c: u64;
-    // SAFETY: cycle CSR is accessible from U-mode when scounteren.CY = 1,
-    // which the kernel sets on every hart.
-    unsafe {
-        core::arch::asm!(
-            "csrr {}, cycle",
-            out(reg) c,
-            options(nostack, nomem),
-        );
-    }
-    c
-}
-
 /// Run every RISC-V-specific Tier 1 test. x86-64's wrapped-stack probe has no
 /// RISC-V counterpart: the RISC-V entry alignment, `sp & !0xF`, rounds down
 /// without wrapping, so the raw stack check covers it. Nor has its top-of-user-

@@ -60,8 +60,8 @@ xtask/
 │   ├── commands/               # Subcommand modules (build, capture_acpi, run (the
 │   │   │                       #   interactive boot; run/classified.rs, --runs),
 │   │   │                       #   ktest_timing, symbolize, mkdisk, clean, crypto_vectors, fuzz,
-│   │   │                       #   compare_images, lint_docs, pr_check, review, release_scope,
-│   │   │                       #   issue, orch, hook, host, trust_request)
+│   │   │                       #   kani, compare_images, lint_docs, pr_check, review,
+│   │   │                       #   release_scope, issue, orch, hook, host, trust_request)
 │   │   └── test/               # `test`: the unit tests, the cases, the cells
 │   │       ├── mod.rs          # Dispatch: the unit tests, a case, a cell
 │   │       ├── cases.rs        # The case registry; the runners of a case and of a cell
@@ -88,7 +88,7 @@ Build Seraph components and populate `sysroot/`.
 
 ```
 cargo xtask build [--arch x86_64|riscv64] [--release] \
-    [--component <name>|all] [--debug <comp>[,...]]
+    [--component <name>|all] [--debug <comp>[,...]] [--ktest-bench-only]
 ```
 
 | Option | Default | Description |
@@ -97,6 +97,7 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 | `--release` | off | Build in release mode |
 | `--component` | `all` | Build a single component: `boot`, the crate name of any component the build installs (an entry of the `SPECS` table in `xtask/src/commands/build.rs`: `kernel`, `init`, `ktest`, each service, driver, program, fixture, and tester crate), or `all` |
 | `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, each named as `--component` names it, e.g. `--debug kernel,crashme`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
+| `--ktest-bench-only` | off | Build ktest with its `bench-only` feature, which runs Tier 3 alone at its benchmark iteration count ([core/ktest/README.md](../core/ktest/README.md#compile-time-options) § Compile-time options); refused with a `--component` other than `ktest` or `all` |
 
 Before it compiles, the build checks that the workspace's Rust source is formatted as
 `cargo fmt` formats it (`cargo fmt --all --check`) and fails on a file that is not, printing
@@ -1453,6 +1454,50 @@ aside, and takes their `--wait-host` and `--host-override` options.
 
 ---
 
+### `cargo xtask kani`
+
+Run the bounded proofs ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded
+verification) with the pinned Kani release.
+
+```
+cargo xtask kani [--component <CRATE> [--harness <NAME>]]
+cargo xtask kani --pin
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--component <CRATE>` | every registered crate | Verify the harnesses of this crate only, by its package name |
+| `--harness <NAME>` | every harness | Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`); needs `--component` |
+| `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
+
+The command first checks that every tracked Rust source declaring a `#[kani::proof]` lies in a
+crate `HARNESSED` in `src/commands/kani.rs` registers, the crate being the nearest directory
+above the file that holds a `Cargo.toml`, and fails naming each file that does not: a crate's
+first harness registers it. It then checks that `cargo kani --version` names `KANI_VERSION`, and
+fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
+§ Toolchain) on another release or none.
+
+For each selected crate it runs `cargo kani --tests -p <package>` (with `--harness` when given),
+which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies
+each harness with Kani's unwinding assertions on. It prints Kani's output as it comes and judges
+it as well as Kani's verdict: the crate fails when `cargo kani` exits unsuccessfully, when a
+harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED` check or a
+`FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's verdict
+names), and when Kani's closing summary is missing, counts a failure or no harness, or counts
+other harnesses than reported a verdict. Every selected crate runs, and the command fails naming
+each that failed. CI's `kani` job runs the command with no option, after installing the release
+`--pin` prints ([docs/build-system.md](../docs/build-system.md#continuous-integration)
+§ Continuous Integration).
+
+No assistant session runs Kani: `cargo install` is outside the permissions
+`.claude/settings.json` grants, and the `bash` hook refuses `cargo kani`
+([§ `cargo xtask hook`](#cargo-xtask-hook)).
+
+The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`
+aside, and takes their `--wait-host` and `--host-override` options.
+
+---
+
 ### `cargo xtask compare-images`
 
 Build two commits for each architecture and profile, and compare every file the build installs in
@@ -2171,13 +2216,13 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 ## Host launch rules
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
-themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypto-vectors`,
-`fuzz` (but `--list`), `compare-images` and `test` without a case or a cell (the unit tests) as
-builds
-(`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`, and `test` with a case
-or a cell as boots, each boot admitted as above (the `shutdown` case admits once for its boots,
-which it runs one at a time). The `signing` case, which compiles its revoking and role-scoped
-bootloaders before it boots, is admitted as a build for each compile and then each boot as a boot.
+themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypto-vectors`, `fuzz`
+(but `--list`), `kani` (but `--pin`), `compare-images` and `test` without a case or a cell (the unit
+tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`, and
+`test` with a case or a cell as boots, each boot admitted as above (the `shutdown` case admits once
+for its boots, which it runs one at a time). The `signing` case, which compiles its revoking and
+role-scoped bootloaders before it boots, is admitted as a build for each compile and then each boot
+as a boot.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
@@ -2301,7 +2346,7 @@ error prints no `tip:` lines. An argument that is not valid UTF-8 is refused wit
 `InvalidUtf8` error wherever it stands, a path value among them, which clap passed on as its
 bytes.
 
-`src/argparse/reference/` holds the evidence: every help screen of the table (93), and 7229 command
+`src/argparse/reference/` holds the evidence: every help screen of the table (95), and 7244 command
 lines with their outcome (the command and the values parsed, or the error's kind and message),
 recorded from clap 4.6 before the parser replaced it. `cargo xtask test` parses each command line
 and prints each screen through the table, and fails on any difference. A change to the table that

@@ -17,7 +17,7 @@
 //! on to the kernel as the same exception.
 //! A firmware that leaves `TM` or `IR` set fails the case where the kernel
 //! keeps that bit. The granted `cycle` read is
-//! the one `crate::arch::cycles_now` makes. The exception's `stval` holds the
+//! the one `bench::Counters` makes. The exception's `stval` holds the
 //! instruction or zero, at the hart's and the firmware's choice, so the case
 //! does not check it.
 
@@ -28,7 +28,7 @@ use syscall_abi::FAULT_EXC_ILLEGAL_INSTRUCTION;
 use crate::integration::user_mode_controls::{DeniedInstruction, StateCheck};
 
 /// No granted control has a state to check beyond the `cycle` read
-/// `crate::arch::cycles_now` makes.
+/// `bench::Counters` makes.
 pub const STATE_CHECKS: &[StateCheck] = &[];
 
 /// The instructions U-mode is denied: reads of the counters `time`,

@@ -17,7 +17,7 @@
 
 extern crate alloc;
 
-#[cfg(any(test, fuzzing))]
+#[cfg(any(test, kani, fuzzing))]
 pub mod property;
 
 use alloc::vec::Vec;

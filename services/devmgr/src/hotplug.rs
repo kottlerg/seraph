@@ -54,7 +54,7 @@ enum Grant
     /// `Notify`.
     Firmware,
     /// The slot could not be handed to the poller, or its BAR pages could not
-    /// be held; devmgr never touches the slot.
+    /// be held; devmgr acts on none of its events.
     Unmanaged,
 }
 
@@ -379,7 +379,10 @@ impl Hotplug
 
     /// Hand slot `index` to the poller, starting the poller with the first,
     /// and hold its port's record and the BAR pages of the functions behind
-    /// it ([`hold_behind`]); `by` names the grant in the log line.
+    /// it ([`hold_behind`]); `by` names the grant in the log line. The slot
+    /// is taken over here, before the hand-over ([`take_over`]), so every
+    /// event latched after the log line is the poller's to act on, whichever
+    /// thread runs first.
     fn manage(
         &mut self,
         index: usize,
@@ -416,13 +419,17 @@ impl Hotplug
         {
             self.poller = start_poller(self.posted.clone(), self.job_note, self.aspace);
         }
-        let polled = Polled {
+        let mut polled = Polled {
             index,
             slot,
             page,
             behind: behind(&slot, records, caps),
             state: SlotState::Empty,
         };
+        if self.poller.is_some()
+        {
+            take_over(&mut polled, self.aspace);
+        }
         let sent = self.poller.as_ref().map(|poller| poller.slots.send(polled));
         if !matches!(sent, Some(Ok(())))
         {
@@ -717,9 +724,10 @@ fn start_poller(posted: mpsc::Sender<Job>, job_note: u64, aspace: u64) -> Option
     })
 }
 
-/// The poller: take over each slot as it arrives, power off each slot whose
-/// removal job completed ([`power_off`]), then every
-/// [`hp::HOTPLUG_POLL_MS`] read and act on each managed slot's Slot Status.
+/// The poller: add each slot as it arrives, taken over already
+/// ([`take_over`]), power off each slot whose removal job completed
+/// ([`power_off`]), then every [`hp::HOTPLUG_POLL_MS`] read and act on each
+/// managed slot's Slot Status. With no slot yet it waits for the first.
 fn poll_loop(
     slots: &mpsc::Receiver<Polled>,
     completions: &mpsc::Receiver<usize>,
@@ -731,6 +739,14 @@ fn poll_loop(
     let mut managed: Vec<Polled> = Vec::new();
     loop
     {
+        // No slot to poll and none to power off: the poller started with its
+        // first slot on the way, so it waits for that slot rather than a
+        // period.
+        if managed.is_empty()
+            && let Ok(slot) = slots.recv()
+        {
+            add_polled(&mut managed, slot);
+        }
         while let Ok(index) = completions.try_recv()
         {
             if let Some(slot) = managed.iter_mut().find(|s| s.index == index)
@@ -738,20 +754,9 @@ fn poll_loop(
                 power_off(slot, aspace);
             }
         }
-        while let Ok(mut slot) = slots.try_recv()
+        while let Ok(slot) = slots.try_recv()
         {
-            if managed.try_reserve(1).is_err()
-            {
-                let _ = syscall::cap_delete(slot.page);
-                let (s, b, d, f) = slot.slot.port;
-                std::os::seraph::log!(
-                    warn: "hotplug: no memory to poll slot {}:{}:{}.{}; not watched",
-                    s, b, d, f
-                );
-                continue;
-            }
-            take_over(&mut slot, aspace);
-            managed.push(slot);
+            add_polled(&mut managed, slot);
         }
         for slot in &mut managed
         {
@@ -759,6 +764,23 @@ fn poll_loop(
         }
         let _ = syscall::thread_sleep(hp::HOTPLUG_POLL_MS);
     }
+}
+
+/// Add `slot` to the poller's `managed` slots; with no memory to, drop its
+/// page derivation, logged.
+fn add_polled(managed: &mut Vec<Polled>, slot: Polled)
+{
+    if managed.try_reserve(1).is_err()
+    {
+        let _ = syscall::cap_delete(slot.page);
+        let (s, b, d, f) = slot.slot.port;
+        std::os::seraph::log!(
+            warn: "hotplug: no memory to poll slot {}:{}:{}.{}; not watched",
+            s, b, d, f
+        );
+        return;
+    }
+    managed.push(slot);
 }
 
 /// Run `access` on the port's configuration registers, mapped for the call;
@@ -774,11 +796,12 @@ fn with_port<R>(slot: &Polled, aspace: u64, access: impl FnOnce(&ConfigRegs) -> 
     })
 }
 
-/// Take over a slot: turn its event interrupts off (the poller reads the
-/// latches instead), clear its latches, and hold it as what lay behind it
-/// when it was managed ([`hp::initial`]): the first poll removes a recorded
-/// card that left before take-over, removes and then adds a card that
-/// replaced it, and brings up an unrecorded card present.
+/// Take over a slot, on the control thread before it is handed to the
+/// poller ([`Hotplug::manage`]): turn its event interrupts off (the poller
+/// reads the latches instead), clear its latches, and hold it as what lay
+/// behind it when it was managed ([`hp::initial`]): the first poll removes a
+/// recorded card that left before take-over, removes and then adds a card
+/// that replaced it, and brings up an unrecorded card present.
 fn take_over(slot: &mut Polled, aspace: u64)
 {
     let s = slot.slot;

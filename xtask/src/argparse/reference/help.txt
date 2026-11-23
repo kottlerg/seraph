@@ -764,7 +764,7 @@ Usage: xtask path-account trace [OPTIONS] --reference <LOG>
 Options:
       --arch <ARCH>            Target architecture: the sysroot's [default: x86_64] [possible values: x86_64, riscv64]
       --release                The sysroot was built with `--release` (default: the dev profile)
-      --iteration <ITERATION>  The sample index traced in each benchmark: the iteration that records it is stepped. Below the smallest sample count of a benchmark (100), so every benchmark records it [default: 64]
+      --iteration <ITERATION>  The first sample index traced in each benchmark: the iteration that records it and the 7 after it are stepped. From 1 to 92, so the last stepped index stays below the smallest sample count of a benchmark (100) [default: 64]
       --reference <LOG>        Saved logs of icount boots of the same tree and profile's bench-only image built without `--limited-debug` (`run --icount --save-logs`), whose lowest p50s are the reference counts each traced window must equal
       --timeout <TIMEOUT>      Seconds the whole boot may take [default: 3600]
       --wait-host <SECS>       When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
@@ -792,7 +792,7 @@ Options:
           The sysroot was built with `--release` (default: the dev profile)
 
       --iteration <ITERATION>
-          The sample index traced in each benchmark: the iteration that records it is stepped. Below the smallest sample count of a benchmark (100), so every benchmark records it
+          The first sample index traced in each benchmark: the iteration that records it and the 7 after it are stepped. From 1 to 92, so the last stepped index stays below the smallest sample count of a benchmark (100)
           
           [default: 64]
 

@@ -1288,9 +1288,10 @@ args! {
         #[arg(long)]
         pub release: bool,
 
-        /// The sample index traced in each benchmark: the iteration that
-        /// records it is stepped. Below the smallest sample count of a
-        /// benchmark (100), so every benchmark records it.
+        /// The first sample index traced in each benchmark: the iteration
+        /// that records it and the 7 after it are stepped. From 1 to 92, so
+        /// the last stepped index stays below the smallest sample count of a
+        /// benchmark (100).
         #[arg(long, default_value_t = 64)]
         pub iteration: u32,
 

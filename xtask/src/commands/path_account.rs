@@ -68,6 +68,25 @@ const RECORD_FUNCTION: &str = "<bench::stats::Samples>::record";
 /// `--iteration`: the account takes the first whose window is the boot's p50.
 const CANDIDATES: u32 = 8;
 
+/// The fewest samples any benchmark records (`thread_lifecycle` and
+/// `wait_set_cycle` in core/ktest/src/bench): every stepped iteration,
+/// `--iteration` through `--iteration` + [`CANDIDATES`] - 1, is below it.
+const MIN_SAMPLES: u32 = 100;
+
+/// Check that every iteration a trace steps from `iteration` is one every
+/// benchmark records.
+fn check_iteration(iteration: u32) -> Result<()>
+{
+    let last = iteration.saturating_add(CANDIDATES - 1);
+    ensure!(
+        iteration >= 1 && last < MIN_SAMPLES,
+        "--iteration must be from 1 to {}: the trace steps {CANDIDATES} iterations from it, \
+         and the shortest benchmark records {MIN_SAMPLES} samples",
+        MIN_SAMPLES - CANDIDATES
+    );
+    Ok(())
+}
+
 /// The wait for each gdbstub reply but a resume's.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -286,7 +305,7 @@ fn trace(ctx: &Context, args: &PathAccountTraceArgs) -> Result<()>
         harness == Harness::Ktest,
         "the disk image boots the {harness:?} harness; run `cargo xtask mkdisk --harness ktest`"
     );
-    ensure!(args.iteration >= 1, "--iteration must be at least 1");
+    check_iteration(args.iteration)?;
     let profile = if args.release { "release" } else { "dev" };
     let images = read_images(ctx)?;
     let (references, reference_name) = references(args, arch)?;
@@ -968,6 +987,17 @@ mod tests
         assert!(!is_trap(b"W00"));
         assert!(!is_trap(b"T02thread:01;"));
         assert!(!is_trap(b"E14"));
+    }
+
+    #[test]
+    fn every_stepped_iteration_is_one_each_benchmark_records()
+    {
+        assert!(matches!(check_iteration(1), Ok(())));
+        assert!(matches!(check_iteration(64), Ok(())));
+        assert!(matches!(check_iteration(MIN_SAMPLES - CANDIDATES), Ok(())));
+        assert!(check_iteration(0).is_err());
+        assert!(check_iteration(MIN_SAMPLES - CANDIDATES + 1).is_err());
+        assert!(check_iteration(u32::MAX).is_err());
     }
 
     #[test]

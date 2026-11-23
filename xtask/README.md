@@ -1746,7 +1746,7 @@ cargo xtask path-account write [--doc FILE]
 |---|---|---|
 | `--arch` | `x86_64` | The sysroot's architecture |
 | `--release` | off | The sysroot was built with `--release` |
-| `--iteration` | `64` | The first sample index stepped; below the smallest sample count of a benchmark (100), less the 7 iterations stepped after it |
+| `--iteration` | `64` | The first sample index stepped, from 1 to 92: it and the 7 iterations after it stay below the smallest sample count of a benchmark (100) |
 | `--reference` | | Saved logs of icount boots of the same tree and profile's bench-only image built without `--limited-debug`, whose lowest one-CPU p50s are the reference counts |
 | `--timeout` | `3600` | Seconds the whole boot may take |
 | `--doc` | `core/kernel/docs/hot-path-account.md` | (`write`) The document whose generated block is replaced |

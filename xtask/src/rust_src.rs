@@ -1485,7 +1485,7 @@ fn write_if_changed(src: &Path, dst: &Path, short: &str) -> Result<()>
     Ok(())
 }
 
-fn probe_real_sysroot() -> Result<PathBuf>
+pub(crate) fn probe_real_sysroot() -> Result<PathBuf>
 {
     let rustc = require_tool("rustc")?;
     let out = Command::new(&rustc)

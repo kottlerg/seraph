@@ -5,11 +5,15 @@
 
 //! Clean command: remove the sysroot, the symbols store, the disk images and
 //! any per-launch variable store a killed launch left, and optionally the
-//! cargo target/ directory.
+//! cargo target/ directory, whole or but for the standard library's build
+//! units.
 
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 
-use crate::error::Result;
+use crate::error::{Context as _, Result};
 
 use crate::cli::CleanArgs;
 use crate::context::Context as BuildContext;
@@ -59,7 +63,16 @@ pub fn run(ctx: &BuildContext, args: &CleanArgs) -> Result<()>
             .map_err(|e| crate::error::err!("failed to remove {}: {}", vars.display(), e))?;
     }
 
-    if args.all
+    if args.keep_std
+    {
+        let lock = crate::rust_src::probe_real_sysroot()?
+            .join("lib/rustlib/src/rust/library/Cargo.lock");
+        let text =
+            fs::read_to_string(&lock).with_context(|| format!("reading {}", lock.display()))?;
+        step("Removing cargo target/ but the standard library's build units");
+        prune_to_std(&ctx.target_dir, &library_packages(&text))?;
+    }
+    else if args.all
     {
         step("Removing cargo target/ directory");
         run_cmd(Command::new("cargo").args(["clean"]).current_dir(&ctx.root))?;
@@ -67,4 +80,173 @@ pub fn run(ctx: &BuildContext, args: &CleanArgs) -> Result<()>
 
     step("Clean complete");
     Ok(())
+}
+
+/// Cargo's profile directories, in `target/` for the host and in
+/// `target/<triple>/` for each target.
+const PROFILES: [&str; 2] = ["debug", "release"];
+
+/// The packages the toolchain's `library/Cargo.lock` names: those a
+/// `-Z build-std` build compiles from the toolchain's sources.
+fn library_packages(lock: &str) -> BTreeSet<String>
+{
+    lock.lines()
+        .filter_map(|line| line.strip_prefix("name = \""))
+        .filter_map(|rest| rest.strip_suffix('"'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Remove `path`, a directory with what it holds or a file.
+fn remove(path: &Path) -> Result<()>
+{
+    let result = if path.is_dir() && !path.is_symlink()
+    {
+        fs::remove_dir_all(path)
+    }
+    else
+    {
+        fs::remove_file(path)
+    };
+    result.with_context(|| format!("removing {}", path.display()))
+}
+
+/// Empty `target`, a cargo target directory, but for the build units of
+/// `keep`'s packages: in each profile directory, host or target, only
+/// `build/<package>/` of a kept package stays. Cargo checks each unit it
+/// finds kept as it checks every unit, so a kept unit whose inputs changed is
+/// rebuilt.
+fn prune_to_std(target: &Path, keep: &BTreeSet<String>) -> Result<()>
+{
+    let prune_profile = |profile: &Path| -> Result<()> {
+        for entry in fs::read_dir(profile).with_context(|| format!("reading {}", profile.display()))?
+        {
+            let path = entry.context("reading a directory entry")?.path();
+            if path.file_name().is_some_and(|name| name == "build") && path.is_dir()
+            {
+                for unit in fs::read_dir(&path).with_context(|| format!("reading {}", path.display()))?
+                {
+                    let unit = unit.context("reading a directory entry")?;
+                    if !keep.contains(unit.file_name().to_string_lossy().as_ref())
+                    {
+                        remove(&unit.path())?;
+                    }
+                }
+            }
+            else
+            {
+                remove(&path)?;
+            }
+        }
+        Ok(())
+    };
+    if !target.exists()
+    {
+        return Ok(());
+    }
+    for entry in fs::read_dir(target).with_context(|| format!("reading {}", target.display()))?
+    {
+        let path = entry.context("reading a directory entry")?.path();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if PROFILES.contains(&name.as_str()) && path.is_dir()
+        {
+            prune_profile(&path)?;
+        }
+        else if !path.is_symlink()
+            && PROFILES.iter().any(|p| path.join(p).join("build").is_dir())
+        {
+            // A target's directory: its profile directories and nothing else.
+            for sub in fs::read_dir(&path).with_context(|| format!("reading {}", path.display()))?
+            {
+                let sub = sub.context("reading a directory entry")?.path();
+                if sub.file_name().is_some_and(|n| PROFILES.iter().any(|p| n == *p)) && sub.is_dir()
+                {
+                    prune_profile(&sub)?;
+                }
+                else
+                {
+                    remove(&sub)?;
+                }
+            }
+        }
+        else
+        {
+            remove(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    // Defect caught: a library package missed, so CI's cache drops its unit,
+    // or a line that is no package name taken for one.
+    #[test]
+    fn the_library_packages_are_the_lock_names()
+    {
+        let lock = "version = 4\n\n[[package]]\nname = \"core\"\nversion = \"0.0.0\"\n\n\
+                    [[package]]\nname = \"rustc-std-workspace-core\"\nsource = \"x\"\n";
+        let names: Vec<String> = library_packages(lock).into_iter().collect();
+        assert_eq!(names, ["core", "rustc-std-workspace-core"]);
+    }
+
+    // Defect caught: a workspace unit kept in the cache, where its fixed
+    // modification times could pass a changed source as fresh, or a library
+    // unit dropped from it.
+    #[test]
+    fn only_the_library_units_stay()
+    {
+        let target = std::env::temp_dir().join(format!("xtask-keep-std-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&target);
+        for dir in [
+            "debug/build/compiler_builtins/1/out",
+            "debug/build/xtask/2/out",
+            "debug/incremental/x",
+            "x86_64-seraph-none/debug/build/core/3/out",
+            "x86_64-seraph-none/debug/build/kernel/4/out",
+            "x86_64-seraph-none/release/build/alloc/5",
+            "seraph-toolchain/lib",
+            "xtask/test",
+        ]
+        {
+            fs::create_dir_all(target.join(dir)).unwrap();
+        }
+        for file in ["CACHEDIR.TAG", "debug/xtask", "x86_64-seraph-none/debug/kernel"]
+        {
+            fs::write(target.join(file), b"x").unwrap();
+        }
+        let keep: BTreeSet<String> =
+            ["core", "alloc", "compiler_builtins"].map(str::to_owned).into();
+        prune_to_std(&target, &keep).unwrap();
+        let mut left = Vec::new();
+        let mut stack = vec![target.clone()];
+        while let Some(dir) = stack.pop()
+        {
+            for entry in fs::read_dir(&dir).unwrap()
+            {
+                let path = entry.unwrap().path();
+                if path.is_dir() && fs::read_dir(&path).unwrap().next().is_some()
+                {
+                    stack.push(path);
+                }
+                else
+                {
+                    left.push(path.strip_prefix(&target).unwrap().display().to_string());
+                }
+            }
+        }
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "debug/build/compiler_builtins/1/out",
+                "x86_64-seraph-none/debug/build/core/3/out",
+                "x86_64-seraph-none/release/build/alloc/5"
+            ]
+        );
+        fs::remove_dir_all(&target).unwrap();
+    }
 }

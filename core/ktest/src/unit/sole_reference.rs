@@ -353,15 +353,22 @@ extern "C" fn busy_spinner_entry(_arg: u64) -> !
     thread_exit()
 }
 
+/// The cycle counter of the CPU the case's thread is pinned to, read as
+/// `bench::Counters` reads it.
+fn cycles() -> u64
+{
+    ::bench::Counters::open().read().cycles
+}
+
 /// Cycle-counter ticks per millisecond on this CPU, measured over a 20 ms
 /// sleep against the kernel's elapsed-microseconds clock.
 fn cycles_per_ms() -> Result<u64, &'static str>
 {
     let elapsed = || system_info(SystemInfoType::ElapsedUs as u64);
     let us0 = elapsed().map_err(|_| "busy_cpu: system_info(ElapsedUs) failed")?;
-    let c0 = crate::arch::cycles_now();
+    let c0 = cycles();
     thread_sleep(20).map_err(|_| "busy_cpu: thread_sleep failed")?;
-    let c1 = crate::arch::cycles_now();
+    let c1 = cycles();
     let us1 = elapsed().map_err(|_| "busy_cpu: system_info(ElapsedUs) failed")?;
     let us = us1.saturating_sub(us0).max(1);
     u128::from(c1.wrapping_sub(c0))
@@ -435,10 +442,10 @@ fn busy_window(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> Tes
         let per_ms = cycles_per_ms()?;
         start_spinners(ctx, &mut children, spinners)?;
         let ready_wait = per_ms.saturating_mul(post_wait());
-        let start = crate::arch::cycles_now();
+        let start = cycles();
         while SPIN_READY.load(Ordering::Acquire) < u32::try_from(spinners).unwrap_or(u32::MAX)
         {
-            if crate::arch::cycles_now().wrapping_sub(start) > ready_wait
+            if cycles().wrapping_sub(start) > ready_wait
             {
                 return Err("busy_cpu: the spinners did not start");
             }
@@ -447,8 +454,8 @@ fn busy_window(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> Tes
         // The fall to one; this delete's own drain posts the first pass.
         cap_delete(copy).map_err(|_| "busy_cpu: delete failed")?;
         let window = per_ms.saturating_mul(BUSY_WINDOW_MS);
-        let start = crate::arch::cycles_now();
-        while crate::arch::cycles_now().wrapping_sub(start) < window
+        let start = cycles();
+        while cycles().wrapping_sub(start) < window
         {
             core::hint::spin_loop();
         }

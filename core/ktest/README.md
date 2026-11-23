@@ -97,6 +97,13 @@ decides it (`stress::msg_inject_delete_race` behind `MSG_INJECTABLE`), so elsewh
 runs nor counts; a case of a test so decided is gated by the constant inside the test, without a
 SKIP line (`integration::arena_reclaim`'s case 5 behind `HAS_IO_PORTS`).
 
+CI's functional ktest boots, the `ktest` cells' own boot and the burn-in's ktest boots, run at 4
+CPUs on a launch that hands ktest every device and capability a test gates on, and fail on a SKIP
+line ([docs/testing.md § Gating](../../docs/testing.md#gating)): there a SKIP is a defect, and a
+CPU minimum above 4 fails CI. The `bench` cell's boots of the bench-only image carry no such
+check, and its one-CPU boots log the SKIP lines of benchmarks that need more CPUs. A local boot at
+fewer CPUs keeps its skips.
+
 ### Tier 1 — `src/unit/`
 
 Per-syscall isolation tests. Every kernel syscall except `SYS_ASPACE_BIND_NOTIFICATION`,

@@ -372,14 +372,17 @@ jobs:
           # The usertest boot also checks the log-level configuration its
           # staging packed: a debug line of vfsd and of the fatfs vfsd spawns,
           # and none of devmgr or procmgr. The ktest boot also checks the
-          # bootloader's line for the mapredo knob its staging staged.
+          # bootloader's line for the mapredo knob its staging staged, and fails
+          # on a SKIP line: at the cell's 4 CPUs and initial capability set no
+          # test's skip condition holds (docs/testing.md § Gating).
           checks=()
           case "${{ matrix.tester }}" in
             usertest)
               checks=(--require '\[vfsd\] DEBUG ' --require '\[fatfs\] DEBUG '
                       --fail-also '\[(devmgr|procmgr)\] DEBUG ') ;;
             ktest)
-              checks=(--require 'mapredo knob present; redoing steps 6 and 7') ;;
+              checks=(--require 'mapredo knob present; redoing steps 6 and 7'
+                      --fail-also ' SKIP ') ;;
           esac
           budgeted cargo xtask run \
             --arch ${{ matrix.arch }} \

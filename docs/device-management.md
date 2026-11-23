@@ -709,10 +709,11 @@ init
 vfsd and the consumers svcmgr launches after handover (logd, pwrmgr, timed, entropyd, terminal)
 query devmgr's registry for their device endpoints and hardware caps, which devmgr serves
 only after initial enumeration and binding complete. A device endpoint is queried with
-`devmgr_labels::QUERY_DEVICE`, and a class's changes are watched with `devmgr_labels::WATCH_CLASS`,
-each sent on a class SEND: a SEND on devmgr's registry endpoint
-whose badge names a class and the verb bits the reply carries. The class and the verbs come from
-the badge, never the message, and a registry SEND without a class slot gets `UNAUTHORIZED`.
+`devmgr_labels::QUERY_DEVICE`, where its device sits with `devmgr_labels::QUERY_DEVICE_LOCATION`,
+and a class's changes are watched with `devmgr_labels::WATCH_CLASS`, each sent on a class SEND:
+a SEND on devmgr's registry endpoint whose badge names a class and the verb bits the reply
+carries. The class and the verbs come from the badge, never the message, and a registry SEND
+without a class slot gets `UNAUTHORIZED`.
 svcmgr mints each class SEND (`devmgr_labels::MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`) from
 a class file and publishes it seed-only as `devmgr.class.<stem>` (the class file's name without
 `.class`) ([driver-binding.md](driver-binding.md) § Device Classes). The dependency ordering is

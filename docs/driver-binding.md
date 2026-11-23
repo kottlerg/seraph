@@ -474,6 +474,14 @@ watch lasts while its consumer holds a copy of the Notification: devmgr drops it
 time it signals the class or finds the class full, once its own copy is the only reference
 left, as it is after the consumer deletes its copy or exits.
 
+A consumer asks where a served driver's device sits with `QUERY_DEVICE_LOCATION` on its class
+SEND, refused `UNAUTHORIZED` like `QUERY_DEVICE` to a SEND without a class slot. devmgr answers
+with the PCI segment, bus, device, and function of the function it bound the driver at that
+ordinal to, `NO_LOCATION` for a driver of a platform device, and `WITHDRAWN` and `NO_DEVICE`
+at the ordinals `QUERY_DEVICE` answers them at. An ordinal is not stable across boots; the
+location names the device. vfsd keeps each disk's location
+([services/vfsd/README.md](../services/vfsd/README.md)).
+
 The class's protocol (its labels, message layouts, and verb bit positions) is the contract
 between its drivers and its consumers, and is the one artefact both compile against. It is
 per class, never per driver, and neither devmgr nor svcmgr reads it. The existing protocols

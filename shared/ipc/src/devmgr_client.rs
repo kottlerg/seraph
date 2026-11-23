@@ -5,7 +5,8 @@
 
 //! Client calls of devmgr's driver-facing protocol: the driver-ready report and
 //! the device-class calls (`devmgr_labels::DRIVER_READY`, `QUERY_DEVICE`,
-//! `WATCH_CLASS`, `MINT_CLASS_SEND`), re-exported at the crate root.
+//! `WATCH_CLASS`, `DECLINE_RESTART`, `QUERY_DEVICE_LOCATION`,
+//! `MINT_CLASS_SEND`), re-exported at the crate root.
 
 // Under `rustc-dep-of-std` the crate root is `no_core`, and a submodule needs
 // its own prelude import (see `recv_guard.rs`).
@@ -63,8 +64,9 @@ pub unsafe fn report_driver_ready(devmgr_ep: u64, ipc_buf: *mut u64) -> Result<(
 }
 
 /// Why a [`query_device`], [`watch_class`], [`await_device`], or
-/// [`mint_class_send`] call returned no cap, or a [`decline_restart`] call
-/// was not served.
+/// [`mint_class_send`] call returned no cap, a [`decline_restart`] call
+/// was not served, or a [`query_device_location`] call returned no
+/// location.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassCallError
 {
@@ -182,6 +184,40 @@ pub unsafe fn decline_restart(
         devmgr_errors::SUCCESS => Ok(()),
         label => Err(ClassCallError::Refused(label)),
     }
+}
+
+/// Send [`devmgr_labels::QUERY_DEVICE_LOCATION`] on the class SEND
+/// `class_send` for the driver at instance ordinal `ordinal`, and return
+/// where its device sits. Logs nothing.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// [`ClassCallError`]: [`devmgr_errors::NO_LOCATION`] for a driver of a
+/// platform device, [`devmgr_errors::NO_DEVICE`] past the last served
+/// driver of the class, [`devmgr_errors::WITHDRAWN`] at a withdrawn one's
+/// ordinal, and the other refusals
+/// [`devmgr_labels::QUERY_DEVICE_LOCATION`] names; a `SUCCESS` reply whose
+/// word is no location reads as devmgr's `INVALID_REQUEST`.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, 32 KiB at the smallest (a std process's main thread)"
+)]
+pub unsafe fn query_device_location(
+    class_send: u64,
+    ordinal: u64,
+    ipc_buf: *mut u64,
+) -> Result<devmgr_labels::PciLocation, ClassCallError>
+{
+    let request = IpcMessage::builder(devmgr_labels::QUERY_DEVICE_LOCATION)
+        .word(0, u64::from(DEVMGR_LABELS_VERSION))
+        .word(1, ordinal)
+        .build();
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    let reply = unsafe { ipc_call(class_send, &request, ipc_buf) }.map_err(ClassCallError::Call)?;
+    class_call_location(&reply)
 }
 
 /// The driver at the lowest ordinal of the class whose class SEND is
@@ -499,6 +535,19 @@ fn class_call_cap(reply: &IpcMessage) -> Result<u64, ClassCallError>
         .ok_or(ClassCallError::NoCap)
 }
 
+/// The location of a [`devmgr_labels::QUERY_DEVICE_LOCATION`] reply: its
+/// word when the reply is `SUCCESS`; devmgr's refusal otherwise, and
+/// `INVALID_REQUEST` for a `SUCCESS` whose word is no location.
+fn class_call_location(reply: &IpcMessage) -> Result<devmgr_labels::PciLocation, ClassCallError>
+{
+    if reply.label != devmgr_errors::SUCCESS
+    {
+        return Err(ClassCallError::Refused(reply.label));
+    }
+    devmgr_labels::PciLocation::from_word(reply.word(0))
+        .ok_or(ClassCallError::Refused(devmgr_errors::INVALID_REQUEST))
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -522,6 +571,33 @@ mod tests
         assert_eq!(class_call_cap(&empty), Err(ClassCallError::NoCap));
         let null = IpcMessage::builder(devmgr_errors::SUCCESS).cap(0).build();
         assert_eq!(class_call_cap(&null), Err(ClassCallError::NoCap));
+    }
+
+    #[test]
+    fn a_location_reply_yields_its_location_or_why_not()
+    {
+        let at = devmgr_labels::PciLocation {
+            segment: 1,
+            bus: 2,
+            device: 3,
+            function: 4,
+        };
+        let located = IpcMessage::builder(devmgr_errors::SUCCESS)
+            .word(0, at.word())
+            .build();
+        assert_eq!(class_call_location(&located), Ok(at));
+        let platform = IpcMessage::new(devmgr_errors::NO_LOCATION);
+        assert_eq!(
+            class_call_location(&platform),
+            Err(ClassCallError::Refused(devmgr_errors::NO_LOCATION))
+        );
+        let garbled = IpcMessage::builder(devmgr_errors::SUCCESS)
+            .word(0, 1 << 40)
+            .build();
+        assert_eq!(
+            class_call_location(&garbled),
+            Err(ClassCallError::Refused(devmgr_errors::INVALID_REQUEST))
+        );
     }
 
     /// A class as devmgr answers it: `withdrawn` ordinals answer `WITHDRAWN`,

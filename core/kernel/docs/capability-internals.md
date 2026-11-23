@@ -904,9 +904,10 @@ The mechanism is `cap/sole_reference.rs`.
   list. An object on a chain is live,
   since its death takes it off the chain under the same lock before its memory can be reused. A
   compare-and-swap that races an increment either fails, and the object stays bound, or wins, and
-  the count was one. After the unlock the drain posts each node through
-  `sched::post_one_death_event`, returns it to its pool, and releases the binding's queue
-  reference, so no post is made under `DERIVATION_LOCK` or a CSpace lock.
+  the count was one. After the unlock the drain returns each node to its pool, posts through
+  `sched::post_one_death_event`, and releases the binding's queue reference, so no post is made
+  under `DERIVATION_LOCK` or a CSpace lock, and a binder that receives a post finds its node
+  free.
 - **The budget.** A death fires every node bound to the object, any number of them, each funded
   by its binder's queue, and the drain that takes them runs in whatever thread's syscall return or
   idle-loop iteration comes next, on any CPU. The budget bounds what one pass does for observers

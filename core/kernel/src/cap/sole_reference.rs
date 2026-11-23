@@ -413,8 +413,8 @@ fn claim_bucket(chains: &mut Chains, bucket: usize)
 }
 
 /// Post at most [`POST_BUDGET`] of the sole-reference observers the table
-/// has fired: `(0, correlator)` to each node's queue, the node back to its
-/// pool, and the queue's reference the binding held released.
+/// has fired: each node back to its pool, then `(0, correlator)` to its
+/// queue, then the queue's reference the binding held released.
 ///
 /// Called by `drain_deferred_reclaim` after its reclaim: on the syscall
 /// epilogue and in the idle loop, with no lock held. Reads one word when
@@ -447,9 +447,10 @@ pub unsafe fn drain(cpu: usize)
             (*node).death.next = null_mut();
             fields
         };
-        // SAFETY: the binding's reference keeps eq live; no lock is held.
-        unsafe { crate::sched::post_one_death_event(eq, correlator, 0) };
-        // SAFETY: as above.
+        // The node goes back to its pool before the post, so a binder that
+        // receives the post and binds again finds it free; its fields are
+        // read above and it is not touched again.
+        // SAFETY: the binding's reference keeps eq live.
         let eq_state = unsafe { (*eq).state };
         // SAFETY: node came from this queue's pool and is on no list; the
         // binding's reference keeps eq live; no lock is held.
@@ -459,6 +460,8 @@ pub unsafe fn drain(cpu: usize)
                 node.cast::<crate::sched::thread::DeathObserver>(),
             );
         }
+        // SAFETY: the binding's reference keeps eq live; no lock is held.
+        unsafe { crate::sched::post_one_death_event(eq, correlator, 0) };
         if let Some(eq) = core::ptr::NonNull::new(eq.cast::<KernelObjectHeader>())
         {
             // SAFETY: the binding's reference, which this consumes; the

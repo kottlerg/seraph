@@ -64,11 +64,11 @@ through `compiler_builtins`' word loops in both ubench and the kernel (`memcpy` 
 ### Page Faults
 
 `ubench.fault_fill path=fault pages=16` is 37273 / 60795: memmgr 13990 / 31652, of which its
-`memset` zeroing the 16 frames is 8298 / 24812 (x86_64's `rep stos` is about one iteration per
-8 bytes, riscv64's loop about one instruction per 2.6 bytes), and the kernel 23272 / 29135, spread over
-the page-table walk and install (`level_shift`, `table_index`, `names_table`, `read_entry`,
-`install_user_leaf`), the frame map's counters, and `sys_mem_map`. `fault_scaling threads=1`
-runs the same path. `path=grant` adds the grant's capability operations, 37745 / 64915.
+`memset` zeroing the 16 frames is 8298 / 24812 (x86_64's `rep stos` is about one iteration per 8
+bytes, riscv64's loop about one instruction per 2.6 bytes), and the kernel 23272 / 29135, spread
+over the page-table walk and install (`level_shift`, `table_index`, `names_table`, `read_entry`,
+`install_user_leaf`), the frame map's counters, and `sys_mem_map`. `fault_scaling threads=1` runs
+the same path. `path=grant` adds the grant's capability operations, 37745 / 64915.
 
 ### Shared-Memory Ring
 

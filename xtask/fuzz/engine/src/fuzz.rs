@@ -324,7 +324,10 @@ pub fn write_crash(target: &Target, options: &Options, crash: &Crash) -> i32
 /// The registered counters, or `None` after printing why a run cannot start.
 fn instrumented() -> Option<Counters>
 {
-    let counters = Counters::registered();
+    // SAFETY: the target's code, the only instrumented code, runs on the
+    // thread that runs the executions, between the calls of the counters'
+    // methods; the engine's other thread, the watchdog, is not instrumented.
+    let counters = unsafe { Counters::registered() };
     if counters.is_empty()
     {
         eprintln!("fuzz: {NOT_INSTRUMENTED}");

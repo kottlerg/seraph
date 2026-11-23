@@ -27,15 +27,27 @@ const PC_ENTRY: usize = 2 * size_of::<usize>();
 
 /// Record the counter array `[start, stop)` of an instrumented module. The
 /// module's constructor calls it before `main`.
+///
+/// # Safety
+///
+/// `[start, stop)` is an array of bytes that stays valid for the rest of the
+/// program and that nothing but instrumented code writes, as the counter
+/// array `SanitizerCoverage` emits for a module is.
 #[unsafe(no_mangle)]
-pub extern "C" fn __sanitizer_cov_8bit_counters_init(start: *mut u8, stop: *mut u8)
+pub unsafe extern "C" fn __sanitizer_cov_8bit_counters_init(start: *mut u8, stop: *mut u8)
+{
+    register(&REGIONS, start, stop);
+}
+
+/// Add the counter array `[start, stop)` to `regions`.
+fn register(regions: &Mutex<Vec<(usize, usize)>>, start: *mut u8, stop: *mut u8)
 {
     let len = stop.addr().saturating_sub(start.addr());
     if len == 0
     {
         return;
     }
-    let mut regions = REGIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut regions = regions.lock().unwrap_or_else(PoisonError::into_inner);
     regions.push((start.expose_provenance(), len));
 }
 
@@ -55,9 +67,8 @@ pub extern "C" fn __sanitizer_cov_pcs_init(start: *const usize, stop: *const usi
 /// The counter arrays registered when a run starts.
 ///
 /// Every module's constructor has run by then, so the set is complete. The
-/// instrumented code that increments the counters runs only on the thread
-/// that executes the target, the thread that reads and clears them here, and
-/// never while a method of this type runs.
+/// methods read and write the arrays, so [`Counters::registered`] makes its
+/// caller promise that no instrumented code runs while one of them does.
 pub struct Counters
 {
     regions: Vec<(usize, usize)>,
@@ -67,10 +78,22 @@ pub struct Counters
 impl Counters
 {
     /// The arrays registered so far.
+    ///
+    /// # Safety
+    ///
+    /// No instrumented code runs, on any thread, while a method of the value
+    /// returned runs: the target's code runs only on the thread that calls
+    /// them, between their calls.
     #[must_use]
-    pub fn registered() -> Self
+    pub unsafe fn registered() -> Self
     {
-        let regions = REGIONS
+        Self::over(&REGIONS)
+    }
+
+    /// The arrays `regions` holds.
+    fn over(regions: &Mutex<Vec<(usize, usize)>>) -> Self
+    {
+        let regions = regions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
@@ -108,10 +131,11 @@ impl Counters
         for &(addr, len) in &self.regions
         {
             let counters = with_exposed_provenance_mut::<u8>(addr);
-            // SAFETY: `counters` and `len` are a counter array its module
-            // registered: a static array of `len` bytes that lives as long as
-            // the program. Only the target's code writes it, on this thread,
-            // and none of it runs during this call.
+            // SAFETY: `counters` and `len` are a counter array registered
+            // under the contract of `__sanitizer_cov_8bit_counters_init`: an
+            // array of `len` bytes that lives as long as the program, which
+            // only instrumented code writes. By the contract of
+            // `Counters::registered`, none of that code runs during this call.
             unsafe { counters.write_bytes(0, len) };
         }
     }
@@ -124,8 +148,8 @@ impl Counters
         for &(addr, len) in &self.regions
         {
             let counters = with_exposed_provenance::<u8>(addr);
-            // SAFETY: as in `clear`, `counters` is a live static array of `len`
-            // bytes. No instrumented code runs while the slice lives, so nothing
+            // SAFETY: as in `clear`, `counters` is a live array of `len` bytes,
+            // and no instrumented code runs while the slice lives, so nothing
             // writes it meanwhile.
             let counters = unsafe { std::slice::from_raw_parts(counters, len) };
             for (index, &count) in counters.iter().enumerate()
@@ -150,21 +174,30 @@ mod tests
     #[test]
     fn registered_counters_are_read_across_arrays_and_cleared()
     {
-        let first: &'static mut [u8] = Box::leak(vec![0u8; 4].into_boxed_slice());
-        let second: &'static mut [u8] = Box::leak(vec![0u8; 3].into_boxed_slice());
-        for array in [&mut *first, &mut *second]
-        {
-            let range = array.as_mut_ptr_range();
-            __sanitizer_cov_8bit_counters_init(range.start, range.end);
-        }
-        let counters = Counters::registered();
+        let mut arrays = [0u8; 7];
+        let base = arrays.as_mut_ptr();
+        // Every access below goes through `base`, from which the registered
+        // addresses derive.
+        let at = |offset: usize| base.wrapping_add(offset);
+        let regions = Mutex::new(Vec::new());
+        register(&regions, at(0), at(4));
+        register(&regions, at(4), at(7));
+        register(&regions, at(7), at(7));
+        let counters = Counters::over(&regions);
         assert_eq!(counters.len(), 7);
-        first[1] = 5;
-        second[2] = 1;
+        // SAFETY: both offsets lie inside `arrays`, and no other access to it
+        // is live.
+        unsafe {
+            at(1).write(5);
+            at(6).write(1);
+        }
         let mut hits = Vec::new();
         counters.for_each_hit(|index, count| hits.push((index, count)));
         assert_eq!(hits, [(1, 5), (6, 1)]);
         counters.clear();
-        assert_eq!((&*first, &*second), (&[0u8; 4][..], &[0u8; 3][..]));
+        // SAFETY: `base` points at the 7 bytes of `arrays`, which `counters`
+        // no longer accesses.
+        let cleared = unsafe { std::slice::from_raw_parts(base, 7) };
+        assert_eq!(cleared, [0u8; 7]);
     }
 }

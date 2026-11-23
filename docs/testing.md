@@ -2008,7 +2008,9 @@ of a comparison the parent input executed where the input holds the other. Every
 one generator seeded by `--seed`, and a supervising process runs the search with address-space
 randomization off on a Linux host, since compare operands include addresses: a run of a fixed
 execution count from a fixed seed, over the same checked-in inputs and working corpus, is
-reproduced by the same command on the same host. The property runs under a panic catch; the
+reproduced by the same command on the same host. A host that refuses to turn randomization off
+(a container's default seccomp profile does) still runs the search, which then says that it is
+not reproducible from its seed. The property runs under a panic catch; the
 supervisor catches what no catch can: a signal, an AddressSanitizer report, an allocation over the
 cap, and an input that runs over the time limit.
 

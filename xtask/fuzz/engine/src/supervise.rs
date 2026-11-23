@@ -128,12 +128,28 @@ pub fn supervise(target: &Target, options: &Options) -> i32
             return EXIT_ERROR;
         }
     };
-    let child = fixed_layout(&mut Command::new(&exe))
-        .args(env::args_os().skip(1))
-        .env(ROLE, "1")
-        .env("ASAN_OPTIONS", ASAN_OPTIONS)
-        .stderr(Stdio::piped())
-        .spawn();
+    let spawn = |fixed: bool| {
+        let mut command = Command::new(&exe);
+        if fixed
+        {
+            fixed_layout(&mut command);
+        }
+        command
+            .args(env::args_os().skip(1))
+            .env(ROLE, "1")
+            .env("ASAN_OPTIONS", ASAN_OPTIONS)
+            .stderr(Stdio::piped())
+            .spawn()
+    };
+    let (child, fixed) = start(spawn);
+    if !fixed
+    {
+        eprintln!(
+            "fuzz: {}: the host refuses to turn address-space randomization off; the run is \
+             not reproducible from its seed",
+            target.name
+        );
+    }
     let mut child = match child
     {
         Ok(child) => child,
@@ -162,6 +178,26 @@ pub fn supervise(target: &Target, options: &Options) -> i32
             eprintln!("fuzz: {}: waiting for the run: {err}", target.name);
             EXIT_ERROR
         }
+    }
+}
+
+/// The error a process start returns when the host refuses the persona
+/// [`fixed_layout`] sets, as a container's default seccomp profile does.
+const LAYOUT_REFUSED: i32 = 1; // EPERM
+
+/// Start a process with `spawn`, which starts it with a fixed layout when
+/// passed `true`; when the host refuses the layout, start it as the host lays
+/// it out. Returns the start's result, and `false` when the host refused the
+/// layout.
+fn start<T>(mut spawn: impl FnMut(bool) -> std::io::Result<T>) -> (std::io::Result<T>, bool)
+{
+    match spawn(true)
+    {
+        Err(err) if cfg!(target_os = "linux") && err.raw_os_error() == Some(LAYOUT_REFUSED) =>
+        {
+            (spawn(false), false)
+        }
+        result => (result, true),
     }
 }
 
@@ -311,6 +347,36 @@ mod tests
             assert!(!endings[index + 1..].contains(one), "{one:?}");
         }
         assert_eq!(ending(None, Some(11)).unwrap(), "signal 11 (SIGSEGV)");
+    }
+
+    // Defect caught: a host that refuses the fixed layout (a container's
+    // seccomp profile) fails the run instead of running it unfixed, or
+    // another start error is retried and hidden.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_layout_starts_the_run_unfixed_and_other_errors_stand()
+    {
+        let mut asked = Vec::new();
+        let (started, fixed) = start(|fixed| {
+            asked.push(fixed);
+            if fixed
+            {
+                Err(std::io::Error::from_raw_os_error(LAYOUT_REFUSED))
+            }
+            else
+            {
+                Ok(())
+            }
+        });
+        assert!(started.is_ok());
+        assert!(!fixed);
+        assert_eq!(asked, [true, false]);
+        let not_found = std::io::ErrorKind::NotFound;
+        let (started, fixed) = start(|_| Err::<(), _>(std::io::Error::from(not_found)));
+        assert_eq!(started.unwrap_err().kind(), not_found);
+        assert!(fixed);
+        let (started, fixed) = start(Ok);
+        assert_eq!((started.unwrap(), fixed), (true, true));
     }
 
     #[test]

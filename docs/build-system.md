@@ -767,8 +767,8 @@ command is `build`), so it installs no QEMU and runs on `ubuntu-latest`.
 `build-test.yml` cancels a pull request's stacked runs on the same ref;
 every other run, each push to `master` among them, is grouped by its commit
 and never cancelled, so each merge commit gets its own run
-([conventions.md](conventions.md#ci-gating) § CI Gating). `burnin.yml`, `fuzz.yml` and `release.yml` do
-not cancel on the same ref — a tag-push run completes even if a later tag
+([conventions.md](conventions.md#ci-gating) § CI Gating). `burnin.yml`, `fuzz.yml` and
+`release.yml` do not cancel on the same ref — a tag-push run completes even if a later tag
 pushes, and a campaign completes even if another is dispatched.
 
 Harness staging and the per-cell boot sequence are specified in

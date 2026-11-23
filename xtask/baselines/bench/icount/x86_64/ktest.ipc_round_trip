@@ -1,8 +1,8 @@
 # bench baseline, written by `cargo xtask bench-baseline`
 # Format: xtask/README.md (`cargo xtask bench-check`).
-words=0 cpus=1 unit=cycles p50=4969
-words=0 cpus=4 unit=cycles p50=5085
-words=6 cpus=1 unit=cycles p50=5167
-words=6 cpus=4 unit=cycles p50=8486
-words=7 cpus=1 unit=cycles p50=5454
-words=7 cpus=4 unit=cycles p50=5563
+words=0 cpus=1 unit=cycles p50=4612
+words=0 cpus=4 unit=cycles p50=4728
+words=6 cpus=1 unit=cycles p50=4812
+words=6 cpus=4 unit=cycles p50=4928
+words=7 cpus=1 unit=cycles p50=5095
+words=7 cpus=4 unit=cycles p50=5211

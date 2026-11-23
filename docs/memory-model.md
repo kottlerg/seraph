@@ -426,6 +426,6 @@ Retype and pool allocation MUST be handled as fallible at every call site.
 [Memory Subsystem Internals](../core/kernel/docs/memory-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Architecture Overview](architecture.md), [Limits](limits.md),
-[Platform Requirements](platform-requirements.md),
+[Platform Requirements](platform-requirements.md), [Threat Model](threat-model.md),
 [Userspace Memory Model](userspace-memory-model.md),
 [services/oomd/README.md](../services/oomd/README.md), [xtask/README.md](../xtask/README.md)

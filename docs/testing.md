@@ -2263,6 +2263,7 @@ note in full.
 [README.md](../README.md), [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [core/ktest/README.md](../core/ktest/README.md), [Build System](build-system.md),
 [Console Model](console-model.md), [Project Conventions](conventions.md),
+[Threat Model](threat-model.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
 [programs/crashme/README.md](../programs/crashme/README.md),
 [programs/deadline/README.md](../programs/deadline/README.md),

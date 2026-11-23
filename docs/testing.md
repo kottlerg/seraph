@@ -1214,6 +1214,8 @@ memory size, or device set, and owes no local host run, whatever file it is in:
 - code compiled only for host tests, proofs, or fuzzing: a module or item under `#[cfg(test)]`,
   `#[cfg(fuzzing)]`, or a `#[cfg(any(...))]` of no predicate but `test`, `kani`, and `fuzzing`
   (§ Fuzzing), or a `#[test]` function;
+- checked-in fuzz inputs: the files under a crate's `fuzz/` directory (§ Fuzzing), which only its
+  replay test and its fuzz target read;
 - the deletion of a named function, constant, static, or type (not an `impl` block or a
   trait-method implementation; a module is the next item) that nothing names at the PR head
   outside comments and Markdown (`git grep -w <name> <head>` finds no other use) and that carries

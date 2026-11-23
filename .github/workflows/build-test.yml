@@ -417,10 +417,11 @@ jobs:
           retention-days: 14
 
   bench:
-    # The benchmark cell: the bench-only ktest image of each architecture,
-    # booted under QEMU's icount, whose counts repeat from run to run, and its
-    # one-CPU counts held to the checked-in baselines (xtask/README.md
-    # § `cargo xtask bench-check`; docs/testing.md § Gating). After the
+    # The benchmark cell: the bench-only ktest image and the userspace ubench
+    # suite of each architecture, booted under QEMU's icount, whose counts
+    # repeat from run to run, and their one-CPU counts held to the checked-in
+    # baselines (xtask/README.md § `cargo xtask bench-check`; docs/testing.md
+    # § Gating). After the
     # qemu-debs job, as validate is; see docs/build-system.md § Continuous
     # Integration.
     needs: qemu-debs
@@ -468,12 +469,38 @@ jobs:
           cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 4 \
             --runs 1 --timeout 300 --save-logs target/xtask/bench
 
+      - name: Stage the ubench suite (${{ matrix.arch }})
+        # The init harness's image with ubench's recipe staged and the
+        # terminal dropped, so it adds no output of its own to the framebuffer
+        # console_write measures (logd's mirror of the log lines still does); `--repack-only` keeps the staging, as the
+        # functional harness cells' staging does (programs/ubench/README.md
+        # § Running).
+        run: |
+          cargo xtask mkdisk --arch ${{ matrix.arch }} --harness init
+          cp sysroot/config/svcmgr/tests/ubench.svc \
+             sysroot/config/svcmgr/services/
+          rm -f sysroot/config/svcmgr/services/terminal.svc
+          cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
+
+      - name: Boot ubench under icount
+        # As the ktest boots, with a framebuffer for console_write; the logs
+        # go to their own directory, since a saved log is named by its
+        # architecture, CPU count and run alone.
+        run: |
+          cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 1 \
+            --display framebuffer --runs 3 --timeout 900 \
+            --save-logs target/xtask/bench/ubench
+          cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 4 \
+            --display framebuffer --runs 1 --timeout 900 \
+            --save-logs target/xtask/bench/ubench
+
       - name: cargo xtask bench-check
         # Writes the cell's environment beside its logs, for
         # `cargo xtask bench-baseline --from-run`.
         run: |
           cargo xtask bench-check --mode icount \
-            --write-env target/xtask/bench/ENV target/xtask/bench/*.log
+            --write-env target/xtask/bench/ENV target/xtask/bench/*.log \
+            target/xtask/bench/ubench/*.log
 
       - name: Upload the benchmark logs
         # `cargo xtask bench-baseline --from-run <run id>` reads them.
@@ -483,5 +510,6 @@ jobs:
           name: bench-${{ matrix.arch }}
           path: |
             target/xtask/bench/*.log
+            target/xtask/bench/ubench/*.log
             target/xtask/bench/ENV
           if-no-files-found: ignore

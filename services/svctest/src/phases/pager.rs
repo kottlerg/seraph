@@ -55,21 +55,16 @@
 //! allocator places on the same VA. memmgr accepts that registration only if
 //! the teardown removed the first one.
 //!
-//! An eighth phase, **fault cost**, runs the child's bench mode, which times
-//! the first touch of each chunk of a demand region and a grant-and-map of the
-//! same size and logs the result line of each, the figures the cost of
-//! memmgr's work on a fault is measured by.
-//!
-//! A ninth phase, **fragmented**, leaves the pool free pages in runs of one
+//! An eighth phase, **fragmented**, leaves the pool free pages in runs of one
 //! page fewer than a demand chunk and no run of a chunk's size, and touches a
 //! demand region: memmgr must back each fault from a smaller run.
 //!
-//! A tenth phase, **fragmented `CSpace` top-up**, fragments the pool the same
+//! A ninth phase, **fragmented `CSpace` top-up**, fragments the pool the same
 //! way and funds svctest's own `CSpace` for more slot pages than any free run
 //! holds: a slot-page pool takes pages, not a run, so the top-up must be funded
 //! from the short runs.
 //!
-//! An eleventh phase, **sparse region**, registers a region of 2^14 chunks, whose
+//! A tenth phase, **sparse region**, registers a region of 2^14 chunks, whose
 //! chunk table in memmgr has six directory levels, and touches a spread of
 //! its chunks and its last one: each fault must find its chunk's entry, back
 //! it, and leave every other chunk's data in place.
@@ -110,10 +105,6 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "demand_paging_teardown",
             run: demand_paging_teardown_phase,
-        },
-        Phase {
-            name: "demand_fault_cost",
-            run: demand_fault_cost_phase,
         },
         Phase {
             name: "demand_fault_fragmented",
@@ -435,31 +426,6 @@ fn assert_ram_identity()
 /// Pages memmgr backs per demand fault when a free run covers them
 /// (`DEMAND_CHUNK_PAGES`, services/memmgr/free-pool/src/lib.rs).
 const DEMAND_CHUNK_PAGES: u64 = 16;
-
-/// Spawn `/programs/demandpaged bench`, which times the first touch of each
-/// chunk of a demand region and a grant-and-map of the same size and logs
-/// the result line of each (programs/demandpaged/README.md § Bench mode). No
-/// bound is asserted: the figures are the measure of a change to memmgr's
-/// work on a fault (services/memmgr/docs/memory-pool.md
-/// § Frame contents). The phase passes when the child exits cleanly and the
-/// RAM identity holds after memmgr reclaims what it was lent.
-fn demand_fault_cost_phase(_: &Caps)
-{
-    use std::process::Command;
-
-    let mut child = Command::new("/programs/demandpaged")
-        .arg("bench")
-        .spawn()
-        .expect("spawn /programs/demandpaged bench failed");
-    let status = child.wait().expect("demandpaged bench wait failed");
-    std::os::seraph::log!("demandpaged bench exited: {status}");
-    assert!(
-        status.success(),
-        "the fault-cost bench must run both paths to the end: {status}"
-    );
-    assert_ram_identity();
-    std::os::seraph::log!("demand_fault_cost phase passed");
-}
 
 /// Chunks of the region [`demand_paging_sparse_region_phase`] registers: 2^14
 /// (1 GiB of VA), so memmgr's chunk table for it has six directory levels of

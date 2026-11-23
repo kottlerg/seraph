@@ -2346,7 +2346,7 @@ error prints no `tip:` lines. An argument that is not valid UTF-8 is refused wit
 `InvalidUtf8` error wherever it stands, a path value among them, which clap passed on as its
 bytes.
 
-`src/argparse/reference/` holds the evidence: every help screen of the table (93), and 7229 command
+`src/argparse/reference/` holds the evidence: every help screen of the table (95), and 7244 command
 lines with their outcome (the command and the values parsed, or the error's kind and message),
 recorded from clap 4.6 before the parser replaced it. `cargo xtask test` parses each command line
 and prints each screen through the table, and fails on any difference. A change to the table that

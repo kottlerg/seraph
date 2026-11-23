@@ -412,36 +412,39 @@ unsafe fn finish_syscall(exit: SyscallExit) -> SyscallExit
         unsafe { crate::sched::schedule(crate::sched::Requeue::IfRunnable) };
         crate::arch::current::cpu::halt_loop();
     }
-    // The syscall delivery point of a pending upcall
-    // (docs/fault-handling.md § Asynchronous Upcalls): the frame holds the
-    // syscall's result, and the thread is live. A restarted syscall is not
-    // a delivery point: its frame holds its arguments for the
-    // re-execution, whose own return delivers.
-    if exit == SyscallExit::Complete
-    {
-        // SAFETY: syscall context on the caller's kernel stack, the frame
-        // holding the syscall's result, no lock held and interrupts disabled.
-        unsafe { crate::ipc::upcall::deliver_at_syscall() };
-    }
     // SAFETY: kernel context with the scheduler initialised.
     let tcb = unsafe { current_tcb() };
-    if !tcb.is_null()
-    {
-        // SAFETY: tcb is the running thread's live TCB (checked non-null), and
-        // the running thread alone writes its own `syscall_nr`.
-        unsafe {
-            (*tcb)
-                .syscall_nr
-                .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+    // The return to user mode: the syscall delivery point of a pending upcall
+    // (docs/fault-handling.md § Asynchronous Upcalls), then the wake
+    // preemption of a thread this syscall linked on this CPU above the caller
+    // (a self-wake), or one whose wake IPI a preemption-disabled window
+    // absorbed (core/kernel/docs/scheduler.md § Wake Preemption), both again
+    // after a preemption. The frame holds the syscall's result, and the thread
+    // is live. A restarted syscall is not a delivery point: its frame holds
+    // its arguments for the re-execution, whose own return delivers.
+    let deliver = || {
+        if exit == SyscallExit::Complete
+        {
+            // SAFETY: syscall context on the caller's kernel stack, the frame
+            // holding the syscall's result, no lock held and interrupts
+            // disabled.
+            unsafe { crate::ipc::upcall::deliver_at_syscall() };
         }
-    }
-    // The return to user mode: a thread this syscall linked on this CPU above
-    // the caller (a self-wake), or one whose wake IPI a preemption-disabled
-    // window absorbed, runs now (core/kernel/docs/scheduler.md § Wake
-    // Preemption). The caller resumes here, its frame unchanged.
+        if !tcb.is_null()
+        {
+            // SAFETY: tcb is the running thread's live TCB (checked
+            // non-null), and the running thread alone writes its own
+            // `syscall_nr`.
+            unsafe {
+                (*tcb)
+                    .syscall_nr
+                    .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    };
     // SAFETY: syscall context on the caller's kernel stack, the frame holding
     // what the thread resumes with, no lock held and interrupts disabled.
-    unsafe { crate::sched::preempt_if_outranked() };
+    unsafe { crate::sched::deliver_and_preempt(deliver) };
     exit
 }
 

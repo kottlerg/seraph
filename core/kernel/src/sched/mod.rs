@@ -8312,10 +8312,11 @@ pub unsafe fn timer_tick()
 
 /// Reschedule when a thread queued on this CPU outranks the running one
 /// ([`run_queue::PerCpuScheduler::outranked`]), the running thread keeping its
-/// turn ([`Requeue::Preempted`]). Called at every return to user mode that can
-/// follow a link with no wake IPI pending: the end of a syscall, and of an
-/// interrupt or exception taken from user mode
-/// (core/kernel/docs/scheduler.md § Wake Preemption).
+/// turn ([`Requeue::Preempted`]); returns whether it rescheduled. Called at
+/// every return to user mode that can follow a link with no wake IPI pending:
+/// the end of a syscall, and of an interrupt or exception taken from user mode
+/// (core/kernel/docs/scheduler.md § Wake Preemption), through
+/// [`deliver_and_preempt`] where the return is an upcall delivery point.
 ///
 /// Does nothing during the BSP boot transient, as `timer_tick` does, while
 /// preemption is disabled, or for the idle thread, whose loop takes queued
@@ -8326,13 +8327,13 @@ pub unsafe fn timer_tick()
 /// on the running thread's kernel stack with interrupts disabled and no lock
 /// held, the thread's frame holding what it returns to user mode with.
 #[cfg(not(test))]
-pub unsafe fn preempt_if_outranked()
+pub unsafe fn preempt_if_outranked() -> bool
 {
     // See core/kernel/docs/scheduling-internals.md § BSP Boot Transient.
     if BOOT_TRANSIENT_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
         || crate::percpu::preemption_disabled()
     {
-        return;
+        return false;
     }
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
     // SAFETY: cpu is this CPU's index, below CPU_COUNT, and the scheduler slab
@@ -8340,12 +8341,69 @@ pub unsafe fn preempt_if_outranked()
     let sched = unsafe { scheduler_for(cpu) };
     if core::ptr::eq(sched.current(), sched.idle()) || !sched.outranked()
     {
-        return;
+        return false;
     }
     // SAFETY: kernel context on the running thread's kernel stack with no lock
     // held (contract); schedule() switches away and returns when this thread
     // is dispatched again.
     unsafe { schedule(Requeue::Preempted) };
+    true
+}
+
+/// The end of a return to user mode that is an upcall delivery point: `deliver`
+/// makes the delivery point, then [`preempt_if_outranked`] decides, both again
+/// while it reschedules (core/kernel/docs/scheduler.md § Wake Preemption). A
+/// thread that waited on the run queue for an outranking one has an upcall
+/// posted meanwhile delivered at this return, as a post to a thread running on
+/// no CPU expects (`ipc::upcall::post`), and a thread a delivery linked here,
+/// or whose wake IPI a delivery absorbed, is decided before the return.
+///
+/// # Safety
+/// As for [`preempt_if_outranked`]; `deliver` makes the delivery point of this
+/// return, on that contract.
+#[cfg(not(test))]
+pub unsafe fn deliver_and_preempt(deliver: impl FnMut())
+{
+    deliver_then_preempt(deliver, || {
+        // SAFETY: the caller's contract is preempt_if_outranked's.
+        unsafe { preempt_if_outranked() }
+    });
+}
+
+/// The end of an exception taken from user mode, which is no upcall delivery
+/// point: [`preempt_if_outranked`] decides, and only a thread it rescheduled
+/// returns through [`deliver_and_preempt`] with `deliver`, the interrupt delivery
+/// point, as a thread an interrupt preempted does (docs/fault-handling.md
+/// § Delivery points).
+///
+/// # Safety
+/// As for [`preempt_if_outranked`], at the end of an exception that resumes
+/// the thread; `deliver` makes the interrupt delivery point with the thread's
+/// live user frame.
+#[cfg(not(test))]
+pub unsafe fn preempt_at_exception_return(deliver: impl FnMut())
+{
+    // SAFETY: the caller's contract.
+    if unsafe { preempt_if_outranked() }
+    {
+        // SAFETY: the caller's contract.
+        unsafe { deliver_and_preempt(deliver) };
+    }
+}
+
+/// [`deliver_and_preempt`]'s order: `deliver`, then `preempt`, both again while
+/// `preempt` reports a reschedule, so the last step before the return is a
+/// `preempt` that kept the thread and a `deliver` follows every reschedule.
+fn deliver_then_preempt(mut deliver: impl FnMut(), mut preempt: impl FnMut() -> bool)
+{
+    loop
+    {
+        deliver();
+        if !preempt()
+        {
+            return;
+        }
+    }
 }
 
 // ── user_thread_trampoline ────────────────────────────────────────────────────
@@ -9763,6 +9821,41 @@ mod slab_tests
                     .with_elems_per_cpu(crate::cpu_mask::words_for(cpus))
                     .sized_at(cpus),
                 "TLB_PENDING_CPUS at {cpus} CPUs"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod deliver_and_preempt_tests
+{
+    use super::deliver_then_preempt;
+
+    // The defect caught: a thread preempted at a return to user mode resuming
+    // without a delivery point after its wait, so an upcall posted to it while
+    // it was queued, which no CPU is prodded for, waits for a later return; or
+    // a reschedule left undecided after a delivery that linked a thread.
+    #[test]
+    fn every_reschedule_is_followed_by_a_delivery_and_the_return_by_a_kept_check()
+    {
+        for reschedules in 0usize..4
+        {
+            let mut steps = Vec::new();
+            let mut left = reschedules;
+            let steps_cell = core::cell::RefCell::new(&mut steps);
+            deliver_then_preempt(
+                || steps_cell.borrow_mut().push('d'),
+                || {
+                    steps_cell.borrow_mut().push('p');
+                    let rescheduled = left > 0;
+                    left = left.saturating_sub(1);
+                    rescheduled
+                },
+            );
+            assert_eq!(
+                steps.iter().collect::<String>(),
+                "dp".repeat(reschedules + 1),
+                "{reschedules} reschedules"
             );
         }
     }

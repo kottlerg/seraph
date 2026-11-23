@@ -2523,8 +2523,8 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
 /// - **Running** elsewhere: a wakeup IPI is delivered to the CPU running
 ///   it. The wakeup IPI handler does not itself call `schedule()`; the
 ///   running thread observes the new affinity at its next `schedule()` entry
-///   (slice-expiry preemption, a fair-dispatched thread's preemption for
-///   RT, voluntary yield, or IPC block). The
+///   (slice-expiry preemption, its preemption by an outranking thread at a
+///   return to user mode, voluntary yield, or IPC block). The
 ///   affinity-vs-current-CPU check in `schedule()` then routes the
 ///   re-enqueue cross-CPU to the new target. Worst-case latency is
 ///   one time slice.

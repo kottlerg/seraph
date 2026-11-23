@@ -762,6 +762,16 @@ A CPU decides at every return to user mode that can follow a link with no wake I
   `exception_handler` and `page_fault_handler`, riscv64 `trap_dispatch`): fault delivery can
   link a thread on the CPU and absorb a wake IPI in a preemption-disabled window.
 
+Where the return is an upcall delivery point, the delivery comes first and the decision after it,
+and a thread the decision preempted passes the delivery point again, then the decision, when it is
+dispatched again (`sched::deliver_and_preempt`). An upcall posted while it waited on the run
+queue, for which no CPU is prodded since the thread runs nowhere, is so delivered at this return,
+and a thread a delivery linked on the CPU, or whose wake IPI a delivery absorbed, is decided before
+the thread returns. An exception's return is no delivery point, but a thread preempted there
+passes the interrupt delivery point when it is dispatched again, as a thread an interrupt preempted
+does (`sched::preempt_at_exception_return`;
+[fault-handling.md](../../../docs/fault-handling.md#delivery-points) § Delivery points).
+
 Two returns to user mode make no decision. The x86-64 `#NM` lazy FPU restore runs with interrupts
 masked and preemption disabled throughout and links nothing, so an IPI raised meanwhile is taken
 in user mode as it returns. A new thread's first entry to user mode follows the dispatch that

@@ -364,12 +364,15 @@ pub unsafe fn deliver_at_syscall()
 
 /// The interrupt delivery point: deliver the pending upcalls posted with
 /// `UPCALL_ANY_INSTRUCTION` of the thread an interrupt preempted in user mode,
-/// before the interrupt returns to it.
+/// before the interrupt returns to it, or of a thread the wake preemption
+/// rescheduled at the end of an exception it took in user mode
+/// (`sched::preempt_at_exception_return`).
 ///
 /// # Safety
 /// The end of an interrupt handler taken from user mode, the interrupt
-/// acknowledged, on the interrupted thread's kernel stack with `frame` its
-/// live user frame; no lock is held, interrupts disabled.
+/// acknowledged, or of an exception taken from user mode that resumes the
+/// thread, on the thread's kernel stack with `frame` its live user frame; no
+/// lock is held, interrupts disabled.
 #[cfg(not(test))]
 pub unsafe fn deliver_at_interrupt(frame: *mut crate::arch::current::trap_frame::TrapFrame)
 {

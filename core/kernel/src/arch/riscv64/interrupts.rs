@@ -445,10 +445,11 @@ unsafe fn clear_sip_ssip()
 
 /// Main trap dispatch routine, called by `trap_entry` with interrupts disabled
 /// (sstatus.SIE is cleared on trap entry): [`handle_trap`], then, for a trap
-/// taken from U-mode other than an ecall, the wake-preemption check
-/// (`sched::preempt_if_outranked`) before the return to U-mode. An ecall's
-/// check is the syscall exit's (`syscall::finish_syscall`), so a syscall makes
-/// it once.
+/// taken from U-mode other than an ecall, the return to U-mode: for an
+/// interrupt, its upcall delivery point and the wake-preemption check
+/// (`sched::deliver_and_preempt`), for an exception the check alone
+/// (`sched::preempt_at_exception_return`). An ecall's return is the syscall
+/// exit's (`syscall::finish_syscall`), so a syscall makes it once.
 #[cfg(not(test))]
 extern "C" fn trap_dispatch(frame: *mut TrapFrame)
 {
@@ -462,9 +463,28 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
     // clear) is the U-mode ecall.
     if sstatus_at_entry & (1 << 8) == 0 && scause != 8
     {
-        // SAFETY: the end of a trap from U-mode on the running thread's kernel
-        // stack, its frame published; no lock is held, SIE = 0.
-        unsafe { crate::sched::preempt_if_outranked() };
+        let deliver = || {
+            // The interrupt delivery point of an upcall posted with
+            // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
+            // Upcalls): the trap is handled and completed.
+            // SAFETY: U-mode origin, so frame is the thread's live frame on
+            // its kernel stack; no lock is held, SIE = 0.
+            unsafe { crate::ipc::upcall::deliver_at_interrupt(frame) };
+        };
+        if scause >> 63 != 0
+        {
+            // SAFETY: the end of an interrupt from U-mode on the interrupted
+            // thread's kernel stack, its frame published; no lock is held,
+            // SIE = 0.
+            unsafe { crate::sched::deliver_and_preempt(deliver) };
+        }
+        else
+        {
+            // SAFETY: the end of an exception from U-mode that handle_trap
+            // resumed, on the thread's kernel stack, its frame published; no
+            // lock is held, SIE = 0.
+            unsafe { crate::sched::preempt_at_exception_return(deliver) };
+        }
     }
 }
 
@@ -530,16 +550,8 @@ fn handle_trap(frame: *mut TrapFrame)
                 crate::fatal("unhandled interrupt");
             }
         }
-        if sstatus_at_entry & (1 << 8) == 0
-        {
-            // The interrupt delivery point of an upcall posted with
-            // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
-            // Upcalls): the interrupt is handled and completed, and the thread
-            // it preempted (SPP = 0, U-mode) is about to return to U-mode.
-            // SAFETY: U-mode origin, so frame is the interrupted thread's live
-            // frame on its kernel stack; no lock is held, SIE = 0.
-            unsafe { crate::ipc::upcall::deliver_at_interrupt(frame) };
-        }
+        // The interrupt delivery point of a trap from U-mode is
+        // trap_dispatch's, with the wake-preemption check.
     }
     else if cause_code == 2
         && (sstatus_at_entry & (1 << 8)) == 0

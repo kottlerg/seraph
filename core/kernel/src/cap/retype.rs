@@ -1407,12 +1407,12 @@ pub const fn wait_set_dispatch(capacity: u64) -> DispatchEntry
     }
 }
 
-/// Bytes of one death-observer node in an `EventQueue`'s inline pool.
+/// Bytes of one observer node in an `EventQueue`'s inline pool.
 const EVENT_QUEUE_OBSERVER_BYTES: u64 =
-    core::mem::size_of::<crate::sched::thread::DeathObserver>() as u64;
+    core::mem::size_of::<crate::ipc::event_queue::ObserverNode>() as u64;
 
 /// Compute the inline byte cost of an `EventQueue` retype slot for a
-/// user-visible `capacity` and `observers` death-observer nodes: wrapper +
+/// user-visible `capacity` and `observers` observer nodes: wrapper +
 /// state + (capacity + 1) two-word ring slots + the node pool. Every part is
 /// an 8-byte multiple, so the ring and the pool start at `u64` boundaries.
 ///
@@ -1430,7 +1430,7 @@ pub const fn event_queue_raw_bytes(capacity: u64, observers: u64) -> u64
 /// path; must match the layout assumed by `event_queue_raw_bytes`.
 pub const EVENT_QUEUE_RING_OFFSET: u64 = EVENT_QUEUE_WRAPPER_BYTES + EVENT_QUEUE_STATE_BYTES;
 
-/// Offset of the death-observer node pool from the start of an `EventQueue`
+/// Offset of the observer node pool from the start of an `EventQueue`
 /// retype slot of `capacity`: directly after the ring.
 pub const fn event_queue_observer_offset(capacity: u64) -> u64
 {
@@ -1442,7 +1442,7 @@ pub const fn event_queue_observer_offset(capacity: u64) -> u64
 }
 
 /// Byte cost and allocation mode of an `EventQueue` of `capacity` entries and
-/// `observers` death-observer nodes: sub-page in place while it fits the
+/// `observers` observer nodes: sub-page in place while it fits the
 /// 512 B bin, page-aligned split beyond. The construction layout in
 /// `sys_cap_create_event_queue` and the reclaim arithmetic in
 /// `dealloc_object_one`'s `EventQueue` arm use the same formula, the ABI's
@@ -1728,21 +1728,21 @@ mod tests
     #[test]
     fn dispatch_event_queue()
     {
-        // Inline: 24 wrapper + 64 state + (capacity+1)*16 ring + observers*24.
+        // Inline: 24 wrapper + 64 state + (capacity+1)*16 ring + observers*40.
         // capacity=1, no observers → 88 + 32 = 120 → BIN_128, in-place.
         let small = event_queue_dispatch(1, 0);
         assert!(!small.split);
         assert_eq!(small.raw_bytes, 120);
         assert_eq!(round_to_class(small.raw_bytes), BIN_128);
-        // capacity=16, 2 observers → 88 + 17*16 + 48 = 408 → BIN_512, in-place.
+        // capacity=16, 2 observers → 88 + 17*16 + 80 = 440 → BIN_512, in-place.
         let medium = event_queue_dispatch(16, 2);
         assert!(!medium.split);
-        assert_eq!(medium.raw_bytes, 408);
+        assert_eq!(medium.raw_bytes, 440);
         assert_eq!(round_to_class(medium.raw_bytes), BIN_512);
-        // capacity=1, 18 observers → 88 + 32 + 432 = 552 → exceeds BIN_512 → split.
+        // capacity=1, 18 observers → 88 + 32 + 720 = 840 → exceeds BIN_512 → split.
         let large = event_queue_dispatch(1, 18);
         assert!(large.split);
-        assert_eq!(large.raw_bytes, 552);
+        assert_eq!(large.raw_bytes, 840);
         // The two-size type has no single-size entry.
         assert!(dispatch_for(ObjectType::EventQueue, 4).is_none());
     }

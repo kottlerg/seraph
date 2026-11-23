@@ -39,7 +39,7 @@ free-bytes word and returns `None` when memmgr is unreachable. It runs in three 
 1. **Warm-up.** Eight spawn-and-join iterations bring the reaper's first death queue, the
    pooled object slabs, and the page-table budget to steady state. A held burst follows:
    `HELD_BURST` (128) detached threads each wait on one barrier until all are spawned, so all
-   are bound at once, past the reaper's first 99-node death queue and past 64 slots. The
+   are bound at once, past the reaper's first 71-node death queue and past 64 slots. The
    fixture does not fund its `CSpace` first: the burst's caps outgrow the `CSpace` procmgr
    seeds, so a spawn is refused unless thread spawn tops the `CSpace` up itself
    ([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § CSpace slot headroom).

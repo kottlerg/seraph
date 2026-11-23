@@ -570,7 +570,7 @@ pub struct EventQueueState
     pub wait_set: *mut u8,
     pub wait_set_member_idx: u16,
 
-    /// Free death-observer nodes (the pool inline after the ring) and the
+    /// Free observer nodes (the pool inline after the ring) and the
     /// pool's size, fixed at creation.
     pub observer_free: *mut DeathObserver,
     pub observer_count: u32,
@@ -594,21 +594,24 @@ are occupied at any time (the extra slot is never needed for full/empty
 detection) and the user observes exactly N usable slots. The ring is reclaimed
 wholesale with the wrapper on `dealloc_object(EventQueue)`.
 
-The queue's death-observer nodes follow the ring in the same slot
-(`cap::retype::event_queue_observer_offset`), as many as `SYS_CAP_CREATE_EVENT_Q` argument 2
-asks for, all on `observer_free` at creation. A thread or address-space bind takes one under
-`eq.lock` alone (`event_queue_take_observer`) before it takes the owner's lock, links it into the
-owner's chain, and takes a checked reference on the queue (`try_inc_ref`); the owner's teardown
-returns the node under `eq.lock` (`event_queue_return_observer`) and only then drops that
-reference. `eq.lock` is therefore never held with a thread's `sched_lock` or an address space's
-`death_lock`, and a queue whose count reaches zero has every node back on its free list. A node's
-`next` and `correlator` are bare fields owned by the lock of the list that holds the node: the
-queue's `lock` while it is free, the owner thread's `sched_lock` or the owner address space's
-`death_lock` while it is bound (the bare-field exception of
+The queue's observer nodes follow the ring in the same slot
+(`cap::retype::event_queue_observer_offset`), as many as `SYS_CAP_CREATE_EVENT_Q` argument 2 asks
+for, all on `observer_free` at creation. A thread or address-space bind takes one under `eq.lock`
+alone (`event_queue_take_observer`) before it takes the owner's lock, links it into the owner's
+chain, and takes a checked reference on the queue (`try_inc_ref`); the owner's teardown returns the
+node under `eq.lock` (`event_queue_return_observer`) and only then drops that reference. A
+sole-reference bind takes its node the same way before it links it into the sole-reference table
+under the table's lock, and the drain that posts it returns it after that lock is released
+([capability-internals.md § Sole-Reference
+Observers](capability-internals.md#sole-reference-observers)). `eq.lock` is therefore never held
+with a thread's `sched_lock`, an address space's `death_lock`, or the table's lock, and a queue
+whose count reaches zero has every node back on its free list. A node's `next` and `correlator` are
+bare fields owned by the lock of the list that holds the node: the queue's `lock` while it is free,
+the owner thread's `sched_lock` or the owner address space's `death_lock` while it is bound to an
+owner, the sole-reference table's `lock` while it is on a table chain (the bare-field exception of
 [coding-standards.md § Concurrency](../../../docs/coding-standards.md#concurrency)); a death walk
-reads a bound node's links without the lock, after reading the chain head under it, because a
-linked node's links never change until the owner's teardown takes the chain. `eq` is fixed at
-creation.
+reads a bound node's links without the lock, after reading the chain head under it, because a linked
+node's links never change until the owner's teardown takes the chain. `eq` is fixed at creation.
 
 ### Post Path
 

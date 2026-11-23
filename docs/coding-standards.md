@@ -409,7 +409,8 @@ states the guarantee for each architecture.
     records;
   - a death-observer node's link and correlator, which the lock of the list holding the node
     serialises (its queue's `lock` on the free list, the owner thread's `sched_lock` or the owner
-    address space's `death_lock` on an owner chain), as
+    address space's `death_lock` on an owner chain, the sole-reference table's `lock` on a table
+    chain), as
     [ipc-internals.md § Event Queue](../core/kernel/docs/ipc-internals.md#event-queue-corekernelsrcipcevent_queuers)
     records;
   - a field of a per-CPU scheduler that its `lock` serialises, as

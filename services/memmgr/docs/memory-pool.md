@@ -796,7 +796,7 @@ usage with `QUERY_MEMORY_USAGE`.
 **Server-side charges.** Memory a server spends on a client's behalf is charged to the server's
 node, not to the client's. procmgr keeps, for each live process, its process-table entry (448
 bytes), 6 to 13 capability slots in procmgr's `CSpace` (72 bytes each) and two death-observer nodes
-(24 bytes each), about 0.9 to 1.8 KiB with the growth of their containers, and 96 bytes for each
+(40 bytes each), about 0.9 to 1.8 KiB with the growth of their containers, and 96 bytes for each
 thread it registers. Every page of the process itself, at least 55 (its address-space and `CSpace`
 slabs, its thread, its `ProcessInfo` page and the rest of its image), is requested on its own
 account and charged to its own node, in its creator's subtree, so procmgr's share is at most 0.85%

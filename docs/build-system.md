@@ -321,6 +321,15 @@ Limits: under `--release`, fat LTO reoptimizes at the profile opt-level and
 partially overrides the per-package `opt-level=1`, so step fidelity is
 degraded — the normal debug flow uses the default (`dev`) profile.
 
+To read where a build's own instructions come from rather than to step through
+them, `--limited-debug <component>[,<component>…]` injects
+`profile.<active>.package."<pkg>".debug="limited"` alone: line tables and
+function frames, inlined ones included, at the profile's own opt-level, so the
+instructions are those a build without it emits (the crate hashes it changes can
+reorder functions in the image). `cargo xtask path-account` reads the kernel's
+and ktest's this way ([xtask/README.md](../xtask/README.md#cargo-xtask-path-account)).
+A component `--debug` also names takes `--debug`.
+
 ---
 
 ## Build Output: the Sysroot

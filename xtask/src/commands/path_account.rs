@@ -52,9 +52,10 @@ const BIAS_MARKER: &str = "init: PIE bias=";
 /// ktest's summary lines, one of which ends its run.
 const END_MARKERS: [&str; 2] = ["[ktest] ALL TESTS PASSED", "[ktest] SOME TESTS FAILED"];
 
-/// The kernel function whose first call, ktest's first syscall, comes after
-/// the kernel has logged ktest's bias and before any benchmark runs.
-const FIRST_SYSCALL: &str = "kernel::syscall::dispatch";
+/// The kernel function that hands the CPU to init, called once, after the
+/// kernel has logged ktest's load bias and before ktest runs: the trace sets
+/// its watchpoint there.
+const HANDOFF: &str = "kernel::sched::enter";
 
 /// ktest's sample buffer, which every benchmark records into from index 0.
 const SAMPLES_SYMBOL: &str = "ktest::bench::SAMPLES";
@@ -291,7 +292,7 @@ fn trace(ctx: &Context, args: &PathAccountTraceArgs) -> Result<()>
     let (references, reference_name) = references(args, arch)?;
 
     let samples = data_symbol(&images.ktest, SAMPLES_SYMBOL)?;
-    let first_syscall = resolve(&images.kernel, FIRST_SYSCALL)?.address;
+    let handoff = resolve(&images.kernel, HANDOFF)?.address;
     let mut resolver = Resolver {
         kernel: Symbolizer::new(&images.kernel)?,
         ktest: Symbolizer::new(&images.ktest)?,
@@ -315,13 +316,7 @@ fn trace(ctx: &Context, args: &PathAccountTraceArgs) -> Result<()>
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(args.timeout))
         .context("--timeout is too large")?;
-    let traced = boot.trace_all(
-        &mut resolver,
-        samples,
-        first_syscall,
-        args.iteration,
-        deadline,
-    );
+    let traced = boot.trace_all(&mut resolver, samples, handoff, args.iteration, deadline);
     boot.save_log()?;
     let traced = traced?;
 
@@ -642,7 +637,7 @@ impl Boot
         &mut self,
         resolver: &mut Resolver<'_>,
         samples: u64,
-        first_syscall: u64,
+        handoff: u64,
         iteration: u32,
         deadline: Instant,
     ) -> Result<Vec<(Key, u64, Traced)>>
@@ -657,27 +652,27 @@ impl Boot
         self.stub = Some(stub);
         let pc_reg = gdb_arch(self.arch).pc_regnum();
 
-        let bp = first_syscall.wrapping_add(resolver.slide);
+        let bp = handoff.wrapping_add(resolver.slide);
         let kind = break_kind(self.arch);
         self.stub()?
             .expect_ok(format!("Z1,{bp:x},{kind}").as_bytes())?;
         let stop = self.resume_until_stop(deadline)?;
         ensure!(
             stop.is_some(),
-            "the guest ended before ktest's first syscall"
+            "the guest ended before the kernel started init"
         );
         self.stub()?
             .expect_ok(format!("z1,{bp:x},{kind}").as_bytes())?;
+        // The kernel logged the bias before the stop: the line is on its way.
         let bias_line = self.line_with(BIAS_MARKER, LINE_WAIT)?;
         resolver.bias = field_hex(&bias_line, "bias=").context("no bias in ktest's bias line")?;
-
         let base = samples.wrapping_add(resolver.bias);
         let element = |i: u32| base.wrapping_add(u64::from(i).wrapping_mul(8));
         let before = element(iteration.saturating_sub(1));
-        ensure!(
-            self.stub()?.read_u64(before)? == 0,
-            "ktest recorded a sample before the trace began"
-        );
+        // No sample is read here: riscv64's gdbstub reads user memory only
+        // while the hart is in user mode. A benchmark that recorded sample
+        // k-1 before the watchpoint was set goes untraced, which the account
+        // rejects as a reference count with no trace.
         self.stub()?
             .expect_ok(format!("Z2,{before:x},8").as_bytes())?;
 
@@ -699,7 +694,15 @@ impl Boot
             if !frames.iter().any(|f| f == RECORD_FUNCTION)
             {
                 // The summary's sort, or a benchmark that writes the buffer
-                // itself.
+                // itself. Step over the watched instruction without the
+                // watchpoint, which a stop before the store would otherwise
+                // hit again on resuming.
+                self.stub()?
+                    .expect_ok(format!("z2,{before:x},8").as_bytes())?;
+                let reply = self.stub()?.request(b"s")?;
+                ensure!(is_trap(&reply), "stepping the write at {pc:#x} failed");
+                self.stub()?
+                    .expect_ok(format!("Z2,{before:x},8").as_bytes())?;
                 continue;
             }
             if let Some(done) = pending.take()
@@ -707,22 +710,23 @@ impl Boot
                 let (key, p50) = self.next_result(LINE_WAIT)?;
                 traced.push((key, p50, done));
             }
-            // The stop follows the store of sample k-1: stepping from it to
-            // the same address again runs exactly one iteration, whose last
-            // instruction is the store of sample k. CANDIDATES iterations are
-            // stepped in turn; the account takes the first whose window is
+            // x86-64 stops after the watched store, riscv64 before it. One step
+            // without the watchpoint completes the store in either case; the
+            // address it ends at runs once per iteration, so stepping from it
+            // to the same address again runs exactly one iteration, the store
+            // of the next sample among its instructions. CANDIDATES iterations
+            // are stepped in turn; the account takes the first whose window is
             // the boot's p50, which the result line gives only after them.
-            ensure!(
-                self.stub()?.read_u64(before)? != 0,
-                "the watchpoint stopped before ktest's store at {pc:#x}"
-            );
             self.stub()?
                 .expect_ok(format!("z2,{before:x},8").as_bytes())?;
+            let reply = self.stub()?.request(b"s")?;
+            ensure!(is_trap(&reply), "stepping the store at {pc:#x} failed");
+            let anchor = self.stub()?.read_register(pc_reg)?;
             let mut candidates = Vec::new();
             for j in 0..CANDIDATES
             {
                 let at = element(iteration.saturating_add(j));
-                let steps = self.step_until(pc, pc_reg)?;
+                let steps = self.step_until(anchor, pc_reg, deadline)?;
                 let sample = self.stub()?.read_u64(at)?;
                 ensure!(
                     sample != 0,
@@ -797,13 +801,14 @@ impl Boot
 
     /// Single-step from `start` until the guest is back at `start`, recording
     /// each instruction and the counter each counter read returned.
-    fn step_until(&mut self, start: u64, pc_reg: usize) -> Result<Vec<Step>>
+    fn step_until(&mut self, start: u64, pc_reg: usize, deadline: Instant) -> Result<Vec<Step>>
     {
         let arch = self.arch;
         let mut steps = Vec::new();
         let mut pc = start;
         loop
         {
+            ensure!(Instant::now() < deadline, "the boot outlived --timeout");
             ensure!(
                 steps.len() < MAX_STEPS,
                 "{MAX_STEPS} instructions stepped and ktest recorded no sample"
@@ -947,4 +952,49 @@ const fn break_kind(arch: Arch) -> u32
 fn remaining(deadline: Instant) -> Duration
 {
     deadline.saturating_duration_since(Instant::now())
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn a_trap_is_a_step_or_a_watchpoint_stop()
+    {
+        assert!(is_trap(b"T05thread:01;"));
+        assert!(is_trap(b"T05thread:01;watch:33bcc47608;"));
+        assert!(is_trap(b"S05"));
+        assert!(!is_trap(b"W00"));
+        assert!(!is_trap(b"T02thread:01;"));
+        assert!(!is_trap(b"E14"));
+    }
+
+    #[test]
+    fn a_result_line_names_its_measurement_and_p50()
+    {
+        let line = "[0.316180] bench ktest.aspace_harvest_all_accessed pages=32 arch=x86_64 cpus=1 \
+                    unit=cycles n=4096 min=4786 p50=4790 p90=4790 p99=4790 max=5672";
+        let (key, p50) = result_of(line).unwrap().unwrap();
+        assert_eq!(
+            key.to_string(),
+            "ktest.aspace_harvest_all_accessed pages=32 cpus=1"
+        );
+        assert_eq!(p50, 4790);
+        assert!(
+            result_of("[0.416305] [ktest] ALL TESTS PASSED")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_nearest_symbol_is_at_or_before_the_address()
+    {
+        let symbols = vec![(0x100, "a".to_owned()), (0x200, "b".to_owned())];
+        assert_eq!(nearest_symbol(&symbols, 0x100), "a");
+        assert_eq!(nearest_symbol(&symbols, 0x1ff), "a");
+        assert_eq!(nearest_symbol(&symbols, 0x250), "b");
+        assert_eq!(nearest_symbol(&symbols, 0x50), "<unresolved>");
+    }
 }

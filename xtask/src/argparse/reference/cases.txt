@@ -27107,3 +27107,47 @@ help xtask bench-baseline -h
 
 ["run","--icount","--runs","3","--cpus","1"]
 ok run cpus=["1"] icount runs=["3"]
+
+["path-account"]
+help-on-missing xtask path-account -h
+
+["path-account","trace","--reference","a.log"]
+ok-all path-account trace arch=default["x86_64"] release=default iteration=default["64"] reference=["a.log"] timeout=default["3600"] host_override=default alone=default timing=default
+
+["path-account","trace","--arch","riscv64","--release","--iteration","32","--timeout","600","--wait-host","1800","--alone","--reference","a","--reference","b"]
+ok path-account trace arch=["riscv64"] release iteration=["32"] reference=["a","b"] timeout=["600"] wait_host=["1800"] alone
+
+["path-account","trace"]
+MissingRequiredArgument
+error: the following required arguments were not provided:
+  --reference <LOG>
+
+["path-account","trace","--reference","a","--iteration","x"]
+ValueValidation
+error: invalid value 'x' for '--iteration <ITERATION>': invalid digit found in string
+
+["path-account","trace","--reference","a","--timing","--alone"]
+ArgumentConflict
+error: the argument '--timing' cannot be used with '--alone'
+
+["path-account","write"]
+ok-all path-account write doc=default["core/kernel/docs/hot-path-account.md"]
+
+["path-account","write","--doc","d.md"]
+ok path-account write doc=["d.md"]
+
+["path-account","-h"]
+help xtask path-account -h
+
+["path-account","trace","--help"]
+help xtask path-account trace --help
+
+["path-account","write","-h"]
+help xtask path-account write -h
+
+["build","--limited-debug","kernel,ktest","--debug","kernel"]
+ok build debug=["kernel"] limited_debug=["kernel","ktest"]
+
+["build","--limited-debug","bogus"]
+ValueValidation
+error: invalid value 'bogus' for '--limited-debug <LIMITED_DEBUG>': no component named "bogus"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, tpm, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, swapd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, entropyd, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester

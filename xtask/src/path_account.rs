@@ -244,7 +244,7 @@ pub struct Path
     pub key: String,
     /// The p50 of the boot that was traced.
     pub p50: u64,
-    /// The reference count: the checked-in baseline, or the reference logs' p50.
+    /// The reference count: the lowest p50 of the reference logs.
     pub reference: u64,
     /// The sample index traced.
     pub iteration: u32,
@@ -458,13 +458,44 @@ pub fn render_block(configs: &[Configuration]) -> String
     {
         let _ = write!(out, "\n#### `{key}`\n\n");
         header(&mut out, "Function", "Image", configs);
-        for (place, cells) in place_rows(configs, key)
+        let rows = place_rows(configs, key);
+        let largest = configs
+            .iter()
+            .filter_map(|c| c.paths.iter().find(|p| &p.key == key))
+            .map(|p| p.tally.total)
+            .max()
+            .unwrap_or(0);
+        let floor = row_floor(largest);
+        let mut rest: Vec<Option<u64>> = vec![None; configs.len()];
+        let mut hidden = 0usize;
+        for (place, cells) in rows
+        {
+            if most(&cells) >= floor
+            {
+                row(
+                    &mut out,
+                    &format!("`{}`", place.function),
+                    place.image.name(),
+                    &cells,
+                );
+                continue;
+            }
+            hidden = hidden.saturating_add(1);
+            for (sum, cell) in rest.iter_mut().zip(&cells)
+            {
+                if let Some(n) = cell
+                {
+                    *sum = Some(sum.unwrap_or(0).saturating_add(*n));
+                }
+            }
+        }
+        if hidden > 0
         {
             row(
                 &mut out,
-                &format!("`{}`", place.function),
-                place.image.name(),
-                &cells,
+                &format!("{hidden} functions below {floor} each"),
+                "",
+                &rest,
             );
         }
     }
@@ -512,11 +543,24 @@ fn place_rows(configs: &[Configuration], key: &str) -> Vec<(Place, Vec<Option<u6
         }
     }
     let mut rows: Vec<(Place, Vec<Option<u64>>)> = rows.into_iter().collect();
-    rows.sort_by(|(pa, ca), (pb, cb)| {
-        let most = |cells: &[Option<u64>]| cells.iter().flatten().copied().max().unwrap_or(0);
-        most(cb).cmp(&most(ca)).then_with(|| pa.cmp(pb))
-    });
+    rows.sort_by(|(pa, ca), (pb, cb)| most(cb).cmp(&most(ca)).then_with(|| pa.cmp(pb)));
     rows
+}
+
+/// The largest of a row's counts.
+fn most(cells: &[Option<u64>]) -> u64
+{
+    cells.iter().flatten().copied().max().unwrap_or(0)
+}
+
+/// The fewest instructions a function shows its own row with, in a path whose
+/// largest configuration ran `largest`: 3, or half a percent of the path when
+/// that is more, so a long path's table stays readable. The functions below
+/// it share one row; the result files keep every function.
+pub const fn row_floor(largest: u64) -> u64
+{
+    let share = largest / 200;
+    if share > 3 { share } else { 3 }
 }
 
 fn header(out: &mut String, first: &str, second: &str, configs: &[Configuration])
@@ -572,4 +616,247 @@ pub fn replace_block(doc: &str, block: &str) -> Result<String>
     let tail = tail.strip_prefix('\n').unwrap_or(tail);
     let head = doc.get(..begin).unwrap_or("");
     Ok(format!("{head}{block}{tail}"))
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn step(pc: u64, counter: Option<u64>) -> Step
+    {
+        Step { pc, counter }
+    }
+
+    /// Steps 0..n, with counter reads at the given indices and values.
+    fn steps(n: u64, reads: &[(u64, u64)]) -> Vec<Step>
+    {
+        (0..n)
+            .map(|i| step(i, reads.iter().find(|(at, _)| *at == i).map(|(_, v)| *v)))
+            .collect()
+    }
+
+    #[test]
+    fn rdtsc_is_a_counter_read_on_x86_64_only()
+    {
+        assert_eq!(
+            counter_read(Arch::X86_64, &[0x0f, 0x31, 0x48, 0x89]),
+            Some(CounterDest::EdxEax)
+        );
+        assert_eq!(counter_read(Arch::X86_64, &[0x0f, 0x05]), None);
+        assert_eq!(counter_read(Arch::Riscv64, &[0x0f, 0x31, 0x00, 0x00]), None);
+    }
+
+    #[test]
+    fn csrr_cycle_is_a_counter_read_on_riscv64()
+    {
+        // csrr a0, cycle = csrrs x10, 0xc00, x0.
+        let word: u32 = (0xc00 << 20) | (0b010 << 12) | (10 << 7) | 0x73;
+        assert_eq!(
+            counter_read(Arch::Riscv64, &word.to_le_bytes()),
+            Some(CounterDest::Register(10))
+        );
+        // csrr a0, time (0xc01) is not the cycle counter.
+        let time: u32 = (0xc01 << 20) | (0b010 << 12) | (10 << 7) | 0x73;
+        assert_eq!(counter_read(Arch::Riscv64, &time.to_le_bytes()), None);
+        // A read into x0 is discarded.
+        let zero: u32 = (0xc00 << 20) | (0b010 << 12) | 0x73;
+        assert_eq!(counter_read(Arch::Riscv64, &zero.to_le_bytes()), None);
+        // A csrrs that sets bits (rs1 != x0) is not a plain read.
+        let set: u32 = (0xc00 << 20) | (5 << 15) | (0b010 << 12) | (10 << 7) | 0x73;
+        assert_eq!(counter_read(Arch::Riscv64, &set.to_le_bytes()), None);
+        assert_eq!(counter_read(Arch::Riscv64, &[0x73, 0x00]), None);
+    }
+
+    #[test]
+    fn the_window_is_the_pair_that_differs_by_the_sample()
+    {
+        // Reads at 2 (100) and 9 (107): 7 instructions, 2..9.
+        let trace = steps(12, &[(2, 100), (9, 107), (11, 200)]);
+        assert_eq!(window(&trace, 7).unwrap(), 2..9);
+    }
+
+    #[test]
+    fn a_window_whose_steps_differ_from_the_sample_is_rejected()
+    {
+        // The counter advanced by 5 over 7 stepped instructions.
+        let trace = steps(12, &[(2, 100), (9, 105)]);
+        let err = window(&trace, 5).unwrap_err().to_string();
+        assert!(err.contains("not the measured one"), "{err}");
+    }
+
+    #[test]
+    fn no_pair_or_several_pairs_are_rejected()
+    {
+        let trace = steps(12, &[(1, 100), (4, 103), (7, 106)]);
+        window(&trace, 4).unwrap_err();
+        let err = window(&trace, 3).unwrap_err().to_string();
+        assert!(err.contains("2 pairs"), "{err}");
+    }
+
+    #[test]
+    fn library_frames_count_against_their_caller()
+    {
+        for library in [
+            "core::sync::atomic::atomic_load::<u32, false>",
+            "<*const _>::is_null::runtime",
+            "<usize>::overflowing_add",
+            "<u64 as core::convert::From<u32>>::from",
+            "<core::result::Result<u64, E>>::map_err::<F, G>",
+            "alloc::vec::Vec::push",
+            "<[u8]>::len",
+            "<&T as core::fmt::Debug>::fmt",
+        ]
+        {
+            assert!(is_library(library), "{library}");
+        }
+        for own in [
+            "kernel::sched::scheduler_for",
+            "<kernel::syscall::UserFrame>::arg",
+            "<bench::counters::Counters>::read",
+            "<core_ext::Thing>::new",
+            "seraph_enter_from_user",
+        ]
+        {
+            assert!(!is_library(own), "{own}");
+        }
+        let frames: Vec<String> = [
+            "core::sync::atomic::atomic_load::<u32, false>",
+            "kernel::sched::scheduler_for",
+            "kernel::syscall::dispatch",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(attributed(&frames), "kernel::sched::scheduler_for");
+        let only_library = vec!["<usize>::overflowing_add".to_owned()];
+        assert_eq!(attributed(&only_library), "<usize>::overflowing_add");
+        assert_eq!(attributed(&[]), "");
+    }
+
+    fn place(image: Image, function: &str) -> Place
+    {
+        Place {
+            image,
+            function: function.to_owned(),
+        }
+    }
+
+    fn config(arch: &str, profile: &str, null: u64) -> Configuration
+    {
+        let tally = Tally::of(0..null, |pc| match pc
+        {
+            0..=3 => place(Image::Ktest, "bench::arch::current::cycles"),
+            4 => place(Image::Kernel, "kernel::cap::sole_reference::drain"),
+            _ => place(Image::Kernel, "kernel::syscall::dispatch"),
+        });
+        Configuration {
+            arch: arch.to_owned(),
+            profile: profile.to_owned(),
+            head: "0123456789ab".to_owned(),
+            date: "2026-11-23".to_owned(),
+            qemu: "QEMU emulator version 11.1.3".to_owned(),
+            reference: "1 icount boot(s)".to_owned(),
+            paths: vec![Path {
+                key: "ktest.null_syscall_roundtrip cpus=1".to_owned(),
+                p50: null,
+                reference: null,
+                iteration: 64,
+                tally,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_tally_counts_each_place()
+    {
+        let c = config("x86_64", "dev", 20);
+        let tally = &c.paths[0].tally;
+        assert_eq!(tally.total, 20);
+        assert_eq!(tally.of_image(Image::Ktest), 4);
+        assert_eq!(tally.of_image(Image::Kernel), 16);
+        assert_eq!(tally.of_image(Image::Other), 0);
+    }
+
+    #[test]
+    fn a_result_file_round_trips()
+    {
+        let c = config("riscv64", "release", 20);
+        assert_eq!(Configuration::parse(&c.render()).unwrap(), c);
+    }
+
+    #[test]
+    fn a_malformed_result_file_is_rejected()
+    {
+        Configuration::parse(
+            "arch	x86_64
+",
+        )
+        .unwrap_err();
+        let text = format!(
+            "{RESULT_HEADER}
+fn	kernel	f	3
+"
+        );
+        Configuration::parse(&text).unwrap_err();
+        let text = format!(
+            "{RESULT_HEADER}
+arch	x86_64
+"
+        );
+        let err = Configuration::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("no profile"), "{err}");
+        let text = format!(
+            "{RESULT_HEADER}
+path	k	1	1	64
+fn	firmware	f	1
+"
+        );
+        Configuration::parse(&text).unwrap_err();
+    }
+
+    #[test]
+    fn the_block_sets_the_configurations_side_by_side()
+    {
+        let block = render_block(&[config("x86_64", "dev", 20), config("riscv64", "dev", 30)]);
+        assert!(block.starts_with(BLOCK_BEGIN) && block.trim_end().ends_with(BLOCK_END));
+        assert!(block.contains("| `ktest.null_syscall_roundtrip cpus=1` | all | 20 | 30 |"));
+        assert!(block.contains("| `ktest.null_syscall_roundtrip cpus=1` | kernel | 16 | 26 |"));
+        // The largest function first; one below the floor of 3 folds into
+        // the closing row.
+        let dispatch = block
+            .find("| `kernel::syscall::dispatch` | kernel | 15 | 25 |")
+            .unwrap();
+        let cycles = block
+            .find("| `bench::arch::current::cycles` | ktest | 4 | 4 |")
+            .unwrap();
+        assert!(dispatch < cycles);
+        assert!(!block.contains("sole_reference"));
+        assert!(block.contains("| 1 functions below 3 each |  | 1 | 1 |"));
+        // A configuration without "other" instructions gets no such row.
+        assert!(!block.contains("| other |"));
+    }
+
+    #[test]
+    fn the_row_floor_grows_with_the_path()
+    {
+        assert_eq!(row_floor(0), 3);
+        assert_eq!(row_floor(358), 3);
+        assert_eq!(row_floor(97_213), 486);
+    }
+
+    #[test]
+    fn the_block_is_replaced_in_place()
+    {
+        let doc = format!("# Title\n\nIntro.\n\n{BLOCK_BEGIN}\nold\n{BLOCK_END}\n\nAfter.\n");
+        let new = format!("{BLOCK_BEGIN}\nnew\n{BLOCK_END}\n");
+        assert_eq!(
+            replace_block(&doc, &new).unwrap(),
+            format!("# Title\n\nIntro.\n\n{BLOCK_BEGIN}\nnew\n{BLOCK_END}\n\nAfter.\n")
+        );
+        replace_block("# Title\n", &new).unwrap_err();
+        let twice = format!("{doc}{BLOCK_BEGIN}\n");
+        replace_block(&twice, &new).unwrap_err();
+        let reversed = format!("{BLOCK_END}\n{BLOCK_BEGIN}\n");
+        replace_block(&reversed, &new).unwrap_err();
+    }
 }

@@ -21,6 +21,7 @@ Commands:
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
   bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
+  path-account    Account for every instruction of each kernel benchmark's measured window: `trace` boots the bench-only ktest image at one CPU under icount with QEMU's gdbstub, single-steps one iteration of each benchmark, checks it against the counts, and attributes each instruction to its function; `write` sets the traced configurations side by side in the account document. See xtask/README.md
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   trust-request   Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)
@@ -56,6 +57,7 @@ Commands:
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
   bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
+  path-account    Account for every instruction of each kernel benchmark's measured window: `trace` boots the bench-only ktest image at one CPU under icount with QEMU's gdbstub, single-steps one iteration of each benchmark, checks it against the counts, and attributes each instruction to its function; `write` sets the traced configurations side by side in the account document. See xtask/README.md
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   trust-request   Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)
@@ -81,14 +83,15 @@ Build Seraph components and populate the sysroot
 Usage: xtask build [OPTIONS]
 
 Options:
-      --arch <ARCH>            Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --release                Build in release mode (default: debug)
-      --component <COMPONENT>  Build only one component (default: all): `boot`, or the crate name of any component the build installs [default: all]
-      --debug <DEBUG>          Emit debuginfo (`debug = 2`, `opt-level = 1`) for the named component(s) only, within the active profile (default or `--release`). Comma-separated, e.g. `--debug kernel,procmgr`; names match `--component`. Only components in the current build are affected
-      --ktest-bench-only       Build ktest with its `bench-only` feature: the benchmark tier alone, each benchmark at its full iteration count, for a run whose result lines are compared (core/ktest/README.md "Tier 3"). Needs a build that includes ktest (`--component all` or `ktest`)
-      --wait-host <SECS>       When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-  -h, --help                   Print help (see more with '--help')
+      --arch <ARCH>                    Target architecture [default: x86_64] [possible values: x86_64, riscv64]
+      --release                        Build in release mode (default: debug)
+      --component <COMPONENT>          Build only one component (default: all): `boot`, or the crate name of any component the build installs [default: all]
+      --debug <DEBUG>                  Emit debuginfo (`debug = 2`, `opt-level = 1`) for the named component(s) only, within the active profile (default or `--release`). Comma-separated, e.g. `--debug kernel,procmgr`; names match `--component`. Only components in the current build are affected
+      --limited-debug <LIMITED_DEBUG>  Emit limited debuginfo (`debug = "limited"`: line tables and function frames, inlined ones included, without types or variables) for the named component(s), at the active profile's own opt-level, so the code is the code a build without it emits; a component `--debug` also names takes `--debug`. Comma-separated, names as for `--debug`. `cargo xtask path-account` reads the kernel's and ktest's
+      --ktest-bench-only               Build ktest with its `bench-only` feature: the benchmark tier alone, each benchmark at its full iteration count, for a run whose result lines are compared (core/ktest/README.md "Tier 3"). Needs a build that includes ktest (`--component all` or `ktest`)
+      --wait-host <SECS>               When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+      --host-override                  Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+  -h, --help                           Print help (see more with '--help')
 === xtask build --help
 Build Seraph components and populate the sysroot
 
@@ -114,6 +117,9 @@ Options:
 
       --debug <DEBUG>
           Emit debuginfo (`debug = 2`, `opt-level = 1`) for the named component(s) only, within the active profile (default or `--release`). Comma-separated, e.g. `--debug kernel,procmgr`; names match `--component`. Only components in the current build are affected
+
+      --limited-debug <LIMITED_DEBUG>
+          Emit limited debuginfo (`debug = "limited"`: line tables and function frames, inlined ones included, without types or variables) for the named component(s), at the active profile's own opt-level, so the code is the code a build without it emits; a component `--debug` also names takes `--debug`. Comma-separated, names as for `--debug`. `cargo xtask path-account` reads the kernel's and ktest's
 
       --ktest-bench-only
           Build ktest with its `bench-only` feature: the benchmark tier alone, each benchmark at its full iteration count, for a run whose result lines are compared (core/ktest/README.md "Tier 3"). Needs a build that includes ktest (`--component all` or `ktest`)
@@ -726,6 +732,111 @@ Options:
       --all              Rewrite every baseline file and the ENV file, not only those whose measurements moved
       --baselines <DIR>  The baselines root, which holds `<mode>/<arch>/` [default: xtask/baselines/bench]
   -h, --help             Print help
+=== xtask path-account -h
+Account for every instruction of each kernel benchmark's measured window: `trace` boots the bench-only ktest image at one CPU under icount with QEMU's gdbstub, single-steps one iteration of each benchmark, checks it against the counts, and attributes each instruction to its function; `write` sets the traced configurations side by side in the account document. See xtask/README.md
+
+Usage: xtask path-account <COMMAND>
+
+Commands:
+  trace  Boot the sysroot's bench-only ktest image (`build --ktest-bench-only --limited-debug kernel,ktest`, `mkdisk --harness ktest`) at one CPU under icount, trace one iteration of each benchmark, check each window against the counts, and write the configuration's result under target/xtask/path-account/
+  write  Write the generated block of the account document from the result files of every configuration traced
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+=== xtask path-account --help
+Account for every instruction of each kernel benchmark's measured window: `trace` boots the bench-only ktest image at one CPU under icount with QEMU's gdbstub, single-steps one iteration of each benchmark, checks it against the counts, and attributes each instruction to its function; `write` sets the traced configurations side by side in the account document. See xtask/README.md
+
+Usage: xtask path-account <COMMAND>
+
+Commands:
+  trace  Boot the sysroot's bench-only ktest image (`build --ktest-bench-only --limited-debug kernel,ktest`, `mkdisk --harness ktest`) at one CPU under icount, trace one iteration of each benchmark, check each window against the counts, and write the configuration's result under target/xtask/path-account/
+  write  Write the generated block of the account document from the result files of every configuration traced
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+=== xtask path-account trace -h
+Boot the sysroot's bench-only ktest image (`build --ktest-bench-only --limited-debug kernel,ktest`, `mkdisk --harness ktest`) at one CPU under icount, trace one iteration of each benchmark, check each window against the counts, and write the configuration's result under target/xtask/path-account/
+
+Usage: xtask path-account trace [OPTIONS] --reference <LOG>
+
+Options:
+      --arch <ARCH>            Target architecture: the sysroot's [default: x86_64] [possible values: x86_64, riscv64]
+      --release                The sysroot was built with `--release` (default: the dev profile)
+      --iteration <ITERATION>  The sample index traced in each benchmark: the iteration that records it is stepped. Below the smallest sample count of a benchmark (100), so every benchmark records it [default: 64]
+      --reference <LOG>        Saved logs of icount boots of the same tree and profile's bench-only image built without `--limited-debug` (`run --icount --save-logs`), whose lowest p50s are the reference counts each traced window must equal
+      --timeout <TIMEOUT>      Seconds the whole boot may take [default: 3600]
+      --wait-host <SECS>       When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+      --host-override          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --alone                  Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
+      --timing                 A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
+      --grant <HOLDER>         Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
+  -h, --help                   Print help (see more with '--help')
+=== xtask path-account trace --help
+Boot the sysroot's bench-only ktest image (`build --ktest-bench-only --limited-debug kernel,ktest`, `mkdisk --harness ktest`) at one CPU under icount, trace one iteration of each benchmark, check each window against the counts, and write the configuration's result under target/xtask/path-account/
+
+Usage: xtask path-account trace [OPTIONS] --reference <LOG>
+
+Options:
+      --arch <ARCH>
+          Target architecture: the sysroot's
+
+          Possible values:
+          - x86_64:  x86-64 (Intel/AMD 64-bit)
+          - riscv64: RISC-V 64-bit
+          
+          [default: x86_64]
+
+      --release
+          The sysroot was built with `--release` (default: the dev profile)
+
+      --iteration <ITERATION>
+          The sample index traced in each benchmark: the iteration that records it is stepped. Below the smallest sample count of a benchmark (100), so every benchmark records it
+          
+          [default: 64]
+
+      --reference <LOG>
+          Saved logs of icount boots of the same tree and profile's bench-only image built without `--limited-debug` (`run --icount --save-logs`), whose lowest p50s are the reference counts each traced window must equal
+
+      --timeout <TIMEOUT>
+          Seconds the whole boot may take
+          
+          [default: 3600]
+
+      --wait-host <SECS>
+          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+
+      --host-override
+          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+
+      --alone
+          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
+
+      --timing
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
+
+      --grant <HOLDER>
+          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
+
+  -h, --help
+          Print help (see a summary with '-h')
+=== xtask path-account write -h
+Write the generated block of the account document from the result files of every configuration traced
+
+Usage: xtask path-account write [OPTIONS]
+
+Options:
+      --doc <DOC>  The account document, whose generated block is replaced [default: core/kernel/docs/hot-path-account.md]
+  -h, --help       Print help
+=== xtask path-account write --help
+Write the generated block of the account document from the result files of every configuration traced
+
+Usage: xtask path-account write [OPTIONS]
+
+Options:
+      --doc <DOC>  The account document, whose generated block is replaced [default: core/kernel/docs/hot-path-account.md]
+  -h, --help       Print help
 === xtask symbolize -h
 Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
 
@@ -1704,6 +1815,7 @@ Commands:
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
   bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
+  path-account    Account for every instruction of each kernel benchmark's measured window: `trace` boots the bench-only ktest image at one CPU under icount with QEMU's gdbstub, single-steps one iteration of each benchmark, checks it against the counts, and attributes each instruction to its function; `write` sets the traced configurations side by side in the account document. See xtask/README.md
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   trust-request   Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)

@@ -440,4 +440,48 @@ mod tests
         assert_eq!(field_hex("rip=ffff", "rip="), Some(0xffff));
         assert_eq!(field_hex("nothing", "rip="), None);
     }
+
+    /// `body` framed as a packet: `$body#xx`, `xx` the sum of its bytes.
+    fn framed(body: &[u8]) -> Vec<u8>
+    {
+        let sum = body.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+        let mut packet = vec![b'$'];
+        packet.extend_from_slice(body);
+        packet.extend_from_slice(format!("#{sum:02x}").as_bytes());
+        packet
+    }
+
+    #[test]
+    fn a_resume_waits_for_its_stop_reply_across_timeouts()
+    {
+        use std::io::{Read as _, Write as _};
+
+        let (near, mut far) = UnixStream::pair().unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let sent = framed(b"c");
+            let mut got = vec![0u8; sent.len()];
+            far.read_exact(&mut got).unwrap();
+            assert_eq!(got, sent);
+            far.write_all(b"+").unwrap();
+            // The stop comes only once the client has seen a wait run out.
+            released.recv().unwrap();
+            far.write_all(&framed(b"T05thread:01;watch:1000;")).unwrap();
+            let mut ack = [0u8; 1];
+            far.read_exact(&mut ack).unwrap();
+            assert_eq!(&ack, b"+");
+        });
+        let mut stub = Stub::over_unix(near, Duration::from_secs(5)).unwrap();
+        stub.wait_stop(Duration::from_millis(10)).unwrap_err();
+        stub.resume(b"c").unwrap();
+        assert_eq!(stub.wait_stop(Duration::from_millis(50)).unwrap(), None);
+        release.send(()).unwrap();
+        assert_eq!(
+            stub.wait_stop(Duration::from_secs(5)).unwrap().as_deref(),
+            Some(&b"T05thread:01;watch:1000;"[..])
+        );
+        // The reply was taken: no resume is owed one.
+        stub.wait_stop(Duration::from_millis(10)).unwrap_err();
+        server.join().unwrap();
+    }
 }

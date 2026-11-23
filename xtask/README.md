@@ -43,6 +43,8 @@ xtask/
 │   │                           #   and the report of QEMU's exit under a harness
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── image_check.rs          # The check every pack makes of the images it wrote (fsck.fat, ESP)
+│   ├── path_account.rs         # The per-path instruction account: counter reads, the window,
+│   │                           #   attribution, the result file, the document's block
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
 │   ├── qemu_gdb.rs             # GDB remote client: QEMU's gdbstub and the GDB stub service
@@ -62,7 +64,8 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # Subcommand modules (build, capture_acpi, run (the
 │   │   │                       #   interactive boot; run/classified.rs, --runs),
-│   │   │                       #   ktest_timing, bench_check, bench_baseline, symbolize,
+│   │   │                       #   ktest_timing, bench_check, bench_baseline, path_account,
+│   │   │                       #   symbolize,
 │   │   │                       #   mkdisk, clean, crypto_vectors, fuzz, kani,
 │   │   │                       #   compare_images, lint_docs, pr_check, review,
 │   │   │                       #   release_scope, issue, orch, hook, host, trust_request)
@@ -92,7 +95,8 @@ Build Seraph components and populate `sysroot/`.
 
 ```
 cargo xtask build [--arch x86_64|riscv64] [--release] \
-    [--component <name>|all] [--debug <comp>[,...]] [--ktest-bench-only]
+    [--component <name>|all] [--debug <comp>[,...]] [--limited-debug <comp>[,...]] \
+    [--ktest-bench-only]
 ```
 
 | Option | Default | Description |
@@ -101,6 +105,7 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 | `--release` | off | Build in release mode |
 | `--component` | `all` | Build a single component: `boot`, the crate name of any component the build installs (an entry of the `SPECS` table in `xtask/src/commands/build.rs`: `kernel`, `init`, `ktest`, each service, driver, program, fixture, and tester crate), or `all` |
 | `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, each named as `--component` names it, e.g. `--debug kernel,crashme`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
+| `--limited-debug` | (none) | Emit limited debuginfo (`debug="limited"`: line tables and function frames, inlined ones included, without types or variables) for the named component(s), at the active profile's own opt-level, so their instructions are a plain build's; a component `--debug` also names takes `--debug`. `path-account` reads the kernel's and ktest's. See [Debuginfo is opt-in](../docs/build-system.md#debuginfo-is-opt-in). |
 | `--ktest-bench-only` | off | Build ktest with its `bench-only` feature, which runs Tier 3 alone at its benchmark iteration count ([core/ktest/README.md](../core/ktest/README.md#compile-time-options) § Compile-time options); refused with a `--component` other than `ktest` or `all` |
 
 Before it compiles, the build checks that the workspace's Rust source is formatted as
@@ -1722,6 +1727,87 @@ no longer measured, and is removed when none of its measurements remains; each r
 every measurement of its benchmark at its lowest p50. The `ENV` file is written when `--all` is
 given or it does not exist: the cell's own, from its artifact, with `--from-run`; this host's with
 `--host`. The command prints each file it wrote or removed.
+
+---
+
+### `cargo xtask path-account`
+
+Account for every instruction of each kernel benchmark's measured window by the function it
+belongs to, on the architecture and profile of the sysroot, and write the accounts into
+[core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md).
+
+```
+cargo xtask path-account trace [--arch x86_64|riscv64] [--release] [--iteration K] \
+    [--timeout SECS] [--wait-host SECS] [--alone] [--grant HOLDER] --reference LOG...
+cargo xtask path-account write [--doc FILE]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | The sysroot's architecture |
+| `--release` | off | The sysroot was built with `--release` |
+| `--iteration` | `64` | The first sample index stepped; below the smallest sample count of a benchmark (100), less the 7 iterations stepped after it |
+| `--reference` | | Saved logs of icount boots of the same tree and profile's bench-only image built without `--limited-debug`, whose lowest one-CPU p50s are the reference counts |
+| `--timeout` | `3600` | Seconds the whole boot may take |
+| `--doc` | `core/kernel/docs/hot-path-account.md` | (`write`) The document whose generated block is replaced |
+
+The host options are `run`'s ([Host launch rules](#host-launch-rules)); a trace is a boot of one
+vCPU. One configuration is regenerated with:
+
+```
+cargo xtask build --arch <a> [--release] --ktest-bench-only
+cargo xtask mkdisk --arch <a> --harness ktest
+cargo xtask run --arch <a> --icount --cpus 1 --runs 1 --save-logs target/pa-ref/<a>-<profile>
+cargo xtask build --arch <a> [--release] --ktest-bench-only --limited-debug kernel,ktest
+cargo xtask mkdisk --arch <a> --harness ktest
+cargo xtask path-account trace --arch <a> [--release] --reference target/pa-ref/<a>-<profile>/*.log
+```
+
+and the document from every configuration traced with `cargo xtask path-account write`
+(`cargo xtask clean` between architectures). A trace takes about two minutes.
+
+**Method.** `trace` boots the sysroot's image at one CPU under icount, as `run --icount` does,
+with QEMU's gdbstub on a unix socket, and drives the stub as the guest runs:
+
+1. It reads the kernel's KASLR slide from the serial log, stops the guest, and stops it again
+   where the kernel hands the CPU to init (`kernel::sched::enter`), after the kernel has logged
+   ktest's load bias, which it then reads.
+2. It sets a write watchpoint on sample `K-1` of ktest's sample buffer (`ktest::bench::SAMPLES`),
+   into which every benchmark records from index 0. A stop whose frames do not include
+   `Samples::record` (the summary's in-place sort) is stepped over.
+3. At a benchmark's recording of sample `K-1`, it steps past the store (x86_64 stops after it,
+   riscv64 before it), then single-steps, with interrupts and timers masked for each step
+   (`Qqemu.sstep=0x7`), until the program counter is back at that address: one iteration, the
+   store of the next sample among its instructions. It steps 8 iterations in turn.
+4. In each iteration, the window is the pair of counter reads (`rdtsc`, `csrr cycle`, decoded at
+   each address stepped) whose values differ by the sample the iteration stored: the opening read
+   and every instruction up to the closing read.
+5. The benchmark's next result line names it and gives the boot's p50; the account takes the
+   first of its 8 iterations whose window ran the p50.
+
+Each check is a failure of the command: a window whose stepped instructions are not the counter's
+difference (the stepped path is not the measured one); a benchmark none of whose 8 iterations ran
+its p50; a p50 that is not the reference count; a one-CPU measurement of the reference logs left
+untraced; a benchmark's `FAIL` line. The reference is a count of the image without debuginfo
+because limited debuginfo changes the crates' hashes, and with them the order the linker lays
+functions out in: the instructions are a plain build's, which the equal counts confirm.
+
+**Attribution.** An address is the kernel's when, less the slide, it lies in the kernel's text,
+and ktest's when, less the bias, it lies in ktest's (the symbols store's file, which keeps its
+DWARF). Each instruction counts against the innermost function of its DWARF frames, inlined ones
+included, that is not the standard library's (`core`, `alloc`, `compiler_builtins`, or a
+primitive type's method), so an inlined helper counts against its caller; an instruction no DWARF
+covers (assembly) counts against the nearest text symbol at or before it.
+
+**Output.** `target/xtask/path-account/<arch>-<profile>.tsv`, the result file: the
+configuration's head (`-dirty` when the tree differed from it), date, QEMU version and reference,
+then per path a `path` record (measurement, p50, reference, iteration) and an `fn` record per
+function (image, path, count). Beside it, `<arch>-<profile>/` holds the boot's serial log and one
+`.trace` file per path, a line per instruction: its address, its image, and its frames from the
+outermost in. `write` reads the result file of each configuration traced and replaces the block
+between the document's `path-account` markers with a provenance table, each path's totals by
+image, and per path its functions, a column per configuration; a function below 3 instructions,
+or below half a percent of the path when that is more, shares one closing row.
 
 ---
 

@@ -6,6 +6,7 @@
 //! Pure GUID Partition Table parsing.
 //!
 //! Decodes a GPT header and partition entries from raw block bytes, and
+//! chooses between a disk's primary and backup GPT by their CRC32s, and
 //! resolves a partition by type GUID across the partitions of every disk the
 //! caller holds, with Discoverable-Partitions-Specification priority
 //! tie-breaking. This crate performs no I/O: a caller reads logical
@@ -52,28 +53,43 @@ pub struct GptEntry
 
 /// Validated GPT header fields needed to walk the partition array. The
 /// `u32` widths of `num_parts` and `entry_size` are the UEFI GPT header's
-/// own field widths; [`parse_header`] has checked that the
-/// `num_parts * entry_size`-byte array lies between LBA 2 and the header's
-/// own first usable LBA. That holds the array to the layout the header
-/// declares; it is only as trustworthy as `first_usable_lba`, which comes
-/// from the same block. `block_size` is the length of the block the header
-/// was parsed from, the unit of every LBA here.
+/// own field widths; [`parse_header`] has checked the header's CRC32, and
+/// that the `num_parts * entry_size`-byte array lies outside the usable
+/// range the header declares (§ [`parse_header`]). `block_size` is the
+/// length of the block the header was parsed from, the unit of every LBA
+/// here; `entries_crc` is the CRC32 the header gives its array, which
+/// [`collect_partitions`] checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GptHeader
 {
     pub part_entry_lba: u64,
     pub num_parts: u32,
     pub entry_size: u32,
     pub block_size: u32,
+    pub entries_crc: u32,
 }
 
+/// The least `HeaderSize` the UEFI spec permits, the bytes of the header's
+/// own fields (UEFI 2.10 § 5.3.2, Table 5-5); a header's CRC32 covers its
+/// first `HeaderSize` bytes.
+pub const HEADER_LEN: u32 = 92;
+
 /// GPT parsing error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GptError
 {
-    /// Block I/O read failed. Produced by the I/O caller, never by the pure
-    /// parsers in this crate.
+    /// Block I/O read failed: a read of a header block in [`read_gpt`], or
+    /// one of the I/O caller's own.
     IoError,
     /// GPT header signature is not "EFI PART".
     InvalidSignature,
+    /// The header's `HeaderSize` lies outside [`HEADER_LEN`] to the block
+    /// size.
+    InvalidHeaderSize,
+    /// The header's CRC32 does not match its first `HeaderSize` bytes.
+    InvalidHeaderCrc,
+    /// The header's `MyLBA` is not the LBA it was read from.
+    MisplacedHeader,
     /// Partition entry size is not one the GPT spec permits within one
     /// block: `128 * 2^n` bytes, no larger than the block.
     InvalidEntrySize,
@@ -81,38 +97,93 @@ pub enum GptError
     /// [`MIN_BLOCK_SIZE`] to [`MAX_BLOCK_SIZE`] bytes.
     InvalidBlockSize,
     /// The partition-entry array does not lie where the GPT spec places it:
-    /// it starts before LBA 2 (over the protective MBR or the header), or its
-    /// `num_parts * entry_size` bytes run past `first_usable_lba`, the first
-    /// LBA a partition may occupy.
+    /// it starts before LBA 2 (over the protective MBR or the primary
+    /// header), or its `num_parts * entry_size` bytes reach into the usable
+    /// range, where partitions lie, or past the header itself.
     InvalidEntryArray,
 }
 
-/// Parse and validate the GPT header from `block`, the logical block at LBA 1;
-/// its length is the device's logical block size.
+impl core::fmt::Display for GptError
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        f.write_str(match self
+        {
+            GptError::IoError => "I/O error",
+            GptError::InvalidSignature => "invalid signature",
+            GptError::InvalidHeaderSize => "header size outside 92 bytes to the block size",
+            GptError::InvalidHeaderCrc => "header CRC32 mismatch",
+            GptError::MisplacedHeader => "header names another LBA as its own",
+            GptError::InvalidEntrySize => "invalid entry size",
+            GptError::InvalidBlockSize => "unsupported logical block size",
+            GptError::InvalidEntryArray => "entry array outside the space the GPT spec gives it",
+        })
+    }
+}
+
+/// Parse and validate the GPT header in `block`, the logical block at `lba`;
+/// its length is the device's logical block size. The primary header lies at
+/// LBA 1 and the backup at the disk's last LBA (UEFI 2.10 § 5.3.2).
 ///
-/// Checks the `EFI PART` signature and that `entry_size` is one the GPT spec
-/// permits (`128 * 2^n`) and fits one block. The entry-size check matters: the
-/// partition-array walk tiles each block from offset 0 with
-/// `block_size / entry_size` entries, which reads every entry at its true
-/// offset only when `entry_size` divides the block, and `parse_entry` reads 56
-/// bytes per entry.
+/// Checks, in this order, the `EFI PART` signature; a `HeaderSize` from
+/// [`HEADER_LEN`] to the block size; the header's CRC32, over its first
+/// `HeaderSize` bytes with the CRC field read as zero; that `MyLBA` is
+/// `lba`; and that `entry_size` is one the GPT spec permits (`128 * 2^n`)
+/// and fits one block. The entry-size check matters: the partition-array
+/// walk tiles each block from offset 0 with `block_size / entry_size`
+/// entries, which reads every entry at its true offset only when
+/// `entry_size` divides the block, and `parse_entry` reads 56 bytes per
+/// entry.
 ///
-/// Also checks that the entry array lies between LBA 2 and the header's
-/// `first_usable_lba`, as the GPT spec places it, so a `num_parts` that
-/// disagrees with the header's own layout is refused rather than walked.
-/// The check trusts `first_usable_lba`, which the same block supplies: a
-/// header that also inflates it still passes, and its walk is then bounded
-/// only by the device (a read past its capacity fails) and by memory
-/// ([`collect_partitions`] stops with [`ScanStop`] either way). The header
-/// and entry-array CRC32s are not checked.
+/// Last, it checks that the entry array starts at LBA 2 or later and ends by
+/// `first_usable_lba`, where the primary's array lies, or starts after
+/// `last_usable_lba` and ends by the header's own LBA, where the backup's
+/// does; so a `num_parts` that disagrees with the header's own layout is
+/// refused rather than walked. The array's own CRC32 is checked by
+/// [`collect_partitions`], which reads it.
 ///
 /// # Errors
 /// Returns [`GptError::InvalidBlockSize`] when `block` is not a supported
 /// block size, [`GptError::InvalidSignature`] when the `EFI PART` signature
-/// is absent, [`GptError::InvalidEntrySize`] when `entry_size` is not
-/// `128 * 2^n` or exceeds the block, or [`GptError::InvalidEntryArray`] when
-/// the entry array starts before LBA 2 or ends past `first_usable_lba`.
-pub fn parse_header(block: &[u8]) -> Result<GptHeader, GptError>
+/// is absent, [`GptError::InvalidHeaderSize`], [`GptError::InvalidHeaderCrc`]
+/// or [`GptError::MisplacedHeader`] when the header's size, CRC32 or
+/// `MyLBA` fails its check, [`GptError::InvalidEntrySize`] when
+/// `entry_size` is not `128 * 2^n` or exceeds the block, or
+/// [`GptError::InvalidEntryArray`] when the entry array lies elsewhere.
+pub fn parse_header(block: &[u8], lba: u64) -> Result<GptHeader, GptError>
+{
+    header_fields(block, lba, header_crc(block))
+}
+
+/// The CRC32 of the header in `block`: its first `HeaderSize` bytes with
+/// the CRC field (bytes 16 to 19) read as zero. A `HeaderSize` past the
+/// block yields 0, which [`header_fields`] never compares, since it refuses
+/// that size first.
+fn header_crc(block: &[u8]) -> u32
+{
+    let size = block
+        .get(12..16)
+        .and_then(|field| field.try_into().ok())
+        .map(u32::from_le_bytes)
+        .and_then(|size| usize::try_from(size).ok());
+    let Some(header) = size.and_then(|size| block.get(..size))
+    else
+    {
+        return 0;
+    };
+    let crc = header
+        .iter()
+        .enumerate()
+        .fold(CRC32_INIT, |crc, (at, &byte)| {
+            crc32_update(crc, if (16..20).contains(&at) { 0 } else { byte })
+        });
+    !crc
+}
+
+/// [`parse_header`] given `crc`, the CRC32 of the header's bytes, which the
+/// header's own CRC field must match: every check but the CRC computation,
+/// none of which loops over the block.
+fn header_fields(block: &[u8], lba: u64, crc: u32) -> Result<GptHeader, GptError>
 {
     let Ok(block_size) = u32::try_from(block.len())
     else
@@ -132,10 +203,27 @@ pub fn parse_header(block: &[u8]) -> Result<GptHeader, GptError>
     {
         return Err(GptError::InvalidSignature);
     }
-    let first_usable_lba = u64::from_le_bytes(hdr[40..48].try_into().unwrap_or([0; 8]));
-    let part_entry_lba = u64::from_le_bytes(hdr[72..80].try_into().unwrap_or([0; 8]));
-    let num_parts = u32::from_le_bytes(hdr[80..84].try_into().unwrap_or([0; 4]));
-    let entry_size = u32::from_le_bytes(hdr[84..88].try_into().unwrap_or([0; 4]));
+    let le32 = |field: &[u8]| u32::from_le_bytes(field.try_into().unwrap_or([0; 4]));
+    let le64 = |field: &[u8]| u64::from_le_bytes(field.try_into().unwrap_or([0; 8]));
+    if !(HEADER_LEN..=block_size).contains(&le32(&hdr[12..16]))
+    {
+        return Err(GptError::InvalidHeaderSize);
+    }
+    if le32(&hdr[16..20]) != crc
+    {
+        return Err(GptError::InvalidHeaderCrc);
+    }
+    let my_lba = le64(&hdr[24..32]);
+    if my_lba != lba
+    {
+        return Err(GptError::MisplacedHeader);
+    }
+    let first_usable_lba = le64(&hdr[40..48]);
+    let last_usable_lba = le64(&hdr[48..56]);
+    let part_entry_lba = le64(&hdr[72..80]);
+    let num_parts = le32(&hdr[80..84]);
+    let entry_size = le32(&hdr[84..88]);
+    let entries_crc = le32(&hdr[88..92]);
     let Some(entries_per_block) = block_size
         .checked_div(entry_size)
         .filter(|_| is_entry_size(entry_size, block_size))
@@ -147,7 +235,9 @@ pub fn parse_header(block: &[u8]) -> Result<GptHeader, GptError>
     let array_fits = part_entry_lba >= 2
         && part_entry_lba
             .checked_add(array_sectors)
-            .is_some_and(|end| end <= first_usable_lba);
+            .is_some_and(|end| {
+                end <= first_usable_lba || (part_entry_lba > last_usable_lba && end <= my_lba)
+            });
     if !array_fits
     {
         return Err(GptError::InvalidEntryArray);
@@ -157,7 +247,38 @@ pub fn parse_header(block: &[u8]) -> Result<GptHeader, GptError>
         num_parts,
         entry_size,
         block_size,
+        entries_crc,
     })
+}
+
+/// The CRC-32 GPT headers carry (IEEE 802.3, reflected polynomial
+/// `0xEDB88320`): its register before the first byte.
+const CRC32_INIT: u32 = !0;
+
+/// The reflected IEEE 802.3 polynomial.
+const CRC32_POLY: u32 = 0xEDB8_8320;
+
+/// The CRC-32 register after `byte`, shifted through the polynomial one bit
+/// at a time.
+fn crc32_update(crc: u32, byte: u8) -> u32
+{
+    let mut crc = crc ^ u32::from(byte);
+    for _ in 0..8
+    {
+        crc = (crc >> 1) ^ (CRC32_POLY & (crc & 1).wrapping_neg());
+    }
+    crc
+}
+
+/// The CRC-32 of `bytes` as a GPT header and its entry array carry it
+/// (UEFI 2.10 § 5.3.2): IEEE 802.3, reflected, initial value and final XOR
+/// all ones.
+#[must_use]
+pub fn crc32(bytes: &[u8]) -> u32
+{
+    !bytes
+        .iter()
+        .fold(CRC32_INIT, |crc, &byte| crc32_update(crc, byte))
 }
 
 /// Whether `size` is a logical block size the parser takes: a power of two
@@ -211,29 +332,45 @@ pub fn parse_entry(entry: &[u8]) -> Option<GptEntry>
     })
 }
 
-/// Why [`collect_partitions`] ended its walk before checking every one of
-/// the header's `num_parts` entries.
+/// Why [`collect_partitions`] did not return the whole verified array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanStop
 {
     /// Reading the entry-array block at this LBA failed, or its LBA
-    /// overflowed `u64`.
+    /// overflowed `u64`: the walk ended there, and the array is unverified.
     ReadFailed
     {
         lba: u64
     },
-    /// The partition list could not grow to hold the next used entry.
+    /// The walk read every slot, and the array's CRC32 does not match the
+    /// header's `entries_crc`: the array is corrupt.
+    ChecksumMismatch,
+    /// The partition list could not grow to hold a used entry. The walk read
+    /// every slot and the array's CRC32 matched, but the list holds only the
+    /// entries before that one.
     OutOfMemory,
 }
 
 /// The used partitions of a GPT entry array, in on-disk order.
 pub struct PartitionScan
 {
-    /// Every used entry the walk decoded.
+    /// Every used entry the walk decoded and could hold.
     pub entries: Vec<GptEntry>,
-    /// `None` when the walk checked all `num_parts` entries; otherwise why it
-    /// stopped early, so the caller can report the partitions it may miss.
+    /// `None` when the walk checked all `num_parts` entries and the array's
+    /// CRC32 matched; otherwise what went wrong. Only `None` and
+    /// [`ScanStop::OutOfMemory`] leave the array verified ([`Self::verified`]).
     pub stop: Option<ScanStop>,
+}
+
+impl PartitionScan
+{
+    /// Whether the walk read the whole array and its CRC32 matched, so the
+    /// entries are the array's.
+    #[must_use]
+    pub fn verified(&self) -> bool
+    {
+        matches!(self.stop, None | Some(ScanStop::OutOfMemory))
+    }
 }
 
 /// One slot of a partition-entry array: the block that holds it and where
@@ -251,14 +388,11 @@ struct EntrySlot
 
 impl EntrySlot
 {
-    /// The used entry this slot holds in `block`, the block at its LBA, as
-    /// [`parse_entry`] decodes it; `None` for an unused or malformed entry,
-    /// or a block too short to hold the slot.
-    fn entry(&self, block: &[u8]) -> Option<GptEntry>
+    /// The slot's bytes in `block`, the block at its LBA, or `None` for a
+    /// block too short to hold the slot.
+    fn bytes<'a>(&self, block: &'a [u8]) -> Option<&'a [u8]>
     {
-        block
-            .get(self.offset..self.offset.checked_add(self.len)?)
-            .and_then(parse_entry)
+        block.get(self.offset..self.offset.checked_add(self.len)?)
     }
 }
 
@@ -331,18 +465,21 @@ impl Iterator for ArrayWalk
     }
 }
 
-/// Walk the partition-entry array `header` describes and collect every used
-/// entry, however many the header declares.
+/// Walk the partition-entry array `header` describes, collect every used
+/// entry, however many the header declares, and check the array's CRC32.
 ///
 /// `read_block(lba, buf)` fills `buf`, `header.block_size` bytes long, with
 /// the logical block at `lba` and returns whether the read succeeded. The
 /// walk takes the array's slots in order (`ArrayWalk`), reading each block
 /// once, when its first slot comes up, so it reads the array's blocks in order
-/// from `header.part_entry_lba` and checks exactly `num_parts` entries. The
+/// from `header.part_entry_lba` and checks exactly `num_parts` entries; their
+/// `num_parts * entry_size` bytes are the bytes the array's CRC32 covers
+/// (UEFI 2.10 § 5.3.2), compared with `header.entries_crc` at the end. The
 /// list grows on the heap, one element per used entry, so its size follows
-/// the disk, not a fixed table. A header whose block size or entry size
-/// [`parse_header`] would refuse yields an empty scan stopped at its first
-/// LBA.
+/// the disk, not a fixed table; when it cannot grow, the walk goes on to check
+/// the CRC32 and reports [`ScanStop::OutOfMemory`]. A header whose block size
+/// or entry size [`parse_header`] would refuse yields an empty scan stopped at
+/// its first LBA.
 pub fn collect_partitions(
     header: &GptHeader,
     mut read_block: impl FnMut(u64, &mut [u8]) -> bool,
@@ -364,6 +501,8 @@ pub fn collect_partitions(
     };
     // The LBA of the block `block_buf` holds.
     let mut loaded = None;
+    let mut crc = CRC32_INIT;
+    let mut out_of_memory = false;
     for slot in walk
     {
         let slot = match slot
@@ -388,22 +527,196 @@ pub fn collect_partitions(
             }
             loaded = Some(slot.lba);
         }
-        if let Some(entry) = slot.entry(block_buf)
+        let bytes = slot.bytes(block_buf).unwrap_or_default();
+        crc = bytes.iter().fold(crc, |crc, &byte| crc32_update(crc, byte));
+        if out_of_memory
+        {
+            continue;
+        }
+        if let Some(entry) = parse_entry(bytes)
         {
             if entries.try_reserve(1).is_err()
             {
-                return PartitionScan {
-                    entries,
-                    stop: Some(ScanStop::OutOfMemory),
-                };
+                out_of_memory = true;
+                continue;
             }
             entries.push(entry);
         }
     }
-    PartitionScan {
-        entries,
-        stop: None,
+    let stop = if !crc != header.entries_crc
+    {
+        Some(ScanStop::ChecksumMismatch)
     }
+    else if out_of_memory
+    {
+        Some(ScanStop::OutOfMemory)
+    }
+    else
+    {
+        None
+    };
+    PartitionScan { entries, stop }
+}
+
+/// Which copy of a disk's GPT [`read_gpt`] read its partitions from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GptCopy
+{
+    /// The primary GPT: the header at LBA 1 and its array.
+    Primary,
+    /// The backup GPT: the header at the disk's last LBA and its array.
+    Backup,
+}
+
+/// Why [`read_gpt`] did not use one copy of a disk's GPT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GptFault
+{
+    /// The copy's header could not be read, or [`parse_header`] refused it.
+    Header(GptError),
+    /// The copy's array could not be read whole
+    /// ([`ScanStop::ReadFailed`]), or its CRC32 did not match
+    /// ([`ScanStop::ChecksumMismatch`]).
+    Array(ScanStop),
+    /// The disk has no LBA past LBA 1 to hold a backup header: it is two
+    /// blocks long or shorter.
+    NoBackup,
+}
+
+impl core::fmt::Display for GptFault
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match self
+        {
+            GptFault::Header(error) => write!(f, "header: {error}"),
+            GptFault::NoBackup => f.write_str("disk too short to hold a backup header"),
+            GptFault::Array(ScanStop::ReadFailed { lba }) =>
+            {
+                write!(f, "entry-array read at LBA {lba:#018x} failed")
+            }
+            GptFault::Array(ScanStop::ChecksumMismatch) =>
+            {
+                f.write_str("entry-array CRC32 mismatch")
+            }
+            GptFault::Array(ScanStop::OutOfMemory) =>
+            {
+                f.write_str("no memory for the partition list")
+            }
+        }
+    }
+}
+
+/// A disk's partitions, as [`read_gpt`] read them from one verified copy of
+/// its GPT.
+pub struct DiskGpt
+{
+    /// The header of the copy read.
+    pub header: GptHeader,
+    /// Its array's used entries; [`PartitionScan::verified`] holds.
+    pub scan: PartitionScan,
+    /// The copy read.
+    pub copy: GptCopy,
+    /// Why the primary was not used, when the copy is the backup.
+    pub primary_fault: Option<GptFault>,
+}
+
+/// Read a disk's partitions from its GPT, as UEFI 2.10 § 5.3.2 directs: the
+/// primary GPT, the header at LBA 1 and its array, when [`parse_header`]
+/// takes the header and [`collect_partitions`] reads and verifies the array;
+/// otherwise the backup GPT at the disk's last LBA, `blocks - 1`, under the
+/// same checks, when the disk is longer than two blocks.
+///
+/// `block_size` is the device's logical block size and `blocks` its
+/// length in those blocks; `read_block` reads a block as for
+/// [`collect_partitions`]. The backup is read only when the primary fails,
+/// and neither copy is written: restoring a damaged copy from the other is
+/// left to firmware and to tools that own the disk.
+///
+/// # Errors
+/// Returns the fault of each copy, the primary's first, when neither
+/// verifies.
+pub fn read_gpt(
+    block_size: usize,
+    blocks: u64,
+    mut read_block: impl FnMut(u64, &mut [u8]) -> bool,
+) -> Result<DiskGpt, [GptFault; 2]>
+{
+    choose_copy(blocks, |lba| read_copy(block_size, lba, &mut read_block)).map(
+        |((header, scan), copy, primary_fault)| DiskGpt {
+            header,
+            scan,
+            copy,
+            primary_fault,
+        },
+    )
+}
+
+/// Choose the copy of a disk of `blocks` blocks that [`read_gpt`] reads:
+/// `read_copy(1)`, the primary, and only when it fails, `read_copy(blocks -
+/// 1)`, the backup at the disk's last LBA, which a disk of two blocks or
+/// fewer does not have ([`GptFault::NoBackup`]). Returns the copy read,
+/// which one it is, and the primary's fault when it is the backup.
+fn choose_copy<T>(
+    blocks: u64,
+    mut read_copy: impl FnMut(u64) -> Result<T, GptFault>,
+) -> Result<(T, GptCopy, Option<GptFault>), [GptFault; 2]>
+{
+    let primary_fault = match read_copy(1)
+    {
+        Ok(copy) => return Ok((copy, GptCopy::Primary, None)),
+        Err(fault) => fault,
+    };
+    let backup = blocks
+        .checked_sub(1)
+        .filter(|&last| last > 1)
+        .map_or(Err(GptFault::NoBackup), &mut read_copy);
+    match backup
+    {
+        Ok(copy) => Ok((copy, GptCopy::Backup, Some(primary_fault))),
+        Err(backup_fault) => Err([primary_fault, backup_fault]),
+    }
+}
+
+/// One copy of a disk's GPT: the header at `lba` and its verified array.
+fn read_copy(
+    block_size: usize,
+    lba: u64,
+    read_block: &mut impl FnMut(u64, &mut [u8]) -> bool,
+) -> Result<(GptHeader, PartitionScan), GptFault>
+{
+    let header = read_header(block_size, lba, read_block).map_err(GptFault::Header)?;
+    let scan = collect_partitions(&header, &mut *read_block);
+    match scan.stop
+    {
+        Some(stop @ (ScanStop::ReadFailed { .. } | ScanStop::ChecksumMismatch)) =>
+        {
+            Err(GptFault::Array(stop))
+        }
+        None | Some(ScanStop::OutOfMemory) => Ok((header, scan)),
+    }
+}
+
+/// Read the header block at `lba` and parse it. Its block buffer lives in
+/// this frame alone, which ends before [`collect_partitions`] puts its own
+/// on the stack, so a GPT read holds one block on the stack at a time.
+#[inline(never)]
+fn read_header(
+    block_size: usize,
+    lba: u64,
+    read_block: &mut impl FnMut(u64, &mut [u8]) -> bool,
+) -> Result<GptHeader, GptError>
+{
+    let mut block = [0u8; MAX_BLOCK_SIZE];
+    let block = block
+        .get_mut(..block_size)
+        .filter(|_| is_block_size(block_size))
+        .ok_or(GptError::InvalidBlockSize)?;
+    if !read_block(lba, block)
+    {
+        return Err(GptError::IoError);
+    }
+    parse_header(block, lba)
 }
 
 /// Failure modes for [`lookup_partition_by_type_guid`].
@@ -523,16 +836,121 @@ mod tests
         header_block(512, sig, part_lba, num, esize)
     }
 
-    /// A `size`-byte header block whose first usable LBA is 34.
+    /// A `size`-byte primary header block (`MyLBA` 1) of the spec's least
+    /// size, whose first usable LBA is 34 and last usable LBA 1000, with its
+    /// CRC32 sealed.
     fn header_block(size: usize, sig: [u8; 8], part_lba: u64, num: u32, esize: u32) -> Vec<u8>
     {
         let mut s = vec![0u8; size];
         s[0..8].copy_from_slice(&sig);
+        s[12..16].copy_from_slice(&HEADER_LEN.to_le_bytes());
+        s[24..32].copy_from_slice(&1u64.to_le_bytes());
         s[40..48].copy_from_slice(&34u64.to_le_bytes());
+        s[48..56].copy_from_slice(&1000u64.to_le_bytes());
         s[72..80].copy_from_slice(&part_lba.to_le_bytes());
         s[80..84].copy_from_slice(&num.to_le_bytes());
         s[84..88].copy_from_slice(&esize.to_le_bytes());
+        seal(&mut s);
         s
+    }
+
+    /// Write the header CRC32 of the header in `s`, over its first 92 bytes
+    /// with the CRC field zero.
+    fn seal(s: &mut [u8])
+    {
+        s[16..20].fill(0);
+        let crc = crc32(&s[..HEADER_LEN as usize]);
+        s[16..20].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// [`parse_header`] of `s` as the primary header, its CRC32 sealed
+    /// first, so a test that edits a field sees that field's check.
+    fn parse(s: &[u8]) -> Result<GptHeader, GptError>
+    {
+        let mut s = s.to_vec();
+        seal(&mut s);
+        parse_header(&s, 1)
+    }
+
+    // Defect caught: a CRC-32 other than the one GPT carries (IEEE 802.3,
+    // reflected, all-ones initial value and final XOR) refuses every real
+    // disk; "123456789" is the algorithm's published check input.
+    #[test]
+    fn crc32_matches_the_ieee_check_value()
+    {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(&[]), 0);
+    }
+
+    // Defect caught: a header whose bytes were corrupted after its CRC32 was
+    // written is taken as valid (UEFI 2.10 § 5.3.2).
+    #[test]
+    fn parse_header_rejects_a_header_whose_crc_does_not_match()
+    {
+        let mut s = header_sector(*b"EFI PART", 2, 128, 128);
+        parse_header(&s, 1).unwrap();
+        s[80] ^= 1;
+        assert_eq!(parse_header(&s, 1).err(), Some(GptError::InvalidHeaderCrc));
+        // Bytes past `HeaderSize` are outside the CRC32.
+        let mut s = header_sector(*b"EFI PART", 2, 128, 128);
+        s[200] ^= 1;
+        parse_header(&s, 1).unwrap();
+    }
+
+    #[test]
+    fn parse_header_rejects_a_header_size_outside_92_bytes_to_the_block()
+    {
+        for size in [0u32, 91, 513]
+        {
+            let mut s = header_sector(*b"EFI PART", 2, 128, 128);
+            s[12..16].copy_from_slice(&size.to_le_bytes());
+            assert_eq!(parse(&s).err(), Some(GptError::InvalidHeaderSize), "{size}");
+        }
+        // A larger header is covered by its CRC32 whole.
+        let mut s = header_sector(*b"EFI PART", 2, 128, 128);
+        s[12..16].copy_from_slice(&512u32.to_le_bytes());
+        s[16..20].fill(0);
+        let crc = crc32(&s);
+        s[16..20].copy_from_slice(&crc.to_le_bytes());
+        parse_header(&s, 1).unwrap();
+        s[300] ^= 1;
+        assert_eq!(parse_header(&s, 1).err(), Some(GptError::InvalidHeaderCrc));
+    }
+
+    // Defect caught: a header read at one LBA that names another as its own,
+    // a stale copy, is taken as the disk's (UEFI 2.10 § 5.3.2).
+    #[test]
+    fn parse_header_rejects_a_header_read_at_another_lba()
+    {
+        let s = header_sector(*b"EFI PART", 2, 128, 128);
+        assert_eq!(parse_header(&s, 2).err(), Some(GptError::MisplacedHeader));
+    }
+
+    #[test]
+    fn parse_header_accepts_a_backup_array_between_the_usable_range_and_itself()
+    {
+        // A backup header at LBA 1033: its array of 32 blocks fills LBAs
+        // 1001..1033, after the last usable LBA 1000.
+        let mut s = header_sector(*b"EFI PART", 1001, 128, 128);
+        s[24..32].copy_from_slice(&1033u64.to_le_bytes());
+        seal(&mut s);
+        parse_header(&s, 1033).unwrap();
+        // The same array reaches the header at LBA 1032, and the usable
+        // range when it starts at LBA 1000.
+        let mut s = header_sector(*b"EFI PART", 1001, 128, 128);
+        s[24..32].copy_from_slice(&1032u64.to_le_bytes());
+        seal(&mut s);
+        assert_eq!(
+            parse_header(&s, 1032).err(),
+            Some(GptError::InvalidEntryArray)
+        );
+        let mut s = header_sector(*b"EFI PART", 1000, 128, 128);
+        s[24..32].copy_from_slice(&1033u64.to_le_bytes());
+        seal(&mut s);
+        assert_eq!(
+            parse_header(&s, 1033).err(),
+            Some(GptError::InvalidEntryArray)
+        );
     }
 
     fn entry_bytes(tg: u8, first: u64, last: u64, attrs: u64) -> [u8; 128]
@@ -550,7 +968,7 @@ mod tests
     fn parse_header_accepts_valid_header()
     {
         let s = header_sector(*b"EFI PART", 2, 128, 128);
-        let h = parse_header(&s).ok().expect("valid header");
+        let h = parse(&s).expect("valid header");
         assert_eq!(h.part_entry_lba, 2);
         assert_eq!(h.num_parts, 128);
         assert_eq!(h.entry_size, 128);
@@ -565,18 +983,18 @@ mod tests
         // 32 and be refused against the same first usable LBA.
         let mut s = header_block(4096, *b"EFI PART", 2, 128, 128);
         s[40..48].copy_from_slice(&6u64.to_le_bytes());
-        let h = parse_header(&s).ok().expect("4Kn header");
+        let h = parse(&s).expect("4Kn header");
         assert_eq!(h.block_size, 4096);
         s.truncate(512);
-        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
+        assert!(matches!(parse(&s), Err(GptError::InvalidEntryArray)));
     }
 
     #[test]
     fn parse_header_accepts_an_entry_as_large_as_a_4kn_block()
     {
-        assert!(parse_header(&header_block(4096, *b"EFI PART", 2, 1, 4096)).is_ok());
+        parse(&header_block(4096, *b"EFI PART", 2, 1, 4096)).unwrap();
         assert!(matches!(
-            parse_header(&header_block(4096, *b"EFI PART", 2, 1, 8192)),
+            parse(&header_block(4096, *b"EFI PART", 2, 1, 8192)),
             Err(GptError::InvalidEntrySize)
         ));
     }
@@ -588,7 +1006,7 @@ mod tests
         {
             assert!(
                 matches!(
-                    parse_header(&header_block(size, *b"EFI PART", 2, 1, 128)),
+                    parse(&header_block(size, *b"EFI PART", 2, 1, 128)),
                     Err(GptError::InvalidBlockSize)
                 ),
                 "block size {size}"
@@ -600,29 +1018,29 @@ mod tests
     fn parse_header_rejects_bad_signature()
     {
         let s = header_sector(*b"NOT PART", 2, 128, 128);
-        assert!(matches!(parse_header(&s), Err(GptError::InvalidSignature)));
+        assert!(matches!(parse(&s), Err(GptError::InvalidSignature)));
     }
 
     #[test]
     fn parse_header_rejects_entry_size_below_spec_minimum()
     {
         let s = header_sector(*b"EFI PART", 2, 128, 64);
-        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntrySize)));
+        assert!(matches!(parse(&s), Err(GptError::InvalidEntrySize)));
     }
 
     #[test]
     fn parse_header_rejects_entry_size_above_sector()
     {
         let s = header_sector(*b"EFI PART", 2, 128, 513);
-        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntrySize)));
+        assert!(matches!(parse(&s), Err(GptError::InvalidEntrySize)));
     }
 
     #[test]
     fn parse_header_accepts_every_spec_entry_size()
     {
-        assert!(parse_header(&header_sector(*b"EFI PART", 2, 1, 128)).is_ok());
-        assert!(parse_header(&header_sector(*b"EFI PART", 2, 1, 256)).is_ok());
-        assert!(parse_header(&header_sector(*b"EFI PART", 2, 1, 512)).is_ok());
+        parse(&header_sector(*b"EFI PART", 2, 1, 128)).unwrap();
+        parse(&header_sector(*b"EFI PART", 2, 1, 256)).unwrap();
+        parse(&header_sector(*b"EFI PART", 2, 1, 512)).unwrap();
     }
 
     #[test]
@@ -631,14 +1049,14 @@ mod tests
         // 200 lies inside 128..=512 but does not divide the sector, so the
         // per-sector entry walk would read entries at the wrong offsets.
         let s = header_sector(*b"EFI PART", 2, 128, 200);
-        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntrySize)));
+        assert!(matches!(parse(&s), Err(GptError::InvalidEntrySize)));
     }
 
     #[test]
     fn parse_header_accepts_an_array_ending_at_the_first_usable_lba()
     {
         // 128 entries of 128 bytes from LBA 2 fill LBAs 2..34 exactly.
-        assert!(parse_header(&header_sector(*b"EFI PART", 2, 128, 128)).is_ok());
+        parse(&header_sector(*b"EFI PART", 2, 128, 128)).unwrap();
     }
 
     #[test]
@@ -646,17 +1064,17 @@ mod tests
     {
         // One entry more needs LBA 34, the first usable LBA.
         let s = header_sector(*b"EFI PART", 2, 129, 128);
-        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
+        assert!(matches!(parse(&s), Err(GptError::InvalidEntryArray)));
         // A `num_parts` near `u32::MAX` is refused rather than walked.
         let s = header_sector(*b"EFI PART", 2, u32::MAX, 128);
-        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
+        assert!(matches!(parse(&s), Err(GptError::InvalidEntryArray)));
     }
 
     #[test]
     fn parse_header_rejects_an_array_before_lba_2()
     {
         let s = header_sector(*b"EFI PART", 1, 4, 128);
-        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
+        assert!(matches!(parse(&s), Err(GptError::InvalidEntryArray)));
     }
 
     #[test]
@@ -664,7 +1082,7 @@ mod tests
     {
         let mut s = header_sector(*b"EFI PART", u64::MAX, 8, 128);
         s[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
+        assert!(matches!(parse(&s), Err(GptError::InvalidEntryArray)));
     }
 
     #[test]
@@ -748,6 +1166,17 @@ mod tests
             num_parts,
             entry_size,
             block_size: 512,
+            entries_crc: 0,
+        }
+    }
+
+    /// The header of `disk`'s first `num_parts` entries of `entry_size`
+    /// bytes, with their CRC32.
+    fn header_of(disk: &[u8], num_parts: u32, entry_size: u32) -> GptHeader
+    {
+        GptHeader {
+            entries_crc: crc32(&disk[..(num_parts * entry_size) as usize]),
+            ..header(num_parts, entry_size)
         }
     }
 
@@ -779,7 +1208,7 @@ mod tests
         let mut reads = Vec::new();
         let h = GptHeader {
             block_size: 4096,
-            ..header(128, 128)
+            ..header_of(&disk, 128, 128)
         };
         let scan = collect_partitions(&h, reader(&disk, None, &mut reads));
         assert_eq!(scan.stop, None);
@@ -795,7 +1224,7 @@ mod tests
         // it, more than the 8 a fixed table once kept.
         let disk = entry_array(128, 128, |i| i % 6 == 5);
         let mut reads = Vec::new();
-        let scan = collect_partitions(&header(128, 128), reader(&disk, None, &mut reads));
+        let scan = collect_partitions(&header_of(&disk, 128, 128), reader(&disk, None, &mut reads));
         assert_eq!(scan.stop, None);
         let firsts: Vec<u64> = scan.entries.iter().map(|e| e.first_lba).collect();
         let expected: Vec<u64> = (0..128u64)
@@ -815,7 +1244,7 @@ mod tests
         // part of the array.
         let disk = entry_array(6, 256, |i| i == 4 || i == 5);
         let mut reads = Vec::new();
-        let scan = collect_partitions(&header(5, 256), reader(&disk, None, &mut reads));
+        let scan = collect_partitions(&header_of(&disk, 5, 256), reader(&disk, None, &mut reads));
         assert_eq!(scan.stop, None);
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].first_lba, 5000);
@@ -839,9 +1268,7 @@ mod tests
         // itself; one full sector at the last LBA, then no next LBA.
         let header = GptHeader {
             part_entry_lba: u64::MAX,
-            num_parts: 8,
-            entry_size: 128,
-            block_size: 512,
+            ..header(8, 128)
         };
         let mut reads = Vec::new();
         let scan = collect_partitions(&header, |lba, _| {
@@ -851,6 +1278,21 @@ mod tests
         assert_eq!(scan.stop, Some(ScanStop::ReadFailed { lba: u64::MAX }));
         assert_eq!(scan.entries, [] as [GptEntry; 0]);
         assert_eq!(reads, vec![u64::MAX]);
+    }
+
+    // Defect caught: an entry array corrupted after its CRC32 was written is
+    // walked as valid (UEFI 2.10 § 5.3.2).
+    #[test]
+    fn collect_reports_an_array_whose_crc_does_not_match()
+    {
+        let mut disk = entry_array(16, 128, |_| true);
+        let h = header_of(&disk, 16, 128);
+        disk[700] ^= 1;
+        let mut reads = Vec::new();
+        let scan = collect_partitions(&h, reader(&disk, None, &mut reads));
+        assert_eq!(scan.stop, Some(ScanStop::ChecksumMismatch));
+        assert!(!scan.verified());
+        assert_eq!(reads, vec![2, 3, 4, 5]);
     }
 
     #[test]
@@ -987,33 +1429,122 @@ mod tests
         );
     }
 
-    /// A 512-byte-block disk image holding a GPT header at LBA 1 and a
-    /// 128-entry array from LBA 2 with `parts` in its first slots, each
-    /// `(type GUID byte, first LBA, last LBA, DPS priority)`.
+    /// The blocks of a test disk: the primary header and array at LBAs 1 to
+    /// 33, the usable LBAs 34 to 1000, and the backup array and header at LBAs
+    /// 1001 to 1033.
+    const DISK_BLOCKS: u64 = 1034;
+
+    /// A 512-byte-block disk image holding both copies of a GPT whose
+    /// 128-entry array holds `parts` in its first slots, each `(type GUID
+    /// byte, first LBA, last LBA, DPS priority)`.
     fn disk_image(parts: &[(u8, u64, u64, u64)]) -> Vec<u8>
     {
-        let mut disk = vec![0u8; 512 * 34];
-        disk[512..1024].copy_from_slice(&header_sector(*b"EFI PART", 2, 128, 128));
+        let mut array = vec![0u8; 128 * 128];
         for (i, &(tg, first, last, priority)) in parts.iter().enumerate()
         {
-            let off = 1024 + i * 128;
-            disk[off..off + 128].copy_from_slice(&entry_bytes(tg, first, last, priority << 48));
+            array[i * 128..(i + 1) * 128].copy_from_slice(&entry_bytes(
+                tg,
+                first,
+                last,
+                priority << 48,
+            ));
+        }
+        let mut disk = vec![0u8; 512 * usize::try_from(DISK_BLOCKS).unwrap()];
+        for (header_lba, array_lba) in [(1u64, 2u64), (DISK_BLOCKS - 1, 1001)]
+        {
+            let mut h = header_sector(*b"EFI PART", array_lba, 128, 128);
+            h[24..32].copy_from_slice(&header_lba.to_le_bytes());
+            h[88..92].copy_from_slice(&crc32(&array).to_le_bytes());
+            seal(&mut h);
+            let at = |lba: u64| usize::try_from(lba).unwrap() * 512;
+            disk[at(header_lba)..at(header_lba) + 512].copy_from_slice(&h);
+            disk[at(array_lba)..at(array_lba) + array.len()].copy_from_slice(&array);
         }
         disk
     }
 
-    /// The used partitions of `disk`, read through the header parse and
-    /// array walk vfsd runs on each block device.
-    fn discover(disk: &[u8]) -> Vec<GptEntry>
+    /// [`read_gpt`] over `disk` in 512-byte blocks, failing the reads of
+    /// `failing`.
+    fn read_disk(disk: &[u8], failing: &[u64]) -> Result<DiskGpt, [GptFault; 2]>
     {
-        let header = parse_header(&disk[512..1024]).ok().expect("header");
-        let scan = collect_partitions(&header, |lba, buf| {
+        let blocks = (disk.len() / 512) as u64;
+        read_gpt(512, blocks, |lba, buf| {
             let off = usize::try_from(lba).unwrap() * buf.len();
+            if failing.contains(&lba) || off + buf.len() > disk.len()
+            {
+                return false;
+            }
             buf.copy_from_slice(&disk[off..off + buf.len()]);
             true
-        });
-        assert_eq!(scan.stop, None);
-        scan.entries
+        })
+    }
+
+    /// The used partitions of `disk`, read as vfsd reads each block device.
+    fn discover(disk: &[u8]) -> Vec<GptEntry>
+    {
+        let gpt = read_disk(disk, &[]).expect("GPT");
+        assert_eq!(gpt.copy, GptCopy::Primary);
+        assert_eq!(gpt.scan.stop, None);
+        gpt.scan.entries
+    }
+
+    #[test]
+    fn read_gpt_reads_an_intact_primary_alone()
+    {
+        let disk = disk_image(&[(0xE5, 34, 99, 0)]);
+        let gpt = read_disk(&disk, &[DISK_BLOCKS - 1]).expect("GPT");
+        assert_eq!(gpt.copy, GptCopy::Primary);
+        assert_eq!(gpt.primary_fault, None);
+        assert_eq!(gpt.scan.entries.len(), 1);
+    }
+
+    // Defect caught: a disk whose primary GPT is corrupt shows no partitions,
+    // or the corruption's, though its backup GPT is intact (UEFI 2.10
+    // § 5.3.2).
+    #[test]
+    fn read_gpt_falls_back_to_the_backup_when_the_primary_fails()
+    {
+        let parts = [(0xE5, 34, 99, 0), (0xDA, 100, 199, 0)];
+        let intact = discover(&disk_image(&parts));
+        let cases: [(usize, &[u64], GptFault); 4] = [
+            (512 + 80, &[], GptFault::Header(GptError::InvalidHeaderCrc)),
+            (1024 + 130, &[], GptFault::Array(ScanStop::ChecksumMismatch)),
+            (0, &[1], GptFault::Header(GptError::IoError)),
+            (0, &[3], GptFault::Array(ScanStop::ReadFailed { lba: 3 })),
+        ];
+        for (flip, failing, fault) in cases
+        {
+            let mut disk = disk_image(&parts);
+            if flip != 0
+            {
+                disk[flip] ^= 1;
+            }
+            let gpt = read_disk(&disk, failing).expect("backup GPT");
+            assert_eq!(gpt.copy, GptCopy::Backup);
+            assert_eq!(gpt.primary_fault, Some(fault));
+            assert_eq!(gpt.header.part_entry_lba, 1001);
+            assert_eq!(gpt.scan.entries, intact);
+        }
+    }
+
+    #[test]
+    fn read_gpt_reports_both_faults_when_neither_copy_verifies()
+    {
+        let mut disk = disk_image(&[(0xE5, 34, 99, 0)]);
+        disk[512 + 80] ^= 1;
+        disk[1001 * 512 + 3] ^= 1;
+        assert_eq!(
+            read_disk(&disk, &[]).err(),
+            Some([
+                GptFault::Header(GptError::InvalidHeaderCrc),
+                GptFault::Array(ScanStop::ChecksumMismatch),
+            ])
+        );
+        // A disk of no blocks has no last LBA to hold a backup.
+        assert_eq!(
+            read_gpt(512, 0, |_, _| false).err(),
+            Some([GptFault::Header(GptError::IoError), GptFault::NoBackup])
+        );
     }
 
     // Defect caught: a parser change that breaks its contract on an input
@@ -1041,6 +1572,54 @@ mod tests
         assert!(replayed > 0, "no checked-in input under {}", dir.display());
     }
 
+    // Defect caught: a read of a backup header at LBA 1 or 0 on a disk too
+    // short to hold one past the primary, which reads the primary or the
+    // protective MBR again as if it were the backup.
+    #[test]
+    fn read_gpt_takes_no_backup_on_a_two_block_disk()
+    {
+        let mut disk = disk_image(&[(0xE5, 34, 99, 0)]);
+        disk.truncate(2 * 512);
+        disk[512 + 16] ^= 1;
+        let mut reads = Vec::new();
+        let result = read_gpt(512, 2, |lba, buf| {
+            reads.push(lba);
+            let off = usize::try_from(lba).unwrap() * 512;
+            disk.get(off..off + 512)
+                .map(|b| buf.copy_from_slice(b))
+                .is_some()
+        });
+        assert_eq!(
+            result.err(),
+            Some([
+                GptFault::Header(GptError::InvalidHeaderCrc),
+                GptFault::NoBackup
+            ])
+        );
+        assert_eq!(reads, [1]);
+    }
+
+    // Defect caught: a seed that no longer reaches the path it was written
+    // for (a header CRC32 left stale by an edit of the seed, say), so the
+    // fuzz target starts from the refusals alone.
+    #[test]
+    fn the_512_byte_seeds_reach_the_primary_and_the_backup_gpt()
+    {
+        let seeds = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/gpt/seeds");
+        let primary = read_disk(&std::fs::read(seeds.join("disk-512")).unwrap(), &[]).expect("GPT");
+        assert_eq!(primary.copy, GptCopy::Primary);
+        assert!(primary.scan.verified());
+        let backup =
+            read_disk(&std::fs::read(seeds.join("disk-backup-512")).unwrap(), &[]).expect("GPT");
+        assert_eq!(backup.copy, GptCopy::Backup);
+        assert_eq!(
+            backup.primary_fault,
+            Some(GptFault::Header(GptError::InvalidHeaderCrc))
+        );
+        assert!(backup.scan.verified());
+        assert_eq!(backup.scan.entries.len(), 1);
+    }
+
     #[test]
     fn role_discovery_resolves_each_role_on_the_disk_that_holds_it()
     {
@@ -1062,35 +1641,51 @@ mod tests
 }
 
 /// Bounded proofs of the parsers' contract (docs/testing.md § Bounded
-/// verification, Parser proofs). The parsers check no CRC32
-/// ([`parse_header`]), so no proof computes one.
+/// verification, Parser proofs).
 ///
-/// The header and entry proofs run the property's checks of those structures
-/// ([`property::gpt_holds`]) on every input they are read from. The
-/// partition-array walk and the lookup loop over input of any length, so each
-/// is proven by induction: a base proof that the walk or the lookup starts in
-/// a state its invariant describes, and a step proof that one step from any
-/// state the invariant describes keeps it and does what the contract asks of
-/// that step. No step loops, so the two give the contract for a walk or a
-/// lookup of any length. What lies outside them is the loop that drives each
-/// step in [`collect_partitions`] and [`lookup_partition_by_type_guid`] (the
-/// block read when a slot's block comes up, the list it grows), which the
-/// fuzz target `gpt`, the replay of the checked-in inputs and the unit tests
-/// check.
+/// The entry proof runs the property's check of an entry on every input it
+/// is read from, and the header proof runs the property's check of a header
+/// on every block, for every CRC32 the header's bytes may have. Every other
+/// part of the parse loops over input of any length, so each is proven by
+/// induction: a base proof that it starts in a state its invariant describes,
+/// and a step proof that one step from any state the invariant describes
+/// keeps it and does what the contract asks of that step. No step loops past
+/// a bound its proof states, so these give the contract for input of any
+/// length:
+///
+/// - the CRC32 of the header and of the entry array is a fold of
+///   `crc32_update` over their bytes from `CRC32_INIT`, whose step proof
+///   shows it the GF(2)-linear map of the reflected polynomial that takes
+///   each byte into the register's low bits; the unit test
+///   `crc32_matches_the_ieee_check_value` pins that map to IEEE 802.3's;
+/// - the partition-array walk is a run of `ArrayWalk` steps from the state
+///   an accepted header starts;
+/// - the lookup is a run of `Pick::consider` steps from `Pick::default()`.
+///
+/// What lies outside them is the code that drives the steps: the folds that
+/// feed `crc32_update` (in `header_crc`, the header's bytes with its CRC
+/// field read as zero), the loop of [`collect_partitions`] (the block read
+/// when a slot's block comes up, the list it grows, the CRC32 compare at the
+/// end), the reads that feed them (`read_header` and `read_copy`, which
+/// [`read_gpt`] hands to `choose_copy`, the choice between the GPT's two
+/// copies, which its own harness proves), and the loop of [`lookup_partition_by_type_guid`]. The fuzz target `gpt`,
+/// the replay of the checked-in inputs and the unit tests check them.
 #[cfg(kani)]
 mod proofs
 {
     use super::{
-        ArrayWalk, GptLookupError, MAX_BLOCK_SIZE, PartitionLocation, Pick, ScanStop,
-        is_block_size, is_entry_size, parse_header, property,
+        ArrayWalk, CRC32_POLY, GptCopy, GptError, GptFault, GptLookupError, MAX_BLOCK_SIZE,
+        PartitionLocation, Pick, ScanStop, choose_copy, crc32_update, header_fields, is_block_size,
+        is_entry_size, property,
     };
 
     /// The header contract holds on the first `len` bytes of any
-    /// `MAX_BLOCK_SIZE`-byte block, for every `len` up to it: a block of each
-    /// supported size, the 4096-byte block of a 4Kn disk among them, and every
-    /// length the parser refuses. A longer block takes the refusal of any
-    /// unsupported length. The only loops are the compares of the 8-byte
-    /// signature, so an unwind bound of 9 covers them.
+    /// `MAX_BLOCK_SIZE`-byte block read at any LBA, for every `len` up to it
+    /// and every CRC32 its bytes may have: a block of each supported size, the
+    /// 4096-byte block of a 4Kn disk among them, and every length the parser
+    /// refuses. A longer block takes the refusal of any unsupported length.
+    /// The only loops are the compares of the 8-byte signature, so an unwind
+    /// bound of 9 covers them.
     #[kani::proof]
     #[kani::unwind(9)]
     fn every_block_holds_the_header_contract()
@@ -1098,7 +1693,115 @@ mod proofs
         let block: [u8; MAX_BLOCK_SIZE] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= MAX_BLOCK_SIZE);
-        property::header_holds(&block[..len]);
+        property::header_contract(&block[..len], kani::any(), kani::any());
+    }
+
+    /// The choice between a disk's two GPT copies, for a disk of any length
+    /// and either outcome of each copy's read: the primary at LBA 1 is read
+    /// first; the backup is read only when the primary fails, at the disk's
+    /// last LBA when that lies past LBA 1, and never otherwise; the result is
+    /// the copy read, named, with the primary's fault when it is the backup,
+    /// or both faults, the primary's first. `choose_copy` passes the faults
+    /// through without reading them, so two distinct ones stand for all. It
+    /// has no loop.
+    #[kani::proof]
+    fn the_backup_gpt_is_read_only_when_the_primary_fails()
+    {
+        let blocks: u64 = kani::any();
+        let primary_ok: bool = kani::any();
+        let backup_ok: bool = kani::any();
+        let primary_fault = GptFault::Header(GptError::InvalidHeaderCrc);
+        let backup_fault = GptFault::Array(ScanStop::ChecksumMismatch);
+        let mut reads: [Option<u64>; 2] = [None, None];
+        let result = choose_copy(blocks, |lba| match reads
+        {
+            [None, _] =>
+            {
+                reads[0] = Some(lba);
+                if primary_ok
+                {
+                    Ok(lba)
+                }
+                else
+                {
+                    Err(primary_fault)
+                }
+            }
+            [Some(_), None] =>
+            {
+                reads[1] = Some(lba);
+                if backup_ok
+                {
+                    Ok(lba)
+                }
+                else
+                {
+                    Err(backup_fault)
+                }
+            }
+            [Some(_), Some(_)] => panic!("a third copy was read"),
+        });
+        assert_eq!(reads[0], Some(1));
+        let has_backup = blocks > 2;
+        let expected = if primary_ok
+        {
+            assert_eq!(reads[1], None);
+            Ok((1, GptCopy::Primary, None))
+        }
+        else if !has_backup
+        {
+            assert_eq!(reads[1], None);
+            Err([primary_fault, GptFault::NoBackup])
+        }
+        else
+        {
+            assert_eq!(reads[1], Some(blocks - 1));
+            if backup_ok
+            {
+                Ok((blocks - 1, GptCopy::Backup, Some(primary_fault)))
+            }
+            else
+            {
+                Err([primary_fault, backup_fault])
+            }
+        };
+        assert_eq!(result, expected);
+    }
+
+    /// Step of the CRC32: for any registers `a` and `b` and any byte, the
+    /// update is linear over GF(2) (`update(a ^ b, 0)` is `update(a, 0) ^
+    /// update(b, 0)`), takes the byte as an XOR into the register's low bits
+    /// (`update(a, byte)` is `update(a ^ byte, 0)`), and shifts a register of
+    /// bit 0 alone through the polynomial eight times. Linearity and the
+    /// update of each one-bit register fix the update of every register. Its
+    /// loop runs 8 times, so an unwind bound of 9 covers it.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn each_crc32_step_is_the_polynomial_division()
+    {
+        let a: u32 = kani::any();
+        let b: u32 = kani::any();
+        let byte: u8 = kani::any();
+        assert_eq!(
+            crc32_update(a ^ b, 0),
+            crc32_update(a, 0) ^ crc32_update(b, 0)
+        );
+        assert_eq!(crc32_update(a, byte), crc32_update(a ^ u32::from(byte), 0));
+        let bit: u32 = kani::any();
+        kani::assume(bit < 32);
+        let mut expected = 1u32 << bit;
+        for _ in 0..8
+        {
+            expected = if expected & 1 == 1
+            {
+                (expected >> 1) ^ CRC32_POLY
+            }
+            else
+            {
+                expected >> 1
+            };
+        }
+        assert_eq!(crc32_update(1 << bit, 0), expected);
     }
 
     /// The entry contract holds on the first `len` bytes of any 128-byte
@@ -1127,9 +1830,10 @@ mod proofs
     }
 
     /// Base: every header the parser accepts, from any block of up to
-    /// `MAX_BLOCK_SIZE` bytes, starts a walk of its own array at its first
-    /// slot, in the invariant. The only loops are the compares of the 8-byte
-    /// signature, so an unwind bound of 9 covers them.
+    /// `MAX_BLOCK_SIZE` bytes read at any LBA with any CRC32, starts a walk of
+    /// its own array at its first slot, in the invariant. The only loops are
+    /// the compares of the 8-byte signature, so an unwind bound of 9 covers
+    /// them.
     #[kani::proof]
     #[kani::unwind(9)]
     fn an_accepted_header_starts_its_walk_in_the_invariant()
@@ -1137,7 +1841,7 @@ mod proofs
         let block: [u8; MAX_BLOCK_SIZE] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= MAX_BLOCK_SIZE);
-        let Ok(header) = parse_header(&block[..len])
+        let Ok(header) = header_fields(&block[..len], kani::any(), kani::any())
         else
         {
             return;

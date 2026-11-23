@@ -1992,9 +1992,11 @@ per edge and compare tracing) and, where the host target supports it, AddressSan
   compiled under `#[cfg(any(test, kani, fuzzing))]`, so no image carries it. It panics when the
   parser breaks its contract on the input, and asserts that contract, not only that the parser
   returns:
-  for the GPT parser (`services/vfsd/gpt`), that an accepted header's entry array lies between
-  LBA 2 and the first usable LBA, that the partition walk reads exactly the array's blocks inside
-  the disk, and that each decoded entry re-encodes to its own bytes.
+  for the GPT parser (`services/vfsd/gpt`), that an accepted header's CRC32 and `MyLBA` match
+  and its entry array lies outside the usable range, that the partition walk reads exactly the
+  array's blocks inside the disk and judges the array's CRC32 rightly, that a disk's partitions
+  come from the primary GPT or, when it fails, the backup, and that each decoded entry re-encodes
+  to its own bytes.
 - Its checked-in inputs, under `<crate>/fuzz/<target>/`: `seeds/`, inputs that reach the parser's
   paths, and `regressions/`, each failing input a fuzz run found, minimized, added by the PR that
   fixes it. A `#[cfg(test)]` test of the crate runs the property on every one, so
@@ -2078,13 +2080,14 @@ first `len` bytes of `kani::any::<[u8; N]>()`, `len` itself any value up to N, s
 for every input of at most N bytes, not only for the inputs a search reached; its comment states N
 and why inputs of that length cover the structure. Where a harness of the whole property does not
 complete within the gating job, the parser MUST write each loop over a structure of variable length
-(the walk of an array, a search over its entries) as a step over a small state, which two harnesses
-prove by induction: a base harness, that the loop starts in an invariant the harness states, and a
-step harness, that one step from any state in the invariant (`kani::any` under `kani::assume`) keeps
-it and does what the property asks of that step, with no loop to unwind. Code other than the loop
-that drives the steps MUST NOT lie outside the harnesses; the module's comment states how its
-harnesses compose into the property and names that loop, with the drivers that check it. The crate's
-first harness registers it with `cargo xtask kani`. Implemented for the GPT parser
+(the walk of an array, a search over its entries, a checksum over its bytes) as a step over a small
+state, which two harnesses prove by induction: a base harness, that the loop starts in an invariant
+the harness states, and a step harness, that one step from any state in the invariant (`kani::any`
+under `kani::assume`) keeps it and does what the property asks of that step, with no loop to
+unwind. Code other than the loops that drive the steps and the reads that feed them MUST NOT lie
+outside the harnesses; the module's comment states how its harnesses compose into the property and
+names those loops and reads, with the drivers that check them. The crate's first harness registers
+it with `cargo xtask kani`. Implemented for the GPT parser
 (`services/vfsd/gpt`); design intent, not yet implemented, for every other parser of hostile input,
 none of which holds a property function yet.
 

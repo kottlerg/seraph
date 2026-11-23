@@ -405,7 +405,7 @@ mod tests
     /// The used entries of the table whose header is at `lba`, read by vfsd's parser.
     fn vfsd_entries(disk: &[u8], block_size: u64, lba: u64) -> Vec<vfsd_gpt::GptEntry>
     {
-        let Ok(header) = vfsd_gpt::parse_header(block(disk, block_size, lba))
+        let Ok(header) = vfsd_gpt::parse_header(block(disk, block_size, lba), lba)
         else
         {
             panic!("vfsd-gpt refused the header at LBA {lba}");

@@ -931,7 +931,7 @@ mod tests
     fn read_partitions(path: &Path, block_size: BlockSize) -> Vec<(u64, Guid)>
     {
         let size = block_size.bytes();
-        let Ok(header) = vfsd_gpt::parse_header(&read_range(path, size, size))
+        let Ok(header) = vfsd_gpt::parse_header(&read_range(path, size, size), 1)
         else
         {
             panic!("vfsd-gpt refused the GPT header of {}", path.display());

@@ -146,14 +146,16 @@ or on-disk UUID. The model is:
   at instance ordinals 0, 1, …, passing a `WITHDRAWN` one (a disk whose
   driver devmgr withdrew when it died), until another reply is not
   `SUCCESS`, holds the whole-disk cap of every block driver devmgr
-  serves, and parses each disk's GPT. Before a runtime `MOUNT` and the
+  serves, and parses each disk's GPT: the primary, or, when the primary's header or entry array
+  fails its CRC32 or `MyLBA` check or cannot be read, the backup at the disk's last LBA, as
+  UEFI 2.10 § 5.3.2 directs; vfsd writes neither copy. Before a runtime `MOUNT` and the
   first `GET_SWAP_PARTITION` look their role up, vfsd queries again from
   the first ordinal not yet queried and holds each disk devmgr served
   since, a disk added or inserted again after startup among them. A role
   lookup, at the root self-mount, the auto-mounts, a runtime `MOUNT`,
   and the first `GET_SWAP_PARTITION`, so considers the partitions of
   every disk devmgr serves, under the priority and tie rules below; a
-  disk whose GPT cannot be read or validated contributes none. The
+  disk neither of whose GPT copies can be read and validated contributes none. The
   partition's `REGISTER_PARTITION` goes
   to the block driver of the disk that holds it.
 - **DPS-style priority tie-break.** Where multiple partitions match

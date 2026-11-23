@@ -13,6 +13,8 @@ xtask/
 ├── README.md
 ├── baselines/
 │   └── ktest-timing/           # Checked-in ktest timing baselines (see ktest-timing)
+├── fuzz/                       # The fuzzing engine (engine/) and the fuzz targets (targets/);
+│                               #   see Sub-crates and § `cargo xtask fuzz`
 ├── src/
 │   ├── main.rs                 # Entry point; dispatches CliCommand
 │   ├── cli.rs                  # The command table: every command's arguments
@@ -57,9 +59,9 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # Subcommand modules (build, capture_acpi, run (the
 │   │   │                       #   interactive boot; run/classified.rs, --runs),
-│   │   │                       #   ktest_timing, symbolize, mkdisk, clean, crypto_vectors,
-│   │   │                       #   compare_images, lint_docs, pr_check, review, release_scope,
-│   │   │                       #   issue, orch, hook, host, trust_request)
+│   │   │                       #   ktest_timing, symbolize, mkdisk, clean, crypto_vectors, fuzz,
+│   │   │                       #   kani, compare_images, lint_docs, pr_check, review,
+│   │   │                       #   release_scope, issue, orch, hook, host, trust_request)
 │   │   └── test/               # `test`: the unit tests, the cases, the cells
 │   │       ├── mod.rs          # Dispatch: the unit tests, a case, a cell
 │   │       ├── cases.rs        # The case registry; the runners of a case and of a cell
@@ -1401,6 +1403,101 @@ their `--wait-host` and `--host-override` options.
 
 ---
 
+### `cargo xtask fuzz`
+
+Build the fuzz targets with coverage instrumentation and run them under the in-tree engine
+([docs/testing.md](../docs/testing.md#fuzzing) § Fuzzing gives the tier, its layout and its rules).
+
+```
+cargo xtask fuzz <TARGET>|--all [--runs N | --time SECS] [--seed S]
+cargo xtask fuzz <TARGET> --replay FILE
+cargo xtask fuzz <TARGET>|--all --minimize
+cargo xtask fuzz --list
+cargo xtask fuzz --self-test
+```
+
+| Option | Effect |
+|---|---|
+| `<TARGET>` | The target to run: a binary of `fuzz/targets/src/bin/` |
+| `--all` | Every target in turn, each whatever another's outcome; fails naming those that found a failing input |
+| `--runs N` | Stop after N executions (default 200,000, the gating CI job's count) |
+| `--time SECS` | Stop after SECS seconds instead |
+| `--seed S` | The seed of the engine's random choices (default 0) |
+| `--replay FILE` | Run the property once on FILE: 0 when it holds, non-zero when it fails |
+| `--minimize` | Reduce the target's working corpus to a subset of its inputs with the same coverage, the shorter inputs kept first |
+| `--list` | Print the targets' names, building nothing |
+| `--self-test` | Check the engine on its planted defects (below) |
+
+The command builds `fuzz-targets` for the host target in the `fuzz` profile
+([docs/build-system.md](../docs/build-system.md#build-profiles)) with `--cfg fuzzing`, the
+SanitizerCoverage flags (inline 8-bit edge counters, their PC table, and compare tracing) and,
+where the host target's specification lists it, AddressSanitizer, all in `RUSTFLAGS`, so a change
+to them rebuilds every unit. The wrapper shim, installed as `target/xtask/fuzz-shim/sancov-rustc`
+and passed as `RUSTC_WORKSPACE_WRAPPER`, drops the coverage flags from the engine's own units,
+whose functions are the callbacks the instrumentation calls. A build made any other way leaves
+`fuzzing` unset, and each target then exits at once with status 2.
+
+Each target's working directory is `target/xtask/fuzz/<target>/`: `corpus/`, the inputs a run
+found novel, which the next run starts from after the checked-in inputs; and `crashes/`, each
+failing input, minimized, beside its `.txt` report. A target binary runs the search in a child
+of itself and catches the endings no panic catch can: a signal, an AddressSanitizer report (exit
+73), the allocation cap of 2 GiB (exit 72), and an input that runs past 10 seconds (exit 71); it
+reports each, and minimizes all but a timeout by replaying candidates in fresh processes.
+
+`--self-test` runs the planted targets `planted-magic`, `planted-length` and `planted-nested`
+from clean working directories, each from seed 0 within its budget in `src/commands/fuzz.rs`
+(`PLANTED`), twice, and fails unless both runs find the planted panic, at its own source line,
+at the same execution, with the same minimized input. `--list` and `--all` leave them out.
+
+The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--list`
+aside, and takes their `--wait-host` and `--host-override` options.
+
+---
+
+### `cargo xtask kani`
+
+Run the bounded proofs ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded
+verification) with the pinned Kani release.
+
+```
+cargo xtask kani [--component <CRATE> [--harness <NAME>]]
+cargo xtask kani --pin
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--component <CRATE>` | every registered crate | Verify the harnesses of this crate only, by its package name |
+| `--harness <NAME>` | every harness | Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`); needs `--component` |
+| `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
+
+The command first checks that every tracked Rust source declaring a `#[kani::proof]` lies in a
+crate `HARNESSED` in `src/commands/kani.rs` registers, the crate being the nearest directory
+above the file that holds a `Cargo.toml`, and fails naming each file that does not: a crate's
+first harness registers it. It then checks that `cargo kani --version` names `KANI_VERSION`, and
+fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
+§ Toolchain) on another release or none.
+
+For each selected crate it runs `cargo kani --tests -p <package>` (with `--harness` when given),
+which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies
+each harness with Kani's unwinding assertions on. It prints Kani's output as it comes and judges
+it as well as Kani's verdict: the crate fails when `cargo kani` exits unsuccessfully, when a
+harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED` check or a
+`FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's verdict
+names), and when Kani's closing summary is missing, counts a failure or no harness, or counts
+other harnesses than reported a verdict. Every selected crate runs, and the command fails naming
+each that failed. CI's `kani` job runs the command with no option, after installing the release
+`--pin` prints ([docs/build-system.md](../docs/build-system.md#continuous-integration)
+§ Continuous Integration).
+
+No assistant session runs Kani: `cargo install` is outside the permissions
+`.claude/settings.json` grants, and the `bash` hook refuses `cargo kani`
+([§ `cargo xtask hook`](#cargo-xtask-hook)).
+
+The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`
+aside, and takes their `--wait-host` and `--host-override` options.
+
+---
+
 ### `cargo xtask compare-images`
 
 Build two commits for each architecture and profile, and compare every file the build installs in
@@ -2119,12 +2216,13 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 ## Host launch rules
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
-themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypto-vectors`,
-`compare-images` and `test` without a case or a cell (the unit tests) as builds
-(`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`, and `test` with a case
-or a cell as boots, each boot admitted as above (the `shutdown` case admits once for its boots,
-which it runs one at a time). The `signing` case, which compiles its revoking and role-scoped
-bootloaders before it boots, is admitted as a build for each compile and then each boot as a boot.
+themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypto-vectors`, `fuzz`
+(but `--list`), `kani` (but `--pin`), `compare-images` and `test` without a case or a cell (the unit
+tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`, and
+`test` with a case or a cell as boots, each boot admitted as above (the `shutdown` case admits once
+for its boots, which it runs one at a time). The `signing` case, which compiles its revoking and
+role-scoped bootloaders before it boots, is admitted as a build for each compile and then each boot
+as a boot.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
@@ -2248,7 +2346,7 @@ error prints no `tip:` lines. An argument that is not valid UTF-8 is refused wit
 `InvalidUtf8` error wherever it stands, a path value among them, which clap passed on as its
 bytes.
 
-`src/argparse/reference/` holds the evidence: every help screen of the table (91), and 7374 command
+`src/argparse/reference/` holds the evidence: every help screen of the table (93), and 7229 command
 lines with their outcome (the command and the values parsed, or the error's kind and message),
 recorded from clap 4.6 before the parser replaced it. `cargo xtask test` parses each command line
 and prints each screen through the table, and fails on any difference. A change to the table that
@@ -2263,7 +2361,9 @@ command line, for the review to read.
 
 | Sub-crate | Purpose |
 |---|---|
-| [wrapper-shim/](wrapper-shim/README.md) | Tiny native binary installed into the seraph toolchain mirror as both `rustc` and `ws-clippy`. Dispatches by argv[0] basename to exec the real rustc / clippy-driver with overlay-aware `--sysroot` flags. Built by `cargo xtask build` as part of StdUser builds; never invoked directly. |
+| `fuzz/engine/` (`fuzz-engine`) | The coverage-guided fuzzing engine: the SanitizerCoverage callbacks, the queue, the mutator, the minimizer, the supervisor and the reports. A host library the fuzz targets link; built without coverage instrumentation. Its unit tests run under `cargo xtask test`. See § `cargo xtask fuzz`. |
+| `fuzz/targets/` (`fuzz-targets`) | One binary per fuzz target, each handing a parser crate's property function to the engine, and the self-test's planted targets. Built only by `cargo xtask fuzz`. |
+| [wrapper-shim/](wrapper-shim/README.md) | Tiny native binary installed into the seraph toolchain mirror as both `rustc` and `ws-clippy`, and for `cargo xtask fuzz` as `sancov-rustc`. Dispatches by argv[0] basename to exec the real rustc / clippy-driver with overlay-aware `--sysroot` flags, or the real rustc without the coverage flags for the fuzzing engine's units. Built by `cargo xtask build` as part of StdUser builds, and by `cargo xtask fuzz`; never invoked directly. |
 
 ---
 
@@ -2275,7 +2375,7 @@ command line, for the review to read.
 | [docs/memory-model.md](../docs/memory-model.md) | Randomized kernel layout the `kaslr` case checks; RISC-V paging-mode ceiling behind `--riscv-mmu`; x86-64 paging depth behind `--x86-paging` |
 | [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) | PIE image placement and the per-spawn ASLR bias used with `--gdb` and `symbolize --bias` |
 | [docs/storage.md](../docs/storage.md) | GPT role-GUID discovery of the data partition the disk image carries |
-| [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the `test` cases run; the Coverage tiers surface list `lint-docs` checks; the Troubleshooting guide `symbolize` serves |
+| [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the `test` cases run; the Coverage tiers surface list `lint-docs` checks; the Troubleshooting guide `symbolize` serves; the fuzzing tier `fuzz` runs |
 | [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md) | The debug port `--debug-port` attaches and the `debug-port` case drives |
 | [services/gdbstub/README.md](../services/gdbstub/README.md) | The GDB stub `--debug-target` stages and the `debug-port` case's GDB stub boot drives |
 | [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md) | The PCI Express hotplug the `hotplug` case drives, native and through acpid |

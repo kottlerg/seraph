@@ -313,6 +313,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzz-engine"
+version = "0.1.5"
+
+[[package]]
+name = "fuzz-targets"
+version = "0.1.5"
+dependencies = [
+ "fuzz-engine",
+ "vfsd-gpt",
+]
+
+[[package]]
 name = "gdb-rsp"
 version = "0.1.5"
 

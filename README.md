@@ -62,15 +62,17 @@ cargo xtask run                              # launch existing sysroot under QEM
 cargo xtask run --gdb                        # pause at start; GDB on :1234
 cargo xtask run --runs 1 --timeout 300       # one unattended boot, judged by its log
 cargo xtask test                             # fmt, test lints, host and riscv64 unit tests
+cargo xtask kani                             # bounded proofs (Kani) of pure, sequential code
 cargo xtask lint-docs                        # check docs and source-header rules
 cargo xtask clean [--all]                    # remove sysroot/, symbols, disk images (+target/)
 ```
 
-Testing spans host-side `cargo xtask test`, in-tree QEMU harnesses
-(`ktest`, `svctest`, `usertest`), host-driven boot test cases (`cargo xtask test <CASE>`:
-`terminal`, `wedge`, `cet`, `vmgenid`, `tpm`, `kaslr`, `shutdown`, `debug-port`, `signing`,
-`hotplug`), and the host-side check of a boot's serial log (`run --crash-reports`); the default boot
-is interactive and runs no harness. See [docs/testing.md](docs/testing.md) for the full model.
+Testing spans host-side `cargo xtask test`, bounded proofs of pure, sequential code (`cargo xtask
+kani`), in-tree QEMU harnesses (`ktest`, `svctest`, `usertest`), host-driven boot test cases (`cargo
+xtask test <CASE>`: `terminal`, `wedge`, `cet`, `vmgenid`, `tpm`, `kaslr`, `shutdown`, `debug-port`,
+`signing`, `hotplug`), and the host-side check of a boot's serial log (`run --crash-reports`); the
+default boot is interactive and runs no harness. See [docs/testing.md](docs/testing.md) for the full
+model.
 
 ---
 

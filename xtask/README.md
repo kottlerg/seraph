@@ -1809,8 +1809,9 @@ cargo xtask path-account write
 | `--timeout` | `3600` | Seconds the whole boot may take |
 | `--reuse` | off | Account the boot log and the record the configuration's last trace left, without booting, against the same images |
 
-The host options are `run`'s ([Host launch rules](#host-launch-rules)); a trace is a boot of one
-vCPU. `trace` accounts the harness the disk image records: ktest's bench-only image, or the init
+The host options are `run`'s ([Host launch rules](#host-launch-rules)); a trace is a build of the
+plugin and then a boot of one vCPU, each admitted by those rules, and `--reuse` is neither.
+`trace` accounts the harness the disk image records: ktest's bench-only image, or the init
 image with ubench staged as a service, as the benchmark cell boots it. One configuration of
 ktest is regenerated with:
 
@@ -2555,13 +2556,14 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypto-vectors`, `fuzz`
 (but `--list`), `kani` (but `--pin`), `compare-images` and `test` without a case or a cell (the unit
-tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`, and
-`test` with a case or a cell as boots, each boot admitted as above (the `shutdown` case admits once
-for its boots, which it runs one at a time). The `signing` case, which compiles its revoking and
-role-scoped bootloaders before it boots, is admitted as a build for each compile and then each boot
-as a boot. A cell's lanes (`test --cell T --lanes N`) start up to N cases side by side, each
-admitting its own boots, so each is a small boot counted with the others, and `--wait-host` lets a
-lane's boot wait for another lane's to end rather than fail.
+tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`,
+`path-account trace` (but `--reuse`), and `test` with a case or a cell as boots, each boot admitted
+as above (the `shutdown` case admits once for its boots, which it runs one at a time). The
+`signing` case, which compiles its revoking and role-scoped bootloaders before it boots, and
+`path-account trace`, which compiles its plugin, are admitted as a build for each compile and then
+each boot as a boot. A cell's lanes (`test --cell T --lanes N`) start up to N cases side by side,
+each admitting its own boots, so each is a small boot counted with the others, and `--wait-host`
+lets a lane's boot wait for another lane's to end rather than fail.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

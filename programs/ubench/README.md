@@ -17,7 +17,7 @@ that it adds no output of its own to the framebuffer `console_write` measures; l
 the log lines still draws through the same driver:
 
 ```sh
-cargo xtask build --arch x86_64
+cargo xtask build --arch x86_64 --release
 cp sysroot/config/svcmgr/tests/ubench.svc sysroot/config/svcmgr/services/
 rm -f sysroot/config/svcmgr/services/terminal.svc
 cargo xtask mkdisk --arch x86_64 --repack-only
@@ -25,10 +25,12 @@ cargo xtask run --arch x86_64 --icount --cpus 1 --display framebuffer --runs 1 -
     --save-logs target/xtask/bench/ubench
 ```
 
-`--icount` gives the counts the `bench` cell compares; without it the counts are time on the
-host. A boot without `--display framebuffer` has no framebuffer, and `console_write` logs a SKIP
-line. The recipe seeds `devmgr.class.framebuffer`, the class `console_write` writes through, and
-`pwrmgr.shutdown`, through which ubench powers the system off once it logged its pass marker.
+`--icount` on the release build gives the counts the `bench` cell compares, since the cell builds
+the release profile ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell));
+without `--icount` the counts are time on the host. A boot without `--display framebuffer` has no
+framebuffer, and `console_write` logs a SKIP line. The recipe seeds `devmgr.class.framebuffer`, the
+class `console_write` writes through, and `pwrmgr.shutdown`, through which ubench powers the system
+off once it logged its pass marker.
 
 ---
 

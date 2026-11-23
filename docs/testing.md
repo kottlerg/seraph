@@ -2146,11 +2146,11 @@ request, and the merge waits on it ([build-system.md](build-system.md#continuous
 **Local sizing.** A harness is sized on the development host before CI runs it. The author of a
 change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
 with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries
-it, every process of the run limited to an address space of 16 GB, the memory of CI's `kani`
-runner ([GitHub's standard Linux runner for a public
-repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)). On a
-Linux host, `prlimit --as=16000000000 cargo xtask kani ...` sets that limit where the command
-does not set it itself. A run that the limit ends (an allocation failure, or a process killed)
+it, under the limit the command sets on every process of the run: 12 GiB of address space, the share
+of the 16 GB of CI's `kani` runner ([GitHub's standard Linux runner for a public
+repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)) that
+leaves 4 GB to the runner's own processes, so a harness that fits under it locally fits on the
+runner. A run that the limit ends (an allocation failure, or a process killed)
 or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
 still cover the property or by the induction form of the parser proofs below. A failed,
 undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code

@@ -1545,7 +1545,7 @@ The development host carries the pinned release, which the maintainer installs, 
 session runs `cargo xtask kani` there. A session installs nothing (`cargo install` is outside the
 permissions `.claude/settings.json` grants) and does not run `cargo kani` itself, which the
 `bash` hook refuses ([§ `cargo xtask hook`](#cargo-xtask-hook)). A new or changed harness is
-sized there, under the memory of CI's runner, before CI runs it
+sized there, under the limit the command sets, before CI runs it
 ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification).
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`

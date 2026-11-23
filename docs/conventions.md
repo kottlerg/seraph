@@ -523,7 +523,7 @@ gives the PR-level linear view.
 
 - Pull request required before merging.
 - Required status checks (not strict: a branch need not be up to date with
-  `master`, § Syncing with `master`): `host-tests`,
+  `master`, § Syncing with `master`): `host-tests`, `fuzz`,
   `validate (x86_64, debug, ktest)`, `validate (x86_64, debug, svctest)`,
   `validate (x86_64, debug, usertest)`, `validate (x86_64, release, ktest)`,
   `validate (x86_64, release, svctest)`, `validate (x86_64, release, usertest)`,

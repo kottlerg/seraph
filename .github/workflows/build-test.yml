@@ -72,6 +72,44 @@ jobs:
       - name: cargo xtask test
         run: cargo xtask test
 
+  # The gating fuzz tier (docs/testing.md § Fuzzing): the engine's self-test,
+  # then every target for the default execution count from seed 0, from the
+  # checked-in inputs alone, so a run is reproduced by the same command.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-10
+          components: rust-src,rustfmt,clippy,llvm-tools
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz
+
+      # A working corpus a cache restored would change what the fixed-seed
+      # run executes.
+      - name: Clear the fuzz working directories
+        run: rm -rf target/xtask/fuzz
+
+      - name: cargo xtask fuzz --self-test
+        run: cargo xtask fuzz --self-test
+
+      - name: cargo xtask fuzz --all
+        run: cargo xtask fuzz --all
+
+      - name: Upload the failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashes
+          path: target/xtask/fuzz/*/crashes/
+          if-no-files-found: ignore
+
   qemu-debs:
     uses: ./.github/workflows/qemu-debs.yml
 

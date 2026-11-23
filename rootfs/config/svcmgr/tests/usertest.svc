@@ -1,8 +1,14 @@
 # /tests/usertest — programs-surface test orchestrator.
 #
 # One-shot: exits cleanly on completion; svcmgr never restarts it. The
-# orchestrator walks /tests/programs/, spawns each per-program tester
-# sequentially, then powers off via the pwrmgr.shutdown seed.
+# orchestrator compares /tests/programs/ with TESTERS, the testers the image
+# holds, failing for each one named and absent or present and unnamed; spawns
+# each named one present, sequentially, killing one still running after
+# TESTER_BOUND_MS; then powers off via the pwrmgr.shutdown seed. A new tester
+# is added to TESTERS. The bound is 2.6 times the slowest tester's worst pass
+# (pipestress, 46 s on riscv64 debug), and below every usertest CI cell's
+# budget less that cell's worst pass, so a hung tester's FAIL line and the
+# testers after it reach the log (services/usertest/README.md § Testers).
 #
 # The later seeds are authorities testers take: TESTER_SEEDS names, per
 # tester, the seed slots usertest hands it as its bootstrap caps (slot 0,
@@ -22,5 +28,5 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-env       = TESTER_SEEDS=hello:1;crashme:2
+env       = TESTERS=crashme;deadline;debugger;hello;pipestress;shell;stdiotest;threadchurn;threadstack TESTER_BOUND_MS=120000 TESTER_SEEDS=hello:1;crashme:2
 seed      = pwrmgr.shutdown pwrmgr.deny crashd.core

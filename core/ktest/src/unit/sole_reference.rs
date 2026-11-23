@@ -19,7 +19,7 @@ use syscall::{
     RIGHTS_ALL, RIGHTS_EQ_RECV, cap_bind_sole_reference, cap_copy, cap_create_cspace,
     cap_create_notification, cap_delete, cap_derive, cap_info, cap_move,
     event_queue_create_observed, event_recv_entry, system_info, thread_exit, thread_set_affinity,
-    thread_sleep,
+    thread_sleep, thread_yield,
 };
 use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, SyscallError, SystemInfoType};
 
@@ -416,10 +416,38 @@ pub fn leftover_posts_reach_a_busy_cpu(ctx: &TestContext) -> TestResult
     result
 }
 
+/// Yield until the case's thread runs on [`BUSY_CASE_CPU`]: a thread that
+/// pins itself moves at its next pass through the scheduler, and the cycle
+/// counts the case compares must all come from that CPU.
+fn reach_case_cpu() -> TestResult
+{
+    /// Yields that give the scheduler the chance to move the thread; the
+    /// bound only ends the wait of a thread that never moves.
+    const MAX_YIELDS: u32 = 1000;
+    let on_cpu = || system_info(SystemInfoType::CurrentCpu as u64) == Ok(u64::from(BUSY_CASE_CPU));
+    for _ in 0..MAX_YIELDS
+    {
+        if on_cpu()
+        {
+            return Ok(());
+        }
+        let _ = thread_yield();
+    }
+    if on_cpu()
+    {
+        Ok(())
+    }
+    else
+    {
+        Err("busy_cpu: the thread did not move to its pinned CPU")
+    }
+}
+
 /// Body of [`leftover_posts_reach_a_busy_cpu`], with its thread pinned to
 /// [`BUSY_CASE_CPU`].
 fn busy_window(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> TestResult
 {
+    reach_case_cpu()?;
     let object = cap_create_notification(ctx.memory_base).map_err(|_| "busy_cpu: create failed")?;
     let mut children: [Option<crate::spawn::SpawnedChild>; BUSY_SPINNERS] =
         core::array::from_fn(|_| None);

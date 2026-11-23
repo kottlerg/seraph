@@ -81,7 +81,7 @@ fn le32(bytes: &[u8], at: usize) -> Option<u32>
 /// `InvalidSignature`; a header it accepts holds the block's own fields, an
 /// entry size that tiles the block, and an entry array from LBA 2 or later
 /// that ends by the first usable LBA.
-fn header_holds(block: &[u8])
+pub(crate) fn header_holds(block: &[u8])
 {
     let result = parse_header(block);
     let supported = is_block_size(block.len());
@@ -283,7 +283,7 @@ fn lookup_holds(entries: &[GptEntry])
 /// [`parse_entry`] decodes an entry that re-encodes to its own 56 bytes, and
 /// refuses one only when it is short, unused (zero type GUID), or has an
 /// inverted or whole-`u64` range.
-fn entry_holds(raw: &[u8])
+pub(crate) fn entry_holds(raw: &[u8])
 {
     let Some(bytes) = raw.get(..ENTRY_LEN)
     else

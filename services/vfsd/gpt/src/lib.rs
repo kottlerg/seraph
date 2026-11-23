@@ -236,17 +236,113 @@ pub struct PartitionScan
     pub stop: Option<ScanStop>,
 }
 
+/// One slot of a partition-entry array: the block that holds it and where
+/// its entry lies in that block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EntrySlot
+{
+    /// The LBA of the block that holds the slot.
+    lba: u64,
+    /// The slot's first byte in that block.
+    offset: usize,
+    /// The slot's length, the header's entry size.
+    len: usize,
+}
+
+impl EntrySlot
+{
+    /// The used entry this slot holds in `block`, the block at its LBA, as
+    /// [`parse_entry`] decodes it; `None` for an unused or malformed entry,
+    /// or a block too short to hold the slot.
+    fn entry(&self, block: &[u8]) -> Option<GptEntry>
+    {
+        block
+            .get(self.offset..self.offset.checked_add(self.len)?)
+            .and_then(parse_entry)
+    }
+}
+
+/// A walk over the slots of the partition-entry array a header describes,
+/// one slot a step, in order from the array's first. Slot `i` lies `i *
+/// entry_size` bytes into the array, which starts at the header's
+/// `part_entry_lba`; the entry size divides the block, so no slot crosses a
+/// block. The walk yields every one of the header's `num_parts` slots, then
+/// ends; a slot whose LBA does not fit a `u64` ends it with
+/// [`ScanStop::ReadFailed`] at `u64::MAX`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArrayWalk
+{
+    /// The LBA of the array's first block.
+    first_lba: u64,
+    /// The block size, one [`is_block_size`] accepts.
+    block_size: u32,
+    /// The entry size: `128 * 2^n`, no larger than the block.
+    entry_size: u32,
+    /// The slots the header declares.
+    num_parts: u32,
+    /// The slot the next step yields; `num_parts` once the walk has ended.
+    next: u32,
+}
+
+impl ArrayWalk
+{
+    /// The walk of `header`'s array from its first slot, or `None` when its
+    /// block size or entry size is one [`parse_header`] refuses.
+    fn new(header: &GptHeader) -> Option<Self>
+    {
+        let sizes = is_block_size(header.block_size as usize)
+            && is_entry_size(header.entry_size, header.block_size);
+        sizes.then_some(Self {
+            first_lba: header.part_entry_lba,
+            block_size: header.block_size,
+            entry_size: header.entry_size,
+            num_parts: header.num_parts,
+            next: 0,
+        })
+    }
+}
+
+impl Iterator for ArrayWalk
+{
+    type Item = Result<EntrySlot, ScanStop>;
+
+    fn next(&mut self) -> Option<Self::Item>
+    {
+        if self.next >= self.num_parts
+        {
+            return None;
+        }
+        let per_block = self.block_size.checked_div(self.entry_size)?;
+        let block = self.next.checked_div(per_block)?;
+        let within = self.next.checked_rem(per_block)?;
+        let offset = (within as usize).checked_mul(self.entry_size as usize)?;
+        let Some(lba) = self.first_lba.checked_add(u64::from(block))
+        else
+        {
+            self.next = self.num_parts;
+            return Some(Err(ScanStop::ReadFailed { lba: u64::MAX }));
+        };
+        self.next = self.next.saturating_add(1);
+        Some(Ok(EntrySlot {
+            lba,
+            offset,
+            len: self.entry_size as usize,
+        }))
+    }
+}
+
 /// Walk the partition-entry array `header` describes and collect every used
 /// entry, however many the header declares.
 ///
 /// `read_block(lba, buf)` fills `buf`, `header.block_size` bytes long, with
-/// the logical block at `lba` and returns whether the read succeeded; the
-/// walk reads the array's blocks in order starting at
-/// `header.part_entry_lba`, tiling each with `block_size / entry_size`
-/// entries, and checks exactly `num_parts` entries. The list grows on the
-/// heap, one element per used entry, so its size follows the disk, not a
-/// fixed table. A header whose block size or entry size [`parse_header`]
-/// would refuse yields an empty scan stopped at its first LBA.
+/// the logical block at `lba` and returns whether the read succeeded. The
+/// walk takes the array's slots in order (`ArrayWalk`), reading each block
+/// once, when its first slot comes up, so it reads the array's blocks in order
+/// from `header.part_entry_lba` and checks exactly `num_parts` entries. The
+/// list grows on the heap, one element per used entry, so its size follows
+/// the disk, not a fixed table. A header whose block size or entry size
+/// [`parse_header`] would refuse yields an empty scan stopped at its first
+/// LBA.
 pub fn collect_partitions(
     header: &GptHeader,
     mut read_block: impl FnMut(u64, &mut [u8]) -> bool,
@@ -254,12 +350,9 @@ pub fn collect_partitions(
 {
     let mut entries = Vec::new();
     let mut block = [0u8; MAX_BLOCK_SIZE];
-    let block_size = header.block_size as usize;
-    let entry_size = header.entry_size as usize;
-    let block_buf = block.get_mut(..block_size).filter(|_| {
-        is_block_size(block_size) && is_entry_size(header.entry_size, header.block_size)
-    });
-    let Some(block_buf) = block_buf
+    let walk = ArrayWalk::new(header);
+    let block_buf = block.get_mut(..header.block_size as usize);
+    let (Some(walk), Some(block_buf)) = (walk, block_buf)
     else
     {
         return PartitionScan {
@@ -269,48 +362,43 @@ pub fn collect_partitions(
             }),
         };
     };
-    // `entry_size` divides the block, so the block's `entry_size`-byte chunks
-    // are its entries at their true offsets.
-    let entries_per_block = block_buf.chunks_exact(entry_size).len();
-    let mut remaining = header.num_parts as usize;
-    let mut lba = header.part_entry_lba;
-    while remaining > 0
+    // The LBA of the block `block_buf` holds.
+    let mut loaded = None;
+    for slot in walk
     {
-        if !read_block(lba, block_buf)
+        let slot = match slot
         {
-            return PartitionScan {
-                entries,
-                stop: Some(ScanStop::ReadFailed { lba }),
-            };
-        }
-        for raw in block_buf.chunks_exact(entry_size).take(remaining)
-        {
-            if let Some(entry) = parse_entry(raw)
+            Ok(slot) => slot,
+            Err(stop) =>
             {
-                if entries.try_reserve(1).is_err()
-                {
-                    return PartitionScan {
-                        entries,
-                        stop: Some(ScanStop::OutOfMemory),
-                    };
-                }
-                entries.push(entry);
+                return PartitionScan {
+                    entries,
+                    stop: Some(stop),
+                };
             }
-        }
-        remaining = remaining.saturating_sub(entries_per_block);
-        if remaining == 0
-        {
-            break;
-        }
-        let Some(next) = lba.checked_add(1)
-        else
-        {
-            return PartitionScan {
-                entries,
-                stop: Some(ScanStop::ReadFailed { lba: u64::MAX }),
-            };
         };
-        lba = next;
+        if loaded != Some(slot.lba)
+        {
+            if !read_block(slot.lba, block_buf)
+            {
+                return PartitionScan {
+                    entries,
+                    stop: Some(ScanStop::ReadFailed { lba: slot.lba }),
+                };
+            }
+            loaded = Some(slot.lba);
+        }
+        if let Some(entry) = slot.entry(block_buf)
+        {
+            if entries.try_reserve(1).is_err()
+            {
+                return PartitionScan {
+                    entries,
+                    stop: Some(ScanStop::OutOfMemory),
+                };
+            }
+            entries.push(entry);
+        }
     }
     PartitionScan {
         entries,
@@ -362,41 +450,65 @@ pub fn lookup_partition_by_type_guid<'a>(
     disks: impl IntoIterator<Item = &'a [GptEntry]>,
 ) -> Result<PartitionLocation, GptLookupError>
 {
-    let mut best: Option<(PartitionLocation, u16)> = None;
-    let mut tied = false;
+    let mut pick = Pick::default();
     for (disk, parts) in disks.into_iter().enumerate()
     {
         for p in parts.iter().filter(|p| &p.type_guid == type_guid)
         {
             let priority = ((p.attributes >> 48) & 0xFFFF) as u16;
-            let location = PartitionLocation {
-                disk,
-                first_lba: p.first_lba,
-                length_lba: p.length_lba,
-            };
-            match best
-            {
-                None => best = Some((location, priority)),
-                Some((_, b)) if priority > b =>
-                {
-                    best = Some((location, priority));
-                    tied = false;
-                }
-                Some((_, b)) if priority == b =>
-                {
-                    tied = true;
-                }
-                _ =>
-                {}
-            }
+            pick.consider(
+                PartitionLocation {
+                    disk,
+                    first_lba: p.first_lba,
+                    length_lba: p.length_lba,
+                },
+                priority,
+            );
         }
     }
-    if tied
+    pick.result()
+}
+
+/// What [`lookup_partition_by_type_guid`] has found among the matches it has
+/// considered: the first of the highest priority, and whether another shares
+/// that priority.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Pick
+{
+    best: Option<(PartitionLocation, u16)>,
+    tied: bool,
+}
+
+impl Pick
+{
+    /// Take one more match, at `location` with `priority`, into account.
+    fn consider(&mut self, location: PartitionLocation, priority: u16)
     {
-        return Err(GptLookupError::DuplicateTie);
+        match self.best
+        {
+            None => self.best = Some((location, priority)),
+            Some((_, best)) if priority > best =>
+            {
+                self.best = Some((location, priority));
+                self.tied = false;
+            }
+            Some((_, best)) if priority == best => self.tied = true,
+            Some(_) =>
+            {}
+        }
     }
-    best.map(|(location, _)| location)
-        .ok_or(GptLookupError::NotFound)
+
+    /// The lookup's answer over the matches considered.
+    fn result(self) -> Result<PartitionLocation, GptLookupError>
+    {
+        if self.tied
+        {
+            return Err(GptLookupError::DuplicateTie);
+        }
+        self.best
+            .map(|(location, _)| location)
+            .ok_or(GptLookupError::NotFound)
+    }
 }
 
 #[cfg(test)]
@@ -946,5 +1058,247 @@ mod tests
             lookup_partition_by_type_guid(&[0xDA; 16], disks).ok(),
             Some(at(0, 100, 100))
         );
+    }
+}
+
+/// Bounded proofs of the parsers' contract (docs/testing.md § Bounded
+/// verification, Parser proofs). The parsers check no CRC32
+/// ([`parse_header`]), so no proof computes one.
+///
+/// The header and entry proofs run the property's checks of those structures
+/// ([`property::gpt_holds`]) on every input they are read from. The
+/// partition-array walk and the lookup loop over input of any length, so each
+/// is proven by induction: a base proof that the walk or the lookup starts in
+/// a state its invariant describes, and a step proof that one step from any
+/// state the invariant describes keeps it and does what the contract asks of
+/// that step. No step loops, so the two give the contract for a walk or a
+/// lookup of any length. What lies outside them is the loop that drives each
+/// step in [`collect_partitions`] and [`lookup_partition_by_type_guid`] (the
+/// block read when a slot's block comes up, the list it grows), which the
+/// fuzz target `gpt`, the replay of the checked-in inputs and the unit tests
+/// check.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{
+        ArrayWalk, GptLookupError, MAX_BLOCK_SIZE, PartitionLocation, Pick, ScanStop,
+        is_block_size, is_entry_size, parse_header, property,
+    };
+
+    /// The header contract holds on the first `len` bytes of any
+    /// `MAX_BLOCK_SIZE`-byte block, for every `len` up to it: a block of each
+    /// supported size, the 4096-byte block of a 4Kn disk among them, and every
+    /// length the parser refuses. A longer block takes the refusal of any
+    /// unsupported length. The only loops are the compares of the 8-byte
+    /// signature, so an unwind bound of 9 covers them.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_block_holds_the_header_contract()
+    {
+        let block: [u8; MAX_BLOCK_SIZE] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_BLOCK_SIZE);
+        property::header_holds(&block[..len]);
+    }
+
+    /// The entry contract holds on the first `len` bytes of any 128-byte
+    /// entry, for every `len` up to 128: the parser reads only an entry's
+    /// first 56 bytes, so every entry of any size, and every slice too short
+    /// to hold one. The longest loop is the compare of the 56 bytes the
+    /// decoded entry re-encodes to, so an unwind bound of 57 covers every
+    /// loop.
+    #[kani::proof]
+    #[kani::unwind(57)]
+    fn every_entry_holds_the_entry_contract()
+    {
+        let raw: [u8; 128] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= raw.len());
+        property::entry_holds(&raw[..len]);
+    }
+
+    /// The walk's invariant: a block size and an entry size `parse_header`
+    /// accepts, and a next slot no further than the last.
+    fn walk_holds(walk: &ArrayWalk) -> bool
+    {
+        is_block_size(walk.block_size as usize)
+            && is_entry_size(walk.entry_size, walk.block_size)
+            && walk.next <= walk.num_parts
+    }
+
+    /// Base: every header the parser accepts, from any block of up to
+    /// `MAX_BLOCK_SIZE` bytes, starts a walk of its own array at its first
+    /// slot, in the invariant. The only loops are the compares of the 8-byte
+    /// signature, so an unwind bound of 9 covers them.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn an_accepted_header_starts_its_walk_in_the_invariant()
+    {
+        let block: [u8; MAX_BLOCK_SIZE] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_BLOCK_SIZE);
+        let Ok(header) = parse_header(&block[..len])
+        else
+        {
+            return;
+        };
+        let walk = ArrayWalk::new(&header);
+        assert_eq!(
+            walk,
+            Some(ArrayWalk {
+                first_lba: header.part_entry_lba,
+                block_size: header.block_size,
+                entry_size: header.entry_size,
+                num_parts: header.num_parts,
+                next: 0,
+            })
+        );
+        assert!(walk.is_some_and(|walk| walk_holds(&walk)));
+    }
+
+    /// Step: from any state in the invariant, a step before the last slot
+    /// yields that slot at its place, `next * entry_size` bytes into the
+    /// array that starts at `first_lba`, as a range inside one block, and
+    /// moves to the next slot in the invariant; or, when the slot's LBA does
+    /// not fit a `u64`, stops at `u64::MAX` and ends the walk. A step at the
+    /// end yields nothing and stays there.
+    ///
+    /// By induction from the base, a walk yields slots `0..num_parts` in
+    /// order, each inside its block, at block positions that never decrease,
+    /// so the loop of `collect_partitions` reads the array's blocks once each,
+    /// in order. No loop.
+    #[kani::proof]
+    fn each_step_of_a_walk_yields_its_slot_inside_its_block()
+    {
+        let walk = ArrayWalk {
+            first_lba: kani::any(),
+            block_size: kani::any(),
+            entry_size: kani::any(),
+            num_parts: kani::any(),
+            next: kani::any(),
+        };
+        kani::assume(walk_holds(&walk));
+        let mut after = walk.clone();
+        let step = after.next();
+        if walk.next == walk.num_parts
+        {
+            assert!(step.is_none());
+            assert_eq!(after, walk);
+            return;
+        }
+        let block = u128::from(walk.block_size);
+        let entry = u128::from(walk.entry_size);
+        let at = u128::from(walk.first_lba) * block + u128::from(walk.next) * entry;
+        match step
+        {
+            Some(Ok(slot)) =>
+            {
+                assert_eq!(u128::from(slot.lba) * block + slot.offset as u128, at);
+                assert_eq!(slot.len as u128, entry);
+                assert!(slot.offset as u128 + entry <= block);
+                assert_eq!(
+                    after,
+                    ArrayWalk {
+                        next: walk.next + 1,
+                        ..walk
+                    }
+                );
+                assert!(walk_holds(&after));
+            }
+            Some(Err(ScanStop::ReadFailed { lba })) =>
+            {
+                assert_eq!(lba, u64::MAX);
+                assert!(at / block > u128::from(u64::MAX));
+                assert_eq!(after.next, after.num_parts);
+                assert!(walk_holds(&after));
+            }
+            _ => panic!("a step before the last slot yielded no slot"),
+        }
+    }
+
+    /// Any location in a lookup's disks.
+    fn any_location() -> PartitionLocation
+    {
+        PartitionLocation {
+            disk: kani::any(),
+            first_lba: kani::any(),
+            length_lba: kani::any(),
+        }
+    }
+
+    /// Step of the lookup: for any matches considered so far, summed up by
+    /// their highest priority, the first location at it, and how many share
+    /// it (2 standing for two or more), a pick that holds the first location
+    /// of the highest priority and is tied exactly when two or more share it
+    /// keeps that invariant over one more match of any location and priority.
+    /// The empty summary is `Pick::default()`, the lookup's start
+    /// (`a_lookup_starts_with_an_empty_pick`), so by induction the lookup answers with the first match of the highest
+    /// priority over every disk, a tie when two or more share it, and
+    /// `NotFound` when nothing matched. No loop.
+    #[kani::proof]
+    fn each_match_a_lookup_considers_keeps_its_pick()
+    {
+        let top: Option<(PartitionLocation, u16)> = if kani::any()
+        {
+            Some((any_location(), kani::any()))
+        }
+        else
+        {
+            None
+        };
+        let sharing: u8 = if top.is_some()
+        {
+            kani::any_where(|n: &u8| (1..=2).contains(n))
+        }
+        else
+        {
+            0
+        };
+        let pick = Pick {
+            best: top,
+            tied: sharing == 2,
+        };
+        let location = any_location();
+        let priority: u16 = kani::any();
+        let (top, sharing) = match top
+        {
+            Some((_, highest)) if priority < highest => (top, sharing),
+            Some((_, highest)) if priority == highest => (top, 2),
+            _ => (Some((location, priority)), 1),
+        };
+        let mut after = pick;
+        after.consider(location, priority);
+        assert_eq!(
+            after,
+            Pick {
+                best: top,
+                tied: sharing == 2,
+            }
+        );
+        match after.result()
+        {
+            Ok(found) =>
+            {
+                assert!(sharing == 1 && top.is_some_and(|(at, _)| at == found));
+            }
+            Err(GptLookupError::DuplicateTie) => assert_eq!(sharing, 2),
+            Err(GptLookupError::NotFound) => panic!("a lookup that considered a match found none"),
+        }
+    }
+
+    /// Base of the lookup: before any match, the pick holds nothing, is not
+    /// tied, and answers `NotFound`; the empty summary of the step proof.
+    #[kani::proof]
+    fn a_lookup_starts_with_an_empty_pick()
+    {
+        let pick = Pick::default();
+        assert_eq!(
+            pick,
+            Pick {
+                best: None,
+                tied: false,
+            }
+        );
+        assert!(matches!(pick.result(), Err(GptLookupError::NotFound)));
     }
 }

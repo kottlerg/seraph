@@ -18,8 +18,10 @@ vfsd/
 ├── Cargo.toml
 ├── README.md
 ├── gpt/                     # `vfsd-gpt` crate: pure host-tested GPT-format parser; its
-│                            # property (src/property.rs) and fuzz inputs (fuzz/gpt/), the
-│                            # fuzz target `gpt` (docs/testing.md § Fuzzing)
+│                            # property (src/property.rs), its proof harnesses (`proofs` in
+│                            # src/lib.rs, docs/testing.md § Bounded verification) and fuzz
+│                            # inputs (fuzz/gpt/), the fuzz target `gpt` (docs/testing.md
+│                            # § Fuzzing)
 ├── root-backend/            # `vfsd-root-backend` crate: VfsdRootBackend (NamespaceBackend impl)
 ├── swap/                    # `vfsd-swap` crate: pure host-tested swap-partition hand-out
 ├── src/

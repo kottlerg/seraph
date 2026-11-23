@@ -2043,7 +2043,7 @@ in the same one, as a red `master` is ([conventions.md](conventions.md#ci-gating
 
 **Parser rule.** A parser of hostile input (bytes from a disk image, a device, the network, or
 another process across an IPC boundary) MUST land with its property function, its seeds, its replay
-test, and its fuzz target, as Layout above describes, and with the proof harness of its property
+test, and its fuzz target, as Layout above describes, and with the proof harnesses of its property
 ([Bounded verification](#bounded-verification), Parser proofs).
 
 ---
@@ -2071,12 +2071,22 @@ one; its loops are bounded; and it does not detect every aliasing or provenance 
 [supported Rust features](https://model-checking.github.io/kani/rust-feature-support.html)).
 
 **Parser proofs.** The property function of a parser of hostile input (§ Fuzzing, Layout) has a
-third driver beside its replay test and its fuzz target: a `#[kani::proof]` in the parser crate's
-`#[cfg(kani)] mod proofs` that runs the property on the first `len` bytes of
-`kani::any::<[u8; N]>()`, `len` itself any value up to N, so the contract holds for every input of
-at most N bytes, not only for the inputs a search reached. Its comment states N and why inputs of
-that length cover the format. The crate's first harness registers it with `cargo xtask kani`.
-Design intent; not yet implemented: no parser crate holds a proof harness yet.
+third driver beside its replay test and its fuzz target: the `#[kani::proof]` harnesses in the
+parser crate's `#[cfg(kani)] mod proofs`, which prove the property in one of two forms. A harness
+runs the property, or its check of one structure the parser decodes (a header, an entry), on the
+first `len` bytes of `kani::any::<[u8; N]>()`, `len` itself any value up to N, so the check holds
+for every input of at most N bytes, not only for the inputs a search reached; its comment states N
+and why inputs of that length cover the structure. Where a harness of the whole property does not
+complete within the gating job, the parser MUST write each loop over a structure of variable length
+(the walk of an array, a search over its entries) as a step over a small state, which two harnesses
+prove by induction: a base harness, that the loop starts in an invariant the harness states, and a
+step harness, that one step from any state in the invariant (`kani::any` under `kani::assume`) keeps
+it and does what the property asks of that step, with no loop to unwind. Code other than the loop
+that drives the steps MUST NOT lie outside the harnesses; the module's comment states how its
+harnesses compose into the property and names that loop, with the drivers that check it. The crate's
+first harness registers it with `cargo xtask kani`. Implemented for the GPT parser
+(`services/vfsd/gpt`); design intent, not yet implemented, for every other parser of hostile input,
+none of which holds a property function yet.
 
 ---
 

@@ -27,7 +27,8 @@ pub struct Read
     /// The histogram of the instructions run since the previous read.
     pub hist: u64,
     /// The addresses of the attempts in that segment that did not retire:
-    /// instructions a trap interrupted, and reads begun again.
+    /// instructions a trap interrupted, a counter read's executions before
+    /// the one that retired among them.
     pub unretired: Vec<u64>,
 }
 

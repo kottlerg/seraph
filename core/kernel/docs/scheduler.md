@@ -497,7 +497,8 @@ Victim selection is mode-dependent:
   is pulled once it has stood for a tick without a break: the idle CPU records the first
   such CPU in its scan's order as its candidate (`PerCpuScheduler::idle_pull_candidate`),
   with that CPU's backlog episode (`PerCpuScheduler::backlog`), and, at its next idle tick,
-  pulls from that CPU if its backlog is still the same episode, else records afresh. A CPU's
+  pulls from that CPU if its backlog is still the same episode, else moves its cursor to the CPU
+  after that one and records afresh, another CPU's backlog first when there is one. A CPU's
   backlog episode is a wrapping count that `link` advances under the CPU's run-queue lock
   each time the queues come to hold a thread other than the idle thread after holding none,
   so the same episode at both ticks is one backlog that stood between them. Threads
@@ -508,8 +509,11 @@ Victim selection is mode-dependent:
   when no CPU has a backlog, and on every tick the CPU runs another thread. A pull from the
   candidate that finds no thread it can take (`sched::PullOutcome::NothingPullable`: the
   backlog is pinned, or still mid-handoff) moves the cursor to the CPU after the candidate,
-  so the next backlog recorded is another CPU's. The scan is `sched::idle_scan`, the decision
-  `sched::idle_pull_step`, and the tick `sched::idle_pull_tick`.
+  so the next backlog recorded is another CPU's, and so does one whose re-check under the
+  candidate's lock finds its backlog in a later episode (below). So neither a CPU whose
+  backlog no pull can take nor one whose backlog keeps breaking within a tick, which would be
+  recorded afresh at every tick, hides a backlog behind it. The scan is `sched::idle_scan`, the
+  decision `sched::idle_pull_step`, and the tick `sched::idle_pull_tick`.
 
 The idle CPU's pull below the threshold is what keeps a thread from starving while a CPU
 idles. A thread queued behind a running thread that never blocks or yields to its level
@@ -536,9 +540,10 @@ the outcomes that cost no tick still cost none, since a pull above the threshold
 - Recording a candidate whose backlog clears before the pull from it, the thread running on
   its own CPU, costs at most two ticks: the one that recorded it, and the pull's when the
   pull, rather than the next tick's check, finds it cleared or in a later episode. r counts
-  these candidates, a backlog that clears and forms again among them. The queued thread the
-  bound is for cannot be one: its CPU's queues hold it, so its backlog stays one episode
-  until it runs.
+  these candidates, a backlog that clears and forms again among them; each moves the cursor
+  past its CPU, so r counts at most the CPUs ahead of the thread's in the cursor's order. The
+  queued thread the bound is for cannot be one: its CPU's queues hold it, so its backlog stays
+  one episode until it runs.
 - A pull above the threshold that the re-check of its rule refuses
   (`sched::PullOutcome::RuleFailed`) or that finds nothing pullable
   (`sched::PullOutcome::NothingPullable`) costs no tick, since the confirmation rule decides
@@ -647,7 +652,8 @@ Hot-path cost per CPU per tick:
   candidate's run-queue mask and one Relaxed load of its backlog episode, and a Relaxed store of its
   own candidate and episode (and of its cursor when a pull from the candidate found nothing
   pullable), fields only this CPU writes. A pull above the threshold that finds nothing pullable
-  adds a second scan of the same cost. Each idle tick also loads its own `idle_pull_held` (Relaxed)
+  adds a second scan of the same cost, and so does a candidate whose backlog did not stand when the
+  scan recorded its CPU again. Each idle tick also loads its own `idle_pull_held` (Relaxed)
   and stores it with its candidate, and a confirmed candidate not held the tick before adds a
   `has_no_work` read of each of the idle CPU's SMT siblings (§ SMT Awareness).
 - Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick

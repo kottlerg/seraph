@@ -5872,8 +5872,10 @@ fn idle_scan(
 /// contended, so a transient load does not hide that CPU's own backlog.
 /// A pull from the confirmed candidate that finds nothing pullable moves the
 /// cursor past that CPU, so the next backlog recorded is another CPU's rather
-/// than the same pinned one again. A confirmed candidate is held one tick,
-/// once, when a sibling of `this_cpu` has work ([`IdlePullStep::Hold`]).
+/// than the same pinned one again; so do a candidate whose backlog did not
+/// stand ([`pass_broken_candidate`]) and a backlog pull the re-check refuses.
+/// A confirmed candidate is held one tick, once, when a sibling of `this_cpu`
+/// has work ([`IdlePullStep::Hold`]).
 fn idle_pull_tick(
     view: &mut impl IdlePullView,
     this_cpu: usize,
@@ -5889,11 +5891,12 @@ fn idle_pull_tick(
     {
         0
     };
-    let scan = idle_scan(view, this_cpu, cpu_count, cursor, None);
     let candidate = memory
         .candidate
         .filter(|backlog| backlog.cpu < cpu_count && backlog.cpu != this_cpu)
         .map(|backlog| (backlog, view.backlog(backlog.cpu) == Some(backlog.episode)));
+    let mut scan = idle_scan(view, this_cpu, cpu_count, cursor, None);
+    let cursor = pass_broken_candidate(view, this_cpu, cpu_count, cursor, candidate, &mut scan);
 
     let held = memory.held;
     let mut step = idle_pull_step(scan, candidate, || !held && view.sibling_busy());
@@ -5947,7 +5950,13 @@ fn idle_pull_tick(
     {
         IdlePullStep::Pull(src, rule) =>
         {
-            let cursor = if view.pull(src, rule) == PullOutcome::NothingPullable
+            // A backlog pull the re-check refuses found the backlog broken
+            // since the sample, so the cursor passes that CPU as after a
+            // failed confirmation.
+            let outcome = view.pull(src, rule);
+            let passed = outcome == PullOutcome::NothingPullable
+                || (outcome == PullOutcome::RuleFailed && matches!(rule, PullRule::Backlog(_)));
+            let cursor = if passed
             {
                 cpu_after(src, cpu_count)
             }
@@ -5977,6 +5986,37 @@ fn idle_pull_tick(
             cursor,
         },
     }
+}
+
+/// The cursor of an idle tick of `this_cpu` whose scan from `cursor` read
+/// `scan`, given its `candidate` as [`idle_pull_tick`] read it. A candidate
+/// whose backlog did not stand since it was recorded moves the cursor past its
+/// CPU, and `scan` then records another CPU's backlog when there is one: a CPU
+/// whose queues keep draining and filling again within a tick, recorded afresh
+/// on every tick, would otherwise hide every backlog behind it in the scan's
+/// order (core/kernel/docs/scheduler.md § Load Balancing).
+fn pass_broken_candidate(
+    view: &impl IdlePullView,
+    this_cpu: usize,
+    cpu_count: usize,
+    cursor: usize,
+    candidate: Option<(Backlog, bool)>,
+    scan: &mut IdleScan,
+) -> usize
+{
+    let Some((broken, false)) = candidate
+    else
+    {
+        return cursor;
+    };
+    let cursor = cpu_after(broken.cpu, cpu_count);
+    if scan
+        .backlogged
+        .is_some_and(|backlog| backlog.cpu == broken.cpu)
+    {
+        scan.backlogged = idle_scan(view, this_cpu, cpu_count, cursor, Some(broken.cpu)).backlogged;
+    }
+    cursor
 }
 
 /// The most-loaded CPU other than `this_cpu` and its queued load, or `None`
@@ -9016,6 +9056,10 @@ mod idle_pull_tests
         moved_from: Option<usize>,
         /// Whether a sibling of the idle CPU has work.
         sibling_busy: bool,
+        /// A CPU whose queues drain and fill again between an idle CPU's
+        /// lock-free sample and its pull, so the pull's re-check reads a new
+        /// backlog episode.
+        relink_on_pull: Option<usize>,
     }
 
     impl Model
@@ -9029,6 +9073,7 @@ mod idle_pull_tests
                 pulls: Vec::new(),
                 moved_from: None,
                 sibling_busy: false,
+                relink_on_pull: None,
             }
         }
 
@@ -9085,6 +9130,10 @@ mod idle_pull_tests
         fn pull(&mut self, src: usize, rule: PullRule) -> PullOutcome
         {
             self.pulls.push((src, rule));
+            if self.relink_on_pull == Some(src)
+            {
+                self.cpus[src].episode = self.cpus[src].episode.wrapping_add(1);
+            }
             if self.contended == Some(src)
             {
                 return PullOutcome::Deferred;
@@ -9531,7 +9580,7 @@ mod idle_pull_tests
             IdlePullMemory {
                 candidate: None,
                 held: false,
-                cursor: 0,
+                cursor: 1,
             }
         );
         assert_eq!(model.pulls, Vec::<(usize, PullRule)>::new());
@@ -9556,13 +9605,6 @@ mod idle_pull_tests
         for tick in 1..=10u32
         {
             memory = idle_pull_tick(&mut model, 1, 2, memory);
-            assert_eq!(
-                memory.candidate,
-                Some(Backlog {
-                    cpu: 0,
-                    episode: tick - 1,
-                })
-            );
             model.cpus[0].episode = tick;
         }
         assert_eq!(model.moved_from, None);
@@ -9591,7 +9633,65 @@ mod idle_pull_tests
         model.cpus[0].episode = 1;
         let next = idle_pull_tick(&mut model, 1, 2, memory);
         assert_eq!(model.moved_from, None);
-        assert_eq!(next.candidate, Some(Backlog { cpu: 0, episode: 1 }));
+        assert_eq!(
+            next,
+            IdlePullMemory {
+                candidate: None,
+                held: false,
+                cursor: 1,
+            }
+        );
+
+        // Confirmed lock-free, broken by the time the pull holds the lock.
+        let mut model = Model::new(&[IDLE, busy(0, 1), IDLE]);
+        model.relink_on_pull = Some(1);
+        let memory = IdlePullMemory {
+            candidate: Some(bl(1)),
+            held: false,
+            cursor: 0,
+        };
+        let next = idle_pull_tick(&mut model, 0, 3, memory);
+        assert_eq!(model.moved_from, None);
+        assert_eq!(model.pulls, vec![(1, PullRule::Backlog(0))]);
+        assert_eq!(
+            next,
+            IdlePullMemory {
+                candidate: None,
+                held: false,
+                cursor: 2,
+            }
+        );
+    }
+
+    // The defect caught: a CPU whose queues drain and fill again within every
+    // tick, recorded afresh as the candidate on every tick, hiding a backlog
+    // behind it in the scan's order for good, so a thread queued behind one
+    // that never yields starves while a CPU idles. Each such CPU ahead costs
+    // at most two ticks (core/kernel/docs/scheduler.md § Load Balancing).
+    #[test]
+    fn a_backlog_that_keeps_breaking_does_not_hide_one_behind_it()
+    {
+        // CPU 0 holds a ping-pong pair, CPU 1 a thread queued behind one that
+        // never yields; CPU 2 idles.
+        let mut model = Model::new(&[busy(0, 1), busy(0, 1), IDLE]);
+        let mut memory = IdlePullMemory {
+            candidate: None,
+            held: false,
+            cursor: 0,
+        };
+        let mut pulled_at = None;
+        for tick in 1..=6u32
+        {
+            memory = idle_pull_tick(&mut model, 2, 3, memory);
+            if model.moved_from.is_some()
+            {
+                pulled_at = Some(tick);
+                break;
+            }
+            model.cpus[0].episode = tick;
+        }
+        assert_eq!(model.moved_from, Some(1));
+        assert!(pulled_at.is_some_and(|tick| tick <= 2 + 2));
     }
 }
 

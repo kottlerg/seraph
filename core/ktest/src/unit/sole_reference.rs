@@ -217,12 +217,7 @@ fn race_once(ctx: &TestContext, eq: u64, cpu: u32, correlator: u64) -> TestResul
         cap_bind_sole_reference(object, eq, correlator)
             .map_err(|_| "racing_delete: bind failed")?;
         crate::spawn::wait_until_exited(child.th, crate::scaled_polls(2000))?;
-        expect_post(
-            eq,
-            correlator,
-            post_wait(),
-            "racing_delete: no post",
-        )?;
+        expect_post(eq, correlator, post_wait(), "racing_delete: no post")?;
         expect_none(eq, "racing_delete: a second post")
     })();
     child.delete_thread().ok();
@@ -244,8 +239,7 @@ pub fn two_bindings_each_post_once(ctx: &TestContext) -> TestResult
         cap_bind_sole_reference(copy, eq, CORRELATOR | 1)
             .map_err(|_| "two_bindings: second bind failed")?;
         cap_delete(copy).map_err(|_| "two_bindings: delete failed")?;
-        let first =
-            event_recv_entry(eq, post_wait()).map_err(|_| "two_bindings: no first post")?;
+        let first = event_recv_entry(eq, post_wait()).map_err(|_| "two_bindings: no first post")?;
         let second =
             event_recv_entry(eq, post_wait()).map_err(|_| "two_bindings: no second post")?;
         cap_delete(object).ok();

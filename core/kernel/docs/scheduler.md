@@ -173,6 +173,14 @@ pub struct PerCpuScheduler
     /// previous idle tick (§ Load Balancing).
     idle_pull_candidate: AtomicUsize,
 
+    /// The backlog episode of that CPU the sample read (§ Load Balancing).
+    idle_pull_episode: AtomicU32,
+
+    /// The count of this CPU's backlog episodes, advanced by `link` under `lock`
+    /// when the queues come to hold a thread other than the idle thread after holding
+    /// none (§ Load Balancing).
+    backlog_episode: AtomicU32,
+
     /// Whether the previous idle tick held the candidate one tick more, a sibling of
     /// this CPU being busy (§ SMT Awareness).
     idle_pull_held: AtomicBool,
@@ -485,11 +493,16 @@ Victim selection is mode-dependent:
   in index order from its cursor (`PerCpuScheduler::idle_pull_cursor`), wrapping, and a
   pull whatever the victim's load. The heaviest CPU's load above
   `LOAD_BALANCE_IMBALANCE_THRESHOLD` is pulled at once. A smaller backlog, a thread other
-  than the idle thread queued on a CPU (`PerCpuScheduler::has_queued_thread`, a bit of the
-  run-queue mask above the idle queue's), is pulled once it has outlived one tick: the
-  idle CPU records the first such CPU in its scan's order as its candidate
-  (`PerCpuScheduler::idle_pull_candidate`) and, at its next idle tick, pulls from that CPU
-  if it still has one, else records afresh. An idle CPU with a busy SMT sibling holds a
+  than the idle thread queued on a CPU (a bit of the run-queue mask above the idle queue's),
+  is pulled once it has stood for a tick without a break: the idle CPU records the first
+  such CPU in its scan's order as its candidate (`PerCpuScheduler::idle_pull_candidate`),
+  with that CPU's backlog episode (`PerCpuScheduler::backlog`), and, at its next idle tick,
+  pulls from that CPU if its backlog is still the same episode, else records afresh. A CPU's
+  backlog episode is a wrapping count that `link` advances under the CPU's run-queue lock
+  each time the queues come to hold a thread other than the idle thread after holding none,
+  so the same episode at both ticks is one backlog that stood between them. Threads
+  time-slicing behind one another on a CPU stay one episode, since `schedule()` requeues
+  the outgoing thread before it dequeues the next. An idle CPU with a busy SMT sibling holds a
   confirmed candidate one tick more before it pulls (§ SMT Awareness). A CPU whose queue
   holds only its idle thread is no backlog. The candidate is cleared after every attempt,
   when no CPU has a backlog, and on every tick the CPU runs another thread. A pull from the
@@ -522,7 +535,10 @@ the outcomes that cost no tick still cost none, since a pull above the threshold
   records it in the backlog's place. d counts these pulls.
 - Recording a candidate whose backlog clears before the pull from it, the thread running on
   its own CPU, costs at most two ticks: the one that recorded it, and the pull's when the
-  pull, rather than the next tick's check, finds it cleared. r counts these candidates.
+  pull, rather than the next tick's check, finds it cleared or in a later episode. r counts
+  these candidates, a backlog that clears and forms again among them. The queued thread the
+  bound is for cannot be one: its CPU's queues hold it, so its backlog stays one episode
+  until it runs.
 - A pull above the threshold that the re-check of its rule refuses
   (`sched::PullOutcome::RuleFailed`) or that finds nothing pullable
   (`sched::PullOutcome::NothingPullable`) costs no tick, since the confirmation rule decides
@@ -530,14 +546,23 @@ the outcomes that cost no tick still cost none, since a pull above the threshold
   nothing pullable on it, costs nothing; any other CPU past the threshold with nothing
   pullable on it is recorded, and counts in k.
 
-The rule stays bounded: only an idle CPU pulls below the threshold, and a pull leaves it busy,
-so two busy CPUs never trade threads (the steady state the threshold protects); a busy CPU
-with nothing queued but its idle thread draws no attempt; a backlog that clears between two
-idle ticks stays with the CPU whose caches hold it; and a backlog of pinned threads, which no
-pull can take, draws at most one try-lock attempt per idle CPU every two ticks (three for an
-idle CPU with a busy SMT sibling) while its load reads at or below the threshold (above it,
-one per idle CPU every tick, and two in a tick whose pull above the threshold moves nothing
-while a candidate is confirmed).
+The rule stays bounded: only an idle CPU pulls below the threshold, and a pull leaves it busy, so
+two busy CPUs never trade threads (the steady state the threshold protects); a busy CPU with nothing
+queued but its idle thread draws no attempt; a backlog that clears between two idle ticks, even one
+that forms again, stays with the CPU whose caches hold it; and a backlog of pinned threads, which no
+pull can take, draws at most one try-lock attempt per idle CPU every two ticks (three for an idle
+CPU with a busy SMT sibling) while its load reads at or below the threshold (above it, one per idle
+CPU every tick, and two in a tick whose pull above the threshold moves nothing while a candidate is
+confirmed).
+
+A backlog that drains within a tick is not the pull's to spread: where its threads run is wake
+placement's ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection
+(`select_target_cpu`)). The episode leaves such a backlog on its CPU even when its threads
+could run in parallel. Two threads that hand work to one another in turns, each queued behind
+the other for far less than a tick, so stay on one CPU, and their round trips wake no halted
+CPU; an asynchronous producer and consumer whose every handoff drains within a tick stay
+there too, since the pull does not spread them either. Whether a wake should place either kind
+of pair by its waker is open (#1560).
 
 The loads that choose a pull are read without the CPUs' locks, and a CPU's `schedule()`
 raises its own load for a moment under its lock: it counts every requeue of the running
@@ -550,8 +575,9 @@ and the pull. The pull therefore decides its rule again under the two run-queue 
 every load change has completed, and moves nothing when it no longer holds
 (`sched::PullRule`): a pull above the threshold, a busy CPU's or an idle CPU's, re-checks that
 the victim's load exceeds the puller's by more than `LOAD_BALANCE_IMBALANCE_THRESHOLD`; an idle
-CPU's pull from its confirmed candidate re-checks no load, since the locked pick of a queued
-unpinned thread is the backlog it confirmed. An idle CPU whose pull above the threshold
+CPU's pull from its confirmed candidate re-checks no load but that the victim's backlog is
+still the episode it confirmed, which under the victim's lock is exact, and the locked pick of
+a queued unpinned thread takes from that backlog. An idle CPU whose pull above the threshold
 moves nothing applies the confirmation rule in the same tick: it records or pulls its
 candidate as if the scan had seen no load past the threshold. When the victim had no thread a
 pull can take, the rule reads a second scan that leaves that victim out, and a candidate other
@@ -572,7 +598,7 @@ pull_unpinned_ready(src, dst, rule):
     if !try_lock(min(src, dst).scheduler.lock): return   // ascending-CPU order
     if !try_lock(max(src, dst).scheduler.lock):
         unlock(min); return
-    if !rule.passes(src.current_load(), dst.current_load()):
+    if !rule.passes(src.current_load(), src.backlog(), dst.current_load()):
         unlock both; return RuleFailed                   // the caller's reading no longer holds
     (tcb, prio) = src.find_runnable(|t| t.cpu_affinity == AFFINITY_ANY
                                         && t.context_saved.load(Acquire) == 1)
@@ -614,13 +640,14 @@ deferred to a later tick. Pinned threads (`cpu_affinity != AFFINITY_ANY`)
 are invisible to the `find_runnable` predicate and are never migrated.
 
 Hot-path cost per CPU per tick:
-- Idle CPU: one Relaxed load of its own load, one Relaxed load of the load per remote CPU
-  to find the heaviest victim, one Relaxed load of the run-queue mask per remote CPU whose
-  load is non-zero up to the first with a queued thread, one Relaxed load each of its own
-  candidate and cursor and one of the candidate's run-queue mask, and a Relaxed store of its
-  own candidate (and of its cursor when a pull from the candidate found nothing pullable),
-  fields only this CPU writes. A pull above the threshold that finds nothing pullable adds a
-  second scan of the same cost. Each idle tick also loads its own `idle_pull_held` (Relaxed)
+- Idle CPU: one Relaxed load of its own load, one Relaxed load of the load per remote CPU to find
+  the heaviest victim, one Acquire load of the run-queue mask per remote CPU whose load is non-zero
+  up to the first with a queued thread and one Relaxed load of that CPU's backlog episode, one
+  Relaxed load each of its own candidate, its episode and its cursor, one Acquire load of the
+  candidate's run-queue mask and one Relaxed load of its backlog episode, and a Relaxed store of its
+  own candidate and episode (and of its cursor when a pull from the candidate found nothing
+  pullable), fields only this CPU writes. A pull above the threshold that finds nothing pullable
+  adds a second scan of the same cost. Each idle tick also loads its own `idle_pull_held` (Relaxed)
   and stores it with its candidate, and a confirmed candidate not held the tick before adds a
   `has_no_work` read of each of the idle CPU's SMT siblings (§ SMT Awareness).
 - Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick
@@ -631,7 +658,10 @@ Hot-path cost per CPU per tick:
   `LOAD_BALANCE_IMBALANCE_THRESHOLD` is observed, and by an idle CPU when the idle rule
   above decides a pull (a second time in the tick when a pull above the threshold moves
   nothing and the confirmation rule pulls the candidate). Under both locks the pull
-  makes one Relaxed load of each CPU's load for the re-check.
+  makes one Relaxed load of each CPU's load, and one load of the victim's run-queue mask and
+  backlog episode, for the re-check.
+- `link`, under the run-queue lock it already holds: one Relaxed load of the run-queue mask
+  and, when it starts a backlog episode, one Relaxed load and store of the episode.
 
 ### Placement Counters
 
@@ -657,7 +687,6 @@ writer at a time and a load and a store make the increment; a reader takes no lo
 counter `Relaxed`, a snapshot. Each counter is a free-running 32-bit count that wraps, so a reader
 takes the wrapping difference of two reads. The CPU the selector reports is `preferred_cpu`, read
 under the thread's `sched_lock`: the CPU the thread was last linked on or dispatched on.
-
 
 ---
 

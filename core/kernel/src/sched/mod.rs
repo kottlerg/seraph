@@ -3172,7 +3172,7 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     CPU_DIAG_PTR.store(diag_ptr, core::sync::atomic::Ordering::Release);
 
     // Per-CPU arch data (PerCpuData) and APIC-ID slabs.
-    crate::percpu::init_storage(n, allocator);
+    crate::percpu::init_storage(n, sched_ptr, allocator);
 
     // Arch-specific per-CPU tables (x86-64 per-AP GDT/TSS, AP IST stacks, and
     // NMI-backtrace storage; riscv64 each CPU's IMSIC identity row, which
@@ -3507,9 +3507,9 @@ pub enum StartCommit
 /// stop can cycle the thread through a run, a park and a claim between a pass
 /// and the commit. A CPU still running the target is prodded
 /// ([`prod_remote_cpu`]); it drops the `Stopped` target at its next
-/// `timer_tick` reschedule (a slice expiry, or a fair-dispatched target's
-/// preemption for RT) or the target's own park or yield, where the requeue
-/// denylist leaves it unlinked.
+/// reschedule (a slice expiry, or the target's preemption by an outranking
+/// thread at a return to user mode) or the target's own park or yield, where
+/// the requeue denylist leaves it unlinked.
 ///
 /// The loop ends without writing when the target is no longer `Created` or
 /// `Stopped` ([`StartCommit::Refused`]: a concurrent start resumed it, or it
@@ -5211,9 +5211,9 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// `Stopped` or `Exited`, and `sys_thread_set_affinity` on a CPU running a
 /// target whose affinity it changed. The IPI's handler does no work: the trap
 /// it forces snapshots the target's user registers and returns to user mode,
-/// and the CPU acts on the target at its next `timer_tick` reschedule (a slice
-/// expiry, or a fair-dispatched target's preemption for RT) or the target's
-/// own park or yield, where the requeue denylist drops a
+/// and the CPU acts on the target at its next reschedule (a slice expiry, or
+/// the target's preemption by an outranking thread at a return to user mode)
+/// or the target's own park or yield, where the requeue denylist drops a
 /// `Stopped` or `Exited` target and the affinity check relocates a moved one.
 /// The callers' drains wait for that; the prod itself only exits a `hlt` on an
 /// idle CPU. `sys_thread_set_affinity` also uses it as the wake-protocol prod
@@ -5221,7 +5221,8 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// there (the move linked the thread on that CPU's run queue; the prod wakes it
 /// from idle to dispatch the thread), and `sys_thread_set_priority` as the
 /// prod of the CPU on which `relocate_ready_priority` re-linked a `Ready`
-/// thread.
+/// thread, or of the CPU running a `Running` one whose level it marked stale,
+/// whose return to user mode then re-records the level and decides.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI
@@ -6959,8 +6960,9 @@ unsafe fn wake_idle_cpu(target_cpu: usize)
     let current = crate::arch::current::cpu::current_cpu() as usize;
 
     // Don't IPI ourselves; the newly enqueued thread is picked up on the
-    // next schedule() call (sys_yield, timer preemption, or the producer's
-    // own later return to scheduler context).
+    // next schedule() call: this CPU's next return to user mode when it
+    // outranks the running thread (preempt_if_outranked), else a slice expiry,
+    // a yield or a park.
     if target_cpu == current
     {
         return;
@@ -6986,12 +6988,45 @@ unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Requeue
 {
-    /// Timer preemption or a yield: place the current thread back in the run
-    /// queue at its priority.
+    /// Slice expiry, a yield, or the idle thread leaving for queued work:
+    /// place the current thread back in the run queue at its priority, at the
+    /// tail, behind the threads of its level.
     Always,
+    /// A thread queued on this CPU outranks the current one
+    /// ([`preempt_if_outranked`]): place the current thread back in the run
+    /// queue at its priority, at the head, so it keeps its turn and the rest of
+    /// its slice (core/kernel/docs/scheduler.md § Wake Preemption).
+    Preempted,
     /// The caller parked, stopped, or exited the current thread: requeue it
     /// only if a concurrent wake has already made it runnable again.
     IfRunnable,
+}
+
+/// Link `current`, the thread [`schedule`] on this CPU is leaving, back on
+/// this CPU's run queue for `priority`: at the head for
+/// [`Requeue::Preempted`], at the tail otherwise. Returns whether the link was
+/// created, as `PerCpuScheduler::enqueue` does.
+///
+/// # Safety
+/// As for `PerCpuScheduler::enqueue`: the caller holds `sched.lock`, and
+/// `current` is a valid, unlinked TCB.
+unsafe fn requeue_local(
+    sched: &PerCpuScheduler,
+    current: *mut ThreadControlBlock,
+    priority: u8,
+    requeue: Requeue,
+) -> bool
+{
+    if requeue == Requeue::Preempted
+    {
+        // SAFETY: the caller's contract is enqueue_at_head's.
+        unsafe { sched.enqueue_at_head(current, priority) }
+    }
+    else
+    {
+        // SAFETY: the caller's contract is enqueue's.
+        unsafe { sched.enqueue(current, priority) }
+    }
 }
 
 /// What [`schedule`]'s outgoing requeue reads of `current`, under its
@@ -7047,7 +7082,7 @@ impl Outgoing
     fn requeue(&self, requeue: Requeue, cpu: usize) -> bool
     {
         let runnable = matches!(self.state, ThreadState::Running | ThreadState::Ready);
-        (requeue == Requeue::Always || runnable)
+        (requeue != Requeue::IfRunnable || runnable)
             && self.state != ThreadState::Exited
             && self.state != ThreadState::Stopped
             && self.state != ThreadState::Blocked
@@ -7058,11 +7093,14 @@ impl Outgoing
 
 /// Select the next thread to run and switch to it.
 ///
-/// Called from `sys_yield`, timer preemption, and the idle thread. Uses
-/// the current CPU's scheduler slot (indexed by `current_cpu()`).
+/// Called from `sys_yield`, slice expiry, wake preemption, the parking and
+/// exit paths, and the idle thread. Uses the current CPU's scheduler slot
+/// (indexed by `current_cpu()`).
 ///
 /// `requeue`: [`Requeue::Always`] places the current thread back in the
-/// run queue at its priority (timer preemption, yield).
+/// run queue at its priority, at the tail (slice expiry, yield), and
+/// [`Requeue::Preempted`] at the head (wake preemption); a requeue that the
+/// thread's hard affinity routes to another CPU links at that CPU's tail.
 /// [`Requeue::IfRunnable`] is for a thread the caller has already marked
 /// Blocked/Stopped/Exited, which must not be re-enqueued unless a wake made it
 /// runnable meanwhile.
@@ -7343,8 +7381,8 @@ pub unsafe fn schedule(requeue: Requeue)
                 // only on the created link (#359); a skip is unreachable
                 // here (`!already_queued` read under the held sched_lock).
                 // SAFETY: this CPU's run-queue lock is held; current is a valid
-                // TCB.
-                let linked = unsafe { sched.enqueue(current, prio) };
+                // TCB, unlinked (`!already_queued`).
+                let linked = unsafe { requeue_local(sched, current, prio, requeue) };
                 debug_assert!(
                     linked,
                     "schedule local requeue: enqueue skipped despite \
@@ -8147,9 +8185,10 @@ pub unsafe fn post_aspace_death_notification(post: &AspaceEndPost)
 
 /// Timer interrupt handler: decrement current thread's time slice.
 ///
-/// When the slice expires, or a fair thread runs while an RT thread is queued
-/// on this CPU ([`run_queue::PerCpuScheduler::tick_outcome`]), call
-/// `schedule(Requeue::Always)` unless preemption is disabled.
+/// When the slice expires ([`run_queue::PerCpuScheduler::tick_outcome`]), call
+/// `schedule(Requeue::Always)` unless preemption is disabled. A thread queued
+/// here that outranks the running one is not the tick's to decide: the
+/// interrupt's return to user mode does ([`preempt_if_outranked`]).
 /// Also runs the BSP sleep-list and watchdog checks and the per-CPU load
 /// balancer. This function is called from the timer interrupt handler on each
 /// CPU independently.
@@ -8275,8 +8314,8 @@ pub unsafe fn timer_tick()
     }
     // If preemption is disabled (e.g., during TLB shootdown spin-wait with
     // interrupts temporarily enabled), skip the context switch. The thread will
-    // be rescheduled at a later tick that decides a reschedule (its next slice
-    // expiry, or, for a fair thread with an RT thread queued, the next tick).
+    // be rescheduled at its next slice expiry, or, when a queued thread
+    // outranks it, at its next return to user mode.
     if crate::percpu::preemption_disabled()
     {
         // A live, preemption-disabled `current` still counts as non-idle
@@ -8286,9 +8325,160 @@ pub unsafe fn timer_tick()
     else
     {
         // SAFETY: schedule() re-acquires the lock and performs a context switch.
-        // Requeue::Always: thread was preempted and should go back in queue
-        // (a fair thread preempted for an RT one keeps the rest of its slice).
+        // Requeue::Always: the expired thread goes back to its queue's tail.
         unsafe { schedule(Requeue::Always) };
+    }
+}
+
+// ── Wake preemption ──────────────────────────────────────────────────────────
+
+/// Reschedule when a thread queued on this CPU outranks the running one
+/// ([`run_queue::PerCpuScheduler::outranked`]), the running thread keeping its
+/// turn ([`Requeue::Preempted`]); returns whether it rescheduled. Called at
+/// every return to user mode that can follow a link with no wake IPI pending:
+/// the end of a syscall, and of an interrupt or exception taken from user mode
+/// (core/kernel/docs/scheduler.md § Wake Preemption), through
+/// [`deliver_and_preempt`] where the return is an upcall delivery point.
+///
+/// The test every return makes is [`run_queue::PerCpuScheduler::outranked`]
+/// on this CPU's scheduler, reached through `PerCpuData::scheduler`
+/// ([`crate::percpu::current_scheduler`]): two loads and a branch past the
+/// per-CPU pointer's. Only a hit takes the rest of the decision, which does
+/// nothing during the BSP boot transient, as `timer_tick` does, while
+/// preemption is disabled, or for the idle thread, whose loop takes queued
+/// work itself, and which re-records a level a priority change marked stale
+/// (`PerCpuScheduler::mark_level_stale`) from the running thread's
+/// `priority` under its `sched_lock` before it decides again
+/// (core/kernel/docs/scheduler.md § Wake Preemption).
+///
+/// # Safety
+/// The end of a syscall, or of an interrupt or exception taken from user mode,
+/// on the running thread's kernel stack with interrupts disabled and no lock
+/// held, the thread's frame holding what it returns to user mode with.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn preempt_if_outranked() -> bool
+{
+    // SAFETY: a return to user mode runs on a CPU whose per-CPU pointer is
+    // installed, and percpu::init_storage, before it, named its scheduler.
+    let sched = unsafe { crate::percpu::current_scheduler() };
+    if !sched.outranked()
+    {
+        return false;
+    }
+    // SAFETY: the caller's contract is preempt_outranked's.
+    unsafe { preempt_outranked(sched) }
+}
+
+/// The rest of [`preempt_if_outranked`]'s decision, after its test hit: kept
+/// out of line, so each return to user mode inlines only the test.
+///
+/// # Safety
+/// As for [`preempt_if_outranked`]; `sched` is this CPU's scheduler.
+#[cfg(not(test))]
+#[cold]
+#[inline(never)]
+unsafe fn preempt_outranked(sched: &PerCpuScheduler) -> bool
+{
+    // See core/kernel/docs/scheduling-internals.md § BSP Boot Transient.
+    if BOOT_TRANSIENT_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+        || crate::percpu::preemption_disabled()
+    {
+        return false;
+    }
+    let current = sched.current();
+    if core::ptr::eq(current, sched.idle())
+    {
+        return false;
+    }
+    if sched.level_stale()
+    {
+        // The running thread's priority changed since its level was recorded:
+        // re-record it under the thread's sched_lock, which the change held,
+        // then decide again.
+        // SAFETY: current is this CPU's running thread, a valid TCB.
+        let lock = unsafe { &(*current).sched_lock };
+        // SAFETY: no lock is held (contract); paired with the unlock_raw below.
+        let saved = unsafe { lock.lock_raw() };
+        // SAFETY: priority is written under the sched_lock held here.
+        sched.set_current_level(unsafe { (*current).priority });
+        // SAFETY: saved is the word the lock_raw above returned.
+        unsafe { lock.unlock_raw(saved) };
+        if !sched.outranked()
+        {
+            return false;
+        }
+    }
+    // SAFETY: kernel context on the running thread's kernel stack with no lock
+    // held (contract); schedule() switches away and returns when this thread
+    // is dispatched again.
+    unsafe { schedule(Requeue::Preempted) };
+    true
+}
+
+/// The end of a return to user mode that is an upcall delivery point: `deliver`
+/// makes the delivery point, then [`preempt_if_outranked`] decides, both again
+/// while it reschedules (core/kernel/docs/scheduler.md § Wake Preemption). A
+/// thread that waited on the run queue for an outranking one has an upcall
+/// posted meanwhile delivered at this return, as a post to a thread running on
+/// no CPU expects (`ipc::upcall::post`), and a thread a delivery linked here,
+/// or whose wake IPI a delivery absorbed, is decided before the return.
+///
+/// # Safety
+/// As for [`preempt_if_outranked`]; `deliver` makes the delivery point of this
+/// return, on that contract.
+#[cfg(not(test))]
+#[expect(
+    clippy::inline_always,
+    reason = "every syscall's return runs it; the dev profile CI's bench cell counts otherwise keeps it out of line in syscall::dispatch, a call and a frame per syscall"
+)]
+#[inline(always)]
+pub unsafe fn deliver_and_preempt(deliver: impl FnMut())
+{
+    deliver_then_preempt(deliver, || {
+        // SAFETY: the caller's contract is preempt_if_outranked's.
+        unsafe { preempt_if_outranked() }
+    });
+}
+
+/// The end of an exception taken from user mode, which is no upcall delivery
+/// point: [`preempt_if_outranked`] decides, and only a thread it rescheduled
+/// returns through [`deliver_and_preempt`] with `deliver`, the interrupt delivery
+/// point, as a thread an interrupt preempted does (docs/fault-handling.md
+/// § Delivery points).
+///
+/// # Safety
+/// As for [`preempt_if_outranked`], at the end of an exception that resumes
+/// the thread; `deliver` makes the interrupt delivery point with the thread's
+/// live user frame.
+#[cfg(not(test))]
+pub unsafe fn preempt_at_exception_return(deliver: impl FnMut())
+{
+    // SAFETY: the caller's contract.
+    if unsafe { preempt_if_outranked() }
+    {
+        // SAFETY: the caller's contract.
+        unsafe { deliver_and_preempt(deliver) };
+    }
+}
+
+/// [`deliver_and_preempt`]'s order: `deliver`, then `preempt`, both again while
+/// `preempt` reports a reschedule, so the last step before the return is a
+/// `preempt` that kept the thread and a `deliver` follows every reschedule.
+#[expect(
+    clippy::inline_always,
+    reason = "inlined with deliver_and_preempt into every return to user mode, for the reason given there"
+)]
+#[inline(always)]
+fn deliver_then_preempt(mut deliver: impl FnMut(), mut preempt: impl FnMut() -> bool)
+{
+    loop
+    {
+        deliver();
+        if !preempt()
+        {
+            return;
+        }
     }
 }
 
@@ -9286,7 +9476,10 @@ mod placement_tests
 mod outgoing_requeue_tests
 {
     use super::thread::{TCB_MAGIC, ThreadControlBlock, ThreadState};
-    use super::{IDLE_PRIORITY, Outgoing, PerCpuScheduler, Requeue, least_loaded_cpu};
+    use super::{
+        IDLE_PRIORITY, Outgoing, PerCpuScheduler, RT_PRIORITY_MIN, Requeue, least_loaded_cpu,
+        requeue_local,
+    };
 
     const CPU: usize = 1;
     const OTHER_CPU: usize = 2;
@@ -9340,15 +9533,17 @@ mod outgoing_requeue_tests
         }
     }
 
-    /// Run `schedule()`'s outgoing requeue and next-thread selection on a
-    /// scheduler whose lock the single-threaded test stands in for; the thread
-    /// it dispatches.
-    fn schedule(
+    /// Run `schedule()`'s local outgoing requeue for `requeue` and its
+    /// next-thread selection on a scheduler whose lock the single-threaded test
+    /// stands in for; the thread it dispatches, recorded as running at its
+    /// level, as the dispatch does.
+    fn schedule_for(
         sched: &PerCpuScheduler,
         current: *mut ThreadControlBlock,
+        requeue: Requeue,
     ) -> *mut ThreadControlBlock
     {
-        if read(sched, current).requeue(Requeue::Always, CPU)
+        if read(sched, current).requeue(requeue, CPU)
         {
             // SAFETY: current is a live boxed TCB; single-threaded test.
             unsafe { (*current).state = ThreadState::Ready };
@@ -9356,10 +9551,79 @@ mod outgoing_requeue_tests
             let prio = unsafe { (*current).priority };
             // SAFETY: current is unlinked (`requeue` read it); the test stands
             // in for the run-queue lock.
-            assert!(unsafe { sched.enqueue(current, prio) });
+            assert!(unsafe { requeue_local(sched, current, prio, requeue) });
         }
         // SAFETY: single-threaded test.
-        unsafe { sched.dequeue_highest() }
+        let next = unsafe { sched.dequeue_highest() };
+        // The dispatch flip, which leaves the idle thread `Ready` (the
+        // idle-runs-`Ready` invariant at `schedule()`'s dispatch flip).
+        if !core::ptr::eq(next, sched.idle())
+        {
+            // SAFETY: next is a live boxed TCB; single-threaded test.
+            unsafe { (*next).state = ThreadState::Running };
+        }
+        next
+    }
+
+    /// [`schedule_for`] with [`Requeue::Always`].
+    fn schedule(
+        sched: &PerCpuScheduler,
+        current: *mut ThreadControlBlock,
+    ) -> *mut ThreadControlBlock
+    {
+        schedule_for(sched, current, Requeue::Always)
+    }
+
+    /// A TCB at `priority`, `Ready` and unlinked, and its pointer; the box
+    /// owns it for the test.
+    fn ready_at(priority: u8) -> (Box<ThreadControlBlock>, *mut ThreadControlBlock)
+    {
+        let mut tcb = make_tcb(ThreadState::Ready, CPU);
+        tcb.priority = priority;
+        let ptr: *mut ThreadControlBlock = &raw mut *tcb;
+        (tcb, ptr)
+    }
+
+    // The defect caught: a thread preempted by an outranking wake requeued at
+    // its queue's tail, so every peer of its level overtakes it and it loses a
+    // turn per wake (for a fair thread, the one-turn share bound of
+    // core/kernel/docs/scheduler.md § Scheduling Classes broken), or a slice
+    // expiry requeued at the head, so it keeps the CPU from its peers.
+    #[test]
+    fn a_preempted_thread_keeps_its_turn_and_an_expired_one_goes_behind_its_peers()
+    {
+        for level in [10, RT_PRIORITY_MIN + 1]
+        {
+            for (requeue, first) in [(Requeue::Preempted, true), (Requeue::Always, false)]
+            {
+                let sched = PerCpuScheduler::new();
+                let (_running_box, running) = ready_at(level);
+                let (_peer_box, peer) = ready_at(level);
+                let (_woken_box, woken) = ready_at(26);
+                // SAFETY: single-threaded test; running is a live box.
+                assert!(unsafe { sched.enqueue(running, level) });
+                // SAFETY: as above, for peer.
+                assert!(unsafe { sched.enqueue(peer, level) });
+                // Its dispatch.
+                // SAFETY: single-threaded test.
+                assert_eq!(unsafe { sched.dequeue_highest() }, running);
+                // SAFETY: running is a live box.
+                unsafe { (*running).state = ThreadState::Running };
+                // The wake of an outranking thread.
+                // SAFETY: as above, for woken.
+                assert!(unsafe { sched.enqueue(woken, 26) });
+                assert_eq!(schedule_for(&sched, running, requeue), woken);
+                // The woken thread blocks; the next of the level runs.
+                // SAFETY: single-threaded test; woken is a live box.
+                unsafe { (*woken).state = ThreadState::Blocked };
+                let next = schedule_for(&sched, woken, Requeue::IfRunnable);
+                assert_eq!(
+                    core::ptr::eq(next, running),
+                    first,
+                    "level {level}, {requeue:?}"
+                );
+            }
+        }
     }
 
     // The defect caught: this CPU's idle thread, which its own dispatch leaves
@@ -9371,7 +9635,7 @@ mod outgoing_requeue_tests
     {
         for state in [ThreadState::Ready, ThreadState::Running]
         {
-            for requeue in [Requeue::Always, Requeue::IfRunnable]
+            for requeue in [Requeue::Always, Requeue::Preempted, Requeue::IfRunnable]
             {
                 assert!(idle_thread(state).requeue(requeue, CPU), "{state:?}");
             }
@@ -9384,7 +9648,7 @@ mod outgoing_requeue_tests
     #[test]
     fn a_thread_another_cpu_took_is_left_to_that_cpu()
     {
-        for requeue in [Requeue::Always, Requeue::IfRunnable]
+        for requeue in [Requeue::Always, Requeue::Preempted, Requeue::IfRunnable]
         {
             assert!(!thread(ThreadState::Ready, OTHER_CPU).requeue(requeue, CPU));
             assert!(!thread(ThreadState::Ready, CPU).requeue(requeue, CPU));
@@ -9400,7 +9664,7 @@ mod outgoing_requeue_tests
     {
         for make in [|s| thread(s, CPU), idle_thread]
         {
-            for requeue in [Requeue::Always, Requeue::IfRunnable]
+            for requeue in [Requeue::Always, Requeue::Preempted, Requeue::IfRunnable]
             {
                 for state in [ThreadState::Ready, ThreadState::Running]
                 {
@@ -9633,6 +9897,41 @@ mod slab_tests
                     .with_elems_per_cpu(crate::cpu_mask::words_for(cpus))
                     .sized_at(cpus),
                 "TLB_PENDING_CPUS at {cpus} CPUs"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod deliver_and_preempt_tests
+{
+    use super::deliver_then_preempt;
+
+    // The defect caught: a thread preempted at a return to user mode resuming
+    // without a delivery point after its wait, so an upcall posted to it while
+    // it was queued, which no CPU is prodded for, waits for a later return; or
+    // a reschedule left undecided after a delivery that linked a thread.
+    #[test]
+    fn every_reschedule_is_followed_by_a_delivery_and_the_return_by_a_kept_check()
+    {
+        for reschedules in 0usize..4
+        {
+            let mut steps = Vec::new();
+            let mut left = reschedules;
+            let steps_cell = core::cell::RefCell::new(&mut steps);
+            deliver_then_preempt(
+                || steps_cell.borrow_mut().push('d'),
+                || {
+                    steps_cell.borrow_mut().push('p');
+                    let rescheduled = left > 0;
+                    left = left.saturating_sub(1);
+                    rescheduled
+                },
+            );
+            assert_eq!(
+                steps.iter().collect::<String>(),
+                "dp".repeat(reschedules + 1),
+                "{reschedules} reschedules"
             );
         }
     }

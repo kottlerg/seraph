@@ -628,8 +628,8 @@ unsafe fn drain_remote_stopped(
         return;
     }
     // The IPI's trap snapshots the target's user registers; the remote CPU
-    // drops the Stopped target at its next timer_tick reschedule (a slice
-    // expiry, or a fair-dispatched target's preemption for RT) or its own
+    // drops the Stopped target at its next reschedule (a slice expiry, or its
+    // preemption by an outranking thread at a return to user mode) or its own
     // park or yield, whose trap leaves the snapshot sys_thread_read_regs
     // reads once this drain completes.
     // SAFETY: run_cpu < CPU_COUNT per contract.
@@ -2244,9 +2244,13 @@ pub fn sys_thread_set_upcall_mask(tf: UserFrame) -> Result<u64, SyscallError>
 /// `SchedControl` (or one whose band excludes the level) cannot set any
 /// priority. There is no ambient priority authority.
 ///
-/// The change takes effect at the next scheduler invocation. If the thread is
-/// currently in the Ready state, it is re-linked on the new level's run queue
-/// immediately (at its tail, even when both levels share the fair queue).
+/// If the thread is currently in the Ready state, it is re-linked on the new
+/// level's run queue immediately (at its tail, even when both levels share the
+/// fair queue). If it is Running, the level its CPU recorded for it is marked
+/// stale and that CPU prodded, so its next return to user mode re-records the
+/// level and yields to a thread queued there that now outranks it
+/// (core/kernel/docs/scheduler.md § Wake Preemption); the caller's own change
+/// does so at this syscall's return.
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -2348,7 +2352,8 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
         (old_prio, state)
     };
 
-    // The CPU whose run queue the relocation re-linked the thread on, if any.
+    // The CPU whose run queue the relocation re-linked the thread on, or that
+    // runs the thread, if any.
     let mut relinked_on = None;
     if state == ThreadState::Ready && old_prio != priority
     {
@@ -2373,6 +2378,24 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
             crate::sched::relocate_ready_priority(target_tcb, old_prio, priority, hint, cpu_count)
         };
     }
+    else if state == ThreadState::Running && old_prio != priority
+    {
+        // A Running thread's preferred_cpu names the CPU running it, written
+        // with the state flip under the held sched_lock. That CPU recorded the
+        // thread's level from `priority` under this same lock, at the dispatch
+        // flip or the same-thread re-mark, so the record predates the write
+        // above; mark it stale, still under the lock, so a re-record cannot
+        // fall between the write and the mark.
+        // SAFETY: target_tcb validated non-null; `sched_lock` (held)
+        // serializes preferred_cpu.
+        let cpu = unsafe { (*target_tcb).preferred_cpu } as usize;
+        if cpu < cpu_count
+        {
+            // SAFETY: cpu < CPU_COUNT, and the schedulers are initialised.
+            unsafe { crate::sched::scheduler_for(cpu) }.mark_level_stale();
+            relinked_on = Some(cpu);
+        }
+    }
 
     // Release `sched_lock`, restoring the caller's interrupt state.
     // SAFETY: target_tcb validated non-null.
@@ -2384,6 +2407,9 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
     // its idle loop can read them empty then and halt; the re-link, like every
     // link on another CPU, is followed by the wake IPI, sent after the unlock
     // (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants).
+    // A CPU running the thread takes the IPI's return to user mode through the
+    // stale level's full decision; for the caller's own CPU the prod is a
+    // no-op and this syscall's return decides.
     if let Some(cpu) = relinked_on
     {
         // SAFETY: relocate_ready_priority returns only a CPU below cpu_count.
@@ -2523,8 +2549,8 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
 /// - **Running** elsewhere: a wakeup IPI is delivered to the CPU running
 ///   it. The wakeup IPI handler does not itself call `schedule()`; the
 ///   running thread observes the new affinity at its next `schedule()` entry
-///   (slice-expiry preemption, a fair-dispatched thread's preemption for
-///   RT, voluntary yield, or IPC block). The
+///   (slice-expiry preemption, its preemption by an outranking thread at a
+///   return to user mode, voluntary yield, or IPC block). The
 ///   affinity-vs-current-CPU check in `schedule()` then routes the
 ///   re-enqueue cross-CPU to the new target. Worst-case latency is
 ///   one time slice.

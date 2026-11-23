@@ -59,8 +59,9 @@
 //! x86-64 has no counterpart: a message there is a write to the local APIC's
 //! message window, which only a device's bus write reaches, and a CPU raises a
 //! device vector only from ring 0, through the ICR. The same interleavings are
-//! driven there by the host tests of `core/kernel/src/irq.rs`. The cell skips
-//! where `crate::arch::MSG_INJECTABLE` is false.
+//! driven there by the host tests of `core/kernel/src/irq.rs`. The cell has no
+//! arch check of its own: `stress::run_irq` registers it only where
+//! `crate::arch::MSG_INJECTABLE` holds.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -126,14 +127,6 @@ enum Timing
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    if !crate::arch::MSG_INJECTABLE
-    {
-        crate::log(
-            "ktest: stress::msg_inject_delete_race SKIP (no user-mode message write on this \
-             architecture; the irq.rs host tests cover the race)",
-        );
-        return Ok(());
-    }
     let cpus = system_info(SystemInfoType::CpuCount as u64)
         .map_err(|_| "stress::msg_inject_delete_race: system_info(CpuCount) failed")?;
     if cpus < MIN_CPUS

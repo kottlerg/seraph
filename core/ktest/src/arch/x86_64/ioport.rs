@@ -57,6 +57,16 @@ pub fn init(info: &InitInfo)
     }
 }
 
+/// The wide cap's handle, or `None` when it is uninitialised or exhausted. A
+/// bind through it grants every port it still covers and consumes nothing, so
+/// it moves no later carve.
+pub fn wide_cap() -> Option<u64>
+{
+    // SAFETY: ktest is single-threaded.
+    let slot = unsafe { WIDE }.slot;
+    (slot != 0).then_some(slot)
+}
+
 /// Bind `[port, port + count)` to `thread_cap`. Returns `true` on
 /// success.
 ///

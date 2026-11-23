@@ -486,10 +486,11 @@ jobs:
         run: echo "SERAPH_SIGNING_DIR=$RUNNER_TEMP/seraph-signing" >> "$GITHUB_ENV"
 
       - name: Build the benchmark image (${{ matrix.arch }})
-        # The debug profile: the build the host-mode bands were calibrated on,
+        # The release profile, the build that runs on hardware (docs/testing.md
+        # § Benchmarks); the host-mode bands were calibrated on the same build,
         # so both modes measure one build.
         run: |
-          cargo xtask build --arch ${{ matrix.arch }} --ktest-bench-only
+          cargo xtask build --arch ${{ matrix.arch }} --release --ktest-bench-only
           cargo xtask mkdisk --arch ${{ matrix.arch }} --harness ktest
 
       - name: Boot it under icount

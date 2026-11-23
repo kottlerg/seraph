@@ -402,7 +402,15 @@ fn kept_in_spilled_record(ctx: &TestContext) -> TestResult
             .map_err(|_| "integration::arena_reclaim: the spilled augment failed")?;
         place_moved_bodies(ctx, a, probe)
     })();
-    finish_kept(ctx, a, piece, P_PAGES, base_before, placed)
+    finish_kept(
+        ctx,
+        "kept_in_spilled_record",
+        a,
+        piece,
+        P_PAGES,
+        base_before,
+        placed,
+    )
 }
 
 /// Case 5, on an architecture with I/O ports (`crate::arch::HAS_IO_PORTS`):
@@ -418,6 +426,8 @@ fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
         );
         return Ok(());
     };
+    let port = crate::arch::io_port_cap()
+        .ok_or("integration::arena_reclaim: ktest holds no IoPort cap to bind")?;
     let base_before = available(ctx.memory_base);
     let piece = split_piece(ctx, T_PAGES)?;
     // Every page of A is the piece's: its create-time slab, its only donation.
@@ -427,7 +437,6 @@ fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
         memory_merge(ctx.memory_base, piece).ok();
         return Err("integration::arena_reclaim: cap_create_cspace(A from the piece) failed");
     };
-    let mut bound = false;
     let placed = (|| {
         // A bound thread's first bind takes its table's three pages from A's
         // pool; deleting the thread returns them to the top of the pool, each
@@ -435,23 +444,20 @@ fn kept_on_freed_table_pages(ctx: &TestContext) -> TestResult
         // and a slot page takes the third.
         let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, a, 0, 0)
             .map_err(|_| "integration::arena_reclaim: cap_create_thread failed")?;
-        bound = (1..=u64::from(crate::unit::hw::scan_bound(ctx)))
-            .any(|slot| syscall::ioport_bind(th, slot).is_ok());
+        let bound = syscall::ioport_bind(th, port);
         cap_delete(th).ok();
-        if !bound
-        {
-            return Ok(());
-        }
+        bound.map_err(|_| "integration::arena_reclaim: ioport_bind to a thread of A failed")?;
         place_moved_bodies(ctx, a, probe)
     })();
-    if placed.is_ok() && !bound
-    {
-        cap_delete(a).ok();
-        memory_merge(ctx.memory_base, piece).ok();
-        crate::log("ktest: integration::arena_reclaim kept_on_freed_table_pages SKIP (none bound)");
-        return Ok(());
-    }
-    finish_kept(ctx, a, piece, T_PAGES, base_before, placed)
+    finish_kept(
+        ctx,
+        "kept_on_freed_table_pages",
+        a,
+        piece,
+        T_PAGES,
+        base_before,
+        placed,
+    )
 }
 
 /// Split a piece of `pages` pages off the top of `memory_base`.
@@ -497,9 +503,10 @@ fn place_moved_bodies(ctx: &TestContext, a: u64, probe: u64) -> TestResult
 /// bodies of `COPIES`, then the copies, and merge `piece` back. `placed` is the
 /// fixture's outcome. Checks that `piece` came back but for at least two kept
 /// pages while the copies lived, so its span was cut into several runs, and is
-/// whole once they go.
+/// whole once they go; logs the kept page count under `case`.
 fn finish_kept(
     ctx: &TestContext,
+    case: &str,
     a: u64,
     piece: u64,
     pages: u64,
@@ -530,6 +537,10 @@ fn finish_kept(
     {
         return Err("integration::arena_reclaim: the bodies were not placed and moved out");
     }
+    crate::log_args(format_args!(
+        "ktest: integration::arena_reclaim {case} kept_pages={}",
+        pages.saturating_sub(held / PAGE)
+    ));
     let kept_limit = pages
         .checked_sub(2)
         .and_then(|rest| rest.checked_mul(PAGE))

@@ -287,8 +287,14 @@ fn run_irq(ctx: &TestContext)
         "stress::irq_route_delete_race",
         irq_route_delete_race::run(ctx)
     );
-    run_integration_test!(
-        "stress::msg_inject_delete_race",
-        msg_inject_delete_race::run(ctx)
-    );
+    // Registered only where a user-mode write raises a message
+    // (`crate::arch::MSG_INJECTABLE`); elsewhere the `core/kernel/src/irq.rs`
+    // host interleaving tests cover the race.
+    if crate::arch::MSG_INJECTABLE
+    {
+        run_integration_test!(
+            "stress::msg_inject_delete_race",
+            msg_inject_delete_race::run(ctx)
+        );
+    }
 }

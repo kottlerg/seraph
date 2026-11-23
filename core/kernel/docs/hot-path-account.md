@@ -104,7 +104,7 @@ with seven words, the one whose payload passes the register words.
 
 ## Profile
 
-The benchmark cell is decided to gate the release profile (opt-level 2, LTO, one codegen
+The benchmark cell gates the release profile (opt-level 2, LTO, one codegen
 unit), for its ktest rows, ubench and fsbench alike, so one rule states what the cell measures:
 the build that runs on hardware. Dev (opt-level 2 with debug assertions and overflow checks,
 without LTO) adds 9 % to 58 % to a path on x86_64, unevenly, so a dev count does not predict
@@ -126,8 +126,8 @@ Dev's excess is debug assertions (`debug_assert_kernel_entry_flags`, `read_rflag
 checks, and calls that LTO inlines in release: the current-thread lookup alone is 96 (dev) and 38
 (release) of the x86_64 null syscall. The accepted cost is that a regression only dev runs (a
 debug assertion added to a hot path) is not gated; it costs nothing on hardware, and the
-functional cells still build and boot dev. The cell builds dev until the change that moves it
-to release, with its baselines and its host-mode bands re-taken on the release build.
+functional cells still build and boot dev. The cell's icount baselines and the host-mode bands
+are taken on the release build ([docs/testing.md](../../../docs/testing.md) § Benchmarks).
 
 ## Ranked Cuts
 

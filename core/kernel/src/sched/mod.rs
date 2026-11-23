@@ -4124,6 +4124,48 @@ unsafe fn cpu_running(tcb: *mut ThreadControlBlock, cpu_count: usize) -> Option<
     })
 }
 
+/// Every CPU below `cpu_count` whose `current`, as `current_of` reads it, is
+/// `tcb`. A thread is `current` on two CPUs while a CPU that claimed it in
+/// its voluntary-block window waits for the parking CPU's register save
+/// (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership), so a
+/// post that every CPU running the thread owes walks them all.
+fn cpus_current_on(
+    tcb: *mut ThreadControlBlock,
+    cpu_count: usize,
+    current_of: impl Fn(usize) -> *mut ThreadControlBlock,
+) -> impl Iterator<Item = usize>
+{
+    (0..cpu_count).filter(move |&cpu| core::ptr::eq(current_of(cpu), tcb))
+}
+
+/// Post the stopped check (`STOPPED`) to every CPU whose `current` is
+/// `tcb`, a thread just committed `Exited`: that CPU's next syscall return
+/// owes [`running_thread_stopped`]. A thread can be `current` on two CPUs:
+/// one that claimed it in its voluntary-block window waits for the parking
+/// CPU's register save with it `current` on both, and resumes it in that
+/// syscall (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
+/// Ownership). With every CPU lock held, no other CPU makes it `current`
+/// before the caller releases them, and it is never dispatched again
+/// (core/kernel/docs/scheduling-internals.md § Return Work).
+///
+/// # Safety
+/// The caller holds every CPU's `scheduler.lock`, and `cpu_count` is the
+/// number of CPUs whose per-CPU storage is initialised.
+#[cfg(not(test))]
+unsafe fn post_stopped(tcb: *mut ThreadControlBlock, cpu_count: usize)
+{
+    let current_of = |cpu| {
+        // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+        unsafe { scheduler_for(cpu) }.current()
+    };
+    for cpu in cpus_current_on(tcb, cpu_count, current_of)
+    {
+        // SAFETY: cpu < cpu_count, and per-CPU storage is initialised before
+        // any thread runs.
+        unsafe { crate::percpu::post_return_work_to(cpu, crate::percpu::return_work::STOPPED) };
+    }
+}
+
 /// Shared body of [`set_state_under_all_locks`], [`exit_under_all_locks`],
 /// [`commit_cancelling_park`], and [`start_under_all_locks`].
 ///
@@ -4272,18 +4314,10 @@ unsafe fn commit_state_under_all_locks(
 
         // SAFETY: every CPU lock is held (above).
         running_on = unsafe { cpu_running(tcb, cpu_count) };
-        // A thread committed `Exited` while `current` on a CPU owes that
-        // CPU's next syscall return the stopped check
-        // ([`running_thread_stopped`]). Every CPU lock is held, so the thread
-        // is `current` on that CPU alone until it leaves it, and is never
-        // dispatched again (core/kernel/docs/scheduling-internals.md § Return
-        // Work).
         if state_out == thread::ThreadState::Exited
-            && let Some(cpu) = running_on
         {
-            // SAFETY: cpu < cpu_count, and per-CPU storage is initialised
-            // before any thread runs.
-            unsafe { crate::percpu::post_return_work_to(cpu, crate::percpu::return_work::STOPPED) };
+            // SAFETY: every CPU lock is held (above); tcb valid.
+            unsafe { post_stopped(tcb, cpu_count) };
         }
     }
 
@@ -7251,6 +7285,65 @@ unsafe fn set_running(sched: &PerCpuScheduler, tcb: *mut ThreadControlBlock)
     unsafe { crate::percpu::set_current_thread(tcb) };
 }
 
+/// Mark `tcb` dispatched on `cpu`: `Running`, its `preferred_cpu` naming
+/// `cpu`, this CPU's slice level its priority, no outstanding park-wake, and
+/// its pending upcall posted to this CPU's return work.
+///
+/// `schedule()`'s two ways into `Running`, the dispatch flip and the
+/// `next == current` re-mark, both call it. An upcall post that found the
+/// thread not `Running` posted no CPU, and one that found it `Running` posted
+/// the CPU it ran on before, so every dispatch reads the pending upcall here,
+/// under the `sched_lock` the post writes under: the post either sees
+/// `Running` and this CPU in `preferred_cpu`, or is seen here
+/// (core/kernel/docs/scheduling-internals.md § Return Work).
+///
+/// Clearing `wake_pending` is defensive: the `Running` coalesce that sets it
+/// is reached by the dying-server reply-bound wake in `dealloc_object(Thread)`,
+/// which the caller's commit consumes, and a stale flag must not survive into
+/// a later, unrelated `commit_blocked`
+/// (core/kernel/docs/sched-ipc-redesign.md § 2.1).
+///
+/// Returns whether a park-wake was pending, for the #375 tripwire, and the
+/// thread's id.
+///
+/// # Safety
+/// `tcb` is a valid TCB whose `sched_lock` the caller holds; `sched` is CPU
+/// `cpu`'s scheduler, `cpu` is this CPU, its per-CPU pointer is installed,
+/// and interrupts are disabled.
+#[cfg(not(test))]
+unsafe fn mark_dispatched(
+    sched: &PerCpuScheduler,
+    tcb: *mut ThreadControlBlock,
+    cpu: usize,
+) -> (bool, u32)
+{
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of `tcb`, a valid TCB whose sched_lock this CPU holds"
+    )]
+    // SAFETY: tcb is a valid TCB; its scheduling fields are written under its
+    // sched_lock, held (contract), and thread_id is immutable.
+    let marked = unsafe {
+        (*tcb).state = ThreadState::Running;
+        (*tcb).preferred_cpu = cpu as u32;
+        // The level its slice is measured by (`timer_tick` may not read
+        // `priority` without this sched_lock).
+        sched.set_current_level((*tcb).priority);
+        let was_pending = (*tcb).wake_pending;
+        (*tcb).wake_pending = false;
+        (was_pending, (*tcb).thread_id)
+    };
+    // SAFETY: tcb is a valid TCB whose sched_lock is held (contract).
+    let upcall = unsafe { crate::ipc::upcall::return_work_of(tcb) };
+    if upcall != 0
+    {
+        // SAFETY: this CPU's per-CPU pointer is installed and interrupts are
+        // disabled (contract).
+        unsafe { crate::percpu::post_return_work(upcall) };
+    }
+    marked
+}
+
 /// Select the next thread to run and switch to it.
 ///
 /// Called from `sys_yield`, slice expiry, wake preemption, the parking and
@@ -7600,28 +7693,17 @@ pub unsafe fn schedule(requeue: Requeue)
         // register save happens.
         if !current.is_null()
         {
-            #[expect(
-                clippy::multiple_unsafe_ops_per_block,
-                reason = "every access is to a field of `current`, a valid TCB whose sched_lock \
-                          this CPU holds"
-            )]
-            // SAFETY: current is a valid TCB; its scheduling fields are written
-            // under its sched_lock, held here, and thread_id is immutable.
-            let (cleared_live_wake, tid) = unsafe {
-                (*current).state = ThreadState::Running;
-                // Still running on THIS CPU: keep preferred_cpu authoritative
-                // (the re-mark, like the local requeue above, must not leave it
-                // stale — core/kernel/docs/sched-ipc-redesign.md § 3).
-                (*current).preferred_cpu = cpu as u32;
-                // The level its next slice is measured by, read under its held
-                // sched_lock (a priority change since its dispatch lands here).
-                sched.set_current_level((*current).priority);
-                // A running thread carries no pending park-wake (see the
-                // dispatch flip below).
-                let was_pending = (*current).wake_pending;
-                (*current).wake_pending = false;
-                (was_pending, (*current).thread_id)
-            };
+            // Still running on THIS CPU: keep preferred_cpu authoritative
+            // (the re-mark, like the local requeue above, must not leave it
+            // stale — core/kernel/docs/sched-ipc-redesign.md § 3), and read
+            // the level its next slice is measured by under its held
+            // sched_lock (a priority change since its dispatch lands here). A
+            // thread re-selected after a wake inside its block window is a
+            // dispatch like any other, and owes the upcall its wake may carry.
+            // SAFETY: current is a valid TCB whose sched_lock this CPU holds;
+            // `sched` is this CPU's scheduler, its per-CPU pointer is
+            // installed, and interrupts are disabled.
+            let (cleared_live_wake, tid) = unsafe { mark_dispatched(sched, current, cpu) };
             if cleared_live_wake
                 && !WAKE_PENDING_CLEAR_TRIPPED.swap(true, core::sync::atomic::Ordering::Relaxed)
             {
@@ -7802,44 +7884,10 @@ pub unsafe fn schedule(requeue: Requeue)
         }
         if dispatchable
         {
-            #[expect(
-                clippy::multiple_unsafe_ops_per_block,
-                reason = "every access is to a field of `next`, a valid TCB whose sched_lock this \
-                          CPU holds"
-            )]
-            // SAFETY: next is a valid TCB; its scheduling fields are written under
-            // its sched_lock, held here, and thread_id is immutable.
-            let (cleared_live_wake, tid) = unsafe {
-                (*next).state = ThreadState::Running;
-                (*next).preferred_cpu = cpu as u32;
-                // The level its slice is measured by (`timer_tick` may not read
-                // `priority` without this sched_lock).
-                sched.set_current_level((*next).priority);
-                // A running thread has no outstanding park-wake to honour; clear
-                // wake_pending so a stale flag can never survive into a later,
-                // unrelated commit_blocked (defensive — the `Running` coalesce
-                // that sets it is reached by the dying-server reply-bound wake in
-                // dealloc_object(Thread), which the caller's commit consumes; see
-                // core/kernel/docs/sched-ipc-redesign.md § 2.1).
-                let was_pending = (*next).wake_pending;
-                (*next).wake_pending = false;
-                (was_pending, (*next).thread_id)
-            };
-            // An upcall pending on `next` is owed by this CPU's returns to
-            // user mode from now on: a post that found the thread not
-            // `Running` posted no CPU, and one that found it `Running` posted
-            // the CPU it ran on before. Read under next.sched_lock, the lock
-            // the post writes under, so the post either sees `Running` and
-            // this CPU in `preferred_cpu` or is seen here
-            // (core/kernel/docs/scheduling-internals.md § Return Work).
-            // SAFETY: next is a valid TCB whose sched_lock is held.
-            let upcall = unsafe { crate::ipc::upcall::return_work_of(next) };
-            if upcall != 0
-            {
-                // SAFETY: this CPU's per-CPU pointer is installed and
-                // interrupts are disabled.
-                unsafe { crate::percpu::post_return_work(upcall) };
-            }
+            // SAFETY: next is a valid TCB whose sched_lock this CPU holds;
+            // `sched` is this CPU's scheduler, its per-CPU pointer is
+            // installed, and interrupts are disabled.
+            let (cleared_live_wake, tid) = unsafe { mark_dispatched(sched, next, cpu) };
             if cleared_live_wake
                 && !WAKE_PENDING_CLEAR_TRIPPED.swap(true, core::sync::atomic::Ordering::Relaxed)
             {
@@ -10361,5 +10409,42 @@ mod return_work_tests
             );
             assert!(seen.iter().all(|&w| w != 0), "a round ran on no work");
         }
+    }
+}
+
+#[cfg(test)]
+mod stopped_post_tests
+{
+    use super::cpus_current_on;
+    use super::thread::ThreadControlBlock;
+
+    /// A distinct TCB address; the scan compares addresses only.
+    fn tcb(n: usize) -> *mut ThreadControlBlock
+    {
+        core::ptr::without_provenance_mut(0x1000 * n)
+    }
+
+    // The defect caught: an `Exited` commit that posted `STOPPED` only to the
+    // first CPU found with the thread `current`, while a CPU that claimed it in
+    // its voluntary-block window also had it `current` and resumed it in user
+    // mode.
+    #[test]
+    fn a_thread_current_on_two_cpus_is_found_on_both()
+    {
+        let currents = [tcb(1), tcb(2), tcb(1), tcb(2)];
+        let found: Vec<usize> =
+            cpus_current_on(tcb(2), currents.len(), |cpu| currents[cpu]).collect();
+        assert_eq!(found, vec![1, 3]);
+    }
+
+    #[test]
+    fn a_thread_current_nowhere_or_past_the_count_is_not_found()
+    {
+        let currents = [tcb(1), tcb(1), tcb(3)];
+        assert_eq!(
+            cpus_current_on(tcb(2), currents.len(), |cpu| currents[cpu]).count(),
+            0
+        );
+        assert_eq!(cpus_current_on(tcb(3), 2, |cpu| currents[cpu]).count(), 0);
     }
 }

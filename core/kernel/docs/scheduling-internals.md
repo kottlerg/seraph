@@ -1134,13 +1134,18 @@ Rules:
    bits and runs again while one is set (`sched::run_return_work`). The kinds that belong to the
    thread rather than to a CPU follow it there: the dispatch posts a pending upcall, and an
    `Exited` thread is never dispatched again.
-4. `STOPPED` is posted under every CPU lock, by the commit that found the thread `current`: the
-   thread stays `current` on that CPU alone until it leaves it.
+4. `STOPPED` is posted under every CPU lock, by the commit that found the thread `current`, to
+   every CPU that has it `current`: a CPU that claimed it in its voluntary-block window has it
+   `current` beside the parking CPU until that CPU's register save (§ Cross-CPU TCB Ownership).
+   With every CPU lock held, no other CPU makes it `current` before the posts, and it is never
+   dispatched again.
 5. An upcall's post and the dispatch flip both hold the target's `sched_lock`. The post finds the
    thread `Running`, and posts the CPU the dispatch wrote in `preferred_cpu` under that lock, or
-   finds it not `Running`, and the later dispatch reads the pending upcall under the lock. A post
-   to a `Running` thread that leaves the CPU before the return leaves a bit the next thread's
-   return clears in vain, and the thread's own dispatch posts again.
+   finds it not `Running`, and the later dispatch reads the pending upcall under the lock: the
+   dispatch flip, or the `next == current` re-mark of a thread re-selected while still
+   `current` (`sched::mark_dispatched`). A post to a `Running` thread that leaves the CPU before
+   the return leaves a bit the next thread's return clears in vain, and the thread's own dispatch
+   posts again.
 6. A link posts `PREEMPT` when it leaves `non_empty & outranking` nonzero, under the linked CPU's
    `scheduler.lock`. For a link the CPU makes itself that test is exact. A link another CPU makes
    can read `outranking` before a dispatch on the linked CPU rewrites it, since the dispatch

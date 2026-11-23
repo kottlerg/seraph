@@ -33,7 +33,8 @@
 //! - `ioport_revoke.rs` — revoking an `IoPort` cap withdraws the port access
 //!   bound through its descendant from a reader on another CPU
 //! - `ioport_switch.rs` — a thread's port permissions follow it across CPUs and context
-//!   switches: unbound, remotely bound, switched, withdrawn, and two bindings on one CPU
+//!   switches: remotely bound, switched, withdrawn, and denied to an unbound or a
+//!   differently bound thread on a CPU that holds another's bitmap
 //! - `umip.rs` — on a CPU reporting UMIP, ring-3 `SIDT` and `SGDT` raise `#GP`
 //! - `single_step.rs` — a handler single-steps a thread with the trap flag, one
 //!   `FAULT_EXC_DEBUG` per instruction, a `syscall` stepping as one

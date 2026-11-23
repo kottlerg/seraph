@@ -9,17 +9,16 @@
 //! A thread with no port binding runs with the TSS I/O-bitmap offset out of
 //! limit, so every port access raises `#GP`; a bound thread's bitmap is copied
 //! into a CPU's TSS only when that CPU's TSS does not already hold it at the
-//! bitmap's generation, which every bind and withdrawal advances. Three phases
+//! bitmap's generation, which every bind and withdrawal advances. Two phases
 //! check what userspace sees of that, on ports 0x4D1 (the 8259 ELCR for IRQs
 //! 8-15, which reads without side effect) and 0x4D2 (bound, never accessed):
 //!
-//! 1. `unbound_child_faults`: a thread without a binding dies of `#GP` on a
-//!    port read.
-//! 2. `remote_bind_switch_and_withdraw`: a bind made while the thread runs on
+//! 1. `remote_bind_switch_and_withdraw`: a bind made while the thread runs on
 //!    another CPU, the thread switched out and back, and a withdrawal made
 //!    while it is switched out.
-//! 3. `two_bound_threads_one_cpu`: two threads with different bindings on one
-//!    CPU.
+//! 2. `threads_after_a_bound_one`: on a CPU whose TSS holds a bound thread's
+//!    bitmap, a thread without a binding and a thread with a different binding
+//!    each die of `#GP` on the first thread's port.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,7 +34,7 @@ use crate::{ChildStack, TestContext, TestResult};
 /// The port the children read: the 8259 ELCR for IRQs 8-15.
 const PORT_P: u16 = 0x4D1;
 
-/// The port bound to the second thread of phase 3, never accessed.
+/// The port bound to the third thread of phase 2, never accessed.
 const PORT_Q: u16 = 0x4D2;
 
 /// `#GP`, the vector a denied port access faults with.
@@ -50,7 +49,7 @@ static SPINNING: AtomicU64 = AtomicU64::new(0);
 static GO: AtomicU64 = AtomicU64::new(0);
 /// Reads the phase 2 child completed.
 static READS: AtomicU64 = AtomicU64::new(0);
-/// Set by the phase 3 child A once its read succeeded.
+/// Set by the phase 2 child A once its read succeeded.
 static A_READ: AtomicU64 = AtomicU64::new(0);
 /// Set by a child just before its notification wait.
 static PARKING: AtomicU64 = AtomicU64::new(0);
@@ -119,9 +118,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: integration::ioport_switch SKIP (cannot carve ports 0x4D1-0x4D2)");
         return Ok(());
     };
-    let result = unbound_child_faults(ctx)
-        .and_then(|()| remote_bind_switch_and_withdraw(ctx, p))
-        .and_then(|()| two_bound_threads_one_cpu(ctx, p, q));
+    let result =
+        remote_bind_switch_and_withdraw(ctx, p).and_then(|()| threads_after_a_bound_one(ctx, p, q));
     cap_delete(p).ok();
     cap_delete(q).ok();
     result
@@ -248,18 +246,6 @@ fn exit_is_gp(child: &mut SpawnedChild, why: &'static str) -> TestResult
     Ok(())
 }
 
-/// Defect caught: a thread without bindings left permitted by an earlier
-/// thread's bitmap (the TSS bitmap offset not taken out of limit for it).
-fn unbound_child_faults(ctx: &TestContext) -> TestResult
-{
-    let mut child = crate::spawn::new_child(ctx)?;
-    start(&child, reader_once, core::ptr::addr_of!(STACK_A), 0)?;
-    exit_is_gp(
-        &mut child,
-        "integration::ioport_switch: an unbound thread did not die of #GP",
-    )
-}
-
 /// Defect caught: a bind made to a running thread on another CPU not taking
 /// effect before its next port access, a binding lost across a context switch
 /// (a stale or missing bitmap copy on the switch back), or a withdrawal made
@@ -311,10 +297,16 @@ fn remote_bind_switch_and_withdraw(ctx: &TestContext, p: u64) -> TestResult
     Ok(())
 }
 
-/// Defect caught: a CPU's copy of one thread's bitmap taken as another
-/// thread's (the TSS reused for a thread with a different binding because the
-/// generation matched).
-fn two_bound_threads_one_cpu(ctx: &TestContext, p: u64, q: u64) -> TestResult
+/// A, bound to [`PORT_P`], reads it on CPU 1 and parks there, so that CPU's
+/// TSS holds A's bitmap (the switch to idle loads nothing); then an unbound
+/// thread C and a thread B bound only to [`PORT_Q`] each read [`PORT_P`] on the
+/// same CPU and must die of `#GP`.
+///
+/// Defects caught: a thread without bindings left permitted by an earlier
+/// thread's bitmap (the TSS bitmap offset not taken out of limit for it), and a
+/// CPU's copy of one thread's bitmap taken as another thread's (the copy
+/// skipped for a thread with a different binding).
+fn threads_after_a_bound_one(ctx: &TestContext, p: u64, q: u64) -> TestResult
 {
     let mut caps = Caps([0; 5]);
     let a_grant = cap_derive(p, syscall::RIGHTS_ALL)
@@ -335,6 +327,12 @@ fn two_bound_threads_one_cpu(ctx: &TestContext, p: u64, q: u64) -> TestResult
     start(&a, parker, core::ptr::addr_of!(STACK_A), arg)?;
     wait_flag(&A_READ, "integration::ioport_switch: A never read the port")?;
     wait_parked()?;
+    let mut unbound = crate::spawn::new_child(ctx)?;
+    start(&unbound, reader_once, core::ptr::addr_of!(STACK_B), 0)?;
+    exit_is_gp(
+        &mut unbound,
+        "integration::ioport_switch: an unbound thread did not die of #GP on A's port",
+    )?;
     start(&b, reader_once, core::ptr::addr_of!(STACK_B), 0)?;
     exit_is_gp(
         &mut b,
@@ -354,7 +352,7 @@ extern "C" fn reader_once(_arg: u64) -> !
     syscall::thread_exit()
 }
 
-/// Phase 2 child: spin until released, read, then read again after each of
+/// Phase 1 child: spin until released, read, then read again after each of
 /// two notification waits; the third read is expected to fault.
 extern "C" fn spinner(arg: u64) -> !
 {
@@ -377,7 +375,7 @@ extern "C" fn spinner(arg: u64) -> !
     }
 }
 
-/// Phase 3 child A: read once, then block forever.
+/// Phase 2 child A: read once, then block forever.
 extern "C" fn parker(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the parent published for this child.

@@ -250,9 +250,9 @@ load from any 2 MiB slot of the kernel image window, every one of which is deliv
 `#GP` instead of returning a kernel address; `src/arch/x86_64/ioport_revoke.rs` checks that revoking
 an `IoPort` cap withdraws the port access bound through its descendant from a reader on another CPU,
 whose next port read raises `#GP`. `src/arch/x86_64/ioport_switch.rs` checks that a thread's port
-permissions follow it across CPUs and context switches: an unbound thread, a bind made while the
-thread runs on another CPU, a withdrawal made while it is switched out, and two differently bound
-threads on one CPU. `src/arch/x86_64/trap_redelivery.rs` checks that a fault-handler
+permissions follow it across CPUs and context switches: a bind made while the thread runs on
+another CPU, a withdrawal made while it is switched out, and an unbound thread and a differently
+bound one each denied the port on a CPU whose TSS holds a bound thread's bitmap. `src/arch/x86_64/trap_redelivery.rs` checks that a fault-handler
 rebind redelivers a single-step `#DB`, a trap whose saved instruction pointer is past the stepped
 instruction, from the kernel: the second endpoint's message names the same instruction pointer, and
 the thread, its TF cleared, resumes into a recovery routine. `src/arch/x86_64/single_step.rs`

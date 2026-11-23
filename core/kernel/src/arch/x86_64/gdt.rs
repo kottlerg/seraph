@@ -727,8 +727,9 @@ unsafe fn iopb_offset_of<'a>(tss: *mut TssWithIopb) -> &'a core::sync::atomic::A
 /// Must be called with interrupts disabled or from a single-CPU context.
 /// GS-base must point to a valid `PerCpuData` with `tss_ptr` set. Each part of
 /// `iopb` is a live [`IOPB_PART_BYTES`]-byte block that no other CPU writes for
-/// the duration, and its generation names its bytes (the thread's `sched_lock`
-/// is held, or the thread is the caller's own and only it binds itself).
+/// the duration, and its generation names its bytes: the thread's `sched_lock`
+/// is held, which is what serialises every change of a bitmap's bytes and
+/// generation (a bind of the thread, or a withdrawal from any CPU).
 #[cfg(not(test))]
 pub unsafe fn load_iopb(iopb: Option<&ThreadIopb>)
 {

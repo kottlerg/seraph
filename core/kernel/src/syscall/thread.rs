@@ -2403,10 +2403,10 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb_sched_saved from the lock_raw above.
     unsafe { lock.unlock_raw(tcb_sched_saved) };
 
-    // The relocation's unlink can empty that CPU's run queues for a moment, and
-    // its idle loop can read them empty then and halt; the re-link, like every
-    // link on another CPU, is followed by the wake IPI, sent after the unlock
-    // (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants).
+    // The move can set the bit of a queue that outranks the thread running on
+    // that CPU, so, like every link on another CPU, it is followed by the wake
+    // IPI, sent after the unlock (core/kernel/docs/scheduling-internals.md
+    // § Wake Protocol Invariants, invariant 1).
     // A CPU running the thread takes the IPI's return to user mode through the
     // stale level's full decision; for the caller's own CPU the prod is a
     // no-op and this syscall's return decides.

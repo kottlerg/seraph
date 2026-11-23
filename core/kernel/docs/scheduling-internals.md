@@ -1477,6 +1477,45 @@ the ordering choice is required for correctness; relaxations would introduce a r
 - SeqCst is permitted only where a Dekker-style fence pair is the proven pattern; new SeqCst uses
   MUST cite the proof.
 
+### Lock-free readers of a CPU's run queues
+
+A CPU's run queues, its `non_empty` mask, its `backlog_episode` and each linked TCB's
+`queued_on` are written only under its `scheduler.lock`, by four writers: `link` (behind
+`enqueue` and `enqueue_at_head`), `dequeue_highest`, `remove_from_queue` and `relink`. Other
+CPUs, and the owning CPU's idle loop, read the mask and the episode without the lock:
+`has_runnable`, `has_queued_thread`, `has_no_work` and `outranked` read the mask, and `backlog`
+reads the mask (Acquire) and then the episode. Four invariants make those samples sound:
+
+1. **Publication.** Each writer makes every store to the queues, the episode and `queued_on`
+   before the Release read-modify-write of `non_empty` that ends its write, so a sample that sees
+   a bit change also sees the writes behind it (§ Atomic Ordering Invariants, the `non_empty`
+   and `backlog_episode` rows).
+2. **No false empty.** A bit for a queue holding a thread other than the idle thread is cleared
+   only by `dequeue_highest` or `remove_from_queue` taking that queue's last thread. `relink`,
+   which moves a thread between the CPU's queues, sets the destination's bit before it clears the
+   source's; both are read-modify-writes of one atomic by one CPU, so every value of the mask, in
+   its modification order, names at least one queue while the thread stays queued. A sample that
+   reads no queued-thread bit therefore read a value written while no thread but the idle thread
+   was queued.
+3. **Episodes.** The episode changes only at `link` into queues holding no thread but the idle
+   thread (an even count two on, an odd one back to the even count before it) and at a
+   `remove_from_queue` that leaves no such thread queued (the count one lower, odd). `backlog`
+   rounds an odd count up. Two equal samples are thus one backlog that the CPU's dispatch did not
+   run dry between them, save the one imprecision
+   [scheduler.md § Load Balancing](scheduler.md#load-balancing) states: a sample that races a
+   dispatch running the backlog dry and the link that refills it can read the new episode.
+4. **Samples only choose.** No reader acts on a sample alone: `schedule()` reads the queues under
+   the lock, a pull re-reads the episode and the queues under both CPUs' locks, and the idle
+   loop's halt decision is closed by the wake IPI that invariant 1 of § Wake Protocol Invariants
+   orders after every link on another CPU. A stale sample costs a futile lock round, a halt the
+   IPI ends, or one pull the idle pull's bound allows, never a lost thread.
+
+A new writer of a CPU's run queues MUST keep all four: in particular, it moves a queued thread
+with `relink`, never by an unlink and a re-link, which shows the queues empty to every reader
+between the two. The host tests `a_relink_never_shows_a_lock_free_reader_the_queues_empty` and
+`a_relink_moves_the_thread_to_the_new_level_and_keeps_its_episode` (`sched::run_queue`) cover
+invariant 2 and the episode half of invariant 3 for `relink`.
+
 ---
 
 ## Process-Death and Parked-Thread Protocol

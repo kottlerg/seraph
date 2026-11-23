@@ -1,0 +1,22 @@
+# bench baseline, written by `cargo xtask bench-baseline`
+# Format: xtask/README.md (`cargo xtask bench-check`).
+size=1024 path=frame cpus=1 unit=cycles p50=76377
+size=1024 path=frame cpus=4 unit=cycles p50=76659
+size=1024 path=inline cpus=1 unit=cycles p50=62152
+size=1024 path=inline cpus=4 unit=cycles p50=62716
+size=16 path=frame cpus=1 unit=cycles p50=76377
+size=16 path=frame cpus=4 unit=cycles p50=76659
+size=16 path=inline cpus=1 unit=cycles p50=11428
+size=16 path=inline cpus=4 unit=cycles p50=11569
+size=16384 path=frame cpus=1 unit=cycles p50=306302
+size=16384 path=frame cpus=4 unit=cycles p50=336762
+size=16384 path=inline cpus=1 unit=cycles p50=1013210
+size=16384 path=inline cpus=4 unit=cycles p50=1250015
+size=4096 path=frame cpus=1 unit=cycles p50=76377
+size=4096 path=frame cpus=4 unit=cycles p50=83847
+size=4096 path=inline cpus=1 unit=cycles p50=248452
+size=4096 path=inline cpus=4 unit=cycles p50=251930
+size=65536 path=frame cpus=1 unit=cycles p50=1229706
+size=65536 path=frame cpus=4 unit=cycles p50=1236574
+size=65536 path=inline cpus=1 unit=cycles p50=4349868
+size=65536 path=inline cpus=4 unit=cycles p50=4393724

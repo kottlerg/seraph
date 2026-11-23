@@ -18,8 +18,10 @@ vfsd/
 ├── Cargo.toml
 ├── README.md
 ├── gpt/                     # `vfsd-gpt` crate: pure host-tested GPT-format parser; its
-│                            # property (src/property.rs) and fuzz inputs (fuzz/gpt/), the
-│                            # fuzz target `gpt` (docs/testing.md § Fuzzing)
+│                            # property (src/property.rs), its proof harnesses (`proofs` in
+│                            # src/lib.rs, docs/testing.md § Bounded verification) and fuzz
+│                            # inputs (fuzz/gpt/), the fuzz target `gpt` (docs/testing.md
+│                            # § Fuzzing)
 ├── root-backend/            # `vfsd-root-backend` crate: VfsdRootBackend (NamespaceBackend impl)
 ├── swap/                    # `vfsd-swap` crate: pure host-tested swap-partition hand-out
 ├── src/
@@ -146,8 +148,10 @@ vfsd/
   and parses each disk's GPT
   partition table through one scratch memory cap reused across the reads (replaced from memmgr
   before the next disk when a failed read left it lost), keeping every
-  used entry of each header's `num_parts`-entry array (a disk whose GPT
-  cannot be read or validated contributes none). It then resolves the
+  used entry of each header's `num_parts`-entry array, from the primary
+  GPT or, when the primary fails its CRC32 or `MyLBA` checks, the backup at
+  the disk's last LBA (a disk neither of whose GPT copies can be read and
+  validated contributes none). It then resolves the
   arch-conditional root GUID in `src/role_guids.rs` via
   `gpt::lookup_partition_by_type_guid` over the partitions of every disk
   for the self-mount; the DPS priority tie-break runs across disks, and

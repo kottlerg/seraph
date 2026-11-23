@@ -95,7 +95,13 @@ use core::prelude::rust_2024::*;
 /// v25: [`ProcessInfo::restore_sp`], the restore word, is appended
 ///      (docs/checkpoint-restore.md § Restore entry and handle rebinding);
 ///      every other field offset is unchanged.
-pub const PROCESS_ABI_VERSION: u32 = 25;
+/// v26: The stdio ring header gains the `reader_waiting` and `writer_waiting`
+///      waiter words after `closed`, and a ring end rings its peer's data or
+///      space notification only when the peer announced a wait in its word
+///      (`shared/shmem/README.md` § Doorbell protocol). `ProcessInfo`'s layout
+///      is unchanged; an end that never announces would wait forever on a
+///      peer of this version.
+pub const PROCESS_ABI_VERSION: u32 = 26;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -425,12 +431,17 @@ pub struct ProcessInfo
 
     /// `CSpace` slot of the shmem memory cap backing `std::io::stdin`.
     ///
-    /// One 4 KiB page laid out as `shmem::SpscHeader` followed by a
-    /// power-of-two byte ring. The page is shared with the spawner; the
-    /// spawner is the writer (parent → child), the child is the reader.
-    /// Wakeup notifications live in `stdin_data_notification_cap` (writer-kicks-reader)
-    /// and `stdin_space_notification_cap` (reader-kicks-writer); EOF rides on the
-    /// header's `closed` flag plus a final notification kick.
+    /// One 4 KiB page laid out as `shmem::SpscHeader` (the `head`, `tail`,
+    /// `capacity` and `closed` words, then the `reader_waiting` and
+    /// `writer_waiting` waiter words) followed by a power-of-two byte ring.
+    /// The page is shared with the spawner; the spawner is the writer
+    /// (parent → child), the child is the reader. Wakeup notifications live
+    /// in `stdin_data_notification_cap` (the writer rings the reader) and
+    /// `stdin_space_notification_cap` (the reader rings the writer), each rung
+    /// only when the peer announced a wait in its waiter word
+    /// (`shared/shmem/README.md` § Doorbell protocol); EOF rides on the
+    /// header's `closed` flag plus a final notification, rung whether or not
+    /// the peer waits.
     ///
     /// Zero means "no stdin attached"; reads return `Ok(0)` (EOF)
     /// immediately. The standard case for services spawned by init.
@@ -572,10 +583,17 @@ pub struct ProcessInfo
     // ── Stdio pipe wakeup notifications ──────────────────────────────────────
     //
     // Each piped direction gets two notification caps:
-    //   * `data_notification`  — writer kicks reader after producing bytes;
-    //                      reader awaits this when the ring is empty.
-    //   * `space_notification` — reader kicks writer after consuming bytes;
-    //                      writer awaits this when the ring is full.
+    //   * `data_notification`  — reader awaits this when the ring is empty;
+    //                      the writer rings it after producing bytes when
+    //                      the reader announced the wait.
+    //   * `space_notification` — writer awaits this when the ring is full;
+    //                      the reader rings it after consuming bytes when
+    //                      the writer announced the wait.
+    //
+    // A wait is announced in the ring header's waiter word
+    // (`shared/shmem/README.md` § Doorbell protocol). A close rings the
+    // peer's notification and the spawner's death bridge rings both, whether
+    // or not a wait was announced.
     //
     // Both processes hold caps to both notifications, with Notify and Wait
     // rights. At most one side blocks on each notification at any given
@@ -584,17 +602,17 @@ pub struct ProcessInfo
     // Zero in any slot means that notification is not attached: a reader
     // with no data notification reports EOF instead of blocking, and a writer
     // with no space notification drops bytes, so neither side spins.
-    /// Data-available notification for the stdin pipe. Writer-kicked.
+    /// Data-available notification for the stdin pipe. Rung by the writer.
     pub stdin_data_notification_cap: u64,
-    /// Space-available notification for the stdin pipe. Reader-kicked.
+    /// Space-available notification for the stdin pipe. Rung by the reader.
     pub stdin_space_notification_cap: u64,
-    /// Data-available notification for the stdout pipe. Writer-kicked.
+    /// Data-available notification for the stdout pipe. Rung by the writer.
     pub stdout_data_notification_cap: u64,
-    /// Space-available notification for the stdout pipe. Reader-kicked.
+    /// Space-available notification for the stdout pipe. Rung by the reader.
     pub stdout_space_notification_cap: u64,
-    /// Data-available notification for the stderr pipe. Writer-kicked.
+    /// Data-available notification for the stderr pipe. Rung by the writer.
     pub stderr_data_notification_cap: u64,
-    /// Space-available notification for the stderr pipe. Reader-kicked.
+    /// Space-available notification for the stderr pipe. Rung by the reader.
     pub stderr_space_notification_cap: u64,
 
     // ── Main-thread stack envelope ─────────────────────────────────────

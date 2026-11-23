@@ -31,6 +31,11 @@ Three harnesses exercise three surfaces:
 itself owns its phases. `usertest` is an orchestrator that runs per-program
 tester binaries discovered under `/tests/programs/`.
 
+[`ubench`](../programs/ubench/README.md), the userspace benchmark suite, is launched as
+`svctest` is, from a recipe staged into `/config/svcmgr/services/`, and measures rather than
+tests: it logs result lines, and passes when every benchmark ran
+([Benchmarks](#benchmarks-bench-cell)).
+
 ---
 
 ## Reporting marker
@@ -132,6 +137,7 @@ sysroot/
     ├── ktest                 # kernel-surface harness (bootloader-loaded)
     ├── svctest               # services-surface harness
     ├── usertest              # programs-surface orchestrator
+    ├── ubench                # userspace benchmark suite
     ├── crasher               # svcmgr restart-path fixture
     ├── debug-echo            # debug-port fixture (`debug-port` case)
     ├── hotplug-check         # PCI Express hotplug fixture (`hotplug` case)
@@ -186,6 +192,7 @@ rootfs/config/svcmgr/
 ├── tests/                    # NOT loaded by svcmgr
 │   ├── svctest.svc
 │   ├── usertest.svc
+│   ├── ubench.svc            # userspace benchmark suite; staged by the `bench` cell
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
 │   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
 │   ├── crasher-boot.svc      # death-before-bootstrap fixture; co-staged with svctest
@@ -403,11 +410,18 @@ result line, its samples' summary in the form
 [shared/bench/README.md § Result line](../shared/bench/README.md#result-line) gives. A functional
 ktest boot runs every benchmark 8 times, a smoke run whose lines no check compares; the bench-only
 image (`cargo xtask build --ktest-bench-only`) runs Tier 3 alone, 4096 iterations each, for the
-lines that are compared. CI's `bench` cell, one per architecture, boots that image (debug) under
-QEMU's icount (`cargo xtask run --icount`): one guest clock tick per retired instruction, so a
-benchmark's count is the same in every run of one build, whatever the runner's load. It boots
-three times at one CPU and once at four, and `cargo xtask bench-check --mode icount` compares
-each measurement's lowest p50 over the runs with its baseline under `xtask/baselines/bench/icount/`
+lines that are compared. The userspace paths are measured by the
+[`ubench`](../programs/ubench/README.md) suite, in a boot of the regular init image with its
+recipe (`/config/svcmgr/tests/ubench.svc`) staged and the terminal dropped; it logs its own
+lines and fsbench's.
+
+CI's `bench` cell, one per architecture, boots both (debug) under QEMU's icount
+(`cargo xtask run --icount`): one guest clock tick per retired instruction, so a benchmark's
+count is the same in every run of one build, whatever the runner's load. It boots each three times
+at one CPU and once at four, the ubench boots with a framebuffer (`--display framebuffer`) and
+their logs saved in `ubench/` beside the ktest boots', and one
+`cargo xtask bench-check --mode icount` over both sets compares each measurement's lowest p50
+over the runs that reported its suite with its baseline under `xtask/baselines/bench/icount/`
 ([xtask/README.md § `cargo xtask bench-check`](../xtask/README.md#cargo-xtask-bench-check)).
 
 The one-CPU counts gate: a count further from its baseline than the larger of 1% of it and 8
@@ -417,6 +431,16 @@ too, since the stale baseline would let a later regression of the same size thro
 moves a count on purpose rewrites the baselines of the benchmarks it moved from its own CI run
 (`cargo xtask bench-baseline --from-run <run id>`) and states the change and its reason in its
 body. The four-CPU counts are reported, not gated: the interleaving of the CPUs moves them.
+
+A one-CPU count gates only when it does not include time blocked on a device completion. The
+completion arrives at host time: a guest blocked on it retires no instructions, and its clock
+advances by timer deadlines until QEMU completes the request, so the count follows the host's I/O
+latency. `fsbench.write`, which writes through the filesystem's page cache to the disk, is such a
+benchmark at every size, and is reported, not gated; a regression of the write path's
+instructions shows in the cell's report and in host mode, not as a failure. `fsbench.read` gates:
+its untimed open, fixture check and warm-up reads fill the filesystem's page cache with the file,
+so no timed read waits on the disk. A benchmark is classified by the same test: one whose timed
+samples wait on a device joins the set (`ICOUNT_IO_BOUND` in `xtask/src/benchmark.rs`).
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
@@ -1159,7 +1183,7 @@ registry runs it on (its `md-test-cells` rule).
 | `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
-| `bench` | Canonical | x86_64, riscv64; debug | the bench-only ktest bundle under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
+| `bench` | Canonical | x86_64, riscv64; debug | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |
 | 4kn | Local and release host runs | x86_64, riscv64; debug | svctest from a 4Kn disk (`mkdisk --block-size 4096`) | none | 4096-byte logical blocks (Disk variations below) |
@@ -2023,9 +2047,11 @@ per edge and compare tracing) and, where the host target supports it, AddressSan
   compiled under `#[cfg(any(test, kani, fuzzing))]`, so no image carries it. It panics when the
   parser breaks its contract on the input, and asserts that contract, not only that the parser
   returns:
-  for the GPT parser (`services/vfsd/gpt`), that an accepted header's entry array lies between
-  LBA 2 and the first usable LBA, that the partition walk reads exactly the array's blocks inside
-  the disk, and that each decoded entry re-encodes to its own bytes.
+  for the GPT parser (`services/vfsd/gpt`), that an accepted header's CRC32 and `MyLBA` match
+  and its entry array lies outside the usable range, that the partition walk reads exactly the
+  array's blocks inside the disk and judges the array's CRC32 rightly, that a disk's partitions
+  come from the primary GPT or, when it fails, the backup, and that each decoded entry re-encodes
+  to its own bytes.
 - Its checked-in inputs, under `<crate>/fuzz/<target>/`: `seeds/`, inputs that reach the parser's
   paths, and `regressions/`, each failing input a fuzz run found, minimized, added by the PR that
   fixes it. A `#[cfg(test)]` test of the crate runs the property on every one, so
@@ -2074,7 +2100,7 @@ in the same one, as a red `master` is ([conventions.md](conventions.md#ci-gating
 
 **Parser rule.** A parser of hostile input (bytes from a disk image, a device, the network, or
 another process across an IPC boundary) MUST land with its property function, its seeds, its replay
-test, and its fuzz target, as Layout above describes, and with the proof harness of its property
+test, and its fuzz target, as Layout above describes, and with the proof harnesses of its property
 ([Bounded verification](#bounded-verification), Parser proofs).
 
 ---
@@ -2102,12 +2128,23 @@ one; its loops are bounded; and it does not detect every aliasing or provenance 
 [supported Rust features](https://model-checking.github.io/kani/rust-feature-support.html)).
 
 **Parser proofs.** The property function of a parser of hostile input (§ Fuzzing, Layout) has a
-third driver beside its replay test and its fuzz target: a `#[kani::proof]` in the parser crate's
-`#[cfg(kani)] mod proofs` that runs the property on the first `len` bytes of
-`kani::any::<[u8; N]>()`, `len` itself any value up to N, so the contract holds for every input of
-at most N bytes, not only for the inputs a search reached. Its comment states N and why inputs of
-that length cover the format. The crate's first harness registers it with `cargo xtask kani`.
-Design intent; not yet implemented: no parser crate holds a proof harness yet.
+third driver beside its replay test and its fuzz target: the `#[kani::proof]` harnesses in the
+parser crate's `#[cfg(kani)] mod proofs`, which prove the property in one of two forms. A harness
+runs the property, or its check of one structure the parser decodes (a header, an entry), on the
+first `len` bytes of `kani::any::<[u8; N]>()`, `len` itself any value up to N, so the check holds
+for every input of at most N bytes, not only for the inputs a search reached; its comment states N
+and why inputs of that length cover the structure. Where a harness of the whole property does not
+complete within the gating job, the parser MUST write each loop over a structure of variable length
+(the walk of an array, a search over its entries, a checksum over its bytes) as a step over a small
+state, which two harnesses prove by induction: a base harness, that the loop starts in an invariant
+the harness states, and a step harness, that one step from any state in the invariant (`kani::any`
+under `kani::assume`) keeps it and does what the property asks of that step, with no loop to
+unwind. Code other than the loops that drive the steps and the reads that feed them MUST NOT lie
+outside the harnesses; the module's comment states how its harnesses compose into the property and
+names those loops and reads, with the drivers that check them. The crate's first harness registers
+it with `cargo xtask kani`. Implemented for the GPT parser
+(`services/vfsd/gpt`); design intent, not yet implemented, for every other parser of hostile input,
+none of which holds a property function yet.
 
 ---
 
@@ -2263,6 +2300,7 @@ note in full.
 [README.md](../README.md), [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [core/ktest/README.md](../core/ktest/README.md), [Build System](build-system.md),
 [Console Model](console-model.md), [Project Conventions](conventions.md),
+[Threat Model](threat-model.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
 [programs/crashme/README.md](../programs/crashme/README.md),
 [programs/deadline/README.md](../programs/deadline/README.md),
@@ -2279,6 +2317,7 @@ note in full.
 [programs/terminal/README.md](../programs/terminal/README.md),
 [programs/threadchurn/README.md](../programs/threadchurn/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
+[programs/ubench/README.md](../programs/ubench/README.md),
 [services/crashd/README.md](../services/crashd/README.md),
 [services/crasher/README.md](../services/crasher/README.md),
 [services/debug-echo/README.md](../services/debug-echo/README.md),

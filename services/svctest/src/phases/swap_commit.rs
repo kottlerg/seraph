@@ -8,11 +8,12 @@
 //! registered, so memmgr's overcommit allowance (`QUERY_POOL_STATUS`
 //! `data[15]`) is above 0.
 //!
-//! The admission part runs in every boot. A commitment of what the free pool
-//! alone admits (the free pages less `promised` and the growth floor) and
-//! half the allowance more is admitted; one of the free pages and the
-//! allowance less `promised` and the floor, and [`PAST_MARGIN_PAGES`] more,
-//! is refused with `OUT_OF_MEMORY_BEST_EFFORT`.
+//! The admission part runs in every boot. A commitment that takes, with its
+//! page-table reservation and metadata bound ([`commit_fitting`]), what the
+//! free pool alone admits (the free pages less `promised` and the growth
+//! floor) and half the allowance more is admitted; one of the free pages and
+//! the allowance less `promised` and the floor, and [`PAST_MARGIN_PAGES`]
+//! more, is refused with `OUT_OF_MEMORY_BEST_EFFORT`.
 //!
 //! The write part runs when crashd holds faults declined for want of memory
 //! (its recipe staged with a non-zero `CRASHD_OOM_STALL_MS`): without it a
@@ -173,16 +174,20 @@ fn admission() -> (u64, u64)
          below {MIN_ALLOWANCE_PAGES}"
     );
     let alone = free.saturating_sub(promised).saturating_sub(floor);
-    let within = alone.saturating_add(allowance / 2);
+    let within = commit_fitting(alone.saturating_add(allowance / 2));
     let got = commit_once(within);
     assert_eq!(
         got,
         memmgr_errors::SUCCESS,
         "{PHASE}: a commitment of {within} pages refused ({got:#x}): {free} free, {promised} \
-         promised, a floor of {floor} and an allowance of {allowance} pages admit up to {}",
-        free.saturating_add(allowance)
-            .saturating_sub(promised)
-            .saturating_sub(floor)
+         promised, a floor of {floor} and an allowance of {allowance} pages admit up to {} with \
+         the page-table reservation and metadata bound ({} on the free pool alone)",
+        commit_fitting(
+            free.saturating_add(allowance)
+                .saturating_sub(promised)
+                .saturating_sub(floor)
+        ),
+        commit_fitting(alone)
     );
     for _ in 0..PAST_ATTEMPTS
     {
@@ -204,6 +209,34 @@ fn admission() -> (u64, u64)
         }
     }
     panic!("{PHASE}: a commitment past the allowance admitted in each of {PAST_ATTEMPTS} attempts");
+}
+
+/// The most pages a committed region may have for its commitment to take at
+/// most `budget` of the pages a commitment may still promise: its data pages,
+/// its page-table reservation and its metadata bound together
+/// (`free_pool::commit::grow_need`; services/memmgr/docs/memory-pool.md
+/// § Commit). The two bounds grow with the region, so on a large pool they
+/// outgrow any fixed margin.
+fn commit_fitting(budget: u64) -> u64
+{
+    let takes =
+        |pages: u64| free_pool::commit::grow_need(0, pages.saturating_mul(PAGE_SIZE)).promised();
+    // A commitment takes at least its pages, so the answer is at most
+    // `budget`; `takes` grows with the pages, so halve the range between.
+    let (mut lo, mut hi) = (0u64, budget);
+    while lo < hi
+    {
+        let mid = lo.saturating_add(hi.saturating_sub(lo).div_ceil(2));
+        if takes(mid) <= budget
+        {
+            lo = mid;
+        }
+        else
+        {
+            hi = mid.saturating_sub(1);
+        }
+    }
+    lo
 }
 
 /// Register a committed region of `pages` pages over a range reserved for

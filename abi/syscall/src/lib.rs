@@ -837,8 +837,10 @@ pub const EVENT_QUEUE_MAX_CAPACITY: u32 = 1 << 20;
 /// Maximum number of data words in an IPC message.
 ///
 /// Supports transferring a full 512-byte disk sector (64 words) inline.
-/// Data is read from / written to the sender/receiver's IPC buffer page.
-/// Cap metadata starts at word `MSG_DATA_WORDS_MAX` in the IPC buffer.
+/// A message of more than [`MSG_REGS_DATA_MAX`] words is read from / written
+/// to the sender/receiver's IPC buffer page; a shorter one travels in the
+/// message registers. Cap metadata starts at word `MSG_DATA_WORDS_MAX` in the
+/// IPC buffer.
 ///
 /// The value is an ABI width: the cap count and the handles follow it at fixed
 /// word offsets, and all of them fit the one IPC buffer page. It bounds only
@@ -863,6 +865,56 @@ pub const MSG_CAP_SLOTS_MAX: usize = 4;
 /// the delivered count at word `MSG_DATA_WORDS_MAX`, the delivered handles from
 /// this word on.
 pub const MSG_CAP_HANDLES_WORD: usize = MSG_DATA_WORDS_MAX + 1;
+
+/// Most data words a message carries in the message registers MR0..MR5
+/// rather than in the IPC buffer page; the same on every architecture.
+///
+/// The data-word count selects the transport, all or nothing, in both
+/// directions (`SYS_IPC_CALL`, `SYS_IPC_REPLY`, and every delivery): a
+/// message of at most this many words carries all of them in the message
+/// registers, and the kernel neither reads nor writes the IPC buffer's data
+/// words for it; a longer one carries all of them in the IPC buffer, and the
+/// message registers are ignored on input and left as they were on output.
+/// Capability handles always travel in the IPC buffer's cap block. Which
+/// registers are MR0..MR5 is per architecture
+/// (`core/kernel/docs/syscalls.md` § Calling Convention).
+pub const MSG_REGS_DATA_MAX: usize = 6;
+
+/// Bit position of the delivered capability count in the count word an IPC
+/// delivery returns ([`ipc_delivered_counts`]).
+pub const IPC_DELIVERED_CAPS_SHIFT: u32 = 8;
+
+/// Mask of each field of the delivered count word.
+const IPC_DELIVERED_FIELD_MASK: u64 = 0xFF;
+
+/// The count word an IPC delivery returns (`SYS_IPC_CALL`'s reply count,
+/// `SYS_IPC_RECV`'s message count): the delivered data-word count in bits
+/// 0..7 and the delivered capability count in bits
+/// [`IPC_DELIVERED_CAPS_SHIFT`]..15, the rest zero. Each count is cut to its
+/// 8 bits; the kernel's counts are at most [`MSG_DATA_WORDS_MAX`] and
+/// [`MSG_CAP_SLOTS_MAX`]. The handles of delivered capabilities are in the
+/// IPC buffer's cap result block, which the kernel writes only when the
+/// capability count is non-zero.
+#[must_use]
+pub const fn ipc_delivered_counts(data_count: u64, cap_count: u64) -> u64
+{
+    (data_count & IPC_DELIVERED_FIELD_MASK)
+        | ((cap_count & IPC_DELIVERED_FIELD_MASK) << IPC_DELIVERED_CAPS_SHIFT)
+}
+
+/// The data-word count of a delivered count word ([`ipc_delivered_counts`]).
+#[must_use]
+pub const fn ipc_delivered_data_count(counts: u64) -> u64
+{
+    counts & IPC_DELIVERED_FIELD_MASK
+}
+
+/// The capability count of a delivered count word ([`ipc_delivered_counts`]).
+#[must_use]
+pub const fn ipc_delivered_cap_count(counts: u64) -> u64
+{
+    (counts >> IPC_DELIVERED_CAPS_SHIFT) & IPC_DELIVERED_FIELD_MASK
+}
 
 // ── Wait timeouts ─────────────────────────────────────────────────────────────
 
@@ -970,6 +1022,14 @@ pub const fn cspace_topup_pages(headroom: u64, budget_bytes: u64, slots: u64) ->
 // The cap block (count word plus the handles) must stay inside the one IPC
 // buffer page the kernel reads and writes.
 const _: () = assert!(((MSG_CAP_HANDLES_WORD + MSG_CAP_SLOTS_MAX) * 8) as u64 <= PAGE_SIZE);
+
+// Both counts fit their 8-bit fields of the delivered count word, and the
+// register transport is a prefix of the buffer's.
+const _: () = assert!(
+    MSG_DATA_WORDS_MAX as u64 <= IPC_DELIVERED_FIELD_MASK
+        && MSG_CAP_SLOTS_MAX as u64 <= IPC_DELIVERED_FIELD_MASK
+        && MSG_REGS_DATA_MAX <= MSG_DATA_WORDS_MAX
+);
 
 /// Synthetic reply label written to the caller's IPC message by the kernel
 /// when `SYS_IPC_REPLY` cannot deliver the server's reply intact: rejected
@@ -2010,6 +2070,36 @@ mod tests
             ipc_call_timeout_ms(wide),
             9,
             "count bits never reach the timeout"
+        );
+    }
+
+    // Defects guarded: a delivered count word whose capability count leaks
+    // into the data count (a capless reader then sees extra words), one that
+    // drops either count at its largest value, or a capless delivery whose
+    // word is not its bare data count.
+    #[test]
+    fn ipc_delivered_counts_round_trip_both_counts()
+    {
+        assert_eq!(
+            ipc_delivered_counts(6, 0),
+            6,
+            "a capless word is the bare count"
+        );
+        for (data, caps) in [
+            (0, 0),
+            (0, MSG_CAP_SLOTS_MAX as u64),
+            (MSG_REGS_DATA_MAX as u64, 1),
+            (MSG_DATA_WORDS_MAX as u64, MSG_CAP_SLOTS_MAX as u64),
+        ]
+        {
+            let counts = ipc_delivered_counts(data, caps);
+            assert_eq!(ipc_delivered_data_count(counts), data);
+            assert_eq!(ipc_delivered_cap_count(counts), caps);
+        }
+        assert_eq!(
+            ipc_delivered_counts(0x1FF, 0x102),
+            0x2FF,
+            "each count is cut to its field"
         );
     }
 

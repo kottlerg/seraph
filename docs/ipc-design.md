@@ -105,19 +105,25 @@ A message consists of:
   specified in [capability-internals.md](../core/kernel/docs/capability-internals.md)
   § Move.
 
-**Data-word transport:** Data words travel through a per-thread **IPC buffer
-page**. Each thread registers its IPC buffer page once via `SYS_IPC_BUFFER_SET`.
-The kernel reads from the sender's page and writes to the receiver's page
-directly — no arbitrary user pointer dereference, no heap allocation. The error
-surface of a missing or unmapped page, on the sending and the delivery side, is
-specified in [syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_IPC_BUFFER_SET`.
+**Data-word transport:** The data-word count selects the transport, all or nothing. A
+message of at most `MSG_REGS_DATA_MAX` (6) data words carries them all in six **message
+registers**, in both directions: the kernel reads them from the sender's saved registers and
+writes them to the receiver's, touching neither thread's memory. The registers are named per
+architecture in [syscalls.md](../core/kernel/docs/syscalls.md) § Calling Convention. A longer
+message travels through a per-thread **IPC buffer page**, which a thread registers once via
+`SYS_IPC_BUFFER_SET`: the kernel reads from the sender's page and writes to the receiver's page
+directly — no arbitrary user pointer dereference, no heap allocation — and its message registers
+are ignored. The error surface of a missing or unmapped page, on the sending and the delivery
+side, is specified in [syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_IPC_BUFFER_SET`.
 The IPC buffer page also carries the capability handles, in a cap block after the
 data words: the sender writes the full handles of the caps it transfers there
 (one `u64` handle per word from `MSG_CAP_HANDLES_WORD`), and the kernel writes the
 delivered destination handles to the same words of the receiver's page, after the
-delivered count at word `MSG_DATA_WORDS_MAX`. A message that transfers caps therefore
-needs a registered page, as one that carries data words does. Message labels,
-counts, and badges travel in registers.
+delivered count at word `MSG_DATA_WORDS_MAX`, only when it delivers a capability. A message
+that transfers caps therefore needs a registered page, as one of more than
+`MSG_REGS_DATA_MAX` data words does, and a capless message within the register limit needs
+none. Message labels, counts, and badges travel in registers: the delivered data-word count and
+cap count share one register, so a receiver learns that no cap arrived without reading the page.
 
 For bulk data, pass a shared memory capability instead.
 

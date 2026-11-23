@@ -34,9 +34,18 @@ Seraph uses the `SYSCALL`/`SYSRET` instructions on x86-64.
 | `r11` | Clobbered by `SYSCALL` (holds saved rflags); not an argument register |
 
 All other registers are preserved across a syscall, except the extra return registers
-the IPC calls name (`r9` for `SYS_IPC_CALL`; `rsi` and `r8` for `SYS_IPC_RECV`; `rsi` for
-`SYS_EVENT_RECV`). The callee-saved set matches the System V AMD64 ABI (`rbx`, `rbp`,
-`r12`–`r15`).
+the IPC calls name (`r10` for `SYS_IPC_CALL`; `rsi` and `r10` for `SYS_IPC_RECV`; `rsi` for
+`SYS_EVENT_RECV`) and the message registers a delivered message writes (below). The
+callee-saved set matches the System V AMD64 ABI (`rbx`, `rbp`, `r12`–`r15`), so a wrapper of
+`SYS_IPC_CALL` or `SYS_IPC_RECV` declares `r12`–`r15` among its outputs.
+
+**Message registers:** MR0..MR5 are `r8`, `r9`, `r12`, `r13`, `r14` and `r15`. A message of
+at most `MSG_REGS_DATA_MAX` (6) data words carries them all in these registers: a sent message's
+word *i* is read from MR*i* (`SYS_IPC_CALL`, `SYS_IPC_REPLY`), and a delivered message's word
+*i* is written to MR*i* (the reply at a `SYS_IPC_CALL`'s return, the message at a
+`SYS_IPC_RECV`'s), the registers past the data count keeping their values. A message of more
+words travels in the IPC buffer page: its message registers are ignored on input and left
+unchanged on output (§ `SYS_IPC_CALL` (0)).
 
 **Return values:**
 
@@ -44,7 +53,7 @@ the IPC calls name (`r9` for `SYS_IPC_CALL`; `rsi` and `r8` for `SYS_IPC_RECV`; 
   On success, `rax` holds the non-negative result (or zero if the call has no result).
 - `rdx`: secondary return value (e.g. the label from `ipc_recv`, the acquired bits from
   `notification_wait`). A call with no secondary result leaves `rdx` unchanged. The IPC
-  calls also return values in `rsi`, `r8` and `r9`: see § `SYS_IPC_CALL` (0),
+  calls also return values in `rsi`, `r10` and the message registers: see § `SYS_IPC_CALL` (0),
   § `SYS_IPC_RECV` (2), and § `SYS_EVENT_RECV` (6).
 
 **Errno convention:** The kernel returns the error code directly in `rax` as a
@@ -66,9 +75,14 @@ Seraph uses the `ECALL` instruction on RISC-V. The trap handler in `stvec` dispa
 | `a5` | Argument 5 |
 
 All other registers are preserved, except the extra return registers the IPC calls name
-(`a2` for `SYS_IPC_CALL`; `a2` and `a3` for `SYS_IPC_RECV`; `a2` for `SYS_EVENT_RECV`).
+(`a2` for `SYS_IPC_CALL`; `a2` and `a3` for `SYS_IPC_RECV`; `a2` for `SYS_EVENT_RECV`)
+and the message registers a delivered message writes (below).
 Callee-saved registers are `s0`–`s11` and `sp` (matching the RISC-V calling convention); the
 kernel also restores `ra`.
+
+**Message registers:** MR0..MR5 are `a4`, `a5`, `a6`, `t0`, `t1` and `t2`, used as on x86-64
+(above): a message of at most `MSG_REGS_DATA_MAX` (6) data words carries them all in these
+registers, in both directions.
 
 **Return values:** `a0` is the primary return value (negative on error). `a1` is the
 secondary return value where applicable.
@@ -330,7 +344,7 @@ timeout elapses.
 | 1 | `label` | Message label (opaque word; passed to server as-is) |
 | 2 | `data_count`, `timeout_ms` | Bits 0–31: number of data words (0–MSG_DATA_WORDS_MAX). Bits 32–63: `timeout_ms`, `0` = no timeout (`syscall_abi::ipc_call_count_arg` packs both) |
 | 3 | `cap_count` | Number of capabilities to transfer (0–MSG_CAP_SLOTS_MAX) |
-| 4, 5 | (unused) | Ignored |
+| 4, 5 | (unused) | Ignored as arguments: their registers are MR0 and MR1 (**Data words** below) |
 
 **Timeout:** A non-zero `timeout_ms` bounds the whole call, its wait for a receiver and its
 wait for the reply, at timer-tick granularity. On expiry the call returns `WouldBlock`: a
@@ -348,27 +362,35 @@ handle to a recycled slot is rejected (`InvalidCapability`) instead of transmitt
 the slot's current occupant (see [capability-model.md](../../../docs/capability-model.md)
 § Capability Handle Format). The delivered destination handles are reported through
 the result block in the receiver's IPC buffer page, at the same word offsets (see
-[ipc-design.md](../../../docs/ipc-design.md) § Message Format).
+[ipc-design.md](../../../docs/ipc-design.md) § Message Format). The kernel writes the result
+block only when it delivers a capability; with none delivered, the block's count word is
+unspecified, and the returned count register's cap count is the authority.
 
-**Data words:** When `data_count` > 0, the kernel reads the data words from
-the caller's registered IPC buffer page (`SYS_IPC_BUFFER_SET`); the syscall
-fails with `InvalidArgument` if none is registered. Reply data words are
-written back to the same page when the server replies. No arbitrary user
-pointer is dereferenced (see [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
+**Data words:** A message of at most `MSG_REGS_DATA_MAX` (6) data words travels in the
+message registers (§ Calling Convention): the kernel reads the caller's words from MR0 onward and
+needs no IPC buffer page for them. A message of more words is read from the caller's registered
+IPC buffer page (`SYS_IPC_BUFFER_SET`), from word 0, and the syscall fails with
+`InvalidArgument` if none is registered. The reply's data words come back the same way, by the
+reply's own count: in the message registers when at most `MSG_REGS_DATA_MAX`, in the same page
+otherwise. No arbitrary user pointer is dereferenced (see
+[ipc-design.md](../../../docs/ipc-design.md) § Message Format).
 
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: reply label (valid on success)
-- `r9`/`a2`: reply data-word count
+- `r10`/`a2`: the delivered counts: the reply's data-word count in bits 0–7 and the count of
+  capabilities delivered with it in bits 8–15 (`syscall_abi::ipc_delivered_data_count` and
+  `ipc_delivered_cap_count` read them)
+- MR0..MR5: the reply's data words, when it carries at most `MSG_REGS_DATA_MAX`
 
 **Capability requirement:** `endpoint_cap` must have Send rights, plus Grant
 when the message carries capabilities.
 
 **Errors:** `InvalidCapability` (also: a cap slot is stale or Null),
 `InsufficientRights`, `InvalidArgument` (a cap slot repeated in one message, or
-`data_count` > 0 or `cap_count` > 0 with no IPC buffer page registered; a `data_count`
-or `cap_count` above its maximum is clamped, not refused),
+`data_count` above `MSG_REGS_DATA_MAX` or `cap_count` > 0 with no IPC buffer page registered;
+a `data_count` or `cap_count` above its maximum is clamped, not refused),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
 slot is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
 transfer), `QuotaExceeded` (a cap's object has its reference count at its 2^30 ceiling),
@@ -402,7 +424,7 @@ Send a reply to the caller bound to this thread by its most recent `SYS_IPC_RECV
 | 0 | `label` | Reply label |
 | 1 | `data_count` | Number of data words (0–MSG_DATA_WORDS_MAX) |
 | 2 | `cap_count` | Number of capabilities to transfer (0–MSG_CAP_SLOTS_MAX) |
-| 3, 4 | (unused) | Ignored |
+| 3, 4 | (unused) | Ignored as arguments: argument 4's register is MR0 (data words below) |
 
 The reply's cap handles travel as for `SYS_IPC_CALL`: full handles in the server's
 IPC buffer page from word `MSG_CAP_HANDLES_WORD`, so a stale reply slot is rejected
@@ -417,21 +439,22 @@ time; see [capability-internals.md](capability-internals.md) § Capability Trans
 in IPC). It is consumed by this syscall whether it succeeds or fails. If no reply
 capability is present (this thread holds no pending caller: it received none, or the
 caller was cancelled), the syscall returns `InvalidCapability`, unless a payload or cap
-check fails first: `data_count` > 0 or `cap_count` > 0 with no IPC buffer page
-registered returns `InvalidArgument`, an unmapped IPC buffer page `InvalidAddress`, and
+check fails first: `data_count` above `MSG_REGS_DATA_MAX` or `cap_count` > 0 with no IPC
+buffer page registered returns `InvalidArgument`, an unmapped IPC buffer page `InvalidAddress`, and
 an invalid reply cap slot its own error.
 
-Data words follow the same rules as `SYS_IPC_CALL`: when `data_count` > 0
-they are read from this thread's registered IPC buffer page and written to
-the original caller's IPC buffer page; when `cap_count` > 0 the handles are read
-from the same page's cap block.
+Data words follow the same rules as `SYS_IPC_CALL`: a reply of at most
+`MSG_REGS_DATA_MAX` words is read from this thread's message registers and written to the
+original caller's, and a longer one is read from this thread's registered IPC buffer page and
+written to the caller's page; when `cap_count` > 0 the handles are read from the same page's
+cap block.
 
 **Capability requirement:** Implicit reply capability bound in the calling thread
 (`reply_tcb`).
 
 **Errors:** `InvalidCapability` (no pending reply, or a reply cap slot went
-stale), `InvalidArgument` (a cap slot repeated in one reply, or
-`data_count` > 0 or `cap_count` > 0 with no IPC buffer page registered), `InvalidAddress`
+stale), `InvalidArgument` (a cap slot repeated in one reply, or `data_count` above
+`MSG_REGS_DATA_MAX` or `cap_count` > 0 with no IPC buffer page registered), `InvalidAddress`
 (registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
 pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer),
 `QuotaExceeded` (caller's CSpace
@@ -481,23 +504,28 @@ Wait for a call on an endpoint, with an optional bounded wait.
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: label from the incoming message
 - `rsi`/`a2`: badge of the incoming message (0 if unbadged)
-- `r8`/`a3`: data-word count of the delivered message
+- `r10`/`a3`: the delivered counts, packed as for `SYS_IPC_CALL`: the data-word count in
+  bits 0–7 and the count of capabilities delivered in bits 8–15
+- MR0..MR5: the message's data words, when it carries at most `MSG_REGS_DATA_MAX`
 
-The message's data words are written to the receiver's registered IPC buffer page, followed by the
-cap-transfer result block (count, then the delivered destination handles) at word offset
-`MSG_DATA_WORDS_MAX`. The kernel binds the caller to the receiving thread as its reply capability
-(the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive
-that passes its capability check and cap-slot pre-allocation while a reply is still pending first
+The message's data words are written to the receiver's message registers when there are at most
+`MSG_REGS_DATA_MAX` of them, kernel-synthesized fault messages included, and to its registered IPC
+buffer page otherwise. The cap-transfer result block (count, then the delivered destination handles)
+at word offset `MSG_DATA_WORDS_MAX` of that page is written only when a capability is delivered;
+with none delivered its count word is unspecified, and the returned count register's cap count is
+the authority. The kernel binds the caller to the receiving thread as its reply capability (the
+per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive that
+passes its capability check and cap-slot pre-allocation while a reply is still pending first
 releases the pending caller (a receive refused before then leaves the binding, and so does a
 try-once that finds no caller, which therefore leaves the reply owed; a try-once that finds one
 releases the pending caller as it binds the new one, and a bounded receive releases it before it
-waits, whether or not the wait then times out): its
-`SYS_IPC_CALL` returns `Interrupted`, a fault-blocked caller is killed as for any cancelled
-fault episode (for the fault of a restartable syscall's user copy, that syscall fails with
-`InvalidAddress`), and a caller blocked in an upcall delivery has its upcall dropped and resumes
-([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
-Upcalls). The binding is therefore never overwritten
-([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model).
+waits, whether or not the wait then times out): its `SYS_IPC_CALL` returns `Interrupted`, a
+fault-blocked caller is killed as for any cancelled fault episode (for the fault of a restartable
+syscall's user copy, that syscall fails with `InvalidAddress`), and a caller blocked in an upcall
+delivery has its upcall dropped and resumes
+([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous Upcalls).
+The binding is therefore never overwritten ([ipc-design.md](../../../docs/ipc-design.md) § The
+Call/Reply Model).
 
 For a call, the badge is the value attached to the sender's endpoint capability via
 `SYS_CAP_DERIVE_BADGE`; it identifies the caller without a forgeable PID. For a
@@ -3540,9 +3568,11 @@ space is not held: no hold was made, a release ended it, or a hold of it has not
 
 Register the per-thread IPC buffer page. This is the page the kernel uses for
 IPC data words (`SYS_IPC_CALL`, `SYS_IPC_REPLY`, and `SYS_IPC_RECV` delivery,
-whenever `data_count` > 0), for the cap handles a `SYS_IPC_CALL` or
+whenever `data_count` exceeds `MSG_REGS_DATA_MAX`; a shorter message travels in the message
+registers of § Calling Convention), for the cap handles a `SYS_IPC_CALL` or
 `SYS_IPC_REPLY` transfers (whenever `cap_count` > 0), and for the cap-transfer
-result block.
+result block (whenever a capability is delivered). A thread whose messages carry at most
+`MSG_REGS_DATA_MAX` data words and no capabilities needs no page.
 
 **Arguments:**
 
@@ -3555,17 +3585,17 @@ result block.
 The page at `virt` must already be mapped in the calling thread's address space with
 at least read+write permissions. The kernel records the address in the calling
 thread's TCB. The page must remain mapped for the duration of any IPC that uses it.
-The error surface is read-side only: a *sending* IPC that carries data words or
-caps fails with `InvalidArgument` when no page is registered and `InvalidAddress`
-when the registered page is unmapped, while delivery-side writes are best-effort — a
-receiver with no usable page silently misses the data words and the
-cap-result block. Transferred capabilities are still moved into that receiver's
+The error surface is read-side only: a *sending* IPC that carries more than
+`MSG_REGS_DATA_MAX` data words, or caps, fails with `InvalidArgument` when no page is
+registered and `InvalidAddress` when the registered page is unmapped, while delivery-side
+writes are best-effort — a receiver with no usable page silently misses a longer message's data
+words and the cap-result block. Transferred capabilities are still moved into that receiver's
 CSpace; without the result block it cannot learn their handles, so the slots
 stay consumed until the CSpace is torn down.
 
 Calling `SYS_IPC_BUFFER_SET` again replaces the previous registration. Passing 0
-deregisters the IPC buffer page (sending IPC that carries data words or caps then
-fails with `InvalidArgument`).
+deregisters the IPC buffer page (sending IPC that carries more than `MSG_REGS_DATA_MAX`
+data words, or caps, then fails with `InvalidArgument`).
 
 **Capability requirement:** None — acts on the calling thread implicitly.
 

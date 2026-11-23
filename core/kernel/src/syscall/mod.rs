@@ -204,19 +204,34 @@ impl UserFrame
     }
 
     /// Write the `SYS_IPC_CALL` return registers.
-    pub fn set_ipc_call_return(self, primary: u64, reply_label: u64, reply_word_count: u64)
+    pub fn set_ipc_call_return(self, primary: u64, reply_label: u64, counts: u64)
     {
         // SAFETY: as for `set_return`.
-        unsafe { (*self.0.as_ptr()).set_ipc_call_return(primary, reply_label, reply_word_count) };
+        unsafe { (*self.0.as_ptr()).set_ipc_call_return(primary, reply_label, counts) };
     }
 
     /// Write the `SYS_IPC_RECV` return registers.
-    pub fn set_ipc_recv_return(self, primary: u64, label: u64, badge: u64, word_count: u64)
+    pub fn set_ipc_recv_return(self, primary: u64, label: u64, badge: u64, counts: u64)
     {
         // SAFETY: as for `set_return`.
         unsafe {
-            (*self.0.as_ptr()).set_ipc_recv_return(primary, label, badge, word_count);
+            (*self.0.as_ptr()).set_ipc_recv_return(primary, label, badge, counts);
         };
+    }
+
+    /// The message registers MR0..MR5 ([`TrapFrame::msg_regs`]).
+    pub fn msg_regs(self) -> [u64; syscall::MSG_REGS_DATA_MAX]
+    {
+        // SAFETY: as for `syscall_nr`.
+        unsafe { (*self.0.as_ptr()).msg_regs() }
+    }
+
+    /// Write `words` to the message registers from MR0 on
+    /// ([`TrapFrame::set_msg_regs`]).
+    pub fn set_msg_regs(self, words: &[u64])
+    {
+        // SAFETY: as for `set_return`.
+        unsafe { (*self.0.as_ptr()).set_msg_regs(words) };
     }
 }
 

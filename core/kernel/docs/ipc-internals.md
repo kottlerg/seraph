@@ -93,7 +93,8 @@ every earlier waiter and a later one finds the queues empty.
 
 ```
 1. Resolve endpoint_cap → verify Send rights
-2. Read the data words from the sender's IPC buffer page (data_count > 0),
+2. Read the data words, from the sender's message registers in its saved
+   frame (data_count <= MSG_REGS_DATA_MAX) or its IPC buffer page (above),
    pre-validate the cap slots, open the park episode (open_call_episode);
    a non-zero timeout_ms (arg 2's high half) gives the call's deadline
 3. Acquire endpoint lock; if receivers == 0, release it and return NoReceiver
@@ -105,8 +106,8 @@ every earlier waiter and a later one finds the queues empty.
       claims its receive, so a timed receive's sleep-list entry is removed
       (cancel_timed_entry)
    b. Stage the message in recv_tcb.ipc_msg: label/counts/badge from the
-      sender's saved register state, data words read from the sender's IPC
-      buffer page (the receiver writes them to its own page when it resumes)
+      sender's saved register state, data words read at step 2 (the receiver
+      writes them to its own message registers or page when it resumes)
    c. Pin current_tcb for its eventual reply wake (wake_in_flight = 1),
       store a timed call's sleep_deadline, publish the caller binding (the
       server's reply capability): recv_tcb.reply_tcb = current_tcb (Release
@@ -147,18 +148,23 @@ every earlier waiter and a later one finds the queues empty.
 **Message copy:** The label, counts, and badge travel in saved register state
 (message format per
 [docs/ipc-design.md § Message Format](../../../docs/ipc-design.md#message-format)).
-Data words and the sender's cap handles travel through the per-thread IPC buffer
-pages: when `data_count` > 0 the kernel reads the words from the sender's
-registered page and writes them into the receiver's registered page, and when
-`cap_count` > 0 it reads the handles from the sender's cap block; the delivered
-cap-transfer result block is likewise written into the receiver's page. The error
-surface is read-side only,
-per [syscalls.md § `SYS_IPC_BUFFER_SET`](syscalls.md#sys_ipc_buffer_set-42): a
-sender (or replier) with no registered page fails with `InvalidArgument`, and a
-sender page unmapped at copy time surfaces the copy fault (`InvalidAddress`),
-while delivery-side writes are best-effort — an unregistered or unmapped
-receiver page silently drops the data words and cap results; the drop fails no
-syscall on either side. Nothing is allocated on the path.
+The data-word count selects the data words' transport. At most `MSG_REGS_DATA_MAX` words
+travel in the message registers: `read_data_words` copies them from the sender's saved frame
+(`UserFrame::msg_regs`) into `Message::data`, a read that cannot fault, and
+`deliver_data_words` writes exactly the delivered count into the receiver's saved frame
+(`UserFrame::set_msg_regs`), so the registers past it keep the receiver's values and no word
+of another message reaches them. More words travel through the per-thread IPC buffer pages:
+the kernel reads them from the sender's registered page and writes them into the receiver's.
+When `cap_count` > 0 the kernel reads the handles from the sender's cap block, and when it
+delivers a cap it writes the cap-transfer result block into the receiver's page
+(`write_cap_results`, which skips a delivery of no cap; the count register carries the
+delivered cap count, `syscall_abi::ipc_delivered_counts`). The error surface is read-side
+only, per [syscalls.md § `SYS_IPC_BUFFER_SET`](syscalls.md#sys_ipc_buffer_set-42): a sender
+(or replier) of a longer message or of caps with no registered page fails with
+`InvalidArgument`, and a sender page unmapped at copy time surfaces the copy fault
+(`InvalidAddress`), while delivery-side writes are best-effort — an unregistered or unmapped
+receiver page silently drops a longer message's data words and the cap results; the drop fails
+no syscall on either side. Nothing is allocated on the path.
 
 ### Receive Path (Server)
 
@@ -195,7 +201,8 @@ syscall on either side. Nothing is allocated on the path.
       binding is published, a stop, a timed call's expiry, or a teardown can
       claim it and wake the sender, which can exit and be freed
    f. Copy the message copied in a (label/counts plus the data words read at
-      call time) into the server's trap frame and IPC buffer page, and
+      call time) into the server's trap frame (its message registers within
+      MSG_REGS_DATA_MAX words) or IPC buffer page (above), and
       transfer capability slots from the CSpace the identity copied in a
       names
    g. Return to server with message (no blocking)
@@ -249,7 +256,8 @@ released.
    the reply returning the error, when it names none), in
    caller_tcb.fault_outcome; for DECLINED, FORWARDED, or REDIRECTED,
    deposit the label and data word 0 (the decline reason or the redirect
-   word, when sent and readable, by `deposit_reply_word`), with the named
+   word, when sent and readable, by `deposit_reply_word`, from MR0 within
+   MSG_REGS_DATA_MAX words), with the named
    cap's badge for REDIRECTED, in caller_tcb's ipc_msg; stamp the episode, and go to step 6
 3. Read the data words and pre-validate the reply cap slots; when caps are
    attached, pre-allocate the slots in the caller's CSpace (resolved
@@ -260,8 +268,8 @@ released.
    IPC_REPLY_TRANSFER_FAILED reply instead, wake the caller (step 6), and
    return the error to the server
 5. Stage the reply in caller_tcb.ipc_msg (label/count for the caller's
-   return registers, data words for the caller to write to its own IPC
-   buffer page when it resumes, cap results) and stamp REPLY
+   return registers, data words for the caller to write to its own message
+   registers or IPC buffer page when it resumes, cap results) and stamp REPLY
 6. enqueue_and_wake(caller_tcb) on its selected CPU; return to the server
 ```
 
@@ -1042,8 +1050,8 @@ The capability-revocation deferred-cleanup pattern remains specified in
 
 ### Cross-CPU Wakeup
 
-The wake protocol — producer-side enqueue plus RESCHEDULE_PENDING set, IPI
-delivery, consumer-side atomic check-and-halt — is specified in
+The wake protocol — producer-side enqueue, IPI delivery, consumer-side atomic
+check-and-halt — is specified in
 [scheduling-internals.md § Wake Protocol Invariants](scheduling-internals.md#wake-protocol-invariants).
 The wake-one primitives invoke `enqueue_and_wake` after releasing their source IPC lock;
 `waitset_notify` and `waitset_add`'s ready-at-add wake release `ws.lock` but wake while the

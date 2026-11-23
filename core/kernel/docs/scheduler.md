@@ -541,7 +541,8 @@ the outcomes that cost no tick still cost none, since a pull above the threshold
   its own CPU, costs at most two ticks: the one that recorded it, and the pull's when the
   pull, rather than the next tick's check, finds it cleared or in a later episode. r counts
   these candidates, a backlog that clears and forms again among them; each moves the cursor
-  past its CPU, so r counts at most the CPUs ahead of the thread's in the cursor's order. The
+  past its CPU, where the next scan starts, so the cursor only moves forward and r counts at
+  most the CPUs ahead of the thread's in the cursor's order. The
   queued thread the bound is for cannot be one: its CPU's queues hold it, so its backlog stays
   one episode until it runs.
 - A pull above the threshold that the re-check of its rule refuses
@@ -652,8 +653,7 @@ Hot-path cost per CPU per tick:
   candidate's run-queue mask and one Relaxed load of its backlog episode, and a Relaxed store of its
   own candidate and episode (and of its cursor when a pull from the candidate found nothing
   pullable), fields only this CPU writes. A pull above the threshold that finds nothing pullable
-  adds a second scan of the same cost, and so does a candidate whose backlog did not stand when the
-  scan recorded its CPU again. Each idle tick also loads its own `idle_pull_held` (Relaxed)
+  adds a second scan of the same cost. Each idle tick also loads its own `idle_pull_held` (Relaxed)
   and stores it with its candidate, and a confirmed candidate not held the tick before adds a
   `has_no_work` read of each of the idle CPU's SMT siblings (§ SMT Awareness).
 - Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick

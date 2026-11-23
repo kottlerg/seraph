@@ -5895,8 +5895,8 @@ fn idle_pull_tick(
         .candidate
         .filter(|backlog| backlog.cpu < cpu_count && backlog.cpu != this_cpu)
         .map(|backlog| (backlog, view.backlog(backlog.cpu) == Some(backlog.episode)));
-    let mut scan = idle_scan(view, this_cpu, cpu_count, cursor, None);
-    let cursor = pass_broken_candidate(view, this_cpu, cpu_count, cursor, candidate, &mut scan);
+    let cursor = pass_broken_candidate(cursor, cpu_count, candidate);
+    let scan = idle_scan(view, this_cpu, cpu_count, cursor, None);
 
     let held = memory.held;
     let mut step = idle_pull_step(scan, candidate, || !held && view.sibling_busy());
@@ -5988,35 +5988,26 @@ fn idle_pull_tick(
     }
 }
 
-/// The cursor of an idle tick of `this_cpu` whose scan from `cursor` read
-/// `scan`, given its `candidate` as [`idle_pull_tick`] read it. A candidate
-/// whose backlog did not stand since it was recorded moves the cursor past its
-/// CPU, and `scan` then records another CPU's backlog when there is one: a CPU
-/// whose queues keep draining and filling again within a tick, recorded afresh
-/// on every tick, would otherwise hide every backlog behind it in the scan's
-/// order (core/kernel/docs/scheduler.md § Load Balancing).
-fn pass_broken_candidate(
-    view: &impl IdlePullView,
-    this_cpu: usize,
-    cpu_count: usize,
+/// The cursor an idle tick's scan starts at, given the `cursor` it kept and
+/// its `candidate` as [`idle_pull_tick`] read it. A candidate whose backlog
+/// did not stand since it was recorded moves the cursor to the CPU after its
+/// own, so the scan reads that CPU last and records another CPU's backlog when
+/// there is one: a CPU whose queues keep draining and filling again within a
+/// tick, recorded afresh on every tick, would otherwise hide every backlog
+/// behind it in the scan's order. The candidate is always the first backlog at
+/// or after the cursor, so the cursor only moves forward past backlogs that
+/// did not stand (core/kernel/docs/scheduler.md § Load Balancing).
+const fn pass_broken_candidate(
     cursor: usize,
+    cpu_count: usize,
     candidate: Option<(Backlog, bool)>,
-    scan: &mut IdleScan,
 ) -> usize
 {
-    let Some((broken, false)) = candidate
-    else
+    match candidate
     {
-        return cursor;
-    };
-    let cursor = cpu_after(broken.cpu, cpu_count);
-    if scan
-        .backlogged
-        .is_some_and(|backlog| backlog.cpu == broken.cpu)
-    {
-        scan.backlogged = idle_scan(view, this_cpu, cpu_count, cursor, Some(broken.cpu)).backlogged;
+        Some((broken, false)) => cpu_after(broken.cpu, cpu_count),
+        _ => cursor,
     }
-    cursor
 }
 
 /// The most-loaded CPU other than `this_cpu` and its queued load, or `None`
@@ -9636,7 +9627,7 @@ mod idle_pull_tests
         assert_eq!(
             next,
             IdlePullMemory {
-                candidate: None,
+                candidate: Some(Backlog { cpu: 0, episode: 1 }),
                 held: false,
                 cursor: 1,
             }
@@ -9692,6 +9683,49 @@ mod idle_pull_tests
         }
         assert_eq!(model.moved_from, Some(1));
         assert!(pulled_at.is_some_and(|tick| tick <= 2 + 2));
+    }
+
+    // The defect caught: a broken candidate moving the cursor past its CPU
+    // while the backlog recorded in the same tick lay before that CPU, so the
+    // next refusal moved the cursor back and the same breaking backlog was
+    // passed twice in one pass, past the 2 + 2r bound.
+    #[test]
+    fn the_cursor_passes_each_breaking_backlog_once_per_pass()
+    {
+        // CPU 0 idles with its cursor at 2; CPU 1 holds a thread queued behind
+        // one that never yields. CPU 2 is sampled empty at the first tick and
+        // CPU 3 queued; both then form new backlogs before the second, and
+        // every pull from either finds a later episode under its lock.
+        let mut model = Model::new(&[IDLE, busy(0, 1), IDLE, busy(0, 1)]);
+        let mut memory = IdlePullMemory {
+            candidate: None,
+            held: false,
+            cursor: 2,
+        };
+        let mut pulled_at = None;
+        for tick in 1..=8u32
+        {
+            model.relink_on_pull = memory
+                .candidate
+                .map(|backlog| backlog.cpu)
+                .filter(|&cpu| cpu >= 2);
+            memory = idle_pull_tick(&mut model, 0, 4, memory);
+            if model.moved_from.is_some()
+            {
+                pulled_at = Some(tick);
+                break;
+            }
+            if tick == 1
+            {
+                model.cpus[2] = Cpu {
+                    episode: 1,
+                    ..busy(0, 1)
+                };
+                model.cpus[3].episode = 1;
+            }
+        }
+        assert_eq!(model.moved_from, Some(1));
+        assert!(pulled_at.is_some_and(|tick| tick <= 2 + 2 * 2));
     }
 }
 

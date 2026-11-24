@@ -36,7 +36,8 @@ use crate::crash_log::{SysrootImages, symbolize_log};
 use crate::disk::{logical_block_size, second_disk_block_size};
 use crate::qemu::{Execution, QemuDisplay};
 use crate::qemu::{
-    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv_for, validate_sysroot_for_launch,
+    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, SecondSlot, build_qemu_argv_for,
+    validate_sysroot_for_launch,
 };
 use crate::regex::Regex;
 use crate::term::filter::FilterWriter;
@@ -298,6 +299,7 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
                         path: &second_dst,
                         block_size,
                         line: second_line,
+                        slot: SecondSlot::Named,
                     }),
                     firmware_code_path: &firmware.code,
                     firmware_vars_path: vars.path(),

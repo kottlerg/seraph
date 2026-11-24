@@ -1337,8 +1337,8 @@ impl Want<'_>
         }
     }
 
-    /// The unique GUID of the partition the statement names for it.
-    fn named(self, statement: &storage_statement::Statement) -> Option<[u8; 16]>
+    /// The partition the statement names for it: its disk and unique GUID.
+    fn named(self, statement: &storage_statement::Statement) -> Option<&storage_statement::Named>
     {
         match self
         {
@@ -1366,15 +1366,48 @@ impl core::fmt::Display for Want<'_>
     }
 }
 
+/// The place a statement's disk field binds a partition to, in the
+/// locations devmgr reports for the held disks.
+fn bound_disk(disk: storage_statement::Disk) -> gpt::BoundDisk<ipc::vfsd_bootstrap::PciLocation>
+{
+    match disk
+    {
+        storage_statement::Disk::Boot => gpt::BoundDisk::Boot,
+        storage_statement::Disk::Pci(at) => gpt::BoundDisk::At(ipc::vfsd_bootstrap::PciLocation {
+            segment: at.segment,
+            bus: at.bus,
+            device: at.device,
+            function: at.function,
+        }),
+    }
+}
+
+/// The disk a statement binds a partition to, as vfsd's lines name it: the
+/// boot disk, or the location in the form a disk's line gives it.
+struct Bound(storage_statement::Disk);
+
+impl core::fmt::Display for Bound
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match bound_disk(self.0)
+        {
+            gpt::BoundDisk::Boot => f.write_str("the boot disk"),
+            gpt::BoundDisk::At(at) => core::fmt::Display::fmt(&Where(Some(at)), f),
+        }
+    }
+}
+
 /// Resolve `want` to a partition and its disk's whole-disk cap, over the
 /// held disks (docs/storage.md § GPT Role-GUID Discovery). With no boot
 /// disk nothing resolves. The root resolves on the boot disk by type and
 /// priority, `/esp` is the boot ESP on the boot disk, and a role the
-/// statement names resolves to the named partition only
-/// (`gpt::resolve_named`: the boot disk's when it holds it, else the one
-/// other disk's); a role not named resolves on the boot disk by type and
-/// priority. A disk neither the boot disk nor named takes no role. Logs the
-/// partition it resolved, with its disk's location, or why none.
+/// statement names resolves to the named partition on the disk the
+/// statement binds it to only (`gpt::resolve_named`: the boot disk, or the
+/// disks at a PCI location); a role not named resolves on the boot disk by
+/// type and priority. A disk neither the boot disk nor named takes no role.
+/// Logs the partition it resolved, with its disk's location, or why none:
+/// for a named partition seen only on a disk outside its place, that disk.
 fn resolve_role(
     rt: &VfsdRuntime,
     want: Want<'_>,
@@ -1386,7 +1419,9 @@ fn resolve_role(
         std::os::seraph::log!(warn: "{want}: no boot disk, so no partition takes the role");
         return Err(gpt::GptLookupError::NotFound);
     };
-    let named = want.named(rt.statement());
+    let named = want
+        .named(rt.statement())
+        .map(|entry| (entry.disk, entry.guid));
     let disks = rt.disks.lock().unwrap_or_else(PoisonError::into_inner);
     let on_boot = disks
         .get(boot.index)
@@ -1399,11 +1434,14 @@ fn resolve_role(
             length_lba: boot.esp.length_lba,
         }),
         (Want::Esp, _) => Err(gpt::GptLookupError::NotFound),
-        (_, Some(guid)) => gpt::resolve_named(
+        (_, Some((disk, guid))) => gpt::resolve_named(
             &want.type_guid(),
             &guid,
+            &bound_disk(disk),
             boot.index,
-            disks.iter().map(|d| d.partitions.as_slice()),
+            disks
+                .iter()
+                .map(|d| (d.location.as_ref(), d.partitions.as_slice())),
         ),
         (_, None) => gpt::lookup_on_disk(boot.index, &want.type_guid(), on_boot),
     };
@@ -1416,6 +1454,15 @@ fn resolve_role(
             disk.and_then(|d| d.location),
         )
     });
+    // The disk outside its place a named partition was seen on.
+    let seen = match held
+    {
+        Err(gpt::GptLookupError::Elsewhere { disk }) =>
+        {
+            disks.get(disk).map(|d| (d.ordinal, d.location))
+        }
+        _ => None,
+    };
     drop(disks);
     let how = if named.is_some()
     {
@@ -1425,6 +1472,7 @@ fn resolve_role(
     {
         "on the boot disk"
     };
+    let bound = named.map(|(disk, _)| Bound(disk));
     match held
     {
         Ok((location, blk_ep, ordinal, at)) =>
@@ -1446,8 +1494,20 @@ fn resolve_role(
                 {
                     "the named partition is of another type; not taken"
                 }
+                gpt::GptLookupError::Elsewhere { .. } => "not on its disk",
             };
-            std::os::seraph::log!(warn: "{want}: no partition {how}: {why}");
+            match (bound, seen)
+            {
+                (Some(bound), Some((ordinal, at))) => std::os::seraph::log!(
+                    warn: "{want}: no partition {how}: not on {bound}; seen on disk {ordinal} at {}; not taken",
+                    Where(at)
+                ),
+                (Some(bound), None) =>
+                {
+                    std::os::seraph::log!(warn: "{want}: no partition {how} on {bound}: {why}");
+                }
+                (None, _) => std::os::seraph::log!(warn: "{want}: no partition {how}: {why}"),
+            }
             Err(e)
         }
     }
@@ -1571,13 +1631,14 @@ fn read_statement(root_cap: u64, ipc_buf: *mut u64) -> storage_statement::Statem
             {
                 let guid = storage_statement::format_guid(&entry.guid);
                 std::os::seraph::log!(
-                    "storage statement {path}: {} {}names partition {}",
+                    "storage statement {path}: {} {}names partition {} on {}",
                     entry.role.keyword(),
                     entry
                         .path
                         .as_deref()
                         .map_or(String::new(), |p| format!("{p} ")),
-                    core::str::from_utf8(&guid).unwrap_or_default()
+                    core::str::from_utf8(&guid).unwrap_or_default(),
+                    Bound(entry.disk)
                 );
             }
             statement

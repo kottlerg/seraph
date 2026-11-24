@@ -199,6 +199,11 @@ rewrite (§ Operations) is for a MUST violation.
 - No tool or assistant attribution, in a commit message or a PR description: no attribution
   trailer and no link to an assistant session.
 - No `Co-authored-by` trailers unless the change was genuinely co-authored.
+- No tool output in a PR description, an Issue, or a comment on either: a line a command
+  printed for its user (advice on stderr, a status line) is not the author's text. Tool output
+  quoted as evidence stands in a fenced code block. `cargo xtask pr-check` checks the PR body
+  and the bodies of the Issues it closes or references
+  ([xtask/README.md](../xtask/README.md#cargo-xtask-pr-check)).
 - No quotation of the maintainer. [documentation-standards.md](documentation-standards.md)
   § Tone and Language owns the rule for every tracked file and for permanent text, commit
   messages included: a decision of the maintainer is stated as a decision, in the project's

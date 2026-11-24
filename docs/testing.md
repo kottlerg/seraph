@@ -1246,9 +1246,9 @@ to the tiers below.
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof (`cargo xtask kani`, [Bounded verification](#bounded-verification)) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
 
 **Cells.** A cell is one launch configuration and the boots made on it; each differs from every
 other cell in that configuration, which is why it stands alone. The table states every cell, its
@@ -1982,18 +1982,24 @@ Release Production, step 4), these MUST be run on the commit to be tagged, or on
 that contains the version bump when the change from it to the commit to be tagged is documentation
 or comments only as this section defines that: the whole boundary set (riscv64 16 and 128 harts,
 x86_64 16 and 128 vCPUs) once each (`--runs 1`) in the debug profile and once each in the release
-profile (`cargo xtask build --release`, then the same `run` command, per the boundary
-commands above), and the memory variation and every device cell (the disk variations, the no-IOMMU
-variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM
-cell) once each, so every tag boots at each boundary CPU count in both profiles (CI boots release
-builds only at 4 CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, with a
-debug port, with a hot-added device, on CET shadow stacks, and with a TPM, and runs the timing
-report on the boundary logs, which is reported and blocks nothing. A tag's repeated-run check is the
-burn-in tier, which the tag push starts. The no-IOMMU variant, the no-iommu device cell, boots
-svctest once on each architecture with the machine's IOMMU detached, so devmgr's unconfined path
-still serves every driver (svctest staged as `build-test.yml` stages it, on a debug-profile
-sysroot). A run whose outcome is not a pass, as When the runs are owed classifies outcomes, blocks
-the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
+profile (`cargo xtask build --release`, then the same `run` command, per the boundary commands
+above), and the memory variation and every device cell (the disk variations, the no-IOMMU variant,
+the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once
+each, and every bounded proof (`cargo xtask kani` with no option, [Bounded
+verification](#bounded-verification)), and the fuzz campaign (§ Fuzzing): a manual dispatch of
+`fuzz.yml` on `master` while the commit to be tagged is its head (`gh workflow run fuzz.yml --ref
+master`), at the default time per target, whose run's head commit is that commit and whose
+conclusion is `success`, the report giving the run's URL as its command, `--runs 1`, and `PASS` as
+its outcome when the conclusion is `success`; so every tag boots at each boundary CPU count in both
+profiles (CI boots release builds only at 4 CPUs), from a 4Kn disk, from two disks, with no IOMMU,
+with a framebuffer, with a debug port, with a hot-added device, on CET shadow stacks, and with a
+TPM, carries every proof a pull request's selection may have left unverified and a campaign of every
+fuzz target, and runs the timing report on the boundary logs, which is reported and blocks nothing.
+A tag's repeated-run check is the burn-in tier, which the tag push starts. The no-IOMMU variant, the
+no-iommu device cell, boots svctest once on each architecture with the machine's IOMMU detached, so
+devmgr's unconfined path still serves every driver (svctest staged as `build-test.yml` stages it, on
+a debug-profile sysroot). A run whose outcome is not a pass, as When the runs are owed classifies
+outcomes, blocks the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
 
 ```sh
 # No-IOMMU variant, each architecture (svctest staged, debug profile):
@@ -2158,7 +2164,7 @@ fails as the search did, on any host. The run exits non-zero.
 | Tier | Where | When | Runs |
 |---|---|---|---|
 | Gating | CI, the `fuzz` job of `build-test.yml` | every push and pull request | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
-| Campaign | CI, `fuzz.yml` | weekly, and on a manual dispatch | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
+| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
 | Local | developer host | at will | `cargo xtask fuzz <target>` with `--runs` or `--time` |
 
 The self-test runs the engine on planted defects in `xtask/fuzz/targets` (an eight-byte magic
@@ -2166,8 +2172,10 @@ compared as one integer, a length field whose add overflows, and a state reached
 three nested records with no checksum) and fails unless each is found within its execution budget
 from seed 0, twice, at the same execution with the same minimized input.
 
-The campaign gates nothing. A red campaign run is a finding, recorded as
-[conventions.md](conventions.md#recording-findings) § Recording findings says.
+The campaign gates no merge: a red campaign run is a finding, recorded as
+[conventions.md](conventions.md#recording-findings) § Recording findings says. The campaign the
+release host runs dispatch on the commit to be tagged gates the tag (§ Coverage tiers, Release host
+runs).
 
 **Predating defects.** A failing input the gating job finds on a pull request whose own diff does
 not introduce the defect (the same run fails at the merge base) is fixed first, in its own PR or
@@ -2195,8 +2203,27 @@ undetermined or unwinding-incomplete check, on a Kani release other than the pin
 harness that lies in no package. It finds the crates from their harnesses, so a crate's first
 harness adds it to the run. It holds each process of the run to the address space CI's runner can
 give a harness, so a harness that needs more fails, named as out of memory, and it closes with
-every harness's verdict and verification time. CI's `kani` job runs it on every push and pull
-request, and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
+every harness's verdict and verification time.
+
+**Time budget.** A harness MUST verify in at most 120 s on CI's `kani` runner, the verification
+time Kani reports for it, beside the memory bound below. `cargo xtask kani` fails a harness over
+the budget on a CI runner, naming it and its time, and warns of it on another host, whose speed
+differs. A harness that cannot meet the budget is resized, by bounds that still cover its property,
+or proved in the induction form of the parser proofs below, or split into harnesses that together
+cover the inputs it covered; no property is dropped or narrowed to meet it. A PR that resizes a
+harness for the budget states its time before and after.
+
+**Where the proofs run.** On a pull request, CI's `kani` job verifies only the crates the change
+can affect (`cargo xtask kani --since` against the pull request's base): a crate that holds a
+harness and whose own package, a workspace package in its dependency closure, or a file those
+read, the change touches, and every such crate when the change touches an input of every build
+(the workspace manifest and lock file, Cargo's configuration, the toolchain pin, the command's own
+sources and the job itself). That selection gates the merge, and a pull request that affects no
+such crate ends the job without installing Kani, with a notice on the run that it verified
+nothing. On a push to `master` the job runs the same selection against the commit the push
+moved from. The whole set runs in the `kani` job of `burnin.yml`, on each tag push and on a
+manual dispatch, and in the release host runs (§ Coverage tiers), so a change the selection
+missed is found before a tag ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
 
 **Local sizing.** A harness is sized on the development host before CI runs it. The author of a
@@ -2208,7 +2235,9 @@ repository](https://docs.github.com/en/actions/reference/runners/github-hosted-r
 leaves 4 GB to the runner's own processes, so a harness that fits under it locally fits on the
 runner. A run that the limit ends (an allocation failure, or a process killed)
 or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
-still cover the property or by the induction form of the parser proofs below. A failed,
+still cover the property or by the induction form of the parser proofs below; a run whose time
+on the development host is near or over the time budget is a harness that CI's runner may fail,
+made to fit the same way. A failed,
 undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
 or the harness, fixed as such, and MUST NOT be bounded away. The PR body's `## Validation`
 section states, for each such harness, the verification time Kani reports, the peak resident
@@ -2229,7 +2258,7 @@ runs the property, or its check of one structure the parser decodes (a header, a
 first `len` bytes of `kani::any::<[u8; N]>()`, `len` itself any value up to N, so the check holds
 for every input of at most N bytes, not only for the inputs a search reached; its comment states N
 and why inputs of that length cover the structure. Where a harness of the whole property does not
-complete within the gating job, the parser MUST write each loop over a structure of variable length
+complete within the time budget, the parser MUST write each loop over a structure of variable length
 (the walk of an array, a search over its entries, a checksum over its bytes) as a step over a small
 state, which two harnesses prove by induction: a base harness, that the loop starts in an invariant
 the harness states, and a step harness, that one step from any state in the invariant (`kani::any`

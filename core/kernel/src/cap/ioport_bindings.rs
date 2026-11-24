@@ -260,9 +260,14 @@ impl IoPortBindings
 /// are freed. A bind through the object holds a syscall pin on it, so no bind
 /// can record it once this runs.
 ///
+/// The registry walk holds its lock for one batch at a time and opens an
+/// interrupt window between batches (`sched::thread_registry::for_each`). A
+/// thread registered after the walk began, which it may miss, holds no
+/// binding through the object.
+///
 /// # Safety
 /// No lock is held (the walk takes the thread registry lock and each thread's
-/// `sched_lock`).
+/// `sched_lock`), and interrupts may be taken.
 #[cfg(not(test))]
 pub unsafe fn withdraw_everywhere(object: usize)
 {
@@ -290,6 +295,16 @@ pub unsafe fn withdraw_everywhere(object: usize)
         }
         // SAFETY: `saved` is the value the `lock_raw` above returned.
         unsafe { sched_lock.unlock_raw(saved) };
+        // A table's withdrawal rebuilds its bitmap; a thread with none cost
+        // one lock round trip.
+        if table.is_null()
+        {
+            crate::sched::thread_registry::Visit::Passed
+        }
+        else
+        {
+            crate::sched::thread_registry::Visit::Acted
+        }
     };
     // SAFETY: the closure registers nothing and waits on no other CPU; it
     // takes only each thread's sched_lock, ordered after the registry lock.
@@ -306,9 +321,16 @@ pub unsafe fn withdraw_everywhere(object: usize)
 /// installs it and the Thread arm of `dealloc_object` frees it under, so no
 /// table of these threads is freed into the pool after this returns.
 ///
+/// The registry walk holds its lock for one batch at a time and opens an
+/// interrupt window between batches (`sched::thread_registry::for_each`). A
+/// thread registered after the walk began, which it may miss, is bound to
+/// another `CSpace`: a thread is registered only while its creation pins
+/// the `CSpace` it binds, and this one's last reference is gone.
+///
 /// # Safety
 /// `cspace` is a dying `CSpace` whose bound threads are all stopped
-/// (`Exited`), so none binds again; its wrapper is live; no lock is held.
+/// (`Exited`), so none binds again; its wrapper is live; no lock is held,
+/// and interrupts may be taken.
 #[cfg(not(test))]
 pub unsafe fn free_tables_bound_to(cspace: *mut crate::cap::cspace::CSpace)
 {
@@ -321,7 +343,7 @@ pub unsafe fn free_tables_bound_to(cspace: *mut crate::cap::cspace::CSpace)
         // while the visit runs.
         if !core::ptr::eq(unsafe { (*tcb).cspace }, cspace)
         {
-            return;
+            return crate::sched::thread_registry::Visit::Passed;
         }
         // SAFETY: as above.
         let sched_lock = unsafe { &(*tcb).sched_lock };
@@ -342,6 +364,7 @@ pub unsafe fn free_tables_bound_to(cspace: *mut crate::cap::cspace::CSpace)
         }
         // SAFETY: `saved` is the value the `lock_raw` above returned.
         unsafe { sched_lock.unlock_raw(saved) };
+        crate::sched::thread_registry::Visit::Acted
     };
     // SAFETY: the closure takes only each thread's sched_lock, ordered after
     // the registry lock, and the pool lock inside it; it waits on no other CPU.

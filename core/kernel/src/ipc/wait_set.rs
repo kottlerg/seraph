@@ -875,7 +875,8 @@ pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Resu
 ///
 /// # Safety
 /// `ws` must be a valid pointer. After this call `ws` itself is NOT freed —
-/// the caller drops the outer `WaitSetObject` storage.
+/// the caller drops the outer `WaitSetObject` storage. No lock is held, and
+/// interrupts may be taken (the waiter drain opens interrupt windows).
 ///
 /// Lock discipline: clears each source's back-pointer FIRST under the
 /// source's own lock — this is the inverse of the `notification_send →
@@ -930,19 +931,25 @@ pub unsafe fn wait_set_drop(
         }
     }
 
-    // Under ws.lock, claim and wake every blocked waiter with its park stamped
-    // INTERRUPTED (the destroyed wait set cancels the wait;
-    // `SYS_WAIT_SET_WAIT` returns Interrupted).
-    // SAFETY: lock owned by ws; matched unlock_raw below.
-    let saved = unsafe { ws_ref.lock.lock_raw() };
-    // SAFETY: ws.lock held; no scheduler or sleep-list lock held.
-    unsafe { crate::ipc::interrupt_all_waiters(&mut ws_ref.waiters) };
+    // Under ws.lock, a batch at a time, claim and wake every blocked waiter
+    // with its park stamped INTERRUPTED (the destroyed wait set cancels the
+    // wait; `SYS_WAIT_SET_WAIT` returns Interrupted). No reference is left
+    // to wait on the set through, so no waiter joins meanwhile.
+    // SAFETY: the returned flags are passed, through the drain, to the
+    // unlock_raw below.
+    let mut saved = unsafe { ws_ref.lock.lock_raw() };
+    // SAFETY: ws.lock held with flags `saved`, and no other lock; the wait
+    // set is live until the caller's free, and the caller may take
+    // interrupts.
+    unsafe {
+        crate::ipc::interrupt_all_waiters(&raw mut ws_ref.waiters, &ws_ref.lock, &mut saved);
+    }
     for slot in ws_ref.members_mut()
     {
         *slot = WaitSetMember::vacant();
     }
     ws_ref.member_count = 0;
-    // SAFETY: paired with lock_raw above.
+    // SAFETY: `saved` is the flags of the drain's last hold of this lock.
     unsafe { ws_ref.lock.unlock_raw(saved) };
 }
 

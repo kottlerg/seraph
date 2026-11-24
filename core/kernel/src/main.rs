@@ -1729,8 +1729,7 @@ unsafe fn kernel_entry_post_rebase(
                         sleep_node: crate::sched::deadline_heap::DeadlineNode::new(),
                         sleep_expiry: crate::sched::thread::SleepExpiry::EMPTY,
                         extended: sched::thread::ExtendedState::from_raw(init_extended_area),
-                        registry_next: core::ptr::null_mut(),
-                        registry_prev: core::ptr::null_mut(),
+                        registry: crate::sched::registry_list::RegistryLinks::new(),
                         magic: sched::thread::TCB_MAGIC,
                     },
                 );

@@ -1244,16 +1244,10 @@ unsafe fn claim_queued_fault(
                   guarantees alignment"
     )]
     let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
-    #[expect(
-        clippy::multiple_unsafe_ops_per_block,
-        reason = "every access reaches a send-queue field of the endpoint, which the held ep.lock \
-                  serialises"
-    )]
     // SAFETY: `held` holds ep.lock on the live endpoint the binding names.
-    let (send_head, send_tail) = unsafe { (&mut (*ep).send_head, &mut (*ep).send_tail) };
+    let send = unsafe { &mut (*ep).send };
     // SAFETY: ep.lock is held, and tcb is a valid TCB.
-    let unlinked =
-        unsafe { crate::ipc::endpoint::unlink_from_wait_queue(tcb, send_head, send_tail) };
+    let unlinked = unsafe { send.remove(tcb) };
     if unlinked
     {
         // SAFETY: `held` holds ep.lock on the live endpoint.

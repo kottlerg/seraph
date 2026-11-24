@@ -547,25 +547,30 @@ pub unsafe fn event_queue_recv(
 ///
 /// # Safety
 /// `eq` must be a valid pointer to a live `EventQueueState`. Acquires `eq.lock`
-/// internally to claim the waiters; the caller MUST NOT hold it.
+/// internally to claim the waiters; the caller MUST NOT hold it, or any other
+/// lock, and may take interrupts (the drain opens interrupt windows).
 #[cfg(not(test))]
 pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
 {
-    // SAFETY: eq is a valid pointer.
-    let eq = unsafe { &mut *eq };
-
     // Claim every waiter under eq.lock, as event_queue_post claims (#160),
-    // and, as a multi-waiter drain, wake it under the lock too
-    // (core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5), so
-    // a concurrent dealloc(waiter) BlockedOnEventQueue unlink (which takes
+    // and, as a multi-waiter drain, wake it under the lock too, a batch at a
+    // time (core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5),
+    // so a concurrent dealloc(waiter) BlockedOnEventQueue unlink (which takes
     // eq.lock and spins on wake_in_flight) cannot free a TCB before its
-    // enqueue_and_wake commits.
-    // SAFETY: lock_raw paired with unlock_raw below.
-    let saved = unsafe { eq.lock.lock_raw() };
-    // SAFETY: eq.lock held; no scheduler or sleep-list lock held.
-    unsafe { crate::ipc::interrupt_all_waiters(&mut eq.waiters) };
-    // SAFETY: paired with lock_raw above.
-    unsafe { eq.lock.unlock_raw(saved) };
+    // enqueue_and_wake commits. No reference is left to receive on the queue
+    // through, so no waiter joins meanwhile.
+    // SAFETY: eq is a valid pointer (contract).
+    let lock = unsafe { &(*eq).lock };
+    // SAFETY: the returned flags are passed, through the drain, to the
+    // unlock_raw below.
+    let mut saved = unsafe { lock.lock_raw() };
+    // SAFETY: eq is valid (contract).
+    let waiters = unsafe { &raw mut (*eq).waiters };
+    // SAFETY: eq.lock held with flags `saved`, and no other lock; eq is live
+    // until the caller's free, and the caller may take interrupts.
+    unsafe { crate::ipc::interrupt_all_waiters(waiters, lock, &mut saved) };
+    // SAFETY: `saved` is the flags of the drain's last hold of this lock.
+    unsafe { lock.unlock_raw(saved) };
 }
 
 #[cfg(test)]

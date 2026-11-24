@@ -23,15 +23,16 @@
 //! between the stretch's first and last steps passes it.
 //!
 //! The cases are `unit::retype`'s page-pool and placement cases,
-//! `unit::cap_batches`'s derivation-lock cases and `unit::teardown_windows`'s
-//! teardown cases. They run one at a time: the rig's words and the worker's
+//! `unit::cap_batches`'s derivation-lock cases, `unit::teardown_windows`'s
+//! teardown cases and `unit::locked_windows`'s cases of the registry walks and
+//! wake-all drains that hold a lock for one batch at a time. They run one at a time: the rig's words and the worker's
 //! stack are this module's own.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use syscall::{
-    cap_create_aspace, cap_create_cspace, cap_create_thread, cap_delete, cap_insert, cap_move,
-    cap_revoke, mem_map, mem_unmap, sched_split, system_info, thread_configure,
+    aspace_hold, cap_create_aspace, cap_create_cspace, cap_create_thread, cap_delete, cap_insert,
+    cap_move, cap_revoke, mem_map, mem_unmap, sched_split, system_info, thread_configure,
     thread_set_affinity, thread_start, thread_yield,
 };
 use syscall_abi::{MAP_WRITABLE, SystemInfoType};
@@ -78,6 +79,27 @@ pub const ATTEMPT_LIMIT: u32 = 16;
 const PROBE_VA: u64 = 0x1_6600_0000;
 const PROBE_CPU: u32 = 0;
 const WORKER_CPU: u32 = 1;
+/// The CPU above the rig's two that the cases of `unit::locked_windows` pin
+/// their parked waiters to when the guest has it.
+const SPARE_CPU: u32 = 2;
+
+/// The CPU the cases of `unit::locked_windows` pin their parked waiters to: one
+/// other than `WORKER_CPU`, so the worker wakes each of them remotely and each
+/// wake counts `THREAD_PLACEMENT_REMOTE_WAKES` of the waiter. It is
+/// [`SPARE_CPU`] when the guest has one, so the woken waiters run beside the
+/// probe's issue loop rather than on its CPU, and the probe's otherwise.
+pub fn waiter_cpu() -> u32
+{
+    let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
+    if cpus > u64::from(SPARE_CPU)
+    {
+        SPARE_CPU
+    }
+    else
+    {
+        PROBE_CPU
+    }
+}
 
 /// The call the worker makes, between two clock reads.
 #[derive(Clone, Copy)]
@@ -115,6 +137,8 @@ pub enum Call
     {
         cap: u64, at: u8
     },
+    /// `SYS_ASPACE_HOLD` of the address-space cap.
+    Hold(u64),
     /// `SYS_THREAD_EXIT` of the worker itself, which never returns: made by
     /// [`measure_exit`] alone, which ends the probes once its bracket's stretch
     /// has ended and takes that time for the call's end.
@@ -148,6 +172,7 @@ impl Call
             Call::Move { cap, cspace } => (6, [cap, cspace, 0]),
             Call::SchedSplit { cap, at } => (7, [cap, u64::from(at), 0]),
             Call::Exit => (8, [0; 3]),
+            Call::Hold(cap) => (9, [cap, 0, 0]),
         }
     }
 }
@@ -170,6 +195,7 @@ fn make_call(op: u64, args: [u64; 3]) -> Result<(u64, u64), i64>
             .map_err(|_| 0)
             .and_then(|at| sched_split(a0, at)),
         8 => syscall::thread_exit(),
+        9 => aspace_hold(a0).map(|()| (0, 0)),
         _ => Err(0),
     }
 }

@@ -865,7 +865,7 @@ const TARGETS: &str = "targets";
 const TREE_KEY_FILE: &str = "compare-images-tree";
 
 /// How many source trees' target directories a run leaves in the scratch
-/// directory, the most recently used: the two it built, and two more, so that
+/// directory, the most recently used: the ones it built, and more, so that
 /// a later comparison sharing a commit's tree with one of the last two runs
 /// rebuilds only what its other tree needs.
 const KEPT_TARGETS: usize = 4;
@@ -992,8 +992,17 @@ fn build_side(
     git(tree, &["clean", "-ffdx", "-e", "/target"])?;
     take_target(scratch, tree, &tree_key(tree, commit)?)?;
     let built = build_cells(tree, scratch, (side, commit), cells, nested);
-    park_target(scratch, tree)?;
-    built
+    give_back_target(scratch, tree, built, KEPT_TARGETS)
+}
+
+/// Park the worktree's target under its key and evict all but the `keep` most
+/// recently used, whether `built` passed or failed, so that failing runs bound
+/// the scratch directory as passing ones do. The build's own error, when it
+/// has one, is the one returned.
+fn give_back_target(scratch: &Path, tree: &Path, built: Result<()>, keep: usize) -> Result<()>
+{
+    let given_back = park_target(scratch, tree).and_then(|()| evict_targets(scratch, keep));
+    built.and(given_back)
 }
 
 /// What a failed build in the scratch says, past the nested command's own
@@ -1168,7 +1177,6 @@ pub fn run(ctx: &BuildContext, args: &CompareImagesArgs) -> Result<()>
     };
     build_side(&tree, &scratch, (Side::Base, &base), &cells, &nested)?;
     build_side(&tree, &scratch, (Side::Head, &head), &cells, &nested)?;
-    evict_targets(&scratch, KEPT_TARGETS)?;
     let mut reports = Vec::new();
     for &cell in &cells
     {
@@ -1882,6 +1890,46 @@ rustflags = [\"-Zunstable-options\"]
             .collect();
         kept.sort();
         assert_eq!(kept, [keys[3].clone(), keys[4].clone()]);
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    // Defect caught: a failed build that parks its target but evicts nothing,
+    // so that a series of failing runs grows the scratch directory past the
+    // kept targets.
+    #[test]
+    fn a_failed_build_still_evicts_and_reports_its_own_error()
+    {
+        let (scratch, tree) = scratch_fixture("evict-failed");
+        let keys: Vec<String> = (0..6u8).map(|i| format!("{i}").repeat(40)).collect();
+        for (age, key) in keys[..5].iter().enumerate()
+        {
+            take_target(&scratch, &tree, key).unwrap();
+            let used = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000 + u64::try_from(age).unwrap());
+            fs::File::options()
+                .write(true)
+                .open(tree.join("target").join(TREE_KEY_FILE))
+                .unwrap()
+                .set_modified(used)
+                .unwrap();
+            park_target(&scratch, &tree).unwrap();
+        }
+        take_target(&scratch, &tree, &keys[5]).unwrap();
+        let err = give_back_target(
+            &scratch,
+            &tree,
+            Err(crate::error::Error::msg("the build failed")),
+            2,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "the build failed");
+        assert!(!tree.join("target").exists());
+        let mut kept: Vec<String> = fs::read_dir(scratch.join(TARGETS))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, [keys[4].clone(), keys[5].clone()]);
         fs::remove_dir_all(&scratch).unwrap();
     }
 

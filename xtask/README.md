@@ -1778,9 +1778,10 @@ the workspace crates std depends on among them, so a commit's build whose own `c
 does not make up for it would link std against the other commit's copy of such a crate. A
 target left in the scratch worktree by an interrupted run is moved back under the id it names; one
 whose file names none is removed. A comparison builds each tree whose target is not kept from
-scratch, and one whose two commits share a tree builds it once. After its builds a run removes every
-target directory but the four most recently used, by the time of their `compare-images-tree` files,
-the two it built among them: each holds every cell's build of one tree, about 1.5 GiB.
+scratch, and one whose two commits share a tree builds it once. After each commit's builds, whether
+they pass or fail, a run removes every target directory but the four most recently used, by the time
+of their `compare-images-tree` files, the ones it built among them: each holds every cell's build of
+one tree, about 1.5 GiB.
 
 Each build is the commit's own. The scratch directory is outside the checkout, whose
 `.cargo/config.toml` Cargo would merge into every build below it, and the command refuses to run

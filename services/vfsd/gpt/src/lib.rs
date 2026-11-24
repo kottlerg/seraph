@@ -734,16 +734,27 @@ fn read_header(
 pub enum GptLookupError
 {
     /// No partition the resolution reads carries the requested type GUID (or,
-    /// for a named partition, the requested unique GUID).
+    /// for a named partition, the requested unique GUID, in its place or a
+    /// typed one outside it).
     NotFound,
     /// Two or more partitions answer equally: by the lookup, two share the
     /// highest DPS priority (attribute bits 48-63); by the named resolution,
     /// two carry the named unique GUID and the role's type GUID in the place
-    /// it reads. The caller must not pick arbitrarily.
+    /// the statement binds it to. The caller must not pick arbitrarily.
     DuplicateTie,
-    /// The named unique GUID is carried only by partitions of another type
-    /// GUID than the role's.
+    /// The named unique GUID is carried, in the place the named resolution
+    /// reads, only by partitions of another type GUID than the role's.
     WrongType,
+    /// The named partition is not in the place the statement binds it to,
+    /// and a disk outside it, at position `disk`, carries a partition of
+    /// the unique GUID and the role's type GUID: the named disk moved, or a
+    /// copy of it is attached. The role is not taken.
+    Elsewhere
+    {
+        /// Position of the first such disk in the sequence the caller
+        /// passed.
+        disk: usize,
+    },
 }
 
 /// Where a resolution found a partition.
@@ -1028,44 +1039,75 @@ impl BootDiskPick
     }
 }
 
+/// The disk a signed statement binds a named partition to: the boot disk,
+/// or the disk at a location of type `L` (a PCI function's), compared whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundDisk<L>
+{
+    /// The boot disk ([`find_boot_disk`]), wherever it is.
+    Boot,
+    /// Every disk at this location.
+    At(L),
+}
+
+/// Whether the disk at position `disk`, at `location` when it has one, is
+/// in the place `bound` names: the boot disk when it is `boot_disk`, a
+/// location when the disk's equals it whole. A disk with no location is at
+/// none.
+fn in_place<L: PartialEq>(
+    bound: &BoundDisk<L>,
+    boot_disk: usize,
+    disk: usize,
+    location: Option<&L>,
+) -> bool
+{
+    match bound
+    {
+        BoundDisk::Boot => disk == boot_disk,
+        BoundDisk::At(at) => location == Some(at),
+    }
+}
+
 /// Resolve a role a signed statement names: the partition of unique GUID
-/// `unique_guid` that carries the role's `type_guid`, on the boot disk (at
-/// position `boot_disk` in `disks`) when the boot disk holds one, else on
-/// the one other disk that does.
+/// `unique_guid` that carries the role's `type_guid`, on the disk the
+/// statement binds it to (`bound`): the boot disk, at position `boot_disk`
+/// in `disks`, or the disks at a location. Each of `disks` is a disk's
+/// location, when it has one, and its partitions.
 ///
-/// A partition carrying the unique GUID under another type GUID never takes
-/// the role. The boot disk's own partition wins over a copy elsewhere, so a
-/// copy of the boot disk never denies a role named on it; two matches in the
-/// place read (on the boot disk, or, with none there, across the others)
-/// leave the role unresolved.
+/// The resolution reads that place alone. A partition carrying the unique
+/// GUID on any other disk never takes the role and never denies it, so a
+/// copy of a disk attached beside it is inert, and one partition named on a
+/// disk that is not in its place leaves the role unresolved: the role is
+/// never taken from a disk the statement does not name. A partition there
+/// carrying the unique GUID under another type GUID never takes the role,
+/// and two typed matches there leave it unresolved.
 ///
 /// # Errors
-/// [`GptLookupError::NotFound`] when no partition carries the unique GUID,
-/// [`GptLookupError::WrongType`] when only partitions of another type do,
-/// and [`GptLookupError::DuplicateTie`] when two answer equally.
-pub fn resolve_named<'a>(
+/// [`GptLookupError::DuplicateTie`] when two typed matches are in the
+/// place; with none there, [`GptLookupError::WrongType`] when one of
+/// another type is, else [`GptLookupError::Elsewhere`] naming the first
+/// disk outside it that carries a typed match, else
+/// [`GptLookupError::NotFound`].
+pub fn resolve_named<'a, L: PartialEq + 'a>(
     type_guid: &[u8; 16],
     unique_guid: &[u8; 16],
+    bound: &BoundDisk<L>,
     boot_disk: usize,
-    disks: impl IntoIterator<Item = &'a [GptEntry]>,
+    disks: impl IntoIterator<Item = (Option<&'a L>, &'a [GptEntry])>,
 ) -> Result<PartitionLocation, GptLookupError>
 {
     let mut pick = NamedPick::default();
-    for (disk, entries) in disks.into_iter().enumerate()
+    for (disk, (location, entries)) in disks.into_iter().enumerate()
     {
+        let here = in_place(bound, boot_disk, disk, location);
         for entry in entries.iter().filter(|entry| &entry.uuid == unique_guid)
         {
-            let seen = if &entry.type_guid != type_guid
+            let seen = match (here, &entry.type_guid == type_guid)
             {
-                NamedSeen::Mistyped
-            }
-            else if disk == boot_disk
-            {
-                NamedSeen::OnBootDisk
-            }
-            else
-            {
-                NamedSeen::Elsewhere
+                (true, true) => NamedSeen::InPlace,
+                (true, false) => NamedSeen::Mistyped,
+                (false, true) => NamedSeen::Elsewhere,
+                (false, false) => continue,
             };
             pick.consider(PartitionLocation::of(disk, entry), seen);
         }
@@ -1097,15 +1139,17 @@ impl Matches
     }
 }
 
-/// What [`resolve_named`] learns of one partition carrying the unique GUID.
+/// What [`resolve_named`] learns of one partition carrying the unique GUID
+/// that bears on the role: one in the bound place, or a typed one outside
+/// it. A partition of another type outside the place bears on nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NamedSeen
 {
-    /// It carries another type GUID than the role's.
+    /// It carries another type GUID than the role's, in the place.
     Mistyped,
-    /// It carries the role's type GUID, on the boot disk.
-    OnBootDisk,
-    /// It carries the role's type GUID, on another disk.
+    /// It carries the role's type GUID, in the place.
+    InPlace,
+    /// It carries the role's type GUID, on a disk outside the place.
     Elsewhere,
 }
 
@@ -1114,11 +1158,11 @@ enum NamedSeen
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct NamedPick
 {
-    /// The typed matches on the boot disk.
-    boot: Matches,
-    /// The typed matches on every other disk.
-    other: Matches,
-    /// A match of another type GUID was seen.
+    /// The typed matches in the place.
+    here: Matches,
+    /// The disk of the first typed match outside it.
+    elsewhere: Option<usize>,
+    /// A match of another type GUID was seen in the place.
     mistyped: bool,
 }
 
@@ -1131,31 +1175,30 @@ impl NamedPick
         match seen
         {
             NamedSeen::Mistyped => self.mistyped = true,
-            NamedSeen::OnBootDisk => self.boot.add(location),
-            NamedSeen::Elsewhere => self.other.add(location),
+            NamedSeen::InPlace => self.here.add(location),
+            NamedSeen::Elsewhere =>
+            {
+                self.elsewhere.get_or_insert(location.disk);
+            }
         }
     }
 
     /// The resolution's answer over the partitions considered.
     fn result(self) -> Result<PartitionLocation, GptLookupError>
     {
-        let place = if self.boot.first.is_some()
+        match (self.here, self.elsewhere)
         {
-            self.boot
-        }
-        else
-        {
-            self.other
-        };
-        match place
-        {
-            Matches { more: true, .. } => Err(GptLookupError::DuplicateTie),
-            Matches {
-                first: Some(location),
-                ..
-            } => Ok(location),
-            Matches { first: None, .. } if self.mistyped => Err(GptLookupError::WrongType),
-            Matches { first: None, .. } => Err(GptLookupError::NotFound),
+            (Matches { more: true, .. }, _) => Err(GptLookupError::DuplicateTie),
+            (
+                Matches {
+                    first: Some(location),
+                    ..
+                },
+                _,
+            ) => Ok(location),
+            (Matches { first: None, .. }, _) if self.mistyped => Err(GptLookupError::WrongType),
+            (Matches { first: None, .. }, Some(disk)) => Err(GptLookupError::Elsewhere { disk }),
+            (Matches { first: None, .. }, None) => Err(GptLookupError::NotFound),
         }
     }
 }
@@ -1884,56 +1927,121 @@ mod tests
         );
     }
 
+    /// `entries` as a disk at `location`.
+    fn on<'a>(location: &'a Loc, entries: &'a [GptEntry]) -> (Option<&'a Loc>, &'a [GptEntry])
+    {
+        (Some(location), entries)
+    }
+
+    const TWO: Loc = (0, 0, 2, 0);
+    const FOUR: Loc = (0, 0, 4, 0);
+    const HERE: Loc = (0, 0, 3, 0);
+
     // Defect caught: a named partition resolved over every disk alike, so a
-    // copy of the boot disk denies a role the statement names on it.
+    // copy of the boot disk denies a role the statement binds to it, or a
+    // copy elsewhere takes it when the boot disk lacks it.
     #[test]
-    fn a_named_partition_on_the_boot_disk_wins_over_its_copies()
+    fn a_named_partition_bound_to_the_boot_disk_is_taken_there_alone()
     {
         let boot = [entry(3, 0xDA, 0x33, 1000, 10, 0)];
         let copy = boot.clone();
-        let disks = [copy.as_slice(), boot.as_slice(), copy.as_slice()];
+        let disks = [on(&TWO, &copy), on(&HERE, &boot), on(&FOUR, &copy)];
         assert_eq!(
-            resolve_named(&[0xDA; 16], &[0x33; 16], 1, disks),
+            resolve_named(&[0xDA; 16], &[0x33; 16], &BoundDisk::Boot, 1, disks),
             Ok(at(1, 1000, 10))
         );
-    }
-
-    #[test]
-    fn a_named_partition_off_the_boot_disk_resolves_on_the_one_disk_holding_it()
-    {
-        let boot = boot_entries();
-        let data = [entry(1, 0xDA, 0x44, 34, 500, 0)];
-        let hostile = [entry(1, 0xDA, 0x45, 34, 500, 0xFFFF)];
-        let disks = [hostile.as_slice(), boot.as_slice(), data.as_slice()];
+        let bare = boot_entries();
+        let disks = [on(&TWO, &copy), on(&HERE, &bare), on(&FOUR, &copy)];
         assert_eq!(
-            resolve_named(&[0xDA; 16], &[0x44; 16], 1, disks),
-            Ok(at(2, 34, 500))
+            resolve_named(&[0xDA; 16], &[0x33; 16], &BoundDisk::Boot, 1, disks),
+            Err(GptLookupError::Elsewhere { disk: 0 })
         );
     }
 
-    // Defect caught: a copy of a named non-boot partition resolved by disk
-    // order, or by priority, instead of leaving the role unresolved.
+    // Defect caught: a named partition taken from a disk at another location
+    // than its statement binds it to (a hostile copy, or the named disk moved),
+    // or a copy beside the named disk that denies the role.
     #[test]
-    fn a_named_partition_on_two_other_disks_is_a_tie()
+    fn a_named_partition_bound_to_a_location_is_taken_there_alone()
     {
         let boot = boot_entries();
         let data = [entry(1, 0xDA, 0x44, 34, 500, 0)];
         let copy = [entry(1, 0xDA, 0x44, 34, 500, 0xFFFF)];
+        let bound = BoundDisk::At(TWO);
+        let resolve = |disks: &[(Option<&Loc>, &[GptEntry])]| {
+            resolve_named(&[0xDA; 16], &[0x44; 16], &bound, 0, disks.iter().copied())
+        };
+        assert_eq!(
+            resolve(&[on(&HERE, &boot), on(&FOUR, &copy), on(&TWO, &data)]),
+            Ok(at(2, 34, 500))
+        );
+        // The named disk absent: its copy is seen, not taken.
+        assert_eq!(
+            resolve(&[on(&HERE, &boot), on(&FOUR, &copy)]),
+            Err(GptLookupError::Elsewhere { disk: 1 })
+        );
+        // The named disk moved to another location.
+        assert_eq!(
+            resolve(&[on(&HERE, &boot), on(&FOUR, &data)]),
+            Err(GptLookupError::Elsewhere { disk: 1 })
+        );
+        // A disk with no location is at none.
+        assert_eq!(
+            resolve(&[on(&HERE, &boot), (None, data.as_slice())]),
+            Err(GptLookupError::Elsewhere { disk: 1 })
+        );
+        assert_eq!(resolve(&[on(&HERE, &boot)]), Err(GptLookupError::NotFound));
+        // Bound to the boot disk's own location, the place is the boot disk.
+        let own = [entry(5, 0xDA, 0x44, 4000, 8, 0)];
         assert_eq!(
             resolve_named(
                 &[0xDA; 16],
                 &[0x44; 16],
+                &BoundDisk::At(HERE),
                 0,
-                [boot.as_slice(), data.as_slice(), copy.as_slice()]
+                [on(&HERE, &own), on(&TWO, &data)]
+            ),
+            Ok(at(0, 4000, 8))
+        );
+    }
+
+    // Defect caught: two matches at the named location resolved by disk
+    // order or by priority instead of leaving the role unresolved; or a
+    // removed disk, which holds no partitions, counted against the disk
+    // added at its location since.
+    #[test]
+    fn two_matches_at_the_named_location_are_a_tie()
+    {
+        let boot = boot_entries();
+        let data = [entry(1, 0xDA, 0x44, 34, 500, 0)];
+        let removed: [GptEntry; 0] = [];
+        let bound = BoundDisk::At(TWO);
+        assert_eq!(
+            resolve_named(
+                &[0xDA; 16],
+                &[0x44; 16],
+                &bound,
+                0,
+                [on(&HERE, &boot), on(&TWO, &data), on(&TWO, &data)]
             ),
             Err(GptLookupError::DuplicateTie)
+        );
+        assert_eq!(
+            resolve_named(
+                &[0xDA; 16],
+                &[0x44; 16],
+                &bound,
+                0,
+                [on(&HERE, &boot), on(&TWO, &removed), on(&TWO, &data)]
+            ),
+            Ok(at(2, 34, 500))
         );
         let twice = [
             entry(1, 0xDA, 0x44, 34, 500, 0),
             entry(2, 0xDA, 0x44, 600, 10, 0),
         ];
         assert_eq!(
-            resolve_named(&[0xDA; 16], &[0x44; 16], 0, [twice.as_slice()]),
+            resolve_named(&[0xDA; 16], &[0x44; 16], &bound, 0, [on(&TWO, &twice)]),
             Err(GptLookupError::DuplicateTie)
         );
     }
@@ -1944,27 +2052,40 @@ mod tests
     fn a_named_partition_of_another_type_never_takes_the_role()
     {
         let boot = boot_entries();
+        let typed = [entry(4, 0xDA, 0x02, 2000, 10, 0)];
+        let resolve = |unique: u8, bound: &BoundDisk<Loc>| {
+            resolve_named(
+                &[0xDA; 16],
+                &[unique; 16],
+                bound,
+                0,
+                [on(&HERE, &boot), on(&TWO, &typed)],
+            )
+        };
+        // In the place, only mistyped: refused, whatever lies elsewhere.
         assert_eq!(
-            resolve_named(&[0xDA; 16], &[0x02; 16], 0, [boot.as_slice()]),
+            resolve(0x02, &BoundDisk::Boot),
             Err(GptLookupError::WrongType)
         );
-        // A mistyped copy elsewhere neither wins nor ties with the typed one.
-        let typed = [entry(4, 0xDA, 0x02, 2000, 10, 0)];
+        // A mistyped one elsewhere neither wins nor ties with the typed one.
+        assert_eq!(resolve(0x02, &BoundDisk::At(TWO)), Ok(at(1, 2000, 10)));
+        assert_eq!(
+            resolve(0x99, &BoundDisk::At(TWO)),
+            Err(GptLookupError::NotFound)
+        );
+        // Nor is it reported as the named partition seen elsewhere.
+        assert_eq!(
+            resolve(0x02, &BoundDisk::At(FOUR)),
+            Err(GptLookupError::Elsewhere { disk: 1 })
+        );
+        let mistyped_only = [entry(4, 0x77, 0x02, 2000, 10, 0)];
         assert_eq!(
             resolve_named(
                 &[0xDA; 16],
                 &[0x02; 16],
+                &BoundDisk::At(FOUR),
                 0,
-                [boot.as_slice(), typed.as_slice()]
-            ),
-            Ok(at(1, 2000, 10))
-        );
-        assert_eq!(
-            resolve_named(
-                &[0xDA; 16],
-                &[0x99; 16],
-                0,
-                [boot.as_slice(), typed.as_slice()]
+                [on(&TWO, &mistyped_only)]
             ),
             Err(GptLookupError::NotFound)
         );
@@ -2196,14 +2317,31 @@ mod tests
         ];
         let boot_disk = find_boot_disk(Some(&here), &esp, located).expect("boot disk");
         assert_eq!(boot_disk, 1);
-        let disks = located.map(|(_, entries)| entries);
         assert_eq!(
-            lookup_on_disk(boot_disk, &[0x77; 16], disks[boot_disk]),
+            lookup_on_disk(boot_disk, &[0x77; 16], located[boot_disk].1),
             Ok(at(1, 2048, 2048))
         );
         assert_eq!(
-            resolve_named(&[0xDA; 16], &[0x10; 16], boot_disk, disks),
+            resolve_named(
+                &[0xDA; 16],
+                &[0x10; 16],
+                &BoundDisk::At(two),
+                boot_disk,
+                located
+            ),
             Ok(at(0, 34, 966))
+        );
+        // Bound to the boot disk, the partition of that unique GUID there is
+        // its ESP, not a data partition.
+        assert_eq!(
+            resolve_named(
+                &[0xDA; 16],
+                &[0x10; 16],
+                &BoundDisk::Boot,
+                boot_disk,
+                located
+            ),
+            Err(GptLookupError::WrongType)
         );
     }
 }
@@ -2234,7 +2372,8 @@ mod tests
 ///   `BootDiskPick::default()`, over the candidacy `is_candidate` decides
 ///   and the match `PartitionDescriptor::names` decides, each proven whole;
 /// - the resolution of a named partition is a run of `NamedPick::consider`
-///   steps from `NamedPick::default()`.
+///   steps from `NamedPick::default()`, over the place `in_place` decides,
+///   proven whole.
 ///
 /// What lies outside them is the code that drives the steps: the folds that
 /// feed `crc32_update` (in `header_crc`, the header's bytes with its CRC
@@ -2248,10 +2387,11 @@ mod tests
 mod proofs
 {
     use super::{
-        ArrayWalk, BootDiskError, BootDiskPick, BootDiskSeen, CRC32_POLY, GptCopy, GptEntry,
-        GptError, GptFault, GptLookupError, MAX_BLOCK_SIZE, Matches, NamedPick, NamedSeen,
-        PartitionDescriptor, PartitionLocation, Pick, ScanStop, choose_copy, crc32_update,
-        header_fields, is_block_size, is_candidate, is_entry_size, property,
+        ArrayWalk, BootDiskError, BootDiskPick, BootDiskSeen, BoundDisk, CRC32_POLY, GptCopy,
+        GptEntry, GptError, GptFault, GptLookupError, MAX_BLOCK_SIZE, Matches, NamedPick,
+        NamedSeen, PartitionDescriptor, PartitionLocation, Pick, ScanStop, choose_copy,
+        crc32_update, header_fields, in_place, is_block_size, is_candidate, is_entry_size,
+        property,
     };
 
     /// The header contract holds on the first `len` bytes of any
@@ -2562,10 +2702,11 @@ mod proofs
                 assert!(sharing == 1 && top.is_some_and(|(at, _)| at == found));
             }
             Err(GptLookupError::DuplicateTie) => assert_eq!(sharing, 2),
-            Err(GptLookupError::NotFound | GptLookupError::WrongType) =>
-            {
-                panic!("a lookup that considered a match found none")
-            }
+            Err(
+                GptLookupError::NotFound
+                | GptLookupError::WrongType
+                | GptLookupError::Elsewhere { .. },
+            ) => panic!("a lookup that considered a match found none"),
         }
     }
 
@@ -2759,64 +2900,105 @@ mod proofs
         }
     }
 
+    /// A disk is in the place a statement binds a partition to exactly when
+    /// the place is the boot disk and the disk is it, or the place is a
+    /// location and the disk's own location is that one, every part of it
+    /// equal; a disk with no location is at none. No loop.
+    #[kani::proof]
+    fn a_disk_is_in_the_bound_place_exactly_as_stated()
+    {
+        let bound = if kani::any()
+        {
+            BoundDisk::Boot
+        }
+        else
+        {
+            BoundDisk::At(kani::any::<Loc>())
+        };
+        let boot_disk: usize = kani::any();
+        let disk: usize = kani::any();
+        let location: Option<Loc> = kani::any();
+        let expected = match (bound, location)
+        {
+            (BoundDisk::Boot, _) => disk == boot_disk,
+            (BoundDisk::At(_), None) => false,
+            (BoundDisk::At(want), Some(here)) =>
+            {
+                want.0 == here.0 && want.1 == here.1 && want.2 == here.2 && want.3 == here.3
+            }
+        };
+        assert_eq!(
+            in_place(&bound, boot_disk, disk, location.as_ref()),
+            expected
+        );
+    }
+
     /// Step of the named resolution: for any partitions carrying the unique
-    /// GUID considered so far, summed up by the typed matches on the boot
-    /// disk and elsewhere (each its first and how many, 2 standing for two or
-    /// more) and whether a mistyped one was seen, a pick that holds exactly
-    /// that keeps it over one more partition of any location, place and
-    /// type. The empty summary is `NamedPick::default()`
-    /// (`a_named_resolution_starts_with_an_empty_pick`), so by induction the
-    /// resolution answers with the boot disk's one typed match, else the one
-    /// typed match elsewhere, a tie for two or more in the place it reads,
-    /// `WrongType` when only mistyped ones were seen, and `NotFound` when
-    /// none was. No loop.
+    /// GUID considered so far, summed up by the typed matches in the bound
+    /// place (their first and how many, 2 standing for two or more), the
+    /// disk of the first typed match outside it, and whether a mistyped one
+    /// was seen in the place, a pick that holds exactly that keeps it over
+    /// one more partition of any location and kind. The empty summary is
+    /// `NamedPick::default()` (`a_named_resolution_starts_with_an_empty_pick`),
+    /// so by induction the resolution answers with the one typed match in the
+    /// place, a tie for two or more there, `WrongType` when only mistyped
+    /// ones are there, `Elsewhere` naming the first disk outside the place
+    /// with a typed match when the place holds none, and `NotFound` when no
+    /// partition bears on the role. No loop.
     #[kani::proof]
     fn each_partition_a_named_resolution_considers_keeps_its_pick()
     {
-        let boot = any_matches();
-        let other = any_matches();
+        let here = any_matches();
+        let elsewhere: Option<usize> = kani::any();
         let mistyped: bool = kani::any();
         let pick = NamedPick {
-            boot: matches_of(boot),
-            other: matches_of(other),
+            here: matches_of(here),
+            elsewhere,
             mistyped,
         };
         let location = any_location();
         let seen = match kani::any_where(|n: &u8| *n < 3)
         {
             0 => NamedSeen::Mistyped,
-            1 => NamedSeen::OnBootDisk,
+            1 => NamedSeen::InPlace,
             _ => NamedSeen::Elsewhere,
         };
-        let (boot, other, mistyped) = match seen
+        let (here, elsewhere, mistyped) = match seen
         {
-            NamedSeen::Mistyped => (boot, other, true),
-            NamedSeen::OnBootDisk => (add_to(boot, location), other, mistyped),
-            NamedSeen::Elsewhere => (boot, add_to(other, location), mistyped),
+            NamedSeen::Mistyped => (here, elsewhere, true),
+            NamedSeen::InPlace => (add_to(here, location), elsewhere, mistyped),
+            NamedSeen::Elsewhere => (here, elsewhere.or(Some(location.disk)), mistyped),
         };
         let mut after = pick;
         after.consider(location, seen);
         assert_eq!(
             after,
             NamedPick {
-                boot: matches_of(boot),
-                other: matches_of(other),
+                here: matches_of(here),
+                elsewhere,
                 mistyped,
             }
         );
-        let (first, count) = if boot.1 > 0 { boot } else { other };
+        let (first, count) = here;
         match after.result()
         {
             Ok(found) => assert!(count == 1 && first == Some(found)),
             Err(GptLookupError::DuplicateTie) => assert_eq!(count, 2),
             Err(GptLookupError::WrongType) => assert!(count == 0 && mistyped),
-            Err(GptLookupError::NotFound) => assert!(count == 0 && !mistyped),
+            Err(GptLookupError::Elsewhere { disk }) =>
+            {
+                assert!(count == 0 && !mistyped && elsewhere == Some(disk));
+            }
+            Err(GptLookupError::NotFound) =>
+            {
+                assert!(count == 0 && !mistyped && elsewhere.is_none());
+            }
         }
     }
 
     /// Base of the named resolution: before any partition, the pick holds no
-    /// match, has seen no mistyped one, and answers `NotFound`; the empty
-    /// summary of the step proof.
+    /// match, has seen none elsewhere and no mistyped one, and answers
+    /// `NotFound`; the empty summary of the step proof.
     #[kani::proof]
     fn a_named_resolution_starts_with_an_empty_pick()
     {
@@ -2824,8 +3006,8 @@ mod proofs
         assert_eq!(
             pick,
             NamedPick {
-                boot: matches_of((None, 0)),
-                other: matches_of((None, 0)),
+                here: matches_of((None, 0)),
+                elsewhere: None,
                 mistyped: false,
             }
         );

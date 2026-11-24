@@ -8,7 +8,8 @@
 //! work; removed, its driver is withdrawn and the slot powered off or
 //! ejected; added again, it is bound anew and works. A disk behind the port
 //! is torn down at its removal and mounted again through vfsd, and a copy of
-//! it added after start enters vfsd's role lookup; and the loss
+//! it added at another location takes none of the roles its storage
+//! statement binds to the disk's location; and the loss
 //! of the root filesystem's driver, or of the boot disk, ends vfsd and shuts
 //! the system down.
 //!
@@ -45,25 +46,31 @@
 //! The storage boots stage the fixture's disk-mode recipe alone and repack
 //! the images in the split-data layout at the same block size, so the data
 //! and swap partitions are on `disk-data.img`, named by the storage
-//! statement the layout stages, and swapd takes its partition from that
-//! disk. The first places that image's
-//! `virtio-blk-pci` behind the first port from boot (`PortDisk::Data`), so vfsd
-//! mounts `/data` on it at startup: once devmgr manages the slot and the
-//! fixture holds a file open there ([`DISK_REMOVE_MARKER`]), the host
-//! removes the disk and requires devmgr's removal lines and vfsd's
-//! [`VFSD_REMOVED_MARKER`]; once the fixture logs [`DISK_READD_MARKER`], it
-//! adds the disk again on the same block node. Once the fixture mounted it
-//! again ([`DISK_TIE_MARKER`]), the host adds a copy of the image, taken
-//! before the boot, behind the second port ([`add_tie_disk`]): it carries
-//! the data partition the storage statement names, as the data disk does,
-//! so the fixture's `MOUNT` of the data role, `TABLE_FULL` while `/data`
-//! stands, must turn `NO_MOUNT` once devmgr serves the copy. The fixture then stops and
-//! kills the root mount's driver, and the host requires its verdict, vfsd's
-//! [`ROOT_LOST_MARKER`], svcmgr's [`SHUTDOWN_MARKER`], and QEMU's exit. The
-//! second boots with the boot disk itself behind that port (`PortDisk::Boot`)
-//! and the data disk on a slot of its own; once the slot is managed and the
-//! fixture ready, the host removes the boot disk and requires the same last
-//! three. Both run under native control.
+//! statement the layout stages on the disk at the location the boot places
+//! that image, and swapd takes its partition from that disk. The first
+//! places that image's `virtio-blk-pci` behind the first port from boot
+//! (`PortDisk::Data`), its statement naming the port's location
+//! (`DataDisk::HotplugPort`), so vfsd mounts `/data` on it at startup: once
+//! devmgr manages the slot and the fixture holds a file open there
+//! ([`DISK_REMOVE_MARKER`]), the host removes the disk and requires
+//! devmgr's removal lines and vfsd's [`VFSD_REMOVED_MARKER`]. Once the
+//! fixture logs [`DISK_READD_MARKER`], the host adds a copy of the image,
+//! taken before the boot, behind the second port ([`add_copy_disk`]): it
+//! carries the data partition the storage statement names, at another
+//! location than the statement's, so vfsd, asked by the fixture's `MOUNT`,
+//! must log that the partition is not on its disk and is seen on the copy,
+//! and take nothing ([`ELSEWHERE_MARKER`]); the fixture's mount before the
+//! data disk is back fails the case. The host then adds the data disk again
+//! on the same block node, and requires vfsd's line placing `/data` on the
+//! disk at the port's location and the fixture's mount there
+//! ([`DISK_MOUNTED_MARKER`]): the copy beside it denies nothing. The
+//! fixture then stops and kills the root mount's driver, and the host
+//! requires its verdict, vfsd's [`ROOT_LOST_MARKER`], svcmgr's
+//! [`SHUTDOWN_MARKER`], and QEMU's exit. The second boots with the boot disk
+//! itself behind that port (`PortDisk::Boot`) and the data disk at the
+//! second disk's slot, its statement naming that slot (`DataDisk::Slot`);
+//! once the slot is managed and the fixture ready, the host removes the boot
+//! disk and requires the same last three. Both run under native control.
 //!
 //! The staged files are always removed and the images repacked in their
 //! layout afterwards. The host kills QEMU after a boot that does not shut
@@ -81,14 +88,14 @@ use std::time::{Duration, Instant};
 use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
-use crate::disk::{DataPlacement, DiskLayout};
+use crate::disk::{DataDisk, DataPlacement, DiskLayout};
 use crate::error::{Context as _, Result, bail};
 use crate::guest::{QemuStderr, explain_exit};
 use crate::qemu::{
     EDU_DMA_MASK, Firmware, GdbMode, HOTPLUG_DISK_PORT_ID, HOTPLUG_PORT_ID, HotplugControl,
-    HotplugPort, Iommu, PORT_DISK_ID, PortDisk, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr,
-    SecondDisk, X86Paging, X86ShadowStack, build_qemu_argv, port_disk_properties,
-    validate_sysroot_for_launch,
+    HotplugPort, Iommu, PORT_DISK_ID, PORT_DISK_LOCATION, PortDisk, QemuDisplay, QemuLaunchSpec,
+    RiscvMmu, RiscvZkr, SecondDisk, X86Paging, X86ShadowStack, build_qemu_argv,
+    port_disk_properties, validate_sysroot_for_launch,
 };
 use crate::qmp::{self, Property};
 use crate::socket_dir::SocketDir;
@@ -132,15 +139,27 @@ const DISK_READD_MARKER: &str =
     "[hotplug-check] TORN DOWN /data, its disk removed; READY for the re-added disk";
 
 /// The disk-mode fixture's line once it mounted `/data` on the re-added
-/// disk. Kept in sync with `services/fixtures/hotplug-check/src/disk.rs`.
-const DISK_TIE_MARKER: &str =
-    "[hotplug-check] MOUNTED /data on the re-added disk; READY for a copy of the disk";
+/// disk, beside the copy of it. Kept in sync with
+/// `services/fixtures/hotplug-check/src/disk.rs`.
+const DISK_MOUNTED_MARKER: &str =
+    "[hotplug-check] MOUNTED /data on the re-added disk beside the copy of it";
+
+/// The text of vfsd's line, a warning, for `/data` when the partition the
+/// storage statement names is not on the disk it binds it to and a disk
+/// elsewhere carries it, up to the bound disk's location. Kept in sync with
+/// `resolve_role` in `services/vfsd/src/main.rs`.
+const ELSEWHERE_MARKER: &str = "/data: no partition named by the storage statement: not on ";
+
+/// vfsd's line for `/data` once it took the partition the storage statement
+/// names, up to the block it starts at. Kept in sync with `resolve_role` in
+/// `services/vfsd/src/main.rs`.
+const NAMED_DATA_MARKER: &str = "[vfsd] /data: partition named by the storage statement at block ";
 
 /// The id `device_add` gives the storage boot's copy of the data disk.
-const TIE_DISK_ID: &str = "hotplug-tie-disk";
+const COPY_DISK_ID: &str = "hotplug-copy-disk";
 
 /// The block node of the storage boot's copy of the data disk.
-const TIE_DISK_NODE: &str = "hotplug-tie-disk-node";
+const COPY_DISK_NODE: &str = "hotplug-copy-disk-node";
 
 /// devmgr's lines of a native removal, in the order they must come: the
 /// poller starts the removal at the end of the attention button's abort
@@ -273,17 +292,12 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
     // Read before staging, so a failed staging repack cannot change the
     // layout the restore writes.
     let layout = crate::disk::current_layout(ctx)?;
-    let storage_layout = DiskLayout {
-        block_size: layout.block_size,
-        data: DataPlacement::SecondImage,
-    };
     let booted = stage(&device_set)
         .and_then(|()| crate::disk::create_disk_image(ctx, args.arch, layout))
         .and_then(|()| device_boots(ctx, args, layout))
         .and_then(|()| unstage(&device_set))
         .and_then(|()| stage(&storage_set))
-        .and_then(|()| crate::disk::create_disk_image(ctx, args.arch, storage_layout))
-        .and_then(|()| storage_boots(ctx, args));
+        .and_then(|()| storage_boots(ctx, args, layout));
     // Restore first, and surface its failure ahead of the boot's: a staged
     // recipe would start the fixture on every later boot.
     let unstaged = unstage(&device_set);
@@ -297,7 +311,7 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
          driver and powered the slot off or ejected it, and it was bound again; a hot-added \
          disk was bound from the drivers directory on its wired line; the data disk's mount was \
          torn down at its removal and the disk mounted again when added back, and a copy of it \
-         added after start left the data partition the storage statement names untaken; the loss of the root driver and of the \
+         at another location took none of its roles and denied none; the loss of the root driver and of the \
          boot disk shut the system down)",
     );
     Ok(())
@@ -362,21 +376,29 @@ fn device_boots(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()
     Ok(())
 }
 
-/// The storage boots, on the split-data layout under native control: the
-/// data disk behind the port removed and added again, then the root driver
-/// killed; and the boot disk behind the port removed.
-fn storage_boots(ctx: &Context, args: &CaseArgs) -> Result<()>
+/// The storage boots, on the split-data layout at `layout`'s block size
+/// under native control, each packed with the statement naming the location
+/// it places the data disk at: the data disk behind the port removed, a copy
+/// of it added at another location, the disk added again, then the root
+/// driver killed; and the boot disk behind the port removed.
+fn storage_boots(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
 {
+    let split = |at: DataDisk| DiskLayout {
+        block_size: layout.block_size,
+        data: DataPlacement::SecondImage(at),
+    };
+    crate::disk::create_disk_image(ctx, args.arch, split(DataDisk::HotplugPort))?;
     let data_image = ctx.data_disk_image();
     let block_size = crate::disk::logical_block_size(&data_image)?;
     // Copied before the boot writes the data disk: its GPT, and so the data
-    // partition's type GUID and priority, are the data disk's.
-    let tie_image = ctx.target_dir.join("xtask").join("hotplug-tie-disk.img");
-    std::fs::copy(&data_image, &tie_image).with_context(|| {
+    // partition's type GUID, unique GUID and priority, are the data disk's,
+    // and the file the fixture writes is not on it.
+    let copy_image = ctx.target_dir.join("xtask").join("hotplug-copy-disk.img");
+    std::fs::copy(&data_image, &copy_image).with_context(|| {
         format!(
             "copying {} to {}",
             data_image.display(),
-            tie_image.display()
+            copy_image.display()
         )
     })?;
     let port = HotplugPort {
@@ -387,10 +409,11 @@ fn storage_boots(ctx: &Context, args: &CaseArgs) -> Result<()>
         }),
     };
     let checked = boot(ctx, args, None, port, |lines, socket| {
-        disk_check(lines, socket, block_size, &tie_image)
+        disk_check(lines, socket, block_size, &copy_image)
     });
-    let _ = std::fs::remove_file(&tie_image);
+    let _ = std::fs::remove_file(&copy_image);
     checked?;
+    crate::disk::create_disk_image(ctx, args.arch, split(DataDisk::Slot))?;
     let port = HotplugPort {
         control: HotplugControl::Native,
         disk: Some(PortDisk::Boot),
@@ -613,13 +636,16 @@ fn disk_bound(lines: &Lines) -> Result<()>
 
 /// The check of the storage boot with the data disk behind the port: once
 /// the slot is managed and the fixture holds a file open on the disk, the
-/// host removes it, and adds it again, a `virtio-blk-pci` of
-/// `block_size`-byte blocks on the same node, once vfsd has torn its mount
-/// down; once the fixture mounted it again, the host adds `tie_image`, a
-/// copy of the disk, behind the second port ([`add_tie_disk`]); the fixture
-/// passes, kills the root mount's driver, and the system shuts down
-/// ([`root_lost`]).
-fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32, tie_image: &Path) -> Result<()>
+/// host removes it; once vfsd has torn its mount down, the host adds
+/// `copy_image`, a copy of the disk, behind the second port
+/// ([`add_copy_disk`]), and requires vfsd's line that `/data`'s named
+/// partition is not on the disk at the port's location and is seen on the
+/// copy, with no mount before it; then adds the disk again, a
+/// `virtio-blk-pci` of `block_size`-byte blocks on the same node, and
+/// requires vfsd's line placing `/data` at the port's location and the
+/// fixture's mount there; the fixture passes, kills the root mount's driver,
+/// and the system shuts down ([`root_lost`]).
+fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32, copy_image: &Path) -> Result<()>
 {
     granted_and_ready(lines, HotplugControl::Native, DISK_REMOVE_MARKER)?;
     step("hotplug test: slot managed and a file open on its disk; removing the data disk");
@@ -634,7 +660,20 @@ fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32, tie_image: &Pat
     )?;
     step(
         "hotplug test: devmgr withdrew the driver and powered the slot off, vfsd tore the mount \
-         down; adding the disk again",
+         down; adding a copy of the disk behind the second port",
+    );
+    add_copy_disk(socket, copy_image, block_size)?;
+    lines.start = Instant::now();
+    let port = vfsd_location(PORT_DISK_LOCATION);
+    let seen = lines.until(VERDICT_TIMEOUT, "vfsd's sighting of the copy", |l| {
+        [ELSEWHERE_MARKER, DISK_MOUNTED_MARKER, FAIL_MARKER]
+            .iter()
+            .any(|m| l.contains(m))
+    })?;
+    elsewhere_seen(&seen, &port)?;
+    step(
+        "hotplug test: vfsd saw /data's named partition on the copy, off its disk, and took \
+         nothing; adding the disk again",
     );
     qmp::device_add(
         socket,
@@ -644,42 +683,94 @@ fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32, tie_image: &Pat
         &port_disk_properties(block_size, IOMMU),
     )?;
     lines.start = Instant::now();
-    let mounted = lines.until(VERDICT_TIMEOUT, "the re-added disk's mount", |l| {
-        l.contains(DISK_TIE_MARKER) || l.contains(FAIL_MARKER)
-    })?;
-    if !mounted.contains(DISK_TIE_MARKER)
+    let (mut placed, mut mounted) = (false, false);
+    while !(placed && mounted)
     {
-        bail!("the fixture failed: {mounted}");
+        let line = lines.until(VERDICT_TIMEOUT, "the re-added disk's mount", |l| {
+            [NAMED_DATA_MARKER, DISK_MOUNTED_MARKER, FAIL_MARKER]
+                .iter()
+                .any(|m| l.contains(m))
+        })?;
+        let (on_port, is_mount) = mounted_on(&line, &port)?;
+        placed |= on_port;
+        mounted |= is_mount;
     }
-    step("hotplug test: the disk was mounted again; adding a copy of it behind the second port");
-    add_tie_disk(socket, tie_image, block_size)?;
+    step("hotplug test: /data mounted again on its disk beside the copy");
     lines.start = Instant::now();
     verdict(lines)?;
-    step(
-        "hotplug test: vfsd resolved the data role across the added copy (a tie); the root \
-         driver is killed",
-    );
+    step("hotplug test: the fixture passed; the root driver is killed");
     lines.start = Instant::now();
     root_lost(lines)
+}
+
+/// The text vfsd logs for a disk at `at`: `PCI` and the location.
+fn vfsd_location(at: storage_statement::PciLocation) -> String
+{
+    format!(
+        "PCI {:04x}:{:02x}:{:02x}.{}",
+        at.segment, at.bus, at.device, at.function
+    )
+}
+
+/// Check `line`, the first after the copy's add that is vfsd's sighting,
+/// the fixture's mount, or its failure: it must be vfsd's line that
+/// `/data`'s named partition is not on the disk at `port` and is seen on
+/// another disk, at another location, and not taken.
+fn elsewhere_seen(line: &str, port: &str) -> Result<()>
+{
+    let Some((_, rest)) = line.split_once(ELSEWHERE_MARKER)
+    else
+    {
+        bail!("before the data disk was added again: {line}");
+    };
+    let seen = rest
+        .strip_prefix(port)
+        .and_then(|rest| rest.strip_prefix("; seen on disk "))
+        .and_then(|rest| rest.strip_suffix("; not taken"))
+        .and_then(|rest| rest.split_once(" at "));
+    match seen
+    {
+        Some((_, at)) if at != port => Ok(()),
+        _ => bail!("vfsd's line does not place the named partition off {port}: {line}"),
+    }
+}
+
+/// Read `line`, one after the data disk's re-add: whether it is vfsd's line
+/// placing `/data` on the disk at `port`, and whether it is the fixture's
+/// mount. A failure of the fixture, or `/data` placed elsewhere, fails.
+fn mounted_on(line: &str, port: &str) -> Result<(bool, bool)>
+{
+    if line.contains(FAIL_MARKER)
+    {
+        bail!("the fixture failed: {line}");
+    }
+    if line.contains(NAMED_DATA_MARKER)
+    {
+        if !line.trim_end().ends_with(&format!(" at {port}"))
+        {
+            bail!("vfsd placed /data on another disk than the one at {port}: {line}");
+        }
+        return Ok((true, false));
+    }
+    Ok((false, line.contains(DISK_MOUNTED_MARKER)))
 }
 
 /// Hot-add `image`, a copy of the data disk, behind the second port: a raw
 /// block node over it (QMP `blockdev-add`), then a `virtio-blk-pci` on it
 /// with the properties of the data disk's device added again, on that node.
 /// Its data partition is the one the storage statement names, as the data
-/// disk's is, so vfsd, resolving the named partition across every disk
-/// devmgr serves, finds two disks other than the boot disk carrying it and
-/// answers the fixture's `MOUNT` `NO_MOUNT` once devmgr serves it.
-fn add_tie_disk(socket: &Path, image: &Path, block_size: u32) -> Result<()>
+/// disk's is, at the second port's location, which the statement does not
+/// name.
+fn add_copy_disk(socket: &Path, image: &Path, block_size: u32) -> Result<()>
 {
-    qmp::blockdev_add_raw(socket, TIE_DISK_NODE, image)?;
+    qmp::blockdev_add_raw(socket, COPY_DISK_NODE, image)?;
     let mut properties = port_disk_properties(block_size, IOMMU);
     properties.retain(|&(name, _)| name != "drive");
-    properties.push(("drive", Property::Text(TIE_DISK_NODE)));
+    properties.push(("drive", Property::Text(COPY_DISK_NODE)));
     qmp::device_add(
         socket,
         "virtio-blk-pci",
-        TIE_DISK_ID,
+        COPY_DISK_ID,
         HOTPLUG_DISK_PORT_ID,
         &properties,
     )
@@ -850,5 +941,71 @@ impl Lines
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    const PORT: &str = "PCI 0000:01:00.0";
+
+    // Defect caught: the copy's step read as a pass when vfsd took the
+    // copy's partition, mounted before the data disk was back, or saw the
+    // partition at the very location the statement names.
+    #[test]
+    fn only_a_sighting_off_the_named_location_passes_the_copy_step()
+    {
+        elsewhere_seen(
+            "[vfsd] WARN /data: no partition named by the storage statement: not on PCI \
+             0000:01:00.0; seen on disk 2 at PCI 0000:02:00.0; not taken",
+            PORT,
+        )
+        .unwrap();
+        for line in [
+            "[vfsd] WARN /data: no partition named by the storage statement: not on PCI \
+             0000:01:00.0; seen on disk 2 at PCI 0000:01:00.0; not taken",
+            "[vfsd] WARN /data: no partition named by the storage statement: not on PCI \
+             0000:02:00.0; seen on disk 2 at PCI 0000:03:00.0; not taken",
+            "[hotplug-check] MOUNTED /data on the re-added disk beside the copy of it",
+            "[hotplug-check] FAIL: MOUNT at /data answered 0x7",
+        ]
+        {
+            elsewhere_seen(line, PORT).unwrap_err();
+        }
+    }
+
+    // Defect caught: /data placed on the copy after the re-add, or a
+    // failure of the fixture, read as the re-added disk's mount.
+    #[test]
+    fn the_re_added_mount_must_be_at_the_port()
+    {
+        assert_eq!(
+            mounted_on(
+                "[vfsd] /data: partition named by the storage statement at block 2048 on disk 3 \
+                 at PCI 0000:01:00.0",
+                PORT
+            )
+            .unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            mounted_on(DISK_MOUNTED_MARKER, PORT).unwrap(),
+            (false, true)
+        );
+        mounted_on(
+            "[vfsd] /data: partition named by the storage statement at block 2048 on disk 2 at \
+             PCI 0000:02:00.0",
+            PORT,
+        )
+        .unwrap_err();
+        mounted_on("[hotplug-check] FAIL: reading", PORT).unwrap_err();
+    }
+
+    #[test]
+    fn the_port_location_reads_as_vfsd_logs_it()
+    {
+        assert_eq!(vfsd_location(PORT_DISK_LOCATION), PORT);
     }
 }

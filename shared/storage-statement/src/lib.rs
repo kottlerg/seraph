@@ -13,17 +13,20 @@
 //!
 //! The statement is UTF-8 text of lines each ending in `\n`. An empty line,
 //! and one whose first byte is `#`, is skipped; every other line names one
-//! partition for one role: the role's keyword, one space, the mount path
-//! when the role takes one and one space, then the partition's unique GUID
-//! in its canonical text form (`8-4-4-4-12` hex digits, either case). The
-//! roles are the rows of [`Role`]: `data <path> <guid>`, any number of
-//! them, and `swap <guid>`, at most one. A later role is one more row.
+//! partition for one role: the role's keyword, the mount path when the role
+//! takes one, the disk the partition must be on ([`Disk`]: `boot`, or
+//! `pci:SSSS:BB:DD.F`, the PCI location devmgr reports for the disk), and
+//! the partition's unique GUID in its canonical text form (`8-4-4-4-12` hex
+//! digits, either case), joined by single spaces. The roles are the rows of
+//! [`Role`]: `data <path> <disk> <guid>`, any number of them, and
+//! `swap <disk> <guid>`, at most one. A later role is one more row.
 //!
 //! A statement is accepted whole or not at all ([`Error`]): a line with an
-//! unknown keyword, a field missing, extra or empty, a path or a GUID not in
-//! their form, a mount path or a GUID named twice, a role that takes one
-//! partition named twice, and a last line with no `\n` each refuse it,
-//! naming the line.
+//! unknown keyword, a field missing, extra or empty, a path, a disk or a GUID
+//! not in its form, a mount path or a partition (a disk and a GUID) named
+//! twice, a role that takes one partition named twice, and a last line with
+//! no `\n` each refuse it, naming the line. One GUID named on two disks
+//! names two partitions.
 //!
 //! The crate performs no I/O, so it stays host-testable
 //! ([coding-standards.md](../../../docs/coding-standards.md#d-testing-invariants)).
@@ -48,6 +51,144 @@ pub const MAX_PATH_LEN: usize = 255;
 
 /// The length of a GUID's canonical text form.
 pub const GUID_TEXT_LEN: usize = 36;
+
+/// The length of a disk field's longest form, `pci:SSSS:BB:DD.F`.
+pub const DISK_TEXT_MAX: usize = 16;
+
+/// The disk field of the boot disk.
+const BOOT_TEXT: &[u8] = b"boot";
+
+/// What a PCI location's disk field starts with.
+const PCI_PREFIX: &[u8] = b"pci:";
+
+/// The length of a PCI location's text after [`PCI_PREFIX`]: `SSSS:BB:DD.F`.
+const PCI_LOCATION_LEN: usize = 12;
+
+/// The largest PCI device number.
+const MAX_PCI_DEVICE: u8 = 31;
+
+/// The largest PCI function number.
+const MAX_PCI_FUNCTION: u8 = 7;
+
+/// A PCI function's location: its segment, bus, device and function, as
+/// devmgr reports a disk's (`QUERY_DEVICE_LOCATION`) and vfsd holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciLocation
+{
+    /// The PCI segment group.
+    pub segment: u16,
+    /// The bus number.
+    pub bus: u8,
+    /// The device number, at most 31.
+    pub device: u8,
+    /// The function number, at most 7.
+    pub function: u8,
+}
+
+/// The disk a line binds its partition to: the partition takes its role
+/// only on that disk (docs/storage.md § GPT Role-GUID Discovery).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disk
+{
+    /// The boot disk, wherever vfsd found it: `boot`.
+    Boot,
+    /// The disk whose device sits at the location, compared whole:
+    /// `pci:SSSS:BB:DD.F`, the segment, bus and device in hex digits of
+    /// either case and the function a digit from 0 to 7.
+    Pci(PciLocation),
+}
+
+impl Disk
+{
+    /// The disk `text` names: `boot`, or `pci:` and a location of four,
+    /// two and two hex digits and one digit, joined by `:`, `:` and `.`,
+    /// whose device is at most 31 and function at most 7.
+    #[must_use]
+    pub fn parse(text: &[u8]) -> Option<Self>
+    {
+        if text == BOOT_TEXT
+        {
+            return Some(Self::Boot);
+        }
+        let at = text.strip_prefix(PCI_PREFIX)?;
+        // `SSSS:BB:DD.F`, read at its places.
+        if at.len() != PCI_LOCATION_LEN
+            || at.get(4) != Some(&b':')
+            || at.get(7) != Some(&b':')
+            || at.get(10) != Some(&b'.')
+        {
+            return None;
+        }
+        let location = PciLocation {
+            segment: u16::from_be_bytes([hex_byte(at, 0)?, hex_byte(at, 2)?]),
+            bus: hex_byte(at, 5)?,
+            device: hex_byte(at, 8)?,
+            function: hex_value(*at.get(11)?)?,
+        };
+        (location.device <= MAX_PCI_DEVICE && location.function <= MAX_PCI_FUNCTION)
+            .then_some(Self::Pci(location))
+    }
+
+    /// The disk's field as a line writes it, in lowercase, and its length.
+    #[must_use]
+    pub fn text(&self) -> ([u8; DISK_TEXT_MAX], usize)
+    {
+        let mut text = [0u8; DISK_TEXT_MAX];
+        match self
+        {
+            Self::Boot =>
+            {
+                if let Some(head) = text.get_mut(..BOOT_TEXT.len())
+                {
+                    head.copy_from_slice(BOOT_TEXT);
+                }
+                (text, BOOT_TEXT.len())
+            }
+            Self::Pci(at) =>
+            {
+                let [high, low] = at.segment.to_be_bytes();
+                let mut written = *b"pci:0000:00:00.0";
+                for (place, byte) in [(4usize, high), (6, low), (9, at.bus), (12, at.device)]
+                {
+                    if let Some(pair) = written.get_mut(place..place.wrapping_add(2))
+                    {
+                        pair.copy_from_slice(&[hex_digit(byte >> 4), hex_digit(byte & 0xF)]);
+                    }
+                }
+                if let Some(digit) = written.get_mut(15)
+                {
+                    *digit = hex_digit(at.function & 0xF);
+                }
+                (written, DISK_TEXT_MAX)
+            }
+        }
+    }
+}
+
+impl core::fmt::Display for Disk
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        let (text, len) = self.text();
+        // Every byte `text` writes is ASCII.
+        f.write_str(core::str::from_utf8(text.get(..len).unwrap_or_default()).unwrap_or_default())
+    }
+}
+
+/// The byte of the two hex digits at `at` and `at + 1` of `text`.
+fn hex_byte(text: &[u8], at: usize) -> Option<u8>
+{
+    let high = hex_value(*text.get(at)?)?;
+    let low = hex_value(*text.get(at.wrapping_add(1))?)?;
+    Some((high << 4) | low)
+}
+
+/// The lowercase hex digit of `nibble`, at most 15.
+fn hex_digit(nibble: u8) -> u8
+{
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    DIGITS.get(usize::from(nibble)).copied().unwrap_or(b'0')
+}
 
 /// A storage role a statement can name a partition for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,22 +260,27 @@ pub enum ErrorKind
     /// The line's first field is no role's keyword.
     UnknownRole,
     /// The line is not its role's keyword, a space, the mount path and a
-    /// space when the role takes one, and a GUID-length field: a field is
-    /// missing or empty, or a `swap` line holds one too many.
+    /// space when the role takes one, the disk field, a space, and a
+    /// GUID-length field: a field is missing or empty.
     Fields,
     /// The mount path, all a `data` line holds between its keyword's space
-    /// and the GUID's, is not an absolute path of at most [`MAX_PATH_LEN`]
-    /// bytes whose components are each one or more of `A-Z a-z 0-9 . _ -`,
-    /// and neither `.` nor `..`; or it is `/`. A space in it, a field too
-    /// many, is refused here.
+    /// and the last space before the disk field, is not an absolute path of
+    /// at most [`MAX_PATH_LEN`] bytes whose components are each one or more
+    /// of `A-Z a-z 0-9 . _ -`, and neither `.` nor `..`; or it is `/`. A
+    /// space in it, a field too many, is refused here.
     Path,
+    /// The disk field is not `boot` or a PCI location in its form
+    /// ([`Disk::parse`]). A space in a `swap` line's, a field too many, is
+    /// refused here.
+    Disk,
     /// The line's last [`GUID_TEXT_LEN`] bytes are not a GUID in its
     /// canonical text form.
     Guid,
     /// The mount path is named on an earlier line.
     PathRepeated,
-    /// The partition's unique GUID is named on an earlier line.
-    GuidRepeated,
+    /// The partition, its disk and its unique GUID, is named on an earlier
+    /// line.
+    PartitionRepeated,
     /// The role takes one partition and an earlier line names one.
     RoleRepeated,
     /// The statement's entries could not be allocated.
@@ -151,9 +297,10 @@ impl core::fmt::Display for ErrorKind
             Self::UnknownRole => "no role has this keyword",
             Self::Fields => "the fields are not the role's",
             Self::Path => "the mount path is not in its form",
+            Self::Disk => "the disk is not boot or a PCI location in its form",
             Self::Guid => "the GUID is not in its canonical form",
             Self::PathRepeated => "the mount path is named twice",
-            Self::GuidRepeated => "the partition is named twice",
+            Self::PartitionRepeated => "the partition is named twice on its disk",
             Self::RoleRepeated => "the role takes one partition and is named twice",
             Self::OutOfMemory => "out of memory",
         })
@@ -186,19 +333,27 @@ pub struct Named
     pub role: Role,
     /// The mount path, for a role that takes one.
     pub path: Option<String>,
+    /// The disk the partition must be on.
+    pub disk: Disk,
     /// The partition's unique GUID, in GPT on-disk byte order.
     pub guid: [u8; 16],
 }
 
 impl Named
 {
-    /// A partition named for `role` at `path`, checked as a line of it is.
+    /// The partition of unique GUID `guid` on `disk`, named for `role` at
+    /// `path`, checked as a line of it is.
     ///
     /// # Errors
     /// [`ErrorKind::Fields`] when `path` is given for a role that takes
     /// none, or missing for one that takes one; [`ErrorKind::Path`] when it
     /// is not in its form.
-    pub fn new(role: Role, path: Option<&str>, guid: [u8; 16]) -> Result<Self, ErrorKind>
+    pub fn new(
+        role: Role,
+        path: Option<&str>,
+        disk: Disk,
+        guid: [u8; 16],
+    ) -> Result<Self, ErrorKind>
     {
         let path = match (role.takes_path(), path)
         {
@@ -207,7 +362,12 @@ impl Named
             (false, None) => None,
             (true, None) | (false, Some(_)) => return Err(ErrorKind::Fields),
         };
-        Ok(Self { role, path, guid })
+        Ok(Self {
+            role,
+            path,
+            disk,
+            guid,
+        })
     }
 
     /// The fields a conflict between two entries is judged on.
@@ -216,6 +376,7 @@ impl Named
         Key {
             role: self.role,
             path: self.path.as_deref().map(str::as_bytes),
+            disk: self.disk,
             guid: &self.guid,
         }
     }
@@ -227,17 +388,18 @@ struct Key<'a>
 {
     role: Role,
     path: Option<&'a [u8]>,
+    disk: Disk,
     guid: &'a [u8; 16],
 }
 
 /// Why `later` cannot stand in one statement with `earlier`, if it cannot:
-/// both name one partition, one mount path, or a role that takes one
-/// partition.
+/// both name one partition (one GUID on one disk), one mount path, or a role
+/// that takes one partition.
 fn conflict(earlier: Key<'_>, later: Key<'_>) -> Option<ErrorKind>
 {
-    if earlier.guid == later.guid
+    if earlier.disk == later.disk && earlier.guid == later.guid
     {
-        return Some(ErrorKind::GuidRepeated);
+        return Some(ErrorKind::PartitionRepeated);
     }
     if earlier.path.is_some() && earlier.path == later.path
     {
@@ -276,15 +438,14 @@ impl Statement
         &self.entries
     }
 
-    /// The unique GUID of the partition named for `role` at `path` (`None`
-    /// for a role that takes no path), if a line names one.
+    /// The partition named for `role` at `path` (`None` for a role that
+    /// takes no path), if a line names one: its disk and unique GUID.
     #[must_use]
-    pub fn named(&self, role: Role, path: Option<&[u8]>) -> Option<[u8; 16]>
+    pub fn named(&self, role: Role, path: Option<&[u8]>) -> Option<&Named>
     {
         self.entries
             .iter()
             .find(|entry| entry.role == role && entry.path.as_deref().map(str::as_bytes) == path)
-            .map(|entry| entry.guid)
     }
 
     /// Add `entry` after the entries named so far.
@@ -333,6 +494,10 @@ fn render_line(entry: &Named, text: &mut String)
         text.push_str(path);
     }
     text.push(' ');
+    let (disk, len) = entry.disk.text();
+    // Every byte Disk::text writes is ASCII.
+    text.push_str(core::str::from_utf8(disk.get(..len).unwrap_or_default()).unwrap_or_default());
+    text.push(' ');
     let guid = format_guid(&entry.guid);
     // Every byte format_guid writes is an ASCII hex digit or a dash.
     text.push_str(core::str::from_utf8(&guid).unwrap_or_default());
@@ -376,35 +541,42 @@ pub fn parse_line(line: &[u8]) -> Result<Option<Named>, ErrorKind>
     {
         return Ok(None);
     }
-    let (role, path, guid) = split_line(line)?;
+    let (role, path, disk, guid) = split_line(line)?;
     if path.is_some_and(|path| !is_mount_path(path))
     {
         return Err(ErrorKind::Path);
     }
+    let disk = Disk::parse(disk).ok_or(ErrorKind::Disk)?;
     let guid = parse_guid(guid).ok_or(ErrorKind::Guid)?;
     // A mount path is ASCII, so it is UTF-8.
     let path = path.map(|path| String::from(core::str::from_utf8(path).unwrap_or_default()));
-    Ok(Some(Named { role, path, guid }))
+    Ok(Some(Named {
+        role,
+        path,
+        disk,
+        guid,
+    }))
 }
 
-/// A line's role, its path field when the role takes one, and its GUID
-/// field, as [`split_line`] reads them.
-pub(crate) type Fields<'a> = (Role, Option<&'a [u8]>, &'a [u8]);
+/// A line's role, its path field when the role takes one, its disk field
+/// and its GUID field, as [`split_line`] reads them.
+pub(crate) type Fields<'a> = (Role, Option<&'a [u8]>, &'a [u8], &'a [u8]);
 
-/// A line's role, its path field when the role takes one, and its GUID
-/// field, read by place before either field's form is checked.
+/// A line's role, its path field when the role takes one, its disk field
+/// and its GUID field, read before any field's form is checked.
 ///
-/// The fields stand at fixed places: the keyword first, the GUID the last
-/// [`GUID_TEXT_LEN`] bytes, each followed or preceded by one space, and the
-/// path, when the role takes one, all that lies between. A space anywhere
-/// else falls inside the path or the GUID, whose forms refuse it, so the
-/// line is read with no search for its separators.
+/// The keyword stands first and the GUID in the last [`GUID_TEXT_LEN`]
+/// bytes, each followed or preceded by one space; the disk field is what
+/// lies after the last space before the GUID's, and the path, when the role
+/// takes one, all that lies before it. A space anywhere else falls inside
+/// the path, the disk field of a `swap` line, or the GUID, whose forms
+/// refuse it.
 ///
 /// # Errors
 /// [`ErrorKind::UnknownRole`] when the line starts with no keyword followed
 /// by a space or its end; [`ErrorKind::Fields`] when the bytes after it are
-/// not a GUID-length field, after a non-empty path and a space when the role
-/// takes one.
+/// not a non-empty path and a space when the role takes one, then a
+/// non-empty disk field, a space and a GUID-length field.
 pub(crate) fn split_line(line: &[u8]) -> Result<Fields<'_>, ErrorKind>
 {
     let role = Role::ALL
@@ -423,23 +595,37 @@ pub(crate) fn split_line(line: &[u8]) -> Result<Fields<'_>, ErrorKind>
         return Err(ErrorKind::Fields);
     };
     let (head, guid) = rest.split_at(head_len);
-    let path = if role.takes_path()
-    {
-        match head.strip_suffix(b" ")
-        {
-            Some(path) if !path.is_empty() => Some(path),
-            _ => return Err(ErrorKind::Fields),
-        }
-    }
-    else if head.is_empty()
-    {
-        None
-    }
+    let Some(head) = head.strip_suffix(b" ")
     else
     {
         return Err(ErrorKind::Fields);
     };
-    Ok((role, path, guid))
+    let (path, disk) = if role.takes_path()
+    {
+        let Some(space) = head.iter().rposition(|&byte| byte == b' ')
+        else
+        {
+            return Err(ErrorKind::Fields);
+        };
+        let path = head.get(..space).unwrap_or_default();
+        if path.is_empty()
+        {
+            return Err(ErrorKind::Fields);
+        }
+        (
+            Some(path),
+            head.get(space.saturating_add(1)..).unwrap_or_default(),
+        )
+    }
+    else
+    {
+        (None, head)
+    };
+    if disk.is_empty()
+    {
+        return Err(ErrorKind::Fields);
+    }
+    Ok((role, path, disk, guid))
 }
 
 /// Whether `path` is a mount path a statement names: `/` then one or more
@@ -521,14 +707,12 @@ pub fn parse_guid(text: &[u8]) -> Option<[u8; 16]>
 #[must_use]
 pub fn format_guid(guid: &[u8; 16]) -> [u8; GUID_TEXT_LEN]
 {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut text = [b'-'; GUID_TEXT_LEN];
     for (&byte, &at) in guid.iter().zip(&GUID_TEXT_OFFSETS)
     {
-        let digit = |nibble: u8| DIGITS.get(usize::from(nibble)).copied().unwrap_or(b'0');
         if let Some(pair) = text.get_mut(at..at.wrapping_add(2))
         {
-            pair.copy_from_slice(&[digit(byte >> 4), digit(byte & 0xF)]);
+            pair.copy_from_slice(&[hex_digit(byte >> 4), hex_digit(byte & 0xF)]);
         }
     }
     text
@@ -571,21 +755,95 @@ mod tests
         }
     }
 
+    /// `pci:0000:00:12.0`, the slot of a split launch's second disk.
+    const SLOT: Disk = Disk::Pci(PciLocation {
+        segment: 0,
+        bus: 0,
+        device: 0x12,
+        function: 0,
+    });
+
+    // Defect caught: a location read with its fields swapped or its digits
+    // out of place, so a line binds its partition to another disk than the
+    // one it writes.
+    #[test]
+    fn a_disk_reads_as_boot_or_a_pci_location_and_writes_back()
+    {
+        assert_eq!(Disk::parse(b"boot"), Some(Disk::Boot));
+        assert_eq!(Disk::parse(b"pci:0000:00:12.0"), Some(SLOT));
+        let far = Disk::Pci(PciLocation {
+            segment: 0xab01,
+            bus: 0xcd,
+            device: 0x1f,
+            function: 7,
+        });
+        assert_eq!(Disk::parse(b"pci:AB01:Cd:1F.7"), Some(far));
+        assert_eq!(far.to_string(), "pci:ab01:cd:1f.7");
+        assert_eq!(SLOT.to_string(), "pci:0000:00:12.0");
+        assert_eq!(Disk::Boot.to_string(), "boot");
+        for bad in [
+            "",
+            "Boot",
+            "boot ",
+            "pci:0000:00:20.0",
+            "pci:0000:00:12.8",
+            "pci:000:00:12.0",
+            "pci:0000:00:12.00",
+            "pci:0000-00:12.0",
+            "pci:0000:00:12:0",
+            "PCI:0000:00:12.0",
+            "pci 0000:00:12.0",
+            "pci:0000:0g:12.0",
+        ]
+        {
+            assert_eq!(Disk::parse(bad.as_bytes()), None, "{bad}");
+        }
+    }
+
     #[test]
     fn a_statement_names_data_paths_and_swap()
     {
         let text = format!(
-            "# disks\n\ndata /data {GUID_TEXT}\ndata /srv/cache 00000000-0000-0000-0000-000000000001\nswap \
+            "# disks\n\ndata /data pci:0000:00:12.0 {GUID_TEXT}\ndata /srv/cache boot \
+             00000000-0000-0000-0000-000000000001\nswap pci:0000:00:12.0 \
              00000000-0000-0000-0000-000000000002\n"
         );
         let statement = parse(text.as_bytes()).unwrap();
         assert_eq!(statement.entries().len(), 3);
-        assert_eq!(statement.named(Role::Data, Some(b"/data")), Some(GUID));
+        let data = statement.named(Role::Data, Some(b"/data")).unwrap();
+        assert_eq!((data.disk, data.guid), (SLOT, GUID));
+        assert_eq!(
+            statement
+                .named(Role::Data, Some(b"/srv/cache"))
+                .map(|entry| entry.disk),
+            Some(Disk::Boot)
+        );
         assert_eq!(statement.named(Role::Data, Some(b"/srv")), None);
         let mut swap = [0u8; 16];
         swap[15] = 2;
-        assert_eq!(statement.named(Role::Swap, None), Some(swap));
+        let named = statement.named(Role::Swap, None).unwrap();
+        assert_eq!((named.disk, named.guid), (SLOT, swap));
         assert_eq!(parse(statement.render().as_bytes()), Ok(statement));
+    }
+
+    // Defect caught: a statement refused for one GUID on two disks, which
+    // mkdisk's constant GUIDs make the usual case, or taken naming one
+    // partition on one disk twice.
+    #[test]
+    fn one_guid_names_a_partition_on_each_disk()
+    {
+        let text = format!("data /a boot {GUID_TEXT}\ndata /b pci:0000:00:12.0 {GUID_TEXT}\n");
+        let statement = parse(text.as_bytes()).unwrap();
+        assert_eq!(statement.entries().len(), 2);
+        assert_eq!(
+            refused(&format!(
+                "data /a pci:0000:00:12.0 {GUID_TEXT}\nswap pci:0000:00:12.0 {GUID_TEXT}\n"
+            )),
+            Error {
+                line: 2,
+                kind: ErrorKind::PartitionRepeated
+            }
+        );
     }
 
     #[test]
@@ -597,41 +855,70 @@ mod tests
     }
 
     // Defect caught: a statement taken in part, so a line the deployer wrote
-    // is dropped silently and its role falls to another partition.
+    // is dropped silently and its role falls to another partition; and a
+    // line that names no disk taken, so its partition is bound nowhere.
     #[test]
     fn a_statement_is_refused_whole_naming_its_line()
     {
-        let cases: [(String, usize, ErrorKind); 13] = [
+        let cases: [(String, usize, ErrorKind); 19] = [
             (
-                format!("data /data {GUID_TEXT}"),
+                format!("data /data boot {GUID_TEXT}"),
                 1,
                 ErrorKind::NoFinalNewline,
             ),
             (
-                format!("# ok\ndisk /data {GUID_TEXT}\n"),
+                format!("# ok\ndisk /data boot {GUID_TEXT}\n"),
                 2,
                 ErrorKind::UnknownRole,
             ),
-            (format!("data {GUID_TEXT}\n"), 1, ErrorKind::Fields),
-            (format!("data  /data {GUID_TEXT}\n"), 1, ErrorKind::Path),
-            (format!("data /data {GUID_TEXT} \n"), 1, ErrorKind::Fields),
-            (format!("swap /swap {GUID_TEXT}\n"), 1, ErrorKind::Fields),
-            (format!("data data {GUID_TEXT}\n"), 1, ErrorKind::Path),
-            (format!("data /a/../b {GUID_TEXT}\n"), 1, ErrorKind::Path),
-            (format!("data / {GUID_TEXT}\n"), 1, ErrorKind::Path),
-            (format!("data /data {GUID_TEXT}\r\n"), 1, ErrorKind::Fields),
+            (format!("data /data {GUID_TEXT}\n"), 1, ErrorKind::Fields),
+            (format!("swap {GUID_TEXT}\n"), 1, ErrorKind::Fields),
+            (format!("data boot {GUID_TEXT}\n"), 1, ErrorKind::Fields),
+            (format!("data  boot {GUID_TEXT}\n"), 1, ErrorKind::Fields),
+            (format!("data /data  {GUID_TEXT}\n"), 1, ErrorKind::Fields),
             (
-                format!("data /a {GUID_TEXT}\ndata /a 00000000-0000-0000-0000-000000000001\n"),
+                format!("data  /data boot {GUID_TEXT}\n"),
+                1,
+                ErrorKind::Path,
+            ),
+            (
+                format!("data /data boot {GUID_TEXT} \n"),
+                1,
+                ErrorKind::Fields,
+            ),
+            (format!("swap /swap boot {GUID_TEXT}\n"), 1, ErrorKind::Disk),
+            (format!("swap disk {GUID_TEXT}\n"), 1, ErrorKind::Disk),
+            (
+                format!("data /data pci:0:0:12.0 {GUID_TEXT}\n"),
+                1,
+                ErrorKind::Disk,
+            ),
+            (format!("data data boot {GUID_TEXT}\n"), 1, ErrorKind::Path),
+            (
+                format!("data /a/../b boot {GUID_TEXT}\n"),
+                1,
+                ErrorKind::Path,
+            ),
+            (format!("data / boot {GUID_TEXT}\n"), 1, ErrorKind::Path),
+            (
+                format!("data /data boot {GUID_TEXT}\r\n"),
+                1,
+                ErrorKind::Fields,
+            ),
+            (
+                format!(
+                    "data /a boot {GUID_TEXT}\ndata /a boot 00000000-0000-0000-0000-000000000001\n"
+                ),
                 2,
                 ErrorKind::PathRepeated,
             ),
             (
-                format!("data /a {GUID_TEXT}\nswap {GUID_TEXT}\n"),
+                format!("data /a boot {GUID_TEXT}\nswap boot {GUID_TEXT}\n"),
                 2,
-                ErrorKind::GuidRepeated,
+                ErrorKind::PartitionRepeated,
             ),
             (
-                "swap 00000000-0000-0000-0000-000000000001\nswap \
+                "swap boot 00000000-0000-0000-0000-000000000001\nswap pci:0000:00:12.0 \
                  00000000-0000-0000-0000-000000000002\n"
                     .into(),
                 2,
@@ -670,25 +957,25 @@ mod tests
     {
         let mut statement = Statement::new();
         statement
-            .push(Named::new(Role::Data, Some("/data"), GUID).unwrap())
+            .push(Named::new(Role::Data, Some("/data"), SLOT, GUID).unwrap())
             .unwrap();
         statement
-            .push(Named::new(Role::Swap, None, [7; 16]).unwrap())
+            .push(Named::new(Role::Swap, None, Disk::Boot, [7; 16]).unwrap())
             .unwrap();
         assert_eq!(
-            statement.push(Named::new(Role::Swap, None, [8; 16]).unwrap()),
+            statement.push(Named::new(Role::Swap, None, SLOT, [8; 16]).unwrap()),
             Err(ErrorKind::RoleRepeated)
         );
         assert_eq!(
-            Named::new(Role::Swap, Some("/swap"), [8; 16]),
+            Named::new(Role::Swap, Some("/swap"), SLOT, [8; 16]),
             Err(ErrorKind::Fields)
         );
         assert_eq!(
-            Named::new(Role::Data, None, [8; 16]),
+            Named::new(Role::Data, None, SLOT, [8; 16]),
             Err(ErrorKind::Fields)
         );
         assert_eq!(
-            Named::new(Role::Data, Some("data"), [8; 16]),
+            Named::new(Role::Data, Some("data"), SLOT, [8; 16]),
             Err(ErrorKind::Path)
         );
         assert_eq!(parse(statement.render().as_bytes()), Ok(statement));
@@ -748,31 +1035,37 @@ mod tests
 ///
 /// A statement is read line by line, and each line is decoded with no state
 /// from another. [`parse_line`] skips an empty line and a comment, splits
-/// the rest into its fields by place ([`split_line`], with no loop over the
-/// line: the keyword at its start, the GUID in its last 36 bytes, the path
-/// between), checks the path and the GUID, and builds the entry. The proofs
-/// compose: the short-line proof runs the property's check of a line on
-/// every line of at most 12 bytes; the split proof runs the split's check
-/// on every line of at most 48 bytes; the path and GUID proofs run the
-/// checks of the two fields on every path of at most 8 bytes and every text
-/// of at most 37; and the taken-line proof shows a `data` line of any
-/// three-byte path, or a `swap` line, with the first digit and the first
-/// dash of its GUID of any value, built into its entry or refused for its path before its GUID. A
-/// line's entry is then judged against each earlier one by `conflict`, whose
-/// proof covers any two entries. What lies outside them is the code that
-/// drives the steps: the split of a statement into its lines in [`parse`],
-/// the check that the last ends in `\n`, and the search of the earlier
-/// entries in [`Statement::push`]; the fuzz target `storage-statement`,
-/// the replay of the checked-in inputs and the unit tests check them.
+/// the rest into its fields ([`split_line`]: the keyword at its start, the
+/// GUID in its last 36 bytes, the disk field after the last space before
+/// the GUID's, the path before it), checks the path, the disk and the GUID,
+/// and builds the entry. The proofs compose: the short-line proof runs the
+/// property's check of a line on every line of at most 12 bytes; the split
+/// proof runs the split's check on every line of at most 48 bytes; the path,
+/// disk and GUID proofs run the checks of the three fields on every path of
+/// at most 8 bytes, every disk field of at most 17 and every text of at most
+/// 37; and the taken-line proof shows a `data` line of any three-byte path
+/// and the disk field `boot`, or a `swap` line of any four-byte disk
+/// field,
+/// with the first digit and the first dash of its GUID of any value, built
+/// into its entry or refused for the first of its fields out of its form. A
+/// line's entry is then judged against each earlier one by `conflict`,
+/// whose proof covers any two entries. What lies outside them is the code
+/// that drives the steps: the split of a statement into its lines in
+/// [`parse`], the check that the last ends in `\n`, and the search of the
+/// earlier entries in [`Statement::push`]; the fuzz target
+/// `storage-statement`, the replay of the checked-in inputs and the unit
+/// tests check them.
 #[cfg(kani)]
 mod proofs
 {
-    use super::{ErrorKind, Key, Role, conflict, property};
+    use super::{Disk, ErrorKind, Key, PciLocation, Role, conflict, property};
 
     /// Every line of at most 12 bytes holds the line contract: an empty
     /// line, a comment, and each refusal of a line too short to name a
     /// partition, for both roles and none (an unknown keyword, a field
-    /// missing, extra or empty).
+    /// missing, extra or empty): 12 bytes hold a keyword and four one-byte
+    /// fields, a `data` line's three and one more, so a line of a field too
+    /// many for either role, and a field empty between two spaces.
     #[kani::proof]
     #[kani::unwind(14)]
     fn every_short_line_holds_the_line_contract()
@@ -784,11 +1077,13 @@ mod proofs
     }
 
     /// Every line of at most 48 bytes is split into its fields at their
-    /// places: 48 bytes hold a `swap` line (41 bytes) with room for a field
-    /// too many, and a `data` line with a path of up to 6 bytes, so each
-    /// refusal and each split of both roles is reached.
+    /// places: 48 bytes hold a `swap` line of a disk field of up to 6 bytes
+    /// (`boot` among them), and a `data` line whose path and disk field
+    /// together hold up to 5, so each refusal and each split of both roles is
+    /// reached. The search for the disk field's space runs over at most the
+    /// 6 bytes before the GUID's.
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(9)]
     fn every_line_splits_into_its_fields()
     {
         let bytes: [u8; 48] = kani::any();
@@ -798,65 +1093,90 @@ mod proofs
     }
 
     /// Every `data` line of a three-byte path field, and every `swap` line,
-    /// whose GUID field is a canonical text of mixed case with its first
-    /// digit and its first dash each any value, is taken exactly when its path and its GUID are each
-    /// in their form, as an entry of its role, path and GUID, and is refused
-    /// otherwise for its path before its GUID: the step from the split fields
-    /// to the entry, whose checks of the path and the GUID the path and GUID
-    /// proofs cover on every field of their bounds.
+    /// each of a four-byte disk field, whose GUID field is a canonical text of
+    /// mixed case with its first digit and its first dash each any value, is
+    /// taken exactly when its path, its disk and its GUID are each in their
+    /// form, as an entry of its role, path, disk and GUID, and is refused
+    /// otherwise for the first field out of its form: the step from the split
+    /// fields to the entry, whose checks of the path, the disk and the GUID
+    /// the path, disk and GUID proofs cover on every field of their bounds. A
+    /// `data` line's disk field is `boot`: a symbolic byte there would make
+    /// the path's length, which the split reads from the last space,
+    /// symbolic for every check after it, and a space there moves the split,
+    /// which the split proof covers on every line of its bound. The `swap`
+    /// line's field carries any four-byte disk text into the same
+    /// `Disk::parse`.
     fn line_is_taken_as_its_fields(data: bool)
     {
         let mut guid = *b"a1B2c3d4-E5f6-7890-ABcd-ef0123456789";
         guid[0] = kani::any();
         guid[8] = kani::any();
         let path: [u8; 3] = kani::any();
-        let mut line = [0u8; 45];
+        let disk: [u8; 4] = if data { *b"boot" } else { kani::any() };
+        let mut line = [0u8; 50];
         let len = if data
         {
             line[..5].copy_from_slice(b"data ");
             line[5..8].copy_from_slice(&path);
             line[8] = b' ';
-            line[9..].copy_from_slice(&guid);
-            45
+            line[9..13].copy_from_slice(&disk);
+            line[13] = b' ';
+            line[14..].copy_from_slice(&guid);
+            50
         }
         else
         {
             line[..5].copy_from_slice(b"swap ");
-            line[5..41].copy_from_slice(&guid);
-            41
+            line[5..9].copy_from_slice(&disk);
+            line[9] = b' ';
+            line[10..46].copy_from_slice(&guid);
+            46
         };
         let path_in_form = !data || property::path_form(&path);
+        let disk_in_form = property::disk_form(&disk);
         let guid_in_form = property::guid_form(&guid);
         match super::parse_line(&line[..len])
         {
             Ok(Some(entry)) =>
             {
-                assert!(path_in_form && guid_in_form, "a line out of its form taken");
+                assert!(
+                    path_in_form && disk_in_form && guid_in_form,
+                    "a line out of its form taken"
+                );
                 assert_eq!(entry.role, if data { Role::Data } else { Role::Swap });
                 assert_eq!(
                     entry.path.as_deref().map(str::as_bytes),
                     data.then_some(&path[..]),
                     "a path read as another"
                 );
+                assert_eq!(
+                    Some(entry.disk),
+                    Disk::parse(&disk),
+                    "a disk read as another"
+                );
                 assert!(
                     super::format_guid(&entry.guid).eq_ignore_ascii_case(&guid),
                     "a GUID read as another"
                 );
             }
-            Ok(None) => assert!(false, "a line naming a partition skipped"),
+            Ok(None) => panic!("a line naming a partition skipped"),
             Err(kind) =>
             {
                 assert!(
-                    !(path_in_form && guid_in_form),
+                    !(path_in_form && disk_in_form && guid_in_form),
                     "a line in its form refused"
                 );
-                let first = if path_in_form
+                let first = if !path_in_form
                 {
-                    ErrorKind::Guid
+                    ErrorKind::Path
+                }
+                else if !disk_in_form
+                {
+                    ErrorKind::Disk
                 }
                 else
                 {
-                    ErrorKind::Path
+                    ErrorKind::Guid
                 };
                 assert_eq!(kind, first, "a refusal names another field");
             }
@@ -891,6 +1211,18 @@ mod proofs
         property::guid_holds(&bytes[..len]);
     }
 
+    /// Every disk field of at most 17 bytes holds the disk contract: `boot`,
+    /// a PCI location's 16 bytes, and one more.
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn every_disk_text_holds_the_disk_contract()
+    {
+        let bytes: [u8; 17] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        property::disk_holds(&bytes[..len]);
+    }
+
     /// Every path of at most 8 bytes holds the path contract: room for two
     /// components, a `..` among them, and each separator fault. The length
     /// bound is one compare, which the unit tests check at the bound.
@@ -909,12 +1241,29 @@ mod proofs
         if kani::any() { Role::Data } else { Role::Swap }
     }
 
+    fn any_disk() -> Disk
+    {
+        if kani::any()
+        {
+            Disk::Boot
+        }
+        else
+        {
+            Disk::Pci(PciLocation {
+                segment: kani::any(),
+                bus: kani::any(),
+                device: kani::any(),
+                function: kani::any(),
+            })
+        }
+    }
+
     /// The step of a statement's add: any entry conflicts with any earlier
-    /// one exactly when both name one partition, one mount path, or a role
-    /// that takes one partition, and the refusal names the first of these
-    /// that holds. Paths of up to 2 bytes stand for any: `conflict` compares
-    /// them whole. No loop beyond the compares of the paths and of the two
-    /// 16-byte GUIDs.
+    /// one exactly when both name one partition (one GUID on one disk), one
+    /// mount path, or a role that takes one partition, and the refusal names
+    /// the first of these that holds. Paths of up to 2 bytes stand for any:
+    /// `conflict` compares them whole. No loop beyond the compares of the
+    /// paths and of the two 16-byte GUIDs.
     #[kani::proof]
     #[kani::unwind(17)]
     fn each_entry_is_judged_against_an_earlier_one()
@@ -926,15 +1275,17 @@ mod proofs
         ];
         let guids: [[u8; 16]; 2] = kani::any();
         let roles = [any_role(), any_role()];
+        let disks = [any_disk(), any_disk()];
         let key = |i: usize| Key {
             role: roles[i],
             path: roles[i].takes_path().then(|| &paths[i][..lens[i]]),
+            disk: disks[i],
             guid: &guids[i],
         };
         let (earlier, later) = (key(0), key(1));
-        let expected = if guids[0] == guids[1]
+        let expected = if disks[0] == disks[1] && guids[0] == guids[1]
         {
-            Some(ErrorKind::GuidRepeated)
+            Some(ErrorKind::PartitionRepeated)
         }
         else if earlier.path.is_some() && earlier.path == later.path
         {

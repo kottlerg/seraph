@@ -21,13 +21,14 @@
 //! [`READD_MARKER`]; and, once the host has added the disk again, mounts it
 //! through a fresh `MOUNT`, which vfsd answers `NO_MOUNT` until devmgr
 //! serves the disk and then finds it by querying devmgr first, and reads its
-//! file back. It logs [`TIE_MARKER`], the host adds a copy of the disk
-//! behind its second port, and the fixture checks that vfsd resolves the
-//! partition the storage statement names for `/data` across every disk
-//! devmgr serves: `MOUNT` at `/data` answers `TABLE_FULL` (the path taken)
-//! while the data disk alone holds the partition, and `NO_MOUNT` (two disks
-//! other than the boot disk carry the named partition) once devmgr serves
-//! the copy, and `/data` still reads.
+//! file back. Before it adds the disk again, the host adds a copy of it,
+//! taken before the boot, behind its second port, at a location the storage
+//! statement does not name, and requires vfsd's line that `/data`'s named
+//! partition is seen there and not taken: meanwhile `MOUNT` answers
+//! `NO_MOUNT`, and a mount before the disk is back fails the case on the
+//! host. Once the disk is back at its location, `MOUNT` takes it beside the
+//! copy, and the file the fixture wrote, which the copy does not hold, reads
+//! back. It logs [`MOUNTED_MARKER`].
 //!
 //! It then stops every thread of the root mount's driver through an attach
 //! with the debug authority it holds: a lookup at `/` that falls through
@@ -55,10 +56,10 @@ const REMOVE_MARKER: &str = "HOLDING a file open on /data; READY for the removal
 /// `xtask/src/commands/test/hotplug.rs`.
 const READD_MARKER: &str = "TORN DOWN /data, its disk removed; READY for the re-added disk";
 
-/// Logged once the fixture mounted `/data` on the re-added disk: the host
-/// adds a copy of the disk on seeing it. Kept in sync with
+/// Logged once the fixture mounted `/data` on the re-added disk, beside
+/// the copy of it the host added before it. Kept in sync with
 /// `xtask/src/commands/test/hotplug.rs`.
-const TIE_MARKER: &str = "MOUNTED /data on the re-added disk; READY for a copy of the disk";
+const MOUNTED_MARKER: &str = "MOUNTED /data on the re-added disk beside the copy of it";
 
 /// The process name vfsd gives the root mount's driver: `fatfs:` and the
 /// mount path.
@@ -80,10 +81,11 @@ const FILE_BYTES: &[u8] = b"hotplug-check: written before the removal\n";
 /// root filesystem's driver.
 const FALLTHROUGH_PATH: &str = "/hotplug-check-absent";
 
-/// How long the fixture waits for vfsd to mount the re-added disk, or to
-/// see its copy: past the host's hot-add, devmgr's poller period, the link
-/// wait, and the driver's settle.
-const DISK_WAIT: Duration = Duration::from_mins(2);
+/// How long the fixture waits for vfsd to mount the re-added disk: past two
+/// hot-adds, the copy's and then the disk's, each with devmgr's poller
+/// period, the link wait, and the driver's settle, and the host's wait for
+/// vfsd's line on the copy between them.
+const DISK_WAIT: Duration = Duration::from_mins(4);
 
 /// How long the fixture waits for vfsd to mark the removed disk removed and
 /// tear its mount down: past the poller's period and the attention button's
@@ -113,7 +115,7 @@ pub fn run(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64)
             std::os::seraph::log!(
                 "{PASS_MARKER}: /data torn down at its disk's removal with its driver idle and \
                  its disk marked removed, its open file stale; mounted again on the re-added \
-                 disk through MOUNT; the data role a tie once a copy of the disk was served; \
+                 disk through MOUNT beside a copy of it at another location; \
                  with the root driver stopped a lookup at / ended in {:?} after {} ms and /data \
                  answered; killing the root driver",
                 stopped.fallthrough,
@@ -176,10 +178,9 @@ fn check(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Result<Stopp
     std::os::seraph::log!("{READD_MARKER}");
 
     mount_when_served(mount, ipc_buf, "the re-added disk")?;
-    read_back("after the re-add")?;
-    std::os::seraph::log!("{TIE_MARKER}");
-    await_tie(mount, ipc_buf)?;
-    read_back("beside the copy of its disk")?;
+    // The copy was taken before the boot: the file is on the data disk alone.
+    read_back("after the re-add beside the copy of its disk")?;
+    std::os::seraph::log!("{MOUNTED_MARKER}");
     let _ = syscall::cap_delete(mount);
 
     let threads = attach(authority, root, ipc_buf)?;
@@ -367,40 +368,6 @@ fn await_removed(mount: u64, ipc_buf: *mut u64) -> Result<(), String>
         {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             _ => in_time().map_err(|e| format!("{e}: /data still resolves"))?,
-        }
-    }
-}
-
-/// Wait for vfsd to resolve the data role across the copy of the data disk
-/// the host adds: `MOUNT` at `/data` answers `TABLE_FULL` while the
-/// mounted data disk alone holds the partition the storage statement names
-/// (the role resolves, the path is taken), and `NO_MOUNT` once devmgr serves
-/// the copy, which carries the named partition too, so two disks other than
-/// the boot disk do, within [`DISK_WAIT`]. A resolution that saw only the
-/// disks it held answers `TABLE_FULL` on.
-fn await_tie(mount: u64, ipc_buf: *mut u64) -> Result<(), String>
-{
-    let start = Instant::now();
-    loop
-    {
-        match mount_data(mount, ipc_buf)?
-        {
-            vfsd_errors::NO_MOUNT => return Ok(()),
-            vfsd_errors::TABLE_FULL if start.elapsed() < DISK_WAIT => std::thread::sleep(POLL),
-            vfsd_errors::TABLE_FULL =>
-            {
-                return Err(format!(
-                    "MOUNT at /data still answers TABLE_FULL {DISK_WAIT:?} after the copy of \
-                     its disk was asked for: the data role did not resolve across it"
-                ));
-            }
-            label =>
-            {
-                return Err(format!(
-                    "MOUNT at /data beside the copy of its disk answered {label:#x}, not \
-                     TABLE_FULL or NO_MOUNT"
-                ));
-            }
         }
     }
 }

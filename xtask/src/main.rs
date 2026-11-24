@@ -44,6 +44,7 @@ extern crate object;
 extern crate rustc_demangle;
 
 mod accel;
+mod affected;
 mod arch;
 mod argparse;
 mod benchmark;

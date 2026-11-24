@@ -283,9 +283,29 @@ pub(crate) fn entry_header_holds(raw: &[u8; ENTRY_HEADER_SIZE])
 /// [`name_str`] of `name` is its bytes before the first NUL, or the whole
 /// name when it holds none ([`crate::bundle::BundleEntryHeader::name`]):
 /// a prefix of the name itself, with no NUL before its end and a NUL, or
-/// the name's end, at it. Each byte is checked at its own index, so the
-/// check makes no search or compare of a length the name decides.
+/// the name's end, at it. Each byte is checked at its own index
+/// ([`name_holds_at`]), so the check makes no search or compare of a length
+/// the name decides.
 pub(crate) fn name_holds(name: &[u8; ENTRY_NAME_LEN])
+{
+    let end = trimmed_end(name);
+    for at in 0..ENTRY_NAME_LEN
+    {
+        byte_holds(name, end, at);
+    }
+}
+
+/// The check of [`name_holds`] at the byte `at` of `name`: the trim is a
+/// prefix of the name itself, and the byte is no NUL when it lies before
+/// the trim's end and a NUL when it lies at it.
+#[cfg(kani)]
+pub(crate) fn name_holds_at(name: &[u8; ENTRY_NAME_LEN], at: usize)
+{
+    byte_holds(name, trimmed_end(name), at);
+}
+
+/// The end of the trim of `name`, which is a prefix of the name itself.
+fn trimmed_end(name: &[u8; ENTRY_NAME_LEN]) -> usize
 {
     let trimmed = name_str(name);
     let end = trimmed.len();
@@ -293,16 +313,25 @@ pub(crate) fn name_holds(name: &[u8; ENTRY_NAME_LEN])
         trimmed.as_ptr() == name.as_ptr() && end <= ENTRY_NAME_LEN,
         "a name was trimmed to other bytes"
     );
-    for (at, &byte) in name.iter().enumerate()
+    end
+}
+
+/// The byte `at` of `name` is no NUL when it lies before `end`, the end of
+/// its trim, and a NUL when it lies at it.
+fn byte_holds(name: &[u8; ENTRY_NAME_LEN], end: usize, at: usize)
+{
+    let Some(&byte) = name.get(at)
+    else
     {
-        if at < end
-        {
-            assert_ne!(byte, 0, "a trimmed name holds a NUL");
-        }
-        else if at == end
-        {
-            assert_eq!(byte, 0, "a name was trimmed short of its first NUL");
-        }
+        return;
+    };
+    if at < end
+    {
+        assert_ne!(byte, 0, "a trimmed name holds a NUL");
+    }
+    else if at == end
+    {
+        assert_eq!(byte, 0, "a name was trimmed short of its first NUL");
     }
 }
 

@@ -7,8 +7,9 @@
 //! deferred list of reclaimed frames not yet pooled, the process index, the
 //! budget nodes processes are charged to, the chunk table of each demand
 //! region, the commitment bounds of a committed region, the memory-pressure
-//! levels, the demand-region interval arithmetic and protection check, and
-//! the chunks a `FILL_REGION` request names.
+//! levels, the demand-region interval arithmetic and protection check, the
+//! chunks a `FILL_REGION` request names, and the leaf-table windows memmgr
+//! makes a map in.
 //!
 //! The crate performs no IPC and issues no syscalls. Storage arrives through
 //! the [`SlotStore`] and [`WordStore`] traits (mapped pool pages in memmgr, a
@@ -210,10 +211,103 @@ pub fn fault_window(span_start: u64, span_end: u64, page_base: u64, pages: u32) 
         .max(span_start)
 }
 
+/// Pages one leaf page table maps: 512 (2 MiB) under every paging mode of both
+/// architectures, the x86-64 page table and the last-level table of RISC-V
+/// Sv39, Sv48 and Sv57. A map that stays inside one leaf table needs at most
+/// one new page table for each level below the root.
+pub const LEAF_TABLE_PAGES: u64 = 512;
+
+/// The windows a map of `pages` pages at the page-aligned address `va` is
+/// made in, so that none crosses a leaf page table ([`LEAF_TABLE_PAGES`]):
+/// `(first, count)`, the window's first page counted from `va` and its page
+/// count, in address order. Each window ends at a leaf-table boundary or at
+/// the span's end, so the first starts wherever `va` lies in its table and
+/// every later one at a boundary, and together they cover the span once. An
+/// empty span has none.
+pub fn leaf_windows(va: u64, pages: u64) -> impl Iterator<Item = (u64, u64)>
+{
+    // Pages of `va`'s leaf table that lie below it.
+    let lead = (va / PAGE_SIZE) % LEAF_TABLE_PAGES;
+    let mut first: u64 = 0;
+    core::iter::from_fn(move || {
+        if first >= pages
+        {
+            return None;
+        }
+        let into_table = lead.wrapping_add(first) % LEAF_TABLE_PAGES;
+        let count = LEAF_TABLE_PAGES
+            .saturating_sub(into_table)
+            .min(pages.saturating_sub(first));
+        let window = (first, count);
+        // `count` is at most `pages - first`.
+        first = first.saturating_add(count);
+        Some(window)
+    })
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn leaf_windows_tile_a_span_without_crossing_a_leaf_table()
+    {
+        let table = LEAF_TABLE_PAGES * PAGE_SIZE;
+        for lead in [0, 1, 3, LEAF_TABLE_PAGES - 1]
+        {
+            let va = 64 * table + lead * PAGE_SIZE;
+            for pages in [1, 2, 511, 512, 513, 1025, 33_054]
+            {
+                let windows: Vec<_> = leaf_windows(va, pages).collect();
+                let mut next = 0;
+                for (i, &(first, count)) in windows.iter().enumerate()
+                {
+                    assert_eq!(
+                        first, next,
+                        "lead {lead}, {pages} pages: a gap or an overlap"
+                    );
+                    assert!(count > 0, "lead {lead}, {pages} pages: an empty window");
+                    let start = va / PAGE_SIZE + first;
+                    let end = start + count;
+                    assert_eq!(
+                        start / LEAF_TABLE_PAGES,
+                        (end - 1) / LEAF_TABLE_PAGES,
+                        "lead {lead}, {pages} pages: window {i} crosses a leaf table"
+                    );
+                    if i + 1 < windows.len()
+                    {
+                        assert_eq!(end % LEAF_TABLE_PAGES, 0, "window {i} stops short");
+                    }
+                    next = first + count;
+                }
+                assert_eq!(
+                    next, pages,
+                    "lead {lead}: the windows do not cover the span"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_windows_start_a_new_window_at_each_leaf_table()
+    {
+        let base = 64 * LEAF_TABLE_PAGES * PAGE_SIZE;
+        let aligned: Vec<_> = leaf_windows(base, 1029).collect();
+        assert_eq!(aligned, [(0, 512), (512, 512), (1024, 5)]);
+        // Three pages before a boundary: the first window ends there.
+        let unaligned: Vec<_> = leaf_windows(base + 509 * PAGE_SIZE, 10).collect();
+        assert_eq!(unaligned, [(0, 3), (3, 7)]);
+        // A span inside one table is one window.
+        let inside: Vec<_> = leaf_windows(base + 100 * PAGE_SIZE, 16).collect();
+        assert_eq!(inside, [(0, 16)]);
+    }
+
+    #[test]
+    fn leaf_windows_of_an_empty_span_are_none()
+    {
+        assert_eq!(leaf_windows(0x4000_0000, 0).count(), 0);
+    }
 
     #[test]
     fn region_grants_refuses_only_an_access_the_protection_lacks()

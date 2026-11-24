@@ -362,7 +362,9 @@ budgets). The pool is shared by every mapping in the address space, the process'
 pager's. A process that funds the pool before it registers a region (ruststd's
 `fund_aspace_pt_budget`) cannot reserve that funding for the region: any later mapping may draw it
 first. So memmgr does not depend on it. When the map of a run fails with `OutOfMemory`, memmgr
-funds the pool itself and maps the run again, at most four times:
+funds the pool itself and maps the run again, at most four times for each leaf-table window of the
+run, as it maps its own pages ([Metadata Arena](#metadata-arena)); a run lies in one window unless
+it crosses a 2 MiB boundary:
 
 1. It admits four pages against the process's budget node, or two when four would take the
    subtree of the node or of an ancestor over its max, or would take the growth floor. The demand
@@ -441,14 +443,23 @@ kernel refuses the map and the arena ends with the low zone, which outlasts any
 RAM such a machine holds. Growth stops when neither zone has a page left or RAM
 is exhausted, surfaced as `QUOTA`.
 
-Each arena or index page memmgr maps can need new page-table pages in its own
-`AddressSpace`, whose page-table pool init seeds at creation. When the kernel
-reports that pool exhausted, memmgr funds it from its own free pool: it donates
-a contiguous run of `ASPACE_TOPUP_PAGES` (4) frames, or two when no such run is
-free, with augment-mode `cap_create_aspace` against its own `AddressSpace`,
-deletes the frame's cap (the donation holds its own reference), and retries the
-map. Like arena pages, donated frames leave the free pool for good and stay in
-`pool_total` as memmgr-owned metadata.
+Each page memmgr maps in its own `AddressSpace` (an arena or index page, a page of a window it
+clears or copies through, its own view of an object's frames) can need new page-table pages there,
+taken from the page-table pool init seeds at creation. When the kernel reports that pool
+exhausted, memmgr funds it from its own free pool: it donates a contiguous run of
+`ASPACE_TOPUP_PAGES` (4) frames, or two when no such run is free, with augment-mode
+`cap_create_aspace` against its own `AddressSpace`, deletes the frame's cap (the donation holds
+its own reference), and retries the map. memmgr makes each map one leaf-table window at a time,
+the 512 pages (2 MiB) one leaf page table maps under every paging mode, and funds each window at
+most `PT_FUND_ROUNDS` (4) times. A window needs at most one new page table for each level below
+the root, four under 5-level paging and Sv57, and a donation adds at least one, so a map of any
+length, the own view of a grant that spans many leaf tables among them, maps while the pool can
+spare its page tables. The bound stays for the map a donation does not cure: the kernel also
+refuses a map with `OutOfMemory` for a frame already named by `u32::MAX` mappings, and without a
+bound memmgr would turn its free pool into page tables no map uses. The window that fails ends its
+map, which then unmaps every page it mapped, so a failed map costs at most four donations and
+leaves none of its span mapped. Like arena pages, donated frames leave the free pool for good and
+stay in `pool_total` as memmgr-owned metadata.
 
 The arena only grows, and a page once carved is permanent memmgr-owned metadata.
 This preserves the all-RAM-accounted identity: the page was counted in

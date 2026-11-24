@@ -6,9 +6,9 @@
 # each named one present, sequentially, killing one still running after
 # TESTER_BOUND_MS; then powers off via the pwrmgr.shutdown seed. A new tester
 # is added to TESTERS. The bound is 2.6 times the slowest tester's worst pass
-# (pipestress, 46 s on riscv64 debug), and below every usertest CI cell's
-# budget less that cell's worst pass, so a hung tester's FAIL line and the
-# testers after it reach the log (services/usertest/README.md § Testers).
+# (pipestress, 46 s on riscv64 debug); with the 5 s drain after a kill it is
+# the added bound the usertest CI cells' budgets are derived with, so a change
+# to it re-derives them (services/usertest/README.md § Testers).
 #
 # The later seeds are authorities testers take: TESTER_SEEDS names, per
 # tester, the seed slots usertest hands it as its bootstrap caps (slot 0,

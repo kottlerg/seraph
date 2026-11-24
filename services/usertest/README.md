@@ -29,12 +29,13 @@ of both its output streams. A tester still running at the bound is killed and re
 `<tester>: FAIL (no exit within <ms> ms)`, and the testers after it run. A tester that exits
 while a process it started holds its output open fails at the bound too, with nothing to kill.
 After a kill, the run waits five seconds more for the tester's end and its streams' close, and
-goes on without them, the reason naming what stayed open. The bound is 120000 ms: 2.6 times the
-slowest tester's worst pass (pipestress, 46 s on riscv64 debug), and below the budget of every
-usertest CI cell less that cell's worst pass (the tightest is x86_64 release, 180 s against a
-worst pass of 48.5 s in burn-in), so a hung tester's FAIL line and the testers after it reach the
-log before the cell's budget ends the boot. A missing, zero or non-numeric bound fails the run
-before any tester starts.
+goes on without them, the reason naming what stayed open. The bound is 120000 ms, 2.6 times the
+slowest tester's worst pass (pipestress, 46 s on riscv64 debug). With the drain it holds a boot
+125 s, the added bound the usertest CI cells' budgets are derived with
+([docs/build-system.md](../../docs/build-system.md) § Continuous Integration), so a hung
+tester's FAIL line and the testers after it reach the log before the cell's budget ends the boot;
+a change to the bound or the drain re-derives those budgets. A missing, zero or non-numeric bound
+fails the run before any tester starts.
 
 ---
 

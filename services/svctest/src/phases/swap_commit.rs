@@ -8,28 +8,33 @@
 //! registered, so memmgr's overcommit allowance (`QUERY_POOL_STATUS`
 //! `data[15]`) is above 0.
 //!
-//! The admission part runs in every boot. A commitment of what the free pool
-//! alone admits (the free pages less `promised` and the growth floor) and
-//! half the allowance more is admitted; one of the free pages and the
-//! allowance less `promised` and the floor, and [`PAST_MARGIN_PAGES`] more,
-//! is refused with `OUT_OF_MEMORY_BEST_EFFORT`.
+//! The admission part runs in every boot. A commitment that takes, with its
+//! page-table reservation and metadata bound ([`commit_fitting`]), what the
+//! free pool alone admits (the free pages less `promised` and the growth
+//! floor) and half the allowance more is admitted; one of the free pages and
+//! the allowance less `promised` and the floor, and [`PAST_MARGIN_PAGES`]
+//! more, is refused with `OUT_OF_MEMORY_BEST_EFFORT`.
 //!
 //! The write part runs when crashd holds faults declined for want of memory
 //! (its recipe staged with a non-zero `CRASHD_OOM_STALL_MS`): without it a
-//! commit overrun kills its process at once. A child ([`WRITER_ROLE`])
-//! commits [`WRITE_PAGES`] pages; svctest then takes the free pool down to the
-//! growth floor with grants ([`super::swap::Hog`]), so the commitment lies
-//! past the free frames, and the child writes every page of it with an
-//! incompressible pattern, [`STEP_PAGES`] at a time. A fault memmgr cannot
-//! back at once is declined as a commit overrun (code 11) and held by crashd,
-//! and resumed once write-out frees frames above the floor. After each step
-//! svctest counts crashd's new lines in logd's history before the child goes
-//! on, so none leaves the history uncounted. svctest then returns its grants,
-//! and the child reads every page back. The phase requires the child's exit 0
-//! (every page read back as written), crashd's lines since the phase began
-//! holding at least one hold for want of commit draw room and one resume on
-//! it, and no hold that timed out, no fault crashd did not hold, and no crash
-//! report: no process was killed.
+//! commit overrun kills its process at once. A child ([`WRITER_ROLE`]) commits
+//! at most [`WRITE_PAGES`] pages, so few that `promised` stays within the
+//! system reserve ([`write_pages`]); svctest then takes the free pool down to
+//! the growth floor with grants ([`super::swap::Hog`]). The free frames then
+//! cover `promised`, but a committed draw keeps off the growth floor while swap
+//! slots are registered, so the reserve stays the reserve nodes' and the
+//! restore headroom the uncommitted restores': the commitment lies past the
+//! draw room, and the child writes every page of it with an incompressible
+//! pattern, [`STEP_PAGES`] at a time. A fault memmgr cannot back at once is
+//! declined as a commit overrun (code 11) and held by crashd, and resumed once
+//! write-out frees frames above the floor. After each step svctest counts
+//! crashd's new lines in logd's history before the child goes on, so none
+//! leaves the history uncounted. svctest then returns its grants, and the child
+//! reads every page back. The phase requires the child's exit 0 (every page
+//! read back as written), crashd's lines since the phase began holding at least
+//! one hold for want of commit draw room and one resume on it, and no hold that
+//! timed out, no fault crashd did not hold, and no crash report: no process was
+//! killed.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::seraph::{reserve_pages, unreserve_pages};
@@ -40,16 +45,20 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::PAGE_SIZE;
 
 use crate::bootstrap::Caps;
+use crate::phases::heap_commit::commit_fitting;
 use crate::runner::Phase;
 
 /// The phase's name, which its failure messages carry.
 const PHASE: &str = "memmgr_swap_commit";
-/// argv[1] of the child that commits and writes past the free frames.
+/// argv[1] of the child that commits and writes past the draw room; argv[2]
+/// is the pages it commits.
 const WRITER_ROLE: &str = "swap-commit-writer";
 
-/// Pages the child commits and writes: 16 MiB past the free frames, which
-/// memmgr backs by writing chunks to the swap slots.
+/// The most pages the child commits and writes: 16 MiB, which memmgr backs by
+/// writing chunks to the swap slots.
 const WRITE_PAGES: u64 = 4096;
+/// The fewest pages the child commits: four steps.
+const MIN_WRITE_PAGES: u64 = 4 * STEP_PAGES;
 /// Pages the child writes between svctest's counts of crashd's lines: four
 /// demand chunks, each at most one commit overrun, a hold and a resume, so a
 /// step's lines stay within the 16 entries logd keeps of one sender
@@ -96,6 +105,8 @@ const WRITER_BAD_LINE: i32 = 3;
 const WRITER_CORRUPT: i32 = 4;
 /// The child's exit code: its range could not be reserved.
 const WRITER_RESERVE_FAILED: i32 = 5;
+/// The child's exit code: its argv named no page count.
+const WRITER_BAD_ARGS: i32 = 6;
 
 pub fn phases() -> &'static [Phase]
 {
@@ -128,11 +139,11 @@ fn swap_commit_phase(caps: &Caps)
         );
         return;
     };
-    let lines = write_past_frames(caps.logd_query);
+    let (pages, lines) = write_past_draw_room(caps.logd_query);
     std::os::seraph::log!(
         "{PHASE} phase passed (a commitment of {within} pages within the allowance admitted, one \
-         of {past} past it refused; {WRITE_PAGES} pages written past the free frames and read \
-         back, crashd holding {} faults and resuming {} within its {stall_ms} ms stall)",
+         of {past} past it refused; {pages} pages written past the draw room and read back, \
+         crashd holding {} faults and resuming {} within its {stall_ms} ms stall)",
         lines.held,
         lines.resumed
     );
@@ -164,16 +175,20 @@ fn admission() -> (u64, u64)
          below {MIN_ALLOWANCE_PAGES}"
     );
     let alone = free.saturating_sub(promised).saturating_sub(floor);
-    let within = alone.saturating_add(allowance / 2);
+    let within = commit_fitting(alone.saturating_add(allowance / 2));
     let got = commit_once(within);
     assert_eq!(
         got,
         memmgr_errors::SUCCESS,
         "{PHASE}: a commitment of {within} pages refused ({got:#x}): {free} free, {promised} \
-         promised, a floor of {floor} and an allowance of {allowance} pages admit up to {}",
-        free.saturating_add(allowance)
-            .saturating_sub(promised)
-            .saturating_sub(floor)
+         promised, a floor of {floor} and an allowance of {allowance} pages admit up to {} with \
+         the page-table reservation and metadata bound ({} on the free pool alone)",
+        commit_fitting(
+            free.saturating_add(allowance)
+                .saturating_sub(promised)
+                .saturating_sub(floor)
+        ),
+        commit_fitting(alone)
     );
     for _ in 0..PAST_ATTEMPTS
     {
@@ -309,12 +324,13 @@ struct Writer
 
 impl Writer
 {
-    /// Spawn the child and wait for its `ready`, which it prints with its
-    /// commitment made.
-    fn start() -> Self
+    /// Spawn the child to commit `pages` pages and wait for its `ready`, which
+    /// it prints with its commitment made.
+    fn start(pages: u64) -> Self
     {
         let mut child = Command::new("/tests/svctest")
             .arg(WRITER_ROLE)
+            .arg(pages.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -372,26 +388,51 @@ impl Writer
             panic!(
                 "{PHASE}: the writer printed {:?} for {want:?} and exited {status:?} \
                  ({WRITER_COMMIT_REFUSED}=its commitment refused, {WRITER_RESERVE_FAILED}=its \
-                 range not reserved, a fault=it was killed)",
+                 range not reserved, {WRITER_BAD_ARGS}=no page count in its argv, a fault=it was \
+                 killed)",
                 self.line
             );
         }
     }
 }
 
-/// The write part: the child writes its commitment past the free frames, held
+/// The pages the child commits: [`WRITE_PAGES`], or fewer, in whole steps, so
+/// that `promised` stays within the system reserve, a step's pages left for
+/// the page-table reservation the commitment promises too. At the growth
+/// floor, which holds the reserve, the free frames then cover `promised`, and
+/// the write shows that a committed draw keeps off the floor all the same
+/// (services/memmgr/docs/memory-pool.md § Commit, Overcommit).
+fn write_pages() -> u64
+{
+    let s = super::swap::pool();
+    let (promised, reserve) = (s.promised / PAGE_SIZE, s.reserve / PAGE_SIZE);
+    let pages = reserve
+        .saturating_sub(promised)
+        .saturating_sub(STEP_PAGES)
+        .min(WRITE_PAGES);
+    let pages = pages.saturating_sub(pages.checked_rem(STEP_PAGES).unwrap_or(0));
+    assert!(
+        pages >= MIN_WRITE_PAGES,
+        "{PHASE}: a reserve of {reserve} pages with {promised} promised leaves room for a \
+         commitment of {pages} pages, below {MIN_WRITE_PAGES}"
+    );
+    pages
+}
+
+/// The write part: the child writes its commitment past the draw room, held
 /// by crashd where memmgr cannot back a page at once, and reads it back once
-/// svctest's grants are returned. Returns crashd's lines.
-fn write_past_frames(query: u64) -> Lines
+/// svctest's grants are returned. Returns the pages written and crashd's
+/// lines.
+fn write_past_draw_room(query: u64) -> (u64, Lines)
 {
     let mut lines = Lines::after(newest_seq(query));
-    let mut writer = Writer::start();
+    let pages = write_pages();
+    let mut writer = Writer::start(pages);
     let (_, promised, _, allowance) = status_pages();
     assert!(
         allowance >= promised,
         "{PHASE}: an allowance of {allowance} pages below the {promised} pages promised with the \
-         writer's {WRITE_PAGES} committed: the grants would leave the free frames above the \
-         commitment"
+         writer's {pages} committed: the grants would leave free frames above the growth floor"
     );
     let mut hog = super::swap::Hog::new();
     touch_stack();
@@ -429,8 +470,8 @@ fn write_past_frames(query: u64) -> Lines
     assert!(
         lines.held > 0 && lines.resumed > 0,
         "{PHASE}: crashd logged {} holds and {} resumes for want of commit draw room: no write \
-         past the free frames was declined and held (the fill left {} pages free against a \
-         floor of {})",
+         past the draw room was declined and held (the fill left {} pages free against a floor \
+         of {})",
         lines.held,
         lines.resumed,
         filled.free / PAGE_SIZE,
@@ -442,7 +483,7 @@ fn write_past_frames(query: u64) -> Lines
         "{PHASE}: crashd logged holds that timed out, faults it did not hold, and crash reports \
          while the writer ran"
     );
-    lines
+    (pages, lines)
 }
 
 /// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame, so the phase
@@ -473,7 +514,8 @@ const fn pattern(index: u64) -> u64
 /// Words of a page.
 const PAGE_WORDS: u64 = PAGE_SIZE / 8;
 
-/// Child role: commit [`WRITE_PAGES`] pages and print `ready`; on `go`, write
+/// Child role: commit the pages its argv's next word names and print `ready`, or
+/// exit [`WRITER_BAD_ARGS`] when it names none; on `go`, write
 /// every word of them with [`pattern`], [`STEP_PAGES`] at a time, printing
 /// `step` after each step but the last and waiting for `next`, and print
 /// `written`; on `check`, read
@@ -481,17 +523,22 @@ const PAGE_WORDS: u64 = PAGE_SIZE / 8;
 /// differs.
 fn writer_main() -> !
 {
-    let Ok(range) = reserve_pages(WRITE_PAGES)
+    let Some(pages) = std::env::args().nth(2).and_then(|a| a.parse::<u64>().ok())
+    else
+    {
+        exit(WRITER_BAD_ARGS)
+    };
+    let Ok(range) = reserve_pages(pages)
     else
     {
         exit(WRITER_RESERVE_FAILED)
     };
     let base = range.va_start();
-    if register(base, WRITE_PAGES * PAGE_SIZE) != memmgr_errors::SUCCESS
+    if register(base, pages.saturating_mul(PAGE_SIZE)) != memmgr_errors::SUCCESS
     {
         exit(WRITER_COMMIT_REFUSED);
     }
-    let words = WRITE_PAGES * PAGE_WORDS;
+    let words = pages.saturating_mul(PAGE_WORDS);
     let mut line = String::with_capacity(64);
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();

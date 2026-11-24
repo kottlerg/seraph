@@ -1023,15 +1023,28 @@ freeing it. If any bitmap changed, `gdt::invalidate_all_iopbs` stores an out-of-
 the revoke raises `#GP`. The `#GP` handler (`gdt::reload_invalidated_iopb`) sees the invalid
 offset, reloads the running thread's current bitmap under its `sched_lock`, restores the
 offset, and retries the instruction: a port the thread still holds succeeds, one it lost
-faults again and is handled as a genuine `#GP`. A context switch loads its incoming
-thread's bitmap (the all-denied one for a thread with no bindings) and restores the offset
-itself, under that thread's `sched_lock` in the hold that marks it running, so a remote
-bind's or withdrawal's invalidation is never overwritten by a stale load; only a switch to the
-idle thread, which runs no ring-3 code, loads the all-denied bitmap outside a thread lock. A
-CPU's TSS is written only by that CPU, except for the offset, which `TssWithIopb`'s 2-byte
-alignment lets another CPU store atomically; any interleaving of a remote invalidation with a
-local reload leaves the CPU either invalidated or running a bitmap loaded under its thread's lock
-after the rebuild.
+faults again and is handled as a genuine `#GP`. A thread with no bindings runs with the
+out-of-limit offset itself: a context switch to it stores that offset and writes no byte of
+the bitmap, and its `#GP` is genuine at once, with nothing reloaded. A context switch to a
+bound thread makes the TSS hold its bitmap and restores the offset, under that thread's
+`sched_lock` in the hold that marks it running, so a remote bind's or withdrawal's
+invalidation is never overwritten by a stale load. A switch to the idle thread, which runs no
+ring-3 code, touches neither; the next thread's switch sets the offset for itself.
+
+Each bitmap carries a generation (`ThreadIopb::generation`), drawn from one kernel-wide
+64-bit counter by the table's initialisation, by every bind that records a binding, and by
+every withdrawal that drops one, so it changes with the bitmap's bytes, under the same
+`sched_lock`, and never repeats: no two states of any bitmap, a table freed and reallocated
+at the same address or a TCB reused included, share one, and none is 0. Each CPU's TSS records
+the generation of the bitmap it last copied (`TssWithIopb::held_generation`, 0 before any).
+The context switch and the `#GP` reload copy a bound thread's parts only when that record
+differs from the thread's generation, which they read under the thread's `sched_lock`; an
+equal record means the TSS already holds exactly the bitmap's current bytes, so a thread
+switched away from and back to on one CPU, with only unbound or idle threads between, costs
+one offset store. A CPU's TSS is written only by that CPU, except for the offset, which
+`TssWithIopb`'s alignment lets another CPU store atomically; any interleaving of a remote
+invalidation with a local reload leaves the CPU either invalidated or running a bitmap loaded
+under its thread's lock after the rebuild.
 
 ### Interrupt Bindings
 

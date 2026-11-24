@@ -33,7 +33,11 @@ Label `12` on the service endpoint is reserved and MUST NOT be reused for an unr
 ## Endpoint
 
 vfsd holds the receive side of one un-badged service endpoint,
-created and delivered by init at vfsd's bootstrap (round 1, `caps[0]`).
+created and delivered by init at vfsd's bootstrap (round 1, `caps[0]`). Round 1 also
+carries the boot device record, six data words laid out by
+[`shared/ipc/src/vfsd_bootstrap.rs`](../../../shared/ipc/src/vfsd_bootstrap.rs). vfsd exits at
+bootstrap on a round 1 without a well-formed record, stores the record with its capabilities, and
+logs it at startup (`boot ESP` and `boot controller`); it uses it for nothing else.
 Init holds a badged `SEED_AUTHORITY` SEND for `GET_SYSTEM_ROOT_CAP`
 during boot; it issues no `MOUNT`, since vfsd self-mounts root (see
 [services/init/docs/bootstrap.md](../../init/docs/bootstrap.md#per-stage-authority-transfers)).

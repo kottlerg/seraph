@@ -28,8 +28,8 @@ Three harnesses exercise three surfaces:
 | `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (the `terminal` case, `cargo xtask test terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
-itself owns its phases. `usertest` is an orchestrator that runs per-program
-tester binaries discovered under `/tests/programs/`.
+itself owns its phases. `usertest` is an orchestrator that runs the per-program
+tester binaries under `/tests/programs/` that its recipe names.
 
 [`ubench`](../programs/ubench/README.md), the userspace benchmark suite, is launched as
 `svctest` is, from a recipe staged into `/config/svcmgr/services/`, and measures rather than
@@ -83,10 +83,21 @@ program opt in or skip; absence is the default.
 - The install path is controlled by `xtask`'s `SPECS` entry for the tester
   crate; the tester crate MUST NOT rely on its own binary name to land at
   the correct sysroot path.
+- The tester MUST be named in the `TESTERS` env entry of usertest's recipe
+  (`rootfs/config/svcmgr/tests/usertest.svc`), the testers the image holds.
+  usertest fails the run for each tester named and absent from
+  `/tests/programs/`, for each one there that the list does not name, and
+  for an empty list
+  ([services/usertest/README.md](../services/usertest/README.md) § Testers).
 
 ### Contract
 
 - The tester binary MUST exit `0` on pass and non-zero on fail.
+- The tester MUST exit, and its stdout and stderr MUST close, within the
+  bound usertest's recipe sets in `TESTER_BOUND_MS`. usertest kills a tester
+  still running at the bound, reports it as FAIL, and runs the testers after
+  it ([services/usertest/README.md](../services/usertest/README.md)
+  § Testers).
 - The tester binary's exit code is the authoritative verdict. Seraph propagates
   it natively, without POSIX 8-bit truncation (see
   [syscalls.md § `SYS_ASPACE_EXIT`](../core/kernel/docs/syscalls.md#sys_aspace_exit-54));
@@ -1096,7 +1107,7 @@ burn-in svctest cell: svctest's `oom_policy` phase runs when it is staged, has i
 oomd stops it, and passes otherwise, and its `logd_reserve` phase has it fill memory while logd is
 killed and restarted. The CI svctest cell drops crashd, so the held-write path of
 that phase (a child's page fault crashd holds until oomd's stop frees memory), and the write part of
-the `memmgr_swap_commit` phase (a child's commitment past the free frames, its commit overruns
+the `memmgr_swap_commit` phase (a child's commitment past the draw room, its commit overruns
 held by crashd until write-out to swap opens memmgr's draw room), run in the burn-in svctest cell,
 which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart = always`,
 `stop_source = program`) is co-staged beside `memhog` in both cells: svctest's
@@ -2084,7 +2095,8 @@ per edge and compare tracing) and, where the host target supports it, AddressSan
   fixes it. A `#[cfg(test)]` test of the crate runs the property on every one, so
   `cargo xtask test` replays them on each change, on the host and under riscv64 emulation.
 - Its target: `xtask/fuzz/targets/src/bin/<target>.rs`, which names the property, the inputs'
-  directory, and the longest input the engine makes.
+  directory, and the longest input the engine makes, and one line for it in each of the two
+  name-ordered lists of `xtask/fuzz/targets/Cargo.toml`, the binaries and the parser crates.
 
 **The engine.** Each run is AFL-style: a queue of the inputs that reached a new edge or a new
 hit-count bucket of one; havoc mutations and splices of the queued inputs; a dictionary of the
@@ -2144,18 +2156,21 @@ to the rules of [coding-standards.md](coding-standards.md#proof-harnesses) § Pr
 every crate that holds one, each crate built in its host test configuration, with the pinned Kani
 release ([build-system.md](build-system.md#toolchain) § Toolchain). It fails on any failed,
 undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a
-harness in a crate it does not register. CI's `kani` job runs it on every push and pull request,
-and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
+harness that lies in no package. It finds the crates from their harnesses, so a crate's first
+harness adds it to the run. It holds each process of the run to the address space CI's runner can
+give a harness, so a harness that needs more fails, named as out of memory, and it closes with
+every harness's verdict and verification time. CI's `kani` job runs it on every push and pull
+request, and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
 
 **Local sizing.** A harness is sized on the development host before CI runs it. The author of a
 change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
 with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries
-it, every process of the run limited to an address space of 16 GB, the memory of CI's `kani`
-runner ([GitHub's standard Linux runner for a public
-repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)). On a
-Linux host, `prlimit --as=16000000000 cargo xtask kani ...` sets that limit where the command
-does not set it itself. A run that the limit ends (an allocation failure, or a process killed)
+it, under the limit the command sets on every process of the run: 12 GiB of address space, the share
+of the 16 GB of CI's `kani` runner ([GitHub's standard Linux runner for a public
+repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)) that
+leaves 4 GB to the runner's own processes, so a harness that fits under it locally fits on the
+runner. A run that the limit ends (an allocation failure, or a process killed)
 or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
 still cover the property or by the induction form of the parser proofs below. A failed,
 undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
@@ -2185,10 +2200,9 @@ the harness states, and a step harness, that one step from any state in the inva
 under `kani::assume`) keeps it and does what the property asks of that step, with no loop to
 unwind. Code other than the loops that drive the steps and the reads that feed them MUST NOT lie
 outside the harnesses; the module's comment states how its harnesses compose into the property and
-names those loops and reads, with the drivers that check them. The crate's first harness registers
-it with `cargo xtask kani`. Implemented for the GPT parser
-(`services/vfsd/gpt`); design intent, not yet implemented, for every other parser of hostile input,
-none of which holds a property function yet.
+names those loops and reads, with the drivers that check them. Implemented for the parsers whose
+crates hold a `property` module, each with its fuzz target in `xtask/fuzz/targets`; design
+intent, not yet implemented, for every other parser of hostile input.
 
 ---
 

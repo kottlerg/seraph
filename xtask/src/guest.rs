@@ -298,6 +298,26 @@ impl Guest
         }
     }
 
+    /// The next serial line, waiting at most `timeout`; `None` when none
+    /// arrived in time.
+    ///
+    /// # Errors
+    ///
+    /// The serial stream ended; the error gives QEMU's exit ([`explain_exit`]).
+    pub fn line_within(&mut self, timeout: Duration) -> Result<Option<String>>
+    {
+        match self.lines.recv_timeout(timeout)
+        {
+            Ok(line) => Ok(Some(line)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) =>
+            {
+                let err = crate::error::err!("the serial stream ended");
+                Err(explain_exit(err, &mut self.child, self.stderr.as_mut()))
+            }
+        }
+    }
+
     /// The next serial line, waiting at most `remaining`; the error names the
     /// `markers` still awaited, and, when the stream ended, QEMU's exit
     /// ([`explain_exit`]).
@@ -317,13 +337,6 @@ impl Guest
                 Err(explain_exit(err, &mut self.child, self.stderr.as_mut()))
             }
         }
-    }
-
-    /// Every serial line that has arrived and no wait has taken, without
-    /// waiting.
-    pub fn take_lines(&mut self) -> Vec<String>
-    {
-        self.lines.try_iter().collect()
     }
 
     /// Wait until the serial stream ends, as QEMU's exit ends it, or

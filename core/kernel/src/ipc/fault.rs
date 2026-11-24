@@ -91,6 +91,8 @@ const DELIVERY_UNBOUND: u8 = u8::MAX;
 // A forward's reason and a redirect's word share data word 4, the word after
 // the four every fault message carries, so a delivery carries at most one.
 const _: () = assert!(syscall::FAULT_FORWARD_REASON_WORD == syscall::FAULT_REDIRECT_WORD);
+// `deliver_once` sends the fifth word as the one after the four fault words.
+const _: () = assert!(syscall::FAULT_REDIRECT_WORD == 4);
 
 /// Number of fault classes a thread binds separately
 /// (docs/fault-handling.md § Fault-Handler Binding), and the length of the
@@ -786,8 +788,7 @@ unsafe fn take_redirect(tcb: *mut ThreadControlBlock) -> Option<Route>
 unsafe fn reply_reason(tcb: *mut ThreadControlBlock) -> Option<u64>
 {
     // SAFETY: the contract above.
-    let reply = unsafe { &(*tcb).ipc_msg };
-    (reply.data_count > 0).then(|| reply.data[0])
+    unsafe { &(*tcb).ipc_msg }.data().first().copied()
 }
 
 /// Make one delivery of `info` by `route`, through `tcb`'s binding for
@@ -869,18 +870,22 @@ unsafe fn deliver_once(
         (*tcb).park_episode.fetch_add(1, Ordering::Relaxed);
     }
 
-    let mut msg = crate::ipc::message::Message::new(syscall::FAULT_LABEL);
-    msg.badge = badge;
-    msg.data[0] = info.kind;
-    msg.data[1] = info.d1;
-    msg.data[2] = info.d2;
-    msg.data[3] = info.ip;
-    msg.data_count = 4;
-    if let Some(word) = fifth
+    // Build the fault message in place, in the thread's own ipc_msg, which
+    // endpoint_call sends: words 0..=3 are the fault, and word 4
+    // (FAULT_REDIRECT_WORD, FAULT_FORWARD_REASON_WORD) the redirect word or
+    // forward reason, read into `fifth` above before this overwrites the
+    // reply that carried it.
+    let words = [info.kind, info.d1, info.d2, info.ip, fifth.unwrap_or(0)];
+    let sent = match fifth
     {
-        msg.data[syscall::FAULT_REDIRECT_WORD] = word;
-        msg.data_count = syscall::FAULT_REDIRECT_WORD + 1;
-    }
+        Some(_) => words.as_slice(),
+        None => words.get(..syscall::FAULT_REDIRECT_WORD).unwrap_or(&words),
+    };
+    // SAFETY: tcb is the current CPU's running thread outside any park, so it
+    // owns its ipc_msg until endpoint_call publishes the delivery.
+    let msg = unsafe { &mut (*tcb).ipc_msg };
+    msg.begin(syscall::FAULT_LABEL, badge);
+    msg.set_data(sent);
 
     // SAFETY: ep_state is a valid EndpointState (this delivery's pin keeps it
     // live); tcb is the current CPU's running thread (this fn's contract); no
@@ -889,7 +894,7 @@ unsafe fn deliver_once(
     // IpcThreadState; the reply linkage is identical. A fault delivery is
     // never timed (deadline 0).
     let result = unsafe {
-        crate::ipc::endpoint::endpoint_call(ep_state, tcb, &msg, IpcThreadState::BlockedOnFault, 0)
+        crate::ipc::endpoint::endpoint_call(ep_state, tcb, IpcThreadState::BlockedOnFault, 0)
     };
 
     if let crate::ipc::endpoint::CallRendezvous::NoReceiver = result

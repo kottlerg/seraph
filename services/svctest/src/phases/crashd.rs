@@ -416,13 +416,8 @@ const RESUME_FILL_MS: u64 = 1000;
 /// [`RESUME_FILL_MS`], the rest being the filler's tick and the phase's
 /// write after `full`.
 const RESUME_HELD_MIN_MS: u128 = 500;
-/// How long the filler keeps the pool full after `full` for the fault that
-/// times out, past the stall by [`TIMEOUT_FILL_MARGIN_MS`]: enough for the crash service to see
-/// the deadline pass first.
-const TIMEOUT_FILL_MARGIN_MS: u64 = 1500;
-/// How long a fault that times out was held at least, from the write.
-const TIMEOUT_HELD_MIN_MS: u128 = 1000;
-/// How long the phase waits for either fixture to exit.
+/// How long the phase waits for either fixture to exit, past the stall for
+/// the fixture whose hold times out.
 const OOM_WAIT: Duration = Duration::from_secs(30);
 /// Bytes of stack the phase touches before a window, below its frame.
 const STACK_TOUCH_BYTES: usize = 16 * 1024;
@@ -508,6 +503,12 @@ fn start_filler(hold_ms: u64) -> Child
 /// Wait for `child` up to [`OOM_WAIT`], killing it and failing past that.
 fn wait_bounded(child: &mut Child, what: &str) -> ExitStatus
 {
+    wait_within(child, what, OOM_WAIT)
+}
+
+/// Wait for `child` up to `bound`, killing it and failing past that.
+fn wait_within(child: &mut Child, what: &str, bound: Duration) -> ExitStatus
+{
     let start = Instant::now();
     loop
     {
@@ -515,10 +516,10 @@ fn wait_bounded(child: &mut Child, what: &str) -> ExitStatus
         {
             return status;
         }
-        if start.elapsed() > OOM_WAIT
+        if start.elapsed() > bound
         {
             let _ = child.kill();
-            panic!("crashd_oom_hold: {what}: still running after {OOM_WAIT:?}");
+            panic!("crashd_oom_hold: {what}: still running after {bound:?}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -542,9 +543,16 @@ fn touch_stack()
 /// (services/crashd/docs/operation.md § Hold). A fixture writes the pages of a
 /// demand region while a filler keeps the pool full down to the growth floor:
 /// when the filler gives it back within the stall, the writes complete and the
-/// fixture prints how long the held one took; when it holds the pool past the stall, the hold times
-/// out and the fixture dies of the fault, with no core written, since memory
-/// was still critical.
+/// fixture prints how long the held one took; when it holds the pool until the
+/// fixture has died, the hold times out and the fixture dies of the fault, at
+/// least the stall after its write, with no core written, since memory was
+/// still critical.
+///
+/// oomd stops its candidates while the level reads `CRITICAL`, a grace and
+/// then a cooldown apart, and a stop that frees memory ends the hold it finds;
+/// the fixture's next write is then held anew. The timeout case's filler
+/// therefore keeps the pool full until the fixture has died, and the phase
+/// then kills it: only the last hold has to outlast the stall.
 ///
 /// Between the filler's `full` and its exit the phase allocates nothing and
 /// touches no new stack page, since a fault of its own would be held too.
@@ -557,7 +565,12 @@ fn check_oom_hold()
 {
     let stall_ms = super::oom::crashd_stall("crashd_oom_hold")
         .expect("crashd_oom_hold: crashd's recipe is not staged or holds no fault");
-    let timeout_fill_ms = stall_ms.saturating_add(TIMEOUT_FILL_MARGIN_MS);
+    let stall = Duration::from_millis(stall_ms);
+    let toucher_bound = OOM_WAIT.saturating_add(stall);
+    // Longer than the phase waits for the fixture, so only the phase's kill
+    // ends it.
+    let timeout_fill_ms =
+        u64::try_from(toucher_bound.saturating_add(OOM_WAIT).as_millis()).unwrap_or(u64::MAX);
     // A fault the hold resumes.
     let mut toucher = start_toucher();
     touch_stack();
@@ -601,17 +614,19 @@ fn check_oom_hold()
         .write_all(b"go\n")
         .expect("write to oom-touch");
     let start = Instant::now();
-    let status = wait_bounded(&mut toucher.child, "oom-touch (timeout)");
+    let status = wait_within(&mut toucher.child, "oom-touch (timeout)", toucher_bound);
     let died_after = start.elapsed().as_millis();
-    let fill = wait_bounded(&mut filler, "oom-fill (timeout)");
+    let filling = filler.try_wait().expect("try_wait").is_none();
+    let _ = filler.kill();
+    let _ = wait_bounded(&mut filler, "oom-fill (timeout)");
     assert!(
-        fill.success(),
-        "crashd_oom_hold: oom-fill (timeout): {fill}"
+        filling,
+        "crashd_oom_hold: oom-fill (timeout): exited before oom-touch died"
     );
     let reason = status.code().map(|code| code as u64);
     if status.success()
         || !reason.is_some_and(|r| (EXIT_FAULT_BASE..EXIT_KILLED).contains(&r))
-        || died_after < TIMEOUT_HELD_MIN_MS
+        || died_after < stall.as_millis()
     {
         panic!(
             "crashd_oom_hold: oom-touch (timeout): {status} after {died_after} ms: the fault was \

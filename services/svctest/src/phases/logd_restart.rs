@@ -67,12 +67,18 @@
 //! stamps is the order of the restart and the destroy, however long the
 //! restart takes and whether oomd or svctest asks for the stop.
 //!
-//! In the same window, before the kill, the phase makes the creates of
-//! `super::critical_creates` (svctest's own, refused `OUT_OF_MEMORY`, and a
-//! reserve creator's, which succeeds), and after it faults the `crasher-worker`
-//! fixture's worker, whose restart must be held until the level falls and then
-//! made; the window is shared because svcmgr restarts memhog at most three
-//! times a window and the boot's other memhog windows spend them.
+//! The kill comes first in the window: oomd stops the fixture its grace after
+//! the level reads `CRITICAL`, and the restart has to come before that stop,
+//! though logd's death reaches svcmgr only once the crash service, when the
+//! boot stages it, has reported the fault. After the kill, in the same window,
+//! the phase makes the creates of `super::critical_creates` (svctest's own,
+//! refused `OUT_OF_MEMORY`, and a reserve creator's, which succeeds), and
+//! faults the `crasher-worker` fixture's worker, whose restart must be held
+//! until the level falls and then made; the window is shared because svcmgr
+//! restarts memhog at most three times a window and the boot's other memhog
+//! windows spend them. A create of svctest's own that the old instance's freed
+//! frames serve before the fixture's next tick takes them back is destroyed and
+//! made again (`super::critical_creates`).
 
 use std::time::{Duration, Instant};
 
@@ -147,9 +153,9 @@ pub fn logd_reserve_phase(caps: &Caps)
     let mut creates = super::critical_creates::Checks::prepare(phase);
     let mut killed_us = 0;
     super::oom::critical_window(caps, phase, RESERVE_HOLD, || {
-        creates.creates();
         killed_us = super::oom::elapsed_us();
         fault_main(&threads, phase);
+        creates.creates();
         creates.fault_worker();
     });
     for cap in threads

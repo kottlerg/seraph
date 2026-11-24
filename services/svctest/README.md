@@ -443,26 +443,30 @@ instance to run and serve before the level falls. Outside the reserve the create
 instance and every first touch of its heap and stacks are refused while memhog holds the pool,
 except from the frames the kill frees until memhog's next tick takes them back, so the attach flags,
 not the timing, are what fail for a logd outside the reserve. It attaches to logd before the fill,
-has memhog fill the pool, faults logd's main thread once the level reads `CRITICAL`, and waits for
-the level to fall: oomd's stop of memhog ends the window when oomd is staged in its stop mode, and
-svctest's own stop through `caps[23]`, 5 s after the fill, otherwise. It then requires, through
+has memhog fill the pool, faults logd's main thread as soon as the level reads `CRITICAL`, and waits
+for the level to fall: oomd's stop of memhog ends the window when oomd is staged in its stop mode,
+and svctest's own stop through `caps[23]`, 5 s after the fill, otherwise. It then requires, through
 `caps[6]`, svcmgr's `service restarted: logd` line in the new instance's history stamped before
 svcmgr's `stop memhog` line, the first of each after the kill, and memhog's next instance to answer
 `PROBE` with a new nonce and no pages. svcmgr writes the stop line once procmgr has destroyed
 memhog, which frees the memory, and serves a stop and a restart on one event loop ([Restart
 Protocol](../svcmgr/docs/restart-protocol.md) § Death detection), so a stop asked for while it
 restarts logd waits for the restart, and the order of the two lines is the order of the restart and
-the stop, however long the restart takes.
+the stop, however long the restart takes. The kill comes first in the window because logd's death
+reaches svcmgr only once crashd, which every svctest set but `crash-endpoint` stages, has reported
+the fault, and the restart has to come before oomd's stop, its grace after the level reads
+`CRITICAL`.
 
 In the same window the `logd_reserve` phase makes three more checks (`critical_creates.rs`), the
 second and third skipped, each logging the skip line, when the staged set does not declare their
 fixture; they share its window because svcmgr restarts memhog at most three times a window and the
-boot's other memhog windows spend them. Before the kill, check 1: svctest's own raw
+boot's other memhog windows spend them. After the kill, check 1: svctest's own raw
 `CREATE_FROM_FILE` of `/tests/fixtures/programs/spawn-target`, outside the reserve, must be refused
 with `OUT_OF_MEMORY` and no other label, the one label svcmgr's memory wait for a restart holds; the
 phase destroys each child it creates, waits for memhog's next tick to take back what the destroy
-freed, and tries up to four times. Check 2 runs when the set declares `reserve-creator`: the
-fixture, a service in the system reserve, makes a `CREATE_FROM_FILE | CREATE_RESERVE` of
+freed, and tries up to four times, so a create the killed logd's freed frames serve before that tick
+is made again. Check 2 runs when the set declares `reserve-creator`: the fixture, a service in the
+system reserve, makes a `CREATE_FROM_FILE | CREATE_RESERVE` of
 `/tests/fixtures/programs/spawn-target` inside the window, which must succeed. After the kill, check
 3 runs when the set declares `crasher-worker`: the phase has the fixture's worker fault inside the
 window and requires the fixture's next instance to answer, after the window, with a new nonce. Check

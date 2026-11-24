@@ -294,8 +294,8 @@ set does not declare skips, or skips the part the fixture drives, and logs
 
 The `ci`, `burn-in` and `none` sets stage crashd's test recipe, `tests/crashd.svc`, over the default
 one: the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death, and
-the default's `CRASHD_OOM_STALL_MS=10000`, which svctest's `crashd_oom_hold` phase reads to size
-the fill that outlasts crashd's hold of a fault memmgr declined for want of memory; svctest's
+the default's `CRASHD_OOM_STALL_MS=10000`, which svctest's `crashd_oom_hold` phase reads as the
+least time a fault memmgr declined for want of memory is held before the hold times out; svctest's
 `crashd_*` phases check them ([Crash reports](#crash-reports)), and its `crashd.core` seed is the
 authority for the live cores. The `crash-endpoint` set stages no crashd, so procmgr's crash endpoint
 is free for svctest's `crash_endpoint` phase; the set records `SVCTEST_PHASES=crash_endpoint` in
@@ -571,8 +571,8 @@ The svctest boot's crashd also holds a page fault memmgr declined for want of me
 `crashd_oom_hold` phase, which runs after `swap_commit`, fills memory down to memmgr's growth floor
 and has the fixture write a page it has not touched, reading the stall from the staged crashd
 recipe: once the filler gives the memory back within the stall, and the write completes after the
-hold; once the filler keeps it past the stall, and the fixture dies of the fault with no core
-written.
+hold; once the filler keeps it until the fixture has died, and the fixture dies of the fault at
+least the stall after its write, with no core written.
 
 In CI the svctest cell's `ci` boot passes `--crash-reports reports` to `cargo xtask run --runs 1`,
 its `crash-endpoint` boot and the usertest cell's boot pass `--crash-reports none`. Each makes the

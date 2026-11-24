@@ -108,15 +108,17 @@ memory ([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § H
 uses is the one the staged crash service's recipe sets, read from the recipe. In each of two cases
 it starts `oom-touch 1024`, waits for its `ready`, touches 16 KiB of its own stack so its window
 faults no new stack page, starts `oom-fill <ms>` and waits for `full`, and tells the fixture to
-write. Either fixture still running 30 s after it was waited on is killed and the phase panics.
+write. Either fixture still running 30 s after it was waited on (30 s and the stall for the timeout
+case's `oom-touch`) is killed and the phase panics.
 
 - Resume: the filler keeps memory critical for 1000 ms after `full`. It asserts that the filler
   exits with a success, that the fixture exits with a success, and that its line is `touched
   held_ms=<ms>` with at least 500 ms.
-- Timeout: the filler keeps memory critical for the stall and 1500 ms more. It asserts that the
-  filler exits with a success; that the fixture does not exit with a success, its exit reason is in
-  the fault range, and it died at least 1000 ms after it was told to write; and that no core is
-  new in `/crash`, since memory was still critical.
+- Timeout: the filler keeps memory critical until the fixture has died, and the phase then kills it,
+  since an oomd stop that frees memory ends the hold it finds and the fixture's next write is held
+  anew. It asserts that the filler was still running when the fixture died; that the fixture does
+  not exit with a success, its exit reason is in the fault range, and it died at least the stall
+  after it was told to write; and that no core is new in `/crash`, since memory was still critical.
 
 ---
 

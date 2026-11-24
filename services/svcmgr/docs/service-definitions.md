@@ -115,7 +115,7 @@ devmgr, vfsd; § Reconciliation), so an `env` key in their recipes reaches nothi
 
 | Value | Semantics |
 |---|---|
-| `never` | Service is one-shot; never restarted, even on fault. Used for integration-test fixtures (e.g. `svctest`) whose clean exit is the success notification. |
+| `never` | Never restarted, even on fault. Its death, a clean exit included, is still observed and logged (`service died: <name>`), and its entry then stays inactive. Used for integration-test harnesses and fixtures (e.g. `svctest`) whose run ends with their exit. |
 | `on_failure` | Restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`). Clean exits are treated as intentional. |
 | `always` | Restart on every exit, clean or faulty. Default for daemons that should never terminate during normal operation. |
 
@@ -385,7 +385,7 @@ name's first publisher: the registry's entry for `<name>` may be another service
 when the recipe also lists `<name>:deny` first, the no-authority SEND. svcmgr knows the actuator
 only by this key; its code names no service.
 
-The actuator is supervised: the parser rejects the key on a `restart = never` recipe, a name that
+The actuator is restarted: the parser rejects the key on a `restart = never` recipe, a name that
 is not one of the recipe's `provides` entries, an entry without `:auth` (a `:grant` entry among
 them), a value of more than one name, and a repeated key. Only the first recipe that declares the
 key, in reconciliation's launch order, is the actuator; svcmgr logs each later one (`<service> also
@@ -465,8 +465,8 @@ a kill authority, and stops only what the [`oom_stop`](#oom_stop) rule allows. T
 path that mints the cap.
 
 `stop_authority = yes` alongside `log_sink = yes` is a parser error, as for `debug_authority`. A
-holder has a core role, so no holder stops another or itself. A one-shot holder
-(`restart = never`) is allowed: svctest's recipe sets the key.
+holder has a core role, so no holder stops another or itself. A holder with
+`restart = never` is allowed: svctest's recipe sets the key.
 
 ## `entropy_authority`
 
@@ -517,8 +517,8 @@ The key is a core role, so the [`oom_stop`](#oom_stop) rule never stops a source
 `LIST_CANDIDATES` never lists one. The parser rejects it on a recipe without `provides`, since a
 source is reached on its service endpoint; on one with a bare `provides` entry, since a bare entry
 publishes an unbadged SEND, from which any holder could derive a SEND badged with the stop bit, so
-every entry carries `:auth`, `:grant` or `:deny`; and with `restart = never`, since svcmgr lists
-only a source it supervises.
+every entry carries `:auth`, `:grant` or `:deny`; and with `restart = never`, since a source
+that ends is then gone for the rest of the boot, and svcmgr lists only a running source.
 
 svcmgr creates each instance of a source contained, on its launch and on every restart
 (`procmgr_labels::CREATE_CONTAIN`,
@@ -547,7 +547,7 @@ refusing for the first row that applies:
 | Row | The service | Refused because |
 |---|---|---|
 | 1 | was started by init (memmgr, procmgr, devmgr, vfsd), so svcmgr only binds it | not launched by svcmgr |
-| 2 | has `restart = never`, so svcmgr does not supervise it | one-shot |
+| 2 | has `restart = never`, so a stop would end it for good | never restarted |
 | 3 | has `critical = yes` | the system is not viable without it |
 | 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `entropy_authority`, `reserve`, `shutdown_actuator` or `stop_source` | the system's log, crash reporting, stopping, shutdown and entropy contribution rest on it |
 | 5 | does not set `oom_stop = yes` | not opted in |
@@ -667,7 +667,7 @@ At `HANDOVER_COMPLETE` svcmgr reads the recipes of `/config/svcmgr/services/`, p
 | Definition | Pending registration | Outcome |
 |---|---|---|
 | present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`, `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
-| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop`, `stop_source` and `private_image` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`, `CREATE_PRIVATE_IMAGE`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
+| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop`, `stop_source` and `private_image` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`, `CREATE_PRIVATE_IMAGE`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (whatever the `restart` policy, so they are in place before the thread runs; a bind that fails destroys the child and the launch fails), `START_PROCESS`, serve the seed bootstrap rounds, and record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 
 svcmgr reads the directory's signed `index` file through procmgr's `READ_VERIFIED` in the

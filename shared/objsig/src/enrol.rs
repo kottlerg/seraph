@@ -22,8 +22,8 @@
 use core::cmp::Ordering;
 
 use crate::store::{
-    ANCHOR_LEN, Anchor, AnchorSpec, TrustStore, ascending, decode_anchor, label_is_valid,
-    next_anchor, put_anchor, raw_key_id,
+    ANCHOR_LEN, Anchor, AnchorSpec, TrustStore, anchor_checks, anchor_parts, ascending,
+    decode_anchor, in_order, label_is_valid, put_anchor, raw_key_id,
 };
 use crate::wire::{Reader, Writer};
 use crate::{EncodeError, KEY_ID_LEN, KeyId, StoreError, key_id};
@@ -100,7 +100,11 @@ impl<'a> Lists<'a>
         let mut previous: Option<KeyId> = None;
         for raw in lists.anchors
         {
-            previous = Some(next_anchor(previous, raw, raw_key_id(raw)).map_err(anchor_error)?);
+            let (_, usage, flags, label) = anchor_parts(raw)
+                .ok_or(StoreError::Length)
+                .map_err(anchor_error)?;
+            anchor_checks(usage, flags, label).map_err(anchor_error)?;
+            previous = Some(in_order(previous, raw_key_id(raw)).map_err(anchor_error)?);
         }
         if !ascending(lists.revoked)
         {
@@ -167,7 +171,7 @@ pub(crate) fn lists_layout(bytes: &[u8], magic: [u8; 8]) -> Result<Lists<'_>, En
 }
 
 /// The error of a blob of either format for the trust store's error of one
-/// of its anchors ([`next_anchor`]).
+/// of its anchors ([`anchor_parts`], [`anchor_checks`], [`in_order`]).
 pub(crate) fn anchor_error(error: StoreError) -> EnrolError
 {
     if error == StoreError::AnchorOrder
@@ -1139,8 +1143,9 @@ mod tests
 /// How they compose into the property's checks of [`EnrolledStore::parse`]
 /// and [`TrustRequest::parse`] (`property::enrolled_store_holds`,
 /// `property::trust_request_holds`). Both parse with `Lists::parse`, whose
-/// walk of the anchors is the trust store's step ([`next_anchor`]), proven
-/// by induction in `store.rs` with the order of the revoked key ids; here
+/// walk of the anchors takes the trust store's step ([`anchor_parts`],
+/// [`anchor_checks`], [`in_order`]), proven by induction in `store.rs`
+/// with the order of the revoked key ids; here
 /// the layout proof shows that the walk starts on the lists the header
 /// gives, the error proof that a step's refusal becomes the blob's, and the
 /// lookup and bound proofs check the revoked lookup the last check makes and

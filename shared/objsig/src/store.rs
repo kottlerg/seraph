@@ -86,7 +86,9 @@ impl<'a> TrustStore<'a>
         let mut previous: Option<KeyId> = None;
         for raw in store.anchors
         {
-            previous = Some(next_anchor(previous, raw, raw_key_id(raw))?);
+            let (_, usage, flags, label) = anchor_parts(raw).ok_or(StoreError::Length)?;
+            anchor_checks(usage, flags, label)?;
+            previous = Some(in_order(previous, raw_key_id(raw))?);
         }
         if !ascending(store.revoked)
         {
@@ -256,24 +258,6 @@ pub(crate) fn store_layout(bytes: &[u8]) -> Result<TrustStore<'_>, StoreError>
     })
 }
 
-/// The step of the walk of a store's anchors: `raw`, whose key id is `id`,
-/// is checked ([`anchor_fields`]) and follows `previous`, the key id of the
-/// anchor before it ([`in_order`]); returns `id`, the state of the next
-/// step.
-///
-/// # Errors
-///
-/// The errors of [`anchor_fields`], then `AnchorOrder`.
-pub(crate) fn next_anchor(
-    previous: Option<KeyId>,
-    raw: &[u8; ANCHOR_LEN],
-    id: KeyId,
-) -> Result<KeyId, StoreError>
-{
-    anchor_fields(raw)?;
-    in_order(previous, id)
-}
-
 /// `id`, when it follows `previous`, the key id of the anchor before it, in
 /// strictly ascending order.
 ///
@@ -328,10 +312,12 @@ pub(crate) fn anchor_key(raw: &[u8; ANCHOR_LEN]) -> Option<&PublicKey>
     raw.first_chunk::<PUBLIC_KEY_LEN>()
 }
 
-/// Decode and check one anchor.
+/// Decode and check one anchor: its fields cut ([`anchor_parts`]) and
+/// checked ([`anchor_checks`]), and its key id.
 pub(crate) fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreError>
 {
-    let (key, usage, local, label) = anchor_fields(raw)?;
+    let (key, usage, flags, label) = anchor_parts(raw).ok_or(StoreError::Length)?;
+    let (usage, local, label) = anchor_checks(usage, flags, label)?;
     Ok(Anchor {
         key,
         key_id: key_id(key),
@@ -339,21 +325,6 @@ pub(crate) fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreE
         local,
         label,
     })
-}
-
-/// Decode and check the fields of one anchor ([`anchor_parts`],
-/// [`anchor_checks`]); returns its key, usage, `LOCAL` flag and label.
-///
-/// # Errors
-///
-/// `AnchorUsage`, `AnchorFlags`, then `Label`.
-pub(crate) fn anchor_fields(
-    raw: &[u8; ANCHOR_LEN],
-) -> Result<(&PublicKey, Usage, bool, &str), StoreError>
-{
-    let (key, usage, flags, label) = anchor_parts(raw).ok_or(StoreError::Length)?;
-    let (usage, local, label) = anchor_checks(usage, flags, label)?;
-    Ok((key, usage, local, label))
 }
 
 /// The fields of an anchor's encoding, cut where they lie: its key, its
@@ -659,19 +630,20 @@ mod tests
 ///
 /// How they compose into the property's check of [`TrustStore::parse`]
 /// (`property::trust_store_holds`). The walk of the anchors is a loop whose
-/// step is [`next_anchor`], its state the key id of the anchor before, and
-/// it is proven by induction: the layout proof shows that the walk starts on
+/// step is three functions in turn, its state the key id of the anchor
+/// before: [`anchor_parts`] cuts an anchor into its fields, [`anchor_checks`]
+/// checks them, and [`in_order`] takes its key id after the one before. It
+/// is proven by induction: the layout proof shows that the walk starts on
 /// the anchors and the revoked key ids the header gives, cut where they lie;
-/// the step ([`next_anchor`]) is an anchor's cut into its fields, their
-/// checks and the order of its key id after the one before, each proven on
-/// any input, so whatever state a step hands the next, the next judges its
-/// anchor as the reading does; and the order proof checks the revoked key
-/// ids the walk ends on. What lies outside the proofs is the straight-line
-/// composition of the step from those three and the loop that drives it,
-/// and the key id each step is given, the SHA-512 of the anchor's key
-/// ([`raw_key_id`]), which no proof may stub (docs/coding-standards.md
-/// § Proof Harnesses); the fuzz target `objsig`, the replay of the
-/// checked-in inputs and the unit tests check them.
+/// the cut, checks and order proofs run each part of the step on any input,
+/// so whatever state a step hands the next, the next judges its anchor as
+/// the reading does; and the ascending proof checks the revoked key ids the
+/// walk ends on. What lies outside the proofs is `parse`, the loop that
+/// drives the step and the check after it, and the key id each step is
+/// given, the SHA-512 of the anchor's key ([`raw_key_id`]), which no proof
+/// may stub (docs/coding-standards.md § Proof Harnesses); the fuzz target
+/// `objsig`, the replay of the checked-in inputs and the unit tests check
+/// them.
 #[cfg(kani)]
 mod proofs
 {

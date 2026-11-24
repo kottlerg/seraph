@@ -714,10 +714,12 @@ pub(crate) fn in_order_holds(previous: Option<KeyId>, id: KeyId) -> Result<KeyId
     expected
 }
 
-/// [`store::next_anchor`] judges an anchor of key id `id` after one of key
-/// id `previous` as its parts, their checks and the order do; returns `id`.
-/// And [`store::anchor_fields`] decodes an anchor it takes as those fields,
-/// the key and the label at their places.
+/// The step of the walk of a store's anchors, as the loops of
+/// [`TrustStore::parse`] and `Lists::parse` take it: the anchor's parts,
+/// their checks, then the order of `id` after `previous`; returns `id`. And
+/// [`store::decode_anchor`] decodes an anchor the step takes as those
+/// fields, the key and the label at their places, and refuses one it
+/// refuses as the checks do.
 #[expect(
     clippy::panic_in_result_fn,
     reason = "a check panics on a defect of the parser by design; its Result is the reading it hands the walk's next step"
@@ -729,21 +731,21 @@ pub(crate) fn anchor_holds(
 ) -> Result<KeyId, StoreError>
 {
     let (usage, flags, field) = anchor_parts_holds(raw);
-    let expected =
-        anchor_checks_holds(usage, flags, field).and_then(|()| in_order_holds(previous, id));
+    let checked = anchor_checks_holds(usage, flags, field);
+    let decoded = store::decode_anchor(raw);
     assert_eq!(
-        store::next_anchor(previous, raw, id),
-        expected,
-        "an anchor judged against its reading"
+        decoded.as_ref().err(),
+        checked.as_ref().err(),
+        "an anchor decoded against its checks"
     );
-    if let (Ok((key, _, _, text)), Some(label)) = (store::anchor_fields(raw), label_reading(field))
+    if let (Ok(anchor), Some(label)) = (decoded, label_reading(field))
     {
         assert!(
-            ptr::eq(key.as_slice(), range(raw, 0, 1984)) && ptr::eq(text, label),
+            ptr::eq(anchor.key.as_slice(), range(raw, 0, 1984)) && ptr::eq(anchor.label, label),
             "an anchor decoded as other fields"
         );
     }
-    expected
+    checked.and_then(|()| in_order_holds(previous, id))
 }
 
 /// [`store::ascending`] holds exactly for key ids each below the next.

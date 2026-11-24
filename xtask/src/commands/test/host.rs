@@ -136,7 +136,6 @@ pub fn run(ctx: &BuildContext, component: TestComponent) -> Result<()>
     Ok(())
 }
 
-/// The cargo package selection of `component`.
 /// Whether the run lints the host crates' non-test code as `cargo xtask
 /// build` does (`clippy_host`): on the whole workspace, which CI's
 /// `host-tests` job runs on every change, so a change that owes no boot
@@ -146,6 +145,7 @@ fn lints_host_crates(component: TestComponent) -> bool
     matches!(component, TestComponent::All)
 }
 
+/// The cargo package selection of `component`.
 fn packages(component: TestComponent) -> &'static [&'static str]
 {
     match component

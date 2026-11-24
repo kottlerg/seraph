@@ -8414,8 +8414,12 @@ pub unsafe fn post_aspace_death_notification(post: &AspaceEndPost)
 /// here that outranks the running one is not the tick's to decide: the
 /// interrupt's return to user mode does ([`preempt_if_outranked`]).
 /// Also runs the BSP sleep-list and watchdog checks and the per-CPU load
-/// balancer. This function is called from the timer interrupt handler on each
-/// CPU independently.
+/// balancer, and posts this CPU's `SOLE_REF` return-work bit while the
+/// sole-reference table has work, whichever CPU left it, so the next return to
+/// user mode of any CPU a tick reaches makes a pass
+/// (core/kernel/docs/capability-internals.md § Sole-Reference Observers). This
+/// function is called from the timer interrupt handler on each CPU
+/// independently.
 ///
 /// # Safety
 /// Must be called from interrupt context on the local CPU only.
@@ -8427,6 +8431,16 @@ pub unsafe fn timer_tick()
     if BOOT_TRANSIENT_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
     {
         return;
+    }
+
+    // A mark, or fired nodes a pass left, on any CPU: this CPU's next return
+    // to user mode makes a pass. A tick taken in user mode returns there at
+    // once; one taken in kernel mode leaves the bit for that syscall's return.
+    if crate::cap::sole_reference::work_pending()
+    {
+        // SAFETY: an interrupt on a CPU whose per-CPU pointer is installed, as
+        // for current_scheduler below.
+        unsafe { crate::percpu::post_return_work(crate::percpu::return_work::SOLE_REF) };
     }
 
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
@@ -8684,9 +8698,10 @@ unsafe fn interrupt_return_slow(mut deliver: impl FnMut())
         // on the CPU the thread runs on at each take.
         || unsafe { crate::percpu::take_return_work(AT_INTERRUPT) },
         |_| {
-            // A pass of the sole-reference posts this CPU marked or an earlier
-            // pass on it left, so a CPU that runs only user code still makes
-            // a pass of at most POST_BUDGET posts every tick
+            // A pass of the sole-reference posts this CPU marked, an earlier
+            // pass on it left, or a tick found pending on any CPU, so a CPU
+            // that runs only user code still makes a pass of at most
+            // POST_BUDGET posts every tick while there is work
             // (core/kernel/docs/capability-internals.md § Sole-Reference
             // Observers). Before the delivery point and the decision, so a
             // thread a post wakes on this CPU is decided at this return.

@@ -53,8 +53,9 @@ resync).
 Where a bind goes and when the set grows is the `DeathQueues` policy of
 [`runtime/ruststd/death-queues`](../../runtime/ruststd/README.md), host-tested there. The set itself
 makes the syscalls and funds the objects through `std::os::seraph`, so it compiles only for seraph
-(`src/set.rs`, under `cfg(target_os = "seraph")`, which `build.rs` declares an expected cfg on
-the host). The overflow watch and the drain are host-tested here against `model::KernelQueue`, a
+(`src/set.rs`, under `cfg(target_os = "seraph")`, which the workspace's `unexpected_cfgs` check-cfg
+in the root `Cargo.toml` declares an expected cfg on the host). The overflow watch and the drain
+are host-tested here against `model::KernelQueue`, a
 model of the kernel's event-queue ring (FIFO, a post to a full ring dropped): every interleaving of
 posts and takes up to a bound is checked to leave no dropped post without a later report. The
 `model` feature gives the same model to the host tests of each service's resync, which drain it as
@@ -72,7 +73,6 @@ build enables the feature. The crate depends on `ruststd-death-queues`, `shared/
 shared/death-set/
 ├── Cargo.toml
 ├── README.md
-├── build.rs                    # Declares cfg(target_os = "seraph") expected on the host
 └── src/
     ├── lib.rs                  # Crate root: the modules and their exports
     ├── set.rs                  # DeathSet: queue and wait-set creation, binds, growth, drain

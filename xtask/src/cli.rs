@@ -405,7 +405,9 @@ args! {
 
         /// Skip the formatting check (`cargo fmt --check`) and the
         /// per-component `cargo check` (clippy), which would otherwise double
-        /// the cargo invocations per component. `cargo xtask compare-images`
+        /// the cargo invocations per component. The build of a `StdUser`
+        /// component still runs clippy, with warnings denied, as every build
+        /// through the seraph toolchain mirror does. `cargo xtask compare-images`
         /// and `cargo xtask test signing` and `rollback` set it for the builds
         /// they run.
         /// Use `cargo xtask build` without it for the full lint pass.

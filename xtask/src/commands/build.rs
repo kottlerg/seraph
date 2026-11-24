@@ -1395,8 +1395,10 @@ fn clippy_check(ctx: &BuildContext, flags: &[&str]) -> Result<()>
 /// from rustup instead of our mirror and the overlay never takes effect.
 /// To keep our wrapper in place we drive clippy ourselves: `cargo check`
 /// with `RUSTC_WORKSPACE_WRAPPER=<ws-clippy>` runs the mirror-aware
-/// wrapper on every workspace crate, and `CLIPPY_ARGS` feeds the same
-/// lint args that `cargo clippy -- …` would pass through.
+/// wrapper on every workspace crate, and `CLIPPY_ARGS`, which
+/// [`rust_src::SeraphToolchain::apply_env`] sets for the build too
+/// ([`rust_src::CLIPPY_ARGS`]), feeds the same lint args that
+/// `cargo clippy -- …` would pass through.
 ///
 /// Called before every component `cargo build` with identical flags and
 /// `env`, so lints are enforced on every component build — not just on
@@ -1416,18 +1418,11 @@ fn clippy_check_ext(
     {
         cmd.arg("check").args(flags);
         // Routes RUSTC + RUSTC_WORKSPACE_WRAPPER through the shim,
-        // sets the SERAPH_SHIM_* config, and re-applies
-        // RUSTC_BOOTSTRAP=1. `std` is a recognised (non-restricted)
-        // target via the std `build.rs` overlay, so service code
-        // stays preamble-free.
+        // sets the SERAPH_SHIM_* config and the lint args (CLIPPY_ARGS),
+        // and re-applies RUSTC_BOOTSTRAP=1. `std` is a recognised
+        // (non-restricted) target via the std `build.rs` overlay, so
+        // service code stays preamble-free.
         s.apply_env(&mut cmd);
-        // Clippy-driver splits CLIPPY_ARGS on __CLIPPY_HACKERY__; this
-        // matches the encoding cargo-clippy uses internally when
-        // forwarding post-`--` args.
-        cmd.env(
-            "CLIPPY_ARGS",
-            "__CLIPPY_HACKERY__-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__",
-        );
     }
     else
     {

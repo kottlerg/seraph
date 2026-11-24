@@ -36,9 +36,9 @@
 //!   4. Callers route `cargo build` / `cargo clippy` through the
 //!      mirror by calling `SeraphToolchain::apply_env(&mut cmd)`,
 //!      which sets `RUSTC`, `RUSTC_WORKSPACE_WRAPPER`, the three
-//!      `SERAPH_SHIM_*` config vars, `RUSTC_BOOTSTRAP=1`, and Cargo's
-//!      build directory (`target/seraph-build/`, [`BUILD_DIR`]) in one
-//!      go. No rustup-level state is modified;
+//!      `SERAPH_SHIM_*` config vars, `RUSTC_BOOTSTRAP=1`, Cargo's
+//!      build directory (`target/seraph-build/`, [`BUILD_DIR`]), and the
+//!      lint arguments (`CLIPPY_ARGS`, [`CLIPPY_ARGS`]) in one go. No rustup-level state is modified;
 //!      `target/seraph-toolchain/` is a pure build artifact under
 //!      `target/`.
 //!
@@ -89,6 +89,21 @@ const MIRROR_DIR: &str = "seraph-toolchain";
 /// rebuild what the other built.
 pub(crate) const BUILD_DIR: &str = "seraph-build";
 
+/// The lint arguments `clippy-driver` reads from `CLIPPY_ARGS`: `-D warnings`,
+/// split on `__CLIPPY_HACKERY__`, the encoding `cargo clippy` uses to forward
+/// the arguments after its `--`.
+///
+/// [`SeraphToolchain::apply_env`] gives every cargo invocation through the
+/// mirror this one value, the lint pass's, the build's and a `--skip-lints`
+/// build's alike. `clippy-driver` records `CLIPPY_ARGS` as an input of each
+/// unit it compiles, and the workspace crates `std` depends on are units both
+/// the lint pass and the build compile; a value that differed between them
+/// would make each rebuild those crates, `std`, and every `StdUser` crate
+/// after the other. In the build, as in the lint pass, a `StdUser` crate's
+/// clippy warning is an error.
+pub(crate) const CLIPPY_ARGS: &str =
+    "__CLIPPY_HACKERY__-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__";
+
 /// Rustc-version stamp: invalidates the mirror if the underlying
 /// toolchain changes (`rustc --version --verbose` output).
 const VERSION_STAMP: &str = ".seraph-toolchain-stamp";
@@ -120,8 +135,9 @@ impl SeraphToolchain
     /// build through the seraph toolchain mirror: `RUSTC` and
     /// `RUSTC_WORKSPACE_WRAPPER` (mirror entry points), the three
     /// `SERAPH_SHIM_*` config vars (so the shim knows what to exec),
-    /// `RUSTC_BOOTSTRAP=1`, and `CARGO_BUILD_BUILD_DIR` ([`BUILD_DIR`]):
-    /// the final artifacts still land in `target/<triple>/<profile>/`.
+    /// `RUSTC_BOOTSTRAP=1`, `CARGO_BUILD_BUILD_DIR` ([`BUILD_DIR`]), where
+    /// the final artifacts still land in `target/<triple>/<profile>/`, and
+    /// `CLIPPY_ARGS` ([`CLIPPY_ARGS`]).
     ///
     /// `RUSTC_BOOTSTRAP=1` unlocks the unstable features that
     /// `-Zbuild-std` and the std overlay's workspace deps
@@ -140,6 +156,7 @@ impl SeraphToolchain
         cmd.env("SERAPH_SHIM_MIRROR_SYSROOT", &self.mirror_sysroot);
         cmd.env("RUSTC_BOOTSTRAP", "1");
         cmd.env("CARGO_BUILD_BUILD_DIR", &self.build_dir);
+        cmd.env("CLIPPY_ARGS", CLIPPY_ARGS);
     }
 }
 
@@ -1770,5 +1787,61 @@ mod tests
                 "{rel}/Cargo.toml does not name the package {package}"
             );
         }
+    }
+
+    // Defect caught: the lint pass and the build giving `clippy-driver`
+    // different `CLIPPY_ARGS`, which it records as an input of each unit, so
+    // that each pass rebuilds the workspace crates `std` depends on, `std`,
+    // and every `StdUser` crate after the other, and a no-change build is
+    // never a no-op.
+    #[test]
+    fn every_cargo_invocation_through_the_mirror_gives_clippy_one_lint_argument_set()
+    {
+        let toolchain = SeraphToolchain {
+            rustc: PathBuf::from("rustc"),
+            ws_clippy: PathBuf::from("ws-clippy"),
+            real_rustc: PathBuf::from("real-rustc"),
+            real_clippy: PathBuf::from("real-clippy"),
+            mirror_sysroot: PathBuf::from("mirror"),
+            build_dir: PathBuf::from("build"),
+        };
+        let mut cmd = Command::new("cargo");
+        toolchain.apply_env(&mut cmd);
+        let args = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "CLIPPY_ARGS")
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str())
+            .expect("apply_env sets CLIPPY_ARGS");
+        assert_eq!(args, CLIPPY_ARGS);
+        let words: Vec<&str> = args
+            .split("__CLIPPY_HACKERY__")
+            .filter(|w| !w.is_empty())
+            .collect();
+        assert_eq!(words, ["-D", "warnings"]);
+
+        // No other xtask code sets the variable, so no pass can give it
+        // another value.
+        let setter = concat!(".env(\"CLIPPY", "_ARGS\"");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop()
+        {
+            for entry in fs::read_dir(&dir).unwrap()
+            {
+                let path = entry.unwrap().path();
+                if path.is_dir()
+                {
+                    dirs.push(path);
+                }
+                else if path.extension().is_some_and(|e| e == "rs")
+                    && fs::read_to_string(&path).unwrap().contains(setter)
+                {
+                    files.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        assert_eq!(files, ["rust_src.rs"]);
     }
 }

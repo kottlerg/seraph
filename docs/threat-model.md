@@ -325,7 +325,8 @@ loader reached only through such an image is a defect, not an attack.
   over a raw relocation table, from the seeds in `shared/elf/fuzz/elf/seeds/`: the header checks,
   `load_segments`, `tls_segment`, `load_span`, `relro_span`, `rela_table`, the relocation
   decode, validation and application, `find_note`, `parse_stack_note` and `find_note_streaming`.
-  CI's gating `fuzz` job runs it on every pull request and the weekly campaign for 30 minutes.
+  CI's gating `fuzz` job runs it on a pull request whose change can affect it and the campaign for
+  30 minutes.
 - The `proofs` module of `shared/elf/src/lib.rs` proves the same property by induction over
   each walk ([testing.md](testing.md) § Bounded verification); CI's `kani` job runs them. A step
   proof runs each walk's step on any element and any state (a program header, a dynamic entry and

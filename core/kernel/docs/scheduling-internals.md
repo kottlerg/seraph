@@ -1102,7 +1102,7 @@ the word existed. A bit says only that a check may find work.
 | `RECLAIM` | `cap::object::push_deferred_reclaim` | its own |
 | `SOLE_REF` | a decrement that marks the sole-reference table or fires its observers (`KernelObjectHeader::dec_ref`), and a drain pass that leaves work | its own |
 | `UPCALL_SYSCALL`, `UPCALL_ANY` | `ipc::upcall::post` for a `Running`, unmasked target; `schedule()`'s dispatch of a thread with an unmasked upcall pending; the unmask (`upcall::set_mask`) | the target's `preferred_cpu`; the dispatching CPU; its own |
-| `PREEMPT` | a run-queue link that leaves a queued thread outranking the running one; `mark_level_stale`; the wake IPI's handler; a preemption the boot transient or a preemption-disabled window declined | the linked CPU; the CPU running the thread; the IPI's target; its own |
+| `PREEMPT` | a run-queue link, or a priority change's move (`relink`), that leaves a queued thread outranking the running one; `mark_level_stale`; the wake IPI's handler; a preemption the boot transient or a preemption-disabled window declined | the linked CPU; the CPU running the thread; the IPI's target; its own |
 
 The return points and the bits they handle:
 
@@ -1146,7 +1146,8 @@ Rules:
    `current` (`sched::mark_dispatched`). A post to a `Running` thread that leaves the CPU before
    the return leaves a bit the next thread's return clears in vain, and the thread's own dispatch
    posts again.
-6. A link posts `PREEMPT` when it leaves `non_empty & outranking` nonzero, under the linked CPU's
+6. A link, and a priority change's move between one CPU's queues (`PerCpuScheduler::relink`),
+   posts `PREEMPT` when it leaves `non_empty & outranking` nonzero, under the linked CPU's
    `scheduler.lock`. For a link the CPU makes itself that test is exact. A link another CPU makes
    can read `outranking` before a dispatch on the linked CPU rewrites it, since the dispatch
    records the level without that lock; every such link is followed by a wake IPI (§ Wake Protocol

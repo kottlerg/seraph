@@ -883,8 +883,9 @@ thread's level, read under that thread's lock.
 A CPU decides at every return to user mode that can follow a link with no wake IPI pending
 (`sched::preempt_if_outranked`), and when a queued thread outranks the running one it calls
 `schedule(Requeue::Preempted)`. The decision runs when the CPU's `PREEMPT` return-work bit is set,
-which a link leaving a queued thread outranking the running one posts, as do the wake IPI's
-handler and the stale mark of a priority change, so a return with nothing to decide makes one test
+which a link or a priority change's move (`relink`) leaving a queued thread outranking the
+running one posts, as do the wake IPI's handler and the stale mark of a priority change, so a
+return with nothing to decide makes one test
 ([scheduling-internals.md](scheduling-internals.md#return-work) § Return Work):
 
 - the end of every syscall (`syscall::finish_syscall`), after the syscall delivery point of

@@ -362,7 +362,7 @@ Cargo's own output stays in `target/`. The builds of the std-user programs compi
 `core` and `alloc`, from the seraph toolchain mirror, `target/seraph-toolchain/`, which carries
 the `std` overlay ([`xtask/src/rust_src.rs`](../xtask/src/rust_src.rs)); every other build
 compiles `core` and `alloc` from the toolchain's own `rust-src`. The mirror's builds take
-`target/seraph-build/` as Cargo's build directory, and their binaries still land in
+`target/seraph-build-<format>/` as Cargo's build directory, and their binaries still land in
 `target/<triple>/<profile>/` with every other build's. Two builds of one library package from
 two source paths cannot share a build directory: a host build script, `compiler_builtins`'s among
 them, is one unit for every target, its fingerprint records the path it was built from, and each
@@ -389,9 +389,11 @@ builds current:
   std-user program. Host tests check that each listed crate reads it and that the list holds every
   path dependency of its crates.
 
-`target/seraph-build/` records the rules its units were judged by (`.seraph-build-format`): xtask
-removes a build directory that records other rules, or none, before the build, since a unit
-compiled under the old rules can pass as current under the new.
+The build directory's name carries its format, the rules its units are judged by
+(`BUILD_DIR` in `xtask/src/rust_src.rs`, `target/seraph-build-1/`): a unit compiled under older
+rules can pass as current under newer ones, so each format builds in a directory of its own, which
+no xtask of another format writes into, and xtask removes the directories of older formats
+(`target/seraph-build/`, of the builds before the digest) before the build.
 
 ```
 sysroot/

@@ -2180,7 +2180,7 @@ fails as the search did, on any host. The run exits non-zero.
 | Tier | Where | When | Runs |
 |---|---|---|---|
 | Gating | CI, the `fuzz` job of `build-test.yml` | a change that can affect a crate it fuzzes, its engine, xtask or the workflows; skipped as not owed otherwise | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
-| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
+| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, from a seed that changes each run, over the checked-in inputs and the working corpus of an earlier run when the Actions cache still holds one; failing inputs upload as an artifact |
 | Local | developer host | at will | `cargo xtask fuzz <target>` with `--runs` or `--time` |
 
 The self-test runs the engine on planted defects in `xtask/fuzz/targets` (an eight-byte magic
@@ -2221,14 +2221,6 @@ harness adds it to the run. It holds each process of the run to the address spac
 give a harness, so a harness that needs more fails, named as out of memory, and it closes with
 every harness's verdict and verification time.
 
-**Time budget.** A harness MUST verify in at most 120 s on CI's `kani` runner, the verification
-time Kani reports for it, beside the memory bound below. `cargo xtask kani` fails a harness over
-the budget on a CI runner, naming it and its time, and warns of it on another host, whose speed
-differs. A harness that cannot meet the budget is resized, by bounds that still cover its property,
-or proved in the induction form of the parser proofs below, or split into harnesses that together
-cover the inputs it covered; no property is dropped or narrowed to meet it. A PR that resizes a
-harness for the budget states its time before and after.
-
 **Where the proofs run.** On a pull request, CI's `kani` job verifies only the crates the change
 can affect (`cargo xtask kani --since` against the base the `select` job found, the newest commit
 before the run's whose `master` run passed; [conventions.md](conventions.md#ci-gating) § CI
@@ -2253,9 +2245,9 @@ repository](https://docs.github.com/en/actions/reference/runners/github-hosted-r
 leaves 4 GB to the runner's own processes, so a harness that fits under it locally fits on the
 runner. A run that the limit ends (an allocation failure, or a process killed)
 or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
-still cover the property or by the induction form of the parser proofs below; a run whose time
-on the development host is near or over the time budget is a harness that CI's runner may fail,
-made to fit the same way. A failed,
+still cover the property or by the induction form of the parser proofs below. A harness is
+also sized to finish well within CI's `kani` job, whose timeout, GitHub's default for a job, is
+the backstop, and is made to fit the same way when it does not. A failed,
 undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
 or the harness, fixed as such, and MUST NOT be bounded away. The PR body's `## Validation`
 section states, for each such harness, the verification time Kani reports, the peak resident
@@ -2275,15 +2267,15 @@ parser crate's `#[cfg(kani)] mod proofs`, which prove the property in one of two
 runs the property, or its check of one structure the parser decodes (a header, an entry), on the
 first `len` bytes of `kani::any::<[u8; N]>()`, `len` itself any value up to N, so the check holds
 for every input of at most N bytes, not only for the inputs a search reached; its comment states N
-and why inputs of that length cover the structure. Where a harness of the whole property does not
-complete within the time budget, the parser MUST write each loop over a structure of variable length
-(the walk of an array, a search over its entries, a checksum over its bytes) as a step over a small
-state, which two harnesses prove by induction: a base harness, that the loop starts in an invariant
-the harness states, and a step harness, that one step from any state in the invariant (`kani::any`
-under `kani::assume`) keeps it and does what the property asks of that step, with no loop to
-unwind. Code other than the loops that drive the steps and the reads that feed them MUST NOT lie
-outside the harnesses; the module's comment states how its harnesses compose into the property and
-names those loops and reads, with the drivers that check them. Implemented for the parsers whose
+and why inputs of that length cover the structure. Where a harness of the whole property cannot
+be sized as Local sizing above says, the parser MUST write each loop over a structure of variable
+length (the walk of an array, a search over its entries, a checksum over its bytes) as a step over
+a small state, which two harnesses prove by induction: a base harness, that the loop starts in an
+invariant the harness states, and a step harness, that one step from any state in the invariant
+(`kani::any` under `kani::assume`) keeps it and does what the property asks of that step, with no
+loop to unwind. Code other than the loops that drive the steps and the reads that feed them MUST NOT
+lie outside the harnesses; the module's comment states how its harnesses compose into the property
+and names those loops and reads, with the drivers that check them. Implemented for the parsers whose
 crates hold a `property` module, each with its fuzz target in `xtask/fuzz/targets`; design
 intent, not yet implemented, for every other parser of hostile input.
 

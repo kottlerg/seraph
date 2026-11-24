@@ -4138,9 +4138,10 @@ fn cpus_current_on(
     (0..cpu_count).filter(move |&cpu| core::ptr::eq(current_of(cpu), tcb))
 }
 
-/// Post the stopped check (`STOPPED`) to every CPU whose `current` is
-/// `tcb`, a thread just committed `Exited`: that CPU's next syscall return
-/// owes [`running_thread_stopped`]. A thread can be `current` on two CPUs:
+/// After a commit of `state` to `tcb`, post the stopped check (`STOPPED`)
+/// to every CPU whose `current` is `tcb` when `state` is `Exited`: that
+/// CPU's next syscall return owes [`running_thread_stopped`]. Another state
+/// posts nothing. A thread can be `current` on two CPUs:
 /// one that claimed it in its voluntary-block window waits for the parking
 /// CPU's register save with it `current` on both, and resumes it in that
 /// syscall (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
@@ -4152,17 +4153,41 @@ fn cpus_current_on(
 /// The caller holds every CPU's `scheduler.lock`, and `cpu_count` is the
 /// number of CPUs whose per-CPU storage is initialised.
 #[cfg(not(test))]
-unsafe fn post_stopped(tcb: *mut ThreadControlBlock, cpu_count: usize)
+unsafe fn post_stopped(tcb: *mut ThreadControlBlock, state: ThreadState, cpu_count: usize)
 {
     let current_of = |cpu| {
         // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
         unsafe { scheduler_for(cpu) }.current()
     };
-    for cpu in cpus_current_on(tcb, cpu_count, current_of)
-    {
+    let word_of = |cpu| {
         // SAFETY: cpu < cpu_count, and per-CPU storage is initialised before
         // any thread runs.
-        unsafe { crate::percpu::post_return_work_to(cpu, crate::percpu::return_work::STOPPED) };
+        unsafe { crate::percpu::return_work_of(cpu) }
+    };
+    post_stopped_to(tcb, state, cpu_count, current_of, word_of);
+}
+
+/// The body of [`post_stopped`], with each CPU's `current` read through
+/// `current_of` and its return-work word named by `word_of`. Release, after
+/// the caller's `Exited` store, as every post is.
+fn post_stopped_to(
+    tcb: *mut ThreadControlBlock,
+    state: ThreadState,
+    cpu_count: usize,
+    current_of: impl Fn(usize) -> *mut ThreadControlBlock,
+    word_of: impl Fn(usize) -> &'static core::sync::atomic::AtomicU32,
+)
+{
+    if state != ThreadState::Exited
+    {
+        return;
+    }
+    for cpu in cpus_current_on(tcb, cpu_count, current_of)
+    {
+        word_of(cpu).fetch_or(
+            crate::percpu::return_work::STOPPED,
+            core::sync::atomic::Ordering::Release,
+        );
     }
 }
 
@@ -4314,11 +4339,8 @@ unsafe fn commit_state_under_all_locks(
 
         // SAFETY: every CPU lock is held (above).
         running_on = unsafe { cpu_running(tcb, cpu_count) };
-        if state_out == thread::ThreadState::Exited
-        {
-            // SAFETY: every CPU lock is held (above); tcb valid.
-            unsafe { post_stopped(tcb, cpu_count) };
-        }
+        // SAFETY: every CPU lock is held (above); tcb valid.
+        unsafe { post_stopped(tcb, state_out, cpu_count) };
     }
 
     // Release all CPU locks in descending order, then (*tcb).sched_lock last.
@@ -10452,8 +10474,11 @@ mod return_work_tests
 #[cfg(test)]
 mod stopped_post_tests
 {
-    use super::cpus_current_on;
-    use super::thread::ThreadControlBlock;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use super::thread::{ThreadControlBlock, ThreadState};
+    use super::{cpus_current_on, post_stopped_to};
+    use crate::percpu::return_work::{PREEMPT, STOPPED};
 
     /// A distinct TCB address; the scan compares addresses only.
     fn tcb(n: usize) -> *mut ThreadControlBlock
@@ -10483,5 +10508,67 @@ mod stopped_post_tests
             0
         );
         assert_eq!(cpus_current_on(tcb(3), 2, |cpu| currents[cpu]).count(), 0);
+    }
+
+    /// Four return-work words, one per CPU of a test, the second holding
+    /// `PREEMPT` already.
+    fn words() -> &'static [AtomicU32; 4]
+    {
+        Box::leak(Box::new([
+            AtomicU32::new(0),
+            AtomicU32::new(PREEMPT),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ]))
+    }
+
+    /// Each word's value.
+    fn values(words: &[AtomicU32; 4]) -> [u32; 4]
+    {
+        words.each_ref().map(|word| word.load(Ordering::Relaxed))
+    }
+
+    // The defect caught: an `Exited` commit of a thread running on a CPU that
+    // leaves that CPU's word without `STOPPED` (the post removed, or posted to
+    // the wrong CPU), so the thread goes on in user mode until a tick
+    // reschedules it; or one that clears a bit another producer posted.
+    #[test]
+    fn an_exit_of_a_running_thread_posts_stopped_to_its_cpu_alone()
+    {
+        let currents = [tcb(1), tcb(2), tcb(3), tcb(4)];
+        let words = words();
+        post_stopped_to(
+            tcb(2),
+            ThreadState::Exited,
+            currents.len(),
+            |cpu| currents[cpu],
+            |cpu| &words[cpu],
+        );
+        assert_eq!(values(words), [0, PREEMPT | STOPPED, 0, 0]);
+    }
+
+    // The defect caught: an `Exited` commit posting `STOPPED` where the
+    // thread runs on no CPU, or a commit of another state posting it, which
+    // sends a return down the slow path for nothing.
+    #[test]
+    fn an_exit_of_a_thread_running_nowhere_or_a_stop_posts_nothing()
+    {
+        let currents = [tcb(1), tcb(2), tcb(3), tcb(4)];
+        let words = words();
+        post_stopped_to(
+            tcb(5),
+            ThreadState::Exited,
+            currents.len(),
+            |cpu| currents[cpu],
+            |cpu| &words[cpu],
+        );
+        post_stopped_to(
+            tcb(2),
+            ThreadState::Stopped,
+            currents.len(),
+            |cpu| currents[cpu],
+            |cpu| &words[cpu],
+        );
+        assert_eq!(values(words), [0, PREEMPT, 0, 0]);
     }
 }

@@ -1064,7 +1064,8 @@ mod proofs
     /// line, a comment, and each refusal of a line too short to name a
     /// partition, for both roles and none (an unknown keyword, a field
     /// missing, extra or empty): 10 bytes hold a keyword and three one-byte
-    /// fields, a `data` line's four.
+    /// fields, a `data` line's four, so a `swap` line of a field too many,
+    /// and a field empty between two spaces.
     #[kani::proof]
     #[kani::unwind(12)]
     fn every_short_line_holds_the_line_contract()

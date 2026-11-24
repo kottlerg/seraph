@@ -19,7 +19,7 @@
 //! where it does not.
 //!
 //! The drain cases park [`WAITERS`] threads of one fresh address space on one
-//! source, in FIFO order, pinned to `latency::WAITER_CPU`, and the worker, on another
+//! source, in FIFO order, pinned to `latency::waiter_cpu()`, and the worker, on another
 //! CPU, deletes the source. Each wake of a waiter on a CPU other than the
 //! waker's counts in the waiter's `THREAD_PLACEMENT_REMOTE_WAKES`, committed
 //! under the drain's hold, so the first waiter's count rising is the drain's
@@ -46,13 +46,16 @@ use super::teardown_windows::{Owned, delete_bracketed, run};
 use crate::latency::{self, Call, Measured};
 use crate::{TestContext, TestResult};
 
-/// Threads parked on one source by the drain cases: eight batches of the
-/// kernel's `DRAIN_BATCH_WAITERS`.
-const WAITERS: usize = 128;
+/// Threads parked on one source by the drain cases: 32 batches of the kernel's
+/// `DRAIN_BATCH_WAITERS`, a stretch long enough that a probe is issued and
+/// acknowledged inside it on a host whose acknowledgements take hundreds of
+/// microseconds.
+const WAITERS: usize = 512;
 /// Threads bound to the dying object of the stop, hold and withdrawal cases:
-/// 256 acted visits of the registry walk, 32 batches of its
-/// `REGISTRY_BATCH_COST`.
-pub(crate) const BOUND: usize = 256;
+/// 1024 acted visits of the registry walk, 128 batches of its
+/// `REGISTRY_BATCH_COST`, so even the hold's walk of never-started threads, the
+/// cheapest visit, lasts long enough for a probe to land in its first half.
+pub(crate) const BOUND: usize = 1024;
 /// Most threads a [`ThreadSet`] holds.
 const THREADS_MAX: usize = BOUND;
 const _: () = assert!(WAITERS <= THREADS_MAX);
@@ -268,7 +271,7 @@ impl Waiters
             .map_err(|_| "locked_windows: map the record page in the space failed")
     }
 
-    /// Start [`WAITERS`] threads one by one, each pinned to `latency::WAITER_CPU`
+    /// Start [`WAITERS`] threads one by one, each pinned to `latency::waiter_cpu()`
     /// and given a yield to park, then let them settle.
     fn park(&mut self, ctx: &TestContext) -> TestResult
     {
@@ -281,7 +284,7 @@ impl Waiters
             // ktest's own, so its entry state touches nothing ktest runs on.
             unsafe { thread_configure(thread, STUB_VA, STACK, DATA_VA) }
                 .map_err(|_| "locked_windows: configure a waiter failed")?;
-            thread_set_affinity(thread, latency::WAITER_CPU)
+            thread_set_affinity(thread, latency::waiter_cpu())
                 .map_err(|_| "locked_windows: pin a waiter failed")?;
             thread_start(thread).map_err(|_| "locked_windows: start a waiter failed")?;
             thread_yield().ok();

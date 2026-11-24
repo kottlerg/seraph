@@ -79,10 +79,27 @@ pub const ATTEMPT_LIMIT: u32 = 16;
 const PROBE_VA: u64 = 0x1_6600_0000;
 const PROBE_CPU: u32 = 0;
 const WORKER_CPU: u32 = 1;
-/// The CPU the cases of `unit::locked_windows` pin their parked waiters to: the
-/// probe's, so the worker (on `WORKER_CPU`) wakes each of them remotely, and
-/// each wake counts `THREAD_PLACEMENT_REMOTE_WAKES` of the waiter.
-pub const WAITER_CPU: u32 = PROBE_CPU;
+/// The CPU above the rig's two that the cases of `unit::locked_windows` pin
+/// their parked waiters to when the guest has it.
+const SPARE_CPU: u32 = 2;
+
+/// The CPU the cases of `unit::locked_windows` pin their parked waiters to: one
+/// other than `WORKER_CPU`, so the worker wakes each of them remotely and each
+/// wake counts `THREAD_PLACEMENT_REMOTE_WAKES` of the waiter. It is
+/// [`SPARE_CPU`] when the guest has one, so the woken waiters run beside the
+/// probe's issue loop rather than on its CPU, and the probe's otherwise.
+pub fn waiter_cpu() -> u32
+{
+    let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
+    if cpus > u64::from(SPARE_CPU)
+    {
+        SPARE_CPU
+    }
+    else
+    {
+        PROBE_CPU
+    }
+}
 
 /// The call the worker makes, between two clock reads.
 #[derive(Clone, Copy)]

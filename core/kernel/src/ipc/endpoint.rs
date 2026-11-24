@@ -981,9 +981,10 @@ pub unsafe fn endpoint_reply(server: *mut ThreadControlBlock) -> Option<*mut Thr
 /// (`SYS_CAP_DELETE`, a revoke's `dealloc_revoked`, a move's source release,
 /// and a dying `CSpace`'s release of its slots), after the slot was uncounted.
 /// The release whose decrement made the count zero reads it here, after its
-/// own decrement, so it drains the queues ([`release_waiters`]); a later one
-/// finds them empty, since a call or receive that reads zero under `ep.lock`
-/// queues nothing.
+/// own decrement, so it drains the queues ([`release_waiters`]). A later one
+/// drains, alongside it, the waiters its batches have not yet released, if
+/// any: a call or receive that reads zero under `ep.lock` queues nothing, so
+/// every release returns with both queues empty.
 ///
 /// # Safety
 /// `obj` must carry a reference the caller owns. Call with no

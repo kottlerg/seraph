@@ -603,10 +603,11 @@ const STAY_SPINNERS: usize = 2;
 /// timer ticks of 1 ms.
 const STAY_WINDOW_MS: u64 = 3;
 
-/// Pages of the first `CSpace` pool whose delete keeps the case's CPU in the
-/// kernel; an attempt whose delete ends before the observer's poll sizes the
-/// next pool from the rate that delete measured ([`next_stay_pages`]).
-const STAY_FIRST_PAGES: u64 = 4096;
+/// Pages of the probe pool ([`stay_probe`]) whose delete measures how fast the
+/// case's CPU clears a pool; the first attempt's pool is sized from that rate,
+/// and an attempt whose delete still ends before the observer's poll sizes the
+/// next pool from the rate it measured ([`next_stay_pages`]).
+const STAY_PROBE_PAGES: u64 = 4096;
 
 /// Milliseconds a pool's delete is sized to last: the observer's window and the
 /// poll's margin, with 2 ms to spare, so an observer that is running when the
@@ -701,11 +702,14 @@ extern "C" fn stay_observer_entry(queue: u64) -> !
 /// as [`leftover_posts_reach_a_busy_cpu`] does, then deletes a large `CSpace`
 /// pool, whose clear keeps its CPU in the kernel; an observer on the next CPU
 /// spins through several ticks and polls the leftover queue while that delete
-/// still runs. A delete that ends first is retried with a pool sized from the
-/// rate it measured to outlast the window; memory that cannot fund that pool
-/// fails the case, as do [`STAY_ATTEMPTS`] attempts none of whose observers
-/// polled inside its delete. The case logs the attempt that concluded. Fails if
-/// the leftovers wait for the CPU that left them, or for an idle CPU.
+/// still runs. A probe delete that no observer watches first measures the rate
+/// at which the CPU clears a pool and warms the path, so that each counted
+/// attempt's pool is sized to outlast the window; a delete that still ends
+/// first is retried with a pool sized from the rate it measured. Memory that
+/// cannot fund that pool fails the case, as do [`STAY_ATTEMPTS`] attempts none
+/// of whose observers polled inside its delete. The case logs the attempt that
+/// concluded. Fails if the leftovers wait for the CPU that left them, or for an
+/// idle CPU.
 pub fn leftover_posts_while_their_cpu_stays_in_the_kernel(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -758,7 +762,9 @@ fn stay_attempts(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> T
         .checked_sub(STAY_HEADROOM_PAGES + 1)
         .filter(|&pages| pages > 0)
         .ok_or(STAY_NO_MEMORY)?;
-    let mut pages = STAY_FIRST_PAGES.min(fundable);
+    let probe = STAY_PROBE_PAGES.min(fundable);
+    let took = stay_probe(ctx, probe)?;
+    let mut pages = next_stay_pages(probe, took, target, 1).min(fundable);
     for attempt in 1..=STAY_ATTEMPTS
     {
         let (outcome, took) = stay_attempt(ctx, (first, rest), spinners, per_ms, pages)?;
@@ -777,7 +783,7 @@ fn stay_attempts(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> T
             }
             None =>
             {
-                let next = next_stay_pages(pages, took, target);
+                let next = next_stay_pages(pages, took, target, 2);
                 if next > pages && pages >= fundable
                 {
                     return Err(STAY_NO_MEMORY);
@@ -800,19 +806,41 @@ const STAY_INCONCLUSIVE: &str =
 /// window: a setup failure, not an inconclusive attempt.
 const STAY_NO_MEMORY: &str = "stay: memory cannot fund a pool whose delete outlasts the window";
 
-/// The pool of the attempt after one of `pages` whose delete took `took`
-/// cycles: grown so that its delete, at the rate just measured, takes at least
-/// `target` cycles, by at least twice and at most [`STAY_MAX_GROWTH`] times;
-/// unchanged when the delete already took that long, since the attempt was then
-/// inconclusive only because its observer ran late.
-fn next_stay_pages(pages: u64, took: u64, target: u64) -> u64
+/// The pool of the attempt after a delete of `pages` that took `took` cycles:
+/// grown so that its delete, at the rate just measured, takes at least
+/// `target` cycles, by at least `least` and at most [`STAY_MAX_GROWTH`] times;
+/// unchanged when the delete already took that long, since an attempt was then
+/// inconclusive only because its observer ran late. After the probe `least` is
+/// 1; after an inconclusive attempt it is 2, so a rate the probe overstated
+/// still grows the pool.
+fn next_stay_pages(pages: u64, took: u64, target: u64, least: u64) -> u64
 {
     if took >= target
     {
         return pages;
     }
-    let growth = target.div_ceil(took.max(1)).clamp(2, STAY_MAX_GROWTH);
+    let growth = target.div_ceil(took.max(1)).clamp(least, STAY_MAX_GROWTH);
     pages.saturating_mul(growth)
+}
+
+/// Donate `pages` to a fresh `CSpace` pool and delete it, with no observer
+/// and no spinner, on the case's pinned CPU; returns the cycles the delete took.
+/// It measures the rate [`stay_attempts`] sizes its first pool from and warms
+/// the delete path, so that no counted attempt is spent on either.
+fn stay_probe(ctx: &TestContext, pages: u64) -> Result<u64, &'static str>
+{
+    let pool =
+        cap_create_cspace(ctx.memory_base, 0, 1).map_err(|_| "stay: cap_create_cspace failed")?;
+    if cap_create_cspace(ctx.memory_base, pool, pages).is_err()
+    {
+        cap_delete(pool).ok();
+        return Err("stay: probe donation failed");
+    }
+    let entered = cycles();
+    let deleted = cap_delete(pool);
+    let took = cycles().wrapping_sub(entered);
+    deleted.map_err(|_| "stay: probe delete failed")?;
+    Ok(took)
 }
 
 /// One attempt with a pool of `pages`: `Some(posted)` when the observer's

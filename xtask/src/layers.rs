@@ -590,8 +590,7 @@ pub fn install_row(path: &str) -> Option<Install>
 /// or not; it is called for a recipe alone.
 ///
 /// # Errors
-/// When no install row holds `path`, or a recipe cannot be read or is no
-/// UTF-8 text.
+/// When no install row holds `path`, or a recipe cannot be read.
 pub fn installed(path: &str, read: impl FnOnce() -> Result<Vec<u8>>) -> Result<Install>
 {
     let Some(row) = install_row(path)
@@ -612,8 +611,11 @@ pub fn installed(path: &str, read: impl FnOnce() -> Result<Vec<u8>>) -> Result<I
     }
     let object = read().with_context(|| format!("reading the recipe {path}"))?;
     let body = crate::signing::body_of(&object).with_context(|| format!("reading {path}"))?;
-    let text = std::str::from_utf8(body).with_context(|| format!("{path} is not UTF-8"))?;
-    let named = recipe(text);
+    // A recipe that is not UTF-8 (a tampered one, which the `signing` case
+    // boots on purpose for svcmgr to refuse) is judged by the paths its
+    // decodable text names: a byte that does not decode names no path.
+    let text = String::from_utf8_lossy(body);
+    let named = recipe(&text);
     Ok(Install {
         layer: row.layer.max(named.layer),
         role: if row.role == Role::Test || named.role == Role::Test
@@ -1261,6 +1263,13 @@ mod tests
         })
         .unwrap();
         assert_eq!((staged.layer, staged.role), (programs, test));
+        // A recipe that is not UTF-8 (the `signing` case's tampered one) is
+        // judged by the paths its decodable text names, not refused.
+        let tampered = installed("config/svcmgr/services/timed.svc", || {
+            Ok(b"binary = /services/timed\n\xff\nargv = timed /programs/shell\n".to_vec())
+        })
+        .unwrap();
+        assert_eq!((tampered.layer, tampered.role), (programs, system));
     }
 
     // Defect caught: an image kind holding what it may not: a test feature on

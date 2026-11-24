@@ -702,6 +702,12 @@ mod tests
         let dir = scratch("substituted");
         let (esp, root, image) = fixture(&dir);
         put(&esp, "EFI/seraph/kernel", b"\x7fELF tampered kernel");
+        // The `signing` case's tampered recipe: a body byte that is no UTF-8.
+        put(
+            &root,
+            "config/svcmgr/services/timed.svc",
+            b"binary = /services/timed\n\xff\n",
+        );
         pack(&image, &esp, &root, &dir.join("data"));
         let work = dir.join("work");
         check(&image, None, EspCheck::Copies, Image::Harness, &dir, &work).unwrap_err();

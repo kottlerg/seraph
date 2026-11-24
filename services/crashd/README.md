@@ -102,19 +102,18 @@ replies ([docs/operation.md](docs/operation.md) § Hold).
 ## Testing
 
 The `crashme` fixture faults on purpose in both kinds, on its main thread and on a spawned one
-([programs/crashme/README.md](../../programs/crashme/README.md)); the usertest boot runs it, and
-`cargo xtask run --crash-reports` checks the blocks in that boot's log
+([services/fixtures/crashme/README.md](../fixtures/crashme/README.md)); the usertest boot runs it,
+and `cargo xtask run --crash-reports` checks the blocks in that boot's log
 ([docs/testing.md](../../docs/testing.md) § Crash reports). That boot stages a crashd recipe whose
 `CORE_DUMP` names crashme, and the fixture's tester checks the core each faulting mode leaves in
-`/crash`. It also sets a stall of 3000 ms, and the tester has the fixture write a page while
-memory is critical, once resumed after the hold and once declined when the stall passes. The
-boot's usertest recipe seeds `crashd.core` to the tester, which asks for a live core of the
-fixture running and checks the fixture ran on unchanged and the core holds its threads and a page
-it marked, then asks for one of a fixture that declared itself on the core path and checks the
-refusal released the capture.
-svctest's `crash_endpoint` phase drives
-procmgr's side, registration, handover, and take-back, and the thread list and crash badges an
-attach returns, with svctest as the crash service.
+`/crash`. It also sets a stall of 3000 ms, and the tester has the fixture write a page while memory
+is critical, once resumed after the hold and once declined when the stall passes. The boot's
+usertest recipe seeds `crashd.core` to the tester, which asks for a live core of the fixture running
+and checks the fixture ran on unchanged and the core holds its threads and a page it marked, then
+asks for one of a fixture that declared itself on the core path and checks the refusal released the
+capture. svctest's `crash_endpoint` phase drives procmgr's side, registration, handover, and
+take-back, and the thread list and crash badges an attach returns, with svctest as the crash
+service.
 
 ---
 

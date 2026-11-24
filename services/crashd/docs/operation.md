@@ -204,13 +204,13 @@ serves nothing while it dumps, past its stall: the dump's line is `not written: 
 
 ## Core Dump
 
-`CORE_DUMP` in crashd's environment, which its recipe's `env` key sets, names the processes
-crashd writes a core of. `no`, the recipe's value, or no entry, writes none. Otherwise the value is
-a comma-separated list of names, each matched against a process's name, the first string of its
-argv, or that name's last path component, so `crashme` names a process started as
-`/programs/crashme`. A process with an empty name is never named. crashd logs the setting at
-startup, `core dumps off` or `core dumps for <list>`; a list holding an empty name is logged as a
-warning and writes no core. The usertest boot stages a recipe that names `crashme`
+`CORE_DUMP` in crashd's environment, which its recipe's `env` key sets, names the processes crashd
+writes a core of. `no`, the recipe's value, or no entry, writes none. Otherwise the value is a
+comma-separated list of names, each matched against a process's name, the first string of its argv,
+or that name's last path component, so `crashme` names a process started as
+`/tests/fixtures/programs/crashme`. A process with an empty name is never named. crashd logs the
+setting at startup, `core dumps off` or `core dumps for <list>`; a list holding an empty name is
+logged as a warning and writes no core. The usertest boot stages a recipe that names `crashme`
 ([docs/testing.md](../../../docs/testing.md) § Crash reports).
 
 A dump follows the block when the report attached and read the process within its bound, its

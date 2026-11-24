@@ -1,13 +1,13 @@
-# /tests/debug-echo — the debug port's transport fixture.
+# /tests/fixtures/debug-echo — the debug port's transport fixture.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # the `debug-port` case stages it into /config/svcmgr/services/ for
 # one boot with `--debug-port`, which attaches the virtio-console device
-# devmgr binds as the debug port. See services/debug-echo/README.md.
+# devmgr binds as the debug port. See services/fixtures/debug-echo/README.md.
 #
 # seed = devmgr.class.debug-port is the debug-port class SEND it sends
 # QUERY_DEVICE on. It invokes no shutdown: the host test kills QEMU.
-binary    = /tests/debug-echo
+binary    = /tests/fixtures/debug-echo
 argv      = debug-echo
 restart   = never
 critical  = no

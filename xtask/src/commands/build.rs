@@ -42,10 +42,11 @@ enum BuildProfile
 
 /// Where the built binary is installed in the sysroot.
 ///
-/// Mirrors the repo's source-tree shape: anything under `services/<x>/`
-/// installs under `/services/`, anything under `programs/<x>/` under
-/// `/programs/`. Test harnesses and per-program testers live under their
-/// own Seraph-native trees rather than borrowing FHS spelling.
+/// Mirrors the repo's source-tree shape: a service under `services/<x>/`
+/// installs under `/services/`, a program under `programs/<x>/` under
+/// `/programs/`. The test features (harnesses, per-program testers, and the
+/// fixtures of `services/fixtures/<x>/`) install under `/tests/`, their own
+/// Seraph-native tree rather than borrowed FHS spelling.
 #[derive(Clone, Copy, Debug)]
 enum InstallDest
 {
@@ -74,15 +75,14 @@ enum InstallDest
     /// [`Self::ServicesDrivers`] — vfsd is the sole spawner of fs
     /// drivers and can be confined to `/services/fs/`.
     ServicesFs,
-    /// Installed under `sysroot/programs/<install_name>` — userspace
-    /// utilities and test programs sourced from `programs/<x>/`. Loaded
-    /// by procmgr from the root partition via VFS at runtime.
+    /// Installed under `sysroot/programs/<install_name>` — the userspace
+    /// programs sourced from `programs/<x>/`. Loaded by procmgr from the
+    /// root partition via VFS at runtime.
     Programs,
     /// Installed under `sysroot/tests/<install_name>` — the test
     /// harnesses (kernel-surface `ktest`, service-surface `svctest`,
-    /// programs-surface orchestrator `usertest`), the `crasher`
-    /// restart-path fixture, the `debug-echo` debug-port fixture, and the
-    /// `hotplug-check` hotplug fixture.
+    /// programs-surface orchestrator `usertest`) and the `ubench`
+    /// benchmark suite.
     /// svcmgr does not scan this path; harness recipes live in
     /// `rootfs/config/svcmgr/tests/`. See
     /// docs/testing.md § Sysroot layout.
@@ -91,6 +91,16 @@ enum InstallDest
     /// per-program tester binaries discovered by the `usertest`
     /// orchestrator. See docs/testing.md § Sysroot layout.
     TestsPrograms,
+    /// Installed under `sysroot/tests/fixtures/<install_name>` — the test
+    /// fixtures that run as services, sourced from
+    /// `services/fixtures/<x>/` (`crasher`, `memhog`, `stopsrc`,
+    /// `debug-echo`, `hotplug-check`). See docs/testing.md § Sysroot layout.
+    TestsFixtures,
+    /// Installed under `sysroot/tests/fixtures/programs/<install_name>` —
+    /// the test fixtures that run as programs, sourced from
+    /// `services/fixtures/<x>/`: the `programs` component keeps their
+    /// program signing role. See docs/testing.md § Sysroot layout.
+    TestsFixturesPrograms,
     /// Installed under `sysroot/tests/drivers/<install_name>` — test-only
     /// drivers no drivers-directory pass of the boot lists, which devmgr
     /// binds only on svctest's `BIND_DRIVERS` with a cap on that directory.
@@ -296,21 +306,21 @@ const SPECS: &[Spec] = &[
         name: "crasher",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Tests,
+        dest: InstallDest::TestsFixtures,
         arch_only: None,
     },
     Spec {
         name: "memhog",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Tests,
+        dest: InstallDest::TestsFixtures,
         arch_only: None,
     },
     Spec {
         name: "stopsrc",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Tests,
+        dest: InstallDest::TestsFixtures,
         arch_only: None,
     },
     // The GDB stub: installed on every image, started only on a boot that
@@ -328,7 +338,7 @@ const SPECS: &[Spec] = &[
         name: "debug-echo",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Tests,
+        dest: InstallDest::TestsFixtures,
         arch_only: None,
     },
     // The hotplug fixture the `hotplug` case stages: it waits for the `test-dma`
@@ -338,7 +348,7 @@ const SPECS: &[Spec] = &[
         name: "hotplug-check",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Tests,
+        dest: InstallDest::TestsFixtures,
         arch_only: None,
     },
     Spec {
@@ -478,49 +488,49 @@ const SPECS: &[Spec] = &[
         name: "fsbench",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
         name: "stackoverflow",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
         name: "relrofault",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
         name: "capexhaust",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
         name: "pipefault",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
         name: "demandpaged",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
         name: "stdiotest",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
@@ -534,7 +544,7 @@ const SPECS: &[Spec] = &[
         name: "threadstack",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
@@ -548,7 +558,7 @@ const SPECS: &[Spec] = &[
         name: "deadline",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
@@ -562,7 +572,7 @@ const SPECS: &[Spec] = &[
         name: "debugger",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
@@ -576,7 +586,7 @@ const SPECS: &[Spec] = &[
         name: "crashme",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
@@ -590,7 +600,7 @@ const SPECS: &[Spec] = &[
         name: "pipestress",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
@@ -604,7 +614,7 @@ const SPECS: &[Spec] = &[
         name: "threadchurn",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
@@ -1312,6 +1322,8 @@ fn install_relative(spec: &Spec) -> PathBuf
         InstallDest::Programs => &["programs"],
         InstallDest::Tests => &["tests"],
         InstallDest::TestsPrograms => &["tests", "programs"],
+        InstallDest::TestsFixtures => &["tests", "fixtures"],
+        InstallDest::TestsFixturesPrograms => &["tests", "fixtures", "programs"],
         InstallDest::TestsDrivers => &["tests", "drivers"],
     };
     dir.iter().collect::<PathBuf>().join(spec.install_name())

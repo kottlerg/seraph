@@ -5,13 +5,16 @@
 
 //! Per-program tester for `/programs/shell` (#112). Drives the shell over piped
 //! stdin/stdout and asserts its built-ins, an external spawn, and stdin
-//! forwarding to a child. See [docs/testing.md](../../../docs/testing.md).
+//! forwarding to a child. See [docs/testing.md](../../../../docs/testing.md).
 //!
 //! Two invocations are used because the shell forwards subsequent input lines
 //! to a running external child: any command after an external one would be
 //! consumed by that child's stdin. Each invocation therefore puts its external
 //! command last, before EOF — (A) the built-ins plus `/programs/hello`, and
-//! (B) `/programs/stdiotest` fed one line to prove stdin forwarding.
+//! (B) `/tests/fixtures/programs/stdiotest`, a command given as a path, fed one
+//! line to prove stdin forwarding. (C) runs no program: a missing path, a
+//! missing bare name and a file that is no program each fail with an error
+//! line, and the shell reads on.
 //!
 //! There is no terminal here, so nothing echoes the typed commands; the shell's
 //! own `$ ` prompt and command output are the only bytes on its stdout. The
@@ -29,14 +32,25 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 /// Drive a fresh `/programs/shell` with `script` on stdin (closed afterwards,
-/// so the shell exits on EOF). Returns its captured stdout and clean-exit flag.
-fn run_shell(script: &str) -> (String, bool)
+/// so the shell exits on EOF). Returns its captured stdout and stderr and its
+/// clean-exit flag.
+fn run_shell(script: &str) -> (String, String, bool)
 {
     let mut child = Command::new("/programs/shell")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn /programs/shell");
+
+    // Drained on its own thread, so a full stderr pipe cannot stall the
+    // shell while stdout is read.
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let errors = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).expect("read shell stderr");
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
 
     {
         let mut stdin = child.stdin.take().expect("piped stdin");
@@ -47,9 +61,11 @@ fn run_shell(script: &str) -> (String, bool)
     let mut bytes = Vec::new();
     stdout.read_to_end(&mut bytes).expect("read shell stdout");
     let status = child.wait().expect("wait /programs/shell");
+    let errors = errors.join().expect("join the stderr reader");
 
     (
         String::from_utf8_lossy(&bytes).into_owned(),
+        errors,
         status.success(),
     )
 }
@@ -88,7 +104,7 @@ fn main()
                     ls\n\
                     cat test.txt\n\
                     hello\n";
-    let (out_a, ok_a) = run_shell(script_a);
+    let (out_a, _, ok_a) = run_shell(script_a);
 
     if !out_a.contains("$ ")
     {
@@ -165,9 +181,10 @@ fn main()
     }
 
     // Invocation B: an external child that reads stdin, last, to prove the
-    // shell forwards stdin to it. stdiotest uppercases the line it reads.
-    let script_b = "stdiotest\nhello-stdio\n";
-    let (out_b, ok_b) = run_shell(script_b);
+    // shell forwards stdin to it, named by its path, which proves a command
+    // given as a path runs. stdiotest uppercases the line it reads.
+    let script_b = "/tests/fixtures/programs/stdiotest\nhello-stdio\n";
+    let (out_b, _, ok_b) = run_shell(script_b);
 
     if !out_b.contains("shouted: HELLO-STDIO")
     {
@@ -185,5 +202,58 @@ fn main()
         fail("shell (invocation B) exited non-zero", &out_b);
     }
 
+    commands_that_name_no_program();
+
     println!("[shell-tester] PASS");
+}
+
+/// Invocation C: a command given as a path that names no file fails as a
+/// bare name naming no program does, with `command not found`; one that
+/// names a file that is no program fails with an error line naming it. After
+/// each the shell reads its next command, which the `echo` lines prove.
+fn commands_that_name_no_program()
+{
+    let script_c = "/tests/fixtures/programs/absent\n\
+                    echo after-missing-path\n\
+                    absent\n\
+                    echo after-missing-name\n\
+                    /data/test.txt\n\
+                    echo after-not-a-program\n";
+    let (out_c, err_c, ok_c) = run_shell(script_c);
+    let both = format!("stdout {out_c:?} stderr {err_c:?}");
+
+    for line in [
+        "after-missing-path",
+        "after-missing-name",
+        "after-not-a-program",
+    ]
+    {
+        if !out_c.lines().any(|l| strip_prompts(l) == line)
+        {
+            fail(
+                &format!("the shell did not read on to `echo {line}`"),
+                &both,
+            );
+        }
+    }
+    for line in [
+        "shell: command not found: absent",
+        "shell: command not found: /tests/fixtures/programs/absent",
+    ]
+    {
+        if !err_c.lines().any(|l| l.trim_end() == line)
+        {
+            fail(&format!("error line {line:?} missing"), &both);
+        }
+    }
+    if !err_c
+        .lines()
+        .any(|l| l.starts_with("shell: ") && l.contains("/data/test.txt"))
+    {
+        fail("no error line for a file that is no program", &both);
+    }
+    if !ok_c
+    {
+        fail("shell (invocation C) exited non-zero", &both);
+    }
 }

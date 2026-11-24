@@ -510,7 +510,7 @@ read from the recipe, never from the source, so a source cannot claim the servic
 its own stop. `program` is the one value; any other is a parser error. sessiond's recipe sets it,
 the default image's program-class source
 ([services/sessiond/README.md](../../sessiond/README.md)); the `stopsrc` test fixture's does
-too ([services/stopsrc/README.md](../../stopsrc/README.md)).
+too ([services/fixtures/stopsrc/README.md](../../fixtures/stopsrc/README.md)).
 
 The key is a core role, so the [`oom_stop`](#oom_stop) rule never stops a source and
 `LIST_CANDIDATES` never lists one. The parser rejects it on a recipe without `provides`, since a
@@ -526,7 +526,7 @@ instance ends, procmgr destroys what is left of its subtree, so no process the s
 outlives it, a candidate it listed is gone with it, and its next instance starts with none.
 
 ```
-binary      = /tests/stopsrc
+binary      = /tests/fixtures/stopsrc
 restart     = always
 critical    = no
 namespace   = universal
@@ -564,7 +564,7 @@ an `on_failure` or `always` service restarts while its budget lasts
 ([Restart Protocol](restart-protocol.md)).
 
 ```
-binary    = /tests/crasher
+binary    = /tests/fixtures/crasher
 argv      = crasher worker-fault
 restart   = on_failure
 critical  = no

@@ -3,7 +3,8 @@
 Minimal interactive shell: the leader of an operator session that sessiond opens for
 [`programs/terminal`](../terminal/README.md).
 It reads `\n`-terminated lines from stdin, runs a small set of built-ins, and
-otherwise spawns `/programs/<name>` as an external command. Pure `std` — no
+otherwise spawns an external command: `/programs/<name>` for a bare name, the
+file a path names for a command holding a `/`. Pure `std` — no
 Seraph cap awareness; stdin/stdout/stderr are the terminal's stdio pipes and
 children are spawned via `std::process::Command`. This is v0.0.1 ([#112]),
 replacing the `echosh` placeholder; the feature surface grows in later releases.
@@ -20,7 +21,7 @@ shell/
 ├── README.md
 ├── src/main.rs                 # REPL, built-ins, external-command relay
 ├── path/                       # `shell-path` crate: pure host-tested lexical
-│                               # path resolution
+│                               # path and command resolution
 └── tester/                     # `shell-tester` crate: per-program tester
                                 # (docs/testing.md § Per-program tester protocol)
 ```
@@ -43,10 +44,15 @@ shell/
   against it lexically (collapsing `.`/`..`) into an absolute path before calling
   `std` — so `cd`, `pwd`, `ls`, and `cat` are consistent. `cd` also keeps the
   process cwd cap (which external children inherit) in lockstep.
-- **External commands**: a bare name `<cmd>` resolves to `/programs/<cmd>`,
-  spawned with piped stdin/stdout/stderr. The child's stdout/stderr are relayed
-  to the shell's, and subsequent input lines are forwarded to the child's stdin
-  until it exits. An unknown command reports `command not found`.
+- **External commands**: a bare name `<cmd>` resolves to `/programs/<cmd>`; a
+  command holding a `/` is a path, resolved against the working directory as
+  every path argument is, and runs the file it names. Either is spawned with
+  piped stdin/stdout/stderr. The child's stdout/stderr are relayed to the
+  shell's, and subsequent input lines are forwarded to the child's stdin until it
+  exits. A command that names no file reports `command not found`; one whose
+  spawn fails otherwise reports the error. Whether a file may run is procmgr's
+  decision under the signing policy ([docs/signing.md](../../docs/signing.md));
+  the shell adds no rule of its own.
 - **Working directory**: starts at the namespace root (`/`).
 
 ## Architecture
@@ -95,9 +101,11 @@ capabilities of its own.
 
 Per-program tester at `tester/` (crate `shell-tester`), installed to
 `/tests/programs/shell` and run by the `usertest` orchestrator. It drives the
-shell over piped stdio across two invocations — built-ins plus an external
-`/programs/hello` spawn, and an `/programs/stdiotest` run fed one line to prove
-stdin forwarding — and exits non-zero on any mismatch. The terminal interactive
+shell over piped stdio across three invocations — built-ins plus an external
+`/programs/hello` spawn; `/tests/fixtures/programs/stdiotest`, a command given as
+a path, fed one line to prove stdin forwarding; and a missing path, a missing
+bare name and a file that is no program, each of which fails with an error line
+while the shell reads on — and exits non-zero on any mismatch. The terminal interactive
 path (the `$ ` prompt rendered via the terminal) is covered by
 `cargo xtask test terminal`. See [docs/testing.md](../../docs/testing.md).
 
@@ -119,4 +127,4 @@ path (the `$ ` prompt rendered via the terminal) is covered by
 ## Summarized By
 
 [Session Supervision](../../docs/session-supervision.md),
-[programs/stdiotest/README.md](../stdiotest/README.md)
+[services/fixtures/stdiotest/README.md](../../services/fixtures/stdiotest/README.md)

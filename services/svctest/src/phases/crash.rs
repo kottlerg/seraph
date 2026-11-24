@@ -163,10 +163,10 @@ fn stopped_regs(thread: u64) -> Option<[u8; REGS_BYTES]>
     (held != syscall_abi::THREAD_REGS_SYSCALL).then_some(file)
 }
 
-/// Spawn `/programs/crashme <mode>`.
+/// Spawn `/tests/fixtures/programs/crashme <mode>`.
 fn crashme(mode: &str) -> std::process::Child
 {
-    Command::new("/programs/crashme")
+    Command::new("/tests/fixtures/programs/crashme")
         .arg(mode)
         .stdout(Stdio::null())
         .spawn()
@@ -462,7 +462,7 @@ fn debugger_session(authority: u64, process: u64, threads: &[u64])
 {
     assert_eq!(
         listed_name(authority, process).as_deref(),
-        Some(&b"/programs/crashme"[..]),
+        Some(&b"/tests/fixtures/programs/crashme"[..]),
         "crash_endpoint: LIST_PROCESSES names the child by its argv[0]"
     );
     let parked = *threads
@@ -560,7 +560,7 @@ fn debugger_tag_check(authority: u64)
 {
     use std::io::{BufRead, BufReader, Write};
 
-    let mut child = Command::new("/programs/crashme")
+    let mut child = Command::new("/tests/fixtures/programs/crashme")
         .arg("debugger-tag")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -604,7 +604,7 @@ fn debugger_tag_check(authority: u64)
         "crash_endpoint: a registration with a gone debugger's binding: {line}"
     );
 
-    let process = badge_named(authority, b"/programs/crashme")
+    let process = badge_named(authority, b"/tests/fixtures/programs/crashme")
         .expect("crash_endpoint: LIST_PROCESSES lists crashme debugger-tag");
     let debugger = Registrant::spawn();
     let reply = call(

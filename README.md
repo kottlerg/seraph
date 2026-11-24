@@ -32,7 +32,7 @@ see there for the authoritative statement.
 | [`abi/`](abi/README.md) | Stable cross-boundary contracts |
 | [`core/`](core/README.md) | Core OS: bootloader, kernel, and the kernel-validation harness (ktest) |
 | [`docs/`](docs/) | Architecture and design documentation |
-| [`programs/`](programs/README.md) | General-purpose userspace applications, utilities, and the test fixtures the harnesses spawn |
+| [`programs/`](programs/README.md) | General-purpose userspace applications and utilities, and the programs-surface test orchestrator |
 | [`rootfs/`](rootfs/README.md) | System files installed into the sysroot during builds (config files, etc) |
 | [`runtime/`](runtime/README.md) | Language runtime layers consumed by userspace (ruststd; libc is design intent, not yet implemented) |
 | [`services/`](services/README.md) | Userspace OS processes: managers, drivers, filesystems, daemons |

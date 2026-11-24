@@ -113,7 +113,7 @@ fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
 }
 
 /// The boot-fault fixture's token, which an instance that finds it removes
-/// before it dies (`services/crasher/src/main.rs` `BOOT_FAULT_TOKEN`, there
+/// before it dies (`services/fixtures/crasher/src/main.rs` `BOOT_FAULT_TOKEN`, there
 /// named in the fixture's own namespace).
 const BOOT_FAULT_TOKEN: &str = "/data/crasher-boot/die-early";
 
@@ -283,7 +283,7 @@ pub(super) const SESSIOND_RECIPE: &str = "/config/svcmgr/services/sessiond.svc";
 /// The name procmgr lists `stopsrc`'s job under: the first word of its argv,
 /// the path the fixture creates it from. The fixture's own instance, which
 /// svcmgr creates with no argv, is listed with an empty name.
-const STOPSRC_PATH: &[u8] = b"/tests/stopsrc";
+const STOPSRC_PATH: &[u8] = b"/tests/fixtures/stopsrc";
 
 /// The pages of the job [`check_source_contained`] has `stopsrc` start: one,
 /// since only its process is looked for.

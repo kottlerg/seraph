@@ -45,6 +45,7 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::PAGE_SIZE;
 
 use crate::bootstrap::Caps;
+use crate::phases::heap_commit::commit_fitting;
 use crate::runner::Phase;
 
 /// The phase's name, which its failure messages carry.
@@ -209,34 +210,6 @@ fn admission() -> (u64, u64)
         }
     }
     panic!("{PHASE}: a commitment past the allowance admitted in each of {PAST_ATTEMPTS} attempts");
-}
-
-/// The most pages a committed region may have for its commitment to take at
-/// most `budget` of the pages a commitment may still promise: its data pages,
-/// its page-table reservation and its metadata bound together
-/// (`free_pool::commit::grow_need`; services/memmgr/docs/memory-pool.md
-/// § Commit). The two bounds grow with the region, so on a large pool they
-/// outgrow any fixed margin.
-fn commit_fitting(budget: u64) -> u64
-{
-    let takes =
-        |pages: u64| free_pool::commit::grow_need(0, pages.saturating_mul(PAGE_SIZE)).promised();
-    // A commitment takes at least its pages, so the answer is at most
-    // `budget`; `takes` grows with the pages, so halve the range between.
-    let (mut lo, mut hi) = (0u64, budget);
-    while lo < hi
-    {
-        let mid = lo.saturating_add(hi.saturating_sub(lo).div_ceil(2));
-        if takes(mid) <= budget
-        {
-            lo = mid;
-        }
-        else
-        {
-            hi = mid.saturating_sub(1);
-        }
-    }
-    lo
 }
 
 /// Register a committed region of `pages` pages over a range reserved for

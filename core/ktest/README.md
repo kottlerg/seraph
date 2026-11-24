@@ -48,6 +48,8 @@ core/ktest/
     │                       # code-stub install
     ├── cpu_sample.rs       # The CPUs a per-CPU case checks past 16 CPUs
     ├── tally.rs            # Failure tallies and receive-guard diagnostics for stress cells
+    ├── latency.rs          # Interrupt-latency rig: a call probed by TLB shootdowns from
+    │                       # another CPU
     ├── arch/               # Arch-dispatch surface (see Test structure)
     │   ├── mod.rs          # Selects the active arch module by target_arch
     │   ├── x86_64/         # x86-64 entry points, constants, I/O ports, COM1 serial,
@@ -124,6 +126,7 @@ respectively. Files are grouped by kernel subsystem, mirroring the kernel's own 
 | File | Syscalls / behaviour exercised |
 |---|---|
 | `cap.rs` | `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (incl. the `cap_insert` explicit-slot form), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_ENDPOINT_BADGE` (the badge read back, and the refusals: no Receive, another endpoint, a non-endpoint cap, a deleted handle), `SYS_ENDPOINT_IDENTIFY` (a match through badged, derived and copied caps, and through a key carrying Identify alone; no match for another endpoint or a non-endpoint cap; the refusals: a key without Identify, Receive and Grant included, a key whose `RIGHTS_ALL` derive, badged derive or copy does not regain it, a non-endpoint key, a deleted handle), `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, and the bounds of handle resolution (`lookup_bounds`) |
+| `cap_batches.rs` | The derivation-lock batches of `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`'s reparent, `SYS_CAP_MOVE`, `SYS_SCHED_SPLIT` and a dying `CSpace`'s drain, each over a child list of 16,384 copies: a TLB shootdown of the calling CPU, issued from another CPU while the call runs, is acknowledged before the call returns and within a bound, on the latency rig of `src/latency.rs` that the page-pool latency cases of `retype.rs` share ([core/kernel/docs/capability-internals.md § Global Derivation Lock](../kernel/docs/capability-internals.md#global-derivation-lock)) |
 | `aspace_hold.rs` | `SYS_ASPACE_HOLD` and `SYS_ASPACE_RELEASE` on spaces holding no thread: a non-address-space cap, the null handle and a stale handle are `InvalidCapability`; a cap without `Control` is `InsufficientRights` for both calls; release of an unheld space and hold of a held one are `InvalidState`, and the pair repeats; deleting a held, empty space succeeds and returns its memory |
 | `dispatch.rs` | Syscall dispatch: the first and the last number below `SYSCALL_NR_BOUND` reach their handlers, `SYS_SYSTEM_INFO(KernelVersion)` reaches its own, and a number at or past the bound (the bound, the next number, one whose low 32 bits name a syscall, the sign bit, `u64::MAX`) returns `UnknownSyscall` |
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, sole reference, type-specific fields); the `InitInfo` RAM Memory descriptors against their caps; the `Phys` gate on the physical base and on an address space's `Read` right |
@@ -355,8 +358,8 @@ event and memory polls of `integration::fault_kills_thread`,
 `retype::aspace_self_delete_stops_caller`; the teardown polls of
 `mm::memory_split_after_cspace_teardown`; the probe-wait bound and the worker's readiness, call
 and exit bounds of `retype::pool_seeding_takes_interrupts`,
-`retype::explicit_placement_takes_interrupts`, `retype::cspace_teardown_takes_interrupts` and
-`retype::aspace_teardown_takes_interrupts`; the
+`retype::explicit_placement_takes_interrupts`, `retype::cspace_teardown_takes_interrupts`,
+`retype::aspace_teardown_takes_interrupts` and the five `cap_batches` cases; the
 phase polls, the child's spin bound and the cleanup
 exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is stretched so its
 `cap_delete` does not race a still-running pinned child); the migration polls of

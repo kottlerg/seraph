@@ -36,21 +36,19 @@
 //! back; the source cap is never deleted (the parent Memory cap is shared
 //! across the suite). Each test cleans up only its own derived caps.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
     cap_create_thread, cap_delete, cap_info, cap_insert, mem_map, mem_unmap, mem_unmap_reclaim,
-    memory_merge, memory_split, system_info, thread_configure, thread_set_affinity, thread_sleep,
-    thread_start, thread_yield,
+    memory_merge, memory_split, thread_configure, thread_sleep, thread_start,
 };
 use syscall_abi::{
     CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_USED,
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, CAP_INFO_THREAD_STATE, EXIT_KILLED,
-    FAULT_LABEL, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_NTF_NOTIFY, SystemInfoType, THREAD_STATE_EXITED,
+    FAULT_LABEL, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_NTF_NOTIFY, THREAD_STATE_EXITED,
 };
 
+use crate::latency::{self, Call, Measured};
 use crate::{TestContext, TestResult};
 
 const TEST_VA_BASE: u64 = 0x0000_0001_4000_0000;
@@ -1489,15 +1487,12 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
 // slot, inside one syscall whose length the caller chooses; the kernel takes
 // interrupts between the batches of each
 // (core/kernel/docs/capability-internals.md § Storage: Hybrid Radix Directory,
-// § Donation Records and § Teardown). A probe pinned to `PROBE_CPU` unmaps a page of ktest's address
-// space in a loop, each unmap a synchronous TLB shootdown of `WORKER_CPU`,
-// where a worker makes the call. Every probe the call overlaps must be
-// acknowledged within `LATENCY_BOUND_US`, and a probe issued once the call
-// was under way must be acknowledged before the call returned (for the
-// seeding and the placement, which are short, before one of several calls
-// returned, as `SEED_ATTEMPTS` says). A kernel that masks interrupts for the
-// whole call fails both on the teardown, whose returns each walk the source's
-// page free list, and the second on the seeding and the placement.
+// § Donation Records and § Teardown). The `crate::latency` rig makes each
+// call on one CPU while it probes that CPU with TLB shootdowns from another.
+// A kernel that masks interrupts for the whole call fails the teardown cases,
+// whose returns each walk the source's page free list, on both of the rig's
+// checks, and the seeding and placement cases, which are short, on the
+// acknowledgement inside one of several calls.
 
 /// One-page holes the teardown cases leave on the source's page free list
 /// below every donation of the target: a teardown that returns each donation
@@ -1510,314 +1505,12 @@ const LAT_DONATIONS: u64 = 10_000;
 /// neighbour per hole, the donations, and a guard page above them that keeps
 /// their returns off the source's bump frontier.
 const LAT_SOURCE_PAGES: u64 = 2 * LAT_HOLES + LAT_DONATIONS + 1;
-/// Longest a probe that the measured call overlaps may wait for its
-/// acknowledgement, in microseconds (stretched by `scaled_bound`). A window
-/// between batches here costs at most one walk of `LAT_HOLES` nodes.
-const LATENCY_BOUND_US: u64 = 250_000;
-/// Bound on the whole measured call and on the worker's readiness, in
-/// microseconds (stretched by `scaled_bound`).
-const LAT_CALL_DEADLINE_US: u64 = 60_000_000;
-/// Conclusive calls of one kind the seeding and placement cases make, each
-/// into a fresh pool or `CSpace`, until a probe is acknowledged inside one. A
-/// seeding call lasts about a millisecond, and a placement a few, not much
-/// longer than one probe's scheduling delay on a contended host, so one call
-/// can see no probe land inside it with interrupts taken; a kernel that masks them for the whole call lets no probe
-/// land inside any.
-///
-/// A call is conclusive when the first probe issued inside it (at least the
-/// margin after its start and before its end) waited no longer than the whole
-/// call. A call is inconclusive, and does not count here, when no probe was
-/// issued inside it (the probe's CPU was off the host for the call) or when
-/// that probe outwaited the whole call (a CPU was off the host for longer than
-/// the call: a kernel that masks interrupts for the call holds a probe issued
-/// inside it for at most the rest of the call, less than the call's span).
-/// Only an acknowledgement inside a call passes the case, so an inconclusive
-/// call cannot hide a masked stretch: under a kernel that masks the whole
-/// call, the probe in flight is acknowledged only at the call's end, and the
-/// call either counts here, when that probe was issued inside it, or is
-/// inconclusive, when it was issued before; either way no call passes, and the
-/// case fails once `SEED_ATTEMPTS` calls were conclusive or
-/// [`SEED_ATTEMPT_LIMIT`] calls were made.
-const SEED_ATTEMPTS: u32 = 4;
-/// Calls of one kind the seeding and placement cases make at most, conclusive
-/// or not: the bound that fails the case when the host keeps every call
-/// inconclusive, or when a kernel that masks interrupts for the whole call
-/// leaves every call inconclusive.
-const SEED_ATTEMPT_LIMIT: u32 = 16;
-/// The probe's page (crate docs § Scratch VAs).
-const PROBE_VA: u64 = 0x1_6600_0000;
-const PROBE_CPU: u32 = 0;
-const WORKER_CPU: u32 = 1;
-
-/// The calls the worker makes: delete `LAT_ARG0`; create a `CSpace` or an
-/// address space from Memory cap `LAT_ARG0` with `LAT_ARG1` pages; or copy
-/// capability `LAT_ARG0` into `CSpace` `LAT_ARG1` at `LAT_PLACE_SLOT`.
-const LAT_OP_DELETE: u64 = 1;
-const LAT_OP_CREATE_CSPACE: u64 = 2;
-const LAT_OP_CREATE_ASPACE: u64 = 3;
-const LAT_OP_COPY_AT: u64 = 4;
 /// The explicit slot the placement case copies into, in a fresh `CSpace`:
 /// the pre-grow materialises every leaf through its own
 /// (`LAT_PLACE_SLOT / CSPACE_SLOTS_PER_PAGE + 1`, 9,363) and their directory
 /// pages, in 147 batches of the kernel's `MAX_GROW_LEAVES_PER_HOLD` (64)
 /// leaves.
 const LAT_PLACE_SLOT: u32 = 1 << 19;
-
-static LAT_OP: AtomicU64 = AtomicU64::new(0);
-static LAT_ARG0: AtomicU64 = AtomicU64::new(0);
-static LAT_ARG1: AtomicU64 = AtomicU64::new(0);
-/// The worker's shortest syscall round trip, in microseconds: how long its
-/// CPU runs with interrupts enabled between two syscalls.
-static LAT_GAP_US: AtomicU64 = AtomicU64::new(0);
-static LAT_READY: AtomicBool = AtomicBool::new(false);
-static LAT_GO: AtomicBool = AtomicBool::new(false);
-/// `ElapsedUs` just before and just after the measured call; 0 until set.
-static LAT_START: AtomicU64 = AtomicU64::new(0);
-static LAT_END: AtomicU64 = AtomicU64::new(0);
-/// The call's result: its return value, or `u64::MAX` on an error.
-static LAT_RESULT: AtomicU64 = AtomicU64::new(0);
-static mut LAT_STACK: crate::ChildStack = crate::ChildStack::ZERO;
-
-/// Worker entry: measure this CPU's syscall round trip, report ready, wait for
-/// the probe, then make the call `LAT_OP` names between two clock reads.
-extern "C" fn latency_worker(_arg: u64) -> !
-{
-    let mut gap = u64::MAX;
-    let mut prev = crate::elapsed_us();
-    for _ in 0..16
-    {
-        let now = crate::elapsed_us();
-        gap = gap.min(now.saturating_sub(prev));
-        prev = now;
-    }
-    LAT_GAP_US.store(gap, Ordering::Relaxed);
-    LAT_READY.store(true, Ordering::Release);
-    while !LAT_GO.load(Ordering::Acquire)
-    {
-        core::hint::spin_loop();
-    }
-    let (op, a0, a1) = (
-        LAT_OP.load(Ordering::Relaxed),
-        LAT_ARG0.load(Ordering::Relaxed),
-        LAT_ARG1.load(Ordering::Relaxed),
-    );
-    LAT_START.store(crate::elapsed_us(), Ordering::Release);
-    let result = match op
-    {
-        LAT_OP_DELETE => cap_delete(a0).map(|()| 0),
-        LAT_OP_CREATE_CSPACE => cap_create_cspace(a0, 0, a1),
-        LAT_OP_CREATE_ASPACE => cap_create_aspace(a0, 0, a1),
-        LAT_OP_COPY_AT => cap_insert(a0, a1, LAT_PLACE_SLOT, RIGHTS_NTF_NOTIFY),
-        _ => Err(0),
-    };
-    let end = crate::elapsed_us();
-    LAT_RESULT.store(result.unwrap_or(u64::MAX), Ordering::Relaxed);
-    LAT_END.store(end, Ordering::Release);
-    syscall::thread_exit()
-}
-
-/// What the probe saw of one measured call.
-struct Measured
-{
-    /// The call's duration.
-    span_us: u64,
-    /// The longest acknowledgement of a probe the call overlapped.
-    max_wait_us: u64,
-    /// Whether a probe issued once the call was under way was acknowledged
-    /// before it returned.
-    acked_inside: bool,
-    /// Whether the call, unacknowledged, tells nothing about the kernel: no
-    /// probe was issued inside it, or the first one issued inside it waited
-    /// longer than the whole call (`SEED_ATTEMPTS`).
-    inconclusive: bool,
-    /// The call's result (`LAT_RESULT`).
-    result: u64,
-}
-
-/// Run the call `op` on a worker pinned to `WORKER_CPU`, probing it from
-/// `PROBE_CPU` with unmaps of `frame` at `PROBE_VA`. The harness thread is
-/// pinned to `PROBE_CPU` for the call and unpinned afterwards.
-fn measure_call(
-    ctx: &TestContext,
-    frame: u64,
-    op: u64,
-    a0: u64,
-    a1: u64,
-) -> Result<Measured, &'static str>
-{
-    for word in [&LAT_GAP_US, &LAT_START, &LAT_END, &LAT_RESULT]
-    {
-        word.store(0, Ordering::Relaxed);
-    }
-    LAT_READY.store(false, Ordering::Relaxed);
-    LAT_GO.store(false, Ordering::Relaxed);
-    LAT_OP.store(op, Ordering::Relaxed);
-    LAT_ARG0.store(a0, Ordering::Relaxed);
-    LAT_ARG1.store(a1, Ordering::Release);
-
-    thread_set_affinity(ctx.thread_cap, PROBE_CPU)
-        .map_err(|_| "retype::pool_latency: pin the probe failed")?;
-    let measured = thread_yield()
-        .map_err(|_| "retype::pool_latency: yield failed")
-        .and_then(|()| probe_worker(ctx, frame));
-    let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
-        .map_err(|_| "retype::pool_latency: restore the probe's affinity failed");
-    let measured = measured?;
-    restore?;
-    Ok(measured)
-}
-
-/// Start the worker in ktest's own `CSpace`, so the handles in `LAT_ARG0`
-/// are its own, probe it until its call returns, and reap it.
-fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
-{
-    let mut worker = crate::spawn::SpawnedChild {
-        th: cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
-            .map_err(|_| "retype::pool_latency: create the worker failed")?,
-        cs: 0,
-    };
-    // SAFETY: `LAT_STACK` is a static stack, reached only through `addr_of!`.
-    let lat_stack = unsafe { crate::ChildStack::top(core::ptr::addr_of!(LAT_STACK)) };
-    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and
-    // `LAT_STACK` is this test's own stack, on which no other live thread runs
-    // (the cases run one at a time and reap the worker before returning).
-    unsafe { thread_configure(worker.th, latency_worker as *const () as u64, lat_stack, 0) }
-        .map_err(|_| "retype::pool_latency: configure the worker failed")?;
-    thread_set_affinity(worker.th, WORKER_CPU)
-        .map_err(|_| "retype::pool_latency: pin the worker failed")?;
-    thread_start(worker.th).map_err(|_| "retype::pool_latency: start the worker failed")?;
-
-    let deadline = crate::scaled_bound(LAT_CALL_DEADLINE_US);
-    let begun = crate::elapsed_us();
-    while !LAT_READY.load(Ordering::Acquire)
-    {
-        if crate::elapsed_us().saturating_sub(begun) > deadline
-        {
-            return Err("retype::pool_latency: the worker never reported ready");
-        }
-        thread_yield().ok();
-    }
-    // A probe the worker's CPU could acknowledge between two of its syscalls,
-    // just before or just after the call, is not counted against the call.
-    let margin = LAT_GAP_US
-        .load(Ordering::Relaxed)
-        .checked_mul(8)
-        .and_then(|gap| gap.checked_add(10))
-        .ok_or("retype::pool_latency: probe margin out of range")?;
-
-    let mut max_wait = 0u64;
-    // The issue and acknowledgement times of the first probe issued `margin`
-    // after the call's start. Probes run one at a time, so it is also the
-    // first of them acknowledged.
-    let mut first_after_start: Option<(u64, u64)> = None;
-    let mut probe = || -> TestResult {
-        // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so
-        // the page holds no Rust object or IPC page of ktest.
-        unsafe { mem_map(frame, ctx.aspace_cap, PROBE_VA, 0, 1, MAP_WRITABLE) }
-            .map_err(|_| "retype::pool_latency: probe map failed")?;
-        let t0 = crate::elapsed_us();
-        // SAFETY: as for the map.
-        let unmapped = unsafe { mem_unmap(ctx.aspace_cap, PROBE_VA, 1) };
-        let t1 = crate::elapsed_us();
-        unmapped.map_err(|_| "retype::pool_latency: probe unmap failed")?;
-        let start = LAT_START.load(Ordering::Acquire);
-        if start != 0 && t1 >= start
-        {
-            max_wait = max_wait.max(t1.wrapping_sub(t0));
-        }
-        if start != 0 && t0 >= start.saturating_add(margin) && first_after_start.is_none()
-        {
-            first_after_start = Some((t0, t1));
-        }
-        Ok(())
-    };
-    LAT_GO.store(true, Ordering::Release);
-    let probed = loop
-    {
-        if LAT_END.load(Ordering::Acquire) != 0
-        {
-            break Ok(());
-        }
-        if let Err(e) = probe()
-        {
-            break Err(e);
-        }
-        if crate::elapsed_us().saturating_sub(begun) > deadline
-        {
-            break Err("retype::pool_latency: the measured call outlived its deadline");
-        }
-    };
-    let exited = crate::spawn::wait_until_exited(worker.th, crate::scaled_polls(60_000));
-    worker.delete_thread().ok();
-    probed?;
-    exited?;
-
-    let (start, end) = (
-        LAT_START.load(Ordering::Acquire),
-        LAT_END.load(Ordering::Acquire),
-    );
-    let span_us = end.saturating_sub(start);
-    let acked_inside = first_after_start.is_some_and(|(_, t1)| t1.saturating_add(margin) <= end);
-    let inconclusive = !acked_inside
-        && first_after_start.is_none_or(|(t0, t1)| {
-            t0.saturating_add(margin) > end || t1.saturating_sub(t0) > span_us
-        });
-    Ok(Measured {
-        span_us,
-        max_wait_us: max_wait,
-        acked_inside,
-        inconclusive,
-        result: LAT_RESULT.load(Ordering::Relaxed),
-    })
-}
-
-/// The result of the worker's call, when it made the call: its return value,
-/// or `u64::MAX` on an error. `None` when the worker never finished it, so the
-/// call's object was neither consumed (a delete) nor created (a create). Read
-/// once [`measure_call`] has returned, whatever its outcome: the worker is
-/// reaped by then, so the words no longer change.
-fn worker_result() -> Option<u64>
-{
-    (LAT_END.load(Ordering::Acquire) != 0).then(|| LAT_RESULT.load(Ordering::Relaxed))
-}
-
-/// Log `m`, the measure of `call` (a log line naming it), and check it against
-/// the bounds.
-fn check_measured(call: &'static str, m: &Measured) -> TestResult
-{
-    crate::log(call);
-    crate::log_u64("ktest: pool_latency span_us=", m.span_us);
-    crate::log_u64("ktest: pool_latency max_probe_wait_us=", m.max_wait_us);
-    crate::log_u64(
-        "ktest: pool_latency acked_inside=",
-        u64::from(m.acked_inside),
-    );
-    crate::log_u64(
-        "ktest: pool_latency inconclusive=",
-        u64::from(m.inconclusive),
-    );
-    if m.max_wait_us > crate::scaled_bound(LATENCY_BOUND_US)
-    {
-        return Err("retype::pool_latency: a probe waited past LATENCY_BOUND_US for the call");
-    }
-    if !m.acked_inside
-    {
-        return Err("retype::pool_latency: no probe was acknowledged while the call ran");
-    }
-    Ok(())
-}
-
-/// Whether the guest has the two CPUs the cases pin to; logs the skip.
-fn latency_cpus_present() -> bool
-{
-    let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
-    if cpus <= u64::from(WORKER_CPU)
-    {
-        crate::log("ktest: pool_latency SKIP (need 2+ CPUs)");
-        return false;
-    }
-    true
-}
 
 /// Split `LAT_SOURCE_PAGES` pages off the top of `memory_base`, after checking
 /// that it has them available.
@@ -1937,23 +1630,22 @@ enum TeardownTarget
 /// a worker CPU, while probing that CPU with TLB shootdowns.
 fn teardown_case(ctx: &TestContext, target: TeardownTarget, call: &'static str) -> TestResult
 {
-    if !latency_cpus_present()
+    if !latency::cpus_present()
     {
         return Ok(());
     }
     let source = split_latency_source(ctx)?;
-    let scratch = ScratchFrame::alloc();
-    let measured = scratch.as_ref().map_err(|e| *e).and_then(|frame| {
+    let measured = (|| {
         let mut fixture = TeardownFixture {
             holes: 0,
             kept: 0,
             target: 0,
         };
         build_teardown_fixture(ctx, source, target, &mut fixture)?;
-        let measured = measure_call(ctx, frame.0, LAT_OP_DELETE, fixture.target, 0);
+        let measured = latency::measure_call(ctx, Call::Delete(fixture.target));
         // The fixture's drop deletes the target unless the worker's delete
         // consumed it, whether or not the measure itself succeeded.
-        if worker_result() == Some(0)
+        if latency::worker_results().map(|r| r.0) == Some(0)
         {
             fixture.target = 0;
         }
@@ -1963,14 +1655,9 @@ fn teardown_case(ctx: &TestContext, target: TeardownTarget, call: &'static str) 
             return Err("retype::pool_latency: the worker's delete of the target failed");
         }
         Ok(measured)
-    });
-    if let Ok(frame) = scratch
-    {
-        // SAFETY: every probe map was undone by its unmap, or failed.
-        unsafe { frame.release() };
-    }
+    })();
     let merged = merge_latency_source(ctx, source);
-    check_measured(call, &measured?)?;
+    latency::check_measured(call, &measured?)?;
     merged
 }
 
@@ -1999,12 +1686,13 @@ pub fn aspace_teardown_takes_interrupts(ctx: &TestContext) -> TestResult
 /// Measure one seeding call `op` from `source` and delete the pool it
 /// created, whether or not the measure itself succeeded, so the source can
 /// merge back. A failed measure reports its own error, not the cleanup's.
-fn seed_once(ctx: &TestContext, frame: u64, op: u64, source: u64)
--> Result<Measured, &'static str>
+fn seed_once(ctx: &TestContext, call: Call) -> Result<Measured, &'static str>
 {
-    let measured = measure_call(ctx, frame, op, source, LAT_SOURCE_PAGES);
+    let measured = latency::measure_call(ctx, call);
     let deleted =
-        match worker_result().filter(|&r| r != u64::MAX)
+        match latency::worker_results()
+            .map(|r| r.0)
+            .filter(|&r| r != u64::MAX)
         {
             Some(created) => cap_delete(created)
                 .map_err(|_| "retype::pool_latency: delete the seeded pool failed"),
@@ -2019,97 +1707,47 @@ fn seed_once(ctx: &TestContext, frame: u64, op: u64, source: u64)
     Ok(m)
 }
 
-/// Make the calls `once` measures until one sees a probe acknowledged inside
-/// it, `SEED_ATTEMPTS` of them were conclusive, or `SEED_ATTEMPT_LIMIT` were
-/// made, and return the last call's measure with the longest probe wait of
-/// them all: every call's probes count against `LATENCY_BOUND_US`, and only a
-/// conclusive call counts against `SEED_ATTEMPTS`.
-fn attempt_until_acked(
-    mut once: impl FnMut() -> Result<Measured, &'static str>,
-) -> Result<Measured, &'static str>
-{
-    let mut max_wait_us = 0;
-    let mut conclusive = 0u32;
-    let mut last = None;
-    for _ in 0..SEED_ATTEMPT_LIMIT
-    {
-        let m = once()?;
-        log_seed_attempt(&m);
-        max_wait_us = max_wait_us.max(m.max_wait_us);
-        let (acked, inconclusive) = (m.acked_inside, m.inconclusive);
-        last = Some(Measured { max_wait_us, ..m });
-        if acked
-        {
-            break;
-        }
-        if !inconclusive
-        {
-            conclusive = conclusive.saturating_add(1);
-            if conclusive == SEED_ATTEMPTS
-            {
-                break;
-            }
-        }
-    }
-    last.ok_or("retype::pool_latency: SEED_ATTEMPT_LIMIT made no call")
-}
-
-/// Log one attempt's own measure, before the attempts' longest probe wait is
-/// folded into it.
-fn log_seed_attempt(m: &Measured)
-{
-    crate::log_u64("ktest: pool_latency seed_attempt span_us=", m.span_us);
-    crate::log_u64(
-        "ktest: pool_latency seed_attempt max_probe_wait_us=",
-        m.max_wait_us,
-    );
-    crate::log_u64(
-        "ktest: pool_latency seed_attempt inconclusive=",
-        u64::from(m.inconclusive),
-    );
-}
-
 /// Creating a `CSpace`, then an address space, whose one donation seeds the
 /// whole latency source takes interrupts throughout: of up to
-/// [`SEED_ATTEMPTS`] conclusive calls of each kind, and at most
-/// [`SEED_ATTEMPT_LIMIT`] calls, one sees a probe acknowledged inside it.
+/// [`latency::ATTEMPTS`] conclusive calls of each kind, and at most
+/// [`latency::ATTEMPT_LIMIT`] calls, one sees a probe acknowledged inside it.
 pub fn pool_seeding_takes_interrupts(ctx: &TestContext) -> TestResult
 {
-    const CALLS: [(u64, &str); 2] = [
-        (
-            LAT_OP_CREATE_CSPACE,
-            "ktest: pool_latency call=cspace_create",
-        ),
-        (
-            LAT_OP_CREATE_ASPACE,
-            "ktest: pool_latency call=aspace_create",
-        ),
-    ];
-    if !latency_cpus_present()
+    if !latency::cpus_present()
     {
         return Ok(());
     }
     let source = split_latency_source(ctx)?;
-    let scratch = ScratchFrame::alloc();
-    let measured = scratch.as_ref().map_err(|e| *e).and_then(|frame| {
-        let mut all = [const { None }; CALLS.len()];
-        for (slot, &(op, _)) in all.iter_mut().zip(&CALLS)
+    let calls = [
+        (
+            Call::CreateCSpace {
+                memory: source,
+                pages: LAT_SOURCE_PAGES,
+            },
+            "ktest: pool_latency call=cspace_create",
+        ),
+        (
+            Call::CreateAspace {
+                memory: source,
+                pages: LAT_SOURCE_PAGES,
+            },
+            "ktest: pool_latency call=aspace_create",
+        ),
+    ];
+    let measured = (|| {
+        let mut all = [const { None }; 2];
+        for (slot, &(call, _)) in all.iter_mut().zip(&calls)
         {
-            *slot = Some(attempt_until_acked(|| seed_once(ctx, frame.0, op, source))?);
+            *slot = Some(latency::attempt_until_acked(|| seed_once(ctx, call))?);
         }
-        Ok(all)
-    });
-    if let Ok(frame) = scratch
-    {
-        // SAFETY: every probe map was undone by its unmap, or failed.
-        unsafe { frame.release() };
-    }
+        Ok::<_, &'static str>(all)
+    })();
     let merged = merge_latency_source(ctx, source);
-    for (m, &(_, call)) in measured?.iter().zip(&CALLS)
+    for (m, &(_, line)) in measured?.iter().zip(&calls)
     {
         if let Some(m) = m
         {
-            check_measured(call, m)?;
+            latency::check_measured(line, m)?;
         }
     }
     merged
@@ -2121,7 +1759,6 @@ pub fn pool_seeding_takes_interrupts(ctx: &TestContext) -> TestResult
 /// succeeded. A failed measure reports its own error, not the cleanup's.
 fn place_once(
     ctx: &TestContext,
-    frame: u64,
     notification: u64,
     pool_pages: u64,
 ) -> Result<Measured, &'static str>
@@ -2131,7 +1768,17 @@ fn place_once(
         .map_err(|_| "retype::placement_latency: cap_create_cspace failed")?;
     let measured = cap_create_cspace(ctx.memory_base, cspace, pool_pages)
         .map_err(|_| "retype::placement_latency: augment failed")
-        .and_then(|_| measure_call(ctx, frame, LAT_OP_COPY_AT, notification, cspace));
+        .and_then(|_| {
+            latency::measure_call(
+                ctx,
+                Call::CopyAt {
+                    cap: notification,
+                    cspace,
+                    slot: LAT_PLACE_SLOT,
+                    rights: RIGHTS_NTF_NOTIFY,
+                },
+            )
+        });
     let deleted =
         cap_delete(cspace).map_err(|_| "retype::placement_latency: cap_delete(cspace) failed");
     let m = measured?;
@@ -2145,31 +1792,23 @@ fn place_once(
 
 /// An explicit placement through `SYS_CAP_COPY` at `LAT_PLACE_SLOT` of a
 /// fresh `CSpace` takes interrupts throughout its pre-grow, which grows every
-/// leaf below that slot: of up to [`SEED_ATTEMPTS`] conclusive placements, and
-/// at most [`SEED_ATTEMPT_LIMIT`], one sees a probe acknowledged inside it,
-/// and no probe waits past `LATENCY_BOUND_US`. A kernel that masks interrupts
+/// leaf below that slot: of up to [`latency::ATTEMPTS`] conclusive placements,
+/// and at most [`latency::ATTEMPT_LIMIT`], one sees a probe acknowledged inside
+/// it, and no probe waits past `latency::LATENCY_BOUND_US`. A kernel that masks interrupts
 /// for the whole pre-grow acknowledges a probe only once the placement returns.
 pub fn explicit_placement_takes_interrupts(ctx: &TestContext) -> TestResult
 {
-    if !latency_cpus_present()
+    if !latency::cpus_present()
     {
         return Ok(());
     }
     let pool_pages = pages_to_cover(LAT_PLACE_SLOT);
     let notification = cap_create_notification(ctx.memory_base)
         .map_err(|_| "retype::placement_latency: cap_create_notification failed")?;
-    let scratch = ScratchFrame::alloc();
-    let measured = scratch.as_ref().map_err(|e| *e).and_then(|frame| {
-        attempt_until_acked(|| place_once(ctx, frame.0, notification, pool_pages))
-    });
-    if let Ok(frame) = scratch
-    {
-        // SAFETY: every probe map was undone by its unmap, or failed.
-        unsafe { frame.release() };
-    }
+    let measured = latency::attempt_until_acked(|| place_once(ctx, notification, pool_pages));
     let deleted = cap_delete(notification)
         .map_err(|_| "retype::placement_latency: cap_delete(notification) failed");
     let m = measured?;
     deleted?;
-    check_measured("ktest: pool_latency call=cap_copy_explicit_slot", &m)
+    latency::check_measured("ktest: pool_latency call=cap_copy_explicit_slot", &m)
 }

@@ -2172,8 +2172,10 @@ compared as one integer, a length field whose add overflows, and a state reached
 three nested records with no checksum) and fails unless each is found within its execution budget
 from seed 0, twice, at the same execution with the same minimized input.
 
-The campaign gates nothing. A red campaign run is a finding, recorded as
-[conventions.md](conventions.md#recording-findings) § Recording findings says.
+The campaign gates no merge: a red campaign run is a finding, recorded as
+[conventions.md](conventions.md#recording-findings) § Recording findings says. The campaign the
+release host runs dispatch on the commit to be tagged gates the tag (§ Coverage tiers, Release host
+runs).
 
 **Predating defects.** A failing input the gating job finds on a pull request whose own diff does
 not introduce the defect (the same run fails at the merge base) is fixed first, in its own PR or

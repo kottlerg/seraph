@@ -5,8 +5,10 @@
 
 # The campaign fuzz tier: every target for a fixed time from a seed that
 # changes each run, growing a working corpus this workflow's cache carries
-# from run to run, on a manual dispatch (docs/testing.md § Fuzzing). It gates nothing: a failing input it finds is uploaded, and its
-# fix lands with the minimized input under the target's regressions/.
+# from run to run, on a manual dispatch (docs/testing.md § Fuzzing). It
+# gates no merge; the run the release host runs dispatch gates the tag. A
+# failing input it finds is uploaded, and its fix lands with the minimized
+# input under the target's regressions/.
 
 name: fuzz
 

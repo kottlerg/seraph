@@ -744,14 +744,14 @@ mod proofs
     }
 
     /// The trim of a table name holds on every name: it stops at the first
-    /// NUL and keeps the whole name without one. The longest loops are the
-    /// trim's scan of the 256-byte name and the check of each of its bytes at
-    /// its own index, so an unwind bound of 257 covers them.
+    /// NUL and keeps the whole name without one. The check is made at any
+    /// one index of the name, so it holds at each; the longest loop is the
+    /// trim's scan of the 256-byte name, so an unwind bound of 257 covers it.
     #[kani::proof]
     #[kani::unwind(257)]
     fn every_name_trims_at_its_first_nul()
     {
         let name: [u8; INIT_MODULE_NAME_LEN] = kani::any();
-        property::name_holds(&name);
+        property::name_holds_at(&name, kani::any());
     }
 }

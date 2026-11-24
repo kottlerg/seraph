@@ -11,10 +11,12 @@
 # one line; a root key, so it comes before the first table.
 bin = [
     { name = "boot-protocol", path = "src/bin/boot-protocol.rs", test = false },
+    { name = "driver-binding", path = "src/bin/driver-binding.rs", test = false },
     { name = "elf", path = "src/bin/elf.rs", test = false },
     { name = "gpt", path = "src/bin/gpt.rs", test = false },
     { name = "hwrng-protocol", path = "src/bin/hwrng-protocol.rs", test = false },
     { name = "init-protocol", path = "src/bin/init-protocol.rs", test = false },
+    { name = "objsig", path = "src/bin/objsig.rs", test = false },
     { name = "planted-length", path = "src/bin/planted-length.rs", test = false },
     { name = "planted-magic", path = "src/bin/planted-magic.rs", test = false },
     { name = "planted-nested", path = "src/bin/planted-nested.rs", test = false },
@@ -30,10 +32,12 @@ autobins = false
 
 [dependencies]
 boot-protocol = { path = "../../../abi/boot-protocol" }
+driver-binding = { path = "../../../shared/driver-binding" }
 elf = { path = "../../../shared/elf" }
 fuzz-engine = { path = "../engine" }
 hwrng-protocol = { path = "../../../shared/hwrng-protocol" }
 init-protocol = { path = "../../../abi/init-protocol" }
+objsig = { path = "../../../shared/objsig" }
 storage-statement = { path = "../../../shared/storage-statement" }
 vfsd-gpt = { path = "../../../services/vfsd/gpt" }
 

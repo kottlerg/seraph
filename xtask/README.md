@@ -122,6 +122,15 @@ rustfmt's diff, each hunk headed by the file and line, and the command that fixe
 [docs/coding-standards.md](../docs/coding-standards.md) § Formatters requires. It then runs Clippy
 over the host crates, and over each component before it builds it.
 
+Cargo judges each unit of the build current by the checksums of the files rustc read for it, not
+by their modification times (`.cargo/config.toml`), so a checkout, a cache restore or a `touch`
+rebuilds nothing whose content is unchanged; no package of the tree has a build script, whose
+`rerun-if-changed` files Cargo still judges by time, and the build passes the kernel's and the
+riscv64 bootloader's linker scripts itself
+([docs/build-system.md](../docs/build-system.md#custom-targets) § Custom Targets). CI carries
+`target/` between runs on that basis
+([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
+
 The sysroot is architecture-specific. Building for a different arch than the
 existing sysroot is an error — run `cargo xtask clean` first (per
 [docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
@@ -669,17 +678,15 @@ contract.
 
 Remove the sysroot, the symbols store `symbols/`, the disk images `disk.img` and
 `disk-data.img`, and any per-launch variable store a killed launch left under
-`target/xtask/vars/` (and optionally `target/`, or Cargo's build output in it but for the standard
-library's build units).
+`target/xtask/vars/` (and optionally `target/`).
 
 ```
-cargo xtask clean [--all | --keep-std]
+cargo xtask clean [--all]
 ```
 
 | Option | Description |
 |---|---|
 | `--all` | Also run `cargo clean` to remove the `target/` directory |
-| `--keep-std` | Also empty Cargo's profile directories, the host's (`target/<profile>/`) and each target's (`target/<triple>/<profile>/`), and those of `target/seraph-build/`, the Cargo build directory of the builds that compile `std` from the toolchain mirror, but for the build units of the packages the toolchain's `library/Cargo.lock` names (`core`, `alloc`, `compiler_builtins`, `std` and their dependencies): only `build/<package>/` of such a package stays. The rest of `target/`, `target/xtask/` among it, is left alone. CI's standard-library cache saves what is left ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration) |
 
 ---
 
@@ -844,11 +851,12 @@ of the checkout itself, and fails, naming each path, when a lane changed one: a 
 outside its copy fails the cell rather than racing another lane. `--lanes` above 1 refuses
 `--alone` and `--timing`, which run a boot beside no other QEMU.
 
-CI (`.github/workflows/build-test.yml`) runs, in every cell after the cell's own boot,
-`cargo xtask mkdisk --arch A` (the plain repack: the `rootfs/` re-mirror, the repository's log
-levels, no knobs, the recorded harness kept) and then `cargo xtask test --cell <tester> --arch A
-[--release] --lanes 3`: each boot keeps about one of the runner's four vCPUs busy. The cases no
-cell runs, which are host runs
+CI (`.github/workflows/build-test.yml`) runs, in every cell after the cell's own boot, the
+shipped `xtask` binary of the cell's build job (the tree action puts `target/debug` on the
+`PATH`): `xtask mkdisk --arch A` (the plain repack: the `rootfs/`
+re-mirror, the repository's log levels, no knobs, the recorded harness kept) and then
+`xtask test --cell <tester> --arch A [--release] --lanes 3`: each
+boot keeps about one of the runner's four vCPUs busy. The cases no cell runs, which are host runs
 ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers), are `hotplug`, `cet`,
 `tpm` and `debug-port`.
 

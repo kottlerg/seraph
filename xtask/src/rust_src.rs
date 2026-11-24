@@ -1540,38 +1540,6 @@ mod tests
 {
     use super::*;
 
-    /// The path dependencies a crate's `Cargo.toml` names, as directories
-    /// relative to `root`: `path = "..."` from the crate's directory, and a
-    /// `workspace = true` one from the workspace's `Cargo.toml`.
-    fn path_deps(root: &Path, krate: &str) -> Vec<String>
-    {
-        let workspace = fs::read_to_string(root.join("Cargo.toml")).unwrap();
-        let manifest = fs::read_to_string(root.join(krate).join("Cargo.toml")).unwrap();
-        let path_of = |line: &str| -> Option<String> {
-            let rest = &line[line.find("path = \"")? + "path = \"".len()..];
-            Some(rest[..rest.find('"')?].to_owned())
-        };
-        let mut deps = Vec::new();
-        for line in manifest.lines()
-        {
-            if let Some(rel) = path_of(line)
-            {
-                let dir = root.join(krate).join(rel).canonicalize().unwrap();
-                deps.push(dir.strip_prefix(root).unwrap().display().to_string());
-            }
-            else if line.contains("workspace = true")
-                && let Some(name) = line.split(['=', '.']).next().map(str::trim)
-                && let Some(entry) = workspace
-                    .lines()
-                    .find(|l| l.split('=').next().map(str::trim) == Some(name))
-                && let Some(rel) = path_of(entry)
-            {
-                deps.push(rel);
-            }
-        }
-        deps
-    }
-
     /// The repository's root.
     fn repo_root() -> PathBuf
     {
@@ -1582,11 +1550,10 @@ mod tests
             .unwrap()
     }
 
-    /// The patterns of the standard-library cache key's `hashFiles` call, in
-    /// order.
+    /// The patterns of the build carry's key's `hashFiles` call, in order.
     fn key_patterns(root: &Path) -> Vec<String>
     {
-        let action = fs::read_to_string(root.join(".github/actions/std-cache/action.yml")).unwrap();
+        let action = fs::read_to_string(root.join(".github/actions/carry/action.yml")).unwrap();
         let call = &action[action.find("hashFiles(").unwrap()..];
         let call = &call[..call.find(')').unwrap()];
         call.split('\'')
@@ -1632,52 +1599,52 @@ mod tests
         hashed
     }
 
-    // Defect caught: a file the seraph std is built from left out of the
-    // standard-library cache's key, so a change to it (one byte of an
-    // overlay source, of a crate std depends on, or of the specs and flags
-    // it is built with) restores the entry of the unchanged tree instead of
-    // missing it. Cargo rebuilds what changed after a restore in any case,
-    // since the checkout gives every file a new modification time; the key
-    // is what keeps an entry to one tree.
+    // Defect caught: an input of the carried build units that Cargo's
+    // checksums do not cover (a target spec, the Cargo configuration, the
+    // action) left out of the build carry's key, so a change to it restores
+    // units built under the old one as current; or a source file of the tree
+    // hashed, which Cargo's checksums do cover, so that every change to it
+    // misses master's entry and rebuilds everything.
     #[test]
-    fn the_std_cache_key_hashes_every_std_input()
+    fn the_carry_key_hashes_the_inputs_the_checksums_do_not_cover_and_no_source()
     {
         let root = repo_root();
         let patterns = key_patterns(&root);
-        let covered = |path: &str| key_hashes(&patterns, path);
-        let mut inputs: Vec<String> = [
-            "Cargo.toml",
+        for input in [
             ".cargo/config.toml",
-            "xtask/targets",
-            "xtask/src/rust_src.rs",
-            "xtask/src/commands/build.rs",
-            "runtime/ruststd/src",
+            "xtask/targets/x86_64-seraph-none.json",
+            "xtask/targets/riscv64imac-seraph-uefi.json",
+            ".github/actions/carry/action.yml",
         ]
-        .map(str::to_owned)
-        .into();
-        let mut stack: Vec<String> = STD_WORKSPACE_DEPS.iter().map(|d| d.1.to_owned()).collect();
-        while let Some(krate) = stack.pop()
         {
-            if !inputs.contains(&krate)
-            {
-                stack.extend(path_deps(&root, &krate));
-                inputs.push(krate);
-            }
+            assert!(key_hashes(&patterns, input), "{input}: {patterns:?}");
         }
-        let missed: Vec<&String> = inputs.iter().filter(|i| !covered(i)).collect();
-        assert!(
-            missed.is_empty(),
-            "the key's hashFiles misses {missed:?}; patterns {patterns:?}"
-        );
+        let out = Command::new("git")
+            .arg("ls-files")
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let files = String::from_utf8(out.stdout).unwrap();
+        let sources: Vec<&str> = files
+            .lines()
+            .filter(|f| {
+                let path = Path::new(f);
+                path.file_name().is_some_and(|n| n == "Cargo.toml")
+                    || path.extension().is_some_and(|e| e == "rs" || e == "ld")
+            })
+            .filter(|f| key_hashes(&patterns, f))
+            .collect();
+        assert!(sources.is_empty(), "the key hashes sources: {sources:?}");
     }
 
-    // Defect caught: a file the standard-library cache's key hashes whose
-    // change alone owes the build job of some tree no run (a README under
-    // `shared/`, say): a `master` merge changing only it changes the key
-    // but runs no job that saves that tree's entry under it, so every later
-    // pull request misses the cache until a merge owes that build.
+    // Defect caught: a file the build carry's key hashes whose change alone
+    // owes the build job of some tree no run: a `master` merge changing only
+    // it changes the key but runs no job that saves that tree's entry under
+    // it, so every later pull request misses the carry until a merge owes
+    // that build.
     #[test]
-    fn a_change_to_a_file_the_std_cache_key_hashes_owes_the_build_jobs_that_save_it()
+    fn a_change_to_a_file_the_carry_key_hashes_owes_the_build_jobs_that_save_it()
     {
         use crate::affected::Workspace;
         use crate::commands::cells::{build_trees, owed_by};

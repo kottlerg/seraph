@@ -185,10 +185,11 @@ follow. Both set `os: "none"`, `llvm-target: "riscv64-unknown-none-elf"`,
 |---|---|---|
 | `features` | `"+m,+a,+c"` (RV64IMAC) | `"+m,+a,+c,+svinval,+svpbmt,+svnapot"` |
 | `pre-link-args` (`ld.lld`) | `--gc-sections --build-id=sha1 -pie --no-dynamic-linker -z notext -z norelro -Bsymbolic` | `--gc-sections --build-id=sha1 -pie --no-dynamic-linker -Bsymbolic -z max-page-size=4096` |
-| Linker script | `core/boot/linker/riscv64-uefi.ld`, passed by `core/boot/build.rs` | chosen by `core/kernel/build.rs` |
+| Linker script | `core/boot/linker/riscv64-uefi.ld`, passed by `cargo xtask build` | `core/kernel/linker/riscv64.ld`, passed by `cargo xtask build` |
 
-Neither JSON names a linker script; each crate's `build.rs` passes its own
-(§ Build Pipeline, step 1). The kernel target's properties and rationale are owned by
+Neither JSON names a linker script; `cargo xtask build` passes each crate's own
+as a `-Clink-arg=-T` link argument (§ Build Pipeline, step 1). The kernel target's
+properties and rationale are owned by
 [docs/build-system.md § Custom Targets](../../../docs/build-system.md#custom-targets).
 
 The `relocation-model: "pic"` setting (with `-pie`,
@@ -209,8 +210,8 @@ The RISC-V UEFI image is produced by `cargo xtask build --arch riscv64`.
 Internally the pipeline runs in three steps:
 
 1. The bootloader crate is compiled against `riscv64imac-seraph-uefi` and
-   linked with `linker/riscv64-uefi.ld`, which `build.rs` passes to the
-   linker as an absolute `-T` link argument (summarized from
+   linked with `linker/riscv64-uefi.ld`, which `cargo xtask build` passes to the
+   linker as an absolute `-T` link argument (see
    [docs/build-system.md § Custom Targets](../../../docs/build-system.md#custom-targets)),
    producing an ELF that contains the `.pecoff_header` section (assembled
    from `header.S`) at load address `0x0`, followed by `.text` at `0x1000`.

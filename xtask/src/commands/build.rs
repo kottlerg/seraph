@@ -822,8 +822,9 @@ pub fn compile_boot(ctx: &BuildContext, args: &BuildArgs, store: &Path, out: &Pa
         .to_str()
         .with_context(|| format!("the trust store path {} is not UTF-8", store.display()))?;
 
+    let rustflags = with_linker_script(&ctx.root, BOOT_RUSTFLAGS, args.arch.boot_linker_script())?;
     let env = [
-        ("RUSTFLAGS", BOOT_RUSTFLAGS),
+        ("RUSTFLAGS", rustflags.as_str()),
         ("SERAPH_BOOT_TRUST_STORE", store),
     ];
     if !args.skip_lints
@@ -954,10 +955,11 @@ fn build_group(
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let env = profile_env(args.arch, profile);
+    let env_owned = profile_env(&ctx.root, args.arch, profile)?;
+    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if !args.skip_lints
     {
-        clippy_check_ext(ctx, &flags_ref, env, seraph.as_ref())?;
+        clippy_check_ext(ctx, &flags_ref, &env, seraph.as_ref())?;
         clippy_std_members(ctx, triple, build_std, args.profile(), seraph.as_ref())?;
     }
 
@@ -1083,10 +1085,11 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let env = profile_env(args.arch, spec.profile);
+    let env_owned = profile_env(&ctx.root, args.arch, spec.profile)?;
+    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if !args.skip_lints
     {
-        clippy_check_ext(ctx, &flags_ref, env, seraph.as_ref())?;
+        clippy_check_ext(ctx, &flags_ref, &env, seraph.as_ref())?;
         clippy_std_members(ctx, triple, build_std, args.profile(), seraph.as_ref())?;
     }
 
@@ -1252,15 +1255,52 @@ const RISCV64_KERNEL_RUSTFLAGS: &str = "-Zunstable-options -Zemit-stack-sizes";
 const X86_64_KERNEL_RUSTFLAGS: &str = "-Zunstable-options -Zretpoline-external-thunk";
 
 /// The environment a build of `profile` for `arch`, and its lint pass, run
-/// with.
-fn profile_env(arch: Arch, profile: BuildProfile) -> &'static [(&'static str, &'static str)]
+/// with: for the kernel, `RUSTFLAGS` with the kernel's linker script.
+fn profile_env(
+    root: &Path,
+    arch: Arch,
+    profile: BuildProfile,
+) -> Result<Vec<(&'static str, String)>>
 {
-    match (arch, profile)
+    let base = match (arch, profile)
     {
-        (Arch::Riscv64, BuildProfile::Kernel) => &[("RUSTFLAGS", RISCV64_KERNEL_RUSTFLAGS)],
-        (Arch::X86_64, BuildProfile::Kernel) => &[("RUSTFLAGS", X86_64_KERNEL_RUSTFLAGS)],
-        _ => &[],
+        (Arch::Riscv64, BuildProfile::Kernel) => RISCV64_KERNEL_RUSTFLAGS,
+        (Arch::X86_64, BuildProfile::Kernel) => X86_64_KERNEL_RUSTFLAGS,
+        _ => return Ok(Vec::new()),
+    };
+    let rustflags = with_linker_script(root, base, Some(arch.kernel_linker_script()))?;
+    Ok(vec![("RUSTFLAGS", rustflags)])
+}
+
+/// `rustflags` with the `-T` link argument that passes `script`, a linker
+/// script named relative to `root`, to the link, when there is one.
+///
+/// The path is absolute, so the link reads the same file from any working
+/// directory. Cargo splits `RUSTFLAGS` at whitespace, so a path that holds
+/// whitespace is refused rather than passed in pieces. The crate that links
+/// with the script includes it as well, which makes it an input Cargo judges
+/// by content (docs/build-system.md § Custom Targets).
+fn with_linker_script(root: &Path, rustflags: &str, script: Option<&str>) -> Result<String>
+{
+    let Some(script) = script
+    else
+    {
+        return Ok(rustflags.to_owned());
+    };
+    let path = root.join(script);
+    let Some(path) = path.to_str()
+    else
+    {
+        bail!("the linker script path {} is not UTF-8", path.display());
+    };
+    if path.contains(char::is_whitespace)
+    {
+        bail!(
+            "the linker script path {path} holds whitespace, which RUSTFLAGS cannot carry; \
+             build from a checkout whose path holds none"
+        );
     }
+    Ok(format!("{rustflags} -Clink-arg=-T{path}"))
 }
 
 /// Fail a riscv64 kernel build whose `image` has a frame above
@@ -1887,5 +1927,113 @@ mod tests
                 }
             }
         }
+    }
+
+    /// The project root, the parent of xtask's manifest directory.
+    fn project_root() -> &'static Path
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits under the project root")
+    }
+
+    /// Every manifest directory under `dir`, outside the build output and
+    /// hidden directories.
+    fn manifest_dirs(dir: &Path, found: &mut Vec<PathBuf>)
+    {
+        if dir.join("Cargo.toml").is_file()
+        {
+            found.push(dir.to_owned());
+        }
+        for entry in fs::read_dir(dir).unwrap()
+        {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() && !name.starts_with('.') && name != "target" && name != "sysroot"
+            {
+                manifest_dirs(&path, found);
+            }
+        }
+    }
+
+    // Defect caught: a package of the tree with a build script. Cargo judges
+    // a build script's `rerun-if-changed` files by modification time, which a
+    // fresh checkout resets, so CI's carried build would rerun the script and
+    // recompile its package and every dependent on each run
+    // (docs/build-system.md § Continuous Integration).
+    #[test]
+    fn no_package_of_the_tree_has_a_build_script()
+    {
+        let mut dirs = Vec::new();
+        manifest_dirs(project_root(), &mut dirs);
+        assert!(dirs.len() > 50, "found only {} manifests", dirs.len());
+        for dir in dirs
+        {
+            assert!(
+                !dir.join("build.rs").exists(),
+                "{} has a build.rs",
+                dir.display()
+            );
+            let manifest = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+            assert!(
+                !manifest
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("build =")),
+                "{} names a build script",
+                dir.display()
+            );
+        }
+    }
+
+    // Defect caught: a kernel or bootloader linked without its linker script,
+    // or with one its crate does not include, whose change would then leave
+    // the linked image as it was (docs/build-system.md § Custom Targets).
+    #[test]
+    fn each_linker_script_is_passed_to_the_link_and_included_by_its_crate()
+    {
+        let root = project_root();
+        let cases = [Arch::X86_64, Arch::Riscv64].into_iter().flat_map(|arch| {
+            [
+                (arch, Some(arch.kernel_linker_script()), "core/kernel"),
+                (arch, arch.boot_linker_script(), "core/boot"),
+            ]
+        });
+        for (arch, script, krate) in cases
+        {
+            let base = "-Zunstable-options";
+            let flags = with_linker_script(root, base, script).unwrap();
+            let Some(script) = script
+            else
+            {
+                assert_eq!(flags, base, "{arch}: {krate}");
+                continue;
+            };
+            let path = root.join(script);
+            assert!(path.is_file(), "{}", path.display());
+            assert_eq!(flags, format!("{base} -Clink-arg=-T{}", path.display()));
+            let main = fs::read_to_string(root.join(krate).join("src/main.rs")).unwrap();
+            let file = Path::new(script).file_name().unwrap().to_str().unwrap();
+            assert!(
+                main.contains(&format!("include_bytes!(\"../linker/{file}\")")),
+                "{krate}/src/main.rs does not include {file}"
+            );
+        }
+        let kernel = profile_env(root, Arch::Riscv64, BuildProfile::Kernel).unwrap();
+        assert_eq!(kernel.len(), 1);
+        assert!(
+            kernel[0].1.starts_with(RISCV64_KERNEL_RUSTFLAGS),
+            "{}",
+            kernel[0].1
+        );
+        assert!(
+            kernel[0].1.ends_with("core/kernel/linker/riscv64.ld"),
+            "{}",
+            kernel[0].1
+        );
+        assert_eq!(
+            profile_env(root, Arch::X86_64, BuildProfile::StdUser).unwrap(),
+            Vec::<(&str, String)>::new()
+        );
+        with_linker_script(Path::new("/a b"), "-Zunstable-options", Some("x.ld")).unwrap_err();
     }
 }

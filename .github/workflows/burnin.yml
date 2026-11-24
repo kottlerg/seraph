@@ -39,11 +39,12 @@ jobs:
       matrix:
         arch: [x86_64, riscv64]
         profile: [debug, release]
-        # One harness per cell, as in build-test.yml: each cell builds
-        # once, stages exactly one recipe (or swaps boot.conf for ktest),
-        # then burns it in. Avoids back-to-back fatfs/sysroot state
-        # accumulation across harnesses and lets a failing tier surface as
-        # a single named cell. See docs/testing.md for the recipe-dir
+        # One harness per cell, as in build-test.yml; unlike its cells,
+        # which boot the tree of their run's build job, each cell here
+        # builds its own tree once, stages exactly one recipe (or swaps
+        # boot.conf for ktest), then burns it in. Avoids back-to-back
+        # fatfs/sysroot state accumulation across harnesses and lets a
+        # failing tier surface as a single named cell. See docs/testing.md for the recipe-dir
         # gating contract.
         tester: [ktest, svctest, usertest]
     steps:

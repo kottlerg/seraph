@@ -973,12 +973,6 @@ args! {
         #[arg(long)]
         pub all: bool,
 
-        /// Also empty Cargo's profile directories in target/ but for the build
-        /// units of the toolchain's library packages (core, alloc,
-        /// compiler_builtins, std and their dependencies), the part CI caches.
-        #[arg(long, conflicts_with = "all")]
-        pub keep_std: bool,
-
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
         #[command(flatten)]

@@ -217,7 +217,7 @@ bootloader embeds.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SERAPH_SIGNING_DIR` | `seraph/signing/ed25519-ml-dsa-65-roles-1-9` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory; one that holds an identity of the earlier Ed25519 format is refused, and so is a signing key the build's trust store does not trust for every role, the error naming the roles it lacks. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
+| `SERAPH_SIGNING_DIR` | `seraph/signing/ed25519-ml-dsa-65-roles-1-9` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory; one that holds an identity of the earlier Ed25519 format is refused, and so is a signing key the build's trust store does not trust for every role, the error naming the roles it lacks. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job that builds signs with keys it generates, which `build-test.yml`'s build job ships to the cells of its run ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration) |
 | `SERAPH_SIGNER` | (none) | An external signer program, which signs in place of `signer.seed`: it reads the encoded signed attributes on its standard input and writes the 3,373-byte composite signature to its standard output. The identity directory MUST already hold the certificate (or public key) and store |
 | `SERAPH_TRUST_STORE` | (none) | A deployer's trust store file, combined with the identity's |
 | `SERAPH_SECURE_BOOT_KEY` | (none) | The PEM private key of the db key `build` Authenticode-signs the installed bootloader, `/boot/boot.efi`, with (`sbsign`, then `sbverify` against the certificate), so a firmware that enrols its certificate in db boots it under UEFI Secure Boot ([docs/signing.md](../docs/signing.md) § Secure Boot). Set together with `SERAPH_SECURE_BOOT_CERT`; with neither set the bootloader is not signed, and one alone is refused |
@@ -269,7 +269,7 @@ The launch options, the same in both modes:
 | `--iommu` | Whether the machine's IOMMU is attached (default: `attached`): `intel-iommu` with interrupt remapping and 32-bit destinations offered (`intremap=on,eim=on`, under KVM on a `kernel-irqchip=split` machine) on x86-64, `riscv-iommu-pci` in Bare mode (`off=off`) at 00:01.0 on riscv64, with the `virtio-pci` devices a driver of the system binds behind it (`iommu_platform=on`). `absent` boots the no-IOMMU variant, the no-iommu device cell of the local and release host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers), which keeps devmgr's unconfined path covered while the attached IOMMU confines every device a driver binds, on both architectures ([docs/device-management.md](../docs/device-management.md#dma-safety-model) § DMA Safety Model) |
 | `--second-disk` | Attach `PATH` as a second disk: its own `virtio-blk-pci` device (drive `hd1`) beside `disk.img`, presenting the logical block size of its GPT (see Attached devices). `mkdisk --split-data` authors `disk-data.img` for it; any GPT image at 512- or 4096-byte blocks serves too, and any other image needs `--second-disk-block-size` |
 | `--second-disk-block-size` | Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image: a power of two of at least 512, up to QEMU's own limit. A size above virtio-blk's `MAX_BLOCK_SIZE` (4096), such as `8192`, stages the refused second disk of the disk variations ([docs/testing.md](../docs/testing.md) § Coverage tiers) |
-| `--second-disk-shared-line` | Place the second disk's device on the first disk's `INTx` line instead of a line of its own, and launch both disks with no MSI-X (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
+| `--second-disk-shared-line` | Place the two disks' devices on one `INTx` line instead of a line each, the first disk moved onto the second disk's line so the second keeps the location the storage statement `mkdisk --split-data` stages names, and launch both disks with no MSI-X (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
 | `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
 | `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the store file of the process binary's build id (`symbols/<build-id>.elf`) for symbols when a staged recipe or `programs/`/`services/` names it; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
 | `--test-devices` | Attach the test devices (see Attached devices): `edu` and five `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
@@ -347,9 +347,11 @@ launcher (`run` and the `test` cases) does the same. `run` attaches `--second-di
 second `virtio-blk-pci` device on drive `hd1`, at its own image's block size unless
 `--second-disk-block-size` sets it. A two-disk launch pins the
 disks to PCI slots `0x10` and `0x12`, which OVMF (x86-64) and the `virt` host bridge (riscv64)
-route to distinct `INTx` lines, so each disk has a line of its own. With
-`--second-disk-shared-line` the second disk sits at slot `0x14` instead, which both machines route
-to the first disk's line, and both disks are launched with `vectors=0`, so they present no MSI-X
+route to distinct `INTx` lines, so each disk has a line of its own. The
+second disk is at slot `0x12` (PCI `0000:00:12.0`) in every launch, the location the statement
+`mkdisk --split-data` stages names. With `--second-disk-shared-line` the first disk sits at slot
+`0x0e` instead, which both machines route to the second disk's line, and both disks are launched
+with `vectors=0`, so they present no MSI-X
 capability and devmgr gives their driver the line they share
 ([docs/device-management.md](../docs/device-management.md) § Interrupt Delivery). OVMF routes
 every x86-64 PCI slot to one of two lines, so in a two-disk x86-64 boot the keyboard shares a
@@ -545,9 +547,11 @@ partition (from `sysroot/data/`), and a 64 MiB raw swap partition of the arch-ne
 data partition is authored unconditionally; `mkdisk --split-data` authors it and the swap
 partition on a second image, `disk-data.img` beside `disk.img`, which then carries the ESP and
 root, for a boot that attaches the pair (`run --second-disk disk-data.img`), and stages the storage
-statement naming the two by their unique GUIDs at `sysroot/config/vfsd/storage.conf`, which the
-pack signs in the configuration role under `/config/vfsd/storage.conf`: vfsd gives a disk other
-than the boot disk a role only where the statement names its partition. Every other authoring
+statement naming the two by their unique GUIDs on the disk at the second disk's PCI location,
+`pci:0000:00:12.0`, at `sysroot/config/vfsd/storage.conf`, which the pack signs in the
+configuration role under `/config/vfsd/storage.conf`: vfsd gives a disk other than the boot disk a
+role only where the statement names its partition on that disk. The `hotplug` case stages its own
+statement naming the location behind the first hotplug port instead. Every other authoring
 removes a `disk-data.img` left beside it, and a statement whose body is the staged one. vfsd
 auto-mounts the data partition at `/data`; the data tree lives only on this partition, not on
 root. Every GUID the images carry is fixed (each
@@ -615,7 +619,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest
 | `--knob` | none | Stage a presence-only bootloader knob in `\EFI\seraph\`, repeatable or comma-separated: `nokaslr` boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; `mapredo` makes the first attempt of the bootloader's steps 6 and 7 redo whatever its memory map's size ([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md) § Sizing the Entry Array). Every knob not named is removed |
 | `--log-levels` | the repository's | Install `FILE` at `/config/init/log-levels.conf` in place of `services/init/log-levels.conf`; refused, before anything changes, unless init's parser (`services/init/log-levels`) accepts every line, since init ignores a line it refuses |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
-| `--split-data` | `false` | Author the data and swap partitions on `disk-data.img` and the ESP and root on `disk.img`, both at `--block-size`, and stage the storage statement naming the two; omit to author all four on `disk.img` and remove a stale `disk-data.img` and the staged statement |
+| `--split-data` | `false` | Author the data and swap partitions on `disk-data.img` and the ESP and root on `disk.img`, both at `--block-size`, and stage the storage statement naming the two on the disk at the second disk's slot; omit to author all four on `disk.img` and remove a stale `disk-data.img` and the staged statement |
 
 A boot that redoes the bootloader's steps 6 and 7 logs `boot: memory map: mapredo knob present;
 redoing steps 6 and 7`, which `run --runs --require` matches, once in the run
@@ -712,7 +716,7 @@ Over the whole workspace (`all`), it then lints the host crates' non-test code a
 `cargo xtask build` does (`clippy_host` of `src/commands/build.rs`: `xtask`, the wrapper shim and
 the path-account plugin under the workspace lints, then the fuzz engine and targets with
 `--cfg fuzzing`), so CI's `host-tests` job, which runs on every change, proves the pass every
-booting cell's build runs.
+build job's build runs.
 
 Tests compile for the host — no `--arch` flag needed. The workspace-level
 `panic=abort` profile does not affect the test harness.
@@ -1379,13 +1383,17 @@ Then two storage boots on the split-data layout, under native control, with the 
 
 3. the data disk (`disk-data.img`) behind the first port from boot: the host removes it (QMP
    `device_del`), requires devmgr's removal lines and vfsd's `disk N: removed; tearing down its
-   mounts`, adds it again (`device_add` of a `virtio-blk-pci` on the kept block node); once the
-   fixture logs `MOUNTED /data on the re-added disk`, it adds a raw block node over a copy of
-   `disk-data.img` taken before the boot (`target/xtask/hotplug-tie-disk.img`, removed after
-   the boot) and a `virtio-blk-pci` on it behind the second port, with the data disk's
-   properties; it then requires the fixture's `PASS`, vfsd's `FATAL: root filesystem lost`,
-   svcmgr's `critical service unrecoverable: vfsd; initiating graceful shutdown`, and QEMU's exit;
-4. the boot disk behind the first port and the data disk on a slot of its own: the host removes
+   mounts`; it adds a raw block node over a copy of `disk-data.img` taken before the boot
+   (`target/xtask/hotplug-copy-disk.img`, removed after the boot) and a `virtio-blk-pci` on it
+   behind the second port, with the data disk's properties, and requires vfsd's `/data: no partition
+   named by the storage statement: not on` line naming the second port's location, with no mount
+   before the data disk is back; it adds the data disk again (`device_add` of a `virtio-blk-pci` on
+   the kept block node) and requires vfsd's line placing `/data`'s named partition on the disk at
+   the first port's location and the fixture's `MOUNTED /data on the re-added disk beside the copy
+   of it`; it then requires the fixture's `PASS`, vfsd's `FATAL: root filesystem lost`, svcmgr's
+   `critical service unrecoverable: vfsd; initiating graceful shutdown`, and QEMU's exit;
+4. the boot disk behind the first port and the data disk at the second disk's slot, which the
+   statement the images are repacked with for this boot names: the host removes
    the boot disk and requires the same last three.
 
 It kills QEMU after each boot, then removes the staged files and repacks the images in that layout
@@ -1406,21 +1414,26 @@ host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tier
 #### The `storage-roles` case
 
 Check that vfsd gives each storage role to the boot disk or to the partition the storage statement
-names, and none to another disk, on either arch. Boots the default boot set headless four times,
-each with a second disk (`virtio-blk-pci`, drive `hd1`), to the terminal's `terminal: READY for
-injection` line and swapd's `swap partition:` line, and reads vfsd's `boot controller:`, `boot
+names on the disk it binds it to, and none to another disk, on either arch. Boots the default boot
+set headless five times, each with a second disk (`virtio-blk-pci`, drive `hd1`), to the terminal's
+`terminal: READY for injection` line and swapd's `swap partition:` line, or its `no swap partition;
+swap stays in RAM` line in the boot that takes none, and reads vfsd's `boot controller:`, `boot
 disk:` and role lines (`root:`, `/esp:`, `/data:`, `swap:`, each naming its disk's location):
 
 1. the images repacked in the split-data layout, `disk-data.img` on the second slot: the root and
    `/esp` on the boot disk, `/data` and swap named by the staged statement on the second disk;
-2. the single image, and a foreign disk (`target/xtask/storage-roles/foreign.img`, authored by
+2. the same images, `disk-data.img` at slot `0x11`, a location the statement does not name: the
+   root and `/esp` on the boot disk, `/data` and swap not taken, each with vfsd's `no partition
+   named by the storage statement: not on` line naming the disk it was seen on;
+3. the single image, and a foreign disk (`target/xtask/storage-roles/foreign.img`, authored by
    `disk::create_foreign_image`) on the second slot whose four partitions carry priority `0xFFFF`
    under unique GUIDs of their own: every role on the boot disk;
-3. the same at priority 0, the boot disk's: every role on the boot disk;
-4. a copy of `disk.img` (`target/xtask/storage-roles/disk-copy.img`) on the second slot: the boot
+4. the same at priority 0, the boot disk's: every role on the boot disk;
+5. a copy of `disk.img` (`target/xtask/storage-roles/disk-copy.img`) on the second slot: the boot
    disk at the boot controller's location, and every role on it.
 
-A `no boot disk:` line, a role on another disk than the boot says, or a missing line fails the boot.
+A `no boot disk:` line, a role on another disk than the boot says or taken where it says none is,
+or a missing line fails the boot.
 The scratch images are removed, and the images repacked in the layout they had, whatever the
 outcome. Each boot to its markers is bounded by four minutes. It requires a populated sysroot:
 
@@ -1640,7 +1653,7 @@ cargo xtask cells [--since <COMMIT> | --since-green <REV>] [--github-output <FIL
 |---|---|---|
 | `--since <COMMIT>` | no base | The change from this commit to the working tree |
 | `--since-green <REV>` | no base | The change from the newest commit of `REV`'s first-parent history, 200 commits at most, whose `build-test` run on a push to `master` passed (`gh run list`); every cell, after a `WARNING:` line, when there is none or the runs cannot be read |
-| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate` and `bench`, each a matrix's `include` list; `validate-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
+| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate`, `build` and `bench`, each a matrix's `include` list, `build` holding one tree per architecture and profile a `validate` cell is owed in and the release trees when the `bench` cell is owed, those with `bench` true; `validate-owed`, `build-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
 
 Without a base, every cell is owed. With one, the command places each changed file
 (`git diff --name-only` from the base to the working tree, a rename as both its paths) in a

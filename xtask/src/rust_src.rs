@@ -1655,15 +1655,15 @@ mod tests
     }
 
     // Defect caught: a file the standard-library cache's key hashes whose
-    // change alone owes no validate or bench cell (a README under
+    // change alone owes the build job of some tree no run (a README under
     // `shared/`, say): a `master` merge changing only it changes the key
-    // but runs no job that saves an entry under it, so every later pull
-    // request misses the cache until a merge owes those cells.
+    // but runs no job that saves that tree's entry under it, so every later
+    // pull request misses the cache until a merge owes that build.
     #[test]
-    fn a_change_to_a_file_the_std_cache_key_hashes_owes_the_cells_that_save_it()
+    fn a_change_to_a_file_the_std_cache_key_hashes_owes_the_build_jobs_that_save_it()
     {
         use crate::affected::Workspace;
-        use crate::commands::cells::owed_by;
+        use crate::commands::cells::{build_trees, owed_by};
         use crate::layers::{Presence, place};
 
         let root = repo_root();
@@ -1683,13 +1683,13 @@ mod tests
             .filter_map(|file| {
                 let placed = place(&ws, file, Presence::Present).unwrap();
                 let owed = owed_by(placed.class);
-                (owed.testers.is_empty() || !owed.bench)
+                (build_trees(owed).len() != 4)
                     .then(|| format!("{file}: {} ({})", placed.class.label(), placed.why))
             })
             .collect();
         assert!(
             short.is_empty(),
-            "files the key hashes that owe no saving cell: {short:#?}"
+            "files the key hashes that owe not every build job: {short:#?}"
         );
     }
 

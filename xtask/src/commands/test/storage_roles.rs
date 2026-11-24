@@ -5,24 +5,30 @@
 
 //! Storage roles test: vfsd gives each storage role to the boot disk, the
 //! disk at the PCI location the bootloader reported that carries the boot
-//! ESP, or to the partition the signed storage statement names, and to no
-//! other disk (docs/storage.md § GPT Role-GUID Discovery). Both arches.
+//! ESP, or to the partition the signed storage statement names on the disk
+//! it binds it to, and to no other disk (docs/storage.md § GPT Role-GUID
+//! Discovery). Both arches.
 //!
-//! Four boots of the default boot set, each to the terminal's
-//! [`READY_MARKER`] and swapd's taking of the swap partition, read vfsd's
-//! lines: the boot controller it was told of, the boot disk it found there,
-//! and, for each role (the root, `/esp`, `/data` and swap), the partition it
-//! took and the location of its disk.
+//! Five boots of the default boot set, each to the terminal's
+//! [`READY_MARKER`] and swapd's taking of the swap partition, or its line
+//! that it has none ([`NO_SWAP_MARKER`]), read vfsd's lines: the boot
+//! controller it was told of, the boot disk it found there, and, for each
+//! role (the root, `/esp`, `/data` and swap), the partition it took and the
+//! location of its disk, or why it took none.
 //!
 //! 1. **Split**: the images in the split-data layout, `disk-data.img` on the
 //!    second slot. The statement the layout stages names `/data` and swap
-//!    there: the root and `/esp` are on the boot disk, `/data` and swap
-//!    named on the second disk.
-//! 2. **Foreign, higher priority**: the single image, and on the second slot a
+//!    on the disk at that slot's location: the root and `/esp` are on the
+//!    boot disk, `/data` and swap named on the second disk.
+//! 2. **Moved**: the same images, `disk-data.img` at another slot
+//!    (`SecondSlot::Moved`). The root and `/esp` are on the boot disk;
+//!    `/data` and swap are not taken, vfsd naming the disk it saw their
+//!    partitions on, and swapd has no partition.
+//! 3. **Foreign, higher priority**: the single image, and on the second slot a
 //!    foreign disk ([`crate::disk::create_foreign_image`]) whose ESP, root,
 //!    data and swap partitions carry priority `0xFFFF`, above `disk.img`'s.
-//! 3. **Foreign, equal priority**: the same at `disk.img`'s priority, 0.
-//! 4. **Copy**: the single image, and a copy of `disk.img` on the second
+//! 4. **Foreign, equal priority**: the same at `disk.img`'s priority, 0.
+//! 5. **Copy**: the single image, and a copy of `disk.img` on the second
 //!    slot, which carries the boot ESP too.
 //!
 //! In the last three, every role is on the boot disk, and the boot disk is
@@ -42,10 +48,10 @@ use crate::error::{Context as _, Result, bail};
 use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
-use crate::disk::{DataPlacement, DiskLayout};
+use crate::disk::{DataDisk, DataPlacement, DiskLayout};
 use crate::guest::Guest;
 use crate::qemu::{
-    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, SecondDisk, build_qemu_argv,
+    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, SecondDisk, SecondSlot, build_qemu_argv,
     validate_sysroot_for_launch,
 };
 use crate::util::{require_tool, step};
@@ -55,6 +61,15 @@ const READY_MARKER: &str = "terminal: READY for injection";
 
 /// swapd's line once it took the swap partition and registered it.
 const SWAP_MARKER: &str = "swap partition: ";
+
+/// swapd's line when vfsd hands it no swap partition. Kept in sync with
+/// `services/swapd/src/main.rs`.
+const NO_SWAP_MARKER: &str = "no swap partition; swap stays in RAM";
+
+/// The text of vfsd's line for a role whose named partition is not on the
+/// disk the statement binds it to, after the role's name and up to that
+/// disk. Kept in sync with `resolve_role` in `services/vfsd/src/main.rs`.
+const ELSEWHERE_MARKER: &str = ": no partition named by the storage statement: not on ";
 
 /// vfsd's line naming the location the bootloader reported, its text from
 /// `PCI ` on.
@@ -81,6 +96,9 @@ enum On
     BootDisk,
     /// On the second disk, named by the storage statement.
     Named,
+    /// Taken by no partition: its named partition is on a disk outside the
+    /// place the statement binds it to.
+    Untaken,
 }
 
 /// One boot of the case.
@@ -89,6 +107,8 @@ struct Boot<'a>
     label: &'a str,
     /// The disk on the second slot.
     second: &'a Path,
+    /// The second slot.
+    slot: SecondSlot,
     /// Where each of [`ROLES`] must be found.
     roles: [On; 4],
 }
@@ -117,6 +137,7 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
             &firmware.code,
             vars.path(),
             boot.second,
+            boot.slot,
         )?;
         let lines = collect(&mut guest);
         guest.shutdown();
@@ -125,7 +146,7 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 
     let split = DiskLayout {
         block_size: layout.block_size,
-        data: DataPlacement::SecondImage,
+        data: DataPlacement::SecondImage(DataDisk::Slot),
     };
     let single = DiskLayout {
         block_size: layout.block_size,
@@ -139,7 +160,14 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
         boot(&Boot {
             label: "split: /data and swap named on the second disk",
             second: &ctx.data_disk_image(),
+            slot: SecondSlot::Named,
             roles: [On::BootDisk, On::BootDisk, On::Named, On::Named],
+        })?;
+        boot(&Boot {
+            label: "moved: /data and swap named on a disk at another slot",
+            second: &ctx.data_disk_image(),
+            slot: SecondSlot::Moved,
+            roles: [On::BootDisk, On::BootDisk, On::Untaken, On::Untaken],
         })?;
         crate::disk::create_disk_image(ctx, args.arch, single)
             .context("packing the single image")?;
@@ -152,6 +180,7 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
             boot(&Boot {
                 label,
                 second: &foreign,
+                slot: SecondSlot::Named,
                 roles: [On::BootDisk; 4],
             })?;
         }
@@ -160,6 +189,7 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
         boot(&Boot {
             label: "a copy of the boot disk",
             second: &copy,
+            slot: SecondSlot::Named,
             roles: [On::BootDisk; 4],
         })
     })();
@@ -172,8 +202,8 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
     Ok(())
 }
 
-/// Launch QEMU on the current `disk.img` with `second` on the second slot,
-/// and the variable store `firmware_vars`.
+/// Launch QEMU on the current `disk.img` with `second` at `slot`, and the
+/// variable store `firmware_vars`.
 fn launch(
     qemu_binary: &Path,
     ctx: &Context,
@@ -181,6 +211,7 @@ fn launch(
     firmware_code: &Path,
     firmware_vars: &Path,
     second: &Path,
+    slot: SecondSlot,
 ) -> Result<Guest>
 {
     let disk_path = ctx.disk_image();
@@ -188,7 +219,10 @@ fn launch(
         arch: args.arch,
         disk_path: &disk_path,
         disk_block_size: crate::disk::logical_block_size(&disk_path)?,
-        second_disk: Some(SecondDisk::of_image(second)?),
+        second_disk: Some(SecondDisk {
+            slot,
+            ..SecondDisk::of_image(second)?
+        }),
         firmware_code_path: firmware_code,
         firmware_vars_path: firmware_vars,
         smm: false,
@@ -220,9 +254,9 @@ fn launch(
     Guest::from_child(child)
 }
 
-/// The boot's serial lines up to both [`READY_MARKER`] and [`SWAP_MARKER`],
-/// in either order, within [`TIMEOUT`]; ended early by vfsd's
-/// [`NO_BOOT_DISK_MARKER`], which halts the boot.
+/// The boot's serial lines up to both [`READY_MARKER`] and [`SWAP_MARKER`]
+/// or [`NO_SWAP_MARKER`], in either order, within [`TIMEOUT`]; ended early
+/// by vfsd's [`NO_BOOT_DISK_MARKER`], which halts the boot.
 fn collect(guest: &mut Guest) -> Result<Vec<String>>
 {
     let start = std::time::Instant::now();
@@ -232,6 +266,10 @@ fn collect(guest: &mut Guest) -> Result<Vec<String>>
     {
         let mut awaited = pending.clone();
         awaited.push(NO_BOOT_DISK_MARKER);
+        if pending.contains(&SWAP_MARKER)
+        {
+            awaited.push(NO_SWAP_MARKER);
+        }
         let read = guest.collect_until_any(&awaited, TIMEOUT.saturating_sub(start.elapsed()))?;
         let last = read.last().cloned().unwrap_or_default();
         lines.extend(read);
@@ -239,14 +277,18 @@ fn collect(guest: &mut Guest) -> Result<Vec<String>>
         {
             break;
         }
-        pending.retain(|marker| !last.contains(marker));
+        pending.retain(|marker| {
+            !(last.contains(marker) || *marker == SWAP_MARKER && last.contains(NO_SWAP_MARKER))
+        });
     }
     Ok(lines)
 }
 
 /// Check a boot's `lines`: vfsd found the boot disk at the boot controller,
 /// and each of [`ROLES`] where `roles` says: on the boot disk, at its
-/// location; named, by the statement and at another.
+/// location; named, by the statement and at another; untaken, its named
+/// partition seen on a disk at another location than the one the statement
+/// binds it to and not taken, and for swap, swapd given none.
 fn check(lines: &[String], roles: [On; 4]) -> Result<()>
 {
     if let Some(line) = lines.iter().find(|line| line.contains(NO_BOOT_DISK_MARKER))
@@ -267,6 +309,15 @@ fn check(lines: &[String], roles: [On; 4]) -> Result<()>
     for (role, on) in ROLES.into_iter().zip(roles)
     {
         let marker = format!("{role}: partition ");
+        if on == On::Untaken
+        {
+            if let Some(line) = after(lines, &marker)
+            {
+                bail!("{role} was taken off the disk its statement binds it to: {line}");
+            }
+            untaken(lines, role, controller)?;
+            continue;
+        }
         let line = after(lines, &marker)
             .with_context(|| format!("vfsd logged no partition for {role}"))?;
         let at = location(line).with_context(|| format!("{role}: no location in {line}"))?;
@@ -281,9 +332,34 @@ fn check(lines: &[String], roles: [On; 4]) -> Result<()>
             {
                 bail!("{role} is not the statement's partition on the second disk: {line}")
             }
-            On::BootDisk | On::Named =>
+            On::BootDisk | On::Named | On::Untaken =>
             {}
         }
+    }
+    Ok(())
+}
+
+/// Check that `role` took no partition for the reason the moved boot
+/// stages: vfsd's line places the named partition on a disk at another
+/// location than the one the statement binds it to, neither being the boot
+/// controller's; for swap, swapd logged that it has none.
+fn untaken(lines: &[String], role: &str, controller: &str) -> Result<()>
+{
+    let line = after(lines, &format!("{role}{ELSEWHERE_MARKER}"))
+        .with_context(|| format!("vfsd logged no sighting of {role}'s named partition"))?;
+    let (bound, seen) = line
+        .split_once("; seen on disk ")
+        .and_then(|(bound, rest)| Some((bound, location(rest.strip_suffix("; not taken")?)?)))
+        .with_context(|| format!("{role}: no bound disk and sighting in {line}"))?;
+    if !bound.starts_with("PCI ") || bound == seen || bound == controller || seen == controller
+    {
+        bail!(
+            "{role}: the named partition is not seen off its disk, apart from the boot disk: {line}"
+        );
+    }
+    if role == "swap" && !lines.iter().any(|line| line.contains(NO_SWAP_MARKER))
+    {
+        bail!("swapd did not log that it has no swap partition");
     }
     Ok(())
 }
@@ -363,6 +439,49 @@ mod tests
             ESP,
         ]);
         check(&elsewhere, [On::BootDisk; 4]).unwrap_err();
+    }
+
+    // Defect caught: a role taken from a disk at another location than its
+    // statement binds it to, or untaken with no line naming where its
+    // partition was seen, read as the moved boot's pass.
+    #[test]
+    fn a_role_named_off_its_disk_must_be_untaken_and_seen()
+    {
+        let moved = [On::BootDisk, On::BootDisk, On::Untaken, On::Untaken];
+        let mut untaken = lines(&[
+            CONTROLLER,
+            BOOT_DISK,
+            ROOT,
+            ESP,
+            "/data: no partition named by the storage statement: not on PCI 0000:00:12.0; seen on disk 1 at PCI 0000:00:11.0; not taken",
+            "swap: no partition named by the storage statement: not on PCI 0000:00:12.0; seen on disk 1 at PCI 0000:00:11.0; not taken",
+        ]);
+        untaken.push("[swapd] no swap partition; swap stays in RAM".into());
+        check(&untaken, moved).unwrap();
+        check(&untaken[..untaken.len() - 1], moved).unwrap_err();
+        check(&untaken, [On::BootDisk; 4]).unwrap_err();
+
+        let taken = lines(&[
+            CONTROLLER,
+            BOOT_DISK,
+            ROOT,
+            ESP,
+            "/data: partition named by the storage statement at block 2048 on disk 1 at PCI 0000:00:11.0",
+            "swap: no partition named by the storage statement: not on PCI 0000:00:12.0; seen on disk 1 at PCI 0000:00:11.0; not taken",
+            "[swapd] no swap partition; swap stays in RAM",
+        ]);
+        check(&taken, moved).unwrap_err();
+
+        let unseen = lines(&[
+            CONTROLLER,
+            BOOT_DISK,
+            ROOT,
+            ESP,
+            "/data: no partition named by the storage statement on PCI 0000:00:12.0: none found",
+            "swap: no partition named by the storage statement: not on PCI 0000:00:12.0; seen on disk 1 at PCI 0000:00:11.0; not taken",
+            "[swapd] no swap partition; swap stays in RAM",
+        ]);
+        check(&unseen, moved).unwrap_err();
     }
 
     // Defect caught: a boot with no boot disk, or a role vfsd logged no

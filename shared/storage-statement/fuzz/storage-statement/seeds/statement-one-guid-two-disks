@@ -1,0 +1,2 @@
+data /a boot c0ffee01-2345-6789-abcd-ef0123456789
+data /b pci:0000:01:00.0 c0ffee01-2345-6789-abcd-ef0123456789

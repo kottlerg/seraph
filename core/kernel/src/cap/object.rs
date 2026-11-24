@@ -102,12 +102,15 @@ pub struct KernelObjectHeader
     /// multiply; bit 31 is [`REF_OBSERVED`], set while a sole-reference
     /// observer is bound. While the object waits on a dealloc cascade
     /// ([`CascadeStack`]) its count is 0, the flag clear, and this field holds
-    /// the low 32 bits of the stack link instead.
+    /// the low 32 bits of the stack link instead, but for an `AddressSpace`,
+    /// which keeps its link in [`AddressSpaceObject::deferred_next`] and reads
+    /// 0 here until it is freed.
     pub ref_count: AtomicU32,
     /// Concrete type, for use during deallocation.
     pub obj_type: ObjectType,
     /// The high 24 bits of the dealloc-cascade link ([`CascadeStack`]) while
-    /// the object is queued on one, and zero at every other time. The bytes
+    /// the object is queued on one, and zero at every other time; always zero
+    /// for an `AddressSpace`, whose link is in its wrapper. The bytes
     /// also pad the header to 8-byte alignment for `ancestor`. Public because
     /// mint sites outside this module build the header by struct literal.
     pub cascade_link_hi: [u8; 3],
@@ -290,7 +293,9 @@ impl KernelObjectHeader
     /// is not `Exited`, which keeps the object's storage from being freed
     /// (`sched::pin_thread_aspace`). A count of zero means the object's last
     /// reference is gone and its teardown has begun or is about to, so the pin
-    /// is refused rather than revive it. The pin is bounded like every syscall
+    /// is refused rather than revive it; a dealloc cascade keeps the link of an
+    /// address space it queues outside the count, so the count reads zero
+    /// until the space is freed ([`CascadeStack`]). The pin is bounded like every syscall
     /// pin (one per thread in a syscall), so no ceiling check is made.
     ///
     /// Returns whether the reference was taken.
@@ -1157,15 +1162,22 @@ impl MmioObject
     /// The spill chunks then go back to the arenas that funded them; a release
     /// that frees an arena page its `CSpace` outlived pushes it onto `stack`.
     ///
+    /// The records and chunks are as many as the mappings the owners made, so
+    /// the walk takes this CPU's pending interrupts between two withdrawn
+    /// mappings, each one unmap and its shootdown, and between batches of
+    /// [`SPILL_BATCH_CHUNKS`] chunks.
+    ///
     /// # Safety
     /// No capability slot or syscall pin references the object (its reference
     /// count is zero), so no map can be recording into it; only its lineage
-    /// count may still be touched by other CPUs. No lock is held, and the CPU
-    /// is stable (`release_ref`'s preconditions).
+    /// count may still be touched by other CPUs. No lock is held, the CPU
+    /// is stable (`release_ref`'s preconditions), and the caller runs where
+    /// an [`interrupt_window`] may open ([`dealloc_object`]'s contract).
     #[cfg(not(test))]
     unsafe fn withdraw_mappings(&self, stack: &mut CascadeStack)
     {
         let pages = (self.size / super::PAGE_BYTES) as usize;
+        let mut windows = BatchWindows::new(1);
         for m in self.records()
         {
             let Some(aso) = NonNull::new(m.aso.swap(core::ptr::null_mut(), Ordering::Acquire))
@@ -1173,6 +1185,13 @@ impl MmioObject
             {
                 continue;
             };
+            if windows.step()
+            {
+                // No lock is held (contract); the records not yet withdrawn
+                // still hold their address spaces, and no map records into
+                // the object at refcount zero.
+                interrupt_window();
+            }
             debug_assert!(
                 !core::ptr::eq(aso.as_ptr(), MMIO_RECORD_CLAIMED),
                 "withdraw_mappings: a record was being filled at refcount zero"
@@ -1190,8 +1209,15 @@ impl MmioObject
             unsafe { release_ref(aso.cast::<KernelObjectHeader>()) };
         }
         let mut next = self.spill.swap(core::ptr::null_mut(), Ordering::Acquire);
+        let mut windows = BatchWindows::new(SPILL_BATCH_CHUNKS);
         while let Some(chunk) = NonNull::new(next)
         {
+            if windows.step()
+            {
+                // No lock is held (contract), and the chain is this
+                // teardown's alone.
+                interrupt_window();
+            }
             // SAFETY: a chunk of this object's chain, which nothing else reads
             // at refcount zero.
             next = unsafe { chunk.as_ref().next.load(Ordering::Acquire) };
@@ -1486,12 +1512,53 @@ const SEED_BATCH_PAGES: u64 = 64;
 /// batches of this many pages.
 const ORPHAN_BATCH_PAGES: u64 = 64;
 
+/// Kept arena pages a dying `CSpace`'s donation return passes per stretch
+/// with interrupts masked: the lease each takes on its Memory object
+/// ([`free_donation_group`]) and the release of the teardown's hold on each
+/// ([`reclaim_cspace_donations`]). Each costs an atomic or two per page, and
+/// the kept pages are as many as the bodies the owner funded that outlive the
+/// `CSpace`, so each loop takes this CPU's pending interrupts between batches
+/// of this many pages.
+const KEPT_BATCH_PAGES: u64 = 64;
+
+/// Slot leaves a dying `CSpace`'s release pass visits per stretch with
+/// interrupts masked (the `CSpaceObj` arm of `dealloc_object_one`): four
+/// leaves are 224 slots, about one batch of the drain before it
+/// (`cap::drain::MAX_DRAIN_EDITS`). A slot costs at most one reference release
+/// and the leaves are as many as the owner paid for, so the pass takes this
+/// CPU's pending interrupts between batches of this many leaves. (An endpoint
+/// slot's release also releases the endpoint's waiters under its lock, a walk
+/// #1628 bounds.)
+const RELEASE_BATCH_LEAVES: u64 = 4;
+
+/// Spill chunks a dead `Mmio` object returns to their arenas per stretch with
+/// interrupts masked (`MmioObject::withdraw_mappings`). A chunk costs one
+/// arena-page lock hold, and the chunks are as many as the owners' mappings
+/// need, so the return takes this CPU's pending interrupts between batches of
+/// this many chunks.
+const SPILL_BATCH_CHUNKS: u64 = 64;
+
+/// Steps of the sort of a donation's kept arena pages
+/// ([`crate::cap::arena::sort_list`]) per stretch with interrupts masked. A
+/// step takes one page off the list or places one in a merged run, and the
+/// sort of `k` pages takes `O(k log k)` of them, so the sort takes this
+/// CPU's pending interrupts between batches of this many steps.
+const KEPT_SORT_BATCH_STEPS: u64 = 256;
+
+/// Death-observer nodes [`release_death_observers`] returns, and a death post
+/// (`sched::post_death_walk`) posts to, per stretch with interrupts masked. A
+/// node costs one hold of its queue's lock and a reference release or a post,
+/// and a thread or address space carries as many nodes as its binders bound,
+/// so each walk takes this CPU's pending interrupts between batches of this
+/// many nodes.
+pub(crate) const OBSERVER_BATCH_NODES: u64 = 64;
+
 /// The steps of a walk whose length a caller sizes, counted to say when the
 /// walk opens an [`interrupt_window`]: before each step that follows a full
 /// batch of `size` steps, so that the walk masks interrupts for at most
 /// `size` steps at a time and opens no window before its first step or
 /// after its last.
-struct BatchWindows
+pub(crate) struct BatchWindows
 {
     size: u64,
     in_batch: u64,
@@ -1499,13 +1566,13 @@ struct BatchWindows
 
 impl BatchWindows
 {
-    const fn new(size: u64) -> Self
+    pub(crate) const fn new(size: u64) -> Self
     {
         Self { size, in_batch: 0 }
     }
 
     /// Count one step; `true` when a window opens before it.
-    fn step(&mut self) -> bool
+    pub(crate) fn step(&mut self) -> bool
     {
         let due = self.in_batch == self.size;
         if due
@@ -1528,8 +1595,13 @@ impl BatchWindows
 /// (`syscall::cap`, `pre_grow_for_explicit_slot`), every derivation-lock
 /// loop between its holds
 /// ([`DerivationLock::write_unlock_between_batches`](crate::cap::derivation::DerivationLock::write_unlock_between_batches))
-/// and a dying `CSpace`'s pass over its arena pages
-/// (`CSpaceKernelObject::orphan_arena_pages`), so that a syscall
+/// a dying `CSpace`'s pass over its arena pages
+/// (`CSpaceKernelObject::orphan_arena_pages`), the dealloc cascade between
+/// two teardowns ([`dealloc_object`]), and the teardown walks whose length
+/// an owner chose: a dying `CSpace`'s release pass and the sort, leases and
+/// release of its kept arena pages, a death-observer chain's release, an
+/// address space's frame release and an Mmio object's mapping withdrawal, so
+/// that a syscall
 /// running one masks interrupts for one batch at a time: shootdown and wakeup
 /// IPIs are acknowledged, and the timer and the heartbeat tick, meanwhile
 /// (core/kernel/docs/capability-internals.md § Storage: Hybrid Radix
@@ -2041,13 +2113,18 @@ pub struct AddressSpaceObject
     /// Intermediate page-table pages donated to this AS, and the record of
     /// every donation; `dealloc` reclaims the donations wholesale.
     pub pt_pool: PagePool,
-    /// Intrusive link for the per-CPU deferred reclaim stack
-    /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
-    /// that stack: the thread that dropped its last capability was itself
-    /// bound to it (or was stopped by a concurrent teardown while freeing
-    /// it), or `release_ref` dropped its last reference (a syscall pin, a
-    /// batched capability move's freed source, or an Mmio object's mapping
-    /// record), so the free completes off-CPU. Written only by the owning CPU.
+    /// Intrusive link for the stack that holds this object once its last
+    /// reference is gone: a dealloc cascade's ([`CascadeStack`], which keeps an
+    /// address space's link here rather than in its count, so that the count
+    /// reads 0 to [`KernelObjectHeader::inc_ref_if_live`] while it is queued),
+    /// or the per-CPU deferred reclaim stack ([`drain_deferred_reclaim`]),
+    /// never both at once. It goes on the deferred stack when the thread that
+    /// dropped its last capability was itself bound to it (or was stopped by a
+    /// concurrent teardown while freeing it), or when `release_ref` dropped
+    /// its last reference (a syscall pin, a batched capability move's freed
+    /// source, or an Mmio object's mapping record), so the free completes
+    /// off-CPU. Null while on neither stack; written only by the CPU whose stack
+    /// holds the object.
     pub deferred_next: *mut KernelObjectHeader,
 }
 
@@ -3067,8 +3144,9 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 ///   or the idle thread (pinned to its CPU) draining the deferred-reclaim
 ///   stack, which reaches here through an Mmio object's teardown
 ///   (`MmioObject::withdraw_mappings`).
-/// - Must NOT be called with `DERIVATION_LOCK` held, nor with any IPC source,
-///   per-TCB `sched_lock`, per-CPU scheduler, or sleep-list lock held (the
+/// - No lock may be held, `DERIVATION_LOCK`, an IPC source, a per-TCB
+///   `sched_lock`, a per-CPU scheduler and a sleep-list lock among them, and
+///   the caller runs where an [`interrupt_window`] may open (the
 ///   preconditions `dealloc_object` states).
 #[cfg(not(test))]
 pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
@@ -3420,7 +3498,7 @@ unsafe fn unlink_dying_waiter(
 const CASCADE_LINK_BITS: u32 = 56;
 
 /// The objects a [`dealloc_object`] call has orphaned and not yet torn down:
-/// a LIFO linked through the objects' own headers, so it holds any number of
+/// a LIFO linked through the objects themselves, so it holds any number of
 /// them without allocating.
 ///
 /// Only a refcount-0 object that nothing else references, and that is on no
@@ -3439,6 +3517,14 @@ const CASCADE_LINK_BITS: u32 = 56;
 /// `obj_type` and `ancestor`, which the teardown reads, are never written.
 /// [`Self::pop`] zeroes both link fields again, so the object it returns
 /// reads `ref_count == 0`, as when it was pushed.
+///
+/// An `AddressSpace` keeps its link in [`AddressSpaceObject::deferred_next`]
+/// instead, and its `ref_count` reads 0 for as long as it is queued: a thread
+/// still bound to it names it with no reference, and
+/// [`crate::sched::pin_thread_aspace`] pins it through
+/// [`KernelObjectHeader::inc_ref_if_live`], which refuses only a count of 0.
+/// A link in the count would read as a live count there, and the pin would
+/// both corrupt the link and revive a space whose teardown is under way.
 struct CascadeStack
 {
     top: Option<NonNull<KernelObjectHeader>>,
@@ -3486,6 +3572,67 @@ impl CascadeStack
         )]
         let va = (((word << (64 - CASCADE_LINK_BITS)) as i64) >> (61 - CASCADE_LINK_BITS)) as u64;
         NonNull::new(va as *mut KernelObjectHeader)
+    }
+
+    /// Where `obj` keeps its link outside its header: an `AddressSpace`'s
+    /// [`AddressSpaceObject::deferred_next`], which no other stack uses while
+    /// this one holds the object (the deferred-reclaim stack hands its objects
+    /// to [`dealloc_object`] only after popping them). `None` for every other
+    /// type, whose link is in its header.
+    ///
+    /// # Safety
+    /// `obj` is the header of a live object of the type its `obj_type` names.
+    unsafe fn outside_link(obj: NonNull<KernelObjectHeader>)
+    -> Option<*mut *mut KernelObjectHeader>
+    {
+        // SAFETY: caller contract; `obj_type` is never written while queued.
+        if unsafe { (*obj.as_ptr()).obj_type } != ObjectType::AddressSpace
+        {
+            return None;
+        }
+        // SAFETY: an AddressSpace header starts an `AddressSpaceObject`
+        // (caller contract); the field address is taken without a reference.
+        Some(unsafe {
+            core::ptr::addr_of_mut!((*obj.as_ptr().cast::<AddressSpaceObject>()).deferred_next)
+        })
+    }
+
+    /// The object below `obj` on this stack.
+    ///
+    /// # Safety
+    /// `obj` is a header on this stack.
+    unsafe fn read_next(obj: NonNull<KernelObjectHeader>) -> Option<NonNull<KernelObjectHeader>>
+    {
+        // SAFETY: caller contract (a live, queued object).
+        match unsafe { Self::outside_link(obj) }
+        {
+            // SAFETY: the link field is this stack's alone while it holds `obj`.
+            Some(link) => NonNull::new(unsafe { link.read() }),
+            // SAFETY: caller contract.
+            None => Self::decode(unsafe { Self::read_link(obj) }),
+        }
+    }
+
+    /// Store `next` as the object below `obj`.
+    ///
+    /// # Safety
+    /// As [`Self::write_link`]'s.
+    unsafe fn write_next(
+        obj: NonNull<KernelObjectHeader>,
+        next: Option<NonNull<KernelObjectHeader>>,
+    )
+    {
+        // SAFETY: caller contract (a live object whose link fields are ours).
+        if let Some(link) = unsafe { Self::outside_link(obj) }
+        {
+            // SAFETY: caller contract; `link` is valid and aligned for the write.
+            unsafe { link.write(next.map_or(core::ptr::null_mut(), NonNull::as_ptr)) };
+        }
+        else
+        {
+            // SAFETY: caller contract.
+            unsafe { Self::write_link(obj, Self::encode(next)) };
+        }
     }
 
     /// Read the link word `obj`'s header holds.
@@ -3537,16 +3684,19 @@ impl CascadeStack
     /// its header is used after this call. The one exception to "no other
     /// owner" is a `CSpace` wrapper's arena pages' `owner` back-pointer, used
     /// only for the wrapper's `cs_pool.lock` and `arena_free`
-    /// (`free_arena_chunk`), never its header.
+    /// (`free_arena_chunk`), never its header; and an `AddressSpace`'s bound
+    /// threads, whose pointer reaches only its count, through
+    /// [`KernelObjectHeader::inc_ref_if_live`], which the stack leaves at 0.
     unsafe fn push(&mut self, obj: NonNull<KernelObjectHeader>)
     {
         // SAFETY: caller contract (a live header).
         let refs = unsafe { obj.as_ref() }.ref_count.load(Ordering::Relaxed);
         debug_assert_eq!(refs, 0, "cascade: pushed object is still referenced");
-        // SAFETY: caller contract: the link fields are ours alone; the one
-        // other reference it allows, a `CSpace` wrapper's arena-page `owner`
-        // back-pointer, never reaches the header.
-        unsafe { Self::write_link(obj, Self::encode(self.top)) };
+        // SAFETY: caller contract: the link fields are ours alone; the other
+        // references it allows, a `CSpace` wrapper's arena-page `owner`
+        // back-pointer and an `AddressSpace`'s bound threads, never write them,
+        // and an `AddressSpace`'s link is not in its count.
+        unsafe { Self::write_next(obj, self.top) };
         self.top = Some(obj);
     }
 
@@ -3557,29 +3707,32 @@ impl CascadeStack
         // SAFETY: `top` was queued by `push`, whose contract keeps it live,
         // its link fields this stack's alone, and unreferenced but for the
         // `owner` back-pointer it allows until it is popped here.
-        let word = unsafe { Self::read_link(top) };
-        self.top = Self::decode(word);
+        self.top = unsafe { Self::read_next(top) };
         // SAFETY: as above; `top` is popped here, so the link fields are the
         // caller's alone and no reference to its header is used across this call.
-        unsafe { Self::write_link(top, 0) };
+        unsafe { Self::write_next(top, None) };
         Some(top)
     }
 }
 
 /// Tear down `first` and everything its teardown orphans: `teardown` runs on
 /// `first`, then on each object it or a later run pushed onto the stack, most
-/// recent first, until the stack is empty.
+/// recent first, until the stack is empty. `window` runs between two
+/// teardowns, before each one after the first, so a cascade of one object runs
+/// it never.
 ///
-/// The driver of [`dealloc_object`]; generic so the host tests drive the same
-/// loop with a model teardown.
-fn run_cascade<F>(first: NonNull<KernelObjectHeader>, mut teardown: F)
+/// The driver of [`dealloc_object`], whose `window` is [`interrupt_window`];
+/// generic so the host tests drive the same loop with a model teardown.
+fn run_cascade<F, W>(first: NonNull<KernelObjectHeader>, mut teardown: F, mut window: W)
 where
     F: FnMut(NonNull<KernelObjectHeader>, &mut CascadeStack),
+    W: FnMut(),
 {
     let mut stack = CascadeStack::new();
     teardown(first, &mut stack);
     while let Some(next) = stack.pop()
     {
+        window();
         teardown(next, &mut stack);
     }
 }
@@ -3589,17 +3742,28 @@ where
 /// queueing a queue whose last reference this was on the cascade stack (its
 /// dealloc then runs from the caller's loop, not by recursion). Called by an
 /// owner's teardown (the Thread and `AddressSpace` arms) with the chain it
-/// took, once no death walk can read it.
+/// took, once no death walk can read it. The chain is as long as the owner's
+/// binders made it, so the walk takes this CPU's pending interrupts between
+/// batches of [`OBSERVER_BATCH_NODES`] nodes.
 ///
 /// # Safety
-/// The caller owns every node of the chain and holds no lock.
+/// The caller owns every node of the chain, holds no lock, and runs where an
+/// [`interrupt_window`] may open ([`dealloc_object`]'s contract).
 #[cfg(not(test))]
 unsafe fn release_death_observers(
     first: *mut crate::sched::thread::DeathObserver,
     stack: &mut CascadeStack,
 )
 {
+    let mut windows = BatchWindows::new(OBSERVER_BATCH_NODES);
     let release = |node: *mut crate::sched::thread::DeathObserver| {
+        if windows.step()
+        {
+            // No lock is held (contract), the walk has read this node's
+            // successor, and the nodes not yet returned are the caller's
+            // alone, each holding its queue live.
+            interrupt_window();
+        }
         // SAFETY: the caller took the chain, so it owns every node; `node` is valid
         // until this closure returns for it.
         let eq = unsafe { (*node).eq };
@@ -3870,9 +4034,23 @@ pub unsafe fn object_for_new_slot(
 ///   or it is a fresh body that was never published (a range split's
 ///   rollback frees such bodies at their initial count of 1).
 /// - The CPU index must be stable — syscall context with interrupts disabled,
-///   fault delivery with interrupts disabled before its park, or the idle
+///   fault delivery with interrupts disabled before its park, the end of an
+///   interrupt taken from user mode with interrupts disabled, or the idle
 ///   thread's deferred-reclaim drain — because the Mmio arm releases
 ///   address-space references through [`release_ref`].
+/// - The call may open an [`interrupt_window`]: between every two
+///   teardowns of its cascade, and between the batches of the walks an arm
+///   makes (a dying `CSpace`'s release pass and donation return, a
+///   death-observer chain, an address space's frame release, an Mmio
+///   object's mapping withdrawal, a freed body's clear). So no lock of any
+///   kind may be held across it, the bare spin locks of
+///   core/kernel/docs/scheduling-internals.md § Lock Hierarchy included, and
+///   the caller runs where an interrupt may be taken with preemption
+///   disabled, as each context above does: an interrupt taken in a fault
+///   delivery's window leaves the parking thread to its own `schedule()`
+///   (§ `ThreadState` Transitions, "Voluntary-block window"), and one taken
+///   at the end of an interrupt from user mode leaves the return-work bits
+///   it posts to the next return (§ Return Work).
 /// - Must NOT be called with `DERIVATION_LOCK` held: the `CSpaceObj` arm
 ///   takes that (non-recursive) lock for its batched derivation drain, and
 ///   the Memory arm takes the frame-allocator lock.
@@ -3894,7 +4072,7 @@ pub unsafe fn object_for_new_slot(
 /// Each object one of those releases leaves unreferenced is pushed onto a
 /// [`CascadeStack`] local to this call (and a `CSpace` wrapper's first run re-pushes the wrapper beneath its slots'
 /// objects, for the second run that returns its pool), linked through the
-/// objects' own headers, and this function tears the stack down, most recent
+/// objects themselves, and this function tears the stack down, most recent
 /// first, until it is empty. No arm recurses into `dealloc_object`, so the
 /// call's stack use is a constant whatever the fan-out (a caller-sized wait
 /// set, a chain of observer nodes, a `CSpace`'s slots) or the depth of the
@@ -3905,13 +4083,26 @@ pub unsafe fn object_for_new_slot(
 #[cfg(not(test))]
 pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 {
-    run_cascade(ptr, |next, stack| {
-        // SAFETY: `next` is the caller's object (this function's contract)
-        // or one an arm pushed, which `CascadeStack::push`'s contract leaves
-        // unreferenced and exclusively owned but for a `CSpace` wrapper's
-        // arena-page `owner` back-pointer; no lock is held between arms.
-        unsafe { dealloc_object_one(next, stack) };
-    });
+    run_cascade(
+        ptr,
+        |next, stack| {
+            // SAFETY: `next` is the caller's object (this function's contract)
+            // or one an arm pushed, which `CascadeStack::push`'s contract leaves
+            // unreferenced and exclusively owned but for a `CSpace` wrapper's
+            // arena-page `owner` back-pointer and an `AddressSpace`'s bound
+            // threads, whose pins its count of 0 refuses; no lock is held
+            // between arms.
+            unsafe { dealloc_object_one(next, stack) };
+        },
+        // No lock is held between arms, and every caller runs where an
+        // interrupt window may open (this function's contract). The popped
+        // object is on no stack and referenced by nothing an interrupt handler
+        // reaches, and the queued ones only through a `CSpace` wrapper's
+        // arena-page `owner`, as across the windows the arms open themselves,
+        // and an `AddressSpace`'s bound threads, whose pins its count of 0
+        // refuses (`CascadeStack`).
+        interrupt_window,
+    );
 }
 
 /// Return a group of a dead pool's donations that share one Memory object,
@@ -3950,6 +4141,19 @@ unsafe fn free_donation_group(group: &mut [DonationRecord], stack: &mut CascadeS
     let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
     // A kept page lies inside its donation, inside the Memory object's region.
     let offset_of = |page: *mut ArenaPage| virt_to_phys(page as u64).wrapping_sub(anc_memory.base);
+    // No lock is held (contract), and every kept page is held, on its list
+    // or in a sorted run, with no other path reading the links, so a window
+    // between two sort steps or two leases exposes nothing another CPU could
+    // use; the record's reference and the leases taken so far keep the Memory
+    // object live. The counts run across the group's records.
+    let mut sort_windows = BatchWindows::new(KEPT_SORT_BATCH_STEPS);
+    let mut sort_step = || {
+        if sort_windows.step()
+        {
+            interrupt_window();
+        }
+    };
+    let mut lease_windows = BatchWindows::new(KEPT_BATCH_PAGES);
     for record in group.iter_mut()
     {
         let next_of = |page: *mut ArenaPage| {
@@ -3965,12 +4169,23 @@ unsafe fn free_donation_group(group: &mut [DonationRecord], stack: &mut CascadeS
         // SAFETY: every page on the list is held (contract) and lies in this
         // donation's span (its record cell named this record), so each is valid
         // for `next_of`, `set_next`, and `offset_of`.
-        record.holes =
-            unsafe { crate::cap::arena::sort_list(record.holes, &next_of, &set_next, &offset_of) };
+        record.holes = unsafe {
+            crate::cap::arena::sort_list(
+                record.holes,
+                &next_of,
+                &set_next,
+                &offset_of,
+                &mut sort_step,
+            )
+        };
         let mut cur = record.holes;
         // SAFETY: every page on the list is held (contract).
         while let Some(page) = unsafe { cur.as_ref() }
         {
+            if lease_windows.step()
+            {
+                interrupt_window();
+            }
             cur = page.next.load(Ordering::Relaxed);
             // The page's lease on the Memory object is taken while the
             // record's reference still holds it.
@@ -4051,8 +4266,15 @@ unsafe fn reclaim_cspace_donations(
     // SAFETY: caller contract.
     unsafe { obj.cs_pool.reclaim_donations(free) };
     let mut cur = kept;
+    let mut windows = BatchWindows::new(KEPT_BATCH_PAGES);
     while !cur.is_null()
     {
+        if windows.step()
+        {
+            // No lock is held (contract), and the pages not yet passed are
+            // still held, so none is freed by another CPU meanwhile.
+            interrupt_window();
+        }
         // SAFETY: a kept page, held by the teardown until the release below;
         // its ancestor and lease were set when its donation went back.
         let page = unsafe { &*cur };
@@ -4566,7 +4788,21 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 };
                 // SAFETY: cs_ptr non-null and live; for_each_object handles iteration.
                 let cs = unsafe { &*cs_ptr };
-                cs.for_each_object(release);
+                // The pass visits every slot below the grow cursor, as many as
+                // the owner paid for, so it takes this CPU's pending interrupts
+                // between batches of RELEASE_BATCH_LEAVES leaves. No lock is
+                // held between leaves, and the CSpace is drained, unregistered
+                // and its bound threads stopped, so no other CPU reads its slot
+                // pages meanwhile; the objects already queued are reached only
+                // as `CascadeStack::push` allows.
+                let mut windows = BatchWindows::new(RELEASE_BATCH_LEAVES);
+                let leaf = || {
+                    if windows.step()
+                    {
+                        interrupt_window();
+                    }
+                };
+                cs.for_each_object_by_leaf(leaf, release);
 
                 // Drop the inline CSpace before reclaiming its storage; its
                 // own `Drop` is a no-op for retype-backed (pool pages flow
@@ -5775,34 +6011,63 @@ unsafe fn dealloc_thread(
 #[cfg(test)]
 mod tests
 {
-    // The orphan walk itself runs over physical arena pages, which a host
-    // test has none of; its batching is `BatchWindows`, checked here.
+    // The walks a teardown batches (the orphan pass, the kept pages' sort,
+    // leases and releases, the release pass's leaves, the death-observer
+    // nodes, a dead Mmio object's mappings and spill chunks, an address
+    // space's tables) run over physical pages, slot leaves, observer nodes or
+    // page tables, which a host test has none of; their batching is
+    // `BatchWindows` at each walk's size, checked here. The defect caught: a
+    // window missing after a full batch, one before the first step or after
+    // the last, or a batch longer than its size.
     #[test]
-    fn orphan_walk_opens_a_window_per_batch_of_pages()
+    fn teardown_walks_open_a_window_per_batch()
     {
-        for pages in [0u64, 1, 63, 64, 65, 128, 129, 1000]
+        for size in [
+            super::ORPHAN_BATCH_PAGES,
+            super::KEPT_BATCH_PAGES,
+            super::KEPT_SORT_BATCH_STEPS,
+            super::RELEASE_BATCH_LEAVES,
+            super::OBSERVER_BATCH_NODES,
+            super::SPILL_BATCH_CHUNKS,
+            // A dead Mmio object's mappings and an address space's tables.
+            1,
+        ]
         {
-            let mut windows = super::BatchWindows::new(super::ORPHAN_BATCH_PAGES);
-            let (mut opened, mut run, mut longest) = (0u64, 0u64, 0u64);
-            for _ in 0..pages
+            for steps in [
+                0u64,
+                1,
+                2,
+                size - 1,
+                size,
+                size + 1,
+                2 * size,
+                2 * size + 1,
+                1000,
+            ]
             {
-                if windows.step()
+                let mut windows = super::BatchWindows::new(size);
+                let (mut opened, mut run, mut longest) = (0u64, 0u64, 0u64);
+                for _ in 0..steps
                 {
-                    opened += 1;
-                    run = 0;
+                    if windows.step()
+                    {
+                        assert!(run > 0, "a window before the first step");
+                        opened += 1;
+                        run = 0;
+                    }
+                    run += 1;
+                    longest = longest.max(run);
                 }
-                run += 1;
-                longest = longest.max(run);
+                assert_eq!(
+                    opened,
+                    steps.saturating_sub(1) / size,
+                    "one window per full batch of {size} in {steps} steps, none after the last"
+                );
+                assert!(
+                    longest <= size,
+                    "{steps} steps: a batch of {longest} over {size}"
+                );
             }
-            assert_eq!(
-                opened,
-                pages.saturating_sub(1) / super::ORPHAN_BATCH_PAGES,
-                "one window per full batch of {pages} pages, none after the last"
-            );
-            assert!(
-                longest <= super::ORPHAN_BATCH_PAGES,
-                "{pages} pages: a batch of {longest}"
-            );
         }
     }
 
@@ -6130,9 +6395,15 @@ mod tests
     /// object 0 with none. A `CSpaceObj` runs twice, as the kernel's arm does:
     /// its first run queues itself, then releases its holds, and its second
     /// run tears it down. Returns how many times each object was torn down,
-    /// and the step at which each was (its last run).
+    /// and the step at which each was (its last run). Checks that the cascade
+    /// runs its window once between every two teardowns, and never before the
+    /// first or after the last.
     fn run_model_cascade(types: &[ObjectType], holds: &[Vec<usize>]) -> (Vec<u32>, Vec<usize>)
     {
+        use core::cell::Cell;
+        // A window ran since the last teardown, and how many ran.
+        let window_open = Cell::new(false);
+        let windows = Cell::new(0usize);
         let mut refs = vec![0u32; types.len()];
         for held in holds
         {
@@ -6149,46 +6420,67 @@ mod tests
         let mut torn_at = vec![usize::MAX; types.len()];
         let mut requeued = vec![false; types.len()];
         let mut step = 0;
-        run_cascade(ptrs[0], |obj, stack| {
-            // SAFETY: every pointer the model queues is one of `objects`,
-            // popped and so no longer written by the stack.
-            let model = unsafe { &*obj.as_ptr().cast::<ModelObject>() };
-            let i = model.index;
-            assert_eq!(model.header.ref_count.load(Ordering::Relaxed), 0);
-            assert_eq!(model.header.cascade_link_hi, [0; 3]);
-            assert_eq!(model.header.obj_type, types[i]);
-            assert_eq!(
-                model.header.ancestor.load(Ordering::Relaxed),
-                model_ancestor(i)
-            );
-            step += 1;
-            let first_of_two = types[i] == ObjectType::CSpaceObj && !requeued[i];
-            if first_of_two
-            {
-                requeued[i] = true;
-                // SAFETY: popped and unreferenced, as the kernel's wrapper is
-                // when its first run re-queues it.
-                unsafe { stack.push(obj) };
-            }
-            else
-            {
-                torn[i] += 1;
-                torn_at[i] = step;
-            }
-            if first_of_two || types[i] != ObjectType::CSpaceObj
-            {
-                for &h in &holds[i]
+        run_cascade(
+            ptrs[0],
+            |obj, stack| {
+                // SAFETY: every pointer the model queues is one of `objects`,
+                // popped and so no longer written by the stack.
+                let model = unsafe { &*obj.as_ptr().cast::<ModelObject>() };
+                let i = model.index;
+                assert_eq!(
+                    window_open.replace(false),
+                    step > 0,
+                    "a window runs before each teardown but the first, at step {step}"
+                );
+                assert_eq!(model.header.ref_count.load(Ordering::Relaxed), 0);
+                assert_eq!(model.header.cascade_link_hi, [0; 3]);
+                assert_eq!(model.header.obj_type, types[i]);
+                assert_eq!(
+                    model.header.ancestor.load(Ordering::Relaxed),
+                    model_ancestor(i)
+                );
+                step += 1;
+                let first_of_two = types[i] == ObjectType::CSpaceObj && !requeued[i];
+                if first_of_two
                 {
-                    // SAFETY: `ptrs[h]` is a live model header.
-                    if unsafe { ptrs[h].as_ref() }.dec_ref() == 0
+                    requeued[i] = true;
+                    // SAFETY: popped and unreferenced, as the kernel's wrapper is
+                    // when its first run re-queues it.
+                    unsafe { stack.push(obj) };
+                }
+                else
+                {
+                    torn[i] += 1;
+                    torn_at[i] = step;
+                }
+                if first_of_two || types[i] != ObjectType::CSpaceObj
+                {
+                    for &h in &holds[i]
                     {
-                        // SAFETY: that was the model object's last reference,
-                        // and its pointer has a raw source.
-                        unsafe { stack.push(ptrs[h]) };
+                        // SAFETY: `ptrs[h]` is a live model header.
+                        if unsafe { ptrs[h].as_ref() }.dec_ref() == 0
+                        {
+                            // SAFETY: that was the model object's last reference,
+                            // and its pointer has a raw source.
+                            unsafe { stack.push(ptrs[h]) };
+                        }
                     }
                 }
-            }
-        });
+            },
+            || {
+                assert!(
+                    !window_open.replace(true),
+                    "two windows with no teardown between"
+                );
+                windows.set(windows.get() + 1);
+            },
+        );
+        assert!(!window_open.get(), "a window ran after the last teardown");
+        assert_eq!(
+            windows.get(),
+            step - 1,
+            "one window between every two teardowns"
+        );
         free_models(objects);
         (torn, torn_at)
     }
@@ -6390,5 +6682,60 @@ mod tests
         }
         assert_eq!(CascadeStack::encode(None), 0);
         assert_eq!(CascadeStack::decode(0), None);
+    }
+
+    // Defect guarded: a queued address space whose count word holds its
+    // cascade link, so a bound thread's `SYS_THREAD_READ_MEM` pin
+    // (`sched::pin_thread_aspace`) reads the link as a live count, takes a
+    // reference on a space whose teardown is under way, and corrupts the link.
+    #[test]
+    fn a_queued_address_space_refuses_a_live_pin()
+    {
+        let below = alloc_models(&[ObjectType::Endpoint, ObjectType::Endpoint], &[0, 0]);
+        let mut space: core::mem::MaybeUninit<AddressSpaceObject> =
+            core::mem::MaybeUninit::uninit();
+        let aso = space.as_mut_ptr();
+        // SAFETY: `aso` points to storage of an `AddressSpaceObject` live for
+        // this function; the field addresses are taken without a reference,
+        // and only the header and `deferred_next` are ever touched.
+        // SAFETY: `aso` points to storage of an `AddressSpaceObject` live for
+        // this function; the field address is taken without a reference, and
+        // only the header and `deferred_next` are ever touched.
+        let header = unsafe { core::ptr::addr_of_mut!((*aso).header) };
+        // SAFETY: as above.
+        let next = unsafe { core::ptr::addr_of_mut!((*aso).deferred_next) };
+        // SAFETY: `header` is valid and aligned for the write, and nothing else
+        // accesses it.
+        unsafe { header.write(KernelObjectHeader::new(ObjectType::AddressSpace)) };
+        // SAFETY: `next` is valid and aligned for the write, and nothing else
+        // accesses it.
+        unsafe { next.write(core::ptr::null_mut()) };
+        // SAFETY: the header was initialised above.
+        let fresh = unsafe { &*header };
+        fresh.ref_count.store(0, Ordering::Relaxed);
+        // SAFETY: `header` is the address of a field of live storage.
+        let space_header = unsafe { NonNull::new_unchecked(header) };
+        let mut stack = CascadeStack::new();
+        // SAFETY: each object is live, unreferenced, on no stack, and ours.
+        unsafe { stack.push(model_header(below[0])) };
+        // SAFETY: as above.
+        unsafe { stack.push(space_header) };
+        // SAFETY: as above.
+        unsafe { stack.push(model_header(below[1])) };
+        // SAFETY: the header is live; the stack writes only `deferred_next`.
+        let queued = unsafe { &*header };
+        assert_eq!(queued.ref_count.load(Ordering::Relaxed), 0);
+        assert_eq!(queued.cascade_link_hi, [0; 3]);
+        assert!(!queued.inc_ref_if_live(), "a pin revived a queued space");
+        // SAFETY: as above.
+        assert_eq!(unsafe { next.read() }, model_header(below[0]).as_ptr());
+        assert_eq!(stack.pop(), Some(model_header(below[1])));
+        assert_eq!(stack.pop(), Some(space_header));
+        // SAFETY: popped, so the stack no longer writes it.
+        assert!(unsafe { next.read() }.is_null());
+        assert_eq!(queued.ref_count.load(Ordering::Relaxed), 0);
+        assert_eq!(stack.pop(), Some(model_header(below[0])));
+        assert_eq!(stack.pop(), None);
+        free_models(below);
     }
 }

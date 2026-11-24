@@ -734,6 +734,9 @@ fn sys_exit(_tf: UserFrame) -> Result<u64, SyscallError>
 
         // Post death notification if bound (exit_reason 0 = clean exit).
         // SAFETY: tcb is valid; post_death_notification handles null eq check.
+        // No lock is held, and a syscall may take interrupts. The walk takes interrupts between batches
+        // of observers with preemption disabled, so the thread stays on this
+        // CPU until the schedule below.
         unsafe {
             crate::sched::post_death_notification(tcb, 0);
         }
@@ -762,9 +765,10 @@ fn sys_exit(_tf: UserFrame) -> Result<u64, SyscallError>
 /// terminal-fault path's ([`crate::sched::record_aspace_end`]), and like it
 /// this schedules away right after the posts, with no further dereference of
 /// the thread or its address space: interrupts stay masked from the record to
-/// the posts, so the thread stays on its CPU and the address space's teardown,
-/// which waits until every bound thread runs on no CPU, cannot take the
-/// observer chain the post walks.
+/// the posts, and the posts take interrupts only between batches of observers
+/// with preemption disabled (`sched::post_death_walk`), so the thread stays on
+/// its CPU and the address space's teardown, which waits until every bound
+/// thread runs on no CPU, cannot take the observer chain the post walks.
 ///
 /// The kernel stops only the calling thread and has no notion of a main
 /// thread; sibling threads and the process's resources are torn down by
@@ -805,6 +809,9 @@ fn sys_aspace_exit(tf: UserFrame) -> Result<u64, SyscallError>
         // Notify the calling thread's observers (a supervisor that bound the
         // thread; procmgr's per-thread observer of a main thread).
         // SAFETY: tcb is valid; post_death_notification handles null eq check.
+        // No lock is held, and a syscall may take interrupts. The walk takes interrupts between batches
+        // of observers with preemption disabled, so the thread stays on this
+        // CPU until the schedule below.
         unsafe {
             crate::sched::post_death_notification(tcb, reason);
         }
@@ -812,8 +819,9 @@ fn sys_aspace_exit(tf: UserFrame) -> Result<u64, SyscallError>
         // Notify the address-space observers recorded above, so procmgr
         // reaps the whole process whichever thread exited.
         // SAFETY: aspace_post comes from this path's record, and the thread
-        // has stayed on this CPU since (interrupts masked); it is now Exited
-        // and no lock is held.
+        // has stayed on this CPU since (interrupts masked, then the windows of
+        // the post above, with preemption disabled); it is now Exited and no
+        // lock is held. Its walk takes interrupts the same way.
         unsafe {
             crate::sched::post_aspace_death_notification(&aspace_post);
         }

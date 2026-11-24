@@ -599,6 +599,10 @@ pub(super) unsafe extern "C" fn common_exception_handler(
 
             // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + vector).
             // SAFETY: tcb is valid; post_death_notification handles null check.
+            // No lock is held, and this fault came from ring 3 on the thread's
+            // own kernel stack (no IST), so the walk may take interrupts
+            // between batches of observers, with preemption disabled: the
+            // thread stays on this CPU until the schedule below.
             unsafe {
                 crate::sched::post_death_notification(tcb, reason);
             }
@@ -606,8 +610,9 @@ pub(super) unsafe extern "C" fn common_exception_handler(
             // Notify the address-space observers recorded above with the fault
             // class so procmgr can tear the whole process down.
             // SAFETY: aspace_post comes from this path's record, and the
-            // thread has stayed on this CPU since; it is now Exited and no
-            // lock is held.
+            // thread has stayed on this CPU since (the post above takes
+            // interrupts with preemption disabled); it is now Exited and no
+            // lock is held. Its walk takes interrupts the same way.
             unsafe {
                 crate::sched::post_aspace_death_notification(&aspace_post);
             }

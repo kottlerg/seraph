@@ -29,6 +29,7 @@ pub mod notification;
 pub mod retype;
 pub mod sole_reference;
 pub mod sysinfo;
+pub mod teardown_windows;
 pub mod thread;
 pub mod wait_set;
 
@@ -332,6 +333,30 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "cap_batches::cspace_drain_takes_interrupts",
         cap_batches::cspace_drain_takes_interrupts(ctx)
+    );
+    run_test!(
+        "teardown_windows::cascade_takes_interrupts",
+        teardown_windows::cascade_takes_interrupts(ctx)
+    );
+    run_test!(
+        "teardown_windows::release_pass_takes_interrupts",
+        teardown_windows::release_pass_takes_interrupts(ctx)
+    );
+    run_test!(
+        "teardown_windows::observer_release_takes_interrupts",
+        teardown_windows::observer_release_takes_interrupts(ctx)
+    );
+    run_test!(
+        "teardown_windows::frame_release_takes_interrupts",
+        teardown_windows::frame_release_takes_interrupts(ctx)
+    );
+    run_test!(
+        "teardown_windows::mmio_withdrawal_takes_interrupts",
+        teardown_windows::mmio_withdrawal_takes_interrupts(ctx)
+    );
+    run_test!(
+        "teardown_windows::death_post_takes_interrupts",
+        teardown_windows::death_post_takes_interrupts(ctx)
     );
 
     // ── Memory management syscalls ────────────────────────────────────────────

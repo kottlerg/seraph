@@ -93,6 +93,12 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         crate::mm::icache::sync_user_code();
     }
 
+    // The pins the call takes under the read lock below, declared before its
+    // guard so that every return path drops them after it: a pin's release
+    // runs with no lock held, since a last reference frees its object there
+    // (`cap::object::release_ref`'s contract).
+    let still_held;
+    let aspace_slot;
     // Read-lock the cap across the validate-and-commit sequence: shrinks of
     // `memory.size` by a concurrent `sys_memory_split` would otherwise race
     // with the bound check below or the mapping loop. RAII guard releases on
@@ -153,7 +159,7 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     // either this lookup sees the cleared slot and the map is refused, or the
     // issuer's count sees the pins and every leaf this call installs.
     // SAFETY: caller_cspace validated above; lookup_cap checks tag and rights.
-    let still_held = unsafe { super::lookup_cap(caller_cspace, memory_idx, MemRights::MAP) }?;
+    still_held = unsafe { super::lookup_cap(caller_cspace, memory_idx, MemRights::MAP) }?;
     if still_held.object != memory_slot.object
     {
         return Err(SyscallError::InvalidCapability);
@@ -180,7 +186,7 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     // § Speculative-Execution Hardening); architecturally the refusal has
     // passed, and the select returns the pinned object.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::MAP) }?;
+    aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::MAP) }?;
     let (as_ptr, aso_raw) = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
         let aso = crate::arch::nospec::select_ptr(permitted, obj.as_ptr(), core::ptr::null_mut())

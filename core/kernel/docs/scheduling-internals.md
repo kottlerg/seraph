@@ -463,8 +463,11 @@ the timer-batch quiesce (`sleep_wakeups_quiesce`), the contended `pt_lock`
 path, the `sys_thread_stop` drain and save wait (`await_stopped_save`), the `sys_thread_start`
 settle loop, the register-access wait (`with_held_frame`), the idle-stack depth sample
 (`stack_depth::idle_used_bytes`), the page-pool seeding and teardown windows between batches,
-the explicit-placement pre-grow's windows between its `CSpace`-lock holds, a dying `CSpace`'s
-windows in its arena-page pass, and the windows between the derivation-lock holds of
+the explicit-placement pre-grow's windows between its `CSpace`-lock holds, the dealloc cascade's
+windows between two teardowns, a dying `CSpace`'s windows in its release pass, its arena-page pass
+and its kept-page sort and release, the windows of a death-observer chain's release, of an address
+space's frame release and of an Mmio object's mapping withdrawal, the windows of an exiting
+thread's death posts, and the windows between the derivation-lock holds of
 revocation, deletion, the range splits, a move, and the teardown drain
 (`interrupt_window` in `cap/object.rs`, through
 `DerivationLock::write_unlock_between_batches` for the last) — runs
@@ -559,17 +562,28 @@ un-commits a park (rule 8).
 
 **Voluntary-block window — `schedule()` never requeues a `Blocked` `current` (issue #299).** Between
 a thread committing `Blocked` (`commit_blocked_under_local_lock` writes `Blocked` under
-`(*tcb).sched_lock`, then releases it) and reaching its own `schedule(Requeue::IfRunnable)`, no
-timer tick can run `schedule(Requeue::Always)` under the interrupt model in § Lock Hierarchy:
-syscall and fault context run with interrupts masked, and every interrupt-enabled window is
-preempt-disabled. The guard is defensive: should such a window ever open, the outgoing-requeue guard
-excludes a `Blocked` `current` regardless of the caller's `Requeue`: re-marking the parking thread
-`Ready` and enqueuing it would race the pending `enqueue_and_wake` (which links the same TCB on its
-`Blocked → Ready` wake) into a `queued_on` double-enqueue — in debug the `#244` enqueue tripwire
-panics under `scheduler.lock`, wedging that CPU. `cur_state` is read under `current.sched_lock`
-(held from the top of `schedule()`), so the `Blocked` observation is authoritative, not the racy
-`state` read a `timer_tick`-side guard would require. The parked thread is redispatched by its
-deposited wake (the resume-DEPOSIT model, Wake Protocol Invariants).
+`(*tcb).sched_lock`, then releases it) and reaching its own `schedule(Requeue::IfRunnable)`,
+interrupt-enabled windows open: fault delivery releases its endpoint pin there, after the park
+commit (`ipc::fault::deliver_once`, the pin-before-park rule of capability-internals.md § Kernel
+Object Reference Counting), and a release that frees the endpoint runs the dealloc cascade, which
+takes the CPU's pending interrupts between every two teardowns and inside its arms' walks
+(capability-internals.md § Teardown). Three invariants carry the window. Every interrupt-enabled
+window is preempt-disabled (§ Lock Hierarchy), so a timer tick taken in it returns before
+`schedule(Requeue::Always)` (`sched::tick_switches`) and a wake IPI only posts `PREEMPT` for a later
+return; the parking thread is never switched out before its own `schedule()`. The outgoing-requeue
+guard excludes a `Blocked` `current` regardless of the caller's `Requeue`, so a path into
+`schedule()` from the window would still not requeue it: re-marking the parking thread `Ready` and
+enqueuing it would race the pending `enqueue_and_wake` (which links the same TCB on its `Blocked →
+Ready` wake) into a `queued_on` double-enqueue — in debug the `#244` enqueue tripwire panics under
+`scheduler.lock`, wedging that CPU. `cur_state` is read under `current.sched_lock` (held from the
+top of `schedule()`), so the `Blocked` observation is authoritative, not the racy `state` read a
+`timer_tick`-side guard would require. A wake that lands in the window, the freed endpoint's
+send-queue drain on this CPU or another CPU's reply or cancellation, deposits the resume (the
+resume-DEPOSIT model, Wake Protocol Invariants): the save-window pin links the thread on this CPU,
+the guard skips it as linked, and its own `schedule()` dequeues it, or, under hard affinity, another
+CPU claims it, as the next paragraph says. The
+`a_window_between_a_park_commit_and_its_schedule_leaves_one_link` host test drives each order of the
+wake and the tick.
 
 **Hard-affinity wake in the voluntary-block window — `schedule()` never requeues a claimed
 `current` (issue #1221).** The save-window pin (§ Wake Protocol Invariants, Target CPU selection)
@@ -1128,12 +1142,14 @@ Rules:
    `fetch_and`, so a check after a take that saw the bit sees the work. The one-load test is a
    plain load of the aligned word: a bit it misses was set after it, and stays for a later return,
    as a state probe that lagged the store did before.
-2. Only the CPU itself clears its bits, and only at a return to user mode, before the checks; a
-   bit set after the take stays for the next return. A check that leaves its work (a pass the budget
+2. Only the CPU itself clears its bits, and only at a return to user mode, before the checks; a bit
+   set after the take stays for the next return. A check that leaves its work (a pass the budget
    cut, a declined preemption) posts its bit again, and the path does not loop on it, so one return
-   does one round of each check. A syscall's return whose stopped check schedules the thread away
-   posts again the `RECLAIM` and `SOLE_REF` bits it took: the drain did not run for the stopped
-   thread, or re-queued the thread's own object, so the CPU's next return owes it.
+   does one round of each check. An interrupt taken inside a check (the sole-reference pass and the
+   deferred-reclaim drain run dealloc cascades, which open interrupt windows) posts its bits after
+   the take, so they too stay for the next return. A syscall's return whose stopped check schedules
+   the thread away posts again the `RECLAIM` and `SOLE_REF` bits it took: the drain did not run for
+   the stopped thread, or re-queued the thread's own object, so the CPU's next return owes it.
 3. A reschedule inside the path can land the thread on another CPU. The path then takes that CPU's
    bits and runs again while one is set (`sched::run_return_work`). The kinds that belong to the
    thread rather than to a CPU follow it there: the dispatch posts a pending upcall, and an
@@ -1721,7 +1737,15 @@ The kernel does not auto-cascade IPC unblock on process exit. The contract:
    observer immediately, so a supervisor that binds after the thread was started never loses the
    death (#106 Window 2). When a post wakes a blocked observer, `post_death_notification` /
    `post_aspace_death_notification` route the wake through `select_target_cpu` + `enqueue_and_wake`
-   — the same save-window-pinned producer path as every other waker (§ Target CPU selection). A
+   — the same save-window-pinned producer path as every other waker (§ Target CPU selection). The
+   walk (`post_death_walk`) takes the CPU's pending interrupts between batches of
+   `OBSERVER_BATCH_NODES` nodes, as every interrupt-enabled window does, with preemption disabled,
+   so the `Exited` thread stays `current` on its CPU until its `schedule()`, and the teardown
+   that takes the chain, which waits until the thread runs on no CPU, cannot run before the walk
+   ends. An interrupt there finds an `Exited` `current`: a timer tick writes its slice and runs
+   the balancer but does not schedule (`sched::tick_switches`), a wake links another thread on a
+   run queue and posts `PREEMPT`, a shootdown flushes, and an interrupt taken in kernel mode returns
+   with no return work, so none switches the thread out or queues it. A
    death post that enqueued on the *dying* thread's CPU instead would bypass the
    `context_saved == 0` pin and land an observer still mid-block on a foreign CPU, whose
    `schedule()` then spins on the observer's in-flight register save; if the observer is

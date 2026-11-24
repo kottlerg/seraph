@@ -1655,17 +1655,28 @@ impl CSpace
     }
 
     /// Call `f` with each non-null slot's tag, rights, and kernel object
-    /// pointer.
+    /// pointer. Skips slot 0 (permanently null) and unallocated pages.
+    pub fn for_each_object<F>(&self, f: F)
+    where
+        F: FnMut(CapTag, Rights, NonNull<KernelObjectHeader>),
+    {
+        self.for_each_object_by_leaf(|| {}, f);
+    }
+
+    /// [`Self::for_each_object`], calling `leaf` before each leaf's slots are
+    /// visited, once per leaf below the grow cursor.
     ///
     /// Used by `dealloc_object(CSpaceObj)` to uncount and dec-ref all objects
-    /// before the `CSpace` pages are freed. Skips slot 0 (permanently null)
-    /// and unallocated pages.
-    pub fn for_each_object<F>(&self, mut f: F)
+    /// before the `CSpace` pages are freed, opening an interrupt window from
+    /// `leaf` every few leaves, since the leaf count is the owner's to choose.
+    pub fn for_each_object_by_leaf<L, F>(&self, mut leaf: L, mut f: F)
     where
+        L: FnMut(),
         F: FnMut(CapTag, Rights, NonNull<KernelObjectHeader>),
     {
         for leaf_idx in 0..self.next_leaf as usize
         {
+            leaf();
             let page = self.leaf_ptr(leaf_idx);
             if page != sentinel_leaf()
             {
@@ -2111,6 +2122,34 @@ mod tests
                 (CapTag::Endpoint, EpRights::SEND.erase())
             ]
         );
+    }
+
+    // The defect caught: a release pass whose leaf hook, where its interrupt
+    // windows open, skips a leaf or runs after the slots it should precede,
+    // so a pass over many leaves visits them with no window between.
+    #[test]
+    fn for_each_object_by_leaf_runs_the_hook_before_each_leaf()
+    {
+        use core::cell::Cell;
+        let mut cs = CSpace::new(0);
+        let obj = dummy_object();
+        let per_leaf = L2_SIZE as u32;
+        // One cap in each of the first three leaves, the third grown by the
+        // explicit placement.
+        for index in [1, per_leaf + 1, 2 * per_leaf + 1]
+        {
+            cs.insert_cap_at(index, CapTag::Memory, MemRights::MAP.erase(), obj)
+                .unwrap();
+        }
+        let leaves = Cell::new(0usize);
+        let mut seen_in_leaf = Vec::new();
+        cs.for_each_object_by_leaf(
+            || leaves.set(leaves.get() + 1),
+            |_, _, _| seen_in_leaf.push(leaves.get()),
+        );
+        assert_eq!(leaves.get(), cs.next_leaf as usize);
+        // Each cap is passed after its own leaf's hook and before the next's.
+        assert_eq!(seen_in_leaf, [1, 2, 3]);
     }
 
     #[test]

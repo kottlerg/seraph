@@ -3,7 +3,7 @@
 
 // shared/ipc/src/stopsrc_labels.rs
 
-//! The `stopsrc` fixture's service labels (services/stopsrc/README.md): a
+//! The `stopsrc` fixture's service labels (services/fixtures/stopsrc/README.md): a
 //! supervised stop source of the program class, staged only with svctest,
 //! that runs one job child holding memory on request and lists it as its
 //! candidate, so svctest's phases drive svcmgr's list of sources and oomd's

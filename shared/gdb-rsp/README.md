@@ -52,7 +52,8 @@ the packet set: a stub using this crate advertises none of them, and parses no p
 carries them.
 
 Consumers: the GDB stub ([services/gdbstub/README.md](../../services/gdbstub/README.md)) and the
-`debug-echo` fixture ([services/debug-echo/README.md](../../services/debug-echo/README.md)) in the
+`debug-echo` fixture
+([services/fixtures/debug-echo/README.md](../../services/fixtures/debug-echo/README.md)) in the
 guest, and `cargo xtask test debug-port` ([xtask/README.md](../../xtask/README.md)) on the host.
 
 ---

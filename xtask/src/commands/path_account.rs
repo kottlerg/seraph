@@ -87,7 +87,7 @@ const ACCOUNTS: [Account; 2] = [
 ];
 
 /// The svcmgr recipe that runs ubench, which the userspace account's image
-/// boots staged among the services (programs/ubench/README.md).
+/// boots staged among the services (services/ubench/README.md).
 const UBENCH_RECIPE: &str = "config/svcmgr/services/ubench.svc";
 
 /// Entry point for `cargo xtask path-account`.
@@ -243,7 +243,7 @@ impl<'a> Resolver<'a>
     }
 
     /// The text of the image of program `name`: the placed image of that
-    /// name, or of a path whose file is that name (`/programs/fsbench`).
+    /// name, or of a path whose file is that name (`/tests/fixtures/programs/fsbench`).
     fn text_of(&self, name: &str) -> Result<Range<u64>>
     {
         let mut found = self

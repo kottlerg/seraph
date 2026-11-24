@@ -47,7 +47,7 @@ shared/device-tracker/
 | [services/devmgr/docs/responsibilities.md](../../services/devmgr/docs/responsibilities.md) | Driver restart, and what a client does on it (§ Driver Restart, Clients) |
 | [programs/terminal/README.md](../../programs/terminal/README.md) | The terminal's classes |
 | [services/gdbstub/README.md](../../services/gdbstub/README.md) | The stub's debug port |
-| [services/debug-echo/README.md](../../services/debug-echo/README.md) | The fixture's debug port and its restart |
+| [services/fixtures/debug-echo/README.md](../../services/fixtures/debug-echo/README.md) | The fixture's debug port and its restart |
 
 ---
 

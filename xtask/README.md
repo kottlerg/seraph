@@ -1094,39 +1094,39 @@ cargo xtask test debug-port [--arch x86_64|riscv64] [--port PORT] [--gdb GDB] [-
 | `--gdb` | `gdb` | The host GDB the stub boot runs: one built with every target, or `gdb-multiarch` |
 
 **The transport boot.** Stages the `debug-echo` fixture's recipe
-([services/debug-echo/README.md](../services/debug-echo/README.md)) from `config/svcmgr/tests/` into
-`config/svcmgr/services/`, repacks the disk images in the layout they have, boots the current
-sysroot once with the debug port attached (as `run --debug-port` attaches it, headless), waits for
-the fixture's `[debug-echo] READY on the debug port` line on the serial stream, connects to the
-port, and drives one GDB remote serial protocol exchange with the fixture, framed at both ends by
-`shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)), then a restart round
-on the same connection: through QEMU's gdbstub, which the boot attaches on a unix socket
-([§ Cases](#cases)), the host kills the port's `virtio-console` driver at a hardware breakpoint in
-its code, its bias taken from procmgr's `spawn image bias=0x… (/services/drivers/virtio-console)`
-line, waits for the fixture's `[debug-echo] debug port driver at ordinal 1` line, and echoes
-through the restarted driver. It then kills QEMU, removes the recipe, and repacks the images in
-that layout again, whatever the outcome. It passes when every answer of the exchange and of the
-restart round arrives as expected;
+([services/fixtures/debug-echo/README.md](../services/fixtures/debug-echo/README.md)) from
+`config/svcmgr/tests/` into `config/svcmgr/services/`, repacks the disk images in the layout they
+have, boots the current sysroot once with the debug port attached (as `run --debug-port` attaches
+it, headless), waits for the fixture's `[debug-echo] READY on the debug port` line on the serial
+stream, connects to the port, and drives one GDB remote serial protocol exchange with the fixture,
+framed at both ends by `shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)),
+then a restart round on the same connection: through QEMU's gdbstub, which the boot attaches on a
+unix socket ([§ Cases](#cases)), the host kills the port's `virtio-console` driver at a hardware
+breakpoint in its code, its bias taken from procmgr's
+`spawn image bias=0x… (/services/drivers/virtio-console)` line, waits for the fixture's
+`[debug-echo] debug port driver at ordinal 1` line, and echoes through the restarted driver. It then
+kills QEMU, removes the recipe, and repacks the images in that layout again, whatever the outcome.
+It passes when every answer of the exchange and of the restart round arrives as expected;
 [docs/testing.md](../docs/testing.md#debug-port-debug-port-case) § Debug port lists the exchange.
 
 **The GDB stub boot.** Checks the GDB stub
 ([services/gdbstub/README.md](../services/gdbstub/README.md)) from a host GDB. Stages the
-`gdb-target` recipe (`programs/debugger --gdb-target`) from `config/svcmgr/tests/` and the stub's
-template from `config/svcmgr/debug/` naming it, as `run --debug-target gdb-target` does, repacks the
-disk images in the layout they have, boots the current sysroot once with the debug port attached
-(headless), and waits for the stub's `[gdbstub] attached; serving the debug port` line on the serial
-stream. It then runs `gdb -nx -batch` against the port with the symbols store's file of the target
-binary's build id for symbols: the session lists the threads, single-steps from where the attach
-stopped the main thread, breaks on the target's tick function and continues to it, rewrites a
+`gdb-target` recipe (`services/fixtures/debugger --gdb-target`) from `config/svcmgr/tests/` and the
+stub's template from `config/svcmgr/debug/` naming it, as `run --debug-target gdb-target` does,
+repacks the disk images in the layout they have, boots the current sysroot once with the debug port
+attached (headless), and waits for the stub's `[gdbstub] attached; serving the debug port` line on
+the serial stream. It then runs `gdb -nx -batch` against the port with the symbols store's file of
+the target binary's build id for symbols: the session lists the threads, single-steps from where the
+attach stopped the main thread, breaks on the target's tick function and continues to it, rewrites a
 variable and a register and reads each back, single-steps again, selects the second thread and reads
-its registers, and detaches; the case then waits up to 30 s for the stub's `[gdbstub] detached from
-gdb-target (crash bindings restored: ...)` line. A restart round follows: the case connects to the
-stub, which attaches to the target anew, kills the port's driver through QEMU's gdbstub as the
-transport boot does, waits for the stub's `[gdbstub] debug port driver at ordinal 1` line, and
-requires the session to go on on the same connection (`?`, `Hg1`, the pointer read, `D`). It kills
-QEMU, removes both recipes, and repacks the images in that layout again, whatever the outcome, and
-passes when GDB's output shows each of those results, the stub's line reports the crash bindings
-restored, and the restart round passes;
+its registers, and detaches; the case then waits up to 30 s for the stub's
+`[gdbstub] detached from gdb-target (crash bindings restored: ...)` line. A restart round follows:
+the case connects to the stub, which attaches to the target anew, kills the port's driver through
+QEMU's gdbstub as the transport boot does, waits for the stub's
+`[gdbstub] debug port driver at ordinal 1` line, and requires the session to go on on the same
+connection (`?`, `Hg1`, the pointer read, `D`). It kills QEMU, removes both recipes, and repacks the
+images in that layout again, whatever the outcome, and passes when GDB's output shows each of those
+results, the stub's line reports the crash bindings restored, and the restart round passes;
 [docs/testing.md](../docs/testing.md#gdb-stub-debug-port-case) § GDB stub lists them. The host needs
 a GDB that debugs the architecture.
 
@@ -1336,12 +1336,12 @@ cargo xtask test secureboot [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
 
 Check devmgr's PCI Express hotplug add and removal paths, native and through acpid, and its bind of
 a hot-added disk from the drivers directory, on either arch. Stages the `hotplug-check` fixture's
-recipe ([services/hotplug-check/README.md](../services/hotplug-check/README.md)) from
-`config/svcmgr/tests/` into `config/svcmgr/services/` and the `test-dma` class file from
+recipe ([services/fixtures/hotplug-check/README.md](../services/fixtures/hotplug-check/README.md))
+from `config/svcmgr/tests/` into `config/svcmgr/services/` and the `test-dma` class file from
 `config/devmgr/tests/` into `config/devmgr/classes/`, and repacks the disk images in the layout they
-have. It boots the current sysroot headless, with two empty `pcie-root-port`s (`-device
-pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c` and `-device
-pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socket:
+have. It boots the current sysroot headless, with two empty `pcie-root-port`s
+(`-device pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c` and
+`-device pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socket:
 
 1. on x86_64 only, under the machine's default, the firmware's ACPI PCI hotplug, whose `_OSC`
    withholds native hotplug control: devmgr must log the slot `firmware hotplug: _OSC control`,

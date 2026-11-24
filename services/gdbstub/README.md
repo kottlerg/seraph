@@ -377,33 +377,33 @@ Each bound's entry is in [docs/limits.md](../../docs/limits.md) § Other service
 
 ## Testing
 
-The host tests cover the register map, the breakpoint table and instructions, the stop signals,
-the binding badges, the credit of a stop to its thread, the origin, settling, and decline of a stop
-no thread claims, the slot a new thread takes, the rewind of an unreported breakpoint hit, and the
+The host tests cover the register map, the breakpoint table and instructions, the stop signals, the
+binding badges, the credit of a stop to its thread, the origin, settling, and decline of a stop no
+thread claims, the slot a new thread takes, the rewind of an unreported breakpoint hit, and the
 resume plans of `c`, `s`, and `vCont`: each thread takes its leftmost action, a thread no action
 names stays held, a step runs alone, and `c` and `s` resume the thread `Hc` selected alone. They
-drive the stop state machine against a simulated kernel through the interleavings that can break
-it: a spawner and a thread it spawned after the attach at one breakpoint, in either order and with
-the spawner's stop late; a fault of a thread the stub cannot bind; a new thread in its exited
-spawner's slot; stops during a step; a repeat of a stop GDB knows of, and the kernel's second
-delivery of one; a restart at a breakpoint built into the target; a thread's own upcall beside a
-stop that was not its; stops racing a resume or an all-stop, and an all-stop that holds no thread;
-an attach before the target's start, holding its main thread once started, and one whose target is
-not started within the all-stop, or starts after its last read; a start late in the all-stop, alone
-or beside a thread a refresh adds unstarted; a continue that ends every thread, or whose threads all
-exit while the target runs; a continue of one thread with another held at the same breakpoint,
-whose stop alone is reported, a held thread's call returning meanwhile, an interrupt meanwhile, the
-restart of the resumed thread's stop, and a continue or step whose one thread exits; and a detach
-with a stop pending, with every thread exited, and
-with the step's thread exited or never stopped. The `debug-port` case's second boot boots the
-`gdb-target` fixture (`programs/debugger --gdb-target`,
-[programs/debugger/README.md](../../programs/debugger/README.md)) with the stub and runs a batch
-GDB session over the debug port: it lists two threads, single-steps the main thread from where the
-attach stopped it, on text the fixture attaches shared, breaks on the fixture's tick function and
-continues to it, rewrites and reads back a variable and a register, single-steps again, selects the
-second thread and reads its registers, and detaches, and the stub's detach line reports the crash
-bindings restored; it then has the port's driver killed under the stub and requires the stub to
-answer through the restarted driver ([docs/testing.md](../../docs/testing.md) § GDB stub
+drive the stop state machine against a simulated kernel through the interleavings that can break it:
+a spawner and a thread it spawned after the attach at one breakpoint, in either order and with the
+spawner's stop late; a fault of a thread the stub cannot bind; a new thread in its exited spawner's
+slot; stops during a step; a repeat of a stop GDB knows of, and the kernel's second delivery of one;
+a restart at a breakpoint built into the target; a thread's own upcall beside a stop that was not
+its; stops racing a resume or an all-stop, and an all-stop that holds no thread; an attach before
+the target's start, holding its main thread once started, and one whose target is not started within
+the all-stop, or starts after its last read; a start late in the all-stop, alone or beside a thread
+a refresh adds unstarted; a continue that ends every thread, or whose threads all exit while the
+target runs; a continue of one thread with another held at the same breakpoint, whose stop alone is
+reported, a held thread's call returning meanwhile, an interrupt meanwhile, the restart of the
+resumed thread's stop, and a continue or step whose one thread exits; and a detach with a stop
+pending, with every thread exited, and with the step's thread exited or never stopped. The
+`debug-port` case's second boot boots the `gdb-target` fixture
+(`services/fixtures/debugger --gdb-target`,
+[services/fixtures/debugger/README.md](../fixtures/debugger/README.md)) with the stub and runs a
+batch GDB session over the debug port: it lists two threads, single-steps the main thread from where
+the attach stopped it, on text the fixture attaches shared, breaks on the fixture's tick function
+and continues to it, rewrites and reads back a variable and a register, single-steps again, selects
+the second thread and reads its registers, and detaches, and the stub's detach line reports the
+crash bindings restored; it then has the port's driver killed under the stub and requires the stub
+to answer through the restarted driver ([docs/testing.md](../../docs/testing.md) § GDB stub
 (`debug-port` case)). svctest's `debug_authority_refused` phase checks that `LIST_PROCESSES` and
 `DETACH_PROCESS` refuse a caller without the authority, and its `crash_endpoint` phase drives both
 for a holder of it, with the restore after a watch thread's exit.

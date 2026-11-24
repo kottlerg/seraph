@@ -1484,8 +1484,39 @@ const SEED_BATCH_PAGES: u64 = 64;
 /// reference-count read per page, and the arena's page count is the owner's
 /// to choose, so the pass takes this CPU's pending interrupts between
 /// batches of this many pages.
-#[cfg(not(test))]
 const ORPHAN_BATCH_PAGES: u64 = 64;
+
+/// The steps of a walk whose length a caller sizes, counted to say when the
+/// walk opens an [`interrupt_window`]: before each step that follows a full
+/// batch of `size` steps, so that the walk masks interrupts for at most
+/// `size` steps at a time and opens no window before its first step or
+/// after its last.
+struct BatchWindows
+{
+    size: u64,
+    in_batch: u64,
+}
+
+impl BatchWindows
+{
+    const fn new(size: u64) -> Self
+    {
+        Self { size, in_batch: 0 }
+    }
+
+    /// Count one step; `true` when a window opens before it.
+    fn step(&mut self) -> bool
+    {
+        let due = self.in_batch == self.size;
+        if due
+        {
+            self.in_batch = 0;
+        }
+        // At most `size` after the reset above, so it never saturates.
+        self.in_batch = self.in_batch.saturating_add(1);
+        due
+    }
+}
 
 /// Let this CPU take the interrupts pending on it, then return to the
 /// caller's interrupt state, with preemption disabled throughout so that an
@@ -2641,19 +2672,16 @@ impl CSpaceKernelObject
         let mut cur = self
             .arena_pages
             .swap(core::ptr::null_mut(), Ordering::AcqRel);
-        let mut batch: u64 = 0;
+        let mut windows = BatchWindows::new(ORPHAN_BATCH_PAGES);
         while !cur.is_null()
         {
-            if batch == ORPHAN_BATCH_PAGES
+            if windows.step()
             {
                 // No lock is held between pages; a chunk free on another CPU
                 // meanwhile finds a passed page's owner cleared, or a page not
                 // yet passed still owned, as it does without the window.
                 interrupt_window();
-                batch = 0;
             }
-            // Below ORPHAN_BATCH_PAGES, reset above on reaching it.
-            batch = batch.saturating_add(1);
             // SAFETY: a page of this arena, live: it is held by the owner hold
             // the teardown now carries.
             let page = unsafe { &*cur };
@@ -5747,6 +5775,37 @@ unsafe fn dealloc_thread(
 #[cfg(test)]
 mod tests
 {
+    // The orphan walk itself runs over physical arena pages, which a host
+    // test has none of; its batching is `BatchWindows`, checked here.
+    #[test]
+    fn orphan_walk_opens_a_window_per_batch_of_pages()
+    {
+        for pages in [0u64, 1, 63, 64, 65, 128, 129, 1000]
+        {
+            let mut windows = super::BatchWindows::new(super::ORPHAN_BATCH_PAGES);
+            let (mut opened, mut run, mut longest) = (0u64, 0u64, 0u64);
+            for _ in 0..pages
+            {
+                if windows.step()
+                {
+                    opened += 1;
+                    run = 0;
+                }
+                run += 1;
+                longest = longest.max(run);
+            }
+            assert_eq!(
+                opened,
+                pages.saturating_sub(1) / super::ORPHAN_BATCH_PAGES,
+                "one window per full batch of {pages} pages, none after the last"
+            );
+            assert!(
+                longest <= super::ORPHAN_BATCH_PAGES,
+                "{pages} pages: a batch of {longest}"
+            );
+        }
+    }
+
     use super::*;
     use core::mem::offset_of;
 

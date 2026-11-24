@@ -1479,8 +1479,8 @@ pub fn thread_start_suspended(thread_cap: u64) -> Result<(), i64>
 /// `QuotaExceeded` also means the object's reference count is at its 2^30
 /// ceiling. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
-/// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
-/// capability transfer is in flight on the source.
+/// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, IPC
+/// capability transfer, or range split is in flight on the source.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
@@ -1515,8 +1515,8 @@ pub fn cap_copy(src_slot: u64, dest_cspace_cap: u64, rights_mask: u64) -> Result
 /// cannot back an `Mmio`, `IoPort`, or `Interrupt` object. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
 /// new slot was linked;
-/// `InvalidState` means a `cap_revoke`, `cap_move`, or IPC capability
-/// transfer is in flight on the source.
+/// `InvalidState` means a `cap_revoke`, `cap_move`, IPC capability
+/// transfer, or range split is in flight on the source.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
@@ -1547,8 +1547,8 @@ pub fn cap_derive(src_slot: u64, rights_mask: u64) -> Result<u64, i64>
 /// source object's 2^30 reference-count ceiling).
 /// `InvalidCapability` also covers a source a concurrent delete, move, or
 /// revoke freed before the new slot was linked; `InvalidState` means a
-/// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
-/// source.
+/// `cap_revoke`, `cap_move`, IPC capability transfer, or range split is in
+/// flight on the source.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
@@ -1762,8 +1762,8 @@ pub fn cap_revoke_all(slot: u64) -> Result<(), i64>
 /// `QuotaExceeded` at the structural ceiling, or when the object's reference
 /// count is at its 2^30 ceiling, since the destination takes its reference
 /// before the source releases its own);
-/// `InvalidState` if a revoke, another move, or an IPC capability transfer
-/// is in flight on the source, or the destination slot was freed mid-move
+/// `InvalidState` if a revoke, another move, an IPC capability transfer, or
+/// a range split is in flight on the source, or the destination slot was freed mid-move
 /// (the source keeps the capability);
 /// `Interrupted` if a concurrent deriver kept extending the child list past
 /// the kernel's batch backstop — the capability then lives in both slots,
@@ -1816,8 +1816,8 @@ pub fn cap_move(src_cap: u64, dest_cspace_cap: u64, dest_index: u32) -> Result<u
 /// [`cap_copy`] (`QuotaExceeded` at the copy limits and the 2^30
 /// reference-count ceiling). `InvalidCapability` also covers a source a
 /// concurrent delete, move, or revoke freed before the copy was linked; `InvalidState` means a
-/// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
-/// source.
+/// `cap_revoke`, `cap_move`, IPC capability transfer, or range split is in flight
+/// on the source.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \

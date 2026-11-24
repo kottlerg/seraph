@@ -740,9 +740,9 @@ impl CapabilitySlot
     // ── In-flight pin ─────────────────────────────────────────────────────────
 
     /// Return `true` if a multi-batch operation is in flight on this slot
-    /// (the `pin` byte): a `SYS_CAP_REVOKE` on its root, or a
+    /// (the `pin` byte): a `SYS_CAP_REVOKE` on its root, a
     /// `SYS_CAP_MOVE` / IPC capability transfer on its source and
-    /// destination.
+    /// destination, or a range split on its two children.
     ///
     /// The operations that refuse a pinned slot, and why, are defined in
     /// core/kernel/docs/capability-internals.md § Revocation Algorithm and

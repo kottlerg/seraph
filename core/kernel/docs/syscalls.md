@@ -3355,9 +3355,8 @@ lacks Insert), `InvalidArgument` (dst_slot occupied or out of range),
 `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded` (dst CSpace directory
 structurally full, or the object's reference count is at its 2^30 ceiling: the destination takes
 its reference before the source releases its own), `InvalidState` (a `SYS_CAP_REVOKE`, another
-`SYS_CAP_MOVE`, or an IPC
-capability transfer is in flight on the source slot; or the destination slot was
-freed while the move was in flight — the source keeps the capability),
+`SYS_CAP_MOVE`, an IPC capability transfer, or a range split is in flight on the source slot; or
+the destination slot was freed while the move was in flight — the source keeps the capability),
 `Interrupted` (liveness backstop, per above).
 
 ---

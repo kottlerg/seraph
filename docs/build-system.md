@@ -220,8 +220,10 @@ all, so the bootloader link is the same from any checkout.
 The linker scripts of the kernel (`core/kernel/linker/<arch>.ld`) and of the
 riscv64 bootloader are passed by `cargo xtask build`, in the `RUSTFLAGS` of
 their builds, as the link argument `-Clink-arg=-T<path>` with the script's
-absolute path (`Arch::kernel_linker_script` and `Arch::boot_linker_script`
-in `xtask/src/arch.rs` name them), and not by a build script, whose
+path relative to the workspace root, from which Cargo runs rustc for a
+workspace member, so the flags are the same in every checkout
+(`Arch::kernel_linker_script` and `Arch::boot_linker_script` in
+`xtask/src/arch.rs` name them), and not by a build script, whose
 `rerun-if-changed` files Cargo judges by modification time
 ([§ Continuous Integration](#continuous-integration)). Each crate includes its
 script (`include_bytes!` in its `main.rs`), which makes the script an input
@@ -856,9 +858,11 @@ inputs are unchanged. The key is
 (`build-<arch>-<profile>` for the `build` job of one architecture and profile, or `host-tests`),
 the runner image, whose libraries the entry's host build scripts and tools link against, the first
 16 hex digits of the SHA-256 of `rustc -Vv`, those of the `hashFiles` digest of the inputs of
-every unit that the checksums do not cover (the target specs, `.cargo/config.toml` and the action,
-Markdown excepted), and the commit. A change to any file the key hashes owes every job that saves
-an entry, and the key hashes no source file of the tree, as host tests check. A job restores the
+every unit that the checksums do not cover (the target specs, `.cargo/config.toml`, the action and
+`xtask/wrapper-shim/`, which adds arguments to every rustc and clippy-driver command line of a
+build through the toolchain mirror that Cargo never sees, Markdown excepted), and the commit. A
+change to any file the key hashes owes every job that saves an entry, and the key hashes no other
+source file of the tree, as host tests check. A job restores the
 newest entry whose key starts with its own up to the commit: an entry built from another tree is
 safe, since every unit restored is judged by content, and only what differs is rebuilt. Before the
 build it dates the toolchain's library sources to 2000-01-01, which the install writes with its own

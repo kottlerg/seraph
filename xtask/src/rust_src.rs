@@ -1601,12 +1601,13 @@ mod tests
 
     // Defect caught: an input of the carried build units that Cargo's
     // checksums do not cover (a target spec, the Cargo configuration, the
-    // action) left out of the build carry's key, so a change to it restores
-    // units built under the old one as current; or a source file of the tree
-    // hashed, which Cargo's checksums do cover, so that every change to it
-    // misses master's entry and rebuilds everything.
+    // action, the wrapper shim, whose arguments to rustc and clippy-driver
+    // Cargo never sees) left out of the build carry's key, so a change to it
+    // restores units built under the old one as current; or another source
+    // file of the tree hashed, which Cargo's checksums do cover, so that
+    // every change to it misses master's entry and rebuilds everything.
     #[test]
-    fn the_carry_key_hashes_the_inputs_the_checksums_do_not_cover_and_no_source()
+    fn the_carry_key_hashes_the_inputs_the_checksums_do_not_cover_and_no_other_source()
     {
         let root = repo_root();
         let patterns = key_patterns(&root);
@@ -1615,6 +1616,8 @@ mod tests
             "xtask/targets/x86_64-seraph-none.json",
             "xtask/targets/riscv64imac-seraph-uefi.json",
             ".github/actions/carry/action.yml",
+            "xtask/wrapper-shim/src/main.rs",
+            "xtask/wrapper-shim/Cargo.toml",
         ]
         {
             assert!(key_hashes(&patterns, input), "{input}: {patterns:?}");
@@ -1633,7 +1636,7 @@ mod tests
                 path.file_name().is_some_and(|n| n == "Cargo.toml")
                     || path.extension().is_some_and(|e| e == "rs" || e == "ld")
             })
-            .filter(|f| key_hashes(&patterns, f))
+            .filter(|f| !f.starts_with("xtask/wrapper-shim/") && key_hashes(&patterns, f))
             .collect();
         assert!(sources.is_empty(), "the key hashes sources: {sources:?}");
     }

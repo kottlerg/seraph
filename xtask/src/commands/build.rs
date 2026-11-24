@@ -787,7 +787,7 @@ pub fn compile_boot(ctx: &BuildContext, args: &BuildArgs, store: &Path, out: &Pa
         .to_str()
         .with_context(|| format!("the trust store path {} is not UTF-8", store.display()))?;
 
-    let rustflags = with_linker_script(&ctx.root, BOOT_RUSTFLAGS, args.arch.boot_linker_script())?;
+    let rustflags = with_linker_script(BOOT_RUSTFLAGS, args.arch.boot_linker_script());
     let env = [
         ("RUSTFLAGS", rustflags.as_str()),
         ("SERAPH_BOOT_TRUST_STORE", store),
@@ -920,7 +920,7 @@ fn build_group(
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let env_owned = profile_env(&ctx.root, args.arch, profile)?;
+    let env_owned = profile_env(args.arch, profile);
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if !args.skip_lints
     {
@@ -1050,7 +1050,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let env_owned = profile_env(&ctx.root, args.arch, spec.profile)?;
+    let env_owned = profile_env(args.arch, spec.profile);
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if !args.skip_lints
     {
@@ -1221,51 +1221,36 @@ const X86_64_KERNEL_RUSTFLAGS: &str = "-Zunstable-options -Zretpoline-external-t
 
 /// The environment a build of `profile` for `arch`, and its lint pass, run
 /// with: for the kernel, `RUSTFLAGS` with the kernel's linker script.
-fn profile_env(
-    root: &Path,
-    arch: Arch,
-    profile: BuildProfile,
-) -> Result<Vec<(&'static str, String)>>
+fn profile_env(arch: Arch, profile: BuildProfile) -> Vec<(&'static str, String)>
 {
     let base = match (arch, profile)
     {
         (Arch::Riscv64, BuildProfile::Kernel) => RISCV64_KERNEL_RUSTFLAGS,
         (Arch::X86_64, BuildProfile::Kernel) => X86_64_KERNEL_RUSTFLAGS,
-        _ => return Ok(Vec::new()),
+        _ => return Vec::new(),
     };
-    let rustflags = with_linker_script(root, base, Some(arch.kernel_linker_script()))?;
-    Ok(vec![("RUSTFLAGS", rustflags)])
+    let rustflags = with_linker_script(base, Some(arch.kernel_linker_script()));
+    vec![("RUSTFLAGS", rustflags)]
 }
 
 /// `rustflags` with the `-T` link argument that passes `script`, a linker
-/// script named relative to `root`, to the link, when there is one.
+/// script named relative to the workspace root, to the link, when there is
+/// one.
 ///
-/// The path is absolute, so the link reads the same file from any working
-/// directory. Cargo splits `RUSTFLAGS` at whitespace, so a path that holds
-/// whitespace is refused rather than passed in pieces. The crate that links
-/// with the script includes it as well, which makes it an input Cargo judges
-/// by content (docs/build-system.md § Custom Targets).
-fn with_linker_script(root: &Path, rustflags: &str, script: Option<&str>) -> Result<String>
+/// The path stays relative: Cargo runs rustc for a workspace member, the
+/// kernel and the bootloader among them, from the workspace root, and the
+/// linker from there, so the flags, which Cargo fingerprints, are the same in
+/// every checkout and a build output carried to another one (a CI cell, a
+/// test lane) stays fresh. The crate that links with the script includes it
+/// as well, which makes it an input Cargo judges by content
+/// (docs/build-system.md § Custom Targets).
+fn with_linker_script(rustflags: &str, script: Option<&str>) -> String
 {
-    let Some(script) = script
-    else
+    match script
     {
-        return Ok(rustflags.to_owned());
-    };
-    let path = root.join(script);
-    let Some(path) = path.to_str()
-    else
-    {
-        bail!("the linker script path {} is not UTF-8", path.display());
-    };
-    if path.contains(char::is_whitespace)
-    {
-        bail!(
-            "the linker script path {path} holds whitespace, which RUSTFLAGS cannot carry; \
-             build from a checkout whose path holds none"
-        );
+        Some(script) => format!("{rustflags} -Clink-arg=-T{script}"),
+        None => rustflags.to_owned(),
     }
-    Ok(format!("{rustflags} -Clink-arg=-T{path}"))
 }
 
 /// Fail a riscv64 kernel build whose `image` has a frame above
@@ -1952,11 +1937,14 @@ mod tests
 
     // Defect caught: a kernel or bootloader linked without its linker script,
     // or with one its crate does not include, whose change would then leave
-    // the linked image as it was (docs/build-system.md § Custom Targets).
+    // the linked image as it was (docs/build-system.md § Custom Targets); or
+    // a script named by a path of the checkout, which makes every unit of the
+    // build stale in another checkout (a CI cell, a test lane).
     #[test]
     fn each_linker_script_is_passed_to_the_link_and_included_by_its_crate()
     {
         let root = project_root();
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         let cases = [Arch::X86_64, Arch::Riscv64].into_iter().flat_map(|arch| {
             [
                 (arch, Some(arch.kernel_linker_script()), "core/kernel"),
@@ -1966,16 +1954,26 @@ mod tests
         for (arch, script, krate) in cases
         {
             let base = "-Zunstable-options";
-            let flags = with_linker_script(root, base, script).unwrap();
+            let flags = with_linker_script(base, script);
             let Some(script) = script
             else
             {
                 assert_eq!(flags, base, "{arch}: {krate}");
                 continue;
             };
-            let path = root.join(script);
-            assert!(path.is_file(), "{}", path.display());
-            assert_eq!(flags, format!("{base} -Clink-arg=-T{}", path.display()));
+            assert!(Path::new(script).is_relative(), "{script}");
+            assert!(root.join(script).is_file(), "{script}");
+            assert!(
+                !script.contains(char::is_whitespace),
+                "{script}: RUSTFLAGS splits at whitespace"
+            );
+            assert_eq!(flags, format!("{base} -Clink-arg=-T{script}"));
+            // A workspace member, so Cargo runs its rustc, and the link, from
+            // the workspace root the path is relative to.
+            assert!(
+                manifest.contains(&format!("\"{krate}\"")),
+                "{krate} is not a workspace member"
+            );
             let main = fs::read_to_string(root.join(krate).join("src/main.rs")).unwrap();
             let file = Path::new(script).file_name().unwrap().to_str().unwrap();
             assert!(
@@ -1983,22 +1981,17 @@ mod tests
                 "{krate}/src/main.rs does not include {file}"
             );
         }
-        let kernel = profile_env(root, Arch::Riscv64, BuildProfile::Kernel).unwrap();
-        assert_eq!(kernel.len(), 1);
-        assert!(
-            kernel[0].1.starts_with(RISCV64_KERNEL_RUSTFLAGS),
-            "{}",
-            kernel[0].1
-        );
-        assert!(
-            kernel[0].1.ends_with("core/kernel/linker/riscv64.ld"),
-            "{}",
-            kernel[0].1
+        let kernel = profile_env(Arch::Riscv64, BuildProfile::Kernel);
+        assert_eq!(
+            kernel,
+            vec![(
+                "RUSTFLAGS",
+                format!("{RISCV64_KERNEL_RUSTFLAGS} -Clink-arg=-Tcore/kernel/linker/riscv64.ld")
+            )]
         );
         assert_eq!(
-            profile_env(root, Arch::X86_64, BuildProfile::StdUser).unwrap(),
+            profile_env(Arch::X86_64, BuildProfile::StdUser),
             Vec::<(&str, String)>::new()
         );
-        with_linker_script(Path::new("/a b"), "-Zunstable-options", Some("x.ld")).unwrap_err();
     }
 }

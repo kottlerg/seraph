@@ -211,7 +211,7 @@ Internally the pipeline runs in three steps:
 
 1. The bootloader crate is compiled against `riscv64imac-seraph-uefi` and
    linked with `linker/riscv64-uefi.ld`, which `cargo xtask build` passes to the
-   linker as an absolute `-T` link argument (see
+   linker as a `-T` link argument (see
    [docs/build-system.md § Custom Targets](../../../docs/build-system.md#custom-targets)),
    producing an ELF that contains the `.pecoff_header` section (assembled
    from `header.S`) at load address `0x0`, followed by `.text` at `0x1000`.

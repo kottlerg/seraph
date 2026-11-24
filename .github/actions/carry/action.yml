@@ -14,7 +14,8 @@ description: >-
   it was built from (.cargo/config.toml), so an entry built from another
   tree is safe to restore and only what differs is rebuilt; the key prefix
   names every input that check does not see: the job, the runner image, the
-  installed toolchain, the target specs and the Cargo configuration.
+  installed toolchain, the wrapper shim, the target specs and the Cargo
+  configuration.
   `restore` restores master's newest entry of the prefix and dates the
   toolchain's library sources; `save`, on a push to master, saves the
   entry under the prefix and the commit and deletes master's older entries
@@ -52,13 +53,16 @@ runs:
         NAME: ${{ inputs.name }}
         # The inputs of every unit that Cargo's checksums do not cover: the
         # target specs, the Cargo configuration (which also turns the
-        # checksums on), and this action. Markdown is left out: no unit
-        # reads it, and a change to it alone owes no build job, so no master
-        # run would save an entry under the key it made. A host test of
-        # xtask/src/rust_src.rs checks the list.
+        # checksums on), this action, and the wrapper shim, which runs every
+        # rustc and clippy-driver of a build through the toolchain mirror
+        # and adds arguments to their command lines that Cargo never sees.
+        # Markdown is left out: no unit reads it, and a change to it alone
+        # owes no build job, so no master run would save an entry under the
+        # key it made. A host test of xtask/src/rust_src.rs checks the list.
         CONFIG_HASH: >-
           ${{ hashFiles('xtask/targets/**', '.cargo/config.toml',
-          '.github/actions/carry/action.yml', '!**/*.md') }}
+          '.github/actions/carry/action.yml', 'xtask/wrapper-shim/**',
+          '!**/*.md') }}
       # The installed toolchain is named by its full version, the runner
       # image by its name and version: the host build scripts and host tools
       # the entry holds link against the image's libraries.
@@ -113,7 +117,10 @@ runs:
         key: ${{ steps.key.outputs.key }}
 
     # Only the newest entry of a prefix is ever restored, so the older ones
-    # only take quota. Deleting needs the job's `actions: write`.
+    # only take quota. Deleting needs the job's `actions: write`. Two master
+    # runs can run at once (build-test.yml's concurrency group is per
+    # commit), and both can list an entry the other deletes first; a
+    # deletion is housekeeping, so one that fails warns and fails nothing.
     - name: Delete master's older entries
       if: inputs.mode == 'save' && github.event_name == 'push' && github.ref == 'refs/heads/master'
       shell: sh
@@ -122,10 +129,15 @@ runs:
         PREFIX: ${{ steps.key.outputs.prefix }}
         KEY: ${{ steps.key.outputs.key }}
       run: |
-        gh cache list --repo "$GITHUB_REPOSITORY" --ref refs/heads/master \
-          --key "$PREFIX" --limit 100 --json key --jq '.[].key' |
-          while read -r old; do
-            if [ "$old" != "$KEY" ]; then
-              gh cache delete --repo "$GITHUB_REPOSITORY" "$old"
-            fi
-          done
+        old_keys="$RUNNER_TEMP/carry-old-keys"
+        if ! gh cache list --repo "$GITHUB_REPOSITORY" --ref refs/heads/master \
+          --key "$PREFIX" --limit 100 --json key --jq '.[].key' > "$old_keys"; then
+          echo "::warning::could not list master's entries of $PREFIX; none deleted"
+          exit 0
+        fi
+        while read -r old; do
+          if [ "$old" != "$KEY" ] &&
+            ! gh cache delete --repo "$GITHUB_REPOSITORY" "$old"; then
+            echo "::warning::$old not deleted (another master run may have deleted it)"
+          fi
+        done < "$old_keys"

@@ -270,6 +270,14 @@ The review is the `pr-reviewer` and `pr-auditor` run of § Review, never a deleg
 - Edit an Issue body with `cargo xtask issue-edit <N> --body-file <file>`, from a copy fetched in
   the same step (`gh issue view <N> --json body --jq .body > <file>`). The command refuses an
   empty body or one that lost items, keeps a backup, and verifies the edit.
+- Read a PR or Issue body back for editing without stderr: redirect the body alone to the file
+  in the command itself (`gh pr view <N> --json body --jq .body > <file>`, and `gh issue view`
+  for an Issue), and never write back text a tool returned with stderr merged into it. `gh`
+  prints advice on stderr after reading a pull request, which a merged read writes into the
+  body. Before writing the file back (`gh pr edit <N> --body-file <file>`, `cargo xtask
+  issue-edit`), check that its first line is the body's own (`## Summary` for a PR body).
+  `cargo xtask pr-check` fails a body that carries tool output (`pr-tool-output`,
+  `issue-tool-output`), and `issue-edit` and `issue-file` refuse such a body file.
 - An Issue whose acceptance spans several PRs is a multi-PR parent Issue. The PR that ends one
   of its phases leaves the next phase's brief (the approved mechanism, the PR grouping, the call
   sites) as a comment on that Issue. No other PR leaves a handover plan.

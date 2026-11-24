@@ -14,6 +14,7 @@ use crate::error::{Context, Result, bail};
 use crate::arch::Arch;
 use crate::cli::{BuildArgs, BuildComponent};
 use crate::context::{Context as BuildContext, Profile};
+use crate::layers::{self, Layer};
 use crate::rust_src;
 use crate::stack_sizes;
 use crate::symbolize::store::{self, Store};
@@ -769,33 +770,92 @@ pub fn compile_boot(ctx: &BuildContext, args: &BuildArgs, store: &Path, out: &Pa
 
 // ── Grouped component build ───────────────────────────────────────────────────
 
-/// Build every non-boot component, one `cargo build` invocation per
-/// [`BuildProfile`]. A single cargo invocation walks the dependency graph
+/// Build every non-boot component, one `cargo build` invocation per group
+/// of [`spec_groups`]. A single cargo invocation walks the dependency graph
 /// once, re-uses one `-Z build-std` cache, and shares fingerprint work
 /// across packages — on a no-change tree this turns roughly
-/// `N_specs × 5s` of cargo re-entry overhead into a single pass.
+/// `N_specs × 5s` of cargo re-entry overhead into one pass per group.
 fn build_all_specs(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 {
-    // Preserve SPECS ordering inside each group so initial-boot output
-    // order (kernel → init → ktest → procmgr → StdUser …) is stable.
+    let mut std_lint = StdLint::Run;
+    for (profile, _, group) in spec_groups(args.arch)?
+    {
+        build_group(ctx, args, profile, &group, std_lint)?;
+        // The std members' lint pass is the same for every group of the
+        // profile that builds std, so it runs with the first.
+        if profile == BuildProfile::StdUser
+        {
+            std_lint = StdLint::Skip;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a group's build runs the lint pass of the workspace crates std
+/// depends on ([`clippy_std_members`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StdLint
+{
+    Run,
+    Skip,
+}
+
+/// The components a build of `arch` builds, in the groups of one cargo
+/// invocation each: per [`BuildProfile`], the components of each layer
+/// apart, lowest layer first, each group in [`SPECS`] order. Cargo unifies
+/// the features of a crate over every package of one invocation, so a
+/// higher layer built with a lower one could turn on a feature of a crate
+/// the lower layer links and change the lower layer's binaries; built
+/// apart, a layer's binaries depend on its own manifests and those below
+/// it alone (docs/testing.md § Harnesses), which the CI selection relies
+/// on (`cargo xtask cells`).
+///
+/// # Errors
+/// A component whose install path no install row of the layer record
+/// places.
+fn spec_groups(arch: Arch) -> Result<Vec<(BuildProfile, Layer, Vec<&'static Spec>)>>
+{
+    let mut groups = Vec::new();
     for profile in [
         BuildProfile::Kernel,
         BuildProfile::LowLevelUser,
         BuildProfile::StdUser,
     ]
     {
-        let group: Vec<&Spec> = SPECS
-            .iter()
-            .filter(|s| s.profile == profile)
-            .filter(|s| s.arch_only.is_none_or(|a| a == args.arch))
-            .collect();
-        if group.is_empty()
+        for layer in [Layer::Kernel, Layer::Services, Layer::Programs]
         {
-            continue;
+            let mut group = Vec::new();
+            for spec in SPECS
+                .iter()
+                .filter(|s| s.profile == profile && arch_refusal(s, arch).is_none())
+            {
+                if spec_layer(spec)? == layer
+                {
+                    group.push(spec);
+                }
+            }
+            if !group.is_empty()
+            {
+                groups.push((profile, layer, group));
+            }
         }
-        build_group(ctx, args, profile, &group)?;
     }
-    Ok(())
+    Ok(groups)
+}
+
+/// The layer whose harness `spec`'s binary serves, by its install row.
+fn spec_layer(spec: &Spec) -> Result<Layer>
+{
+    let path = install_relative(spec);
+    let path = path.to_string_lossy();
+    match layers::install_row(&path)
+    {
+        Some(install) => Ok(install.layer),
+        None => bail!(
+            "{}: no install row of xtask/src/layers.rs places {path}",
+            spec.name
+        ),
+    }
 }
 
 fn build_group(
@@ -803,6 +863,7 @@ fn build_group(
     args: &BuildArgs,
     profile: BuildProfile,
     group: &[&Spec],
+    std_lint: StdLint,
 ) -> Result<()>
 {
     let (triple, build_std, needs_seraph_rustc) = profile_params(args.arch, profile);
@@ -855,7 +916,10 @@ fn build_group(
     if !args.skip_lints
     {
         clippy_check_ext(ctx, &flags_ref, &env, seraph.as_ref())?;
-        clippy_std_members(ctx, triple, build_std, args.profile(), seraph.as_ref())?;
+        if std_lint == StdLint::Run
+        {
+            clippy_std_members(ctx, triple, build_std, args.profile(), seraph.as_ref())?;
+        }
     }
 
     let mut cmd = cargo(&ctx.root);
@@ -1504,6 +1568,50 @@ mod tests
         );
         assert_eq!(feature_flags(&build(true), &["init", "procmgr"]), none);
         assert_eq!(feature_flags(&build(false), &["ktest"]), none);
+    }
+
+    // Defect caught: one cargo invocation building the components of two
+    // layers, so a feature a higher layer's manifest turns on for a crate
+    // both link changes a lower layer's binary, while the CI selection owes
+    // that change no cell of the lower layer; or a component built in no
+    // group, or in two.
+    #[test]
+    fn each_cargo_invocation_builds_one_layer()
+    {
+        for arch in [Arch::X86_64, Arch::Riscv64]
+        {
+            let groups = spec_groups(arch).unwrap();
+            let mut seen = Vec::new();
+            for (profile, layer, group) in &groups
+            {
+                for spec in group
+                {
+                    assert_eq!(
+                        (spec.profile, spec_layer(spec).unwrap()),
+                        (*profile, *layer),
+                        "{}",
+                        spec.name
+                    );
+                    seen.push(spec.name);
+                }
+            }
+            let mut want: Vec<&str> = SPECS
+                .iter()
+                .filter(|s| arch_refusal(s, arch).is_none())
+                .map(|s| s.name)
+                .collect();
+            seen.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(seen, want, "{arch:?}");
+            let group_of = |name: &str| {
+                groups
+                    .iter()
+                    .position(|(_, _, g)| g.iter().any(|s| s.name == name))
+                    .unwrap()
+            };
+            assert_ne!(group_of("ktest"), group_of("init"));
+            assert_ne!(group_of("usertest"), group_of("svctest"));
+        }
     }
 
     #[test]

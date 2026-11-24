@@ -2734,7 +2734,7 @@ UnknownArgument
 error: unexpected argument '--headless' found
 
 ["clean"]
-ok-all clean all=default keep_std=default host_override=default
+ok-all clean all=default host_override=default
 
 ["clean","-h"]
 help xtask clean -h
@@ -27187,13 +27187,6 @@ error: the following required arguments were not provided:
 
 ["test","--cell","usertest","--lane-root","/tmp/lane"]
 ok test cell=["usertest"] lane_root=["/tmp/lane"]
-
-["clean","--keep-std"]
-ok clean keep_std
-
-["clean","--all","--keep-std"]
-ArgumentConflict
-error: the argument '--all' cannot be used with '--keep-std'
 
 ["path-account"]
 help-on-missing xtask path-account -h

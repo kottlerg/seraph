@@ -140,7 +140,14 @@ publish = false
 # `cargo kani` sets `cfg(kani)` (docs/testing.md § Bounded verification), and
 # `cargo xtask fuzz` alone sets `fuzzing`: the property modules of the parser
 # crates and the fuzz targets compile under it (docs/testing.md § Fuzzing).
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(fuzzing)'] }
+# `target_os = "seraph"` is the seraph targets' operating system, which the
+# host's `rustc` does not know: a crate compiled for both reads it in its host
+# build (`death-set`, whose `DeathSet` is compiled only for seraph).
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(kani)',
+    'cfg(fuzzing)',
+    'cfg(target_os, values("seraph"))',
+] }
 
 [workspace.lints.clippy]
 all      = { level = "warn", priority = -1 }

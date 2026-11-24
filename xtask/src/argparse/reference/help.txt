@@ -403,7 +403,6 @@ Usage: xtask clean [OPTIONS]
 
 Options:
       --all               Also remove the cargo target/ directory (full clean)
-      --keep-std          Also empty Cargo's profile directories in target/ but for the build units of the toolchain's library packages (core, alloc, compiler_builtins, std and their dependencies), the part CI caches
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
@@ -414,7 +413,6 @@ Usage: xtask clean [OPTIONS]
 
 Options:
       --all               Also remove the cargo target/ directory (full clean)
-      --keep-std          Also empty Cargo's profile directories in target/ but for the build units of the toolchain's library packages (core, alloc, compiler_builtins, std and their dependencies), the part CI caches
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help

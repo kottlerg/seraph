@@ -362,13 +362,19 @@ jobs:
           name: validate-${{ matrix.arch }}-${{ matrix.profile }}
 
   validate:
-    # After the build job of the cell's architecture and profile (and so
-    # after the qemu-debs job; see docs/build-system.md § Continuous
-    # Integration), whose tree the cell boots: no cell builds. The cells
-    # are the ones the select job owes; when it owes none, `if` skips the
-    # job, since a job of an empty matrix fails.
+    # After the build job (and so after the qemu-debs job; see
+    # docs/build-system.md § Continuous Integration): a cell boots the tree
+    # of its architecture and profile's entry and builds nothing. A job that
+    # needs a matrix job starts once every entry has ended, so the cells
+    # start after the last build; `if` runs them whatever the other
+    # entries' outcomes, so a cell whose tree shipped boots it and one whose
+    # build failed fails at its fetch, under its own name. The cells are the
+    # ones the select job owes; when it owes none, `if` skips the job,
+    # since a job of an empty matrix fails.
     needs: [select, build]
-    if: needs.select.outputs.validate-owed == 'true'
+    if: >-
+      ${{ !cancelled() && needs.build.result != 'skipped'
+      && needs.select.outputs.validate-owed == 'true' }}
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
@@ -643,12 +649,15 @@ jobs:
     # repeat from run to run, and their one-CPU counts held to the checked-in
     # baselines (xtask/README.md § `cargo xtask bench-check`; docs/testing.md
     # § Gating). After the
-    # build job of its architecture's release tree, which builds its image,
-    # as validate is; see docs/build-system.md § Continuous Integration. The select job owes the cell, and within it the ktest
+    # build job, whose release entry of the cell's architecture builds its
+    # image, and run whatever the other entries' outcomes, as validate is;
+    # see docs/build-system.md § Continuous Integration. The select job owes the cell, and within it the ktest
     # boots apart: when it does not owe them they are skipped, and so are
     # the ktest suite's baselines.
     needs: [select, build]
-    if: needs.select.outputs.bench-owed == 'true'
+    if: >-
+      ${{ !cancelled() && needs.build.result != 'skipped'
+      && needs.select.outputs.bench-owed == 'true' }}
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false

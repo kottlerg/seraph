@@ -663,7 +663,8 @@ mod tests
 
     // Defect caught: a cell or bench boot that builds its own tree, runs a
     // `cargo` command a cell without the toolchain cannot, waits on no build
-    // job, or fetches an artifact no build job ships.
+    // job, is skipped with every other cell when one build entry fails, or
+    // fetches an artifact no build job ships.
     #[test]
     fn the_cells_boot_the_trees_the_build_jobs_ship()
     {
@@ -689,6 +690,10 @@ mod tests
         for (cell, name) in [(&validate, tree), (&bench, image)]
         {
             assert!(cell.contains("\n    needs: [select, build]\n"), "{cell}");
+            assert!(
+                cell.contains("!cancelled() && needs.build.result != 'skipped'\n"),
+                "{cell}"
+            );
             assert!(cell.contains("mode: fetch\n"), "{cell}");
             assert!(cell.contains(name), "{cell}");
             assert!(build.contains(name), "{name}");

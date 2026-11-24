@@ -795,8 +795,8 @@ its faults go unreported. A `NOT_ATTACHABLE` refusal, from a process declared un
 one-way, so a declared process registers nothing.
 
 The new thread makes the call, not its spawner, so a spawner never waits on procmgr, apart from
-the spawner of one of the runtime's own threads, which waits for the thread to reach its wait
-(§ Runtime threads). Any of
+the spawner of one of the runtime's own threads, which waits for the thread to reach its wait,
+and whose call deadline the thread's registration takes (§ Runtime threads). Any of
 procmgr's request workers serves a registration
 ([services/procmgr/README.md](../../services/procmgr/README.md) § Concurrency), so a request of
 procmgr's blocked on the same process holds one worker and the registration goes to another. Only
@@ -867,9 +867,10 @@ after a spawn returns thus finds the spawn's whole charge, as svctest's `crashd_
 relies on when it compares the readings on either side of a refused live-core request
 (`check_live_no_core` in `services/svctest/src/phases/crashd.rs`).
 
-The wait covers the thread's registration with procmgr (§ Thread registration) and has no bound of
-its own; inside a call deadline it also ends at the deadline (§ Call deadline). It ends on every
-path of the thread that does not end the process: the thread signals at its wait, or drops its
+The wait covers the thread's registration with procmgr (§ Thread registration), which the thread
+makes under its spawner's call deadline, if any (§ Call deadline), so a deadline that bounds the
+spawner's calls bounds the wait too; the wait has no bound of its own. It ends on every path of the
+thread that does not end the process: the thread signals at its wait, or drops its
 signal when its main returns or unwinds first, which fails the spawn with an error. A fault that
 kills the thread, a stack fault the pager refuses for the process's budget among them, ends the
 whole process, the waiting spawner with it
@@ -901,10 +902,11 @@ trust to answer, as crashd bounds a fault's report and a core dump
   `UNIX_EPOCH` from `SystemTime::now`, `None` from the registry lookup, and a dropped line from
   the log. Such a call may have reached its server, which may have acted on it, and whose reply
   then finds no caller. A spawn's wait for its child's bootstrap requests (§ Bootstrap caps), which
-  is a receive, ends at the deadline too, and fails the spawn `TimedOut`. So does the wait of a
-  piped `Command::spawn`, or of a process's first `File::open`, for the runtime thread it starts
-  to reach its wait (§ Runtime threads): the call goes on with the thread still on its way, its
-  charge not yet ordered, and its next IPC call fails it `TimedOut`. A `File` dropped past
+  is a receive, ends at the deadline too, and fails the spawn `TimedOut`. The runtime thread
+  that a piped `Command::spawn` or a process's first `File::open` starts (§ Runtime threads)
+  makes its registration with procmgr under the caller's deadline, so the call's wait for that
+  thread to reach its wait ends by the deadline too; a registration the deadline cuts leaves the
+  thread unregistered (§ Thread registration). A `File` dropped past
   the deadline sends no `FS_CLOSE`: the session table keeps its open cap, and the process's next
   `File::open`, or its exit hook, sends the close within a bound of its own for the whole drain
   (`KEPT_CLOSE_DRAIN`) and that thread's deadline, whichever ends first, so a thread with no
@@ -931,7 +933,8 @@ trust to answer, as crashd bounds a fault's report and a core dump
   The deadline in force before `with_call_deadline` is in force again once `f` returns, unwinds,
   or returns early, so nothing of it is left set. It is thread-local: a thread `f` spawns does not
   inherit it, so a new thread's registration with procmgr (§ Thread registration) waits for
-  procmgr's answer.
+  procmgr's answer, apart from one of the runtime's own threads, whose spawner waits for its
+  registration, which it makes under the spawner's deadline (§ Runtime threads).
 
 The runtime makes each bounded call through one helper that reads the deadline (`deadline_call`),
 and the unbounded ones through three others, one for memmgr and the objects it serves
@@ -1065,8 +1068,7 @@ dropped, so it cannot drift from the values alive. A value the application forge
 accepted, as the leak of the capability is. The runtime's own threads, the fs release handler and
 a child's death bridge, are spawned through `thread::runtime_spawn` and not counted: their spawn
 returns once they are at their wait (§ Runtime threads), and they are idle there whenever the counts
-are zero, apart from a release handler whose start a call deadline cut, which reaches its wait on
-its own once procmgr answers its registration. The filesystem session table (§ Filesystem sessions)
+are zero. The filesystem session table (§ Filesystem sessions)
 keeps its sessions' caps past a quiesce point in a `rebound` static, which the restore entry
 forgets.
 

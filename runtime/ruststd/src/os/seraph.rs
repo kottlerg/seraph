@@ -351,7 +351,9 @@ static CALL_DEADLINE: Cell<Option<crate::time::Instant>> = Cell::new(None);
 /// A deadline set inside `f` takes effect only when it is earlier than this
 /// one. The deadline in force before the call is in force again once `f`
 /// returns, unwinds, or returns early. A thread `f` spawns does not inherit
-/// the deadline.
+/// the deadline, apart from the registration with procmgr of one of the
+/// runtime's own threads, which the spawn waits for
+/// ([`thread::runtime_spawn`]).
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn with_call_deadline<R>(deadline: crate::time::Instant, f: impl FnOnce() -> R) -> R {
     /// Restores the deadline in force before the scope when dropped.
@@ -374,6 +376,14 @@ pub fn with_call_deadline<R>(deadline: crate::time::Instant, f: impl FnOnce() ->
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn call_time_left() -> Option<crate::time::Duration> {
     CALL_DEADLINE.get().map(|deadline| deadline.saturating_duration_since(crate::time::Instant::now()))
+}
+
+/// The calling thread's call deadline ([`with_call_deadline`]), `None`
+/// outside every deadline; read by `sys::thread::Thread::new` for the
+/// registration of one of the runtime's own threads
+/// ([`thread::runtime_spawn`]).
+pub(crate) fn call_deadline() -> Option<crate::time::Instant> {
+    CALL_DEADLINE.get()
 }
 
 /// `ipc::ipc_call` under the calling thread's call deadline
@@ -2543,15 +2553,14 @@ pub mod thread {
     /// counted among the application's (`checkpoint::quiesce`).
     ///
     /// The wait covers the thread's registration with procmgr (README
-    /// § Thread registration) and has no bound of its own. It ends on every
-    /// path of the thread that does not end the process: `main` signals, or
-    /// drops its signal when it returns or unwinds. A fault that kills the
-    /// thread, a refused stack fault among them, ends the process, this thread
-    /// with it (docs/process-lifecycle.md § Exit reason). Inside a call
-    /// deadline (`with_call_deadline`) it also ends at the deadline, and this
-    /// returns the thread's handle with the thread still on its way to its
-    /// wait: the caller's next bounded call then fails `TimedOut` (README
-    /// § Call deadline).
+    /// § Thread registration), which the thread makes under the caller's call
+    /// deadline (`with_call_deadline`), if any, so a deadline that bounds the
+    /// caller's calls bounds the wait too (README § Call deadline); the wait
+    /// has no bound of its own. It ends on every path of the thread that does
+    /// not end the process: `main` signals, or drops its signal when it
+    /// returns or unwinds. A fault that kills the thread, a refused stack
+    /// fault among them, ends the process, this thread with it
+    /// (docs/process-lifecycle.md § Exit reason).
     ///
     /// # Errors
     /// The spawn's own error, or an error when `main` returned or unwound
@@ -2580,13 +2589,7 @@ pub mod thread {
                 }
                 // Not at its wait yet. A park may return early or spuriously,
                 // which the loop's recheck absorbs.
-                _ => match super::call_time_left() {
-                    None => crate::thread::park(),
-                    // The caller's deadline has passed: return without the
-                    // ordering rather than past the deadline.
-                    Some(left) if left.is_zero() => return Ok(handle),
-                    Some(left) => crate::thread::park_timeout(left),
-                },
+                _ => crate::thread::park(),
             }
         }
     }

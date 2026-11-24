@@ -1039,12 +1039,13 @@ mod tests
 /// GUID in its last 36 bytes, the disk field after the last space before
 /// the GUID's, the path before it), checks the path, the disk and the GUID,
 /// and builds the entry. The proofs compose: the short-line proof runs the
-/// property's check of a line on every line of at most 12 bytes; the split
+/// property's check of a line on every line of at most 10 bytes; the split
 /// proof runs the split's check on every line of at most 48 bytes; the path,
 /// disk and GUID proofs run the checks of the three fields on every path of
 /// at most 8 bytes, every disk field of at most 17 and every text of at most
 /// 37; and the taken-line proof shows a `data` line of any three-byte path
-/// and four-byte disk field, or a `swap` line of any four-byte disk field,
+/// and the disk field `boot`, or a `swap` line of any four-byte disk
+/// field,
 /// with the first digit and the first dash of its GUID of any value, built
 /// into its entry or refused for the first of its fields out of its form. A
 /// line's entry is then judged against each earlier one by `conflict`,
@@ -1059,15 +1060,16 @@ mod proofs
 {
     use super::{Disk, ErrorKind, Key, PciLocation, Role, conflict, property};
 
-    /// Every line of at most 12 bytes holds the line contract: an empty
+    /// Every line of at most 10 bytes holds the line contract: an empty
     /// line, a comment, and each refusal of a line too short to name a
     /// partition, for both roles and none (an unknown keyword, a field
-    /// missing, extra or empty).
+    /// missing, extra or empty): 10 bytes hold a keyword and three one-byte
+    /// fields, a `data` line's four.
     #[kani::proof]
-    #[kani::unwind(14)]
+    #[kani::unwind(12)]
     fn every_short_line_holds_the_line_contract()
     {
-        let bytes: [u8; 12] = kani::any();
+        let bytes: [u8; 10] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= bytes.len());
         property::line_holds(&bytes[..len]);
@@ -1097,17 +1099,19 @@ mod proofs
     /// otherwise for the first field out of its form: the step from the split
     /// fields to the entry, whose checks of the path, the disk and the GUID
     /// the path, disk and GUID proofs cover on every field of their bounds. A
-    /// space in a `data` line's disk field moves the field's start past it:
-    /// at its end, the disk field read is empty and the line is refused for
-    /// its fields; elsewhere, the path read holds a space and the line is
-    /// refused for its path.
+    /// `data` line's disk field is `boot`: a symbolic byte there would make
+    /// the path's length, which the split reads from the last space,
+    /// symbolic for every check after it, and a space there moves the split,
+    /// which the split proof covers on every line of its bound. The `swap`
+    /// line's field carries any four-byte disk text into the same
+    /// `Disk::parse`.
     fn line_is_taken_as_its_fields(data: bool)
     {
         let mut guid = *b"a1B2c3d4-E5f6-7890-ABcd-ef0123456789";
         guid[0] = kani::any();
         guid[8] = kani::any();
         let path: [u8; 3] = kani::any();
-        let disk: [u8; 4] = kani::any();
+        let disk: [u8; 4] = if data { *b"boot" } else { kani::any() };
         let mut line = [0u8; 50];
         let len = if data
         {
@@ -1127,7 +1131,7 @@ mod proofs
             line[10..46].copy_from_slice(&guid);
             46
         };
-        let path_in_form = !data || (property::path_form(&path) && !disk.contains(&b' '));
+        let path_in_form = !data || property::path_form(&path);
         let disk_in_form = property::disk_form(&disk);
         let guid_in_form = property::guid_form(&guid);
         match super::parse_line(&line[..len])
@@ -1161,11 +1165,7 @@ mod proofs
                     !(path_in_form && disk_in_form && guid_in_form),
                     "a line in its form refused"
                 );
-                let first = if data && disk[3] == b' '
-                {
-                    ErrorKind::Fields
-                }
-                else if !path_in_form
+                let first = if !path_in_form
                 {
                     ErrorKind::Path
                 }

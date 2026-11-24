@@ -330,6 +330,10 @@ pub(crate) fn split_holds(line: &[u8])
         };
         (path.is_none_or(|path| !path.is_empty()) && !disk.is_empty()).then_some((path, disk))
     });
+    assert!(
+        result.is_err() || expected.is_some(),
+        "a line read into fields not at their places"
+    );
     match (result, expected)
     {
         (Ok((taken, path, disk, guid)), Some((expected_path, expected_disk))) =>
@@ -356,7 +360,9 @@ pub(crate) fn split_holds(line: &[u8])
                 );
             }
         }
-        (Ok(_), None) => panic!("a line read into fields not at their places"),
+        // Refused by the assertion above.
+        (Ok(_), None) =>
+        {}
         (Err(kind), expected) =>
         {
             assert!(

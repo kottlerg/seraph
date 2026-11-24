@@ -802,8 +802,15 @@ fn check_live_no_core(crashd: u64)
         "crashd_live_core: live-no-core: expected ready, read {line:?}"
     );
 
-    // Nothing between the two reads of the charge allocates or touches a new
-    // page of this process.
+    // The two reads of the charge bracket the request alone: this thread
+    // allocates nothing and touches no page between them. The spawn's charge
+    // is whole before `spawn` returns: the child's death bridge, a runtime
+    // thread, signals the spawn only at its wait, so the pages it touched to
+    // get there, its stack's top chunk among them, are charged before the
+    // first read (runtime/ruststd/README.md § Runtime threads). The handshake
+    // covers the bridge only up to its wait; the comparison is exact because
+    // the bridge does not wake between the reads: it wakes only on the child's
+    // end, and the child lives until the `exit` written after the second read.
     let request = live_core_request("live-no-core");
     let charged = own_charge(ipc_buf);
     // SAFETY: ipc_buf is the registered IPC buffer.

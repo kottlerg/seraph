@@ -2469,6 +2469,7 @@ pub use crate::__seraph_stack_pages as stack_pages;
 pub mod thread {
     use crate::cell::Cell;
     use crate::io;
+    use crate::sync::atomic::{AtomicU8, Ordering};
     use crate::thread::{Builder, JoinHandle};
 
     /// The level the next spawn from the current thread places its child at,
@@ -2493,14 +2494,90 @@ pub mod thread {
     // restore: none
     static RUNTIME_SPAWN: Cell<bool> = Cell::new(false);
 
-    /// Run `spawn`, which spawns one of the runtime's own threads (the fs
-    /// release handler, a child's death bridge), so that thread is not
+    /// [`StartSignal`] state: the runtime thread has not reached its wait.
+    const STARTING: u8 = 0;
+    /// [`StartSignal`] state: the runtime thread is at its wait.
+    const AT_WAIT: u8 = 1;
+    /// [`StartSignal`] state: the runtime thread's main returned or unwound
+    /// before it reached its wait.
+    const ENDED: u8 = 2;
+
+    /// The new runtime thread's half of [`runtime_spawn`]'s wait. Its main
+    /// calls [`StartSignal::at_wait`] right before the wait it idles at; a
+    /// signal dropped without that call, by a main that returned or unwound
+    /// first, ends the spawner's wait with an error, so the wait ends on every
+    /// path of the thread that does not end the process.
+    pub(crate) struct StartSignal {
+        state: crate::sync::Arc<AtomicU8>,
+        /// The spawner, parked in [`runtime_spawn`] until the state leaves
+        /// [`STARTING`]. The handle keeps its Parker, and the Parker's
+        /// notification, alive for the `unpark` that follows the store.
+        spawner: crate::thread::Thread,
+        at_wait: bool,
+    }
+
+    impl StartSignal {
+        /// Tell the spawner that this thread is at its wait: called right
+        /// before the thread's first blocking wait, with nothing between the
+        /// call and the wait but the call's own store and wake.
+        pub(crate) fn at_wait(mut self) {
+            self.at_wait = true;
+        }
+    }
+
+    impl Drop for StartSignal {
+        fn drop(&mut self) {
+            let state = if self.at_wait { AT_WAIT } else { ENDED };
+            self.state.store(state, Ordering::Release);
+            self.spawner.unpark();
+        }
+    }
+
+    /// Spawn one of the runtime's own threads (the fs release handler, a
+    /// child's death bridge), named `name`, to run `main`, and return once
+    /// it is at its wait (`main` calls [`StartSignal::at_wait`]). Every page
+    /// the thread touches on its way there, its stack's first chunk among
+    /// them, is charged to the process before this returns, so a caller that
+    /// reads its own account afterwards finds the spawn's whole charge
+    /// (runtime/ruststd/README.md § Runtime threads). The thread is not
     /// counted among the application's (`checkpoint::quiesce`).
-    pub(crate) fn runtime_spawn<R>(spawn: impl FnOnce() -> R) -> R {
+    ///
+    /// The wait has no bound and covers the thread's registration with
+    /// procmgr (README § Thread registration). It ends on every path of the
+    /// thread that does not end the process: `main` signals, or drops its
+    /// signal when it returns or unwinds. A fault that kills the thread, a
+    /// refused stack fault among them, ends the process, this thread with it
+    /// (docs/process-lifecycle.md § Exit reason).
+    ///
+    /// # Errors
+    /// The spawn's own error, or an error when `main` returned or unwound
+    /// before it reached its wait.
+    pub(crate) fn runtime_spawn(
+        name: &str,
+        main: impl FnOnce(StartSignal) + Send + 'static,
+    ) -> io::Result<JoinHandle<()>> {
+        let state = crate::sync::Arc::new(AtomicU8::new(STARTING));
+        let signal = StartSignal {
+            state: state.clone(),
+            spawner: crate::thread::current(),
+            at_wait: false,
+        };
         let previous = RUNTIME_SPAWN.replace(true);
-        let spawned = spawn();
+        let spawned = Builder::new().name(name.into()).spawn(move || main(signal));
         RUNTIME_SPAWN.set(previous);
-        spawned
+        let handle = spawned?;
+        loop {
+            match state.load(Ordering::Acquire) {
+                AT_WAIT => return Ok(handle),
+                ENDED => {
+                    return Err(io::Error::other(crate::format!(
+                        "runtime thread {name} ended before it reached its wait"
+                    )));
+                }
+                // An early or spurious return: the park contract allows one.
+                _ => crate::thread::park(),
+            }
+        }
     }
 
     /// Whether the spawn in progress on the current thread is the runtime's

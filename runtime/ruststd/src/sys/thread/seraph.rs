@@ -1054,8 +1054,9 @@ static REGISTRY_REFUSED: crate::sync::atomic::AtomicBool =
 /// § `REGISTER_THREAD`): hand it a copy of `self_thread_cap` with
 /// `RIGHTS_THREAD`, so `ATTACH_PROCESS` lists the thread and procmgr can
 /// bind its exception class under a badge of its own. Runs on the new
-/// thread before its code, so the spawner never waits on procmgr; a thread
-/// that procmgr cannot serve yet waits here alone. Best-effort: a refusal or
+/// thread before its code, so the spawner never waits on procmgr, apart from
+/// `os::seraph::thread::runtime_spawn`'s, which waits for its thread to reach
+/// its wait; a thread that procmgr cannot serve yet waits here alone. Best-effort: a refusal or
 /// a failed call leaves the thread unregistered, and it runs as before,
 /// apart from a call cancelled `Interrupted` after procmgr received it,
 /// which procmgr carried out. A failed call is not repeated, since a repeat

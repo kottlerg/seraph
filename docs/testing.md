@@ -547,8 +547,11 @@ lines and fsbench's.
 
 CI's `bench` cell, one per architecture, takes both in the release profile from its architecture's
 release build job (`cargo xtask build --release --ktest-bench-only`) and boots them under QEMU's
-icount (`cargo xtask run --icount`): one guest clock tick per retired instruction, so a benchmark's
-count is the same in every run of one build, whatever the runner's load. It boots each three times
+icount (`cargo xtask run --icount`): one guest clock tick per retired instruction while a vCPU runs,
+so the count of a window that does not idle is the same in every run of one build, whatever the
+runner's load. While every vCPU idles, the guest's clock follows the host's time up to its next
+timer deadline (QEMU's `sleep=on`), so a device completion ends the idle as it would on hardware,
+and a window that idles counts host time. It boots each three times
 at one CPU and once at four, the ubench boots with a framebuffer (`--display framebuffer`) and their
 logs saved in `ubench/` beside the ktest boots', and one `cargo xtask bench-check --mode icount`
 over both sets compares each measurement's lowest p50 over the runs that reported its suite with its
@@ -577,7 +580,7 @@ profiles. [core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-ac
 
 A one-CPU count gates only when it does not include time blocked on a device completion. The
 completion arrives at host time: a guest blocked on it retires no instructions, and its clock
-advances by timer deadlines until QEMU completes the request, so the count follows the host's I/O
+follows the host's time until QEMU completes the request, so the count follows the host's I/O
 latency. `fsbench.write`, which writes through the filesystem's page cache to the disk, is such a
 benchmark at every size, and is reported, not gated; a regression of the write path's
 instructions shows in the cell's report and in host mode, not as a failure. `fsbench.read` gates:

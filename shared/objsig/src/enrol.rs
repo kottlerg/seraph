@@ -22,8 +22,8 @@
 use core::cmp::Ordering;
 
 use crate::store::{
-    ANCHOR_LEN, Anchor, AnchorSpec, TrustStore, anchor_checks, anchor_parts, ascending,
-    decode_anchor, in_order, label_is_valid, put_anchor, raw_key_id,
+    ANCHOR_LEN, Anchor, AnchorSpec, TrustStore, anchor_checks, anchor_parts, ascending, decoded,
+    in_order, label_is_valid, put_anchor, raw_key_id,
 };
 use crate::wire::{Reader, Writer};
 use crate::{EncodeError, KEY_ID_LEN, KeyId, StoreError, key_id};
@@ -119,8 +119,7 @@ impl<'a> Lists<'a>
 
     fn anchors(&self) -> impl Iterator<Item = Anchor<'a>> + use<'a>
     {
-        let anchors: &'a [[u8; ANCHOR_LEN]] = self.anchors;
-        anchors.iter().filter_map(|raw| decode_anchor(raw).ok())
+        decoded(self.anchors)
     }
 
     fn anchor(&self, id: &KeyId) -> Option<Anchor<'a>>
@@ -1151,8 +1150,9 @@ mod tests
 /// lookup and bound proofs check the revoked lookup the last check makes and
 /// the enrolled store's bound. What lies outside the proofs is
 /// `Lists::parse` and the two `parse` functions, which drive these checks
-/// in their order, and the SHA-512 key id each anchor is walked and looked
-/// up by, which no proof may stub (docs/coding-standards.md § Proof
+/// in their order, the lookups' loop over the anchors (`decoded` in
+/// `store.rs`), and the SHA-512 key id each anchor is walked and looked up
+/// by, which no proof may stub (docs/coding-standards.md § Proof
 /// Harnesses); the fuzz target `objsig`, the replay of the checked-in
 /// inputs and the unit tests check them.
 #[cfg(kani)]

@@ -100,8 +100,7 @@ impl<'a> TrustStore<'a>
     /// The anchors, in key-id order.
     pub fn anchors(&self) -> impl Iterator<Item = Anchor<'a>> + use<'a>
     {
-        let anchors: &'a [[u8; ANCHOR_LEN]] = self.anchors;
-        anchors.iter().filter_map(|raw| decode_anchor(raw).ok())
+        decoded(self.anchors)
     }
 
     /// The anchor whose key id is `id`.
@@ -114,7 +113,7 @@ impl<'a> TrustStore<'a>
                 anchor_key(raw).map_or(core::cmp::Ordering::Less, |key| key_id(key).cmp(id))
             })
             .ok()?;
-        decode_anchor(self.anchors.get(index)?).ok()
+        decoded(self.anchors.get(index..=index)?).next()
     }
 
     /// Whether `id` is revoked.
@@ -312,18 +311,22 @@ pub(crate) fn anchor_key(raw: &[u8; ANCHOR_LEN]) -> Option<&PublicKey>
     raw.first_chunk::<PUBLIC_KEY_LEN>()
 }
 
-/// Decode and check one anchor: its fields cut ([`anchor_parts`]) and
-/// checked ([`anchor_checks`]), and its key id.
-pub(crate) fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreError>
+/// The anchors of `raw` that decode, in order: each cut into its fields
+/// ([`anchor_parts`]) and checked ([`anchor_checks`]), the steps of the
+/// parse's walk, and keyed by the SHA-512 of its key. The lookups walk the
+/// anchors a parse took this way.
+pub(crate) fn decoded(raw: &[[u8; ANCHOR_LEN]]) -> impl Iterator<Item = Anchor<'_>>
 {
-    let (key, usage, flags, label) = anchor_parts(raw).ok_or(StoreError::Length)?;
-    let (usage, local, label) = anchor_checks(usage, flags, label)?;
-    Ok(Anchor {
-        key,
-        key_id: key_id(key),
-        usage,
-        local,
-        label,
+    raw.iter().filter_map(|raw| {
+        let (key, usage, flags, label) = anchor_parts(raw)?;
+        let (usage, local, label) = anchor_checks(usage, flags, label).ok()?;
+        Some(Anchor {
+            key,
+            key_id: key_id(key),
+            usage,
+            local,
+            label,
+        })
     })
 }
 
@@ -638,12 +641,14 @@ mod tests
 /// the cut, checks and order proofs run each part of the step on any input,
 /// so whatever state a step hands the next, the next judges its anchor as
 /// the reading does; and the ascending proof checks the revoked key ids the
-/// walk ends on. What lies outside the proofs is `parse`, the loop that
-/// drives the step and the check after it, and the key id each step is
-/// given, the SHA-512 of the anchor's key ([`raw_key_id`]), which no proof
-/// may stub (docs/coding-standards.md § Proof Harnesses); the fuzz target
-/// `objsig`, the replay of the checked-in inputs and the unit tests check
-/// them.
+/// walk ends on. The lookups walk the anchors a parse took by the cut and
+/// the checks again ([`decoded`]). What lies outside the proofs is
+/// `parse`, the loop that drives the step and the check after it, the
+/// lookups' loop, and the key id each step is given and each anchor is
+/// keyed by, the SHA-512 of the anchor's key ([`raw_key_id`]), which no
+/// proof may stub (docs/coding-standards.md § Proof Harnesses); the fuzz
+/// target `objsig`, the replay of the checked-in inputs and the unit tests
+/// check them.
 #[cfg(kani)]
 mod proofs
 {

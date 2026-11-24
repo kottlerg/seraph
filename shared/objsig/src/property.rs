@@ -717,9 +717,9 @@ pub(crate) fn in_order_holds(previous: Option<KeyId>, id: KeyId) -> Result<KeyId
 /// The step of the walk of a store's anchors, as the loops of
 /// [`TrustStore::parse`] and `Lists::parse` take it: the anchor's parts,
 /// their checks, then the order of `id` after `previous`; returns `id`. And
-/// [`store::decode_anchor`] decodes an anchor the step takes as those
-/// fields, the key and the label at their places, and refuses one it
-/// refuses as the checks do.
+/// the lookups' walk ([`store::decoded`]) decodes an anchor the checks take
+/// as those fields, the key and the label at their places, and skips one
+/// they refuse.
 #[expect(
     clippy::panic_in_result_fn,
     reason = "a check panics on a defect of the parser by design; its Result is the reading it hands the walk's next step"
@@ -732,13 +732,13 @@ pub(crate) fn anchor_holds(
 {
     let (usage, flags, field) = anchor_parts_holds(raw);
     let checked = anchor_checks_holds(usage, flags, field);
-    let decoded = store::decode_anchor(raw);
+    let decoded = store::decoded(core::slice::from_ref(raw)).next();
     assert_eq!(
-        decoded.as_ref().err(),
-        checked.as_ref().err(),
+        decoded.is_some(),
+        checked.is_ok(),
         "an anchor decoded against its checks"
     );
-    if let (Ok(anchor), Some(label)) = (decoded, label_reading(field))
+    if let (Some(anchor), Some(label)) = (decoded, label_reading(field))
     {
         assert!(
             ptr::eq(anchor.key.as_slice(), range(raw, 0, 1984)) && ptr::eq(anchor.label, label),

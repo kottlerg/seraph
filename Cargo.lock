@@ -50,15 +50,6 @@ name = "boot-protocol"
 version = "0.1.5"
 
 [[package]]
-name = "capexhaust"
-version = "0.1.5"
-dependencies = [
- "ipc",
- "syscall",
- "syscall-abi",
-]
-
-[[package]]
 name = "cmos-rtc"
 version = "0.1.5"
 dependencies = [
@@ -100,14 +91,6 @@ name = "crashd-oom-hold"
 version = "0.1.5"
 
 [[package]]
-name = "crasher"
-version = "0.1.5"
-dependencies = [
- "ipc",
- "syscall",
-]
-
-[[package]]
 name = "crashme"
 version = "0.1.5"
 dependencies = [
@@ -129,15 +112,6 @@ name = "crypto-testkit"
 version = "0.1.5"
 dependencies = [
  "json",
-]
-
-[[package]]
-name = "deadline"
-version = "0.1.5"
-dependencies = [
- "ipc",
- "syscall",
- "syscall-abi",
 ]
 
 [[package]]
@@ -166,15 +140,6 @@ version = "0.1.5"
 dependencies = [
  "ipc",
  "riscv-step",
- "syscall",
- "syscall-abi",
-]
-
-[[package]]
-name = "demandpaged"
-version = "0.1.5"
-dependencies = [
- "ipc",
  "syscall",
  "syscall-abi",
 ]
@@ -550,16 +515,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "memhog"
-version = "0.1.5"
-dependencies = [
- "ipc",
- "mem-fill",
- "syscall",
- "syscall-abi",
-]
-
-[[package]]
 name = "memmgr"
 version = "0.1.5"
 dependencies = [
@@ -629,14 +584,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pipefault"
-version = "0.1.5"
-
-[[package]]
-name = "pipestress"
-version = "0.1.5"
-
-[[package]]
 name = "process-abi"
 version = "0.1.5"
 dependencies = [
@@ -679,6 +626,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "program-modes"
+version = "0.1.5"
+dependencies = [
+ "ipc",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "pwrmgr"
 version = "0.1.5"
 dependencies = [
@@ -711,10 +667,6 @@ dependencies = [
  "syscall",
  "syscall-abi",
 ]
-
-[[package]]
-name = "relrofault"
-version = "0.1.5"
 
 [[package]]
 name = "restart-budget"
@@ -800,6 +752,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-modes"
+version = "0.1.5"
+dependencies = [
+ "ipc",
+ "mem-fill",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "sessiond"
 version = "0.1.5"
 dependencies = [
@@ -842,21 +804,8 @@ name = "spawn-target"
 version = "0.1.5"
 
 [[package]]
-name = "stackoverflow"
-version = "0.1.5"
-
-[[package]]
 name = "stdiotest"
 version = "0.1.5"
-
-[[package]]
-name = "stopsrc"
-version = "0.1.5"
-dependencies = [
- "ipc",
- "syscall",
- "syscall-abi",
-]
 
 [[package]]
 name = "storage-statement"
@@ -1007,18 +956,6 @@ version = "0.1.5"
 dependencies = [
  "font",
 ]
-
-[[package]]
-name = "threadchurn"
-version = "0.1.5"
-dependencies = [
- "syscall",
- "syscall-abi",
-]
-
-[[package]]
-name = "threadstack"
-version = "0.1.5"
 
 [[package]]
 name = "timed"

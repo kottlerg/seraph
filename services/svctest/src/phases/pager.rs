@@ -6,7 +6,7 @@
 //! Demand-paging pager surface: memmgr backs reserved anonymous regions on
 //! fault, and declines (kills) faults outside any registered region.
 //!
-//! Drives `/tests/fixtures/programs/demandpaged`. Demand paging is the system-wide default, so
+//! Drives `program-modes demandpaged`. Demand paging is the system-wide default, so
 //! the first two phases spawn it with no opt-in; the third opts out via
 //! `std::os::seraph::CommandExt::pinned`:
 //!
@@ -262,9 +262,10 @@ fn demand_paging_phase(_: &Caps)
 {
     use std::process::Command;
 
-    let mut child = Command::new("/tests/fixtures/programs/demandpaged")
+    let mut child = Command::new(super::PROGRAM_MODES_PATH)
+        .arg("demandpaged")
         .spawn()
-        .expect("spawn /tests/fixtures/programs/demandpaged failed");
+        .expect("spawn program-modes demandpaged failed");
     let status = child.wait().expect("demandpaged wait failed");
     std::os::seraph::log!("demandpaged exited: {status}");
     assert!(
@@ -288,10 +289,11 @@ fn demand_paging_pt_drain_phase(_: &Caps)
 {
     use std::process::Command;
 
-    let mut child = Command::new("/tests/fixtures/programs/demandpaged")
+    let mut child = Command::new(super::PROGRAM_MODES_PATH)
+        .arg("demandpaged")
         .arg("ptdrain")
         .spawn()
-        .expect("spawn /tests/fixtures/programs/demandpaged ptdrain failed");
+        .expect("spawn program-modes demandpaged ptdrain failed");
     let status = child.wait().expect("demandpaged ptdrain wait failed");
     std::os::seraph::log!("demandpaged ptdrain exited: {status}");
     assert!(
@@ -315,10 +317,11 @@ fn demand_paging_teardown_phase(_: &Caps)
 {
     use std::process::Command;
 
-    let mut child = Command::new("/tests/fixtures/programs/demandpaged")
+    let mut child = Command::new(super::PROGRAM_MODES_PATH)
+        .arg("demandpaged")
         .arg("teardown")
         .spawn()
-        .expect("spawn /tests/fixtures/programs/demandpaged teardown failed");
+        .expect("spawn program-modes demandpaged teardown failed");
     let status = child.wait().expect("demandpaged teardown wait failed");
     std::os::seraph::log!("demandpaged teardown exited: {status}");
     assert!(
@@ -342,10 +345,11 @@ fn demand_paging_segfault_phase(_: &Caps)
     use std::process::Command;
     use syscall::EXIT_FAULT_BASE;
 
-    let mut child = Command::new("/tests/fixtures/programs/demandpaged")
+    let mut child = Command::new(super::PROGRAM_MODES_PATH)
+        .arg("demandpaged")
         .arg("oor")
         .spawn()
-        .expect("spawn /tests/fixtures/programs/demandpaged oor failed");
+        .expect("spawn program-modes demandpaged oor failed");
     let status = child.wait().expect("demandpaged oor wait failed");
     std::os::seraph::log!("demandpaged oor exited: {status}");
     assert!(
@@ -376,10 +380,11 @@ fn demand_paging_pinned_phase(_: &Caps)
     // bound, so the kernel kills the process. The same registered-region touch
     // exits cleanly in `demand_paging` — the kill here is the proof that
     // `pinned(true)` suppressed the default pager.
-    let mut child = Command::new("/tests/fixtures/programs/demandpaged")
+    let mut child = Command::new(super::PROGRAM_MODES_PATH)
+        .arg("demandpaged")
         .pinned(true)
         .spawn()
-        .expect("spawn /tests/fixtures/programs/demandpaged pinned failed");
+        .expect("spawn program-modes demandpaged pinned failed");
     let status = child.wait().expect("demandpaged pinned wait failed");
     std::os::seraph::log!("demandpaged pinned exited: {status}");
     assert!(

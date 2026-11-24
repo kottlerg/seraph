@@ -13,7 +13,8 @@
 # service oomd stops. `restart = on_failure`, `critical = no`: the stop's
 # EXIT_KILLED death restarts it, and the system continues if the restart
 # budget is spent.
-binary    = /tests/fixtures/memhog
+binary    = /tests/fixtures/service-modes
+argv      = service-modes memhog
 restart   = on_failure
 critical  = no
 namespace = none

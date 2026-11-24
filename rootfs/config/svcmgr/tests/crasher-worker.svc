@@ -15,8 +15,8 @@
 # fixtures (with memhog) a stop-authority holder may stop: svctest's
 # svcmgr_stop_service phase lists it, stops it, and reads the restarted
 # instance's nonce.
-binary    = /tests/fixtures/crasher
-argv      = crasher worker-fault
+binary    = /tests/fixtures/service-modes
+argv      = service-modes crasher worker-fault
 restart   = on_failure
 critical  = no
 namespace = none

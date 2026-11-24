@@ -15,7 +15,8 @@
 # the job. `restart = always`: the fixture's EXIT label starts a new instance.
 # `universal`: it spawns its job from /tests/fixtures/stopsrc, the path its image is
 # signed under, which a namespace rooted below / cannot name.
-binary      = /tests/fixtures/stopsrc
+binary      = /tests/fixtures/service-modes
+argv        = service-modes stopsrc
 restart     = always
 critical    = no
 namespace   = universal

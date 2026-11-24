@@ -78,6 +78,10 @@
 
 use crate::runner::Phase;
 
+/// The shared program fixture the phases spawn in the mode its first argument
+/// names (services/fixtures/program-modes/README.md).
+pub(crate) const PROGRAM_MODES_PATH: &str = "/tests/fixtures/programs/program-modes";
+
 pub mod acpi;
 pub mod budget;
 pub mod charge_node;

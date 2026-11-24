@@ -35,12 +35,13 @@ pub fn stack_overflow_phase(_: &Caps)
     use std::process::Command;
     use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
 
-    let mut child = Command::new("/tests/fixtures/programs/stackoverflow")
+    let mut child = Command::new(super::PROGRAM_MODES_PATH)
+        .arg("stackoverflow")
         .spawn()
-        .expect("spawn /tests/fixtures/programs/stackoverflow failed");
+        .expect("spawn program-modes stackoverflow failed");
 
     let id = child.process_handle();
-    std::os::seraph::log!("spawned /tests/fixtures/programs/stackoverflow handle={id:#x}");
+    std::os::seraph::log!("spawned program-modes stackoverflow handle={id:#x}");
 
     let status = child.wait().expect("stackoverflow wait failed");
     std::os::seraph::log!("stackoverflow exited: {status}");
@@ -95,9 +96,10 @@ pub fn relro_write_phase(_: &Caps)
     use std::process::Command;
     use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
 
-    let mut child = Command::new("/tests/fixtures/programs/relrofault")
+    let mut child = Command::new(super::PROGRAM_MODES_PATH)
+        .arg("relrofault")
         .spawn()
-        .expect("spawn /tests/fixtures/programs/relrofault failed");
+        .expect("spawn program-modes relrofault failed");
 
     let status = child.wait().expect("relrofault wait failed");
     std::os::seraph::log!("relrofault exited: {status}");

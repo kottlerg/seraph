@@ -206,7 +206,7 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout: EndpointObject at offset 0; EndpointState at offset
-    // size_of::<EndpointObject>() (24). Total 24 + 64 = 88 B, rounds to 128 B.
+    // size_of::<EndpointObject>() (24). Total 24 + 48 = 72 B, rounds to 128 B.
     let ep_obj_ptr = block_virt as *mut EndpointObject;
     let state_offset = core::mem::size_of::<EndpointObject>() as u64;
     let ep_state_ptr = slot_field::<EndpointState>(block_virt, state_offset);

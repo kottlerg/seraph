@@ -84,7 +84,9 @@ stamps it `PARK_DISPOSITION_NO_RECEIVER` (a queued fault delivery `FAULT_OUTCOME
 removes a timed park's sleep-list entry, sets `wake_in_flight`, wakes it with
 `enqueue_and_wake`, and republishes `send_nonempty`. The Endpoint's dealloc runs the same drain. A
 call or receive that reads zero under `ep.lock` queues nothing, so the release whose decrement made
-the count zero finds every earlier waiter and a later one finds the queues empty.
+the count zero finds every earlier waiter. A later release, or the dealloc, finds the waiters not
+yet released, if any, and drains them alongside it: no waiter joins once the count is zero, so every
+release returns with both queues empty.
 
 ### Call Path (Sender)
 

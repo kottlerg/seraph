@@ -250,6 +250,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | One wait set per source | `core/kernel/src/ipc/wait_set.rs` | 1 | design choice (bounds no capacity) | 8 B per source | correct as is | None |
 | Wait-set size asserts | `core/kernel/src/ipc/wait_set.rs` | member 24 B, state 40 B | encoding artefact | none | correct as is | Keep |
 | Bound-source backoff | `core/kernel/src/ipc/mod.rs` | 64 spins | tuning (a backoff, not a bound) | none | correct as is | None |
+| `DRAIN_BATCH_WAITERS` | `core/kernel/src/ipc/mod.rs` | 16 waiters | batch size (bounds each hold of a source's lock, and each interrupts-off stretch, of a wake-all drain of a dying notification, event queue or wait set or an unreceivable endpoint, which takes interrupts between batches) | none | correct as is | None |
 | `SLEEP_LIST` (deadline heap) | `core/kernel/src/sched/mod.rs` | unbounded, one node per TCB | none (intrusive through the TCB) | about 72 B per TCB (heap node and expiry snapshot) | correct as is | One global heap under `SLEEP_LIST_LOCK`, popped on the BSP |
 | `NUM_PRIORITY_LEVELS` | `core/kernel/src/sched/mod.rs` | 32 | ABI width (`PRIORITY_MAX` 30, the reserved level 31 above it) | none | correct as is | None |
 | `NUM_RUN_QUEUES` | `core/kernel/src/sched/run_queue.rs` | 13 | derived from `NUM_PRIORITY_LEVELS` and `RT_PRIORITY_MIN` (one queue per RT level, one fair, one idle; a `u32` `non_empty` mask, asserted at build time) | 13 run queues per CPU | correct as is | None |
@@ -259,6 +260,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `MAX_CPUS` | `core/kernel/src/sched/mod.rs` | 8192 (`boot_protocol::MAX_CPUS`) | current peak plus headroom (a sanity ceiling no structure is sized from) | none | correct as is | None; see the boot section |
 | Watchdog breadcrumbs (`CpuDiag`, `CPU_DIAG_PTR`) | `core/kernel/src/sched/mod.rs` | `cpu_count`-sized slab | derived from `cpu_count` (`MAX_CPUS` the sanity ceiling) | `cpu_count` x 32 B | correct as is | Already pay-as-you-go |
 | `stop_threads_bound_to` prod (`mark_bound_threads`) | `core/kernel/src/sched/mod.rs` | one prod per bound thread found running, inside the registry walk | design choice (no set is held) | none | correct as is | None |
+| `REGISTRY_BATCH_COST`, `VISIT_ACTED_COST` | `core/kernel/src/sched/thread_registry.rs` | 64 cost units per batch; a passed thread costs 1, a thread acted on 8 | batch size (bounds each hold of `THREAD_REGISTRY_LOCK`, and each interrupts-off stretch, of a registry walk, which takes interrupts between batches outside interrupt context) | none | correct as is | None |
 | `WATCHDOG_THRESHOLD_SECONDS`, `DETECTOR_SCAN_INTERVAL_MS` | `core/kernel/src/sched/mod.rs` | 3 s / 500 ms, converted at `ticks_per_second()` | tuning (a diagnostic threshold at any tick rate) | none | correct as is | None |
 | `WEDGE_GRACE_SECONDS` | `core/kernel/src/sched/mod.rs` | 8, scaled per 128 CPUs | tuning (scales with CPU count) | none | correct as is | None |
 | `OWED_WAKE_MAX` (`OWED_WAKE_LAST`) | `core/kernel/src/sched/mod.rs` | 8, keyed by TCB pointer | diagnostic output cap | 128 B BSS | correct as is | None |

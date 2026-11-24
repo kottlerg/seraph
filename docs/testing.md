@@ -1221,7 +1221,7 @@ to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof (`cargo xtask kani`, [Bounded verification](#bounded-verification)) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
 
 **Cells.** A cell is one launch configuration and the boots made on it; each differs from every
 other cell in that configuration, which is why it stands alone. The table states every cell, its
@@ -1953,20 +1953,24 @@ Release Production, step 4), these MUST be run on the commit to be tagged, or on
 that contains the version bump when the change from it to the commit to be tagged is documentation
 or comments only as this section defines that: the whole boundary set (riscv64 16 and 128 harts,
 x86_64 16 and 128 vCPUs) once each (`--runs 1`) in the debug profile and once each in the release
-profile (`cargo xtask build --release`, then the same `run` command, per the boundary
-commands above), and the memory variation and every device cell (the disk variations, the no-IOMMU
-variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM
-cell) once each, and every bounded proof (`cargo xtask kani` with no option, [Bounded
-verification](#bounded-verification)), so every tag boots at each boundary CPU count in both
+profile (`cargo xtask build --release`, then the same `run` command, per the boundary commands
+above), and the memory variation and every device cell (the disk variations, the no-IOMMU variant,
+the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once
+each, and every bounded proof (`cargo xtask kani` with no option, [Bounded
+verification](#bounded-verification)), and the fuzz campaign (§ Fuzzing): a manual dispatch of
+`fuzz.yml` on `master` while the commit to be tagged is its head (`gh workflow run fuzz.yml --ref
+master`), at the default time per target, whose run's head commit is that commit and whose
+conclusion is `success`, the report giving the run's URL as its command, `--runs 1`, and `PASS` as
+its outcome when the conclusion is `success`; so every tag boots at each boundary CPU count in both
 profiles (CI boots release builds only at 4 CPUs), from a 4Kn disk, from two disks, with no IOMMU,
 with a framebuffer, with a debug port, with a hot-added device, on CET shadow stacks, and with a
-TPM, carries every proof a pull request's selection may have left unverified, and runs the timing
-report on the boundary logs, which is reported and blocks nothing. A tag's repeated-run check is the
-burn-in tier, which the tag push starts. The no-IOMMU variant, the no-iommu device cell, boots
-svctest once on each architecture with the machine's IOMMU detached, so devmgr's unconfined path
-still serves every driver (svctest staged as `build-test.yml` stages it, on a debug-profile
-sysroot). A run whose outcome is not a pass, as When the runs are owed classifies outcomes, blocks
-the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
+TPM, carries every proof a pull request's selection may have left unverified and a campaign of every
+fuzz target, and runs the timing report on the boundary logs, which is reported and blocks nothing.
+A tag's repeated-run check is the burn-in tier, which the tag push starts. The no-IOMMU variant, the
+no-iommu device cell, boots svctest once on each architecture with the machine's IOMMU detached, so
+devmgr's unconfined path still serves every driver (svctest staged as `build-test.yml` stages it, on
+a debug-profile sysroot). A run whose outcome is not a pass, as When the runs are owed classifies
+outcomes, blocks the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
 
 ```sh
 # No-IOMMU variant, each architecture (svctest staged, debug profile):
@@ -2131,7 +2135,7 @@ fails as the search did, on any host. The run exits non-zero.
 | Tier | Where | When | Runs |
 |---|---|---|---|
 | Gating | CI, the `fuzz` job of `build-test.yml` | every push and pull request | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
-| Campaign | CI, `fuzz.yml` | a manual dispatch | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
+| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
 | Local | developer host | at will | `cargo xtask fuzz <target>` with `--runs` or `--time` |
 
 The self-test runs the engine on planted defects in `xtask/fuzz/targets` (an eight-byte magic

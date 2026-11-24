@@ -685,8 +685,12 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    debug-port cell (`test debug-port`, on both architectures),
    the hotplug cell (`test hotplug`, on both architectures),
    the CET cell (`test cet`, on x86_64), and the TPM cell (`test tpm`,
-   on x86_64) once each, and every bounded proof (`cargo xtask kani`
-   with no option). A run at an earlier `master` commit that contains the bump
+   on x86_64) once each, every bounded proof (`cargo xtask kani`
+   with no option), and the fuzz campaign: a manual dispatch of `fuzz.yml`
+   on `master` while the commit to be tagged is its head (`gh workflow run
+   fuzz.yml --ref master`), at the default time per target, whose run's
+   head commit is that commit and whose conclusion is `success`. A run at an
+   earlier `master` commit that contains the bump
    stands for the commit to be tagged when the change between the two is
    documentation or comments only, as [testing.md](testing.md#coverage-tiers)
    § Coverage tiers defines it.

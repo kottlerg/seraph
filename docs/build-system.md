@@ -832,9 +832,12 @@ each job, is rebuilt in each too. The key is
 `rustc -Vv`, and those of the `hashFiles` digest of every file in the tree the units are built from
 or with: the target specs, `.cargo/config.toml`, the workspace `Cargo.toml`,
 `xtask/src/commands/build.rs`, `xtask/src/rust_src.rs`, the action, `runtime/ruststd/`, `shared/`
-and `abi/`. The restore takes that exact key, with no partial-match fallback: units built from other
-inputs would carry modification times Cargo could take as fresh. Only a push run on `master` saves,
-after its uploads, so a pull request reads the entries its base made. Cargo checks every unit
+and `abi/`, Markdown excepted. No unit reads Markdown, and a change to Markdown alone owes no cell
+([conventions.md § CI Gating](conventions.md#ci-gating)), so a key it changed would get no entry
+from the `master` run; a change to any file the key hashes owes every job that saves an entry, as a
+host test checks. The restore takes that exact key, with no partial-match fallback: units built from
+other inputs would carry modification times Cargo could take as fresh. Only a push run on `master`
+saves, after its uploads, so a pull request reads the entries its base made. Cargo checks every unit
 restored as it checks any, so a unit whose sources or flags differ is rebuilt.
 
 The `validate`, `bench`, `burnin` and `build-image` jobs each have a step that sets

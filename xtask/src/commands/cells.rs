@@ -7,8 +7,9 @@
 //! tiers). Each file the change touches is placed by the layer record
 //! (`crate::layers`), and the change owes the cells of its most demanding
 //! file: a kernel-layer file or an input of every cell owes every cell, a
-//! services or programs file the svctest and usertest cells and the bench
-//! cell's ubench boots, and documentation or host tooling alone owes no boot.
+//! services-layer file the svctest and usertest cells and the bench cell's
+//! ubench boots, a programs-layer file the usertest cells alone, and
+//! documentation or host tooling alone owes no boot.
 //! Without a base the command owes every cell.
 //!
 //! The base is a commit (`--since`), or the newest commit of a revision's
@@ -98,17 +99,24 @@ const NO_CELL: Owed = Owed {
     ktest_bench: false,
 };
 
-/// What a change whose most demanding file is of `class` owes. The services
-/// and programs layers owe the same cells: the selection does not separate
-/// them, though no services-layer image holds a file of the programs layer.
-/// Every change that owes a boot owes the bench cell's ubench boots.
+/// What a change whose most demanding file is of `class` owes: the cells
+/// whose images hold that file's layer. The ktest image holds the kernel
+/// layer alone, and so does the bench cell's ktest image; the svctest image
+/// and the bench cell's ubench image hold the services layer and the kernel
+/// layer below it, and no file of the programs layer; the usertest image
+/// holds every layer (`layers::Image`).
 #[must_use]
 pub fn owed_by(class: Class) -> Owed
 {
     match class
     {
         Class::Docs | Class::Host => NO_CELL,
-        Class::Layer(Layer::Services | Layer::Programs) => Owed {
+        Class::Layer(Layer::Programs) => Owed {
+            testers: &[Tester::Usertest],
+            bench: false,
+            ktest_bench: false,
+        },
+        Class::Layer(Layer::Services) => Owed {
             testers: &[Tester::Svctest, Tester::Usertest],
             bench: true,
             ktest_bench: false,
@@ -199,19 +207,40 @@ fn select(root: &Path, base: Option<(String, String)>) -> Result<Selection>
     let changed = affected::changed_files(root, &commit)?;
     let workspace = Workspace::load(root)?;
     let fuzz = fuzz_input(&workspace, &changed)?;
-    let mut placed = Vec::new();
-    let mut unplaced = Vec::new();
-    for file in changed
-    {
-        let presence = if root.join(&file).exists()
+    let (placed, owed) = place_change(&workspace, changed, |file| {
+        if root.join(file).exists()
         {
             Presence::Present
         }
         else
         {
             Presence::Deleted
-        };
-        match layers::place(&workspace, &file, presence)
+        }
+    })?;
+    Ok(Selection {
+        base: Some((commit, how)),
+        placed,
+        owed,
+        fuzz,
+    })
+}
+
+/// Each of `changed` placed in `workspace`'s layer record, `presence` saying
+/// whether the working tree holds it, and what the change owes.
+///
+/// # Errors
+/// A changed file no row places, each named.
+fn place_change(
+    workspace: &Workspace,
+    changed: Vec<String>,
+    presence: impl Fn(&str) -> Presence,
+) -> Result<(Vec<(String, Placed)>, Owed)>
+{
+    let mut placed = Vec::new();
+    let mut unplaced = Vec::new();
+    for file in changed
+    {
+        match layers::place(workspace, &file, presence(&file))
         {
             Ok(p) => placed.push((file, p)),
             Err(e) => unplaced.push(e.to_string()),
@@ -226,12 +255,7 @@ fn select(root: &Path, base: Option<(String, String)>) -> Result<Selection>
         );
     }
     let owed = most_demanding(&placed).map_or(NO_CELL, |(_, p)| owed_by(p.class));
-    Ok(Selection {
-        base: Some((commit, how)),
-        placed,
-        owed,
-        fuzz,
-    })
+    Ok((placed, owed))
 }
 
 /// The most demanding of `placed`, the first on a tie.
@@ -577,6 +601,7 @@ fn append(file: &PathBuf, text: &str) -> Result<()>
 mod tests
 {
     use super::*;
+    use crate::layers::{Image, Install, Role};
 
     fn placed(class: Class) -> Placed
     {
@@ -621,9 +646,145 @@ mod tests
         let upper = owed(&[Class::Docs, services]);
         assert_eq!(upper.testers, [Tester::Svctest, Tester::Usertest]);
         assert!(upper.bench && !upper.ktest_bench);
-        assert_eq!(owed(&[programs]), upper);
+        let top = owed(&[Class::Host, programs]);
+        assert_eq!(top.testers, [Tester::Usertest]);
+        assert!(!top.bench && !top.ktest_bench);
+        assert_eq!(owed(&[programs, services]), upper);
         assert_eq!(owed(&[services, kernel, programs]), EVERY_CELL);
         assert_eq!(owed(&[Class::Host, Class::Build]), EVERY_CELL);
+    }
+
+    /// The image kind each validate cell's tester boots, as the validate
+    /// job stages it: the ktest bundle, svctest's services-layer image, and
+    /// usertest's test image.
+    fn image_of(tester: Tester) -> Image
+    {
+        match tester
+        {
+            Tester::Ktest => Image::Kernel,
+            Tester::Svctest => Image::Services,
+            Tester::Usertest => Image::Harness,
+        }
+    }
+
+    /// Whether an image of `kind` holds a file of `layer`: the kernel
+    /// layer's files are on every image's ESP, and the other layers' on its
+    /// root and data partitions as [`Image::holds`] says.
+    fn image_holds(kind: Image, layer: Layer) -> bool
+    {
+        layer == Layer::Kernel
+            || [Role::System, Role::Test]
+                .into_iter()
+                .any(|role| kind.holds(Install { layer, role }))
+    }
+
+    // Defect caught: a layer owing a cell whose image holds none of its
+    // files, so a program change boots svctest or the bench cell for
+    // nothing; or a cell whose image holds a layer's files left unowed by a
+    // change to that layer, so the change merges with a cell that could fail
+    // unrun.
+    #[test]
+    fn a_layer_owes_exactly_the_cells_whose_images_hold_it()
+    {
+        for layer in [Layer::Kernel, Layer::Services, Layer::Programs]
+        {
+            let owed = owed_by(Class::Layer(layer));
+            for tester in TESTERS
+            {
+                assert_eq!(
+                    owed.testers.contains(&tester),
+                    image_holds(image_of(tester), layer),
+                    "{layer:?} {tester:?}"
+                );
+            }
+            // The bench cell boots the ubench suite on a services-layer
+            // image and its ktest boots on the kernel layer's.
+            assert_eq!(owed.bench, image_holds(Image::Services, layer), "{layer:?}");
+            assert_eq!(
+                owed.ktest_bench,
+                image_holds(Image::Kernel, layer),
+                "{layer:?}"
+            );
+        }
+    }
+
+    // Defect caught: a program change owing a svctest, ktest or bench cell; a
+    // core service change owing a ktest cell or no svctest cell; a crate a
+    // service and a program both link owed by the program's layer, so a
+    // change to it boots no svctest, or one the kernel and a program both
+    // link owing less than every cell; or a changed file no row places owing
+    // nothing instead of failing the selection.
+    #[test]
+    fn a_change_owes_by_the_lowest_layer_its_files_reach()
+    {
+        let package = |name: &str, dir: &str, deps: &[&str]| affected::Package {
+            name: name.to_owned(),
+            dir: dir.to_owned(),
+            deps: deps.iter().map(|d| (*d).to_owned()).collect(),
+        };
+        let ws = Workspace::new(
+            vec![
+                package("kernel", "core/kernel", &["shared/kshared"]),
+                package("ktest", "core/ktest", &[]),
+                package("vfsd", "services/vfsd", &["shared/both"]),
+                package(
+                    "shell",
+                    "programs/shell",
+                    &["shared/both", "shared/kshared", "shared/progonly"],
+                ),
+                package("both", "shared/both", &[]),
+                package("kshared", "shared/kshared", &[]),
+                package("progonly", "shared/progonly", &[]),
+            ],
+            &[],
+        );
+        let owes = |files: &[&str]| {
+            let changed = files.iter().map(|f| (*f).to_owned()).collect();
+            place_change(&ws, changed, |_| Presence::Present).map(|(_, owed)| owed)
+        };
+        let usertest = Owed {
+            testers: &[Tester::Usertest],
+            bench: false,
+            ktest_bench: false,
+        };
+        let services = Owed {
+            testers: &[Tester::Svctest, Tester::Usertest],
+            bench: true,
+            ktest_bench: false,
+        };
+        for (files, want) in [
+            (&["programs/shell/src/main.rs"][..], usertest),
+            (
+                &["shared/progonly/src/lib.rs", "docs/testing.md"][..],
+                usertest,
+            ),
+            (
+                &["rootfs/config/svcmgr/services/terminal.svc"][..],
+                usertest,
+            ),
+            (&["services/vfsd/src/main.rs"][..], services),
+            (&["shared/both/src/lib.rs"][..], services),
+            (
+                &["programs/shell/src/main.rs", "services/vfsd/src/main.rs"][..],
+                services,
+            ),
+            (&["shared/kshared/src/lib.rs"][..], EVERY_CELL),
+            (&["core/kernel/src/lib.rs"][..], EVERY_CELL),
+            (
+                &["programs/shell/src/main.rs", "core/ktest/src/main.rs"][..],
+                EVERY_CELL,
+            ),
+        ]
+        {
+            assert_eq!(owes(files).unwrap(), want, "{files:?}");
+        }
+        let refused = owes(&["programs/shell/src/main.rs", "tools/new.sh"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("tools/new.sh") && refused.contains("add its row"),
+            "{refused}"
+        );
     }
 
     // Defect caught: a matrix the workflow cannot take: an owed cell missing
@@ -931,6 +1092,7 @@ mod tests
                 package("vfsd-gpt", "services/vfsd/gpt", &["shared/crc"]),
                 package("crc", "shared/crc", &[]),
                 package("kernel", "core/kernel", &[]),
+                package("shell", "programs/shell", &["shared/crc"]),
                 package("xtask", "xtask", &["shared/json"]),
                 package("json", "shared/json", &[]),
             ],
@@ -955,6 +1117,7 @@ mod tests
             "core/kernel/src/lib.rs",
             "docs/testing.md",
             "services/vfsd/src/main.rs",
+            "programs/shell/src/main.rs",
         ]
         {
             assert_eq!(owes(file), None, "{file}");

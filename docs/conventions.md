@@ -623,9 +623,14 @@ demanding file:
 - A file of the kernel layer owes every cell: the kernel, the bootloader, ktest, the ABI crates,
   and every crate one of them links. So does an input of every build: the toolchain pin,
   `Cargo.lock`, the workflows, and the parts of xtask that build, stage or boot an image.
-- A file of the services or programs layer owes the svctest and usertest cells and the `bench`
-  cell's ubench boots, and no ktest cell. This covers the runtime, the std port, and the crates
-  std links that no kernel-layer crate links.
+- A file of the services layer owes the svctest and usertest cells and the `bench` cell's ubench
+  boots, and no ktest cell. This covers the runtime, the std port, and the crates std links that
+  no kernel-layer crate links.
+- A file of the programs layer owes the usertest cells alone: no ktest or svctest cell and no
+  `bench` cell, since no image but usertest's holds a file of the programs layer
+  ([testing.md § Harnesses](testing.md#harnesses)), and a programs-layer manifest reaches no
+  services binary, since `cargo xtask build` builds each layer in cargo invocations of its own. A
+  crate a service and a program both link is in the services layer.
 - Markdown, the instruction files, and host tooling that no cell runs owe no boot. `host-tests`,
   which runs on every change, lints the host crates as a build job's build does.
 

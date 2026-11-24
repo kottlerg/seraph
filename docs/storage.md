@@ -458,7 +458,11 @@ To prevent inference of behavior that does not exist:
   and no kernel command line carrying mount config.
 - **No role from a disk's own say-so.** A disk other than the boot disk
   takes no role by its type GUIDs or priority bits, whatever they are;
-  only the statement gives it one.
+  only the statement gives it one. The statement binds a role to a
+  partition's unique GUID and type alone, which the disk itself carries,
+  so a disk that copies them takes the named role whenever the disk the
+  statement meant is not held; binding a named partition to its disk is
+  not built ([#1575](https://github.com/kottlerg/seraph/issues/1575)).
 - **No process-global filesystem authority.** A process delivered no
   namespace cap has no filesystem access; `std::fs` returns
   `Unsupported`. There is no fallback to a system identity. See

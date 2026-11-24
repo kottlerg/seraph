@@ -125,13 +125,24 @@ fn mount_deny_phase(caps: &Caps)
 /// `MOUNT` of the root role at `/` and of the data role at `/esp`, both
 /// already mount points, replies `TABLE_FULL` in every one of
 /// `REJECT_ROUNDS` rounds, and the mounted filesystems still answer
-/// afterwards.
+/// afterwards. With the data partition named for `/data` alone
+/// ([`data_named_for_data_path`]) the data role at `/esp` resolves on the
+/// boot disk, which carries no data partition, so the data role is asked
+/// at `/data`, where it resolves and the mount point is taken.
 fn mount_rejects_mounted_paths_phase(caps: &Caps)
 {
     assert_ne!(caps.vfsd_mount, 0, "vfsd_mount_rejects: no vfsd.mount seed");
+    let data_path = if data_named_for_data_path()
+    {
+        "/data"
+    }
+    else
+    {
+        "/esp"
+    };
     for round in 0..REJECT_ROUNDS
     {
-        for (role, path) in [(ROLE_ROOT, "/"), (ROLE_DATA, "/esp")]
+        for (role, path) in [(ROLE_ROOT, "/"), (ROLE_DATA, data_path)]
         {
             let msg = mount_request(role, path.as_bytes(), path.len() as u64);
             let label = mount_reply(caps.vfsd_mount, &msg, "vfsd_mount_rejects");

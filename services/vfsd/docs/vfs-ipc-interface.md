@@ -66,11 +66,15 @@ labels live in `ipc::vfsd_labels` in `shared/ipc`.
 
 ## Label 10: `MOUNT`
 
-Runtime explicit-mount surface (foreign-GUID disks, user-invoked
-mounts). vfsd self-mounts root, `/esp`, and `/data` at startup through
-the same resolution path; the only in-tree caller is svctest, whose
-cases drive the rejection paths below and mount the data partition again
-after an `UNMOUNT`, at `/data` and elsewhere. The caller's badge MUST carry
+Mounts the root or the data role at a path, resolved as the startup
+self-mount resolves it: on the boot disk, or, for a data path the storage
+statement names, its named partition
+([docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)). vfsd
+self-mounts root, `/esp`, and the data paths at startup through the same
+resolution path; the in-tree callers are test fixtures alone: svctest,
+whose cases drive the rejection paths below and mount the data partition
+again after an `UNMOUNT`, at `/data` and elsewhere, and the
+`hotplug-check` disk fixture. The caller's badge MUST carry
 `MOUNT_AUTHORITY`: vfsd replies `UNAUTHORIZED` otherwise, before it
 reads the request.
 
@@ -118,16 +122,18 @@ registered for it stays in virtio-blk's table, which has no unregister
 request.
 
 When the requested role is the rootfs (`MountRole::Root`, byte `0`),
-vfsd additionally auto-mounts the EFI System Partition at `/esp` and
-the data partition at `/data` inside the same handler before replying —
-the same logic the startup self-mount uses. Both auto-mounts are
-best-effort: a missing or duplicate-priority partition logs a
-diagnostic and is skipped (leaving `/esp` / `/data` to resolve through
-the root-fs fall-through) without propagating into the root mount
-reply (see [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
-The ESP is identified by the standard EFI System Partition type
-GUID (`c12a7328-f81f-11d2-ba4b-00a0c93ec93b`); the data partition by
-the arch-neutral `SERAPH_DATA` GUID.
+vfsd additionally reads the storage statement and auto-mounts the boot
+ESP at `/esp`, each data partition the statement names at its path, and,
+unless the statement names one for `/data`, the boot disk's data
+partition at `/data`, inside the same handler before replying — the
+same logic the startup self-mount uses. Every auto-mount is
+best-effort: a partition that is missing, tied, or not taken logs a
+diagnostic and is skipped (leaving its path to resolve through the
+root-fs fall-through) without propagating into the root mount reply
+(see [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
+The ESP is the partition the bootloader's HardDrive descriptor names on
+the boot disk; the boot disk's data partition is its partition of the
+arch-neutral `SERAPH_DATA` type GUID.
 
 **Request**
 

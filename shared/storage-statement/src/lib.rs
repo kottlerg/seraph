@@ -108,15 +108,6 @@ impl Role
             Role::Swap => boot_protocol::role_guids::SERAPH_SWAP,
         }
     }
-
-    /// The role whose keyword is `keyword`.
-    #[must_use]
-    pub fn from_keyword(keyword: &[u8]) -> Option<Role>
-    {
-        Role::ALL
-            .into_iter()
-            .find(|role| role.keyword().as_bytes() == keyword)
-    }
 }
 
 /// Why a statement, or one line of it, was refused.
@@ -127,14 +118,18 @@ pub enum ErrorKind
     NoFinalNewline,
     /// The line's first field is no role's keyword.
     UnknownRole,
-    /// The line holds another number of fields than its role takes, or an
-    /// empty one (two spaces in a row, or one at either end).
+    /// The line is not its role's keyword, a space, the mount path and a
+    /// space when the role takes one, and a GUID-length field: a field is
+    /// missing or empty, or a `swap` line holds one too many.
     Fields,
-    /// The mount path is not an absolute path of at most [`MAX_PATH_LEN`]
+    /// The mount path, all a `data` line holds between its keyword's space
+    /// and the GUID's, is not an absolute path of at most [`MAX_PATH_LEN`]
     /// bytes whose components are each one or more of `A-Z a-z 0-9 . _ -`,
-    /// and neither `.` nor `..`; or it is `/`.
+    /// and neither `.` nor `..`; or it is `/`. A space in it, a field too
+    /// many, is refused here.
     Path,
-    /// The GUID is not in its canonical text form.
+    /// The line's last [`GUID_TEXT_LEN`] bytes are not a GUID in its
+    /// canonical text form.
     Guid,
     /// The mount path is named on an earlier line.
     PathRepeated,
@@ -381,25 +376,7 @@ pub fn parse_line(line: &[u8]) -> Result<Option<Named>, ErrorKind>
     {
         return Ok(None);
     }
-    let mut fields = line.split(|&byte| byte == b' ');
-    let keyword = fields.next().unwrap_or_default();
-    let role = Role::from_keyword(keyword).ok_or(ErrorKind::UnknownRole)?;
-    // The fields after the keyword: the path when the role takes one, then
-    // the GUID; checked in number and for emptiness before either's form.
-    let (path, guid) = match (
-        role.takes_path(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    )
-    {
-        (true, Some(path), Some(guid), None) if !path.is_empty() && !guid.is_empty() =>
-        {
-            (Some(path), guid)
-        }
-        (false, Some(guid), None, None) if !guid.is_empty() => (None, guid),
-        _ => return Err(ErrorKind::Fields),
-    };
+    let (role, path, guid) = split_line(line)?;
     if path.is_some_and(|path| !is_mount_path(path))
     {
         return Err(ErrorKind::Path);
@@ -410,18 +387,87 @@ pub fn parse_line(line: &[u8]) -> Result<Option<Named>, ErrorKind>
     Ok(Some(Named { role, path, guid }))
 }
 
+/// A line's role, its path field when the role takes one, and its GUID
+/// field, as [`split_line`] reads them.
+pub(crate) type Fields<'a> = (Role, Option<&'a [u8]>, &'a [u8]);
+
+/// A line's role, its path field when the role takes one, and its GUID
+/// field, read by place before either field's form is checked.
+///
+/// The fields stand at fixed places: the keyword first, the GUID the last
+/// [`GUID_TEXT_LEN`] bytes, each followed or preceded by one space, and the
+/// path, when the role takes one, all that lies between. A space anywhere
+/// else falls inside the path or the GUID, whose forms refuse it, so the
+/// line is read with no search for its separators.
+///
+/// # Errors
+/// [`ErrorKind::UnknownRole`] when the line starts with no keyword followed
+/// by a space or its end; [`ErrorKind::Fields`] when the bytes after it are
+/// not a GUID-length field, after a non-empty path and a space when the role
+/// takes one.
+pub(crate) fn split_line(line: &[u8]) -> Result<Fields<'_>, ErrorKind>
+{
+    let role = Role::ALL
+        .into_iter()
+        .find(|role| {
+            let keyword = role.keyword().as_bytes();
+            line.starts_with(keyword) && matches!(line.get(keyword.len()), None | Some(b' '))
+        })
+        .ok_or(ErrorKind::UnknownRole)?;
+    let rest = line
+        .get(role.keyword().len().saturating_add(1)..)
+        .unwrap_or_default();
+    let Some(head_len) = rest.len().checked_sub(GUID_TEXT_LEN)
+    else
+    {
+        return Err(ErrorKind::Fields);
+    };
+    let (head, guid) = rest.split_at(head_len);
+    let path = if role.takes_path()
+    {
+        match head.strip_suffix(b" ")
+        {
+            Some(path) if !path.is_empty() => Some(path),
+            _ => return Err(ErrorKind::Fields),
+        }
+    }
+    else if head.is_empty()
+    {
+        None
+    }
+    else
+    {
+        return Err(ErrorKind::Fields);
+    };
+    Ok((role, path, guid))
+}
+
 /// Whether `path` is a mount path a statement names: `/` then one or more
 /// components joined by `/`, each one or more of `A-Z a-z 0-9 . _ -` and
 /// neither `.` nor `..`, the whole at most [`MAX_PATH_LEN`] bytes.
 #[must_use]
 pub fn is_mount_path(path: &[u8]) -> bool
 {
-    let Some(rest) = path.strip_prefix(b"/")
-    else
+    if path.first() != Some(&b'/') || path.len() > MAX_PATH_LEN
     {
         return false;
-    };
-    path.len() <= MAX_PATH_LEN && rest.split(|&byte| byte == b'/').all(is_component)
+    }
+    // The start of the component being read; each `/`, and the end, closes
+    // one.
+    let mut start = 1usize;
+    for at in 1..=path.len()
+    {
+        if at < path.len() && path.get(at) != Some(&b'/')
+        {
+            continue;
+        }
+        if !is_component(path.get(start..at).unwrap_or_default())
+        {
+            return false;
+        }
+        start = at.saturating_add(1);
+    }
+    true
 }
 
 /// Whether `component` is one component of a mount path.
@@ -567,13 +613,13 @@ mod tests
                 ErrorKind::UnknownRole,
             ),
             (format!("data {GUID_TEXT}\n"), 1, ErrorKind::Fields),
-            (format!("data  /data {GUID_TEXT}\n"), 1, ErrorKind::Fields),
+            (format!("data  /data {GUID_TEXT}\n"), 1, ErrorKind::Path),
             (format!("data /data {GUID_TEXT} \n"), 1, ErrorKind::Fields),
             (format!("swap /swap {GUID_TEXT}\n"), 1, ErrorKind::Fields),
             (format!("data data {GUID_TEXT}\n"), 1, ErrorKind::Path),
             (format!("data /a/../b {GUID_TEXT}\n"), 1, ErrorKind::Path),
             (format!("data / {GUID_TEXT}\n"), 1, ErrorKind::Path),
-            (format!("data /data {GUID_TEXT}\r\n"), 1, ErrorKind::Guid),
+            (format!("data /data {GUID_TEXT}\r\n"), 1, ErrorKind::Fields),
             (
                 format!("data /a {GUID_TEXT}\ndata /a 00000000-0000-0000-0000-000000000001\n"),
                 2,
@@ -701,9 +747,16 @@ mod tests
 /// verification, Parser proofs).
 ///
 /// A statement is read line by line, and each line is decoded with no state
-/// from another: the line proof runs the property's check of a line on every
-/// line of at most 46 bytes, and the path and GUID proofs the checks of the
-/// two fields a line carries on every field of the lengths they state. A
+/// from another. [`parse_line`] skips an empty line and a comment, splits
+/// the rest into its fields by place ([`split_line`], with no loop over the
+/// line: the keyword at its start, the GUID in its last 36 bytes, the path
+/// between), checks the path and the GUID, and builds the entry. The proofs
+/// compose: the short-line proof runs the property's check of a line on
+/// every line of at most 12 bytes; the split proof runs the split's check
+/// on every line of at most 48 bytes; the path and GUID proofs run the
+/// checks of the two fields on every path of at most 8 bytes and every text
+/// of at most 37; and the taken-line proof shows a `data` line of any
+/// three-byte path built into its entry. A
 /// line's entry is then judged against each earlier one by `conflict`, whose
 /// proof covers any two entries. What lies outside them is the code that
 /// drives the steps: the split of a statement into its lines in [`parse`],
@@ -715,10 +768,10 @@ mod proofs
 {
     use super::{ErrorKind, Key, Role, conflict, property};
 
-    /// Every line of at most 12 bytes holds the line contract: each
-    /// refusal of a line's shape for both roles (an unknown keyword, a field
-    /// missing, extra or empty, a path out of its form) and of a GUID too
-    /// short to be one.
+    /// Every line of at most 12 bytes holds the line contract: an empty
+    /// line, a comment, and each refusal of a line too short to name a
+    /// partition, for both roles and none (an unknown keyword, a field
+    /// missing, extra or empty).
     #[kani::proof]
     #[kani::unwind(14)]
     fn every_short_line_holds_the_line_contract()
@@ -729,27 +782,54 @@ mod proofs
         property::line_holds(&bytes[..len]);
     }
 
-    /// Every line made of any head of at most 10 bytes, a space and a
-    /// canonical GUID whose first digit is any byte holds the line contract:
-    /// both roles' acceptance, a `data` line's path of up to three bytes, a
-    /// field too many before the GUID, and a GUID digit out of its form. The
-    /// GUID text's own contract is
-    /// [`every_guid_text_holds_the_guid_contract`]'s; a line of every byte
-    /// symbolic up to an accepted length does not fit the runner's memory.
+    /// Every line of at most 48 bytes is split into its fields at their
+    /// places: 48 bytes hold a `swap` line (41 bytes) with room for a field
+    /// too many, and a `data` line with a path of up to 6 bytes, so each
+    /// refusal and each split of both roles is reached.
     #[kani::proof]
-    #[kani::unwind(49)]
-    fn every_line_ending_in_a_guid_holds_the_line_contract()
+    #[kani::unwind(6)]
+    fn every_line_splits_into_its_fields()
     {
-        const GUID: &[u8; 36] = b"00000000-0000-0000-0000-000000000000";
-        let head: [u8; 10] = kani::any();
+        let bytes: [u8; 48] = kani::any();
         let len: usize = kani::any();
-        kani::assume(len <= head.len());
-        let mut line = [0u8; 47];
-        line[..len].copy_from_slice(&head[..len]);
-        line[len] = b' ';
-        line[len + 1..len + 37].copy_from_slice(GUID);
-        line[len + 1] = kani::any();
-        property::line_holds(&line[..len + 37]);
+        kani::assume(len <= bytes.len());
+        property::split_holds(&bytes[..len]);
+    }
+
+    /// Every `data` line of a three-byte path field and a canonical GUID of
+    /// mixed case is taken exactly when its path is in its form, as an entry
+    /// of the data role, that path and that GUID: the step from the split
+    /// fields to the entry, whose checks of the path and the GUID the path
+    /// and GUID proofs cover on every field of their bounds.
+    #[kani::proof]
+    #[kani::unwind(38)]
+    fn a_data_line_is_taken_as_its_fields()
+    {
+        const LINE: &[u8; 45] = b"data /ab a1B2c3d4-E5f6-7890-ABcd-ef0123456789";
+        let mut line = *LINE;
+        let path: [u8; 3] = kani::any();
+        line[5..8].copy_from_slice(&path);
+        let taken = super::parse_line(&line);
+        assert_eq!(
+            taken.is_ok(),
+            property::path_form(&path),
+            "a data line judged against its path's form"
+        );
+        if let Ok(entry) = taken
+        {
+            let entry = entry.expect("a data line read as a comment");
+            assert_eq!(entry.role, Role::Data);
+            assert_eq!(entry.path.as_deref().map(str::as_bytes), Some(&path[..]));
+            assert_eq!(
+                Some(entry.guid),
+                super::parse_guid(&LINE[9..]),
+                "a GUID read as another"
+            );
+        }
+        else
+        {
+            assert_eq!(taken, Err(ErrorKind::Path));
+        }
     }
 
     /// Every text of at most 37 bytes holds the GUID contract: the canonical
@@ -786,9 +866,10 @@ mod proofs
     /// one exactly when both name one partition, one mount path, or a role
     /// that takes one partition, and the refusal names the first of these
     /// that holds. Paths of up to 2 bytes stand for any: `conflict` compares
-    /// them whole. No loop beyond the path compare.
+    /// them whole. No loop beyond the compares of the paths and of the two
+    /// 16-byte GUIDs.
     #[kani::proof]
-    #[kani::unwind(3)]
+    #[kani::unwind(17)]
     fn each_entry_is_judged_against_an_earlier_one()
     {
         let paths: [[u8; 2]; 2] = kani::any();

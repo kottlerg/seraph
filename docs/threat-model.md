@@ -236,9 +236,9 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   `services/vfsd/gpt/src/lib.rs`). Another disk takes a role only where the storage statement,
   signed in the configuration role and read through procmgr's verified read, names its partition
   by unique GUID (`resolve_named`), so a written disk at any priority, or a copy of the boot disk,
-  neither wins a role nor makes the root lookup a tie ([storage.md](storage.md) § GPT Role-GUID
-  Discovery). The statement is decoded by a pure crate, `shared/storage-statement`, which refuses
-  the whole file on any error.
+  neither wins the root or `/esp`, nor a role the statement does not name, nor makes the root
+  lookup a tie ([storage.md](storage.md) § GPT Role-GUID Discovery). The statement is decoded by a
+  pure crate, `shared/storage-statement`, which refuses the whole file on any error.
 
 **Fuzz targets and proof harnesses.**
 
@@ -265,9 +265,14 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   entries `num_parts` declares, which the device's capacity then bounds.
 - No check compares one partition entry with another, so two partitions can overlap, and a
   filesystem driver given one reaches the other's blocks in the overlap.
-- A copy of a partition the statement names, on a disk other than the boot disk, denies that role:
-  vfsd skips it and logs why, and the boot goes on. A statement signed earlier at a security
-  version the machine still admits verifies, and names what it named
+- A copy of a partition the statement names, on a disk other than the boot disk, denies that role
+  while the named disk is held: vfsd skips it and logs why, and the boot goes on. A named partition
+  is bound to its unique GUID and its type alone, which are written on the disk and readable, so a
+  disk that carries them takes that role (`/data` at its path, or swap, whose pages it then stores
+  and serves back) whenever the disk the statement meant is not held: not attached, removed, or
+  not yet served. Binding a named partition to its disk is not built
+  ([#1575](https://github.com/kottlerg/seraph/issues/1575)). A statement signed earlier at a
+  security version the machine still admits verifies, and names what it named
   ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
 - Two disks at the boot controller's location that both carry the boot ESP (two namespaces or
   units behind one controller), or, with a controller that reports no PCI location, a copy of the

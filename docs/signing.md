@@ -884,7 +884,10 @@ configuration directory (`CONFIG_TREES` in `xtask/src/signing/mod.rs`: `/config/
 whose files are `.svc` recipes, and `/config/devmgr/classes/`, whose files are `.class` files) is
 signed with the configuration role under its install path, and the pack writes the directory's index
 from the files the directory then holds and their bodies, and signs it the same way
-(§ Configuration); a subdirectory, or a file of another suffix, fails the pack. Every path that
+(§ Configuration); a subdirectory, or a file of another suffix, fails the pack. Every single
+configuration file a guest reads through the verified read (`CONFIG_FILES` in
+`xtask/src/signing/mod.rs`: `/config/vfsd/storage.conf`, the storage statement, when staged) is
+signed with the configuration role under its install path, with no index. Every path that
 stages a file into a configuration directory (`mkdisk --repack-only`, the debug stub, the harness
 test cases) stages it before the pack, so the pack signs it and names it in the index. The ESP is
 composed by copying installed files and signs nothing, so each object on it, each bundle entry

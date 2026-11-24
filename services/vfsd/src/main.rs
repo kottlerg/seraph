@@ -13,10 +13,11 @@
 //! out of the path: file reads, memory-cap requests, and closes go straight
 //! from client to driver.
 //!
-//! vfsd self-mounts the Seraph root partition at `/` (and the ESP at
-//! `/esp` and the data partition at `/data`) during startup, before
-//! serving any request; the runtime `MOUNT` IPC remains for
-//! explicit/foreign-GUID mounts. The swap partition is never mounted:
+//! vfsd self-mounts the Seraph root partition at `/` (and the boot ESP at
+//! `/esp` and the data partitions at their paths) during startup, before
+//! serving any request; the runtime `MOUNT` IPC mounts the root or the
+//! data role at a path, resolved as the self-mount resolves it, and only
+//! test fixtures call it. The swap partition is never mounted:
 //! `GET_SWAP_PARTITION` hands its holder a raw partition cap.
 //!
 //! See `services/vfsd/README.md` for the design and
@@ -571,8 +572,8 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// [`SERVICE_THREAD_COUNT`]).
 ///
 /// Concurrency invariants. `MOUNT` routes into `do_mount`, and a
-/// successful root `MOUNT` then auto-mounts `/esp` and `/data` through
-/// `auto_mount_role`; all of them reach `do_mount_internal`, which
+/// successful root `MOUNT` then auto-mounts `/esp` and the data paths
+/// through `auto_mount_role` ([`after_root_mount`]); all of them reach `do_mount_internal`, which
 /// mutates shared runtime state under the `VfsdRuntime` mutexes:
 /// - `rt.boot_module_cap` — Mutex; swapped to zero by the first mount
 ///   that reaches the driver spawn, whether or not it succeeds.

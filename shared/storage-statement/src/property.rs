@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use crate::{
     ErrorKind, GUID_TEXT_LEN, MAX_PATH_LEN, Named, Role, format_guid, is_mount_path, parse,
-    parse_guid, parse_line,
+    parse_guid, parse_line, split_line,
 };
 
 /// Check the parser's contract on `input`: read as a whole statement, and
@@ -29,9 +29,64 @@ pub fn storage_statement_holds(input: &[u8])
 {
     for line in input.split(|&byte| byte == b'\n')
     {
+        let reading = read_fields(line);
+        if let Some(path) = reading.second
+        {
+            path_holds(path);
+        }
+        guid_holds(reading.last);
+        split_holds(line);
         line_holds(line);
     }
     statement_holds(input);
+}
+
+/// A line read at its spaces, apart from the parser's reading by place.
+struct Reading<'a>
+{
+    /// The bytes before the first space, or the whole line.
+    first: &'a [u8],
+    /// The bytes between the first space and the next, or the line's end.
+    second: Option<&'a [u8]>,
+    /// The bytes after the last space, or the whole line.
+    last: &'a [u8],
+    /// How many fields the spaces part the line into.
+    count: usize,
+    /// Whether a field is empty: two spaces in a row, or one at either end.
+    empty: bool,
+}
+
+/// Read `line` at each of its spaces.
+fn read_fields(line: &[u8]) -> Reading<'_>
+{
+    let mut reading = Reading {
+        first: line,
+        second: None,
+        last: line,
+        count: 0,
+        empty: false,
+    };
+    let mut start = 0usize;
+    for at in 0..=line.len()
+    {
+        if at < line.len() && line.get(at) != Some(&b' ')
+        {
+            continue;
+        }
+        let field = line.get(start..at).unwrap_or_default();
+        reading.empty |= field.is_empty();
+        match reading.count
+        {
+            0 => reading.first = field,
+            1 => reading.second = Some(field),
+            _ =>
+            {}
+        }
+        reading.last = field;
+        reading.count = reading.count.saturating_add(1);
+        start = at.saturating_add(1);
+    }
+    reading
 }
 
 /// Whether `path` is a mount path, read byte by byte: a `/` first, no two
@@ -116,6 +171,77 @@ pub(crate) fn guid_holds(text: &[u8])
     }
 }
 
+/// [`split_line`] reads a line's fields at their places: the role whose
+/// keyword the line starts with, followed by a space or the line's end;
+/// then, when the role takes a path, a path of at least one byte and a
+/// space; then a field of the last [`GUID_TEXT_LEN`] bytes, and nothing
+/// else. Each field is the very bytes of the line at its place.
+pub(crate) fn split_holds(line: &[u8])
+{
+    let result = split_line(line);
+    let role = Role::ALL.into_iter().find(|role| {
+        let keyword = role.keyword().as_bytes();
+        line.get(..keyword.len()) == Some(keyword)
+            && line.get(keyword.len()).is_none_or(|&byte| byte == b' ')
+    });
+    let Some(role) = role
+    else
+    {
+        assert!(
+            matches!(result, Err(ErrorKind::UnknownRole)),
+            "a line of no keyword read as a role's"
+        );
+        return;
+    };
+    let start = role.keyword().len().saturating_add(1);
+    let len = line.len();
+    let guid_at = len.saturating_sub(GUID_TEXT_LEN);
+    let fits = if role.takes_path()
+    {
+        len >= start.saturating_add(2).saturating_add(GUID_TEXT_LEN)
+            && line.get(guid_at.saturating_sub(1)) == Some(&b' ')
+    }
+    else
+    {
+        len == start.saturating_add(GUID_TEXT_LEN)
+    };
+    match result
+    {
+        Ok((taken, path, guid)) =>
+        {
+            assert!(fits, "a line read into fields not at their places");
+            assert_eq!(taken, role, "a line read as another role");
+            assert!(
+                core::ptr::eq(guid, line.get(guid_at..).unwrap_or_default()),
+                "a GUID field read from another place"
+            );
+            let expected = role.takes_path().then(|| {
+                line.get(start..guid_at.saturating_sub(1))
+                    .unwrap_or_default()
+            });
+            assert_eq!(
+                path.is_some(),
+                expected.is_some(),
+                "a path field read or missed"
+            );
+            if let (Some(path), Some(expected)) = (path, expected)
+            {
+                assert!(
+                    core::ptr::eq(path, expected),
+                    "a path field read from another place"
+                );
+            }
+        }
+        Err(kind) =>
+        {
+            assert!(
+                kind == ErrorKind::Fields && !fits,
+                "a line of fields at their places refused as {kind:?}"
+            );
+        }
+    }
+}
+
 /// [`parse_line`] skips exactly an empty line and a comment; a line it
 /// takes is the role's keyword, its path when it takes one, and the GUID,
 /// joined by single spaces, which the entry writes back; and each refusal
@@ -129,20 +255,10 @@ pub(crate) fn line_holds(line: &[u8])
         assert_eq!(result, Ok(None), "an empty line or a comment was read");
         return;
     }
-    let fields: Vec<&[u8]> = line.split(|&byte| byte == b' ').collect();
-    if let Some(path) = fields.get(1)
-    {
-        path_holds(path);
-    }
-    if let Some(text) = fields.last()
-    {
-        guid_holds(text);
-    }
-    let role = fields.first().and_then(|keyword| {
-        Role::ALL
-            .into_iter()
-            .find(|role| role.keyword().as_bytes() == *keyword)
-    });
+    let reading = read_fields(line);
+    let role = Role::ALL
+        .into_iter()
+        .find(|role| role.keyword().as_bytes() == reading.first);
     let arity = role.map_or(0, |role| if role.takes_path() { 3 } else { 2 });
     assert!(
         !matches!(result, Ok(None)),
@@ -155,53 +271,57 @@ pub(crate) fn line_holds(line: &[u8])
         Ok(Some(entry)) =>
         {
             assert_eq!(Some(entry.role), role, "a line read as another role");
-            assert_eq!(
-                fields.len(),
-                arity,
-                "a line read with another number of fields"
+            assert!(
+                reading.count == arity && !reading.empty,
+                "a line read with another number of fields, or an empty one"
             );
             let path = entry.path.as_deref().map(str::as_bytes);
             assert_eq!(path.is_some(), entry.role.takes_path());
             if let Some(path) = path
             {
-                assert_eq!(fields.get(1), Some(&path), "a path read as another");
+                assert_eq!(reading.second, Some(path), "a path read as another");
                 assert!(path_form(path), "a path out of its form was taken");
             }
-            let text = fields.last().copied().unwrap_or_default();
+            let text = reading.last;
             assert!(guid_form(text), "a GUID out of its form was taken");
-            assert_eq!(
-                &format_guid(&entry.guid)[..],
-                &text.to_ascii_lowercase()[..],
+            assert!(
+                format_guid(&entry.guid).eq_ignore_ascii_case(text),
                 "a GUID read as another"
             );
             let mut written = String::new();
             crate::render_line(&entry, &mut written);
             // The GUID is written in lowercase; the rest of the line, its
             // path among it, keeps its case.
-            let kept = line
-                .get(..line.len().saturating_sub(text.len()))
-                .unwrap_or_default();
-            let mut expected = kept.to_vec();
-            expected.extend_from_slice(&text.to_ascii_lowercase());
-            assert_eq!(
-                written.as_bytes(),
-                &expected[..],
+            let kept = line.len().saturating_sub(text.len());
+            assert!(
+                written.len() == line.len()
+                    && written.as_bytes().get(..kept) == line.get(..kept)
+                    && written.as_bytes().get(kept..) == Some(&format_guid(&entry.guid)[..]),
                 "a line taken does not write back as itself"
             );
         }
         Err(kind) =>
         {
-            let field = |at: usize| fields.get(at).copied().unwrap_or_default();
+            // The parser reads its fields by place (`parse_line`): a field
+            // of another number, an empty one, or a last one not of a GUID's
+            // length is a fault of the fields; a space within the path makes
+            // a field too many, which it reads as a fault of the path.
+            let path = reading.second.unwrap_or_default();
             let justified = match kind
             {
                 ErrorKind::UnknownRole => role.is_none(),
                 ErrorKind::Fields =>
                 {
                     role.is_some()
-                        && (fields.len() != arity || fields.iter().any(|field| field.is_empty()))
+                        && (reading.count != arity
+                            || reading.empty
+                            || reading.last.len() != GUID_TEXT_LEN)
                 }
-                ErrorKind::Path => role.is_some_and(Role::takes_path) && !path_form(field(1)),
-                ErrorKind::Guid => !guid_form(fields.last().copied().unwrap_or_default()),
+                ErrorKind::Path =>
+                {
+                    role.is_some_and(Role::takes_path) && (reading.count != 3 || !path_form(path))
+                }
+                ErrorKind::Guid => !guid_form(reading.last),
                 ErrorKind::NoFinalNewline
                 | ErrorKind::PathRepeated
                 | ErrorKind::GuidRepeated

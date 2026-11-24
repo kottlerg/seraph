@@ -384,10 +384,14 @@ builds current:
 - The workspace crates `std` depends on (`STD_WORKSPACE_DEPS` in `xtask/src/rust_src.rs`, which
   lists every path dependency of each of them too) each read `SERAPH_STD_DEPS_DIGEST` under
   `rustc-dep-of-std`, which only `-Z build-std` enables. Every cargo command through the mirror
-  sets it to the SHA-512 of the names and contents of every file of those crates, so a change to
-  any of them changes a value their units recorded, and rebuilds them, `std`, and every
-  std-user program. Host tests check that each listed crate reads it and that the list holds every
-  path dependency of its crates.
+  sets it to the SHA-512 of the names and contents of every file of those crates but Markdown,
+  so a change to any of them changes a value their units recorded, and rebuilds them, `std`, and
+  every std-user program. Markdown is left out, as the cells and the build carry's key leave it
+  out: no unit reads it, and a change to it alone owes no build job, so a digest that saw it would
+  make every later pull request's build jobs rebuild these units after a merge that saved no carry
+  entry. The mirror's stamp leaves it out by the same rule. Host tests check that each listed crate
+  reads the digest, that the list holds every path dependency of its crates, and that the digest
+  hashes exactly the files of those crates whose change owes every build job.
 
 The build directory's name carries its format, the rules its units are judged by
 (`BUILD_DIR` in `xtask/src/rust_src.rs`, `target/seraph-build-1/`): a unit compiled under older

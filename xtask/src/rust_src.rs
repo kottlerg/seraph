@@ -75,6 +75,7 @@ use crate::error::{Context, Result, bail};
 
 use crate::context::Context as BuildContext;
 use crate::fs_compat::link_or_copy;
+use crate::layers;
 use crate::util::{require_tool, run_cmd, step};
 
 /// Substring placed in every patched source file for idempotency
@@ -116,8 +117,8 @@ pub(crate) const BUILD_DIR: &str = "seraph-build-1";
 /// checks the environment variables a unit reads for every unit, though. Each
 /// of these crates reads this variable under `rustc-dep-of-std`, which only
 /// `-Z build-std` enables, and [`SeraphToolchain::apply_env`] sets it, so a
-/// change to any of their files changes its value and rebuilds their units and
-/// every unit that depends on them.
+/// change to any of their files but Markdown, which no unit reads, changes its
+/// value and rebuilds their units and every unit that depends on them.
 const STD_DEPS_DIGEST_VAR: &str = "SERAPH_STD_DEPS_DIGEST";
 
 /// The lint arguments `clippy-driver` reads from `CLIPPY_ARGS`: `-D warnings`,
@@ -308,8 +309,8 @@ fn remove_older_build_dirs(target_dir: &Path) -> Result<()>
 }
 
 /// The SHA-512 digest, in hex, of every file of every crate of
-/// [`STD_WORKSPACE_DEPS`] under `project_root`: each crate's path, then the
-/// names and contents of the files and directories under it
+/// [`STD_WORKSPACE_DEPS`] under `project_root`, Markdown aside: each crate's
+/// path, then the names and contents of the files and directories under it
 /// ([`feed_tree`]). A change to the content, the name, or the presence of any
 /// of them changes it, whether or not the crate's compilation reads the file.
 fn std_deps_digest(project_root: &Path) -> Result<String>
@@ -590,6 +591,12 @@ fn feed_bytes(feed: &mut dyn FnMut(&[u8]), bytes: &[u8])
 /// symbolic link's target and the content of the file it resolves to, if any,
 /// or a directory's entries and an end byte. So a change to the content, the
 /// name or the presence of any of them changes what is fed.
+///
+/// A Markdown file, or a link named as one ([`layers::is_markdown`]), is
+/// left out: no unit reads it, so a change to it alone owes no build job (the
+/// cells, and the build carry's key, leave it out by the same rule), and a
+/// hash that saw it would make the units that record the hash differ from the
+/// carried ones after a merge that saved no carry entry.
 fn feed_tree(dir: &Path, feed: &mut dyn FnMut(&[u8])) -> Result<()>
 {
     let mut entries: Vec<_> = fs::read_dir(dir)
@@ -604,6 +611,10 @@ fn feed_tree(dir: &Path, feed: &mut dyn FnMut(&[u8])) -> Result<()>
         let ft = entry
             .file_type()
             .with_context(|| format!("reading the type of {}", path.display()))?;
+        if !ft.is_dir() && layers::is_markdown(&path)
+        {
+            continue;
+        }
         let read =
             |path: &Path| fs::read(path).with_context(|| format!("hashing {}", path.display()));
         if ft.is_dir()
@@ -1814,6 +1825,52 @@ mod tests
         );
     }
 
+    // Defect caught: a file of a crate std depends on whose change alone owes
+    // no build job but changes the digest, so a `master` merge changing only
+    // it saves no carry entry and every later pull request's build jobs
+    // rebuild those crates, std and every std user; or a file the digest
+    // leaves out that a unit reads, whose change rebuilds nothing.
+    #[test]
+    fn the_digest_hashes_exactly_the_files_whose_change_owes_every_build_job()
+    {
+        use crate::affected::Workspace;
+        use crate::commands::cells::{build_trees, owed_by};
+        use crate::layers::{Presence, place};
+
+        let root = repo_root();
+        let ws = Workspace::load(&root).unwrap();
+        let rels: Vec<&str> = STD_WORKSPACE_DEPS.iter().map(|(_, rel, _)| *rel).collect();
+        let out = Command::new("git")
+            .arg("ls-files")
+            .arg("--")
+            .args(&rels)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let files = String::from_utf8(out.stdout).unwrap();
+        assert_ne!(files.lines().count(), 0, "the crates hold no tracked file");
+        let wrong: Vec<String> = files
+            .lines()
+            .filter_map(|file| {
+                let hashed = !layers::is_markdown(Path::new(file));
+                let placed = place(&ws, file, Presence::Present).unwrap();
+                let owes_every_build = build_trees(owed_by(placed.class)).len() == 4;
+                (hashed != owes_every_build).then(|| {
+                    format!(
+                        "{file}: hashed {hashed}, placed {} ({})",
+                        placed.class.label(),
+                        placed.why
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "files the digest judges otherwise than the cells: {wrong:#?}"
+        );
+    }
+
     /// A fresh directory under the system's temporary directory.
     fn scratch_dir(name: &str) -> PathBuf
     {
@@ -1968,6 +2025,17 @@ mod tests
             &|| fs::remove_file(&manifest),
             &|| fs::write(&manifest, "[package]\n"),
         );
+
+        // Markdown is no unit's input: adding, changing or removing it leaves
+        // the digest as it was.
+        for readme in ["README.md", "src/NOTES.MD"]
+        {
+            fs::write(root.join(rel).join(readme), "# a\n").unwrap();
+            assert_eq!(std_deps_digest(&root).unwrap(), base, "{readme} added");
+            fs::write(root.join(rel).join(readme), "# b\n").unwrap();
+            assert_eq!(std_deps_digest(&root).unwrap(), base, "{readme} changed");
+            fs::remove_file(root.join(rel).join(readme)).unwrap();
+        }
 
         // Moving bytes between a file's name and its content, or between two
         // files, is a change too.

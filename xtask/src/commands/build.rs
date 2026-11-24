@@ -1307,6 +1307,19 @@ pub(crate) fn install_names(arch: Arch) -> Vec<String>
         .collect()
 }
 
+/// The crate and the sysroot-relative install path of every binary a build of
+/// `arch` installs, the kernel's and the bootloader's included.
+#[cfg(test)]
+pub(crate) fn crate_installs(arch: Arch) -> Vec<(&'static str, String)>
+{
+    SPECS
+        .iter()
+        .filter(|spec| arch_refusal(spec, arch).is_none())
+        .map(|spec| (spec.name, install_relative(spec).display().to_string()))
+        .chain([("boot", "boot/boot.efi".to_owned())])
+        .collect()
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Clippy-gate the host crates (`xtask`, `seraph-wrapper-shim`,

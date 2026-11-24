@@ -7,12 +7,12 @@
 //! (`cargo xtask mkdisk --svctest <set>`) and the ubench boot
 //! (`cargo xtask mkdisk --ubench`). Both stage the services layer
 //! ([`stage_services_layer`]): every recipe in `config/svcmgr/services/`
-//! that starts a file of the programs layer ([`PROGRAMS_LAYER`]), or another
-//! services-layer harness, is removed, and sessiond's svctest recipe, whose
-//! session leader is the fixture `/tests/fixtures/programs/leader`, is staged
-//! over the default one. A pack of a sysroot so staged omits the programs
-//! layer's files from the image ([`services_layer`], `crate::disk`), so the
-//! image runs no program.
+//! that names a file of the programs layer (`crate::layers::recipe`), or
+//! another services-layer harness, is removed, and sessiond's svctest recipe,
+//! whose session leader is the fixture `/tests/fixtures/programs/leader`, is
+//! staged over the default one. A pack of a sysroot so staged writes a
+//! services-layer image ([`services_layer`], `crate::layers::Image`), which
+//! holds no file of the programs layer, so the image runs no program.
 //!
 //! The svctest boot then stages svctest's recipe and the fixtures of one
 //! named set ([`svctest_fixtures::Set`]) copied from `config/svcmgr/tests/`
@@ -30,6 +30,7 @@ use std::path::Path;
 use svctest_fixtures::{CRASHD_RECIPE, ENV, Fixture, NONE, PHASES_ENV, Set};
 
 use crate::error::{Context as _, Result, bail};
+use crate::layers::{self, Layer};
 use crate::signing::body_of;
 use crate::util::step;
 
@@ -73,16 +74,6 @@ impl SvctestSet
     }
 }
 
-/// The programs layer's files, relative to the sysroot: the programs, their
-/// testers, the programs-layer harness and its recipe. A services-layer image
-/// holds none of them.
-pub const PROGRAMS_LAYER: [&str; 4] = [
-    "programs",
-    "tests/programs",
-    "tests/usertest",
-    "config/svcmgr/tests/usertest.svc",
-];
-
 /// The sysroot-relative directory of the test recipes.
 const TESTS_DIR: &str = "config/svcmgr/tests";
 /// The sysroot-relative directory svcmgr starts the recipes of.
@@ -102,7 +93,7 @@ const SESSIOND_RECIPE: &str = "sessiond.svc";
 const SERVICES_LAYER_HARNESSES: [&str; 2] = [SVCTEST_RECIPE, UBENCH_RECIPE];
 
 /// Whether the sysroot at `sysroot` stages a services-layer harness, whose
-/// image omits the files of [`PROGRAMS_LAYER`].
+/// image is a services-layer image (`crate::layers::Image::Services`).
 pub fn services_layer(sysroot: &Path) -> bool
 {
     let services = sysroot.join(SERVICES_DIR);
@@ -125,9 +116,10 @@ pub fn stage_ubench(sysroot: &Path) -> Result<()>
     Ok(())
 }
 
-/// Stage the services layer in `sysroot`: remove each staged recipe whose
-/// `binary` is a file of [`PROGRAMS_LAYER`] or a services-layer harness, and
-/// stage sessiond's svctest recipe over the default one.
+/// Stage the services layer in `sysroot`: remove each staged recipe that
+/// names a file of the programs layer (`crate::layers::installed`) or is a
+/// services-layer harness's, and stage sessiond's svctest recipe over the
+/// default one.
 ///
 /// # Errors
 ///
@@ -147,43 +139,21 @@ fn stage_services_layer(sysroot: &Path) -> Result<()>
         {
             continue;
         }
-        let harness = path
-            .file_name()
-            .is_some_and(|name| SERVICES_LAYER_HARNESSES.iter().any(|h| name == *h));
-        let object = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let body = body_of(&object).with_context(|| format!("reading {}", path.display()))?;
-        if harness || binary_of(body).is_some_and(in_programs_layer)
+        let Some(name) = path.file_name().and_then(|name| name.to_str())
+        else
+        {
+            bail!("{} has a name that is not UTF-8", path.display());
+        };
+        let harness = SERVICES_LAYER_HARNESSES.contains(&name);
+        let install = layers::installed(&format!("{SERVICES_DIR}/{name}"), || {
+            fs::read(&path).with_context(|| format!("reading {}", path.display()))
+        })?;
+        if harness || install.layer == Layer::Programs
         {
             fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
     }
     copy_recipe(sysroot, SESSIOND_RECIPE)
-}
-
-/// The value of the recipe `body`'s `binary` line, when it has one.
-fn binary_of(body: &[u8]) -> Option<&str>
-{
-    std::str::from_utf8(body).ok()?.lines().find_map(|line| {
-        let (key, value) = line.split_once('=')?;
-        (key.trim() == "binary").then(|| value.trim())
-    })
-}
-
-/// Whether the absolute path `binary` is a file of [`PROGRAMS_LAYER`], or
-/// lies under a directory of it.
-fn in_programs_layer(binary: &str) -> bool
-{
-    let Some(relative) = binary.strip_prefix('/')
-    else
-    {
-        return false;
-    };
-    PROGRAMS_LAYER.iter().any(|layer| {
-        relative == *layer
-            || relative
-                .strip_prefix(layer)
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
 }
 
 /// Copy the test recipe `name` from [`TESTS_DIR`] into [`SERVICES_DIR`].
@@ -511,9 +481,11 @@ mod tests
     }
 
     // Defect caught: a services-layer boot that still starts a program (the
-    // terminal, a hand-staged usertest), leads its sessions with a program, or
-    // keeps the other services-layer harness of an earlier staging; or a
-    // sysroot so staged whose pack keeps the programs layer.
+    // terminal, a hand-staged usertest, a service handed a program in its
+    // argv), leads its sessions with a program, or keeps the other
+    // services-layer harness of an earlier staging; a service removed because
+    // its path shares a prefix with the programs layer's; or a sysroot so
+    // staged whose pack keeps the programs layer.
     #[test]
     fn the_services_layer_runs_no_program()
     {
@@ -532,6 +504,16 @@ mod tests
             fs::write(
                 root.join(SERVICES_DIR).join("usertest.svc"),
                 "binary = /tests/usertest\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join(SERVICES_DIR).join("launcher.svc"),
+                "binary = /services/launcher\nargv = launcher /programs/shell\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join(SERVICES_DIR).join("near.svc"),
+                "binary = /services/programsd\n# argv = near /programs/shell\n",
             )
             .unwrap();
             let earlier = if ubench
@@ -554,6 +536,8 @@ mod tests
             }
             assert_eq!(staged(&root, "terminal.svc"), None);
             assert_eq!(staged(&root, "usertest.svc"), None);
+            assert_eq!(staged(&root, "launcher.svc"), None);
+            assert!(staged(&root, "near.svc").is_some());
             assert_eq!(
                 staged(&root, SESSIOND_RECIPE).as_deref(),
                 Some("test sessiond")
@@ -567,37 +551,6 @@ mod tests
         let root = sysroot("layer-default");
         assert!(!services_layer(&root));
         fs::remove_dir_all(&root).unwrap();
-    }
-
-    // Defect caught: a programs-layer file judged a service's, or a service
-    // judged a program because its name shares a prefix with a layer's.
-    #[test]
-    fn a_binary_is_in_the_programs_layer_only_under_one_of_its_paths()
-    {
-        for binary in [
-            "/programs/shell",
-            "/tests/programs/hello",
-            "/tests/usertest",
-        ]
-        {
-            assert!(in_programs_layer(binary), "{binary}");
-        }
-        for binary in [
-            "/services/timed",
-            "/tests/svctest",
-            "/tests/usertest2",
-            "/programsx/a",
-            "/tests/fixtures/programs/leader",
-            "programs/shell",
-        ]
-        {
-            assert!(!in_programs_layer(binary), "{binary}");
-        }
-        assert_eq!(
-            binary_of(b"# c\nbinary  =  /programs/a \n"),
-            Some("/programs/a")
-        );
-        assert_eq!(binary_of(b"argv = a\n"), None);
     }
 
     // Defect caught: a set whose fixture recipe is renamed or gone staged

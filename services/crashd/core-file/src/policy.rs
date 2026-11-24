@@ -108,10 +108,10 @@ mod tests
     {
         let policy = Policy::parse(Some("crashme,svc")).unwrap();
         assert!(policy.dumps(b"crashme"));
-        assert!(policy.dumps(b"/programs/crashme"));
+        assert!(policy.dumps(b"/tests/fixtures/programs/crashme"));
         assert!(policy.dumps(b"svc"));
         assert!(!policy.dumps(b"crashmex"));
-        assert!(!policy.dumps(b"/programs/crash"));
+        assert!(!policy.dumps(b"/tests/fixtures/programs/crash"));
         assert!(!policy.dumps(b""));
     }
 
@@ -119,11 +119,17 @@ mod tests
     fn a_name_names_a_listed_process_whole_or_by_its_last_path_component()
     {
         assert!(names(b"crashme", b"crashme"));
-        assert!(names(b"crashme", b"/programs/crashme"));
-        assert!(names(b"/programs/crashme", b"/programs/crashme"));
-        assert!(!names(b"programs/crashme", b"/programs/crashme"));
-        assert!(!names(b"crash", b"/programs/crashme"));
-        assert!(!names(b"crashme", b"/programs/crashme/"));
+        assert!(names(b"crashme", b"/tests/fixtures/programs/crashme"));
+        assert!(names(
+            b"/tests/fixtures/programs/crashme",
+            b"/tests/fixtures/programs/crashme"
+        ));
+        assert!(!names(
+            b"fixtures/programs/crashme",
+            b"/tests/fixtures/programs/crashme"
+        ));
+        assert!(!names(b"crash", b"/tests/fixtures/programs/crashme"));
+        assert!(!names(b"crashme", b"/tests/fixtures/programs/crashme/"));
         assert!(!names(b"", b"crashme"));
         assert!(!names(b"crashme", b""));
     }

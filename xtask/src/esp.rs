@@ -13,7 +13,8 @@
 //! that every object on it equals the installed file it copies ([`check`]),
 //! so the ESP of every image equals the installed files it derives from.
 //! The pack then makes the same check of the image it wrote, its ESP against
-//! its root partition (`crate::image_check`).
+//! the installed files, those on its root partition or, for the kernel layer's
+//! image, the sysroot's (`crate::image_check`).
 //!
 //! Composing signs nothing and reads no key: the sysroot is signed first
 //! (`crate::signing::sign_for_harness`), and the composer checks what it

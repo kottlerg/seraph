@@ -69,9 +69,9 @@ const NO_CELL: Owed = Owed {
 };
 
 /// What a change whose most demanding file is of `class` owes. The services
-/// and programs layers owe the same cells while svctest still runs programs.
-/// The bench cell's ubench boots run the services and programs layers, so
-/// every change that owes a boot owes them.
+/// and programs layers owe the same cells: the selection does not separate
+/// them, though no services-layer image holds a file of the programs layer.
+/// Every change that owes a boot owes the bench cell's ubench boots.
 #[must_use]
 pub fn owed_by(class: Class) -> Owed
 {

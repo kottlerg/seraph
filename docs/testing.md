@@ -19,13 +19,62 @@ reduced to a hand-written test case.
 
 ## Harnesses
 
-Three harnesses exercise three surfaces:
+The tree is three layers, and each has one harness. A layer depends only on itself and the layers
+below it; each harness tests its own layer, through the layers below it, on an image that holds its
+layer and the layers below and nothing above.
 
-| Harness | Surface | Crate | Launch mechanism |
+| Layer | Harness | What the layer holds | The harness's image |
 |---|---|---|---|
-| `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask mkdisk --harness ktest`) |
-| `svctest` | Services | [`services/svctest/`](../services/svctest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
-| `usertest` | Programs | [`programs/usertest/`](../programs/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (the `terminal` case, `cargo xtask test terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
+| Kernel | `ktest` | the bootloader, the kernel, the ABI crates, and ktest | the ESP alone: the bootloader, the kernel, and the ktest bundle (`/tests/ktest` in the `init` slot and the boot-time policy); the root and data partitions hold no file |
+| Services | `svctest` | init, every core service, driver and filesystem driver, the runtime (`runtime/`), and the services' test features: svctest, its fixtures, the test-only drivers, and `ubench` | the kernel layer's, and the default service set, crashd included, the test recipe of each service svctest configures for its checks, svctest, the fixtures of its set, and the test class files; no file of the programs layer: nothing under `/programs/` or `/tests/programs/`, and no recipe that names a file of the programs layer |
+| Programs | `usertest` | the programs a user runs for their own purpose, their testers, and usertest | the whole system |
+
+- **A component is in exactly one layer.** The record is
+  [`xtask/src/layers.rs`](../xtask/src/layers.rs), and the CI selection reads it
+  (§ Coverage tiers). Its source rows place every tracked file: a crate by its directory, a crate
+  under `shared/` at the lowest layer of the crates that link it, and a recipe by the highest
+  layer of the install paths it names. Its install rows place every file an image holds, by its
+  install path: the layer it serves, and whether it is a test feature. A host test fails when a
+  tracked file or an installed file is in no row, or when the two rows of a file disagree.
+- **A dependency on a higher layer is forbidden**, in every form: a crate dependency, a path a
+  component's code spawns, creates, opens or reads, a path a recipe names, and a file a harness's
+  staging puts in its image. A process a phase needs is a fixture of the phase's own layer, never
+  a component of a higher one. Host tests fail on a crate that depends on a crate of a higher
+  layer, on a source below the programs layer whose code names an install path of the programs
+  layer, and on a bundle list that names a file above its harness's layer.
+- **A harness asserts on its own layer.** ktest on the kernel; svctest on the services, the runtime
+  and the kernel objects they hand out; usertest on each program's real I/O surface, consuming the
+  services as any program does. A tester asserts nothing about a service's internals.
+- **A change in a layer can affect that layer's harness and those above it, never one below.** A
+  component's checks live in its own layer's harness, so a change runs them wherever it can affect
+  them.
+- **A case** (`cargo xtask test`) belongs to the layer of the cell that runs it, and boots an image
+  no higher than that layer's.
+- **A test feature** (a harness, a tester, a fixture, a test-only driver, or a recipe, class file or
+  data file only a test reads) installs under `/tests/` and reaches an image only through its
+  harness's staging. A fixture that the component under test finds by its install path installs
+  where that component looks, and is still a test feature: `test-dma`, which devmgr binds from
+  `/services/drivers/`, and the test recipes, class files and data files under `/config/` and
+  `/data/` that the services read from their own directories. Nothing but a program installs under
+  `/programs/`.
+- **The default image holds no test feature.** The pack composes four kinds of image from the
+  record ([`xtask/src/disk.rs`](../xtask/src/disk.rs)): the kernel layer's for the ktest bundle,
+  a services-layer image when svctest or ubench is staged, a test image, the whole system with its
+  test features, when a staged recipe names a test feature (usertest's, a case's fixture's), and
+  the default image, the whole system without any test feature, otherwise. Every pack reads its
+  images back and fails when they hold a file their kind does not
+  ([xtask/README.md](../xtask/README.md#the-image-check) § The image check).
+- The layers have directories: `core/` is the kernel layer, `services/` the services layer, and
+  `programs/` the programs layer; `abi/` is the kernel layer, `runtime/` the services layer,
+  and `shared/` as the first rule says.
+
+Each harness is launched as follows:
+
+| Harness | Crate | Launch mechanism |
+|---|---|---|
+| `ktest` | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask mkdisk --harness ktest`) |
+| `svctest` | [`services/svctest/`](../services/svctest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe (`cargo xtask mkdisk --svctest <set>`) |
+| `usertest` | [`programs/usertest/`](../programs/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (the `terminal` case, `cargo xtask test terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs the per-program
@@ -168,9 +217,11 @@ sysroot/
 ```
 
 `/services/` and `/programs/` MUST NOT contain test harnesses, per-program testers or test
-fixtures; those live under `/tests/`. Dropping `/tests/` does not by itself
-give a non-test distro, because test-only artifacts also install under
-`/services/drivers/`, `/config/svcmgr/tests/`, `/config/devmgr/tests/`, and `/data/`.
+fixtures; those live under `/tests/`. Test features also install under `/services/drivers/`,
+`/config/svcmgr/tests/`, `/config/devmgr/tests/`, `/config/bundle/` (the ktest bundle's list) and
+`/data/`, where the components under test look for them; the default image holds none of them, nor
+anything under `/tests/` ([Harnesses](#harnesses)), and the install rows of
+[`xtask/src/layers.rs`](../xtask/src/layers.rs) name each.
 Under `/services/drivers/` is [`test-dma`](../services/drivers/test-dma/README.md), the test-only
 driver of the `edu` DMA test device. Under `/tests/drivers/` is
 [`test-fault`](../services/drivers/test-fault/README.md), a test-only fault-injection driver that
@@ -248,7 +299,10 @@ To enable a harness for a boot, copy its recipe from
 `sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/` after
 `cargo xtask build`, then repack with `cargo xtask mkdisk --repack-only` before
 `cargo xtask run` (`run` boots the existing `disk.img`, and a normal `mkdisk`
-re-mirror prunes the hand-staged recipe). svctest and ubench are staged by `mkdisk` itself: svctest
+re-mirror prunes the hand-staged recipe). A staged recipe that names a test feature, usertest's
+among them, makes the pack write a test image, the whole system with its test features; a sysroot
+that stages none packs the default image, which holds no test feature
+([Harnesses](#harnesses)). svctest and ubench are staged by `mkdisk` itself: svctest
 with a fixture set (`--svctest ci|burn-in|none|crash-endpoint`, below), ubench with `--ubench`:
 
 ```sh
@@ -258,11 +312,12 @@ cargo xtask run --test-devices
 ```
 
 `mkdisk --svctest` and `mkdisk --ubench` (the two conflict) stage a services-layer image: they
-remove from `/config/svcmgr/services/` every recipe that starts a file of the programs layer (the
-autostarted `terminal` among them) and stage sessiond's test recipe (`tests/sessiond.svc`), whose
-session leader is the fixture `/tests/fixtures/programs/leader`, over the default one. The pack then
-omits the programs layer from the image (`/programs/`, `/tests/programs/`, `/tests/usertest` and
-`/config/svcmgr/tests/usertest.svc`) whenever the staged services hold `svctest.svc` or
+remove from `/config/svcmgr/services/` every recipe that names a file of the programs layer (the
+autostarted `terminal` and the default sessiond among them) and stage sessiond's test recipe
+(`tests/sessiond.svc`), whose session leader is the fixture `/tests/fixtures/programs/leader`, over
+the default one. The pack then writes a services-layer image, which holds no file of the programs
+layer (`/programs/`, `/tests/programs/`, `/tests/usertest`, and every recipe that names one,
+`/config/svcmgr/tests/usertest.svc` among them), whenever the staged services hold `svctest.svc` or
 `ubench.svc`, so a later `--repack-only` keeps the omission and the boot runs no program.
 
 `mkdisk --svctest` also stages the test class files of `sysroot/config/devmgr/tests/` into

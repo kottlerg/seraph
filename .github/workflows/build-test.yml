@@ -381,8 +381,10 @@ jobs:
       # Each cell is one of arch [x86_64, riscv64] x profile [debug, release]
       # x tester [svctest, usertest, ktest], in that key order, so its check
       # is named `validate (<arch>, <profile>, <tester>)`. One harness per
-      # cell: each cell takes its build job's tree, stages exactly one
-      # recipe (or swaps boot.conf for ktest), then runs once. Avoids
+      # cell: each cell takes its build job's tree and stages one harness
+      # (svctest's recipe with a fixture set, usertest's recipe, or the ktest
+      # bundle), then boots it: once, or for svctest twice, its `ci` set
+      # and then its `crash-endpoint` set. Avoids
       # back-to-back fatfs/sysroot state accumulation across harnesses
       # and lets a failing tier surface as a single named cell. After its
       # boot, each cell runs the host-driven cases `cargo xtask test`'s
@@ -446,9 +448,11 @@ jobs:
         # re-mirrors rootfs and repacks the FAT image without invoking
         # cargo. ktest swaps the bundle's `init` entry via
         # `cargo xtask mkdisk --harness ktest`, which repacks the disk
-        # image with the ktest bundle. Every pack checks the images it
-        # writes (fsck.fat -n on every FAT volume, then the ESP against the
-        # root partition; xtask/README.md § The image check).
+        # image with the ktest bundle and nothing on its root and data
+        # partitions. Every pack checks the images it writes (fsck.fat -n on
+        # every FAT volume, then the partitions against the image's kind,
+        # then the ESP against the installed files; xtask/README.md § The
+        # image check).
         #
         # The svctest cell's `ci` set co-stages crasher (the restart-path
         # fixture), its worker-fault recipe (crasher-worker.svc) and its
@@ -633,8 +637,9 @@ jobs:
         # § Coverage tiers): on usertest the terminal, wedge, shutdown,
         # signing, dma-confinement, rollback, enrolment, secureboot and
         # storage-roles cases, and vmgenid on x86_64; on ktest the kaslr case;
-        # svctest has none. Each case boots the default image of its bundle,
-        # so the plain repack first re-mirrors rootfs (dropping the staged
+        # svctest has none. Each case boots its bundle's image unstaged, but
+        # for what the case stages itself, so the plain repack first
+        # re-mirrors rootfs (dropping the staged
         # test recipes and restoring terminal.svc), installs the repository's
         # log-level configuration, and removes the knobs, keeping the
         # recorded harness. The signing and rollback cases build their

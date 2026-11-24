@@ -590,19 +590,25 @@ writer in `src/fat.rs` that changes nothing, on the copy. The pack fails on the 
 `fsck.fat` does not pass, printing what `fsck.fat` printed, and when `fsck.fat` is not on
 `PATH`, naming the package to install.
 
-It then reads the ESP and the root partition of `disk.img` with xtask's FAT reader
-(`src/fat_read.rs`, built on the `fatfs` service's decoders) and makes the check every pack makes of
-the ESP it composes (`src/esp.rs`), of the image this time
-([docs/boot-media.md](../docs/boot-media.md) § The ESP): the bootloader at both of its paths equals
-`/boot/boot.efi`, the kernel `/boot/kernel`, and each entry of the bundle the installed file its
-bundle list names, the list read from the root partition's `/config/bundle/` and the harness chosen
-by the bundle's entries; the bundle holds every entry its list names and no other; and the ESP holds
-no other file than an empty presence-only knob in `\EFI\seraph\` or a trust request at
-`\EFI\seraph\trust-request`. The architecture is the root partition's type. It fails naming every
-object that differs, is missing, or copies a file the root partition does not install. A pack that
-writes substitutes in place of installed files, as the `signing` case's refusal images do, makes the
-`fsck.fat` check alone, since its ESP is by design no copy of its root partition. The check adds
-about half a second to a pack at 512-byte blocks, and under a second at 4096.
+It then reads the ESP, the root and the data partition with xtask's FAT reader (`src/fat_read.rs`,
+built on the `fatfs` service's decoders) and checks that the root and data partitions hold only what
+the kind of image the pack wrote holds (the image's kind, below), each file placed by its install
+path as the layer record's install rows place it (`src/layers.rs`). It fails naming every file the
+kind does not hold and every file no install row places.
+
+It then makes the check every pack makes of the ESP it composes (`src/esp.rs`), of the image this
+time ([docs/boot-media.md](../docs/boot-media.md) § The ESP): the bootloader at both of its paths
+equals `/boot/boot.efi`, the kernel `/boot/kernel`, and each entry of the bundle the installed file
+its bundle list names, the lists read from the root partition's `/config/bundle/` and the harness
+chosen by the bundle's entries; the bundle holds every entry its list names and no other; and the
+ESP holds no other file than an empty presence-only knob in `\EFI\seraph\` or a trust request at
+`\EFI\seraph\trust-request`. The architecture is the root partition's type. For the kernel layer's
+image, whose root partition holds nothing, the installed files and the lists are the sysroot's, and
+the ktest bundle's list must name only files of the kernel layer. It fails naming every object that
+differs, is missing, or copies a file that is not installed. A pack that writes substitutes in place
+of installed files, as the `signing` case's refusal images do, skips the ESP check, since its ESP is
+by design no copy of the installed files. The check adds about half a second to a pack at 512-byte
+blocks, and under a second at 4096.
 
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest] \
@@ -632,13 +638,22 @@ it, and no `[devmgr] DEBUG ` or `[procmgr] DEBUG ` line, which `run --runs --req
 `--fail-also` match
 ([docs/testing.md](../docs/testing.md#log-levels-usertest-cell) § Log levels).
 
-The services layer. `--svctest` and `--ubench` remove from `config/svcmgr/services/` every recipe
-that starts a file of the programs layer (the autostarted `terminal` among them) or another
+The image's kind. Every pack writes on the root and data partitions what the kind of image its
+sysroot's staging asks for holds, each file judged by its install path in the layer record's install
+rows (`src/layers.rs`; [docs/testing.md](../docs/testing.md#harnesses) § Harnesses), a recipe also
+by the install paths it names. With the ktest bundle (`--harness ktest`) it writes the kernel
+layer's image, whose root and data partitions hold no file. When the staged services hold
+`svctest.svc` or `ubench.svc`, it writes a services-layer image, which holds no file of the programs
+layer (`/programs/`, `/tests/programs/`, `/tests/usertest`, and every recipe that names one). When a
+staged recipe names a test feature (usertest's, a case's fixture's), it writes a test image, the
+whole system with its test features. Otherwise it writes the default image, the whole system without
+any test feature: nothing under `/tests/`, and neither `test-dma`, nor the test recipes, class files
+and data files, nor the ktest bundle's list. A file no install row places fails the pack.
+`--svctest` and `--ubench` remove from `config/svcmgr/services/` every recipe that names a file of
+the programs layer (the autostarted `terminal` and the default sessiond among them) or another
 services-layer harness, and stage sessiond's test recipe (`config/svcmgr/tests/sessiond.svc`, whose
-session leader is the fixture `/tests/fixtures/programs/leader`) over the default one. The pack of a
-sysroot whose staged services hold `svctest.svc` or `ubench.svc` omits the programs layer from the
-image (`/programs/`, `/tests/programs/`, `/tests/usertest` and `/config/svcmgr/tests/usertest.svc`),
-so a later `--repack-only` keeps the omission and the boot runs no program.
+session leader is the fixture `/tests/fixtures/programs/leader`) over the default one, so a later
+`--repack-only` keeps the composition and the boot runs no program.
 
 Example — stage `svctest` as the canonical cells do and run it (`--repack-only` keeps the staging;
 a plain repack would restore the removed recipes):

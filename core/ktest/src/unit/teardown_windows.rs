@@ -34,7 +34,8 @@ use syscall::{
     memory_split, mmio_map, thread_bind_notification,
 };
 use syscall_abi::{
-    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, PAGE_SIZE, RIGHTS_ALL,
+    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, MAP_WRITABLE,
+    PAGE_SIZE, RIGHTS_ALL,
 };
 
 use crate::latency::{self, Bracket, Call, Measured};
@@ -372,7 +373,7 @@ pub fn frame_release_takes_interrupts(ctx: &TestContext) -> TestResult
             // SAFETY: the space is fresh and no thread runs in it, so no Rust
             // object or IPC page of ktest is at the address; the region holds
             // none either (a piece split off for the case).
-            unsafe { mem_map(region.cap, space.0, va, 0, REGION_PAGES, 0) }
+            unsafe { mem_map(region.cap, space.0, va, 0, REGION_PAGES, MAP_WRITABLE) }
                 .map_err(|_| "teardown_windows::frame_release: map the region failed")?;
         }
         if mappings(region.cap)? != full
@@ -518,7 +519,9 @@ pub fn death_post_takes_interrupts(ctx: &TestContext) -> TestResult
             ended: &mut ended,
         };
         let m = latency::measure_exit(ctx, &mut setup, &mut bracket)?;
-        if !first_seen.get() || !last_seen.get()
+        // The bracket stops reading once a read sees the last post, which a
+        // stretch run whole between two probes leaves the first one unread.
+        if !posted(first.0, &first_seen)? || !posted(last.0, &last_seen)?
         {
             return Err("teardown_windows::death_post: an observer missed the post");
         }

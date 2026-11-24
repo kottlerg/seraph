@@ -947,9 +947,14 @@ dependencies = [
  "restart-budget",
  "shmem",
  "storage-statement",
+ "svctest-fixtures",
  "syscall",
  "syscall-abi",
 ]
+
+[[package]]
+name = "svctest-fixtures"
+version = "0.1.5"
 
 [[package]]
 name = "swapd"
@@ -1195,6 +1200,7 @@ dependencies = [
  "restart-budget",
  "seraph-path-account-plugin",
  "storage-statement",
+ "svctest-fixtures",
  "syscall-abi",
  "vfsd-gpt",
 ]

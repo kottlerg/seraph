@@ -75,16 +75,15 @@ a fall below `CRITICAL`, an unreadable level, `OOMD_STOP=no`), the class codes a
 The svctest `oom_policy` phase drives oomd end to end with the `memhog` fixture
 ([services/memhog/README.md](../memhog/README.md)) and the `stopsrc` fixture
 ([services/stopsrc/README.md](../stopsrc/README.md)), which the svctest boot stages: stopsrc
-restarts, so the source oomd finds started after oomd, and starts a job. With sessiond staged,
-svctest also opens an operator session whose shell runs `crashme oom-hold 512`, a job larger than
-stopsrc's 64-page one. memhog fills the pool up to the reserve; oomd stops the crashme job after the
-grace, then stopsrc's job, then the session or sessions, then memhog, a cooldown apart; the
-session's relay gives the leader's end. The level falls to `NORMAL`, memhog's next instance is idle,
-and oomd has logged one stop of each. In a boot that stages crashd with a stall, a child of svctest
-writes the pages of a demand region while the pool is full, its start deferred until sessiond lists
-no candidate, so crashd's hold of the write memmgr declines covers only memhog's stop, and crashd
-resumes it once the stop frees memory. With
-`OOMD_STOP=no`, or without oomd's recipe, the phase checks that nothing stops memhog
+restarts, so the source oomd finds started after oomd, and starts a job. svctest also opens an
+operator session whose shell runs `crashme oom-hold 512`, a job larger than stopsrc's 64-page one.
+memhog fills the pool up to the reserve; oomd stops the crashme job after the grace, then stopsrc's
+job, then the session or sessions, then memhog, a cooldown apart; the session's relay gives the
+leader's end. The level falls to `NORMAL`, memhog's next instance is idle, and oomd has logged one
+stop of each. In a boot that stages crashd with a stall, a child of svctest writes the pages of a
+demand region while the pool is full, its start deferred until sessiond lists no candidate, so
+crashd's hold of the write memmgr declines covers only memhog's stop, and crashd resumes it once the
+stop frees memory. With `OOMD_STOP=no`, the phase checks that nothing stops memhog
 ([services/svctest/README.md](../svctest/README.md)).
 
 ---

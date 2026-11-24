@@ -28,6 +28,9 @@ free_pool = { path = "../memmgr/free-pool", package = "memmgr-free-pool" }
 # entropy driver through the `hwrng` class protocol.
 hwrng-protocol = { path = "../../shared/hwrng-protocol" }
 ipc = { path = "../../shared/ipc" }
+# The fixture record of svctest's staged recipe, and the fixtures it names:
+# svctest refuses a run whose image does not stage exactly the declared set.
+svctest-fixtures = { path = "fixtures" }
 # `TICK_MS`: the logd_reserve phase's creates wait out memhog's take-back of
 # the pages a destroy freed.
 mem-fill = { path = "../../shared/mem-fill" }

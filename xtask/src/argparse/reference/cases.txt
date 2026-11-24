@@ -11891,6 +11891,42 @@ InvalidValue
 error: invalid value 'bogus' for '--harness <HARNESS>'
   [possible values: init, ktest]
 
+["mkdisk","--svctest"]
+InvalidValue
+error: a value is required for '--svctest <SET>' but none was supplied
+  [possible values: ci, burn-in, none]
+
+["mkdisk","--svctest","7"]
+InvalidValue
+error: invalid value '7' for '--svctest <SET>'
+  [possible values: ci, burn-in, none]
+
+["mkdisk","--svctest",""]
+InvalidValue
+error: a value is required for '--svctest <SET>' but none was supplied
+  [possible values: ci, burn-in, none]
+
+["mkdisk","--svctest=--"]
+InvalidValue
+error: invalid value '--' for '--svctest <SET>'
+  [possible values: ci, burn-in, none]
+
+["mkdisk","--svctest","ci"]
+ok mkdisk svctest=["ci"]
+
+["mkdisk","--svctest","burn-in"]
+ok mkdisk svctest=["burn-in"]
+
+["mkdisk","--svctest","none"]
+ok mkdisk svctest=["none"]
+
+["mkdisk","--svctest","ci","--svctest","none"]
+ArgumentConflict
+error: the argument '--svctest <SET>' cannot be used multiple times
+
+["mkdisk","--repack-only","--svctest","ci","--block-size","4096"]
+ok mkdisk repack_only svctest=["ci"] block_size=["4096"]
+
 ["mkdisk","--repack-only","--harness","ktest","--knob","mapredo"]
 ok mkdisk repack_only harness=["ktest"] knob=["mapredo"]
 

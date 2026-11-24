@@ -236,20 +236,41 @@ To enable a harness for a boot, copy its recipe from
 `sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/` after
 `cargo xtask build`, then repack with `cargo xtask mkdisk --repack-only` before
 `cargo xtask run` (`run` boots the existing `disk.img`, and a normal `mkdisk`
-re-mirror prunes the hand-staged recipe):
+re-mirror prunes the hand-staged recipe). svctest is staged by `mkdisk` itself, with a fixture
+set (`--svctest ci|burn-in|none`, below):
 
 ```sh
 cargo xtask build
-cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
-cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
-cargo xtask mkdisk --repack-only
+rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
+cargo xtask mkdisk --repack-only --svctest none
 cargo xtask run --test-devices
 ```
 
-The svctest recipe also stages the test class files of `sysroot/config/devmgr/tests/` into
-`sysroot/config/devmgr/classes/`, the directory svcmgr reads class files from, and boots with
-`--test-devices`, which attaches `edu` and five QEMU `pci-testdev` functions that no other launch
-attaches and no production driver binds. svctest fails, naming the flag, when they are missing.
+`mkdisk --svctest` also stages the test class files of `sysroot/config/devmgr/tests/` into
+`sysroot/config/devmgr/classes/`, the directory svcmgr reads class files from, and the svctest
+boot runs with `--test-devices`, which attaches `edu` and five QEMU `pci-testdev` functions that
+no other launch attaches and no production driver binds. svctest fails, naming the flag, when they
+are missing.
+
+**svctest fixture sets.** A fixture is a test recipe that svctest's phases drive when it is staged
+beside svctest (`services/svctest/fixtures`). `cargo xtask mkdisk --svctest <set>` stages svctest's
+recipe with the fixtures of one named set, removes every other fixture's recipe from
+`/config/svcmgr/services/`, and writes the set into the staged recipe's `env` line as
+`SVCTEST_FIXTURES=<fixture>,...` (`none` for the empty set) before the pack signs it:
+
+| Set | Fixtures | Used by |
+|---|---|---|
+| `ci` | `crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc` | the canonical svctest cells, and the local host runs that stage svctest as they do |
+| `burn-in` | `memhog`, `reserve-creator`, `stopsrc` | the burn-in svctest cell |
+| `none` | none | a boot of svctest alone |
+
+svctest's `svctest_fixtures` phase, right after its startup phases, fails the run unless the image
+stages exactly the fixtures the record declares, naming each recipe that disagrees: a declared
+fixture whose recipe is missing, or a fixture recipe the record does not declare. It fails the same
+way without the record, so a hand-copied svctest recipe does not boot, and when the recipes of
+oomd or sessiond, the default services its phases drive, are missing. A phase whose fixture the
+set does not declare skips, or skips the part the fixture drives, and logs
+`phase=<phase> skipped: <recipe> not staged`.
 
 The usertest recipe also stages crashd's test recipe, `tests/crashd.svc`, over the default one:
 the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death, and
@@ -1118,36 +1139,32 @@ harnesses staged together race on shutdown — the slower one may not finish.
 Per boot, at most one *shutdown-invoking* harness recipe MUST be staged in
 `/config/svcmgr/services/`.
 
-Non-shutdown fixtures may co-stage alongside one harness. `crasher`
-(`restart = always`, never shuts down) and its worker-fault role
-(`crasher-worker.svc`, `restart = on_failure`) are co-staged with `svctest` in
-the services-surface CI cell so their restart paths are exercised there (svctest's
-`svcmgr_worker_fault_restart` phase runs when `crasher-worker.svc` is staged and is
-skipped otherwise, and its `svcmgr_stop_service` phase stops and restarts the fixture through
-svcmgr's stop authority when it is staged), as is its boot-fault role (`crasher-boot.svc`,
-`restart = on_failure`), whose instance that finds the token `/data/crasher-boot/die-early`,
-which the data partition ships, removes it and dies before its bootstrap request (svctest's
-`svcmgr_boot_death` phase runs when it is staged and is skipped otherwise); its
-bounded faults complete long before `svctest`'s terminal marker, so the
-kernel fault dump never clobbers it. The `memhog` fixture (`memhog.svc`,
-`restart = on_failure`, `oom_stop = yes`) is co-staged with `svctest` in that cell and in the
-burn-in svctest cell: svctest's `oom_policy` phase runs when it is staged, has it fill memory until
-oomd stops it, and passes otherwise, and its `logd_reserve` phase has it fill memory while logd is
-killed and restarted. The CI svctest cell drops crashd, so the held-write path of
-that phase (a child's page fault crashd holds until oomd's stop frees memory), and the write part of
-the `memmgr_swap_commit` phase (a child's commitment past the draw room, its commit overruns
-held by crashd until write-out to swap opens memmgr's draw room), run in the burn-in svctest cell,
-which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart = always`,
-`stop_source = program`) is co-staged beside `memhog` in both cells: svctest's
-`svcmgr_stop_service` phase reads that svcmgr lists it, beside sessiond when that recipe is staged,
-as a stop source of the program class and that a job it started ends with it, and its `oom_policy`
-phase has it start a job that oomd stops before memhog; both phases pass without it. With
-`sessiond.svc` staged, the `oom_policy` phase also opens an operator session whose shell runs
-`crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's `sessiond_operator` phase
-checks sessiond's operator interface; both pass without it. The `reserve-creator` fixture
-(`reserve-creator.svc`, `reserve = yes`) is co-staged beside `memhog` in both cells: svctest's
-`logd_reserve` phase has it make a `CREATE_FROM_FILE | CREATE_RESERVE` of `/programs/hello` while
-memhog holds memory critical, which must succeed, and skips that check without it.
+Non-shutdown fixtures may co-stage alongside one harness; svctest's are staged by the fixture sets
+above, and each phase below skips, logging the skip line, when the staged set does not declare its
+fixture. `crasher` (`restart = always`, never shuts down) and its worker-fault role
+(`crasher-worker.svc`, `restart = on_failure`) are in the `ci` set, so their restart paths are
+exercised in the services-surface CI cell (svctest's `svcmgr_worker_fault_restart` phase drives the
+worker fault, and its `svcmgr_stop_service` phase stops and restarts the fixture through svcmgr's
+stop authority), as is its boot-fault role (`crasher-boot.svc`, `restart = on_failure`), whose
+instance that finds the token `/data/crasher-boot/die-early`, which the data partition ships,
+removes it and dies before its bootstrap request (svctest's `svcmgr_boot_death` phase); its bounded
+faults complete long before `svctest`'s terminal marker, so the kernel fault dump never clobbers
+it. The `memhog` fixture (`memhog.svc`, `restart = on_failure`, `oom_stop = yes`) is in the `ci`
+and `burn-in` sets: svctest's `oom_policy` phase has it fill memory until oomd stops it, and its
+`logd_reserve` phase has it fill memory while logd is killed and restarted. The CI svctest cell
+drops crashd, so the held-write path of that phase (a child's page fault crashd holds until oomd's
+stop frees memory), and the write part of the `memmgr_swap_commit` phase (a child's commitment
+past the draw room, its commit overruns held by crashd until write-out to swap opens memmgr's draw
+room), run in the burn-in svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`,
+`restart = always`, `stop_source = program`) is in both sets: svctest's `svcmgr_stop_service`
+phase reads that svcmgr lists it, beside sessiond, as a stop source of the program class and that a
+job it started ends with it, and its `oom_policy` phase has it start a job that oomd stops before
+memhog. The `oom_policy` phase also opens an operator session whose shell runs
+`crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's `sessiond_operator`
+phase checks sessiond's operator interface; sessiond, like oomd, is a default service, which every
+svctest boot stages. The `reserve-creator` fixture (`reserve-creator.svc`, `reserve = yes`) is in
+both sets: svctest's `logd_reserve` phase has it make a `CREATE_FROM_FILE | CREATE_RESERVE` of
+`/programs/hello` while memhog holds memory critical, which must succeed.
 
 **Test isolation.** The functional harness boots run a controlled substrate:
 they drop the autostarted `terminal` (a user-facing program, not part of the
@@ -1851,13 +1868,8 @@ runs those boots, and the release host runs run all four.
 ```sh
 # Disk variations, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
-cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/crasher-boot.svc \
-    sysroot/config/svcmgr/tests/memhog.svc sysroot/config/svcmgr/tests/stopsrc.svc \
-    sysroot/config/svcmgr/tests/reserve-creator.svc sysroot/config/svcmgr/services/
-cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
-cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
+cargo xtask mkdisk --arch <arch> --repack-only --svctest ci --block-size 4096
 cargo xtask run --arch <arch> --runs 1 --timeout 420 \
     --test-devices
 cargo xtask mkdisk --arch <arch> --repack-only --split-data
@@ -1889,13 +1901,8 @@ is the framebuffer device cell (Device surfaces above).
 ```sh
 # Framebuffer cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
-cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/crasher-boot.svc \
-    sysroot/config/svcmgr/tests/memhog.svc sysroot/config/svcmgr/tests/stopsrc.svc \
-    sysroot/config/svcmgr/tests/reserve-creator.svc sysroot/config/svcmgr/services/
-cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
-cargo xtask mkdisk --arch <arch> --repack-only
+cargo xtask mkdisk --arch <arch> --repack-only --svctest ci
 cargo xtask run --arch <arch> --runs 1 --timeout 360 \
     --display framebuffer --test-devices --fail-also 'framebuffer case skipped'
 ```

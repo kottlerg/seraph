@@ -6,12 +6,13 @@
 //! The out-of-memory policy end to end (services/oomd/docs/operation.md): the
 //! `memhog` fixture fills memmgr's pool down to its growth floor, and oomd
 //! stops it once the level has read `CRITICAL` for its grace, or, with
-//! `OOMD_STOP=no` or no oomd, nothing stops it. With the `stopsrc` fixture
-//! staged, oomd first stops the job that stop source lists, since the program
-//! class is stopped before the service class. With sessiond staged, svctest
-//! opens an operator session whose shell runs a job larger than `stopsrc`'s,
-//! and oomd stops that job first, then `stopsrc`'s, then the sessions, then
-//! the fixture (docs/session-supervision.md).
+//! `OOMD_STOP=no`, nothing stops it. With the `stopsrc` fixture staged, oomd
+//! first stops the job that stop source lists, since the program class is
+//! stopped before the service class. svctest opens an operator session whose
+//! shell runs a job larger than `stopsrc`'s, and oomd stops that job first,
+//! then `stopsrc`'s, then the sessions, then the fixture
+//! (docs/session-supervision.md). oomd and sessiond are of the default service
+//! set, which svctest requires staged ([`super::fixtures`]).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -20,16 +21,15 @@ use std::time::{Duration, Instant};
 use ipc::memhog_labels as hog;
 use ipc::stopsrc_labels as src;
 use std::os::seraph::MemoryPressure;
+use svctest_fixtures::Fixture;
 
+use super::fixtures;
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
-/// The recipe that starts the `memhog` fixture, when it is staged for this
-/// boot.
-pub const MEMHOG_RECIPE: &str = "/config/svcmgr/services/memhog.svc";
-
-/// oomd's recipe, when the image starts oomd.
-const OOMD_RECIPE: &str = "/config/svcmgr/services/oomd.svc";
+/// oomd's recipe, of the default service set, which svctest requires staged
+/// ([`super::fixtures`]).
+pub(super) const OOMD_RECIPE: &str = "/config/svcmgr/services/oomd.svc";
 
 /// crashd's recipe, when the image starts crashd.
 const CRASHD_RECIPE: &str = "/config/svcmgr/services/crashd.svc";
@@ -106,11 +106,11 @@ pub fn phases() -> &'static [Phase]
     }]
 }
 
-/// What oomd's recipe sets, as oomd reads it (`oomd_policy`); `None` when
-/// the image does not start oomd.
-fn oomd_config(phase: &str) -> Option<oomd_policy::Config>
+/// What oomd's recipe sets, as oomd reads it (`oomd_policy`).
+fn oomd_config(phase: &str) -> oomd_policy::Config
 {
-    let recipe = recipe_text(OOMD_RECIPE, phase)?;
+    let recipe = recipe_text(OOMD_RECIPE, phase)
+        .unwrap_or_else(|| panic!("{phase}: {OOMD_RECIPE} is not staged"));
     let grace = oomd_policy::parse_ms(
         env_value(&recipe, "OOMD_GRACE_MS"),
         oomd_policy::GRACE_DEFAULT_MS,
@@ -119,11 +119,11 @@ fn oomd_config(phase: &str) -> Option<oomd_policy::Config>
         env_value(&recipe, "OOMD_COOLDOWN_MS"),
         oomd_policy::COOLDOWN_DEFAULT_MS,
     );
-    Some(oomd_policy::Config {
+    oomd_policy::Config {
         grace_ms: grace.value,
         cooldown_ms: cooldown.value,
         mode: oomd_policy::parse_stop(env_value(&recipe, "OOMD_STOP")).value,
-    })
+    }
 }
 
 /// crashd's stall, when crashd runs and holds a fault declined for want of
@@ -166,9 +166,10 @@ fn env_value<'a>(recipe: &'a str, key: &str) -> Option<&'a str>
 }
 
 /// The out-of-memory policy, with the `memhog` fixture staged; the phase
-/// passes without it, which leaves no service oomd may stop.
+/// skips when the staged set does not declare it, which leaves no service
+/// oomd may stop.
 ///
-/// With oomd's recipe staged and `OOMD_STOP` not `no` (the stop case): the
+/// With oomd's `OOMD_STOP` not `no` (the stop case): the
 /// fixture fills the pool up to the reserve; the level falls back to
 /// `NORMAL`; the fixture's next instance answers with a new nonce and no
 /// pages held; and oomd's log holds one new line for the stop, after the
@@ -176,23 +177,23 @@ fn env_value<'a>(recipe: &'a str, key: &str) -> Option<&'a str>
 /// staged, the phase first has that stop source exit, so the instance svcmgr
 /// restarts started after oomd, and start a job of [`JOB_PAGES`]: oomd stops
 /// the job at its first act, before memhog at a later one, and the fixture
-/// reports the job stopped. With sessiond staged, the phase opens an
-/// operator session whose shell runs `crashme oom-hold` [`HOLD_PAGES`]:
+/// reports the job stopped. The phase opens an operator session whose shell
+/// runs `crashme oom-hold` [`HOLD_PAGES`]:
 /// oomd stops that job first, as the largest of the program class, then
 /// `stopsrc`'s, then the sessions, then the fixture, and the session's relay
 /// gives its leader's end. With crashd holding faults, a child
 /// (`/programs/crashme oom-touch` [`TOUCH_PAGES`]) writes the pages of a
 /// demand region in turn while the pool is full, once sessiond lists no
-/// candidate when it is staged, so that only memhog's stop is left: crashd
-/// holds the write memmgr declines, and resumes it once the stop frees
-/// memory, so crashd logs one more held and one more resumed fault and the
-/// child exits 0. crashd's stall must outlast the acts left from the write to
-/// memhog's stop ([`hold_span_ms`]).
+/// candidate, so that only memhog's stop is left: crashd holds the write
+/// memmgr declines, and resumes it once the stop frees memory, so crashd logs
+/// one more held and one more resumed fault and the child exits 0. crashd's
+/// stall must outlast the act left from the write to memhog's stop, one
+/// cooldown.
 ///
-/// With `OOMD_STOP=no`, or no oomd (the no-stop case): the level stays
-/// `CRITICAL` past oomd's grace and cooldown with the same instance of the
-/// fixture running and no stop line logged, and, with oomd, at least one line
-/// naming a candidate it would stop; svctest then stops the fixture itself,
+/// With `OOMD_STOP=no` (the no-stop case): the level stays `CRITICAL` past
+/// oomd's grace and cooldown with the same instance of the fixture running and
+/// no stop line logged, and at least one line naming a candidate it would
+/// stop; svctest then stops the fixture itself,
 /// through its stop authority, by the key svcmgr listed it under before the
 /// fill, and the level falls back to `NORMAL`.
 ///
@@ -201,9 +202,9 @@ fn env_value<'a>(recipe: &'a str, key: &str) -> Option<&'a str>
 fn oom_policy_phase(caps: &Caps)
 {
     let phase = "oom_policy";
-    if !super::svcmgr::recipe_staged(MEMHOG_RECIPE, phase)
+    if !fixtures::staged(Fixture::Memhog)
     {
-        std::os::seraph::log!("oom phase passed (memhog.svc not staged)");
+        fixtures::skip(phase, Fixture::Memhog);
         return;
     }
     let config = oomd_config(phase);
@@ -216,13 +217,13 @@ fn oom_policy_phase(caps: &Caps)
     );
     let before = Lines::read(caps.logd_query);
 
-    match config
+    if config.mode == oomd_policy::Mode::Stop
     {
-        Some(config) if config.mode == oomd_policy::Mode::Stop =>
-        {
-            stop_case(caps, fixture, config, before, phase);
-        }
-        _ => no_stop_case(caps, fixture, config, first, before, phase),
+        stop_case(caps, fixture, config, before, phase);
+    }
+    else
+    {
+        no_stop_case(caps, fixture, config, first, before, phase);
     }
 
     let (next, pages) = probe(fixture, phase, "PROBE after the stop");
@@ -237,11 +238,12 @@ fn oom_policy_phase(caps: &Caps)
 /// The stop case of [`oom_policy_phase`].
 fn stop_case(caps: &Caps, fixture: u64, config: oomd_policy::Config, before: Lines, phase: &str)
 {
-    let job = super::svcmgr::recipe_staged(super::svcmgr::STOPSRC_RECIPE, phase)
-        .then(|| Job::start(phase));
-    let session = super::sessiond::staged(caps, phase).then(|| Held::start(caps, phase));
+    let job = fixtures::staged(Fixture::Stopsrc).then(|| Job::start(phase));
+    let session = Held::start(caps, phase);
     let mut toucher = crashd_stall(phase).map(|stall_ms| {
-        let span_ms = hold_span_ms(config, job.as_ref(), session.as_ref());
+        // The write follows the stop of the last program, the session's,
+        // so oomd stops memhog one cooldown after it.
+        let span_ms = config.cooldown_ms;
         assert!(
             stall_ms > span_ms,
             "{phase}: crashd's {stall_ms} ms stall does not outlast the {span_ms} ms oomd takes \
@@ -251,15 +253,12 @@ fn stop_case(caps: &Caps, fixture: u64, config: oomd_policy::Config, before: Lin
     });
     touch_stack();
     let pages = hog_call(fixture, phase);
-    if let Some(session) = &session
-    {
-        // crashd holds the toucher's fault for its stall alone, so the write
-        // waits for oomd to have stopped every program, which leaves only
-        // the fixture's stop before memory is freed. The last stop's pages
-        // lie free until memhog's next top-up; the toucher's writes spend
-        // them (`TOUCH_PAGES`).
-        session.await_no_candidate(phase);
-    }
+    // crashd holds the toucher's fault for its stall alone, so the write
+    // waits for oomd to have stopped every program, which leaves only the
+    // fixture's stop before memory is freed. The last stop's pages lie free
+    // until memhog's next top-up; the toucher's writes spend them
+    // (`TOUCH_PAGES`).
+    session.await_no_candidate(phase);
     if let Some(toucher) = &mut toucher
     {
         toucher
@@ -276,13 +275,13 @@ fn stop_case(caps: &Caps, fixture: u64, config: oomd_policy::Config, before: Lin
         now.stops > before.stops
             && (held_ms.is_none() || now.resumed > before.resumed)
             && (job.is_none() || now.job_stops > before.job_stops)
-            && (session.is_none() || now.hold_stops > before.hold_stops)
+            && now.hold_stops > before.hold_stops
     });
     if let Some(job) = &job
     {
         job.finish(&before, &after, phase);
     }
-    let sessions = session.map(|session| session.finish(&before, &after, job.as_ref(), phase));
+    let sessions = session.finish(&before, &after, job.as_ref(), phase);
     let stops = after.stops.saturating_sub(before.stops);
     assert_eq!(
         stops, 1,
@@ -294,20 +293,16 @@ fn stop_case(caps: &Caps, fixture: u64, config: oomd_policy::Config, before: Lin
         "{phase}: oomd advised in its stop mode"
     );
     let critical_ms = after.last_stop_critical_ms.unwrap_or(0);
-    let job_line = match (sessions, job.is_some())
+    let job_line = if job.is_some()
     {
-        (Some(sessions), true) => format!(
+        format!(
             "; the session's job, stopsrc's job and the sessions ({sessions}) stopped first, in that \
              order"
-        ),
-        (Some(sessions), false) =>
-        {
-            format!(
-                "; the session's job and the sessions ({sessions}) stopped first, in that order"
-            )
-        }
-        (None, true) => String::from("; stopsrc's job stopped first"),
-        (None, false) => String::new(),
+        )
+    }
+    else
+    {
+        format!("; the session's job and the sessions ({sessions}) stopped first, in that order")
     };
     assert!(
         critical_ms >= config.grace_ms,
@@ -338,38 +333,20 @@ fn stop_case(caps: &Caps, fixture: u64, config: oomd_policy::Config, before: Lin
     }
 }
 
-/// How long, at most, oomd takes from the `oom-touch` child's write to its
-/// stop of memhog, which crashd's stall must outlast: with the operator
-/// session open (`session`), the write follows the stop of the last program,
-/// so one cooldown; otherwise the write follows the level's rise, so the grace
-/// and a cooldown for each act before memhog's, the stop of `stopsrc`'s job
-/// when it runs (`job`).
-fn hold_span_ms(config: oomd_policy::Config, job: Option<&Job>, session: Option<&Held>) -> u64
-{
-    match (session, job)
-    {
-        (Some(_), _) => config.cooldown_ms,
-        (None, Some(_)) => config.grace_ms.saturating_add(config.cooldown_ms),
-        (None, None) => config.grace_ms,
-    }
-}
-
 /// The no-stop case of [`oom_policy_phase`]: oomd advises (`config` with
-/// `OOMD_STOP=no`) or is absent (`None`).
+/// `OOMD_STOP=no`).
 fn no_stop_case(
     caps: &Caps,
     fixture: u64,
-    config: Option<oomd_policy::Config>,
+    config: oomd_policy::Config,
     first: u64,
     before: Lines,
     phase: &str,
 )
 {
     let watch_ms = config
-        .map_or(
-            oomd_policy::GRACE_DEFAULT_MS + oomd_policy::COOLDOWN_DEFAULT_MS,
-            |c| c.grace_ms.saturating_add(c.cooldown_ms),
-        )
+        .grace_ms
+        .saturating_add(config.cooldown_ms)
         .saturating_add(NO_STOP_MARGIN_MS);
     let stop_cap = caps.stop_authority;
     assert_ne!(
@@ -407,25 +384,15 @@ fn no_stop_case(
         ipc::stop_labels::SUCCESS,
         "{phase}: STOP_CANDIDATE(memhog) replied {label:#x}"
     );
-    let after = Lines::await_where(before.query, |now| {
-        config.is_none() || now.advice > before.advice
-    });
+    let after = Lines::await_where(before.query, |now| now.advice > before.advice);
     assert_eq!(
         after.stops, before.stops,
         "{phase}: oomd stopped memhog with no stop allowed"
     );
     let advice = after.advice.saturating_sub(before.advice);
-    let shown = if config.is_some()
-    {
-        assert!(advice >= 1, "{phase}: oomd named nothing it would stop");
-        "OOMD_STOP=no"
-    }
-    else
-    {
-        "oomd.svc not staged"
-    };
+    assert!(advice >= 1, "{phase}: oomd named nothing it would stop");
     std::os::seraph::log!(
-        "oom phase passed ({shown}: memhog held {pages} pages for {watch_ms} ms unstopped, oomd \
+        "oom phase passed (OOMD_STOP=no: memhog held {pages} pages for {watch_ms} ms unstopped, oomd \
          advised {advice} times; stopped by svctest)"
     );
 }
@@ -448,12 +415,13 @@ fn probe(fixture: u64, phase: &str, what: &str) -> (u64, u64)
 }
 
 /// Hold the level at `CRITICAL` for `phase`, through the `memhog` fixture,
-/// which must be staged ([`MEMHOG_RECIPE`]): wait for `NORMAL`, have the
-/// fixture fill the pool down to the growth floor, run `during` once the level
-/// reads `CRITICAL`, and wait for the level to fall back to `NORMAL`. oomd's
-/// stop of the fixture ends the window when oomd's recipe is staged in its stop
-/// mode, at least its grace after the fill; otherwise svctest stops the fixture
-/// itself, through its stop authority, `hold` after the fill. The fixture's
+/// which the staged set must declare ([`super::fixtures`]): wait for
+/// `NORMAL`, have the fixture fill the pool down to the growth floor, run
+/// `during` once the level reads `CRITICAL`, and wait for the level to fall
+/// back to `NORMAL`. oomd's stop of the fixture ends the window when oomd's
+/// recipe sets its stop mode, at least its grace after the fill; otherwise
+/// svctest stops the fixture itself, through its stop authority, `hold` after
+/// the fill. The fixture's
 /// next instance must then answer with a new nonce and no pages.
 ///
 /// From the fill to the fixture's stop the fixture holds the pool at the growth
@@ -466,7 +434,7 @@ fn probe(fixture: u64, phase: &str, what: &str) -> (u64, u64)
 /// the fill.
 pub(super) fn critical_window(caps: &Caps, phase: &str, hold: Duration, during: impl FnOnce())
 {
-    let stops = oomd_config(phase).is_some_and(|config| config.mode == oomd_policy::Mode::Stop);
+    let stops = oomd_config(phase).mode == oomd_policy::Mode::Stop;
     await_level(MemoryPressure::Normal, phase, "before the fill");
     let fixture = super::svcmgr::provided_endpoint(hog::NAME, phase);
     let (first, idle) = probe(fixture, phase, "PROBE before the fill");

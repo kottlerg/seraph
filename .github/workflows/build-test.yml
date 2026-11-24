@@ -228,7 +228,11 @@ jobs:
       - name: Stage ${{ matrix.tester }} and repack disk
         # Recipe staging: svctest and usertest live in
         # `sysroot/config/svcmgr/tests/` (svcmgr does not scan that
-        # directory); cp into services/ to enable. `cargo xtask mkdisk`
+        # directory). usertest is cp'd into services/ to enable it; svctest is
+        # staged by `cargo xtask mkdisk --svctest ci`, which co-stages the
+        # `ci` fixture set below and records the set in svctest's staged
+        # recipe, and svctest fails a boot whose image stages other fixtures
+        # than the record declares (docs/testing.md § Gating). `cargo xtask mkdisk`
         # re-mirrors rootfs and repacks the FAT image without invoking
         # cargo. ktest swaps the bundle's `init` entry via
         # `cargo xtask mkdisk --harness ktest`, which repacks the disk
@@ -236,7 +240,7 @@ jobs:
         # writes (fsck.fat -n on every FAT volume, then the ESP against the
         # root partition; xtask/README.md § The image check).
         #
-        # The svctest cell also co-stages crasher (the restart-path
+        # The svctest cell's `ci` set co-stages crasher (the restart-path
         # fixture), its worker-fault recipe (crasher-worker.svc) and its
         # boot-fault recipe (crasher-boot.svc, whose first launch dies before
         # its bootstrap request on the token the data partition ships):
@@ -275,27 +279,17 @@ jobs:
         # crashd's test recipe over the default one, so crashd also writes a
         # core of each crashme death to /crash, which the crashme tester checks.
         #
-        # The svctest cell also stages the test-only device class files of
+        # `mkdisk --svctest` also stages the test-only device class files of
         # `sysroot/config/devmgr/tests/` (svcmgr does not scan that directory)
-        # into `classes/`, and its boot attaches the test devices
+        # into `classes/`, and the svctest cell's boot attaches the test devices
         # (`--test-devices`, below) the test-only drivers bind.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
-              cp sysroot/config/svcmgr/tests/svctest.svc \
-                 sysroot/config/svcmgr/services/
-              cp sysroot/config/devmgr/tests/*.class \
-                 sysroot/config/devmgr/classes/
-              cp sysroot/config/svcmgr/tests/crasher.svc \
-                 sysroot/config/svcmgr/tests/crasher-worker.svc \
-                 sysroot/config/svcmgr/tests/crasher-boot.svc \
-                 sysroot/config/svcmgr/tests/memhog.svc \
-                 sysroot/config/svcmgr/tests/reserve-creator.svc \
-                 sysroot/config/svcmgr/tests/stopsrc.svc \
-                 sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
               rm -f sysroot/config/svcmgr/services/crashd.svc
-              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
+              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
+                --svctest ci
               ;;
             usertest)
               cp sysroot/config/svcmgr/tests/usertest.svc \

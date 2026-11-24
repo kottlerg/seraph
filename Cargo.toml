@@ -15,6 +15,7 @@ members = [
     "services/svcmgr/svc-defs",
     "services/svcmgr/endowment",
     "services/svctest",
+    "services/svctest/fixtures",
     "services/usertest",
     "services/crasher",
     "services/crashd",

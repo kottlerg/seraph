@@ -132,9 +132,9 @@ const RESERVE_HOLD: Duration = Duration::from_secs(5);
 pub fn logd_reserve_phase(caps: &Caps)
 {
     let phase = "logd_reserve";
-    if !super::svcmgr::recipe_staged(super::oom::MEMHOG_RECIPE, phase)
+    if !super::fixtures::staged(svctest_fixtures::Fixture::Memhog)
     {
-        std::os::seraph::log!("logd_reserve phase passed (memhog.svc not staged)");
+        super::fixtures::skip(phase, svctest_fixtures::Fixture::Memhog);
         return;
     }
     let authority = caps.debug_authority;

@@ -9,6 +9,9 @@
 
 use std::os::seraph::startup_info;
 
+use svctest_fixtures::Fixture;
+
+use super::fixtures;
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -59,10 +62,6 @@ pub fn phases() -> &'static [Phase]
 /// milliseconds: svcmgr may launch the fixture after svctest.
 const FIXTURE_PUBLISH_WAIT_MS: u64 = 10_000;
 
-/// The recipe that starts the fixture [`svcmgr_worker_fault_restart_phase`]
-/// drives, when it is staged for this boot.
-const WORKER_FAULT_RECIPE: &str = "/config/svcmgr/services/crasher-worker.svc";
-
 /// End to end: a terminal fault of a thread other than the main thread of a
 /// supervised service reaches svcmgr, which restarts the service under its
 /// `restart = on-failure` policy. The `crasher` fixture's `worker-fault`
@@ -76,19 +75,17 @@ const WORKER_FAULT_RECIPE: &str = "/config/svcmgr/services/crasher-worker.svc";
 /// no instance would receive again and the call would block until the run's
 /// timeout.
 ///
-/// The phase runs when the fixture's recipe is staged in
-/// `/config/svcmgr/services/` and is skipped otherwise; once staged, the name
-/// must be published within [`FIXTURE_PUBLISH_WAIT_MS`].
+/// The phase runs when the staged fixture set declares the fixture
+/// ([`super::fixtures`]) and is skipped otherwise; once staged, the name must
+/// be published within [`FIXTURE_PUBLISH_WAIT_MS`].
 fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
 {
     use ipc::restart_probe_labels as probe;
 
     let phase = "svcmgr_worker_fault_restart";
-    if !worker_fixture_staged(phase)
+    if !fixtures::staged(Fixture::CrasherWorker)
     {
-        std::os::seraph::log!(
-            "svcmgr_worker_fault_restart phase skipped: crasher-worker.svc not staged"
-        );
+        fixtures::skip(phase, Fixture::CrasherWorker);
         return;
     }
     let (_, ipc_buf) = registry_cap_and_buf(phase);
@@ -114,10 +111,6 @@ fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
     let _ = syscall::cap_delete(fixture);
     std::os::seraph::log!("svcmgr worker-fault-restart phase passed (restarted instance answered)");
 }
-
-/// The recipe that starts the fixture [`svcmgr_boot_death_phase`] drives,
-/// when it is staged for this boot.
-const BOOT_FAULT_RECIPE: &str = "/config/svcmgr/services/crasher-boot.svc";
 
 /// The boot-fault fixture's token, which an instance that finds it removes
 /// before it dies (`services/crasher/src/main.rs` `BOOT_FAULT_TOKEN`, there
@@ -147,16 +140,16 @@ const BOOT_FAULT_NAME: &[u8] = b"crasher.boot";
 /// budget. The phase writes the token again at its end, so a later boot of the
 /// same image takes the first-launch case again.
 ///
-/// The phase runs when the fixture's recipe is staged in
-/// `/config/svcmgr/services/` and is skipped otherwise.
+/// The phase runs when the staged fixture set declares the fixture
+/// ([`super::fixtures`]) and is skipped otherwise.
 fn svcmgr_boot_death_phase(_caps: &Caps)
 {
     use ipc::restart_probe_labels as probe;
 
     let phase = "svcmgr_boot_death";
-    if !recipe_staged(BOOT_FAULT_RECIPE, phase)
+    if !fixtures::staged(Fixture::CrasherBoot)
     {
-        std::os::seraph::log!("svcmgr_boot_death phase skipped: crasher-boot.svc not staged");
+        fixtures::skip(phase, Fixture::CrasherBoot);
         return;
     }
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -202,15 +195,7 @@ fn svcmgr_boot_death_phase(_caps: &Caps)
     );
 }
 
-/// Whether the worker-fault fixture's recipe is staged in
-/// `/config/svcmgr/services/`; a stat error other than "not found" fails
-/// `phase`.
-pub(super) fn worker_fixture_staged(phase: &str) -> bool
-{
-    recipe_staged(WORKER_FAULT_RECIPE, phase)
-}
-
-/// Whether the recipe (or any file) at `path` is there; a stat error other
+/// Whether the file at `path` is there; a stat error other
 /// than "not found" fails `phase`.
 pub(super) fn recipe_staged(path: &str, phase: &str) -> bool
 {
@@ -291,12 +276,8 @@ pub(super) struct Listed
     pub(super) pages: u64,
 }
 
-/// The recipe that starts the stop-source fixture, when it is staged for this
-/// boot.
-pub(super) const STOPSRC_RECIPE: &str = "/config/svcmgr/services/stopsrc.svc";
-
-/// sessiond's recipe, a stop source (`stop_source = program`); present in
-/// every image that stages the operator session's service.
+/// sessiond's recipe, a stop source (`stop_source = program`) of the default
+/// service set, which svctest requires staged ([`super::fixtures`]).
 pub(super) const SESSIOND_RECIPE: &str = "/config/svcmgr/services/sessiond.svc";
 
 /// The name procmgr lists `stopsrc`'s job under: the first word of its argv,
@@ -464,9 +445,9 @@ fn service_key(slot: u64, instance: u64) -> u64
 }
 
 /// The stop sources of [`svcmgr_stop_service_phase`]: `LIST_STOP_SOURCES`
-/// through svcmgr's stop authority `stop_cap` lists `sessiond` and
-/// `stopsrc`, each with the program class, each when its recipe is staged,
-/// and nothing else; the SEND each carries reaches the source's stop labels,
+/// through svcmgr's stop authority `stop_cap` lists `sessiond`, and `stopsrc`
+/// when the staged set declares it, each with the program class, and nothing
+/// else; the SEND each carries reaches the source's stop labels,
 /// and the fixture's own `:deny` SEND does not.
 fn check_stop_sources(stop_cap: u64, phase: &str)
 {
@@ -474,14 +455,11 @@ fn check_stop_sources(stop_cap: u64, phase: &str)
         CLASS_PROGRAM, LIST_CANDIDATES, NO_CANDIDATE, STOP_CANDIDATE, SUCCESS, UNAUTHORIZED,
     };
     let sources = list_stop_sources(stop_cap, phase);
-    let stopsrc = recipe_staged(STOPSRC_RECIPE, phase);
+    let stopsrc = fixtures::staged(Fixture::Stopsrc);
     let mut shown: Vec<(&str, u64)> = sources.iter().map(|(n, c, _)| (n.as_str(), *c)).collect();
     shown.sort_unstable();
     let mut want: Vec<(&str, u64)> = Vec::with_capacity(2);
-    if recipe_staged(SESSIOND_RECIPE, phase)
-    {
-        want.push(("sessiond", CLASS_PROGRAM));
-    }
+    want.push(("sessiond", CLASS_PROGRAM));
     if stopsrc
     {
         want.push(("stopsrc", CLASS_PROGRAM));
@@ -602,8 +580,8 @@ fn check_source_contained(authority: u64, phase: &str)
 /// timed, no `oom_stop`), and past the table, none. The rule's every row is host-tested
 /// in `svcmgr-defs` (`svcmgr_defs::stop`).
 ///
-/// `LIST_STOP_SOURCES` lists `sessiond` and the `stopsrc` fixture, each with
-/// the program class and each when its recipe is staged, and nothing else
+/// `LIST_STOP_SOURCES` lists `sessiond`, and the `stopsrc` fixture when the
+/// staged set declares it, each with the program class, and nothing else
 /// ([`check_stop_sources`]). The SEND each entry carries reaches that
 /// source's stop labels: its list replies `SUCCESS`, and a stop of a key it
 /// never gave replies `NO_CANDIDATE`. The fixture's SEND reaches its own
@@ -647,13 +625,13 @@ fn svcmgr_stop_service_phase(caps: &Caps)
         );
     }
 
-    let staged = worker_fixture_staged(phase);
+    let staged = fixtures::staged(Fixture::CrasherWorker);
     let mut expected: Vec<&str> = Vec::new();
     if staged
     {
         expected.push("crasher-worker");
     }
-    if recipe_staged(super::oom::MEMHOG_RECIPE, phase)
+    if fixtures::staged(Fixture::Memhog)
     {
         expected.push("memhog");
     }
@@ -677,15 +655,14 @@ fn svcmgr_stop_service_phase(caps: &Caps)
     }
 
     check_stop_sources(stop_cap, phase);
-    if recipe_staged(STOPSRC_RECIPE, phase)
+    if fixtures::staged(Fixture::Stopsrc)
     {
         check_source_contained(caps.debug_authority, phase);
     }
     if !staged
     {
-        std::os::seraph::log!(
-            "svcmgr stop-service phase passed (gates and refusals; crasher-worker.svc not staged)"
-        );
+        std::os::seraph::log!("svcmgr stop-service gates and refusals passed");
+        fixtures::skip(phase, Fixture::CrasherWorker);
         return;
     }
 

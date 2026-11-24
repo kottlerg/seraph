@@ -622,8 +622,11 @@ const STAY_HEADROOM_PAGES: u64 = 4096;
 // Child stack of the observer.
 static mut OBSERVER_STACK: ChildStack = ChildStack::ZERO;
 
-/// Set by the case while its delete of the pool runs.
-static IN_KERNEL: AtomicBool = AtomicBool::new(false);
+/// Set by the case just before its delete of the pool, and cleared only at
+/// the start of an attempt: an observer that runs late still makes its poll,
+/// and the poll's reading of the kernel's elapsed time decides whether it
+/// counts.
+static DELETE_ENTERED: AtomicBool = AtomicBool::new(false);
 
 /// Observer state: started, finished, the kernel's elapsed microseconds read
 /// just after its poll, and the entry the poll received (`NO_ENTRY` for none).
@@ -639,15 +642,15 @@ static OBSERVER_WINDOW: AtomicU64 = AtomicU64::new(0);
 /// [`OBSERVER_TAG`] when the observer received nothing.
 const NO_ENTRY: u64 = u64::MAX;
 
-/// Wait in user mode, with no syscall, until the case's CPU enters the kernel
-/// for its long delete, spin for the window, then poll `queue` once and record
+/// Wait in user mode, with no syscall, until the case's CPU has entered the
+/// kernel for its long delete, spin for the window, then poll `queue` once and record
 /// the entry and the kernel's elapsed time after the poll; then exit.
 extern "C" fn stay_observer_entry(queue: u64) -> !
 {
     clear_return_work();
     OBSERVER_READY.store(true, Ordering::Release);
     let mut stopped = false;
-    while !IN_KERNEL.load(Ordering::Acquire)
+    while !DELETE_ENTERED.load(Ordering::Acquire)
     {
         if SPIN_STOP.load(Ordering::Acquire)
         {
@@ -787,7 +790,7 @@ fn stay_attempt(
         core::array::from_fn(|_| None);
     SPIN_STOP.store(false, Ordering::Release);
     SPIN_READY.store(0, Ordering::Release);
-    IN_KERNEL.store(false, Ordering::Release);
+    DELETE_ENTERED.store(false, Ordering::Release);
     OBSERVER_READY.store(false, Ordering::Release);
     OBSERVER_DONE.store(false, Ordering::Release);
     OBSERVER_POLLED_US.store(u64::MAX, Ordering::Relaxed);
@@ -875,9 +878,8 @@ fn stay_window(
     cap_delete(copy).map_err(|_| "stay: delete failed")?;
     // No syscall before the pool's delete: its return would drain the
     // leftovers on this CPU.
-    IN_KERNEL.store(true, Ordering::Release);
+    DELETE_ENTERED.store(true, Ordering::Release);
     let deleted = cap_delete(pool_cap);
-    IN_KERNEL.store(false, Ordering::Release);
     let returned_us = system_info(SystemInfoType::ElapsedUs as u64)
         .map_err(|_| "stay: system_info(ElapsedUs) failed");
     deleted.map_err(|_| "stay: pool delete failed")?;

@@ -39,7 +39,7 @@ jobs:
       matrix:
         arch: [x86_64, riscv64]
         profile: [debug, release]
-        # One harness per cell, matching build-test.yml: each cell builds
+        # One harness per cell, as in build-test.yml: each cell builds
         # once, stages exactly one recipe (or swaps boot.conf for ktest),
         # then burns it in. Avoids back-to-back fatfs/sysroot state
         # accumulation across harnesses and lets a failing tier surface as

@@ -159,7 +159,7 @@ mod tests
     #[test]
     fn names_round_trip_through_classify()
     {
-        let (core, partial) = names(42, b"/programs/crash me!");
+        let (core, partial) = names(42, b"/services/crash me!");
         assert_eq!(core, "0000000042-crash_me_.core");
         assert_eq!(classify(&core), Some(Entry::Core(42)));
         assert_eq!(classify(&partial), Some(Entry::Partial(42)));

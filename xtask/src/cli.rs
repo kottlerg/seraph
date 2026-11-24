@@ -160,9 +160,10 @@ subcommands! {
         /// log-level configuration among them, are installed either way; pack
         /// another configuration with `--log-levels`). Every pack re-signs
         /// the sysroot's signed objects in place, then checks the images it
-        /// wrote with `fsck.fat -n` (dosfstools) and reads their ESP back
-        /// against the root partition. Requires an arch-tagged sysroot from a
-        /// prior `cargo xtask build`.
+        /// wrote with `fsck.fat -n` (dosfstools) and reads them back: the
+        /// partitions against the kind of image the staging asks for, the
+        /// ESP against the installed files. Requires an arch-tagged sysroot
+        /// from a prior `cargo xtask build`.
         Mkdisk(MkdiskArgs),
 
         /// Write a trust request: roots to enrol and key ids to revoke in the

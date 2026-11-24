@@ -35,7 +35,7 @@ each object on it is its installed file byte for byte, and the composition copie
 nothing and reads no key; the bundle's entries are chosen by a list per harness in configuration
 (`/config/bundle/`), and every entry other than `init` is named by its install path; every pack
 checks, once it has composed the ESP, that each object on it equals its installed file, and
-the pack then checks the same of the image it wrote, its ESP against its root partition
+the pack then checks the same of the image it wrote, its ESP against the installed files
 (§ The ESP); the
 bootloader refuses an entry without the boot-module role, or, under `/config/` (a platform table
 excepted), without the configuration role, and a bundle without the boot-time policy
@@ -91,8 +91,9 @@ one whose object is missing, differs from its installed file or copies one that 
 whose bundle holds an entry its list does not name or lacks one it names, or that holds any other
 file than an empty presence-only knob in `\EFI\seraph\` or a trust request at
 `\EFI\seraph\trust-request`. Once it has written the disk image, the
-pack makes the same check of the image, its ESP against the installed files of its root
-partition, read back by xtask's FAT reader, after `fsck.fat -n` has checked every FAT volume of
+pack makes the same check of the image, its ESP against the installed files (those of its root
+partition, or the sysroot's for the kernel layer's image, whose root and data partitions hold no
+file), read back by xtask's FAT reader, after `fsck.fat -n` has checked every FAT volume of
 it, so a pack that wrote one side alone, or wrote a volume an independent reader refuses, fails
 ([xtask/README.md](../xtask/README.md#the-image-check) § The image check).
 

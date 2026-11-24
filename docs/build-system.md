@@ -464,9 +464,10 @@ uses the partition.) The split mirrors real deployments: anything the
 firmware must reach lives on the ESP; everything else lives on the root
 partition, except the discoverable `/data` mountpoint.
 
-The ESP is derived from the root partition ([boot-media.md](boot-media.md)): every object on it,
-the bootloader and the kernel included, is a byte copy of a file installed on the root partition,
-and composing it copies files, signs nothing and reads no key. Every pack composes it as its last
+The ESP is derived from the installed files ([boot-media.md](boot-media.md)): every object on it,
+the bootloader and the kernel included, is a byte copy of a file installed in the sysroot (on the
+root partition, except for the kernel layer's image, which holds none), and composing it copies
+files, signs nothing and reads no key. Every pack composes it as its last
 step before it writes the images, and refuses it unless every object on it equals its installed
 file, so the ESP of every image equals the installed files. The
 bundle's entries are the installed files that the recorded harness's bundle list names

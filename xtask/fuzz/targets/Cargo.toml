@@ -11,6 +11,7 @@
 # one line; a root key, so it comes before the first table.
 bin = [
     { name = "boot-protocol", path = "src/bin/boot-protocol.rs", test = false },
+    { name = "elf", path = "src/bin/elf.rs", test = false },
     { name = "gpt", path = "src/bin/gpt.rs", test = false },
     { name = "hwrng-protocol", path = "src/bin/hwrng-protocol.rs", test = false },
     { name = "init-protocol", path = "src/bin/init-protocol.rs", test = false },
@@ -29,6 +30,7 @@ autobins = false
 
 [dependencies]
 boot-protocol = { path = "../../../abi/boot-protocol" }
+elf = { path = "../../../shared/elf" }
 fuzz-engine = { path = "../engine" }
 hwrng-protocol = { path = "../../../shared/hwrng-protocol" }
 init-protocol = { path = "../../../abi/init-protocol" }

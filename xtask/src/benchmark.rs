@@ -188,7 +188,7 @@ pub fn parse_run(text: &str) -> Result<RunLog>
 /// The benchmark a `FAIL` line names, if `line` is one: ktest's
 /// `ktest: bench <name> FAIL (...)`, or a userspace suite's
 /// `[<suite>] bench <name> FAIL (...)`, the form a program's log line takes
-/// (programs/ubench/README.md § Output).
+/// (services/ubench/README.md § Output).
 fn failed_bench(line: &str) -> Option<&str>
 {
     let (_, rest) = line

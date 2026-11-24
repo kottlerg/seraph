@@ -319,10 +319,24 @@ loader reached only through such an image is a defect, not an attack.
   bootloader located (refusing a record of another type, or a table over 4 MiB) at a randomized bias
   (`pie_rebase_init_image` in `core/kernel/src/main.rs`, `core/kernel/src/mm/init_reloc.rs`).
 
-**Fuzz targets and proof harnesses.** None on `master`. Planned: property functions, fuzz targets
-and proof harnesses for `validate`, `validate_executable`, `parse_stack_note`, `decode_rela` and
-`validate_relative_relocs` ([#680](https://github.com/kottlerg/seraph/issues/680),
-[#756](https://github.com/kottlerg/seraph/issues/756)).
+**Fuzz targets and proof harnesses.**
+
+- `elf` (`xtask/fuzz/targets/src/bin/elf.rs`) drives `elf::property::elf_holds` over an image and
+  over a raw relocation table, from the seeds in `shared/elf/fuzz/elf/seeds/`: the header checks,
+  `load_segments`, `tls_segment`, `load_span`, `relro_span`, `rela_table`, the relocation
+  decode, validation and application, `find_note`, `parse_stack_note` and `find_note_streaming`.
+  CI's gating `fuzz` job runs it on a pull request whose change can affect it and the campaign for
+  30 minutes.
+- The `proofs` module of `shared/elf/src/lib.rs` proves the same property by induction over
+  each walk ([testing.md](testing.md) § Bounded verification); CI's `kani` job runs them. A step
+  proof runs each walk's step on any element and any state (a program header, a dynamic entry and
+  any gathered tags, a relocation record, a note record at any offset, a section header), and a
+  base proof runs each walk whole on a short table at a fixed place: two program headers at
+  offset 64, two dynamic entries after them, two relocation records, 48 bytes of note records, and
+  two section headers at offset 64 for a short section name and owner, which the name-compare and
+  note-step proofs stand behind for the stack note's. The program-header, section-header and
+  file-range reads are proven at any place. The loops that drive the steps are left to the fuzz
+  target.
 
 **Gaps.**
 
@@ -332,8 +346,8 @@ and proof harnesses for `validate`, `validate_executable`, `parse_stack_note`, `
   `elf::validate_executable`, `elf::find_note_streaming` and the declaration decoder with bytes no
   key signed. procmgr still refuses to run such a file
   ([#1533](https://github.com/kottlerg/seraph/issues/1533)).
-- No fuzz target or proof harness covers `shared/elf` yet. Those for `find_note_streaming` and the
-  declaration decoder are planned ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
+- No fuzz target or proof harness covers the declaration decoder yet; they are planned
+  ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---
 

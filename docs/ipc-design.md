@@ -337,7 +337,7 @@ The kernel does not provide:
 [core/ktest/README.md](../core/ktest/README.md),
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),
 [Fault Handling](fault-handling.md), [Threat Model](threat-model.md),
-[programs/capexhaust/README.md](../programs/capexhaust/README.md),
+[services/fixtures/capexhaust/README.md](../services/fixtures/capexhaust/README.md),
 [logd IPC interface](../services/logd/docs/ipc-interface.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
 [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md),

@@ -109,30 +109,30 @@ const CLASS: &str = "test-dma.class";
 const DISK_RECIPE: &str = "hotplug-check-disk.svc";
 
 /// The fixture's line once it watches the `test-dma` class. Kept in sync
-/// with `services/hotplug-check/src/main.rs`.
+/// with `services/fixtures/hotplug-check/src/main.rs`.
 const READY_MARKER: &str = "[hotplug-check] READY for the hot-added device";
 
 /// The fixture's line once the hot-added device passed its probes. Kept in
-/// sync with `services/hotplug-check/src/main.rs`.
+/// sync with `services/fixtures/hotplug-check/src/main.rs`.
 const REMOVE_MARKER: &str = "[hotplug-check] READY for the removal";
 
 /// The fixture's line once devmgr withdrew the removed device's driver. Kept
-/// in sync with `services/hotplug-check/src/main.rs`.
+/// in sync with `services/fixtures/hotplug-check/src/main.rs`.
 const READD_MARKER: &str = "[hotplug-check] WITHDRAWN at ordinal 0; READY for the re-added device";
 
 /// The disk-mode fixture's line once it knows the root mount's driver and
 /// holds a file open under `/data`. Kept in sync with
-/// `services/hotplug-check/src/disk.rs`.
+/// `services/fixtures/hotplug-check/src/disk.rs`.
 const DISK_REMOVE_MARKER: &str =
     "[hotplug-check] HOLDING a file open on /data; READY for the removal of its disk";
 
 /// The disk-mode fixture's line once vfsd tore the removed disk's mount
-/// down. Kept in sync with `services/hotplug-check/src/disk.rs`.
+/// down. Kept in sync with `services/fixtures/hotplug-check/src/disk.rs`.
 const DISK_READD_MARKER: &str =
     "[hotplug-check] TORN DOWN /data, its disk removed; READY for the re-added disk";
 
 /// The disk-mode fixture's line once it mounted `/data` on the re-added
-/// disk. Kept in sync with `services/hotplug-check/src/disk.rs`.
+/// disk. Kept in sync with `services/fixtures/hotplug-check/src/disk.rs`.
 const DISK_TIE_MARKER: &str =
     "[hotplug-check] MOUNTED /data on the re-added disk; READY for a copy of the disk";
 

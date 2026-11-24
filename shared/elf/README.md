@@ -28,6 +28,14 @@ kernel (Phase 9 `RELATIVE` relocation of a PIE init via `mm/init_reloc`, per
 [core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md#phase-9-init-creation-and-scheduler-entry)).
 No stability obligation; internal code reuse only.
 
+The parsers read hostile input, so they carry the parser rule's property and its three drivers
+([docs/testing.md](../../docs/testing.md#fuzzing) § Fuzzing, § Bounded verification). The property,
+`property::elf_holds`, holds every public parser to its documented contract on any input read as an
+image (and as a raw relocation table). Its drivers are the fuzz target `elf`
+(`xtask/fuzz/targets`), which starts from the seeds under `fuzz/elf/seeds/`; the replay of those
+seeds and any `fuzz/elf/regressions/` in the crate's tests; and the Kani proofs in `lib.rs`, whose
+module comment states their bounds and how they compose into the property.
+
 ---
 
 ## Source Layout
@@ -36,9 +44,15 @@ No stability obligation; internal code reuse only.
 shared/elf/
 ├── Cargo.toml                  # Workspace member; no_std library
 ├── README.md
+├── fuzz/
+│   └── elf/
+│       └── seeds/              # Checked-in inputs of the `elf` fuzz target
 └── src/
-    └── lib.rs                  # ELF64 header validation, segment iteration, named and
-                                #   stack notes, TLS and RELRO spans, RELATIVE relocations
+    ├── lib.rs                  # ELF64 header validation, segment iteration, named and
+    │                           #   stack notes, TLS and RELRO spans, RELATIVE relocations;
+    │                           #   the proofs of the property
+    └── property.rs             # The parsers' contract as one property (host tests,
+                                #   proofs and fuzzing only)
 ```
 
 ---

@@ -23,13 +23,9 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | [`sessiond/`](sessiond/README.md) | Operator-session supervisor — creates each session's leader for the interface that opens it, ends the session with its leader, and offers oomd the stop of its programs |
 | [`oomd/`](oomd/README.md) | Out-of-memory policy service — stops a service that opted in to being stopped when memory stays critical |
 | [`swapd/`](swapd/README.md) | Swap service — holds the swap partition and moves memmgr's sealed chunks between it and memmgr, writing chunks out while memory is critical and restoring each on a fault or a debugger's read |
-| [`usertest/`](usertest/README.md) | Programs-surface test orchestrator |
 | [`svctest/`](svctest/README.md) | Services-surface test harness |
-| [`crasher/`](crasher/README.md) | Test-tier fixture: deliberate-crash canary for svcmgr's restart path (gated, opt-in) |
-| [`memhog/`](memhog/README.md) | Test-tier fixture: fills memory until the pressure level reads `CRITICAL`, for oomd to stop (gated, opt-in) |
-| [`stopsrc/`](stopsrc/README.md) | Test-tier fixture: a stop source of the program class, whose one job oomd stops before any service (gated, opt-in) |
-| [`debug-echo/`](debug-echo/README.md) | Test-tier fixture: answers fixed GDB remote serial protocol packets on the debug port (gated, opt-in) |
-| [`hotplug-check/`](hotplug-check/README.md) | Test-tier fixture: checks that devmgr binds a driver to a device hot-added behind a PCI Express root port, and that its DMA and MSI work; its disk mode checks vfsd's handling of a disk removed and added again, and of its root driver's loss (gated, opt-in) |
+| [`ubench/`](ubench/README.md) | Userspace benchmark suite, installed as `/tests/ubench`: IPC, demand faults, the pipe ring, console output, and fsbench |
+| [`fixtures/`](fixtures/README.md) | Test fixtures the harnesses and per-program testers spawn, installed under `/tests/fixtures/` (gated, opt-in) |
 
 ---
 

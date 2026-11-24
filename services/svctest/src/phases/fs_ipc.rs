@@ -269,17 +269,17 @@ pub fn fs_removed_node_id_stays_dead_phase(_: &Caps)
 /// Timed iterations the `fs_crossover_bench` phase asks of `fsbench`, of every
 /// case: enough to drive both read paths and the write path at every size.
 /// The phase proves the paths work; the full benchmark, whose counts the
-/// `bench` cell compares, is ubench's (programs/ubench/README.md).
+/// `bench` cell compares, is ubench's (services/ubench/README.md).
 const FSBENCH_PHASE_ITERS: &str = "8";
 
 pub fn fs_crossover_bench_phase(_: &Caps)
 {
     use std::process::Command;
 
-    let mut child = Command::new("/programs/fsbench")
+    let mut child = Command::new("/tests/fixtures/programs/fsbench")
         .arg(FSBENCH_PHASE_ITERS)
         .spawn()
-        .expect("spawn /programs/fsbench failed");
+        .expect("spawn /tests/fixtures/programs/fsbench failed");
     let status = child.wait().expect("fsbench wait failed");
     assert!(status.success(), "fsbench did not exit cleanly: {status}");
     std::os::seraph::log!("fs_crossover_bench phase passed");

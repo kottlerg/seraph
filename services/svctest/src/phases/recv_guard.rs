@@ -91,12 +91,12 @@ fn recv_wedge_phase(_: &Caps)
 {
     use std::process::Command;
 
-    let mut child = Command::new("/programs/capexhaust")
+    let mut child = Command::new("/tests/fixtures/programs/capexhaust")
         .spawn()
-        .expect("spawn /programs/capexhaust failed");
+        .expect("spawn /tests/fixtures/programs/capexhaust failed");
 
     let id = child.process_handle();
-    std::os::seraph::log!("spawned /programs/capexhaust handle={id:#x}");
+    std::os::seraph::log!("spawned /tests/fixtures/programs/capexhaust handle={id:#x}");
 
     let status = child.wait().expect("capexhaust wait failed");
     std::os::seraph::log!("capexhaust exited: {status}");

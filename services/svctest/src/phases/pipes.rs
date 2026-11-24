@@ -69,12 +69,12 @@ pub fn pipes_phase(_: &Caps)
 
     // ── (2) stdiotest round-trip ──────────────────────────────────────
     {
-        let mut child = Command::new("/programs/stdiotest")
+        let mut child = Command::new("/tests/fixtures/programs/stdiotest")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn /programs/stdiotest (piped) failed");
+            .expect("spawn /tests/fixtures/programs/stdiotest (piped) failed");
 
         // The child blocks on stdin until the write below, so it is alive:
         // a piped `try_wait` must report that without blocking.
@@ -188,13 +188,13 @@ pub fn pipe_fault_eof_phase(_: &Caps)
     use std::process::{Command, Stdio};
     use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
 
-    let mut child = Command::new("/programs/pipefault")
+    let mut child = Command::new("/tests/fixtures/programs/pipefault")
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn /programs/pipefault failed");
+        .expect("spawn /tests/fixtures/programs/pipefault failed");
 
     let id = child.process_handle();
-    std::os::seraph::log!("spawned /programs/pipefault handle={id:#x}");
+    std::os::seraph::log!("spawned /tests/fixtures/programs/pipefault handle={id:#x}");
 
     let mut stdout = child.stdout.take().expect("piped stdout missing");
     let mut bytes = Vec::new();

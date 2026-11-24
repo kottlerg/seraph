@@ -90,7 +90,7 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
         block_size: args.block_size,
         data: if args.split_data
         {
-            disk::DataPlacement::SecondImage
+            disk::DataPlacement::SecondImage(disk::DataDisk::Slot)
         }
         else
         {

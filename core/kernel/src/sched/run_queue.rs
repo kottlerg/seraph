@@ -559,6 +559,13 @@ pub struct PerCpuScheduler
     /// avoid a sched→cap layering edge; the object module owns the cast and the
     /// per-type intrusive link field.
     pub deferred_reclaim_head: AtomicPtr<u8>,
+
+    /// This CPU's `PerCpuData::return_work` word, in which a link that leaves
+    /// a queued thread outranking the running one, and a stale level, post
+    /// `percpu::return_work::PREEMPT` ([`post_preempt`](Self::post_preempt)).
+    /// Written once by `percpu::init_storage`, before the slabs are
+    /// published; null before it, and in the host tests that set none.
+    return_work: AtomicPtr<AtomicU32>,
 }
 
 #[expect(
@@ -598,6 +605,31 @@ impl PerCpuScheduler
             idle_pull_cursor: AtomicUsize::new(0),
             saved_lock_flags: AtomicU64::new(0),
             deferred_reclaim_head: AtomicPtr::new(core::ptr::null_mut()),
+            return_work: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// Name `word` as this CPU's `PerCpuData::return_work`. Called once per
+    /// CPU by `percpu::init_storage`, before the slabs are published.
+    pub fn set_return_work(&self, word: &'static AtomicU32)
+    {
+        self.return_work
+            .store(core::ptr::from_ref(word).cast_mut(), Ordering::Relaxed);
+    }
+
+    /// Post `percpu::return_work::PREEMPT` in this CPU's return-work word, so
+    /// its next return to user mode takes the full preemption decision
+    /// (`sched::preempt_if_outranked`). Release, after the caller's write of
+    /// `non_empty` or `outranking`. Nothing before `percpu::init_storage`
+    /// names the word, when no thread runs in user mode.
+    fn post_preempt(&self)
+    {
+        let word = self.return_work.load(Ordering::Relaxed);
+        if !word.is_null()
+        {
+            // SAFETY: set_return_work stored a reference to a per-CPU entry's
+            // word, live for the kernel's lifetime.
+            unsafe { (*word).fetch_or(crate::percpu::return_work::PREEMPT, Ordering::Release) };
         }
     }
 
@@ -802,6 +834,17 @@ impl PerCpuScheduler
         // lockless `has_runnable` Acquire (core/kernel/docs/scheduling-internals.md
         // § Atomic Ordering Invariants).
         self.non_empty.fetch_or(1 << q, Ordering::Release);
+        // A link that leaves a queued thread outranking the running one owes
+        // this CPU's next return to user mode the preemption decision. Exact
+        // for a link this CPU makes, which follows its own last
+        // `set_current_level` in program order; a link another CPU makes may
+        // read `outranking` before a dispatch on this CPU rewrites it, so the
+        // wake IPI that follows every remote link posts the bit again on
+        // arrival (core/kernel/docs/scheduling-internals.md § Return Work).
+        if self.outranked()
+        {
+            self.post_preempt();
+        }
         true
     }
 
@@ -921,6 +964,7 @@ impl PerCpuScheduler
     pub fn mark_level_stale(&self)
     {
         self.outranking.store(LEVEL_STALE, Ordering::Relaxed);
+        self.post_preempt();
     }
 
     /// Whether [`mark_level_stale`](Self::mark_level_stale) marked the recorded
@@ -1157,6 +1201,9 @@ impl PerCpuScheduler
     /// changes neither the load nor the backlog episode: the thread never left
     /// this CPU's queues (core/kernel/docs/scheduler.md § Load Balancing).
     ///
+    /// A move that leaves a queued thread outranking the running one posts
+    /// `percpu::return_work::PREEMPT`, as a link does.
+    ///
     /// A `new_priority` at or above `NUM_PRIORITY_LEVELS` names no run queue
     /// and halts the kernel, as for [`enqueue`](Self::enqueue).
     ///
@@ -1205,6 +1252,15 @@ impl PerCpuScheduler
         if left_empty
         {
             self.non_empty.fetch_and(!(1 << from), Ordering::Release);
+        }
+        // A move that leaves a queued thread outranking the running one posts
+        // PREEMPT as a link does, tested once the old queue's bit is cleared so
+        // a thread moved below the running one posts nothing. A move another
+        // CPU makes is followed by the wake IPI, as for a link
+        // (core/kernel/docs/scheduling-internals.md § Return Work).
+        if self.outranked()
+        {
+            self.post_preempt();
         }
         true
     }
@@ -1529,6 +1585,85 @@ mod tests
         assert_eq!(found, Some((pr, 23)));
         assert!(rm(&sched, pr, 23));
         assert_eq!(sched.non_empty_mask(), 0);
+    }
+
+    // ── Return work ───────────────────────────────────────────────────────────
+
+    /// A return-work word for one test, named on `sched`.
+    fn return_work_word(sched: &PerCpuScheduler) -> &'static AtomicU32
+    {
+        let word: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        sched.set_return_work(word);
+        word
+    }
+
+    // Defect caught: a link that leaves a queued thread outranking the running
+    // one not posting PREEMPT, so the running thread keeps the CPU past its next
+    // return to user mode; or a link that outranks nothing posting it, which
+    // sends every later return down the slow path.
+    #[test]
+    fn a_link_posts_preempt_only_when_it_outranks_the_running_thread()
+    {
+        let sched = PerCpuScheduler::new();
+        let word = return_work_word(&sched);
+        sched.set_current_level(RT_PRIORITY_MIN);
+        let mut low = make_tcb();
+        let mut equal = make_tcb();
+        let mut high = make_tcb();
+        assert!(enq(&sched, &raw mut *low, 10));
+        assert!(enq(&sched, &raw mut *equal, RT_PRIORITY_MIN));
+        assert_eq!(word.load(Ordering::Relaxed), 0);
+        assert!(enq(&sched, &raw mut *high, RT_PRIORITY_MIN + 1));
+        assert_eq!(
+            word.load(Ordering::Relaxed),
+            crate::percpu::return_work::PREEMPT
+        );
+    }
+
+    // Defect caught: a priority change that moves a queued thread above the
+    // running one without posting PREEMPT, so a raise on the caller's own CPU,
+    // where no wake IPI follows, leaves the raised thread waiting for a tick;
+    // or a move that outranks nothing (one tested before the old queue's bit
+    // is cleared included) posting it.
+    #[test]
+    fn a_relink_posts_preempt_only_when_it_outranks_the_running_thread()
+    {
+        let sched = PerCpuScheduler::new();
+        let word = return_work_word(&sched);
+        sched.set_current_level(RT_PRIORITY_MIN);
+        let mut moved = make_tcb();
+        let p_moved = &raw mut *moved;
+        assert!(enq(&sched, p_moved, 10));
+        // SAFETY: single-threaded test, which owns `sched`; p_moved is a live
+        // box queued at 10.
+        assert!(unsafe { sched.relink(p_moved, 10, RT_PRIORITY_MIN) });
+        assert_eq!(word.load(Ordering::Relaxed), 0);
+        // SAFETY: as above; p_moved is queued at RT_PRIORITY_MIN.
+        assert!(unsafe { sched.relink(p_moved, RT_PRIORITY_MIN, RT_PRIORITY_MIN + 1) });
+        assert_eq!(
+            word.load(Ordering::Relaxed),
+            crate::percpu::return_work::PREEMPT
+        );
+        word.store(0, Ordering::Relaxed);
+        // SAFETY: as above; p_moved is queued at RT_PRIORITY_MIN + 1.
+        assert!(unsafe { sched.relink(p_moved, RT_PRIORITY_MIN + 1, 10) });
+        assert_eq!(word.load(Ordering::Relaxed), 0);
+    }
+
+    // Defect caught: a priority change of the running thread that marks its
+    // level stale without posting PREEMPT, so no return re-records the level and
+    // decides until the next link.
+    #[test]
+    fn a_stale_level_posts_preempt()
+    {
+        let sched = PerCpuScheduler::new();
+        let word = return_work_word(&sched);
+        sched.set_current_level(RT_PRIORITY_MIN);
+        sched.mark_level_stale();
+        assert_eq!(
+            word.load(Ordering::Relaxed),
+            crate::percpu::return_work::PREEMPT
+        );
     }
 
     // ── Tick decision ─────────────────────────────────────────────────────────

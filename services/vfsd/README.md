@@ -161,7 +161,9 @@ vfsd/
   the self-mount; the DPS priority tie-break runs on the boot disk alone,
   and a tie at the highest priority is ambiguous. Another disk takes a
   role only where the signed storage statement `/config/vfsd/storage.conf`
-  names its partition by unique partition GUID (`gpt::resolve_named`); a
+  names its partition by unique partition GUID on the disk it binds it
+  to, the boot disk or the disk at a PCI location (`gpt::resolve_named`,
+  which reads only that disk); a
   disk neither the boot disk nor named takes no role, and with no boot
   disk the root self-mount fails. After root, vfsd reads the statement and
   auto-mounts the boot ESP (the partition the bootloader's descriptor

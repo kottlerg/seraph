@@ -29,8 +29,9 @@ pub trait SwapOps
     ///
     /// # Errors
     /// [`GptLookupError::NotFound`] when there is none, [`GptLookupError::WrongType`] when the
-    /// named partition is not a swap partition, [`GptLookupError::DuplicateTie`] when two or
-    /// more answer equally.
+    /// named partition is not a swap partition, [`GptLookupError::Elsewhere`] when it is not on
+    /// the disk the statement binds it to, [`GptLookupError::DuplicateTie`] when two or more
+    /// answer equally.
     fn lookup(&mut self) -> Result<PartitionLocation, GptLookupError>;
 
     /// Register `location` with its disk's block driver and return the partition cap the driver
@@ -102,7 +103,9 @@ impl SwapPartition
         {
             let location = ops.lookup().map_err(|e| match e
             {
-                GptLookupError::NotFound | GptLookupError::WrongType => HandOutError::NoPartition,
+                GptLookupError::NotFound
+                | GptLookupError::WrongType
+                | GptLookupError::Elsewhere { .. } => HandOutError::NoPartition,
                 GptLookupError::DuplicateTie => HandOutError::Ambiguous,
             })?;
             self.kept = ops.register(&location).ok_or(HandOutError::Register)?;
@@ -235,6 +238,11 @@ mod tests
         let mut swap = SwapPartition::new();
         let mut ops = Model::with_lookup(Err(GptLookupError::WrongType));
         assert_eq!(swap.hand_out(&mut ops), Err(HandOutError::NoPartition));
+        // Defect caught: a named partition seen off the disk its statement
+        // binds it to handed to swapd from there.
+        let mut moved = Model::with_lookup(Err(GptLookupError::Elsewhere { disk: 1 }));
+        assert_eq!(swap.hand_out(&mut moved), Err(HandOutError::NoPartition));
+        assert_eq!(swap.kept(), 0);
         assert_eq!(swap.kept(), 0);
         assert_eq!(ops.registered, Vec::new());
     }

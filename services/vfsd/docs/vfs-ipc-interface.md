@@ -87,8 +87,9 @@ for the root role, arch-neutral for data; see
 [`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
 resolves the partition with `resolve_role` in
 [`services/vfsd/src/main.rs`](../src/main.rs): the partition the signed
-storage statement names for the role on a disk it holds and has not marked
-removed ([`gpt::resolve_named`](../gpt/src/lib.rs)), else the boot disk's
+storage statement names for the role on the disk the statement binds it to,
+when vfsd holds that disk and has not marked it removed
+([`gpt::resolve_named`](../gpt/src/lib.rs)), else the boot disk's
 partition of the type GUID
 ([`gpt::lookup_on_disk`](../gpt/src/lib.rs); DPS-style priority
 tie-break on attribute bits 48-63, on the boot disk alone; a tie at the
@@ -108,10 +109,11 @@ rejected (`TABLE_FULL`) before any partition is registered or driver
 spawned. Before the role lookup vfsd queries devmgr for the block devices
 it served since vfsd's last query (from the first instance ordinal not yet
 queried) and holds them, so a partition the statement names resolves on
-any disk devmgr serves, under the rules of
-[docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery): a disk
-added or inserted again after startup is found, and takes a role only by
-the statement; it is not ranked against the boot disk's partitions. A partition is mounted
+the disk it binds it to whenever devmgr serves that disk, under the rules
+of [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery): a
+disk added or inserted again after startup is found, and takes a role only
+by the statement, at the location it names; it is not ranked against the
+boot disk's partitions. A partition is mounted
 once: a mount of a partition a mount holds, at another path, one
 restarting or whose removal is under way included, is rejected (`TABLE_FULL`) before any
 driver is spawned, so no two drivers serve one partition. A mount that
@@ -156,8 +158,10 @@ arch-neutral `SERAPH_DATA` type GUID.
 
 **Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a
 badge without `MOUNT_AUTHORITY`, `NOT_FOUND` for an
-unknown role byte or invalid path length, `NO_MOUNT` if no partition
-on any held disk matches the role GUID after the query for new disks,
+unknown role byte or invalid path length, `NO_MOUNT` if the role
+resolves to no partition after the query for new disks (none of the
+role's type on the boot disk, or the named partition not on the disk the
+statement binds it to, of another type there, or there twice),
 if duplicate-priority partitions are detected, or if the disk was
 removed during the mount, `SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if
 the synthetic-root install fails: root already mounted, the path
@@ -297,9 +301,10 @@ one, until a later request succeeds. The pure decisions are
 
 **Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a badge without
 `SWAP_AUTHORITY`, `LABEL_VERSION_MISMATCH` when `data[0]` differs from vfsd's
-`VFSD_LABELS_VERSION`, `NO_MOUNT` when no held disk carries a swap partition or two tie at the
-highest priority, and `IO_ERROR` when the registration, the revoke of the previous holder's cap,
-or the derivation fails).
+`VFSD_LABELS_VERSION`, `NO_MOUNT` when the swap role resolves to no partition (none of the swap
+type on the boot disk, two there tied at the highest priority, or the partition the statement names
+not on the disk it binds it to, of another type there, or there twice), and `IO_ERROR` when the
+registration, the revoke of the previous holder's cap, or the derivation fails).
 
 ---
 

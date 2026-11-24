@@ -337,7 +337,8 @@ A component `--debug` also names takes `--debug`.
 
 Build artifacts are staged in `sysroot/`, which is then packaged into the
 top-level `disk.img` GPT image consumed by QEMU (with the data and swap partitions on
-a second image, `disk-data.img`, which the staged storage statement names, under
+a second image, `disk-data.img`, which the staged storage statement names at the PCI location its
+boot places it, under
 `mkdisk --split-data`). The sysroot is built for
 one architecture at a time; the active architecture is recorded in
 `sysroot/.arch`. Switching architectures requires a clean rebuild. The harness

@@ -666,8 +666,8 @@ pub(super) unsafe extern "C" fn common_exception_handler(
 /// trampoline upholds the precondition that `tf` is a valid, writable
 /// [`TrapFrame`] on the current stack, so this is a safe `extern "C"` fn.
 /// `vector`/`error_code` are the trap metadata from the stub frame. A return
-/// to ring 3 runs the wake-preemption check after [`resolve_exception`]
-/// (`sched::preempt_at_exception_return`), since fault delivery can link a
+/// to ring 3 runs the return work, whose preemption decision follows [`resolve_exception`]
+/// (`sched::exception_return_work`), since fault delivery can link a
 /// thread on this CPU and absorb a wake IPI in a preemption-disabled window.
 #[cfg(not(test))]
 extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64)
@@ -686,7 +686,7 @@ extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64
         // SAFETY: the end of an exception from ring 3 that resolve_exception
         // resumed, on the thread's kernel stack (#DF and #MC, on IST1, never
         // return), its frame published; no lock is held, IF=0.
-        unsafe { crate::sched::preempt_at_exception_return(deliver) };
+        unsafe { crate::sched::exception_return_work(deliver) };
     }
 }
 
@@ -1031,8 +1031,8 @@ pub(super) unsafe fn publish_user_frame(frame: *mut TrapFrame)
 /// it publishes as the thread's `trap_frame` first ([`publish_user_frame`]).
 /// Each handler performs its own EOI; this only dispatches, then, for an
 /// interrupt from user mode, makes the interrupt delivery point of a pending
-/// upcall (`ipc::upcall::deliver_at_interrupt`) and the wake-preemption check
-/// (`sched::preempt_if_outranked`). A device vector's slot entry
+/// upcall (`ipc::upcall::deliver_at_interrupt`) and the wake-preemption decision
+/// (`sched::interrupt_return_work`, § Return Work). A device vector's slot entry
 /// in this CPU's vector row (`ioapic::slot_for_vector`), which names a GSI the
 /// I/O APIC routes, a message-signaled target, or no source, is passed to
 /// `irq::dispatch_device_irq`; an entry with no source (an interrupt latched
@@ -1079,22 +1079,14 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
     }
     if !user_frame.is_null()
     {
-        // A pass of the sole-reference posts earlier drains left, so a CPU
-        // that runs only user code still makes a pass of at most
-        // POST_BUDGET posts every tick
-        // (core/kernel/docs/capability-internals.md § Sole-Reference
-        // Observers). Before the delivery point and the check, so a thread a
-        // post wakes on this CPU is decided at this return.
-        // SAFETY: ring-3 origin: the interrupted thread's kernel stack, each
-        // handler above has sent its EOI, no lock is held, IF=0.
-        unsafe { crate::cap::sole_reference::drain_at_interrupt() };
-        // The return to ring 3: the interrupt delivery point of an upcall
+        // The return to ring 3, when this CPU's return-work word owes it work:
+        // a sole-reference pass, the interrupt delivery point of an upcall
         // posted with UPCALL_ANY_INSTRUCTION (docs/fault-handling.md
-        // § Asynchronous Upcalls), each handler above having sent its EOI;
+        // § Asynchronous Upcalls), each handler above having sent its EOI,
         // then the wake preemption of a thread the handler, or a wake IPI's
         // sender, linked on this CPU above the interrupted one
-        // (core/kernel/docs/scheduler.md § Wake Preemption); both again after
-        // a preemption.
+        // (core/kernel/docs/scheduler.md § Wake Preemption;
+        // core/kernel/docs/scheduling-internals.md § Return Work).
         let deliver = || {
             // SAFETY: ring-3 origin, so user_frame is the interrupted
             // thread's live frame on its kernel stack; no lock is held,
@@ -1102,8 +1094,9 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
             unsafe { crate::ipc::upcall::deliver_at_interrupt(user_frame) };
         };
         // SAFETY: the end of an interrupt from ring 3 on the interrupted
-        // thread's kernel stack, its frame published; no lock is held, IF=0.
-        unsafe { crate::sched::deliver_and_preempt(deliver) };
+        // thread's kernel stack, its frame published, each handler above
+        // having sent its EOI; no lock is held, IF=0.
+        unsafe { crate::sched::interrupt_return_work(deliver) };
     }
 }
 
@@ -1458,8 +1451,8 @@ unsafe extern "custom" fn isr_page_fault()
 /// bytes not copied, `rcx` is set to 0, and `rip` is left as it was, since a
 /// ring-0 `iretq` to another address raises `#CP` while shadow stacks are on.
 /// Every other fault is handed to [`common_exception_handler`], which never
-/// returns. A return to ring 3 runs the wake-preemption check after
-/// [`resolve_page_fault`] (`sched::preempt_at_exception_return`), since
+/// returns. A return to ring 3 runs the return work, whose preemption decision follows
+/// [`resolve_page_fault`] (`sched::exception_return_work`), since
 /// fault delivery can link a thread on this CPU and absorb a wake IPI in a
 /// preemption-disabled window.
 #[cfg(not(test))]
@@ -1478,7 +1471,7 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
         // SAFETY: the end of a page fault from ring 3 that resolve_page_fault
         // resumed, on the thread's kernel stack, its frame published; no lock
         // is held, IF=0.
-        unsafe { crate::sched::preempt_at_exception_return(deliver) };
+        unsafe { crate::sched::exception_return_work(deliver) };
     }
 }
 
@@ -1977,14 +1970,19 @@ extern "C" fn ipi_tlb_shootdown_handler()
 
 /// Wakeup IPI handler (vector 251).
 ///
-/// The interrupt itself breaks `hlt`, so this handler just sends EOI and returns.
-/// No additional work is needed; the idle loop will check for runnable threads
-/// immediately after returning from the interrupt.
+/// The interrupt itself breaks `hlt`, and the idle loop checks for runnable
+/// threads immediately after it returns. A wake IPI follows every link another
+/// CPU makes on this one, so the handler posts this CPU's
+/// `percpu::return_work::PREEMPT`: the return to user mode that follows takes
+/// the full preemption decision, with the sender's link visible, even when the
+/// sender's own test of the link read this CPU's level before a dispatch here
+/// changed it (core/kernel/docs/scheduling-internals.md § Return Work).
 #[cfg(not(test))]
 extern "C" fn ipi_wakeup_handler()
 {
-    // Send EOI to local APIC. No other work needed; the interrupt wakes the CPU.
-    // Vector 251 is the wakeup IPI vector.
+    // SAFETY: interrupt context on a CPU whose per-CPU pointer is installed.
+    unsafe { crate::percpu::post_return_work(crate::percpu::return_work::PREEMPT) };
+    // Send EOI to local APIC. Vector 251 is the wakeup IPI vector.
     super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_WAKEUP));
 }
 

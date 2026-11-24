@@ -435,9 +435,9 @@ The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
 boot-loaded services live alongside it under `EFI/seraph/`, the Seraph vendor
 directory within the EFI partition.
 
-`tests/` holds the test harnesses, per-program testers, and harness-only
-fixtures, but test-only artifacts also install under `services/drivers/`,
-`programs/`, `config/svcmgr/tests/`, `config/devmgr/tests/`, and `data/`;
+`tests/` holds the test harnesses, per-program testers, and test fixtures,
+but test-only artifacts also install under `services/drivers/`,
+`config/svcmgr/tests/`, `config/devmgr/tests/`, and `data/`;
 [testing.md § Sysroot layout](testing.md#sysroot-layout) lists them.
 
 Non-ESP, non-`data` directories (`boot/`, `services/`, `programs/`, `tests/`,

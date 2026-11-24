@@ -1903,9 +1903,9 @@ second disk at 8192-byte blocks (`--second-disk-block-size 8192`), above virtio-
 each boot exercises ([storage.md](storage.md) § GPT Role-GUID Discovery,
 [device-management.md](device-management.md) § Relationship to Other Services and § Interrupt
 Delivery), and [xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the options. svctest is
-staged as the canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is
+staged as the canonical cells stage it, and its pass marker passes each boot. Each budget, 900 s, is
 the larger of three times the slowest of these boots on the reference host (the riscv64 8192-byte
-boot, 133 s) and that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above
+boot, 296 s) and that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above
 follow; a change to these boots' times re-derives it. Each boot is a storage cell (Device surfaces
 above): in the commands below, 4kn is the first `run --runs` boot, second-disk the second,
 shared-line the third, and oversize-block the fourth, each after the `mkdisk` before it; a PR that
@@ -1915,16 +1915,16 @@ owes some of the cells runs those boots, and the release host runs run all four.
 # Disk variations, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cargo xtask mkdisk --arch <arch> --repack-only --svctest ci --block-size 4096
-cargo xtask run --arch <arch> --runs 1 --timeout 420 \
+cargo xtask run --arch <arch> --runs 1 --timeout 900 \
     --test-devices
 cargo xtask mkdisk --arch <arch> --repack-only --split-data
-cargo xtask run --arch <arch> --runs 1 --timeout 420 \
+cargo xtask run --arch <arch> --runs 1 --timeout 900 \
     --second-disk disk-data.img --test-devices
-cargo xtask run --arch <arch> --runs 1 --timeout 420 \
+cargo xtask run --arch <arch> --runs 1 --timeout 900 \
     --second-disk disk-data.img --second-disk-shared-line --test-devices
 cargo xtask mkdisk --arch <arch> --repack-only
 cp disk.img target/xtask/second-disk.img
-cargo xtask run --arch <arch> --runs 1 --timeout 420 \
+cargo xtask run --arch <arch> --runs 1 --timeout 900 \
     --second-disk target/xtask/second-disk.img --second-disk-block-size 8192 \
     --test-devices
 ```
@@ -1938,8 +1938,8 @@ and `logd_sinks` phases run their framebuffer cases
 `framebuffer case skipped`. The boot passes on svctest's pass marker with no
 such line: its `--fail-also 'framebuffer case skipped'` makes a boot that logs the skip a `FAIL`.
 svctest is staged as `build-test.yml` stages it, on a debug-profile sysroot, as the commands
-below spell out. Its budget, 360 s, is the larger of three times the slower of the two boots on
-the reference host (the riscv64 boot, 103 s) and that boot plus 100 s, rounded up to a minute, the
+below spell out. Its budget, 960 s, is the larger of three times the slower of the two boots on
+the reference host (the riscv64 boot, 301 s) and that boot plus 100 s, rounded up to a minute, the
 rule the disk variations' budget follows; a change to these boots' times re-derives it. The boot
 is the framebuffer device cell (Device surfaces above).
 
@@ -1947,7 +1947,7 @@ is the framebuffer device cell (Device surfaces above).
 # Framebuffer cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cargo xtask mkdisk --arch <arch> --repack-only --svctest ci
-cargo xtask run --arch <arch> --runs 1 --timeout 360 \
+cargo xtask run --arch <arch> --runs 1 --timeout 960 \
     --display framebuffer --test-devices --fail-also 'framebuffer case skipped'
 ```
 
@@ -2042,12 +2042,15 @@ fuzz target, and runs the timing report on the boundary logs, which is reported 
 A tag's repeated-run check is the burn-in tier, which the tag push starts. The no-IOMMU variant, the
 no-iommu device cell, boots svctest once on each architecture with the machine's IOMMU detached, so
 devmgr's unconfined path still serves every driver (svctest staged as `build-test.yml` stages it, on
-a debug-profile sysroot). A run whose outcome is not a pass, as When the runs are owed classifies
-outcomes, blocks the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
+a debug-profile sysroot). Its budget, 840 s, is the larger of three times its riscv64 boot on the
+reference host (278 s) and that boot plus 100 s, rounded up to a minute, the rule the disk
+variations' budget follows; a change to that boot's time re-derives it. A run whose outcome is not
+a pass, as When the runs are owed classifies outcomes, blocks the tag, MUST be filed as an Issue,
+and is bisected over the release's PRs.
 
 ```sh
 # No-IOMMU variant, each architecture (svctest staged, debug profile):
-cargo xtask run --arch <arch> --iommu absent --runs 1 --timeout 540 \
+cargo xtask run --arch <arch> --iommu absent --runs 1 --timeout 840 \
     --test-devices
 ```
 

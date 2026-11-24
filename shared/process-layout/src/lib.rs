@@ -67,6 +67,12 @@
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
 
+// Cargo records no source file of a `-Z build-std` unit, only the environment variables it
+// reads: reading xtask's digest of the sources of every crate std depends on makes a change to
+// any of them rebuild this unit (docs/build-system.md § Build Output: the Sysroot).
+#[cfg(feature = "rustc-dep-of-std")]
+const _: &str = core::env!("SERAPH_STD_DEPS_DIGEST");
+
 // `no_core` drops the implicit prelude; the glob restores it.
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;

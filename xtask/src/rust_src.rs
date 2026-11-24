@@ -37,8 +37,10 @@
 //!      mirror by calling `SeraphToolchain::apply_env(&mut cmd)`,
 //!      which sets `RUSTC`, `RUSTC_WORKSPACE_WRAPPER`, the three
 //!      `SERAPH_SHIM_*` config vars, `RUSTC_BOOTSTRAP=1`, Cargo's
-//!      build directory (`target/seraph-build/`, [`BUILD_DIR`]), and the
-//!      lint arguments (`CLIPPY_ARGS`, [`CLIPPY_ARGS`]) in one go. No rustup-level state is modified;
+//!      build directory (`target/seraph-build-1/`, [`BUILD_DIR`]), the
+//!      lint arguments (`CLIPPY_ARGS`, [`CLIPPY_ARGS`]), and the digest of
+//!      the sources of the workspace crates std depends on
+//!      ([`STD_DEPS_DIGEST_VAR`]) in one go. No rustup-level state is modified;
 //!      `target/seraph-toolchain/` is a pure build artifact under
 //!      `target/`.
 //!
@@ -82,12 +84,41 @@ const MARKER: &str = "// seraph-overlay:";
 /// Name of the toolchain mirror directory under `target/`.
 const MIRROR_DIR: &str = "seraph-toolchain";
 
+/// The stem of the name of [`BUILD_DIR`], which a build directory of every
+/// format carries.
+const BUILD_DIR_STEM: &str = "seraph-build";
+
+/// The format of [`BUILD_DIR`]: the rules by which its units are judged
+/// current, raised with every change of those rules. A unit compiled under
+/// older rules can pass as current under newer ones, and nothing in the unit
+/// tells it apart, so each format builds in a directory of its own, named for
+/// it, which no xtask of another format writes into. Format 1 is the first
+/// whose units of the workspace crates std depends on read
+/// [`STD_DEPS_DIGEST_VAR`]; the builds before it used [`BUILD_DIR_STEM`]
+/// alone, format 0 here.
+const BUILD_DIR_FORMAT: u32 = 1;
+
 /// Cargo's build directory under `target/` for the builds the mirror's
-/// rustc compiles: their host build scripts (`compiler_builtins`'s among them)
-/// are built from the mirror's sources, and sharing `target/<profile>/build/`
-/// with the builds from the toolchain's own sources would make each kind
-/// rebuild what the other built.
-pub(crate) const BUILD_DIR: &str = "seraph-build";
+/// rustc compiles, [`BUILD_DIR_STEM`] and [`BUILD_DIR_FORMAT`]: their host
+/// build scripts (`compiler_builtins`'s among them) are built from the
+/// mirror's sources, and sharing `target/<profile>/build/` with the builds
+/// from the toolchain's own sources would make each kind rebuild what the
+/// other built.
+pub(crate) const BUILD_DIR: &str = "seraph-build-1";
+
+/// The environment variable that carries [`std_deps_digest`] to the units of
+/// the workspace crates std depends on ([`STD_WORKSPACE_DEPS`]).
+///
+/// Cargo records no source file of a `-Z build-std` unit: it does not count
+/// such a unit as local, and drops every path of its dep-info under the
+/// package's root, so a change to a source of one of these crates would leave
+/// its unit, std, and every `StdUser` crate as they were. Cargo records and
+/// checks the environment variables a unit reads for every unit, though. Each
+/// of these crates reads this variable under `rustc-dep-of-std`, which only
+/// `-Z build-std` enables, and [`SeraphToolchain::apply_env`] sets it, so a
+/// change to any of their files changes its value and rebuilds their units and
+/// every unit that depends on them.
+const STD_DEPS_DIGEST_VAR: &str = "SERAPH_STD_DEPS_DIGEST";
 
 /// The lint arguments `clippy-driver` reads from `CLIPPY_ARGS`: `-D warnings`,
 /// split on `__CLIPPY_HACKERY__`, the encoding `cargo clippy` uses to forward
@@ -127,6 +158,7 @@ pub struct SeraphToolchain
     real_clippy: PathBuf,
     mirror_sysroot: PathBuf,
     build_dir: PathBuf,
+    std_deps_digest: String,
 }
 
 impl SeraphToolchain
@@ -136,8 +168,9 @@ impl SeraphToolchain
     /// `RUSTC_WORKSPACE_WRAPPER` (mirror entry points), the three
     /// `SERAPH_SHIM_*` config vars (so the shim knows what to exec),
     /// `RUSTC_BOOTSTRAP=1`, `CARGO_BUILD_BUILD_DIR` ([`BUILD_DIR`]), where
-    /// the final artifacts still land in `target/<triple>/<profile>/`, and
-    /// `CLIPPY_ARGS` ([`CLIPPY_ARGS`]).
+    /// the final artifacts still land in `target/<triple>/<profile>/`,
+    /// `CLIPPY_ARGS` ([`CLIPPY_ARGS`]), and the digest of the sources of the
+    /// workspace crates std depends on ([`STD_DEPS_DIGEST_VAR`]).
     ///
     /// `RUSTC_BOOTSTRAP=1` unlocks the unstable features that
     /// `-Zbuild-std` and the std overlay's workspace deps
@@ -157,6 +190,7 @@ impl SeraphToolchain
         cmd.env("RUSTC_BOOTSTRAP", "1");
         cmd.env("CARGO_BUILD_BUILD_DIR", &self.build_dir);
         cmd.env("CLIPPY_ARGS", CLIPPY_ARGS);
+        cmd.env(STD_DEPS_DIGEST_VAR, &self.std_deps_digest);
     }
 }
 
@@ -211,6 +245,11 @@ pub fn ensure_seraph_toolchain(ctx: &BuildContext) -> Result<SeraphToolchain>
     let mirror_sysroot = mirror
         .canonicalize()
         .context("canonicalising seraph mirror")?;
+    let build_dir = ctx.target_dir.join(BUILD_DIR);
+    remove_older_build_dirs(&ctx.target_dir)
+        .context("removing the build directories of older formats")?;
+    let std_deps_digest =
+        std_deps_digest(&ctx.root).context("hashing the workspace crates std depends on")?;
 
     Ok(SeraphToolchain {
         rustc: mirror.join("bin/rustc"),
@@ -218,8 +257,75 @@ pub fn ensure_seraph_toolchain(ctx: &BuildContext) -> Result<SeraphToolchain>
         real_rustc,
         real_clippy,
         mirror_sysroot,
-        build_dir: ctx.target_dir.join(BUILD_DIR),
+        build_dir,
+        std_deps_digest,
     })
+}
+
+/// The format of the build directory named `name`: 0 for [`BUILD_DIR_STEM`]
+/// alone, `<n>` for `<stem>-<n>`, and `None` for any other name.
+fn build_dir_format(name: &str) -> Option<u32>
+{
+    let rest = name.strip_prefix(BUILD_DIR_STEM)?;
+    if rest.is_empty()
+    {
+        return Some(0);
+    }
+    let digits = rest.strip_prefix('-')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Remove each build directory under `target_dir` of a format older than
+/// [`BUILD_DIR_FORMAT`]: no build of this format reads it. One of a newer
+/// format is kept, for the checkout's return to a commit of that format.
+fn remove_older_build_dirs(target_dir: &Path) -> Result<()>
+{
+    let entries =
+        fs::read_dir(target_dir).with_context(|| format!("reading {}", target_dir.display()))?;
+    for entry in entries
+    {
+        let entry = entry.with_context(|| format!("reading {}", target_dir.display()))?;
+        let older = entry
+            .file_name()
+            .to_str()
+            .and_then(build_dir_format)
+            .is_some_and(|format| format < BUILD_DIR_FORMAT);
+        let path = entry.path();
+        if older && path.is_dir()
+        {
+            step(&format!(
+                "seraph-toolchain: removing {}, a build directory of an older format",
+                path.display()
+            ));
+            fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The SHA-512 digest, in hex, of every file of every crate of
+/// [`STD_WORKSPACE_DEPS`] under `project_root`: each crate's path, then the
+/// names and contents of the files and directories under it
+/// ([`feed_tree`]). A change to the content, the name, or the presence of any
+/// of them changes it, whether or not the crate's compilation reads the file.
+fn std_deps_digest(project_root: &Path) -> Result<String>
+{
+    let mut hasher = crypto::Sha512::new();
+    for (_, rel, _) in STD_WORKSPACE_DEPS
+    {
+        feed_bytes(&mut |bytes| hasher.update(bytes), rel.as_bytes());
+        feed_tree(&project_root.join(rel), &mut |bytes| hasher.update(bytes))?;
+    }
+    let mut hex = String::with_capacity(2 * crypto::sha512::DIGEST_LEN);
+    for byte in hasher.finalize()
+    {
+        write!(hex, "{byte:02x}")?;
+    }
+    Ok(hex)
 }
 
 // ── Mirror assembly ───────────────────────────────────────────────────────────
@@ -457,16 +563,34 @@ fn compute_stamp(real: &Path, overlay_root: &Path, project_root: &Path) -> Resul
     ))
 }
 
-/// 64-bit FNV-1a over every regular file under `root`, in a deterministic
-/// lexicographic order. Used as a cheap content fingerprint.
+/// 64-bit FNV-1a over every file and directory under `root`
+/// ([`feed_tree`]). Used as a cheap content fingerprint.
 fn hash_dir_content(root: &Path) -> Result<u64>
 {
     let mut state = FNV_OFFSET;
-    hash_dir_into(root, &mut state)?;
+    feed_tree(root, &mut |bytes| {
+        for b in bytes
+        {
+            fnv_mix(&mut state, *b);
+        }
+    })?;
     Ok(state)
 }
 
-fn hash_dir_into(dir: &Path, state: &mut u64) -> Result<()>
+/// Feed `bytes` to `feed` after their length, so that no two different
+/// sequences of fed items make one stream.
+fn feed_bytes(feed: &mut dyn FnMut(&[u8]), bytes: &[u8])
+{
+    feed(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    feed(bytes);
+}
+
+/// Feed every entry under `dir` to `feed`, in the lexicographic order of
+/// their names: a byte for its kind and its name, then a file's content, a
+/// symbolic link's target and the content of the file it resolves to, if any,
+/// or a directory's entries and an end byte. So a change to the content, the
+/// name or the presence of any of them changes what is fed.
+fn feed_tree(dir: &Path, feed: &mut dyn FnMut(&[u8])) -> Result<()>
 {
     let mut entries: Vec<_> = fs::read_dir(dir)
         .with_context(|| format!("reading {}", dir.display()))?
@@ -477,25 +601,35 @@ fn hash_dir_into(dir: &Path, state: &mut u64) -> Result<()>
     for entry in entries
     {
         let path = entry.path();
-        let ft = entry.file_type()?;
-        // Include the name so deletions/renames register.
-        for b in entry.file_name().as_encoded_bytes()
-        {
-            fnv_mix(state, *b);
-        }
-        fnv_mix(state, 0x1e); // record separator
-
+        let ft = entry
+            .file_type()
+            .with_context(|| format!("reading the type of {}", path.display()))?;
+        let read =
+            |path: &Path| fs::read(path).with_context(|| format!("hashing {}", path.display()));
         if ft.is_dir()
         {
-            hash_dir_into(&path, state)?;
+            feed(b"d");
+            feed_bytes(feed, entry.file_name().as_encoded_bytes());
+            feed_tree(&path, feed)?;
+            feed(b"e");
         }
-        else if ft.is_file()
+        else if ft.is_symlink()
         {
-            let bytes = fs::read(&path).with_context(|| format!("hashing {}", path.display()))?;
-            for b in &bytes
+            feed(b"l");
+            feed_bytes(feed, entry.file_name().as_encoded_bytes());
+            let target =
+                fs::read_link(&path).with_context(|| format!("reading {}", path.display()))?;
+            feed_bytes(feed, target.as_os_str().as_encoded_bytes());
+            if path.is_file()
             {
-                fnv_mix(state, *b);
+                feed_bytes(feed, &read(&path)?);
             }
+        }
+        else
+        {
+            feed(b"f");
+            feed_bytes(feed, entry.file_name().as_encoded_bytes());
+            feed_bytes(feed, &read(&path)?);
         }
     }
     Ok(())
@@ -1680,6 +1814,225 @@ mod tests
         );
     }
 
+    /// A fresh directory under the system's temporary directory.
+    fn scratch_dir(name: &str) -> PathBuf
+    {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "seraph-xtask-rust-src-{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Defect caught: a crate std depends on that does not read the digest
+    // under `rustc-dep-of-std`, so Cargo records nothing of its sources in its
+    // `-Z build-std` unit, and a change to them leaves that unit, std and
+    // every `StdUser` crate built from the old ones.
+    #[test]
+    fn each_crate_std_depends_on_reads_the_digest_of_their_sources()
+    {
+        let root = repo_root();
+        let read = format!(
+            "#[cfg(feature = \"rustc-dep-of-std\")]\n\
+             const _: &str = core::env!(\"{STD_DEPS_DIGEST_VAR}\");\n"
+        );
+        for (_, rel, _) in STD_WORKSPACE_DEPS
+        {
+            let lib = fs::read_to_string(root.join(rel).join("src/lib.rs")).unwrap();
+            assert!(
+                lib.contains(&read),
+                "{rel}/src/lib.rs does not read the digest"
+            );
+        }
+    }
+
+    // Defect caught: a crate std reaches through a path dependency of one of
+    // the crates it depends on, which the digest does not cover, so a change
+    // to it rebuilds nothing.
+    #[test]
+    fn the_crates_std_depends_on_are_closed_under_path_dependencies()
+    {
+        use json::Value;
+
+        let root = repo_root();
+        let listed: Vec<PathBuf> = STD_WORKSPACE_DEPS
+            .iter()
+            .map(|(_, rel, _)| root.join(rel).canonicalize().unwrap())
+            .collect();
+        // Cargo resolves every form a manifest can give a dependency in
+        // (inline, a dotted table, `workspace = true`) to the path it names.
+        let output = Command::new("cargo")
+            .args(["metadata", "--format-version", "1", "--no-deps"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "cargo metadata failed");
+        let metadata = json::parse(&String::from_utf8_lossy(&output.stdout)).unwrap();
+        let Some(Value::Array(packages)) = metadata.get("packages")
+        else
+        {
+            panic!("cargo metadata lists no packages");
+        };
+        let mut seen = 0;
+        for package in packages
+        {
+            let manifest = package
+                .get("manifest_path")
+                .and_then(Value::as_str)
+                .unwrap();
+            let dir = Path::new(manifest)
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap();
+            if !listed.contains(&dir)
+            {
+                continue;
+            }
+            seen += 1;
+            let Some(Value::Array(deps)) = package.get("dependencies")
+            else
+            {
+                panic!("cargo metadata gives {manifest} no dependency list");
+            };
+            for dep in deps
+            {
+                if dep.get("kind").and_then(Value::as_str) == Some("dev")
+                {
+                    continue;
+                }
+                let Some(path) = dep.get("path").and_then(Value::as_str)
+                else
+                {
+                    continue;
+                };
+                assert!(
+                    listed.contains(&Path::new(path).canonicalize().unwrap()),
+                    "{manifest} depends on {path}, which STD_WORKSPACE_DEPS does not list"
+                );
+            }
+        }
+        assert_eq!(
+            seen,
+            listed.len(),
+            "a listed crate is not a workspace package"
+        );
+    }
+
+    // Defect caught: a change to a file of a crate std depends on that leaves
+    // the digest as it was, so the crate's `-Z build-std` unit and std are not
+    // rebuilt; or a digest that differs between two runs over the same files,
+    // so a build with no change is never a no-op.
+    #[test]
+    fn the_digest_changes_with_every_change_to_a_file_of_a_crate_std_depends_on()
+    {
+        let root = scratch_dir("digest");
+        for (_, rel, _) in STD_WORKSPACE_DEPS
+        {
+            fs::create_dir_all(root.join(rel).join("src")).unwrap();
+            fs::write(root.join(rel).join("Cargo.toml"), "[package]\n").unwrap();
+            fs::write(root.join(rel).join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        }
+        let base = std_deps_digest(&root).unwrap();
+        assert_eq!(std_deps_digest(&root).unwrap(), base);
+        assert_eq!(base.len(), 128);
+
+        let (_, rel, _) = STD_WORKSPACE_DEPS[STD_WORKSPACE_DEPS.len() - 1];
+        let lib = root.join(rel).join("src/lib.rs");
+        let added = root.join(rel).join("src/added.rs");
+        let renamed = root.join(rel).join("src/lib2.rs");
+        let manifest = root.join(rel).join("Cargo.toml");
+        let check = |what: &str,
+                     change: &dyn Fn() -> std::io::Result<()>,
+                     undo: &dyn Fn() -> std::io::Result<()>| {
+            change().unwrap();
+            assert_ne!(std_deps_digest(&root).unwrap(), base, "{what}");
+            undo().unwrap();
+            assert_eq!(std_deps_digest(&root).unwrap(), base, "{what} undone");
+        };
+        check("content", &|| fs::write(&lib, "pub fn g() {}\n"), &|| {
+            fs::write(&lib, "pub fn f() {}\n")
+        });
+        check("an added file", &|| fs::write(&added, ""), &|| {
+            fs::remove_file(&added)
+        });
+        check("a rename", &|| fs::rename(&lib, &renamed), &|| {
+            fs::rename(&renamed, &lib)
+        });
+        check(
+            "a removed manifest",
+            &|| fs::remove_file(&manifest),
+            &|| fs::write(&manifest, "[package]\n"),
+        );
+
+        // Moving bytes between a file's name and its content, or between two
+        // files, is a change too.
+        fs::write(&lib, "").unwrap();
+        fs::write(root.join(rel).join("src/a"), "b").unwrap();
+        let split = std_deps_digest(&root).unwrap();
+        fs::remove_file(root.join(rel).join("src/a")).unwrap();
+        fs::write(root.join(rel).join("src/ab"), "").unwrap();
+        assert_ne!(std_deps_digest(&root).unwrap(), split);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_digest_covers_the_crates_of_the_tree()
+    {
+        assert_eq!(std_deps_digest(&repo_root()).unwrap().len(), 128);
+    }
+
+    // Defect caught: a build of this format in a directory an xtask of another
+    // format also builds in, whose units, compiled there without the digest
+    // after this format's last build, this format would keep as current.
+    #[test]
+    fn the_build_directory_is_named_for_its_format()
+    {
+        assert_eq!(BUILD_DIR, format!("{BUILD_DIR_STEM}-{BUILD_DIR_FORMAT}"));
+        assert_eq!(build_dir_format(BUILD_DIR), Some(BUILD_DIR_FORMAT));
+        assert_eq!(build_dir_format(BUILD_DIR_STEM), Some(0));
+        assert_eq!(build_dir_format("seraph-build-12"), Some(12));
+        for other in [
+            "seraph-build-",
+            "seraph-build-1a",
+            "seraph-builds",
+            "seraph-toolchain",
+        ]
+        {
+            assert_eq!(build_dir_format(other), None, "{other}");
+        }
+    }
+
+    // Defect caught: a build directory of an older format left in place, or
+    // a directory of this or a newer format, or one of another name, removed.
+    #[test]
+    fn the_build_directories_of_older_formats_are_removed()
+    {
+        let root = scratch_dir("format");
+        let newer = format!("{BUILD_DIR_STEM}-{}", BUILD_DIR_FORMAT + 1);
+        let kept = [
+            BUILD_DIR,
+            newer.as_str(),
+            "seraph-toolchain",
+            "seraph-builds",
+        ];
+        for dir in kept.iter().chain(&[BUILD_DIR_STEM])
+        {
+            fs::create_dir_all(root.join(dir).join("debug")).unwrap();
+        }
+        remove_older_build_dirs(&root).unwrap();
+        assert!(!root.join(BUILD_DIR_STEM).exists(), "format 0 is kept");
+        for dir in kept
+        {
+            assert!(root.join(dir).join("debug").exists(), "{dir} is removed");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // Defect caught: `sys/random/mod.rs`'s marker guarding `hash/random.rs`
     // too, so a run stopped between the two writes left the key cell
     // upstream's for every later build.
@@ -1774,6 +2127,7 @@ mod tests
             real_clippy: PathBuf::from("real-clippy"),
             mirror_sysroot: PathBuf::from("mirror"),
             build_dir: PathBuf::from("build"),
+            std_deps_digest: String::from("digest"),
         };
         let mut cmd = Command::new("cargo");
         toolchain.apply_env(&mut cmd);
@@ -1789,6 +2143,11 @@ mod tests
             .filter(|w| !w.is_empty())
             .collect();
         assert_eq!(words, ["-D", "warnings"]);
+        let digest = cmd
+            .get_envs()
+            .find(|(key, _)| *key == STD_DEPS_DIGEST_VAR)
+            .and_then(|(_, value)| value);
+        assert_eq!(digest, Some(std::ffi::OsStr::new("digest")));
 
         // No other xtask code sets the variable, so no pass can give it
         // another value.

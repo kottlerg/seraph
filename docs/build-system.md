@@ -362,12 +362,38 @@ Cargo's own output stays in `target/`. The builds of the std-user programs compi
 `core` and `alloc`, from the seraph toolchain mirror, `target/seraph-toolchain/`, which carries
 the `std` overlay ([`xtask/src/rust_src.rs`](../xtask/src/rust_src.rs)); every other build
 compiles `core` and `alloc` from the toolchain's own `rust-src`. The mirror's builds take
-`target/seraph-build/` as Cargo's build directory, and their binaries still land in
+`target/seraph-build-<format>/` as Cargo's build directory, and their binaries still land in
 `target/<triple>/<profile>/` with every other build's. Two builds of one library package from
 two source paths cannot share a build directory: a host build script, `compiler_builtins`'s among
 them, is one unit for every target, its fingerprint records the path it was built from, and each
 kind of build would find the other's path there and rebuild the script, `compiler_builtins` and
 `alloc` for every target. `cargo xtask clean --all` removes `target/`, both directories with it.
+
+Cargo records no source file of a unit that `-Z build-std` compiles: it does not count such a unit
+as local, and drops every path of its dep-info under the package's root. It keeps the files outside
+that root (those `std` includes from `backtrace` and `portable-simd`, and `core` from `stdarch`)
+and the environment variables the unit reads. So three things judge the units of the mirror's
+builds current:
+
+- The toolchain's library sources are fixed by its version, which every unit's fingerprint holds.
+- `std`'s overlay is in the mirror's stamp, a hash of `runtime/ruststd/src/`, of
+  [`xtask/src/rust_src.rs`](../xtask/src/rust_src.rs) and of the toolchain's version. A stamp that
+  differs from the tree's makes xtask assemble the mirror anew, which writes `std`'s patched
+  `build.rs` again: `std`'s build script names that file, and Cargo judges a build script's files
+  by time, so the script reruns and `std` and every unit that depends on it are rebuilt.
+- The workspace crates `std` depends on (`STD_WORKSPACE_DEPS` in `xtask/src/rust_src.rs`, which
+  lists every path dependency of each of them too) each read `SERAPH_STD_DEPS_DIGEST` under
+  `rustc-dep-of-std`, which only `-Z build-std` enables. Every cargo command through the mirror
+  sets it to the SHA-512 of the names and contents of every file of those crates, so a change to
+  any of them changes a value their units recorded, and rebuilds them, `std`, and every
+  std-user program. Host tests check that each listed crate reads it and that the list holds every
+  path dependency of its crates.
+
+The build directory's name carries its format, the rules its units are judged by
+(`BUILD_DIR` in `xtask/src/rust_src.rs`, `target/seraph-build-1/`): a unit compiled under older
+rules can pass as current under newer ones, so each format builds in a directory of its own, which
+no xtask of another format writes into, and xtask removes the directories of older formats
+(`target/seraph-build/`, of the builds before the digest) before the build.
 
 ```
 sysroot/
@@ -839,15 +865,16 @@ firmware entry, and the bounded download, offline install and save of a booting 
 mode. No job seeds it: a `master` run's job on a new image version downloads and saves it, and
 every later run on that version installs offline.
 
-Cargo judges a build unit current by the checksums of the files rustc read for it, which the
+Cargo judges a unit of the tree current by the checksums of the files rustc read for it, which the
 unit's dep-info records, and not by their modification times, which a checkout or a cache restore
 resets: `.cargo/config.toml` sets `[unstable] checksum-freshness` and `[build] fingerprint =
-"content"`, which the nightly toolchain needs together. A build script's `rerun-if-changed` files
-are still judged by time, and a script that reruns makes its package and every dependent rebuild,
-so no package of the tree has a build script (a host test checks it): the linker scripts of the
-kernel and of the riscv64 bootloader are passed by `cargo xtask build`
-([§ Custom Targets](#custom-targets)). The toolchain's library build scripts (`compiler_builtins`')
-name library sources, which are dated as below.
+"content"`, which the nightly toolchain needs together. A unit `-Z build-std` compiles is judged as
+[§ Build Output: the Sysroot](#build-output-the-sysroot) describes. A build script's
+`rerun-if-changed` files are still judged by time, and a script that reruns makes its package and
+every dependent rebuild, so no package of the tree has a build script (a host test checks it): the
+linker scripts of the kernel and of the riscv64 bootloader are passed by `cargo xtask build`
+([§ Custom Targets](#custom-targets)). The toolchain's library build scripts
+(`compiler_builtins`') name library sources, which are dated as below.
 
 So the `build` jobs and `host-tests` carry their build between runs, through the composite action
 `.github/actions/carry/action.yml`, restored before their first build and saved as their last
@@ -865,7 +892,9 @@ build through the toolchain mirror that Cargo never sees, Markdown excepted), an
 change to any file the key hashes owes every job that saves an entry, and the key hashes no other
 source file of the tree, as host tests check. A job restores the
 newest entry whose key starts with its own up to the commit: an entry built from another tree is
-safe, since every unit restored is judged by content, and only what differs is rebuilt. Before the
+safe, since every unit restored is judged by the content of the tree it is restored into (a
+`-Z build-std` unit through the mirror's stamp and the digest of the crates `std` depends on), and
+only what differs is rebuilt. Before the
 build it dates the toolchain's library sources to 2000-01-01, which the install writes with its own
 time; the date hides no change, since the toolchain's version is in the key and in every unit's
 fingerprint. Only a push run on `master` saves, after its uploads, under the commit, and then

@@ -879,7 +879,7 @@ fn spells(found: &[u8], want: &[u8]) -> bool
         {
             return false;
         }
-        at += 1;
+        at = at.saturating_add(1);
     }
     found.get(want.len()) == Some(&0)
 }

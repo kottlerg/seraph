@@ -855,10 +855,12 @@ args! {
         #[arg(long, default_value = "512")]
         pub block_size: BlockSize,
 
-        /// Author the data partition alone on a second image, `disk-data.img`,
-        /// and only the ESP, root and swap partitions on `disk.img`; boot the pair
-        /// with `--second-disk disk-data.img`. Without it `disk.img` carries all
-        /// four and a `disk-data.img` an earlier authoring left is removed.
+        /// Author the data and swap partitions on a second image, `disk-data.img`,
+        /// and only the ESP and root partitions on `disk.img`, and stage the storage
+        /// statement naming the two; boot the pair with `--second-disk
+        /// disk-data.img`. Without it `disk.img` carries all four, and the statement
+        /// the split layout staged and a `disk-data.img` an earlier authoring left
+        /// are removed.
         #[arg(long)]
         pub split_data: bool,
     }
@@ -1236,6 +1238,10 @@ value_enum! {
         Vmgenid,
         /// PCI Express hotplug of a device and of a disk behind root ports.
         Hotplug,
+        /// vfsd gives each storage role to the boot disk or to the partition
+        /// the signed storage statement names, and none to a foreign disk or a
+        /// copy of the boot disk.
+        StorageRoles,
         /// The kernel's CET supervisor shadow stacks, under KVM (`x86_64`
         /// only).
         Cet,

@@ -46,8 +46,8 @@ IOMMU driver's image, which devmgr keeps for the driver's restart (§ Bootstrap-
 the loss of the root filesystem's driver or of its disk is system death; and the ESP holds no
 secret.
 
-The policy-bearing configuration files are signed in the configuration role, and svcmgr has procmgr
-verify each before it parses it ([signing.md](signing.md) § Configuration).
+The policy-bearing configuration files are signed in the configuration role, and each is verified
+before its consumer parses it ([signing.md](signing.md) § Configuration).
 
 ---
 

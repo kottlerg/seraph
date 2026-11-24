@@ -422,7 +422,7 @@ Run Seraph's tests: without a case, check formatting and lint the test code, the
 Usage: xtask test [OPTIONS] [CASE]
 
 Arguments:
-  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, storage-roles, cet, tpm, shutdown, debug-port]
 
 Options:
       --cell <TESTER>            Run every case the CI validate cell of TESTER runs on `--arch`, in the registry's order, each whatever another's outcome, and fail when one failed [possible values: svctest, usertest, ktest]
@@ -463,6 +463,7 @@ Arguments:
           - wedge:           The softlockup watchdog reports a CPU wedged with interrupts off
           - vmgenid:         The kernel detects a VM generation change across a snapshot restore (`x86_64` only)
           - hotplug:         PCI Express hotplug of a device and of a disk behind root ports
+          - storage-roles:   vfsd gives each storage role to the boot disk or to the partition the signed storage statement names, and none to a foreign disk or a copy of the boot disk
           - cet:             The kernel's CET supervisor shadow stacks, under KVM (`x86_64` only)
           - tpm:             The TPM 2.0 driver behind `tpm-tis` and `tpm-crb` (`x86_64` only)
           - shutdown:        The machine shuts down for each cause: a reboot, the power button, and the death of each core or critical service
@@ -888,7 +889,7 @@ Options:
       --knob <KNOB>              Stage a bootloader knob in `\EFI\seraph\`: `nokaslr` boots the kernel at its deterministic (un-randomized) layout, for GDB and symbolization; `mapredo` makes the bootloader redo the first attempt of its steps 6 and 7. Repeatable, or comma-separated. The image carries exactly the knobs named: every other is removed [possible values: nokaslr, mapredo]
       --log-levels <FILE>        Install FILE as the log-level configuration init reads (`/config/init/log-levels.conf`) in place of the repository's `services/init/log-levels.conf`, which mkdisk installs without it. Refused unless init's parser accepts every line
       --block-size <BLOCK_SIZE>  Logical block size of the authored images: the unit of their GPT LBAs and the sector size of their FAT volumes. `run` and the other launchers present the disk device at the size the image's GPT has [default: 512] [possible values: 512, 4096]
-      --split-data               Author the data partition alone on a second image, `disk-data.img`, and only the ESP, root and swap partitions on `disk.img`; boot the pair with `--second-disk disk-data.img`. Without it `disk.img` carries all four and a `disk-data.img` an earlier authoring left is removed
+      --split-data               Author the data and swap partitions on a second image, `disk-data.img`, and only the ESP and root partitions on `disk.img`, and stage the storage statement naming the two; boot the pair with `--second-disk disk-data.img`. Without it `disk.img` carries all four, and the statement the split layout staged and a `disk-data.img` an earlier authoring left are removed
   -h, --help                     Print help (see more with '--help')
 === xtask mkdisk --help
 Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
@@ -943,7 +944,7 @@ Options:
           [default: 512]
 
       --split-data
-          Author the data partition alone on a second image, `disk-data.img`, and only the ESP, root and swap partitions on `disk.img`; boot the pair with `--second-disk disk-data.img`. Without it `disk.img` carries all four and a `disk-data.img` an earlier authoring left is removed
+          Author the data and swap partitions on a second image, `disk-data.img`, and only the ESP and root partitions on `disk.img`, and stage the storage statement naming the two; boot the pair with `--second-disk disk-data.img`. Without it `disk.img` carries all four, and the statement the split layout staged and a `disk-data.img` an earlier authoring left are removed
 
   -h, --help
           Print help (see a summary with '-h')

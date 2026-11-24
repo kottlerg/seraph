@@ -17,6 +17,7 @@ bin = [
     { name = "planted-length", path = "src/bin/planted-length.rs", test = false },
     { name = "planted-magic", path = "src/bin/planted-magic.rs", test = false },
     { name = "planted-nested", path = "src/bin/planted-nested.rs", test = false },
+    { name = "storage-statement", path = "src/bin/storage-statement.rs", test = false },
 ]
 
 [package]
@@ -31,6 +32,7 @@ boot-protocol = { path = "../../../abi/boot-protocol" }
 fuzz-engine = { path = "../engine" }
 hwrng-protocol = { path = "../../../shared/hwrng-protocol" }
 init-protocol = { path = "../../../abi/init-protocol" }
+storage-statement = { path = "../../../shared/storage-statement" }
 vfsd-gpt = { path = "../../../services/vfsd/gpt" }
 
 [lints]

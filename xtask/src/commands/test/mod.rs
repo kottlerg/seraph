@@ -19,6 +19,7 @@ mod rollback;
 mod secureboot;
 mod shutdown;
 mod signing;
+mod storage_roles;
 mod terminal;
 mod tpm;
 mod vmgenid;

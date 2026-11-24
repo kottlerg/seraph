@@ -1,0 +1,5 @@
+# The split layout: data and swap on a second disk.
+
+data /data c0ffee01-2345-6789-abcd-ef0123456789
+data /srv/cache 00000000-0000-0000-0000-0000000000aa
+swap 5A9F0E11-2345-6789-ABCD-EF0123456789

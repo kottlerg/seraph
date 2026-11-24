@@ -97,6 +97,7 @@ members = [
     "shared/gdb-rsp",
     "shared/riscv-step",
     "shared/shmem",
+    "shared/storage-statement",
     "shared/svc-grammar",
     "shared/text",
     "programs/demandpaged",

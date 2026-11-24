@@ -23,10 +23,11 @@
 //! serves the disk and then finds it by querying devmgr first, and reads its
 //! file back. It logs [`TIE_MARKER`], the host adds a copy of the disk
 //! behind its second port, and the fixture checks that vfsd resolves the
-//! data role across every disk devmgr serves: `MOUNT` at `/data` answers
-//! `TABLE_FULL` (the path taken) while the data disk alone holds the
-//! partition, and `NO_MOUNT` (a tie at the highest priority) once devmgr
-//! serves the copy, and `/data` still reads.
+//! partition the storage statement names for `/data` across every disk
+//! devmgr serves: `MOUNT` at `/data` answers `TABLE_FULL` (the path taken)
+//! while the data disk alone holds the partition, and `NO_MOUNT` (two disks
+//! other than the boot disk carry the named partition) once devmgr serves
+//! the copy, and `/data` still reads.
 //!
 //! It then stops every thread of the root mount's driver through an attach
 //! with the debug authority it holds: a lookup at `/` that falls through
@@ -372,10 +373,11 @@ fn await_removed(mount: u64, ipc_buf: *mut u64) -> Result<(), String>
 
 /// Wait for vfsd to resolve the data role across the copy of the data disk
 /// the host adds: `MOUNT` at `/data` answers `TABLE_FULL` while the
-/// mounted data disk alone holds the partition (the role resolves, the path
-/// is taken), and `NO_MOUNT` once devmgr serves the copy, whose partition
-/// ties the data disk's at the highest priority, within [`DISK_WAIT`]. A
-/// role lookup that saw only the disks it held answers `TABLE_FULL` on.
+/// mounted data disk alone holds the partition the storage statement names
+/// (the role resolves, the path is taken), and `NO_MOUNT` once devmgr serves
+/// the copy, which carries the named partition too, so two disks other than
+/// the boot disk do, within [`DISK_WAIT`]. A resolution that saw only the
+/// disks it held answers `TABLE_FULL` on.
 fn await_tie(mount: u64, ipc_buf: *mut u64) -> Result<(), String>
 {
     let start = Instant::now();

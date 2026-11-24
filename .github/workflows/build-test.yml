@@ -1,553 +1,152 @@
-# SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
-
-# .github/workflows/build-test.yml
-
-# The canonical CI tier: host tests and the architecture x profile x harness
-# boots every push and pull request runs (docs/build-system.md
-# § Continuous Integration).
-
+# Probe of required-check behaviour on this repository; not for merge.
 name: build-test
 
 on:
-  push:
-    branches: [master]
   pull_request:
     branches: [master]
-  workflow_dispatch:
-
-# A pull request's newer push cancels its older run. Every other run (each
-# push to master, each merge commit among them) is grouped by its commit, so
-# no later run cancels or replaces it: each merge commit gets its own run
-# (docs/conventions.md § CI Gating).
-concurrency:
-  group: build-test-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
   host-tests:
+    if: false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-        with:
-          # commit-check reads the pull request's commits back to the base
-          # branch; the default depth of 1 holds only the merge commit.
-          fetch-depth: 0
+      - run: "true"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-11-10
-          components: rust-src,rustfmt,clippy,llvm-tools
-
-      - name: Restore the standard-library units
-        # Of the riscv64 test build's `-Z build-std`; see
-        # docs/build-system.md § Continuous Integration.
-        uses: ./.github/actions/std-cache
-        with:
-          mode: restore
-          name: host-tests
-
-      - name: cargo xtask lint-docs
-        run: cargo xtask lint-docs
-
-      - name: cargo xtask commit-check
-        if: github.event_name == 'pull_request'
-        run: >-
-          cargo xtask commit-check
-          --base origin/${{ github.base_ref }}
-          --head ${{ github.event.pull_request.head.sha }}
-
-      # `cargo xtask test` also runs the tests built for riscv64 under QEMU's
-      # user-mode emulator, linked by the riscv64 Linux cross compiler against
-      # its C library (xtask/README.md § `cargo xtask test`), and the image
-      # check's tests run dosfstools' fsck.fat (xtask/README.md § The image
-      # check).
-      # The packages come from the cache entry of this job's runner image,
-      # downloaded under a bound when it is absent (docs/build-system.md
-      # § Continuous Integration).
-      - name: Install the riscv64 test emulation and dosfstools
-        uses: ./.github/actions/qemu-packages
-        with:
-          mode: install
-          set: host-tests
-
-      - name: cargo xtask test
-        run: cargo xtask test
-
-      - name: Save the standard-library units
-        uses: ./.github/actions/std-cache
-        with:
-          mode: save
-          name: host-tests
-
-  kani:
-    # Every bounded proof, with the Kani release xtask pins (docs/testing.md
-    # § Bounded verification; docs/build-system.md § Toolchain). Installing
-    # the release and its setup take seconds, so nothing of Kani is cached.
+  req-0:
+    name: "validate (x86_64, debug, ktest)"
+    if: false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - run: "true"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-11-10
+  req-1:
+    name: "validate (x86_64, debug, svctest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
 
-      - name: Cache cargo and target
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: kani
+  req-2:
+    name: "validate (x86_64, debug, usertest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
 
-      # Installed outside the checkout, so the repository's
-      # rust-toolchain.toml does not choose the compiler that builds Kani;
-      # `cargo kani setup` installs the nightly Kani builds with.
-      - name: Install the pinned Kani release
+  req-3:
+    name: "validate (x86_64, release, ktest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+
+  req-4:
+    name: "validate (x86_64, release, svctest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+
+  req-5:
+    name: "validate (x86_64, release, usertest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+
+  req-6:
+    name: "validate (riscv64, debug, ktest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+
+  req-7:
+    name: "validate (riscv64, debug, svctest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+
+  req-8:
+    name: "validate (riscv64, debug, usertest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+
+  req-9:
+    name: "validate (riscv64, release, ktest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+
+  req-10:
+    name: "validate (riscv64, release, svctest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+
+  req-11:
+    name: "validate (riscv64, release, usertest)"
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      subset: ${{ steps.s.outputs.subset }}
+      empty: ${{ steps.s.outputs.empty }}
+    steps:
+      - id: s
         run: |
-          version=$(cargo xtask kani --pin)
-          cd "$RUNNER_TEMP"
-          cargo install --locked kani-verifier --version "$version"
-          cargo kani setup
+          echo 'subset={"include":[{"arch":"x86_64","profile":"debug","tester":"svctest"}]}' >> "$GITHUB_OUTPUT"
+          echo 'empty={"include":[]}' >> "$GITHUB_OUTPUT"
 
-      - name: cargo xtask kani
-        run: cargo xtask kani
-
-  # The gating fuzz tier (docs/testing.md § Fuzzing): the engine's self-test,
-  # then every target for the default execution count from seed 0, from the
-  # checked-in inputs alone, so a run is reproduced by the same command.
-  fuzz:
+  probe-matrix:
+    needs: select
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-11-10
-          components: rust-src,rustfmt,clippy,llvm-tools
-
-      - name: Cache cargo and target
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: fuzz
-
-      # A working corpus a cache restored would change what the fixed-seed
-      # run executes.
-      - name: Clear the fuzz working directories
-        run: rm -rf target/xtask/fuzz
-
-      - name: cargo xtask fuzz --self-test
-        run: cargo xtask fuzz --self-test
-
-      - name: cargo xtask fuzz --all
-        run: cargo xtask fuzz --all
-
-      - name: Upload the failing inputs
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fuzz-crashes
-          path: target/xtask/fuzz/*/crashes/
-          if-no-files-found: ignore
-
-  qemu-debs:
-    uses: ./.github/workflows/qemu-debs.yml
-
-  validate:
-    # After the qemu-debs job, which seeds the firmware entry and the .deb
-    # set of its own image; see docs/build-system.md § Continuous
-    # Integration.
-    needs: qemu-debs
-    runs-on: ubuntu-26.04
     strategy:
-      fail-fast: false
-      matrix:
-        arch: [x86_64, riscv64]
-        profile: [debug, release]
-        # One harness per cell: each cell builds once, stages exactly one
-        # recipe (or swaps boot.conf for ktest), then runs once. Avoids
-        # back-to-back fatfs/sysroot state accumulation across harnesses
-        # and lets a failing tier surface as a single named cell. After its
-        # boot, each cell runs the host-driven cases `cargo xtask test`'s
-        # registry assigns to its tester (`cargo xtask test --cell`): they
-        # need a runner that drives QEMU from the host (QMP, a gdbstub), not
-        # `run --runs`, and colocating them avoids a matrix dimension that
-        # would multiply with every arch. See docs/testing.md.
-        tester: [svctest, usertest, ktest]
+      matrix: ${{ fromJSON(needs.select.outputs.subset) }}
     steps:
-      - uses: actions/checkout@v6
+      - run: echo "${{ matrix.arch }} ${{ matrix.profile }} ${{ matrix.tester }}"
 
-      - name: Install QEMU and firmware
-        # From the cache entry of this cell's own runner image; see
-        # docs/build-system.md § Continuous Integration.
-        uses: ./.github/actions/qemu-packages
-        with:
-          mode: install
-
-      - name: Log QEMU versions
-        # A missing binary fails here rather than at the first boot. The
-        # version floor and the pinned image's QEMU are in
-        # docs/build-system.md § QEMU and Firmware and § Continuous Integration.
-        run: |
-          qemu-system-x86_64 --version
-          qemu-system-riscv64 --version
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-11-10
-          components: rust-src,rustfmt,clippy,llvm-tools
-
-      - name: Restore the standard-library units
-        # See docs/build-system.md § Continuous Integration. The cells of one
-        # architecture and profile build the same units, so they share one
-        # entry.
-        uses: ./.github/actions/std-cache
-        with:
-          mode: restore
-          name: validate-${{ matrix.arch }}-${{ matrix.profile }}
-
-      - name: Place the signing keys outside the checkout
-        # The job's first build generates a local root and a signing key in
-        # the runner's temporary directory, which the runner discards with the
-        # job (docs/signing.md § Signing). A job-level env cannot read the
-        # runner context, so the path is set for the later steps here.
-        run: echo "SERAPH_SIGNING_DIR=$RUNNER_TEMP/seraph-signing" >> "$GITHUB_ENV"
-
-      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }})
-        run: |
-          if [ "${{ matrix.profile }}" = "release" ]; then
-            cargo xtask build --arch ${{ matrix.arch }} --release
-          else
-            cargo xtask build --arch ${{ matrix.arch }}
-          fi
-
-      - name: Stage ${{ matrix.tester }} and repack disk
-        # Recipe staging: svctest and usertest live in
-        # `sysroot/config/svcmgr/tests/` (svcmgr does not scan that
-        # directory). usertest is cp'd into services/ to enable it; svctest is
-        # staged by `cargo xtask mkdisk --svctest ci`, which co-stages the
-        # `ci` fixture set below and records the set in svctest's staged
-        # recipe, and svctest fails a boot whose image stages other fixtures
-        # than the record declares (docs/testing.md § Gating). `cargo xtask mkdisk`
-        # re-mirrors rootfs and repacks the FAT image without invoking
-        # cargo. ktest swaps the bundle's `init` entry via
-        # `cargo xtask mkdisk --harness ktest`, which repacks the disk
-        # image with the ktest bundle. Every pack checks the images it
-        # writes (fsck.fat -n on every FAT volume, then the ESP against the
-        # root partition; xtask/README.md § The image check).
-        #
-        # The svctest cell's `ci` set co-stages crasher (the restart-path
-        # fixture), its worker-fault recipe (crasher-worker.svc) and its
-        # boot-fault recipe (crasher-boot.svc, whose first launch dies before
-        # its bootstrap request on the token the data partition ships):
-        # crasher is non-shutdown, so it shares the boot with
-        # svctest without racing pwrmgr shutdown; its bounded faults
-        # finish long before svctest's terminal marker. This is the only
-        # automated boot crasher runs in. It also co-stages memhog
-        # (memhog.svc), the out-of-memory policy service's fixture, which
-        # svctest's oom_policy phase has fill memory until oomd stops it,
-        # and stopsrc (stopsrc.svc), a stop source of the program class,
-        # whose job oomd stops first and whose source svcmgr lists. It also
-        # co-stages reserve-creator (reserve-creator.svc), svctest's fixture for
-        # a reserve creator's create while memory is critical.
-        #
-        # The functional harness boots also drop the autostarted `terminal`
-        # (a user-facing program, not part of the services/programs substrate
-        # under test) so the boot is controlled. `--repack-only` makes the
-        # removal stick: a normal repack re-mirrors rootfs, which would restore
-        # terminal.svc. The terminal is exercised in its own boot (the
-        # `terminal` case, below).
-        #
-        # The usertest cell also packs the log-level configuration that sets
-        # vfsd to debug (services/init/log-levels-vfsd-debug.conf), and its
-        # boot checks that the level reached vfsd and the fatfs it spawns and
-        # no other service. The ktest cell also stages the `mapredo` knob, so
-        # the bootloader redoes the first attempt of its steps 6 and 7, and
-        # its boot checks the bootloader's line for the redo; the boot host
-        # test `the_mapredo_knob_redoes_the_first_attempt_alone` holds the redo
-        # to one.
-        #
-        # The svctest cell also drops crashd (the crash service, default-on), so
-        # one boot per arch and profile runs an image without it: its faults,
-        # crasher's among them, must kill as with no handler and leave no crash
-        # report (`--crash-reports none` on its boot, below). The usertest cell
-        # keeps crashd and checks the crashme fixture's reports; it stages
-        # crashd's test recipe over the default one, so crashd also writes a
-        # core of each crashme death to /crash, which the crashme tester checks.
-        #
-        # `mkdisk --svctest` also stages the test-only device class files of
-        # `sysroot/config/devmgr/tests/` (svcmgr does not scan that directory)
-        # into `classes/`, and the svctest cell's boot attaches the test devices
-        # (`--test-devices`, below) the test-only drivers bind.
-        run: |
-          case "${{ matrix.tester }}" in
-            svctest)
-              rm -f sysroot/config/svcmgr/services/terminal.svc
-              rm -f sysroot/config/svcmgr/services/crashd.svc
-              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
-                --svctest ci
-              ;;
-            usertest)
-              cp sysroot/config/svcmgr/tests/usertest.svc \
-                 sysroot/config/svcmgr/tests/crashd.svc \
-                 sysroot/config/svcmgr/services/
-              rm -f sysroot/config/svcmgr/services/terminal.svc
-              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
-                --log-levels services/init/log-levels-vfsd-debug.conf
-              ;;
-            ktest)
-              cargo xtask mkdisk --arch ${{ matrix.arch }} --harness ktest \
-                --knob mapredo
-              ;;
-          esac
-
-      - name: Run ${{ matrix.tester }}
-        # Per-cell boot budget, for HANG classification, derived as
-        # docs/build-system.md § Continuous Integration states from each
-        # cell's worst pass, over the boots of its image (the cell's boot, and
-        # on usertest and ktest the log-level and mapredo boots whose checks
-        # its boot carries), in the 174 build-test runs from 2026-11-17 22:44 to
-        # 2026-11-18 15:28 UTC (the latest attempt of each); the worst passes
-        # are beside the values. riscv64 debug
-        # svctest's three runs that the previous 300 s budget cut short were
-        # still passing phases; its worst is the slowest one's projected
-        # completion (the phases it had left, at its own pace, from a passing
-        # run's log), above the 297.5 s of its worst observed pass.
-        run: |
-          case "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" in
-            riscv64-debug-svctest)    budget=1140 ;;  # worst pass 372.3 s
-            riscv64-debug-usertest)   budget=540 ;;   # worst pass 168.4 s
-            riscv64-debug-ktest)      budget=300 ;;   # worst pass 81.9 s
-            riscv64-release-svctest)  budget=660 ;;   # worst pass 201.0 s
-            riscv64-release-usertest) budget=240 ;;   # worst pass 66.4 s
-            riscv64-release-ktest)    budget=240 ;;   # worst pass 70.9 s
-            x86_64-debug-svctest)     budget=480 ;;   # worst pass 159.0 s
-            x86_64-debug-usertest)    budget=240 ;;   # worst pass 61.4 s
-            x86_64-debug-ktest)       budget=480 ;;   # worst pass 153.3 s
-            x86_64-release-svctest)   budget=420 ;;   # worst pass 129.5 s
-            x86_64-release-usertest)  budget=180 ;;   # worst pass 39.3 s
-            x86_64-release-ktest)     budget=540 ;;   # worst pass 175.8 s
-            *) echo "no budget for this cell" >&2; exit 1 ;;
-          esac
-          # The svctest boot attaches the test devices its devmgr phases drive.
-          test_devices=
-          if [ "${{ matrix.tester }}" = "svctest" ]; then
-            test_devices=--test-devices
-          fi
-          # Runs one boot the budget bounds. A pass over half its budget has
-          # outgrown the worst pass the budget was derived from, a third of
-          # the budget or less, so the budget is due for re-derivation before
-          # a slower draw of the same boot reaches it; a warning annotation on
-          # the run says so and fails nothing.
-          budgeted() {
-            started=$SECONDS
-            "$@"
-            took=$((SECONDS - started))
-            if [ "$took" -gt $((budget / 2)) ]; then
-              echo "::warning title=boot budget::$3 took ${took} s, over half of the cell's ${budget} s budget; re-derive the budgets (docs/build-system.md § Continuous Integration)."
-            fi
-          }
-          # --save-logs keeps every run's log, a PASS included, for the
-          # run-saved artifact below, so a cell's per-phase timings
-          # can be compared across heads.
-          # The boot also checks the crash service's report blocks in its log:
-          # the svctest image staged no crashd, so its log must hold no crash
-          # report; the usertest boot ran the crashme fixture with crashd
-          # staged, whose reports must be there and well-formed.
-          crash_reports=
-          case "${{ matrix.tester }}" in
-            svctest)  crash_reports="--crash-reports none" ;;
-            usertest) crash_reports="--crash-reports reports" ;;
-          esac
-          # The usertest boot also checks the log-level configuration its
-          # staging packed: a debug line of vfsd and of the fatfs vfsd spawns,
-          # and none of devmgr or procmgr. The ktest boot also checks the
-          # bootloader's line for the mapredo knob its staging staged, and fails
-          # on a SKIP line: at the cell's 4 CPUs and initial capability set no
-          # test's skip condition holds (docs/testing.md § Gating).
-          checks=()
-          case "${{ matrix.tester }}" in
-            usertest)
-              checks=(--require '\[vfsd\] DEBUG ' --require '\[fatfs\] DEBUG '
-                      --fail-also '\[(devmgr|procmgr)\] DEBUG ') ;;
-            ktest)
-              checks=(--require 'mapredo knob present; redoing steps 6 and 7'
-                      --fail-also ' SKIP ') ;;
-          esac
-          budgeted cargo xtask run \
-            --arch ${{ matrix.arch }} \
-            --runs 1 --timeout "$budget" \
-            --save-logs target/xtask/run-saved $test_devices $crash_reports \
-            "${checks[@]}"
-
-      - name: Run ${{ matrix.tester }}'s cases
-        # The host-driven cases of `cargo xtask test`'s registry this cell's
-        # tester runs (xtask/README.md § `cargo xtask test`; docs/testing.md
-        # § Coverage tiers): on usertest the terminal, wedge, shutdown,
-        # signing, dma-confinement, rollback, enrolment, secureboot and
-        # storage-roles cases, and vmgenid on x86_64; on ktest the kaslr case;
-        # svctest has none. Each case boots the default image of its bundle,
-        # so the plain repack first re-mirrors rootfs (dropping the staged
-        # test recipes and restoring terminal.svc), installs the repository's
-        # log-level configuration, and removes the knobs, keeping the
-        # recorded harness. The signing and rollback cases build their
-        # bootloaders in the cell's profile. Each case runs whatever another's outcome,
-        # and the step fails naming the cases that failed. The cases run in
-        # three lanes side by side, each on its own copy of the checkout,
-        # since each boot keeps about one of the runner's four vCPUs busy
-        # (xtask/README.md § Cells); the step reports each case's and each
-        # lane's wall and CPU time.
-        run: |
-          cargo xtask mkdisk --arch ${{ matrix.arch }}
-          release=
-          if [ "${{ matrix.profile }}" = "release" ]; then
-            release=--release
-          fi
-          cargo xtask test --cell ${{ matrix.tester }} --arch ${{ matrix.arch }} $release \
-            --lanes 3
-
-      - name: Upload run logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: run-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
-          path: |
-            target/xtask/run/**/*.log
-            target/xtask/run/**/*.crash.txt
-            target/xtask/test/*/*/*.log
-            target/xtask/lanes/**/*.log
-            target/xtask/lanes/**/*.crash.txt
-          if-no-files-found: ignore
-
-      - name: Upload saved run logs
-        # Every run's log, a PASS included, kept only as long as a cross-head
-        # timing comparison needs; the failure logs above keep the
-        # repository's default retention.
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: run-saved-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
-          path: |
-            target/xtask/run-saved/*.log
-            target/xtask/run-saved/*.crash.txt
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Save the standard-library units
-        # Last, since it empties Cargo's build directories but for those units.
-        uses: ./.github/actions/std-cache
-        with:
-          mode: save
-          name: validate-${{ matrix.arch }}-${{ matrix.profile }}
-
-  bench:
-    # The benchmark cell: the bench-only ktest image and the userspace ubench
-    # suite of each architecture, booted under QEMU's icount, whose counts
-    # repeat from run to run, and their one-CPU counts held to the checked-in
-    # baselines (xtask/README.md § `cargo xtask bench-check`; docs/testing.md
-    # § Gating). After the
-    # qemu-debs job, as validate is; see docs/build-system.md § Continuous
-    # Integration.
-    needs: qemu-debs
-    runs-on: ubuntu-26.04
+  probe-empty-guarded:
+    needs: select
+    if: needs.select.outputs.empty != '{"include":[]}'
+    runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.empty) }}
+    steps:
+      - run: "true"
+
+  probe-skipped-matrix:
+    if: false
+    runs-on: ubuntu-latest
+    strategy:
       matrix:
         arch: [x86_64, riscv64]
     steps:
-      - uses: actions/checkout@v6
+      - run: "true"
 
-      - name: Install QEMU and firmware
-        uses: ./.github/actions/qemu-packages
-        with:
-          mode: install
+  probe-empty:
+    needs: select
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJSON(needs.select.outputs.empty) }}
+    steps:
+      - run: "true"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-11-10
-          components: rust-src,rustfmt,clippy,llvm-tools
-
-      - name: Restore the standard-library units
-        # As validate's step of the same name.
-        uses: ./.github/actions/std-cache
-        with:
-          mode: restore
-          name: bench-${{ matrix.arch }}
-
-      - name: Place the signing keys outside the checkout
-        # As validate's step of the same name.
-        run: echo "SERAPH_SIGNING_DIR=$RUNNER_TEMP/seraph-signing" >> "$GITHUB_ENV"
-
-      - name: Build the benchmark image (${{ matrix.arch }})
-        # The release profile, the build that runs on hardware (docs/testing.md
-        # § Benchmarks); the host-mode bands were calibrated on the same build,
-        # so both modes measure one build.
-        run: |
-          cargo xtask build --arch ${{ matrix.arch }} --release --ktest-bench-only
-          cargo xtask mkdisk --arch ${{ matrix.arch }} --harness ktest
-
-      - name: Boot it under icount
-        # Three one-CPU runs, whose counts the gate compares, and one
-        # four-CPU run, whose counts it reports. A boot takes about 15 s.
-        run: |
-          cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 1 \
-            --runs 3 --timeout 300 --save-logs target/xtask/bench
-          cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 4 \
-            --runs 1 --timeout 300 --save-logs target/xtask/bench
-
-      - name: Stage the ubench suite (${{ matrix.arch }})
-        # The init harness's image with ubench's recipe staged and the
-        # terminal dropped, so it adds no output of its own to the framebuffer
-        # console_write measures (logd's mirror of the log lines still does); `--repack-only` keeps the staging, as the
-        # functional harness cells' staging does (programs/ubench/README.md
-        # § Running).
-        run: |
-          cargo xtask mkdisk --arch ${{ matrix.arch }} --harness init
-          cp sysroot/config/svcmgr/tests/ubench.svc \
-             sysroot/config/svcmgr/services/
-          rm -f sysroot/config/svcmgr/services/terminal.svc
-          cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
-
-      - name: Boot ubench under icount
-        # As the ktest boots, with a framebuffer for console_write; the logs
-        # go to their own directory, since a saved log is named by its
-        # architecture, CPU count and run alone.
-        run: |
-          cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 1 \
-            --display framebuffer --runs 3 --timeout 900 \
-            --save-logs target/xtask/bench/ubench
-          cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 4 \
-            --display framebuffer --runs 1 --timeout 900 \
-            --save-logs target/xtask/bench/ubench
-
-      - name: cargo xtask bench-check
-        # Writes the cell's environment beside its logs, for
-        # `cargo xtask bench-baseline --from-run`.
-        run: |
-          cargo xtask bench-check --mode icount \
-            --write-env target/xtask/bench/ENV target/xtask/bench/*.log \
-            target/xtask/bench/ubench/*.log
-
-      - name: Upload the benchmark logs
-        # `cargo xtask bench-baseline --from-run <run id>` reads them.
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: bench-${{ matrix.arch }}
-          path: |
-            target/xtask/bench/*.log
-            target/xtask/bench/ubench/*.log
-            target/xtask/bench/ENV
-          if-no-files-found: ignore
-
-      - name: Save the standard-library units
-        # As validate's step of the same name.
-        uses: ./.github/actions/std-cache
-        with:
-          mode: save
-          name: bench-${{ matrix.arch }}
+  summary:
+    needs: [host-tests, select, probe-matrix, probe-empty-guarded, probe-skipped-matrix, probe-empty]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo '${{ toJSON(needs) }}'

@@ -209,6 +209,7 @@ pub const FILE_ROWS: &[(&str, Class, &str)] = &[
         HOST_TOOL,
     ),
     ("xtask/src/diag.rs", Class::Host, HOST_TOOL),
+    ("xtask/src/markdown.rs", Class::Host, HOST_TOOL),
     ("xtask/src/path_account.rs", Class::Host, HOST_TOOL),
     ("xtask/src/path_record.rs", Class::Host, HOST_TOOL),
     ("xtask/src/tasklist.rs", Class::Host, HOST_TOOL),

@@ -46,6 +46,8 @@ xtask/
 │   ├── image_check.rs          # The check every pack makes of the images it wrote (fsck.fat, ESP)
 │   ├── layers.rs               # The layer record: the class of each path, which sets the CI
 │   │                           #   cells a change to it owes (cells)
+│   ├── markdown.rs             # Fenced code blocks, as lint-docs and the PR and Issue checks read
+│   │                           #   Markdown
 │   ├── path_account.rs         # The per-path instruction account: the images a boot placed,
 │   │                           #   attribution, the result file, the documents' blocks
 │   ├── path_record.rs          # The path-account plugin's record: reads, windows, rows
@@ -2234,6 +2236,7 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 |---|---|---|
 | `pr-unticked-box` | error | The body has no unticked task-list item (§ PR-body checklist discipline): `[ ]` after a `-`, `*`, `+`, or numbered list marker, the forms GitHub renders as a checkbox. |
 | `pr-attribution` | error | The body carries no tool attribution line and no session link. |
+| `pr-tool-output` | error | The body carries no line of tool output ([docs/conventions.md](../docs/conventions.md) § Style, whose rule covers a comment on a PR or an Issue too, which the command does not read), the text a command prints on stderr for its user, which no author wrote and which a read of the body with stderr merged into it writes back: a line that begins `hint:` at column 0 (the advice `gh` and `git` print, such as the block `gh` 2.105 prints after reading a pull request) a line whose text after its indentation begins `gh event listen` (the command that block suggests), each with every line of its block (each indented, non-blank line after it, up to a blank line or a line at column 0), and a cargo status line (one of cargo's status verbs, such as `Compiling`, `Finished` or `Running`, indented to end at column 12, then a space). Each such line is an error that names it, so one run names every line of a block. A line inside a fenced code block (backticks or tildes) is not read, so a body may quote tool output there; an indented code block is read as prose, since the second line of `gh`'s hint block is indented as one. |
 | `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`; a closing reference that names a repository (`<owner>/<repo>#N`, or the Issue's URL) is not compared. A drain PR that closes a follow-up Issue of the earlier pattern carries both (§ Follow-up Issues); in any other body the pair usually means a sentence closes an Issue the PR only references. |
 | `pr-refs-unread` | warning | Every `#N` after the start of a `Refs` list on its body line is read as a referenced Issue (a line with the word but no list, such as a rule name or prose, is not checked): one the `Refs` list does not reach, because other text stands between it and the number before it, is named with its line, since its ticks and state go unchecked. A reference into another repository is not counted. |
 | `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
@@ -2246,6 +2249,7 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 | `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |
 | `issue-milestone` | error | Every Issue the PR closes carries the current milestone, the lowest-versioned open one. |
 | `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
+| `issue-tool-output` | error | The body of every Issue the PR closes or references with `Refs #N` carries no line of tool output, as `pr-tool-output` reads it; each one is an error that names its line. |
 
 The command prints the Issues the body and the commits close and the ones the body references,
 so that a keyword in prose that closes an Issue by accident is seen. A `Refs` keyword references
@@ -2496,7 +2500,9 @@ destroying it.
 cargo xtask issue-edit <N> --body-file <path> [--allow-removal]
 ```
 
-The command refuses an empty body. Unless `--allow-removal` is given (an edit that drops,
+The command refuses an empty body, and a body that carries a line of tool output, as
+`pr-tool-output` of [`cargo xtask pr-check`](#cargo-xtask-pr-check) reads it, naming every such
+line. Unless `--allow-removal` is given (an edit that drops,
 rewords, or reopens items on purpose, as
 [docs/conventions.md](../docs/conventions.md) § Acceptance checklist discipline allows), it also
 refuses a body that lacks a task-list item the Issue holds, or that reopens one the Issue has
@@ -2517,11 +2523,12 @@ cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
 ```
 
 The command refuses a filing without a class label, without a subsystem label, or without a
-milestone decision. `--unscheduled` files an Issue without a milestone, which
-[docs/conventions.md](../docs/conventions.md) § Milestones allows only for an Issue that cannot
-be worked on now, and needs `--reason`: `hardware` (it needs hardware the project does not
-have), `not-possible` (it is not possible yet) or `undecided` (whether it belongs in the project
-is itself undecided). The body states the same reason in a line that begins
+milestone decision, and one whose body carries a line of tool output, as `pr-tool-output` of
+[`cargo xtask pr-check`](#cargo-xtask-pr-check) reads it. `--unscheduled` files an Issue without
+a milestone, which [docs/conventions.md](../docs/conventions.md) § Milestones allows only for an
+Issue that cannot be worked on now, and needs `--reason`: `hardware` (it needs hardware the
+project does not have), `not-possible` (it is not possible yet) or `undecided` (whether it
+belongs in the project is itself undecided). The body states the same reason in a line that begins
 `No milestone: <reason>`, the reason as `--reason` names it and the rest of the line saying why;
 the command refuses an `--unscheduled` filing whose body has no such line or one naming another
 reason, and a filing under a milestone whose body has one. It refuses a rolling follow-up Issue

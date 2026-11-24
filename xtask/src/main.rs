@@ -70,6 +70,7 @@ mod guest;
 mod host_lock;
 mod image_check;
 mod layers;
+mod markdown;
 mod path_account;
 mod path_record;
 mod qemu;

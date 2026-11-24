@@ -746,7 +746,9 @@ pub unsafe fn open_esp_volume(
 /// is that of the deepest handle on the path with `EFI_PCI_IO_PROTOCOL`,
 /// which `LocateDevicePath` finds, from its `GetLocation`; `None` when no
 /// handle on the path has the protocol, a call fails, or a value lies outside
-/// its PCI range. Neither absence fails the boot.
+/// its PCI range. The bootloader goes on without either; vfsd, which takes the
+/// boot disk from them, finds none without the descriptor (docs/storage.md
+/// § GPT Role-GUID Discovery).
 ///
 /// # Safety
 /// `bs` must be valid boot services and `device` the device handle from the

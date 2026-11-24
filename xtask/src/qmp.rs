@@ -60,12 +60,7 @@ impl Client
 
     fn send(&mut self, json: &str) -> Result<()>
     {
-        self.writer
-            .write_all(json.as_bytes())
-            .context("QMP write")?;
-        self.writer.write_all(b"\n").context("QMP write newline")?;
-        self.writer.flush().context("QMP flush")?;
-        Ok(())
+        send_line(&mut self.writer, json)
     }
 
     /// Read QMP lines until a command result, skipping asynchronous `event`
@@ -111,6 +106,21 @@ impl Client
             }
         }
     }
+}
+
+/// Write the QMP command `json` and its newline terminator to `out` in one
+/// write. QEMU runs a command as soon as its JSON object closes, without
+/// waiting for the newline, so after a command that ends the connection
+/// (`quit`) QEMU can exit before a terminator written on its own arrives,
+/// and that write fails with `EPIPE` although the command ran.
+fn send_line(out: &mut impl Write, json: &str) -> Result<()>
+{
+    let mut line = String::with_capacity(json.len().saturating_add(1));
+    line.push_str(json);
+    line.push('\n');
+    out.write_all(line.as_bytes()).context("QMP write")?;
+    out.flush().context("QMP flush")?;
+    Ok(())
 }
 
 /// Connect to the QMP socket, complete the handshake, and inject each
@@ -668,6 +678,62 @@ mod tests
             r#"{"event": "SHUTDOWN", "data": {"device": "hotplug-edu"}}"#,
             "hotplug-edu"
         ));
+    }
+
+    /// A peer that reads commands as QEMU's QMP parser does: it acts on a
+    /// command once its JSON object closes and then, as after `quit`, has
+    /// closed the connection, so any later write fails.
+    #[derive(Default)]
+    struct QuittingPeer
+    {
+        received: Vec<u8>,
+        depth: u32,
+        closed: bool,
+    }
+
+    impl Write for QuittingPeer
+    {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize>
+        {
+            if self.closed
+            {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            for &byte in buf
+            {
+                self.received.push(byte);
+                match byte
+                {
+                    b'{' => self.depth = self.depth.saturating_add(1),
+                    b'}' =>
+                    {
+                        self.depth = self.depth.saturating_sub(1);
+                        self.closed |= self.depth == 0;
+                    }
+                    _ =>
+                    {}
+                }
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()>
+        {
+            Ok(())
+        }
+    }
+
+    // Defect caught: the command and its newline written apart, so QEMU
+    // runs `quit` on the closing brace, exits, and the newline's write
+    // fails with EPIPE: the vmgenid case failed so after a completed
+    // migration.
+    #[test]
+    fn a_command_and_its_newline_go_in_one_write()
+    {
+        let mut peer = QuittingPeer::default();
+        send_line(&mut peer, r#"{"execute":"quit"}"#).unwrap();
+        assert_eq!(peer.received, b"{\"execute\":\"quit\"}\n");
+        assert!(peer.closed);
     }
 
     #[test]

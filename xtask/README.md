@@ -839,9 +839,11 @@ directory to each case. Each lane's output is echoed prefixed `[lane N]` and kep
 `target/xtask/lanes/<N>/lane.log`, with the lane's `test/` and `run/` logs copied beside it when
 the lane ends. The cell then reports each case's outcome, wall time and CPU time (its process's and
 its boots', from `/proc`, where the host has it) and each lane's, and fails naming the cases that
-failed. Around the lanes it records `sysroot/`, `symbols/`, the images and `target/xtask/signing/`
-of the checkout itself, and fails, naming each path, when a lane changed one: a case that wrote
-outside its copy fails the cell rather than racing another lane. `--lanes` above 1 refuses
+failed. A failed case's report line ends with the last `error:` line the case printed, so its
+cause reads from the report and not only from the lanes' interleaved output. Around the lanes it
+records `sysroot/`, `symbols/`, the images and `target/xtask/signing/` of the checkout itself, and
+fails, naming each path, when a lane changed one: a case that wrote outside its copy fails the cell
+rather than racing another lane. `--lanes` above 1 refuses
 `--alone` and `--timing`, which run a boot beside no other QEMU.
 
 CI (`.github/workflows/build-test.yml`) runs, in every cell after the cell's own boot,
@@ -961,7 +963,10 @@ state. Asserts — host-side — the kernel's `entropy: VM generation change
 detected` marker and a post-resume interactive liveness round (`help` over
 QMP → `shell built-ins:` on serial). The case fails on a QMP error, a failed
 migration, or a timeout: 180 s per marker-wait phase, 120 s for the
-migrate-to-file poll, 30 s for the source to quit.
+migrate-to-file poll, 30 s for the source to quit. Each failure names its step
+(`setup`, `boot A`, `migrate to file`, `quit source`, `boot B`, `liveness`)
+and its cause: the QMP error, the timeout with its bound, or the markers
+awaited.
 
 ```sh
 cargo xtask build

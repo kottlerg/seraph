@@ -428,8 +428,8 @@ fn swap_client_phase(caps: &Caps)
     require_refusals(swap);
 
     let mut hog = Hog::new();
-    let _ = settle_resident(authority, None);
-    let baseline = baseline_totals();
+    let _ = settle_resident(authority, PHASE, None);
+    let baseline = baseline_totals(authority, PHASE);
     let reserve = pool().reserve_pages();
     let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Page);
     let begun = pool().evictions;
@@ -594,13 +594,13 @@ fn swap_client_phase(caps: &Caps)
 
     buf.release();
     let slot_map_pages = free0.div_ceil(free_pool::disk::SLOT_WORDS_PER_PAGE);
-    let floor = baseline.saturating_sub(slot_map_pages.saturating_mul(PAGE_SIZE));
-    let end = settle_resident(authority, Some(floor));
+    let floor = baseline.less(slot_map_pages.saturating_mul(PAGE_SIZE));
+    let end = settle_resident(authority, PHASE, Some(&floor));
     std::os::seraph::log!(
         "memmgr_swap_client phase passed ({} bytes sealed, chi-square {chi}, t lost and its \
          chunk's fault declined, free, deferred and svctest's own {} pages above the start less \
          the {slot_map_pages} slot-map pages)",
         sealed.len(),
-        end.saturating_sub(floor) / PAGE_SIZE
+        end.saturating_sub(floor.totals) / PAGE_SIZE
     );
 }

@@ -265,8 +265,8 @@ fn swap_raw_phase(caps: &Caps)
     assert_ne!(swap, 0, "{PHASE}: no memmgr.swap seed");
 
     let mut hog = Hog::new();
-    let _ = settle_resident(authority, None);
-    let baseline = baseline_totals();
+    let _ = settle_resident(authority, PHASE, None);
+    let baseline = baseline_totals(authority, PHASE);
     let reserve = pool().reserve_pages();
     let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Noise);
     let threads = attach(authority, process, "the fixture");
@@ -411,12 +411,12 @@ fn swap_raw_phase(caps: &Caps)
     assert!(status.success(), "{PHASE}: the fixture exited {status:?}");
     buf.release();
     let slot_map_pages = free0.div_ceil(free_pool::disk::SLOT_WORDS_PER_PAGE);
-    let floor = baseline.saturating_sub(slot_map_pages.saturating_mul(PAGE_SIZE));
-    let end = settle_resident(authority, Some(floor));
+    let floor = baseline.less(slot_map_pages.saturating_mul(PAGE_SIZE));
+    let end = settle_resident(authority, PHASE, Some(&floor));
     std::os::seraph::log!(
         "memmgr_swap_raw phase passed ({raw_count} chunks raw, one written and restored, one \
          cancelled in flight, {written} written by swapd and faulted back, free, deferred and svctest's own {} pages above the start less the \
          {slot_map_pages} slot-map pages)",
-        end.saturating_sub(floor) / PAGE_SIZE
+        end.saturating_sub(floor.totals) / PAGE_SIZE
     );
 }

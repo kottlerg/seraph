@@ -217,7 +217,7 @@ bootloader embeds.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SERAPH_SIGNING_DIR` | `seraph/signing/ed25519-ml-dsa-65-roles-1-9` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory; one that holds an identity of the earlier Ed25519 format is refused, and so is a signing key the build's trust store does not trust for every role, the error naming the roles it lacks. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
+| `SERAPH_SIGNING_DIR` | `seraph/signing/ed25519-ml-dsa-65-roles-1-9` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory; one that holds an identity of the earlier Ed25519 format is refused, and so is a signing key the build's trust store does not trust for every role, the error naming the roles it lacks. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job that builds signs with keys it generates, which `build-test.yml`'s build job ships to the cells of its run ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration) |
 | `SERAPH_SIGNER` | (none) | An external signer program, which signs in place of `signer.seed`: it reads the encoded signed attributes on its standard input and writes the 3,373-byte composite signature to its standard output. The identity directory MUST already hold the certificate (or public key) and store |
 | `SERAPH_TRUST_STORE` | (none) | A deployer's trust store file, combined with the identity's |
 | `SERAPH_SECURE_BOOT_KEY` | (none) | The PEM private key of the db key `build` Authenticode-signs the installed bootloader, `/boot/boot.efi`, with (`sbsign`, then `sbverify` against the certificate), so a firmware that enrols its certificate in db boots it under UEFI Secure Boot ([docs/signing.md](../docs/signing.md) § Secure Boot). Set together with `SERAPH_SECURE_BOOT_CERT`; with neither set the bootloader is not signed, and one alone is refused |
@@ -725,7 +725,7 @@ Over the whole workspace (`all`), it then lints the host crates' non-test code a
 `cargo xtask build` does (`clippy_host` of `src/commands/build.rs`: `xtask`, the wrapper shim and
 the path-account plugin under the workspace lints, then the fuzz engine and targets with
 `--cfg fuzzing`), so CI's `host-tests` job, which runs on every change, proves the pass every
-booting cell's build runs.
+build job's build runs.
 
 Tests compile for the host — no `--arch` flag needed. The workspace-level
 `panic=abort` profile does not affect the test harness.
@@ -1662,7 +1662,7 @@ cargo xtask cells [--since <COMMIT> | --since-green <REV>] [--github-output <FIL
 |---|---|---|
 | `--since <COMMIT>` | no base | The change from this commit to the working tree |
 | `--since-green <REV>` | no base | The change from the newest commit of `REV`'s first-parent history, 200 commits at most, whose `build-test` run on a push to `master` passed (`gh run list`); every cell, after a `WARNING:` line, when there is none or the runs cannot be read |
-| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate` and `bench`, each a matrix's `include` list; `validate-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
+| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate`, `build` and `bench`, each a matrix's `include` list, `build` holding one tree per architecture and profile a `validate` cell is owed in and the release trees when the `bench` cell is owed, those with `bench` true; `validate-owed`, `build-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
 
 Without a base, every cell is owed. With one, the command places each changed file
 (`git diff --name-only` from the base to the working tree, a rename as both its paths) in a

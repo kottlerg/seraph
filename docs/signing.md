@@ -816,8 +816,10 @@ never loaded;
 xtask refuses a directory `SERAPH_SIGNING_DIR` names that holds one of another format, saying that
 its format is the reason, and a signing key the build's trust store does not trust for every role,
 naming the roles it lacks. xtask refuses a directory or a key file whose canonical path lies inside
-the work tree, `target/` included. CI generates its keys per job in the runner's temporary directory
-and discards them.
+the work tree, `target/` included. CI generates its keys per build job in the runner's temporary
+directory; `build-test.yml`'s build job ships them to the cells of its run with the tree they
+sign, as an artifact kept three days, and the other jobs discard them with the job. No store but the
+ones those jobs build trusts them.
 
 **External signer.** In place of a key file, xtask runs a configured signer command
 (`SERAPH_SIGNER`): it receives the encoded signed attributes on its standard input and writes the

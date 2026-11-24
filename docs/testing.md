@@ -483,14 +483,14 @@ recipe (`/config/svcmgr/tests/ubench.svc`) staged by `cargo xtask mkdisk --ubenc
 no program in the image; it logs its own
 lines and fsbench's.
 
-CI's `bench` cell, one per architecture, builds both in the release profile
-(`cargo xtask build --release --ktest-bench-only`) and boots them under QEMU's icount
-(`cargo xtask run --icount`): one guest clock tick per retired instruction, so a benchmark's
+CI's `bench` cell, one per architecture, takes both in the release profile from its architecture's
+release build job (`cargo xtask build --release --ktest-bench-only`) and boots them under QEMU's
+icount (`cargo xtask run --icount`): one guest clock tick per retired instruction, so a benchmark's
 count is the same in every run of one build, whatever the runner's load. It boots each three times
-at one CPU and once at four, the ubench boots with a framebuffer (`--display framebuffer`) and
-their logs saved in `ubench/` beside the ktest boots', and one
-`cargo xtask bench-check --mode icount` over both sets compares each measurement's lowest p50
-over the runs that reported its suite with its baseline under `xtask/baselines/bench/icount/`
+at one CPU and once at four, the ubench boots with a framebuffer (`--display framebuffer`) and their
+logs saved in `ubench/` beside the ktest boots', and one `cargo xtask bench-check --mode icount`
+over both sets compares each measurement's lowest p50 over the runs that reported its suite with its
+baseline under `xtask/baselines/bench/icount/`
 ([xtask/README.md § `cargo xtask bench-check`](../xtask/README.md#cargo-xtask-bench-check)).
 
 The one-CPU counts gate: a count further from its baseline than the larger of 1% of it and 8

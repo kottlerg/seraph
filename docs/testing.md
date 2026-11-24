@@ -26,7 +26,7 @@ layer and the layers below and nothing above.
 | Layer | Harness | What the layer holds | The harness's image |
 |---|---|---|---|
 | Kernel | `ktest` | the bootloader, the kernel, the ABI crates, and ktest | the ESP alone: the bootloader, the kernel, and the ktest bundle (`/tests/ktest` in the `init` slot and the boot-time policy); the root and data partitions hold no file |
-| Services | `svctest` | init, every core service, driver and filesystem driver, the runtime (`runtime/`), and the services' test features: svctest, its fixtures, the test-only drivers, and `ubench` | the kernel layer's, and the default service set, crashd included, the test recipe of each service svctest configures for its checks, svctest, the fixtures of its set, and the test class files; no file of the programs layer: nothing under `/programs/` or `/tests/programs/`, and no recipe that names a file of the programs layer |
+| Services | `svctest` | init, every core service, driver and filesystem driver, the runtime (`runtime/`), and the services' test features: svctest, its fixtures, the test-only drivers, and `ubench` | the kernel layer's, and the default service set (crashd included, except in the `crash-endpoint` set, which stages none), the test recipe of each service svctest configures for its checks, svctest, the fixtures of its set, and the test class files; no file of the programs layer: nothing under `/programs/` or `/tests/programs/`, and no recipe that names a file of the programs layer |
 | Programs | `usertest` | the programs a user runs for their own purpose, their testers, and usertest | the whole system |
 
 - **A component is in exactly one layer.** The record is

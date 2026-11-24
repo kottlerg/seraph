@@ -22,8 +22,8 @@
 //! The live-core phase (`crashd_live_core`) asks the crash service for a live core of
 //! `crashme live` ([`check_live`]) through `caps.crashd_core`, and checks the fixture ran on
 //! unchanged and the core holds every registered thread, stopped nowhere, and the fixture's marked
-//! page; then asks for one of `crashme live-no-core`, which declared itself on the core path, and
-//! checks the refusal ([`check_live_no_core`]).
+//! page; then asks for one of `crashme live-no-core`, which declared itself on the core path,
+//! on an account that cannot fund a snapshot, and checks the refusal ([`check_live_no_core`]).
 //!
 //! The hold phase (`crashd_oom_hold`) runs `oom-touch` beside `oom-fill`, which checks the
 //! crash service's hold of a fault memmgr declined for want of memory ([`check_oom_hold`]).
@@ -678,7 +678,7 @@ fn check_live(crashd: u64)
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
         .unwrap_or_else(|| panic!("crashd_live_core: live: expected ready, read {line:?}"));
 
-    let request = live_core_request("live");
+    let request = live_core_request(own_account("live"));
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = match unsafe { ipc::ipc_call(crashd, &request, ipc_buf) }
     {
@@ -730,15 +730,21 @@ fn check_live(crashd: u64)
     }
 }
 
-/// A `LIVE_CORE` request for the fixture, charged to a copy of this process's
-/// own memmgr account. It names the fixture by its whole path.
-fn live_core_request(what: &str) -> ipc::IpcMessage
+/// A copy of this process's own memmgr account, for a `LIVE_CORE` request
+/// about the fixture mode `what`.
+fn own_account(what: &str) -> u64
 {
-    let account = syscall::cap_derive(
+    syscall::cap_derive(
         std::os::seraph::startup_info().memmgr_endpoint,
         syscall::RIGHTS_EP_SEND,
     )
-    .unwrap_or_else(|e| panic!("crashd_live_core: {what}: no copy of the memmgr account ({e})"));
+    .unwrap_or_else(|e| panic!("crashd_live_core: {what}: no copy of the memmgr account ({e})"))
+}
+
+/// A `LIVE_CORE` request for the fixture, charged to `account`, which the
+/// request carries. It names the fixture by its whole path.
+fn live_core_request(account: u64) -> ipc::IpcMessage
+{
     ipc::with_name_block(
         ipc::IpcMessage::builder(ipc::crashd_labels::LIVE_CORE),
         0,
@@ -750,41 +756,77 @@ fn live_core_request(what: &str) -> ipc::IpcMessage
     .build()
 }
 
-/// The pages charged to this process's own memmgr account
-/// (`QUERY_MEMORY_USAGE` `data[0]`).
-fn own_charge(ipc_buf: *mut u64) -> u64
+/// Badge of the SEND that stops [`refuse_account`]; the account's SEND
+/// carries none.
+const ACCOUNT_STOP_BADGE: u64 = 1;
+
+/// Serve `ep` as an account that funds nothing: refuse each call with
+/// memmgr's `LIMIT`, as memmgr refuses a request its node's max cannot take,
+/// and delete the caps it carried, until a call under [`ACCOUNT_STOP_BADGE`].
+/// Returns the calls it refused. procmgr cannot tell that an account names
+/// memmgr (services/procmgr/docs/ipc-interface.md § Label 33: `SNAPSHOT`),
+/// so a capture of a process procmgr attaches calls it first for the frames,
+/// and fails `LIMIT`.
+fn refuse_account(ep: u64) -> u64
 {
-    let request = ipc::IpcMessage::new(ipc::memmgr_labels::QUERY_MEMORY_USAGE);
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    match unsafe {
-        ipc::ipc_call(
-            std::os::seraph::startup_info().memmgr_endpoint,
-            &request,
-            ipc_buf,
-        )
-    }
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let mut calls = 0u64;
+    loop
     {
-        Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS => reply.word(0),
-        Ok(reply) => panic!(
-            "crashd_live_core: QUERY_MEMORY_USAGE answered {:#x}",
-            reply.label
-        ),
-        Err(e) => panic!("crashd_live_core: QUERY_MEMORY_USAGE failed ({e})"),
+        // SAFETY: ipc_buf is this thread's registered IPC buffer.
+        let msg = unsafe { ipc::ipc_recv(ep, ipc_buf) }
+            .expect("crashd_live_core: live-no-core: the account's ipc_recv");
+        for &cap in msg.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        let stop = msg.badge == ACCOUNT_STOP_BADGE;
+        let label = if stop
+        {
+            ipc::memmgr_errors::SUCCESS
+        }
+        else
+        {
+            calls = calls.saturating_add(1);
+            ipc::memmgr_errors::LIMIT
+        };
+        // SAFETY: as above.
+        let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(label), ipc_buf) };
+        if stop
+        {
+            return calls;
+        }
     }
 }
 
 /// Start `crashme live-no-core`, which declares itself on the core path, and
-/// ask the crash service for a live core of it, charged to this process's own
-/// account. Check that the crash service refused with `NO_CORE`, wrote no
-/// core, and left the account charged as before the request, its snapshot
-/// released; and that the fixture ran on and exited cleanly.
+/// ask the crash service for a live core of it, charged to an account that
+/// cannot fund one: an endpoint of this process's own whose server refuses
+/// every call ([`refuse_account`]). Check that the crash service refused
+/// with `NO_CORE`, that nothing called the account, so no snapshot was asked
+/// for and nothing was charged to it, that no core was written, and that the
+/// fixture ran on and exited cleanly.
 /// Defect guarded: a live core of a process on the core path (a core of
-/// another process's pages it handled), or a refused snapshot left charged to
-/// the requester.
+/// another process's pages it handled), or a snapshot taken before the
+/// declaration was read, which charges the requester for a capture the
+/// refusal discards and answers a requester that cannot fund it
+/// `SNAPSHOT_REFUSED`.
 fn check_live_no_core(crashd: u64)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let before = cores();
+    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+        syscall::cap_create_endpoint(slab).ok()
+    })
+    .expect("crashd_live_core: live-no-core: an account endpoint");
+    let account = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND)
+        .expect("crashd_live_core: live-no-core: the account SEND");
+    let stop = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, ACCOUNT_STOP_BADGE)
+        .expect("crashd_live_core: live-no-core: the account's stop SEND");
+    let server = std::thread::Builder::new()
+        .name("crashd_live_core_account".into())
+        .spawn(move || refuse_account(ep))
+        .expect("crashd_live_core: live-no-core: the account thread");
     let mut child = Command::new("/tests/fixtures/programs/crashme")
         .arg("live-no-core")
         .stdin(Stdio::piped())
@@ -802,34 +844,38 @@ fn check_live_no_core(crashd: u64)
         "crashd_live_core: live-no-core: expected ready, read {line:?}"
     );
 
-    // The two reads of the charge bracket the request alone: this thread
-    // allocates nothing and touches no page between them. The spawn's charge
-    // is whole before `spawn` returns: the child's death bridge, a runtime
-    // thread, signals the spawn only at its wait, so the pages it touched to
-    // get there, its stack's top chunk among them, are charged before the
-    // first read (runtime/ruststd/README.md § Runtime threads). The handshake
-    // covers the bridge only up to its wait; the comparison is exact because
-    // the bridge does not wake between the reads: it wakes only on the child's
-    // end, and the child lives until the `exit` written after the second read.
-    let request = live_core_request("live-no-core");
-    let charged = own_charge(ipc_buf);
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(crashd, &request, ipc_buf) };
-    let after = own_charge(ipc_buf);
+    let reply = unsafe { ipc::ipc_call(crashd, &live_core_request(account), ipc_buf) };
+    // The crash service deleted the account before it replied, and procmgr
+    // ends every call on an account before its own reply, so no call on the
+    // account follows the reply: the count the stop returns is whole.
+    // SAFETY: as above.
+    let stopped = unsafe { ipc::ipc_call(stop, &ipc::IpcMessage::new(0), ipc_buf) };
+    let calls = server
+        .join()
+        .expect("crashd_live_core: live-no-core: the account thread panicked");
+    let _ = syscall::cap_delete(stop);
+    let _ = syscall::cap_delete(ep);
+    assert!(
+        stopped.is_ok(),
+        "crashd_live_core: live-no-core: the account's stop call failed"
+    );
     match reply
     {
         Ok(r) if r.label == ipc::crashd_errors::NO_CORE =>
         {}
         Ok(r) => panic!(
-            "crashd_live_core: live-no-core: LIVE_CORE answered {:#x}, expected NO_CORE",
-            r.label
+            "crashd_live_core: live-no-core: LIVE_CORE answered {:#x} (data[0] {:#x}), \
+             expected NO_CORE",
+            r.label,
+            r.word(0)
         ),
         Err(e) => panic!("crashd_live_core: live-no-core: the LIVE_CORE call failed ({e})"),
     }
     assert!(
-        after == charged,
-        "crashd_live_core: live-no-core: the account holds {after} pages after the refusal, \
-             {charged} before"
+        calls == 0,
+        "crashd_live_core: live-no-core: the account was called {calls} time(s) before the \
+         refusal: a snapshot was asked for"
     );
 
     stdin

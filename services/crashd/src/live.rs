@@ -8,7 +8,8 @@
 //! from a procmgr `SNAPSHOT` of the process (services/crashd/docs/operation.md
 //! § Live Core; the file is specified in services/crashd/docs/core-format.md).
 //!
-//! crashd finds the process the request names in procmgr's list and asks
+//! crashd finds the process the request names in procmgr's list, refuses it at
+//! once when it declared no core before the request, and otherwise asks
 //! procmgr, through its debug authority, for a snapshot charged to the account
 //! the requester presents, so the capture's pages are the requester's, not
 //! crashd's reserve. procmgr holds the process for the capture alone and
@@ -232,6 +233,11 @@ fn capture(name: &[u8], account: u64, authority: u64, ipc_buf: *mut u64) -> Resu
             return Err(fail);
         }
     };
+    if let Err(fail) = declared_no_core(process, authority, ipc_buf)
+    {
+        let _ = syscall::cap_delete(account);
+        return Err(fail);
+    }
     let object = snapshot(process, account, authority, ipc_buf)?;
     let complete = object.complete;
     let outcome = match read_layout(&object, ipc_buf)
@@ -313,6 +319,42 @@ fn find_process(name: &[u8], authority: u64, ipc_buf: *mut u64) -> Result<(u64, 
         {
             return Err(Fail::NotFound);
         }
+    }
+}
+
+/// The first thread index the attach before the snapshot asks for: past every
+/// attach list, so procmgr derives no thread cap and the reply carries none
+/// (procmgr's `ATTACH_PROCESS`, none past the count).
+const NO_THREADS: u64 = u64::MAX;
+
+/// Refuse a live core of `process` before any snapshot when it declared no
+/// core before the request: procmgr's `ATTACH_PROCESS`, with no thread asked
+/// for and no debugger watch, so it leaves nothing held in procmgr or in
+/// crashd. The declaration is one-way, so a flag set now holds for the whole
+/// request. Every other answer of the attach leaves the reply to the
+/// snapshot, whose refusal procmgr gives as it would have given it without
+/// this attach: a process that ended, or that declared itself undebuggable,
+/// is refused there.
+///
+/// # Errors
+/// [`Fail::NoCore`] when the process declared no core; [`Fail::TimedOut`]
+/// when the bound passed first.
+fn declared_no_core(process: u64, authority: u64, ipc_buf: *mut u64) -> Result<(), Fail>
+{
+    match crate::attach(process, NO_THREADS, authority, ipc_buf)
+    {
+        Ok(reply) =>
+        {
+            delete_caps(reply.caps());
+            if reply.word(procmgr_labels::ATTACH_WORD_FLAGS) & procmgr_labels::ATTACH_FLAG_NO_CORE
+                != 0
+            {
+                return Err(Fail::NoCore);
+            }
+            Ok(())
+        }
+        Err(crate::AttachFailed::Expired) => Err(Fail::TimedOut),
+        Err(crate::AttachFailed::Refused(_)) => Ok(()),
     }
 }
 
@@ -515,7 +557,8 @@ fn read_layout(object: &Object, ipc_buf: *mut u64) -> Result<(Snapshot, Window),
 /// core: the header lies on the image's shared pages, which the snapshot
 /// names but does not hold, and which no process writes without taking a page
 /// of its own). A declaration the process made before the capture's hold is
-/// always seen here. The caps the attach returns are deleted.
+/// always seen here, one made since [`declared_no_core`] read its flags among
+/// them. The caps the attach returns are deleted.
 ///
 /// # Errors
 /// [`Fail::NoCore`] when the process declared no core; [`Fail::NotFound`]

@@ -272,8 +272,8 @@ restarted: its driver's death ends vfsd (§ Driver death and device loss).
 
 A disk added or inserted again is a new driver at a new ordinal. vfsd mounts none of its
 partitions on its own: each runtime role lookup first queries devmgr for the disks served since
-the last query and holds them, so a `MOUNT` resolves its role across every disk devmgr serves
-([`vfs-ipc-interface.md`](vfs-ipc-interface.md#label-10-mount) § Label 10).
+the last query and holds them, so a `MOUNT` resolves a partition the statement names on any disk
+devmgr serves ([`vfs-ipc-interface.md`](vfs-ipc-interface.md#label-10-mount) § Label 10).
 
 ---
 

@@ -131,8 +131,8 @@ process creation to procmgr IPC.
 
 vfsd self-mounts the root partition at `/` on its own startup, then
 mounts the ESP at `/esp` and the data partition at `/data` (both
-best-effort), identifying partitions by GPT type-GUID
-(`boot_protocol::role_guids::SERAPH_ROOT_<arch>`; see
+best-effort), identifying the root partition by GPT type-GUID on the
+boot disk (`boot_protocol::role_guids::SERAPH_ROOT_<arch>`; see
 [Storage](../../../docs/storage.md)). Init issues no `MOUNT`; its only
 contribution is the seed-cap pull, which doubles as init's
 wait-for-root barrier.

@@ -24,11 +24,13 @@ use gpt::{GptLookupError, PartitionLocation};
 /// The operations a hand-out runs, which vfsd carries out with IPC and capability syscalls.
 pub trait SwapOps
 {
-    /// Look up the swap partition across every disk vfsd holds.
+    /// Look up the swap partition: the one the storage statement names, else the boot disk's
+    /// by type and priority (`docs/storage.md` § GPT Role-GUID Discovery).
     ///
     /// # Errors
-    /// [`GptLookupError::NotFound`] when no disk holds one, [`GptLookupError::DuplicateTie`]
-    /// when two or more share the highest priority.
+    /// [`GptLookupError::NotFound`] when there is none, [`GptLookupError::WrongType`] when the
+    /// named partition is not a swap partition, [`GptLookupError::DuplicateTie`] when two or
+    /// more answer equally.
     fn lookup(&mut self) -> Result<PartitionLocation, GptLookupError>;
 
     /// Register `location` with its disk's block driver and return the partition cap the driver
@@ -46,9 +48,11 @@ pub trait SwapOps
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandOutError
 {
-    /// No held disk carries a swap partition.
+    /// There is no swap partition: none on the boot disk and none named, the named one not
+    /// found, or the named one of another type.
     NoPartition,
-    /// Two or more swap partitions tie at the highest priority.
+    /// Two or more swap partitions answer equally: a tie at the highest priority on the boot
+    /// disk, or the named one found twice.
     Ambiguous,
     /// The block driver refused the registration, or the call failed.
     Register,
@@ -98,7 +102,7 @@ impl SwapPartition
         {
             let location = ops.lookup().map_err(|e| match e
             {
-                GptLookupError::NotFound => HandOutError::NoPartition,
+                GptLookupError::NotFound | GptLookupError::WrongType => HandOutError::NoPartition,
                 GptLookupError::DuplicateTie => HandOutError::Ambiguous,
             })?;
             self.kept = ops.register(&location).ok_or(HandOutError::Register)?;
@@ -170,12 +174,7 @@ mod tests
         fn lookup(&mut self) -> Result<PartitionLocation, GptLookupError>
         {
             self.calls.push("lookup");
-            match &self.lookup
-            {
-                Ok(l) => Ok(*l),
-                Err(GptLookupError::NotFound) => Err(GptLookupError::NotFound),
-                Err(GptLookupError::DuplicateTie) => Err(GptLookupError::DuplicateTie),
-            }
+            self.lookup
         }
 
         fn register(&mut self, location: &PartitionLocation) -> Option<u64>
@@ -226,6 +225,18 @@ mod tests
         assert_eq!(ops.registered, Vec::new());
         assert_eq!(ops.live, Vec::new());
         assert_eq!(ops.calls, ["lookup", "lookup"]);
+    }
+
+    // Defect caught: a statement naming a partition of another type as swap, and vfsd handing
+    // it to swapd.
+    #[test]
+    fn a_named_partition_of_another_type_answers_no_partition()
+    {
+        let mut swap = SwapPartition::new();
+        let mut ops = Model::with_lookup(Err(GptLookupError::WrongType));
+        assert_eq!(swap.hand_out(&mut ops), Err(HandOutError::NoPartition));
+        assert_eq!(swap.kept(), 0);
+        assert_eq!(ops.registered, Vec::new());
     }
 
     #[test]

@@ -76,6 +76,17 @@ const ROLE_DATA: u64 = 1;
 /// mounted to show the fall-through to a directory that exists.
 pub(super) const SHADOWED_DIR: &str = "/config/svcmgr/tests";
 
+/// Whether a storage statement is staged on the root filesystem. Only
+/// `mkdisk --split-data` stages one, naming the data partition of the second
+/// disk for `/data`; vfsd then resolves the data role at any other path on
+/// the boot disk, which carries no data partition, so the partition mounts
+/// at `/data` alone and a phase that mounts it elsewhere cannot run
+/// (docs/storage.md § GPT Role-GUID Discovery).
+pub(super) fn data_named_for_data_path() -> bool
+{
+    std::fs::metadata(storage_statement::PATH).is_ok()
+}
+
 /// A file of [`SHADOWED_DIR`] on the root filesystem.
 const SHADOWED_FILE: &str = "/config/svcmgr/tests/svctest.svc";
 
@@ -323,7 +334,9 @@ fn unmount_busy_then_forced_phase(caps: &Caps)
 /// it. The data partition mounted over [`SHADOWED_DIR`], a directory the
 /// root filesystem has, shadows it while mounted, the tree around it still
 /// resolving, and the directory's own entries come back through the
-/// fall-through once it is unmounted.
+/// fall-through once it is unmounted. With the data partition named for
+/// `/data` alone ([`data_named_for_data_path`]) the phase ends before that
+/// mount.
 fn unmount_falls_through_phase(caps: &Caps)
 {
     let root_names = || -> Vec<String> {
@@ -348,6 +361,14 @@ fn unmount_falls_through_phase(caps: &Caps)
         "/ lists data while /data is unmounted"
     );
 
+    if data_named_for_data_path()
+    {
+        std::os::seraph::log!(
+            "vfsd unmount fall-through passed (/data absent; no mount over {SHADOWED_DIR}: \
+             the storage statement names the data partition for /data alone)"
+        );
+        return;
+    }
     let svc = std::fs::read(SHADOWED_FILE).expect("read the shadowed file before the mount");
     mount_data(caps, SHADOWED_DIR);
     let shadowed_test = format!("{SHADOWED_DIR}/test.txt");

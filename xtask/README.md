@@ -539,13 +539,16 @@ policy, which ktest does not read; ktest is monolithic and does not spawn usersp
 (from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
 excluding `esp/` and `data/`), an arch-neutral `SERAPH_DATA`
 partition (from `sysroot/data/`), and a 64 MiB raw swap partition of the arch-neutral
-`SERAPH_SWAP` type GUID (no filesystem, left zero), always the last partition of `disk.img`. The
-data partition is authored unconditionally; `mkdisk --split-data` authors it alone on a second
-image, `disk-data.img` beside `disk.img`, which then carries the ESP, root and swap, for a
-boot that attaches the pair (`run --second-disk disk-data.img`), and every
-other authoring removes a `disk-data.img` left beside it. vfsd auto-mounts
-the data partition at `/data`, on whichever disk holds it; the data tree
-lives only on this partition, not on root. Every GUID the images carry is fixed (each
+`SERAPH_SWAP` type GUID (no filesystem, left zero), always the last partition of its image. The
+data partition is authored unconditionally; `mkdisk --split-data` authors it and the swap
+partition on a second image, `disk-data.img` beside `disk.img`, which then carries the ESP and
+root, for a boot that attaches the pair (`run --second-disk disk-data.img`), and stages the storage
+statement naming the two by their unique GUIDs at `sysroot/config/vfsd/storage.conf`, which the
+pack signs in the configuration role under `/config/vfsd/storage.conf`: vfsd gives a disk other
+than the boot disk a role only where the statement names its partition. Every other authoring
+removes a `disk-data.img` left beside it, and a statement whose body is the staged one. vfsd
+auto-mounts the data partition at `/data`; the data tree lives only on this partition, not on
+root. Every GUID the images carry is fixed (each
 image's disk GUID and each partition's unique GUID), and so is every FAT volume's metadata, so
 two authorings of one layout from one sysroot write identical images.
 (vfsd's fall-through would also serve `/data` from a root-fs directory,
@@ -610,7 +613,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest
 | `--knob` | none | Stage a presence-only bootloader knob in `\EFI\seraph\`, repeatable or comma-separated: `nokaslr` boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; `mapredo` makes the first attempt of the bootloader's steps 6 and 7 redo whatever its memory map's size ([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md) § Sizing the Entry Array). Every knob not named is removed |
 | `--log-levels` | the repository's | Install `FILE` at `/config/init/log-levels.conf` in place of `services/init/log-levels.conf`; refused, before anything changes, unless init's parser (`services/init/log-levels`) accepts every line, since init ignores a line it refuses |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
-| `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP, root and swap on `disk.img`, both at `--block-size`; omit to author all four on `disk.img` and remove a stale `disk-data.img` |
+| `--split-data` | `false` | Author the data and swap partitions on `disk-data.img` and the ESP and root on `disk.img`, both at `--block-size`, and stage the storage statement naming the two; omit to author all four on `disk.img` and remove a stale `disk-data.img` and the staged statement |
 
 A boot that redoes the bootloader's steps 6 and 7 logs `boot: memory map: mapredo knob present;
 redoing steps 6 and 7`, which `run --runs --require` matches, once in the run
@@ -763,6 +766,7 @@ options it takes:
 | `enrolment` | x86_64 (6), riscv64 (6) | init | usertest | none |
 | `secureboot` | x86_64 (4), riscv64 (4) | init | usertest | none |
 | `hotplug` | x86_64 (4), riscv64 (3) | init | host run | none |
+| `storage-roles` | x86_64 (4), riscv64 (4) | init | usertest | none |
 
 Before a case runs, `test` checks that the case runs on the architecture, that the sysroot was built
 for it, and that the recorded harness is the case's bundle (`ktest` for `kaslr` and `cet`, `init`
@@ -1391,6 +1395,35 @@ Each boot to its markers is bounded by five minutes, and the fixture's verdict a
 by three minutes after their hot-add. The boots are the hotplug device cell of the local and release
 host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
 
+#### The `storage-roles` case
+
+Check that vfsd gives each storage role to the boot disk or to the partition the storage statement
+names, and none to another disk, on either arch. Boots the default boot set headless four times,
+each with a second disk (`virtio-blk-pci`, drive `hd1`), to the terminal's `terminal: READY for
+injection` line and swapd's `swap partition:` line, and reads vfsd's `boot controller:`, `boot
+disk:` and role lines (`root:`, `/esp:`, `/data:`, `swap:`, each naming its disk's location):
+
+1. the images repacked in the split-data layout, `disk-data.img` on the second slot: the root and
+   `/esp` on the boot disk, `/data` and swap named by the staged statement on the second disk;
+2. the single image, and a foreign disk (`target/xtask/storage-roles/foreign.img`, authored by
+   `disk::create_foreign_image`) on the second slot whose four partitions carry priority `0xFFFF`
+   under unique GUIDs of their own: every role on the boot disk;
+3. the same at priority 0, the boot disk's: every role on the boot disk;
+4. a copy of `disk.img` (`target/xtask/storage-roles/disk-copy.img`) on the second slot: the boot
+   disk at the boot controller's location, and every role on it.
+
+A `no boot disk:` line, a role on another disk than the boot says, or a missing line fails the boot.
+The scratch images are removed, and the images repacked in the layout they had, whatever the
+outcome. Each boot to its markers is bounded by four minutes. It requires a populated sysroot:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test storage-roles [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
+
+See [docs/testing.md](../docs/testing.md#storage-roles-storage-roles-case) § Storage roles for what
+each boot covers.
+
 ---
 
 ### `cargo xtask trust-request`
@@ -1510,7 +1543,8 @@ Run the bounded proofs ([docs/testing.md](../docs/testing.md#bounded-verificatio
 verification) with the pinned Kani release.
 
 ```
-cargo xtask kani [--component <CRATE> [--harness <NAME>]]
+cargo xtask kani [--component <CRATE> [--harness <NAME>]] [--list]
+cargo xtask kani --since <COMMIT> [--list]
 cargo xtask kani --pin
 ```
 
@@ -1518,13 +1552,34 @@ cargo xtask kani --pin
 |---|---|---|
 | `--component <CRATE>` | every crate that holds a harness | Verify the harnesses of this crate only, by its package name |
 | `--harness <NAME>` | every harness | Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`); needs `--component` |
+| `--since <COMMIT>` | every crate that holds a harness | Verify the crates the change from this commit to the working tree can affect (below); takes no `--component` |
+| `--list` | `false` | Print the package of each crate the run would verify, one a line, and exit, verifying nothing; needs no Kani |
 | `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
 
 The command first finds the crates to verify, keeping no list of them: the crate of every tracked
 Rust source declaring a `#[kani::proof]`, the crate being the nearest directory above the file
 that holds a `Cargo.toml`, each run once by the package name that manifest gives. It fails
 naming each such source that lies in no crate, or in one whose manifest names no package, so no
-harness is left out of the run. It then checks that `cargo kani --version` names `KANI_VERSION`, and
+harness is left out of the run.
+
+With `--since`, the command selects from those crates the ones the change from `<COMMIT>` to the
+working tree (`git diff --name-only --no-renames`, a rename as both its paths) can affect, and
+prints each with the changed file that selects it, or a line saying that none is affected and why. A
+crate is affected when a changed file lies in the directory of its package or of a workspace package
+in its dependency closure, as `cargo metadata --no-deps` gives the path dependencies (of every kind
+and target: a superset of what its test build compiles), or is a file one of those packages names in
+an `include!`, `include_str!`, `include_bytes!` or `#[path]` string literal. Every crate is affected
+when a changed file is an input of every build: the workspace `Cargo.toml` and `Cargo.lock`,
+`rust-toolchain.toml`, `.cargo/config.toml`, the command's own sources
+(`xtask/src/commands/kani.rs`, which holds the Kani pin, the memory limit and the judge of Kani's
+output, and `xtask/src/affected.rs`, the selection, which other commands can share), or
+`.github/workflows/build-test.yml`, whose `kani` job an empty selection does not install Kani in. A
+package's build script, features and `cfg` settings lie in its directory or the workspace manifest,
+so a change to them selects it. A commit the checkout does not hold fails the command, so a shallow
+clone never narrows the run. With no crate affected the command verifies nothing and does not check
+the installed release.
+
+It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
 § Toolchain) on another release or none.
 
@@ -1543,7 +1598,17 @@ verdict names), and when Kani's closing summary is missing, counts a failure or 
 counts other harnesses than reported a verdict; a harness that Kani starts and prints no verdict for
 fails too. Every selected crate runs, and the command then prints a table of every harness, by
 package and path, with its verdict and verification time, and fails naming each crate that failed.
-CI's `kani` job runs the command with no option, after installing the release `--pin` prints
+A harness whose verification time exceeds the 120 s budget (`BUDGET_SECONDS`,
+[docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification) fails on a CI
+runner (`GITHUB_ACTIONS` set to `true`), named with its time and marked `FAILED (over budget)` in
+the table; on another host, whose speed differs, the command prints a warning naming it and its
+time.
+
+CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the pull request's base
+(the first parent of the merge commit it checks out), or on a push to `master` against the commit
+the push moved it from; when the list is empty it installs no Kani and says so in a notice on the
+run, and otherwise it installs the release `--pin` prints and runs the command with the same
+`--since`. The `kani` job of `burnin.yml` runs the command with no option
 ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
@@ -2563,15 +2628,15 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypto-vectors`, `fuzz`
-(but `--list`), `kani` (but `--pin`), `compare-images` and `test` without a case or a cell (the unit
-tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`,
-`path-account trace` (but `--reuse`), and `test` with a case or a cell as boots, each boot admitted
-as above (the `shutdown` case admits once for its boots, which it runs one at a time). The
-`signing` case, which compiles its revoking and role-scoped bootloaders before it boots, and
-`path-account trace`, which compiles its plugin, are admitted as a build for each compile and then
-each boot as a boot. A cell's lanes (`test --cell T --lanes N`) start up to N cases side by side,
-each admitting its own boots, so each is a small boot counted with the others, and `--wait-host`
-lets a lane's boot wait for another lane's to end rather than fail.
+(but `--list`), `kani` (but `--pin` and `--list`), `compare-images` and `test` without a case or a
+cell (the unit tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
+`capture-acpi`, `path-account trace` (but `--reuse`), and `test` with a case or a cell as boots,
+each boot admitted as above (the `shutdown` case admits once for its boots, which it runs one at a
+time). The `signing` case, which compiles its revoking and role-scoped bootloaders before it boots,
+and `path-account trace`, which compiles its plugin, are admitted as a build for each compile and
+then each boot as a boot. A cell's lanes (`test --cell T --lanes N`) start up to N cases side by
+side, each admitting its own boots, so each is a small boot counted with the others, and
+`--wait-host` lets a lane's boot wait for another lane's to end rather than fail.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

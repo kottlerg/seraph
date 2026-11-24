@@ -171,7 +171,7 @@ service executes as built, since procmgr verified it.
 - `hwrng-protocol` (`xtask/fuzz/targets/src/bin/hwrng-protocol.rs`) drives
   `hwrng_protocol::property::hwrng_protocol_holds` over a request and a reply, from the seeds in
   `shared/hwrng-protocol/fuzz/hwrng-protocol/seeds/`; CI's gating `fuzz` job runs it on every pull
-  request and the weekly campaign for 30 minutes.
+  request and the campaign for 30 minutes.
 - The `proofs` module of `shared/hwrng-protocol/src/lib.rs` proves `requested_len` on every request
   and, by induction over a reply's words, `decode_reply` and `encode_reply`
   ([testing.md](testing.md) § Bounded verification); CI's `kani` job runs them.
@@ -231,16 +231,29 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   bounds a directory's chain walk to the volume's cluster count, and a file's to the clusters before
   the offset it reads, so a cyclic chain ends (`services/fs/fat/src/dir.rs`, `read_file_data` in
   `services/fs/fat/src/fat.rs`).
+- A disk's own partition table gives a role on the boot disk alone, the disk at the PCI location
+  the bootloader reported that carries the boot ESP it booted (`find_boot_disk` in
+  `services/vfsd/gpt/src/lib.rs`). Another disk takes a role only where the storage statement,
+  signed in the configuration role and read through procmgr's verified read, names its partition
+  by unique GUID (`resolve_named`), so a written disk at any priority, or a copy of the boot disk,
+  neither wins the root or `/esp`, nor a role the statement does not name, nor makes the root
+  lookup a tie ([storage.md](storage.md) § GPT Role-GUID Discovery). The statement is decoded by a
+  pure crate, `shared/storage-statement`, which refuses the whole file on any error.
 
 **Fuzz targets and proof harnesses.**
 
 - `gpt` (`xtask/fuzz/targets/src/bin/gpt.rs`) drives `vfsd_gpt::property::gpt_holds` over a header
   block and a whole disk, from the seeds in `services/vfsd/gpt/fuzz/gpt/seeds/`; CI's gating `fuzz`
-  job runs it on every pull request and the weekly campaign for 30 minutes.
+  job runs it on every pull request and the campaign for 30 minutes.
 - The `proofs` module of `services/vfsd/gpt/src/lib.rs` proves the property's check of a header and
   of an entry over every input, the choice between the two copies, and, by induction, the CRC32, the
   entry-array walk and the lookup ([testing.md](testing.md) § Bounded verification); CI's `kani` job
-  runs them.
+  runs them, and the boot-disk lookup and the named resolution over every disk set they bound.
+- `storage-statement` (`xtask/fuzz/targets/src/bin/storage-statement.rs`) drives
+  `storage_statement::property::storage_statement_holds` from the seeds in
+  `shared/storage-statement/fuzz/storage-statement/seeds/`, and the `proofs` module of
+  `shared/storage-statement/src/lib.rs` proves the line parser, the GUID and path forms and the
+  conflict check; the same CI jobs run them.
 - Planned: the FAT decoders' property function, fuzz target and proof harness (`parse_bpb_geometry`,
   `read_fat_entry`, `parse_dir_entry`; [#680](https://github.com/kottlerg/seraph/issues/680),
   [#756](https://github.com/kottlerg/seraph/issues/756)).
@@ -252,6 +265,21 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   entries `num_parts` declares, which the device's capacity then bounds.
 - No check compares one partition entry with another, so two partitions can overlap, and a
   filesystem driver given one reaches the other's blocks in the overlap.
+- A copy of a partition the statement names, on a disk other than the boot disk, denies that role
+  while the named disk is held: vfsd skips it and logs why, and the boot goes on. A named partition
+  is bound to its unique GUID and its type alone, which are written on the disk and readable, so a
+  disk that carries them takes that role (`/data` at its path, or swap, whose pages it then stores
+  and serves back) whenever the disk the statement meant is not held: not attached, removed, or
+  not yet served. Binding a named partition to its disk is not built
+  ([#1575](https://github.com/kottlerg/seraph/issues/1575)). A statement signed earlier at a
+  security version the machine still admits verifies, and names what it named
+  ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
+- Two disks at the boot controller's location that both carry the boot ESP (two namespaces or
+  units behind one controller), or, with a controller that reports no PCI location, a copy of the
+  boot disk anywhere, leave no boot disk, and the boot halts: a driver of such a controller
+  defines a finer location fact first. Where the bootloader's PCI segment and devmgr's differ (a
+  Device-Tree-only platform with several ECAM host bridges and no `linux,pci-domain`), no disk is
+  at the location and the boot halts the same way.
 - The FAT decoders have no fuzz target or proof harness yet, and no target drives fatfs's own logic
   over a corrupt volume (its cache, allocation and write paths): the targets drive the parser crates
   only.
@@ -346,7 +374,7 @@ is.
   (`xtask/fuzz/targets/src/bin/init-protocol.rs`) drives
   `init_protocol::property::init_protocol_holds` over a request and a module-name table, from the
   seeds in `abi/init-protocol/fuzz/init-protocol/seeds/`; CI's gating `fuzz` job runs them on every
-  pull request and the weekly campaign for 30 minutes each.
+  pull request and the campaign for 30 minutes each.
 - The `proofs` modules of `abi/boot-protocol/src/lib.rs` and `abi/boot-protocol/src/bundle.rs` prove
   `FramebufferInfo::from_bytes` on every record, the bundle's `parse_header` and `entry_at` on every
   input of up to two entries, and, by induction, the walk of the entry headers; that of

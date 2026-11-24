@@ -1068,7 +1068,8 @@ static REGISTRY_REFUSED: crate::sync::atomic::AtomicBool =
 /// (`SpawnArgs::registration_deadline`); a thread that procmgr cannot serve
 /// yet waits here alone. Best-effort: a refusal or
 /// a failed call leaves the thread unregistered, and it runs as before,
-/// apart from a call cancelled `Interrupted` after procmgr received it,
+/// apart from a call that failed after procmgr received it, cancelled
+/// `Interrupted` or timed out at the spawner's deadline (`WouldBlock`),
 /// which procmgr carried out. A failed call is not repeated, since a repeat
 /// of one procmgr carried out would register the thread twice. A process
 /// procmgr did not create (no procmgr endpoint) sends nothing.

@@ -783,11 +783,12 @@ crash service, and binds the thread's exception class under a crash badge of its
 the thread names it (`register_with_procmgr` in `src/sys/thread/seraph.rs`). The registration costs
 one IPC per spawn and nothing on any path that does not spawn. A process procmgr did not create,
 whose `ProcessInfo` names no procmgr endpoint (procmgr and memmgr), sends none. A refusal or a
-failed call leaves the thread unregistered, its faults reported without registers, with one
-exception: a call the kernel cancels with `Interrupted` after procmgr received it has been carried
-out, so the thread is registered, or refused, though the runtime cannot tell which. The runtime
-does not repeat a failed call, since a repeat of one procmgr carried out registers the thread
-twice: two entries, each with its crash badge. At a refusal
+failed call leaves the thread unregistered, its faults reported without registers, apart from a
+call that failed after procmgr received it: one the kernel cancels with `Interrupted`, or a runtime
+thread's that times out at its spawner's call deadline (§ Runtime threads). procmgr has carried
+such a call out, so the thread is registered, or refused, though the runtime cannot tell which.
+The runtime does not repeat a failed call, since a repeat of one procmgr carried out registers the
+thread twice: two entries, each with its crash badge. At a refusal
 for the bound or the heap procmgr binds back a debugger's binding the thread copied, and at a
 `NOT_ATTACHABLE` refusal it unbinds the thread as the declaration unbinds the process's threads, so
 its faults go unreported. A `NOT_ATTACHABLE` refusal, from a process declared undebuggable
@@ -905,8 +906,9 @@ trust to answer, as crashd bounds a fault's report and a core dump
   is a receive, ends at the deadline too, and fails the spawn `TimedOut`. The runtime thread
   that a piped `Command::spawn` or a process's first `File::open` starts (§ Runtime threads)
   makes its registration with procmgr under the caller's deadline, so the call's wait for that
-  thread to reach its wait ends by the deadline too; a registration the deadline cuts leaves the
-  thread unregistered (§ Thread registration). A `File` dropped past
+  thread to reach its wait ends by the deadline too. A registration the deadline cuts before
+  procmgr received it leaves the thread unregistered, and one cut after has been carried out
+  (§ Thread registration). A `File` dropped past
   the deadline sends no `FS_CLOSE`: the session table keeps its open cap, and the process's next
   `File::open`, or its exit hook, sends the close within a bound of its own for the whole drain
   (`KEPT_CLOSE_DRAIN`) and that thread's deadline, whichever ends first, so a thread with no

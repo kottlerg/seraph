@@ -4,8 +4,8 @@
 # .github/workflows/burnin.yml
 
 # The burn-in tier: each canonical boot repeated, on a tag push or a manual
-# dispatch, and every bounded proof, on those and on a weekly schedule
-# (docs/testing.md § Coverage tiers, § Bounded verification).
+# dispatch, and every bounded proof (docs/testing.md § Coverage tiers,
+# § Bounded verification).
 
 name: burn-in
 
@@ -16,10 +16,6 @@ on:
   # dispatch stress-tests whatever ref it targets and mints no version-named
   # artifacts. Release certification reads the tag-push run only.
   workflow_dispatch:
-  # Every bounded proof, alone: a pull request proves only the crates it can
-  # affect, so this run finds a change the selection missed between tags.
-  schedule:
-    - cron: '17 3 * * 1'
 
 concurrency:
   group: burnin-${{ github.ref }}
@@ -30,7 +26,6 @@ permissions:
 
 jobs:
   qemu-debs:
-    if: github.event_name != 'schedule'
     uses: ./.github/workflows/qemu-debs.yml
 
   burnin:
@@ -38,7 +33,6 @@ jobs:
     # set of its own image; see docs/build-system.md § Continuous
     # Integration.
     needs: qemu-debs
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false

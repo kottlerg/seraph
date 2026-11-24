@@ -1219,7 +1219,7 @@ to the tiers below.
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref; the bounded proofs alone also weekly | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof (`cargo xtask kani`, [Bounded verification](#bounded-verification)) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof (`cargo xtask kani`, [Bounded verification](#bounded-verification)) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched (see Release host runs below) |
 
@@ -2187,7 +2187,7 @@ sources and the job itself). That selection gates the merge, and a pull request 
 such crate ends the job without installing Kani, with a notice on the run that it verified
 nothing. On a push to `master` the job runs the same selection against the commit the push
 moved from. The whole set runs in the `kani` job of `burnin.yml`, on each tag push and on a
-weekly schedule, and in the release host runs (§ Coverage tiers), so a change the selection
+manual dispatch, and in the release host runs (§ Coverage tiers), so a change the selection
 missed is found before a tag ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
 

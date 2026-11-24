@@ -979,8 +979,9 @@ fn read_log(path: &Path) -> Result<String>
 /// a signal — `128 + signum` (shell convention), so a signal death is legible
 /// (e.g. `139` = SIGSEGV, `134` = SIGABRT, `137` = SIGKILL) instead of
 /// collapsing to `-1`. Legibility is separate from tolerance: only SIGSEGV /
-/// SIGABRT are later classified as a (non-gating) host-emulator crash
-/// (`classify` via `RC_SIGSEGV`/`RC_SIGABRT`); SIGKILL is reported but still
+/// SIGABRT are later classified as a host-emulator crash (`classify` via
+/// `RC_SIGSEGV`/`RC_SIGABRT`), tolerated only beside a passing run
+/// ([`set_failure`]); SIGKILL is reported but always
 /// gates (it is our own timeout kill, or an OOM — never a tolerated flake).
 /// This distinguishes a host-emulator crash (the QEMU 8.2.x mttcg segfault —
 /// issue #350 / QEMU gitlab #2220) from a guest fault, which is otherwise

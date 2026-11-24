@@ -551,8 +551,12 @@ fn capture(authority: u64, child: &mut Snapped)
     );
 }
 
-/// The object of a snapshot, attached read-only and private to svctest, its
-/// layout decoded.
+/// The object of a snapshot, attached read-only and shared to svctest, its
+/// layout decoded. A shared attachment is charged its pages against svctest's
+/// budget node and takes no free page but its page tables
+/// (services/memmgr/docs/ipc-interface.md § Label 28), where a private one is
+/// admitted as a committed region of the object's size, which a reader never
+/// writes and the pool under pressure may not admit.
 pub(super) struct Attached
 {
     handle: u64,
@@ -591,7 +595,7 @@ impl Attached
             .word(1, page_at(0, pages))
             .word(2, MAP_READ)
             .word(3, 0)
-            .word(4, memmgr_labels::ATTACH_PRIVATE)
+            .word(4, 0)
             .cap(handle_copy(handle))
             .build();
         let got = call(startup_info().memmgr_endpoint, &attach, "ATTACH_OBJECT").label;
@@ -603,7 +607,8 @@ impl Attached
         let page_bytes = |at: u64, count: u64| {
             let len = usize::try_from(count.saturating_mul(PAGE_SIZE)).unwrap_or(0);
             // SAFETY: the `count` pages at `at` lie in the object's attachment,
-            // read-only and private; the slice is read here only, while attached.
+            // read-only, of a sealed object whose frames no process writes; the
+            // slice is read here only, while attached.
             unsafe { std::slice::from_raw_parts(at as *const u8, len) }
         };
         let header = Header::decode(page_bytes(va, 1))
@@ -705,8 +710,9 @@ impl Attached
             "{}: the run {run:?} places {at:#x} at object page {object_page}",
             self.phase
         );
-        // SAFETY: the page lies in the object's attachment, read-only and
-        // private, which lasts until `release` consumes `self`.
+        // SAFETY: the page lies in the object's attachment, read-only, of a
+        // sealed object whose frames no process writes, which lasts until
+        // `release` consumes `self`.
         Some(unsafe {
             std::slice::from_raw_parts(
                 page_at(self.va, object_page) as *const u8,

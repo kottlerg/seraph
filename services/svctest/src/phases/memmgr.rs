@@ -1372,7 +1372,7 @@ pub fn frame_reclaim_live_object_phase(_: &Caps)
 
     for i in 0..SPAWNS
     {
-        let status = std::process::Command::new("/programs/hello")
+        let status = std::process::Command::new("/tests/fixtures/programs/spawn-target")
             .status()
             .unwrap_or_else(|e| panic!("frame_reclaim_live_object: spawn {i} failed: {e}"));
         assert!(

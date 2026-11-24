@@ -1,21 +1,23 @@
 # /config/svcmgr/tests/crashd.svc — crashd with core dumps on for crashme.
 #
-# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan. The
-# usertest boot stages it over /config/svcmgr/services/crashd.svc, so the
-# crashme tester finds a core of each faulting mode in /crash
-# (services/fixtures/crashme/README.md). See docs/testing.md.
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# `cargo xtask mkdisk --svctest <set>` stages it over
+# /config/svcmgr/services/crashd.svc for every set but crash-endpoint, so
+# svctest's crashd phases find a core of each faulting mode of the crashme
+# fixture in /crash (services/fixtures/crashme/README.md). See
+# docs/testing.md § Gating.
 #
-# The same recipe as services/crashd.svc, `reserve = yes` and the `crashd.core`
-# name included, but for `CORE_DUMP`, which names
-# crashme, and `CRASHD_OOM_STALL_MS`, which holds a fault memmgr declined for
-# want of memory for up to 3000 ms: the crashme tester's `oom-touch` case
-# (services/fixtures/crashme/README.md) reads that stall.
+# The same recipe as services/crashd.svc but for `CORE_DUMP`, which names
+# crashme; xtask's svctest_stage tests hold the two to that one difference.
+# It keeps the default's `CRASHD_OOM_STALL_MS` of 10000 ms, which svctest's
+# oom_policy phase requires to outlast oomd's cooldown, and which its
+# crashd_oom_hold phase reads to size the fill that outlasts the hold.
 binary          = /services/crashd
 priority        = 20
 restart         = on_failure
 critical        = no
 provides        = crashd.core:grant
-env             = CORE_DUMP=crashme CRASHD_OOM_STALL_MS=3000
+env             = CORE_DUMP=crashme CRASHD_OOM_STALL_MS=10000
 namespace       = subtree:/crash:LOOKUP+READDIR+STAT+WRITE+MUTATE_DIR
 debug_authority = yes
 reserve         = yes

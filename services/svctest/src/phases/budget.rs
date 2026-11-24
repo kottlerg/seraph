@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
-use super::procmgr::{HELLO_PATH, create_call, expect_create, with_head};
+use super::procmgr::{SPAWN_TARGET_PATH, create_call, expect_create, spawn_target_file, with_head};
 
 pub fn phases() -> &'static [Phase]
 {
@@ -56,7 +56,7 @@ const CHILD_MAX_PAGES: u64 = 4096;
 const CHILD_USAGE_QUERY_FAILED: i32 = 2;
 /// Exit code: the child's node holds a max other than [`CHILD_MAX_PAGES`].
 const CHILD_MAX_NOT_TAKEN: i32 = 3;
-/// Exit code: the lookup of `/programs/hello` failed.
+/// Exit code: the lookup of `/tests/fixtures/programs/spawn-target` failed.
 const CHILD_LOOKUP_FAILED: i32 = 4;
 /// Exit code: the grandchild's create call failed or was refused.
 const CHILD_GRANDCHILD_REFUSED: i32 = 5;
@@ -192,12 +192,12 @@ fn create_reserve_refused()
     use ipc::{procmgr_errors, procmgr_labels};
 
     let procmgr = startup_info().procmgr_endpoint;
-    let (file, size) = file_at(b"programs", b"hello");
+    let (file, size) = spawn_target_file();
     expect_create(
         procmgr,
         procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_RESERVE,
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_FROM_FILE with CREATE_RESERVE from a creator outside the reserve",
@@ -208,7 +208,7 @@ fn create_reserve_refused()
         procmgr,
         procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_RESERVE,
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[spare],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_PROCESS with CREATE_RESERVE from a creator outside the reserve",
@@ -224,7 +224,7 @@ fn memory_max_word_refused()
     use std::os::seraph::process::ArgvEnvCap;
 
     let procmgr = startup_info().procmgr_endpoint;
-    let (file, size) = file_at(b"programs", b"hello");
+    let (file, size) = spawn_target_file();
     expect_reply(
         procmgr,
         &IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_MEMORY_MAX)
@@ -234,10 +234,10 @@ fn memory_max_word_refused()
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_FROM_FILE with CREATE_MEMORY_MAX and no max word",
     );
-    let argv_env = ArgvEnvCap::new(b"/programs/hello\0", 1, b"", 0)
+    let argv_env = ArgvEnvCap::new(b"/tests/fixtures/programs/spawn-target\0", 1, b"", 0)
         .expect("building the argv/env cap failed")
         .expect("a nonempty argv builds a cap");
-    let (file, size) = file_at(b"programs", b"hello");
+    let (file, size) = spawn_target_file();
     expect_reply(
         procmgr,
         &IpcMessage::builder(
@@ -266,12 +266,12 @@ fn max_refusals_answer_limit()
     use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 
     let procmgr = startup_info().procmgr_endpoint;
-    let (file, size) = file_at(b"programs", b"hello");
+    let (file, size) = spawn_target_file();
     expect_create(
         procmgr,
         procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_MEMORY_MAX,
         &[size, 1],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
         procmgr_errors::LIMIT,
         "CREATE_FROM_FILE with a one-page max",
@@ -289,23 +289,23 @@ fn max_refusals_answer_limit()
     let small = sub_node(1, "CREATE_SUB_NODE of one page");
     let roomy = sub_node(u64::MAX, "CREATE_SUB_NODE with no max");
     let charged = procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_CHARGE_NODE;
-    let (file, size) = file_at(b"programs", b"hello");
+    let (file, size) = spawn_target_file();
     expect_create(
         procmgr,
         charged,
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file, handle_copy(small)],
         procmgr_errors::LIMIT,
         "CREATE_FROM_FILE charged to a one-page sub-node",
     );
     let what = "CREATE_FROM_FILE charged to a sub-node with no max";
-    let (file, size) = file_at(b"programs", b"hello");
+    let (file, size) = spawn_target_file();
     let reply = create_call(
         procmgr,
         charged,
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file, handle_copy(roomy)],
     )
     .unwrap_or_else(|e| panic!("{what}: ipc_call failed ({e})"));
@@ -339,12 +339,12 @@ fn run_budget_child()
 
     let (handle, thread) = create_with_max(BUDGET_CHILD_ROLE, CHILD_MAX_PAGES, "the budget child");
     let reason = run_to_exit(handle, "the budget child");
-    let (file, size) = file_at(b"programs", b"hello");
+    let (file, size) = spawn_target_file();
     expect_create(
         handle,
         procmgr_labels::CREATE_FROM_FILE,
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_FROM_FILE on a destroyed child's process handle",
@@ -647,7 +647,7 @@ pub(crate) fn memory_usage() -> Option<(u64, u64, u64)>
         .then(|| (reply.word(0), reply.word(1), reply.word(2)))
 }
 
-/// Create `/programs/hello` under the child with a max above the child's
+/// Create `/tests/fixtures/programs/spawn-target` under the child with a max above the child's
 /// own, check its node took what the child's node had left (memmgr's clamp,
 /// which procmgr relays in the create reply), destroy it unstarted, and wait
 /// until its charge has left the child's subtree.
@@ -661,8 +661,17 @@ fn grandchild_clamped()
         crate::ipc_util::ns::ns_lookup(dir, name, 0xFFFF, ipc_buf)
             .unwrap_or_else(|_| exit(CHILD_LOOKUP_FAILED))
     };
-    let (programs, _, _) = lookup(std::os::seraph::root_dir_cap(), b"programs");
-    let (file, _, size) = lookup(programs, b"hello");
+    let mut programs = std::os::seraph::root_dir_cap();
+    for name in [&b"tests"[..], &b"fixtures"[..], &b"programs"[..]]
+    {
+        let next = lookup(programs, name).0;
+        if programs != std::os::seraph::root_dir_cap()
+        {
+            let _ = syscall::cap_delete(programs);
+        }
+        programs = next;
+    }
+    let (file, _, size) = lookup(programs, b"spawn-target");
     let _ = syscall::cap_delete(programs);
     let Some((_, _, used)) = memory_usage()
     else
@@ -673,7 +682,7 @@ fn grandchild_clamped()
         startup_info().procmgr_endpoint,
         procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_MEMORY_MAX,
         &[size, CHILD_MAX_PAGES * 4],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
     )
     .unwrap_or_else(|_| exit(CHILD_GRANDCHILD_REFUSED));

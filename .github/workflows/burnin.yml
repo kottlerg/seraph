@@ -96,19 +96,21 @@ jobs:
         # directory). usertest is cp'd into services/ to enable it; svctest is
         # staged by `cargo xtask mkdisk --svctest burn-in`, which co-stages the
         # `burn-in` fixture set below and records it in svctest's staged
-        # recipe (docs/testing.md § Gating). These functional harness
-        # boots drop the autostarted `terminal` (a user-facing program, not
-        # part of the services/programs substrate under test) so the boot is
-        # controlled. `--repack-only` makes the removal stick: a normal repack
-        # re-mirrors rootfs, which would restore terminal.svc. ktest swaps the
+        # recipe (docs/testing.md § Gating); it composes a services-layer
+        # image, which holds no program and stages sessiond's and crashd's
+        # svctest recipes. The usertest boot drops the autostarted `terminal`
+        # (a user-facing program, not part of the programs substrate under
+        # test) so the boot is controlled. `--repack-only` makes the removal
+        # and the staging stick: a normal repack re-mirrors rootfs, which
+        # would restore terminal.svc. ktest swaps the
         # bundle's `init` entry via `cargo xtask mkdisk --harness ktest`,
         # which repacks the disk image with the ktest bundle.
         # `mkdisk --svctest` also stages the test-only device class files of
         # `sysroot/config/devmgr/tests/` into `classes/`, and its boots attach
         # the test devices (`--test-devices`, below) the test-only drivers bind.
         # The `burn-in` set co-stages memhog (memhog.svc), which svctest's
-        # oom_policy phase has fill memory until oomd stops it. The cell keeps
-        # crashd, which build-test.yml's svctest cells drop, so the phase's
+        # oom_policy phase has fill memory until oomd stops it. The set stages
+        # crashd's svctest recipe, as build-test.yml's `ci` set does, so the phase's
         # child writes the pages of a demand region once oomd has stopped every
         # program, spending the pages the last stop freed; crashd holds the
         # write memmgr declines and resumes it when oomd's stop of memhog, a
@@ -118,21 +120,17 @@ jobs:
         # oomd stops first and whose source svcmgr lists. It also co-stages
         # reserve-creator (reserve-creator.svc), svctest's fixture for a reserve
         # creator's create while memory is critical.
-        # The usertest cell also stages crashd's test recipe over the default
-        # one: its `CORE_DUMP` names crashme, whose tester checks the cores.
         # Unlike build-test.yml's, the usertest and ktest images keep the
         # repository's log levels and stage no bootloader knob, so the boot
         # burned in is the default one.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
-              rm -f sysroot/config/svcmgr/services/terminal.svc
               cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
                 --svctest burn-in
               ;;
             usertest)
               cp sysroot/config/svcmgr/tests/usertest.svc \
-                 sysroot/config/svcmgr/tests/crashd.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
               cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
@@ -151,19 +149,23 @@ jobs:
         # are beside the values. The svctest cells' worsts are over their
         # passes alone, which svctest's oom_policy failures (#1292) thinned
         # to 5 (riscv64 debug), 9 (riscv64 release), 10 (x86_64 debug) and 8
-        # (x86_64 release) of 20.
+        # (x86_64 release) of 20. The svctest worsts marked (est.) add to that
+        # worst the largest sum of the seven testers whose checks svctest's
+        # phases took over, in build-test.yml's usertest logs of 8 master runs
+        # (2026-11-22 to 2026-11-24); the usertest budgets keep the worst of a
+        # boot that ran them, an upper bound until a burn-in re-derives both.
         run: |
           case "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" in
-            riscv64-debug-svctest)    budget=840 ;;  # worst pass 278.3 s
+            riscv64-debug-svctest)    budget=1140 ;; # worst pass 362.8 s (est.)
             riscv64-debug-usertest)   budget=360 ;;  # worst pass 114.1 s
             riscv64-debug-ktest)      budget=480 ;;  # worst pass 140.8 s
-            riscv64-release-svctest)  budget=540 ;;  # worst pass 174.2 s
+            riscv64-release-svctest)  budget=660 ;;  # worst pass 219.4 s (est.)
             riscv64-release-usertest) budget=240 ;;  # worst pass 74.2 s
             riscv64-release-ktest)    budget=300 ;;  # worst pass 83.0 s
-            x86_64-debug-svctest)     budget=420 ;;  # worst pass 129.5 s
+            x86_64-debug-svctest)     budget=540 ;;  # worst pass 175.3 s (est.)
             x86_64-debug-usertest)    budget=240 ;;  # worst pass 76.3 s
             x86_64-debug-ktest)       budget=420 ;;  # worst pass 127.0 s
-            x86_64-release-svctest)   budget=480 ;;  # worst pass 144.7 s
+            x86_64-release-svctest)   budget=540 ;;  # worst pass 176.1 s (est.)
             x86_64-release-usertest)  budget=180 ;;  # worst pass 48.5 s
             x86_64-release-ktest)     budget=420 ;;  # worst pass 121.6 s
             *) echo "no budget for this cell" >&2; exit 1 ;;

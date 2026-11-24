@@ -7,16 +7,13 @@ log.
 
 ## Role
 
-The fixture's per-program tester, `crashme-tester`, runs it once in each of the `vm`, `exception`,
-`worker`, and `registry-declare` modes, then twice in the `oom-touch` mode, with 1024 pages, beside
-the `oom-fill` mode, then once in each of the `live` and `live-no-core` modes, and the `usertest`
-orchestrator discovers and runs that tester. svctest's `crash_endpoint` phase also spawns it, in the
-`vm`, `exception`, `registry-main`, `registry-worker`, and `debugger-tag` modes, and its
-`oom_policy` phase in the `oom-touch` mode, with 1024 pages, and, through the shell of an operator
-session it opens, in the `oom-hold` mode ([services/svctest/README.md §
+svctest drives the fixture through the `crashd_faults`, `crashd_cores`, `crashd_live_core`, and
+`crashd_oom_hold` phases (§ Driven By), through its `crash_endpoint` phase, in the `vm`,
+`exception`, `registry-main`, `registry-worker`, and `debugger-tag` modes, through its `oom_policy`
+phase, in the `oom-touch` mode with 1024 pages, and, through the [`leader`](../leader/README.md)
+fixture of an operator session it opens, in the `oom-hold` mode ([services/svctest/README.md §
 Fixtures](../../svctest/README.md#fixtures)). The fixture installs at
-`/tests/fixtures/programs/crashme` and the tester at `/tests/programs/crashme`, per [docs/testing.md
-§ Per-program tester protocol](../../../docs/testing.md#per-program-tester-protocol).
+`/tests/fixtures/programs/crashme`.
 
 | Mode | Fault |
 |---|---|
@@ -43,40 +40,85 @@ reads the `crashme` blocks, does not take the timed-out fault's block for one of
 `oom-fill` nor `oom-touch` allocates nor touches a new stack page between the filler's `full` and
 its exit, since a fault of its own would be held too.
 
-The tester passes when, for each faulting mode it runs, the fixture printed its line and died of a
-fault: a non-clean exit whose reason is in the fault range, and left one new core in `/crash`, when
-`registry-declare` passed, and when the crash service's hold of a fault declined for want of memory
-([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Hold) behaved in its
-two cases. In the first, the filler keeps memory critical for 1000 ms after `full` while `oom-touch`
-writes its pages: the writes complete, the held one taking at least 500 ms. In the second, the
-filler keeps it critical for the usertest crash service's stall, 3000 ms, and 1500 ms more: the
-fixture dies of the fault, with a fault reason, at least 1000 ms after it was told to write, and
-leaves no core, since memory was still critical. The usertest boot stages a crash service whose
-`CORE_DUMP` names `crashme` ([docs/testing.md](../../../docs/testing.md) § Gating), so each faulting
-death leaves an ELF core
-([services/crashd/docs/core-format.md](../../crashd/docs/core-format.md)). The tester reads
-it with a reader of its own, not crashd's code, and checks that it is an `ET_CORE` of the machine,
-that its first `NT_PRSTATUS` carries the fault's signal (`SIGSEGV` for `vm`, `SIGILL` for the
-others) and an instruction pointer and a stack pointer inside `PT_LOAD`s whose bytes the core holds,
-that the bytes at the instruction pointer are the illegal instruction in the `exception` and
-`worker` modes, and that the `worker` core records more than one thread. That the crash service
-declined the fault, and the thread still died with a fault reason, is what it shows; the report
-blocks themselves are checked host-side, in the boot's serial log, by `cargo xtask
-run --crash-reports` ([docs/testing.md](../../../docs/testing.md) § Crash reports), which ties each
-block to `crashme` through the badge logd's `reclaim:` line names.
+---
 
-The tester also takes `crashd.core`, the one seed usertest's recipe declares for it
-([programs/usertest/README.md](../../../programs/usertest/README.md) § Seeds), and asks the crash
-service for live cores ([services/crashd/docs/operation.md](../../crashd/docs/operation.md)
-§ Live Core), each charged to a copy of its own memmgr account. Of `crashme live` it checks that the
-reply is `SUCCESS` and names the one new core, whose bytes match the reply's, that the fixture ran
-on unchanged and exited 0, and that the core is an `ET_CORE` of the machine with an `NT_PRSTATUS` of
-signal 0 for each of the fixture's three threads, each stack pointer inside a `PT_LOAD` whose bytes
-the core holds, every word of the marked bytes inside one, holding the word, and the main thread's
-instruction pointer, in the binary's text, inside none, so a debugger reads the text from the
-binary. Of `crashme live-no-core` it checks that the reply is `NO_CORE`, that no core was written,
-that the pages charged to its account (`QUERY_MEMORY_USAGE`) are the same after the reply as before
-the request, so the refused capture was released, and that the fixture exited 0.
+## Driven By
+
+The phases live in `services/svctest/src/phases/crashd.rs`. The staged crash service's recipe,
+`rootfs/config/svcmgr/tests/crashd.svc`, sets `CORE_DUMP` to `crashme`
+([docs/testing.md](../../../docs/testing.md) § Gating), so each faulting death leaves an ELF core
+([services/crashd/docs/core-format.md](../../crashd/docs/core-format.md)). The report blocks
+themselves are checked host-side, in the boot's serial log, by `cargo xtask run --crash-reports`
+([docs/testing.md](../../../docs/testing.md) § Crash reports), which ties each block to `crashme`
+through the badge logd's `reclaim:` line names.
+
+### `crashd_faults`
+
+For each of `vm`, `exception`, and `worker`, in that order, it spawns
+`/tests/fixtures/programs/crashme <mode>` with a piped stdout, reads stdout to EOF, and waits. It
+asserts:
+
+- stdout contains `faulting (<mode>)`;
+- the exit is not a success;
+- the exit reason is in the fault range, `0x1000` up to but not including `0x2000`;
+- exactly one core ending `-crashme.core` is new in `/crash` since before the spawn; the phase
+  records its name for `crashd_cores`.
+
+It then runs `registry-declare` and asserts that the exit is a success and stdout contains
+`registry-declare: PASS`.
+
+### `crashd_cores`
+
+It asserts that `crashd_faults` recorded at least one core, then reads each recorded core with a
+reader of its own, not crashd's code, and asserts that it is:
+
+- a 64-bit little-endian ELF file of type `ET_CORE` and of this machine, with a `PT_NOTE`;
+- carrying a first `NT_PRSTATUS` whose signal is `SIGSEGV` for `vm` and `SIGILL` for the others;
+- with an instruction pointer inside a `PT_LOAD` whose bytes the core holds, and, in the
+  `exception` and `worker` modes, the illegal instruction (`ud2` on x86-64, `unimp` on riscv64)
+  at those bytes;
+- with a stack pointer inside a `PT_LOAD` whose bytes the core holds;
+- and, for `worker`, with more than one `NT_PRSTATUS`.
+
+### `crashd_live_core`
+
+It asserts that svctest holds the `crashd.core` bootstrap capability, then asks the crash service
+for live cores ([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Live Core),
+each charged to a copy of its own memmgr account.
+
+For `crashme live`: the fixture prints `ready mark=0x<address>` (otherwise it panics); the
+`LIVE_CORE` reply is `SUCCESS`; after the phase writes `check` to the fixture's stdin, the
+fixture exits with a success and prints `live: PASS`, so it ran on unchanged; exactly one core is
+new in `/crash`, its name starting with the reply's sequence number and its length equal to the
+reply's byte count; and the core is an `ET_CORE` of this machine holding at least three
+`NT_PRSTATUS` notes, each of signal 0, each stack pointer inside a written `PT_LOAD`, the main
+thread's instruction pointer, in the binary's text, inside no `PT_LOAD` (so a debugger reads the
+text from the binary), and every 8-byte word of the 4096 marked bytes inside a written `PT_LOAD` and
+equal to the mark word `0x4c49_5645_434f_5245`.
+
+For `crashme live-no-core`: the fixture prints `ready`; the `LIVE_CORE` reply is `NO_CORE`; the
+pages charged to the phase's account (`QUERY_MEMORY_USAGE`) are the same after the reply as before
+the request, so the refused capture was released; after the phase writes `exit` to its stdin the
+fixture exits with a success; and no core is new in `/crash`.
+
+### `crashd_oom_hold`
+
+It runs after the swap phases and checks the crash service's hold of a fault declined for want of
+memory ([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Hold). The stall it
+uses is the one the staged crash service's recipe sets, read from the recipe. In each of two cases
+it starts `oom-touch 1024`, waits for its `ready`, touches 16 KiB of its own stack so its window
+faults no new stack page, starts `oom-fill <ms>` and waits for `full`, and tells the fixture to
+write. Either fixture still running 30 s after it was waited on (30 s and the stall for the timeout
+case's `oom-touch`) is killed and the phase panics.
+
+- Resume: the filler keeps memory critical for 1000 ms after `full`. It asserts that the filler
+  exits with a success, that the fixture exits with a success, and that its line is `touched
+  held_ms=<ms>` with at least 500 ms.
+- Timeout: the filler keeps memory critical until the fixture has died, and the phase then kills it,
+  since an oomd stop that frees memory ends the hold it finds and the fixture's next write is held
+  anew. It asserts that the filler was still running when the fixture died; that the fixture does
+  not exit with a success, its exit reason is in the fault range, and it died at least the stall
+  after it was told to write; and that no core is new in `/crash`, since memory was still critical.
 
 ---
 
@@ -95,10 +137,6 @@ crashme/
 │       │   └── mod.rs     # `ud2`
 │       └── riscv64/
 │           └── mod.rs     # `unimp`
-└── tester/
-    ├── Cargo.toml
-    └── src/
-        └── main.rs        # Runs the modes; checks deaths, cores, declaration, hold, live cores
 ```
 
 ---
@@ -108,10 +146,10 @@ crashme/
 | Document | Covers |
 |---|---|
 | [services/crashd/README.md](../../crashd/README.md) | The crash service the fixture's deaths are reported by |
-| [services/crashd/docs/core-format.md](../../crashd/docs/core-format.md) | The core the tester checks |
-| [services/crashd/docs/operation.md](../../crashd/docs/operation.md) | § Hold: the hold the `oom-` modes drive; § Live Core: the live cores the tester asks for |
+| [services/crashd/docs/core-format.md](../../crashd/docs/core-format.md) | The core the phases check |
+| [services/crashd/docs/operation.md](../../crashd/docs/operation.md) | § Hold: the hold the `oom-` modes drive; § Live Core: the live cores the phases ask for |
 | [docs/fault-handling.md](../../../docs/fault-handling.md) | § Crash Reports, § Reply |
-| [docs/testing.md](../../../docs/testing.md) | § Per-program tester protocol, § Crash reports |
+| [docs/testing.md](../../../docs/testing.md) | § Gating, § Crash reports |
 
 ---
 

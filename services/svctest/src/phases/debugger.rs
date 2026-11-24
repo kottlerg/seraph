@@ -1,34 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/fixtures/debugger/tester/src/main.rs
+// services/svctest/src/phases/debugger.rs
 
-//! Per-program tester for `/tests/fixtures/programs/debugger`. Spawns it once and asserts
+//! svctest phase for `/tests/fixtures/programs/debugger`. Spawns it once and asserts
 //! that it printed `PASS` and exited cleanly: its debugger thread took the
 //! debuggee's breakpoint, inspected and modified its memory, single-stepped
 //! it, and async-broke it with an upcall, then debugged a debuggee process
 //! through its memory and a breakpoint in its text.
-//!
-//! See [docs/testing.md](../../../../../docs/testing.md) for the protocol.
-
-#![expect(
-    clippy::expect_used,
-    reason = "a per-program tester is test code, where unwrap and expect are permitted \
-              (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait must \
-              abort the tester, and the panic's non-zero exit is its FAIL verdict"
-)]
 
 use std::io::Read;
 use std::os::seraph::process::CommandExt;
 use std::process::{Command, Stdio};
 
-fn fail(msg: &str) -> !
+use crate::bootstrap::Caps;
+use crate::runner::Phase;
+
+pub fn phases() -> &'static [Phase]
 {
-    println!("[debugger-tester] FAIL {msg}");
-    std::process::exit(1);
+    &[Phase {
+        name: "debugger",
+        run: debugger_phase,
+    }]
 }
 
-fn main()
+pub fn debugger_phase(_: &Caps)
 {
     // A private image: the fixture writes breakpoints in its own text, which
     // needs text frames it alone maps (the fixture's README.md § Private
@@ -49,12 +45,13 @@ fn main()
     let out = String::from_utf8_lossy(&bytes);
     if !out.lines().any(|l| l.trim() == "PASS")
     {
-        println!("[debugger-tester] stdout: {out:?}");
-        fail("PASS marker missing");
+        std::os::seraph::log!("debugger: stdout: {out:?}");
+        panic!("debugger: PASS marker missing");
     }
-    if !status.success()
-    {
-        fail(&format!("exited non-clean: {:?}", status.code()));
-    }
-    println!("[debugger-tester] PASS");
+    assert!(
+        status.success(),
+        "debugger: exited non-clean: {:?}",
+        status.code()
+    );
+    std::os::seraph::log!("debugger phase passed");
 }

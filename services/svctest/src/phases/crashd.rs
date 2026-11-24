@@ -1,47 +1,70 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/fixtures/crashme/tester/src/main.rs
+// services/svctest/src/phases/crashd.rs
 
-//! Per-program tester for `/tests/fixtures/programs/crashme`. Runs it in each mode the
-//! crash-report check reads, `vm`, `exception`, and `worker`, and checks
-//! that it reached its fault and died of it: a non-clean exit whose reason
-//! is a fault class, so the crash service's decline ended the thread as the
-//! kernel would have. It also runs `registry-declare`, which faults on
-//! nothing, and checks that it passed, and `oom-touch` beside `oom-fill`,
-//! which checks the crash service's hold of a fault memmgr declined for want
-//! of memory ([`check_oom_hold`]). The report block each
-//! death leaves in the log is checked host-side, from the boot's serial log,
-//! by `cargo xtask run --crash-reports` (docs/testing.md § Crash reports).
+//! Crash-service surfaces, driven through `/tests/fixtures/programs/crashme`. The faults phase
+//! (`crashd_faults`) runs it in each mode the crash-report check reads, `vm`, `exception`, and
+//! `worker`, and checks that it reached its fault and died of it: a non-clean exit whose reason
+//! is a fault class, so the crash service's decline ended the thread as the kernel would have. It
+//! also runs `registry-declare`, which faults on nothing, and checks that it passed. The report
+//! block each death leaves in the log is checked host-side, from the boot's serial log, by
+//! `cargo xtask run --crash-reports` (docs/testing.md § Crash reports).
 //!
-//! The usertest boot stages a crash service whose `CORE_DUMP` names
-//! crashme, so each faulting mode also leaves one ELF core in `/crash`; the
-//! tester checks it (services/crashd/docs/core-format.md): an `ET_CORE` of
-//! this machine whose first `NT_PRSTATUS` carries the fault's signal, an
-//! instruction pointer in a written `PT_LOAD` (at the illegal instruction,
-//! for the modes that execute it) and a stack pointer in one, and, for
+//! svctest's staging stages a crash service whose `CORE_DUMP` names crashme
+//! (rootfs/config/svcmgr/tests/crashd.svc), so each faulting mode also leaves one ELF core in
+//! `/crash`; the cores phase (`crashd_cores`) checks the ones the faults phase recorded
+//! (services/crashd/docs/core-format.md): an `ET_CORE` of this machine whose first
+//! `NT_PRSTATUS` carries the fault's signal, an instruction pointer in a written `PT_LOAD` (at
+//! the illegal instruction, for the modes that execute it) and a stack pointer in one, and, for
 //! `worker`, more than one thread.
 //!
-//! It also asks the crash service for a live core of `crashme live`
-//! ([`check_live`]) through the `crashd.core` seed usertest's recipe declares
-//! for it, and checks the fixture ran on unchanged and the core holds every
-//! registered thread, stopped nowhere, and the fixture's marked page; then
-//! asks for one of `crashme live-no-core`, which declared itself on the core
-//! path, and checks the refusal ([`check_live_no_core`]).
+//! The live-core phase (`crashd_live_core`) asks the crash service for a live core of
+//! `crashme live` ([`check_live`]) through `caps.crashd_core`, and checks the fixture ran on
+//! unchanged and the core holds every registered thread, stopped nowhere, and the fixture's marked
+//! page; then asks for one of `crashme live-no-core`, which declared itself on the core path, and
+//! checks the refusal ([`check_live_no_core`]).
 //!
-//! See [docs/testing.md](../../../../../docs/testing.md) for the protocol.
-
-#![expect(
-    clippy::expect_used,
-    reason = "a per-program tester is test code, where unwrap and expect are permitted \
-              (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait must \
-              abort the tester, and the panic's non-zero exit is its FAIL verdict"
-)]
+//! The hold phase (`crashd_oom_hold`) runs `oom-touch` beside `oom-fill`, which checks the
+//! crash service's hold of a fault memmgr declined for want of memory ([`check_oom_hold`]).
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::bootstrap::Caps;
+use crate::runner::Phase;
+
+/// The fault, core and live-core phases.
+pub fn faults_and_cores() -> &'static [Phase]
+{
+    &[
+        Phase {
+            name: "crashd_faults",
+            run: crashd_faults_phase,
+        },
+        Phase {
+            name: "crashd_cores",
+            run: crashd_cores_phase,
+        },
+        Phase {
+            name: "crashd_live_core",
+            run: crashd_live_core_phase,
+        },
+    ]
+}
+
+/// The hold phase, which the phase order places after the swap phases
+/// (`super::all`).
+pub fn oom_hold() -> &'static [Phase]
+{
+    &[Phase {
+        name: "crashd_oom_hold",
+        run: crashd_oom_hold_phase,
+    }]
+}
 
 /// Base exit reason for a fault-induced death (`abi/syscall`
 /// `EXIT_FAULT_BASE`); faults occupy `[EXIT_FAULT_BASE, EXIT_KILLED)`.
@@ -89,12 +112,6 @@ mod machine
     pub const ILLEGAL: &[u8] = &[0x00, 0x00];
 }
 
-fn fail(msg: &str) -> !
-{
-    println!("[crashme-tester] FAIL {msg}");
-    std::process::exit(1);
-}
-
 /// Run `/tests/fixtures/programs/crashme <mode>` and check it reached its fault and died of
 /// it.
 #[expect(
@@ -119,37 +136,75 @@ fn check(mode: &str)
         .expect("read /tests/fixtures/programs/crashme stdout");
     let status = child.wait().expect("wait /tests/fixtures/programs/crashme");
     let out = String::from_utf8_lossy(&bytes);
-    if !out.contains(&format!("faulting ({mode})"))
-    {
-        fail(&format!(
-            "{mode}: the fixture never reached its fault: {out:?}"
-        ));
-    }
-    if status.success()
-    {
-        fail(&format!("{mode}: the fixture exited cleanly"));
-    }
+    assert!(
+        out.contains(&format!("faulting ({mode})")),
+        "crashd_faults: {mode}: the fixture never reached its fault: {out:?}"
+    );
+    assert!(
+        !status.success(),
+        "crashd_faults: {mode}: the fixture exited cleanly"
+    );
     let reason = status.code().expect("a fault death carries a reason") as u64;
-    if !(EXIT_FAULT_BASE..EXIT_KILLED).contains(&reason)
-    {
-        fail(&format!(
-            "{mode}: exit reason {reason:#x} is not a fault class"
-        ));
-    }
+    assert!(
+        (EXIT_FAULT_BASE..EXIT_KILLED).contains(&reason),
+        "crashd_faults: {mode}: exit reason {reason:#x} is not a fault class"
+    );
     let new: Vec<String> = cores().difference(&before).cloned().collect();
     let [name] = new.as_slice()
     else
     {
-        fail(&format!(
-            "{mode}: expected one new core in {CORE_DIR}, found {new:?}"
-        ));
+        panic!("crashd_faults: {mode}: expected one new core in {CORE_DIR}, found {new:?}");
     };
-    let path = format!("{CORE_DIR}/{name}");
-    let core = std::fs::read(&path).expect("read the core");
-    if let Err(why) = check_core(&core, mode)
+    RECORDED
+        .lock()
+        .expect("lock the recorded cores")
+        .push((mode.to_string(), name.clone()));
+}
+
+/// The cores [`check`] found, as (mode, name) in the order the modes ran, for
+/// [`crashd_cores_phase`].
+static RECORDED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Check the core each faulting mode left, as [`check`] recorded it.
+fn crashd_cores_phase(_: &Caps)
+{
+    let recorded = RECORDED.lock().expect("lock the recorded cores");
+    assert!(
+        !recorded.is_empty(),
+        "crashd_cores: crashd_faults recorded no core"
+    );
+    for (mode, name) in recorded.iter()
     {
-        fail(&format!("{mode}: {path}: {why}"));
+        let path = format!("{CORE_DIR}/{name}");
+        let core = std::fs::read(&path).expect("read the core");
+        if let Err(why) = check_core(&core, mode)
+        {
+            panic!("crashd_cores: {mode}: {path}: {why}");
+        }
     }
+}
+
+fn crashd_faults_phase(_: &Caps)
+{
+    check("vm");
+    check("exception");
+    check("worker");
+    check_declare();
+}
+
+fn crashd_live_core_phase(caps: &Caps)
+{
+    assert_ne!(
+        caps.crashd_core, 0,
+        "crashd_live_core: no crashd.core authority delivered"
+    );
+    check_live(caps.crashd_core);
+    check_live_no_core(caps.crashd_core);
+}
+
+fn crashd_oom_hold_phase(_: &Caps)
+{
+    check_oom_hold();
 }
 
 /// The names of crashme's complete cores in [`CORE_DIR`].
@@ -347,33 +402,26 @@ fn check_declare()
         .output()
         .expect("run /tests/fixtures/programs/crashme registry-declare");
     let text = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() || !text.contains("registry-declare: PASS")
-    {
-        fail(&format!("registry-declare: {}: {text:?}", out.status));
-    }
+    assert!(
+        out.status.success() && text.contains("registry-declare: PASS"),
+        "crashd_faults: registry-declare: {}: {text:?}",
+        out.status
+    );
 }
 
-/// The stall the usertest boot's crash service holds a fault for
-/// (`CRASHD_OOM_STALL_MS` in rootfs/config/svcmgr/tests/crashd.svc).
-const STALL_MS: u64 = 3000;
 /// How long the filler keeps the pool full after `full` for the fault that
-/// resumes: well inside [`STALL_MS`].
+/// resumes: well inside the stall `crashd_stall` names.
 const RESUME_FILL_MS: u64 = 1000;
 /// How long a fault that resumes was held at least: half of
-/// [`RESUME_FILL_MS`], the rest being the filler's tick and the tester's
+/// [`RESUME_FILL_MS`], the rest being the filler's tick and the phase's
 /// write after `full`.
 const RESUME_HELD_MIN_MS: u128 = 500;
-/// How long the filler keeps the pool full after `full` for the fault that
-/// times out: past [`STALL_MS`], by enough for the crash service to see the
-/// deadline pass first.
-const TIMEOUT_FILL_MS: u64 = STALL_MS + 1500;
-/// How long a fault that times out was held at least, from the write.
-const TIMEOUT_HELD_MIN_MS: u128 = 1000;
-/// How long the tester waits for either fixture to exit.
+/// How long the phase waits for either fixture to exit, past the stall for
+/// the fixture whose hold times out.
 const OOM_WAIT: Duration = Duration::from_secs(30);
-/// Bytes of stack the tester touches before a window, below its frame.
+/// Bytes of stack the phase touches before a window, below its frame.
 const STACK_TOUCH_BYTES: usize = 16 * 1024;
-/// The pages `oom-touch` writes: 1024, 64 chunks. No process the tester ends
+/// The pages `oom-touch` writes: 1024, 64 chunks. No process the phase ends
 /// frees memory between the filler's `full` and the writes, but memmgr goes on
 /// evicting at `CRITICAL`, and once the restore headroom has reached the
 /// reserve each eviction it completes frees pages above the growth floor until
@@ -407,10 +455,10 @@ fn start_toucher() -> Toucher
     let mut line = String::with_capacity(256);
     stdin.write_all(b"start\n").expect("write to oom-touch");
     stdout.read_line(&mut line).expect("read oom-touch stdout");
-    if line.trim() != "ready"
-    {
-        fail(&format!("oom-touch: expected ready, read {line:?}"));
-    }
+    assert!(
+        line.trim() == "ready",
+        "crashd_oom_hold: oom-touch: expected ready, read {line:?}"
+    );
     line.clear();
     Toucher {
         child,
@@ -443,7 +491,7 @@ fn start_filler(hold_ms: u64) -> Child
         if stdout.read_line(&mut line).expect("read oom-fill stdout") == 0
         {
             let status = wait_bounded(&mut child, "oom-fill");
-            fail(&format!("oom-fill: exited before full: {status}"));
+            panic!("crashd_oom_hold: oom-fill: exited before full: {status}");
         }
         if line.trim() == "full"
         {
@@ -455,6 +503,12 @@ fn start_filler(hold_ms: u64) -> Child
 /// Wait for `child` up to [`OOM_WAIT`], killing it and failing past that.
 fn wait_bounded(child: &mut Child, what: &str) -> ExitStatus
 {
+    wait_within(child, what, OOM_WAIT)
+}
+
+/// Wait for `child` up to `bound`, killing it and failing past that.
+fn wait_within(child: &mut Child, what: &str, bound: Duration) -> ExitStatus
+{
     let start = Instant::now();
     loop
     {
@@ -462,21 +516,22 @@ fn wait_bounded(child: &mut Child, what: &str) -> ExitStatus
         {
             return status;
         }
-        if start.elapsed() > OOM_WAIT
+        if start.elapsed() > bound
         {
             let _ = child.kill();
-            fail(&format!("{what}: still running after {OOM_WAIT:?}"));
+            panic!("crashd_oom_hold: {what}: still running after {bound:?}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
 /// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame, so the window
-/// faults no new stack page of the tester.
+/// faults no new stack page of the phase.
 #[inline(never)]
 #[expect(
     clippy::large_stack_frames,
-    reason = "the frame is the touch: its array is the stack the window may use, written once before it"
+    reason = "the frame is the touch: its array is the stack the window may use, written once \
+              before it"
 )]
 fn touch_stack()
 {
@@ -488,11 +543,18 @@ fn touch_stack()
 /// (services/crashd/docs/operation.md § Hold). A fixture writes the pages of a
 /// demand region while a filler keeps the pool full down to the growth floor:
 /// when the filler gives it back within the stall, the writes complete and the
-/// fixture prints how long the held one took; when it holds the pool past the stall, the hold times
-/// out and the fixture dies of the fault, with no core written, since memory
-/// was still critical.
+/// fixture prints how long the held one took; when it holds the pool until the
+/// fixture has died, the hold times out and the fixture dies of the fault, at
+/// least the stall after its write, with no core written, since memory was
+/// still critical.
 ///
-/// Between the filler's `full` and its exit the tester allocates nothing and
+/// oomd stops its candidates while the level reads `CRITICAL`, a grace and
+/// then a cooldown apart, and a stop that frees memory ends the hold it finds;
+/// the fixture's next write is then held anew. The timeout case's filler
+/// therefore keeps the pool full until the fixture has died, and the phase
+/// then kills it: only the last hold has to outlast the stall.
+///
+/// Between the filler's `full` and its exit the phase allocates nothing and
 /// touches no new stack page, since a fault of its own would be held too.
 #[expect(
     clippy::cast_sign_loss,
@@ -501,6 +563,14 @@ fn touch_stack()
 )]
 fn check_oom_hold()
 {
+    let stall_ms = super::oom::crashd_stall("crashd_oom_hold")
+        .expect("crashd_oom_hold: crashd's recipe is not staged or holds no fault");
+    let stall = Duration::from_millis(stall_ms);
+    let toucher_bound = OOM_WAIT.saturating_add(stall);
+    // Longer than the phase waits for the fixture, so only the phase's kill
+    // ends it.
+    let timeout_fill_ms =
+        u64::try_from(toucher_bound.saturating_add(OOM_WAIT).as_millis()).unwrap_or(u64::MAX);
     // A fault the hold resumes.
     let mut toucher = start_toucher();
     touch_stack();
@@ -517,10 +587,7 @@ fn check_oom_hold()
         .expect("read oom-touch stdout");
     let status = wait_bounded(&mut toucher.child, "oom-touch (resume)");
     let fill = wait_bounded(&mut filler, "oom-fill (resume)");
-    if !fill.success()
-    {
-        fail(&format!("oom-fill (resume): {fill}"));
-    }
+    assert!(fill.success(), "crashd_oom_hold: oom-fill (resume): {fill}");
     let held = toucher
         .line
         .trim()
@@ -530,46 +597,48 @@ fn check_oom_hold()
     {
         Some(ms) if status.success() && ms >= RESUME_HELD_MIN_MS =>
         {}
-        _ => fail(&format!(
-            "oom-touch (resume): {status}, {:?}: the write was not held and resumed",
+        _ => panic!(
+            "crashd_oom_hold: oom-touch (resume): {status}, {:?}: the write was not held and \
+             resumed",
             toucher.line
-        )),
+        ),
     }
 
     // A fault the hold times out on.
     let before = cores();
     let mut toucher = start_toucher();
     touch_stack();
-    let mut filler = start_filler(TIMEOUT_FILL_MS);
+    let mut filler = start_filler(timeout_fill_ms);
     toucher
         .stdin
         .write_all(b"go\n")
         .expect("write to oom-touch");
     let start = Instant::now();
-    let status = wait_bounded(&mut toucher.child, "oom-touch (timeout)");
+    let status = wait_within(&mut toucher.child, "oom-touch (timeout)", toucher_bound);
     let died_after = start.elapsed().as_millis();
-    let fill = wait_bounded(&mut filler, "oom-fill (timeout)");
-    if !fill.success()
-    {
-        fail(&format!("oom-fill (timeout): {fill}"));
-    }
+    let filling = filler.try_wait().expect("try_wait").is_none();
+    let _ = filler.kill();
+    let _ = wait_bounded(&mut filler, "oom-fill (timeout)");
+    assert!(
+        filling,
+        "crashd_oom_hold: oom-fill (timeout): exited before oom-touch died"
+    );
     let reason = status.code().map(|code| code as u64);
     if status.success()
         || !reason.is_some_and(|r| (EXIT_FAULT_BASE..EXIT_KILLED).contains(&r))
-        || died_after < TIMEOUT_HELD_MIN_MS
+        || died_after < stall.as_millis()
     {
-        fail(&format!(
-            "oom-touch (timeout): {status} after {died_after} ms: the fault was not held and \
-             declined"
-        ));
+        panic!(
+            "crashd_oom_hold: oom-touch (timeout): {status} after {died_after} ms: the fault was \
+             not held and declined"
+        );
     }
     let new: Vec<String> = cores().difference(&before).cloned().collect();
-    if !new.is_empty()
-    {
-        fail(&format!(
-            "oom-touch (timeout): a core was written while memory was critical: {new:?}"
-        ));
-    }
+    assert!(
+        new.is_empty(),
+        "crashd_oom_hold: oom-touch (timeout): a core was written while memory was critical: \
+             {new:?}"
+    );
 }
 
 /// Threads `crashme live` runs: its main thread and the two it parks.
@@ -579,9 +648,8 @@ const LIVE_MARK: u64 = 0x4c49_5645_434f_5245;
 /// Bytes of the marked page.
 const LIVE_MARK_BYTES: usize = 4096;
 
-/// With the seed usertest's recipe declares for this tester (`crashd.core`,
-/// [`crashd_seed`]), start `crashme live`, and
-/// ask the crash service for a live core of it, charged to this tester's own
+/// With `caps.crashd_core`, start `crashme live`, and
+/// ask the crash service for a live core of it, charged to this phase's own
 /// memmgr account. Check the reply, that the fixture then ran on with its
 /// threads and its marked page unchanged and exited cleanly, and the core
 /// ([`check_live_core`]).
@@ -589,12 +657,7 @@ const LIVE_MARK_BYTES: usize = 4096;
 /// that does not record its threads, their stacks or its memory.
 fn check_live(crashd: u64)
 {
-    let info = std::os::seraph::startup_info();
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
-    )]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     let before = cores();
     let mut child = Command::new("/tests/fixtures/programs/crashme")
@@ -613,23 +676,21 @@ fn check_live(crashd: u64)
         .trim()
         .strip_prefix("ready mark=0x")
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-        .unwrap_or_else(|| fail(&format!("live: expected ready, read {line:?}")));
+        .unwrap_or_else(|| panic!("crashd_live_core: live: expected ready, read {line:?}"));
 
     let request = live_core_request("live");
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = match unsafe { ipc::ipc_call(crashd, &request, ipc_buf) }
     {
         Ok(reply) => reply,
-        Err(e) => fail(&format!("live: the LIVE_CORE call failed ({e})")),
+        Err(e) => panic!("crashd_live_core: live: the LIVE_CORE call failed ({e})"),
     };
-    if reply.label != ipc::crashd_errors::SUCCESS
-    {
-        fail(&format!(
-            "live: LIVE_CORE answered {:#x} ({:#x})",
-            reply.label,
-            reply.word(0)
-        ));
-    }
+    assert!(
+        reply.label == ipc::crashd_errors::SUCCESS,
+        "crashd_live_core: live: LIVE_CORE answered {:#x} ({:#x})",
+        reply.label,
+        reply.word(0)
+    );
 
     stdin.write_all(b"check\n").expect("write to crashme live");
     line.clear();
@@ -639,80 +700,45 @@ fn check_live(crashd: u64)
     let status = child
         .wait()
         .expect("wait /tests/fixtures/programs/crashme live");
-    if !status.success() || !line.contains("live: PASS")
-    {
-        fail(&format!(
-            "live: the fixture did not run on unchanged: {status}, {line:?}"
-        ));
-    }
+    assert!(
+        status.success() && line.contains("live: PASS"),
+        "crashd_live_core: live: the fixture did not run on unchanged: {status}, {line:?}"
+    );
 
     let new: Vec<String> = cores().difference(&before).cloned().collect();
     let [name] = new.as_slice()
     else
     {
-        fail(&format!(
-            "live: expected one new core in {CORE_DIR}, found {new:?}"
-        ));
+        panic!("crashd_live_core: live: expected one new core in {CORE_DIR}, found {new:?}");
     };
-    if !name.starts_with(&format!("{:010}-", reply.word(1)))
-    {
-        fail(&format!(
-            "live: the new core {name} is not core {}",
-            reply.word(1)
-        ));
-    }
+    assert!(
+        name.starts_with(&format!("{:010}-", reply.word(1))),
+        "crashd_live_core: live: the new core {name} is not core {}",
+        reply.word(1)
+    );
     let path = format!("{CORE_DIR}/{name}");
     let core = std::fs::read(&path).expect("read the live core");
-    if core.len() as u64 != reply.word(2)
-    {
-        fail(&format!(
-            "live: {path} holds {} bytes, the reply named {}",
-            core.len(),
-            reply.word(2)
-        ));
-    }
+    assert!(
+        core.len() as u64 == reply.word(2),
+        "crashd_live_core: live: {path} holds {} bytes, the reply named {}",
+        core.len(),
+        reply.word(2)
+    );
     if let Err(why) = check_live_core(&core, mark)
     {
-        fail(&format!("live: {path}: {why}"));
+        panic!("crashd_live_core: live: {path}: {why}");
     }
 }
 
-/// Take the one seed usertest's recipe declares for this tester
-/// (`crashd.core`) over the bootstrap protocol.
-fn crashd_seed() -> u64
-{
-    let info = std::os::seraph::startup_info();
-    if info.creator_endpoint == 0
-    {
-        fail("no creator endpoint for the declared crashd.core seed");
-    }
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
-    )]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
-    // SAFETY: the IPC buffer is registered by `_start` and page-aligned.
-    let slots = unsafe { ipc::bootstrap::request_slots::<1>(info.creator_endpoint, ipc_buf) };
-    match slots
-    {
-        Ok([cap]) if cap != 0 => cap,
-        other => fail(&format!(
-            "the declared crashd.core seed was not delivered: {other:?}"
-        )),
-    }
-}
-
-/// A `LIVE_CORE` request for the fixture, charged to a copy of this tester's
-/// own memmgr account. It names the fixture by its whole path: `crashme`
-/// alone would name this tester too, `/tests/programs/crashme`, by its last
-/// component.
+/// A `LIVE_CORE` request for the fixture, charged to a copy of this process's
+/// own memmgr account. It names the fixture by its whole path.
 fn live_core_request(what: &str) -> ipc::IpcMessage
 {
     let account = syscall::cap_derive(
         std::os::seraph::startup_info().memmgr_endpoint,
         syscall::RIGHTS_EP_SEND,
     )
-    .unwrap_or_else(|e| fail(&format!("{what}: no copy of the memmgr account ({e})")));
+    .unwrap_or_else(|e| panic!("crashd_live_core: {what}: no copy of the memmgr account ({e})"));
     ipc::with_name_block(
         ipc::IpcMessage::builder(ipc::crashd_labels::LIVE_CORE),
         0,
@@ -724,7 +750,7 @@ fn live_core_request(what: &str) -> ipc::IpcMessage
     .build()
 }
 
-/// The pages charged to this tester's own memmgr account
+/// The pages charged to this process's own memmgr account
 /// (`QUERY_MEMORY_USAGE` `data[0]`).
 fn own_charge(ipc_buf: *mut u64) -> u64
 {
@@ -739,13 +765,16 @@ fn own_charge(ipc_buf: *mut u64) -> u64
     }
     {
         Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS => reply.word(0),
-        Ok(reply) => fail(&format!("QUERY_MEMORY_USAGE answered {:#x}", reply.label)),
-        Err(e) => fail(&format!("QUERY_MEMORY_USAGE failed ({e})")),
+        Ok(reply) => panic!(
+            "crashd_live_core: QUERY_MEMORY_USAGE answered {:#x}",
+            reply.label
+        ),
+        Err(e) => panic!("crashd_live_core: QUERY_MEMORY_USAGE failed ({e})"),
     }
 }
 
 /// Start `crashme live-no-core`, which declares itself on the core path, and
-/// ask the crash service for a live core of it, charged to this tester's own
+/// ask the crash service for a live core of it, charged to this process's own
 /// account. Check that the crash service refused with `NO_CORE`, wrote no
 /// core, and left the account charged as before the request, its snapshot
 /// released; and that the fixture ran on and exited cleanly.
@@ -754,12 +783,7 @@ fn own_charge(ipc_buf: *mut u64) -> u64
 /// the requester.
 fn check_live_no_core(crashd: u64)
 {
-    let info = std::os::seraph::startup_info();
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
-    )]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let before = cores();
     let mut child = Command::new("/tests/fixtures/programs/crashme")
         .arg("live-no-core")
@@ -773,13 +797,13 @@ fn check_live_no_core(crashd: u64)
     stdout
         .read_line(&mut line)
         .expect("read crashme live-no-core stdout");
-    if line.trim() != "ready"
-    {
-        fail(&format!("live-no-core: expected ready, read {line:?}"));
-    }
+    assert!(
+        line.trim() == "ready",
+        "crashd_live_core: live-no-core: expected ready, read {line:?}"
+    );
 
     // Nothing between the two reads of the charge allocates or touches a new
-    // page of this tester.
+    // page of this process.
     let request = live_core_request("live-no-core");
     let charged = own_charge(ipc_buf);
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -789,18 +813,17 @@ fn check_live_no_core(crashd: u64)
     {
         Ok(r) if r.label == ipc::crashd_errors::NO_CORE =>
         {}
-        Ok(r) => fail(&format!(
-            "live-no-core: LIVE_CORE answered {:#x}, expected NO_CORE",
+        Ok(r) => panic!(
+            "crashd_live_core: live-no-core: LIVE_CORE answered {:#x}, expected NO_CORE",
             r.label
-        )),
-        Err(e) => fail(&format!("live-no-core: the LIVE_CORE call failed ({e})")),
+        ),
+        Err(e) => panic!("crashd_live_core: live-no-core: the LIVE_CORE call failed ({e})"),
     }
-    if after != charged
-    {
-        fail(&format!(
-            "live-no-core: the account holds {after} pages after the refusal, {charged} before"
-        ));
-    }
+    assert!(
+        after == charged,
+        "crashd_live_core: live-no-core: the account holds {after} pages after the refusal, \
+             {charged} before"
+    );
 
     stdin
         .write_all(b"exit\n")
@@ -808,15 +831,15 @@ fn check_live_no_core(crashd: u64)
     let status = child
         .wait()
         .expect("wait /tests/fixtures/programs/crashme live-no-core");
-    if !status.success()
-    {
-        fail(&format!("live-no-core: the fixture exited {status}"));
-    }
+    assert!(
+        status.success(),
+        "crashd_live_core: live-no-core: the fixture exited {status}"
+    );
     let new: Vec<String> = cores().difference(&before).cloned().collect();
-    if !new.is_empty()
-    {
-        fail(&format!("live-no-core: a core was written: {new:?}"));
-    }
+    assert!(
+        new.is_empty(),
+        "crashd_live_core: live-no-core: a core was written: {new:?}"
+    );
 }
 
 /// Check a live core of `crashme live`, whose marked page is at `mark`: an
@@ -869,20 +892,4 @@ fn check_live_core(core: &[u8], mark: u64) -> Result<(), String>
         }
     }
     Ok(())
-}
-
-fn main()
-{
-    // The seed is taken before the first write to stdout: usertest's spawn
-    // returns, and it forwards the tester's output, only once the seed
-    // request has come (docs/testing.md § Per-program tester protocol).
-    let crashd = crashd_seed();
-    check("vm");
-    check("exception");
-    check("worker");
-    check_declare();
-    check_oom_hold();
-    check_live(crashd);
-    check_live_no_core(crashd);
-    println!("[crashme-tester] PASS");
 }

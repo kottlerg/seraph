@@ -169,5 +169,5 @@ pub const SESSIOND_OPERATOR: &[u8] = b"sessiond.operator";
 /// `crashd_labels::LIVE_CORE_AUTHORITY`: the authority to ask crashd for an
 /// ELF core of a live process (services/crashd/docs/operation.md § Live
 /// Core), whose request moves the account the snapshot is charged to.
-/// Seed-only; seeded only by usertest, which hands it to the crashme tester.
+/// Seed-only; seeded only by svctest's recipe, for its `crashd_live_core` phase.
 pub const CRASHD_CORE: &[u8] = b"crashd.core";

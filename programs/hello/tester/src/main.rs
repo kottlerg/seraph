@@ -4,13 +4,16 @@
 // programs/hello/tester/src/main.rs
 
 //! Per-program tester for `/programs/hello`. Spawns it with a piped stdout,
-//! asserts the expected line appears, and asserts a clean exit. Then, as a
-//! program, which may start programs only (docs/signing.md § Signature Policy
-//! in procmgr), asserts that starting a service is refused. Before all that,
+//! asserts the expected line appears, and asserts a clean exit. Before that,
 //! it checks the seed usertest's recipe declares for it, `pwrmgr.deny`: it
 //! takes the cap over the bootstrap protocol, which usertest's spawn waits
 //! on, and pwrmgr refuses it `SHUTDOWN`. See
 //! [docs/testing.md](../../../docs/testing.md) for the protocol.
+//!
+//! After taking the seed it writes [`STDERR_BLOCK_BYTES`] to its own stderr while its stdout
+//! is open, which the usertest orchestrator must drain while it waits on
+//! stdout (programs/usertest/README.md); an orchestrator that does not leaves
+//! this tester blocked on a full pipe ring and the run hangs.
 
 #![expect(
     clippy::expect_used,
@@ -19,18 +22,36 @@
               abort the tester, and the panic's non-zero exit is its FAIL verdict"
 )]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 const EXPECTED_LINE: &str = "hello from seraph userspace";
 
-/// A service image a program may not start: the restart-path fixture,
-/// which only crashes if it does start.
-const SERVICE_IMAGE: &str = "/tests/fixtures/crasher";
+/// Bytes written to stderr before the stdout check: twice the 2048-byte pipe
+/// ring (`RING_CAPACITY` in `runtime/ruststd/src/sys/pipe/seraph.rs`), so
+/// the writes cannot complete unless the reader drains them.
+const STDERR_BLOCK_BYTES: usize = 4096;
+
+/// Length of each stderr line, its newline included.
+const STDERR_LINE_BYTES: usize = 1024;
 
 fn main()
 {
+    // The seed is taken before the first write to stdout or stderr: usertest's
+    // spawn returns, and it drains the tester's streams, only once the seed
+    // request has come (docs/testing.md § Per-program tester protocol).
     check_declared_seed();
+
+    // Defect guarded: an orchestrator that reads a tester's stdout to its end
+    // before it drains the tester's stderr, so a tester whose stderr fills its
+    // pipe ring blocks and the run hangs.
+    let line = "e".repeat(STDERR_LINE_BYTES - 1);
+    let mut stderr = std::io::stderr().lock();
+    for _ in 0..STDERR_BLOCK_BYTES / STDERR_LINE_BYTES
+    {
+        writeln!(stderr, "{line}").expect("write the stderr block");
+    }
+    drop(stderr);
 
     let mut child = Command::new("/programs/hello")
         .stdout(Stdio::piped())
@@ -57,25 +78,6 @@ fn main()
     {
         println!("[hello-tester] FAIL non-zero exit: {:?}", status.code());
         std::process::exit(2);
-    }
-
-    // Defect guarded: a program starting an image in a role its creator's
-    // signature policy does not admit, a service here.
-    match Command::new(SERVICE_IMAGE).spawn()
-    {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied =>
-        {}
-        Err(e) =>
-        {
-            println!("[hello-tester] FAIL starting {SERVICE_IMAGE}: {e}, not PermissionDenied");
-            std::process::exit(3);
-        }
-        Ok(mut started) =>
-        {
-            let _ = started.kill();
-            println!("[hello-tester] FAIL a program started the service {SERVICE_IMAGE}");
-            std::process::exit(4);
-        }
     }
 
     println!("[hello-tester] PASS");

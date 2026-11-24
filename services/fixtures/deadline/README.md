@@ -6,28 +6,14 @@ server that never answers.
 
 ---
 
-## Role
-
-The fixture's per-program tester, `deadline-tester`, runs it once, and the `usertest` orchestrator
-discovers and runs that tester. The fixture installs at `/tests/fixtures/programs/deadline` and the
-tester at `/tests/programs/deadline`, per [docs/testing.md § Per-program tester
-protocol](../../../docs/testing.md#per-program-tester-protocol). The fixture handles Seraph
-capabilities directly; the tester uses idiomatic `std` only.
-
----
-
 ## Source Layout
 
 ```
 deadline/
 ├── Cargo.toml
 ├── README.md
-├── src/
-│   └── main.rs            # Supervisor, spinning worker, cancellation routine; call deadline
-└── tester/
-    ├── Cargo.toml
-    └── src/
-        └── main.rs        # Spawns the fixture and checks stdout and exit status
+└── src/
+    └── main.rs            # Supervisor, spinning worker, cancellation routine; call deadline
 ```
 
 ---
@@ -72,11 +58,35 @@ timeout ends it, and bounds calls on it with a call deadline (`std::os::seraph::
    or more and under 5 s, and the cap it did not deliver is deleted
    ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Bootstrap caps).
 
-Before either part, the fixture checks that it holds no creator endpoint: its tester spawns it
-with no bootstrap caps.
+Before either part, the fixture checks that it holds no creator endpoint: svctest spawns it with no
+bootstrap caps.
 
-The tester passes when the fixture prints `PASS` and exits cleanly; any failed step panics the
-fixture, a non-clean exit.
+The fixture handles Seraph capabilities directly. It prints `PASS` and exits cleanly when every
+step holds; a failed step panics it, a non-clean exit.
+
+---
+
+## Driven By
+
+The `deadline` phase of svctest (`services/svctest/src/phases/deadline.rs`) spawns
+`/tests/fixtures/programs/deadline` once, with stdout piped and no bootstrap caps, reads its stdout
+to the end, and waits for it. It asserts:
+
+- a stdout line, trimmed, is `PASS`; otherwise the phase logs the stdout and panics with
+  `deadline: PASS marker missing`;
+- the exit status is a success; otherwise it panics with `deadline: exited non-clean` and the exit
+  code.
+
+---
+
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/testing.md](../../../docs/testing.md) | Where test fixtures install and how `svctest` stages them |
+| [docs/fault-handling.md](../../../docs/fault-handling.md) | Asynchronous upcalls |
+| [runtime/ruststd/README.md](../../../runtime/ruststd/README.md) | Call deadlines and bootstrap caps |
+| [services/svctest/README.md](../../svctest/README.md) | The harness that runs the `deadline` phase |
 
 ---
 

@@ -15,10 +15,8 @@
 //! reply the driver's `UNAUTHORIZED` at once, without blocking for input or
 //! consuming a byte. The serial, input, and entropy drivers are part of every
 //! boot's device set; the framebuffer case skips on a headless boot (CI's), where
-//! devmgr runs no framebuffer driver. The input case also skips when the
-//! `terminal` recipe is staged: the input driver serves one request at a
-//! time, and the terminal keeps a blocking `INPUT_READ_EVENTS` pending, so
-//! svctest's call would wait behind it for a keypress.
+//! devmgr runs no framebuffer driver. The svctest image stages no program, so no
+//! terminal reads the input driver or the UART beside the phases.
 //!
 //! The stray-cap flood phase checks the serial, input, entropy, RTC, and
 //! framebuffer drivers' cap hygiene: a cap a request carries that the driver
@@ -29,9 +27,7 @@
 //! SENDs, and the framebuffer driver's through `devmgr.class.framebuffer-deny`,
 //! whose refused badge stands for every label, since the driver checks the
 //! badge first. The framebuffer case skips on a headless boot, as the deny
-//! phase's does. Under a staged terminal its input case skips, as the deny
-//! phase's does, and so do its serial cases that read the UART or rebind its
-//! interrupt, which would take the terminal's input.
+//! phase's does.
 //!
 //! The hwrng read phase reads the entropy driver through a granted SEND on
 //! the `devmgr.class.hwrng` class SEND: a `READ` of the most bytes one reply
@@ -85,18 +81,6 @@ pub fn phases() -> &'static [Phase]
 /// framebuffer drivers before it serves any query, so their queries do not
 /// wait. Shared with the devmgr phases.
 pub(crate) const DEVICE_WAIT_MS: u64 = 5_000;
-
-/// The recipe that starts the terminal, the system's other input reader
-/// (programs/terminal/README.md), when it is staged for this boot.
-const TERMINAL_RECIPE: &str = "/config/svcmgr/services/terminal.svc";
-
-/// Whether the terminal is staged for this boot: it then reads the input
-/// driver and the UART, so a case that would wait behind its read, take its
-/// bytes, or rebind its UART notification skips.
-fn terminal_staged() -> bool
-{
-    std::fs::metadata(TERMINAL_RECIPE).is_ok()
-}
 
 /// `msg` sent on the no-authority `cap` replies `unauthorized` and carries
 /// no cap.
@@ -162,24 +146,17 @@ fn verb_bit_deny_phase(caps: &Caps)
     assert_denied(serial, &notify, unauth, "SERIAL_REGISTER_RX_NOTIFY");
     let _ = syscall::cap_delete(serial);
 
-    if terminal_staged()
-    {
-        std::os::seraph::log!("drivers deny: input case skipped: terminal staged as a reader");
-    }
-    else
-    {
-        let input = granted_send(caps.input_deny_class, "input-deny", Some(DEVICE_WAIT_MS))
-            .expect("drivers deny: no input driver");
-        // A granted read blocks until a key arrives; the deny must not.
-        let read = ipc::IpcMessage::new(ipc::input_labels::INPUT_READ_EVENTS);
-        assert_denied(
-            input,
-            &read,
-            ipc::input_errors::UNAUTHORIZED,
-            "INPUT_READ_EVENTS",
-        );
-        let _ = syscall::cap_delete(input);
-    }
+    let input = granted_send(caps.input_deny_class, "input-deny", Some(DEVICE_WAIT_MS))
+        .expect("drivers deny: no input driver");
+    // A granted read blocks until a key arrives; the deny must not.
+    let read = ipc::IpcMessage::new(ipc::input_labels::INPUT_READ_EVENTS);
+    assert_denied(
+        input,
+        &read,
+        ipc::input_errors::UNAUTHORIZED,
+        "INPUT_READ_EVENTS",
+    );
+    let _ = syscall::cap_delete(input);
 
     let Some(fb) = granted_send(caps.framebuffer_deny_class, "framebuffer-deny", None)
     else
@@ -222,9 +199,6 @@ struct StrayCapCase
     label: u64,
     first: FirstCap,
     expected: u64,
-    /// Whether the case reads the UART or rebinds its interrupt, so it skips
-    /// under a staged terminal ([`terminal_staged`]).
-    uart: bool,
     what: &'static str,
 }
 
@@ -242,7 +216,6 @@ const SERIAL_CASES: [StrayCapCase; 5] = [
         label: UNKNOWN_LABEL,
         first: FirstCap::Stray,
         expected: ipc::serial_errors::UNKNOWN_OPCODE,
-        uart: false,
         what: "serial unknown label",
     },
     // A zero-byte write: it emits nothing.
@@ -250,28 +223,24 @@ const SERIAL_CASES: [StrayCapCase; 5] = [
         label: ipc::serial_labels::SERIAL_WRITE_BYTES,
         first: FirstCap::Stray,
         expected: ipc::serial_errors::SUCCESS,
-        uart: false,
         what: "SERIAL_WRITE_BYTES",
     },
     StrayCapCase {
         label: ipc::serial_labels::SERIAL_READ_BYTES,
         first: FirstCap::Stray,
         expected: ipc::serial_errors::SUCCESS,
-        uart: true,
         what: "SERIAL_READ_BYTES",
     },
     StrayCapCase {
         label: ipc::serial_labels::SERIAL_REGISTER_RX_NOTIFY,
         first: FirstCap::Stray,
         expected: ipc::serial_errors::REGISTER_FAILED,
-        uart: false,
         what: "SERIAL_REGISTER_RX_NOTIFY rejected",
     },
     StrayCapCase {
         label: ipc::serial_labels::SERIAL_REGISTER_RX_NOTIFY,
         first: FirstCap::Notification,
         expected: ipc::serial_errors::SUCCESS,
-        uart: true,
         what: "SERIAL_REGISTER_RX_NOTIFY accepted",
     },
 ];
@@ -287,14 +256,12 @@ const HWRNG_CASES: [StrayCapCase; 2] = [
         label: UNKNOWN_LABEL,
         first: FirstCap::Stray,
         expected: hwrng_errors::UNKNOWN_OPCODE,
-        uart: false,
         what: "hwrng unknown label",
     },
     StrayCapCase {
         label: hwrng_protocol::READ,
         first: FirstCap::Stray,
         expected: hwrng_errors::SUCCESS,
-        uart: false,
         what: "hwrng READ(0)",
     },
 ];
@@ -307,14 +274,12 @@ const RTC_CASES: [StrayCapCase; 2] = [
         label: UNKNOWN_LABEL,
         first: FirstCap::Stray,
         expected: ipc::rtc_errors::UNKNOWN_OPCODE,
-        uart: false,
         what: "rtc unknown label",
     },
     StrayCapCase {
         label: ipc::rtc_labels::RTC_GET_EPOCH_TIME,
         first: FirstCap::Stray,
         expected: ipc::rtc_errors::SUCCESS,
-        uart: false,
         what: "RTC_GET_EPOCH_TIME",
     },
 ];
@@ -326,7 +291,6 @@ const FRAMEBUFFER_CASE: StrayCapCase = StrayCapCase {
     label: ipc::fb_labels::FB_WRITE_BYTES,
     first: FirstCap::Stray,
     expected: ipc::fb_errors::UNAUTHORIZED,
-    uart: false,
     what: "framebuffer refused FB_WRITE_BYTES",
 };
 
@@ -337,7 +301,6 @@ const INPUT_CASE: StrayCapCase = StrayCapCase {
     label: UNKNOWN_LABEL,
     first: FirstCap::Stray,
     expected: ipc::input_errors::UNKNOWN_OPCODE,
-    uart: false,
     what: "input unknown label",
 };
 
@@ -454,7 +417,6 @@ fn stray_cap_flood_phase(caps: &Caps)
         "drivers stray caps: no devmgr.class.serial, devmgr.class.input, \
          devmgr.class.hwrng, devmgr.class.rtc, or devmgr.class.framebuffer-deny cap seeded"
     );
-    let staged = terminal_staged();
 
     let hwrng = granted_send(caps.hwrng_class, "hwrng", Some(DEVICE_WAIT_MS))
         .expect("drivers stray caps: no hwrng driver");
@@ -488,25 +450,10 @@ fn stray_cap_flood_phase(caps: &Caps)
         .expect("drivers stray caps: no serial driver");
     for case in &SERIAL_CASES
     {
-        if staged && case.uart
-        {
-            std::os::seraph::log!(
-                "drivers stray caps: {} case skipped: terminal staged as a reader",
-                case.what
-            );
-            continue;
-        }
         flood(serial, case);
     }
     let _ = syscall::cap_delete(serial);
 
-    if staged
-    {
-        std::os::seraph::log!(
-            "drivers stray caps: input case skipped: terminal staged as a reader"
-        );
-        return;
-    }
     let input = granted_send(caps.input_class, "input", Some(DEVICE_WAIT_MS))
         .expect("drivers stray caps: no input driver");
     flood(input, &INPUT_CASE);

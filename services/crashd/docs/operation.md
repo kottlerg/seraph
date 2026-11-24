@@ -80,7 +80,7 @@ how long crashd holds a page fault memmgr declined for want of memory before it 
 declines it. No entry, or `0`, holds none, and crashd handles every fault as
 [Per Fault](#per-fault) says. A value that is not decimal digits is logged as a warning and holds
 none; one past 600 000 ms (`STALL_MAX_MS`, ten minutes) is clamped to it, logged. The shipped
-recipe sets 10 000 ms; the usertest boot's sets 3000 ms
+recipe sets 10 000 ms, and svctest's test recipe keeps it
 ([docs/testing.md](../../../docs/testing.md) § Crash reports).
 
 **The stall and oomd's ladder.** oomd stops one candidate once the level has read `CRITICAL` for
@@ -210,8 +210,8 @@ comma-separated list of names, each matched against a process's name, the first 
 or that name's last path component, so `crashme` names a process started as
 `/tests/fixtures/programs/crashme`. A process with an empty name is never named. crashd logs the
 setting at startup, `core dumps off` or `core dumps for <list>`; a list holding an empty name is
-logged as a warning and writes no core. The usertest boot stages a recipe that names `crashme`
-([docs/testing.md](../../../docs/testing.md) § Crash reports).
+logged as a warning and writes no core. The svctest sets other than `crash-endpoint` stage a recipe
+that names `crashme` ([docs/testing.md](../../../docs/testing.md) § Crash reports).
 
 A dump follows the block when the report attached and read the process within its bound, its
 `status` `complete`, and the policy is not off. Its steps, in order, each under the dump's bound

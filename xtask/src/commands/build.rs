@@ -534,10 +534,17 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
-        name: "stdiotest-tester",
-        install_name: Some("stdiotest"),
+        name: "spawn-target",
+        install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsPrograms,
+        dest: InstallDest::TestsFixturesPrograms,
+        arch_only: None,
+    },
+    Spec {
+        name: "leader",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::TestsFixturesPrograms,
         arch_only: None,
     },
     Spec {
@@ -548,24 +555,10 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
-        name: "threadstack-tester",
-        install_name: Some("threadstack"),
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsPrograms,
-        arch_only: None,
-    },
-    Spec {
         name: "deadline",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "deadline-tester",
-        install_name: Some("deadline"),
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsPrograms,
         arch_only: None,
     },
     Spec {
@@ -576,24 +569,10 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
-        name: "debugger-tester",
-        install_name: Some("debugger"),
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsPrograms,
-        arch_only: None,
-    },
-    Spec {
         name: "crashme",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "crashme-tester",
-        install_name: Some("crashme"),
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsPrograms,
         arch_only: None,
     },
     Spec {
@@ -604,24 +583,10 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
-        name: "pipestress-tester",
-        install_name: Some("pipestress"),
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsPrograms,
-        arch_only: None,
-    },
-    Spec {
         name: "threadchurn",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "threadchurn-tester",
-        install_name: Some("threadchurn"),
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsPrograms,
         arch_only: None,
     },
 ];

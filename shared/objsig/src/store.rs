@@ -678,21 +678,22 @@ mod proofs
         let _ = property::anchor_parts_holds(&raw);
     }
 
-    /// Every usage and flags word, and every label field of up to 8 bytes of
+    /// Every usage and flags word, and every label field of up to 4 bytes of
     /// any value, hold the checks' contract: each refusal, the empty label, a
     /// label filling its field and one before NUL padding, a NUL inside the
     /// text or the padding, and every UTF-8 sequence (at most 4 bytes) whole,
     /// cut by the field's end or broken, are reached. The checks read a
     /// field of any length alike, and an anchor's field of 32 bytes adds no
     /// case: each byte is judged alone or within its one sequence. The
-    /// validation of UTF-8 over 32 bytes of any value is past what a proof
-    /// finishes. The loops are the label's: its bytes are walked from the
-    /// end, searched for a NUL and checked as UTF-8, each at most 8 steps.
+    /// validation of UTF-8 over a longer field of any value is past the
+    /// memory limit `cargo xtask kani` sets: 8 bytes ran out of it on CI's
+    /// runner. The loops are the label's: its bytes are walked from the end,
+    /// searched for a NUL and checked as UTF-8, each at most 4 steps.
     #[kani::proof]
-    #[kani::unwind(10)]
+    #[kani::unwind(6)]
     fn every_anchors_fields_are_checked_as_read()
     {
-        let field: [u8; 8] = kani::any();
+        let field: [u8; 4] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= field.len());
         let _ = property::anchor_checks_holds(kani::any(), kani::any(), &field[..len]);

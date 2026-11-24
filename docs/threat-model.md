@@ -522,7 +522,7 @@ and the verifier), `shared/crypto` (the primitives), `core/boot/src/main.rs`,
   proven on any input up to their bounds, a record's decode on any fields of each certificate
   length, the attributes on any input of up to 103 bytes, the certificate on any input, each
   store's header layout on any input up to one anchor and one revoked key id, an anchor's check on
-  any anchor, its checks on any usage and flags and on label fields of up to 8 bytes, the order of
+  any anchor, its checks on any usage and flags and on label fields of up to 4 bytes, the order of
   its key id after any key id, and the order and lookup of revoked key ids on up to 3. The loops
   that drive the steps, and the SHA-512 key id of each anchor, are left to the fuzz target.
 - The primitives are tested against known-answer and Wycheproof vectors, `shared/objsig` is

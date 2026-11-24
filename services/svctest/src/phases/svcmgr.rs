@@ -283,8 +283,7 @@ pub(super) const SESSIOND_RECIPE: &str = "/config/svcmgr/services/sessiond.svc";
 /// The name procmgr lists `stopsrc`'s job under: the first word of its argv,
 /// the path of the shared service fixture the job is created from. The
 /// fixture's own instances, which svcmgr creates with their recipes' argv, are
-/// listed as `service-modes <mode> ...`, and no other process is created from
-/// that path.
+/// listed as `service-modes`, and no other process is created from that path.
 const STOPSRC_PATH: &[u8] = b"/tests/fixtures/service-modes";
 
 /// The pages of the job [`check_source_contained`] has `stopsrc` start: one,

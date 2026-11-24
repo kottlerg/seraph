@@ -24,7 +24,8 @@ first argument.
 | [`threadstack`](#threadstack) | `program-modes threadstack <mode>` | `threadstack` |
 
 Unknown mode: with no first argument or one that names no mode above, it prints
-`program-modes: no mode <argument>` on stderr and exits with code 2 (`src/main.rs`).
+`program-modes: no mode <argument>` on stderr, the argument in Rust's debug form (`Some("x")`, or
+`None` when there is none), and exits with code 2 (`src/main.rs`).
 
 ---
 

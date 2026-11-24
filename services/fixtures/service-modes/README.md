@@ -17,10 +17,11 @@ first argument.
 | [`crasher`](#crasher) | `crasher-boot.svc` | `service-modes crasher boot-fault` |
 | [`crasher`](#crasher) | `crasher-worker.svc` | `service-modes crasher worker-fault` |
 | [`memhog`](#memhog) | `memhog.svc` | `service-modes memhog` |
-| [`stopsrc`](#stopsrc) | `stopsrc.svc` | `service-modes stopsrc`; its job `service-modes stopsrc job <pages>` |
+| [`stopsrc`](#stopsrc) | `stopsrc.svc` | `service-modes stopsrc`; its job `/tests/fixtures/service-modes stopsrc job <pages>` |
 
 Unknown or missing mode: it registers the log name `service-modes`, logs an error
-`no mode <argument>`, and returns (`src/main.rs`).
+`no mode <argument>`, the argument in Rust's debug form (`Some("x")`, or `None` when there is
+none), and returns (`src/main.rs`).
 
 ---
 

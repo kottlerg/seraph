@@ -1229,7 +1229,7 @@ side, each lane on its own copy of the checkout and its cases one after another 
 order ([xtask/README.md § Cells](../xtask/README.md#cells)): the `terminal` case's boot, the
 `signing` case's eight boots, the `dma-confinement` case's two boots, the `rollback` case's three
 boots, the `enrolment` case's six boots, the `secureboot` case's four boots, the `wedge` case's boot
-pair, on x86_64 the `vmgenid` case's save/restore boot pair, the `storage-roles` case's four boots,
+pair, on x86_64 the `vmgenid` case's save/restore boot pair, the `storage-roles` case's five boots,
 and the `shutdown` case's boots, nine on x86_64 (the reboot, the power button and the seven core
 deaths) and eight on riscv64. The `ktest` cell's cases are the `kaslr` case's three boots; the
 `svctest` cell has none. The terminal and wedge boots have *no* shutdown-invoking harness: the

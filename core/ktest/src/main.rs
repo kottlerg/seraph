@@ -70,6 +70,7 @@ mod frame_pool;
 mod framebuffer;
 mod init_info;
 mod integration;
+mod latency;
 mod serial;
 mod spawn;
 mod stress;

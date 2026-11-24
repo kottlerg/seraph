@@ -22,17 +22,17 @@ use syscall::EXIT_KILLED;
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
-/// The marker the session phase has the shell echo.
+/// The marker the session phase has the leader echo.
 const ECHO_MARKER: &str = "sessiond-echo-ok";
 
-/// The shell's prompt.
+/// The leader's prompt.
 pub(super) const PROMPT: &str = "$ ";
 
 /// The pages the session phase's job holds.
 const PHASE_JOB_PAGES: u64 = 16;
 
-/// The path procmgr names a job of the shell by: the first word of the
-/// argv the shell creates it with.
+/// The path procmgr names a job of the leader by: the first word of the
+/// argv the leader creates it with.
 pub(super) const CRASHME_PATH: &str = "/tests/fixtures/programs/crashme";
 
 /// The end queue svctest registered with procmgr; 0 until it has.
@@ -329,12 +329,12 @@ impl Session
 ///   cap as `REGISTER_INTERFACE`'s end queue, a RECV cap as
 ///   `OPEN_SESSION`'s relay, and a notification in `SESSION_STDIO`'s
 ///   memory slot, which also ends the session, so its relay is posted.
-/// - A session opened and started runs its leader, the shell: it echoes a
+/// - A session opened and started runs its leader: it echoes a
 ///   line. The session is listed with `RANK_SESSION` under the key
-///   `OPEN_SESSION` gave, and the job the shell runs
+///   `OPEN_SESSION` gave, and the job the leader runs
 ///   (`crashme oom-hold`) with `RANK_JOB`, under the path it was created
 ///   from and with at least the pages it holds. `STOP_CANDIDATE` of the job
-///   leaves the shell answering; the shell's `exit` ends the session, whose
+///   leaves the leader answering; the leader's `exit` ends the session, whose
 ///   relay gives status 0, and its key is no candidate after.
 /// - `STOP_CANDIDATE` of a second session's key ends it, and its relay
 ///   gives `EXIT_KILLED`.
@@ -500,7 +500,7 @@ fn session_life(operator: u64, send: u64, phase: &str)
         stop_labels::SUCCESS,
         "{phase}: STOP_CANDIDATE(job) replied {label:#x}"
     );
-    // The shell forwards a line to its job until it has seen the job end, and
+    // The leader forwards a line to its job until it has seen the job end, and
     // prompts once it has.
     session.expect(PROMPT, phase);
     session.send(&format!("echo {ECHO_MARKER}"), phase);

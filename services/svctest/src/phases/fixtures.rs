@@ -13,10 +13,16 @@
 //! fixture the record does not declare then skips, or skips the part the
 //! fixture drives, and logs `phase=<phase> skipped: <recipe> not staged`
 //! ([`skip`]); a declared fixture's phase runs.
+//!
+//! The phase also requires crashd staged exactly when the run makes every
+//! phase: a run whose recipe selects phases (`SVCTEST_PHASES`, the
+//! `crash-endpoint` set) needs procmgr's crash endpoint free, and every other
+//! run's crashd phases need crashd's svctest recipe (`super::all` applies
+//! the selection).
 
 use std::sync::OnceLock;
 
-use svctest_fixtures::{Declared, ENV, Fixture};
+use svctest_fixtures::{CRASHD_STAGED_PATH, Declared, ENV, Fixture, PHASES_ENV, crashd_staged};
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -64,6 +70,33 @@ fn fixtures_phase(_caps: &Caps)
             std::os::seraph::log!("{phase}: {recipe} is not staged: svctest drives that service");
             disagree = disagree.saturating_add(1);
         }
+    }
+    let selection = std::env::var(PHASES_ENV).ok();
+    let want_crashd = crashd_staged(selection.as_deref());
+    match (
+        want_crashd,
+        super::svcmgr::recipe_staged(CRASHD_STAGED_PATH, phase),
+    )
+    {
+        (true, false) =>
+        {
+            std::os::seraph::log!(
+                "{phase}: {CRASHD_STAGED_PATH} is not staged: the crashd phases need crashd's \
+                 svctest recipe"
+            );
+            disagree = disagree.saturating_add(1);
+        }
+        (false, true) =>
+        {
+            std::os::seraph::log!(
+                "{phase}: {CRASHD_STAGED_PATH} is staged: the run of {PHASES_ENV}={} needs \
+                 procmgr's crash endpoint free",
+                selection.as_deref().unwrap_or_default()
+            );
+            disagree = disagree.saturating_add(1);
+        }
+        (true, true) | (false, false) =>
+        {}
     }
     assert_eq!(
         disagree, 0,

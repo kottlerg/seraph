@@ -13,7 +13,7 @@
 //! services/crashd/docs/block-format.md).
 //!
 //! With [`CrashReportExpect::Reports`], the log must also hold, for the
-//! `crashme` fixture the usertest boot runs, one `vm` and one `exception`
+//! `crashme` fixture the svctest boot runs, one `vm` and one `exception`
 //! block of its main thread and one `exception` block of a spawned thread,
 //! each complete, its walk starting at its instruction pointer, matched by
 //! the kernel's decline line naming the block's id, and carrying the stack
@@ -31,7 +31,7 @@ use crash_report::Block;
 use crate::cli::CrashReportExpect;
 use crate::crash_log::reclaimed_names;
 
-/// The log name of the fixture whose three reports the usertest boot leaves.
+/// The log name of the fixture whose three reports the svctest boot leaves.
 const FIXTURE: &str = "crashme";
 
 /// The kernel's decline line, up to its reason
@@ -42,7 +42,7 @@ const DECLINE_TAG: &str = "handler declined, reason=0x";
 /// the thread's id.
 const DUMP_TAG: &str = "USERSPACE FAULT: tid=";
 
-/// The fixture's blocks the usertest boot must leave, by kind and thread:
+/// The fixture's blocks the svctest boot must leave, by kind and thread:
 /// `crashme vm`, `crashme exception`, and `crashme worker`'s spawned thread.
 const FIXTURE_BLOCKS: [(&str, &str); 3] = [
     ("vm", "main"),

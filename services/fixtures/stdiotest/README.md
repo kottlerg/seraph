@@ -1,8 +1,7 @@
 # stdiotest
 
 Test fixture that proves a line written to a child's piped stdin comes back on its piped stdout. It
-uses only `std::io` and has no Seraph capability awareness. Its per-program tester, which `usertest`
-discovers at `/tests/programs/stdiotest`, drives it; the [`svctest`](../../svctest/README.md)
+uses only `std::io` and has no Seraph capability awareness. The [`svctest`](../../svctest/README.md)
 `pipes` phase ([pipes.rs](../../svctest/src/phases/pipes.rs)) and `death_queue_growth` phase
 ([procmgr.rs](../../svctest/src/phases/procmgr.rs)) spawn it directly; and the
 [shell](../../../programs/shell/README.md) per-program tester runs it through `/programs/shell` to
@@ -16,17 +15,11 @@ prove stdin forwarding. Nothing starts it automatically on a normal boot.
 services/fixtures/stdiotest/
 ├── Cargo.toml
 ├── README.md
-├── src/
-│   └── main.rs            # Read one stdin line, print the byte count, echo, and PASS
-└── tester/
-    ├── Cargo.toml         # stdiotest-tester crate
-    └── src/
-        └── main.rs        # Per-program tester: pipes a probe line, checks PASS and exit
+└── src/
+    └── main.rs            # Read one stdin line, print the byte count, echo, and PASS
 ```
 
-`xtask` installs `stdiotest` at `/tests/fixtures/programs/stdiotest` and `stdiotest-tester` at
-`/tests/programs/stdiotest`, as the
-[per-program tester protocol](../../../docs/testing.md#per-program-tester-protocol) requires.
+`xtask` installs `stdiotest` at `/tests/fixtures/programs/stdiotest`.
 
 ---
 
@@ -47,26 +40,22 @@ PASS
 
 ---
 
-## Tester
+## Driven By
 
-`stdiotest-tester` first writes four 1024-byte lines (4096 bytes, twice the 2048-byte pipe ring) to
-its own stderr while its stdout is open, which checks that `usertest` drains a tester's two streams
-at once: an orchestrator that read stdout to EOF first would leave the tester blocked on the full
-stderr ring, and the run would hang. It then spawns `/tests/fixtures/programs/stdiotest` with piped
-stdin and stdout, writes the probe line `hello-stdio`, closes stdin, and reads stdout to EOF. Its
-verdict follows the [tester contract](../../../docs/testing.md#contract):
+Section 2 of the `pipes` phase of svctest (`services/svctest/src/phases/pipes.rs`) spawns
+`/tests/fixtures/programs/stdiotest` with piped stdin, stdout, and stderr and asserts:
 
-| Condition | Stdout | Exit code |
-|---|---|---|
-| Spawn, stdin write, stdout read, or wait fails | No verdict line; the tester panics through `expect` | Non-zero (panic) |
-| No stdout line is `PASS` | `[stdiotest-tester] FAIL PASS marker missing from stdout`, then `[stdiotest-tester] captured stdout: <out>` | `1` |
-| `stdiotest` exited non-zero | `[stdiotest-tester] FAIL non-zero exit: <code>`, with `<code>` the `Debug` form of `ExitStatus::code()` | `2` |
-| Otherwise | `[stdiotest-tester] PASS` | `0` |
+- before the probe is written, `try_wait` on the child returns no exit status, since the child
+  blocks on stdin (`stdiotest try_wait reported an exit before its stdin was written`);
+- after writing the probe `hello` and a newline and closing stdin, the trimmed stdout lines, read
+  to EOF, are exactly `got 6 bytes: "hello"`, `shouted: HELLO`, and `PASS`, in that order
+  (`stdiotest stdout is not the expected three-line reply`);
+- stderr reads to EOF, and each line it holds is logged;
+- polling `try_wait` every millisecond, up to `TRY_WAIT_POLLS` (5000) times, reports the exit
+  (`stdiotest try_wait never reported the exit`), and the status is a success (`stdiotest did not
+  exit cleanly`).
 
-`<out>` is the `Debug` form of the captured stdout. The tester checks only the `PASS` line and
-the exit status. The `svctest` `pipes` phase also checks the byte-count and uppercase lines for
-its probe `hello`, and the shell per-program tester checks the `shouted: HELLO-STDIO` line for
-its probe `hello-stdio` and the `PASS` line.
+The `death_queue_growth` phase of `procmgr.rs` spawns it as well.
 
 ---
 
@@ -74,8 +63,8 @@ its probe `hello-stdio` and the `PASS` line.
 
 | Document | Content |
 |---|---|
-| [docs/testing.md](../../../docs/testing.md) | Harnesses, per-program tester protocol, sysroot layout |
-| [programs/usertest/README.md](../../../programs/usertest/README.md) | Orchestrator that runs the tester |
+| [docs/testing.md](../../../docs/testing.md) | Harnesses and sysroot layout |
+| [services/svctest/README.md](../../svctest/README.md) | The service that runs the phases |
 | [runtime/ruststd/README.md](../../../runtime/ruststd/README.md) | `std` platform layer that backs piped stdio |
 
 ---

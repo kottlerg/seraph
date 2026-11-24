@@ -84,6 +84,9 @@ const GUARDED_STATE: &[&str] = &[
 /// children's.
 pub const CPU_MARK: &str = "lane case cpu: ";
 
+/// The start of the line a failing case process prints with its error.
+const ERROR_MARK: &str = "error: ";
+
 /// Split `cases`, each with its weight, over at most `lanes` lanes: the
 /// heaviest first, each to the lane with the least weight so far (the first
 /// such lane on a tie). A lane keeps the order `cases` gives; no lane is
@@ -313,6 +316,18 @@ struct Ran
     passed: bool,
     wall: f64,
     cpu: Option<f64>,
+    /// The case's last [`ERROR_MARK`] line, without the mark.
+    error: Option<String>,
+}
+
+/// The output a run of a case's process leaves the cell.
+struct Echoed
+{
+    passed: bool,
+    /// The CPU seconds its last [`CPU_MARK`] line states.
+    cpu: Option<f64>,
+    /// Its last [`ERROR_MARK`] line, without the mark.
+    error: Option<String>,
 }
 
 /// The command line of `name`'s process in the lane copy `lane`: the case
@@ -350,9 +365,9 @@ fn case_command(exe: &Path, name: TestCase, arch: Arch, args: &TestArgs, lane: &
 }
 
 /// Run `cmd`, echoing each line of its output prefixed with `tag` and
-/// appending it to `log`; whether it succeeded, and the CPU seconds its last
-/// [`CPU_MARK`] line states.
-fn run_echoed(mut cmd: Command, tag: &str, log: &Mutex<fs::File>) -> Result<(bool, Option<f64>)>
+/// appending it to `log`; whether it succeeded, the CPU seconds its last
+/// [`CPU_MARK`] line states, and its last [`ERROR_MARK`] line.
+fn run_echoed(mut cmd: Command, tag: &str, log: &Mutex<fs::File>) -> Result<Echoed>
 {
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -362,13 +377,14 @@ fn run_echoed(mut cmd: Command, tag: &str, log: &Mutex<fs::File>) -> Result<(boo
     let stdout = child.stdout.take().context("the case's stdout")?;
     let stderr = child.stderr.take().context("the case's stderr")?;
     let cpu = Mutex::new(None);
+    let error = Mutex::new(None);
     std::thread::scope(|scope| {
         for stream in [
             Box::new(stdout) as Box<dyn std::io::Read + Send>,
             Box::new(stderr),
         ]
         {
-            let cpu = &cpu;
+            let (cpu, error) = (&cpu, &error);
             scope.spawn(move || {
                 for line in BufReader::new(stream)
                     .lines()
@@ -379,6 +395,13 @@ fn run_echoed(mut cmd: Command, tag: &str, log: &Mutex<fs::File>) -> Result<(boo
                         *cpu.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             secs.trim_end_matches(" s").parse::<f64>().ok();
+                    }
+                    if let Some(text) = line.strip_prefix(ERROR_MARK)
+                    {
+                        *error
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(text.to_owned());
                     }
                     println!("{tag} {line}");
                     let _ = writeln!(
@@ -391,11 +414,15 @@ fn run_echoed(mut cmd: Command, tag: &str, log: &Mutex<fs::File>) -> Result<(boo
         }
     });
     let status = child.wait().context("waiting for a lane's case")?;
-    Ok((
-        status.success(),
-        cpu.into_inner()
+    Ok(Echoed {
+        passed: status.success(),
+        cpu: cpu
+            .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-    ))
+        error: error
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    })
 }
 
 /// The CPU seconds this process and its waited-for children have used, from
@@ -474,12 +501,13 @@ fn run_lane(
         let mut cmd = case_command(&exe, name, arch, args, &root);
         cmd.env(crate::host_lock::LANE_LOCK_DIR_ENV, lock);
         let case_start = Instant::now();
-        let (passed, cpu) = run_echoed(cmd, &format!("[lane {n}]"), &log)?;
+        let echoed = run_echoed(cmd, &format!("[lane {n}]"), &log)?;
         ran.push(Ran {
             name,
-            passed,
+            passed: echoed.passed,
             wall: case_start.elapsed().as_secs_f64(),
-            cpu,
+            cpu: echoed.cpu,
+            error: echoed.error,
         });
     }
     for sub in ["test", "run"]
@@ -491,6 +519,27 @@ fn run_lane(
         }
     }
     Ok((ran, started.elapsed().as_secs_f64()))
+}
+
+/// The cell's report line of the case `r` of lane `n`: its outcome, wall and
+/// CPU time, and for a failed case its last error line, so the failure reads
+/// from the report, away from the lanes' interleaved output.
+fn case_report(tester: Tester, n: usize, r: &Ran) -> String
+{
+    let cause = match (&r.error, r.passed)
+    {
+        (Some(error), false) => format!(": {error}"),
+        _ => String::new(),
+    };
+    format!(
+        "{} cell: lane {}: {} case: {} in {:.0} s wall{}{cause}",
+        tester.name(),
+        n,
+        r.name.name(),
+        if r.passed { "PASS" } else { "FAIL" },
+        r.wall,
+        cpu_note(r.cpu)
+    )
 }
 
 /// ` and its CPU seconds`, or nothing when they are unknown.
@@ -567,15 +616,7 @@ pub fn run(
         let (ran, wall) = result.with_context(|| format!("lane {n}"))?;
         for r in &ran
         {
-            step(&format!(
-                "{} cell: lane {}: {} case: {} in {:.0} s wall{}",
-                tester.name(),
-                n,
-                r.name.name(),
-                if r.passed { "PASS" } else { "FAIL" },
-                r.wall,
-                cpu_note(r.cpu)
-            ));
+            step(&case_report(tester, n, r));
             if !r.passed
             {
                 failed.push(r.name.name());
@@ -742,6 +783,47 @@ mod tests
         );
         #[cfg(unix)]
         assert_eq!(fs::read_link(root.join("to/l")).unwrap(), Path::new("d/f"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Defect caught: a failing case whose error line is only in the lanes'
+    // interleaved output, minutes before the cell's report, so the report
+    // names the failure without its cause.
+    #[test]
+    fn a_failed_case_reports_its_last_error_line()
+    {
+        let root = scratch("echo");
+        let log = Mutex::new(fs::File::create(root.join("lane.log")).unwrap());
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "echo 'boot: error: not the mark'; echo 'error: first' >&2; \
+             echo 'error: quit source: QMP write: Broken pipe' >&2; echo 'lane case cpu: 9.5 s'; \
+             exit 1",
+        ]);
+        let echoed = run_echoed(cmd, "[lane 1]", &log).unwrap();
+        assert!(!echoed.passed);
+        assert_eq!(echoed.cpu, Some(9.5));
+        let error = echoed.error.as_deref();
+        assert_eq!(error, Some("quit source: QMP write: Broken pipe"));
+        let mut ran = Ran {
+            name: Vmgenid,
+            passed: false,
+            wall: 8.0,
+            cpu: echoed.cpu,
+            error: echoed.error,
+        };
+        assert_eq!(
+            case_report(Tester::Usertest, 1, &ran),
+            "usertest cell: lane 1: vmgenid case: FAIL in 8 s wall, 10 s CPU: quit source: QMP \
+             write: Broken pipe"
+        );
+        // A passing case's report carries no error line, even one it printed.
+        ran.passed = true;
+        assert_eq!(
+            case_report(Tester::Usertest, 1, &ran),
+            "usertest cell: lane 1: vmgenid case: PASS in 8 s wall, 10 s CPU"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

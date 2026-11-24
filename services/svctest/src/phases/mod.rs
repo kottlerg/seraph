@@ -64,6 +64,17 @@
 //! 15. [`fixtures`] right after [`startup`]: it reads the staged fixture
 //!     set, which every later phase that drives a fixture consults, and fails
 //!     the run before any of them when the image disagrees with it.
+//! 16. The `crashd_oom_hold` phase of [`crashd`] after [`swap_commit`]: it
+//!     fills memory until memmgr declines a fault crashd holds, so oomd stops
+//!     the `memhog` fixture, whose restart while the level reads `CRITICAL`
+//!     fails, as in item 12.
+//!
+//! ### Selection
+//!
+//! A run whose recipe sets `SVCTEST_PHASES` (the `crash-endpoint` set's
+//! staging, `svctest_fixtures::Set::phases`) makes the [`startup`] and
+//! [`fixtures`] phases and, of the rest, only the phases that record names,
+//! in this order; a name no phase has fails the run.
 
 use crate::runner::Phase;
 
@@ -72,7 +83,10 @@ pub mod budget;
 pub mod charge_node;
 pub mod checkpoint;
 pub mod crash;
+pub mod crashd;
 pub mod critical_creates;
+pub mod deadline;
+pub mod debugger;
 pub mod devmgr;
 pub mod discard;
 pub mod drivers;
@@ -102,6 +116,7 @@ pub mod object_io;
 pub mod oom;
 pub mod pager;
 pub mod pipes;
+pub mod pipestress;
 pub mod process_faults;
 pub mod process_kill;
 pub mod process_tree;
@@ -122,20 +137,53 @@ pub mod swap_commit;
 pub mod swap_raw;
 pub mod swapd;
 pub mod thread_exits;
+pub mod threadchurn;
 pub mod threading;
+pub mod threadstack;
 pub mod timed;
 pub mod unmount;
 pub mod verified_read;
 pub mod vfsd;
 pub mod vfsd_caps;
 
-/// Ordered phase list. Order encodes cross-module dependencies (see
-/// module-level docstring above).
+/// Ordered phase list. Order encodes cross-module dependencies, and the
+/// recipe's selection, when it makes one, filters it (see the module-level
+/// docstring above).
+///
+/// # Panics
+///
+/// When the selection names a phase the list does not hold.
 pub fn all() -> Vec<Phase>
 {
     let mut out: Vec<Phase> = Vec::new();
     out.extend_from_slice(startup::main_startup());
     out.extend_from_slice(fixtures::phases());
+    let always = out.len();
+    out.extend_from_slice(&ordered());
+    let Ok(selection) = std::env::var(svctest_fixtures::PHASES_ENV)
+    else
+    {
+        return out;
+    };
+    for name in selection.split(',')
+    {
+        assert!(
+            out.iter().any(|p| p.name == name),
+            "{}={selection}: no phase is named {name:?}",
+            svctest_fixtures::PHASES_ENV
+        );
+    }
+    out.into_iter()
+        .enumerate()
+        .filter(|(i, p)| *i < always || svctest_fixtures::selects(&selection, p.name))
+        .map(|(_, p)| p)
+        .collect()
+}
+
+/// The phases after the startup and fixture-check ones, in order.
+fn ordered() -> Vec<Phase>
+{
+    let mut out: Vec<Phase> = Vec::new();
     out.extend_from_slice(memmgr::phases());
     out.extend_from_slice(layout::phases());
     out.extend_from_slice(threading::phases());
@@ -143,6 +191,11 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(procmgr::logd_forward());
     out.extend_from_slice(process_faults::phases());
     out.extend_from_slice(exit_code::phases());
+    out.extend_from_slice(crashd::faults_and_cores());
+    out.extend_from_slice(deadline::phases());
+    out.extend_from_slice(debugger::phases());
+    out.extend_from_slice(threadchurn::phases());
+    out.extend_from_slice(threadstack::phases());
     out.extend_from_slice(random::phases());
     out.extend_from_slice(entropyd::phases());
     out.extend_from_slice(recv_guard::phases());
@@ -164,6 +217,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(restore::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
+    out.extend_from_slice(pipestress::phases());
     out.extend_from_slice(namespace::early());
     // fs_opens runs while /data's cache is still cold (its eviction phase's
     // CSpace case needs slots not yet provisioned) and writes the file the
@@ -193,6 +247,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(swap_raw::phases());
     out.extend_from_slice(swapd::phases());
     out.extend_from_slice(swap_commit::phases());
+    out.extend_from_slice(crashd::oom_hold());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(logd_sinks::phases());
     out.extend_from_slice(acpi::phases());

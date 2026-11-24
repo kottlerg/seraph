@@ -6,8 +6,8 @@
 //! vfsd / namespace-protocol surface.
 //!
 //! Hosts the child-mode entries `sandbox_child_main` and
-//! `programs_child_main`, spawned by `ns_sandbox_phase` and
-//! `ns_programs_subtree_phase` respectively.
+//! `fixtures_child_main`, spawned by `ns_sandbox_phase` and
+//! `ns_fixtures_subtree_phase` respectively.
 
 use crate::bootstrap::Caps;
 use crate::ipc_util::ns::{ns_lookup, ns_lookup_path, ns_readdir, ns_stat};
@@ -45,8 +45,8 @@ pub fn late() -> &'static [Phase]
             run: ns_sandbox_phase,
         },
         Phase {
-            name: "ns_programs_subtree",
-            run: ns_programs_subtree_phase,
+            name: "ns_fixtures_subtree",
+            run: ns_fixtures_subtree_phase,
         },
         Phase {
             name: "ns_startup_cwd",
@@ -63,7 +63,7 @@ pub fn reentry_main(role: &str)
     match role
     {
         "sandbox-child" => sandbox_child_main(),
-        "programs-child" => programs_child_main(),
+        "fixtures-child" => fixtures_child_main(),
         _ =>
         {}
     }
@@ -91,14 +91,14 @@ fn sandbox_child_main() -> !
     }
 }
 
-fn programs_child_main() -> !
+fn fixtures_child_main() -> !
 {
     let root = std::os::seraph::root_dir_cap();
     if root == 0
     {
         std::process::exit(4);
     }
-    if std::fs::File::open("/hello").is_err()
+    if std::fs::File::open("/spawn-target").is_err()
     {
         std::process::exit(1);
     }
@@ -117,11 +117,48 @@ fn programs_child_main() -> !
     }
 }
 
+/// Walk `root` -> `tests` -> `fixtures` -> `programs` one `NS_LOOKUP` per component, asking
+/// `last_rights` of the final hop and full rights of the others, deleting each intermediate cap.
+/// The result must be a directory.
+fn walk_fixture_programs(root: u64, last_rights: u64, ipc_buf: *mut u64) -> u64
+{
+    let mut dir = root;
+    for (i, name) in [&b"tests"[..], &b"fixtures"[..], &b"programs"[..]]
+        .into_iter()
+        .enumerate()
+    {
+        let rights = if i == 2 { last_rights } else { 0xFFFF };
+        let cap = match ns_lookup(dir, name, rights, ipc_buf)
+        {
+            Ok((cap, kind, _size)) =>
+            {
+                assert_eq!(
+                    kind,
+                    1,
+                    "expected {} to be a directory (kind=1)",
+                    core::str::from_utf8(name).unwrap()
+                );
+                cap
+            }
+            Err(code) => panic!(
+                "NS_LOOKUP({}) failed: code={code}",
+                core::str::from_utf8(name).unwrap()
+            ),
+        };
+        if dir != root
+        {
+            let _ = syscall::cap_delete(dir);
+        }
+        dir = cap;
+    }
+    dir
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one sequence of namespace-protocol checks (lookup, stat, readdir, case-insensitive \
-              lookup, not-found, rights denial) that share the `/programs` cap the first lookup \
-              returns until the phase's final delete"
+              lookup, not-found, rights denial) that share the `/tests/fixtures/programs` cap the \
+              first walk returns until the phase's final delete"
 )]
 pub fn ns_phase(caps: &Caps)
 {
@@ -136,22 +173,14 @@ pub fn ns_phase(caps: &Caps)
 
     let ipc_buf = std::os::seraph::current_ipc_buf();
 
-    let programs_cap = match ns_lookup(root_fs, b"programs", 0xFFFF, ipc_buf)
-    {
-        Ok((cap, kind, _size)) =>
-        {
-            assert_eq!(kind, 1, "expected /programs to be a directory (kind=1)");
-            cap
-        }
-        Err(code) => panic!("NS_LOOKUP(root, \"programs\") failed: code={code}"),
-    };
-    std::os::seraph::log!("ns: NS_LOOKUP /programs ok");
+    let programs_cap = walk_fixture_programs(root_fs, 0xFFFF, ipc_buf);
+    std::os::seraph::log!("ns: NS_LOOKUP /tests/fixtures/programs ok");
 
     let (size, _mtime, kind) =
-        ns_stat(programs_cap, ipc_buf).expect("NS_STAT on /programs must succeed");
-    assert_eq!(kind, 1, "/programs stat: kind must be Dir");
+        ns_stat(programs_cap, ipc_buf).expect("NS_STAT on /tests/fixtures/programs must succeed");
+    assert_eq!(kind, 1, "/tests/fixtures/programs stat: kind must be Dir");
     let _ = size;
-    std::os::seraph::log!("ns: NS_STAT /programs ok");
+    std::os::seraph::log!("ns: NS_STAT /tests/fixtures/programs ok");
 
     let mut readdir_names: Vec<Vec<u8>> = Vec::new();
     for idx in 0..32u64
@@ -167,20 +196,23 @@ pub fn ns_phase(caps: &Caps)
                 readdir_names.push(name);
             }
             Ok(None) => break,
-            Err(code) => panic!("NS_READDIR(/programs, {idx}) failed: code={code}"),
+            Err(code) =>
+            {
+                panic!("NS_READDIR(/tests/fixtures/programs, {idx}) failed: code={code}")
+            }
         }
     }
     for expected in [
-        &b"hello"[..],
-        &b"shell"[..],
-        &b"terminal"[..],
-        &b"fb-charset"[..],
+        &b"spawn-target"[..],
+        &b"leader"[..],
+        &b"threadchurn"[..],
+        &b"demandpaged"[..],
     ]
     {
         assert!(
             readdir_names.iter().any(|n| n.as_slice() == expected),
-            "NS_READDIR did not surface {:?} verbatim under /programs (LFN-canonical regression — \
-             saw {:?})",
+            "NS_READDIR did not surface {:?} verbatim under /tests/fixtures/programs \
+             (LFN-canonical regression — saw {:?})",
             core::str::from_utf8(expected).unwrap(),
             readdir_names
                 .iter()
@@ -188,20 +220,28 @@ pub fn ns_phase(caps: &Caps)
                 .collect::<Vec<_>>(),
         );
     }
-    std::os::seraph::log!("ns: NS_READDIR /programs saw lowercase LFN-canonical names");
+    std::os::seraph::log!(
+        "ns: NS_READDIR /tests/fixtures/programs saw lowercase LFN-canonical names"
+    );
 
-    let hello_cap = match ns_lookup(programs_cap, b"HELLO", 0xFFFF, ipc_buf)
+    let spawn_target_cap = match ns_lookup(programs_cap, b"SPAWN-TARGET", 0xFFFF, ipc_buf)
     {
         Ok((cap, kind, _size)) =>
         {
-            assert_eq!(kind, 0, "expected /programs/HELLO to be a file (kind=0)");
+            assert_eq!(
+                kind, 0,
+                "expected /tests/fixtures/programs/SPAWN-TARGET to be a file (kind=0)"
+            );
             cap
         }
-        Err(code) => panic!("NS_LOOKUP(/programs, \"HELLO\") failed: code={code}"),
+        Err(code) =>
+        {
+            panic!("NS_LOOKUP(/tests/fixtures/programs, \"SPAWN-TARGET\") failed: code={code}")
+        }
     };
-    let _ = ns_stat(hello_cap, ipc_buf).expect("NS_STAT on HELLO must succeed");
-    let _ = syscall::cap_delete(hello_cap);
-    std::os::seraph::log!("ns: NS_LOOKUP /programs/HELLO ok");
+    let _ = ns_stat(spawn_target_cap, ipc_buf).expect("NS_STAT on SPAWN-TARGET must succeed");
+    let _ = syscall::cap_delete(spawn_target_cap);
+    std::os::seraph::log!("ns: NS_LOOKUP /tests/fixtures/programs/SPAWN-TARGET ok");
 
     match ns_lookup(root_fs, b"nonexistent_xyz", 0xFFFF, ipc_buf)
     {
@@ -218,12 +258,8 @@ pub fn ns_phase(caps: &Caps)
     std::os::seraph::log!("ns: NS_LOOKUP nonexistent → NOT_FOUND");
 
     let stat_only = NamespaceRights::from_raw(rights::STAT).raw();
-    let limited_cap = match ns_lookup(root_fs, b"programs", u64::from(stat_only), ipc_buf)
-    {
-        Ok((cap, _kind, _size)) => cap,
-        Err(code) => panic!("NS_LOOKUP for limited /programs cap failed: code={code}"),
-    };
-    match ns_lookup(limited_cap, b"HELLO", 0xFFFF, ipc_buf)
+    let limited_cap = walk_fixture_programs(root_fs, u64::from(stat_only), ipc_buf);
+    match ns_lookup(limited_cap, b"SPAWN-TARGET", 0xFFFF, ipc_buf)
     {
         Ok(_) => panic!("NS_LOOKUP through STAT-only cap unexpectedly succeeded"),
         Err(code) =>
@@ -540,7 +576,7 @@ pub fn ns_sandbox_phase(_: &Caps)
     std::os::seraph::log!("ns_sandbox phase passed");
 }
 
-pub fn ns_programs_subtree_phase(_: &Caps)
+pub fn ns_fixtures_subtree_phase(_: &Caps)
 {
     use namespace_protocol::{NamespaceRights, rights};
     use std::os::seraph::process::CommandExt;
@@ -548,45 +584,51 @@ pub fn ns_programs_subtree_phase(_: &Caps)
     let root = std::os::seraph::root_dir_cap();
     if root == 0
     {
-        std::os::seraph::log!("ns_programs_subtree phase skipped: no root_dir_cap");
+        std::os::seraph::log!("ns_fixtures_subtree phase skipped: no root_dir_cap");
         return;
     }
 
     let programs_rights =
         NamespaceRights::from_raw(rights::LOOKUP | rights::STAT | rights::READ).raw();
-    let programs_cap =
-        match std::os::seraph::namespace_lookup_dir(root, "/programs", u64::from(programs_rights))
+    let programs_cap = match std::os::seraph::namespace_lookup_dir(
+        root,
+        "/tests/fixtures/programs",
+        u64::from(programs_rights),
+    )
+    {
+        Ok(c) => c,
+        Err(e) =>
         {
-            Ok(c) => c,
-            Err(e) => panic!("ns_programs_subtree: walk-attenuate /programs failed: {e}"),
-        };
+            panic!("ns_fixtures_subtree: walk-attenuate /tests/fixtures/programs failed: {e}")
+        }
+    };
 
     // "/" names the anchor itself, which no hop narrows: a narrowed request
     // is refused rather than answered with the anchor's full rights.
     let err = std::os::seraph::namespace_lookup_dir(root, "/", u64::from(programs_rights))
-        .expect_err("ns_programs_subtree: a narrowed walk of / must not return the anchor");
+        .expect_err("ns_fixtures_subtree: a narrowed walk of / must not return the anchor");
     assert_eq!(
         err.kind(),
         std::io::ErrorKind::InvalidInput,
-        "ns_programs_subtree: narrowed walk of / must be InvalidInput, got {err:?}"
+        "ns_fixtures_subtree: narrowed walk of / must be InvalidInput, got {err:?}"
     );
 
     let mut cmd = std::process::Command::new("/tests/svctest");
-    cmd.arg("programs-child");
+    cmd.arg("fixtures-child");
     cmd.namespace_cap(programs_cap);
     let status = cmd
         .status()
-        .expect("ns_programs_subtree: spawn /tests/svctest programs-child failed");
+        .expect("ns_fixtures_subtree: spawn /tests/svctest fixtures-child failed");
 
     assert!(
         status.success(),
-        "ns_programs_subtree: child exit status {status:?}; expected 0. \
-         1 = /hello open failed (cap not rooted at /programs), \
+        "ns_fixtures_subtree: child exit status {status:?}; expected 0. \
+         1 = /spawn-target open failed (cap not rooted at /tests/fixtures/programs), \
          2 = /data/test.txt unexpectedly opened (cap not attenuated), \
          3 = /data/test.txt failed with unexpected error kind, \
          4 = no system_root_cap delivered to child"
     );
-    std::os::seraph::log!("ns_programs_subtree phase passed");
+    std::os::seraph::log!("ns_fixtures_subtree phase passed");
 }
 
 pub fn ns_startup_cwd_phase(_: &Caps)

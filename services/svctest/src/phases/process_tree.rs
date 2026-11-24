@@ -23,7 +23,7 @@ use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
 
 use crate::bootstrap::Caps;
-use crate::phases::procmgr::{HELLO_PATH, create_call, hello_file};
+use crate::phases::procmgr::{SPAWN_TARGET_PATH, create_call, spawn_target_file};
 use crate::runner::Phase;
 
 pub fn phases() -> &'static [Phase]
@@ -89,8 +89,8 @@ const POST_TIMEOUT_MS: u64 = 10_000;
 /// only guards against a post that should not exist.
 const QUIET_MS: u64 = 100;
 
-/// Exit reason of a `/programs/hello` that runs to its end.
-const HELLO_EXIT_REASON: u64 = 0;
+/// Exit reason of a `/tests/fixtures/programs/spawn-target` that runs to its end.
+const SPAWN_TARGET_EXIT_REASON: u64 = 0;
 
 /// Call `target` with `msg` and return the reply.
 fn call(target: u64, msg: &IpcMessage, what: &str) -> IpcMessage
@@ -183,7 +183,7 @@ impl Node
 
 /// Create a process with a raw `CREATE_FROM_FILE` sent on `on`: svctest's
 /// own procmgr cap, which makes a child of svctest, or the process handle of
-/// the process that is to be its parent. The process runs `/programs/hello`,
+/// the process that is to be its parent. The process runs `/tests/fixtures/programs/spawn-target`,
 /// or `/tests/svctest <role>` when `role` is given; the create carries
 /// `flags` and a death relay on a fresh queue. Not started.
 fn create(on: u64, role: Option<&str>, flags: u64, what: &str) -> Node
@@ -195,12 +195,12 @@ fn create(on: u64, role: Option<&str>, flags: u64, what: &str) -> Node
     {
         None =>
         {
-            let (file, size) = hello_file();
+            let (file, size) = spawn_target_file();
             create_call(
                 on,
                 procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_DEATH_RELAY | flags,
                 &[size],
-                HELLO_PATH,
+                SPAWN_TARGET_PATH,
                 &[file, post_cap(relay)],
             )
         }
@@ -347,12 +347,12 @@ fn destroy_child(badge: u64) -> IpcMessage
 /// torn down, as for any badge that names no live process.
 fn expect_create_refused(handle: u64, what: &str)
 {
-    let (file, size) = hello_file();
+    let (file, size) = spawn_target_file();
     crate::phases::procmgr::expect_create(
         handle,
         procmgr_labels::CREATE_FROM_FILE,
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
         procmgr_errors::INVALID_ARGUMENT,
         &format!("a create on the handle of {what}"),
@@ -521,7 +521,11 @@ pub fn reparent_phase(_: &Caps)
     let leaf_badge = only_child(middle.handle, "the middle process");
 
     crate::phases::budget::start(middle.handle, "the middle process");
-    expect_one_post(middle.relay, HELLO_EXIT_REASON, "the exited middle process");
+    expect_one_post(
+        middle.relay,
+        SPAWN_TARGET_EXIT_REASON,
+        "the exited middle process",
+    );
     assert_eq!(
         child_badges(root.handle, "the root"),
         [leaf_badge],
@@ -575,7 +579,7 @@ pub fn destroy_after_end_phase(_: &Caps)
 
         expect_one_post(
             middle.relay,
-            HELLO_EXIT_REASON,
+            SPAWN_TARGET_EXIT_REASON,
             "the ended, destroyed middle process",
         );
         assert_eq!(
@@ -619,7 +623,7 @@ pub fn contain_phase(_: &Caps)
     crate::phases::budget::start(contained.handle, "the contained process");
     expect_one_post(
         contained.relay,
-        HELLO_EXIT_REASON,
+        SPAWN_TARGET_EXIT_REASON,
         "the exited contained process",
     );
     expect_one_post(child.relay, EXIT_KILLED, "the contained process's child");

@@ -123,11 +123,12 @@ pub fn env_phase(_: &Caps)
         env::var("SERAPH_NOPE").is_err(),
         "unset key must return Err"
     );
-    // The staging's fixture record is the recipe's own entry, which the
-    // svctest_fixtures phase checks; the counts here leave it out.
+    // The staging's fixture record and phase selection are the recipe's own
+    // entries, which the svctest_fixtures phase checks; the counts here
+    // leave them out.
     let entries = || {
         env::vars()
-            .filter(|(key, _)| key != svctest_fixtures::ENV)
+            .filter(|(key, _)| key != svctest_fixtures::ENV && key != svctest_fixtures::PHASES_ENV)
             .count()
     };
     assert_eq!(entries(), 2, "expected 2 seeded entries");

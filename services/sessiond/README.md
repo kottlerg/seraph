@@ -27,6 +27,13 @@ svcmgr starts sessiond from `rootfs/config/svcmgr/services/sessiond.svc`:
 | `stop_source` | `program` | svcmgr lists sessiond to oomd as the source of the program class, and creates it contained |
 | `reserve` | `yes` | sessiond lists and stops while the pool outside the system reserve is spent |
 
+sessiond has no default leader: it logs `no leader: the recipe's argv names none` and exits when
+`argv[1]` is absent. The test recipe `rootfs/config/svcmgr/tests/sessiond.svc`, which `mkdisk
+--svctest` and `mkdisk --ubench` stage over this one, names the fixture
+`/tests/fixtures/programs/leader`: it prints the prompt `$ `, answers `echo` and `exit`, starts a
+command with a `/` as a job whose stdout and stderr it copies and to which later lines go until it
+ends, and prints `leader: command not found: <cmd>` to stderr for any other.
+
 For each session sessiond makes a budget node under its own with memmgr's `CREATE_SUB_NODE`,
 outside the system reserve, and creates the leader through procmgr from the file `argv[1]` names:
 suspended, contained, charged to that node, at priority 5 with a band ceiling of 5, with the
@@ -94,12 +101,12 @@ memmgr's endpoint, procmgr's, the log endpoint and the namespace root come in th
 `table/`'s host tests cover the slot tables and their generations, the keys of sessions and jobs,
 the paging of the candidate list, and the session names. svctest's `sessiond_operator` phase
 drives sessiond as an interface, through its `sessiond.operator` seed, and as a stop-authority
-holder: the badge gates, an open under an unregistered nonce, a session that runs the shell, lists
-its job and has it stopped, then exits, and a session stopped whole. Its `oom_policy` phase opens a
-session whose shell runs a job larger than the `stopsrc` fixture's, and checks that oomd stops that
-job first, then `stopsrc`'s, then the session, then `memhog`
-([services/svctest/README.md](../svctest/README.md)). `cargo xtask test terminal` drives the
-terminal's session end to end.
+holder: the badge gates, an open under an unregistered nonce, a session that runs the
+[`leader`](../fixtures/leader/README.md) fixture as its leader, lists its job and has it stopped,
+then exits, and a session stopped whole. Its `oom_policy` phase opens a session whose leader runs a
+job larger than the `stopsrc` fixture's, and checks that oomd stops that job first, then
+`stopsrc`'s, then the session, then `memhog` ([services/svctest/README.md](../svctest/README.md)).
+`cargo xtask test terminal` drives the terminal's session end to end.
 
 ---
 

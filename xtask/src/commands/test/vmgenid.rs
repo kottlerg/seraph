@@ -15,7 +15,7 @@
 //!    `entropy: vmgenid armed` line (bootloader discovery + kernel consumer
 //!    wired) and the terminal's READY marker (system fully up).
 //! 2. **Save**: QMP `migrate` to a state file, wait `completed`, `quit`
-//!    (releases the raw disk image's write lock).
+//!    (releases the raw disk image's write lock), wait for the exit.
 //! 3. **Boot B** with GUID `G2` and `-incoming exec:cat <state>`: QEMU
 //!    rewrites the GUID in guest RAM at migration load, before any vCPU
 //!    resumes. Assert the kernel's `entropy: VM generation change detected`
@@ -81,6 +81,9 @@ const TIMEOUT: Duration = Duration::from_mins(3);
 /// Budget for the migrate-to-file completion poll.
 const MIGRATE_TIMEOUT: Duration = Duration::from_mins(2);
 
+/// Budget for the source QEMU's exit after `quit`.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Launch QEMU for one boot of the test with the generation GUID `guid`,
 /// restoring the state at `incoming` when one is given.
 fn launch(
@@ -134,55 +137,79 @@ fn launch(
 
 pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
-    validate_sysroot_for_launch(ctx, Arch::X86_64)?;
+    // Every failing exit names its step, as the step lines below print it,
+    // and the callee's cause: a QMP error, a timeout with its bound, or the
+    // markers awaited.
+    validate_sysroot_for_launch(ctx, Arch::X86_64).context("setup")?;
     // Held until the case returns, after its last QEMU has exited.
-    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
-    let qemu_binary = require_tool(Arch::X86_64.qemu_binary())?;
+    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1).context("setup")?;
+    let qemu_binary = require_tool(Arch::X86_64.qemu_binary()).context("setup")?;
 
     let work_dir = ctx.target_dir.join("xtask");
     std::fs::create_dir_all(&work_dir)
-        .with_context(|| format!("creating {}", work_dir.display()))?;
+        .with_context(|| format!("setup: creating {}", work_dir.display()))?;
     // Declared before the guests, so it is removed after their QEMUs are
     // reaped.
-    let sockets = SocketDir::create()?;
-    let sock_a = sockets.socket("vmgenid-a.qmp")?;
-    let sock_b = sockets.socket("vmgenid-b.qmp")?;
+    let sockets = SocketDir::create().context("setup")?;
+    let sock_a = sockets.socket("vmgenid-a.qmp").context("setup")?;
+    let sock_b = sockets.socket("vmgenid-b.qmp").context("setup")?;
     let state_path = work_dir.join("vmgenid-state.bin");
     let _ = std::fs::remove_file(&state_path);
 
     // Built before boot A so a path the URI cannot carry fails up front.
-    let incoming = qmp::exec_restore_uri(&state_path)?;
+    let incoming = qmp::exec_restore_uri(&state_path).context("setup")?;
 
     // ── Boot A: fixed GUID, wait until fully up ─────────────────────────────
     step("vmgenid test: boot A (source) — waiting for armed + READY markers");
     // Every `?` below drops the live `Guest`, which kills and reaps its QEMU
     // (see `Guest`).
-    let mut guest_a = launch(&qemu_binary, ctx, args, &sock_a, GUID_A, None)?;
+    let mut guest_a =
+        launch(&qemu_binary, ctx, args, &sock_a, GUID_A, None).context("boot A: launching QEMU")?;
     guest_a
         .wait_for_markers(&[ARMED_MARKER, READY_MARKER], TIMEOUT)
-        .context("boot A")?;
+        .with_context(|| format!("boot A: armed and READY markers, bound {}", secs(TIMEOUT)))?;
 
     // ── Save: migrate to file, then quit to release the disk lock ──────────
     step("vmgenid test: migrating state to file");
     qmp::migrate_to_file(&sock_a, &state_path, MIGRATE_TIMEOUT).context("migrate to file")?;
-    qmp::quit(&sock_a).context("quitting source QEMU")?;
-    guest_a.wait_exit(Duration::from_secs(30))?;
+    step("vmgenid test: quitting the source");
+    qmp::quit(&sock_a).context("quit source: QMP quit")?;
+    guest_a
+        .wait_exit(QUIT_TIMEOUT)
+        .context("quit source: QEMU exit")?;
 
     // ── Boot B: new GUID, restore the state, assert detection ──────────────
     step("vmgenid test: boot B (restore with new GUID) — waiting for detection");
-    let mut guest_b = launch(&qemu_binary, ctx, args, &sock_b, GUID_B, Some(&incoming))?;
+    let mut guest_b = launch(&qemu_binary, ctx, args, &sock_b, GUID_B, Some(&incoming))
+        .context("boot B: launching QEMU")?;
     guest_b
         .wait_for_markers(&[CHANGE_MARKER], TIMEOUT)
-        .context("generation-change detection after restore")?;
+        .with_context(|| {
+            format!(
+                "boot B: generation-change detection after restore, bound {}",
+                secs(TIMEOUT)
+            )
+        })?;
 
     // ── Liveness: the resumed guest still draws and schedules ───────────────
     step("vmgenid test: post-resume liveness round (help via QMP)");
-    qmp::inject_events(&sock_b, EVENTS).context("QMP key injection after resume")?;
+    qmp::inject_events(&sock_b, EVENTS).context("liveness: QMP key injection after resume")?;
     let live = guest_b.wait_for_markers(&[CHILD_LINE], TIMEOUT);
     guest_b.shutdown();
     let _ = std::fs::remove_file(&state_path);
-    live.context("post-resume liveness round")?;
+    live.with_context(|| {
+        format!(
+            "liveness: shell output after resume, bound {}",
+            secs(TIMEOUT)
+        )
+    })?;
 
     step("vmgenid snapshot-resume test: PASS (detection + post-resume liveness)");
     Ok(())
+}
+
+/// `d` as whole seconds with its unit, for a failure that names its bound.
+fn secs(d: Duration) -> String
+{
+    format!("{} s", d.as_secs())
 }

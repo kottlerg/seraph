@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/fixtures/threadstack/tester/src/main.rs
+// services/svctest/src/phases/threadstack.rs
 
-//! Per-program tester for `/tests/fixtures/programs/threadstack`. Spawns it in eight modes
+//! svctest phase for `/tests/fixtures/programs/threadstack`. Spawns it in eight modes
 //! demand-paged (the system default), then in three pinned, with no pager, and
 //! asserts, capability-natively
 //! (stdout marker is the verdict;
@@ -38,31 +38,27 @@
 //!   * `eager-bigframe`, pinned — `bigframe` sized to the eager stack, the
 //!     frame's lowest byte in the parked worker's mapped stack; same verdict as
 //!     `guard`, which only an unmapped guard below the stack delivers.
-//!
-//! See [docs/testing.md](../../../../../docs/testing.md) for the protocol.
-
-#![expect(
-    clippy::expect_used,
-    reason = "a per-program tester is test code, where unwrap and expect are permitted \
-              (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait must \
-              abort the tester, and the panic's non-zero exit is its FAIL verdict"
-)]
 
 use std::io::Read;
 use std::os::seraph::process::CommandExt;
 use std::process::{Command, Stdio};
 
+use crate::bootstrap::Caps;
+use crate::runner::Phase;
+
+pub fn phases() -> &'static [Phase]
+{
+    &[Phase {
+        name: "threadstack",
+        run: threadstack_phase,
+    }]
+}
+
 /// Base exit reason for a fault-induced death (`abi/syscall` `EXIT_FAULT_BASE`).
 /// The kernel adds the arch fault vector/cause; a clean exit is `0`.
 const EXIT_FAULT_BASE: u64 = 0x1000;
 
-fn fail(msg: &str) -> !
-{
-    println!("[threadstack-tester] FAIL {msg}");
-    std::process::exit(1);
-}
-
-/// How the tester has procmgr create the fixture.
+/// How the phase has procmgr create the fixture.
 #[derive(Clone, Copy)]
 enum Paging
 {
@@ -117,19 +113,20 @@ fn check_grow(mode: &str, paging: Paging)
 {
     let (out, status) = run(mode, paging);
     let mode = format!("{mode}{}", paging.label());
-    if out.lines().any(|l| l.trim() == "SURVIVED (BUG)")
-    {
-        fail(&format!("{mode} unexpectedly reported SURVIVED"));
-    }
+    assert!(
+        !out.lines().any(|l| l.trim() == "SURVIVED (BUG)"),
+        "threadstack: {mode} unexpectedly reported SURVIVED"
+    );
     if !out.lines().any(|l| l.trim() == "PASS")
     {
-        println!("[threadstack-tester] {mode} stdout: {out:?}");
-        fail(&format!("{mode} PASS marker missing"));
+        std::os::seraph::log!("threadstack: {mode} stdout: {out:?}");
+        panic!("threadstack: {mode} PASS marker missing");
     }
-    if !status.success()
-    {
-        fail(&format!("{mode} exited non-clean: {:?}", status.code()));
-    }
+    assert!(
+        status.success(),
+        "threadstack: {mode} exited non-clean: {:?}",
+        status.code()
+    );
 }
 
 /// Run an overflow `mode` (`guard`, `bigframe`, `splitframe`, `span`,
@@ -144,34 +141,33 @@ fn check_overflow(mode: &str, paging: Paging)
 {
     let (out, status) = run(mode, paging);
     let mode = format!("{mode}{}", paging.label());
-    if out.lines().any(|l| l.trim() == "SURVIVED (BUG)")
-    {
-        fail(&format!("{mode}: guard did not fault — overflow survived"));
-    }
+    assert!(
+        !out.lines().any(|l| l.trim() == "SURVIVED (BUG)"),
+        "threadstack: {mode}: guard did not fault — overflow survived"
+    );
     if !out.lines().any(|l| l.contains("about to overflow"))
     {
-        println!("[threadstack-tester] {mode} stdout: {out:?}");
-        fail(&format!("{mode} fixture never reached the overflow point"));
+        std::os::seraph::log!("threadstack: {mode} stdout: {out:?}");
+        panic!("threadstack: {mode} fixture never reached the overflow point");
     }
-    if status.success()
-    {
-        fail(&format!("{mode} overflow exited cleanly — must be killed"));
-    }
+    assert!(
+        !status.success(),
+        "threadstack: {mode} overflow exited cleanly — must be killed"
+    );
     // Corroborating mechanism: the death reason should be a fault class, not an
     // application exit code. Advisory — the primary verdict is the non-clean
     // exit plus the absence of SURVIVED.
     let raw = status
         .code()
         .expect("overflow ExitStatus must carry a code") as u64;
-    if raw < EXIT_FAULT_BASE
-    {
-        fail(&format!(
-            "{mode} death reason {raw:#x} is not a fault class (>= {EXIT_FAULT_BASE:#x})"
-        ));
-    }
+    assert!(
+        raw >= EXIT_FAULT_BASE,
+        "threadstack: {mode} death reason {raw:#x} is not a fault class \
+         (>= {EXIT_FAULT_BASE:#x})"
+    );
 }
 
-fn main()
+pub fn threadstack_phase(_: &Caps)
 {
     check_grow("grow", Paging::Demand);
     check_overflow("guard", Paging::Demand);
@@ -184,5 +180,5 @@ fn main()
     check_grow("eager-grow", Paging::Pinned);
     check_overflow("guard", Paging::Pinned);
     check_overflow("eager-bigframe", Paging::Pinned);
-    println!("[threadstack-tester] PASS");
+    std::os::seraph::log!("threadstack phase passed");
 }

@@ -1,0 +1,23 @@
+# /config/svcmgr/tests/sessiond.svc — sessiond with the services layer's
+# session leader.
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# `cargo xtask mkdisk --svctest <set>` and `cargo xtask mkdisk --ubench`
+# stage it over /config/svcmgr/services/sessiond.svc, so the sessions of a
+# services-layer boot, which holds no program, are led by the fixture
+# /tests/fixtures/programs/leader (services/fixtures/leader/README.md), which
+# speaks the protocol svctest's sessiond_operator and oom_policy phases drive.
+# See docs/testing.md § Gating.
+#
+# The same recipe as services/sessiond.svc but for the leader `argv` names;
+# xtask's svctest_stage tests hold the two to that one difference.
+binary      = /services/sessiond
+priority    = 10
+sched_max   = 10
+argv        = sessiond /tests/fixtures/programs/leader
+restart     = on_failure
+critical    = no
+namespace   = universal
+provides    = sessiond.operator:grant
+stop_source = program
+reserve     = yes

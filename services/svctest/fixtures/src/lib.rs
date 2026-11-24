@@ -17,6 +17,17 @@
 //! recipe, or a staged fixture recipe the record does not declare. A phase
 //! whose fixture is not declared skips, and logs that it did.
 //!
+//! Every set but one also stages crashd's svctest recipe
+//! ([`CRASHD_RECIPE`]) over the default one, so svctest's crashd phases find
+//! a core of each faulting mode of the `crashme` fixture in `/crash`. The
+//! `crash-endpoint` set stages no crashd, which leaves procmgr's crash
+//! endpoint free for svctest to register as the crash service, and selects
+//! the one phase that does: its staging writes [`PHASES_ENV`]`=crash_endpoint`
+//! into the recipe, and svctest then runs its startup and fixture-check
+//! phases and the phases that record names ([`Set::phases`],
+//! [`selects`]). Whether crashd is staged follows from that record
+//! ([`crashd_staged`]), which svctest checks the image against too.
+//!
 //! The crate performs no IPC and issues no syscalls, so it stays host-testable
 //! ([coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants)).
 
@@ -29,6 +40,34 @@ pub const ENV: &str = "SVCTEST_FIXTURES";
 
 /// The record of the empty set.
 pub const NONE: &str = "none";
+
+/// The `env` key of the phase selection in svctest's staged recipe, which
+/// a set that runs only some phases writes ([`Set::phases`]).
+pub const PHASES_ENV: &str = "SVCTEST_PHASES";
+
+/// The file name of crashd's svctest recipe under `/config/svcmgr/tests/`,
+/// staged over crashd's default recipe of the same name.
+pub const CRASHD_RECIPE: &str = "crashd.svc";
+
+/// The path svcmgr reads crashd's staged recipe from.
+pub const CRASHD_STAGED_PATH: &str = "/config/svcmgr/services/crashd.svc";
+
+/// Whether a run whose recipe carries the phase selection `phases` (the
+/// value of [`PHASES_ENV`], `None` when the recipe sets none) has crashd
+/// staged: a run of every phase does, the run of a selection does not.
+#[must_use]
+pub const fn crashd_staged(phases: Option<&str>) -> bool
+{
+    phases.is_none()
+}
+
+/// Whether the phase selection `phases` (a [`PHASES_ENV`] value: phase
+/// names separated by commas) names `phase`.
+#[must_use]
+pub fn selects(phases: &str, phase: &str) -> bool
+{
+    phases.split(',').any(|name| name == phase)
+}
 
 /// A fixture the svctest boot may co-stage. Its recipe is
 /// `/config/svcmgr/tests/<name>.svc`, staged as
@@ -142,12 +181,16 @@ pub enum Set
     BurnIn,
     /// No fixture: every fixture phase skips.
     None,
+    /// No fixture and no crashd: the run of procmgr's crash endpoint with
+    /// svctest as the crash service, which only a boot without crashd
+    /// drives. Its staging selects the `crash_endpoint` phase.
+    CrashEndpoint,
 }
 
 impl Set
 {
     /// Every set.
-    pub const ALL: [Set; 3] = [Set::Ci, Set::BurnIn, Set::None];
+    pub const ALL: [Set; 4] = [Set::Ci, Set::BurnIn, Set::None, Set::CrashEndpoint];
 
     /// The set's name, as `mkdisk --svctest` takes it.
     #[must_use]
@@ -158,6 +201,7 @@ impl Set
             Set::Ci => "ci",
             Set::BurnIn => "burn-in",
             Set::None => "none",
+            Set::CrashEndpoint => "crash-endpoint",
         }
     }
 
@@ -169,8 +213,28 @@ impl Set
         {
             Set::Ci => &Fixture::ALL,
             Set::BurnIn => &[Fixture::Memhog, Fixture::ReserveCreator, Fixture::Stopsrc],
-            Set::None => &[],
+            Set::None | Set::CrashEndpoint => &[],
         }
+    }
+
+    /// The phases a run of the set selects, beyond the startup and
+    /// fixture-check phases every run makes, as its [`PHASES_ENV`] record
+    /// lists them; `None` for a run of every phase.
+    #[must_use]
+    pub const fn phases(self) -> Option<&'static str>
+    {
+        match self
+        {
+            Set::CrashEndpoint => Some("crash_endpoint"),
+            Set::Ci | Set::BurnIn | Set::None => None,
+        }
+    }
+
+    /// Whether a staging of the set stages crashd's svctest recipe.
+    #[must_use]
+    pub const fn stages_crashd(self) -> bool
+    {
+        crashd_staged(self.phases())
     }
 }
 
@@ -344,6 +408,31 @@ mod tests
                 );
             }
         }
+    }
+
+    // Defect caught: a set whose staging stages crashd while it selects the
+    // crash_endpoint phase, so the endpoint is taken and the phase checks only
+    // the refusal, or a canonical set that stages none, so the crashd phases
+    // find no core; or a selection svctest reads as naming another phase.
+    #[test]
+    fn only_the_crash_endpoint_set_selects_phases_and_stages_no_crashd()
+    {
+        for set in Set::ALL
+        {
+            assert_eq!(set.stages_crashd(), set != Set::CrashEndpoint, "{set:?}");
+            assert_eq!(set.phases().is_some(), set == Set::CrashEndpoint, "{set:?}");
+        }
+        let selection = Set::CrashEndpoint.phases().unwrap();
+        assert!(selects(selection, "crash_endpoint"));
+        assert!(!selects(selection, "crash"));
+        assert!(!selects(selection, "crash_endpoint_x"));
+        assert!(selects("a,crash_endpoint", "crash_endpoint"));
+        assert!(!crashd_staged(Some(selection)));
+        assert!(crashd_staged(None));
+        assert_eq!(
+            CRASHD_STAGED_PATH,
+            format!("/config/svcmgr/services/{CRASHD_RECIPE}")
+        );
     }
 
     // Defect caught: two fixtures sharing a name or a recipe, or a recipe or

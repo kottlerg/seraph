@@ -915,8 +915,8 @@ pub(super) const SVCTEST_CHILD_NAME: &[u8] = b"/tests/svctest";
 /// The badge of the child of svctest's own binary spawned since `before`, a
 /// [`listed_badges`] taken before the spawn: the one process
 /// `LIST_PROCESSES` lists under [`SVCTEST_CHILD_NAME`] that `before` does
-/// not hold. Any other process can be spawned meanwhile (the terminal's next
-/// session's shell once oomd has stopped a session, say), so a new entry under
+/// not hold. Any other process can be spawned meanwhile (the next instance of
+/// a service svcmgr restarts once oomd has stopped it, say), so a new entry under
 /// another name is not the child's. `what` names the phase in a panic.
 pub(super) fn spawned_badge(authority: u64, before: &[u64], what: &str) -> u64
 {

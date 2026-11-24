@@ -19,7 +19,7 @@ use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
 /// The install path of the program most create requests here name.
-pub(crate) const HELLO_PATH: &str = "/programs/hello";
+pub(crate) const SPAWN_TARGET_PATH: &str = "/tests/fixtures/programs/spawn-target";
 
 /// `head` followed by `rest`: the data words of a create request before its
 /// name block.
@@ -519,6 +519,10 @@ pub fn command_phases() -> &'static [Phase]
             run: procmgr_concurrent_spawn_phase,
         },
         Phase {
+            name: "procmgr_program_narrowing",
+            run: procmgr_program_narrowing_phase,
+        },
+        Phase {
             name: "crash_endpoint",
             run: super::crash::crash_endpoint_phase,
         },
@@ -688,15 +692,15 @@ pub fn spawn_phase(_: &Caps)
 {
     use std::process::Command;
 
-    let mut child = Command::new("/programs/hello")
+    let mut child = Command::new("/tests/fixtures/programs/spawn-target")
         .arg("one")
         .arg("two")
         .env("SPAWNED_BY", "svctest")
         .spawn()
-        .expect("spawn /programs/hello failed");
+        .expect("spawn /tests/fixtures/programs/spawn-target failed");
 
     let id = child.process_handle();
-    std::os::seraph::log!("spawned /programs/hello handle={id:#x}");
+    std::os::seraph::log!("spawned /tests/fixtures/programs/spawn-target handle={id:#x}");
 
     {
         let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -734,7 +738,7 @@ pub fn spawn_phase(_: &Caps)
     std::os::seraph::log!("child exited: {status}");
     assert!(
         status.success(),
-        "child /programs/hello did not exit cleanly: {status}"
+        "child /tests/fixtures/programs/spawn-target did not exit cleanly: {status}"
     );
 
     let again = child.try_wait().expect("try_wait after wait failed");
@@ -821,14 +825,16 @@ pub fn command_invalid_elf_loop_phase(_: &Caps)
         let _ = err;
     }
 
-    let mut child = Command::new("/programs/hello")
+    let mut child = Command::new("/tests/fixtures/programs/spawn-target")
         .spawn()
         .expect("legitimate spawn after invalid-ELF loop failed");
-    let status = child.wait().expect("wait on hello after loop failed");
+    let status = child
+        .wait()
+        .expect("wait on spawn-target after loop failed");
     assert_eq!(
         status.code().unwrap_or(-1),
         0,
-        "hello after invalid-ELF loop exited non-zero",
+        "spawn-target after invalid-ELF loop exited non-zero",
     );
     std::os::seraph::log!("command_invalid_elf_loop phase passed");
 }
@@ -979,17 +985,17 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
     let spawner = std::thread::Builder::new()
         .name("command_spawner".into())
         .spawn(|| {
-            let output = Command::new("/programs/hello")
+            let output = Command::new("/tests/fixtures/programs/spawn-target")
                 .output()
                 .expect("Command::output from a spawned thread failed");
             assert!(
                 output.status.success(),
-                "hello spawned from a thread did not exit cleanly: {}",
+                "spawn-target spawned from a thread did not exit cleanly: {}",
                 output.status
             );
             assert!(
                 !output.stdout.is_empty(),
-                "hello spawned from a thread produced no stdout"
+                "spawn-target spawned from a thread produced no stdout"
             );
 
             let mut child = Command::new("/tests/svctest")
@@ -1066,7 +1072,7 @@ pub fn stdio_file_unsupported_phase(_: &Caps)
     use std::process::{Command, Stdio};
 
     let file = File::open("/data/test.txt").expect("open /data/test.txt for stdio probe");
-    let err = Command::new("/programs/hello")
+    let err = Command::new("/tests/fixtures/programs/spawn-target")
         .stdout(Stdio::from(file))
         .spawn()
         .expect_err("Stdio::from(File) must surface as Unsupported on seraph");
@@ -1092,21 +1098,18 @@ const SPAWNS_PER_THREAD: usize = 3;
 /// procmgr opens the file before it reads the size.
 const STALLED_FILE_SIZE: u64 = 4096;
 
-/// procmgr serves a create on one request worker while others serve the
-/// rest (services/procmgr/README.md § Concurrency). A thread of svctest
-/// serves an endpoint whose SEND cap is the file cap of a `CREATE_FROM_FILE`
-/// another thread makes, and holds procmgr's first call, the `FS_SESSION` of
-/// the read's session, unanswered. While
-/// it is held, [`CONCURRENT_SPAWNERS`] threads each spawn `/programs/hello`
-/// [`SPAWNS_PER_THREAD`] times, at once, and every child must exit cleanly.
-/// The server never answers, and the stalled create must fail with
-/// `IO_ERROR` once procmgr's bound on the call passes
-/// (`FILE_CAP_CALL_TIMEOUT_MS`, services/procmgr/docs/ipc-interface.md
-/// § Label 13). A second stalled create runs beside it: its file server
-/// answers `FS_SESSION` and `FS_OPEN`, lends the first page of `/programs/hello` through
-/// `FS_READ_MEMORY`, then leaves the read of the second page unanswered, and
-/// that create must also fail with `IO_ERROR` under the same bound. After the
-/// stall a closer thread answers procmgr's `FS_CLOSE`, so the close does not
+/// procmgr serves a create on one request worker while others serve the rest
+/// (services/procmgr/README.md § Concurrency). A thread of svctest serves an endpoint whose SEND
+/// cap is the file cap of a `CREATE_FROM_FILE` another thread makes, and holds procmgr's first
+/// call, the `FS_SESSION` of the read's session, unanswered. While it is held,
+/// [`CONCURRENT_SPAWNERS`] threads each spawn `/tests/fixtures/programs/spawn-target`
+/// [`SPAWNS_PER_THREAD`] times, at once, and every child must exit cleanly. The server never
+/// answers, and the stalled create must fail with `IO_ERROR` once procmgr's bound on the call
+/// passes (`FILE_CAP_CALL_TIMEOUT_MS`, services/procmgr/docs/ipc-interface.md § Label 13). A second
+/// stalled create runs beside it: its file server answers `FS_SESSION` and `FS_OPEN`, lends the
+/// first page of `/tests/fixtures/programs/spawn-target` through `FS_READ_MEMORY`, then leaves the
+/// read of the second page unanswered, and that create must also fail with `IO_ERROR` under the
+/// same bound. After the stall a closer thread answers procmgr's `FS_CLOSE`, so the close does not
 /// wait out a second bound.
 pub fn procmgr_concurrent_spawn_phase(_: &Caps)
 {
@@ -1153,7 +1156,7 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
                 startup_info().procmgr_endpoint,
                 procmgr_labels::CREATE_FROM_FILE,
                 &[STALLED_FILE_SIZE],
-                HELLO_PATH,
+                SPAWN_TARGET_PATH,
                 &[file],
             )
             .expect("stalled CREATE_FROM_FILE call failed")
@@ -1180,14 +1183,14 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
                 .spawn(move || {
                     for n in 0..SPAWNS_PER_THREAD
                     {
-                        let status = std::process::Command::new("/programs/hello")
+                        let status = std::process::Command::new(SPAWN_TARGET_PATH)
                             .status()
                             .unwrap_or_else(|e| {
                                 panic!("spawner {i}: spawn {n} beside a stalled create failed: {e}")
                             });
                         assert!(
                             status.success(),
-                            "spawner {i}: hello {n} beside a stalled create exited {status}"
+                            "spawner {i}: spawn-target {n} beside a stalled create exited {status}"
                         );
                     }
                 })
@@ -1220,7 +1223,7 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
 }
 
 /// The second stalled create of [`procmgr_concurrent_spawn_phase`]: a file
-/// server that lends procmgr the first page of `/programs/hello` and then
+/// server that lends procmgr the first page of `/tests/fixtures/programs/spawn-target` and then
 /// leaves the read of the second unanswered.
 struct ReadStall
 {
@@ -1248,7 +1251,7 @@ fn first_page_of(data: &[u8]) -> (u64, u64, usize)
     let first_page = usize::try_from(syscall_abi::PAGE_SIZE).expect("a page size fits a usize");
     assert!(
         first_page < data.len(),
-        "procmgr_concurrent_spawn: /programs/hello fits one page"
+        "procmgr_concurrent_spawn: /tests/fixtures/programs/spawn-target fits one page"
     );
     let (page, region) = super::memmgr::try_request_contiguous(1)
         .unwrap_or_else(|label| panic!("REQUEST_MEMORY_CAPS status {label:#x}"));
@@ -1312,8 +1315,9 @@ impl ReadStall
         use ipc::{IpcMessage, procmgr_labels};
         use std::sync::mpsc;
 
-        let data = std::fs::read("/programs/hello")
-            .expect("procmgr_concurrent_spawn: reading /programs/hello failed");
+        let data = std::fs::read("/tests/fixtures/programs/spawn-target").expect(
+            "procmgr_concurrent_spawn: reading /tests/fixtures/programs/spawn-target failed",
+        );
         let len = data.len() as u64;
         let (page, region, first_page) = first_page_of(&data);
 
@@ -1341,7 +1345,7 @@ impl ReadStall
                 let ipc_buf = std::os::seraph::current_ipc_buf();
                 serve_read_session(endpoint, session, liveness, open, ipc_buf);
 
-                // procmgr's first read: hello's first page, lent from a page
+                // procmgr's first read: spawn-target's first page, lent from a page
                 // of svctest's own as an fs driver lends a cache page.
                 // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
                 let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
@@ -1393,7 +1397,7 @@ impl ReadStall
                     startup_info().procmgr_endpoint,
                     procmgr_labels::CREATE_FROM_FILE,
                     &[len],
-                    HELLO_PATH,
+                    SPAWN_TARGET_PATH,
                     &[node],
                 )
                 .expect("read-stall CREATE_FROM_FILE call failed")
@@ -1511,12 +1515,12 @@ fn phys_access_refused(procmgr: u64)
 {
     use ipc::{procmgr_errors, procmgr_labels};
 
-    let (file, size) = hello_file();
+    let (file, size) = spawn_target_file();
     expect_create(
         procmgr,
         procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_PHYS_ACCESS,
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_FROM_FILE with CREATE_PHYS_ACCESS from a creator that is not phys-class",
@@ -1581,15 +1585,71 @@ fn debug_authority_refused(procmgr: u64)
     );
 }
 
-/// Look up `/programs/hello` and return `(file_cap, size)`.
-pub(crate) fn hello_file() -> (u64, u64)
+/// Look up `/tests/fixtures/programs` and return its directory cap. Each hop's intermediate cap
+/// is deleted once the next is held.
+pub(crate) fn fixture_programs_dir() -> u64
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    let root = std::os::seraph::root_dir_cap();
-    let (programs, _, _) = crate::ipc_util::ns::ns_lookup(root, b"programs", 0xFFFF, ipc_buf)
-        .expect("ns_lookup /programs failed");
-    let (file, _, size) = crate::ipc_util::ns::ns_lookup(programs, b"hello", 0xFFFF, ipc_buf)
-        .expect("ns_lookup /programs/hello failed");
+    let mut dir = std::os::seraph::root_dir_cap();
+    let mut held = false;
+    for name in [&b"tests"[..], &b"fixtures"[..], &b"programs"[..]]
+    {
+        let (next, _, _) = crate::ipc_util::ns::ns_lookup(dir, name, 0xFFFF, ipc_buf)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "ns_lookup {} failed: {e:?}",
+                    core::str::from_utf8(name).unwrap_or("?")
+                )
+            });
+        if held
+        {
+            let _ = syscall::cap_delete(dir);
+        }
+        dir = next;
+        held = true;
+    }
+    dir
+}
+
+/// A program narrows what its creator may start: as a program, which may
+/// start programs only (docs/signing.md § Signature Policy in procmgr), the
+/// spawn target's `narrow` mode starts the service image
+/// `/tests/fixtures/crasher` and is refused `PermissionDenied`. It reports
+/// the outcome on its stdout and by its exit status.
+///
+/// Defect guarded: a program starting an image in a role its creator's
+/// signature policy does not admit, a service here.
+fn procmgr_program_narrowing_phase(_caps: &Caps)
+{
+    use std::process::{Command, Stdio};
+
+    let phase = "procmgr_program_narrowing";
+    let output = Command::new(SPAWN_TARGET_PATH)
+        .arg("narrow")
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| panic!("{phase}: spawn {SPAWN_TARGET_PATH} narrow: {e}"));
+    let out = String::from_utf8_lossy(&output.stdout);
+    for line in out.lines()
+    {
+        std::os::seraph::log!("{phase}: spawn-target: {line}");
+    }
+    assert!(
+        output.status.success(),
+        "{phase}: the program's start of a service was not refused PermissionDenied \
+         ({}): {out:?}",
+        output.status
+    );
+}
+
+/// Look up `/tests/fixtures/programs/spawn-target` and return `(file_cap, size)`.
+pub(crate) fn spawn_target_file() -> (u64, u64)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let programs = fixture_programs_dir();
+    let (file, _, size) =
+        crate::ipc_util::ns::ns_lookup(programs, b"spawn-target", 0xFFFF, ipc_buf)
+            .expect("ns_lookup /tests/fixtures/programs/spawn-target failed");
     let _ = syscall::cap_delete(programs);
     (file, size)
 }
@@ -1677,12 +1737,12 @@ pub fn procmgr_refusals_phase(_: &Caps)
             procmgr_errors::UNKNOWN_OPCODE,
             "unassigned label 4",
         );
-        let (file, size) = hello_file();
+        let (file, size) = spawn_target_file();
         expect_create(
             procmgr,
             procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_DEATH_RELAY,
             &[size],
-            HELLO_PATH,
+            SPAWN_TARGET_PATH,
             &[file],
             procmgr_errors::INVALID_ARGUMENT,
             "CREATE_FROM_FILE with the relay flag and only the file cap",
@@ -1695,12 +1755,12 @@ pub fn procmgr_refusals_phase(_: &Caps)
     bind_death_observer_cells();
     argv_env_refusals();
 
-    let status = std::process::Command::new("/programs/hello")
+    let status = std::process::Command::new("/tests/fixtures/programs/spawn-target")
         .status()
         .expect("spawn after the refused requests failed");
     assert!(
         status.success(),
-        "hello after the refused requests exited {status}"
+        "spawn-target after the refused requests exited {status}"
     );
 
     let status = std::process::Command::new("/tests/svctest")
@@ -1739,7 +1799,7 @@ fn argv_env_refusals()
 
     let procmgr = startup_info().procmgr_endpoint;
     let label = procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_ARGV_ENV;
-    let blob = b"/programs/hello\0";
+    let blob = b"/tests/fixtures/programs/spawn-target\0";
     let len = blob.len() as u64;
     let page = syscall_abi::PAGE_SIZE;
     let cells: [(&str, [u64; 4]); 3] = [
@@ -1760,35 +1820,35 @@ fn argv_env_refusals()
         let argv_env = ArgvEnvCap::new(blob, 1, b"", 0)
             .expect("building the argv/env cap failed")
             .expect("a nonempty argv builds a cap");
-        let (file, size) = hello_file();
+        let (file, size) = spawn_target_file();
         expect_create(
             procmgr,
             label,
             &with_head(size, &header),
-            HELLO_PATH,
+            SPAWN_TARGET_PATH,
             &[file, argv_env.cap()],
             procmgr_errors::INVALID_ARGUMENT,
             what,
         );
     }
 
-    let (file, size) = hello_file();
+    let (file, size) = spawn_target_file();
     expect_create(
         procmgr,
         label,
         &[size, len, 1, 0, 0],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_ARGV_ENV with only the file cap",
     );
 
-    let (file, size) = hello_file();
+    let (file, size) = spawn_target_file();
     expect_create(
         procmgr,
         label,
         &[size, len, 1, 0, 0],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file, spare_cap()],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_ARGV_ENV with an endpoint cap as the argv/env cap",
@@ -1801,23 +1861,23 @@ fn argv_env_refusals()
         .expect("a nonempty argv builds a cap");
     let no_rights =
         syscall::cap_derive(argv_env.cap(), 0).expect("deriving a rights-free argv/env cap failed");
-    let (file, size) = hello_file();
+    let (file, size) = spawn_target_file();
     expect_create(
         procmgr,
         label,
         &[size, len, 1, 0, 0],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file, no_rights],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_ARGV_ENV with a Memory cap that has no map right",
     );
 
-    let (file, size) = hello_file();
+    let (file, size) = spawn_target_file();
     expect_create(
         procmgr,
         procmgr_labels::CREATE_FROM_FILE | (len << 32) | (1 << 48),
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
         procmgr_errors::INVALID_ARGUMENT,
         "a create label with the former inline argv fields",
@@ -1837,7 +1897,7 @@ fn create_process_argv_env_refusals()
 
     let procmgr = startup_info().procmgr_endpoint;
     let label = procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_ARGV_ENV;
-    let blob = b"/programs/hello\0";
+    let blob = b"/tests/fixtures/programs/spawn-target\0";
     let len = blob.len() as u64;
     let page = syscall_abi::PAGE_SIZE;
     let cells: [(&str, [u64; 4]); 2] = [
@@ -1859,7 +1919,7 @@ fn create_process_argv_env_refusals()
             procmgr,
             label,
             &with_head(len, &header),
-            HELLO_PATH,
+            SPAWN_TARGET_PATH,
             &[spare_cap(), argv_env.cap()],
             procmgr_errors::INVALID_ARGUMENT,
             what,
@@ -1869,7 +1929,7 @@ fn create_process_argv_env_refusals()
         procmgr,
         label,
         &[len, len, 1, 0, 0],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[spare_cap()],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_PROCESS with CREATE_ARGV_ENV and only the module cap",
@@ -1888,7 +1948,7 @@ const DMA_HOLD_POLLS: u32 = 256;
 const DMA_HOLD_EXIT_POLLS: u32 = 100_000;
 
 /// The caps the create reply of a `CREATE_DMA_HOLD` child carries.
-struct HeldHello
+struct HeldSpawnTarget
 {
     handle: u64,
     thread: u64,
@@ -1896,7 +1956,7 @@ struct HeldHello
     token: u64,
 }
 
-impl HeldHello
+impl HeldSpawnTarget
 {
     /// Delete the three caps.
     fn delete(&self)
@@ -1908,18 +1968,18 @@ impl HeldHello
     }
 }
 
-/// Create `/programs/hello` through raw `CREATE_FROM_FILE` with
+/// Create `/tests/fixtures/programs/spawn-target` through raw `CREATE_FROM_FILE` with
 /// `CREATE_DMA_HOLD` and return its reply caps, the release token among them.
-fn create_held_hello() -> HeldHello
+fn create_held_spawn_target() -> HeldSpawnTarget
 {
     use ipc::{procmgr_errors, procmgr_labels};
 
-    let (file, size) = hello_file();
+    let (file, size) = spawn_target_file();
     let reply = create_call(
         startup_info().procmgr_endpoint,
         procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_DMA_HOLD,
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
     )
     .expect("CREATE_FROM_FILE with CREATE_DMA_HOLD call failed");
@@ -1930,7 +1990,7 @@ fn create_held_hello() -> HeldHello
     );
     match reply.caps()
     {
-        &[handle, thread, token] => HeldHello {
+        &[handle, thread, token] => HeldSpawnTarget {
             handle,
             thread,
             token,
@@ -2014,7 +2074,7 @@ pub fn procmgr_dma_hold_phase(_: &Caps)
     // Never started: no hold, reclaimed at its destroy.
     let unstarted = (0..DMA_HOLD_WINDOWS).any(|_| {
         let before = pool_free();
-        let child = create_held_hello();
+        let child = create_held_spawn_target();
         expect_reply(
             child.token,
             &release,
@@ -2045,7 +2105,7 @@ pub fn procmgr_dma_hold_phase(_: &Caps)
     let mut held_seen = false;
     let started = (0..DMA_HOLD_WINDOWS).any(|_| {
         let before = pool_free();
-        let child = create_held_hello();
+        let child = create_held_spawn_target();
         run_held_child_to_teardown(child.handle);
         let held = !pool_returns_to(before);
         expect_reply(
@@ -2193,13 +2253,14 @@ fn run_created_child(reply: &ipc::IpcMessage)
 
 /// A module procmgr creates from is verified before it is parsed, under the
 /// creator-supplied name and length (`services/procmgr/docs/ipc-interface.md`
-/// § Label 1). svctest holds no boot module, so it copies `/programs/hello`
+/// § Label 1). svctest holds no boot module, so it copies `/tests/fixtures/programs/spawn-target`
 /// into a contiguous memmgr grant and creates from map-only derivations of it.
 pub fn create_process_verifies_module_phase(_: &Caps)
 {
     use ipc::procmgr_errors;
 
-    let image = std::fs::read(HELLO_PATH).expect("reading /programs/hello failed");
+    let image = std::fs::read(SPAWN_TARGET_PATH)
+        .expect("reading /tests/fixtures/programs/spawn-target failed");
     let len = image.len() as u64;
     // One byte past the image too, so the overlong request below fails on
     // the object's trailer, not on the grant's end.
@@ -2213,7 +2274,7 @@ pub fn create_process_verifies_module_phase(_: &Caps)
 
     // Defect guarded: a module under its own name and exact length is not
     // accepted, or the child it yields does not run.
-    let reply = create_process_of_grant(grant, len, Some(HELLO_PATH));
+    let reply = create_process_of_grant(grant, len, Some(SPAWN_TARGET_PATH));
     assert_eq!(
         reply.label,
         procmgr_errors::SUCCESS,
@@ -2224,7 +2285,7 @@ pub fn create_process_verifies_module_phase(_: &Caps)
 
     // Defect guarded: a module is accepted under a name other than the one it
     // was signed under.
-    let reply = create_process_of_grant(grant, len, Some("/programs/hellp"));
+    let reply = create_process_of_grant(grant, len, Some("/tests/fixtures/programs/spawn-targer"));
     assert_refused(
         &reply,
         procmgr_errors::SIGNATURE_REFUSED,
@@ -2240,7 +2301,7 @@ pub fn create_process_verifies_module_phase(_: &Caps)
     );
 
     // Defect guarded: a zero length reaches the module's bytes.
-    let reply = create_process_of_grant(grant, 0, Some(HELLO_PATH));
+    let reply = create_process_of_grant(grant, 0, Some(SPAWN_TARGET_PATH));
     assert_refused(
         &reply,
         procmgr_errors::INVALID_ARGUMENT,
@@ -2250,7 +2311,7 @@ pub fn create_process_verifies_module_phase(_: &Caps)
     // Defect guarded: the creator-supplied length is not part of what is
     // verified; an object end one byte later leaves its trailer unparsed.
     let longer = len.checked_add(1).expect("the length plus one fits a u64");
-    let reply = create_process_of_grant(grant, longer, Some(HELLO_PATH));
+    let reply = create_process_of_grant(grant, longer, Some(SPAWN_TARGET_PATH));
     assert_refused(
         &reply,
         procmgr_errors::SIGNATURE_REFUSED,
@@ -2264,7 +2325,7 @@ pub fn create_process_verifies_module_phase(_: &Caps)
         *byte ^= 0xFF;
     };
     edit_grant(grant, pages, image.len(), &flip);
-    let reply = create_process_of_grant(grant, len, Some(HELLO_PATH));
+    let reply = create_process_of_grant(grant, len, Some(SPAWN_TARGET_PATH));
     assert_refused(
         &reply,
         procmgr_errors::SIGNATURE_REFUSED,
@@ -2276,20 +2337,20 @@ pub fn create_process_verifies_module_phase(_: &Caps)
     std::os::seraph::log!("create_process_verifies_module phase passed ({pages} pages)");
 }
 
-/// procmgr refuses a `CREATE_FROM_FILE` of `/programs/hello` under another
+/// procmgr refuses a `CREATE_FROM_FILE` of `/tests/fixtures/programs/spawn-target` under another
 /// name with `SIGNATURE_REFUSED` and creates no child.
 pub fn create_from_file_refuses_wrong_name_phase(_: &Caps)
 {
     use ipc::{procmgr_errors, procmgr_labels};
 
-    let (file, size) = hello_file();
+    let (file, size) = spawn_target_file();
     // Defect guarded: a file is accepted under a name other than the one it
     // was signed under.
     let reply = create_call(
         startup_info().procmgr_endpoint,
         procmgr_labels::CREATE_FROM_FILE,
         &[size],
-        "/programs/hellp",
+        "/tests/fixtures/programs/spawn-targer",
         &[file],
     )
     .expect("raw CREATE_FROM_FILE call failed");
@@ -2310,12 +2371,12 @@ fn configure_pipe_refusals()
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 
-    let (file, size) = hello_file();
+    let (file, size) = spawn_target_file();
     let reply = create_call(
         startup_info().procmgr_endpoint,
         procmgr_labels::CREATE_FROM_FILE,
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
     )
     .expect("raw CREATE_FROM_FILE call failed");
@@ -2404,12 +2465,12 @@ fn bind_death_observer_cells()
         "BIND_DEATH_OBSERVER on svctest's own procmgr cap",
     );
 
-    let (file, size) = hello_file();
+    let (file, size) = spawn_target_file();
     let reply = create_call(
         procmgr,
         procmgr_labels::CREATE_FROM_FILE,
         &[size],
-        HELLO_PATH,
+        SPAWN_TARGET_PATH,
         &[file],
     )
     .expect("raw CREATE_FROM_FILE call failed");
@@ -2509,8 +2570,17 @@ fn undeliverable_reply_child_main() -> !
         crate::ipc_util::ns::ns_lookup(dir, name, 0xFFFF, ipc_buf)
             .unwrap_or_else(|_| std::process::exit(UNDELIVERABLE_LOOKUP_FAILED))
     };
-    let (programs, _, _) = lookup(std::os::seraph::root_dir_cap(), b"programs");
-    let (mut file, _, size) = lookup(programs, b"hello");
+    let mut programs = std::os::seraph::root_dir_cap();
+    for name in [&b"tests"[..], &b"fixtures"[..], &b"programs"[..]]
+    {
+        let next = lookup(programs, name).0;
+        if programs != std::os::seraph::root_dir_cap()
+        {
+            let _ = syscall::cap_delete(programs);
+        }
+        programs = next;
+    }
+    let (mut file, _, size) = lookup(programs, b"spawn-target");
 
     // Fill every general slot, then spend the IPC receive reserve, which
     // general allocations leave free, on one-page memmgr grants: each lands
@@ -2539,7 +2609,7 @@ fn undeliverable_reply_child_main() -> !
         if window > 0
         {
             // The slot the previous create freed takes the new file cap.
-            file = lookup(programs, b"hello").0;
+            file = lookup(programs, b"spawn-target").0;
         }
         let Some(before) = std::os::seraph::memmgr_pool_free_bytes()
         else
@@ -2550,7 +2620,7 @@ fn undeliverable_reply_child_main() -> !
             info.procmgr_endpoint,
             procmgr_labels::CREATE_FROM_FILE,
             &[size],
-            HELLO_PATH,
+            SPAWN_TARGET_PATH,
             &[file],
         )
         {

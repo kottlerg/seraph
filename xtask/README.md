@@ -280,7 +280,7 @@ The launch options, the same in both modes:
 | `--second-disk-block-size` | Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image: a power of two of at least 512, up to QEMU's own limit. A size above virtio-blk's `MAX_BLOCK_SIZE` (4096), such as `8192`, stages the refused second disk of the disk variations ([docs/testing.md](../docs/testing.md) § Coverage tiers) |
 | `--second-disk-shared-line` | Place the two disks' devices on one `INTx` line instead of a line each, the first disk moved onto the second disk's line so the second keeps the location the storage statement `mkdisk --split-data` stages names, and launch both disks with no MSI-X (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
 | `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
-| `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the store file of the process binary's build id (`symbols/<build-id>.elf`) for symbols when a staged recipe or `programs/`/`services/` names it; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
+| `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the store file of the process binary's build id (`symbols/<build-id>.elf`) for symbols when a staged recipe names it or it is installed in `programs/`, `services/`, `tests/fixtures/programs/` or `tests/fixtures/`, searched in that order; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
 | `--test-devices` | Attach the test devices (see Attached devices): `edu` and five `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
 | `--icount` | Count instructions: QEMU runs the machine on single-threaded TCG (`-accel tcg,thread=single`) with `-icount shift=0,sleep=off,align=off`, so the guest's clock, and the cycle counters the benchmarks read, advance one tick per retired instruction and never with the host's time, and a benchmark's count repeats from run to run. Always TCG, whatever `SERAPH_ACCEL` says. On x86_64 the `-cpu` model also takes `-x2apic`: QEMU's icount cannot serve the x2APIC timer (`Bad icount read` once the kernel arms it), so the kernel runs its xAPIC paths. The bench cell's boots ([§ `cargo xtask bench-check`](#cargo-xtask-bench-check)); a functional boot does not take it |
 | `--display` | What the guest presents for display (see Attached devices): `window`, QEMU std VGA in a display window; `framebuffer`, the adapter with no window (`-display none`), on a host with or without a graphical backend, so the bootloader hands the kernel a GOP framebuffer and devmgr spawns the framebuffer driver: the framebuffer device cell ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers); `headless`, no adapter, so devmgr spawns no framebuffer driver. Default: `window` for the interactive boot, `headless` with `--runs`, which refuses `window` |
@@ -432,7 +432,7 @@ before the runs copy them, and removes it after the last run.
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
 | `--require` | (none) | A regex a line of the log must match for the run to pass; repeatable, each must match a line. A run whose `--pass` matched but whose log has no line matching one of them is `FAIL`, its reason naming the pattern |
-| `--crash-reports` | (none) | Check the crash service's report blocks in each passing run's log: every block must be complete and hold the fields its kind, thread, and status require, read with `shared/crash-report`, the crate crashd emits them with ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)). `reports` also requires one `vm` and one `exception` block of the `crashme` fixture's main thread and one `exception` block of a `spawned` thread (its `worker` mode), found through the badge logd's `reclaim:` line names it by, each complete, its walk starting at its instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the block read the thread the kernel killed; the `vm` block's `addr` must also be the faulting address that dump prints (`cr2` on x86_64, `stval` on riscv64). `none` requires no block at all. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `none`, its usertest boot `reports`; the model is in [docs/testing.md](../docs/testing.md) § Crash reports |
+| `--crash-reports` | (none) | Check the crash service's report blocks in each passing run's log: every block must be complete and hold the fields its kind, thread, and status require, read with `shared/crash-report`, the crate crashd emits them with ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)). `reports` also requires one `vm` and one `exception` block of the `crashme` fixture's main thread and one `exception` block of a `spawned` thread (its `worker` mode), found through the badge logd's `reclaim:` line names it by, each complete, its walk starting at its instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the block read the thread the kernel killed; the `vm` block's `addr` must also be the faulting address that dump prints (`cr2` on x86_64, `stval` on riscv64). `none` requires no block at all. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `reports`, its `crash-endpoint` svctest boot and its usertest boot `none`; the model is in [docs/testing.md](../docs/testing.md) § Crash reports |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
 | `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> icount=<on\|off> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing`, `bench-check` and `bench-baseline` read |
@@ -615,7 +615,8 @@ about half a second to a pack at 512-byte blocks, and under a second at 4096.
 
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest] \
-    [--svctest ci|burn-in|none] [--knob nokaslr|mapredo]... [--log-levels FILE] \
+    [--svctest ci|burn-in|none|crash-endpoint | --ubench] [--knob nokaslr|mapredo]... \
+    [--log-levels FILE] \
     [--block-size 512|4096] [--split-data]
 ```
 
@@ -624,7 +625,8 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands, the repository's data files installed and its objects re-signed as every pack signs them — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 | `--harness` | the recorded one | Record the harness whose bundle this and every later pack composes: `init` for the regular userspace init, `ktest` for the kernel-test harness |
-| `--svctest` | none | Stage the svctest boot with a fixture set: svctest's recipe and the set's fixture recipes copied from `config/svcmgr/tests/` into `config/svcmgr/services/`, every other fixture's recipe removed from it, the test class files of `config/devmgr/tests/` copied into `config/devmgr/classes/`, and the set's record written into the staged recipe's `env` line as `SVCTEST_FIXTURES`; `ci` stages every fixture, as the canonical svctest cells do, `burn-in` `memhog`, `reserve-creator` and `stopsrc`, as the burn-in cell does, and `none` no fixture; every set leaves oomd's and sessiond's recipes in place, which svctest requires; refused when a recipe the set needs is missing ([docs/testing.md](../docs/testing.md#gating) § Gating, svctest fixture sets) |
+| `--svctest` | none | Stage the svctest boot with a fixture set, on the services layer (below): svctest's recipe, sessiond's test recipe and the set's fixture recipes copied from `config/svcmgr/tests/` into `config/svcmgr/services/`, every other fixture's recipe removed from it, crashd's test recipe copied over the default one (no crashd at all for `crash-endpoint`), the test class files of `config/devmgr/tests/` copied into `config/devmgr/classes/`, and the set's record written into the staged recipe's `env` line as `SVCTEST_FIXTURES` (with `SVCTEST_PHASES` for a set that selects phases); `ci` stages every fixture, as the canonical svctest cells do, `burn-in` `memhog`, `reserve-creator` and `stopsrc`, as the burn-in cell does, `none` no fixture, and `crash-endpoint` no fixture and no crashd, with svctest running only its startup phases, `svctest_fixtures` and `crash_endpoint`; every set leaves oomd's recipe in place, which svctest requires; refused when a recipe the set needs is missing ([docs/testing.md](../docs/testing.md#gating) § Gating, svctest fixture sets) |
+| `--ubench` | `false` | Stage the ubench boot on the services layer, as `--svctest` stages svctest's: ubench's recipe copied from `config/svcmgr/tests/` into `config/svcmgr/services/`; conflicts with `--svctest` |
 | `--knob` | none | Stage a presence-only bootloader knob in `\EFI\seraph\`, repeatable or comma-separated: `nokaslr` boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; `mapredo` makes the first attempt of the bootloader's steps 6 and 7 redo whatever its memory map's size ([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md) § Sizing the Entry Array). Every knob not named is removed |
 | `--log-levels` | the repository's | Install `FILE` at `/config/init/log-levels.conf` in place of `services/init/log-levels.conf`; refused, before anything changes, unless init's parser (`services/init/log-levels`) accepts every line, since init ignores a line it refuses |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
@@ -639,11 +641,18 @@ it, and no `[devmgr] DEBUG ` or `[procmgr] DEBUG ` line, which `run --runs --req
 `--fail-also` match
 ([docs/testing.md](../docs/testing.md#log-levels-usertest-cell) § Log levels).
 
-Example — stage `svctest` as the canonical cells do and run it (`--repack-only` keeps the
-removal of the terminal and crashd; a plain repack would restore them):
+The services layer. `--svctest` and `--ubench` remove from `config/svcmgr/services/` every recipe
+that starts a file of the programs layer (the autostarted `terminal` among them) or another
+services-layer harness, and stage sessiond's test recipe (`config/svcmgr/tests/sessiond.svc`, whose
+session leader is the fixture `/tests/fixtures/programs/leader`) over the default one. The pack of a
+sysroot whose staged services hold `svctest.svc` or `ubench.svc` omits the programs layer from the
+image (`/programs/`, `/tests/programs/`, `/tests/usertest` and `/config/svcmgr/tests/usertest.svc`),
+so a later `--repack-only` keeps the omission and the boot runs no program.
+
+Example — stage `svctest` as the canonical cells do and run it (`--repack-only` keeps the staging;
+a plain repack would restore the removed recipes):
 
 ```sh
-rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --repack-only --svctest ci --arch x86_64
 cargo xtask run --arch x86_64 --test-devices
 ```
@@ -846,9 +855,11 @@ directory to each case. Each lane's output is echoed prefixed `[lane N]` and kep
 `target/xtask/lanes/<N>/lane.log`, with the lane's `test/` and `run/` logs copied beside it when
 the lane ends. The cell then reports each case's outcome, wall time and CPU time (its process's and
 its boots', from `/proc`, where the host has it) and each lane's, and fails naming the cases that
-failed. Around the lanes it records `sysroot/`, `symbols/`, the images and `target/xtask/signing/`
-of the checkout itself, and fails, naming each path, when a lane changed one: a case that wrote
-outside its copy fails the cell rather than racing another lane. `--lanes` above 1 refuses
+failed. A failed case's report line ends with the last `error:` line the case printed, so its
+cause reads from the report and not only from the lanes' interleaved output. Around the lanes it
+records `sysroot/`, `symbols/`, the images and `target/xtask/signing/` of the checkout itself, and
+fails, naming each path, when a lane changed one: a case that wrote outside its copy fails the cell
+rather than racing another lane. `--lanes` above 1 refuses
 `--alone` and `--timing`, which run a boot beside no other QEMU.
 
 CI (`.github/workflows/build-test.yml`) runs, in every cell after the cell's own boot, the
@@ -969,7 +980,10 @@ state. Asserts — host-side — the kernel's `entropy: VM generation change
 detected` marker and a post-resume interactive liveness round (`help` over
 QMP → `shell built-ins:` on serial). The case fails on a QMP error, a failed
 migration, or a timeout: 180 s per marker-wait phase, 120 s for the
-migrate-to-file poll, 30 s for the source to quit.
+migrate-to-file poll, 30 s for the source to quit. Each failure names its step
+(`setup`, `boot A`, `migrate to file`, `quit source`, `boot B`, `liveness`)
+and its cause: the QMP error, the timeout with its bound, or the markers
+awaited.
 
 ```sh
 cargo xtask build
@@ -1977,10 +1991,7 @@ and one of the userspace rows with:
 
 ```
 cargo xtask build --arch <a> [--release]
-cargo xtask mkdisk --arch <a> --harness init
-cp sysroot/config/svcmgr/tests/ubench.svc sysroot/config/svcmgr/services/
-rm sysroot/config/svcmgr/services/terminal.svc
-cargo xtask mkdisk --arch <a> --repack-only
+cargo xtask mkdisk --arch <a> --harness init --ubench
 cargo xtask run --arch <a> --icount --cpus 1 --runs 1 --display framebuffer \
     --save-logs target/pa-ref/user-<a>-<profile>
 cargo xtask build --arch <a> [--release] --limited-debug all
@@ -2117,7 +2128,8 @@ debug section is refused.
 `reclaim (resync): badge=<badge> name=<log name>`) gives the log name, read with
 `logd_codec::record::fields` (a quoted name is read whole and unescaped), and the image is the
 sysroot binary named by the log name's first word, searched in `services/`, `services/drivers/`,
-`services/fs/`, `programs/`, `tests/`, `tests/drivers/`, and `tests/programs/`, in that order. The
+`services/fs/`, `programs/`, `tests/`, `tests/drivers/`, `tests/fixtures/`,
+`tests/fixtures/programs/`, and `tests/programs/`, in that order. The
 binary is used only when its executable segments span exactly the block's `text` less its
 `load_bias`, the span procmgr records at spawn, so a binary rebuilt since the boot is refused
 rather than resolved against. Each block prints as:

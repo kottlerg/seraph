@@ -13,7 +13,7 @@
 //! (`services/svcmgr/docs/service-definitions.md` § `restart`), and the boot's
 //! other memhog windows spend them.
 //!
-//! 1. svctest's own `CREATE_FROM_FILE` of `/programs/hello`, which is outside
+//! 1. svctest's own `CREATE_FROM_FILE` of `/tests/fixtures/programs/spawn-target`, which is outside
 //!    the reserve, is refused with `OUT_OF_MEMORY`, and no other label:
 //!    svcmgr's memory wait for a restart holds only that label, so a create
 //!    outside the reserve that failed otherwise would be a hard failure there.
@@ -61,7 +61,7 @@ const CREATE_FAILED: u64 = 0xFF;
 /// The label recorded for a call that returned no reply.
 const NO_REPLY: u64 = u64::MAX;
 
-/// The file caps of `/programs/hello` each side looks up before the window,
+/// The file caps of `/tests/fixtures/programs/spawn-target` each side looks up before the window,
 /// and so the most creates it makes in one.
 const ATTEMPTS: usize = 4;
 
@@ -69,31 +69,31 @@ const ATTEMPTS: usize = 4;
 /// so memhog takes back what the destroy freed.
 const TAKE_BACK_TICKS: u64 = 3;
 
-/// The file caps of `/programs/hello` and their sizes, as `hello_file` returns
-/// them; `(0, 0)` for a cap spent or deleted.
+/// The file caps of `/tests/fixtures/programs/spawn-target` and their sizes, as `spawn_target_file`
+/// returns them; `(0, 0)` for a cap spent or deleted.
 type Files = [(u64, u64); ATTEMPTS];
 
-/// Look up [`ATTEMPTS`] file caps of `/programs/hello`.
+/// Look up [`ATTEMPTS`] file caps of `/tests/fixtures/programs/spawn-target`.
 fn lookup_files() -> Files
 {
     let mut files = [(0, 0); ATTEMPTS];
     for slot in &mut files
     {
-        *slot = super::procmgr::hello_file();
+        *slot = super::procmgr::spawn_target_file();
     }
     files
 }
 
-/// A raw `CREATE_FROM_FILE` of `/programs/hello` with `flags` added to the
+/// A raw `CREATE_FROM_FILE` of `/tests/fixtures/programs/spawn-target` with `flags` added to the
 /// label, from `file` of `size` bytes: procmgr's reply, or `None` when the
 /// call returned none. Allocates nothing.
-fn create_hello(file: u64, size: u64, flags: u64) -> Option<IpcMessage>
+fn create_spawn_target(file: u64, size: u64, flags: u64) -> Option<IpcMessage>
 {
     super::procmgr::create_call(
         std::os::seraph::startup_info().procmgr_endpoint,
         procmgr_labels::CREATE_FROM_FILE | flags,
         &[size],
-        super::procmgr::HELLO_PATH,
+        super::procmgr::SPAWN_TARGET_PATH,
         &[file],
     )
     .ok()
@@ -141,7 +141,7 @@ fn own_creates(files: &Files, labels: &mut [u64; ATTEMPTS]) -> usize
     for (&(file, size), slot) in files.iter().zip(labels.iter_mut())
     {
         made = made.saturating_add(1);
-        let label = match create_hello(file, size, 0)
+        let label = match create_spawn_target(file, size, 0)
         {
             Some(reply) =>
             {
@@ -416,7 +416,7 @@ fn reserve_create(files: &mut Files, next: &mut usize) -> u64
     };
     let (file, size) = core::mem::take(slot);
     *next = next.saturating_add(1);
-    let Some(reply) = create_hello(file, size, procmgr_labels::CREATE_RESERVE)
+    let Some(reply) = create_spawn_target(file, size, procmgr_labels::CREATE_RESERVE)
     else
     {
         std::os::seraph::log!(warn: "CREATE_FROM_FILE | CREATE_RESERVE returned no reply");

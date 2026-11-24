@@ -799,7 +799,7 @@ value_enum! {
     pub enum CrashReportExpect
     {
         /// The `crashme` fixture's `vm` and `exception` reports of its main
-        /// thread and its `worker` report of a spawned thread: a usertest boot
+        /// thread and its `worker` report of a spawned thread: a svctest boot
         /// with crashd staged.
         Reports,
         /// No report block: a boot of an image that stages no crashd.
@@ -834,16 +834,30 @@ args! {
         #[arg(long)]
         pub harness: Option<Harness>,
 
-        /// Stage the svctest boot with the fixture set SET: svctest's recipe
-        /// and the set's fixture recipes copied from `config/svcmgr/tests/`
-        /// into `config/svcmgr/services/`, every other fixture's recipe
-        /// removed from it, the test class files of `config/devmgr/tests/`
-        /// copied into `config/devmgr/classes/`, and the set's record written
-        /// into the staged recipe's `env` line as `SVCTEST_FIXTURES`, which
-        /// svctest checks the image against. Refused when a recipe the set
-        /// needs is missing.
+        /// Stage the svctest boot with the fixture set SET on the services
+        /// layer: every recipe that starts a program, or another
+        /// services-layer harness, removed from `config/svcmgr/services/`;
+        /// svctest's recipe, sessiond's test recipe, the set's fixture
+        /// recipes, and crashd's test recipe (no crashd for
+        /// `crash-endpoint`) copied into it from `config/svcmgr/tests/`, every
+        /// other fixture's recipe removed from it; the test class files of
+        /// `config/devmgr/tests/` copied into `config/devmgr/classes/`; and
+        /// the set's record written into the staged recipe's `env` line as
+        /// `SVCTEST_FIXTURES`, with `SVCTEST_PHASES` for a set that selects
+        /// phases, which svctest checks the image against. The pack then
+        /// leaves the programs layer out of the image. Refused when a recipe
+        /// the set needs is missing.
         #[arg(long, value_name = "SET")]
         pub svctest: Option<SvctestSet>,
+
+        /// Stage the ubench boot: ubench's recipe copied from
+        /// `config/svcmgr/tests/` into `config/svcmgr/services/` on the
+        /// services layer, as `--svctest` stages svctest's: every recipe that
+        /// starts a program, or another services-layer harness, removed, and
+        /// sessiond's test recipe staged over its default. The pack then
+        /// leaves the programs layer out of the image.
+        #[arg(long, conflicts_with = "svctest")]
+        pub ubench: bool,
 
         /// Stage a bootloader knob in `\EFI\seraph\`: `nokaslr` boots the
         /// kernel at its deterministic (un-randomized) layout, for GDB and

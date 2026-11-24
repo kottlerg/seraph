@@ -696,9 +696,9 @@ rings both notifications, so a reader drains the ring to EOF and a writer fails 
 
 `std::os::seraph::pipe::notification_sends` counts the notifications the calling thread's pipe
 ends have sent, and `std::os::seraph::pipe::waits` the times they found their ring empty or full
-and announced a wait, whether or not they then blocked; the pipestress tester's doorbell trial
-reports both
-([services/fixtures/pipestress/README.md](../../services/fixtures/pipestress/README.md) § Tester).
+and announced a wait, whether or not they then blocked; the svctest `pipestress` phase's doorbell
+trial reports both
+([services/fixtures/pipestress/README.md](../../services/fixtures/pipestress/README.md)).
 
 ---
 

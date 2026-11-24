@@ -29,13 +29,13 @@ of both its output streams. A tester still running at the bound is killed and re
 `<tester>: FAIL (no exit within <ms> ms)`, and the testers after it run. A tester that exits
 while a process it started holds its output open fails at the bound too, with nothing to kill.
 After a kill, the run waits five seconds more for the tester's end and its streams' close, and
-goes on without them, the reason naming what stayed open. The bound is 120000 ms, 2.6 times the
-slowest tester's worst pass (pipestress, 46 s on riscv64 debug). With the drain it holds a boot
-125 s, the added bound the usertest CI cells' budgets are derived with
-([docs/build-system.md](../../docs/build-system.md) § Continuous Integration), so a hung
-tester's FAIL line and the testers after it reach the log before the cell's budget ends the boot;
-a change to the bound or the drain re-derives those budgets. A missing, zero or non-numeric bound
-fails the run before any tester starts.
+goes on without them, the reason naming what stayed open. The bound is 4000 ms, 2.6 times the
+slowest tester's worst CI pass (shell, 1.46 s on riscv64 debug, over 97 runs), rounded up to a
+second. With the drain it holds a boot 9 s, below the 100 s added bound the CI cells' budgets are
+derived with ([docs/build-system.md](../../docs/build-system.md) § Continuous Integration), so a
+hung tester's FAIL line and the testers after it reach the log before the cell's budget ends the
+boot; a change to the bound or the drain that takes it past 100 s re-derives those budgets. A
+missing, zero or non-numeric bound fails the run before any tester starts.
 
 ---
 
@@ -50,10 +50,8 @@ tester a copy of each as its bootstrap caps
 `k` being the `k`-th slot its entry names. A tester with no entry gets no creator endpoint. A
 declaration that names slot 0, a slot past the eight, a tester twice, or a tester `TESTERS` does not
 name, or that does not parse, fails the run before any tester starts. The recipe declares
-`hello:1;crashme:2`: the hello tester takes `pwrmgr.deny` and checks that pwrmgr refuses it
-([programs/hello/README.md](../hello/README.md) § Tester), and the crashme tester takes
-`crashd.core` and asks the crash service for live cores
-([services/fixtures/crashme/README.md](../../services/fixtures/crashme/README.md)).
+`hello:1`: the hello tester takes `pwrmgr.deny` and checks that pwrmgr refuses it
+([programs/hello/README.md](../hello/README.md) § Tester).
 
 ---
 
@@ -69,10 +67,9 @@ programs/usertest/
 ```
 
 `usertest` ships no per-program testers itself. Each program under `programs/<name>/` may ship a
-tester at `programs/<name>/tester/`, and each fixture under `services/fixtures/<name>/` one at
-`services/fixtures/<name>/tester/`; the tester binary lands at `/tests/programs/<name>`, is named in
-the recipe's `TESTERS` (§ Testers), and is discovered at runtime, per [docs/testing.md § Per-program
-tester protocol](../../docs/testing.md#per-program-tester-protocol).
+tester at `programs/<name>/tester/`; the tester binary lands at `/tests/programs/<name>`, is named
+in the recipe's `TESTERS` (§ Testers), and is discovered at runtime, per [docs/testing.md §
+Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
 
 ---
 

@@ -1,31 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/fixtures/threadchurn/tester/src/main.rs
+// services/svctest/src/phases/threadchurn.rs
 
-//! Per-program tester for `/tests/fixtures/programs/threadchurn` (#240). Runs the fixture with
+//! svctest phase for `/tests/fixtures/programs/threadchurn` (#240). Runs the fixture with
 //! a piped stdout, demand-paged and then pinned, and asserts each run reports
-//! bounded CSpace-slot growth and exits cleanly. The exit code is the verdict;
-//! the `[threadchurn-tester]` line is advisory.
-
-#![expect(
-    clippy::expect_used,
-    reason = "a per-program tester is test code, where unwrap and expect are permitted \
-              (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait must \
-              abort the tester, and the panic's non-zero exit is its FAIL verdict"
-)]
+//! bounded CSpace-slot growth and exits cleanly.
 
 use std::io::Read;
 use std::os::seraph::process::CommandExt;
 use std::process::{Command, Stdio};
 
-fn fail(msg: &str) -> !
+use crate::bootstrap::Caps;
+use crate::runner::Phase;
+
+pub fn phases() -> &'static [Phase]
 {
-    println!("[threadchurn-tester] FAIL {msg}");
-    std::process::exit(1);
+    &[Phase {
+        name: "threadchurn",
+        run: threadchurn_phase,
+    }]
 }
 
-/// How the tester has procmgr create the fixture.
+/// How the phase has procmgr create the fixture.
 #[derive(Clone, Copy)]
 enum Paging
 {
@@ -38,14 +35,14 @@ enum Paging
     Pinned,
 }
 
-fn main()
+pub fn threadchurn_phase(_: &Caps)
 {
     run(Paging::Demand);
     run(Paging::Pinned);
-    println!("[threadchurn-tester] PASS");
+    std::os::seraph::log!("threadchurn phase passed");
 }
 
-/// Run the fixture as `paging` says and fail the tester unless it reports
+/// Run the fixture as `paging` says and fail the phase unless it reports
 /// `PASS` and exits cleanly.
 fn run(paging: Paging)
 {
@@ -73,19 +70,17 @@ fn run(paging: Paging)
         .expect("read stdout");
     let status = child.wait().expect("wait");
 
-    if out.lines().any(|l| l.contains("threadchurn: FAIL"))
-    {
-        fail(&format!("fixture{label} reported FAIL"));
-    }
-    if !out.lines().any(|l| l.contains("threadchurn: PASS"))
-    {
-        fail(&format!("fixture{label} PASS marker missing"));
-    }
-    if !status.success()
-    {
-        fail(&format!(
-            "fixture{label} exited non-zero: {:?}",
-            status.code()
-        ));
-    }
+    assert!(
+        !out.lines().any(|l| l.contains("threadchurn: FAIL")),
+        "threadchurn: fixture{label} reported FAIL"
+    );
+    assert!(
+        out.lines().any(|l| l.contains("threadchurn: PASS")),
+        "threadchurn: fixture{label} PASS marker missing"
+    );
+    assert!(
+        status.success(),
+        "threadchurn: fixture{label} exited non-zero: {:?}",
+        status.code()
+    );
 }

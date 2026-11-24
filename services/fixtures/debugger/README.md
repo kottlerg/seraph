@@ -7,17 +7,6 @@ and planting a breakpoint in its text.
 
 ---
 
-## Role
-
-The fixture's per-program tester, `debugger-tester`, runs it once, and the `usertest` orchestrator
-discovers and runs that tester. The fixture installs at `/tests/fixtures/programs/debugger` and the
-tester at `/tests/programs/debugger`, per [docs/testing.md § Per-program tester
-protocol](../../../docs/testing.md#per-program-tester-protocol). The fixture handles Seraph
-capabilities directly; the tester uses idiomatic `std` apart from the one Seraph extension that asks
-for a private image (§ Private images).
-
----
-
 ## Source Layout
 
 ```
@@ -34,10 +23,6 @@ debugger/
 │       │   └── mod.rs     # `int3`; single-step by the trap flag
 │       └── riscv64/
 │           └── mod.rs     # `ebreak`; single-step by `c.ebreak` at the successor
-└── tester/
-    ├── Cargo.toml
-    └── src/
-        └── main.rs        # Spawns the fixture and checks stdout and exit status
 ```
 
 ---
@@ -81,14 +66,27 @@ The text writes, of step 5 and of the riscv64 steps of step 2, succeed only beca
 its debuggee process have text frames of their own. procmgr shares a demand-paged process's text and
 read-only data with the other instances of its binary unless its creator asks for a private image
 ([services/procmgr/README.md § Image Sharing](../../procmgr/README.md#image-sharing)), and
-the kernel refuses a text write to a frame mapped more than once. So the tester creates the fixture,
+the kernel refuses a text write to a frame mapped more than once. So svctest creates the fixture,
 and the fixture its debuggee, with `CommandExt::private_image`
 (`procmgr_labels::CREATE_PRIVATE_IMAGE`). The GDB stub's target (`--gdb-target`) keeps the default,
 as a debugger meets most processes: the stub gives a page a copy of its own (`MAKE_PRIVATE`) before
 it writes a breakpoint there.
 
-The tester passes when the fixture prints `PASS` and exits cleanly; a failed step panics the
-fixture, a non-clean exit.
+The fixture handles Seraph capabilities directly. It prints `PASS` and exits cleanly when every
+step holds; a failed step panics it, a non-clean exit.
+
+---
+
+## Driven By
+
+The `debugger` phase of svctest (`services/svctest/src/phases/debugger.rs`) spawns
+`/tests/fixtures/programs/debugger` once with `CommandExt::private_image(true)` and stdout piped,
+reads its stdout to the end, and waits for it. It asserts:
+
+- a stdout line, trimmed, is `PASS`; otherwise the phase logs the stdout and panics with
+  `debugger: PASS marker missing`;
+- the exit status is a success; otherwise it panics with `debugger: exited non-clean` and the exit
+  code.
 
 ---
 
@@ -118,7 +116,7 @@ never exits; the host test kills QEMU.
 | [shared/riscv-step/README.md](../../../shared/riscv-step/README.md) | The successor decoder of the riscv64 step |
 | [core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md) | `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_POST_UPCALL`, `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM` |
 | [runtime/ruststd/README.md](../../../runtime/ruststd/README.md) | § Child process handles: `ChildExt::main_thread_cap` |
-| [docs/testing.md](../../../docs/testing.md) | § Per-program tester protocol, § GDB stub (`debug-port` case) |
+| [docs/testing.md](../../../docs/testing.md) | § GDB stub (`debug-port` case) |
 | [services/gdbstub/README.md](../../gdbstub/README.md) | The stub `--gdb-target` is the target of |
 
 ---

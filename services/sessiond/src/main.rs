@@ -70,9 +70,6 @@ const WAKE_DEATH: u64 = 1;
 /// takes `WAKE_INTERFACE + n`.
 const WAKE_INTERFACE: u64 = 2;
 
-/// The leader when the recipe passes no `argv[1]`.
-const DEFAULT_LEADER: &str = "/programs/shell";
-
 /// Priority level, and the band ceiling, of every leader: the least-trusted
 /// processes of the system, below the interface that serves them.
 const LEADER_PRIORITY: u8 = 5;
@@ -139,9 +136,14 @@ fn main() -> !
         std::os::seraph::log!(error: "no service endpoint");
         syscall::thread_exit();
     }
-    let leader = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_LEADER.to_owned());
+    // The leader is the recipe's to name: the image that holds sessiond need
+    // not hold any one program.
+    let Some(leader) = std::env::args().nth(1)
+    else
+    {
+        std::os::seraph::log!(error: "no leader: the recipe's argv names none");
+        syscall::thread_exit();
+    };
     touch_stack();
     let Some(sessiond) = Sessiond::start(endpoint, leader, ipc_buf)
     else

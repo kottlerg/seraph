@@ -3,9 +3,9 @@
 Fills memmgr's pool down to its growth floor, the system reserve and, while chunks are swapped, the
 restore headroom ([memmgr Memory Pool](../../services/memmgr/docs/memory-pool.md#eviction) §
 Eviction), for the test fixtures that drive the out-of-memory paths: the
-[`memhog`](../../services/fixtures/memhog/README.md) fixture, which oomd stops, and the `oom-fill`
-mode of [`crashme`](../../services/fixtures/crashme/README.md), beside whose `oom-touch` write
-crashd holds a fault.
+[`memhog`](../../services/fixtures/service-modes/README.md#memhog) fixture, which oomd stops, and
+the `oom-fill` mode of [`crashme`](../../services/fixtures/crashme/README.md), beside whose
+`oom-touch` write crashd holds a fault.
 
 ---
 

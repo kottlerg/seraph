@@ -3,7 +3,7 @@
 
 // services/svctest/src/phases/threadchurn.rs
 
-//! svctest phase for `/tests/fixtures/programs/threadchurn` (#240). Runs the fixture with
+//! svctest phase for `program-modes threadchurn` (#240). Runs the fixture with
 //! a piped stdout, demand-paged and then pinned, and asserts each run reports
 //! bounded CSpace-slot growth and exits cleanly.
 
@@ -46,20 +46,21 @@ pub fn threadchurn_phase(_: &Caps)
 /// `PASS` and exits cleanly.
 fn run(paging: Paging)
 {
-    let (label, mut command) = match paging
+    let mut command = Command::new(super::PROGRAM_MODES_PATH);
+    command.arg("threadchurn");
+    let label = match paging
     {
-        Paging::Demand => ("", Command::new("/tests/fixtures/programs/threadchurn")),
+        Paging::Demand => "",
         Paging::Pinned =>
         {
-            let mut command = Command::new("/tests/fixtures/programs/threadchurn");
             command.pinned(true);
-            (" (pinned)", command)
+            " (pinned)"
         }
     };
     let mut child = command
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn /tests/fixtures/programs/threadchurn");
+        .expect("spawn program-modes threadchurn");
 
     let mut out = String::new();
     child

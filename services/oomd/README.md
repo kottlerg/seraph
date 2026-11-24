@@ -73,10 +73,11 @@ the level, calls the sources and logs.
 `policy/`'s host tests cover each setting's parse, each step of the ladder (the grace, the cooldown,
 a fall below `CRITICAL`, an unreadable level, `OOMD_STOP=no`), the class codes and the stop order.
 The svctest `oom_policy` phase drives oomd end to end with the `memhog` fixture
-([services/fixtures/memhog/README.md](../fixtures/memhog/README.md)) and the `stopsrc` fixture
-([services/fixtures/stopsrc/README.md](../fixtures/stopsrc/README.md)), which the svctest boot
-stages: stopsrc restarts, so the source oomd finds started after oomd, and starts a job. svctest
-also opens an operator session whose leader, the `leader` fixture, runs
+([services/fixtures/service-modes/README.md#memhog](../fixtures/service-modes/README.md#memhog)) and
+the `stopsrc` fixture
+([services/fixtures/service-modes/README.md#stopsrc](../fixtures/service-modes/README.md#stopsrc)),
+which the svctest boot stages: stopsrc restarts, so the source oomd finds started after oomd, and
+starts a job. svctest also opens an operator session whose leader, the `leader` fixture, runs
 `/tests/fixtures/programs/crashme oom-hold 512`, a job larger than stopsrc's 64-page one. memhog
 fills the pool up to the reserve; oomd stops the crashme job after the grace, then stopsrc's job,
 then the session or sessions, then memhog, a cooldown apart; the session's relay gives the leader's

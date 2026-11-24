@@ -1,4 +1,4 @@
-# /tests/fixtures/crasher — deliberate-crash fixture for svcmgr's restart path.
+# /tests/fixtures/service-modes crasher — deliberate-crash fixture for svcmgr's restart path.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # Co-staged with svctest (services-surface harness) in CI and stageable
@@ -13,10 +13,10 @@
 # continues). A surface that fails to survive restart makes crasher log
 # `FATAL:`, which fails the run. Confined to a read-only `/tests` subtree to model the
 # min-privilege shape future real services use.
-binary    = /tests/fixtures/crasher
+binary    = /tests/fixtures/service-modes
 priority  = 5
 sched_max = 5
-argv      = crasher selftest
+argv      = service-modes crasher selftest
 env       = CRASHER_MARKER=107
 namespace = subtree:/tests:LOOKUP+READDIR+STAT+READ
 cwd       = /tests/fixtures

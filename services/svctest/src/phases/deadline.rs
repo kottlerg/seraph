@@ -3,7 +3,7 @@
 
 // services/svctest/src/phases/deadline.rs
 
-//! svctest phase for `/tests/fixtures/programs/deadline`. Spawns it once and asserts
+//! svctest phase for `program-modes deadline`. Spawns it once and asserts
 //! that it printed `PASS` and exited cleanly: its supervisor cancelled the
 //! spinning worker at the deadline with an asynchronous upcall, a call
 //! deadline ended its calls on an endpoint nobody receives on and a spawn
@@ -26,18 +26,17 @@ pub fn phases() -> &'static [Phase]
 
 pub fn deadline_phase(_: &Caps)
 {
-    let mut child = Command::new("/tests/fixtures/programs/deadline")
+    let mut child = Command::new(super::PROGRAM_MODES_PATH)
+        .arg("deadline")
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn /tests/fixtures/programs/deadline");
+        .expect("spawn program-modes deadline");
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut bytes = Vec::new();
     stdout
         .read_to_end(&mut bytes)
-        .expect("read /tests/fixtures/programs/deadline stdout");
-    let status = child
-        .wait()
-        .expect("wait /tests/fixtures/programs/deadline");
+        .expect("read program-modes deadline stdout");
+    let status = child.wait().expect("wait program-modes deadline");
     let out = String::from_utf8_lossy(&bytes);
     if !out.lines().any(|l| l.trim() == "PASS")
     {

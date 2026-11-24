@@ -2131,7 +2131,7 @@ fails as the search did, on any host. The run exits non-zero.
 | Tier | Where | When | Runs |
 |---|---|---|---|
 | Gating | CI, the `fuzz` job of `build-test.yml` | every push and pull request | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
-| Campaign | CI, `fuzz.yml` | weekly, and on a manual dispatch | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
+| Campaign | CI, `fuzz.yml` | a manual dispatch | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
 | Local | developer host | at will | `cargo xtask fuzz <target>` with `--runs` or `--time` |
 
 The self-test runs the engine on planted defects in `xtask/fuzz/targets` (an eight-byte magic

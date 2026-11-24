@@ -2270,10 +2270,15 @@ mod tests
         let img = build_image(ET_DYN, &std_dynamic());
         let (ehdr, _) = valid_executable(&img);
         let short = &img[..100];
+        let mut segments = load_segments(&ehdr, short);
         assert!(matches!(
-            load_segments(&ehdr, short).next(),
+            segments.next(),
             Some(Err(ElfError::PhdrTableOverflow))
         ));
+        assert!(
+            segments.next().is_none(),
+            "the iterator went on past a table that overflows the data"
+        );
         assert!(matches!(
             tls_segment(&ehdr, short),
             Err(ElfError::PhdrTableOverflow)
@@ -2685,10 +2690,14 @@ mod tests
 /// note-step proofs stand behind for the stack note's names. Each base holds
 /// two elements, not one, because a base of one and the step proofs leave out
 /// the loop carrying its state from one element to the next: an iterator's
-/// index and its stop after a refusal, the span carried, a search's stop at
-/// its first match. The base proves that carrying once, and the driving loops
-/// below repeat it. A base of one header costs nearly what two do, since a
-/// proof's cost lies in a header's symbolic fields. The reads that
+/// index past an element it skipped or yielded, the span carried, the dynamic
+/// walk's summary, and each stop a second element can follow (`load_span`'s
+/// at a `SegmentOverflow`, the first match of `tls_segment`, `relro_span`
+/// and `rela_table`'s dynamic header, the dynamic walk's at `DT_NULL`, and
+/// `validate_relative_relocs`'s at its first refused record). The base
+/// proves that carrying once, and the driving loops below repeat it. A base
+/// of one header costs nearly what two do, since a proof's cost lies in a
+/// header's symbolic fields. The reads that
 /// feed the walks are proven at any place: `read_phdr_at`, `read_shdr`,
 /// `read_shdr_streaming`, `slice_at` and `read_exact_at`. The header proof
 /// covers the header checks whole, a proof the record decode, and one
@@ -2700,7 +2709,13 @@ mod tests
 /// record iteration of `RelativeRelocIter` (`split_first_chunk`) and the
 /// counts of `validate_relative_relocs` and `apply_relative_relocs`; and the
 /// offset loop of `note_desc`. The fuzz target `elf` and the replay of the
-/// checked-in inputs check them on images of every length.
+/// checked-in inputs check them on images of every length. One stop is
+/// reached by neither the proofs nor the fuzz target: `LoadSegmentIter`'s end
+/// after a `PhdrTableOverflow`, which needs a header paired with data shorter
+/// than the one it was validated against, while both drivers hand each fold
+/// the data its header was accepted from. The unit test
+/// `header_paired_with_shorter_data_errs_instead_of_reading_past_it` checks
+/// it.
 #[cfg(kani)]
 mod proofs
 {

@@ -1085,6 +1085,80 @@ preemption count, the stack floor, the guard epoch and the flush counters are re
 before any CPU installs its per-CPU pointer. A read of another CPU's entry indexes the slab
 (`percpu::per_cpu_ptr`, `sched::scheduler_for`, `sched::cpu_diag`).
 
+## Return Work
+
+Every return to user mode owes some work only now and then: the stopped check of a thread a
+commit marked `Exited`, the deferred-reclaim drain, the sole-reference pass, the delivery of a
+pending upcall, and the wake preemption. Each CPU's `PerCpuData::return_work` word holds one
+bit per kind (`percpu::return_work`), and a return tests the bits it handles with one load,
+relative to the per-CPU pointer (`gs:[120]` on x86-64, `120(tp)` on riscv64,
+`PERCPU_RETURN_WORK_OFFSET`), and one branch. Only a set bit takes the return's out-of-line path,
+which clears the bits it handles with an Acquire `fetch_and` (`percpu::take_return_work`) and
+then runs every check of that return in full, each deciding from its own state as it did before
+the word existed. A bit says only that a check may find work.
+
+| Bit | Producer | CPU it posts |
+|---|---|---|
+| `STOPPED` | `commit_state_under_all_locks` committing `Exited`, and `dealloc_object(Thread)`'s `Exited` write, for a thread `current` on a CPU | that CPU, found under every CPU lock |
+| `RECLAIM` | `cap::object::push_deferred_reclaim` | its own |
+| `SOLE_REF` | a decrement that marks the sole-reference table or fires its observers (`KernelObjectHeader::dec_ref`), and a drain pass that leaves work | its own |
+| `UPCALL_SYSCALL`, `UPCALL_ANY` | `ipc::upcall::post` for a `Running`, unmasked target; `schedule()`'s dispatch of a thread with an unmasked upcall pending; the unmask (`upcall::set_mask`) | the target's `preferred_cpu`; the dispatching CPU; its own |
+| `PREEMPT` | a run-queue link, or a priority change's move (`relink`), that leaves a queued thread outranking the running one; `mark_level_stale`; the wake IPI's handler; a preemption the boot transient or a preemption-disabled window declined | the linked CPU; the CPU running the thread; the IPI's target; its own |
+
+The return points and the bits they handle:
+
+- A syscall's return (`syscall::finish_syscall`): every bit (`AT_SYSCALL`). Its out-of-line path
+  runs the stopped check, the deferred-reclaim drain with the sole-reference pass, the stopped check
+  again, the syscall delivery point, and the preemption decision. A restarted syscall is no
+  delivery point, so the upcall bits it took are posted again for the re-execution's return.
+- The return from an interrupt taken in user mode (`sched::interrupt_return_work`): `SOLE_REF`,
+  `UPCALL_ANY` and `PREEMPT` (`AT_INTERRUPT`): the sole-reference pass, the interrupt delivery
+  point and the preemption decision. `STOPPED`, `RECLAIM` and `UPCALL_SYSCALL` stay set for the
+  thread's next syscall.
+- The return from an exception taken in user mode (`sched::exception_return_work`): `PREEMPT`
+  (`AT_EXCEPTION`), and the interrupt return's work after a reschedule.
+
+Rules:
+
+1. A producer makes its work visible, then sets the bit with a Release `fetch_or`
+   (`percpu::post_return_work`, `percpu::post_return_work_to`); the take is an Acquire
+   `fetch_and`, so a check after a take that saw the bit sees the work. The one-load test is a
+   plain load of the aligned word: a bit it misses was set after it, and stays for a later return,
+   as a state probe that lagged the store did before.
+2. Only the CPU itself clears its bits, and only at a return to user mode, before the checks; a
+   bit set after the take stays for the next return. A check that leaves its work (a pass the budget
+   cut, a declined preemption) posts its bit again, and the path does not loop on it, so one return
+   does one round of each check. A syscall's return whose stopped check schedules the thread away
+   posts again the `RECLAIM` and `SOLE_REF` bits it took: the drain did not run for the stopped
+   thread, or re-queued the thread's own object, so the CPU's next return owes it.
+3. A reschedule inside the path can land the thread on another CPU. The path then takes that CPU's
+   bits and runs again while one is set (`sched::run_return_work`). The kinds that belong to the
+   thread rather than to a CPU follow it there: the dispatch posts a pending upcall, and an
+   `Exited` thread is never dispatched again.
+4. `STOPPED` is posted under every CPU lock, by the commit that found the thread `current`, to
+   every CPU that has it `current`: a CPU that claimed it in its voluntary-block window has it
+   `current` beside the parking CPU until that CPU's register save (§ Cross-CPU TCB Ownership).
+   With every CPU lock held, no other CPU makes it `current` before the posts, and it is never
+   dispatched again.
+5. An upcall's post and the dispatch flip both hold the target's `sched_lock`. The post finds the
+   thread `Running`, and posts the CPU the dispatch wrote in `preferred_cpu` under that lock, or
+   finds it not `Running`, and the later dispatch reads the pending upcall under the lock: the
+   dispatch flip, or the `next == current` re-mark of a thread re-selected while still
+   `current` (`sched::mark_dispatched`). A post to a `Running` thread that leaves the CPU before
+   the return leaves a bit the next thread's return clears in vain, and the thread's own dispatch
+   posts again.
+6. A link, and a priority change's move between one CPU's queues (`PerCpuScheduler::relink`),
+   posts `PREEMPT` when it leaves `non_empty & outranking` nonzero, under the linked CPU's
+   `scheduler.lock`. For a link the CPU makes itself that test is exact. A link another CPU makes
+   can read `outranking` before a dispatch on the linked CPU rewrites it, since the dispatch
+   records the level without that lock; every such link is followed by a wake IPI (§ Wake Protocol
+   Invariants), whose handler posts `PREEMPT` on arrival, so the return after it takes the full
+   decision with the link visible, as the IPI's return did when the test ran at every return.
+7. A sole-reference mark posts its own CPU's bit, and a pass that leaves work posts the bit of the
+   CPU that made it: every mark and every leftover is drained by a later return, or the idle loop,
+   on the CPU that made it, which is the bound capability-internals.md § Sole-Reference Observers
+   states.
+
 ---
 
 ## Wake Protocol Invariants
@@ -1338,7 +1412,7 @@ a defined purpose and correctness role.
 | Vector | Constant | Purpose | Handler | Correctness role |
 |---|---|---|---|---|
 | 250 | `IPI_VECTOR_TLB_SHOOTDOWN` | TLB invalidation cascade | Flushes per-CPU TLB entries staged by the issuer. | Required for rewrites that could strand a dangerous stale entry — unmap, permission narrowing, or frame replacement — where the stale entry would alias a freed/reused frame or grant revoked rights. Fresh maps and permission widenings skip the IPI and rely instead on the page-fault handler's spurious-fault retry (the live PTE already permits the access). See [memory-internals.md](memory-internals.md#smp-tlb-shootdown). |
-| 251 | `IPI_VECTOR_WAKEUP` | Wake target CPU from `hlt`, or reach a running CPU's return to user mode | EOI only (no work); `irq_dispatch`'s return to user mode then makes the wake-preemption check. | Required for the wake protocol's "always-IPI" invariant. The handler does no real work; the IPI's value is the trap entry itself, which exits `hlt` and re-enters the idle loop's check, or, taken in user mode, ends at the wake-preemption check (§ Wake Protocol Invariants, consumer side at a return to user mode). |
+| 251 | `IPI_VECTOR_WAKEUP` | Wake target CPU from `hlt`, or reach a running CPU's return to user mode | EOI, and posts its own CPU's `PREEMPT` return-work bit; it deschedules nothing itself, and `irq_dispatch`'s return to user mode then takes the full preemption decision (§ Return Work). | Required for the wake protocol's "always-IPI" invariant. The handler deschedules nothing; the IPI's value is the trap entry itself, which exits `hlt` and re-enters the idle loop's check, or, taken in user mode, ends at the return work's preemption decision (§ Wake Protocol Invariants, consumer side at a return to user mode). |
 
 ### riscv64
 
@@ -1347,9 +1421,9 @@ a defined purpose and correctness role.
 The riscv64 build uses one SBI IPI extension (EID `0x735049`, FID `0`) for both TLB shootdown and
 wakeup. The supervisor-mode trap handler distinguishes the two by side-channel state — the shootdown
 path scans the per-CPU TLB shootdown request slots and services any whose pending mask names this
-hart; a wakeup-only IPI finds no slot naming it and falls through with no work, exactly mirroring
-the x86_64 wakeup-vector handler, and `trap_dispatch` makes the wake-preemption check for a trap
-taken from U-mode. The request-slot protocol is specified in
+hart; a wakeup-only IPI finds no slot naming it and posts its own hart's `PREEMPT` return-work
+bit, exactly mirroring the x86_64 wakeup-vector handler, and `trap_dispatch` runs the return work
+for a trap taken from U-mode (§ Return Work). The request-slot protocol is specified in
 [memory-internals.md](memory-internals.md#smp-tlb-shootdown). The send (`sbi_send_ipi_to`) issues
 `fence rw, iorw` before the SBI ecall, so the request slot or run-queue link an IPI announces is
 visible to the target before it takes the interrupt (§ Wake Protocol Invariants, invariant 1).
@@ -1508,8 +1582,8 @@ the ordering choice is required for correctness; relaxations would introduce a r
   guard read — not for lock-free synchronisation. It is listed here for cross-reference only. The
   load-bearing reads of `state` outside `sched_lock` are the exceptions § Cross-CPU TCB Ownership
   enumerates, each sound only because `Exited` is monotone. One is the probe in
-  `running_thread_stopped` (the syscall epilogue and the object-teardown spins), a volatile read
-  that only decides whether to take
+  `running_thread_stopped` (the syscall epilogue's work path and the object-teardown spins), a
+  volatile read that only decides whether to take
   this CPU's `scheduler.lock` and confirm, never the outcome itself. A lagging probe delays
   detection by one spin iteration, or until the thread next enters the kernel; a same-CPU write is
   always observed.

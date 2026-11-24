@@ -422,17 +422,20 @@ fn claim_bucket(chains: &mut Chains, bucket: usize)
 /// has fired: each node back to its pool, then `(0, correlator)` to its
 /// queue, then the queue's reference the binding held released.
 ///
-/// Called by `drain_deferred_reclaim` after its reclaim, on the syscall
-/// epilogue and in the idle loop; by the idle loop again while
-/// [`work_pending`] holds and its run queues are empty; and by
-/// [`drain_at_interrupt`] at the end of every interrupt taken from user mode;
-/// with no lock held. The fired nodes a pass leaves stay marked for the next
-/// drain on any CPU, which a CPU running user code reaches at its next
-/// interrupt at the latest.
+/// Called by `drain_deferred_reclaim` after its reclaim, on a syscall's
+/// return work and in the idle loop; by the idle loop again while
+/// [`work_pending`] holds and its run queues are empty; and by the return
+/// work of an interrupt taken from user mode (`sched::interrupt_return_work`);
+/// with no lock held. A return reaches it when its CPU's
+/// `percpu::return_work::SOLE_REF` bit is set: a decrement on that CPU marked
+/// the table (`KernelObjectHeader::dec_ref`), or a pass on it left fired nodes
+/// ([`drain_pass`] posts the bit again), so every mark and every leftover is
+/// drained by a later return or idle pass on the CPU that made it, one pass
+/// per return, which a CPU running user code reaches at its next interrupt at
+/// the latest (core/kernel/docs/scheduling-internals.md § Return Work).
 ///
-/// Inline, it is one load and a branch when nothing is pending, since the
-/// syscall epilogue runs it on every syscall; the pass is [`drain_pass`],
-/// out of line.
+/// Inline, it is one load and a branch when nothing is pending; the pass is
+/// [`drain_pass`], out of line.
 ///
 /// # Safety
 /// No lock is held, and the context is one [`release_ref`] allows: syscall
@@ -454,11 +457,11 @@ pub unsafe fn drain()
     // earlier store to the same word or a later value; so the release is
     // claimed by this CPU's pass or by that one, either of which may post after
     // the releasing call returns, and the budget may leave the post to a later
-    // pass. A bit another CPU set and this load misses is drained by that CPU,
-    // whose next drain point (its own syscall return, its next interrupt from
-    // user mode, or its idle loop) sees its own store. So every leftover is
-    // drained within the bound that core/kernel/docs/capability-internals.md
-    // § Sole-Reference Observers states under The budget.
+    // pass, whose CPU posted its own return-work bit. A bit another CPU set and
+    // this load misses is drained by that CPU, whose return-work bit its mark
+    // set. So every leftover is drained within the bound that
+    // core/kernel/docs/capability-internals.md § Sole-Reference Observers
+    // states under The budget.
     if TABLE.summary.load(Ordering::Relaxed) != 0
     {
         // SAFETY: forwarded caller contract.
@@ -475,6 +478,14 @@ pub unsafe fn drain()
 unsafe fn drain_pass()
 {
     let mut node = TABLE.collect(POST_BUDGET);
+    if TABLE.work_pending()
+    {
+        // The budget left fired nodes, or a mark landed meanwhile: this CPU's
+        // next return to user mode makes another pass.
+        // SAFETY: the contract of drain: kernel context on a CPU whose
+        // per-CPU pointer is installed.
+        unsafe { crate::percpu::post_return_work(crate::percpu::return_work::SOLE_REF) };
+    }
     while !node.is_null()
     {
         #[expect(
@@ -520,25 +531,6 @@ unsafe fn drain_pass()
 pub fn work_pending() -> bool
 {
     TABLE.work_pending()
-}
-
-/// One [`drain`] pass when the table has work, at the end of an interrupt
-/// taken from user mode. A CPU that runs only user code makes no syscall and
-/// never idles, so this is where it posts what earlier passes left: one pass,
-/// at most `POST_BUDGET` posts, per tick. Costs [`drain`]'s one load when
-/// nothing is pending.
-///
-/// # Safety
-/// The end of an interrupt handler taken from user mode, the interrupt
-/// acknowledged, on the interrupted thread's kernel stack; no lock is held,
-/// interrupts disabled.
-#[cfg(not(test))]
-#[inline]
-pub unsafe fn drain_at_interrupt()
-{
-    // SAFETY: an interrupt's end on the interrupted thread's kernel stack, no
-    // lock held, interrupts disabled (contract): a context drain allows.
-    unsafe { drain() };
 }
 
 #[cfg(test)]

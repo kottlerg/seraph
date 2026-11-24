@@ -2288,6 +2288,23 @@ mod tests
         assert_eq!(rela_table(&ehdr, short), Err(ElfError::PhdrTableOverflow));
     }
 
+    #[test]
+    fn a_table_resolved_past_the_header_table_is_refused()
+    {
+        // A table of two headers whose first, `PT_DYNAMIC`, is the image's
+        // last 56 bytes: the dynamic walk finds it at index 0, and the search
+        // for the `PT_LOAD` holding the relocation table reaches index 1,
+        // past the data. That must be refused, not ended as if no header
+        // held the table.
+        let mut img = build_image(ET_DYN, &std_dynamic());
+        let (mut ehdr, _) = valid_executable(&img);
+        let dynamic: [u8; 56] = img[64 + 112..64 + 168].try_into().unwrap();
+        put(&mut img, FILE_SIZE - 56, &dynamic);
+        ehdr.e_phoff = (FILE_SIZE - 56) as u64;
+        ehdr.e_phnum = 2;
+        assert_eq!(rela_table(&ehdr, &img), Err(ElfError::PhdrTableOverflow));
+    }
+
     // ── Note locator ────────────────────────────────────────────────────────
 
     /// Section name string table of a note-carrying image: the null name,
@@ -2709,13 +2726,15 @@ mod tests
 /// record iteration of `RelativeRelocIter` (`split_first_chunk`) and the
 /// counts of `validate_relative_relocs` and `apply_relative_relocs`; and the
 /// offset loop of `note_desc`. The fuzz target `elf` and the replay of the
-/// checked-in inputs check them on images of every length. One stop is
-/// reached by neither the proofs nor the fuzz target: `LoadSegmentIter`'s end
-/// after a `PhdrTableOverflow`, which needs a header paired with data shorter
-/// than the one it was validated against, while both drivers hand each fold
-/// the data its header was accepted from. The unit test
-/// `header_paired_with_shorter_data_errs_instead_of_reading_past_it` checks
-/// it.
+/// checked-in inputs check them on images of every length. Neither driver
+/// reaches a program-header walk's exit at a `PhdrTableOverflow`, which needs
+/// a header paired with data that does not hold the table it was validated
+/// against, while both hand each walk the data its header was accepted from.
+/// Unit tests check those exits: the end of `LoadSegmentIter` and the exits
+/// of `tls_segment`, `load_span`, `relro_span` and `find_dynamic_phdr` in
+/// `header_paired_with_shorter_data_errs_instead_of_reading_past_it`, and
+/// that of `resolve_rela_table` in
+/// `a_table_resolved_past_the_header_table_is_refused`.
 #[cfg(kani)]
 mod proofs
 {

@@ -237,11 +237,11 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   no swap service is registered.
 /// * `data[16]` — `draw_room_bytes`: the free pages a fault on a committed
 ///   page of a process outside the system reserve may take now: all of
-///   `data[3]` while no swap slot is registered or `data[3]` covers
-///   `data[8]`, else those above the growth floor, `data[11]`. memmgr declines such a
-///   fault as a commit overrun (decline code 11) when it finds none. The
-///   draw room is open at [`DEMAND_CHUNK_BYTES`] or more, room for any one
-///   committed draw (a fault's, or the restore of a committed chunk), and a
+///   `data[3]` while no swap slot is registered, else those above the
+///   growth floor, `data[11]`. memmgr declines such a fault as a commit
+///   overrun (decline code 11) when it finds none. The draw room is open at
+///   [`DEMAND_CHUNK_BYTES`] or more, room for any one committed draw (a
+///   fault's, or the restore of a committed chunk), and a
 ///   [`REGISTER_PRESSURE`] draw-room bit says it opened.
 /// * `data[17]` — `uncommitted_free_bytes`: the free pages outside
 ///   `promised`, which a charge that takes frames now may take and the

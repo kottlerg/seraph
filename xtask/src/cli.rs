@@ -268,6 +268,8 @@ impl CliCommand
             | Self::KtestTiming(_)
             | Self::BenchCheck(_)
             | Self::BenchBaseline(_)
+            // A trace compiles the plugin before it boots, and its entry point
+            // admits the compile as a build.
             | Self::PathAccount(_)
             | Self::Symbolize(_)
             | Self::Mkdisk(_)

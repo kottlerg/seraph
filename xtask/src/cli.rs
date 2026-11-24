@@ -22,6 +22,7 @@ use crate::esp::Knob;
 use crate::qemu::{
     DiskLine, Execution, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
 };
+use crate::svctest_stage::SvctestSet;
 
 args! {
     /// Top-level CLI entry point.
@@ -820,6 +821,17 @@ args! {
         #[arg(long)]
         pub harness: Option<Harness>,
 
+        /// Stage the svctest boot with the fixture set SET: svctest's recipe
+        /// and the set's fixture recipes copied from `config/svcmgr/tests/`
+        /// into `config/svcmgr/services/`, every other fixture's recipe
+        /// removed from it, the test class files of `config/devmgr/tests/`
+        /// copied into `config/devmgr/classes/`, and the set's record written
+        /// into the staged recipe's `env` line as `SVCTEST_FIXTURES`, which
+        /// svctest checks the image against. Refused when a recipe the set
+        /// needs is missing.
+        #[arg(long, value_name = "SET")]
+        pub svctest: Option<SvctestSet>,
+
         /// Stage a bootloader knob in `\EFI\seraph\`: `nokaslr` boots the
         /// kernel at its deterministic (un-randomized) layout, for GDB and
         /// symbolization; `mapredo` makes the bootloader redo the first
@@ -841,10 +853,12 @@ args! {
         #[arg(long, default_value = "512")]
         pub block_size: BlockSize,
 
-        /// Author the data partition alone on a second image, `disk-data.img`,
-        /// and only the ESP, root and swap partitions on `disk.img`; boot the pair
-        /// with `--second-disk disk-data.img`. Without it `disk.img` carries all
-        /// four and a `disk-data.img` an earlier authoring left is removed.
+        /// Author the data and swap partitions on a second image, `disk-data.img`,
+        /// and only the ESP and root partitions on `disk.img`, and stage the storage
+        /// statement naming the two; boot the pair with `--second-disk
+        /// disk-data.img`. Without it `disk.img` carries all four, and the statement
+        /// the split layout staged and a `disk-data.img` an earlier authoring left
+        /// are removed.
         #[arg(long)]
         pub split_data: bool,
     }
@@ -1210,6 +1224,10 @@ value_enum! {
         Vmgenid,
         /// PCI Express hotplug of a device and of a disk behind root ports.
         Hotplug,
+        /// vfsd gives each storage role to the boot disk or to the partition
+        /// the signed storage statement names, and none to a foreign disk or a
+        /// copy of the boot disk.
+        StorageRoles,
         /// The kernel's CET supervisor shadow stacks, under KVM (`x86_64`
         /// only).
         Cet,

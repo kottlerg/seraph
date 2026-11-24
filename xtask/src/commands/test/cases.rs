@@ -124,7 +124,7 @@ pub fn case(case: TestCase) -> Case
     use super::dma_confinement;
     use super::{
         cet, debug_port, enrolment, hotplug, kaslr, rollback, secureboot, shutdown, signing,
-        terminal, tpm, vmgenid, wedge,
+        storage_roles, terminal, tpm, vmgenid, wedge,
     };
     match case
     {
@@ -222,6 +222,16 @@ pub fn case(case: TestCase) -> Case
             options: &[],
             weight: None,
             run: hotplug::run,
+        },
+        // The split layout's boot, then one beside each of a foreign disk above
+        // the boot disk's priority, one at it, and a copy of the boot disk.
+        TestCase::StorageRoles => Case {
+            arches: &[(Arch::X86_64, 4), (Arch::Riscv64, 4)],
+            bundle: Harness::Init,
+            cell: Cell::Ci(Tester::Usertest),
+            options: &[],
+            weight: Some(240),
+            run: storage_roles::run,
         },
         // The ktest boot on shadow stacks, then the corrupted return.
         TestCase::Cet => Case {
@@ -671,6 +681,7 @@ mod tests
                 Secureboot,
                 Wedge,
                 Vmgenid,
+                StorageRoles,
                 Shutdown
             ]
         );
@@ -684,6 +695,7 @@ mod tests
                 Enrolment,
                 Secureboot,
                 Wedge,
+                StorageRoles,
                 Shutdown
             ]
         );

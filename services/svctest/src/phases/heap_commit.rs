@@ -14,10 +14,11 @@
 //! ([`limited_child_main`]), whose `try_reserve` past the max returns `Err`
 //! and which keeps running, and a `heap-commit-hog` ([`hog_main`]), which
 //! commits all but [`HOG_MARGIN_PAGES`] of what the free frames can still
-//! back ([`uncommitted_available`]), sees a best-effort grant of one page past
-//! what memmgr may grant a node outside the reserve ([`grant_room`]) refused
-//! although free pages exist, and touches every page it committed with no
-//! fault declined. Each child's charge leaves
+//! back ([`uncommitted_available`]), its commitments' page-table reservations
+//! and metadata bounds counted ([`commit_to_margin`]), sees a best-effort
+//! grant of one page past what memmgr may grant a node outside the reserve
+//! ([`grant_room`]) refused although free pages exist, and touches every page
+//! it committed with no fault declined. Each child's charge leaves
 //! svctest's budget subtree before the phase goes on, memmgr's free and
 //! promised totals, each net of eviction, then return to their levels
 //! ([`PoolLevels`]), and the all-RAM-accounted identity holds.
@@ -108,6 +109,16 @@ pub(crate) const HOG_BALLAST_FAILED: i32 = 6;
 /// Exit code: memmgr refused the release of a grant it admitted past what
 /// was left, or its grant reply had no valid layout.
 const HOG_RELEASE_FAILED: i32 = 7;
+/// Exit code: a commitment the hog made within what the free frames could
+/// still back ([`uncommitted_available`]) left them short of `promised` and
+/// the growth floor, so memmgr promised it past the free frames.
+pub(crate) const HOG_PAST_FRAMES: i32 = 8;
+
+/// Pages past an allocation's own that the heap's committed region can grow
+/// by to hold it: the growth is a whole number of chunks and covers the
+/// allocation's header beside its bytes (docs/userspace-memory-model.md
+/// § Byte Heap), so at most two chunks more.
+const HEAP_GROWTH_SLACK_PAGES: u64 = 2 * CHUNK_PAGES;
 
 /// Pages of one memmgr demand chunk, the unit `SHRINK_REGION` and
 /// `DISCARD_RANGE` take.
@@ -619,7 +630,9 @@ fn run_hog()
          {HOG_NOT_COMMITTED}=it did not commit down to its margin, {HOG_GRANT_NOT_REFUSED}=a grant \
          past what is left was admitted in every attempt, {HOG_NO_FREE_PAGES}=the refusal showed no free \
          pages, {HOG_BALLAST_FAILED}=its ballast's allocation failed, \
-         {HOG_RELEASE_FAILED}=the release of a grant admitted past what was left failed, a fault=a fault on a committed page was declined"
+         {HOG_RELEASE_FAILED}=the release of a grant admitted past what was left failed, \
+         {HOG_PAST_FRAMES}=its commitment ran past the free frames, a fault=a fault on a committed \
+         page was declined"
     );
 }
 
@@ -741,10 +754,60 @@ fn grant_room() -> u64
     }
 }
 
+/// The most pages a committed region may have for its commitment to take at
+/// most `budget` of the pages a commitment may still promise: its data pages,
+/// its page-table reservation and its metadata bound together
+/// (`free_pool::commit::grow_need`; services/memmgr/docs/memory-pool.md
+/// § Commit). The two bounds grow with the region, so on a large pool they
+/// outgrow any fixed margin.
+pub(crate) fn commit_fitting(budget: u64) -> u64
+{
+    let takes =
+        |pages: u64| free_pool::commit::grow_need(0, pages.saturating_mul(PAGE_SIZE)).promised();
+    // A commitment takes at least its pages, so the answer is at most
+    // `budget`; `takes` grows with the pages, so halve the range between.
+    let (mut lo, mut hi) = (0u64, budget);
+    while lo < hi
+    {
+        let mid = lo.saturating_add(hi.saturating_sub(lo).div_ceil(2));
+        if takes(mid) <= budget
+        {
+            lo = mid;
+        }
+        else
+        {
+            hi = mid.saturating_sub(1);
+        }
+    }
+    lo
+}
+
+/// The most pages a heap allocation may ask so that what it adds to memmgr's
+/// `promised` is at most `room` pages: the growth of the heap's committed
+/// region that holds it, at most [`HEAP_GROWTH_SLACK_PAGES`] more than its
+/// pages, with that growth's page-table reservation and metadata bound
+/// ([`commit_fitting`]), and one arena page, more than the directory nodes
+/// that extending a longer region can add beyond those of a region of the
+/// growth's length alone. 0 when not even one page fits.
+fn pages_within(room: u64) -> u64
+{
+    commit_fitting(room.saturating_sub(1)).saturating_sub(HEAP_GROWTH_SLACK_PAGES)
+}
+
 /// Commit blocks into `held` until what the free frames can still back
 /// ([`uncommitted_available`]) is at most [`HOG_MARGIN_PAGES`], spending
 /// reservation attempts from `rounds`, and return what is then left; exit with
-/// [`HOG_NOT_COMMITTED`] when `rounds` runs out first.
+/// [`HOG_NOT_COMMITTED`] when `rounds` runs out first. Each block asks at
+/// most what keeps its whole commitment, page-table reservation and metadata
+/// bound included ([`pages_within`]), within all but half the margin of what
+/// is left, so the blocks stay within the free frames above the growth floor
+/// and every fault on them finds a free frame above the floor
+/// (services/memmgr/docs/memory-pool.md § Commit, Overcommit). Past the free
+/// frames memmgr promises from its overcommit allowance while a swap service
+/// has registered slots, and a fault there waits on write-out to swap, a
+/// commit overrun that only crashd's hold survives; so a commitment that
+/// leaves the free frames short of `promised` and the growth floor exits
+/// with [`HOG_PAST_FRAMES`].
 pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u64
 {
     let mut ask = u64::MAX;
@@ -756,11 +819,12 @@ pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u
             return available;
         }
         *rounds = rounds.saturating_sub(1);
-        ask = ask.min(available.saturating_sub(HOG_MARGIN_PAGES / 2));
+        ask = ask.min(pages_within(available.saturating_sub(HOG_MARGIN_PAGES / 2)));
         let mut block: Vec<u8> = Vec::new();
         if block.try_reserve_exact(page_bytes(ask)).is_ok()
         {
             held.push(block);
+            within_frames();
         }
         else
         {
@@ -768,6 +832,22 @@ pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u
         }
     }
     exit(HOG_NOT_COMMITTED)
+}
+
+/// Exit with [`HOG_PAST_FRAMES`] when memmgr's free pages are fewer than
+/// `promised` and the growth floor together, and with [`HOG_STATUS_FAILED`]
+/// when the status call fails or is refused.
+fn within_frames()
+{
+    let Some((free, promised, floor)) = pool_totals()
+    else
+    {
+        exit(HOG_STATUS_FAILED)
+    };
+    if free < promised.saturating_add(floor)
+    {
+        exit(HOG_PAST_FRAMES);
+    }
 }
 
 /// Ask memmgr for a best-effort grant of one page more than it may grant a

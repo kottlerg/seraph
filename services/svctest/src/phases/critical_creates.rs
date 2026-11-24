@@ -27,15 +27,16 @@
 //!    fault inside the window, is held and made: its next instance answers
 //!    after the window with a new nonce.
 //!
-//! Check 2 runs when `reserve-creator.svc` is staged, check 3 when
-//! `crasher-worker.svc` is. Everything the window needs is allocated before it
+//! Check 2 runs when the staged fixture set declares `reserve-creator`,
+//! check 3 when it declares `crasher-worker` ([`super::fixtures`]); each
+//! check left out logs the skip line. Everything the window needs is allocated before it
 //! ([`Checks::prepare`]), and the window's steps ([`Checks::creates`],
 //! [`Checks::fault_worker`]) allocate nothing and log nothing.
 
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels, restart_probe_labels as probe};
+use svctest_fixtures::Fixture;
 
-/// The recipe that starts the reserve-creator fixture, when it is staged.
-const RESERVE_RECIPE: &str = "/config/svcmgr/services/reserve-creator.svc";
+use super::fixtures;
 
 /// The name the reserve-creator fixture provides.
 const RESERVE_NAME: &[u8] = b"svctest.reserve";
@@ -190,7 +191,7 @@ impl Checks
     pub(super) fn prepare(phase: &str) -> Self
     {
         let files = lookup_files();
-        let creator = super::svcmgr::recipe_staged(RESERVE_RECIPE, phase).then(|| {
+        let creator = fixtures::staged(Fixture::ReserveCreator).then(|| {
             let fixture = super::svcmgr::provided_endpoint(RESERVE_NAME, phase);
             let label = call_label(fixture, PREPARE);
             assert_eq!(
@@ -199,7 +200,7 @@ impl Checks
             );
             fixture
         });
-        let worker = super::svcmgr::worker_fixture_staged(phase).then(|| {
+        let worker = fixtures::staged(Fixture::CrasherWorker).then(|| {
             let fixture = super::svcmgr::worker_fixture(phase);
             let nonce = super::svcmgr::probe_nonce(fixture, phase, "first PROBE_INSTANCE");
             (fixture, nonce)
@@ -297,6 +298,14 @@ impl Checks
             shown(self.creator.is_some()),
             shown(self.worker.is_some())
         );
+        if self.creator.is_none()
+        {
+            fixtures::skip(phase, Fixture::ReserveCreator);
+        }
+        if self.worker.is_none()
+        {
+            fixtures::skip(phase, Fixture::CrasherWorker);
+        }
     }
 }
 

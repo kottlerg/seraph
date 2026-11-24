@@ -66,11 +66,15 @@ labels live in `ipc::vfsd_labels` in `shared/ipc`.
 
 ## Label 10: `MOUNT`
 
-Runtime explicit-mount surface (foreign-GUID disks, user-invoked
-mounts). vfsd self-mounts root, `/esp`, and `/data` at startup through
-the same resolution path; the only in-tree caller is svctest, whose
-cases drive the rejection paths below and mount the data partition again
-after an `UNMOUNT`, at `/data` and elsewhere. The caller's badge MUST carry
+Mounts the root or the data role at a path, resolved as the startup
+self-mount resolves it: on the boot disk, or, for a data path the storage
+statement names, its named partition
+([docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)). vfsd
+self-mounts root, `/esp`, and the data paths at startup through the same
+resolution path; the in-tree callers are test fixtures alone: svctest,
+whose cases drive the rejection paths below and mount the data partition
+again after an `UNMOUNT`, at `/data` and elsewhere, and the
+`hotplug-check` disk fixture. The caller's badge MUST carry
 `MOUNT_AUTHORITY`: vfsd replies `UNAUTHORIZED` otherwise, before it
 reads the request.
 
@@ -78,12 +82,14 @@ Mount the partition identified by a Seraph-minted GPT type GUID at the
 given path. vfsd resolves the role byte to a type GUID (arch-conditional
 for the root role, arch-neutral for data; see
 [`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
-looks the partition up across the parsed GPT tables of every disk it
-holds and has not marked removed via
-[`gpt::lookup_partition_by_type_guid`](../gpt/src/lib.rs)
-(DPS-style priority tie-break on attribute bits 48-63, run across disks;
-a tie at the highest priority, on one disk or across disks, is rejected
-with `NO_MOUNT` (fatal only for the root self-mount); see
+resolves the partition with `resolve_role` in
+[`services/vfsd/src/main.rs`](../src/main.rs): the partition the signed
+storage statement names for the role on a disk it holds and has not marked
+removed ([`gpt::resolve_named`](../gpt/src/lib.rs)), else the boot disk's
+partition of the type GUID
+([`gpt::lookup_on_disk`](../gpt/src/lib.rs); DPS-style priority
+tie-break on attribute bits 48-63, on the boot disk alone; a tie at the
+highest priority is rejected with `NO_MOUNT` (fatal only for the root self-mount); see
 [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)),
 registers the partition bound with the virtio-blk instance of the disk
 that holds it, spawns a fatfs driver, sends `FS_MOUNT` (see
@@ -98,11 +104,11 @@ point, or on a path with a component the namespace protocol cannot name, is
 rejected (`TABLE_FULL`) before any partition is registered or driver
 spawned. Before the role lookup vfsd queries devmgr for the block devices
 it served since vfsd's last query (from the first instance ordinal not yet
-queried) and holds them, so the role resolves across every disk devmgr
-serves, under the priority and tie rules of
+queried) and holds them, so a partition the statement names resolves on
+any disk devmgr serves, under the rules of
 [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery): a disk
-added or inserted again after startup is found, and its partition wins or
-ties against those of the disks held before it. A partition is mounted
+added or inserted again after startup is found, and takes a role only by
+the statement; it is not ranked against the boot disk's partitions. A partition is mounted
 once: a mount of a partition a mount holds, at another path, one
 restarting or whose removal is under way included, is rejected (`TABLE_FULL`) before any
 driver is spawned, so no two drivers serve one partition. A mount that
@@ -116,16 +122,18 @@ registered for it stays in virtio-blk's table, which has no unregister
 request.
 
 When the requested role is the rootfs (`MountRole::Root`, byte `0`),
-vfsd additionally auto-mounts the EFI System Partition at `/esp` and
-the data partition at `/data` inside the same handler before replying —
-the same logic the startup self-mount uses. Both auto-mounts are
-best-effort: a missing or duplicate-priority partition logs a
-diagnostic and is skipped (leaving `/esp` / `/data` to resolve through
-the root-fs fall-through) without propagating into the root mount
-reply (see [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
-The ESP is identified by the standard EFI System Partition type
-GUID (`c12a7328-f81f-11d2-ba4b-00a0c93ec93b`); the data partition by
-the arch-neutral `SERAPH_DATA` GUID.
+vfsd additionally reads the storage statement and auto-mounts the boot
+ESP at `/esp`, each data partition the statement names at its path, and,
+unless the statement names one for `/data`, the boot disk's data
+partition at `/data`, inside the same handler before replying — the
+same logic the startup self-mount uses. Every auto-mount is
+best-effort: a partition that is missing, tied, or not taken logs a
+diagnostic and is skipped (leaving its path to resolve through the
+root-fs fall-through) without propagating into the root mount reply
+(see [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
+The ESP is the partition the bootloader's HardDrive descriptor names on
+the boot disk; the boot disk's data partition is its partition of the
+arch-neutral `SERAPH_DATA` type GUID.
 
 **Request**
 
@@ -253,8 +261,9 @@ reads and writes the partition's blocks, and no block outside it
 MUST carry `SWAP_AUTHORITY`: vfsd replies `UNAUTHORIZED` otherwise, before it checks the version
 word.
 
-The first request that finds the partition looks the role up across every held disk (the same
-lookup and tie-break as `MOUNT`), registers the partition's range with that disk's block driver,
+The first request that finds the partition resolves the role (the same
+resolution as `MOUNT`: the statement's `swap` line, else the boot disk by type GUID and
+priority), registers the partition's range with that disk's block driver,
 and keeps the partition cap the driver returns for vfsd's life. vfsd's startup does none of this,
 so a disk with no swap partition is a supported configuration: vfsd boots and mounts as it would
 otherwise, and each request then replies `NO_MOUNT`. A lookup or registration that fails keeps

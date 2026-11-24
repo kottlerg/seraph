@@ -19,9 +19,14 @@ boot-protocol = { path = "../../abi/boot-protocol" }
 gpt = { path = "gpt", package = "vfsd-gpt" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
+# The walk to the storage statement.
+ns-client = { path = "../../shared/ns-client" }
 # Pure host-tested synthetic-root tree (`VfsdRootBackend`); the `root_backend`
 # key keeps the in-crate path the module name it replaced.
 root_backend = { path = "root-backend", package = "vfsd-root-backend" }
+# The storage statement's format (`/config/vfsd/storage.conf`), shared with
+# xtask, which stages one.
+storage-statement = { path = "../../shared/storage-statement" }
 # Pure host-tested swap-partition hand-out (`GET_SWAP_PARTITION`'s decisions).
 swap = { path = "swap", package = "vfsd-swap" }
 syscall = { path = "../../shared/syscall" }

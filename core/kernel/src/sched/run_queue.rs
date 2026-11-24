@@ -890,9 +890,12 @@ impl PerCpuScheduler
     }
 
     /// Record `tcb` as the currently running thread on this CPU. Called by
-    /// `init` on the boot CPU before any CPU schedules, and by `sched::enter`
-    /// for CPU 0 without `lock` (its boot dispatch of init, before CPU 0 first
-    /// schedules), then only by this CPU, under `lock`.
+    /// `init` on the boot CPU before any CPU schedules, beside
+    /// `percpu::init_current_thread`, and otherwise only through
+    /// `sched::set_running`, which also stores this CPU's
+    /// `PerCpuData::current`: by `sched::enter` for CPU 0 without `lock` (its
+    /// boot dispatch of init, before CPU 0 first schedules), then only by this
+    /// CPU, under `lock`.
     pub fn set_current(&self, tcb: *mut ThreadControlBlock)
     {
         self.current.store(tcb, Ordering::Relaxed);

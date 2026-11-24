@@ -62,7 +62,7 @@ program:
   svcmgr's stop authority, stops a session's job, then a whole session, before any service that
   opted in, when memory stays critical ([services/oomd/README.md](../services/oomd/README.md)).
   The `stopsrc` test fixture is a second source of the class, staged in the svctest boot
-  ([services/fixtures/stopsrc/README.md](../services/fixtures/stopsrc/README.md)).
+  ([service-modes § stopsrc](../services/fixtures/service-modes/README.md#stopsrc)).
 
 ---
 

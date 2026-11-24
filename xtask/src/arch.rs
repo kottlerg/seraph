@@ -70,15 +70,43 @@ impl Arch
     }
 
     /// Rust target triple for the UEFI bootloader.
-    ///
-    /// `core/boot/build.rs` matches the riscv64 name exactly to decide
-    /// whether to pass the linker script; rename both together.
     pub fn boot_target_triple(self) -> &'static str
     {
         match self
         {
             Arch::X86_64 => "x86_64-unknown-uefi",
             Arch::Riscv64 => "riscv64imac-seraph-uefi",
+        }
+    }
+
+    /// The kernel's linker script, relative to the project root.
+    ///
+    /// `cargo xtask build` passes it to the kernel's link as `-T`, and
+    /// `core/kernel/src/main.rs` includes it, so that a change to it
+    /// rebuilds the kernel (docs/build-system.md § Custom Targets).
+    pub fn kernel_linker_script(self) -> &'static str
+    {
+        match self
+        {
+            Arch::X86_64 => "core/kernel/linker/x86_64.ld",
+            Arch::Riscv64 => "core/kernel/linker/riscv64.ld",
+        }
+    }
+
+    /// The bootloader's linker script, relative to the project root, where
+    /// its target needs one: the riscv64 PE/COFF pipeline's. The x86-64
+    /// bootloader links with the layout of the built-in
+    /// `x86_64-unknown-uefi` target.
+    ///
+    /// `cargo xtask build` passes it to the bootloader's link as `-T`,
+    /// and `core/boot/src/main.rs` includes it, so that a change to it
+    /// rebuilds the bootloader (docs/build-system.md § Custom Targets).
+    pub fn boot_linker_script(self) -> Option<&'static str>
+    {
+        match self
+        {
+            Arch::X86_64 => None,
+            Arch::Riscv64 => Some("core/boot/linker/riscv64-uefi.ld"),
         }
     }
 

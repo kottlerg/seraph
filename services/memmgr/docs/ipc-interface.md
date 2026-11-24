@@ -2138,11 +2138,7 @@ reply-then-death ordering is therefore enforced by the kernel.
 [Session Supervision](../../../docs/session-supervision.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
-[services/fixtures/capexhaust/README.md](../../fixtures/capexhaust/README.md),
-[services/fixtures/demandpaged/README.md](../../fixtures/demandpaged/README.md),
-[services/fixtures/stackoverflow/README.md](../../fixtures/stackoverflow/README.md),
-[services/fixtures/threadchurn/README.md](../../fixtures/threadchurn/README.md),
-[services/fixtures/threadstack/README.md](../../fixtures/threadstack/README.md),
+[services/fixtures/program-modes/README.md](../../fixtures/program-modes/README.md),
 [services/memmgr/README.md](../README.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
 [swapd Operation](../../swapd/docs/operation.md)

@@ -36,9 +36,9 @@
 //!   4. Callers route `cargo build` / `cargo clippy` through the
 //!      mirror by calling `SeraphToolchain::apply_env(&mut cmd)`,
 //!      which sets `RUSTC`, `RUSTC_WORKSPACE_WRAPPER`, the three
-//!      `SERAPH_SHIM_*` config vars, `RUSTC_BOOTSTRAP=1`, and Cargo's
-//!      build directory (`target/seraph-build/`, [`BUILD_DIR`]) in one
-//!      go. No rustup-level state is modified;
+//!      `SERAPH_SHIM_*` config vars, `RUSTC_BOOTSTRAP=1`, Cargo's
+//!      build directory (`target/seraph-build/`, [`BUILD_DIR`]), and the
+//!      lint arguments (`CLIPPY_ARGS`, [`CLIPPY_ARGS`]) in one go. No rustup-level state is modified;
 //!      `target/seraph-toolchain/` is a pure build artifact under
 //!      `target/`.
 //!
@@ -89,6 +89,21 @@ const MIRROR_DIR: &str = "seraph-toolchain";
 /// rebuild what the other built.
 pub(crate) const BUILD_DIR: &str = "seraph-build";
 
+/// The lint arguments `clippy-driver` reads from `CLIPPY_ARGS`: `-D warnings`,
+/// split on `__CLIPPY_HACKERY__`, the encoding `cargo clippy` uses to forward
+/// the arguments after its `--`.
+///
+/// [`SeraphToolchain::apply_env`] gives every cargo invocation through the
+/// mirror this one value, the lint pass's, the build's and a `--skip-lints`
+/// build's alike. `clippy-driver` records `CLIPPY_ARGS` as an input of each
+/// unit it compiles, and the workspace crates `std` depends on are units both
+/// the lint pass and the build compile; a value that differed between them
+/// would make each rebuild those crates, `std`, and every `StdUser` crate
+/// after the other. In the build, as in the lint pass, a `StdUser` crate's
+/// clippy warning is an error.
+pub(crate) const CLIPPY_ARGS: &str =
+    "__CLIPPY_HACKERY__-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__";
+
 /// Rustc-version stamp: invalidates the mirror if the underlying
 /// toolchain changes (`rustc --version --verbose` output).
 const VERSION_STAMP: &str = ".seraph-toolchain-stamp";
@@ -120,8 +135,9 @@ impl SeraphToolchain
     /// build through the seraph toolchain mirror: `RUSTC` and
     /// `RUSTC_WORKSPACE_WRAPPER` (mirror entry points), the three
     /// `SERAPH_SHIM_*` config vars (so the shim knows what to exec),
-    /// `RUSTC_BOOTSTRAP=1`, and `CARGO_BUILD_BUILD_DIR` ([`BUILD_DIR`]):
-    /// the final artifacts still land in `target/<triple>/<profile>/`.
+    /// `RUSTC_BOOTSTRAP=1`, `CARGO_BUILD_BUILD_DIR` ([`BUILD_DIR`]), where
+    /// the final artifacts still land in `target/<triple>/<profile>/`, and
+    /// `CLIPPY_ARGS` ([`CLIPPY_ARGS`]).
     ///
     /// `RUSTC_BOOTSTRAP=1` unlocks the unstable features that
     /// `-Zbuild-std` and the std overlay's workspace deps
@@ -140,6 +156,7 @@ impl SeraphToolchain
         cmd.env("SERAPH_SHIM_MIRROR_SYSROOT", &self.mirror_sysroot);
         cmd.env("RUSTC_BOOTSTRAP", "1");
         cmd.env("CARGO_BUILD_BUILD_DIR", &self.build_dir);
+        cmd.env("CLIPPY_ARGS", CLIPPY_ARGS);
     }
 }
 
@@ -1523,38 +1540,6 @@ mod tests
 {
     use super::*;
 
-    /// The path dependencies a crate's `Cargo.toml` names, as directories
-    /// relative to `root`: `path = "..."` from the crate's directory, and a
-    /// `workspace = true` one from the workspace's `Cargo.toml`.
-    fn path_deps(root: &Path, krate: &str) -> Vec<String>
-    {
-        let workspace = fs::read_to_string(root.join("Cargo.toml")).unwrap();
-        let manifest = fs::read_to_string(root.join(krate).join("Cargo.toml")).unwrap();
-        let path_of = |line: &str| -> Option<String> {
-            let rest = &line[line.find("path = \"")? + "path = \"".len()..];
-            Some(rest[..rest.find('"')?].to_owned())
-        };
-        let mut deps = Vec::new();
-        for line in manifest.lines()
-        {
-            if let Some(rel) = path_of(line)
-            {
-                let dir = root.join(krate).join(rel).canonicalize().unwrap();
-                deps.push(dir.strip_prefix(root).unwrap().display().to_string());
-            }
-            else if line.contains("workspace = true")
-                && let Some(name) = line.split(['=', '.']).next().map(str::trim)
-                && let Some(entry) = workspace
-                    .lines()
-                    .find(|l| l.split('=').next().map(str::trim) == Some(name))
-                && let Some(rel) = path_of(entry)
-            {
-                deps.push(rel);
-            }
-        }
-        deps
-    }
-
     /// The repository's root.
     fn repo_root() -> PathBuf
     {
@@ -1565,11 +1550,10 @@ mod tests
             .unwrap()
     }
 
-    /// The patterns of the standard-library cache key's `hashFiles` call, in
-    /// order.
+    /// The patterns of the build carry's key's `hashFiles` call, in order.
     fn key_patterns(root: &Path) -> Vec<String>
     {
-        let action = fs::read_to_string(root.join(".github/actions/std-cache/action.yml")).unwrap();
+        let action = fs::read_to_string(root.join(".github/actions/carry/action.yml")).unwrap();
         let call = &action[action.find("hashFiles(").unwrap()..];
         let call = &call[..call.find(')').unwrap()];
         call.split('\'')
@@ -1615,52 +1599,55 @@ mod tests
         hashed
     }
 
-    // Defect caught: a file the seraph std is built from left out of the
-    // standard-library cache's key, so a change to it (one byte of an
-    // overlay source, of a crate std depends on, or of the specs and flags
-    // it is built with) restores the entry of the unchanged tree instead of
-    // missing it. Cargo rebuilds what changed after a restore in any case,
-    // since the checkout gives every file a new modification time; the key
-    // is what keeps an entry to one tree.
+    // Defect caught: an input of the carried build units that Cargo's
+    // checksums do not cover (a target spec, the Cargo configuration, the
+    // action, the wrapper shim, whose arguments to rustc and clippy-driver
+    // Cargo never sees) left out of the build carry's key, so a change to it
+    // restores units built under the old one as current; or another source
+    // file of the tree hashed, which Cargo's checksums do cover, so that
+    // every change to it misses master's entry and rebuilds everything.
     #[test]
-    fn the_std_cache_key_hashes_every_std_input()
+    fn the_carry_key_hashes_the_inputs_the_checksums_do_not_cover_and_no_other_source()
     {
         let root = repo_root();
         let patterns = key_patterns(&root);
-        let covered = |path: &str| key_hashes(&patterns, path);
-        let mut inputs: Vec<String> = [
-            "Cargo.toml",
+        for input in [
             ".cargo/config.toml",
-            "xtask/targets",
-            "xtask/src/rust_src.rs",
-            "xtask/src/commands/build.rs",
-            "runtime/ruststd/src",
+            "xtask/targets/x86_64-seraph-none.json",
+            "xtask/targets/riscv64imac-seraph-uefi.json",
+            ".github/actions/carry/action.yml",
+            "xtask/wrapper-shim/src/main.rs",
+            "xtask/wrapper-shim/Cargo.toml",
         ]
-        .map(str::to_owned)
-        .into();
-        let mut stack: Vec<String> = STD_WORKSPACE_DEPS.iter().map(|d| d.1.to_owned()).collect();
-        while let Some(krate) = stack.pop()
         {
-            if !inputs.contains(&krate)
-            {
-                stack.extend(path_deps(&root, &krate));
-                inputs.push(krate);
-            }
+            assert!(key_hashes(&patterns, input), "{input}: {patterns:?}");
         }
-        let missed: Vec<&String> = inputs.iter().filter(|i| !covered(i)).collect();
-        assert!(
-            missed.is_empty(),
-            "the key's hashFiles misses {missed:?}; patterns {patterns:?}"
-        );
+        let out = Command::new("git")
+            .arg("ls-files")
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let files = String::from_utf8(out.stdout).unwrap();
+        let sources: Vec<&str> = files
+            .lines()
+            .filter(|f| {
+                let path = Path::new(f);
+                path.file_name().is_some_and(|n| n == "Cargo.toml")
+                    || path.extension().is_some_and(|e| e == "rs" || e == "ld")
+            })
+            .filter(|f| !f.starts_with("xtask/wrapper-shim/") && key_hashes(&patterns, f))
+            .collect();
+        assert!(sources.is_empty(), "the key hashes sources: {sources:?}");
     }
 
-    // Defect caught: a file the standard-library cache's key hashes whose
-    // change alone owes the build job of some tree no run (a README under
-    // `shared/`, say): a `master` merge changing only it changes the key
-    // but runs no job that saves that tree's entry under it, so every later
-    // pull request misses the cache until a merge owes that build.
+    // Defect caught: a file the build carry's key hashes whose change alone
+    // owes the build job of some tree no run: a `master` merge changing only
+    // it changes the key but runs no job that saves that tree's entry under
+    // it, so every later pull request misses the carry until a merge owes
+    // that build.
     #[test]
-    fn a_change_to_a_file_the_std_cache_key_hashes_owes_the_build_jobs_that_save_it()
+    fn a_change_to_a_file_the_carry_key_hashes_owes_the_build_jobs_that_save_it()
     {
         use crate::affected::Workspace;
         use crate::commands::cells::{build_trees, owed_by};
@@ -1770,5 +1757,61 @@ mod tests
                 "{rel}/Cargo.toml does not name the package {package}"
             );
         }
+    }
+
+    // Defect caught: the lint pass and the build giving `clippy-driver`
+    // different `CLIPPY_ARGS`, which it records as an input of each unit, so
+    // that each pass rebuilds the workspace crates `std` depends on, `std`,
+    // and every `StdUser` crate after the other, and a no-change build is
+    // never a no-op.
+    #[test]
+    fn every_cargo_invocation_through_the_mirror_gives_clippy_one_lint_argument_set()
+    {
+        let toolchain = SeraphToolchain {
+            rustc: PathBuf::from("rustc"),
+            ws_clippy: PathBuf::from("ws-clippy"),
+            real_rustc: PathBuf::from("real-rustc"),
+            real_clippy: PathBuf::from("real-clippy"),
+            mirror_sysroot: PathBuf::from("mirror"),
+            build_dir: PathBuf::from("build"),
+        };
+        let mut cmd = Command::new("cargo");
+        toolchain.apply_env(&mut cmd);
+        let args = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "CLIPPY_ARGS")
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str())
+            .expect("apply_env sets CLIPPY_ARGS");
+        assert_eq!(args, CLIPPY_ARGS);
+        let words: Vec<&str> = args
+            .split("__CLIPPY_HACKERY__")
+            .filter(|w| !w.is_empty())
+            .collect();
+        assert_eq!(words, ["-D", "warnings"]);
+
+        // No other xtask code sets the variable, so no pass can give it
+        // another value.
+        let setter = concat!(".env(\"CLIPPY", "_ARGS\"");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop()
+        {
+            for entry in fs::read_dir(&dir).unwrap()
+            {
+                let path = entry.unwrap().path();
+                if path.is_dir()
+                {
+                    dirs.push(path);
+                }
+                else if path.extension().is_some_and(|e| e == "rs")
+                    && fs::read_to_string(&path).unwrap().contains(setter)
+                {
+                    files.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        assert_eq!(files, ["rust_src.rs"]);
     }
 }

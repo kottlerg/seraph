@@ -698,7 +698,7 @@ rings both notifications, so a reader drains the ring to EOF and a writer fails 
 ends have sent, and `std::os::seraph::pipe::waits` the times they found their ring empty or full
 and announced a wait, whether or not they then blocked; the svctest `pipestress` phase's doorbell
 trial reports both
-([services/fixtures/pipestress/README.md](../../services/fixtures/pipestress/README.md)).
+([program-modes § pipestress](../../services/fixtures/program-modes/README.md#pipestress)).
 
 ---
 
@@ -763,7 +763,7 @@ the cap the spawn created a spawned thread with, carrying `RIGHTS_THREAD`, or th
 bind its fault or upcall handlers, read its registers, or post it an upcall
 ([fault-handling.md § Asynchronous Upcalls](../../docs/fault-handling.md#asynchronous-upcalls));
 the `deadline` fixture's supervisor bounds a spinning worker this way
-([services/fixtures/deadline/README.md](../../services/fixtures/deadline/README.md)).
+([program-modes § deadline](../../services/fixtures/program-modes/README.md#deadline)).
 
 The reclaim of a spawned thread, by its `join` or by the reaper after a detach, revokes every cap
 derived from the spawned thread's cap before it deletes that cap: the copy the thread registered
@@ -849,7 +849,7 @@ every deadline, zero once it has passed). A process bounds a step that waits on 
 trust to answer, as crashd bounds a fault's report and a core dump
 ([services/crashd/docs/operation.md](../../services/crashd/docs/operation.md) § Bounds), and the
 `deadline` fixture tests it
-([services/fixtures/deadline/README.md](../../services/fixtures/deadline/README.md)).
+([program-modes § deadline](../../services/fixtures/program-modes/README.md#deadline)).
 
 - **Bounded.** Every IPC call the runtime makes on the thread inside `f` carries the time left as
   its `SYS_IPC_CALL` timeout, which bounds its wait for a receiver and for the reply
@@ -1085,8 +1085,7 @@ primitives.
 [Process Lifecycle](../../docs/process-lifecycle.md), [Storage](../../docs/storage.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
 [runtime/libc/README.md](../libc/README.md),
-[services/fixtures/threadchurn/README.md](../../services/fixtures/threadchurn/README.md),
-[services/fixtures/threadstack/README.md](../../services/fixtures/threadstack/README.md),
+[services/fixtures/program-modes/README.md](../../services/fixtures/program-modes/README.md),
 [Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
 [logd IPC interface](../../services/logd/docs/ipc-interface.md),
 [procmgr IPC Interface](../../services/procmgr/docs/ipc-interface.md),

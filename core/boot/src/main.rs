@@ -13,6 +13,15 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 
+// The riscv64 linker script `cargo xtask build` passes to the bootloader's
+// link (`-T`), made an input of this crate: Cargo judges a build current by
+// the content of the files rustc read, so a change to the script rebuilds and
+// relinks the bootloader (docs/build-system.md § Custom Targets). Nothing
+// reads the bytes. The x86-64 bootloader links with its built-in target's
+// default layout.
+#[cfg(all(target_os = "none", target_arch = "riscv64"))]
+const _: &[u8] = include_bytes!("../linker/riscv64-uefi.ld");
+
 mod acpi;
 mod arch;
 mod boot_device;

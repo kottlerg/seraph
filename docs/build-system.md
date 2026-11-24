@@ -183,9 +183,9 @@ which no probe touches), and the probe of a vector frame lies a page below
 its fixed area, so two consecutive stack stores can lie up to 14312 bytes
 apart. Every main-thread stack that `shared/process-layout` places and every
 thread stack std spawns therefore keeps a guard of four pages
-(`process_abi::STACK_GUARD_PAGES`; [`threadstack`](../services/fixtures/threadstack/README.md)'s
-`splitframe` and `span` modes check it), where x86-64, whose `call` pushes
-the return address, needs one. The two floors:
+(`process_abi::STACK_GUARD_PAGES`;
+[`threadstack`](../services/fixtures/program-modes/README.md#threadstack)'s `splitframe` and `span`
+modes check it), where x86-64, whose `call` pushes the return address, needs one. The two floors:
 
 - `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
   SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, CX16, LAHF/SAHF,
@@ -208,19 +208,31 @@ the per-arch primitives are in `core/kernel/src/arch/{x86_64,riscv64}/fpu.rs`.
 The x86-64 bootloader uses the built-in `x86_64-unknown-uefi` target, so no
 custom JSON is needed. The RISC-V bootloader uses
 `riscv64imac-seraph-uefi.json` because no equivalent built-in target exists.
-Its linker script, `core/boot/linker/riscv64-uefi.ld`, is passed by
-`core/boot/build.rs` as an absolute `-T` link argument, the way
-`core/kernel/build.rs` passes the kernel's, and `cargo xtask build` sets
-`RUSTFLAGS` for the bootloader build to `-Zunstable-options` on both architectures.
+`cargo xtask build` sets `RUSTFLAGS` for the bootloader build to
+`-Zunstable-options` on both architectures, and on riscv64 adds the link
+argument of the bootloader's linker script, `core/boot/linker/riscv64-uefi.ld`.
 Cargo reads the `.cargo/config.toml` of the current directory and of every
 parent directory and joins their `rustflags` arrays, so a checkout nested
 under another (a worktree under `.claude/worktrees/`) receives a flag once
 for each config file that lists it; `RUSTFLAGS` is used in place of them
-all, and a build-script link arg is emitted once, so the bootloader link is
-the same from any checkout.
+all, so the bootloader link is the same from any checkout.
 
-The riscv64 kernel build, and its Clippy pass, also run with `RUSTFLAGS` set,
-to `-Zunstable-options -Zemit-stack-sizes` (`RISCV64_KERNEL_RUSTFLAGS` in
+The linker scripts of the kernel (`core/kernel/linker/<arch>.ld`) and of the
+riscv64 bootloader are passed by `cargo xtask build`, in the `RUSTFLAGS` of
+their builds, as the link argument `-Clink-arg=-T<path>` with the script's
+path relative to the workspace root, from which Cargo runs rustc for a
+workspace member, so the flags are the same in every checkout
+(`Arch::kernel_linker_script` and `Arch::boot_linker_script` in
+`xtask/src/arch.rs` name them), and not by a build script, whose
+`rerun-if-changed` files Cargo judges by modification time
+([§ Continuous Integration](#continuous-integration)). Each crate includes its
+script (`include_bytes!` in its `main.rs`), which makes the script an input
+Cargo judges by content, so a change to it rebuilds and relinks the image.
+Cargo splits `RUSTFLAGS` at whitespace, so neither path holds any, as a host
+test checks.
+
+The riscv64 kernel build, and its Clippy pass, run with `RUSTFLAGS` set,
+besides the link argument, to `-Zunstable-options -Zemit-stack-sizes` (`RISCV64_KERNEL_RUSTFLAGS` in
 `xtask/src/commands/build.rs`), so that `-Z emit-stack-sizes` reaches the
 `-Z build-std` crates as well. The x86-64 kernel build and its Clippy pass run
 with `RUSTFLAGS` set to `-Zunstable-options -Zretpoline-external-thunk`
@@ -826,30 +838,39 @@ firmware entry, and the bounded download, offline install and save of a booting 
 mode. No job seeds it: a `master` run's job on a new image version downloads and saves it, and
 every later run on that version installs offline.
 
-The jobs that build with `-Z build-std` (`host-tests`, for its riscv64 test build, and each
-`build` job) keep a standard-library cache, `.github/actions/std-cache/action.yml`,
-restored before their first build and saved as their last step. Its entry holds the build units of
-the toolchain's library packages alone, what `cargo xtask clean --keep-std` leaves of Cargo's build
-directories (`target/<profile>/build/` and `target/<triple>/<profile>/build/`, and the same under
-`target/seraph-build/`, the build directory of the builds of `std`) ([xtask/README.md §
-`cargo xtask clean`](../xtask/README.md#cargo-xtask-clean)): Cargo judges a path source fresh by its
-modification time, and a checkout gives every file of the tree a new one, so a workspace crate's
-unit is rebuilt in every job and is left out, while the library's sources keep the times the
-toolchain's install gave them. The seraph `std`, whose overlaid sources the build writes anew in
-each job, is rebuilt in each too. The key is
-`std-<entry>-<ImageOS>-<ImageVersion>-<toolchain>-<tree>`: the job's entry
-(`validate-<arch>-<profile>` for the `build` job of one architecture and profile, or
-`host-tests`), the runner image, the first 16 hex digits of the SHA-256 of
-`rustc -Vv`, and those of the `hashFiles` digest of every file in the tree the units are built from
-or with: the target specs, `.cargo/config.toml`, the workspace `Cargo.toml`,
-`xtask/src/commands/build.rs`, `xtask/src/rust_src.rs`, the action, `runtime/ruststd/`, `shared/`
-and `abi/`, Markdown excepted. No unit reads Markdown, and a change to Markdown alone owes no cell
-([conventions.md § CI Gating](conventions.md#ci-gating)), so a key it changed would get no entry
-from the `master` run; a change to any file the key hashes owes every job that saves an entry, as a
-host test checks. The restore takes that exact key, with no partial-match fallback: units built from
-other inputs would carry modification times Cargo could take as fresh. Only a push run on `master`
-saves, after its uploads, so a pull request reads the entries its base made. Cargo checks every unit
-restored as it checks any, so a unit whose sources or flags differ is rebuilt.
+Cargo judges a build unit current by the checksums of the files rustc read for it, which the
+unit's dep-info records, and not by their modification times, which a checkout or a cache restore
+resets: `.cargo/config.toml` sets `[unstable] checksum-freshness` and `[build] fingerprint =
+"content"`, which the nightly toolchain needs together. A build script's `rerun-if-changed` files
+are still judged by time, and a script that reruns makes its package and every dependent rebuild,
+so no package of the tree has a build script (a host test checks it): the linker scripts of the
+kernel and of the riscv64 bootloader are passed by `cargo xtask build`
+([§ Custom Targets](#custom-targets)). The toolchain's library build scripts (`compiler_builtins`')
+name library sources, which are dated as below.
+
+So the `build` jobs and `host-tests` carry their build between runs, through the composite action
+`.github/actions/carry/action.yml`, restored before their first build and saved as their last
+step. Its entry is `target/` but `target/xtask/`, which holds the job's signing identity and
+records: Cargo's build directories, the `xtask` binary, and the toolchain mirror of the builds of
+`std`, whose stamp and modification times it keeps, so the mirror is not rewritten while its
+inputs are unchanged. The key is
+`carry-<entry>-<ImageOS>-<ImageVersion>-<toolchain>-<config>-<commit>`: the job's entry
+(`build-<arch>-<profile>` for the `build` job of one architecture and profile, or `host-tests`),
+the runner image, whose libraries the entry's host build scripts and tools link against, the first
+16 hex digits of the SHA-256 of `rustc -Vv`, those of the `hashFiles` digest of the inputs of
+every unit that the checksums do not cover (the target specs, `.cargo/config.toml`, the action and
+`xtask/wrapper-shim/`, which adds arguments to every rustc and clippy-driver command line of a
+build through the toolchain mirror that Cargo never sees, Markdown excepted), and the commit. A
+change to any file the key hashes owes every job that saves an entry, and the key hashes no other
+source file of the tree, as host tests check. A job restores the
+newest entry whose key starts with its own up to the commit: an entry built from another tree is
+safe, since every unit restored is judged by content, and only what differs is rebuilt. Before the
+build it dates the toolchain's library sources to 2000-01-01, which the install writes with its own
+time; the date hides no change, since the toolchain's version is in the key and in every unit's
+fingerprint. Only a push run on `master` saves, after its uploads, under the commit, and then
+deletes `master`'s other entries of the same key prefix, which no run would restore (the jobs
+have `actions: write` for it); a pull request reads the entries its base made and never writes
+one, so it evicts none of them.
 
 The `build`, `burnin` and `build-image` jobs each have a step that sets
 `SERAPH_SIGNING_DIR=$RUNNER_TEMP/seraph-signing`, so each job generates its signing keys outside
@@ -867,13 +888,12 @@ copies, [xtask/README.md § Cells](../xtask/README.md#cells)) as `tree-<arch>-<p
 release job owing the `bench` cell then ships the bench-only image as `tree-<arch>-bench`. Each
 artifact is kept three days, so a cell re-run after its build job still finds its tree. In `fetch`
 mode, each cell downloads its tree, the usertest cell also the bootloader's build state, unpacks
-them, puts the `xtask` binary on the `PATH` and points `SERAPH_SIGNING_DIR` at the identity, and
-dates every tracked file of its checkout to 2000-01-01. The checkout is of the commit the build job
-built, so its files are the ones that build read; dated before it, they are older than every unit
-Cargo recorded, and the usertest cell's `signing` and `rollback` cases, which compile bootloaders
-under trust stores they generate, recompile only the bootloader, where the checkout's own times
-would make every crate it links stale. That cell alone installs the toolchain (with `rust-src` and
-`llvm-tools`), and the `bench` cell installs it with no component for the compiler version
+them, puts the `xtask` binary on the `PATH` and points `SERAPH_SIGNING_DIR` at the identity;
+with the bootloader's build state, it dates the toolchain's library sources as the build job did.
+The usertest cell's `signing` and `rollback` cases, which compile bootloaders under trust stores
+they generate, then recompile only the bootloader: Cargo judges the shipped units by content, so
+the checkout's own times make none stale. That cell alone installs the toolchain (with `rust-src`
+and `llvm-tools`), and the `bench` cell installs it with no component for the compiler version
 `bench-check` records; no other cell has one.
 
 The `build-image` job of `release.yml` boots nothing (its one `cargo xtask`

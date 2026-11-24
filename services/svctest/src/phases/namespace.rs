@@ -205,8 +205,8 @@ pub fn ns_phase(caps: &Caps)
     for expected in [
         &b"spawn-target"[..],
         &b"leader"[..],
-        &b"threadchurn"[..],
-        &b"demandpaged"[..],
+        &b"program-modes"[..],
+        &b"stdiotest"[..],
     ]
     {
         assert!(

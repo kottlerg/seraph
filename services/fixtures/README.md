@@ -26,21 +26,25 @@ Installed at `/tests/fixtures/programs/<name>`.
 
 | Crate | Purpose |
 |---|---|
-| [`capexhaust/`](capexhaust/README.md) | CSpace-exhaustion fixture for the recv-wedge regression test |
+| [`program-modes/`](program-modes/README.md) | svctest's shared program-role fixture: the `capexhaust`, `deadline`, `demandpaged`, `narrow`, `pipefault`, `pipestress`, `relrofault`, `stackoverflow`, `threadchurn` and `threadstack` modes |
 | [`crashme/`](crashme/README.md) | Deliberate-fault fixture for the svctest `crashd` phases and the crash-report check |
-| [`deadline/`](deadline/README.md) | Deadline-cancel fixture for the svctest `deadline` phase: an upcall cancels a spinning worker |
 | [`debugger/`](debugger/README.md) | Debugger fixture for the svctest `debugger` phase: breakpoint, single-step, memory inspection, and async break |
-| [`demandpaged/`](demandpaged/README.md) | Demand-paging fixture for the svctest pager phase |
 | [`fsbench/`](fsbench/README.md) | `std::fs::File` read and write benchmark: the `FS_READ` vs `FS_READ_MEMORY` crossover, and `FS_WRITE_MEMORY` rewrites |
 | [`leader/`](leader/README.md) | Session leader of svctest's operator sessions: a line-oriented command loop standing in for the shell |
-| [`pipefault/`](pipefault/README.md) | Piped-stdio fault fixture for the pipe death-bridge regression test |
-| [`pipestress/`](pipestress/README.md) | Spawn-exit-drain stress fixture for the pipe EOF-drain regression test |
-| [`relrofault/`](relrofault/README.md) | RELRO write fixture for the `PT_GNU_RELRO` enforcement test |
-| [`spawn-target/`](spawn-target/README.md) | Known-good program-role image the svctest phases create, spawn, read, and look up; its `narrow` argument checks that starting a service image is refused |
-| [`stackoverflow/`](stackoverflow/README.md) | Stack-overflow fixture for the stack guard-page regression test |
+| [`spawn-target/`](spawn-target/README.md) | Known-good program-role image the svctest phases create, spawn, read, and look up |
 | [`stdiotest/`](stdiotest/README.md) | Stdin↔stdout proof |
-| [`threadchurn/`](threadchurn/README.md) | CSpace-slot and memmgr-pool reclaim fixture for the svctest `threadchurn` phase |
-| [`threadstack/`](threadstack/README.md) | Guarded thread-stack fixture, demand-paged and pinned, for the svctest `threadstack` phase |
+
+The other program fixtures keep a binary of their own, each for a reason the shared one cannot meet:
+
+- `spawn-target`: its image is the subject of procmgr's create, read and lookup checks, and its
+  name that of the `ns` phase's LFN lookups.
+- `leader`: sessiond's recipe names it, and sessiond starts it with no argument.
+- `crashme`: its name is what the crash-report check, crashd's `CORE_DUMP` list and the symbolizer
+  key on.
+- `debugger`, `fsbench` and `stdiotest`: another harness runs them too, as the debug-port case's
+  `gdb-target` recipe, `ubench` and `usertest`'s shell tester do.
+- `debug-echo` and `hotplug-check` (service role): the debug-port and hotplug cases run them, and
+  their directories name the device surfaces of [docs/testing.md](../../docs/testing.md).
 
 ## Service fixtures
 
@@ -48,9 +52,7 @@ Installed at `/tests/fixtures/<name>`.
 
 | Crate | Purpose |
 |---|---|
-| [`crasher/`](crasher/README.md) | Deliberate-crash canary for svcmgr's restart path |
-| [`memhog/`](memhog/README.md) | Fills memory until the pressure level reads `CRITICAL`, for oomd to stop |
-| [`stopsrc/`](stopsrc/README.md) | A stop source of the program class, whose one job oomd stops before any service |
+| [`service-modes/`](service-modes/README.md) | svctest's shared service-role fixture: the `crasher`, `memhog` and `stopsrc` modes |
 | [`debug-echo/`](debug-echo/README.md) | Answers fixed GDB remote serial protocol packets on the debug port |
 | [`hotplug-check/`](hotplug-check/README.md) | Checks that devmgr binds a driver to a device hot-added behind a PCI Express root port, and that its DMA and MSI work; its disk mode checks vfsd's handling of a disk removed and added again, and of its root driver's loss |
 

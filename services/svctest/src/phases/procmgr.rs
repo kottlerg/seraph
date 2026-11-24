@@ -1613,8 +1613,8 @@ pub(crate) fn fixture_programs_dir() -> u64
 
 /// A program narrows what its creator may start: as a program, which may
 /// start programs only (docs/signing.md § Signature Policy in procmgr), the
-/// spawn target's `narrow` mode starts the service image
-/// `/tests/fixtures/crasher` and is refused `PermissionDenied`. It reports
+/// `narrow` mode of the shared program fixture starts the service image
+/// `/tests/fixtures/service-modes` and is refused `PermissionDenied`. It reports
 /// the outcome on its stdout and by its exit status.
 ///
 /// Defect guarded: a program starting an image in a role its creator's
@@ -1624,15 +1624,15 @@ fn procmgr_program_narrowing_phase(_caps: &Caps)
     use std::process::{Command, Stdio};
 
     let phase = "procmgr_program_narrowing";
-    let output = Command::new(SPAWN_TARGET_PATH)
+    let output = Command::new(super::PROGRAM_MODES_PATH)
         .arg("narrow")
         .stdout(Stdio::piped())
         .output()
-        .unwrap_or_else(|e| panic!("{phase}: spawn {SPAWN_TARGET_PATH} narrow: {e}"));
+        .unwrap_or_else(|e| panic!("{phase}: spawn {} narrow: {e}", super::PROGRAM_MODES_PATH));
     let out = String::from_utf8_lossy(&output.stdout);
     for line in out.lines()
     {
-        std::os::seraph::log!("{phase}: spawn-target: {line}");
+        std::os::seraph::log!("{phase}: program-modes narrow: {line}");
     }
     assert!(
         output.status.success(),

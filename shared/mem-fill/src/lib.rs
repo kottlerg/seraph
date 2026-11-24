@@ -6,7 +6,7 @@
 //! Filling memmgr's pool down to its growth floor (the system reserve and,
 //! while chunks are swapped, the restore headroom), for the test fixtures that
 //! drive the out-of-memory paths: the `memhog` fixture
-//! (services/fixtures/memhog/README.md) and crashme's `oom-fill` mode
+//! (services/fixtures/service-modes/README.md#memhog) and crashme's `oom-fill` mode
 //! (services/fixtures/crashme/README.md).
 //!
 //! A [`Fill`] takes what memmgr can still promise a process outside the

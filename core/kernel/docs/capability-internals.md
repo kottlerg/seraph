@@ -919,10 +919,10 @@ The mechanism is `cap/sole_reference.rs`.
   pass may post after the call that made the release returns, and the budget may leave the post
   to a later pass, as The budget says. A bit set by another CPU that the load misses is drained
   by that CPU at its own next drain point (its syscall return, its next interrupt from user mode,
-  or its idle loop), so the bound under The budget holds. Otherwise, under the table lock, it
-  claims each object of a pending chain whose word is `REF_OBSERVED | 1` by a compare-and-swap to
-  1, moving its nodes to the fired list, and takes at most `POST_BUDGET` (64) nodes off the fired
-  list. An object on a chain is live,
+  or its idle loop), or by a CPU after its next timer tick, so the bound under The budget holds.
+  Otherwise, under the table lock, it claims each object of a pending chain whose word is
+  `REF_OBSERVED | 1` by a compare-and-swap to 1, moving its nodes to the fired list, and takes at
+  most `POST_BUDGET` (64) nodes off the fired list. An object on a chain is live,
   since its death takes it off the chain under the same lock before its memory can be reused. A
   compare-and-swap that races an increment either fails, and the object stays bound, or wins, and
   the count was one. After the unlock the drain returns each node to its pool, posts through
@@ -930,18 +930,18 @@ The mechanism is `cap/sole_reference.rs`.
   under `DERIVATION_LOCK` or a CSpace lock, and a binder that receives a post finds its node
   free.
 - **The budget.** A death fires every node bound to the object, any number of them, each funded by
-  its binder's queue, and the drain that takes them runs in whatever thread's syscall return or
-  idle-loop iteration comes next, on any CPU. The budget bounds what one pass does for observers its
-  thread did not bind. Nodes left on the fired list keep the summary's fired bit set, so the next
-  drain on any CPU continues. An idle CPU whose run queues are empty drains again, a pass at a time,
-  before its halt decision (`sole_reference::work_pending`). A decrement that marks the table or
-  fires observers posts its own CPU's `SOLE_REF` bit, and a pass that leaves fired nodes posts it
-  again, so every mark and leftover is drained by a later return, one pass per return, or by the
-  idle loop, on the CPU that made it (scheduling-internals.md § Return Work). A CPU that runs only
-  user code, makes no syscall and never idles reaches that return at its next interrupt at the
-  latest, posting up to the budget each time. The drain that claims a post may run on a CPU other
-  than the one whose release made it, so a post can reach its queue just after the call that made
-  the release returns.
+  its binder's queue. The budget bounds what one pass does for observers its thread did not bind.
+  Nodes left on the fired list keep the summary's fired bit set for a later pass. A decrement that
+  marks the table or fires observers posts its own CPU's `SOLE_REF` bit, a pass that leaves fired
+  nodes posts it again, and each CPU's timer tick posts its own while the summary is nonzero
+  (`sole_reference::work_pending`), so a pass runs at the next return to user mode of the CPU
+  that made the mark or left the nodes, and of every CPU a tick reaches meanwhile, one pass per
+  return (scheduling-internals.md § Return Work). An idle CPU whose run queues are empty drains
+  too, a pass at a time, before its halt decision. The next pass therefore comes within a timer
+  tick while any CPU runs user code or idles; when every CPU is in the kernel across a tick, it
+  comes at the first return to user mode or idle-loop pass after it. Each pass posts up to the
+  budget. The drain that claims a post may run on a CPU other than the one whose release made it,
+  so a post can reach its queue just after the call that made the release returns.
 - **What a post means.** Every arrival at `REF_OBSERVED | 1` is a decrement from
   `REF_OBSERVED | 2`, which marks the chain, so a count that rests at one is always found. A count
   that falls to one and rises again before the drain looks is not claimed, and is found at its next

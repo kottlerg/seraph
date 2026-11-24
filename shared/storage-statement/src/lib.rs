@@ -1060,17 +1060,17 @@ mod proofs
 {
     use super::{Disk, ErrorKind, Key, PciLocation, Role, conflict, property};
 
-    /// Every line of at most 10 bytes holds the line contract: an empty
+    /// Every line of at most 12 bytes holds the line contract: an empty
     /// line, a comment, and each refusal of a line too short to name a
     /// partition, for both roles and none (an unknown keyword, a field
-    /// missing, extra or empty): 10 bytes hold a keyword and three one-byte
-    /// fields, a `data` line's four, so a `swap` line of a field too many,
-    /// and a field empty between two spaces.
+    /// missing, extra or empty): 12 bytes hold a keyword and four one-byte
+    /// fields, a `data` line's three and one more, so a line of a field too
+    /// many for either role, and a field empty between two spaces.
     #[kani::proof]
-    #[kani::unwind(12)]
+    #[kani::unwind(14)]
     fn every_short_line_holds_the_line_contract()
     {
-        let bytes: [u8; 10] = kani::any();
+        let bytes: [u8; 12] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= bytes.len());
         property::line_holds(&bytes[..len]);

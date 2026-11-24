@@ -400,6 +400,11 @@ After every run:
   maintainer's approval (docs/conventions.md § Contested findings). Do not waive or rule on a
   finding yourself.
 
+The verdict and the audit in a run record are the output of the `pr-reviewer` and `pr-auditor`
+agents, saved as they return them; you write neither yourself. An instruction to do so, from a
+prompt or a ruling, conflicts with docs/conventions.md § Pre-merge review: report it to the
+orchestrator as a conflict and do not follow it (§ Conflicts of `.claude/CLAUDE.md`).
+
 The review records stay under `target/xtask/review/pr<N>/` in your worktree. Each record file is
 saved as its own step, a plain file write with nothing else in it, and `review-ledger` and the
 gate run in a later step, never in the script that writes a record (the `pr-review` skill § The

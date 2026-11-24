@@ -459,7 +459,10 @@ as a ruling and tell the maintainer in one line (§ Reporting to the maintainer)
 before it is built or merged; put it to them once per batch where a standing answer makes
 sense, and keep their answer in the record. A case with no clearly best option is not a reason
 to hand the choice over: do the reading that separates the options, pick, and say what remains
-uncertain.
+uncertain. A batch ruling or a spawn prompt adds to what the documents require of a review and
+never replaces or reassigns an agent that docs/conventions.md § Pre-merge review names: the
+verdict and the audit of a run record are the `pr-reviewer`'s and the `pr-auditor`'s output,
+never a worker's own (`.claude/agents/worker.md` § Review).
 
 - **A finding that is not a defect.** A review reports defects only (docs/conventions.md
   § Findings). A worker disputes a finding that is not one as a contested finding, below; it

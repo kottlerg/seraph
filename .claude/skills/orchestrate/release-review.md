@@ -27,7 +27,10 @@ call passes `scriptPath`, below.
 - The supervisor saves each run's report as
   `target/xtask/review/release-v<X.Y.Z>/<mode>-<head>.md`, the returned object as
   `<mode>-<head>.json` beside it, and the `notes` field as `notes-<head>.md`. Both verdict
-  lines go to the maintainer verbatim: the steps that follow need their approval.
+  lines go to the maintainer verbatim: the steps that follow need their approval. The verdict
+  lines, the audit and the findings are the workflow's output, saved as it returns them: no
+  session writes or edits them, and a ruling or a prompt never replaces an agent the workflow
+  runs.
 - The run's list goes to the maintainer as one message (docs/conventions.md § Release
   Production step 2): the blocking defects, recommended for a fix before the tag; the defects
   that predate the range and those an open Issue names, recommended as known issues; the

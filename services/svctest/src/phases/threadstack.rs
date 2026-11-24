@@ -3,7 +3,7 @@
 
 // services/svctest/src/phases/threadstack.rs
 
-//! svctest phase for `/tests/fixtures/programs/threadstack`. Spawns it in eight modes
+//! svctest phase for `program-modes threadstack`. Spawns it in eight modes
 //! demand-paged (the system default), then in three pinned, with no pager, and
 //! asserts, capability-natively
 //! (stdout marker is the verdict;
@@ -83,27 +83,23 @@ impl Paging
     }
 }
 
-/// Spawn `/tests/fixtures/programs/threadstack <mode>` as `paging` says, capture stdout, and
+/// Spawn `program-modes threadstack <mode>` as `paging` says, capture stdout, and
 /// return `(stdout, ExitStatus)`.
 fn run(mode: &str, paging: Paging) -> (String, std::process::ExitStatus)
 {
-    let mut command = Command::new("/tests/fixtures/programs/threadstack");
-    command.arg(mode).stdout(Stdio::piped());
+    let mut command = Command::new(super::PROGRAM_MODES_PATH);
+    command.args(["threadstack", mode]).stdout(Stdio::piped());
     if let Paging::Pinned = paging
     {
         command.pinned(true);
     }
-    let mut child = command
-        .spawn()
-        .expect("spawn /tests/fixtures/programs/threadstack");
+    let mut child = command.spawn().expect("spawn program-modes threadstack");
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut bytes = Vec::new();
     stdout
         .read_to_end(&mut bytes)
-        .expect("read /tests/fixtures/programs/threadstack stdout");
-    let status = child
-        .wait()
-        .expect("wait /tests/fixtures/programs/threadstack");
+        .expect("read program-modes threadstack stdout");
+    let status = child.wait().expect("wait program-modes threadstack");
     (String::from_utf8_lossy(&bytes).into_owned(), status)
 }
 

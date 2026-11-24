@@ -5,7 +5,7 @@
 
 //! The service labels of the `crasher` fixture's `worker-fault` role, and of
 //! its `boot-fault` role once an instance lives through its bootstrap
-//! (services/fixtures/crasher/README.md), through which svctest checks that svcmgr
+//! (services/fixtures/service-modes/README.md#crasher), through which svctest checks that svcmgr
 //! restarts a supervised service whose worker thread faults, and one whose
 //! instance died before its bootstrap request.
 //!

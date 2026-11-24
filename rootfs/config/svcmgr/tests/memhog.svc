@@ -1,4 +1,4 @@
-# /tests/fixtures/memhog — the out-of-memory policy service's test fixture.
+# /tests/fixtures/service-modes memhog — the out-of-memory policy service's test fixture.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # Co-staged with svctest (services-surface harness) in CI and stageable
@@ -9,11 +9,12 @@
 # on request it takes what memmgr can still promise until the pressure level
 # reads CRITICAL, and holds it until it is stopped. svctest's oom phase has it
 # hog and reads that oomd stopped it and svcmgr restarted it idle
-# (services/fixtures/memhog/README.md). `oom_stop = yes`, with no reserve: it is the
-# service oomd stops. `restart = on_failure`, `critical = no`: the stop's
+# (services/fixtures/service-modes/README.md#memhog). `oom_stop = yes`, with no reserve: it
+# is the service oomd stops. `restart = on_failure`, `critical = no`: the stop's
 # EXIT_KILLED death restarts it, and the system continues if the restart
 # budget is spent.
-binary    = /tests/fixtures/memhog
+binary    = /tests/fixtures/service-modes
+argv      = service-modes memhog
 restart   = on_failure
 critical  = no
 namespace = none

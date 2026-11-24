@@ -363,20 +363,20 @@ to answer with bytes. The `rtc_create_retry` phase runs just before `timed_rtc_r
 when the staged fixture set does not declare it, and logs the skip line ([docs/testing.md §
 Gating](../../docs/testing.md#gating)). It stops devmgr's main thread, which runs every driver
 restart, through `caps[22]`, kills the RTC driver and waits until procmgr no longer lists it, then
-has [memhog](../fixtures/memhog/README.md) fill the pool down to the growth floor and, once the
-level reads `CRITICAL`, starts devmgr's main thread again, so devmgr's restart of the driver makes
-its create while no page is left to a driver outside the system reserve, and procmgr refuses it. It
-requires devmgr's line for the refusal and its first retry in logd's history through `caps[6]`,
-stamped after the kill; once oomd's stop of memhog, or svctest's own through `caps[23]` when no oomd
-stops it, has ended the window, devmgr serving the retried driver at the `rtc` class's next ordinal
-on `caps[19]` within 90 s, before the next phase kills it, since devmgr restarts no driver that dies
-before its batch settles and serves it, and that driver a new process; and devmgr's line for a retry
-of its create ([devmgr responsibilities](../devmgr/docs/responsibilities.md#create-retry)). The
-`timed_rtc_restart` phase kills the RTC driver (`cmos-rtc` on x86-64, `goldfish-rtc` on riscv64)
-through `caps[22]` and waits for devmgr's restart of it, then kills timed (its recipe's
-`argv = timed` names it), and requires `SystemTime::now()` to give a time between 2024 and 2100
-again within 30 s: the restarted timed resolves the RTC past the withdrawn ordinal
-([services/timed/README.md](../timed/README.md)).
+has [memhog](../fixtures/service-modes/README.md#memhog) fill the pool down to the growth floor and,
+once the level reads `CRITICAL`, starts devmgr's main thread again, so devmgr's restart of the
+driver makes its create while no page is left to a driver outside the system reserve, and procmgr
+refuses it. It requires devmgr's line for the refusal and its first retry in logd's history through
+`caps[6]`, stamped after the kill; once oomd's stop of memhog, or svctest's own through `caps[23]`
+when no oomd stops it, has ended the window, devmgr serving the retried driver at the `rtc` class's
+next ordinal on `caps[19]` within 90 s, before the next phase kills it, since devmgr restarts no
+driver that dies before its batch settles and serves it, and that driver a new process; and devmgr's
+line for a retry of its create ([devmgr
+responsibilities](../devmgr/docs/responsibilities.md#create-retry)). The `timed_rtc_restart` phase
+kills the RTC driver (`cmos-rtc` on x86-64, `goldfish-rtc` on riscv64) through `caps[22]` and waits
+for devmgr's restart of it, then kills timed (its recipe's `argv = timed` names it), and requires
+`SystemTime::now()` to give a time between 2024 and 2100 again within 30 s: the restarted timed
+resolves the RTC past the withdrawn ordinal ([services/timed/README.md](../timed/README.md)).
 
 The `logd_sinks` phase's framebuffer-restarted case queries the framebuffer class's ordinal 1
 through `caps[13]`, finds, attaches to, and stops the instance devmgr restarted through `caps[22]`,
@@ -438,17 +438,17 @@ The `logd_reserve` phase, just before it, skips when the staged fixture set does
 `reserve = yes` makes it ([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md) §
 `reserve`): the attach to the running instance and the attach to the next must each report
 `ATTACH_FLAG_RESERVE`. Between them it kills logd in the same way while
-[memhog](../fixtures/memhog/README.md) holds memory at the system reserve, and requires the next
-instance to run and serve before the level falls. Outside the reserve the create of the next
-instance and every first touch of its heap and stacks are refused while memhog holds the pool,
-except from the frames the kill frees until memhog's next tick takes them back, so the attach flags,
-not the timing, are what fail for a logd outside the reserve. It attaches to logd before the fill,
-has memhog fill the pool, faults logd's main thread as soon as the level reads `CRITICAL`, and waits
-for the level to fall: oomd's stop of memhog ends the window when oomd is staged in its stop mode,
-and svctest's own stop through `caps[23]`, 5 s after the fill, otherwise. It then requires, through
-`caps[6]`, svcmgr's `service restarted: logd` line in the new instance's history stamped before
-svcmgr's `stop memhog` line, the first of each after the kill, and memhog's next instance to answer
-`PROBE` with a new nonce and no pages. svcmgr writes the stop line once procmgr has destroyed
+[memhog](../fixtures/service-modes/README.md#memhog) holds memory at the system reserve, and
+requires the next instance to run and serve before the level falls. Outside the reserve the create
+of the next instance and every first touch of its heap and stacks are refused while memhog holds the
+pool, except from the frames the kill frees until memhog's next tick takes them back, so the attach
+flags, not the timing, are what fail for a logd outside the reserve. It attaches to logd before the
+fill, has memhog fill the pool, faults logd's main thread as soon as the level reads `CRITICAL`, and
+waits for the level to fall: oomd's stop of memhog ends the window when oomd is staged in its stop
+mode, and svctest's own stop through `caps[23]`, 5 s after the fill, otherwise. It then requires,
+through `caps[6]`, svcmgr's `service restarted: logd` line in the new instance's history stamped
+before svcmgr's `stop memhog` line, the first of each after the kill, and memhog's next instance to
+answer `PROBE` with a new nonce and no pages. svcmgr writes the stop line once procmgr has destroyed
 memhog, which frees the memory, and serves a stop and a restart on one event loop ([Restart
 Protocol](../svcmgr/docs/restart-protocol.md) § Death detection), so a stop asked for while it
 restarts logd waits for the restart, and the order of the two lines is the order of the restart and
@@ -485,7 +485,7 @@ The `svcmgr_worker_fault_restart` phase skips when the staged fixture set does n
 `crasher-worker`; declared, it fails if `crasher.worker` is not published within 10 s. It reads the
 instance's nonce with `PROBE_INSTANCE`, sends `PROBE_FAULT_WORKER` so a worker thread of the fixture
 faults, and requires a different nonce from the instance svcmgr restarts
-([crasher](../fixtures/crasher/README.md)).
+([crasher](../fixtures/service-modes/README.md#crasher)).
 
 The `svcmgr_boot_death` phase skips when the staged fixture set does not declare `crasher-boot`;
 declared, it fails if `crasher.boot` is not published within 10 s. It checks that svcmgr routes the
@@ -509,33 +509,33 @@ declares it), each with a non-zero usage and the service rank, and nothing when 
 below 32 it does not list, which covers svctest itself (`restart = never`), the services init
 started, logd (`critical = yes`), pwrmgr, entropyd and `stopsrc` (core roles), timed (no `oom_stop`)
 and the slots past the table. The whole `LIST_STOP_SOURCES` walk must list exactly
-[sessiond](../sessiond/README.md), and [stopsrc](../fixtures/stopsrc/README.md) when the staged set
-declares it, both with the program class; through the SEND it carries, the fixture's
+[sessiond](../sessiond/README.md), and [stopsrc](../fixtures/service-modes/README.md#stopsrc) when
+the staged set declares it, both with the program class; through the SEND it carries, the fixture's
 `LIST_CANDIDATES` must reply `SUCCESS`, `STOP_CANDIDATE` of a key it never gave `NO_CANDIDATE`, and
 stopsrc's `PROBE` `SUCCESS`, and through the fixture's `:deny` SEND, which `QUERY_ENDPOINT`
 resolves, both must reply `UNAUTHORIZED`. With `stopsrc` declared, the phase also checks that svcmgr
 creates the source contained: through `caps[22]`, `LIST_PROCESSES` must list one new process named
-`/tests/fixtures/stopsrc`, the job's first argv word, after `START_JOB`; once the fixture has exited
-(`EXIT`, which leaves the job running) and its next instance answers `PROBE` with a new nonce, the
-job's badge must leave the list within 2 s. With `crasher-worker` declared, `STOP_CANDIDATE` of its
-listed key must reply `SUCCESS`, the fixture must then answer `PROBE_INSTANCE` with a new instance's
-nonce, the restart its `on_failure` policy makes of the `EXIT_KILLED` death, and the same key must
-then reply `NO_CANDIDATE`; without it, the phase logs the skip line for that part after the checks
-above.
+`/tests/fixtures/service-modes`, the job's first argv word, after `START_JOB`; once the fixture has
+exited (`EXIT`, which leaves the job running) and its next instance answers `PROBE` with a new
+nonce, the job's badge must leave the list within 2 s. With `crasher-worker` declared,
+`STOP_CANDIDATE` of its listed key must reply `SUCCESS`, the fixture must then answer
+`PROBE_INSTANCE` with a new instance's nonce, the restart its `on_failure` policy makes of the
+`EXIT_KILLED` death, and the same key must then reply `NO_CANDIDATE`; without it, the phase logs the
+skip line for that part after the checks above.
 
 The `oom_policy` phase (`phases/oom.rs`, registered after the svcmgr phases) skips when the staged
 fixture set does not declare `memhog`. It waits for the pressure level to read `NORMAL`, sends
-`PROBE` to [memhog](../fixtures/memhog/README.md) (a nonce, 0 pages) and then `HOG`, which fills
-memory until the level reads `CRITICAL`. With oomd's `OOMD_STOP=yes`, it waits for the level to fall
-to `NORMAL` and checks that oomd logged exactly one `stopped memhog: ` line after at least its grace
-critical, and no advice line. The phase also opens, through `caps[15]`, an operator session whose
-leader runs `/tests/fixtures/programs/crashme oom-hold 512`, a job larger than `stopsrc`'s; oomd
-must log one `stopped /tests/fixtures/programs/crashme: ` line before its stop of `stopsrc`'s job,
-then stop the session, whose relay gives the leader's end, and then memhog. When the set declares
-`stopsrc`, the phase first sends the fixture `EXIT`, waits for its restarted instance's new nonce,
-so the source oomd finds started after oomd, and has it start a job of 64 pages; oomd must then log
-one `stopped stopsrc-job: ` line before its stop of memhog, and the fixture must report the job
-stopped. When crashd is staged with a stall, a child
+`PROBE` to [memhog](../fixtures/service-modes/README.md#memhog) (a nonce, 0 pages) and then `HOG`,
+which fills memory until the level reads `CRITICAL`. With oomd's `OOMD_STOP=yes`, it waits for the
+level to fall to `NORMAL` and checks that oomd logged exactly one `stopped memhog: ` line after at
+least its grace critical, and no advice line. The phase also opens, through `caps[15]`, an operator
+session whose leader runs `/tests/fixtures/programs/crashme oom-hold 512`, a job larger than
+`stopsrc`'s; oomd must log one `stopped /tests/fixtures/programs/crashme: ` line before its stop of
+`stopsrc`'s job, then stop the session, whose relay gives the leader's end, and then memhog. When
+the set declares `stopsrc`, the phase first sends the fixture `EXIT`, waits for its restarted
+instance's new nonce, so the source oomd finds started after oomd, and has it start a job of 64
+pages; oomd must then log one `stopped stopsrc-job: ` line before its stop of memhog, and the
+fixture must report the job stopped. When crashd is staged with a stall, a child
 (`/tests/fixtures/programs/crashme oom-touch 1024`) writes the pages of a demand region in turn
 during the fill, and crashd logs the write memmgr declines held, then resumed; the child's `go`
 waits until sessiond lists no candidate, so crashd's hold covers only memhog's stop. The pages
@@ -628,10 +628,13 @@ through to the normal run.
 
 Phases spawn these fixtures from `/tests/fixtures/programs/`
 ([services/fixtures/README.md](../fixtures/README.md)): `spawn-target` (procmgr, pipes and the other
-spawning phases: with no argument it prints `spawn-target ran` and exits 0; with `narrow` it tries
-to start `/tests/fixtures/crasher` and exits 0 only when refused `PermissionDenied`), `stdiotest`
-(pipes, procmgr), `pipefault` (pipes), `stackoverflow` and `relrofault` (process faults),
-`capexhaust` (recv guard), `demandpaged` (pager), `fsbench` (FS IPC), and `crashme`
+spawning phases: whatever its arguments it prints `spawn-target ran` and exits 0), `stdiotest`
+(pipes, procmgr), `program-modes`
+([services/fixtures/program-modes/README.md](../fixtures/program-modes/README.md)), one image run
+in a mode per phase: `narrow` (procmgr: it tries to start `/tests/fixtures/service-modes` and
+exits 0 only when refused `PermissionDenied`), `pipefault` (pipes), `stackoverflow` and
+`relrofault` (process faults), `capexhaust` (recv guard), `demandpaged` (pager), `threadchurn`,
+`threadstack`, `deadline` and `pipestress` (their own phases), `fsbench` (FS IPC), and `crashme`
 (`oom-hold <pages>`, run by its path through a session's leader by the `sessiond_operator` and
 `oom_policy` phases: it touches that many heap pages, prints `holding <pages>` and waits to be
 destroyed; and the crash endpoint: svctest, its recipe granting `debug_authority`, registers as the
@@ -773,12 +776,8 @@ layout](../../docs/testing.md#sysroot-layout).
 [Testing](../../docs/testing.md),
 [services/drivers/test-dma/README.md](../drivers/test-dma/README.md),
 [services/drivers/test-fault/README.md](../drivers/test-fault/README.md),
-[services/fixtures/capexhaust/README.md](../fixtures/capexhaust/README.md),
-[services/fixtures/demandpaged/README.md](../fixtures/demandpaged/README.md),
 [services/fixtures/fsbench/README.md](../fixtures/fsbench/README.md),
-[services/fixtures/pipefault/README.md](../fixtures/pipefault/README.md),
-[services/fixtures/relrofault/README.md](../fixtures/relrofault/README.md),
-[services/fixtures/stackoverflow/README.md](../fixtures/stackoverflow/README.md),
+[services/fixtures/program-modes/README.md](../fixtures/program-modes/README.md),
 [services/fixtures/stdiotest/README.md](../fixtures/stdiotest/README.md),
 [services/pwrmgr/README.md](../pwrmgr/README.md),
 [`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)

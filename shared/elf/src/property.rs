@@ -379,32 +379,47 @@ fn header_fields_hold(ehdr: &Elf64Ehdr, data: &[u8])
 
 /// [`load_segments`] yields, in table order, one item per `PT_LOAD` header and
 /// none for another type: `SegmentOverflow` when the header's file bytes pass
-/// the image's end, else the header's fields.
+/// the image's end, else the header's fields. The three parts below hold it
+/// together, and the proofs run each alone.
 pub(crate) fn segments_holds(ehdr: &Elf64Ehdr, data: &[u8])
+{
+    segments_count_holds(ehdr, data);
+    segments_fit_holds(ehdr, data);
+    segment_fields_hold(ehdr, data);
+}
+
+/// The first of the three parts of [`segments_holds`]: [`load_segments`]
+/// yields, in table order, one item per `PT_LOAD` header and none for another
+/// type, and nothing past the table.
+pub(crate) fn segments_count_holds(ehdr: &Elf64Ehdr, data: &[u8])
+{
+    let mut segments = load_segments(ehdr, data);
+    for _ in phdrs(ehdr, data).filter(|p| p.ty == PT_LOAD)
+    {
+        assert!(
+            segments.next().is_some(),
+            "a PT_LOAD header yielded nothing"
+        );
+    }
+    assert!(
+        segments.next().is_none(),
+        "a segment was yielded past the table"
+    );
+}
+
+/// The second part of [`segments_holds`]: the item yielded for the n-th
+/// `PT_LOAD` header, which the first part shows is the n-th item, is a
+/// segment exactly when the header's file bytes lie inside the image, and a
+/// refusal is `SegmentOverflow`.
+pub(crate) fn segments_fit_holds(ehdr: &Elf64Ehdr, data: &[u8])
 {
     let mut segments = load_segments(ehdr, data);
     for p in phdrs(ehdr, data).filter(|p| p.ty == PT_LOAD)
     {
         let fits = inside(p.offset, p.filesz, data.len());
-        let item = segments.next();
-        assert!(item.is_some(), "a PT_LOAD header yielded nothing");
-        match item
+        match segments.next()
         {
-            Some(Ok(s)) =>
-            {
-                assert!(fits, "a segment past the image was yielded");
-                let same = s.vaddr == p.vaddr
-                    && s.paddr == p.paddr
-                    && s.offset == p.offset
-                    && s.filesz == p.filesz
-                    && s.memsz == p.memsz
-                    && s.writable == (p.flags & 2 != 0)
-                    && s.executable == (p.flags & 1 != 0);
-                assert!(
-                    same,
-                    "a segment was yielded with other fields than its header's"
-                );
-            }
+            Some(Ok(_)) => assert!(fits, "a segment past the image was yielded"),
             Some(Err(e)) =>
             {
                 assert!(!fits, "a segment inside the image was refused");
@@ -418,10 +433,31 @@ pub(crate) fn segments_holds(ehdr: &Elf64Ehdr, data: &[u8])
             {}
         }
     }
-    assert!(
-        segments.next().is_none(),
-        "a segment was yielded past the table"
-    );
+}
+
+/// The third part of [`segments_holds`]: the segment yielded for the n-th
+/// `PT_LOAD` header, which the first part shows is the n-th item, has that
+/// header's fields.
+pub(crate) fn segment_fields_hold(ehdr: &Elf64Ehdr, data: &[u8])
+{
+    let mut segments = load_segments(ehdr, data);
+    for p in phdrs(ehdr, data).filter(|p| p.ty == PT_LOAD)
+    {
+        if let Some(Ok(s)) = segments.next()
+        {
+            let same = s.vaddr == p.vaddr
+                && s.paddr == p.paddr
+                && s.offset == p.offset
+                && s.filesz == p.filesz
+                && s.memsz == p.memsz
+                && s.writable == (p.flags & 2 != 0)
+                && s.executable == (p.flags & 1 != 0);
+            assert!(
+                same,
+                "a segment was yielded with other fields than its header's"
+            );
+        }
+    }
 }
 
 /// [`tls_segment`] is the first `PT_TLS` header's template: refused when its

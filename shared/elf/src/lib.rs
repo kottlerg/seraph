@@ -2682,7 +2682,13 @@ mod tests
 /// entries fixed after them, the records on at most two, the note walk on 48
 /// bytes, and the locators on two section headers at offset 64 for a note of
 /// a two-byte section name and a one-byte owner, which the name-compare and
-/// note-step proofs stand behind for the stack note's names. The reads that
+/// note-step proofs stand behind for the stack note's names. Each base holds
+/// two elements, not one, because a base of one and the step proofs leave out
+/// the loop carrying its state from one element to the next: an iterator's
+/// index and its stop after a refusal, the span carried, a search's stop at
+/// its first match. The base proves that carrying once, and the driving loops
+/// below repeat it. A base of one header costs nearly what two do, since a
+/// proof's cost lies in a header's symbolic fields. The reads that
 /// feed the walks are proven at any place: `read_phdr_at`, `read_shdr`,
 /// `read_shdr_streaming`, `slice_at` and `read_exact_at`. The header proof
 /// covers the header checks whole, a proof the record decode, and one
@@ -2762,9 +2768,14 @@ mod proofs
             .map(|(ehdr, _)| (ehdr, data))
     }
 
-    /// `load_segments` yields each `PT_LOAD` header of a table of at most two.
-    /// The longest loop is the walk of the two, so an unwind bound of 3 covers
-    /// it.
+    /// `load_segments` yields one item for each `PT_LOAD` header of a table of
+    /// at most two, in order, and nothing past the table. `property::segments_holds`
+    /// is split over this proof and the two after it, to keep each within the
+    /// CI time budget: this one fixes which item belongs to which header, the
+    /// next whether each item is a segment or a refusal, and the third each
+    /// segment's fields. Together they are the property whole, and none drops
+    /// a case. The longest loop is the walk of the two, so an unwind bound of
+    /// 3 covers it.
     #[kani::proof]
     #[kani::unwind(3)]
     fn every_load_segment_is_its_header()
@@ -2772,7 +2783,38 @@ mod proofs
         let data = image::<IMAGE>();
         if let Some((ehdr, data)) = accepted(&data)
         {
-            property::segments_holds(&ehdr, data);
+            property::segments_count_holds(&ehdr, data);
+        }
+    }
+
+    /// The item `load_segments` yields for each `PT_LOAD` header of a table of
+    /// at most two is a segment exactly when the header's file bytes fit the
+    /// image, and otherwise `SegmentOverflow`: the second part of
+    /// `property::segments_holds`, beside
+    /// `every_load_segment_is_its_header`. Unwind bound 3, as there.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn every_load_segment_fits_or_is_refused()
+    {
+        let data = image::<IMAGE>();
+        if let Some((ehdr, data)) = accepted(&data)
+        {
+            property::segments_fit_holds(&ehdr, data);
+        }
+    }
+
+    /// The segment `load_segments` yields for each `PT_LOAD` header of a table
+    /// of at most two has that header's fields: the third part of
+    /// `property::segments_holds`, beside
+    /// `every_load_segment_is_its_header`. Unwind bound 3, as there.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn every_load_segment_has_its_headers_fields()
+    {
+        let data = image::<IMAGE>();
+        if let Some((ehdr, data)) = accepted(&data)
+        {
+            property::segment_fields_hold(&ehdr, data);
         }
     }
 
@@ -3096,11 +3138,14 @@ mod proofs
 
     /// A section header at any place, index and entry size is read from its 64
     /// bytes, in memory and streamed, when they lie inside the data, of up to
-    /// two headers' bytes and 8 more, and refused otherwise. No loop.
+    /// one header's bytes and 8 more, and refused otherwise. No loop: the place
+    /// is `shoff + index * shentsize`, all three any value, so a read inside
+    /// the data, one across its end and one whose place overflows are each
+    /// reached within one header's room.
     #[kani::proof]
     fn every_section_header_is_read_at_its_place()
     {
-        let data: [u8; 2 * 64 + 8] = kani::any();
+        let data: [u8; 64 + 8] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= data.len());
         property::shdr_read_holds(&data[..len], kani::any(), kani::any(), kani::any());

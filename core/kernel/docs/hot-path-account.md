@@ -159,7 +159,7 @@ Not taken:
 
 - The zeroing of memory on retype and free (most of `ktest.thread_lifecycle`'s `memset`):
   it is what keeps one owner's data from the next, and the account shows no excess in it.
-- The entry and exit stubs (70 / 151 per syscall): they save and restore the full trap frame,
+- The entry and exit stubs (70 / 150 per syscall): they save and restore the full trap frame,
   which faults, upcalls and the debugger read; a syscall-only frame changes that contract for a
   saving the account does not yet bound, and is not on this list.
 

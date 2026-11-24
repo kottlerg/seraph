@@ -364,8 +364,8 @@ A sync is a merge of `master` into the PR's branch, and its incoming diff is wha
 brings in: the diff from the PR's merge base with `master` before the sync to its merge base
 after it.
 
-- Every sync owes a passing CI run on the synced head, which builds and boots both
-  architectures there.
+- Every sync owes a passing CI run on the synced head, which boots the cells the PR's change
+  owes there (§ CI Gating).
 - What else a sync owes is judged on its incoming diff restricted to the files the PR's own
   diff touches (`git diff <merge base before> <merge base after> -- <the PR's files>`); the rest
   of the incoming diff, in files the PR does not touch, does not count. When that restricted
@@ -547,13 +547,9 @@ gives the PR-level linear view.
 
 - Pull request required before merging.
 - Required status checks (not strict: a branch need not be up to date with
-  `master`, § Syncing with `master`): `host-tests`, `fuzz`, `kani`,
-  `validate (x86_64, debug, ktest)`, `validate (x86_64, debug, svctest)`,
-  `validate (x86_64, debug, usertest)`, `validate (x86_64, release, ktest)`,
-  `validate (x86_64, release, svctest)`, `validate (x86_64, release, usertest)`,
-  `validate (riscv64, debug, ktest)`, `validate (riscv64, debug, svctest)`,
-  `validate (riscv64, debug, usertest)`, `validate (riscv64, release, ktest)`,
-  `validate (riscv64, release, svctest)`, `validate (riscv64, release, usertest)`.
+  `master`, § Syncing with `master`): `summary`, the `build-test` job that judges every
+  other job of the run (§ CI Gating). A check that does not report blocks a merge, and a cell
+  runs only when its change owes it, so no cell is a required check of its own.
 - Required signed commits.
 - Force pushes blocked.
 - Branch deletion blocked.
@@ -614,6 +610,34 @@ PR merges only at a head that contains `master`, whose own green CI shows
 the combination green, and `cargo xtask pr-check <N> --gate` refuses any
 other. A release is cut
 only from a green `master` (§ Release Production).
+
+A CI run boots the cells its change owes, not every cell. The `select` job of `build-test.yml`
+places each file the change touches by the layer record (`cargo xtask cells`,
+[xtask/README.md](../xtask/README.md#cargo-xtask-cells)), and the run owes the cells of the most
+demanding file:
+
+- A file of the kernel layer owes every cell: the kernel, the bootloader, ktest, the ABI crates,
+  and every crate one of them links. So does an input of every build: the toolchain pin,
+  `Cargo.lock`, the workflows, and the parts of xtask that build, stage or boot an image.
+- A file of the services or programs layer owes the svctest and usertest cells and the `bench`
+  cell's ubench boots, and no ktest cell. This covers the runtime, the std port, and the crates
+  std links that no kernel-layer crate links.
+- Markdown, the instruction files, and host tooling that no cell runs owe no boot. `host-tests`,
+  which runs on every change, lints the host crates as a cell's build does.
+
+A file the record does not place fails the run.
+
+The change is measured from the newest commit of the first-parent history before the run's commit
+whose `build-test` run on a push to `master` passed. For a pull request that history starts at
+`master`'s tip, which its merge commit's first parent is. A cell that a red or unfinished
+`master` run left unproven therefore stays owed by every later run until a run proves it. When no
+such commit is found, or the runs cannot be read, every cell is owed.
+
+`host-tests` runs on every change. `kani` proves the crates the change can affect, and `fuzz`
+runs when the change can affect a crate it fuzzes, its engine, or xtask, which drives it. Both
+measure the change from the same base as the cells, so a proof or a fuzz run that a red `master`
+run left unproven stays owed too. The `summary` job reports the run: it fails when a job failed
+or was cancelled, or was skipped although the change owed it.
 
 The `kani` check gates a pull request on the bounded proofs of the crates
 the change can affect, not on the whole set, which runs in burn-in and in

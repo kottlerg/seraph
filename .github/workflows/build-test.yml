@@ -3,9 +3,11 @@
 
 # .github/workflows/build-test.yml
 
-# The canonical CI tier: host tests and the architecture x profile x harness
-# boots every push and pull request runs (docs/build-system.md
-# § Continuous Integration).
+# The canonical CI tier: host tests on every push and pull request, and the
+# architecture x profile x harness boots and the benchmark cell the change
+# owes, which the select job computes (docs/build-system.md § Continuous
+# Integration; docs/testing.md § Coverage tiers). The summary job is the one
+# check branch protection requires.
 
 name: build-test
 
@@ -22,6 +24,12 @@ on:
           empty proves every crate
         required: false
         default: ''
+      cells-since:
+        description: >-
+          The commit the select job computes the owed cells from; empty
+          owes every cell
+        required: false
+        default: ''
 
 # A pull request's newer push cancels its older run. Every other run (each
 # push to master, each merge commit among them) is grouped by its commit, so
@@ -35,6 +43,58 @@ permissions:
   contents: read
 
 jobs:
+  select:
+    # The cells the change owes (`cargo xtask cells`, xtask/README.md): its
+    # base is the newest commit of the first-parent history before this one
+    # whose build-test run on a push to master passed, so a cell a red or
+    # unfinished master run left unproven stays owed; a dispatch selects
+    # from its input, or owes every cell. Reading the runs needs
+    # `actions: read`.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      validate: ${{ steps.cells.outputs.validate }}
+      validate-owed: ${{ steps.cells.outputs.validate-owed }}
+      bench: ${{ steps.cells.outputs.bench }}
+      bench-owed: ${{ steps.cells.outputs.bench-owed }}
+      ktest-bench: ${{ steps.cells.outputs.ktest-bench }}
+      fuzz-owed: ${{ steps.cells.outputs.fuzz-owed }}
+      base: ${{ steps.cells.outputs.base }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The base is found in, and diffed against, the history, which a
+          # depth of 1 leaves out.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-10
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: select
+
+      - name: Select the owed cells
+        id: cells
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          DISPATCHED: ${{ inputs.cells-since }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$EVENT" in
+            pull_request|push) base=(--since-green HEAD^1) ;;
+            *) if [ -n "$DISPATCHED" ]; then base=(--since "$DISPATCHED"); else base=(); fi ;;
+          esac
+          cargo xtask cells "${base[@]}" --github-output "$GITHUB_OUTPUT" | tee "$RUNNER_TEMP/cells.log"
+          sed -n 's/^WARNING: /::warning title=cells::/p' "$RUNNER_TEMP/cells.log"
+          { echo '```'; cat "$RUNNER_TEMP/cells.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
   host-tests:
     runs-on: ubuntu-latest
     steps:
@@ -97,6 +157,7 @@ jobs:
     # docs/build-system.md § Toolchain); burnin.yml proves every crate.
     # Installing the release and its setup take seconds, so nothing of Kani
     # is cached.
+    needs: select
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -115,20 +176,19 @@ jobs:
         with:
           shared-key: kani
 
-      # The base: on a pull request the first parent of the merge commit
-      # checked out, the base it merges into; on a push the commit the push
-      # moved master from; on a dispatch its input, or none, which proves
-      # every crate.
+      # The base: on a pull request or a push the one the select job found,
+      # the newest commit before this one whose master run passed, so a proof
+      # a red master run left unproven stays owed; on a dispatch its input.
+      # None proves every crate.
       - name: Select the affected crates
         id: select
         env:
           EVENT: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
+          SELECTED: ${{ needs.select.outputs.base }}
           DISPATCHED: ${{ inputs.kani-since }}
         run: |
           case "$EVENT" in
-            pull_request) base=$(git rev-parse HEAD^1) ;;
-            push) base=$BEFORE ;;
+            pull_request|push) base=$SELECTED ;;
             *) base=$DISPATCHED ;;
           esac
           if [ -n "$base" ]; then
@@ -169,6 +229,11 @@ jobs:
   # then every target for the default execution count from seed 0, from the
   # checked-in inputs alone, so a run is reproduced by the same command.
   fuzz:
+    # Run when the select job owes it: the change reaches the build of the
+    # fuzz targets, the engine or a crate they fuzz, or xtask, which drives
+    # them, or the workflows.
+    needs: select
+    if: needs.select.outputs.fuzz-owed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -209,24 +274,26 @@ jobs:
   validate:
     # After the qemu-debs job, which seeds the firmware entry and the .deb
     # set of its own image; see docs/build-system.md § Continuous
-    # Integration.
-    needs: qemu-debs
+    # Integration. The cells are the ones the select job owes; when it owes
+    # none, `if` skips the job, since a job of an empty matrix fails.
+    needs: [select, qemu-debs]
+    if: needs.select.outputs.validate-owed == 'true'
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
-      matrix:
-        arch: [x86_64, riscv64]
-        profile: [debug, release]
-        # One harness per cell: each cell builds once, stages exactly one
-        # recipe (or swaps boot.conf for ktest), then runs once. Avoids
-        # back-to-back fatfs/sysroot state accumulation across harnesses
-        # and lets a failing tier surface as a single named cell. After its
-        # boot, each cell runs the host-driven cases `cargo xtask test`'s
-        # registry assigns to its tester (`cargo xtask test --cell`): they
-        # need a runner that drives QEMU from the host (QMP, a gdbstub), not
-        # `run --runs`, and colocating them avoids a matrix dimension that
-        # would multiply with every arch. See docs/testing.md.
-        tester: [svctest, usertest, ktest]
+      # Each cell is one of arch [x86_64, riscv64] x profile [debug, release]
+      # x tester [svctest, usertest, ktest], in that key order, so its check
+      # is named `validate (<arch>, <profile>, <tester>)`. One harness per
+      # cell: each cell builds once, stages exactly one
+      # recipe (or swaps boot.conf for ktest), then runs once. Avoids
+      # back-to-back fatfs/sysroot state accumulation across harnesses
+      # and lets a failing tier surface as a single named cell. After its
+      # boot, each cell runs the host-driven cases `cargo xtask test`'s
+      # registry assigns to its tester (`cargo xtask test --cell`): they
+      # need a runner that drives QEMU from the host (QMP, a gdbstub), not
+      # `run --runs`, and colocating them avoids a matrix dimension that
+      # would multiply with every arch. See docs/testing.md.
+      matrix: ${{ fromJSON(needs.select.outputs.validate) }}
     steps:
       - uses: actions/checkout@v6
 
@@ -501,13 +568,15 @@ jobs:
     # baselines (xtask/README.md § `cargo xtask bench-check`; docs/testing.md
     # § Gating). After the
     # qemu-debs job, as validate is; see docs/build-system.md § Continuous
-    # Integration.
-    needs: qemu-debs
+    # Integration. The select job owes the cell, and within it the ktest
+    # boots apart: when it does not owe them they are skipped, and so are
+    # the ktest suite's baselines.
+    needs: [select, qemu-debs]
+    if: needs.select.outputs.bench-owed == 'true'
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
-      matrix:
-        arch: [x86_64, riscv64]
+      matrix: ${{ fromJSON(needs.select.outputs.bench) }}
     steps:
       - uses: actions/checkout@v6
 
@@ -542,6 +611,7 @@ jobs:
           cargo xtask mkdisk --arch ${{ matrix.arch }} --harness ktest
 
       - name: Boot it under icount
+        if: needs.select.outputs.ktest-bench == 'true'
         # Three one-CPU runs, whose counts the gate compares, and one
         # four-CPU run, whose counts it reports. A boot takes about 15 s.
         run: |
@@ -577,10 +647,19 @@ jobs:
 
       - name: cargo xtask bench-check
         # Writes the cell's environment beside its logs, for
-        # `cargo xtask bench-baseline --from-run`.
+        # `cargo xtask bench-baseline --from-run`, whose rewrite leaves the
+        # files of a suite the logs measure nothing of.
+        shell: bash
+        env:
+          KTEST: ${{ needs.select.outputs.ktest-bench }}
         run: |
+          if [ "$KTEST" = true ]; then
+            ktest=(target/xtask/bench/*.log)
+          else
+            ktest=(--skip-suite ktest)
+          fi
           cargo xtask bench-check --mode icount \
-            --write-env target/xtask/bench/ENV target/xtask/bench/*.log \
+            --write-env target/xtask/bench/ENV "${ktest[@]}" \
             target/xtask/bench/ubench/*.log
 
       - name: Upload the benchmark logs
@@ -601,3 +680,40 @@ jobs:
         with:
           mode: save
           name: bench-${{ matrix.arch }}
+
+  summary:
+    # The one check branch protection requires (docs/conventions.md § Branch
+    # protection): it fails when a job failed or was cancelled, or was
+    # skipped although the select job owed it; a job skipped because the
+    # change owes it nothing passes. A check that never reports blocks a
+    # merge, so the cells, which run only when owed, are not required
+    # checks themselves.
+    needs: [select, host-tests, kani, fuzz, qemu-debs, validate, bench]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Judge the jobs
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          VALIDATE_OWED: ${{ needs.select.outputs.validate-owed }}
+          BENCH_OWED: ${{ needs.select.outputs.bench-owed }}
+          FUZZ_OWED: ${{ needs.select.outputs.fuzz-owed }}
+        run: |
+          failed=0
+          for job in $(jq -r 'keys[]' <<<"$NEEDS"); do
+            result=$(jq -r --arg job "$job" '.[$job].result' <<<"$NEEDS")
+            case "$job" in
+              validate) owed=$VALIDATE_OWED ;;
+              bench) owed=$BENCH_OWED ;;
+              fuzz) owed=$FUZZ_OWED ;;
+              *) owed=true ;;
+            esac
+            if [ "$result" = success ] || { [ "$result" = skipped ] && [ "$owed" != true ]; }; then
+              echo "$job: $result (owed: $owed)"
+            else
+              echo "::error title=summary::$job: $result (owed: $owed)"
+              failed=1
+            fi
+          done
+          exit $failed

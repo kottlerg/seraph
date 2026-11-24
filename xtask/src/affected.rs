@@ -106,8 +106,8 @@ impl Workspace
         not(test),
         expect(
             dead_code,
-            reason = "the graph's API for the layer table (#1591) and the CI cell selection \
-                      (#1592); until they call it, only its tests do"
+            reason = "only the tests of the graph and of the layer record (xtask/src/layers.rs) \
+                      read every package"
         )
     )]
     pub fn packages(&self) -> &[Package]
@@ -124,14 +124,6 @@ impl Workspace
     /// The package `path` (relative to the root) lies in: the one whose
     /// directory holds it most deeply, so a package nested in another's
     /// directory owns its own files; `None` when no package's does.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the graph's API for the layer table (#1591) and the CI cell selection \
-                      (#1592); until they call it, only its tests do"
-        )
-    )]
     pub fn package_of(&self, path: &str) -> Option<&Package>
     {
         self.packages
@@ -157,14 +149,6 @@ impl Workspace
     /// The package named `name` and every workspace package whose path
     /// dependencies reach it, of every kind and on every target, the package
     /// itself first; `None` when no package has that name.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the graph's API for the layer table (#1591) and the CI cell selection \
-                      (#1592); until they call it, only its tests do"
-        )
-    )]
     pub fn dependents(&self, name: &str) -> Option<Vec<&Package>>
     {
         let root = self.package(name)?;
@@ -174,6 +158,17 @@ impl Workspace
                 .filter(|p| p.deps.contains(&package.dir))
                 .collect()
         }))
+    }
+
+    /// The tracked sources that name `path` (relative to the root) as a file
+    /// they read, in an `include!`, `include_str!`, `include_bytes!` or
+    /// `#[path]` string literal.
+    pub fn readers_of<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a str> + 'a
+    {
+        self.reads
+            .iter()
+            .filter(move |(_, read)| read == path)
+            .map(|(source, _)| source.as_str())
     }
 
     /// The first file of `changed` (paths relative to the root) that is an
@@ -218,7 +213,7 @@ pub fn first_under<'a>(changed: &'a [String], inputs: &[&str]) -> Option<&'a Str
 
 /// Whether `file` is `input` or lies under it, `input` being a file or a
 /// directory, with or without its closing `/`.
-fn under(file: &str, input: &str) -> bool
+pub fn under(file: &str, input: &str) -> bool
 {
     let dir = input.trim_end_matches('/');
     file == dir
@@ -403,7 +398,7 @@ fn read_of(hit: &str) -> Option<(String, String)>
 
 /// Run `git` with `args` in `root` and return its output; fails on a
 /// non-zero exit, naming git's error.
-fn git(root: &Path, args: &[&str]) -> Result<String>
+pub fn git(root: &Path, args: &[&str]) -> Result<String>
 {
     let output = Command::new("git")
         .args(args)

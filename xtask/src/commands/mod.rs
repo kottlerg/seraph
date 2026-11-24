@@ -9,6 +9,7 @@ pub mod bench_baseline;
 pub mod bench_check;
 pub mod build;
 pub mod capture_acpi;
+pub mod cells;
 pub mod clean;
 pub mod compare_images;
 pub mod crypto_vectors;

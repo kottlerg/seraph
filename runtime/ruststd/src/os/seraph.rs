@@ -2542,12 +2542,16 @@ pub mod thread {
     /// (runtime/ruststd/README.md § Runtime threads). The thread is not
     /// counted among the application's (`checkpoint::quiesce`).
     ///
-    /// The wait has no bound and covers the thread's registration with
-    /// procmgr (README § Thread registration). It ends on every path of the
-    /// thread that does not end the process: `main` signals, or drops its
-    /// signal when it returns or unwinds. A fault that kills the thread, a
-    /// refused stack fault among them, ends the process, this thread with it
-    /// (docs/process-lifecycle.md § Exit reason).
+    /// The wait covers the thread's registration with procmgr (README
+    /// § Thread registration) and has no bound of its own. It ends on every
+    /// path of the thread that does not end the process: `main` signals, or
+    /// drops its signal when it returns or unwinds. A fault that kills the
+    /// thread, a refused stack fault among them, ends the process, this thread
+    /// with it (docs/process-lifecycle.md § Exit reason). Inside a call
+    /// deadline (`with_call_deadline`) it also ends at the deadline, and this
+    /// returns the thread's handle with the thread still on its way to its
+    /// wait: the caller's next bounded call then fails `TimedOut` (README
+    /// § Call deadline).
     ///
     /// # Errors
     /// The spawn's own error, or an error when `main` returned or unwound
@@ -2574,8 +2578,15 @@ pub mod thread {
                         "runtime thread {name} ended before it reached its wait"
                     )));
                 }
-                // An early or spurious return: the park contract allows one.
-                _ => crate::thread::park(),
+                // Not at its wait yet. A park may return early or spuriously,
+                // which the loop's recheck absorbs.
+                _ => match super::call_time_left() {
+                    None => crate::thread::park(),
+                    // The caller's deadline has passed: return without the
+                    // ordering rather than past the deadline.
+                    Some(left) if left.is_zero() => return Ok(handle),
+                    Some(left) => crate::thread::park_timeout(left),
+                },
             }
         }
     }

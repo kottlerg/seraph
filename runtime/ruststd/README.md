@@ -837,8 +837,9 @@ neither can deadlock, since that request does not wait on the new thread:
 Two patterns would deadlock once they hold every one of procmgr's request workers, and no in-tree
 process follows either: a spawner that waits on its new thread without bound while procmgr waits on
 that spawner, as a runtime thread's spawner would be in a process a request of procmgr's waits on
-(procmgr's unbounded calls go to memmgr and to filesystem nodes, whose servers neither open a
-`std::fs::File` nor spawn a child with a piped stream); and a process that hands procmgr a cap
+without bound (procmgr's unbounded calls go to memmgr, its endpoint and the nodes it serves, and to
+procmgr's own crash decliner; its calls on a file server are bounded by `FILE_CAP_CALL_TIMEOUT_MS`);
+and a process that hands procmgr a cap
 which a newly spawned thread serves (a file or node for `CREATE_FROM_FILE`, say) before that
 thread's registration has been served, so procmgr's call on the cap waits on a thread that waits
 for a free worker. The second holds only until procmgr's bound on each call on a caller-supplied
@@ -866,11 +867,12 @@ after a spawn returns thus finds the spawn's whole charge, as svctest's `crashd_
 relies on when it compares the readings on either side of a refused live-core request
 (`check_live_no_core` in `services/svctest/src/phases/crashd.rs`).
 
-The wait has no bound and covers the thread's registration with procmgr (§ Thread registration).
-It ends on every path of the thread that does not end the process: the thread signals at its wait,
-or drops its signal when its main returns or unwinds first, which fails the spawn with an error. A
-fault that kills the thread, a stack fault the pager refuses for the process's budget among them,
-ends the whole process, the waiting spawner with it
+The wait covers the thread's registration with procmgr (§ Thread registration) and has no bound of
+its own; inside a call deadline it also ends at the deadline (§ Call deadline). It ends on every
+path of the thread that does not end the process: the thread signals at its wait, or drops its
+signal when its main returns or unwinds first, which fails the spawn with an error. A fault that
+kills the thread, a stack fault the pager refuses for the process's budget among them, ends the
+whole process, the waiting spawner with it
 ([docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Exit reason); a refused fault the
 crash service holds for memory holds the spawner until the service resumes or declines it
 ([crashd Operation](../../services/crashd/docs/operation.md) § Hold).
@@ -899,7 +901,10 @@ trust to answer, as crashd bounds a fault's report and a core dump
   `UNIX_EPOCH` from `SystemTime::now`, `None` from the registry lookup, and a dropped line from
   the log. Such a call may have reached its server, which may have acted on it, and whose reply
   then finds no caller. A spawn's wait for its child's bootstrap requests (§ Bootstrap caps), which
-  is a receive, ends at the deadline too, and fails the spawn `TimedOut`. A `File` dropped past
+  is a receive, ends at the deadline too, and fails the spawn `TimedOut`. So does the wait of a
+  piped `Command::spawn`, or of a process's first `File::open`, for the runtime thread it starts
+  to reach its wait (§ Runtime threads): the call goes on with the thread still on its way, its
+  charge not yet ordered, and its next IPC call fails it `TimedOut`. A `File` dropped past
   the deadline sends no `FS_CLOSE`: the session table keeps its open cap, and the process's next
   `File::open`, or its exit hook, sends the close within a bound of its own for the whole drain
   (`KEPT_CLOSE_DRAIN`) and that thread's deadline, whichever ends first, so a thread with no
@@ -1060,7 +1065,8 @@ dropped, so it cannot drift from the values alive. A value the application forge
 accepted, as the leak of the capability is. The runtime's own threads, the fs release handler and
 a child's death bridge, are spawned through `thread::runtime_spawn` and not counted: their spawn
 returns once they are at their wait (§ Runtime threads), and they are idle there whenever the counts
-are zero. The filesystem session table (§ Filesystem sessions)
+are zero, apart from a release handler whose start a call deadline cut, which reaches its wait on
+its own once procmgr answers its registration. The filesystem session table (§ Filesystem sessions)
 keeps its sessions' caps past a quiesce point in a `rebound` static, which the restore entry
 forgets.
 

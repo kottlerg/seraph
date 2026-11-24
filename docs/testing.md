@@ -467,8 +467,11 @@ over the runs that reported its suite with its baseline under `xtask/baselines/b
 
 The one-CPU counts gate: a count further from its baseline than the larger of 1% of it and 8
 instructions, in either direction, fails the cell, as does a measurement with no baseline, a
-baseline no run measured, and a benchmark's `FAIL` line. A count that fell past its band fails
-too, since the stale baseline would let a later regression of the same size through. A PR that
+baseline no run measured, and a benchmark's `FAIL` line. A run whose change owes no ktest cell
+skips the ktest boots and does not check the ktest suite's baselines (`bench-check --skip-suite
+ktest`), and a rewrite from that run leaves the ktest suite's files as they are. A count that fell
+past its band fails too, since the stale baseline would let a later regression of the same size
+through. A PR that
 moves a count on purpose rewrites the baselines of the benchmarks it moved from its own CI run
 (`cargo xtask bench-baseline --from-run <run id>`) and states the change and its reason in its
 body. The four-CPU counts are reported, not gated: the interleaving of the CPUs moves them.
@@ -1211,11 +1214,12 @@ another.
 
 ## Coverage tiers
 
-The matrix CI exercises is exhaustive in three dimensions and fixed in the
-rest. Coverage is tiered so the fixed dimensions still get exercised — just
+The matrix CI exercises is exhaustive in three dimensions, over the cells a change owes, and
+fixed in the rest. Coverage is tiered so the fixed dimensions still get exercised — just
 not on every push.
 
-**Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
+**Dimension inventory.** Exhaustive per CI run, over the cells its change owes
+([conventions.md § CI Gating](conventions.md#ci-gating)): architecture (x86_64,
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest), and the `bench` cell
 beside them (release, one CPU and four, under icount; [Benchmarks](#benchmarks-bench-cell)).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
@@ -1251,7 +1255,7 @@ to the tiers below.
 
 | Tier | Where | When | Coverage |
 |---|---|---|---|
-| Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
+| Canonical | `build-test.yml` | every push / PR: the cells its change owes ([conventions.md § CI Gating](conventions.md#ci-gating)) | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof (`cargo xtask kani`, [Bounded verification](#bounded-verification)) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
@@ -2170,7 +2174,7 @@ fails as the search did, on any host. The run exits non-zero.
 
 | Tier | Where | When | Runs |
 |---|---|---|---|
-| Gating | CI, the `fuzz` job of `build-test.yml` | every push and pull request | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
+| Gating | CI, the `fuzz` job of `build-test.yml` | a change that can affect a crate it fuzzes, its engine, xtask or the workflows; skipped as not owed otherwise | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
 | Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
 | Local | developer host | at will | `cargo xtask fuzz <target>` with `--runs` or `--time` |
 
@@ -2221,16 +2225,18 @@ cover the inputs it covered; no property is dropped or narrowed to meet it. A PR
 harness for the budget states its time before and after.
 
 **Where the proofs run.** On a pull request, CI's `kani` job verifies only the crates the change
-can affect (`cargo xtask kani --since` against the pull request's base): a crate that holds a
-harness and whose own package, a workspace package in its dependency closure, or a file those
-read, the change touches, and every such crate when the change touches an input of every build
-(the workspace manifest and lock file, Cargo's configuration, the toolchain pin, the command's own
-sources and the job itself). That selection gates the merge, and a pull request that affects no
-such crate ends the job without installing Kani, with a notice on the run that it verified
-nothing. On a push to `master` the job runs the same selection against the commit the push
-moved from. The whole set runs in the `kani` job of `burnin.yml`, on each tag push and on a
-manual dispatch, and in the release host runs (§ Coverage tiers), so a change the selection
-missed is found before a tag ([build-system.md](build-system.md#continuous-integration)
+can affect (`cargo xtask kani --since` against the base the `select` job found, the newest commit
+before the run's whose `master` run passed; [conventions.md](conventions.md#ci-gating) § CI
+Gating): a crate that holds a harness and whose own package, a workspace package in its
+dependency closure, or a file those read, the change touches, and every such crate when the
+change touches an input of every build (the workspace manifest and lock file, Cargo's
+configuration, the toolchain pin, the command's own sources and the job itself). That selection
+gates the merge, and a pull request that affects no such crate ends the job without installing
+Kani, with a notice on the run that it verified nothing. On a push to `master` the job runs the
+same selection from the same kind of base, so a harness a red `master` run left unproven stays
+owed until a run proves it. The whole set runs in the `kani` job of `burnin.yml`, on each tag
+push and on a manual dispatch, and in the release host runs (§ Coverage tiers), so a change the
+selection missed is found before a tag ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
 
 **Local sizing.** A harness is sized on the development host before CI runs it. The author of a

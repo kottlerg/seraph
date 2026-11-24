@@ -396,11 +396,11 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
    checkout. A gate whose records you cannot read is not verified.
 2. `git fetch origin`, then `cargo xtask pr-check <N> --gate`. It checks the commits (subject,
    references, closing keywords, attribution, signatures), the PR body (boxes, validated head
-   and its comment-only delta), the Issues the PR closes or references (the ticks of both, the
-   milestone of those it closes), the check rollup and merge state, that `master` is an
-   ancestor of the head or that `master`'s change since the merge base touches none of the
-   PR's files on a green `master` (it prints which case held), and the run record for the
-   head.
+   and its comment-only delta, tool output), the Issues the PR closes or references (the ticks
+   and the tool output of both, the milestone of those it closes), the check rollup and merge
+   state, that `master` is an ancestor of the head or that `master`'s change since the merge
+   base touches none of the PR's files on a green `master` (it prints which case held), and the
+   run record for the head.
 3. Read what the command cannot decide: when it prints `gate-defects-recorded`, that each
    defect a run recorded off the surface is on its Issue (docs/conventions.md § Findings); for
    records of the earlier form, when it prints `gate-findings-recorded`, that each finding it
@@ -431,12 +431,16 @@ names is recorded there and leads to no PR. Once a check hands back and leaves t
 nothing is left for it: remove its parked worktree (§ Worktree removal). A defect PR's own merge
 owes a check on the same terms as any other, and the worktree then waits for that check.
 
-Order merges to minimize re-validation. A PR whose merge touches no file another open PR
-touches costs the others nothing, and one that touches their files only in Markdown or comments
-costs those a sync and a CI run, so merge it as soon as its gate passes. Hold a PR at its gate
-only when its merge touches files another open PR touches and merging it later would force
-fewer re-validations; among such PRs, merge first the one whose later syncs the others have not
-validated yet.
+Order merges to minimize re-validation. A PR that other open PRs are stacked on (their branches
+hold its commits) merges first: before any PR that touches files it touches, and as soon as its
+gate passes, never held at its gate for them, since the PRs stacked on it cannot merge before it.
+Its cost is that each open PR sharing its files pays a sync onto it, with what that sync owes
+(docs/conventions.md § Syncing with `master`). Of the other PRs, one whose merge touches no file
+another open PR touches costs the others nothing, and one that touches their files only in
+Markdown or comments costs those a sync and a CI run, so merge it as soon as its gate passes.
+Hold a PR at its gate only when its merge touches files another open PR touches and merging it
+later would force fewer re-validations; among such PRs, merge first the one whose later syncs the
+others have not validated yet.
 
 `--delete-branch` removes the remote branch, and a worker whose worktree sits on it may not be
 resumable afterwards. Before merging a worker's last PR, make sure nothing is left for it. If a
@@ -455,7 +459,10 @@ as a ruling and tell the maintainer in one line (§ Reporting to the maintainer)
 before it is built or merged; put it to them once per batch where a standing answer makes
 sense, and keep their answer in the record. A case with no clearly best option is not a reason
 to hand the choice over: do the reading that separates the options, pick, and say what remains
-uncertain.
+uncertain. A batch ruling or a spawn prompt adds to what the documents require of a review and
+never replaces or reassigns an agent that docs/conventions.md § Pre-merge review names: the
+verdict and the audit of a run record are the `pr-reviewer`'s and the `pr-auditor`'s output,
+never a worker's own (`.claude/agents/worker.md` § Review).
 
 - **A finding that is not a defect.** A review reports defects only (docs/conventions.md
   § Findings). A worker disputes a finding that is not one as a contested finding, below; it

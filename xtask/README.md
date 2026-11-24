@@ -44,6 +44,10 @@ xtask/
 │   │                           #   and the report of QEMU's exit under a harness
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── image_check.rs          # The check every pack makes of the images it wrote (fsck.fat, ESP)
+│   ├── layers.rs               # The layer record: the class of each path, which sets the CI
+│   │                           #   cells a change to it owes (cells)
+│   ├── markdown.rs             # Fenced code blocks, as lint-docs and the PR and Issue checks read
+│   │                           #   Markdown
 │   ├── path_account.rs         # The per-path instruction account: the images a boot placed,
 │   │                           #   attribution, the result file, the documents' blocks
 │   ├── path_record.rs          # The path-account plugin's record: reads, windows, rows
@@ -68,7 +72,7 @@ xtask/
 │   │   │                       #   interactive boot; run/classified.rs, --runs),
 │   │   │                       #   ktest_timing, bench_check, bench_baseline, path_account,
 │   │   │                       #   symbolize,
-│   │   │                       #   mkdisk, clean, crypto_vectors, fuzz, kani,
+│   │   │                       #   mkdisk, clean, crypto_vectors, fuzz, kani, cells,
 │   │   │                       #   compare_images, lint_docs, pr_check, review,
 │   │   │                       #   release_scope, threat_scope, issue, orch, hook, host,
 │   │   │                       #   trust_request)
@@ -685,8 +689,8 @@ Run Seraph's tests: the unit tests, and the host-driven QEMU cases.
 
 #### Unit tests
 
-Check the formatting of the selected packages, lint the test code, then run Seraph unit tests on
-the host target and under riscv64 emulation.
+Check the formatting of the selected packages, lint the test code and, over the whole workspace,
+the host crates, then run Seraph unit tests on the host target and under riscv64 emulation.
 
 ```
 cargo xtask test [--component boot|protocol|kernel|init|all]
@@ -707,6 +711,12 @@ lints its test configuration for the host target alone, against the prebuilt `st
 host-only, so no riscv64 Linux build of it runs. Every pass allows the lints `TEST_RELAXED_LINTS`
 in `src/commands/test/host.rs` names, as [docs/coding-standards.md](../docs/coding-standards.md)
 § Clippy states.
+
+Over the whole workspace (`all`), it then lints the host crates' non-test code as
+`cargo xtask build` does (`clippy_host` of `src/commands/build.rs`: `xtask`, the wrapper shim and
+the path-account plugin under the workspace lints, then the fuzz engine and targets with
+`--cfg fuzzing`), so CI's `host-tests` job, which runs on every change, proves the pass every
+booting cell's build runs.
 
 Tests compile for the host — no `--arch` flag needed. The workspace-level
 `panic=abort` profile does not affect the test harness.
@@ -1615,11 +1625,11 @@ runner (`GITHUB_ACTIONS` set to `true`), named with its time and marked `FAILED 
 the table; on another host, whose speed differs, the command prints a warning naming it and its
 time.
 
-CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the pull request's base
-(the first parent of the merge commit it checks out), or on a push to `master` against the commit
-the push moved it from; when the list is empty it installs no Kani and says so in a notice on the
-run, and otherwise it installs the release `--pin` prints and runs the command with the same
-`--since`. The `kani` job of `burnin.yml` runs the command with no option
+CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the base its `select`
+job found with `cargo xtask cells --since-green`, on a pull request and on a push to `master`
+alike, and with no option when that job found none; when the list is empty it installs no Kani
+and says so in a notice on the run, and otherwise it installs the release `--pin` prints and runs
+the command with the same `--since`. The `kani` job of `burnin.yml` runs the command with no option
 ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
@@ -1631,6 +1641,59 @@ sized there, under the limit the command sets, before CI runs it
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`
 aside, and takes their `--wait-host` and `--host-override` options.
+
+---
+
+### `cargo xtask cells`
+
+Print the CI cells a change owes ([docs/conventions.md](../docs/conventions.md#ci-gating) § CI
+Gating), which `build-test.yml`'s `select` job runs to build its `validate` and `bench`
+matrices.
+
+```
+cargo xtask cells [--since <COMMIT> | --since-green <REV>] [--github-output <FILE>]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--since <COMMIT>` | no base | The change from this commit to the working tree |
+| `--since-green <REV>` | no base | The change from the newest commit of `REV`'s first-parent history, 200 commits at most, whose `build-test` run on a push to `master` passed (`gh run list`); every cell, after a `WARNING:` line, when there is none or the runs cannot be read |
+| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate` and `bench`, each a matrix's `include` list; `validate-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
+
+Without a base, every cell is owed. With one, the command places each changed file
+(`git diff --name-only` from the base to the working tree, a rename as both its paths) in a
+class of the layer record, `src/layers.rs`, and prints each with its class and why. The first
+rule that holds places it:
+
+1. Markdown is `docs`.
+2. An input of every build (`WORKSPACE_WIDE` of `src/affected.rs`: the toolchain pin, the root
+   manifest and lock file, `.cargo/config.toml`) is `build`.
+3. The longest file row of the record that holds it: the instruction files and the Issue templates
+   are `docs`; the workflows are `build`; the rootfs files take the layer that reads them; the
+   modules of xtask that no cell runs, and the host tools' settings, are `host`.
+4. A file of a workspace package takes the most demanding directory row among the package and every
+   package whose dependencies reach it (`cargo metadata`), the std port counting as a package of
+   `runtime/ruststd/` that links the crates std depends on. The directory rows: `core/` and
+   `abi/` are `kernel`; `services/` and `runtime/` `services`; `programs/` `programs`;
+   `xtask/fuzz/` and `xtask/path-account-plugin/` `host`; `xtask/` `build`.
+5. Any other file takes its directory row.
+
+A file a tracked source reads (`include!`, `include_str!`, `include_bytes!`, `#[path]`) takes
+its reader's class too, when that is more demanding. A changed file no rule places fails the
+command, naming it ("add its row"), so a crate moved to a directory no row holds is reported, not
+misplaced; a deleted file no rule places is `build`.
+
+The change owes the cells of its most demanding file, in the order `docs`, `host`, `programs`,
+`services`, `kernel`, `build`: `kernel` and `build` owe every `validate` cell and the `bench`
+cell with its ktest boots; `services` and `programs` owe the svctest and usertest cells and the
+`bench` cell's ubench boots; `docs` and `host` owe no boot. The host tests check that every
+tracked file is placed, that every row holds a tracked file, and that no module of xtask a cell
+runs uses one the record calls `host`.
+
+The `fuzz` job is owed apart from the cells: by a change to an input of every build, to the
+workflows, to an input of the build of `xtask/fuzz/targets`, whose closure holds the engine and
+every crate a target fuzzes, or to an input of the build of xtask, which drives it, its own
+sources and manifest and every crate it links; and without a base.
 
 ---
 
@@ -1788,7 +1851,8 @@ baselines of their mode and architecture: CI's `bench` cell's gate
 ([docs/testing.md](../docs/testing.md#benchmarks-bench-cell) § Benchmarks).
 
 ```
-cargo xtask bench-check --mode icount|host [--baselines DIR] [--write-env FILE] LOG...
+cargo xtask bench-check --mode icount|host [--baselines DIR] [--write-env FILE]
+    [--skip-suite SUITE]... LOG...
 ```
 
 | Option | Default | Description |
@@ -1796,6 +1860,7 @@ cargo xtask bench-check --mode icount|host [--baselines DIR] [--write-env FILE] 
 | `--mode` | | `icount`: instruction counts, from boots under `run --icount`; `host`: time, from x86_64 boots under a native accelerator |
 | `--baselines` | `xtask/baselines/bench` | The baselines root, which holds `<mode>/<arch>/` |
 | `--write-env` | | Write this host's environment to `FILE`, in the `ENV` file's format below |
+| `--skip-suite` | none | Leave out the baselines of this suite, whose boot did not run (`ktest` when the `bench` cell skips its ktest boots); repeatable; a log that measures the suite fails the command |
 | `LOG...` | | The saved logs, one per run, all of one architecture, of any boot that logs result lines (ktest's bench-only image, the ubench suite's); each must carry the trailer of a passing run of the mode (`icount=on` for `icount`; `icount=off` and an accelerator other than `tcg` for `host`) |
 
 A measurement is a result line's `<suite>.<name>` and variant parameters
@@ -1858,7 +1923,9 @@ The logs are read as `bench-check` reads them, and must be complete: a benchmark
 one of its measurements has no baseline or is no longer measured, or one of its gating
 measurements (in host mode, any of them) is past its band, and is removed when none of its
 measurements remains; each rewritten file holds every measurement of its benchmark at its lowest
-p50. The `ENV` file is written when `--all` is given or it does not exist: the cell's own, from its
+p50. The files of a suite the logs measure nothing of are left as they are, with or without
+`--all`: that suite's boot did not run, as in a `bench` cell whose change owed no ktest boot.
+The `ENV` file is written when `--all` is given or it does not exist: the cell's own, from its
 artifact, with `--from-run`; this host's with `--host`. The command prints each file it wrote or
 removed. An artifact's logs are those at its top level and those one directory down, where the
 `bench` cell saves its ubench boots'.
@@ -2182,6 +2249,7 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 |---|---|---|
 | `pr-unticked-box` | error | The body has no unticked task-list item (§ PR-body checklist discipline): `[ ]` after a `-`, `*`, `+`, or numbered list marker, the forms GitHub renders as a checkbox. |
 | `pr-attribution` | error | The body carries no tool attribution line and no session link. |
+| `pr-tool-output` | error | The body carries no line of tool output ([docs/conventions.md](../docs/conventions.md) § Style, whose rule covers a comment on a PR or an Issue too, which the command does not read), the text a command prints on stderr for its user, which no author wrote and which a read of the body with stderr merged into it writes back: a line that begins `hint:` at column 0 (the advice `gh` and `git` print, such as the block `gh` 2.105 prints after reading a pull request) a line whose text after its indentation begins `gh event listen` (the command that block suggests), each with every line of its block (each indented, non-blank line after it, up to a blank line or a line at column 0), and a cargo status line (one of cargo's status verbs, such as `Compiling`, `Finished` or `Running`, indented to end at column 12, then a space). Each such line is an error that names it, so one run names every line of a block. A line inside a fenced code block (backticks or tildes) is not read, so a body may quote tool output there; an indented code block is read as prose, since the second line of `gh`'s hint block is indented as one. |
 | `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`; a closing reference that names a repository (`<owner>/<repo>#N`, or the Issue's URL) is not compared. A drain PR that closes a follow-up Issue of the earlier pattern carries both (§ Follow-up Issues); in any other body the pair usually means a sentence closes an Issue the PR only references. |
 | `pr-refs-unread` | warning | Every `#N` after the start of a `Refs` list on its body line is read as a referenced Issue (a line with the word but no list, such as a rule name or prose, is not checked): one the `Refs` list does not reach, because other text stands between it and the number before it, is named with its line, since its ticks and state go unchecked. A reference into another repository is not counted. |
 | `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
@@ -2194,6 +2262,7 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 | `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |
 | `issue-milestone` | error | Every Issue the PR closes carries the current milestone, the lowest-versioned open one. |
 | `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
+| `issue-tool-output` | error | The body of every Issue the PR closes or references with `Refs #N` carries no line of tool output, as `pr-tool-output` reads it; each one is an error that names its line. |
 
 The command prints the Issues the body and the commits close and the ones the body references,
 so that a keyword in prose that closes an Issue by accident is seen. A `Refs` keyword references
@@ -2444,7 +2513,9 @@ destroying it.
 cargo xtask issue-edit <N> --body-file <path> [--allow-removal]
 ```
 
-The command refuses an empty body. Unless `--allow-removal` is given (an edit that drops,
+The command refuses an empty body, and a body that carries a line of tool output, as
+`pr-tool-output` of [`cargo xtask pr-check`](#cargo-xtask-pr-check) reads it, naming every such
+line. Unless `--allow-removal` is given (an edit that drops,
 rewords, or reopens items on purpose, as
 [docs/conventions.md](../docs/conventions.md) § Acceptance checklist discipline allows), it also
 refuses a body that lacks a task-list item the Issue holds, or that reopens one the Issue has
@@ -2465,11 +2536,12 @@ cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
 ```
 
 The command refuses a filing without a class label, without a subsystem label, or without a
-milestone decision. `--unscheduled` files an Issue without a milestone, which
-[docs/conventions.md](../docs/conventions.md) § Milestones allows only for an Issue that cannot
-be worked on now, and needs `--reason`: `hardware` (it needs hardware the project does not
-have), `not-possible` (it is not possible yet) or `undecided` (whether it belongs in the project
-is itself undecided). The body states the same reason in a line that begins
+milestone decision, and one whose body carries a line of tool output, as `pr-tool-output` of
+[`cargo xtask pr-check`](#cargo-xtask-pr-check) reads it. `--unscheduled` files an Issue without
+a milestone, which [docs/conventions.md](../docs/conventions.md) § Milestones allows only for an
+Issue that cannot be worked on now, and needs `--reason`: `hardware` (it needs hardware the
+project does not have), `not-possible` (it is not possible yet) or `undecided` (whether it
+belongs in the project is itself undecided). The body states the same reason in a line that begins
 `No milestone: <reason>`, the reason as `--reason` names it and the rest of the line saying why;
 the command refuses an `--unscheduled` filing whose body has no such line or one naming another
 reason, and a filing under a milestone whose body has one. It refuses a rolling follow-up Issue

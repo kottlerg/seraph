@@ -1121,14 +1121,17 @@ object counts until it returns: when the slot `cap` names is the only other refe
 release is the fall to one, and a drain posts it as for any other release.
 
 **When it posts:** a release that leaves one reference marks the object for the kernel's drain,
-which runs at the next return to user mode of the CPU that made the release, when its `SOLE_REF`
-return-work bit is set, and in the idle loop, after the deferred reclaim; the post is made when a
+which runs at the next return to user mode of the CPU that made the release, or of any CPU after
+its next timer tick, each when its `SOLE_REF` return-work bit is set, and in the idle loop, after
+the deferred reclaim; the post is made when a
 drain finds the object still at one reference. That drain may run on another CPU, so the post can
 reach the queue just after the call that made the release returns: a binder waits for it on the
 queue (`SYS_EVENT_RECV` with a timeout or none), and does not poll once. A drain posts at most
-`POST_BUDGET` (64) bindings; the rest wait for the next drain, which the CPU that left them makes
-before it halts or at its next return to user mode, an interrupt's at the latest: the next pass
-comes within a timer tick, and each posts at most `POST_BUDGET` more. A count that falls to one and
+`POST_BUDGET` (64) bindings; the rest wait for the next drain: the next return to user mode of
+the CPU that left them, or of any CPU after its next timer tick, or an idle CPU before it halts.
+The next pass comes within a timer tick while any CPU runs user code or idles, and at the first
+such return or idle pass when every CPU is in the kernel across a tick; each posts at most
+`POST_BUDGET` more. A count that falls to one and
 rises again before the drain looks is found at its next fall to one or at the object's death, which
 posts every binding the object still has. The binding posts once and then ends. No post is made
 while a copy of the capability is in an IPC transfer: a queued message holds a slot handle, not a

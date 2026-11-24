@@ -1101,7 +1101,7 @@ the word existed. A bit says only that a check may find work.
 |---|---|---|
 | `STOPPED` | `commit_state_under_all_locks` committing `Exited`, and `dealloc_object(Thread)`'s `Exited` write, for a thread `current` on a CPU | that CPU, found under every CPU lock |
 | `RECLAIM` | `cap::object::push_deferred_reclaim` | its own |
-| `SOLE_REF` | a decrement that marks the sole-reference table or fires its observers (`KernelObjectHeader::dec_ref`), and a drain pass that leaves work | its own |
+| `SOLE_REF` | a decrement that marks the sole-reference table or fires its observers (`KernelObjectHeader::dec_ref`), a drain pass that leaves work, and the timer tick while the table has work (`sched::timer_tick`) | its own |
 | `UPCALL_SYSCALL`, `UPCALL_ANY` | `ipc::upcall::post` for a `Running`, unmasked target; `schedule()`'s dispatch of a thread with an unmasked upcall pending; the unmask (`upcall::set_mask`) | the target's `preferred_cpu`; the dispatching CPU; its own |
 | `PREEMPT` | a run-queue link, or a priority change's move (`relink`), that leaves a queued thread outranking the running one; `mark_level_stale`; the wake IPI's handler; a preemption the boot transient or a preemption-disabled window declined | the linked CPU; the CPU running the thread; the IPI's target; its own |
 
@@ -1154,10 +1154,12 @@ Rules:
    records the level without that lock; every such link is followed by a wake IPI (§ Wake Protocol
    Invariants), whose handler posts `PREEMPT` on arrival, so the return after it takes the full
    decision with the link visible, as the IPI's return did when the test ran at every return.
-7. A sole-reference mark posts its own CPU's bit, and a pass that leaves work posts the bit of the
-   CPU that made it: every mark and every leftover is drained by a later return, or the idle loop,
-   on the CPU that made it, which is the bound capability-internals.md § Sole-Reference Observers
-   states.
+7. A sole-reference mark posts its own CPU's bit, a pass that leaves work posts the bit of the CPU
+   that made it, and each CPU's timer tick posts its own bit while the table has work. Every mark
+   and every leftover is therefore drained by a later return or the idle loop of the CPU that made
+   it, or by the next return to user mode of any CPU a tick reached meanwhile: within a tick while
+   any CPU runs user code or idles, and at the first such return or idle pass when every CPU is in
+   the kernel across a tick, the bound capability-internals.md § Sole-Reference Observers states.
 
 ---
 

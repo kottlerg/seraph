@@ -428,11 +428,12 @@ fn claim_bucket(chains: &mut Chains, bucket: usize)
 /// work of an interrupt taken from user mode (`sched::interrupt_return_work`);
 /// with no lock held. A return reaches it when its CPU's
 /// `percpu::return_work::SOLE_REF` bit is set: a decrement on that CPU marked
-/// the table (`KernelObjectHeader::dec_ref`), or a pass on it left fired nodes
-/// ([`drain_pass`] posts the bit again), so every mark and every leftover is
-/// drained by a later return or idle pass on the CPU that made it, one pass
-/// per return, which a CPU running user code reaches at its next interrupt at
-/// the latest (core/kernel/docs/scheduling-internals.md § Return Work).
+/// the table (`KernelObjectHeader::dec_ref`), a pass on it left fired nodes
+/// ([`drain_pass`] posts the bit again), or its timer tick found the table
+/// with work (`sched::timer_tick`), so every mark and every leftover is
+/// drained by a later return or idle pass on the CPU that made it, or by the
+/// next return to user mode of any CPU a tick reached meanwhile, one pass per
+/// return (core/kernel/docs/scheduling-internals.md § Return Work).
 ///
 /// Inline, it is one load and a branch when nothing is pending; the pass is
 /// [`drain_pass`], out of line.
@@ -459,7 +460,8 @@ pub unsafe fn drain()
     // the releasing call returns, and the budget may leave the post to a later
     // pass, whose CPU posted its own return-work bit. A bit another CPU set and
     // this load misses is drained by that CPU, whose return-work bit its mark
-    // set. So every leftover is drained within the bound that
+    // set, or by a CPU whose later tick saw it. So every leftover is drained
+    // within the bound that
     // core/kernel/docs/capability-internals.md § Sole-Reference Observers
     // states under The budget.
     if TABLE.summary.load(Ordering::Relaxed) != 0

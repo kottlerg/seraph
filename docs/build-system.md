@@ -228,8 +228,8 @@ workspace member, so the flags are the same in every checkout
 ([§ Continuous Integration](#continuous-integration)). Each crate includes its
 script (`include_bytes!` in its `main.rs`), which makes the script an input
 Cargo judges by content, so a change to it rebuilds and relinks the image.
-Cargo splits `RUSTFLAGS` at whitespace, so the build refuses a checkout whose
-path holds whitespace.
+Cargo splits `RUSTFLAGS` at whitespace, so neither path holds any, as a host
+test checks.
 
 The riscv64 kernel build, and its Clippy pass, run with `RUSTFLAGS` set,
 besides the link argument, to `-Zunstable-options -Zemit-stack-sizes` (`RISCV64_KERNEL_RUSTFLAGS` in

@@ -1359,18 +1359,38 @@ impl AddressSpace
     /// every bound thread is stopped, so no leaf can be used again: the tag is
     /// flushed before any later space runs under it.
     ///
+    /// The walk reads every entry of every table the space holds, as many as
+    /// its owner paid for, so it takes this CPU's pending interrupts between
+    /// tables (`cap::object::interrupt_window`), each at most 512 entries and
+    /// 512 frame-map updates.
+    ///
     /// # Safety
     /// The address space is being reclaimed: no CPU has it active, no thread
-    /// can run in it, and nothing maps or unmaps in it any more.
+    /// can run in it, and nothing maps or unmaps in it any more. No lock is
+    /// held, and the caller runs where an interrupt window may open
+    /// (`cap::object::dealloc_object`'s contract).
     #[cfg(not(test))]
     pub unsafe fn release_mapped_frames(&self)
     {
+        let mut windows = crate::cap::object::BatchWindows::new(1);
+        // No lock is held (contract), and nothing else reads or writes these
+        // tables, so a window between two tables exposes nothing.
+        let mut on_table = || {
+            if windows.step()
+            {
+                crate::cap::object::interrupt_window();
+            }
+        };
         // SAFETY: root_virt is this space's valid root; nothing modifies its
         // tables during the walk (contract).
         unsafe {
-            crate::arch::current::paging::for_each_user_leaf(self.root_virt, &mut |phys| {
-                crate::mm::frame_map::lower(phys);
-            });
+            crate::arch::current::paging::for_each_user_leaf(
+                self.root_virt,
+                &mut on_table,
+                &mut |phys| {
+                    crate::mm::frame_map::lower(phys);
+                },
+            );
         }
     }
 

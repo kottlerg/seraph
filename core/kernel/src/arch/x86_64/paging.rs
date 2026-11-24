@@ -1231,23 +1231,30 @@ unsafe fn unmap_span(
 /// installs one.
 ///
 /// Drives the frame-map release of an address space's teardown
-/// (`AddressSpace::release_mapped_frames`).
+/// (`AddressSpace::release_mapped_frames`). `on_table` runs before each
+/// table's entries are read, the root's included, so the caller counts the
+/// walk's work in tables and may open an interrupt window there.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map VA of a valid 4 KiB root frame whose
 /// tables no other CPU modifies during the walk.
 #[cfg(not(test))]
-pub unsafe fn for_each_user_leaf(root_virt: u64, on_leaf: &mut dyn FnMut(u64))
+pub unsafe fn for_each_user_leaf(
+    root_virt: u64,
+    on_table: &mut dyn FnMut(),
+    on_leaf: &mut dyn FnMut(u64),
+)
 {
     let limit = USER_CANONICAL_LIMIT.load(Ordering::Relaxed);
     // SAFETY: root_virt is the direct-map VA of a valid root (caller's contract).
     let root = unsafe { table_at(root_virt) };
     // SAFETY: root is a live table at the root level, unmodified meanwhile.
-    unsafe { walk_leaves(root, root_level(), 0, limit, on_leaf) };
+    unsafe { walk_leaves(root, root_level(), 0, limit, on_table, on_leaf) };
 }
 
 /// Pass the frame of every present leaf of `[lo, hi)` under `table` (a table
-/// at `level`) to `on_leaf`. Bounded recursion: `level <= 4`.
+/// at `level`) to `on_leaf`, running `on_table` before each table's entries
+/// are read, `table`'s first. Bounded recursion: `level <= 4`.
 ///
 /// # Safety
 /// `table` must be a live table at `level` whose reachable child frames are
@@ -1258,12 +1265,14 @@ unsafe fn walk_leaves(
     level: usize,
     lo: u64,
     hi: u64,
+    on_table: &mut dyn FnMut(),
     on_leaf: &mut dyn FnMut(u64),
 )
 {
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
 
+    on_table();
     let Some(child_level) = level.checked_sub(1)
     else
     {
@@ -1289,7 +1298,7 @@ unsafe fn walk_leaves(
             // SAFETY: a present non-leaf entry points at a live child table.
             let child = unsafe { table_at(phys_to_virt(e.phys_addr())) };
             // SAFETY: child is a live table at child_level (this call's contract).
-            unsafe { walk_leaves(child, child_level, va, entry_end, on_leaf) };
+            unsafe { walk_leaves(child, child_level, va, entry_end, on_table, on_leaf) };
         }
         va = entry_end;
     }

@@ -832,7 +832,9 @@ unsafe fn terminate_faulted_thread(
 
         // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + cause_code).
         // SAFETY: tcb validated non-null; exit_under_all_locks has marked it Exited and no
-        // sched_lock is held.
+        // lock is held. The trap came from U-mode, so the walk may take interrupts
+        // between batches of observers, with preemption disabled: the thread stays on
+        // this hart until the schedule below.
         unsafe {
             crate::sched::post_death_notification(tcb, reason);
         }
@@ -840,8 +842,9 @@ unsafe fn terminate_faulted_thread(
         // Notify the address-space observers recorded above with the
         // fault class so procmgr can tear the whole process down.
         // SAFETY: aspace_post comes from this path's record, and the
-        // thread has stayed on this hart since; it is now Exited and
-        // no lock is held.
+        // thread has stayed on this hart since (the post above takes
+        // interrupts with preemption disabled); it is now Exited and
+        // no lock is held. Its walk takes interrupts the same way.
         unsafe {
             crate::sched::post_aspace_death_notification(&aspace_post);
         }

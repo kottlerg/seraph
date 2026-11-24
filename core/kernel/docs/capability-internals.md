@@ -425,15 +425,36 @@ arm runs inside another's lock scope (a nested `CSpace`'s derivation drain takes
 lock after the outer arm has released it; a wait set's sources are torn down after
 `wait_set_drop` has released every source lock).
 
+The call takes the interrupts pending on its CPU between every two teardowns (`interrupt_window`),
+so a fan-out masks interrupts for one teardown at a time, and the teardowns whose own walks the
+owner sizes take them between batches: a dying `CSpace`'s release pass after every
+`RELEASE_BATCH_LEAVES` slot leaves (4 leaves, 224 slots), the sort of its kept arena pages, their
+leases and the release of its holds on them ([§ Body Arena](#body-arena)), an owner's death-observer
+chain after every `OBSERVER_BATCH_NODES` (64) nodes, an address space's frame release after every
+page table ([memory-internals.md](memory-internals.md) § Frame Map Table), and an Mmio object's
+mapping withdrawal after every mapping and every `SPILL_BATCH_CHUNKS` (64) spill chunks ([§ Mmio
+Mappings](#mmio-mappings)). The walks that run under a lock stay masked for their whole length, the
+release of an endpoint's waiters among them (#1628). Every context that calls `dealloc_object`
+allows a window, holding no lock and running where an interrupt may be taken with preemption
+disabled: a syscall and its epilogue, fault delivery between its park commit and its `schedule()`
+([scheduling-internals.md](scheduling-internals.md) § `ThreadState` Transitions, "Voluntary-block
+window"), the end of an interrupt taken from user mode (§ Return Work there), and the idle thread's
+drain. A window between two teardowns exposes no partial state: the popped object is torn down whole
+before the window, the queued ones are reachable by nothing but their own links and a `CSpace`
+wrapper's arena pages' `owner` back-pointers, which the windows of its arena-page pass expose
+already, and no interrupt handler releases a reference, so no cascade runs nested inside another on
+its CPU.
+
 The walk holds no lock across groups (each group's return takes only its Memory object's locks,
 its read lock and its retype-allocator lock), and takes the interrupts pending on its CPU after
 every group but the create-time slab's (`interrupt_window`, as seeding does, [§ Donation
 Records](#donation-records)). Between two windows it therefore masks interrupts for one group: at
 most `RECORDS_PER_PAGE` records of one Memory object, whose return costs one walk of that object's
 page free list (at most one node per page of the object, [docs/limits.md](../../../docs/limits.md)),
-an insertion per run, and the sort of the group and of its records' kept arena pages. The kept
-pages are a dimension of their own, bounded by the bodies that outlive the `CSpace`, one page per
-body at most. Before taking the locks, the return zeroes the group's runs
+an insertion per run, and the sort of the group. The kept arena pages are a dimension of their
+own, bounded by the bodies that outlive the `CSpace`, one page per body at most, and their sort and
+leases take windows of their own ([§ Body Arena](#body-arena)). Before taking the locks, the
+return zeroes the group's runs
 ([memory-internals.md](memory-internals.md) § Kernel Object Memory), taking the pending interrupts
 after every 16 pages it zeroes, so the zeroing adds at most one 16-page batch of stores to a window.
 Neither the donation count nor any `init_pages` lengthens the window; the walk's
@@ -520,7 +541,11 @@ with its kept pages, sorted once (`cap::arena::sort_list`), cut out of its span
 donation came from and records it as its `ancestor`, and the runs between kept pages go back, with
 the runs of the other donations of its group ([§ Teardown](#teardown)), through one walk of that
 Memory object's page free list (`cap::retype::retype_free_runs`). The
-teardown then releases its hold on each kept page, and the release of a page's last reference, its
+teardown then releases its hold on each kept page. Since the owner chose how many bodies outlive
+the `CSpace`, the sort takes the interrupts pending on its CPU after every `KEPT_SORT_BATCH_STEPS`
+(256) steps, each step taking one page off a list or placing one in a merged run, and the leases
+and the releases after every `KEPT_BATCH_PAGES` (64) pages (`interrupt_window`, with no lock
+held). The release of a page's last reference, its
 hold's or its last chunk's, returns the page to that Memory object (the `ArenaPage` arm of
 `dealloc_object`). A dead `CSpace` therefore holds, past its death, only the pages its surviving
 bodies sit on, each to its Memory object, the analogue of a retyped object pinning its Memory
@@ -1004,7 +1029,10 @@ frames are never reallocated, so no frame reuse waits on the shootdown. The reco
 reference is then released through `release_ref`, so an address space it was the last reference to
 goes to this CPU's deferred reclaim, as for a syscall pin: an Mmio object can be freed in place
 inside IPC delivery, where an address-space teardown must not run. Each spill chunk then returns to
-the arena that funded it.
+the arena that funded it. The records and chunks are as many as the owners' mappings, so the
+withdrawal takes the interrupts pending on its CPU between two records and after every
+`SPILL_BATCH_CHUNKS` (64) chunks it returns (`interrupt_window`, with no lock held; [§
+Teardown](#teardown)).
 
 ### IoPort Bindings
 
@@ -1163,7 +1191,8 @@ the lock alone, so a call that finishes in one hold opens no window. The window 
 keeps preemption disabled, so the thread neither switches nor migrates; it exposes nothing that the
 release does not already expose to other CPUs, and every such loop revalidates what it works on
 when it takes the lock again. The dealloc cascade's fan-out and a dying `CSpace`'s release passes
-take no derivation lock and still mask interrupts for their whole length (#1623).
+take no derivation lock; they take `interrupt_window` between their batches themselves ([§
+Teardown](#teardown)).
 
 ### Revocation Algorithm
 
@@ -1727,4 +1756,3 @@ Path, and
 [Fault Handling](../../../docs/fault-handling.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [init Bootstrap Stages](../../../services/init/docs/bootstrap.md)
-

@@ -207,10 +207,16 @@ pub unsafe fn unmap_user_region_pooled(
 ) -> usize;
 
 /// Pass the frame of every present 4 KiB leaf in the user half of the page
-/// table rooted at `root_virt` to `on_leaf`, changing nothing; drives the
-/// frame-map release of an address space's teardown
+/// table rooted at `root_virt` to `on_leaf`, changing nothing, and run
+/// `on_table` before each table's entries are read, the root's included;
+/// drives the frame-map release of an address space's teardown, which opens
+/// an interrupt window in `on_table`
 /// (core/kernel/docs/memory-internals.md § Frame Map Table).
-pub unsafe fn for_each_user_leaf(root_virt: u64, on_leaf: &mut dyn FnMut(u64));
+pub unsafe fn for_each_user_leaf(
+    root_virt: u64,
+    on_table: &mut dyn FnMut(),
+    on_leaf: &mut dyn FnMut(u64),
+);
 
 /// Pass the VA of each present 4 KiB leaf in `[virt_base, virt_base +
 /// page_count * 4 KiB)` whose accessed bit is set to `on_accessed`, in VA

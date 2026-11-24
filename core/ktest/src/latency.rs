@@ -17,9 +17,15 @@
 //! issued inside it only once the call returns, so it fails the second check
 //! whatever the host's scheduling.
 //!
-//! The cases are `unit::retype`'s page-pool and placement cases and
-//! `unit::cap_batches`'s derivation-lock cases. They run one at a time: the
-//! rig's words and the worker's stack are this module's own.
+//! A call that opens other windows besides the ones under test is judged by
+//! a [`Bracket`] instead ([`measure_bracketed`]): two reads of kernel state
+//! that the stretch under test changes, so that only a probe acknowledged
+//! between the stretch's first and last steps passes it.
+//!
+//! The cases are `unit::retype`'s page-pool and placement cases,
+//! `unit::cap_batches`'s derivation-lock cases and `unit::teardown_windows`'s
+//! teardown cases. They run one at a time: the rig's words and the worker's
+//! stack are this module's own.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -109,6 +115,10 @@ pub enum Call
     {
         cap: u64, at: u8
     },
+    /// `SYS_THREAD_EXIT` of the worker itself, which never returns: made by
+    /// [`measure_exit`] alone, which ends the probes once its bracket's stretch
+    /// has ended and takes that time for the call's end.
+    Exit,
 }
 
 impl Call
@@ -137,6 +147,7 @@ impl Call
             ),
             Call::Move { cap, cspace } => (6, [cap, cspace, 0]),
             Call::SchedSplit { cap, at } => (7, [cap, u64::from(at), 0]),
+            Call::Exit => (8, [0; 3]),
         }
     }
 }
@@ -158,6 +169,7 @@ fn make_call(op: u64, args: [u64; 3]) -> Result<(u64, u64), i64>
         7 => u8::try_from(a1)
             .map_err(|_| 0)
             .and_then(|at| sched_split(a0, at)),
+        8 => syscall::thread_exit(),
         _ => Err(0),
     }
 }
@@ -205,6 +217,45 @@ extern "C" fn latency_worker(_arg: u64) -> !
     RESULT[1].store(second, Ordering::Relaxed);
     END.store(end, Ordering::Release);
     syscall::thread_exit()
+}
+
+/// A stretch of the measured call that kernel state shows from outside it,
+/// read through syscalls on the probe's CPU: `begun` reads true once the
+/// stretch has made its first step, and `ended` once it has made its last;
+/// each stays true from then on.
+///
+/// A probe is acknowledged inside the stretch when `begun` read true and
+/// `ended` false before its unmap was issued, and `ended` read false again
+/// once the unmap returned. The worker's CPU cannot take the shootdown before
+/// it is sent, which is after the stretch's first step, and the unmap
+/// returns only once that CPU has acknowledged it: had the CPU taken it after
+/// the stretch's last step, the read after the acknowledgement would see that
+/// step. So the CPU took it between two steps of the stretch, whatever the
+/// host's scheduling and whatever windows the rest of the call opens. A call
+/// in which no probe was issued inside the stretch is inconclusive.
+pub struct Bracket<'a>
+{
+    pub begun: &'a mut dyn FnMut() -> Result<bool, &'static str>,
+    pub ended: &'a mut dyn FnMut() -> Result<bool, &'static str>,
+}
+
+impl Bracket<'_>
+{
+    /// Whether the stretch has made its first step and not its last.
+    fn under_way(&mut self) -> Result<bool, &'static str>
+    {
+        Ok((self.begun)()? && !(self.ended)()?)
+    }
+}
+
+/// What the probes saw of a [`Bracket`]'s stretch.
+#[derive(Clone, Copy, Default)]
+struct Bracketed
+{
+    /// A probe was issued inside the stretch.
+    issued: bool,
+    /// A probe issued inside the stretch was acknowledged before it ended.
+    acked: bool,
 }
 
 /// What the probe saw of one measured call.
@@ -275,6 +326,51 @@ impl Measured
 /// thread is pinned to `PROBE_CPU` for the call and unpinned afterwards.
 pub fn measure_call(ctx: &TestContext, call: Call) -> Result<Measured, &'static str>
 {
+    if matches!(call, Call::Exit)
+    {
+        return Err("latency: an exit is measured by measure_exit");
+    }
+    measure(ctx, call, None, None)
+}
+
+/// [`measure_call`], judged by `bracket`: acknowledged inside when a probe
+/// was acknowledged inside its stretch, inconclusive when no probe was issued
+/// inside it.
+pub fn measure_bracketed(
+    ctx: &TestContext,
+    call: Call,
+    bracket: &mut Bracket<'_>,
+) -> Result<Measured, &'static str>
+{
+    if matches!(call, Call::Exit)
+    {
+        return Err("latency: an exit is measured by measure_exit");
+    }
+    measure(ctx, call, Some(bracket), None)
+}
+
+/// The worker's own `SYS_THREAD_EXIT` ([`Call::Exit`]), judged by `bracket`,
+/// whose stretch must end in the exit: `setup` is given the worker's thread
+/// capability before the worker starts, and the probes end once a read after
+/// an acknowledgement sees the stretch ended.
+pub fn measure_exit(
+    ctx: &TestContext,
+    setup: &mut dyn FnMut(u64) -> TestResult,
+    bracket: &mut Bracket<'_>,
+) -> Result<Measured, &'static str>
+{
+    measure(ctx, Call::Exit, Some(bracket), Some(setup))
+}
+
+/// [`measure_call`], judged by `bracket` when there is one, with `setup`
+/// given the worker's thread capability before it starts.
+fn measure(
+    ctx: &TestContext,
+    call: Call,
+    bracket: Option<&mut Bracket<'_>>,
+    setup: Option<&mut dyn FnMut(u64) -> TestResult>,
+) -> Result<Measured, &'static str>
+{
     for word in [&GAP_US, &START, &END, &RESULT[0], &RESULT[1]]
     {
         word.store(0, Ordering::Relaxed);
@@ -294,7 +390,7 @@ pub fn measure_call(ctx: &TestContext, call: Call) -> Result<Measured, &'static 
         .and_then(|()| {
             let measured = thread_yield()
                 .map_err(|_| "latency: yield failed")
-                .and_then(|()| probe_worker(ctx, frame));
+                .and_then(|()| probe_worker(ctx, frame, bracket, setup));
             let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
                 .map_err(|_| "latency: restore the probe's affinity failed");
             let measured = measured?;
@@ -307,15 +403,23 @@ pub fn measure_call(ctx: &TestContext, call: Call) -> Result<Measured, &'static 
     measured
 }
 
-/// Start the worker in ktest's own `CSpace`, so the handles in its words
-/// are its own, probe it until its call returns, and reap it.
-fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
+/// Create the worker in ktest's own `CSpace`, so the handles in its words
+/// are its own, give its thread capability to `setup`, and start it pinned to
+/// `WORKER_CPU`.
+fn start_worker(
+    ctx: &TestContext,
+    setup: Option<&mut dyn FnMut(u64) -> TestResult>,
+) -> Result<crate::spawn::SpawnedChild, &'static str>
 {
-    let mut worker = crate::spawn::SpawnedChild {
+    let worker = crate::spawn::SpawnedChild {
         th: cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "latency: create the worker failed")?,
         cs: 0,
     };
+    if let Some(setup) = setup
+    {
+        setup(worker.th)?;
+    }
     // SAFETY: `STACK` is a static stack, reached only through `addr_of!`.
     let stack = unsafe { crate::ChildStack::top(core::ptr::addr_of!(STACK)) };
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and
@@ -325,6 +429,20 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
         .map_err(|_| "latency: configure the worker failed")?;
     thread_set_affinity(worker.th, WORKER_CPU).map_err(|_| "latency: pin the worker failed")?;
     thread_start(worker.th).map_err(|_| "latency: start the worker failed")?;
+    Ok(worker)
+}
+
+/// Start the worker ([`start_worker`]), probe it until its call returns, or
+/// until its exit's bracketed stretch has ended, and reap it.
+fn probe_worker(
+    ctx: &TestContext,
+    frame: u64,
+    mut bracket: Option<&mut Bracket<'_>>,
+    setup: Option<&mut dyn FnMut(u64) -> TestResult>,
+) -> Result<Measured, &'static str>
+{
+    let mut worker = start_worker(ctx, setup)?;
+    let exits = OP.load(Ordering::Relaxed) == 8;
 
     let deadline = crate::scaled_bound(CALL_DEADLINE_US);
     let begun = crate::elapsed_us();
@@ -349,7 +467,12 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
     // after the call's start. Probes run one at a time, so it is also the
     // first of them acknowledged.
     let mut first_after_start: Option<(u64, u64)> = None;
+    let mut bracketed = Bracketed::default();
+    // Whether a read after an acknowledgement saw the stretch ended.
+    let stretch_ended = core::cell::Cell::new(false);
     let mut probe = || -> TestResult {
+        // Whether the stretch was under way before this probe's unmap.
+        let inside = bracket.as_mut().map(|b| b.under_way()).transpose()? == Some(true);
         // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so
         // the page holds no Rust object or IPC page of ktest.
         unsafe { mem_map(frame, ctx.aspace_cap, PROBE_VA, 0, 1, MAP_WRITABLE) }
@@ -359,6 +482,16 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
         let unmapped = unsafe { mem_unmap(ctx.aspace_cap, PROBE_VA, 1) };
         let t1 = crate::elapsed_us();
         unmapped.map_err(|_| "latency: probe unmap failed")?;
+        if let Some(b) = bracket.as_mut()
+        {
+            let ended = (b.ended)()?;
+            stretch_ended.set(ended);
+            if inside
+            {
+                bracketed.issued = true;
+                bracketed.acked |= !ended;
+            }
+        }
         let start = START.load(Ordering::Acquire);
         if start != 0 && t1 >= start
         {
@@ -375,6 +508,12 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
     {
         if END.load(Ordering::Acquire) != 0
         {
+            break Ok(());
+        }
+        if exits && stretch_ended.get()
+        {
+            // The worker's exit never returns to write its end.
+            END.store(crate::elapsed_us(), Ordering::Release);
             break Ok(());
         }
         if let Err(e) = probe()
@@ -403,8 +542,16 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
         margin,
         first: first_after_start,
     };
-    let inside_by = end.saturating_sub(margin);
-    measured.judge(inside_by, inside_by);
+    if bracket.is_some()
+    {
+        measured.acked_inside = bracketed.acked;
+        measured.inconclusive = !bracketed.acked && !bracketed.issued;
+    }
+    else
+    {
+        let inside_by = end.saturating_sub(margin);
+        measured.judge(inside_by, inside_by);
+    }
     Ok(measured)
 }
 

@@ -8261,12 +8261,14 @@ pub(crate) unsafe fn post_one_death_event(
 /// against a late `sys_thread_bind_notification` on a still-live thread,
 /// which takes the same lock and links only while the thread is not yet
 /// `Exited`; the links behind the head never change until the thread's
-/// teardown takes the chain.
+/// teardown takes the chain. The walk takes this CPU's pending interrupts
+/// between batches of nodes ([`post_death_walk`]).
 ///
 /// # Safety
-/// `tcb` must be a valid, non-null TCB pointer. Must be called without
-/// holding `(*tcb).sched_lock`, with the thread's state already set to
-/// `Exited` (or about to be).
+/// `tcb` must be a valid, non-null TCB pointer: the running thread, on its
+/// `SYS_THREAD_EXIT`, `SYS_ASPACE_EXIT` or terminal-fault path from user
+/// mode, with its state already set to `Exited`. Must be called holding no
+/// lock (`(*tcb).sched_lock` included) where interrupts may be taken.
 #[cfg(not(test))]
 pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit_reason: u64)
 {
@@ -8287,18 +8289,52 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
     // Every node reachable from `first` lives in its queue, which the node's own
     // reference keeps live; only this thread's teardown returns the nodes and
     // releases the references, and that waits until the thread runs on no CPU,
-    // so no link changes during the walk.
+    // so no link changes during the walk. sched_lock is released, and the
+    // caller holds no other lock.
+    // SAFETY: as above; the caller is this thread's exit or terminal-fault path.
+    unsafe { post_death_walk(first, exit_reason) };
+}
+
+/// Post the entry `(exit_reason, correlator)` to the `EventQueue` of each node
+/// of the death-observer chain starting at `first` ([`post_one_death_event`]),
+/// for [`post_death_notification`] and [`post_aspace_death_notification`].
+/// The chain is as long as the ending thread's or address space's binders made
+/// it, so the walk takes this CPU's pending interrupts between batches of
+/// [`OBSERVER_BATCH_NODES`](crate::cap::object::OBSERVER_BATCH_NODES) nodes
+/// ([`interrupt_window`](crate::cap::object::interrupt_window)). A window keeps
+/// preemption disabled, so the ending thread stays on its CPU across it, and
+/// the teardown that takes the chain, which waits until that thread runs on no
+/// CPU, cannot run before the walk ends.
+///
+/// # Safety
+/// Every node reachable from `first` lives in its queue, which the node's own
+/// reference keeps live, and no path changes their links while the running
+/// thread stays on its CPU. The caller is the running thread's exit or
+/// terminal-fault path (`SYS_THREAD_EXIT`, `SYS_ASPACE_EXIT`, a terminal
+/// fault from user mode), whose thread is `Exited`, holds no lock, and runs
+/// where an interrupt window may open.
+#[cfg(not(test))]
+unsafe fn post_death_walk(first: *mut thread::DeathObserver, exit_reason: u64)
+{
+    let mut windows =
+        crate::cap::object::BatchWindows::new(crate::cap::object::OBSERVER_BATCH_NODES);
     let post_node = |node: *mut thread::DeathObserver| {
-        // SAFETY: `node` is a node of the walked chain, live as above.
+        if windows.step()
+        {
+            // No lock is held, and the thread stays on its CPU across the
+            // window (contract), so no link of the chain changes.
+            crate::cap::object::interrupt_window();
+        }
+        // SAFETY: `node` is a node of the walked chain, live (contract).
         let eq = unsafe { (*node).eq };
         // SAFETY: as for `eq`.
         let correlator = unsafe { (*node).correlator };
-        // SAFETY: the node's reference keeps `eq` live for the call, and
-        // sched_lock is released.
+        // SAFETY: the node's reference keeps `eq` live for the call, and no
+        // lock is held (contract).
         unsafe { post_one_death_event(eq, correlator, exit_reason) };
     };
     // SAFETY: every node reachable from `first` is live and its links do not
-    // change during the walk (above).
+    // change during the walk (contract).
     unsafe { thread::for_each_observer(first, post_node) };
 }
 
@@ -8367,7 +8403,8 @@ pub unsafe fn record_aspace_end(
 ///
 /// Mirrors [`post_death_notification`]: it walks the snapshotted chain outside
 /// any lock and posts the entry `(exit_reason, correlator)` to each bound
-/// node's `EventQueue`. The kernel only notifies here — it does not enumerate
+/// node's `EventQueue`, taking this CPU's pending interrupts between batches
+/// of nodes ([`post_death_walk`]). The kernel only notifies here — it does not enumerate
 /// or terminate the address space's threads.
 ///
 /// When the main thread's fault or exit is its space's first end, this fires
@@ -8380,7 +8417,8 @@ pub unsafe fn record_aspace_end(
 /// `post` must come from [`record_aspace_end`] on this terminal-fault or
 /// `SYS_ASPACE_EXIT` path of the running thread, which has stayed on its CPU
 /// since, and must be called after the thread has been marked `Exited`,
-/// without holding the space's `death_lock` or a thread's `sched_lock`.
+/// holding no lock (the space's `death_lock` and a thread's `sched_lock`
+/// included) where interrupts may be taken.
 #[cfg(not(test))]
 pub unsafe fn post_aspace_death_notification(post: &AspaceEndPost)
 {
@@ -8391,21 +8429,31 @@ pub unsafe fn post_aspace_death_notification(post: &AspaceEndPost)
     // thread, this ending one included, and waits until it runs on no CPU.
     // The thread has stayed on its CPU since the snapshot (the contract), so no
     // link changes between the snapshot and the walk.
-    let post_node = |node: *mut thread::DeathObserver| {
-        // SAFETY: `node` is a node of the walked chain, live as above.
-        let eq = unsafe { (*node).eq };
-        // SAFETY: as for `eq`.
-        let correlator = unsafe { (*node).correlator };
-        // SAFETY: the node's reference keeps `eq` live for the call, and this
-        // function is not called holding a thread's sched_lock (the contract).
-        unsafe { post_one_death_event(eq, correlator, exit_reason) };
-    };
-    // SAFETY: every node reachable from `first` is live and its links do not
-    // change during the walk (above).
-    unsafe { thread::for_each_observer(first, post_node) };
+    // SAFETY: as above; the caller is this thread's `SYS_ASPACE_EXIT` or
+    // terminal-fault path and holds no lock (the contract).
+    unsafe { post_death_walk(first, exit_reason) };
 }
 
 // ── Timer tick ───────────────────────────────────────────────────────────────
+
+/// Whether preemption is enabled on the CPU a timer tick interrupts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Preemption
+{
+    Enabled,
+    Disabled,
+}
+
+/// Whether a timer tick whose slice accounting asks for a reschedule switches
+/// `current` out at once: only with preemption enabled. A tick taken inside a
+/// preempt-disabled window, which every interrupt-enabled kernel window is
+/// (core/kernel/docs/scheduling-internals.md § Lock Hierarchy), leaves the
+/// thread on the CPU, so a thread parking across such a window reaches its own
+/// `schedule()` (§ `ThreadState` Transitions, "Voluntary-block window").
+const fn tick_switches(preemption: Preemption) -> bool
+{
+    matches!(preemption, Preemption::Enabled)
+}
 
 /// Timer interrupt handler: decrement current thread's time slice.
 ///
@@ -8546,21 +8594,30 @@ pub unsafe fn timer_tick()
     {
         return;
     }
-    // If preemption is disabled (e.g., during TLB shootdown spin-wait with
-    // interrupts temporarily enabled), skip the context switch. The thread will
-    // be rescheduled at its next slice expiry, or, when a queued thread
-    // outranks it, at its next return to user mode.
-    if crate::percpu::preemption_disabled()
+    // If preemption is disabled (an interrupt-enabled window: a TLB shootdown
+    // spin-wait, a batch window of a caller-sized walk, a dealloc cascade
+    // between two teardowns), skip the context switch. The thread will be
+    // rescheduled at its next slice expiry, or, when a queued thread outranks
+    // it, at its next return to user mode.
+    let preemption = if crate::percpu::preemption_disabled()
     {
-        // A live, preemption-disabled `current` still counts as non-idle
-        // (core/kernel/docs/scheduling-internals.md § Softlockup Watchdog).
-        watchdog_mark_non_idle(cpu);
+        Preemption::Disabled
     }
     else
+    {
+        Preemption::Enabled
+    };
+    if tick_switches(preemption)
     {
         // SAFETY: schedule() re-acquires the lock and performs a context switch.
         // Requeue::Always: the expired thread goes back to its queue's tail.
         unsafe { schedule(Requeue::Always) };
+    }
+    else
+    {
+        // A live, preemption-disabled `current` still counts as non-idle
+        // (core/kernel/docs/scheduling-internals.md § Softlockup Watchdog).
+        watchdog_mark_non_idle(cpu);
     }
 }
 
@@ -10018,8 +10075,8 @@ mod outgoing_requeue_tests
 {
     use super::thread::{TCB_MAGIC, ThreadControlBlock, ThreadState};
     use super::{
-        IDLE_PRIORITY, Outgoing, PerCpuScheduler, RT_PRIORITY_MIN, Requeue, least_loaded_cpu,
-        requeue_local,
+        IDLE_PRIORITY, Outgoing, PerCpuScheduler, Preemption, RT_PRIORITY_MIN, Requeue,
+        least_loaded_cpu, requeue_local, tick_switches,
     };
 
     const CPU: usize = 1;
@@ -10223,6 +10280,99 @@ mod outgoing_requeue_tests
                 {
                     assert!(!make(state).requeue(requeue, CPU));
                 }
+            }
+        }
+    }
+
+    /// A timer tick whose slice accounting asks for a reschedule, taken with
+    /// `preemption`: `schedule()` with [`Requeue::Always`] when
+    /// [`tick_switches`] lets it switch; the thread running after it.
+    fn expiring_tick(
+        sched: &PerCpuScheduler,
+        current: *mut ThreadControlBlock,
+        preemption: Preemption,
+    ) -> *mut ThreadControlBlock
+    {
+        if tick_switches(preemption)
+        {
+            schedule(sched, current)
+        }
+        else
+        {
+            current
+        }
+    }
+
+    // The defect caught: an interrupt taken in a window between a thread's
+    // park commit and its own `schedule()` (the dealloc cascade's windows in
+    // fault delivery's release before its park, ipc/fault.rs) that switches
+    // the parking thread out mid-release, or links it beside the wake its
+    // release's teardown or another CPU deposits: a thread taken off its CPU
+    // inside a preempt-disabled window, a double link (#299), or a link of a
+    // thread another CPU claimed (#1221).
+    #[test]
+    fn a_window_between_a_park_commit_and_its_schedule_leaves_one_link()
+    {
+        // Whether another CPU's dispatch claims the woken thread (hard
+        // affinity) or its wake links it here (the save-window pin), and
+        // whether the window's tick lands before or after the wake.
+        for claimed_elsewhere in [false, true]
+        {
+            for tick_first in [true, false]
+            {
+                let case =
+                    format!("claimed elsewhere {claimed_elsewhere}, tick first {tick_first}");
+                let sched = PerCpuScheduler::new();
+                let (_parking_box, parking) = ready_at(10);
+                // Its dispatch, then its park commit.
+                // SAFETY: single-threaded test; parking is a live box.
+                assert!(unsafe { sched.enqueue(parking, 10) });
+                // SAFETY: single-threaded test.
+                assert_eq!(unsafe { sched.dequeue_highest() }, parking);
+                // SAFETY: parking is a live box.
+                unsafe { (*parking).state = ThreadState::Blocked };
+                let wake = || {
+                    // SAFETY: as above.
+                    unsafe { (*parking).state = ThreadState::Ready };
+                    // Claimed elsewhere: another CPU linked it and its
+                    // dispatch dequeued it, leaving it `Ready` and unlinked.
+                    if !claimed_elsewhere
+                    {
+                        // SAFETY: single-threaded test; parking is unlinked.
+                        assert!(unsafe { sched.enqueue(parking, 10) });
+                    }
+                };
+                if !tick_first
+                {
+                    wake();
+                }
+                assert_eq!(
+                    expiring_tick(&sched, parking, Preemption::Disabled),
+                    parking,
+                    "{case}"
+                );
+                // Neither state would link it, should a path into
+                // `schedule(Requeue::Always)` run here.
+                assert!(
+                    !read(&sched, parking).requeue(Requeue::Always, CPU),
+                    "{case}"
+                );
+                if tick_first
+                {
+                    wake();
+                }
+                // Its own `schedule()`.
+                let next = schedule_for(&sched, parking, Requeue::IfRunnable);
+                assert_eq!(core::ptr::eq(next, parking), !claimed_elsewhere, "{case}");
+                // SAFETY: single-threaded test.
+                assert_eq!(unsafe { sched.dequeue_highest() }, sched.idle(), "{case}");
+                // SAFETY: parking is a live box.
+                let queued_on = unsafe {
+                    (*parking)
+                        .queued_on
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                };
+                assert_eq!(queued_on, -1, "{case}");
             }
         }
     }
@@ -10487,6 +10637,31 @@ mod return_work_tests
             );
             assert!(seen.iter().all(|&w| w != 0), "a round ran on no work");
         }
+    }
+
+    // The defect caught: an interrupt return whose checks take an interrupt
+    // in a window (the sole-reference pass's dealloc cascade between two
+    // teardowns) and whose loop then takes the bits that interrupt posted and
+    // runs its checks again, so a stream of ticks holds the thread in its
+    // return, or drops them, so the work they announce waits for a later post.
+    #[test]
+    fn a_bit_an_interrupt_posts_inside_the_checks_stays_for_the_next_return()
+    {
+        use crate::percpu::return_work::{PREEMPT, SOLE_REF};
+        let word = core::cell::Cell::new(SOLE_REF);
+        let mut rounds = 0u32;
+        run_return_work(
+            || word.replace(0),
+            |_| {
+                rounds = rounds.saturating_add(1);
+                // The tick (its SOLE_REF post) and a wake IPI (its PREEMPT
+                // post) taken in a window of the pass.
+                word.set(word.get() | SOLE_REF | PREEMPT);
+                false
+            },
+        );
+        assert_eq!(rounds, 1);
+        assert_eq!(word.get(), SOLE_REF | PREEMPT);
     }
 }
 

@@ -622,7 +622,7 @@ demanding file:
   cell's ubench boots, and no ktest cell. This covers the runtime, the std port, and the crates
   std links that no kernel-layer crate links.
 - Markdown, the instruction files, and host tooling that no cell runs owe no boot. `host-tests`,
-  which runs on every change, lints the host crates as a cell's build does.
+  which runs on every change, lints the host crates as a build job's build does.
 
 A file the record does not place fails the run.
 

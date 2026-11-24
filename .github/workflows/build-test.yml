@@ -57,6 +57,8 @@ jobs:
     outputs:
       validate: ${{ steps.cells.outputs.validate }}
       validate-owed: ${{ steps.cells.outputs.validate-owed }}
+      build: ${{ steps.cells.outputs.build }}
+      build-owed: ${{ steps.cells.outputs.build-owed }}
       bench: ${{ steps.cells.outputs.bench }}
       bench-owed: ${{ steps.cells.outputs.bench-owed }}
       ktest-bench: ${{ steps.cells.outputs.ktest-bench }}
@@ -271,12 +273,101 @@ jobs:
   qemu-debs:
     uses: ./.github/workflows/qemu-debs.yml
 
-  validate:
-    # After the qemu-debs job, which seeds the firmware entry and the .deb
-    # set of its own image; see docs/build-system.md § Continuous
-    # Integration. The cells are the ones the select job owes; when it owes
-    # none, `if` skips the job, since a job of an empty matrix fails.
+  build:
+    # Each tree the owed cells and the bench cell boot, built once per run
+    # and shipped to them as artifacts (the tree action;
+    # docs/build-system.md § Continuous Integration): one job per
+    # architecture and profile a validate cell is owed in, and the release
+    # trees when the bench cell is owed, whose job also builds the
+    # benchmark image. The select job lists them; when it lists none, `if`
+    # skips the job, since a job of an empty matrix fails. After the
+    # qemu-debs job, which seeds the firmware entry and the .deb set of its
+    # own image: the build's pack runs the image check's fsck.fat.
     needs: [select, qemu-debs]
+    if: needs.select.outputs.build-owed == 'true'
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.build) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install QEMU and firmware
+        # For dosfstools; see docs/build-system.md § Continuous Integration.
+        uses: ./.github/actions/qemu-packages
+        with:
+          mode: install
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-10
+          components: rust-src,rustfmt,clippy,llvm-tools
+
+      - name: Restore the standard-library units
+        # See docs/build-system.md § Continuous Integration. One entry per
+        # architecture and profile, whose name is the one master's entries
+        # hold.
+        uses: ./.github/actions/std-cache
+        with:
+          mode: restore
+          name: validate-${{ matrix.arch }}-${{ matrix.profile }}
+
+      - name: Place the signing keys outside the checkout
+        # The job's first build generates a local root and a signing key in
+        # the runner's temporary directory; the tree action ships them to
+        # the cells of this run (docs/signing.md § Signing). A job-level env
+        # cannot read the runner context, so the path is set for the later
+        # steps here.
+        run: echo "SERAPH_SIGNING_DIR=$RUNNER_TEMP/seraph-signing" >> "$GITHUB_ENV"
+
+      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }})
+        run: |
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            cargo xtask build --arch ${{ matrix.arch }} --release
+          else
+            cargo xtask build --arch ${{ matrix.arch }}
+          fi
+
+      - name: Ship the tree
+        uses: ./.github/actions/tree
+        with:
+          mode: ship
+          name: tree-${{ matrix.arch }}-${{ matrix.profile }}
+          arch: ${{ matrix.arch }}
+          boot: 'true'
+
+      - name: Build the benchmark image (${{ matrix.arch }})
+        # The release tree with ktest's bench-only tier (docs/testing.md
+        # § Benchmarks), the build that runs on hardware; the host-mode bands
+        # were calibrated on the same build, so both modes measure one
+        # build. The lint pass is the build's above, so only ktest and what
+        # its feature reaches compile again.
+        if: matrix.bench
+        run: cargo xtask build --arch ${{ matrix.arch }} --release --ktest-bench-only --skip-lints
+
+      - name: Ship the benchmark image
+        if: matrix.bench
+        uses: ./.github/actions/tree
+        with:
+          mode: ship
+          name: tree-${{ matrix.arch }}-bench
+          arch: ${{ matrix.arch }}
+
+      - name: Save the standard-library units
+        # Last, since it empties Cargo's build directories but for those units.
+        uses: ./.github/actions/std-cache
+        with:
+          mode: save
+          name: validate-${{ matrix.arch }}-${{ matrix.profile }}
+
+  validate:
+    # After the build job of the cell's architecture and profile (and so
+    # after the qemu-debs job; see docs/build-system.md § Continuous
+    # Integration), whose tree the cell boots: no cell builds. The cells
+    # are the ones the select job owes; when it owes none, `if` skips the
+    # job, since a job of an empty matrix fails.
+    needs: [select, build]
     if: needs.select.outputs.validate-owed == 'true'
     runs-on: ubuntu-26.04
     strategy:
@@ -284,7 +375,7 @@ jobs:
       # Each cell is one of arch [x86_64, riscv64] x profile [debug, release]
       # x tester [svctest, usertest, ktest], in that key order, so its check
       # is named `validate (<arch>, <profile>, <tester>)`. One harness per
-      # cell: each cell builds once, stages exactly one
+      # cell: each cell takes its build job's tree, stages exactly one
       # recipe (or swaps boot.conf for ktest), then runs once. Avoids
       # back-to-back fatfs/sysroot state accumulation across harnesses
       # and lets a failing tier surface as a single named cell. After its
@@ -313,34 +404,25 @@ jobs:
           qemu-system-riscv64 --version
 
       - name: Install Rust toolchain
+        # The usertest cell alone compiles: its signing and rollback cases
+        # build bootloaders under trust stores they generate, from the
+        # bootloader's build state its build job ships (docs/build-system.md
+        # § Continuous Integration).
+        if: matrix.tester == 'usertest'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-11-10
-          components: rust-src,rustfmt,clippy,llvm-tools
+          components: rust-src,llvm-tools
 
-      - name: Restore the standard-library units
-        # See docs/build-system.md § Continuous Integration. The cells of one
-        # architecture and profile build the same units, so they share one
-        # entry.
-        uses: ./.github/actions/std-cache
+      - name: Fetch the tree (${{ matrix.arch }}, ${{ matrix.profile }})
+        # The build job's tree, its xtask binary, which the later steps run
+        # as `xtask`, and its signing identity, which every pack signs with.
+        uses: ./.github/actions/tree
         with:
-          mode: restore
-          name: validate-${{ matrix.arch }}-${{ matrix.profile }}
-
-      - name: Place the signing keys outside the checkout
-        # The job's first build generates a local root and a signing key in
-        # the runner's temporary directory, which the runner discards with the
-        # job (docs/signing.md § Signing). A job-level env cannot read the
-        # runner context, so the path is set for the later steps here.
-        run: echo "SERAPH_SIGNING_DIR=$RUNNER_TEMP/seraph-signing" >> "$GITHUB_ENV"
-
-      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }})
-        run: |
-          if [ "${{ matrix.profile }}" = "release" ]; then
-            cargo xtask build --arch ${{ matrix.arch }} --release
-          else
-            cargo xtask build --arch ${{ matrix.arch }}
-          fi
+          mode: fetch
+          name: tree-${{ matrix.arch }}-${{ matrix.profile }}
+          arch: ${{ matrix.arch }}
+          boot: ${{ matrix.tester == 'usertest' }}
 
       - name: Stage ${{ matrix.tester }} and repack disk
         # Recipe staging: svctest and usertest live in
@@ -405,7 +487,7 @@ jobs:
             svctest)
               rm -f sysroot/config/svcmgr/services/terminal.svc
               rm -f sysroot/config/svcmgr/services/crashd.svc
-              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
+              xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
                 --svctest ci
               ;;
             usertest)
@@ -413,11 +495,11 @@ jobs:
                  sysroot/config/svcmgr/tests/crashd.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
-              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
+              xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
                 --log-levels services/init/log-levels-vfsd-debug.conf
               ;;
             ktest)
-              cargo xtask mkdisk --arch ${{ matrix.arch }} --harness ktest \
+              xtask mkdisk --arch ${{ matrix.arch }} --harness ktest \
                 --knob mapredo
               ;;
           esac
@@ -465,7 +547,7 @@ jobs:
             "$@"
             took=$((SECONDS - started))
             if [ "$took" -gt $((budget / 2)) ]; then
-              echo "::warning title=boot budget::$3 took ${took} s, over half of the cell's ${budget} s budget; re-derive the budgets (docs/build-system.md § Continuous Integration)."
+              echo "::warning title=boot budget::$2 took ${took} s, over half of the cell's ${budget} s budget; re-derive the budgets (docs/build-system.md § Continuous Integration)."
             fi
           }
           # --save-logs keeps every run's log, a PASS included, for the
@@ -495,7 +577,7 @@ jobs:
               checks=(--require 'mapredo knob present; redoing steps 6 and 7'
                       --fail-also ' SKIP ') ;;
           esac
-          budgeted cargo xtask run \
+          budgeted xtask run \
             --arch ${{ matrix.arch }} \
             --runs 1 --timeout "$budget" \
             --save-logs target/xtask/run-saved $test_devices $crash_reports \
@@ -519,12 +601,12 @@ jobs:
         # (xtask/README.md § Cells); the step reports each case's and each
         # lane's wall and CPU time.
         run: |
-          cargo xtask mkdisk --arch ${{ matrix.arch }}
+          xtask mkdisk --arch ${{ matrix.arch }}
           release=
           if [ "${{ matrix.profile }}" = "release" ]; then
             release=--release
           fi
-          cargo xtask test --cell ${{ matrix.tester }} --arch ${{ matrix.arch }} $release \
+          xtask test --cell ${{ matrix.tester }} --arch ${{ matrix.arch }} $release \
             --lanes 3
 
       - name: Upload run logs
@@ -554,12 +636,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Save the standard-library units
-        # Last, since it empties Cargo's build directories but for those units.
-        uses: ./.github/actions/std-cache
-        with:
-          mode: save
-          name: validate-${{ matrix.arch }}-${{ matrix.profile }}
 
   bench:
     # The benchmark cell: the bench-only ktest image and the userspace ubench
@@ -567,11 +643,11 @@ jobs:
     # repeat from run to run, and their one-CPU counts held to the checked-in
     # baselines (xtask/README.md § `cargo xtask bench-check`; docs/testing.md
     # § Gating). After the
-    # qemu-debs job, as validate is; see docs/build-system.md § Continuous
-    # Integration. The select job owes the cell, and within it the ktest
+    # build job of its architecture's release tree, which builds its image,
+    # as validate is; see docs/build-system.md § Continuous Integration. The select job owes the cell, and within it the ktest
     # boots apart: when it does not owe them they are skipped, and so are
     # the ktest suite's baselines.
-    needs: [select, qemu-debs]
+    needs: [select, build]
     if: needs.select.outputs.bench-owed == 'true'
     runs-on: ubuntu-26.04
     strategy:
@@ -586,38 +662,33 @@ jobs:
           mode: install
 
       - name: Install Rust toolchain
+        # For the compiler version `bench-check` records with the counts; the
+        # cell compiles nothing.
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-11-10
-          components: rust-src,rustfmt,clippy,llvm-tools
 
-      - name: Restore the standard-library units
-        # As validate's step of the same name.
-        uses: ./.github/actions/std-cache
+      - name: Fetch the benchmark image (${{ matrix.arch }})
+        # The release tree with ktest's bench-only tier, which the build job
+        # of the architecture's release tree builds; as validate's step of
+        # the same kind.
+        uses: ./.github/actions/tree
         with:
-          mode: restore
-          name: bench-${{ matrix.arch }}
+          mode: fetch
+          name: tree-${{ matrix.arch }}-bench
+          arch: ${{ matrix.arch }}
 
-      - name: Place the signing keys outside the checkout
-        # As validate's step of the same name.
-        run: echo "SERAPH_SIGNING_DIR=$RUNNER_TEMP/seraph-signing" >> "$GITHUB_ENV"
-
-      - name: Build the benchmark image (${{ matrix.arch }})
-        # The release profile, the build that runs on hardware (docs/testing.md
-        # § Benchmarks); the host-mode bands were calibrated on the same build,
-        # so both modes measure one build.
-        run: |
-          cargo xtask build --arch ${{ matrix.arch }} --release --ktest-bench-only
-          cargo xtask mkdisk --arch ${{ matrix.arch }} --harness ktest
+      - name: Pack the ktest image (${{ matrix.arch }})
+        run: xtask mkdisk --arch ${{ matrix.arch }} --harness ktest
 
       - name: Boot it under icount
         if: needs.select.outputs.ktest-bench == 'true'
         # Three one-CPU runs, whose counts the gate compares, and one
         # four-CPU run, whose counts it reports. A boot takes about 15 s.
         run: |
-          cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 1 \
+          xtask run --arch ${{ matrix.arch }} --icount --cpus 1 \
             --runs 3 --timeout 300 --save-logs target/xtask/bench
-          cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 4 \
+          xtask run --arch ${{ matrix.arch }} --icount --cpus 4 \
             --runs 1 --timeout 300 --save-logs target/xtask/bench
 
       - name: Stage the ubench suite (${{ matrix.arch }})
@@ -627,21 +698,21 @@ jobs:
         # functional harness cells' staging does (services/ubench/README.md
         # § Running).
         run: |
-          cargo xtask mkdisk --arch ${{ matrix.arch }} --harness init
+          xtask mkdisk --arch ${{ matrix.arch }} --harness init
           cp sysroot/config/svcmgr/tests/ubench.svc \
              sysroot/config/svcmgr/services/
           rm -f sysroot/config/svcmgr/services/terminal.svc
-          cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
+          xtask mkdisk --arch ${{ matrix.arch }} --repack-only
 
       - name: Boot ubench under icount
         # As the ktest boots, with a framebuffer for console_write; the logs
         # go to their own directory, since a saved log is named by its
         # architecture, CPU count and run alone.
         run: |
-          cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 1 \
+          xtask run --arch ${{ matrix.arch }} --icount --cpus 1 \
             --display framebuffer --runs 3 --timeout 900 \
             --save-logs target/xtask/bench/ubench
-          cargo xtask run --arch ${{ matrix.arch }} --icount --cpus 4 \
+          xtask run --arch ${{ matrix.arch }} --icount --cpus 4 \
             --display framebuffer --runs 1 --timeout 900 \
             --save-logs target/xtask/bench/ubench
 
@@ -658,7 +729,7 @@ jobs:
           else
             ktest=(--skip-suite ktest)
           fi
-          cargo xtask bench-check --mode icount \
+          xtask bench-check --mode icount \
             --write-env target/xtask/bench/ENV "${ktest[@]}" \
             target/xtask/bench/ubench/*.log
 
@@ -674,13 +745,6 @@ jobs:
             target/xtask/bench/ENV
           if-no-files-found: ignore
 
-      - name: Save the standard-library units
-        # As validate's step of the same name.
-        uses: ./.github/actions/std-cache
-        with:
-          mode: save
-          name: bench-${{ matrix.arch }}
-
   summary:
     # The one check branch protection requires (docs/conventions.md § Branch
     # protection): it fails when a job failed or was cancelled, or was
@@ -688,7 +752,7 @@ jobs:
     # change owes it nothing passes. A check that never reports blocks a
     # merge, so the cells, which run only when owed, are not required
     # checks themselves.
-    needs: [select, host-tests, kani, fuzz, qemu-debs, validate, bench]
+    needs: [select, host-tests, kani, fuzz, qemu-debs, build, validate, bench]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -697,6 +761,7 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           VALIDATE_OWED: ${{ needs.select.outputs.validate-owed }}
+          BUILD_OWED: ${{ needs.select.outputs.build-owed }}
           BENCH_OWED: ${{ needs.select.outputs.bench-owed }}
           FUZZ_OWED: ${{ needs.select.outputs.fuzz-owed }}
         run: |
@@ -705,6 +770,7 @@ jobs:
             result=$(jq -r --arg job "$job" '.[$job].result' <<<"$NEEDS")
             case "$job" in
               validate) owed=$VALIDATE_OWED ;;
+              build) owed=$BUILD_OWED ;;
               bench) owed=$BENCH_OWED ;;
               fuzz) owed=$FUZZ_OWED ;;
               *) owed=true ;;

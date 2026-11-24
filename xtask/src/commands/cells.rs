@@ -15,7 +15,7 @@
 //! first-parent history whose `build-test` run on a push to `master` passed
 //! (`--since-green`), so that a cell a red or unfinished `master` run left
 //! unproven stays owed until a run passes it. `build-test.yml` builds its
-//! validate and bench matrices from `--github-output`.
+//! validate, build and bench matrices from `--github-output`.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -400,8 +400,31 @@ fn validate_cells(owed: Owed) -> Vec<(&'static str, &'static str, &'static str)>
     cells
 }
 
+/// The trees the owed cells boot, as (arch, profile, bench), in the
+/// workflow's order: every architecture and profile when a validate cell is
+/// owed, and the release trees when the bench cell is, whose bench-only
+/// image is built from its architecture's release tree (`bench` true).
+#[must_use]
+pub fn build_trees(owed: Owed) -> Vec<(&'static str, &'static str, bool)>
+{
+    let mut trees = Vec::new();
+    for arch in ARCHES
+    {
+        for profile in PROFILES
+        {
+            let bench = owed.bench && profile == "release";
+            if !owed.testers.is_empty() || bench
+            {
+                trees.push((arch, profile, bench));
+            }
+        }
+    }
+    trees
+}
+
 /// The workflow's outputs (`key=value` lines for `$GITHUB_OUTPUT`): the
-/// validate and bench matrices as `include` lists, whether each is owed,
+/// validate matrix, the build matrix of the trees its cells and the bench
+/// cell boot, and the bench matrix, as `include` lists, whether each is owed,
 /// whether the bench cell's ktest boots are, whether the fuzz job is, and the
 /// base commit, empty when there is none, from which the `kani` job selects
 /// its crates.
@@ -412,6 +435,12 @@ fn github_output(selection: &Selection) -> String
         .iter()
         .map(|(arch, profile, tester)| {
             format!(r#"{{"arch":"{arch}","profile":"{profile}","tester":"{tester}"}}"#)
+        })
+        .collect();
+    let build: Vec<String> = build_trees(owed)
+        .iter()
+        .map(|(arch, profile, bench)| {
+            format!(r#"{{"arch":"{arch}","profile":"{profile}","bench":{bench}}}"#)
         })
         .collect();
     let bench: Vec<String> = if owed.bench
@@ -426,10 +455,13 @@ fn github_output(selection: &Selection) -> String
         Vec::new()
     };
     format!(
-        "validate={{\"include\":[{}]}}\nvalidate-owed={}\nbench={{\"include\":[{}]}}\n\
-         bench-owed={}\nktest-bench={}\nfuzz-owed={}\nbase={}\n",
+        "validate={{\"include\":[{}]}}\nvalidate-owed={}\nbuild={{\"include\":[{}]}}\n\
+         build-owed={}\nbench={{\"include\":[{}]}}\nbench-owed={}\nktest-bench={}\n\
+         fuzz-owed={}\nbase={}\n",
         validate.join(","),
         !validate.is_empty(),
+        build.join(","),
+        !build.is_empty(),
         bench.join(","),
         owed.bench,
         owed.ktest_bench,
@@ -538,6 +570,52 @@ mod tests
         assert!(every.contains(r#"bench={"include":[{"arch":"x86_64"},{"arch":"riscv64"}]}"#));
     }
 
+    // Defect caught: a cell or bench boot whose tree no build job makes, a
+    // tree built twice, a tree built that no owed cell boots, or the
+    // bench-only image built from a tree other than its architecture's
+    // release tree.
+    #[test]
+    fn each_booted_tree_is_built_once()
+    {
+        let none = output(NO_CELL, None);
+        assert!(
+            none.contains("build={\"include\":[]}\nbuild-owed=false\n"),
+            "{none}"
+        );
+        let every = output(EVERY_CELL, None);
+        assert!(
+            every.contains(concat!(
+                r#"build={"include":[{"arch":"x86_64","profile":"debug","bench":false},"#,
+                r#"{"arch":"x86_64","profile":"release","bench":true},"#,
+                r#"{"arch":"riscv64","profile":"debug","bench":false},"#,
+                r#"{"arch":"riscv64","profile":"release","bench":true}]}"#,
+                "\nbuild-owed=true\n"
+            )),
+            "{every}"
+        );
+        let upper = owed_by(Class::Layer(Layer::Services));
+        assert_eq!(build_trees(upper).len(), 4);
+        let bench_only = Owed {
+            testers: &[],
+            bench: true,
+            ktest_bench: false,
+        };
+        assert_eq!(
+            build_trees(bench_only),
+            [("x86_64", "release", true), ("riscv64", "release", true)]
+        );
+        for (arch, profile, _) in validate_cells(EVERY_CELL)
+        {
+            assert_eq!(
+                build_trees(EVERY_CELL)
+                    .iter()
+                    .filter(|(a, p, _)| (*a, *p) == (arch, profile))
+                    .count(),
+                1
+            );
+        }
+    }
+
     // Defect caught: the base taken from a red or unfinished run's commit, so
     // the cells it left unproven are owed by no later run, or from an older
     // passing commit than the newest.
@@ -581,6 +659,47 @@ mod tests
         assert!(kani.contains("\n    needs: select\n"), "{kani}");
         assert!(kani.contains("${{ needs.select.outputs.base }}"), "{kani}");
         assert!(!kani.contains("github.event.before"), "{kani}");
+    }
+
+    // Defect caught: a cell or bench boot that builds its own tree, runs a
+    // `cargo` command a cell without the toolchain cannot, waits on no build
+    // job, or fetches an artifact no build job ships.
+    #[test]
+    fn the_cells_boot_the_trees_the_build_jobs_ship()
+    {
+        let workflow = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/build-test.yml"),
+        )
+        .unwrap();
+        let job = |name: &str, next: &str| {
+            workflow
+                .split(&format!("\n  {name}:\n"))
+                .nth(1)
+                .and_then(|rest| rest.split(&format!("\n  {next}:\n")).next())
+                .unwrap()
+                .to_owned()
+        };
+        let build = job("build", "validate");
+        let validate = job("validate", "bench");
+        let bench = job("bench", "summary");
+        assert!(build.contains("${{ fromJSON(needs.select.outputs.build) }}"));
+        assert!(build.contains("if: needs.select.outputs.build-owed == 'true'"));
+        let tree = "name: tree-${{ matrix.arch }}-${{ matrix.profile }}\n";
+        let image = "name: tree-${{ matrix.arch }}-bench\n";
+        for (cell, name) in [(&validate, tree), (&bench, image)]
+        {
+            assert!(cell.contains("\n    needs: [select, build]\n"), "{cell}");
+            assert!(cell.contains("mode: fetch\n"), "{cell}");
+            assert!(cell.contains(name), "{cell}");
+            assert!(build.contains(name), "{name}");
+            assert!(!cell.contains("std-cache"), "{cell}");
+            for line in cell.lines().map(str::trim_start)
+            {
+                assert!(!line.starts_with("cargo "), "{line}");
+            }
+        }
+        assert!(build.contains("mode: ship\n"));
+        assert!(validate.contains("boot: ${{ matrix.tester == 'usertest' }}"));
     }
 
     // Defect caught: the fuzz job skipped for a change to a crate it fuzzes,

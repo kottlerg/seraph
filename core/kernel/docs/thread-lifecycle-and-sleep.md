@@ -375,7 +375,7 @@ stated explicitly.
     queue (a no-op if a waker already dequeued it) and blocked_on_object is
     nulled inside the same hold. A binding that no longer matches was
     retired by its claimant, and nothing is touched. Branches:
-      - BlockedOnSend / BlockedOnRecv: ep.lock; unlink_from_wait_queue.
+      - BlockedOnSend / BlockedOnRecv: ep.lock; WaitQueue::remove.
       - BlockedOnNotification: sig.lock; remove tcb from the waiter queue.
       - BlockedOnEventQueue: eq.lock; remove tcb from the waiter queue.
       - BlockedOnWaitSet: ws.lock; remove tcb from the waiter queue.
@@ -1073,12 +1073,12 @@ written under its `sched_lock`: `None`; `Pending`, the hold found it `Running` o
 
 1. Compare-and-swap the space `Free → Holding`; on failure return `InvalidState`.
 2. Walk the thread registry (`thread_registry::for_each`: its lock held, interrupts disabled on
-   this CPU). For each thread whose `address_space` is the space, under its `sched_lock`: a
-   `Ready` thread is committed `Stopped` and marked `Stopped` under every CPU's scheduler lock,
-   its run-queue link drained, as a `sys_thread_stop` commit drains it (a CPU whose dispatch
-   already dequeued it finds it `Stopped` at the dispatch flip and does not run it); a `Running`
-   or `Blocked` thread is marked `Pending`; a `Created`, `Stopped` or `Exited` one is left
-   alone.
+   this CPU, one batch at a time, with an interrupt window between batches). For each thread whose
+   `address_space` is the space, under its `sched_lock`: a `Ready` thread is committed `Stopped` and
+   marked `Stopped` under every CPU's scheduler lock, its run-queue link drained, as a
+   `sys_thread_stop` commit drains it (a CPU whose dispatch already dequeued it finds it `Stopped`
+   at the dispatch flip and does not run it); a `Running` or `Blocked` thread is marked `Pending`; a
+   `Created`, `Stopped` or `Exited` one is left alone.
 3. Wait, preemption disabled and interrupts enabled (spin site `hold:settle`), until no CPU's
    `current` executes in the space, read under each CPU's scheduler lock in turn, and every thread
    of the space has `context_saved` set, read in a registry walk. A pass that finds either unmet

@@ -5,9 +5,9 @@
 
 //! Endpoint IPC — synchronous call / receive / reply.
 //!
-//! An endpoint has two intrusive FIFO queues:
-//! - `send_queue`: callers blocked waiting for a server to `recv`.
-//! - `recv_queue`: servers blocked waiting for a caller to `call`.
+//! An endpoint has two intrusive FIFO queues ([`WaitQueue`]):
+//! - `send`: callers blocked waiting for a server to `recv`.
+//! - `recv`: servers blocked waiting for a caller to `call`.
 //!
 //! ## Protocol
 //! The call, receive, and reply paths (`endpoint_call`, `endpoint_recv`,
@@ -25,8 +25,8 @@
 //! `endpoint_call` and `endpoint_recv` take `EndpointState::lock` (`ep.lock`)
 //! themselves; it serialises the send/recv queues and the call/recv rendezvous.
 //! `endpoint_reply` takes no lock and serialises through the `reply_tcb` claim.
-//! `unlink_from_wait_queue` requires the caller to hold the owning endpoint's
-//! `ep.lock`. Callers enter with no scheduler lock held (lock order:
+//! Every other access to a queue (a canceller's or a dying thread's removal)
+//! holds the owning endpoint's `ep.lock`. Callers enter with no scheduler lock held (lock order:
 //! core/kernel/docs/scheduling-internals.md § Lock Hierarchy). A server's `reply_tcb` is
 //! claimed by compare-exchange (`endpoint_reply`, cancel, teardown) or by an
 //! atomic swap (the `SYS_IPC_REPLY` failure path, the release of an unreplied
@@ -35,31 +35,29 @@
 //! core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership, and the swap claim
 //! in core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes.
 
+use super::WaitQueue;
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 
 // ── EndpointState ─────────────────────────────────────────────────────────────
 
 /// Kernel state backing an Endpoint capability.
 ///
-/// The send/recv queues are intrusive singly-linked lists through `ipc_wait_next`
-/// in each TCB. Both queues have FIFO ordering. `lock` serialises every
-/// non-atomic field that changes after construction (the bare-field
-/// exception of docs/coding-standards.md § Concurrency).
+/// The send/recv queues are [`WaitQueue`]s: FIFO, and O(1) to remove any
+/// thread from, which a canceller, a dying thread and a refused park's
+/// rollback do. `lock` serialises every non-atomic field that changes after
+/// construction (the bare-field exception of docs/coding-standards.md
+/// § Concurrency).
 pub struct EndpointState
 {
-    /// Head of the blocked-senders queue (callers waiting for a receiver).
-    pub send_head: *mut ThreadControlBlock,
-    /// Tail of the blocked-senders queue.
-    pub send_tail: *mut ThreadControlBlock,
-    /// `1` iff `send_head != null`: the lockless readiness signal that
+    /// The blocked senders (callers waiting for a receiver).
+    pub send: WaitQueue,
+    /// `1` iff `send` is not empty: the lockless readiness signal that
     /// `wait_set::source_is_ready` reads, Release-stored under `lock` by
-    /// [`EndpointState::refresh_send_ready`] at every `send_head` mutation
+    /// [`EndpointState::refresh_send_ready`] at every `send` mutation
     /// (core/kernel/docs/ipc-internals.md § Wait Path).
     pub send_nonempty: core::sync::atomic::AtomicU32,
-    /// Head of the blocked-receivers queue (servers waiting for a caller).
-    pub recv_head: *mut ThreadControlBlock,
-    /// Tail of the blocked-receivers queue.
-    pub recv_tail: *mut ThreadControlBlock,
+    /// The blocked receivers (servers waiting for a caller).
+    pub recv: WaitQueue,
     /// Opaque pointer to the `WaitSetState` this endpoint is registered with,
     /// or null if not in any wait set. Type-erased to avoid a circular import.
     /// Cast to `*mut WaitSetState` only inside `wait_set.rs`.
@@ -81,12 +79,17 @@ pub struct EndpointState
     pub receivers: core::sync::atomic::AtomicU32,
 }
 
-// SAFETY: every mutation of the raw queue pointers (`send_*`, `recv_*`) and of
-// the wait-set back-pointer fields happens under `EndpointState::lock`, and
-// `send_nonempty` and `receivers` are atomics, so moving the state between CPUs exposes no
-// unsynchronised write.
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the fields that are not `Send`, the wait queues and the wait-set back-pointer, \
+              are read and written only under the endpoint's `lock`"
+)]
+// SAFETY: every access to the queues (`send`, `recv`) and to the wait-set
+// back-pointer fields happens under `EndpointState::lock`, and
+// `send_nonempty` and `receivers` are atomics, so moving the state between
+// CPUs exposes no unsynchronised write.
 unsafe impl Send for EndpointState {}
-// SAFETY: concurrent shared access writes the raw-pointer fields only under
+// SAFETY: concurrent shared access writes the queues and raw-pointer fields only under
 // `EndpointState::lock`; the lock-free readiness check
 // (`wait_set::source_is_ready`) reads only the atomic `send_nonempty`.
 unsafe impl Sync for EndpointState {}
@@ -104,11 +107,9 @@ impl EndpointState
     pub fn new() -> Self
     {
         Self {
-            send_head: core::ptr::null_mut(),
-            send_tail: core::ptr::null_mut(),
+            send: WaitQueue::new(),
             send_nonempty: core::sync::atomic::AtomicU32::new(0),
-            recv_head: core::ptr::null_mut(),
-            recv_tail: core::ptr::null_mut(),
+            recv: WaitQueue::new(),
             wait_set: core::ptr::null_mut(),
             wait_set_member_idx: 0,
             lock: crate::sync::Spinlock::new(),
@@ -143,80 +144,21 @@ impl EndpointState
         self.receivers.load(core::sync::atomic::Ordering::Acquire) != 0
     }
 
-    /// Republish the `send_nonempty` shadow from the current `send_head`.
+    /// Republish the `send_nonempty` shadow from the current `send` queue.
     ///
-    /// MUST be called under `lock` after every `send_head` mutation so the
+    /// MUST be called under `lock` after every `send` mutation so the
     /// lockless `Acquire` reader in `wait_set::source_is_ready` observes the
     /// current level. `Release` pairs with that `Acquire`.
     ///
     /// # Safety
-    /// Caller holds `self.lock` (serialises with all `send_head` writers).
+    /// Caller holds `self.lock` (serialises with all `send` writers).
     pub unsafe fn refresh_send_ready(&self)
     {
         self.send_nonempty.store(
-            u32::from(!self.send_head.is_null()),
+            u32::from(!self.send.is_empty()),
             core::sync::atomic::Ordering::Release,
         );
     }
-}
-
-// ── Queue helpers ─────────────────────────────────────────────────────────────
-
-/// Append `tcb` to the tail of a FIFO queue (head, tail pointers).
-///
-/// # Safety
-/// The TCB must not already be on any queue.
-unsafe fn enqueue(
-    head: &mut *mut ThreadControlBlock,
-    tail: &mut *mut ThreadControlBlock,
-    tcb: *mut ThreadControlBlock,
-)
-{
-    // SAFETY: tcb validated by caller; ipc_wait_next field always valid in TCB.
-    unsafe {
-        (*tcb).ipc_wait_next = None;
-    }
-    if tail.is_null()
-    {
-        *head = tcb;
-        *tail = tcb;
-    }
-    else
-    {
-        // SAFETY: tail validated non-null; ipc_wait_next field always valid in TCB.
-        unsafe {
-            (**tail).ipc_wait_next = Some(tcb);
-        }
-        *tail = tcb;
-    }
-}
-
-/// Remove and return the head of the queue, or null if empty.
-///
-/// # Safety
-/// Head/tail pointers must be consistent.
-unsafe fn dequeue(
-    head: &mut *mut ThreadControlBlock,
-    tail: &mut *mut ThreadControlBlock,
-) -> *mut ThreadControlBlock
-{
-    if head.is_null()
-    {
-        return core::ptr::null_mut();
-    }
-    let tcb = *head;
-    // SAFETY: tcb validated non-null; ipc_wait_next field always valid in TCB.
-    let next = unsafe { (*tcb).ipc_wait_next };
-    *head = next.unwrap_or_default();
-    if head.is_null()
-    {
-        *tail = core::ptr::null_mut();
-    }
-    // SAFETY: tcb validated non-null; ipc_wait_next field always valid in TCB.
-    unsafe {
-        (*tcb).ipc_wait_next = None;
-    }
-    tcb
 }
 
 // ── Endpoint operations ───────────────────────────────────────────────────────
@@ -382,8 +324,8 @@ pub unsafe fn endpoint_call(
     }
 
     // Is a server waiting?
-    // SAFETY: recv_head/recv_tail maintained by enqueue/dequeue operations.
-    let server = unsafe { dequeue(&mut ep.recv_head, &mut ep.recv_tail) };
+    // SAFETY: ep.lock is held.
+    let server = unsafe { ep.recv.pop() };
     if !server.is_null()
     {
         // The dequeue claimed the server's receive, so a timed receive's
@@ -394,7 +336,7 @@ pub unsafe fn endpoint_call(
             clippy::undocumented_unsafe_blocks,
             reason = "the two unsafe reads sit inside debug_assert! arguments, where a per-block \
                       SAFETY comment cannot be placed. Both are sound: server was just dequeued \
-                      from recv_head under ep.lock and is a live TCB"
+                      from the recv queue under ep.lock and is a live TCB"
         )]
         {
             debug_assert!(
@@ -451,7 +393,7 @@ pub unsafe fn endpoint_call(
             reason = "every access is to an atomic field of server, a live TCB dequeued under the \
                       held ep.lock"
         )]
-        // SAFETY: server was dequeued from recv_head under the held ep.lock,
+        // SAFETY: server was dequeued from the recv queue under the held ep.lock,
         // so it is a live TCB this call has claimed; each field is an atomic.
         unsafe {
             // The server reached the recv queue through endpoint_recv, which
@@ -522,7 +464,7 @@ pub unsafe fn endpoint_call(
     // the push below, for the receive that binds it.
     // SAFETY: caller is the running thread, on no wait queue; ep.lock held.
     unsafe {
-        enqueue(&mut ep.send_head, &mut ep.send_tail, caller);
+        ep.send.push(caller);
     }
     // Publish the send-queue level before the wait-set notify below.
     // SAFETY: ep.lock held.
@@ -544,7 +486,7 @@ pub unsafe fn endpoint_call(
         // delivery's); unlink from the send queue.
         // SAFETY: ep.lock held; caller is a valid TCB.
         unsafe {
-            let _ = unlink_from_wait_queue(caller, &mut ep.send_head, &mut ep.send_tail);
+            let _ = ep.send.remove(caller);
         }
         // SAFETY: ep.lock held.
         unsafe { ep.refresh_send_ready() };
@@ -695,8 +637,8 @@ unsafe fn bind_next_sender(
     // then retires the dequeued sender's episode and skips to the next.
     loop
     {
-        // SAFETY: send_head/send_tail maintained by enqueue/dequeue operations.
-        let caller = unsafe { dequeue(&mut ep.send_head, &mut ep.send_tail) };
+        // SAFETY: ep.lock is held.
+        let caller = unsafe { ep.send.pop() };
         // Republish the send-queue level after each dequeue (the queue may now be
         // empty) for the lockless wait-set level self-heal (#285).
         // SAFETY: ep.lock held.
@@ -716,7 +658,7 @@ unsafe fn bind_next_sender(
         // a timed call's expiry, a teardown) can claim the binding and wake
         // the caller, which can then exit and be freed while the receive's
         // capability transfer is still to run.
-        // SAFETY: caller dequeued from send_head under ep.lock, which a stop
+        // SAFETY: caller dequeued from the send queue under ep.lock, which a stop
         // or dealloc of a BlockedOnSend thread takes to unlink it, so it is
         // live.
         let cspace = unsafe { crate::cap::CSpaceIdentity::of_thread(caller) };
@@ -725,7 +667,7 @@ unsafe fn bind_next_sender(
         // (docs/fault-handling.md § Delivery, Resume, and Kill, § Kernel
         // Copies, § Asynchronous Upcalls); a normal call sender parks as
         // BlockedOnReply.
-        // SAFETY: caller dequeued from send_head; in_fault_delivery always valid.
+        // SAFETY: caller dequeued from the send queue; in_fault_delivery always valid.
         let parked = if unsafe { (*caller).in_fault_delivery }
         {
             IpcThreadState::BlockedOnFault
@@ -739,7 +681,7 @@ unsafe fn bind_next_sender(
         // wake BEFORE the rebind publishes reply_tcb, so dealloc's
         // BlockedOnReply / BlockedOnFault detach (which Acquire-loads
         // reply_tcb) sees the flag and gates on it before retype_free (#160).
-        // SAFETY: caller dequeued from send_head under ep.lock.
+        // SAFETY: caller dequeued from the send queue under ep.lock.
         unsafe {
             (*caller)
                 .wake_in_flight
@@ -866,9 +808,9 @@ pub unsafe fn endpoint_recv(
             .context_saved
             .store(0, core::sync::atomic::Ordering::Relaxed);
     }
-    // SAFETY: server validated by syscall layer.
+    // SAFETY: server is the running thread, on no wait queue; ep.lock held.
     unsafe {
-        enqueue(&mut ep.recv_head, &mut ep.recv_tail, server);
+        ep.recv.push(server);
     }
     let blocked_on = core::ptr::from_mut::<EndpointState>(ep).cast::<u8>();
     // SAFETY: server is the current CPU's running thread (this fn's contract);
@@ -889,7 +831,7 @@ pub unsafe fn endpoint_recv(
         // ipc_msg; a coalesced-wake refusal leaves the deposit standing.
         // SAFETY: ep.lock held; server is a valid TCB.
         unsafe {
-            unlink_from_wait_queue(server, &mut ep.recv_head, &mut ep.recv_tail);
+            let _ = ep.recv.remove(server);
         }
         if committed == crate::sched::ParkCommit::RefusedStop
         {
@@ -1045,7 +987,8 @@ pub unsafe fn endpoint_reply(server: *mut ThreadControlBlock) -> Option<*mut Thr
 ///
 /// # Safety
 /// `obj` must carry a reference the caller owns. Call with no
-/// `DERIVATION_LOCK`, `CSpace`, IPC, scheduler, or sleep-list lock held.
+/// `DERIVATION_LOCK`, `CSpace`, IPC, scheduler, or sleep-list lock held, where
+/// interrupts may be taken (the drain opens interrupt windows).
 #[cfg(not(test))]
 pub unsafe fn release_if_unreceivable(
     obj: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
@@ -1073,150 +1016,106 @@ pub unsafe fn release_if_unreceivable(
 /// [`PARK_DISPOSITION_NO_RECEIVER`](crate::sched::thread::PARK_DISPOSITION_NO_RECEIVER)
 /// (a queued fault delivery with `FAULT_OUTCOME_NO_RECEIVER`, so the fault is
 /// unhandled), and each parked receiver the same way; a timed park's sleep-list
-/// entry goes with it, and `send_nonempty` is republished.
+/// entry goes with it, and `send_nonempty` is republished. The senders go
+/// first, then the receivers, each queue in its order.
 ///
 /// Run by [`release_if_unreceivable`] and by the endpoint's dealloc, where no
 /// slot names the endpoint, so none with the Receive right does.
 ///
-/// The drain runs under `ep.lock`: a concurrent `dealloc_object(Thread)`
-/// `BlockedOnSend` / `BlockedOnRecv` unlink takes the same lock, so it cannot
-/// change these queues or free a waiter mid-walk, and the per-waiter
-/// `wake_in_flight = 1` set here (the #160 discipline) makes a
-/// `dealloc_object(Thread)` that already left the queue wait at its
+/// Each waiter is popped from its queue under `ep.lock` (its episode claim),
+/// pinned (`wake_in_flight = 1`, the #160 discipline, so a
+/// `dealloc_object(Thread)` that finds it gone from the queue waits at its
 /// wake-in-flight gate for this drain's `enqueue_and_wake` rather than free
-/// the TCB under it. Holding `ep.lock` across `enqueue_and_wake` follows
-/// core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 1.
+/// the TCB under it), stamped, and woken, all in one hold of the lock, as
+/// core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5 allows.
+/// The drain holds the lock for [`super::DRAIN_BATCH_WAITERS`] waiters at a
+/// time and opens an interrupt window between batches
+/// ([`super::drain_in_batches`]): the waiters it has not reached stay queued
+/// and unclaimed meanwhile, so a canceller, a timed park's expiry or the
+/// waiter's own dealloc claims one by its usual removal under `ep.lock`, and
+/// no thread joins either queue, since a call or a receive reads
+/// [`EndpointState::receivers`] under the lock and that count's zero is
+/// final. Two drains of one endpoint (two releases that each read zero) take
+/// turns at the queues; each pop is one claim.
 ///
 /// # Safety
-/// `ep` must be a live `EndpointState` with no receiver left. Call with no
-/// `DERIVATION_LOCK`, `CSpace`, IPC, scheduler, or sleep-list lock held.
+/// `ep` must be a live `EndpointState` with no receiver left, live until
+/// this returns. Call with no `DERIVATION_LOCK`, `CSpace`, IPC, scheduler,
+/// or sleep-list lock held, where interrupts may be taken.
 #[cfg(not(test))]
 pub unsafe fn release_waiters(ep: *mut EndpointState)
 {
     // SAFETY: ep is live (contract).
-    let ep = unsafe { &mut *ep };
+    let lock = unsafe { &(*ep).lock };
     debug_assert!(
-        !ep.has_receiver(),
+        // SAFETY: ep is live (contract); receivers is atomic.
+        !unsafe { (*ep).has_receiver() },
         "release_waiters: the endpoint still has a receiver"
     );
-    // SAFETY: the returned flags are passed verbatim to the unlock_raw below.
-    let saved = unsafe { ep.lock.lock_raw() };
-    // The whole-queue detach under ep.lock is each episode's claim.
-    let senders = core::mem::replace(&mut ep.send_head, core::ptr::null_mut());
-    ep.send_tail = core::ptr::null_mut();
-    // SAFETY: ep.lock is held, serialising with all send_head writers.
-    unsafe { ep.refresh_send_ready() };
-    let receivers = core::mem::replace(&mut ep.recv_head, core::ptr::null_mut());
-    ep.recv_tail = core::ptr::null_mut();
+    // SAFETY: the returned flags are passed, through the drain, to the
+    // unlock_raw below.
+    let mut saved = unsafe { lock.lock_raw() };
+    let has_waiter = || {
+        // SAFETY: ep is live; ep.lock is held while the drain calls this.
+        let state = unsafe { &*ep };
+        !state.send.is_empty() || !state.recv.is_empty()
+    };
     // A queued fault sender (its handler never received) takes the
     // no-receiver kill outcome when woken (its copy fault fails the syscall,
     // its upcall is dropped): its resume runs the fault helper, which reads
     // `fault_outcome`. A caller or a receiver gets NO_RECEIVER, so its
     // syscall's resume returns the error instead of reading the deposit.
-    for (head, sender) in [(senders, true), (receivers, false)]
-    {
-        let mut tcb = head;
-        while !tcb.is_null()
+    let release_next = || {
+        // SAFETY: ep is live; ep.lock is held while the drain calls this, and
+        // the drain calls it only while a queue holds a waiter.
+        let state = unsafe { &mut *ep };
+        let sender = !state.send.is_empty();
+        let tcb = if sender
         {
-            // SAFETY: tcb was queued on ep, kept live by the held ep.lock,
-            // which a concurrent dealloc(waiter) unlink also takes.
-            let next = unsafe { (*tcb).ipc_wait_next };
             // SAFETY: as above.
-            unsafe { (*tcb).ipc_wait_next = None };
-            let kind = if sender
-            {
-                // SAFETY: tcb is a valid TCB whose park claim this drain
-                // holds: it was detached from the queue under ep.lock.
-                unsafe { crate::sched::thread::ParkKind::of_sender(tcb) }
-            }
-            else
-            {
-                crate::sched::thread::ParkKind::Call
-            };
-            // SAFETY: tcb is a valid TCB whose park episode this drain has
-            // claimed under ep.lock; exactly one stamp per episode.
-            unsafe { crate::sched::thread::stamp_no_receiver_deposit(tcb, kind) };
-            // A timed park's entry ends with its episode.
-            // SAFETY: tcb's park episode was just claimed under ep.lock and is
-            // not yet woken; no sleep-list lock is held.
-            unsafe { crate::ipc::cancel_timed_entry(tcb) };
-            // Claim for wake under ep.lock (#160); cleared by enqueue_and_wake.
-            // SAFETY: tcb is a valid TCB; ep.lock held.
-            unsafe {
-                (*tcb)
-                    .wake_in_flight
-                    .store(1, core::sync::atomic::Ordering::Release);
-            }
-            // SAFETY: tcb is a valid, initialised TCB.
-            let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
-            // SAFETY: tcb is a valid TCB; target_cpu came from
-            // select_target_cpu.
-            unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };
-            tcb = next.unwrap_or(core::ptr::null_mut());
+            let tcb = unsafe { state.send.pop() };
+            // SAFETY: as above; ep.lock serialises every send-queue writer.
+            unsafe { state.refresh_send_ready() };
+            tcb
         }
-    }
-    // SAFETY: `saved` is the value lock_raw returned for this lock above.
-    unsafe { ep.lock.unlock_raw(saved) };
-}
-
-// ── IPC block cancellation helper ────────────────────────────────────────────
-
-/// Remove `tcb` from a singly-linked IPC wait queue (chained through
-/// `ipc_wait_next`). Updates `head`/`tail` as needed.
-///
-/// Returns `true` if the TCB was found and removed, `false` if not present.
-///
-/// Used by `cancel_park` (the `SYS_THREAD_STOP`, object-teardown, upcall and
-/// timeout cancel path), by `dealloc_object(Thread)`'s `BlockedOnSend` /
-/// `BlockedOnRecv` unlink, and by the refused-park rollbacks in
-/// `endpoint_call` and `endpoint_recv`.
-///
-/// # Safety
-/// Caller must hold the owning endpoint's `ep.lock`. All pointers must be valid.
-pub unsafe fn unlink_from_wait_queue(
-    tcb: *mut ThreadControlBlock,
-    head: &mut *mut ThreadControlBlock,
-    tail: &mut *mut ThreadControlBlock,
-) -> bool
-{
-    let mut prev: *mut ThreadControlBlock = core::ptr::null_mut();
-    let mut cur = *head;
-
-    while !cur.is_null()
-    {
-        if core::ptr::eq(cur, tcb)
+        else
         {
-            // SAFETY: cur validated non-null; ipc_wait_next field always valid in TCB.
-            let next = unsafe { (*cur).ipc_wait_next.unwrap_or_default() };
-
-            if prev.is_null()
-            {
-                *head = next;
-            }
-            else
-            {
-                // SAFETY: prev validated non-null; ipc_wait_next field always valid in TCB.
-                unsafe {
-                    (*prev).ipc_wait_next = if next.is_null() { None } else { Some(next) };
-                }
-            }
-
-            if core::ptr::eq(cur, *tail)
-            {
-                *tail = prev;
-            }
-
-            // SAFETY: cur validated non-null; ipc_wait_next field always valid in TCB.
-            unsafe {
-                (*cur).ipc_wait_next = None;
-            }
-            return true;
+            // SAFETY: as above.
+            unsafe { state.recv.pop() }
+        };
+        let kind = if sender
+        {
+            // SAFETY: tcb is a valid TCB whose park this drain has claimed by
+            // popping it under ep.lock.
+            unsafe { crate::sched::thread::ParkKind::of_sender(tcb) }
         }
-
-        prev = cur;
-        // SAFETY: cur validated non-null; ipc_wait_next field always valid in TCB.
-        cur = unsafe { (*cur).ipc_wait_next.unwrap_or_default() };
-    }
-
-    false
+        else
+        {
+            crate::sched::thread::ParkKind::Call
+        };
+        // SAFETY: tcb is a valid TCB whose park episode this drain has
+        // claimed under ep.lock; exactly one stamp per episode.
+        unsafe { crate::sched::thread::stamp_no_receiver_deposit(tcb, kind) };
+        // A timed park's entry ends with its episode.
+        // SAFETY: tcb's park episode was just claimed under ep.lock and is
+        // not yet woken; no sleep-list lock is held.
+        unsafe { crate::ipc::cancel_timed_entry(tcb) };
+        // Claim for wake under ep.lock (#160); cleared by enqueue_and_wake.
+        // SAFETY: tcb is a valid TCB; ep.lock held.
+        unsafe {
+            (*tcb)
+                .wake_in_flight
+                .store(1, core::sync::atomic::Ordering::Release);
+        }
+        // SAFETY: tcb is a valid, initialised TCB.
+        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
+        // SAFETY: tcb is a valid TCB; target_cpu came from
+        // select_target_cpu.
+        unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };
+    };
+    // SAFETY: ep.lock is held with flags `saved` and no other lock; no waiter
+    // joins either queue (above); interrupts may be taken (contract).
+    unsafe { super::drain_in_batches(lock, &mut saved, has_waiter, release_next) };
+    // SAFETY: `saved` is the flags of the drain's last hold of this lock.
+    unsafe { lock.unlock_raw(saved) };
 }

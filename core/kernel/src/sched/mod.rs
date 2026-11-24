@@ -18,6 +18,7 @@
 
 pub mod deadline_heap;
 pub mod hold;
+pub mod registry_list;
 pub mod run_queue;
 pub mod thread;
 #[cfg(not(test))]
@@ -1710,7 +1711,7 @@ fn watchdog_dump_registry()
     let walked = unsafe { thread_registry::try_for_each(dump) };
     if !walked
     {
-        crate::kprintln!("    (registry lock contended; skipped)");
+        crate::kprintln!("    (registry walk contended; skipped or cut short)");
     }
 }
 
@@ -2075,9 +2076,11 @@ unsafe fn watchdog_read_source(
                 })
             };
             // SAFETY: the endpoint is live and locked (caller contract).
-            let send_head = head_tid(unsafe { (*ep).send_head });
+            let state = unsafe { &*ep };
+            // SAFETY: as for state; its lock serialises the queues.
+            let send_head = head_tid(unsafe { state.send.head() });
             // SAFETY: as for send_head.
-            let recv_head = head_tid(unsafe { (*ep).recv_head });
+            let recv_head = head_tid(unsafe { state.recv.head() });
             SourceSnapshot::Endpoint {
                 send_head,
                 recv_head,
@@ -2906,8 +2909,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     // thread it would loop back to a phase 1 that cannot
                     // mark it. They are never deallocated or `Blocked`, and
                     // the watchdog's per-CPU `current` dump already shows them.
-                    registry_next: core::ptr::null_mut(),
-                    registry_prev: core::ptr::null_mut(),
+                    registry: crate::sched::registry_list::RegistryLinks::new(),
                     magic: thread::TCB_MAGIC,
                 },
             );
@@ -4615,9 +4617,10 @@ pub(crate) unsafe fn running_thread_stopped() -> bool
     stopped
 }
 
-/// Phase 1 of [`stop_threads_bound_to`]: under the registry lock, stop every
-/// bound thread not already `Exited`, and prod each CPU found running one as
-/// the walk finds it.
+/// Phase 1 of [`stop_threads_bound_to`]: walk the registry
+/// ([`thread_registry::for_each`], under its lock a batch at a time), stop
+/// every bound thread not already `Exited`, and prod each CPU found running
+/// one as the walk finds it.
 /// Returns whether the running thread on `this_cpu` was among them.
 ///
 /// # Safety
@@ -4642,7 +4645,7 @@ unsafe fn mark_bound_threads(
         // SAFETY: tcb is registered for the call, so a valid TCB.
         if !bound(tcb) || unsafe { (*tcb).state } == thread::ThreadState::Exited
         {
-            return;
+            return thread_registry::Visit::Passed;
         }
         // Reading our own CPU's `current` needs no lock — only this
         // CPU writes it at dispatch, and we are that running thread.
@@ -4680,6 +4683,7 @@ unsafe fn mark_bound_threads(
             // started CPU.
             unsafe { prod_remote_cpu(cpu) };
         }
+        thread_registry::Visit::Acted
     };
     // SAFETY: caller contract (no conflicting locks held); `mark` registers
     // and unregisters no thread, takes only locks ordered after the registry
@@ -4761,8 +4765,8 @@ unsafe fn scan_bound_current(
 /// Stop every live thread bound to an object under teardown, identified by
 /// `bound`, before the object's storage is reclaimed.
 ///
-/// Phase 1 ([`mark_bound_threads`]) walks the thread registry under its
-/// lock: each bound thread not already `Exited` has any park cancelled and
+/// Phase 1 ([`mark_bound_threads`]) walks the thread registry, under its
+/// lock a batch at a time: each bound thread not already `Exited` has any park cancelled and
 /// is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
 /// recorded as its retained exit reason in the same hold, the commit retried
 /// until no park was committed since the cancel ([`commit_cancelling_park`],
@@ -4788,10 +4792,12 @@ unsafe fn scan_bound_current(
 /// the syscall epilogue schedules this thread away, and the deferred drain
 /// re-enters the teardown from a context that is not a bound thread.
 ///
-/// The phase-1 hold is proportional to the number of live threads (one
-/// all-locks transition per bound thread, each `O(CPUs)`), with interrupts
-/// disabled on this CPU throughout. The phase-2 spin has no bound; it warns
-/// once after 100 ms.
+/// Phase 1 holds the registry lock, with interrupts disabled on this CPU, for
+/// one batch at a time ([`thread_registry::REGISTRY_BATCH_COST`]: 64 threads
+/// passed, or 8 stopped, each stop an all-locks transition, `O(CPUs)`), and
+/// opens an interrupt window between batches, so its stretches with
+/// interrupts masked do not grow with the number of live threads. The phase-2
+/// spin has no bound; it warns once after 100 ms.
 ///
 /// # Safety
 /// The caller must hold no scheduler, IPC-source, or registry lock. `bound`

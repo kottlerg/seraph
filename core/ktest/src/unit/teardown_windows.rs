@@ -79,12 +79,12 @@ const SPACE_VA: u64 = 0x8_0000_0000;
 const TABLE_SPAN: u64 = REGION_PAGES * PAGE_SIZE;
 
 /// A capability of ktest's own `CSpace`, deleted on drop unless taken.
-struct Owned(u64);
+pub(crate) struct Owned(pub(crate) u64);
 
 impl Owned
 {
     /// Give the capability up to a call that consumed it.
-    fn take(&mut self)
+    pub(crate) fn take(&mut self)
     {
         self.0 = 0;
     }
@@ -162,7 +162,7 @@ fn mappings(cap: u64) -> Result<u64, &'static str>
 /// Have the worker delete `owner`, the last capability to the stretch's
 /// owner, judged by the stretch `begun` and `ended` bracket; `owner` is
 /// taken when the delete consumed it.
-fn delete_bracketed(
+pub(crate) fn delete_bracketed(
     ctx: &TestContext,
     owner: &mut Owned,
     mut begun: impl FnMut() -> Result<bool, &'static str>,
@@ -189,7 +189,10 @@ fn delete_bracketed(
 
 /// Run `once` on a fresh fixture per call until the rig's attempts end,
 /// then check the measure, logged as `line`.
-fn run(line: &'static str, once: impl FnMut() -> Result<Measured, &'static str>) -> TestResult
+pub(crate) fn run(
+    line: &'static str,
+    once: impl FnMut() -> Result<Measured, &'static str>,
+) -> TestResult
 {
     let m = latency::attempt_until_acked(once)?;
     latency::check_measured(line, &m)

@@ -1922,13 +1922,13 @@ target's remaining time slice (at most the longest slice, 20 timer ticks, that o
 `TIME_SLICE_TICKS`, 10, for a target dispatched at an RT level; see
 [scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)), except when the
 slice expires while the target runs a preemption-disabled kernel section with interrupts enabled (a
-TLB-shootdown or drain spin, or a page-pool seeding, teardown, explicit-placement pre-grow, or
-derivation-lock window between batches, `interrupt_window`): `timer_tick` then refills the slice
-without rescheduling, and `preempt_enable` does not reschedule, so the stop completes at the
-first later slice-expiry tick with preemption enabled, a further slice later at the least, or at
-the target's next return to user mode when a thread queued on its CPU outranks it. Callers that
-need a bounded stop latency MUST budget a slice for each slice expiry the target can spend in such
-a section.
+TLB-shootdown or drain spin, or a page-pool seeding, teardown, explicit-placement pre-grow,
+registry-walk, waiter-drain, or derivation-lock window between batches, `interrupt_window`):
+`timer_tick` then refills the slice without rescheduling, and `preempt_enable` does not reschedule,
+so the stop completes at the first later slice-expiry tick with preemption enabled, a further slice
+later at the least, or at the target's next return to user mode when a thread queued on its CPU
+outranks it. Callers that need a bounded stop latency MUST budget a slice for each slice expiry the
+target can spend in such a section.
 
 **Capability requirement:** `thread_cap` must have Control rights.
 
@@ -3543,9 +3543,11 @@ killed during the hold stays `Exited`. Deleting the space's last capability duri
 it down as any other space, killing its threads (§ `SYS_CAP_DELETE`). A hold has no timeout: the
 space stays held until a holder of a Control capability to it releases it.
 
-**Cost.** The walk holds the thread registry's lock across every live thread of the system, with
-interrupts disabled on the calling CPU, and takes every CPU's scheduler lock once for each `Ready`
-thread of the space, as the teardown walk does: O(threads + Ready threads of the space × CPUs).
+**Cost.** The walk holds the thread registry's lock, with interrupts disabled on the calling CPU,
+for one batch of threads at a time (`REGISTRY_BATCH_COST`, 64: a thread passed costs 1, one acted
+on 8) and opens an interrupt window between batches. It takes every CPU's scheduler lock once for
+each `Ready` thread of the space, as the teardown walk does: O(threads + Ready threads of the space
+× CPUs) in total.
 
 **Capability requirement:** `aspace_cap` must have Control rights.
 

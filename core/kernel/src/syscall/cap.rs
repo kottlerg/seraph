@@ -152,7 +152,7 @@ fn slot_field<T>(block_virt: u64, offset: u64) -> *mut T
 ///
 /// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The Memory cap
 /// MUST carry `MemRights::RETYPE` and have at least the size class of
-/// `dispatch_for(Endpoint, 0).raw_bytes` (88 B = 24 wrapper + 64
+/// `dispatch_for(Endpoint, 0).raw_bytes` (72 B = 24 wrapper + 48
 /// `EndpointState`, debited as the 128 B `BIN_128` class) of `available_bytes`.
 ///
 /// On success, the wrapper + `EndpointState` are constructed in place inside
@@ -1370,8 +1370,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 sleep_node: crate::sched::deadline_heap::DeadlineNode::new(),
                 sleep_expiry: crate::sched::thread::SleepExpiry::EMPTY,
                 extended: crate::sched::thread::ExtendedState::from_raw(extended_area),
-                registry_next: core::ptr::null_mut(),
-                registry_prev: core::ptr::null_mut(),
+                registry: crate::sched::registry_list::RegistryLinks::new(),
                 magic: crate::sched::thread::TCB_MAGIC,
             },
         );

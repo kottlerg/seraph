@@ -18,9 +18,10 @@
 //! options after it are then checked against that command and every command
 //! below it.
 
-use super::{CodeSpans, Diagnostic, SourceFile, has_ext, is_markdown, marked_lines, one_based};
+use super::{CodeSpans, Diagnostic, SourceFile, has_ext, is_markdown, one_based};
 use crate::argparse::Command;
 use crate::cli::Cli;
+use crate::markdown::marked_lines;
 
 const RULE: &str = "xtask-commands";
 

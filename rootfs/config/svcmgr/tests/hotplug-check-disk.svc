@@ -1,4 +1,4 @@
-# /tests/hotplug-check, disk mode — the fixture of the `hotplug` case's storage
+# /tests/fixtures/hotplug-check, disk mode — the fixture of the `hotplug` case's storage
 # boots: a disk hot-added, removed and added again behind the root port,
 # a copy of it added behind the second port, and the loss of the root
 # filesystem's driver.
@@ -6,7 +6,7 @@
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # the `hotplug` case stages it into /config/svcmgr/services/ for
 # its storage boots, which hold the data image for the port. See
-# services/hotplug-check/README.md.
+# services/fixtures/hotplug-check/README.md.
 #
 # seed = vfsd.mount is the MOUNT_AUTHORITY SEND on vfsd's service endpoint
 # the fixture mounts the hot-added disk's data partition through.
@@ -17,7 +17,7 @@
 # gives it the system root, which crosses mounts, for the files it writes
 # and reads under /data. It invokes no shutdown: the kill of the root driver
 # ends vfsd, and svcmgr shuts the system down.
-binary    = /tests/hotplug-check
+binary    = /tests/fixtures/hotplug-check
 argv      = hotplug-check disk
 restart   = never
 critical  = no

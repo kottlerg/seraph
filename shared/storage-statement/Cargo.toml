@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "storage-statement"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# `no_std` with `alloc`: the format of the storage statement,
+# `/config/vfsd/storage.conf`, shared by vfsd, which parses the signed file,
+# and xtask, which renders the statement a split layout stages and refuses
+# one vfsd would refuse. Host unit tests cover the parser.
+[lib]
+test = true
+doctest = false
+
+[dependencies]
+# The role type GUIDs a named partition must carry.
+boot-protocol = { path = "../../abi/boot-protocol" }
+
+[lints]
+workspace = true

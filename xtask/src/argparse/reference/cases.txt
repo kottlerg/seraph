@@ -2874,7 +2874,7 @@ help xtask test --help
 ["test","bogus"]
 InvalidValue
 error: invalid value 'bogus' for '[CASE]'
-  [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, storage-roles, cet, tpm, shutdown, debug-port]
 
 ["test","--bogus"]
 UnknownArgument
@@ -2883,7 +2883,7 @@ error: unexpected argument '--bogus' found
 ["test","--","x"]
 InvalidValue
 error: invalid value 'x' for '[CASE]'
-  [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, storage-roles, cet, tpm, shutdown, debug-port]
 
 ["test","-h","bogus"]
 help xtask test -h
@@ -2891,7 +2891,7 @@ help xtask test -h
 ["test","bogus","-h"]
 InvalidValue
 error: invalid value 'bogus' for '[CASE]'
-  [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, storage-roles, cet, tpm, shutdown, debug-port]
 
 ["help","test"]
 help xtask test --help
@@ -3068,12 +3068,12 @@ ok test case=["debug-port"]
 ["test","7"]
 InvalidValue
 error: invalid value '7' for '[CASE]'
-  [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, storage-roles, cet, tpm, shutdown, debug-port]
 
 ["test",""]
 InvalidValue
 error: a value is required for '[CASE]' but none was supplied
-  [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, storage-roles, cet, tpm, shutdown, debug-port]
 
 ["test","terminal","kaslr"]
 UnknownArgument
@@ -11890,6 +11890,42 @@ error: a value is required for '--log-levels <FILE>' but none was supplied
 InvalidValue
 error: invalid value 'bogus' for '--harness <HARNESS>'
   [possible values: init, ktest]
+
+["mkdisk","--svctest"]
+InvalidValue
+error: a value is required for '--svctest <SET>' but none was supplied
+  [possible values: ci, burn-in, none]
+
+["mkdisk","--svctest","7"]
+InvalidValue
+error: invalid value '7' for '--svctest <SET>'
+  [possible values: ci, burn-in, none]
+
+["mkdisk","--svctest",""]
+InvalidValue
+error: a value is required for '--svctest <SET>' but none was supplied
+  [possible values: ci, burn-in, none]
+
+["mkdisk","--svctest=--"]
+InvalidValue
+error: invalid value '--' for '--svctest <SET>'
+  [possible values: ci, burn-in, none]
+
+["mkdisk","--svctest","ci"]
+ok mkdisk svctest=["ci"]
+
+["mkdisk","--svctest","burn-in"]
+ok mkdisk svctest=["burn-in"]
+
+["mkdisk","--svctest","none"]
+ok mkdisk svctest=["none"]
+
+["mkdisk","--svctest","ci","--svctest","none"]
+ArgumentConflict
+error: the argument '--svctest <SET>' cannot be used multiple times
+
+["mkdisk","--repack-only","--svctest","ci","--block-size","4096"]
+ok mkdisk repack_only svctest=["ci"] block_size=["4096"]
 
 ["mkdisk","--repack-only","--harness","ktest","--knob","mapredo"]
 ok mkdisk repack_only harness=["ktest"] knob=["mapredo"]
@@ -26995,7 +27031,7 @@ ok trust-request clear
 ok trust-request arch=["riscv64"] add=["s"] revoke=["00"] sign out=["f"]
 
 ["kani"]
-ok-all kani pin=default host_override=default
+ok-all kani list=default pin=default host_override=default
 
 ["kani","-h"]
 help xtask kani -h
@@ -27041,6 +27077,27 @@ ok kani wait_host=["30"]
 
 ["kani","--host-override"]
 ok kani host_override
+
+["kani","--since","origin/master"]
+ok kani since=["origin/master"]
+
+["kani","--since","HEAD","--list"]
+ok kani since=["HEAD"] list
+
+["kani","--list","--component","kernel"]
+ok kani component=["kernel"] list
+
+["kani","--since","HEAD","--component","kernel"]
+ArgumentConflict
+error: the argument '--since <COMMIT>' cannot be used with '--component <CRATE>'
+
+["kani","--pin","--list"]
+ArgumentConflict
+error: the argument '--pin' cannot be used with '--list'
+
+["kani","--since"]
+InvalidValue
+error: a value is required for '--since <COMMIT>' but none was supplied
 
 ["kani","--pin","--pin"]
 ArgumentConflict

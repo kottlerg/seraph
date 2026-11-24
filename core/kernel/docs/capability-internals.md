@@ -107,6 +107,14 @@ must remain stable). Because growth is contiguous, over a span of leaves still t
 directory pages above its first leaf can already exist, so `pages_to_cover`, the
 explicit-placement path's fast-fail count, is arithmetic per level with one probe each.
 
+An explicit placement (`SYS_CAP_COPY` or `SYS_CAP_MOVE` with a nonzero destination slot)
+grows the destination before it takes the derivation lock and the `CSpace` lock pair
+(`pre_grow_for_explicit_slot`): `MAX_GROW_LEAVES_PER_HOLD` leaves per hold of the destination's
+spinlock, and the interrupts pending on its CPU taken between holds (`interrupt_window`, as
+seeding does, [§ Donation Records](#donation-records)). The syscall therefore masks interrupts
+for at most one batch of leaves at a time, whatever slot the caller chose; its total length still
+grows with the slot.
+
 **Memory ordering and lock domains:** directory and leaf pointers are write-once while the CSpace is
 live, published with Release after full initialisation, and read with Acquire by the lock-free
 readers. Mutation is split across two lock domains: slot occupancy, the free list, the directory,

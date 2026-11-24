@@ -12,9 +12,10 @@
 use alloc::vec::Vec;
 
 use crate::{
-    GptCopy, GptEntry, GptError, GptFault, GptHeader, GptLookupError, HEADER_LEN, ScanStop,
-    collect_partitions, crc32, header_crc, header_fields, is_block_size,
-    lookup_partition_by_type_guid, parse_entry, parse_header, read_gpt,
+    BootDiskError, GptCopy, GptEntry, GptError, GptFault, GptHeader, GptLookupError, HEADER_LEN,
+    PartitionDescriptor, PartitionLocation, ScanStop, collect_partitions, crc32, find_boot_disk,
+    header_crc, header_fields, is_block_size, lookup_on_disk, parse_entry, parse_header, read_gpt,
+    resolve_named,
 };
 
 /// The block sizes the parser takes ([`is_block_size`]).
@@ -26,13 +27,14 @@ const ENTRY_STRIDE: usize = 128;
 /// The length of the part of an entry [`parse_entry`] decodes.
 const ENTRY_LEN: usize = 56;
 
-/// The most distinct partition types the lookup check resolves per disk.
+/// The most entries per disk the resolution checks take as the wanted one.
 const LOOKUPS: usize = 8;
 
 /// Check the parsers' contract on `input`: read as one header block; read as
 /// a disk of each block size whose LBA 1 it holds, through the header parse,
 /// the partition-array walk, the choice between the GPT's two copies and the
-/// lookup; and read as entries at each 128-byte offset. Each disk is read as
+/// resolutions of a role (by type on one disk, the boot disk, a named
+/// partition); and read as entries at each 128-byte offset. Each disk is read as
 /// it is, and again with its header's CRC32s and `MyLBA` made to match
 /// ([`seal`]), so the checks past the CRC32s see the input's fields; then
 /// with its last block sealed as a backup header too, and with the primary's
@@ -68,9 +70,9 @@ pub fn gpt_holds(input: &[u8])
             }
         }
     }
-    for raw in input.chunks(ENTRY_STRIDE)
+    for (slot, raw) in (1..).zip(input.chunks(ENTRY_STRIDE))
     {
-        entry_holds(raw);
+        entry_holds(raw, slot);
     }
 }
 
@@ -261,7 +263,8 @@ fn block_at(disk: &[u8], lba: u64, size: usize) -> Option<&[u8]>
 /// The used entries of the array `header` describes, read slot by slot from
 /// `disk` (slot `i` at byte `part_entry_lba * block_size + i * entry_size`,
 /// since the entry size divides the block), up to the first slot whose block
-/// lies past the disk's end; and, when every one of the `num_parts` slots
+/// lies past the disk's end, each carrying its slot's 1-based number; and,
+/// when every one of the `num_parts` slots
 /// lies inside it, the CRC32 of their bytes.
 fn expected_entries(disk: &[u8], header: &GptHeader) -> (Vec<GptEntry>, Option<u32>)
 {
@@ -287,7 +290,8 @@ fn expected_entries(disk: &[u8], header: &GptHeader) -> (Vec<GptEntry>, Option<u
             .saturating_mul(entry);
         let bytes = raw.get(at..at.saturating_add(entry)).unwrap_or_default();
         array.extend_from_slice(bytes);
-        if let Some(parsed) = parse_entry(bytes)
+        let number = u32::try_from(slot).map_or(u32::MAX, |slot| slot.saturating_add(1));
+        if let Some(parsed) = parse_entry(bytes, number)
         {
             entries.push(parsed);
         }
@@ -351,7 +355,7 @@ fn disk_holds(disk: &[u8], header: &GptHeader) -> crate::PartitionScan
         Some(ScanStop::OutOfMemory) =>
         {}
     }
-    lookup_holds(&scan.entries);
+    roles_hold(&scan.entries);
     scan
 }
 
@@ -417,71 +421,232 @@ fn priority(entry: &GptEntry) -> u64
     entry.attributes.wrapping_shr(48)
 }
 
-/// [`lookup_partition_by_type_guid`] over one disk's `entries` finds each
-/// type they hold: the one entry of its highest priority, or a tie when two
-/// share it; and over two copies of the disk, always a tie.
-fn lookup_holds(entries: &[GptEntry])
+/// The location of `entry` on the disk at position `disk`.
+fn located(disk: usize, entry: &GptEntry) -> PartitionLocation
+{
+    PartitionLocation {
+        disk,
+        first_lba: entry.first_lba,
+        length_lba: entry.length_lba,
+    }
+}
+
+/// The resolutions of a role over one disk's `entries` keep their contracts.
+fn roles_hold(entries: &[GptEntry])
 {
     for wanted in entries.iter().take(LOOKUPS)
     {
-        let matching: Vec<&GptEntry> = entries
-            .iter()
-            .filter(|entry| entry.type_guid == wanted.type_guid)
-            .collect();
-        let top = matching
-            .iter()
-            .map(|entry| priority(entry))
-            .max()
-            .unwrap_or(0);
-        let at_top: Vec<&&GptEntry> = matching
-            .iter()
-            .filter(|entry| priority(entry) == top)
-            .collect();
-        match lookup_partition_by_type_guid(&wanted.type_guid, [entries])
+        lookup_holds(entries, wanted);
+        boot_disk_holds(entries, wanted);
+        named_holds(entries, wanted);
+    }
+}
+
+/// [`lookup_on_disk`] over `entries` finds `wanted`'s type on the disk it
+/// is given: the one entry of its highest priority, or a tie when two share
+/// it.
+fn lookup_holds(entries: &[GptEntry], wanted: &GptEntry)
+{
+    let matching: Vec<&GptEntry> = entries
+        .iter()
+        .filter(|entry| entry.type_guid == wanted.type_guid)
+        .collect();
+    let top = matching
+        .iter()
+        .map(|entry| priority(entry))
+        .max()
+        .unwrap_or(0);
+    let at_top: Vec<&&GptEntry> = matching
+        .iter()
+        .filter(|entry| priority(entry) == top)
+        .collect();
+    for disk in [0, 5]
+    {
+        match lookup_on_disk(disk, &wanted.type_guid, entries)
         {
             Ok(found) =>
             {
                 assert_eq!(at_top.len(), 1, "a tie at the top priority was resolved");
                 assert!(
-                    at_top.iter().any(|entry| entry.first_lba == found.first_lba
-                        && entry.length_lba == found.length_lba
-                        && found.disk == 0),
-                    "the lookup returned a partition below the top priority"
+                    at_top.iter().any(|entry| located(disk, entry) == found),
+                    "the lookup returned a partition below the top priority, or off its disk"
                 );
             }
             Err(GptLookupError::DuplicateTie) =>
             {
                 assert!(at_top.len() > 1, "a lone partition was called a tie");
             }
-            Err(GptLookupError::NotFound) =>
+            Err(error @ (GptLookupError::NotFound | GptLookupError::WrongType)) =>
             {
+                assert_eq!(
+                    error,
+                    GptLookupError::NotFound,
+                    "a lookup by type reported a wrong type"
+                );
                 assert!(matching.is_empty(), "a present type was not found");
             }
         }
-        assert!(
-            matches!(
-                lookup_partition_by_type_guid(&wanted.type_guid, [entries, entries]),
-                Err(GptLookupError::DuplicateTie)
-            ),
-            "one partition on two disks was not a tie"
+    }
+}
+
+/// [`find_boot_disk`] with `wanted` as the described ESP finds the disk of
+/// `entries` only at the reported location, whatever other disks carry it,
+/// and finds none when two at the location carry it, or when the description
+/// differs from every entry in one field.
+fn boot_disk_holds(entries: &[GptEntry], wanted: &GptEntry)
+{
+    type Loc = (u16, u8, u8, u8);
+    let (here, there): (Loc, Loc) = ((0, 0, 3, 0), (1, 0, 3, 0));
+    let esp = PartitionDescriptor {
+        type_guid: wanted.type_guid,
+        unique_guid: wanted.uuid,
+        number: wanted.number,
+        first_lba: wanted.first_lba,
+        length_lba: wanted.length_lba,
+    };
+    let find = |location: Option<&Loc>,
+                esp: &PartitionDescriptor,
+                disks: &[(Option<&Loc>, &[GptEntry])]| {
+        find_boot_disk(location, esp, disks.iter().copied())
+    };
+    assert_eq!(
+        find(
+            Some(&here),
+            &esp,
+            &[
+                (Some(&there), entries),
+                (None, entries),
+                (Some(&here), entries)
+            ]
+        ),
+        Ok(2),
+        "the disk at the location carrying the ESP was not the boot disk"
+    );
+    assert_eq!(
+        find(
+            Some(&here),
+            &esp,
+            &[(Some(&here), entries), (Some(&here), entries)]
+        ),
+        Err(BootDiskError::Ambiguous),
+        "two disks at the location carrying the ESP left a boot disk"
+    );
+    assert_eq!(
+        find(
+            Some(&here),
+            &esp,
+            &[(Some(&there), entries), (None, entries)]
+        ),
+        Err(BootDiskError::NoDiskAtLocation),
+        "a disk at another location stood in for the boot disk"
+    );
+    assert_eq!(
+        find(None, &esp, &[(Some(&there), entries)]),
+        Ok(0),
+        "with no location, the one disk carrying the ESP was not the boot disk"
+    );
+    let mut renumbered = esp;
+    renumbered.number = esp.number.wrapping_add(1);
+    let carried = entries.iter().any(|entry| {
+        entry.number == renumbered.number
+            && entry.type_guid == esp.type_guid
+            && entry.uuid == esp.unique_guid
+            && entry.first_lba == esp.first_lba
+            && entry.length_lba == esp.length_lba
+    });
+    assert_eq!(
+        find(Some(&here), &renumbered, &[(Some(&here), entries)]),
+        if carried
+        {
+            Ok(0)
+        }
+        else
+        {
+            Err(BootDiskError::NotCarried)
+        },
+        "a disk was taken for a partition it does not carry"
+    );
+}
+
+/// [`resolve_named`] of `wanted`'s unique GUID under its type takes the one
+/// typed match in the place it reads (the boot disk, else every other disk),
+/// lets the boot disk's own win over a copy, and ties two copies elsewhere.
+fn named_holds(entries: &[GptEntry], wanted: &GptEntry)
+{
+    let typed: Vec<&GptEntry> = entries
+        .iter()
+        .filter(|entry| entry.uuid == wanted.uuid && entry.type_guid == wanted.type_guid)
+        .collect();
+    let empty: &[GptEntry] = &[];
+    let resolve = |boot_disk: usize, disks: &[&[GptEntry]]| {
+        resolve_named(
+            &wanted.type_guid,
+            &wanted.uuid,
+            boot_disk,
+            disks.iter().copied(),
+        )
+    };
+    let one = |disk: usize| match typed.as_slice()
+    {
+        [entry] => Ok(located(disk, entry)),
+        _ => Err(GptLookupError::DuplicateTie),
+    };
+    assert_eq!(
+        resolve(0, &[entries]),
+        one(0),
+        "a named partition resolved against its matches"
+    );
+    assert_eq!(
+        resolve(1, &[entries, entries]),
+        one(1),
+        "the boot disk's named partition did not win over its copy"
+    );
+    assert_eq!(
+        resolve(0, &[empty, entries]),
+        one(1),
+        "a named partition off the boot disk was not found"
+    );
+    assert_eq!(
+        resolve(0, &[empty, entries, entries]),
+        Err(GptLookupError::DuplicateTie),
+        "a named partition on two disks besides the boot disk was resolved"
+    );
+    let mut other_type = wanted.type_guid;
+    if let Some(byte) = other_type.first_mut()
+    {
+        *byte ^= 1;
+    }
+    let retyped = entries
+        .iter()
+        .any(|entry| entry.uuid == wanted.uuid && entry.type_guid == other_type);
+    if !retyped
+    {
+        assert_eq!(
+            resolve_named(&other_type, &wanted.uuid, 0, [entries]),
+            Err(GptLookupError::WrongType),
+            "a named partition was taken under another type"
         );
     }
 }
 
-/// [`parse_entry`] decodes an entry that re-encodes to its own 56 bytes, and
-/// refuses one only when it is short, unused (zero type GUID), or has an
-/// inverted or whole-`u64` range.
-pub(crate) fn entry_holds(raw: &[u8])
+/// [`parse_entry`] decodes an entry that re-encodes to its own 56 bytes and
+/// carries the partition number `number` it is given, and refuses one only
+/// when it is short, unused (zero type GUID), or has an inverted or
+/// whole-`u64` range.
+pub(crate) fn entry_holds(raw: &[u8], number: u32)
 {
     let Some(bytes) = raw.get(..ENTRY_LEN)
     else
     {
-        assert!(parse_entry(raw).is_none(), "a short entry was decoded");
+        assert!(
+            parse_entry(raw, number).is_none(),
+            "a short entry was decoded"
+        );
         return;
     };
     let first = le64(bytes, 32).unwrap_or(0);
     let last = le64(bytes, 40).unwrap_or(0);
-    if let Some(entry) = parse_entry(raw)
+    if let Some(entry) = parse_entry(raw, number)
     {
         let end = entry
             .length_lba
@@ -494,6 +659,7 @@ pub(crate) fn entry_holds(raw: &[u8])
         encoded.extend_from_slice(&end.unwrap_or(0).to_le_bytes());
         encoded.extend_from_slice(&entry.attributes.to_le_bytes());
         assert!(end.is_some(), "an entry decoded with a length of 0");
+        assert_eq!(entry.number, number, "an entry decoded with another number");
         assert_eq!(
             encoded, bytes,
             "a decoded entry does not re-encode to its bytes"

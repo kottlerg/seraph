@@ -44,7 +44,9 @@
 //!
 //! The storage boots stage the fixture's disk-mode recipe alone and repack
 //! the images in the split-data layout at the same block size, so the data
-//! partition is on `disk-data.img`. The first places that image's
+//! and swap partitions are on `disk-data.img`, named by the storage
+//! statement the layout stages, and swapd takes its partition from that
+//! disk. The first places that image's
 //! `virtio-blk-pci` behind the first port from boot (`PortDisk::Data`), so vfsd
 //! mounts `/data` on it at startup: once devmgr manages the slot and the
 //! fixture holds a file open there ([`DISK_REMOVE_MARKER`]), the host
@@ -52,10 +54,10 @@
 //! [`VFSD_REMOVED_MARKER`]; once the fixture logs [`DISK_READD_MARKER`], it
 //! adds the disk again on the same block node. Once the fixture mounted it
 //! again ([`DISK_TIE_MARKER`]), the host adds a copy of the image, taken
-//! before the boot, behind the second port ([`add_tie_disk`]): its data
-//! partition ties the data disk's, so the fixture's `MOUNT` of the data
-//! role, `TABLE_FULL` while `/data` stands, must turn `NO_MOUNT` once
-//! devmgr serves the copy. The fixture then stops and
+//! before the boot, behind the second port ([`add_tie_disk`]): it carries
+//! the data partition the storage statement names, as the data disk does,
+//! so the fixture's `MOUNT` of the data role, `TABLE_FULL` while `/data`
+//! stands, must turn `NO_MOUNT` once devmgr serves the copy. The fixture then stops and
 //! kills the root mount's driver, and the host requires its verdict, vfsd's
 //! [`ROOT_LOST_MARKER`], svcmgr's [`SHUTDOWN_MARKER`], and QEMU's exit. The
 //! second boots with the boot disk itself behind that port (`PortDisk::Boot`)
@@ -107,30 +109,30 @@ const CLASS: &str = "test-dma.class";
 const DISK_RECIPE: &str = "hotplug-check-disk.svc";
 
 /// The fixture's line once it watches the `test-dma` class. Kept in sync
-/// with `services/hotplug-check/src/main.rs`.
+/// with `services/fixtures/hotplug-check/src/main.rs`.
 const READY_MARKER: &str = "[hotplug-check] READY for the hot-added device";
 
 /// The fixture's line once the hot-added device passed its probes. Kept in
-/// sync with `services/hotplug-check/src/main.rs`.
+/// sync with `services/fixtures/hotplug-check/src/main.rs`.
 const REMOVE_MARKER: &str = "[hotplug-check] READY for the removal";
 
 /// The fixture's line once devmgr withdrew the removed device's driver. Kept
-/// in sync with `services/hotplug-check/src/main.rs`.
+/// in sync with `services/fixtures/hotplug-check/src/main.rs`.
 const READD_MARKER: &str = "[hotplug-check] WITHDRAWN at ordinal 0; READY for the re-added device";
 
 /// The disk-mode fixture's line once it knows the root mount's driver and
 /// holds a file open under `/data`. Kept in sync with
-/// `services/hotplug-check/src/disk.rs`.
+/// `services/fixtures/hotplug-check/src/disk.rs`.
 const DISK_REMOVE_MARKER: &str =
     "[hotplug-check] HOLDING a file open on /data; READY for the removal of its disk";
 
 /// The disk-mode fixture's line once vfsd tore the removed disk's mount
-/// down. Kept in sync with `services/hotplug-check/src/disk.rs`.
+/// down. Kept in sync with `services/fixtures/hotplug-check/src/disk.rs`.
 const DISK_READD_MARKER: &str =
     "[hotplug-check] TORN DOWN /data, its disk removed; READY for the re-added disk";
 
 /// The disk-mode fixture's line once it mounted `/data` on the re-added
-/// disk. Kept in sync with `services/hotplug-check/src/disk.rs`.
+/// disk. Kept in sync with `services/fixtures/hotplug-check/src/disk.rs`.
 const DISK_TIE_MARKER: &str =
     "[hotplug-check] MOUNTED /data on the re-added disk; READY for a copy of the disk";
 
@@ -295,7 +297,7 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
          driver and powered the slot off or ejected it, and it was bound again; a hot-added \
          disk was bound from the drivers directory on its wired line; the data disk's mount was \
          torn down at its removal and the disk mounted again when added back, and a copy of it \
-         added after start entered vfsd's role lookup; the loss of the root driver and of the \
+         added after start left the data partition the storage statement names untaken; the loss of the root driver and of the \
          boot disk shut the system down)",
     );
     Ok(())
@@ -664,9 +666,10 @@ fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32, tie_image: &Pat
 /// Hot-add `image`, a copy of the data disk, behind the second port: a raw
 /// block node over it (QMP `blockdev-add`), then a `virtio-blk-pci` on it
 /// with the properties of the data disk's device added again, on that node.
-/// Its data partition ties the data disk's at the highest priority, so vfsd,
-/// resolving the role across every disk devmgr serves, answers the fixture's
-/// `MOUNT` `NO_MOUNT` once devmgr serves it.
+/// Its data partition is the one the storage statement names, as the data
+/// disk's is, so vfsd, resolving the named partition across every disk
+/// devmgr serves, finds two disks other than the boot disk carrying it and
+/// answers the fixture's `MOUNT` `NO_MOUNT` once devmgr serves it.
 fn add_tie_disk(socket: &Path, image: &Path, block_size: u32) -> Result<()>
 {
     qmp::blockdev_add_raw(socket, TIE_DISK_NODE, image)?;

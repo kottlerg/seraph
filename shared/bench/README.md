@@ -109,13 +109,13 @@ whole log can be scanned. A program logs no other text of the form `bench <word>
 | Consumer | Suite | What it reports |
 |---|---|---|
 | [`core/ktest`](../../core/ktest/README.md) | `ktest` | Tier 3, one line per kernel benchmark (§ Tier 3) |
-| [`programs/fsbench`](../../programs/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3` |
-| [`programs/ubench`](../../programs/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring` and `ubench.console_write`, per variant |
+| [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3` |
+| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring` and `ubench.console_write`, per variant |
 
 ---
 
 ## Summarized By
 
 [core/ktest/README.md](../../core/ktest/README.md),
-[programs/fsbench/README.md](../../programs/fsbench/README.md),
-[programs/ubench/README.md](../../programs/ubench/README.md)
+[services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md),
+[services/ubench/README.md](../../services/ubench/README.md)

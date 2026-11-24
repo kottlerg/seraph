@@ -463,6 +463,7 @@ the timer-batch quiesce (`sleep_wakeups_quiesce`), the contended `pt_lock`
 path, the `sys_thread_stop` drain and save wait (`await_stopped_save`), the `sys_thread_start`
 settle loop, the register-access wait (`with_held_frame`), the idle-stack depth sample
 (`stack_depth::idle_used_bytes`), the page-pool seeding and teardown windows between batches
+and the explicit-placement pre-grow's windows between its `CSpace`-lock holds
 (`interrupt_window` in `cap/object.rs`) — runs
 preempt-disabled and returns to the saved interrupt state through
 `restore_interrupts`, which writes that state whatever the current one; the

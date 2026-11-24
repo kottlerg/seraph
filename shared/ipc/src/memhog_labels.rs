@@ -3,7 +3,7 @@
 
 // shared/ipc/src/memhog_labels.rs
 
-//! The `memhog` fixture's service labels (services/memhog/README.md): a
+//! The `memhog` fixture's service labels (services/fixtures/memhog/README.md): a
 //! supervised service that fills memmgr's pool up to the system reserve on
 //! request and holds it until it is stopped, which svctest's `oom` phase
 //! drives the out-of-memory policy service with.

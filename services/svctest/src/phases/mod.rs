@@ -61,6 +61,9 @@
 //! 14. [`swap_commit`] after [`swapd`]: its allowance is derived from the
 //!     slots the swap service registered, and its write part needs a swap
 //!     service that writes chunks to disk.
+//! 15. [`fixtures`] right after [`startup`]: it reads the staged fixture
+//!     set, which every later phase that drives a fixture consults, and fails
+//!     the run before any of them when the image disagrees with it.
 
 use crate::runner::Phase;
 
@@ -75,6 +78,7 @@ pub mod discard;
 pub mod drivers;
 pub mod entropyd;
 pub mod exit_code;
+pub mod fixtures;
 pub mod fs_create_open;
 pub mod fs_faults;
 pub mod fs_ipc;
@@ -131,6 +135,7 @@ pub fn all() -> Vec<Phase>
 {
     let mut out: Vec<Phase> = Vec::new();
     out.extend_from_slice(startup::main_startup());
+    out.extend_from_slice(fixtures::phases());
     out.extend_from_slice(memmgr::phases());
     out.extend_from_slice(layout::phases());
     out.extend_from_slice(threading::phases());

@@ -41,7 +41,7 @@ the syscall returns to the instruction after it.
 
 Consumers: ktest's riscv64 `integration::single_step`
 ([core/ktest/README.md](../../core/ktest/README.md)) and the `debugger` fixture
-([programs/debugger/README.md](../../programs/debugger/README.md)).
+([services/fixtures/debugger/README.md](../../services/fixtures/debugger/README.md)).
 
 ---
 

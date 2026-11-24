@@ -19,7 +19,8 @@ use crate::error::{Context as _, Result, bail};
 use crate::arch::Arch;
 use crate::benchmark::{
     BANDS_FILE, BenchMode, ENV_FILE, Key, RunLog, RunSet, Stored, compare, env_differences, fails,
-    gather, is_bench_file, parse_bands, parse_baseline, parse_env, parse_run, report, write_env,
+    gather, is_bench_file, parse_bands, parse_baseline, parse_env, parse_run, report,
+    without_suites, write_env,
 };
 use crate::cli::BenchCheckArgs;
 use crate::commands::ktest_timing::{accel_settings, first_line, host_cpu};
@@ -31,7 +32,7 @@ pub fn run(ctx: &BuildContext, args: &BenchCheckArgs) -> Result<()>
     let runs = read_runs(&args.logs)?;
     let set = gather(args.mode, &runs)?;
     let dir = mode_dir(ctx, &args.baselines, args.mode, &set.arch);
-    let stored = read_baselines(&dir)?;
+    let stored = without_suites(&set, read_baselines(&dir)?, &args.skip_suite)?;
     let bands = read_bands(&dir, args.mode)?;
     let rows = compare(args.mode, &set, &stored, &bands);
     print!("{}", report(args.mode, &set, &rows));

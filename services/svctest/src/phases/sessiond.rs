@@ -33,7 +33,7 @@ const PHASE_JOB_PAGES: u64 = 16;
 
 /// The path procmgr names a job of the shell by: the first word of the
 /// argv the shell creates it with.
-pub(super) const CRASHME_PATH: &str = "/programs/crashme";
+pub(super) const CRASHME_PATH: &str = "/tests/fixtures/programs/crashme";
 
 /// The end queue svctest registered with procmgr; 0 until it has.
 static END_QUEUE: AtomicU64 = AtomicU64::new(0);
@@ -49,11 +49,16 @@ pub fn phases() -> &'static [Phase]
     }]
 }
 
-/// Whether the image stages sessiond and svctest holds its operator SEND.
-pub(super) fn staged(caps: &Caps, phase: &str) -> bool
+/// sessiond's operator SEND, which svctest's recipe seeds: sessiond is of
+/// the default service set, which svctest requires staged
+/// ([`super::fixtures`]), so a missing seed fails `phase`.
+pub(super) fn operator(caps: &Caps, phase: &str) -> u64
 {
-    super::svcmgr::recipe_staged(super::svcmgr::SESSIOND_RECIPE, phase)
-        && caps.sessiond_operator != 0
+    assert_ne!(
+        caps.sessiond_operator, 0,
+        "{phase}: no sessiond.operator seed: sessiond did not publish its operator SEND"
+    );
+    caps.sessiond_operator
 }
 
 /// sessiond's stop SEND, from svcmgr's `LIST_STOP_SOURCES` through the stop
@@ -312,8 +317,7 @@ impl Session
 }
 
 /// sessiond's gates, a session's life through the relay, and the list and
-/// stop of its candidates through svcmgr's stop authority. The phase passes
-/// without sessiond's recipe, or without its operator seed.
+/// stop of its candidates through svcmgr's stop authority.
 ///
 /// - The operator labels through sessiond's stop SEND, and the stop labels
 ///   through the operator SEND, reply `UNAUTHORIZED`.
@@ -337,12 +341,7 @@ impl Session
 fn sessiond_phase(caps: &Caps)
 {
     let phase = "sessiond_operator";
-    if !staged(caps, phase)
-    {
-        std::os::seraph::log!("sessiond phase passed (sessiond.svc not staged)");
-        return;
-    }
-    let operator = caps.sessiond_operator;
+    let operator = operator(caps, phase);
     let send = stop_send(caps, phase);
     gates(operator, send, phase);
     cap_checks(operator, phase);
@@ -476,7 +475,7 @@ fn session_life(operator: u64, send: u64, phase: &str)
     let mut session = Session::open(operator, phase);
     session.send(&format!("echo {ECHO_MARKER}"), phase);
     session.expect(ECHO_MARKER, phase);
-    session.send(&format!("crashme oom-hold {PHASE_JOB_PAGES}"), phase);
+    session.send(&format!("{CRASHME_PATH} oom-hold {PHASE_JOB_PAGES}"), phase);
     session.expect(&format!("holding {PHASE_JOB_PAGES}"), phase);
     let listed = super::svcmgr::list_candidates(send, phase);
     assert!(

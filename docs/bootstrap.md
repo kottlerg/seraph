@@ -43,8 +43,8 @@ and the bootloader binary itself, a copy of its installed file `/boot/boot.efi`
 both at `\EFI\seraph\boot.efi` and at the EFI fallback path
 ([build-system.md § Build Output: the Sysroot](build-system.md#build-output-the-sysroot)).
 `BootInfo` carries no kernel command
-line; root-partition identity comes from GPT type-GUID role discovery,
-performed by vfsd
+line; root-partition identity comes from GPT type-GUID role discovery on
+the boot disk, performed by vfsd
 ([storage.md § GPT Role-GUID Discovery](storage.md#gpt-role-guid-discovery)),
 and ktest options are baked into ktest's compile-time defaults
 ([ktest README § Compile-time options](../core/ktest/README.md#compile-time-options)).

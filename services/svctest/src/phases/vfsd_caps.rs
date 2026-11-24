@@ -26,7 +26,9 @@ use ipc::{IpcMessage, IpcMessageBuilder};
 use namespace_protocol::NsError;
 use syscall_abi::MSG_CAP_SLOTS_MAX;
 
-use super::unmount::{SHADOWED_DIR, UNFORCED, force_unmount_data, mount_data, unmount};
+use super::unmount::{
+    SHADOWED_DIR, UNFORCED, data_named_for_data_path, force_unmount_data, mount_data, unmount,
+};
 use crate::bootstrap::Caps;
 use crate::ipc_util::ns::ns_lookup;
 use crate::runner::Phase;
@@ -148,13 +150,23 @@ fn send_with_stray_caps(dir: u64, case: &Case, ipc_buf: *mut u64)
 
 /// Mount the data partition over [`SHADOWED_DIR`], send each of [`CASES`]
 /// with stray caps on the synthetic `/config`, then mount the partition at
-/// `/data` again and set the cwd to it.
+/// `/data` again and set the cwd to it. With the data partition named for
+/// `/data` alone ([`data_named_for_data_path`]) nothing can make `/config`
+/// synthetic, and the phase is skipped.
 fn stray_caps_phase(caps: &Caps)
 {
     assert_ne!(
         caps.vfsd_mount, 0,
         "vfsd_namespace_stray_caps: no vfsd.mount seed"
     );
+    if data_named_for_data_path()
+    {
+        std::os::seraph::log!(
+            "vfsd_namespace_stray_caps: skipped: the storage statement names the data \
+             partition for /data alone, so it cannot mount over {SHADOWED_DIR}"
+        );
+        return;
+    }
     force_unmount_data(caps);
     mount_data(caps, SHADOWED_DIR);
 

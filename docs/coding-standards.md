@@ -21,7 +21,8 @@ restated in this document. Developers MUST NOT disable or bypass these tools.
 
 `cargo xtask build` and `cargo xtask test` enforce the Rust rule: each runs `cargo fmt --check`
 and fails on a file `cargo fmt` would change, naming its file and line, without rewriting it.
-CI runs both on every pull request ([build-system.md](build-system.md) § Continuous Integration).
+CI runs `cargo xtask test` on every pull request, and `cargo xtask build` in each cell the change
+owes ([build-system.md](build-system.md) § Continuous Integration).
 No check enforces the C rule.
 
 `.editorconfig` is authoritative for editor-level settings (indentation, line endings,
@@ -730,7 +731,8 @@ formatter behavior MUST:
 Blanket or module-wide suppressions are forbidden without explicit justification.
 
 A crate that exists only to test reports a defect by panicking: a booted harness (`svctest`,
-`usertest`), a per-program tester, and a test fixture or benchmark program under `programs/`. Its
+`usertest`), a per-program tester, a test fixture under `services/fixtures/`, and the `ubench`
+benchmark suite under `services/ubench/`. Its
 crate root MAY suppress, of `unwrap_used`, `expect_used`, `panic`, `unreachable`,
 `unwrap_in_result` and `panic_in_result_fn`, those that fire in it, with one
 `#![expect(.., reason = "...")]` whose reason names the crate's role and how it reports a

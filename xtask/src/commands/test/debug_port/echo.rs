@@ -51,7 +51,7 @@ use crate::util::{require_tool, step};
 const RECIPE: &str = "debug-echo.svc";
 
 /// The fixture's line once it holds the debug port. Kept in sync with
-/// `services/debug-echo/src/main.rs`.
+/// `services/fixtures/debug-echo/src/main.rs`.
 const READY_MARKER: &str = "[debug-echo] READY on the debug port";
 
 /// The fixture's line once it holds the driver devmgr restarted at the
@@ -262,7 +262,7 @@ impl Link
     }
 }
 
-/// The exchange the fixture answers (services/debug-echo/README.md):
+/// The exchange the fixture answers (services/fixtures/debug-echo/README.md):
 /// acknowledged mode first, a refused checksum, the interrupt byte, then
 /// no-ack mode, a binary echo through the escapes, and a packet past the
 /// fixture's buffer.

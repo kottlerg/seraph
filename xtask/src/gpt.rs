@@ -79,6 +79,10 @@ pub struct Partition<'a>
     pub first_lba: u64,
     /// The partition's length in blocks, at least one.
     pub blocks: u64,
+    /// The entry's attribute bits; bits 48-63 are the type-specific field,
+    /// which vfsd reads as the partition's priority among those of its type
+    /// on one disk.
+    pub attributes: u64,
 }
 
 /// A disk's partition table.
@@ -166,7 +170,7 @@ fn protective_mbr(block: usize, total_blocks: u64) -> Vec<u8>
     mbr
 }
 
-/// One partition entry: the two GUIDs, the LBA range, no attribute bits, and the name in
+/// One partition entry: the two GUIDs, the LBA range, the attribute bits, and the name in
 /// UTF-16LE, zero-padded.
 fn entry(p: &Partition<'_>, last_lba: u64) -> Result<Vec<u8>>
 {
@@ -181,7 +185,7 @@ fn entry(p: &Partition<'_>, last_lba: u64) -> Result<Vec<u8>>
     e.extend_from_slice(&p.unique_guid);
     e.extend_from_slice(&p.first_lba.to_le_bytes());
     e.extend_from_slice(&last_lba.to_le_bytes());
-    e.extend_from_slice(&0u64.to_le_bytes());
+    e.extend_from_slice(&p.attributes.to_le_bytes());
     for unit in name
     {
         e.extend_from_slice(&unit.to_le_bytes());
@@ -360,6 +364,7 @@ mod tests
             unique_guid: [unique; 16],
             first_lba,
             blocks,
+            attributes: 0,
         }
     }
 
@@ -447,19 +452,25 @@ mod tests
             let parts = [
                 part("ESP", EFI_SYSTEM_PARTITION, 1, first, 10),
                 part("ROOT", TYPE_A, 2, first + 10, 20),
-                part("SWAP", TYPE_B, 3, first + 40, 5),
+                Partition {
+                    attributes: 0xFFFF << 48,
+                    ..part("SWAP", TYPE_B, 3, first + 40, 5)
+                },
             ];
             let t = table(block_size, 200, &parts);
             let disk = image(&t);
 
-            let expected: Vec<vfsd_gpt::GptEntry> = parts
-                .iter()
-                .map(|p| vfsd_gpt::GptEntry {
+            // Each partition sits in the array slot of its position, the
+            // 1-based number a UEFI HardDrive node names it by.
+            let expected: Vec<vfsd_gpt::GptEntry> = (1..)
+                .zip(&parts)
+                .map(|(number, p)| vfsd_gpt::GptEntry {
                     type_guid: p.type_guid,
                     uuid: p.unique_guid,
                     first_lba: p.first_lba,
                     length_lba: p.blocks,
-                    attributes: 0,
+                    attributes: p.attributes,
+                    number,
                 })
                 .collect();
             assert_eq!(vfsd_entries(&disk, block_size, 1), expected, "{block_size}");

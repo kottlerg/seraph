@@ -172,9 +172,9 @@ pub fn ns_phase(caps: &Caps)
     }
     for expected in [
         &b"hello"[..],
-        &b"pipefault"[..],
-        &b"stackoverflow"[..],
-        &b"stdiotest"[..],
+        &b"shell"[..],
+        &b"terminal"[..],
+        &b"fb-charset"[..],
     ]
     {
         assert!(

@@ -5,7 +5,8 @@
 
 //! Mkdisk command: re-mirror `rootfs/` into `sysroot/`, re-synthesise test
 //! fixtures, choose what the image boots (the harness whose bundle it
-//! composes, the bootloader's knobs, the log-level configuration), and
+//! composes, the svctest boot's staging, the bootloader's knobs, the log-level
+//! configuration), and
 //! regenerate `disk.img` (and `disk-data.img` under `--split-data`) at the
 //! requested block size without invoking cargo. The pack checks the images it
 //! writes ([`crate::image_check`]). Hand-staging a test recipe (copying it
@@ -32,6 +33,7 @@ use crate::cli::MkdiskArgs;
 use crate::context::Context as BuildContext;
 use crate::disk;
 use crate::esp::{self, Knob};
+use crate::svctest_stage;
 use crate::sysroot::{self, LOG_LEVELS};
 use crate::util::step;
 
@@ -39,7 +41,8 @@ use crate::util::step;
 /// sysroot (including the test-fixture synthesis) unless `--repack-only`,
 /// installs the repository's data files in either case, then the log-level
 /// configuration `--log-levels` names over the repository's, records the
-/// harness `--harness` names, stages exactly the knobs `--knob` names, and
+/// harness `--harness` names, stages the svctest boot with the fixture set
+/// `--svctest` names, stages exactly the knobs `--knob` names, and
 /// regenerates `disk.img` (and `disk-data.img` under `--split-data`) at the
 /// requested block size. Cargo is not invoked; the existing per-arch sysroot
 /// from a prior `cargo xtask build` is reused.
@@ -48,8 +51,8 @@ use crate::util::step;
 ///
 /// When the sysroot was built for another architecture, the `--log-levels`
 /// file cannot be read or holds a line init's parser refuses, and as
-/// [`sysroot::install_rootfs`], [`esp::set_knobs`] and
-/// [`disk::create_disk_image`] fail.
+/// [`sysroot::install_rootfs`], [`svctest_stage::stage`], [`esp::set_knobs`]
+/// and [`disk::create_disk_image`] fail.
 pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
 {
     sysroot::check_arch(ctx, args.arch)?;
@@ -77,6 +80,10 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
     if let Some(harness) = args.harness
     {
         sysroot::record_harness(ctx, harness)?;
+    }
+    if let Some(set) = args.svctest
+    {
+        svctest_stage::stage(&ctx.sysroot, set.set())?;
     }
     esp::set_knobs(ctx, &args.knob)?;
     let layout = disk::DiskLayout {

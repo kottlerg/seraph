@@ -123,7 +123,14 @@ pub fn env_phase(_: &Caps)
         env::var("SERAPH_NOPE").is_err(),
         "unset key must return Err"
     );
-    assert_eq!(env::vars().count(), 2, "expected 2 seeded entries");
+    // The staging's fixture record is the recipe's own entry, which the
+    // svctest_fixtures phase checks; the counts here leave it out.
+    let entries = || {
+        env::vars()
+            .filter(|(key, _)| key != svctest_fixtures::ENV)
+            .count()
+    };
+    assert_eq!(entries(), 2, "expected 2 seeded entries");
 
     // SAFETY: svctest is single-threaded at this point in main.
     unsafe {
@@ -142,15 +149,15 @@ pub fn env_phase(_: &Caps)
     }
     assert_eq!(env::var("SERAPH_MODE").unwrap_or_default(), "test");
 
-    let all: Vec<(String, String)> = env::vars().collect();
-    assert_eq!(all.len(), 4, "expected 4 entries, got {}", all.len());
+    let all = entries();
+    assert_eq!(all, 4, "expected 4 entries, got {all}");
 
     // SAFETY: single-threaded.
     unsafe {
         env::remove_var("FOO");
     }
     assert!(env::var("FOO").is_err(), "removed key must return Err");
-    assert_eq!(env::vars().count(), 3, "three entries must remain");
+    assert_eq!(entries(), 3, "three entries must remain");
 
     std::os::seraph::log!("env phase passed");
 }

@@ -187,7 +187,7 @@ and a demand fault's run goes back to the pool and the fault is declined with co
 The clearing costs one map, one pass of stores over the run, and one unmap per hand-out. The
 ubench suite's `ubench.fault_fill` lines report the cycles of a 16-page demand fault and of a
 grant-and-map of the same size, the measure of a change to that work
-([programs/ubench/README.md](../../../programs/ubench/README.md#benchmarks) § Benchmarks).
+([services/ubench/README.md](../../ubench/README.md#benchmarks) § Benchmarks).
 
 ---
 

@@ -87,7 +87,9 @@ read it to find the document a task needs.
   runs that section owes for it, at the heads and repeat counts it sets. Any other change owes
   none, whatever directory it touches.
 - A documentation-only or comment-only change, as that section defines it, needs none of the
-  runs above, since the CI gate builds and boots both architectures. The pre-merge review still
+  runs above. A Markdown-only change changes nothing an image holds, so CI owes it no boot; a
+  comment-only change's CI run builds and boots the cells its files owe
+  ([docs/conventions.md](../docs/conventions.md) § CI Gating). The pre-merge review still
   applies, and the PR body carries what [docs/conventions.md](../docs/conventions.md) § PR-body
   checklist discipline requires.
 - `cargo xtask lint-docs` passes on every change

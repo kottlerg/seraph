@@ -22,8 +22,9 @@
 //!
 //! `crashme oom-hold <pages>` touches `<pages>` pages of heap, prints
 //! `holding <pages>` and waits to be destroyed: a program of an operator
-//! session that svctest's `oom_policy` phase starts through the session's
-//! shell, for oomd to stop as a job (docs/session-supervision.md).
+//! session that svctest's `oom_policy` and `sessiond_operator` phases start
+//! through the session's leader, the `leader` fixture, for oomd to stop as a
+//! job (docs/session-supervision.md).
 
 use std::io::{BufRead, Write};
 use std::process::exit;

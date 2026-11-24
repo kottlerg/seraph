@@ -139,7 +139,7 @@ fn check_env()
     }
 }
 
-/// Assert cwd survived the (re)spawn: the recipe declares `cwd = /tests`,
+/// Assert cwd survived the (re)spawn: the recipe declares `cwd = /tests/fixtures`,
 /// where crasher's own binary lives. A **relative** lookup of `crasher`
 /// resolves through the child's `current_dir_cap`; if cwd were dropped on
 /// restart that cap is zero and the lookup fails. The path is relative (no

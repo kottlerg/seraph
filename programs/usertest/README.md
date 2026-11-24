@@ -68,11 +68,11 @@ programs/usertest/
     └── main.rs   # seed bootstrap + discovery + spawn loop + summary marker
 ```
 
-`usertest` ships no per-program testers itself. Each program under
-`programs/<name>/` may ship a tester at `programs/<name>/tester/`; the
-tester binary lands at `/tests/programs/<name>`, is named in the recipe's `TESTERS` (§ Testers),
-and is discovered at runtime, per
-[docs/testing.md § Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
+`usertest` ships no per-program testers itself. Each program under `programs/<name>/` may ship a
+tester at `programs/<name>/tester/`, and each fixture under `services/fixtures/<name>/` one at
+`services/fixtures/<name>/tester/`; the tester binary lands at `/tests/programs/<name>`, is named in
+the recipe's `TESTERS` (§ Testers), and is discovered at runtime, per [docs/testing.md § Per-program
+tester protocol](../../docs/testing.md#per-program-tester-protocol).
 
 ---
 

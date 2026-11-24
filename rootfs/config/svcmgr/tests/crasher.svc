@@ -19,7 +19,7 @@ sched_max = 5
 argv      = crasher selftest
 env       = CRASHER_MARKER=107
 namespace = subtree:/tests:LOOKUP+READDIR+STAT+READ
-cwd       = /tests
+cwd       = /tests/fixtures
 restart   = always
 critical  = no
 seed      = svcmgr pwrmgr.deny

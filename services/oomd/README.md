@@ -76,7 +76,8 @@ The svctest `oom_policy` phase drives oomd end to end with the `memhog` fixture
 ([services/fixtures/memhog/README.md](../fixtures/memhog/README.md)) and the `stopsrc` fixture
 ([services/fixtures/stopsrc/README.md](../fixtures/stopsrc/README.md)), which the svctest boot
 stages: stopsrc restarts, so the source oomd finds started after oomd, and starts a job. svctest
-also opens an operator session whose shell runs `crashme oom-hold 512`, a job larger than stopsrc's
+also opens an operator session whose shell runs `/tests/fixtures/programs/crashme oom-hold 512`, a
+job larger than stopsrc's
 64-page one. memhog fills the pool up to the reserve; oomd stops the crashme job after the grace,
 then stopsrc's job, then the session or sessions, then memhog, a cooldown apart; the session's relay
 gives the leader's end. The level falls to `NORMAL`, memhog's next instance is idle, and oomd has

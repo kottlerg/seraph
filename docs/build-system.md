@@ -393,18 +393,25 @@ sysroot/
   services/fs/            # Filesystem drivers sourced from
                           # services/fs/<x>/ (fatfs today). VFS-loaded
                           # respawns walk /services/fs/<name>.
-  programs/               # Userspace utilities and test programs sourced
-                          # from programs/ in the repo tree (the
-                          # InstallDest::Programs entries in
-                          # xtask/src/commands/build.rs SPECS).
-                          # Loaded by procmgr from the root
+  programs/               # Userspace programs sourced from programs/
+                          # in the repo tree (the InstallDest::Programs
+                          # entries in xtask/src/commands/build.rs
+                          # SPECS). Loaded by procmgr from the root
                           # partition via VFS at runtime.
   tests/                  # Test harnesses, per-program testers, and
-                          # harness-only fixtures: kernel-surface
-                          # harness (ktest), services-surface (svctest),
+                          # test fixtures: kernel-surface harness
+                          # (ktest), services-surface (svctest),
                           # programs-surface orchestrator (usertest),
-                          # and the crasher restart-path fixture. Some
+                          # and the ubench benchmark suite. Some
                           # test-only artifacts install outside it.
+  tests/fixtures/         # Test fixtures a harness recipe starts as
+                          # services, sourced from services/fixtures/
+                          # (the InstallDest::TestsFixtures entries in
+                          # xtask/src/commands/build.rs SPECS).
+  tests/fixtures/programs/ # Test fixtures spawned as programs, sourced
+                          # from services/fixtures/ (the
+                          # InstallDest::TestsFixturesPrograms entries),
+                          # signed in the program role.
   tests/drivers/          # Test-only drivers devmgr binds only on demand
                           # (test-fault; the InstallDest::TestsDrivers
                           # entries in xtask/src/commands/build.rs SPECS),

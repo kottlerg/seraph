@@ -66,15 +66,16 @@ harness-specific and MUST NOT include the bracketed summary substring.
 
 ## Per-program tester protocol
 
-A program under `programs/<name>/` MAY ship a tester. Authors of each
-program opt in or skip; absence is the default.
+A program under `programs/<name>/`, or a test fixture under `services/fixtures/<name>/`, MAY ship
+a tester. Authors of each opt in or skip; absence is the default.
 
 ### Layout
 
-- The tester crate lives at `programs/<name>/tester/`.
+- The tester crate lives at `programs/<name>/tester/` for a program and at
+  `services/fixtures/<name>/tester/` for a fixture.
 - The tester crate is a workspace member listed in the root `Cargo.toml`.
-- The tester uses the standard userspace build profile (same as
-  `programs/<name>/` itself).
+- The tester uses the standard userspace build profile (same as the
+  program or fixture itself).
 
 ### Install
 
@@ -1158,23 +1159,23 @@ worker fault, and its `svcmgr_stop_service` phase stops and restarts the fixture
 stop authority), as is its boot-fault role (`crasher-boot.svc`, `restart = on_failure`), whose
 instance that finds the token `/data/crasher-boot/die-early`, which the data partition ships,
 removes it and dies before its bootstrap request (svctest's `svcmgr_boot_death` phase); its bounded
-faults complete long before `svctest`'s terminal marker, so the kernel fault dump never clobbers
-it. The `memhog` fixture (`memhog.svc`, `restart = on_failure`, `oom_stop = yes`) is in the `ci`
-and `burn-in` sets: svctest's `oom_policy` phase has it fill memory until oomd stops it, and its
+faults complete long before `svctest`'s terminal marker, so the kernel fault dump never clobbers it.
+The `memhog` fixture (`memhog.svc`, `restart = on_failure`, `oom_stop = yes`) is in the `ci` and
+`burn-in` sets: svctest's `oom_policy` phase has it fill memory until oomd stops it, and its
 `logd_reserve` phase has it fill memory while logd is killed and restarted. The CI svctest cell
 drops crashd, so the held-write path of that phase (a child's page fault crashd holds until oomd's
-stop frees memory), and the write part of the `memmgr_swap_commit` phase (a child's commitment
-past the draw room, its commit overruns held by crashd until write-out to swap opens memmgr's draw
-room), run in the burn-in svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`,
-`restart = always`, `stop_source = program`) is in both sets: svctest's `svcmgr_stop_service`
-phase reads that svcmgr lists it, beside sessiond, as a stop source of the program class and that a
-job it started ends with it, and its `oom_policy` phase has it start a job that oomd stops before
-memhog. The `oom_policy` phase also opens an operator session whose shell runs
-`crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's `sessiond_operator`
-phase checks sessiond's operator interface; sessiond, like oomd, is a default service, which every
-svctest boot stages. The `reserve-creator` fixture (`reserve-creator.svc`, `reserve = yes`) is in
-both sets: svctest's `logd_reserve` phase has it make a `CREATE_FROM_FILE | CREATE_RESERVE` of
-`/programs/hello` while memhog holds memory critical, which must succeed.
+stop frees memory), and the write part of the `memmgr_swap_commit` phase (a child's commitment past
+the draw room, its commit overruns held by crashd until write-out to swap opens memmgr's draw room),
+run in the burn-in svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart
+= always`, `stop_source = program`) is in both sets: svctest's `svcmgr_stop_service` phase reads
+that svcmgr lists it, beside sessiond, as a stop source of the program class and that a job it
+started ends with it, and its `oom_policy` phase has it start a job that oomd stops before memhog.
+The `oom_policy` phase also opens an operator session whose shell runs
+`/tests/fixtures/programs/crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's
+`sessiond_operator` phase checks sessiond's operator interface; sessiond, like oomd, is a default
+service, which every svctest boot stages. The `reserve-creator` fixture (`reserve-creator.svc`,
+`reserve = yes`) is in both sets: svctest's `logd_reserve` phase has it make a `CREATE_FROM_FILE |
+CREATE_RESERVE` of `/programs/hello` while memhog holds memory critical, which must succeed.
 
 **Test isolation.** The functional harness boots run a controlled substrate:
 they drop the autostarted `terminal` (a user-facing program, not part of the

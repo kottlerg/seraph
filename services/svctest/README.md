@@ -513,23 +513,23 @@ fixture set does not declare `memhog`. It waits for the pressure level to read `
 memory until the level reads `CRITICAL`. With oomd's `OOMD_STOP=yes`, it waits for the level to fall
 to `NORMAL` and checks that oomd logged exactly one `stopped memhog: ` line after at least its grace
 critical, and no advice line. The phase also opens, through `caps[15]`, an operator session whose
-shell runs `crashme oom-hold 512`, a job larger than `stopsrc`'s; oomd must log one
-`stopped /tests/fixtures/programs/crashme: ` line before its stop of `stopsrc`'s job, then stop the
-session, whose relay gives the leader's end, and then memhog. When the set declares `stopsrc`, the
-phase first sends the fixture `EXIT`, waits for its restarted instance's new nonce, so the source
-oomd finds started after oomd, and has it start a job of 64 pages; oomd must then log one
-`stopped stopsrc-job: ` line before its stop of memhog, and the fixture must report the job stopped.
-When crashd is staged with a stall, a child (`/tests/fixtures/programs/crashme oom-touch 1024`)
-writes the pages of a demand region in turn during the fill, and crashd logs the write memmgr
+shell runs `/tests/fixtures/programs/crashme oom-hold 512`, a job larger than `stopsrc`'s; oomd must
+log one `stopped /tests/fixtures/programs/crashme: ` line before its stop of `stopsrc`'s job, then
+stop the session, whose relay gives the leader's end, and then memhog. When the set declares
+`stopsrc`, the phase first sends the fixture `EXIT`, waits for its restarted instance's new nonce,
+so the source oomd finds started after oomd, and has it start a job of 64 pages; oomd must then log
+one `stopped stopsrc-job: ` line before its stop of memhog, and the fixture must report the job
+stopped. When crashd is staged with a stall, a child (`/tests/fixtures/programs/crashme oom-touch
+1024`) writes the pages of a demand region in turn during the fill, and crashd logs the write memmgr
 declines held, then resumed; the child's `go` waits until sessiond lists no candidate, so crashd's
 hold covers only memhog's stop. The pages oomd's last stop freed lie above the reserve until
 memhog's next top-up takes them back, and the child's writes spend them, so one write is always
 declined. The phase first checks that crashd's stall outlasts what oomd takes from the write to
 memhog's stop: a cooldown. With `OOMD_STOP=no`, it checks that memhog stays running and the level
-stays `CRITICAL` past the grace, the cooldown and 2000 ms, that oomd logged at least one
-`would stop ` line, which names the operator session while one is open, and no stop, and then stops
-memhog itself through `caps[22]`, by the key svcmgr listed it under before the fill. In every case
-memhog's next instance answers `PROBE` with a new nonce and 0 pages ([oomd](../oomd/README.md)).
+stays `CRITICAL` past the grace, the cooldown and 2000 ms, that oomd logged at least one `would stop
+` line, which names the operator session while one is open, and no stop, and then stops memhog
+itself through `caps[22]`, by the key svcmgr listed it under before the fill. In every case memhog's
+next instance answers `PROBE` with a new nonce and 0 pages ([oomd](../oomd/README.md)).
 
 The `sessiond_operator` phase (`phases/sessiond.rs`, right after the svcmgr phases) fails when
 `caps[15]` is not set. Through the stop SEND svcmgr hands svctest for sessiond, operator labels must
@@ -539,7 +539,7 @@ unregistered nonce replies `UNKNOWN_INTERFACE`, `REGISTER_INTERFACE` of another 
 rights replies `INVALID_ARGUMENT`: a POST cap as `REGISTER_INTERFACE`'s end queue, a RECV cap as
 `OPEN_SESSION`'s relay, and a notification as `SESSION_STDIO`'s memory cap, which also ends the
 session, whose relay is then posted. A session runs the shell (`echo`), lists with `RANK_SESSION`
-under its key and its job (`crashme oom-hold 16`) with `RANK_JOB` under
+under its key and its job (`/tests/fixtures/programs/crashme oom-hold 16`) with `RANK_JOB` under
 `/tests/fixtures/programs/crashme` with at least 16 pages; `STOP_CANDIDATE` of the job leaves the
 shell answering. The shell's exit gives status 0 on the relay and its key `NO_CANDIDATE` after; a
 second session stopped whole gives `EXIT_KILLED` ([sessiond](../sessiond/README.md)).

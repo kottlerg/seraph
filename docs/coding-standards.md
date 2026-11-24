@@ -730,7 +730,8 @@ formatter behavior MUST:
 Blanket or module-wide suppressions are forbidden without explicit justification.
 
 A crate that exists only to test reports a defect by panicking: a booted harness (`svctest`,
-`usertest`), a per-program tester, and a test fixture or benchmark program under `programs/`. Its
+`usertest`), a per-program tester, a test fixture under `services/fixtures/`, and the `ubench`
+benchmark suite under `services/ubench/`. Its
 crate root MAY suppress, of `unwrap_used`, `expect_used`, `panic`, `unreachable`,
 `unwrap_in_result` and `panic_in_result_fn`, those that fire in it, with one
 `#![expect(.., reason = "...")]` whose reason names the crate's role and how it reports a

@@ -57,10 +57,13 @@ const ROOT_PARTITION_SIZE: u64 = 192 * 1024 * 1024;
 const DATA_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Swap partition size. A raw partition, neither formatted nor populated,
-/// which vfsd hands to the swap service; 64 MiB holds the pages a small
-/// `--mem` boot spills under pressure. The image file is sized with
-/// `set_len`, so the partition costs no host disk until it is written.
-const SWAP_PARTITION_SIZE: u64 = 64 * 1024 * 1024;
+/// which vfsd hands to the swap service. svctest's `memmgr_swap` phase swaps
+/// about one and a half times memmgr's system reserve, a sixty-fourth of the
+/// pool (services/svctest/src/phases/swap.rs, `require_swap_room`), so 256
+/// MiB, 65,536 pages, holds it for a guest of up to 10 GiB. The image file is
+/// sized with `set_len`, so the partition costs no host disk until it is
+/// written.
+const SWAP_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Bytes before the first partition and after the last: the first partition
 /// starts 1 MiB in (standard GPT alignment, past the primary header and

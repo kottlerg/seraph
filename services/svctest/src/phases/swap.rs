@@ -18,6 +18,10 @@
 //! which does not ask the pager and fails with `InvalidAddress` on a page that
 //! is not present.
 //!
+//! Before it starts the child, the phase requires the swap slots free, when a
+//! swap service has registered any, to hold the pages it must swap, so a swap
+//! partition too small for the machine's memory fails at once and names both.
+//!
 //! The phase then takes grants from memmgr until the pressure level reads
 //! `LOW` and keeps it there, taking more whenever the level falls to
 //! `NORMAL` and giving a block back at `CRITICAL`, until memmgr holds a quarter
@@ -1227,7 +1231,14 @@ fn swap_phase(caps: &Caps)
     // empty.
     let _ = settle_resident(authority, PHASE, None);
     let baseline = baseline_totals(authority, PHASE);
-    let reserve = pool().reserve_pages();
+    let status = pool();
+    let reserve = status.reserve_pages();
+    // A restore from the headroom of at most the reserve takes nearly a chunk
+    // of free pages (`pattern`), so the restores that use it up and the one
+    // direct reclaim admits need a little more than the reserve swapped: a
+    // quarter more allows for chunks the clock evicts meanwhile.
+    let want = reserve.saturating_add(reserve / 4);
+    require_swap_room(&status, want);
     let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Page);
     let threads = attach(authority, process, "the fixture");
     let thread = *threads.first().expect("the attach returned a thread");
@@ -1240,11 +1251,7 @@ fn swap_phase(caps: &Caps)
     take_room(&mut room, room_pages);
 
     hog.fill_to_low();
-    // A restore from the headroom of at most the reserve takes nearly a chunk
-    // of free pages (`pattern`), so the restores that use it up and the one
-    // direct reclaim admits need a little more than the reserve swapped: a
-    // quarter more allows for chunks the clock evicts meanwhile.
-    await_swapped(&mut hog, &mut fixture, reserve.saturating_add(reserve / 4));
+    await_swapped(&mut hog, &mut fixture, want);
     debugger_restore(authority, process, thread, &ready);
     let from_headroom = critical_restore(&mut hog, authority, process, thread, &ready);
     hog.fill_to_low();
@@ -1294,6 +1301,43 @@ fn swap_phase(caps: &Caps)
         peaks.swapped,
         peaks.hogged,
         end.saturating_sub(baseline.totals) / PAGE_SIZE
+    );
+}
+
+/// Require the swap slots free at the baseline to hold what the phase must
+/// swap, so a swap partition too small for the machine's memory fails here,
+/// naming both, rather than as a wait that runs out at [`SWAP_BOUND`].
+///
+/// While a swap service has registered slots, eviction at `LOW` runs only
+/// while the overcommit allowance the free slots give covers `promised` and a
+/// chunk (`free_pool::Ledger::evicting_frees`; services/memmgr/docs/memory-pool.md
+/// § Commit, Overcommit), so the `want` pages of the fixture's main region the
+/// phase awaits swapped, the pages `promised` holds, and the chunks of other
+/// processes the clock evicts meanwhile, allowed a quarter of the reserve, all
+/// come out of the free slots. With no slot registered the compressed store
+/// alone holds what memmgr evicts, and there is nothing to check.
+fn require_swap_room(status: &Pool, want: u64)
+{
+    if !status.overcommits()
+    {
+        return;
+    }
+    let reserve = status.reserve_pages();
+    let promised = status.promised / PAGE_SIZE;
+    let need = want.saturating_add(promised).saturating_add(reserve / 4);
+    let room = status.free_slots.saturating_mul(CHUNK_PAGES);
+    assert!(
+        room >= need,
+        "{PHASE}: the {} swap slots free hold {room} pages, short of the {need} pages the phase \
+         must swap ({want} of the fixture's main region, {promised} promised, and a quarter of \
+         the reserve of {reserve} pages for other processes' chunks): the swap partition is too \
+         small for this machine's memory",
+        status.free_slots
+    );
+    std::os::seraph::log!(
+        "{PHASE}: {} swap slots free hold {room} pages of the {need} the phase must swap \
+         (reserve {reserve} pages, {promised} promised)",
+        status.free_slots
     );
 }
 

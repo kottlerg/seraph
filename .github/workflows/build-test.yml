@@ -624,7 +624,7 @@ jobs:
         # The init harness's image with ubench's recipe staged and the
         # terminal dropped, so it adds no output of its own to the framebuffer
         # console_write measures (logd's mirror of the log lines still does); `--repack-only` keeps the staging, as the
-        # functional harness cells' staging does (programs/ubench/README.md
+        # functional harness cells' staging does (services/ubench/README.md
         # § Running).
         run: |
           cargo xtask mkdisk --arch ${{ matrix.arch }} --harness init

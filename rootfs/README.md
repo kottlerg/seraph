@@ -96,4 +96,5 @@ performs the mirror is
 ## Summarized By
 
 [Build System](../docs/build-system.md),
-[programs/fsbench/README.md](../programs/fsbench/README.md), [xtask/README.md](../xtask/README.md)
+[services/fixtures/fsbench/README.md](../services/fixtures/fsbench/README.md),
+[xtask/README.md](../xtask/README.md)

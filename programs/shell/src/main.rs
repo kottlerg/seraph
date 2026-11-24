@@ -8,7 +8,8 @@
 //!
 //! Reads `\n`-terminated lines from stdin, runs a small set of built-ins
 //! (`help`, `exit`, `echo`, `pwd`, `cd`, `ls`, `cat`), and otherwise spawns
-//! `/programs/<name>` as an external command. Pure `std`: no Seraph cap
+//! an external command: `/programs/<name>` for a bare name, the file a path
+//! names for a command holding a `/`. Pure `std`: no Seraph cap
 //! awareness — stdin/stdout/stderr are the terminal's stdio pipes, and
 //! children are spawned through `std::process::Command`. The terminal renders
 //! no prompt; the shell owns the `$ ` prompt.
@@ -37,13 +38,10 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-use shell_path::resolve_path;
+use shell_path::{command_path, resolve_path};
 
 /// The prompt. The terminal renders none, so the shell prints its own.
 const PROMPT: &[u8] = b"$ ";
-
-/// Directory holding spawnable external programs — Seraph's `/bin`.
-const PROGRAMS_DIR: &str = "/programs";
 
 /// An input line (newline included), end-of-input, or an external child's
 /// exit, delivered to the main loop from the reader / per-child waiter threads.
@@ -143,7 +141,7 @@ fn repl(rx: &Receiver<Event>, tx: &Sender<Event>)
             "cat" => cat(&mut out, &cwd, &args),
             _ =>
             {
-                if run_external(cmd, &args, rx, tx)
+                if run_external(cmd, &args, &cwd, rx, tx)
                 {
                     return; // stdin reached EOF while the child ran
                 }
@@ -174,7 +172,8 @@ fn help(out: &mut std::io::Stdout)
                 cd <path>       change directory\n\
                 ls [path]       list a directory\n\
                 cat <path>      print a file\n\
-                <name> [args]   run /programs/<name>\n";
+                <name> [args]   run /programs/<name>\n\
+                <path> [args]   run the program at <path>\n";
     let _ = out.write_all(text.as_bytes());
     let _ = out.flush();
 }
@@ -284,19 +283,19 @@ fn cat(out: &mut std::io::Stdout, cwd: &str, args: &[&str])
     }
 }
 
-/// Spawn `/programs/<cmd>`, relay its stdout/stderr to the shell's, and
-/// forward subsequent input lines to its stdin until it exits. Returns `true`
-/// if stdin reached EOF while the child ran (the caller ends the session).
-fn run_external(cmd: &str, args: &[&str], rx: &Receiver<Event>, tx: &Sender<Event>) -> bool
+/// Spawn the program `cmd` names ([`command_path`]), relay its stdout/stderr
+/// to the shell's, and forward subsequent input lines to its stdin until it
+/// exits. Returns `true` if stdin reached EOF while the child ran (the caller
+/// ends the session).
+fn run_external(
+    cmd: &str,
+    args: &[&str],
+    cwd: &str,
+    rx: &Receiver<Event>,
+    tx: &Sender<Event>,
+) -> bool
 {
-    if cmd.contains('/')
-    {
-        eprint_line(&format!(
-            "shell: {cmd}: only bare /programs names are runnable"
-        ));
-        return false;
-    }
-    let path = format!("{PROGRAMS_DIR}/{cmd}");
+    let path = command_path(cwd, cmd);
     let mut child = match Command::new(&path)
         .args(args)
         .stdin(Stdio::piped())

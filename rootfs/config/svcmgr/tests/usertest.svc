@@ -8,7 +8,7 @@
 # is added to TESTERS. The bound is 2.6 times the slowest tester's worst pass
 # (pipestress, 46 s on riscv64 debug); with the 5 s drain after a kill it is
 # the added bound the usertest CI cells' budgets are derived with, so a change
-# to it re-derives them (services/usertest/README.md § Testers).
+# to it re-derives them (programs/usertest/README.md § Testers).
 #
 # The later seeds are authorities testers take: TESTER_SEEDS names, per
 # tester, the seed slots usertest hands it as its bootstrap caps (slot 0,

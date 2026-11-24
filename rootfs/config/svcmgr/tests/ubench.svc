@@ -1,10 +1,10 @@
-# /tests/ubench — the userspace benchmark suite (programs/ubench/README.md).
+# /tests/ubench — the userspace benchmark suite (services/ubench/README.md).
 #
 # One-shot: exits once every benchmark ran; svcmgr never restarts it.
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan. To
 # enable in a boot, copy this file into the sysroot's /config/svcmgr/services/
 # after `cargo xtask build` and repack the disk with
-# `cargo xtask mkdisk --repack-only` (programs/ubench/README.md § Running).
+# `cargo xtask mkdisk --repack-only` (services/ubench/README.md § Running).
 #
 # devmgr.class.framebuffer is the class SEND console_write draws through; a
 # boot with no framebuffer (headless) leaves it serving no driver, and the

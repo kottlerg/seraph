@@ -1493,7 +1493,7 @@ mod tests
 
     /// Each ELF image of the test sysroot of riscv64 under the init harness:
     /// its sysroot-relative path, its role set and its name.
-    const SIGNED_IMAGES: [(&str, &[Role], &str); 9] = [
+    const SIGNED_IMAGES: [(&str, &[Role], &str); 11] = [
         ("boot/kernel", &[Role::Kernel], "kernel"),
         ("services/init", &[Role::Init], "init"),
         (
@@ -1522,6 +1522,16 @@ mod tests
             "tests/programs/fixture",
             &[Role::Program],
             "/tests/programs/fixture",
+        ),
+        (
+            "tests/fixtures/programs/fixture",
+            &[Role::Program],
+            "/tests/fixtures/programs/fixture",
+        ),
+        (
+            "tests/fixtures/fixture",
+            &[Role::Service],
+            "/tests/fixtures/fixture",
         ),
     ];
 

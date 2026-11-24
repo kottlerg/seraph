@@ -588,7 +588,8 @@ gives the PR-level linear view.
   sizes MUST report, in its `## Validation` section, the local sizing run of each such harness
   that [testing.md](testing.md#bounded-verification) § Bounded verification owes: its
   verification time, the peak resident memory of the run, its unwind bounds, and the head it
-  ran at.
+  ran at; and, for a harness it resizes to meet the time budget that section sets, its
+  verification time on CI's runner before and after.
 
 ## CI Gating
 
@@ -608,6 +609,13 @@ PR merges only at a head that contains `master`, whose own green CI shows
 the combination green, and `cargo xtask pr-check <N> --gate` refuses any
 other. A release is cut
 only from a green `master` (§ Release Production).
+
+The `kani` check gates a pull request on the bounded proofs of the crates
+the change can affect, not on the whole set, which runs in burn-in and in
+the release host runs
+([testing.md](testing.md#bounded-verification) § Bounded verification); a
+pull request that affects none passes it with a notice that it verified
+nothing.
 
 ## Release Production
 
@@ -677,7 +685,8 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    debug-port cell (`test debug-port`, on both architectures),
    the hotplug cell (`test hotplug`, on both architectures),
    the CET cell (`test cet`, on x86_64), and the TPM cell (`test tpm`,
-   on x86_64) once each. A run at an earlier `master` commit that contains the bump
+   on x86_64) once each, and every bounded proof (`cargo xtask kani`
+   with no option). A run at an earlier `master` commit that contains the bump
    stands for the commit to be tagged when the change between the two is
    documentation or comments only, as [testing.md](testing.md#coverage-tiers)
    § Coverage tiers defines it.

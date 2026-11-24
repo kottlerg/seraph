@@ -93,10 +93,12 @@ subcommands! {
         /// under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md).
         Fuzz(FuzzArgs),
         /// Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every
-        /// crate that holds one, with the pinned Kani release, and fail on any
-        /// failed, undetermined or unwinding-incomplete check, on a Kani release
-        /// other than the pinned one, and on a harness that lies in no package;
-        /// with `--pin`, print the pinned release (see xtask/README.md).
+        /// crate that holds one, or with `--since` of each crate a change can
+        /// affect, with the pinned Kani release, and fail on any failed,
+        /// undetermined or unwinding-incomplete check, on a Kani release other
+        /// than the pinned one, on a harness that lies in no package, and on CI's
+        /// runner on a harness over the time budget; with `--pin`, print the
+        /// pinned release (see xtask/README.md).
         Kani(KaniArgs),
 
         /// Read preserved ktest boot logs (from `run --runs N --save-logs`) and
@@ -263,7 +265,7 @@ impl CliCommand
             Self::Test(args) => args.unit_tests().then_some(&args.host.common),
             Self::CryptoVectors(args) => Some(&args.host),
             Self::Fuzz(args) => (!args.list).then_some(&args.host),
-            Self::Kani(args) => (!args.pin).then_some(&args.host),
+            Self::Kani(args) => (!args.pin && !args.list).then_some(&args.host),
             Self::CompareImages(args) => Some(&args.host),
             Self::Run(_)
             | Self::KtestTiming(_)
@@ -1058,13 +1060,25 @@ args! {
         #[arg(long, value_name = "CRATE")]
         pub component: Option<String>,
 
+        /// Verify only the crates the change from COMMIT to the working tree
+        /// can affect: each crate whose package, a package in its dependency
+        /// closure, or a file one of them reads, the change touches; every
+        /// crate when it touches an input of every build.
+        #[arg(long, value_name = "COMMIT", conflicts_with_all = ["component", "harness"])]
+        pub since: Option<String>,
+
+        /// Print the package of each crate the run would verify and exit,
+        /// verifying nothing.
+        #[arg(long, conflicts_with = "harness")]
+        pub list: bool,
+
         /// Verify this harness only, by its path in the crate
         /// (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it.
         #[arg(long, value_name = "NAME", requires = "component")]
         pub harness: Option<String>,
 
         /// Print the pinned Kani release and exit, verifying nothing.
-        #[arg(long, conflicts_with_all = ["component", "harness"])]
+        #[arg(long, conflicts_with_all = ["component", "harness", "since", "list"])]
         pub pin: bool,
 
         /// The shared host's launch rules (see xtask/README.md "Host launch
@@ -2043,8 +2057,10 @@ mod tests
         assert!(build_host_of(&["xtask", "lint-docs"]).is_none());
         assert!(build_host_of(&["xtask", "host", "status"]).is_none());
         assert!(build_host_of(&["xtask", "fuzz", "--list"]).is_none());
-        // Printing the pinned Kani release compiles nothing.
+        // Printing the pinned Kani release, or the crates a run would
+        // verify, compiles nothing.
         assert!(build_host_of(&["xtask", "kani", "--pin"]).is_none());
+        assert!(build_host_of(&["xtask", "kani", "--since", "HEAD", "--list"]).is_none());
         // A case or a cell boots, and admits each boot itself.
         assert!(build_host_of(&["xtask", "test", "kaslr"]).is_none());
         assert!(build_host_of(&["xtask", "test", "--cell", "usertest"]).is_none());

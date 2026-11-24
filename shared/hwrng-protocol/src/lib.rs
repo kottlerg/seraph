@@ -388,19 +388,21 @@ mod proofs
     /// Base of the decoder's walk: the reply contract holds on the first
     /// `len` of any count word and `WORDS_AFTER_COUNT` words after it,
     /// decoded into a buffer of every length up to `OUT_BOUND`. The longest
-    /// loop is the check of the `OUT_BOUND` bytes of the buffer, so an unwind
-    /// bound of `OUT_BOUND + 1` (18) covers every loop.
+    /// loops are the walks of a word's 8 bytes, the decoder's unpacking and
+    /// the check's, and the walks over the reply's words and the buffer's
+    /// 8-byte chunks take at most `WORDS_AFTER_COUNT + 1` (3) steps, so an
+    /// unwind bound of 9 covers every loop.
     #[kani::proof]
-    #[kani::unwind(18)]
+    #[kani::unwind(9)]
     fn every_bounded_reply_holds_the_reply_contract()
     {
-        const _: () = assert!(OUT_BOUND + 1 == 18);
+        const _: () = assert!(OUT_BOUND.div_ceil(8) < 9);
         let words: [u64; WORDS_AFTER_COUNT + 1] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= words.len());
         let out_len: usize = kani::any();
         kani::assume(out_len <= OUT_BOUND);
-        property::reply_holds(&words[..len], out_len);
+        property::reply_holds_within::<OUT_BOUND>(&words[..len], out_len);
     }
 
     /// Base of the encoder's walk: the encode contract holds on every byte

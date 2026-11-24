@@ -1508,7 +1508,8 @@ Run the bounded proofs ([docs/testing.md](../docs/testing.md#bounded-verificatio
 verification) with the pinned Kani release.
 
 ```
-cargo xtask kani [--component <CRATE> [--harness <NAME>]]
+cargo xtask kani [--component <CRATE> [--harness <NAME>]] [--list]
+cargo xtask kani --since <COMMIT> [--list]
 cargo xtask kani --pin
 ```
 
@@ -1516,13 +1517,33 @@ cargo xtask kani --pin
 |---|---|---|
 | `--component <CRATE>` | every crate that holds a harness | Verify the harnesses of this crate only, by its package name |
 | `--harness <NAME>` | every harness | Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`); needs `--component` |
+| `--since <COMMIT>` | every crate that holds a harness | Verify the crates the change from this commit to the working tree can affect (below); takes no `--component` |
+| `--list` | `false` | Print the package of each crate the run would verify, one a line, and exit, verifying nothing; needs no Kani |
 | `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
 
 The command first finds the crates to verify, keeping no list of them: the crate of every tracked
 Rust source declaring a `#[kani::proof]`, the crate being the nearest directory above the file
 that holds a `Cargo.toml`, each run once by the package name that manifest gives. It fails
 naming each such source that lies in no crate, or in one whose manifest names no package, so no
-harness is left out of the run. It then checks that `cargo kani --version` names `KANI_VERSION`, and
+harness is left out of the run.
+
+With `--since`, the command selects from those crates the ones the change from `<COMMIT>` to the
+working tree (`git diff --name-only --no-renames`, a rename as both its paths) can affect, and prints
+each with the changed file that selects it, or a line saying that none is affected and why. A crate
+is affected when a changed file lies in the directory of its package or of a workspace package in its
+dependency closure, as `cargo metadata --no-deps` gives the path dependencies (of every kind and
+target: a superset of what its test build compiles), or is a file one of those packages names in an
+`include!`, `include_str!`, `include_bytes!` or `#[path]` string literal. Every crate is
+affected when a changed file is an input of every build: the workspace `Cargo.toml` and
+`Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`, the command's own sources
+(`xtask/src/commands/kani.rs`, which holds the Kani pin, the memory limit and the judge of Kani's
+output, and `xtask/src/affected.rs`, the selection, which other commands can share), or `.github/workflows/build-test.yml`, whose `kani` job an empty selection does not
+install Kani in. A package's build script, features and `cfg` settings lie in its directory or the
+workspace manifest, so a change to them selects it. A commit the checkout does not hold fails the
+command, so a shallow clone never narrows the run. With no crate affected the command verifies
+nothing and does not check the installed release.
+
+It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
 § Toolchain) on another release or none.
 
@@ -1541,7 +1562,17 @@ verdict names), and when Kani's closing summary is missing, counts a failure or 
 counts other harnesses than reported a verdict; a harness that Kani starts and prints no verdict for
 fails too. Every selected crate runs, and the command then prints a table of every harness, by
 package and path, with its verdict and verification time, and fails naming each crate that failed.
-CI's `kani` job runs the command with no option, after installing the release `--pin` prints
+A harness whose verification time exceeds the 120 s budget (`BUDGET_SECONDS`,
+[docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification) fails on a CI
+runner (`GITHUB_ACTIONS` set to `true`), named with its time and marked `FAILED (over budget)` in
+the table; on another host, whose speed differs, the command prints a warning naming it and its
+time.
+
+CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the pull request's base
+(the first parent of the merge commit it checks out), or on a push to `master` against the commit
+the push moved it from; when the list is empty it installs no Kani and says so in a notice on the
+run, and otherwise it installs the release `--pin` prints and runs the command with the same
+`--since`. The `kani` job of `burnin.yml` runs the command with no option
 ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
@@ -2556,7 +2587,7 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypto-vectors`, `fuzz`
-(but `--list`), `kani` (but `--pin`), `compare-images` and `test` without a case or a cell (the unit
+(but `--list`), `kani` (but `--pin` and `--list`), `compare-images` and `test` without a case or a cell (the unit
 tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`,
 `path-account trace` (but `--reuse`), and `test` with a case or a cell as boots, each boot admitted
 as above (the `shutdown` case admits once for its boots, which it runs one at a time). The

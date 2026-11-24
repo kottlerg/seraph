@@ -101,6 +101,14 @@ subcommands! {
         /// pinned release (see xtask/README.md).
         Kani(KaniArgs),
 
+        /// Print the CI cells a change owes: each file the change from a base
+        /// commit touches, the class the layer record places it in and why, and
+        /// the validate cells and bench boots of its most demanding file; every
+        /// cell without a base. Fails on a file no row places. With
+        /// `--github-output`, append the matrices build-test.yml runs (see
+        /// xtask/README.md).
+        Cells(CellsArgs),
+
         /// Read preserved ktest boot logs (from `run --runs N --save-logs`) and
         /// print per-tier and per-cell wall times; with `--base` and `--wide`,
         /// compare two widths against their width factor; with `--baseline`,
@@ -268,6 +276,7 @@ impl CliCommand
             Self::Kani(args) => (!args.pin && !args.list).then_some(&args.host),
             Self::CompareImages(args) => Some(&args.host),
             Self::Run(_)
+            | Self::Cells(_)
             | Self::KtestTiming(_)
             | Self::BenchCheck(_)
             | Self::BenchBaseline(_)
@@ -1090,6 +1099,30 @@ args! {
     }
 }
 
+// ── Cells ─────────────────────────────────────────────────────────────────────
+
+args! {
+    pub struct CellsArgs
+    {
+        /// The base: the change from COMMIT to the working tree.
+        #[arg(long, value_name = "COMMIT", conflicts_with = "since_green")]
+        pub since: Option<String>,
+
+        /// The base: the newest commit of REV's first-parent history whose
+        /// build-test run on a push to master passed (read with gh), so a cell
+        /// a red or unfinished master run left unproven stays owed; every cell
+        /// when none is found or the runs cannot be read.
+        #[arg(long, value_name = "REV")]
+        pub since_green: Option<String>,
+
+        /// Append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): the
+        /// validate and bench matrices, whether each is owed, and which bench
+        /// boots are.
+        #[arg(long, value_name = "FILE")]
+        pub github_output: Option<PathBuf>,
+    }
+}
+
 // ── Test ──────────────────────────────────────────────────────────────────────
 
 args! {
@@ -1428,6 +1461,12 @@ args! {
         /// Write this host's environment (the ENV file's keys) to FILE.
         #[arg(long, value_name = "FILE")]
         pub write_env: Option<PathBuf>,
+
+        /// A suite whose boot did not run, whose baselines are not checked:
+        /// `ktest` when the bench cell skips its ktest boots. Repeatable; a
+        /// log that measures the suite fails the command.
+        #[arg(long, value_name = "SUITE")]
+        pub skip_suite: Vec<String>,
 
         /// The saved run logs, one per run, all of one architecture.
         #[arg(required = true, value_name = "LOG")]

@@ -69,6 +69,7 @@ mod gpt;
 mod guest;
 mod host_lock;
 mod image_check;
+mod layers;
 mod path_account;
 mod path_record;
 mod qemu;
@@ -131,6 +132,7 @@ fn main()
         CliCommand::CryptoVectors(args) => commands::crypto_vectors::run(&ctx, args),
         CliCommand::Fuzz(args) => commands::fuzz::run(&ctx, args),
         CliCommand::Kani(args) => commands::kani::run(&ctx, args),
+        CliCommand::Cells(args) => commands::cells::run(&ctx, args),
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
         CliCommand::PathAccount(args) => commands::path_account::run(&ctx, args),
         CliCommand::BenchCheck(args) => commands::bench_check::run(&ctx, args),

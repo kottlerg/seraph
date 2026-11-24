@@ -1938,7 +1938,7 @@ then a `WARNING:` line per key of the stored `ENV` whose value differs here.
   one-CPU measurement gates; a measurement at more CPUs is reported only, since the interleaving
   of its CPUs moves its count. So is a benchmark of `ICOUNT_IO_BOUND` (`src/benchmark.rs`),
   `fsbench.write`, whose count includes time blocked on a device completion: the completion
-  arrives at host time, and the guest's clock advances by timer deadlines while it waits, so the
+  arrives at host time, and the guest's clock follows the host's time while it waits, so the
   count follows the host's I/O latency. `fsbench.read` gates, since its untimed warm-up fills the
   filesystem's page cache and no timed read waits on the disk; a benchmark whose timed samples
   wait on a device joins the set. The command fails when a gating measurement's verdict is not

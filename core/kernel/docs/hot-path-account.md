@@ -169,10 +169,10 @@ Not taken:
 
 | Configuration | Head | Taken | QEMU | Checked against |
 |---|---|---|---|---|
-| x86_64 dev | `fa75a4ab5f3a` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| x86_64 release | `fa75a4ab5f3a` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| riscv64 dev | `fa75a4ab5f3a` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| riscv64 release | `fa75a4ab5f3a` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| x86_64 dev | `4d3aacc90e4c` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| x86_64 release | `4d3aacc90e4c` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| riscv64 dev | `4d3aacc90e4c` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| riscv64 release | `4d3aacc90e4c` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
 
 #### Totals
 

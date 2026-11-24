@@ -698,7 +698,7 @@ rings both notifications, so a reader drains the ring to EOF and a writer fails 
 ends have sent, and `std::os::seraph::pipe::waits` the times they found their ring empty or full
 and announced a wait, whether or not they then blocked; the pipestress tester's doorbell trial
 reports both
-([programs/pipestress/README.md](../../programs/pipestress/README.md) § Tester).
+([services/fixtures/pipestress/README.md](../../services/fixtures/pipestress/README.md) § Tester).
 
 ---
 
@@ -763,7 +763,7 @@ the cap the spawn created a spawned thread with, carrying `RIGHTS_THREAD`, or th
 bind its fault or upcall handlers, read its registers, or post it an upcall
 ([fault-handling.md § Asynchronous Upcalls](../../docs/fault-handling.md#asynchronous-upcalls));
 the `deadline` fixture's supervisor bounds a spinning worker this way
-([programs/deadline/README.md](../../programs/deadline/README.md)).
+([services/fixtures/deadline/README.md](../../services/fixtures/deadline/README.md)).
 
 The reclaim of a spawned thread, by its `join` or by the reaper after a detach, revokes every cap
 derived from the spawned thread's cap before it deletes that cap: the copy the thread registered
@@ -843,12 +843,13 @@ procmgr's bound on each call on a caller-supplied file cap passes (`FILE_CAP_CAL
 
 ## Call deadline
 
-`std::os::seraph::with_call_deadline(deadline, f)` runs `f` with `deadline` as the calling
-thread's call deadline, and `std::os::seraph::call_time_left` returns the time left to it (`None`
-outside every deadline, zero once it has passed). A process bounds a step that waits on servers it
-does not trust to answer, as crashd bounds a fault's report and a core dump
+`std::os::seraph::with_call_deadline(deadline, f)` runs `f` with `deadline` as the calling thread's
+call deadline, and `std::os::seraph::call_time_left` returns the time left to it (`None` outside
+every deadline, zero once it has passed). A process bounds a step that waits on servers it does not
+trust to answer, as crashd bounds a fault's report and a core dump
 ([services/crashd/docs/operation.md](../../services/crashd/docs/operation.md) § Bounds), and the
-`deadline` fixture tests it ([programs/deadline/README.md](../../programs/deadline/README.md)).
+`deadline` fixture tests it
+([services/fixtures/deadline/README.md](../../services/fixtures/deadline/README.md)).
 
 - **Bounded.** Every IPC call the runtime makes on the thread inside `f` carries the time left as
   its `SYS_IPC_CALL` timeout, which bounds its wait for a receiver and for the reply
@@ -1080,13 +1081,12 @@ primitives.
 ## Summarized By
 
 [abi/process-abi/README.md](../../abi/process-abi/README.md),
-[Fault Handling](../../docs/fault-handling.md),
-[Namespace Model](../../docs/namespace-model.md),
+[Fault Handling](../../docs/fault-handling.md), [Namespace Model](../../docs/namespace-model.md),
 [Process Lifecycle](../../docs/process-lifecycle.md), [Storage](../../docs/storage.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
-[programs/threadchurn/README.md](../../programs/threadchurn/README.md),
-[programs/threadstack/README.md](../../programs/threadstack/README.md),
 [runtime/libc/README.md](../libc/README.md),
+[services/fixtures/threadchurn/README.md](../../services/fixtures/threadchurn/README.md),
+[services/fixtures/threadstack/README.md](../../services/fixtures/threadstack/README.md),
 [Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
 [logd IPC interface](../../services/logd/docs/ipc-interface.md),
 [procmgr IPC Interface](../../services/procmgr/docs/ipc-interface.md),

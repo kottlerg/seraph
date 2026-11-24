@@ -38,7 +38,7 @@ use crate::util::step;
 const ESP_PARTITION_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Root partition size. Holds every installed userspace binary under
-/// `/services/` and `/programs/` plus the `/tests/` harness binaries. With
+/// `/services/` and `/programs/` plus the test binaries under `/tests/`. With
 /// debuginfo off by default the tree is ~10 MiB; 192 MiB covers a full
 /// `--debug` rebuild and ample future components.
 const ROOT_PARTITION_SIZE: u64 = 192 * 1024 * 1024;

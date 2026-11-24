@@ -6,7 +6,7 @@
 //! GDB stub batch test: the host's GDB debugs a guest process through the
 //! stub over the debug port.
 //!
-//! Stages the `gdb-target` recipe (`programs/debugger --gdb-target`) and the
+//! Stages the `gdb-target` recipe (`/tests/fixtures/programs/debugger --gdb-target`) and the
 //! GDB stub naming it, repacks `disk.img`, and boots the current sysroot once
 //! with the debug port attached. Once the stub logs [`READY_MARKER`], the host
 //! runs `gdb -batch` against the port with the image's symbols ([`SCRIPT`]):
@@ -203,8 +203,8 @@ fn boot(ctx: &Context, args: &CaseArgs, gdb: &Path, layout: DiskLayout) -> Resul
     let gdb_sock = sockets.socket("gdb.gdb")?;
     // GDB reads the symbols of the stripped installed image from the symbols
     // store's file of its build id.
-    let binary =
-        Store::at(ctx.symbols_dir()).symbols_path(&ctx.sysroot.join("programs/debugger"))?;
+    let binary = Store::at(ctx.symbols_dir())
+        .symbols_path(&ctx.sysroot.join("tests/fixtures/programs/debugger"))?;
     let firmware = Firmware::prepare(ctx, args.arch)?;
     let vars = firmware.launch_vars()?;
     let disk_path = ctx.disk_image();

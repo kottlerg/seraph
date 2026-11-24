@@ -579,7 +579,7 @@ const GROWTH_CHILDREN: usize = process_table::death_queues::FIRST_POOL_OBSERVERS
 /// Hold [`GROWTH_CHILDREN`] children alive at once, so procmgr's death
 /// binds outgrow its first death queue's pool, then let each exit and check
 /// its clean exit and procmgr's `QUERY_PROCESS` answer (`EXITED`, reason 0).
-/// Each child is `/programs/stdiotest`, blocked on its piped stdin until the
+/// Each child is `/tests/fixtures/programs/stdiotest`, blocked on its piped stdin until the
 /// phase writes a line to it. A procmgr whose pool did not grow refuses the
 /// spawns past it. The phase cannot observe which queue a bind landed on, so
 /// it tests growth only while [`GROWTH_CHILDREN`] follows procmgr's pool.
@@ -591,7 +591,7 @@ pub fn death_queue_growth_phase(_: &Caps)
     let mut children = Vec::with_capacity(GROWTH_CHILDREN);
     for i in 0..GROWTH_CHILDREN
     {
-        let child = Command::new("/programs/stdiotest")
+        let child = Command::new("/tests/fixtures/programs/stdiotest")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

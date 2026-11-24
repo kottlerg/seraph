@@ -165,8 +165,11 @@ services/svctest/
         ├── fs_faults/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
         │   ├── pressure.rs    # Own fatfs gives idle cache pages back at memory pressure Low
-        │   ├── ramdisk.rs     # RAM FAT16 volume and block server with armed faults, read log
-        │   └── run_fill.rs    # Own fatfs fills sequential reads in runs; chain cursor retired
+        │   ├── ramdisk.rs     # RAM FAT16 volume and block server with armed faults, read and
+        │   │                  #   write logs
+        │   ├── run_fill.rs    # Own fatfs fills sequential reads in runs; chain cursor retired
+        │   └── run_write.rs   # Own fatfs writes a page as one block request; a dropped run
+        │                      #   rolls back
         ├── verified_read.rs   # procmgr's verified read of a data file: the body returned and
         │                      #   charged while held; another name, a flipped byte, no
         │                      #   signature, past the bound, and no length refused

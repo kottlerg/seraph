@@ -25,12 +25,12 @@ receives keep the IPC receive reserve. Once hogging, the fixture tops up every 1
 requests, so it takes back what another process frees and the level stays `CRITICAL` until it is
 stopped.
 
-svctest's `oom_policy` phase, which runs when this recipe is staged, has it hog and reads that oomd
-stopped it, or with `OOMD_STOP=no` or no oomd that nothing did, and that its next instance answers
-`PROBE` with a new nonce and no pages; its `logd_reserve` phase has it hog while logd is killed and
-restarted ([services/svctest/README.md](../svctest/README.md)). Its `oom_stop = yes` also makes it
-a service svctest's `svcmgr_stop_service` phase may list. A fixture that lacks its endpoint or
-nonce, or cannot allocate its ballast, logs an error and exits.
+svctest's `oom_policy` phase, which skips when the staged fixture set does not declare `memhog`, has
+it hog and reads that oomd stopped it, or with `OOMD_STOP=no` that nothing did, and that its next
+instance answers `PROBE` with a new nonce and no pages; its `logd_reserve` phase has it hog while
+logd is killed and restarted ([services/svctest/README.md](../svctest/README.md)). Its `oom_stop =
+yes` also makes it a service svctest's `svcmgr_stop_service` phase may list. A fixture that lacks
+its endpoint or nonce, or cannot allocate its ballast, logs an error and exits.
 
 ---
 

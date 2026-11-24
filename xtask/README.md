@@ -619,11 +619,11 @@ it, and no `[devmgr] DEBUG ` or `[procmgr] DEBUG ` line, which `run --runs --req
 `--fail-also` match
 ([docs/testing.md](../docs/testing.md#log-levels-usertest-cell) § Log levels).
 
-Example — stage `svctest` with the canonical cells' fixtures and run it (`--repack-only` keeps
-the terminal's removal; a plain repack would restore it):
+Example — stage `svctest` as the canonical cells do and run it (`--repack-only` keeps the
+removal of the terminal and crashd; a plain repack would restore them):
 
 ```sh
-rm -f sysroot/config/svcmgr/services/terminal.svc
+rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --repack-only --svctest ci --arch x86_64
 cargo xtask run --arch x86_64 --test-devices
 ```

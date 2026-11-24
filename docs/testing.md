@@ -241,6 +241,7 @@ set (`--svctest ci|burn-in|none`, below):
 
 ```sh
 cargo xtask build
+rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --repack-only --svctest none
 cargo xtask run --test-devices
 ```

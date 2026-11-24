@@ -795,7 +795,7 @@ pub mod class_badge
     pub const VERBS_MASK: u64 = crate::VERB_BIT_MASK >> VERB_SHIFT;
     /// Slots a class badge can name.
     pub const MAX_SLOTS: usize = 0xFFFF;
-    const _: () = assert!(
+    const _: () = core::assert!(
         SLOT_MASK & VERBS_MASK == 0
             && VERBS_MASK & crate::VERB_BIT_MASK == 0
             && VERBS_MASK << VERB_SHIFT == crate::VERB_BIT_MASK

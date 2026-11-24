@@ -284,7 +284,7 @@ fn demand_paging_phase(_: &Caps)
 /// yet. A clean exit proves memmgr funded the pool and backed the fault; a
 /// fault exit is memmgr declining it with code 9 (`mem_map` failed,
 /// `OutOfMemory`). The exit codes are the fixture's
-/// (services/fixtures/demandpaged/README.md).
+/// (services/fixtures/program-modes/README.md#demandpaged).
 fn demand_paging_pt_drain_phase(_: &Caps)
 {
     use std::process::Command;
@@ -312,7 +312,7 @@ fn demand_paging_pt_drain_phase(_: &Caps)
 /// memmgr's registration and released the reservation; exit `2` is memmgr
 /// refusing the second registration as an overlap, `4` an unanswered
 /// teardown, `5` a second reservation at another VA. The exit codes are the
-/// fixture's (services/fixtures/demandpaged/README.md).
+/// fixture's (services/fixtures/program-modes/README.md#demandpaged).
 fn demand_paging_teardown_phase(_: &Caps)
 {
     use std::process::Command;

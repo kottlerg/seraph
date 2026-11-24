@@ -3,13 +3,14 @@
 
 // services/fixtures/program-modes/src/pipestress.rs
 
-//! Pipe fixture for its tester, in two modes. By default it echoes its first
-//! argument in one stdout line and returns immediately (#360), so the interval
-//! between the write landing in the stdout ring and process death is as short
-//! as the runtime allows — the shape that races a parent draining the pipe
-//! against the death-bridge flipping `peer_dead`. Given `sink`, it is the
-//! reader of the tester's doorbell trial: it reads its stdin to EOF and reports
-//! the bytes it read and its pipe counters (`std::os::seraph::pipe`).
+//! Pipe fixture for `services/svctest`'s `pipestress` phase, in two modes. By
+//! default it echoes its first argument in one stdout line and returns
+//! immediately (#360), so the interval between the write landing in the stdout
+//! ring and process death is as short as the runtime allows — the shape that
+//! races a parent draining the pipe against the death-bridge flipping
+//! `peer_dead`. Given `sink`, it is the reader of the phase's doorbell trial:
+//! it reads its stdin to EOF and reports the bytes it read and its pipe
+//! counters (`std::os::seraph::pipe`).
 
 use std::io::{Read, Write};
 
@@ -30,7 +31,7 @@ pub fn main()
 
 /// Announce readiness, read stdin to EOF, and report the bytes read and this
 /// thread's pipe notification sends and waits. A read error ends the count
-/// where it stands; the tester's byte check reports it.
+/// where it stands; the phase's byte check reports it.
 fn sink()
 {
     let mut stdout = std::io::stdout();

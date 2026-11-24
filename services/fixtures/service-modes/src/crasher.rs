@@ -10,7 +10,8 @@
 //! and, on request, faults a worker thread; `boot-fault` faults its main
 //! thread before its bootstrap request when it finds a token file, and is
 //! `worker-fault` otherwise. Gating, the surface checks, the fail rules, and
-//! the capability slots are defined in `services/fixtures/crasher/README.md`.
+//! the capability slots are defined in
+//! `services/fixtures/service-modes/README.md#crasher`.
 
 use std::os::seraph::startup_info;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -208,7 +209,7 @@ fn bootstrap_caps(creator_ep: u64, ipc_buffer: *mut u8) -> (u64, u64, usize)
 /// does not exist. A successful round-trip (any reply, including
 /// `UNKNOWN_NAME`) proves the cap is live. A dead or stale seed makes
 /// `ipc_call` return `Err`, which is a surface that failed to round-trip and
-/// is logged with `FATAL:` (services/fixtures/crasher/README.md).
+/// is logged with `FATAL:` (services/fixtures/service-modes/README.md#crasher).
 fn probe_svcmgr(svcmgr_cap: u64, ipc_buffer: *mut u8)
 {
     #[expect(

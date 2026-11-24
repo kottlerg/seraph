@@ -1,5 +1,5 @@
-# /tests/fixtures/crasher, boot-fault role — fixture for a service that dies before its
-# bootstrap request.
+# /tests/fixtures/service-modes crasher, boot-fault role — fixture for a service that dies
+# before its bootstrap request.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # Co-staged with svctest in CI and stageable by hand: copy this file into

@@ -183,9 +183,9 @@ which no probe touches), and the probe of a vector frame lies a page below
 its fixed area, so two consecutive stack stores can lie up to 14312 bytes
 apart. Every main-thread stack that `shared/process-layout` places and every
 thread stack std spawns therefore keeps a guard of four pages
-(`process_abi::STACK_GUARD_PAGES`; [`threadstack`](../services/fixtures/threadstack/README.md)'s
-`splitframe` and `span` modes check it), where x86-64, whose `call` pushes
-the return address, needs one. The two floors:
+(`process_abi::STACK_GUARD_PAGES`;
+[`threadstack`](../services/fixtures/program-modes/README.md#threadstack)'s `splitframe` and `span`
+modes check it), where x86-64, whose `call` pushes the return address, needs one. The two floors:
 
 - `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
   SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, CX16, LAHF/SAHF,

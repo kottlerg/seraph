@@ -93,8 +93,8 @@ enum InstallDest
     TestsPrograms,
     /// Installed under `sysroot/tests/fixtures/<install_name>` — the test
     /// fixtures that run as services, sourced from
-    /// `services/fixtures/<x>/` (`crasher`, `memhog`, `stopsrc`,
-    /// `debug-echo`, `hotplug-check`). See docs/testing.md § Sysroot layout.
+    /// `services/fixtures/<x>/` (`service-modes`, `debug-echo`,
+    /// `hotplug-check`). See docs/testing.md § Sysroot layout.
     TestsFixtures,
     /// Installed under `sysroot/tests/fixtures/programs/<install_name>` —
     /// the test fixtures that run as programs, sourced from

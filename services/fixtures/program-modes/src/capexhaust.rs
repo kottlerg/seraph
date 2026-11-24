@@ -28,7 +28,7 @@
 //! this `CSpace` must leave memmgr's pool `free_bytes` unchanged.
 //!
 //! Driven by `services/svctest`'s `recv_wedge` phase, which spawns this
-//! binary, waits for exit, and asserts the exit code.
+//! mode, waits for exit, and asserts the exit code.
 
 /// `RecvGuard` diagnostic hook. The `First` line doubles as evidence that
 /// logging still works from a fully exhausted `CSpace` (`STREAM_BYTES`

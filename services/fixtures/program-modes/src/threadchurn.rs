@@ -3,8 +3,8 @@
 
 // services/fixtures/program-modes/src/threadchurn.rs
 
-//! `CSpace`-slot and memmgr-pool reclaim fixture for the usertest
-//! `threadchurn` tester (#240, #274).
+//! `CSpace`-slot and memmgr-pool reclaim fixture for
+//! `services/svctest`'s `threadchurn` phase (#240, #274).
 //!
 //! Holds a burst of detached threads bound at once, then spawns and joins, then
 //! spawns and detaches, batches of threads, sampling two quantities before and
@@ -37,7 +37,7 @@
     reason = "threadchurn is a test fixture, where unwrap and expect are permitted \
               (docs/coding-standards.md § Error Handling): a failed `cap_info` sample or a \
               panicked worker must abort the run, and the panic's non-zero exit with no PASS \
-              marker is the failure its tester reports"
+              marker is the failure its phase reports"
 )]
 
 use std::os::seraph::log;

@@ -6,11 +6,12 @@
 //! Stack-overflow fixture for the main-thread stack guard: recursion
 //! without bound until the main thread's stack overflows onto its guard
 //! and the thread is killed with a page-fault exit reason. The stack it
-//! overflows is described in `services/fixtures/stackoverflow/README.md` and
+//! overflows is described in
+//! `services/fixtures/program-modes/README.md#stackoverflow` and
 //! docs/userspace-memory-model.md § Bootstrap Cross-Boundary VAs.
 //!
 //! Driven by `services/svctest`'s `stack_overflow_phase`, which spawns this
-//! binary, waits for exit, and asserts the non-zero fault reason.
+//! mode, waits for exit, and asserts the non-zero fault reason.
 
 pub fn main()
 {

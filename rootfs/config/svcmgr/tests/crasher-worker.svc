@@ -1,4 +1,4 @@
-# /tests/fixtures/crasher worker-fault — svcmgr's worker-thread-fault restart fixture.
+# /tests/fixtures/service-modes crasher worker-fault — svcmgr's worker-thread-fault restart fixture.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # Co-staged with svctest (services-surface harness) in CI and stageable

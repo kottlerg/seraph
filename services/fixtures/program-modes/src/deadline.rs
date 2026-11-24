@@ -24,13 +24,13 @@
 //! releases the caps, and the fixture, spawned with none, holds no creator
 //! endpoint. The fixture prints `PASS` once both parts hold.
 //!
-//! Driven by its per-program tester (`tester/`), which `usertest` runs.
+//! Driven by `services/svctest`'s `deadline` phase.
 
 #![expect(
     clippy::expect_used,
     reason = "a test fixture, where unwrap and expect are permitted (docs/coding-standards.md § \
               Error Handling): a failed step must abort the fixture, and the panic's non-zero exit \
-              is its FAIL verdict for the tester"
+              is its FAIL verdict for the phase"
 )]
 
 use std::io::ErrorKind;

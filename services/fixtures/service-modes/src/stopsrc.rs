@@ -5,7 +5,7 @@
 
 //! The stop-source test fixture: a supervised stop source of the program
 //! class (`stop_source = program`), staged only with svctest
-//! (services/fixtures/stopsrc/README.md).
+//! (services/fixtures/service-modes/README.md#stopsrc).
 //!
 //! On request it starts one job, a child process of its own binary that
 //! touches a given number of pages and waits, and lists it through the

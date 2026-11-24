@@ -3,7 +3,8 @@
 
 // services/fixtures/program-modes/src/threadstack.rs
 
-//! Guarded demand-stack fixture for the usertest `threadstack` tester.
+//! Guarded demand-stack fixture for `services/svctest`'s `threadstack`
+//! phase.
 //!
 //! Spawned demand-paged (the system default; no opt-in needed), so threads this
 //! process spawns get a guarded demand-paged stack: a large lazily-grown
@@ -28,7 +29,7 @@
 //!     the kernel kills the worker, and (via the address-space death-observer)
 //!     procmgr tears the whole process down — so this process never exits
 //!     cleanly. If the overflow somehow survives, print `SURVIVED (BUG)` and
-//!     exit `SUCCESS` so the tester's "must be killed" assertion fails loudly
+//!     exit `SUCCESS` so the phase's "must be killed" assertion fails loudly
 //!     rather than the run hanging.
 //!   * `bigframe` — spawn a worker that runs and then parks, then a second
 //!     worker, whose stack the reservation arena places directly above the
@@ -266,7 +267,7 @@ fn grow() -> ExitCode
 }
 
 /// Spawn `f` on a worker asking for `EAGER_STACK_BYTES` of stack. A refused
-/// spawn prints `spawn failed` and exits with code 4, which no tester
+/// spawn prints `spawn failed` and exits with code 4, which no phase
 /// verdict accepts.
 fn spawn_worker<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
@@ -319,7 +320,7 @@ fn nested_grow() -> ExitCode
 
 fn guard() -> ExitCode
 {
-    // Flush the marker before the worker faults, so the tester sees the fixture
+    // Flush the marker before the worker faults, so the phase sees the fixture
     // reached the overflow point even though the process is about to die.
     println!("about to overflow");
     let _ = std::io::stdout().flush();
@@ -480,7 +481,7 @@ fn over_the_guard(overflow: fn() -> u8) -> ExitCode
 /// misjudged by a page or more (entry frames above this one larger than a
 /// page) puts the computed base below the real one; the dry run's descent
 /// then faults on the guard before `about to overflow` is printed, which
-/// fails the tester.
+/// fails the phase.
 #[inline(never)]
 fn usable_base() -> usize
 {

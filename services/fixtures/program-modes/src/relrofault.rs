@@ -12,7 +12,7 @@
 //! page-fault exit reason. A clean exit means RELRO was not enforced.
 //!
 //! Driven by `services/svctest`'s `relro_write_phase`, which spawns this
-//! binary, waits for exit, and asserts the non-zero fault reason.
+//! mode, waits for exit, and asserts the non-zero fault reason.
 
 static MESSAGE: &str = "resident of .data.rel.ro";
 

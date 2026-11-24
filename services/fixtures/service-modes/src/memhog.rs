@@ -6,7 +6,7 @@
 //! The memory hog test fixture: a supervised service that, on request, takes
 //! what memmgr can still promise a process outside the system reserve until
 //! the pressure level reads `CRITICAL`, and holds it until it is stopped
-//! (services/fixtures/memhog/README.md).
+//! (services/fixtures/service-modes/README.md#memhog).
 //!
 //! memhog serves `ipc::memhog_labels` on the endpoint of the name its recipe
 //! provides, which svcmgr delivers in bootstrap slot 0. The fill is

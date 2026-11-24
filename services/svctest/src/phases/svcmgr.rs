@@ -113,7 +113,7 @@ fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
 }
 
 /// The boot-fault fixture's token, which an instance that finds it removes
-/// before it dies (`services/fixtures/crasher/src/main.rs` `BOOT_FAULT_TOKEN`, there
+/// before it dies (`services/fixtures/service-modes/src/crasher.rs` `BOOT_FAULT_TOKEN`, there
 /// named in the fixture's own namespace).
 const BOOT_FAULT_TOKEN: &str = "/data/crasher-boot/die-early";
 

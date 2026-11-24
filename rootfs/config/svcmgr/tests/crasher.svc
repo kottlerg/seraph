@@ -1,4 +1,4 @@
-# /tests/fixtures/crasher — deliberate-crash fixture for svcmgr's restart path.
+# /tests/fixtures/service-modes crasher — deliberate-crash fixture for svcmgr's restart path.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # Co-staged with svctest (services-surface harness) in CI and stageable

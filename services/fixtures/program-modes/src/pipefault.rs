@@ -12,7 +12,7 @@
 //! spawner-side death bridge instead.
 //!
 //! Driven by `services/svctest`'s `pipe_fault_eof` phase, which spawns
-//! this binary with `Stdio::piped()`, drains stdout, and asserts the
+//! this mode with `Stdio::piped()`, drains stdout, and asserts the
 //! prefix arrived followed by EOF (no hang) plus a fault `exit_reason`.
 
 use std::io::Write;

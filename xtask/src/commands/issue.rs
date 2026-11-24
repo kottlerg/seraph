@@ -211,14 +211,11 @@ fn tool_output_problem(body: &str) -> Option<String>
 {
     let found = tool_output_lines(body);
     let (line, kind) = found.first()?;
-    let more = match found.len()
-    {
-        1 => String::new(),
-        n => format!(" (and {} more line(s))", n.saturating_sub(1)),
-    };
+    let lines: Vec<String> = found.iter().map(|(line, _)| line.to_string()).collect();
     Some(format!(
-        "line {line} of the body is {}, which no author wrote{more}; remove the tool output, or \
-         quote it in a fenced code block",
+        "the body carries tool output, which no author wrote, at line(s) {} (line {line} is {}); \
+         remove those lines, or quote them in a fenced code block",
+        lines.join(", "),
         kind.describe()
     ))
 }
@@ -878,10 +875,12 @@ mod tests
         {
             let err = guard_body(OLD, &new, removal).expect_err("tool output");
             assert!(
-                err.starts_with("line 4 of the body is a `hint:` advice line"),
+                err.starts_with(
+                    "the body carries tool output, which no author wrote, at line(s) 4, 5, 6, 7, \
+                     8, 9, 10, 11 (line 4 is a `hint:` advice line"
+                ),
                 "{err}"
             );
-            assert!(err.contains("(and 7 more line(s))"), "{err}");
         }
         let quoted = format!("{OLD}```\n{hint}```\n");
         guard_body(OLD, &quoted, ItemRemoval::Refuse).unwrap();
@@ -889,10 +888,7 @@ mod tests
         let labels = ["bug".to_owned(), "xtask".to_owned()];
         let problems = check_filing("t", &new, &labels, &milestone("v0.1.4"));
         assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(
-            problems[0].starts_with("line 4 of the body"),
-            "{problems:?}"
-        );
+        assert!(problems[0].contains("at line(s) 4, 5,"), "{problems:?}");
         assert_eq!(
             check_filing("t", &quoted, &labels, &milestone("v0.1.4")),
             Vec::<String>::new()

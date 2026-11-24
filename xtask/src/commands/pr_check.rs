@@ -522,9 +522,9 @@ pub enum ToolOutput
     /// A `gh event listen` command on its own line, as the hint block `gh`
     /// prints after reading a pull request suggests it.
     EventListen,
-    /// A line of a `hint:` line's block: an indented, non-blank line after
-    /// the `hint:` line or after another line of its block, as `gh` indents
-    /// the lines of its advice under the `hint:` line.
+    /// A line of a hint block: an indented, non-blank line after a `hint:`
+    /// line, a `gh event listen` line, or another line of its block, as `gh`
+    /// indents the lines of its advice under the `hint:` line.
     HintBlock,
     /// A cargo status line: one of [`CARGO_STATUS_VERBS`], indented so that
     /// it ends at column [`CARGO_STATUS_COLUMN`], then a space
@@ -603,9 +603,10 @@ impl ToolOutput
 }
 
 /// The lines of `text` that are tool output, each with its one-based number
-/// and its kind. A `hint:` line counts with its whole block: every indented,
-/// non-blank line after it up to a blank line or a line at column 0, so that
-/// a diagnostic names every line of the advice and none is left behind. A
+/// and its kind. A `hint:` line or a `gh event listen` line counts with its
+/// block: every indented, non-blank line after it up to a blank line or a
+/// line at column 0, so that the diagnostics name every line of the advice
+/// at once, and the block's lines stay named while either line remains. A
 /// line inside a fenced code block is not counted: a body may quote tool
 /// output there. An indented code block is read as prose, since the lines of
 /// `gh`'s hint block are indented as one.
@@ -623,8 +624,8 @@ pub fn tool_output_lines(text: &str) -> Vec<(usize, ToolOutput)>
             None if continues && !line.trim().is_empty() => Some(ToolOutput::HintBlock),
             None => None,
         };
-        in_block = kind == Some(ToolOutput::Hint)
-            || (continues && !line.trim().is_empty() && kind.is_some());
+        in_block = matches!(kind, Some(ToolOutput::Hint | ToolOutput::EventListen))
+            || (continues && kind.is_some());
         if let Some(kind) = kind
         {
             out.push((index.saturating_add(1), kind));
@@ -3943,12 +3944,17 @@ mod tests
     #[test]
     fn a_hint_block_counts_to_its_end_and_no_further()
     {
-        // Each line of the block is named, so a body that removes only the
-        // `hint:` line and the command line still fails at the next run.
+        // Every line of the block is named at once, and up to its end.
         let (_, fixture) = HINT_BODIES[1];
         let lines: Vec<(usize, ToolOutput)> = tool_output_lines(fixture);
         assert_eq!(lines.len(), 8);
         assert!(lines.iter().all(|(line, _)| *line <= 8), "{lines:?}");
+        // A body that removed the `hint:` line alone still fails at every
+        // line left of the block: the command line opens it too.
+        let trimmed: String = fixture.lines().skip(1).flat_map(|l| [l, "\n"]).collect();
+        let mut expected = vec![(1, ToolOutput::EventListen)];
+        expected.extend((2..=7).map(|line| (line, ToolOutput::HintBlock)));
+        assert_eq!(tool_output_lines(&trimmed), expected);
         // The block ends at a blank line: an indented line after it is prose.
         let text = "hint: advice\n  - more advice\n\n  an indented paragraph\n";
         assert_eq!(

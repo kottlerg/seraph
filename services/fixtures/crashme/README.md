@@ -10,8 +10,8 @@ log.
 svctest drives the fixture through the `crashd_faults`, `crashd_cores`, `crashd_live_core`, and
 `crashd_oom_hold` phases (§ Driven By), through its `crash_endpoint` phase, in the `vm`,
 `exception`, `registry-main`, `registry-worker`, and `debugger-tag` modes, through its `oom_policy`
-phase, in the `oom-touch` mode with 1024 pages, and, through the shell of an operator session it
-opens, in the `oom-hold` mode ([services/svctest/README.md §
+phase, in the `oom-touch` mode with 1024 pages, and, through the [`leader`](../leader/README.md)
+fixture of an operator session it opens, in the `oom-hold` mode ([services/svctest/README.md §
 Fixtures](../../svctest/README.md#fixtures)). The fixture installs at
 `/tests/fixtures/programs/crashme`.
 

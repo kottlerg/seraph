@@ -101,12 +101,12 @@ memmgr's endpoint, procmgr's, the log endpoint and the namespace root come in th
 `table/`'s host tests cover the slot tables and their generations, the keys of sessions and jobs,
 the paging of the candidate list, and the session names. svctest's `sessiond_operator` phase
 drives sessiond as an interface, through its `sessiond.operator` seed, and as a stop-authority
-holder: the badge gates, an open under an unregistered nonce, a session that runs the shell, lists
-its job and has it stopped, then exits, and a session stopped whole. Its `oom_policy` phase opens a
-session whose shell runs a job larger than the `stopsrc` fixture's, and checks that oomd stops that
-job first, then `stopsrc`'s, then the session, then `memhog`
-([services/svctest/README.md](../svctest/README.md)). `cargo xtask test terminal` drives the
-terminal's session end to end.
+holder: the badge gates, an open under an unregistered nonce, a session that runs the
+[`leader`](../fixtures/leader/README.md) fixture as its leader, lists its job and has it stopped,
+then exits, and a session stopped whole. Its `oom_policy` phase opens a session whose leader runs a
+job larger than the `stopsrc` fixture's, and checks that oomd stops that job first, then
+`stopsrc`'s, then the session, then `memhog` ([services/svctest/README.md](../svctest/README.md)).
+`cargo xtask test terminal` drives the terminal's session end to end.
 
 ---
 

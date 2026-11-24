@@ -1193,13 +1193,14 @@ memmgr's draw room), run in each of them. The `stopsrc` fixture (`stopsrc.svc`, 
 = always`, `stop_source = program`) is in both sets: svctest's `svcmgr_stop_service` phase reads
 that svcmgr lists it, beside sessiond, as a stop source of the program class and that a job it
 started ends with it, and its `oom_policy` phase has it start a job that oomd stops before memhog.
-The `oom_policy` phase also opens an operator session whose shell runs
+The `oom_policy` phase also opens an operator session whose leader, the `leader` fixture, runs
 `/tests/fixtures/programs/crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's
-`sessiond_operator` phase checks sessiond's operator interface; sessiond, like oomd, is a default
-service, which every svctest boot stages. The `reserve-creator` fixture (`reserve-creator.svc`,
-`reserve = yes`) is in both sets: svctest's `logd_reserve` phase has it make a `CREATE_FROM_FILE |
-CREATE_RESERVE` of `/tests/fixtures/programs/spawn-target` while memhog holds memory critical,
-which must succeed.
+`sessiond_operator` phase checks sessiond's operator interface; oomd is a default service, which
+every svctest boot stages, and every svctest boot stages sessiond's test recipe in place of its
+default one, which names the `leader` fixture (`/tests/fixtures/programs/leader`) as the session
+leader. The `reserve-creator` fixture (`reserve-creator.svc`, `reserve = yes`) is in both sets:
+svctest's `logd_reserve` phase has it make a `CREATE_FROM_FILE | CREATE_RESERVE` of
+`/tests/fixtures/programs/spawn-target` while memhog holds memory critical, which must succeed.
 
 **Test isolation.** The functional harness boots run a controlled substrate:
 they drop the autostarted `terminal` (a user-facing program, not part of the

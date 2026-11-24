@@ -190,7 +190,7 @@ services/svctest/
         ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2;
         │                      #   stray caps
         ├── sessiond.rs        # sessiond's operator interface: badge gates, interface registration
-        │                      #   refusals, a session's shell, listed jobs, stopped whole
+        │                      #   refusals, a session's leader, listed jobs, stopped whole
         ├── oom.rs             # Out-of-memory policy: memhog filled until oomd stops it, a
         │                      #   stop source's job stopped first, a held write resumed
         ├── timed.rs           # `SystemTime::now()` through svcmgr and timed; a timed started
@@ -300,7 +300,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[12]` | `devmgr.class.input-deny` | drivers deny phase: an `input` class SEND without the driver's verb bits |
 | `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits; `logd_sinks` phase: the class it waits on for the killed framebuffer driver's withdrawal and queries for the restarted instance at ordinal 1; drivers stray-cap phase: the SEND its framebuffer case floods |
 | `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase: the stale-version refusal only, swapd holding the partition |
-| `caps[15]` | `sessiond.operator` (`SEND\|GRANT`) | `sessiond_operator` phase: `OPEN_SESSION`, `REGISTER_INTERFACE`; `oom_policy` phase: opens the operator session whose shell runs the large job |
+| `caps[15]` | `sessiond.operator` (`SEND\|GRANT`) | `sessiond_operator` phase: `OPEN_SESSION`, `REGISTER_INTERFACE`; `oom_policy` phase: opens the operator session whose leader runs the large job |
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read, hwrng restart, and stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
 | `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases: memmgr's swap labels, as a second swap client beside swapd, registering nothing, over a RAM slot store |
@@ -525,23 +525,24 @@ fixture set does not declare `memhog`. It waits for the pressure level to read `
 memory until the level reads `CRITICAL`. With oomd's `OOMD_STOP=yes`, it waits for the level to fall
 to `NORMAL` and checks that oomd logged exactly one `stopped memhog: ` line after at least its grace
 critical, and no advice line. The phase also opens, through `caps[15]`, an operator session whose
-shell runs `/tests/fixtures/programs/crashme oom-hold 512`, a job larger than `stopsrc`'s; oomd must
-log one `stopped /tests/fixtures/programs/crashme: ` line before its stop of `stopsrc`'s job, then
-stop the session, whose relay gives the leader's end, and then memhog. When the set declares
+leader runs `/tests/fixtures/programs/crashme oom-hold 512`, a job larger than `stopsrc`'s; oomd
+must log one `stopped /tests/fixtures/programs/crashme: ` line before its stop of `stopsrc`'s job,
+then stop the session, whose relay gives the leader's end, and then memhog. When the set declares
 `stopsrc`, the phase first sends the fixture `EXIT`, waits for its restarted instance's new nonce,
 so the source oomd finds started after oomd, and has it start a job of 64 pages; oomd must then log
 one `stopped stopsrc-job: ` line before its stop of memhog, and the fixture must report the job
-stopped. When crashd is staged with a stall, a child (`/tests/fixtures/programs/crashme oom-touch
-1024`) writes the pages of a demand region in turn during the fill, and crashd logs the write memmgr
-declines held, then resumed; the child's `go` waits until sessiond lists no candidate, so crashd's
-hold covers only memhog's stop. The pages oomd's last stop freed lie above the reserve until
-memhog's next top-up takes them back, and the child's writes spend them, so one write is always
-declined. The phase first checks that crashd's stall outlasts what oomd takes from the write to
-memhog's stop: a cooldown. With `OOMD_STOP=no`, it checks that memhog stays running and the level
-stays `CRITICAL` past the grace, the cooldown and 2000 ms, that oomd logged at least one `would stop
-` line, which names the operator session while one is open, and no stop, and then stops memhog
-itself through `caps[23]`, by the key svcmgr listed it under before the fill. In every case memhog's
-next instance answers `PROBE` with a new nonce and 0 pages ([oomd](../oomd/README.md)).
+stopped. When crashd is staged with a stall, a child
+(`/tests/fixtures/programs/crashme oom-touch 1024`) writes the pages of a demand region in turn
+during the fill, and crashd logs the write memmgr declines held, then resumed; the child's `go`
+waits until sessiond lists no candidate, so crashd's hold covers only memhog's stop. The pages
+oomd's last stop freed lie above the reserve until memhog's next top-up takes them back, and the
+child's writes spend them, so one write is always declined. The phase first checks that crashd's
+stall outlasts what oomd takes from the write to memhog's stop: a cooldown. With `OOMD_STOP=no`, it
+checks that memhog stays running and the level stays `CRITICAL` past the grace, the cooldown and
+2000 ms, that oomd logged at least one `would stop ` line, which names the operator session while
+one is open, and no stop, and then stops memhog itself through `caps[23]`, by the key svcmgr listed
+it under before the fill. In every case memhog's next instance answers `PROBE` with a new nonce and
+0 pages ([oomd](../oomd/README.md)).
 
 The `sessiond_operator` phase (`phases/sessiond.rs`, right after the svcmgr phases) fails when
 `caps[15]` is not set. Through the stop SEND svcmgr hands svctest for sessiond, operator labels must
@@ -550,10 +551,11 @@ unregistered nonce replies `UNKNOWN_INTERFACE`, `REGISTER_INTERFACE` of another 
 `VERSION_MISMATCH`, and a second one under one nonce `INVALID_ARGUMENT`. A cap of the wrong type or
 rights replies `INVALID_ARGUMENT`: a POST cap as `REGISTER_INTERFACE`'s end queue, a RECV cap as
 `OPEN_SESSION`'s relay, and a notification as `SESSION_STDIO`'s memory cap, which also ends the
-session, whose relay is then posted. A session runs the shell (`echo`), lists with `RANK_SESSION`
-under its key and its job (`/tests/fixtures/programs/crashme oom-hold 16`) with `RANK_JOB` under
+session, whose relay is then posted. A session runs the [`leader`](../fixtures/leader/README.md)
+fixture (`echo`), lists with `RANK_SESSION` under its key and its job
+(`/tests/fixtures/programs/crashme oom-hold 16`) with `RANK_JOB` under
 `/tests/fixtures/programs/crashme` with at least 16 pages; `STOP_CANDIDATE` of the job leaves the
-shell answering. The shell's exit gives status 0 on the relay and its key `NO_CANDIDATE` after; a
+leader answering. The leader's exit gives status 0 on the relay and its key `NO_CANDIDATE` after; a
 second session stopped whole gives `EXIT_KILLED` ([sessiond](../sessiond/README.md)).
 
 ---
@@ -626,7 +628,7 @@ spawning phases: with no argument it prints `spawn-target ran` and exits 0; with
 to start `/tests/fixtures/crasher` and exits 0 only when refused `PermissionDenied`), `stdiotest`
 (pipes, procmgr), `pipefault` (pipes), `stackoverflow` and `relrofault` (process faults),
 `capexhaust` (recv guard), `demandpaged` (pager), `fsbench` (FS IPC), and `crashme`
-(`oom-hold <pages>`, run by its path through a session's shell by the `sessiond_operator` and
+(`oom-hold <pages>`, run by its path through a session's leader by the `sessiond_operator` and
 `oom_policy` phases: it touches that many heap pages, prints `holding <pages>` and waits to be
 destroyed; and the crash endpoint: svctest, its recipe granting `debug_authority`, registers as the
 crash service and takes a `crashme` child's forwarded page fault, and the faults of two `registry-*`

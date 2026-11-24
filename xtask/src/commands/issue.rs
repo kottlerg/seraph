@@ -6,11 +6,12 @@
 //! `issue-edit` and `issue-file`: guarded writes to GitHub Issues.
 //!
 //! `issue-edit` replaces an Issue's body from a file. It refuses a body that
-//! is empty, that lost a task-list item, or that reopened a ticked one, keeps
-//! the previous body as a backup
-//! under `target/xtask/issue-backup/`, and reads the Issue back after the
-//! edit, restoring the backup when what GitHub holds is not what was sent.
-//! `issue-file` creates an Issue with the labels and milestone
+//! is empty, that carries tool output, that lost a task-list item, or that
+//! reopened a ticked one, keeps the previous body as a backup under
+//! `target/xtask/issue-backup/`, and reads the Issue back after the edit,
+//! restoring the backup when what GitHub holds is not what was sent.
+//! `issue-file` refuses a body that carries tool output too, and creates an
+//! Issue with the labels and milestone
 //! `docs/conventions.md` § Labels and § Milestones require, and reads it back
 //! to confirm that both were applied; an Issue without a milestone it files
 //! only with a reason its body states, and a rolling follow-up Issue only
@@ -25,7 +26,7 @@ use crate::error::{Context, Result, bail};
 use json::Value;
 
 use crate::cli::{IssueEditArgs, IssueFileArgs, UnscheduledReason};
-use crate::commands::pr_check::{current_milestone, is_rolling};
+use crate::commands::pr_check::{current_milestone, is_rolling, tool_output_lines};
 use crate::context::Context as BuildContext;
 use crate::gh;
 use crate::tasklist::{TaskItem, task_item, task_item_text};
@@ -203,15 +204,37 @@ fn lost_items(old: &str, new: &str) -> Vec<String>
     out
 }
 
+/// Why `body` may not be written to an Issue for the tool output it carries
+/// (a line a command printed on stderr, which no author wrote); `None` when
+/// it carries none.
+fn tool_output_problem(body: &str) -> Option<String>
+{
+    let found = tool_output_lines(body);
+    let (line, kind) = found.first()?;
+    let lines: Vec<String> = found.iter().map(|(line, _)| line.to_string()).collect();
+    Some(format!(
+        "the body carries tool output, which no author wrote, at line(s) {} (line {line} is {}); \
+         remove those lines, or quote them in a fenced code block",
+        lines.join(", "),
+        kind.describe()
+    ))
+}
+
 /// Decide whether `new` may replace `old` as an Issue body. A body that is
 /// empty, that lacks a task-list item of the one it replaces, or that reopens
 /// an item it has ticked, is what a mis-directed fetch or a stale copy
 /// produces: a copy fetched before another worker appended or ticked an item.
+/// A body that carries tool output is what a read with stderr merged into it
+/// produces, and is refused whatever `removal` allows.
 pub fn guard_body(old: &str, new: &str, removal: ItemRemoval) -> Result<(), String>
 {
     if new.trim().is_empty()
     {
         return Err("the new body is empty".to_owned());
+    }
+    if let Some(problem) = tool_output_problem(new)
+    {
+        return Err(problem);
     }
     if removal == ItemRemoval::Allow
     {
@@ -334,6 +357,7 @@ pub fn check_filing(
     {
         out.push("the body is empty".to_owned());
     }
+    out.extend(tool_output_problem(body));
     let class = labels
         .iter()
         .filter(|l| CLASS_LABELS.contains(&l.as_str()))
@@ -839,6 +863,35 @@ mod tests
         assert_eq!(
             missing_metadata(&wanted, None, &wanted, None),
             [] as [String; 0]
+        );
+    }
+
+    #[test]
+    fn a_body_with_tool_output_is_refused_before_it_is_written()
+    {
+        let hint = include_str!("pr_check/tool-output/pr1574.txt");
+        let new = format!("{OLD}{hint}");
+        for removal in [ItemRemoval::Refuse, ItemRemoval::Allow]
+        {
+            let err = guard_body(OLD, &new, removal).expect_err("tool output");
+            assert!(
+                err.starts_with(
+                    "the body carries tool output, which no author wrote, at line(s) 4, 5, 6, 7, \
+                     8, 9, 10, 11 (line 4 is a `hint:` advice line"
+                ),
+                "{err}"
+            );
+        }
+        let quoted = format!("{OLD}```\n{hint}```\n");
+        guard_body(OLD, &quoted, ItemRemoval::Refuse).unwrap();
+
+        let labels = ["bug".to_owned(), "xtask".to_owned()];
+        let problems = check_filing("t", &new, &labels, &milestone("v0.1.4"));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("at line(s) 4, 5,"), "{problems:?}");
+        assert_eq!(
+            check_filing("t", &quoted, &labels, &milestone("v0.1.4")),
+            Vec::<String>::new()
         );
     }
 }

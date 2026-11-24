@@ -135,8 +135,9 @@ pub fn unstage(ctx: &Context, arch: Arch, layout: DiskLayout) -> Result<()>
 /// The ELF that holds the symbols of the sysroot binary a process named
 /// `target` runs, best effort: the symbols store's file of the binary's build
 /// id, the binary being the `binary` of a staged recipe whose `argv` begins
-/// with the name, or else `/programs/<target>` or `/services/<target>` when
-/// one exists.
+/// with the name, or else the first of `/programs/<target>`,
+/// `/services/<target>`, `/tests/fixtures/programs/<target>` and
+/// `/tests/fixtures/<target>` that exists.
 pub fn binary_for(ctx: &Context, target: &str) -> Option<PathBuf>
 {
     let installed = installed_binary_for(ctx, target)?;
@@ -159,10 +160,15 @@ fn installed_binary_for(ctx: &Context, target: &str) -> Option<PathBuf>
     {
         return Some(ctx.sysroot.join(binary.trim_start_matches('/')));
     }
-    ["programs", "services"]
-        .iter()
-        .map(|d| ctx.sysroot.join(d).join(target))
-        .find(|p| p.is_file())
+    [
+        "programs",
+        "services",
+        "tests/fixtures/programs",
+        "tests/fixtures",
+    ]
+    .iter()
+    .map(|d| ctx.sysroot.join(d).join(target))
+    .find(|p| p.is_file())
 }
 
 /// The `binary` of the first recipe in `dir` whose `argv` begins with
@@ -376,10 +382,10 @@ mod tests
     #[test]
     fn a_recipe_names_its_binary_by_its_first_argv_word()
     {
-        let recipe = "binary = /programs/debugger\nargv = gdb-target --gdb-target\n";
+        let recipe = "binary = /tests/fixtures/programs/debugger\nargv = gdb-target --gdb-target\n";
         assert_eq!(
             recipe_binary_named(recipe, "gdb-target"),
-            Some("/programs/debugger")
+            Some("/tests/fixtures/programs/debugger")
         );
         assert_eq!(recipe_binary_named(recipe, "debugger"), None);
     }
@@ -395,7 +401,7 @@ mod tests
         let signer = signer(&dir.join("keys"), crate::arch::Arch::Riscv64);
         let services = dir.join("services");
         std::fs::create_dir_all(&services).unwrap();
-        let body = b"binary = /programs/debugger\nargv = gdb-target\n";
+        let body = b"binary = /tests/fixtures/programs/debugger\nargv = gdb-target\n";
         let recipe = signer
             .sign(
                 body,
@@ -406,7 +412,7 @@ mod tests
         std::fs::write(services.join("gdb-target.svc"), &recipe).unwrap();
         assert_eq!(
             recipe_binary_in(&services, "gdb-target").as_deref(),
-            Some("/programs/debugger")
+            Some("/tests/fixtures/programs/debugger")
         );
         assert_eq!(recipe_binary_in(&services, "debugger"), None);
         let _ = std::fs::remove_dir_all(&dir);

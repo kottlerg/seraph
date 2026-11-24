@@ -149,6 +149,7 @@ core/kernel/
     ├── initialization.md       # Boot-to-init sequence, phase by phase
     ├── syscalls.md             # Syscall ABI and complete syscall table
     ├── hot-path-account.md     # Instructions of each benchmarked path by function; ranked cuts
+    ├── hot-path-account-userspace.md # The same account of the ubench and fsbench paths
     ├── transient-execution.md  # x86-64 transient-execution table: classes, sources, rules
     ├── return-address-integrity.md # Kernel shadow stacks: threat model, options, direction
     ├── cross-boundary-disclosure.md # Kernel-pointer leak audit of outputs
@@ -260,7 +261,9 @@ disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-discl
 it records the accepted residual of the x86-64 descriptor-table registers on a CPU without
 UMIP. Where the instructions of the syscall, IPC and context-switch paths go, function by
 function, and the ranked cuts drawn from that are in
-[`docs/hot-path-account.md`](docs/hot-path-account.md).
+[`docs/hot-path-account.md`](docs/hot-path-account.md); the same account of the userspace
+benchmarks' paths, which cross the kernel and several processes, is in
+[`docs/hot-path-account-userspace.md`](docs/hot-path-account-userspace.md).
 
 ---
 

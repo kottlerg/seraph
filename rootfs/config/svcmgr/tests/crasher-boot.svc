@@ -1,4 +1,4 @@
-# /tests/crasher, boot-fault role — fixture for a service that dies before its
+# /tests/fixtures/crasher, boot-fault role — fixture for a service that dies before its
 # bootstrap request.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
@@ -13,7 +13,7 @@
 # token, so the first launch dies so, and svctest's svcmgr_boot_death phase
 # writes it again for a restart: svcmgr must route each such death under
 # `restart = on_failure`, so a later instance answers the phase.
-binary    = /tests/crasher
+binary    = /tests/fixtures/crasher
 argv      = crasher boot-fault
 restart   = on_failure
 critical  = no

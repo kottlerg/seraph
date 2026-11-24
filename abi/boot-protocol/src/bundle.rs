@@ -198,22 +198,34 @@ pub fn parse_header(bytes: &[u8]) -> Result<BundleHeader, BundleError>
     let (headers, _) = entries.as_chunks::<ENTRY_HEADER_SIZE>();
     for raw in headers
     {
-        let entry = read_entry_header(raw);
-        if !entry.offset.is_multiple_of(BODY_ALIGNMENT)
-        {
-            return Err(BundleError::EntryMisaligned);
-        }
-        let body_end = entry
-            .offset
-            .checked_add(entry.size)
-            .ok_or(BundleError::EntryOutOfBounds)?;
-        if body_end > bytes.len() as u64
-        {
-            return Err(BundleError::EntryOutOfBounds);
-        }
+        check_entry(&read_entry_header(raw), bytes.len())?;
     }
 
     Ok(header)
+}
+
+/// One step of [`parse_header`]'s walk of the entry headers: refuse `entry`
+/// when its `offset` is not a multiple of [`BODY_ALIGNMENT`]
+/// (`EntryMisaligned`) or its body `[offset, offset + size)` does not lie
+/// inside a bundle of `len` bytes (`EntryOutOfBounds`). The step reads
+/// one entry and the bundle's length alone and carries nothing to the next,
+/// so the bounded proofs prove it on any entry (docs/testing.md § Bounded
+/// verification, Parser proofs).
+pub(crate) fn check_entry(entry: &BundleEntryHeader, len: usize) -> Result<(), BundleError>
+{
+    if !entry.offset.is_multiple_of(BODY_ALIGNMENT)
+    {
+        return Err(BundleError::EntryMisaligned);
+    }
+    let body_end = entry
+        .offset
+        .checked_add(entry.size)
+        .ok_or(BundleError::EntryOutOfBounds)?;
+    if body_end > len as u64
+    {
+        return Err(BundleError::EntryOutOfBounds);
+    }
+    Ok(())
 }
 
 /// Read the file header (magic + version + `entry_count`) without validating
@@ -225,7 +237,27 @@ fn parse_file_header(bytes: &[u8]) -> Result<(BundleHeader, u32), BundleError>
     {
         return Err(BundleError::TooSmall);
     };
-    let [magic @ .., v0, v1, v2, v3, c0, c1, c2, c3] = *head;
+    // Bound byte by byte: Kani cannot model a sub-array binding
+    // (`magic @ ..`), which the bounded proofs below reach.
+    let [
+        m0,
+        m1,
+        m2,
+        m3,
+        m4,
+        m5,
+        m6,
+        m7,
+        v0,
+        v1,
+        v2,
+        v3,
+        c0,
+        c1,
+        c2,
+        c3,
+    ] = *head;
+    let magic = [m0, m1, m2, m3, m4, m5, m6, m7];
     if magic != MAGIC
     {
         return Err(BundleError::BadMagic);
@@ -251,7 +283,7 @@ fn parse_file_header(bytes: &[u8]) -> Result<(BundleHeader, u32), BundleError>
 pub fn read_entry_header(bytes: &[u8; ENTRY_HEADER_SIZE]) -> BundleEntryHeader
 {
     let [
-        name @ ..,
+        ..,
         o0,
         o1,
         o2,
@@ -269,6 +301,14 @@ pub fn read_entry_header(bytes: &[u8; ENTRY_HEADER_SIZE]) -> BundleEntryHeader
         s6,
         s7,
     ] = *bytes;
+    // The name is the header's first ENTRY_NAME_LEN bytes, which an
+    // ENTRY_HEADER_SIZE array always holds, so the fallback is never taken.
+    // It is read as a chunk because Kani cannot model a sub-array binding
+    // (`name @ ..`), which the bounded proofs below reach.
+    let name = bytes
+        .first_chunk::<ENTRY_NAME_LEN>()
+        .copied()
+        .unwrap_or([0; ENTRY_NAME_LEN]);
     BundleEntryHeader {
         name,
         offset: u64::from_le_bytes([o0, o1, o2, o3, o4, o5, o6, o7]),
@@ -494,5 +534,146 @@ mod tests
         let mut name = [0u8; ENTRY_NAME_LEN];
         name[..4].copy_from_slice(b"init");
         assert_eq!(name_str(&name), b"init");
+    }
+}
+
+/// Bounded proofs of the bundle parsers' contract (docs/testing.md § Bounded
+/// verification, Parser proofs).
+///
+/// Each proof runs one of the property's checks on every input up to its
+/// bound. [`parse_header`]'s walk of the entry headers is the one loop over
+/// input of any length, and each of its steps, [`check_entry`], reads one
+/// entry and the bundle's length alone and carries nothing to the next: the
+/// walk's state is only that no entry was refused yet, which it starts in.
+/// The step proof proves the step on any entry in a bundle of any length, so
+/// by induction the walk refuses at the first entry the step refuses, over a
+/// table of any length. The header proof runs the whole parse, file header,
+/// count bound and walk, on inputs of up to two entries, which reach the
+/// walk's start, a step after one that passed, and every refusal. What lies
+/// outside the proofs is the code that drives the steps and feeds them: the
+/// loop of `parse_header` over the `as_chunks` of the entry array, the loop
+/// that drives [`entry_at`] over every index, and the one that hands the
+/// property each index and each entry's name. The fuzz target
+/// `boot-protocol` and the replay of the checked-in inputs check them.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{BundleEntryHeader, ENTRY_HEADER_SIZE, ENTRY_NAME_LEN, HEADER_SIZE};
+    use crate::property;
+
+    /// The longest input the proofs read: the file header and two entry
+    /// headers.
+    const MAX_LEN: usize = HEADER_SIZE + 2 * ENTRY_HEADER_SIZE;
+
+    /// The header contract holds on the first `len` bytes of any
+    /// `MAX_LEN`-byte input, for every `len` up to it and so every
+    /// `entry_count` the slice can hold, with every offset and size: a body
+    /// aligned to `BODY_ALIGNMENT` lies inside such a slice only at offset 0,
+    /// and every other one is refused, so both outcomes of each entry's
+    /// checks are reached. The longest loops are the compare of the 8-byte
+    /// magic and the walk of at most two entries, so an unwind bound of 9
+    /// covers them.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_bundle_holds_the_header_contract()
+    {
+        let bytes: [u8; MAX_LEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_LEN);
+        property::header_holds(&bytes[..len]);
+    }
+
+    /// Step of the entry walk: [`super::check_entry`] keeps its contract on
+    /// any entry, of any offset and size, in a bundle of any length up to
+    /// `usize::MAX`. No loop.
+    #[kani::proof]
+    fn each_entry_the_walk_checks_holds_the_step_contract()
+    {
+        let entry = BundleEntryHeader {
+            name: kani::any(),
+            offset: kani::any(),
+            size: kani::any(),
+        };
+        property::entry_check_holds(&entry, kani::any());
+    }
+
+    /// The entry's place holds for entry `index` on the first `len` bytes of
+    /// any `MAX_LEN`-byte input, `len` up to it, with every count:
+    /// [`super::entry_at`] answers exactly when the index is listed and its
+    /// header lies whole in the slice, and reads the offset and size at that
+    /// header's place. The index is a constant of each harness below, so the
+    /// entry is read at a fixed offset, and each harness checks one index, so
+    /// no harness carries another index's state. The decode of the header's
+    /// bytes, its name among them, is the header-decode proof's, on any bytes;
+    /// `entry_at` hands that decode the one chunk whose offset and size words
+    /// this proof places. The longest loops are the compares of the 8-byte
+    /// magic, so an unwind bound of 9 covers every loop.
+    fn entry_place_holds_at(index: u32)
+    {
+        let bytes: [u8; MAX_LEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_LEN);
+        let _ = property::entry_place_holds(&bytes[..len], index);
+    }
+
+    /// An entry header decodes from any [`ENTRY_HEADER_SIZE`] bytes as its
+    /// layout says: the name its first `ENTRY_NAME_LEN` bytes, then the offset
+    /// and the size, little-endian. The longest loop is the check of the
+    /// 256-byte name at fixed indices, so an unwind bound of 257 covers it.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn every_entry_header_decodes_as_its_layout()
+    {
+        let raw: [u8; ENTRY_HEADER_SIZE] = kani::any();
+        property::entry_header_holds(&raw);
+    }
+
+    /// The entry's place holds for the first entry, at byte `HEADER_SIZE`.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn the_first_entry_holds_the_entry_contract()
+    {
+        entry_place_holds_at(0);
+    }
+
+    /// The entry's place holds for the second entry, after one the input
+    /// can hold whole.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn the_second_entry_holds_the_entry_contract()
+    {
+        entry_place_holds_at(1);
+    }
+
+    /// The entry's place holds for index 2, the first whose entry header
+    /// starts at or past byte `MAX_LEN`, the input's end. Every index from 2
+    /// up lies past the input, so this harness and the one of `u32::MAX`, the
+    /// last, stand for them.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn the_first_entry_past_the_input_holds_the_entry_contract()
+    {
+        entry_place_holds_at(2);
+    }
+
+    /// The entry's place holds for `u32::MAX`, the last index, whose offset
+    /// no `usize` arithmetic of the parser may wrap into the input.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn the_last_index_holds_the_entry_contract()
+    {
+        entry_place_holds_at(u32::MAX);
+    }
+
+    /// The name contract holds on every name: the trim stops at the first
+    /// NUL and keeps the whole name without one. The check is made at any
+    /// one index of the name, so it holds at each; the longest loop is the
+    /// trim's scan of the 256-byte name, so an unwind bound of 257 covers it.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn every_name_holds_the_name_contract()
+    {
+        let name: [u8; ENTRY_NAME_LEN] = kani::any();
+        property::name_holds_at(&name, kani::any());
     }
 }

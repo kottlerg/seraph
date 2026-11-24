@@ -1920,13 +1920,13 @@ thread outranks it. That is within the
 target's remaining time slice (at most the longest slice, 20 timer ticks, that of fair level 20;
 `TIME_SLICE_TICKS`, 10, for a target dispatched at an RT level; see
 [scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)), except when the
-slice expires while the target runs a preemption-disabled kernel section with interrupts
-enabled (a TLB-shootdown or drain spin, or a page-pool seeding or teardown window between
-batches, `interrupt_window`): `timer_tick` then refills the slice without rescheduling,
-and `preempt_enable` does not reschedule, so the stop completes at the first later slice-expiry
-tick with preemption enabled, a further slice later at the least, or at the target's next return
-to user mode when a thread queued on its CPU outranks it. Callers that need a bounded stop latency
-MUST budget a slice for each slice expiry the target can spend in such a section.
+slice expires while the target runs a preemption-disabled kernel section with interrupts enabled (a
+TLB-shootdown or drain spin, or a page-pool seeding, teardown, or explicit-placement pre-grow window
+between batches, `interrupt_window`): `timer_tick` then refills the slice without rescheduling, and
+`preempt_enable` does not reschedule, so the stop completes at the first later slice-expiry tick
+with preemption enabled, a further slice later at the least, or at the target's next return to user
+mode when a thread queued on its CPU outranks it. Callers that need a bounded stop latency MUST
+budget a slice for each slice expiry the target can spend in such a section.
 
 **Capability requirement:** `thread_cap` must have Control rights.
 
@@ -3267,7 +3267,8 @@ reuses.
 
 A high explicit `dst_slot` materialises every intermediate leaf page up to
 its own, drawn from the destination's slot-page pool (donor-funded, in
-bounded batches outside the heavyweight locks). When the pool cannot cover
+bounded batches outside the heavyweight locks, with interrupts taken between
+batches). When the pool cannot cover
 the required growth the call fails with `OutOfMemory` before consuming any
 pool page. Leaves grown for a placement that then fails — the target slot
 turns out to be occupied, or a concurrent pool consumer starves the final
@@ -3966,7 +3967,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `MAX_THREAD_MEM_COPY` | 4096 | Most bytes one `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM` or `SYS_THREAD_READ_EXT_REGS` copies |
 | `MAX_PAGE_RUNS` | 128 | Most runs one `SYS_THREAD_LIST_PAGES` writes |
 | `MAX_HARVEST_PAGES` | 4096 | Most pages one `SYS_ASPACE_HARVEST` reports |
-| `BOOT_PROTOCOL_VERSION` | 23 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 24 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
 [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs) crates, which are the

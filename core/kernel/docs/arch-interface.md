@@ -1194,8 +1194,10 @@ pub const HAS_SBI: bool;
 
 /// A thread's I/O Permission Bitmap as `IOPB_PARTS` page-sized parts
 /// (`IOPB_PART_BYTES` each) in separately allocated pages: two on x86-64, none on
-/// RISC-V. Types the `iopb` field in `ThreadControlBlock` uniformly.
-pub struct ThreadIopb { pub parts: [*mut [u8; IOPB_PART_BYTES]; IOPB_PARTS] }
+/// RISC-V, and the generation of their bytes, a kernel-wide version that every
+/// change of the bytes advances and that is never 0 or reused. Types the `iopb`
+/// field in `ThreadControlBlock` uniformly.
+pub struct ThreadIopb { pub parts: [*mut [u8; IOPB_PART_BYTES]; IOPB_PARTS], pub generation: u64 }
 pub const IOPB_PART_BYTES: usize;
 pub const IOPB_PARTS: usize;
 
@@ -1225,8 +1227,10 @@ MMIO_DIRECT_MAP_REGIONS}`,
 of those modules is arch-private:
 
 ```rust
-/// Load a thread's IOPB into the TSS, part by part, or clear it (x86-64); no-op on
-/// RISC-V.
+/// Make the TSS run a thread's IOPB (x86-64): `Some` copies its parts unless this
+/// CPU's TSS already holds them at their generation, and makes the bitmap live;
+/// `None`, a thread without port bindings, places the bitmap offset past the TSS
+/// limit, denying every port, and writes no byte. No-op on RISC-V.
 pub unsafe fn gdt::load_iopb(iopb: Option<&ThreadIopb>);
 /// Permit the ports of a range that one part of a thread's IOPB covers, the part's
 /// first bit being port `first_port` (x86-64); no-op on RISC-V.

@@ -13,10 +13,11 @@
 //! rule of § Style stays with the reader: it needs no precise definition to
 //! be followed, and a script would need one.
 //! `pr-check` adds the pull request: § PR-body checklist discipline (unticked
-//! boxes, the validated head and its delta), § Milestones, the Issues the
-//! body closes or references, and, with `--gate`, the merge gate (check
-//! rollup, merge state, `master` included or its change disjoint from the
-//! PR's files, and a passing review record for the head).
+//! boxes, the validated head and its delta), § Milestones, tool output in the
+//! body (§ Style), the Issues the body closes or references, and, with
+//! `--gate`, the merge gate (check rollup, merge state, `master` included or
+//! its change disjoint from the PR's files, and a passing review record for
+//! the head).
 //!
 //! What needs judgment stays with the pre-merge review: whether the body's
 //! claims match the diff, whether an acceptance item is delivered, and which
@@ -33,6 +34,7 @@ use crate::commands::review;
 use crate::context::Context as BuildContext;
 use crate::diag::{Diag, Strictness, report};
 use crate::gh;
+use crate::markdown::marked_lines;
 use crate::regex::Regex;
 use crate::tasklist::{TaskItem, task_item};
 use crate::util::{run_cmd_capture, step};
@@ -506,6 +508,132 @@ pub fn run_commit_check(ctx: &BuildContext, args: &CommitCheckArgs) -> Result<()
     )
 }
 
+// ── Tool output ───────────────────────────────────────────────────────────────
+
+/// A line of tool output that a body carries: what a command prints on
+/// stderr for its user, which an author did not write and which reaches a
+/// body when a read merges stderr into the text written back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolOutput
+{
+    /// An advice line: `hint:` at column 0, the prefix `gh` and `git` print
+    /// their advice under.
+    Hint,
+    /// A `gh event listen` command on its own line, as the hint block `gh`
+    /// prints after reading a pull request suggests it.
+    EventListen,
+    /// A line of a hint block: an indented, non-blank line after a `hint:`
+    /// line, a `gh event listen` line, or another line of its block, as `gh`
+    /// indents the lines of its advice under the `hint:` line.
+    HintBlock,
+    /// A cargo status line: one of [`CARGO_STATUS_VERBS`], indented so that
+    /// it ends at column [`CARGO_STATUS_COLUMN`], then a space
+    /// (`    Finished `, `     Running `).
+    CargoStatus,
+}
+
+/// The column at which cargo's status lines end their verb.
+const CARGO_STATUS_COLUMN: usize = 12;
+
+/// The verbs cargo's status lines open with, of those a build, a run, or a
+/// test prints.
+const CARGO_STATUS_VERBS: &[&str] = &[
+    "Adding",
+    "Blocking",
+    "Building",
+    "Checking",
+    "Compiling",
+    "Documenting",
+    "Downloaded",
+    "Downloading",
+    "Finished",
+    "Fresh",
+    "Installing",
+    "Locking",
+    "Removing",
+    "Running",
+    "Updating",
+    "Waiting",
+];
+
+impl ToolOutput
+{
+    /// What the line is, for a diagnostic.
+    pub fn describe(self) -> &'static str
+    {
+        match self
+        {
+            ToolOutput::Hint => "a `hint:` advice line, as `gh` and `git` print on stderr",
+            ToolOutput::EventListen =>
+            {
+                "the `gh event listen` command of the hint block `gh` prints on stderr"
+            }
+            ToolOutput::HintBlock =>
+            {
+                "a line of the advice block a `hint:` line opens, as `gh` prints on stderr"
+            }
+            ToolOutput::CargoStatus => "a cargo status line, as cargo prints on stderr",
+        }
+    }
+
+    /// The kind of tool output `line` is, if it is one.
+    fn of(line: &str) -> Option<ToolOutput>
+    {
+        if line.starts_with("hint:")
+        {
+            return Some(ToolOutput::Hint);
+        }
+        let text = line.trim_start();
+        if text
+            .strip_prefix("gh event listen")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            return Some(ToolOutput::EventListen);
+        }
+        let indent = line.len().saturating_sub(text.len());
+        let (word, _) = text.split_once(' ')?;
+        let spaces = line
+            .get(..indent)
+            .is_some_and(|s| s.bytes().all(|b| b == b' '));
+        (spaces
+            && CARGO_STATUS_VERBS.contains(&word)
+            && indent.saturating_add(word.len()) == CARGO_STATUS_COLUMN)
+            .then_some(ToolOutput::CargoStatus)
+    }
+}
+
+/// The lines of `text` that are tool output, each with its one-based number
+/// and its kind. A `hint:` line or a `gh event listen` line counts with its
+/// block: every indented, non-blank line after it up to a blank line or a
+/// line at column 0, so that the diagnostics name every line of the advice
+/// at once, and the block's lines stay named while either line remains. A
+/// line inside a fenced code block is not counted: a body may quote tool
+/// output there. An indented code block is read as prose, since the lines of
+/// `gh`'s hint block are indented as one.
+pub fn tool_output_lines(text: &str) -> Vec<(usize, ToolOutput)>
+{
+    let mut in_block = false;
+    let mut out = Vec::new();
+    for (index, line, prose) in marked_lines(text)
+    {
+        let continues = in_block && prose && line.starts_with(char::is_whitespace);
+        let kind = if prose { ToolOutput::of(line) } else { None };
+        let kind = match kind
+        {
+            Some(kind) => Some(kind),
+            None if continues && !line.trim().is_empty() => Some(ToolOutput::HintBlock),
+            None => None,
+        };
+        in_block = matches!(kind, Some(ToolOutput::Hint | ToolOutput::EventListen))
+            || (continues && kind.is_some());
+        if let Some(kind) = kind
+        {
+            out.push((index.saturating_add(1), kind));
+        }
+    }
+    out
+}
+
 // ── PR body ───────────────────────────────────────────────────────────────────
 
 /// The lines of the section `heading` opens (a `## ` line), up to the next
@@ -535,8 +663,8 @@ pub fn validated_head_candidates(pat: &Patterns, body: &str) -> Vec<String>
         .collect()
 }
 
-/// Check the PR body's own text: unticked boxes, attribution, and that the
-/// `## Validation` section could name a validated head.
+/// Check the PR body's own text: unticked boxes, attribution, tool output,
+/// and that the `## Validation` section could name a validated head.
 pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
 {
     let mut out = Vec::new();
@@ -560,6 +688,18 @@ pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
             "pr-attribution",
             "body",
             "the body carries a tool attribution line or a session link",
+        ));
+    }
+    for (line, kind) in tool_output_lines(body)
+    {
+        out.push(Diag::error(
+            "pr-tool-output",
+            format!("body:{line}"),
+            format!(
+                "this line is {}, which no author wrote; remove the tool output, or quote it in \
+                 a fenced code block",
+                kind.describe()
+            ),
         ));
     }
     out.extend(check_body_closing(pat, body));
@@ -1492,6 +1632,26 @@ pub fn check_referenced_issue(issue: &Issue, pr: u64) -> Vec<Diag>
         .collect()
 }
 
+/// Check the body of an Issue the PR closes or references: it carries no
+/// tool output.
+pub fn check_issue_body(issue: &Issue) -> Vec<Diag>
+{
+    tool_output_lines(&issue.body)
+        .into_iter()
+        .map(|(line, kind)| {
+            Diag::error(
+                "issue-tool-output",
+                format!("#{}", issue.number),
+                format!(
+                    "line {line} of the body is {}, which no author wrote; remove it with \
+                     `cargo xtask issue-edit`",
+                    kind.describe()
+                ),
+            )
+        })
+        .collect()
+}
+
 fn issue_from(value: &Value) -> Issue
 {
     Issue {
@@ -1561,7 +1721,7 @@ fn this_repository(root: &Path) -> Result<String>
 }
 
 /// Check the Issues the PR closes, by its body or by a commit message, and
-/// the ones its body references with `Refs`.
+/// the ones its body references with `Refs`, the bodies of both included.
 fn check_issues(
     pat: &Patterns,
     root: &Path,
@@ -1629,11 +1789,13 @@ fn check_issues(
     {
         out.extend(check_closed_issue(issue, current.as_deref()));
         out.extend(check_referenced_issue(issue, pr));
+        out.extend(check_issue_body(issue));
     }
     for issue in &referenced_issues
     {
         out.extend(check_rolling_issue(issue, current.as_deref()));
         out.extend(check_referenced_issue(issue, pr));
+        out.extend(check_issue_body(issue));
     }
     Ok(out)
 }
@@ -3629,6 +3791,180 @@ mod tests
         assert_eq!(
             rules(&check_base_fresh("origin/master", "abc", "def")),
             ["gate-base-fresh"]
+        );
+    }
+
+    /// The leading lines of the five PR bodies that carried `gh` 2.105's
+    /// hint block, as each body's edit history on GitHub holds them: the
+    /// block, then the body's own first lines.
+    const HINT_BODIES: [(u64, &str); 5] = [
+        (1446, include_str!("pr_check/tool-output/pr1446.txt")),
+        (1562, include_str!("pr_check/tool-output/pr1562.txt")),
+        (1568, include_str!("pr_check/tool-output/pr1568.txt")),
+        (1574, include_str!("pr_check/tool-output/pr1574.txt")),
+        (1581, include_str!("pr_check/tool-output/pr1581.txt")),
+    ];
+
+    /// Where the `pr-tool-output` errors of `body` stand.
+    fn tool_output_errors(body: &str) -> Vec<String>
+    {
+        check_body(&pat(), body)
+            .iter()
+            .filter(|d| d.rule == "pr-tool-output")
+            .map(|d| d.at.clone())
+            .collect()
+    }
+
+    #[test]
+    fn each_body_that_carried_the_gh_hint_block_fails_at_its_lines()
+    {
+        for (pr, fixture) in HINT_BODIES
+        {
+            assert!(fixture.starts_with("hint: "), "#{pr}");
+            assert!(fixture.contains(&format!("/pull/{pr} ")), "#{pr}");
+            let block: Vec<(usize, ToolOutput)> =
+                (3..=8).map(|line| (line, ToolOutput::HintBlock)).collect();
+            let mut expected = vec![(1, ToolOutput::Hint), (2, ToolOutput::EventListen)];
+            expected.extend(block);
+            assert_eq!(tool_output_lines(fixture), expected, "#{pr}");
+            let at: Vec<String> = (1..=8).map(|line| format!("body:{line}")).collect();
+            assert_eq!(tool_output_errors(fixture), at, "#{pr}");
+        }
+    }
+
+    #[test]
+    fn the_hint_block_fails_anywhere_in_the_body()
+    {
+        let (_, fixture) = HINT_BODIES[0];
+        let body = format!("{BODY}{fixture}");
+        let first = BODY.lines().count().saturating_add(1);
+        let at: Vec<String> = (first..first.saturating_add(8))
+            .map(|line| format!("body:{line}"))
+            .collect();
+        assert_eq!(tool_output_errors(&body), at);
+        assert_eq!(tool_output_errors(BODY), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_hint_block_quoted_in_a_fence_passes()
+    {
+        let (_, fixture) = HINT_BODIES[2];
+        for fence in ["```", "~~~", "```text"]
+        {
+            let close = &fence[..3];
+            let body = format!("{BODY}{fence}\n{fixture}{close}\n");
+            assert!(tool_output_errors(&body).is_empty(), "{fence}");
+        }
+        // An unclosed fence holds the rest of the body.
+        assert_eq!(
+            tool_output_errors(&format!("{BODY}```\n{fixture}")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn each_line_of_the_class_fails_alone_and_prose_about_it_passes()
+    {
+        let failing = [
+            (
+                "hint: Updates were rejected because the remote contains work",
+                ToolOutput::Hint,
+            ),
+            ("hint:", ToolOutput::Hint),
+            (
+                "gh event listen --resource https://github.com/o/r/pull/7",
+                ToolOutput::EventListen,
+            ),
+            ("\tgh event listen", ToolOutput::EventListen),
+            (
+                "    Finished `dev` profile [optimized] target(s) in 0.03s",
+                ToolOutput::CargoStatus,
+            ),
+            (
+                "     Running `target/debug/xtask orch state`",
+                ToolOutput::CargoStatus,
+            ),
+            (
+                "   Compiling xtask v0.1.0 (/src/xtask)",
+                ToolOutput::CargoStatus,
+            ),
+        ];
+        for (line, kind) in failing
+        {
+            assert_eq!(tool_output_lines(line), [(1, kind)], "{line:?}");
+        }
+        let passing = [
+            " hint: an indented hint is prose",
+            "- hint: a list item is prose",
+            "Hint: capitalized",
+            "A hint: in a sentence",
+            "Wait with `gh event listen --resource <url>` instead of polling.",
+            "- `gh event listen` waits for one event",
+            "gh event listener",
+            "Finished `dev` profile, at column 0",
+            "  Finished at two columns",
+            "    Requires the verb set",
+            "    Running at four columns, one short of cargo's",
+        ];
+        for line in passing
+        {
+            assert!(tool_output_lines(line).is_empty(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn an_issue_body_with_tool_output_fails_naming_the_line()
+    {
+        let (_, fixture) = HINT_BODIES[3];
+        let issue = Issue {
+            number: 9,
+            body: format!("## Summary\nText.\n{fixture}"),
+            ..Issue::default()
+        };
+        let found = check_issue_body(&issue);
+        assert_eq!(rules(&found), ["issue-tool-output"; 8]);
+        assert!(found.iter().all(|d| d.at == "#9"));
+        assert!(
+            found[0].message.starts_with("line 3 "),
+            "{}",
+            found[0].message
+        );
+        assert!(
+            found[7].message.starts_with("line 10 "),
+            "{}",
+            found[7].message
+        );
+        let clean = Issue {
+            body: BODY.to_owned(),
+            ..issue
+        };
+        assert_eq!(rules(&check_issue_body(&clean)), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_hint_block_counts_to_its_end_and_no_further()
+    {
+        // Every line of the block is named at once, and up to its end.
+        let (_, fixture) = HINT_BODIES[1];
+        let lines: Vec<(usize, ToolOutput)> = tool_output_lines(fixture);
+        assert_eq!(lines.len(), 8);
+        assert!(lines.iter().all(|(line, _)| *line <= 8), "{lines:?}");
+        // A body that removed the `hint:` line alone still fails at every
+        // line left of the block: the command line opens it too.
+        let trimmed: String = fixture.lines().skip(1).flat_map(|l| [l, "\n"]).collect();
+        let mut expected = vec![(1, ToolOutput::EventListen)];
+        expected.extend((2..=7).map(|line| (line, ToolOutput::HintBlock)));
+        assert_eq!(tool_output_lines(&trimmed), expected);
+        // The block ends at a blank line: an indented line after it is prose.
+        let text = "hint: advice\n  - more advice\n\n  an indented paragraph\n";
+        assert_eq!(
+            tool_output_lines(text),
+            [(1, ToolOutput::Hint), (2, ToolOutput::HintBlock)]
+        );
+        // Indented lines with no `hint:` line before them are prose.
+        assert_eq!(
+            tool_output_lines("Text.\n  - an item's continuation\n"),
+            Vec::<(usize, ToolOutput)>::new()
         );
     }
 }

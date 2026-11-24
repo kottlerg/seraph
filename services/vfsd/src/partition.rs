@@ -14,7 +14,7 @@
 //! its device sits,
 //! allocating a scratch page, moving a Memory cap to the block driver and
 //! back, and copying the returned sector — and delegates every decode of the
-//! (untrusted) on-disk GPT structures, and the role lookup across disks, to
+//! (untrusted) on-disk GPT structures, and the role resolution, to
 //! the host-tested [`gpt`] crate.
 //!
 //! Block reads use [`BLK_READ_INTO_MEMORY`](ipc::blk_labels::BLK_READ_INTO_MEMORY):
@@ -183,8 +183,8 @@ impl Discovery
     /// devmgr served and withdrew, is skipped: devmgr keeps the ordinals after
     /// it, so no live disk is missed. The ordinal counts drivers in the order
     /// devmgr served them and is not stable across boots, so it carries no
-    /// meaning beyond this boot's log lines and [`probe`]; role discovery
-    /// never breaks a tie on it (`gpt::lookup_partition_by_type_guid`). A
+    /// meaning beyond this boot's log lines and [`probe`]; no role
+    /// resolution reads it (`resolve_role` in main.rs). A
     /// disk whose GPT cannot be parsed is held with no partitions. An
     /// allocation failure for the list stops the run with a log, keeping the
     /// disks found before it; the next run starts at the disk it dropped.

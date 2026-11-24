@@ -35,9 +35,9 @@ use syscall_abi::PAGE_SIZE;
 use crate::bootstrap::Caps;
 use crate::phases::heap_commit::{
     CHUNK_PAGES, HOG_BALLAST_BYTES, HOG_BALLAST_FAILED, HOG_MARGIN_PAGES, HOG_MAX_ROUNDS,
-    HOG_NOT_COMMITTED, HOG_STATUS_FAILED, POOL_POLLS, POOL_WINDOWS, children_reclaimed,
-    commit_to_margin, expect_region_reply, memmgr_label, own_usage, pool_totals, touch_committed,
-    windows_settle,
+    HOG_NOT_COMMITTED, HOG_PAST_FRAMES, HOG_STATUS_FAILED, POOL_POLLS, POOL_WINDOWS,
+    children_reclaimed, commit_to_margin, expect_region_reply, memmgr_label, own_usage,
+    pool_totals, touch_committed, windows_settle,
 };
 use crate::runner::Phase;
 
@@ -125,7 +125,8 @@ fn discard_range_phase(caps: &Caps)
             "the discard hog",
             &format!(
                 "{HOG_STATUS_FAILED}=QUERY_POOL_STATUS failed, {HOG_NOT_COMMITTED}=it did not \
-                 commit down to its margin, {HOG_BALLAST_FAILED}=its ballast's allocation failed, \
+                 commit down to its margin, {HOG_PAST_FRAMES}=its commitment ran past the free \
+                 frames, {HOG_BALLAST_FAILED}=its ballast's allocation failed, \
                  {HOG_REGION_FAILED}=its region's registration failed, {HOG_DISCARD_FAILED}=its \
                  discard was refused, {HOG_NOT_ZERO}=a refaulted page read other than zero, a \
                  fault=the refault of a discarded committed page was declined"

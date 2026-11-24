@@ -548,13 +548,13 @@ contiguous bytes across the boundary.
 
 ### Measured per-call cost (`fsbench`, debug builds)
 
-Source: [programs/fsbench/README.md](../../../programs/fsbench/README.md), which owns the
+Source: [services/fixtures/fsbench/README.md](../../fixtures/fsbench/README.md), which owns the
 method. The full benchmark (`fsbench` with no iteration argument) loops 256 timed
 iterations of "seek to 0; read N bytes via the chosen path" against a 64 KiB fixture
 (`/data/svctest/bench.bin`); the per-path buffer sizes and cycle sources are in that
-README's [§ Method](../../../programs/fsbench/README.md#method). Numbers below are the mean
+README's [§ Method](../../fixtures/fsbench/README.md#method). Numbers below are the mean
 cycles of the timed iterations of one size and path; `fsbench` reports their percentiles
-([§ Output](../../../programs/fsbench/README.md#output)).
+([§ Output](../../fixtures/fsbench/README.md#output)).
 
 **x86_64 (KVM-accelerated, TSC = hardware cycles)**
 
@@ -1162,8 +1162,8 @@ destruction of a driver that an unmount found still running
 ## Summarized By
 
 [Namespace Model](../../../docs/namespace-model.md), [Storage](../../../docs/storage.md),
-[programs/fsbench/README.md](../../../programs/fsbench/README.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
+[services/fixtures/fsbench/README.md](../../fixtures/fsbench/README.md),
 [services/fs/README.md](../README.md), [services/fs/fat/README.md](../fat/README.md),
 [services/vfsd/README.md](../../vfsd/README.md),
 [vfsd Service Interface](../../vfsd/docs/vfs-ipc-interface.md)

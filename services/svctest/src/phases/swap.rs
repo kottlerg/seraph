@@ -39,8 +39,13 @@
 //! * the child reads every page of both regions, and its threads read their
 //!   arrays, while the hog still holds the level;
 //! * a snapshot (procmgr's `SNAPSHOT`) taken while chunks of the main region are
-//!   evicted, with the hog giving back more than the region's pages, is complete
-//!   and holds every page's pattern but the hole chunk's.
+//!   evicted is complete and holds every page's pattern but the hole chunk's.
+//!   procmgr seals a capture from at most 63 grants, which memmgr serves from
+//!   its largest free runs (docs/limits.md), and the runs the hog holds after
+//!   eviction and restores can be too small for that, so the phase takes a room
+//!   of the region's pages and the capture's other pages before the hog, while
+//!   memmgr still serves it from its largest runs, and gives it back right
+//!   before the snapshot.
 //!
 //! After the hog's grants are released and the child has exited, the phase
 //! makes every process resident, and requires the store and the swapped total
@@ -181,6 +186,17 @@ const GRANT_CAPS_MAX: u64 = syscall_abi::CSPACE_IPC_RECV_RESERVE;
 /// cannot hold a grant's caps: a grant then would take the receive reserve the
 /// next top-up's reply needs. memmgr replies no such label.
 const HOLD_REFUSED: u64 = u64::MAX - 1;
+/// Pages the snapshot's room ([`take_room`]) holds beyond the fixture's main
+/// region: the capture's other pages (the fixture's heap, stacks and no-evict
+/// region) and the snapshot object's layout.
+const ROOM_EXTRA_PAGES: u64 = 1024;
+/// Grants the snapshot's room may take at most: one seal names at most
+/// `SEAL_OBJECT_MAX_GRANTS`, the layout's grant among them.
+const ROOM_GRANTS_MAX: u64 = memmgr_labels::SEAL_OBJECT_MAX_GRANTS - 1;
+/// Grants the room's list has room for: [`ROOM_GRANTS_MAX`] and the caps of
+/// one more reply, so that [`take_room`] records every grant of the reply
+/// that takes the room past its bound before it fails the phase.
+const ROOM_LIST_GRANTS: u64 = ROOM_GRANTS_MAX + GRANT_CAPS_MAX;
 /// Grant region ids one `RELEASE_MEMORY_CAPS` of the hog's release names.
 const RELEASE_BATCH: usize = 32;
 /// How often the hog looks at the level once it holds it.
@@ -440,10 +456,16 @@ impl Hog
     /// An empty hog whose list has room for [`HOG_MAX_GRANTS`] grants.
     pub(super) fn new() -> Self
     {
+        Self::with_capacity(HOG_MAX_GRANTS)
+    }
+
+    /// An empty hog whose list has room for `capacity` grants.
+    fn with_capacity(capacity: usize) -> Self
+    {
         let mut grants = Vec::new();
         grants
-            .try_reserve_exact(HOG_MAX_GRANTS)
-            .unwrap_or_else(|e| panic!("{PHASE}: the hog's list of {HOG_MAX_GRANTS}: {e}"));
+            .try_reserve_exact(capacity)
+            .unwrap_or_else(|e| panic!("{PHASE}: the hog's list of {capacity}: {e}"));
         Self {
             grants,
             pages: 0,
@@ -488,7 +510,8 @@ impl Hog
             .unwrap_or_else(|| panic!("{PHASE}: a REQUEST_MEMORY_CAPS reply of no grant layout"));
         assert!(
             self.grants.len().saturating_add(reply.caps().len()) <= self.grants.capacity(),
-            "{PHASE}: the hog's list of {HOG_MAX_GRANTS} grants is full"
+            "{PHASE}: the hog's list of {} grants is full",
+            self.grants.capacity()
         );
         for ((&cap, &count), &id) in reply.caps().iter().zip(counts).zip(ids)
         {
@@ -523,17 +546,6 @@ impl Hog
         self.pages = self.pages.saturating_sub(count);
     }
 
-    /// Return grants, last first, until at least `pages` pages are returned or
-    /// none is left.
-    pub(super) fn release_pages(&mut self, pages: u64)
-    {
-        let target = self.pages.saturating_sub(pages);
-        while self.pages > target && !self.grants.is_empty()
-        {
-            self.release_one();
-        }
-    }
-
     /// Return every grant: delete the caps, then release the regions in
     /// batches of [`RELEASE_BATCH`].
     pub(super) fn release_all(&mut self)
@@ -543,12 +555,21 @@ impl Hog
             syscall::cap_delete(cap)
                 .unwrap_or_else(|e| panic!("{PHASE}: deleting a hog grant's cap failed ({e})"));
         }
+        // The pool can stand at the floor until the grants are returned, so
+        // the batch is built on the stack: a heap allocation could fault a
+        // new page memmgr declines there.
+        let mut words = [0u64; RELEASE_BATCH + 1];
         for batch in self.grants.chunks(RELEASE_BATCH)
         {
-            let mut words = vec![u64::try_from(batch.len()).unwrap_or(0)];
-            words.extend(batch.iter().map(|&(_, id, _)| id));
+            let fields = core::iter::once(u64::try_from(batch.len()).unwrap_or(0))
+                .chain(batch.iter().map(|&(_, id, _)| id));
+            for (w, v) in words.iter_mut().zip(fields)
+            {
+                *w = v;
+            }
+            let used = words.get(..=batch.len()).unwrap_or(&words);
             let req = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS)
-                .words(0, &words)
+                .words(0, used)
                 .build();
             let reply = memmgr_call(&req, "RELEASE_MEMORY_CAPS");
             assert_eq!(
@@ -1187,8 +1208,10 @@ fn swap_phase(caps: &Caps)
     let authority = caps.debug_authority;
     assert_ne!(authority, 0, "{PHASE}: no debug authority");
 
-    // The hog's list is made before the baseline, so it is not a change of it.
+    // The hog's list is made before the baseline, so it is not a change of it,
+    // and so is the snapshot's room's.
     let mut hog = Hog::new();
+    let mut room = Hog::with_capacity(usize::try_from(ROOM_LIST_GRANTS).unwrap_or(usize::MAX));
     // An earlier phase that took the level to `LOW` may have had memmgr evict
     // chunks of any process: make them resident first, so the store starts
     // empty.
@@ -1200,6 +1223,11 @@ fn swap_phase(caps: &Caps)
     let thread = *threads.first().expect("the attach returned a thread");
     read_before_hog(thread, &ready);
     let logd = read_stack(authority, LOGD_NAME, "logd");
+    let room_pages = ready
+        .chunks
+        .saturating_mul(CHUNK_PAGES)
+        .saturating_add(ROOM_EXTRA_PAGES);
+    take_room(&mut room, room_pages);
 
     hog.fill_to_low();
     // A restore from the headroom of at most the reserve takes nearly a chunk
@@ -1214,15 +1242,11 @@ fn swap_phase(caps: &Caps)
     require_stack(authority, &logd, "logd");
 
     // A snapshot taken while chunks of the main region are evicted holds every
-    // page's pattern.
+    // page's pattern. The room goes back for its frames.
     let mut from = 0;
     let evicted = next_evicted(thread, &ready, &mut from);
-    hog.release_pages(
-        ready
-            .chunks
-            .saturating_mul(CHUNK_PAGES)
-            .saturating_add(1024),
-    );
+    let room_grants = room.grants.len();
+    room.release_all();
     // The snapshot's grants take the level back toward `LOW`, so the clock
     // may evict the fixture's chunks while procmgr holds it: memmgr supplies
     // each chunk wherever it is.
@@ -1232,7 +1256,8 @@ fn swap_phase(caps: &Caps)
     hog.fill_to_low();
     std::os::seraph::log!(
         "{PHASE}: snapshot complete with the chunk at {evicted:#x} of the main region evicted, \
-         {during} evictions begun during it"
+         {during} evictions begun during it, its frames from a room of {room_pages} pages in \
+         {room_grants} grants"
     );
 
     // The fixture reads everything while the hog holds the level.
@@ -1321,6 +1346,38 @@ pub(super) fn start_fixture(authority: u64, main_pages: u64, fill: Fill) -> (Fix
     let ready = parse_ready(&line);
     let process = spawned_badge(authority, &before, PHASE);
     (fixture, ready, process)
+}
+
+/// Take the snapshot's room of `pages` pages into `room`, before the hog.
+/// memmgr serves a grant from the smallest free run that covers it, or else
+/// from its largest runs first (services/memmgr/docs/memory-pool.md
+/// § Allocation), and serves the capture's frames the same way once the room
+/// is given back. Taken while the pool is still nearly free, the room holds runs the
+/// capture can be sealed from; one in more than [`ROOM_GRANTS_MAX`] grants
+/// means the pool's largest runs cannot hold a capture of its size, which
+/// fails the phase here rather than at the snapshot.
+fn take_room(room: &mut Hog, pages: u64)
+{
+    while room.pages < pages
+    {
+        assert!(
+            room.take(pages.saturating_sub(room.pages)),
+            "{PHASE}: the snapshot's room of {pages} pages refused with {} pages held: label \
+             {:#x}, words {:?}",
+            room.pages,
+            room.refusal.0,
+            room.refusal.1
+        );
+        // Checked after each reply, which adds at most `GRANT_CAPS_MAX`
+        // grants, so the list's room for one more reply is never passed.
+        let grants = u64::try_from(room.grants.len()).unwrap_or(u64::MAX);
+        assert!(
+            grants <= ROOM_GRANTS_MAX,
+            "{PHASE}: the snapshot's room of {pages} pages took {grants} grants with {} pages \
+             held, more than the {ROOM_GRANTS_MAX} a capture can be sealed from beside its layout",
+            room.pages
+        );
+    }
 }
 
 /// Read, with no pressure on memmgr, the first page of the first, the third,

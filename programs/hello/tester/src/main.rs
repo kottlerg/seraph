@@ -26,7 +26,7 @@ const EXPECTED_LINE: &str = "hello from seraph userspace";
 
 /// A service image a program may not start: the restart-path fixture,
 /// which only crashes if it does start.
-const SERVICE_IMAGE: &str = "/tests/crasher";
+const SERVICE_IMAGE: &str = "/tests/fixtures/crasher";
 
 fn main()
 {

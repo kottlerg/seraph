@@ -3,13 +3,13 @@
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan. The
 # usertest boot stages it over /config/svcmgr/services/crashd.svc, so the
 # crashme tester finds a core of each faulting mode in /crash
-# (programs/crashme/README.md). See docs/testing.md.
+# (services/fixtures/crashme/README.md). See docs/testing.md.
 #
 # The same recipe as services/crashd.svc, `reserve = yes` and the `crashd.core`
 # name included, but for `CORE_DUMP`, which names
 # crashme, and `CRASHD_OOM_STALL_MS`, which holds a fault memmgr declined for
 # want of memory for up to 3000 ms: the crashme tester's `oom-touch` case
-# (programs/crashme/README.md) reads that stall.
+# (services/fixtures/crashme/README.md) reads that stall.
 binary          = /services/crashd
 priority        = 20
 restart         = on_failure

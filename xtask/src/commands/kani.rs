@@ -7,50 +7,81 @@
 //! (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned
 //! Kani release (docs/testing.md § Bounded verification).
 //!
-//! The command checks that every crate holding a harness is in [`HARNESSED`],
-//! checks `cargo kani --version` against [`KANI_VERSION`], then runs
+//! The command finds every crate holding a harness ([`harnessed`]), checks
+//! `cargo kani --version` against [`KANI_VERSION`], then runs
 //! `cargo kani --tests -p <package>` for each selected crate, which builds it in
 //! the host test configuration. It streams Kani's output and judges each
 //! harness's checks itself as well as Kani's verdict ([`Judge`]), so that an
-//! undetermined check fails the run whatever verdict Kani gives.
+//! undetermined check fails the run whatever verdict Kani gives. Every
+//! process of the run is held to [`MEMORY_LIMIT_GIB`] of address space, so a
+//! harness too large for CI's runner fails by name instead of taking the
+//! runner down, and the run closes with every harness's verdict and time. A
+//! harness whose verification takes longer than [`BUDGET_SECONDS`] fails on
+//! a CI runner and is warned of elsewhere. With `--since`, the run verifies
+//! only the crates the change from a base commit can affect ([`affected`]).
 
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::affected::{self, Input, Workspace};
 use crate::cli::KaniArgs;
 use crate::context::Context as BuildContext;
 use crate::error::{Context, Result, bail, err};
+use crate::host_lock::on_ci_runner;
 use crate::util::step;
+
+/// The inputs of every crate's verification beside the workspace's
+/// ([`affected::WORKSPACE_WIDE`]): this command, which holds the Kani pin,
+/// the memory limit and the judge of Kani's output, the selection it makes,
+/// and the job that installs the pinned release and runs it, whose install
+/// steps an empty selection skips.
+const KANI_INPUTS: &[&str] = &[
+    "xtask/src/commands/kani.rs",
+    "xtask/src/affected.rs",
+    ".github/workflows/build-test.yml",
+];
 
 /// The Kani release every run uses (docs/build-system.md § Toolchain). A
 /// toolchain bump moves it to the newest release that builds the harnessed
 /// crates.
 pub const KANI_VERSION: &str = "0.68.0";
 
-/// A crate whose proof harnesses the command runs.
+/// The address space, in GiB, each process of a run may map: `cargo`, the
+/// Kani compiler, and each harness's CBMC, which Kani runs one at a time.
+/// Derived from the runner CI's `kani` job runs on (`ubuntu-latest` for a
+/// public repository: 4 vCPUs, 16 GB): a harness gets 12 GiB, and the other
+/// 4 GB stay with the runner's own processes, so a harness that needs more
+/// fails with an out-of-memory error, which [`Judge`] reports by name, where
+/// without the limit the runner is shut down and the job reports nothing.
+const MEMORY_LIMIT_GIB: u64 = 12;
+
+/// The longest verification time, in seconds, a harness may take on CI's
+/// runner (docs/testing.md § Bounded verification): Kani's `Verification
+/// Time` for it, which leaves out the build. A harness over it fails on a CI
+/// runner; on another host, whose speed differs, the run warns of it.
+const BUDGET_SECONDS: f64 = 120.0;
+
+/// What a run does with a harness over [`BUDGET_SECONDS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Budget
+{
+    /// Fail it: the run is on CI's runner, which the budget is set for.
+    Enforce,
+    /// Warn of it: the run is on another host.
+    Warn,
+}
+
+/// A crate whose proof harnesses the command runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Harnessed
 {
     /// Its package name, which `cargo kani -p` takes.
-    package: &'static str,
+    package: String,
     /// Its directory, relative to the workspace root.
-    dir: &'static str,
+    dir: String,
 }
-
-/// Every crate that holds a proof harness. A crate gains its entry in the
-/// change that adds its first harness; the command fails while a harness lies
-/// in a crate not listed here ([`unregistered`]).
-const HARNESSED: &[Harnessed] = &[
-    Harnessed {
-        package: "kernel",
-        dir: "core/kernel",
-    },
-    Harnessed {
-        package: "vfsd-gpt",
-        dir: "services/vfsd/gpt",
-    },
-];
 
 /// The `git grep -E` pattern of a line that declares a proof harness.
 const HARNESS_PATTERN: &str = r"^[[:space:]]*#\[kani::proof\]";
@@ -63,15 +94,57 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
         println!("{KANI_VERSION}");
         return Ok(());
     }
-    let crates = selected(args.component.as_deref())?;
-    check_registry(&ctx.root)?;
+    let crates = match args.since.as_deref()
+    {
+        Some(base) => affected_since(&ctx.root, harnessed(&ctx.root)?, base)?,
+        None => selected(harnessed(&ctx.root)?, args.component.as_deref())?,
+    };
+    if args.list
+    {
+        for harnessed in &crates
+        {
+            println!("{}", harnessed.package);
+        }
+        return Ok(());
+    }
+    // Only a selection can be empty, and it said why.
+    if crates.is_empty()
+    {
+        return Ok(());
+    }
     check_version(&ctx.root)?;
     let mut failed = Vec::new();
-    for harnessed in crates
+    let mut outcomes = Vec::new();
+    for harnessed in &crates
     {
-        if let Err(e) = verify(&ctx.root, harnessed, args.harness.as_deref())
+        if let Err(e) = verify(&ctx.root, harnessed, args.harness.as_deref(), &mut outcomes)
         {
             failed.push(format!("{e:#}"));
+        }
+    }
+    let budget = if on_ci_runner()
+    {
+        Budget::Enforce
+    }
+    else
+    {
+        Budget::Warn
+    };
+    let over = over_budget(&mut outcomes, budget);
+    step("Kani: every harness");
+    print!("{}", outcome_table(&outcomes));
+    match budget
+    {
+        Budget::Enforce => failed.extend(over),
+        Budget::Warn =>
+        {
+            for finding in over
+            {
+                eprintln!(
+                    "warning: {finding}; CI's runner fails it there, and its time on this host \
+                     differs"
+                );
+            }
         }
     }
     if !failed.is_empty()
@@ -81,29 +154,154 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
     Ok(())
 }
 
-/// The crates a run verifies: every registered one, or the one `--component`
-/// names.
-fn selected(component: Option<&str>) -> Result<Vec<&'static Harnessed>>
+/// The crates a run verifies: every crate that holds a harness, or the one
+/// `--component` names.
+fn selected(crates: Vec<Harnessed>, component: Option<&str>) -> Result<Vec<Harnessed>>
 {
     let Some(name) = component
     else
     {
-        return Ok(HARNESSED.iter().collect());
+        return Ok(crates);
     };
-    HARNESSED
+    let names = crates
         .iter()
+        .map(|h| h.package.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    crates
+        .into_iter()
         .find(|h| h.package == name)
         .map(|h| vec![h])
         .ok_or_else(|| {
             err!(
-                "`{name}` is not a crate with proof harnesses; the registered crates are {}",
-                HARNESSED
-                    .iter()
-                    .map(|h| h.package)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "`{name}` is not a crate with proof harnesses; the crates that hold one are {names}"
             )
         })
+}
+
+/// Why a crate was selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Reason
+{
+    /// The change touches this input of every crate's verification.
+    BuildWide(String),
+    /// The change touches an input of the crate's build.
+    Input(Input),
+}
+
+impl Reason
+{
+    /// The reason as the selection's report gives it for `crate_name`.
+    fn describe(&self, crate_name: &str) -> String
+    {
+        match self
+        {
+            Self::BuildWide(file) => format!("{file} is an input of every crate's verification"),
+            Self::Input(Input { file, package }) if package == crate_name =>
+            {
+                format!("{file} is an input of the crate")
+            }
+            Self::Input(Input { file, package }) =>
+            {
+                format!("{file} is an input of {package}, which the crate depends on")
+            }
+        }
+    }
+}
+
+/// Each crate of `crates` the change to `changed` can affect in
+/// `workspace`, with the first reason found, in the order of `crates`:
+/// every crate when a changed file is an input of every verification
+/// ([`affected::WORKSPACE_WIDE`], [`KANI_INPUTS`]), else each crate with a
+/// changed input of its build. Fails naming a crate that is no workspace
+/// package.
+fn affected_crates(
+    crates: Vec<Harnessed>,
+    workspace: &Workspace,
+    changed: &[String],
+) -> Result<Vec<(Harnessed, Reason)>>
+{
+    let wide: Vec<&str> = affected::WORKSPACE_WIDE
+        .iter()
+        .chain(KANI_INPUTS)
+        .copied()
+        .collect();
+    if let Some(file) = affected::first_under(changed, &wide)
+    {
+        return Ok(crates
+            .into_iter()
+            .map(|h| (h, Reason::BuildWide(file.clone())))
+            .collect());
+    }
+    let mut selected = Vec::new();
+    for harnessed in crates
+    {
+        let input = workspace
+            .first_input(&harnessed.dir, changed)
+            .with_context(|| format!("{} holds a proof harness", harnessed.package))?;
+        if let Some(input) = input
+        {
+            selected.push((harnessed, Reason::Input(input)));
+        }
+    }
+    Ok(selected)
+}
+
+/// The crates of `crates` the change from `base` to the working tree can
+/// affect, each reported with why on stderr, or a line saying that none is,
+/// so `--list` prints the packages alone on stdout.
+fn affected_since(root: &Path, crates: Vec<Harnessed>, base: &str) -> Result<Vec<Harnessed>>
+{
+    let changed = affected::changed_files(root, base)?;
+    let picked = affected_crates(crates, &Workspace::load(root)?, &changed)?;
+    eprintln!(
+        "==> Kani: the crates the change since {base} can affect ({} file(s) changed)",
+        changed.len()
+    );
+    if picked.is_empty()
+    {
+        eprintln!(
+            "none: the change touches no input of a crate that holds a harness (its package, a \
+             package it depends on, a file they read, or an input of every build), so no \
+             harness is verified"
+        );
+    }
+    for (harnessed, reason) in &picked
+    {
+        eprintln!(
+            "{}: {}",
+            harnessed.package,
+            reason.describe(&harnessed.package)
+        );
+    }
+    Ok(picked.into_iter().map(|(h, _)| h).collect())
+}
+
+/// One finding for each harness of `outcomes` whose verification took longer
+/// than [`BUDGET_SECONDS`], naming it and its time. Under
+/// [`Budget::Enforce`] each such harness that passed is marked
+/// [`Verdict::OverBudget`], so the closing table shows it failed.
+fn over_budget(outcomes: &mut [(String, Outcome)], budget: Budget) -> Vec<String>
+{
+    let mut findings = Vec::new();
+    for (package, outcome) in outcomes.iter_mut()
+    {
+        let Some(seconds) = outcome.seconds.filter(|s| *s > BUDGET_SECONDS)
+        else
+        {
+            continue;
+        };
+        if budget == Budget::Enforce && outcome.verdict == Verdict::Passed
+        {
+            outcome.verdict = Verdict::OverBudget;
+        }
+        findings.push(format!(
+            "{package}: {} verified in {seconds:.1}s, over the {BUDGET_SECONDS:.0} s budget \
+             (docs/testing.md § Bounded verification)",
+            outcome.harness
+        ));
+    }
+    findings
 }
 
 // ── The installed release ─────────────────────────────────────────────────────
@@ -168,11 +366,13 @@ fn version_mismatch(output: &str) -> Option<String>
     }
 }
 
-// ── The registry ──────────────────────────────────────────────────────────────
+// ── The harnessed crates ──────────────────────────────────────────────────────
 
-/// Fail when a tracked source declares a proof harness in a crate
-/// [`HARNESSED`] does not list, whose harnesses no run would verify.
-fn check_registry(root: &Path) -> Result<()>
+/// Every crate that holds a proof harness: the crate of each tracked Rust
+/// source that declares one, so a harness needs no registration to be run.
+/// Fails when such a source lies in no crate, or in a crate whose manifest
+/// names no package, since no run could verify it.
+fn harnessed(root: &Path) -> Result<Vec<Harnessed>>
 {
     let output = Command::new("git")
         .args(["grep", "-l", "-E", HARNESS_PATTERN, "--", "*.rs"])
@@ -190,56 +390,113 @@ fn check_registry(root: &Path) -> Result<()>
         ),
     };
     let files: Vec<&str> = files.lines().filter(|l| !l.is_empty()).collect();
-    let missing = unregistered(&files, HARNESSED, |dir| {
-        root.join(dir).join("Cargo.toml").is_file()
-    });
-    if !missing.is_empty()
+    harnessed_crates(&files, |dir| {
+        std::fs::read_to_string(root.join(dir).join("Cargo.toml")).ok()
+    })
+    .map_err(|unplaced| {
+        err!(
+            "proof harnesses that no run would verify:\n  {}",
+            unplaced.join("\n  ")
+        )
+    })
+}
+
+/// The crates of `files` (paths relative to the workspace root), each once,
+/// in the order of their directories, read through `manifest`, which gives a
+/// directory's `Cargo.toml` when it has one; or each file that lies in no
+/// crate, or in one whose manifest names no package.
+fn harnessed_crates(
+    files: &[&str],
+    manifest: impl Fn(&str) -> Option<String>,
+) -> core::result::Result<Vec<Harnessed>, Vec<String>>
+{
+    let mut crates: Vec<Harnessed> = Vec::new();
+    let mut unplaced = Vec::new();
+    for file in files
     {
-        bail!(
-            "proof harnesses in crates `HARNESSED` (xtask/src/commands/kani.rs) does not list, \
-             which no run would verify:\n  {}",
-            missing.join("\n  ")
-        );
+        let Some((dir, text)) = crate_dir(file, &manifest)
+        else
+        {
+            unplaced.push(format!("{file} (in no crate)"));
+            continue;
+        };
+        if crates.iter().any(|h| h.dir == dir)
+        {
+            continue;
+        }
+        match package_name(&text)
+        {
+            Some(package) => crates.push(Harnessed {
+                package: package.to_owned(),
+                dir: dir.to_owned(),
+            }),
+            None => unplaced.push(format!("{file} (crate {dir} names no package)")),
+        }
     }
-    Ok(())
+    crates.sort_by(|a, b| a.dir.cmp(&b.dir));
+    if unplaced.is_empty()
+    {
+        Ok(crates)
+    }
+    else
+    {
+        Err(unplaced)
+    }
+}
+
+/// The `name` of a manifest's `[package]` table.
+fn package_name(manifest: &str) -> Option<&str>
+{
+    let mut in_package = false;
+    for line in manifest.lines().map(str::trim)
+    {
+        if line.starts_with('[')
+        {
+            in_package = line == "[package]";
+        }
+        else if in_package
+            && let Some(value) = line
+                .strip_prefix("name")
+                .map(str::trim_start)
+                .and_then(|rest| rest.strip_prefix('='))
+        {
+            return value.trim().strip_prefix('"')?.strip_suffix('"');
+        }
+    }
+    None
 }
 
 /// The directory of the crate `file` (a path relative to the workspace root)
-/// belongs to: its nearest ancestor that `has_manifest`.
-fn crate_dir(file: &str, has_manifest: impl Fn(&str) -> bool) -> Option<&str>
+/// belongs to, its nearest ancestor with a manifest, and that manifest.
+fn crate_dir(file: &str, manifest: impl Fn(&str) -> Option<String>) -> Option<(&str, String)>
 {
     let mut dir = file;
     while let Some((parent, _)) = dir.rsplit_once('/')
     {
-        if has_manifest(parent)
+        if let Some(text) = manifest(parent)
         {
-            return Some(parent);
+            return Some((parent, text));
         }
         dir = parent;
     }
     None
 }
 
-/// The files of `files` whose crate `registry` does not list, each with the
-/// crate directory it belongs to.
-fn unregistered(
-    files: &[&str],
-    registry: &[Harnessed],
-    has_manifest: impl Fn(&str) -> bool,
-) -> Vec<String>
-{
-    files
-        .iter()
-        .filter_map(|file| match crate_dir(file, &has_manifest)
-        {
-            Some(dir) if registry.iter().any(|h| h.dir == dir) => None,
-            Some(dir) => Some(format!("{file} (crate {dir})")),
-            None => Some(format!("{file} (in no crate)")),
-        })
-        .collect()
-}
-
 // ── One crate's run ───────────────────────────────────────────────────────────
+
+/// The `prlimit` arguments that run `cargo` with `args` under
+/// [`MEMORY_LIMIT_GIB`]. A limit given as one value is both the soft and the
+/// hard limit, so no process of the run can raise it.
+fn limited(args: Vec<&str>) -> Vec<String>
+{
+    let mut limited = vec![
+        format!("--as={}", MEMORY_LIMIT_GIB << 30),
+        "--".to_owned(),
+        "cargo".to_owned(),
+    ];
+    limited.extend(args.into_iter().map(str::to_owned));
+    limited
+}
 
 /// The `cargo` arguments that verify `package`'s harnesses, or the one
 /// `harness` names. Kani's unwinding assertions stay on: no
@@ -255,17 +512,23 @@ fn kani_args<'a>(package: &'a str, harness: Option<&'a str>) -> Vec<&'a str>
     args
 }
 
-/// Run Kani over one crate, printing its output as it comes, and fail on
-/// what [`Judge`] finds.
-fn verify(root: &Path, harnessed: &Harnessed, harness: Option<&str>) -> Result<()>
+/// Run Kani over one crate under [`MEMORY_LIMIT_GIB`], printing its output as
+/// it comes, add each harness's outcome to `outcomes`, and fail on what
+/// [`Judge`] finds.
+fn verify(
+    root: &Path,
+    harnessed: &Harnessed,
+    harness: Option<&str>,
+    outcomes: &mut Vec<(String, Outcome)>,
+) -> Result<()>
 {
     step(&format!("Kani: {}", harnessed.package));
-    let mut child = Command::new("cargo")
-        .args(kani_args(harnessed.package, harness))
+    let mut child = Command::new("prlimit")
+        .args(limited(kani_args(&harnessed.package, harness)))
         .current_dir(root)
         .stdout(Stdio::piped())
         .spawn()
-        .context("failed to launch cargo kani")?;
+        .context("failed to launch prlimit (util-linux), which runs cargo kani")?;
     let mut judge = Judge::default();
     if let Some(stdout) = child.stdout.take()
     {
@@ -278,7 +541,12 @@ fn verify(root: &Path, harnessed: &Harnessed, harness: Option<&str>) -> Result<(
         }
     }
     let status = child.wait().context("failed to wait for cargo kani")?;
-    let mut findings = judge.finish();
+    let (crate_outcomes, mut findings) = judge.finish();
+    outcomes.extend(
+        crate_outcomes
+            .into_iter()
+            .map(|o| (harnessed.package.clone(), o)),
+    );
     if !status.success()
     {
         findings.push(format!("cargo kani exited with {status}"));
@@ -294,23 +562,99 @@ fn verify(root: &Path, harnessed: &Harnessed, harness: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// How one harness ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict
+{
+    /// Its verdict is `SUCCESSFUL` and no check of it failed or is
+    /// undetermined.
+    Passed,
+    /// Its verdict, or a check of it, says it failed.
+    Failed,
+    /// Its CBMC ran out of memory under [`MEMORY_LIMIT_GIB`]: a failure,
+    /// whatever verdict Kani gives.
+    OutOfMemory,
+    /// Kani started it and printed no verdict for it.
+    Unfinished,
+    /// It verified, in longer than [`BUDGET_SECONDS`], on CI's runner.
+    OverBudget,
+}
+
+impl Verdict
+{
+    /// Its name in the table that closes a run.
+    fn label(self) -> &'static str
+    {
+        match self
+        {
+            Self::Passed => "PASSED",
+            Self::Failed => "FAILED",
+            Self::OutOfMemory => "FAILED (out of memory)",
+            Self::Unfinished => "FAILED (no verdict)",
+            Self::OverBudget => "FAILED (over budget)",
+        }
+    }
+}
+
+/// What became of one harness.
+#[derive(Clone, Debug, PartialEq)]
+struct Outcome
+{
+    /// Its path in its crate, as Kani names it.
+    harness: String,
+    verdict: Verdict,
+    /// Why it failed, when it did and Kani's output says why.
+    detail: Option<String>,
+    /// Kani's `Verification Time` for it, in seconds, when it printed one.
+    seconds: Option<f64>,
+}
+
+/// The table that closes a run: each harness, by its package and its path,
+/// with its verdict and verification time, in the order Kani ran them.
+fn outcome_table(outcomes: &[(String, Outcome)]) -> String
+{
+    if outcomes.is_empty()
+    {
+        return "no harness reported a verdict\n".to_owned();
+    }
+    let mut table = String::new();
+    for (package, outcome) in outcomes
+    {
+        let time = outcome
+            .seconds
+            .map_or_else(|| "-".to_owned(), |s| format!("{s:.1}s"));
+        let _ = writeln!(
+            table,
+            "{:<22} {time:>9}  {package}: {}",
+            outcome.verdict.label(),
+            outcome.harness
+        );
+    }
+    table
+}
+
 /// The verdict on one crate's `cargo kani` output, read a line at a time in
 /// Kani's default output format: each harness's `Checking harness <name>...`
-/// line, a `- Status: <status>` line per check, and its
-/// `VERIFICATION:- <result>` line, then one `Complete - ...` summary.
+/// line, a `- Status: <status>` line per check, its `VERIFICATION:- <result>`
+/// line and its `Verification Time: <seconds>s` line, then one
+/// `Complete - ...` summary. A line that says CBMC ran out of memory marks
+/// the harness it falls in, or follows the verdict of, as out of memory.
 #[derive(Debug, Default)]
 struct Judge
 {
-    /// The harness whose checks the lines report.
+    /// The harness whose checks the lines report, until its verdict.
     current: Option<String>,
     /// Checks of the current harness with status `FAILURE`.
     failed: usize,
     /// Checks of the current harness with status `UNDETERMINED`.
     undetermined: usize,
+    /// Whether a line since the current harness started says it ran out of
+    /// memory.
+    out_of_memory: bool,
     /// Harnesses with a `VERIFICATION:-` line.
     judged: usize,
-    /// Why a harness or the run failed, one line each.
-    findings: Vec<String>,
+    /// Each harness's outcome, in the order Kani ran them.
+    outcomes: Vec<Outcome>,
     /// The summary's counts: harnesses verified, failures, total.
     summary: Option<(usize, usize, usize)>,
 }
@@ -323,9 +667,11 @@ impl Judge
         let line = line.trim();
         if let Some(name) = line.strip_prefix("Checking harness ")
         {
+            self.unjudged();
             self.current = Some(name.trim_end_matches("...").to_owned());
             self.failed = 0;
             self.undetermined = 0;
+            self.out_of_memory = false;
         }
         else if let Some(status) = line.strip_prefix("- Status: ")
         {
@@ -341,9 +687,30 @@ impl Judge
         {
             self.verdict(result);
         }
+        else if let Some(time) = line.strip_prefix("Verification Time: ")
+        {
+            if let Some(last) = self.outcomes.last_mut()
+                && last.seconds.is_none()
+            {
+                last.seconds = time.trim_end_matches('s').parse().ok();
+            }
+        }
         else if let Some(counts) = line.strip_prefix("Complete - ")
         {
+            self.unjudged();
             self.summary = summary_counts(counts);
+        }
+        else if !line.starts_with("- Description: ")
+            && line.to_ascii_lowercase().contains("out of memory")
+        {
+            if self.current.is_some()
+            {
+                self.out_of_memory = true;
+            }
+            else if let Some(last) = self.outcomes.last_mut()
+            {
+                last.verdict = Verdict::OutOfMemory;
+            }
         }
     }
 
@@ -352,59 +719,119 @@ impl Judge
     /// checks, which Kani's result then says it encountered as expected.
     fn verdict(&mut self, result: &str)
     {
-        let name = self
+        let harness = self
             .current
             .take()
             .unwrap_or_else(|| "a harness".to_owned());
         self.judged = self.judged.saturating_add(1);
         let successful = result.starts_with("SUCCESSFUL");
         let expected_panics = successful && result.contains("as expected");
-        if !successful
+        let detail = if !successful
         {
-            self.findings.push(format!("{name}: verification {result}"));
+            Some(format!("verification {result}"))
         }
         else if self.undetermined > 0
         {
-            self.findings.push(format!(
-                "{name}: {} undetermined check(s)",
-                self.undetermined
-            ));
+            Some(format!("{} undetermined check(s)", self.undetermined))
         }
         else if self.failed > 0 && !expected_panics
         {
-            self.findings
-                .push(format!("{name}: {} failed check(s)", self.failed));
+            Some(format!("{} failed check(s)", self.failed))
+        }
+        else
+        {
+            None
+        };
+        let verdict = if self.out_of_memory
+        {
+            Verdict::OutOfMemory
+        }
+        else if detail.is_some()
+        {
+            Verdict::Failed
+        }
+        else
+        {
+            Verdict::Passed
+        };
+        self.outcomes.push(Outcome {
+            harness,
+            verdict,
+            detail,
+            seconds: None,
+        });
+    }
+
+    /// Record the current harness, which Kani started, as ending without a
+    /// verdict, when there is one.
+    fn unjudged(&mut self)
+    {
+        if let Some(harness) = self.current.take()
+        {
+            let verdict = if self.out_of_memory
+            {
+                Verdict::OutOfMemory
+            }
+            else
+            {
+                Verdict::Unfinished
+            };
+            self.outcomes.push(Outcome {
+                harness,
+                verdict,
+                detail: None,
+                seconds: None,
+            });
         }
     }
 
-    /// The findings over the whole output; empty when every harness passed.
-    /// `verify` adds the finding of an unsuccessful exit.
-    fn finish(mut self) -> Vec<String>
+    /// Each harness's outcome, and the findings over the whole output, one
+    /// line each; no finding when every harness passed. `verify` adds the
+    /// finding of an unsuccessful exit.
+    fn finish(mut self) -> (Vec<Outcome>, Vec<String>)
     {
+        self.unjudged();
+        let mut findings: Vec<String> = self
+            .outcomes
+            .iter()
+            .filter_map(|o| {
+                let name = &o.harness;
+                let detail = o.detail.as_deref();
+                match o.verdict
+                {
+                    // A verdict `over_budget` gives after the run, never Kani's.
+                    Verdict::Passed | Verdict::OverBudget => None,
+                    Verdict::Failed => Some(format!("{name}: {}", detail.unwrap_or("failed"))),
+                    Verdict::OutOfMemory => Some(format!(
+                        "{name}: FAILED, out of memory under the {MEMORY_LIMIT_GIB} GiB limit{}",
+                        detail.map_or_default(|d| format!(" ({d})"))
+                    )),
+                    Verdict::Unfinished => Some(format!("{name}: no verdict")),
+                }
+            })
+            .collect();
         match self.summary
         {
-            None => self
-                .findings
-                .push("no `Complete -` summary: Kani did not finish".to_owned()),
-            Some((_, _, 0)) => self.findings.push("no harness ran".to_owned()),
+            None => findings.push("no `Complete -` summary: Kani did not finish".to_owned()),
+            Some((_, _, 0)) => findings.push("no harness ran".to_owned()),
             Some((verified, failures, total)) =>
             {
                 if failures > 0 || verified != total
                 {
-                    self.findings.push(format!(
+                    findings.push(format!(
                         "{verified} of {total} harness(es) verified, {failures} failure(s)"
                     ));
                 }
                 if self.judged != total
                 {
-                    self.findings.push(format!(
+                    findings.push(format!(
                         "{} harness result(s) for {total} harness(es)",
                         self.judged
                     ));
                 }
             }
         }
-        self.findings
+        (self.outcomes, findings)
     }
 }
 
@@ -455,7 +882,7 @@ mod tests
         {
             judge.line(line);
         }
-        judge.finish()
+        judge.finish().1
     }
 
     const ONE_PASSED: &str = "Complete - 1 successfully verified harnesses, 0 failures, 1 total.";
@@ -544,6 +971,145 @@ mod tests
         assert_eq!(judge(&out), ["1 harness result(s) for 2 harness(es)"]);
     }
 
+    fn judged(output: &str) -> (Vec<Outcome>, Vec<String>)
+    {
+        let mut judge = Judge::default();
+        for line in output.lines()
+        {
+            judge.line(line);
+        }
+        judge.finish()
+    }
+
+    const OUT_OF_MEMORY: &str = "a::proofs::big: FAILED, out of memory under the 12 GiB limit \
+                                 (verification FAILED)";
+
+    // Defect caught: a harness whose CBMC ran out of memory under the limit
+    // reported as a pass, as skipped, or without naming the limit, whether
+    // the line saying so comes before Kani's verdict or after it; or the
+    // harnesses after it left unverified.
+    #[test]
+    fn a_harness_out_of_memory_fails_by_name_and_the_run_goes_on()
+    {
+        let next = harness_output("a::proofs::small", &["SUCCESS"], "SUCCESSFUL");
+        let summary = "Complete - 1 successfully verified harnesses, 1 failures, 2 total.\n";
+        let before = format!(
+            "Checking harness a::proofs::big...\nOut of memory\n\nCBMC failed\n\n\
+             VERIFICATION:- FAILED\nVerification Time: 30.5s\n\n{next}{summary}"
+        );
+        let after = format!(
+            "Checking harness a::proofs::big...\n\nCBMC failed\n\nVERIFICATION:- FAILED\nCBMC \
+             appears to have run out of memory.\nVerification Time: 30.5s\n\n{next}{summary}"
+        );
+        for out in [before, after]
+        {
+            let (outcomes, findings) = judged(&out);
+            assert_eq!(
+                findings,
+                [OUT_OF_MEMORY, "1 of 2 harness(es) verified, 1 failure(s)"]
+            );
+            let verdicts: Vec<_> = outcomes.iter().map(|o| (o.verdict, o.seconds)).collect();
+            assert_eq!(
+                verdicts,
+                [
+                    (Verdict::OutOfMemory, Some(30.5)),
+                    (Verdict::Passed, Some(0.1))
+                ]
+            );
+        }
+        // A harness out of memory fails whatever verdict Kani gives it.
+        let out = format!(
+            "Checking harness a::proofs::big...\nOut of memory\nVERIFICATION:- SUCCESSFUL\n{}",
+            "Complete - 1 successfully verified harnesses, 0 failures, 1 total.\n"
+        );
+        assert_eq!(
+            judged(&out).1,
+            ["a::proofs::big: FAILED, out of memory under the 12 GiB limit"]
+        );
+        // A check whose description mentions memory marks nothing.
+        let out = format!(
+            "{}{ONE_PASSED}\n",
+            harness_output("a::proofs::one", &["SUCCESS"], "SUCCESSFUL")
+                .replace("\"d\"", "\"out of memory\"")
+        );
+        assert_eq!(judged(&out).1, Vec::<String>::new());
+    }
+
+    // Defect caught: a harness that Kani started and that printed no verdict
+    // (its process killed, the run cut short) missing from the outcomes, so
+    // the closing table hides it.
+    #[test]
+    fn a_harness_without_a_verdict_fails_by_name()
+    {
+        let out = format!(
+            "{}Checking harness a::proofs::cut...\n",
+            harness_output("a::proofs::one", &["SUCCESS"], "SUCCESSFUL")
+        );
+        let (outcomes, findings) = judged(&out);
+        assert_eq!(
+            findings,
+            [
+                "a::proofs::cut: no verdict",
+                "no `Complete -` summary: Kani did not finish"
+            ]
+        );
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[1].verdict, Verdict::Unfinished);
+    }
+
+    // Defect caught: the closing table leaving a harness out, or giving it
+    // another's verdict or time.
+    #[test]
+    fn the_closing_table_gives_every_harness_its_verdict_and_time()
+    {
+        let out = format!(
+            "{}{}Complete - 1 successfully verified harnesses, 1 failures, 2 total.\n",
+            harness_output("a::proofs::one", &["SUCCESS"], "SUCCESSFUL"),
+            harness_output("a::proofs::two", &["FAILURE"], "FAILED"),
+        );
+        let (outcomes, _) = judged(&out);
+        let rows: Vec<_> = outcomes
+            .into_iter()
+            .map(|o| ("pkg".to_owned(), o))
+            .collect();
+        let table = outcome_table(&rows);
+        let lines: Vec<_> = table
+            .lines()
+            .map(str::split_whitespace)
+            .map(Iterator::collect::<Vec<_>>)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ["PASSED", "0.1s", "pkg:", "a::proofs::one"],
+                ["FAILED", "0.1s", "pkg:", "a::proofs::two"]
+            ]
+        );
+        assert_eq!(outcome_table(&[]), "no harness reported a verdict\n");
+    }
+
+    // Defect caught: Kani run without the memory limit, or with one that a
+    // process of the run could raise.
+    #[test]
+    fn cargo_kani_runs_under_the_memory_limit()
+    {
+        let args = limited(kani_args("pkg", Some("a::proofs::one")));
+        assert_eq!(
+            args,
+            [
+                "--as=12884901888",
+                "--",
+                "cargo",
+                "kani",
+                "--tests",
+                "-p",
+                "pkg",
+                "--harness",
+                "a::proofs::one"
+            ]
+        );
+    }
+
     // Defect caught: a run with another Kani release than the pin, or with
     // none, accepted.
     #[test]
@@ -560,25 +1126,215 @@ mod tests
         assert!(version_mismatch("cargo 1.0\n").is_some());
     }
 
-    // Defect caught: a harness in a crate the registry does not list, which no
-    // run verifies, accepted; or one attributed to an enclosing crate.
+    // Defect caught: a crate holding a harness left out of the run, which
+    // no run then verifies; a harness attributed to an enclosing crate; a
+    // crate run once per harness file; or a harness outside any crate
+    // accepted.
     #[test]
-    fn a_harness_outside_the_registered_crates_is_reported()
+    fn every_crate_holding_a_harness_is_run_once_by_its_package()
     {
-        let registry = [Harnessed {
-            package: "outer",
-            dir: "a/outer",
-        }];
-        let manifests = ["a/outer", "a/outer/inner"];
-        let has_manifest = |dir: &str| manifests.contains(&dir);
-        let files = ["a/outer/src/x.rs", "a/outer/inner/src/y.rs", "a/loose.rs"];
+        let manifest = |dir: &str| match dir
+        {
+            "a/outer" => Some("[package]\nname = \"outer\"\n".to_owned()),
+            "a/outer/inner" => Some(
+                "# c\n[lib]\nname = \"lib\"\n\n[package]\nname    =   \"inner-pkg\"\n".to_owned(),
+            ),
+            "b" => Some("[workspace]\nmembers = []\n".to_owned()),
+            _ => None,
+        };
+        let files = [
+            "a/outer/src/x.rs",
+            "a/outer/inner/src/y.rs",
+            "a/outer/src/z.rs",
+        ];
         assert_eq!(
-            unregistered(&files, &registry, has_manifest),
-            [
-                "a/outer/inner/src/y.rs (crate a/outer/inner)",
-                "a/loose.rs (in no crate)"
-            ]
+            harnessed_crates(&files, manifest),
+            Ok(vec![
+                Harnessed {
+                    package: "outer".to_owned(),
+                    dir: "a/outer".to_owned(),
+                },
+                Harnessed {
+                    package: "inner-pkg".to_owned(),
+                    dir: "a/outer/inner".to_owned(),
+                },
+            ])
         );
+        assert_eq!(
+            harnessed_crates(&["a/outer/src/x.rs", "loose.rs", "b/src/w.rs"], manifest),
+            Err(vec![
+                "loose.rs (in no crate)".to_owned(),
+                "b/src/w.rs (crate b names no package)".to_owned(),
+            ])
+        );
+    }
+
+    // Defect caught: a harness over the time budget passing on CI's runner,
+    // or failing on another host, whose speed differs; or a finding that
+    // does not name the harness and its time.
+    #[test]
+    fn a_harness_over_the_budget_fails_on_ci_and_is_warned_of_elsewhere()
+    {
+        let outcome = |harness: &str, seconds: f64| {
+            (
+                "pkg".to_owned(),
+                Outcome {
+                    harness: harness.to_owned(),
+                    verdict: Verdict::Passed,
+                    detail: None,
+                    seconds: Some(seconds),
+                },
+            )
+        };
+        let run = || {
+            vec![
+                outcome("a::proofs::fast", BUDGET_SECONDS),
+                outcome("a::proofs::slow", BUDGET_SECONDS + 0.1),
+            ]
+        };
+        let finding = "pkg: a::proofs::slow verified in 120.1s, over the 120 s budget \
+                       (docs/testing.md § Bounded verification)";
+        let mut enforced = run();
+        assert_eq!(over_budget(&mut enforced, Budget::Enforce), [finding]);
+        let verdicts: Vec<_> = enforced.iter().map(|(_, o)| o.verdict).collect();
+        assert_eq!(verdicts, [Verdict::Passed, Verdict::OverBudget]);
+        let mut warned = run();
+        assert_eq!(over_budget(&mut warned, Budget::Warn), [finding]);
+        assert!(warned.iter().all(|(_, o)| o.verdict == Verdict::Passed));
+    }
+
+    fn crates() -> Vec<Harnessed>
+    {
+        ["services/gpt", "shared/proto"]
+            .into_iter()
+            .map(|dir| Harnessed {
+                package: dir.rsplit('/').next().unwrap().to_owned(),
+                dir: dir.to_owned(),
+            })
+            .collect()
+    }
+
+    /// The crates `changed` selects, by package, with their reasons: `proto`
+    /// depends on `abi`, `gpt` on nothing, and `other` holds no harness.
+    fn select(changed: &[&str]) -> Vec<(String, Reason)>
+    {
+        let package = |name: &str, dir: &str, deps: &[&str]| affected::Package {
+            name: name.to_owned(),
+            dir: dir.to_owned(),
+            deps: deps.iter().map(|d| (*d).to_owned()).collect(),
+        };
+        let workspace = Workspace::new(
+            vec![
+                package("gpt", "services/gpt", &[]),
+                package("proto", "shared/proto", &["abi/abi"]),
+                package("abi", "abi/abi", &[]),
+                package("other", "services/other", &["abi/abi"]),
+            ],
+            &[],
+        );
+        let changed: Vec<String> = changed.iter().map(|c| (*c).to_owned()).collect();
+        affected_crates(crates(), &workspace, &changed)
+            .unwrap()
+            .into_iter()
+            .map(|(h, r)| (h.package, r))
+            .collect()
+    }
+
+    fn input(file: &str, package: &str) -> Reason
+    {
+        Reason::Input(Input {
+            file: file.to_owned(),
+            package: package.to_owned(),
+        })
+    }
+
+    // Defect caught: a change in a proof crate that does not select it, or
+    // that selects another.
+    #[test]
+    fn a_change_in_a_proof_crate_selects_that_crate_alone()
+    {
+        assert_eq!(
+            select(&["services/gpt/src/lib.rs"]),
+            [("gpt".to_owned(), input("services/gpt/src/lib.rs", "gpt"))]
+        );
+    }
+
+    // Defect caught: a change in a dependency of a proof crate that leaves
+    // the crate out, so a moved dependency's proof goes unverified.
+    #[test]
+    fn a_change_in_a_dependency_of_a_proof_crate_selects_it()
+    {
+        assert_eq!(
+            select(&["abi/abi/src/lib.rs"]),
+            [("proto".to_owned(), input("abi/abi/src/lib.rs", "abi"))]
+        );
+    }
+
+    // Defect caught: a change no proof crate can see (a document, a package
+    // nothing proven depends on) selecting crates, which costs the gate the
+    // time the selection exists to save.
+    #[test]
+    fn a_change_in_neither_selects_nothing()
+    {
+        assert_eq!(
+            select(&["docs/testing.md", "services/other/src/main.rs"]),
+            []
+        );
+        assert_eq!(select(&[]), []);
+    }
+
+    // Defect caught: a change to an input of every verification (the Kani
+    // pin and the judge in this command, the selection, the job, the lock
+    // file, the toolchain pin, the workspace manifest) that leaves a crate
+    // out, though it can move any harness's verdict.
+    #[test]
+    fn a_change_to_the_pin_or_an_input_of_every_build_selects_every_crate()
+    {
+        for file in [
+            "xtask/src/commands/kani.rs",
+            "xtask/src/affected.rs",
+            ".github/workflows/build-test.yml",
+            "Cargo.lock",
+            "Cargo.toml",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+        ]
+        {
+            assert_eq!(
+                select(&["docs/x.md", file]),
+                [
+                    ("gpt".to_owned(), Reason::BuildWide(file.to_owned())),
+                    ("proto".to_owned(), Reason::BuildWide(file.to_owned())),
+                ],
+                "{file}"
+            );
+        }
+    }
+
+    // Defect caught: `--component` running another crate than it names, or
+    // accepting a crate that holds no harness.
+    #[test]
+    fn a_component_selects_its_crate_alone()
+    {
+        let crates = || {
+            vec![
+                Harnessed {
+                    package: "kernel".to_owned(),
+                    dir: "core/kernel".to_owned(),
+                },
+                Harnessed {
+                    package: "vfsd-gpt".to_owned(),
+                    dir: "services/vfsd/gpt".to_owned(),
+                },
+            ]
+        };
+        assert_eq!(selected(crates(), None).unwrap(), crates());
+        assert_eq!(
+            selected(crates(), Some("vfsd-gpt")).unwrap(),
+            [crates().remove(1)]
+        );
+        let refused = selected(crates(), Some("elf")).unwrap_err().to_string();
+        assert!(refused.contains("kernel, vfsd-gpt"), "{refused}");
     }
 
     // Defect caught: a run that turned the unwinding assertions off, so a

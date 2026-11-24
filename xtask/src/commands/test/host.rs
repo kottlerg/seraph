@@ -69,7 +69,7 @@ const EMULATED_START_FILE: &str = "crt1.o";
 
 /// The workspace crates that only ever run on the build host, left out of the
 /// emulated test run.
-const HOST_ONLY: [&str; 2] = ["xtask", "seraph-wrapper-shim"];
+const HOST_ONLY: [&str; 3] = ["xtask", "seraph-wrapper-shim", "seraph-path-account-plugin"];
 
 /// The workspace crates that reach crates of the toolchain sysroot under
 /// `rustc_private` (xtask's `object`, `addr2line` and `rustc_demangle`). Those
@@ -114,6 +114,11 @@ pub fn run(ctx: &BuildContext, component: TestComponent) -> Result<()>
         step("Linting test code for the host, against the prebuilt std");
         run_cmd(cargo(ctx).arg("clippy").args(args))?;
     }
+    if lints_host_crates(component)
+    {
+        step("Linting the host crates as `cargo xtask build` does");
+        crate::commands::build::clippy_host(ctx)?;
+    }
 
     step("Testing (host)");
     run_cmd(cargo(ctx).arg("test").args(packages))?;
@@ -129,6 +134,15 @@ pub fn run(ctx: &BuildContext, component: TestComponent) -> Result<()>
 
     step("Tests complete");
     Ok(())
+}
+
+/// Whether the run lints the host crates' non-test code as `cargo xtask
+/// build` does (`clippy_host`): on the whole workspace, which CI's
+/// `host-tests` job runs on every change, so a change that owes no boot
+/// cannot leave master with host code the next booting run's build rejects.
+fn lints_host_crates(component: TestComponent) -> bool
+{
+    matches!(component, TestComponent::All)
 }
 
 /// The cargo package selection of `component`.
@@ -343,6 +357,17 @@ mod tests
         assert_eq!(&host[..split], ["-p", "xtask", "--tests"]);
         assert!(!host.contains(&LINT_BUILD_STD), "{host:?}");
         assert_eq!(host_lint_args(packages(TestComponent::Kernel)), None);
+    }
+
+    // Defect caught: a change that owes no boot merging host code that
+    // `cargo xtask build`'s lint pass rejects, since CI's `host-tests` job,
+    // the one job that runs on every change, linted only the test code under
+    // the relaxed lints, and every later booting run's build failing on it.
+    #[test]
+    fn the_whole_workspace_run_lints_the_host_crates_as_the_build_does()
+    {
+        assert!(lints_host_crates(TestComponent::All));
+        assert!(!lints_host_crates(TestComponent::Kernel));
     }
 
     #[test]

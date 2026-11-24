@@ -87,6 +87,24 @@ pub static EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID: EfiGuid = EfiGuid {
     data4: [0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A],
 };
 
+/// `EFI_DEVICE_PATH_PROTOCOL_GUID`
+/// `{09576E91-6D3F-11D2-8E39-00A0C969723B}`
+pub static EFI_DEVICE_PATH_PROTOCOL_GUID: EfiGuid = EfiGuid {
+    data1: 0x0957_6E91,
+    data2: 0x6D3F,
+    data3: 0x11D2,
+    data4: [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
+};
+
+/// `EFI_PCI_IO_PROTOCOL_GUID`
+/// `{4CF5B200-68B8-4CA5-9EEC-B23E3F50029A}`
+pub static EFI_PCI_IO_PROTOCOL_GUID: EfiGuid = EfiGuid {
+    data1: 0x4CF5_B200,
+    data2: 0x68B8,
+    data3: 0x4CA5,
+    data4: [0x9E, 0xEC, 0xB2, 0x3E, 0x3F, 0x50, 0x02, 0x9A],
+};
+
 /// `EFI_ACPI_20_TABLE_GUID` (ACPI 2.0 RSDP)
 /// `{8868E871-E4F1-11D3-BC22-0080C73C8881}`
 pub static EFI_ACPI_20_TABLE_GUID: EfiGuid = EfiGuid {
@@ -388,7 +406,11 @@ pub struct EfiBootServices
     _reserved: usize,
     pub register_protocol_notify: usize,
     pub locate_handle: usize,
-    pub locate_device_path: usize,
+    pub locate_device_path: unsafe extern "efiapi" fn(
+        protocol: *const EfiGuid,
+        device_path: *mut *mut EfiDevicePathProtocol,
+        device: *mut EfiHandle,
+    ) -> EfiStatus,
     pub install_configuration_table: usize,
 
     // Image services (LoadImage, StartImage — 2 entries, unused)
@@ -478,6 +500,34 @@ pub struct EfiLoadedImageProtocol
     pub image_code_type: u32,
     pub image_data_type: u32,
     pub unload: usize,
+}
+
+/// `EFI_DEVICE_PATH_PROTOCOL` — the header of a device path's first node; the
+/// path's nodes follow one another to its End Entire node
+/// (`crate::boot_device::path_len`).
+#[repr(C)]
+pub struct EfiDevicePathProtocol
+{
+    pub node_type: u8,
+    pub sub_type: u8,
+    pub length: [u8; 2],
+}
+
+/// `EFI_PCI_IO_PROTOCOL` — only `GetLocation` is named; the entries before
+/// it (`PollMem`, `PollIo`, `Mem`, `Io` and `Pci` of two each, `CopyMem`,
+/// `Map`, `Unmap`, `AllocateBuffer`, `FreeBuffer`, `Flush`) are padding, and
+/// the table goes on past it.
+#[repr(C)]
+pub struct EfiPciIoProtocol
+{
+    _before_get_location: [usize; 14],
+    pub get_location: unsafe extern "efiapi" fn(
+        this: *mut Self,
+        segment: *mut usize,
+        bus: *mut usize,
+        device: *mut usize,
+        function: *mut usize,
+    ) -> EfiStatus,
 }
 
 /// `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` — opens the ESP volume.
@@ -685,6 +735,125 @@ pub unsafe fn open_esp_volume(
         return Err(BootError::UefiError(status));
     }
     Ok(root)
+}
+
+/// The boot ESP's GPT descriptor and its controller's PCI location, read from
+/// the device path of `device`, the loaded image's device handle
+/// ([boot-flow.md](../docs/boot-flow.md) § Step 1).
+///
+/// The descriptor is the reduction of the device's whole device path
+/// (`crate::boot_device::reduce`), or the reason there is none. The location
+/// is that of the deepest handle on the path with `EFI_PCI_IO_PROTOCOL`,
+/// which `LocateDevicePath` finds, from its `GetLocation`; `None` when no
+/// handle on the path has the protocol, a call fails, or a value lies outside
+/// its PCI range. The bootloader goes on without either; vfsd, which takes the
+/// boot disk from them, finds none without the descriptor (docs/storage.md
+/// § GPT Role-GUID Discovery).
+///
+/// # Safety
+/// `bs` must be valid boot services and `device` the device handle from the
+/// loaded image protocol.
+pub unsafe fn boot_device(
+    bs: *mut EfiBootServices,
+    device: EfiHandle,
+) -> (
+    Result<crate::boot_device::EspDescriptor, crate::boot_device::NoEsp>,
+    Option<crate::boot_device::PciLocation>,
+)
+{
+    use crate::boot_device::{NoEsp, path_len, pci_location, reduce};
+
+    let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `handle_protocol` entry
+    // is readable.
+    let handle_protocol_fn = unsafe { (*bs).handle_protocol };
+    // SAFETY: caller guarantees bs and device are valid.
+    let status = unsafe {
+        handle_protocol_fn(
+            device,
+            core::ptr::addr_of!(EFI_DEVICE_PATH_PROTOCOL_GUID),
+            core::ptr::addr_of_mut!(iface),
+        )
+    };
+    if status != EFI_SUCCESS || iface.is_null()
+    {
+        return (Err(NoEsp::Malformed), None);
+    }
+    let path = iface.cast::<EfiDevicePathProtocol>();
+    let base = path.cast::<u8>().cast_const();
+    let len = path_len(|offset| {
+        // SAFETY: the firmware's device path is a run of nodes, each at least
+        // a header long, ending in an End Entire node; `path_len` asks only
+        // for the header of a node it reached, which lies inside that run,
+        // and no farther than `MAX_PATH_BYTES`.
+        let header = unsafe { base.add(offset) };
+        // SAFETY: `header` points at the node's four header bytes (above),
+        // which have no alignment, so the read is unaligned.
+        unsafe { core::ptr::read_unaligned(header.cast::<[u8; 4]>()) }
+    });
+    let esp = len.and_then(|len| {
+        // SAFETY: `path_len` walked the path's nodes to its End Entire node,
+        // `len` bytes from `base`; the firmware keeps the device path
+        // protocol's interface, and so the path, while boot services run,
+        // and this slice does not outlive this call.
+        let bytes = unsafe { core::slice::from_raw_parts(base, len) };
+        reduce(bytes)
+    });
+
+    let mut remaining = path;
+    let mut pci_handle: EfiHandle = core::ptr::null_mut();
+    // SAFETY: `bs` points to valid boot services (caller contract), so the `locate_device_path`
+    // entry is readable.
+    let locate_device_path_fn = unsafe { (*bs).locate_device_path };
+    // SAFETY: bs is valid; `remaining` is a copy of the device's path pointer,
+    // which LocateDevicePath advances past the matched prefix, leaving the
+    // firmware's path itself unchanged.
+    let status = unsafe {
+        locate_device_path_fn(
+            core::ptr::addr_of!(EFI_PCI_IO_PROTOCOL_GUID),
+            core::ptr::addr_of_mut!(remaining),
+            core::ptr::addr_of_mut!(pci_handle),
+        )
+    };
+    if status != EFI_SUCCESS || pci_handle.is_null()
+    {
+        return (esp, None);
+    }
+    let mut pci_iface: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: bs is valid; pci_handle is the handle LocateDevicePath returned
+    // for the PCI I/O protocol.
+    let status = unsafe {
+        handle_protocol_fn(
+            pci_handle,
+            core::ptr::addr_of!(EFI_PCI_IO_PROTOCOL_GUID),
+            core::ptr::addr_of_mut!(pci_iface),
+        )
+    };
+    if status != EFI_SUCCESS || pci_iface.is_null()
+    {
+        return (esp, None);
+    }
+    let pci_io = pci_iface.cast::<EfiPciIoProtocol>();
+    let (mut segment, mut bus, mut dev, mut function) = (0usize, 0usize, 0usize, 0usize);
+    // SAFETY: `pci_io` is the PCI I/O protocol HandleProtocol returned, so
+    // the `get_location` entry is readable.
+    let get_location_fn = unsafe { (*pci_io).get_location };
+    // SAFETY: pci_io is a valid PCI I/O protocol; the four outputs are live
+    // locals.
+    let status = unsafe {
+        get_location_fn(
+            pci_io,
+            core::ptr::addr_of_mut!(segment),
+            core::ptr::addr_of_mut!(bus),
+            core::ptr::addr_of_mut!(dev),
+            core::ptr::addr_of_mut!(function),
+        )
+    };
+    if status != EFI_SUCCESS
+    {
+        return (esp, None);
+    }
+    (esp, pci_location(segment, bus, dev, function))
 }
 
 /// Open a file on the ESP by path.

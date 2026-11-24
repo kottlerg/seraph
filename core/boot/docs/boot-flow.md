@@ -26,12 +26,24 @@ only then queries GOP:
 - `EFI_LOADED_IMAGE_PROTOCOL` — to find the device handle for the boot volume
 - `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` — to open the EFI System Partition filesystem
 - `EFI_GRAPHICS_OUTPUT_PROTOCOL` — to record the framebuffer, if present
+- `EFI_DEVICE_PATH_PROTOCOL` and `EFI_PCI_IO_PROTOCOL` — to record the boot device, if reported
 
 `EFI_LOADED_IMAGE_PROTOCOL` is opened with `BootServices->OpenProtocol` on the image
 handle, `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` with `BootServices->HandleProtocol` on the device
 handle, and GOP handles are enumerated with `BootServices->LocateHandleBuffer` and opened
 with `HandleProtocol`. Failure to locate either of the first two is fatal; an absent GOP
 is not.
+
+The boot device record is read from the device path of the loaded image's device handle
+(`EFI_DEVICE_PATH_PROTOCOL`). The bootloader walks the path, bounded at 4096 bytes, and
+reduces it to the `HardDrive` node before the End Entire node: a GPT partition with a GUID
+signature, a nonzero partition number and size, and an extent that does not wrap. It finds the
+deepest handle on that path that carries `EFI_PCI_IO_PROTOCOL` with
+`BootServices->LocateDevicePath` and reads its location with `GetLocation`. It logs two lines,
+`boot ESP` and `boot controller`. Each part is recorded present or all zero, and the bootloader
+goes on without either. vfsd takes the boot disk from the record: without the ESP part there is
+no boot disk and the root self-mount fails, and without the location every held disk carrying
+the ESP is a candidate ([storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
 
 After step 1 the bootloader reads the firmware's UEFI Secure Boot state, its `SecureBoot` and
 `SetupMode` variables, and logs it in one line: `on`, `off` with the reason (the firmware does
@@ -342,7 +354,7 @@ Pointer and resource-address fields hold physical addresses; `init_image` carrie
 unbiased link virtual addresses, and the only kernel virtual addresses are the
 KASLR-biased `kernel_virtual_base` and `direct_map_base`, which the kernel scrubs from
 this donated page after consuming them. The `version` field is set to
-`BOOT_PROTOCOL_VERSION` (currently `23`). Fields are populated as follows:
+`BOOT_PROTOCOL_VERSION` (currently `24`). Fields are populated as follows:
 
 | Field | Source |
 |---|---|
@@ -354,6 +366,7 @@ this donated page after consuming them. The `version` field is set to
 | `init_image` | Pre-parsed init ELF segments and entry point from step 4 |
 | `modules` | Name, physical base, and size of each non-`init` bundle entry from step 4, at most `MAX_BOOT_MODULES - 1` (`MAX_BOOT_MODULES` is 85; a larger bundle fails step 4 by name), in an array step 6 allocates at the bundle's size, then the `trust-store` module step 4 allocated; never empty |
 | `framebuffer` | GOP framebuffer from step 1 (zeroed if GOP is absent) |
+| `boot_device` | Boot device record from step 1: the ESP's GPT descriptor (partition number, first block, size in blocks, partition GUID) and its controller's PCI location, each flagged present or all zero |
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
 | `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see [firmware-parsing.md](firmware-parsing.md)). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults, except the riscv64 `aplic` and `imsic` fields, zero when neither source reports them, which the kernel requires: a zero `imsic` halts it at [Phase 4](../../kernel/docs/initialization.md#phase-4-typed-memory-cap-surface), and a zero `aplic` at Phase 5; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel [Phase 5](../../kernel/docs/initialization.md#phase-5-architecture-hardware-initialisation). |

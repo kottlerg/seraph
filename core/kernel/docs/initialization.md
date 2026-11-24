@@ -535,7 +535,7 @@ Phase 7.
    AcpiReclaimable memory-map entry, MMIO aperture, boot module and reclaim range, and
    FIXED_BOOT_DESCRIPTORS more (`cap::init_info_descriptor_bound`), in the fewest pages that hold
    them past the header and a boot-module name table of one entry per module, one contiguous zeroed
-   extent. A boot whose bound passes INIT_INFO_DESCRIPTOR_CAPACITY, the 7,484 slots of the
+   extent. A boot whose bound passes INIT_INFO_DESCRIPTOR_CAPACITY, the 7,482 slots of the
    protocol's INIT_INFO_MAX_PAGES = 64 ceiling past a full name table, halts with "FATAL: Phase 7:
    boot descriptors exceed the InitInfo region ceiling". Then drain the remaining buddy RAM as
    address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the buddy,
@@ -823,7 +823,10 @@ calls `sched::enter()`.
       built on the stack), map every page of the region read-only at the chosen
       InitInfo VA (`choose_init_layout().init_info_va`), mint a reclaimable Memory cap per
       page into the root CSpace, and record the page count in the header's
-      `init_info_memory_count`
+      `init_info_memory_count`. The framebuffer geometry and the boot device record come from
+      `BootInfo` through the direct map: `BootDevice::check` validates `boot_info.boot_device`,
+      and the record is copied field for field into `InitInfo.boot_device`; the kernel acts on none
+      of it
 4. Map init's user stack (inlined in `kernel_entry_post_rebase`):
    a. Take the INIT_STACK_PAGES (4) frames reserved from the buddy in
       Phase 7, before the user-cap drain, one at a time so each phys
@@ -861,9 +864,9 @@ calls `sched::enter()`.
 6. Zero every `BootInfo.reclaim_ranges` entry, late-flagged ones included, through the
    direct map (`cap::scrub_reclaim_ranges`), so no page the bootloader wrote reaches init
    with its contents intact: its transient page tables encode the slid kernel layout. The
-   last kernel read of the `BootInfo` page (the framebuffer geometry for InitInfo in step
-   3c) precedes it. Entries are read by value and the pages holding the reclaim array are
-   zeroed last. Emit: "reclaim scrub: zeroed N pages over M ranges"
+   last kernel read of the `BootInfo` page (the framebuffer geometry and the boot device record for
+   InitInfo in step 3c) precedes it. Entries are read by value and the pages holding the reclaim
+   array are zeroed last. Emit: "reclaim scrub: zeroed N pages over M ranges"
 7. Enqueue the init TCB on the BSP's run queue at INIT_PRIORITY
 8. Call sched::enter() — does not return:
    a. Dequeue the highest-priority ready thread (init), then, with interrupts disabled,
@@ -912,7 +915,9 @@ failed step. Invalid init_image (zero segment_count or zero entry_point) halts w
 stack the direct map cannot unmap halts with "Phase 9: cannot unmap init's kernel stack guard
 page". Init's segment, stack, or
 InitInfo-region Memory caps not landing in consecutive slots halts with "Phase 9: init segment
-Memory caps are not in consecutive slots" (or the stack's or InitInfo's equivalent).
+Memory caps are not in consecutive slots" (or the stack's or InitInfo's equivalent). A
+`BootInfo.boot_device` that fails `BootDevice::check` prints "Phase 9: BootInfo.boot_device:
+<defect>" and halts with "FATAL: Phase 9: malformed BootInfo.boot_device".
 
 **Completion criterion:** Init is executing in user mode (ring-3 / U-mode).
 
@@ -968,7 +973,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM; boot descriptors exceed the InitInfo region ceiling; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
 | 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; an x86-64 AP without the CET shadow stacks the BSP enabled; a riscv64 hart id no APLIC MSI can target; a riscv64 `vlenb` other than the boot hart's, no Vector extension, no writable `sstateen0` or `senvcfg`, AIA CSRs kept from S-mode, or no ASID-tagged TLB); a mapped handoff or idle stack guard page; an entropy self-test FAIL is printed and the boot continues |
-| 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, init's kernel stack guard page not unmapped, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
+| 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, init's kernel stack guard page not unmapped, a reclaim_ranges count above MAX_RECLAIM_RANGES, or a malformed BootInfo.boot_device |
 
 ---
 

@@ -369,14 +369,15 @@ fn reclaiming(l: &MemLedger) -> bool
 
 /// Whether memmgr evicts in the background for free frames
 /// ([`free_pool::Ledger::frames_short`]): the free pool does not cover
-/// `promised`, and its free frames stand at or below the growth floor and
-/// the hysteresis band, or a demand chunk when the band is less, so the
-/// eviction opens the draw room (`ipc::memmgr_labels::QUERY_POOL_STATUS`
-/// `data[16]`). The frames then go to the committed draws, which
-/// `promised` keeps them for, and to the restores, and not to the next
-/// admission, so eviction runs at `CRITICAL` too, and any evictable idle
-/// chunk whose eviction frees a page above the growth floor is a victim
-/// ([`free_pool::Ledger::evicting_opens`]).
+/// `promised`, or a committed draw found too few free pages since the draw
+/// room last opened ([`draw_room`]), and the free frames stand at or below
+/// the growth floor and the hysteresis band, or a demand chunk when the band
+/// is less, so the eviction opens the draw room
+/// (`ipc::memmgr_labels::QUERY_POOL_STATUS` `data[16]`). The frames then go
+/// to the committed draws, which `promised` keeps them for or which wait for
+/// them, and to the restores, so eviction runs at `CRITICAL` too, and any
+/// evictable idle chunk whose eviction frees a page above the growth floor is
+/// a victim ([`free_pool::Ledger::evicting_opens`]).
 fn frames_short(l: &MemLedger) -> bool
 {
     let total = pool_total_pages();
@@ -1238,7 +1239,8 @@ fn admit_restore(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> bool
 /// § Commit, Overcommit); `spare`, a region and the base of a chunk of it,
 /// names the chunk a fault backs, which is never taken. With no swap slot
 /// registered the draw always fits while a page is free. Returns the pages
-/// the draw may take; 0 makes it a commit overrun.
+/// the draw may take; 0 makes it a commit overrun, and memmgr then evicts for
+/// frames in the background until the draw room opens ([`frames_short`]).
 pub(crate) fn draw_room(
     l: &mut MemLedger,
     rec: NodeIdx,
@@ -1251,13 +1253,16 @@ pub(crate) fn draw_room(
     let need = if floor == 0 { Need::Frames } else { Need::Draw };
     if !reclaim(l, need, spare, |l| l.draw_room(floor) >= least)
     {
+        // The draw is short: memmgr evicts for frames until the draw room
+        // opens.
+        l.note_short_draw();
         return 0;
     }
     l.draw_room(floor).min(want)
 }
 
-/// The free pages a committed draw for `rec` leaves while the free pool does
-/// not cover `promised` ([`free_pool::Ledger::draw_room`]): the growth floor,
+/// The free pages a committed draw for `rec` leaves while a swap service has
+/// registered swap slots ([`free_pool::Ledger::draw_room`]): the growth floor,
 /// the system reserve and the restore headroom, for a budget node outside the
 /// reserve; 0 for a reserve node.
 pub(crate) fn draw_floor(l: &MemLedger, rec: NodeIdx) -> u64

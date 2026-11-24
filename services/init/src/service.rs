@@ -1159,6 +1159,30 @@ fn request_block_class(registry_ep: u64, ipc_buf: *mut u64) -> Option<u64>
     block_class.ok()
 }
 
+/// The boot device record the kernel copied into `InitInfo`, in the form
+/// vfsd's round 1 carries it. The kernel checked the record, so each flagged
+/// part is passed on as it stands.
+fn vfsd_boot_device(record: &init_protocol::InitBootDevice) -> ipc::vfsd_bootstrap::BootDevice
+{
+    use init_protocol::{INIT_BOOT_DEVICE_ESP, INIT_BOOT_DEVICE_PCI};
+    use ipc::vfsd_bootstrap::{BootDevice, EspDescriptor, PciLocation};
+
+    BootDevice {
+        esp: (record.flags & INIT_BOOT_DEVICE_ESP != 0).then_some(EspDescriptor {
+            partition_number: record.esp_partition_number,
+            start_lba: record.esp_start_lba,
+            size_lba: record.esp_size_lba,
+            partition_guid: record.esp_partition_guid,
+        }),
+        location: (record.flags & INIT_BOOT_DEVICE_PCI != 0).then_some(PciLocation {
+            segment: record.pci_segment,
+            bus: record.pci_bus,
+            device: record.pci_device,
+            function: record.pci_function,
+        }),
+    }
+}
+
 /// Create vfsd via procmgr and serve its bootstrap.
 pub fn create_vfsd_with_caps(
     info: &InitInfo,
@@ -1226,15 +1250,16 @@ pub fn create_vfsd_with_caps(
         return None;
     }
 
-    // Round 1: [service, block class]
-    // (log + procmgr auto-delivered via ProcessInfo.)
+    // Round 1: [service, block class] and the boot device record
+    // (`ipc::vfsd_bootstrap`); log + procmgr auto-delivered via ProcessInfo.
+    let boot_device = vfsd_boot_device(&info.boot_device).to_words();
     if !serve(
         bootstrap_ep,
         &child,
         ipc_buf,
         false,
         &round1_caps,
-        &[],
+        &boot_device,
         "vfsd: bootstrap round 1 failed",
     )
     {

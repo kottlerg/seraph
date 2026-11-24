@@ -96,6 +96,13 @@ const CONFIG_TREES: &[(&str, &str)] = &[
     ("config/devmgr/classes", ".class"),
 ];
 
+/// The configuration files a service reads alone, through procmgr's
+/// verified read in the configuration role under the file's install path
+/// (docs/signing.md § Configuration), with no index: vfsd's storage
+/// statement (`storage_statement::PATH`), whose removal withdraws the roles
+/// it gives and grants none. [`sign_sysroot`] signs each the sysroot holds.
+const CONFIG_FILES: &[&str] = &[storage_statement::PATH];
+
 /// The index file name, [`objsig::INDEX_NAME`], as text.
 const INDEX_FILE: &str = "index";
 
@@ -661,7 +668,9 @@ fn install_name(path: &Path) -> Result<String>
 /// [`CONFIG_TREES`] under its install path in the configuration role, the
 /// role of its bundle entry too, with the directory's index written from the
 /// files it holds ([`write_index`]) and signed in the configuration role
-/// under `<directory>/index`; and every other installed file a list names,
+/// under `<directory>/index`; each of [`CONFIG_FILES`] the sysroot holds
+/// under its install path in the configuration role; and every other
+/// installed file a list names,
 /// `init` with the init role alone when it is the object of a signed `init`
 /// slot, under its install path with its bundle entry's role alone otherwise. The `init` slot objects signed are the init harness's, always,
 /// and `harness`'s. A file a list names that the sysroot does not install is
@@ -735,6 +744,24 @@ pub fn sign_sysroot(
         }
     }
     sign_config_trees(ctx, signer, &mut done, &mut count)?;
+    for install in CONFIG_FILES
+    {
+        let path = ctx.sysroot.join(install.trim_start_matches('/'));
+        if !path.is_file()
+        {
+            continue;
+        }
+        let roles = if boot_modules.iter().any(|module| module == install)
+        {
+            RoleSet::of(&[Role::Configuration, crate::bundle::entry_role(install)])
+        }
+        else
+        {
+            RoleSet::of(&[Role::Configuration])
+        };
+        count(signer.sign_file(&path, roles, install)?);
+        done.insert((*install).to_owned());
+    }
     for install in slots.iter().chain(&boot_modules)
     {
         let path = ctx.sysroot.join(install.trim_start_matches('/'));
@@ -1466,7 +1493,7 @@ mod tests
 
     /// Each ELF image of the test sysroot of riscv64 under the init harness:
     /// its sysroot-relative path, its role set and its name.
-    const SIGNED_IMAGES: [(&str, &[Role], &str); 9] = [
+    const SIGNED_IMAGES: [(&str, &[Role], &str); 11] = [
         ("boot/kernel", &[Role::Kernel], "kernel"),
         ("services/init", &[Role::Init], "init"),
         (
@@ -1495,6 +1522,16 @@ mod tests
             "tests/programs/fixture",
             &[Role::Program],
             "/tests/programs/fixture",
+        ),
+        (
+            "tests/fixtures/programs/fixture",
+            &[Role::Program],
+            "/tests/fixtures/programs/fixture",
+        ),
+        (
+            "tests/fixtures/fixture",
+            &[Role::Service],
+            "/tests/fixtures/fixture",
         ),
     ];
 
@@ -1608,6 +1645,40 @@ mod tests
         )
         .unwrap();
         sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap_err();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: the storage statement left unsigned, or signed in another
+    // role or under another name than its install path, so vfsd's verified
+    // read refuses it and the roles it names on a second disk are given to
+    // none; or a statement the sysroot does not hold counted as signed.
+    #[test]
+    fn the_storage_statement_is_signed_in_the_configuration_role_under_its_path()
+    {
+        let arch = Arch::Riscv64;
+        let install = storage_statement::PATH;
+        let body = b"swap 5a9f0e11-2345-6789-abcd-ef0123456789\n".as_slice();
+        let (root, ctx) = sysroot_of("statement", &[(&install[1..], body)]);
+        testing::install_lists(&ctx);
+        let signer = signer(&root.join("keys"), arch);
+
+        assert_eq!(
+            sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap(),
+            (1, 1)
+        );
+        let object = fs::read(ctx.sysroot.join(&install[1..])).unwrap();
+        let split = objsig::split(&object).unwrap();
+        assert_eq!(split.body(), body);
+        let attrs = split.records().next().unwrap().attrs;
+        assert_eq!(attrs.roles, RoleSet::of(&[Role::Configuration]));
+        assert!(verifies(&signer, &object, Role::Configuration, install));
+        assert!(!verifies(&signer, &object, Role::Data, install));
+        // With no statement, nothing is signed in its place.
+        fs::remove_file(ctx.sysroot.join(&install[1..])).unwrap();
+        assert_eq!(
+            sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap(),
+            (0, 0)
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

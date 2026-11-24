@@ -25,13 +25,13 @@ Three harnesses exercise three surfaces:
 |---|---|---|---|
 | `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask mkdisk --harness ktest`) |
 | `svctest` | Services | [`services/svctest/`](../services/svctest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
-| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (the `terminal` case, `cargo xtask test terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
+| `usertest` | Programs | [`programs/usertest/`](../programs/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (the `terminal` case, `cargo xtask test terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
-itself owns its phases. `usertest` is an orchestrator that runs per-program
-tester binaries discovered under `/tests/programs/`.
+itself owns its phases. `usertest` is an orchestrator that runs the per-program
+tester binaries under `/tests/programs/` that its recipe names.
 
-[`ubench`](../programs/ubench/README.md), the userspace benchmark suite, is launched as
+[`ubench`](../services/ubench/README.md), the userspace benchmark suite, is launched as
 `svctest` is, from a recipe staged into `/config/svcmgr/services/`, and measures rather than
 tests: it logs result lines, and passes when every benchmark ran
 ([Benchmarks](#benchmarks-bench-cell)).
@@ -66,15 +66,16 @@ harness-specific and MUST NOT include the bracketed summary substring.
 
 ## Per-program tester protocol
 
-A program under `programs/<name>/` MAY ship a tester. Authors of each
-program opt in or skip; absence is the default.
+A program under `programs/<name>/`, or a test fixture under `services/fixtures/<name>/`, MAY ship
+a tester. Authors of each opt in or skip; absence is the default.
 
 ### Layout
 
-- The tester crate lives at `programs/<name>/tester/`.
+- The tester crate lives at `programs/<name>/tester/` for a program and at
+  `services/fixtures/<name>/tester/` for a fixture.
 - The tester crate is a workspace member listed in the root `Cargo.toml`.
-- The tester uses the standard userspace build profile (same as
-  `programs/<name>/` itself).
+- The tester uses the standard userspace build profile (same as the
+  program or fixture itself).
 
 ### Install
 
@@ -83,10 +84,21 @@ program opt in or skip; absence is the default.
 - The install path is controlled by `xtask`'s `SPECS` entry for the tester
   crate; the tester crate MUST NOT rely on its own binary name to land at
   the correct sysroot path.
+- The tester MUST be named in the `TESTERS` env entry of usertest's recipe
+  (`rootfs/config/svcmgr/tests/usertest.svc`), the testers the image holds.
+  usertest fails the run for each tester named and absent from
+  `/tests/programs/`, for each one there that the list does not name, and
+  for an empty list
+  ([programs/usertest/README.md](../programs/usertest/README.md) § Testers).
 
 ### Contract
 
 - The tester binary MUST exit `0` on pass and non-zero on fail.
+- The tester MUST exit, and its stdout and stderr MUST close, within the
+  bound usertest's recipe sets in `TESTER_BOUND_MS`. usertest kills a tester
+  still running at the bound, reports it as FAIL, and runs the testers after
+  it ([programs/usertest/README.md](../programs/usertest/README.md)
+  § Testers).
 - The tester binary's exit code is the authoritative verdict. Seraph propagates
   it natively, without POSIX 8-bit truncation (see
   [syscalls.md § `SYS_ASPACE_EXIT`](../core/kernel/docs/syscalls.md#sys_aspace_exit-54));
@@ -94,7 +106,8 @@ program opt in or skip; absence is the default.
 - The tester SHOULD emit a final stdout line `[<name>-tester] PASS` or
   `[<name>-tester] FAIL` for log readability. The orchestrator does not
   rely on this line for the verdict.
-- The tester drives `/programs/<name>` (the program under test) through its
+- The tester drives the program under test, `/programs/<name>` or the fixture
+  `/tests/fixtures/programs/<name>`, through its
   real I/O surface — stdio (via `std::process::Command` with
   `Stdio::piped()`), argv, environment, filesystem — and asserts whatever
   invariant fits that program.
@@ -111,7 +124,7 @@ program opt in or skip; absence is the default.
   caps, in the order its entry names them, and the tester takes them with
   `ipc::bootstrap::request_slots` on its `creator_endpoint` before it writes
   to its stdout or stderr
-  ([services/usertest/README.md](../services/usertest/README.md) § Seeds).
+  ([programs/usertest/README.md](../programs/usertest/README.md) § Seeds).
 - A tester with no entry is spawned with no creator endpoint.
 
 ---
@@ -127,42 +140,51 @@ sysroot/
 │   │                         # cmos-rtc | goldfish-rtc, iommu-vtd |
 │   │                         # iommu-riscv, and the test-only test-dma)
 │   └── fs/                   # filesystem drivers (fatfs)
-├── programs/                 # program binaries and the test fixtures the
-│                             # harnesses spawn
+├── programs/                 # program binaries
 │   ├── hello
-│   ├── stdiotest
+│   ├── shell
 │   └── …
 └── tests/                    # test harnesses, per-program testers, and
-    │                         # harness-only fixtures
+    │                         # test fixtures
     ├── ktest                 # kernel-surface harness (bootloader-loaded)
     ├── svctest               # services-surface harness
     ├── usertest              # programs-surface orchestrator
     ├── ubench                # userspace benchmark suite
-    ├── crasher               # svcmgr restart-path fixture
-    ├── debug-echo            # debug-port fixture (`debug-port` case)
-    ├── hotplug-check         # PCI Express hotplug fixture (`hotplug` case)
     ├── drivers/              # test-only drivers bound only on demand
     │   └── test-fault        # fault-injection driver, bound by BIND_DRIVERS
+    ├── fixtures/             # fixtures started as services
+    │   ├── crasher           # svcmgr restart-path fixture
+    │   ├── debug-echo        # debug-port fixture (`debug-port` case)
+    │   ├── hotplug-check     # PCI Express hotplug fixture (`hotplug` case)
+    │   ├── …
+    │   └── programs/         # fixtures spawned as programs
+    │       ├── crashme
+    │       ├── stdiotest
+    │       └── …
     └── programs/
         ├── hello             # per-program tester for /programs/hello
-        ├── stdiotest         # per-program tester for /programs/stdiotest
+        ├── stdiotest         # per-program tester for /tests/fixtures/programs/stdiotest
         └── …
 ```
 
-`/services/` and `/programs/` MUST NOT contain test harnesses or per-program
-testers; those live under `/tests/`. Dropping `/tests/` does not by itself
+`/services/` and `/programs/` MUST NOT contain test harnesses, per-program testers or test
+fixtures; those live under `/tests/`. Dropping `/tests/` does not by itself
 give a non-test distro, because test-only artifacts also install under
-`/services/drivers/`, `/programs/`, `/config/svcmgr/tests/`, `/config/devmgr/tests/`, and `/data/`.
+`/services/drivers/`, `/config/svcmgr/tests/`, `/config/devmgr/tests/`, and `/data/`.
 Under `/services/drivers/` is [`test-dma`](../services/drivers/test-dma/README.md), the test-only
 driver of the `edu` DMA test device. Under `/tests/drivers/` is
 [`test-fault`](../services/drivers/test-fault/README.md), a test-only fault-injection driver that
 no drivers-directory pass at boot reads: devmgr binds it only through `BIND_DRIVERS`. Under
-`/programs/` are the test fixtures the harnesses and per-program
-testers spawn: `capexhaust`, `crashme`, `deadline`, `debugger`, `demandpaged`, `fsbench`,
+`/tests/fixtures/` are the test fixtures the harnesses and per-program testers spawn, sourced from
+[`services/fixtures/`](../services/fixtures/README.md): under `/tests/fixtures/programs/` the ones
+spawned as programs, `capexhaust`, `crashme`, `deadline`, `debugger`, `demandpaged`, `fsbench`,
 `pipefault`, `pipestress`, `relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and
-`threadstack`. Which consumer spawns or drives each one is owned by [services/svctest/README.md §
-Fixtures](../services/svctest/README.md#fixtures) for `svctest` phases and by each fixture's README
-(`programs/<name>/README.md`) for every per-program tester that drives it. Under
+`threadstack`, which the `programs` component keeps in the program signing role; directly under
+`/tests/fixtures/` the ones a harness recipe starts as services, `crasher`, `debug-echo`,
+`hotplug-check`, `memhog`, and `stopsrc`. Which consumer spawns or drives each one is owned by
+[services/svctest/README.md § Fixtures](../services/svctest/README.md#fixtures) for `svctest` phases
+and by each fixture's README (`services/fixtures/<name>/README.md`) for every per-program tester
+that drives it. Under
 `/config/svcmgr/tests/` are the harness recipes, and under `/config/devmgr/tests/` the test
 device class files the svctest recipe stages (see [Gating](#gating)). Under `/data/` are
 `/data/test.txt`, a fixture shared by `svctest` and the `shell` tester, and the build-synthesised
@@ -225,20 +247,41 @@ To enable a harness for a boot, copy its recipe from
 `sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/` after
 `cargo xtask build`, then repack with `cargo xtask mkdisk --repack-only` before
 `cargo xtask run` (`run` boots the existing `disk.img`, and a normal `mkdisk`
-re-mirror prunes the hand-staged recipe):
+re-mirror prunes the hand-staged recipe). svctest is staged by `mkdisk` itself, with a fixture
+set (`--svctest ci|burn-in|none`, below):
 
 ```sh
 cargo xtask build
-cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
-cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
-cargo xtask mkdisk --repack-only
+rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
+cargo xtask mkdisk --repack-only --svctest none
 cargo xtask run --test-devices
 ```
 
-The svctest recipe also stages the test class files of `sysroot/config/devmgr/tests/` into
-`sysroot/config/devmgr/classes/`, the directory svcmgr reads class files from, and boots with
-`--test-devices`, which attaches `edu` and five QEMU `pci-testdev` functions that no other launch
-attaches and no production driver binds. svctest fails, naming the flag, when they are missing.
+`mkdisk --svctest` also stages the test class files of `sysroot/config/devmgr/tests/` into
+`sysroot/config/devmgr/classes/`, the directory svcmgr reads class files from, and the svctest
+boot runs with `--test-devices`, which attaches `edu` and five QEMU `pci-testdev` functions that
+no other launch attaches and no production driver binds. svctest fails, naming the flag, when they
+are missing.
+
+**svctest fixture sets.** A fixture is a test recipe that svctest's phases drive when it is staged
+beside svctest (`services/svctest/fixtures`). `cargo xtask mkdisk --svctest <set>` stages svctest's
+recipe with the fixtures of one named set, removes every other fixture's recipe from
+`/config/svcmgr/services/`, and writes the set into the staged recipe's `env` line as
+`SVCTEST_FIXTURES=<fixture>,...` (`none` for the empty set) before the pack signs it:
+
+| Set | Fixtures | Used by |
+|---|---|---|
+| `ci` | `crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc` | the canonical svctest cells, and the local host runs that stage svctest as they do |
+| `burn-in` | `memhog`, `reserve-creator`, `stopsrc` | the burn-in svctest cell |
+| `none` | none | a boot of svctest alone |
+
+svctest's `svctest_fixtures` phase, right after its startup phases, fails the run unless the image
+stages exactly the fixtures the record declares, naming each recipe that disagrees: a declared
+fixture whose recipe is missing, or a fixture recipe the record does not declare. It fails the same
+way without the record, so a hand-copied svctest recipe does not boot, and when the recipes of
+oomd or sessiond, the default services its phases drive, are missing. A phase whose fixture the
+set does not declare skips, or skips the part the fixture drives, and logs
+`phase=<phase> skipped: <recipe> not staged`.
 
 The usertest recipe also stages crashd's test recipe, `tests/crashd.svc`, over the default one:
 the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death, and
@@ -419,7 +462,7 @@ result line, its samples' summary in the form
 ktest boot runs every benchmark 8 times, a smoke run whose lines no check compares; the bench-only
 image (`cargo xtask build --ktest-bench-only`) runs Tier 3 alone, 4096 iterations each, for the
 lines that are compared. The userspace paths are measured by the
-[`ubench`](../programs/ubench/README.md) suite, in a boot of the regular init image with its
+[`ubench`](../services/ubench/README.md) suite, in a boot of the regular init image with its
 recipe (`/config/svcmgr/tests/ubench.svc`) staged and the terminal dropped; it logs its own
 lines and fsbench's.
 
@@ -435,8 +478,11 @@ over the runs that reported its suite with its baseline under `xtask/baselines/b
 
 The one-CPU counts gate: a count further from its baseline than the larger of 1% of it and 8
 instructions, in either direction, fails the cell, as does a measurement with no baseline, a
-baseline no run measured, and a benchmark's `FAIL` line. A count that fell past its band fails
-too, since the stale baseline would let a later regression of the same size through. A PR that
+baseline no run measured, and a benchmark's `FAIL` line. A run whose change owes no ktest cell
+skips the ktest boots and does not check the ktest suite's baselines (`bench-check --skip-suite
+ktest`), and a rewrite from that run leaves the ktest suite's files as they are. A count that fell
+past its band fails too, since the stale baseline would let a later regression of the same size
+through. A PR that
 moves a count on purpose rewrites the baselines of the benchmarks it moved from its own CI run
 (`cargo xtask bench-baseline --from-run <run id>`) and states the change and its reason in its
 body. The four-CPU counts are reported, not gated: the interleaving of the CPUs moves them.
@@ -477,15 +523,15 @@ checks the blocks in each boot's serial log, with the parser of the format crash
 must be complete and hold the fields its kind, thread, and status require.
 
 - `--crash-reports reports` reads a usertest boot, which runs the `crashme` fixture's tester
-  ([programs/crashme/README.md](../programs/crashme/README.md)): the log must also hold one `vm`
-  and one `exception` block of `crashme`'s main thread and one `exception` block of a `spawned`
-  thread, whose fault the fixture takes while a sibling is held blocked on a fault at the same
-  instruction, each tied to `crashme` through the badge logd's `reclaim:` line names, complete, its
-  walk starting at its instruction pointer, matched by the kernel's `handler declined` line
+  ([services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md)): the log must also
+  hold one `vm` and one `exception` block of `crashme`'s main thread and one `exception` block of a
+  `spawned` thread, whose fault the fixture takes while a sibling is held blocked on a fault at the
+  same instruction, each tied to `crashme` through the badge logd's `reclaim:` line names, complete,
+  its walk starting at its instruction pointer, matched by the kernel's `handler declined` line
   carrying the block's id, and carrying the stack pointer the kernel's register dump of that line's
   thread prints, so the block read the thread that faulted. The `vm` block's `addr`, the fault
-  message's address, must also be the faulting address that dump prints (`cr2` on x86_64, `stval`
-  on riscv64), so the dump names the access that faulted.
+  message's address, must also be the faulting address that dump prints (`cr2` on x86_64, `stval` on
+  riscv64), so the dump names the access that faulted.
 - `--crash-reports none` reads a boot of an image that stages no crashd: the log must hold no block,
   the check that the absent service changes nothing a fault does.
 
@@ -493,12 +539,12 @@ The usertest boot's crashd names `crashme` in its `CORE_DUMP` ([Gating](#gating)
 fixture's faulting deaths also leaves an ELF core in `/crash`, which the crashme tester checks in
 the guest: its machine, the faulting thread's signal, instruction pointer and stack pointer against
 the page runs it holds, the illegal instruction's bytes, and the `worker` core's threads
-([programs/crashme/README.md](../programs/crashme/README.md)). The tester also asks crashd for a
-live core of the running fixture and checks that the fixture ran on unchanged and that the core
-records its threads, their stacks and a page it marked, and none of the binary's text, and asks for
-one of a fixture on the core path and checks the refusal released the capture ([crashd Operation §
-Live Core](../services/crashd/docs/operation.md#live-core)). A core is checked in the boot, not in
-the log; `gdb` reading one is checked by hand
+([services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md)). The tester also
+asks crashd for a live core of the running fixture and checks that the fixture ran on unchanged and
+that the core records its threads, their stacks and a page it marked, and none of the binary's text,
+and asks for one of a fixture on the core path and checks the refusal released the capture ([crashd
+Operation § Live Core](../services/crashd/docs/operation.md#live-core)). A core is checked in the
+boot, not in the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The usertest boot's crashd also holds a page fault memmgr declined for want of memory, for up to
@@ -681,7 +727,7 @@ No guest-side check can show that bytes cross it, since its far end is the host.
 `cargo xtask test debug-port [--arch] [--port]` (both arches) checks the transport host-side in
 the case's first boot:
 
-1. Stage the [`debug-echo`](../services/debug-echo/README.md) fixture's recipe from
+1. Stage the [`debug-echo`](../services/fixtures/debug-echo/README.md) fixture's recipe from
    `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and repack the disk images in the
    layout they have.
 2. Boot the current sysroot once with the debug port, and wait for the fixture's
@@ -856,10 +902,10 @@ from a host GDB over the debug port, so its check is a host GDB session.
 `cargo xtask test debug-port [--arch] [--port] [--gdb]` (both arches) runs it as the case's second
 boot, whatever the first boot's outcome:
 
-1. Stage the `gdb-target` recipe (`programs/debugger --gdb-target`, a process of two threads with
-   an exported counter and tick function;
-   [programs/debugger/README.md](../programs/debugger/README.md)) from `/config/svcmgr/tests/`,
-   and the stub's template from `/config/svcmgr/debug/` naming it, into
+1. Stage the `gdb-target` recipe (`services/fixtures/debugger --gdb-target`, a process of two
+   threads with an exported counter and tick function;
+   [services/fixtures/debugger/README.md](../services/fixtures/debugger/README.md)) from
+   `/config/svcmgr/tests/`, and the stub's template from `/config/svcmgr/debug/` naming it, into
    `/config/svcmgr/services/`, and repack the disk images in the layout they have.
 2. Boot the current sysroot once with the debug port, and wait for the stub's
    `[gdbstub] attached; serving the debug port` line on the serial stream.
@@ -965,6 +1011,32 @@ inconclusive: the command boots again, up to four runs of each boot, and the boo
 a run without it; four such runs fail the command as inconclusive. On a host that is not a guest
 the same report fails the command, as does every other fault.
 
+### Storage roles (`storage-roles` case)
+
+vfsd gives the root and `/esp` to the boot disk alone, and a role on another disk only to the
+partition the signed storage statement names ([storage.md](storage.md) § GPT Role-GUID
+Discovery); no boot set without a second disk shows either. `cargo xtask test storage-roles
+[--arch]` (both arches) boots the default boot set four times with a second disk, each to the
+terminal's `terminal: READY for injection` line and swapd's `swap partition:` line, and reads
+vfsd's lines: the boot disk it found must be at the location of the boot controller it was told
+of, and each of the root, `/esp`, `/data` and swap must be on the disk the boot says:
+
+1. Repack the images in the split-data layout, which stages the statement naming the data and
+   swap partitions on `disk-data.img`, and boot with that image on the second slot: the root and
+   `/esp` are on the boot disk, `/data` and swap named by the statement on the second disk.
+2. Repack the single image, and boot with a foreign disk on the second slot whose ESP, root, data
+   and swap partitions carry priority `0xFFFF`, above the boot disk's, under GUIDs of their own:
+   every role is on the boot disk.
+3. The same with the foreign disk at the boot disk's priority, where the every-disk search made
+   the root lookup a fatal tie: every role is on the boot disk.
+4. Boot with a copy of `disk.img` on the second slot, which carries the boot ESP too: the boot
+   disk is the one at the boot controller, and every role is on it.
+
+A `no boot disk:` line, a role on another disk than the boot says, or a missing line fails the
+case; the images are repacked in the layout they had, whatever the outcome. See
+[xtask/README.md § The `storage-roles` case](../xtask/README.md#the-storage-roles-case) for the
+command.
+
 ### PCI Express hotplug (`hotplug` case)
 
 devmgr's PCI Express hotplug
@@ -976,7 +1048,7 @@ namespace composition](../services/vfsd/docs/namespace-composition.md#driver-dea
 (both arches) makes a device arrive, leave, and arrive again, then makes a disk arrive, in one boot
 per hotplug control, and then makes a disk leave and arrive again and a second disk arrive:
 
-1. Stage the [`hotplug-check`](../services/hotplug-check/README.md) fixture's recipe from
+1. Stage the [`hotplug-check`](../services/fixtures/hotplug-check/README.md) fixture's recipe from
    `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and the `test-dma` class file from
    `/config/devmgr/tests/` into `/config/devmgr/classes/`, and repack the disk images in the
    layout they have.
@@ -1016,12 +1088,13 @@ per hotplug control, and then makes a disk leave and arrive again and a second d
    pass is, on the wired line the firmware never programmed into it
    ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#binding) § Binding).
    Kill QEMU.
-8. For the storage boots, stage the fixture's disk-mode recipe (`hotplug-check-disk.svc`) alone
-   and repack the images in the split-data layout at the block size they have, so the data
-   partition is on `disk-data.img`. Boot under native control with that image's `virtio-blk-pci`
-   behind the first port, and wait for devmgr's `managed` line and the fixture's
-   `HOLDING a file open on /data` line: vfsd mounted `/data` on the disk at startup, and the
-   fixture holds a file open there and knows the root mount's driver by its name, `fatfs:/`.
+8. For the storage boots, stage the fixture's disk-mode recipe (`hotplug-check-disk.svc`) alone and
+   repack the images in the split-data layout at the block size they have, so the data and swap
+   partitions are on `disk-data.img`, named by the storage statement the layout stages, and swapd
+   takes its partition from that disk. Boot under native control with that image's `virtio-blk-pci`
+   behind the first port, and wait for devmgr's `managed` line and the fixture's `HOLDING a file
+   open on /data` line: vfsd mounted `/data` on the disk at startup, and the fixture holds a file
+   open there and knows the root mount's driver by its name, `fatfs:/`.
 9. Remove the disk with its driver idle, and require devmgr's removal lines, vfsd's
    `disk N: removed; tearing down its mounts` line, and the fixture's `TORN DOWN /data` line: the
    mount is gone, the disk marked removed, the open file stale. Add the disk again on the same
@@ -1029,8 +1102,9 @@ per hotplug control, and then makes a disk leave and arrive again and a second d
    `MOUNT` mounts `/data` on it. Then hot-add a copy of `disk-data.img`, taken before the
    boot, behind the second port, and wait for the fixture's verdict: its `MOUNT` of the data
    role, `TABLE_FULL` while `/data` stands, answers `NO_MOUNT` once devmgr serves the copy,
-   whose data partition ties the data disk's, so vfsd resolves a role across every disk devmgr
-   serves, a disk added after start among them
+   which carries the data partition the statement names as the data disk does, so vfsd resolves
+   a named partition across every disk devmgr serves, a disk added after start among them, and
+   takes none when two disks other than the boot disk carry it
    ([docs/storage.md](storage.md#gpt-role-guid-discovery) § GPT Role-GUID Discovery); and with
    the root mount's driver stopped a lookup at `/` ends in an error within vfsd's bound while
    `/data` still reads. The fixture then kills the root mount's driver; require vfsd's
@@ -1079,36 +1153,32 @@ harnesses staged together race on shutdown — the slower one may not finish.
 Per boot, at most one *shutdown-invoking* harness recipe MUST be staged in
 `/config/svcmgr/services/`.
 
-Non-shutdown fixtures may co-stage alongside one harness. `crasher`
-(`restart = always`, never shuts down) and its worker-fault role
-(`crasher-worker.svc`, `restart = on_failure`) are co-staged with `svctest` in
-the services-surface CI cell so their restart paths are exercised there (svctest's
-`svcmgr_worker_fault_restart` phase runs when `crasher-worker.svc` is staged and is
-skipped otherwise, and its `svcmgr_stop_service` phase stops and restarts the fixture through
-svcmgr's stop authority when it is staged), as is its boot-fault role (`crasher-boot.svc`,
-`restart = on_failure`), whose instance that finds the token `/data/crasher-boot/die-early`,
-which the data partition ships, removes it and dies before its bootstrap request (svctest's
-`svcmgr_boot_death` phase runs when it is staged and is skipped otherwise); its
-bounded faults complete long before `svctest`'s terminal marker, so the
-kernel fault dump never clobbers it. The `memhog` fixture (`memhog.svc`,
-`restart = on_failure`, `oom_stop = yes`) is co-staged with `svctest` in that cell and in the
-burn-in svctest cell: svctest's `oom_policy` phase runs when it is staged, has it fill memory until
-oomd stops it, and passes otherwise, and its `logd_reserve` phase has it fill memory while logd is
-killed and restarted. The CI svctest cell drops crashd, so the held-write path of
-that phase (a child's page fault crashd holds until oomd's stop frees memory), and the write part of
-the `memmgr_swap_commit` phase (a child's commitment past the free frames, its commit overruns
-held by crashd until write-out to swap opens memmgr's draw room), run in the burn-in svctest cell,
-which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart = always`,
-`stop_source = program`) is co-staged beside `memhog` in both cells: svctest's
-`svcmgr_stop_service` phase reads that svcmgr lists it, beside sessiond when that recipe is staged,
-as a stop source of the program class and that a job it started ends with it, and its `oom_policy`
-phase has it start a job that oomd stops before memhog; both phases pass without it. With
-`sessiond.svc` staged, the `oom_policy` phase also opens an operator session whose shell runs
-`crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's `sessiond_operator` phase
-checks sessiond's operator interface; both pass without it. The `reserve-creator` fixture
-(`reserve-creator.svc`, `reserve = yes`) is co-staged beside `memhog` in both cells: svctest's
-`logd_reserve` phase has it make a `CREATE_FROM_FILE | CREATE_RESERVE` of `/programs/hello` while
-memhog holds memory critical, which must succeed, and skips that check without it.
+Non-shutdown fixtures may co-stage alongside one harness; svctest's are staged by the fixture sets
+above, and each phase below skips, logging the skip line, when the staged set does not declare its
+fixture. `crasher` (`restart = always`, never shuts down) and its worker-fault role
+(`crasher-worker.svc`, `restart = on_failure`) are in the `ci` set, so their restart paths are
+exercised in the services-surface CI cell (svctest's `svcmgr_worker_fault_restart` phase drives the
+worker fault, and its `svcmgr_stop_service` phase stops and restarts the fixture through svcmgr's
+stop authority), as is its boot-fault role (`crasher-boot.svc`, `restart = on_failure`), whose
+instance that finds the token `/data/crasher-boot/die-early`, which the data partition ships,
+removes it and dies before its bootstrap request (svctest's `svcmgr_boot_death` phase); its bounded
+faults complete long before `svctest`'s terminal marker, so the kernel fault dump never clobbers it.
+The `memhog` fixture (`memhog.svc`, `restart = on_failure`, `oom_stop = yes`) is in the `ci` and
+`burn-in` sets: svctest's `oom_policy` phase has it fill memory until oomd stops it, and its
+`logd_reserve` phase has it fill memory while logd is killed and restarted. The CI svctest cell
+drops crashd, so the held-write path of that phase (a child's page fault crashd holds until oomd's
+stop frees memory), and the write part of the `memmgr_swap_commit` phase (a child's commitment past
+the draw room, its commit overruns held by crashd until write-out to swap opens memmgr's draw room),
+run in the burn-in svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart
+= always`, `stop_source = program`) is in both sets: svctest's `svcmgr_stop_service` phase reads
+that svcmgr lists it, beside sessiond, as a stop source of the program class and that a job it
+started ends with it, and its `oom_policy` phase has it start a job that oomd stops before memhog.
+The `oom_policy` phase also opens an operator session whose shell runs
+`/tests/fixtures/programs/crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's
+`sessiond_operator` phase checks sessiond's operator interface; sessiond, like oomd, is a default
+service, which every svctest boot stages. The `reserve-creator` fixture (`reserve-creator.svc`,
+`reserve = yes`) is in both sets: svctest's `logd_reserve` phase has it make a `CREATE_FROM_FILE |
+CREATE_RESERVE` of `/programs/hello` while memhog holds memory critical, which must succeed.
 
 **Test isolation.** The functional harness boots run a controlled substrate:
 they drop the autostarted `terminal` (a user-facing program, not part of the
@@ -1120,23 +1190,22 @@ which would restore it). The terminal is exercised in its own boot
 drops `crashd.svc`, so one boot per cell runs the image without the crash
 service (see Crash reports above).
 
-CI matrix cells follow these rules per boot. The `usertest` cell boots `usertest` first (via
-`run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the default boot
-(terminal present), `cargo xtask test --cell usertest --lanes 3` runs the cell's cases in three
-lanes side by side, each lane on its own copy of the checkout and its cases one after another in the
-registry's order ([xtask/README.md § Cells](../xtask/README.md#cells)): the
-`terminal` case's boot, the `signing` case's eight boots, the `dma-confinement` case's two boots,
-the `rollback` case's three boots, the
-`enrolment` case's six boots, the `secureboot` case's four boots, the
-`wedge` case's boot pair, on x86_64 the `vmgenid` case's save/restore boot pair, and the `shutdown`
-case's boots, nine on x86_64 (the reboot, the power button and the seven core deaths) and eight on
-riscv64. The `ktest` cell's cases are the `kaslr` case's three boots; the `svctest` cell has none.
-The terminal and wedge boots have *no* shutdown-invoking harness: the `terminal` and `wedge` cases
-compute the verdict host-side and kill QEMU themselves. The reboot boot's fixture invokes `REBOOT`,
-the host reads the reset over QMP, and QEMU exits on its own. Each core-death boot is powered off by
-the death it makes, read over QMP, and QEMU exits on its own. The power-button boot is powered off
-by its press: the host presses the button over QMP, reads the power-off there, and QEMU exits on its
-own.
+CI matrix cells follow these rules per boot. The `usertest` cell boots `usertest` first (via `run
+--runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the default boot (terminal
+present), `cargo xtask test --cell usertest --lanes 3` runs the cell's cases in three lanes side by
+side, each lane on its own copy of the checkout and its cases one after another in the registry's
+order ([xtask/README.md § Cells](../xtask/README.md#cells)): the `terminal` case's boot, the
+`signing` case's eight boots, the `dma-confinement` case's two boots, the `rollback` case's three
+boots, the `enrolment` case's six boots, the `secureboot` case's four boots, the `wedge` case's boot
+pair, on x86_64 the `vmgenid` case's save/restore boot pair, the `storage-roles` case's four boots,
+and the `shutdown` case's boots, nine on x86_64 (the reboot, the power button and the seven core
+deaths) and eight on riscv64. The `ktest` cell's cases are the `kaslr` case's three boots; the
+`svctest` cell has none. The terminal and wedge boots have *no* shutdown-invoking harness: the
+`terminal` and `wedge` cases compute the verdict host-side and kill QEMU themselves. The reboot
+boot's fixture invokes `REBOOT`, the host reads the reset over QMP, and QEMU exits on its own. Each
+core-death boot is powered off by the death it makes, read over QMP, and QEMU exits on its own. The
+power-button boot is powered off by its press: the host presses the button over QMP, reads the
+power-off there, and QEMU exits on its own.
 
 A local run of a cell takes `--lanes` as CI does when the host allows it: each lane's boots are
 small boots of the host launch rules
@@ -1150,11 +1219,12 @@ another.
 
 ## Coverage tiers
 
-The matrix CI exercises is exhaustive in three dimensions and fixed in the
-rest. Coverage is tiered so the fixed dimensions still get exercised — just
+The matrix CI exercises is exhaustive in three dimensions, over the cells a change owes, and
+fixed in the rest. Coverage is tiered so the fixed dimensions still get exercised — just
 not on every push.
 
-**Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
+**Dimension inventory.** Exhaustive per CI run, over the cells its change owes
+([conventions.md § CI Gating](conventions.md#ci-gating)): architecture (x86_64,
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest), and the `bench` cell
 beside them (release, one CPU and four, under icount; [Benchmarks](#benchmarks-bench-cell)).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
@@ -1190,10 +1260,10 @@ to the tiers below.
 
 | Tier | Where | When | Coverage |
 |---|---|---|---|
-| Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots) |
+| Canonical | `build-test.yml` | every push / PR: the cells its change owes ([conventions.md § CI Gating](conventions.md#ci-gating)) | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof (`cargo xtask kani`, [Bounded verification](#bounded-verification)) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
 
 **Cells.** A cell is one launch configuration and the boots made on it; each differs from every
 other cell in that configuration, which is why it stands alone. The table states every cell, its
@@ -1207,13 +1277,13 @@ registry runs it on (its `md-test-cells` rule).
 | Cell | Tier | Architectures | Launch | Cases | Covers |
 |---|---|---|---|---|---|
 | `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
-| `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
+| `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `storage-roles`, `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
 | `bench` | Canonical | x86_64, riscv64; release | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |
 | 4kn | Local and release host runs | x86_64, riscv64; debug | svctest from a 4Kn disk (`mkdisk --block-size 4096`) | none | 4096-byte logical blocks (Disk variations below) |
-| second-disk | Local and release host runs | x86_64, riscv64; debug | svctest with `/data` on a second disk (`mkdisk --split-data`, `--second-disk`) | none | the data partition on its own disk |
+| second-disk | Local and release host runs | x86_64, riscv64; debug | svctest with `/data` and swap on a second disk (`mkdisk --split-data`, `--second-disk`) | none | the data and swap partitions on their own disk, named by the storage statement |
 | shared-line | Local and release host runs | x86_64, riscv64; debug | as second-disk, both disks on one `INTx` line (`--second-disk-shared-line`) | none | two virtio-blk devices served on one interrupt line |
 | oversize-block | Local and release host runs | x86_64, riscv64; debug | svctest with a second disk at 8192-byte blocks (`--second-disk-block-size 8192`) | none | the refusal of a disk above virtio-blk's largest block size |
 | no-iommu | Local and release host runs | x86_64, riscv64; debug | svctest with the IOMMU detached (`--iommu absent`) | none | devmgr's unconfined path (Release host runs below) |
@@ -1652,14 +1722,14 @@ the cells of every surface a non-inert line of its own diff is on.
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
 | Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, `core/kernel/src/arch/riscv64/aia_encoding.rs`, `core/kernel/src/arch/x86_64/msi.rs`, and `core/kernel/src/arch/x86_64/remap.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, `sys_irq_split`, `sys_irq_msg_alloc`, `sys_irq_route`, and `sys_irq_remap`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, the message-signaled targets' slots (`alloc_message_target`, `free_message_target`, and the slot entry a delivery reads, `slot_entry`), and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, `select_ioapics`, and the allocation of the per-CPU device-vector rows the routes and targets take (`init_vector_storage`)); the interrupt-remapping switch and the entries it needs (`set_remap`, `remap_entry`, and `remap_handles`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes and targets take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules, as files (`shared/ipc/src/devmgr_labels.rs`, `shared/ipc/src/devmgr_errors.rs`, `shared/ipc/src/devmgr_dma_labels.rs`, `shared/ipc/src/devmgr_dma_errors.rs`, and `shared/ipc/src/device_info_kind.rs`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, `RISCV_IOMMU_DEVICE`, `X86_IOMMU_DEVICE`, and `X86_MACHINE_SPLIT_IRQCHIP`) | every device cell |
-| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, its GPT writer `xtask/src/gpt.rs`, its FAT writer `xtask/src/fat.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers, as files (`shared/ipc/src/vfsd_labels.rs`, `shared/ipc/src/vfsd_errors.rs`, `shared/ipc/src/fs_labels.rs`, `shared/ipc/src/fs_errors.rs`, `shared/ipc/src/blk_labels.rs`, and `shared/ipc/src/blk_errors.rs`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_line`, `DiskLine`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
+| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), the storage statement's crate `shared/storage-statement/`, `xtask/src/disk.rs`, its GPT writer `xtask/src/gpt.rs`, its FAT writer `xtask/src/fat.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers, as files (`shared/ipc/src/vfsd_labels.rs`, `shared/ipc/src/vfsd_errors.rs`, `shared/ipc/src/fs_labels.rs`, `shared/ipc/src/fs_errors.rs`, `shared/ipc/src/blk_labels.rs`, and `shared/ipc/src/blk_errors.rs`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_line`, `DiskLine`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
 | virtio-rng and the `hwrng` class | `services/drivers/virtio/rng/`, its class protocol crate (`shared/hwrng-protocol/`), and svctest's hwrng checks, which drive it (by definition alone: `hwrng_read_phase`, `hwrng_restart_phase`, `hwrng_read`, and `hwrng_denied`) | no-iommu |
-| virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test/debug_port/echo.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test/debug_port/gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
+| virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/fixtures/debug-echo/` and `xtask/src/commands/test/debug_port/echo.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test/debug_port/gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module, a file (`shared/ipc/src/test_dma_labels.rs`), the launchers' `edu` attachment (`EDU_DEVICE`), and svctest's DMA confinement, MSI delivery, MSI forge, MSI churn and MSI release checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, `msi_forge_phase`, `msi_churn_phase`, `msi_release_phase`, `iommu_restart_phase`, and `call_test_dma`) | no-iommu, and hotplug |
-| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test/hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
+| PCI Express hotplug | the fixture and the host test that drive it (`services/fixtures/hotplug-check/` and `xtask/src/commands/test/hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay` and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | TPM 2.0, and the bootloader's seed of its registers | `services/drivers/tpm/`, its class protocol crate (`shared/hwrng-protocol/`), which the virtio-rng row lists too, the host test that drives it (`xtask/src/commands/test/tpm.rs`), and the launchers' TPM attachment (`Tpm`, `TpmInterface`, and `tpm_args`); and the bootloader's `TPM2` table seed, which only a boot with a TPM takes (`tpm2_register_window`, `tpm_register_window`, `TPM2_OFF_CONTROL_AREA`, `TPM2_OFF_START_METHOD`, `TPM2_MIN_LEN`, `TPM2_START_FIFO`, and `TPM2_START_CRB`) | tpm |
@@ -1690,13 +1760,15 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     core/kernel/src/irq.rs core/kernel/src/arch/x86_64/ioapic.rs \
     core/kernel/src/arch/riscv64/aia.rs core/kernel/src/arch/riscv64/aia_encoding.rs \
     core/kernel/src/arch/x86_64/msi.rs core/kernel/src/arch/x86_64/remap.rs services/vfsd/ \
-    xtask/src/disk.rs xtask/src/gpt.rs xtask/src/fat.rs xtask/src/commands/mkdisk.rs \
+    shared/storage-statement/ xtask/src/disk.rs xtask/src/gpt.rs xtask/src/fat.rs \
+    xtask/src/commands/mkdisk.rs \
     services/drivers/virtio/blk/ services/fs/fat/ \
     services/drivers/virtio/input/ services/drivers/virtio/rng/ shared/hwrng-protocol/ \
     services/drivers/test-dma/ services/drivers/framebuffer/ \
-    services/drivers/virtio/console/ services/debug-echo/ \
+    services/drivers/virtio/console/ services/fixtures/debug-echo/ \
     xtask/src/commands/test/debug_port/echo.rs \
-    services/hotplug-check/ xtask/src/commands/test/hotplug.rs services/acpid/src/hotplug.rs \
+    services/fixtures/hotplug-check/ xtask/src/commands/test/hotplug.rs \
+    services/acpid/src/hotplug.rs \
     shared/gdb-rsp/ services/gdbstub/ xtask/src/debug_stub.rs \
     xtask/src/commands/test/debug_port/gdb.rs \
     core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/ \
@@ -1789,35 +1861,31 @@ timing report is neither a HANG nor a failure.
 
 **Disk variations.** Four svctest boots, on each architecture, vary the disk: a 4Kn disk (`mkdisk
 --block-size 4096`), booted from a 4096-byte-block ESP with its root and data partitions at
-4096-byte blocks; the data partition alone on a second disk (`mkdisk --split-data`, booted with
-`--second-disk disk-data.img`), so `/data` lives only there; the same second disk on the first
-disk's `INTx` line (`--second-disk-shared-line`, which launches both disks with no MSI-X), so the
-svctest phases that read `/data` pass only when devmgr serves both virtio-blk devices on one line (a
-lost interrupt costs a disk request up to its interrupt-service thread's timed read, `ISR_POLL_MS`,
-not the boot, so the boot's time, not its outcome, shows whether both drivers acknowledge every
-delivery); and a second disk at 8192-byte blocks (`--second-disk-block-size
-8192`), above virtio-blk's `MAX_BLOCK_SIZE` (4096), which the boot goes on without. The storage and
-device documents own what each boot exercises ([storage.md](storage.md) § GPT Role-GUID Discovery,
-[device-management.md](device-management.md) § Relationship to Other Services and § Interrupt
-Delivery), and [xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the options. svctest is
-staged as the canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is
-the larger of three times the slowest of these boots on the reference host (the riscv64 8192-byte
-boot, 133 s) and that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above
-follow; a change to these boots' times re-derives it. Each boot is a storage cell (Device surfaces
-above): in the commands below, 4kn is the first `run --runs` boot, second-disk the second,
-shared-line the third, and oversize-block the fourth, each after the `mkdisk` before it; a PR that
-owes some of the cells runs those boots, and the release host runs run all four.
+4096-byte blocks; the data and swap partitions on a second disk, which the storage statement the
+pack stages names (`mkdisk --split-data`, booted with `--second-disk disk-data.img`), so `/data`
+lives only there; the same second disk on the first disk's `INTx` line (`--second-disk-shared-line`,
+which launches both disks with no MSI-X), so the svctest phases that read `/data` pass only when
+devmgr serves both virtio-blk devices on one line (a lost interrupt costs a disk request up to its
+interrupt-service thread's timed read, `ISR_POLL_MS`, not the boot, so the boot's time, not its
+outcome, shows whether both drivers acknowledge every delivery); and a second disk at 8192-byte
+blocks (`--second-disk-block-size 8192`), above virtio-blk's `MAX_BLOCK_SIZE` (4096), which the boot
+goes on without. The storage and device documents own what each boot exercises
+([storage.md](storage.md) § GPT Role-GUID Discovery, [device-management.md](device-management.md) §
+Relationship to Other Services and § Interrupt Delivery), and
+[xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the options. svctest is staged as the
+canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is the larger of
+three times the slowest of these boots on the reference host (the riscv64 8192-byte boot, 133 s) and
+that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above follow; a change
+to these boots' times re-derives it. Each boot is a storage cell (Device surfaces above): in the
+commands below, 4kn is the first `run --runs` boot, second-disk the second, shared-line the third,
+and oversize-block the fourth, each after the `mkdisk` before it; a PR that owes some of the cells
+runs those boots, and the release host runs run all four.
 
 ```sh
 # Disk variations, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
-cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/crasher-boot.svc \
-    sysroot/config/svcmgr/tests/memhog.svc sysroot/config/svcmgr/tests/stopsrc.svc \
-    sysroot/config/svcmgr/tests/reserve-creator.svc sysroot/config/svcmgr/services/
-cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
-cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
+cargo xtask mkdisk --arch <arch> --repack-only --svctest ci --block-size 4096
 cargo xtask run --arch <arch> --runs 1 --timeout 420 \
     --test-devices
 cargo xtask mkdisk --arch <arch> --repack-only --split-data
@@ -1849,13 +1917,8 @@ is the framebuffer device cell (Device surfaces above).
 ```sh
 # Framebuffer cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
-cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/crasher-boot.svc \
-    sysroot/config/svcmgr/tests/memhog.svc sysroot/config/svcmgr/tests/stopsrc.svc \
-    sysroot/config/svcmgr/tests/reserve-creator.svc sysroot/config/svcmgr/services/
-cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
-cargo xtask mkdisk --arch <arch> --repack-only
+cargo xtask mkdisk --arch <arch> --repack-only --svctest ci
 cargo xtask run --arch <arch> --runs 1 --timeout 360 \
     --display framebuffer --test-devices --fail-also 'framebuffer case skipped'
 ```
@@ -1886,12 +1949,12 @@ hot-adds behind one, withdraws it when the host removes the device, binds it aga
 adds it again, and binds the drivers directory's virtio-blk to the disk the host then hot-adds
 behind the other, with no MSI-X vectors, on its wired interrupt line. In the two storage boots, vfsd
 tears down the mount of a disk removed behind a port and mounts it again when it is added again,
-resolves the data role across a copy of the disk added beside it, and ends at the loss of its root
-filesystem's driver and of the boot disk. The command stages and unstages its own files on the
-current sysroot, a debug-profile build. It bounds each boot to its markers by five minutes, the
-fixture's probes and the disk's bind by three minutes after each hot-add, and the removal by one
-minute from `device_del`; it has no boot budget. The boots are the hotplug device cell
-(Device surfaces above).
+refuses the data role once a copy of the disk added beside it carries the named partition too, and
+ends at the loss of its root filesystem's driver and of the boot disk. The command stages and
+unstages its own files on the current sysroot, a debug-profile build. It bounds each boot to its
+markers by five minutes, the fixture's probes and the disk's bind by three minutes after each
+hot-add, and the removal by one minute from `device_del`; it has no boot budget. The boots are the
+hotplug device cell (Device surfaces above).
 
 ```sh
 # Hotplug cell, per architecture (clean between architectures):
@@ -1935,18 +1998,24 @@ Release Production, step 4), these MUST be run on the commit to be tagged, or on
 that contains the version bump when the change from it to the commit to be tagged is documentation
 or comments only as this section defines that: the whole boundary set (riscv64 16 and 128 harts,
 x86_64 16 and 128 vCPUs) once each (`--runs 1`) in the debug profile and once each in the release
-profile (`cargo xtask build --release`, then the same `run` command, per the boundary
-commands above), and the memory variation and every device cell (the disk variations, the no-IOMMU
-variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM
-cell) once each, so every tag boots at each boundary CPU count in both profiles (CI boots release
-builds only at 4 CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, with a
-debug port, with a hot-added device, on CET shadow stacks, and with a TPM, and runs the timing
-report on the boundary logs, which is reported and blocks nothing. A tag's repeated-run check is the
-burn-in tier, which the tag push starts. The no-IOMMU variant, the no-iommu device cell, boots
-svctest once on each architecture with the machine's IOMMU detached, so devmgr's unconfined path
-still serves every driver (svctest staged as `build-test.yml` stages it, on a debug-profile
-sysroot). A run whose outcome is not a pass, as When the runs are owed classifies outcomes, blocks
-the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
+profile (`cargo xtask build --release`, then the same `run` command, per the boundary commands
+above), and the memory variation and every device cell (the disk variations, the no-IOMMU variant,
+the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once
+each, and every bounded proof (`cargo xtask kani` with no option, [Bounded
+verification](#bounded-verification)), and the fuzz campaign (§ Fuzzing): a manual dispatch of
+`fuzz.yml` on `master` while the commit to be tagged is its head (`gh workflow run fuzz.yml --ref
+master`), at the default time per target, whose run's head commit is that commit and whose
+conclusion is `success`, the report giving the run's URL as its command, `--runs 1`, and `PASS` as
+its outcome when the conclusion is `success`; so every tag boots at each boundary CPU count in both
+profiles (CI boots release builds only at 4 CPUs), from a 4Kn disk, from two disks, with no IOMMU,
+with a framebuffer, with a debug port, with a hot-added device, on CET shadow stacks, and with a
+TPM, carries every proof a pull request's selection may have left unverified and a campaign of every
+fuzz target, and runs the timing report on the boundary logs, which is reported and blocks nothing.
+A tag's repeated-run check is the burn-in tier, which the tag push starts. The no-IOMMU variant, the
+no-iommu device cell, boots svctest once on each architecture with the machine's IOMMU detached, so
+devmgr's unconfined path still serves every driver (svctest staged as `build-test.yml` stages it, on
+a debug-profile sysroot). A run whose outcome is not a pass, as When the runs are owed classifies
+outcomes, blocks the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
 
 ```sh
 # No-IOMMU variant, each architecture (svctest staged, debug profile):
@@ -2084,7 +2153,8 @@ per edge and compare tracing) and, where the host target supports it, AddressSan
   fixes it. A `#[cfg(test)]` test of the crate runs the property on every one, so
   `cargo xtask test` replays them on each change, on the host and under riscv64 emulation.
 - Its target: `xtask/fuzz/targets/src/bin/<target>.rs`, which names the property, the inputs'
-  directory, and the longest input the engine makes.
+  directory, and the longest input the engine makes, and one line for it in each of the two
+  name-ordered lists of `xtask/fuzz/targets/Cargo.toml`, the binaries and the parser crates.
 
 **The engine.** Each run is AFL-style: a queue of the inputs that reached a new edge or a new
 hit-count bucket of one; havoc mutations and splices of the queued inputs; a dictionary of the
@@ -2109,8 +2179,8 @@ fails as the search did, on any host. The run exits non-zero.
 
 | Tier | Where | When | Runs |
 |---|---|---|---|
-| Gating | CI, the `fuzz` job of `build-test.yml` | every push and pull request | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
-| Campaign | CI, `fuzz.yml` | weekly, and on a manual dispatch | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
+| Gating | CI, the `fuzz` job of `build-test.yml` | a change that can affect a crate it fuzzes, its engine, xtask or the workflows; skipped as not owed otherwise | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
+| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
 | Local | developer host | at will | `cargo xtask fuzz <target>` with `--runs` or `--time` |
 
 The self-test runs the engine on planted defects in `xtask/fuzz/targets` (an eight-byte magic
@@ -2118,8 +2188,10 @@ compared as one integer, a length field whose add overflows, and a state reached
 three nested records with no checksum) and fails unless each is found within its execution budget
 from seed 0, twice, at the same execution with the same minimized input.
 
-The campaign gates nothing. A red campaign run is a finding, recorded as
-[conventions.md](conventions.md#recording-findings) § Recording findings says.
+The campaign gates no merge: a red campaign run is a finding, recorded as
+[conventions.md](conventions.md#recording-findings) § Recording findings says. The campaign the
+release host runs dispatch on the commit to be tagged gates the tag (§ Coverage tiers, Release host
+runs).
 
 **Predating defects.** A failing input the gating job finds on a pull request whose own diff does
 not introduce the defect (the same run fails at the merge base) is fixed first, in its own PR or
@@ -2144,20 +2216,46 @@ to the rules of [coding-standards.md](coding-standards.md#proof-harnesses) § Pr
 every crate that holds one, each crate built in its host test configuration, with the pinned Kani
 release ([build-system.md](build-system.md#toolchain) § Toolchain). It fails on any failed,
 undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a
-harness in a crate it does not register. CI's `kani` job runs it on every push and pull request,
-and the merge waits on it ([build-system.md](build-system.md#continuous-integration)
+harness that lies in no package. It finds the crates from their harnesses, so a crate's first
+harness adds it to the run. It holds each process of the run to the address space CI's runner can
+give a harness, so a harness that needs more fails, named as out of memory, and it closes with
+every harness's verdict and verification time.
+
+**Time budget.** A harness MUST verify in at most 120 s on CI's `kani` runner, the verification
+time Kani reports for it, beside the memory bound below. `cargo xtask kani` fails a harness over
+the budget on a CI runner, naming it and its time, and warns of it on another host, whose speed
+differs. A harness that cannot meet the budget is resized, by bounds that still cover its property,
+or proved in the induction form of the parser proofs below, or split into harnesses that together
+cover the inputs it covered; no property is dropped or narrowed to meet it. A PR that resizes a
+harness for the budget states its time before and after.
+
+**Where the proofs run.** On a pull request, CI's `kani` job verifies only the crates the change
+can affect (`cargo xtask kani --since` against the base the `select` job found, the newest commit
+before the run's whose `master` run passed; [conventions.md](conventions.md#ci-gating) § CI
+Gating): a crate that holds a harness and whose own package, a workspace package in its
+dependency closure, or a file those read, the change touches, and every such crate when the
+change touches an input of every build (the workspace manifest and lock file, Cargo's
+configuration, the toolchain pin, the command's own sources and the job itself). That selection
+gates the merge, and a pull request that affects no such crate ends the job without installing
+Kani, with a notice on the run that it verified nothing. On a push to `master` the job runs the
+same selection from the same kind of base, so a harness a red `master` run left unproven stays
+owed until a run proves it. The whole set runs in the `kani` job of `burnin.yml`, on each tag
+push and on a manual dispatch, and in the release host runs (§ Coverage tiers), so a change the
+selection missed is found before a tag ([build-system.md](build-system.md#continuous-integration)
 § Continuous Integration).
 
 **Local sizing.** A harness is sized on the development host before CI runs it. The author of a
 change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
 with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries
-it, every process of the run limited to an address space of 16 GB, the memory of CI's `kani`
-runner ([GitHub's standard Linux runner for a public
-repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)). On a
-Linux host, `prlimit --as=16000000000 cargo xtask kani ...` sets that limit where the command
-does not set it itself. A run that the limit ends (an allocation failure, or a process killed)
+it, under the limit the command sets on every process of the run: 12 GiB of address space, the share
+of the 16 GB of CI's `kani` runner ([GitHub's standard Linux runner for a public
+repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)) that
+leaves 4 GB to the runner's own processes, so a harness that fits under it locally fits on the
+runner. A run that the limit ends (an allocation failure, or a process killed)
 or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
-still cover the property or by the induction form of the parser proofs below. A failed,
+still cover the property or by the induction form of the parser proofs below; a run whose time
+on the development host is near or over the time budget is a harness that CI's runner may fail,
+made to fit the same way. A failed,
 undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
 or the harness, fixed as such, and MUST NOT be bounded away. The PR body's `## Validation`
 section states, for each such harness, the verification time Kani reports, the peak resident
@@ -2178,17 +2276,16 @@ runs the property, or its check of one structure the parser decodes (a header, a
 first `len` bytes of `kani::any::<[u8; N]>()`, `len` itself any value up to N, so the check holds
 for every input of at most N bytes, not only for the inputs a search reached; its comment states N
 and why inputs of that length cover the structure. Where a harness of the whole property does not
-complete within the gating job, the parser MUST write each loop over a structure of variable length
+complete within the time budget, the parser MUST write each loop over a structure of variable length
 (the walk of an array, a search over its entries, a checksum over its bytes) as a step over a small
 state, which two harnesses prove by induction: a base harness, that the loop starts in an invariant
 the harness states, and a step harness, that one step from any state in the invariant (`kani::any`
 under `kani::assume`) keeps it and does what the property asks of that step, with no loop to
 unwind. Code other than the loops that drive the steps and the reads that feed them MUST NOT lie
 outside the harnesses; the module's comment states how its harnesses compose into the property and
-names those loops and reads, with the drivers that check them. The crate's first harness registers
-it with `cargo xtask kani`. Implemented for the GPT parser
-(`services/vfsd/gpt`); design intent, not yet implemented, for every other parser of hostile input,
-none of which holds a property function yet.
+names those loops and reads, with the drivers that check them. Implemented for the parsers whose
+crates hold a `property` module, each with its fuzz target in `xtask/fuzz/targets`; design
+intent, not yet implemented, for every other parser of hostile input.
 
 ---
 
@@ -2318,9 +2415,10 @@ cargo xtask build
 cp sysroot/config/svcmgr/tests/gdb-target.svc sysroot/config/svcmgr/services/
 cargo xtask mkdisk --repack-only
 cargo xtask run --debug-port 4561 --debug-target gdb-target   # in one shell
+# in another shell:
 gdb -ex 'set architecture i386:x86-64' -ex 'set remotetimeout 30' \
     -ex 'target remote localhost:4561' \
-    "symbols/$(awk '$1 == "/programs/debugger" {print $2}' symbols/manifest)"  # in another
+    "symbols/$(awk '$1 == "/tests/fixtures/programs/debugger" {print $2}' symbols/manifest)"
 ```
 
 ---
@@ -2331,7 +2429,7 @@ The identifier `usertest` formerly named the services-tier harness, which
 lived at `base/usertest/`. The rename pass that landed under PR #119
 relocated that harness to `services/svctest/`, freeing the `usertest`
 name. As of this document, `usertest` is the programs-surface
-orchestrator at `services/usertest/`. References to `usertest` in commit
+orchestrator at `programs/usertest/`. References to `usertest` in commit
 history before that rename refer to the prior services-tier harness.
 
 See [conventions.md](conventions.md) for the original historical-naming
@@ -2344,33 +2442,32 @@ note in full.
 [README.md](../README.md), [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [core/ktest/README.md](../core/ktest/README.md), [Build System](build-system.md),
 [Console Model](console-model.md), [Project Conventions](conventions.md),
-[Threat Model](threat-model.md),
-[programs/capexhaust/README.md](../programs/capexhaust/README.md),
-[programs/crashme/README.md](../programs/crashme/README.md),
-[programs/deadline/README.md](../programs/deadline/README.md),
-[programs/debugger/README.md](../programs/debugger/README.md),
-[programs/demandpaged/README.md](../programs/demandpaged/README.md),
-[programs/fsbench/README.md](../programs/fsbench/README.md),
-[programs/hello/README.md](../programs/hello/README.md),
-[programs/pipefault/README.md](../programs/pipefault/README.md),
-[programs/pipestress/README.md](../programs/pipestress/README.md),
-[programs/relrofault/README.md](../programs/relrofault/README.md),
+[Threat Model](threat-model.md), [programs/hello/README.md](../programs/hello/README.md),
 [programs/shell/README.md](../programs/shell/README.md),
-[programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
-[programs/stdiotest/README.md](../programs/stdiotest/README.md),
 [programs/terminal/README.md](../programs/terminal/README.md),
-[programs/threadchurn/README.md](../programs/threadchurn/README.md),
-[programs/threadstack/README.md](../programs/threadstack/README.md),
-[programs/ubench/README.md](../programs/ubench/README.md),
+[programs/usertest/README.md](../programs/usertest/README.md),
 [services/crashd/README.md](../services/crashd/README.md),
-[services/crasher/README.md](../services/crasher/README.md),
-[services/debug-echo/README.md](../services/debug-echo/README.md),
 [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md),
+[services/fixtures/capexhaust/README.md](../services/fixtures/capexhaust/README.md),
+[services/fixtures/crasher/README.md](../services/fixtures/crasher/README.md),
+[services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md),
+[services/fixtures/deadline/README.md](../services/fixtures/deadline/README.md),
+[services/fixtures/debug-echo/README.md](../services/fixtures/debug-echo/README.md),
+[services/fixtures/debugger/README.md](../services/fixtures/debugger/README.md),
+[services/fixtures/demandpaged/README.md](../services/fixtures/demandpaged/README.md),
+[services/fixtures/fsbench/README.md](../services/fixtures/fsbench/README.md),
+[services/fixtures/hotplug-check/README.md](../services/fixtures/hotplug-check/README.md),
+[services/fixtures/pipefault/README.md](../services/fixtures/pipefault/README.md),
+[services/fixtures/pipestress/README.md](../services/fixtures/pipestress/README.md),
+[services/fixtures/relrofault/README.md](../services/fixtures/relrofault/README.md),
+[services/fixtures/stackoverflow/README.md](../services/fixtures/stackoverflow/README.md),
+[services/fixtures/stdiotest/README.md](../services/fixtures/stdiotest/README.md),
+[services/fixtures/threadchurn/README.md](../services/fixtures/threadchurn/README.md),
+[services/fixtures/threadstack/README.md](../services/fixtures/threadstack/README.md),
 [services/gdbstub/README.md](../services/gdbstub/README.md),
-[services/hotplug-check/README.md](../services/hotplug-check/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),
 [services/svctest/README.md](../services/svctest/README.md),
-[services/usertest/README.md](../services/usertest/README.md),
+[services/ubench/README.md](../services/ubench/README.md),
 [shared/aml/README.md](../shared/aml/README.md), [xtask/README.md](../xtask/README.md)

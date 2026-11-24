@@ -15,6 +15,7 @@
 
 mod acpi;
 mod arch;
+mod boot_device;
 mod console;
 mod dtb;
 mod elf;
@@ -41,8 +42,8 @@ use crate::uefi::{
     open_esp_volume, open_file, query_gop,
 };
 use boot_protocol::{
-    BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage,
-    KernelMmio, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice, MmioAperture,
+    BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootDevice, BootInfo, BootModule, FramebufferInfo,
+    InitImage, KernelMmio, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice, MmioAperture,
     MmioApertureSlice, ModuleSlice, RECLAIM_FLAG_LATE, ReclaimRange, ReclaimSlice,
     TRUST_STORE_MODULE, bundle,
 };
@@ -202,6 +203,9 @@ struct UefiContext
     bs: *mut EfiBootServices,
     esp_root: *mut EfiFileProtocol,
     framebuffer: FramebufferInfo,
+    /// The device the firmware booted from, which step 9 writes into
+    /// `BootInfo`.
+    boot_device: BootDevice,
 }
 
 /// Kernel ELF load result. The file read buffer is released inside
@@ -703,6 +707,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
             &boot_entropy,
             &kaslr,
             &ctx.framebuffer,
+            &ctx.boot_device,
             &allocs,
             &uefi_map,
             &page_table,
@@ -747,8 +752,10 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
 // ── Step 1: UEFI protocol discovery ──────────────────────────────────────────
 
 /// Resolve the UEFI protocols and handles the subsequent steps need: the
-/// `EFI_LOADED_IMAGE_PROTOCOL`, the ESP root directory, and the (optional)
-/// GOP framebuffer. Initializes the framebuffer backend of the early console.
+/// `EFI_LOADED_IMAGE_PROTOCOL`, the ESP root directory, the boot device
+/// record (the boot ESP's GPT descriptor and its controller's PCI location),
+/// and the (optional) GOP framebuffer. Initializes the framebuffer backend of
+/// the early console.
 ///
 /// # Safety
 /// `image` and `st` must be the UEFI firmware-supplied handle and system
@@ -768,6 +775,10 @@ unsafe fn step1_locate_uefi_protocols(
     let device_handle = unsafe { (*loaded_image).device_handle };
     // SAFETY: bs is valid; device_handle is the boot volume device handle.
     let esp_root = unsafe { open_esp_volume(bs, device_handle)? };
+    // The boot device's path is connected already, since the image loaded
+    // from it, so the read needs no `connect_all_controllers` first.
+    // SAFETY: bs is valid; device_handle is the boot volume device handle.
+    let boot_device = unsafe { read_boot_device(bs, device_handle) };
     // Force EDK2 to bind device drivers (e.g. virtio-gpu → GOP) on platforms
     // that don't auto-connect during BDS (notably RISC-V).
     // SAFETY: bs is valid boot services.
@@ -801,7 +812,47 @@ unsafe fn step1_locate_uefi_protocols(
         bs,
         esp_root,
         framebuffer,
+        boot_device,
     })
+}
+
+/// The boot device record of `device`, the loaded image's device handle,
+/// logged one line per part. A part the firmware does not report is absent from the
+/// record, and the bootloader goes on; vfsd, which takes the boot disk from the
+/// record, finds none without the ESP part (docs/storage.md § GPT Role-GUID
+/// Discovery).
+///
+/// # Safety
+/// `bs` must be valid boot services and `device` the device handle from the
+/// loaded image protocol.
+unsafe fn read_boot_device(bs: *mut EfiBootServices, device: EfiHandle) -> BootDevice
+{
+    // SAFETY: forwarded from the caller.
+    let (esp, location) = unsafe { uefi::boot_device(bs, device) };
+    match esp
+    {
+        Ok(esp) => bprintln!(
+            "[--------] boot: boot ESP: GPT partition {} ({} blocks)",
+            esp.partition_number,
+            esp.size_lba
+        ),
+        Err(reason) => bprintln!("[--------] boot: boot ESP: absent ({})", reason.as_str()),
+    }
+    if let Some(pci) = location
+    {
+        bprintln!(
+            "[--------] boot: boot controller: PCI {:04x}:{:02x}:{:02x}.{}",
+            pci.segment,
+            pci.bus,
+            pci.device,
+            pci.function
+        );
+    }
+    else
+    {
+        bprintln!("[--------] boot: boot controller: PCI location absent");
+    }
+    boot_device::record(esp.ok(), location)
 }
 
 // ── Step 2: Load bundle ──────────────────────────────────────────────────────
@@ -2515,6 +2566,7 @@ unsafe fn step9_populate_boot_info(
     boot_entropy: &BootEntropy,
     kaslr: &KaslrDecision,
     framebuffer: &FramebufferInfo,
+    boot_device: &BootDevice,
     allocs: &BootAllocations,
     uefi_map: &uefi::MemoryMapResult,
     page_table: &arch::current::BootPageTable,
@@ -2939,6 +2991,7 @@ unsafe fn step9_populate_boot_info(
                 vmgenid_paddr,
                 direct_map_base,
                 kaslr_flags,
+                boot_device: *boot_device,
             },
         );
     }

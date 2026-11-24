@@ -44,6 +44,7 @@ extern crate object;
 extern crate rustc_demangle;
 
 mod accel;
+mod affected;
 mod arch;
 mod argparse;
 mod benchmark;
@@ -68,7 +69,10 @@ mod gpt;
 mod guest;
 mod host_lock;
 mod image_check;
+mod layers;
+mod markdown;
 mod path_account;
+mod path_record;
 mod qemu;
 mod qemu_gdb;
 mod qmp;
@@ -78,6 +82,7 @@ mod secure_boot;
 mod signing;
 mod socket_dir;
 mod stack_sizes;
+mod svctest_stage;
 mod symbolize;
 mod sys;
 mod sysroot;
@@ -128,6 +133,7 @@ fn main()
         CliCommand::CryptoVectors(args) => commands::crypto_vectors::run(&ctx, args),
         CliCommand::Fuzz(args) => commands::fuzz::run(&ctx, args),
         CliCommand::Kani(args) => commands::kani::run(&ctx, args),
+        CliCommand::Cells(args) => commands::cells::run(&ctx, args),
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
         CliCommand::PathAccount(args) => commands::path_account::run(&ctx, args),
         CliCommand::BenchCheck(args) => commands::bench_check::run(&ctx, args),

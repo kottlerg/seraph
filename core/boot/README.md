@@ -45,6 +45,7 @@ core/boot/
     ├── enrolment.rs            # Enrolled trust store in a UEFI variable; trust requests
     ├── rollback.rs             # The machine's security floor in a boot-services UEFI variable
     ├── secure_boot.rs          # The firmware's UEFI Secure Boot state, read and logged
+    ├── boot_device.rs          # The boot device record: device-path walk and reduction
     └── arch/
         ├── mod.rs              # Re-exports the active arch module
         ├── x86_64/

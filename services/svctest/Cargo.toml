@@ -21,12 +21,16 @@ fat_parse = { path = "../fs/fat/fat-parse", package = "fatfs-parse" }
 elf = { path = "../../shared/elf" }
 # `SLOT_WORDS_PER_PAGE`: the memmgr_swap_client and memmgr_swap_raw phases bound
 # the slot-map pages memmgr keeps after the phase's takes by the map memmgr
-# grows.
+# grows. `commit::grow_need`: the memmgr_swap_commit phase sizes its
+# commitments by what memmgr's admission counts for them.
 free_pool = { path = "../memmgr/free-pool", package = "memmgr-free-pool" }
 # `READ`, its error codes, and `decode_reply`: the drivers phases read the
 # entropy driver through the `hwrng` class protocol.
 hwrng-protocol = { path = "../../shared/hwrng-protocol" }
 ipc = { path = "../../shared/ipc" }
+# The fixture record of svctest's staged recipe, and the fixtures it names:
+# svctest refuses a run whose image does not stage exactly the declared set.
+svctest-fixtures = { path = "fixtures" }
 # `TICK_MS`: the logd_reserve phase's creates wait out memhog's take-back of
 # the pages a destroy freed.
 mem-fill = { path = "../../shared/mem-fill" }
@@ -52,6 +56,9 @@ recv-pool = { path = "../../shared/recv-pool" }
 # the /data fs driver once per restart vfsd's budget for the mount allows, and
 # once more.
 restart-budget = { path = "../../shared/restart-budget" }
+# `PATH`: the vfsd phases that mount the data partition away from /data run
+# only when no storage statement names it for /data.
+storage-statement = { path = "../../shared/storage-statement" }
 syscall = { path = "../../shared/syscall" }
 # `MSG_DATA_WORDS_MAX`: the `fs_std` rename cell sizes its long leaf names
 # so two of them overflow the `FS_RENAME` data area, and the

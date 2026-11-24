@@ -22,6 +22,7 @@ use crate::esp::Knob;
 use crate::qemu::{
     DiskLine, Execution, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
 };
+use crate::svctest_stage::SvctestSet;
 
 args! {
     /// Top-level CLI entry point.
@@ -74,7 +75,8 @@ subcommands! {
         Clean(CleanArgs),
 
         /// Run Seraph's tests: without a case, check formatting and lint the test
-        /// code, then run the unit tests on the host and, built for riscv64,
+        /// code (and over the whole workspace the host crates, as `build` does),
+        /// then run the unit tests on the host and, built for riscv64,
         /// under QEMU's user-mode emulator; with a CASE, boot the current
         /// sysroot for that host-driven QEMU case; with `--cell`, run every
         /// case a CI validate cell runs (see xtask/README.md).
@@ -92,11 +94,21 @@ subcommands! {
         /// under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md).
         Fuzz(FuzzArgs),
         /// Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every
-        /// crate that holds one, with the pinned Kani release, and fail on any
-        /// failed, undetermined or unwinding-incomplete check, on a Kani release
-        /// other than the pinned one, and on a harness in an unregistered crate;
-        /// with `--pin`, print the pinned release (see xtask/README.md).
+        /// crate that holds one, or with `--since` of each crate a change can
+        /// affect, with the pinned Kani release, and fail on any failed,
+        /// undetermined or unwinding-incomplete check, on a Kani release other
+        /// than the pinned one, on a harness that lies in no package, and on CI's
+        /// runner on a harness over the time budget; with `--pin`, print the
+        /// pinned release (see xtask/README.md).
         Kani(KaniArgs),
+
+        /// Print the CI cells a change owes: each file the change from a base
+        /// commit touches, the class the layer record places it in and why, and
+        /// the validate cells and bench boots of its most demanding file; every
+        /// cell without a base. Fails on a file no row places. With
+        /// `--github-output`, append the matrices build-test.yml runs (see
+        /// xtask/README.md).
+        Cells(CellsArgs),
 
         /// Read preserved ktest boot logs (from `run --runs N --save-logs`) and
         /// print per-tier and per-cell wall times; with `--base` and `--wide`,
@@ -122,13 +134,13 @@ subcommands! {
         /// xtask/README.md.
         BenchBaseline(BenchBaselineArgs),
 
-        /// Account for every instruction of each kernel benchmark's measured
-        /// window: `trace` boots the bench-only ktest image at one CPU under
-        /// icount with QEMU's gdbstub, single-steps one iteration of each
-        /// benchmark, checks it against the counts, and attributes each
-        /// instruction to its function; `write` sets the traced
-        /// configurations side by side in the account document. See
-        /// xtask/README.md.
+        /// Account for every instruction of each gated benchmark's measured
+        /// window: `trace` boots a benchmark image (ktest's bench-only image,
+        /// or the init image with ubench) at one CPU under icount with a QEMU
+        /// plugin that counts every instruction, checks each window against
+        /// its sample and the counts, and attributes each instruction to its
+        /// function; `write` sets the traced configurations side by side in
+        /// the account documents. See xtask/README.md.
         PathAccount(PathAccountArgs),
 
         /// Resolve runtime addresses in a loaded ELF image (a binary, or the
@@ -262,12 +274,15 @@ impl CliCommand
             Self::Test(args) => args.unit_tests().then_some(&args.host.common),
             Self::CryptoVectors(args) => Some(&args.host),
             Self::Fuzz(args) => (!args.list).then_some(&args.host),
-            Self::Kani(args) => (!args.pin).then_some(&args.host),
+            Self::Kani(args) => (!args.pin && !args.list).then_some(&args.host),
             Self::CompareImages(args) => Some(&args.host),
             Self::Run(_)
+            | Self::Cells(_)
             | Self::KtestTiming(_)
             | Self::BenchCheck(_)
             | Self::BenchBaseline(_)
+            // A trace compiles the plugin before it boots, and its entry point
+            // admits the compile as a build.
             | Self::PathAccount(_)
             | Self::Symbolize(_)
             | Self::Mkdisk(_)
@@ -818,6 +833,17 @@ args! {
         #[arg(long)]
         pub harness: Option<Harness>,
 
+        /// Stage the svctest boot with the fixture set SET: svctest's recipe
+        /// and the set's fixture recipes copied from `config/svcmgr/tests/`
+        /// into `config/svcmgr/services/`, every other fixture's recipe
+        /// removed from it, the test class files of `config/devmgr/tests/`
+        /// copied into `config/devmgr/classes/`, and the set's record written
+        /// into the staged recipe's `env` line as `SVCTEST_FIXTURES`, which
+        /// svctest checks the image against. Refused when a recipe the set
+        /// needs is missing.
+        #[arg(long, value_name = "SET")]
+        pub svctest: Option<SvctestSet>,
+
         /// Stage a bootloader knob in `\EFI\seraph\`: `nokaslr` boots the
         /// kernel at its deterministic (un-randomized) layout, for GDB and
         /// symbolization; `mapredo` makes the bootloader redo the first
@@ -839,10 +865,12 @@ args! {
         #[arg(long, default_value = "512")]
         pub block_size: BlockSize,
 
-        /// Author the data partition alone on a second image, `disk-data.img`,
-        /// and only the ESP, root and swap partitions on `disk.img`; boot the pair
-        /// with `--second-disk disk-data.img`. Without it `disk.img` carries all
-        /// four and a `disk-data.img` an earlier authoring left is removed.
+        /// Author the data and swap partitions on a second image, `disk-data.img`,
+        /// and only the ESP and root partitions on `disk.img`, and stage the storage
+        /// statement naming the two; boot the pair with `--second-disk
+        /// disk-data.img`. Without it `disk.img` carries all four, and the statement
+        /// the split layout staged and a `disk-data.img` an earlier authoring left
+        /// are removed.
         #[arg(long)]
         pub split_data: bool,
     }
@@ -1040,9 +1068,21 @@ args! {
     pub struct KaniArgs
     {
         /// Verify the harnesses of this crate only, by its package name (one
-        /// `cargo xtask kani` registers).
+        /// that holds a harness).
         #[arg(long, value_name = "CRATE")]
         pub component: Option<String>,
+
+        /// Verify only the crates the change from COMMIT to the working tree
+        /// can affect: each crate whose package, a package in its dependency
+        /// closure, or a file one of them reads, the change touches; every
+        /// crate when it touches an input of every build.
+        #[arg(long, value_name = "COMMIT", conflicts_with_all = ["component", "harness"])]
+        pub since: Option<String>,
+
+        /// Print the package of each crate the run would verify and exit,
+        /// verifying nothing.
+        #[arg(long, conflicts_with = "harness")]
+        pub list: bool,
 
         /// Verify this harness only, by its path in the crate
         /// (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it.
@@ -1050,13 +1090,37 @@ args! {
         pub harness: Option<String>,
 
         /// Print the pinned Kani release and exit, verifying nothing.
-        #[arg(long, conflicts_with_all = ["component", "harness"])]
+        #[arg(long, conflicts_with_all = ["component", "harness", "since", "list"])]
         pub pin: bool,
 
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
         #[command(flatten)]
         pub host: HostArgs,
+    }
+}
+
+// ── Cells ─────────────────────────────────────────────────────────────────────
+
+args! {
+    pub struct CellsArgs
+    {
+        /// The base: the change from COMMIT to the working tree.
+        #[arg(long, value_name = "COMMIT", conflicts_with = "since_green")]
+        pub since: Option<String>,
+
+        /// The base: the newest commit of REV's first-parent history whose
+        /// build-test run on a push to master passed (read with gh), so a cell
+        /// a red or unfinished master run left unproven stays owed; every cell
+        /// when none is found or the runs cannot be read.
+        #[arg(long, value_name = "REV")]
+        pub since_green: Option<String>,
+
+        /// Append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): the
+        /// validate and bench matrices, whether each is owed, and which bench
+        /// boots are.
+        #[arg(long, value_name = "FILE")]
+        pub github_output: Option<PathBuf>,
     }
 }
 
@@ -1067,7 +1131,8 @@ args! {
     {
         /// The host-driven QEMU case to run against the populated sysroot (see
         /// xtask/README.md for each). Without a case or `--cell`, `test`
-        /// checks formatting, lints the test code and runs the unit tests.
+        /// checks formatting, lints the test code (and over the whole workspace
+        /// the host crates) and runs the unit tests.
         #[arg(value_name = "CASE", conflicts_with = "cell")]
         pub case: Option<TestCase>,
 
@@ -1208,6 +1273,10 @@ value_enum! {
         Vmgenid,
         /// PCI Express hotplug of a device and of a disk behind root ports.
         Hotplug,
+        /// vfsd gives each storage role to the boot disk or to the partition
+        /// the signed storage statement names, and none to a foreign disk or a
+        /// copy of the boot disk.
+        StorageRoles,
         /// The kernel's CET supervisor shadow stacks, under KVM (`x86_64`
         /// only).
         Cet,
@@ -1289,16 +1358,17 @@ args! {
 subcommands! {
     pub enum PathAccountCommand
     {
-        /// Boot the sysroot's bench-only ktest image (`build --ktest-bench-only
-        /// --limited-debug kernel,ktest`, `mkdisk --harness ktest`) at one CPU
-        /// under icount, trace one iteration of each benchmark, check each
-        /// window against the counts, and write the configuration's result
-        /// under target/xtask/path-account/.
+        /// Boot the sysroot's benchmark image, built with `--limited-debug
+        /// all` (ktest's bench-only image, `mkdisk --harness ktest`; or the init
+        /// image with ubench staged), at one CPU under icount with the
+        /// path-account plugin counting every instruction, check each gated
+        /// measurement's windows against their samples and the counts, and
+        /// write the configuration's result under target/xtask/path-account/.
         Trace(PathAccountTraceArgs),
 
-        /// Write the generated block of the account document from the result
+        /// Write the generated block of each account document from the result
         /// files of every configuration traced.
-        Write(PathAccountWriteArgs),
+        Write,
     }
 }
 
@@ -1313,17 +1383,10 @@ args! {
         #[arg(long)]
         pub release: bool,
 
-        /// The first sample index traced in each benchmark: the iteration
-        /// that records it and the 7 after it are stepped. From 1 to 92, so
-        /// the last stepped index stays below the smallest sample count of a
-        /// benchmark (100).
-        #[arg(long, default_value_t = 64)]
-        pub iteration: u32,
-
-        /// Saved logs of icount boots of the same tree and profile's bench-only
-        /// image built without `--limited-debug` (`run --icount --save-logs`),
-        /// whose lowest p50s are the reference counts each traced window must
-        /// equal.
+        /// Saved logs of icount boots of the same tree, profile and image
+        /// built without `--limited-debug` (`run --icount --save-logs`), whose
+        /// lowest p50s are the reference counts each traced p50 must lie within
+        /// the gate's band of.
         #[arg(long, value_name = "LOG", required = true)]
         pub reference: Vec<PathBuf>,
 
@@ -1331,17 +1394,13 @@ args! {
         #[arg(long, default_value_t = 3600)]
         pub timeout: u64,
 
+        /// Account the boot log and record the configuration's last trace
+        /// left under target/xtask/path-account/, without booting.
+        #[arg(long)]
+        pub reuse: bool,
+
         #[command(flatten)]
         pub host: BootHostArgs,
-    }
-}
-
-args! {
-    pub struct PathAccountWriteArgs
-    {
-        /// The account document, whose generated block is replaced.
-        #[arg(long, default_value = "core/kernel/docs/hot-path-account.md")]
-        pub doc: PathBuf,
     }
 }
 
@@ -1404,6 +1463,12 @@ args! {
         /// Write this host's environment (the ENV file's keys) to FILE.
         #[arg(long, value_name = "FILE")]
         pub write_env: Option<PathBuf>,
+
+        /// A suite whose boot did not run, whose baselines are not checked:
+        /// `ktest` when the bench cell skips its ktest boots. Repeatable; a
+        /// log that measures the suite fails the command.
+        #[arg(long, value_name = "SUITE")]
+        pub skip_suite: Vec<String>,
 
         /// The saved run logs, one per run, all of one architecture.
         #[arg(required = true, value_name = "LOG")]
@@ -2039,8 +2104,10 @@ mod tests
         assert!(build_host_of(&["xtask", "lint-docs"]).is_none());
         assert!(build_host_of(&["xtask", "host", "status"]).is_none());
         assert!(build_host_of(&["xtask", "fuzz", "--list"]).is_none());
-        // Printing the pinned Kani release compiles nothing.
+        // Printing the pinned Kani release, or the crates a run would
+        // verify, compiles nothing.
         assert!(build_host_of(&["xtask", "kani", "--pin"]).is_none());
+        assert!(build_host_of(&["xtask", "kani", "--since", "HEAD", "--list"]).is_none());
         // A case or a cell boots, and admits each boot itself.
         assert!(build_host_of(&["xtask", "test", "kaslr"]).is_none());
         assert!(build_host_of(&["xtask", "test", "--cell", "usertest"]).is_none());

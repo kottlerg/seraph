@@ -16,6 +16,7 @@ xtask/
 │   └── ktest-timing/           # Checked-in ktest timing baselines (see ktest-timing)
 ├── fuzz/                       # The fuzzing engine (engine/) and the fuzz targets (targets/);
 │                               #   see Sub-crates and § `cargo xtask fuzz`
+├── path-account-plugin/        # The QEMU TCG plugin of `path-account trace` (see Sub-crates)
 ├── src/
 │   ├── main.rs                 # Entry point; dispatches CliCommand
 │   ├── cli.rs                  # The command table: every command's arguments
@@ -43,8 +44,13 @@ xtask/
 │   │                           #   and the report of QEMU's exit under a harness
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── image_check.rs          # The check every pack makes of the images it wrote (fsck.fat, ESP)
-│   ├── path_account.rs         # The per-path instruction account: counter reads, the window,
-│   │                           #   attribution, the result file, the document's block
+│   ├── layers.rs               # The layer record: the class of each path, which sets the CI
+│   │                           #   cells a change to it owes (cells)
+│   ├── markdown.rs             # Fenced code blocks, as lint-docs and the PR and Issue checks read
+│   │                           #   Markdown
+│   ├── path_account.rs         # The per-path instruction account: the images a boot placed,
+│   │                           #   attribution, the result file, the documents' blocks
+│   ├── path_record.rs          # The path-account plugin's record: reads, windows, rows
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
 │   ├── qemu_gdb.rs             # GDB remote client: QEMU's gdbstub and the GDB stub service
@@ -66,7 +72,7 @@ xtask/
 │   │   │                       #   interactive boot; run/classified.rs, --runs),
 │   │   │                       #   ktest_timing, bench_check, bench_baseline, path_account,
 │   │   │                       #   symbolize,
-│   │   │                       #   mkdisk, clean, crypto_vectors, fuzz, kani,
+│   │   │                       #   mkdisk, clean, crypto_vectors, fuzz, kani, cells,
 │   │   │                       #   compare_images, lint_docs, pr_check, review,
 │   │   │                       #   release_scope, threat_scope, issue, orch, hook, host,
 │   │   │                       #   trust_request)
@@ -535,13 +541,16 @@ policy, which ktest does not read; ktest is monolithic and does not spawn usersp
 (from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
 excluding `esp/` and `data/`), an arch-neutral `SERAPH_DATA`
 partition (from `sysroot/data/`), and a 64 MiB raw swap partition of the arch-neutral
-`SERAPH_SWAP` type GUID (no filesystem, left zero), always the last partition of `disk.img`. The
-data partition is authored unconditionally; `mkdisk --split-data` authors it alone on a second
-image, `disk-data.img` beside `disk.img`, which then carries the ESP, root and swap, for a
-boot that attaches the pair (`run --second-disk disk-data.img`), and every
-other authoring removes a `disk-data.img` left beside it. vfsd auto-mounts
-the data partition at `/data`, on whichever disk holds it; the data tree
-lives only on this partition, not on root. Every GUID the images carry is fixed (each
+`SERAPH_SWAP` type GUID (no filesystem, left zero), always the last partition of its image. The
+data partition is authored unconditionally; `mkdisk --split-data` authors it and the swap
+partition on a second image, `disk-data.img` beside `disk.img`, which then carries the ESP and
+root, for a boot that attaches the pair (`run --second-disk disk-data.img`), and stages the storage
+statement naming the two by their unique GUIDs at `sysroot/config/vfsd/storage.conf`, which the
+pack signs in the configuration role under `/config/vfsd/storage.conf`: vfsd gives a disk other
+than the boot disk a role only where the statement names its partition. Every other authoring
+removes a `disk-data.img` left beside it, and a statement whose body is the staged one. vfsd
+auto-mounts the data partition at `/data`; the data tree lives only on this partition, not on
+root. Every GUID the images carry is fixed (each
 image's disk GUID and each partition's unique GUID), and so is every FAT volume's metadata, so
 two authorings of one layout from one sysroot write identical images.
 (vfsd's fall-through would also serve `/data` from a root-fs directory,
@@ -593,7 +602,8 @@ about half a second to a pack at 512-byte blocks, and under a second at 4096.
 
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest] \
-    [--knob nokaslr|mapredo]... [--log-levels FILE] [--block-size 512|4096] [--split-data]
+    [--svctest ci|burn-in|none] [--knob nokaslr|mapredo]... [--log-levels FILE] \
+    [--block-size 512|4096] [--split-data]
 ```
 
 | Option | Default | Description |
@@ -601,10 +611,11 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands, the repository's data files installed and its objects re-signed as every pack signs them — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 | `--harness` | the recorded one | Record the harness whose bundle this and every later pack composes: `init` for the regular userspace init, `ktest` for the kernel-test harness |
+| `--svctest` | none | Stage the svctest boot with a fixture set: svctest's recipe and the set's fixture recipes copied from `config/svcmgr/tests/` into `config/svcmgr/services/`, every other fixture's recipe removed from it, the test class files of `config/devmgr/tests/` copied into `config/devmgr/classes/`, and the set's record written into the staged recipe's `env` line as `SVCTEST_FIXTURES`; `ci` stages every fixture, as the canonical svctest cells do, `burn-in` `memhog`, `reserve-creator` and `stopsrc`, as the burn-in cell does, and `none` no fixture; every set leaves oomd's and sessiond's recipes in place, which svctest requires; refused when a recipe the set needs is missing ([docs/testing.md](../docs/testing.md#gating) § Gating, svctest fixture sets) |
 | `--knob` | none | Stage a presence-only bootloader knob in `\EFI\seraph\`, repeatable or comma-separated: `nokaslr` boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; `mapredo` makes the first attempt of the bootloader's steps 6 and 7 redo whatever its memory map's size ([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md) § Sizing the Entry Array). Every knob not named is removed |
 | `--log-levels` | the repository's | Install `FILE` at `/config/init/log-levels.conf` in place of `services/init/log-levels.conf`; refused, before anything changes, unless init's parser (`services/init/log-levels`) accepts every line, since init ignores a line it refuses |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
-| `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP, root and swap on `disk.img`, both at `--block-size`; omit to author all four on `disk.img` and remove a stale `disk-data.img` |
+| `--split-data` | `false` | Author the data and swap partitions on `disk-data.img` and the ESP and root on `disk.img`, both at `--block-size`, and stage the storage statement naming the two; omit to author all four on `disk.img` and remove a stale `disk-data.img` and the staged statement |
 
 A boot that redoes the bootloader's steps 6 and 7 logs `boot: memory map: mapredo knob present;
 redoing steps 6 and 7`, which `run --runs --require` matches, once in the run
@@ -615,13 +626,12 @@ it, and no `[devmgr] DEBUG ` or `[procmgr] DEBUG ` line, which `run --runs --req
 `--fail-also` match
 ([docs/testing.md](../docs/testing.md#log-levels-usertest-cell) § Log levels).
 
-Example — stage `svctest` and run it (`--repack-only` keeps the hand-added
-recipe; a plain repack would prune it):
+Example — stage `svctest` as the canonical cells do and run it (`--repack-only` keeps the
+removal of the terminal and crashd; a plain repack would restore them):
 
 ```sh
-cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
-cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
-cargo xtask mkdisk --repack-only --arch x86_64
+rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
+cargo xtask mkdisk --repack-only --svctest ci --arch x86_64
 cargo xtask run --arch x86_64 --test-devices
 ```
 
@@ -675,8 +685,8 @@ Run Seraph's tests: the unit tests, and the host-driven QEMU cases.
 
 #### Unit tests
 
-Check the formatting of the selected packages, lint the test code, then run Seraph unit tests on
-the host target and under riscv64 emulation.
+Check the formatting of the selected packages, lint the test code and, over the whole workspace,
+the host crates, then run Seraph unit tests on the host target and under riscv64 emulation.
 
 ```
 cargo xtask test [--component boot|protocol|kernel|init|all]
@@ -697,6 +707,12 @@ lints its test configuration for the host target alone, against the prebuilt `st
 host-only, so no riscv64 Linux build of it runs. Every pass allows the lints `TEST_RELAXED_LINTS`
 in `src/commands/test/host.rs` names, as [docs/coding-standards.md](../docs/coding-standards.md)
 § Clippy states.
+
+Over the whole workspace (`all`), it then lints the host crates' non-test code as
+`cargo xtask build` does (`clippy_host` of `src/commands/build.rs`: `xtask`, the wrapper shim and
+the path-account plugin under the workspace lints, then the fuzz engine and targets with
+`--cfg fuzzing`), so CI's `host-tests` job, which runs on every change, proves the pass every
+booting cell's build runs.
 
 Tests compile for the host — no `--arch` flag needed. The workspace-level
 `panic=abort` profile does not affect the test harness.
@@ -758,6 +774,7 @@ options it takes:
 | `enrolment` | x86_64 (6), riscv64 (6) | init | usertest | none |
 | `secureboot` | x86_64 (4), riscv64 (4) | init | usertest | none |
 | `hotplug` | x86_64 (4), riscv64 (3) | init | host run | none |
+| `storage-roles` | x86_64 (4), riscv64 (4) | init | usertest | none |
 
 Before a case runs, `test` checks that the case runs on the architecture, that the sysroot was built
 for it, and that the recorded harness is the case's bundle (`ktest` for `kaslr` and `cet`, `init`
@@ -1087,39 +1104,39 @@ cargo xtask test debug-port [--arch x86_64|riscv64] [--port PORT] [--gdb GDB] [-
 | `--gdb` | `gdb` | The host GDB the stub boot runs: one built with every target, or `gdb-multiarch` |
 
 **The transport boot.** Stages the `debug-echo` fixture's recipe
-([services/debug-echo/README.md](../services/debug-echo/README.md)) from `config/svcmgr/tests/` into
-`config/svcmgr/services/`, repacks the disk images in the layout they have, boots the current
-sysroot once with the debug port attached (as `run --debug-port` attaches it, headless), waits for
-the fixture's `[debug-echo] READY on the debug port` line on the serial stream, connects to the
-port, and drives one GDB remote serial protocol exchange with the fixture, framed at both ends by
-`shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)), then a restart round
-on the same connection: through QEMU's gdbstub, which the boot attaches on a unix socket
-([§ Cases](#cases)), the host kills the port's `virtio-console` driver at a hardware breakpoint in
-its code, its bias taken from procmgr's `spawn image bias=0x… (/services/drivers/virtio-console)`
-line, waits for the fixture's `[debug-echo] debug port driver at ordinal 1` line, and echoes
-through the restarted driver. It then kills QEMU, removes the recipe, and repacks the images in
-that layout again, whatever the outcome. It passes when every answer of the exchange and of the
-restart round arrives as expected;
+([services/fixtures/debug-echo/README.md](../services/fixtures/debug-echo/README.md)) from
+`config/svcmgr/tests/` into `config/svcmgr/services/`, repacks the disk images in the layout they
+have, boots the current sysroot once with the debug port attached (as `run --debug-port` attaches
+it, headless), waits for the fixture's `[debug-echo] READY on the debug port` line on the serial
+stream, connects to the port, and drives one GDB remote serial protocol exchange with the fixture,
+framed at both ends by `shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)),
+then a restart round on the same connection: through QEMU's gdbstub, which the boot attaches on a
+unix socket ([§ Cases](#cases)), the host kills the port's `virtio-console` driver at a hardware
+breakpoint in its code, its bias taken from procmgr's
+`spawn image bias=0x… (/services/drivers/virtio-console)` line, waits for the fixture's
+`[debug-echo] debug port driver at ordinal 1` line, and echoes through the restarted driver. It then
+kills QEMU, removes the recipe, and repacks the images in that layout again, whatever the outcome.
+It passes when every answer of the exchange and of the restart round arrives as expected;
 [docs/testing.md](../docs/testing.md#debug-port-debug-port-case) § Debug port lists the exchange.
 
 **The GDB stub boot.** Checks the GDB stub
 ([services/gdbstub/README.md](../services/gdbstub/README.md)) from a host GDB. Stages the
-`gdb-target` recipe (`programs/debugger --gdb-target`) from `config/svcmgr/tests/` and the stub's
-template from `config/svcmgr/debug/` naming it, as `run --debug-target gdb-target` does, repacks the
-disk images in the layout they have, boots the current sysroot once with the debug port attached
-(headless), and waits for the stub's `[gdbstub] attached; serving the debug port` line on the serial
-stream. It then runs `gdb -nx -batch` against the port with the symbols store's file of the target
-binary's build id for symbols: the session lists the threads, single-steps from where the attach
-stopped the main thread, breaks on the target's tick function and continues to it, rewrites a
+`gdb-target` recipe (`services/fixtures/debugger --gdb-target`) from `config/svcmgr/tests/` and the
+stub's template from `config/svcmgr/debug/` naming it, as `run --debug-target gdb-target` does,
+repacks the disk images in the layout they have, boots the current sysroot once with the debug port
+attached (headless), and waits for the stub's `[gdbstub] attached; serving the debug port` line on
+the serial stream. It then runs `gdb -nx -batch` against the port with the symbols store's file of
+the target binary's build id for symbols: the session lists the threads, single-steps from where the
+attach stopped the main thread, breaks on the target's tick function and continues to it, rewrites a
 variable and a register and reads each back, single-steps again, selects the second thread and reads
-its registers, and detaches; the case then waits up to 30 s for the stub's `[gdbstub] detached from
-gdb-target (crash bindings restored: ...)` line. A restart round follows: the case connects to the
-stub, which attaches to the target anew, kills the port's driver through QEMU's gdbstub as the
-transport boot does, waits for the stub's `[gdbstub] debug port driver at ordinal 1` line, and
-requires the session to go on on the same connection (`?`, `Hg1`, the pointer read, `D`). It kills
-QEMU, removes both recipes, and repacks the images in that layout again, whatever the outcome, and
-passes when GDB's output shows each of those results, the stub's line reports the crash bindings
-restored, and the restart round passes;
+its registers, and detaches; the case then waits up to 30 s for the stub's
+`[gdbstub] detached from gdb-target (crash bindings restored: ...)` line. A restart round follows:
+the case connects to the stub, which attaches to the target anew, kills the port's driver through
+QEMU's gdbstub as the transport boot does, waits for the stub's
+`[gdbstub] debug port driver at ordinal 1` line, and requires the session to go on on the same
+connection (`?`, `Hg1`, the pointer read, `D`). It kills QEMU, removes both recipes, and repacks the
+images in that layout again, whatever the outcome, and passes when GDB's output shows each of those
+results, the stub's line reports the crash bindings restored, and the restart round passes;
 [docs/testing.md](../docs/testing.md#gdb-stub-debug-port-case) § GDB stub lists them. The host needs
 a GDB that debugs the architecture.
 
@@ -1329,12 +1346,12 @@ cargo xtask test secureboot [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
 
 Check devmgr's PCI Express hotplug add and removal paths, native and through acpid, and its bind of
 a hot-added disk from the drivers directory, on either arch. Stages the `hotplug-check` fixture's
-recipe ([services/hotplug-check/README.md](../services/hotplug-check/README.md)) from
-`config/svcmgr/tests/` into `config/svcmgr/services/` and the `test-dma` class file from
+recipe ([services/fixtures/hotplug-check/README.md](../services/fixtures/hotplug-check/README.md))
+from `config/svcmgr/tests/` into `config/svcmgr/services/` and the `test-dma` class file from
 `config/devmgr/tests/` into `config/devmgr/classes/`, and repacks the disk images in the layout they
-have. It boots the current sysroot headless, with two empty `pcie-root-port`s (`-device
-pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c` and `-device
-pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socket:
+have. It boots the current sysroot headless, with two empty `pcie-root-port`s
+(`-device pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c` and
+`-device pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socket:
 
 1. on x86_64 only, under the machine's default, the firmware's ACPI PCI hotplug, whose `_OSC`
    withholds native hotplug control: devmgr must log the slot `firmware hotplug: _OSC control`,
@@ -1385,6 +1402,35 @@ cargo xtask test hotplug [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
 Each boot to its markers is bounded by five minutes, and the fixture's verdict and the disk's bind
 by three minutes after their hot-add. The boots are the hotplug device cell of the local and release
 host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
+
+#### The `storage-roles` case
+
+Check that vfsd gives each storage role to the boot disk or to the partition the storage statement
+names, and none to another disk, on either arch. Boots the default boot set headless four times,
+each with a second disk (`virtio-blk-pci`, drive `hd1`), to the terminal's `terminal: READY for
+injection` line and swapd's `swap partition:` line, and reads vfsd's `boot controller:`, `boot
+disk:` and role lines (`root:`, `/esp:`, `/data:`, `swap:`, each naming its disk's location):
+
+1. the images repacked in the split-data layout, `disk-data.img` on the second slot: the root and
+   `/esp` on the boot disk, `/data` and swap named by the staged statement on the second disk;
+2. the single image, and a foreign disk (`target/xtask/storage-roles/foreign.img`, authored by
+   `disk::create_foreign_image`) on the second slot whose four partitions carry priority `0xFFFF`
+   under unique GUIDs of their own: every role on the boot disk;
+3. the same at priority 0, the boot disk's: every role on the boot disk;
+4. a copy of `disk.img` (`target/xtask/storage-roles/disk-copy.img`) on the second slot: the boot
+   disk at the boot controller's location, and every role on it.
+
+A `no boot disk:` line, a role on another disk than the boot says, or a missing line fails the boot.
+The scratch images are removed, and the images repacked in the layout they had, whatever the
+outcome. Each boot to its markers is bounded by four minutes. It requires a populated sysroot:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test storage-roles [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
+
+See [docs/testing.md](../docs/testing.md#storage-roles-storage-roles-case) § Storage roles for what
+each boot covers.
 
 ---
 
@@ -1505,44 +1551,136 @@ Run the bounded proofs ([docs/testing.md](../docs/testing.md#bounded-verificatio
 verification) with the pinned Kani release.
 
 ```
-cargo xtask kani [--component <CRATE> [--harness <NAME>]]
+cargo xtask kani [--component <CRATE> [--harness <NAME>]] [--list]
+cargo xtask kani --since <COMMIT> [--list]
 cargo xtask kani --pin
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--component <CRATE>` | every registered crate | Verify the harnesses of this crate only, by its package name |
+| `--component <CRATE>` | every crate that holds a harness | Verify the harnesses of this crate only, by its package name |
 | `--harness <NAME>` | every harness | Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`); needs `--component` |
+| `--since <COMMIT>` | every crate that holds a harness | Verify the crates the change from this commit to the working tree can affect (below); takes no `--component` |
+| `--list` | `false` | Print the package of each crate the run would verify, one a line, and exit, verifying nothing; needs no Kani |
 | `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
 
-The command first checks that every tracked Rust source declaring a `#[kani::proof]` lies in a
-crate `HARNESSED` in `src/commands/kani.rs` registers, the crate being the nearest directory
-above the file that holds a `Cargo.toml`, and fails naming each file that does not: a crate's
-first harness registers it. It then checks that `cargo kani --version` names `KANI_VERSION`, and
+The command first finds the crates to verify, keeping no list of them: the crate of every tracked
+Rust source declaring a `#[kani::proof]`, the crate being the nearest directory above the file
+that holds a `Cargo.toml`, each run once by the package name that manifest gives. It fails
+naming each such source that lies in no crate, or in one whose manifest names no package, so no
+harness is left out of the run.
+
+With `--since`, the command selects from those crates the ones the change from `<COMMIT>` to the
+working tree (`git diff --name-only --no-renames`, a rename as both its paths) can affect, and
+prints each with the changed file that selects it, or a line saying that none is affected and why. A
+crate is affected when a changed file lies in the directory of its package or of a workspace package
+in its dependency closure, as `cargo metadata --no-deps` gives the path dependencies (of every kind
+and target: a superset of what its test build compiles), or is a file one of those packages names in
+an `include!`, `include_str!`, `include_bytes!` or `#[path]` string literal. Every crate is affected
+when a changed file is an input of every build: the workspace `Cargo.toml` and `Cargo.lock`,
+`rust-toolchain.toml`, `.cargo/config.toml`, the command's own sources
+(`xtask/src/commands/kani.rs`, which holds the Kani pin, the memory limit and the judge of Kani's
+output, and `xtask/src/affected.rs`, the selection, which other commands can share), or
+`.github/workflows/build-test.yml`, whose `kani` job an empty selection does not install Kani in. A
+package's build script, features and `cfg` settings lie in its directory or the workspace manifest,
+so a change to them selects it. A commit the checkout does not hold fails the command, so a shallow
+clone never narrows the run. With no crate affected the command verifies nothing and does not check
+the installed release.
+
+It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
 § Toolchain) on another release or none.
 
 For each selected crate it runs `cargo kani --tests -p <package>` (with `--harness` when given),
-which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies
-each harness with Kani's unwinding assertions on. It prints Kani's output as it comes and judges
-it as well as Kani's verdict: the crate fails when `cargo kani` exits unsuccessfully, when a
-harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED` check or a
-`FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's verdict
-names), and when Kani's closing summary is missing, counts a failure or no harness, or counts
-other harnesses than reported a verdict. Every selected crate runs, and the command fails naming
-each that failed. CI's `kani` job runs the command with no option, after installing the release
-`--pin` prints ([docs/build-system.md](../docs/build-system.md#continuous-integration)
-§ Continuous Integration).
+which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies each
+harness with Kani's unwinding assertions on. It runs `cargo kani` under `prlimit --as` (util-linux),
+which holds each process of the run (`cargo`, the Kani compiler, and the CBMC of each harness, which
+Kani runs one at a time) to 12 GiB of address space (`MEMORY_LIMIT_GIB`). The limit derives from the
+runner CI's `kani` job runs on (`ubuntu-latest` for a public repository: 4 vCPUs, 16 GB), leaving
+4 GB to the runner's own processes, so a harness whose CBMC needs more fails, named as out of memory
+under the limit, where without it the runner would be shut down with no verdict. It prints Kani's
+output as it comes and judges it as well as Kani's verdict: the crate fails when `cargo kani` exits
+unsuccessfully, when a harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED`
+check or a `FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's
+verdict names), and when Kani's closing summary is missing, counts a failure or no harness, or
+counts other harnesses than reported a verdict; a harness that Kani starts and prints no verdict for
+fails too. Every selected crate runs, and the command then prints a table of every harness, by
+package and path, with its verdict and verification time, and fails naming each crate that failed.
+A harness whose verification time exceeds the 120 s budget (`BUDGET_SECONDS`,
+[docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification) fails on a CI
+runner (`GITHUB_ACTIONS` set to `true`), named with its time and marked `FAILED (over budget)` in
+the table; on another host, whose speed differs, the command prints a warning naming it and its
+time.
+
+CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the base its `select`
+job found with `cargo xtask cells --since-green`, on a pull request and on a push to `master`
+alike, and with no option when that job found none; when the list is empty it installs no Kani
+and says so in a notice on the run, and otherwise it installs the release `--pin` prints and runs
+the command with the same `--since`. The `kani` job of `burnin.yml` runs the command with no option
+([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
 session runs `cargo xtask kani` there. A session installs nothing (`cargo install` is outside the
 permissions `.claude/settings.json` grants) and does not run `cargo kani` itself, which the
 `bash` hook refuses ([§ `cargo xtask hook`](#cargo-xtask-hook)). A new or changed harness is
-sized there, under the memory of CI's runner, before CI runs it
+sized there, under the limit the command sets, before CI runs it
 ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification).
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`
 aside, and takes their `--wait-host` and `--host-override` options.
+
+---
+
+### `cargo xtask cells`
+
+Print the CI cells a change owes ([docs/conventions.md](../docs/conventions.md#ci-gating) § CI
+Gating), which `build-test.yml`'s `select` job runs to build its `validate` and `bench`
+matrices.
+
+```
+cargo xtask cells [--since <COMMIT> | --since-green <REV>] [--github-output <FILE>]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--since <COMMIT>` | no base | The change from this commit to the working tree |
+| `--since-green <REV>` | no base | The change from the newest commit of `REV`'s first-parent history, 200 commits at most, whose `build-test` run on a push to `master` passed (`gh run list`); every cell, after a `WARNING:` line, when there is none or the runs cannot be read |
+| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate` and `bench`, each a matrix's `include` list; `validate-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
+
+Without a base, every cell is owed. With one, the command places each changed file
+(`git diff --name-only` from the base to the working tree, a rename as both its paths) in a
+class of the layer record, `src/layers.rs`, and prints each with its class and why. The first
+rule that holds places it:
+
+1. Markdown is `docs`.
+2. An input of every build (`WORKSPACE_WIDE` of `src/affected.rs`: the toolchain pin, the root
+   manifest and lock file, `.cargo/config.toml`) is `build`.
+3. The longest file row of the record that holds it: the instruction files and the Issue templates
+   are `docs`; the workflows are `build`; the rootfs files take the layer that reads them; the
+   modules of xtask that no cell runs, and the host tools' settings, are `host`.
+4. A file of a workspace package takes the most demanding directory row among the package and every
+   package whose dependencies reach it (`cargo metadata`), the std port counting as a package of
+   `runtime/ruststd/` that links the crates std depends on. The directory rows: `core/` and
+   `abi/` are `kernel`; `services/` and `runtime/` `services`; `programs/` `programs`;
+   `xtask/fuzz/` and `xtask/path-account-plugin/` `host`; `xtask/` `build`.
+5. Any other file takes its directory row.
+
+A file a tracked source reads (`include!`, `include_str!`, `include_bytes!`, `#[path]`) takes
+its reader's class too, when that is more demanding. A changed file no rule places fails the
+command, naming it ("add its row"), so a crate moved to a directory no row holds is reported, not
+misplaced; a deleted file no rule places is `build`.
+
+The change owes the cells of its most demanding file, in the order `docs`, `host`, `programs`,
+`services`, `kernel`, `build`: `kernel` and `build` owe every `validate` cell and the `bench`
+cell with its ktest boots; `services` and `programs` owe the svctest and usertest cells and the
+`bench` cell's ubench boots; `docs` and `host` owe no boot. The host tests check that every
+tracked file is placed, that every row holds a tracked file, and that no module of xtask a cell
+runs uses one the record calls `host`.
+
+The `fuzz` job is owed apart from the cells: by a change to an input of every build, to the
+workflows, to an input of the build of `xtask/fuzz/targets`, whose closure holds the engine and
+every crate a target fuzzes, or to an input of the build of xtask, which drives it, its own
+sources and manifest and every crate it links; and without a base.
 
 ---
 
@@ -1700,7 +1838,8 @@ baselines of their mode and architecture: CI's `bench` cell's gate
 ([docs/testing.md](../docs/testing.md#benchmarks-bench-cell) § Benchmarks).
 
 ```
-cargo xtask bench-check --mode icount|host [--baselines DIR] [--write-env FILE] LOG...
+cargo xtask bench-check --mode icount|host [--baselines DIR] [--write-env FILE]
+    [--skip-suite SUITE]... LOG...
 ```
 
 | Option | Default | Description |
@@ -1708,6 +1847,7 @@ cargo xtask bench-check --mode icount|host [--baselines DIR] [--write-env FILE] 
 | `--mode` | | `icount`: instruction counts, from boots under `run --icount`; `host`: time, from x86_64 boots under a native accelerator |
 | `--baselines` | `xtask/baselines/bench` | The baselines root, which holds `<mode>/<arch>/` |
 | `--write-env` | | Write this host's environment to `FILE`, in the `ENV` file's format below |
+| `--skip-suite` | none | Leave out the baselines of this suite, whose boot did not run (`ktest` when the `bench` cell skips its ktest boots); repeatable; a log that measures the suite fails the command |
 | `LOG...` | | The saved logs, one per run, all of one architecture, of any boot that logs result lines (ktest's bench-only image, the ubench suite's); each must carry the trailer of a passing run of the mode (`icount=on` for `icount`; `icount=off` and an accelerator other than `tcg` for `host`) |
 
 A measurement is a result line's `<suite>.<name>` and variant parameters
@@ -1770,7 +1910,9 @@ The logs are read as `bench-check` reads them, and must be complete: a benchmark
 one of its measurements has no baseline or is no longer measured, or one of its gating
 measurements (in host mode, any of them) is past its band, and is removed when none of its
 measurements remains; each rewritten file holds every measurement of its benchmark at its lowest
-p50. The `ENV` file is written when `--all` is given or it does not exist: the cell's own, from its
+p50. The files of a suite the logs measure nothing of are left as they are, with or without
+`--all`: that suite's boot did not run, as in a `bench` cell whose change owed no ktest boot.
+The `ENV` file is written when `--all` is given or it does not exist: the cell's own, from its
 artifact, with `--from-run`; this host's with `--host`. The command prints each file it wrote or
 removed. An artifact's logs are those at its top level and those one directory down, where the
 `bench` cell saves its ubench boots'.
@@ -1779,27 +1921,32 @@ removed. An artifact's logs are those at its top level and those one directory d
 
 ### `cargo xtask path-account`
 
-Account for every instruction of each kernel benchmark's measured window by the function it
-belongs to, on the architecture and profile of the sysroot, and write the accounts into
-[core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md).
+Account for every instruction of each gated benchmark's measured window by the function it
+belongs to, on the architecture and profile of the sysroot, and write the accounts into the
+hot-path documents: ktest's rows into
+[core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md), the ubench and
+fsbench rows into
+[core/kernel/docs/hot-path-account-userspace.md](../core/kernel/docs/hot-path-account-userspace.md).
 
 ```
-cargo xtask path-account trace [--arch x86_64|riscv64] [--release] [--iteration K] \
+cargo xtask path-account trace [--arch x86_64|riscv64] [--release] [--reuse] \
     [--timeout SECS] [--wait-host SECS] [--alone] [--grant HOLDER] --reference LOG...
-cargo xtask path-account write [--doc FILE]
+cargo xtask path-account write
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | The sysroot's architecture |
 | `--release` | off | The sysroot was built with `--release` |
-| `--iteration` | `64` | The first sample index stepped, from 1 to 92: it and the 7 iterations after it stay below the smallest sample count of a benchmark (100) |
-| `--reference` | | Saved logs of icount boots of the same tree and profile's bench-only image built without `--limited-debug`, whose lowest one-CPU p50s are the reference counts |
+| `--reference` | | Saved logs of icount boots of the same tree, profile and image built without `--limited-debug`, whose lowest one-CPU p50s are the reference counts |
 | `--timeout` | `3600` | Seconds the whole boot may take |
-| `--doc` | `core/kernel/docs/hot-path-account.md` | (`write`) The document whose generated block is replaced |
+| `--reuse` | off | Account the boot log and the record the configuration's last trace left, without booting, against the same images |
 
-The host options are `run`'s ([Host launch rules](#host-launch-rules)); a trace is a boot of one
-vCPU. One configuration is regenerated with:
+The host options are `run`'s ([Host launch rules](#host-launch-rules)); a trace is a build of the
+plugin and then a boot of one vCPU, each admitted by those rules, and `--reuse` is neither.
+`trace` accounts the harness the disk image records: ktest's bench-only image, or the init
+image with ubench staged as a service, as the benchmark cell boots it. One configuration of
+ktest is regenerated with:
 
 ```
 cargo xtask build --arch <a> [--release] --ktest-bench-only
@@ -1810,51 +1957,94 @@ cargo xtask mkdisk --arch <a> --harness ktest
 cargo xtask path-account trace --arch <a> [--release] --reference target/pa-ref/<a>-<profile>/*.log
 ```
 
-and the document from every configuration traced with `cargo xtask path-account write`
-(`cargo xtask clean` between architectures). A trace takes about two minutes.
+and one of the userspace rows with:
 
-**Method.** `trace` boots the sysroot's image at one CPU under icount, as `run --icount` does,
-with QEMU's gdbstub on a unix socket, and drives the stub as the guest runs:
+```
+cargo xtask build --arch <a> [--release]
+cargo xtask mkdisk --arch <a> --harness init
+cp sysroot/config/svcmgr/tests/ubench.svc sysroot/config/svcmgr/services/
+rm sysroot/config/svcmgr/services/terminal.svc
+cargo xtask mkdisk --arch <a> --repack-only
+cargo xtask run --arch <a> --icount --cpus 1 --runs 1 --display framebuffer \
+    --save-logs target/pa-ref/user-<a>-<profile>
+cargo xtask build --arch <a> [--release] --limited-debug all
+(the same mkdisk and staging)
+cargo xtask path-account trace --arch <a> [--release] \
+    --reference target/pa-ref/user-<a>-<profile>/*.log
+```
 
-1. It reads the kernel's KASLR slide from the serial log, stops the guest, and stops it again
-   where the kernel hands the CPU to init (`kernel::sched::enter`), after the kernel has logged
-   ktest's load bias, which it then reads.
-2. It sets a write watchpoint on sample `K-1` of ktest's sample buffer (`ktest::bench::SAMPLES`),
-   into which every benchmark records from index 0. A stop whose frames do not include
-   `Samples::record` (the summary's in-place sort) is stepped over.
-3. At a benchmark's recording of sample `K-1`, it steps past the store (x86_64 stops after it,
-   riscv64 before it), then single-steps, with interrupts and timers masked for each step
-   (`Qqemu.sstep=0x7`), until the program counter is back at that address: one iteration, the
-   store of the next sample among its instructions. It steps 8 iterations in turn.
-4. In each iteration, the window is the pair of counter reads (`rdtsc`, `csrr cycle`, decoded at
-   each address stepped) whose values differ by the sample the iteration stored: the opening read
-   and every instruction up to the closing read.
-5. The benchmark's next result line names it and gives the boot's p50; the account takes the
-   first of its 8 iterations whose window ran the p50.
+which stage ubench and boot it as the benchmark cell does
+([docs/testing.md](../docs/testing.md#benchmarks-bench-cell) § Benchmarks), and the documents
+from every configuration traced with `cargo xtask path-account write` (`cargo xtask clean`
+between architectures). A trace runs every instruction of the boot through the plugin and takes
+several minutes. The userspace rows of both architectures take about 30 minutes of the host,
+builds included: per architecture two builds, the reference boot and the trace, each boot of
+one vCPU and so needing no grant. A kernel change on a path those rows run owes them as well as
+ktest's configurations
+([hot-path-account-userspace.md](../core/kernel/docs/hot-path-account-userspace.md#regenerating-it)
+§ Regenerating It).
 
-Each check is a failure of the command: a window whose stepped instructions are not the counter's
-difference (the stepped path is not the measured one); a benchmark none of whose 8 iterations ran
-its p50; a p50 that is not the reference count; a one-CPU measurement of the reference logs left
+**Method.** `trace` builds the path-account plugin
+([path-account-plugin/](path-account-plugin/README.md)) for the host and boots the sysroot's
+image at one CPU under icount, as `run --icount` does, with the plugin loaded (`-plugin`); the
+host's QEMU must be built with TCG plugins and take the plugin's API version (7), and `trace`
+says so when it does not. The plugin never stops the guest: a stop of the debug stub under
+icount moves the virtual clock to the next timer deadline, which would corrupt every sample
+taken across it. It writes a record, in the order the guest ran: every instruction executed
+between two user-mode counter reads (`rdtsc`, `csrr cycle`), by address, in every privilege
+mode and address space; each read's value; and each attempt a trap ended before it retired
+that the counter did not count. `trace` reads the boot's serial log until the harness's last
+line (`[ktest] ALL` or `SOME`, `[ubench] ALL TESTS PASSED` or `SOME TESTS FAILED`), then
+accounts the record offline:
+
+1. **Images.** The log places each image the boot ran: the kernel at its KASLR slide, init,
+   memmgr and procmgr at the biases the kernel and init log, and each process procmgr spawns at
+   the bias it logs (a spawn logged without a name takes the one svcmgr logged launching it).
+   The texts of two placed images must not overlap at run time, so that an address names one
+   image; process ASLR overlaps two of them in fewer than one boot in 400, and `trace` refuses
+   such a boot, to be booted again.
+2. **Windows.** A program's reads are those in its image's text, and pair in turn into windows,
+   an opening read and a closing one, whose values' difference is the window's sample. A
+   benchmark loop reads the counter at the same two addresses on every iteration, its warm-up
+   iterations included, which it does not keep: the windows of one loop are divided among its
+   result lines in order, each line taking an equal warm-up and then its `n` samples, and the
+   division must give each line exactly its summary (`n`, `min`, `p50`, `p90`, `p99`,
+   `max`).
+3. **Checks.** Each window of a gated line (`bench-check`'s gating rows of the icount mode)
+   must retire exactly its sample: its instructions, less the attempts the counter did not
+   count. Its p50 must lie within the gate's band of the reference count. The account takes the
+   first window that ran the p50.
+
+Each check is a failure of the command, listed with every other: a window that retired other
+than its sample (the traced path is not the measured one); a line none of whose windows ran its
+p50; a p50 outside the reference's band; a gated measurement of the reference logs left
 untraced; a benchmark's `FAIL` line. The reference is a count of the image without debuginfo
 because limited debuginfo changes the crates' hashes, and with them the order the linker lays
-functions out in: the instructions are a plain build's, which the equal counts confirm.
+functions out in: the instructions are a plain build's, which the counts within the band
+confirm.
 
 **Attribution.** An address is the kernel's when, less the slide, it lies in the kernel's text,
-and ktest's when, less the bias, it lies in ktest's (the symbols store's file, which keeps its
-DWARF). Each instruction counts against the innermost function of its DWARF frames, inlined ones
-included, that is not the standard library's (`core`, `alloc`, `compiler_builtins`, or a
-primitive type's method), so an inlined helper counts against its caller; an instruction no DWARF
-covers (assembly) counts against the nearest text symbol at or before it.
+and a process's when, less its bias, it lies in its image's (the symbols store's file of the
+image, which keeps its DWARF); an address in no placed image (a page the kernel or firmware
+mapped) counts against `<page …>`. Each instruction counts against the innermost function of
+its DWARF frames, inlined ones included, that is not the standard library's (`core`, `alloc`,
+`compiler_builtins`, or a primitive type's method), so an inlined helper counts against its
+caller; an instruction no DWARF covers (assembly) counts against the nearest text symbol at or
+before it.
 
-**Output.** `target/xtask/path-account/<arch>-<profile>.tsv`, the result file: the
-configuration's head (`-dirty` when the tree differed from it), date, QEMU version and reference,
-then per path a `path` record (measurement, p50, reference, iteration) and an `fn` record per
-function (image, path, count). Beside it, `<arch>-<profile>/` holds the boot's serial log and one
-`.trace` file per path, a line per instruction: its address, its image, and its frames from the
-outermost in. `write` reads the result file of each configuration traced and replaces the block
-between the document's `path-account` markers with a provenance table, each path's totals by
-image, and per path its functions, a column per configuration; a function below 3 instructions,
-or below half a percent of the path when that is more, shares one closing row.
+**Output.** `target/xtask/path-account/<harness>-<arch>-<profile>.tsv` (`ktest` or
+`userspace`), the result file: the configuration's head (`-dirty` when the tree differed from
+it), date, QEMU version and reference, then per path a `path` record (measurement, p50,
+reference, the window's index among the line's samples) and an `fn` record per function (image,
+path, count). Beside it, `<harness>-<arch>-<profile>/` holds the plugin's record
+(`record.txt`), the boot's provenance (`provenance.txt`: the head, date and QEMU version of the
+trace and each placed image's build id, which `--reuse` takes, refusing a sysroot whose images
+differ), the boot's serial log, and one `.trace` file per path, a line per address: the
+instructions retired there, its image, and its frames from the outermost in. `write` reads the
+result files of each harness and replaces the block between its document's `path-account`
+markers with a provenance table, each path's totals by image, and per path its functions, a
+column per configuration; a function below 3 instructions, or below half a percent of the path
+when that is more, shares one closing row.
 
 ---
 
@@ -2046,6 +2236,7 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 |---|---|---|
 | `pr-unticked-box` | error | The body has no unticked task-list item (§ PR-body checklist discipline): `[ ]` after a `-`, `*`, `+`, or numbered list marker, the forms GitHub renders as a checkbox. |
 | `pr-attribution` | error | The body carries no tool attribution line and no session link. |
+| `pr-tool-output` | error | The body carries no line of tool output ([docs/conventions.md](../docs/conventions.md) § Style, whose rule covers a comment on a PR or an Issue too, which the command does not read), the text a command prints on stderr for its user, which no author wrote and which a read of the body with stderr merged into it writes back: a line that begins `hint:` at column 0 (the advice `gh` and `git` print, such as the block `gh` 2.105 prints after reading a pull request) a line whose text after its indentation begins `gh event listen` (the command that block suggests), each with every line of its block (each indented, non-blank line after it, up to a blank line or a line at column 0), and a cargo status line (one of cargo's status verbs, such as `Compiling`, `Finished` or `Running`, indented to end at column 12, then a space). Each such line is an error that names it, so one run names every line of a block. A line inside a fenced code block (backticks or tildes) is not read, so a body may quote tool output there; an indented code block is read as prose, since the second line of `gh`'s hint block is indented as one. |
 | `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`; a closing reference that names a repository (`<owner>/<repo>#N`, or the Issue's URL) is not compared. A drain PR that closes a follow-up Issue of the earlier pattern carries both (§ Follow-up Issues); in any other body the pair usually means a sentence closes an Issue the PR only references. |
 | `pr-refs-unread` | warning | Every `#N` after the start of a `Refs` list on its body line is read as a referenced Issue (a line with the word but no list, such as a rule name or prose, is not checked): one the `Refs` list does not reach, because other text stands between it and the number before it, is named with its line, since its ticks and state go unchecked. A reference into another repository is not counted. |
 | `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
@@ -2058,6 +2249,7 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 | `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |
 | `issue-milestone` | error | Every Issue the PR closes carries the current milestone, the lowest-versioned open one. |
 | `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
+| `issue-tool-output` | error | The body of every Issue the PR closes or references with `Refs #N` carries no line of tool output, as `pr-tool-output` reads it; each one is an error that names its line. |
 
 The command prints the Issues the body and the commits close and the ones the body references,
 so that a keyword in prose that closes an Issue by accident is seen. A `Refs` keyword references
@@ -2308,7 +2500,9 @@ destroying it.
 cargo xtask issue-edit <N> --body-file <path> [--allow-removal]
 ```
 
-The command refuses an empty body. Unless `--allow-removal` is given (an edit that drops,
+The command refuses an empty body, and a body that carries a line of tool output, as
+`pr-tool-output` of [`cargo xtask pr-check`](#cargo-xtask-pr-check) reads it, naming every such
+line. Unless `--allow-removal` is given (an edit that drops,
 rewords, or reopens items on purpose, as
 [docs/conventions.md](../docs/conventions.md) § Acceptance checklist discipline allows), it also
 refuses a body that lacks a task-list item the Issue holds, or that reopens one the Issue has
@@ -2329,11 +2523,12 @@ cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
 ```
 
 The command refuses a filing without a class label, without a subsystem label, or without a
-milestone decision. `--unscheduled` files an Issue without a milestone, which
-[docs/conventions.md](../docs/conventions.md) § Milestones allows only for an Issue that cannot
-be worked on now, and needs `--reason`: `hardware` (it needs hardware the project does not
-have), `not-possible` (it is not possible yet) or `undecided` (whether it belongs in the project
-is itself undecided). The body states the same reason in a line that begins
+milestone decision, and one whose body carries a line of tool output, as `pr-tool-output` of
+[`cargo xtask pr-check`](#cargo-xtask-pr-check) reads it. `--unscheduled` files an Issue without
+a milestone, which [docs/conventions.md](../docs/conventions.md) § Milestones allows only for an
+Issue that cannot be worked on now, and needs `--reason`: `hardware` (it needs hardware the
+project does not have), `not-possible` (it is not possible yet) or `undecided` (whether it
+belongs in the project is itself undecided). The body states the same reason in a line that begins
 `No milestone: <reason>`, the reason as `--reason` names it and the rest of the line saying why;
 the command refuses an `--unscheduled` filing whose body has no such line or one naming another
 reason, and a filing under a milestone whose body has one. It refuses a rolling follow-up Issue
@@ -2498,14 +2693,15 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypto-vectors`, `fuzz`
-(but `--list`), `kani` (but `--pin`), `compare-images` and `test` without a case or a cell (the unit
-tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`, and
-`test` with a case or a cell as boots, each boot admitted as above (the `shutdown` case admits once
-for its boots, which it runs one at a time). The `signing` case, which compiles its revoking and
-role-scoped bootloaders before it boots, is admitted as a build for each compile and then each boot
-as a boot. A cell's lanes (`test --cell T --lanes N`) start up to N cases side by side, each
-admitting its own boots, so each is a small boot counted with the others, and `--wait-host` lets a
-lane's boot wait for another lane's to end rather than fail.
+(but `--list`), `kani` (but `--pin` and `--list`), `compare-images` and `test` without a case or a
+cell (the unit tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
+`capture-acpi`, `path-account trace` (but `--reuse`), and `test` with a case or a cell as boots,
+each boot admitted as above (the `shutdown` case admits once for its boots, which it runs one at a
+time). The `signing` case, which compiles its revoking and role-scoped bootloaders before it boots,
+and `path-account trace`, which compiles its plugin, are admitted as a build for each compile and
+then each boot as a boot. A cell's lanes (`test --cell T --lanes N`) start up to N cases side by
+side, each admitting its own boots, so each is a small boot counted with the others, and
+`--wait-host` lets a lane's boot wait for another lane's to end rather than fail.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
@@ -2646,6 +2842,7 @@ command line, for the review to read.
 |---|---|
 | `fuzz/engine/` (`fuzz-engine`) | The coverage-guided fuzzing engine: the SanitizerCoverage callbacks, the queue, the mutator, the minimizer, the supervisor and the reports. A host library the fuzz targets link; built without coverage instrumentation. Its unit tests run under `cargo xtask test`. See § `cargo xtask fuzz`. |
 | `fuzz/targets/` (`fuzz-targets`) | One binary per fuzz target, each handing a parser crate's property function to the engine, and the self-test's planted targets. Built only by `cargo xtask fuzz`. |
+| [path-account-plugin/](path-account-plugin/README.md) (`seraph-path-account-plugin`) | The QEMU TCG plugin `cargo xtask path-account trace` loads into the guest's QEMU, which records every instruction between user-mode counter reads, and the record's format, which xtask links. A host artifact, built by `trace` when it boots and never part of an image. Its unit tests run under `cargo xtask test`. See § `cargo xtask path-account`. |
 | [wrapper-shim/](wrapper-shim/README.md) | Tiny native binary installed into the seraph toolchain mirror as both `rustc` and `ws-clippy`, and for `cargo xtask fuzz` as `sancov-rustc`. Dispatches by argv[0] basename to exec the real rustc / clippy-driver with overlay-aware `--sysroot` flags, or the real rustc without the coverage flags for the fuzzing engine's units. Built by `cargo xtask build` as part of StdUser builds, and by `cargo xtask fuzz`; never invoked directly. |
 
 ---

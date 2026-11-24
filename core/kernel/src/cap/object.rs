@@ -1483,18 +1483,20 @@ const SEED_BATCH_PAGES: u64 = 64;
 /// caller's interrupt state, with preemption disabled throughout so that an
 /// interrupt taken here cannot switch the thread out. The page-pool seeding
 /// and reclaim walks call it between their batches, whose number a caller
-/// chooses, and so does the retype free's clear of a dead object's bytes
-/// between its batches (`cap::retype`, § Freed bytes), so that a syscall
+/// chooses, and so do the retype free's clear of a dead object's bytes
+/// between its batches (`cap::retype`, § Freed bytes) and an explicit
+/// placement's pre-grow between its `CSpace`-lock holds
+/// (`syscall::cap`, `pre_grow_for_explicit_slot`), so that a syscall
 /// running one masks interrupts for one batch at a time: shootdown and wakeup
 /// IPIs are acknowledged, and the timer and the heartbeat tick, meanwhile
-/// (core/kernel/docs/capability-internals.md § Donation Records and
-/// § Teardown).
+/// (core/kernel/docs/capability-internals.md § Storage: Hybrid Radix
+/// Directory, § Donation Records and § Teardown).
 ///
-/// No lock may be held across it. Every pool is created, and every retyped
-/// object freed, after the timer is initialised, which enables interrupts
-/// with the trap vector in place, so every caller runs where interrupts may
-/// be taken; the idle drain, which runs with them enabled, keeps them
-/// enabled.
+/// No lock may be held across it. Every pool is created, every retyped
+/// object freed, and every explicit placement pre-grown, after the timer is
+/// initialised, which enables interrupts with the trap vector in place, so
+/// every caller runs where interrupts may be taken; the idle drain, which
+/// runs with them enabled, keeps them enabled.
 #[cfg(not(test))]
 pub(crate) fn interrupt_window()
 {

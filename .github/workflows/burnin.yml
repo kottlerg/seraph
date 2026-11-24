@@ -4,7 +4,8 @@
 # .github/workflows/burnin.yml
 
 # The burn-in tier: each canonical boot repeated, on a tag push or a manual
-# dispatch (docs/testing.md § Coverage tiers).
+# dispatch, and every bounded proof (docs/testing.md § Coverage tiers,
+# § Bounded verification).
 
 name: burn-in
 
@@ -92,17 +93,20 @@ jobs:
       - name: Stage ${{ matrix.tester }} and repack disk
         # Recipe staging: svctest and usertest live in
         # `sysroot/config/svcmgr/tests/` (svcmgr does not scan that
-        # directory); cp into services/ to enable. These functional harness
+        # directory). usertest is cp'd into services/ to enable it; svctest is
+        # staged by `cargo xtask mkdisk --svctest burn-in`, which co-stages the
+        # `burn-in` fixture set below and records it in svctest's staged
+        # recipe (docs/testing.md § Gating). These functional harness
         # boots drop the autostarted `terminal` (a user-facing program, not
         # part of the services/programs substrate under test) so the boot is
         # controlled. `--repack-only` makes the removal stick: a normal repack
         # re-mirrors rootfs, which would restore terminal.svc. ktest swaps the
         # bundle's `init` entry via `cargo xtask mkdisk --harness ktest`,
         # which repacks the disk image with the ktest bundle.
-        # The svctest cell also stages the test-only device class files of
+        # `mkdisk --svctest` also stages the test-only device class files of
         # `sysroot/config/devmgr/tests/` into `classes/`, and its boots attach
         # the test devices (`--test-devices`, below) the test-only drivers bind.
-        # The svctest cell also co-stages memhog (memhog.svc), which svctest's
+        # The `burn-in` set co-stages memhog (memhog.svc), which svctest's
         # oom_policy phase has fill memory until oomd stops it. The cell keeps
         # crashd, which build-test.yml's svctest cells drop, so the phase's
         # child writes the pages of a demand region once oomd has stopped every
@@ -122,15 +126,9 @@ jobs:
         run: |
           case "${{ matrix.tester }}" in
             svctest)
-              cp sysroot/config/svcmgr/tests/svctest.svc \
-                 sysroot/config/svcmgr/tests/memhog.svc \
-                 sysroot/config/svcmgr/tests/reserve-creator.svc \
-                 sysroot/config/svcmgr/tests/stopsrc.svc \
-                 sysroot/config/svcmgr/services/
-              cp sysroot/config/devmgr/tests/*.class \
-                 sysroot/config/devmgr/classes/
               rm -f sysroot/config/svcmgr/services/terminal.svc
-              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
+              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
+                --svctest burn-in
               ;;
             usertest)
               cp sysroot/config/svcmgr/tests/usertest.svc \
@@ -195,3 +193,35 @@ jobs:
             target/xtask/run/**/*.log
             target/xtask/run/**/*.crash.txt
           if-no-files-found: ignore
+
+  kani:
+    # Every bounded proof, with the Kani release xtask pins (docs/testing.md
+    # § Bounded verification), as build-test.yml's kani job runs the crates a
+    # change can affect. Installing the release and its setup take seconds,
+    # so nothing of Kani is cached.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-10
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: kani
+
+      # Installed outside the checkout, so the repository's
+      # rust-toolchain.toml does not choose the compiler that builds Kani;
+      # `cargo kani setup` installs the nightly Kani builds with.
+      - name: Install the pinned Kani release
+        run: |
+          version=$(cargo xtask kani --pin)
+          cd "$RUNNER_TEMP"
+          cargo install --locked kani-verifier --version "$version"
+          cargo kani setup
+
+      - name: cargo xtask kani
+        run: cargo xtask kani

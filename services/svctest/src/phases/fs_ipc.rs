@@ -1441,9 +1441,9 @@ fn take_outstanding(open: u64, index: usize, ipc_buf: *mut u64) -> Option<(u64, 
 /// page: one run fill (fatfs `RUN_PAGES`).
 const OUTSTANDING_SPARE_SLOTS: usize = 16;
 
-/// The opens [`opens_outstanding`] holds pages on at once: four times
-/// the slot ceiling's ancestors, well past what fatfs funds without a top-up
-/// per read.
+/// The fewest opens [`opens_outstanding`] holds pages on at once: four
+/// times the slot ceiling's ancestors, well past what fatfs funds without a
+/// top-up per read.
 const OUTSTANDING_OPENS: usize = 4;
 
 /// Slots svctest funds past the caps [`opens_outstanding`] holds, for the
@@ -1451,8 +1451,8 @@ const OUTSTANDING_OPENS: usize = 4;
 /// funds 64 past the caps it holds.
 const OUTSTANDING_CSPACE_MARGIN: usize = 64;
 
-/// Several opens of the slot-reuse file (`OUTSTANDING_OPENS`, the phase's
-/// own among them) each hold the same pages outstanding at once, all of the
+/// Several opens of the slot-reuse file (at least `OUTSTANDING_OPENS`, the
+/// phase's own among them) each hold the same pages outstanding at once, all of the
 /// cache's slot ceiling but one run fill's worth (`OUTSTANDING_SPARE_SLOTS`),
 /// left for the FAT and directory pages and the run fills, so no outstanding
 /// page is evicted. Each outstanding page holds an ancestor cap, and fatfs's
@@ -1462,23 +1462,37 @@ const OUTSTANDING_CSPACE_MARGIN: usize = 64;
 /// `FS_RELEASE_MEMORY` releases each page.
 ///
 /// svctest holds every outstanding page's cap and the other opens' caps at
-/// once, a count the slot ceiling makes grow with RAM. Its `CSpace` grows
-/// only when svctest funds it, and a reply whose cap finds no free slot
-/// arrives as `IPC_REPLY_TRANSFER_FAILED` (runtime/ruststd/README.md
-/// § `CSpace` slot headroom), so the phase funds the whole count first instead
-/// of relying on the headroom earlier phases left.
+/// once. Its `CSpace` grows only when svctest funds it, and a reply whose
+/// cap finds no free slot arrives as `IPC_REPLY_TRANSFER_FAILED`
+/// (runtime/ruststd/README.md § `CSpace` slot headroom), so the phase funds
+/// the whole count first. It also takes enough opens that the pages
+/// outstanding exceed the general slots svctest's `CSpace` has free before
+/// that funding, so at every RAM size the reads succeed only when the
+/// funding grew the `CSpace`. svctest once funded none of them and relied
+/// on the headroom earlier phases left, which covered the four opens' pages
+/// up to 1 GiB of RAM and fell short at 2 GiB.
 fn opens_outstanding(node_cap: u64, open: u64, slots: usize, ipc_buf: *mut u64)
 {
     let pages = slots.saturating_sub(OUTSTANDING_SPARE_SLOTS);
+    let cspace = startup_info().self_cspace;
+    let unfunded = usize::try_from(std::os::seraph::cspace_slot_headroom(cspace))
+        .expect("slot reuse: CSpace headroom past usize");
+    let opens = unfunded
+        .checked_div(pages)
+        .and_then(|n| n.checked_add(1))
+        .expect("slot reuse: open count overflowed")
+        .max(OUTSTANDING_OPENS);
     let held = pages
-        .checked_mul(OUTSTANDING_OPENS)
+        .checked_mul(opens)
         .expect("slot reuse: outstanding page count overflowed");
     let need = held
-        .checked_add(OUTSTANDING_OPENS)
+        .checked_add(opens)
         .and_then(|n| n.checked_add(OUTSTANDING_CSPACE_MARGIN))
         .expect("slot reuse: outstanding cap count overflowed");
     let need_slots = u64::try_from(need).expect("slot reuse: cap count past u64");
-    let cspace = startup_info().self_cspace;
+    std::os::seraph::log!(
+        "slot reuse: {opens} opens hold {held} pages outstanding past {unfunded} free slots"
+    );
     assert!(
         std::os::seraph::fund_cspace_slot_budget(cspace, need_slots),
         "slot reuse: funding svctest's CSpace for {need} caps failed"
@@ -1488,7 +1502,7 @@ fn opens_outstanding(node_cap: u64, open: u64, slots: usize, ipc_buf: *mut u64)
         headroom >= need_slots,
         "slot reuse: svctest's CSpace has {headroom} free slots after funding {need}"
     );
-    let others: Vec<u64> = (1..OUTSTANDING_OPENS)
+    let others: Vec<u64> = (1..opens)
         .map(|_| fs_open(node_cap, 0, ipc_buf).expect("slot reuse: another FS_OPEN"))
         .collect();
     let mut kept: Vec<(u64, u64, u64)> = Vec::with_capacity(held);

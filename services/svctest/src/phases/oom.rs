@@ -24,6 +24,7 @@ use std::os::seraph::MemoryPressure;
 use svctest_fixtures::Fixture;
 
 use super::fixtures;
+use super::sessiond::CRASHME_PATH;
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -69,7 +70,7 @@ const JOB_STOP_LINE: &[u8] = b"stopped stopsrc-job: ";
 const JOB_PAGES: u64 = 64;
 
 /// The prefix of oomd's line for a stop of the session's job.
-const HOLD_STOP_LINE: &[u8] = b"stopped /programs/crashme: ";
+const HOLD_STOP_LINE: &[u8] = b"stopped /tests/fixtures/programs/crashme: ";
 
 /// The prefix of oomd's line for a stop of a session.
 const SESSION_STOP_LINE: &[u8] = b"stopped session ";
@@ -182,7 +183,7 @@ fn env_value<'a>(recipe: &'a str, key: &str) -> Option<&'a str>
 /// oomd stops that job first, as the largest of the program class, then
 /// `stopsrc`'s, then the sessions, then the fixture, and the session's relay
 /// gives its leader's end. With crashd holding faults, a child
-/// (`/programs/crashme oom-touch` [`TOUCH_PAGES`]) writes the pages of a
+/// (`/tests/fixtures/programs/crashme oom-touch` [`TOUCH_PAGES`]) writes the pages of a
 /// demand region in turn while the pool is full, once sessiond lists no
 /// candidate, so that only memhog's stop is left: crashd holds the write
 /// memmgr declines, and resumes it once the stop frees memory, so crashd logs
@@ -751,7 +752,7 @@ impl Held
     {
         let send = super::sessiond::stop_send(caps, phase);
         let mut session = super::sessiond::Session::open(caps.sessiond_operator, phase);
-        session.send(&format!("crashme oom-hold {HOLD_PAGES}"), phase);
+        session.send(&format!("{CRASHME_PATH} oom-hold {HOLD_PAGES}"), phase);
         session.expect(&format!("holding {HOLD_PAGES}"), phase);
         Self { session, send }
     }
@@ -821,7 +822,7 @@ impl Held
     }
 }
 
-/// A `/programs/crashme oom-touch` [`TOUCH_PAGES`] child, between its
+/// A `/tests/fixtures/programs/crashme oom-touch` [`TOUCH_PAGES`] child, between its
 /// `ready` and its writes.
 struct Toucher
 {
@@ -837,13 +838,15 @@ impl Toucher
     /// demand region registered and its buffers made.
     fn start(phase: &str) -> Self
     {
-        let mut child = Command::new("/programs/crashme")
+        let mut child = Command::new("/tests/fixtures/programs/crashme")
             .arg("oom-touch")
             .arg(TOUCH_PAGES.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("{phase}: spawn /programs/crashme oom-touch: {e:?}"));
+            .unwrap_or_else(|e| {
+                panic!("{phase}: spawn /tests/fixtures/programs/crashme oom-touch: {e:?}")
+            });
         let mut stdin = child.stdin.take().expect("piped stdin");
         let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let mut line = String::with_capacity(256);

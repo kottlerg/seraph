@@ -111,12 +111,12 @@ write's wait is a timed poll.
 ## Testing
 
 `cargo xtask test debug-port` boots the `debug-echo` fixture
-([services/debug-echo/README.md](../../../debug-echo/README.md)) with the debug port attached
-and drives a GDB remote serial protocol exchange with it from the host, and its second boot boots
-the GDB stub ([services/gdbstub/README.md](../../../gdbstub/README.md)) with it and runs a
-host GDB session over it. The two boots are the driver's device cell, `debug-port`, in
-[docs/testing.md](../../../../docs/testing.md#coverage-tiers) § Coverage tiers: no canonical CI
-boot attaches the device.
+([services/fixtures/debug-echo/README.md](../../../fixtures/debug-echo/README.md)) with the debug
+port attached and drives a GDB remote serial protocol exchange with it from the host, and its second
+boot boots the GDB stub ([services/gdbstub/README.md](../../../gdbstub/README.md)) with it and runs
+a host GDB session over it. The two boots are the driver's device cell, `debug-port`, in
+[docs/testing.md](../../../../docs/testing.md#coverage-tiers) § Coverage tiers: no canonical CI boot
+attaches the device.
 
 ---
 

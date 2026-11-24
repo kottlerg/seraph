@@ -1,4 +1,4 @@
-# /tests/crasher worker-fault — svcmgr's worker-thread-fault restart fixture.
+# /tests/fixtures/crasher worker-fault — svcmgr's worker-thread-fault restart fixture.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # Co-staged with svctest (services-surface harness) in CI and stageable
@@ -15,7 +15,7 @@
 # fixtures (with memhog) a stop-authority holder may stop: svctest's
 # svcmgr_stop_service phase lists it, stops it, and reads the restarted
 # instance's nonce.
-binary    = /tests/crasher
+binary    = /tests/fixtures/crasher
 argv      = crasher worker-fault
 restart   = on_failure
 critical  = no

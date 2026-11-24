@@ -110,17 +110,17 @@ architectures: `SYS_THREAD_POST_UPCALL`, the third class `FAULT_CLASS_UPCALL`, d
 syscall's return and, for an `UPCALL_ANY_INSTRUCTION` post, at an interrupt's return to user mode,
 the cancel of a blocking syscall, and `SYS_THREAD_SET_UPCALL_MASK`. Its end-to-end consumer is the
 `deadline` fixture's supervisor, which cancels a spinning worker at a deadline
-([programs/deadline/README.md](../programs/deadline/README.md)).
+([services/fixtures/deadline/README.md](../services/fixtures/deadline/README.md)).
 
-A debugger's access to the memory of the address space a thread executes in
-(`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, [Debugging](#debugging)) is implemented on both
-architectures, the instruction-fetch synchronisation of a text write included, and so are the
-listing of that space's pages (`SYS_THREAD_LIST_PAGES`) and the read of a thread's extended
-register state (`SYS_THREAD_READ_EXT_REGS`), which ktest exercises. Its end-to-end
-consumer is the `debugger` fixture, which debugs a child process
-([programs/debugger/README.md](../programs/debugger/README.md)). The GDB stub, which debugs a
-process of a running system from a host GDB over the debug port, is implemented on both
-architectures ([services/gdbstub/README.md](../services/gdbstub/README.md)).
+A debugger's access to the memory of the address space a thread executes in (`SYS_THREAD_READ_MEM`,
+`SYS_THREAD_WRITE_MEM`, [Debugging](#debugging)) is implemented on both architectures, the
+instruction-fetch synchronisation of a text write included, and so are the listing of that space's
+pages (`SYS_THREAD_LIST_PAGES`) and the read of a thread's extended register state
+(`SYS_THREAD_READ_EXT_REGS`), which ktest exercises. Its end-to-end consumer is the `debugger`
+fixture, which debugs a child process
+([services/fixtures/debugger/README.md](../services/fixtures/debugger/README.md)). The GDB stub,
+which debugs a process of a running system from a host GDB over the debug port, is implemented on
+both architectures ([services/gdbstub/README.md](../services/gdbstub/README.md)).
 
 ---
 
@@ -824,7 +824,7 @@ GDB session on both architectures ([testing.md](testing.md) § GDB stub (`debug-
 The `debugger` fixture drives the breakpoint, the single-step on both architectures, register and
 same-process memory access, and the asynchronous break end to end, then reads and writes a debuggee
 process's memory and plants, takes, and removes a breakpoint in its text
-([programs/debugger/README.md](../programs/debugger/README.md)). ktest
+([services/fixtures/debugger/README.md](../services/fixtures/debugger/README.md)). ktest
 `integration::fault_exception_redirect` drives a resume at a handler-written instruction pointer
 after an illegal instruction; `integration::single_step` steps a `syscall` on x86-64 and, on
 riscv64, steps a thread through taken and not-taken branches and jumps, compressed ones among them;
@@ -1038,20 +1038,19 @@ svcmgr service definitions carry no paging key; see
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
-[core/ktest/README.md](../core/ktest/README.md),
-[Capability Model](capability-model.md), [IPC Design](ipc-design.md),
-[Memory Model](memory-model.md),
+[core/ktest/README.md](../core/ktest/README.md), [Capability Model](capability-model.md),
+[IPC Design](ipc-design.md), [Memory Model](memory-model.md),
 [Platform Requirements](platform-requirements.md), [Process Lifecycle](process-lifecycle.md),
-[Supervision](supervision.md),
-[Testing](testing.md), [Userspace Memory Model](userspace-memory-model.md),
-[programs/deadline/README.md](../programs/deadline/README.md),
-[programs/debugger/README.md](../programs/debugger/README.md),
-[programs/demandpaged/README.md](../programs/demandpaged/README.md),
-[programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
-[programs/threadstack/README.md](../programs/threadstack/README.md),
+[Supervision](supervision.md), [Testing](testing.md),
+[Userspace Memory Model](userspace-memory-model.md),
 [runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [services/crashd/README.md](../services/crashd/README.md),
 [crashd Operation](../services/crashd/docs/operation.md),
+[services/fixtures/deadline/README.md](../services/fixtures/deadline/README.md),
+[services/fixtures/debugger/README.md](../services/fixtures/debugger/README.md),
+[services/fixtures/demandpaged/README.md](../services/fixtures/demandpaged/README.md),
+[services/fixtures/stackoverflow/README.md](../services/fixtures/stackoverflow/README.md),
+[services/fixtures/threadstack/README.md](../services/fixtures/threadstack/README.md),
 [services/gdbstub/README.md](../services/gdbstub/README.md),
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),

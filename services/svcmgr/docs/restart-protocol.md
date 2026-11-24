@@ -546,7 +546,7 @@ and powers the system off
 [Console Model](../../../docs/console-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Supervision](../../../docs/supervision.md),
-[services/crasher/README.md](../../crasher/README.md),
+[services/fixtures/crasher/README.md](../../fixtures/crasher/README.md),
 [services/logd/README.md](../../logd/README.md),
 [logd handover protocol](../../logd/docs/handover-protocol.md),
 [logd IPC interface](../../logd/docs/ipc-interface.md),

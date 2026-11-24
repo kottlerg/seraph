@@ -38,16 +38,18 @@ const RECLAIM_TAGS: [&str; 2] = ["[logd] reclaim: ", "[logd] reclaim (resync): "
 
 /// The sysroot directories searched, in this order, for the binary a log
 /// name names: the boot modules and services, the drivers, the filesystem
-/// drivers, the programs, the harnesses, the test-only drivers, and the
-/// per-program testers (last, since a tester installs under its program's
-/// name).
-const IMAGE_DIRS: [&str; 7] = [
+/// drivers, the programs, the harnesses, the test-only drivers, the test
+/// fixtures, and the per-program testers (last, since a tester installs
+/// under the name of the program or fixture it drives).
+const IMAGE_DIRS: [&str; 9] = [
     "services",
     "services/drivers",
     "services/fs",
     "programs",
     "tests",
     "tests/drivers",
+    "tests/fixtures",
+    "tests/fixtures/programs",
     "tests/programs",
 ];
 
@@ -1131,6 +1133,8 @@ mod tests
                 "programs/crashme",
                 "tests/crashme",
                 "tests/drivers/crashme",
+                "tests/fixtures/crashme",
+                "tests/fixtures/programs/crashme",
                 "tests/programs/crashme",
             ]
         );

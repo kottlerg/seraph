@@ -33,7 +33,7 @@ const PHASE_JOB_PAGES: u64 = 16;
 
 /// The path procmgr names a job of the shell by: the first word of the
 /// argv the shell creates it with.
-pub(super) const CRASHME_PATH: &str = "/programs/crashme";
+pub(super) const CRASHME_PATH: &str = "/tests/fixtures/programs/crashme";
 
 /// The end queue svctest registered with procmgr; 0 until it has.
 static END_QUEUE: AtomicU64 = AtomicU64::new(0);
@@ -475,7 +475,7 @@ fn session_life(operator: u64, send: u64, phase: &str)
     let mut session = Session::open(operator, phase);
     session.send(&format!("echo {ECHO_MARKER}"), phase);
     session.expect(ECHO_MARKER, phase);
-    session.send(&format!("crashme oom-hold {PHASE_JOB_PAGES}"), phase);
+    session.send(&format!("{CRASHME_PATH} oom-hold {PHASE_JOB_PAGES}"), phase);
     session.expect(&format!("holding {PHASE_JOB_PAGES}"), phase);
     let listed = super::svcmgr::list_candidates(send, phase);
     assert!(

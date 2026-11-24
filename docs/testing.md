@@ -25,13 +25,13 @@ Three harnesses exercise three surfaces:
 |---|---|---|---|
 | `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask mkdisk --harness ktest`) |
 | `svctest` | Services | [`services/svctest/`](../services/svctest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
-| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (the `terminal` case, `cargo xtask test terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
+| `usertest` | Programs | [`programs/usertest/`](../programs/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (the `terminal` case, `cargo xtask test terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs the per-program
 tester binaries under `/tests/programs/` that its recipe names.
 
-[`ubench`](../programs/ubench/README.md), the userspace benchmark suite, is launched as
+[`ubench`](../services/ubench/README.md), the userspace benchmark suite, is launched as
 `svctest` is, from a recipe staged into `/config/svcmgr/services/`, and measures rather than
 tests: it logs result lines, and passes when every benchmark ran
 ([Benchmarks](#benchmarks-bench-cell)).
@@ -66,15 +66,16 @@ harness-specific and MUST NOT include the bracketed summary substring.
 
 ## Per-program tester protocol
 
-A program under `programs/<name>/` MAY ship a tester. Authors of each
-program opt in or skip; absence is the default.
+A program under `programs/<name>/`, or a test fixture under `services/fixtures/<name>/`, MAY ship
+a tester. Authors of each opt in or skip; absence is the default.
 
 ### Layout
 
-- The tester crate lives at `programs/<name>/tester/`.
+- The tester crate lives at `programs/<name>/tester/` for a program and at
+  `services/fixtures/<name>/tester/` for a fixture.
 - The tester crate is a workspace member listed in the root `Cargo.toml`.
-- The tester uses the standard userspace build profile (same as
-  `programs/<name>/` itself).
+- The tester uses the standard userspace build profile (same as the
+  program or fixture itself).
 
 ### Install
 
@@ -88,7 +89,7 @@ program opt in or skip; absence is the default.
   usertest fails the run for each tester named and absent from
   `/tests/programs/`, for each one there that the list does not name, and
   for an empty list
-  ([services/usertest/README.md](../services/usertest/README.md) § Testers).
+  ([programs/usertest/README.md](../programs/usertest/README.md) § Testers).
 
 ### Contract
 
@@ -96,7 +97,7 @@ program opt in or skip; absence is the default.
 - The tester MUST exit, and its stdout and stderr MUST close, within the
   bound usertest's recipe sets in `TESTER_BOUND_MS`. usertest kills a tester
   still running at the bound, reports it as FAIL, and runs the testers after
-  it ([services/usertest/README.md](../services/usertest/README.md)
+  it ([programs/usertest/README.md](../programs/usertest/README.md)
   § Testers).
 - The tester binary's exit code is the authoritative verdict. Seraph propagates
   it natively, without POSIX 8-bit truncation (see
@@ -105,7 +106,8 @@ program opt in or skip; absence is the default.
 - The tester SHOULD emit a final stdout line `[<name>-tester] PASS` or
   `[<name>-tester] FAIL` for log readability. The orchestrator does not
   rely on this line for the verdict.
-- The tester drives `/programs/<name>` (the program under test) through its
+- The tester drives the program under test, `/programs/<name>` or the fixture
+  `/tests/fixtures/programs/<name>`, through its
   real I/O surface — stdio (via `std::process::Command` with
   `Stdio::piped()`), argv, environment, filesystem — and asserts whatever
   invariant fits that program.
@@ -122,7 +124,7 @@ program opt in or skip; absence is the default.
   caps, in the order its entry names them, and the tester takes them with
   `ipc::bootstrap::request_slots` on its `creator_endpoint` before it writes
   to its stdout or stderr
-  ([services/usertest/README.md](../services/usertest/README.md) § Seeds).
+  ([programs/usertest/README.md](../programs/usertest/README.md) § Seeds).
 - A tester with no entry is spawned with no creator endpoint.
 
 ---
@@ -138,42 +140,51 @@ sysroot/
 │   │                         # cmos-rtc | goldfish-rtc, iommu-vtd |
 │   │                         # iommu-riscv, and the test-only test-dma)
 │   └── fs/                   # filesystem drivers (fatfs)
-├── programs/                 # program binaries and the test fixtures the
-│                             # harnesses spawn
+├── programs/                 # program binaries
 │   ├── hello
-│   ├── stdiotest
+│   ├── shell
 │   └── …
 └── tests/                    # test harnesses, per-program testers, and
-    │                         # harness-only fixtures
+    │                         # test fixtures
     ├── ktest                 # kernel-surface harness (bootloader-loaded)
     ├── svctest               # services-surface harness
     ├── usertest              # programs-surface orchestrator
     ├── ubench                # userspace benchmark suite
-    ├── crasher               # svcmgr restart-path fixture
-    ├── debug-echo            # debug-port fixture (`debug-port` case)
-    ├── hotplug-check         # PCI Express hotplug fixture (`hotplug` case)
     ├── drivers/              # test-only drivers bound only on demand
     │   └── test-fault        # fault-injection driver, bound by BIND_DRIVERS
+    ├── fixtures/             # fixtures started as services
+    │   ├── crasher           # svcmgr restart-path fixture
+    │   ├── debug-echo        # debug-port fixture (`debug-port` case)
+    │   ├── hotplug-check     # PCI Express hotplug fixture (`hotplug` case)
+    │   ├── …
+    │   └── programs/         # fixtures spawned as programs
+    │       ├── crashme
+    │       ├── stdiotest
+    │       └── …
     └── programs/
         ├── hello             # per-program tester for /programs/hello
-        ├── stdiotest         # per-program tester for /programs/stdiotest
+        ├── stdiotest         # per-program tester for /tests/fixtures/programs/stdiotest
         └── …
 ```
 
-`/services/` and `/programs/` MUST NOT contain test harnesses or per-program
-testers; those live under `/tests/`. Dropping `/tests/` does not by itself
+`/services/` and `/programs/` MUST NOT contain test harnesses, per-program testers or test
+fixtures; those live under `/tests/`. Dropping `/tests/` does not by itself
 give a non-test distro, because test-only artifacts also install under
-`/services/drivers/`, `/programs/`, `/config/svcmgr/tests/`, `/config/devmgr/tests/`, and `/data/`.
+`/services/drivers/`, `/config/svcmgr/tests/`, `/config/devmgr/tests/`, and `/data/`.
 Under `/services/drivers/` is [`test-dma`](../services/drivers/test-dma/README.md), the test-only
 driver of the `edu` DMA test device. Under `/tests/drivers/` is
 [`test-fault`](../services/drivers/test-fault/README.md), a test-only fault-injection driver that
 no drivers-directory pass at boot reads: devmgr binds it only through `BIND_DRIVERS`. Under
-`/programs/` are the test fixtures the harnesses and per-program
-testers spawn: `capexhaust`, `crashme`, `deadline`, `debugger`, `demandpaged`, `fsbench`,
+`/tests/fixtures/` are the test fixtures the harnesses and per-program testers spawn, sourced from
+[`services/fixtures/`](../services/fixtures/README.md): under `/tests/fixtures/programs/` the ones
+spawned as programs, `capexhaust`, `crashme`, `deadline`, `debugger`, `demandpaged`, `fsbench`,
 `pipefault`, `pipestress`, `relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and
-`threadstack`. Which consumer spawns or drives each one is owned by [services/svctest/README.md §
-Fixtures](../services/svctest/README.md#fixtures) for `svctest` phases and by each fixture's README
-(`programs/<name>/README.md`) for every per-program tester that drives it. Under
+`threadstack`, which the `programs` component keeps in the program signing role; directly under
+`/tests/fixtures/` the ones a harness recipe starts as services, `crasher`, `debug-echo`,
+`hotplug-check`, `memhog`, and `stopsrc`. Which consumer spawns or drives each one is owned by
+[services/svctest/README.md § Fixtures](../services/svctest/README.md#fixtures) for `svctest` phases
+and by each fixture's README (`services/fixtures/<name>/README.md`) for every per-program tester
+that drives it. Under
 `/config/svcmgr/tests/` are the harness recipes, and under `/config/devmgr/tests/` the test
 device class files the svctest recipe stages (see [Gating](#gating)). Under `/data/` are
 `/data/test.txt`, a fixture shared by `svctest` and the `shell` tester, and the build-synthesised
@@ -451,7 +462,7 @@ result line, its samples' summary in the form
 ktest boot runs every benchmark 8 times, a smoke run whose lines no check compares; the bench-only
 image (`cargo xtask build --ktest-bench-only`) runs Tier 3 alone, 4096 iterations each, for the
 lines that are compared. The userspace paths are measured by the
-[`ubench`](../programs/ubench/README.md) suite, in a boot of the regular init image with its
+[`ubench`](../services/ubench/README.md) suite, in a boot of the regular init image with its
 recipe (`/config/svcmgr/tests/ubench.svc`) staged and the terminal dropped; it logs its own
 lines and fsbench's.
 
@@ -512,15 +523,15 @@ checks the blocks in each boot's serial log, with the parser of the format crash
 must be complete and hold the fields its kind, thread, and status require.
 
 - `--crash-reports reports` reads a usertest boot, which runs the `crashme` fixture's tester
-  ([programs/crashme/README.md](../programs/crashme/README.md)): the log must also hold one `vm`
-  and one `exception` block of `crashme`'s main thread and one `exception` block of a `spawned`
-  thread, whose fault the fixture takes while a sibling is held blocked on a fault at the same
-  instruction, each tied to `crashme` through the badge logd's `reclaim:` line names, complete, its
-  walk starting at its instruction pointer, matched by the kernel's `handler declined` line
+  ([services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md)): the log must also
+  hold one `vm` and one `exception` block of `crashme`'s main thread and one `exception` block of a
+  `spawned` thread, whose fault the fixture takes while a sibling is held blocked on a fault at the
+  same instruction, each tied to `crashme` through the badge logd's `reclaim:` line names, complete,
+  its walk starting at its instruction pointer, matched by the kernel's `handler declined` line
   carrying the block's id, and carrying the stack pointer the kernel's register dump of that line's
   thread prints, so the block read the thread that faulted. The `vm` block's `addr`, the fault
-  message's address, must also be the faulting address that dump prints (`cr2` on x86_64, `stval`
-  on riscv64), so the dump names the access that faulted.
+  message's address, must also be the faulting address that dump prints (`cr2` on x86_64, `stval` on
+  riscv64), so the dump names the access that faulted.
 - `--crash-reports none` reads a boot of an image that stages no crashd: the log must hold no block,
   the check that the absent service changes nothing a fault does.
 
@@ -528,12 +539,12 @@ The usertest boot's crashd names `crashme` in its `CORE_DUMP` ([Gating](#gating)
 fixture's faulting deaths also leaves an ELF core in `/crash`, which the crashme tester checks in
 the guest: its machine, the faulting thread's signal, instruction pointer and stack pointer against
 the page runs it holds, the illegal instruction's bytes, and the `worker` core's threads
-([programs/crashme/README.md](../programs/crashme/README.md)). The tester also asks crashd for a
-live core of the running fixture and checks that the fixture ran on unchanged and that the core
-records its threads, their stacks and a page it marked, and none of the binary's text, and asks for
-one of a fixture on the core path and checks the refusal released the capture ([crashd Operation §
-Live Core](../services/crashd/docs/operation.md#live-core)). A core is checked in the boot, not in
-the log; `gdb` reading one is checked by hand
+([services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md)). The tester also
+asks crashd for a live core of the running fixture and checks that the fixture ran on unchanged and
+that the core records its threads, their stacks and a page it marked, and none of the binary's text,
+and asks for one of a fixture on the core path and checks the refusal released the capture ([crashd
+Operation § Live Core](../services/crashd/docs/operation.md#live-core)). A core is checked in the
+boot, not in the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The usertest boot's crashd also holds a page fault memmgr declined for want of memory, for up to
@@ -716,7 +727,7 @@ No guest-side check can show that bytes cross it, since its far end is the host.
 `cargo xtask test debug-port [--arch] [--port]` (both arches) checks the transport host-side in
 the case's first boot:
 
-1. Stage the [`debug-echo`](../services/debug-echo/README.md) fixture's recipe from
+1. Stage the [`debug-echo`](../services/fixtures/debug-echo/README.md) fixture's recipe from
    `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and repack the disk images in the
    layout they have.
 2. Boot the current sysroot once with the debug port, and wait for the fixture's
@@ -891,10 +902,10 @@ from a host GDB over the debug port, so its check is a host GDB session.
 `cargo xtask test debug-port [--arch] [--port] [--gdb]` (both arches) runs it as the case's second
 boot, whatever the first boot's outcome:
 
-1. Stage the `gdb-target` recipe (`programs/debugger --gdb-target`, a process of two threads with
-   an exported counter and tick function;
-   [programs/debugger/README.md](../programs/debugger/README.md)) from `/config/svcmgr/tests/`,
-   and the stub's template from `/config/svcmgr/debug/` naming it, into
+1. Stage the `gdb-target` recipe (`services/fixtures/debugger --gdb-target`, a process of two
+   threads with an exported counter and tick function;
+   [services/fixtures/debugger/README.md](../services/fixtures/debugger/README.md)) from
+   `/config/svcmgr/tests/`, and the stub's template from `/config/svcmgr/debug/` naming it, into
    `/config/svcmgr/services/`, and repack the disk images in the layout they have.
 2. Boot the current sysroot once with the debug port, and wait for the stub's
    `[gdbstub] attached; serving the debug port` line on the serial stream.
@@ -1041,7 +1052,7 @@ namespace composition](../services/vfsd/docs/namespace-composition.md#driver-dea
 (both arches) makes a device arrive, leave, and arrive again, then makes a disk arrive, in one boot
 per hotplug control, and then makes a disk leave and arrive again and a second disk arrive:
 
-1. Stage the [`hotplug-check`](../services/hotplug-check/README.md) fixture's recipe from
+1. Stage the [`hotplug-check`](../services/fixtures/hotplug-check/README.md) fixture's recipe from
    `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and the `test-dma` class file from
    `/config/devmgr/tests/` into `/config/devmgr/classes/`, and repack the disk images in the
    layout they have.
@@ -1157,23 +1168,23 @@ worker fault, and its `svcmgr_stop_service` phase stops and restarts the fixture
 stop authority), as is its boot-fault role (`crasher-boot.svc`, `restart = on_failure`), whose
 instance that finds the token `/data/crasher-boot/die-early`, which the data partition ships,
 removes it and dies before its bootstrap request (svctest's `svcmgr_boot_death` phase); its bounded
-faults complete long before `svctest`'s terminal marker, so the kernel fault dump never clobbers
-it. The `memhog` fixture (`memhog.svc`, `restart = on_failure`, `oom_stop = yes`) is in the `ci`
-and `burn-in` sets: svctest's `oom_policy` phase has it fill memory until oomd stops it, and its
+faults complete long before `svctest`'s terminal marker, so the kernel fault dump never clobbers it.
+The `memhog` fixture (`memhog.svc`, `restart = on_failure`, `oom_stop = yes`) is in the `ci` and
+`burn-in` sets: svctest's `oom_policy` phase has it fill memory until oomd stops it, and its
 `logd_reserve` phase has it fill memory while logd is killed and restarted. The CI svctest cell
 drops crashd, so the held-write path of that phase (a child's page fault crashd holds until oomd's
-stop frees memory), and the write part of the `memmgr_swap_commit` phase (a child's commitment
-past the draw room, its commit overruns held by crashd until write-out to swap opens memmgr's draw
-room), run in the burn-in svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`,
-`restart = always`, `stop_source = program`) is in both sets: svctest's `svcmgr_stop_service`
-phase reads that svcmgr lists it, beside sessiond, as a stop source of the program class and that a
-job it started ends with it, and its `oom_policy` phase has it start a job that oomd stops before
-memhog. The `oom_policy` phase also opens an operator session whose shell runs
-`crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's `sessiond_operator`
-phase checks sessiond's operator interface; sessiond, like oomd, is a default service, which every
-svctest boot stages. The `reserve-creator` fixture (`reserve-creator.svc`, `reserve = yes`) is in
-both sets: svctest's `logd_reserve` phase has it make a `CREATE_FROM_FILE | CREATE_RESERVE` of
-`/programs/hello` while memhog holds memory critical, which must succeed.
+stop frees memory), and the write part of the `memmgr_swap_commit` phase (a child's commitment past
+the draw room, its commit overruns held by crashd until write-out to swap opens memmgr's draw room),
+run in the burn-in svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart
+= always`, `stop_source = program`) is in both sets: svctest's `svcmgr_stop_service` phase reads
+that svcmgr lists it, beside sessiond, as a stop source of the program class and that a job it
+started ends with it, and its `oom_policy` phase has it start a job that oomd stops before memhog.
+The `oom_policy` phase also opens an operator session whose shell runs
+`/tests/fixtures/programs/crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's
+`sessiond_operator` phase checks sessiond's operator interface; sessiond, like oomd, is a default
+service, which every svctest boot stages. The `reserve-creator` fixture (`reserve-creator.svc`,
+`reserve = yes`) is in both sets: svctest's `logd_reserve` phase has it make a `CREATE_FROM_FILE |
+CREATE_RESERVE` of `/programs/hello` while memhog holds memory critical, which must succeed.
 
 **Test isolation.** The functional harness boots run a controlled substrate:
 they drop the autostarted `terminal` (a user-facing program, not part of the
@@ -1722,9 +1733,9 @@ the cells of every surface a non-inert line of its own diff is on.
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
 | virtio-rng and the `hwrng` class | `services/drivers/virtio/rng/`, its class protocol crate (`shared/hwrng-protocol/`), and svctest's hwrng checks, which drive it (by definition alone: `hwrng_read_phase`, `hwrng_restart_phase`, `hwrng_read`, and `hwrng_denied`) | no-iommu |
-| virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test/debug_port/echo.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test/debug_port/gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
+| virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/fixtures/debug-echo/` and `xtask/src/commands/test/debug_port/echo.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test/debug_port/gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module, a file (`shared/ipc/src/test_dma_labels.rs`), the launchers' `edu` attachment (`EDU_DEVICE`), and svctest's DMA confinement, MSI delivery, MSI forge, MSI churn and MSI release checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, `msi_forge_phase`, `msi_churn_phase`, `msi_release_phase`, `iommu_restart_phase`, and `call_test_dma`) | no-iommu, and hotplug |
-| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test/hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `PORT_DISK_LOCATION`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
+| PCI Express hotplug | the fixture and the host test that drive it (`services/fixtures/hotplug-check/` and `xtask/src/commands/test/hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `PORT_DISK_LOCATION`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay` and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | TPM 2.0, and the bootloader's seed of its registers | `services/drivers/tpm/`, its class protocol crate (`shared/hwrng-protocol/`), which the virtio-rng row lists too, the host test that drives it (`xtask/src/commands/test/tpm.rs`), and the launchers' TPM attachment (`Tpm`, `TpmInterface`, and `tpm_args`); and the bootloader's `TPM2` table seed, which only a boot with a TPM takes (`tpm2_register_window`, `tpm_register_window`, `TPM2_OFF_CONTROL_AREA`, `TPM2_OFF_START_METHOD`, `TPM2_MIN_LEN`, `TPM2_START_FIFO`, and `TPM2_START_CRB`) | tpm |
@@ -1760,9 +1771,10 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     services/drivers/virtio/blk/ services/fs/fat/ \
     services/drivers/virtio/input/ services/drivers/virtio/rng/ shared/hwrng-protocol/ \
     services/drivers/test-dma/ services/drivers/framebuffer/ \
-    services/drivers/virtio/console/ services/debug-echo/ \
+    services/drivers/virtio/console/ services/fixtures/debug-echo/ \
     xtask/src/commands/test/debug_port/echo.rs \
-    services/hotplug-check/ xtask/src/commands/test/hotplug.rs services/acpid/src/hotplug.rs \
+    services/fixtures/hotplug-check/ xtask/src/commands/test/hotplug.rs \
+    services/acpid/src/hotplug.rs \
     shared/gdb-rsp/ services/gdbstub/ xtask/src/debug_stub.rs \
     xtask/src/commands/test/debug_port/gdb.rs \
     core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/ \
@@ -2175,7 +2187,7 @@ fails as the search did, on any host. The run exits non-zero.
 | Tier | Where | When | Runs |
 |---|---|---|---|
 | Gating | CI, the `fuzz` job of `build-test.yml` | a change that can affect a crate it fuzzes, its engine, xtask or the workflows; skipped as not owed otherwise | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
-| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, from a seed that changes each run, over a working corpus the Actions cache carries from run to run; failing inputs upload as an artifact |
+| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, from a seed that changes each run, over the checked-in inputs and the working corpus of an earlier run when the Actions cache still holds one; failing inputs upload as an artifact |
 | Local | developer host | at will | `cargo xtask fuzz <target>` with `--runs` or `--time` |
 
 The self-test runs the engine on planted defects in `xtask/fuzz/targets` (an eight-byte magic
@@ -2216,14 +2228,6 @@ harness adds it to the run. It holds each process of the run to the address spac
 give a harness, so a harness that needs more fails, named as out of memory, and it closes with
 every harness's verdict and verification time.
 
-**Time budget.** A harness MUST verify in at most 120 s on CI's `kani` runner, the verification
-time Kani reports for it, beside the memory bound below. `cargo xtask kani` fails a harness over
-the budget on a CI runner, naming it and its time, and warns of it on another host, whose speed
-differs. A harness that cannot meet the budget is resized, by bounds that still cover its property,
-or proved in the induction form of the parser proofs below, or split into harnesses that together
-cover the inputs it covered; no property is dropped or narrowed to meet it. A PR that resizes a
-harness for the budget states its time before and after.
-
 **Where the proofs run.** On a pull request, CI's `kani` job verifies only the crates the change
 can affect (`cargo xtask kani --since` against the base the `select` job found, the newest commit
 before the run's whose `master` run passed; [conventions.md](conventions.md#ci-gating) § CI
@@ -2248,9 +2252,9 @@ repository](https://docs.github.com/en/actions/reference/runners/github-hosted-r
 leaves 4 GB to the runner's own processes, so a harness that fits under it locally fits on the
 runner. A run that the limit ends (an allocation failure, or a process killed)
 or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
-still cover the property or by the induction form of the parser proofs below; a run whose time
-on the development host is near or over the time budget is a harness that CI's runner may fail,
-made to fit the same way. A failed,
+still cover the property or by the induction form of the parser proofs below. A harness is
+also sized to finish well within CI's `kani` job, whose timeout, GitHub's default for a job, is
+the backstop, and is made to fit the same way when it does not. A failed,
 undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
 or the harness, fixed as such, and MUST NOT be bounded away. The PR body's `## Validation`
 section states, for each such harness, the verification time Kani reports, the peak resident
@@ -2270,15 +2274,15 @@ parser crate's `#[cfg(kani)] mod proofs`, which prove the property in one of two
 runs the property, or its check of one structure the parser decodes (a header, an entry), on the
 first `len` bytes of `kani::any::<[u8; N]>()`, `len` itself any value up to N, so the check holds
 for every input of at most N bytes, not only for the inputs a search reached; its comment states N
-and why inputs of that length cover the structure. Where a harness of the whole property does not
-complete within the time budget, the parser MUST write each loop over a structure of variable length
-(the walk of an array, a search over its entries, a checksum over its bytes) as a step over a small
-state, which two harnesses prove by induction: a base harness, that the loop starts in an invariant
-the harness states, and a step harness, that one step from any state in the invariant (`kani::any`
-under `kani::assume`) keeps it and does what the property asks of that step, with no loop to
-unwind. Code other than the loops that drive the steps and the reads that feed them MUST NOT lie
-outside the harnesses; the module's comment states how its harnesses compose into the property and
-names those loops and reads, with the drivers that check them. Implemented for the parsers whose
+and why inputs of that length cover the structure. Where a harness of the whole property cannot
+be sized as Local sizing above says, the parser MUST write each loop over a structure of variable
+length (the walk of an array, a search over its entries, a checksum over its bytes) as a step over
+a small state, which two harnesses prove by induction: a base harness, that the loop starts in an
+invariant the harness states, and a step harness, that one step from any state in the invariant
+(`kani::any` under `kani::assume`) keeps it and does what the property asks of that step, with no
+loop to unwind. Code other than the loops that drive the steps and the reads that feed them MUST NOT
+lie outside the harnesses; the module's comment states how its harnesses compose into the property
+and names those loops and reads, with the drivers that check them. Implemented for the parsers whose
 crates hold a `property` module, each with its fuzz target in `xtask/fuzz/targets`; design
 intent, not yet implemented, for every other parser of hostile input.
 
@@ -2410,9 +2414,10 @@ cargo xtask build
 cp sysroot/config/svcmgr/tests/gdb-target.svc sysroot/config/svcmgr/services/
 cargo xtask mkdisk --repack-only
 cargo xtask run --debug-port 4561 --debug-target gdb-target   # in one shell
+# in another shell:
 gdb -ex 'set architecture i386:x86-64' -ex 'set remotetimeout 30' \
     -ex 'target remote localhost:4561' \
-    "symbols/$(awk '$1 == "/programs/debugger" {print $2}' symbols/manifest)"  # in another
+    "symbols/$(awk '$1 == "/tests/fixtures/programs/debugger" {print $2}' symbols/manifest)"
 ```
 
 ---
@@ -2423,7 +2428,7 @@ The identifier `usertest` formerly named the services-tier harness, which
 lived at `base/usertest/`. The rename pass that landed under PR #119
 relocated that harness to `services/svctest/`, freeing the `usertest`
 name. As of this document, `usertest` is the programs-surface
-orchestrator at `services/usertest/`. References to `usertest` in commit
+orchestrator at `programs/usertest/`. References to `usertest` in commit
 history before that rename refer to the prior services-tier harness.
 
 See [conventions.md](conventions.md) for the original historical-naming
@@ -2436,33 +2441,32 @@ note in full.
 [README.md](../README.md), [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [core/ktest/README.md](../core/ktest/README.md), [Build System](build-system.md),
 [Console Model](console-model.md), [Project Conventions](conventions.md),
-[Threat Model](threat-model.md),
-[programs/capexhaust/README.md](../programs/capexhaust/README.md),
-[programs/crashme/README.md](../programs/crashme/README.md),
-[programs/deadline/README.md](../programs/deadline/README.md),
-[programs/debugger/README.md](../programs/debugger/README.md),
-[programs/demandpaged/README.md](../programs/demandpaged/README.md),
-[programs/fsbench/README.md](../programs/fsbench/README.md),
-[programs/hello/README.md](../programs/hello/README.md),
-[programs/pipefault/README.md](../programs/pipefault/README.md),
-[programs/pipestress/README.md](../programs/pipestress/README.md),
-[programs/relrofault/README.md](../programs/relrofault/README.md),
+[Threat Model](threat-model.md), [programs/hello/README.md](../programs/hello/README.md),
 [programs/shell/README.md](../programs/shell/README.md),
-[programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
-[programs/stdiotest/README.md](../programs/stdiotest/README.md),
 [programs/terminal/README.md](../programs/terminal/README.md),
-[programs/threadchurn/README.md](../programs/threadchurn/README.md),
-[programs/threadstack/README.md](../programs/threadstack/README.md),
-[programs/ubench/README.md](../programs/ubench/README.md),
+[programs/usertest/README.md](../programs/usertest/README.md),
 [services/crashd/README.md](../services/crashd/README.md),
-[services/crasher/README.md](../services/crasher/README.md),
-[services/debug-echo/README.md](../services/debug-echo/README.md),
 [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md),
+[services/fixtures/capexhaust/README.md](../services/fixtures/capexhaust/README.md),
+[services/fixtures/crasher/README.md](../services/fixtures/crasher/README.md),
+[services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md),
+[services/fixtures/deadline/README.md](../services/fixtures/deadline/README.md),
+[services/fixtures/debug-echo/README.md](../services/fixtures/debug-echo/README.md),
+[services/fixtures/debugger/README.md](../services/fixtures/debugger/README.md),
+[services/fixtures/demandpaged/README.md](../services/fixtures/demandpaged/README.md),
+[services/fixtures/fsbench/README.md](../services/fixtures/fsbench/README.md),
+[services/fixtures/hotplug-check/README.md](../services/fixtures/hotplug-check/README.md),
+[services/fixtures/pipefault/README.md](../services/fixtures/pipefault/README.md),
+[services/fixtures/pipestress/README.md](../services/fixtures/pipestress/README.md),
+[services/fixtures/relrofault/README.md](../services/fixtures/relrofault/README.md),
+[services/fixtures/stackoverflow/README.md](../services/fixtures/stackoverflow/README.md),
+[services/fixtures/stdiotest/README.md](../services/fixtures/stdiotest/README.md),
+[services/fixtures/threadchurn/README.md](../services/fixtures/threadchurn/README.md),
+[services/fixtures/threadstack/README.md](../services/fixtures/threadstack/README.md),
 [services/gdbstub/README.md](../services/gdbstub/README.md),
-[services/hotplug-check/README.md](../services/hotplug-check/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),
 [services/svctest/README.md](../services/svctest/README.md),
-[services/usertest/README.md](../services/usertest/README.md),
+[services/ubench/README.md](../services/ubench/README.md),
 [shared/aml/README.md](../shared/aml/README.md), [xtask/README.md](../xtask/README.md)

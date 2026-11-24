@@ -5,9 +5,9 @@
 
 //! Pure lexical path resolution for the shell.
 //!
-//! Normalises `.`/`..`/cwd-relative inputs into an absolute, dot-free path
-//! without any namespace I/O — kept separate from the shell's syscall/IPC glue
-//! so it is host-reachable, per
+//! Normalises `.`/`..`/cwd-relative inputs into an absolute, dot-free path,
+//! and names the file an external command runs, without any namespace I/O —
+//! kept separate from the shell's syscall/IPC glue so it is host-reachable, per
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
@@ -17,6 +17,28 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+
+/// Directory a bare command name resolves in — Seraph's `/bin`.
+pub const PROGRAMS_DIR: &str = "/programs";
+
+/// The absolute path of the file the external command `cmd` runs, typed
+/// with the working directory `cwd`.
+///
+/// A command holding a `/` is a path, resolved against `cwd` as every path
+/// argument is ([`resolve_path`]); a bare name is the program of that name
+/// under [`PROGRAMS_DIR`]. Whether the file may run is procmgr's to decide.
+#[must_use]
+pub fn command_path(cwd: &str, cmd: &str) -> String
+{
+    if cmd.contains('/')
+    {
+        resolve_path(cwd, cmd)
+    }
+    else
+    {
+        format!("{PROGRAMS_DIR}/{cmd}")
+    }
+}
 
 /// Resolve `arg` against `cwd` into a normalized absolute path.
 ///
@@ -106,5 +128,25 @@ mod tests
     fn repeated_slashes_collapse()
     {
         assert_eq!(resolve_path("/home", "a//b"), "/home/a/b");
+    }
+
+    #[test]
+    fn a_bare_command_runs_from_the_programs_directory()
+    {
+        assert_eq!(command_path("/data", "hello"), "/programs/hello");
+    }
+
+    #[test]
+    fn a_command_with_a_slash_is_a_path_from_the_working_directory()
+    {
+        assert_eq!(
+            command_path("/data", "/tests/fixtures/programs/stdiotest"),
+            "/tests/fixtures/programs/stdiotest"
+        );
+        assert_eq!(command_path("/programs", "./hello"), "/programs/hello");
+        assert_eq!(
+            command_path("/tests/fixtures", "../programs/hello"),
+            "/tests/programs/hello"
+        );
     }
 }

@@ -152,7 +152,7 @@ The identifier `usertest` formerly named the services-tier integration test
 harness, which lived at `base/usertest/`. The `base/`→`programs/` and
 `usertest`→`svctest` rename relocated that harness to `services/svctest/`
 (log prefix `[svctest]`), freeing the `usertest` name. The reclaimed name now
-identifies the programs-surface orchestrator at `services/usertest/` (log
+identifies the programs-surface orchestrator at `programs/usertest/` (log
 prefix `[usertest]`) — see [testing.md](testing.md) for the current
 tier taxonomy and conventions. References to `usertest` predating the rename
 (commit messages, PR descriptions, closed Issues) refer to the historical
@@ -589,8 +589,7 @@ gives the PR-level linear view.
   sizes MUST report, in its `## Validation` section, the local sizing run of each such harness
   that [testing.md](testing.md#bounded-verification) § Bounded verification owes: its
   verification time, the peak resident memory of the run, its unwind bounds, and the head it
-  ran at; and, for a harness it resizes to meet the time budget that section sets, its
-  verification time on CI's runner before and after.
+  ran at.
 
 ## CI Gating
 

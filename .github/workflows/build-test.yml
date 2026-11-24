@@ -78,13 +78,6 @@ jobs:
     steps:
       - run: "true"
 
-  req-9:
-    name: "validate (riscv64, release, ktest)"
-    if: false
-    runs-on: ubuntu-latest
-    steps:
-      - run: "true"
-
   req-10:
     name: "validate (riscv64, release, svctest)"
     if: false
@@ -136,16 +129,9 @@ jobs:
     steps:
       - run: "true"
 
-  probe-empty:
-    needs: select
-    runs-on: ubuntu-latest
-    strategy:
-      matrix: ${{ fromJSON(needs.select.outputs.empty) }}
-    steps:
-      - run: "true"
 
   summary:
-    needs: [host-tests, select, probe-matrix, probe-empty-guarded, probe-skipped-matrix, probe-empty]
+    needs: [host-tests, select, probe-matrix, probe-empty-guarded, probe-skipped-matrix]
     if: always()
     runs-on: ubuntu-latest
     steps:

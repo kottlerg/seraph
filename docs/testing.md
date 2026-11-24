@@ -37,11 +37,15 @@ layer and the layers below and nothing above.
   install path: the layer it serves, and whether it is a test feature. A host test fails when a
   tracked file or an installed file is in no row, or when the two rows of a file disagree.
 - **A dependency on a higher layer is forbidden**, in every form: a crate dependency, a path a
-  component's code spawns, creates, opens or reads, a path a recipe names, and a file a harness's
-  staging puts in its image. A process a phase needs is a fixture of the phase's own layer, never
-  a component of a higher one. Host tests fail on a crate that depends on a crate of a higher
-  layer, on a source below the programs layer whose code names an install path of the programs
-  layer, and on a bundle list that names a file above its harness's layer.
+  component's code spawns, creates, opens or reads, a path a recipe names, a file a harness's
+  staging puts in its image, and a crate feature. Cargo turns on, for a crate, every feature any
+  package of one invocation asks of it, so `cargo xtask build` builds each layer's components in
+  cargo invocations of their own, and no higher layer's manifest changes a lower layer's
+  binaries. A process a phase needs is a fixture of the phase's own layer, never a component of a
+  higher one. Host tests fail on a crate that depends on a crate of a higher layer, on a source
+  below the programs layer whose code names an install path of the programs layer, on a bundle
+  list that names a file above its harness's layer, and on a build invocation that builds the
+  components of two layers.
 - **A harness asserts on its own layer.** ktest on the kernel; svctest on the services, the runtime
   and the kernel objects they hand out; usertest on each program's real I/O surface, consuming the
   services as any program does. A tester asserts nothing about a service's internals.

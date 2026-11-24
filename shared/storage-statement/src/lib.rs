@@ -1039,7 +1039,7 @@ mod tests
 /// GUID in its last 36 bytes, the disk field after the last space before
 /// the GUID's, the path before it), checks the path, the disk and the GUID,
 /// and builds the entry. The proofs compose: the short-line proof runs the
-/// property's check of a line on every line of at most 10 bytes; the split
+/// property's check of a line on every line of at most 12 bytes; the split
 /// proof runs the split's check on every line of at most 48 bytes; the path,
 /// disk and GUID proofs run the checks of the three fields on every path of
 /// at most 8 bytes, every disk field of at most 17 and every text of at most

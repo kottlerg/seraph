@@ -756,7 +756,8 @@ mod tests
 /// on every line of at most 48 bytes; the path and GUID proofs run the
 /// checks of the two fields on every path of at most 8 bytes and every text
 /// of at most 37; and the taken-line proof shows a `data` line of any
-/// three-byte path built into its entry. A
+/// three-byte path, or a `swap` line, with the first digit and the first
+/// dash of its GUID of any value, built into its entry or refused for its path before its GUID. A
 /// line's entry is then judged against each earlier one by `conflict`, whose
 /// proof covers any two entries. What lies outside them is the code that
 /// drives the steps: the split of a statement into its lines in [`parse`],
@@ -796,40 +797,86 @@ mod proofs
         property::split_holds(&bytes[..len]);
     }
 
-    /// Every `data` line of a three-byte path field and a canonical GUID of
-    /// mixed case is taken exactly when its path is in its form, as an entry
-    /// of the data role, that path and that GUID: the step from the split
-    /// fields to the entry, whose checks of the path and the GUID the path
-    /// and GUID proofs cover on every field of their bounds.
+    /// Every `data` line of a three-byte path field, and every `swap` line,
+    /// whose GUID field is a canonical text of mixed case with its first
+    /// digit and its first dash each any value, is taken exactly when its path and its GUID are each
+    /// in their form, as an entry of its role, path and GUID, and is refused
+    /// otherwise for its path before its GUID: the step from the split fields
+    /// to the entry, whose checks of the path and the GUID the path and GUID
+    /// proofs cover on every field of their bounds.
+    fn line_is_taken_as_its_fields(data: bool)
+    {
+        let mut guid = *b"a1B2c3d4-E5f6-7890-ABcd-ef0123456789";
+        guid[0] = kani::any();
+        guid[8] = kani::any();
+        let path: [u8; 3] = kani::any();
+        let mut line = [0u8; 45];
+        let len = if data
+        {
+            line[..5].copy_from_slice(b"data ");
+            line[5..8].copy_from_slice(&path);
+            line[8] = b' ';
+            line[9..].copy_from_slice(&guid);
+            45
+        }
+        else
+        {
+            line[..5].copy_from_slice(b"swap ");
+            line[5..41].copy_from_slice(&guid);
+            41
+        };
+        let path_in_form = !data || property::path_form(&path);
+        let guid_in_form = property::guid_form(&guid);
+        match super::parse_line(&line[..len])
+        {
+            Ok(Some(entry)) =>
+            {
+                assert!(path_in_form && guid_in_form, "a line out of its form taken");
+                assert_eq!(entry.role, if data { Role::Data } else { Role::Swap });
+                assert_eq!(
+                    entry.path.as_deref().map(str::as_bytes),
+                    data.then_some(&path[..]),
+                    "a path read as another"
+                );
+                assert!(
+                    super::format_guid(&entry.guid).eq_ignore_ascii_case(&guid),
+                    "a GUID read as another"
+                );
+            }
+            Ok(None) => assert!(false, "a line naming a partition skipped"),
+            Err(kind) =>
+            {
+                assert!(
+                    !(path_in_form && guid_in_form),
+                    "a line in its form refused"
+                );
+                let first = if path_in_form
+                {
+                    ErrorKind::Guid
+                }
+                else
+                {
+                    ErrorKind::Path
+                };
+                assert_eq!(kind, first, "a refusal names another field");
+            }
+        }
+    }
+
+    /// [`line_is_taken_as_its_fields`] for a `data` line.
     #[kani::proof]
     #[kani::unwind(38)]
     fn a_data_line_is_taken_as_its_fields()
     {
-        const LINE: &[u8; 45] = b"data /ab a1B2c3d4-E5f6-7890-ABcd-ef0123456789";
-        let mut line = *LINE;
-        let path: [u8; 3] = kani::any();
-        line[5..8].copy_from_slice(&path);
-        let taken = super::parse_line(&line);
-        assert_eq!(
-            taken.is_ok(),
-            property::path_form(&path),
-            "a data line judged against its path's form"
-        );
-        if let Ok(entry) = taken
-        {
-            let entry = entry.expect("a data line read as a comment");
-            assert_eq!(entry.role, Role::Data);
-            assert_eq!(entry.path.as_deref().map(str::as_bytes), Some(&path[..]));
-            assert_eq!(
-                Some(entry.guid),
-                super::parse_guid(&LINE[9..]),
-                "a GUID read as another"
-            );
-        }
-        else
-        {
-            assert_eq!(taken, Err(ErrorKind::Path));
-        }
+        line_is_taken_as_its_fields(true);
+    }
+
+    /// [`line_is_taken_as_its_fields`] for a `swap` line.
+    #[kani::proof]
+    #[kani::unwind(38)]
+    fn a_swap_line_is_taken_as_its_fields()
+    {
+        line_is_taken_as_its_fields(false);
     }
 
     /// Every text of at most 37 bytes holds the GUID contract: the canonical

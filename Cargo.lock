@@ -801,6 +801,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "seraph-path-account-plugin"
+version = "0.1.5"
+
+[[package]]
 name = "seraph-wrapper-shim"
 version = "0.1.5"
 
@@ -1189,6 +1193,7 @@ dependencies = [
  "objsig",
  "procmgr-process-table",
  "restart-budget",
+ "seraph-path-account-plugin",
  "storage-statement",
  "syscall-abi",
  "vfsd-gpt",

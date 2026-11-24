@@ -5471,10 +5471,13 @@ pub unsafe fn migrate_ready_thread(
 /// (the thread migrated between the caller's `preferred_cpu` read and this lock,
 /// or is in the transient `Ready`-but-unlinked publication window) it falls back
 /// to the ascending all-CPU-locks walk — the #122 correctness path — taking every
-/// run-queue lock in ascending-CPU order and trying `remove_from_queue` on each.
+/// run-queue lock in ascending-CPU order and trying [`PerCpuScheduler::relink`]
+/// on each.
 ///
-/// `remove_from_queue`'s boolean is the authoritative "located here at `old_prio`"
-/// check on both paths, mirroring [`relocate_ready_thread`]. A thread linked
+/// `relink`'s boolean is the authoritative "located here at `old_prio`" check on
+/// both paths, as `remove_from_queue`'s is for [`relocate_ready_thread`], and a
+/// hit moves the entry between that CPU's run queues as one step to the
+/// lock-free readers of its queues. A thread linked
 /// nowhere is left for its pending link to place at the already-committed
 /// priority (returns `None`). On a walk hit the thread's `preferred_cpu` is
 /// refreshed to the located CPU so a stale hint self-heals.
@@ -5504,22 +5507,13 @@ pub unsafe fn relocate_ready_priority(
     let hint_sched = unsafe { scheduler_for(hint_cpu) };
     // SAFETY: lock_raw paired with the unlock_raw below.
     let saved = unsafe { hint_sched.lock.lock_raw() };
-    // `remove_from_queue` is the authoritative located-on-hint check at
-    // `old_prio`; the held hint run-queue lock pins the list.
+    // `relink` is the authoritative located-on-hint check at `old_prio`, and
+    // on a hit moves the entry to `new_prio` on the same CPU without the
+    // queues reading empty to a lock-free reader; the held hint run-queue lock
+    // pins the list. `preferred_cpu` already names `hint_cpu`, so no retarget
+    // is needed.
     // SAFETY: the hint CPU's lock is held; tcb valid per contract.
-    let hit = unsafe { hint_sched.remove_from_queue(tcb, old_prio) };
-    if hit
-    {
-        // Skip impossible: `remove_from_queue` just cleared `queued_on` under
-        // this lock. Re-link at `new_prio` on the same CPU; `preferred_cpu`
-        // already names `hint_cpu`, so no retarget is needed.
-        // SAFETY: as above.
-        let linked = unsafe { hint_sched.enqueue(tcb, new_prio) };
-        debug_assert!(
-            linked,
-            "relocate_ready_priority: re-enqueue skipped after hint hit"
-        );
-    }
+    let hit = unsafe { hint_sched.relink(tcb, old_prio, new_prio) };
     // SAFETY: paired with the lock_raw above.
     unsafe { hint_sched.lock.unlock_raw(saved) };
     if hit
@@ -5545,25 +5539,16 @@ pub unsafe fn relocate_ready_priority(
     {
         // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
         let sched = unsafe { scheduler_for(cpu) };
-        // All run-queue locks held; `remove_from_queue` is the authoritative
-        // located-on-cpu check at `old_prio`.
+        // All run-queue locks held; `relink` is the authoritative
+        // located-on-cpu check at `old_prio`, and moves the entry on a hit.
         // SAFETY: every CPU's lock is held; tcb valid per contract.
-        if unsafe { sched.remove_from_queue(tcb, old_prio) }
+        if unsafe { sched.relink(tcb, old_prio, new_prio) }
         {
-            // SAFETY: as above.
-            let linked = unsafe { sched.enqueue(tcb, new_prio) };
-            debug_assert!(
-                linked,
-                "relocate_ready_priority: re-enqueue skipped after walk hit"
-            );
-            if linked
-            {
-                // Found on `cpu`, not `hint_cpu`: the hint was stale (a migration
-                // raced the read). Refresh it so the next priority/affinity
-                // change hits. Gated on the created link (#359).
-                // SAFETY: tcb valid; all run-queue locks + sched_lock held.
-                unsafe { (*tcb).preferred_cpu = cpu as u32 };
-            }
+            // Found on `cpu`, not `hint_cpu`: the hint was stale (a migration
+            // raced the read). Refresh it so the next priority/affinity
+            // change hits; the link it names is the one just moved (#359).
+            // SAFETY: tcb valid; all run-queue locks + sched_lock held.
+            unsafe { (*tcb).preferred_cpu = cpu as u32 };
             located = Some(cpu);
             break;
         }
@@ -5625,8 +5610,8 @@ enum PullRule
     Imbalance,
     /// A backlog an idle CPU confirmed across two ticks, in the backlog episode
     /// it carries: the pull from its candidate, which no load decides. The
-    /// source must still be in that episode under its lock, so the backlog has
-    /// stood without a break since the idle CPU sampled it, and the locked
+    /// source must still be in that episode under its lock, so its dispatch has
+    /// not run the backlog dry since the idle CPU sampled it, and the locked
     /// pick of a queued unpinned thread takes from it.
     Backlog(u32),
 }
@@ -5759,8 +5744,8 @@ enum IdlePullStep
 /// The idle pull's decision, the rule core/kernel/docs/scheduler.md § Load
 /// Balancing states, from what an idle CPU read this tick: `scan`, its scan of
 /// the other CPUs, and `candidate`, the backlog it recorded at its previous
-/// idle tick with whether that CPU's backlog is still the same episode, so has
-/// stood without a break since (`None` when none is recorded). `hold` tells
+/// idle tick with whether that CPU's backlog is still the same episode, so its
+/// dispatch has not run it dry since (`None` when none is recorded). `hold` tells
 /// whether the idle CPU keeps a confirmed candidate one more tick rather than
 /// pull it (§ SMT Awareness), and is called only when a candidate is confirmed.
 fn idle_pull_step(
@@ -7699,14 +7684,17 @@ pub unsafe fn schedule(requeue: Requeue)
     // blocks), it is now off-queue and drained — fall back to idle this cycle
     // (the next tick re-schedules).
     //
-    // A dispatched `next`'s IOPB (its own bitmap, or the all-denied one when
-    // `iopb` is null) is loaded into this CPU's TSS inside the same critical
-    // section: `SYS_IOPORT_BIND` installs and edits the bitmap under that
+    // A dispatched `next`'s IOPB is loaded into this CPU's TSS inside the same
+    // critical section (its own bitmap, copied only when the TSS does not hold
+    // it at its generation, or, when `iopb` is null, the invalid offset and no
+    // byte): `SYS_IOPORT_BIND` installs and edits the bitmap under that
     // `sched_lock` (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
     // Ownership, Address-space / capability row), so an
     // `invalidate_all_iopbs` that a remote bind or withdrawal issues after
-    // this load is never overwritten by it. x86-64 only; `load_iopb` is a
-    // no-op on RISC-V, where `iopb` is always null.
+    // this load is never overwritten by it. An idle `next` loads nothing: it
+    // runs no ring-3 code, and the next non-idle thread's flip sets the TSS for
+    // itself. x86-64 only; `load_iopb` is a no-op on RISC-V, where `iopb` is
+    // always null.
     //
     // Only an idle (or absent) outgoing thread may wait for `next`'s register
     // save to publish (step 3.5 of the `context_saved` protocol in
@@ -7717,8 +7705,6 @@ pub unsafe fn schedule(requeue: Requeue)
     // back to its own run queue and switches to idle, whose `schedule()`
     // dispatches it once published.
     let outgoing_may_wait = current.is_null() || core::ptr::eq(current, sched.idle());
-    #[cfg(not(test))]
-    let mut iopb_loaded = false;
     // The idle-runs-`Ready` invariant: this CPU's idle thread skips the flip
     // below, so it runs `Ready` once its own dispatch has dequeued it (or
     // `Running`, from its construction or a `next == current` re-mark), and no
@@ -7824,7 +7810,6 @@ pub unsafe fn schedule(requeue: Requeue)
                 // SAFETY: interrupts are disabled; the bitmap stays live and
                 // unchanged under next.sched_lock, held here.
                 unsafe { crate::arch::current::gdt::load_iopb(iopb) };
-                iopb_loaded = true;
             }
         }
         // SAFETY: paired with lock_raw above.
@@ -7967,18 +7952,6 @@ pub unsafe fn schedule(requeue: Requeue)
         // SAFETY: the space is marked active on this CPU above; this runs at
         // ring 0 / S-mode, in kernel mappings every address space shares.
         unsafe { nxt_space.activate() };
-    }
-
-    // An idle `next` (dispatched as idle, or the fallback above), whose IOPB
-    // the dispatch flip did not load, runs with the TSS IOPB filled with 0xFF
-    // (deny all). Idle runs no ring-3 code, and the switch to the next user
-    // thread reloads the bitmap under that thread's `sched_lock`.
-    #[cfg(not(test))]
-    if !iopb_loaded
-    {
-        // SAFETY: interrupts are disabled (scheduler path); GS-base names this
-        // CPU's PerCpuData.
-        unsafe { crate::arch::current::gdt::load_iopb(None) };
     }
 
     // FPU context-switch hooks. Both arches use eager save on switch-out,
@@ -9726,6 +9699,70 @@ mod idle_pull_tests
         }
         assert_eq!(model.moved_from, Some(1));
         assert!(pulled_at.is_some_and(|tick| tick <= 2 + 2 * 2));
+    }
+
+    // The defect caught: the only thread queued behind one that never yields,
+    // its level changed between every two idle ticks, never pulled: the
+    // priority change's move started a new backlog episode, so every
+    // confirmation found the backlog broken (#1565).
+    #[test]
+    fn a_queued_thread_whose_level_changes_every_tick_is_still_pulled()
+    {
+        use super::run_queue::PerCpuScheduler;
+        use super::thread::{TCB_MAGIC, ThreadControlBlock};
+        use super::{IDLE_PRIORITY, RT_PRIORITY_MIN};
+
+        /// A zeroed, unlinked TCB.
+        fn tcb() -> Box<ThreadControlBlock>
+        {
+            // SAFETY: the run queue reads only `run_queue_next`, `queued_on`,
+            // `last_enqueue`, `ipc_state`, `preferred_cpu`, `thread_id` and
+            // `magic`; every other field stays zero/null, and the debug-only
+            // `last_enqueue` zeroes to `None` through its niche.
+            let mut tcb: ThreadControlBlock = unsafe { core::mem::zeroed() };
+            tcb.magic = TCB_MAGIC;
+            tcb.queued_on = core::sync::atomic::AtomicI16::new(-1);
+            Box::new(tcb)
+        }
+
+        // CPU 1's queues: its idle thread linked (it runs a thread that never
+        // yields) and one queued thread, whose level a priority change moves
+        // between a fair and an RT level after every idle tick of CPU 0.
+        let sched = PerCpuScheduler::new();
+        let mut idle = tcb();
+        let mut queued = tcb();
+        let p_idle = &raw mut *idle;
+        let p_queued = &raw mut *queued;
+        sched.set_idle(p_idle);
+        // SAFETY: single-threaded test, which owns `sched`; p_idle is a live box.
+        assert!(unsafe { sched.enqueue(p_idle, IDLE_PRIORITY) });
+        let mut levels = [syscall::PRIORITY_MIN, RT_PRIORITY_MIN];
+        // SAFETY: as above; p_queued is a live box.
+        assert!(unsafe { sched.enqueue(p_queued, levels[0]) });
+
+        let mut model = Model::new(&[IDLE, busy(0, 1)]);
+        let mut memory = IdlePullMemory {
+            candidate: None,
+            held: false,
+            cursor: 0,
+        };
+        let mut pulled_at = None;
+        for tick in 1..=6u32
+        {
+            model.cpus[1].episode = sched.backlog().unwrap();
+            memory = idle_pull_tick(&mut model, 0, 2, memory);
+            if model.moved_from.is_some()
+            {
+                pulled_at = Some(tick);
+                break;
+            }
+            // `relocate_ready_priority`'s move on the same CPU.
+            // SAFETY: as above.
+            assert!(unsafe { sched.relink(p_queued, levels[0], levels[1]) });
+            levels.swap(0, 1);
+        }
+        assert_eq!(model.moved_from, Some(1));
+        assert!(pulled_at.is_some_and(|tick| tick <= 2));
     }
 }
 

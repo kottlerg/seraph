@@ -250,28 +250,30 @@ load from any 2 MiB slot of the kernel image window, every one of which is deliv
 `src/arch/x86_64/umip.rs` checks that, on a CPU reporting UMIP, a ring-3 `SIDT` or `SGDT` raises
 `#GP` instead of returning a kernel address; `src/arch/x86_64/ioport_revoke.rs` checks that revoking
 an `IoPort` cap withdraws the port access bound through its descendant from a reader on another CPU,
-whose next port read raises `#GP`. `src/arch/x86_64/trap_redelivery.rs` checks that a fault-handler
-rebind redelivers a single-step `#DB`, a trap whose saved instruction pointer is past the stepped
-instruction, from the kernel: the second endpoint's message names the same instruction pointer, and
-the thread, its TF cleared, resumes into a recovery routine. `src/arch/x86_64/single_step.rs`
-checks that a handler that resumes a thread from `int3` with the trap flag set receives one
-`FAULT_EXC_DEBUG` per instruction of a `mov`, a `syscall`, and a `nop`, each naming the next
-instruction (the stepped `syscall` stepping as one), as
-[docs/fault-handling.md § Debugging](../../docs/fault-handling.md#debugging) defines.
+whose next port read raises `#GP`. `src/arch/x86_64/ioport_switch.rs` checks that a thread's port
+permissions follow it across CPUs and context switches: a bind made while the thread runs on
+another CPU, a withdrawal made while it is switched out, and an unbound thread and a differently
+bound one each denied the port on a CPU whose TSS holds a bound thread's bitmap.
+`src/arch/x86_64/trap_redelivery.rs` checks that a fault-handler rebind redelivers a single-step
+`#DB`, a trap whose saved instruction pointer is past the stepped instruction, from the kernel: the
+second endpoint's message names the same instruction pointer, and the thread, its TF cleared,
+resumes into a recovery routine. `src/arch/x86_64/single_step.rs` checks that a handler that resumes
+a thread from `int3` with the trap flag set receives one `FAULT_EXC_DEBUG` per instruction of a
+`mov`, a `syscall`, and a `nop`, each naming the next instruction (the stepped `syscall` stepping as
+one), as [docs/fault-handling.md § Debugging](../../docs/fault-handling.md#debugging) defines.
 `src/arch/x86_64/speculation_controls.rs` checks that the transient-execution controls the kernel
-selected are the ones
-[core/kernel/docs/transient-execution.md § Controls](../kernel/docs/transient-execution.md#controls)
-states for the inputs it reports, and that on every CPU, the case pinned there in turn, the
-controls in effect equal the selection; it logs the inputs, the selection, and the controls in
-effect on every CPU (or on the first that differs). On RISC-V,
-`src/arch/riscv64/sbi_gating.rs` checks that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions
-and sanctioned ones the cap lacks the right for, and `src/arch/riscv64/single_step.rs` checks that a
-handler steps a thread of a fresh address space through a stub written there, one instruction at a
-time, by planting `c.ebreak` at the successor `riscv_step` computes (with `SYS_THREAD_WRITE_MEM` and
-`THREAD_MEM_TEXT`): each step's `FAULT_EXC_BREAKPOINT` names the stub's next instruction across a
-fall-through, a taken and a not-taken branch, `jal`, `c.addi`, a not-taken `c.beqz`, `c.j`, `auipc`
-and `jalr`, and the stub reads back as written, as
-[docs/fault-handling.md § Debugging](../../docs/fault-handling.md#debugging) defines.
+selected are the ones [core/kernel/docs/transient-execution.md §
+Controls](../kernel/docs/transient-execution.md#controls) states for the inputs it reports, and that
+on every CPU, the case pinned there in turn, the controls in effect equal the selection; it logs the
+inputs, the selection, and the controls in effect on every CPU (or on the first that differs). On
+RISC-V, `src/arch/riscv64/sbi_gating.rs` checks that `SYS_SBI_CALL` refuses kernel-reserved SBI
+extensions and sanctioned ones the cap lacks the right for, and `src/arch/riscv64/single_step.rs`
+checks that a handler steps a thread of a fresh address space through a stub written there, one
+instruction at a time, by planting `c.ebreak` at the successor `riscv_step` computes (with
+`SYS_THREAD_WRITE_MEM` and `THREAD_MEM_TEXT`): each step's `FAULT_EXC_BREAKPOINT` names the stub's
+next instruction across a fall-through, a taken and a not-taken branch, `jal`, `c.addi`, a not-taken
+`c.beqz`, `c.j`, `auipc` and `jalr`, and the stub reads back as written, as [docs/fault-handling.md
+§ Debugging](../../docs/fault-handling.md#debugging) defines.
 
 ### Tier S — `src/stress/`
 

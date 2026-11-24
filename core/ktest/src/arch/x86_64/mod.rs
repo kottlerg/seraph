@@ -32,6 +32,9 @@
 //!   bit only for a user-half address
 //! - `ioport_revoke.rs` — revoking an `IoPort` cap withdraws the port access
 //!   bound through its descendant from a reader on another CPU
+//! - `ioport_switch.rs` — a thread's port permissions follow it across CPUs and context
+//!   switches: remotely bound, switched, withdrawn, and denied to an unbound or a
+//!   differently bound thread on a CPU that holds another's bitmap
 //! - `umip.rs` — on a CPU reporting UMIP, ring-3 `SIDT` and `SGDT` raise `#GP`
 //! - `single_step.rs` — a handler single-steps a thread with the trap flag, one
 //!   `FAULT_EXC_DEBUG` per instruction, a `syscall` stepping as one
@@ -46,6 +49,7 @@ mod configure_wrapped_stack;
 pub mod fpu;
 mod ioport;
 mod ioport_revoke;
+mod ioport_switch;
 mod ioport_syscalls;
 mod page_fault_present_bit;
 mod sbi_call;
@@ -281,7 +285,8 @@ pub fn software_breakpoint() -> u64
 /// an `IoPort` cap for two otherwise unused ports, split off the wide cap.
 ///
 /// Carves move upward through the wide cap, so this carve of 0x4E0 must run
-/// after `integration::ioport_revoke` carves 0x4D0 (`integration::run_all`
+/// after `integration::ioport_revoke` carves 0x4D0 and `integration::ioport_switch`
+/// carves 0x4D1 and 0x4D2 (`integration::run_all`
 /// runs `crate::arch::run_integration` before `range_copy_lineage`);
 /// reordering them turns that case into a SKIP.
 pub fn fresh_range_root(_ctx: &TestContext) -> Option<u64>
@@ -349,6 +354,7 @@ pub fn run_integration(ctx: &TestContext)
         page_fault_present_bit::run(ctx)
     );
     crate::run_integration_test!("integration::ioport_revoke", ioport_revoke::run(ctx));
+    crate::run_integration_test!("integration::ioport_switch", ioport_switch::run(ctx));
     crate::run_integration_test!("integration::umip_descriptor_reads_fault", umip::run(ctx));
     crate::run_integration_test!("integration::trap_redelivery", trap_redelivery::run(ctx));
     crate::run_integration_test!("integration::single_step", single_step::run(ctx));

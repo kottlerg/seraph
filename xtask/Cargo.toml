@@ -40,6 +40,10 @@ procmgr-process-table = { path = "../services/procmgr/process-table" }
 # svcmgr's restart budget (`restart_budget::RESTART_BURST`): the `shutdown` case kills
 # logd once per restart the budget allows, and once more.
 restart-budget = { path = "../shared/restart-budget" }
+# The path-account plugin's record format and instruction classes:
+# `path-account trace` reads the record the plugin wrote with the crate that
+# writes it.
+seraph-path-account-plugin = { path = "path-account-plugin" }
 # vfsd's GPT parser: the check every pack makes of the images it writes
 # (src/image_check.rs) finds each image's partitions through it, and the disk
 # tooling's tests read the tables mkdisk writes back through it.

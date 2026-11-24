@@ -136,6 +136,7 @@ members = [
     "xtask",
     "xtask/fuzz/engine",
     "xtask/fuzz/targets",
+    "xtask/path-account-plugin",
     "xtask/wrapper-shim",
 ]
 

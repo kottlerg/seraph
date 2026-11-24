@@ -21,7 +21,8 @@ fat_parse = { path = "../fs/fat/fat-parse", package = "fatfs-parse" }
 elf = { path = "../../shared/elf" }
 # `SLOT_WORDS_PER_PAGE`: the memmgr_swap_client and memmgr_swap_raw phases bound
 # the slot-map pages memmgr keeps after the phase's takes by the map memmgr
-# grows.
+# grows. `commit::grow_need`: the memmgr_swap_commit phase sizes its
+# commitments by what memmgr's admission counts for them.
 free_pool = { path = "../memmgr/free-pool", package = "memmgr-free-pool" }
 # `READ`, its error codes, and `decode_reply`: the drivers phases read the
 # entropy driver through the `hwrng` class protocol.

@@ -543,12 +543,21 @@ impl Hog
             syscall::cap_delete(cap)
                 .unwrap_or_else(|e| panic!("{PHASE}: deleting a hog grant's cap failed ({e})"));
         }
+        // The pool can stand at the floor until the grants are returned, so
+        // the batch is built on the stack: a heap allocation could fault a
+        // new page memmgr declines there.
+        let mut words = [0u64; RELEASE_BATCH + 1];
         for batch in self.grants.chunks(RELEASE_BATCH)
         {
-            let mut words = vec![u64::try_from(batch.len()).unwrap_or(0)];
-            words.extend(batch.iter().map(|&(_, id, _)| id));
+            let fields = core::iter::once(u64::try_from(batch.len()).unwrap_or(0))
+                .chain(batch.iter().map(|&(_, id, _)| id));
+            for (w, v) in words.iter_mut().zip(fields)
+            {
+                *w = v;
+            }
+            let used = words.get(..=batch.len()).unwrap_or(&words);
             let req = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS)
-                .words(0, &words)
+                .words(0, used)
                 .build();
             let reply = memmgr_call(&req, "RELEASE_MEMORY_CAPS");
             assert_eq!(

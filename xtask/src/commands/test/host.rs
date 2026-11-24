@@ -69,7 +69,7 @@ const EMULATED_START_FILE: &str = "crt1.o";
 
 /// The workspace crates that only ever run on the build host, left out of the
 /// emulated test run.
-const HOST_ONLY: [&str; 2] = ["xtask", "seraph-wrapper-shim"];
+const HOST_ONLY: [&str; 3] = ["xtask", "seraph-wrapper-shim", "seraph-path-account-plugin"];
 
 /// The workspace crates that reach crates of the toolchain sysroot under
 /// `rustc_private` (xtask's `object`, `addr2line` and `rustc_demangle`). Those

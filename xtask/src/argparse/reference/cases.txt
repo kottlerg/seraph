@@ -27031,7 +27031,7 @@ ok trust-request clear
 ok trust-request arch=["riscv64"] add=["s"] revoke=["00"] sign out=["f"]
 
 ["kani"]
-ok-all kani pin=default host_override=default
+ok-all kani list=default pin=default host_override=default
 
 ["kani","-h"]
 help xtask kani -h
@@ -27077,6 +27077,27 @@ ok kani wait_host=["30"]
 
 ["kani","--host-override"]
 ok kani host_override
+
+["kani","--since","origin/master"]
+ok kani since=["origin/master"]
+
+["kani","--since","HEAD","--list"]
+ok kani since=["HEAD"] list
+
+["kani","--list","--component","kernel"]
+ok kani component=["kernel"] list
+
+["kani","--since","HEAD","--component","kernel"]
+ArgumentConflict
+error: the argument '--since <COMMIT>' cannot be used with '--component <CRATE>'
+
+["kani","--pin","--list"]
+ArgumentConflict
+error: the argument '--pin' cannot be used with '--list'
+
+["kani","--since"]
+InvalidValue
+error: a value is required for '--since <COMMIT>' but none was supplied
 
 ["kani","--pin","--pin"]
 ArgumentConflict

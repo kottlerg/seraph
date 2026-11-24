@@ -992,17 +992,25 @@ fn build_side(
     git(tree, &["clean", "-ffdx", "-e", "/target"])?;
     take_target(scratch, tree, &tree_key(tree, commit)?)?;
     let built = build_cells(tree, scratch, (side, commit), cells, nested);
-    give_back_target(scratch, tree, built, KEPT_TARGETS)
+    let parked = park_target(scratch, tree);
+    built.and(parked)
 }
 
-/// Park the worktree's target under its key and evict all but the `keep` most
-/// recently used, whether `built` passed or failed, so that failing runs bound
-/// the scratch directory as passing ones do. The build's own error, when it
+/// Build the base, then the head when the base passed, with `build_one`, and
+/// then evict all but the `keep` most recently used targets, whether the
+/// builds passed or failed: failing runs bound the scratch directory as
+/// passing ones do, and the eviction follows both sides, so it never removes
+/// the kept target the head is about to take. The build's own error, when it
 /// has one, is the one returned.
-fn give_back_target(scratch: &Path, tree: &Path, built: Result<()>, keep: usize) -> Result<()>
+fn build_both(
+    scratch: &Path,
+    keep: usize,
+    mut build_one: impl FnMut(Side) -> Result<()>,
+) -> Result<()>
 {
-    let given_back = park_target(scratch, tree).and_then(|()| evict_targets(scratch, keep));
-    built.and(given_back)
+    let built = build_one(Side::Base).and_then(|()| build_one(Side::Head));
+    let evicted = evict_targets(scratch, keep);
+    built.and(evicted)
 }
 
 /// What a failed build in the scratch says, past the nested command's own
@@ -1175,8 +1183,14 @@ pub fn run(ctx: &BuildContext, args: &CompareImagesArgs) -> Result<()>
         wait_host: args.host.wait_host,
         removed: removed_variables(root),
     };
-    build_side(&tree, &scratch, (Side::Base, &base), &cells, &nested)?;
-    build_side(&tree, &scratch, (Side::Head, &head), &cells, &nested)?;
+    build_both(&scratch, KEPT_TARGETS, |side| {
+        let commit = match side
+        {
+            Side::Base => &base,
+            Side::Head => &head,
+        };
+        build_side(&tree, &scratch, (side, commit), &cells, &nested)
+    })?;
     let mut reports = Vec::new();
     for &cell in &cells
     {
@@ -1893,6 +1907,36 @@ rustflags = [\"-Zunstable-options\"]
         fs::remove_dir_all(&scratch).unwrap();
     }
 
+    // Park a target under `key`, last used at `age` seconds after a fixed
+    // time, holding `marker` when one is given.
+    fn park_aged(scratch: &Path, tree: &Path, key: &str, age: u64, marker: Option<&str>)
+    {
+        take_target(scratch, tree, key).unwrap();
+        if let Some(marker) = marker
+        {
+            fs::write(tree.join("target").join(marker), "").unwrap();
+        }
+        fs::File::options()
+            .write(true)
+            .open(tree.join("target").join(TREE_KEY_FILE))
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + age),
+            )
+            .unwrap();
+        park_target(scratch, tree).unwrap();
+    }
+
+    fn parked_keys(scratch: &Path) -> Vec<String>
+    {
+        let mut kept: Vec<String> = fs::read_dir(scratch.join(TARGETS))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        kept.sort();
+        kept
+    }
+
     // Defect caught: a failed build that parks its target but evicts nothing,
     // so that a series of failing runs grows the scratch directory past the
     // kept targets.
@@ -1901,35 +1945,62 @@ rustflags = [\"-Zunstable-options\"]
     {
         let (scratch, tree) = scratch_fixture("evict-failed");
         let keys: Vec<String> = (0..6u8).map(|i| format!("{i}").repeat(40)).collect();
-        for (age, key) in keys[..5].iter().enumerate()
+        for (age, key) in (0u64..).zip(&keys[..5])
         {
-            take_target(&scratch, &tree, key).unwrap();
-            let used = std::time::SystemTime::UNIX_EPOCH
-                + std::time::Duration::from_secs(1_000 + u64::try_from(age).unwrap());
-            fs::File::options()
-                .write(true)
-                .open(tree.join("target").join(TREE_KEY_FILE))
-                .unwrap()
-                .set_modified(used)
-                .unwrap();
-            park_target(&scratch, &tree).unwrap();
+            park_aged(&scratch, &tree, key, age, None);
         }
-        take_target(&scratch, &tree, &keys[5]).unwrap();
-        let err = give_back_target(
-            &scratch,
-            &tree,
-            Err(crate::error::Error::msg("the build failed")),
-            2,
-        )
+        let err = build_both(&scratch, 2, |side| match side
+        {
+            Side::Base =>
+            {
+                take_target(&scratch, &tree, &keys[5]).unwrap();
+                park_target(&scratch, &tree).unwrap();
+                Err(crate::error::Error::msg("the build failed"))
+            }
+            Side::Head => panic!("the head is built after a failed base"),
+        })
         .unwrap_err();
         assert_eq!(err.to_string(), "the build failed");
-        assert!(!tree.join("target").exists());
-        let mut kept: Vec<String> = fs::read_dir(scratch.join(TARGETS))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        kept.sort();
-        assert_eq!(kept, [keys[4].clone(), keys[5].clone()]);
+        assert_eq!(parked_keys(&scratch), [keys[4].clone(), keys[5].clone()]);
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    // Defect caught: an eviction between the two sides, which removes the
+    // oldest kept target before the head takes it, so a head whose tree is
+    // kept is rebuilt from scratch.
+    #[test]
+    fn the_heads_kept_target_survives_the_base_build()
+    {
+        let (scratch, tree) = scratch_fixture("evict-head");
+        let keys: Vec<String> = (0..5u8).map(|i| format!("{i}").repeat(40)).collect();
+        park_aged(&scratch, &tree, &keys[0], 0, Some("built"));
+        for (age, key) in (1u64..).zip(&keys[1..4])
+        {
+            park_aged(&scratch, &tree, key, age, None);
+        }
+        build_both(&scratch, 4, |side| {
+            let key = match side
+            {
+                Side::Base => &keys[4],
+                Side::Head => &keys[0],
+            };
+            take_target(&scratch, &tree, key).unwrap();
+            if matches!(side, Side::Head)
+            {
+                assert!(tree.join("target").join("built").exists());
+            }
+            park_target(&scratch, &tree)
+        })
+        .unwrap();
+        assert_eq!(
+            parked_keys(&scratch),
+            [
+                keys[0].clone(),
+                keys[2].clone(),
+                keys[3].clone(),
+                keys[4].clone()
+            ]
+        );
         fs::remove_dir_all(&scratch).unwrap();
     }
 

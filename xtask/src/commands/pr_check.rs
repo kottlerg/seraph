@@ -14,9 +14,10 @@
 //! be followed, and a script would need one.
 //! `pr-check` adds the pull request: § PR-body checklist discipline (unticked
 //! boxes, the validated head and its delta), § Milestones, tool output in the
-//! body, the Issues the body closes or references, and, with `--gate`, the merge gate (check
-//! rollup, merge state, `master` included or its change disjoint from the
-//! PR's files, and a passing review record for the head).
+//! body (§ Style), the Issues the body closes or references, and, with
+//! `--gate`, the merge gate (check rollup, merge state, `master` included or
+//! its change disjoint from the PR's files, and a passing review record for
+//! the head).
 //!
 //! What needs judgment stays with the pre-merge review: whether the body's
 //! claims match the diff, whether an acceptance item is delivered, and which
@@ -521,6 +522,10 @@ pub enum ToolOutput
     /// A `gh event listen` command on its own line, as the hint block `gh`
     /// prints after reading a pull request suggests it.
     EventListen,
+    /// A line of a `hint:` line's block: an indented, non-blank line after
+    /// the `hint:` line or after another line of its block, as `gh` indents
+    /// the lines of its advice under the `hint:` line.
+    HintBlock,
     /// A cargo status line: one of [`CARGO_STATUS_VERBS`], indented so that
     /// it ends at column [`CARGO_STATUS_COLUMN`], then a space
     /// (`    Finished `, `     Running `).
@@ -563,6 +568,10 @@ impl ToolOutput
             {
                 "the `gh event listen` command of the hint block `gh` prints on stderr"
             }
+            ToolOutput::HintBlock =>
+            {
+                "a line of the advice block a `hint:` line opens, as `gh` prints on stderr"
+            }
             ToolOutput::CargoStatus => "a cargo status line, as cargo prints on stderr",
         }
     }
@@ -594,15 +603,34 @@ impl ToolOutput
 }
 
 /// The lines of `text` that are tool output, each with its one-based number
-/// and its kind. A line inside a fenced code block is not counted: a body
-/// may quote tool output there. An indented code block is read as prose,
-/// since the second line of `gh`'s hint block is indented as one.
+/// and its kind. A `hint:` line counts with its whole block: every indented,
+/// non-blank line after it up to a blank line or a line at column 0, so that
+/// a diagnostic names every line of the advice and none is left behind. A
+/// line inside a fenced code block is not counted: a body may quote tool
+/// output there. An indented code block is read as prose, since the lines of
+/// `gh`'s hint block are indented as one.
 pub fn tool_output_lines(text: &str) -> Vec<(usize, ToolOutput)>
 {
-    marked_lines(text)
-        .filter(|&(_, _, prose)| prose)
-        .filter_map(|(index, line, _)| Some((index.saturating_add(1), ToolOutput::of(line)?)))
-        .collect()
+    let mut in_block = false;
+    let mut out = Vec::new();
+    for (index, line, prose) in marked_lines(text)
+    {
+        let continues = in_block && prose && line.starts_with(char::is_whitespace);
+        let kind = if prose { ToolOutput::of(line) } else { None };
+        let kind = match kind
+        {
+            Some(kind) => Some(kind),
+            None if continues && !line.trim().is_empty() => Some(ToolOutput::HintBlock),
+            None => None,
+        };
+        in_block = kind == Some(ToolOutput::Hint)
+            || (continues && !line.trim().is_empty() && kind.is_some());
+        if let Some(kind) = kind
+        {
+            out.push((index.saturating_add(1), kind));
+        }
+    }
+    out
 }
 
 // ── PR body ───────────────────────────────────────────────────────────────────
@@ -3793,12 +3821,13 @@ mod tests
         {
             assert!(fixture.starts_with("hint: "), "#{pr}");
             assert!(fixture.contains(&format!("/pull/{pr} ")), "#{pr}");
-            assert_eq!(
-                tool_output_lines(fixture),
-                [(1, ToolOutput::Hint), (2, ToolOutput::EventListen)],
-                "#{pr}"
-            );
-            assert_eq!(tool_output_errors(fixture), ["body:1", "body:2"], "#{pr}");
+            let block: Vec<(usize, ToolOutput)> =
+                (3..=8).map(|line| (line, ToolOutput::HintBlock)).collect();
+            let mut expected = vec![(1, ToolOutput::Hint), (2, ToolOutput::EventListen)];
+            expected.extend(block);
+            assert_eq!(tool_output_lines(fixture), expected, "#{pr}");
+            let at: Vec<String> = (1..=8).map(|line| format!("body:{line}")).collect();
+            assert_eq!(tool_output_errors(fixture), at, "#{pr}");
         }
     }
 
@@ -3808,13 +3837,10 @@ mod tests
         let (_, fixture) = HINT_BODIES[0];
         let body = format!("{BODY}{fixture}");
         let first = BODY.lines().count().saturating_add(1);
-        assert_eq!(
-            tool_output_errors(&body),
-            [
-                format!("body:{first}"),
-                format!("body:{}", first.saturating_add(1))
-            ]
-        );
+        let at: Vec<String> = (first..first.saturating_add(8))
+            .map(|line| format!("body:{line}"))
+            .collect();
+        assert_eq!(tool_output_errors(&body), at);
         assert_eq!(tool_output_errors(BODY), Vec::<String>::new());
     }
 
@@ -3895,7 +3921,7 @@ mod tests
             ..Issue::default()
         };
         let found = check_issue_body(&issue);
-        assert_eq!(rules(&found), ["issue-tool-output", "issue-tool-output"]);
+        assert_eq!(rules(&found), ["issue-tool-output"; 8]);
         assert!(found.iter().all(|d| d.at == "#9"));
         assert!(
             found[0].message.starts_with("line 3 "),
@@ -3903,14 +3929,36 @@ mod tests
             found[0].message
         );
         assert!(
-            found[1].message.starts_with("line 4 "),
+            found[7].message.starts_with("line 10 "),
             "{}",
-            found[1].message
+            found[7].message
         );
         let clean = Issue {
             body: BODY.to_owned(),
             ..issue
         };
         assert_eq!(rules(&check_issue_body(&clean)), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_hint_block_counts_to_its_end_and_no_further()
+    {
+        // Each line of the block is named, so a body that removes only the
+        // `hint:` line and the command line still fails at the next run.
+        let (_, fixture) = HINT_BODIES[1];
+        let lines: Vec<(usize, ToolOutput)> = tool_output_lines(fixture);
+        assert_eq!(lines.len(), 8);
+        assert!(lines.iter().all(|(line, _)| *line <= 8), "{lines:?}");
+        // The block ends at a blank line: an indented line after it is prose.
+        let text = "hint: advice\n  - more advice\n\n  an indented paragraph\n";
+        assert_eq!(
+            tool_output_lines(text),
+            [(1, ToolOutput::Hint), (2, ToolOutput::HintBlock)]
+        );
+        // Indented lines with no `hint:` line before them are prose.
+        assert_eq!(
+            tool_output_lines("Text.\n  - an item's continuation\n"),
+            Vec::<(usize, ToolOutput)>::new()
+        );
     }
 }

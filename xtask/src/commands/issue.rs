@@ -881,7 +881,7 @@ mod tests
                 err.starts_with("line 4 of the body is a `hint:` advice line"),
                 "{err}"
             );
-            assert!(err.contains("(and 1 more line(s))"), "{err}");
+            assert!(err.contains("(and 7 more line(s))"), "{err}");
         }
         let quoted = format!("{OLD}```\n{hint}```\n");
         guard_body(OLD, &quoted, ItemRemoval::Refuse).unwrap();

@@ -583,10 +583,11 @@ pub fn band(mode: BenchMode, base: u64, hundredths: Option<u64>) -> Option<u64>
 /// completion, which arrives at host time, counts the host's I/O latency, and
 /// one waiting on a timer counts the host time its idle took.
 /// `fsbench.write` writes through the filesystem's page cache to the disk
-/// (services/fs/fat/docs/crash-safety.md), every size of it. `fsbench.read` is not here: its timed reads find the file in that
-/// cache, which its untimed open, check and warm-up filled, so no timed sample
-/// waits on the disk. A benchmark whose timed samples idle, on a device, a
-/// timer or any other event, joins this set.
+/// (services/fs/fat/docs/crash-safety.md), every size of it. `fsbench.read`
+/// is not here: its timed reads find the file in that cache, which its
+/// untimed open, check and warm-up filled, so no timed sample waits on the
+/// disk. A benchmark whose timed samples idle, on a device, a timer or any
+/// other event, joins this set.
 pub const ICOUNT_IO_BOUND: [&str; 1] = ["fsbench.write"];
 
 /// Whether a measurement gates: an icount measurement at one CPU of a

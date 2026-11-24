@@ -61,6 +61,7 @@ jobs:
       bench-owed: ${{ steps.cells.outputs.bench-owed }}
       ktest-bench: ${{ steps.cells.outputs.ktest-bench }}
       fuzz-owed: ${{ steps.cells.outputs.fuzz-owed }}
+      base: ${{ steps.cells.outputs.base }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -156,6 +157,7 @@ jobs:
     # docs/build-system.md § Toolchain); burnin.yml proves every crate.
     # Installing the release and its setup take seconds, so nothing of Kani
     # is cached.
+    needs: select
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -174,20 +176,19 @@ jobs:
         with:
           shared-key: kani
 
-      # The base: on a pull request the first parent of the merge commit
-      # checked out, the base it merges into; on a push the commit the push
-      # moved master from; on a dispatch its input, or none, which proves
-      # every crate.
+      # The base: on a pull request or a push the one the select job found,
+      # the newest commit before this one whose master run passed, so a proof
+      # a red master run left unproven stays owed; on a dispatch its input.
+      # None proves every crate.
       - name: Select the affected crates
         id: select
         env:
           EVENT: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
+          SELECTED: ${{ needs.select.outputs.base }}
           DISPATCHED: ${{ inputs.kani-since }}
         run: |
           case "$EVENT" in
-            pull_request) base=$(git rev-parse HEAD^1) ;;
-            push) base=$BEFORE ;;
+            pull_request|push) base=$SELECTED ;;
             *) base=$DISPATCHED ;;
           esac
           if [ -n "$base" ]; then
@@ -646,8 +647,8 @@ jobs:
 
       - name: cargo xtask bench-check
         # Writes the cell's environment beside its logs, for
-        # `cargo xtask bench-baseline --from-run`, which refuses the logs of a
-        # cell that skipped a suite.
+        # `cargo xtask bench-baseline --from-run`, whose rewrite leaves the
+        # files of a suite the logs measure nothing of.
         shell: bash
         env:
           KTEST: ${{ needs.select.outputs.ktest-bench }}

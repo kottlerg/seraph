@@ -617,7 +617,8 @@ demanding file:
 - A file of the services or programs layer owes the svctest and usertest cells and the `bench`
   cell's ubench boots, and no ktest cell. This covers the runtime, the std port, and the crates
   std links that no kernel-layer crate links.
-- Markdown, the instruction files, and host tooling that no cell runs owe no boot.
+- Markdown, the instruction files, and host tooling that no cell runs owe no boot. `host-tests`,
+  which runs on every change, lints the host crates as a cell's build does.
 
 A file the record does not place fails the run.
 
@@ -628,9 +629,10 @@ whose `build-test` run on a push to `master` passed. For a pull request that his
 such commit is found, or the runs cannot be read, every cell is owed.
 
 `host-tests` runs on every change. `kani` proves the crates the change can affect, and `fuzz`
-runs when the change can affect a crate it fuzzes, its engine, or xtask, which drives it. The
-`summary` job reports the run: it fails when a job failed or was cancelled, or was skipped although
-the change owed it.
+runs when the change can affect a crate it fuzzes, its engine, or xtask, which drives it. Both
+measure the change from the same base as the cells, so a proof or a fuzz run that a red `master`
+run left unproven stays owed too. The `summary` job reports the run: it fails when a job failed
+or was cancelled, or was skipped although the change owed it.
 
 The `kani` check gates a pull request on the bounded proofs of the crates
 the change can affect, not on the whole set, which runs in burn-in and in

@@ -75,7 +75,8 @@ subcommands! {
         Clean(CleanArgs),
 
         /// Run Seraph's tests: without a case, check formatting and lint the test
-        /// code, then run the unit tests on the host and, built for riscv64,
+        /// code (and over the whole workspace the host crates, as `build` does),
+        /// then run the unit tests on the host and, built for riscv64,
         /// under QEMU's user-mode emulator; with a CASE, boot the current
         /// sysroot for that host-driven QEMU case; with `--cell`, run every
         /// case a CI validate cell runs (see xtask/README.md).
@@ -1130,7 +1131,8 @@ args! {
     {
         /// The host-driven QEMU case to run against the populated sysroot (see
         /// xtask/README.md for each). Without a case or `--cell`, `test`
-        /// checks formatting, lints the test code and runs the unit tests.
+        /// checks formatting, lints the test code (and over the whole workspace
+        /// the host crates) and runs the unit tests.
         #[arg(value_name = "CASE", conflicts_with = "cell")]
         pub case: Option<TestCase>,
 

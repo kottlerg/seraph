@@ -14,7 +14,7 @@ Commands:
   build           Build Seraph components and populate the sysroot
   run             Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
   clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
-  test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+  test            Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
   kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, or with `--since` of each crate a change can affect, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, on a harness that lies in no package, and on CI's runner on a harness over the time budget; with `--pin`, print the pinned release (see xtask/README.md)
@@ -52,7 +52,7 @@ Commands:
   build           Build Seraph components and populate the sysroot
   run             Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
   clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
-  test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+  test            Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
   kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, or with `--since` of each crate a change can affect, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, on a harness that lies in no package, and on CI's runner on a harness over the time budget; with `--pin`, print the pinned release (see xtask/README.md)
@@ -419,12 +419,12 @@ Options:
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
 === xtask test -h
-Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
 
 Usage: xtask test [OPTIONS] [CASE]
 
 Arguments:
-  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, storage-roles, cet, tpm, shutdown, debug-port]
+  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code (and over the whole workspace the host crates) and runs the unit tests [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, storage-roles, cet, tpm, shutdown, debug-port]
 
 Options:
       --cell <TESTER>            Run every case the CI validate cell of TESTER runs on `--arch`, in the registry's order, each whatever another's outcome, and fail when one failed [possible values: svctest, usertest, ktest]
@@ -446,13 +446,13 @@ Options:
       --grant <HOLDER>           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help                     Print help (see more with '--help')
 === xtask test --help
-Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
 
 Usage: xtask test [OPTIONS] [CASE]
 
 Arguments:
   [CASE]
-          The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests
+          The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code (and over the whole workspace the host crates) and runs the unit tests
 
           Possible values:
           - terminal:        Keyboard and serial input through the terminal, and keyboard input again after a restart of the input driver
@@ -1878,7 +1878,7 @@ Commands:
   build           Build Seraph components and populate the sysroot
   run             Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
   clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
-  test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+  test            Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
   kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, or with `--since` of each crate a change can affect, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, on a harness that lies in no package, and on CI's runner on a harness over the time budget; with `--pin`, print the pinned release (see xtask/README.md)

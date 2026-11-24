@@ -107,23 +107,30 @@ pub struct Selection
 /// it fuzzes) the fuzz job builds.
 const FUZZ_TARGETS: &str = "xtask/fuzz/targets";
 
-/// The fuzz job's inputs beside its targets' builds and the inputs of every
-/// build: xtask, which drives it, and the workflows, which define it.
-const FUZZ_DRIVERS: &[&str] = &["xtask/src/", ".github/workflows/"];
+/// The package that drives the fuzz job, whose build closure is an input of
+/// the job beside its targets' builds.
+const FUZZ_DRIVER: &str = "xtask";
+
+/// The fuzz job's inputs beside the builds of its targets and its driver and
+/// the inputs of every build: the workflows, which define it.
+const FUZZ_WORKFLOWS: &[&str] = &[".github/workflows/"];
 
 /// The first of `changed` that is an input of the fuzz job; `None` when none
 /// is.
 fn fuzz_input(workspace: &Workspace, changed: &[String]) -> Result<Option<String>>
 {
-    let driver = affected::first_under(changed, affected::WORKSPACE_WIDE)
-        .or_else(|| affected::first_under(changed, FUZZ_DRIVERS));
-    if let Some(file) = driver
+    let wide = affected::first_under(changed, affected::WORKSPACE_WIDE)
+        .or_else(|| affected::first_under(changed, FUZZ_WORKFLOWS));
+    if let Some(file) = wide
     {
         return Ok(Some(file.clone()));
     }
-    Ok(workspace
-        .first_input(FUZZ_TARGETS, changed)?
-        .map(|input| format!("{}, an input of crate {}", input.file, input.package)))
+    let input = match workspace.first_input(FUZZ_TARGETS, changed)?
+    {
+        Some(input) => Some(input),
+        None => workspace.first_input(FUZZ_DRIVER, changed)?,
+    };
+    Ok(input.map(|input| format!("{}, an input of crate {}", input.file, input.package)))
 }
 
 /// Entry point for `cargo xtask cells`.
@@ -395,7 +402,9 @@ fn validate_cells(owed: Owed) -> Vec<(&'static str, &'static str, &'static str)>
 
 /// The workflow's outputs (`key=value` lines for `$GITHUB_OUTPUT`): the
 /// validate and bench matrices as `include` lists, whether each is owed,
-/// whether the bench cell's ktest boots are, and whether the fuzz job is.
+/// whether the bench cell's ktest boots are, whether the fuzz job is, and the
+/// base commit, empty when there is none, from which the `kani` job selects
+/// its crates.
 fn github_output(selection: &Selection) -> String
 {
     let owed = selection.owed;
@@ -418,13 +427,17 @@ fn github_output(selection: &Selection) -> String
     };
     format!(
         "validate={{\"include\":[{}]}}\nvalidate-owed={}\nbench={{\"include\":[{}]}}\n\
-         bench-owed={}\nktest-bench={}\nfuzz-owed={}\n",
+         bench-owed={}\nktest-bench={}\nfuzz-owed={}\nbase={}\n",
         validate.join(","),
         !validate.is_empty(),
         bench.join(","),
         owed.bench,
         owed.ktest_bench,
-        selection.fuzz.is_some()
+        selection.fuzz.is_some(),
+        selection
+            .base
+            .as_ref()
+            .map_or("", |(commit, _)| commit.as_str())
     )
 }
 
@@ -516,7 +529,7 @@ mod tests
             upper.contains("bench-owed=true\nktest-bench=false\nfuzz-owed=true\n"),
             "{upper}"
         );
-        assert!(none.ends_with("fuzz-owed=false\n"), "{none}");
+        assert!(none.ends_with("fuzz-owed=false\nbase=\n"), "{none}");
         let every = output(EVERY_CELL, None);
         assert_eq!(every.matches("\"tester\"").count(), 12, "{every}");
         assert!(every.starts_with(
@@ -541,9 +554,39 @@ mod tests
         assert_eq!(newest_green(&history, &none), None);
     }
 
+    // Defect caught: the kani job measuring its crates from another base
+    // than the cells, so a proof a red or unfinished master run left
+    // unproven is owed by no later run once an unrelated change turns master
+    // green.
+    #[test]
+    fn the_kani_job_selects_from_the_base_of_the_cells()
+    {
+        let with = github_output(&Selection {
+            base: Some(("c2".to_owned(), String::new())),
+            placed: Vec::new(),
+            owed: NO_CELL,
+            fuzz: None,
+        });
+        assert!(with.ends_with("\nbase=c2\n"), "{with}");
+        let workflow = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/build-test.yml"),
+        )
+        .unwrap();
+        assert!(workflow.contains("      base: ${{ steps.cells.outputs.base }}\n"));
+        let kani = workflow
+            .split("\n  kani:\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  fuzz:\n").next())
+            .unwrap();
+        assert!(kani.contains("\n    needs: select\n"), "{kani}");
+        assert!(kani.contains("${{ needs.select.outputs.base }}"), "{kani}");
+        assert!(!kani.contains("github.event.before"), "{kani}");
+    }
+
     // Defect caught: the fuzz job skipped for a change to a crate it fuzzes,
-    // to one of that crate's dependencies, to the engine, or to its driver;
-    // or run for a change that reaches none of them.
+    // to one of that crate's dependencies, to the engine, or to its driver or
+    // a crate the driver links; or run for a change that reaches none of
+    // them.
     #[test]
     fn the_fuzz_job_is_owed_by_an_input_of_its_targets_or_its_driver()
     {
@@ -563,6 +606,8 @@ mod tests
                 package("vfsd-gpt", "services/vfsd/gpt", &["shared/crc"]),
                 package("crc", "shared/crc", &[]),
                 package("kernel", "core/kernel", &[]),
+                package("xtask", "xtask", &["shared/json"]),
+                package("json", "shared/json", &[]),
             ],
             &[],
         );
@@ -573,6 +618,8 @@ mod tests
             "xtask/fuzz/engine/src/lib.rs",
             "xtask/fuzz/targets/src/bin/gpt.rs",
             "xtask/src/commands/fuzz.rs",
+            "xtask/Cargo.toml",
+            "shared/json/src/lib.rs",
             ".github/workflows/build-test.yml",
             "Cargo.lock",
         ]

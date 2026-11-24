@@ -683,8 +683,8 @@ Run Seraph's tests: the unit tests, and the host-driven QEMU cases.
 
 #### Unit tests
 
-Check the formatting of the selected packages, lint the test code, then run Seraph unit tests on
-the host target and under riscv64 emulation.
+Check the formatting of the selected packages, lint the test code and, over the whole workspace,
+the host crates, then run Seraph unit tests on the host target and under riscv64 emulation.
 
 ```
 cargo xtask test [--component boot|protocol|kernel|init|all]
@@ -705,6 +705,12 @@ lints its test configuration for the host target alone, against the prebuilt `st
 host-only, so no riscv64 Linux build of it runs. Every pass allows the lints `TEST_RELAXED_LINTS`
 in `src/commands/test/host.rs` names, as [docs/coding-standards.md](../docs/coding-standards.md)
 § Clippy states.
+
+Over the whole workspace (`all`), it then lints the host crates' non-test code as
+`cargo xtask build` does (`clippy_host` of `src/commands/build.rs`: `xtask`, the wrapper shim and
+the path-account plugin under the workspace lints, then the fuzz engine and targets with
+`--cfg fuzzing`), so CI's `host-tests` job, which runs on every change, proves the pass every
+booting cell's build runs.
 
 Tests compile for the host — no `--arch` flag needed. The workspace-level
 `panic=abort` profile does not affect the test harness.
@@ -1604,11 +1610,11 @@ runner (`GITHUB_ACTIONS` set to `true`), named with its time and marked `FAILED 
 the table; on another host, whose speed differs, the command prints a warning naming it and its
 time.
 
-CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the pull request's base
-(the first parent of the merge commit it checks out), or on a push to `master` against the commit
-the push moved it from; when the list is empty it installs no Kani and says so in a notice on the
-run, and otherwise it installs the release `--pin` prints and runs the command with the same
-`--since`. The `kani` job of `burnin.yml` runs the command with no option
+CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the base its `select`
+job found with `cargo xtask cells --since-green`, on a pull request and on a push to `master`
+alike, and with no option when that job found none; when the list is empty it installs no Kani
+and says so in a notice on the run, and otherwise it installs the release `--pin` prints and runs
+the command with the same `--since`. The `kani` job of `burnin.yml` runs the command with no option
 ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
@@ -1637,7 +1643,7 @@ cargo xtask cells [--since <COMMIT> | --since-green <REV>] [--github-output <FIL
 |---|---|---|
 | `--since <COMMIT>` | no base | The change from this commit to the working tree |
 | `--since-green <REV>` | no base | The change from the newest commit of `REV`'s first-parent history, 200 commits at most, whose `build-test` run on a push to `master` passed (`gh run list`); every cell, after a `WARNING:` line, when there is none or the runs cannot be read |
-| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate` and `bench`, each a matrix's `include` list; `validate-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is |
+| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate` and `bench`, each a matrix's `include` list; `validate-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
 
 Without a base, every cell is owed. With one, the command places each changed file
 (`git diff --name-only` from the base to the working tree, a rename as both its paths) in a
@@ -1669,10 +1675,10 @@ cell with its ktest boots; `services` and `programs` owe the svctest and usertes
 tracked file is placed, that every row holds a tracked file, and that no module of xtask a cell
 runs uses one the record calls `host`.
 
-The `fuzz` job is owed apart from the cells: by a change to an input of every build, to xtask's
-sources (`xtask/src/`, which drive it), to the workflows, or to an input of the build of
-`xtask/fuzz/targets`, whose closure holds the engine and every crate a target fuzzes; and without
-a base.
+The `fuzz` job is owed apart from the cells: by a change to an input of every build, to the
+workflows, to an input of the build of `xtask/fuzz/targets`, whose closure holds the engine and
+every crate a target fuzzes, or to an input of the build of xtask, which drives it, its own
+sources and manifest and every crate it links; and without a base.
 
 ---
 

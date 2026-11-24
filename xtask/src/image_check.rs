@@ -7,7 +7,7 @@
 //! (`crate::disk::create_disk_image`): every FAT volume read by an independent
 //! reader, `fsck.fat -n` (dosfstools), which reports any structure it does not
 //! accept and changes nothing, then the ESP of `disk.img` read back against its
-//! root partition. No image a pack writes is left unchecked.
+//! installed files. No image a pack writes is left unchecked.
 //!
 //! The check reads the GPT of each image the pack wrote through vfsd's GPT
 //! parser, copies each partition other than swap, the one raw partition a pack
@@ -15,15 +15,25 @@
 //! on the copy. It fails on the first volume `fsck.fat` does not pass, printing
 //! what `fsck.fat` printed.
 //!
-//! It then reads the ESP and the root partition of `disk.img` with xtask's FAT
-//! reader (`crate::fat_read`) and checks that every object on the ESP equals the
-//! installed file on the root partition it copies, as composition checks the ESP
-//! it writes (`crate::esp::check`): the bundle list is read from the root
-//! partition's `/config/bundle/`, and the bundle's entries choose the harness. A
-//! pack that wrote one side alone fails, naming the object. A pack that writes
-//! substitutes in place of installed files (the `signing` case's refusal images,
-//! `crate::disk::create_disk_image_substituting`) makes the `fsck.fat` check
-//! alone, since its ESP is by design no copy of its root partition.
+//! It then reads the ESP, the root and the data partition with xtask's FAT
+//! reader (`crate::fat_read`) and checks that the root and data partitions hold
+//! only what the kind of image the pack wrote holds (`crate::layers::Image`):
+//! nothing for the kernel layer's image, no file of the programs layer for a
+//! services-layer harness's, no test feature for the default image, and no file
+//! the layer record's install rows do not place, each file placed by its install
+//! path as `crate::layers::installed` places it. A pack that wrote a file
+//! outside its kind fails, naming every such file.
+//!
+//! It then checks that every object on the ESP equals the installed file it
+//! copies, as composition checks the ESP it writes (`crate::esp::check`): the
+//! installed files and the bundle lists are those on the root partition, under
+//! `/config/bundle/`, or, for the kernel layer's image, whose root partition
+//! holds nothing, the sysroot's, whose ktest bundle must then name only files of
+//! the kernel layer; the bundle's entries choose the harness. A pack that wrote
+//! one side alone fails, naming the object. A pack that writes substitutes in
+//! place of installed files (the `signing` case's refusal images,
+//! `crate::disk::create_disk_image_substituting`) skips the ESP check, since
+//! its ESP is by design no copy of its installed files.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -39,6 +49,7 @@ use crate::argparse::ValueEnum as _;
 use crate::bundle::{self, Harness};
 use crate::error::{Context, Result, bail, ensure};
 use crate::fat_read::{self, Node};
+use crate::layers::{self, Image, Layer, Role};
 use crate::util::{require_tool, step};
 use crate::{disk, esp, gpt};
 
@@ -46,24 +57,35 @@ use crate::{disk, esp, gpt};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EspCheck
 {
-    /// The ESP of the main image against its root partition
+    /// The ESP of the main image against the installed files
     /// ([`check_esp_copies`]).
     Copies,
-    /// Nothing: the pack wrote substitutes, so its ESP is no copy of its root
-    /// partition by design.
+    /// Nothing: the pack wrote substitutes, so its ESP is no copy of the
+    /// installed files by design.
     Skipped,
 }
 
 /// Check the images a pack wrote: each FAT volume of `main`, and of `data` when
 /// the pack wrote one, with `fsck.fat -n`, copying each volume under `work`
-/// first; then, as `esp` says, the ESP of `main` against its root partition.
+/// first; then that the root and data partitions hold only what an image of the
+/// kind `image` holds ([`check_contents`]); then, as `esp` says, the ESP of
+/// `main` against the installed files it copies: those on its root partition,
+/// or, for the kernel layer's image, whose root partition holds none, those of
+/// the sysroot at `sysroot` ([`check_esp_copies`]).
 ///
 /// # Errors
 /// Fails when `fsck.fat` is not on `PATH`, an image's GPT does not parse, a
-/// partition cannot be copied, `fsck.fat` does not pass a volume, or an object
-/// on the ESP of `main` is not its installed file on the root partition
-/// ([`check_esp_copies`]).
-pub fn check(main: &Path, data: Option<&Path>, esp: EspCheck, work: &Path) -> Result<()>
+/// partition cannot be copied or read, `fsck.fat` does not pass a volume, a
+/// partition holds a file the image's kind does not, or an object on the ESP
+/// of `main` is not the installed file it copies.
+pub fn check(
+    main: &Path,
+    data: Option<&Path>,
+    esp: EspCheck,
+    image: Image,
+    sysroot: &Path,
+    work: &Path,
+) -> Result<()>
 {
     let fsck = require_tool("fsck.fat")?;
     fs::create_dir_all(work).with_context(|| format!("failed to create {}", work.display()))?;
@@ -72,73 +94,205 @@ pub fn check(main: &Path, data: Option<&Path>, esp: EspCheck, work: &Path) -> Re
     {
         checked = checked.saturating_add(check_image(&fsck, image, work)?);
     }
+    let volumes = Volumes::read(main, data)?;
+    check_contents(&volumes, image)
+        .with_context(|| format!("the images of {} (a {})", main.display(), image.label()))?;
     match esp
     {
         EspCheck::Copies =>
         {
-            check_esp_copies(main)?;
+            check_esp_copies(&volumes, image, sysroot)
+                .with_context(|| format!("the ESP of {}", main.display()))?;
             step(&format!(
-                "Image check: fsck.fat passed {checked} FAT volumes; every object on the ESP of \
-                 {} is its installed file",
+                "Image check: fsck.fat passed {checked} FAT volumes; the partitions hold only what \
+                 their kind holds ({}); every object on the ESP of {} is its installed file",
+                image.label(),
                 main.display()
             ));
         }
         EspCheck::Skipped => step(&format!(
-            "Image check: fsck.fat passed {checked} FAT volumes; the ESP holds substitutes, \
-             so it is not checked against the root partition"
+            "Image check: fsck.fat passed {checked} FAT volumes; the partitions hold only what \
+             their kind holds ({}); the ESP holds substitutes, so it is not checked against the \
+             installed files",
+            image.label()
         )),
     }
     Ok(())
 }
 
-/// Check that every object on the ESP of the GPT image at `image` equals the installed file on
-/// its root partition that it copies ([`esp::check`]), the root partition's type giving the
-/// architecture and its `/config/bundle/` the bundle lists.
+/// The files of the ESP, the root and the data partition of a pack's images,
+/// read with xtask's FAT reader, by path from each volume's root, and the
+/// architecture the root partition's type names.
+struct Volumes
+{
+    arch: Arch,
+    esp: BTreeMap<String, Vec<u8>>,
+    root: BTreeMap<String, Vec<u8>>,
+    data: BTreeMap<String, Vec<u8>>,
+}
+
+impl Volumes
+{
+    /// Read the ESP and the root partition of `main`, and the data partition
+    /// of `data` when the pack wrote one, of `main` otherwise.
+    ///
+    /// # Errors
+    /// When an image's GPT does not parse, it has not one partition of each
+    /// role, or a volume does not read.
+    fn read(main: &Path, data: Option<&Path>) -> Result<Self>
+    {
+        let (esp, ()) = read_partition(main, "ESP", |guid| {
+            (*guid == gpt::EFI_SYSTEM_PARTITION).then_some(())
+        })?;
+        let (root, arch) = read_partition(main, "root partition", |guid| match *guid
+        {
+            role_guids::SERAPH_ROOT_X86_64 => Some(Arch::X86_64),
+            role_guids::SERAPH_ROOT_RISCV64 => Some(Arch::Riscv64),
+            _ => None,
+        })?;
+        let (data, ()) = read_partition(data.unwrap_or(main), "data partition", |guid| {
+            (*guid == role_guids::SERAPH_DATA).then_some(())
+        })?;
+        Ok(Self {
+            arch,
+            esp,
+            root,
+            data,
+        })
+    }
+}
+
+/// The files of the one partition of the GPT image at `image` whose type GUID
+/// `kind` maps to a value, the `what` of the image, and that value.
 ///
 /// # Errors
-/// When the image's GPT does not parse, it has not one ESP and one Seraph root partition, a
-/// volume does not read, a bundle list does not parse, or the check fails.
-fn check_esp_copies(image: &Path) -> Result<()>
+/// When the image's GPT does not parse, not one partition has such a type, or
+/// its volume does not read.
+fn read_partition<T>(
+    image: &Path,
+    what: &str,
+    kind: impl Fn(&[u8; 16]) -> Option<T>,
+) -> Result<(BTreeMap<String, Vec<u8>>, T)>
 {
     let block = u64::from(disk::logical_block_size(image)?);
     let mut file =
         File::open(image).with_context(|| format!("failed to open {}", image.display()))?;
     let parts = partitions(&mut file, image, block)?;
-    let (esp_part, ()) = one_partition(&parts, |guid| {
-        (*guid == gpt::EFI_SYSTEM_PARTITION).then_some(())
-    })
-    .with_context(|| format!("the ESP of {}", image.display()))?;
-    let (root_part, arch) = one_partition(&parts, |guid| match *guid
-    {
-        role_guids::SERAPH_ROOT_X86_64 => Some(Arch::X86_64),
-        role_guids::SERAPH_ROOT_RISCV64 => Some(Arch::Riscv64),
-        _ => None,
-    })
-    .with_context(|| format!("the root partition of {}", image.display()))?;
-    let mut volume = |part: &GptEntry, what: &str| -> Result<BTreeMap<String, Vec<u8>>> {
-        let offset = part
-            .first_lba
-            .checked_mul(block)
-            .with_context(|| format!("the {what} of {} lies past u64", image.display()))?;
-        let tree = fat_read::read_volume(&mut file, offset, u32::try_from(block)?)
-            .with_context(|| format!("reading the {what} of {}", image.display()))?;
-        Ok(files(tree))
-    };
-    let esp_files = volume(esp_part, "ESP")?;
-    let root_files = volume(root_part, "root partition")?;
-    let lists = Harness::VARIANTS
+    let (part, value) = one_partition(&parts, kind)
+        .with_context(|| format!("the {what} of {}", image.display()))?;
+    let offset = part
+        .first_lba
+        .checked_mul(block)
+        .with_context(|| format!("the {what} of {} lies past u64", image.display()))?;
+    let tree = fat_read::read_volume(&mut file, offset, u32::try_from(block)?)
+        .with_context(|| format!("reading the {what} of {}", image.display()))?;
+    Ok((files(tree), value))
+}
+
+/// Check that every file of the root and data partitions of `volumes` is one an
+/// image of the kind `image` holds, by its install path (its path on the root
+/// partition, or `/data` and its path on the data partition), as the layer
+/// record places it ([`layers::installed`]).
+///
+/// # Errors
+/// Naming every file the kind does not hold, and every one no install row
+/// places.
+fn check_contents(volumes: &Volumes, image: Image) -> Result<()>
+{
+    let files = volumes
+        .root
         .iter()
-        .map(|harness| installed_list(&root_files, arch, *harness))
-        .collect::<Result<Vec<_>>>()
-        .with_context(|| format!("reading the bundle lists of {}", image.display()))?;
-    let installed =
-        |install: &str| -> Result<Option<Vec<u8>>> { Ok(root_files.get(install).cloned()) };
-    esp::check(&esp_files, &installed, arch, &lists).with_context(|| {
-        format!(
-            "the ESP of {} is not copies of the installed files on its root partition",
-            image.display()
-        )
-    })
+        .map(|(path, bytes)| (path.trim_start_matches('/').to_owned(), bytes))
+        .chain(
+            volumes
+                .data
+                .iter()
+                .map(|(path, bytes)| (format!("data/{}", path.trim_start_matches('/')), bytes)),
+        );
+    let mut faults = Vec::new();
+    for (install, bytes) in files
+    {
+        match layers::installed(&install, || Ok(bytes.clone()))
+        {
+            Ok(placed) if image.holds(placed) =>
+            {}
+            Ok(placed) => faults.push(format!(
+                "/{install}, a {} of the {:?} layer",
+                match placed.role
+                {
+                    Role::System => "system file",
+                    Role::Test => "test feature",
+                },
+                placed.layer
+            )),
+            Err(e) => faults.push(format!("{e:#}")),
+        }
+    }
+    ensure!(
+        faults.is_empty(),
+        "they hold files the kind does not:\n  {}",
+        faults.join("\n  ")
+    );
+    Ok(())
+}
+
+/// Check that every object on the ESP of `volumes` equals the installed file it
+/// copies ([`esp::check`]): the installed files and the bundle lists are those
+/// of the root partition, or, for an image of the kernel layer, those of the
+/// sysroot at `sysroot`, whose bundle list must then name only files of the
+/// kernel layer.
+///
+/// # Errors
+/// When a bundle list does not parse, a sysroot file cannot be read, the ktest
+/// bundle names a file above the kernel layer, or the check fails.
+fn check_esp_copies(volumes: &Volumes, image: Image, sysroot: &Path) -> Result<()>
+{
+    let from_sysroot = |install: &str| -> Result<Option<Vec<u8>>> {
+        let path = sysroot.join(install.trim_start_matches('/'));
+        match fs::read(&path)
+        {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+        }
+    };
+    let from_root =
+        |install: &str| -> Result<Option<Vec<u8>>> { Ok(volumes.root.get(install).cloned()) };
+    let installed: &dyn Fn(&str) -> Result<Option<Vec<u8>>> = if image == Image::Kernel
+    {
+        &from_sysroot
+    }
+    else
+    {
+        &from_root
+    };
+    let lists = installed_lists(volumes.arch, installed).context("reading the bundle lists")?;
+    if image == Image::Kernel
+    {
+        let ktest = installed_list(volumes.arch, Harness::Ktest, installed)?
+            .context("the sysroot installs no ktest bundle list")?;
+        let above: Vec<&String> = std::iter::once(&ktest.init)
+            .chain(&ktest.entries)
+            .filter(|entry| {
+                layers::install_row(entry.trim_start_matches('/'))
+                    .is_none_or(|install| install.layer != Layer::Kernel)
+            })
+            .collect();
+        ensure!(
+            above.is_empty(),
+            "the ktest bundle names {above:?}, which no install row places in the kernel layer"
+        );
+    }
+    esp::check(&volumes.esp, installed, volumes.arch, &lists).context(
+        if image == Image::Kernel
+        {
+            "it is not copies of the sysroot's installed files"
+        }
+        else
+        {
+            "it is not copies of the installed files on its root partition"
+        },
+    )
 }
 
 /// The one partition of `parts` whose type GUID `kind` maps to a value, and that value.
@@ -170,24 +324,53 @@ fn files(tree: BTreeMap<String, Node>) -> BTreeMap<String, Vec<u8>>
         .collect()
 }
 
-/// The bundle list of `harness` for `arch` that the root volume's `root_files` install under
-/// `/config/bundle/` ([`bundle::list_name`]), parsed.
+/// The bundle list of each harness that has one for `arch` among the installed
+/// files `installed` returns by install path, parsed.
+///
+/// # Errors
+/// When a harness has two lists for `arch`, a list is not UTF-8 or does not
+/// parse, or `installed` fails.
+fn installed_lists(
+    arch: Arch,
+    installed: &dyn Fn(&str) -> Result<Option<Vec<u8>>>,
+) -> Result<Vec<bundle::BundleList>>
+{
+    let mut lists = Vec::new();
+    for harness in Harness::VARIANTS
+    {
+        lists.extend(installed_list(arch, *harness, installed)?);
+    }
+    Ok(lists)
+}
+
+/// The bundle list of `harness` for `arch` among the installed files
+/// `installed` returns ([`bundle::list_name`]), parsed; `None` when neither of
+/// its names is installed.
+///
+/// # Errors
+/// As [`installed_lists`].
 fn installed_list(
-    root_files: &BTreeMap<String, Vec<u8>>,
     arch: Arch,
     harness: Harness,
-) -> Result<bundle::BundleList>
+    installed: &dyn Fn(&str) -> Result<Option<Vec<u8>>>,
+) -> Result<Option<bundle::BundleList>>
 {
     let path = |name: &str| format!("/{}/{name}", bundle::LIST_DIR);
-    let name = bundle::list_name(arch, harness, |name| root_files.contains_key(&path(name)))?;
+    let own = format!("{}.{arch}.list", harness.name());
+    let shared = format!("{}.list", harness.name());
+    if installed(&path(&own))?.is_none() && installed(&path(&shared))?.is_none()
+    {
+        return Ok(None);
+    }
+    let name = bundle::list_name(arch, harness, |name| {
+        installed(&path(name)).is_ok_and(|bytes| bytes.is_some())
+    })?;
     let path = path(&name);
-    let text = root_files
-        .get(&path)
-        .map(|bytes| std::str::from_utf8(bytes))
-        .transpose()
-        .with_context(|| format!("{path} is not UTF-8"))?
-        .with_context(|| format!("{path} is not installed"))?;
-    bundle::parse_list(text).with_context(|| format!("parsing {path}"))
+    let bytes = installed(&path)?.with_context(|| format!("{path} is not installed"))?;
+    let text = std::str::from_utf8(&bytes).with_context(|| format!("{path} is not UTF-8"))?;
+    bundle::parse_list(text)
+        .map(Some)
+        .with_context(|| format!("parsing {path}"))
 }
 
 /// The partitions of the GPT image `image`, open as `file`, of `block`-byte blocks, read
@@ -336,9 +519,9 @@ mod tests
         fs::write(full, bytes).unwrap();
     }
 
-    /// Write at `image` a riscv64 GPT image of 512-byte blocks holding an ESP of 17 MiB with
-    /// the tree under `esp` and a root partition of 17 MiB with the tree under `root`.
-    fn pack(image: &Path, esp: &Path, root: &Path)
+    /// Write at `image` a riscv64 GPT image of 512-byte blocks holding an ESP, a root and a
+    /// data partition of 17 MiB each, with the trees under `esp`, `root` and `data`.
+    fn pack(image: &Path, esp: &Path, root: &Path, data: &Path)
     {
         let first = MIB / 512;
         let blocks = 17 * MIB / 512;
@@ -359,8 +542,16 @@ mod tests
                 blocks,
                 attributes: 0,
             },
+            gpt::Partition {
+                name: "DATA",
+                type_guid: role_guids::SERAPH_DATA,
+                unique_guid: [4; 16],
+                first_lba: first + 2 * blocks,
+                blocks,
+                attributes: 0,
+            },
         ];
-        let total = 2 * MIB + 2 * 17 * MIB;
+        let total = 2 * MIB + 3 * 17 * MIB;
         let regions = gpt::encode(&gpt::Table {
             block_size: 512,
             total_blocks: total / 512,
@@ -375,8 +566,9 @@ mod tests
             file.seek(SeekFrom::Start(region.offset)).unwrap();
             std::io::Write::write_all(&mut file, &region.bytes).unwrap();
         }
-        for (part, dir) in partitions.iter().zip([esp, root])
+        for (part, dir) in partitions.iter().zip([esp, root, data])
         {
+            fs::create_dir_all(dir).unwrap();
             fat::write_volume(
                 &mut file,
                 part.first_lba * 512,
@@ -389,12 +581,14 @@ mod tests
         }
     }
 
-    /// A riscv64 image at `dir/disk.img` of an ESP and a root partition that agree, from the
-    /// trees under `dir/esp` and `dir/root`; returns those three paths.
+    /// A riscv64 image at `dir/disk.img` of an ESP and a root partition that agree and a data
+    /// partition, from the trees under `dir/esp`, `dir/root` and `dir/data`; returns the
+    /// first three paths.
     fn fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf)
     {
         let _ = fs::remove_dir_all(dir);
         let (esp, root, image) = (dir.join("esp"), dir.join("root"), dir.join("disk.img"));
+        put(&dir.join("data"), "notes/a.txt", b"data");
         for (path, bytes) in [
             ("boot/boot.efi", b"MZ bootloader".as_slice()),
             ("boot/kernel", b"\x7fELF kernel"),
@@ -422,8 +616,24 @@ mod tests
             ],
         )
         .unwrap();
-        pack(&image, &esp, &root);
+        pack(&image, &esp, &root, &dir.join("data"));
         (esp, root, image)
+    }
+
+    /// The ESP check of the image at `image` against its root partition.
+    fn esp_copies(image: &Path) -> Result<()>
+    {
+        check_esp_copies(
+            &Volumes::read(image, None)?,
+            Image::Harness,
+            Path::new("/nonexistent"),
+        )
+    }
+
+    /// The content check of the image at `image` as an image of the kind `kind`.
+    fn contents(image: &Path, kind: Image) -> Result<()>
+    {
+        check_contents(&Volumes::read(image, None)?, kind)
     }
 
     /// A directory under the host's temporary directory, unique to this process and `name`.
@@ -441,19 +651,19 @@ mod tests
     {
         let dir = scratch("esp");
         let (esp, root, image) = fixture(&dir);
-        check_esp_copies(&image).unwrap();
+        esp_copies(&image).unwrap();
 
         put(&root, "services/vfsd", b"\x7fELF vfsd, rebuilt");
-        pack(&image, &esp, &root);
-        let error = format!("{:#}", check_esp_copies(&image).unwrap_err());
+        pack(&image, &esp, &root, &dir.join("data"));
+        let error = format!("{:#}", esp_copies(&image).unwrap_err());
         assert!(
             error.contains("entry /services/vfsd differs from its installed file /services/vfsd"),
             "{error}"
         );
         put(&root, "services/vfsd", b"\x7fELF vfsd");
         put(&esp, "EFI/seraph/kernel", b"\x7fELF stale kernel");
-        pack(&image, &esp, &root);
-        let error = format!("{:#}", check_esp_copies(&image).unwrap_err());
+        pack(&image, &esp, &root, &dir.join("data"));
+        let error = format!("{:#}", esp_copies(&image).unwrap_err());
         assert!(error.contains("/EFI/seraph/kernel differs"), "{error}");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -466,7 +676,7 @@ mod tests
         let dir = scratch("fsck");
         let (_, _, image) = fixture(&dir);
         let work = dir.join("work");
-        check(&image, None, EspCheck::Copies, &work).unwrap();
+        check(&image, None, EspCheck::Copies, Image::Harness, &dir, &work).unwrap();
 
         // The root partition's boot sector claims clusters of no sectors.
         let mut file = fs::OpenOptions::new().write(true).open(&image).unwrap();
@@ -475,7 +685,7 @@ mod tests
         drop(file);
         let error = format!(
             "{:#}",
-            check(&image, None, EspCheck::Skipped, &work).unwrap_err()
+            check(&image, None, EspCheck::Skipped, Image::Harness, &dir, &work).unwrap_err()
         );
         assert!(
             error.contains("fsck.fat -n does not pass partition 2"),
@@ -485,17 +695,119 @@ mod tests
     }
 
     // Defect caught: a substituting pack (a refusal image of the signing case) refused for the
-    // ESP it writes on purpose, or its volumes left unchecked.
+    // ESP it writes on purpose, or its volumes and partitions left unchecked.
     #[test]
-    fn a_substituted_image_is_checked_by_fsck_alone()
+    fn a_substituted_image_skips_the_esp_check()
     {
         let dir = scratch("substituted");
         let (esp, root, image) = fixture(&dir);
         put(&esp, "EFI/seraph/kernel", b"\x7fELF tampered kernel");
-        pack(&image, &esp, &root);
+        // The `signing` case's tampered recipe: a body byte that is no UTF-8.
+        put(
+            &root,
+            "config/svcmgr/services/timed.svc",
+            b"binary = /services/timed\n\xff\n",
+        );
+        pack(&image, &esp, &root, &dir.join("data"));
         let work = dir.join("work");
-        check(&image, None, EspCheck::Copies, &work).unwrap_err();
-        check(&image, None, EspCheck::Skipped, &work).unwrap();
+        check(&image, None, EspCheck::Copies, Image::Harness, &dir, &work).unwrap_err();
+        check(&image, None, EspCheck::Skipped, Image::Harness, &dir, &work).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+    // Defect caught: an image holding what its kind does not (a test feature on the default
+    // image, a program on a services-layer image, anything on the root or data partition of the
+    // kernel layer's), or a file no install row places, passing the check; or a recipe judged
+    // by its path alone, so a staged copy that starts a program passes on a services-layer
+    // image.
+    #[test]
+    fn an_image_holding_what_its_kind_does_not_is_refused()
+    {
+        let dir = scratch("kinds");
+        let (esp, root, image) = fixture(&dir);
+        let data = dir.join("data");
+        contents(&image, Image::Harness).unwrap();
+        contents(&image, Image::Services).unwrap();
+        let error = format!("{:#}", contents(&image, Image::Default).unwrap_err());
+        assert!(
+            error.contains("/tests/ktest, a test feature of the Kernel layer")
+                && error.contains("/config/bundle/ktest.list"),
+            "{error}"
+        );
+        let error = format!("{:#}", contents(&image, Image::Kernel).unwrap_err());
+        assert!(
+            error.contains("/services/vfsd") && error.contains("/data/notes/a.txt"),
+            "{error}"
+        );
+
+        put(&root, "programs/shell", b"\x7fELF shell");
+        put(
+            &root,
+            "config/svcmgr/services/sessiond.svc",
+            b"binary = /services/sessiond\nargv = sessiond /programs/shell\n",
+        );
+        pack(&image, &esp, &root, &data);
+        contents(&image, Image::Harness).unwrap();
+        let error = format!("{:#}", contents(&image, Image::Services).unwrap_err());
+        assert!(
+            error.contains("/programs/shell, a system file of the Programs layer")
+                && error.contains(
+                    "/config/svcmgr/services/sessiond.svc, a system file of the Programs layer"
+                ),
+            "{error}"
+        );
+
+        put(&root, "stray/file", b"?");
+        pack(&image, &esp, &root, &data);
+        let error = format!("{:#}", contents(&image, Image::Harness).unwrap_err());
+        assert!(error.contains("stray/file: no install row"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Defect caught: the ESP of the kernel layer's image, whose root partition holds nothing,
+    // refused for lacking installed files to compare, or held to nothing; or a ktest bundle
+    // carrying a file above the kernel layer passing.
+    #[test]
+    fn the_kernel_image_s_esp_is_checked_against_the_sysroot()
+    {
+        let dir = scratch("kernel");
+        let (esp, sysroot, image) = fixture(&dir);
+        let empty = dir.join("empty");
+        bundle::write_bundle(
+            &esp.join("EFI/seraph/bootstrap.bundle"),
+            1,
+            &[("init".to_owned(), b"\x7fELF ktest".to_vec())],
+        )
+        .unwrap();
+        pack(&image, &esp, &empty, &empty);
+        let volumes = Volumes::read(&image, None).unwrap();
+        check_contents(&volumes, Image::Kernel).unwrap();
+        check_esp_copies(&volumes, Image::Kernel, &sysroot).unwrap();
+        check_esp_copies(&volumes, Image::Harness, &sysroot).unwrap_err();
+
+        put(
+            &sysroot,
+            "config/bundle/ktest.list",
+            b"init /tests/ktest\n/services/vfsd\n",
+        );
+        bundle::write_bundle(
+            &esp.join("EFI/seraph/bootstrap.bundle"),
+            2,
+            &[
+                ("init".to_owned(), b"\x7fELF ktest".to_vec()),
+                ("/services/vfsd".to_owned(), b"\x7fELF vfsd".to_vec()),
+            ],
+        )
+        .unwrap();
+        pack(&image, &esp, &empty, &empty);
+        let volumes = Volumes::read(&image, None).unwrap();
+        let error = format!(
+            "{:#}",
+            check_esp_copies(&volumes, Image::Kernel, &sysroot).unwrap_err()
+        );
+        assert!(
+            error.contains("names [\"/services/vfsd\"], which no install row places in the kernel"),
+            "{error}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

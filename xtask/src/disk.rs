@@ -12,8 +12,15 @@
 //! 4096 bytes, is chosen per authoring. Every pack signs the sysroot for the
 //! harness whose bundle it composes ([`crate::signing::sign_sysroot`]), then
 //! composes the ESP from the installed files ([`crate::esp::compose`]), then
-//! writes the images, then checks what it wrote ([`crate::image_check`]). The
-//! refusal boots of the `signing` case pack through
+//! writes the images, then checks what it wrote ([`crate::image_check`]).
+//!
+//! What the root and data partitions hold follows the kind of image the pack
+//! writes ([`Image`], decided by [`image_of`]) and the layer record's install
+//! rows (`crate::layers`): a ktest image holds nothing there, its ESP carrying
+//! the kernel layer's bundle; a services-layer harness's image no file of the
+//! programs layer; an image whose staged recipes name a test feature the whole
+//! system; and the default image no test feature. A file no install row places
+//! fails the pack. The refusal boots of the `signing` case pack through
 //! [`create_disk_image_substituting`], which writes bytes the harness staged
 //! in place of named sysroot files and leaves the sysroot as it was.
 
@@ -29,6 +36,7 @@ use crate::bundle::Harness;
 use crate::context::Context as BuildContext;
 use crate::fat;
 use crate::gpt::{self, Guid, guid};
+use crate::layers::{self, Image, Role};
 use crate::signing::sign_for_harness;
 use crate::util::step;
 
@@ -209,9 +217,22 @@ struct FatSource
     dir: PathBuf,
     /// Paths relative to `dir`.
     substitutes: Vec<Substitute>,
-    /// Files and directories under `dir` the volume leaves out, as paths
-    /// relative to `dir`.
-    omit: Vec<PathBuf>,
+    /// Which files under `dir` the volume holds: every one, or, for the root
+    /// and data partitions, those [`Keep`] says.
+    keep: Option<Keep>,
+}
+
+/// Which files of the root or the data partition's host directory the volume
+/// holds: those the image's kind holds ([`Image::holds`]) by their install
+/// paths ([`layers::installed`]).
+#[derive(Clone, Copy, Debug)]
+struct Keep
+{
+    /// The kind of image the volume is written for.
+    image: Image,
+    /// The volume's directory relative to the sysroot, empty or ending in
+    /// `/`, which a path within the volume follows to give its install path.
+    prefix: &'static str,
 }
 
 /// A file a pack writes in place of the one the sysroot holds
@@ -236,9 +257,8 @@ struct Sources
     data: PathBuf,
     /// Paths relative to the sysroot.
     substitutes: Vec<Substitute>,
-    /// Files and directories the root partition leaves out, as paths relative
-    /// to the sysroot.
-    omit_from_root: Vec<PathBuf>,
+    /// The kind of image the root and data partitions are written for.
+    image: Image,
 }
 
 /// Create the GPT disk image at `<project_root>/disk.img`, and, when the
@@ -345,28 +365,17 @@ fn pack(
     sign_for_harness(ctx, arch, harness)?;
     crate::esp::compose(ctx, arch, harness)?;
 
-    // A sysroot staged for a services-layer harness packs a services-layer
-    // image, which holds no file of the programs layer; deciding it here, from
-    // the staged recipes, keeps a later `--repack-only` (the storage cells'
-    // `--split-data`) to the composition the staging chose.
-    let omit_from_root = if crate::svctest_stage::services_layer(&ctx.sysroot)
-    {
-        step("Services-layer image: the programs layer is left out");
-        crate::svctest_stage::PROGRAMS_LAYER
-            .iter()
-            .map(PathBuf::from)
-            .collect()
-    }
-    else
-    {
-        Vec::new()
-    };
+    // Deciding the kind here, from the harness and the staged recipes, keeps
+    // a later `--repack-only` (the storage cells' `--split-data`) to the
+    // composition the staging chose.
+    let image = image_of(&ctx.sysroot, harness)?;
+    step(&format!("Composing a {}", image.label()));
     let sources = Sources {
         esp: ctx.sysroot_esp(),
         root: ctx.sysroot.clone(),
         data: ctx.sysroot.join("data"),
         substitutes,
-        omit_from_root,
+        image,
     };
     let data_image = ctx.data_disk_image();
     author_images(&image_path, &data_image, arch, layout, &sources)?;
@@ -389,11 +398,65 @@ fn pack(
         &image_path,
         matches!(layout.data, DataPlacement::SecondImage(_)).then_some(data_image.as_path()),
         esp,
+        image,
+        &ctx.sysroot,
         &ctx.target_dir.join("xtask").join("image-check"),
     )?;
 
     step("Disk image complete");
     Ok(())
+}
+
+/// The sysroot-relative directory of the recipes svcmgr starts.
+const STAGED_RECIPES: &str = "config/svcmgr/services";
+
+/// The kind of image a pack of the sysroot at `sysroot` with `harness`'s
+/// bundle writes: the kernel layer's for ktest; a services-layer image when
+/// the sysroot stages a services-layer harness
+/// (`crate::svctest_stage::services_layer`); a test image when a recipe it
+/// stages in `config/svcmgr/services/` names a test feature
+/// ([`layers::installed`]); the default image otherwise.
+///
+/// # Errors
+/// When a staged recipe cannot be read, or its name or text is not UTF-8.
+fn image_of(sysroot: &Path, harness: Harness) -> Result<Image>
+{
+    if matches!(harness, Harness::Ktest)
+    {
+        return Ok(Image::Kernel);
+    }
+    if crate::svctest_stage::services_layer(sysroot)
+    {
+        return Ok(Image::Services);
+    }
+    let staged = sysroot.join(STAGED_RECIPES);
+    if !staged.is_dir()
+    {
+        return Ok(Image::Default);
+    }
+    for entry in
+        fs::read_dir(&staged).with_context(|| format!("failed to read {}", staged.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("failed to read {}", staged.display()))?
+            .path();
+        if !path.is_file()
+        {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| err!("{} has a name that is not UTF-8", path.display()))?;
+        let install = layers::installed(&format!("{STAGED_RECIPES}/{name}"), || {
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))
+        })?;
+        if install.role == Role::Test
+        {
+            return Ok(Image::Harness);
+        }
+    }
+    Ok(Image::Default)
 }
 
 /// Author `main_image`, and `data_image` when `layout` places the data
@@ -407,11 +470,17 @@ fn author_images(
 ) -> Result<()>
 {
     let [on_esp, on_root, on_data] = split_substitutes(&sources.substitutes)?;
-    let fat = |dir: &Path, substitutes, omit| {
+    let fat = |dir: &Path, substitutes, keep| {
         Contents::Fat(FatSource {
             dir: dir.to_path_buf(),
             substitutes,
-            omit,
+            keep,
+        })
+    };
+    let keep = |prefix| {
+        Some(Keep {
+            image: sources.image,
+            prefix,
         })
     };
     let esp = Volume {
@@ -420,7 +489,7 @@ fn author_images(
         unique_guid: ESP_UNIQUE_GUID,
         bytes: ESP_PARTITION_SIZE,
         attributes: 0,
-        contents: fat(&sources.esp, on_esp, Vec::new()),
+        contents: fat(&sources.esp, on_esp, None),
     };
     let root = Volume {
         name: "ROOT",
@@ -428,7 +497,7 @@ fn author_images(
         unique_guid: ROOT_UNIQUE_GUID,
         bytes: ROOT_PARTITION_SIZE,
         attributes: 0,
-        contents: fat(&sources.root, on_root, sources.omit_from_root.clone()),
+        contents: fat(&sources.root, on_root, keep("")),
     };
     // The data tree is not also written to the root partition
     // (populate_dir skips top-level data/).
@@ -438,7 +507,7 @@ fn author_images(
         unique_guid: DATA_UNIQUE_GUID,
         bytes: DATA_PARTITION_SIZE,
         attributes: 0,
-        contents: fat(&sources.data, on_data, Vec::new()),
+        contents: fat(&sources.data, on_data, keep("data/")),
     };
     let swap = Volume {
         name: "SWAP",
@@ -883,7 +952,7 @@ fn write_fat_partition(
     let source_dir = source.dir.as_path();
     let mut tree = if source_dir.exists()
     {
-        host_tree(source_dir, source_dir, &source.omit)?
+        host_tree(source_dir, source_dir, source.keep)?
     }
     else
     {
@@ -1010,12 +1079,16 @@ fn substitute(tree: &mut [fat::Entry], path: &Path, source: &Path) -> Result<()>
 ///
 /// Skips build metadata (`.arch`, `.harness`, `NvVars`), the `esp` directory, and
 /// at the top of `sysroot_root` the `data` directory: `esp` and `data` are mount
-/// points with their own partitions, and so not root content. Entries other than files and directories are skipped,
-/// and so is each file or directory whose path relative to `sysroot_root` `omit` names.
+/// points with their own partitions, and so not root content. Entries other than files and
+/// directories are skipped. With `keep`, so is each file the image's kind does not hold, by
+/// its install path (its path relative to `sysroot_root` after `keep.prefix`), and each
+/// directory that holds none of its files; a directory empty on the host is kept when the
+/// image holds its own path.
 ///
 /// # Errors
-/// Fails when a directory cannot be read or a name is not UTF-8.
-fn host_tree(host_dir: &Path, sysroot_root: &Path, omit: &[PathBuf]) -> Result<Vec<fat::Entry>>
+/// Fails when a directory cannot be read, a name is not UTF-8, or, with `keep`, a path no
+/// install row places ([`layers::installed`]).
+fn host_tree(host_dir: &Path, sysroot_root: &Path, keep: Option<Keep>) -> Result<Vec<fat::Entry>>
 {
     let mut entries: Vec<_> = fs::read_dir(host_dir)
         .with_context(|| format!("failed to read {}", host_dir.display()))?
@@ -1047,22 +1120,60 @@ fn host_tree(host_dir: &Path, sysroot_root: &Path, omit: &[PathBuf]) -> Result<V
             continue;
         }
 
-        if path
-            .strip_prefix(sysroot_root)
-            .is_ok_and(|relative| omit.iter().any(|o| o == relative))
-        {
-            continue;
-        }
+        // The install path, and whether the image holds what installs there.
+        let holds = |read: &dyn Fn() -> Result<Vec<u8>>| -> Result<bool> {
+            let Some(keep) = keep
+            else
+            {
+                return Ok(true);
+            };
+            let mut install = keep.prefix.to_owned();
+            let relative = path
+                .strip_prefix(sysroot_root)
+                .context("a volume's path lies under its root")?;
+            for (index, component) in relative.components().enumerate()
+            {
+                if index > 0
+                {
+                    install.push('/');
+                }
+                install.push_str(
+                    component
+                        .as_os_str()
+                        .to_str()
+                        .ok_or_else(|| err!("{} has a name that is not UTF-8", path.display()))?,
+                );
+            }
+            Ok(keep.image.holds(layers::installed(&install, read)?))
+        };
 
         let ft = entry
             .file_type()
             .with_context(|| format!("failed to get file type: {}", path.display()))?;
         let kind = if ft.is_dir()
         {
-            fat::Kind::Dir(host_tree(&path, sysroot_root, omit)?)
+            let children = host_tree(&path, sysroot_root, keep)?;
+            if children.is_empty() && keep.is_some()
+            {
+                let empty_on_host = fs::read_dir(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?
+                    .next()
+                    .is_none();
+                if !empty_on_host || !holds(&|| Ok(Vec::new()))?
+                {
+                    continue;
+                }
+            }
+            fat::Kind::Dir(children)
         }
         else if ft.is_file()
         {
+            let read =
+                || fs::read(&path).with_context(|| format!("failed to read {}", path.display()));
+            if !holds(&read)?
+            {
+                continue;
+            }
             let len = entry
                 .metadata()
                 .with_context(|| format!("failed to read the size of {}", path.display()))?
@@ -1111,7 +1222,7 @@ mod tests
                 root: self.0.join("no-root"),
                 data,
                 substitutes: Vec::new(),
-                omit_from_root: Vec::new(),
+                image: Image::Harness,
             }
         }
     }
@@ -1578,7 +1689,7 @@ mod tests
             root: sysroot.clone(),
             data: sysroot.join("data"),
             substitutes,
-            omit_from_root: Vec::new(),
+            image: Image::Harness,
         };
         let main = scratch.0.join("disk.img");
         let data_image = scratch.0.join("disk-data.img");
@@ -1680,7 +1791,7 @@ mod tests
             root: sysroot.clone(),
             data: sysroot.join("data"),
             substitutes: Vec::new(),
-            omit_from_root: Vec::new(),
+            image: Image::Harness,
         };
         author_images(
             &main,
@@ -1706,77 +1817,196 @@ mod tests
         assert_eq!(esp.get("/EFI/seraph/kernel"), file(b"kernel").as_ref());
     }
 
-    // Defect caught: a services-layer image that still carries a program, a
-    // tester or the programs-layer harness, or one that leaves out a services-
-    // layer file whose path shares a prefix with an omitted one.
+    /// Every path the sysroot of [`each_kind_of_image_holds_what_its_kind_holds`] puts on
+    /// the root and data partitions (the latter under `/data`), its directories included.
+    const EVERY: &[&str] = &[
+        "/programs",
+        "/programs/shell",
+        "/tests",
+        "/tests/programs",
+        "/tests/programs/hello",
+        "/tests/usertest",
+        "/tests/svctest",
+        "/tests/fixtures",
+        "/tests/fixtures/programs",
+        "/tests/fixtures/programs/leader",
+        "/services",
+        "/services/vfsd",
+        "/services/drivers",
+        "/services/drivers/test-dma",
+        "/config",
+        "/config/svcmgr",
+        "/config/svcmgr/tests",
+        "/config/svcmgr/tests/usertest.svc",
+        "/config/svcmgr/tests/svctest.svc",
+        "/config/svcmgr/services",
+        "/config/svcmgr/services/sessiond.svc",
+        "/crash",
+        "/data/test.txt",
+        "/data/notes",
+        "/data/notes/a.txt",
+    ];
+
+    // Defect caught: an image holding what its kind does not (a program, a
+    // tester, the programs-layer harness or a recipe that starts a program on a
+    // services-layer image; a test feature, the test DMA driver among them, on
+    // the default image; any file on the kernel layer's root or data
+    // partition), leaving out what its kind holds (a services-layer file whose
+    // path shares a prefix with a programs-layer one, crashd's empty dump
+    // directory), or keeping a directory the omission emptied.
     #[test]
-    fn a_services_layer_image_leaves_the_programs_layer_out()
+    fn each_kind_of_image_holds_what_its_kind_holds()
     {
         use crate::fat_read::read_volume;
 
-        let scratch = Scratch::new("services-layer");
+        let scratch = Scratch::new("kinds");
         let sysroot = scratch.0.join("sysroot");
-        for path in [
-            "programs/shell",
-            "tests/programs/hello",
-            "tests/usertest",
-            "tests/svctest",
-            "tests/fixtures/programs/leader",
-            "config/svcmgr/tests/usertest.svc",
-            "config/svcmgr/tests/svctest.svc",
-            "config/svcmgr/services/svctest.svc",
+        for (path, bytes) in [
+            ("programs/shell", "shell"),
+            ("tests/programs/hello", "hello's tester"),
+            ("tests/usertest", "usertest"),
+            ("tests/svctest", "svctest"),
+            ("tests/fixtures/programs/leader", "leader"),
+            ("services/vfsd", "vfsd"),
+            ("services/drivers/test-dma", "test-dma"),
+            (
+                "config/svcmgr/tests/usertest.svc",
+                "binary = /tests/usertest\n",
+            ),
+            (
+                "config/svcmgr/tests/svctest.svc",
+                "binary = /tests/svctest\n",
+            ),
+            (
+                "config/svcmgr/services/sessiond.svc",
+                "binary = /services/sessiond\nargv = sessiond /programs/shell\n",
+            ),
+            ("data/test.txt", "seraph"),
+            ("data/notes/a.txt", "a"),
         ]
         {
             let full = sysroot.join(path);
             fs::create_dir_all(full.parent().unwrap()).unwrap();
-            fs::write(&full, path).unwrap();
+            fs::write(&full, bytes).unwrap();
         }
-        assert!(crate::svctest_stage::services_layer(&sysroot));
+        fs::create_dir_all(sysroot.join("crash")).unwrap();
         let main = scratch.0.join("disk.img");
+        let held = |image: Image| {
+            let sources = Sources {
+                esp: sysroot.join("esp"),
+                root: sysroot.clone(),
+                data: sysroot.join("data"),
+                substitutes: Vec::new(),
+                image,
+            };
+            author_images(
+                &main,
+                &scratch.0.join("disk-data.img"),
+                Arch::X86_64,
+                DiskLayout::default(),
+                &sources,
+            )
+            .unwrap();
+            let mut file = File::open(&main).unwrap();
+            let root = read_volume(&mut file, IMAGE_MARGIN + ESP_PARTITION_SIZE, 512).unwrap();
+            let data = read_volume(
+                &mut file,
+                IMAGE_MARGIN + ESP_PARTITION_SIZE + ROOT_PARTITION_SIZE,
+                512,
+            )
+            .unwrap();
+            root.into_keys()
+                .chain(data.into_keys().map(|path| format!("/data{path}")))
+                .collect::<std::collections::BTreeSet<String>>()
+        };
+        let but = |absent: &[&str]| -> std::collections::BTreeSet<String> {
+            EVERY
+                .iter()
+                .filter(|path| {
+                    !absent
+                        .iter()
+                        .any(|gone| *path == gone || path.starts_with(&format!("{gone}/")))
+                })
+                .map(|path| (*path).to_owned())
+                .collect()
+        };
+        assert_eq!(held(Image::Harness), but(&[]));
+        assert_eq!(
+            held(Image::Services),
+            but(&[
+                "/programs",
+                "/tests/programs",
+                "/tests/usertest",
+                "/config/svcmgr/tests/usertest.svc",
+                "/config/svcmgr/services",
+            ])
+        );
+        assert_eq!(
+            held(Image::Default),
+            but(&[
+                "/tests",
+                "/services/drivers",
+                "/config/svcmgr/tests",
+                "/data/test.txt",
+            ])
+        );
+        assert_eq!(held(Image::Kernel), but(EVERY));
+    }
+
+    // Defect caught: a file the record does not place written to an image, so
+    // an image holds what no layer accounts for.
+    #[test]
+    fn a_file_no_install_row_places_fails_the_pack()
+    {
+        let scratch = Scratch::new("unplaced");
+        let sysroot = scratch.0.join("sysroot");
+        fs::create_dir_all(sysroot.join("stray")).unwrap();
+        fs::write(sysroot.join("stray/file"), b"?").unwrap();
         let sources = Sources {
             esp: sysroot.join("esp"),
             root: sysroot.clone(),
             data: sysroot.join("data"),
             substitutes: Vec::new(),
-            omit_from_root: crate::svctest_stage::PROGRAMS_LAYER
-                .iter()
-                .map(PathBuf::from)
-                .collect(),
+            image: Image::Harness,
         };
-        author_images(
-            &main,
-            &scratch.0.join("disk-data.img"),
-            Arch::X86_64,
-            DiskLayout::default(),
-            &sources,
+        let error = format!(
+            "{:#}",
+            author_images(
+                &scratch.0.join("disk.img"),
+                &scratch.0.join("disk-data.img"),
+                Arch::X86_64,
+                DiskLayout::default(),
+                &sources,
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("stray/file: no install row"), "{error}");
+    }
+
+    // Defect caught: a pack that writes the default image for a sysroot
+    // staging a harness's recipe, so the harness boots without its tests, or
+    // a test image for one that stages none; or a ktest pack whose root
+    // partition still carries the system.
+    #[test]
+    fn the_pack_decides_the_kind_from_the_harness_and_the_staged_recipes()
+    {
+        let scratch = Scratch::new("image-of");
+        let sysroot = scratch.0.join("sysroot");
+        let services = sysroot.join(STAGED_RECIPES);
+        fs::create_dir_all(&services).unwrap();
+        fs::write(services.join("vfsd.svc"), "binary = /services/vfsd\n").unwrap();
+        fs::write(
+            services.join("sessiond.svc"),
+            "binary = /services/sessiond\nargv = sessiond /programs/shell\n",
         )
         .unwrap();
-        let mut image = File::open(&main).unwrap();
-        let root = read_volume(&mut image, IMAGE_MARGIN + ESP_PARTITION_SIZE, 512).unwrap();
-        for absent in [
-            "/programs",
-            "/tests/programs",
-            "/tests/usertest",
-            "/config/svcmgr/tests/usertest.svc",
-        ]
-        {
-            assert!(!root.contains_key(absent), "{absent}");
-            assert!(
-                !root
-                    .keys()
-                    .any(|path| path.starts_with(&format!("{absent}/"))),
-                "{absent}"
-            );
-        }
-        for present in [
-            "/tests/svctest",
-            "/tests/fixtures/programs/leader",
-            "/config/svcmgr/tests/svctest.svc",
-            "/config/svcmgr/services/svctest.svc",
-        ]
-        {
-            assert!(root.contains_key(present), "{present}");
-        }
+        assert_eq!(image_of(&sysroot, Harness::Init).unwrap(), Image::Default);
+        assert_eq!(image_of(&sysroot, Harness::Ktest).unwrap(), Image::Kernel);
+        fs::write(services.join("usertest.svc"), "binary = /tests/usertest\n").unwrap();
+        assert_eq!(image_of(&sysroot, Harness::Init).unwrap(), Image::Harness);
+        fs::write(services.join("svctest.svc"), "binary = /tests/svctest\n").unwrap();
+        assert_eq!(image_of(&sysroot, Harness::Init).unwrap(), Image::Services);
+        assert_eq!(image_of(&sysroot, Harness::Ktest).unwrap(), Image::Kernel);
     }
 
     #[test]

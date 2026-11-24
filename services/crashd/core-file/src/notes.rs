@@ -670,7 +670,7 @@ mod tests
     {
         let notes = parse(&encode(
             Machine::X86_64,
-            &process(b"/programs/a-rather-long-program-name"),
+            &process(b"/services/a-rather-long-service-name"),
             &[],
         ));
         let desc = &notes[0].2;
@@ -679,7 +679,7 @@ mod tests
             136,
             "bfd reads a 64-bit elf_prpsinfo of 136 bytes"
         );
-        assert_eq!(&desc[40..56], b"a-rather-long-p\0");
-        assert!(desc[56..].starts_with(b"/programs/a-rather-long-program-name\0"));
+        assert_eq!(&desc[40..56], b"a-rather-long-s\0");
+        assert!(desc[56..].starts_with(b"/services/a-rather-long-service-name\0"));
     }
 }

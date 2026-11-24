@@ -996,8 +996,8 @@ mod tests
     {
         let contents = "\
 # comment\n\
-binary    = /programs/terminal\n\
-argv      = terminal /programs/shell\n\
+binary    = /services/timed\n\
+argv      = timed /config/timed.conf\n\
 env       = KEY=VAL\n\
 restart   = on_failure\n\
 critical  = yes\n\
@@ -1006,9 +1006,9 @@ cwd       = /tests\n\
 seed      = devmgr.registry\n\
 priority  = 10\n\
 sched_max = 12\n";
-        let def = parse("terminal", contents).expect("valid recipe");
-        assert_eq!(def.binary, "/programs/terminal");
-        assert_eq!(def.argv, ["terminal", "/programs/shell"]);
+        let def = parse("timed", contents).expect("valid recipe");
+        assert_eq!(def.binary, "/services/timed");
+        assert_eq!(def.argv, ["timed", "/config/timed.conf"]);
         assert_eq!(def.restart, RestartPolicy::OnFailure);
         assert!(def.system_critical);
         assert!(matches!(def.namespace, NamespaceShape::Subtree { .. }));

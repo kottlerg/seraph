@@ -1528,20 +1528,21 @@ naming each such source that lies in no crate, or in one whose manifest names no
 harness is left out of the run.
 
 With `--since`, the command selects from those crates the ones the change from `<COMMIT>` to the
-working tree (`git diff --name-only --no-renames`, a rename as both its paths) can affect, and prints
-each with the changed file that selects it, or a line saying that none is affected and why. A crate
-is affected when a changed file lies in the directory of its package or of a workspace package in its
-dependency closure, as `cargo metadata --no-deps` gives the path dependencies (of every kind and
-target: a superset of what its test build compiles), or is a file one of those packages names in an
-`include!`, `include_str!`, `include_bytes!` or `#[path]` string literal. Every crate is
-affected when a changed file is an input of every build: the workspace `Cargo.toml` and
-`Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`, the command's own sources
+working tree (`git diff --name-only --no-renames`, a rename as both its paths) can affect, and
+prints each with the changed file that selects it, or a line saying that none is affected and why. A
+crate is affected when a changed file lies in the directory of its package or of a workspace package
+in its dependency closure, as `cargo metadata --no-deps` gives the path dependencies (of every kind
+and target: a superset of what its test build compiles), or is a file one of those packages names in
+an `include!`, `include_str!`, `include_bytes!` or `#[path]` string literal. Every crate is affected
+when a changed file is an input of every build: the workspace `Cargo.toml` and `Cargo.lock`,
+`rust-toolchain.toml`, `.cargo/config.toml`, the command's own sources
 (`xtask/src/commands/kani.rs`, which holds the Kani pin, the memory limit and the judge of Kani's
-output, and `xtask/src/affected.rs`, the selection, which other commands can share), or `.github/workflows/build-test.yml`, whose `kani` job an empty selection does not
-install Kani in. A package's build script, features and `cfg` settings lie in its directory or the
-workspace manifest, so a change to them selects it. A commit the checkout does not hold fails the
-command, so a shallow clone never narrows the run. With no crate affected the command verifies
-nothing and does not check the installed release.
+output, and `xtask/src/affected.rs`, the selection, which other commands can share), or
+`.github/workflows/build-test.yml`, whose `kani` job an empty selection does not install Kani in. A
+package's build script, features and `cfg` settings lie in its directory or the workspace manifest,
+so a change to them selects it. A commit the checkout does not hold fails the command, so a shallow
+clone never narrows the run. With no crate affected the command verifies nothing and does not check
+the installed release.
 
 It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
@@ -2587,15 +2588,15 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypto-vectors`, `fuzz`
-(but `--list`), `kani` (but `--pin` and `--list`), `compare-images` and `test` without a case or a cell (the unit
-tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`,
-`path-account trace` (but `--reuse`), and `test` with a case or a cell as boots, each boot admitted
-as above (the `shutdown` case admits once for its boots, which it runs one at a time). The
-`signing` case, which compiles its revoking and role-scoped bootloaders before it boots, and
-`path-account trace`, which compiles its plugin, are admitted as a build for each compile and then
-each boot as a boot. A cell's lanes (`test --cell T --lanes N`) start up to N cases side by side,
-each admitting its own boots, so each is a small boot counted with the others, and `--wait-host`
-lets a lane's boot wait for another lane's to end rather than fail.
+(but `--list`), `kani` (but `--pin` and `--list`), `compare-images` and `test` without a case or a
+cell (the unit tests) as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
+`capture-acpi`, `path-account trace` (but `--reuse`), and `test` with a case or a cell as boots,
+each boot admitted as above (the `shutdown` case admits once for its boots, which it runs one at a
+time). The `signing` case, which compiles its revoking and role-scoped bootloaders before it boots,
+and `path-account trace`, which compiles its plugin, are admitted as a build for each compile and
+then each boot as a boot. A cell's lanes (`test --cell T --lanes N`) start up to N cases side by
+side, each admitting its own boots, so each is a small boot counted with the others, and
+`--wait-host` lets a lane's boot wait for another lane's to end rather than fail.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

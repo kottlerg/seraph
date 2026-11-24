@@ -13,7 +13,7 @@
 //! another CPU may finish waits for the post, bounded. Every case ends by
 //! checking that its queue's observer pool has every node back.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
     RIGHTS_ALL, RIGHTS_EQ_RECV, cap_bind_sole_reference, cap_copy, cap_create_cspace,
@@ -342,9 +342,18 @@ static SPIN_STOP: AtomicBool = AtomicBool::new(false);
 /// Spinners that have started their loops.
 static SPIN_READY: AtomicU32 = AtomicU32::new(0);
 
+/// Make one syscall, whose return takes every return-work bit of this CPU: a
+/// bit an earlier mark on the CPU left would make the CPU's next interrupt
+/// drain the table whatever the case does.
+fn clear_return_work()
+{
+    let _ = system_info(SystemInfoType::CurrentCpu as u64);
+}
+
 /// Spin in user mode, with no syscall, until [`SPIN_STOP`] is set, then exit.
 extern "C" fn busy_spinner_entry(_arg: u64) -> !
 {
+    clear_return_work();
     SPIN_READY.fetch_add(1, Ordering::AcqRel);
     while !SPIN_STOP.load(Ordering::Acquire)
     {
@@ -468,7 +477,7 @@ fn busy_window(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> Tes
                 .map_err(|_| "busy_cpu: a first-pass bind failed")?;
         }
         let per_ms = cycles_per_ms()?;
-        start_spinners(ctx, &mut children, spinners)?;
+        start_spinners(ctx, &mut children, spinners, BUSY_FIRST_SPINNER_CPU)?;
         let ready_wait = per_ms.saturating_mul(post_wait());
         let start = cycles();
         while SPIN_READY.load(Ordering::Acquire) < u32::try_from(spinners).unwrap_or(u32::MAX)
@@ -529,12 +538,13 @@ fn busy_window(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> Tes
     result
 }
 
-/// Start `spinners` spinner threads, each pinned to its own CPU after
-/// [`BUSY_CASE_CPU`], into `children`.
+/// Start `spinners` spinner threads, each pinned to its own CPU from
+/// `first_cpu` on, into `children`.
 fn start_spinners(
     ctx: &TestContext,
     children: &mut [Option<crate::spawn::SpawnedChild>; BUSY_SPINNERS],
     spinners: usize,
+    first_cpu: u32,
 ) -> TestResult
 {
     for (index, slot) in children.iter_mut().enumerate().take(spinners)
@@ -542,8 +552,7 @@ fn start_spinners(
         let child = crate::spawn::new_child(ctx).map_err(|_| "busy_cpu: new_child failed")?;
         let cpu = u32::try_from(index)
             .ok()
-            .and_then(|i| i.checked_add(1))
-            .and_then(|i| i.checked_add(BUSY_CASE_CPU))
+            .and_then(|i| i.checked_add(first_cpu))
             .ok_or("busy_cpu: spinner CPU out of range")?;
         // SAFETY: SPIN_STACKS is a static array reached only through
         // addr_of!; each spinner runs on its own element, and the case waits
@@ -574,6 +583,416 @@ fn mark_post(seen: &mut [bool], index: u64, payload: u64) -> TestResult
     }
     *slot = true;
     Ok(())
+}
+
+/// The CPU of [`leftover_posts_reach_a_busy_cpu`]'s first spinner.
+const BUSY_FIRST_SPINNER_CPU: u32 = BUSY_CASE_CPU + 1;
+
+/// The CPU of the observer of
+/// [`leftover_posts_while_their_cpu_stays_in_the_kernel`]; its spinners take
+/// the ones after it.
+const OBSERVER_CPU: u32 = BUSY_CASE_CPU + 1;
+
+/// Spinners of [`leftover_posts_while_their_cpu_stays_in_the_kernel`], on the
+/// CPUs after the case's and the observer's; at most two, so the case's work
+/// stops growing at four CPUs. On more CPUs an idle one may post the
+/// leftovers first, which the case accepts.
+const STAY_SPINNERS: usize = 2;
+
+/// Length, in milliseconds, of the observer's window with no syscall: several
+/// timer ticks of 1 ms.
+const STAY_WINDOW_MS: u64 = 3;
+
+/// Pages of the first `CSpace` pool whose delete keeps the case's CPU in the
+/// kernel; each attempt that ends before the observer's window doubles it.
+const STAY_FIRST_PAGES: u64 = 4096;
+
+/// Attempts of [`leftover_posts_while_their_cpu_stays_in_the_kernel`] before it
+/// skip-passes; the last pool is 32 times the first, memory permitting.
+const STAY_ATTEMPTS: u32 = 6;
+
+/// Microseconds the observer's poll must precede the end of the case's delete
+/// by to count: more than the delete's own return drain and the reading after
+/// it take.
+const STAY_MARGIN_US: u64 = 1000;
+
+/// Pages the case leaves the source Memory beyond a pool.
+const STAY_HEADROOM_PAGES: u64 = 4096;
+
+// Child stack of the observer.
+static mut OBSERVER_STACK: ChildStack = ChildStack::ZERO;
+
+/// Set by the case while its delete of the pool runs.
+static IN_KERNEL: AtomicBool = AtomicBool::new(false);
+
+/// Observer state: started, finished, the kernel's elapsed microseconds read
+/// just after its poll, and the entry the poll received (`NO_ENTRY` for none).
+static OBSERVER_READY: AtomicBool = AtomicBool::new(false);
+static OBSERVER_DONE: AtomicBool = AtomicBool::new(false);
+static OBSERVER_POLLED_US: AtomicU64 = AtomicU64::new(u64::MAX);
+static OBSERVER_TAG: AtomicU64 = AtomicU64::new(NO_ENTRY);
+static OBSERVER_PAYLOAD: AtomicU64 = AtomicU64::new(0);
+
+/// Cycles of the observer's window, set before it starts.
+static OBSERVER_WINDOW: AtomicU64 = AtomicU64::new(0);
+
+/// [`OBSERVER_TAG`] when the observer received nothing.
+const NO_ENTRY: u64 = u64::MAX;
+
+/// Wait in user mode, with no syscall, until the case's CPU enters the kernel
+/// for its long delete, spin for the window, then poll `queue` once and record
+/// the entry and the kernel's elapsed time after the poll; then exit.
+extern "C" fn stay_observer_entry(queue: u64) -> !
+{
+    clear_return_work();
+    OBSERVER_READY.store(true, Ordering::Release);
+    let mut stopped = false;
+    while !IN_KERNEL.load(Ordering::Acquire)
+    {
+        if SPIN_STOP.load(Ordering::Acquire)
+        {
+            stopped = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if !stopped
+    {
+        let window = OBSERVER_WINDOW.load(Ordering::Relaxed);
+        let start = cycles();
+        while cycles().wrapping_sub(start) < window
+        {
+            core::hint::spin_loop();
+        }
+        // The observer's first syscall since its start: a drain at its
+        // return would come too late for this receive.
+        let entry = event_recv_entry(queue, TRY_ONCE);
+        let polled = system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(u64::MAX);
+        OBSERVER_POLLED_US.store(polled, Ordering::Relaxed);
+        if let Ok(entry) = entry
+        {
+            OBSERVER_TAG.store(entry.tag, Ordering::Relaxed);
+            OBSERVER_PAYLOAD.store(entry.payload, Ordering::Relaxed);
+        }
+    }
+    OBSERVER_DONE.store(true, Ordering::Release);
+    thread_exit()
+}
+
+/// The leftovers of a drain pass reach their queue while the CPU that left
+/// them stays in the kernel and every other CPU the case occupies runs user
+/// code that makes no syscall: every CPU's timer tick posts its own drain bit
+/// while the table has work, so another CPU's interrupt return to user mode
+/// posts them within a tick. The case leaves sixteen bindings past one pass,
+/// as [`leftover_posts_reach_a_busy_cpu`] does, then deletes a large `CSpace`
+/// pool, whose clear keeps its CPU in the kernel; an observer on the next CPU
+/// spins through several ticks and polls the leftover queue while that delete
+/// still runs. A delete that ends first is retried with a pool twice the size,
+/// and the case skip-passes when memory runs out first. Fails if the leftovers
+/// wait for the CPU that left them, or for an idle CPU.
+pub fn leftover_posts_while_their_cpu_stays_in_the_kernel(ctx: &TestContext) -> TestResult
+{
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "stay: system_info(CpuCount) failed")?;
+    if cpus < 2
+    {
+        crate::log(
+            "ktest: sole_reference::leftover_posts_while_their_cpu_stays_in_the_kernel SKIP (one CPU)",
+        );
+        return Ok(());
+    }
+    let spinners = usize::try_from(cpus.saturating_sub(2))
+        .unwrap_or(STAY_SPINNERS)
+        .min(STAY_SPINNERS);
+    let first = event_queue_create_observed(ctx.memory_base, FIRST_PASS_NODES, FIRST_PASS_NODES)
+        .map_err(|_| "stay: event_queue_create_observed failed")?;
+    let result = event_queue_create_observed(ctx.memory_base, LEFTOVER_NODES, LEFTOVER_NODES)
+        .map_err(|_| "stay: event_queue_create_observed failed")
+        .and_then(|rest| {
+            let result = thread_set_affinity(ctx.thread_cap, BUSY_CASE_CPU)
+                .map_err(|_| "stay: pin failed")
+                .and_then(|()| {
+                    let result = stay_attempts(ctx, first, rest, spinners);
+                    let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
+                        .map_err(|_| "stay: restore affinity failed");
+                    result.and(restore)
+                })
+                .and_then(|()| pool_restored(ctx, first, u64::from(FIRST_PASS_NODES)))
+                .and_then(|()| pool_restored(ctx, rest, u64::from(LEFTOVER_NODES)));
+            cap_delete(rest).ok();
+            result
+        });
+    cap_delete(first).ok();
+    result
+}
+
+/// The attempts of [`leftover_posts_while_their_cpu_stays_in_the_kernel`],
+/// with its thread pinned to [`BUSY_CASE_CPU`].
+fn stay_attempts(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> TestResult
+{
+    reach_case_cpu()?;
+    let per_ms = cycles_per_ms()?;
+    OBSERVER_WINDOW.store(per_ms.saturating_mul(STAY_WINDOW_MS), Ordering::Relaxed);
+    let mut pages = STAY_FIRST_PAGES;
+    for _ in 0..STAY_ATTEMPTS
+    {
+        let available = cap_info(ctx.memory_base, CAP_INFO_MEMORY_AVAILABLE)
+            .map_err(|_| "stay: cap_info(available) failed")?;
+        let need = pages
+            .checked_add(STAY_HEADROOM_PAGES)
+            .and_then(|p| p.checked_mul(syscall_abi::PAGE_SIZE))
+            .ok_or("stay: pool size out of range")?;
+        if available <= need
+        {
+            break;
+        }
+        match stay_attempt(ctx, (first, rest), spinners, per_ms, pages)?
+        {
+            Some(true) => return Ok(()),
+            Some(false) =>
+            {
+                return Err("stay: no leftover posted while their CPU stayed in the kernel");
+            }
+            None => pages = pages.saturating_mul(2),
+        }
+    }
+    crate::log(
+        "ktest: sole_reference::leftover_posts_while_their_cpu_stays_in_the_kernel SKIP (no delete outlasted the window)",
+    );
+    Ok(())
+}
+
+/// One attempt with a pool of `pages`: `Some(posted)` when the observer's
+/// poll ran while the case's delete did, `posted` saying whether it found a
+/// leftover; `None` when the delete ended first. Every binding is checked to
+/// post once either way.
+fn stay_attempt(
+    ctx: &TestContext,
+    queues: (u64, u64),
+    spinners: usize,
+    per_ms: u64,
+    pages: u64,
+) -> Result<Option<bool>, &'static str>
+{
+    let pool =
+        cap_create_cspace(ctx.memory_base, 0, 1).map_err(|_| "stay: cap_create_cspace failed")?;
+    let Ok(object) = cap_create_notification(ctx.memory_base)
+    else
+    {
+        cap_delete(pool).ok();
+        return Err("stay: create failed");
+    };
+    let mut pool = Some(pool);
+    let mut children: [Option<crate::spawn::SpawnedChild>; STAY_CHILDREN] =
+        core::array::from_fn(|_| None);
+    SPIN_STOP.store(false, Ordering::Release);
+    SPIN_READY.store(0, Ordering::Release);
+    IN_KERNEL.store(false, Ordering::Release);
+    OBSERVER_READY.store(false, Ordering::Release);
+    OBSERVER_DONE.store(false, Ordering::Release);
+    OBSERVER_POLLED_US.store(u64::MAX, Ordering::Relaxed);
+    OBSERVER_TAG.store(NO_ENTRY, Ordering::Relaxed);
+    OBSERVER_PAYLOAD.store(0, Ordering::Relaxed);
+    let result = stay_window(
+        ctx,
+        queues,
+        object,
+        &mut pool,
+        &mut children,
+        spinners,
+        per_ms,
+        pages,
+    )
+    .and_then(|returned_us| stay_collect(queues, returned_us));
+    SPIN_STOP.store(true, Ordering::Release);
+    for child in children.iter_mut().flatten()
+    {
+        crate::spawn::wait_until_exited(child.th, crate::scaled_polls(2000)).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
+    }
+    if let Some(pool) = pool
+    {
+        cap_delete(pool).ok();
+    }
+    cap_delete(object).ok();
+    result
+}
+
+/// Children of an attempt: the observer, then the spinners.
+const STAY_CHILDREN: usize = STAY_SPINNERS + 1;
+
+/// The window of [`stay_attempt`]: donate `pages` to `pool`, bind the
+/// queues `(first, rest)` to `object`, start the observer and the spinners
+/// into `children`, make the fall to one, delete the pool (clearing `pool`
+/// once it is gone), and wait for the observer's poll. Returns the kernel's
+/// elapsed microseconds read just after the pool's delete returned.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the attempt's resources, which its caller releases on every path"
+)]
+fn stay_window(
+    ctx: &TestContext,
+    (first, rest): (u64, u64),
+    object: u64,
+    pool: &mut Option<u64>,
+    children: &mut [Option<crate::spawn::SpawnedChild>; STAY_CHILDREN],
+    spinners: usize,
+    per_ms: u64,
+    pages: u64,
+) -> Result<u64, &'static str>
+{
+    let pool_cap = pool.ok_or("stay: no pool")?;
+    cap_create_cspace(ctx.memory_base, pool_cap, pages)
+        .map_err(|_| "stay: pool donation failed")?;
+    let copy = cap_derive(object, RIGHTS_ALL).map_err(|_| "stay: derive failed")?;
+    // The pass takes an object's newest bindings first and its first binding
+    // last: the leftover queue's go first.
+    for i in 0..u64::from(LEFTOVER_NODES)
+    {
+        cap_bind_sole_reference(object, rest, CORRELATOR | 0x80 | i)
+            .map_err(|_| "stay: a leftover bind failed")?;
+    }
+    for i in 0..u64::from(FIRST_PASS_NODES)
+    {
+        cap_bind_sole_reference(object, first, CORRELATOR | i)
+            .map_err(|_| "stay: a first-pass bind failed")?;
+    }
+    start_stay_children(ctx, rest, children, spinners)?;
+    let ready_wait = per_ms.saturating_mul(post_wait());
+    let start = cycles();
+    while !OBSERVER_READY.load(Ordering::Acquire)
+        || SPIN_READY.load(Ordering::Acquire) < u32::try_from(spinners).unwrap_or(u32::MAX)
+    {
+        if cycles().wrapping_sub(start) > ready_wait
+        {
+            return Err("stay: the observer or the spinners did not start");
+        }
+        core::hint::spin_loop();
+    }
+    // The fall to one; this delete's own drain posts the first pass and leaves
+    // the rest.
+    cap_delete(copy).map_err(|_| "stay: delete failed")?;
+    // No syscall before the pool's delete: its return would drain the
+    // leftovers on this CPU.
+    IN_KERNEL.store(true, Ordering::Release);
+    let deleted = cap_delete(pool_cap);
+    IN_KERNEL.store(false, Ordering::Release);
+    let returned_us = system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "stay: system_info(ElapsedUs) failed");
+    deleted.map_err(|_| "stay: pool delete failed")?;
+    *pool = None;
+    let returned_us = returned_us?;
+    let start = cycles();
+    while !OBSERVER_DONE.load(Ordering::Acquire)
+    {
+        if cycles().wrapping_sub(start) > ready_wait
+        {
+            return Err("stay: the observer did not finish");
+        }
+        core::hint::spin_loop();
+    }
+    Ok(returned_us)
+}
+
+/// Start the observer of [`stay_attempt`] on [`OBSERVER_CPU`], polling its
+/// copy of `rest`, into `children[0]`, and `spinners` spinners on the CPUs
+/// after it into the rest of `children`.
+fn start_stay_children(
+    ctx: &TestContext,
+    rest: u64,
+    children: &mut [Option<crate::spawn::SpawnedChild>; STAY_CHILDREN],
+    spinners: usize,
+) -> TestResult
+{
+    let [observer, spinner_slots @ ..] = children;
+    let child = crate::spawn::new_child(ctx).map_err(|_| "stay: new_child failed")?;
+    let queue = cap_copy(rest, child.cs, RIGHTS_ALL);
+    // SAFETY: OBSERVER_STACK is a static stack reached only through addr_of!,
+    // and every attempt waits for its observer to exit before the next one
+    // starts.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(OBSERVER_STACK)) };
+    let started = queue
+        .map_err(|_| "stay: copy into the observer failed")
+        .and_then(|q| {
+            // SAFETY: stack_top's stack is the observer's alone (above).
+            unsafe {
+                crate::spawn::configure_and_start_pinned(
+                    &child,
+                    stay_observer_entry,
+                    stack_top,
+                    q,
+                    OBSERVER_CPU,
+                )
+            }
+        });
+    *observer = Some(child);
+    started?;
+    for (index, slot) in spinner_slots.iter_mut().enumerate().take(spinners)
+    {
+        let child = crate::spawn::new_child(ctx).map_err(|_| "stay: new_child failed")?;
+        let cpu = u32::try_from(index)
+            .ok()
+            .and_then(|i| i.checked_add(OBSERVER_CPU + 1))
+            .ok_or("stay: spinner CPU out of range")?;
+        // SAFETY: SPIN_STACKS is a static array reached only through
+        // addr_of!; each spinner runs on its own element, and the attempt
+        // waits for every spinner to exit before the array is used again.
+        let stack_top = unsafe { ChildStack::top_at(core::ptr::addr_of!(SPIN_STACKS), index) }?;
+        // SAFETY: stack_top's stack is this spinner's alone (above).
+        let started = unsafe {
+            crate::spawn::configure_and_start_pinned(&child, busy_spinner_entry, stack_top, 0, cpu)
+        };
+        *slot = Some(child);
+        started?;
+    }
+    Ok(())
+}
+
+/// Receive every post of [`stay_attempt`]'s bindings on the queues
+/// `(first, rest)`, the observer's included, each once; then
+/// `Some(posted)` when the observer's poll ran while the case's delete did,
+/// `posted` saying whether it found a leftover, and `None` otherwise. The
+/// delete's own return drains before `returned_us` is read, so a poll counts
+/// only when its reading comes [`STAY_MARGIN_US`] before that one.
+fn stay_collect((first, rest): (u64, u64), returned_us: u64) -> Result<Option<bool>, &'static str>
+{
+    let tag = OBSERVER_TAG.load(Ordering::Relaxed);
+    let mut seen_rest = [false; LEFTOVER_NODES as usize];
+    let mut received = 0;
+    if tag != NO_ENTRY
+    {
+        mark_post(
+            &mut seen_rest,
+            tag ^ (CORRELATOR | 0x80),
+            OBSERVER_PAYLOAD.load(Ordering::Relaxed),
+        )?;
+        received = 1;
+    }
+    for _ in received..LEFTOVER_NODES
+    {
+        let entry = event_recv_entry(rest, post_wait())
+            .map_err(|_| "stay: a leftover binding did not post")?;
+        mark_post(
+            &mut seen_rest,
+            entry.tag ^ (CORRELATOR | 0x80),
+            entry.payload,
+        )?;
+    }
+    let mut seen_first = [false; FIRST_PASS_NODES as usize];
+    for _ in 0..FIRST_PASS_NODES
+    {
+        let entry = event_recv_entry(first, post_wait())
+            .map_err(|_| "stay: a first-pass binding did not post")?;
+        mark_post(&mut seen_first, entry.tag ^ CORRELATOR, entry.payload)?;
+    }
+    expect_none(rest, "stay: a leftover binding posted twice")?;
+    expect_none(first, "stay: a first-pass binding posted twice")?;
+    let polled_us = OBSERVER_POLLED_US.load(Ordering::Relaxed);
+    let conclusive = polled_us
+        .checked_add(STAY_MARGIN_US)
+        .is_some_and(|bound| bound < returned_us);
+    Ok(conclusive.then_some(tag != NO_ENTRY))
 }
 
 /// A copy moved into another `CSpace`, the move an IPC transfer makes at

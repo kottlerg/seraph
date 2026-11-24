@@ -1717,10 +1717,12 @@ misplaced; a deleted file no rule places is `build`.
 
 The change owes the cells of its most demanding file, in the order `docs`, `host`, `programs`,
 `services`, `kernel`, `build`: `kernel` and `build` owe every `validate` cell and the `bench`
-cell with its ktest boots; `services` and `programs` owe the svctest and usertest cells and the
-`bench` cell's ubench boots; `docs` and `host` owe no boot. The host tests check that every
-tracked file is placed, that every row holds a tracked file, and that no module of xtask a cell
-runs uses one the record calls `host`.
+cell with its ktest boots; `services` owes the svctest and usertest cells and the `bench` cell's
+ubench boots; `programs` owes the usertest cells alone, since no image but usertest's holds a file
+of the programs layer; `docs` and `host` owe no boot. The host tests check that every
+tracked file is placed, that every row holds a tracked file, that no module of xtask a cell runs
+uses one the record calls `host`, and that each layer owes exactly the cells whose images hold its
+files (`layers::Image`).
 
 The `fuzz` job is owed apart from the cells: by a change to an input of every build, to the
 workflows, to an input of the build of `xtask/fuzz/targets`, whose closure holds the engine and

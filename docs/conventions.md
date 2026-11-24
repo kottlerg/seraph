@@ -265,8 +265,9 @@ The reviewer verdict is:
 - `BLOCKING ISSUES` when a defect is on the review surface or a reviewer returned no result;
 - `READY TO MERGE` otherwise.
 
-A PR meets the merge condition when its CI is green, its head contains `master` or meets the
-conditions to merge without it (§ Syncing with `master`), and the last
+A PR meets the merge condition when its CI is green, its head contains `master` at a tip whose
+CI the head's proves together with the tip's own (§ CI Gating) or meets the conditions to merge
+without it (§ Syncing with `master`), and the last
 run at its head is a completed run (one with the reviewer and the auditor, a run of the
 reviewer alone that its audit has completed, or the auditor-only run of § Auditor-only run)
 with no failed agent, `AUDIT PASS`, and the reviewer verdict `READY TO MERGE`.
@@ -604,11 +605,15 @@ among them the merge of a PR that was not built with the commits
 `master` gained after its merge base (§ Syncing with `master`); the
 composition check (§ Composition check) is the other backstop. A red
 `master` is a composition defect, and it is fixed before anything else
-merges: while the CI run of `master`'s tip is red, or has not finished, a
-PR merges only at a head that contains `master`, whose own green CI shows
-the combination green, and `cargo xtask pr-check <N> --gate` refuses any
-other. A release is cut
-only from a green `master` (§ Release Production).
+merges. While the CI run of `master`'s tip has not finished, no PR
+merges, since a pull request's run proves only the change on its side of
+the newest `master` commit whose run passed or is proving it (below).
+While the tip's run is red, or ended without a verdict, a PR merges only
+at a head that contains `master` and whose own green CI run selected its
+cells (the `select` job whose choice its jobs ran) after the tip's run
+ended, so that it proved the tip's change too and shows the combination
+green. `cargo xtask pr-check <N> --gate` refuses any other. A release is
+cut only from a green `master` (§ Release Production).
 
 A CI run boots the cells its change owes, not every cell. The `select` job of `build-test.yml`
 places each file the change touches by the layer record (`cargo xtask cells`,
@@ -631,17 +636,30 @@ demanding file:
 
 A file the record does not place fails the run.
 
-The change is measured from the newest commit of the first-parent history before the run's commit
-whose `build-test` run on a push to `master` passed. For a pull request that history starts at
-`master`'s tip, which its merge commit's first parent is. A cell that a red or unfinished
-`master` run left unproven therefore stays owed by every later run until a run proves it. When no
-such commit is found, or the runs cannot be read, every cell is owed.
+A run proves the change that no other run proves or is proving. It is measured from a base in the
+first-parent history before the run's commit, from the merge base of that base and the run's commit
+to its tree. For a pull request the history starts at `master`'s tip, which its merge commit's first
+parent is, and the base is the newest commit whose `build-test` run on a push to `master` passed, or
+has not finished while no newer commit's run is red or cancelled: `master`'s own run proves its
+commit, so a pull request started while that run goes on is not charged its change, but a newer red
+or cancelled run took that change in and failed, so it is charged then. A push to `master` takes the
+newest commit whose run passed, so `master`'s own runs prove every commit between them. A cell that
+a red or cancelled `master` run left unproven therefore stays owed by every later run until a run
+proves it, and one that a run left unproven when it failed after a pull request's run selected its
+cells is proved again before that pull request merges (above). When no such commit is found, or the
+runs cannot be read, every cell is owed.
 
-`host-tests` runs on every change. `kani` proves the crates the change can affect, and `fuzz`
-runs when the change can affect a crate it fuzzes, its engine, or xtask, which drives it. Both
-measure the change from the same base as the cells, so a proof or a fuzz run that a red `master`
-run left unproven stays owed too. The `summary` job reports the run: it fails when a job failed
-or was cancelled, or was skipped although the change owed it.
+`host-tests` runs on every change. `kani` proves the crates the change can affect, and `fuzz` runs
+when the change can affect a crate it fuzzes, its engine, or xtask, which drives it. Both measure
+the change from the same base as the cells, so a proof or a fuzz run that a red or cancelled
+`master` run left unproven stays owed too. An input of every proof is what can change a harness's
+verdict: the workspace manifest and lock file, Cargo's configuration, the toolchain pin, and the
+command that holds the Kani pin, the arguments Kani runs with and the judge of its output. The
+workflows decide whether and where a job runs, not what a harness proves, so they are inputs of
+every build but of no proof; a change to `build-test.yml`, whose steps run the `kani` job, that
+selects no crate otherwise has it prove the crate with the fewest harnesses, so the job's steps run.
+The `summary` job reports the run: it fails when a job failed or was cancelled, or was skipped
+although the change owed it.
 
 The `kani` check gates a pull request on the bounded proofs of the crates
 the change can affect, not on the whole set, which runs in burn-in and in

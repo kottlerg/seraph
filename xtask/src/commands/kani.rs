@@ -30,16 +30,21 @@ use crate::context::Context as BuildContext;
 use crate::error::{Context, Result, bail, err};
 use crate::util::step;
 
-/// The inputs of every crate's verification beside the workspace's
-/// ([`affected::WORKSPACE_WIDE`]): this command, which holds the Kani pin,
-/// the memory limit and the judge of Kani's output, the selection it makes,
-/// and the job that installs the pinned release and runs it, whose install
-/// steps an empty selection skips.
-const KANI_INPUTS: &[&str] = &[
-    "xtask/src/commands/kani.rs",
-    "xtask/src/affected.rs",
-    ".github/workflows/build-test.yml",
-];
+/// The inputs of every crate's verification beside those of every build
+/// ([`affected::WORKSPACE_WIDE`], the toolchain pin among them): what can
+/// change a harness's verdict. That is this command, which holds the Kani
+/// pin, the arguments and the memory limit it runs `cargo kani` with, and
+/// the judge of Kani's output. What decides only which crates are verified,
+/// or whether and where a job runs them (the selection in
+/// `xtask/src/affected.rs`, the workflows), is not one.
+const KANI_INPUTS: &[&str] = &["xtask/src/commands/kani.rs"];
+
+/// The workflow that runs the `kani` job. A change to it moves no harness's
+/// verdict, but can break the job's own steps (installing the pinned
+/// release, its setup, the run), which only a run that verifies a crate
+/// exercises. So a change to it that selects no crate otherwise selects the
+/// crate with the fewest harnesses.
+const KANI_JOB: &[&str] = &[".github/workflows/build-test.yml"];
 
 /// The Kani release every run uses (docs/build-system.md § Toolchain). A
 /// toolchain bump moves it to the newest release that builds the harnessed
@@ -63,6 +68,8 @@ struct Harnessed
     package: String,
     /// Its directory, relative to the workspace root.
     dir: String,
+    /// How many harnesses its sources declare.
+    harnesses: usize,
 }
 
 /// The `git grep -E` pattern of a line that declares a proof harness.
@@ -146,6 +153,9 @@ enum Reason
     BuildWide(String),
     /// The change touches an input of the crate's build.
     Input(Input),
+    /// The change touches the workflow that runs the job, and the crate
+    /// holds the fewest harnesses.
+    Job(String),
 }
 
 impl Reason
@@ -164,6 +174,10 @@ impl Reason
             {
                 format!("{file} is an input of {package}, which the crate depends on")
             }
+            Self::Job(file) => format!(
+                "{file} runs the job, and the crate holds the fewest harnesses, so the job's \
+                 steps run once"
+            ),
         }
     }
 }
@@ -172,8 +186,9 @@ impl Reason
 /// `workspace`, with the first reason found, in the order of `crates`:
 /// every crate when a changed file is an input of every verification
 /// ([`affected::WORKSPACE_WIDE`], [`KANI_INPUTS`]), else each crate with a
-/// changed input of its build. Fails naming a crate that is no workspace
-/// package.
+/// changed input of its build, else, when the change touches [`KANI_JOB`],
+/// the first crate with the fewest harnesses. Fails naming a crate that is
+/// no workspace package.
 fn affected_crates(
     crates: Vec<Harnessed>,
     workspace: &Workspace,
@@ -192,6 +207,7 @@ fn affected_crates(
             .map(|h| (h, Reason::BuildWide(file.clone())))
             .collect());
     }
+    let fewest = crates.iter().min_by_key(|h| h.harnesses).cloned();
     let mut selected = Vec::new();
     for harnessed in crates
     {
@@ -202,6 +218,11 @@ fn affected_crates(
         {
             selected.push((harnessed, Reason::Input(input)));
         }
+    }
+    if selected.is_empty()
+        && let (Some(file), Some(harnessed)) = (affected::first_under(changed, KANI_JOB), fewest)
+    {
+        selected.push((harnessed, Reason::Job(file.clone())));
     }
     Ok(selected)
 }
@@ -307,7 +328,7 @@ fn version_mismatch(output: &str) -> Option<String>
 fn harnessed(root: &Path) -> Result<Vec<Harnessed>>
 {
     let output = Command::new("git")
-        .args(["grep", "-l", "-E", HARNESS_PATTERN, "--", "*.rs"])
+        .args(["grep", "-c", "-E", HARNESS_PATTERN, "--", "*.rs"])
         .current_dir(root)
         .output()
         .context("failed to launch git grep")?;
@@ -321,7 +342,14 @@ fn harnessed(root: &Path) -> Result<Vec<Harnessed>>
             String::from_utf8_lossy(&output.stderr).trim()
         ),
     };
-    let files: Vec<&str> = files.lines().filter(|l| !l.is_empty()).collect();
+    // Each line is `<file>:<harnesses>`.
+    let files: Vec<(&str, usize)> = files
+        .lines()
+        .filter_map(|line| {
+            let (file, count) = line.rsplit_once(':')?;
+            Some((file, count.parse().ok()?))
+        })
+        .collect();
     harnessed_crates(&files, |dir| {
         std::fs::read_to_string(root.join(dir).join("Cargo.toml")).ok()
     })
@@ -333,18 +361,20 @@ fn harnessed(root: &Path) -> Result<Vec<Harnessed>>
     })
 }
 
-/// The crates of `files` (paths relative to the workspace root), each once,
-/// in the order of their directories, read through `manifest`, which gives a
-/// directory's `Cargo.toml` when it has one; or each file that lies in no
-/// crate, or in one whose manifest names no package.
+/// The crates of `files` (paths relative to the workspace root, each with
+/// the number of harnesses it declares), each once with the sum of its
+/// files' harnesses, in the order of their directories, read through
+/// `manifest`, which gives a directory's `Cargo.toml` when it has one; or
+/// each file that lies in no crate, or in one whose manifest names no
+/// package.
 fn harnessed_crates(
-    files: &[&str],
+    files: &[(&str, usize)],
     manifest: impl Fn(&str) -> Option<String>,
 ) -> core::result::Result<Vec<Harnessed>, Vec<String>>
 {
     let mut crates: Vec<Harnessed> = Vec::new();
     let mut unplaced = Vec::new();
-    for file in files
+    for &(file, harnesses) in files
     {
         let Some((dir, text)) = crate_dir(file, &manifest)
         else
@@ -352,8 +382,9 @@ fn harnessed_crates(
             unplaced.push(format!("{file} (in no crate)"));
             continue;
         };
-        if crates.iter().any(|h| h.dir == dir)
+        if let Some(known) = crates.iter_mut().find(|h| h.dir == dir)
         {
+            known.harnesses = known.harnesses.saturating_add(harnesses);
             continue;
         }
         match package_name(&text)
@@ -361,6 +392,7 @@ fn harnessed_crates(
             Some(package) => crates.push(Harnessed {
                 package: package.to_owned(),
                 dir: dir.to_owned(),
+                harnesses,
             }),
             None => unplaced.push(format!("{file} (crate {dir} names no package)")),
         }
@@ -1071,9 +1103,9 @@ mod tests
             _ => None,
         };
         let files = [
-            "a/outer/src/x.rs",
-            "a/outer/inner/src/y.rs",
-            "a/outer/src/z.rs",
+            ("a/outer/src/x.rs", 2),
+            ("a/outer/inner/src/y.rs", 1),
+            ("a/outer/src/z.rs", 3),
         ];
         assert_eq!(
             harnessed_crates(&files, manifest),
@@ -1081,15 +1113,20 @@ mod tests
                 Harnessed {
                     package: "outer".to_owned(),
                     dir: "a/outer".to_owned(),
+                    harnesses: 5,
                 },
                 Harnessed {
                     package: "inner-pkg".to_owned(),
                     dir: "a/outer/inner".to_owned(),
+                    harnesses: 1,
                 },
             ])
         );
         assert_eq!(
-            harnessed_crates(&["a/outer/src/x.rs", "loose.rs", "b/src/w.rs"], manifest),
+            harnessed_crates(
+                &[("a/outer/src/x.rs", 1), ("loose.rs", 1), ("b/src/w.rs", 1)],
+                manifest
+            ),
             Err(vec![
                 "loose.rs (in no crate)".to_owned(),
                 "b/src/w.rs (crate b names no package)".to_owned(),
@@ -1099,11 +1136,12 @@ mod tests
 
     fn crates() -> Vec<Harnessed>
     {
-        ["services/gpt", "shared/proto"]
+        [("services/gpt", 2), ("shared/proto", 1)]
             .into_iter()
-            .map(|dir| Harnessed {
+            .map(|(dir, harnesses)| Harnessed {
                 package: dir.rsplit('/').next().unwrap().to_owned(),
                 dir: dir.to_owned(),
+                harnesses,
             })
             .collect()
     }
@@ -1178,16 +1216,14 @@ mod tests
     }
 
     // Defect caught: a change to an input of every verification (the Kani
-    // pin and the judge in this command, the selection, the job, the lock
-    // file, the toolchain pin, the workspace manifest) that leaves a crate
-    // out, though it can move any harness's verdict.
+    // pin, the arguments and the judge in this command, the lock file, the
+    // toolchain pin, the workspace manifest, Cargo's configuration) that
+    // leaves a crate out, though it can move any harness's verdict.
     #[test]
     fn a_change_to_the_pin_or_an_input_of_every_build_selects_every_crate()
     {
         for file in [
             "xtask/src/commands/kani.rs",
-            "xtask/src/affected.rs",
-            ".github/workflows/build-test.yml",
             "Cargo.lock",
             "Cargo.toml",
             "rust-toolchain.toml",
@@ -1205,6 +1241,38 @@ mod tests
         }
     }
 
+    // Defect caught: a change that decides only whether or where the job
+    // runs, or which crates it selects (a workflow, the selection's module),
+    // taken as an input of every verification, so an edit of the workflow
+    // proves every crate although no harness's verdict can move.
+    #[test]
+    fn a_change_to_the_workflows_or_the_selection_proves_no_crate_for_it()
+    {
+        for file in [".github/workflows/burnin.yml", "xtask/src/affected.rs"]
+        {
+            assert_eq!(select(&["docs/x.md", file]), [], "{file}");
+        }
+        let job = ".github/workflows/build-test.yml";
+        assert_eq!(
+            select(&["services/gpt/src/lib.rs", job]),
+            [("gpt".to_owned(), input("services/gpt/src/lib.rs", "gpt"))]
+        );
+    }
+
+    // Defect caught: an edit of the workflow that runs the job selecting no
+    // crate, so the job's install, setup and run steps are skipped on its
+    // own run and on master's, and a broken step lands green; or one that
+    // proves more than the crate with the fewest harnesses.
+    #[test]
+    fn a_change_to_the_job_runs_it_on_the_crate_with_the_fewest_harnesses()
+    {
+        let job = ".github/workflows/build-test.yml";
+        assert_eq!(
+            select(&["docs/x.md", job]),
+            [("proto".to_owned(), Reason::Job(job.to_owned()))]
+        );
+    }
+
     // Defect caught: `--component` running another crate than it names, or
     // accepting a crate that holds no harness.
     #[test]
@@ -1215,10 +1283,12 @@ mod tests
                 Harnessed {
                     package: "kernel".to_owned(),
                     dir: "core/kernel".to_owned(),
+                    harnesses: 5,
                 },
                 Harnessed {
                     package: "vfsd-gpt".to_owned(),
                     dir: "services/vfsd/gpt".to_owned(),
+                    harnesses: 15,
                 },
             ]
         };

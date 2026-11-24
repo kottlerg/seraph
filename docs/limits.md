@@ -229,7 +229,7 @@ Tracked by [#760](https://github.com/kottlerg/seraph/issues/760); the Phase 7 bo
 | `SPILL_BATCH_CHUNKS` | `core/kernel/src/cap/object.rs` | 64 spill chunks | batch size (bounds each interrupts-off stretch of a dead `Mmio` object's return of its spill chunks; its mappings are withdrawn one per stretch) | none | correct as is | None |
 | `OBSERVER_BATCH_NODES` | `core/kernel/src/cap/object.rs` | 64 death-observer nodes | batch size (bounds each interrupts-off stretch of a thread's or an address space's release of its death-observer chain, and of the death posts to that chain) | none | correct as is | None |
 | `RECORDS_PER_PAGE` | `core/kernel/src/cap/object.rs` | 127 | encoding artefact (record pages chain, so it bounds no record count; it bounds the group a teardown returns between two interrupt windows, one walk of one Memory object's page free list) | none | correct as is | None |
-| `CascadeStack` (`dealloc_object` cascade) | `core/kernel/src/cap/object.rs` | none: a LIFO linked through the queued objects' headers | provable unreachability (no storage outside the refcount-0 objects it holds) | 8 B stack | correct as is | None |
+| `CascadeStack` (`dealloc_object` cascade) | `core/kernel/src/cap/object.rs` | none: a LIFO linked through the queued objects' headers (an `AddressSpace`'s through its wrapper's `deferred_next`) | provable unreachability (no storage outside the refcount-0 objects it holds) | 8 B stack | correct as is | None |
 | `MAX_DRAIN_EDITS` | `core/kernel/src/cap/drain.rs` | 256 | batch size | none | correct as is | None |
 | `FRAME_WRITE_LOCKED` reader count | `core/kernel/src/cap/object.rs` | `u32` | provably unreachable (readers at most CPUs) | embedded | correct as is | None |
 

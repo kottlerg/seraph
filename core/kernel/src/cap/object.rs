@@ -290,7 +290,9 @@ impl KernelObjectHeader
     /// is not `Exited`, which keeps the object's storage from being freed
     /// (`sched::pin_thread_aspace`). A count of zero means the object's last
     /// reference is gone and its teardown has begun or is about to, so the pin
-    /// is refused rather than revive it. The pin is bounded like every syscall
+    /// is refused rather than revive it; a dealloc cascade keeps the link of an
+    /// address space it queues outside the count, so the count reads zero
+    /// until the space is freed ([`CascadeStack`]). The pin is bounded like every syscall
     /// pin (one per thread in a syscall), so no ceiling check is made.
     ///
     /// Returns whether the reference was taken.
@@ -2108,13 +2110,18 @@ pub struct AddressSpaceObject
     /// Intermediate page-table pages donated to this AS, and the record of
     /// every donation; `dealloc` reclaims the donations wholesale.
     pub pt_pool: PagePool,
-    /// Intrusive link for the per-CPU deferred reclaim stack
-    /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
-    /// that stack: the thread that dropped its last capability was itself
-    /// bound to it (or was stopped by a concurrent teardown while freeing
-    /// it), or `release_ref` dropped its last reference (a syscall pin, a
-    /// batched capability move's freed source, or an Mmio object's mapping
-    /// record), so the free completes off-CPU. Written only by the owning CPU.
+    /// Intrusive link for the stack that holds this object once its last
+    /// reference is gone: a dealloc cascade's ([`CascadeStack`], which keeps an
+    /// address space's link here rather than in its count, so that the count
+    /// reads 0 to [`KernelObjectHeader::inc_ref_if_live`] while it is queued),
+    /// or the per-CPU deferred reclaim stack ([`drain_deferred_reclaim`]),
+    /// never both at once. It goes on the deferred stack when the thread that
+    /// dropped its last capability was itself bound to it (or was stopped by a
+    /// concurrent teardown while freeing it), or when `release_ref` dropped
+    /// its last reference (a syscall pin, a batched capability move's freed
+    /// source, or an Mmio object's mapping record), so the free completes
+    /// off-CPU. Null while on neither stack; written only by the CPU whose stack
+    /// holds the object.
     pub deferred_next: *mut KernelObjectHeader,
 }
 
@@ -3507,6 +3514,14 @@ const CASCADE_LINK_BITS: u32 = 56;
 /// `obj_type` and `ancestor`, which the teardown reads, are never written.
 /// [`Self::pop`] zeroes both link fields again, so the object it returns
 /// reads `ref_count == 0`, as when it was pushed.
+///
+/// An `AddressSpace` keeps its link in [`AddressSpaceObject::deferred_next`]
+/// instead, and its `ref_count` reads 0 for as long as it is queued: a thread
+/// still bound to it names it with no reference, and
+/// [`crate::sched::pin_thread_aspace`] pins it through
+/// [`KernelObjectHeader::inc_ref_if_live`], which refuses only a count of 0.
+/// A link in the count would read as a live count there, and the pin would
+/// both corrupt the link and revive a space whose teardown is under way.
 struct CascadeStack
 {
     top: Option<NonNull<KernelObjectHeader>>,
@@ -3554,6 +3569,67 @@ impl CascadeStack
         )]
         let va = (((word << (64 - CASCADE_LINK_BITS)) as i64) >> (61 - CASCADE_LINK_BITS)) as u64;
         NonNull::new(va as *mut KernelObjectHeader)
+    }
+
+    /// Where `obj` keeps its link outside its header: an `AddressSpace`'s
+    /// [`AddressSpaceObject::deferred_next`], which no other stack uses while
+    /// this one holds the object (the deferred-reclaim stack hands its objects
+    /// to [`dealloc_object`] only after popping them). `None` for every other
+    /// type, whose link is in its header.
+    ///
+    /// # Safety
+    /// `obj` is the header of a live object of the type its `obj_type` names.
+    unsafe fn outside_link(obj: NonNull<KernelObjectHeader>)
+    -> Option<*mut *mut KernelObjectHeader>
+    {
+        // SAFETY: caller contract; `obj_type` is never written while queued.
+        if unsafe { (*obj.as_ptr()).obj_type } != ObjectType::AddressSpace
+        {
+            return None;
+        }
+        // SAFETY: an AddressSpace header starts an `AddressSpaceObject`
+        // (caller contract); the field address is taken without a reference.
+        Some(unsafe {
+            core::ptr::addr_of_mut!((*obj.as_ptr().cast::<AddressSpaceObject>()).deferred_next)
+        })
+    }
+
+    /// The object below `obj` on this stack.
+    ///
+    /// # Safety
+    /// `obj` is a header on this stack.
+    unsafe fn read_next(obj: NonNull<KernelObjectHeader>) -> Option<NonNull<KernelObjectHeader>>
+    {
+        // SAFETY: caller contract (a live, queued object).
+        match unsafe { Self::outside_link(obj) }
+        {
+            // SAFETY: the link field is this stack's alone while it holds `obj`.
+            Some(link) => NonNull::new(unsafe { link.read() }),
+            // SAFETY: caller contract.
+            None => Self::decode(unsafe { Self::read_link(obj) }),
+        }
+    }
+
+    /// Store `next` as the object below `obj`.
+    ///
+    /// # Safety
+    /// As [`Self::write_link`]'s.
+    unsafe fn write_next(
+        obj: NonNull<KernelObjectHeader>,
+        next: Option<NonNull<KernelObjectHeader>>,
+    )
+    {
+        // SAFETY: caller contract (a live object whose link fields are ours).
+        if let Some(link) = unsafe { Self::outside_link(obj) }
+        {
+            // SAFETY: caller contract; `link` is valid and aligned for the write.
+            unsafe { link.write(next.map_or(core::ptr::null_mut(), NonNull::as_ptr)) };
+        }
+        else
+        {
+            // SAFETY: caller contract.
+            unsafe { Self::write_link(obj, Self::encode(next)) };
+        }
     }
 
     /// Read the link word `obj`'s header holds.
@@ -3605,16 +3681,19 @@ impl CascadeStack
     /// its header is used after this call. The one exception to "no other
     /// owner" is a `CSpace` wrapper's arena pages' `owner` back-pointer, used
     /// only for the wrapper's `cs_pool.lock` and `arena_free`
-    /// (`free_arena_chunk`), never its header.
+    /// (`free_arena_chunk`), never its header; and an `AddressSpace`'s bound
+    /// threads, whose pointer reaches only its count, through
+    /// [`KernelObjectHeader::inc_ref_if_live`], which the stack leaves at 0.
     unsafe fn push(&mut self, obj: NonNull<KernelObjectHeader>)
     {
         // SAFETY: caller contract (a live header).
         let refs = unsafe { obj.as_ref() }.ref_count.load(Ordering::Relaxed);
         debug_assert_eq!(refs, 0, "cascade: pushed object is still referenced");
-        // SAFETY: caller contract: the link fields are ours alone; the one
-        // other reference it allows, a `CSpace` wrapper's arena-page `owner`
-        // back-pointer, never reaches the header.
-        unsafe { Self::write_link(obj, Self::encode(self.top)) };
+        // SAFETY: caller contract: the link fields are ours alone; the other
+        // references it allows, a `CSpace` wrapper's arena-page `owner`
+        // back-pointer and an `AddressSpace`'s bound threads, never write them,
+        // and an `AddressSpace`'s link is not in its count.
+        unsafe { Self::write_next(obj, self.top) };
         self.top = Some(obj);
     }
 
@@ -3625,11 +3704,10 @@ impl CascadeStack
         // SAFETY: `top` was queued by `push`, whose contract keeps it live,
         // its link fields this stack's alone, and unreferenced but for the
         // `owner` back-pointer it allows until it is popped here.
-        let word = unsafe { Self::read_link(top) };
-        self.top = Self::decode(word);
+        self.top = unsafe { Self::read_next(top) };
         // SAFETY: as above; `top` is popped here, so the link fields are the
         // caller's alone and no reference to its header is used across this call.
-        unsafe { Self::write_link(top, 0) };
+        unsafe { Self::write_next(top, None) };
         Some(top)
     }
 }
@@ -4008,14 +4086,18 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
             // SAFETY: `next` is the caller's object (this function's contract)
             // or one an arm pushed, which `CascadeStack::push`'s contract leaves
             // unreferenced and exclusively owned but for a `CSpace` wrapper's
-            // arena-page `owner` back-pointer; no lock is held between arms.
+            // arena-page `owner` back-pointer and an `AddressSpace`'s bound
+            // threads, whose pins its count of 0 refuses; no lock is held
+            // between arms.
             unsafe { dealloc_object_one(next, stack) };
         },
         // No lock is held between arms, and every caller runs where an
         // interrupt window may open (this function's contract). The popped
         // object is on no stack and referenced by nothing an interrupt handler
         // reaches, and the queued ones only through a `CSpace` wrapper's
-        // arena-page `owner`, as across the windows the arms open themselves.
+        // arena-page `owner`, as across the windows the arms open themselves,
+        // and an `AddressSpace`'s bound threads, whose pins its count of 0
+        // refuses (`CascadeStack`).
         interrupt_window,
     );
 }
@@ -6597,5 +6679,60 @@ mod tests
         }
         assert_eq!(CascadeStack::encode(None), 0);
         assert_eq!(CascadeStack::decode(0), None);
+    }
+
+    // Defect guarded: a queued address space whose count word holds its
+    // cascade link, so a bound thread's `SYS_THREAD_READ_MEM` pin
+    // (`sched::pin_thread_aspace`) reads the link as a live count, takes a
+    // reference on a space whose teardown is under way, and corrupts the link.
+    #[test]
+    fn a_queued_address_space_refuses_a_live_pin()
+    {
+        let below = alloc_models(&[ObjectType::Endpoint, ObjectType::Endpoint], &[0, 0]);
+        let mut space: core::mem::MaybeUninit<AddressSpaceObject> =
+            core::mem::MaybeUninit::uninit();
+        let aso = space.as_mut_ptr();
+        // SAFETY: `aso` points to storage of an `AddressSpaceObject` live for
+        // this function; the field addresses are taken without a reference,
+        // and only the header and `deferred_next` are ever touched.
+        // SAFETY: `aso` points to storage of an `AddressSpaceObject` live for
+        // this function; the field address is taken without a reference, and
+        // only the header and `deferred_next` are ever touched.
+        let header = unsafe { core::ptr::addr_of_mut!((*aso).header) };
+        // SAFETY: as above.
+        let next = unsafe { core::ptr::addr_of_mut!((*aso).deferred_next) };
+        // SAFETY: `header` is valid and aligned for the write, and nothing else
+        // accesses it.
+        unsafe { header.write(KernelObjectHeader::new(ObjectType::AddressSpace)) };
+        // SAFETY: `next` is valid and aligned for the write, and nothing else
+        // accesses it.
+        unsafe { next.write(core::ptr::null_mut()) };
+        // SAFETY: the header was initialised above.
+        let fresh = unsafe { &*header };
+        fresh.ref_count.store(0, Ordering::Relaxed);
+        // SAFETY: `header` is the address of a field of live storage.
+        let space_header = unsafe { NonNull::new_unchecked(header) };
+        let mut stack = CascadeStack::new();
+        // SAFETY: each object is live, unreferenced, on no stack, and ours.
+        unsafe { stack.push(model_header(below[0])) };
+        // SAFETY: as above.
+        unsafe { stack.push(space_header) };
+        // SAFETY: as above.
+        unsafe { stack.push(model_header(below[1])) };
+        // SAFETY: the header is live; the stack writes only `deferred_next`.
+        let queued = unsafe { &*header };
+        assert_eq!(queued.ref_count.load(Ordering::Relaxed), 0);
+        assert_eq!(queued.cascade_link_hi, [0; 3]);
+        assert!(!queued.inc_ref_if_live(), "a pin revived a queued space");
+        // SAFETY: as above.
+        assert_eq!(unsafe { next.read() }, model_header(below[0]).as_ptr());
+        assert_eq!(stack.pop(), Some(model_header(below[1])));
+        assert_eq!(stack.pop(), Some(space_header));
+        // SAFETY: popped, so the stack no longer writes it.
+        assert!(unsafe { next.read() }.is_null());
+        assert_eq!(queued.ref_count.load(Ordering::Relaxed), 0);
+        assert_eq!(stack.pop(), Some(model_header(below[0])));
+        assert_eq!(stack.pop(), None);
+        free_models(below);
     }
 }

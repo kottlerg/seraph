@@ -409,7 +409,12 @@ teardown orphans.
 The cascade is one stack per `dealloc_object` call (`CascadeStack`), linked through the queued
 objects' own headers: an object on it has a reference count of 0, so its `ref_count` and the
 header's three padding bytes hold the link to the next, while the type and `ancestor` fields its
-teardown reads stay intact, and the link is cleared when it is popped. An object reaches zero once,
+teardown reads stay intact, and the link is cleared when it is popped. An `AddressSpace` keeps its
+link in its wrapper's `deferred_next` instead, the deferred-reclaim stack's link, which no other
+stack uses while the cascade holds it: a thread still bound to a queued space reaches its count
+through `pin_thread_aspace` ([§ Kernel Object Reference
+Counting](#kernel-object-reference-counting), "Thread address-space pins"), and a link in the count
+would read there as a live count, which the pin would take and corrupt. An object reaches zero once,
 so only the call that took it there queues it, at most once at a time, and the stack holds any
 number of objects without allocating. The one object queued twice is a `CSpace` wrapper: its arm's
 first run, having popped it, pushes it back beneath the objects its slots held, so its second run,
@@ -440,9 +445,10 @@ disabled: a syscall and its epilogue, fault delivery between its park commit and
 ([scheduling-internals.md](scheduling-internals.md) § `ThreadState` Transitions, "Voluntary-block
 window"), the end of an interrupt taken from user mode (§ Return Work there), and the idle thread's
 drain. A window between two teardowns exposes no partial state: the popped object is torn down whole
-before the window, the queued ones are reachable by nothing but their own links and a `CSpace`
+before the window, the queued ones are reachable by nothing but their own links, a `CSpace`
 wrapper's arena pages' `owner` back-pointers, which the windows of its arena-page pass expose
-already, and no interrupt handler releases a reference, so no cascade runs nested inside another on
+already, and a queued `AddressSpace`'s bound threads, whose pins its count of 0 refuses, and no
+interrupt handler releases a reference, so no cascade runs nested inside another on
 its CPU.
 
 The walk holds no lock across groups (each group's return takes only its Memory object's locks,
@@ -733,8 +739,9 @@ pub struct KernelObjectHeader
     ref_count: AtomicU32,
     obj_type: ObjectType,
     /// The high 24 bits of the dealloc-cascade link while the object is
-    /// queued on one (its low 32 bits sit in `ref_count`, then 0); zero
-    /// at every other time.
+    /// queued on one (its low 32 bits sit in `ref_count`, then 0; an
+    /// `AddressSpace` keeps its link in its wrapper instead); zero at every
+    /// other time.
     cascade_link_hi: [u8; 3],
     /// The Memory object this object's bytes were retyped from.
     ancestor: AtomicPtr<KernelObjectHeader>,
@@ -876,8 +883,10 @@ The principal kernel-internal owners:
   thread's `sched_lock`, before it frees anything. `sched::pin_thread_aspace` reads the thread's
   state and space under that lock and, while the thread is not `Exited`, takes a reference with
   `KernelObjectHeader::inc_ref_if_live`, which refuses a count of zero rather than revive an
-  object whose teardown has begun. The reference is released through `release_ref` when the copy
-  or the listing ends, before the syscall returns, as a syscall pin's is.
+  object whose teardown has begun. A space queued on a dealloc cascade reads zero too, since the
+  cascade keeps its link outside the count ([§ Teardown](#teardown)). The reference is released
+  through `release_ref` when the copy or the listing ends, before the syscall returns, as a
+  syscall pin's is.
 - **Wait-set membership.** `sys_wait_set_add` `inc_ref`s the source's header under the
   source's lock together with the back-pointer publication; `sys_wait_set_remove` and
   `wait_set_drop` perform the matching `dec_ref`. The source's state therefore outlives

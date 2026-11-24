@@ -3,10 +3,12 @@
 
 // xtask/src/affected.rs
 
-//! What a change can affect: the files a change from a base commit touches,
-//! and which of them are inputs of a workspace package's build. A command
-//! that verifies only what a change can affect (`cargo xtask kani --since`)
-//! selects from them.
+//! The workspace's package graph and what a change can affect: the
+//! workspace packages as `cargo metadata` gives them, each by its name and
+//! directory, the package a path lies in, the dependency and dependent
+//! closures of each, the files a change from a base commit touches, and which
+//! of them are inputs of a package's build. A command that verifies or
+//! builds only what a change can affect selects from them.
 //!
 //! The inputs of a package's build are its own directory, the directories of
 //! the workspace packages in its dependency closure, as `cargo metadata`
@@ -63,7 +65,8 @@ pub struct Input
     pub package: String,
 }
 
-/// The workspace's packages and the files their sources read.
+/// The workspace's packages and the files their sources read: the one reader
+/// of the workspace's package graph.
 #[derive(Clone, Debug, Default)]
 pub struct Workspace
 {
@@ -98,6 +101,81 @@ impl Workspace
         }
     }
 
+    /// The workspace's packages, in `cargo metadata`'s order.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the graph's API for the layer table (#1591) and the CI cell selection \
+                      (#1592); until they call it, only its tests do"
+        )
+    )]
+    pub fn packages(&self) -> &[Package]
+    {
+        &self.packages
+    }
+
+    /// The package named `name`; its `dir` is its manifest's directory.
+    pub fn package(&self, name: &str) -> Option<&Package>
+    {
+        self.packages.iter().find(|p| p.name == name)
+    }
+
+    /// The package `path` (relative to the root) lies in: the one whose
+    /// directory holds it most deeply, so a package nested in another's
+    /// directory owns its own files; `None` when no package's does.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the graph's API for the layer table (#1591) and the CI cell selection \
+                      (#1592); until they call it, only its tests do"
+        )
+    )]
+    pub fn package_of(&self, path: &str) -> Option<&Package>
+    {
+        self.packages
+            .iter()
+            .filter(|p| under(path, &p.dir))
+            .max_by_key(|p| p.dir.len())
+    }
+
+    /// The package named `name` and every workspace package its path
+    /// dependencies reach, of every kind and on every target, the package
+    /// itself first; `None` when no package has that name.
+    pub fn dependencies(&self, name: &str) -> Option<Vec<&Package>>
+    {
+        let root = self.package(name)?;
+        Some(reach(root, |package| {
+            self.packages
+                .iter()
+                .filter(|p| package.deps.contains(&p.dir))
+                .collect()
+        }))
+    }
+
+    /// The package named `name` and every workspace package whose path
+    /// dependencies reach it, of every kind and on every target, the package
+    /// itself first; `None` when no package has that name.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the graph's API for the layer table (#1591) and the CI cell selection \
+                      (#1592); until they call it, only its tests do"
+        )
+    )]
+    pub fn dependents(&self, name: &str) -> Option<Vec<&Package>>
+    {
+        let root = self.package(name)?;
+        Some(reach(root, |package| {
+            self.packages
+                .iter()
+                .filter(|p| p.deps.contains(&package.dir))
+                .collect()
+        }))
+    }
+
     /// The first file of `changed` (paths relative to the root) that is an
     /// input of the build of the package in `dir`, other than the inputs of
     /// every build, which the caller checks with [`first_under`]; `None` when
@@ -105,7 +183,11 @@ impl Workspace
     /// cannot be known.
     pub fn first_input(&self, dir: &str, changed: &[String]) -> Result<Option<Input>>
     {
-        let closure = closure(&self.packages, dir)
+        let closure = self
+            .packages
+            .iter()
+            .find(|p| p.dir == dir)
+            .and_then(|p| self.dependencies(&p.name))
             .ok_or_else(|| err!("no workspace package lies in {dir}"))?;
         for package in closure
         {
@@ -145,28 +227,24 @@ fn under(file: &str, input: &str) -> bool
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// The package in `dir` and every workspace package its path dependencies
-/// reach, of every kind (normal, development and build) and on every target,
-/// which is what the host test build of it can compile; `None` when no
-/// package lies in `dir`.
-fn closure<'a>(packages: &'a [Package], dir: &str) -> Option<Vec<&'a Package>>
+/// `root` and every package `edges` reaches from it, each once, `root`
+/// first, in the order they are reached.
+fn reach<'a>(root: &'a Package, edges: impl Fn(&Package) -> Vec<&'a Package>) -> Vec<&'a Package>
 {
-    let root = packages.iter().find(|p| p.dir == dir)?;
     let mut reached = vec![root];
     let mut next = 0;
     while let Some(package) = reached.get(next).copied()
     {
         next = next.saturating_add(1);
-        for dep in &package.deps
+        for found in edges(package)
         {
-            if let Some(found) = packages.iter().find(|p| &p.dir == dep)
-                && !reached.iter().any(|r| r.dir == found.dir)
+            if !reached.iter().any(|r| r.dir == found.dir)
             {
                 reached.push(found);
             }
         }
     }
-    Some(reached)
+    reached
 }
 
 // ── What the repository gives ────────────────────────────────────────────────
@@ -187,8 +265,8 @@ pub fn changed_files(root: &Path, base: &str) -> Result<Vec<String>>
     )
     .with_context(|| {
         format!(
-            "--since {base} names no commit of this checkout (a shallow clone lacks the \
-                 base's history)"
+            "{base} names no commit of this checkout (a shallow clone lacks the base's \
+                 history)"
         )
     })?;
     let commit = verified.trim();
@@ -434,6 +512,55 @@ mod tests
         // A read by a package outside the closure is not its input.
         let reads = [("services/other/src/main.rs", "rootfs/config/table.conf")];
         assert_eq!(first(&reads, &["rootfs/config/table.conf"]), None);
+    }
+
+    fn names(packages: &[&Package]) -> Vec<String>
+    {
+        packages.iter().map(|p| p.name.clone()).collect()
+    }
+
+    // Defect caught: a crate's directory, or the crate a path lies in,
+    // answered wrongly: a file of a sibling whose directory's name extends
+    // another's taken as that one's, or a package nested in another's
+    // directory losing its files to the outer one.
+    #[test]
+    fn the_graph_maps_crates_to_directories_and_paths_to_crates()
+    {
+        let mut ws = workspace(&[]);
+        ws.packages
+            .push(package("inner", "shared/proto/inner", &[]));
+        assert_eq!(ws.package("abi").map(|p| p.dir.as_str()), Some("abi/abi"));
+        assert_eq!(ws.package("absent"), None);
+        let of = |path: &str| ws.package_of(path).map(|p| p.name.clone());
+        assert_eq!(of("shared/proto/src/lib.rs").as_deref(), Some("proto"));
+        assert_eq!(of("shared/proto/Cargo.toml").as_deref(), Some("proto"));
+        assert_eq!(
+            of("shared/proto/inner/src/lib.rs").as_deref(),
+            Some("inner")
+        );
+        assert_eq!(of("shared/proto-tool/src/lib.rs"), None);
+        assert_eq!(of("docs/a.md"), None);
+        assert_eq!(ws.packages().len(), 5);
+    }
+
+    // Defect caught: a closure that stops at the first edge, visits a
+    // package twice through two paths, or follows the edges the wrong way.
+    #[test]
+    fn the_graph_gives_each_crate_s_dependency_and_dependent_closures()
+    {
+        let ws = workspace(&[]);
+        assert_eq!(
+            names(&ws.dependencies("proto").unwrap()),
+            ["proto", "abi", "util"]
+        );
+        assert_eq!(names(&ws.dependencies("util").unwrap()), ["util"]);
+        assert_eq!(
+            names(&ws.dependents("util").unwrap()),
+            ["util", "abi", "other", "proto"]
+        );
+        assert_eq!(names(&ws.dependents("proto").unwrap()), ["proto"]);
+        assert!(ws.dependencies("absent").is_none());
+        assert!(ws.dependents("absent").is_none());
     }
 
     // Defect caught: a directory no package lies in answered as having no

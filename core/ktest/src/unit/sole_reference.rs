@@ -619,7 +619,7 @@ const STAY_MAX_GROWTH: u64 = 16;
 
 /// Attempts of [`leftover_posts_while_their_cpu_stays_in_the_kernel`]; once a
 /// pool's delete outlasts the target, an attempt is inconclusive only when its
-/// observer ran late.
+/// observer ran late. The case fails when every attempt is inconclusive.
 const STAY_ATTEMPTS: u32 = 8;
 
 /// Microseconds the observer's poll must precede the end of the case's delete
@@ -703,8 +703,9 @@ extern "C" fn stay_observer_entry(queue: u64) -> !
 /// spins through several ticks and polls the leftover queue while that delete
 /// still runs. A delete that ends first is retried with a pool sized from the
 /// rate it measured to outlast the window; memory that cannot fund that pool
-/// fails the case. Fails if the leftovers wait for the CPU that left them, or
-/// for an idle CPU.
+/// fails the case, as do [`STAY_ATTEMPTS`] attempts none of whose observers
+/// polled inside its delete. The case logs the attempt that concluded. Fails if
+/// the leftovers wait for the CPU that left them, or for an idle CPU.
 pub fn leftover_posts_while_their_cpu_stays_in_the_kernel(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -758,12 +759,18 @@ fn stay_attempts(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> T
         .filter(|&pages| pages > 0)
         .ok_or(STAY_NO_MEMORY)?;
     let mut pages = STAY_FIRST_PAGES.min(fundable);
-    for _ in 0..STAY_ATTEMPTS
+    for attempt in 1..=STAY_ATTEMPTS
     {
         let (outcome, took) = stay_attempt(ctx, (first, rest), spinners, per_ms, pages)?;
         match outcome
         {
-            Some(true) => return Ok(()),
+            Some(true) =>
+            {
+                crate::log_args(format_args!(
+                    "ktest: sole_reference::leftover_posts_while_their_cpu_stays_in_the_kernel conclusive at attempt {attempt} of {STAY_ATTEMPTS} ({pages} pages)"
+                ));
+                return Ok(());
+            }
             Some(false) =>
             {
                 return Err("stay: no leftover posted while their CPU stayed in the kernel");
@@ -779,11 +786,14 @@ fn stay_attempts(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> T
             }
         }
     }
-    crate::log_args(format_args!(
-        "ktest: sole_reference::leftover_posts_while_their_cpu_stays_in_the_kernel inconclusive after {STAY_ATTEMPTS} attempts (no observer poll ran inside a delete)"
-    ));
-    Ok(())
+    Err(STAY_INCONCLUSIVE)
 }
+
+/// The failure of [`leftover_posts_while_their_cpu_stays_in_the_kernel`] when
+/// every one of its [`STAY_ATTEMPTS`] attempts was inconclusive: the case did
+/// not reach its subject.
+const STAY_INCONCLUSIVE: &str =
+    "stay: inconclusive after every attempt (no observer poll ran inside a delete)";
 
 /// The failure of [`leftover_posts_while_their_cpu_stays_in_the_kernel`] when
 /// the source Memory cannot fund a pool whose delete outlasts the observer's

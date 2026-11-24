@@ -1468,9 +1468,7 @@ const OUTSTANDING_CSPACE_MARGIN: usize = 64;
 /// the whole count first. It also takes enough opens that the pages
 /// outstanding exceed every slot svctest's `CSpace` has free before that
 /// funding, its IPC receive reserve included, so at every RAM size the reads
-/// succeed only when the funding grew the `CSpace`. svctest once funded none
-/// of them and relied on the headroom earlier phases left, which covered the
-/// four opens' pages up to 1 GiB of RAM and fell short at 2 GiB.
+/// succeed only when the funding grew the `CSpace`.
 fn opens_outstanding(node_cap: u64, open: u64, slots: usize, ipc_buf: *mut u64)
 {
     let pages = slots.saturating_sub(OUTSTANDING_SPARE_SLOTS);

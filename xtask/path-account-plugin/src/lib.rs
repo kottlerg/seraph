@@ -8,8 +8,8 @@
 //! address, between consecutive user-mode reads of the cycle counter, and
 //! records each read's value, without stopping the guest.
 //!
-//! A stop of the guest (a gdbstub breakpoint or step) under `-icount
-//! sleep=off` moves the virtual clock to the next timer deadline, so a
+//! A stop of the guest (a gdbstub breakpoint or step) under icount moves
+//! the virtual clock to the next timer deadline, so a
 //! window stepped through the gdbstub does not run the instructions the
 //! benchmark measured. A plugin's callbacks run inside the translated code
 //! and leave the instruction count untouched.

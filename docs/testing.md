@@ -28,8 +28,8 @@ Three harnesses exercise three surfaces:
 | `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (the `terminal` case, `cargo xtask test terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
-itself owns its phases. `usertest` is an orchestrator that runs per-program
-tester binaries discovered under `/tests/programs/`.
+itself owns its phases. `usertest` is an orchestrator that runs the per-program
+tester binaries under `/tests/programs/` that its recipe names.
 
 [`ubench`](../programs/ubench/README.md), the userspace benchmark suite, is launched as
 `svctest` is, from a recipe staged into `/config/svcmgr/services/`, and measures rather than
@@ -83,10 +83,21 @@ program opt in or skip; absence is the default.
 - The install path is controlled by `xtask`'s `SPECS` entry for the tester
   crate; the tester crate MUST NOT rely on its own binary name to land at
   the correct sysroot path.
+- The tester MUST be named in the `TESTERS` env entry of usertest's recipe
+  (`rootfs/config/svcmgr/tests/usertest.svc`), the testers the image holds.
+  usertest fails the run for each tester named and absent from
+  `/tests/programs/`, for each one there that the list does not name, and
+  for an empty list
+  ([services/usertest/README.md](../services/usertest/README.md) § Testers).
 
 ### Contract
 
 - The tester binary MUST exit `0` on pass and non-zero on fail.
+- The tester MUST exit, and its stdout and stderr MUST close, within the
+  bound usertest's recipe sets in `TESTER_BOUND_MS`. usertest kills a tester
+  still running at the bound, reports it as FAIL, and runs the testers after
+  it ([services/usertest/README.md](../services/usertest/README.md)
+  § Testers).
 - The tester binary's exit code is the authoritative verdict. Seraph propagates
   it natively, without POSIX 8-bit truncation (see
   [syscalls.md § `SYS_ASPACE_EXIT`](../core/kernel/docs/syscalls.md#sys_aspace_exit-54));

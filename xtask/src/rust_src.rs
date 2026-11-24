@@ -1555,6 +1555,66 @@ mod tests
         deps
     }
 
+    /// The repository's root.
+    fn repo_root() -> PathBuf
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+    }
+
+    /// The patterns of the standard-library cache key's `hashFiles` call, in
+    /// order.
+    fn key_patterns(root: &Path) -> Vec<String>
+    {
+        let action = fs::read_to_string(root.join(".github/actions/std-cache/action.yml")).unwrap();
+        let call = &action[action.find("hashFiles(").unwrap()..];
+        let call = &call[..call.find(')').unwrap()];
+        call.split('\'')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Whether the key's `hashFiles` call hashes `path` (a file, or a
+    /// directory a `<dir>/**` pattern holds), as `@actions/glob` reads the
+    /// patterns: in order, a later one deciding, `!` excluding. The forms
+    /// read are a path, `<dir>/**`, and `!**/*.<ext>`; another form fails
+    /// the test, so its reading is added here first.
+    fn key_hashes(patterns: &[String], path: &str) -> bool
+    {
+        let mut hashed = false;
+        for pattern in patterns
+        {
+            if let Some(excluded) = pattern.strip_prefix('!')
+            {
+                let ext = excluded
+                    .strip_prefix("**/*.")
+                    .unwrap_or_else(|| panic!("an exclusion this test cannot read: {pattern}"));
+                if path.ends_with(&format!(".{ext}"))
+                {
+                    hashed = false;
+                }
+            }
+            else if pattern.trim_end_matches("/**").contains('*')
+            {
+                panic!("a pattern this test cannot read: {pattern}");
+            }
+            else if let Some(dir) = pattern.strip_suffix("/**")
+            {
+                hashed |= path == dir || path.starts_with(&format!("{dir}/"));
+            }
+            else
+            {
+                hashed |= path == pattern;
+            }
+        }
+        hashed
+    }
+
     // Defect caught: a file the seraph std is built from left out of the
     // standard-library cache's key, so a change to it (one byte of an
     // overlay source, of a crate std depends on, or of the specs and flags
@@ -1565,22 +1625,9 @@ mod tests
     #[test]
     fn the_std_cache_key_hashes_every_std_input()
     {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .canonicalize()
-            .unwrap();
-        let action = fs::read_to_string(root.join(".github/actions/std-cache/action.yml")).unwrap();
-        let call = &action[action.find("hashFiles(").unwrap()..];
-        let call = &call[..call.find(')').unwrap()];
-        let patterns: Vec<&str> = call.split('\'').skip(1).step_by(2).collect();
-        let covered = |path: &str| {
-            patterns.iter().any(|p| {
-                p.strip_suffix("/**").map_or(*p == path, |dir| {
-                    path == dir || path.starts_with(&format!("{dir}/"))
-                })
-            })
-        };
+        let root = repo_root();
+        let patterns = key_patterns(&root);
+        let covered = |path: &str| key_hashes(&patterns, path);
         let mut inputs: Vec<String> = [
             "Cargo.toml",
             ".cargo/config.toml",
@@ -1604,6 +1651,45 @@ mod tests
         assert!(
             missed.is_empty(),
             "the key's hashFiles misses {missed:?}; patterns {patterns:?}"
+        );
+    }
+
+    // Defect caught: a file the standard-library cache's key hashes whose
+    // change alone owes no validate or bench cell (a README under
+    // `shared/`, say): a `master` merge changing only it changes the key
+    // but runs no job that saves an entry under it, so every later pull
+    // request misses the cache until a merge owes those cells.
+    #[test]
+    fn a_change_to_a_file_the_std_cache_key_hashes_owes_the_cells_that_save_it()
+    {
+        use crate::affected::Workspace;
+        use crate::commands::cells::owed_by;
+        use crate::layers::{Presence, place};
+
+        let root = repo_root();
+        let patterns = key_patterns(&root);
+        let ws = Workspace::load(&root).unwrap();
+        let out = Command::new("git")
+            .arg("ls-files")
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let files = String::from_utf8(out.stdout).unwrap();
+        let hashed: Vec<&str> = files.lines().filter(|f| key_hashes(&patterns, f)).collect();
+        assert_ne!(hashed.len(), 0, "the key hashes no tracked file");
+        let short: Vec<String> = hashed
+            .iter()
+            .filter_map(|file| {
+                let placed = place(&ws, file, Presence::Present).unwrap();
+                let owed = owed_by(placed.class);
+                (owed.testers.is_empty() || !owed.bench)
+                    .then(|| format!("{file}: {} ({})", placed.class.label(), placed.why))
+            })
+            .collect();
+        assert!(
+            short.is_empty(),
+            "files the key hashes that owe no saving cell: {short:#?}"
         );
     }
 

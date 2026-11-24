@@ -14,7 +14,6 @@ this boundary.
 ```
 core/kernel/
 ├── Cargo.toml                  # Workspace member; no_std crate
-├── build.rs                    # Linker script selection per target
 ├── vendor/
 │   └── intel-affected-processor-list/ # Intel's affected-processor list, vendored verbatim
 ├── linker/
@@ -282,11 +281,13 @@ static-PIE relocation model, and soft-float codegen (no SSE/AVX/MMX in the kerne
 x86-64). See [docs/build-system.md](../../docs/build-system.md) § Custom Targets for the
 toolchain and target configuration.
 
-`build.rs` selects the appropriate linker script from `linker/` based on the active
-target. Linker scripts link the static-PIE image at `KERNEL_VBASE`, the zero-bias
-higher-half origin of the layout described in
-[docs/memory-model.md](../../docs/memory-model.md); the bootloader chooses the KASLR load
-bias and applies the `RELATIVE` relocations before handoff (see
+`cargo xtask build` passes the linker script of the active target from `linker/` to the
+link, and `src/main.rs` includes it with `include_bytes!` so a change to it relinks the
+image (see
+[build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)). Linker
+scripts link the static-PIE image at `KERNEL_VBASE`, the zero-bias higher-half origin of the layout
+described in [docs/memory-model.md](../../docs/memory-model.md); the bootloader chooses the
+KASLR load bias and applies the `RELATIVE` relocations before handoff (see
 [core/boot/docs/elf-loading.md](../boot/docs/elf-loading.md#elf-validation)).
 
 ---

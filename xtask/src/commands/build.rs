@@ -787,8 +787,9 @@ pub fn compile_boot(ctx: &BuildContext, args: &BuildArgs, store: &Path, out: &Pa
         .to_str()
         .with_context(|| format!("the trust store path {} is not UTF-8", store.display()))?;
 
+    let rustflags = with_linker_script(BOOT_RUSTFLAGS, args.arch.boot_linker_script());
     let env = [
-        ("RUSTFLAGS", BOOT_RUSTFLAGS),
+        ("RUSTFLAGS", rustflags.as_str()),
         ("SERAPH_BOOT_TRUST_STORE", store),
     ];
     if !args.skip_lints
@@ -919,10 +920,11 @@ fn build_group(
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let env = profile_env(args.arch, profile);
+    let env_owned = profile_env(args.arch, profile);
+    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if !args.skip_lints
     {
-        clippy_check_ext(ctx, &flags_ref, env, seraph.as_ref())?;
+        clippy_check_ext(ctx, &flags_ref, &env, seraph.as_ref())?;
         clippy_std_members(ctx, triple, build_std, args.profile(), seraph.as_ref())?;
     }
 
@@ -1048,10 +1050,11 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let env = profile_env(args.arch, spec.profile);
+    let env_owned = profile_env(args.arch, spec.profile);
+    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if !args.skip_lints
     {
-        clippy_check_ext(ctx, &flags_ref, env, seraph.as_ref())?;
+        clippy_check_ext(ctx, &flags_ref, &env, seraph.as_ref())?;
         clippy_std_members(ctx, triple, build_std, args.profile(), seraph.as_ref())?;
     }
 
@@ -1217,14 +1220,36 @@ const RISCV64_KERNEL_RUSTFLAGS: &str = "-Zunstable-options -Zemit-stack-sizes";
 const X86_64_KERNEL_RUSTFLAGS: &str = "-Zunstable-options -Zretpoline-external-thunk";
 
 /// The environment a build of `profile` for `arch`, and its lint pass, run
-/// with.
-fn profile_env(arch: Arch, profile: BuildProfile) -> &'static [(&'static str, &'static str)]
+/// with: for the kernel, `RUSTFLAGS` with the kernel's linker script.
+fn profile_env(arch: Arch, profile: BuildProfile) -> Vec<(&'static str, String)>
 {
-    match (arch, profile)
+    let base = match (arch, profile)
     {
-        (Arch::Riscv64, BuildProfile::Kernel) => &[("RUSTFLAGS", RISCV64_KERNEL_RUSTFLAGS)],
-        (Arch::X86_64, BuildProfile::Kernel) => &[("RUSTFLAGS", X86_64_KERNEL_RUSTFLAGS)],
-        _ => &[],
+        (Arch::Riscv64, BuildProfile::Kernel) => RISCV64_KERNEL_RUSTFLAGS,
+        (Arch::X86_64, BuildProfile::Kernel) => X86_64_KERNEL_RUSTFLAGS,
+        _ => return Vec::new(),
+    };
+    let rustflags = with_linker_script(base, Some(arch.kernel_linker_script()));
+    vec![("RUSTFLAGS", rustflags)]
+}
+
+/// `rustflags` with the `-T` link argument that passes `script`, a linker
+/// script named relative to the workspace root, to the link, when there is
+/// one.
+///
+/// The path stays relative: Cargo runs rustc for a workspace member, the
+/// kernel and the bootloader among them, from the workspace root, and the
+/// linker from there, so the flags, which Cargo fingerprints, are the same in
+/// every checkout and a build output carried to another one (a CI cell, a
+/// test lane) stays fresh. The crate that links with the script includes it
+/// as well, which makes it an input Cargo judges by content
+/// (docs/build-system.md § Custom Targets).
+fn with_linker_script(rustflags: &str, script: Option<&str>) -> String
+{
+    match script
+    {
+        Some(script) => format!("{rustflags} -Clink-arg=-T{script}"),
+        None => rustflags.to_owned(),
     }
 }
 
@@ -1360,8 +1385,10 @@ fn clippy_check(ctx: &BuildContext, flags: &[&str]) -> Result<()>
 /// from rustup instead of our mirror and the overlay never takes effect.
 /// To keep our wrapper in place we drive clippy ourselves: `cargo check`
 /// with `RUSTC_WORKSPACE_WRAPPER=<ws-clippy>` runs the mirror-aware
-/// wrapper on every workspace crate, and `CLIPPY_ARGS` feeds the same
-/// lint args that `cargo clippy -- …` would pass through.
+/// wrapper on every workspace crate, and `CLIPPY_ARGS`, which
+/// [`rust_src::SeraphToolchain::apply_env`] sets for the build too
+/// ([`rust_src::CLIPPY_ARGS`]), feeds the same lint args that
+/// `cargo clippy -- …` would pass through.
 ///
 /// Called before every component `cargo build` with identical flags and
 /// `env`, so lints are enforced on every component build — not just on
@@ -1381,18 +1408,11 @@ fn clippy_check_ext(
     {
         cmd.arg("check").args(flags);
         // Routes RUSTC + RUSTC_WORKSPACE_WRAPPER through the shim,
-        // sets the SERAPH_SHIM_* config, and re-applies
-        // RUSTC_BOOTSTRAP=1. `std` is a recognised (non-restricted)
-        // target via the std `build.rs` overlay, so service code
-        // stays preamble-free.
+        // sets the SERAPH_SHIM_* config and the lint args (CLIPPY_ARGS),
+        // and re-applies RUSTC_BOOTSTRAP=1. `std` is a recognised
+        // (non-restricted) target via the std `build.rs` overlay, so
+        // service code stays preamble-free.
         s.apply_env(&mut cmd);
-        // Clippy-driver splits CLIPPY_ARGS on __CLIPPY_HACKERY__; this
-        // matches the encoding cargo-clippy uses internally when
-        // forwarding post-`--` args.
-        cmd.env(
-            "CLIPPY_ARGS",
-            "__CLIPPY_HACKERY__-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__",
-        );
     }
     else
     {
@@ -1857,5 +1877,121 @@ mod tests
                 }
             }
         }
+    }
+
+    /// The project root, the parent of xtask's manifest directory.
+    fn project_root() -> &'static Path
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits under the project root")
+    }
+
+    /// Every manifest directory under `dir`, outside the build output and
+    /// hidden directories.
+    fn manifest_dirs(dir: &Path, found: &mut Vec<PathBuf>)
+    {
+        if dir.join("Cargo.toml").is_file()
+        {
+            found.push(dir.to_owned());
+        }
+        for entry in fs::read_dir(dir).unwrap()
+        {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() && !name.starts_with('.') && name != "target" && name != "sysroot"
+            {
+                manifest_dirs(&path, found);
+            }
+        }
+    }
+
+    // Defect caught: a package of the tree with a build script. Cargo judges
+    // a build script's `rerun-if-changed` files by modification time, which a
+    // fresh checkout resets, so CI's carried build would rerun the script and
+    // recompile its package and every dependent on each run
+    // (docs/build-system.md § Continuous Integration).
+    #[test]
+    fn no_package_of_the_tree_has_a_build_script()
+    {
+        let mut dirs = Vec::new();
+        manifest_dirs(project_root(), &mut dirs);
+        assert!(dirs.len() > 50, "found only {} manifests", dirs.len());
+        for dir in dirs
+        {
+            assert!(
+                !dir.join("build.rs").exists(),
+                "{} has a build.rs",
+                dir.display()
+            );
+            let manifest = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+            assert!(
+                !manifest
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("build =")),
+                "{} names a build script",
+                dir.display()
+            );
+        }
+    }
+
+    // Defect caught: a kernel or bootloader linked without its linker script,
+    // or with one its crate does not include, whose change would then leave
+    // the linked image as it was (docs/build-system.md § Custom Targets); or
+    // a script named by a path of the checkout, which makes every unit of the
+    // build stale in another checkout (a CI cell, a test lane).
+    #[test]
+    fn each_linker_script_is_passed_to_the_link_and_included_by_its_crate()
+    {
+        let root = project_root();
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let cases = [Arch::X86_64, Arch::Riscv64].into_iter().flat_map(|arch| {
+            [
+                (arch, Some(arch.kernel_linker_script()), "core/kernel"),
+                (arch, arch.boot_linker_script(), "core/boot"),
+            ]
+        });
+        for (arch, script, krate) in cases
+        {
+            let base = "-Zunstable-options";
+            let flags = with_linker_script(base, script);
+            let Some(script) = script
+            else
+            {
+                assert_eq!(flags, base, "{arch}: {krate}");
+                continue;
+            };
+            assert!(Path::new(script).is_relative(), "{script}");
+            assert!(root.join(script).is_file(), "{script}");
+            assert!(
+                !script.contains(char::is_whitespace),
+                "{script}: RUSTFLAGS splits at whitespace"
+            );
+            assert_eq!(flags, format!("{base} -Clink-arg=-T{script}"));
+            // A workspace member, so Cargo runs its rustc, and the link, from
+            // the workspace root the path is relative to.
+            assert!(
+                manifest.contains(&format!("\"{krate}\"")),
+                "{krate} is not a workspace member"
+            );
+            let main = fs::read_to_string(root.join(krate).join("src/main.rs")).unwrap();
+            let file = Path::new(script).file_name().unwrap().to_str().unwrap();
+            assert!(
+                main.contains(&format!("include_bytes!(\"../linker/{file}\")")),
+                "{krate}/src/main.rs does not include {file}"
+            );
+        }
+        let kernel = profile_env(Arch::Riscv64, BuildProfile::Kernel);
+        assert_eq!(
+            kernel,
+            vec![(
+                "RUSTFLAGS",
+                format!("{RISCV64_KERNEL_RUSTFLAGS} -Clink-arg=-Tcore/kernel/linker/riscv64.ld")
+            )]
+        );
+        assert_eq!(
+            profile_env(Arch::X86_64, BuildProfile::StdUser),
+            Vec::<(&str, String)>::new()
+        );
     }
 }

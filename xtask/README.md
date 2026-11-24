@@ -1615,11 +1615,6 @@ verdict names), and when Kani's closing summary is missing, counts a failure or 
 counts other harnesses than reported a verdict; a harness that Kani starts and prints no verdict for
 fails too. Every selected crate runs, and the command then prints a table of every harness, by
 package and path, with its verdict and verification time, and fails naming each crate that failed.
-A harness whose verification time exceeds the 120 s budget (`BUDGET_SECONDS`,
-[docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification) fails on a CI
-runner (`GITHUB_ACTIONS` set to `true`), named with its time and marked `FAILED (over budget)` in
-the table; on another host, whose speed differs, the command prints a warning naming it and its
-time.
 
 CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the base its `select`
 job found with `cargo xtask cells --since-green`, on a pull request and on a push to `master`

@@ -61,23 +61,25 @@ The figures in this section are release, x86_64 / riscv64, unless marked dev.
 
 ### The Null Syscall
 
-The null syscall (`SYS_SYSTEM_INFO` on a cheap query) is 257 / 342 instructions, 250 / 339 in
+The null syscall (`SYS_SYSTEM_INFO` on a cheap query) is 211 / 283 instructions, 204 / 280 in
 the kernel:
 
 | Part | x86_64 | riscv64 | Functions |
 |---|---:|---:|---|
 | Entry and exit stubs | 70 | 151 | `syscall_entry`, `seraph_enter_from_user`; `trap_entry`, `trap_dispatch`, `handle_trap` |
-| Finding this CPU's scheduler and thread | 38 | 53 | `scheduler_for`, `scheduler_ptr`, `read_percpu_ptr`, `current_cpu`, `PerCpuScheduler::current`, `current_tcb` |
-| Dispatch and result | 70 | 42 | `dispatch`, `dispatch_in_range`, `index_mask`, `mask_index`, `syscall_nr`, `finish_syscall` |
-| Return-to-user work checks | 40 | 60 | `running_thread_stopped`, `reclaim_deferred_stack`, `drain_deferred_reclaim`, `sole_reference::drain`, `deliver_at_syscall`, `upcall::take`, `upcall::deliver`, `PerCpuScheduler::outranked`, `preempt_if_outranked` |
-| Diagnostic stamps | 13 | 14 | `cpu_diag`, `stamp_syscall_entry`, `note_cpu_syscall` |
-| The handler | 19 | 19 | `sys_system_info`, `TrapFrame::arg`, `TrapFrame::set_return` |
+| Finding this CPU's scheduler and thread | 8 | 8 | `read_percpu_ptr` of `PerCpuData::current` and `PerCpuData::scheduler` |
+| Dispatch and result | 72 | 38 | `dispatch`, `dispatch_in_range`, `index_mask`, `mask_index`, `finish_syscall` |
+| Return-to-user work checks | 27 | 58 | `running_thread_stopped`, `reclaim_deferred_stack`, `drain_deferred_reclaim`, `sole_reference::drain`, `deliver_at_syscall`, `upcall::take`, `upcall::deliver`, `PerCpuScheduler::outranked`, `preempt_if_outranked` |
+| Diagnostic stamps | 4 | 2 | `stamp_syscall_entry` |
+| The handler | 17 | 18 | `sys_system_info`, `TrapFrame::arg` |
+| Functions below 3 each | 6 | 5 | `syscall_nr`, `note_cpu_syscall`, `TrapFrame::set_return` and the like |
 
-The current-thread lookup goes through the scheduler table on every access, several times per
-syscall; reading it through one per-CPU pointer saved 32 / 53 per syscall (dev) in the
-prototype for PR #1507. The sole-reference drain that #1528 found is the 3 instructions per
-syscall left after PR #1530. Each return-work check reaches its own per-CPU or per-thread
-state, so the checks cost 40 / 60 before any work is pending.
+The current thread, this CPU's scheduler and its diagnostic record are each one load relative to
+the per-CPU pointer
+([scheduling-internals.md](scheduling-internals.md#per-cpu-current-thread) § Per-CPU Current
+Thread). The sole-reference drain that #1528 found is the 3 instructions per syscall left after
+PR #1530. Each return-work check reaches its own per-CPU or per-thread state, so the checks, the
+wake-preemption test among them, cost 27 / 58 before any work is pending.
 
 ### Context Switch and IPC
 
@@ -87,24 +89,24 @@ only when the CPU's TSS does not already hold it at its generation (`gdt::load_i
 [capability-internals.md](capability-internals.md) § IoPort Bindings). Once the TSS holds the
 bound bench thread's bitmap, a row that switches twice (`ktest.ipc_round_trip`,
 `ktest.notification_roundtrip`, `ktest.context_switch_pair`) spends 5 instructions in
-`load_iopb` and copies nothing, so x86_64's context-switch pair, 1165, is below riscv64's 1389,
+`load_iopb` and copies nothing, so x86_64's context-switch pair, 1061, is below riscv64's 1245,
 which has no bitmap.
 
 An IPC message is built in place in each thread's `ipc_msg`, and a rendezvous, a reply or a
 fault delivery copies only its counted data words and capability slots, so no row zeroes or
 moves a whole 576-byte `Message`.
 
-On riscv64 `__copy_user` copies one byte per seven instructions: about 28700 of the 32204 of
-`ktest.thread_read_mem_page`, against 5389 on x86_64, and about 1590 of the IPC round trip
+On riscv64 `__copy_user` copies one byte per seven instructions: about 28700 of the 32129 of
+`ktest.thread_read_mem_page`, against 5334 on x86_64, and about 1590 of the IPC round trip
 with seven words, the one whose payload passes the register words.
 
 ### Other Rows
 
 - `ktest.aspace_harvest_*`: the leaf walker calls its visitor through `dyn FnMut` once per
-  slot; on x86_64 the retpoline thunk alone is 640 of 4382 (all accessed) and 480 of 3390
+  slot; on x86_64 the retpoline thunk alone is 640 of 4319 (all accessed) and 480 of 3327
   (none).
 - `ktest.thread_lifecycle`: two kernel entropy draws (the TCB's random field, and the CSpace-id
-  epoch redraw on free) run Keccak-f[1600] four times, 25256 of 59112 / 25060 of 83971; the
+  epoch redraw on free) run Keccak-f[1600] four times, 25256 of 58482 / 25060 of 83106; the
   kernel-stack paint at creation and the depth scan at teardown are 8223 / 15780 more, and the
   zeroing of new and freed memory 7173 / 21400.
 
@@ -113,33 +115,34 @@ with seven words, the one whose payload passes the register words.
 The benchmark cell gates the release profile (opt-level 2, LTO, one codegen
 unit), for its ktest rows, ubench and fsbench alike, so one rule states what the cell measures:
 the build that runs on hardware. Dev (opt-level 2 with debug assertions and overflow checks,
-without LTO) adds 8 % to 59 % to a path on x86_64, unevenly, so a dev count does not predict
+without LTO) adds 5 % to 59 % to a path on x86_64, unevenly, so a dev count does not predict
 the release count and a cut ranked on dev is mis-ranked:
 
 | Path (x86_64) | Dev | Release | Dev / release |
 |---|---:|---:|---:|
-| `ktest.null_syscall_roundtrip` | 326 | 257 | 1.27 |
-| `ktest.ipc_round_trip words=0` | 3936 | 2493 | 1.58 |
-| `ktest.notification_roundtrip` | 3539 | 2616 | 1.35 |
-| `ktest.cap_info_lookup` | 520 | 368 | 1.41 |
-| `ktest.mem_map_unmap` | 2591 | 1851 | 1.40 |
-| `ktest.aspace_harvest_all_accessed pages=32` | 4747 | 4382 | 1.08 |
-| `ktest.thread_lifecycle` | 93952 | 59112 | 1.59 |
-| `ktest.context_switch_pair` | 1652 | 1165 | 1.42 |
-| `ktest.tlb_shootdown_unmap` | 1000 | 677 | 1.48 |
+| `ktest.null_syscall_roundtrip` | 269 | 211 | 1.27 |
+| `ktest.ipc_round_trip words=0` | 3726 | 2339 | 1.59 |
+| `ktest.notification_roundtrip` | 3249 | 2409 | 1.35 |
+| `ktest.cap_info_lookup` | 458 | 321 | 1.43 |
+| `ktest.mem_map_unmap` | 2418 | 1743 | 1.39 |
+| `ktest.aspace_harvest_all_accessed pages=32` | 4629 | 4319 | 1.07 |
+| `ktest.thread_lifecycle` | 93060 | 58482 | 1.59 |
+| `ktest.context_switch_pair` | 1514 | 1061 | 1.43 |
+| `ktest.tlb_shootdown_unmap` | 913 | 623 | 1.47 |
 
 Dev's excess is debug assertions (`debug_assert_kernel_entry_flags`, `read_rflags`), overflow
-checks, and calls that LTO inlines in release: the current-thread lookup alone is 75 (dev) and 38
-(release) of the x86_64 null syscall. The accepted cost is that a regression only dev runs (a
-debug assertion added to a hot path) is not gated; it costs nothing on hardware, and the
-functional cells still build and boot dev. The cell's icount baselines and the host-mode bands
-are taken on the release build ([docs/testing.md](../../../docs/testing.md) § Benchmarks).
+checks, and calls that LTO inlines in release: the per-CPU reads of the current thread and
+scheduler are 18 (dev) and 8 (release) of the x86_64 null syscall. The accepted cost is that a
+regression only dev runs (a debug assertion added to a hot path) is not gated; it costs nothing
+on hardware, and the functional cells still build and boot dev. The cell's icount baselines and
+the host-mode bands are taken on the release build
+([docs/testing.md](../../../docs/testing.md) § Benchmarks).
 
 ## Ranked Cuts
 
 Ranked on the release account by the instructions each removes from the gated rows. Each cut is
 its own Issue, under #1531. A design change went to the maintainer as a pick before its Issue
-was filed, and each of the four here is approved; a local cut needs no pick. Each reports the
+was filed, and each of the three here is approved; a local cut needs no pick. Each reports the
 host-mode figure under KVM beside its counts, and a cut that saves instructions but costs time
 is not taken.
 
@@ -147,12 +150,11 @@ is not taken.
 |---:|---|---|---|
 | 1 | #1540: copy user memory a word at a time on riscv64 | local | none / about 24000 on `thread_read_mem_page`, 1300 on IPC with 7 words |
 | 2 | #1541: build IPC messages in place, copying only the valid words (taken: PR #1567) | local | 384 / 1570 per IPC round trip, measured |
-| 3 | #1547: read the current thread and per-CPU state through one per-CPU pointer (after PR #1507) | design | about 39 / 53 per kernel entry, three quarters of the 52 / 70 the lookup costs per entry across the gated rows |
-| 4 | #1548: test the return-to-user work with one per-CPU word (after PR #1507) | design | about 30 / 50 per return to user |
-| 5 | #1549: dispatch syscalls through one masked table index | design | about 50 / 30 per syscall |
-| 6 | #1542: monomorphise the page-table leaf walker's visitor | local | about 700 / not estimated (no thunk) per harvest of 32 pages |
-| 7 | #1550: serve small kernel entropy draws from one squeezed block | design | about 24000 / 24000 per thread lifecycle |
-| 8 | #1543: scan kernel stacks a line at a time, and paint them with wider stores | local | about 4700 / 12000 per thread lifecycle |
+| 3 | #1548: test the return-to-user work with one per-CPU word (after PR #1507) | design | about 30 / 50 per return to user |
+| 4 | #1549: dispatch syscalls through one masked table index | design | about 50 / 30 per syscall |
+| 5 | #1542: monomorphise the page-table leaf walker's visitor | local | about 700 / not estimated (no thunk) per harvest of 32 pages |
+| 6 | #1550: serve small kernel entropy draws from one squeezed block | design | about 24000 / 24000 per thread lifecycle |
+| 7 | #1543: scan kernel stacks a line at a time, and paint them with wider stores | local | about 4700 / 12000 per thread lifecycle |
 
 Not taken:
 

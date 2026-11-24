@@ -481,8 +481,10 @@ static mut OWED_WAKE_LAST: [(*mut ThreadControlBlock, u8); OWED_WAKE_MAX] =
 static mut OWED_WAKE_LAST_COUNT: usize = 0;
 
 /// One CPU's softlockup-watchdog breadcrumbs, held in the `cpu_count`-sized
-/// `CPU_DIAG` slab. Each field is written by its own CPU only and read by the
-/// watchdog on another. Diagnostic-only: no field gates control flow.
+/// `CPU_DIAG` slab. Each field is written by its own CPU only, which reaches
+/// its record through `PerCpuData::diag` ([`this_cpu_diag`]), and read by
+/// the watchdog on another ([`cpu_diag`]). Diagnostic-only: no field gates
+/// control flow.
 pub(crate) struct CpuDiag
 {
     /// `timer::current_tick()` stamp of this CPU's most recent `timer_tick`
@@ -530,14 +532,36 @@ pub(crate) struct CpuDiag
 }
 
 /// Base of the `CPU_DIAG` slab: `CPU_COUNT` [`CpuDiag`] records, null until
-/// `init_per_cpu_storage` (Phase 4). Breadcrumbs stored before then are
-/// dropped, which loses nothing: no watchdog runs that early.
+/// `init_per_cpu_storage` (Phase 4). The watchdog's reads of another CPU's
+/// record ([`cpu_diag`]) go through it; a CPU's own stamps go through its
+/// `PerCpuData::diag` ([`this_cpu_diag`]).
 #[cfg(not(test))]
 static CPU_DIAG_PTR: core::sync::atomic::AtomicPtr<CpuDiag> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-/// CPU `cpu`'s breadcrumb record, or `None` before the slab exists or for an
-/// index at or past `CPU_COUNT`.
+/// This CPU's breadcrumb record, read through `PerCpuData::diag` with one
+/// GS- or `tp`-relative load.
+///
+/// Every stamp runs on a CPU whose per-CPU pointer is installed: the syscall
+/// entry, the timer tick, a protocol spin and a contended bare lock all run
+/// after Phase 5 (`percpu::init_bsp`, or `percpu::init_ap` before an AP runs
+/// kernel code), which follows Phase 4's write of the field, as every
+/// [`crate::arch::current::cpu::current_cpu`] read does.
+#[cfg(not(test))]
+#[inline]
+fn this_cpu_diag() -> &'static CpuDiag
+{
+    use crate::percpu::PERCPU_DIAG_OFFSET as DIAG;
+    // SAFETY: the per-CPU pointer is installed (above), and the offset is
+    // that of the `diag` field.
+    let diag = unsafe { crate::arch::current::cpu::read_percpu_ptr::<CpuDiag, DIAG>() };
+    // SAFETY: percpu::init_storage named this CPU's record of the slab, whose
+    // records are initialised before it and never freed.
+    unsafe { &*diag }
+}
+
+/// CPU `cpu`'s breadcrumb record, for the watchdog's reads of another CPU's,
+/// or `None` before the slab exists or for an index at or past `CPU_COUNT`.
 #[cfg(not(test))]
 fn cpu_diag(cpu: usize) -> Option<&'static CpuDiag>
 {
@@ -610,24 +634,18 @@ pub const SPIN_SITE_RELEASE_SETTLE: u32 = 13;
 #[cfg(not(test))]
 pub fn spin_site_enter(site: u32)
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if let Some(diag) = cpu_diag(cpu)
-    {
-        diag.spin_site
-            .store(site, core::sync::atomic::Ordering::Relaxed);
-    }
+    this_cpu_diag()
+        .spin_site
+        .store(site, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Clear the current CPU's spin-site breadcrumb on gate exit.
 #[cfg(not(test))]
 pub fn spin_site_exit()
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if let Some(diag) = cpu_diag(cpu)
-    {
-        diag.spin_site
-            .store(SPIN_SITE_NONE, core::sync::atomic::Ordering::Relaxed);
-    }
+    this_cpu_diag()
+        .spin_site
+        .store(SPIN_SITE_NONE, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Human-readable name for a spin-site code, for the watchdog dump.
@@ -738,14 +756,12 @@ const LOCK_WAIT_NONE: u32 = 0;
 /// [`CpuDiag`] stamp). Called with interrupts masked (syscall entry), so the
 /// CPU index is stable.
 #[cfg(not(test))]
+#[inline]
 pub fn note_cpu_syscall(nr: u64)
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if let Some(diag) = cpu_diag(cpu)
-    {
-        diag.syscall_nr
-            .store(nr, core::sync::atomic::Ordering::Relaxed);
-    }
+    this_cpu_diag()
+        .syscall_nr
+        .store(nr, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Record that the current CPU is spinning for the lock of kind `kind` whose
@@ -756,14 +772,11 @@ pub fn note_cpu_syscall(nr: u64)
 #[cfg(not(test))]
 pub fn lock_wait_enter(kind: LockKind, word: usize)
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if let Some(diag) = cpu_diag(cpu)
-    {
-        diag.lock_wait_word
-            .store(word as u64, core::sync::atomic::Ordering::Relaxed);
-        diag.lock_wait_kind
-            .store(kind as u32, core::sync::atomic::Ordering::Release);
-    }
+    let diag = this_cpu_diag();
+    diag.lock_wait_word
+        .store(word as u64, core::sync::atomic::Ordering::Relaxed);
+    diag.lock_wait_kind
+        .store(kind as u32, core::sync::atomic::Ordering::Release);
 }
 
 /// Clear the current CPU's lock-wait breadcrumb once the lock is acquired:
@@ -772,14 +785,11 @@ pub fn lock_wait_enter(kind: LockKind, word: usize)
 #[cfg(not(test))]
 pub fn lock_wait_exit()
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if let Some(diag) = cpu_diag(cpu)
-    {
-        diag.lock_wait_kind
-            .store(LOCK_WAIT_NONE, core::sync::atomic::Ordering::Release);
-        diag.lock_wait_word
-            .store(0, core::sync::atomic::Ordering::Relaxed);
-    }
+    let diag = this_cpu_diag();
+    diag.lock_wait_kind
+        .store(LOCK_WAIT_NONE, core::sync::atomic::Ordering::Release);
+    diag.lock_wait_word
+        .store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Current CPU index plus one, for lock-holder stamps (0 means no holder).
@@ -789,39 +799,27 @@ pub fn cpu_stamp() -> u32
     crate::arch::current::cpu::current_cpu().wrapping_add(1)
 }
 
-/// This CPU's `current`, read through the raw scheduler slot without the
-/// range-checking [`scheduler_for`]; null
-/// before the scheduler storage exists, when the CPU index is out of range,
-/// or before this CPU has dispatched a thread.
+/// The calling thread, read through `PerCpuData::current` with one load
+/// (`percpu::current_thread`): null before `sched::init` names this CPU's
+/// idle thread. A thread preempted after the load and resumed on another CPU
+/// still holds its own TCB, so the pointer names the caller whatever the state
+/// of preemption.
+///
+/// The lock-holder stamps and the preemptible-hold tripwire that read it run
+/// from Phase 7 on, after Phase 5 installed the boot CPU's per-CPU pointer and
+/// before any AP runs kernel code without its own.
 #[cfg(not(test))]
 fn running_tcb_raw() -> *mut thread::ThreadControlBlock
 {
-    let base = SCHEDULERS_PTR.load(core::sync::atomic::Ordering::Acquire);
-    if base.is_null()
-    {
-        return core::ptr::null_mut();
-    }
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if cpu >= CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
-    {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: `scheduler_ptr`'s contract, both parts checked above: the
-    // storage exists (non-null base, published after `CPU_COUNT`) and
-    // `cpu < CPU_COUNT`, which the allocation covers.
-    let slot = unsafe { base.add(cpu) };
-    // SAFETY: the slot is an initialised scheduler; an atomic read of its
-    // `current`.
-    unsafe { (*slot).current() }
+    // SAFETY: the per-CPU pointer is installed (above).
+    unsafe { crate::percpu::current_thread() }
 }
 
 /// `(thread id, syscall number)` of the running thread, for lock-holder
 /// stamps: `(0, u64::MAX)` before this CPU has dispatched a thread (boot),
 /// and `u64::MAX` for a thread outside a syscall — the idle thread (whose
 /// id is an ordinary registry id) or a kernel path entered without a
-/// syscall. Diagnostic only: in the preemptible state
-/// `check_lock_hold_preemptible` reports, the values may describe another
-/// thread (see the safety argument inside).
+/// syscall. Diagnostic only.
 #[cfg(not(test))]
 pub fn holder_info() -> (u32, u64)
 {
@@ -830,21 +828,11 @@ pub fn holder_info() -> (u32, u64)
     {
         return (0, u64::MAX);
     }
-    // `tcb` names the calling thread unless the caller was preempted
-    // between `running_tcb_raw`'s CPU-index read and its load — possible
-    // only in the preemptible state `check_lock_hold_preemptible` exists to
-    // report, where the pointer may then name another CPU's thread, even one
-    // freed since. Every read is a word of the TCB, which lives in a retype
-    // slab or the boot-allocated idle slab — direct-map memory that stays
-    // mapped — so none can fault, and no pointer read from the TCB is
-    // followed. `magic` and `thread_id` are read with volatile loads because
-    // a teardown on another CPU may poison the slot concurrently (its poison
-    // stores are volatile too; the pair is a deliberate race): a freed slot
-    // fails the magic check; a slot already recycled into a new thread
-    // passes it, and the `thread_id` read then names that thread — nothing
-    // orders the two loads against the recycle, so they may even straddle
-    // it. Either way a torn or stale read only changes which branch this
-    // diagnostic takes.
+    // `tcb` is the caller's own TCB, which stays allocated while the caller
+    // runs: a teardown frees a TCB only once it is current on no CPU
+    // (`SPIN_SITE_DEALLOC_NOT_CURRENT`). `magic` and `thread_id` are still
+    // read with volatile loads and the magic checked, so a corrupted TCB only
+    // changes which branch this diagnostic takes and is never what faults.
     // SAFETY: the TCB's words stay mapped, as above.
     let magic_ptr = unsafe { core::ptr::addr_of!((*tcb).magic) };
     // SAFETY: an aligned word of mapped memory; the race with a poison store
@@ -894,27 +882,22 @@ static PREEMPTIBLE_HOLD_REPORTED: core::sync::atomic::AtomicU32 =
 
 /// Whether `tcb` is this CPU's idle TCB. The idle thread never migrates, so
 /// the calling thread is idle exactly when it is its own CPU's idle TCB; a
-/// user thread that migrates between the CPU-index read and the load still
-/// compares unequal to whichever idle TCB is read. Reads `idle` through the
-/// raw scheduler slot, so it may run while a caller up the stack holds a
-/// reference into the same scheduler.
+/// user thread that migrates between the scheduler read and the compare still
+/// compares unequal to whichever idle TCB is read. Reads `idle` through a
+/// shared reference to this CPU's scheduler
+/// ([`crate::percpu::current_scheduler`]), so it may run while a caller up the
+/// stack holds a reference into the same scheduler.
 ///
 /// # Safety
 /// The scheduler storage must be initialised — a non-null
-/// [`running_tcb_raw`] establishes it, since it returns null otherwise.
-/// The CPU index read here is then below `CPU_COUNT` on any CPU executing
-/// kernel code: every online CPU's id is below the published count, and a
-/// caller migrated since `running_tcb_raw` ran is still on an online CPU.
+/// [`running_tcb_raw`] establishes it, since `sched::init` names every CPU's
+/// idle thread after it.
 #[cfg(not(test))]
 unsafe fn is_idle_tcb(tcb: *const thread::ThreadControlBlock) -> bool
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: storage initialised per the caller contract and `cpu` is an
-    // online CPU's index.
-    let sched_ptr = unsafe { scheduler_ptr(cpu) };
-    // SAFETY: the slot is an initialised scheduler; `idle` is written once at
-    // init.
-    let idle = unsafe { (*sched_ptr).idle() };
+    // SAFETY: the per-CPU pointer is installed wherever running_tcb_raw
+    // returned non-null, and percpu::init_storage named this CPU's scheduler.
+    let idle = unsafe { crate::percpu::current_scheduler() }.idle();
     core::ptr::eq(tcb, idle)
 }
 
@@ -1039,7 +1022,7 @@ fn system_has_no_work(cpu_count: usize) -> bool
     (0..cpu_count).all(|cpu| {
         // SAFETY: cpu < cpu_count, which is CPU_COUNT; the scheduler slab
         // exists, since the BSP's `timer_tick`, the only caller's caller, has
-        // already reached its own scheduler through `scheduler_ptr`. The
+        // already reached its own scheduler through `PerCpuData::scheduler`. The
         // scheduler is reached through a shared reference, as every CPU
         // reaches it, and only its atomics are read.
         let sched_ptr = unsafe { scheduler_ptr(cpu) };
@@ -2692,8 +2675,6 @@ fn idle_thread_entry(_cpu_id: u64) -> !
     {
         #[cfg(not(test))]
         {
-            let cpu = crate::arch::current::cpu::current_cpu() as usize;
-
             // Reclaim the objects queued on this CPU (#341): what a thread's
             // self-teardown queued (the thread itself, marked Exited, or the
             // `CSpace` or `AddressSpace` it tore down under itself; see
@@ -2710,20 +2691,19 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             // Done with interrupts enabled, before the halt-decision masking
             // below.
             // SAFETY: idle context on a valid kernel stack.
-            unsafe { crate::cap::object::drain_deferred_reclaim(cpu) };
+            unsafe { crate::cap::object::drain_deferred_reclaim() };
             // A drain pass posts at most `cap::sole_reference::POST_BUDGET`
             // observers. While the run queues are empty, post the rest a pass
             // at a time before the halt decision, so a death that fired more
             // than one pass's worth does not wait for another CPU's drain.
             // Each pass leaves interrupts enabled; the run queues are read
             // without masking, as a hint only.
-            // SAFETY: cpu is this CPU's index, < CPU_COUNT, and the per-CPU
-            // storage is initialised.
-            let idle_sched = unsafe { scheduler_ptr(cpu) };
+            // SAFETY: the idle thread, which never migrates, on a CPU whose
+            // per-CPU pointer is installed.
+            let idle_sched = unsafe { crate::percpu::current_scheduler() };
             while crate::cap::sole_reference::work_pending()
             {
-                // SAFETY: the scheduler slot is initialised for this CPU.
-                let runnable = unsafe { (*idle_sched).has_runnable() };
+                let runnable = idle_sched.has_runnable();
                 if runnable
                 {
                     break;
@@ -2746,11 +2726,7 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             // producer links its thread before it sends the wake IPI, which it
             // always sends rather than consulting a per-CPU idle mask.
             // See core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants.
-            // SAFETY: cpu is this CPU's index, < CPU_COUNT, and the per-CPU
-            // storage is initialised.
-            let sched_ptr = unsafe { scheduler_ptr(cpu) };
-            // SAFETY: scheduler slot is initialised for this CPU.
-            let has_work = unsafe { (*sched_ptr).has_runnable() };
+            let has_work = idle_sched.has_runnable();
 
             if has_work
             {
@@ -2945,6 +2921,11 @@ pub unsafe fn init(cpu_count: u32) -> u32
         let s = unsafe { &*sched_ptr };
         s.set_idle(tcb);
         s.set_current(tcb);
+        // SAFETY: cpu < cpu_count, Phase 4 allocated the per-CPU slab, and
+        // `tcb` is CPU `cpu`'s idle thread, which it runs until its first
+        // dispatch. An AP runs no kernel code yet; the boot CPU's readers before
+        // this store see null (percpu::init_current_thread).
+        unsafe { crate::percpu::init_current_thread(cpu, tcb) };
     }
 
     cpu_count
@@ -3173,7 +3154,7 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     CPU_DIAG_PTR.store(diag_ptr, core::sync::atomic::Ordering::Release);
 
     // Per-CPU arch data (PerCpuData) and APIC-ID slabs.
-    crate::percpu::init_storage(n, sched_ptr, allocator);
+    crate::percpu::init_storage(n, sched_ptr, diag_ptr, allocator);
 
     // Arch-specific per-CPU tables (x86-64 per-AP GDT/TSS, AP IST stacks, and
     // NMI-backtrace storage; riscv64 each CPU's IMSIC identity row, which
@@ -4512,15 +4493,15 @@ impl SpinWarnOnce
 /// self-teardown path) is always observed.
 ///
 /// # Safety
-/// The caller must be the thread running on `this_cpu`, with interrupts or
+/// The caller must be the thread running on this CPU, with interrupts or
 /// preemption disabled so it cannot migrate, and must hold no scheduler
 /// lock.
 #[cfg(not(test))]
-pub(crate) unsafe fn running_thread_stopped(this_cpu: usize) -> bool
+pub(crate) unsafe fn running_thread_stopped() -> bool
 {
-    // SAFETY: this_cpu < MAX_CPUS per contract; scheduler slab initialised.
-    let sched = unsafe { scheduler_for(this_cpu) };
-    let cur = sched.current();
+    // SAFETY: kernel context on a CPU whose per-CPU pointer is installed,
+    // which cannot change under the caller (contract).
+    let cur = unsafe { crate::percpu::current_thread() };
     if cur.is_null()
     {
         return false;
@@ -4537,6 +4518,9 @@ pub(crate) unsafe fn running_thread_stopped(this_cpu: usize) -> bool
     {
         return false;
     }
+    // SAFETY: as for the current_thread read; percpu::init_storage named this
+    // CPU's scheduler.
+    let sched = unsafe { crate::percpu::current_scheduler() };
     // SAFETY: the caller holds no scheduler lock; paired with the unlock_raw
     // below.
     let saved = unsafe { sched.lock.lock_raw() };
@@ -4578,10 +4562,9 @@ unsafe fn mark_bound_threads(
         }
         // Reading our own CPU's `current` needs no lock — only this
         // CPU writes it at dispatch, and we are that running thread.
-        // SAFETY: this_cpu is the running CPU's index (caller contract), so
-        // its scheduler is initialised.
-        let this_sched = unsafe { scheduler_for(this_cpu) };
-        let is_self = core::ptr::eq(tcb, this_sched.current());
+        // SAFETY: the running thread on this CPU, which cannot migrate
+        // (caller contract), whose per-CPU pointer is installed.
+        let is_self = core::ptr::eq(tcb, unsafe { crate::percpu::current_thread() });
         // Cancel any park and commit Exited over it. The retained reason
         // for `CAP_INFO_THREAD_STATE` and late-bound observers is written
         // under the same hold as the Exited commit, so a thread that
@@ -4754,7 +4737,7 @@ pub unsafe fn stop_threads_bound_to(bound: impl Fn(*mut ThreadControlBlock) -> b
     {
         // SAFETY: we are the running thread on this_cpu with preemption
         // disabled; no scheduler lock held.
-        if unsafe { running_thread_stopped(this_cpu) }
+        if unsafe { running_thread_stopped() }
         {
             stopped = true;
             break;
@@ -4820,7 +4803,7 @@ pub unsafe fn wait_until_aspace_inactive(
     {
         // SAFETY: we are the running thread on this_cpu with preemption
         // disabled; no scheduler lock held.
-        if unsafe { running_thread_stopped(this_cpu) }
+        if unsafe { running_thread_stopped() }
         {
             completed = false;
             break;
@@ -6119,11 +6102,10 @@ unsafe fn try_pull_balance(this_cpu: usize)
         return;
     }
 
-    // SAFETY: this_cpu bounded; scheduler slab initialised.
-    let sched_ptr = unsafe { scheduler_ptr(this_cpu) };
-    // SAFETY: the slot holds this CPU's initialised scheduler, reached through
-    // shared references only.
-    let sched = unsafe { &*sched_ptr };
+    // SAFETY: this CPU's timer_tick, whose per-CPU pointer is installed;
+    // init() initialised its scheduler, reached through shared references
+    // only.
+    let sched = unsafe { crate::percpu::current_scheduler() };
     // A busy tick ends an idle stretch: the idle pull's next sample starts over,
     // so its one-tick confirmation never rests on a sample taken before it.
     sched.forget_idle_pull_candidate();
@@ -6192,11 +6174,8 @@ unsafe fn try_pull_idle(this_cpu: usize)
         return;
     }
 
-    // SAFETY: this_cpu bounded; scheduler slab initialised.
-    let sched_ptr = unsafe { scheduler_ptr(this_cpu) };
-    // SAFETY: the slot holds this CPU's initialised scheduler, reached through
-    // shared references only.
-    let sched = unsafe { &*sched_ptr };
+    // SAFETY: as in try_pull_balance.
+    let sched = unsafe { crate::percpu::current_scheduler() };
     if sched.current_load() != 0
     {
         // The idle thread dispatches its own queue at its next check.
@@ -7214,11 +7193,30 @@ impl Outgoing
     }
 }
 
+/// Name `tcb` as the thread running on this CPU: in `sched`'s `current`,
+/// which other CPUs read, and in this CPU's `PerCpuData::current`, which its
+/// own reads take (`percpu::current_thread`), in that order and with
+/// interrupts disabled, so no code on this CPU runs between the two stores
+/// (core/kernel/docs/scheduling-internals.md § Per-CPU Current Thread).
+///
+/// # Safety
+/// `sched` is this CPU's scheduler, its per-CPU pointer is installed, and
+/// interrupts are disabled.
+#[cfg(not(test))]
+#[inline]
+unsafe fn set_running(sched: &PerCpuScheduler, tcb: *mut ThreadControlBlock)
+{
+    sched.set_current(tcb);
+    // SAFETY: the per-CPU pointer is installed and interrupts are disabled
+    // (contract).
+    unsafe { crate::percpu::set_current_thread(tcb) };
+}
+
 /// Select the next thread to run and switch to it.
 ///
 /// Called from `sys_yield`, slice expiry, wake preemption, the parking and
-/// exit paths, and the idle thread. Uses the current CPU's scheduler slot
-/// (indexed by `current_cpu()`).
+/// exit paths, and the idle thread. Uses the current CPU's scheduler, reached
+/// through `PerCpuData::scheduler` ([`crate::percpu::current_scheduler`]).
 ///
 /// `requeue`: [`Requeue::Always`] places the current thread back in the
 /// run queue at its priority, at the tail (slice expiry, yield), and
@@ -7266,12 +7264,11 @@ pub unsafe fn schedule(requeue: Requeue)
         cpu < cpu_count,
         "schedule: current_cpu()={cpu} out of range (CPU_COUNT={cpu_count})"
     );
-    // SAFETY: cpu < CPU_COUNT validated above; scheduler slab initialised by init().
-    let sched_ptr = unsafe { scheduler_ptr(cpu) };
-    // SAFETY: the slot holds this CPU's initialised scheduler. A shared reference:
-    // other CPUs reach this scheduler concurrently, and the run queues are touched
-    // only through its lock-held `unsafe` methods.
-    let sched = unsafe { &*sched_ptr };
+    // SAFETY: kernel context on a CPU whose per-CPU pointer is installed;
+    // percpu::init_storage named its scheduler, initialised by init(). A shared
+    // reference: other CPUs reach this scheduler concurrently, and the run
+    // queues are touched only through its lock-held `unsafe` methods.
+    let sched = unsafe { crate::percpu::current_scheduler() };
 
     // The scheduler lock is taken with lock_raw/unlock_raw below, paired before
     // function return (or before the context switch that may change the stack).
@@ -7639,7 +7636,8 @@ pub unsafe fn schedule(requeue: Requeue)
     // Ready→Running write goes under `next.sched_lock` after the CPU lock is
     // released, so it serialises with enqueue_and_wake / set_state on the same
     // per-TCB lock (a flip here under the CPU lock would data-race them).
-    sched.set_current(next);
+    // SAFETY: `sched` is this CPU's scheduler; interrupts are disabled.
+    unsafe { set_running(sched, next) };
 
     // Capture `current`'s save pointers before dropping the locks.
     let current_state: *mut crate::arch::current::context::SavedState = if current.is_null()
@@ -7758,7 +7756,8 @@ pub unsafe fn schedule(requeue: Requeue)
                 // sched_lock, held here.
                 unsafe { (*next).preferred_cpu = cpu as u32 };
             }
-            sched.set_current(sched.idle());
+            // SAFETY: `sched` is this CPU's scheduler; interrupts are disabled.
+            unsafe { set_running(sched, sched.idle()) };
             // SAFETY: paired with the lock_raw above; interrupts stay disabled.
             unsafe { sched.lock.release_lock_only() };
             let _ = relock;
@@ -7825,7 +7824,8 @@ pub unsafe fn schedule(requeue: Requeue)
             // SAFETY: interrupts are already disabled; paired with the
             // release_lock_only below, which leaves them disabled.
             let relock = unsafe { sched.lock.lock_raw() };
-            sched.set_current(sched.idle());
+            // SAFETY: `sched` is this CPU's scheduler; interrupts are disabled.
+            unsafe { set_running(sched, sched.idle()) };
             // SAFETY: paired with the lock_raw above; interrupts stay disabled.
             unsafe { sched.lock.release_lock_only() };
             let _ = relock;
@@ -8330,15 +8330,13 @@ pub unsafe fn timer_tick()
 
     // Cross-CPU liveness heartbeat (one Relaxed store), plus the BSP
     // cross-check on APs. See [`CpuDiag::tick_heartbeat`].
-    if let Some(diag) = cpu_diag(cpu)
+    let heartbeat = crate::arch::current::timer::current_tick();
+    this_cpu_diag()
+        .tick_heartbeat
+        .store(heartbeat, core::sync::atomic::Ordering::Relaxed);
+    if cpu != 0
     {
-        let heartbeat = crate::arch::current::timer::current_tick();
-        diag.tick_heartbeat
-            .store(heartbeat, core::sync::atomic::Ordering::Relaxed);
-        if cpu != 0
-        {
-            bsp_stall_check(heartbeat);
-        }
+        bsp_stall_check(heartbeat);
     }
 
     // VMGENID observability poll (BSP only): two loads and a 16-byte compare
@@ -8349,11 +8347,9 @@ pub unsafe fn timer_tick()
         crate::entropy::vmgenid::poll_log();
     }
 
-    // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
-    let sched_ptr = unsafe { scheduler_ptr(cpu) };
-    // SAFETY: the slot holds this CPU's initialised scheduler, reached through
-    // shared references only.
-    let sched = unsafe { &*sched_ptr };
+    // SAFETY: an interrupt on a CPU whose per-CPU pointer is installed;
+    // percpu::init_storage named its scheduler, initialised by init().
+    let sched = unsafe { crate::percpu::current_scheduler() };
 
     // SAFETY: Acquire scheduler lock to prevent race with schedule().
     // lock_raw is used so the lock can be dropped before a potential
@@ -8659,12 +8655,10 @@ pub unsafe fn enter() -> !
 {
     use crate::arch::current::trap_frame::TrapFrame;
 
-    // SAFETY: CPU 0 is below CPU_COUNT, and Phase 4 allocated the scheduler slab
-    // (the caller's contract).
-    let sched_ptr = unsafe { scheduler_ptr(0) };
-    // SAFETY: CPU 0's scheduler was initialised at Phase 8 and is only ever
-    // reached through shared references.
-    let sched = unsafe { &*sched_ptr };
+    // SAFETY: the boot CPU, CPU 0, whose per-CPU pointer Phase 5 installed;
+    // its scheduler was initialised at Phase 8 and is only ever reached
+    // through shared references.
+    let sched = unsafe { crate::percpu::current_scheduler() };
     // Dequeue the highest-priority ready thread (init, at INIT_PRIORITY).
     // SAFETY: no other thread exists yet, and the idle APs reach CPU 0's queue
     // only through the load balancer, which runs from `timer_tick` and so not
@@ -8675,9 +8669,22 @@ pub unsafe fn enter() -> !
     {
         crate::fatal("sched::enter: run queue empty — init TCB not enqueued");
     }
+    // Disable interrupts before naming init the running thread, so no
+    // interrupt runs between set_running's two stores, and before entering
+    // user mode.
+    // On x86-64: `cli`; iretq restores IF from the frame's rflags.
+    // On RISC-V: return_to_user sets sstatus to SPP=0/SPIE=1/SIE=0 before
+    // sret; SIE is re-enabled atomically by sret. Disabling here prevents any
+    // stray interrupt from arriving before return_to_user arms sscratch.
+    // SAFETY: single-boot-thread; prevents race before user mode entry.
+    unsafe {
+        crate::arch::current::cpu::disable_interrupts();
+    }
     // Mark as the currently running thread so syscall handlers that call
     // current_tcb() find the correct TCB while init is executing.
-    sched.set_current(tcb);
+    // SAFETY: `sched` is this CPU's (the BSP's) scheduler, and interrupts are
+    // disabled above.
+    unsafe { set_running(sched, tcb) };
     // SAFETY: tcb is the non-null init TCB dequeued above, which nothing else
     // references in this once-only boot context.
     let init_level = unsafe { (*tcb).priority };
@@ -8692,16 +8699,6 @@ pub unsafe fn enter() -> !
 
     // Retrieve the user entry point stored in saved_state at TCB creation.
     let entry_point = init_tcb.saved_state.entry_point();
-
-    // Disable interrupts before entering user mode.
-    // On x86-64: `cli`; iretq restores IF from the frame's rflags.
-    // On RISC-V: return_to_user sets sstatus to SPP=0/SPIE=1/SIE=0 before
-    // sret; SIE is re-enabled atomically by sret. Disabling here prevents any
-    // stray interrupt from arriving before return_to_user arms sscratch.
-    // SAFETY: single-boot-thread; prevents race before user mode entry.
-    unsafe {
-        crate::arch::current::cpu::disable_interrupts();
-    }
 
     // Init's first run here is not a schedule() switch-in, so drop any stale
     // translation of its guard page as one would (`mm::stack_guard`).

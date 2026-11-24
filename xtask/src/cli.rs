@@ -22,6 +22,7 @@ use crate::esp::Knob;
 use crate::qemu::{
     DiskLine, Execution, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
 };
+use crate::svctest_stage::SvctestSet;
 
 args! {
     /// Top-level CLI entry point.
@@ -819,6 +820,17 @@ args! {
         /// the recorded harness (`init` after `cargo xtask build`).
         #[arg(long)]
         pub harness: Option<Harness>,
+
+        /// Stage the svctest boot with the fixture set SET: svctest's recipe
+        /// and the set's fixture recipes copied from `config/svcmgr/tests/`
+        /// into `config/svcmgr/services/`, every other fixture's recipe
+        /// removed from it, the test class files of `config/devmgr/tests/`
+        /// copied into `config/devmgr/classes/`, and the set's record written
+        /// into the staged recipe's `env` line as `SVCTEST_FIXTURES`, which
+        /// svctest checks the image against. Refused when a recipe the set
+        /// needs is missing.
+        #[arg(long, value_name = "SET")]
+        pub svctest: Option<SvctestSet>,
 
         /// Stage a bootloader knob in `\EFI\seraph\`: `nokaslr` boots the
         /// kernel at its deterministic (un-randomized) layout, for GDB and

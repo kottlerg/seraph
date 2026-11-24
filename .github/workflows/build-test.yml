@@ -46,10 +46,11 @@ jobs:
   select:
     # The cells the change owes (`cargo xtask cells`, xtask/README.md): its
     # base is the newest commit of the first-parent history before this one
-    # whose build-test run on a push to master passed, so a cell a red or
-    # unfinished master run left unproven stays owed; a dispatch selects
-    # from its input, or owes every cell. Reading the runs needs
-    # `actions: read`.
+    # whose build-test run on a push to master passed, or on a pull request
+    # passed or has not finished below no red or cancelled run, so a cell a
+    # red or cancelled master run left unproven stays owed and one a master
+    # run is proving is left to it; a dispatch selects from its input, or owes every cell. Reading the
+    # runs needs `actions: read`.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -90,7 +91,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           case "$EVENT" in
-            pull_request|push) base=(--since-green HEAD^1) ;;
+            pull_request) base=(--since-covered HEAD^1) ;;
+            push) base=(--since-green HEAD^1) ;;
             *) if [ -n "$DISPATCHED" ]; then base=(--since "$DISPATCHED"); else base=(); fi ;;
           esac
           cargo xtask cells "${base[@]}" --github-output "$GITHUB_OUTPUT" | tee "$RUNNER_TEMP/cells.log"
@@ -184,9 +186,8 @@ jobs:
           shared-key: kani
 
       # The base: on a pull request or a push the one the select job found,
-      # the newest commit before this one whose master run passed, so a proof
-      # a red master run left unproven stays owed; on a dispatch its input.
-      # None proves every crate.
+      # so a proof a red or cancelled master run left unproven stays owed; on
+      # a dispatch its input. None proves every crate.
       - name: Select the affected crates
         id: select
         env:

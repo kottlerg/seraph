@@ -13,8 +13,13 @@
 //!
 //! The base is a commit (`--since`), or the newest commit of a revision's
 //! first-parent history whose `build-test` run on a push to `master` passed
-//! (`--since-green`), so that a cell a red or unfinished `master` run left
-//! unproven stays owed until a run passes it. `build-test.yml` builds its
+//! (`--since-green`, a push to `master`: a cell a red or unfinished `master`
+//! run left unproven stays owed until a run passes it), or passed, or has
+//! not finished with no newer commit's run red or cancelled
+//! (`--since-covered`, a pull request: a cell a `master` run is still
+//! proving is left to that run, and one a red or cancelled run left
+//! unproven, or took in and failed on, stays owed). The diff is taken from the merge base of the base
+//! and `HEAD` (`affected::changed_files`). `build-test.yml` builds its
 //! validate, build and bench matrices from `--github-output`.
 
 use std::fmt::Write as _;
@@ -35,9 +40,34 @@ const PROFILES: [&str; 2] = ["debug", "release"];
 /// The testers of the validate cells, in the order the workflow lists them.
 const TESTERS: [Tester; 3] = [Tester::Svctest, Tester::Usertest, Tester::Ktest];
 
-/// The history `--since-green` searches, in first-parent commits, and the
-/// passing `master` runs it reads.
+/// The history `--since-green` and `--since-covered` search, in
+/// first-parent commits, and the `master` runs they read.
 const GREEN_SEARCH: u32 = 200;
+
+/// Which `master` runs make a commit a base: the runs that prove the cells
+/// of the change before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Proving
+{
+    /// A run that passed (`--since-green`).
+    Passed,
+    /// A run that passed, or one that has not finished with no red or
+    /// cancelled run on a newer commit (`--since-covered`).
+    PassedOrRunning,
+}
+
+impl Proving
+{
+    /// How the selection's log names the base this way gives.
+    fn describe(self) -> &'static str
+    {
+        match self
+        {
+            Self::Passed => "passed",
+            Self::PassedOrRunning => "passed, or has not finished below no red or cancelled run",
+        }
+    }
+}
 
 /// What a change owes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,12 +166,13 @@ fn fuzz_input(workspace: &Workspace, changed: &[String]) -> Result<Option<String
 /// Entry point for `cargo xtask cells`.
 pub fn run(ctx: &BuildContext, args: &CellsArgs) -> Result<()>
 {
-    let base = match (&args.since, &args.since_green)
+    let base = match (&args.since, &args.since_green, &args.since_covered)
     {
-        (Some(commit), None) => Some((commit.clone(), format!("--since {commit}"))),
-        (None, Some(rev)) => green_base(&ctx.root, rev),
-        (None, None) => None,
-        (Some(_), Some(_)) => bail!("give --since or --since-green, not both"),
+        (Some(commit), None, None) => Some((commit.clone(), format!("--since {commit}"))),
+        (None, Some(rev), None) => green_base(&ctx.root, rev, Proving::Passed),
+        (None, None, Some(rev)) => green_base(&ctx.root, rev, Proving::PassedOrRunning),
+        (None, None, None) => None,
+        _ => bail!("give one of --since, --since-green and --since-covered"),
     };
     let selection = select(&ctx.root, base)?;
     print!("{}", report(&selection));
@@ -218,35 +249,36 @@ fn most_demanding(placed: &[(String, Placed)]) -> Option<&(String, Placed)>
     })
 }
 
-/// The base `--since-green rev` names: the newest commit of `rev`'s
-/// first-parent history whose `build-test` run on a push to `master` passed,
-/// with how it was chosen; `None`, after a warning, when the history or the
-/// runs cannot be read or hold no such commit, so the change owes every cell.
-fn green_base(root: &Path, rev: &str) -> Option<(String, String)>
+/// The base `--since-green rev` (`proving` [`Proving::Passed`]) or
+/// `--since-covered rev` names: the newest commit of `rev`'s first-parent
+/// history with a `build-test` run on a push to `master` that `proving`
+/// counts, with how it was chosen; `None`, after a warning, when the history
+/// or the runs cannot be read or hold no such commit, so the change owes
+/// every cell.
+fn green_base(root: &Path, rev: &str, proving: Proving) -> Option<(String, String)>
 {
     let found = first_parents(root, rev).and_then(|history| {
-        let green = passing_master_runs(root)?;
-        Ok(newest_green(&history, &green).cloned())
+        let runs = master_runs(root)?;
+        Ok(base_commit(&history, &runs, proving).cloned())
     });
+    let how = proving.describe();
     match found
     {
         Ok(Some(commit)) => Some((
             commit,
-            format!("the newest commit of {rev}'s first-parent history whose master run passed"),
+            format!("the newest commit of {rev}'s first-parent history whose master run {how}"),
         )),
         Ok(None) =>
         {
             println!(
                 "WARNING: no commit of {rev}'s last {GREEN_SEARCH} first-parent commits has a \
-                 passing master run; every cell is owed"
+                 master run that {how}; every cell is owed"
             );
             None
         }
         Err(e) =>
         {
-            println!(
-                "WARNING: the passing master runs could not be read ({e:#}); every cell is owed"
-            );
+            println!("WARNING: the master runs could not be read ({e:#}); every cell is owed");
             None
         }
     }
@@ -261,9 +293,9 @@ fn first_parents(root: &Path, rev: &str) -> Result<Vec<String>>
     Ok(out.lines().map(str::to_owned).collect())
 }
 
-/// The head commits of the newest passing `build-test` runs on pushes to
-/// `master`.
-fn passing_master_runs(root: &Path) -> Result<Vec<String>>
+/// The newest `build-test` runs on pushes to `master`, as `gh run list`
+/// gives each: its head commit, status and conclusion.
+fn master_runs(root: &Path) -> Result<json::Value>
 {
     let limit = GREEN_SEARCH.to_string();
     let runs = crate::gh::json(
@@ -277,30 +309,85 @@ fn passing_master_runs(root: &Path) -> Result<Vec<String>>
             "master",
             "--event",
             "push",
-            "--status",
-            "success",
             "--limit",
             &limit,
             "--json",
-            "headSha",
+            "headSha,status,conclusion",
         ],
     )?;
-    let json::Value::Array(runs) = runs
-    else
+    if !matches!(runs, json::Value::Array(_))
     {
         bail!("gh run list returned no list");
-    };
-    Ok(runs
-        .iter()
-        .filter_map(|run| run.get("headSha").and_then(json::Value::as_str))
-        .map(str::to_owned)
-        .collect())
+    }
+    Ok(runs)
 }
 
-/// The first commit of `history` (newest first) that `green` holds.
-fn newest_green<'a>(history: &'a [String], green: &[String]) -> Option<&'a String>
+/// What a commit's newest `master` run proved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunState
 {
-    history.iter().find(|commit| green.contains(commit))
+    /// It concluded `success`.
+    Passed,
+    /// It has not finished.
+    Running,
+    /// It failed, was cancelled or was skipped: it proved nothing.
+    Unproven,
+    /// The commit has no run.
+    None,
+}
+
+/// The state of the newest run of `commit` in `runs` (`gh run list`'s list,
+/// newest first).
+fn run_state(runs: &[json::Value], commit: &str) -> RunState
+{
+    let Some(run) = runs
+        .iter()
+        .find(|run| run.get("headSha").and_then(json::Value::as_str) == Some(commit))
+    else
+    {
+        return RunState::None;
+    };
+    if run.get("status").and_then(json::Value::as_str) != Some("completed")
+    {
+        RunState::Running
+    }
+    else if run.get("conclusion").and_then(json::Value::as_str) == Some("success")
+    {
+        RunState::Passed
+    }
+    else
+    {
+        RunState::Unproven
+    }
+}
+
+/// The first commit of `history` (newest first) whose run in `runs`
+/// (`gh run list`'s list) `proving` counts: one that concluded `success`,
+/// and with [`Proving::PassedOrRunning`] one that has not finished, unless a
+/// newer commit of `history` has a red, cancelled or skipped run. A run that
+/// proved nothing leaves its commit's change owed, and a running commit below
+/// it too: the newer commit's push run took that change in and failed, so
+/// the running commit's own run is the only one left to prove it, and it may
+/// still fail.
+fn base_commit<'a>(
+    history: &'a [String],
+    runs: &json::Value,
+    proving: Proving,
+) -> Option<&'a String>
+{
+    let runs = runs.as_array().map_or(&[][..], Vec::as_slice);
+    let mut below_unproven = false;
+    history.iter().find(|commit| match run_state(runs, commit)
+    {
+        RunState::Passed => true,
+        RunState::Running => proving == Proving::PassedOrRunning && !below_unproven,
+        RunState::Unproven =>
+        {
+            below_unproven = true;
+            false
+        }
+        RunState::None => false,
+    })
 }
 
 /// The tester's name as the workflow's matrix writes it.
@@ -616,20 +703,112 @@ mod tests
         }
     }
 
+    /// `gh run list`'s list of runs, newest first, from each commit's status
+    /// and conclusion.
+    fn runs(states: &[(&str, &str, &str)]) -> json::Value
+    {
+        let list: Vec<String> = states
+            .iter()
+            .map(|(sha, status, conclusion)| {
+                format!(r#"{{"headSha":"{sha}","status":"{status}","conclusion":"{conclusion}"}}"#)
+            })
+            .collect();
+        json::parse(&format!("[{}]", list.join(","))).unwrap()
+    }
+
+    fn history(commits: &[&str]) -> Vec<String>
+    {
+        commits.iter().map(|c| (*c).to_owned()).collect()
+    }
+
     // Defect caught: the base taken from a red or unfinished run's commit, so
     // the cells it left unproven are owed by no later run, or from an older
     // passing commit than the newest.
     #[test]
     fn the_green_base_is_the_newest_commit_with_a_passing_master_run()
     {
-        let history: Vec<String> = ["c4", "c3", "c2", "c1"].map(str::to_owned).to_vec();
-        let green: Vec<String> = ["c1", "c2", "x9"].map(str::to_owned).to_vec();
+        let history = history(&["c4", "c3", "c2", "c1"]);
+        let passed = runs(&[
+            ("x9", "completed", "success"),
+            ("c2", "completed", "success"),
+            ("c1", "completed", "success"),
+        ]);
         assert_eq!(
-            newest_green(&history, &green).map(String::as_str),
+            base_commit(&history, &passed, Proving::Passed).map(String::as_str),
             Some("c2")
         );
-        let none: Vec<String> = vec!["x9".to_owned()];
-        assert_eq!(newest_green(&history, &none), None);
+        let none = runs(&[("x9", "completed", "success")]);
+        assert_eq!(base_commit(&history, &none, Proving::Passed), None);
+        assert_eq!(base_commit(&history, &none, Proving::PassedOrRunning), None);
+    }
+
+    // Defect caught: a pull request charged the change of a master commit
+    // whose own run is still proving it (a run started minutes after a merge
+    // re-proved the whole merge, the workflow among its files, so every proof
+    // crate); or a red or cancelled run's commit taken as a base, so the
+    // cells it left unproven are owed by no later run; or a running commit
+    // below a red or cancelled one taken as a base, so its change, which the
+    // red run took in and failed on, merges unproven if its own run then
+    // fails; or a push to master counting a run that has not finished, which
+    // breaks master's own chain of proof.
+    #[test]
+    fn a_pull_request_leaves_a_running_master_commit_to_its_run()
+    {
+        let base = |states: &[(&str, &str, &str)], proving| {
+            let commits: Vec<&str> = states.iter().map(|(sha, _, _)| *sha).collect();
+            base_commit(&history(&commits), &runs(states), proving).cloned()
+        };
+        // A running tip, above a red commit and a running one: the tip's own
+        // push run took in both.
+        let running_tip = [
+            ("c4", "in_progress", ""),
+            ("c3", "completed", "failure"),
+            ("c2", "queued", ""),
+            ("c1", "completed", "success"),
+        ];
+        assert_eq!(base(&running_tip, Proving::Passed).as_deref(), Some("c1"));
+        assert_eq!(
+            base(&running_tip, Proving::PassedOrRunning).as_deref(),
+            Some("c4")
+        );
+        // A red or cancelled tip, above running commits: their change stays
+        // owed.
+        for conclusion in ["failure", "cancelled", "skipped"]
+        {
+            let unproven_tip = [
+                ("c4", "completed", conclusion),
+                ("c3", "in_progress", ""),
+                ("c2", "queued", ""),
+                ("c1", "completed", "success"),
+            ];
+            assert_eq!(
+                base(&unproven_tip, Proving::PassedOrRunning).as_deref(),
+                Some("c1"),
+                "{conclusion}"
+            );
+            assert_eq!(base(&unproven_tip, Proving::Passed).as_deref(), Some("c1"));
+        }
+        // A red tip above a passed commit.
+        let red_tip = [
+            ("c2", "completed", "failure"),
+            ("c1", "completed", "success"),
+        ];
+        assert_eq!(
+            base(&red_tip, Proving::PassedOrRunning).as_deref(),
+            Some("c1")
+        );
+        // A commit with no run yet is no base, and does not hide a running
+        // one below it.
+        let unqueued_runs = runs(&[("c2", "in_progress", ""), ("c1", "completed", "success")]);
+        assert_eq!(
+            base_commit(
+                &history(&["c3", "c2", "c1"]),
+                &unqueued_runs,
+                Proving::PassedOrRunning
+            )
+            .map(String::as_str),
+            Some("c2")
+        );
     }
 
     // Defect caught: the kani job measuring its crates from another base
@@ -659,6 +838,27 @@ mod tests
         assert!(kani.contains("\n    needs: select\n"), "{kani}");
         assert!(kani.contains("${{ needs.select.outputs.base }}"), "{kani}");
         assert!(!kani.contains("github.event.before"), "{kani}");
+    }
+
+    // Defect caught: a pull request's base found as a push's is, so a run
+    // started while master's tip is still running re-proves that tip's whole
+    // change; or a push's found as a pull request's is, so master's own runs
+    // leave a commit whose run then fails unproven.
+    #[test]
+    fn a_pull_request_and_a_push_find_their_bases_apart()
+    {
+        let workflow = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/build-test.yml"),
+        )
+        .unwrap();
+        assert!(
+            workflow.contains("\n            pull_request) base=(--since-covered HEAD^1) ;;\n"),
+            "{workflow}"
+        );
+        assert!(
+            workflow.contains("\n            push) base=(--since-green HEAD^1) ;;\n"),
+            "{workflow}"
+        );
     }
 
     // Defect caught: a cell or bench boot that builds its own tree, runs a

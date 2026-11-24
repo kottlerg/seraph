@@ -301,9 +301,10 @@ one, until a later request succeeds. The pure decisions are
 
 **Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a badge without
 `SWAP_AUTHORITY`, `LABEL_VERSION_MISMATCH` when `data[0]` differs from vfsd's
-`VFSD_LABELS_VERSION`, `NO_MOUNT` when no held disk carries a swap partition or two tie at the
-highest priority, and `IO_ERROR` when the registration, the revoke of the previous holder's cap,
-or the derivation fails).
+`VFSD_LABELS_VERSION`, `NO_MOUNT` when the swap role resolves to no partition (none of the swap
+type on the boot disk, two there tied at the highest priority, or the partition the statement names
+not on the disk it binds it to, of another type there, or there twice), and `IO_ERROR` when the
+registration, the revoke of the previous holder's cap, or the derivation fails).
 
 ---
 

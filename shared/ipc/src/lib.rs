@@ -892,7 +892,7 @@ impl IpcMessageBuilder
 /// caller has insufficient rights (`GRANT` missing on a cap-bearing call),
 /// a cap slot is stale or Null (`InvalidCapability`), a cap slot is
 /// repeated in the message (`InvalidArgument`), a cap slot is pinned by an
-/// in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer
+/// in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability transfer, or range split
 /// (`InvalidState`), a cap's object has its reference count at its 2^30
 /// ceiling (`QuotaExceeded`), no capability with the Receive right on the
 /// endpoint is left, at the call or while it was queued (`NoReceiver`), or the
@@ -1103,8 +1103,8 @@ pub unsafe fn ipc_try_recv(ep: u64, ipc_buf: *mut u64) -> Result<IpcMessage, i64
 /// all-or-nothing with the reply. An `Err` return consumes the pending
 /// reply either way: when a caller was claimed it has already been woken
 /// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label (a reply cap slot
-/// stale, repeated, pinned by an in-flight revoke, move, or IPC capability
-/// transfer, naming an object at its reference ceiling, or unacceptable to
+/// stale, repeated, pinned by an in-flight revoke, move, IPC capability
+/// transfer, or range split, naming an object at its reference ceiling, or unacceptable to
 /// its `CSpace`), and when none was pending
 /// there is nothing to wake — in both cases the reply must not be retried.
 ///
@@ -1116,8 +1116,8 @@ pub unsafe fn ipc_try_recv(ep: u64, ipc_buf: *mut u64) -> Result<IpcMessage, i64
 /// Returns a negative `i64` error code: `InvalidCapability` (no pending
 /// reply target, or a reply cap slot is stale or Null), `InvalidArgument`
 /// (a cap slot repeated in the reply), `InvalidState` (a reply cap slot is
-/// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
-/// transfer), `QuotaExceeded` (the caller's `CSpace` directory cannot accept
+/// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability
+/// transfer, or range split), `QuotaExceeded` (the caller's `CSpace` directory cannot accept
 /// the reply caps, or a reply cap's object has its reference count at its
 /// 2^30 ceiling), or `OutOfMemory` (the caller's `CSpace` slot pool cannot
 /// back them). The reply never blocks, so it never returns

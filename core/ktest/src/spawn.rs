@@ -113,7 +113,7 @@ pub unsafe fn child_args<T: Copy>(arg: u64) -> T
 /// names no cap), so a handle is deleted once, and the drop never deletes a
 /// stale handle a recycled slot's wrapped generation would alias to another
 /// cap. Every other refusal leaves the cap in place (`InvalidState` for a
-/// revoke, move, or IPC transfer in flight on the slot, `Interrupted` for a
+/// revoke, move, IPC transfer, or range split in flight on the slot, `Interrupted` for a
 /// delete a concurrent derive cut short; `core/kernel/docs/syscalls.md`
 /// § `SYS_CAP_REVOKE` and § `SYS_CAP_DELETE`), so the field keeps it and the
 /// drop tries the delete again. A zero field holds nothing:

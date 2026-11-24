@@ -397,24 +397,20 @@ when the message carries capabilities.
 `data_count` above `MSG_REGS_DATA_MAX` or `cap_count` > 0 with no IPC buffer page registered;
 a `data_count` or `cap_count` above its maximum is clamped, not refused),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
-slot is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
-transfer), `QuotaExceeded` (a cap's object has its reference count at its 2^30 ceiling),
-`NoReceiver` (no capability with the Receive right on the endpoint exists when the call
-begins, or the last one goes while the call is queued and not yet received),
-`Interrupted` (the call was cancelled while blocked, including by the receiving thread
-receiving again before it replied; see `SYS_IPC_RECV`), `WouldBlock` (the timeout elapsed
-before the reply). Cap-slot
-problems are rejected before the caller blocks; a refusal that arises only
-afterwards degrades to delivery with zero caps (the caller keeps its
-capabilities; see [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
-A capability whose derived children take more than one lock
-hold to migrate is moved in batches after the message commits (see
-[capability-internals.md](capability-internals.md) § Move); if an ancestor's
-revoke frees it meanwhile it arrives as handle 0 (the permanently null
-slot), as it does when the receiver's CSpace is torn down meanwhile — the
-sender then keeps it; if a concurrent deriver keeps its child list growing
-past the batch backstop it arrives live while the sender's slot survives as
-its derivation parent.
+slot is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability
+transfer, or range split), `QuotaExceeded` (a cap's object has its reference count at its 2^30
+ceiling), `NoReceiver` (no capability with the Receive right on the endpoint exists when the call
+begins, or the last one goes while the call is queued and not yet received), `Interrupted` (the call
+was cancelled while blocked, including by the receiving thread receiving again before it replied;
+see `SYS_IPC_RECV`), `WouldBlock` (the timeout elapsed before the reply). Cap-slot problems are
+rejected before the caller blocks; a refusal that arises only afterwards degrades to delivery with
+zero caps (the caller keeps its capabilities; see [ipc-design.md](../../../docs/ipc-design.md) §
+Message Format). A capability whose derived children take more than one lock hold to migrate is
+moved in batches after the message commits (see [capability-internals.md](capability-internals.md) §
+Move); if an ancestor's revoke frees it meanwhile it arrives as handle 0 (the permanently null
+slot), as it does when the receiver's CSpace is torn down meanwhile — the sender then keeps it; if a
+concurrent deriver keeps its child list growing past the batch backstop it arrives live while the
+sender's slot survives as its derivation parent.
 
 ---
 
@@ -461,7 +457,7 @@ cap block.
 stale), `InvalidArgument` (a cap slot repeated in one reply, or `data_count` above
 `MSG_REGS_DATA_MAX` or `cap_count` > 0 with no IPC buffer page registered), `InvalidAddress`
 (registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
-pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer),
+pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability transfer, or range split),
 `QuotaExceeded` (caller's CSpace
 directory structurally full for reply cap transfer, or a transferred cap's object has its
 reference count at its 2^30 ceiling), `OutOfMemory`
@@ -553,12 +549,11 @@ caps that have spent the reserve fail a receive
 receive was parked, in any timeout mode), `Interrupted`, `WouldBlock` (a try-once found no
 caller, or a bounded wait elapsed). If an
 already-queued sender's cap transfer is refused (a source slot went stale
-or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer, a
-cap's object has its reference count at its 2^30 ceiling, or the server's CSpace cannot supply the
-destination slots, which the pre-park grow makes unlikely but does not reserve), the message is
-still delivered — with zero caps; the sender keeps its
-capabilities (see [ipc-design.md](../../../docs/ipc-design.md) § Message Format and
-§ Receive-Failure Policy).
+or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability transfer, or range
+split, a cap's object has its reference count at its 2^30 ceiling, or the server's CSpace cannot
+supply the destination slots, which the pre-park grow makes unlikely but does not reserve), the
+message is still delivered — with zero caps; the sender keeps its capabilities (see
+[ipc-design.md](../../../docs/ipc-design.md) § Message Format and § Receive-Failure Policy).
 
 ---
 
@@ -981,17 +976,17 @@ The source is revalidated under the derivation lock before the new slot is
 linked beneath it (see [capability-internals.md](capability-internals.md)
 § Global Derivation Lock): a source a concurrent delete, move, or revoke freed
 meanwhile fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE`,
-`SYS_CAP_MOVE`, or IPC capability transfer in flight with `InvalidState`, rather than
+`SYS_CAP_MOVE`, IPC capability transfer, or range split in flight with `InvalidState`, rather than
 leaving the new capability an unlinked derivation root.
 
 **Errors:** `InvalidCapability` (source invalid, null, or freed meanwhile),
-`InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight
-on the source), `OutOfMemory` (slot-page pool exhausted, or, for an `Mmio`, `IoPort`, or
-`Interrupt` source, the caller's `CSpace` pool cannot back the fresh object; see
+`InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, an IPC capability transfer, or a range split
+is in flight on the source), `OutOfMemory` (slot-page pool exhausted, or, for an `Mmio`, `IoPort`,
+or `Interrupt` source, the caller's `CSpace` pool cannot back the fresh object; see
 [capability-internals.md](capability-internals.md) § Body Arena), `QuotaExceeded` (caller's CSpace
 directory structurally full; for an `Mmio`, `IoPort`, or `Interrupt` source, its range already has
-`RANGE_COPY_LIMIT` (2^31 - 1) live copies; for any other source, the object's reference count is
-at its 2^30 ceiling).
+`RANGE_COPY_LIMIT` (2^31 - 1) live copies; for any other source, the object's reference count is at
+its 2^30 ceiling).
 
 If the source capability has a non-zero badge, the derived capability inherits it.
 
@@ -1029,8 +1024,8 @@ derivation: as for `SYS_CAP_DERIVE`.
 
 **Errors:** `InvalidArgument` (badge is zero or source already badged),
 `InvalidCapability` (source invalid, null, or freed meanwhile), `InvalidState` (a
-`SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight on the source),
-`OutOfMemory` and `QuotaExceeded` (as for `SYS_CAP_DERIVE`).
+`SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, an IPC capability transfer, or a range split is in flight on the
+source), `OutOfMemory` and `QuotaExceeded` (as for `SYS_CAP_DERIVE`).
 
 ---
 
@@ -1181,17 +1176,17 @@ reference (see [capability-model.md](../../../docs/capability-model.md) § Revoc
 such a teardown can fail to complete as `SYS_CAP_DELETE` describes for a thread left
 on a halted CPU. While the revoke is in flight, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`,
 `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_MEMORY_SPLIT`,
-`SYS_MEMORY_MERGE`, the range splits, and `SYS_MMIO_MERGE` on the target slot (and IPC transfer
-of it) are refused with `InvalidState`. A `SYS_CAP_MOVE` or IPC transfer in flight pins its
-source and destination slots the same way (see
+`SYS_MEMORY_MERGE`, the range splits, `SYS_MMIO_MERGE`, `SYS_IRQ_MSG_ALLOC` naming it as its
+authority, and a further `SYS_CAP_REVOKE` on the target slot (and IPC transfer of it) are refused
+with `InvalidState`. A `SYS_CAP_MOVE` or IPC transfer in flight pins its source and destination
+slots the same way, and a range split in flight its two children (see
 [capability-internals.md](capability-internals.md) § Revocation Algorithm).
 
-**Errors:** `InvalidCapability`; `InvalidState` (another revoke, a move, or an IPC
-capability transfer is already in flight on this slot, or a corrupted derivation link
-was found — the revoke is incomplete and the dangling chain was cut); `Interrupted`
-(liveness backstop, after `MAX_REVOKE_BATCHES` batches: the subtree was larger than they cover, or
-concurrent derivation kept extending it — everything revoked so far stays revoked; retry to
-continue).
+**Errors:** `InvalidCapability`; `InvalidState` (another revoke, a move, an IPC
+capability transfer, or a range split is already in flight on this slot, or a corrupted derivation
+link was found — the revoke is incomplete and the dangling chain was cut); `Interrupted` (liveness
+backstop, after `MAX_REVOKE_BATCHES` batches: the subtree was larger than they cover, or concurrent
+derivation kept extending it — everything revoked so far stays revoked; retry to continue).
 
 ---
 
@@ -1245,7 +1240,7 @@ place: a thread may not delete any capability to its **own running**
 `Thread` object, last reference or not (always an aliased/stale-cap bug — deleting
 the last one would tear the calling thread down mid-syscall; the object is reclaimed
 normally when a different thread later releases it), and a slot with a
-`SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer
+`SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability transfer, or range split
 in flight may not be deleted until that operation completes.
 
 Capabilities derived from the deleted slot are re-linked under its own derivation parent, so
@@ -1577,7 +1572,7 @@ The parent is revalidated under the derivation lock before its object is
 touched and the tail is linked beside it (see
 [capability-internals.md](capability-internals.md) § Global Derivation Lock): a
 parent a concurrent delete freed meanwhile fails with `InvalidCapability`, and
-one with a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer in flight
+one with a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability transfer, or range split in flight
 with `InvalidState`.
 
 **Capability requirement:** `memory_cap` must have Map rights.
@@ -1668,22 +1663,24 @@ needs the region mapped maps it again through a child.
 
 The original is revalidated under the derivation lock before it is consumed
 (see [capability-internals.md](capability-internals.md) § Revocation Algorithm):
-if a concurrent delete removed it, or a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability
-transfer is in flight on it, the split fails with `InvalidState` and both children are rolled
-back. Its children are re-linked under its derivation parent in batches (lock released between
-them); a concurrent deriver extending that list faster than it is moved returns
-`Interrupted`. Both children are inserted and linked under the original's
-derivation parent in the first derivation-lock hold, so a concurrent move
-cannot carry one out of the grantor's revoke reach before it is linked; a
-child a concurrent delete removed before the split finished stays deleted,
-and its returned handle carries the generation minted at insert, so it no
-longer resolves even if the slot has since been refilled. A split that fails
-after at least one batch leaves the children already moved under the
-original's derivation parent, where they stay: the surviving original no
-longer holds revoke authority over them, as after a `SYS_CAP_DELETE` of an
-intermediate.
-The three other range splits (`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`,
-`SYS_SCHED_SPLIT`) share this tail and these two errors.
+if a concurrent delete removed it, or a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, an IPC capability
+transfer, or a range split is in flight on it, the split fails with `InvalidState` and both children
+are rolled back. Its children are re-linked under its derivation parent in batches (lock released
+between them, and the CPU's pending interrupts taken there); a concurrent deriver extending that
+list faster than it is moved returns `Interrupted`. Both children are inserted and linked under the
+original's derivation parent in the first derivation-lock hold, and from the first release of the
+lock until the split returns both are pinned as a `SYS_CAP_REVOKE` root is: the operations listed
+under `SYS_CAP_REVOKE` (a further split, a merge, a delete, a move, a copy, a derive, and an IPC
+transfer of a child among them) refuse a child with `InvalidState`, while a syscall that uses a
+child's object (a map, a bind, an acknowledgement, `SYS_CAP_INFO`) acts on it. So no concurrent move
+carries a child out of the grantor's revoke reach and nothing is derived from one before the split
+returns. A `SYS_CAP_REVOKE` on an ancestor still reaches both children: one it frees before the
+split returns stays freed, and its returned handle carries the generation minted at insert, so it no
+longer resolves even if the slot has since been refilled. A split that fails after at least one
+batch leaves the children already moved under the original's derivation parent, where they stay: the
+surviving original no longer holds revoke authority over them, as after a `SYS_CAP_DELETE` of an
+intermediate. The three other range splits (`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`, `SYS_SCHED_SPLIT`)
+share this tail and these two errors.
 
 **Errors:** `InvalidState`, `Interrupted` (per above), `InvalidArgument` (`split_offset` not
 page-aligned, zero, `>= size`, or fewer than one page on the upper side), `InvalidCapability`,
@@ -1722,7 +1719,7 @@ Both capabilities are revalidated under the derivation lock before either
 object is touched and the tail is unlinked and freed (see
 [capability-internals.md](capability-internals.md) § Global Derivation Lock): a
 cap a concurrent delete freed meanwhile fails with `InvalidCapability`, and one
-with a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer in flight with
+with a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability transfer, or range split in flight with
 `InvalidState`.
 
 **Errors:** `InvalidArgument` (same slot/object, rights mismatch, ownership-flag
@@ -1771,7 +1768,8 @@ A call that fails changes neither capability.
 Both capabilities are revalidated under the derivation lock before the joined capability is
 inserted (see [capability-internals.md](capability-internals.md) § Global Derivation Lock): a
 capability a concurrent delete freed meanwhile fails with `InvalidCapability`, and one with a
-`SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer in flight with `InvalidState`.
+`SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability transfer, or range split in flight with
+`InvalidState`.
 
 **Capability requirements:** `lower_cap` (Map), `upper_cap` (Map); rights must match.
 
@@ -1924,12 +1922,13 @@ target's remaining time slice (at most the longest slice, 20 timer ticks, that o
 `TIME_SLICE_TICKS`, 10, for a target dispatched at an RT level; see
 [scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)), except when the
 slice expires while the target runs a preemption-disabled kernel section with interrupts enabled (a
-TLB-shootdown or drain spin, or a page-pool seeding, teardown, or explicit-placement pre-grow window
-between batches, `interrupt_window`): `timer_tick` then refills the slice without rescheduling, and
-`preempt_enable` does not reschedule, so the stop completes at the first later slice-expiry tick
-with preemption enabled, a further slice later at the least, or at the target's next return to user
-mode when a thread queued on its CPU outranks it. Callers that need a bounded stop latency MUST
-budget a slice for each slice expiry the target can spend in such a section.
+TLB-shootdown or drain spin, or a page-pool seeding, teardown, explicit-placement pre-grow, or
+derivation-lock window between batches, `interrupt_window`): `timer_tick` then refills the slice
+without rescheduling, and `preempt_enable` does not reschedule, so the stop completes at the
+first later slice-expiry tick with preemption enabled, a further slice later at the least, or at
+the target's next return to user mode when a thread queued on its CPU outranks it. Callers that
+need a bounded stop latency MUST budget a slice for each slice expiry the target can spend in such
+a section.
 
 **Capability requirement:** `thread_cap` must have Control rights.
 
@@ -2074,8 +2073,8 @@ narrow a band — `SYS_CAP_DERIVE` attenuates rights and cannot shrink a range (
 **Capability requirements:** `sched_cap` must be a `SchedControl` (presence-only;
 no rights bit).
 
-Original revalidation, batched re-linking, `InvalidState`, and `Interrupted`: as for
-`SYS_MMIO_SPLIT`.
+Original revalidation, batched re-linking with both children pinned between batches,
+`InvalidState`, and `Interrupted`: as for `SYS_MMIO_SPLIT`.
 
 **Errors:** `InvalidState`, `Interrupted` (per above),
 `InvalidCapability` (not a `SchedControl`), `InvalidArgument`
@@ -3006,8 +3005,8 @@ derivation parent. The original `irq_cap` is consumed.
 
 **Capability requirement:** `irq_cap` must have Notify rights.
 
-Original revalidation, batched re-linking, `InvalidState`, and `Interrupted`: as for
-`SYS_MMIO_SPLIT`.
+Original revalidation, batched re-linking with both children pinned between batches,
+`InvalidState`, and `Interrupted`: as for `SYS_MMIO_SPLIT`.
 
 **Errors:** `InvalidState`, `Interrupted` (per above), `InvalidArgument` (`split_at` outside
 `(start, start+count)`), `InvalidCapability`, `InsufficientRights` (cap lacks Notify), `OutOfMemory`
@@ -3046,8 +3045,8 @@ that syscall releases it). A caller that needs the ports binds a child afterward
 
 **Capability requirement:** `ioport_cap` must have Use rights.
 
-Original revalidation, batched re-linking, `InvalidState`, and `Interrupted`: as for
-`SYS_MMIO_SPLIT`.
+Original revalidation, batched re-linking with both children pinned between batches,
+`InvalidState`, and `Interrupted`: as for `SYS_MMIO_SPLIT`.
 
 **Errors:** `InvalidState`, `Interrupted` (per above), `NotSupported` (RISC-V — no I/O ports),
 `InvalidArgument` (`split_at` 0, `> 0xFFFF`, or outside `(base, base+size)`), `InvalidCapability`,
@@ -3105,7 +3104,7 @@ not carry it.
 `InsufficientRights` (it lacks Mint), `QuotaExceeded` (no CPU a message can reach has a free slot;
 or the caller's `CSpace` directory is structurally full), `OutOfMemory` (the caller's `CSpace` pool
 cannot fund the capability's body or slot; a refill cures it), `InvalidState` (the authority's slot
-is held by an in-flight revoke, move, or transfer). Nothing changes on an error.
+is held by an in-flight revoke, move, transfer, or range split). Nothing changes on an error.
 
 ---
 
@@ -3285,18 +3284,18 @@ Hybrid Radix Directory).
 The source is revalidated under the derivation lock before the copy is linked
 beneath it (see [capability-internals.md](capability-internals.md) § Global
 Derivation Lock): a source a concurrent delete, move, or revoke freed meanwhile
-fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC
-capability transfer in flight with `InvalidState`. With a non-zero `dst_slot`, if
+fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, an IPC
+capability transfer, or a range split in flight with `InvalidState`. With a non-zero `dst_slot`, if
 every other reference to the
 destination CSpace goes while the call is backing the leaves up to that index,
 the call reclaims that CSpace and fails with `InvalidCapability`; a caller bound
 to it is stopped and the call never returns (see
 [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 
-**Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC
-capability transfer is in flight on the source), `InsufficientRights` (dst CSpace lacks Insert),
-`InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted,
-or the dst CSpace pool cannot back an `Mmio`, `IoPort`, or `Interrupt` copy's object),
+**Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, an IPC
+capability transfer, or a range split is in flight on the source), `InsufficientRights` (dst CSpace
+lacks Insert), `InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool
+exhausted, or the dst CSpace pool cannot back an `Mmio`, `IoPort`, or `Interrupt` copy's object),
 `QuotaExceeded` (dst CSpace directory structurally full, an `Mmio`, `IoPort`, or `Interrupt`
 source's range already has `RANGE_COPY_LIMIT` (2^31 - 1) live copies, or any other source's object
 has its reference count at its 2^30 ceiling).
@@ -3356,9 +3355,8 @@ lacks Insert), `InvalidArgument` (dst_slot occupied or out of range),
 `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded` (dst CSpace directory
 structurally full, or the object's reference count is at its 2^30 ceiling: the destination takes
 its reference before the source releases its own), `InvalidState` (a `SYS_CAP_REVOKE`, another
-`SYS_CAP_MOVE`, or an IPC
-capability transfer is in flight on the source slot; or the destination slot was
-freed while the move was in flight — the source keeps the capability),
+`SYS_CAP_MOVE`, an IPC capability transfer, or a range split is in flight on the source slot; or
+the destination slot was freed while the move was in flight — the source keeps the capability),
 `Interrupted` (liveness backstop, per above).
 
 ---

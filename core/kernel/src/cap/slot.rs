@@ -740,9 +740,9 @@ impl CapabilitySlot
     // ── In-flight pin ─────────────────────────────────────────────────────────
 
     /// Return `true` if a multi-batch operation is in flight on this slot
-    /// (the `pin` byte): a `SYS_CAP_REVOKE` on its root, or a
+    /// (the `pin` byte): a `SYS_CAP_REVOKE` on its root, a
     /// `SYS_CAP_MOVE` / IPC capability transfer on its source and
-    /// destination.
+    /// destination, or a range split on its two children.
     ///
     /// The operations that refuse a pinned slot, and why, are defined in
     /// core/kernel/docs/capability-internals.md § Revocation Algorithm and
@@ -788,7 +788,7 @@ impl CapabilitySlot
     /// is the list tail. Leaves the per-slot generation untouched —
     /// `CSpace::free_slot` bumps it immediately before this call and the next
     /// allocation must observe the incremented value. Zeroes the pin — a
-    /// slot freed while a revoke, move, or IPC capability transfer had it
+    /// slot freed while a revoke, move, IPC capability transfer, or range split had it
     /// pinned must not carry the pin into its next occupant (see
     /// [`pinned`](Self::pinned)).
     ///

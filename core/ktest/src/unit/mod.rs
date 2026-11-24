@@ -14,6 +14,7 @@ pub mod aspace_hold;
 pub mod boot_device;
 pub mod boot_reclaim;
 pub mod cap;
+pub mod cap_batches;
 pub mod cap_info;
 pub mod crypto;
 pub mod dispatch;
@@ -311,6 +312,26 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "retype::aspace_teardown_takes_interrupts",
         retype::aspace_teardown_takes_interrupts(ctx)
+    );
+    run_test!(
+        "cap_batches::revoke_takes_interrupts",
+        cap_batches::revoke_takes_interrupts(ctx)
+    );
+    run_test!(
+        "cap_batches::delete_reparent_takes_interrupts",
+        cap_batches::delete_reparent_takes_interrupts(ctx)
+    );
+    run_test!(
+        "cap_batches::move_takes_interrupts",
+        cap_batches::move_takes_interrupts(ctx)
+    );
+    run_test!(
+        "cap_batches::sched_split_takes_interrupts",
+        cap_batches::sched_split_takes_interrupts(ctx)
+    );
+    run_test!(
+        "cap_batches::cspace_drain_takes_interrupts",
+        cap_batches::cspace_drain_takes_interrupts(ctx)
     );
 
     // ── Memory management syscalls ────────────────────────────────────────────

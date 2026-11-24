@@ -311,8 +311,8 @@ impl IpcDelivery
 /// slot repeated in one message, or `data_count > MSG_REGS_DATA_MAX` or
 /// `cap_count > 0` with no IPC buffer page registered), `InvalidAddress` (the
 /// registered IPC buffer page is unmapped), `InvalidState` (a cap slot is
-/// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
-/// transfer), `NoReceiver` (no capability with the Receive right on the
+/// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability
+/// transfer, or range split), `NoReceiver` (no capability with the Receive right on the
 /// endpoint is left, at the call or while it was queued), or `Interrupted`
 /// (the call was cancelled while blocked, including by the receiver receiving
 /// again before it replied). A `data_count` above `MSG_DATA_WORDS_MAX` or a
@@ -443,8 +443,8 @@ pub fn raw_ipc_recv_timeout(ep: u64, timeout_ms: u64) -> Result<IpcDelivery, i64
 /// repeated in the reply, or `data_count > MSG_REGS_DATA_MAX` or
 /// `cap_count > 0` with no IPC buffer page registered), `InvalidAddress` (the
 /// registered IPC buffer page is unmapped), `InvalidState` (a reply cap slot
-/// is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC
-/// capability transfer), or `QuotaExceeded` / `OutOfMemory` (the caller's
+/// is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC
+/// capability transfer, or range split), or `QuotaExceeded` / `OutOfMemory` (the caller's
 /// `CSpace` cannot accept the reply caps). The reply never blocks, so it never
 /// returns `Interrupted`. A `data_count` above `MSG_DATA_WORDS_MAX` or a
 /// `cap_count` above `MSG_CAP_SLOTS_MAX` is clamped to the maximum, not
@@ -1084,7 +1084,7 @@ pub fn memory_merge(parent_cap: u64, tail_cap: u64) -> Result<(), i64>
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
-/// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
+/// `SYS_CAP_MOVE`, IPC capability transfer, or range split on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
@@ -1135,8 +1135,8 @@ pub fn mmio_split(mmio_cap: u64, split_offset: u64) -> Result<(u64, u64), i64>
 /// `InsufficientRights` (either lacks Map), `InvalidArgument` (the same cap
 /// twice, rights or flags differ, the ranges are not adjacent in argument
 /// order, or the caps are not derivation siblings), `InvalidState` (either
-/// cap has a derivation child, or a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC
-/// capability transfer in flight),
+/// cap has a derivation child, or a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC
+/// capability transfer, or range split in flight),
 /// `OutOfMemory` (the caller's `CSpace` pool cannot back the joined cap's
 /// slot or body; `syscall_abi::cspace_topup_pages`), or `QuotaExceeded`
 /// (the `CSpace` directory is structurally full).
@@ -1169,7 +1169,7 @@ pub fn mmio_merge(lower_cap: u64, upper_cap: u64) -> Result<u64, i64>
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
-/// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
+/// `SYS_CAP_MOVE`, IPC capability transfer, or range split on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
@@ -1222,7 +1222,7 @@ pub fn irq_split(irq_cap: u64, split_at: u32) -> Result<(u64, u64), i64>
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
-/// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
+/// `SYS_CAP_MOVE`, IPC capability transfer, or range split on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
@@ -1265,7 +1265,7 @@ pub fn ioport_split(ioport_cap: u64, split_at: u16) -> Result<(u64, u64), i64>
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
-/// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
+/// `SYS_CAP_MOVE`, IPC capability transfer, or range split on it is in flight;
 /// `Interrupted` if a concurrent deriver extended its child list faster than
 /// the batched reparent could move it (retry); `OutOfMemory` if the caller's
 /// `CSpace` pool cannot back two more slots or the children's bodies, which
@@ -1479,8 +1479,8 @@ pub fn thread_start_suspended(thread_cap: u64) -> Result<(), i64>
 /// `QuotaExceeded` also means the object's reference count is at its 2^30
 /// ceiling. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
-/// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
-/// capability transfer is in flight on the source.
+/// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, IPC
+/// capability transfer, or range split is in flight on the source.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
@@ -1515,8 +1515,8 @@ pub fn cap_copy(src_slot: u64, dest_cspace_cap: u64, rights_mask: u64) -> Result
 /// cannot back an `Mmio`, `IoPort`, or `Interrupt` object. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
 /// new slot was linked;
-/// `InvalidState` means a `cap_revoke`, `cap_move`, or IPC capability
-/// transfer is in flight on the source.
+/// `InvalidState` means a `cap_revoke`, `cap_move`, IPC capability
+/// transfer, or range split is in flight on the source.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
@@ -1547,8 +1547,8 @@ pub fn cap_derive(src_slot: u64, rights_mask: u64) -> Result<u64, i64>
 /// source object's 2^30 reference-count ceiling).
 /// `InvalidCapability` also covers a source a concurrent delete, move, or
 /// revoke freed before the new slot was linked; `InvalidState` means a
-/// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
-/// source.
+/// `cap_revoke`, `cap_move`, IPC capability transfer, or range split is in
+/// flight on the source.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \
@@ -1670,7 +1670,7 @@ pub fn cap_bind_sole_reference(cap: u64, event_queue_cap: u64, correlator: u64) 
 /// Returns a negative `i64` error code: `InvalidCapability` if the handle
 /// is out of range or carries a stale generation (deleting a Null slot
 /// succeeds); `InvalidState` if the slot names the caller's own thread or a
-/// `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer on it is in
+/// `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, IPC capability transfer, or range split on it is in
 /// flight; `Interrupted` if a concurrent deriver extended the slot's child
 /// list faster than the batched reparent could move it (retry).
 pub fn cap_delete(slot: u64) -> Result<(), i64>
@@ -1691,8 +1691,8 @@ pub fn cap_delete(slot: u64) -> Result<(), i64>
 /// # Errors
 /// - `InvalidCapability` (-2) — the handle names no live slot, or its
 ///   generation is stale.
-/// - `InvalidState` (-15) — another revoke, a move, or an IPC capability
-///   transfer is already in flight on this slot, or the kernel found a
+/// - `InvalidState` (-15) — another revoke, a move, an IPC capability
+///   transfer, or a range split is already in flight on this slot, or the kernel found a
 ///   corrupted derivation link (the revoke is incomplete).
 /// - `Interrupted` (-16) — the kernel's liveness backstop tripped: the
 ///   subtree was larger than one call covers (about 1.3 × 10^8 nodes), or
@@ -1762,8 +1762,8 @@ pub fn cap_revoke_all(slot: u64) -> Result<(), i64>
 /// `QuotaExceeded` at the structural ceiling, or when the object's reference
 /// count is at its 2^30 ceiling, since the destination takes its reference
 /// before the source releases its own);
-/// `InvalidState` if a revoke, another move, or an IPC capability transfer
-/// is in flight on the source, or the destination slot was freed mid-move
+/// `InvalidState` if a revoke, another move, an IPC capability transfer, or
+/// a range split is in flight on the source, or the destination slot was freed mid-move
 /// (the source keeps the capability);
 /// `Interrupted` if a concurrent deriver kept extending the child list past
 /// the kernel's batch backstop — the capability then lives in both slots,
@@ -1816,8 +1816,8 @@ pub fn cap_move(src_cap: u64, dest_cspace_cap: u64, dest_index: u32) -> Result<u
 /// [`cap_copy`] (`QuotaExceeded` at the copy limits and the 2^30
 /// reference-count ceiling). `InvalidCapability` also covers a source a
 /// concurrent delete, move, or revoke freed before the copy was linked; `InvalidState` means a
-/// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
-/// source.
+/// `cap_revoke`, `cap_move`, IPC capability transfer, or range split is in flight
+/// on the source.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ret is a non-negative cap handle; the kernel keeps bit 63 of every handle clear \

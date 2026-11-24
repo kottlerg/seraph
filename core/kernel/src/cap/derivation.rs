@@ -215,6 +215,27 @@ impl DerivationLock
         self.state.store(0, Ordering::Release);
     }
 
+    /// Release the write lock between two batches of a loop whose batch count
+    /// a caller sizes, then take the interrupts pending on this CPU
+    /// ([`interrupt_window`](crate::cap::object::interrupt_window)) before
+    /// the next batch takes the lock again, so that the loop masks interrupts
+    /// for one batch at a time. Every such loop releases the lock this way
+    /// between its batches, and with [`write_unlock`](Self::write_unlock)
+    /// after its last (core/kernel/docs/capability-internals.md § Global
+    /// Derivation Lock).
+    ///
+    /// The caller holds no other lock and runs where an interrupt window may
+    /// open: syscall context, or the deferred reclaim of a syscall epilogue
+    /// or of the idle thread. The window keeps preemption disabled, so the
+    /// caller stays on its CPU; what other CPUs change meanwhile is what they
+    /// could change at any release, which the next batch revalidates.
+    pub fn write_unlock_between_batches(&self)
+    {
+        self.write_unlock();
+        #[cfg(not(test))]
+        crate::cap::object::interrupt_window();
+    }
+
     /// Snapshot the lock for the softlockup watchdog dump.
     pub fn debug_snapshot(&self) -> DerivationLockSnapshot
     {
@@ -877,6 +898,19 @@ mod tests
     }
 
     // The host stub stamps cpu 1 (`cpu_stamp() == 1`); the site is this test.
+    #[test]
+    fn write_unlock_between_batches_releases_the_lock()
+    {
+        let lock = DerivationLock::new();
+        lock.write_lock();
+        lock.write_unlock_between_batches();
+        let snap = lock.debug_snapshot();
+        assert_eq!(snap.state, 0, "the lock is free after the release");
+        assert_eq!(snap.holder, 0, "no holder is recorded after the release");
+        lock.write_lock();
+        lock.write_unlock();
+    }
+
     #[test]
     fn write_lock_stamps_holder_and_unlock_clears_it()
     {

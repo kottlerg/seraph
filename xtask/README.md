@@ -1619,12 +1619,14 @@ verdict: an input of every build (the workspace `Cargo.toml` and `Cargo.lock`,
 `xtask/src/commands/kani.rs`, which holds the Kani pin, the arguments and the memory limit it runs
 `cargo kani` with, and the judge of Kani's output. What decides only which crates are verified, or
 whether and where a job runs them (the selection in `xtask/src/affected.rs`, the workflows), is not
-one, and a change to it alone selects no crate. The change is taken from the merge base of
-`<COMMIT>` and `HEAD`, so a branch behind `<COMMIT>` is charged its own change alone. A package's
-build script, features and `cfg` settings lie in its directory or the workspace manifest, so a
-change to them selects it. A commit the checkout does not hold fails the command, so a shallow clone
-never narrows the run. With no crate affected the command verifies nothing and does not check the
-installed release.
+one, and a change to it alone selects no crate, save one: a change to
+`.github/workflows/build-test.yml`, whose steps run CI's `kani` job, that selects no crate otherwise
+selects the crate with the fewest harnesses (the first by directory among equals), so the job's
+install, setup and run steps run. The change is taken from the merge base of `<COMMIT>` and `HEAD`,
+so a branch behind `<COMMIT>` is charged its own change alone. A package's build script, features
+and `cfg` settings lie in its directory or the workspace manifest, so a change to them selects it. A
+commit the checkout does not hold fails the command, so a shallow clone never narrows the run. With
+no crate affected the command verifies nothing and does not check the installed release.
 
 It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
@@ -1680,7 +1682,7 @@ cargo xtask cells [--since <COMMIT> | --since-green <REV> | --since-covered <REV
 |---|---|---|
 | `--since <COMMIT>` | no base | The change from the merge base of this commit and `HEAD` to the working tree |
 | `--since-green <REV>` | no base | The change from the newest commit of `REV`'s first-parent history, 200 commits at most, whose `build-test` run on a push to `master` passed (`gh run list`, the 200 newest runs); every cell, after a `WARNING:` line, when there is none or the runs cannot be read. A push to `master` takes this base, so `master`'s own runs prove every commit, and a cell a red or cancelled run left unproven stays owed |
-| `--since-covered <REV>` | no base | As `--since-green`, but a commit whose run has not finished counts too: a pull request takes this base, so it is not charged the change a running `master` run is proving; a red or cancelled run's change stays owed, and the merge gate waits for a running tip (`gate-base-green`) |
+| `--since-covered <REV>` | no base | As `--since-green`, but a commit whose run has not finished counts too, unless a newer commit of the history has a red or cancelled run, which took that change in and failed: a pull request takes this base, so it is not charged the change a running `master` run is proving; a red or cancelled run's change stays owed, and the merge gate waits for a running tip (`gate-base-green`) |
 | `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate`, `build` and `bench`, each a matrix's `include` list, `build` holding one tree per architecture and profile a `validate` cell is owed in and the release trees when the `bench` cell is owed, those with `bench` true; `validate-owed`, `build-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
 
 Without a base, every cell is owed. With one, the command places each changed file (`git diff
@@ -2303,7 +2305,7 @@ fails the gate.
 | `gate-merge-state` | error | GitHub reports the merge state `CLEAN`. |
 | `gate-checks` | error | Every check of the rollup has succeeded, or is neutral or skipped. |
 | `gate-includes-master` | error | The base branch's tip is an ancestor of the PR head; or the two have one merge base, the base branch's change since it (`git diff --name-only --no-renames`, a rename naming both its paths) names no file the PR's own change from it names, and GitHub reports the PR `MERGEABLE` (docs/conventions.md § Syncing with `master`); `UNKNOWN`, before GitHub has computed it, asks for the gate to be run again. The command prints which case held on a `master:` line: `contains`, `disjoint` with the number of commits the head lacks, `overlap`, or the number of merge bases. |
-| `gate-base-green` | error | The tip's own CI run, the newest `build-test.yml` run on the push of the tip commit (`gh run list --commit`), has finished green; or the head contains the tip, the tip's run failed or ended without a verdict (cancelled, skipped), and the head's newest `build-test.yml` run on the pull request started after the tip's run ended (`startedAt`, a re-run's start, against the tip run's `updatedAt`), so it proved the tip's change too (docs/conventions.md § CI Gating). A pending tip run, a tip with no run, and a state that cannot be read are errors, for a head that contains the tip too, since a pull request's run leaves a running tip's change to that run. |
+| `gate-base-green` | error | The tip's own CI run, the newest `build-test.yml` run on the push of the tip commit (`gh run list --commit`), has finished green; or the head contains the tip, the tip's run failed or ended without a verdict (cancelled, skipped), and the newest `select` job of the head's newest `build-test.yml` run on the pull request, of any attempt (the one whose cells a re-run of the failed jobs alone keeps), started after the tip's run ended (its `started_at` against the tip run's `updatedAt`), so it proved the tip's change too (docs/conventions.md § CI Gating). A pending tip run, a tip with no run, and a state that cannot be read are errors, for a head that contains the tip too, since a pull request's run leaves a running tip's change to that run. |
 | `gate-base-fresh` | error | The clone's `origin/<base>` is the base branch's tip on GitHub (`gh api`), since the two rules above read that ref: a stale one is refused with the advice to `git fetch origin`. |
 | `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
 | `record-run-kind` | error | The last run record for the PR head, when it is a `full` or `delta` record of the defect form, has no audit section of another run kind (§ `cargo xtask review-ledger`). |

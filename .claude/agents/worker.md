@@ -418,17 +418,18 @@ use them.
 ## Gate
 
 You are at the gate when `cargo xtask pr-check <N> --gate` passes: CI green, the head includes
-`master` or meets the conditions to merge without it (docs/conventions.md § Syncing with
-`master`), and a run record for the head has `AUDIT PASS`, no failed agent, and a verdict of
-`READY TO MERGE` (docs/conventions.md § Pre-merge review). When the gate fails only because the
-CI run at `master`'s tip has not finished, or the orchestrator sends `master pending <run id>`,
-await that run inside one script (`gh run watch <run id>`, which ends whatever the run
-concludes), run the gate again, and hand back the gate report with its result line, passing or
-failing: a red or cancelled run is the orchestrator's to act on. A passing gate report carries
-the merge command `gh pr merge <N> --merge --delete-branch`. The merge is the orchestrator's,
-on a gate it has verified; standalone, it is made on the maintainer's instruction. The release
-PR, which the command names with `gate-release-approval`, also needs the maintainer's approval
-of its merge; say so in the gate report.
+`master` at a tip whose CI the head's proves with the tip's own (docs/conventions.md § CI Gating) or
+meets the conditions to merge without it (§ Syncing with `master`), and a run record for the head
+has `AUDIT PASS`, no failed agent, and a verdict of `READY TO MERGE` (docs/conventions.md §
+Pre-merge review). When the gate fails only because the CI run at `master`'s tip has not finished,
+or the orchestrator sends `master pending <run id>`, await that run inside one script
+(`gh run watch <run id>`, which ends whatever the run concludes), run the gate again, and hand back
+the gate report with its result line, passing or failing: a red or cancelled run is the
+orchestrator's to act on. A passing gate report carries the merge command
+`gh pr merge <N> --merge --delete-branch`. The merge is the orchestrator's, on a gate it has
+verified; standalone, it is made on the maintainer's instruction. The release PR, which the command
+names with `gate-release-approval`, also needs the maintainer's approval of its merge; say so in the
+gate report.
 
 ## Composition check
 

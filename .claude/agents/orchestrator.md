@@ -420,7 +420,8 @@ is the only instruction to sync. You hold no CI watch (§ Liveness), so read the
 your turn: the worker awaits the run, runs the gate again and hands back its gate report again
 (`.claude/agents/worker.md` § Gate). A red `master` is a composition defect, fixed before
 anything else merges (docs/conventions.md § CI Gating): put its fix first, and until it lands
-merge only a PR whose head contains `master`, as the gate requires.
+merge only a PR whose head contains `master` and whose CI selected its cells after `master`'s
+run ended, as the gate requires.
 
 After each merge that shares a file with another merge since the previous release tag, send the
 merged PR's worker `composition check <merge>` (docs/conventions.md § Composition check;

@@ -1902,6 +1902,10 @@ fn check_release_approval(pat: &Patterns, added: &str) -> Vec<Diag>
 /// own CI (docs/conventions.md § CI Gating).
 const BASE_WORKFLOW: &str = "build-test.yml";
 
+/// The job of `BASE_WORKFLOW` that finds a run's base and the cells it owes
+/// (`cargo xtask cells`).
+const SELECT_JOB: &str = "select";
+
 /// How many of the shared files a gate error names.
 const SHARED_FILES_NAMED: usize = 5;
 
@@ -2077,7 +2081,7 @@ pub fn check_base_fresh(base: &str, local: &str, remote: &str) -> Vec<Diag>
 
 /// The `gate-base-green` finding of a head that contains the tip (see
 /// [`check_master`]).
-fn check_contained(ci: Option<&BaseCi>, head_started: Option<&str>, base: &str) -> Vec<Diag>
+fn check_contained(ci: Option<&BaseCi>, head_selected: Option<&str>, base: &str) -> Vec<Diag>
 {
     let why = match ci
     {
@@ -2091,14 +2095,14 @@ fn check_contained(ci: Option<&BaseCi>, head_started: Option<&str>, base: &str) 
                 conclusion,
                 at: ended,
             },
-        ) => match head_started
+        ) => match head_selected
         {
-            Some(started) if !ended.is_empty() && started > ended.as_str() => None,
+            Some(selected) if !ended.is_empty() && selected > ended.as_str() => None,
             _ => Some(format!(
                 "the CI run of {base}'s tip concluded {conclusion} at {ended}, and the head's \
-                 CI run started before that ({}), so it did not prove the tip's change: run \
-                 the head's CI again",
-                head_started.unwrap_or("no run found")
+                 CI run selected its cells before that ({}), so it did not prove the tip's \
+                 change: run every job of the head's CI again",
+                head_selected.unwrap_or("no run found")
             )),
         },
         Some(BaseCi::Pending) => Some(format!(
@@ -2116,17 +2120,19 @@ fn check_contained(ci: Option<&BaseCi>, head_started: Option<&str>, base: &str) 
 }
 
 /// The `gate-includes-master` and `gate-base-green` findings, from the
-/// tip's CI state `ci` and the start of the head's newest CI run
-/// `head_started` (RFC 3339, `None` when it has none or it could not be
-/// read). A pull request's CI run proves the change on its side of the
-/// newest `master` commit whose run passed or was still running when it
-/// started (`cargo xtask cells --since-covered`), so the combination is
-/// shown green by the head's green CI together with the tip's own green run,
-/// or, after the tip's run failed or ended without a verdict, by a head run
-/// started after that, which proved the tip's change too.
+/// tip's CI state `ci` and the start of the `select` job of the head's
+/// newest CI run `head_selected` (RFC 3339, `None` when it has none or it
+/// could not be read). A pull request's CI run proves the change on its side
+/// of the base its `select` job found (`cargo xtask cells --since-covered`):
+/// the newest `master` commit whose run passed, or was still running with no
+/// red or cancelled run above it. So the combination is shown green by the
+/// head's green CI together with the tip's own green run, which proved every
+/// commit since the newest passed one, or, after the tip's run failed or
+/// ended without a verdict, by a head run that selected its cells after
+/// that, and so proved every commit since the newest passed one too.
 ///
 /// A head that contains the tip passes when the tip's run succeeded, or
-/// ended otherwise before the head's run started; while the tip's run is
+/// ended otherwise before the head's run selected its cells; while the tip's run is
 /// pending, or its state cannot be read, it waits. One that does not
 /// contain the tip passes only when the base branch's change since the
 /// merge base is disjoint from the PR's files, GitHub reports the PR
@@ -2135,7 +2141,7 @@ pub fn check_master(
     case: &MasterCase,
     mergeable: &str,
     ci: Option<&BaseCi>,
-    head_started: Option<&str>,
+    head_selected: Option<&str>,
     base: &str,
     head: &str,
 ) -> Vec<Diag>
@@ -2143,7 +2149,7 @@ pub fn check_master(
     let at = short(head);
     match case
     {
-        MasterCase::Contained => check_contained(ci, head_started, base),
+        MasterCase::Contained => check_contained(ci, head_selected, base),
         MasterCase::Overlap(shared) =>
         {
             let mut named = shared
@@ -2251,10 +2257,11 @@ fn read_base_ci(root: &Path, branch: &str, tip: &str) -> BaseCi
     }
 }
 
-/// When the newest `BASE_WORKFLOW` run of the pull request at `head`
-/// started (RFC 3339; a re-run's start when it was re-run), from `gh run
-/// list`; `None` when it has none or the runs could not be read.
-fn read_head_started(root: &Path, head: &str) -> Option<String>
+/// When the `select` job whose cells the newest `BASE_WORKFLOW` run of the
+/// pull request at `head` ran started (RFC 3339), from `gh run list` and
+/// the run's jobs of every attempt; `None` when it has none or they could
+/// not be read.
+fn read_head_selected(root: &Path, head: &str) -> Option<String>
 {
     let runs = gh::json(
         root,
@@ -2268,22 +2275,32 @@ fn read_head_started(root: &Path, head: &str) -> Option<String>
             "--event",
             "pull_request",
             "--json",
-            "startedAt",
+            "databaseId",
         ],
     )
     .ok()?;
-    head_started(&runs)
+    let id = runs.as_array()?.first()?.get("databaseId")?.as_u64()?;
+    let path = format!("repos/{{owner}}/{{repo}}/actions/runs/{id}/jobs?filter=all&per_page=100");
+    let pages = gh::json(root, &["api", "--paginate", "--slurp", &path]).ok()?;
+    head_selected(&pages)
 }
 
-/// The start of the newest run of `runs` (`gh run list --json startedAt`,
-/// newest first); `None` when there is none.
-fn head_started(runs: &Value) -> Option<String>
+/// The start of the newest `select` job of `pages` (the run's jobs of every
+/// attempt, as `gh api --paginate --slurp` gives them). A re-run of the
+/// failed jobs alone keeps the cells the earlier `select` chose, so the
+/// newest one is the selection the run's jobs proved, and its start, not the
+/// run's, is when the run's base was found. `None` when there is none.
+fn head_selected(pages: &Value) -> Option<String>
 {
-    runs.as_array()?
-        .first()?
-        .get("startedAt")
-        .and_then(Value::as_str)
+    pages
+        .as_array()?
+        .iter()
+        .filter_map(|page| page.get("jobs").and_then(Value::as_array))
+        .flatten()
+        .filter(|job| job.get("name").and_then(Value::as_str) == Some(SELECT_JOB))
+        .filter_map(|job| job.get("started_at").and_then(Value::as_str))
         .filter(|s| !s.is_empty())
+        .max()
         .map(str::to_owned)
 }
 
@@ -2343,7 +2360,7 @@ fn gate(
                 Err(err) => BaseCi::Unknown(format!("{err:#}")),
             });
             let started = matches!(case, MasterCase::Contained)
-                .then(|| read_head_started(&ctx.root, head))
+                .then(|| read_head_selected(&ctx.root, head))
                 .flatten();
             let mergeable = pr["mergeable"].as_str().unwrap_or("UNKNOWN");
             out.extend(check_master(
@@ -3877,8 +3894,9 @@ mod tests
     // Defect caught: a head that contains master merged on a CI run that
     // proved only its own side of a tip whose run was still going (the pull
     // request's base counts a running master commit as covered), or of a
-    // tip whose run then failed; or a head refused although its run started
-    // after the tip's run failed, and so proved the tip's change too.
+    // tip whose run then failed; or a head refused although its run selected
+    // its cells after the tip's run failed, and so proved the tip's change
+    // too.
     #[test]
     fn a_head_that_contains_master_merges_on_a_proven_tip()
     {
@@ -3910,7 +3928,8 @@ mod tests
         assert_eq!(check(Some(&BaseCi::Green), None), pass);
         // Pending tip: wait for it, however recent the head's run.
         assert_eq!(check(Some(&BaseCi::Pending), after), blocked);
-        // Red or cancelled tip: only a head run started after it ended.
+        // Red or cancelled tip: only a head run that selected its cells after
+        // it ended.
         for tip in [&red, &cancelled]
         {
             assert_eq!(check(Some(tip), before), blocked, "{tip:?}");
@@ -3934,19 +3953,41 @@ mod tests
         assert_eq!(check(None, after), blocked);
     }
 
+    // Defect caught: a head admitted after a red tip because its run was
+    // re-run after the tip's run ended, although the re-run of the failed
+    // jobs alone kept the cells a `select` job found while the tip's run was
+    // still going, which left the tip's change to that run; or the start of
+    // another job, or of an older selection, taken for the selection's.
     #[test]
-    fn the_head_s_run_start_is_its_newest_run_s()
+    fn the_head_s_selection_is_its_newest_select_job()
     {
         let parse = |text: &str| -> Value { json::parse(text).unwrap() };
+        // Attempt 1 selected at 12:10; attempt 2 re-ran the failed jobs alone
+        // at 12:50, the page split between the two.
+        let rerun_failed = parse(
+            r#"[{"jobs":[{"name":"select","started_at":"2026-11-24T12:10:00Z"},
+                         {"name":"kani","started_at":"2026-11-24T12:12:00Z"}]},
+                {"jobs":[{"name":"kani","started_at":"2026-11-24T12:50:00Z"}]}]"#,
+        );
         assert_eq!(
-            head_started(&parse(
-                r#"[{"startedAt":"2026-11-24T12:50:00Z"},{"startedAt":"2026-11-24T12:00:00Z"}]"#
-            ))
-            .as_deref(),
+            head_selected(&rerun_failed).as_deref(),
+            Some("2026-11-24T12:10:00Z")
+        );
+        // A re-run of every job selected again.
+        let rerun_all = parse(
+            r#"[{"jobs":[{"name":"select","started_at":"2026-11-24T12:10:00Z"},
+                         {"name":"select","started_at":"2026-11-24T12:50:00Z"},
+                         {"name":"kani","started_at":"2026-11-24T12:55:00Z"}]}]"#,
+        );
+        assert_eq!(
+            head_selected(&rerun_all).as_deref(),
             Some("2026-11-24T12:50:00Z")
         );
-        assert_eq!(head_started(&parse("[]")), None);
-        assert_eq!(head_started(&parse(r#"[{"startedAt":""}]"#)), None);
+        assert_eq!(head_selected(&parse("[]")), None);
+        assert_eq!(
+            head_selected(&parse(r#"[{"jobs":[{"name":"select","started_at":""}]}]"#)),
+            None
+        );
     }
 
     #[test]

@@ -1128,9 +1128,9 @@ args! {
         pub since_green: Option<String>,
 
         /// The base, for a pull request: as --since-green, but a master run
-        /// that has not finished counts too, so a cell that run is proving is
-        /// left to it, and one a red or cancelled run left unproven stays
-        /// owed.
+        /// that has not finished counts too while no newer commit's run is
+        /// red or cancelled, so a cell that run is proving is left to it, and
+        /// one a red or cancelled run left unproven stays owed.
         #[arg(long, value_name = "REV")]
         pub since_covered: Option<String>,
 

@@ -2254,12 +2254,15 @@ every harness's verdict and verification time.
 
 **Where the proofs run.** On a pull request, CI's `kani` job verifies only the crates the change can
 affect (`cargo xtask kani --since` against the base the `select` job found, the newest commit before
-the run's whose `master` run passed or has not finished; [conventions.md](conventions.md#ci-gating)
+the run's whose `master` run passed, or has not finished with no newer red or cancelled one;
+[conventions.md](conventions.md#ci-gating)
 § CI Gating): a crate that holds a harness and whose own package, a workspace package in its
 dependency closure (Markdown aside), or a file those read, the change touches, and every such crate
 when the change touches an input of every proof (the workspace manifest and lock file, Cargo's
 configuration, the toolchain pin, and the command's own source, which holds the Kani pin, the
-arguments and the judge). That selection gates the merge, and a pull request that affects no such
+arguments and the judge). A change to `build-test.yml`, whose steps run the job, that selects no
+crate otherwise selects the crate with the fewest harnesses, so the job's steps run. That selection
+gates the merge, and a pull request that affects no such
 crate ends the job without installing Kani, with a notice on the run that it verified nothing. On a
 push to `master` the job runs the same selection from the newest commit whose `master` run passed,
 so a harness a red or cancelled `master` run left unproven stays owed until a run proves it. The

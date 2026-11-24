@@ -808,6 +808,8 @@ the configured periodic interval on each CPU. The tick handler, `timer_tick`, ru
 
 ```
 timer_tick():
+    if sole_reference::work_pending():        // the table has work, left on any CPU
+        post_return_work(SOLE_REF)            // this CPU's next return makes a pass
     if cpu == 0:                              // BSP only
         sleep_check_wakeups(); watchdog_tick_and_check()
     match tick_outcome(current.slice_remaining):   // PerCpuScheduler::tick_outcome
@@ -837,6 +839,12 @@ This ensures that a thread alone at the highest non-empty queue is never preempt
 
 The tick does not decide a preemption by a queued thread that outranks the running one: that is
 decided at the interrupt's return to user mode, as at every other (§ Wake Preemption).
+
+While the sole-reference table has work, each tick posts its own CPU's `SOLE_REF` return-work
+bit, so the next return to user mode of every CPU a tick reaches makes a drain pass, whichever
+CPU made the mark or left the fired nodes
+([capability-internals.md](capability-internals.md#sole-reference-observers) § Sole-Reference
+Observers; [scheduling-internals.md](scheduling-internals.md#return-work) § Return Work).
 
 ### Wake Preemption
 

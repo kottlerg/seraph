@@ -517,6 +517,10 @@ pub fn run_all(ctx: &TestContext)
         sole_reference::leftover_posts_reach_a_busy_cpu(ctx)
     );
     run_test!(
+        "sole_reference::leftover_posts_while_their_cpu_stays_in_the_kernel",
+        sole_reference::leftover_posts_while_their_cpu_stays_in_the_kernel(ctx)
+    );
+    run_test!(
         "sole_reference::moved_copy_does_not_post",
         sole_reference::moved_copy_does_not_post(ctx)
     );

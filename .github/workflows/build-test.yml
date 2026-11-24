@@ -99,6 +99,11 @@ jobs:
 
   host-tests:
     runs-on: ubuntu-latest
+    # `actions: write` lets a push to master delete the job's superseded
+    # build-carry entries (.github/actions/carry).
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -112,10 +117,10 @@ jobs:
           toolchain: nightly-2026-11-10
           components: rust-src,rustfmt,clippy,llvm-tools
 
-      - name: Restore the standard-library units
-        # Of the riscv64 test build's `-Z build-std`; see
-        # docs/build-system.md § Continuous Integration.
-        uses: ./.github/actions/std-cache
+      - name: Restore the build output
+        # Master's latest build of the tests; see docs/build-system.md
+        # § Continuous Integration.
+        uses: ./.github/actions/carry
         with:
           mode: restore
           name: host-tests
@@ -147,8 +152,8 @@ jobs:
       - name: cargo xtask test
         run: cargo xtask test
 
-      - name: Save the standard-library units
-        uses: ./.github/actions/std-cache
+      - name: Save the build output
+        uses: ./.github/actions/carry
         with:
           mode: save
           name: host-tests
@@ -286,6 +291,11 @@ jobs:
     needs: [select, qemu-debs]
     if: needs.select.outputs.build-owed == 'true'
     runs-on: ubuntu-26.04
+    # `actions: write` lets a push to master delete the job's superseded
+    # build-carry entries (.github/actions/carry).
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.build) }}
@@ -304,14 +314,13 @@ jobs:
           toolchain: nightly-2026-11-10
           components: rust-src,rustfmt,clippy,llvm-tools
 
-      - name: Restore the standard-library units
-        # See docs/build-system.md § Continuous Integration. One entry per
-        # architecture and profile, whose name is the one master's entries
-        # hold.
-        uses: ./.github/actions/std-cache
+      - name: Restore the build output
+        # Master's latest build of this architecture and profile; see
+        # docs/build-system.md § Continuous Integration.
+        uses: ./.github/actions/carry
         with:
           mode: restore
-          name: validate-${{ matrix.arch }}-${{ matrix.profile }}
+          name: build-${{ matrix.arch }}-${{ matrix.profile }}
 
       - name: Place the signing keys outside the checkout
         # The job's first build generates a local root and a signing key in
@@ -354,12 +363,11 @@ jobs:
           name: tree-${{ matrix.arch }}-bench
           arch: ${{ matrix.arch }}
 
-      - name: Save the standard-library units
-        # Last, since it empties Cargo's build directories but for those units.
-        uses: ./.github/actions/std-cache
+      - name: Save the build output
+        uses: ./.github/actions/carry
         with:
           mode: save
-          name: validate-${{ matrix.arch }}-${{ matrix.profile }}
+          name: build-${{ matrix.arch }}-${{ matrix.profile }}
 
   validate:
     # After the build job (and so after the qemu-debs job; see

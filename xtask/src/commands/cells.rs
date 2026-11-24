@@ -697,13 +697,14 @@ mod tests
             assert!(cell.contains("mode: fetch\n"), "{cell}");
             assert!(cell.contains(name), "{cell}");
             assert!(build.contains(name), "{name}");
-            assert!(!cell.contains("std-cache"), "{cell}");
+            assert!(!cell.contains("actions/carry"), "{cell}");
             for line in cell.lines().map(str::trim_start)
             {
                 assert!(!line.starts_with("cargo "), "{line}");
             }
         }
         assert!(build.contains("mode: ship\n"));
+        assert!(build.contains("uses: ./.github/actions/carry\n"));
         assert!(validate.contains("boot: ${{ matrix.tester == 'usertest' }}"));
     }
 

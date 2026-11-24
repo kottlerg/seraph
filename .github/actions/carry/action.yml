@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+# .github/actions/carry/action.yml
+
+# The composite action that carries Cargo's build output of a CI job from
+# master's runs to later runs of the job; its `description` below states
+# what it does.
+
+name: Build carry
+description: >-
+  Cargo's build output of one CI job (target/ but target/xtask/), carried
+  between runs. Cargo judges every build unit by the checksums of the files
+  it was built from (.cargo/config.toml), so an entry built from another
+  tree is safe to restore and only what differs is rebuilt; the key prefix
+  names every input that check does not see: the job, the runner image, the
+  installed toolchain, the wrapper shim, the target specs and the Cargo
+  configuration.
+  `restore` restores master's newest entry of the prefix and dates the
+  toolchain's library sources; `save`, on a push to master, saves the
+  entry under the prefix and the commit and deletes master's older entries
+  of the prefix. The mechanism is specified in docs/build-system.md
+  § Continuous Integration.
+
+inputs:
+  mode:
+    description: >-
+      `restore` before the job's first build; `save` as its last step.
+    required: true
+  name:
+    description: >-
+      The job's entry, unique per job of the matrix: each job builds its
+      own set of targets and profiles.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Check the inputs
+      if: >-
+        !contains(fromJSON('["restore", "save"]'), inputs.mode)
+      shell: sh
+      env:
+        MODE: ${{ inputs.mode }}
+      run: |
+        echo "::error::usage: mode restore | save; got mode '$MODE'"
+        exit 2
+
+    - name: Name the cache key
+      id: key
+      shell: sh
+      env:
+        NAME: ${{ inputs.name }}
+        # The inputs of every unit that Cargo's checksums do not cover: the
+        # target specs, the Cargo configuration (which also turns the
+        # checksums on), this action, and the wrapper shim, which runs every
+        # rustc and clippy-driver of a build through the toolchain mirror
+        # and adds arguments to their command lines that Cargo never sees.
+        # Markdown is left out: no unit reads it, and a change to it alone
+        # owes no build job, so no master run would save an entry under the
+        # key it made. A host test of xtask/src/rust_src.rs checks the list.
+        CONFIG_HASH: >-
+          ${{ hashFiles('xtask/targets/**', '.cargo/config.toml',
+          '.github/actions/carry/action.yml', 'xtask/wrapper-shim/**',
+          '!**/*.md') }}
+      # The installed toolchain is named by its full version, the runner
+      # image by its name and version: the host build scripts and host tools
+      # the entry holds link against the image's libraries.
+      run: |
+        : "${ImageOS:?}" "${ImageVersion:?}" "${CONFIG_HASH:?}" "${GITHUB_SHA:?}"
+        toolchain=$(rustc -Vv | sha256sum | cut -c1-16)
+        config=$(echo "$CONFIG_HASH" | cut -c1-16)
+        prefix="carry-$NAME-$ImageOS-$ImageVersion-$toolchain-$config-"
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "key=$prefix$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+    # A pull request's run restores master's entries, which only master's
+    # runs write (`save` below), so it never reads another pull request's.
+    - name: Restore the build output
+      if: inputs.mode == 'restore'
+      uses: actions/cache/restore@v6
+      with:
+        # target/xtask/ holds the build's signing identity and records,
+        # which are the run's own.
+        path: |
+          target
+          !target/xtask
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ steps.key.outputs.prefix }}
+
+    # The installer writes the toolchain's files with the time of the
+    # install, and the library build scripts (compiler_builtins') name
+    # library sources Cargo judges by modification time, so without this
+    # every run would rerun them and rebuild every unit above them. The
+    # date hides no change: the toolchain's version is in the key and in
+    # every unit's fingerprint, so a unit is never judged against another
+    # toolchain's files.
+    - name: Date the toolchain's library sources
+      if: inputs.mode == 'restore'
+      shell: sh
+      run: |
+        library="$(rustc --print sysroot)/lib/rustlib/src/rust/library"
+        test -d "$library"
+        find "$library" -exec touch -h -d 2000-01-01T00:00:00Z {} +
+
+    # An entry is immutable: a key already saved ends this step with a
+    # warning.
+    - name: Save the build output
+      if: inputs.mode == 'save' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+      uses: actions/cache/save@v6
+      with:
+        # target/xtask/ holds the build's signing identity and records,
+        # which are the run's own.
+        path: |
+          target
+          !target/xtask
+        key: ${{ steps.key.outputs.key }}
+
+    # Only the newest entry of a prefix is ever restored, so the older ones
+    # only take quota. Deleting needs the job's `actions: write`. Two master
+    # runs can run at once (build-test.yml's concurrency group is per
+    # commit), and both can list an entry the other deletes first; a
+    # deletion is housekeeping, so one that fails warns and fails nothing.
+    - name: Delete master's older entries
+      if: inputs.mode == 'save' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+      shell: sh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PREFIX: ${{ steps.key.outputs.prefix }}
+        KEY: ${{ steps.key.outputs.key }}
+      run: |
+        old_keys="$RUNNER_TEMP/carry-old-keys"
+        if ! gh cache list --repo "$GITHUB_REPOSITORY" --ref refs/heads/master \
+          --key "$PREFIX" --limit 100 --json key --jq '.[].key' > "$old_keys"; then
+          echo "::warning::could not list master's entries of $PREFIX; none deleted"
+          exit 0
+        fi
+        while read -r old; do
+          if [ "$old" != "$KEY" ] &&
+            ! gh cache delete --repo "$GITHUB_REPOSITORY" "$old"; then
+            echo "::warning::$old not deleted (another master run may have deleted it)"
+          fi
+        done < "$old_keys"

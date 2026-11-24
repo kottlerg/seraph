@@ -39,6 +39,17 @@ use core::panic::PanicInfo;
 #[cfg(not(test))]
 use core::sync::atomic::{AtomicU32, Ordering};
 
+// ── Linker script ─────────────────────────────────────────────────────────────
+
+// The linker script `cargo xtask build` passes to the kernel's link (`-T`),
+// made an input of this crate: Cargo judges a build current by the content of
+// the files rustc read, so a change to the script rebuilds and relinks the
+// kernel (docs/build-system.md § Custom Targets). Nothing reads the bytes.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+const _: &[u8] = include_bytes!("../linker/x86_64.ld");
+#[cfg(all(target_os = "none", target_arch = "riscv64"))]
+const _: &[u8] = include_bytes!("../linker/riscv64.ld");
+
 // ── AP ready counter ──────────────────────────────────────────────────────────
 
 /// Number of APs that have completed SMP startup and are online.

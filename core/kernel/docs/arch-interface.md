@@ -1355,7 +1355,8 @@ A new architecture port MUST:
    where neutral code calls it; check by hand the items the preamble lists as having no
    neutral caller
 3. Add a custom target JSON in `xtask/targets/`
-4. Add a linker script in `core/kernel/linker/`
+4. Add a linker script in `core/kernel/linker/`, name it in `Arch::kernel_linker_script`
+   (`xtask/src/arch.rs`), and include it in `core/kernel/src/main.rs`
 5. Add the `#[cfg]` branch in `core/kernel/src/arch/mod.rs`
 6. Add the target to the workspace build configuration
 

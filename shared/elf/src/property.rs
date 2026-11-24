@@ -90,6 +90,7 @@ pub fn elf_holds(input: &[u8])
     phdr_read_holds(input, EHDR_BYTES, first);
     note_walk_holds(input, &STACK);
     section_name_holds(input, first, &STACK);
+    steps_hold(input);
     let span_min = le_u64(input, 0).unwrap_or(0);
     let span_end = le_u64(input, 8).unwrap_or(u64::MAX);
     let whole = input.as_chunks::<RELA_ENTRY_SIZE>().0.as_flattened();
@@ -496,16 +497,16 @@ pub(crate) fn relro_holds(ehdr: &Elf64Ehdr, data: &[u8])
 // ── The relocation table ─────────────────────────────────────────────────────
 
 /// The tags of a `PT_DYNAMIC` walk, as the model gathers them.
-#[derive(Default)]
-struct Tags
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Tags
 {
-    rela: Option<u64>,
-    relasz: Option<u64>,
-    relaent: Option<u64>,
-    pltrelsz: u64,
-    jmprel: bool,
-    rel: bool,
-    relr: bool,
+    pub(crate) rela: Option<u64>,
+    pub(crate) relasz: Option<u64>,
+    pub(crate) relaent: Option<u64>,
+    pub(crate) pltrelsz: u64,
+    pub(crate) jmprel: bool,
+    pub(crate) rel: bool,
+    pub(crate) relr: bool,
 }
 
 /// The tags of the whole 16-byte entries of `dynamic` before the first
@@ -515,23 +516,127 @@ fn tags(dynamic: &[u8]) -> Tags
     let mut tags = Tags::default();
     for entry in dynamic.as_chunks::<16>().0
     {
-        let tag = le(entry, 0).map_or(0, i64::from_le_bytes);
-        let val = le_u64(entry, 8).unwrap_or(0);
-        match tag
+        if !tag_step(&mut tags, entry)
         {
-            DT_NULL => break,
-            DT_RELA => tags.rela = Some(val),
-            DT_RELASZ => tags.relasz = Some(val),
-            DT_RELAENT => tags.relaent = Some(val),
-            DT_PLTRELSZ => tags.pltrelsz = val,
-            DT_JMPREL => tags.jmprel = true,
-            DT_REL => tags.rel = true,
-            DT_RELR | DT_RELRSZ => tags.relr = true,
-            _ =>
-            {}
+            break;
         }
     }
     tags
+}
+
+/// One entry of the walk [`tags`] makes: its value recorded under its tag;
+/// `false` at `DT_NULL`.
+fn tag_step(tags: &mut Tags, entry: &[u8; 16]) -> bool
+{
+    let tag = le(entry, 0).map_or(0, i64::from_le_bytes);
+    let val = le_u64(entry, 8).unwrap_or(0);
+    match tag
+    {
+        DT_NULL => return false,
+        DT_RELA => tags.rela = Some(val),
+        DT_RELASZ => tags.relasz = Some(val),
+        DT_RELAENT => tags.relaent = Some(val),
+        DT_PLTRELSZ => tags.pltrelsz = val,
+        DT_JMPREL => tags.jmprel = true,
+        DT_REL => tags.rel = true,
+        DT_RELR | DT_RELRSZ => tags.relr = true,
+        _ =>
+        {}
+    }
+    true
+}
+
+/// The parser's summary holding `tags`.
+fn summary_of(tags: &Tags) -> crate::DynamicSummary
+{
+    crate::DynamicSummary {
+        rela: tags.rela,
+        relasz: tags.relasz,
+        relaent: tags.relaent,
+        pltrelsz: tags.pltrelsz,
+        jmprel: tags.jmprel,
+        rel: tags.rel,
+        relr: tags.relr,
+    }
+}
+
+/// Whether the parser's summary holds `tags`.
+fn holds_tags(summary: &crate::DynamicSummary, tags: &Tags) -> bool
+{
+    summary.rela == tags.rela
+        && summary.relasz == tags.relasz
+        && summary.relaent == tags.relaent
+        && summary.pltrelsz == tags.pltrelsz
+        && summary.jmprel == tags.jmprel
+        && summary.rel == tags.rel
+        && summary.relr == tags.relr
+}
+
+/// The table `tags` ask for, as [`rela_table`] documents it before the table
+/// is resolved: `(vaddr, size)`; `None` for no table or an empty one;
+/// refused for a format the loaders do not apply, a missing counterpart tag,
+/// an entry size other than a record's, a size not a multiple of it, or a
+/// range past the top of the address space.
+fn expected_request(tags: &Tags) -> Result<Option<(u64, u64)>, ElfError>
+{
+    if tags.rel || tags.relr || (tags.jmprel && tags.pltrelsz != 0)
+    {
+        return Err(ElfError::UnsupportedRelocation);
+    }
+    let (vaddr, size) = match (tags.rela, tags.relasz)
+    {
+        (_, Some(0)) | (None, None) => return Ok(None),
+        (Some(vaddr), Some(size)) => (vaddr, size),
+        (None, Some(_)) | (Some(_), None) => return Err(ElfError::MalformedDynamic),
+    };
+    let record = RELA_ENTRY_SIZE as u64;
+    if tags.relaent != Some(record) || !size.is_multiple_of(record)
+    {
+        return Err(ElfError::MalformedDynamic);
+    }
+    if sum(vaddr, size) > u128::from(u64::MAX)
+    {
+        return Err(ElfError::MalformedDynamic);
+    }
+    Ok(Some((vaddr, size)))
+}
+
+/// Where a program header puts the table of link VA `vaddr` and `size` bytes,
+/// as [`rela_table`] documents it: `None` unless it is a `PT_LOAD` header
+/// whose file data backs the whole table; for one that does, the table at its
+/// file offset, refused when that range passes `file_size`; and refused for a
+/// `PT_LOAD` header whose file data's link VAs pass the top of the address
+/// space.
+fn expected_in_load(
+    p: &Phdr,
+    vaddr: u64,
+    size: u64,
+    file_size: u64,
+) -> Option<Result<RelaTable, ElfError>>
+{
+    if p.ty != PT_LOAD
+    {
+        return None;
+    }
+    let file_end = sum(p.vaddr, p.filesz);
+    if file_end > u128::from(u64::MAX)
+    {
+        return Some(Err(ElfError::MalformedDynamic));
+    }
+    if vaddr < p.vaddr || sum(vaddr, size) > file_end
+    {
+        return None;
+    }
+    let file_offset = sum(p.offset, vaddr.saturating_sub(p.vaddr));
+    Some(match u64::try_from(file_offset)
+    {
+        Ok(file_offset) if sum(file_offset, size) <= u128::from(file_size) => Ok(RelaTable {
+            vaddr,
+            file_offset,
+            size,
+        }),
+        _ => Err(ElfError::MalformedDynamic),
+    })
 }
 
 /// The table [`rela_table`] documents for an accepted header: `None` without
@@ -551,46 +656,16 @@ fn expected_table(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<RelaTable>, El
     {
         return Err(ElfError::MalformedDynamic);
     }
-    let tags = tags(slice(data, dynamic.offset, dynamic.filesz));
-    if tags.rel || tags.relr || (tags.jmprel && tags.pltrelsz != 0)
+    let Some((vaddr, size)) = expected_request(&tags(slice(data, dynamic.offset, dynamic.filesz)))?
+    else
     {
-        return Err(ElfError::UnsupportedRelocation);
-    }
-    let (vaddr, size) = match (tags.rela, tags.relasz)
-    {
-        (_, Some(0)) | (None, None) => return Ok(None),
-        (Some(vaddr), Some(size)) => (vaddr, size),
-        (None, Some(_)) | (Some(_), None) => return Err(ElfError::MalformedDynamic),
+        return Ok(None);
     };
-    let record = RELA_ENTRY_SIZE as u64;
-    if tags.relaent != Some(record) || !size.is_multiple_of(record)
+    for p in phdrs(ehdr, data)
     {
-        return Err(ElfError::MalformedDynamic);
-    }
-    let table_end = sum(vaddr, size);
-    if table_end > u128::from(u64::MAX)
-    {
-        return Err(ElfError::MalformedDynamic);
-    }
-    for p in phdrs(ehdr, data).filter(|p| p.ty == PT_LOAD)
-    {
-        let file_end = sum(p.vaddr, p.filesz);
-        if file_end > u128::from(u64::MAX)
+        if let Some(table) = expected_in_load(&p, vaddr, size, data.len() as u64)
         {
-            return Err(ElfError::MalformedDynamic);
-        }
-        if vaddr >= p.vaddr && table_end <= file_end
-        {
-            let file_offset = sum(p.offset, vaddr.saturating_sub(p.vaddr));
-            return match u64::try_from(file_offset)
-            {
-                Ok(file_offset) if inside(file_offset, size, data.len()) => Ok(Some(RelaTable {
-                    vaddr,
-                    file_offset,
-                    size,
-                })),
-                _ => Err(ElfError::MalformedDynamic),
-            };
+            return table.map(Some);
         }
     }
     Err(ElfError::MalformedDynamic)
@@ -890,10 +965,26 @@ fn spells(found: &[u8], want: &[u8]) -> bool
 /// before one is found.
 fn note_in(notes: &[u8], note: &Note) -> Option<Range<usize>>
 {
+    let mut at = 0u128;
+    loop
+    {
+        match note_at(notes, at, note)?
+        {
+            Ok(desc) => return Some(desc),
+            Err(next) => at = next,
+        }
+    }
+}
+
+/// The record at offset `at` of `notes`, as [`note_in`] judges it: `Ok` of
+/// its descriptor's range when it is `note`, `Err` of the next record's
+/// offset when it is another, and `None` when no whole 12-byte header starts
+/// there or its descriptor runs past `notes`.
+fn note_at(notes: &[u8], at: u128, note: &Note) -> Option<Result<Range<usize>, u128>>
+{
     let align = |n: u128| n.saturating_add(3) & !3;
     let len = notes.len() as u128;
-    let mut at = 0u128;
-    while at.saturating_add(12) <= len
+    if at.saturating_add(12) <= len
     {
         let header = usize::try_from(at).ok()?;
         let namesz = u128::from(le_u32(notes, header)?);
@@ -912,9 +1003,11 @@ fn note_in(notes: &[u8], note: &Note) -> Option<Range<usize>>
         };
         if owned && ty == note.ntype
         {
-            return Some(usize::try_from(desc_start).ok()?..usize::try_from(desc_end).ok()?);
+            return Some(Ok(
+                usize::try_from(desc_start).ok()?..usize::try_from(desc_end).ok()?
+            ));
         }
-        at = align(desc_end);
+        return Some(Err(align(desc_end)));
     }
     None
 }
@@ -1151,4 +1244,483 @@ fn strtab_size(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<u64>
     let index = usize::from(ehdr.e_shstrndx).saturating_mul(usize::from(ehdr.e_shentsize));
     let at = usize::try_from(ehdr.e_shoff).ok()?.saturating_add(index);
     shdr(data, at).map(|(_, _, _, size)| size)
+}
+
+// ── The steps of the walks ───────────────────────────────────────────────────
+//
+// Each walk of the parsers is a loop that reads one element and hands it to a
+// step function, which holds all the walk does with the element. The checks
+// below hold each step to the model's step on any element and any state, so
+// the proofs cover a walk of any length by induction: the proofs of the
+// whole walks on short tables are the base, and these the step.
+
+/// Program header decoded from `bytes` by the parser's decode, which
+/// [`phdr_read_holds`] checks.
+fn decoded_phdr(bytes: &[u8; PHDR_BYTES]) -> Option<crate::Elf64Phdr>
+{
+    let decoded = crate::decode_phdr(bytes);
+    assert!(decoded.is_some(), "a whole program header was refused");
+    decoded
+}
+
+/// The steps of the program-header folds hold on the header `bytes`: in an
+/// image of `data_len` bytes, [`load_segments`]'s and [`tls_segment`]'s as
+/// their folds' checks describe them for one header; [`load_span`]'s widening
+/// of the span `span` of the headers before it; [`relro_span`]'s and
+/// `rela_table`'s searches for their first header; and the resolution of a
+/// table of link VA `vaddr` and `size` bytes in a file of `file_size`, as
+/// [`expected_in_load`] describes it.
+pub(crate) fn phdr_steps_hold(
+    bytes: &[u8; PHDR_BYTES],
+    data_len: usize,
+    span: Option<(u64, u64)>,
+    table: (u64, u64),
+    file_size: u64,
+)
+{
+    let Some(h) = decoded_phdr(bytes)
+    else
+    {
+        return;
+    };
+    let p = phdr_at(bytes, 0);
+    let fits = inside(p.offset, p.filesz, data_len);
+
+    let load = crate::load_segment_of(&h, data_len);
+    match load
+    {
+        None => assert!(p.ty != PT_LOAD, "a PT_LOAD header was skipped"),
+        Some(Err(e)) =>
+        {
+            assert!(
+                p.ty == PT_LOAD && !fits,
+                "a segment inside the image was refused"
+            );
+            assert_eq!(
+                e,
+                ElfError::SegmentOverflow,
+                "a segment was refused for another cause"
+            );
+        }
+        Some(Ok(s)) =>
+        {
+            assert!(
+                p.ty == PT_LOAD && fits,
+                "a segment past the image was yielded"
+            );
+            let same = s.vaddr == p.vaddr
+                && s.paddr == p.paddr
+                && s.offset == p.offset
+                && s.filesz == p.filesz
+                && s.memsz == p.memsz
+                && s.writable == (p.flags & 2 != 0)
+                && s.executable == (p.flags & 1 != 0);
+            assert!(
+                same,
+                "a segment was yielded with other fields than its header's"
+            );
+        }
+    }
+
+    let tls = crate::tls_segment_of(&h, data_len);
+    let tls_fits = fits && p.filesz <= p.memsz;
+    match tls
+    {
+        None => assert!(p.ty != PT_TLS, "a PT_TLS header was skipped"),
+        Some(Err(e)) =>
+        {
+            assert!(
+                p.ty == PT_TLS && !tls_fits,
+                "a template that fits was refused"
+            );
+            assert_eq!(
+                e,
+                ElfError::SegmentOverflow,
+                "a template was refused for another cause"
+            );
+        }
+        Some(Ok(t)) =>
+        {
+            assert!(
+                p.ty == PT_TLS && tls_fits,
+                "a template that does not fit was taken"
+            );
+            let same = t.vaddr == p.vaddr
+                && t.offset == p.offset
+                && t.filesz == p.filesz
+                && t.memsz == p.memsz
+                && t.align == p.align;
+            assert!(
+                same,
+                "a template was read with other fields than its header's"
+            );
+        }
+    }
+
+    search_steps_hold(&h, &p, span, table, file_size);
+}
+
+/// The steps of [`phdr_steps_hold`] past the segment and template ones, on
+/// the header `h` the model reads as `p`.
+fn search_steps_hold(
+    h: &crate::Elf64Phdr,
+    p: &Phdr,
+    span: Option<(u64, u64)>,
+    table: (u64, u64),
+    file_size: u64,
+)
+{
+    let widened = if p.ty != PT_LOAD || p.memsz == 0
+    {
+        Ok(span)
+    }
+    else
+    {
+        u64::try_from(sum(p.vaddr, p.memsz))
+            .map_err(|_| ElfError::SegmentOverflow)
+            .map(|end| {
+                Some(span.map_or((p.vaddr, end), |(min, max)| {
+                    (min.min(p.vaddr), max.max(end))
+                }))
+            })
+    };
+    assert_eq!(
+        crate::span_step(span, h),
+        widened,
+        "a header widened the span against its fields"
+    );
+
+    assert_eq!(
+        crate::relro_of(h),
+        (p.ty == PT_GNU_RELRO && p.memsz > 0).then_some((p.vaddr, p.memsz)),
+        "another RELRO span was read from a header"
+    );
+    assert_eq!(
+        crate::dynamic_of(h),
+        (p.ty == PT_DYNAMIC).then_some((p.offset, p.filesz)),
+        "another dynamic segment was read from a header"
+    );
+
+    let (vaddr, size) = table;
+    if let Ok(table_end) = u64::try_from(sum(vaddr, size))
+    {
+        let request = crate::RelaRequest {
+            vaddr,
+            size,
+            table_end,
+        };
+        assert_eq!(
+            crate::rela_in_load(h, &request, file_size),
+            expected_in_load(p, vaddr, size, file_size),
+            "a header resolved the table against its fields"
+        );
+    }
+}
+
+/// [`parse_dynamic`](crate::parse_dynamic)'s step at the entry `entry`, from
+/// a summary holding any tags `before`, records the entry as [`tag_step`]
+/// does and ends the walk where it does.
+pub(crate) fn dynamic_step_holds(entry: &[u8; 16], before: &Tags)
+{
+    let mut summary = summary_of(before);
+    let mut tags = *before;
+    let goes_on = crate::dynamic_step(&mut summary, entry);
+    assert_eq!(
+        goes_on,
+        tag_step(&mut tags, entry),
+        "the dynamic walk ended at another entry"
+    );
+    assert!(
+        holds_tags(&summary, &tags),
+        "an entry was recorded under another tag"
+    );
+}
+
+/// The table a summary of any tags asks for,
+/// [`rela_request`](crate::rela_request), is the one [`expected_request`]
+/// describes, with its link-VA end.
+pub(crate) fn request_holds(tags: &Tags)
+{
+    let got = crate::rela_request(&summary_of(tags))
+        .map(|request| request.map(|r| (r.vaddr, r.size, r.table_end)));
+    let expected = expected_request(tags)
+        .map(|request| request.map(|(vaddr, size)| (vaddr, size, vaddr.wrapping_add(size))));
+    assert_eq!(got, expected, "another table was asked for");
+}
+
+/// The record walks' step at the record `bytes`,
+/// [`relative_of`](crate::relative_of), takes it when it is of type
+/// `rtype` and names no symbol, with its fields, and refuses it otherwise.
+pub(crate) fn record_step_holds(bytes: &[u8; RELA_ENTRY_SIZE], rtype: u32)
+{
+    let (offset, ty, sym, addend) = record(bytes);
+    match crate::relative_of(bytes, rtype)
+    {
+        Ok(rela) =>
+        {
+            assert!(
+                ty == rtype && sym == 0,
+                "a record of another type or with a symbol was taken"
+            );
+            assert!(
+                rela.offset == offset && rela.rtype == ty && rela.addend == addend,
+                "a record was taken with other fields than its bytes'"
+            );
+        }
+        Err(e) =>
+        {
+            assert!(ty != rtype || sym != 0, "a RELATIVE record was refused");
+            assert_eq!(
+                e,
+                ElfError::UnsupportedRelocation,
+                "a record was refused for another cause"
+            );
+        }
+    }
+}
+
+/// [`apply_relative_relocs`]'s step at the record `bytes`,
+/// [`apply_one`](crate::apply_one), on a span of `len` bytes (at most
+/// `SPAN`, a multiple of 8) from link VA `span_vaddr` that does not pass the
+/// top of the address space, writes `bias + r_addend` at the record's target
+/// when its 8 bytes lie in the span and nothing otherwise, and says whether it
+/// wrote.
+pub(crate) fn apply_step_holds<const SPAN: usize>(
+    bytes: &[u8; RELA_ENTRY_SIZE],
+    bias: u64,
+    span_vaddr: u64,
+    len: usize,
+)
+{
+    const { assert!(SPAN.is_multiple_of(8), "the span is compared in words") };
+    let len = len.min(SPAN);
+    let Ok(span_end) = u64::try_from(sum(span_vaddr, len as u64))
+    else
+    {
+        return;
+    };
+    let rela = decode_rela(bytes);
+    let mut got = [UNWRITTEN; SPAN];
+    let wrote = crate::apply_one(
+        &rela,
+        bias,
+        span_vaddr,
+        span_end,
+        got.get_mut(..len).unwrap_or_default(),
+    );
+    let (offset, _, _, addend) = record(bytes);
+    let mut expected = [UNWRITTEN; SPAN];
+    let inside_span = offset >= span_vaddr && sum(offset, 8) <= u128::from(span_end);
+    if inside_span
+    {
+        let at = usize::try_from(offset.saturating_sub(span_vaddr)).unwrap_or(usize::MAX);
+        if let Some(target) = expected
+            .get_mut(at..)
+            .and_then(<[u8]>::first_chunk_mut::<8>)
+        {
+            *target = bias.wrapping_add(addend.cast_unsigned()).to_le_bytes();
+        }
+    }
+    assert_eq!(
+        wrote, inside_span,
+        "a record was applied against its target"
+    );
+    for (got, want) in got
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<8>().0)
+    {
+        assert_eq!(
+            u64::from_le_bytes(*got),
+            u64::from_le_bytes(*want),
+            "a span byte was written against the record"
+        );
+    }
+}
+
+/// The note walk's step at offset `at` of `notes`,
+/// [`note_step`](crate::note_step), judges the record there as [`note_at`]
+/// does.
+pub(crate) fn note_step_holds(notes: &[u8], at: usize, note: &Note)
+{
+    let got = crate::note_step(notes, at, note.owner, note.ntype);
+    let expected = note_at(notes, at as u128, note);
+    match (got, expected)
+    {
+        (None, None) =>
+        {}
+        (Some(crate::NoteStep::Found(desc)), Some(Ok(want))) =>
+        {
+            assert_eq!(desc, want, "another descriptor was found");
+        }
+        (Some(crate::NoteStep::Next(next)), Some(Err(want))) =>
+        {
+            assert_eq!(next as u128, want, "the walk went on at another record");
+        }
+        (got, expected) => assert!(
+            got.is_none() && expected.is_none(),
+            "a note record was judged against its fields"
+        ),
+    }
+}
+
+/// The note locators' step at the section header `bytes`,
+/// [`is_note_section`](crate::is_note_section), takes it exactly when it is
+/// `SHT_NOTE` and named `note`'s section in `strtab`.
+pub(crate) fn section_step_holds(bytes: &[u8; SHDR_BYTES], strtab: &[u8], note: &Note)
+{
+    let decoded = crate::decode_shdr(bytes);
+    assert!(decoded.is_some(), "a whole section header was refused");
+    let Some(h) = decoded
+    else
+    {
+        return;
+    };
+    let Some((name, ty, _, _)) = shdr(bytes, 0)
+    else
+    {
+        return;
+    };
+    assert_eq!(
+        crate::is_note_section(&h, strtab, note.section),
+        ty == SHT_NOTE && named(strtab, name as usize, note.section),
+        "a section was taken, or passed over, against its header"
+    );
+}
+
+/// The section-header reads of the note locators,
+/// [`read_shdr`](crate::read_shdr) and, through a reader of `data`,
+/// [`read_shdr_streaming`](crate::read_shdr_streaming), decode the 64 bytes
+/// at `shoff + index * shentsize` of `data` when they lie inside it, as the
+/// fields the locators read (name, type, offset, size), and refuse otherwise.
+pub(crate) fn shdr_read_holds(data: &[u8], shoff: usize, shentsize: usize, index: usize)
+{
+    let at = (shoff as u128).saturating_add((index as u128).saturating_mul(shentsize as u128));
+    let expected = if at.saturating_add(SHDR_BYTES as u128) <= data.len() as u128
+    {
+        shdr(data, usize::try_from(at).unwrap_or(usize::MAX))
+    }
+    else
+    {
+        None
+    };
+    let fields = |h: crate::Elf64Shdr| (h.sh_name, h.sh_type, h.sh_offset, h.sh_size);
+    assert_eq!(
+        crate::read_shdr(data, shoff, shentsize, index).map(fields),
+        expected,
+        "a section header was read, or refused, against its place"
+    );
+    let mut read = read_of(data);
+    assert_eq!(
+        crate::read_shdr_streaming(shoff as u64, shentsize, index, &mut read).map(fields),
+        expected,
+        "a streamed section header was read, or refused, against its place"
+    );
+}
+
+/// The file-range reads of the note locators: [`slice_at`](crate::slice_at)
+/// is the `size` bytes of `data` at `offset` when they lie inside it and
+/// `None` otherwise; and [`read_exact_at`](crate::read_exact_at), through a
+/// reader of `data`, fills `len` bytes (at most `BUF`) with `data`'s bytes
+/// at `offset` when they lie inside both `data` and `file_size` bytes, and
+/// refuses otherwise.
+pub(crate) fn range_read_holds<const BUF: usize>(
+    data: &[u8],
+    offset: u64,
+    size: u64,
+    len: usize,
+    file_size: u64,
+)
+{
+    let place = |bytes: &[u8]| (bytes.as_ptr().addr(), bytes.len());
+    let expected = inside(offset, size, data.len()).then(|| slice(data, offset, size));
+    assert_eq!(
+        crate::slice_at(data, offset, size).map(place),
+        expected.map(place),
+        "a file range was sliced against its place"
+    );
+    let len = len.min(BUF);
+    let mut buf = [0u8; BUF];
+    let dst = buf.get_mut(..len).unwrap_or_default();
+    let mut read = read_of(data);
+    let got = crate::read_exact_at(offset, dst, file_size, &mut read);
+    let end = sum(offset, len as u64);
+    let fits = end <= u128::from(file_size) && end <= data.len() as u128;
+    assert_eq!(
+        got.is_some(),
+        fits,
+        "a file range was read, or refused, against its place"
+    );
+    if fits
+    {
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        // Every byte under a test or the fuzzer; under a proof any one.
+        #[cfg(not(kani))]
+        for at in 0..len
+        {
+            assert_eq!(
+                buf.get(at),
+                data.get(start.saturating_add(at)),
+                "a file byte was misread"
+            );
+        }
+        #[cfg(kani)]
+        {
+            let at: usize = kani::any();
+            if at < len
+            {
+                assert_eq!(
+                    buf.get(at),
+                    data.get(start.saturating_add(at)),
+                    "a file byte was misread"
+                );
+            }
+        }
+    }
+}
+
+/// The step checks on `input`: its front read as a program header, a dynamic
+/// entry, a relocation record, a section header and note records, with the
+/// states and parameters its later bytes name.
+fn steps_hold(input: &[u8])
+{
+    let word = |at: usize| le_u64(input, at).unwrap_or(0);
+    let first = usize::from(input.first().copied().unwrap_or(0));
+    if let Some(bytes) = input.first_chunk::<PHDR_BYTES>()
+    {
+        let span = (word(8) & 1 == 0).then_some((word(16), word(24)));
+        phdr_steps_hold(bytes, input.len(), span, (word(32), word(40)), word(48));
+    }
+    if let Some(bytes) = input.first_chunk::<16>()
+    {
+        let before = Tags {
+            rela: Some(word(16)),
+            relasz: Some(word(24)),
+            relaent: Some(RELA_ENTRY_SIZE as u64),
+            ..Tags::default()
+        };
+        dynamic_step_holds(bytes, &before);
+        request_holds(&before);
+    }
+    if let Some(bytes) = input.first_chunk::<RELA_ENTRY_SIZE>()
+    {
+        for rtype in [R_X86_64_RELATIVE, R_RISCV_RELATIVE]
+        {
+            record_step_holds(bytes, rtype);
+        }
+        apply_step_holds::<MAX_SPAN>(bytes, word(24), word(0), first);
+    }
+    if let Some(bytes) = input.first_chunk::<SHDR_BYTES>()
+    {
+        section_step_holds(bytes, input, &STACK);
+    }
+    note_step_holds(input, first, &STACK);
+    shdr_read_holds(
+        input,
+        first,
+        usize::from(input.get(1).copied().unwrap_or(0)),
+        1,
+    );
+    range_read_holds::<NOTE_BUF>(input, word(0) & 0xFFF, word(8) & 0xFFF, first, word(16));
 }

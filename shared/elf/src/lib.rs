@@ -480,32 +480,44 @@ impl Iterator for LoadSegmentIter<'_>
                 }
             };
 
-            if phdr.p_type != PT_LOAD
+            if let Some(item) = load_segment_of(&phdr, self.data.len())
             {
-                continue;
+                return Some(item);
             }
-
-            // Validate that the file data for this segment is in bounds.
-            let seg_end = (phdr.p_offset as usize).checked_add(phdr.p_filesz as usize);
-            match seg_end
-            {
-                Some(end) if end <= self.data.len() =>
-                {}
-                _ => return Some(Err(ElfError::SegmentOverflow)),
-            }
-
-            return Some(Ok(LoadSegment {
-                vaddr: phdr.p_vaddr,
-                paddr: phdr.p_paddr,
-                offset: phdr.p_offset,
-                filesz: phdr.p_filesz,
-                memsz: phdr.p_memsz,
-                writable: phdr.p_flags & PF_W != 0,
-                executable: phdr.p_flags & PF_X != 0,
-            }));
         }
         None
     }
+}
+
+/// The step of [`load_segments`] at one program header: `None` for a header
+/// of another type than `PT_LOAD`; for a `PT_LOAD` header,
+/// `Err(`[`ElfError::SegmentOverflow`]`)` when its file data passes the end
+/// of an image of `data_len` bytes, else the segment it describes.
+fn load_segment_of(phdr: &Elf64Phdr, data_len: usize) -> Option<Result<LoadSegment, ElfError>>
+{
+    if phdr.p_type != PT_LOAD
+    {
+        return None;
+    }
+
+    // Validate that the file data for this segment is in bounds.
+    let seg_end = (phdr.p_offset as usize).checked_add(phdr.p_filesz as usize);
+    match seg_end
+    {
+        Some(end) if end <= data_len =>
+        {}
+        _ => return Some(Err(ElfError::SegmentOverflow)),
+    }
+
+    Some(Ok(LoadSegment {
+        vaddr: phdr.p_vaddr,
+        paddr: phdr.p_paddr,
+        offset: phdr.p_offset,
+        filesz: phdr.p_filesz,
+        memsz: phdr.p_memsz,
+        writable: phdr.p_flags & PF_W != 0,
+        executable: phdr.p_flags & PF_X != 0,
+    }))
 }
 
 /// Return an iterator over `PT_LOAD` segments in a validated ELF image.
@@ -558,30 +570,42 @@ pub fn tls_segment(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<TlsSegment>, 
     for i in 0..phdr_count
     {
         let phdr = read_phdr_at(data, phdr_base, i)?;
-
-        if phdr.p_type != PT_TLS
+        if let Some(template) = tls_segment_of(&phdr, data.len())
         {
-            continue;
+            return template.map(Some);
         }
-
-        let seg_end = (phdr.p_offset as usize).checked_add(phdr.p_filesz as usize);
-        match seg_end
-        {
-            Some(end) if end <= data.len() && phdr.p_filesz <= phdr.p_memsz =>
-            {}
-            _ => return Err(ElfError::SegmentOverflow),
-        }
-
-        return Ok(Some(TlsSegment {
-            vaddr: phdr.p_vaddr,
-            offset: phdr.p_offset,
-            filesz: phdr.p_filesz,
-            memsz: phdr.p_memsz,
-            align: phdr.p_align,
-        }));
     }
 
     Ok(None)
+}
+
+/// The step of [`tls_segment`] at one program header: `None` for a header of
+/// another type than `PT_TLS`; for a `PT_TLS` header,
+/// `Err(`[`ElfError::SegmentOverflow`]`)` when its file data passes the end
+/// of an image of `data_len` bytes or its `p_filesz` passes its `p_memsz`,
+/// else the template it describes.
+fn tls_segment_of(phdr: &Elf64Phdr, data_len: usize) -> Option<Result<TlsSegment, ElfError>>
+{
+    if phdr.p_type != PT_TLS
+    {
+        return None;
+    }
+
+    let seg_end = (phdr.p_offset as usize).checked_add(phdr.p_filesz as usize);
+    match seg_end
+    {
+        Some(end) if end <= data_len && phdr.p_filesz <= phdr.p_memsz =>
+        {}
+        _ => return Some(Err(ElfError::SegmentOverflow)),
+    }
+
+    Some(Ok(TlsSegment {
+        vaddr: phdr.p_vaddr,
+        offset: phdr.p_offset,
+        filesz: phdr.p_filesz,
+        memsz: phdr.p_memsz,
+        align: phdr.p_align,
+    }))
 }
 
 // ── ELF note locator ────────────────────────────────────────────────────────
@@ -667,8 +691,7 @@ pub fn find_note<'a>(
         {
             continue;
         };
-        if shdr.sh_type != SHT_NOTE
-            || !section_name_eq(strtab_bytes, shdr.sh_name as usize, section)
+        if !is_note_section(&shdr, strtab_bytes, section)
         {
             continue;
         }
@@ -772,8 +795,7 @@ where
         // A failed header read ends the search: each read can cost the
         // caller a bounded wait on its file server, so none follows it.
         let shdr = read_shdr_streaming(shoff, shentsize, i, &mut read_at)?;
-        if shdr.sh_type != SHT_NOTE
-            || !section_name_eq(strtab_bytes, shdr.sh_name as usize, section)
+        if !is_note_section(&shdr, strtab_bytes, section)
         {
             continue;
         }
@@ -838,30 +860,52 @@ pub const MAX_STREAMING_STRTAB: usize = 4096;
 fn note_desc(notes: &[u8], owner: &[u8], ntype: u32) -> Option<core::ops::Range<usize>>
 {
     let mut at = 0usize;
-    while let Some(record) = notes.get(at..).filter(|r| r.len() >= NOTE_HEADER_BYTES)
+    loop
     {
-        let mut header = Fields(record);
-        let namesz = header.u32()? as usize;
-        let descsz = header.u32()? as usize;
-        let ty = header.u32()?;
-        let name_start = at.checked_add(NOTE_HEADER_BYTES)?;
-        let name_end = name_start.checked_add(namesz)?;
-        let desc_start = name_start.checked_add(align4(namesz)?)?;
-        let desc_end = desc_start.checked_add(descsz)?;
-        if desc_end > notes.len()
+        match note_step(notes, at, owner, ntype)?
         {
-            return None;
+            NoteStep::Found(desc) => return Some(desc),
+            NoteStep::Next(next) => at = next,
         }
-        // The name is the owner and its NUL.
-        let named =
-            notes.get(name_start..name_end).and_then(<[u8]>::split_last) == Some((&0, owner));
-        if named && ty == ntype
-        {
-            return Some(desc_start..desc_end);
-        }
-        at = align4(desc_end)?;
     }
-    None
+}
+
+/// What [`note_desc`] makes of the record at one offset.
+#[cfg_attr(any(test, kani, fuzzing), derive(Debug, PartialEq, Eq))]
+enum NoteStep
+{
+    /// The record is the note: its descriptor's byte range.
+    Found(core::ops::Range<usize>),
+    /// The record is another: the offset of the next.
+    Next(usize),
+}
+
+/// The step of [`note_desc`] at offset `at` of `notes`: the record there,
+/// judged as `note_desc` documents; `None` when no whole header starts there,
+/// or its name or descriptor runs past `notes` or overflows, which ends the
+/// walk.
+fn note_step(notes: &[u8], at: usize, owner: &[u8], ntype: u32) -> Option<NoteStep>
+{
+    let record = notes.get(at..).filter(|r| r.len() >= NOTE_HEADER_BYTES)?;
+    let mut header = Fields(record);
+    let namesz = header.u32()? as usize;
+    let descsz = header.u32()? as usize;
+    let ty = header.u32()?;
+    let name_start = at.checked_add(NOTE_HEADER_BYTES)?;
+    let name_end = name_start.checked_add(namesz)?;
+    let desc_start = name_start.checked_add(align4(namesz)?)?;
+    let desc_end = desc_start.checked_add(descsz)?;
+    if desc_end > notes.len()
+    {
+        return None;
+    }
+    // The name is the owner and its NUL.
+    let named = notes.get(name_start..name_end).and_then(<[u8]>::split_last) == Some((&0, owner));
+    if named && ty == ntype
+    {
+        return Some(NoteStep::Found(desc_start..desc_end));
+    }
+    Some(NoteStep::Next(align4(desc_end)?))
 }
 
 /// `n` rounded up to the 4-byte alignment of a note's fields; `None` on
@@ -976,6 +1020,13 @@ impl Fields<'_>
     }
 }
 
+/// The step of the note locators' section walk at one section header: whether
+/// it is `SHT_NOTE` and named `section` in the section name table `strtab`.
+fn is_note_section(shdr: &Elf64Shdr, strtab: &[u8], section: &str) -> bool
+{
+    shdr.sh_type == SHT_NOTE && section_name_eq(strtab, shdr.sh_name as usize, section)
+}
+
 /// Whether the NUL-terminated name at `offset` in `strtab` is `expected`.
 fn section_name_eq(strtab: &[u8], offset: usize, expected: &str) -> bool
 {
@@ -1007,29 +1058,38 @@ fn section_name_eq(strtab: &[u8], offset: usize, expected: &str) -> bool
 ///   overflows.
 pub fn load_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<(u64, u64), ElfError>
 {
-    let mut min_vaddr = u64::MAX;
-    let mut max_end = 0u64;
-    let mut found = false;
+    let mut span = None;
     for i in 0..ehdr.e_phnum as usize
     {
-        let phdr = read_phdr(data, ehdr, i)?;
-        if phdr.p_type != PT_LOAD || phdr.p_memsz == 0
-        {
-            continue;
-        }
-        let end = phdr
-            .p_vaddr
-            .checked_add(phdr.p_memsz)
-            .ok_or(ElfError::SegmentOverflow)?;
-        min_vaddr = min_vaddr.min(phdr.p_vaddr);
-        max_end = max_end.max(end);
-        found = true;
+        span = span_step(span, &read_phdr(data, ehdr, i)?)?;
     }
-    if !found
+    span.ok_or(ElfError::NoSegments)
+}
+
+/// The step of [`load_span`] at one program header: the span `(min_vaddr,
+/// max_vaddr_end)` of the headers before it (`None` before the first
+/// counted one) widened to a `PT_LOAD` header of nonzero `p_memsz`, and left
+/// as it is for any other header.
+///
+/// # Errors
+///
+/// [`ElfError::SegmentOverflow`] if a counted header's `p_vaddr + p_memsz`
+/// overflows.
+fn span_step(span: Option<(u64, u64)>, phdr: &Elf64Phdr) -> Result<Option<(u64, u64)>, ElfError>
+{
+    if phdr.p_type != PT_LOAD || phdr.p_memsz == 0
     {
-        return Err(ElfError::NoSegments);
+        return Ok(span);
     }
-    Ok((min_vaddr, max_end))
+    let end = phdr
+        .p_vaddr
+        .checked_add(phdr.p_memsz)
+        .ok_or(ElfError::SegmentOverflow)?;
+    Ok(Some(match span
+    {
+        Some((min_vaddr, max_end)) => (min_vaddr.min(phdr.p_vaddr), max_end.max(end)),
+        None => (phdr.p_vaddr, end),
+    }))
 }
 
 /// Return the `PT_GNU_RELRO` span `(vaddr, memsz)`, or `Ok(None)` when the
@@ -1049,13 +1109,19 @@ pub fn relro_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<(u64, u64)>, E
 {
     for i in 0..ehdr.e_phnum as usize
     {
-        let phdr = read_phdr(data, ehdr, i)?;
-        if phdr.p_type == PT_GNU_RELRO && phdr.p_memsz > 0
+        if let Some(span) = relro_of(&read_phdr(data, ehdr, i)?)
         {
-            return Ok(Some((phdr.p_vaddr, phdr.p_memsz)));
+            return Ok(Some(span));
         }
     }
     Ok(None)
+}
+
+/// The step of [`relro_span`] at one program header: its `(p_vaddr,
+/// p_memsz)` when it is `PT_GNU_RELRO` of nonzero `p_memsz`, else `None`.
+fn relro_of(phdr: &Elf64Phdr) -> Option<(u64, u64)>
+{
+    (phdr.p_type == PT_GNU_RELRO && phdr.p_memsz > 0).then_some((phdr.p_vaddr, phdr.p_memsz))
 }
 
 // ── PT_DYNAMIC / RELATIVE relocations ────────────────────────────────────────
@@ -1145,27 +1211,39 @@ fn parse_dynamic(dyn_bytes: &[u8]) -> DynamicSummary
     let mut summary = DynamicSummary::default();
     for entry in dyn_bytes.as_chunks::<DYN_ENTRY_SIZE>().0
     {
-        let mut b = Fields(entry.as_slice());
-        let (Some(tag), Some(val)) = (b.i64(), b.u64())
-        else
+        if !dynamic_step(&mut summary, entry)
         {
             break;
-        };
-        match tag
-        {
-            DT_NULL => break,
-            DT_RELA => summary.rela = Some(val),
-            DT_RELASZ => summary.relasz = Some(val),
-            DT_RELAENT => summary.relaent = Some(val),
-            DT_PLTRELSZ => summary.pltrelsz = val,
-            DT_JMPREL => summary.jmprel = true,
-            DT_REL => summary.rel = true,
-            DT_RELR | DT_RELRSZ => summary.relr = true,
-            _ =>
-            {}
         }
     }
     summary
+}
+
+/// The step of [`parse_dynamic`] at one `Elf64_Dyn` entry: records its value
+/// under the tag it names in `summary`, a later tag replacing an earlier one;
+/// `false` at `DT_NULL`, which ends the walk.
+fn dynamic_step(summary: &mut DynamicSummary, entry: &[u8; DYN_ENTRY_SIZE]) -> bool
+{
+    let mut b = Fields(entry.as_slice());
+    let (Some(tag), Some(val)) = (b.i64(), b.u64())
+    else
+    {
+        return false;
+    };
+    match tag
+    {
+        DT_NULL => return false,
+        DT_RELA => summary.rela = Some(val),
+        DT_RELASZ => summary.relasz = Some(val),
+        DT_RELAENT => summary.relaent = Some(val),
+        DT_PLTRELSZ => summary.pltrelsz = val,
+        DT_JMPREL => summary.jmprel = true,
+        DT_REL => summary.rel = true,
+        DT_RELR | DT_RELRSZ => summary.relr = true,
+        _ =>
+        {}
+    }
+    true
 }
 
 /// Validate the gathered dynamic tags and resolve the table's file offset
@@ -1176,6 +1254,34 @@ fn resolve_rela_table(
     phdr_data: &[u8],
     file_size: u64,
 ) -> Result<Option<RelaTable>, ElfError>
+{
+    let Some(request) = rela_request(summary)?
+    else
+    {
+        return Ok(None);
+    };
+    for i in 0..ehdr.e_phnum as usize
+    {
+        if let Some(table) = rela_in_load(&read_phdr(phdr_data, ehdr, i)?, &request, file_size)
+        {
+            return table.map(Some);
+        }
+    }
+    Err(ElfError::MalformedDynamic)
+}
+
+/// The table the gathered dynamic tags ask for, before it is resolved: its
+/// link VA, its size and the end of its link-VA range; `None` for no table
+/// or an empty one.
+///
+/// # Errors
+///
+/// - [`ElfError::UnsupportedRelocation`] for a format the loaders do not
+///   apply (`DT_REL`, `DT_RELR`, active `DT_JMPREL`).
+/// - [`ElfError::MalformedDynamic`] for a missing counterpart tag, a
+///   `DT_RELAENT` other than [`RELA_ENTRY_SIZE`], a size not a multiple of
+///   it, or a range that overflows.
+fn rela_request(summary: &DynamicSummary) -> Result<Option<RelaRequest>, ElfError>
 {
     // A table format the loaders cannot apply must reject the image, not be
     // silently skipped: an unrelocated PIE is corrupt, not degraded.
@@ -1195,39 +1301,64 @@ fn resolve_rela_table(
         return Err(ElfError::MalformedDynamic);
     }
     let table_end = vaddr.checked_add(size).ok_or(ElfError::MalformedDynamic)?;
+    Ok(Some(RelaRequest {
+        vaddr,
+        size,
+        table_end,
+    }))
+}
 
-    for i in 0..ehdr.e_phnum as usize
+/// A relocation table the dynamic tags ask for: its link VA, its size, and
+/// `vaddr + size`.
+struct RelaRequest
+{
+    vaddr: u64,
+    size: u64,
+    table_end: u64,
+}
+
+/// The step of [`resolve_rela_table`] at one program header: `None` when it
+/// is not a `PT_LOAD` header whose file data backs the whole of `request`;
+/// for one that does, the table at its file offset.
+///
+/// # Errors
+///
+/// [`ElfError::MalformedDynamic`] if a `PT_LOAD` header's `p_vaddr +
+/// p_filesz` overflows, or the table's file range overflows or passes
+/// `file_size`.
+fn rela_in_load(
+    phdr: &Elf64Phdr,
+    request: &RelaRequest,
+    file_size: u64,
+) -> Option<Result<RelaTable, ElfError>>
+{
+    if phdr.p_type != PT_LOAD
     {
-        let phdr = read_phdr(phdr_data, ehdr, i)?;
-        if phdr.p_type != PT_LOAD
-        {
-            continue;
-        }
-        let seg_file_end = phdr
-            .p_vaddr
-            .checked_add(phdr.p_filesz)
-            .ok_or(ElfError::MalformedDynamic)?;
-        if vaddr >= phdr.p_vaddr && table_end <= seg_file_end
-        {
-            let file_offset = vaddr
-                .checked_sub(phdr.p_vaddr)
-                .and_then(|into| phdr.p_offset.checked_add(into))
-                .ok_or(ElfError::MalformedDynamic)?;
-            let file_end = file_offset
-                .checked_add(size)
-                .ok_or(ElfError::MalformedDynamic)?;
-            if file_end > file_size
-            {
-                return Err(ElfError::MalformedDynamic);
-            }
-            return Ok(Some(RelaTable {
-                vaddr,
-                file_offset,
-                size,
-            }));
-        }
+        return None;
     }
-    Err(ElfError::MalformedDynamic)
+    let Some(seg_file_end) = phdr.p_vaddr.checked_add(phdr.p_filesz)
+    else
+    {
+        return Some(Err(ElfError::MalformedDynamic));
+    };
+    if request.vaddr < phdr.p_vaddr || request.table_end > seg_file_end
+    {
+        return None;
+    }
+    let file_offset = request
+        .vaddr
+        .checked_sub(phdr.p_vaddr)
+        .and_then(|into| phdr.p_offset.checked_add(into));
+    let file_end = file_offset.and_then(|start| start.checked_add(request.size));
+    Some(match (file_offset, file_end)
+    {
+        (Some(file_offset), Some(file_end)) if file_end <= file_size => Ok(RelaTable {
+            vaddr: request.vaddr,
+            file_offset,
+            size: request.size,
+        }),
+        _ => Err(ElfError::MalformedDynamic),
+    })
 }
 
 /// Locate the `PT_DYNAMIC` program header; returns `(p_offset, p_filesz)`,
@@ -1241,13 +1372,19 @@ fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Result<Option<(u64, 
 {
     for i in 0..ehdr.e_phnum as usize
     {
-        let phdr = read_phdr(phdr_data, ehdr, i)?;
-        if phdr.p_type == PT_DYNAMIC
+        if let Some(segment) = dynamic_of(&read_phdr(phdr_data, ehdr, i)?)
         {
-            return Ok(Some((phdr.p_offset, phdr.p_filesz)));
+            return Ok(Some(segment));
         }
     }
     Ok(None)
+}
+
+/// The step of [`find_dynamic_phdr`] at one program header: its `(p_offset,
+/// p_filesz)` when it is `PT_DYNAMIC`, else `None`.
+fn dynamic_of(phdr: &Elf64Phdr) -> Option<(u64, u64)>
+{
+    (phdr.p_type == PT_DYNAMIC).then_some((phdr.p_offset, phdr.p_filesz))
 }
 
 /// Locate the `.rela.dyn` table of a fully-mapped, validated ELF image.
@@ -1305,15 +1442,23 @@ impl Iterator for RelativeRelocIter<'_>
     {
         let (bytes, rest) = self.table.split_first_chunk::<RELA_ENTRY_SIZE>()?;
         self.table = rest;
-        let (rela, sym) = decode_rela_record(bytes);
-        // r_info's high half is the symbol index; RELATIVE records must not
-        // reference a symbol.
-        if rela.rtype != self.expected_rtype || sym != 0
-        {
-            return Some(Err(ElfError::UnsupportedRelocation));
-        }
-        Some(Ok(rela))
+        Some(relative_of(bytes, self.expected_rtype))
     }
+}
+
+/// The step of [`RelativeRelocIter`] at one record: its decode when it is of
+/// type `expected_rtype` and names no symbol, else
+/// `Err(`[`ElfError::UnsupportedRelocation`]`)`.
+fn relative_of(bytes: &[u8; RELA_ENTRY_SIZE], expected_rtype: u32) -> Result<Rela, ElfError>
+{
+    let (rela, sym) = decode_rela_record(bytes);
+    // r_info's high half is the symbol index; RELATIVE records must not
+    // reference a symbol.
+    if rela.rtype != expected_rtype || sym != 0
+    {
+        return Err(ElfError::UnsupportedRelocation);
+    }
+    Ok(rela)
 }
 
 /// Iterate the `RELATIVE` relocations in a raw relocation table.
@@ -1414,29 +1559,41 @@ pub fn apply_relative_relocs(
     let mut applied = 0u64;
     for rela in iter.flatten()
     {
-        let Some(target_end) = rela.offset.checked_add(8)
-        else
+        if apply_one(&rela, bias, span_vaddr, span_end, span)
         {
-            continue;
-        };
-        if rela.offset < span_vaddr || target_end > span_end
-        {
-            continue;
+            // At most one per record of `table`, so the count cannot wrap.
+            applied = applied.saturating_add(1);
         }
-        // `rela.offset >= span_vaddr` here, so the difference is exact, and
-        // the whole target lies in `span`, so the lookup succeeds.
-        let pos = rela.offset.saturating_sub(span_vaddr) as usize;
-        let Some(target) = span.get_mut(pos..).and_then(<[u8]>::first_chunk_mut::<8>)
-        else
-        {
-            continue;
-        };
-        let value = bias.wrapping_add(rela.addend.cast_unsigned());
-        *target = value.to_le_bytes();
-        // At most one per record of `table`, so the count cannot wrap.
-        applied = applied.saturating_add(1);
     }
     applied
+}
+
+/// The step of [`apply_relative_relocs`] at one record: writes `bias +
+/// r_addend`, little-endian, at its 8-byte target when the target lies in
+/// `span`, the bytes of link VAs `[span_vaddr, span_end)`, and whether it
+/// wrote.
+fn apply_one(rela: &Rela, bias: u64, span_vaddr: u64, span_end: u64, span: &mut [u8]) -> bool
+{
+    let Some(target_end) = rela.offset.checked_add(8)
+    else
+    {
+        return false;
+    };
+    if rela.offset < span_vaddr || target_end > span_end
+    {
+        return false;
+    }
+    // `rela.offset >= span_vaddr` here, so the difference is exact, and the
+    // whole target lies in `span`, so the lookup succeeds.
+    let pos = rela.offset.saturating_sub(span_vaddr) as usize;
+    let Some(target) = span.get_mut(pos..).and_then(<[u8]>::first_chunk_mut::<8>)
+    else
+    {
+        return false;
+    };
+    let value = bias.wrapping_add(rela.addend.cast_unsigned());
+    *target = value.to_le_bytes();
+    true
 }
 
 /// Decode program header `idx` of `ehdr`'s table from `data`.
@@ -2510,31 +2667,34 @@ mod tests
 /// verification, Parser proofs), each on every input up to the bounds its
 /// comment states.
 ///
-/// How they compose into the property. The header proof covers the header
-/// checks whole. Every program-header fold reads its headers only through
-/// `read_phdr_at`, which one proof covers for any table place, index and
-/// data; the fold proofs then fix the table at offset 64, right after the
-/// header, so each read is at a constant offset, and run each fold whole on a
-/// table of at most two headers (a first and a later one of its type). The
-/// table proof runs `rela_table` whole on such a table with the dynamic
-/// segment fixed after it, holding at most two entries. The record proofs
-/// run the decode on any record, and the validation and the application
-/// whole on tables of at most two records. The note proofs run the note walk
-/// on records of at most 48 bytes and the section-name compare on a 24-byte
-/// name table at any offset, each whole, for the stack note; and
-/// `find_note` and `find_note_streaming` whole on a table of at most two
-/// section headers at offset 64, the 8-byte name table and the 24-byte note
-/// section fixed after them, for a note of a two-byte section name and a
-/// one-byte owner.
-/// The locators take the names as arguments and reach their bytes only
-/// through the walk and the compare the first two proofs cover, so a short
-/// name stands for the stack note's, and keeps the section's walk within its
-/// bound. `parse_stack_note` is `find_note` for the stack note and
-/// `stack_pages_of`, which a proof covers on any descriptor of up to 12 bytes. What lies outside the proofs is the length of the
-/// walks: the loops over more program headers, dynamic entries, records,
-/// section headers and note records than the bounds, and the chunked read of
-/// a longer table. The fuzz target `elf` and the replay of the checked-in
-/// inputs check them on images of every length.
+/// How they compose into the property. Every walk of the parsers is a loop
+/// that reads one element and hands it to a step function holding all the
+/// walk does with it, and the walks are proven by induction. The step proofs
+/// run each step on any element and any state: the program-header steps of
+/// `load_segments`, `tls_segment`, `load_span`, `relro_span` and the
+/// table resolution (`load_segment_of`, `tls_segment_of`, `span_step`,
+/// `relro_of`, `dynamic_of`, `rela_in_load`); the dynamic walk's
+/// `dynamic_step` on any summary, and the request `rela_request` on any;
+/// the record steps `relative_of` and `apply_one`; the note walk's
+/// `note_step` at any offset; and the section walk's `is_note_section`. The
+/// base proofs run each walk whole on a short table: the folds on at most two
+/// headers fixed at offset 64, the table on two headers and two dynamic
+/// entries fixed after them, the records on at most two, the note walk on 48
+/// bytes, and the locators on two section headers at offset 64 for a note of
+/// a two-byte section name and a one-byte owner, which the name-compare and
+/// note-step proofs stand behind for the stack note's names. The reads that
+/// feed the walks are proven at any place: `read_phdr_at`, `read_shdr`,
+/// `read_shdr_streaming`, `slice_at` and `read_exact_at`. The header proof
+/// covers the header checks whole, a proof the record decode, and one
+/// `stack_pages_of`, which with `find_note` is `parse_stack_note`.
+///
+/// What lies outside the proofs is the loops that drive the steps: the index
+/// loops of the program-header folds, of `resolve_rela_table` and of the
+/// note locators' section walks; the chunk loop of `parse_dynamic`; the
+/// record iteration of `RelativeRelocIter` (`split_first_chunk`) and the
+/// counts of `validate_relative_relocs` and `apply_relative_relocs`; and the
+/// offset loop of `note_desc`. The fuzz target `elf` and the replay of the
+/// checked-in inputs check them on images of every length.
 #[cfg(kani)]
 mod proofs
 {
@@ -2655,10 +2815,13 @@ mod proofs
         }
     }
 
-    /// `rela_table` locates the table its tags and `PT_LOAD` headers say, on
-    /// a table of at most two headers whose `PT_DYNAMIC` segment starts right
-    /// after it and holds at most two 16-byte entries: a tag, and a later one
-    /// that replaces it or ends the walk. Every other field is any value. The
+    /// The base of the table's walks: `rela_table` on a table of at most two
+    /// headers whose `PT_DYNAMIC` segment starts right after it and holds at
+    /// most two 16-byte entries (a tag, and a later one that replaces it or
+    /// ends the walk). Two entries cannot name the three tags a table needs,
+    /// so this proof reaches the refusals and the empty table; the request a
+    /// summary of any tags makes, and its resolution through any `PT_LOAD`
+    /// header, are the step proofs'. Every other field is any value. The
     /// longest loops are the walks of the two headers and the two entries, so
     /// an unwind bound of 3 covers them.
     #[kani::proof]
@@ -2724,11 +2887,12 @@ mod proofs
         );
     }
 
-    /// The note walk finds the stack note in the first `len` of any 48 bytes:
-    /// up to four records of a bare 12-byte header, or two of the stack
-    /// note's 28 bytes. The longest loops are the walk of four records and
-    /// the compare of the owner's 6 bytes, so an unwind bound of 7 covers
-    /// them.
+    /// The base of the note walk: it finds the stack note in the first `len`
+    /// of any 48 bytes, up to four records of a bare 12-byte header, or the
+    /// stack note's 28 bytes and a bare header before or after it; a walk of
+    /// any length is the note-step proof's. The longest loops are the walk of
+    /// four records and the compare of the owner's 6 bytes, so an unwind bound
+    /// of 7 covers them.
     #[kani::proof]
     #[kani::unwind(7)]
     fn every_bounded_note_walk_finds_its_note()
@@ -2853,5 +3017,111 @@ mod proofs
         {
             property::failed_reads_hold::<PROOF_BUF, PROOF_STRTAB>(&ehdr, data, &SHORT);
         }
+    }
+
+    /// Each program-header step on any header and any state: a segment and a
+    /// template read in an image of any length, the span widened from any
+    /// span, the first RELRO and dynamic headers taken, and any table resolved
+    /// in a file of any size. No loop.
+    #[kani::proof]
+    fn every_program_header_steps_as_its_folds_say()
+    {
+        property::phdr_steps_hold(
+            &kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+        );
+    }
+
+    /// The dynamic walk's step on any entry from a summary of any tags. No
+    /// loop.
+    #[kani::proof]
+    fn every_dynamic_entry_steps_as_the_walk_says()
+    {
+        let before = property::Tags {
+            rela: kani::any(),
+            relasz: kani::any(),
+            relaent: kani::any(),
+            pltrelsz: kani::any(),
+            jmprel: kani::any(),
+            rel: kani::any(),
+            relr: kani::any(),
+        };
+        property::dynamic_step_holds(&kani::any(), &before);
+        property::request_holds(&before);
+    }
+
+    /// The record walks' steps on any record: taken by any type, and applied
+    /// into a span of up to 16 bytes from any link VA. The longest loop is the
+    /// compare of the span's two words, so an unwind bound of 3 covers it.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn every_record_steps_as_its_walks_say()
+    {
+        let bytes = kani::any();
+        property::record_step_holds(&bytes, kani::any());
+        property::apply_step_holds::<16>(&bytes, kani::any(), kani::any(), kani::any());
+    }
+
+    /// The note walk's step at any offset of the first `len` of any 48 bytes,
+    /// room for the stack note's 28 bytes at offsets 0 to 20 and a header to
+    /// 36: the record there judged for the stack note. The longest loop is the
+    /// compare of the owner's 6 bytes and its NUL, so an unwind bound of 8
+    /// covers it.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn every_note_record_steps_as_the_walk_says()
+    {
+        let notes: [u8; 48] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= notes.len());
+        property::note_step_holds(&notes[..len], kani::any(), &property::STACK);
+    }
+
+    /// The section walk's step on any section header against the first `len`
+    /// of any 24 bytes as the name table, as in
+    /// `every_section_name_is_compared_at_its_place`. Unwind bound 20, as
+    /// there.
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn every_section_header_steps_as_the_walk_says()
+    {
+        let strtab: [u8; 24] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= strtab.len());
+        property::section_step_holds(&kani::any(), &strtab[..len], &property::STACK);
+    }
+
+    /// A section header at any place, index and entry size is read from its 64
+    /// bytes, in memory and streamed, when they lie inside the data, of up to
+    /// two headers' bytes and 8 more, and refused otherwise. No loop.
+    #[kani::proof]
+    fn every_section_header_is_read_at_its_place()
+    {
+        let data: [u8; 2 * 64 + 8] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= data.len());
+        property::shdr_read_holds(&data[..len], kani::any(), kani::any(), kani::any());
+    }
+
+    /// A file range at any offset, of any size, is sliced from the first `len`
+    /// of any 32 bytes when it lies inside them, and one of up to 16 bytes is
+    /// read through a reader of them when it lies inside them and the file
+    /// size. No loop.
+    #[kani::proof]
+    fn every_file_range_is_read_at_its_place()
+    {
+        let data: [u8; 32] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= data.len());
+        property::range_read_holds::<16>(
+            &data[..len],
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+        );
     }
 }

@@ -298,13 +298,16 @@ loader reached only through such an image is a defect, not an attack.
   `load_segments`, `tls_segment`, `load_span`, `relro_span`, `rela_table`, the relocation
   decode, validation and application, `find_note`, `parse_stack_note` and `find_note_streaming`.
   CI's gating `fuzz` job runs it on every pull request and the weekly campaign for 30 minutes.
-- The `proofs` module of `shared/elf/src/lib.rs` proves the same property on every image up to its
-  bounds (two program headers, two dynamic entries, two relocation records, two section headers),
-  the program-header read at any place, and the note walk and the section-name compare on any
-  bytes ([testing.md](testing.md) § Bounded verification); CI's `kani` job runs them. The note
-  locators are proved for a short section name and owner, which the name compare and the walk
-  proofs stand behind for the stack note's, and `parse_stack_note`'s read of the descriptor on any
-  descriptor of up to 12 bytes.
+- The `proofs` module of `shared/elf/src/lib.rs` proves the same property by induction over
+  each walk ([testing.md](testing.md) § Bounded verification); CI's `kani` job runs them. A step
+  proof runs each walk's step on any element and any state (a program header, a dynamic entry and
+  any gathered tags, a relocation record, a note record at any offset, a section header), and a
+  base proof runs each walk whole on a short table at a fixed place: two program headers at
+  offset 64, two dynamic entries after them, two relocation records, 48 bytes of note records, and
+  two section headers at offset 64 for a short section name and owner, which the name-compare and
+  note-step proofs stand behind for the stack note's. The program-header, section-header and
+  file-range reads are proven at any place. The loops that drive the steps are left to the fuzz
+  target.
 
 **Gaps.**
 

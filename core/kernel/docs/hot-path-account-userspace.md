@@ -69,12 +69,12 @@ each round trip also takes the lazy FPU switch's `#NM` trap once a thread is swi
 
 ### Page Faults
 
-`ubench.fault_fill path=fault pages=16` is 33797 / 58200: memmgr 13987 / 31627, of which its
+`ubench.fault_fill path=fault pages=16` is 33729 / 58258: memmgr 13919 / 31685, of which its
 `memset` zeroing the 16 frames is 8298 / 24812 (x86_64's `rep stos` is about one iteration per 8
 bytes, riscv64's loop about one instruction per 2.6 bytes), and the kernel 19799 / 26565, spread
 over the page-table walk and install (`level_shift`, `table_index`, `names_table`, `read_entry`,
 `install_user_leaf`), the frame map's counters, and `sys_mem_map`. `fault_scaling threads=1` runs
-the same path. `path=grant` adds the grant's capability operations, 33859 / 61493.
+the same path. `path=grant` adds the grant's capability operations, 33825 / 61488.
 
 ### Shared-Memory Ring
 
@@ -83,7 +83,7 @@ the same path. `path=grant` adds the grant's capability operations, 33859 / 6149
 
 ### Console Writes
 
-`ubench.console_write bytes=4096` is 48940886 / 177110577, all but 0.2 % in the framebuffer
+`ubench.console_write bytes=4096` is 48940485 / 177108809, all but 0.2 % in the framebuffer
 driver. Its scroll moves the whole framebuffer up a text row at each line it fills
 (`memmove` 28673472 / 143361728 and `FramebufferWriter::scroll` 9013440 / 19662656), and
 drawing the glyphs is 7156800 / 12820888.
@@ -93,8 +93,8 @@ drawing the glyphs is 7156800 / 12820888.
 A read through the inline path (`fsbench.read path=inline`) is fatfs's copy and zeroing of the reply
 and the kernel's copy to and from user memory. A read through granted frames (`path=frame`) spends
 12628 / 12530 in the kernel's Keccak permutation (`keccak_f1600`, a kernel entropy draw) per 4 KiB
-frame the grant names, 202048 / 200480 of 677352 / 1066721 at 64 KiB; #1550 serves such small draws
-from one squeezed block. `fsbench.open depth=3` is 67355 / 103178, one such draw (12628 / 12530) and
+frame the grant names, 202048 / 200480 of 677352 / 1066769 at 64 KiB; #1550 serves such small draws
+from one squeezed block. `fsbench.open depth=3` is 67513 / 103206, one such draw (12628 / 12530) and
 fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 
 ## Account
@@ -103,8 +103,8 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 
 | Configuration | Head | Taken | QEMU | Checked against |
 |---|---|---|---|---|
-| x86_64 release | `7c46cb8cf9db` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| riscv64 release | `7c46cb8cf9db` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| x86_64 release | `a2b3be378888` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| riscv64 release | `a2b3be378888` | 2026-11-24 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
 
 #### Totals
 
@@ -126,18 +126,18 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `ubench.ipc_rt words=64 cpus=1` | ubench | 1939 | 4097 |
 | `ubench.ipc_rt words=64 cpus=1` | kernel | 4396 | 17559 |
 | `ubench.ipc_rt words=64 cpus=1` | other | 0 | 353 |
-| `ubench.fault_fill path=fault pages=16 cpus=1` | all | 33797 | 58200 |
+| `ubench.fault_fill path=fault pages=16 cpus=1` | all | 33729 | 58258 |
 | `ubench.fault_fill path=fault pages=16 cpus=1` | ubench | 11 | 8 |
-| `ubench.fault_fill path=fault pages=16 cpus=1` | memmgr | 13987 | 31627 |
+| `ubench.fault_fill path=fault pages=16 cpus=1` | memmgr | 13919 | 31685 |
 | `ubench.fault_fill path=fault pages=16 cpus=1` | kernel | 19799 | 26565 |
-| `ubench.fault_fill path=grant pages=16 cpus=1` | all | 33859 | 61493 |
+| `ubench.fault_fill path=grant pages=16 cpus=1` | all | 33825 | 61488 |
 | `ubench.fault_fill path=grant pages=16 cpus=1` | ubench | 115 | 353 |
-| `ubench.fault_fill path=grant pages=16 cpus=1` | memmgr | 11142 | 30223 |
+| `ubench.fault_fill path=grant pages=16 cpus=1` | memmgr | 11108 | 30218 |
 | `ubench.fault_fill path=grant pages=16 cpus=1` | kernel | 22602 | 30564 |
 | `ubench.fault_fill path=grant pages=16 cpus=1` | other | 0 | 353 |
-| `ubench.fault_scaling threads=1 pages=16 cpus=1` | all | 33690 | 58144 |
+| `ubench.fault_scaling threads=1 pages=16 cpus=1` | all | 33656 | 58139 |
 | `ubench.fault_scaling threads=1 pages=16 cpus=1` | ubench | 11 | 8 |
-| `ubench.fault_scaling threads=1 pages=16 cpus=1` | memmgr | 13880 | 31562 |
+| `ubench.fault_scaling threads=1 pages=16 cpus=1` | memmgr | 13846 | 31557 |
 | `ubench.fault_scaling threads=1 pages=16 cpus=1` | kernel | 19799 | 26574 |
 | `ubench.shmem_ring bytes=64 cpus=1` | all | 219 | 103 |
 | `ubench.shmem_ring bytes=64 cpus=1` | ubench | 219 | 103 |
@@ -153,79 +153,79 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `ubench.console_write bytes=64 cpus=1` | /services/drivers/framebuffer | 763764 | 2764543 |
 | `ubench.console_write bytes=64 cpus=1` | kernel | 2994 | 5627 |
 | `ubench.console_write bytes=64 cpus=1` | other | 0 | 706 |
-| `ubench.console_write bytes=4096 cpus=1` | all | 48940886 | 177110577 |
+| `ubench.console_write bytes=4096 cpus=1` | all | 48940485 | 177108809 |
 | `ubench.console_write bytes=4096 cpus=1` | ubench | 25251 | 60079 |
 | `ubench.console_write bytes=4096 cpus=1` | /services/drivers/framebuffer | 48865048 | 176873272 |
 | `ubench.console_write bytes=4096 cpus=1` | /services/drivers/iommu-riscv | 0 | 226 |
 | `ubench.console_write bytes=4096 cpus=1` | /services/drivers/iommu-vtd | 63 | 0 |
-| `ubench.console_write bytes=4096 cpus=1` | kernel | 50524 | 171352 |
+| `ubench.console_write bytes=4096 cpus=1` | kernel | 50123 | 169584 |
 | `ubench.console_write bytes=4096 cpus=1` | other | 0 | 5648 |
-| `fsbench.read size=16 path=inline cpus=1` | all | 5944 | 12595 |
+| `fsbench.read size=16 path=inline cpus=1` | all | 5793 | 12398 |
 | `fsbench.read size=16 path=inline cpus=1` | /tests/fixtures/programs/fsbench | 577 | 1541 |
 | `fsbench.read size=16 path=inline cpus=1` | fatfs:/ | 2344 | 5967 |
 | `fsbench.read size=16 path=inline cpus=1` | fatfs:/data | 1 | 1 |
 | `fsbench.read size=16 path=inline cpus=1` | kernel | 2871 | 4122 |
 | `fsbench.read size=16 path=inline cpus=1` | other | 0 | 767 |
-| `fsbench.read size=16 path=frame cpus=1` | all | 42904 | 67442 |
+| `fsbench.read size=16 path=frame cpus=1` | all | 42041 | 66333 |
 | `fsbench.read size=16 path=frame cpus=1` | /tests/fixtures/programs/fsbench | 11322 | 27036 |
 | `fsbench.read size=16 path=frame cpus=1` | fatfs:/ | 4226 | 5986 |
 | `fsbench.read size=16 path=frame cpus=1` | fatfs:/data | 27 | 27 |
-| `fsbench.read size=16 path=frame cpus=1` | kernel | 26466 | 31747 |
+| `fsbench.read size=16 path=frame cpus=1` | kernel | 26466 | 31750 |
 | `fsbench.read size=16 path=frame cpus=1` | other | 0 | 1534 |
-| `fsbench.read size=1024 path=inline cpus=1` | all | 31041 | 75533 |
+| `fsbench.read size=1024 path=inline cpus=1` | all | 30437 | 74745 |
 | `fsbench.read size=1024 path=inline cpus=1` | /tests/fixtures/programs/fsbench | 2643 | 7249 |
 | `fsbench.read size=1024 path=inline cpus=1` | fatfs:/ | 14300 | 33852 |
 | `fsbench.read size=1024 path=inline cpus=1` | fatfs:/data | 4 | 4 |
 | `fsbench.read size=1024 path=inline cpus=1` | kernel | 13490 | 30694 |
 | `fsbench.read size=1024 path=inline cpus=1` | other | 0 | 2946 |
-| `fsbench.read size=1024 path=frame cpus=1` | all | 42904 | 67442 |
+| `fsbench.read size=1024 path=frame cpus=1` | all | 42041 | 66333 |
 | `fsbench.read size=1024 path=frame cpus=1` | /tests/fixtures/programs/fsbench | 11322 | 27036 |
 | `fsbench.read size=1024 path=frame cpus=1` | fatfs:/ | 4226 | 5986 |
 | `fsbench.read size=1024 path=frame cpus=1` | fatfs:/data | 27 | 27 |
-| `fsbench.read size=1024 path=frame cpus=1` | kernel | 26466 | 31747 |
+| `fsbench.read size=1024 path=frame cpus=1` | kernel | 26466 | 31750 |
 | `fsbench.read size=1024 path=frame cpus=1` | other | 0 | 1534 |
-| `fsbench.read size=4096 path=inline cpus=1` | all | 124029 | 301991 |
+| `fsbench.read size=4096 path=inline cpus=1` | all | 121613 | 298839 |
 | `fsbench.read size=4096 path=inline cpus=1` | /tests/fixtures/programs/fsbench | 10437 | 28855 |
 | `fsbench.read size=4096 path=inline cpus=1` | fatfs:/ | 57200 | 135408 |
 | `fsbench.read size=4096 path=inline cpus=1` | fatfs:/data | 16 | 16 |
 | `fsbench.read size=4096 path=inline cpus=1` | kernel | 53960 | 122776 |
 | `fsbench.read size=4096 path=inline cpus=1` | other | 0 | 11784 |
-| `fsbench.read size=4096 path=frame cpus=1` | all | 42904 | 67442 |
+| `fsbench.read size=4096 path=frame cpus=1` | all | 42041 | 66333 |
 | `fsbench.read size=4096 path=frame cpus=1` | /tests/fixtures/programs/fsbench | 11322 | 27036 |
 | `fsbench.read size=4096 path=frame cpus=1` | fatfs:/ | 4226 | 5986 |
 | `fsbench.read size=4096 path=frame cpus=1` | fatfs:/data | 27 | 27 |
-| `fsbench.read size=4096 path=frame cpus=1` | kernel | 26466 | 31747 |
+| `fsbench.read size=4096 path=frame cpus=1` | kernel | 26466 | 31750 |
 | `fsbench.read size=4096 path=frame cpus=1` | other | 0 | 1534 |
-| `fsbench.read size=16384 path=inline cpus=1` | all | 508551 | 1222320 |
+| `fsbench.read size=16384 path=inline cpus=1` | all | 498461 | 1209673 |
 | `fsbench.read size=16384 path=inline cpus=1` | /tests/fixtures/programs/fsbench | 41613 | 115279 |
-| `fsbench.read size=16384 path=inline cpus=1` | fatfs:/ | 240944 | 555693 |
-| `fsbench.read size=16384 path=inline cpus=1` | fatfs:/data | 64 | 67 |
-| `fsbench.read size=16384 path=inline cpus=1` | kernel | 225930 | 504145 |
+| `fsbench.read size=16384 path=inline cpus=1` | fatfs:/ | 240944 | 555696 |
+| `fsbench.read size=16384 path=inline cpus=1` | fatfs:/data | 64 | 64 |
+| `fsbench.read size=16384 path=inline cpus=1` | kernel | 215840 | 491498 |
 | `fsbench.read size=16384 path=inline cpus=1` | other | 0 | 47136 |
-| `fsbench.read size=16384 path=frame cpus=1` | all | 172100 | 270333 |
+| `fsbench.read size=16384 path=frame cpus=1` | all | 168648 | 265897 |
 | `fsbench.read size=16384 path=frame cpus=1` | /tests/fixtures/programs/fsbench | 45153 | 108003 |
 | `fsbench.read size=16384 path=frame cpus=1` | fatfs:/ | 17523 | 24638 |
 | `fsbench.read size=16384 path=frame cpus=1` | fatfs:/data | 108 | 120 |
-| `fsbench.read size=16384 path=frame cpus=1` | kernel | 105864 | 126988 |
+| `fsbench.read size=16384 path=frame cpus=1` | kernel | 105864 | 127000 |
 | `fsbench.read size=16384 path=frame cpus=1` | other | 0 | 6136 |
-| `fsbench.read size=65536 path=inline cpus=1` | all | 2216721 | 5104050 |
+| `fsbench.read size=65536 path=inline cpus=1` | all | 2178017 | 5053429 |
 | `fsbench.read size=65536 path=inline cpus=1` | /tests/fixtures/programs/fsbench | 166317 | 460975 |
-| `fsbench.read size=65536 path=inline cpus=1` | fatfs:/ | 1144836 | 2437002 |
-| `fsbench.read size=65536 path=inline cpus=1` | fatfs:/data | 2700 | 262 |
-| `fsbench.read size=65536 path=inline cpus=1` | kernel | 902868 | 2017267 |
+| `fsbench.read size=65536 path=inline cpus=1` | fatfs:/ | 1145605 | 2437005 |
+| `fsbench.read size=65536 path=inline cpus=1` | fatfs:/data | 1931 | 259 |
+| `fsbench.read size=65536 path=inline cpus=1` | kernel | 864164 | 1966646 |
 | `fsbench.read size=65536 path=inline cpus=1` | other | 0 | 188544 |
-| `fsbench.read size=65536 path=frame cpus=1` | all | 691184 | 1084552 |
+| `fsbench.read size=65536 path=frame cpus=1` | all | 677352 | 1066769 |
 | `fsbench.read size=65536 path=frame cpus=1` | /tests/fixtures/programs/fsbench | 180477 | 431871 |
 | `fsbench.read size=65536 path=frame cpus=1` | fatfs:/ | 72585 | 101516 |
 | `fsbench.read size=65536 path=frame cpus=1` | fatfs:/data | 432 | 444 |
-| `fsbench.read size=65536 path=frame cpus=1` | kernel | 423858 | 508346 |
+| `fsbench.read size=65536 path=frame cpus=1` | kernel | 423858 | 508394 |
 | `fsbench.read size=65536 path=frame cpus=1` | other | 0 | 24544 |
-| `fsbench.open depth=3 cpus=1` | all | 68559 | 104728 |
-| `fsbench.open depth=3 cpus=1` | /tests/fixtures/programs/fsbench | 3274 | 7055 |
-| `fsbench.open depth=3 cpus=1` | fatfs:/ | 25067 | 42866 |
+| `fsbench.open depth=3 cpus=1` | all | 67513 | 103206 |
+| `fsbench.open depth=3 cpus=1` | /tests/fixtures/programs/fsbench | 3407 | 7055 |
+| `fsbench.open depth=3 cpus=1` | fatfs:/ | 25088 | 42894 |
 | `fsbench.open depth=3 cpus=1` | fatfs:/data | 19 | 83 |
 | `fsbench.open depth=3 cpus=1` | vfsd | 1182 | 3579 |
-| `fsbench.open depth=3 cpus=1` | kernel | 37813 | 47294 |
+| `fsbench.open depth=3 cpus=1` | kernel | 37817 | 47294 |
 | `fsbench.open depth=3 cpus=1` | other | 0 | 2301 |
 
 #### `ubench.ipc_rt words=0 cpus=1`
@@ -409,8 +409,8 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 |---|---|---:|---:|
 | `memset` | memmgr | 8298 | 24812 |
 | `boot_protocol::riscv_paging::level_shift` | kernel | | 2136 |
+| `<memmgr::MappedSlots as memmgr_free_pool::arena::SlotStore>::read` | memmgr | 1272 | 1508 |
 | `<kernel::mm::address_space::AddressSpace>::map_page_pooled` | kernel | 608 | 1504 |
-| `<memmgr::MappedSlots as memmgr_free_pool::arena::SlotStore>::read` | memmgr | 1320 | 1454 |
 | `kernel::arch::current::paging::install_user_leaf` | kernel | | 1216 |
 | `<kernel::mm::frame_map::FrameMap>::counter` | kernel | 896 | 1168 |
 | `kernel::arch::current::paging::entry` | kernel | 48 | 1161 |
@@ -444,7 +444,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `kernel::arch::current::paging::user_va_top` | kernel | 298 | 109 |
 | `kernel::arch::current::paging::direct_map_base` | kernel | 292 | 294 |
 | `kernel::mm::paging::phys_to_virt` | kernel | 292 | 292 |
-| 431 functions below 291 each |  | 11557 | 12347 |
+| 431 functions below 291 each |  | 11537 | 12351 |
 
 #### `ubench.fault_fill path=grant pages=16 cpus=1`
 
@@ -466,7 +466,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `<kernel::mm::frame_map::FrameMap>::slot` | kernel | 674 | 720 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 682 | |
 | `kernel::arch::current::paging::descend_existing::<kernel::mm::paging::phys_to_virt>` | kernel | 48 | 672 |
-| `<memmgr::MappedSlots as memmgr_free_pool::arena::SlotStore>::read` | memmgr | 522 | 646 |
+| `<memmgr::MappedSlots as memmgr_free_pool::arena::SlotStore>::read` | memmgr | 498 | 646 |
 | `<kernel::mm::frame_map::FrameMap>::raise` | kernel | 288 | 640 |
 | `kernel::mm::tlb_shootdown::shootdown_range` | kernel | 416 | 640 |
 | `compiler_builtins::mem::memcpy` | kernel | | 635 |
@@ -483,7 +483,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `<kernel::cap::cspace::CSpace>::slot_mut` | kernel | 252 | 414 |
 | `<kernel::arch::current::paging::PageTableEntry>::new_page` | kernel | 352 | 384 |
 | `<kernel::mm::address_space::AddressSpace>::pt_lock` | kernel | 144 | 384 |
-| 463 functions below 307 each |  | 13223 | 15008 |
+| 463 functions below 307 each |  | 13213 | 15003 |
 
 #### `ubench.fault_scaling threads=1 pages=16 cpus=1`
 
@@ -492,7 +492,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `memset` | memmgr | 8298 | 24812 |
 | `boot_protocol::riscv_paging::level_shift` | kernel | | 2136 |
 | `<kernel::mm::address_space::AddressSpace>::map_page_pooled` | kernel | 608 | 1504 |
-| `<memmgr::MappedSlots as memmgr_free_pool::arena::SlotStore>::read` | memmgr | 1248 | 1400 |
+| `<memmgr::MappedSlots as memmgr_free_pool::arena::SlotStore>::read` | memmgr | 1224 | 1400 |
 | `kernel::arch::current::paging::install_user_leaf` | kernel | | 1216 |
 | `<kernel::mm::frame_map::FrameMap>::counter` | kernel | 896 | 1168 |
 | `kernel::arch::current::paging::entry` | kernel | 48 | 1161 |
@@ -526,7 +526,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `kernel::arch::current::paging::user_va_top` | kernel | 298 | 109 |
 | `kernel::arch::current::paging::direct_map_base` | kernel | 292 | 294 |
 | `kernel::mm::paging::phys_to_virt` | kernel | 292 | 292 |
-| 433 functions below 290 each |  | 11522 | 12345 |
+| 433 functions below 290 each |  | 11512 | 12340 |
 
 #### `ubench.shmem_ring bytes=64 cpus=1`
 
@@ -578,7 +578,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `<framebuffer::render::FramebufferWriter>::scroll` | /services/drivers/framebuffer | 9013440 | 19662656 |
 | `<framebuffer::render::FramebufferWriter>::draw_glyph_bitmap` | /services/drivers/framebuffer | 7156800 | 12820888 |
 | `<framebuffer::render::FramebufferWriter>::pixel_bytes` | /services/drivers/framebuffer | 3709440 | 725760 |
-| 328 functions below 885552 each |  | 387734 | 539545 |
+| 318 functions below 885544 each |  | 387333 | 537777 |
 
 #### `fsbench.read size=16 path=inline cpus=1`
 
@@ -597,7 +597,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `<page 0x80000000>` | other | | 208 |
 | `memcpy` | /tests/fixtures/programs/fsbench | 199 | 8 |
 | `std::os::seraph::memmgr_call` | /tests/fixtures/programs/fsbench | 126 | 151 |
-| `kernel::arch::current::interrupts::handle_trap` | kernel | | 132 |
+| `kernel::arch::current::interrupts::handle_trap` | kernel | | 127 |
 | `<page 0x80017000>` | other | | 125 |
 | `<std::fs::File as alloc::io::read::Read>::read` | /tests/fixtures/programs/fsbench | 96 | 124 |
 | `fatfs::service_loop` | fatfs:/ | 116 | 112 |
@@ -629,7 +629,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `kernel::arch::current::interrupts::entry::trap_entry` | kernel | | 2325 |
 | `compiler_builtins::mem::memcpy` | fatfs:/ | | 1816 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 1302 | |
-| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 954 |
+| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 958 |
 | `memset` | /tests/fixtures/programs/fsbench | 175 | 871 |
 | `compiler_builtins::mem::memcpy` | /tests/fixtures/programs/fsbench | | 769 |
 | `<kernel::cap::cspace::CSpace>::slot_mut` | kernel | 456 | 688 |
@@ -649,7 +649,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 341 | 275 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 272 | 340 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 331 | 339 |
-| 474 functions below 331 each |  | 13136 | 15303 |
+| 474 functions below 331 each |  | 13136 | 15306 |
 
 #### `fsbench.read size=1024 path=inline cpus=1`
 
@@ -667,12 +667,13 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `memset` | /tests/fixtures/programs/fsbench | 348 | 1736 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 1240 | |
 | `std::os::seraph::memmgr_call` | /tests/fixtures/programs/fsbench | 854 | 1170 |
-| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 1072 |
+| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 1080 |
 | `<page 0x8000c000>` | other | | 1072 |
 | `ipc::ipc_reply` | fatfs:/ | 900 | 924 |
 | `memcpy` | /tests/fixtures/programs/fsbench | 916 | 32 |
+| `kernel::sched::schedule` | kernel | 680 | 904 |
 | `<page 0x80000000>` | other | | 832 |
-| `kernel::arch::current::interrupts::handle_trap` | kernel | | 528 |
+| `kernel::arch::current::interrupts::handle_trap` | kernel | | 508 |
 | `<std::fs::File as alloc::io::read::Read>::read` | /tests/fixtures/programs/fsbench | 384 | 496 |
 | `fatfs::service_loop` | fatfs:/ | 464 | 454 |
 | `kernel::syscall::dispatch` | kernel | 460 | 140 |
@@ -690,7 +691,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `kernel::arch::current::interrupts::entry::trap_entry` | kernel | | 2325 |
 | `compiler_builtins::mem::memcpy` | fatfs:/ | | 1816 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 1302 | |
-| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 954 |
+| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 958 |
 | `memset` | /tests/fixtures/programs/fsbench | 175 | 871 |
 | `compiler_builtins::mem::memcpy` | /tests/fixtures/programs/fsbench | | 769 |
 | `<kernel::cap::cspace::CSpace>::slot_mut` | kernel | 456 | 688 |
@@ -710,7 +711,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 341 | 275 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 272 | 340 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 331 | 339 |
-| 474 functions below 331 each |  | 13136 | 15303 |
+| 474 functions below 331 each |  | 13136 | 15306 |
 
 #### `fsbench.read size=4096 path=inline cpus=1`
 
@@ -728,12 +729,13 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `memset` | /tests/fixtures/programs/fsbench | 1392 | 6944 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 4960 | |
 | `std::os::seraph::memmgr_call` | /tests/fixtures/programs/fsbench | 3416 | 4680 |
-| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 4288 |
+| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 4320 |
 | `<page 0x8000c000>` | other | | 4288 |
 | `ipc::ipc_reply` | fatfs:/ | 3600 | 3696 |
 | `memcpy` | /tests/fixtures/programs/fsbench | 3664 | 128 |
+| `kernel::sched::schedule` | kernel | 2720 | 3616 |
 | `<page 0x80000000>` | other | | 3328 |
-| `kernel::arch::current::interrupts::handle_trap` | kernel | | 2112 |
+| `kernel::arch::current::interrupts::handle_trap` | kernel | | 2032 |
 | `<std::fs::File as alloc::io::read::Read>::read` | /tests/fixtures/programs/fsbench | 1536 | 1984 |
 | `fatfs::service_loop` | fatfs:/ | 1856 | 1816 |
 | `kernel::syscall::dispatch` | kernel | 1840 | 560 |
@@ -751,7 +753,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `kernel::arch::current::interrupts::entry::trap_entry` | kernel | | 2325 |
 | `compiler_builtins::mem::memcpy` | fatfs:/ | | 1816 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 1302 | |
-| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 954 |
+| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 958 |
 | `memset` | /tests/fixtures/programs/fsbench | 175 | 871 |
 | `compiler_builtins::mem::memcpy` | /tests/fixtures/programs/fsbench | | 769 |
 | `<kernel::cap::cspace::CSpace>::slot_mut` | kernel | 456 | 688 |
@@ -771,7 +773,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 341 | 275 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 272 | 340 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 331 | 339 |
-| 474 functions below 331 each |  | 13136 | 15303 |
+| 474 functions below 331 each |  | 13136 | 15306 |
 
 #### `fsbench.read size=16384 path=inline cpus=1`
 
@@ -789,12 +791,13 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `memset` | /tests/fixtures/programs/fsbench | 5568 | 27776 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 19840 | |
 | `std::os::seraph::memmgr_call` | /tests/fixtures/programs/fsbench | 13664 | 18720 |
-| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 17192 |
+| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 17320 |
 | `<page 0x8000c000>` | other | | 17152 |
 | `ipc::ipc_reply` | fatfs:/ | 14400 | 14784 |
 | `memcpy` | /tests/fixtures/programs/fsbench | 14656 | 512 |
+| `kernel::sched::schedule` | kernel | 10880 | 14464 |
 | `<page 0x80000000>` | other | | 13312 |
-| `kernel::arch::current::interrupts::handle_trap` | kernel | | 8462 |
+| `kernel::arch::current::interrupts::handle_trap` | kernel | | 8142 |
 | `<std::fs::File as alloc::io::read::Read>::read` | /tests/fixtures/programs/fsbench | 6144 | 7936 |
 | `fatfs::service_loop` | fatfs:/ | 7472 | 7312 |
 | `kernel::syscall::dispatch` | kernel | 7360 | 2240 |
@@ -812,7 +815,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `kernel::arch::current::interrupts::entry::trap_entry` | kernel | | 9300 |
 | `compiler_builtins::mem::memcpy` | fatfs:/ | | 7264 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 5208 | |
-| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 3816 |
+| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 3832 |
 | `memset` | /tests/fixtures/programs/fsbench | 700 | 3484 |
 | `compiler_builtins::mem::memcpy` | /tests/fixtures/programs/fsbench | | 3076 |
 | `<kernel::cap::cspace::CSpace>::slot_mut` | kernel | 1824 | 2752 |
@@ -832,42 +835,41 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 1364 | 1100 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 1088 | 1360 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 1324 | 1356 |
-| 482 functions below 1329 each |  | 53028 | 61777 |
+| 482 functions below 1329 each |  | 53028 | 61789 |
 
 #### `fsbench.read size=65536 path=inline cpus=1`
 
 | Function | Image | x86_64 release | riscv64 release |
 |---|---|---:|---:|
 | `memset` | fatfs:/ | 295424 | 909568 |
-| `compiler_builtins::mem::memcpy` | fatfs:/ | | 876160 |
+| `compiler_builtins::mem::memcpy` | fatfs:/ | | 876157 |
 | `__copy_user_fault_end` | kernel | 512 | 525056 |
 | `__copy_user_fault_start` | kernel | 131328 | 262144 |
-| `memcpy` | fatfs:/ | 237565 | 19200 |
+| `memcpy` | fatfs:/ | 237568 | 19200 |
 | `compiler_builtins::mem::memcpy` | /tests/fixtures/programs/fsbench | | 236544 |
 | `kernel::arch::current::interrupts::entry::trap_entry` | kernel | | 167121 |
-| `fatfs::handle_read` | fatfs:/ | 146386 | 126720 |
+| `fatfs::handle_read` | fatfs:/ | 146360 | 126720 |
 | `__copy_user` | kernel | 768 | 131840 |
 | `memset` | /tests/fixtures/programs/fsbench | 22272 | 111104 |
 | `fatfs::fat::chain_next` | fatfs:/ | 99840 | 96000 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 79360 | |
 | `fatfs::alloc::read_fat_entry` | fatfs:/ | 36480 | 76800 |
 | `std::os::seraph::memmgr_call` | /tests/fixtures/programs/fsbench | 54656 | 74880 |
-| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 68808 |
+| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 69320 |
 | `<page 0x8000c000>` | other | | 68608 |
-| `kernel::sched::schedule` | kernel | 46080 | 61541 |
-| `ipc::ipc_reply` | fatfs:/ | 56768 | 59136 |
+| `ipc::ipc_reply` | fatfs:/ | 57184 | 59136 |
 | `memcpy` | /tests/fixtures/programs/fsbench | 58624 | 2048 |
+| `kernel::sched::schedule` | kernel | 43520 | 57950 |
 | `<page 0x80000000>` | other | | 53248 |
-| `fatfs::fat::read_file_data` | fatfs:/ | 40944 | 44800 |
+| `fatfs::fat::read_file_data` | fatfs:/ | 40811 | 44800 |
 | `<fatfs::bpb::FatState>::fat_entry_location` | fatfs:/ | 30720 | 34560 |
-| `kernel::arch::current::interrupts::handle_trap` | kernel | | 33862 |
+| `kernel::arch::current::interrupts::handle_trap` | kernel | | 32582 |
 | `<std::fs::File as alloc::io::read::Read>::read` | /tests/fixtures/programs/fsbench | 24576 | 31744 |
 | `fatfs::service_loop` | fatfs:/ | 29933 | 29296 |
-| `kernel::syscall::dispatch` | kernel | 29440 | 10240 |
-| `kernel::ipc::upcall::deliver` | kernel | 12 | 28270 |
+| `kernel::syscall::dispatch` | kernel | 29440 | 8960 |
 | `<page 0x80017000>` | other | | 27520 |
 | `<kernel::sync::Spinlock>::lock_raw` | kernel | 25382 | 17506 |
-| 296 functions below 25267 each |  | 733097 | 903014 |
+| 301 functions below 25267 each |  | 733259 | 903017 |
 
 #### `fsbench.read size=65536 path=frame cpus=1`
 
@@ -878,7 +880,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `kernel::arch::current::interrupts::entry::trap_entry` | kernel | | 37293 |
 | `compiler_builtins::mem::memcpy` | fatfs:/ | | 29056 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 20832 | |
-| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 15304 |
+| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 15368 |
 | `memset` | /tests/fixtures/programs/fsbench | 2800 | 13936 |
 | `compiler_builtins::mem::memcpy` | /tests/fixtures/programs/fsbench | | 12304 |
 | `<kernel::cap::cspace::CSpace>::slot_mut` | kernel | 7296 | 11008 |
@@ -898,7 +900,7 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 5456 | 4400 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 4352 | 5440 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 5296 | 5424 |
-| 512 functions below 5333 each |  | 214872 | 250142 |
+| 512 functions below 5333 each |  | 214872 | 250190 |
 
 #### `fsbench.open depth=3 cpus=1`
 
@@ -917,9 +919,9 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 1736 | |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 924 | 1516 |
 | `memcpy` | fatfs:/ | 1364 | 62 |
+| `<fatfs::cache::PageCache>::lookup_cached` | fatfs:/ | 639 | 1311 |
+| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 1304 |
 | `memset` | /tests/fixtures/programs/fsbench | 260 | 1299 |
-| `kernel::arch::current::interrupts::trap_dispatch` | kernel | | 1298 |
-| `<fatfs::cache::PageCache>::lookup_cached` | fatfs:/ | 618 | 1283 |
 | `<kernel::cap::cspace::CSpace>::leaf_ptr` | kernel | 543 | 1086 |
 | `std::sys::fs::seraph::walk_components` | /tests/fixtures/programs/fsbench | 958 | 891 |
 | `std::sys::alloc::seraph::alloc` | fatfs:/ | 948 | 666 |
@@ -943,9 +945,9 @@ fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
 | `memcpy` | vfsd | 584 | 22 |
 | `kernel::syscall::dispatch_in_range` | kernel | 545 | 446 |
 | `kernel::cap::cspace::load_at::<kernel::cap::cspace::CSpacePage>` | kernel | | 543 |
-| `<kernel::sync::Spinlock>::lock_raw` | kernel | 531 | 383 |
+| `<kernel::sync::Spinlock>::lock_raw` | kernel | 533 | 383 |
 | `kernel::cap::derivation::resolve_slot_mut` | kernel | 522 | 143 |
-| 453 functions below 515 each |  | 20100 | 24307 |
+| 453 functions below 516 each |  | 20235 | 24307 |
 
 <!-- path-account: end -->
 

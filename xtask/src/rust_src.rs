@@ -117,8 +117,8 @@ pub(crate) const BUILD_DIR: &str = "seraph-build-1";
 /// checks the environment variables a unit reads for every unit, though. Each
 /// of these crates reads this variable under `rustc-dep-of-std`, which only
 /// `-Z build-std` enables, and [`SeraphToolchain::apply_env`] sets it, so a
-/// change to any of their files changes its value and rebuilds their units and
-/// every unit that depends on them.
+/// change to any of their files but Markdown, which no unit reads, changes its
+/// value and rebuilds their units and every unit that depends on them.
 const STD_DEPS_DIGEST_VAR: &str = "SERAPH_STD_DEPS_DIGEST";
 
 /// The lint arguments `clippy-driver` reads from `CLIPPY_ARGS`: `-D warnings`,

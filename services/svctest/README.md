@@ -499,6 +499,13 @@ svcmgr started after routing that death answers, and the token gone. It then wri
 worker's fault took the token and died before its request, and a later restart answered. It writes
 the token again at its end, so a later boot of the same image repeats the first-launch case.
 
+The `svcmgr_one_shot_death` phase, which runs right after it, skips when the staged fixture set does
+not declare `crasher-once`; declared, it fails if `crasher.once` is not published within 10 s. It
+reads the instance's nonce with `PROBE_INSTANCE`, sends `PROBE_FAULT_WORKER` so a worker thread of
+the fixture faults, and requires svcmgr's `service died: crasher-once` line and then its `restart
+policy says no restart` line in logd's history ([restart
+protocol](../svcmgr/docs/restart-protocol.md)).
+
 The `svcmgr_stop_service` phase checks the stop authority ([svcmgr IPC
 Interface](../svcmgr/docs/ipc-interface.md) § Stop authority). Through the per-process
 `service_registry_cap`, `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES` must reply

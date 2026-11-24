@@ -299,9 +299,9 @@ fn seeds_from(consumer: &Definition, provider: &Definition) -> bool
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RestartPolicy
 {
-    /// Service is one-shot; never restart, even on fault. Used for
-    /// integration-test fixtures whose exit is the success notification
-    /// (e.g. `svctest`).
+    /// Never restart, even on fault; the death is still observed and
+    /// logged. Used for integration-test harnesses and fixtures whose run
+    /// ends with their exit (e.g. `svctest`).
     Never,
     /// Restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`).
     /// Clean exits are treated as intentional.
@@ -335,9 +335,8 @@ pub enum NamespaceShape
 ///
 /// Storage uses heap-allocated `String` / `Vec` because svcmgr is
 /// std-built and parsing happens once at handover. Reconciliation
-/// either consumes the definition into a fixed-size `ServiceEntry`
-/// (for supervision) or hands it straight to svcmgr's launch path for
-/// one-shot spawn.
+/// consumes the definition into a `ServiceEntry` and the launch it
+/// supervises.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each bool is one independent `yes | no` recipe key: `critical`, `log_sink`, \
@@ -409,7 +408,7 @@ pub struct Definition
     /// names. When a `critical = yes` service is permanently down, svcmgr
     /// derives a SEND stamped with that entry's badge from the actuator's own
     /// service endpoint and calls the shutdown request through it. The parser
-    /// requires a supervised service (`restart` other than `never`). `None`
+    /// requires a restarted service (`restart` other than `never`). `None`
     /// for every other service; [`shutdown_actuator`] picks one actuator from
     /// a scan.
     pub shutdown_actuator: Option<ProvidedName>,
@@ -450,7 +449,8 @@ pub struct Definition
     /// instance is created contained (`procmgr_labels::CREATE_CONTAIN`,
     /// [`create_flags`]), so what it started ends with it. A core role
     /// ([`stop::core_role`]). The parser requires `provides` with every entry
-    /// badged and a supervised service. `None` for every other service.
+    /// badged and a restarted service (`restart` other than `never`). `None`
+    /// for every other service.
     pub stop_source: Option<stop::StopClass>,
     /// Priority level the service's initial thread is created at
     /// (`priority = ...`, range `1..=30`). `None` = unspecified: procmgr

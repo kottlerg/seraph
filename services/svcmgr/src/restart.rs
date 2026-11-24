@@ -514,7 +514,10 @@ pub struct RestartCtx
 /// budget + restart source). When the service ends up permanently down
 /// — restart not attempted or failed — `system_critical` alone decides
 /// whether the system can continue without it. Marks the service
-/// inactive if not restarted. For the log-sink service (`recipe.log_sink`)
+/// inactive if not restarted, and releases the dead instance
+/// ([`release_instance`]). A `restart = never` service takes this path on
+/// every death, its clean exit included: its death is logged as any other's,
+/// and it is never restarted. For the log-sink service (`recipe.log_sink`)
 /// the death's lines are written only once the new instance runs, and none
 /// when no instance follows (`services/svcmgr/docs/restart-protocol.md`
 /// § Supervision hierarchy). `tag` is the death tag the routed post
@@ -589,6 +592,7 @@ pub fn handle_death(
         if !should_restart(svc, exit_reason, lines)
         {
             svc.active = false;
+            release_instance(svc, ctx);
             return permanent_death_outcome(svc, lines);
         }
 
@@ -873,10 +877,48 @@ enum Respawn
     Failed(CreateFailure),
 }
 
-/// Release the dead instance, create a new process via procmgr, bind its
-/// death observers (its main thread's, and its address space's through
-/// procmgr) under the slot's next instance, start it, and serve its bootstrap
-/// rounds. The observers are bound before `START_PROCESS`, so no death of the
+/// Release svcmgr's hold on the dead instance of `svc`: reclaim its kernel
+/// objects (thread, address space, `CSpace`, `ProcessInfo` memory cap)
+/// through `DESTROY_PROCESS`, whose `CSpace` teardown cascades the memory caps
+/// handed to the dead process via `REQUEST_MEMORY_CAPS` (which procmgr no longer
+/// holds caps on) back into memmgr's pool, then delete its process handle, its
+/// exited thread, for an instance init created by raw syscalls its address
+/// space, and the node handle of its budget node, which memmgr refuses once it
+/// is gone. Each is zeroed, so a second call does nothing. Run before a restart
+/// creates the next instance, and when a death leaves the service permanently
+/// down, so an entry no instance follows holds none of the dead one's objects.
+/// A service init created by raw syscalls (memmgr, procmgr) has no process
+/// handle; every other service holds the handle its launch, its last restart,
+/// or init's endowment (devmgr, vfsd) recorded. A teardown procmgr already ran
+/// makes the destroy a no-op reply.
+fn release_instance(svc: &mut ServiceEntry, ctx: &RestartCtx)
+{
+    if svc.process_handle != 0
+    {
+        let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+        // SAFETY: ctx.ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_call(svc.process_handle, &destroy_msg, ctx.ipc_buf) };
+        let _ = syscall::cap_delete(svc.process_handle);
+        svc.process_handle = 0;
+    }
+    for cap in [
+        &mut svc.thread_cap,
+        &mut svc.aspace_cap,
+        &mut svc.node_handle,
+    ]
+    {
+        if *cap != 0
+        {
+            let _ = syscall::cap_delete(*cap);
+            *cap = 0;
+        }
+    }
+}
+
+/// Release the dead instance ([`release_instance`]), create a new process
+/// via procmgr, bind its death observers (its main thread's, and its address
+/// space's through procmgr) under the slot's next instance, start it, and
+/// serve its bootstrap rounds. The observers are bound before `START_PROCESS`, so no death of the
 /// new instance precedes them. Returns [`Respawn::Started`] on success, and
 /// [`Respawn::DiedInBootstrap`] when the instance dies before its rounds
 /// reach it ([`serve_boot_slots`]); on a failure after the create the new
@@ -890,38 +932,7 @@ fn restart_process(
     registry: &mut registry::Registry,
 ) -> Respawn
 {
-    // Reclaim the previous instance's kernel objects (thread/aspace/cspace/
-    // ProcessInfo memory cap) before spawning a fresh one. CSpace teardown
-    // cascades: memory caps handed to the dead process via `REQUEST_MEMORY_CAPS`
-    // (which procmgr no longer holds caps on) get dec-ref'd and reclaimed
-    // into memmgr's pool. A service init created by raw syscalls (memmgr,
-    // procmgr) has no process handle, and is never restarted: its recipe is
-    // `restart = never`. Every other service holds the handle its launch, its
-    // last restart, or init's endowment (devmgr, vfsd) recorded. A teardown
-    // procmgr already ran makes the call a no-op reply.
-    if svc.process_handle != 0
-    {
-        let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
-        // SAFETY: ctx.ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_call(svc.process_handle, &destroy_msg, ctx.ipc_buf) };
-        let _ = syscall::cap_delete(svc.process_handle);
-        svc.process_handle = 0;
-    }
-    // Release svcmgr's references to the dead instance: its exited thread,
-    // for an instance init created by raw syscalls its address space, and the
-    // node handle of its budget node, which memmgr refuses once it is gone.
-    for cap in [
-        &mut svc.thread_cap,
-        &mut svc.aspace_cap,
-        &mut svc.node_handle,
-    ]
-    {
-        if *cap != 0
-        {
-            let _ = syscall::cap_delete(*cap);
-            *cap = 0;
-        }
-    }
+    release_instance(svc, ctx);
 
     let CreatedProcess {
         process_handle,

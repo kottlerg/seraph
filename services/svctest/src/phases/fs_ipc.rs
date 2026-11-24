@@ -1466,19 +1466,22 @@ const OUTSTANDING_CSPACE_MARGIN: usize = 64;
 /// cap finds no free slot arrives as `IPC_REPLY_TRANSFER_FAILED`
 /// (runtime/ruststd/README.md § `CSpace` slot headroom), so the phase funds
 /// the whole count first. It also takes enough opens that the pages
-/// outstanding exceed the general slots svctest's `CSpace` has free before
-/// that funding, so at every RAM size the reads succeed only when the
-/// funding grew the `CSpace`. svctest once funded none of them and relied
-/// on the headroom earlier phases left, which covered the four opens' pages
-/// up to 1 GiB of RAM and fell short at 2 GiB.
+/// outstanding exceed every slot svctest's `CSpace` has free before that
+/// funding, its IPC receive reserve included, so at every RAM size the reads
+/// succeed only when the funding grew the `CSpace`. svctest once funded none
+/// of them and relied on the headroom earlier phases left, which covered the
+/// four opens' pages up to 1 GiB of RAM and fell short at 2 GiB.
 fn opens_outstanding(node_cap: u64, open: u64, slots: usize, ipc_buf: *mut u64)
 {
     let pages = slots.saturating_sub(OUTSTANDING_SPARE_SLOTS);
     let cspace = startup_info().self_cspace;
     let unfunded = usize::try_from(std::os::seraph::cspace_slot_headroom(cspace))
         .expect("slot reuse: CSpace headroom past usize");
+    let reserve = usize::try_from(syscall_abi::CSPACE_IPC_RECV_RESERVE)
+        .expect("slot reuse: receive reserve past usize");
     let opens = unfunded
-        .checked_div(pages)
+        .checked_add(reserve)
+        .and_then(|n| n.checked_div(pages))
         .and_then(|n| n.checked_add(1))
         .expect("slot reuse: open count overflowed")
         .max(OUTSTANDING_OPENS);
@@ -1491,7 +1494,8 @@ fn opens_outstanding(node_cap: u64, open: u64, slots: usize, ipc_buf: *mut u64)
         .expect("slot reuse: outstanding cap count overflowed");
     let need_slots = u64::try_from(need).expect("slot reuse: cap count past u64");
     std::os::seraph::log!(
-        "slot reuse: {opens} opens hold {held} pages outstanding past {unfunded} free slots"
+        "slot reuse: {opens} opens hold {held} pages outstanding past {unfunded} free slots \
+         and the {reserve}-slot receive reserve"
     );
     assert!(
         std::os::seraph::fund_cspace_slot_budget(cspace, need_slots),

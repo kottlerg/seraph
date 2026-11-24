@@ -58,6 +58,9 @@ bench = { path = "../shared/bench", default-features = false }
 # init's log-level parser: `mkdisk --log-levels` refuses a configuration with a
 # line init would ignore.
 init-log-levels = { path = "../services/init/log-levels" }
+# svctest's fixture sets: `mkdisk --svctest` stages a set and writes its record
+# into the staged svctest recipe with the crate svctest checks the image with.
+svctest-fixtures = { path = "../services/svctest/fixtures" }
 
 [dev-dependencies]
 # The normalized exception codes crash_check's tests build reports with.

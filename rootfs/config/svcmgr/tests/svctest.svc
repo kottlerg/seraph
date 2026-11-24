@@ -71,9 +71,11 @@
 # services and lists the stop sources.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT
-# scan. To enable in a boot, copy this file into
-# /config/svcmgr/services/, and the test class files above into
-# /config/devmgr/classes/, between `cargo xtask build` and
+# scan. `cargo xtask mkdisk --svctest <set>` stages it into
+# /config/svcmgr/services/ with the fixtures of the set and the test
+# class files above, and appends SVCTEST_FIXTURES=<the set's fixtures>
+# to the env line below; svctest fails a run without that record, or
+# whose image stages other fixtures than it declares. Boot it with
 # `cargo xtask run --test-devices`. See docs/testing.md.
 #
 # svctest runs at 10, in the fair class. Its band reaches 21, the floor of

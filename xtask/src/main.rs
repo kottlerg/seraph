@@ -79,6 +79,7 @@ mod secure_boot;
 mod signing;
 mod socket_dir;
 mod stack_sizes;
+mod svctest_stage;
 mod symbolize;
 mod sys;
 mod sysroot;

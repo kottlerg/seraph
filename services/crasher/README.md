@@ -28,7 +28,8 @@ cannot start the thread (memmgr refuses its IPC buffer's grant while memory is c
 `worker-fault: worker thread not started; retrying` at warn level and tries again every 50 ms,
 serving once it runs. procmgr
 tears the process down, and svcmgr restarts it through its address-space observer; svctest's
-`svcmgr_worker_fault_restart` phase, which runs when this recipe is staged, reads a new nonce from
+`svcmgr_worker_fault_restart` phase, which skips when the staged fixture set does not declare
+`crasher-worker`, reads a new nonce from
 the restarted instance. `oom_stop = yes` makes it a service of that boot a stop-authority holder may
 stop, as the `memhog` fixture does ([memhog](../memhog/README.md)): svctest's `svcmgr_stop_service`
 phase lists it, has svcmgr stop it, and reads the restarted instance's nonce the same way. A role

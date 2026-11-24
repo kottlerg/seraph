@@ -14,10 +14,11 @@ Commands:
   build           Build Seraph components and populate the sysroot
   run             Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
   clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
-  test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+  test            Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
-  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--pin`, print the pinned release (see xtask/README.md)
+  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, or with `--since` of each crate a change can affect, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, on a harness that lies in no package, and on CI's runner on a harness over the time budget; with `--pin`, print the pinned release (see xtask/README.md)
+  cells           Print the CI cells a change owes: each file the change from a base commit touches, the class the layer record places it in and why, and the validate cells and bench boots of its most demanding file; every cell without a base. Fails on a file no row places. With `--github-output`, append the matrices build-test.yml runs (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
   bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
@@ -51,10 +52,11 @@ Commands:
   build           Build Seraph components and populate the sysroot
   run             Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
   clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
-  test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+  test            Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
-  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--pin`, print the pinned release (see xtask/README.md)
+  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, or with `--since` of each crate a change can affect, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, on a harness that lies in no package, and on CI's runner on a harness over the time budget; with `--pin`, print the pinned release (see xtask/README.md)
+  cells           Print the CI cells a change owes: each file the change from a base commit touches, the class the layer record places it in and why, and the validate cells and bench boots of its most demanding file; every cell without a base. Fails on a file no row places. With `--github-output`, append the matrices build-test.yml runs (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
   bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md
@@ -417,12 +419,12 @@ Options:
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
 === xtask test -h
-Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
 
 Usage: xtask test [OPTIONS] [CASE]
 
 Arguments:
-  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, storage-roles, cet, tpm, shutdown, debug-port]
+  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code (and over the whole workspace the host crates) and runs the unit tests [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, storage-roles, cet, tpm, shutdown, debug-port]
 
 Options:
       --cell <TESTER>            Run every case the CI validate cell of TESTER runs on `--arch`, in the registry's order, each whatever another's outcome, and fail when one failed [possible values: svctest, usertest, ktest]
@@ -444,13 +446,13 @@ Options:
       --grant <HOLDER>           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help                     Print help (see more with '--help')
 === xtask test --help
-Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
 
 Usage: xtask test [OPTIONS] [CASE]
 
 Arguments:
   [CASE]
-          The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests
+          The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code (and over the whole workspace the host crates) and runs the unit tests
 
           Possible values:
           - terminal:        Keyboard and serial input through the terminal, and keyboard input again after a restart of the input driver
@@ -616,29 +618,53 @@ Options:
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
 === xtask kani -h
-Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--pin`, print the pinned release (see xtask/README.md)
+Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, or with `--since` of each crate a change can affect, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, on a harness that lies in no package, and on CI's runner on a harness over the time budget; with `--pin`, print the pinned release (see xtask/README.md)
 
 Usage: xtask kani [OPTIONS]
 
 Options:
       --component <CRATE>  Verify the harnesses of this crate only, by its package name (one that holds a harness)
+      --since <COMMIT>     Verify only the crates the change from COMMIT to the working tree can affect: each crate whose package, a package in its dependency closure, or a file one of them reads, the change touches; every crate when it touches an input of every build
+      --list               Print the package of each crate the run would verify and exit, verifying nothing
       --harness <NAME>     Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it
       --pin                Print the pinned Kani release and exit, verifying nothing
       --wait-host <SECS>   When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help               Print help
 === xtask kani --help
-Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--pin`, print the pinned release (see xtask/README.md)
+Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, or with `--since` of each crate a change can affect, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, on a harness that lies in no package, and on CI's runner on a harness over the time budget; with `--pin`, print the pinned release (see xtask/README.md)
 
 Usage: xtask kani [OPTIONS]
 
 Options:
       --component <CRATE>  Verify the harnesses of this crate only, by its package name (one that holds a harness)
+      --since <COMMIT>     Verify only the crates the change from COMMIT to the working tree can affect: each crate whose package, a package in its dependency closure, or a file one of them reads, the change touches; every crate when it touches an input of every build
+      --list               Print the package of each crate the run would verify and exit, verifying nothing
       --harness <NAME>     Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it
       --pin                Print the pinned Kani release and exit, verifying nothing
       --wait-host <SECS>   When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help               Print help
+=== xtask cells -h
+Print the CI cells a change owes: each file the change from a base commit touches, the class the layer record places it in and why, and the validate cells and bench boots of its most demanding file; every cell without a base. Fails on a file no row places. With `--github-output`, append the matrices build-test.yml runs (see xtask/README.md)
+
+Usage: xtask cells [OPTIONS]
+
+Options:
+      --since <COMMIT>        The base: the change from COMMIT to the working tree
+      --since-green <REV>     The base: the newest commit of REV's first-parent history whose build-test run on a push to master passed (read with gh), so a cell a red or unfinished master run left unproven stays owed; every cell when none is found or the runs cannot be read
+      --github-output <FILE>  Append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): the validate and bench matrices, whether each is owed, and which bench boots are
+  -h, --help                  Print help
+=== xtask cells --help
+Print the CI cells a change owes: each file the change from a base commit touches, the class the layer record places it in and why, and the validate cells and bench boots of its most demanding file; every cell without a base. Fails on a file no row places. With `--github-output`, append the matrices build-test.yml runs (see xtask/README.md)
+
+Usage: xtask cells [OPTIONS]
+
+Options:
+      --since <COMMIT>        The base: the change from COMMIT to the working tree
+      --since-green <REV>     The base: the newest commit of REV's first-parent history whose build-test run on a push to master passed (read with gh), so a cell a red or unfinished master run left unproven stays owed; every cell when none is found or the runs cannot be read
+      --github-output <FILE>  Append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): the validate and bench matrices, whether each is owed, and which bench boots are
+  -h, --help                  Print help
 === xtask ktest-timing -h
 Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
 
@@ -682,10 +708,11 @@ Arguments:
   <LOG>...  The saved run logs, one per run, all of one architecture
 
 Options:
-      --mode <MODE>       What the runs measured: `icount` for instruction counts under `run --icount`, `host` for time on this host's native accelerator [possible values: icount, host]
-      --baselines <DIR>   The baselines root, which holds `<mode>/<arch>/` [default: xtask/baselines/bench]
-      --write-env <FILE>  Write this host's environment (the ENV file's keys) to FILE
-  -h, --help              Print help (see more with '--help')
+      --mode <MODE>         What the runs measured: `icount` for instruction counts under `run --icount`, `host` for time on this host's native accelerator [possible values: icount, host]
+      --baselines <DIR>     The baselines root, which holds `<mode>/<arch>/` [default: xtask/baselines/bench]
+      --write-env <FILE>    Write this host's environment (the ENV file's keys) to FILE
+      --skip-suite <SUITE>  A suite whose boot did not run, whose baselines are not checked: `ktest` when the bench cell skips its ktest boots. Repeatable; a log that measures the suite fails the command
+  -h, --help                Print help (see more with '--help')
 === xtask bench-check --help
 Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
 
@@ -710,6 +737,9 @@ Options:
 
       --write-env <FILE>
           Write this host's environment (the ENV file's keys) to FILE
+
+      --skip-suite <SUITE>
+          A suite whose boot did not run, whose baselines are not checked: `ktest` when the bench cell skips its ktest boots. Repeatable; a log that measures the suite fails the command
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1848,10 +1878,11 @@ Commands:
   build           Build Seraph components and populate the sysroot
   run             Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
   clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
-  test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+  test            Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
   crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   fuzz            Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
-  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--pin`, print the pinned release (see xtask/README.md)
+  kani            Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, or with `--since` of each crate a change can affect, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, on a harness that lies in no package, and on CI's runner on a harness over the time budget; with `--pin`, print the pinned release (see xtask/README.md)
+  cells           Print the CI cells a change owes: each file the change from a base commit touches, the class the layer record places it in and why, and the validate cells and bench boots of its most demanding file; every cell without a base. Fails on a file no row places. With `--github-output`, append the matrices build-test.yml runs (see xtask/README.md)
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   bench-check     Compare the benchmark result lines of saved run logs (from `run --runs N --save-logs`) with the checked-in baselines of their mode and architecture: each measurement's lowest p50 over the runs against its stored p50 and band. Icount mode fails on a one-CPU measurement past its band in either direction, one with no baseline or no run, and a benchmark's FAIL line; host mode reports only. See xtask/README.md for the rules and the file formats
   bench-baseline  Rewrite the benchmark baselines from the bench cell's artifacts of a CI run (icount mode), or from saved logs of this host (host mode): each baseline file whose measurements moved past their bands, appeared or went, or every file with `--all`. See xtask/README.md

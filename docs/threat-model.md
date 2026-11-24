@@ -170,8 +170,8 @@ service executes as built, since procmgr verified it.
 
 - `hwrng-protocol` (`xtask/fuzz/targets/src/bin/hwrng-protocol.rs`) drives
   `hwrng_protocol::property::hwrng_protocol_holds` over a request and a reply, from the seeds in
-  `shared/hwrng-protocol/fuzz/hwrng-protocol/seeds/`; CI's gating `fuzz` job runs it on every pull
-  request and the weekly campaign for 30 minutes.
+  `shared/hwrng-protocol/fuzz/hwrng-protocol/seeds/`; CI's gating `fuzz` job runs it on a pull
+  request whose change can affect it and the campaign for 30 minutes.
 - The `proofs` module of `shared/hwrng-protocol/src/lib.rs` proves `requested_len` on every request
   and, by induction over a reply's words, `decode_reply` and `encode_reply`
   ([testing.md](testing.md) § Bounded verification); CI's `kani` job runs them.
@@ -244,7 +244,7 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
 
 - `gpt` (`xtask/fuzz/targets/src/bin/gpt.rs`) drives `vfsd_gpt::property::gpt_holds` over a header
   block and a whole disk, from the seeds in `services/vfsd/gpt/fuzz/gpt/seeds/`; CI's gating `fuzz`
-  job runs it on every pull request and the weekly campaign for 30 minutes.
+  job runs it on a pull request whose change can affect it and the campaign for 30 minutes.
 - The `proofs` module of `services/vfsd/gpt/src/lib.rs` proves the property's check of a header and
   of an entry over every input, the choice between the two copies, and, by induction, the CRC32, the
   entry-array walk and the lookup ([testing.md](testing.md) § Bounded verification); CI's `kani` job
@@ -373,8 +373,8 @@ is.
   seeds in `abi/boot-protocol/fuzz/boot-protocol/seeds/`, and `init-protocol`
   (`xtask/fuzz/targets/src/bin/init-protocol.rs`) drives
   `init_protocol::property::init_protocol_holds` over a request and a module-name table, from the
-  seeds in `abi/init-protocol/fuzz/init-protocol/seeds/`; CI's gating `fuzz` job runs them on every
-  pull request and the weekly campaign for 30 minutes each.
+  seeds in `abi/init-protocol/fuzz/init-protocol/seeds/`; CI's gating `fuzz` job runs them on a pull
+  request whose change can affect them and the campaign for 30 minutes each.
 - The `proofs` modules of `abi/boot-protocol/src/lib.rs` and `abi/boot-protocol/src/bundle.rs` prove
   `FramebufferInfo::from_bytes` on every record, the bundle's `parse_header` and `entry_at` on every
   input of up to two entries, and, by induction, the walk of the entry headers; that of

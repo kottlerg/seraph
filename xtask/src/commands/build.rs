@@ -1355,7 +1355,7 @@ pub(crate) fn install_names(arch: Arch) -> Vec<String>
 /// fuzz targets and the parsers' property modules, with `--cfg fuzzing`.
 /// Clippy lints every workspace crate a named one builds, so naming the
 /// targets crate lints each parser crate it depends on.
-fn clippy_host(ctx: &BuildContext) -> Result<()>
+pub(crate) fn clippy_host(ctx: &BuildContext) -> Result<()>
 {
     clippy_check(
         ctx,

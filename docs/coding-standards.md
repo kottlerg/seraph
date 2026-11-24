@@ -21,7 +21,8 @@ restated in this document. Developers MUST NOT disable or bypass these tools.
 
 `cargo xtask build` and `cargo xtask test` enforce the Rust rule: each runs `cargo fmt --check`
 and fails on a file `cargo fmt` would change, naming its file and line, without rewriting it.
-CI runs both on every pull request ([build-system.md](build-system.md) § Continuous Integration).
+CI runs `cargo xtask test` on every pull request, and `cargo xtask build` in each cell the change
+owes ([build-system.md](build-system.md) § Continuous Integration).
 No check enforces the C rule.
 
 `.editorconfig` is authoritative for editor-level settings (indentation, line endings,

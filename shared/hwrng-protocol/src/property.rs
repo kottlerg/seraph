@@ -108,16 +108,25 @@ pub(crate) fn request_holds(words: &[u64])
 /// little-endian from the word after the count, to the buffer's front and
 /// nothing past them. Each byte of the buffer is checked at its own index;
 /// no decode can reach a byte past the buffer, which is a slice of
-/// `out_len` bytes.
+/// `out_len` bytes. An `out_len` past [`MAX_OUT`] is read as `MAX_OUT`.
 pub(crate) fn reply_holds(words: &[u64], out_len: usize)
 {
-    let mut out = [UNWRITTEN; MAX_OUT];
+    reply_holds_within::<MAX_OUT>(words, out_len);
+}
+
+/// [`reply_holds`] on a buffer held in an array of `N` bytes, an `out_len`
+/// past `N` read as `N`: the same check of every buffer of up to `N`
+/// bytes, since the decode sees only the slice of `out_len` bytes. The
+/// proofs check it with `N` at their bound on the buffer's length, so the
+/// solver models no bytes that no buffer of theirs reaches.
+pub(crate) fn reply_holds_within<const N: usize>(words: &[u64], out_len: usize)
+{
+    let out_len = out_len.min(N);
+    let mut out = [UNWRITTEN; N];
     let expected = words.split_first().and_then(|(&count, payload)| {
         let count = u128::from(count);
         let carried = (payload.len() as u128).saturating_mul(8);
-        let fits = count <= out_len.min(MAX_OUT) as u128
-            && count <= MAX_READ_BYTES as u128
-            && count <= carried;
+        let fits = count <= out_len as u128 && count <= MAX_READ_BYTES as u128 && count <= carried;
         fits.then(|| usize::try_from(count).ok()).flatten()
     });
     let buffer = out.get_mut(..out_len).unwrap_or_default();
@@ -132,20 +141,25 @@ pub(crate) fn reply_holds(words: &[u64], out_len: usize)
         return;
     };
     let payload = words.get(1..).unwrap_or_default();
-    for (at, &byte) in out.get(..out_len).unwrap_or_default().iter().enumerate()
+    // The buffer is walked 8 bytes at a time beside the words, so each byte
+    // is checked at its own index, `8 * chunk + offset`, against the byte of
+    // its word.
+    let buffer = out.get(..out_len).unwrap_or_default();
+    for (chunk, bytes) in buffer.chunks(8).enumerate()
     {
-        let word = at.checked_div(8).and_then(|index| payload.get(index));
-        let sent = word.map(|word| word.to_le_bytes()).and_then(|bytes| {
-            at.checked_rem(8)
-                .and_then(|index| bytes.get(index).copied())
-        });
-        if at < count
+        let sent = payload.get(chunk).map(|word| word.to_le_bytes());
+        for (offset, &byte) in bytes.iter().enumerate()
         {
-            assert_eq!(Some(byte), sent, "a counted byte was misread");
-        }
-        else
-        {
-            assert_eq!(byte, UNWRITTEN, "a byte past the count was written");
+            let at = chunk.saturating_mul(8).saturating_add(offset);
+            if at < count
+            {
+                let expected = sent.and_then(|sent| sent.get(offset).copied());
+                assert_eq!(Some(byte), expected, "a counted byte was misread");
+            }
+            else
+            {
+                assert_eq!(byte, UNWRITTEN, "a byte past the count was written");
+            }
         }
     }
 }

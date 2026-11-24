@@ -204,6 +204,42 @@ fn suite_of(bench: &str) -> &str
     bench.split_once('.').map_or(bench, |(suite, _)| suite)
 }
 
+/// `stored` without the baselines of `skipped`, the suites whose boots did
+/// not run.
+///
+/// # Errors
+/// A suite of `skipped` that `set` measures: its boot did run.
+pub fn without_suites(
+    set: &RunSet,
+    stored: BTreeMap<Key, Stored>,
+    skipped: &[String],
+) -> Result<BTreeMap<Key, Stored>>
+{
+    if let Some(key) = set
+        .measured
+        .keys()
+        .find(|key| skipped.iter().any(|s| s == suite_of(&key.bench)))
+    {
+        bail!(
+            "the logs measure {key}, of a suite --skip-suite names ({})",
+            suite_of(&key.bench)
+        );
+    }
+    Ok(stored
+        .into_iter()
+        .filter(|(key, _)| !skipped.iter().any(|s| s == suite_of(&key.bench)))
+        .collect())
+}
+
+/// The suites `stored` holds a baseline of and `set` measures nothing of, in
+/// order: the suites of a boot that did not run.
+fn unmeasured_suites<'a>(set: &'a RunSet, stored: &'a BTreeMap<Key, Stored>) -> Vec<&'a str>
+{
+    let measured: BTreeSet<&str> = set.measured.keys().map(|k| suite_of(&k.bench)).collect();
+    let stored: BTreeSet<&str> = stored.keys().map(|k| suite_of(&k.bench)).collect();
+    stored.difference(&measured).copied().collect()
+}
+
 /// One measurement over a set of runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Measured
@@ -770,7 +806,9 @@ pub enum Rewrite
 /// host mode, any of them) moved (`Verdict::moved`), or when its benchmark measures
 /// lines its file lacks or lacks lines its file holds. Each written file
 /// holds every measurement of its benchmark that the runs made, at its
-/// lowest p50. A file whose benchmark no run measured is removed.
+/// lowest p50. A file whose benchmark no run measured is removed, unless the
+/// runs measured nothing of its suite: that suite's boot did not run (a bench
+/// cell that skipped its ktest boots), and its files are left as they are.
 ///
 /// # Errors
 /// A run set with a measurement some run missed, or with a `FAIL` line: a
@@ -792,7 +830,13 @@ pub fn regenerate(
     {
         bail!("{key} was not measured by every run");
     }
-    let rows = compare(mode, set, stored, bands);
+    let unmeasured = unmeasured_suites(set, stored);
+    let stored: BTreeMap<Key, Stored> = stored
+        .iter()
+        .filter(|(key, _)| !unmeasured.contains(&suite_of(&key.bench)))
+        .map(|(key, s)| (key.clone(), *s))
+        .collect();
+    let rows = compare(mode, set, &stored, bands);
     let benches: BTreeSet<&str> = rows.iter().map(|r| r.key.bench.as_str()).collect();
     let mut out = BTreeMap::new();
     for bench in benches
@@ -1409,5 +1453,56 @@ mod tests
                 }
             }
         }
+    }
+
+    fn ubench_key() -> Key
+    {
+        Key {
+            bench: "ubench.ipc_rt".to_string(),
+            variant: String::new(),
+            cpus: 1,
+        }
+    }
+
+    // Defect caught: the baselines of a suite whose boot the bench cell
+    // skipped reported MISSING, failing the cell; or a skipped suite whose
+    // logs are there ignored instead of refused.
+    #[test]
+    fn a_skipped_suite_s_baselines_are_not_expected()
+    {
+        let set = gather(BenchMode::Icount, &[log(1, "on", &[line("a", 1, 100)])]).unwrap();
+        let both = stored(&[(key("a", "", 1), 100), (ubench_key(), 50)]);
+        let rows = compare(BenchMode::Icount, &set, &both, &BTreeMap::new());
+        assert_eq!(verdict_of(&rows, &ubench_key()), Verdict::Missing);
+        let kept = without_suites(&set, both.clone(), &["ubench".to_owned()]).unwrap();
+        assert_eq!(kept.keys().collect::<Vec<_>>(), [&key("a", "", 1)]);
+        let refused = without_suites(&set, both, &["ktest".to_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("ktest.a"), "{refused}");
+    }
+
+    // Defect caught: baselines rewritten from a run whose bench cell skipped
+    // a boot removing every file of that boot's suites, or a file of a
+    // measured suite that no run measured kept.
+    #[test]
+    fn a_rewrite_leaves_the_files_of_a_suite_the_logs_do_not_measure()
+    {
+        let set = gather(BenchMode::Icount, &[log(1, "on", &[line("a", 1, 100)])]).unwrap();
+        let stored = stored(&[
+            (key("a", "", 1), 90),
+            (key("gone", "", 1), 50),
+            (ubench_key(), 50),
+        ]);
+        let files = regenerate(
+            BenchMode::Icount,
+            &set,
+            &stored,
+            &BTreeMap::new(),
+            Rewrite::All,
+        )
+        .unwrap();
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["ktest.a", "ktest.gone"]);
+        assert!(files["ktest.a"].is_some() && files["ktest.gone"].is_none());
     }
 }

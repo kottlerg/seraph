@@ -173,7 +173,7 @@ Options:
       --test-devices
           Attach the test devices svctest's devmgr phases drive through the test-only drivers: QEMU's `edu` device and five `pci-testdev` functions. A svctest boot needs them (docs/testing.md § Gating)
       --icount
-          Count instructions: run the machine on single-threaded TCG with QEMU's `-icount shift=0,sleep=off,align=off`, so the guest's clock and cycle counters advance one tick per retired instruction, the deterministic measure `bench-check --mode icount` compares. Always TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount cannot serve, so the kernel runs its xAPIC paths
+          Count instructions: run the machine on single-threaded TCG with QEMU's `-icount shift=0,sleep=on,align=off`, so the guest's clock and cycle counters advance one tick per retired instruction while a vCPU runs, the deterministic measure `bench-check --mode icount` compares, and follow the host's time while every vCPU idles, so a device completion ends an idle as it would on hardware. Always TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount cannot serve, so the kernel runs its xAPIC paths
       --runs <N>
           Boot N times unattended and classify each run's log as PASS, FAIL, HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns, failing unless every run passes (a QEMU-CRASH is tolerated). Without it, `run` is one interactive boot whose serial output is the terminal's
       --display <DISPLAY>
@@ -311,7 +311,7 @@ Options:
           Attach the test devices svctest's devmgr phases drive through the test-only drivers: QEMU's `edu` device and five `pci-testdev` functions. A svctest boot needs them (docs/testing.md § Gating)
 
       --icount
-          Count instructions: run the machine on single-threaded TCG with QEMU's `-icount shift=0,sleep=off,align=off`, so the guest's clock and cycle counters advance one tick per retired instruction, the deterministic measure `bench-check --mode icount` compares. Always TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount cannot serve, so the kernel runs its xAPIC paths
+          Count instructions: run the machine on single-threaded TCG with QEMU's `-icount shift=0,sleep=on,align=off`, so the guest's clock and cycle counters advance one tick per retired instruction while a vCPU runs, the deterministic measure `bench-check --mode icount` compares, and follow the host's time while every vCPU idles, so a device completion ends an idle as it would on hardware. Always TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount cannot serve, so the kernel runs its xAPIC paths
 
       --runs <N>
           Boot N times unattended and classify each run's log as PASS, FAIL, HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns, failing unless every run passes (a QEMU-CRASH is tolerated). Without it, `run` is one interactive boot whose serial output is the terminal's

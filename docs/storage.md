@@ -150,28 +150,36 @@ position, a label, or a filesystem UUID. The model is:
   path ([signing.md](signing.md#configuration)). vfsd reads it once per
   boot, through procmgr's verified read, after the root self-mount and
   before the `/esp` and data auto-mounts. Each line names a role's
-  partition by its unique partition GUID: `data <mount path> <GUID>`, any
-  number at distinct paths, and `swap <GUID>`, at most one. A statement
-  that is missing, refused by the verified read, or refused whole by the
-  parser is logged and names nothing: every role then resolves on the
-  boot disk. A named role takes the named partition only, and only when
-  it carries the role's type GUID: the boot disk's when the boot disk
-  holds it, else the one other held disk's that carries it. On no disk it
-  is not found; on two or more disks other than the boot disk, or with
-  another type, it is not taken; each is logged and never fatal. A role
-  the statement does not name resolves on the boot disk by type GUID and
-  priority.
+  partition by the disk it must be on and its unique partition GUID:
+  `data <mount path> <disk> <GUID>`, any number at distinct paths, and
+  `swap <disk> <GUID>`, at most one. The disk is `boot`, the boot disk
+  wherever it is found, or `pci:SSSS:BB:DD.F`, the PCI location devmgr
+  reports for a disk, which vfsd logs for each disk it holds after
+  `PCI `. A statement that is missing, refused by the verified read, or
+  refused whole by the parser is logged and names nothing: every role
+  then resolves on the boot disk. A named role takes the named partition
+  only, only on the disk the line binds it to (the boot disk, or a held
+  disk at the location, compared whole, segment included), and only when
+  it carries the role's type GUID. A partition carrying the named GUID on
+  any other disk neither takes the role nor denies it. With none on the
+  bound disk the role is not taken: vfsd logs that the partition is not
+  on its disk, naming the first other disk it saw it on, or that it found
+  none; two on the bound disk, or one of another type there, and it is
+  not taken either; each is logged and never fatal. A role the statement
+  does not name resolves on the boot disk by type GUID and priority.
 - **A disk neither the boot disk nor named takes no role**, at any
   priority. vfsd still holds it and parses its GPT, since a partition the
   statement names, or one on a disk added later, may be on it. A copy of
-  a named partition on a second disk other than the boot disk denies that
-  role, skipped and logged; a copy of the boot disk is not at the boot
-  controller's location and takes nothing.
+  a named disk at another location takes nothing and denies nothing, and
+  a copy of the boot disk is not at the boot controller's location and
+  takes nothing. A disk that moves to another location loses the roles
+  the statement binds to its old one until the statement names the new
+  one.
 - **Data partitions are auto-mounted.** After `/esp`, vfsd mounts each data
   partition the statement names at its path, then, unless the statement
   names one for `/data`, the boot disk's `SERAPH_DATA` partition at
   `/data`. Each mount is best-effort: when no partition resolves (none
-  present, a tie, or a named partition not taken), vfsd skips the mount and
+  present, a tie, or a named partition not on its disk), vfsd skips the mount and
   the path falls through to the root partition, serving any tree present
   there (or resolving as absent if none); never fatal. Whether `/data` is
   a dedicated partition or a root-fs directory is therefore a
@@ -450,7 +458,7 @@ To prevent inference of behavior that does not exist:
 - **No filesystem labels or filesystem UUIDs as identity.** Partition
   identity is the GPT type GUID plus DPS attribute-bit priority on the
   boot disk, and the GPT unique partition GUID the signed statement names
-  on another disk. Filesystem-level labels (FAT volume label, ext4
+  on the disk it binds it to. Filesystem-level labels (FAT volume label, ext4
   superblock UUID, etc.) are not consulted by vfsd.
 - **No unsigned mount configuration.** The one configuration file is the
   storage statement, signed in the configuration role, which only names
@@ -458,11 +466,12 @@ To prevent inference of behavior that does not exist:
   and no kernel command line carrying mount config.
 - **No role from a disk's own say-so.** A disk other than the boot disk
   takes no role by its type GUIDs or priority bits, whatever they are;
-  only the statement gives it one. The statement binds a role to a
-  partition's unique GUID and type alone, which the disk itself carries,
-  so a disk that copies them takes the named role whenever the disk the
-  statement meant is not held; binding a named partition to its disk is
-  not built ([#1575](https://github.com/kottlerg/seraph/issues/1575)).
+  only the statement gives it one, and only on the disk it names: a
+  partition's unique GUID and type, which any disk can copy, take a named
+  role only at the location the statement binds it to. The location is
+  where the disk sits, not a property the disk proves: a disk placed at
+  that location while the named one is absent takes its roles
+  ([threat-model.md](threat-model.md) § Disk Images).
 - **No process-global filesystem authority.** A process delivered no
   namespace cap has no filesystem access; `std::fs` returns
   `Unsupported`. There is no fallback to a system identity. See

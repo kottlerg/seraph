@@ -1002,26 +1002,30 @@ the same report fails the command, as does every other fault.
 vfsd gives the root and `/esp` to the boot disk alone, and a role on another disk only to the
 partition the signed storage statement names ([storage.md](storage.md) § GPT Role-GUID
 Discovery); no boot set without a second disk shows either. `cargo xtask test storage-roles
-[--arch]` (both arches) boots the default boot set four times with a second disk, each to the
+[--arch]` (both arches) boots the default boot set five times with a second disk, each to the
 terminal's `terminal: READY for injection` line and swapd's `swap partition:` line, and reads
 vfsd's lines: the boot disk it found must be at the location of the boot controller it was told
 of, and each of the root, `/esp`, `/data` and swap must be on the disk the boot says:
 
 1. Repack the images in the split-data layout, which stages the statement naming the data and
-   swap partitions on `disk-data.img`, and boot with that image on the second slot: the root and
-   `/esp` are on the boot disk, `/data` and swap named by the statement on the second disk.
-2. Repack the single image, and boot with a foreign disk on the second slot whose ESP, root, data
+   swap partitions on `disk-data.img` at the second slot's PCI location, and boot with that image
+   on the second slot: the root and `/esp` are on the boot disk, `/data` and swap named by the
+   statement on the second disk.
+2. Boot the same images with `disk-data.img` at another slot: the root and `/esp` are on the
+   boot disk, and `/data` and swap are not taken, vfsd logging that each named partition is not
+   on its disk and naming the disk it saw it on, and swapd logging that it has no swap partition.
+3. Repack the single image, and boot with a foreign disk on the second slot whose ESP, root, data
    and swap partitions carry priority `0xFFFF`, above the boot disk's, under GUIDs of their own:
    every role is on the boot disk.
-3. The same with the foreign disk at the boot disk's priority, where the every-disk search made
+4. The same with the foreign disk at the boot disk's priority, where the every-disk search made
    the root lookup a fatal tie: every role is on the boot disk.
-4. Boot with a copy of `disk.img` on the second slot, which carries the boot ESP too: the boot
+5. Boot with a copy of `disk.img` on the second slot, which carries the boot ESP too: the boot
    disk is the one at the boot controller, and every role is on it.
 
-A `no boot disk:` line, a role on another disk than the boot says, or a missing line fails the
-case; the images are repacked in the layout they had, whatever the outcome. See
-[xtask/README.md § The `storage-roles` case](../xtask/README.md#the-storage-roles-case) for the
-command.
+A `no boot disk:` line, a role on another disk than the boot says or taken where the boot says none
+is, or a missing line fails the case; the images are repacked in the layout they had, whatever the
+outcome. See [xtask/README.md § The `storage-roles` case](../xtask/README.md#the-storage-roles-case)
+for the command.
 
 ### PCI Express hotplug (`hotplug` case)
 
@@ -1076,29 +1080,31 @@ per hotplug control, and then makes a disk leave and arrive again and a second d
    Kill QEMU.
 8. For the storage boots, stage the fixture's disk-mode recipe (`hotplug-check-disk.svc`) alone and
    repack the images in the split-data layout at the block size they have, so the data and swap
-   partitions are on `disk-data.img`, named by the storage statement the layout stages, and swapd
-   takes its partition from that disk. Boot under native control with that image's `virtio-blk-pci`
-   behind the first port, and wait for devmgr's `managed` line and the fixture's `HOLDING a file
-   open on /data` line: vfsd mounted `/data` on the disk at startup, and the fixture holds a file
-   open there and knows the root mount's driver by its name, `fatfs:/`.
+   partitions are on `disk-data.img`, named by the storage statement the layout stages on the disk
+   at the first port's location, and swapd takes its partition from that disk. Boot under native
+   control with that image's `virtio-blk-pci` behind the first port, and wait for devmgr's `managed`
+   line and the fixture's `HOLDING a file open on /data` line: vfsd mounted `/data` on the disk at
+   startup, and the fixture holds a file open there and knows the root mount's driver by its name,
+   `fatfs:/`.
 9. Remove the disk with its driver idle, and require devmgr's removal lines, vfsd's
    `disk N: removed; tearing down its mounts` line, and the fixture's `TORN DOWN /data` line: the
-   mount is gone, the disk marked removed, the open file stale. Add the disk again on the same
-   block node and wait for the fixture's `MOUNTED /data on the re-added disk` line: a fresh
-   `MOUNT` mounts `/data` on it. Then hot-add a copy of `disk-data.img`, taken before the
-   boot, behind the second port, and wait for the fixture's verdict: its `MOUNT` of the data
-   role, `TABLE_FULL` while `/data` stands, answers `NO_MOUNT` once devmgr serves the copy,
-   which carries the data partition the statement names as the data disk does, so vfsd resolves
-   a named partition across every disk devmgr serves, a disk added after start among them, and
-   takes none when two disks other than the boot disk carry it
-   ([docs/storage.md](storage.md#gpt-role-guid-discovery) § GPT Role-GUID Discovery); and with
-   the root mount's driver stopped a lookup at `/` ends in an error within vfsd's bound while
-   `/data` still reads. The fixture then kills the root mount's driver; require vfsd's
-   `FATAL: root filesystem lost` line, svcmgr's `critical service unrecoverable: vfsd` line,
-   and QEMU's exit.
-10. Boot with the boot disk itself behind the first port and the data disk on a slot of its own,
-    wait for the slot managed and the fixture ready, remove the boot disk, and require the same
-    three.
+   mount is gone, the disk marked removed, the open file stale. Hot-add a copy of
+   `disk-data.img`, taken before the boot, behind the second port, and require vfsd's line that
+   `/data`'s named partition is not on its disk and is seen on the disk at the second port's
+   location: the copy carries the partition the statement names, at a location the statement
+   does not name, and takes nothing; a fixture's mount before the data disk is back fails the
+   case. Add the disk again on the same block node, and require vfsd's line placing `/data`'s
+   named partition on the disk at the first port's location and the fixture's `MOUNTED /data on
+   the re-added disk beside the copy of it` line: a fresh `MOUNT` mounts `/data` on it, a disk
+   added after start, which the copy beside it does not deny, and the fixture's file, which the
+   copy does not hold, reads back ([docs/storage.md](storage.md#gpt-role-guid-discovery) § GPT
+   Role-GUID Discovery). Wait for the fixture's verdict: with the root mount's driver stopped a
+   lookup at `/` ends in an error within vfsd's bound while `/data` still reads. The fixture
+   then kills the root mount's driver; require vfsd's `FATAL: root filesystem lost` line,
+   svcmgr's `critical service unrecoverable: vfsd` line, and QEMU's exit.
+10. Boot with the boot disk itself behind the first port and the data disk at the second disk's
+    slot, which the statement the images are repacked with names, wait for the slot managed and
+    the fixture ready, remove the boot disk, and require the same three.
 11. Kill QEMU, remove the staged files, and repack the images in their layout again, whatever the
     outcome.
 
@@ -1707,14 +1713,14 @@ the cells of every surface a non-inert line of its own diff is on.
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
 | Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, `core/kernel/src/arch/riscv64/aia_encoding.rs`, `core/kernel/src/arch/x86_64/msi.rs`, and `core/kernel/src/arch/x86_64/remap.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, `sys_irq_split`, `sys_irq_msg_alloc`, `sys_irq_route`, and `sys_irq_remap`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, the message-signaled targets' slots (`alloc_message_target`, `free_message_target`, and the slot entry a delivery reads, `slot_entry`), and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, `select_ioapics`, and the allocation of the per-CPU device-vector rows the routes and targets take (`init_vector_storage`)); the interrupt-remapping switch and the entries it needs (`set_remap`, `remap_entry`, and `remap_handles`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes and targets take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules, as files (`shared/ipc/src/devmgr_labels.rs`, `shared/ipc/src/devmgr_errors.rs`, `shared/ipc/src/devmgr_dma_labels.rs`, `shared/ipc/src/devmgr_dma_errors.rs`, and `shared/ipc/src/device_info_kind.rs`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, `RISCV_IOMMU_DEVICE`, `X86_IOMMU_DEVICE`, and `X86_MACHINE_SPLIT_IRQCHIP`) | every device cell |
-| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), the storage statement's crate `shared/storage-statement/`, `xtask/src/disk.rs`, its GPT writer `xtask/src/gpt.rs`, its FAT writer `xtask/src/fat.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers, as files (`shared/ipc/src/vfsd_labels.rs`, `shared/ipc/src/vfsd_errors.rs`, `shared/ipc/src/fs_labels.rs`, `shared/ipc/src/fs_errors.rs`, `shared/ipc/src/blk_labels.rs`, and `shared/ipc/src/blk_errors.rs`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_line`, `DiskLine`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
+| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), the storage statement's crate `shared/storage-statement/`, `xtask/src/disk.rs`, its GPT writer `xtask/src/gpt.rs`, its FAT writer `xtask/src/fat.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers, as files (`shared/ipc/src/vfsd_labels.rs`, `shared/ipc/src/vfsd_errors.rs`, `shared/ipc/src/fs_labels.rs`, `shared/ipc/src/fs_errors.rs`, `shared/ipc/src/blk_labels.rs`, and `shared/ipc/src/blk_errors.rs`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_line`, `DiskLine`, `SecondSlot`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_FIRST_DISK_SLOT`, `MOVED_DISK_SLOT`, `first_disk_slot`, `SECOND_DISK_LOCATION`, `BlockSize`, and `split_data`) | every storage cell |
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
 | virtio-rng and the `hwrng` class | `services/drivers/virtio/rng/`, its class protocol crate (`shared/hwrng-protocol/`), and svctest's hwrng checks, which drive it (by definition alone: `hwrng_read_phase`, `hwrng_restart_phase`, `hwrng_read`, and `hwrng_denied`) | no-iommu |
 | virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test/debug_port/echo.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test/debug_port/gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module, a file (`shared/ipc/src/test_dma_labels.rs`), the launchers' `edu` attachment (`EDU_DEVICE`), and svctest's DMA confinement, MSI delivery, MSI forge, MSI churn and MSI release checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, `msi_forge_phase`, `msi_churn_phase`, `msi_release_phase`, `iommu_restart_phase`, and `call_test_dma`) | no-iommu, and hotplug |
-| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test/hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
+| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test/hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `PORT_DISK_LOCATION`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay` and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | TPM 2.0, and the bootloader's seed of its registers | `services/drivers/tpm/`, its class protocol crate (`shared/hwrng-protocol/`), which the virtio-rng row lists too, the host test that drives it (`xtask/src/commands/test/tpm.rs`), and the launchers' TPM attachment (`Tpm`, `TpmInterface`, and `tpm_args`); and the bootloader's `TPM2` table seed, which only a boot with a TPM takes (`tpm2_register_window`, `tpm_register_window`, `TPM2_OFF_CONTROL_AREA`, `TPM2_OFF_START_METHOD`, `TPM2_MIN_LEN`, `TPM2_START_FIFO`, and `TPM2_START_CRB`) | tpm |
@@ -1775,7 +1781,7 @@ D="$D|hwrng_re(ad|start)_phase|hwrng_read|hwrng_denied"
 D="$D|QemuDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
 D="$D|rebase_framebuffer|framebuffer_above|debug_port_args|DEBUG_PORT_CHARDEV"
 D="$D|hotplug_port_args|HOTPLUG_(DISK_)?PORT_(DEVICE|ID)|X86_NATIVE_HOTPLUG_GLOBAL|HotplugControl"
-D="$D|HotplugPort|PortDisk|PORT_DISK_(ID|NODE)|port_disk_(properties|block_size)"
+D="$D|HotplugPort|PortDisk|PORT_DISK_(ID|NODE|LOCATION)|port_disk_(properties|block_size)"
 D="$D|boot_disk_behind_port|Property|blockdev_add_raw(_message)?"
 D="$D|EDU_DMA_MASK|device_add(_message)?|device_del(eted|_message|_request)?"
 D="$D|Hotplug(Slots|Job|Note|Server)|hotplug_slots|start_hotplug|route_hotplug_notes"
@@ -1785,7 +1791,8 @@ D="$D|gdb_target(_tick|_worker_step)?|handle_list_processes|handle_detach_proces
 D="$D|restore_crash_bindings|watch_debugger|check_debuggers"
 D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
 D="$D|second_disk(_[a-z_]+)?|second_(src|dst|line)|DiskLine"
-D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"
+D="$D|(FIRST|SECOND|SHARED_LINE_FIRST|MOVED)_DISK_SLOT|first_disk_slot|SecondSlot"
+D="$D|SECOND_DISK_LOCATION"
 D="$D|shadow_stack|shadow_page|shadow_offset|set_shadow_stack_pages|shadow_on_boot_cpu"
 D="$D|make_cpu_shadow_pages|(idle|cpu)_shadow_pages|idle_saved_state|shadow_direct_map_page"
 D="$D|new_shadow_stack_page|kernel_write_fault_is_spurious"
@@ -1847,23 +1854,23 @@ timing report is neither a HANG nor a failure.
 --block-size 4096`), booted from a 4096-byte-block ESP with its root and data partitions at
 4096-byte blocks; the data and swap partitions on a second disk, which the storage statement the
 pack stages names (`mkdisk --split-data`, booted with `--second-disk disk-data.img`), so `/data`
-lives only there; the same second disk on the first disk's `INTx` line (`--second-disk-shared-line`,
-which launches both disks with no MSI-X), so the svctest phases that read `/data` pass only when
-devmgr serves both virtio-blk devices on one line (a lost interrupt costs a disk request up to its
-interrupt-service thread's timed read, `ISR_POLL_MS`, not the boot, so the boot's time, not its
-outcome, shows whether both drivers acknowledge every delivery); and a second disk at 8192-byte
-blocks (`--second-disk-block-size 8192`), above virtio-blk's `MAX_BLOCK_SIZE` (4096), which the boot
-goes on without. The storage and device documents own what each boot exercises
-([storage.md](storage.md) § GPT Role-GUID Discovery, [device-management.md](device-management.md) §
-Relationship to Other Services and § Interrupt Delivery), and
-[xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the options. svctest is staged as the
-canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is the larger of
-three times the slowest of these boots on the reference host (the riscv64 8192-byte boot, 133 s) and
-that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above follow; a change
-to these boots' times re-derives it. Each boot is a storage cell (Device surfaces above): in the
-commands below, 4kn is the first `run --runs` boot, second-disk the second, shared-line the third,
-and oversize-block the fourth, each after the `mkdisk` before it; a PR that owes some of the cells
-runs those boots, and the release host runs run all four.
+lives only there; the same two disks on one `INTx` line (`--second-disk-shared-line`, which moves
+the first disk onto the second's line and launches both with no MSI-X), so the svctest phases that
+read `/data` pass only when devmgr serves both virtio-blk devices on one line (a lost interrupt
+costs a disk request up to its interrupt-service thread's timed read, `ISR_POLL_MS`, not the boot,
+so the boot's time, not its outcome, shows whether both drivers acknowledge every delivery); and a
+second disk at 8192-byte blocks (`--second-disk-block-size 8192`), above virtio-blk's
+`MAX_BLOCK_SIZE` (4096), which the boot goes on without. The storage and device documents own what
+each boot exercises ([storage.md](storage.md) § GPT Role-GUID Discovery,
+[device-management.md](device-management.md) § Relationship to Other Services and § Interrupt
+Delivery), and [xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the options. svctest is
+staged as the canonical cells stage it, and its pass marker passes each boot. Each budget, 420 s, is
+the larger of three times the slowest of these boots on the reference host (the riscv64 8192-byte
+boot, 133 s) and that boot plus 100 s, rounded up to a minute, the rule the boundary budgets above
+follow; a change to these boots' times re-derives it. Each boot is a storage cell (Device surfaces
+above): in the commands below, 4kn is the first `run --runs` boot, second-disk the second,
+shared-line the third, and oversize-block the fourth, each after the `mkdisk` before it; a PR that
+owes some of the cells runs those boots, and the release host runs run all four.
 
 ```sh
 # Disk variations, per architecture (clean between architectures):
@@ -1933,8 +1940,8 @@ hot-adds behind one, withdraws it when the host removes the device, binds it aga
 adds it again, and binds the drivers directory's virtio-blk to the disk the host then hot-adds
 behind the other, with no MSI-X vectors, on its wired interrupt line. In the two storage boots, vfsd
 tears down the mount of a disk removed behind a port and mounts it again when it is added again,
-refuses the data role once a copy of the disk added beside it carries the named partition too, and
-ends at the loss of its root filesystem's driver and of the boot disk. The command stages and
+gives the data role to that disk back at its location and not to a copy of it added at another,
+and ends at the loss of its root filesystem's driver and of the boot disk. The command stages and
 unstages its own files on the current sysroot, a debug-profile build. It bounds each boot to its
 markers by five minutes, the fixture's probes and the disk's bind by three minutes after each
 hot-add, and the removal by one minute from `device_del`; it has no boot budget. The boots are the

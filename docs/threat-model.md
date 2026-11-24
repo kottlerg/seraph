@@ -235,9 +235,11 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   the bootloader reported that carries the boot ESP it booted (`find_boot_disk` in
   `services/vfsd/gpt/src/lib.rs`). Another disk takes a role only where the storage statement,
   signed in the configuration role and read through procmgr's verified read, names its partition
-  by unique GUID (`resolve_named`), so a written disk at any priority, or a copy of the boot disk,
-  neither wins the root or `/esp`, nor a role the statement does not name, nor makes the root
-  lookup a tie ([storage.md](storage.md) § GPT Role-GUID Discovery). The statement is decoded by a
+  by unique GUID on the disk it binds it to, the boot disk or the disk at a PCI location
+  (`resolve_named`), so a written disk at any priority, a copy of the boot disk, or a copy of a
+  named disk at another location, neither wins the root or `/esp`, nor a role the statement does
+  not name, nor takes or denies a named role, nor makes the root lookup a tie
+  ([storage.md](storage.md) § GPT Role-GUID Discovery). The statement is decoded by a
   pure crate, `shared/storage-statement`, which refuses the whole file on any error.
 
 **Fuzz targets and proof harnesses.**
@@ -252,8 +254,8 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
 - `storage-statement` (`xtask/fuzz/targets/src/bin/storage-statement.rs`) drives
   `storage_statement::property::storage_statement_holds` from the seeds in
   `shared/storage-statement/fuzz/storage-statement/seeds/`, and the `proofs` module of
-  `shared/storage-statement/src/lib.rs` proves the line parser, the GUID and path forms and the
-  conflict check; the same CI jobs run them.
+  `shared/storage-statement/src/lib.rs` proves the line parser, the GUID, path and disk forms and
+  the conflict check; the same CI jobs run them.
 - Planned: the FAT decoders' property function, fuzz target and proof harness (`parse_bpb_geometry`,
   `read_fat_entry`, `parse_dir_entry`; [#680](https://github.com/kottlerg/seraph/issues/680),
   [#756](https://github.com/kottlerg/seraph/issues/756)).
@@ -265,14 +267,13 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   entries `num_parts` declares, which the device's capacity then bounds.
 - No check compares one partition entry with another, so two partitions can overlap, and a
   filesystem driver given one reaches the other's blocks in the overlap.
-- A copy of a partition the statement names, on a disk other than the boot disk, denies that role
-  while the named disk is held: vfsd skips it and logs why, and the boot goes on. A named partition
-  is bound to its unique GUID and its type alone, which are written on the disk and readable, so a
-  disk that carries them takes that role (`/data` at its path, or swap, whose pages it then stores
-  and serves back) whenever the disk the statement meant is not held: not attached, removed, or
-  not yet served. Binding a named partition to its disk is not built
-  ([#1575](https://github.com/kottlerg/seraph/issues/1575)). A statement signed earlier at a
-  security version the machine still admits verifies, and names what it named
+- A named partition is bound to the PCI location the statement names for its disk, which the
+  machine's topology sets and no disk proves. A disk placed at that location while the named disk is
+  absent (not attached, removed, or not yet served) that carries the named unique GUID and type,
+  which are written on a disk and readable, takes that role (`/data` at its path, or swap, whose
+  pages it then stores and serves back); one placed there beside the named disk (two namespaces or
+  units behind one controller) denies it, skipped and logged, and the boot goes on. A statement
+  signed earlier at a security version the machine still admits verifies, and names what it named
   ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
 - Two disks at the boot controller's location that both carry the boot ESP (two namespaces or
   units behind one controller), or, with a controller that reports no PCI location, a copy of the

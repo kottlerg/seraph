@@ -84,8 +84,9 @@ for the root role, arch-neutral for data; see
 [`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
 resolves the partition with `resolve_role` in
 [`services/vfsd/src/main.rs`](../src/main.rs): the partition the signed
-storage statement names for the role on a disk it holds and has not marked
-removed ([`gpt::resolve_named`](../gpt/src/lib.rs)), else the boot disk's
+storage statement names for the role on the disk the statement binds it to,
+when vfsd holds that disk and has not marked it removed
+([`gpt::resolve_named`](../gpt/src/lib.rs)), else the boot disk's
 partition of the type GUID
 ([`gpt::lookup_on_disk`](../gpt/src/lib.rs); DPS-style priority
 tie-break on attribute bits 48-63, on the boot disk alone; a tie at the
@@ -105,10 +106,11 @@ rejected (`TABLE_FULL`) before any partition is registered or driver
 spawned. Before the role lookup vfsd queries devmgr for the block devices
 it served since vfsd's last query (from the first instance ordinal not yet
 queried) and holds them, so a partition the statement names resolves on
-any disk devmgr serves, under the rules of
-[docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery): a disk
-added or inserted again after startup is found, and takes a role only by
-the statement; it is not ranked against the boot disk's partitions. A partition is mounted
+the disk it binds it to whenever devmgr serves that disk, under the rules
+of [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery): a
+disk added or inserted again after startup is found, and takes a role only
+by the statement, at the location it names; it is not ranked against the
+boot disk's partitions. A partition is mounted
 once: a mount of a partition a mount holds, at another path, one
 restarting or whose removal is under way included, is rejected (`TABLE_FULL`) before any
 driver is spawned, so no two drivers serve one partition. A mount that

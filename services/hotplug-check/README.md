@@ -7,9 +7,10 @@ then that devmgr withdraws the driver when the host removes the device, and that
 again is served anew, works, and is charged none of its predecessor's IOMMU faults. So `cargo xtask
 test hotplug` follows an arrival from the slot to a bound driver, and a removal back to an empty
 slot, under each hotplug control. The disk mode (`hotplug-check disk`) proves vfsd's handling of a
-disk removed and added again behind a root port, its resolution of a named partition on a disk added
-after start, and the loss of its root filesystem's driver. It is gated and opt-in: its recipes live
-in `/config/svcmgr/tests/`, and only the `hotplug` case stages them, each for its own boots.
+disk removed and added again behind a root port, its resolution of a named partition on the disk the
+storage statement binds it to, added after start, beside a copy at another location, and the loss of
+its root filesystem's driver. It is gated and opt-in: its recipes live in `/config/svcmgr/tests/`,
+and only the `hotplug` case stages them, each for its own boots.
 
 ---
 
@@ -81,13 +82,13 @@ so vfsd mounts `/data` at startup. It finds the root mount's driver by its proce
 2. the mount is torn down: `/data` is not found;
 3. the open file is stale: it fails with `StaleNetworkFileHandle`.
 
-It logs `TORN DOWN /data, its disk removed; READY for the re-added disk`, on which the host adds the
-disk again. It then mounts `/data` through a fresh `MOUNT`, reads the file back, and logs
-`MOUNTED /data on the re-added disk; READY for a copy of the disk`, on which the host adds a copy
-of the disk behind the second root port. It checks that vfsd resolves the partition the storage
-statement names for `/data` on any disk devmgr serves: `MOUNT` at `/data` answers `TABLE_FULL` while
-the data disk alone holds the partition and `NO_MOUNT` (two disks other than the boot disk carry it)
-once devmgr serves the copy, and the file still reads. It then stops
+It logs `TORN DOWN /data, its disk removed; READY for the re-added disk`, on which the host adds a
+copy of the disk, taken before the boot, behind the second root port, requires vfsd's line that the
+partition the storage statement names for `/data` is not on its disk and is seen on the copy, and
+then adds the disk again behind the first. Meanwhile the fixture's `MOUNT` answers `NO_MOUNT`. It
+then mounts `/data` through a fresh `MOUNT` on the disk back at the location the statement names,
+beside the copy, reads back the file, which the copy does not hold, and logs `MOUNTED /data on the
+re-added disk beside the copy of it`. It then stops
 the root driver's threads through a debug attach, checks that a lookup falling through at `/`
 errors within 30 s while `/data` still reads, logs `PASS`, and kills the root driver; vfsd exits and
 svcmgr shuts the system down. In the second storage boot, whose boot disk sits behind the port, the

@@ -2009,15 +2009,24 @@ pub enum BaseCi
     Green,
     /// The tip's run has not finished.
     Pending,
-    /// The tip's run concluded otherwise: its conclusion.
-    Red(String),
+    /// The tip's run failed: its conclusion, and when it concluded.
+    Red
+    {
+        conclusion: String, at: String
+    },
+    /// The tip's run ended without a verdict (cancelled, skipped): its
+    /// conclusion, and when it ended.
+    Unproven
+    {
+        conclusion: String, at: String
+    },
     /// The tip has no run, or its runs could not be read: why.
     Unknown(String),
 }
 
 /// The CI state of the tip from the runs `gh run list --commit <tip> --json
-/// status,conclusion` returns for it, newest first: the newest decides, so a
-/// re-run that succeeded turns a red tip green.
+/// status,conclusion,updatedAt` returns for it, newest first: the newest
+/// decides, so a re-run that succeeded turns a red tip green.
 pub fn base_ci(runs: &Value) -> BaseCi
 {
     let Some(run) = runs.as_array().and_then(|runs| runs.first())
@@ -2029,14 +2038,18 @@ pub fn base_ci(runs: &Value) -> BaseCi
     {
         return BaseCi::Pending;
     }
+    let at = run["updatedAt"].as_str().unwrap_or("").to_owned();
     match run["conclusion"].as_str().unwrap_or("")
     {
         "success" => BaseCi::Green,
-        conclusion @ ("cancelled" | "skipped" | "") =>
-        {
-            BaseCi::Unknown(format!("the tip's run concluded {conclusion:?}; re-run it"))
-        }
-        other => BaseCi::Red(other.to_owned()),
+        conclusion @ ("cancelled" | "skipped" | "") => BaseCi::Unproven {
+            conclusion: conclusion.to_owned(),
+            at,
+        },
+        other => BaseCi::Red {
+            conclusion: other.to_owned(),
+            at,
+        },
     }
 }
 
@@ -2062,17 +2075,67 @@ pub fn check_base_fresh(base: &str, local: &str, remote: &str) -> Vec<Diag>
     }
 }
 
-/// The `gate-includes-master` and `gate-base-green` findings. A head that
-/// contains the base branch's tip passes. One that does not passes only when
-/// the base branch's change since the merge base is disjoint from the PR's
-/// files, GitHub reports the PR `MERGEABLE`, and the tip's own CI run has
-/// succeeded (`ci`, read for that case alone): while it is pending or red,
-/// only a head that contains the tip merges, whose own green CI shows the
-/// combination green.
+/// The `gate-base-green` finding of a head that contains the tip (see
+/// [`check_master`]).
+fn check_contained(ci: Option<&BaseCi>, head_started: Option<&str>, base: &str) -> Vec<Diag>
+{
+    let why = match ci
+    {
+        Some(BaseCi::Green) => None,
+        Some(
+            BaseCi::Red {
+                conclusion,
+                at: ended,
+            }
+            | BaseCi::Unproven {
+                conclusion,
+                at: ended,
+            },
+        ) => match head_started
+        {
+            Some(started) if !ended.is_empty() && started > ended.as_str() => None,
+            _ => Some(format!(
+                "the CI run of {base}'s tip concluded {conclusion} at {ended}, and the head's \
+                 CI run started before that ({}), so it did not prove the tip's change: run \
+                 the head's CI again",
+                head_started.unwrap_or("no run found")
+            )),
+        },
+        Some(BaseCi::Pending) => Some(format!(
+            "the CI run of {base}'s tip has not finished, and the head's CI proved only \
+             the change on its side of the tip; wait for it"
+        )),
+        Some(BaseCi::Unknown(why)) => Some(format!(
+            "{base}'s CI state could not be read ({why}); read it again"
+        )),
+        None => Some(format!("{base}'s CI state was not read")),
+    };
+    why.map(|why| Diag::error("gate-base-green", base.to_owned(), why))
+        .into_iter()
+        .collect()
+}
+
+/// The `gate-includes-master` and `gate-base-green` findings, from the
+/// tip's CI state `ci` and the start of the head's newest CI run
+/// `head_started` (RFC 3339, `None` when it has none or it could not be
+/// read). A pull request's CI run proves the change on its side of the
+/// newest `master` commit whose run passed or was still running when it
+/// started (`cargo xtask cells --since-covered`), so the combination is
+/// shown green by the head's green CI together with the tip's own green run,
+/// or, after the tip's run failed or ended without a verdict, by a head run
+/// started after that, which proved the tip's change too.
+///
+/// A head that contains the tip passes when the tip's run succeeded, or
+/// ended otherwise before the head's run started; while the tip's run is
+/// pending, or its state cannot be read, it waits. One that does not
+/// contain the tip passes only when the base branch's change since the
+/// merge base is disjoint from the PR's files, GitHub reports the PR
+/// `MERGEABLE`, and the tip's run succeeded.
 pub fn check_master(
     case: &MasterCase,
     mergeable: &str,
     ci: Option<&BaseCi>,
+    head_started: Option<&str>,
     base: &str,
     head: &str,
 ) -> Vec<Diag>
@@ -2080,7 +2143,7 @@ pub fn check_master(
     let at = short(head);
     match case
     {
-        MasterCase::Contained => Vec::new(),
+        MasterCase::Contained => check_contained(ci, head_started, base),
         MasterCase::Overlap(shared) =>
         {
             let mut named = shared
@@ -2138,10 +2201,14 @@ pub fn check_master(
                 Some(BaseCi::Pending) => Some(format!(
                     "the CI run of {base}'s tip has not finished; wait for it, or sync the branch"
                 )),
-                Some(BaseCi::Red(conclusion)) => Some(format!(
+                Some(BaseCi::Red { conclusion, .. }) => Some(format!(
                     "the CI run of {base}'s tip concluded {conclusion}: a red {base} is fixed \
                      before anything else merges, and meanwhile only a head that contains it \
                      merges"
+                )),
+                Some(BaseCi::Unproven { conclusion, .. }) => Some(format!(
+                    "the CI run of {base}'s tip concluded {conclusion:?}; re-run it, or sync \
+                     the branch"
                 )),
                 Some(BaseCi::Unknown(why)) => Some(format!(
                     "{base}'s CI state could not be read ({why}); sync the branch, or read it \
@@ -2175,13 +2242,49 @@ fn read_base_ci(root: &Path, branch: &str, tip: &str) -> BaseCi
             "--event",
             "push",
             "--json",
-            "status,conclusion",
+            "status,conclusion,updatedAt",
         ],
     )
     {
         Ok(runs) => base_ci(&runs),
         Err(err) => BaseCi::Unknown(format!("{err:#}")),
     }
+}
+
+/// When the newest `BASE_WORKFLOW` run of the pull request at `head`
+/// started (RFC 3339; a re-run's start when it was re-run), from `gh run
+/// list`; `None` when it has none or the runs could not be read.
+fn read_head_started(root: &Path, head: &str) -> Option<String>
+{
+    let runs = gh::json(
+        root,
+        &[
+            "run",
+            "list",
+            "--workflow",
+            BASE_WORKFLOW,
+            "--commit",
+            head,
+            "--event",
+            "pull_request",
+            "--json",
+            "startedAt",
+        ],
+    )
+    .ok()?;
+    head_started(&runs)
+}
+
+/// The start of the newest run of `runs` (`gh run list --json startedAt`,
+/// newest first); `None` when there is none.
+fn head_started(runs: &Value) -> Option<String>
+{
+    runs.as_array()?
+        .first()?
+        .get("startedAt")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 fn gate(
@@ -2233,13 +2336,24 @@ fn gate(
         Ok(case) =>
         {
             println!("    master: {}", case.describe(base));
-            let ci = matches!(case, MasterCase::Disjoint { .. }).then(|| match &tip
+            let reads = matches!(case, MasterCase::Disjoint { .. } | MasterCase::Contained);
+            let ci = reads.then(|| match &tip
             {
                 Ok(tip) => read_base_ci(&ctx.root, branch, tip),
                 Err(err) => BaseCi::Unknown(format!("{err:#}")),
             });
+            let started = matches!(case, MasterCase::Contained)
+                .then(|| read_head_started(&ctx.root, head))
+                .flatten();
             let mergeable = pr["mergeable"].as_str().unwrap_or("UNKNOWN");
-            out.extend(check_master(&case, mergeable, ci.as_ref(), base, head));
+            out.extend(check_master(
+                &case,
+                mergeable,
+                ci.as_ref(),
+                started.as_deref(),
+                base,
+                head,
+            ));
         }
         Err(err) => out.push(Diag::error(
             "gate-includes-master",
@@ -3709,11 +3823,11 @@ mod tests
             files: 1,
         };
         let check = |case: &MasterCase, mergeable: &str, ci: Option<&BaseCi>| {
-            check_master(case, mergeable, ci, "origin/master", "0123456789")
+            check_master(case, mergeable, ci, None, "origin/master", "0123456789")
         };
         let green = Some(&BaseCi::Green);
         assert_eq!(
-            check(&MasterCase::Contained, "UNKNOWN", None),
+            check(&MasterCase::Contained, "UNKNOWN", green),
             [] as [Diag; 0]
         );
         assert_eq!(check(&disjoint, "MERGEABLE", green), [] as [Diag; 0]);
@@ -3725,7 +3839,14 @@ mod tests
         }
         for ci in [
             BaseCi::Pending,
-            BaseCi::Red("failure".to_owned()),
+            BaseCi::Red {
+                conclusion: "failure".to_owned(),
+                at: "2026-11-24T12:00:00Z".to_owned(),
+            },
+            BaseCi::Unproven {
+                conclusion: "cancelled".to_owned(),
+                at: "2026-11-24T12:00:00Z".to_owned(),
+            },
             BaseCi::Unknown("no run".to_owned()),
         ]
         {
@@ -3753,6 +3874,81 @@ mod tests
         );
     }
 
+    // Defect caught: a head that contains master merged on a CI run that
+    // proved only its own side of a tip whose run was still going (the pull
+    // request's base counts a running master commit as covered), or of a
+    // tip whose run then failed; or a head refused although its run started
+    // after the tip's run failed, and so proved the tip's change too.
+    #[test]
+    fn a_head_that_contains_master_merges_on_a_proven_tip()
+    {
+        let check = |ci: Option<&BaseCi>, started: Option<&str>| {
+            rules(&check_master(
+                &MasterCase::Contained,
+                "MERGEABLE",
+                ci,
+                started,
+                "origin/master",
+                "0123456789",
+            ))
+        };
+        let pass: [&str; 0] = [];
+        let blocked = ["gate-base-green"];
+        let before = Some("2026-11-24T12:10:00Z");
+        let after = Some("2026-11-24T12:50:00Z");
+        let ended = "2026-11-24T12:40:05Z".to_owned();
+        let red = BaseCi::Red {
+            conclusion: "failure".to_owned(),
+            at: ended.clone(),
+        };
+        let cancelled = BaseCi::Unproven {
+            conclusion: "cancelled".to_owned(),
+            at: ended,
+        };
+        // Green tip: the head's run and the tip's prove the combination.
+        assert_eq!(check(Some(&BaseCi::Green), before), pass);
+        assert_eq!(check(Some(&BaseCi::Green), None), pass);
+        // Pending tip: wait for it, however recent the head's run.
+        assert_eq!(check(Some(&BaseCi::Pending), after), blocked);
+        // Red or cancelled tip: only a head run started after it ended.
+        for tip in [&red, &cancelled]
+        {
+            assert_eq!(check(Some(tip), before), blocked, "{tip:?}");
+            assert_eq!(check(Some(tip), None), blocked, "{tip:?}");
+            assert_eq!(check(Some(tip), after), pass, "{tip:?}");
+        }
+        let found = check_master(
+            &MasterCase::Contained,
+            "MERGEABLE",
+            Some(&red),
+            before,
+            "origin/master",
+            "0123456789",
+        );
+        assert!(found[0].message.contains("again"), "{}", found[0].message);
+        // An unread state waits too.
+        assert_eq!(
+            check(Some(&BaseCi::Unknown("no run".to_owned())), after),
+            blocked
+        );
+        assert_eq!(check(None, after), blocked);
+    }
+
+    #[test]
+    fn the_head_s_run_start_is_its_newest_run_s()
+    {
+        let parse = |text: &str| -> Value { json::parse(text).unwrap() };
+        assert_eq!(
+            head_started(&parse(
+                r#"[{"startedAt":"2026-11-24T12:50:00Z"},{"startedAt":"2026-11-24T12:00:00Z"}]"#
+            ))
+            .as_deref(),
+            Some("2026-11-24T12:50:00Z")
+        );
+        assert_eq!(head_started(&parse("[]")), None);
+        assert_eq!(head_started(&parse(r#"[{"startedAt":""}]"#)), None);
+    }
+
     #[test]
     fn the_base_ci_is_the_newest_run_of_the_tip()
     {
@@ -3765,8 +3961,13 @@ mod tests
             BaseCi::Green
         );
         assert_eq!(
-            base_ci(&parse(r#"[{"status":"completed","conclusion":"failure"}]"#)),
-            BaseCi::Red("failure".to_owned())
+            base_ci(&parse(
+                r#"[{"status":"completed","conclusion":"failure","updatedAt":"2026-11-24T12:40:05Z"}]"#
+            )),
+            BaseCi::Red {
+                conclusion: "failure".to_owned(),
+                at: "2026-11-24T12:40:05Z".to_owned()
+            }
         );
         assert_eq!(
             base_ci(&parse(r#"[{"status":"in_progress","conclusion":""}]"#)),
@@ -3776,7 +3977,7 @@ mod tests
             base_ci(&parse(
                 r#"[{"status":"completed","conclusion":"cancelled"}]"#
             )),
-            BaseCi::Unknown(_)
+            BaseCi::Unproven { .. }
         ));
         assert!(matches!(base_ci(&parse("[]")), BaseCi::Unknown(_)));
     }

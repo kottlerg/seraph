@@ -1606,21 +1606,25 @@ naming each such source that lies in no crate, or in one whose manifest names no
 harness is left out of the run.
 
 With `--since`, the command selects from those crates the ones the change from `<COMMIT>` to the
-working tree (`git diff --name-only --no-renames`, a rename as both its paths) can affect, and
-prints each with the changed file that selects it, or a line saying that none is affected and why. A
-crate is affected when a changed file lies in the directory of its package or of a workspace package
-in its dependency closure, as `cargo metadata --no-deps` gives the path dependencies (of every kind
-and target: a superset of what its test build compiles), or is a file one of those packages names in
-an `include!`, `include_str!`, `include_bytes!` or `#[path]` string literal. Every crate is affected
-when a changed file is an input of every build: the workspace `Cargo.toml` and `Cargo.lock`,
-`rust-toolchain.toml`, `.cargo/config.toml`, the command's own sources
-(`xtask/src/commands/kani.rs`, which holds the Kani pin, the memory limit and the judge of Kani's
-output, and `xtask/src/affected.rs`, the selection, which other commands can share), or
-`.github/workflows/build-test.yml`, whose `kani` job an empty selection does not install Kani in. A
-package's build script, features and `cfg` settings lie in its directory or the workspace manifest,
-so a change to them selects it. A commit the checkout does not hold fails the command, so a shallow
-clone never narrows the run. With no crate affected the command verifies nothing and does not check
-the installed release.
+working tree (`git diff --name-only --no-renames` from their merge base, a rename as both its paths)
+can affect, and prints each with the changed file that selects it, or a line saying that none is
+affected and why. A crate is affected when a changed file other than Markdown lies in the directory
+of its package or of a workspace package in its dependency closure, as `cargo metadata --no-deps`
+gives the path dependencies (of every kind and target: a superset of what its test build compiles),
+or is a file one of those packages names in an `include!`, `include_str!`, `include_bytes!` or
+`#[path]` string literal, Markdown included: a document no source reads changes no build. Every
+crate is affected when a changed file is an input of every proof, one that can change a harness's
+verdict: an input of every build (the workspace `Cargo.toml` and `Cargo.lock`,
+`rust-toolchain.toml`, `.cargo/config.toml`), or the command's own source,
+`xtask/src/commands/kani.rs`, which holds the Kani pin, the arguments and the memory limit it runs
+`cargo kani` with, and the judge of Kani's output. What decides only which crates are verified, or
+whether and where a job runs them (the selection in `xtask/src/affected.rs`, the workflows), is not
+one, and a change to it alone selects no crate. The change is taken from the merge base of
+`<COMMIT>` and `HEAD`, so a branch behind `<COMMIT>` is charged its own change alone. A package's
+build script, features and `cfg` settings lie in its directory or the workspace manifest, so a
+change to them selects it. A commit the checkout does not hold fails the command, so a shallow clone
+never narrows the run. With no crate affected the command verifies nothing and does not check the
+installed release.
 
 It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
@@ -1642,9 +1646,9 @@ counts other harnesses than reported a verdict; a harness that Kani starts and p
 fails too. Every selected crate runs, and the command then prints a table of every harness, by
 package and path, with its verdict and verification time, and fails naming each crate that failed.
 
-CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the base its `select`
-job found with `cargo xtask cells --since-green`, on a pull request and on a push to `master`
-alike, and with no option when that job found none; when the list is empty it installs no Kani
+CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the base its `select` job
+found, with `cargo xtask cells --since-covered` on a pull request and `--since-green` on a push to
+`master`, and with no option when that job found none; when the list is empty it installs no Kani
 and says so in a notice on the run, and otherwise it installs the release `--pin` prints and runs
 the command with the same `--since`. The `kani` job of `burnin.yml` runs the command with no option
 ([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
@@ -1668,19 +1672,21 @@ Gating), which `build-test.yml`'s `select` job runs to build its `validate` and 
 matrices.
 
 ```
-cargo xtask cells [--since <COMMIT> | --since-green <REV>] [--github-output <FILE>]
+cargo xtask cells [--since <COMMIT> | --since-green <REV> | --since-covered <REV>]
+                  [--github-output <FILE>]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--since <COMMIT>` | no base | The change from this commit to the working tree |
-| `--since-green <REV>` | no base | The change from the newest commit of `REV`'s first-parent history, 200 commits at most, whose `build-test` run on a push to `master` passed (`gh run list`); every cell, after a `WARNING:` line, when there is none or the runs cannot be read |
+| `--since <COMMIT>` | no base | The change from the merge base of this commit and `HEAD` to the working tree |
+| `--since-green <REV>` | no base | The change from the newest commit of `REV`'s first-parent history, 200 commits at most, whose `build-test` run on a push to `master` passed (`gh run list`, the 200 newest runs); every cell, after a `WARNING:` line, when there is none or the runs cannot be read. A push to `master` takes this base, so `master`'s own runs prove every commit, and a cell a red or cancelled run left unproven stays owed |
+| `--since-covered <REV>` | no base | As `--since-green`, but a commit whose run has not finished counts too: a pull request takes this base, so it is not charged the change a running `master` run is proving; a red or cancelled run's change stays owed, and the merge gate waits for a running tip (`gate-base-green`) |
 | `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate`, `build` and `bench`, each a matrix's `include` list, `build` holding one tree per architecture and profile a `validate` cell is owed in and the release trees when the `bench` cell is owed, those with `bench` true; `validate-owed`, `build-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
 
-Without a base, every cell is owed. With one, the command places each changed file
-(`git diff --name-only` from the base to the working tree, a rename as both its paths) in a
-class of the layer record, `src/layers.rs`, and prints each with its class and why. The first
-rule that holds places it:
+Without a base, every cell is owed. With one, the command places each changed file (`git diff
+--name-only` from the merge base of the base and `HEAD` to the working tree, a rename as both its
+paths) in a class of the layer record, `src/layers.rs`, and prints each with its class and why. The
+first rule that holds places it:
 
 1. Markdown is `docs`.
 2. An input of every build (`WORKSPACE_WIDE` of `src/affected.rs`: the toolchain pin, the root
@@ -2297,7 +2303,7 @@ fails the gate.
 | `gate-merge-state` | error | GitHub reports the merge state `CLEAN`. |
 | `gate-checks` | error | Every check of the rollup has succeeded, or is neutral or skipped. |
 | `gate-includes-master` | error | The base branch's tip is an ancestor of the PR head; or the two have one merge base, the base branch's change since it (`git diff --name-only --no-renames`, a rename naming both its paths) names no file the PR's own change from it names, and GitHub reports the PR `MERGEABLE` (docs/conventions.md § Syncing with `master`); `UNKNOWN`, before GitHub has computed it, asks for the gate to be run again. The command prints which case held on a `master:` line: `contains`, `disjoint` with the number of commits the head lacks, `overlap`, or the number of merge bases. |
-| `gate-base-green` | error | For a head that does not contain the base branch's tip, the tip's own CI run has finished green: the newest `build-test.yml` run on the push of the tip commit succeeded (`gh run list --commit`). While it is red or has not finished, only a head that contains the tip merges (docs/conventions.md § CI Gating). A tip with no run, a cancelled or skipped run, and a state that cannot be read are errors. |
+| `gate-base-green` | error | The tip's own CI run, the newest `build-test.yml` run on the push of the tip commit (`gh run list --commit`), has finished green; or the head contains the tip, the tip's run failed or ended without a verdict (cancelled, skipped), and the head's newest `build-test.yml` run on the pull request started after the tip's run ended (`startedAt`, a re-run's start, against the tip run's `updatedAt`), so it proved the tip's change too (docs/conventions.md § CI Gating). A pending tip run, a tip with no run, and a state that cannot be read are errors, for a head that contains the tip too, since a pull request's run leaves a running tip's change to that run. |
 | `gate-base-fresh` | error | The clone's `origin/<base>` is the base branch's tip on GitHub (`gh api`), since the two rules above read that ref: a stale one is refused with the advice to `git fetch origin`. |
 | `gate-audit-not-run` | error | The last run record for the PR head is not a run of the reviewer alone (`audit_verdict` `NOT RUN`): the audit is still owed at that head, as an `audit` record with a greater `stats.run`. |
 | `record-run-kind` | error | The last run record for the PR head, when it is a `full` or `delta` record of the defect form, has no audit section of another run kind (§ `cargo xtask review-ledger`). |

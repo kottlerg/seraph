@@ -12,9 +12,10 @@
 //!
 //! The inputs of a package's build are its own directory, the directories of
 //! the workspace packages in its dependency closure, as `cargo metadata`
-//! gives the path dependencies, the files those packages name in an
-//! `include!`, `include_str!`, `include_bytes!` or `#[path]` string
-//! literal, and the inputs of every build ([`WORKSPACE_WIDE`]). A package's
+//! gives the path dependencies, Markdown in them aside, the files those
+//! packages name in an `include!`, `include_str!`, `include_bytes!` or
+//! `#[path]` string literal, Markdown included, and the inputs of every
+//! build ([`WORKSPACE_WIDE`]). A package's
 //! build script, features and `cfg` settings lie in its directory or the
 //! workspace manifest. A caller adds the inputs of its own command.
 
@@ -174,10 +175,17 @@ impl Workspace
     /// The first file of `changed` (paths relative to the root) that is an
     /// input of the build of the package in `dir`, other than the inputs of
     /// every build, which the caller checks with [`first_under`]; `None` when
-    /// none is. Fails when no workspace package lies in `dir`, whose closure
-    /// cannot be known.
+    /// none is. Markdown in a package's directory is an input only when a
+    /// source of the closure reads it, as the layer record places Markdown
+    /// (`crate::layers`). Fails when no workspace package lies in `dir`,
+    /// whose closure cannot be known.
     pub fn first_input(&self, dir: &str, changed: &[String]) -> Result<Option<Input>>
     {
+        let built: Vec<String> = changed
+            .iter()
+            .filter(|f| !is_markdown(f))
+            .cloned()
+            .collect();
         let closure = self
             .packages
             .iter()
@@ -191,8 +199,10 @@ impl Workspace
                 .iter()
                 .filter(|(source, _)| under(source, &package.dir))
                 .map(|(_, read)| read.as_str());
-            let inputs: Vec<&str> = core::iter::once(package.dir.as_str()).chain(read).collect();
-            if let Some(file) = first_under(changed, &inputs)
+            let read: Vec<&str> = read.collect();
+            let found = first_under(&built, &[package.dir.as_str()])
+                .or_else(|| first_under(changed, &read));
+            if let Some(file) = found
             {
                 return Ok(Some(Input {
                     file: file.clone(),
@@ -202,6 +212,15 @@ impl Workspace
         }
         Ok(None)
     }
+}
+
+/// Whether `file` is Markdown, which no build compiles unless a source
+/// reads it.
+fn is_markdown(file: &str) -> bool
+{
+    Path::new(file)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
 }
 
 /// The first file of `changed` that is one of `inputs` or lies under one,
@@ -244,9 +263,13 @@ fn reach<'a>(root: &'a Package, edges: impl Fn(&Package) -> Vec<&'a Package>) ->
 
 // ── What the repository gives ────────────────────────────────────────────────
 
-/// The files the change from `base` to the working tree touches, relative to
-/// the root: `git diff --name-only`, a rename as both its paths. Fails when
-/// `base` names no commit of the checkout.
+/// The files the change on this side of `base` touches, relative to the
+/// root: `git diff --name-only` from the merge base of `base` and `HEAD` to
+/// the working tree, a rename as both its paths. A branch behind `base` is
+/// thus charged its own change alone, not `base`'s later commits undone;
+/// when `base` is an ancestor of `HEAD`, as every base CI gives is, the
+/// merge base is `base` itself. Fails when `base` names no commit of the
+/// checkout, or shares no history with `HEAD`.
 pub fn changed_files(root: &Path, base: &str) -> Result<Vec<String>>
 {
     let verified = git(
@@ -265,7 +288,18 @@ pub fn changed_files(root: &Path, base: &str) -> Result<Vec<String>>
         )
     })?;
     let commit = verified.trim();
-    let diff = git(root, &["diff", "--name-only", "--no-renames", commit, "--"])?;
+    let merge_base = git(root, &["merge-base", commit, "HEAD"])
+        .with_context(|| format!("{base} shares no history with HEAD"))?;
+    let diff = git(
+        root,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            merge_base.trim(),
+            "--",
+        ],
+    )?;
     Ok(diff
         .lines()
         .filter(|l| !l.is_empty())
@@ -493,6 +527,24 @@ mod tests
         );
     }
 
+    // Defect caught: a document in a package's directory (its README, a
+    // design note under its docs/) taken as an input of its build, so a
+    // documentation change proves or fuzzes the crate; or a document its
+    // source reads (`include_str!`) left out.
+    #[test]
+    fn markdown_is_an_input_only_when_a_source_reads_it()
+    {
+        assert_eq!(
+            first(&[], &["shared/proto/README.md", "abi/abi/docs/x.MD"]),
+            None
+        );
+        let reads = [("shared/util/src/lib.rs", "shared/util/table.md")];
+        assert_eq!(
+            first(&reads, &["shared/proto/README.md", "shared/util/table.md"]),
+            Some(input("shared/util/table.md", "util"))
+        );
+    }
+
     // Defect caught: a file a package's source reads from outside its
     // directory (`include_str!` of a shared table, say) changing with no
     // input found.
@@ -599,6 +651,42 @@ mod tests
             None
         );
         assert_eq!(read_of(r#"a.rs:1:include_str!("../../x")"#), None);
+    }
+
+    // Defect caught: a branch behind its base charged the base's later
+    // commits, undone, as its own change (a local `--since origin/master`
+    // on a branch cut before master's last merge proved what that merge
+    // touched); or the working tree's edits left out.
+    #[test]
+    fn the_change_is_taken_from_the_merge_base_with_the_base()
+    {
+        let root =
+            std::env::temp_dir().join(format!("seraph-affected-merge-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| git(&root, args).unwrap();
+        let commit = |file: &str| {
+            std::fs::write(root.join(file), file).unwrap();
+            run(&["add", file]);
+            run(&["commit", "-q", "-m", file]);
+        };
+        run(&["init", "-q", "-b", "master"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        commit("a.rs");
+        let fork = run(&["rev-parse", "HEAD"]).trim().to_owned();
+        run(&["checkout", "-q", "-b", "pr"]);
+        commit("p.rs");
+        run(&["checkout", "-q", "master"]);
+        commit("m.rs");
+        run(&["checkout", "-q", "pr"]);
+        std::fs::write(root.join("a.rs"), "edited").unwrap();
+        assert_eq!(changed_files(&root, "master").unwrap(), ["a.rs", "p.rs"]);
+        assert_eq!(changed_files(&root, &fork).unwrap(), ["a.rs", "p.rs"]);
+        let refused = changed_files(&root, "absent").unwrap_err().to_string();
+        assert!(refused.contains("names no commit"), "{refused}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Defect caught: a package's directory or its path dependencies taken

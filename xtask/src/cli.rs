@@ -1114,16 +1114,25 @@ args! {
 args! {
     pub struct CellsArgs
     {
-        /// The base: the change from COMMIT to the working tree.
-        #[arg(long, value_name = "COMMIT", conflicts_with = "since_green")]
+        /// The base: the change from the merge base of COMMIT and HEAD to the
+        /// working tree.
+        #[arg(long, value_name = "COMMIT", conflicts_with_all = ["since_green", "since_covered"])]
         pub since: Option<String>,
 
-        /// The base: the newest commit of REV's first-parent history whose
-        /// build-test run on a push to master passed (read with gh), so a cell
-        /// a red or unfinished master run left unproven stays owed; every cell
-        /// when none is found or the runs cannot be read.
-        #[arg(long, value_name = "REV")]
+        /// The base, for a push to master: the newest commit of REV's
+        /// first-parent history whose build-test run on a push to master
+        /// passed (read with gh), so a cell a red or unfinished master run
+        /// left unproven stays owed; every cell when none is found or the runs
+        /// cannot be read.
+        #[arg(long, value_name = "REV", conflicts_with = "since_covered")]
         pub since_green: Option<String>,
+
+        /// The base, for a pull request: as --since-green, but a master run
+        /// that has not finished counts too, so a cell that run is proving is
+        /// left to it, and one a red or cancelled run left unproven stays
+        /// owed.
+        #[arg(long, value_name = "REV")]
+        pub since_covered: Option<String>,
 
         /// Append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): the
         /// validate and bench matrices, whether each is owed, and which bench

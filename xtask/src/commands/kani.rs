@@ -30,16 +30,14 @@ use crate::context::Context as BuildContext;
 use crate::error::{Context, Result, bail, err};
 use crate::util::step;
 
-/// The inputs of every crate's verification beside the workspace's
-/// ([`affected::WORKSPACE_WIDE`]): this command, which holds the Kani pin,
-/// the memory limit and the judge of Kani's output, the selection it makes,
-/// and the job that installs the pinned release and runs it, whose install
-/// steps an empty selection skips.
-const KANI_INPUTS: &[&str] = &[
-    "xtask/src/commands/kani.rs",
-    "xtask/src/affected.rs",
-    ".github/workflows/build-test.yml",
-];
+/// The inputs of every crate's verification beside those of every build
+/// ([`affected::WORKSPACE_WIDE`], the toolchain pin among them): what can
+/// change a harness's verdict. That is this command, which holds the Kani
+/// pin, the arguments and the memory limit it runs `cargo kani` with, and
+/// the judge of Kani's output. What decides only which crates are verified,
+/// or whether and where a job runs them (the selection in
+/// `xtask/src/affected.rs`, the workflows), is not one.
+const KANI_INPUTS: &[&str] = &["xtask/src/commands/kani.rs"];
 
 /// The Kani release every run uses (docs/build-system.md § Toolchain). A
 /// toolchain bump moves it to the newest release that builds the harnessed
@@ -1178,16 +1176,14 @@ mod tests
     }
 
     // Defect caught: a change to an input of every verification (the Kani
-    // pin and the judge in this command, the selection, the job, the lock
-    // file, the toolchain pin, the workspace manifest) that leaves a crate
-    // out, though it can move any harness's verdict.
+    // pin, the arguments and the judge in this command, the lock file, the
+    // toolchain pin, the workspace manifest, Cargo's configuration) that
+    // leaves a crate out, though it can move any harness's verdict.
     #[test]
     fn a_change_to_the_pin_or_an_input_of_every_build_selects_every_crate()
     {
         for file in [
             "xtask/src/commands/kani.rs",
-            "xtask/src/affected.rs",
-            ".github/workflows/build-test.yml",
             "Cargo.lock",
             "Cargo.toml",
             "rust-toolchain.toml",
@@ -1202,6 +1198,23 @@ mod tests
                 ],
                 "{file}"
             );
+        }
+    }
+
+    // Defect caught: a change that decides only whether or where the job
+    // runs, or which crates it selects (a workflow, the selection's module),
+    // taken as an input of every verification, so an edit of the workflow
+    // proves every crate although no harness's verdict can move.
+    #[test]
+    fn a_change_to_the_workflows_or_the_selection_selects_nothing()
+    {
+        for file in [
+            ".github/workflows/build-test.yml",
+            ".github/workflows/burnin.yml",
+            "xtask/src/affected.rs",
+        ]
+        {
+            assert_eq!(select(&["docs/x.md", file]), [], "{file}");
         }
     }
 

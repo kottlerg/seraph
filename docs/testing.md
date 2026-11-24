@@ -2252,20 +2252,20 @@ harness adds it to the run. It holds each process of the run to the address spac
 give a harness, so a harness that needs more fails, named as out of memory, and it closes with
 every harness's verdict and verification time.
 
-**Where the proofs run.** On a pull request, CI's `kani` job verifies only the crates the change
-can affect (`cargo xtask kani --since` against the base the `select` job found, the newest commit
-before the run's whose `master` run passed; [conventions.md](conventions.md#ci-gating) § CI
-Gating): a crate that holds a harness and whose own package, a workspace package in its
-dependency closure, or a file those read, the change touches, and every such crate when the
-change touches an input of every build (the workspace manifest and lock file, Cargo's
-configuration, the toolchain pin, the command's own sources and the job itself). That selection
-gates the merge, and a pull request that affects no such crate ends the job without installing
-Kani, with a notice on the run that it verified nothing. On a push to `master` the job runs the
-same selection from the same kind of base, so a harness a red `master` run left unproven stays
-owed until a run proves it. The whole set runs in the `kani` job of `burnin.yml`, on each tag
-push and on a manual dispatch, and in the release host runs (§ Coverage tiers), so a change the
-selection missed is found before a tag ([build-system.md](build-system.md#continuous-integration)
-§ Continuous Integration).
+**Where the proofs run.** On a pull request, CI's `kani` job verifies only the crates the change can
+affect (`cargo xtask kani --since` against the base the `select` job found, the newest commit before
+the run's whose `master` run passed or has not finished; [conventions.md](conventions.md#ci-gating)
+§ CI Gating): a crate that holds a harness and whose own package, a workspace package in its
+dependency closure (Markdown aside), or a file those read, the change touches, and every such crate
+when the change touches an input of every proof (the workspace manifest and lock file, Cargo's
+configuration, the toolchain pin, and the command's own source, which holds the Kani pin, the
+arguments and the judge). That selection gates the merge, and a pull request that affects no such
+crate ends the job without installing Kani, with a notice on the run that it verified nothing. On a
+push to `master` the job runs the same selection from the newest commit whose `master` run passed,
+so a harness a red or cancelled `master` run left unproven stays owed until a run proves it. The
+whole set runs in the `kani` job of `burnin.yml`, on each tag push and on a manual dispatch, and in
+the release host runs (§ Coverage tiers), so a change the selection missed is found before a tag
+([build-system.md](build-system.md#continuous-integration) § Continuous Integration).
 
 **Local sizing.** A harness is sized on the development host before CI runs it. The author of a
 change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there

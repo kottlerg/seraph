@@ -1768,9 +1768,22 @@ out there, removes every untracked file but `target/`, and runs that commit's ow
 moving each built sysroot to
 `<base|head>/<arch>-<profile>/` beside it. One path serves both commits because a build embeds
 absolute source paths (the panic locations of the `-Z build-std` crates under
-`target/seraph-toolchain/`), so builds in two checkouts never compare equal. The scratch
-worktree's `target/` is kept as a cache, so a later comparison rebuilds only what changed, from
-any checkout; the first one builds every cell from scratch.
+`target/seraph-toolchain/`), so builds in two checkouts never compare equal. The cache
+of builds is keyed by source tree: each commit's tree object id names a target directory,
+`targets/<tree>/`, which the command moves into the scratch worktree as its `target/` for that
+commit's builds, after writing the id to its `compare-images-tree` file, and moves back after them,
+whether they pass or fail. A build therefore reuses only artifacts compiled from its own sources,
+whatever the commit's own `cargo xtask build` judges current. One target shared by the builds of
+two commits would hold the artifacts of either for each unit the later build does not judge by its
+sources: Cargo records no source file for the `-Z build-std` units of crates outside `target/`,
+the workspace crates std depends on among them, so a commit's build whose own `cargo xtask build`
+does not make up for it would link std against the other commit's copy of such a crate. A
+target left in the scratch worktree by an interrupted run is moved back under the id it names; one
+whose file names none is removed. A comparison builds each tree whose target is not kept from
+scratch, and one whose two commits share a tree builds it once. After both commits' builds, whether
+they pass or fail, a run removes every target directory but the four most recently used, by the time
+of their `compare-images-tree` files, the ones it built among them: each holds every cell's build of
+one tree, about 1.5 GiB.
 
 Each build is the commit's own. The scratch directory is outside the checkout, whose
 `.cargo/config.toml` Cargo would merge into every build below it, and the command refuses to run
@@ -1781,8 +1794,12 @@ but `CARGO_HOME`, `RUSTUP_TOOLCHAIN` (which outranks the commit's `rust-toolchai
 `RUST_RECURSION_COUNT`, and each variable set by the `[env]` table of a Cargo configuration the
 outer build read (the checkout's and those above it, and Cargo's home's), such as
 `RUST_TARGET_PATH`, which names the commit's target specifications. Removing a checkout leaves
-the shared scratch directory; `git worktree remove --force <scratch>/tree`, then removing
-`<scratch>`, reclaims it.
+the shared scratch directory, with its kept targets; `git worktree remove --force <scratch>/tree`,
+then removing `<scratch>`, reclaims it.
+
+When a nested clean or build fails, the command ends on its own error after the nested one's, naming
+the step, the side and its commit, and the cell, with those two reclaim steps; the target of the
+commit's tree is moved back first, since it holds artifacts of that tree's sources alone.
 
 Each file of a cell's two sysroots is compared by its format:
 

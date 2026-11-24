@@ -14,9 +14,14 @@
 //! One path serves both sides because a build embeds absolute source paths
 //! (the panic locations of the `-Z build-std` crates under
 //! `target/seraph-toolchain/`), so two checkouts at different paths never
-//! build equal images. The scratch worktree's `target/` is a cache that later
-//! builds reuse. A repository has one scratch directory, which every checkout
-//! of it shares and one run at a time holds (`scratch_path`, `lock_scratch`).
+//! build equal images. Each source tree has its own target directory, which
+//! the scratch worktree takes for the builds of a commit with that tree and
+//! gives back after them (`take_target`, `park_target`), so an artifact is
+//! reused only by a build of the sources it was compiled from: Cargo does not
+//! judge every unit by its sources, and records none for a `-Z build-std`
+//! unit of a crate outside `target/`, the workspace crates std depends on
+//! among them. A repository has one scratch directory, which every checkout of
+//! it shares and one run at a time holds (`scratch_path`, `lock_scratch`).
 //!
 //! Each build is the commit's own: the scratch worktree lies in the user's
 //! cache directory, outside the checkout, whose
@@ -851,8 +856,126 @@ fn prepare_tree(root: &Path, tree: &Path) -> Result<()>
     Ok(())
 }
 
-/// Build `commit` in the scratch worktree for every cell, moving each built
-/// sysroot to `<scratch>/<side>/<cell>`.
+/// The directory of the scratch directory that holds the target directory of
+/// each source tree built, named by the tree's object id.
+const TARGETS: &str = "targets";
+
+/// The file in a target directory that names the source tree it was built
+/// from.
+const TREE_KEY_FILE: &str = "compare-images-tree";
+
+/// How many source trees' target directories a run leaves in the scratch
+/// directory, the most recently used: the ones it built, and more, so that
+/// a later comparison sharing a commit's tree with one of the last two runs
+/// rebuilds only what its other tree needs.
+const KEPT_TARGETS: usize = 4;
+
+/// The object id of `commit`'s source tree, which keys the target directory
+/// its builds use: two commits with one tree build from the same sources.
+fn tree_key(tree: &Path, commit: &str) -> Result<String>
+{
+    git(
+        tree,
+        &["rev-parse", "--verify", &format!("{commit}^{{tree}}")],
+    )
+}
+
+/// Whether `key` is an object id, as `tree_key` writes it: 40 or 64
+/// lowercase hex digits, so a key file's text cannot name a path.
+fn is_tree_key(key: &str) -> bool
+{
+    matches!(key.len(), 40 | 64) && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Give back the scratch worktree `tree`'s target directory, if it has one:
+/// move it to `<scratch>/targets/<key>` under the source tree its key file
+/// names, replacing an older copy, or remove it when it names none, as a
+/// target from before the per-tree layout does, whose artifacts may come from
+/// any commit's sources.
+fn park_target(scratch: &Path, tree: &Path) -> Result<()>
+{
+    let target = tree.join("target");
+    if !target.exists()
+    {
+        return Ok(());
+    }
+    let key = fs::read_to_string(target.join(TREE_KEY_FILE))
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|key| is_tree_key(key));
+    let Some(key) = key
+    else
+    {
+        return fs::remove_dir_all(&target)
+            .with_context(|| format!("removing the unkeyed {}", target.display()));
+    };
+    let targets = scratch.join(TARGETS);
+    fs::create_dir_all(&targets).with_context(|| format!("creating {}", targets.display()))?;
+    let parked = targets.join(key);
+    if parked.exists()
+    {
+        fs::remove_dir_all(&parked).with_context(|| format!("removing {}", parked.display()))?;
+    }
+    fs::rename(&target, &parked)
+        .with_context(|| format!("moving the target to {}", parked.display()))
+}
+
+/// Give the scratch worktree `tree` the target directory of the source tree
+/// `key`: give back the one it has (`park_target`), then move in the one
+/// parked under `key`, or start an empty one, and write `key` to its key
+/// file, whose time marks the target's last use. The path is the same for
+/// every tree, so the paths a build embeds do not differ between them.
+fn take_target(scratch: &Path, tree: &Path, key: &str) -> Result<()>
+{
+    park_target(scratch, tree)?;
+    let target = tree.join("target");
+    let parked = scratch.join(TARGETS).join(key);
+    if parked.exists()
+    {
+        fs::rename(&parked, &target)
+            .with_context(|| format!("moving {} into the scratch worktree", parked.display()))?;
+    }
+    else
+    {
+        fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
+    }
+    let key_file = target.join(TREE_KEY_FILE);
+    fs::write(&key_file, format!("{key}\n"))
+        .with_context(|| format!("writing {}", key_file.display()))
+}
+
+/// Remove every parked target directory but the `keep` most recently used,
+/// as their key files' times order them; one without a key file is the
+/// oldest.
+fn evict_targets(scratch: &Path, keep: usize) -> Result<()>
+{
+    let targets = scratch.join(TARGETS);
+    let Ok(entries) = fs::read_dir(&targets)
+    else
+    {
+        return Ok(());
+    };
+    let mut parked = Vec::new();
+    for entry in entries
+    {
+        let path = entry?.path();
+        let used = fs::metadata(path.join(TREE_KEY_FILE))
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        parked.push((used, path));
+    }
+    parked.sort_by(|a, b| b.cmp(a));
+    for (_, path) in parked.into_iter().skip(keep)
+    {
+        fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Build `commit` in the scratch worktree for every cell, in the target
+/// directory of its source tree, moving each built sysroot to
+/// `<scratch>/<side>/<cell>`. The target is given back whether the builds
+/// pass or fail: it holds artifacts of that tree's sources alone either way.
 fn build_side(
     tree: &Path,
     scratch: &Path,
@@ -867,16 +990,66 @@ fn build_side(
     ));
     git(tree, &["checkout", "--detach", "--force", commit])?;
     git(tree, &["clean", "-ffdx", "-e", "/target"])?;
-    for cell in cells
+    take_target(scratch, tree, &tree_key(tree, commit)?)?;
+    let built = build_cells(tree, scratch, (side, commit), cells, nested);
+    let parked = park_target(scratch, tree);
+    built.and(parked)
+}
+
+/// Build the base, then the head when the base passed, with `build_one`, and
+/// then evict all but the `keep` most recently used targets, whether the
+/// builds passed or failed: failing runs bound the scratch directory as
+/// passing ones do, and the eviction follows both sides, so it never removes
+/// the kept target the head is about to take. The build's own error, when it
+/// has one, is the one returned.
+fn build_both(
+    scratch: &Path,
+    keep: usize,
+    mut build_one: impl FnMut(Side) -> Result<()>,
+) -> Result<()>
+{
+    let built = build_one(Side::Base).and_then(|()| build_one(Side::Head));
+    let evicted = evict_targets(scratch, keep);
+    built.and(evicted)
+}
+
+/// What a failed build in the scratch says, past the nested command's own
+/// error: the step, the side and commit, and the cell, and how to reclaim the
+/// scratch directory (xtask/README.md § `cargo xtask compare-images`).
+fn build_failure(what: &str, (side, commit): (Side, &str), cell: Cell, scratch: &Path) -> String
+{
+    format!(
+        "compare-images: the {what} of the {} {commit} failed in cell {}; to reclaim the \
+         scratch directory, run `git worktree remove --force {}`, then remove {}",
+        side.dir_name(),
+        cell.label(),
+        scratch.join("tree").display(),
+        scratch.display()
+    )
+}
+
+/// Run the commit's own clean and build for each cell in the scratch
+/// worktree, which holds the target directory of its source tree.
+fn build_cells(
+    tree: &Path,
+    scratch: &Path,
+    built: (Side, &str),
+    cells: &[Cell],
+    nested: &Nested,
+) -> Result<()>
+{
+    let (side, _) = built;
+    for &cell in cells
     {
-        xtask(tree, &["clean"], nested)?;
+        xtask(tree, &["clean"], nested)
+            .with_context(|| build_failure("clean", built, cell, scratch))?;
         let arch = cell.arch.to_string();
         let mut args = vec!["build", "--skip-lints", "--arch", arch.as_str()];
         if cell.profile == Profile::Release
         {
             args.push("--release");
         }
-        xtask(tree, &args, nested)?;
+        xtask(tree, &args, nested).with_context(|| build_failure("build", built, cell, scratch))?;
         let dst = scratch.join(side.dir_name()).join(cell.label());
         if dst.exists()
         {
@@ -1010,8 +1183,14 @@ pub fn run(ctx: &BuildContext, args: &CompareImagesArgs) -> Result<()>
         wait_host: args.host.wait_host,
         removed: removed_variables(root),
     };
-    build_side(&tree, &scratch, (Side::Base, &base), &cells, &nested)?;
-    build_side(&tree, &scratch, (Side::Head, &head), &cells, &nested)?;
+    build_both(&scratch, KEPT_TARGETS, |side| {
+        let commit = match side
+        {
+            Side::Base => &base,
+            Side::Head => &head,
+        };
+        build_side(&tree, &scratch, (side, commit), &cells, &nested)
+    })?;
     let mut reports = Vec::new();
     for &cell in &cells
     {
@@ -1617,5 +1796,248 @@ rustflags = [\"-Zunstable-options\"]
             Vec::<PathBuf>::new()
         );
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A fresh scratch directory with an empty scratch worktree in it.
+    fn scratch_fixture(name: &str) -> (PathBuf, PathBuf)
+    {
+        let scratch = std::env::temp_dir().join(format!(
+            "xtask-compare-targets-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&scratch);
+        let tree = scratch.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        (scratch, tree)
+    }
+
+    const TREE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TREE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    // Defect caught (#1586): one target directory serving the builds of two
+    // source trees, so that a unit Cargo does not judge by its sources, a
+    // build-std unit of a workspace crate std depends on, compiled from one
+    // commit's sources, links into the other commit's std. Whatever the
+    // commit's own build tracks, the tree's target holds no file another
+    // tree's build wrote.
+    #[test]
+    fn a_build_never_reuses_the_target_of_another_source_tree()
+    {
+        let (scratch, tree) = scratch_fixture("reuse");
+        let artifact = tree.join("target").join("libnamespace_protocol.rlib");
+        take_target(&scratch, &tree, TREE_A).unwrap();
+        fs::write(&artifact, "built from tree A").unwrap();
+        park_target(&scratch, &tree).unwrap();
+        take_target(&scratch, &tree, TREE_B).unwrap();
+        assert!(!artifact.exists(), "tree B's build sees tree A's artifact");
+        fs::write(&artifact, "built from tree B").unwrap();
+        park_target(&scratch, &tree).unwrap();
+        // A later build of tree A reuses its own artifacts, at the same path.
+        take_target(&scratch, &tree, TREE_A).unwrap();
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), "built from tree A");
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    // Defect caught: a target an interrupted run left in the scratch
+    // worktree, or one of the shared layout before per-tree targets, or one
+    // whose key file names a path, taken as the next tree's target.
+    #[test]
+    fn a_target_left_in_the_worktree_is_parked_under_its_key_or_removed()
+    {
+        let (scratch, tree) = scratch_fixture("left");
+        let target = tree.join("target");
+        take_target(&scratch, &tree, TREE_A).unwrap();
+        fs::write(target.join("artifact"), "A").unwrap();
+        // Interrupted: the next run finds tree A's target in the worktree.
+        take_target(&scratch, &tree, TREE_B).unwrap();
+        assert!(!target.join("artifact").exists());
+        assert_eq!(
+            fs::read_to_string(scratch.join(TARGETS).join(TREE_A).join("artifact")).unwrap(),
+            "A"
+        );
+        for key_text in [None, Some("../escape\n")]
+        {
+            park_target(&scratch, &tree).unwrap();
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("artifact"), "unkeyed").unwrap();
+            if let Some(text) = key_text
+            {
+                fs::write(target.join(TREE_KEY_FILE), text).unwrap();
+            }
+            take_target(&scratch, &tree, TREE_B).unwrap();
+            assert!(!target.join("artifact").exists(), "{key_text:?}");
+            let mut parked: Vec<_> = fs::read_dir(scratch.join(TARGETS))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            parked.sort();
+            assert_eq!(parked, [TREE_A], "{key_text:?}");
+            assert!(!scratch.join("escape").exists());
+        }
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    // Defect caught: parked targets kept without bound (each holds a
+    // comparison's build), or the ones just used evicted before older ones.
+    #[test]
+    fn only_the_most_recently_used_targets_are_kept()
+    {
+        let (scratch, tree) = scratch_fixture("evict");
+        let keys: Vec<String> = (0..5u8).map(|i| format!("{i}").repeat(40)).collect();
+        for (age, key) in keys.iter().enumerate()
+        {
+            take_target(&scratch, &tree, key).unwrap();
+            let used = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000 + u64::try_from(age).unwrap());
+            fs::File::options()
+                .write(true)
+                .open(tree.join("target").join(TREE_KEY_FILE))
+                .unwrap()
+                .set_modified(used)
+                .unwrap();
+            park_target(&scratch, &tree).unwrap();
+        }
+        evict_targets(&scratch, 2).unwrap();
+        let mut kept: Vec<String> = fs::read_dir(scratch.join(TARGETS))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, [keys[3].clone(), keys[4].clone()]);
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    // Park a target under `key`, last used at `age` seconds after a fixed
+    // time, holding `marker` when one is given.
+    fn park_aged(scratch: &Path, tree: &Path, key: &str, age: u64, marker: Option<&str>)
+    {
+        take_target(scratch, tree, key).unwrap();
+        if let Some(marker) = marker
+        {
+            fs::write(tree.join("target").join(marker), "").unwrap();
+        }
+        fs::File::options()
+            .write(true)
+            .open(tree.join("target").join(TREE_KEY_FILE))
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + age),
+            )
+            .unwrap();
+        park_target(scratch, tree).unwrap();
+    }
+
+    fn parked_keys(scratch: &Path) -> Vec<String>
+    {
+        let mut kept: Vec<String> = fs::read_dir(scratch.join(TARGETS))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        kept.sort();
+        kept
+    }
+
+    // Defect caught: a failed build that parks its target but evicts nothing,
+    // so that a series of failing runs grows the scratch directory past the
+    // kept targets.
+    #[test]
+    fn a_failed_build_still_evicts_and_reports_its_own_error()
+    {
+        let (scratch, tree) = scratch_fixture("evict-failed");
+        let keys: Vec<String> = (0..6u8).map(|i| format!("{i}").repeat(40)).collect();
+        for (age, key) in (0u64..).zip(&keys[..5])
+        {
+            park_aged(&scratch, &tree, key, age, None);
+        }
+        let err = build_both(&scratch, 2, |side| match side
+        {
+            Side::Base =>
+            {
+                take_target(&scratch, &tree, &keys[5]).unwrap();
+                park_target(&scratch, &tree).unwrap();
+                Err(crate::error::Error::msg("the build failed"))
+            }
+            Side::Head => panic!("the head is built after a failed base"),
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "the build failed");
+        assert_eq!(parked_keys(&scratch), [keys[4].clone(), keys[5].clone()]);
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    // Defect caught: an eviction between the two sides, which removes the
+    // oldest kept target before the head takes it, so a head whose tree is
+    // kept is rebuilt from scratch.
+    #[test]
+    fn the_heads_kept_target_survives_the_base_build()
+    {
+        let (scratch, tree) = scratch_fixture("evict-head");
+        let keys: Vec<String> = (0..5u8).map(|i| format!("{i}").repeat(40)).collect();
+        park_aged(&scratch, &tree, &keys[0], 0, Some("built"));
+        for (age, key) in (1u64..).zip(&keys[1..4])
+        {
+            park_aged(&scratch, &tree, key, age, None);
+        }
+        build_both(&scratch, 4, |side| {
+            let key = match side
+            {
+                Side::Base => &keys[4],
+                Side::Head => &keys[0],
+            };
+            take_target(&scratch, &tree, key).unwrap();
+            if matches!(side, Side::Head)
+            {
+                assert!(tree.join("target").join("built").exists());
+            }
+            park_target(&scratch, &tree)
+        })
+        .unwrap();
+        assert_eq!(
+            parked_keys(&scratch),
+            [
+                keys[0].clone(),
+                keys[2].clone(),
+                keys[3].clone(),
+                keys[4].clone()
+            ]
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    // Defect caught: a key that names something other than the sources, so
+    // that two commits of different trees share a target.
+    #[test]
+    fn the_target_key_is_the_commits_source_tree()
+    {
+        let (scratch, repo) = scratch_fixture("key");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&repo)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        fs::write(repo.join("lib.rs"), "a").unwrap();
+        run(&["add", "lib.rs"]);
+        run(&["commit", "-q", "-m", "a"]);
+        let first = tree_key(&repo, "HEAD").unwrap();
+        run(&["commit", "-q", "--allow-empty", "-m", "same tree"]);
+        assert_eq!(tree_key(&repo, "HEAD").unwrap(), first);
+        fs::write(repo.join("lib.rs"), "b").unwrap();
+        run(&["commit", "-q", "-a", "-m", "b"]);
+        let changed = tree_key(&repo, "HEAD").unwrap();
+        assert_ne!(changed, first);
+        assert!(is_tree_key(&first) && is_tree_key(&changed));
+        fs::remove_dir_all(&scratch).unwrap();
     }
 }

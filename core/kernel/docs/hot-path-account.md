@@ -69,17 +69,17 @@ the kernel:
 | Entry and exit stubs | 70 | 151 | `syscall_entry`, `seraph_enter_from_user`; `trap_entry`, `trap_dispatch`, `handle_trap` |
 | Finding this CPU's scheduler and thread | 8 | 8 | `read_percpu_ptr` of `PerCpuData::current` and `PerCpuData::scheduler` |
 | Dispatch and result | 72 | 38 | `dispatch`, `dispatch_in_range`, `index_mask`, `mask_index`, `finish_syscall` |
-| Return-to-user work checks | 27 | 58 | `running_thread_stopped`, `reclaim_deferred_stack`, `drain_deferred_reclaim`, `sole_reference::drain`, `deliver_at_syscall`, `upcall::take`, `upcall::deliver`, `PerCpuScheduler::outranked`, `preempt_if_outranked` |
+| Return-to-user work checks | 28 | 58 | `running_thread_stopped`, `reclaim_deferred_stack`, `drain_deferred_reclaim`, `sole_reference::drain`, `deliver_at_syscall`, `upcall::take`, `upcall::deliver`, `PerCpuScheduler::outranked`, `preempt_if_outranked` |
 | Diagnostic stamps | 4 | 2 | `stamp_syscall_entry` |
 | The handler | 17 | 18 | `sys_system_info`, `TrapFrame::arg` |
-| Functions below 3 each | 6 | 5 | `syscall_nr`, `note_cpu_syscall`, `TrapFrame::set_return` and the like |
+| Functions below 3 each | 5 | 5 | `syscall_nr`, `note_cpu_syscall`, `TrapFrame::set_return` and the like |
 
 The current thread, this CPU's scheduler and its diagnostic record are each one load relative to
 the per-CPU pointer
 ([scheduling-internals.md](scheduling-internals.md#per-cpu-current-thread) § Per-CPU Current
 Thread). The sole-reference drain that #1528 found is the 3 instructions per syscall left after
 PR #1530. Each return-work check reaches its own per-CPU or per-thread state, so the checks, the
-wake-preemption test among them, cost 27 / 58 before any work is pending.
+wake-preemption test among them, cost 28 / 58 before any work is pending.
 
 ### Context Switch and IPC
 

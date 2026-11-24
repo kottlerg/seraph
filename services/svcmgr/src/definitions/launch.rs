@@ -27,8 +27,7 @@ use crate::restart::{
 };
 
 /// Outcome of a successful launch — the bits svcmgr records on the
-/// resulting `ServiceEntry`. A one-shot (`restart = never`) caller records
-/// nothing and deletes the handles.
+/// resulting `ServiceEntry`.
 pub struct Launched
 {
     pub thread_cap: u64,
@@ -406,13 +405,13 @@ fn assemble_provided_boot_caps(
 /// for an optional seed; consumers that don't tolerate a missing cap fail on
 /// first use, which is the right surface for a real misconfiguration.
 ///
-/// `bind_target` carries the death tag of a supervised launch: when present,
-/// both death observers are bound on `ctx.deaths` under it before
+/// `bind_target` is the death tag of the service's table slot and first
+/// instance: both death observers are bound on `ctx.deaths` under it before
 /// `START_PROCESS` ([`bind_instance_observers`]), one on the main thread and
 /// one on the address space, so a death of any thread of the service, from
-/// the instant it runs, reaches svcmgr. For one-shot launches
-/// (`restart = never`, e.g. `svctest`) the caller passes `None` and forgoes
-/// supervision binding.
+/// the instant it runs, reaches svcmgr, whatever its `restart` policy. A bind
+/// that fails destroys the child and fails the launch: svcmgr runs no service
+/// it launched without observing its death.
 ///
 /// `role` marks the recognised shutdown actuator, which is created pinned and
 /// whose round carries a receive-only derivation of the core-death queue
@@ -421,7 +420,7 @@ pub fn launch(
     def: &Definition,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
-    bind_target: Option<DeathTag>,
+    bind_target: DeathTag,
     role: Role,
 ) -> Option<Launched>
 {
@@ -471,7 +470,7 @@ fn launch_created(
     created: &CreatedProcess,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
-    bind_target: Option<DeathTag>,
+    bind_target: DeathTag,
     role: Role,
 ) -> Option<Launched>
 {
@@ -483,13 +482,12 @@ fn launch_created(
     // Bind the death observers BEFORE start_process so any immediate
     // post-start death is captured. Thread is suspended at this
     // point — no userspace code has run yet.
-    if let Some(tag) = bind_target
-        && !bind_instance_observers(
-            ctx,
-            created.thread_cap,
-            created.process_handle,
-            tag.correlator(),
-        )
+    if !bind_instance_observers(
+        ctx,
+        created.thread_cap,
+        created.process_handle,
+        bind_target.correlator(),
+    )
     {
         std::os::seraph::log!(warn: "launch {}: death observer bind failed", def.name);
         destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);

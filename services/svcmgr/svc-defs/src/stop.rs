@@ -46,7 +46,7 @@ pub enum StopRefusal
 {
     /// init started the service; svcmgr only binds it.
     NotLaunched,
-    /// `restart = never`: a one-shot service svcmgr does not supervise.
+    /// `restart = never`: a stop would end the service for good.
     RestartNever,
     /// `critical = yes`: the system is not viable without it.
     Critical,

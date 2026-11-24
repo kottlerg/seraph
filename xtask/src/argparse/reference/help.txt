@@ -947,7 +947,7 @@ Options:
           Stage the svctest boot with the fixture set SET on the services layer: every recipe that starts a program, or another services-layer harness, removed from `config/svcmgr/services/`; svctest's recipe, sessiond's test recipe, the set's fixture recipes, and crashd's test recipe (no crashd for `crash-endpoint`) copied into it from `config/svcmgr/tests/`, every other fixture's recipe removed from it; the test class files of `config/devmgr/tests/` copied into `config/devmgr/classes/`; and the set's record written into the staged recipe's `env` line as `SVCTEST_FIXTURES`, with `SVCTEST_PHASES` for a set that selects phases, which svctest checks the image against. The pack then leaves the programs layer out of the image. Refused when a recipe the set needs is missing
 
           Possible values:
-          - ci:             Every fixture: crasher, crasher-worker, crasher-boot, memhog, reserve-creator and stopsrc, as the canonical svctest cells stage them
+          - ci:             Every fixture: crasher, crasher-worker, crasher-boot, crasher-once, memhog, reserve-creator and stopsrc, as the canonical svctest cells stage them
           - burn-in:        memhog, reserve-creator and stopsrc, as the burn-in svctest cell stages them
           - none:           No fixture: every fixture phase skips
           - crash-endpoint: No fixture and no crashd, and only the `crash_endpoint` phase runs after svctest's startup phases: procmgr's crash endpoint with svctest as the crash service

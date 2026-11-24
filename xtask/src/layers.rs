@@ -343,14 +343,22 @@ fn more_demanding(a: Option<Placed>, b: Placed) -> Placed
     }
 }
 
+/// Whether `path` is Markdown, by its extension in any letter case: a file
+/// no build compiles and no unit reads unless a source names it, which
+/// [`place`] then places by that source. The hashes xtask gives Cargo for the
+/// units of the crates std depends on leave it out by the same rule
+/// (`crate::rust_src`).
+pub fn is_markdown(path: &Path) -> bool
+{
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+}
+
 /// Place `path` by its own name: Markdown, its explicit row, its package, or
 /// its directory row; `None` when none holds it.
 fn place_alone(workspace: &Workspace, path: &str) -> Option<Placed>
 {
-    let is_markdown = Path::new(path)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-    if is_markdown
+    if is_markdown(Path::new(path))
     {
         return Some(Placed {
             class: Class::Docs,

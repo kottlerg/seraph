@@ -823,7 +823,7 @@ pub fn admit(
 
 /// Whether the command runs on a CI runner, where each job is its own host
 /// and the shared host's rules do not apply.
-pub(crate) fn on_ci_runner() -> bool
+fn on_ci_runner() -> bool
 {
     std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true")
 }

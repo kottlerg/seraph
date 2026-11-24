@@ -15,9 +15,8 @@
 //! undetermined check fails the run whatever verdict Kani gives. Every
 //! process of the run is held to [`MEMORY_LIMIT_GIB`] of address space, so a
 //! harness too large for CI's runner fails by name instead of taking the
-//! runner down, and the run closes with every harness's verdict and time. A
-//! harness whose verification takes longer than [`BUDGET_SECONDS`] fails on
-//! a CI runner and is warned of elsewhere. With `--since`, the run verifies
+//! runner down, and the run closes with every harness's verdict and time.
+//! With `--since`, the run verifies
 //! only the crates the change from a base commit can affect ([`affected`]).
 
 use std::fmt::Write as _;
@@ -29,7 +28,6 @@ use crate::affected::{self, Input, Workspace};
 use crate::cli::KaniArgs;
 use crate::context::Context as BuildContext;
 use crate::error::{Context, Result, bail, err};
-use crate::host_lock::on_ci_runner;
 use crate::util::step;
 
 /// The inputs of every crate's verification beside the workspace's
@@ -56,22 +54,6 @@ pub const KANI_VERSION: &str = "0.68.0";
 /// fails with an out-of-memory error, which [`Judge`] reports by name, where
 /// without the limit the runner is shut down and the job reports nothing.
 const MEMORY_LIMIT_GIB: u64 = 12;
-
-/// The longest verification time, in seconds, a harness may take on CI's
-/// runner (docs/testing.md § Bounded verification): Kani's `Verification
-/// Time` for it, which leaves out the build. A harness over it fails on a CI
-/// runner; on another host, whose speed differs, the run warns of it.
-const BUDGET_SECONDS: f64 = 120.0;
-
-/// What a run does with a harness over [`BUDGET_SECONDS`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Budget
-{
-    /// Fail it: the run is on CI's runner, which the budget is set for.
-    Enforce,
-    /// Warn of it: the run is on another host.
-    Warn,
-}
 
 /// A crate whose proof harnesses the command runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,31 +104,8 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
             failed.push(format!("{e:#}"));
         }
     }
-    let budget = if on_ci_runner()
-    {
-        Budget::Enforce
-    }
-    else
-    {
-        Budget::Warn
-    };
-    let over = over_budget(&mut outcomes, budget);
     step("Kani: every harness");
     print!("{}", outcome_table(&outcomes));
-    match budget
-    {
-        Budget::Enforce => failed.extend(over),
-        Budget::Warn =>
-        {
-            for finding in over
-            {
-                eprintln!(
-                    "warning: {finding}; CI's runner fails it there, and its time on this host \
-                     differs"
-                );
-            }
-        }
-    }
     if !failed.is_empty()
     {
         bail!("{}", failed.join("\n"));
@@ -275,33 +234,6 @@ fn affected_since(root: &Path, crates: Vec<Harnessed>, base: &str) -> Result<Vec
         );
     }
     Ok(picked.into_iter().map(|(h, _)| h).collect())
-}
-
-/// One finding for each harness of `outcomes` whose verification took longer
-/// than [`BUDGET_SECONDS`], naming it and its time. Under
-/// [`Budget::Enforce`] each such harness that passed is marked
-/// [`Verdict::OverBudget`], so the closing table shows it failed.
-fn over_budget(outcomes: &mut [(String, Outcome)], budget: Budget) -> Vec<String>
-{
-    let mut findings = Vec::new();
-    for (package, outcome) in outcomes.iter_mut()
-    {
-        let Some(seconds) = outcome.seconds.filter(|s| *s > BUDGET_SECONDS)
-        else
-        {
-            continue;
-        };
-        if budget == Budget::Enforce && outcome.verdict == Verdict::Passed
-        {
-            outcome.verdict = Verdict::OverBudget;
-        }
-        findings.push(format!(
-            "{package}: {} verified in {seconds:.1}s, over the {BUDGET_SECONDS:.0} s budget \
-             (docs/testing.md § Bounded verification)",
-            outcome.harness
-        ));
-    }
-    findings
 }
 
 // ── The installed release ─────────────────────────────────────────────────────
@@ -576,8 +508,6 @@ enum Verdict
     OutOfMemory,
     /// Kani started it and printed no verdict for it.
     Unfinished,
-    /// It verified, in longer than [`BUDGET_SECONDS`], on CI's runner.
-    OverBudget,
 }
 
 impl Verdict
@@ -591,7 +521,6 @@ impl Verdict
             Self::Failed => "FAILED",
             Self::OutOfMemory => "FAILED (out of memory)",
             Self::Unfinished => "FAILED (no verdict)",
-            Self::OverBudget => "FAILED (over budget)",
         }
     }
 }
@@ -799,8 +728,7 @@ impl Judge
                 let detail = o.detail.as_deref();
                 match o.verdict
                 {
-                    // A verdict `over_budget` gives after the run, never Kani's.
-                    Verdict::Passed | Verdict::OverBudget => None,
+                    Verdict::Passed => None,
                     Verdict::Failed => Some(format!("{name}: {}", detail.unwrap_or("failed"))),
                     Verdict::OutOfMemory => Some(format!(
                         "{name}: FAILED, out of memory under the {MEMORY_LIMIT_GIB} GiB limit{}",
@@ -1167,40 +1095,6 @@ mod tests
                 "b/src/w.rs (crate b names no package)".to_owned(),
             ])
         );
-    }
-
-    // Defect caught: a harness over the time budget passing on CI's runner,
-    // or failing on another host, whose speed differs; or a finding that
-    // does not name the harness and its time.
-    #[test]
-    fn a_harness_over_the_budget_fails_on_ci_and_is_warned_of_elsewhere()
-    {
-        let outcome = |harness: &str, seconds: f64| {
-            (
-                "pkg".to_owned(),
-                Outcome {
-                    harness: harness.to_owned(),
-                    verdict: Verdict::Passed,
-                    detail: None,
-                    seconds: Some(seconds),
-                },
-            )
-        };
-        let run = || {
-            vec![
-                outcome("a::proofs::fast", BUDGET_SECONDS),
-                outcome("a::proofs::slow", BUDGET_SECONDS + 0.1),
-            ]
-        };
-        let finding = "pkg: a::proofs::slow verified in 120.1s, over the 120 s budget \
-                       (docs/testing.md § Bounded verification)";
-        let mut enforced = run();
-        assert_eq!(over_budget(&mut enforced, Budget::Enforce), [finding]);
-        let verdicts: Vec<_> = enforced.iter().map(|(_, o)| o.verdict).collect();
-        assert_eq!(verdicts, [Verdict::Passed, Verdict::OverBudget]);
-        let mut warned = run();
-        assert_eq!(over_budget(&mut warned, Budget::Warn), [finding]);
-        assert!(warned.iter().all(|(_, o)| o.verdict == Verdict::Passed));
     }
 
     fn crates() -> Vec<Harnessed>

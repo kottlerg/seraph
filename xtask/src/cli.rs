@@ -97,9 +97,8 @@ subcommands! {
         /// crate that holds one, or with `--since` of each crate a change can
         /// affect, with the pinned Kani release, and fail on any failed,
         /// undetermined or unwinding-incomplete check, on a Kani release other
-        /// than the pinned one, on a harness that lies in no package, and on CI's
-        /// runner on a harness over the time budget; with `--pin`, print the
-        /// pinned release (see xtask/README.md).
+        /// than the pinned one, and on a harness that lies in no package; with
+        /// `--pin`, print the pinned release (see xtask/README.md).
         Kani(KaniArgs),
 
         /// Print the CI cells a change owes: each file the change from a base

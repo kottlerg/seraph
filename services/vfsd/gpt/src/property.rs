@@ -12,10 +12,10 @@
 use alloc::vec::Vec;
 
 use crate::{
-    BootDiskError, GptCopy, GptEntry, GptError, GptFault, GptHeader, GptLookupError, HEADER_LEN,
-    PartitionDescriptor, PartitionLocation, ScanStop, collect_partitions, crc32, find_boot_disk,
-    header_crc, header_fields, is_block_size, lookup_on_disk, parse_entry, parse_header, read_gpt,
-    resolve_named,
+    BootDiskError, BoundDisk, GptCopy, GptEntry, GptError, GptFault, GptHeader, GptLookupError,
+    HEADER_LEN, PartitionDescriptor, PartitionLocation, ScanStop, collect_partitions, crc32,
+    find_boot_disk, header_crc, header_fields, is_block_size, lookup_on_disk, parse_entry,
+    parse_header, read_gpt, resolve_named,
 };
 
 /// The block sizes the parser takes ([`is_block_size`]).
@@ -476,12 +476,16 @@ fn lookup_holds(entries: &[GptEntry], wanted: &GptEntry)
             {
                 assert!(at_top.len() > 1, "a lone partition was called a tie");
             }
-            Err(error @ (GptLookupError::NotFound | GptLookupError::WrongType)) =>
+            Err(
+                error @ (GptLookupError::NotFound
+                | GptLookupError::WrongType
+                | GptLookupError::Elsewhere { .. }),
+            ) =>
             {
                 assert_eq!(
                     error,
                     GptLookupError::NotFound,
-                    "a lookup by type reported a wrong type"
+                    "a lookup by type reported a wrong type or another disk"
                 );
                 assert!(matching.is_empty(), "a present type was not found");
             }
@@ -568,20 +572,28 @@ fn boot_disk_holds(entries: &[GptEntry], wanted: &GptEntry)
     );
 }
 
-/// [`resolve_named`] of `wanted`'s unique GUID under its type takes the one
-/// typed match in the place it reads (the boot disk, else every other disk),
-/// lets the boot disk's own win over a copy, and ties two copies elsewhere.
+/// [`resolve_named`] of `wanted`'s unique GUID under its type reads only the
+/// place a statement binds it to (the boot disk, or the disks at a location):
+/// it takes the one typed match there over any copy outside it, ties two
+/// there, refuses one there of another type, and with none there reports a
+/// typed one outside it as seen there, never taking it.
 fn named_holds(entries: &[GptEntry], wanted: &GptEntry)
 {
+    const A: u8 = 1;
+    const B: u8 = 2;
     let typed: Vec<&GptEntry> = entries
         .iter()
         .filter(|entry| entry.uuid == wanted.uuid && entry.type_guid == wanted.type_guid)
         .collect();
     let empty: &[GptEntry] = &[];
-    let resolve = |boot_disk: usize, disks: &[&[GptEntry]]| {
+    let resolve = |type_guid: &[u8; 16],
+                   bound: BoundDisk<u8>,
+                   boot_disk: usize,
+                   disks: &[(Option<&u8>, &[GptEntry])]| {
         resolve_named(
-            &wanted.type_guid,
+            type_guid,
             &wanted.uuid,
+            &bound,
             boot_disk,
             disks.iter().copied(),
         )
@@ -591,25 +603,46 @@ fn named_holds(entries: &[GptEntry], wanted: &GptEntry)
         [entry] => Ok(located(disk, entry)),
         _ => Err(GptLookupError::DuplicateTie),
     };
+    let wanted_type = &wanted.type_guid;
     assert_eq!(
-        resolve(0, &[entries]),
-        one(0),
-        "a named partition resolved against its matches"
-    );
-    assert_eq!(
-        resolve(1, &[entries, entries]),
+        resolve(
+            wanted_type,
+            BoundDisk::Boot,
+            1,
+            &[(Some(&A), entries), (Some(&B), entries)]
+        ),
         one(1),
-        "the boot disk's named partition did not win over its copy"
+        "the boot disk's named partition was not taken over its copy"
     );
     assert_eq!(
-        resolve(0, &[empty, entries]),
+        resolve(
+            wanted_type,
+            BoundDisk::At(B),
+            0,
+            &[(Some(&A), entries), (Some(&B), entries)]
+        ),
         one(1),
-        "a named partition off the boot disk was not found"
+        "a named partition at its location was not taken over a copy elsewhere"
     );
     assert_eq!(
-        resolve(0, &[empty, entries, entries]),
+        resolve(
+            wanted_type,
+            BoundDisk::At(B),
+            0,
+            &[(Some(&A), entries), (Some(&B), empty), (None, entries)]
+        ),
+        Err(GptLookupError::Elsewhere { disk: 0 }),
+        "a named partition off its location was taken, or not reported seen there"
+    );
+    assert_eq!(
+        resolve(
+            wanted_type,
+            BoundDisk::At(B),
+            0,
+            &[(Some(&B), entries), (Some(&B), entries)]
+        ),
         Err(GptLookupError::DuplicateTie),
-        "a named partition on two disks besides the boot disk was resolved"
+        "a named partition on two disks at its location was resolved"
     );
     let mut other_type = wanted.type_guid;
     if let Some(byte) = other_type.first_mut()
@@ -622,9 +655,14 @@ fn named_holds(entries: &[GptEntry], wanted: &GptEntry)
     if !retyped
     {
         assert_eq!(
-            resolve_named(&other_type, &wanted.uuid, 0, [entries]),
+            resolve(&other_type, BoundDisk::At(A), 0, &[(Some(&A), entries)]),
             Err(GptLookupError::WrongType),
             "a named partition was taken under another type"
+        );
+        assert_eq!(
+            resolve(&other_type, BoundDisk::At(B), 0, &[(Some(&A), entries)]),
+            Err(GptLookupError::NotFound),
+            "a partition of another type outside the place bore on the role"
         );
     }
 }

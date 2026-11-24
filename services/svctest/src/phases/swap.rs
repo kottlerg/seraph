@@ -194,8 +194,8 @@ const ROOM_EXTRA_PAGES: u64 = 1024;
 /// `SEAL_OBJECT_MAX_GRANTS`, the layout's grant among them.
 const ROOM_GRANTS_MAX: u64 = memmgr_labels::SEAL_OBJECT_MAX_GRANTS - 1;
 /// Grants the room's list has room for: [`ROOM_GRANTS_MAX`] and the caps of
-/// one more reply, so that the grant that takes the room past its bound is
-/// recorded and returned.
+/// one more reply, so that [`take_room`] records every grant of the reply
+/// that takes the room past its bound before it fails the phase.
 const ROOM_LIST_GRANTS: u64 = ROOM_GRANTS_MAX + GRANT_CAPS_MAX;
 /// Grant region ids one `RELEASE_MEMORY_CAPS` of the hog's release names.
 const RELEASE_BATCH: usize = 32;
@@ -1368,13 +1368,16 @@ fn take_room(room: &mut Hog, pages: u64)
             room.refusal.0,
             room.refusal.1
         );
+        // Checked after each reply, which adds at most `GRANT_CAPS_MAX`
+        // grants, so the list's room for one more reply is never passed.
+        let grants = u64::try_from(room.grants.len()).unwrap_or(u64::MAX);
+        assert!(
+            grants <= ROOM_GRANTS_MAX,
+            "{PHASE}: the snapshot's room of {pages} pages took {grants} grants with {} pages \
+             held, more than the {ROOM_GRANTS_MAX} a capture can be sealed from beside its layout",
+            room.pages
+        );
     }
-    let grants = u64::try_from(room.grants.len()).unwrap_or(u64::MAX);
-    assert!(
-        grants <= ROOM_GRANTS_MAX,
-        "{PHASE}: the snapshot's room of {pages} pages took {grants} grants, more than the \
-         {ROOM_GRANTS_MAX} a capture can be sealed from beside its layout"
-    );
 }
 
 /// Read, with no pressure on memmgr, the first page of the first, the third,

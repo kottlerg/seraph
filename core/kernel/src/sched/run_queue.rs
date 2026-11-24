@@ -1201,6 +1201,9 @@ impl PerCpuScheduler
     /// changes neither the load nor the backlog episode: the thread never left
     /// this CPU's queues (core/kernel/docs/scheduler.md § Load Balancing).
     ///
+    /// A move that leaves a queued thread outranking the running one posts
+    /// `percpu::return_work::PREEMPT`, as a link does.
+    ///
     /// A `new_priority` at or above `NUM_PRIORITY_LEVELS` names no run queue
     /// and halts the kernel, as for [`enqueue`](Self::enqueue).
     ///
@@ -1249,6 +1252,15 @@ impl PerCpuScheduler
         if left_empty
         {
             self.non_empty.fetch_and(!(1 << from), Ordering::Release);
+        }
+        // A move that leaves a queued thread outranking the running one posts
+        // PREEMPT as a link does, tested once the old queue's bit is cleared so
+        // a thread moved below the running one posts nothing. A move another
+        // CPU makes is followed by the wake IPI, as for a link
+        // (core/kernel/docs/scheduling-internals.md § Return Work).
+        if self.outranked()
+        {
+            self.post_preempt();
         }
         true
     }
@@ -1606,6 +1618,36 @@ mod tests
             word.load(Ordering::Relaxed),
             crate::percpu::return_work::PREEMPT
         );
+    }
+
+    // Defect caught: a priority change that moves a queued thread above the
+    // running one without posting PREEMPT, so a raise on the caller's own CPU,
+    // where no wake IPI follows, leaves the raised thread waiting for a tick;
+    // or a move that outranks nothing (one tested before the old queue's bit
+    // is cleared included) posting it.
+    #[test]
+    fn a_relink_posts_preempt_only_when_it_outranks_the_running_thread()
+    {
+        let sched = PerCpuScheduler::new();
+        let word = return_work_word(&sched);
+        sched.set_current_level(RT_PRIORITY_MIN);
+        let mut moved = make_tcb();
+        let p_moved = &raw mut *moved;
+        assert!(enq(&sched, p_moved, 10));
+        // SAFETY: single-threaded test, which owns `sched`; p_moved is a live
+        // box queued at 10.
+        assert!(unsafe { sched.relink(p_moved, 10, RT_PRIORITY_MIN) });
+        assert_eq!(word.load(Ordering::Relaxed), 0);
+        // SAFETY: as above; p_moved is queued at RT_PRIORITY_MIN.
+        assert!(unsafe { sched.relink(p_moved, RT_PRIORITY_MIN, RT_PRIORITY_MIN + 1) });
+        assert_eq!(
+            word.load(Ordering::Relaxed),
+            crate::percpu::return_work::PREEMPT
+        );
+        word.store(0, Ordering::Relaxed);
+        // SAFETY: as above; p_moved is queued at RT_PRIORITY_MIN + 1.
+        assert!(unsafe { sched.relink(p_moved, RT_PRIORITY_MIN + 1, 10) });
+        assert_eq!(word.load(Ordering::Relaxed), 0);
     }
 
     // Defect caught: a priority change of the running thread that marks its

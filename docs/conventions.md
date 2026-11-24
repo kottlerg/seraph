@@ -589,8 +589,7 @@ gives the PR-level linear view.
   sizes MUST report, in its `## Validation` section, the local sizing run of each such harness
   that [testing.md](testing.md#bounded-verification) § Bounded verification owes: its
   verification time, the peak resident memory of the run, its unwind bounds, and the head it
-  ran at; and, for a harness it resizes to meet the time budget that section sets, its
-  verification time on CI's runner before and after.
+  ran at.
 
 ## CI Gating
 

@@ -4,8 +4,10 @@
 # .github/workflows/fuzz.yml
 
 # The campaign fuzz tier: every target for a fixed time from a seed that
-# changes each run, growing a working corpus this workflow's cache carries
-# from run to run, on a manual dispatch (docs/testing.md § Fuzzing). It
+# changes each run, on a manual dispatch (docs/testing.md § Fuzzing). This
+# workflow's cache carries a working corpus only between runs made within
+# the cache's lifetime, so a run may start from the checked-in inputs alone;
+# what lasts is in the tree, each target's seeds and regressions. It
 # gates no merge; the run the release host runs dispatch gates the tag. A
 # failing input it finds is uploaded, and its fix lands with the minimized
 # input under the target's regressions/.
@@ -44,7 +46,8 @@ jobs:
           shared-key: fuzz-campaign
 
       # Each run saves its corpus under a new key and restores the newest
-      # earlier one, so the corpus grows across runs.
+      # earlier one the cache still holds; with none, the run starts from
+      # the checked-in inputs alone.
       - name: Restore the working corpora
         uses: actions/cache@v6
         with:

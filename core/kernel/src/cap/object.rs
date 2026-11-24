@@ -5066,10 +5066,7 @@ unsafe fn dealloc_thread(
             // under its sched_lock, held.
             unsafe { (*tcb).hold = crate::sched::hold::HoldMark::None };
 
-            // Remove from whichever queue it's actually in, and post the
-            // stopped check to the CPU the thread is `current` on, if any, for
-            // its next syscall return (core/kernel/docs/scheduling-internals.md
-            // § Return Work).
+            // Remove from whichever queue it's actually in.
             for cpu in 0..cpu_count
             {
                 // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
@@ -5077,18 +5074,14 @@ unsafe fn dealloc_thread(
                 // SAFETY: this CPU's scheduler lock is held (taken above); tcb is a
                 // valid TCB.
                 unsafe { sched.remove_from_queue(tcb, prio) };
-                if core::ptr::eq(sched.current(), tcb)
-                {
-                    // SAFETY: cpu < CPU_COUNT, and per-CPU storage is
-                    // initialised before any thread runs.
-                    unsafe {
-                        crate::percpu::post_return_work_to(
-                            cpu,
-                            crate::percpu::return_work::STOPPED,
-                        );
-                    };
-                }
             }
+            // Post the stopped check to every CPU the thread is `current` on,
+            // for its next syscall return (core/kernel/docs/scheduling-internals.md
+            // § Return Work).
+            // SAFETY: every CPU's scheduler lock is held (taken above), and
+            // cpu_count is the number of CPUs whose per-CPU storage is
+            // initialised.
+            unsafe { crate::sched::post_stopped(tcb, ThreadState::Exited, cpu_count) };
 
             // A dying server orphans any reply-bound client: claim the reply slot
             // (CAS), deposit only the resume disposition, and leave the client

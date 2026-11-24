@@ -869,9 +869,22 @@ pub unsafe fn post_return_work(_bits: u32) {}
 #[cfg(not(test))]
 pub unsafe fn post_return_work_to(cpu: usize, bits: u32)
 {
+    // SAFETY: as for this function (contract).
+    unsafe { return_work_of(cpu) }.fetch_or(bits, Ordering::Release);
+}
+
+/// CPU `cpu`'s [`PerCpuData::return_work`], for a producer that posts
+/// through a function it shares with its host tests.
+///
+/// # Safety
+/// `cpu < CPU_COUNT` and [`init_storage`] has run.
+#[cfg(not(test))]
+pub unsafe fn return_work_of(cpu: usize) -> &'static AtomicU32
+{
     let entry = per_cpu_ptr(cpu);
-    // SAFETY: cpu < CPU_COUNT and the slab is allocated (contract).
-    unsafe { (*entry).return_work.fetch_or(bits, Ordering::Release) };
+    // SAFETY: cpu < CPU_COUNT and the slab is allocated (contract); an entry
+    // of the slab, live for the kernel's lifetime.
+    unsafe { &(*entry).return_work }
 }
 
 /// Returns `true` if preemption is disabled on the current CPU.

@@ -52,12 +52,16 @@ runs:
         # the target specs, the Cargo configuration and profiles, xtask's
         # build flags and std overlay logic, this action, and the std
         # overlay with the workspace crates std depends on (shared/, abi/,
-        # runtime/ruststd/; xtask/src/rust_src.rs lists them).
+        # runtime/ruststd/; xtask/src/rust_src.rs lists them). Markdown is
+        # left out: no unit reads it, and a change to it alone owes no
+        # cell, so no master run would save an entry under the key it
+        # made. A change to any file hashed here owes every job that saves
+        # an entry, as a host test of xtask/src/rust_src.rs checks.
         TREE_HASH: >-
           ${{ hashFiles('xtask/targets/**', '.cargo/config.toml', 'Cargo.toml',
           'xtask/src/commands/build.rs', 'xtask/src/rust_src.rs',
           '.github/actions/std-cache/action.yml', 'runtime/ruststd/**',
-          'shared/**', 'abi/**') }}
+          'shared/**', 'abi/**', '!**/*.md') }}
       # The installed toolchain is named by its full version, the runner
       # image by its name and version, whose host build scripts the
       # entry holds.

@@ -395,71 +395,138 @@ unsafe fn deliver_copy_fault(tf: UserFrame, fault: UserCopyFault) -> SyscallExit
 }
 
 /// The dispatcher's epilogue, run after the frame holds what the thread
-/// resumes with; returns `exit`.
+/// resumes with; returns `exit`. One load and one branch on this CPU's
+/// return-work word for every kind of work a syscall's return owes
+/// (`percpu::return_work::AT_SYSCALL`; core/kernel/docs/scheduling-internals.md
+/// § Return Work), [`finish_syscall_work`] only when a bit is set, and the
+/// store that marks the thread out of its syscall.
 ///
 /// # Safety
 /// Syscall context on the caller's kernel stack with interrupts disabled.
 #[cfg(not(test))]
 unsafe fn finish_syscall(exit: SyscallExit) -> SyscallExit
 {
-    // Self-teardown epilogue (#341): a live thread drains this CPU's
-    // deferred-reclaim stack; a thread found `Exited` (before or after the drain)
-    // reschedules away and never returns to userspace. Protocol and invariants:
-    // core/kernel/docs/thread-lifecycle-and-sleep.md § Self-teardown (the caller
-    // is the freed thread).
-    // Syscall context on the caller's kernel stack with interrupts disabled
-    // (the drain re-enables them only with preemption disabled), so this CPU
-    // and its `current` are stable across both checks.
-    // SAFETY: the caller is the thread running on this CPU, which it cannot
-    // leave with interrupts disabled, and holds no scheduler lock.
-    if !unsafe { crate::sched::running_thread_stopped() }
+    use crate::percpu::return_work::AT_SYSCALL;
+    // SAFETY: syscall context on a CPU whose per-CPU pointer is installed.
+    if unsafe { crate::percpu::return_work_pending() } & AT_SYSCALL != 0
     {
-        // SAFETY: the running thread is alive (not stopped, checked above) and
-        // on its own kernel stack.
-        unsafe { crate::cap::object::drain_deferred_reclaim() };
+        // SAFETY: the caller's contract.
+        unsafe { finish_syscall_work(exit) };
     }
-    // SAFETY: as for the check above; the drain returns with this CPU and its
-    // `current` unchanged.
-    if unsafe { crate::sched::running_thread_stopped() }
+    else
     {
-        // SAFETY: syscall context on the caller's valid kernel stack.
-        unsafe { crate::sched::schedule(crate::sched::Requeue::IfRunnable) };
-        crate::arch::current::cpu::halt_loop();
+        // SAFETY: syscall context; the caller is this CPU's running thread.
+        unsafe { leave_syscall() };
     }
+    exit
+}
+
+/// Mark the running thread out of its syscall: `syscall_nr` reads
+/// `u64::MAX` from here until its next syscall entry.
+///
+/// # Safety
+/// Syscall context; the caller is this CPU's running thread.
+#[cfg(not(test))]
+#[inline]
+unsafe fn leave_syscall()
+{
     // SAFETY: kernel context with the scheduler initialised.
     let tcb = unsafe { current_tcb() };
-    // The return to user mode: the syscall delivery point of a pending upcall
-    // (docs/fault-handling.md § Asynchronous Upcalls), then the wake
-    // preemption of a thread this syscall linked on this CPU above the caller
-    // (a self-wake), or one whose wake IPI a preemption-disabled window
-    // absorbed (core/kernel/docs/scheduler.md § Wake Preemption), both again
-    // after a preemption. The frame holds the syscall's result, and the thread
-    // is live. A restarted syscall is not a delivery point: its frame holds
-    // its arguments for the re-execution, whose own return delivers.
-    let deliver = || {
-        if exit == SyscallExit::Complete
-        {
-            // SAFETY: syscall context on the caller's kernel stack, the frame
-            // holding the syscall's result, no lock held and interrupts
-            // disabled.
-            unsafe { crate::ipc::upcall::deliver_at_syscall() };
+    if !tcb.is_null()
+    {
+        // SAFETY: tcb is the running thread's live TCB (checked non-null),
+        // and the running thread alone writes its own `syscall_nr`.
+        unsafe {
+            (*tcb)
+                .syscall_nr
+                .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
         }
-        if !tcb.is_null()
-        {
-            // SAFETY: tcb is the running thread's live TCB (checked
-            // non-null), and the running thread alone writes its own
-            // `syscall_nr`.
-            unsafe {
-                (*tcb)
-                    .syscall_nr
-                    .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// [`finish_syscall`]'s out-of-line path, which a set return-work bit sends
+/// the return to: take this CPU's bits, then every check of the syscall's
+/// return in full, each deciding from its own state; again on the CPU the
+/// thread returns on after a preemption, while its bits are set
+/// (`sched::run_return_work`).
+///
+/// The checks, in order: the self-teardown epilogue, where a live thread
+/// drains this CPU's deferred-reclaim stack and the sole-reference posts, and
+/// a thread found `Exited` (before or after the drain) reschedules away and
+/// never returns to userspace (core/kernel/docs/thread-lifecycle-and-sleep.md
+/// § Self-teardown); the syscall delivery point of a pending upcall
+/// (docs/fault-handling.md § Asynchronous Upcalls); the store that marks the
+/// thread out of its syscall; and the wake preemption of a thread linked on
+/// this CPU above the caller (core/kernel/docs/scheduler.md § Wake
+/// Preemption). A restarted syscall is not a delivery point: its frame holds
+/// its arguments for the re-execution, whose own return delivers, so the
+/// upcall bits it took are posted again.
+///
+/// # Safety
+/// As for [`finish_syscall`].
+#[cfg(not(test))]
+#[cold]
+#[inline(never)]
+unsafe fn finish_syscall_work(exit: SyscallExit)
+{
+    use crate::percpu::return_work::{AT_SYSCALL, RECLAIM, SOLE_REF, UPCALL_ANY, UPCALL_SYSCALL};
+    let mut upcalls_taken = 0;
+    crate::sched::run_return_work(
+        // SAFETY: syscall context with interrupts disabled, on the CPU the
+        // thread runs on at each take.
+        || unsafe { crate::percpu::take_return_work(AT_SYSCALL) },
+        |work| {
+            upcalls_taken |= work & (UPCALL_SYSCALL | UPCALL_ANY);
+            // Interrupts are disabled (the drain re-enables them only with
+            // preemption disabled), so this CPU and its `current` are stable
+            // across both checks.
+            // SAFETY: the caller is the thread running on this CPU, which it
+            // cannot leave with interrupts disabled, and holds no scheduler
+            // lock.
+            if !unsafe { crate::sched::running_thread_stopped() }
+            {
+                // SAFETY: the running thread is alive (not stopped, checked
+                // above) and on its own kernel stack.
+                unsafe { crate::cap::object::drain_deferred_reclaim() };
             }
-        }
-    };
-    // SAFETY: syscall context on the caller's kernel stack, the frame holding
-    // what the thread resumes with, no lock held and interrupts disabled.
-    unsafe { crate::sched::deliver_and_preempt(deliver) };
-    exit
+            // SAFETY: as for the check above; the drain returns with this CPU
+            // and its `current` unchanged.
+            if unsafe { crate::sched::running_thread_stopped() }
+            {
+                // The drain did not run for a stopped thread, or re-queued the
+                // thread's own object: the take cleared the bits that owe it,
+                // so post them again for this CPU's next return, which a
+                // self-teardown's queued object waits on while the CPU is busy.
+                let owed = work & (RECLAIM | SOLE_REF);
+                if owed != 0
+                {
+                    // SAFETY: syscall context with interrupts disabled.
+                    unsafe { crate::percpu::post_return_work(owed) };
+                }
+                // SAFETY: syscall context on the caller's valid kernel stack.
+                unsafe { crate::sched::schedule(crate::sched::Requeue::IfRunnable) };
+                crate::arch::current::cpu::halt_loop();
+            }
+            if exit == SyscallExit::Complete
+            {
+                // SAFETY: syscall context on the caller's kernel stack, the
+                // frame holding the syscall's result, no lock held and
+                // interrupts disabled.
+                unsafe { crate::ipc::upcall::deliver_at_syscall() };
+            }
+            // SAFETY: syscall context; the caller is the running thread.
+            unsafe { leave_syscall() };
+            // SAFETY: syscall context on the caller's kernel stack, the frame
+            // holding what the thread resumes with, no lock held and
+            // interrupts disabled.
+            unsafe { crate::sched::preempt_if_outranked() }
+        },
+    );
+    if exit != SyscallExit::Complete && upcalls_taken != 0
+    {
+        // SAFETY: syscall context with interrupts disabled.
+        unsafe { crate::percpu::post_return_work(upcalls_taken) };
+    }
 }
 
 /// The syscall handler table: call the handler of `nr`, which

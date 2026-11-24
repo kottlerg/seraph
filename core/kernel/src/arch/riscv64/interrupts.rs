@@ -386,7 +386,7 @@ extern "C" fn kernel_stack_overflow(sepc: u64, stval: u64, sp: u64, floor: u64) 
 /// TLB shootdown / wakeup IPI handler.
 ///
 /// Services any per-CPU shootdown request that names this hart (flush + ack),
-/// then returns. Wakeup IPIs carry no extra work beyond the SSIP clear.
+/// then posts this hart's `percpu::return_work::PREEMPT` for a wakeup IPI.
 #[cfg(not(test))]
 fn handle_software_interrupt()
 {
@@ -420,10 +420,17 @@ fn handle_software_interrupt()
         crate::mm::tlb_shootdown::service_shootdowns(hart_id);
     }
 
-    // Wakeup IPIs carry no handler work beyond the SSIP acknowledgement above; the wake's
-    // correctness rests on the producer linking its thread before it sends the IPI and on the
-    // idle loop's masked check-and-halt (core/kernel/docs/scheduling-internals.md § Wake
-    // Protocol Invariants).
+    // A wakeup IPI follows every link another hart makes on this one: the
+    // wake's correctness rests on the producer linking its thread before it
+    // sends the IPI and on the idle loop's masked check-and-halt
+    // (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants).
+    // The PREEMPT post makes the return to U-mode that follows take the full
+    // preemption decision, with the sender's link visible, even when the
+    // sender's own test of the link read this hart's level before a dispatch
+    // here changed it (§ Return Work). A shootdown-only interrupt, which
+    // cannot be told apart, posts it too, and its return decides nothing.
+    // SAFETY: interrupt context on a hart whose per-CPU pointer is installed.
+    unsafe { crate::percpu::post_return_work(crate::percpu::return_work::PREEMPT) };
 }
 
 /// Clear the supervisor software interrupt pending bit (SIP.SSIP).
@@ -445,12 +452,12 @@ unsafe fn clear_sip_ssip()
 
 /// Main trap dispatch routine, called by `trap_entry` with interrupts disabled
 /// (sstatus.SIE is cleared on trap entry): [`handle_trap`], then, for a trap
-/// taken from U-mode other than an ecall, the return to U-mode: for an
+/// taken from U-mode other than an ecall, the return to U-mode's work: for an
 /// interrupt, a sole-reference drain pass, its upcall delivery point and the
-/// wake-preemption check (`sched::deliver_and_preempt`), for an exception the
-/// check alone
-/// (`sched::preempt_at_exception_return`). An ecall's return is the syscall
-/// exit's (`syscall::finish_syscall`), so a syscall makes it once.
+/// wake-preemption decision (`sched::interrupt_return_work`), for an exception
+/// the decision alone (`sched::exception_return_work`), each behind one test
+/// of this hart's return-work word. An ecall's return is the syscall exit's
+/// (`syscall::finish_syscall`), so a syscall makes it once.
 #[cfg(not(test))]
 extern "C" fn trap_dispatch(frame: *mut TrapFrame)
 {
@@ -474,26 +481,17 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         };
         if scause >> 63 != 0
         {
-            // A pass of the sole-reference posts earlier drains left, so a
-            // hart that runs only user code still makes a pass of at most
-            // POST_BUDGET posts every tick
-            // (core/kernel/docs/capability-internals.md § Sole-Reference
-            // Observers). Before the delivery point and the check, so a
-            // thread a post wakes on this hart is decided at this return.
-            // SAFETY: U-mode origin: the interrupted thread's kernel stack,
-            // the interrupt handled and completed, no lock is held, SIE = 0.
-            unsafe { crate::cap::sole_reference::drain_at_interrupt() };
             // SAFETY: the end of an interrupt from U-mode on the interrupted
-            // thread's kernel stack, its frame published; no lock is held,
-            // SIE = 0.
-            unsafe { crate::sched::deliver_and_preempt(deliver) };
+            // thread's kernel stack, its frame published, the interrupt
+            // handled and completed; no lock is held, SIE = 0.
+            unsafe { crate::sched::interrupt_return_work(deliver) };
         }
         else
         {
             // SAFETY: the end of an exception from U-mode that handle_trap
             // resumed, on the thread's kernel stack, its frame published; no
             // lock is held, SIE = 0.
-            unsafe { crate::sched::preempt_at_exception_return(deliver) };
+            unsafe { crate::sched::exception_return_work(deliver) };
         }
     }
 }
@@ -566,9 +564,9 @@ fn handle_trap(frame: *mut TrapFrame)
                 crate::fatal("unhandled interrupt");
             }
         }
-        // The end of an interrupt from U-mode (the sole-reference drain pass and
-        // the upcall delivery point, with the wake-preemption check) is
-        // trap_dispatch's.
+        // The end of an interrupt from U-mode (the return work: the sole-reference
+        // drain pass, the upcall delivery point and the wake-preemption decision)
+        // is trap_dispatch's.
     }
     else if cause_code == 2
         && (sstatus_at_entry & (1 << 8)) == 0

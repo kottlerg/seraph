@@ -907,10 +907,11 @@ The mechanism is `cap/sole_reference.rs`.
   object. Under the table lock it moves the object's nodes from the chain to the fired list and
   clears the word, before the caller's dealloc cascade reuses it as a link. A flagged object
   reaches zero only this way, so no binding ends without a post.
-- **The drain.** `drain_deferred_reclaim`, after its reclaim, on the syscall epilogue and in the
-  idle loop, and `drain_at_interrupt` at the end of an interrupt taken from user mode, read one
-  summary word when nothing is pending: `sole_reference::drain` is inline, a load and a branch on
-  every syscall, and its pass is out of line. That load is Relaxed. An ordering would not make it
+- **The drain.** `drain_deferred_reclaim`, after its reclaim, on a syscall return whose CPU's
+  `SOLE_REF` bit is set and in the idle loop, and `sched::interrupt_return_work` on an interrupt
+  return from user mode whose CPU's `SOLE_REF` bit is set (scheduling-internals.md § Return Work),
+  read one summary word when nothing is pending: `sole_reference::drain` is inline, a load and a
+  branch, and its pass is out of line. That load is Relaxed. An ordering would not make it
   see a newer value, only order the accesses after it, and the pass orders its own through its
   Acquire load and AcqRel swap of the summary. A bit the CPU set itself, by a release or by a pass
   that left fired nodes, is seen by its own later load unless a pass that cleared the bit, on any
@@ -928,18 +929,19 @@ The mechanism is `cap/sole_reference.rs`.
   `sched::post_one_death_event`, and releases the binding's queue reference, so no post is made
   under `DERIVATION_LOCK` or a CSpace lock, and a binder that receives a post finds its node
   free.
-- **The budget.** A death fires every node bound to the object, any number of them, each funded
-  by its binder's queue, and the drain that takes them runs in whatever thread's syscall return or
-  idle-loop iteration comes next, on any CPU. The budget bounds what one pass does for observers
-  its thread did not bind. Nodes left on the fired list keep the summary's fired bit set, so the
-  next drain on any CPU continues. An idle CPU whose run queues are empty drains again, a pass at
-  a time, before its halt decision (`sole_reference::work_pending`), and every interrupt taken from
-  user mode ends with a pass when the table has work (`sole_reference::drain_at_interrupt`, beside
-  the upcall interrupt delivery point), so a CPU that runs only user code, makes no syscall and
-  never idles still makes a pass every timer tick, posting up to the budget each time. The drain
-  that claims a
-  post may run on a CPU other than the one whose release made it, so a post can reach its queue
-  just after the call that made the release returns.
+- **The budget.** A death fires every node bound to the object, any number of them, each funded by
+  its binder's queue, and the drain that takes them runs in whatever thread's syscall return or
+  idle-loop iteration comes next, on any CPU. The budget bounds what one pass does for observers its
+  thread did not bind. Nodes left on the fired list keep the summary's fired bit set, so the next
+  drain on any CPU continues. An idle CPU whose run queues are empty drains again, a pass at a time,
+  before its halt decision (`sole_reference::work_pending`). A decrement that marks the table or
+  fires observers posts its own CPU's `SOLE_REF` bit, and a pass that leaves fired nodes posts it
+  again, so every mark and leftover is drained by a later return, one pass per return, or by the
+  idle loop, on the CPU that made it (scheduling-internals.md § Return Work). A CPU that runs only
+  user code, makes no syscall and never idles reaches that return at its next interrupt at the
+  latest, posting up to the budget each time. The drain that claims a post may run on a CPU other
+  than the one whose release made it, so a post can reach its queue just after the call that made
+  the release returns.
 - **What a post means.** Every arrival at `REF_OBSERVED | 1` is a decrement from
   `REF_OBSERVED | 2`, which marks the chain, so a count that rests at one is always found. A count
   that falls to one and rises again before the drain looks is not claimed, and is found at its next
@@ -1703,3 +1705,4 @@ Path, and
 [Fault Handling](../../../docs/fault-handling.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [init Bootstrap Stages](../../../services/init/docs/bootstrap.md)
+

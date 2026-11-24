@@ -527,6 +527,32 @@ pub fn current_cpu() -> u32
     }
 }
 
+/// Read the 32-bit word at byte `OFFSET` of this CPU's `PerCpuData` with
+/// one `tp`-relative load. Not `pure`: each call loads again, since other
+/// CPUs write the word.
+///
+/// # Safety
+/// `tp` holds this CPU's `PerCpuData` address (`install_percpu`), and
+/// `OFFSET` is the offset of an aligned 32-bit field of it, below the 2 KiB
+/// reach of a load's immediate.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn read_percpu_u32<const OFFSET: usize>() -> u32
+{
+    let word: u32;
+    // SAFETY: OFFSET(tp) is the aligned 32-bit field (caller contract), so
+    // the load is one access; it writes no memory.
+    unsafe {
+        core::arch::asm!(
+            "lwu {}, {off}(tp)",
+            out(reg) word,
+            off = const OFFSET,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    word
+}
+
 /// Read the pointer at byte `OFFSET` of this CPU's `PerCpuData` with one
 /// `tp`-relative load.
 ///

@@ -5,11 +5,12 @@
 
 //! Programs-surface test orchestrator.
 //!
-//! Walks `/tests/programs/`, spawns each entry as a child process, and
-//! reports a pass/fail verdict from the child's exit status. Each child
-//! (per-program tester) drives its target `/programs/<name>` through that
-//! program's real I/O surface; see [docs/testing.md](../../../docs/testing.md)
-//! for the protocol.
+//! Compares the testers under `/tests/programs/` with those its recipe names,
+//! spawns each named one present as a child process under the recipe's
+//! bound, and reports a pass/fail verdict from the child's exit status. Each
+//! child (per-program tester) drives its target `/programs/<name>` through
+//! that program's real I/O surface; see
+//! [docs/testing.md](../../../docs/testing.md) for the protocol.
 
 #![expect(
     clippy::expect_used,
@@ -21,10 +22,14 @@
 
 use std::os::seraph::process::CommandExt;
 use std::os::seraph::startup_info;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use usertest::{OWN_SLOT, SeedPlan, TESTER_SEEDS};
+use usertest::{
+    Mismatch, OWN_SLOT, RunEnd, SeedPlan, Supervised, TESTER_BOUND_MS, TESTER_SEEDS, TESTERS,
+    TesterList, parse_bound, supervise,
+};
 
 const TESTERS_DIR: &str = "/tests/programs";
 
@@ -33,6 +38,23 @@ const TESTERS_DIR: &str = "/tests/programs";
 /// past them is released at bootstrap, and a declaration naming one is
 /// refused.
 const SEED_SLOTS: usize = 8;
+
+/// How often a running tester's exit and the close of its output are
+/// checked.
+const POLL: Duration = Duration::from_millis(20);
+
+/// How long, after a tester's bound, its kill is given to end it and close
+/// its output before the run goes on without them.
+const DRAIN: Duration = Duration::from_secs(5);
+
+/// The recipe's declarations: which seeds each tester takes, which testers
+/// the image holds, and the bound of each tester's run.
+struct Declarations
+{
+    plan: SeedPlan,
+    testers: TesterList,
+    bound: Duration,
+}
 
 fn main()
 {
@@ -43,51 +65,56 @@ fn main()
 
     std::os::seraph::log!("starting");
 
-    let decl = std::env::var(TESTER_SEEDS).unwrap_or_default();
-    let plan = match SeedPlan::parse(&decl, SEED_SLOTS)
+    let decl = match declarations()
     {
-        Ok(plan) => plan,
-        Err(e) =>
+        Ok(decl) => decl,
+        Err(refusal) =>
         {
-            std::os::seraph::log!("{TESTER_SEEDS} refused: {e:?}");
+            std::os::seraph::log!("{refusal}");
             std::os::seraph::log!("SOME TESTS FAILED");
             shutdown(pwrmgr_auth);
             return;
         }
     };
 
-    let testers = discover_testers();
-    if testers.is_empty()
+    let reconciled = decl.testers.reconcile(&discover_testers());
+    let mut failed = 0usize;
+    for mismatch in &reconciled.mismatches
     {
-        std::os::seraph::log!("no testers found under {TESTERS_DIR}");
+        match mismatch
+        {
+            Mismatch::Missing(name) =>
+            {
+                std::os::seraph::log!(
+                    "  {name}: FAIL (named in {TESTERS}, absent from {TESTERS_DIR})"
+                );
+            }
+            Mismatch::Unnamed(name) =>
+            {
+                std::os::seraph::log!("  {name}: FAIL (in {TESTERS_DIR}, not named in {TESTERS})");
+            }
+        }
+        failed = failed.saturating_add(1);
     }
 
-    let outcomes: Vec<bool> = testers
-        .iter()
-        .map(|path| {
-            let name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("<unnamed>");
-            std::os::seraph::log!("running {}", path.display());
-
-            match run_one(path, name, &seeds, &plan)
+    let mut passed = 0usize;
+    for name in &reconciled.run
+    {
+        std::os::seraph::log!("running {TESTERS_DIR}/{name}");
+        match run_one(name, &seeds, &decl)
+        {
+            Ok(()) =>
             {
-                Ok(()) =>
-                {
-                    std::os::seraph::log!("  {name}: PASS");
-                    true
-                }
-                Err(reason) =>
-                {
-                    std::os::seraph::log!("  {name}: FAIL ({reason})");
-                    false
-                }
+                std::os::seraph::log!("  {name}: PASS");
+                passed = passed.saturating_add(1);
             }
-        })
-        .collect();
-    let passed = outcomes.iter().filter(|&&ok| ok).count();
-    let failed = outcomes.iter().filter(|&&ok| !ok).count();
+            Err(reason) =>
+            {
+                std::os::seraph::log!("  {name}: FAIL ({reason})");
+                failed = failed.saturating_add(1);
+            }
+        }
+    }
 
     std::os::seraph::log!("passed={passed} failed={failed}");
     if failed == 0
@@ -102,43 +129,154 @@ fn main()
     shutdown(pwrmgr_auth);
 }
 
-/// Enumerate `/tests/programs/`. Stable sort by filename for deterministic
-/// output across boots. Empty list on any I/O error (the run then reports
-/// "no testers found"); that surfaces a sysroot-misconfiguration as a
-/// visible empty run rather than a hidden zero-test pass.
-fn discover_testers() -> Vec<PathBuf>
+/// Read the recipe's declarations from the env. A refusal, the log line
+/// that says why, fails the run before any tester starts.
+fn declarations() -> Result<Declarations, String>
 {
-    let mut out: Vec<PathBuf> = match std::fs::read_dir(TESTERS_DIR)
+    let seeds = std::env::var(TESTER_SEEDS).unwrap_or_default();
+    let plan = SeedPlan::parse(&seeds, SEED_SLOTS)
+        .map_err(|e| format!("{TESTER_SEEDS} refused: {e:?}"))?;
+    let testers = TesterList::parse(&std::env::var(TESTERS).unwrap_or_default())
+        .map_err(|e| format!("{TESTERS} refused: {e:?}"))?;
+    if let Some(tester) = testers.unlisted_seed_entry(&plan)
     {
-        Ok(it) => it
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.is_file())
-            .collect(),
-        Err(_) => Vec::new(),
+        return Err(format!(
+            "{TESTER_SEEDS} refused: {tester} is not named in {TESTERS}"
+        ));
+    }
+    let bound_ms = std::env::var(TESTER_BOUND_MS).unwrap_or_default();
+    let bound =
+        parse_bound(&bound_ms).ok_or_else(|| format!("{TESTER_BOUND_MS} refused: {bound_ms:?}"))?;
+    Ok(Declarations {
+        plan,
+        testers,
+        bound,
+    })
+}
+
+/// The names of the files under `/tests/programs/`, sorted for the same
+/// order on every boot. A directory that cannot be read is logged and holds
+/// none, so every tester the recipe names is reported missing and the run
+/// fails; a name that is not UTF-8 is taken lossily, and fails the run as
+/// one the recipe does not name.
+fn discover_testers() -> Vec<String>
+{
+    let entries = match std::fs::read_dir(TESTERS_DIR)
+    {
+        Ok(it) => it,
+        Err(e) =>
+        {
+            std::os::seraph::log!("cannot read {TESTERS_DIR}: {e}");
+            return Vec::new();
+        }
     };
+    let mut out: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
     out.sort();
     out
 }
 
-/// Spawn one tester, `name`, with a copy of each seed `plan` declares for
-/// it as its bootstrap caps, forward its stdout and stderr to the boot log
-/// under a per-tester prefix, both at once, and turn the exit status into a
-/// pass/fail. A tester with no declared seeds gets no creator endpoint.
-fn run_one(
-    path: &Path,
-    name: &str,
-    seeds: &[u64; SEED_SLOTS],
-    plan: &SeedPlan,
-) -> Result<(), String>
+/// Spawn the tester `name` with a copy of each seed `decl` declares for it
+/// as its bootstrap caps, forward its stdout and stderr to the boot log
+/// under a per-tester prefix, each on a thread of its own, and turn its exit
+/// status into a pass/fail. A tester with no declared seeds gets no creator
+/// endpoint. A run that outlives `decl`'s bound fails, its tester killed.
+fn run_one(name: &str, seeds: &[u64; SEED_SLOTS], decl: &Declarations) -> Result<(), String>
 {
-    let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_string())?;
-    let name = name.to_string();
+    let caps = copy_seeds(decl.plan.slots_for(name), seeds)?;
+    let mut command = Command::new(format!("{TESTERS_DIR}/{name}"));
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if !caps.is_empty()
+    {
+        command.bootstrap_caps(&caps);
+    }
+    let start = Instant::now();
+    let mut child = command.spawn().map_err(|e| format!("spawn: {e}"))?;
 
-    // `SeedPlan::parse` kept every declared slot below `SEED_SLOTS`. A copy
-    // that fails releases the copies made before it.
+    // Each stream is drained on its own thread, so a tester blocked on a
+    // full pipe ring of one stream never stops the other from closing, and
+    // this thread is free to bound the run. A reader that failed to spawn
+    // dropped the stream's read end, so the tester's writes to it fail
+    // instead of blocking.
+    let mut spawn_errors = Vec::new();
+    let mut readers = Vec::new();
+    let streams = [
+        ("out", child.stdout.take().map(reader_input)),
+        ("err", child.stderr.take().map(reader_input)),
+    ];
+    for (stream, input) in streams
+    {
+        let Some(input) = input
+        else
+        {
+            continue;
+        };
+        let tester = name.to_string();
+        match std::thread::Builder::new()
+            .name(format!("{name}-std{stream}"))
+            .spawn(move || forward_lines(&tester, stream, input))
+        {
+            Ok(handle) => readers.push(handle),
+            Err(e) => spawn_errors.push(format!("std{stream} reader spawn: {e}")),
+        }
+    }
+
+    let mut run = TesterRun {
+        child,
+        readers,
+        start,
+    };
+    let end = supervise(&mut run, decl.bound, DRAIN)?;
+    // Readers still running hold a stream a process the tester started keeps
+    // open; they are left to end with it.
+    if run.streams_closed()
+    {
+        for reader in run.readers
+        {
+            reader
+                .join()
+                .map_err(|_| "output reader panicked".to_string())?;
+        }
+    }
+    let status = match end
+    {
+        RunEnd::Finished(status) => status,
+        RunEnd::Overran(overrun) => return Err(overrun.reason(decl.bound)),
+    };
+    if let Some(e) = spawn_errors.into_iter().next()
+    {
+        return Err(e);
+    }
+    if status.success()
+    {
+        Ok(())
+    }
+    else
+    {
+        Err(match status.code()
+        {
+            Some(c) => format!("exit={c}"),
+            None => "killed by notification".to_string(),
+        })
+    }
+}
+
+/// A tester's output stream as its reader thread takes it.
+fn reader_input(stream: impl std::io::Read + Send + 'static) -> Box<dyn std::io::Read + Send>
+{
+    Box::new(stream)
+}
+
+/// A copy of each seed of `slots` for one tester. A copy that fails
+/// releases the copies made before it. `SeedPlan::parse` kept every
+/// declared slot below `SEED_SLOTS`.
+fn copy_seeds(slots: &[usize], seeds: &[u64; SEED_SLOTS]) -> Result<Vec<u64>, String>
+{
     let mut caps = Vec::new();
-    for &slot in plan.slots_for(&name)
+    for &slot in slots
     {
         match copy_seed(seeds.get(slot).copied().unwrap_or(0))
         {
@@ -153,54 +291,45 @@ fn run_one(
             }
         }
     }
+    Ok(caps)
+}
 
-    let mut command = Command::new(path_str);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if !caps.is_empty()
-    {
-        command.bootstrap_caps(&caps);
-    }
-    let mut child = command.spawn().map_err(|e| format!("spawn: {e}"))?;
+/// One tester's run as `supervise` drives it: the child, the threads that
+/// read its output, and its start.
+struct TesterRun
+{
+    child: Child,
+    readers: Vec<JoinHandle<()>>,
+    start: Instant,
+}
 
-    // The two streams are drained at once, stderr on its own thread: a
-    // tester blocked on a full pipe ring of one stream would otherwise never
-    // close the other, and the run would hang.
-    let err_reader = child.stderr.take().map(|s| {
-        let tester = name.clone();
-        std::thread::Builder::new()
-            .name(format!("{name}-stderr"))
-            .spawn(move || forward_lines(&tester, "err", s))
-    });
-    if let Some(s) = child.stdout.take()
-    {
-        forward_lines(&name, "out", s);
-    }
-    // Joined before the wait, and a reader failure reported only after it, so
-    // no tester is left unreaped. A reader that failed to spawn dropped the
-    // stream's read end, so the tester's stderr writes fail instead of
-    // blocking.
-    let reader = match err_reader
-    {
-        Some(Ok(handle)) => handle
-            .join()
-            .map_err(|_| "stderr reader panicked".to_string()),
-        Some(Err(e)) => Err(format!("stderr reader spawn: {e}")),
-        None => Ok(()),
-    };
+impl Supervised for TesterRun
+{
+    type Status = ExitStatus;
 
-    let status = child.wait().map_err(|e| format!("wait: {e}"))?;
-    reader?;
-    if status.success()
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, String>
     {
-        Ok(())
+        self.child.try_wait().map_err(|e| e.to_string())
     }
-    else
+
+    fn streams_closed(&self) -> bool
     {
-        Err(match status.code()
-        {
-            Some(c) => format!("exit={c}"),
-            None => "killed by notification".to_string(),
-        })
+        self.readers.iter().all(JoinHandle::is_finished)
+    }
+
+    fn kill(&mut self) -> Result<(), String>
+    {
+        self.child.kill().map_err(|e| e.to_string())
+    }
+
+    fn elapsed(&self) -> Duration
+    {
+        self.start.elapsed()
+    }
+
+    fn pause(&mut self)
+    {
+        std::thread::sleep(POLL);
     }
 }
 

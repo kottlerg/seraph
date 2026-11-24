@@ -155,8 +155,10 @@ arch-neutral `SERAPH_DATA` type GUID.
 
 **Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a
 badge without `MOUNT_AUTHORITY`, `NOT_FOUND` for an
-unknown role byte or invalid path length, `NO_MOUNT` if no partition
-on any held disk matches the role GUID after the query for new disks,
+unknown role byte or invalid path length, `NO_MOUNT` if the role
+resolves to no partition after the query for new disks (none of the
+role's type on the boot disk, or the named partition not on the disk the
+statement binds it to, of another type there, or there twice),
 if duplicate-priority partitions are detected, or if the disk was
 removed during the mount, `SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if
 the synthetic-root install fails: root already mounted, the path

@@ -107,8 +107,9 @@ badge. See
 ## GPT Role-GUID Discovery
 
 Partition identity in Seraph is a GPT type GUID on the boot disk, and a
-unique partition GUID a signed statement names on any other disk; never a
-position, a label, or a filesystem UUID. The model is:
+unique partition GUID a signed statement names on the disk it binds it to,
+the boot disk or the disk at a PCI location; never a position on a disk, a
+label, or a filesystem UUID. The model is:
 
 - **Seraph-minted root GUIDs are arch-distinguished**, following the
   Discoverable Partitions Specification convention. A single disk

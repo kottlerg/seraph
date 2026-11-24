@@ -533,9 +533,10 @@ fn same_inode(_a: &Path, _b: &Path) -> bool
 }
 
 /// Identity string for the mirror. Combines the underlying rustc version
-/// with a content fingerprint for the overlay sources (`runtime/ruststd/`) and
-/// the patch logic (`xtask/src/rust_src.rs`). Any change to those
-/// invalidates the mirror, triggering a clean rebuild.
+/// with a content fingerprint for the overlay sources (`runtime/ruststd/src/`,
+/// Markdown aside, [`feed_tree`]) and the patch logic
+/// (`xtask/src/rust_src.rs`). Any change to those invalidates the mirror,
+/// triggering a clean rebuild.
 fn compute_stamp(real: &Path, overlay_root: &Path, project_root: &Path) -> Result<String>
 {
     let rustc = real.join("bin/rustc");
@@ -1825,13 +1826,14 @@ mod tests
         );
     }
 
-    // Defect caught: a file of a crate std depends on whose change alone owes
-    // no build job but changes the digest, so a `master` merge changing only
-    // it saves no carry entry and every later pull request's build jobs
-    // rebuild those crates, std and every std user; or a file the digest
-    // leaves out that a unit reads, whose change rebuilds nothing.
+    // Defect caught: a file of a crate std depends on, or of std's overlay,
+    // whose change alone owes no build job but changes the digest or the
+    // mirror's stamp, so a `master` merge changing only it saves no carry
+    // entry and every later pull request's build jobs rebuild std and every
+    // std user; or a file the walk leaves out that a unit reads, whose change
+    // rebuilds nothing.
     #[test]
-    fn the_digest_hashes_exactly_the_files_whose_change_owes_every_build_job()
+    fn the_digest_and_the_stamp_hash_exactly_the_files_whose_change_owes_every_build_job()
     {
         use crate::affected::Workspace;
         use crate::commands::cells::{build_trees, owed_by};
@@ -1839,7 +1841,13 @@ mod tests
 
         let root = repo_root();
         let ws = Workspace::load(&root).unwrap();
-        let rels: Vec<&str> = STD_WORKSPACE_DEPS.iter().map(|(_, rel, _)| *rel).collect();
+        // The trees [`feed_tree`] walks: the crates of the digest, and std's
+        // overlay, which the mirror's stamp hashes.
+        let rels: Vec<&str> = STD_WORKSPACE_DEPS
+            .iter()
+            .map(|(_, rel, _)| *rel)
+            .chain(["runtime/ruststd/src"])
+            .collect();
         let out = Command::new("git")
             .arg("ls-files")
             .arg("--")
@@ -1867,7 +1875,7 @@ mod tests
             .collect();
         assert!(
             wrong.is_empty(),
-            "files the digest judges otherwise than the cells: {wrong:#?}"
+            "files the digest or the stamp judges otherwise than the cells: {wrong:#?}"
         );
     }
 

@@ -345,9 +345,9 @@ fn more_demanding(a: Option<Placed>, b: Placed) -> Placed
 
 /// Whether `path` is Markdown, by its extension in any letter case: a file
 /// no build compiles and no unit reads unless a source names it, which
-/// [`place`] then places by that source. The hashes xtask gives Cargo for the
-/// units of the crates std depends on leave it out by the same rule
-/// (`crate::rust_src`).
+/// [`place`] then places by that source. The hash xtask gives Cargo for the
+/// units of the crates std depends on, and the stamp of std's source mirror,
+/// leave it out by the same rule (`crate::rust_src`).
 pub fn is_markdown(path: &Path) -> bool
 {
     path.extension()

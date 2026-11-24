@@ -389,9 +389,11 @@ builds current:
   every std-user program. Markdown is left out, as the cells and the build carry's key leave it
   out: no unit reads it, and a change to it alone owes no build job, so a digest that saw it would
   make every later pull request's build jobs rebuild these units after a merge that saved no carry
-  entry. The mirror's stamp leaves it out by the same rule. Host tests check that each listed crate
-  reads the digest, that the list holds every path dependency of its crates, and that the digest
-  hashes exactly the files of those crates whose change owes every build job.
+  entry. The mirror's stamp leaves it out of `runtime/ruststd/src/` by the same rule. Host tests
+  check that each listed crate reads the digest, that the list holds every path dependency of its
+  crates, and that the digest and the stamp hash exactly the files of those crates and of
+  `runtime/ruststd/src/` whose change owes every build job, so a Markdown file a source reads,
+  which the cells place by that source, fails them.
 
 The build directory's name carries its format, the rules its units are judged by
 (`BUILD_DIR` in `xtask/src/rust_src.rs`, `target/seraph-build-1/`): a unit compiled under older

@@ -110,7 +110,7 @@ architectures: `SYS_THREAD_POST_UPCALL`, the third class `FAULT_CLASS_UPCALL`, d
 syscall's return and, for an `UPCALL_ANY_INSTRUCTION` post, at an interrupt's return to user mode,
 the cancel of a blocking syscall, and `SYS_THREAD_SET_UPCALL_MASK`. Its end-to-end consumer is the
 `deadline` fixture's supervisor, which cancels a spinning worker at a deadline
-([services/fixtures/deadline/README.md](../services/fixtures/deadline/README.md)).
+([program-modes § deadline](../services/fixtures/program-modes/README.md#deadline)).
 
 A debugger's access to the memory of the address space a thread executes in (`SYS_THREAD_READ_MEM`,
 `SYS_THREAD_WRITE_MEM`, [Debugging](#debugging)) is implemented on both architectures, the
@@ -1046,11 +1046,8 @@ svcmgr service definitions carry no paging key; see
 [runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [services/crashd/README.md](../services/crashd/README.md),
 [crashd Operation](../services/crashd/docs/operation.md),
-[services/fixtures/deadline/README.md](../services/fixtures/deadline/README.md),
 [services/fixtures/debugger/README.md](../services/fixtures/debugger/README.md),
-[services/fixtures/demandpaged/README.md](../services/fixtures/demandpaged/README.md),
-[services/fixtures/stackoverflow/README.md](../services/fixtures/stackoverflow/README.md),
-[services/fixtures/threadstack/README.md](../services/fixtures/threadstack/README.md),
+[services/fixtures/program-modes/README.md](../services/fixtures/program-modes/README.md),
 [services/gdbstub/README.md](../services/gdbstub/README.md),
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),

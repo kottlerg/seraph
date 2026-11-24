@@ -93,8 +93,8 @@ enum InstallDest
     TestsPrograms,
     /// Installed under `sysroot/tests/fixtures/<install_name>` — the test
     /// fixtures that run as services, sourced from
-    /// `services/fixtures/<x>/` (`crasher`, `memhog`, `stopsrc`,
-    /// `debug-echo`, `hotplug-check`). See docs/testing.md § Sysroot layout.
+    /// `services/fixtures/<x>/` (`service-modes`, `debug-echo`,
+    /// `hotplug-check`). See docs/testing.md § Sysroot layout.
     TestsFixtures,
     /// Installed under `sysroot/tests/fixtures/programs/<install_name>` —
     /// the test fixtures that run as programs, sourced from
@@ -303,21 +303,7 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
-        name: "crasher",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixtures,
-        arch_only: None,
-    },
-    Spec {
-        name: "memhog",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixtures,
-        arch_only: None,
-    },
-    Spec {
-        name: "stopsrc",
+        name: "service-modes",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::TestsFixtures,
@@ -492,41 +478,6 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
-        name: "stackoverflow",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "relrofault",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "capexhaust",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "pipefault",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "demandpaged",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
         name: "stdiotest",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -541,21 +492,14 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "program-modes",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::TestsFixturesPrograms,
+        arch_only: None,
+    },
+    Spec {
         name: "leader",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "threadstack",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "deadline",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::TestsFixturesPrograms,
@@ -570,20 +514,6 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "crashme",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "pipestress",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::TestsFixturesPrograms,
-        arch_only: None,
-    },
-    Spec {
-        name: "threadchurn",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::TestsFixturesPrograms,

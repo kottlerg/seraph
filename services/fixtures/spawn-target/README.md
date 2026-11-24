@@ -1,8 +1,7 @@
 # spawn-target
 
-Known-good program-role test image that svctest's phases create, spawn, read, and look up. With no
-argument it prints one line and exits 0; with `narrow` it checks that the creator policy of its own
-signing role refuses it a service image.
+Known-good program-role test image that svctest's phases create, spawn, read, and look up. It prints
+one line and exits 0, whatever its arguments.
 
 ---
 
@@ -24,7 +23,7 @@ spawn-target/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # The default line; the `narrow` check
+    └── main.rs            # The one line
 ```
 
 ---
@@ -33,13 +32,11 @@ spawn-target/
 
 | Argument | Output | Exit |
 |---|---|---|
-| none, or any but `narrow` | `spawn-target ran` | `0` |
-| `narrow` | `refused: <error>` when starting `/tests/fixtures/crasher` fails `PermissionDenied` | `0` |
-| `narrow` | `starting /tests/fixtures/crasher: <error>, not PermissionDenied` when the start fails another way | `3` |
-| `narrow` | `started the service /tests/fixtures/crasher` when the start succeeds; the fixture kills the started process first | `4` |
+| any, or none | `spawn-target ran` | `0` |
 
-`/tests/fixtures/crasher` is a service-role image; a program may start programs only
-([docs/signing.md](../../../docs/signing.md) § Signature Policy in procmgr).
+The check that a program may start programs only
+([docs/signing.md](../../../docs/signing.md) § Signature Policy in procmgr) is the `narrow` mode of
+[program-modes](../program-modes/README.md#narrow).
 
 ---
 
@@ -51,8 +48,6 @@ and `namespace.rs`. The phases that read its exit or output assert as follows.
 
 - The `pipes` phase (section 1) spawns it with a piped stdout and asserts that stdout is not empty
   and that it exits cleanly; section 3 asserts the same of `Command::output()`.
-- The `procmgr_program_narrowing` phase (`procmgr.rs`) runs it with `narrow`; the fixture's exit
-  `0` is the check that starting a service image is refused.
 - The `namespace` phase asserts that `NS_READDIR` of `/tests/fixtures/programs` surfaces
   `spawn-target` verbatim, that `NS_LOOKUP` of `SPAWN-TARGET` there finds a file and `NS_STAT` on it
   succeeds (the lookup is case-insensitive), and that the `fixtures-child` role's capability,

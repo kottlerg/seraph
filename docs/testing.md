@@ -151,13 +151,14 @@ sysroot/
     ├── drivers/              # test-only drivers bound only on demand
     │   └── test-fault        # fault-injection driver, bound by BIND_DRIVERS
     ├── fixtures/             # fixtures started as services
-    │   ├── crasher           # svcmgr restart-path fixture
+    │   ├── service-modes     # the service-role modes: crasher, memhog, stopsrc
     │   ├── debug-echo        # debug-port fixture (`debug-port` case)
     │   ├── hotplug-check     # PCI Express hotplug fixture (`hotplug` case)
     │   ├── …
     │   └── programs/         # fixtures spawned as programs
     │       ├── crashme
     │       ├── leader
+    │       ├── program-modes
     │       ├── spawn-target
     │       ├── stdiotest
     │       └── …
@@ -177,20 +178,22 @@ driver of the `edu` DMA test device. Under `/tests/drivers/` is
 no drivers-directory pass at boot reads: devmgr binds it only through `BIND_DRIVERS`. Under
 `/tests/fixtures/` are the test fixtures the harnesses spawn, sourced from
 [`services/fixtures/`](../services/fixtures/README.md): under `/tests/fixtures/programs/` the ones
-spawned as programs, `capexhaust`, `crashme`, `deadline`, `debugger`, `demandpaged`, `fsbench`,
-`leader`, `pipefault`, `pipestress`, `relrofault`, `spawn-target`, `stackoverflow`, `stdiotest`,
-`threadchurn`, and `threadstack`, each an image of the program role, which the `programs` component
-keeps in the program signing role, and none of which installs under `/programs/`; directly under
-`/tests/fixtures/` the ones a harness recipe starts as services, `crasher`, `debug-echo`,
-`hotplug-check`, `memhog`, and `stopsrc`. Which consumer spawns or drives each one is owned by
+spawned as programs, `crashme`, `debugger`, `fsbench`, `leader`, `program-modes`, `spawn-target`,
+and `stdiotest`, each an image of the program role, which the `programs` component keeps in the
+program signing role, and none of which installs under `/programs/`; directly under
+`/tests/fixtures/` the ones a harness recipe starts as services, `debug-echo`, `hotplug-check`, and
+`service-modes`. `program-modes` is one image whose first argument names the mode, `capexhaust`,
+`deadline`, `demandpaged`, `narrow`, `pipefault`, `pipestress`, `relrofault`, `stackoverflow`,
+`threadchurn` or `threadstack`; `service-modes` likewise, `crasher`, `memhog` or `stopsrc`. Which
+consumer spawns or drives each one is owned by
 [services/svctest/README.md § Fixtures](../services/svctest/README.md#fixtures) for `svctest` phases
-and by each fixture's README (`services/fixtures/<name>/README.md`). Under
-`/config/svcmgr/tests/` are the harness recipes, and under `/config/devmgr/tests/` the test
-device class files the svctest recipe stages (see [Gating](#gating)). Under `/data/` are
-`/data/test.txt`, a fixture shared by `svctest` and the `shell` tester, and the build-synthesised
-`svctest`-only fixtures `/data/svctest/large.bin`, `/data/svctest/bench.bin`, and
-`/data/svctest/signed/verified.dat`, the data-role fixture of procmgr's verified read, which every
-pack signs ([signing.md](signing.md) § Signing).
+and by each fixture's README (`services/fixtures/<name>/README.md`, the modes of `program-modes` and
+`service-modes` each a section of theirs). Under `/config/svcmgr/tests/` are the harness recipes,
+and under `/config/devmgr/tests/` the test device class files the svctest recipe stages (see
+[Gating](#gating)). Under `/data/` are `/data/test.txt`, a fixture shared by `svctest` and the
+`shell` tester, and the build-synthesised `svctest`-only fixtures `/data/svctest/large.bin`,
+`/data/svctest/bench.bin`, and `/data/svctest/signed/verified.dat`, the data-role fixture of
+procmgr's verified read, which every pack signs ([signing.md](signing.md) § Signing).
 
 ---
 
@@ -1226,7 +1229,7 @@ side, each lane on its own copy of the checkout and its cases one after another 
 order ([xtask/README.md § Cells](../xtask/README.md#cells)): the `terminal` case's boot, the
 `signing` case's eight boots, the `dma-confinement` case's two boots, the `rollback` case's three
 boots, the `enrolment` case's six boots, the `secureboot` case's four boots, the `wedge` case's boot
-pair, on x86_64 the `vmgenid` case's save/restore boot pair, the `storage-roles` case's four boots,
+pair, on x86_64 the `vmgenid` case's save/restore boot pair, the `storage-roles` case's five boots,
 and the `shutdown` case's boots, nine on x86_64 (the reboot, the power button and the seven core
 deaths) and eight on riscv64. The `ktest` cell's cases are the `kaslr` case's three boots; the
 `svctest` cell has none. The terminal and wedge boots have *no* shutdown-invoking harness: the
@@ -2471,22 +2474,14 @@ note in full.
 [programs/usertest/README.md](../programs/usertest/README.md),
 [services/crashd/README.md](../services/crashd/README.md),
 [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md),
-[services/fixtures/capexhaust/README.md](../services/fixtures/capexhaust/README.md),
-[services/fixtures/crasher/README.md](../services/fixtures/crasher/README.md),
 [services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md),
-[services/fixtures/deadline/README.md](../services/fixtures/deadline/README.md),
 [services/fixtures/debug-echo/README.md](../services/fixtures/debug-echo/README.md),
 [services/fixtures/debugger/README.md](../services/fixtures/debugger/README.md),
-[services/fixtures/demandpaged/README.md](../services/fixtures/demandpaged/README.md),
 [services/fixtures/fsbench/README.md](../services/fixtures/fsbench/README.md),
 [services/fixtures/hotplug-check/README.md](../services/fixtures/hotplug-check/README.md),
-[services/fixtures/pipefault/README.md](../services/fixtures/pipefault/README.md),
-[services/fixtures/pipestress/README.md](../services/fixtures/pipestress/README.md),
-[services/fixtures/relrofault/README.md](../services/fixtures/relrofault/README.md),
-[services/fixtures/stackoverflow/README.md](../services/fixtures/stackoverflow/README.md),
+[services/fixtures/program-modes/README.md](../services/fixtures/program-modes/README.md),
+[services/fixtures/service-modes/README.md](../services/fixtures/service-modes/README.md),
 [services/fixtures/stdiotest/README.md](../services/fixtures/stdiotest/README.md),
-[services/fixtures/threadchurn/README.md](../services/fixtures/threadchurn/README.md),
-[services/fixtures/threadstack/README.md](../services/fixtures/threadstack/README.md),
 [services/gdbstub/README.md](../services/gdbstub/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),

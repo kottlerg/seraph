@@ -191,13 +191,14 @@ pub fn pipe_fault_eof_phase(_: &Caps)
     use std::process::{Command, Stdio};
     use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
 
-    let mut child = Command::new("/tests/fixtures/programs/pipefault")
+    let mut child = Command::new(super::PROGRAM_MODES_PATH)
+        .arg("pipefault")
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn /tests/fixtures/programs/pipefault failed");
+        .expect("spawn program-modes pipefault failed");
 
     let id = child.process_handle();
-    std::os::seraph::log!("spawned /tests/fixtures/programs/pipefault handle={id:#x}");
+    std::os::seraph::log!("spawned program-modes pipefault handle={id:#x}");
 
     let mut stdout = child.stdout.take().expect("piped stdout missing");
     let mut bytes = Vec::new();

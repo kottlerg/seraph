@@ -4,7 +4,7 @@
 // services/svctest/src/phases/pipestress.rs
 
 //! Pipe EOF-drain and long-lived-spawner surface (#360, #364). Repeatedly
-//! spawns `/tests/fixtures/programs/pipestress` with a piped stdout and asserts
+//! spawns `program-modes pipestress` with a piped stdout and asserts
 //! every iteration's output line is captured. Each iteration is one independent
 //! trial of the write-close-exit window in which a parent-side pipe drain races
 //! the death-bridge's `peer_dead` flip; a dropped line means the reader returned
@@ -142,11 +142,12 @@ fn spawner_main()
     for (i, done) in (1..=ITERATIONS).enumerate()
     {
         let token = i.to_string();
-        let mut child = Command::new("/tests/fixtures/programs/pipestress")
+        let mut child = Command::new(super::PROGRAM_MODES_PATH)
+            .arg("pipestress")
             .arg(&token)
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn /tests/fixtures/programs/pipestress");
+            .expect("spawn program-modes pipestress");
 
         let mut out = String::new();
         child
@@ -223,12 +224,13 @@ fn counts_since(base: &Counts) -> Counts
 /// sees EOF, before its process closes its end.
 fn doorbell_trial()
 {
-    let mut child = Command::new("/tests/fixtures/programs/pipestress")
+    let mut child = Command::new(super::PROGRAM_MODES_PATH)
+        .arg("pipestress")
         .arg("sink")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn /tests/fixtures/programs/pipestress sink");
+        .expect("spawn program-modes pipestress sink");
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
 

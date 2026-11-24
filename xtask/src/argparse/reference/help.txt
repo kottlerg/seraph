@@ -175,7 +175,7 @@ Options:
       --icount
           Count instructions: run the machine on single-threaded TCG with QEMU's `-icount shift=0,sleep=off,align=off`, so the guest's clock and cycle counters advance one tick per retired instruction, the deterministic measure `bench-check --mode icount` compares. Always TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount cannot serve, so the kernel runs its xAPIC paths
       --runs <N>
-          Boot N times unattended and classify each run's log as PASS, FAIL, HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns, failing unless every run passes (a QEMU-CRASH is tolerated). Without it, `run` is one interactive boot whose serial output is the terminal's
+          Boot N times unattended and classify each run's log as PASS, FAIL, HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns, failing unless every run passes (a QEMU-CRASH is tolerated beside a PASS, never in a set with none). Without it, `run` is one interactive boot whose serial output is the terminal's
       --display <DISPLAY>
           What the guest presents for display. `window` attaches QEMU std VGA and shows it in a window; `framebuffer` attaches it with no window (`-display none`), so the framebuffer driver runs on a host without a graphical backend: the framebuffer device cell of the local and release host runs (docs/testing.md "Coverage tiers"); `headless` attaches no adapter, so the bootloader finds no GOP and devmgr spawns no framebuffer driver. Default: `window` for the interactive boot, `headless` with `--runs`, which refuses `window` [possible values: window, framebuffer, headless]
       --gdb
@@ -189,7 +189,7 @@ Options:
       --timeout <TIMEOUT>
           Per-run timeout of `--runs`, in seconds. A run still alive at this point is killed and classified as HANG [default: 30]
       --pass <PASS>
-          Regex marking a successful run of `--runs`. On match (and every `--require` and `--crash-reports` check holding) the log is discarded and the run is classified PASS. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [`docs/testing.md`](../../docs/testing.md); override for other rootfs configurations [default: "ALL TESTS PASSED"]
+          Regex marking a successful run of `--runs`. On match (and every `--require` and `--crash-reports` check holding) the log is discarded and the run is classified PASS. The default is the terminal marker `[<harness>] ALL TESTS PASSED` ([`docs/testing.md`](../../docs/testing.md)) of the one harness the image boots, as its pack recorded it; an image that boots no harness, or several, has none, and `--runs` then needs this option. Override for other rootfs configurations
       --fail <FAIL>
           Regex marking a failed run of `--runs`. On match the log is preserved as FAIL-<run>.log. Failure takes precedence over success. The default matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([`docs/testing.md`](../../docs/testing.md)) plus the kernel's own death markers, so a crash classifies as FAIL rather than HANG: a hardware trap prints `KERNEL EXCEPTION` then `FATAL:` (`core/kernel/src/main.rs` `fatal()`), a Rust `panic!` prints `PANIC at`/`PANIC:` (the `#[panic_handler]`), and the scheduler's wedge detectors print a dump headed `=== WATCHDOG` (a kernel that detected its own stall is a failure, not a hang), and the entropy subsystem's boot self-test prints `entropy: SELFTEST FAIL`. The benign userspace fault path prints `USERSPACE FAULT`, which none of these match. Override with a never-matching pattern (e.g. `'$.^'`) to disable [default: "SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"]
       --fail-also <REGEX>
@@ -314,7 +314,7 @@ Options:
           Count instructions: run the machine on single-threaded TCG with QEMU's `-icount shift=0,sleep=off,align=off`, so the guest's clock and cycle counters advance one tick per retired instruction, the deterministic measure `bench-check --mode icount` compares. Always TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount cannot serve, so the kernel runs its xAPIC paths
 
       --runs <N>
-          Boot N times unattended and classify each run's log as PASS, FAIL, HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns, failing unless every run passes (a QEMU-CRASH is tolerated). Without it, `run` is one interactive boot whose serial output is the terminal's
+          Boot N times unattended and classify each run's log as PASS, FAIL, HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns, failing unless every run passes (a QEMU-CRASH is tolerated beside a PASS, never in a set with none). Without it, `run` is one interactive boot whose serial output is the terminal's
 
       --display <DISPLAY>
           What the guest presents for display. `window` attaches QEMU std VGA and shows it in a window; `framebuffer` attaches it with no window (`-display none`), so the framebuffer driver runs on a host without a graphical backend: the framebuffer device cell of the local and release host runs (docs/testing.md "Coverage tiers"); `headless` attaches no adapter, so the bootloader finds no GOP and devmgr spawns no framebuffer driver. Default: `window` for the interactive boot, `headless` with `--runs`, which refuses `window`
@@ -346,9 +346,7 @@ Options:
           [default: 30]
 
       --pass <PASS>
-          Regex marking a successful run of `--runs`. On match (and every `--require` and `--crash-reports` check holding) the log is discarded and the run is classified PASS. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [`docs/testing.md`](../../docs/testing.md); override for other rootfs configurations
-          
-          [default: "ALL TESTS PASSED"]
+          Regex marking a successful run of `--runs`. On match (and every `--require` and `--crash-reports` check holding) the log is discarded and the run is classified PASS. The default is the terminal marker `[<harness>] ALL TESTS PASSED` ([`docs/testing.md`](../../docs/testing.md)) of the one harness the image boots, as its pack recorded it; an image that boots no harness, or several, has none, and `--runs` then needs this option. Override for other rootfs configurations
 
       --fail <FAIL>
           Regex marking a failed run of `--runs`. On match the log is preserved as FAIL-<run>.log. Failure takes precedence over success. The default matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([`docs/testing.md`](../../docs/testing.md)) plus the kernel's own death markers, so a crash classifies as FAIL rather than HANG: a hardware trap prints `KERNEL EXCEPTION` then `FATAL:` (`core/kernel/src/main.rs` `fatal()`), a Rust `panic!` prints `PANIC at`/`PANIC:` (the `#[panic_handler]`), and the scheduler's wedge detectors print a dump headed `=== WATCHDOG` (a kernel that detected its own stall is a failure, not a hang), and the entropy subsystem's boot self-test prints `entropy: SELFTEST FAIL`. The benign userspace fault path prints `USERSPACE FAULT`, which none of these match. Override with a never-matching pattern (e.g. `'$.^'`) to disable

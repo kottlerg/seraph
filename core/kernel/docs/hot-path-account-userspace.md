@@ -71,7 +71,7 @@ each round trip also takes the lazy FPU switch's `#NM` trap once a thread is swi
 
 `ubench.fault_fill path=fault pages=16` is 33724 / 58254: memmgr 13914 / 31690, of which its
 `memset` zeroing the 16 frames is 8298 / 24812 (x86_64's `rep stos` is about one iteration per 8
-bytes, riscv64's loop about one instruction per 2.6 bytes), and the kernel 19799 / 26565, spread
+bytes, riscv64's loop about one instruction per 2.6 bytes), and the kernel 19799 / 26556, spread
 over the page-table walk and install (`level_shift`, `table_index`, `names_table`, `read_entry`,
 `install_user_leaf`), the frame map's counters, and `sys_mem_map`. `fault_scaling threads=1` runs
 the same path. `path=grant` adds the grant's capability operations, 33825 / 61482.

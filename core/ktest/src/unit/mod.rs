@@ -286,6 +286,10 @@ pub fn run_all(ctx: &TestContext)
         retype::pool_seeding_takes_interrupts(ctx)
     );
     run_test!(
+        "retype::explicit_placement_takes_interrupts",
+        retype::explicit_placement_takes_interrupts(ctx)
+    );
+    run_test!(
         "retype::cspace_teardown_takes_interrupts",
         retype::cspace_teardown_takes_interrupts(ctx)
     );

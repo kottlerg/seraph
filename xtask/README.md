@@ -595,7 +595,8 @@ about half a second to a pack at 512-byte blocks, and under a second at 4096.
 
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest] \
-    [--knob nokaslr|mapredo]... [--log-levels FILE] [--block-size 512|4096] [--split-data]
+    [--svctest ci|burn-in|none] [--knob nokaslr|mapredo]... [--log-levels FILE] \
+    [--block-size 512|4096] [--split-data]
 ```
 
 | Option | Default | Description |
@@ -603,6 +604,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands, the repository's data files installed and its objects re-signed as every pack signs them — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 | `--harness` | the recorded one | Record the harness whose bundle this and every later pack composes: `init` for the regular userspace init, `ktest` for the kernel-test harness |
+| `--svctest` | none | Stage the svctest boot with a fixture set: svctest's recipe and the set's fixture recipes copied from `config/svcmgr/tests/` into `config/svcmgr/services/`, every other fixture's recipe removed from it, the test class files of `config/devmgr/tests/` copied into `config/devmgr/classes/`, and the set's record written into the staged recipe's `env` line as `SVCTEST_FIXTURES`; `ci` stages every fixture, as the canonical svctest cells do, `burn-in` `memhog`, `reserve-creator` and `stopsrc`, as the burn-in cell does, and `none` no fixture; refused when a recipe the set needs is missing ([docs/testing.md](../docs/testing.md#gating) § Gating, svctest fixture sets) |
 | `--knob` | none | Stage a presence-only bootloader knob in `\EFI\seraph\`, repeatable or comma-separated: `nokaslr` boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; `mapredo` makes the first attempt of the bootloader's steps 6 and 7 redo whatever its memory map's size ([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md) § Sizing the Entry Array). Every knob not named is removed |
 | `--log-levels` | the repository's | Install `FILE` at `/config/init/log-levels.conf` in place of `services/init/log-levels.conf`; refused, before anything changes, unless init's parser (`services/init/log-levels`) accepts every line, since init ignores a line it refuses |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
@@ -617,13 +619,12 @@ it, and no `[devmgr] DEBUG ` or `[procmgr] DEBUG ` line, which `run --runs --req
 `--fail-also` match
 ([docs/testing.md](../docs/testing.md#log-levels-usertest-cell) § Log levels).
 
-Example — stage `svctest` and run it (`--repack-only` keeps the hand-added
-recipe; a plain repack would prune it):
+Example — stage `svctest` with the canonical cells' fixtures and run it (`--repack-only` keeps
+the terminal's removal; a plain repack would restore it):
 
 ```sh
-cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
-cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
-cargo xtask mkdisk --repack-only --arch x86_64
+rm -f sysroot/config/svcmgr/services/terminal.svc
+cargo xtask mkdisk --repack-only --svctest ci --arch x86_64
 cargo xtask run --arch x86_64 --test-devices
 ```
 

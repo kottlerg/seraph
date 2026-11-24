@@ -189,9 +189,9 @@ const RETRY_TIMEOUT: Duration = Duration::from_secs(90);
 pub fn rtc_create_retry_phase(caps: &Caps)
 {
     let phase = "rtc_create_retry";
-    if !super::svcmgr::recipe_staged(super::oom::MEMHOG_RECIPE, phase)
+    if !super::fixtures::staged(svctest_fixtures::Fixture::Memhog)
     {
-        std::os::seraph::log!("rtc_create_retry phase passed (memhog.svc not staged)");
+        super::fixtures::skip(phase, svctest_fixtures::Fixture::Memhog);
         return;
     }
     let authority = caps.debug_authority;

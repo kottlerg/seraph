@@ -938,9 +938,14 @@ dependencies = [
  "recv-pool",
  "restart-budget",
  "shmem",
+ "svctest-fixtures",
  "syscall",
  "syscall-abi",
 ]
+
+[[package]]
+name = "svctest-fixtures"
+version = "0.1.5"
 
 [[package]]
 name = "swapd"
@@ -1183,6 +1188,7 @@ dependencies = [
  "procmgr-process-table",
  "restart-budget",
  "seraph-path-account-plugin",
+ "svctest-fixtures",
  "syscall-abi",
  "vfsd-gpt",
 ]

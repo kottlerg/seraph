@@ -15,6 +15,9 @@ path = "src/main.rs"
 boot-protocol = { path = "../abi/boot-protocol" }
 # The boot-time policy's parser: a pack refuses a policy it does not accept.
 boot-policy = { path = "../shared/boot-policy" }
+# The storage statement's writer and parser: the split layout stages one, and
+# a pack refuses a statement vfsd's parser would refuse.
+storage-statement = { path = "../shared/storage-statement" }
 # The `debug-port` case: the GDB remote serial protocol's framing, shared with the
 # guest fixture it drives.
 gdb-rsp = { path = "../shared/gdb-rsp" }

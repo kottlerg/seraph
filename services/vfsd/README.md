@@ -67,9 +67,9 @@ vfsd/
   `GET_SWAP_PARTITION` waits at most for the discovery lock and the swap
   lock, held across a discovery of new disks and one call to the block
   driver; none of devmgr, memmgr and the block drivers calls vfsd), so the thread count
-  is a concurrency knob, not a correctness bound. `MOUNT` is the runtime explicit-mount surface
-  (foreign-GUID disks, user-invoked mounts), gated on the
-  `MOUNT_AUTHORITY` badge bit; root, `/esp`, and `/data` are
+  is a concurrency knob, not a correctness bound. `MOUNT` mounts the root or the data role at a
+  path, resolved as the self-mount resolves it, gated on the
+  `MOUNT_AUTHORITY` badge bit; root, `/esp`, and the data paths are
   self-mounted, and svctest and the hotplug-check fixture
   (disk mode) are its only in-tree callers. `UNMOUNT`, on
   the same badge bit, removes a mount below `/`: it asks the driver to
@@ -147,21 +147,27 @@ vfsd/
   each runtime role lookup (a `MOUNT`, the first `GET_SWAP_PARTITION`),
   asks devmgr where each new disk's device sits (`QUERY_DEVICE_LOCATION`
   on the same SEND: the PCI function devmgr bound its driver to, kept with
-  the disk and logged; no role lookup reads it),
+  the disk and logged; the boot-disk identification reads it),
   and parses each disk's GPT
   partition table through one scratch memory cap reused across the reads (replaced from memmgr
   before the next disk when a failed read left it lost), keeping every
   used entry of each header's `num_parts`-entry array, from the primary
   GPT or, when the primary fails its CRC32 or `MyLBA` checks, the backup at
   the disk's last LBA (a disk neither of whose GPT copies can be read and
-  validated contributes none). It then resolves the
-  arch-conditional root GUID in `src/role_guids.rs` via
-  `gpt::lookup_partition_by_type_guid` over the partitions of every disk
-  for the self-mount; the DPS priority tie-break runs across disks, and
-  a tie at the highest priority is ambiguous whether or not the tied
-  partitions share a disk. The EFI System Partition (standard type
-  GUID) and the Seraph data partition (arch-neutral `SERAPH_DATA` GUID)
-  auto-mount at `/esp` and `/data` immediately after root; there is no
+  validated contributes none). It then identifies the boot disk
+  (`gpt::find_boot_disk`: the held disk at the PCI location the bootloader
+  reported that carries the boot ESP) and resolves the arch-conditional
+  root GUID in `src/role_guids.rs` on it via `gpt::lookup_on_disk` for
+  the self-mount; the DPS priority tie-break runs on the boot disk alone,
+  and a tie at the highest priority is ambiguous. Another disk takes a
+  role only where the signed storage statement `/config/vfsd/storage.conf`
+  names its partition by unique partition GUID (`gpt::resolve_named`); a
+  disk neither the boot disk nor named takes no role, and with no boot
+  disk the root self-mount fails. After root, vfsd reads the statement and
+  auto-mounts the boot ESP (the partition the bootloader's descriptor
+  names on the boot disk) at `/esp`, each data partition the statement
+  names at its path, and, unless it names one for `/data`, the boot
+  disk's `SERAPH_DATA` partition at `/data`; there is no
   `mounts.conf` and no `INGEST_CONFIG_MOUNTS` IPC. The runtime `MOUNT`
   handler decodes a `MountRole` byte from the wire payload and reuses
   the same resolution path. See

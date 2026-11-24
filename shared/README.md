@@ -33,6 +33,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`restart-budget/`](restart-budget/README.md) | Windowed restart budget svcmgr keeps per service, devmgr per device record whose driver it restarts, and vfsd per mount whose fs driver it restarts |
 | [`riscv-step/`](riscv-step/README.md) | Successor-address decoder a debugger single-steps a riscv64 thread with |
 | [`shmem/`](shmem/README.md) | Shared-memory byte transport — multi-page `SharedBuffer` plus SPSC ring |
+| [`storage-statement/`](storage-statement/README.md) | Format, parser and writer of the storage statement, `/config/vfsd/storage.conf`, shared by vfsd and xtask, `no_std` with `alloc` |
 | [`svc-grammar/`](svc-grammar/README.md) | Line grammar of the `.svc` files (`key = value`, `#` comments), shared by svcmgr's definition and class parsers and devmgr's platform table parser |
 | [`syscall/`](syscall/README.md) | Userspace syscall wrappers — inline asm over `abi/syscall/` |
 | [`text/`](text/README.md) | Byte-stream → glyph primitives shared by every framebuffer console |

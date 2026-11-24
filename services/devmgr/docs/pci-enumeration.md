@@ -79,7 +79,10 @@ then ordered by segment, bus, device, and function.
      bridge) header, read the
      secondary (0x19) and subordinate (0x1A) bus numbers, the buses behind
      the bridge, against which devmgr resolves the device scopes of the ACPI
-     DMAR.
+     DMAR. devmgr writes no bus number: it keeps the numbering the firmware
+     programmed, so a function's bus is the one the bootloader read for it,
+     which vfsd's boot-disk match relies on
+     ([storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
    - Read interrupt line (0x3C) and interrupt pin (0x3D).
    - For a type-0 header, walk its capability list for the MSI (0x05) and
      MSI-X (0x11) capabilities (`firmware::pci::Msi`, `firmware::pci::Msix`):

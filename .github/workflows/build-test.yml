@@ -388,8 +388,9 @@ jobs:
         # The host-driven cases of `cargo xtask test`'s registry this cell's
         # tester runs (xtask/README.md § `cargo xtask test`; docs/testing.md
         # § Coverage tiers): on usertest the terminal, wedge, shutdown,
-        # signing, dma-confinement, rollback, enrolment and secureboot cases, and vmgenid on
-        # x86_64; on ktest the kaslr case; svctest has none. Each case boots the default image of its bundle,
+        # signing, dma-confinement, rollback, enrolment, secureboot and
+        # storage-roles cases, and vmgenid on x86_64; on ktest the kaslr case;
+        # svctest has none. Each case boots the default image of its bundle,
         # so the plain repack first re-mirrors rootfs (dropping the staged
         # test recipes and restoring terminal.svc), installs the repository's
         # log-level configuration, and removes the knobs, keeping the

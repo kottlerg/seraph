@@ -349,6 +349,7 @@ mod tests
                 unique_guid: [1; 16],
                 first_lba: first,
                 blocks,
+                attributes: 0,
             },
             gpt::Partition {
                 name: "ROOT",
@@ -356,6 +357,7 @@ mod tests
                 unique_guid: [2; 16],
                 first_lba: first + blocks,
                 blocks,
+                attributes: 0,
             },
         ];
         let total = 2 * MIB + 2 * 17 * MIB;

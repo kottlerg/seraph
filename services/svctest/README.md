@@ -728,7 +728,11 @@ not found, and a fresh `MOUNT` at `/data` succeeds on the same disk. They mount 
 set svctest's cwd to it before they end. The `vfsd_namespace_stray_caps` phase after them mounts
 the data partition over `/config/svcmgr/tests` in place of `/data`, sends requests carrying
 caps through vfsd's synthetic `/config`, and mounts `/data` again and sets the cwd to it before it
-ends.
+ends. When a storage statement is staged (`mkdisk --split-data`, which names the second disk's data
+partition for `/data`), the data role at any other path resolves on the boot disk, which carries
+none: the unmount phases mount nothing over `/config/svcmgr/tests`, the
+`vfsd_namespace_stray_caps` phase is skipped, and the mounted-partition phase expects `NO_MOUNT`
+where it otherwise expects `TABLE_FULL`.
 The sysroot placement of all of these is listed in [docs/testing.md § Sysroot
 layout](../../docs/testing.md#sysroot-layout).
 

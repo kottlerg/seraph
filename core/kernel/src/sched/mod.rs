@@ -4109,6 +4109,92 @@ unsafe fn start_decision_of(tcb: *mut ThreadControlBlock) -> hold::StartDecision
     hold::start_decision(space, state, mark)
 }
 
+/// The CPU that has `tcb` as its scheduler's `current`, if any.
+///
+/// # Safety
+/// The caller holds every CPU's `scheduler.lock`, under which `current` is
+/// written, so the answer holds until it releases them.
+#[cfg(not(test))]
+unsafe fn cpu_running(tcb: *mut ThreadControlBlock, cpu_count: usize) -> Option<usize>
+{
+    (0..cpu_count).find(|&cpu| {
+        // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+        let sched = unsafe { scheduler_for(cpu) };
+        sched.current() == tcb
+    })
+}
+
+/// Every CPU below `cpu_count` whose `current`, as `current_of` reads it, is
+/// `tcb`. A thread is `current` on two CPUs while a CPU that claimed it in
+/// its voluntary-block window waits for the parking CPU's register save
+/// (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership), so a
+/// post that every CPU running the thread owes walks them all.
+fn cpus_current_on(
+    tcb: *mut ThreadControlBlock,
+    cpu_count: usize,
+    current_of: impl Fn(usize) -> *mut ThreadControlBlock,
+) -> impl Iterator<Item = usize>
+{
+    (0..cpu_count).filter(move |&cpu| core::ptr::eq(current_of(cpu), tcb))
+}
+
+/// After a commit of `state` to `tcb`, post the stopped check (`STOPPED`)
+/// to every CPU whose `current` is `tcb` when `state` is `Exited`: that
+/// CPU's next syscall return owes [`running_thread_stopped`]. Another state
+/// posts nothing. A thread can be `current` on two CPUs:
+/// one that claimed it in its voluntary-block window waits for the parking
+/// CPU's register save with it `current` on both, and resumes it in that
+/// syscall (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
+/// Ownership). With every CPU lock held, no other CPU makes it `current`
+/// before the caller releases them, and it is never dispatched again
+/// (core/kernel/docs/scheduling-internals.md § Return Work).
+///
+/// # Safety
+/// The caller holds every CPU's `scheduler.lock`, and `cpu_count` is the
+/// number of CPUs whose per-CPU storage is initialised.
+#[cfg(not(test))]
+pub(crate) unsafe fn post_stopped(
+    tcb: *mut ThreadControlBlock,
+    state: ThreadState,
+    cpu_count: usize,
+)
+{
+    let current_of = |cpu| {
+        // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+        unsafe { scheduler_for(cpu) }.current()
+    };
+    let word_of = |cpu| {
+        // SAFETY: cpu < cpu_count, and per-CPU storage is initialised before
+        // any thread runs.
+        unsafe { crate::percpu::return_work_of(cpu) }
+    };
+    post_stopped_to(tcb, state, cpu_count, current_of, word_of);
+}
+
+/// The body of [`post_stopped`], with each CPU's `current` read through
+/// `current_of` and its return-work word named by `word_of`. Release, after
+/// the caller's `Exited` store, as every post is.
+fn post_stopped_to(
+    tcb: *mut ThreadControlBlock,
+    state: ThreadState,
+    cpu_count: usize,
+    current_of: impl Fn(usize) -> *mut ThreadControlBlock,
+    word_of: impl Fn(usize) -> &'static core::sync::atomic::AtomicU32,
+)
+{
+    if state != ThreadState::Exited
+    {
+        return;
+    }
+    for cpu in cpus_current_on(tcb, cpu_count, current_of)
+    {
+        word_of(cpu).fetch_or(
+            crate::percpu::return_work::STOPPED,
+            core::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
 /// Shared body of [`set_state_under_all_locks`], [`exit_under_all_locks`],
 /// [`commit_cancelling_park`], and [`start_under_all_locks`].
 ///
@@ -4255,12 +4341,10 @@ unsafe fn commit_state_under_all_locks(
             unsafe { drain_from_every_queue(tcb, priority, cpu_count) };
         }
 
-        // Identify which CPU (if any) currently has tcb as `current`.
-        running_on = (0..cpu_count).find(|&cpu| {
-            // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
-            let sched = unsafe { scheduler_for(cpu) };
-            sched.current() == tcb
-        });
+        // SAFETY: every CPU lock is held (above).
+        running_on = unsafe { cpu_running(tcb, cpu_count) };
+        // SAFETY: every CPU lock is held (above); tcb valid.
+        unsafe { post_stopped(tcb, state_out, cpu_count) };
     }
 
     // Release all CPU locks in descending order, then (*tcb).sched_lock last.
@@ -4486,7 +4570,7 @@ impl SpinWarnOnce
 /// reads it without a lock. `state` is committed by the writer under every
 /// scheduler lock; it is probed without the lock first and confirmed under
 /// this CPU's lock only when the probe reads `Exited`, so the fast path —
-/// every syscall epilogue and every teardown spin iteration — takes no lock.
+/// every syscall epilogue's work path and every teardown spin iteration — takes no lock.
 /// A probe that lags the store delays detection by one spin iteration, or
 /// in the epilogue until the thread next enters the kernel, exactly as for
 /// a thread stopped while it is in user-mode. A same-CPU transition (the
@@ -5193,7 +5277,7 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// `sys_thread_stop` and `sys_thread_start` drains and the object-teardown
 /// stop (`stop_threads_bound_to`) on a CPU running a target they marked
 /// `Stopped` or `Exited`, and `sys_thread_set_affinity` on a CPU running a
-/// target whose affinity it changed. The IPI's handler does no work: the trap
+/// target whose affinity it changed. The IPI's handler deschedules nothing: the trap
 /// it forces snapshots the target's user registers and returns to user mode,
 /// and the CPU acts on the target at its next reschedule (a slice expiry, or
 /// the target's preemption by an outranking thread at a return to user mode)
@@ -7212,6 +7296,65 @@ unsafe fn set_running(sched: &PerCpuScheduler, tcb: *mut ThreadControlBlock)
     unsafe { crate::percpu::set_current_thread(tcb) };
 }
 
+/// Mark `tcb` dispatched on `cpu`: `Running`, its `preferred_cpu` naming
+/// `cpu`, this CPU's slice level its priority, no outstanding park-wake, and
+/// its pending upcall posted to this CPU's return work.
+///
+/// `schedule()`'s two ways into `Running`, the dispatch flip and the
+/// `next == current` re-mark, both call it. An upcall post that found the
+/// thread not `Running` posted no CPU, and one that found it `Running` posted
+/// the CPU it ran on before, so every dispatch reads the pending upcall here,
+/// under the `sched_lock` the post writes under: the post either sees
+/// `Running` and this CPU in `preferred_cpu`, or is seen here
+/// (core/kernel/docs/scheduling-internals.md § Return Work).
+///
+/// Clearing `wake_pending` is defensive: the `Running` coalesce that sets it
+/// is reached by the dying-server reply-bound wake in `dealloc_object(Thread)`,
+/// which the caller's commit consumes, and a stale flag must not survive into
+/// a later, unrelated `commit_blocked`
+/// (core/kernel/docs/sched-ipc-redesign.md § 2.1).
+///
+/// Returns whether a park-wake was pending, for the #375 tripwire, and the
+/// thread's id.
+///
+/// # Safety
+/// `tcb` is a valid TCB whose `sched_lock` the caller holds; `sched` is CPU
+/// `cpu`'s scheduler, `cpu` is this CPU, its per-CPU pointer is installed,
+/// and interrupts are disabled.
+#[cfg(not(test))]
+unsafe fn mark_dispatched(
+    sched: &PerCpuScheduler,
+    tcb: *mut ThreadControlBlock,
+    cpu: usize,
+) -> (bool, u32)
+{
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of `tcb`, a valid TCB whose sched_lock this CPU holds"
+    )]
+    // SAFETY: tcb is a valid TCB; its scheduling fields are written under its
+    // sched_lock, held (contract), and thread_id is immutable.
+    let marked = unsafe {
+        (*tcb).state = ThreadState::Running;
+        (*tcb).preferred_cpu = cpu as u32;
+        // The level its slice is measured by (`timer_tick` may not read
+        // `priority` without this sched_lock).
+        sched.set_current_level((*tcb).priority);
+        let was_pending = (*tcb).wake_pending;
+        (*tcb).wake_pending = false;
+        (was_pending, (*tcb).thread_id)
+    };
+    // SAFETY: tcb is a valid TCB whose sched_lock is held (contract).
+    let upcall = unsafe { crate::ipc::upcall::return_work_of(tcb) };
+    if upcall != 0
+    {
+        // SAFETY: this CPU's per-CPU pointer is installed and interrupts are
+        // disabled (contract).
+        unsafe { crate::percpu::post_return_work(upcall) };
+    }
+    marked
+}
+
 /// Select the next thread to run and switch to it.
 ///
 /// Called from `sys_yield`, slice expiry, wake preemption, the parking and
@@ -7561,28 +7704,17 @@ pub unsafe fn schedule(requeue: Requeue)
         // register save happens.
         if !current.is_null()
         {
-            #[expect(
-                clippy::multiple_unsafe_ops_per_block,
-                reason = "every access is to a field of `current`, a valid TCB whose sched_lock \
-                          this CPU holds"
-            )]
-            // SAFETY: current is a valid TCB; its scheduling fields are written
-            // under its sched_lock, held here, and thread_id is immutable.
-            let (cleared_live_wake, tid) = unsafe {
-                (*current).state = ThreadState::Running;
-                // Still running on THIS CPU: keep preferred_cpu authoritative
-                // (the re-mark, like the local requeue above, must not leave it
-                // stale — core/kernel/docs/sched-ipc-redesign.md § 3).
-                (*current).preferred_cpu = cpu as u32;
-                // The level its next slice is measured by, read under its held
-                // sched_lock (a priority change since its dispatch lands here).
-                sched.set_current_level((*current).priority);
-                // A running thread carries no pending park-wake (see the
-                // dispatch flip below).
-                let was_pending = (*current).wake_pending;
-                (*current).wake_pending = false;
-                (was_pending, (*current).thread_id)
-            };
+            // Still running on THIS CPU: keep preferred_cpu authoritative
+            // (the re-mark, like the local requeue above, must not leave it
+            // stale — core/kernel/docs/sched-ipc-redesign.md § 3), and read
+            // the level its next slice is measured by under its held
+            // sched_lock (a priority change since its dispatch lands here). A
+            // thread re-selected after a wake inside its block window is a
+            // dispatch like any other, and owes the upcall its wake may carry.
+            // SAFETY: current is a valid TCB whose sched_lock this CPU holds;
+            // `sched` is this CPU's scheduler, its per-CPU pointer is
+            // installed, and interrupts are disabled.
+            let (cleared_live_wake, tid) = unsafe { mark_dispatched(sched, current, cpu) };
             if cleared_live_wake
                 && !WAKE_PENDING_CLEAR_TRIPPED.swap(true, core::sync::atomic::Ordering::Relaxed)
             {
@@ -7764,29 +7896,10 @@ pub unsafe fn schedule(requeue: Requeue)
         }
         if dispatchable
         {
-            #[expect(
-                clippy::multiple_unsafe_ops_per_block,
-                reason = "every access is to a field of `next`, a valid TCB whose sched_lock this \
-                          CPU holds"
-            )]
-            // SAFETY: next is a valid TCB; its scheduling fields are written under
-            // its sched_lock, held here, and thread_id is immutable.
-            let (cleared_live_wake, tid) = unsafe {
-                (*next).state = ThreadState::Running;
-                (*next).preferred_cpu = cpu as u32;
-                // The level its slice is measured by (`timer_tick` may not read
-                // `priority` without this sched_lock).
-                sched.set_current_level((*next).priority);
-                // A running thread has no outstanding park-wake to honour; clear
-                // wake_pending so a stale flag can never survive into a later,
-                // unrelated commit_blocked (defensive — the `Running` coalesce
-                // that sets it is reached by the dying-server reply-bound wake in
-                // dealloc_object(Thread), which the caller's commit consumes; see
-                // core/kernel/docs/sched-ipc-redesign.md § 2.1).
-                let was_pending = (*next).wake_pending;
-                (*next).wake_pending = false;
-                (was_pending, (*next).thread_id)
-            };
+            // SAFETY: next is a valid TCB whose sched_lock this CPU holds;
+            // `sched` is this CPU's scheduler, its per-CPU pointer is
+            // installed, and interrupts are disabled.
+            let (cleared_live_wake, tid) = unsafe { mark_dispatched(sched, next, cpu) };
             if cleared_live_wake
                 && !WAKE_PENDING_CLEAR_TRIPPED.swap(true, core::sync::atomic::Ordering::Relaxed)
             {
@@ -8437,25 +8550,26 @@ pub unsafe fn timer_tick()
     }
 }
 
-// ── Wake preemption ──────────────────────────────────────────────────────────
-
+// ── Return work and wake preemption ──────────────────────────────────────────
 /// Reschedule when a thread queued on this CPU outranks the running one
 /// ([`run_queue::PerCpuScheduler::outranked`]), the running thread keeping its
-/// turn ([`Requeue::Preempted`]); returns whether it rescheduled. Called at
-/// every return to user mode that can follow a link with no wake IPI pending:
-/// the end of a syscall, and of an interrupt or exception taken from user mode
-/// (core/kernel/docs/scheduler.md § Wake Preemption), through
-/// [`deliver_and_preempt`] where the return is an upcall delivery point.
+/// turn ([`Requeue::Preempted`]); returns whether it rescheduled. Called by the
+/// out-of-line return work of a syscall, an interrupt or an exception taken
+/// from user mode ([`interrupt_return_work`], [`exception_return_work`],
+/// `syscall::finish_syscall`), which a set return-work bit sends there: a
+/// link that left a queued thread outranking the running one, a stale level,
+/// and a wake IPI post `percpu::return_work::PREEMPT`
+/// (core/kernel/docs/scheduler.md § Wake Preemption).
 ///
-/// The test every return makes is [`run_queue::PerCpuScheduler::outranked`]
-/// on this CPU's scheduler, reached through `PerCpuData::scheduler`
-/// ([`crate::percpu::current_scheduler`]): two loads and a branch past the
-/// per-CPU pointer's. Only a hit takes the rest of the decision, which does
-/// nothing during the BSP boot transient, as `timer_tick` does, while
-/// preemption is disabled, or for the idle thread, whose loop takes queued
-/// work itself, and which re-records a level a priority change marked stale
-/// (`PerCpuScheduler::mark_level_stale`) from the running thread's
-/// `priority` under its `sched_lock` before it decides again
+/// The test is [`run_queue::PerCpuScheduler::outranked`] on this CPU's
+/// scheduler, reached through `PerCpuData::scheduler`
+/// ([`crate::percpu::current_scheduler`]). Only a hit takes the rest of the
+/// decision, which does nothing during the BSP boot transient, as
+/// `timer_tick` does, or while preemption is disabled, and then posts the
+/// bit again so a later return decides, does nothing for the idle thread,
+/// whose loop takes queued work itself, and re-records a level a priority
+/// change marked stale (`PerCpuScheduler::mark_level_stale`) from the running
+/// thread's `priority` under its `sched_lock` before it decides again
 /// (core/kernel/docs/scheduler.md § Wake Preemption).
 ///
 /// # Safety
@@ -8463,7 +8577,6 @@ pub unsafe fn timer_tick()
 /// on the running thread's kernel stack with interrupts disabled and no lock
 /// held, the thread's frame holding what it returns to user mode with.
 #[cfg(not(test))]
-#[inline]
 pub unsafe fn preempt_if_outranked() -> bool
 {
     // SAFETY: a return to user mode runs on a CPU whose per-CPU pointer is
@@ -8477,20 +8590,21 @@ pub unsafe fn preempt_if_outranked() -> bool
     unsafe { preempt_outranked(sched) }
 }
 
-/// The rest of [`preempt_if_outranked`]'s decision, after its test hit: kept
-/// out of line, so each return to user mode inlines only the test.
+/// The rest of [`preempt_if_outranked`]'s decision, after its test hit.
 ///
 /// # Safety
 /// As for [`preempt_if_outranked`]; `sched` is this CPU's scheduler.
 #[cfg(not(test))]
-#[cold]
-#[inline(never)]
 unsafe fn preempt_outranked(sched: &PerCpuScheduler) -> bool
 {
-    // See core/kernel/docs/scheduling-internals.md § BSP Boot Transient.
+    // See core/kernel/docs/scheduling-internals.md § BSP Boot Transient. The
+    // thread stays outranked, so the bit goes back for a later return.
     if BOOT_TRANSIENT_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
         || crate::percpu::preemption_disabled()
     {
+        // SAFETY: this CPU's per-CPU pointer is installed and interrupts are
+        // disabled (contract).
+        unsafe { crate::percpu::post_return_work(crate::percpu::return_work::PREEMPT) };
         return false;
     }
     let current = sched.current();
@@ -8523,66 +8637,133 @@ unsafe fn preempt_outranked(sched: &PerCpuScheduler) -> bool
     true
 }
 
-/// The end of a return to user mode that is an upcall delivery point: `deliver`
-/// makes the delivery point, then [`preempt_if_outranked`] decides, both again
-/// while it reschedules (core/kernel/docs/scheduler.md § Wake Preemption). A
-/// thread that waited on the run queue for an outranking one has an upcall
-/// posted meanwhile delivered at this return, as a post to a thread running on
-/// no CPU expects (`ipc::upcall::post`), and a thread a delivery linked here,
-/// or whose wake IPI a delivery absorbed, is decided before the return.
+/// The end of an interrupt taken from user mode: one load and one branch on
+/// this CPU's return-work word ([`crate::percpu::return_work_pending`]) for
+/// the bits this return handles (`percpu::return_work::AT_INTERRUPT`), and,
+/// only when one is set, [`interrupt_return_slow`] with `deliver`, the
+/// interrupt delivery point of an upcall (docs/fault-handling.md § Delivery
+/// points; core/kernel/docs/scheduling-internals.md § Return Work).
 ///
 /// # Safety
-/// As for [`preempt_if_outranked`]; `deliver` makes the delivery point of this
-/// return, on that contract.
+/// As for [`preempt_if_outranked`], at the end of an interrupt taken from user
+/// mode, every handler having acknowledged its interrupt; `deliver` makes the
+/// interrupt delivery point with the thread's live user frame.
+// Always inlined: every interrupt's return to user mode runs the test, and the
+// dev profile CI's bench cell counts would otherwise keep it out of line, a
+// call and a frame per return.
 #[cfg(not(test))]
-#[expect(
-    clippy::inline_always,
-    reason = "every syscall's return runs it; the dev profile CI's bench cell counts otherwise keeps it out of line in syscall::dispatch, a call and a frame per syscall"
-)]
 #[inline(always)]
-pub unsafe fn deliver_and_preempt(deliver: impl FnMut())
+pub unsafe fn interrupt_return_work(deliver: impl FnMut())
 {
-    deliver_then_preempt(deliver, || {
-        // SAFETY: the caller's contract is preempt_if_outranked's.
-        unsafe { preempt_if_outranked() }
-    });
+    use crate::percpu::return_work::AT_INTERRUPT;
+    // SAFETY: a return to user mode runs on a CPU whose per-CPU pointer is
+    // installed.
+    if unsafe { crate::percpu::return_work_pending() } & AT_INTERRUPT != 0
+    {
+        // SAFETY: the caller's contract.
+        unsafe { interrupt_return_slow(deliver) };
+    }
+}
+
+/// [`interrupt_return_work`]'s out-of-line path: take this CPU's
+/// `AT_INTERRUPT` bits, then a sole-reference pass, `deliver` and the
+/// preemption decision, each deciding from its own state; again on the CPU the
+/// thread returns on after a reschedule, while its bits are set
+/// ([`run_return_work`]).
+///
+/// # Safety
+/// As for [`interrupt_return_work`].
+#[cfg(not(test))]
+#[cold]
+#[inline(never)]
+unsafe fn interrupt_return_slow(mut deliver: impl FnMut())
+{
+    use crate::percpu::return_work::AT_INTERRUPT;
+    run_return_work(
+        // SAFETY: a return to user mode with interrupts disabled (contract),
+        // on the CPU the thread runs on at each take.
+        || unsafe { crate::percpu::take_return_work(AT_INTERRUPT) },
+        |_| {
+            // A pass of the sole-reference posts this CPU marked or an earlier
+            // pass on it left, so a CPU that runs only user code still makes
+            // a pass of at most POST_BUDGET posts every tick
+            // (core/kernel/docs/capability-internals.md § Sole-Reference
+            // Observers). Before the delivery point and the decision, so a
+            // thread a post wakes on this CPU is decided at this return.
+            // SAFETY: the end of an interrupt from user mode on the
+            // interrupted thread's kernel stack, no lock held, interrupts
+            // disabled (contract).
+            unsafe { crate::cap::sole_reference::drain() };
+            deliver();
+            // SAFETY: the caller's contract is preempt_if_outranked's.
+            unsafe { preempt_if_outranked() }
+        },
+    );
 }
 
 /// The end of an exception taken from user mode, which is no upcall delivery
-/// point: [`preempt_if_outranked`] decides, and only a thread it rescheduled
-/// returns through [`deliver_and_preempt`] with `deliver`, the interrupt delivery
-/// point, as a thread an interrupt preempted does (docs/fault-handling.md
-/// § Delivery points).
+/// point: the one-load test of `percpu::return_work::AT_EXCEPTION`, the
+/// preemption decision when it is set, and, only for a thread that decision
+/// rescheduled, [`interrupt_return_work`] with `deliver`, the interrupt
+/// delivery point, as for a thread an interrupt preempted
+/// (docs/fault-handling.md § Delivery points).
 ///
 /// # Safety
 /// As for [`preempt_if_outranked`], at the end of an exception that resumes
 /// the thread; `deliver` makes the interrupt delivery point with the thread's
 /// live user frame.
+// Always inlined: every exception's return to user mode runs the test, and the
+// dev profile CI's bench cell counts would otherwise keep it out of line, a
+// call and a frame per return.
 #[cfg(not(test))]
-pub unsafe fn preempt_at_exception_return(deliver: impl FnMut())
+#[inline(always)]
+pub unsafe fn exception_return_work(deliver: impl FnMut())
 {
-    // SAFETY: the caller's contract.
-    if unsafe { preempt_if_outranked() }
+    use crate::percpu::return_work::AT_EXCEPTION;
+    // SAFETY: a return to user mode runs on a CPU whose per-CPU pointer is
+    // installed.
+    if unsafe { crate::percpu::return_work_pending() } & AT_EXCEPTION != 0
     {
         // SAFETY: the caller's contract.
-        unsafe { deliver_and_preempt(deliver) };
+        unsafe { exception_return_slow(deliver) };
     }
 }
 
-/// [`deliver_and_preempt`]'s order: `deliver`, then `preempt`, both again while
-/// `preempt` reports a reschedule, so the last step before the return is a
-/// `preempt` that kept the thread and a `deliver` follows every reschedule.
-#[expect(
-    clippy::inline_always,
-    reason = "inlined with deliver_and_preempt into every return to user mode, for the reason given there"
-)]
-#[inline(always)]
-fn deliver_then_preempt(mut deliver: impl FnMut(), mut preempt: impl FnMut() -> bool)
+/// [`exception_return_work`]'s out-of-line path.
+///
+/// # Safety
+/// As for [`exception_return_work`].
+#[cfg(not(test))]
+#[cold]
+#[inline(never)]
+unsafe fn exception_return_slow(deliver: impl FnMut())
+{
+    use crate::percpu::return_work::AT_EXCEPTION;
+    // SAFETY: a return to user mode with interrupts disabled (contract).
+    let _ = unsafe { crate::percpu::take_return_work(AT_EXCEPTION) };
+    // SAFETY: the caller's contract is preempt_if_outranked's.
+    if unsafe { preempt_if_outranked() }
+    {
+        // SAFETY: the caller's contract; the thread returns from the
+        // reschedule at the same exception's end.
+        unsafe { interrupt_return_work(deliver) };
+    }
+}
+
+/// The loop of every out-of-line return work: `take` clears the return
+/// point's bits on the CPU the thread runs on and returns those that were set;
+/// while one was, `checks` runs every check of the return point and reports
+/// whether it rescheduled. A reschedule can land the thread on another CPU,
+/// whose bits the next take reads: the dispatch there posted the kinds that
+/// follow the thread (an upcall pending on it). A bit a check posts without a
+/// reschedule (a pass that left work, a declined preemption) stays for the
+/// next return, so one return does one round of each check.
+pub(crate) fn run_return_work(mut take: impl FnMut() -> u32, mut checks: impl FnMut(u32) -> bool)
 {
     loop
     {
-        deliver();
-        if !preempt()
+        let work = take();
+        if work == 0 || !checks(work)
         {
             return;
         }
@@ -10248,36 +10429,150 @@ mod slab_tests
 }
 
 #[cfg(test)]
-mod deliver_and_preempt_tests
+mod return_work_tests
 {
-    use super::deliver_then_preempt;
+    use super::run_return_work;
 
-    // The defect caught: a thread preempted at a return to user mode resuming
-    // without a delivery point after its wait, so an upcall posted to it while
-    // it was queued, which no CPU is prodded for, waits for a later return; or
-    // a reschedule left undecided after a delivery that linked a thread.
+    // The defect caught: a reschedule at a return to user mode that leaves the
+    // work the thread's new CPU owes it (an upcall its dispatch posted)
+    // undone, or a return that loops on a bit its own checks posted again
+    // (a pass that left work, a declined preemption) instead of leaving it to
+    // the next return.
     #[test]
-    fn every_reschedule_is_followed_by_a_delivery_and_the_return_by_a_kept_check()
+    fn checks_run_again_only_after_a_reschedule_with_work_on_the_new_cpu()
     {
-        for reschedules in 0usize..4
+        // (bits each take returns, whether each round's checks reschedule)
+        let cases: &[(&[u32], &[bool], usize)] = &[
+            (&[0], &[], 0),
+            (&[1], &[false], 1),
+            (&[1, 0], &[true], 1),
+            (&[1, 2, 0], &[true, true], 2),
+            (&[1, 2], &[true, false], 2),
+        ];
+        for &(takes, reschedules, rounds) in cases
         {
-            let mut steps = Vec::new();
-            let mut left = reschedules;
-            let steps_cell = core::cell::RefCell::new(&mut steps);
-            deliver_then_preempt(
-                || steps_cell.borrow_mut().push('d'),
+            let mut take_at = 0usize;
+            let mut seen = Vec::new();
+            run_return_work(
                 || {
-                    steps_cell.borrow_mut().push('p');
-                    let rescheduled = left > 0;
-                    left = left.saturating_sub(1);
+                    let work = takes.get(take_at).copied().unwrap_or(0);
+                    take_at = take_at.saturating_add(1);
+                    work
+                },
+                |work| {
+                    let rescheduled = reschedules.get(seen.len()).copied().unwrap_or(false);
+                    seen.push(work);
                     rescheduled
                 },
             );
             assert_eq!(
-                steps.iter().collect::<String>(),
-                "dp".repeat(reschedules + 1),
-                "{reschedules} reschedules"
+                seen.len(),
+                rounds,
+                "takes {takes:?}, reschedules {reschedules:?}"
             );
+            assert!(seen.iter().all(|&w| w != 0), "a round ran on no work");
         }
+    }
+}
+
+#[cfg(test)]
+mod stopped_post_tests
+{
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use super::thread::{ThreadControlBlock, ThreadState};
+    use super::{cpus_current_on, post_stopped_to};
+    use crate::percpu::return_work::{PREEMPT, STOPPED};
+
+    /// A distinct TCB address; the scan compares addresses only.
+    fn tcb(n: usize) -> *mut ThreadControlBlock
+    {
+        core::ptr::without_provenance_mut(0x1000 * n)
+    }
+
+    // The defect caught: an `Exited` commit that posted `STOPPED` only to the
+    // first CPU found with the thread `current`, while a CPU that claimed it in
+    // its voluntary-block window also had it `current` and resumed it in user
+    // mode.
+    #[test]
+    fn a_thread_current_on_two_cpus_is_found_on_both()
+    {
+        let currents = [tcb(1), tcb(2), tcb(1), tcb(2)];
+        let found: Vec<usize> =
+            cpus_current_on(tcb(2), currents.len(), |cpu| currents[cpu]).collect();
+        assert_eq!(found, vec![1, 3]);
+    }
+
+    #[test]
+    fn a_thread_current_nowhere_or_past_the_count_is_not_found()
+    {
+        let currents = [tcb(1), tcb(1), tcb(3)];
+        assert_eq!(
+            cpus_current_on(tcb(2), currents.len(), |cpu| currents[cpu]).count(),
+            0
+        );
+        assert_eq!(cpus_current_on(tcb(3), 2, |cpu| currents[cpu]).count(), 0);
+    }
+
+    /// Four return-work words, one per CPU of a test, the second holding
+    /// `PREEMPT` already.
+    fn words() -> &'static [AtomicU32; 4]
+    {
+        Box::leak(Box::new([
+            AtomicU32::new(0),
+            AtomicU32::new(PREEMPT),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ]))
+    }
+
+    /// Each word's value.
+    fn values(words: &[AtomicU32; 4]) -> [u32; 4]
+    {
+        words.each_ref().map(|word| word.load(Ordering::Relaxed))
+    }
+
+    // The defect caught: an `Exited` commit of a thread running on a CPU that
+    // leaves that CPU's word without `STOPPED` (the post removed, or posted to
+    // the wrong CPU), so the thread goes on in user mode until a tick
+    // reschedules it; or one that clears a bit another producer posted.
+    #[test]
+    fn an_exit_of_a_running_thread_posts_stopped_to_its_cpu_alone()
+    {
+        let currents = [tcb(1), tcb(2), tcb(3), tcb(4)];
+        let words = words();
+        post_stopped_to(
+            tcb(2),
+            ThreadState::Exited,
+            currents.len(),
+            |cpu| currents[cpu],
+            |cpu| &words[cpu],
+        );
+        assert_eq!(values(words), [0, PREEMPT | STOPPED, 0, 0]);
+    }
+
+    // The defect caught: an `Exited` commit posting `STOPPED` where the
+    // thread runs on no CPU, or a commit of another state posting it, which
+    // sends a return down the slow path for nothing.
+    #[test]
+    fn an_exit_of_a_thread_running_nowhere_or_a_stop_posts_nothing()
+    {
+        let currents = [tcb(1), tcb(2), tcb(3), tcb(4)];
+        let words = words();
+        post_stopped_to(
+            tcb(5),
+            ThreadState::Exited,
+            currents.len(),
+            |cpu| currents[cpu],
+            |cpu| &words[cpu],
+        );
+        post_stopped_to(
+            tcb(2),
+            ThreadState::Stopped,
+            currents.len(),
+            |cpu| currents[cpu],
+            |cpu| &words[cpu],
+        );
+        assert_eq!(values(words), [0, PREEMPT, 0, 0]);
     }
 }

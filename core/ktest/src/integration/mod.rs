@@ -63,6 +63,7 @@ pub mod queued_waiters_fifo;
 pub mod range_copy_lineage;
 pub mod read_regs_blocked_syscall;
 pub mod reply_binding_displaced;
+pub mod return_work;
 pub mod retype_over_mapped_refused;
 pub mod retype_reclaim;
 pub mod rt_wake_preempt;
@@ -285,6 +286,7 @@ pub fn run_all(ctx: &TestContext)
         aspace_harvest_no_fault::run(ctx)
     );
     run_integration_test!("integration::thread_upcall", thread_upcall::run(ctx));
+    run_integration_test!("integration::return_work", return_work::run(ctx));
     run_integration_test!(
         "integration::fault_exception_redirect",
         fault_exception_redirect::run(ctx)

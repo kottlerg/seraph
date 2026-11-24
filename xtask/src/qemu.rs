@@ -673,20 +673,36 @@ pub enum DiskLine
     Shared,
 }
 
+/// The PCI slot a launch places its second disk at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecondSlot
+{
+    /// `SECOND_DISK_SLOT`, at [`SECOND_DISK_LOCATION`], which the split
+    /// layout's storage statement names for its data disk.
+    Named,
+    /// `MOVED_DISK_SLOT`, a location no statement mkdisk stages names: the
+    /// data disk moved off the location its statement binds its roles to.
+    Moved,
+}
+
 /// A second disk for a QEMU launch: its image, the logical block size its
-/// device presents, and whether it shares the first disk's `INTx` line.
+/// device presents, whether it shares the first disk's `INTx` line, and its
+/// slot.
 pub struct SecondDisk<'a>
 {
     pub path: &'a Path,
     /// Logical and physical block size of the `virtio-blk-pci` device, in
     /// bytes.
     pub block_size: u32,
-    /// With [`DiskLine::Shared`], place the device at
-    /// `SHARED_LINE_SECOND_DISK_SLOT`, on the first disk's `INTx` line on
-    /// both machines, rather than at `SECOND_DISK_SLOT`, on a line of its
+    /// With [`DiskLine::Shared`], place the first disk at
+    /// `SHARED_LINE_FIRST_DISK_SLOT`, on the second disk's `INTx` line on
+    /// both machines, rather than at `FIRST_DISK_SLOT`, on a line of its
     /// own, and launch both disks with no MSI-X capability, so their driver
     /// is given the shared wired line.
     pub line: DiskLine,
+    /// The second disk's slot. [`SecondSlot::Moved`] takes only
+    /// [`DiskLine::Own`].
+    pub slot: SecondSlot,
 }
 
 impl<'a> SecondDisk<'a>
@@ -702,6 +718,7 @@ impl<'a> SecondDisk<'a>
             path,
             block_size: crate::disk::logical_block_size(path)?,
             line: DiskLine::Own,
+            slot: SecondSlot::Named,
         })
     }
 }
@@ -899,7 +916,7 @@ fn build_argv(
             blk_device(
                 "hd0",
                 spec.disk_block_size,
-                spec.second_disk.as_ref().map(|_| FIRST_DISK_SLOT),
+                spec.second_disk.as_ref().map(|s| first_disk_slot(s.line)),
                 spec.iommu,
                 spec.second_disk.as_ref().map_or(DiskLine::Own, |s| s.line),
             ),
@@ -909,6 +926,10 @@ fn build_argv(
     if let Some(second) = &spec.second_disk
     {
         check_block_size(second.block_size)?;
+        if second.slot == SecondSlot::Moved && second.line == DiskLine::Shared
+        {
+            bail!("a second disk at the moved slot is on a line of its own");
+        }
         args.extend([
             "-drive".into(),
             format!("if=none,id=hd1,format=raw,file={}", second.path.display()),
@@ -916,7 +937,7 @@ fn build_argv(
             blk_device(
                 "hd1",
                 second.block_size,
-                Some(second_disk_slot(second.line)),
+                Some(second_disk_slot(second.slot)),
                 spec.iommu,
                 second.line,
             ),
@@ -1003,29 +1024,65 @@ fn gdb_args(gdb: GdbMode<'_>) -> Vec<String>
 }
 
 /// PCI slots of the two disks of a two-disk launch (a single disk takes
-/// QEMU's next free slot). On `x86_64` OVMF programs a slot's `INTA` line
-/// from `{10, 10, 11, 11}` indexed by `(slot + 1) % 4`, which pairs adjacent
-/// slots, and on riscv64 the `virt` host swizzles `INTA` onto APLIC source
-/// `32 + slot % 4`. `SECOND_DISK_SLOT`, two slots past the first, avoids
-/// the share on both machines, so the ordinary two-disk boots give each disk
-/// a line of its own. `SHARED_LINE_SECOND_DISK_SLOT`, four slots past the
-/// first, lands on the first disk's line on both machines (the same index
-/// into OVMF's table, the same APLIC source), which the shared-line boot
-/// stages on purpose. Every slot sits below 25, past which q35 routes every
-/// slot to one line, above the slots auto-placed devices take, and clear of
-/// q35's built-in slot 0x1f.
-const FIRST_DISK_SLOT: u8 = 0x10;
-const SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 2;
-const SHARED_LINE_SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 4;
+/// QEMU's next free slot). The second disk sits at `SECOND_DISK_SLOT` in
+/// every launch but the moved one, so a split layout's storage statement,
+/// which names that location ([`SECOND_DISK_LOCATION`]), finds its data disk
+/// there whatever line the launch stages. On `x86_64` OVMF programs a slot's
+/// `INTA` line from `{10, 10, 11, 11}` indexed by `(slot + 1) % 4`, which
+/// pairs adjacent slots, and on riscv64 the `virt` host swizzles `INTA` onto
+/// APLIC source `32 + slot % 4`. `FIRST_DISK_SLOT`, two slots before the
+/// second, avoids the share on both machines, so the ordinary two-disk boots
+/// give each disk a line of its own. `SHARED_LINE_FIRST_DISK_SLOT`, four
+/// slots before the second, lands on the second disk's line on both machines
+/// (the same index into OVMF's table, the same APLIC source), which the
+/// shared-line boot stages on purpose. `MOVED_DISK_SLOT`, the slot past the
+/// first, is on a line of its own beside it on both machines. Every slot
+/// sits below 25, past which q35 routes every slot to one line, above the
+/// slots auto-placed devices take, and clear of q35's built-in slot 0x1f.
+const SECOND_DISK_SLOT: u8 = 0x12;
+const FIRST_DISK_SLOT: u8 = SECOND_DISK_SLOT - 2;
+const SHARED_LINE_FIRST_DISK_SLOT: u8 = SECOND_DISK_SLOT - 4;
+const MOVED_DISK_SLOT: u8 = FIRST_DISK_SLOT + 1;
 
-/// The second disk's PCI slot: on the first disk's line when `line` is
+/// The PCI location of a two-disk launch's second disk at
+/// [`SecondSlot::Named`]: `SECOND_DISK_SLOT` on the root bus of segment 0.
+pub const SECOND_DISK_LOCATION: storage_statement::PciLocation = storage_statement::PciLocation {
+    segment: 0,
+    bus: 0,
+    device: SECOND_DISK_SLOT,
+    function: 0,
+};
+
+/// The PCI location of the disk behind the first hotplug port
+/// ([`PORT_DISK_ID`]): function 0 of device 0 on the port's secondary bus.
+/// The firmware numbers the buses below the root bus in slot order, and the
+/// first port, at the lowest slot of any bridge a launch attaches
+/// ([`HOTPLUG_PORT_DEVICE`]), takes bus 1.
+pub const PORT_DISK_LOCATION: storage_statement::PciLocation = storage_statement::PciLocation {
+    segment: 0,
+    bus: 1,
+    device: 0,
+    function: 0,
+};
+
+/// The first disk's PCI slot: on the second disk's line when `line` is
 /// [`DiskLine::Shared`].
-const fn second_disk_slot(line: DiskLine) -> u8
+const fn first_disk_slot(line: DiskLine) -> u8
 {
     match line
     {
-        DiskLine::Shared => SHARED_LINE_SECOND_DISK_SLOT,
-        DiskLine::Own => SECOND_DISK_SLOT,
+        DiskLine::Shared => SHARED_LINE_FIRST_DISK_SLOT,
+        DiskLine::Own => FIRST_DISK_SLOT,
+    }
+}
+
+/// The second disk's PCI slot.
+const fn second_disk_slot(slot: SecondSlot) -> u8
+{
+    match slot
+    {
+        SecondSlot::Named => SECOND_DISK_SLOT,
+        SecondSlot::Moved => MOVED_DISK_SLOT,
     }
 }
 
@@ -2291,6 +2348,7 @@ mod tests
             path: Path::new("disk-data.img"),
             block_size: 8192,
             line: DiskLine::Own,
+            slot: SecondSlot::Named,
         });
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(
@@ -2310,15 +2368,16 @@ mod tests
         u8::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap()
     }
 
-    /// The two disks' slots of a two-disk launch, the second placed on the
-    /// shared line or not.
-    fn disk_slots(line: DiskLine) -> (u8, u8)
+    /// The two disks' slots of a two-disk launch, the disks on one line or
+    /// not and the second at `slot`.
+    fn disk_slots(line: DiskLine, slot: SecondSlot) -> (u8, u8)
     {
         let mut spec = riscv_spec(1, 512);
         spec.second_disk = Some(SecondDisk {
             path: Path::new("disk-data.img"),
             block_size: 512,
             line,
+            slot,
         });
         let argv = build_qemu_argv(&spec).unwrap();
         (
@@ -2342,17 +2401,44 @@ mod tests
     #[test]
     fn two_disks_land_on_distinct_intx_lines_on_both_machines()
     {
-        let (first, second) = disk_slots(DiskLine::Own);
-        assert_ne!(ovmf_line(first), ovmf_line(second));
-        assert_ne!(aplic_source(first), aplic_source(second));
-        // q35 routes every slot past 24 to one line.
-        assert!(first <= 24 && second <= 24);
+        for slot in [SecondSlot::Named, SecondSlot::Moved]
+        {
+            let (first, second) = disk_slots(DiskLine::Own, slot);
+            assert_ne!(first, second);
+            assert_ne!(ovmf_line(first), ovmf_line(second));
+            assert_ne!(aplic_source(first), aplic_source(second));
+            // q35 routes every slot past 24 to one line.
+            assert!(first <= 24 && second <= 24);
+        }
+    }
+
+    // Defect caught: a launch that places the split layout's data disk
+    // elsewhere than the location its storage statement names, so its
+    // roles are not taken; or a moved launch that leaves it there.
+    #[test]
+    fn the_second_disk_sits_at_its_statement_location_unless_moved()
+    {
+        assert_eq!(SECOND_DISK_LOCATION.device, SECOND_DISK_SLOT);
+        for line in [DiskLine::Own, DiskLine::Shared]
+        {
+            assert_eq!(disk_slots(line, SecondSlot::Named).1, SECOND_DISK_SLOT);
+        }
+        let (first, moved) = disk_slots(DiskLine::Own, SecondSlot::Moved);
+        assert!(moved != SECOND_DISK_SLOT && first != SECOND_DISK_SLOT);
+        let mut spec = riscv_spec(1, 512);
+        spec.second_disk = Some(SecondDisk {
+            path: Path::new("disk-data.img"),
+            block_size: 512,
+            line: DiskLine::Shared,
+            slot: SecondSlot::Moved,
+        });
+        build_qemu_argv(&spec).unwrap_err();
     }
 
     #[test]
     fn shared_line_disks_land_on_one_intx_line_on_both_machines()
     {
-        let (first, second) = disk_slots(DiskLine::Shared);
+        let (first, second) = disk_slots(DiskLine::Shared, SecondSlot::Named);
         assert_ne!(first, second);
         assert_eq!(ovmf_line(first), ovmf_line(second));
         assert_eq!(aplic_source(first), aplic_source(second));
@@ -2371,6 +2457,7 @@ mod tests
                 path: Path::new("disk-data.img"),
                 block_size: 512,
                 line,
+                slot: SecondSlot::Named,
             });
             let argv = build_qemu_argv(&spec).unwrap();
             for drive in ["hd0", "hd1"]
@@ -2408,6 +2495,7 @@ mod tests
                 path: Path::new("second.img"),
                 block_size: size,
                 line: DiskLine::Own,
+                slot: SecondSlot::Named,
             });
             assert!(build_qemu_argv(&spec).is_err(), "second disk {size}");
         }
@@ -2431,6 +2519,7 @@ mod tests
                 path: Path::new("second.img"),
                 block_size: 512,
                 line: DiskLine::Own,
+                slot: SecondSlot::Named,
             });
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(argv.iter().any(|a| a == iommu_device));
@@ -2511,7 +2600,7 @@ mod tests
                         .unwrap();
                     let slot = addr.split('.').next().unwrap();
                     let slot = u8::from_str_radix(slot, 16).unwrap();
-                    assert!(slot > SHARED_LINE_SECOND_DISK_SLOT && slot < 25, "{d}");
+                    assert!(slot > SECOND_DISK_SLOT && slot < 25, "{d}");
                 }
             }
         }

@@ -27,7 +27,8 @@ use crate::context::Context as BuildContext;
 use crate::disk::{logical_block_size, second_disk_block_size};
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv_for, validate_sysroot_for_launch,
+    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, SecondSlot, build_qemu_argv_for,
+    validate_sysroot_for_launch,
 };
 use crate::term::filter::FilterWriter;
 use crate::term::guard::TerminalGuard;
@@ -116,6 +117,7 @@ fn boot_qemu(
             path,
             block_size: second_disk_block_size(path, launch.second_disk_block_size)?,
             line: launch.second_disk_line(),
+            slot: SecondSlot::Named,
         }),
         None => None,
     };

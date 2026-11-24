@@ -15,8 +15,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::{
-    ErrorKind, GUID_TEXT_LEN, MAX_PATH_LEN, Named, Role, format_guid, is_mount_path, parse,
-    parse_guid, parse_line, split_line,
+    DISK_TEXT_MAX, Disk, ErrorKind, GUID_TEXT_LEN, MAX_PATH_LEN, Named, Role, format_guid,
+    is_mount_path, parse, parse_guid, parse_line, split_line,
 };
 
 /// Check the parser's contract on `input`: read as a whole statement, and
@@ -34,6 +34,10 @@ pub fn storage_statement_holds(input: &[u8])
         {
             path_holds(path);
         }
+        if let Some(disk) = reading.before_last
+        {
+            disk_holds(disk);
+        }
         guid_holds(reading.last);
         split_holds(line);
         line_holds(line);
@@ -48,6 +52,8 @@ struct Reading<'a>
     first: &'a [u8],
     /// The bytes between the first space and the next, or the line's end.
     second: Option<&'a [u8]>,
+    /// The bytes between the last space but one and the last.
+    before_last: Option<&'a [u8]>,
     /// The bytes after the last space, or the whole line.
     last: &'a [u8],
     /// How many fields the spaces part the line into.
@@ -62,6 +68,7 @@ fn read_fields(line: &[u8]) -> Reading<'_>
     let mut reading = Reading {
         first: line,
         second: None,
+        before_last: None,
         last: line,
         count: 0,
         empty: false,
@@ -81,6 +88,10 @@ fn read_fields(line: &[u8]) -> Reading<'_>
             1 => reading.second = Some(field),
             _ =>
             {}
+        }
+        if reading.count > 0
+        {
+            reading.before_last = Some(reading.last);
         }
         reading.last = field;
         reading.count = reading.count.saturating_add(1);
@@ -141,6 +152,95 @@ pub(crate) fn guid_form(text: &[u8]) -> bool
         })
 }
 
+/// The value of the hex digit `byte`, either case, read apart from the
+/// parser's.
+fn nibble(byte: u8) -> Option<u8>
+{
+    match byte
+    {
+        b'0'..=b'9' => Some(byte.wrapping_sub(b'0')),
+        b'a'..=b'f' => Some(byte.wrapping_sub(b'a').wrapping_add(10)),
+        b'A'..=b'F' => Some(byte.wrapping_sub(b'A').wrapping_add(10)),
+        _ => None,
+    }
+}
+
+/// Whether `text` is a disk field, read byte by byte: `boot`, or 16 bytes
+/// of `pci:`, then a hex digit at every place but a `:` at offsets 8 and
+/// 11 and a `.` at 14, the two digits at 12 and 13 at most `1f` and the
+/// one at 15 a digit from 0 to 7.
+pub(crate) fn disk_form(text: &[u8]) -> bool
+{
+    if text == b"boot"
+    {
+        return true;
+    }
+    text.len() == DISK_TEXT_MAX
+        && text.starts_with(b"pci:")
+        && text.iter().enumerate().skip(4).all(|(at, &byte)| match at
+        {
+            8 | 11 => byte == b':',
+            14 => byte == b'.',
+            12 => matches!(byte, b'0' | b'1'),
+            15 => (b'0'..=b'7').contains(&byte),
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+/// The number the hex digits `digits` write, read apart from the parser.
+fn hex_number(digits: &[u8]) -> Option<u32>
+{
+    digits.iter().try_fold(0u32, |value, &byte| {
+        Some(
+            value
+                .wrapping_mul(16)
+                .wrapping_add(u32::from(nibble(byte)?)),
+        )
+    })
+}
+
+/// [`Disk::parse`] reads exactly the disk fields in their form, each
+/// location's segment, bus, device and function the numbers its digits
+/// write, and [`Disk::text`] writes the disk it read back as the field in
+/// lowercase.
+pub(crate) fn disk_holds(text: &[u8])
+{
+    let parsed = Disk::parse(text);
+    assert_eq!(
+        parsed.is_some(),
+        disk_form(text),
+        "a disk field judged against its form"
+    );
+    match parsed
+    {
+        None | Some(Disk::Boot) =>
+        {}
+        Some(Disk::Pci(at)) =>
+        {
+            let digits = |from: usize, to: usize| text.get(from..to).and_then(hex_number);
+            assert_eq!(
+                [
+                    Some(u32::from(at.segment)),
+                    Some(u32::from(at.bus)),
+                    Some(u32::from(at.device)),
+                    Some(u32::from(at.function)),
+                ],
+                [digits(4, 8), digits(9, 11), digits(12, 14), digits(15, 16)],
+                "a location read as other numbers than its digits write"
+            );
+        }
+    }
+    if let Some(disk) = parsed
+    {
+        let (written, len) = disk.text();
+        assert_eq!(
+            written.get(..len),
+            Some(&text.to_ascii_lowercase()[..]),
+            "a disk read as other bytes than its field writes"
+        );
+    }
+}
+
 /// [`is_mount_path`] takes exactly the paths [`path_form`] reads as one.
 pub(crate) fn path_holds(path: &[u8])
 {
@@ -174,8 +274,10 @@ pub(crate) fn guid_holds(text: &[u8])
 /// [`split_line`] reads a line's fields at their places: the role whose
 /// keyword the line starts with, followed by a space or the line's end;
 /// then, when the role takes a path, a path of at least one byte and a
-/// space; then a field of the last [`GUID_TEXT_LEN`] bytes, and nothing
-/// else. Each field is the very bytes of the line at its place.
+/// space; then a disk field of at least one byte holding no space when the
+/// role takes a path, a space, and a field of the last [`GUID_TEXT_LEN`]
+/// bytes, and nothing else. Each field is the very bytes of the line at its
+/// place.
 pub(crate) fn split_holds(line: &[u8])
 {
     let result = split_line(line);
@@ -194,37 +296,63 @@ pub(crate) fn split_holds(line: &[u8])
         return;
     };
     let start = role.keyword().len().saturating_add(1);
-    let len = line.len();
-    let guid_at = len.saturating_sub(GUID_TEXT_LEN);
-    let fits = if role.takes_path()
-    {
-        len >= start.saturating_add(2).saturating_add(GUID_TEXT_LEN)
-            && line.get(guid_at.saturating_sub(1)) == Some(&b' ')
-    }
-    else
-    {
-        len == start.saturating_add(GUID_TEXT_LEN)
-    };
-    match result
-    {
-        Ok((taken, path, guid)) =>
+    let guid_at = line.len().saturating_sub(GUID_TEXT_LEN);
+    // The bytes between the keyword's space and the GUID's, when the line
+    // holds both spaces.
+    let head = (line.len() >= start.saturating_add(1).saturating_add(GUID_TEXT_LEN)
+        && line.get(guid_at.saturating_sub(1)) == Some(&b' '))
+    .then(|| {
+        line.get(start..guid_at.saturating_sub(1))
+            .unwrap_or_default()
+    });
+    // The offset in `head` of the disk field's first byte: past the last
+    // space a path-taking role's head holds, else its start.
+    let expected = head.and_then(|head| {
+        let mut disk_from = None;
+        for (at, &byte) in head.iter().enumerate()
         {
-            assert!(fits, "a line read into fields not at their places");
+            if byte == b' '
+            {
+                disk_from = Some(at.saturating_add(1));
+            }
+        }
+        let (path, disk) = if role.takes_path()
+        {
+            let from = disk_from?;
+            (
+                Some(head.get(..from.saturating_sub(1)).unwrap_or_default()),
+                head.get(from..).unwrap_or_default(),
+            )
+        }
+        else
+        {
+            (None, head)
+        };
+        (path.is_none_or(|path| !path.is_empty()) && !disk.is_empty()).then_some((path, disk))
+    });
+    assert!(
+        result.is_err() || expected.is_some(),
+        "a line read into fields not at their places"
+    );
+    match (result, expected)
+    {
+        (Ok((taken, path, disk, guid)), Some((expected_path, expected_disk))) =>
+        {
             assert_eq!(taken, role, "a line read as another role");
             assert!(
                 core::ptr::eq(guid, line.get(guid_at..).unwrap_or_default()),
                 "a GUID field read from another place"
             );
-            let expected = role.takes_path().then(|| {
-                line.get(start..guid_at.saturating_sub(1))
-                    .unwrap_or_default()
-            });
+            assert!(
+                core::ptr::eq(disk, expected_disk),
+                "a disk field read from another place"
+            );
             assert_eq!(
                 path.is_some(),
-                expected.is_some(),
+                expected_path.is_some(),
                 "a path field read or missed"
             );
-            if let (Some(path), Some(expected)) = (path, expected)
+            if let (Some(path), Some(expected)) = (path, expected_path)
             {
                 assert!(
                     core::ptr::eq(path, expected),
@@ -232,10 +360,13 @@ pub(crate) fn split_holds(line: &[u8])
                 );
             }
         }
-        Err(kind) =>
+        // Refused by the assertion above.
+        (Ok(_), None) =>
+        {}
+        (Err(kind), expected) =>
         {
             assert!(
-                kind == ErrorKind::Fields && !fits,
+                kind == ErrorKind::Fields && expected.is_none(),
                 "a line of fields at their places refused as {kind:?}"
             );
         }
@@ -243,9 +374,9 @@ pub(crate) fn split_holds(line: &[u8])
 }
 
 /// [`parse_line`] skips exactly an empty line and a comment; a line it
-/// takes is the role's keyword, its path when it takes one, and the GUID,
-/// joined by single spaces, which the entry writes back; and each refusal
-/// names a field that is not in its form.
+/// takes is the role's keyword, its path when it takes one, the disk and the
+/// GUID, joined by single spaces, which the entry writes back; and each
+/// refusal names a field that is not in its form.
 pub(crate) fn line_holds(line: &[u8])
 {
     let result = parse_line(line);
@@ -259,11 +390,12 @@ pub(crate) fn line_holds(line: &[u8])
     let role = Role::ALL
         .into_iter()
         .find(|role| role.keyword().as_bytes() == reading.first);
-    let arity = role.map_or(0, |role| if role.takes_path() { 3 } else { 2 });
+    let arity = role.map_or(0, |role| if role.takes_path() { 4 } else { 3 });
     assert!(
         !matches!(result, Ok(None)),
         "a line naming a partition was skipped"
     );
+    let disk_field = reading.before_last.unwrap_or_default();
     match result
     {
         Ok(None) =>
@@ -282,6 +414,12 @@ pub(crate) fn line_holds(line: &[u8])
                 assert_eq!(reading.second, Some(path), "a path read as another");
                 assert!(path_form(path), "a path out of its form was taken");
             }
+            assert!(disk_form(disk_field), "a disk out of its form was taken");
+            assert_eq!(
+                Disk::parse(disk_field),
+                Some(entry.disk),
+                "a disk read as another"
+            );
             let text = reading.last;
             assert!(guid_form(text), "a GUID out of its form was taken");
             assert!(
@@ -290,41 +428,47 @@ pub(crate) fn line_holds(line: &[u8])
             );
             let mut written = String::new();
             crate::render_line(&entry, &mut written);
-            // The GUID is written in lowercase; the rest of the line, its
-            // path among it, keeps its case.
-            let kept = line.len().saturating_sub(text.len());
+            // The disk and the GUID are written in lowercase; the rest of the
+            // line, its path among it, keeps its case.
+            let kept = line
+                .len()
+                .saturating_sub(text.len())
+                .saturating_sub(1)
+                .saturating_sub(disk_field.len());
             assert!(
                 written.len() == line.len()
                     && written.as_bytes().get(..kept) == line.get(..kept)
-                    && written.as_bytes().get(kept..) == Some(&format_guid(&entry.guid)[..]),
+                    && written.as_bytes().get(kept..)
+                        == Some(&line.get(kept..).unwrap_or_default().to_ascii_lowercase()[..]),
                 "a line taken does not write back as itself"
             );
         }
         Err(kind) =>
         {
-            // The parser reads its fields by place (`parse_line`): a field
-            // of another number, an empty one, or a last one not of a GUID's
-            // length is a fault of the fields; a space within the path makes
-            // a field too many, which it reads as a fault of the path.
+            // The parser reads the keyword and the GUID by place and the disk
+            // field after the last space before the GUID's (`split_line`): a
+            // field of another number, an empty one, or a last one not of a
+            // GUID's length is a fault of the fields; a space within the
+            // path, or within a `swap` line's disk field, makes a field too
+            // many, which it reads as a fault of that field.
             let path = reading.second.unwrap_or_default();
+            let fields_differ = reading.count != arity || reading.empty;
             let justified = match kind
             {
                 ErrorKind::UnknownRole => role.is_none(),
                 ErrorKind::Fields =>
                 {
-                    role.is_some()
-                        && (reading.count != arity
-                            || reading.empty
-                            || reading.last.len() != GUID_TEXT_LEN)
+                    role.is_some() && (fields_differ || reading.last.len() != GUID_TEXT_LEN)
                 }
                 ErrorKind::Path =>
                 {
-                    role.is_some_and(Role::takes_path) && (reading.count != 3 || !path_form(path))
+                    role.is_some_and(Role::takes_path) && (fields_differ || !path_form(path))
                 }
+                ErrorKind::Disk => role.is_some() && (fields_differ || !disk_form(disk_field)),
                 ErrorKind::Guid => !guid_form(reading.last),
                 ErrorKind::NoFinalNewline
                 | ErrorKind::PathRepeated
-                | ErrorKind::GuidRepeated
+                | ErrorKind::PartitionRepeated
                 | ErrorKind::RoleRepeated
                 | ErrorKind::OutOfMemory => false,
             };
@@ -333,12 +477,18 @@ pub(crate) fn line_holds(line: &[u8])
     }
 }
 
+/// Whether `a` and `b` name one partition: one GUID on one disk.
+fn same_partition(a: &Named, b: &Named) -> bool
+{
+    a.disk == b.disk && a.guid == b.guid
+}
+
 /// Whether `later` conflicts with `earlier`, judged apart from the parser:
-/// one partition, one mount path, or a role that takes one partition named
-/// by both.
+/// one partition (one GUID on one disk), one mount path, or a role that
+/// takes one partition named by both.
 fn conflicts(earlier: &Named, later: &Named) -> bool
 {
-    earlier.guid == later.guid
+    same_partition(earlier, later)
         || earlier.path.is_some() && earlier.path == later.path
         || earlier.role == later.role && !later.role.repeats()
 }
@@ -406,7 +556,7 @@ pub(crate) fn statement_holds(input: &[u8])
             {
                 assert_eq!(
                     statement.named(entry.role, entry.path.as_deref().map(str::as_bytes)),
-                    Some(entry.guid),
+                    Some(entry),
                     "an entry the statement holds is not named"
                 );
             }
@@ -430,13 +580,14 @@ pub(crate) fn statement_holds(input: &[u8])
             assert_eq!(error.line, line, "a conflict refused at another line");
             let justified = entries.iter().any(|earlier| match error.kind
             {
-                ErrorKind::GuidRepeated => earlier.guid == entry.guid,
+                ErrorKind::PartitionRepeated => same_partition(earlier, &entry),
                 ErrorKind::PathRepeated => earlier.path.is_some() && earlier.path == entry.path,
                 ErrorKind::RoleRepeated => earlier.role == entry.role && !entry.role.repeats(),
                 ErrorKind::NoFinalNewline
                 | ErrorKind::UnknownRole
                 | ErrorKind::Fields
                 | ErrorKind::Path
+                | ErrorKind::Disk
                 | ErrorKind::Guid
                 | ErrorKind::OutOfMemory => false,
             });

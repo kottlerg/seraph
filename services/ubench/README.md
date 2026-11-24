@@ -25,7 +25,7 @@ cargo xtask run --arch x86_64 --icount --cpus 1 --display framebuffer --runs 1 -
     --save-logs target/xtask/bench/ubench
 ```
 
-`--icount` on the release build gives the counts the `bench` cell compares, since the cell builds
+`--icount` on the release build gives the counts the `bench` cell compares, since the cell boots
 the release profile ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell));
 without `--icount` the counts are time on the host. A boot without `--display framebuffer` has no
 framebuffer, and `console_write` logs a SKIP line. The recipe seeds `devmgr.class.framebuffer`, the

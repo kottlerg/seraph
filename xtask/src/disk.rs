@@ -122,10 +122,38 @@ pub enum DataPlacement
     #[default]
     MainImage,
     /// `disk.img` carries the ESP and root; `disk-data.img` carries the data
-    /// and swap partitions, for a boot that attaches it as a second disk, and
-    /// the root partition the storage statement that names them
-    /// ([`STATEMENT`]).
-    SecondImage,
+    /// and swap partitions, for a boot that attaches it as a second disk at
+    /// the location `DataDisk` names, and the root partition the storage
+    /// statement that names them on that disk ([`statement`]).
+    SecondImage(DataDisk),
+}
+
+/// Where the boot of a split layout attaches `disk-data.img`, which its
+/// storage statement names as the disk of the data and swap partitions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DataDisk
+{
+    /// The second disk's slot of a two-disk launch
+    /// ([`crate::qemu::SECOND_DISK_LOCATION`]).
+    #[default]
+    Slot,
+    /// Behind the first hotplug port
+    /// ([`crate::qemu::PORT_DISK_LOCATION`]).
+    HotplugPort,
+}
+
+impl DataDisk
+{
+    /// The disk a storage statement names for this location.
+    #[must_use]
+    pub const fn disk(self) -> storage_statement::Disk
+    {
+        storage_statement::Disk::Pci(match self
+        {
+            Self::Slot => crate::qemu::SECOND_DISK_LOCATION,
+            Self::HotplugPort => crate::qemu::PORT_DISK_LOCATION,
+        })
+    }
 }
 
 /// The images [`create_disk_image`] authors and their block size.
@@ -146,7 +174,7 @@ impl DiskLayout
     #[must_use]
     pub fn second_image(self, ctx: &BuildContext) -> Option<PathBuf>
     {
-        (self.data == DataPlacement::SecondImage).then(|| ctx.data_disk_image())
+        matches!(self.data, DataPlacement::SecondImage(_)).then(|| ctx.data_disk_image())
     }
 }
 
@@ -319,7 +347,7 @@ fn pack(
     };
     let data_image = ctx.data_disk_image();
     author_images(&image_path, &data_image, arch, layout, &sources)?;
-    if layout.data == DataPlacement::SecondImage
+    if matches!(layout.data, DataPlacement::SecondImage(_))
     {
         step(&format!("Data partition image: {}", data_image.display()));
     }
@@ -336,7 +364,7 @@ fn pack(
     };
     crate::image_check::check(
         &image_path,
-        (layout.data == DataPlacement::SecondImage).then_some(data_image.as_path()),
+        matches!(layout.data, DataPlacement::SecondImage(_)).then_some(data_image.as_path()),
         esp,
         &ctx.target_dir.join("xtask").join("image-check"),
     )?;
@@ -413,7 +441,7 @@ fn author_images(
                     .with_context(|| format!("failed to remove stale {}", data_image.display()))?;
             }
         }
-        DataPlacement::SecondImage =>
+        DataPlacement::SecondImage(_) =>
         {
             write_image(main_image, layout.block_size, MAIN_DISK_GUID, &[esp, root])?;
             write_image(data_image, layout.block_size, DATA_DISK_GUID, &[data, swap])?;
@@ -475,19 +503,27 @@ pub fn create_foreign_image(
     )
 }
 
-/// The storage statement the split layout stages, at
-/// `storage_statement::PATH` on the root partition: the data partition at
-/// `/data` and the swap partition, each by its unique GUID, both on
-/// `disk-data.img`.
-pub static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+/// The storage statement the split layout stages for `disk-data.img` at
+/// `at`, at `storage_statement::PATH` on the root partition: the data
+/// partition at `/data` and the swap partition, each by its unique GUID,
+/// both on the disk at `at`'s location.
+#[must_use]
+pub fn statement(at: DataDisk) -> String
+{
     let mut statement = storage_statement::Statement::new();
     let named = [
         storage_statement::Named::new(
             storage_statement::Role::Data,
             Some("/data"),
+            at.disk(),
             DATA_UNIQUE_GUID,
         ),
-        storage_statement::Named::new(storage_statement::Role::Swap, None, SWAP_UNIQUE_GUID),
+        storage_statement::Named::new(
+            storage_statement::Role::Swap,
+            None,
+            at.disk(),
+            SWAP_UNIQUE_GUID,
+        ),
     ];
     // Two distinct GUIDs, one data path and one swap: the parser's grammar
     // takes both (the statement_parses test).
@@ -496,23 +532,25 @@ pub static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
         let _ = statement.push(entry);
     }
     statement.render()
-});
+}
 
 /// Stage the storage statement in `sysroot` for a pack whose data
-/// placement is `data`: [`STATEMENT`] at `storage_statement::PATH` for
-/// [`DataPlacement::SecondImage`], which the pack then signs
-/// (`crate::signing::sign_sysroot`); for [`DataPlacement::MainImage`], a
-/// statement there whose bytes are [`STATEMENT`]'s is removed, since its
-/// partitions are on `disk.img`, and any other statement is the deployer's
-/// and is left. Fails when the staged text is one vfsd's parser refuses.
+/// placement is `data`: [`statement`] of its location at
+/// `storage_statement::PATH` for [`DataPlacement::SecondImage`], which the
+/// pack then signs (`crate::signing::sign_sysroot`); for
+/// [`DataPlacement::MainImage`], a statement there whose bytes are one
+/// [`statement`] writes is removed, since its partitions are on `disk.img`,
+/// and any other statement is the deployer's and is left. Fails when the
+/// staged text is one vfsd's parser refuses.
 fn stage_statement(sysroot: &Path, data: DataPlacement) -> Result<()>
 {
     let path = sysroot.join(storage_statement::PATH.trim_start_matches('/'));
     match data
     {
-        DataPlacement::SecondImage =>
+        DataPlacement::SecondImage(at) =>
         {
-            storage_statement::parse(STATEMENT.as_bytes())
+            let text = statement(at);
+            storage_statement::parse(text.as_bytes())
                 .map_err(|e| err!("the staged storage statement is refused: {e}"))?;
             if let Some(dir) = path.parent()
             {
@@ -521,15 +559,15 @@ fn stage_statement(sysroot: &Path, data: DataPlacement) -> Result<()>
             }
             // A statement already staged keeps its signature when its body
             // is the one staged.
-            if !holds_statement(&path)
+            if holds_statement(&path) != Some(at)
             {
-                fs::write(&path, STATEMENT.as_bytes())
+                fs::write(&path, text.as_bytes())
                     .with_context(|| format!("failed to write {}", path.display()))?;
             }
         }
         DataPlacement::MainImage =>
         {
-            if holds_statement(&path)
+            if holds_statement(&path).is_some()
             {
                 fs::remove_file(&path)
                     .with_context(|| format!("failed to remove {}", path.display()))?;
@@ -539,13 +577,15 @@ fn stage_statement(sysroot: &Path, data: DataPlacement) -> Result<()>
     Ok(())
 }
 
-/// Whether the file at `path` is [`STATEMENT`], signed or not
-/// (`crate::signing::body_of`).
-fn holds_statement(path: &Path) -> bool
+/// The location whose [`statement`] the file at `path` is, signed or not
+/// (`crate::signing::body_of`), if it is one.
+fn holds_statement(path: &Path) -> Option<DataDisk>
 {
-    fs::read(path).is_ok_and(|bytes| {
-        crate::signing::body_of(&bytes).is_ok_and(|body| body == STATEMENT.as_bytes())
-    })
+    let bytes = fs::read(path).ok()?;
+    let body = crate::signing::body_of(&bytes).ok()?;
+    [DataDisk::Slot, DataDisk::HotplugPort]
+        .into_iter()
+        .find(|&at| body == statement(at).as_bytes())
 }
 
 /// Start LBA of each of `volumes`, laid end to end after [`IMAGE_MARGIN`],
@@ -630,7 +670,8 @@ pub fn logical_block_size(path: &Path) -> Result<u32>
 }
 
 /// The layout the sysroot's disk images have now: `disk.img`'s block size,
-/// and the data partition on `disk-data.img` when that image is there. A
+/// and the data partition on `disk-data.img` at the second disk's slot when
+/// that image is there. A
 /// command that stages a file for one boot and restores it afterwards repacks
 /// in this layout both times, so a 4Kn or split image stays one.
 ///
@@ -659,7 +700,7 @@ fn image_layout(main_image: &Path, data_image: &Path) -> Result<DiskLayout>
     };
     let data = if data_image.is_file()
     {
-        DataPlacement::SecondImage
+        DataPlacement::SecondImage(DataDisk::Slot)
     }
     else
     {
@@ -1151,7 +1192,10 @@ mod tests
     #[test]
     fn two_authorings_of_a_layout_write_identical_images()
     {
-        for data in [DataPlacement::MainImage, DataPlacement::SecondImage]
+        for data in [
+            DataPlacement::MainImage,
+            DataPlacement::SecondImage(DataDisk::Slot),
+        ]
         {
             let layout = DiskLayout {
                 block_size: BlockSize::B512,
@@ -1270,7 +1314,7 @@ mod tests
         let data_image = scratch.0.join("disk-data.img");
         let layout = DiskLayout {
             block_size: BlockSize::B4096,
-            data: DataPlacement::SecondImage,
+            data: DataPlacement::SecondImage(DataDisk::Slot),
         };
         author_images(
             &main,
@@ -1314,23 +1358,39 @@ mod tests
         let scratch = Scratch::new("statement");
         let sysroot = scratch.0.join("sysroot");
         let path = sysroot.join(storage_statement::PATH.trim_start_matches('/'));
-        stage_statement(&sysroot, DataPlacement::SecondImage).unwrap();
-        let staged = fs::read(&path).unwrap();
-        assert_eq!(staged, STATEMENT.as_bytes());
-        let statement = storage_statement::parse(&staged).unwrap();
+        for at in [DataDisk::HotplugPort, DataDisk::Slot]
+        {
+            stage_statement(&sysroot, DataPlacement::SecondImage(at)).unwrap();
+            let staged = fs::read(&path).unwrap();
+            assert_eq!(staged, statement(at).as_bytes());
+            let staged = storage_statement::parse(&staged).unwrap();
+            let named = |role, path: Option<&[u8]>| {
+                staged
+                    .named(role, path)
+                    .map(|entry| (entry.disk, entry.guid))
+            };
+            assert_eq!(
+                named(storage_statement::Role::Data, Some(b"/data")),
+                Some((at.disk(), DATA_UNIQUE_GUID))
+            );
+            assert_eq!(
+                named(storage_statement::Role::Swap, None),
+                Some((at.disk(), SWAP_UNIQUE_GUID))
+            );
+        }
         assert_eq!(
-            statement.named(storage_statement::Role::Data, Some(b"/data")),
-            Some(DATA_UNIQUE_GUID)
+            DataDisk::Slot.disk().to_string(),
+            "pci:0000:00:12.0",
+            "the slot's statement names another location"
         );
-        assert_eq!(
-            statement.named(storage_statement::Role::Swap, None),
-            Some(SWAP_UNIQUE_GUID)
-        );
-        assert_eq!(statement.entries().len(), 2);
+        assert_eq!(DataDisk::HotplugPort.disk().to_string(), "pci:0000:01:00.0");
+        stage_statement(&sysroot, DataPlacement::MainImage).unwrap();
+        assert!(!path.exists());
+        stage_statement(&sysroot, DataPlacement::SecondImage(DataDisk::HotplugPort)).unwrap();
         stage_statement(&sysroot, DataPlacement::MainImage).unwrap();
         assert!(!path.exists());
         // A statement of other bytes is the deployer's: it stays.
-        let own = b"swap 00000000-0000-0000-0000-000000000001\n";
+        let own = b"swap boot 00000000-0000-0000-0000-000000000001\n";
         fs::write(&path, own).unwrap();
         stage_statement(&sysroot, DataPlacement::MainImage).unwrap();
         assert_eq!(fs::read(&path).unwrap(), own);
@@ -1402,7 +1462,10 @@ mod tests
     {
         for block_size in [BlockSize::B512, BlockSize::B4096]
         {
-            for data in [DataPlacement::MainImage, DataPlacement::SecondImage]
+            for data in [
+                DataPlacement::MainImage,
+                DataPlacement::SecondImage(DataDisk::Slot),
+            ]
             {
                 let layout = DiskLayout { block_size, data };
                 let scratch = Scratch::new(&format!("layout-{}-{data:?}", block_size.bytes()));
@@ -1416,7 +1479,10 @@ mod tests
                 let read = image_layout(&main, &data_image).unwrap();
                 author_images(&main, &data_image, Arch::X86_64, read, &sources).unwrap();
                 assert_eq!(image_layout(&main, &data_image).unwrap(), layout);
-                assert_eq!(data_image.is_file(), data == DataPlacement::SecondImage);
+                assert_eq!(
+                    data_image.is_file(),
+                    data == DataPlacement::SecondImage(DataDisk::Slot)
+                );
             }
         }
     }
@@ -1435,7 +1501,7 @@ mod tests
         {
             let split = DiskLayout {
                 block_size,
-                data: DataPlacement::SecondImage,
+                data: DataPlacement::SecondImage(DataDisk::Slot),
             };
             assert_eq!(split.second_image(&ctx), Some(ctx.data_disk_image()));
             let single = DiskLayout {

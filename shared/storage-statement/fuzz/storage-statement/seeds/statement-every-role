@@ -1,5 +1,5 @@
 # The split layout: data and swap on a second disk.
 
-data /data c0ffee01-2345-6789-abcd-ef0123456789
-data /srv/cache 00000000-0000-0000-0000-0000000000aa
-swap 5A9F0E11-2345-6789-ABCD-EF0123456789
+data /data pci:0000:00:12.0 c0ffee01-2345-6789-abcd-ef0123456789
+data /srv/cache boot 00000000-0000-0000-0000-0000000000aa
+swap pci:AB01:cD:1f.7 5A9F0E11-2345-6789-ABCD-EF0123456789

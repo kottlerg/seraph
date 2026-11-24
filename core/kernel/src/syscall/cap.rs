@@ -1491,9 +1491,12 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     }
 }
 
-/// Leaves materialised per `CSpace`-lock hold while pre-growing for an
-/// explicit destination slot (each leaf costs one page zeroing plus
-/// free-list threading; 64 keeps the interrupts-off hold small).
+/// Leaves materialised per `CSpace`-lock hold, and per stretch with
+/// interrupts masked, while pre-growing for an explicit destination slot
+/// (each leaf costs one page zeroing plus free-list threading). Batching
+/// keeps every hold to this many leaves, and an `interrupt_window` between
+/// batches keeps the syscall's interrupts-off stretches to one batch each,
+/// whatever slot the caller chose.
 #[cfg(not(test))]
 const MAX_GROW_LEAVES_PER_HOLD: usize = 64;
 
@@ -1502,7 +1505,15 @@ const MAX_GROW_LEAVES_PER_HOLD: usize = 64;
 /// takes `DERIVATION_LOCK` and the `CSpace` lock pair. Keeps the
 /// unbounded-donation growth out of the heavyweight critical sections:
 /// `insert_cap_at`'s own grow loop then runs zero iterations (leaves never
-/// un-grow).
+/// un-grow). The syscall runs with interrupts masked, and the lock's release
+/// restores that state, so the batches alone would leave the whole growth,
+/// whose length the caller's `index` chooses, masked: the interrupts pending
+/// on this CPU are taken between batches (`cap::object::interrupt_window`),
+/// with no lock held.
+///
+/// The caller holds no lock, and pins the destination wrapper across the
+/// call (its `dest_cs_slot`), so the `CSpace` outlives an interrupt taken
+/// between batches.
 ///
 /// Fails fast with `OutOfMemory` — before consuming a single pool page —
 /// when the pool budget cannot cover the remaining growth, so a doomed
@@ -1562,10 +1573,10 @@ fn pre_grow_for_explicit_slot(
         match step
         {
             Ok(true) => return Ok(()),
-            // Leaf batch for this hold spent with leaves still missing: the
-            // next iteration takes a fresh hold.
-            Ok(false) =>
-            {}
+            // Leaf batch for this hold spent with leaves still missing: take
+            // the interrupts pending on this CPU with no lock held, then a
+            // fresh hold.
+            Ok(false) => crate::cap::object::interrupt_window(),
             Err(e) => return Err(e),
         }
     }

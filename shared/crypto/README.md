@@ -76,9 +76,10 @@ creates.
   tool may enable it: xtask, the host signer, enables it, and no component built
   for the target does. A component built for the target MUST NOT enable it, so
   that a loader (the bootloader, procmgr) compiles no signing code: `cargo xtask
-  build` builds the components of one build profile in a single Cargo
-  invocation, which resolves one feature set for all of them, so a feature one
-  component enables reaches every loader built beside it. xtask is a host
+  build` builds the components of one layer of one build profile in a single
+  Cargo invocation, which resolves one feature set for all of them, so a
+  feature one component enables reaches every loader built in its invocation
+  (procmgr, with the services). xtask is a host
   binary, built in an invocation of its own outside every component group.
 - **Key generation from the caller's seed.** A key is a 32-byte secret seed and
   the public key `ed25519_public_key` derives from it; the crate draws no

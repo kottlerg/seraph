@@ -33,7 +33,8 @@ holding memory critical calls `top_up` every `TICK_MS` after, taking back what o
 The process's death gives everything back.
 
 The crate calls memmgr through the runtime (`std::os::seraph`), so it builds only for Seraph and
-has no host tests; the svctest `oom_policy` phase and the crashme tester exercise it.
+has no host tests; the svctest `oom_policy` and
+`crashd_oom_hold` phases exercise it.
 
 ---
 

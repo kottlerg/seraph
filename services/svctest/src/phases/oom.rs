@@ -9,7 +9,7 @@
 //! `OOMD_STOP=no`, nothing stops it. With the `stopsrc` fixture staged, oomd
 //! first stops the job that stop source lists, since the program class is
 //! stopped before the service class. svctest opens an operator session whose
-//! shell runs a job larger than `stopsrc`'s, and oomd stops that job first,
+//! leader runs a job larger than `stopsrc`'s, and oomd stops that job first,
 //! then `stopsrc`'s, then the sessions, then the fixture
 //! (docs/session-supervision.md). oomd and sessiond are of the default service
 //! set, which svctest requires staged ([`super::fixtures`]).
@@ -33,7 +33,7 @@ use crate::runner::Phase;
 pub(super) const OOMD_RECIPE: &str = "/config/svcmgr/services/oomd.svc";
 
 /// crashd's recipe, when the image starts crashd.
-const CRASHD_RECIPE: &str = "/config/svcmgr/services/crashd.svc";
+const CRASHD_RECIPE: &str = svctest_fixtures::CRASHD_STAGED_PATH;
 
 /// How long the phase waits for the level to read `NORMAL`: before the
 /// fill, for what earlier phases left, and after it, for oomd's grace, its
@@ -75,7 +75,7 @@ const HOLD_STOP_LINE: &[u8] = b"stopped /tests/fixtures/programs/crashme: ";
 /// The prefix of oomd's line for a stop of a session.
 const SESSION_STOP_LINE: &[u8] = b"stopped session ";
 
-/// The pages of the job the stop case has its session's shell start: more
+/// The pages of the job the stop case has its session's leader start: more
 /// than [`JOB_PAGES`] by far, so oomd stops it before `stopsrc`'s.
 const HOLD_PAGES: u64 = 512;
 
@@ -178,7 +178,7 @@ fn env_value<'a>(recipe: &'a str, key: &str) -> Option<&'a str>
 /// staged, the phase first has that stop source exit, so the instance svcmgr
 /// restarts started after oomd, and start a job of [`JOB_PAGES`]: oomd stops
 /// the job at its first act, before memhog at a later one, and the fixture
-/// reports the job stopped. The phase opens an operator session whose shell
+/// reports the job stopped. The phase opens an operator session whose leader
 /// runs `crashme oom-hold` [`HOLD_PAGES`]:
 /// oomd stops that job first, as the largest of the program class, then
 /// `stopsrc`'s, then the sessions, then the fixture, and the session's relay
@@ -733,7 +733,7 @@ pub(super) fn src_call(
     (reply.word(0), reply.word(1), reply.word(2))
 }
 
-/// The operator session the stop case opens, whose shell runs
+/// The operator session the stop case opens, whose leader runs
 /// `crashme oom-hold` [`HOLD_PAGES`]: a job of the program class larger
 /// than `stopsrc`'s.
 struct Held

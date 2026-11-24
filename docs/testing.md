@@ -66,13 +66,12 @@ harness-specific and MUST NOT include the bracketed summary substring.
 
 ## Per-program tester protocol
 
-A program under `programs/<name>/`, or a test fixture under `services/fixtures/<name>/`, MAY ship
-a tester. Authors of each opt in or skip; absence is the default.
+A program under `programs/<name>/` MAY ship a tester. Its author opts in or skips; absence is the
+default. A test fixture under `services/fixtures/` ships none: svctest's phases drive the fixtures.
 
 ### Layout
 
-- The tester crate lives at `programs/<name>/tester/` for a program and at
-  `services/fixtures/<name>/tester/` for a fixture.
+- The tester crate lives at `programs/<name>/tester/`.
 - The tester crate is a workspace member listed in the root `Cargo.toml`.
 - The tester uses the standard userspace build profile (same as the
   program or fixture itself).
@@ -106,8 +105,7 @@ a tester. Authors of each opt in or skip; absence is the default.
 - The tester SHOULD emit a final stdout line `[<name>-tester] PASS` or
   `[<name>-tester] FAIL` for log readability. The orchestrator does not
   rely on this line for the verdict.
-- The tester drives the program under test, `/programs/<name>` or the fixture
-  `/tests/fixtures/programs/<name>`, through its
+- The tester drives the program under test, `/programs/<name>`, through its
   real I/O surface — stdio (via `std::process::Command` with
   `Stdio::piped()`), argv, environment, filesystem — and asserts whatever
   invariant fits that program.
@@ -159,11 +157,13 @@ sysroot/
     │   ├── …
     │   └── programs/         # fixtures spawned as programs
     │       ├── crashme
+    │       ├── leader
+    │       ├── spawn-target
     │       ├── stdiotest
     │       └── …
     └── programs/
         ├── hello             # per-program tester for /programs/hello
-        ├── stdiotest         # per-program tester for /tests/fixtures/programs/stdiotest
+        ├── shell             # per-program tester for /programs/shell
         └── …
 ```
 
@@ -175,16 +175,16 @@ Under `/services/drivers/` is [`test-dma`](../services/drivers/test-dma/README.m
 driver of the `edu` DMA test device. Under `/tests/drivers/` is
 [`test-fault`](../services/drivers/test-fault/README.md), a test-only fault-injection driver that
 no drivers-directory pass at boot reads: devmgr binds it only through `BIND_DRIVERS`. Under
-`/tests/fixtures/` are the test fixtures the harnesses and per-program testers spawn, sourced from
+`/tests/fixtures/` are the test fixtures the harnesses spawn, sourced from
 [`services/fixtures/`](../services/fixtures/README.md): under `/tests/fixtures/programs/` the ones
 spawned as programs, `capexhaust`, `crashme`, `deadline`, `debugger`, `demandpaged`, `fsbench`,
-`pipefault`, `pipestress`, `relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and
-`threadstack`, which the `programs` component keeps in the program signing role; directly under
+`leader`, `pipefault`, `pipestress`, `relrofault`, `spawn-target`, `stackoverflow`, `stdiotest`,
+`threadchurn`, and `threadstack`, each an image of the program role, which the `programs` component
+keeps in the program signing role, and none of which installs under `/programs/`; directly under
 `/tests/fixtures/` the ones a harness recipe starts as services, `crasher`, `debug-echo`,
 `hotplug-check`, `memhog`, and `stopsrc`. Which consumer spawns or drives each one is owned by
 [services/svctest/README.md § Fixtures](../services/svctest/README.md#fixtures) for `svctest` phases
-and by each fixture's README (`services/fixtures/<name>/README.md`) for every per-program tester
-that drives it. Under
+and by each fixture's README (`services/fixtures/<name>/README.md`). Under
 `/config/svcmgr/tests/` are the harness recipes, and under `/config/devmgr/tests/` the test
 device class files the svctest recipe stages (see [Gating](#gating)). Under `/data/` are
 `/data/test.txt`, a fixture shared by `svctest` and the `shell` tester, and the build-synthesised
@@ -215,13 +215,14 @@ rootfs/config/svcmgr/
 │   ├── svctest.svc
 │   ├── usertest.svc
 │   ├── ubench.svc            # userspace benchmark suite; staged by the `bench` cell
+│   ├── sessiond.svc          # sessiond with a fixture leader; staged with svctest and ubench
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
 │   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
 │   ├── crasher-boot.svc      # death-before-bootstrap fixture; co-staged with svctest
 │   ├── memhog.svc            # out-of-memory policy fixture; co-staged with svctest
 │   ├── reserve-creator.svc   # reserve-creator fixture; co-staged with svctest
 │   ├── stopsrc.svc           # stop-source fixture; co-staged with svctest
-│   ├── crashd.svc            # crashd naming crashme, holding 3 s; co-staged with usertest
+│   ├── crashd.svc            # crashd naming crashme; co-staged with svctest
 │   ├── debug-echo.svc        # debug-port fixture; staged by `debug-port` case
 │   ├── hotplug-check.svc     # hotplug fixture; staged by `hotplug` case
 │   ├── hotplug-check-disk.svc # hotplug fixture's disk mode; staged by `hotplug` case
@@ -247,15 +248,22 @@ To enable a harness for a boot, copy its recipe from
 `sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/` after
 `cargo xtask build`, then repack with `cargo xtask mkdisk --repack-only` before
 `cargo xtask run` (`run` boots the existing `disk.img`, and a normal `mkdisk`
-re-mirror prunes the hand-staged recipe). svctest is staged by `mkdisk` itself, with a fixture
-set (`--svctest ci|burn-in|none`, below):
+re-mirror prunes the hand-staged recipe). svctest and ubench are staged by `mkdisk` itself: svctest
+with a fixture set (`--svctest ci|burn-in|none|crash-endpoint`, below), ubench with `--ubench`:
 
 ```sh
 cargo xtask build
-rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --repack-only --svctest none
 cargo xtask run --test-devices
 ```
+
+`mkdisk --svctest` and `mkdisk --ubench` (the two conflict) stage a services-layer image: they
+remove from `/config/svcmgr/services/` every recipe that starts a file of the programs layer (the
+autostarted `terminal` among them) and stage sessiond's test recipe (`tests/sessiond.svc`), whose
+session leader is the fixture `/tests/fixtures/programs/leader`, over the default one. The pack then
+omits the programs layer from the image (`/programs/`, `/tests/programs/`, `/tests/usertest` and
+`/config/svcmgr/tests/usertest.svc`) whenever the staged services hold `svctest.svc` or
+`ubench.svc`, so a later `--repack-only` keeps the omission and the boot runs no program.
 
 `mkdisk --svctest` also stages the test class files of `sysroot/config/devmgr/tests/` into
 `sysroot/config/devmgr/classes/`, the directory svcmgr reads class files from, and the svctest
@@ -274,6 +282,7 @@ recipe with the fixtures of one named set, removes every other fixture's recipe 
 | `ci` | `crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc` | the canonical svctest cells, and the local host runs that stage svctest as they do |
 | `burn-in` | `memhog`, `reserve-creator`, `stopsrc` | the burn-in svctest cell |
 | `none` | none | a boot of svctest alone |
+| `crash-endpoint` | none | the crash-endpoint boot: no crashd, and svctest runs only its startup phases, `svctest_fixtures` and `crash_endpoint` |
 
 svctest's `svctest_fixtures` phase, right after its startup phases, fails the run unless the image
 stages exactly the fixtures the record declares, naming each recipe that disagrees: a declared
@@ -283,19 +292,26 @@ oomd or sessiond, the default services its phases drive, are missing. A phase wh
 set does not declare skips, or skips the part the fixture drives, and logs
 `phase=<phase> skipped: <recipe> not staged`.
 
-The usertest recipe also stages crashd's test recipe, `tests/crashd.svc`, over the default one:
-the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death, and
-`CRASHD_OOM_STALL_MS=3000`, so crashd holds a fault declined for want of memory for up to 3 s,
-both of which the fixture's tester checks ([Crash reports](#crash-reports)). Its `crashd.core`
-name is the authority the usertest recipe seeds to the crashme tester for its live cores. A
-usertest boot without it fails the crashme tester:
+The `ci`, `burn-in` and `none` sets stage crashd's test recipe, `tests/crashd.svc`, over the default
+one: the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death, and
+the default's `CRASHD_OOM_STALL_MS=10000`, which svctest's `crashd_oom_hold` phase reads to size
+the fill that outlasts crashd's hold of a fault memmgr declined for want of memory; svctest's
+`crashd_*` phases check them ([Crash reports](#crash-reports)), and its `crashd.core` seed is the
+authority for the live cores. The `crash-endpoint` set stages no crashd, so procmgr's crash endpoint
+is free for svctest's `crash_endpoint` phase; the set records `SVCTEST_PHASES=crash_endpoint` in
+svctest's recipe, and `svctest_fixtures` fails an image with crashd staged when that record is set,
+and one without crashd when it is not.
+
+The usertest boot stages no crashd test recipe and runs no faulting fixture. Its testers, `hello`
+and `shell`, are the two under `/tests/programs/`; it is staged by hand and booted with
+`--crash-reports none`:
 
 ```sh
 cargo xtask build
-cp sysroot/config/svcmgr/tests/usertest.svc sysroot/config/svcmgr/tests/crashd.svc \
-    sysroot/config/svcmgr/services/
+cp sysroot/config/svcmgr/tests/usertest.svc sysroot/config/svcmgr/services/
+rm -f sysroot/config/svcmgr/services/terminal.svc
 cargo xtask mkdisk --repack-only
-cargo xtask run
+cargo xtask run --crash-reports none
 ```
 
 `ktest` is gated separately: it lives in the bootloader-loaded bundle,
@@ -463,7 +479,8 @@ ktest boot runs every benchmark 8 times, a smoke run whose lines no check compar
 image (`cargo xtask build --ktest-bench-only`) runs Tier 3 alone, 4096 iterations each, for the
 lines that are compared. The userspace paths are measured by the
 [`ubench`](../services/ubench/README.md) suite, in a boot of the regular init image with its
-recipe (`/config/svcmgr/tests/ubench.svc`) staged and the terminal dropped; it logs its own
+recipe (`/config/svcmgr/tests/ubench.svc`) staged by `cargo xtask mkdisk --ubench`, which leaves
+no program in the image; it logs its own
 lines and fsbench's.
 
 CI's `bench` cell, one per architecture, builds both in the release profile
@@ -521,8 +538,8 @@ system log from inside the guest, so `cargo xtask run --runs N --crash-reports r
 checks the blocks in each boot's serial log, with the parser of the format crashd emits
 ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)): every block
 must be complete and hold the fields its kind, thread, and status require.
-
-- `--crash-reports reports` reads a usertest boot, which runs the `crashme` fixture's tester
+- `--crash-reports reports` reads an svctest boot of a set that stages crashd, whose `crashd_faults`
+  phase runs the `crashme` fixture
   ([services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md)): the log must also
   hold one `vm` and one `exception` block of `crashme`'s main thread and one `exception` block of a
   `spawned` thread, whose fault the fixture takes while a sibling is held blocked on a fault at the
@@ -532,31 +549,34 @@ must be complete and hold the fields its kind, thread, and status require.
   thread prints, so the block read the thread that faulted. The `vm` block's `addr`, the fault
   message's address, must also be the faulting address that dump prints (`cr2` on x86_64, `stval` on
   riscv64), so the dump names the access that faulted.
-- `--crash-reports none` reads a boot of an image that stages no crashd: the log must hold no block,
-  the check that the absent service changes nothing a fault does.
+- `--crash-reports none` reads a boot in which no crash service reports: the usertest boot, which
+  runs no faulting fixture, and the `crash-endpoint` svctest boot, which stages no crashd. The log
+  must hold no block, the check that the absent service changes nothing a fault does.
 
-The usertest boot's crashd names `crashme` in its `CORE_DUMP` ([Gating](#gating)), so each of the
-fixture's faulting deaths also leaves an ELF core in `/crash`, which the crashme tester checks in
-the guest: its machine, the faulting thread's signal, instruction pointer and stack pointer against
-the page runs it holds, the illegal instruction's bytes, and the `worker` core's threads
-([services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md)). The tester also
-asks crashd for a live core of the running fixture and checks that the fixture ran on unchanged and
-that the core records its threads, their stacks and a page it marked, and none of the binary's text,
-and asks for one of a fixture on the core path and checks the refusal released the capture ([crashd
-Operation § Live Core](../services/crashd/docs/operation.md#live-core)). A core is checked in the
-boot, not in the log; `gdb` reading one is checked by hand
+The svctest boot's crashd names `crashme` in its `CORE_DUMP` ([Gating](#gating)), so each of the
+fixture's faulting deaths also leaves an ELF core in `/crash`, which svctest's `crashd_cores` phase
+checks in the guest: its machine, the faulting thread's signal, instruction pointer and stack
+pointer against the page runs it holds, the illegal instruction's bytes, and the `worker` core's
+threads ([services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md)). Its
+`crashd_live_core` phase asks crashd, through the `crashd.core` seed, for a live core of the
+running fixture and checks that the fixture ran on unchanged and that the core records its threads,
+their stacks and a page it marked, and none of the binary's text, and asks for one of a fixture on
+the core path and checks the refusal released the capture ([crashd Operation § Live
+Core](../services/crashd/docs/operation.md#live-core)). A core is checked in the boot, not in the
+log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
-The usertest boot's crashd also holds a page fault memmgr declined for want of memory, for up to
-3000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The crashme tester
-fills memory down to memmgr's growth floor and has the fixture write a page it has not touched: once
-the filler gives the memory back within the stall, and the write completes after the hold; once the
-filler keeps it past the stall, and the fixture dies of the fault with no core written.
+The svctest boot's crashd also holds a page fault memmgr declined for want of memory, for up to
+10000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The
+`crashd_oom_hold` phase, which runs after `swap_commit`, fills memory down to memmgr's growth floor
+and has the fixture write a page it has not touched, reading the stall from the staged crashd
+recipe: once the filler gives the memory back within the stall, and the write completes after the
+hold; once the filler keeps it past the stall, and the fixture dies of the fault with no core
+written.
 
-In CI the usertest cell keeps crashd, and its boot passes `--crash-reports reports` to
-`cargo xtask run --runs 1`; the svctest cell drops `crashd.svc` with `terminal.svc`, and its boot
-passes `--crash-reports none`, while crasher's faults go unreported. Each makes the first or the
-second check on its boot's own log
+In CI the svctest cell's `ci` boot passes `--crash-reports reports` to `cargo xtask run --runs 1`,
+its `crash-endpoint` boot and the usertest cell's boot pass `--crash-reports none`. Each makes the
+first or the second check on its boot's own log
 ([xtask/README.md](../xtask/README.md#classified-boots---runs)).
 
 The crash service cannot cover every process. init, memmgr, and procmgr are not created by procmgr,
@@ -1165,11 +1185,11 @@ removes it and dies before its bootstrap request (svctest's `svcmgr_boot_death` 
 faults complete long before `svctest`'s terminal marker, so the kernel fault dump never clobbers it.
 The `memhog` fixture (`memhog.svc`, `restart = on_failure`, `oom_stop = yes`) is in the `ci` and
 `burn-in` sets: svctest's `oom_policy` phase has it fill memory until oomd stops it, and its
-`logd_reserve` phase has it fill memory while logd is killed and restarted. The CI svctest cell
-drops crashd, so the held-write path of that phase (a child's page fault crashd holds until oomd's
-stop frees memory), and the write part of the `memmgr_swap_commit` phase (a child's commitment past
-the draw room, its commit overruns held by crashd until write-out to swap opens memmgr's draw room),
-run in the burn-in svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart
+`logd_reserve` phase has it fill memory while logd is killed and restarted. The `ci`, `burn-in` and
+`none` sets stage crashd, so the held-write path of that phase (a child's page fault crashd holds
+until oomd's stop frees memory), and the write part of the `memmgr_swap_commit` phase (a child's
+commitment past the draw room, its commit overruns held by crashd until write-out to swap opens
+memmgr's draw room), run in each of them. The `stopsrc` fixture (`stopsrc.svc`, `restart
 = always`, `stop_source = program`) is in both sets: svctest's `svcmgr_stop_service` phase reads
 that svcmgr lists it, beside sessiond, as a stop source of the program class and that a job it
 started ends with it, and its `oom_policy` phase has it start a job that oomd stops before memhog.
@@ -1178,16 +1198,18 @@ The `oom_policy` phase also opens an operator session whose shell runs
 `sessiond_operator` phase checks sessiond's operator interface; sessiond, like oomd, is a default
 service, which every svctest boot stages. The `reserve-creator` fixture (`reserve-creator.svc`,
 `reserve = yes`) is in both sets: svctest's `logd_reserve` phase has it make a `CREATE_FROM_FILE |
-CREATE_RESERVE` of `/programs/hello` while memhog holds memory critical, which must succeed.
+CREATE_RESERVE` of `/tests/fixtures/programs/spawn-target` while memhog holds memory critical,
+which must succeed.
 
 **Test isolation.** The functional harness boots run a controlled substrate:
 they drop the autostarted `terminal` (a user-facing program, not part of the
 services/programs surface under test). Because `terminal.svc` lives in the
 default service set, the harness staging removes it and repacks with
 `cargo xtask mkdisk --repack-only` (a normal repack re-mirrors `rootfs/`,
-which would restore it). The terminal is exercised in its own boot
-(the `terminal` case) and runs in the real default boot. The svctest boot also
-drops `crashd.svc`, so one boot per cell runs the image without the crash
+which would restore it); `mkdisk --svctest` and `mkdisk --ubench` remove it with every other recipe
+that starts a program. The terminal is exercised in its own boot
+(the `terminal` case) and runs in the real default boot. The `crash-endpoint` svctest boot
+stages no crashd, so one boot per cell runs the image without the crash
 service (see Crash reports above).
 
 CI matrix cells follow these rules per boot. The `usertest` cell boots `usertest` first (via `run
@@ -1884,7 +1906,6 @@ runs those boots, and the release host runs run all four.
 ```sh
 # Disk variations, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
-rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --svctest ci --block-size 4096
 cargo xtask run --arch <arch> --runs 1 --timeout 420 \
     --test-devices
@@ -1917,7 +1938,6 @@ is the framebuffer device cell (Device surfaces above).
 ```sh
 # Framebuffer cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
-rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --svctest ci
 cargo xtask run --arch <arch> --runs 1 --timeout 360 \
     --display framebuffer --test-devices --fail-also 'framebuffer case skipped'

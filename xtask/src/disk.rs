@@ -181,6 +181,9 @@ struct FatSource
     dir: PathBuf,
     /// Paths relative to `dir`.
     substitutes: Vec<Substitute>,
+    /// Files and directories under `dir` the volume leaves out, as paths
+    /// relative to `dir`.
+    omit: Vec<PathBuf>,
 }
 
 /// A file a pack writes in place of the one the sysroot holds
@@ -205,6 +208,9 @@ struct Sources
     data: PathBuf,
     /// Paths relative to the sysroot.
     substitutes: Vec<Substitute>,
+    /// Files and directories the root partition leaves out, as paths relative
+    /// to the sysroot.
+    omit_from_root: Vec<PathBuf>,
 }
 
 /// Create the GPT disk image at `<project_root>/disk.img`, and, when the
@@ -311,11 +317,28 @@ fn pack(
     sign_for_harness(ctx, arch, harness)?;
     crate::esp::compose(ctx, arch, harness)?;
 
+    // A sysroot staged for a services-layer harness packs a services-layer
+    // image, which holds no file of the programs layer; deciding it here, from
+    // the staged recipes, keeps a later `--repack-only` (the storage cells'
+    // `--split-data`) to the composition the staging chose.
+    let omit_from_root = if crate::svctest_stage::services_layer(&ctx.sysroot)
+    {
+        step("Services-layer image: the programs layer is left out");
+        crate::svctest_stage::PROGRAMS_LAYER
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+    else
+    {
+        Vec::new()
+    };
     let sources = Sources {
         esp: ctx.sysroot_esp(),
         root: ctx.sysroot.clone(),
         data: ctx.sysroot.join("data"),
         substitutes,
+        omit_from_root,
     };
     let data_image = ctx.data_disk_image();
     author_images(&image_path, &data_image, arch, layout, &sources)?;
@@ -356,10 +379,11 @@ fn author_images(
 ) -> Result<()>
 {
     let [on_esp, on_root, on_data] = split_substitutes(&sources.substitutes)?;
-    let fat = |dir: &Path, substitutes| {
+    let fat = |dir: &Path, substitutes, omit| {
         Contents::Fat(FatSource {
             dir: dir.to_path_buf(),
             substitutes,
+            omit,
         })
     };
     let esp = Volume {
@@ -368,7 +392,7 @@ fn author_images(
         unique_guid: ESP_UNIQUE_GUID,
         bytes: ESP_PARTITION_SIZE,
         attributes: 0,
-        contents: fat(&sources.esp, on_esp),
+        contents: fat(&sources.esp, on_esp, Vec::new()),
     };
     let root = Volume {
         name: "ROOT",
@@ -376,7 +400,7 @@ fn author_images(
         unique_guid: ROOT_UNIQUE_GUID,
         bytes: ROOT_PARTITION_SIZE,
         attributes: 0,
-        contents: fat(&sources.root, on_root),
+        contents: fat(&sources.root, on_root, sources.omit_from_root.clone()),
     };
     // The data tree is not also written to the root partition
     // (populate_dir skips top-level data/).
@@ -386,7 +410,7 @@ fn author_images(
         unique_guid: DATA_UNIQUE_GUID,
         bytes: DATA_PARTITION_SIZE,
         attributes: 0,
-        contents: fat(&sources.data, on_data),
+        contents: fat(&sources.data, on_data, Vec::new()),
     };
     let swap = Volume {
         name: "SWAP",
@@ -818,7 +842,7 @@ fn write_fat_partition(
     let source_dir = source.dir.as_path();
     let mut tree = if source_dir.exists()
     {
-        host_tree(source_dir, source_dir)?
+        host_tree(source_dir, source_dir, &source.omit)?
     }
     else
     {
@@ -945,11 +969,12 @@ fn substitute(tree: &mut [fat::Entry], path: &Path, source: &Path) -> Result<()>
 ///
 /// Skips build metadata (`.arch`, `.harness`, `NvVars`), the `esp` directory, and
 /// at the top of `sysroot_root` the `data` directory: `esp` and `data` are mount
-/// points with their own partitions, and so not root content. Entries other than files and directories are skipped.
+/// points with their own partitions, and so not root content. Entries other than files and directories are skipped,
+/// and so is each file or directory whose path relative to `sysroot_root` `omit` names.
 ///
 /// # Errors
 /// Fails when a directory cannot be read or a name is not UTF-8.
-fn host_tree(host_dir: &Path, sysroot_root: &Path) -> Result<Vec<fat::Entry>>
+fn host_tree(host_dir: &Path, sysroot_root: &Path, omit: &[PathBuf]) -> Result<Vec<fat::Entry>>
 {
     let mut entries: Vec<_> = fs::read_dir(host_dir)
         .with_context(|| format!("failed to read {}", host_dir.display()))?
@@ -981,12 +1006,19 @@ fn host_tree(host_dir: &Path, sysroot_root: &Path) -> Result<Vec<fat::Entry>>
             continue;
         }
 
+        if path
+            .strip_prefix(sysroot_root)
+            .is_ok_and(|relative| omit.iter().any(|o| o == relative))
+        {
+            continue;
+        }
+
         let ft = entry
             .file_type()
             .with_context(|| format!("failed to get file type: {}", path.display()))?;
         let kind = if ft.is_dir()
         {
-            fat::Kind::Dir(host_tree(&path, sysroot_root)?)
+            fat::Kind::Dir(host_tree(&path, sysroot_root, omit)?)
         }
         else if ft.is_file()
         {
@@ -1038,6 +1070,7 @@ mod tests
                 root: self.0.join("no-root"),
                 data,
                 substitutes: Vec::new(),
+                omit_from_root: Vec::new(),
             }
         }
     }
@@ -1479,6 +1512,7 @@ mod tests
             root: sysroot.clone(),
             data: sysroot.join("data"),
             substitutes,
+            omit_from_root: Vec::new(),
         };
         let main = scratch.0.join("disk.img");
         let data_image = scratch.0.join("disk-data.img");
@@ -1580,6 +1614,7 @@ mod tests
             root: sysroot.clone(),
             data: sysroot.join("data"),
             substitutes: Vec::new(),
+            omit_from_root: Vec::new(),
         };
         author_images(
             &main,
@@ -1603,6 +1638,79 @@ mod tests
         }
         let esp = read_volume(&mut image, IMAGE_MARGIN, 512).unwrap();
         assert_eq!(esp.get("/EFI/seraph/kernel"), file(b"kernel").as_ref());
+    }
+
+    // Defect caught: a services-layer image that still carries a program, a
+    // tester or the programs-layer harness, or one that leaves out a services-
+    // layer file whose path shares a prefix with an omitted one.
+    #[test]
+    fn a_services_layer_image_leaves_the_programs_layer_out()
+    {
+        use crate::fat_read::read_volume;
+
+        let scratch = Scratch::new("services-layer");
+        let sysroot = scratch.0.join("sysroot");
+        for path in [
+            "programs/shell",
+            "tests/programs/hello",
+            "tests/usertest",
+            "tests/svctest",
+            "tests/fixtures/programs/leader",
+            "config/svcmgr/tests/usertest.svc",
+            "config/svcmgr/tests/svctest.svc",
+            "config/svcmgr/services/svctest.svc",
+        ]
+        {
+            let full = sysroot.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, path).unwrap();
+        }
+        assert!(crate::svctest_stage::services_layer(&sysroot));
+        let main = scratch.0.join("disk.img");
+        let sources = Sources {
+            esp: sysroot.join("esp"),
+            root: sysroot.clone(),
+            data: sysroot.join("data"),
+            substitutes: Vec::new(),
+            omit_from_root: crate::svctest_stage::PROGRAMS_LAYER
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+        };
+        author_images(
+            &main,
+            &scratch.0.join("disk-data.img"),
+            Arch::X86_64,
+            DiskLayout::default(),
+            &sources,
+        )
+        .unwrap();
+        let mut image = File::open(&main).unwrap();
+        let root = read_volume(&mut image, IMAGE_MARGIN + ESP_PARTITION_SIZE, 512).unwrap();
+        for absent in [
+            "/programs",
+            "/tests/programs",
+            "/tests/usertest",
+            "/config/svcmgr/tests/usertest.svc",
+        ]
+        {
+            assert!(!root.contains_key(absent), "{absent}");
+            assert!(
+                !root
+                    .keys()
+                    .any(|path| path.starts_with(&format!("{absent}/"))),
+                "{absent}"
+            );
+        }
+        for present in [
+            "/tests/svctest",
+            "/tests/fixtures/programs/leader",
+            "/config/svcmgr/tests/svctest.svc",
+            "/config/svcmgr/services/svctest.svc",
+        ]
+        {
+            assert!(root.contains_key(present), "{present}");
+        }
     }
 
     #[test]

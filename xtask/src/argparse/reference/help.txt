@@ -365,7 +365,7 @@ Options:
           Check the crash service's report blocks in each passing run's log: every block well-formed, and `reports` the `crashme` fixture's three reports, `none` no block at all. A run whose check fails is FAIL; a QEMU-CRASH run is not checked
 
           Possible values:
-          - reports: The `crashme` fixture's `vm` and `exception` reports of its main thread and its `worker` report of a spawned thread: a usertest boot with crashd staged
+          - reports: The `crashme` fixture's `vm` and `exception` reports of its main thread and its `worker` report of a spawned thread: a svctest boot with crashd staged
           - none:    No report block: a boot of an image that stages no crashd
 
       --hold-on-hang
@@ -911,7 +911,8 @@ Options:
       --arch <ARCH>              Target architecture — must match the existing sysroot's arch tag [default: x86_64] [possible values: x86_64, riscv64]
       --repack-only              Repack `disk.img` from the sysroot as it stands, skipping the `rootfs/` re-mirror; the repository's data files are still installed, and the sysroot's signed objects re-signed in place, as every pack signs them. Use after editing the staged sysroot directly (e.g. adding a test recipe or removing a default one): a normal re-mirror is authoritative and would restore `rootfs/`-present recipes and prune `rootfs/`-absent ones, undoing the manual staging
       --harness <HARNESS>        Record the harness whose bundle this and every later pack composes from the installed files its bundle list names: `init` for the userspace init, `ktest` for the kernel-test harness. Omit to keep the recorded harness (`init` after `cargo xtask build`) [possible values: init, ktest]
-      --svctest <SET>            Stage the svctest boot with the fixture set SET: svctest's recipe and the set's fixture recipes copied from `config/svcmgr/tests/` into `config/svcmgr/services/`, every other fixture's recipe removed from it, the test class files of `config/devmgr/tests/` copied into `config/devmgr/classes/`, and the set's record written into the staged recipe's `env` line as `SVCTEST_FIXTURES`, which svctest checks the image against. Refused when a recipe the set needs is missing [possible values: ci, burn-in, none]
+      --svctest <SET>            Stage the svctest boot with the fixture set SET on the services layer: every recipe that starts a program, or another services-layer harness, removed from `config/svcmgr/services/`; svctest's recipe, sessiond's test recipe, the set's fixture recipes, and crashd's test recipe (no crashd for `crash-endpoint`) copied into it from `config/svcmgr/tests/`, every other fixture's recipe removed from it; the test class files of `config/devmgr/tests/` copied into `config/devmgr/classes/`; and the set's record written into the staged recipe's `env` line as `SVCTEST_FIXTURES`, with `SVCTEST_PHASES` for a set that selects phases, which svctest checks the image against. The pack then leaves the programs layer out of the image. Refused when a recipe the set needs is missing [possible values: ci, burn-in, none, crash-endpoint]
+      --ubench                   Stage the ubench boot: ubench's recipe copied from `config/svcmgr/tests/` into `config/svcmgr/services/` on the services layer, as `--svctest` stages svctest's: every recipe that starts a program, or another services-layer harness, removed, and sessiond's test recipe staged over its default. The pack then leaves the programs layer out of the image
       --knob <KNOB>              Stage a bootloader knob in `\EFI\seraph\`: `nokaslr` boots the kernel at its deterministic (un-randomized) layout, for GDB and symbolization; `mapredo` makes the bootloader redo the first attempt of its steps 6 and 7. Repeatable, or comma-separated. The image carries exactly the knobs named: every other is removed [possible values: nokaslr, mapredo]
       --log-levels <FILE>        Install FILE as the log-level configuration init reads (`/config/init/log-levels.conf`) in place of the repository's `services/init/log-levels.conf`, which mkdisk installs without it. Refused unless init's parser accepts every line
       --block-size <BLOCK_SIZE>  Logical block size of the authored images: the unit of their GPT LBAs and the sector size of their FAT volumes. `run` and the other launchers present the disk device at the size the image's GPT has [default: 512] [possible values: 512, 4096]
@@ -943,12 +944,16 @@ Options:
           - ktest: The kernel-test harness, `/tests/ktest`, as the `"init"` entry, with the boot-time policy every bundle carries: ktest is monolithic and spawns no module (`ktest.list`)
 
       --svctest <SET>
-          Stage the svctest boot with the fixture set SET: svctest's recipe and the set's fixture recipes copied from `config/svcmgr/tests/` into `config/svcmgr/services/`, every other fixture's recipe removed from it, the test class files of `config/devmgr/tests/` copied into `config/devmgr/classes/`, and the set's record written into the staged recipe's `env` line as `SVCTEST_FIXTURES`, which svctest checks the image against. Refused when a recipe the set needs is missing
+          Stage the svctest boot with the fixture set SET on the services layer: every recipe that starts a program, or another services-layer harness, removed from `config/svcmgr/services/`; svctest's recipe, sessiond's test recipe, the set's fixture recipes, and crashd's test recipe (no crashd for `crash-endpoint`) copied into it from `config/svcmgr/tests/`, every other fixture's recipe removed from it; the test class files of `config/devmgr/tests/` copied into `config/devmgr/classes/`; and the set's record written into the staged recipe's `env` line as `SVCTEST_FIXTURES`, with `SVCTEST_PHASES` for a set that selects phases, which svctest checks the image against. The pack then leaves the programs layer out of the image. Refused when a recipe the set needs is missing
 
           Possible values:
-          - ci:      Every fixture: crasher, crasher-worker, crasher-boot, memhog, reserve-creator and stopsrc, as the canonical svctest cells stage them
-          - burn-in: memhog, reserve-creator and stopsrc, as the burn-in svctest cell stages them
-          - none:    No fixture: every fixture phase skips
+          - ci:             Every fixture: crasher, crasher-worker, crasher-boot, memhog, reserve-creator and stopsrc, as the canonical svctest cells stage them
+          - burn-in:        memhog, reserve-creator and stopsrc, as the burn-in svctest cell stages them
+          - none:           No fixture: every fixture phase skips
+          - crash-endpoint: No fixture and no crashd, and only the `crash_endpoint` phase runs after svctest's startup phases: procmgr's crash endpoint with svctest as the crash service
+
+      --ubench
+          Stage the ubench boot: ubench's recipe copied from `config/svcmgr/tests/` into `config/svcmgr/services/` on the services layer, as `--svctest` stages svctest's: every recipe that starts a program, or another services-layer harness, removed, and sessiond's test recipe staged over its default. The pack then leaves the programs layer out of the image
 
       --knob <KNOB>
           Stage a bootloader knob in `\EFI\seraph\`: `nokaslr` boots the kernel at its deterministic (un-randomized) layout, for GDB and symbolization; `mapredo` makes the bootloader redo the first attempt of its steps 6 and 7. Repeatable, or comma-separated. The image carries exactly the knobs named: every other is removed

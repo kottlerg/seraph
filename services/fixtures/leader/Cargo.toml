@@ -1,11 +1,11 @@
 [package]
-name = "debugger-tester"
+name = "leader"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "debugger-tester"
+name = "leader"
 path = "src/main.rs"
 test = false
 

@@ -6,7 +6,7 @@
 //! procmgr's crash endpoint end to end, with svctest as the crash service
 //! (`services/procmgr/docs/ipc-interface.md` § Crash Endpoint and Debug
 //! Authority): svctest's recipe sets `debug_authority = yes`, and the
-//! svctest boot stages no crashd, so the endpoint is free to take.
+//! `crash-endpoint` set's boot stages no crashd, so the endpoint is free to take.
 //!
 //! The phase registers with a helper thread's cap, is refused a second
 //! registration, and receives faults on the endpoint until the forwarded
@@ -30,9 +30,8 @@
 //! helper, after which procmgr takes the endpoint back: a
 //! `crashme exception` child it spawns dies of its fault though
 //! svctest receives nothing. A second registration then succeeds, and is
-//! given back the same way. With crashd staged (a manual boot, or burn-in's
-//! svctest cell, which keeps the default crashd staging) the endpoint is
-//! taken and the phase checks only the refusal.
+//! given back the same way. With crashd staged (a manual boot of any other set)
+//! the endpoint is taken and the phase checks only the refusal.
 
 use std::os::seraph::process::ChildExt;
 use std::process::{Command, Stdio};

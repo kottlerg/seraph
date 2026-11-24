@@ -118,14 +118,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crashme-tester"
-version = "0.1.5"
-dependencies = [
- "ipc",
- "syscall",
-]
-
-[[package]]
 name = "crypto"
 version = "0.1.5"
 dependencies = [
@@ -147,10 +139,6 @@ dependencies = [
  "syscall",
  "syscall-abi",
 ]
-
-[[package]]
-name = "deadline-tester"
-version = "0.1.5"
 
 [[package]]
 name = "death-set"
@@ -181,10 +169,6 @@ dependencies = [
  "syscall",
  "syscall-abi",
 ]
-
-[[package]]
-name = "debugger-tester"
-version = "0.1.5"
 
 [[package]]
 name = "demandpaged"
@@ -514,6 +498,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "leader"
+version = "0.1.5"
+
+[[package]]
 name = "log"
 version = "0.1.5"
 dependencies = [
@@ -647,14 +635,6 @@ version = "0.1.5"
 [[package]]
 name = "pipestress"
 version = "0.1.5"
-
-[[package]]
-name = "pipestress-tester"
-version = "0.1.5"
-dependencies = [
- "syscall",
- "syscall-abi",
-]
 
 [[package]]
 name = "process-abi"
@@ -858,15 +838,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spawn-target"
+version = "0.1.5"
+
+[[package]]
 name = "stackoverflow"
 version = "0.1.5"
 
 [[package]]
 name = "stdiotest"
-version = "0.1.5"
-
-[[package]]
-name = "stdiotest-tester"
 version = "0.1.5"
 
 [[package]]
@@ -1037,15 +1017,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "threadchurn-tester"
-version = "0.1.5"
-
-[[package]]
 name = "threadstack"
-version = "0.1.5"
-
-[[package]]
-name = "threadstack-tester"
 version = "0.1.5"
 
 [[package]]

@@ -61,11 +61,14 @@
 # DEBUG_AUTHORITY SEND|GRANT in the slot after the seeds, and svctest,
 # as every holder, declares itself undebuggable at startup; the
 # crash_endpoint phase registers with it as the crash service, which the
-# svctest boot, staging no crashd, leaves free (burn-in's svctest cell
-# stages crashd, and the phase then checks only the refusal); the
+# `crash-endpoint` set's boot, staging no crashd, leaves free (a boot of any
+# other set stages crashd, and the phase then checks only the refusal); the
 # logd_restart phase kills logd through an attach with it, and the
 # logd_sinks phase stops the serial and framebuffer drivers and kills the
 # framebuffer driver the same way.
+# crashd.core is the LIVE_CORE_AUTHORITY SEND|GRANT on crashd's live-core
+# endpoint, through which the crashd_live_core phase asks for live cores; it
+# stays zero in a boot that stages no crashd.
 # stop_authority = yes delivers svcmgr's STOP_AUTHORITY SEND in the slot
 # after that, through which the svcmgr_stop_service phase stops and lists
 # services and lists the stop sources.
@@ -74,7 +77,7 @@
 # scan. `cargo xtask mkdisk --svctest <set>` stages it into
 # /config/svcmgr/services/ with the fixtures of the set and the test
 # class files above, and appends SVCTEST_FIXTURES=<the set's fixtures>
-# to the env line below; svctest fails a run without that record, or
+# (and SVCTEST_PHASES for a set that selects phases) to the env line below; svctest fails a run without that record, or
 # whose image stages other fixtures than it declares. Boot it with
 # `cargo xtask run --test-devices`. See docs/testing.md.
 #
@@ -91,6 +94,6 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny memmgr.swap devmgr.class.rtc svcmgr.grant
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny memmgr.swap devmgr.class.rtc svcmgr.grant crashd.core
 debug_authority = yes
 stop_authority  = yes

@@ -38,12 +38,12 @@ pub fn pipes_phase(_: &Caps)
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
 
-    // ── (1) hello capture ─────────────────────────────────────────────
+    // ── (1) spawn-target capture ─────────────────────────────────────────────
     {
-        let mut child = Command::new("/programs/hello")
+        let mut child = Command::new("/tests/fixtures/programs/spawn-target")
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn /programs/hello (piped) failed");
+            .expect("spawn /tests/fixtures/programs/spawn-target (piped) failed");
         let mut stdout_bytes = Vec::new();
         {
             let mut out = child
@@ -51,20 +51,26 @@ pub fn pipes_phase(_: &Caps)
                 .take()
                 .expect("piped child must have stdout handle");
             out.read_to_end(&mut stdout_bytes)
-                .expect("read_to_end on hello stdout failed");
+                .expect("read_to_end on spawn-target stdout failed");
         }
         let body = String::from_utf8_lossy(&stdout_bytes);
         for line in body.lines()
         {
-            std::os::seraph::log!("hello: {line}");
+            std::os::seraph::log!("spawn-target: {line}");
         }
         assert!(
             !stdout_bytes.is_empty(),
-            "hello produced no stdout bytes — pipe wiring broken"
+            "spawn-target produced no stdout bytes — pipe wiring broken"
         );
-        let status = child.wait().expect("hello wait failed");
-        assert!(status.success(), "hello did not exit cleanly: {status}");
-        std::os::seraph::log!("pipes: hello capture ok ({} bytes)", stdout_bytes.len());
+        let status = child.wait().expect("spawn-target wait failed");
+        assert!(
+            status.success(),
+            "spawn-target did not exit cleanly: {status}"
+        );
+        std::os::seraph::log!(
+            "pipes: spawn-target capture ok ({} bytes)",
+            stdout_bytes.len()
+        );
     }
 
     // ── (2) stdiotest round-trip ──────────────────────────────────────
@@ -110,17 +116,14 @@ pub fn pipes_phase(_: &Caps)
         {
             std::os::seraph::log!("stdiotest: {line}");
         }
-        assert!(
-            body.contains("got 6 bytes"),
-            "stdiotest stdout missing byte-count line: {body:?}"
-        );
-        assert!(
-            body.contains("shouted: HELLO"),
-            "stdiotest stdout missing shout line: {body:?}"
-        );
-        assert!(
-            body.contains("PASS"),
-            "stdiotest stdout missing PASS marker: {body:?}"
+        // Defect guarded: a stdin-to-stdout round trip that drops, truncates or
+        // reorders the child's three reply lines (byte count, uppercase echo,
+        // PASS marker) for the probe written above.
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+        assert_eq!(
+            lines,
+            ["got 6 bytes: \"hello\"", "shouted: HELLO", "PASS"],
+            "stdiotest stdout is not the expected three-line reply: {body:?}"
         );
 
         if let Some(mut err) = child.stderr.take()
@@ -156,12 +159,12 @@ pub fn pipes_phase(_: &Caps)
 
     // ── (3) Command::output() round-trip ──────────────────────────────
     {
-        let output = Command::new("/programs/hello")
+        let output = Command::new("/tests/fixtures/programs/spawn-target")
             .output()
-            .expect("Command::output on hello failed");
+            .expect("Command::output on spawn-target failed");
         assert!(
             output.status.success(),
-            "hello via output() did not exit cleanly: {}",
+            "spawn-target via output() did not exit cleanly: {}",
             output.status
         );
         assert!(

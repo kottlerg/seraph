@@ -1,34 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/fixtures/deadline/tester/src/main.rs
+// services/svctest/src/phases/deadline.rs
 
-//! Per-program tester for `/tests/fixtures/programs/deadline`. Spawns it once and asserts
+//! svctest phase for `/tests/fixtures/programs/deadline`. Spawns it once and asserts
 //! that it printed `PASS` and exited cleanly: its supervisor cancelled the
 //! spinning worker at the deadline with an asynchronous upcall, a call
 //! deadline ended its calls on an endpoint nobody receives on and a spawn
 //! whose child never asked for its bootstrap caps, and the fixture, spawned
 //! with none, held no creator endpoint.
-//!
-//! See [docs/testing.md](../../../../../docs/testing.md) for the protocol.
-
-#![expect(
-    clippy::expect_used,
-    reason = "a per-program tester is test code, where unwrap and expect are permitted \
-              (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait must \
-              abort the tester, and the panic's non-zero exit is its FAIL verdict"
-)]
 
 use std::io::Read;
 use std::process::{Command, Stdio};
 
-fn fail(msg: &str) -> !
+use crate::bootstrap::Caps;
+use crate::runner::Phase;
+
+pub fn phases() -> &'static [Phase]
 {
-    println!("[deadline-tester] FAIL {msg}");
-    std::process::exit(1);
+    &[Phase {
+        name: "deadline",
+        run: deadline_phase,
+    }]
 }
 
-fn main()
+pub fn deadline_phase(_: &Caps)
 {
     let mut child = Command::new("/tests/fixtures/programs/deadline")
         .stdout(Stdio::piped())
@@ -45,12 +41,13 @@ fn main()
     let out = String::from_utf8_lossy(&bytes);
     if !out.lines().any(|l| l.trim() == "PASS")
     {
-        println!("[deadline-tester] stdout: {out:?}");
-        fail("PASS marker missing");
+        std::os::seraph::log!("deadline: stdout: {out:?}");
+        panic!("deadline: PASS marker missing");
     }
-    if !status.success()
-    {
-        fail(&format!("exited non-clean: {:?}", status.code()));
-    }
-    println!("[deadline-tester] PASS");
+    assert!(
+        status.success(),
+        "deadline: exited non-clean: {:?}",
+        status.code()
+    );
+    std::os::seraph::log!("deadline phase passed");
 }

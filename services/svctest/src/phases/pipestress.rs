@@ -1,24 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/fixtures/pipestress/tester/src/main.rs
+// services/svctest/src/phases/pipestress.rs
 
-//! Per-program tester for `/tests/fixtures/programs/pipestress` (#360, #364). Repeatedly
-//! spawns the fixture with a piped stdout and asserts every iteration's
-//! output line is captured. Each iteration is one independent trial of the
-//! write-close-exit window in which a parent-side pipe drain races the
-//! death-bridge's `peer_dead` flip; a dropped line means the reader returned
-//! EOF with bytes still in the ring. The exit code is the verdict; the
-//! `[pipestress-tester]` line is advisory.
+//! Pipe EOF-drain and long-lived-spawner surface (#360, #364). Repeatedly
+//! spawns `/tests/fixtures/programs/pipestress` with a piped stdout and asserts
+//! every iteration's output line is captured. Each iteration is one independent
+//! trial of the write-close-exit window in which a parent-side pipe drain races
+//! the death-bridge's `peer_dead` flip; a dropped line means the reader returned
+//! EOF with bytes still in the ring.
 //!
-//! A doorbell trial follows: the tester writes `DOORBELL_WRITES` small writes
+//! A doorbell trial follows: the spawner writes `DOORBELL_WRITES` small writes
 //! into the stdin of the fixture's `sink` mode, reports the throughput and
 //! both ends' pipe notification sends and waits (`std::os::seraph::pipe`),
 //! and fails when either end sent more notifications than its peer announced
 //! waits: a pipe end rings its peer only for a wait the peer announced.
 //!
-//! The tester is also the #364 long-lived-spawner fixture: each iteration
-//! churns ~5 sub-page retype chunks through this process's pooled object
+//! The spawner is also the #364 long-lived-spawner fixture: each iteration
+//! churns ~5 sub-page retype chunks through its process's pooled object
 //! slab (the pipe's data/space notifications, the bridge completion
 //! notification, the child death `EventQueue`, the bridge thread's
 //! done-notification). The pooled slab recycles the bytes the kernel
@@ -26,17 +25,22 @@
 //! count stays flat across the run; a pool that instead refills leaks one
 //! pool-cap slot (and strands one memmgr grant) per ~63 chunks, which the
 //! slot bound below trips.
-
-#![expect(
-    clippy::expect_used,
-    reason = "a per-program tester is test code, where unwrap and expect are permitted \
-              (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait must \
-              abort the tester, and the panic's non-zero exit is its FAIL verdict"
-)]
+//!
+//! The slot bound measures the spawner's own slot growth, so the body runs in
+//! a fresh `/tests/svctest pipestress-spawner` process: `pipestress_phase`
+//! spawns it with a piped stdout, logs every line it prints, and asserts it
+//! exited successfully. The child prints a failure's message and the captured
+//! output of the failing trial to its stdout and exits non-zero.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Instant;
+
+use crate::bootstrap::Caps;
+use crate::runner::Phase;
+
+/// Argv token of the fresh long-lived spawner process.
+const SPAWNER_ROLE: &str = "pipestress-spawner";
 
 /// Trial count per boot. The #360 capture rate (~1/2500 usertest runs, one
 /// exposed external spawn per run) implies a per-trial loss probability on
@@ -64,6 +68,55 @@ const DOORBELL_WRITES: u64 = 10_000;
 /// ring, so a reader that keeps up never finds it full.
 const DOORBELL_WRITE_BYTES: usize = 16;
 
+pub fn phases() -> &'static [Phase]
+{
+    &[Phase {
+        name: "pipestress",
+        run: pipestress_phase,
+    }]
+}
+
+/// Child-mode dispatch for argv tokens this module owns. Matching arms
+/// diverge via `std::process::exit`; on a miss control returns.
+pub fn reentry_main(role: &str)
+{
+    if role == SPAWNER_ROLE
+    {
+        spawner_main();
+        std::process::exit(0);
+    }
+}
+
+/// Spawn the fresh spawner process, log every line it prints, and assert it
+/// exited successfully.
+pub fn pipestress_phase(_: &Caps)
+{
+    let mut child = Command::new("/tests/svctest")
+        .arg(SPAWNER_ROLE)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn /tests/svctest pipestress-spawner failed");
+
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut out)
+        .expect("read pipestress-spawner stdout failed");
+    for line in out.lines()
+    {
+        std::os::seraph::log!("pipestress-spawner: {line}");
+    }
+    let status = child.wait().expect("pipestress-spawner wait failed");
+    assert!(
+        status.success(),
+        "pipestress: spawner exited non-zero: {:?}; captured stdout: {out:?}",
+        status.code()
+    );
+    std::os::seraph::log!("pipestress phase passed");
+}
+
 fn used_slots() -> u64
 {
     let cspace = std::os::seraph::startup_info().self_cspace;
@@ -71,14 +124,18 @@ fn used_slots() -> u64
         .expect("cap_info(CSPACE_USED) on self_cspace")
 }
 
+/// Print a failure to stdout, where the parent phase captures it, and exit
+/// non-zero.
 fn fail(msg: &str, captured: &str) -> !
 {
-    println!("[pipestress-tester] FAIL {msg}");
+    println!("pipestress: FAIL {msg}");
     println!("captured stdout: {captured:?}");
     std::process::exit(1);
 }
 
-fn main()
+/// The body of the spawner process: the spawn-drain loop, the output check,
+/// the CSpace-slot growth bound and the doorbell trial.
+fn spawner_main()
 {
     let mut baseline: u64 = 0;
     let mut peak: u64 = 0;
@@ -123,13 +180,13 @@ fn main()
         if done % 50 == 0
         {
             peak = peak.max(used_slots());
-            println!("[pipestress-tester] {done} / {ITERATIONS} iterations");
+            std::os::seraph::log!("pipestress: {done} / {ITERATIONS} iterations");
         }
     }
 
     peak = peak.max(used_slots());
     let growth = peak.saturating_sub(baseline);
-    println!("[pipestress-tester] slots baseline {baseline} peak {peak} growth {growth}");
+    std::os::seraph::log!("pipestress: slots baseline {baseline} peak {peak} growth {growth}");
     if growth > SLOT_SLACK
     {
         fail(
@@ -140,7 +197,7 @@ fn main()
 
     doorbell_trial();
 
-    println!("[pipestress-tester] PASS");
+    std::os::seraph::log!("pipestress: spawner PASS");
 }
 
 /// One end's pipe counters across a run: notification sends and waits.
@@ -225,10 +282,13 @@ fn doorbell_trial()
         .checked_div(micros)
         .unwrap_or(0)
         / 1024;
-    println!(
-        "[pipestress-tester] doorbell: {DOORBELL_WRITES} writes of {DOORBELL_WRITE_BYTES} B in \
+    std::os::seraph::log!(
+        "pipestress: doorbell: {DOORBELL_WRITES} writes of {DOORBELL_WRITE_BYTES} B in \
          {micros} us, {kib_per_s} KiB/s; writer {} sends {} waits; reader {} sends {} waits",
-        writer.sends, writer.waits, reader.sends, reader.waits
+        writer.sends,
+        writer.waits,
+        reader.sends,
+        reader.waits
     );
     if bytes != sent
     {

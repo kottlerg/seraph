@@ -3,11 +3,8 @@
 Thread-churn reclaim fixture for the CSpace-slot leak regression (#240) and the memmgr-pool
 footprint regression (#274). It spawns and joins, then spawns and detaches, batches of `std`
 threads, and asserts that neither its populated CSpace-slot count nor memmgr's free pool drifts
-across the churn. Its tester, `threadchurn-tester`, is a per-program tester that `usertest`
-discovers at `/tests/programs/threadchurn` and runs, per the [per-program tester
-protocol](../../../docs/testing.md#per-program-tester-protocol). The fixture itself installs at
-`/tests/fixtures/programs/threadchurn`; the threading is plain `std`, and only the sampling reaches
-Seraph surfaces.
+across the churn. The fixture installs at `/tests/fixtures/programs/threadchurn`; the threading is
+plain `std`, and only the sampling reaches Seraph surfaces.
 
 ---
 
@@ -17,13 +14,8 @@ Seraph surfaces.
 threadchurn/
 ├── Cargo.toml             # threadchurn; depends on syscall and syscall-abi
 ├── README.md
-├── src/
-│   └── main.rs            # Warm-up, join churn, detach churn, slot and pool bounds
-└── tester/
-    ├── Cargo.toml         # threadchurn-tester
-    └── src/
-        └── main.rs        # Runs the fixture demand-paged and pinned, checks its marker and
-                           #   exit status
+└── src/
+    └── main.rs            # Warm-up, join churn, detach churn, slot and pool bounds
 ```
 
 ---
@@ -94,19 +86,26 @@ panicked worker panics the fixture, so it exits non-zero with no stdout marker.
 
 ---
 
-## Tester
+## Driven By
 
-The tester runs `/tests/fixtures/programs/threadchurn` twice: demand-paged, the system default, and
-then pinned (`std::os::seraph::process::CommandExt::pinned`), with no pager. In the pinned run each
-thread's stack is mapped at spawn from a memmgr grant
+The `threadchurn` phase of svctest (`services/svctest/src/phases/threadchurn.rs`) runs
+`/tests/fixtures/programs/threadchurn` twice: demand-paged, the system default, and then pinned
+(`std::os::seraph::process::CommandExt::pinned`), with no pager. In the pinned run each thread's
+stack is mapped at spawn from a memmgr grant
 ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Spawned-thread stacks), so a
 stack that a join or the reaper does not return trips the pool bound. For each run it spawns the
-fixture with a piped stdout, reads stdout to EOF, and waits for the child. It fails when any line
-contains `threadchurn: FAIL`, when no line contains `threadchurn: PASS`, or when the child exits
-non-zero, checked in that order; a pinned run's reason names it with ` (pinned)`. It prints
-`[threadchurn-tester] PASS` or `[threadchurn-tester] FAIL <reason>` to stdout and exits `0` or `1`;
-a failed spawn, read, or wait panics and also exits non-zero. The exit code is the verdict and the
-`PASS`/`FAIL` line is advisory, per [docs/testing.md](../../../docs/testing.md#contract).
+fixture with a piped stdout, reads stdout to EOF, and waits for the child. It asserts, in this
+order, and a run's panic message names it with ` (pinned)` for the pinned run:
+
+- no stdout line contains `threadchurn: FAIL`; otherwise it panics with `threadchurn: fixture
+  reported FAIL`;
+- some stdout line contains `threadchurn: PASS`; otherwise it panics with `threadchurn: fixture PASS
+  marker missing`;
+- the child's exit status is a success; otherwise it panics with `threadchurn: fixture exited
+  non-zero` and the exit code.
+
+A failed spawn, read, or wait panics the phase as well. After both runs it logs `threadchurn phase
+passed`.
 
 ---
 
@@ -114,11 +113,11 @@ a failed spawn, read, or wait panics and also exits non-zero. The exit code is t
 
 | Document | Content |
 |---|---|
-| [docs/testing.md](../../../docs/testing.md) | Per-program tester protocol, sysroot layout, and harness gating |
+| [docs/testing.md](../../../docs/testing.md) | Sysroot layout and harness gating |
 | [docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md) | memmgr grants, mid-life release, and ruststd's pooled object-slab recycling |
 | [memmgr IPC Interface](../../memmgr/docs/ipc-interface.md) | `QUERY_POOL_STATUS` and `RELEASE_MEMORY_CAPS` wire shapes |
 | [Syscall Interface Specification](../../../core/kernel/docs/syscalls.md) | `SYS_CAP_INFO` field reads |
-| [programs/usertest/README.md](../../../programs/usertest/README.md) | The orchestrator that runs the tester |
+| [services/svctest/README.md](../../svctest/README.md) | The service that runs the phase |
 
 ---
 

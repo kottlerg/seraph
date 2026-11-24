@@ -5,8 +5,8 @@
 
 //! Mkdisk command: re-mirror `rootfs/` into `sysroot/`, re-synthesise test
 //! fixtures, choose what the image boots (the harness whose bundle it
-//! composes, the svctest boot's staging, the bootloader's knobs, the log-level
-//! configuration), and
+//! composes, the staging of a services-layer boot, svctest's or ubench's, the
+//! bootloader's knobs, the log-level configuration), and
 //! regenerate `disk.img` (and `disk-data.img` under `--split-data`) at the
 //! requested block size without invoking cargo. The pack checks the images it
 //! writes ([`crate::image_check`]). Hand-staging a test recipe (copying it
@@ -42,7 +42,8 @@ use crate::util::step;
 /// installs the repository's data files in either case, then the log-level
 /// configuration `--log-levels` names over the repository's, records the
 /// harness `--harness` names, stages the svctest boot with the fixture set
-/// `--svctest` names, stages exactly the knobs `--knob` names, and
+/// `--svctest` names or the ubench boot under `--ubench`, stages exactly the
+/// knobs `--knob` names, and
 /// regenerates `disk.img` (and `disk-data.img` under `--split-data`) at the
 /// requested block size. Cargo is not invoked; the existing per-arch sysroot
 /// from a prior `cargo xtask build` is reused.
@@ -51,7 +52,8 @@ use crate::util::step;
 ///
 /// When the sysroot was built for another architecture, the `--log-levels`
 /// file cannot be read or holds a line init's parser refuses, and as
-/// [`sysroot::install_rootfs`], [`svctest_stage::stage`], [`esp::set_knobs`]
+/// [`sysroot::install_rootfs`], [`svctest_stage::stage`],
+/// [`svctest_stage::stage_ubench`], [`esp::set_knobs`]
 /// and [`disk::create_disk_image`] fail.
 pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
 {
@@ -84,6 +86,10 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
     if let Some(set) = args.svctest
     {
         svctest_stage::stage(&ctx.sysroot, set.set())?;
+    }
+    if args.ubench
+    {
+        svctest_stage::stage_ubench(&ctx.sysroot)?;
     }
     esp::set_knobs(ctx, &args.knob)?;
     let layout = disk::DiskLayout {

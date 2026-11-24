@@ -496,7 +496,11 @@ fn refused_restores(authority: u64, badge: u64, checkpoint: &Checkpoint)
         "{PHASE}: a pinned restore"
     );
     assert_eq!(
-        refused("/programs/hello", checkpoint.handle(), false),
+        refused(
+            "/tests/fixtures/programs/spawn-target",
+            checkpoint.handle(),
+            false
+        ),
         Err(std::io::ErrorKind::Unsupported),
         "{PHASE}: a restore under another binary's name"
     );

@@ -349,7 +349,12 @@ jobs:
         # staged by `cargo xtask mkdisk --svctest ci`, which co-stages the
         # `ci` fixture set below and records the set in svctest's staged
         # recipe, and svctest fails a boot whose image stages other fixtures
-        # than the record declares (docs/testing.md § Gating). `cargo xtask mkdisk`
+        # than the record declares (docs/testing.md § Gating). The svctest
+        # staging also composes a services-layer image: it drops the
+        # programs layer's recipes (the terminal's among them), stages
+        # sessiond's and crashd's svctest recipes, and the pack leaves the
+        # programs layer (/programs/, /tests/programs/, usertest) out of the
+        # image, so svctest's boot runs no program. `cargo xtask mkdisk`
         # re-mirrors rootfs and repacks the FAT image without invoking
         # cargo. ktest swaps the bundle's `init` entry via
         # `cargo xtask mkdisk --harness ktest`, which repacks the disk
@@ -372,11 +377,11 @@ jobs:
         # co-stages reserve-creator (reserve-creator.svc), svctest's fixture for
         # a reserve creator's create while memory is critical.
         #
-        # The functional harness boots also drop the autostarted `terminal`
-        # (a user-facing program, not part of the services/programs substrate
-        # under test) so the boot is controlled. `--repack-only` makes the
-        # removal stick: a normal repack re-mirrors rootfs, which would restore
-        # terminal.svc. The terminal is exercised in its own boot (the
+        # The usertest boot also drops the autostarted `terminal` (a
+        # user-facing program, not part of the programs substrate under test)
+        # so the boot is controlled. `--repack-only` makes the removal and
+        # the staging stick: a normal repack re-mirrors rootfs, which would
+        # restore terminal.svc. The terminal is exercised in its own boot (the
         # `terminal` case, below).
         #
         # The usertest cell also packs the log-level configuration that sets
@@ -388,13 +393,15 @@ jobs:
         # test `the_mapredo_knob_redoes_the_first_attempt_alone` holds the redo
         # to one.
         #
-        # The svctest cell also drops crashd (the crash service, default-on), so
-        # one boot per arch and profile runs an image without it: its faults,
-        # crasher's among them, must kill as with no handler and leave no crash
-        # report (`--crash-reports none` on its boot, below). The usertest cell
-        # keeps crashd and checks the crashme fixture's reports; it stages
-        # crashd's test recipe over the default one, so crashd also writes a
-        # core of each crashme death to /crash, which the crashme tester checks.
+        # The `ci` set stages crashd's test recipe over the default one, so
+        # crashd writes a core of each crashme death to /crash, which svctest's
+        # crashd phases check, and the boot checks the crashme fixture's
+        # reports (`--crash-reports reports`, below). The svctest cell's
+        # second boot, of the `crash-endpoint` set, stages no crashd, so one
+        # boot per arch and profile runs an image without it: svctest takes
+        # procmgr's crash endpoint, and the faults it does not take must kill
+        # as with no handler and leave no crash report. The usertest image
+        # stages no crashd and runs no faulting fixture.
         #
         # `mkdisk --svctest` also stages the test-only device class files of
         # `sysroot/config/devmgr/tests/` (svcmgr does not scan that directory)
@@ -403,14 +410,11 @@ jobs:
         run: |
           case "${{ matrix.tester }}" in
             svctest)
-              rm -f sysroot/config/svcmgr/services/terminal.svc
-              rm -f sysroot/config/svcmgr/services/crashd.svc
               cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
                 --svctest ci
               ;;
             usertest)
               cp sysroot/config/svcmgr/tests/usertest.svc \
-                 sysroot/config/svcmgr/tests/crashd.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
               cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
@@ -433,19 +437,25 @@ jobs:
         # svctest's three runs that the previous 300 s budget cut short were
         # still passing phases; its worst is the slowest one's projected
         # completion (the phases it had left, at its own pace, from a passing
-        # run's log), above the 297.5 s of its worst observed pass.
+        # run's log), above the 297.5 s of its worst observed pass. The svctest
+        # worsts marked (est.) add to that worst the sum of the seven testers
+        # whose checks svctest's phases took over (crashme, deadline,
+        # debugger, pipestress, stdiotest, threadchurn, threadstack), at its
+        # largest in usertest's logs of the 8 master runs from 2026-11-22 to
+        # 2026-11-24; the usertest budgets keep the worst of a boot that ran
+        # them, an upper bound until CI's passes re-derive both.
         run: |
           case "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" in
-            riscv64-debug-svctest)    budget=1140 ;;  # worst pass 372.3 s
+            riscv64-debug-svctest)    budget=1380 ;;  # worst pass 456.8 s (est.)
             riscv64-debug-usertest)   budget=540 ;;   # worst pass 168.4 s
             riscv64-debug-ktest)      budget=300 ;;   # worst pass 81.9 s
-            riscv64-release-svctest)  budget=660 ;;   # worst pass 201.0 s
+            riscv64-release-svctest)  budget=780 ;;   # worst pass 246.2 s (est.)
             riscv64-release-usertest) budget=240 ;;   # worst pass 66.4 s
             riscv64-release-ktest)    budget=240 ;;   # worst pass 70.9 s
-            x86_64-debug-svctest)     budget=480 ;;   # worst pass 159.0 s
+            x86_64-debug-svctest)     budget=660 ;;   # worst pass 204.8 s (est.)
             x86_64-debug-usertest)    budget=240 ;;   # worst pass 61.4 s
             x86_64-debug-ktest)       budget=480 ;;   # worst pass 153.3 s
-            x86_64-release-svctest)   budget=420 ;;   # worst pass 129.5 s
+            x86_64-release-svctest)   budget=540 ;;   # worst pass 160.9 s (est.)
             x86_64-release-usertest)  budget=180 ;;   # worst pass 39.3 s
             x86_64-release-ktest)     budget=540 ;;   # worst pass 175.8 s
             *) echo "no budget for this cell" >&2; exit 1 ;;
@@ -472,13 +482,13 @@ jobs:
           # run-saved artifact below, so a cell's per-phase timings
           # can be compared across heads.
           # The boot also checks the crash service's report blocks in its log:
-          # the svctest image staged no crashd, so its log must hold no crash
-          # report; the usertest boot ran the crashme fixture with crashd
-          # staged, whose reports must be there and well-formed.
+          # the svctest boot ran the crashme fixture with crashd staged, whose
+          # reports must be there and well-formed; the usertest image staged
+          # no crashd, so its log must hold no crash report.
           crash_reports=
           case "${{ matrix.tester }}" in
-            svctest)  crash_reports="--crash-reports none" ;;
-            usertest) crash_reports="--crash-reports reports" ;;
+            svctest)  crash_reports="--crash-reports reports" ;;
+            usertest) crash_reports="--crash-reports none" ;;
           esac
           # The usertest boot also checks the log-level configuration its
           # staging packed: a debug line of vfsd and of the fatfs vfsd spawns,
@@ -500,6 +510,34 @@ jobs:
             --runs 1 --timeout "$budget" \
             --save-logs target/xtask/run-saved $test_devices $crash_reports \
             "${checks[@]}"
+
+      - name: Run svctest's crash-endpoint boot
+        if: matrix.tester == 'svctest'
+        # The `crash-endpoint` set: no fixture and no crashd, and svctest runs
+        # its startup and fixture-check phases and the crash_endpoint phase,
+        # which takes procmgr's crash endpoint (docs/testing.md § Gating). Its
+        # log must hold no crash report. Its budget follows the cell's rule
+        # (docs/build-system.md § Continuous Integration) from an estimated
+        # worst: the svctest cell's worst time to the end of its
+        # svctest_fixtures phase plus its crash_endpoint phase, in the 8 master
+        # runs above, and 5 s for the firmware and the power-off; its logs go
+        # to their own directory, since
+        # a saved log is named by its architecture, CPU count and run alone.
+        run: |
+          cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
+            --svctest crash-endpoint
+          case "${{ matrix.arch }}-${{ matrix.profile }}" in
+            riscv64-debug)    budget=180 ;;  # worst pass 20.7 s (est.)
+            riscv64-release)  budget=120 ;;  # worst pass 13.0 s (est.)
+            x86_64-debug)     budget=120 ;;  # worst pass 14.6 s (est.)
+            x86_64-release)   budget=120 ;;  # worst pass 11.3 s (est.)
+            *) echo "no budget for this cell" >&2; exit 1 ;;
+          esac
+          cargo xtask run \
+            --arch ${{ matrix.arch }} \
+            --runs 1 --timeout "$budget" \
+            --save-logs target/xtask/run-saved/crash-endpoint --test-devices \
+            --crash-reports none
 
       - name: Run ${{ matrix.tester }}'s cases
         # The host-driven cases of `cargo xtask test`'s registry this cell's
@@ -551,6 +589,8 @@ jobs:
           path: |
             target/xtask/run-saved/*.log
             target/xtask/run-saved/*.crash.txt
+            target/xtask/run-saved/crash-endpoint/*.log
+            target/xtask/run-saved/crash-endpoint/*.crash.txt
           if-no-files-found: ignore
           retention-days: 14
 
@@ -621,17 +661,12 @@ jobs:
             --runs 1 --timeout 300 --save-logs target/xtask/bench
 
       - name: Stage the ubench suite (${{ matrix.arch }})
-        # The init harness's image with ubench's recipe staged and the
-        # terminal dropped, so it adds no output of its own to the framebuffer
-        # console_write measures (logd's mirror of the log lines still does); `--repack-only` keeps the staging, as the
-        # functional harness cells' staging does (services/ubench/README.md
-        # § Running).
+        # The init harness's services-layer image with ubench's recipe staged
+        # (`mkdisk --ubench`): it holds no program, so no terminal adds output
+        # of its own to the framebuffer console_write measures (logd's mirror
+        # of the log lines still does) (services/ubench/README.md § Running).
         run: |
-          cargo xtask mkdisk --arch ${{ matrix.arch }} --harness init
-          cp sysroot/config/svcmgr/tests/ubench.svc \
-             sysroot/config/svcmgr/services/
-          rm -f sysroot/config/svcmgr/services/terminal.svc
-          cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
+          cargo xtask mkdisk --arch ${{ matrix.arch }} --harness init --ubench
 
       - name: Boot ubench under icount
         # As the ktest boots, with a framebuffer for console_write; the logs

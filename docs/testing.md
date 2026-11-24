@@ -578,15 +578,16 @@ is therefore not gated: it costs nothing on hardware, and the functional cells s
 profiles. [core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md)
 § Profile gives the counts of both profiles per path.
 
-A one-CPU count gates only when it does not include time blocked on a device completion. The
-completion arrives at host time: a guest blocked on it retires no instructions, and its clock
-follows the host's time until QEMU completes the request, so the count follows the host's I/O
-latency. `fsbench.write`, which writes through the filesystem's page cache to the disk, is such a
-benchmark at every size, and is reported, not gated; a regression of the write path's
-instructions shows in the cell's report and in host mode, not as a failure. `fsbench.read` gates:
-its untimed open, fixture check and warm-up reads fill the filesystem's page cache with the file,
-so no timed read waits on the disk. A benchmark is classified by the same test: one whose timed
-samples wait on a device joins the set (`ICOUNT_IO_BOUND` in `xtask/src/benchmark.rs`).
+A one-CPU count gates only when its timed window does not idle. While every vCPU idles, the
+guest's clock follows the host's time, so a window that idles counts host time, which no band
+bounds: one blocked on a device completion, which arrives at host time, counts the host's I/O
+latency, and one waiting on a timer counts the host time its idle took. `fsbench.write`, which
+writes through the filesystem's page cache to the disk, is such a benchmark at every size, and is
+reported, not gated; a regression of the write path's instructions shows in the cell's report and
+in host mode, not as a failure. `fsbench.read` gates: its untimed open, fixture check and warm-up
+reads fill the filesystem's page cache with the file, so no timed read waits on the disk. A
+benchmark is classified by the same test: one whose timed samples idle, on a device, a timer or
+any other event, joins the set (`ICOUNT_IO_BOUND` in `xtask/src/benchmark.rs`).
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host

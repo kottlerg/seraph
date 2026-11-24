@@ -220,11 +220,10 @@ const SETTLE_BOUND: Duration = Duration::from_secs(30);
 const SETTLE_POLL: Duration = Duration::from_millis(50);
 /// How long the phase's totals and the processes `LIST_PROCESSES` lists must
 /// hold unchanged before the phase takes its baseline: twice the one-second
-/// retry with which a program replaces what oomd stopped in an earlier phase,
-/// once memory allows (the terminal's next session, `RETRY` in
-/// programs/terminal/src/session.rs; svcmgr's restart waiting for memory,
-/// `MEMORY_RETRY_MS` in services/svcmgr/svc-defs/src/memory_wait.rs). A
-/// process started after the baseline takes free pages the settle then misses.
+/// retry with which svcmgr restarts a service oomd stopped in an earlier
+/// phase, once memory allows (`MEMORY_RETRY_MS` in
+/// services/svcmgr/svc-defs/src/memory_wait.rs). A process started after the
+/// baseline takes free pages the settle then misses.
 const BASELINE_QUIET: Duration = Duration::from_secs(2);
 /// How long the phase waits for its totals and the processes to hold for
 /// [`BASELINE_QUIET`]. A test wait bound.

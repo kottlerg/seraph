@@ -604,12 +604,23 @@ const STAY_SPINNERS: usize = 2;
 const STAY_WINDOW_MS: u64 = 3;
 
 /// Pages of the first `CSpace` pool whose delete keeps the case's CPU in the
-/// kernel; each attempt that ends before the observer's window doubles it.
+/// kernel; an attempt whose delete ends before the observer's poll sizes the
+/// next pool from the rate that delete measured ([`next_stay_pages`]).
 const STAY_FIRST_PAGES: u64 = 4096;
 
-/// Attempts of [`leftover_posts_while_their_cpu_stays_in_the_kernel`] before it
-/// skip-passes; the last pool is 32 times the first, memory permitting.
-const STAY_ATTEMPTS: u32 = 6;
+/// Milliseconds a pool's delete is sized to last: the observer's window and the
+/// poll's margin, with 2 ms to spare, so an observer that is running when the
+/// delete starts polls inside it.
+const STAY_TARGET_MS: u64 = STAY_WINDOW_MS + STAY_MARGIN_US / 1000 + 2;
+
+/// Largest factor one attempt grows the pool by, so a delete too short to
+/// measure well does not size the next pool past memory at once.
+const STAY_MAX_GROWTH: u64 = 16;
+
+/// Attempts of [`leftover_posts_while_their_cpu_stays_in_the_kernel`]; once a
+/// pool's delete outlasts the target, an attempt is inconclusive only when its
+/// observer ran late.
+const STAY_ATTEMPTS: u32 = 8;
 
 /// Microseconds the observer's poll must precede the end of the case's delete
 /// by to count: more than the delete's own return drain and the reading after
@@ -690,9 +701,10 @@ extern "C" fn stay_observer_entry(queue: u64) -> !
 /// as [`leftover_posts_reach_a_busy_cpu`] does, then deletes a large `CSpace`
 /// pool, whose clear keeps its CPU in the kernel; an observer on the next CPU
 /// spins through several ticks and polls the leftover queue while that delete
-/// still runs. A delete that ends first is retried with a pool twice the size,
-/// and the case skip-passes when memory runs out first. Fails if the leftovers
-/// wait for the CPU that left them, or for an idle CPU.
+/// still runs. A delete that ends first is retried with a pool sized from the
+/// rate it measured to outlast the window; memory that cannot fund that pool
+/// fails the case. Fails if the leftovers wait for the CPU that left them, or
+/// for an idle CPU.
 pub fn leftover_posts_while_their_cpu_stays_in_the_kernel(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -736,46 +748,74 @@ fn stay_attempts(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> T
     reach_case_cpu()?;
     let per_ms = cycles_per_ms()?;
     OBSERVER_WINDOW.store(per_ms.saturating_mul(STAY_WINDOW_MS), Ordering::Relaxed);
-    let mut pages = STAY_FIRST_PAGES;
+    let target = per_ms.saturating_mul(STAY_TARGET_MS);
+    let available = cap_info(ctx.memory_base, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "stay: cap_info(available) failed")?;
+    // The largest pool the source Memory funds with the headroom left over;
+    // each attempt returns its pool before the next one.
+    let fundable = (available / syscall_abi::PAGE_SIZE)
+        .checked_sub(STAY_HEADROOM_PAGES + 1)
+        .filter(|&pages| pages > 0)
+        .ok_or(STAY_NO_MEMORY)?;
+    let mut pages = STAY_FIRST_PAGES.min(fundable);
     for _ in 0..STAY_ATTEMPTS
     {
-        let available = cap_info(ctx.memory_base, CAP_INFO_MEMORY_AVAILABLE)
-            .map_err(|_| "stay: cap_info(available) failed")?;
-        let need = pages
-            .checked_add(STAY_HEADROOM_PAGES)
-            .and_then(|p| p.checked_mul(syscall_abi::PAGE_SIZE))
-            .ok_or("stay: pool size out of range")?;
-        if available <= need
-        {
-            break;
-        }
-        match stay_attempt(ctx, (first, rest), spinners, per_ms, pages)?
+        let (outcome, took) = stay_attempt(ctx, (first, rest), spinners, per_ms, pages)?;
+        match outcome
         {
             Some(true) => return Ok(()),
             Some(false) =>
             {
                 return Err("stay: no leftover posted while their CPU stayed in the kernel");
             }
-            None => pages = pages.saturating_mul(2),
+            None =>
+            {
+                let next = next_stay_pages(pages, took, target);
+                if next > pages && pages >= fundable
+                {
+                    return Err(STAY_NO_MEMORY);
+                }
+                pages = next.min(fundable);
+            }
         }
     }
-    crate::log(
-        "ktest: sole_reference::leftover_posts_while_their_cpu_stays_in_the_kernel SKIP (no delete outlasted the window)",
-    );
+    crate::log_args(format_args!(
+        "ktest: sole_reference::leftover_posts_while_their_cpu_stays_in_the_kernel inconclusive after {STAY_ATTEMPTS} attempts (no observer poll ran inside a delete)"
+    ));
     Ok(())
+}
+
+/// The failure of [`leftover_posts_while_their_cpu_stays_in_the_kernel`] when
+/// the source Memory cannot fund a pool whose delete outlasts the observer's
+/// window: a setup failure, not an inconclusive attempt.
+const STAY_NO_MEMORY: &str = "stay: memory cannot fund a pool whose delete outlasts the window";
+
+/// The pool of the attempt after one of `pages` whose delete took `took`
+/// cycles: grown so that its delete, at the rate just measured, takes at least
+/// `target` cycles, by at least twice and at most [`STAY_MAX_GROWTH`] times;
+/// unchanged when the delete already took that long, since the attempt was then
+/// inconclusive only because its observer ran late.
+fn next_stay_pages(pages: u64, took: u64, target: u64) -> u64
+{
+    if took >= target
+    {
+        return pages;
+    }
+    let growth = target.div_ceil(took.max(1)).clamp(2, STAY_MAX_GROWTH);
+    pages.saturating_mul(growth)
 }
 
 /// One attempt with a pool of `pages`: `Some(posted)` when the observer's
 /// poll ran while the case's delete did, `posted` saying whether it found a
-/// leftover; `None` when the delete ended first. Every binding is checked to
-/// post once either way.
+/// leftover; `None` when the delete ended first; and beside it the cycles the
+/// delete took. Every binding is checked to post once either way.
 fn stay_attempt(
     ctx: &TestContext,
     queues: (u64, u64),
     spinners: usize,
     per_ms: u64,
     pages: u64,
-) -> Result<Option<bool>, &'static str>
+) -> Result<(Option<bool>, u64), &'static str>
 {
     let pool =
         cap_create_cspace(ctx.memory_base, 0, 1).map_err(|_| "stay: cap_create_cspace failed")?;
@@ -806,7 +846,9 @@ fn stay_attempt(
         per_ms,
         pages,
     )
-    .and_then(|returned_us| stay_collect(queues, returned_us));
+    .and_then(|(returned_us, took)| {
+        stay_collect(queues, returned_us).map(|outcome| (outcome, took))
+    });
     SPIN_STOP.store(true, Ordering::Release);
     for child in children.iter_mut().flatten()
     {
@@ -829,7 +871,8 @@ const STAY_CHILDREN: usize = STAY_SPINNERS + 1;
 /// queues `(first, rest)` to `object`, start the observer and the spinners
 /// into `children`, make the fall to one, delete the pool (clearing `pool`
 /// once it is gone), and wait for the observer's poll. Returns the kernel's
-/// elapsed microseconds read just after the pool's delete returned.
+/// elapsed microseconds read just after the pool's delete returned, and the
+/// cycles the delete took.
 #[expect(
     clippy::too_many_arguments,
     reason = "the attempt's resources, which its caller releases on every path"
@@ -843,7 +886,7 @@ fn stay_window(
     spinners: usize,
     per_ms: u64,
     pages: u64,
-) -> Result<u64, &'static str>
+) -> Result<(u64, u64), &'static str>
 {
     let pool_cap = pool.ok_or("stay: no pool")?;
     cap_create_cspace(ctx.memory_base, pool_cap, pages)
@@ -879,7 +922,9 @@ fn stay_window(
     // No syscall before the pool's delete: its return would drain the
     // leftovers on this CPU.
     DELETE_ENTERED.store(true, Ordering::Release);
+    let entered = cycles();
     let deleted = cap_delete(pool_cap);
+    let took = cycles().wrapping_sub(entered);
     let returned_us = system_info(SystemInfoType::ElapsedUs as u64)
         .map_err(|_| "stay: system_info(ElapsedUs) failed");
     deleted.map_err(|_| "stay: pool delete failed")?;
@@ -894,7 +939,7 @@ fn stay_window(
         }
         core::hint::spin_loop();
     }
-    Ok(returned_us)
+    Ok((returned_us, took))
 }
 
 /// Start the observer of [`stay_attempt`] on [`OBSERVER_CPU`], polling its

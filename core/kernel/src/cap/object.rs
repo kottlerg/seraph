@@ -102,12 +102,15 @@ pub struct KernelObjectHeader
     /// multiply; bit 31 is [`REF_OBSERVED`], set while a sole-reference
     /// observer is bound. While the object waits on a dealloc cascade
     /// ([`CascadeStack`]) its count is 0, the flag clear, and this field holds
-    /// the low 32 bits of the stack link instead.
+    /// the low 32 bits of the stack link instead, but for an `AddressSpace`,
+    /// which keeps its link in [`AddressSpaceObject::deferred_next`] and reads
+    /// 0 here until it is freed.
     pub ref_count: AtomicU32,
     /// Concrete type, for use during deallocation.
     pub obj_type: ObjectType,
     /// The high 24 bits of the dealloc-cascade link ([`CascadeStack`]) while
-    /// the object is queued on one, and zero at every other time. The bytes
+    /// the object is queued on one, and zero at every other time; always zero
+    /// for an `AddressSpace`, whose link is in its wrapper. The bytes
     /// also pad the header to 8-byte alignment for `ancestor`. Public because
     /// mint sites outside this module build the header by struct literal.
     pub cascade_link_hi: [u8; 3],
@@ -3495,7 +3498,7 @@ unsafe fn unlink_dying_waiter(
 const CASCADE_LINK_BITS: u32 = 56;
 
 /// The objects a [`dealloc_object`] call has orphaned and not yet torn down:
-/// a LIFO linked through the objects' own headers, so it holds any number of
+/// a LIFO linked through the objects themselves, so it holds any number of
 /// them without allocating.
 ///
 /// Only a refcount-0 object that nothing else references, and that is on no
@@ -4069,7 +4072,7 @@ pub unsafe fn object_for_new_slot(
 /// Each object one of those releases leaves unreferenced is pushed onto a
 /// [`CascadeStack`] local to this call (and a `CSpace` wrapper's first run re-pushes the wrapper beneath its slots'
 /// objects, for the second run that returns its pool), linked through the
-/// objects' own headers, and this function tears the stack down, most recent
+/// objects themselves, and this function tears the stack down, most recent
 /// first, until it is empty. No arm recurses into `dealloc_object`, so the
 /// call's stack use is a constant whatever the fan-out (a caller-sized wait
 /// set, a chain of observer nodes, a `CSpace`'s slots) or the depth of the

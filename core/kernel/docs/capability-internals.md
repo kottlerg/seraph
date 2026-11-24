@@ -510,7 +510,9 @@ queues the wrapper on the cascade stack beneath the objects its slots held, as [
 Teardown](#teardown) describes; those objects, and every cascade they start, are torn down first,
 so the bodies the `CSpace`'s own slots held are freed to its arena before the second run. That run
 makes one pass over its arena pages, clearing each one's `owner` under the page's lock and keeping,
-with the owner's hold, every page whose count shows a live chunk; no chunk can be allocated any
+with the owner's hold, every page whose count shows a live chunk, and takes the interrupts pending
+on its CPU after every `ORPHAN_BATCH_PAGES` pages (`interrupt_window`), since the owner chose how
+many pages there are; no chunk can be allocated any
 more, so a count of one stays one, and a higher count never falls below the hold. Each kept page
 goes onto its donation record's list (its `record` names it). Every donation then goes back at once
 with its kept pages, sorted once (`cap::arena::sort_list`), cut out of its span
@@ -1128,13 +1130,13 @@ rely on the tag and generation checks described above.
 The source of a copy or derive, the parent of a memory split, and both caps of
 a memory merge or an Mmio merge are looked up unlocked, so each of those paths revalidates them
 under the write lock — same tag-bearing occupancy, same generation, same
-object, not pinned by an in-flight revoke, move, or IPC capability transfer — before touching
-the object or editing the tree. Every occupied→free transition holds the lock, so a slot that
-revalidates stays live (and stays the link's parent) for the rest of the hold. A slot freed
-meanwhile fails the call with `InvalidCapability` (a revoke, move, or IPC capability transfer
-in flight on it, `InvalidState`); the alternative — `link_child` dropping the link under a freed
-parent — would leave the new capability a derivation root outside every
-ancestor's revoke reach, and a merge would free a recycled tail index.
+object, not pinned by an in-flight revoke, move, IPC capability transfer, or range split — before
+touching the object or editing the tree. Every occupied→free transition holds the lock, so a slot
+that revalidates stays live (and stays the link's parent) for the rest of the hold. A slot freed
+meanwhile fails the call with `InvalidCapability` (a revoke, move, IPC capability transfer, or range
+split in flight on it, `InvalidState`); the alternative — `link_child` dropping the link under a
+freed parent — would leave the new capability a derivation root outside every ancestor's revoke
+reach, and a merge would free a recycled tail index.
 
 This is a deliberate design choice: a single lock avoids deadlock from ordering
 multiple per-CSpace locks, and derivation-tree edits are rare relative to
@@ -1149,6 +1151,19 @@ locks", for the contexts, the invariant each rests on, and the order in which th
 locks nest). The lock records its write holder's CPU, thread, syscall, and call
 site, and a CPU spinning for it records a lock-wait breadcrumb; the softlockup
 watchdog dump prints both.
+
+A loop whose number of holds a caller sizes (revocation, the reparent walk of deletion and the
+range splits, a move's child walk, and a dying `CSpace`'s teardown drain, below) releases the lock
+between two holds through `DerivationLock::write_unlock_between_batches`, which then takes the
+interrupts pending on its CPU (`interrupt_window`, as the page-pool seeding does, [§ Donation
+Records](#donation-records)). Such a syscall therefore masks interrupts for one batch of
+constant-time edits at a time, whatever the size of the subtree, child list, or `CSpace` it works
+through; its total length still grows with that size. The final hold and every early exit release
+the lock alone, so a call that finishes in one hold opens no window. The window holds no lock and
+keeps preemption disabled, so the thread neither switches nor migrates; it exposes nothing that the
+release does not already expose to other CPUs, and every such loop revalidates what it works on
+when it takes the lock again. The dealloc cascade's fan-out and a dying `CSpace`'s release passes
+take no derivation lock and still mask interrupts for their whole length (#1623).
 
 ### Revocation Algorithm
 
@@ -1171,7 +1186,7 @@ revoke(root_handle):
         objects, status = revoke_subtree_batch(root) // ≤ MAX_REVOKE_EDITS edits
         final batch (status ≠ MoreWork, or MAX_REVOKE_BATCHES reached):
             unpin the root
-        release derivation tree write lock
+        release derivation tree write lock; MoreWork: take pending interrupts
         dec_ref / dealloc each collected object      // outside the lock
         Cleared → return success; DeadLink → return error;
         backstop reached → return Interrupted; MoreWork → loop
@@ -1191,7 +1206,8 @@ no per-batch re-traversal. Frees never exceed edits, so the same bound sizes the
 dealloc output buffer.
 
 Between batches the lock is dropped so collected objects can be deallocated
-(`dealloc_object` may take other locks). The walk always operates on the root's
+(`dealloc_object` may take other locks), and the interrupts pending on the CPU are taken ([§ Global
+Derivation Lock](#global-derivation-lock)). The walk always operates on the root's
 current child list, so children derived concurrently between batches are still
 cleared, and the root is revalidated per batch so a root recycled mid-revoke
 stops the loop. Every batch that reports more work performed a full budget of
@@ -1210,26 +1226,28 @@ under it: its children are re-linked under its derivation parent
 (`reparent_children`) so they stay inside every ancestor's subtree. That
 walk is batched on the same terms as revocation — `MAX_REPARENT_EDITS`
 head pops per lock hold, each child detached into a clean root and
-re-linked in O(1), the lock released between batches, and a
-`MAX_REPARENT_BATCHES` backstop against a concurrent deriver — because a
+re-linked in O(1), the lock released between batches with the CPU's pending interrupts taken
+there, and a `MAX_REPARENT_BATCHES` backstop against a concurrent deriver — because a
 slot can have been derived from up to the structural ceiling of every
 CSpace. The consumed slot is revalidated under the lock before every batch
-(tag and handle generation, not pinned by an in-flight revoke, move, or IPC capability
-transfer; after its first batch the delete also checks that the slot still holds the object it
-captured, and the splits check the looked-up object from the first hold, since their lookup ran
-without the lock): a concurrent revoke starting on it stops the delete with `InvalidState` and
-children already moved stay under the parent, a concurrent delete finishing it first turns the
-delete into a success and a split into `InvalidState` with both children rolled back. The split's
-own children are inserted and linked under the original's parent inside the
-first hold, before any batch releases the lock, so they are never reachable
-but unlinked — a sibling's `SYS_CAP_MOVE` carries whatever derivation
-position it finds, and an unlinked child would leave the grantor's revoke
-reach for good. Rolling a child back checks that its slot still holds it
-under the generation minted at insert, so a sibling that deleted one (and
-refilled its slot) never has an unrelated cap freed. The handles returned to
-the caller are the ones minted under the insert's own `CSpace` lock hold, so
-such a child's handle no longer resolves; re-reading the slot after the lock
-is released would instead return a live handle to the refill.
+(tag and handle generation, not pinned by an in-flight revoke, move, IPC capability
+transfer, or range split; after its first batch the delete also checks that the slot still holds the
+object it captured, and the splits check the looked-up object from the first hold, since their
+lookup ran without the lock): a concurrent revoke starting on it stops the delete with
+`InvalidState` and children already moved stay under the parent, a concurrent delete finishing it
+first turns the delete into a success and a split into `InvalidState` with both children rolled
+back. The split's own children are inserted and linked under the original's parent inside the first
+hold, before any batch releases the lock, so they are never reachable but unlinked. From the first
+release of the lock to the split's final hold both carry the in-flight pin below, so no sibling
+derives from, copies, moves, deletes, or transfers either while the batches run: each stays
+childless and where the first hold put it, inside the grantor's revoke reach, and rolling one back
+is one constant-time step, never a walk of a child list a sibling sized. An ancestor's revoke still
+frees a pinned child, as it frees a pinned revoke root. The final hold unpins a child, and a
+rollback frees one, only while its slot still holds it under the generation minted at insert, so a
+slot such a revoke freed, and any refill of it, is left as it is. The handles returned to the caller
+are the ones minted under the insert's own `CSpace` lock hold, so a child a revoke freed before the
+split returned has a handle that no longer resolves; re-reading the slot after the lock is released
+would instead return a live handle to the refill.
 
 Because hoisting destroys intermediate parent→child edges as the flattening
 proceeds, the root is pinned for the whole multi-batch operation with the
@@ -1237,11 +1255,12 @@ proceeds, the root is pinned for the whole multi-batch operation with the
 the derivation write lock and read under it by every path that acts on it; the advisory
 pre-checks of [§ Storage: Hybrid Radix Directory](#storage-hybrid-radix-directory) read it
 without that lock, and their locked path re-decides; a move pins its source and destination
-the same way — see [Move](#move)). `SYS_CAP_DELETE`,
-`SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
-`SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, the range splits, `SYS_MMIO_MERGE`, and a further
-`SYS_CAP_REVOKE` refuse a pinned slot with `InvalidState`; IPC capability
-transfer refuses to move one — the reply direction surfaces `InvalidState` to
+the same way — see [Move](#move) — and a range split its two children, above).
+`SYS_CAP_DELETE`, `SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
+`SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, the range splits, `SYS_MMIO_MERGE`, `SYS_IRQ_MSG_ALLOC`
+on its authority, and a further `SYS_CAP_REVOKE` refuse a pinned slot with `InvalidState`; a
+syscall that only uses the slot's object (a map, a bind, `SYS_CAP_INFO`) reads no pin and acts;
+IPC capability transfer refuses to move one — the reply direction surfaces `InvalidState` to
 the server (the caller resumes with `IPC_REPLY_TRANSFER_FAILED`), the call
 direction rejects before blocking, and a refusal detected only post-commit
 delivers the message with zero caps (see
@@ -1361,7 +1380,9 @@ per derivation-lock hold, so a hold is bounded by a constant whatever the popula
 position across holds is the scan's cursor and the slot it works from.
 
 Every edit leaves the forest consistent, so the drain releases the derivation lock between holds,
-as revocation does, and a foreign traversal in a window between holds sees ordinary nodes. A revoke
+as revocation does, taking the interrupts pending on its CPU there ([§ Global Derivation
+Lock](#global-derivation-lock)), and a foreign traversal in a window between holds sees ordinary
+nodes. A revoke
 above a region hoists or frees dying slots like any others, and whatever the drain re-links goes
 under `P`, inside that revoke's subtree; a dying slot a revoke freed is skipped as empty. The scan
 passes a slot only once it is out of the forest, so a dying slot that foreign activity moves out of
@@ -1402,8 +1423,9 @@ walk is the unbounded part — a slot can have been derived from up to the
 structural ceiling of every `CSpace` — so it runs on the same terms as
 deletion's reparent walk: `MAX_REPARENT_EDITS` head pops per lock hold
 (`reparent_children`, each child detached and re-linked under the destination
-in O(1)), the derivation lock released between batches, and a
-`MAX_REPARENT_BATCHES` backstop against a concurrent deriver.
+in O(1)), the derivation lock released between batches with the CPU's pending interrupts taken
+there ([§ Global Derivation Lock](#global-derivation-lock)), and a `MAX_REPARENT_BATCHES` backstop
+against a concurrent deriver.
 
 ```
 move(src, dst):

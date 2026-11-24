@@ -1479,18 +1479,31 @@ type HolesCell = *mut *mut ArenaPage;
 #[cfg(not(test))]
 const SEED_BATCH_PAGES: u64 = 64;
 
+/// Arena pages `CSpaceKernelObject::orphan_arena_pages` passes per stretch
+/// with interrupts masked. A pass costs one arena-page lock hold and a
+/// reference-count read per page, and the arena's page count is the owner's
+/// to choose, so the pass takes this CPU's pending interrupts between
+/// batches of this many pages.
+#[cfg(not(test))]
+const ORPHAN_BATCH_PAGES: u64 = 64;
+
 /// Let this CPU take the interrupts pending on it, then return to the
 /// caller's interrupt state, with preemption disabled throughout so that an
 /// interrupt taken here cannot switch the thread out. The page-pool seeding
 /// and reclaim walks call it between their batches, whose number a caller
 /// chooses, and so do the retype free's clear of a dead object's bytes
-/// between its batches (`cap::retype`, § Freed bytes) and an explicit
+/// between its batches (`cap::retype`, § Freed bytes), an explicit
 /// placement's pre-grow between its `CSpace`-lock holds
-/// (`syscall::cap`, `pre_grow_for_explicit_slot`), so that a syscall
+/// (`syscall::cap`, `pre_grow_for_explicit_slot`), every derivation-lock
+/// loop between its holds
+/// ([`DerivationLock::write_unlock_between_batches`](crate::cap::derivation::DerivationLock::write_unlock_between_batches))
+/// and a dying `CSpace`'s pass over its arena pages
+/// (`CSpaceKernelObject::orphan_arena_pages`), so that a syscall
 /// running one masks interrupts for one batch at a time: shootdown and wakeup
 /// IPIs are acknowledged, and the timer and the heartbeat tick, meanwhile
 /// (core/kernel/docs/capability-internals.md § Storage: Hybrid Radix
-/// Directory, § Donation Records and § Teardown).
+/// Directory, § Donation Records, § Teardown, § Body Arena and § Global
+/// Derivation Lock).
 ///
 /// No lock may be held across it. Every pool is created, every retyped
 /// object freed, and every explicit placement pre-grown, after the timer is
@@ -2612,11 +2625,15 @@ impl CSpaceKernelObject
     /// carried over): each is linked onto its donation record's list of kept
     /// pages (through [`ArenaPage::next`]), and all of them onto the returned
     /// list (through [`ArenaPage::kept_next`]). A page with no live chunk is
-    /// left to go back with its donation.
+    /// left to go back with its donation. The pass takes this CPU's pending
+    /// interrupts after every [`ORPHAN_BATCH_PAGES`] pages, since the arena's
+    /// page count is the owner's to choose.
     ///
     /// # Safety
     /// The wrapper's reference count is zero and its `CSpace` is drained, so no
-    /// chunk is allocated any more; no lock is held.
+    /// chunk is allocated any more; no lock is held, and the caller runs where
+    /// an [`interrupt_window`] may open (the `CSpace` arm of
+    /// `dealloc_object_one`).
     #[cfg(not(test))]
     unsafe fn orphan_arena_pages(&self) -> *mut ArenaPage
     {
@@ -2624,8 +2641,19 @@ impl CSpaceKernelObject
         let mut cur = self
             .arena_pages
             .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let mut batch: u64 = 0;
         while !cur.is_null()
         {
+            if batch == ORPHAN_BATCH_PAGES
+            {
+                // No lock is held between pages; a chunk free on another CPU
+                // meanwhile finds a passed page's owner cleared, or a page not
+                // yet passed still owned, as it does without the window.
+                interrupt_window();
+                batch = 0;
+            }
+            // Below ORPHAN_BATCH_PAGES, reset above on reaching it.
+            batch = batch.saturating_add(1);
             // SAFETY: a page of this arena, live: it is held by the owner hold
             // the teardown now carries.
             let page = unsafe { &*cur };
@@ -4417,7 +4445,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // DERIVATION_LOCK is held per batch (bounded by
                 // MAX_DRAIN_EDITS steps), released between batches so an
                 // arbitrarily large donor-funded CSpace never stalls
-                // concurrent derivation traffic behind its teardown. The
+                // concurrent derivation traffic behind its teardown, and this
+                // CPU takes its pending interrupts there, so the drain masks
+                // them for one batch at a time (this arm runs only where a
+                // window may open: its second run opens them too). The
                 // first batch marks the CSpace draining, which closes it to
                 // IPC capability transfer and in-flight moves.
                 // `unregister_cspace` runs inside the FINAL batch's
@@ -4453,7 +4484,7 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                         crate::cap::derivation::DERIVATION_LOCK.write_unlock();
                         break;
                     }
-                    crate::cap::derivation::DERIVATION_LOCK.write_unlock();
+                    crate::cap::derivation::DERIVATION_LOCK.write_unlock_between_batches();
                 }
 
                 // The wrapper's second run, which returns the pool, comes

@@ -276,7 +276,7 @@ unsafe fn write_cap_results(buf: u64, handles: &[u64])
 // ── Capability transfer ───────────────────────────────────────────────────────
 
 /// Validate a set of transfer source slots: distinct, non-null, and not
-/// pinned by an in-flight revoke, move, or IPC capability transfer. With the
+/// pinned by an in-flight revoke, move, IPC capability transfer, or range split. With the
 /// reference-ceiling check
 /// ([`check_transfer_ref_limits`](crate::cap::transfer::check_transfer_ref_limits)),
 /// the predicate for every cap-transfer direction — `sys_ipc_call`'s and
@@ -361,7 +361,7 @@ unsafe fn prevalidate_sender_caps(cs: *mut CSpace, handles: &[u64]) -> Result<()
 ///
 /// All-or-nothing at the start: if either `CSpace` is gone, any slot is
 /// null/invalid, repeated within the same message, pinned by an in-flight
-/// revoke, move, or IPC capability transfer (`CapabilitySlot::pinned`), names
+/// revoke, move, IPC capability transfer, or range split (`CapabilitySlot::pinned`), names
 /// an object whose reference count is at `REF_COUNT_LIMIT` (`QuotaExceeded`),
 /// or the destination is full (`pre_allocate` fails), returns an error and no
 /// caps are transferred.
@@ -567,7 +567,7 @@ unsafe fn transfer_caps_between_threads(
 /// `cancel_ipc_block` / `dealloc_object(Thread)` can clear to null or free. The
 /// server pre-allocated worst-case headroom before blocking, so the move cannot
 /// OOM; on failure — reachable when a source cap goes stale or is pinned by an
-/// in-flight revoke, move, or IPC capability transfer between the send and this
+/// in-flight revoke, move, IPC capability transfer, or range split between the send and this
 /// transfer, or its object reaches the reference ceiling meanwhile — the
 /// message is delivered without caps (the sender keeps them; the
 /// transfer fails atomically) rather than stranding the already-parked caller.
@@ -722,8 +722,8 @@ fn call_deadline(timeout_ms: u32) -> u64
 /// If `cap_count` > 0, the endpoint cap must have `EpRights::GRANT`. Capabilities
 /// at the specified slots are moved from the caller's `CSpace` to the server's
 /// `CSpace` all-or-nothing with the message: doomed transfers (duplicate,
-/// stale, or slots pinned by an in-flight revoke, move, or IPC capability
-/// transfer) are rejected before blocking; a refusal that arises only after the
+/// stale, or slots pinned by an in-flight revoke, move, IPC capability
+/// transfer, or range split) are rejected before blocking; a refusal that arises only after the
 /// caller has blocked degrades to delivery with zero caps (the caller keeps its
 /// capabilities).
 ///
@@ -1117,7 +1117,7 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
         // Transfer caps from caller to server (if any). The pre_allocate
         // above makes a destination OOM unlikely but does not reserve the
         // headroom. A failure here (a source cap gone stale or pinned by an
-        // in-flight revoke, move, or IPC capability transfer, a cap's object at
+        // in-flight revoke, move, IPC capability transfer, or range split, a cap's object at
         // the reference ceiling, or a destination OOM) is post-commit —
         // endpoint_recv already dequeued the sender and rebound it
         // BlockedOnReply — so the message MUST still be delivered: degrade to
@@ -1277,7 +1277,7 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 /// Capabilities move from the server's `CSpace` to the caller's `CSpace`
 /// all-or-nothing with the reply; a transfer refused after the caller was
 /// claimed (a reply slot stale, repeated, or pinned by an in-flight revoke,
-/// move, or IPC capability transfer) wakes the caller with the synthetic
+/// move, IPC capability transfer, or range split) wakes the caller with the synthetic
 /// `IPC_REPLY_TRANSFER_FAILED` label and returns the error to the server. No
 /// GRANT right check: the server is trusted by virtue of holding RECEIVE on the
 /// endpoint. A reply to a fault-blocked caller moves no capability: its label

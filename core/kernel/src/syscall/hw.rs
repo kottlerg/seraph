@@ -277,7 +277,7 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `QuotaExceeded` when no CPU a message can reach has a free slot;
 /// `OutOfMemory` when the caller's arena cannot fund the object, which a
 /// refill of its pool cures; `InvalidState` when the authority's slot is
-/// pinned by an in-flight revoke, move, or transfer; and the error of a full
+/// pinned by an in-flight revoke, move, transfer, or range split; and the error of a full
 /// `CSpace`.
 #[cfg(not(test))]
 pub fn sys_irq_msg_alloc(tf: UserFrame) -> Result<u64, SyscallError>

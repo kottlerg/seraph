@@ -788,7 +788,7 @@ impl CapabilitySlot
     /// is the list tail. Leaves the per-slot generation untouched —
     /// `CSpace::free_slot` bumps it immediately before this call and the next
     /// allocation must observe the incremented value. Zeroes the pin — a
-    /// slot freed while a revoke, move, or IPC capability transfer had it
+    /// slot freed while a revoke, move, IPC capability transfer, or range split had it
     /// pinned must not carry the pin into its next occupant (see
     /// [`pinned`](Self::pinned)).
     ///

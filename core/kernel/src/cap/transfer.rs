@@ -225,7 +225,7 @@ unsafe fn stage_move(
         {
             return Err(SyscallError::InvalidCapability);
         }
-        // A multi-batch revoke, move, or IPC capability transfer already in
+        // A multi-batch revoke, move, IPC capability transfer, or range split already in
         // flight on this slot (see `CapabilitySlot::pinned`). Transient —
         // retry once it ends.
         if slot.pinned()
@@ -328,7 +328,8 @@ unsafe fn stage_move(
 }
 
 /// Drive a pending move to completion, one [`MAX_REPARENT_EDITS`] batch
-/// per `DERIVATION_LOCK` hold, revalidating both slots before each. Never
+/// per `DERIVATION_LOCK` hold, revalidating both slots before each and taking
+/// this CPU's pending interrupts between two holds. Never
 /// returns [`MoveStep::Pending`]; the source's object reference is
 /// released here.
 ///
@@ -350,7 +351,17 @@ pub fn move_cap_drive(mv: CapMove) -> MoveStep
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held.
         let step = unsafe { drive_batch(&mv, &mut batches, MAX_REPARENT_BATCHES) };
-        DERIVATION_LOCK.write_unlock();
+        if let MoveStep::Pending(_) = step
+        {
+            // Another batch follows: take this CPU's pending interrupts
+            // between the two (no lock is held, per this function's
+            // contract); the next hold revalidates both slots.
+            DERIVATION_LOCK.write_unlock_between_batches();
+        }
+        else
+        {
+            DERIVATION_LOCK.write_unlock();
+        }
 
         match step
         {

@@ -462,9 +462,12 @@ window that enables interrupts — shootdown ack-waits, the teardown gates,
 the timer-batch quiesce (`sleep_wakeups_quiesce`), the contended `pt_lock`
 path, the `sys_thread_stop` drain and save wait (`await_stopped_save`), the `sys_thread_start`
 settle loop, the register-access wait (`with_held_frame`), the idle-stack depth sample
-(`stack_depth::idle_used_bytes`), the page-pool seeding and teardown windows between batches
-and the explicit-placement pre-grow's windows between its `CSpace`-lock holds
-(`interrupt_window` in `cap/object.rs`) — runs
+(`stack_depth::idle_used_bytes`), the page-pool seeding and teardown windows between batches,
+the explicit-placement pre-grow's windows between its `CSpace`-lock holds, a dying `CSpace`'s
+windows in its arena-page pass, and the windows between the derivation-lock holds of
+revocation, deletion, the range splits, a move, and the teardown drain
+(`interrupt_window` in `cap/object.rs`, through
+`DerivationLock::write_unlock_between_batches` for the last) — runs
 preempt-disabled and returns to the saved interrupt state through
 `restore_interrupts`, which writes that state whatever the current one; the
 contract is stated in [arch-interface.md](arch-interface.md). A window that

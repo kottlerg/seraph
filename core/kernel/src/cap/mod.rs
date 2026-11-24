@@ -51,10 +51,6 @@ pub mod registry;
 pub mod retype;
 pub mod slot;
 pub mod sole_reference;
-// Split-helper body uses production-only object/derivation internals
-// (`dealloc_object`, `link_child`, …) that are `#[cfg(not(test))]`. Its only
-// callers are the `#[cfg(not(test))]` split syscalls, so gate the whole module.
-#[cfg(not(test))]
 pub mod split;
 pub mod transfer;
 

@@ -79,8 +79,8 @@ unsafe fn resolve_src_cap(
 /// # Errors
 ///
 /// `InvalidCapability` when the slot no longer holds the resolved cap;
-/// `InvalidState` when the slot is pinned by an in-flight revoke, move, or IPC
-/// capability transfer (transient — retry after that operation completes).
+/// `InvalidState` when the slot is pinned by an in-flight revoke, move, IPC
+/// capability transfer, or range split (transient — retry after that operation completes).
 ///
 /// # Safety
 ///
@@ -2178,7 +2178,7 @@ unsafe fn resolve_delete_target(
             {
                 return Err(Ok(0));
             }
-            // A revoke, move, or IPC capability transfer is mid-flight on this
+            // A revoke, move, IPC capability transfer, or range split is mid-flight on this
             // slot (`CapabilitySlot::pinned`;
             // `core/kernel/docs/capability-internals.md` § Revocation Algorithm).
             // Transient — retry after the operation completes.
@@ -2294,11 +2294,14 @@ pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
         batches = batches.saturating_add(1);
         if !done
         {
-            crate::cap::DERIVATION_LOCK.write_unlock();
             if batches >= crate::cap::derivation::MAX_REPARENT_BATCHES
             {
+                crate::cap::DERIVATION_LOCK.write_unlock();
                 return Err(SyscallError::Interrupted);
             }
+            // Children remain: release the lock and take this CPU's pending
+            // interrupts before the next batch, which re-resolves the slot.
+            crate::cap::DERIVATION_LOCK.write_unlock_between_batches();
             continue;
         }
 
@@ -2361,7 +2364,7 @@ pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
 ///
 /// - `InvalidCapability` — the handle names no live slot, or its generation
 ///   is stale.
-/// - `InvalidState` — another revoke, a move, or an IPC capability transfer is
+/// - `InvalidState` — another revoke, a move, an IPC capability transfer, or a range split is
 ///   already in flight on this slot; or a corrupted derivation link was found
 ///   (the dangling chain was truncated and the revoke is incomplete).
 /// - `Interrupted` — the liveness backstop tripped after `MAX_REVOKE_BATCHES`
@@ -2405,10 +2408,11 @@ pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
     // operation and unpinned under the lock on every exit path
     // (`core/kernel/docs/capability-internals.md` § Revocation Algorithm).
     // SAFETY: a syscall handler, which holds `snapshot` only until it returns
-    // and neither parks nor yields meanwhile: `dealloc_object` opens interrupt
-    // windows with preemption disabled at most, and a revoke that ends its
-    // own thread is switched away from by the syscall epilogue, after this
-    // returns.
+    // and neither parks nor yields meanwhile: the window between batches and
+    // `dealloc_object` open interrupt windows with preemption disabled at
+    // most, no interrupt handler touches the scratch buffer, and a revoke that
+    // ends its own thread is switched away from by the syscall epilogue,
+    // after this returns.
     let snapshot = unsafe { super::scratch::revoke_snapshot() };
     let mut first_batch = true;
     let mut batches: u32 = 0;
@@ -2450,8 +2454,8 @@ pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
 
         if first_batch
         {
-            // A pin already set means another thread's revoke, move, or IPC
-            // capability transfer is in flight on this slot; refuse rather
+            // A pin already set means another thread's revoke, move, IPC
+            // capability transfer, or range split is in flight on this slot; refuse rather
             // than interleave two pin lifetimes on one slot.
             // SAFETY: caller_cspace validated; marker accessed only under
             // DERIVATION_LOCK.
@@ -2497,8 +2501,14 @@ pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
             // SAFETY: caller_cspace validated; marker accessed only under
             // DERIVATION_LOCK.
             unsafe { unpin_slot(caller_cspace, slot_idx) };
+            crate::cap::DERIVATION_LOCK.write_unlock();
         }
-        crate::cap::DERIVATION_LOCK.write_unlock();
+        else
+        {
+            // Another batch follows: take this CPU's pending interrupts
+            // between the two, with the root still pinned.
+            crate::cap::DERIVATION_LOCK.write_unlock_between_batches();
+        }
 
         dealloc_revoked(snapshot.get(..snapshot_count).unwrap_or(&[]));
 

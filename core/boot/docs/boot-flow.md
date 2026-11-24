@@ -40,8 +40,10 @@ reduces it to the `HardDrive` node before the End Entire node: a GPT partition w
 signature, a nonzero partition number and size, and an extent that does not wrap. It finds the
 deepest handle on that path that carries `EFI_PCI_IO_PROTOCOL` with
 `BootServices->LocateDevicePath` and reads its location with `GetLocation`. It logs two lines,
-`boot ESP` and `boot controller`. Each part is recorded present or all zero; the absence of
-either part does not fail the boot.
+`boot ESP` and `boot controller`. Each part is recorded present or all zero, and the bootloader
+goes on without either. vfsd takes the boot disk from the record: without the ESP part there is
+no boot disk and the root self-mount fails, and without the location every held disk carrying
+the ESP is a candidate ([storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
 
 After step 1 the bootloader reads the firmware's UEFI Secure Boot state, its `SecureBoot` and
 `SetupMode` variables, and logs it in one line: `on`, `off` with the reason (the firmware does

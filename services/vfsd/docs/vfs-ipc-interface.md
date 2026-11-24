@@ -37,7 +37,10 @@ created and delivered by init at vfsd's bootstrap (round 1, `caps[0]`). Round 1 
 carries the boot device record, six data words laid out by
 [`shared/ipc/src/vfsd_bootstrap.rs`](../../../shared/ipc/src/vfsd_bootstrap.rs). vfsd exits at
 bootstrap on a round 1 without a well-formed record, stores the record with its capabilities, and
-logs it at startup (`boot ESP` and `boot controller`); it uses it for nothing else.
+logs it at startup (`boot ESP` and `boot controller`). It takes the boot disk from the record:
+without its ESP part, or without exactly one held disk at its location carrying that ESP, there
+is no boot disk, no partition takes any role, and the root self-mount fails
+([storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
 Init holds a badged `SEED_AUTHORITY` SEND for `GET_SYSTEM_ROOT_CAP`
 during boot; it issues no `MOUNT`, since vfsd self-mounts root (see
 [services/init/docs/bootstrap.md](../../init/docs/bootstrap.md#per-stage-authority-transfers)).

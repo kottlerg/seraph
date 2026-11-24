@@ -4153,7 +4153,11 @@ fn cpus_current_on(
 /// The caller holds every CPU's `scheduler.lock`, and `cpu_count` is the
 /// number of CPUs whose per-CPU storage is initialised.
 #[cfg(not(test))]
-unsafe fn post_stopped(tcb: *mut ThreadControlBlock, state: ThreadState, cpu_count: usize)
+pub(crate) unsafe fn post_stopped(
+    tcb: *mut ThreadControlBlock,
+    state: ThreadState,
+    cpu_count: usize,
+)
 {
     let current_of = |cpu| {
         // SAFETY: cpu < cpu_count; scheduler slab initialised by init().

@@ -218,6 +218,17 @@ const EXIT_BOUND: Duration = Duration::from_secs(30);
 const SETTLE_BOUND: Duration = Duration::from_secs(30);
 /// How often the final wait looks again.
 const SETTLE_POLL: Duration = Duration::from_millis(50);
+/// How long the phase's totals and the processes `LIST_PROCESSES` lists must
+/// hold unchanged before the phase takes its baseline: twice the one-second
+/// retry with which a program replaces what oomd stopped in an earlier phase,
+/// once memory allows (the terminal's next session, `RETRY` in
+/// programs/terminal/src/session.rs; svcmgr's restart waiting for memory,
+/// `MEMORY_RETRY_MS` in services/svcmgr/svc-defs/src/memory_wait.rs). A
+/// process started after the baseline takes free pages the settle then misses.
+const BASELINE_QUIET: Duration = Duration::from_secs(2);
+/// How long the phase waits for its totals and the processes to hold for
+/// [`BASELINE_QUIET`]. A test wait bound.
+const BASELINE_BOUND: Duration = Duration::from_secs(60);
 /// Times the phase asks for a chunk to be made resident and reads its page
 /// again: memmgr may evict the chunk anew between the request and the read,
 /// its worker with the level held at `LOW`, or another restore's direct
@@ -1215,8 +1226,8 @@ fn swap_phase(caps: &Caps)
     // An earlier phase that took the level to `LOW` may have had memmgr evict
     // chunks of any process: make them resident first, so the store starts
     // empty.
-    let _ = settle_resident(authority, None);
-    let baseline = baseline_totals();
+    let _ = settle_resident(authority, PHASE, None);
+    let baseline = baseline_totals(authority, PHASE);
     let reserve = pool().reserve_pages();
     let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Page);
     let threads = attach(authority, process, "the fixture");
@@ -1273,7 +1284,7 @@ fn swap_phase(caps: &Caps)
     hog.release_all();
     fixture.send("exit");
     fixture.finish();
-    let end = settle_resident(authority, Some(baseline));
+    let end = settle_resident(authority, PHASE, Some(&baseline));
 
     let peaks = &hog.peaks;
     std::os::seraph::log!(
@@ -1283,41 +1294,95 @@ fn swap_phase(caps: &Caps)
         peaks.store,
         peaks.swapped,
         peaks.hogged,
-        end.saturating_sub(baseline) / PAGE_SIZE
+        end.saturating_sub(baseline.totals) / PAGE_SIZE
     );
 }
 
-/// Check the phase's baseline: the identity holds and the store and the
-/// swapped total are empty. The phase's totals ([`phase_totals`]) once
-/// memmgr's deferred list has settled.
-pub(super) fn baseline_totals() -> u64
+/// What a phase's final settle compares against ([`settle_resident`]).
+pub(super) struct Baseline
+{
+    /// The phase's totals ([`phase_totals`]) at the start, in bytes.
+    pub(super) totals: u64,
+    /// The processes `LIST_PROCESSES` listed at the start.
+    badges: Vec<u64>,
+}
+
+impl Baseline
+{
+    /// This baseline less `bytes` of totals: what the settle must reach once
+    /// memmgr keeps `bytes` of the phase's pages for good.
+    pub(super) fn less(&self, bytes: u64) -> Self
+    {
+        Self {
+            totals: self.totals.saturating_sub(bytes),
+            badges: self.badges.clone(),
+        }
+    }
+}
+
+/// The phase's baseline, once the totals ([`phase_totals`]) and the processes
+/// `LIST_PROCESSES` lists (through the debug authority `authority`) held
+/// unchanged for [`BASELINE_QUIET`]: a process an earlier phase's pressure
+/// had stopped is replaced by then, not during the phase. At each read the
+/// identity holds, the store and the swapped total are empty, and memmgr's
+/// deferred list has settled.
+pub(super) fn baseline_totals(authority: u64, phase: &str) -> Baseline
+{
+    let start = Instant::now();
+    let mut last = baseline_read(authority, phase);
+    loop
+    {
+        std::thread::sleep(BASELINE_QUIET);
+        let now = baseline_read(authority, phase);
+        if now.totals == last.totals && now.badges == last.badges
+        {
+            return now;
+        }
+        assert!(
+            start.elapsed() < BASELINE_BOUND,
+            "{phase}: baseline: the totals ({} then {} bytes) or the {} then {} processes listed \
+             changed in every {BASELINE_QUIET:?} for {BASELINE_BOUND:?}",
+            last.totals,
+            now.totals,
+            last.badges.len(),
+            now.badges.len()
+        );
+        last = now;
+    }
+}
+
+/// One read of [`baseline_totals`].
+fn baseline_read(authority: u64, phase: &str) -> Baseline
 {
     let _ = crate::phases::memmgr::settled_deferred_bytes();
     let base = pool();
     assert!(
         base.identity(),
-        "{PHASE}: baseline: system_ram {} != kernel_reserved {} + pool_total {}",
+        "{phase}: baseline: system_ram {} != kernel_reserved {} + pool_total {}",
         base.system_ram,
         base.kernel_reserved,
         base.total
     );
     assert!(
         base.store == 0 && base.swapped == 0,
-        "{PHASE}: baseline: store {} bytes, swapped {} bytes, both expected 0",
+        "{phase}: baseline: store {} bytes, swapped {} bytes, both expected 0",
         base.store,
         base.swapped
     );
-    phase_totals(&base)
+    Baseline {
+        totals: phase_totals(&base, phase),
+        badges: listed_badges(authority),
+    }
 }
 
 /// memmgr's free and deferred bytes with the bytes charged to svctest's own
 /// node: what the phase's pages total once they are all back. The pages the
 /// hog's `CSpace` top-ups take stay with svctest's `CSpace`
 /// ([`HOG_HEADROOM`]) and charged to svctest, so they count as back.
-fn phase_totals(status: &Pool) -> u64
+fn phase_totals(status: &Pool, phase: &str) -> u64
 {
     let (charged, _) = own_usage()
-        .unwrap_or_else(|| panic!("{PHASE}: QUERY_MEMORY_USAGE of svctest's own node failed"));
+        .unwrap_or_else(|| panic!("{phase}: QUERY_MEMORY_USAGE of svctest's own node failed"));
     status
         .free
         .saturating_add(status.deferred)
@@ -1647,19 +1712,21 @@ fn require_no_evict(thread: u64, ready: &Ready)
 
 /// Make every listed process resident, then wait until memmgr's store and
 /// swapped total are empty, the identity holds and, given a `baseline`, the
-/// phase's totals ([`phase_totals`]) reach at least it: the phase's pages are
-/// all back, while another process may have returned pages of its own
-/// meanwhile. Returns the phase's totals then.
-pub(super) fn settle_resident(authority: u64, baseline: Option<u64>) -> u64
+/// phase's totals ([`phase_totals`]) reach at least the baseline's: the
+/// phase's pages are all back, while another process may have returned pages
+/// of its own meanwhile. A settle that runs out of time names the processes
+/// listed then that the baseline did not hold, whose pages the totals miss.
+/// `phase` names the phase in a panic. Returns the phase's totals then.
+pub(super) fn settle_resident(authority: u64, phase: &str, baseline: Option<&Baseline>) -> u64
 {
     let top = syscall::user_va_top()
-        .unwrap_or_else(|e| panic!("{PHASE}: SystemInfoType::UserVaTop failed ({e})"));
+        .unwrap_or_else(|e| panic!("{phase}: SystemInfoType::UserVaTop failed ({e})"));
     for badge in listed_badges(authority)
     {
         let label = make_resident(authority, badge, 0, top);
         assert!(
             label == procmgr_errors::SUCCESS || label == procmgr_errors::INVALID_BADGE,
-            "{PHASE}: MAKE_RESIDENT of process {badge:#x} replied {label:#x}"
+            "{phase}: MAKE_RESIDENT of process {badge:#x} replied {label:#x}"
         );
     }
     let start = Instant::now();
@@ -1667,28 +1734,51 @@ pub(super) fn settle_resident(authority: u64, baseline: Option<u64>) -> u64
     {
         crate::phases::memmgr::recheck_deferred();
         let status = pool();
-        let totals = phase_totals(&status);
+        let totals = phase_totals(&status, phase);
         if status.identity()
             && status.store == 0
             && status.swapped == 0
-            && baseline.is_none_or(|b| totals >= b)
+            && baseline.is_none_or(|b| totals >= b.totals)
         {
             return totals;
         }
-        assert!(
-            start.elapsed() < SETTLE_BOUND,
-            "{PHASE}: {SETTLE_BOUND:?} after everything was made resident: identity {} (ram {} \
-             reserved {} total {}), store {} bytes, swapped {} bytes, free + deferred + \
-             svctest's own {totals} bytes against {baseline:?} at the start",
-            status.identity(),
-            status.system_ram,
-            status.kernel_reserved,
-            status.total,
-            status.store,
-            status.swapped
-        );
+        if start.elapsed() >= SETTLE_BOUND
+        {
+            let (expected, new) = baseline.map_or((None, String::new()), |b| {
+                (Some(b.totals), new_processes(authority, &b.badges))
+            });
+            panic!(
+                "{phase}: {SETTLE_BOUND:?} after everything was made resident: identity {} (ram \
+                 {} reserved {} total {}), store {} bytes, swapped {} bytes, free + deferred + \
+                 svctest's own {totals} bytes against {expected:?} at the start; processes \
+                 listed since the start: [{new}]",
+                status.identity(),
+                status.system_ram,
+                status.kernel_reserved,
+                status.total,
+                status.store,
+                status.swapped
+            );
+        }
         std::thread::sleep(SETTLE_POLL);
     }
+}
+
+/// The processes `LIST_PROCESSES` lists, through the debug authority
+/// `authority`, that `before` does not hold: each badge and name,
+/// comma-separated.
+fn new_processes(authority: u64, before: &[u64]) -> String
+{
+    let new = RefCell::new(Vec::new());
+    let _ = super::crash::find_listed(authority, |badge, name| {
+        if !before.contains(&badge)
+        {
+            new.borrow_mut()
+                .push(format!("{badge:#x} {}", String::from_utf8_lossy(name)));
+        }
+        false
+    });
+    new.into_inner().join(", ")
 }
 
 // ── The fixture child ────────────────────────────────────────────────────────

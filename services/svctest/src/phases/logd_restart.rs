@@ -485,7 +485,7 @@ fn await_restart(query: u64, authority: u64, killed: u64, phase: &str)
 /// stamped at or after `after_us` and holds `line`, read every
 /// [`POLL_INTERVAL`] until one is there, for up to [`RESTART_TIMEOUT`].
 /// `phase` names the phase in a failure.
-fn await_line_after(query: u64, line: &[u8], after_us: u64, phase: &str) -> u64
+pub(super) fn await_line_after(query: u64, line: &[u8], after_us: u64, phase: &str) -> u64
 {
     let start = Instant::now();
     loop

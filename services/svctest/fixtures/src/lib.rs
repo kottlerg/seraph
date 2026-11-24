@@ -85,6 +85,9 @@ pub enum Fixture
     /// `crasher-boot`, the crasher's boot-fault role, which the
     /// `svcmgr_boot_death` phase drives.
     CrasherBoot,
+    /// `crasher-once`, the crasher's worker-fault role under
+    /// `restart = never`, which the `svcmgr_one_shot_death` phase drives.
+    CrasherOnce,
     /// `memhog`, which the `svcmgr_stop_service`, `oom_policy`,
     /// `rtc_create_retry` and `logd_reserve` phases fill memory with.
     Memhog,
@@ -99,10 +102,11 @@ pub enum Fixture
 impl Fixture
 {
     /// Every fixture, in the order a record lists them.
-    pub const ALL: [Fixture; 6] = [
+    pub const ALL: [Fixture; 7] = [
         Fixture::Crasher,
         Fixture::CrasherWorker,
         Fixture::CrasherBoot,
+        Fixture::CrasherOnce,
         Fixture::Memhog,
         Fixture::ReserveCreator,
         Fixture::Stopsrc,
@@ -118,6 +122,7 @@ impl Fixture
             Fixture::Crasher => "crasher",
             Fixture::CrasherWorker => "crasher-worker",
             Fixture::CrasherBoot => "crasher-boot",
+            Fixture::CrasherOnce => "crasher-once",
             Fixture::Memhog => "memhog",
             Fixture::ReserveCreator => "reserve-creator",
             Fixture::Stopsrc => "stopsrc",
@@ -133,6 +138,7 @@ impl Fixture
             Fixture::Crasher => "crasher.svc",
             Fixture::CrasherWorker => "crasher-worker.svc",
             Fixture::CrasherBoot => "crasher-boot.svc",
+            Fixture::CrasherOnce => "crasher-once.svc",
             Fixture::Memhog => "memhog.svc",
             Fixture::ReserveCreator => "reserve-creator.svc",
             Fixture::Stopsrc => "stopsrc.svc",
@@ -148,6 +154,7 @@ impl Fixture
             Fixture::Crasher => "/config/svcmgr/services/crasher.svc",
             Fixture::CrasherWorker => "/config/svcmgr/services/crasher-worker.svc",
             Fixture::CrasherBoot => "/config/svcmgr/services/crasher-boot.svc",
+            Fixture::CrasherOnce => "/config/svcmgr/services/crasher-once.svc",
             Fixture::Memhog => "/config/svcmgr/services/memhog.svc",
             Fixture::ReserveCreator => "/config/svcmgr/services/reserve-creator.svc",
             Fixture::Stopsrc => "/config/svcmgr/services/stopsrc.svc",

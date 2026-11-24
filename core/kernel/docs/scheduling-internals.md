@@ -115,14 +115,26 @@ skipping levels, risks deadlock.
    adds, and ones no path traverses in reverse. It must not be held while
    waiting for another CPU to make progress (a CPU spinning on it inside
    `register` cannot deschedule): the teardown walk marks under the lock and
-   waits after releasing it. The hold
-   is interrupts-off on the walking CPU for the whole walk — every live thread
-   is visited, and each bound one costs an all-CPU-locks transition — so its
-   length is proportional to live threads plus bound threads × CPUs; thread
-   creation on other CPUs stalls on the lock meanwhile. The softlockup watchdog
-   walks the registry via `try_for_each` (a non-blocking `try_lock`, so a
-   contended or CPU-died lock degrades to a skipped section rather than a
-   hang), and under it only try-locks each walked thread's `sched_lock` and,
+   waits after releasing it. A walk (`thread_registry::for_each`) holds the
+   lock, interrupts-off on the walking CPU, for one batch at a time: it visits
+   threads until it has spent `REGISTRY_BATCH_COST` (64), a thread it passes
+   costing 1 and one it acts on 8 (a stop is an all-CPU-locks transition,
+   `O(CPUs)`), then releases the lock, opens an interrupt window
+   (`interrupt_window`), and takes the lock again. So no hold grows with the
+   number of live threads, and thread creation on other CPUs waits for at most
+   one batch. The walk resumes from a cursor that stays attached to the registry
+   across the gap: an unregister of the thread the cursor names moves it to the
+   next one, and a thread registered meanwhile is linked at the head, behind
+   every cursor. A walk therefore visits once each thread registered for its
+   whole span, never one after its unregister, and none registered after it
+   began, which no caller owes a visit (§ Thread Registry); and it takes at
+   most as many steps as the registry held when it began, so a list corrupted
+   into a cycle is detected (fatal) rather than walked forever. The softlockup
+   watchdog walks the registry via `try_for_each` (a non-blocking `try_lock`,
+   so a contended or CPU-died lock degrades to a skipped or cut-short section
+   rather than a hang), in the same batches, releasing the lock between them
+   and try-locking it again with no window (it runs in interrupt context), and
+   under it only try-locks each walked thread's `sched_lock` and,
    under that, the lock of the source the thread is bound to; the one lock it
    waits for under the registry lock is the console's `CONSOLE_LOCK`
    (`kprintln!`), a leaf no holder keeps across another acquisition, so that
@@ -191,12 +203,20 @@ skipping levels, risks deadlock.
    [actors 1-10](thread-lifecycle-and-sleep.md#blockedonreply-edge--symmetry-rules) enumerate every
    claimant). A timed notification or event-queue wait arms its sleep-list entry inside the
    source-lock critical section that commits its park (`arm_timed_park`), before any waker can
-   claim it. The multi-waiter drains — the `dealloc_object_one` Endpoint-arm send/recv drain and
+   claim it. The multi-waiter drains — the endpoint's send/recv drain (`release_waiters`) and
    the Notification, EventQueue, and WaitSet destroy wakes (`interrupt_all_waiters`) — instead
-   HOLD the source lock across the per-waiter `enqueue_and_wake` walk (sound precisely because the
-   order is canonical, and `wake_in_flight = 1` per waiter blocks a racing `dealloc(waiter)` unlink
-   from freeing a TCB mid-wake); a drain holds the lock for one bounded wake per queued waiter,
-   once, at the source's destruction. `enqueue_and_wake` dispatches its wakeup
+   HOLD the source lock across each waiter's pop, claim and `enqueue_and_wake` (sound precisely
+   because the order is canonical, and `wake_in_flight = 1` per waiter blocks a racing
+   `dealloc(waiter)` unlink from freeing a TCB mid-wake), for one batch of
+   `DRAIN_BATCH_WAITERS` (16) waiters at a time (`ipc::drain_in_batches`): between batches the
+   drain releases the lock, opens an interrupt window (`interrupt_window`), and takes the lock
+   again. The waiters not yet released stay queued and unclaimed across the gap, so a canceller, a
+   timed park's expiry, or the waiter's own dealloc claims one by its usual removal under the lock
+   and the drain never meets it again, and each released waiter is woken in the hold that popped
+   it. No thread joins a draining queue (a dying source leaves no reference to park through, and
+   an endpoint with no Receive-right capability left refuses a call or a receive under `ep.lock`),
+   so the queues only shrink and the drain ends, at the source's destruction or its last
+   receiver's release. `enqueue_and_wake` dispatches its wakeup
    IPI only after BOTH the run-queue lock and `(*tcb).sched_lock` are released (never IPI under
    `sched_lock`). `pull_unpinned_ready` and the softlockup watchdog's per-CPU snapshot
    (`watchdog_snapshot_cpu`) are the two sites that take `(*tcb).sched_lock` via `try_lock_raw`
@@ -424,8 +444,8 @@ Ordering Invariants).
 
 **Lock primitive.** All locks above except the derivation tree lock are `crate::sync::Spinlock`
 (IRQ-disabling); the derivation tree lock is a bare spin lock (below). Hold-time MUST be bounded
-(target ~10 µs on x86_64), except the `THREAD_REGISTRY_LOCK` teardown walk, whose hold grows with
-live threads and bound threads × CPUs (rule 3); no page-table walks, buddy allocations, IPC
+(target ~10 µs on x86_64); a registry walk's hold is one batch (rule 3) and a multi-waiter
+drain's one batch of wakes (rule 5); no page-table walks, buddy allocations, IPC
 syscalls, or other long-latency operations under any spinlock.
 
 **Kernel-stack guard lock.** `mm::stack_guard`'s lock, a `crate::sync::Spinlock`, serialises
@@ -467,7 +487,9 @@ the explicit-placement pre-grow's windows between its `CSpace`-lock holds, the d
 windows between two teardowns, a dying `CSpace`'s windows in its release pass, its arena-page pass
 and its kept-page sort and release, the windows of a death-observer chain's release, of an address
 space's frame release and of an Mmio object's mapping withdrawal, the windows of an exiting
-thread's death posts, and the windows between the derivation-lock holds of
+thread's death posts, the windows between a registry walk's batches (`thread_registry::for_each`)
+and between a multi-waiter drain's batches (`ipc::drain_in_batches`), and the windows between the
+derivation-lock holds of
 revocation, deletion, the range splits, a move, and the teardown drain
 (`interrupt_window` in `cap/object.rs`, through
 `DerivationLock::write_unlock_between_batches` for the last) — runs
@@ -825,7 +847,7 @@ which `sys_thread_start`'s commit also takes, and holds it across its writes.
 | **IPC buffer** | `ipc_buffer` | Set by `SYS_IPC_BUFFER_SET`; logically owned by the thread itself. | The thread reads it under no lock from its own kernel-mode syscall path; other CPUs MUST NOT read it. |
 | **Death observers** | `death_observers`, `exit_reason`, `sleep_deadline`, `sleep_node`, `sleep_expiry` | The thread's own `sched_lock` for the `death_observers` chain head (`sys_thread_bind_notification` pushes a node under it, taking the node's reference on its `EventQueueObject` in the same hold; `post_death_notification` reads the head under it and walks the chain after, whose links behind the head never change; `dealloc_object(Thread)` takes the chain without it at drain step 13, returning each node to its queue's pool and releasing each observer's reference, since the thread is then off every CPU and unpinnable, so no other path reaches the fields); for `exit_reason`, the all-locks hold of the `Exited` commit (`exit_under_all_locks`, `commit_cancelling_park`), whose every write holds the thread's `sched_lock` and every CPU's `scheduler.lock`; for `sleep_deadline` (an `AtomicU64`), the owner's `tcb.sleep_deadline` row in [thread-lifecycle-and-sleep.md § Atomic Ordering for Sleep List and Lifecycle](thread-lifecycle-and-sleep.md#atomic-ordering-for-sleep-list-and-lifecycle): `SLEEP_LIST_LOCK` for every load-bearing read and every clear except a parker's own rollback of a deadline it never listed, the parker's own store before its park commit for a plain sleep, and the source IPC lock for a timed wait's arming store and the wakers' prechecks ([thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants)); for `sleep_node`, `SLEEP_LIST_LOCK`, under which `sleep_list_add`, `sleep_list_remove`, and the timer pop link and unlink it; for `sleep_expiry`, the timer pop's batch: the pop writes it under `SLEEP_LIST_LOCK` and the same batch reads it after, on CPU0's non-reentrant timer path. | Cross-CPU writes follow the per-field rule above. A reader of `exit_reason` holds one of the locks its writer holds: `CAP_INFO_THREAD_STATE` the local CPU's `scheduler.lock`, `sys_thread_bind_notification` the thread's `sched_lock`. |
 | **Spurious-resume tripwire** (debug builds only) | `park_episode`, `deposit_episode` (`AtomicU32`) | None: lock-free counters. `park_episode` is bumped (Relaxed) by the thread itself when it opens a call or fault park episode (`open_call_episode` in `syscall/ipc.rs`, `ipc::fault::fault_dispatch`), before the park makes it claimable; `deposit_episode` is stamped (Relaxed) to `park_episode` by the episode's exclusive claim winner (`stamp_park_deposit`, `stamp_deposit_episode`), before that winner's Release of the disposition or fault outcome. | Read only by the resumed thread itself, after its Acquire of the disposition or fault outcome, in a `debug_assert!` that the two are equal (the #352-class spurious-resume tripwire); no other path reads them and no control flow depends on them. |
-| **Registry** | `registry_next`, `registry_prev` | `THREAD_REGISTRY_LOCK` (§ Thread Registry): spliced in at construction and out at dealloc under it. | The softlockup watchdog and the object-teardown walk read the links only under that lock. |
+| **Registry** | `registry` (its `next` and `prev` links) | `THREAD_REGISTRY_LOCK` (§ Thread Registry): spliced in at construction and out at dealloc under it. | Every registry walk (the softlockup watchdog's, the object-teardown, hold, release and `IoPort` walks) reads the links only under that lock. |
 
 **`sched_lock` (`core/kernel/src/sched/thread.rs`).** A per-TCB IRQ-disabling ticket `Spinlock` (the
 same `crate::sync::Spinlock` as every other lock here), keyed on the TCB pointer. It is not an
@@ -1695,11 +1717,11 @@ The kernel does not auto-cascade IPC unblock on process exit. The contract:
      back-pointer under the source's lock, then wakes every thread blocked on the wait set itself,
      stamped INTERRUPTED.
      See [ipc-internals.md](ipc-internals.md) § Wait Set Add/Remove.
-   - `dealloc_object` Endpoint arm (`core/kernel/src/cap/object.rs`): under `ep.lock`, drains the
-     send and receive queues and wakes every queued thread. Senders are stamped INTERRUPTED (a
-     queued fault sender is stamped KILL); receivers are stamped INTERRUPTED.
+   - `dealloc_object` Endpoint arm (`core/kernel/src/cap/object.rs`): under `ep.lock`, a batch at
+     a time (rule 5), drains the send and receive queues and wakes every queued thread. Senders are
+     stamped INTERRUPTED (a queued fault sender is stamped KILL); receivers are stamped INTERRUPTED.
    - `dealloc_object` Notification arm (`core/kernel/src/cap/object.rs`): under the notification
-     lock, claims and wakes every queued waiter, stamped INTERRUPTED.
+     lock, a batch at a time (rule 5), claims and wakes every queued waiter, stamped INTERRUPTED.
    - `dealloc_object` Thread arm, dying server (`core/kernel/src/cap/object.rs`): claims the bound
      reply client by `reply_tcb` `compare_exchange`, deposits INTERRUPTED (KILL for a fault-blocked
      client), and wakes it after the all-locks region; see
@@ -2042,8 +2064,9 @@ overhead in healthy paths.
 ## Thread Registry
 
 `core/kernel/src/sched/thread_registry.rs` is an intrusive doubly-linked list of
-every live non-idle TCB, threaded through `registry_next` / `registry_prev` and guarded by
-`THREAD_REGISTRY_LOCK` (Lock Hierarchy rule 3). It serves four readers: the
+every live non-idle TCB, threaded through each TCB's `registry` links and guarded by
+`THREAD_REGISTRY_LOCK` (Lock Hierarchy rule 3); the list and its walk cursors are the generic,
+host-tested `RegistryList` of `core/kernel/src/sched/registry_list.rs`. It serves four readers: the
 softlockup watchdog, which enumerates `Blocked` waiters that the per-CPU
 `current` dump cannot reach; object teardown, which finds every thread bound
 to a dying `CSpace` or `AddressSpace`; the address-space hold and release, which
@@ -2059,26 +2082,42 @@ constructed — before its capability is inserted, because the TCB already names
 its `CSpace` and `AddressSpace` and a teardown of either must find it (the
 rollback arm unregisters before freeing the TCB) — and on init's bootstrap
 thread. It is unregistered in the `dealloc_object(Thread)` arm strictly before
-the TCB is poisoned/freed: both walks hold `THREAD_REGISTRY_LOCK` across every
-dereference, so unlinking before the free guarantees neither observes a
-dangling node. Idle TCBs are deliberately not registered — they are never
-`Blocked`, bound to no object, and already shown by the per-CPU `current` dump.
+the TCB is poisoned/freed: a walk dereferences a node only under
+`THREAD_REGISTRY_LOCK`, and keeps no pointer to one across a release of it but
+its cursor, which the unregister moves on, so unlinking before the free
+guarantees no walk observes a dangling node. Idle TCBs are deliberately not registered — they are
+never `Blocked`, bound to no object, and already shown by the per-CPU `current` dump.
 
-**Walk.** `try_for_each` takes the lock with a non-blocking `try_lock`: if it is
-contended (a register/unregister in flight) or a CPU died holding it, the walk is
-skipped rather than spun on — the watchdog must never block. `for_each` blocks
-on the lock and visits every node: teardown must not skip a thread. Neither
-walk is length-bounded; a list corrupted into a cycle is detected by a
-tortoise-and-hare probe — the watchdog walk simply stops there, the teardown
-walk halts the kernel (`fatal`), since a thread it cannot reach could still be
-running on the object being freed.
+**Walk.** A walk holds the lock for one batch at a time (`REGISTRY_BATCH_COST`,
+64: a thread it passes costs 1, one its visit acts on, under that thread's
+`sched_lock` or every CPU lock, costs 8). Between batches it releases the lock
+and resumes from a cursor, a `Cursor` attached to the list under the lock, which
+`unregister` moves off a thread it unlinks and `register` never passes (a new
+thread goes onto the head, behind every cursor). A walk therefore visits once each
+thread registered for its whole span, never one after its unregister, and none
+registered after it began; every caller is complete without the latter: a thread
+bound to a dying object after phase 1 is sent back to phase 1 by phase 2 (below),
+a thread created into a held space has its start deferred (the space is
+`Holding` before the walk), one created after an `IoPort` died has no binding to
+it, and one created into a dying `CSpace` fails its creation's revalidation. A
+walk's steps are bounded by the registry's length at its start, so a list
+corrupted into a cycle is detected when a walk outruns it. `for_each` blocks on
+the lock, opens an interrupt window between batches, and visits every node:
+teardown must not skip a thread, and a cycle halts the kernel (`fatal`), since a
+thread it cannot reach could still be running on the object being freed.
+`try_for_each` takes the lock with a non-blocking `try_lock`, before the walk
+and again between batches, without a window (it runs in the watchdog's interrupt
+context), on the one cursor the watchdog's walks share: if the lock is contended
+(a register, unregister or other walk in flight) or a CPU died holding it, the
+walk is skipped or cut short rather than spun on, since the watchdog must never
+block, and a cycle ends it.
 
 **Object teardown (`stop_threads_bound_to`).** Deleting the last capability to
 a `CSpace` or `AddressSpace` must not free storage a bound thread is still
 using, so `dealloc_object` for either type first stops every thread bound to
-it. Phase 1 (`mark_bound_threads`) walks the registry under its lock — a TCB
-found there cannot be unregistered, and so cannot be freed, until the walk
-ends — and for each bound thread not already `Exited`: cancels its IPC block
+it. Phase 1 (`mark_bound_threads`) walks the registry under its lock, a batch
+at a time — a TCB a batch is given cannot be unregistered, and so cannot be
+freed, until the batch ends — and for each bound thread not already `Exited`: cancels its IPC block
 if `Blocked` and writes `Exited` under the all-locks discipline (draining every
 run queue), retried while its `park_seq` changed (`commit_cancelling_park`,
 the `sys_thread_stop` primitive), with `EXIT_KILLED` recorded as its retained
@@ -2089,7 +2128,7 @@ reason; a thread stopped mid-exit, whose own exit commit then loses, still posts
 its own reason — only the retained value says killed), and records the CPU it
 was running on, and `mark_bound_threads` prods that CPU at once, inside the walk:
 one IPI per bound running thread, sent under the registry lock with interrupts
-off (`wake_idle_cpu` takes no lock and waits on no remote CPU). Phase 2 then
+off, inside its batch (`wake_idle_cpu` takes no lock and waits on no remote CPU). Phase 2 then
 spins — interrupts enabled, preemption disabled, as the dealloc UAF gate does —
 until no CPU other than the caller's has a bound thread as `current`. A
 bound thread found `current` but not `Exited` was bound after the walk (a

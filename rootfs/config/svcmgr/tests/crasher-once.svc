@@ -1,0 +1,19 @@
+# /tests/fixtures/service-modes crasher worker-fault, never restarted — svcmgr's one-shot death fixture.
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# Co-staged with svctest (services-surface harness) in CI and stageable
+# by hand: copy this file into /config/svcmgr/services/ between
+# `cargo xtask build` and `cargo xtask run`. See docs/testing.md.
+#
+# Exercises svcmgr's observation of a `restart = never` service's death:
+# crasher's worker-fault role serves `ipc::restart_probe_labels` on the
+# endpoint of the name it provides. svctest's svcmgr_one_shot_death phase
+# reads the instance's nonce, has a worker thread fault, and requires
+# svcmgr's `service died: crasher-once` line and its no-restart line in
+# logd's history. `critical = no`: the system continues without it.
+binary    = /tests/fixtures/service-modes
+argv      = service-modes crasher worker-fault
+restart   = never
+critical  = no
+namespace = none
+provides  = crasher.once

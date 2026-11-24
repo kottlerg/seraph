@@ -39,9 +39,9 @@ crate::argparse::value_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum SvctestSet
     {
-        /// Every fixture: crasher, crasher-worker, crasher-boot, memhog,
-        /// reserve-creator and stopsrc, as the canonical svctest cells stage
-        /// them
+        /// Every fixture: crasher, crasher-worker, crasher-boot, crasher-once,
+        /// memhog, reserve-creator and stopsrc, as the canonical svctest cells
+        /// stage them
         #[value(name = "ci")]
         Ci,
         /// memhog, reserve-creator and stopsrc, as the burn-in svctest cell

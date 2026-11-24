@@ -24,6 +24,7 @@ pub mod fpu;
 pub mod hw;
 pub mod init_layout;
 pub mod ipc;
+pub mod locked_windows;
 pub mod mm;
 pub mod notification;
 pub mod retype;
@@ -357,6 +358,34 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "teardown_windows::death_post_takes_interrupts",
         teardown_windows::death_post_takes_interrupts(ctx)
+    );
+    run_test!(
+        "locked_windows::notification_drain_takes_interrupts",
+        locked_windows::notification_drain_takes_interrupts(ctx)
+    );
+    run_test!(
+        "locked_windows::event_queue_drain_takes_interrupts",
+        locked_windows::event_queue_drain_takes_interrupts(ctx)
+    );
+    run_test!(
+        "locked_windows::wait_set_drain_takes_interrupts",
+        locked_windows::wait_set_drain_takes_interrupts(ctx)
+    );
+    run_test!(
+        "locked_windows::endpoint_receivers_drain_takes_interrupts",
+        locked_windows::endpoint_receivers_drain_takes_interrupts(ctx)
+    );
+    run_test!(
+        "locked_windows::endpoint_callers_drain_takes_interrupts",
+        locked_windows::endpoint_callers_drain_takes_interrupts(ctx)
+    );
+    run_test!(
+        "locked_windows::bound_thread_stop_takes_interrupts",
+        locked_windows::bound_thread_stop_takes_interrupts(ctx)
+    );
+    run_test!(
+        "locked_windows::aspace_hold_takes_interrupts",
+        locked_windows::aspace_hold_takes_interrupts(ctx)
     );
 
     // ── Memory management syscalls ────────────────────────────────────────────

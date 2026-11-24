@@ -438,18 +438,18 @@ leases and the release of its holds on them ([§ Body Arena](#body-arena)), an o
 chain after every `OBSERVER_BATCH_NODES` (64) nodes, an address space's frame release after every
 page table ([memory-internals.md](memory-internals.md) § Frame Map Table), and an Mmio object's
 mapping withdrawal after every mapping and every `SPILL_BATCH_CHUNKS` (64) spill chunks ([§ Mmio
-Mappings](#mmio-mappings)). The walks that run under a lock stay masked for their whole length, the
-release of an endpoint's waiters among them (#1628). Every context that calls `dealloc_object`
-allows a window, holding no lock and running where an interrupt may be taken with preemption
-disabled: a syscall and its epilogue, fault delivery between its park commit and its `schedule()`
+Mappings](#mmio-mappings)). A registry walk (`thread_registry::for_each`) and an IPC source's
+release of its waiters (`ipc::drain_in_batches`) take them between their batches, each batch one
+hold of its lock. Every context that calls `dealloc_object` allows a window, holding no lock and
+running where an interrupt may be taken with preemption disabled: a syscall and its epilogue, fault
+delivery between its park commit and its `schedule()`
 ([scheduling-internals.md](scheduling-internals.md) § `ThreadState` Transitions, "Voluntary-block
 window"), the end of an interrupt taken from user mode (§ Return Work there), and the idle thread's
 drain. A window between two teardowns exposes no partial state: the popped object is torn down whole
 before the window, the queued ones are reachable by nothing but their own links, a `CSpace`
 wrapper's arena pages' `owner` back-pointers, which the windows of its arena-page pass expose
 already, and a queued `AddressSpace`'s bound threads, whose pins its count of 0 refuses, and no
-interrupt handler releases a reference, so no cascade runs nested inside another on
-its CPU.
+interrupt handler releases a reference, so no cascade runs nested inside another on its CPU.
 
 The walk holds no lock across groups (each group's return takes only its Memory object's locks,
 its read lock and its retype-allocator lock), and takes the interrupts pending on its CPU after
@@ -1062,7 +1062,8 @@ port access. The bitmap is always the union of the recorded bindings.
 
 The IoPort dealloc arm runs `withdraw_everywhere` before the object's bytes go. It walks
 the thread registry and, under each thread's `sched_lock`, drops the records naming the
-object (compared by address, never dereferenced) and rebuilds the bitmap from the rest; a
+object (compared by address, never dereferenced) and rebuilds the bitmap from the rest; the walk
+holds the registry lock a batch at a time, with an interrupt window between batches; a
 bind through the object holds a pin on it, so none can record it once the teardown runs.
 `dealloc_object(Thread)` detaches a dying thread's table under the same lock before
 freeing it. If any bitmap changed, `gdt::invalidate_all_iopbs` stores an out-of-limit

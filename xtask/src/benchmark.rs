@@ -579,8 +579,8 @@ pub fn band(mode: BenchMode, base: u64, hundredths: Option<u64>) -> Option<u64>
 
 /// The benchmarks whose count includes time blocked on a device completion.
 /// The completion arrives at host time: under icount a guest blocked on it
-/// runs no instructions, and its clock advances by timer deadlines until
-/// QEMU completes the request, so the count follows the host's I/O latency,
+/// runs no instructions, and its clock follows the host's time until QEMU
+/// completes the request, so the count follows the host's I/O latency,
 /// which no band bounds. `fsbench.write` writes through the filesystem's
 /// page cache to the disk (services/fs/fat/docs/crash-safety.md), every size
 /// of it. `fsbench.read` is not here: its timed reads find the file in that

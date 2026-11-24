@@ -466,8 +466,8 @@ fn swapd_phase(caps: &Caps)
     drop(std::hint::black_box(image));
 
     let mut hog = Hog::new();
-    let _ = settle_resident(authority, None);
-    let baseline = baseline_totals();
+    let _ = settle_resident(authority, PHASE, None);
+    let baseline = baseline_totals(authority, PHASE);
     let reserve = pool().reserve_pages();
     let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Page);
 
@@ -500,12 +500,12 @@ fn swapd_phase(caps: &Caps)
     let status = fixture.exit_status();
     assert!(status.success(), "{PHASE}: the fixture exited {status:?}");
     let slot_map_pages = SWAP_SLOTS.div_ceil(free_pool::disk::SLOT_WORDS_PER_PAGE);
-    let floor = baseline.saturating_sub(slot_map_pages.saturating_mul(PAGE_SIZE));
-    let end = settle_resident(authority, Some(floor));
+    let floor = baseline.less(slot_map_pages.saturating_mul(PAGE_SIZE));
+    let end = settle_resident(authority, PHASE, Some(&floor));
     std::os::seraph::log!(
         "swapd phase passed ({free0} slots free at the start, {written} chunks on disk before \
          the restart and every one faulted back through the next instance, free, deferred and \
          svctest's own {} pages above the start less the {slot_map_pages} slot-map pages)",
-        end.saturating_sub(floor) / PAGE_SIZE
+        end.saturating_sub(floor.totals) / PAGE_SIZE
     );
 }

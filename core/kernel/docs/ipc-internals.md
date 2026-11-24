@@ -22,16 +22,14 @@ The IPC subsystem comprises four kernel object types:
 pub struct EndpointState
 {
     /// Threads waiting to send (callers blocked in SYS_IPC_CALL), FIFO.
-    send_head: *mut ThreadControlBlock,
-    send_tail: *mut ThreadControlBlock,
+    send: WaitQueue,
 
-    /// 1 iff send_head is non-null: the atomic shadow the wait-set readiness
+    /// 1 iff `send` is non-empty: the atomic shadow the wait-set readiness
     /// check reads without the lock.
     send_nonempty: AtomicU32,
 
     /// Threads waiting to receive (servers blocked in SYS_IPC_RECV), FIFO.
-    recv_head: *mut ThreadControlBlock,
-    recv_tail: *mut ThreadControlBlock,
+    recv: WaitQueue,
 
     /// Wait-set back-pointer (null if not in any wait set) and this
     /// endpoint's member index in that set.
@@ -68,24 +66,27 @@ Every blocked thread is linked into its object's queue through intrusive link fi
 used only while the thread is blocked on an IPC object (a blocked thread waits on one object, so
 one set of links suffices). No separate allocation. Threads are served in arrival order.
 
-- An endpoint keeps a linear send queue and a linear receive queue, each a head and tail pointer,
-  chained through `tcb.ipc_wait_next`.
-- A notification, event queue, or wait set keeps an `ipc::WaitQueue`: a circular doubly linked
-  list through `tcb.ipc_wait_next` and `tcb.ipc_wait_prev` storing only its tail (the head is the
-  tail's successor), so it is pointer-sized. Each queued TCB's `ipc_wait_queue` tag names the
+- Every IPC source keeps `ipc::WaitQueue`s (an endpoint two, `send` and `recv`; a notification,
+  event queue, or wait set one): a circular doubly linked list through `tcb.ipc_wait_next` and
+  `tcb.ipc_wait_prev` storing only its tail (the head is the tail's successor), so it is
+  pointer-sized. Each queued TCB's `ipc_wait_queue` tag names the
   queue, so push, pop, removal of any waiter, and the membership test are O(1) and touch only the
   TCBs they link or unlink.
 
 **Release when no receiver is left.** `release_if_unreceivable` runs where a slot's reference is
 released after the slot was uncounted: `sys_cap_delete`, a revoke's `dealloc_revoked`
 (`syscall/cap.rs`), `release_moved_object` (`cap/transfer.rs`), and a dying CSpace's teardown
-(`cap/object.rs`). When the endpoint's `receivers` is zero it runs `release_waiters`, which under
-`ep.lock` detaches both queues, stamps each queued caller and parked receiver
-`PARK_DISPOSITION_NO_RECEIVER` (a queued fault delivery `FAULT_OUTCOME_NO_RECEIVER`), removes a
-timed park's sleep-list entry, sets `wake_in_flight`, wakes each waiter with `enqueue_and_wake`,
-and republishes `send_nonempty`. The Endpoint's dealloc runs the same drain. A call or receive that
-reads zero under `ep.lock` queues nothing, so the release whose decrement made the count zero finds
-every earlier waiter and a later one finds the queues empty.
+(`cap/object.rs`). When the endpoint's `receivers` is zero it runs `release_waiters`, which
+releases the waiters of both queues, `DRAIN_BATCH_WAITERS` (16) per hold of `ep.lock`
+(`ipc::drain_in_batches`), with an interrupt window between batches; a waiter not yet released
+stays queued and unclaimed across the gap. For each it dequeues a queued caller or parked receiver,
+stamps it `PARK_DISPOSITION_NO_RECEIVER` (a queued fault delivery `FAULT_OUTCOME_NO_RECEIVER`),
+removes a timed park's sleep-list entry, sets `wake_in_flight`, wakes it with
+`enqueue_and_wake`, and republishes `send_nonempty`. The Endpoint's dealloc runs the same drain. A
+call or receive that reads zero under `ep.lock` queues nothing, so the release whose decrement made
+the count zero finds every earlier waiter. A later release, or the dealloc, finds the waiters not
+yet released, if any, and drains them alongside it: no waiter joins once the count is zero, so every
+release returns with both queues empty.
 
 ### Call Path (Sender)
 
@@ -352,8 +353,8 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `dealloc_object(Notification)` wake of every waiter (`interrupt_all_waiters`) | removal from the waiter queue under `sig.lock` | INTERRUPTED |
 | `event_queue_drop` (`dealloc_object(EventQueue)`) wake of every waiter | removal from the waiter queue under `eq.lock` | INTERRUPTED |
 | `wait_set_drop` (`dealloc_object(WaitSet)`) wake of every waiter | removal from the waiter queue under `ws.lock` | INTERRUPTED |
-| the endpoint's send-queue drain (`release_waiters`, run by `release_if_unreceivable` and by `dealloc_object(Endpoint)`) | whole-queue detach under `ep.lock` | episode + NO_RECEIVER (faulter: episode, `fault_outcome` = `FAULT_OUTCOME_NO_RECEIVER` (8)) |
-| the endpoint's recv-queue drain (`release_waiters`) | whole-queue detach under `ep.lock` | NO_RECEIVER |
+| the endpoint's send-queue drain (`release_waiters`, run by `release_if_unreceivable` and by `dealloc_object(Endpoint)`) | dequeue under `ep.lock`, one batch per hold | episode + NO_RECEIVER (faulter: episode, `fault_outcome` = `FAULT_OUTCOME_NO_RECEIVER` (8)) |
+| the endpoint's recv-queue drain (`release_waiters`) | dequeue under `ep.lock`, one batch per hold | NO_RECEIVER |
 | park-helper refused-commit rollbacks (`notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`) | source lock held continuously from publish to rollback — no waker ever saw the queued entry | INTERRUPTED on `ParkCommit::RefusedStop` only; a `RefusedWake` rollback must leave the coalesced deposit deliverable |
 
 **Resume (call/fault episodes — fail-closed).** `sys_ipc_call` consumes the
@@ -913,7 +914,7 @@ the SeqCst Dekker fence pair orders against `notification_wait`, so their
 `Acquire` load of `bits` has no `Release` partner (`bits` carries no dependent
 payload). The readiness signals are: `NotificationState::bits`
 (`AtomicU64`), `EventQueueState::count` (`AtomicU32`), and
-`EndpointState::send_nonempty` (`AtomicU32`, a shadow of `send_head != null`
+`EndpointState::send_nonempty` (`AtomicU32`, a shadow of `send` being non-empty,
 republished under `ep.lock` at every send-queue mutation); their pairings are tabulated in
 [scheduling-internals.md](scheduling-internals.md#atomic-ordering-invariants) § Atomic Ordering
 Invariants.
@@ -1076,7 +1077,9 @@ The wake-one primitives invoke `enqueue_and_wake` after releasing their source I
 `waitset_notify` and `waitset_add`'s ready-at-add wake release `ws.lock` but wake while the
 notifying or registering source's lock is still held. The multi-waiter drains — the endpoint
 drain (`release_waiters`) and the Notification, EventQueue, and WaitSet destroy wakes
-(`interrupt_all_waiters`) — hold the source lock across their walks. All are per rule 5 of
+(`interrupt_all_waiters`) — hold the source lock for one batch of `DRAIN_BATCH_WAITERS` (16)
+waiters at a time and open an interrupt window between batches (`ipc::drain_in_batches`). All are
+per rule 5 of
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy).
 
 ### Lock-Free Notification Fast Path

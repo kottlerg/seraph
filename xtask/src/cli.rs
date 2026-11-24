@@ -595,9 +595,11 @@ args! {
         pub test_devices: bool,
 
         /// Count instructions: run the machine on single-threaded TCG with
-        /// QEMU's `-icount shift=0,sleep=off,align=off`, so the guest's clock
-        /// and cycle counters advance one tick per retired instruction, the
-        /// deterministic measure `bench-check --mode icount` compares. Always
+        /// QEMU's `-icount shift=0,sleep=on,align=off`, so the guest's clock
+        /// and cycle counters advance one tick per retired instruction while a
+        /// vCPU runs, the deterministic measure `bench-check --mode icount`
+        /// compares, and follow the host's time while every vCPU idles, so a
+        /// device completion ends an idle as it would on hardware. Always
         /// TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount
         /// cannot serve, so the kernel runs its xAPIC paths.
         #[arg(long)]

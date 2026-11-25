@@ -267,6 +267,7 @@ fn run_round_trips(
         samples.record(t1.since(&t0).cycles);
         completed = completed.saturating_add(1);
     }
+    let summary = samples.summary();
     let end = super::Placement::read(ctx.thread_cap, child.th);
 
     // After every round trip the child's last call has returned and it is on
@@ -276,7 +277,6 @@ fn run_round_trips(
     {
         notification_wait(done).ok();
     }
-    let summary = samples.summary();
 
     let extras = super::placement_extras(start.as_ref(), end.as_ref());
     h.report(

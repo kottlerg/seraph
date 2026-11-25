@@ -265,8 +265,6 @@ pub struct Measured
     /// shared/bench/README.md § Idle halts); `None` when a run's line did not
     /// report the count.
     pub idle_halts: Option<u64>,
-    /// The runs whose line reported a halt.
-    pub idled_runs: usize,
 }
 
 /// A set of runs of one architecture and mode, measurement by measurement.
@@ -279,6 +277,9 @@ pub struct RunSet
     pub measured: BTreeMap<Key, Measured>,
     /// The `FAIL` lines' benchmarks, with the run that logged each.
     pub failed: Vec<String>,
+    /// The runs whose line of a measurement reported a halt, each by its
+    /// 1-based place among the logs given, by measurement.
+    pub idled: BTreeMap<Key, Vec<usize>>,
 }
 
 /// Gather `runs`, the logs of one mode, measurement by measurement.
@@ -341,6 +342,7 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
     }
     let mut measured: BTreeMap<Key, Measured> = BTreeMap::new();
     let mut failed = Vec::new();
+    let mut idled: BTreeMap<Key, Vec<usize>> = BTreeMap::new();
     for (i, run) in runs.iter().enumerate()
     {
         failed.extend(
@@ -360,7 +362,6 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
                 runs: 0,
                 expected,
                 idle_halts: Some(0),
-                idled_runs: 0,
             });
             ensure!(entry.unit == *unit, "{key} is reported in two units");
             entry.lowest = entry.lowest.min(*p50);
@@ -371,7 +372,10 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
                 .map(|(sum, halts)| sum.saturating_add(halts));
             if idle_halts.is_some_and(|halts| halts > 0)
             {
-                entry.idled_runs = entry.idled_runs.saturating_add(1);
+                idled
+                    .entry(key.clone())
+                    .or_default()
+                    .push(i.saturating_add(1));
             }
         }
     }
@@ -380,6 +384,7 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
         arch: first.arch.clone(),
         measured,
         failed,
+        idled,
     })
 }
 
@@ -808,15 +813,26 @@ pub fn report(mode: BenchMode, set: &RunSet, rows: &[Row]) -> String
     }
     for row in rows.iter().filter(|r| idled(r))
     {
-        let _ = match row.measured.and_then(|m| m.idle_halts.map(|h| (h, m)))
+        let _ = match row
+            .measured
+            .as_ref()
+            .and_then(|m| m.idle_halts.map(|h| (h, m)))
         {
             Some((halts, m)) => writeln!(
                 out,
-                "FAIL: {} idled: its CPU halted {halts} time(s) in the measured loops of {} of {} \
-                 run(s), and a timed window that idles counts host time under icount: keep the \
-                 wait out of the timed window, or add the benchmark to ICOUNT_IO_BOUND \
-                 (xtask/src/benchmark.rs) if it waits by design",
-                row.key, m.idled_runs, m.runs
+                "FAIL: {} idled: its CPU halted {halts} time(s) in the measured loops of run(s) {} \
+                 of the {} that measured it, and a timed window that idles counts host time under \
+                 icount: keep the wait out of the timed window, or add the benchmark to \
+                 ICOUNT_IO_BOUND (xtask/src/benchmark.rs) if it waits by design",
+                row.key,
+                set.idled
+                    .get(&row.key)
+                    .into_iter()
+                    .flatten()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                m.runs
             ),
             None => writeln!(
                 out,
@@ -1345,8 +1361,9 @@ mod tests
     {
         let base = stored(&[(key("a", "", 1), 500), (key("b", "", 1), 500)]);
         let runs = [
-            log(1, "on", &[idle_line("a", 1, 500, 2), line("b", 1, 500)]),
+            log(1, "on", &[idle_line("a", 1, 500, 1), line("b", 1, 500)]),
             log(1, "on", &[line("a", 1, 500), line("b", 1, 500)]),
+            log(1, "on", &[idle_line("a", 1, 500, 2), line("b", 1, 500)]),
         ];
         let set = gather(BenchMode::Icount, &runs).unwrap();
         let rows = compare(BenchMode::Icount, &set, &base, &BTreeMap::new());
@@ -1357,8 +1374,8 @@ mod tests
         assert!(!fails(row(&key("b", "", 1))));
         let text = report(BenchMode::Icount, &set, &rows);
         assert!(text.contains(
-            "FAIL: ktest.a cpus=1 idled: its CPU halted 2 time(s) in the measured loops of 1 of 2 \
-             run(s)"
+            "FAIL: ktest.a cpus=1 idled: its CPU halted 3 time(s) in the measured loops of run(s) \
+             1, 3 of the 3 that measured it"
         ));
         assert!(!text.contains("FAIL: ktest.b"));
     }

@@ -1936,7 +1936,8 @@ none when a line lacks the extra
 table of every measurement, its verdict, whether it gates, its baseline, its lowest p50, the
 change, its band and its halts (`idle`, `-` for none), then one `FAIL:` line per gating
 measurement whose verdict is not `ok`, with its remedy, one per gating measurement whose loops
-idled, naming the halts and the logs that saw them, or whose lines lack the count, then a
+idled, naming the halts and the runs that saw them (each by its place among the logs given), or
+whose lines lack the count, then a
 `WARNING:` line per key of the stored `ENV` whose value differs here.
 
 - **icount.** The band is the larger of 1% of the baseline (rounded up) and 8 instructions. A

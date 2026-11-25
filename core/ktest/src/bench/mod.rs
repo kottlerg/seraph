@@ -202,7 +202,11 @@ impl Harness
             idle_halts,
         } = measured;
         let mut all = [("", 0u64); MAX_EXTRAS + 1];
-        let Some(given) = all.get_mut(..extras.len())
+        // `all` holds one slot more than `MAX_EXTRAS`, for `idle_halts`, so the
+        // bound is checked here and not by the slice.
+        let Some(given) = all
+            .get_mut(..extras.len())
+            .filter(|_| extras.len() <= MAX_EXTRAS)
         else
         {
             crate::log_args(format_args!(

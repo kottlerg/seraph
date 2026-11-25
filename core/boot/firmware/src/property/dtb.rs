@@ -523,16 +523,42 @@ pub(crate) fn timebase_holds(data: &[u8])
     assert_eq!(timebase_value(data), value);
 }
 
+/// The file strides the IMSIC checks try: none, which places no file, one
+/// and two 4 KiB pages, and one whose offsets overflow.
+pub(crate) const IMSIC_STRIDES: [u64; 4] = [0, 0x1000, 0x2000, u64::MAX];
+
 /// Check the IMSIC readings of `node`: whether it serves supervisor mode,
-/// its layout, and where its files lie.
+/// its layout, where its files lie at each of [`IMSIC_STRIDES`], and its
+/// PCI ranges.
 ///
 /// # Panics
 ///
 /// When a reading breaks its contract.
 pub(crate) fn imsic_holds(node: &FdtNode<'_>)
 {
+    imsic_layout_holds(node);
+    for stride in IMSIC_STRIDES
+    {
+        imsic_files_hold(node, stride);
+    }
+    pci_ranges_hold(node.ranges);
+}
+
+/// The number of whole `interrupts-extended` entries of `node`.
+fn ie_entries(node: &FdtNode<'_>) -> usize
+{
+    node.aia.interrupts_extended.len() / 8
+}
+
+/// Check whether the IMSIC `node` serves supervisor mode, and its layout.
+///
+/// # Panics
+///
+/// When a reading breaks its contract.
+pub(crate) fn imsic_layout_holds(node: &FdtNode<'_>)
+{
     let ie = node.aia.interrupts_extended;
-    let entries = ie.len() / 8;
+    let entries = ie_entries(node);
     let supervisor = entries > 0
         && (0..entries).all(|i| be32(ie, 8usize.saturating_mul(i).saturating_add(4)) == Some(9));
     assert_eq!(is_supervisor_imsic(node), supervisor);
@@ -560,33 +586,49 @@ pub(crate) fn imsic_holds(node: &FdtNode<'_>)
         })
         .flatten();
     assert_eq!(imsic_layout(node), layout);
+}
 
-    for stride in [0u64, 0x1000, 0x2000, u64::MAX]
+/// Check where the files of the IMSIC `node` lie, by index and by a hart's
+/// `interrupts-extended` phandle, when they lie `stride` bytes apart.
+///
+/// # Panics
+///
+/// When a reading breaks its contract.
+pub(crate) fn imsic_files_hold(node: &FdtNode<'_>, stride: u64)
+{
+    let ie = node.aia.interrupts_extended;
+    let entries = ie_entries(node);
+    for index in 0..=(node.reg_count as u64).saturating_add(1)
     {
-        for index in 0..=(node.reg_count as u64).saturating_add(1)
-        {
-            files_hold(node, index, stride);
-        }
-        for i in 0..entries.min(4)
-        {
-            let phandle = be32(ie, 8usize.saturating_mul(i)).unwrap_or(0);
-            let first = (0..entries).find(|&j| be32(ie, 8usize.saturating_mul(j)) == Some(phandle));
-            let expected = if phandle == 0
-            {
-                None
-            }
-            else
-            {
-                first.and_then(|j| imsic_file_in_regs(node, j as u64, stride))
-            };
-            assert_eq!(hart_imsic_file(node, phandle, stride), expected);
-        }
-        assert_eq!(hart_imsic_file(node, 0, stride), None);
+        files_hold(node, index, stride);
     }
-    for (i, range) in pci_ranges(node.ranges).enumerate()
+    for i in 0..entries.min(4)
+    {
+        let phandle = be32(ie, 8usize.saturating_mul(i)).unwrap_or(0);
+        let first = (0..entries).find(|&j| be32(ie, 8usize.saturating_mul(j)) == Some(phandle));
+        let expected = if phandle == 0
+        {
+            None
+        }
+        else
+        {
+            first.and_then(|j| imsic_file_in_regs(node, j as u64, stride))
+        };
+        assert_eq!(hart_imsic_file(node, phandle, stride), expected);
+    }
+    assert_eq!(hart_imsic_file(node, 0, stride), None);
+}
+
+/// Check the PCI ranges a node's `ranges` property `r` reads as.
+///
+/// # Panics
+///
+/// When a reading breaks its contract.
+pub(crate) fn pci_ranges_hold(r: &[u8])
+{
+    for (i, range) in pci_ranges(r).enumerate()
     {
         let at = 28usize.saturating_mul(i);
-        let r = node.ranges;
         assert_eq!(
             Some(range),
             be32(r, at)
@@ -595,7 +637,7 @@ pub(crate) fn imsic_holds(node: &FdtNode<'_>)
                 .map(|((f, c), s)| (f, c, s))
         );
     }
-    assert_eq!(pci_ranges(node.ranges).count(), node.ranges.len() / 28);
+    assert_eq!(pci_ranges(r).count(), r.len() / 28);
 }
 
 /// Check where the `index`-th file of an IMSIC `node` lies when its files lie

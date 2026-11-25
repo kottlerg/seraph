@@ -2070,11 +2070,12 @@ mod proofs
 
     /// The compatible walk's property harnesses, one per property it reads,
     /// each a step from any state taking that property's value of up to the
-    /// bytes given: a `compatible` of 7, which names the walk's two-byte entry
-    /// or not, and a `ranges` and each AIA property of 5, a cell and one past
-    /// it. Whether a list names an entry is the shared `compatible_contains`'s,
-    /// proved in `firmware_tables`. The loops are the list's bytes, the
-    /// states' compare and the names' bytes.
+    /// bytes given: a `compatible` of 5, which holds the walk's two-byte entry
+    /// at either of a list's first two places (`c\0ab\0`), a longer name it
+    /// begins, or neither, and a `ranges` and each AIA property of 5, a cell
+    /// and one past it. Whether a list names an entry is the shared
+    /// `compatible_contains`'s, proved in `firmware_tables`. The loops are
+    /// the list's bytes, the states' compare and the names' bytes.
     macro_rules! compatible_property_proofs {
         ($($proof:ident: $name:literal, $len:literal;)*) => {$(
             #[doc = concat!("Every step of the compatible walk takes a `", $name,
@@ -2093,7 +2094,7 @@ mod proofs
     }
 
     compatible_property_proofs! {
-        every_compatible_walk_step_records_its_compatible: "compatible", 7;
+        every_compatible_walk_step_records_its_compatible: "compatible", 5;
         every_compatible_walk_step_records_its_ranges: "ranges", 5;
         every_compatible_walk_step_records_its_phandle: "phandle", 5;
         every_compatible_walk_step_records_its_msi_parent: "msi-parent", 5;
@@ -2123,19 +2124,26 @@ mod proofs
 
     /// The CPU walk's property harnesses, one per property a CPU node's
     /// binding gives it, each a step from any state taking that property's
-    /// value of up to 12 bytes: 12 bytes hold `riscv,sv57x` with its NUL,
-    /// `disabled`, `riscv` and an extension between separators. The loops
-    /// are the values' entries, the extension names, the states' compare and
-    /// the names' bytes.
+    /// value of up to the bytes given: a `compatible` of 8, which holds
+    /// `riscv` at a list's second place (`a\0riscv\0`); a `reg` of 5, a cell
+    /// and one past it; a `status` of 9, `disabled` and one past it; a
+    /// `riscv,isa-extensions` of 7, which holds `sstc` at a list's second
+    /// place; a `riscv,isa` of 7, which holds `sstc` as a segment after
+    /// another (`a_sstc\0`); and an `mmu-type` of 12, `riscv,sv57x` with its
+    /// NUL. Whether a list names an entry is the shared
+    /// `compatible_contains`'s, proved in `firmware_tables`, and an ISA
+    /// string's reading is `every_isa_string_names_its_whole_segments`'s. The
+    /// loops are the values' entries, the extension names, the states'
+    /// compare and the names' bytes.
     macro_rules! cpu_property_proofs {
-        ($($proof:ident: $name:literal;)*) => {$(
+        ($($proof:ident: $name:literal, $len:literal;)*) => {$(
             #[doc = concat!("Every step of the CPU walk takes a `", $name,
-                "` of up to 12 bytes as its binding says.")]
+                "` of up to ", stringify!($len), " bytes as its binding says.")]
             #[kani::proof]
             #[kani::unwind(22)]
             fn $proof()
             {
-                let data: [u8; 12] = kani::any();
+                let data: [u8; $len] = kani::any();
                 let mut walk = CpuWalk::<D> {
                     states: [cpu_state(), cpu_state()],
                     depth: depth(),
@@ -2147,12 +2155,12 @@ mod proofs
     }
 
     cpu_property_proofs! {
-        every_cpu_walk_step_records_its_compatible: "compatible";
-        every_cpu_walk_step_records_its_reg: "reg";
-        every_cpu_walk_step_records_its_status: "status";
-        every_cpu_walk_step_records_its_isa_extensions: "riscv,isa-extensions";
-        every_cpu_walk_step_records_its_isa: "riscv,isa";
-        every_cpu_walk_step_records_its_mmu_type: "mmu-type";
+        every_cpu_walk_step_records_its_compatible: "compatible", 8;
+        every_cpu_walk_step_records_its_reg: "reg", 5;
+        every_cpu_walk_step_records_its_status: "status", 9;
+        every_cpu_walk_step_records_its_isa_extensions: "riscv,isa-extensions", 7;
+        every_cpu_walk_step_records_its_isa: "riscv,isa", 7;
+        every_cpu_walk_step_records_its_mmu_type: "mmu-type", 12;
     }
 
     /// Every step of the interrupt-controller walk from any state opens and
@@ -2225,23 +2233,67 @@ mod proofs
         property::timebase_holds(&bytes[..len]);
     }
 
-    /// Every IMSIC node with up to 2 `reg` windows, an
-    /// `interrupts-extended` of up to 17 bytes and a `ranges` of up to 29
-    /// serves the supervisor, states its layout and places its files as the
-    /// AIA binding says: 17 bytes hold two entries and a partial one, and 29
-    /// a PCI range and a partial one. The loops are the entries, the windows
-    /// and the strides tried.
-    #[kani::proof]
-    #[kani::unwind(6)]
-    fn every_imsic_node_places_its_files()
+    /// Any matched IMSIC node with up to 2 `reg` windows, its
+    /// `interrupts-extended` the first bytes of `ie`, and no `ranges`.
+    fn imsic_node(ie: &[u8]) -> FdtNode<'_>
     {
-        let ie: [u8; 17] = kani::any();
-        let ranges: [u8; 29] = kani::any();
-        let (ie_len, ranges_len): (usize, usize) = (kani::any(), kani::any());
-        kani::assume(ie_len <= ie.len() && ranges_len <= ranges.len());
-        let mut n = node(&ranges[..ranges_len], &ie[..ie_len]);
+        let ie_len: usize = kani::any();
+        kani::assume(ie_len <= ie.len());
+        let mut n = node(&[], &ie[..ie_len]);
         kani::assume(n.reg_count <= 2);
         n.matched = true;
-        property::imsic_holds(&n);
+        n
+    }
+
+    /// Every IMSIC node with up to 2 `reg` windows and an
+    /// `interrupts-extended` of up to 17 bytes serves the supervisor and
+    /// states its layout as the AIA binding says: 17 bytes hold two entries
+    /// and a partial one. The loops are the entries.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn every_imsic_node_states_its_layout()
+    {
+        let ie: [u8; 17] = kani::any();
+        property::imsic_layout_holds(&imsic_node(&ie));
+    }
+
+    /// The IMSIC file harnesses, one per stride the property tries
+    /// (`property::IMSIC_STRIDES`): every IMSIC node with up to 2 `reg`
+    /// windows and an `interrupts-extended` of up to 17 bytes places each of
+    /// its files, by index and by a hart's phandle, as the AIA binding says:
+    /// 2 windows hold a file past the first window's, and 17 bytes two
+    /// entries and a partial one. The loops are the indices, the windows and
+    /// the entries.
+    macro_rules! imsic_files_proofs {
+        ($($proof:ident: $stride:literal;)*) => {$(
+            #[doc = concat!("Every IMSIC node places its files at the stride `IMSIC_STRIDES[",
+                stringify!($stride), "]` as the AIA binding says.")]
+            #[kani::proof]
+            #[kani::unwind(6)]
+            fn $proof()
+            {
+                let ie: [u8; 17] = kani::any();
+                property::imsic_files_hold(&imsic_node(&ie), property::IMSIC_STRIDES[$stride]);
+            }
+        )*};
+    }
+
+    imsic_files_proofs! {
+        every_imsic_node_places_no_file_at_no_stride: 0;
+        every_imsic_node_places_its_files_a_page_apart: 1;
+        every_imsic_node_places_its_files_two_pages_apart: 2;
+        every_imsic_node_places_its_files_at_an_overflowing_stride: 3;
+    }
+
+    /// Every `ranges` of up to 29 bytes reads as its PCI ranges: 29 bytes
+    /// hold one 28-byte range and a partial one. The loop is the ranges.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn every_pci_range_reads_as_its_cells()
+    {
+        let ranges: [u8; 29] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= ranges.len());
+        property::pci_ranges_hold(&ranges[..len]);
     }
 }

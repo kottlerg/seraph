@@ -1445,44 +1445,44 @@ mod proofs
         term_at_place_one_holds::<3>(&[]);
     }
 
-    /// Every `Scope` at place 1 of a term list of 11 bytes reads as its
-    /// construct: 10 bytes hold it with a one-segment or a dual name and a
-    /// body, and every `PkgLength` form. The loops are the parent prefixes
+    /// Every `Scope` at place 1 of a term list of 12 bytes reads as its
+    /// construct: 11 bytes hold it with a one-segment name and a body or a
+    /// dual name, and every `PkgLength` form. The loops are the parent prefixes
     /// and the name's segments.
     #[kani::proof]
     #[kani::unwind(11)]
     fn every_scope_reads_as_its_construct()
     {
-        term_at_place_one_holds::<11>(&[OP_SCOPE]);
+        term_at_place_one_holds::<12>(&[OP_SCOPE]);
     }
 
-    /// Every `Method` at place 1 of a term list of 11 bytes reads as its
+    /// Every `Method` at place 1 of a term list of 12 bytes reads as its
     /// construct, as a `Scope` does.
     #[kani::proof]
     #[kani::unwind(11)]
     fn every_method_reads_as_its_construct()
     {
-        term_at_place_one_holds::<11>(&[OP_METHOD]);
+        term_at_place_one_holds::<12>(&[OP_METHOD]);
     }
 
-    /// Every `Device` at place 1 of a term list of 12 bytes reads as its
+    /// Every `Device` at place 1 of a term list of 13 bytes reads as its
     /// construct, as a `Scope` does after its two-byte opcode.
     #[kani::proof]
     #[kani::unwind(11)]
     fn every_device_reads_as_its_construct()
     {
-        term_at_place_one_holds::<12>(&[OP_EXT_PREFIX, EXT_DEVICE]);
+        term_at_place_one_holds::<13>(&[OP_EXT_PREFIX, EXT_DEVICE]);
     }
 
-    /// Every `Name` at place 1 of a term list of 11 bytes reads as its
-    /// construct: 10 bytes hold a one-segment name with a value of any kind
-    /// up to a dword, and a dual name with a byte. The loops are the name's
+    /// Every `Name` at place 1 of a term list of 12 bytes reads as its
+    /// construct: 11 bytes hold a one-segment name with a value of any kind
+    /// up to a dword, and a dual name with a value of up to two bytes. The loops are the name's
     /// segments and a string's bytes.
     #[kani::proof]
     #[kani::unwind(11)]
     fn every_name_reads_as_its_construct()
     {
-        term_at_place_one_holds::<11>(&[OP_NAME]);
+        term_at_place_one_holds::<12>(&[OP_NAME]);
     }
 
     /// Every `If`, `Else` and `While` at place 1 of a term list of 8 bytes
@@ -1500,21 +1500,21 @@ mod proofs
         }
     }
 
-    /// Every `External` and `Alias` at place 1 of a term list of 11 bytes
-    /// reads as the construct it skips: 10 bytes hold an `External` of a
+    /// Every `External` and `Alias` at place 1 of a term list of 13 bytes
+    /// reads as the construct it skips: 12 bytes hold an `External` of a
     /// one-segment or a dual name and an `Alias` of two one-segment names.
     /// The loops are the names' segments.
     #[kani::proof]
-    #[kani::unwind(11)]
+    #[kani::unwind(13)]
     fn every_external_and_alias_reads_as_its_skip()
     {
         if kani::any()
         {
-            term_at_place_one_holds::<11>(&[OP_EXTERNAL]);
+            term_at_place_one_holds::<13>(&[OP_EXTERNAL]);
         }
         else
         {
-            term_at_place_one_holds::<11>(&[OP_ALIAS]);
+            term_at_place_one_holds::<13>(&[OP_ALIAS]);
         }
     }
 
@@ -1543,7 +1543,7 @@ mod proofs
     }
 
     /// Every `OperationRegion`, `Mutex` and `Event` at place 1 of a term
-    /// list of 12 bytes reads as the construct it skips: 12 bytes hold each
+    /// list of 13 bytes reads as the construct it skips: 12 bytes hold each
     /// with a one-segment name, a region with a byte offset and length, and a
     /// `Mutex` and an `Event` with a dual name. The loops are the name's
     /// segments and an integer's bytes.
@@ -1553,9 +1553,9 @@ mod proofs
     {
         match kani::any::<u8>() % 3
         {
-            0 => term_at_place_one_holds::<12>(&[OP_EXT_PREFIX, EXT_OP_REGION]),
-            1 => term_at_place_one_holds::<12>(&[OP_EXT_PREFIX, EXT_MUTEX]),
-            _ => term_at_place_one_holds::<12>(&[OP_EXT_PREFIX, EXT_EVENT]),
+            0 => term_at_place_one_holds::<13>(&[OP_EXT_PREFIX, EXT_OP_REGION]),
+            1 => term_at_place_one_holds::<13>(&[OP_EXT_PREFIX, EXT_MUTEX]),
+            _ => term_at_place_one_holds::<13>(&[OP_EXT_PREFIX, EXT_EVENT]),
         }
     }
 
@@ -1584,8 +1584,8 @@ mod proofs
     }
 
     /// Every `_UID` and `_STA`, and a `_ADR` the walk ignores, records its
-    /// value of any kind at place 1 of 9 bytes: 8 bytes hold every integer
-    /// form up to a dword and a string. The loops are a string's bytes and an
+    /// value of any kind at place 1 of 10 bytes: 9 bytes hold every integer
+    /// form and a string. The loops are a string's bytes and an
     /// integer's.
     #[kani::proof]
     #[kani::unwind(9)]
@@ -1593,9 +1593,9 @@ mod proofs
     {
         match kani::any::<u8>() % 3
         {
-            0 => name_at_place_one_records::<9>(*b"_UID"),
-            1 => name_at_place_one_records::<9>(*b"_STA"),
-            _ => name_at_place_one_records::<9>(*b"_ADR"),
+            0 => name_at_place_one_records::<10>(*b"_UID"),
+            1 => name_at_place_one_records::<10>(*b"_STA"),
+            _ => name_at_place_one_records::<10>(*b"_ADR"),
         }
     }
 
@@ -1641,14 +1641,14 @@ mod proofs
         property::cid_element_holds(&bytes, 1, n, any_prior());
     }
 
-    /// Every `_CRS` records its value of any kind at place 1 of 9 bytes: 8
+    /// Every `_CRS` records its value of any kind at place 1 of 12 bytes: 11
     /// bytes hold a `Buffer` with every size-integer form and a byte list
     /// longer and shorter than its size. The loop is an integer's bytes.
     #[kani::proof]
-    #[kani::unwind(9)]
+    #[kani::unwind(12)]
     fn every_crs_records_as_its_list()
     {
-        name_at_place_one_records::<9>(*b"_CRS");
+        name_at_place_one_records::<12>(*b"_CRS");
     }
 
     /// Every `Method` of any name is taken into a device that holds nothing

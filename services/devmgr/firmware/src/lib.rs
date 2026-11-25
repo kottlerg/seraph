@@ -39,8 +39,9 @@
 //! grant and their poller's actions, and places, programs and admits a
 //! hot-added function's BARs and record (`hotplug`), and names the requests
 //! refused while devmgr's `CSpace` is short of its headroom (`headroom`). The
-//! contract of the ACPI table decoders, the AML aside, is one property
-//! (`property`, built for host tests, proofs and fuzzing only). The
+//! contract of the firmware-table decoders, the ACPI tables, the AML walk
+//! with its resource templates and the flattened device tree, is one
+//! property (`property`, built for host tests, proofs and fuzzing only). The
 //! functions read caller-mapped byte slices or values, or reach the platform
 //! only through a caller-supplied accessor or split operation, and touch no
 //! syscall, IPC, or `std::os::seraph` surface, so the crate is host-reachable

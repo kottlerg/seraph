@@ -821,6 +821,11 @@ pub fn current_stack_pointer() -> u64;
 /// behaviour.
 pub unsafe fn load_word_racy(p: *const u64) -> u64;
 
+/// Store `value` to each of `words` aligned words from `p` up, the caller's
+/// alone: one `rep stosq` on x86-64, eight `sd` per 64-byte line on riscv64.
+/// Used by the kernel stack paint (`stack_depth`).
+pub unsafe fn fill_words(p: *mut u64, words: usize, value: u64);
+
 /// Verify the platform hardware baseline and refuse unsupported hardware with a
 /// clear diagnostic. Run once in early boot after the console is live. x86-64
 /// checks the CPUID-detectable required features and sets `CR0.WP`; RISC-V probes

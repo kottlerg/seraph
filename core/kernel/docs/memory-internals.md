@@ -851,9 +851,10 @@ lie above the idle one and hold one event each.
 ### Kernel Stack Depth
 
 Every idle, thread, and handoff stack is filled with `STACK_PAINT` (`boot_protocol::layout`)
-when it is allocated, so its deepest use is the span from its top down to its lowest word
-that no longer holds the paint (`stack_depth.rs`). `SYS_SYSTEM_INFO(StackHighWater)` reports the
-span per class ([syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`):
+when it is allocated, so a word that no longer holds the paint was written, and its deepest use
+is the span from its top down to the lowest written word the depth scan finds (`stack_depth.rs`,
+below). `SYS_SYSTEM_INFO(StackHighWater)` reports the span per class
+([syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`):
 
 - Idle stacks: painted in Phase 4 as each is drawn from the buddy, and sampled across
   every CPU at the query, one CPU at a time with interrupts enabled and preemption
@@ -874,6 +875,25 @@ span per class ([syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`):
   The class reads as unlocated when the mark is absent, which an overflow of the stack, or a
   bootloader that does not mark it, causes; the error the selector then returns is in
   [syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`.
+
+The kernel paints with the arch's `fill_words`, one `rep stosq` on x86-64 and eight `sd` per
+64-byte line on riscv64. A thread's stack is painted even when its pages read zero: a retype
+clears nothing, and the holder of the Memory capability may have written the bytes at or above
+the retype cursor before a thread was carved over them (§ Kernel Object Memory), so zero cannot
+stand for untouched.
+
+The scan reads the first word of each 64-byte line from the stack's base up to the lowest line
+whose first word was written, then walks down from the line below it word by word, line after
+line, and stops after eight consecutive lines every word of which still holds the paint
+(`GAP_LINES`, 512 bytes). It finds the lowest written word unless eight or more wholly unwritten
+64-byte lines lie together between that word and the lowest written first word of a line above
+it; a write below such a gap is not counted, and no fixed byte bound holds for that miss, as none
+holds for any scan that reads fewer than every word. The scan never counts a painted word, so the
+report is a lower bound on the depth the stack reached: a frame that reserves stack it never
+writes is not seen either. A stack sized from the report allows, above it, for what the report
+cannot show: the unwritten reserve of the deepest frame, which on riscv64 can reach the
+2032-byte frame bound ([coding-standards.md](../../../docs/coding-standards.md) § Kernel Stack
+Frames), and the depth of any write below an unwritten gap of 512 bytes or more.
 
 The x86-64 interrupt stacks (the IST stacks for the NMI, double-fault and machine-check
 paths) are not painted and this report does not measure them; their budget rests on the

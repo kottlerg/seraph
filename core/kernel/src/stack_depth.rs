@@ -9,7 +9,8 @@
 //! it is allocated: the bootloader paints the handoff stack, and the kernel
 //! paints each idle stack and each thread's kernel stack. A stack's deepest
 //! use is then the span from its top down to its lowest word that no longer
-//! holds the paint. [`high_water`] reports that span per stack class to
+//! holds the paint, as a scan that samples one word per 64-byte line finds it
+//! ([`used_bytes`]). [`high_water`] reports that span per stack class to
 //! `SYS_SYSTEM_INFO(StackHighWater)`. The mechanism and its limits are in
 //! core/kernel/docs/memory-internals.md § Kernel Stack Depth.
 
@@ -42,6 +43,16 @@ static BOOT_ENTRY_SP: AtomicU64 = AtomicU64::new(0);
 /// Bytes of one stack word.
 const WORD: usize = core::mem::size_of::<u64>();
 
+/// Words in one 64-byte line, the unit the depth scan samples.
+const LINE_WORDS: usize = 8;
+
+/// Clears a word index down to the first word of its line.
+const LINE_MASK: usize = !(LINE_WORDS - 1);
+
+/// Wholly painted lines in a row (512 bytes) that end the scan's walk down: a
+/// gap a frame left unwritten up to this size does not hide a write below it.
+const GAP_LINES: usize = 8;
+
 /// Fill `bytes` bytes at `base` with [`STACK_PAINT`].
 ///
 /// # Safety
@@ -49,27 +60,58 @@ const WORD: usize = core::mem::size_of::<u64>();
 /// by the caller (a stack no thread runs on yet).
 pub unsafe fn paint(base: u64, bytes: usize)
 {
-    let words = bytes / WORD;
-    let p = base as *mut u64;
-    for i in 0..words
-    {
-        // SAFETY: i < words, so the offset stays inside the caller's span.
-        let word = unsafe { p.add(i) };
-        // SAFETY: `word` lies in the caller's span, which is writable, aligned
-        // and the caller's alone.
-        unsafe { word.write(STACK_PAINT) };
-    }
+    // SAFETY: the caller's span is `bytes / WORD` writable, aligned words that
+    // are the caller's alone.
+    unsafe { crate::arch::current::cpu::fill_words(base as *mut u64, bytes / WORD, STACK_PAINT) };
 }
 
-/// Bytes used of a stack of `words` words: its size less the run of
-/// [`STACK_PAINT`] words at its low end, where `word(i)` reads word `i`
-/// counted from the low end.
+/// Bytes used of a stack of `words` words, where `word(i)` reads word `i`
+/// counted from the low end: its size less the words below the lowest written
+/// word [`lowest_written`] finds.
 fn used_bytes_with(words: usize, mut word: impl FnMut(usize) -> u64) -> u64
 {
-    let untouched = (0..words).take_while(|&i| word(i) == STACK_PAINT).count();
-    // `untouched <= words`, and the stack's `words * WORD` bytes fit a `usize`,
+    let lowest = lowest_written(words, &mut word);
+    // `lowest <= words`, and the stack's `words * WORD` bytes fit a `usize`,
     // so neither step saturates.
-    words.saturating_sub(untouched).saturating_mul(WORD) as u64
+    words.saturating_sub(lowest).saturating_mul(WORD) as u64
+}
+
+/// Index of the lowest word no longer holding [`STACK_PAINT`] that the line
+/// scan finds, or `words` when it finds none.
+///
+/// The scan reads the first word of each line from the low end up to the
+/// lowest line whose first word was written, then walks down from the line
+/// below it word by word, line after line, and stops after [`GAP_LINES`]
+/// consecutive lines every word of which still holds the paint. It finds the
+/// lowest written word unless that many wholly painted lines lie together
+/// between that word and the lowest written first word above it, and it never
+/// names a painted word (core/kernel/docs/memory-internals.md § Kernel Stack
+/// Depth).
+fn lowest_written(words: usize, word: &mut impl FnMut(usize) -> u64) -> usize
+{
+    let mut hi = (0..words)
+        .step_by(LINE_WORDS)
+        .find(|&i| word(i) != STACK_PAINT)
+        .unwrap_or(words);
+    let mut lowest = hi;
+    let mut painted_run = 0;
+    // Each pass examines the line `[lo, hi)` directly below `hi`: a whole line,
+    // or the last, shorter one when `hi` is a span's end that no line ends at.
+    while hi > 0 && painted_run < GAP_LINES
+    {
+        let lo = hi.saturating_sub(1) & LINE_MASK;
+        match (lo..hi).find(|&i| word(i) != STACK_PAINT)
+        {
+            Some(i) =>
+            {
+                lowest = i;
+                painted_run = 0;
+            }
+            None => painted_run = painted_run.saturating_add(1),
+        }
+        hi = lo;
+    }
+    lowest
 }
 
 /// Bytes used of the stack `[base, base + bytes)`, which no other CPU writes
@@ -313,32 +355,94 @@ mod tests
         v
     }
 
-    #[test]
-    fn an_untouched_stack_uses_nothing_and_a_full_one_everything()
+    /// A stack of `words` words whose words from `deepest` up were written.
+    fn used_from(words: usize, deepest: usize) -> Vec<u64>
     {
-        let v = painted(512);
-        assert!(v.iter().all(|&w| w == STACK_PAINT));
-        // SAFETY: v is 512 readable words.
-        assert_eq!(unsafe { used_bytes(v.as_ptr() as u64, 512 * 8) }, 0);
-        let full = vec![0u64; 512];
-        // SAFETY: as above.
-        assert_eq!(unsafe { used_bytes(full.as_ptr() as u64, 512 * 8) }, 4096);
-    }
-
-    #[test]
-    fn depth_is_measured_from_the_lowest_overwritten_word()
-    {
-        // Stacks grow down: the top 100 words used, then a deeper excursion
-        // that wrote one word at index 300 with paint left between.
-        let mut v = painted(512);
-        for w in &mut v[412..]
+        let mut v = painted(words);
+        for w in &mut v[deepest..]
         {
             *w = 0;
         }
-        v[300] = 7;
-        // SAFETY: v is 512 readable words.
-        let used = unsafe { used_bytes(v.as_ptr() as u64, 512 * 8) };
-        assert_eq!(used, (512 - 300) * 8);
+        v
+    }
+
+    fn used(v: &[u64]) -> u64
+    {
+        // SAFETY: v is v.len() readable, aligned words.
+        unsafe { used_bytes(v.as_ptr() as u64, v.len() * 8) }
+    }
+
+    // Defect caught: a fill that stops short of its span or runs past it.
+    #[test]
+    fn paint_fills_exactly_its_span()
+    {
+        for words in [512, 13]
+        {
+            let mut v = vec![0u64; words + 1];
+            // SAFETY: v owns words + 1 u64s, 8-aligned; the paint covers the
+            // first `words`.
+            unsafe { paint(v.as_mut_ptr() as u64, words * 8) };
+            assert!(v[..words].iter().all(|&w| w == STACK_PAINT));
+            assert_eq!(v[words], 0, "the word past the span is left alone");
+        }
+    }
+
+    // Defect caught: a line scan that misplaces the boundary inside a line
+    // (each of its eight words), at the base or the top, or on a span whose
+    // last line is short, for a stack used from its top down without a gap.
+    #[test]
+    fn a_stack_used_without_a_gap_is_measured_to_the_word()
+    {
+        for words in [512, 509]
+        {
+            for deepest in 0..=words
+            {
+                let v = used_from(words, deepest);
+                assert_eq!(
+                    used(&v),
+                    ((words - deepest) * 8) as u64,
+                    "{words} words from {deepest}"
+                );
+            }
+        }
+    }
+
+    // Defect caught: a scan that checks only the one line below the lowest
+    // written first word, and so stops short of a deeper write reached through
+    // lines whose first word was left unwritten.
+    #[test]
+    fn the_walk_down_crosses_lines_whose_first_word_is_unwritten()
+    {
+        let mut v = painted(512);
+        for (i, w) in v.iter_mut().enumerate().skip(297)
+        {
+            if i % 8 != 0
+            {
+                *w = 0;
+            }
+        }
+        assert_eq!(used(&v), (512 - 297) * 8);
+    }
+
+    // Defect caught: a walk down that stops at a gap shorter than
+    // `GAP_LINES` lines, or one that never stops at a longer one.
+    #[test]
+    fn a_write_below_a_painted_gap_is_seen_up_to_gap_lines()
+    {
+        // The top 100 words used (from line 51 word 4), then one deeper word
+        // with whole painted lines between.
+        let mut v = used_from(512, 412);
+        // Line 43: lines 44 to 50, seven, are wholly painted.
+        v[347] = 7;
+        assert_eq!(used(&v), (512 - 347) * 8);
+        // Line 42 only: lines 43 to 50, eight, are wholly painted, so the
+        // walk stops above it.
+        v[347] = STACK_PAINT;
+        v[339] = 7;
+        assert_eq!(used(&v), (512 - 412) * 8);
+        // A line's first word is read by the sampling, whatever the gap.
+        v[296] = 7;
+        assert_eq!(used(&v), (512 - 296) * 8);
     }
 
     #[test]

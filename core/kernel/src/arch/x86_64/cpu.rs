@@ -131,6 +131,29 @@ pub fn current_stack_pointer() -> u64
     sp
 }
 
+/// Store `value` to each of the `words` 8-byte words from `p` up, with one
+/// `rep stosq`, which fast-string hardware performs a cache line at a time.
+/// Used by the kernel stack paint (`crate::stack_depth::paint`).
+///
+/// # Safety
+/// `[p, p + words * 8)` is writable, 8-byte aligned, and the caller's alone.
+pub unsafe fn fill_words(p: *mut u64, words: usize, value: u64)
+{
+    // SAFETY: the span is writable, aligned and the caller's per the contract.
+    // `rep stosq` stores `rax` to `[rdi]` `rcx` times, stepping `rdi` up by 8
+    // (the direction flag is clear on entry, as the Rust ABI keeps it); it
+    // clobbers `rdi` and `rcx`, and no flag.
+    unsafe {
+        core::arch::asm!(
+            "rep stosq",
+            inout("rdi") p => _,
+            inout("rcx") words => _,
+            in("rax") value,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 /// Load one word that another CPU may be writing concurrently, as an opaque
 /// machine load the compiler neither elides nor reasons about.
 ///

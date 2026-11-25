@@ -415,7 +415,7 @@ pub(crate) unsafe fn interrupt_all_waiters(
             );
         }
         // SAFETY: tcb is a valid TCB, pinned by the claim's wake_in_flight.
-        let cpu = unsafe { crate::sched::select_target_cpu(tcb) };
+        let cpu = unsafe { crate::sched::select_target_cpu(tcb, crate::sched::WakeHint::None) };
         // SAFETY: tcb is valid and claimed, cpu came from select_target_cpu,
         // and the lock order source → sched_lock → run-queue lock allows the
         // wake here.

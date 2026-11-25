@@ -914,15 +914,21 @@ unsafe fn deliver_once(
             FAULT_OUTCOME_NO_RECEIVER
         };
     }
-    if let crate::ipc::endpoint::CallRendezvous::Bound(woken_handler) = result
+    if let crate::ipc::endpoint::CallRendezvous::Bound {
+        server: woken_handler,
+        hint,
+    } = result
     {
         // A handler was waiting; enqueue it so it can service the fault.
         // SAFETY: woken_handler returned by endpoint_call; valid TCB.
         let magic = unsafe { (*woken_handler).magic };
         debug_assert_eq!(magic, crate::sched::thread::TCB_MAGIC);
+        // A committed park makes the hint Sync: this thread's schedule() below
+        // follows before any return to user mode, so the handler may run here.
         // SAFETY: woken_handler is a valid TCB, pinned by the wake_in_flight
-        // claim endpoint_call took.
-        let target_cpu = unsafe { crate::sched::select_target_cpu(woken_handler) };
+        // claim endpoint_call took; a Sync hint's caller is this running
+        // thread, its park committed.
+        let target_cpu = unsafe { crate::sched::select_target_cpu(woken_handler, hint) };
         // SAFETY: woken_handler is valid and claimed, target_cpu came from
         // select_target_cpu, and no scheduler lock is held.
         unsafe { crate::sched::enqueue_and_wake(woken_handler, target_cpu) };
@@ -1201,7 +1207,8 @@ unsafe fn claim_fault_park(
     {
         // SAFETY: the claim is won and the wake_in_flight pin keeps tcb
         // allocated until enqueue_and_wake clears it.
-        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
+        let target_cpu =
+            unsafe { crate::sched::select_target_cpu(tcb, crate::sched::WakeHint::None) };
         // SAFETY: tcb is valid and claimed, target_cpu came from
         // select_target_cpu, and no lock is held.
         unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };

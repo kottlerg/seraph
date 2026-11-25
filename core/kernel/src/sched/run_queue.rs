@@ -79,6 +79,16 @@ const fn queue_index(level: u8) -> usize
     }
 }
 
+/// Whether a thread at `level` outranks one running at `other`: its run queue
+/// is above `other`'s. Any RT level outranks a fair level and the idle level,
+/// and a higher RT level a lower one; no fair level outranks another, all of
+/// them sharing the fair queue (core/kernel/docs/scheduler.md § Wake
+/// Preemption).
+pub const fn outranks(level: u8, other: u8) -> bool
+{
+    queue_index(level) > queue_index(other)
+}
+
 /// Halt for a link at a priority that names no run queue: one at or above
 /// `NUM_PRIORITY_LEVELS`. Host test builds panic instead, so a test can
 /// observe the stop.

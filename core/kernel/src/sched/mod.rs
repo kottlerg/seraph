@@ -2691,7 +2691,7 @@ pub fn sleep_check_wakeups()
             // affinity changed mid-sleep (raw preferred_cpu would not) and
             // applies the save-window pin for a cs == 0 waker race.
             // SAFETY: tcb valid (wake-in-flight gated).
-            let cpu = unsafe { select_target_cpu(tcb) };
+            let cpu = unsafe { select_target_cpu(tcb, WakeHint::None) };
             // SAFETY: tcb valid (wake-in-flight gated); enqueue_and_wake commits
             // the transition by state.
             unsafe { enqueue_and_wake(tcb, cpu) };
@@ -7031,50 +7031,108 @@ pub unsafe fn enqueue_ready_thread(
     ReadyLink::Linked
 }
 
-/// Select target CPU for enqueueing a thread based on affinity, soft
-/// affinity (cache warmth), and load.
+/// What a wake tells [`select_target_cpu`] about its waker.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WakeHint
+{
+    /// The placement weighs the woken thread and the CPUs alone: the waker
+    /// runs on, or is no thread (an interrupt, a timer, a teardown).
+    None,
+    /// The waker is the thread running on this CPU, its park committed in the
+    /// same syscall, and its `schedule()` follows before any return to user
+    /// mode: the call rendezvous and the fault delivery. The woken thread then
+    /// runs on this CPU when nothing else waits there and it does not outrank
+    /// the waker (core/kernel/docs/scheduling-internals.md § Wake Protocol
+    /// Invariants, "Target CPU selection").
+    Sync,
+}
+
+/// Select target CPU for enqueueing a thread based on affinity, the wake's
+/// hint, soft affinity (cache warmth), and load.
 ///
-/// The policy (hard affinity, save-window pin, sticky preferred CPU, min load
-/// with ties to the CPU with the fewest busy SMT siblings) is specified in core/kernel/docs/scheduling-internals.md § Wake Protocol
-/// Invariants, "Target CPU selection".
+/// The policy (hard affinity, save-window pin, the synchronous wake's CPU,
+/// sticky preferred CPU, min load with ties to the CPU with the fewest busy
+/// SMT siblings) is specified in core/kernel/docs/scheduling-internals.md
+/// § Wake Protocol Invariants, "Target CPU selection", and decided by
+/// [`place_wake`].
 ///
 /// # Safety
 /// `tcb` must be a valid pointer to an initialized [`ThreadControlBlock`].
+/// With [`WakeHint::Sync`], the caller is the waker, running on this CPU
+/// with its park committed and its `schedule()` to follow before any return
+/// to user mode.
 #[cfg(not(test))]
-pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
+pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock, hint: WakeHint) -> usize
 {
-    // SAFETY: caller guarantees tcb is valid.
-    unsafe { select_target_cpu_excluding(tcb, None) }
+    // SAFETY: caller guarantees tcb is valid, and the hint's contract.
+    unsafe { select_target_cpu_excluding(tcb, None, hint) }
 }
 
 /// Like [`select_target_cpu`], but treat `exclude` (when `Some`) as ineligible
-/// for the save-window-pin, sticky, and min-load branches — UNLESS hard
-/// `cpu_affinity` names it (affinity is a correctness constraint that overrides
-/// the placement hint) or it is the only CPU.
+/// for the save-window-pin, synchronous-wake, sticky, and min-load branches —
+/// UNLESS hard `cpu_affinity` names it (affinity is a correctness constraint
+/// that overrides the placement hint) or it is the only CPU.
 ///
 /// `dealloc_object(Thread)`'s deferred reply-wake passes `exclude = Some(dealloc_cpu)`;
 /// the rationale is in core/kernel/docs/scheduling-internals.md § Wake Protocol
 /// Invariants, "Target CPU selection".
 ///
 /// # Safety
-/// `tcb` must be a valid pointer to an initialized [`ThreadControlBlock`].
+/// As for [`select_target_cpu`].
 #[cfg(not(test))]
 pub unsafe fn select_target_cpu_excluding(
     tcb: *mut ThreadControlBlock,
     exclude: Option<usize>,
+    hint: WakeHint,
 ) -> usize
 {
-    // SAFETY: caller guarantees tcb is valid; cpu_affinity field is always valid.
-    let affinity = unsafe { (*tcb).cpu_affinity };
+    place_wake(&KernelWake { tcb }, exclude, hint)
+}
 
+/// The woken thread and the CPUs as [`place_wake`] reads them: the kernel's
+/// (`KernelWake`), or a host test's model. Each value is read when the rule
+/// that needs it is reached, so a pinned thread's wake reads its affinity
+/// alone.
+trait WakeView
+{
+    /// The woken thread's hard affinity, `AFFINITY_ANY` when it has none.
+    fn affinity(&self) -> u32;
+    /// Whether the woken thread's context is still being saved on its
+    /// preferred CPU (`context_saved == 0`).
+    fn saving(&self) -> bool;
+    /// The woken thread's preferred CPU, possibly stale.
+    fn preferred(&self) -> usize;
+    /// The CPU count.
+    fn cpu_count(&self) -> usize;
+    /// The CPU the wake runs on: the waker's, for a [`WakeHint::Sync`] wake.
+    fn this_cpu(&self) -> usize;
+    /// Whether this CPU queues a thread other than its idle thread
+    /// (`PerCpuScheduler::has_queued_thread`).
+    fn this_cpu_queues(&self) -> bool;
+    /// Whether the woken thread's run queue is above that of the thread
+    /// running on this CPU, the waker for a [`WakeHint::Sync`] wake
+    /// (`run_queue::outranks`).
+    fn outranks_waker(&self) -> bool;
+    /// The `current_load` of `cpu`.
+    fn load(&self, cpu: usize) -> u32;
+    /// How many SMT siblings of `cpu` are at work (`topology::busy_siblings`).
+    fn busy_siblings(&self, cpu: usize) -> u32;
+}
+
+/// The placement decision of [`select_target_cpu_excluding`], rule by rule as
+/// core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
+/// "Target CPU selection" orders them.
+fn place_wake(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) -> usize
+{
     // Hard affinity wins, even when it names the excluded CPU: affinity is a
     // correctness constraint, not a placement hint.
+    let affinity = view.affinity();
     if affinity != AFFINITY_ANY
     {
         return affinity as usize;
     }
 
-    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let cpu_count = view.cpu_count();
     let eligible = |c: usize| -> bool { c < cpu_count && Some(c) != exclude };
 
     // Save-window pinning: while `context_saved == 0` the source CPU is
@@ -7083,19 +7141,26 @@ pub unsafe fn select_target_cpu_excluding(
     // the thread, avoiding a cross-CPU publication-barrier spin. Honoured only
     // when `preferred_cpu` is eligible; otherwise fall through so a `cs == 0`
     // client is never pinned to the excluded (wedged) CPU.
-    // SAFETY: tcb valid; context_saved is AtomicU32; preferred_cpu always set.
-    let saved = unsafe {
-        (*tcb)
-            .context_saved
-            .load(core::sync::atomic::Ordering::Acquire)
-    };
-    if saved == 0
+    if view.saving()
     {
-        // SAFETY: preferred_cpu is set by every prior enqueue_and_wake.
-        let pref = unsafe { (*tcb).preferred_cpu } as usize;
+        let pref = view.preferred();
         if eligible(pref)
         {
             return pref;
+        }
+    }
+
+    // A synchronous wake runs the woken thread on the waker's CPU when that CPU
+    // queues nothing else and the woken thread does not outrank the waker: it is
+    // then the thread this CPU's `schedule()` dispatches when the waker blocks,
+    // and the waker's reply wake, which returns it here, does not wait behind
+    // it past a slice.
+    if hint == WakeHint::Sync
+    {
+        let this_cpu = view.this_cpu();
+        if eligible(this_cpu) && !view.this_cpu_queues() && !view.outranks_waker()
+        {
+            return this_cpu;
         }
     }
 
@@ -7103,34 +7168,18 @@ pub unsafe fn select_target_cpu_excluding(
     // siblings at work (core/kernel/docs/scheduler.md § SMT Awareness).
     // `usize::MAX` marks "no eligible CPU" (degenerate: cpu_count == 1 and that
     // CPU excluded).
-    let load = |cpu: usize| -> u32 {
-        // SAFETY: cpu < cpu_count (every caller below passes an eligible CPU
-        // or a ring sibling, each below CPU_COUNT); scheduler slab initialised
-        // for all CPUs.
-        let sched = unsafe { scheduler_ptr(cpu) };
-        // SAFETY: the slot holds CPU `cpu`'s initialised scheduler, which every
-        // CPU reaches through shared references; the load is atomic.
-        unsafe { (*sched).current_load() }
-    };
-    let busy_siblings = |cpu: usize| -> u32 {
-        crate::topology::busy_siblings(cpu, |sibling| {
-            // SAFETY: a ring sibling is a CPU index below CPU_COUNT; scheduler
-            // slab initialised for all CPUs.
-            let sched = unsafe { scheduler_ptr(sibling) };
-            // SAFETY: as for `load`; `has_no_work` reads atomics only.
-            !unsafe { (*sched).has_no_work() }
-        })
-    };
-    let (min_cpu, min_load) =
-        least_loaded_cpu((0..cpu_count).filter(|&c| eligible(c)), load, busy_siblings)
-            .unwrap_or((usize::MAX, u32::MAX));
+    let (min_cpu, min_load) = least_loaded_cpu(
+        (0..cpu_count).filter(|&c| eligible(c)),
+        |cpu| view.load(cpu),
+        |cpu| view.busy_siblings(cpu),
+    )
+    .unwrap_or((usize::MAX, u32::MAX));
 
     // Sticky preferred CPU (eligible only): stay if within the pull-balancer's
-    // imbalance threshold of the global minimum (cache-warmth bias, #128).
-    // SAFETY: preferred_cpu is set by every prior enqueue_and_wake; the
+    // imbalance threshold of the global minimum (cache-warmth bias, #128). The
     // eligibility guard makes a stale value fall through to the min-load path.
-    let pref = unsafe { (*tcb).preferred_cpu } as usize;
-    if eligible(pref) && !exceeds_imbalance(load(pref), min_load)
+    let pref = view.preferred();
+    if eligible(pref) && !exceeds_imbalance(view.load(pref), min_load)
     {
         return pref;
     }
@@ -7148,9 +7197,109 @@ pub unsafe fn select_target_cpu_excluding(
     // overrides returned earlier).
     debug_assert!(
         Some(min_cpu) != exclude,
-        "select_target_cpu_excluding: load scan returned excluded cpu {min_cpu}",
+        "place_wake: load scan returned excluded cpu {min_cpu}",
     );
     min_cpu
+}
+
+/// The kernel's [`WakeView`]: the woken thread `tcb`, read without its
+/// `sched_lock` as placement hints (core/kernel/docs/scheduling-internals.md
+/// § Cross-CPU TCB Ownership), and the CPUs' schedulers, read lock-free.
+#[cfg(not(test))]
+struct KernelWake
+{
+    /// The woken thread, valid and initialized (`select_target_cpu`'s
+    /// contract).
+    tcb: *mut ThreadControlBlock,
+}
+
+#[cfg(not(test))]
+impl KernelWake
+{
+    /// `cpu`'s scheduler; `cpu` is below `CPU_COUNT`, since every caller
+    /// passes an eligible CPU, this CPU, or a ring sibling.
+    fn scheduler(cpu: usize) -> &'static PerCpuScheduler
+    {
+        // SAFETY: cpu < CPU_COUNT (above); scheduler slab initialised for all
+        // CPUs.
+        let sched = unsafe { scheduler_ptr(cpu) };
+        // SAFETY: the slot holds CPU `cpu`'s initialised scheduler, which lives
+        // for the kernel's life and is reached through shared references only.
+        unsafe { &*sched }
+    }
+}
+
+#[cfg(not(test))]
+impl WakeView for KernelWake
+{
+    fn affinity(&self) -> u32
+    {
+        // SAFETY: tcb is valid (select_target_cpu's contract); cpu_affinity is
+        // always initialised.
+        unsafe { (*self.tcb).cpu_affinity }
+    }
+
+    fn saving(&self) -> bool
+    {
+        // SAFETY: tcb is valid; context_saved is an AtomicU32.
+        let saved = unsafe {
+            (*self.tcb)
+                .context_saved
+                .load(core::sync::atomic::Ordering::Acquire)
+        };
+        saved == 0
+    }
+
+    fn preferred(&self) -> usize
+    {
+        // SAFETY: tcb is valid; preferred_cpu is set by every prior
+        // enqueue_and_wake.
+        unsafe { (*self.tcb).preferred_cpu as usize }
+    }
+
+    fn cpu_count(&self) -> usize
+    {
+        CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
+    }
+
+    fn this_cpu(&self) -> usize
+    {
+        crate::arch::current::cpu::current_cpu() as usize
+    }
+
+    fn this_cpu_queues(&self) -> bool
+    {
+        // Relaxed, a local read: it only decides, and every link this CPU made
+        // precedes it in program order. A link another CPU makes after it is the
+        // race scheduling-internals.md § Target CPU selection bounds.
+        Self::scheduler(self.this_cpu()).has_queued_thread()
+    }
+
+    fn outranks_waker(&self) -> bool
+    {
+        let waker = Self::scheduler(self.this_cpu()).current();
+        if waker.is_null()
+        {
+            return false;
+        }
+        // SAFETY: tcb is valid; priority is read as a placement hint, which
+        // enqueue_and_wake re-reads under sched_lock for the link.
+        let level = unsafe { (*self.tcb).priority };
+        // SAFETY: waker is the thread running on this CPU, which the wake runs
+        // on, so it stays allocated across the read; read as for `level`.
+        let waker_level = unsafe { (*waker).priority };
+        run_queue::outranks(level, waker_level)
+    }
+
+    fn load(&self, cpu: usize) -> u32
+    {
+        Self::scheduler(cpu).current_load()
+    }
+
+    fn busy_siblings(&self, cpu: usize) -> u32
+    {
+        crate::topology::busy_siblings(cpu, |sibling| !Self::scheduler(sibling).has_no_work())
+    }
 }
 
 /// The least-loaded CPU of `cpus` by `load` and its load, ties going to the
@@ -7206,7 +7355,7 @@ fn least_loaded_cpu(
 
 /// Test stub for `select_target_cpu` (always returns CPU 0).
 #[cfg(test)]
-pub unsafe fn select_target_cpu(_tcb: *mut ThreadControlBlock) -> usize
+pub unsafe fn select_target_cpu(_tcb: *mut ThreadControlBlock, _hint: WakeHint) -> usize
 {
     0
 }
@@ -8322,7 +8471,7 @@ pub(crate) unsafe fn post_one_death_event(
         // mid-block on its CPU, that save never publishes, deadlocking both
         // CPUs (the observer ends up `current` on two CPUs). See #289.
         // SAFETY: woken_tcb is a valid Ready TCB; select_target_cpu is lock-free.
-        let target_cpu = unsafe { select_target_cpu(woken_tcb) };
+        let target_cpu = unsafe { select_target_cpu(woken_tcb, WakeHint::None) };
         // SAFETY: woken_tcb is a valid TCB, and target_cpu, from
         // select_target_cpu, is an initialised CPU below CPU_COUNT.
         unsafe { enqueue_and_wake(woken_tcb, target_cpu) };
@@ -10104,7 +10253,7 @@ mod idle_pull_tests
 #[cfg(test)]
 mod placement_tests
 {
-    use super::least_loaded_cpu;
+    use super::{AFFINITY_ANY, RT_PRIORITY_MIN, WakeHint, WakeView, least_loaded_cpu, place_wake};
 
     /// `least_loaded_cpu` over CPUs `0..loads.len()` with `loads` and
     /// `busy` (busy siblings per CPU), recording each sibling count asked for.
@@ -10152,6 +10301,174 @@ mod placement_tests
     fn no_cpu_gives_none()
     {
         assert_eq!(least_loaded_cpu(0..0, |_| 0, |_| 0), None);
+    }
+
+    /// A wake as a host test models it: the woken thread and the CPUs, and
+    /// how often the rule read the waker's CPU.
+    struct Wake
+    {
+        affinity: u32,
+        saving: bool,
+        preferred: usize,
+        this_cpu: usize,
+        this_cpu_queues: bool,
+        outranks_waker: bool,
+        loads: Vec<u32>,
+        waker_reads: core::cell::Cell<u32>,
+    }
+
+    impl Wake
+    {
+        /// An unpinned, saved thread preferring CPU `preferred`, woken from CPU
+        /// `this_cpu`, which queues nothing and runs a waker the thread does not
+        /// outrank, with every CPU's load 0.
+        fn new(cpus: usize, preferred: usize, this_cpu: usize) -> Self
+        {
+            Self {
+                affinity: AFFINITY_ANY,
+                saving: false,
+                preferred,
+                this_cpu,
+                this_cpu_queues: false,
+                outranks_waker: false,
+                loads: vec![0; cpus],
+                waker_reads: core::cell::Cell::new(0),
+            }
+        }
+
+        fn place(&self, exclude: Option<usize>, hint: WakeHint) -> usize
+        {
+            place_wake(self, exclude, hint)
+        }
+    }
+
+    impl WakeView for Wake
+    {
+        fn affinity(&self) -> u32
+        {
+            self.affinity
+        }
+        fn saving(&self) -> bool
+        {
+            self.saving
+        }
+        fn preferred(&self) -> usize
+        {
+            self.preferred
+        }
+        fn cpu_count(&self) -> usize
+        {
+            self.loads.len()
+        }
+        fn this_cpu(&self) -> usize
+        {
+            self.this_cpu
+        }
+        fn this_cpu_queues(&self) -> bool
+        {
+            self.waker_reads.set(self.waker_reads.get() + 1);
+            self.this_cpu_queues
+        }
+        fn outranks_waker(&self) -> bool
+        {
+            self.waker_reads.set(self.waker_reads.get() + 1);
+            self.outranks_waker
+        }
+        fn load(&self, cpu: usize) -> u32
+        {
+            self.loads[cpu]
+        }
+        fn busy_siblings(&self, _cpu: usize) -> u32
+        {
+            0
+        }
+    }
+
+    // The defect caught: a synchronous wake left on the woken thread's sticky
+    // CPU, so a pair that starts apart stays apart and every round trip pays
+    // a remote wake; or a plain wake moved to the waker's CPU.
+    #[test]
+    fn a_sync_wake_runs_on_the_wakers_cpu_and_a_plain_wake_stays_sticky()
+    {
+        let wake = Wake::new(4, 1, 2);
+        assert_eq!(wake.place(None, WakeHint::Sync), 2);
+        assert_eq!(wake.place(None, WakeHint::None), 1);
+    }
+
+    // The defect caught: the woken thread placed on the waker's CPU ahead of a
+    // thread queued there (of any class) while another CPU idles, or ahead of
+    // a waker it outranks, whose reply wake would then wait behind it past a
+    // slice; each falls through to the sticky and least-load rules.
+    #[test]
+    fn a_queued_thread_or_an_outranked_waker_sends_a_sync_wake_to_the_other_rules()
+    {
+        let mut queued = Wake::new(4, 1, 2);
+        queued.this_cpu_queues = true;
+        assert_eq!(queued.place(None, WakeHint::Sync), 1);
+        let mut outranking = Wake::new(4, 1, 2);
+        outranking.outranks_waker = true;
+        assert_eq!(outranking.place(None, WakeHint::Sync), 1);
+        outranking.loads = vec![0, 3, 1, 1];
+        assert_eq!(outranking.place(None, WakeHint::Sync), 0);
+    }
+
+    // The defect caught: a synchronous wake overriding hard affinity (a
+    // correctness constraint), or placing a thread whose context its
+    // preferred CPU is still saving on the waker's CPU, which would then spin
+    // on the save.
+    #[test]
+    fn affinity_and_the_save_window_pin_come_before_a_sync_wake()
+    {
+        let mut pinned = Wake::new(4, 1, 2);
+        pinned.affinity = 3;
+        assert_eq!(pinned.place(None, WakeHint::Sync), 3);
+        let mut saving = Wake::new(4, 1, 2);
+        saving.saving = true;
+        assert_eq!(saving.place(None, WakeHint::Sync), 1);
+    }
+
+    // The defect caught: a synchronous wake placed on an excluded CPU (the
+    // dealloc reply-wake's wedged CPU), or one past the CPU count.
+    #[test]
+    fn a_sync_wake_never_picks_an_ineligible_wakers_cpu()
+    {
+        let wake = Wake::new(4, 1, 2);
+        assert_eq!(wake.place(Some(2), WakeHint::Sync), 1);
+        let past = Wake::new(2, 1, 2);
+        assert_eq!(past.place(None, WakeHint::Sync), 1);
+    }
+
+    // The defect caught: the waker's CPU read on every wake, a cost on the
+    // wake path of each plain wake, or on a pinned or mid-save thread's wake,
+    // that only a synchronous wake past those rules uses.
+    #[test]
+    fn only_a_sync_wake_past_affinity_and_the_pin_reads_the_wakers_cpu()
+    {
+        let wake = Wake::new(4, 1, 2);
+        wake.place(None, WakeHint::None);
+        assert_eq!(wake.waker_reads.get(), 0);
+        let mut pinned = Wake::new(4, 1, 2);
+        pinned.affinity = 0;
+        pinned.place(None, WakeHint::Sync);
+        assert_eq!(pinned.waker_reads.get(), 0);
+        wake.place(None, WakeHint::Sync);
+        assert_eq!(wake.waker_reads.get(), 2);
+    }
+
+    // The defect caught: rank compared by raw priority, so one fair level
+    // outranks another (fair levels are weights in one queue) and a fair
+    // recipient is kept off a lower fair waker's CPU; or an RT level not
+    // outranking a fair one or a lower RT one.
+    #[test]
+    fn rank_is_the_run_queue_order()
+    {
+        use super::run_queue::outranks;
+        assert!(!outranks(20, 1));
+        assert!(!outranks(1, 20));
+        assert!(outranks(RT_PRIORITY_MIN, 20));
+        assert!(!outranks(20, RT_PRIORITY_MIN));
+        assert!(outranks(RT_PRIORITY_MIN + 3, RT_PRIORITY_MIN + 2));
+        assert!(!outranks(RT_PRIORITY_MIN + 3, RT_PRIORITY_MIN + 3));
     }
 }
 

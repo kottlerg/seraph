@@ -316,7 +316,8 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
     // stop (and any restart, which links the thread itself) may have
     // superseded it, and the start then took effect and was stopped.
     // SAFETY: target_tcb is a valid, initialized TCB, pinned by `thread_slot`.
-    let target_cpu = unsafe { crate::sched::select_target_cpu(target_tcb) };
+    let target_cpu =
+        unsafe { crate::sched::select_target_cpu(target_tcb, crate::sched::WakeHint::None) };
     // SAFETY: target_tcb is valid and pinned; Ready at `start_seq` it is
     // neither live nor linked on any CPU (the commit drained it); target_cpu comes from
     // select_target_cpu, so it is an initialised CPU; no run-queue lock is

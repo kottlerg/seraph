@@ -25,16 +25,25 @@
 //! with a fair spinner pinned beside it when the case asks, and an unpinned
 //! server runs on P (CPU 1), clears its affinity there, and parks in its
 //! receive. The caller waits for the park, lets the server's switch-out
-//! finish, and calls; the server replies with the CPU it runs on. [`ROUNDS`]
-//! rounds per case.
+//! finish, and calls. Around each receive the server reads its own placement
+//! counts (`CAP_INFO_THREAD_PLACEMENT`): the wakes that reached the rule, those
+//! the rule placed on the waker's CPU, and the load balancer's pulls. It
+//! records them with the CPU the receive returned on. [`ROUNDS`] rounds per
+//! case.
 //!
 //! ## Pass criterion
 //!
-//! A case that allows the rule runs the server on K in at least half its
-//! rounds (a round whose call beat the park stays with the other rules); a
-//! case that does not never runs it on K. Off K the other rules place the
-//! server, usually on P, and an idle CPU's pull may take it from there when P
-//! is busy, so a round off K may end on any CPU but K.
+//! The rule's own counts say which rounds it decided, so every such round is
+//! judged. A round whose wake did not reach the rule is excluded, and the log
+//! gives the count of those rounds. Such a round is one whose call found the
+//! server not yet parked, or its context save on P still in flight.
+//!
+//! - In a case that allows the rule, every counted round is placed on K and
+//!   runs there, unless a pull moved the server off K's queue first.
+//! - In a case that does not, no counted round is placed on K.
+//! - No round of a case that does not allow the rule runs on K.
+//! - A case that allows the rule fails when no round is counted.
+//! - A round whose counts moved by more than its one wake fails.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -132,8 +141,23 @@ const CASES: [Case; 5] = [
 /// The round the server is about to park for (1-based; 0 before the first).
 static PARKING: AtomicU32 = AtomicU32::new(0);
 
-/// The CPU the server ran each round on, as its reply reported it.
+/// The CPU the server ran each round on, as its receive returned there.
 static RAN_ON: [AtomicU32; ROUNDS as usize] = [const { AtomicU32::new(u32::MAX) }; ROUNDS as usize];
+
+/// The server's placement counts across each round's receive, as differences:
+/// the wakes that reached the synchronous wake rule, those it placed on the
+/// waker's CPU, and the load balancer's pulls.
+static REACHED: [AtomicU32; ROUNDS as usize] = [const { AtomicU32::new(0) }; ROUNDS as usize];
+static LOCAL: [AtomicU32; ROUNDS as usize] = [const { AtomicU32::new(0) }; ROUNDS as usize];
+static PULLED: [AtomicU32; ROUNDS as usize] = [const { AtomicU32::new(0) }; ROUNDS as usize];
+
+/// The `CAP_INFO_THREAD_PLACEMENT` views the server reads around a receive,
+/// in the order of [`REACHED`], [`LOCAL`] and [`PULLED`].
+const COUNTED_VIEWS: [u64; 3] = [
+    syscall_abi::THREAD_PLACEMENT_SYNC_WAKES,
+    syscall_abi::THREAD_PLACEMENT_SYNC_LOCAL,
+    syscall_abi::THREAD_PLACEMENT_PULLS,
+];
 
 /// Syscall failures in the children.
 static CHILD_ERRORS: AtomicU32 = AtomicU32::new(0);
@@ -275,6 +299,10 @@ fn rounds(
     {
         ran_on.store(u32::MAX, Ordering::Release);
     }
+    for count in REACHED.iter().chain(&LOCAL).chain(&PULLED)
+    {
+        count.store(0, Ordering::Release);
+    }
     let [server, caller, spinner] = children;
 
     *server = spawn::new_child_at(ctx, ctx.sched_control_cap, case.server)
@@ -344,34 +372,85 @@ fn rounds(
     check(case)
 }
 
-/// Check where the server ran in each round of `case`.
+/// Check each round of `case` against the counts its server recorded.
 fn check(case: Case) -> TestResult
 {
     let mut on_k = 0u32;
-    let mut on_p = 0u32;
-    for ran_on in &RAN_ON
+    let mut counted = 0u32;
+    for (((ran_on, reached), local), pulled) in RAN_ON.iter().zip(&REACHED).zip(&LOCAL).zip(&PULLED)
     {
-        match ran_on.load(Ordering::Acquire)
+        let cpu = ran_on.load(Ordering::Acquire);
+        let reached = reached.load(Ordering::Acquire);
+        let local = local.load(Ordering::Acquire);
+        let pulled = pulled.load(Ordering::Acquire);
+        if cpu == K
         {
-            K => on_k = on_k.saturating_add(1),
-            P => on_p = on_p.saturating_add(1),
-            _ =>
-            {}
+            on_k = on_k.saturating_add(1);
+        }
+        if reached > 1 || local > reached
+        {
+            return Err(
+                "sync_ipc_placement: the rule's counts moved by more than a round's one wake",
+            );
+        }
+        if !case.on_k && cpu == K
+        {
+            return Err(
+                "sync_ipc_placement: a call ran its server on the caller's CPU past the guard",
+            );
+        }
+        if reached == 0
+        {
+            continue;
+        }
+        counted = counted.saturating_add(1);
+        if case.on_k && local == 0
+        {
+            return Err(
+                "sync_ipc_placement: a call the rule allows was not placed on the caller's CPU",
+            );
+        }
+        if !case.on_k && local != 0
+        {
+            return Err("sync_ipc_placement: the rule placed a guarded call on the caller's CPU");
+        }
+        if case.on_k && cpu != K && pulled == 0
+        {
+            crate::log_args(format_args!(
+                "ktest: sync_ipc_placement {}: a server placed on the caller's CPU ran on CPU {cpu}",
+                case.name
+            ));
+            return Err(
+                "sync_ipc_placement: a wake placed on the caller's CPU ran elsewhere unpulled",
+            );
         }
     }
     crate::log_args(format_args!(
-        "ktest: sync_ipc_placement {}: {on_k} of {ROUNDS} on the caller's CPU, {on_p} on its own",
-        case.name
+        "ktest: sync_ipc_placement {}: {counted} of {ROUNDS} rounds reached the rule ({} excluded), {on_k} on the caller's CPU",
+        case.name,
+        ROUNDS.saturating_sub(counted)
     ));
-    if case.on_k && on_k < ROUNDS / 2
+    if case.on_k && counted == 0
     {
-        return Err("sync_ipc_placement: a call did not run its server on the caller's CPU");
-    }
-    if !case.on_k && on_k != 0
-    {
-        return Err("sync_ipc_placement: a call ran its server on the caller's CPU past the guard");
+        return Err("sync_ipc_placement: no round of a case the rule allows reached the rule");
     }
     Ok(())
+}
+
+/// The server's [`COUNTED_VIEWS`] of its own placement, `None` when a read
+/// fails.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "each count is a 32-bit counter"
+)]
+fn counts(me: u64) -> Option<[u32; 3]>
+{
+    let mut out = [0u32; 3];
+    for (slot, &view) in out.iter_mut().zip(&COUNTED_VIEWS)
+    {
+        *slot = syscall::cap_info_thread_placement(me, view).ok()? as u32;
+    }
+    Some(out)
 }
 
 /// Register IPC page `slot` as this thread's IPC buffer.
@@ -386,8 +465,9 @@ fn ipc_buffer(slot: usize) -> Option<*mut u64>
 }
 
 /// Each round: pin to P and run there, clear the affinity (the server stays on
-/// P until it parks), publish the round, receive, and reply with the CPU the
-/// receive returned on. Runs until a receive fails; its case deletes it,
+/// P until it parks), read its placement counts, publish the round, receive,
+/// record the counts' differences across the receive, and reply with the CPU
+/// the receive returned on. Runs until a receive fails; its case deletes it,
 /// parked.
 extern "C" fn server_entry(arg: u64) -> !
 {
@@ -414,13 +494,23 @@ extern "C" fn server_entry(arg: u64) -> !
         {
             fail();
         }
+        let before = counts(me);
         PARKING.store(round, Ordering::Release);
         // SAFETY: buf is this thread's registered IPC buffer.
         if unsafe { ipc::ipc_recv(ep, buf) }.is_err()
         {
             break;
         }
-        let reply = IpcMessage::new(u64::from(current_cpu()));
+        let cpu = current_cpu();
+        match (before, counts(me))
+        {
+            (Some(before), Some(after)) =>
+            {
+                record(round, before, after);
+            }
+            _ => fail(),
+        }
+        let reply = IpcMessage::new(u64::from(cpu));
         // SAFETY: as for the receive.
         if unsafe { ipc::ipc_reply(&reply, buf) }.is_err()
         {
@@ -428,6 +518,27 @@ extern "C" fn server_entry(arg: u64) -> !
         }
     }
     thread_exit()
+}
+
+/// Record round `round`'s count differences, `before` and `after` its
+/// receive, in [`REACHED`], [`LOCAL`] and [`PULLED`]; a round past
+/// [`ROUNDS`] records nothing.
+fn record(round: u32, before: [u32; 3], after: [u32; 3])
+{
+    let Some(index) = round.checked_sub(1).and_then(|i| usize::try_from(i).ok())
+    else
+    {
+        return;
+    };
+    for (counts, (b, a)) in [&REACHED, &LOCAL, &PULLED]
+        .into_iter()
+        .zip(before.into_iter().zip(after))
+    {
+        if let Some(count) = counts.get(index)
+        {
+            count.store(a.wrapping_sub(b), Ordering::Release);
+        }
+    }
 }
 
 /// Each round: wait for the server to announce its park, give its switch-out

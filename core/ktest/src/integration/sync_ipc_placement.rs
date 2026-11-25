@@ -41,7 +41,8 @@
 //! - In a case that allows the rule, every counted round is placed on K and
 //!   runs there, unless a pull moved the server off K's queue first.
 //! - In a case that does not, no counted round is placed on K.
-//! - No round of a case that does not allow the rule runs on K.
+//! - No round of a case that does not allow the rule runs on K, unless a pull
+//!   moved the server there: an idle K may pull it off P's queue.
 //! - A case that allows the rule fails when no round is counted.
 //! - A round whose counts moved by more than its one wake fails.
 
@@ -393,7 +394,7 @@ fn check(case: Case) -> TestResult
                 "sync_ipc_placement: the rule's counts moved by more than a round's one wake",
             );
         }
-        if !case.on_k && cpu == K
+        if !case.on_k && cpu == K && pulled == 0
         {
             return Err(
                 "sync_ipc_placement: a call ran its server on the caller's CPU past the guard",

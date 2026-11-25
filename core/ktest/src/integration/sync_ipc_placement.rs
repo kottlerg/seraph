@@ -31,8 +31,10 @@
 //! ## Pass criterion
 //!
 //! A case that allows the rule runs the server on K in at least half its
-//! rounds (a round whose call beat the park stays on P) and nowhere but K and
-//! P; a case that does not never runs it on K.
+//! rounds (a round whose call beat the park stays with the other rules); a
+//! case that does not never runs it on K. Off K the other rules place the
+//! server, usually on P, and an idle CPU's pull may take it from there when P
+//! is busy, so a round off K may end on any CPU but K.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -346,26 +348,19 @@ fn rounds(
 fn check(case: Case) -> TestResult
 {
     let mut on_k = 0u32;
+    let mut on_p = 0u32;
     for ran_on in &RAN_ON
     {
-        let cpu = ran_on.load(Ordering::Acquire);
-        if cpu == K
+        match ran_on.load(Ordering::Acquire)
         {
-            on_k = on_k.saturating_add(1);
-        }
-        else if cpu != P
-        {
-            crate::log_args(format_args!(
-                "ktest: sync_ipc_placement {}: the server ran on CPU {cpu}",
-                case.name
-            ));
-            return Err(
-                "sync_ipc_placement: the server ran on neither its caller's CPU nor its own",
-            );
+            K => on_k = on_k.saturating_add(1),
+            P => on_p = on_p.saturating_add(1),
+            _ =>
+            {}
         }
     }
     crate::log_args(format_args!(
-        "ktest: sync_ipc_placement {}: {on_k} of {ROUNDS} on the caller's CPU",
+        "ktest: sync_ipc_placement {}: {on_k} of {ROUNDS} on the caller's CPU, {on_p} on its own",
         case.name
     ));
     if case.on_k && on_k < ROUNDS / 2

@@ -577,22 +577,23 @@ pub fn band(mode: BenchMode, base: u64, hundredths: Option<u64>) -> Option<u64>
     }
 }
 
-/// The benchmarks whose count includes time blocked on a device completion.
-/// The completion arrives at host time: under icount a guest blocked on it
-/// runs no instructions, and its clock advances by timer deadlines until
-/// QEMU completes the request, so the count follows the host's I/O latency,
-/// which no band bounds. `fsbench.write` writes through the filesystem's
-/// page cache to the disk (services/fs/fat/docs/crash-safety.md), every size
-/// of it. `fsbench.read` is not here: its timed reads find the file in that
-/// cache, which its untimed open, check and warm-up filled, so no timed sample
-/// waits on the disk. A benchmark whose timed samples wait on a device joins
-/// this set.
+/// The benchmarks whose timed samples idle. Under icount, while every vCPU
+/// idles, the guest's clock follows the host's time, so a window that idles
+/// counts host time, which no band bounds: one blocked on a device
+/// completion, which arrives at host time, counts the host's I/O latency, and
+/// one waiting on a timer counts the host time its idle took.
+/// `fsbench.write` writes through the filesystem's page cache to the disk
+/// (services/fs/fat/docs/crash-safety.md), every size of it. `fsbench.read`
+/// is not here: its timed reads find the file in that cache, which its
+/// untimed open, check and warm-up filled, so no timed sample waits on the
+/// disk. A benchmark whose timed samples idle, on a device, a timer or any
+/// other event, joins this set.
 pub const ICOUNT_IO_BOUND: [&str; 1] = ["fsbench.write"];
 
 /// Whether a measurement gates: an icount measurement at one CPU of a
 /// benchmark not in [`ICOUNT_IO_BOUND`]. A multi-CPU icount measurement's
-/// count moves with the interleaving of its CPUs, an I/O-bound one's with the
-/// host's I/O, and host mode is report-only.
+/// count moves with the interleaving of its CPUs, one whose windows idle with
+/// the host's time, and host mode is report-only.
 pub fn gates(mode: BenchMode, key: &Key) -> bool
 {
     matches!(mode, BenchMode::Icount)

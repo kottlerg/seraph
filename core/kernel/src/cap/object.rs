@@ -1527,8 +1527,8 @@ const KEPT_BATCH_PAGES: u64 = 64;
 /// (`cap::drain::MAX_DRAIN_EDITS`). A slot costs at most one reference release
 /// and the leaves are as many as the owner paid for, so the pass takes this
 /// CPU's pending interrupts between batches of this many leaves. (An endpoint
-/// slot's release also releases the endpoint's waiters under its lock, a walk
-/// #1628 bounds.)
+/// slot's release also releases the endpoint's waiters, sixteen per hold of
+/// its lock, with an interrupt window between holds.)
 const RELEASE_BATCH_LEAVES: u64 = 4;
 
 /// Spill chunks a dead `Mmio` object returns to their arenas per stretch with
@@ -3439,14 +3439,9 @@ unsafe fn unlink_dying_waiter(
             // SAFETY: blocked_on is the live EndpointState bound_state names, its
             // lock held (contract).
             let ep = unsafe { &mut *blocked_on.cast::<crate::ipc::endpoint::EndpointState>() };
-            // SAFETY: ep.lock is held (contract); tcb and the queue ends are valid.
-            unsafe {
-                crate::ipc::endpoint::unlink_from_wait_queue(
-                    tcb,
-                    &mut ep.send_head,
-                    &mut ep.send_tail,
-                )
-            };
+            // SAFETY: tcb is a valid TCB (contract); ep.lock, which serialises
+            // every edit of the send queue, is held.
+            unsafe { ep.send.remove(tcb) };
             // Republish send-queue level (#285-adjacent): this unlink can
             // empty the queue, and the wait-set self-heal reads the shadow
             // locklessly.
@@ -3458,14 +3453,9 @@ unsafe fn unlink_dying_waiter(
             // SAFETY: blocked_on is the live EndpointState bound_state names, its
             // lock held (contract).
             let ep = unsafe { &mut *blocked_on.cast::<crate::ipc::endpoint::EndpointState>() };
-            // SAFETY: ep.lock is held (contract); tcb and the queue ends are valid.
-            unsafe {
-                crate::ipc::endpoint::unlink_from_wait_queue(
-                    tcb,
-                    &mut ep.recv_head,
-                    &mut ep.recv_tail,
-                )
-            };
+            // SAFETY: tcb is a valid TCB (contract); ep.lock, which serialises
+            // every edit of the recv queue, is held.
+            unsafe { ep.recv.remove(tcb) };
         }
         IpcThreadState::BlockedOnEventQueue =>
         {
@@ -4971,22 +4961,31 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
 
                 // Wake every blocked waiter with its park stamped Interrupted.
                 // Each is claimed under sig.lock, as notification_send claims
-                // (#160), and, as a multi-waiter drain, also woken under it
-                // (core/kernel/docs/scheduling-internals.md § Lock Hierarchy
-                // rule 5), so a concurrent dealloc(waiter) BlockedOnNotification
-                // unlink (which takes sig.lock and spins on wake_in_flight)
-                // cannot free a TCB before its enqueue_and_wake commits.
+                // (#160), and, as a multi-waiter drain, also woken under it, a
+                // batch at a time (core/kernel/docs/scheduling-internals.md
+                // § Lock Hierarchy rule 5), so a concurrent dealloc(waiter)
+                // BlockedOnNotification unlink (which takes sig.lock and spins
+                // on wake_in_flight) cannot free a TCB before its
+                // enqueue_and_wake commits. No reference is left to park on
+                // the notification through, so no waiter joins meanwhile.
                 {
                     // SAFETY: state validated non-null; NotificationState live.
-                    let sig = unsafe { &mut *state };
-                    // SAFETY: the returned flags are passed verbatim to the `unlock_raw` below.
-                    let saved = unsafe { sig.lock.lock_raw() };
-                    // SAFETY: sig.lock held, taken above and released only after, and no
-                    // scheduler or sleep-list lock held.
-                    unsafe { crate::ipc::interrupt_all_waiters(&mut sig.waiters) };
-                    sig.refresh_observer();
-                    // SAFETY: `saved` is the value `lock_raw` returned for this lock above.
-                    unsafe { sig.lock.unlock_raw(saved) };
+                    let lock = unsafe { &(*state).lock };
+                    // SAFETY: the returned flags are passed, through the drain,
+                    // to the `unlock_raw` below.
+                    let mut saved = unsafe { lock.lock_raw() };
+                    // SAFETY: state is live (validated above).
+                    let waiters = unsafe { &raw mut (*state).waiters };
+                    // SAFETY: sig.lock held with flags `saved`, and no other
+                    // lock; the notification is live until its free below, and
+                    // dealloc_object runs where interrupts may be taken.
+                    unsafe { crate::ipc::interrupt_all_waiters(waiters, lock, &mut saved) };
+                    // SAFETY: state is live, and sig.lock, held, serialises
+                    // the observer.
+                    unsafe { (*state).refresh_observer() };
+                    // SAFETY: `saved` is the flags of the drain's last hold of
+                    // this lock.
+                    unsafe { lock.unlock_raw(saved) };
                 }
 
                 // A timer batch that popped a timed waiter of this notification

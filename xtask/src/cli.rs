@@ -595,9 +595,11 @@ args! {
         pub test_devices: bool,
 
         /// Count instructions: run the machine on single-threaded TCG with
-        /// QEMU's `-icount shift=0,sleep=off,align=off`, so the guest's clock
-        /// and cycle counters advance one tick per retired instruction, the
-        /// deterministic measure `bench-check --mode icount` compares. Always
+        /// QEMU's `-icount shift=0,sleep=on,align=off`, so the guest's clock
+        /// and cycle counters advance one tick per retired instruction while a
+        /// vCPU runs, the deterministic measure `bench-check --mode icount`
+        /// compares, and follow the host's time while every vCPU idles, so a
+        /// device completion ends an idle as it would on hardware. Always
         /// TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount
         /// cannot serve, so the kernel runs its xAPIC paths.
         #[arg(long)]
@@ -642,7 +644,8 @@ args! {
 
         /// Boot N times unattended and classify each run's log as PASS, FAIL,
         /// HANG, OK, ERR or QEMU-CRASH by the `--pass` and `--fail` patterns,
-        /// failing unless every run passes (a QEMU-CRASH is tolerated). Without
+        /// failing unless every run passes (a QEMU-CRASH is tolerated beside a
+        /// PASS, never in a set with none). Without
         /// it, `run` is one interactive boot whose serial output is the
         /// terminal's.
         #[arg(long, value_name = "N")]
@@ -695,12 +698,14 @@ args! {
 
         /// Regex marking a successful run of `--runs`. On match (and every
         /// `--require` and `--crash-reports` check holding) the log is
-        /// discarded and the run is classified PASS. The default matches the
-        /// cross-harness terminal marker `[<harness>] ALL TESTS PASSED`
-        /// standardised in [`docs/testing.md`](../../docs/testing.md); override
+        /// discarded and the run is classified PASS. The default is the
+        /// terminal marker `[<harness>] ALL TESTS PASSED`
+        /// ([`docs/testing.md`](../../docs/testing.md)) of the one harness the
+        /// image boots, as its pack recorded it; an image that boots no harness,
+        /// or several, has none, and `--runs` then needs this option. Override
         /// for other rootfs configurations.
-        #[arg(long, default_value = DEFAULT_PASS_REGEX, requires = "runs")]
-        pub pass: String,
+        #[arg(long, requires = "runs")]
+        pub pass: Option<String>,
 
         /// Regex marking a failed run of `--runs`. On match the log is
         /// preserved as FAIL-<run>.log. Failure takes precedence over success.
@@ -785,10 +790,6 @@ args! {
 /// The benign `USERSPACE FAULT` path matches none of these.
 pub const DEFAULT_FAIL_REGEX: &str =
     r"SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL";
-
-/// Default `run --pass` regex: the cross-harness terminal pass
-/// marker `[<harness>] ALL TESTS PASSED` (docs/testing.md § Reporting marker).
-pub const DEFAULT_PASS_REGEX: &str = "ALL TESTS PASSED";
 
 /// Default `run --fail-grace-secs`.
 pub const DEFAULT_FAIL_GRACE_SECS: u64 = 10;

@@ -731,8 +731,8 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
 /// so it provides a name; every name it provides is badged (`:auth` or
 /// `:deny`), since a holder of an unbadged SEND could badge it with
 /// `ipc::stop_labels::STOP_AUTHORITY` and stop the source's candidates; and
-/// it is supervised (`restart` other than `never`), since svcmgr lists only
-/// a service it holds the endpoint of.
+/// it is restarted (`restart` other than `never`), since a source that ends
+/// is otherwise gone for the rest of the boot.
 fn check_stop_source(restart: RestartPolicy, provides: &[ProvidedName]) -> Result<(), ParseError>
 {
     if provides.is_empty()
@@ -750,7 +750,7 @@ fn check_stop_source(restart: RestartPolicy, provides: &[ProvidedName]) -> Resul
     {
         return Err(ParseError::InvalidValue(
             0,
-            "stop_source needs a supervised service (restart other than never)",
+            "stop_source needs a restartable service (restart other than never)",
         ));
     }
     Ok(())
@@ -790,7 +790,7 @@ const fn oom_stop_refusal(refusal: StopRefusal) -> &'static str
     {
         StopRefusal::RestartNever =>
         {
-            "oom_stop needs a supervised service (restart other than never)"
+            "oom_stop needs a restartable service (restart other than never)"
         }
         StopRefusal::Critical => "oom_stop needs critical = no",
         StopRefusal::CoreRole =>
@@ -809,9 +809,9 @@ const fn oom_stop_refusal(refusal: StopRefusal) -> &'static str
 /// through and the actuator's gate tests the authority bit (a `:grant`
 /// entry is refused: the shutdown request moves no cap, so the actuator's
 /// name gives its seeders no `GRANT`); and the service
-/// is supervised (`restart` other than `never`), since svcmgr reads the
-/// liveness of the actuator's supervised entry, and derives the SEND from
-/// the endpoint that entry holds, before it calls.
+/// is restarted (`restart` other than `never`), since the shutdown request
+/// needs a running actuator, whose liveness svcmgr reads from its entry, and
+/// derives the SEND from the endpoint that entry holds, before it calls.
 fn check_shutdown_actuator(
     name: &str,
     restart: RestartPolicy,
@@ -832,7 +832,7 @@ fn check_shutdown_actuator(
     {
         return Err(ParseError::InvalidValue(
             0,
-            "shutdown_actuator needs a supervised service (restart other than never)",
+            "shutdown_actuator needs a restartable service (restart other than never)",
         ));
     }
     Ok(ProvidedName {
@@ -1189,7 +1189,7 @@ sched_max = 12\n";
                 "{extra:?}"
             );
         }
-        // restart = never: BASE is one-shot.
+        // restart = never: BASE is never restarted.
         assert!(matches!(
             parse_with("oom_stop = yes\n"),
             Err(ParseError::InvalidValue(0, _))
@@ -1290,7 +1290,7 @@ sched_max = 12\n";
                 .stop_source,
             Some(StopClass::Program)
         );
-        // restart = never: BASE is one-shot, so svcmgr holds no endpoint of it.
+        // restart = never: BASE is never restarted.
         assert!(matches!(
             parse_with("provides = s.ctl:deny\nstop_source = program\n"),
             Err(ParseError::InvalidValue(0, _))
@@ -1313,10 +1313,10 @@ sched_max = 12\n";
             parse_with("log_sink = yes\nstop_authority = yes\n"),
             Err(ParseError::InvalidValue(0, _))
         ));
-        // A one-shot recipe may hold it.
+        // A never-restarted recipe may hold it.
         assert!(
             parse_with("stop_authority = yes\n")
-                .expect("one-shot holder")
+                .expect("never-restarted holder")
                 .stop_authority
         );
     }

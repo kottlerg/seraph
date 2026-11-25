@@ -211,7 +211,8 @@ init-logd. After the handover reply (svcmgr replies immediately, then reads the 
 launches every defined-but-unparked service — `logd`, the `timed` and
 `pwrmgr` providers, `entropyd`, and `terminal` on a normal boot, plus any staged test
 recipes such as `svctest.svc` / `usertest.svc` and the co-staged
-`crasher.svc`, `crasher-worker.svc` and `crasher-boot.svc` restart fixtures), init streams
+`crasher.svc`, `crasher-worker.svc`, `crasher-boot.svc` and `crasher-once.svc` restart fixtures),
+init streams
 every reclaimable Memory cap it solely owns (ELF segments, user stack pages, `InitInfo` pages, the
 bootloader/bundle reclaim ranges, the AP-trampoline frame, and the
 boot-module ELF sources) in further `REGISTER_INIT_TEARDOWN` rounds, sends

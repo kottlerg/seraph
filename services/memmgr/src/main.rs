@@ -20,12 +20,12 @@
 
 use free_pool::{
     ArenaLayout, Attachment, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Evict,
-    Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node,
-    NodeError, NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureBits, PressureLevel,
-    PressureSignal, RecheckBudget, RegionError, ResidentPath, ResizeError, SealError, SelectError,
-    Share, SlotStore, WordStore, ZERO_FRAME_SPAN, arena::Slot, chunk::table_height, chunk_count,
-    chunk_for, commit::grow_need, commit::regrow_need, fault_window, pending_from, region_grants,
-    reserve_pages,
+    Fit, FrameDesc, FreeRun, Grant, LEAF_TABLE_PAGES, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID,
+    NODE_NULL, Node, NodeError, NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureBits,
+    PressureLevel, PressureSignal, RecheckBudget, RegionError, ResidentPath, ResizeError,
+    SealError, SelectError, Share, SlotStore, WordStore, ZERO_FRAME_SPAN, arena::Slot,
+    chunk::table_height, chunk_count, chunk_for, commit::grow_need, commit::regrow_need,
+    fault_window, leaf_windows, pending_from, region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -175,7 +175,7 @@ const SCRUB_VA: u64 = 0x0000_0001_0000_0000;
 /// table, which the kernel funds once and keeps, since a plain `mem_unmap`
 /// leaves page tables in place. A run larger than the window is cleared one
 /// window at a time.
-const SCRUB_WINDOW_PAGES: u64 = 512;
+const SCRUB_WINDOW_PAGES: u64 = LEAF_TABLE_PAGES;
 
 /// Degraded-fallback scratch VA in memmgr's address space for mapping the
 /// bootstrap phys-table memory cap, and the base of its per-boot draw
@@ -760,9 +760,20 @@ const ASPACE_TOPUP_PAGES: u32 = 4;
 const CLIENT_TOPUP_MIN_PAGES: u32 = 2;
 const _: () = assert!(CLIENT_TOPUP_MIN_PAGES as u64 == PT_DONATION_PAGES);
 
-/// Page-table top-ups one map attempts before giving up: a self-map
-/// ([`map_self`]) or a demand chunk's map into a client
-/// ([`map_client_chunk`]).
+/// Page-table top-ups one leaf-table window of a map attempts before giving
+/// up. memmgr makes its own maps ([`map_self`]) and a demand chunk's map into
+/// a client ([`map_client_chunk`]) one leaf-table window at a time
+/// (`free_pool::leaf_windows`), so the bound holds per window, whatever the
+/// map's length. A window needs at most one new page table for each level
+/// below the root, four under 5-level paging and Sv57, and a top-up adds at
+/// least one, so the rounds fund a window while the pool can spare the pages.
+/// The bound stays for the map they do not cure: the kernel also refuses a map
+/// with `OutOfMemory` for a frame already named by `u32::MAX` mappings, and a
+/// thread of a client can take the pages a top-up gave its address space
+/// before the next round maps. Unbounded, memmgr would turn its free pool into
+/// page tables no map uses; the window that fails ends its map, so a failed
+/// map costs at most this many top-ups (services/memmgr/docs/memory-pool.md
+/// § Metadata Arena).
 const PT_FUND_ROUNDS: u32 = 4;
 
 /// Fund memmgr's own page-table growth pool from its free pool: donate a
@@ -790,9 +801,12 @@ fn fund_self_page_tables(l: &mut MemLedger) -> bool
 }
 
 /// Map `pages` pages of the Memory cap `cap`, from its page `offset`,
-/// read-write at `va` in memmgr's own address space, funding its page tables
-/// from the pool when the kernel reports the page-table pool exhausted, at
-/// most [`PT_FUND_ROUNDS`] times. Returns the last map error otherwise.
+/// read-write at `va` in memmgr's own address space, one leaf-table window at
+/// a time (`free_pool::leaf_windows`), funding each window's page tables from
+/// the pool when the kernel reports the page-table pool exhausted, at most
+/// [`PT_FUND_ROUNDS`] times a window, so a span of any length maps while the
+/// pool can spare its page tables. Returns the error of the window's last map
+/// otherwise; a map that fails leaves none of the span mapped.
 ///
 /// # Safety
 /// `[va, va + pages * PAGE_SIZE)` MUST be unmapped VA of memmgr's private
@@ -818,23 +832,68 @@ unsafe fn map_self_with(
     flags: u64,
 ) -> Result<(), i64>
 {
-    let mut last = SyscallError::OutOfMemory as i64;
-    for _ in 0..=PT_FUND_ROUNDS
+    for (first, count) in leaf_windows(va, pages)
     {
-        // SAFETY: the caller's contract makes the span unmapped VA of
-        // memmgr's private zones, so the map changes nothing memmgr runs on.
-        match unsafe { syscall::mem_map(cap, self_aspace(), va, offset, pages, flags) }
+        let at = va.saturating_add(first.saturating_mul(PAGE_SIZE));
+        // SAFETY: the window lies in the caller's span, which the caller's
+        // contract makes unmapped VA of memmgr's private zones.
+        let mapped =
+            unsafe { map_self_window(l, cap, at, offset.saturating_add(first), count, flags) };
+        if let Err(e) = mapped
         {
-            Ok(()) => return Ok(()),
-            Err(e) if e == SyscallError::OutOfMemory as i64 => last = e,
-            Err(e) => return Err(e),
-        }
-        if !fund_self_page_tables(l)
-        {
-            return Err(last);
+            // The windows before this one are mapped, and so are this one's
+            // pages before the one whose page table the kernel could not
+            // allocate: unmap them all, so a failed map leaves the span
+            // unmapped. The unmap checks only what the map checked of the
+            // same VA and address space, so it holds wherever a page mapped.
+            // SAFETY: the span is the caller's, where nothing memmgr runs on
+            // lies.
+            let _ = unsafe { syscall::mem_unmap(self_aspace(), va, first.saturating_add(count)) };
+            return Err(e);
         }
     }
-    Err(last)
+    Ok(())
+}
+
+/// Map one leaf-table window of [`map_self_with`]'s span: `pages` pages of
+/// `cap` from its page `offset` at `va` with `flags`, funding memmgr's page
+/// tables ([`fund_self_page_tables`]) and mapping again while the kernel
+/// reports the page-table pool exhausted, at most [`PT_FUND_ROUNDS`] times. A
+/// map made again maps the pages an earlier attempt mapped in place: the
+/// kernel replaces a page's leaf with the same one
+/// (`AddressSpace::map_page_pooled`). Returns the last map's error otherwise,
+/// which can leave the window's first pages mapped.
+///
+/// # Safety
+/// As [`map_self`], for the window.
+unsafe fn map_self_window(
+    l: &mut MemLedger,
+    cap: u64,
+    va: u64,
+    offset: u64,
+    pages: u64,
+    flags: u64,
+) -> Result<(), i64>
+{
+    let mut rounds: u32 = 0;
+    loop
+    {
+        // SAFETY: the caller's contract makes the window unmapped VA of
+        // memmgr's private zones, apart from the pages an earlier attempt
+        // mapped to the same frames, so the map changes nothing memmgr runs on.
+        let Err(e) = (unsafe { syscall::mem_map(cap, self_aspace(), va, offset, pages, flags) })
+        else
+        {
+            return Ok(());
+        };
+        if e != SyscallError::OutOfMemory as i64
+            || rounds == PT_FUND_ROUNDS
+            || !fund_self_page_tables(l)
+        {
+            return Err(e);
+        }
+        rounds = rounds.saturating_add(1);
+    }
 }
 
 /// Map the one-page Memory cap `cap` read-write at `va` in memmgr's own
@@ -866,17 +925,9 @@ fn scrub_run(l: &mut MemLedger, cap: u64, pages: u64) -> Result<(), i64>
         // The loop condition keeps `first` below `pages`.
         let window = pages.saturating_sub(first).min(SCRUB_WINDOW_PAGES);
         // SAFETY: the scrub window is memmgr's own zone (the zone map above),
-        // which every pass leaves unmapped, so the map changes nothing memmgr
-        // runs on.
-        if let Err(e) = unsafe { map_self(l, cap, SCRUB_VA, first, window) }
-        {
-            // A map that ran out of page tables part way left the pages before
-            // the failing one mapped: unmap them, so the run memmgr keeps is
-            // mapped nowhere.
-            // SAFETY: as for the unmap below.
-            let _ = unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, window) };
-            return Err(e);
-        }
+        // which every pass leaves unmapped, a failed map included, so the map
+        // changes nothing memmgr runs on.
+        unsafe { map_self(l, cap, SCRUB_VA, first, window) }?;
         // `window` is at most `SCRUB_WINDOW_PAGES`, so the byte count is 2 MiB
         // at most.
         let bytes = window.saturating_mul(PAGE_SIZE) as usize;
@@ -3355,7 +3406,8 @@ enum FundRefusal
 /// reports the client's page-table pool exhausted, memmgr funds the pool from
 /// its own ([`fund_client_page_tables`]), holding the `target.held` arena
 /// slots that recording the chunk takes, and maps again, at most
-/// [`PT_FUND_ROUNDS`] times. Returns the last map error otherwise, [`MapRefusal::Limit`] when
+/// [`PT_FUND_ROUNDS`] times for each leaf-table window of the chunk
+/// (`free_pool::leaf_windows`). Returns the last map error otherwise, [`MapRefusal::Limit`] when
 /// the process's budget refused the funding, or [`MapRefusal::Reserve`] when
 /// the growth floor did.
 ///
@@ -3363,8 +3415,8 @@ enum FundRefusal
 /// directly (the kernel grants read at every map, and W^X is enforced); no
 /// per-fault inner derivation is needed. The kernel holds the mapping
 /// independently of the cap, which stays in memmgr as the reclaim anchor. A
-/// failed map can leave the chunk's first pages mapped; a repeat maps them
-/// again in place.
+/// failed map can leave the chunk's first pages mapped, those of the windows
+/// before the failing one included; a repeat maps them again in place.
 fn map_client_chunk(
     l: &mut MemLedger,
     target: &FaultTarget,
@@ -3397,41 +3449,46 @@ fn map_client(
     {
         u64::from(frame.page_count)
     };
-    let mut rounds: u32 = 0;
-    loop
+    for (first, count) in leaf_windows(frame.va, u64::from(frame.page_count))
     {
-        // SAFETY: `aspace_cap` is a client address space procmgr delegated
-        // (`DELEGATE_ASPACE`), never memmgr's own, so the map changes nothing
-        // memmgr runs on.
-        let mapped = unsafe {
-            syscall::mem_map(
-                frame.cap_slot,
-                aspace_cap,
-                frame.va,
-                offset,
-                u64::from(frame.page_count),
-                prot,
-            )
-        };
-        let Err(e) = mapped
-        else
+        let va = frame.va.saturating_add(first.saturating_mul(PAGE_SIZE));
+        let mut rounds: u32 = 0;
+        loop
         {
-            return Ok(());
-        };
-        if e != SyscallError::OutOfMemory as i64 || rounds == PT_FUND_ROUNDS
-        {
-            return Err(MapRefusal::Map(e));
+            // SAFETY: `aspace_cap` is a client address space procmgr delegated
+            // (`DELEGATE_ASPACE`), never memmgr's own, so the map changes
+            // nothing memmgr runs on.
+            let mapped = unsafe {
+                syscall::mem_map(
+                    frame.cap_slot,
+                    aspace_cap,
+                    va,
+                    offset.saturating_add(first),
+                    count,
+                    prot,
+                )
+            };
+            let Err(e) = mapped
+            else
+            {
+                break;
+            };
+            if e != SyscallError::OutOfMemory as i64 || rounds == PT_FUND_ROUNDS
+            {
+                return Err(MapRefusal::Map(e));
+            }
+            match fund_client_page_tables(l, target, pending)
+            {
+                Ok(()) =>
+                {}
+                Err(FundRefusal::Limit) => return Err(MapRefusal::Limit),
+                Err(FundRefusal::Reserve) => return Err(MapRefusal::Reserve(e)),
+                Err(FundRefusal::Failed) => return Err(MapRefusal::Map(e)),
+            }
+            rounds = rounds.saturating_add(1);
         }
-        match fund_client_page_tables(l, target, pending)
-        {
-            Ok(()) =>
-            {}
-            Err(FundRefusal::Limit) => return Err(MapRefusal::Limit),
-            Err(FundRefusal::Reserve) => return Err(MapRefusal::Reserve(e)),
-            Err(FundRefusal::Failed) => return Err(MapRefusal::Map(e)),
-        }
-        rounds = rounds.saturating_add(1);
     }
+    Ok(())
 }
 
 /// Fund the page-table growth pool of the client address space of `target`
@@ -4566,8 +4623,8 @@ fn map_object_view(
         // yet, so the map changes nothing memmgr runs on.
         if let Err(e) = unsafe { map_self_with(l, f.cap_slot, at, 0, frame_pages, MAP_READ) }
         {
-            // The whole span: a map that ran out of page tables part way left
-            // the pages before the failing one mapped, and the unmap passes
+            // The whole span: the grants before this one are mapped (a failed
+            // map leaves none of its own pages mapped), and the unmap passes
             // over the pages no map reached.
             drop_object_view(l, own_va, pages);
             return Err(e);

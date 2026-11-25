@@ -68,6 +68,10 @@
 //!     fills memory until memmgr declines a fault crashd holds, so oomd stops
 //!     the `memhog` fixture, whose restart while the level reads `CRITICAL`
 //!     fails, as in item 12.
+//! 17. [`memory_objects::early`] right after [`memmgr`]'s phases: it seals
+//!     one contiguous grant of 32,768 pages, a run the pool holds at the
+//!     default memory size only before the later phases leave its free
+//!     memory in shorter runs.
 //!
 //! ### Selection
 //!
@@ -189,6 +193,7 @@ fn ordered() -> Vec<Phase>
 {
     let mut out: Vec<Phase> = Vec::new();
     out.extend_from_slice(memmgr::phases());
+    out.extend_from_slice(memory_objects::early());
     out.extend_from_slice(layout::phases());
     out.extend_from_slice(threading::phases());
     out.extend_from_slice(procmgr::spawn_only());

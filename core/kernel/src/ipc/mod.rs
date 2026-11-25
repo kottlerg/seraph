@@ -15,15 +15,17 @@
 //! - [`message`]: the `Message` struct carried by endpoint call/reply and
 //!   fault delivery.
 //!
-//! This module also defines [`WaitQueue`], the FIFO of threads parked on a
-//! notification, event queue, or wait set, and the claims every such source's
-//! waiters share: [`claim_waiter`], [`arm_timed_park`], and
-//! [`interrupt_all_waiters`].
+//! This module also defines [`WaitQueue`], the FIFO of threads parked on an
+//! endpoint, a notification, an event queue, or a wait set, the claims every
+//! such source's waiters share ([`claim_waiter`], [`arm_timed_park`], and
+//! [`interrupt_all_waiters`]), and the batching of the drains that release
+//! every waiter of a source ([`drain_in_batches`]).
 
 use crate::sched::thread::ThreadControlBlock;
 
-/// FIFO of the threads parked on a notification, event queue, or wait set: a
-/// circular doubly linked list through each TCB's `ipc_wait_next` and
+/// FIFO of the threads parked on an endpoint (its send queue and its receive
+/// queue), a notification, an event queue, or a wait set: a circular doubly
+/// linked list through each TCB's `ipc_wait_next` and
 /// `ipc_wait_prev` (a parked thread waits on one object, so the links are
 /// free), storing only its tail, so the queue is pointer-sized and the source
 /// states keep their retype sizes. Each queued TCB's `ipc_wait_queue` tag
@@ -56,6 +58,20 @@ impl WaitQueue
     pub fn is_empty(&self) -> bool
     {
         self.tail.is_null()
+    }
+
+    /// The head (the longest-waiting thread), or null when empty.
+    ///
+    /// # Safety
+    /// The source lock is held.
+    pub unsafe fn head(&self) -> *mut ThreadControlBlock
+    {
+        if self.tail.is_null()
+        {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: tail is a live queued TCB under the held lock.
+        unsafe { (*self.tail).ipc_wait_next.unwrap_or_default() }
     }
 
     /// Append `tcb` at the tail.
@@ -291,25 +307,102 @@ pub(crate) unsafe fn arm_timed_park(tcb: *mut ThreadControlBlock, deadline: u64,
     );
 }
 
-/// Empty `queue` for the destruction of its source: pop every waiter, claim it
-/// ([`claim_waiter`], value 0), stamp its park `INTERRUPTED`, and wake it, all
-/// under the source lock (core/kernel/docs/scheduling-internals.md § Lock
-/// Hierarchy rule 5, the multi-waiter drain).
+/// Waiters a multi-waiter drain ([`drain_in_batches`]) releases per hold of
+/// the source lock. A release costs a claim, a timed park's sleep-list removal,
+/// and a wake (the waiter's `sched_lock`, a run-queue lock, and an IPI), and a
+/// source holds as many waiters as threads parked on it, so the drain takes
+/// this CPU's pending interrupts between batches of this many waiters.
+pub(crate) const DRAIN_BATCH_WAITERS: u32 = 16;
+
+/// Run a multi-waiter drain of a source whose lock the caller holds: call
+/// `release_next` while `has_waiter` holds, each call releasing one waiter
+/// (popped from a queue of the source, claimed, stamped, and woken under the
+/// lock), and between batches of [`DRAIN_BATCH_WAITERS`] release the lock,
+/// open an [`interrupt_window`](crate::cap::object::interrupt_window), and take
+/// the lock again (core/kernel/docs/scheduling-internals.md § Lock Hierarchy
+/// rule 5, the multi-waiter drain). No window opens before the first release
+/// or after the last.
+///
+/// The waiters not yet released stay queued and unclaimed while the lock is
+/// dropped, so a canceller, a timed park's expiry, or the waiter's own dealloc
+/// claims one by its usual removal under the lock, and the drain never meets
+/// it again; each released waiter is pinned (`wake_in_flight`) and woken in
+/// the hold that popped it. With no waiter joining (the caller's guarantee)
+/// every queue only shrinks, so the drain ends.
 ///
 /// # Safety
-/// The caller holds the source lock that owns `queue`, and no scheduler or
-/// sleep-list lock.
+/// The caller holds `lock`, the source's lock, with the flags `*saved` its
+/// `lock_raw` returned, holds no other lock, and runs where interrupts may be
+/// taken; on return the lock is held, with its flags in `*saved`. The source
+/// stays live, and no thread joins its queues, until the drain returns.
+/// `has_waiter` and `release_next` run under the lock, and `release_next`
+/// runs only after `has_waiter` held in the same hold.
 #[cfg(not(test))]
-pub(crate) unsafe fn interrupt_all_waiters(queue: &mut WaitQueue)
+pub(crate) unsafe fn drain_in_batches(
+    lock: &crate::sync::Spinlock,
+    saved: &mut u64,
+    has_waiter: impl FnMut() -> bool,
+    release_next: impl FnMut(),
+)
 {
-    loop
+    let between = || {
+        // SAFETY: the lock is held with flags `*saved` (contract).
+        unsafe { lock.unlock_raw(*saved) };
+        crate::cap::object::interrupt_window();
+        // SAFETY: the source is live (contract); paired with the caller's
+        // unlock_raw of the flags returned in `*saved`.
+        *saved = unsafe { lock.lock_raw() };
+    };
+    run_batches(has_waiter, release_next, between);
+}
+
+/// The batching of [`drain_in_batches`]: call `release_next` while
+/// `has_waiter` holds, and `between` (the drain's lock release, window, and
+/// retake) before each release that follows a full batch of
+/// [`DRAIN_BATCH_WAITERS`], asking `has_waiter` again after it.
+fn run_batches(
+    mut has_waiter: impl FnMut() -> bool,
+    mut release_next: impl FnMut(),
+    mut between: impl FnMut(),
+)
+{
+    let mut in_batch = 0u32;
+    while has_waiter()
     {
-        // SAFETY: source lock held per the caller contract.
-        let tcb = unsafe { queue.pop() };
-        if tcb.is_null()
+        if in_batch == DRAIN_BATCH_WAITERS
         {
-            return;
+            in_batch = 0;
+            between();
+            continue;
         }
+        release_next();
+        in_batch = in_batch.saturating_add(1);
+    }
+}
+
+/// Empty `queue` for the destruction of its source: pop every waiter, claim it
+/// ([`claim_waiter`], value 0), stamp its park `INTERRUPTED`, and wake it,
+/// under the source lock `lock`, a batch at a time ([`drain_in_batches`]).
+///
+/// # Safety
+/// As for [`drain_in_batches`]: the caller holds `lock`, the source lock that
+/// owns `queue`, with flags `*saved`, and no other lock, where interrupts may
+/// be taken; the source is dying, so no thread parks on it again.
+#[cfg(not(test))]
+pub(crate) unsafe fn interrupt_all_waiters(
+    queue: *mut WaitQueue,
+    lock: &crate::sync::Spinlock,
+    saved: &mut u64,
+)
+{
+    // SAFETY: the queue is live and its lock held while the drain calls this.
+    let has_waiter = || !unsafe { (*queue).is_empty() };
+    let release_next = || {
+        // SAFETY: source lock held, and the queue not empty, while the drain
+        // calls this.
+        let waiters = unsafe { &mut *queue };
+        // SAFETY: as above.
+        let tcb = unsafe { waiters.pop() };
         // SAFETY: tcb was just popped under the held source lock, which is its
         // episode claim.
         unsafe { claim_waiter(tcb, 0) };
@@ -327,7 +420,9 @@ pub(crate) unsafe fn interrupt_all_waiters(queue: &mut WaitQueue)
         // and the lock order source → sched_lock → run-queue lock allows the
         // wake here.
         unsafe { crate::sched::enqueue_and_wake(tcb, cpu) };
-    }
+    };
+    // SAFETY: forwarded caller contract.
+    unsafe { drain_in_batches(lock, saved, has_waiter, release_next) };
 }
 
 /// A parked thread's source lock held together with that thread's
@@ -785,5 +880,107 @@ mod tests
             assert_eq!(f.pop(0), Some(t));
         }
         assert!(f.is_empty(0));
+    }
+
+    #[test]
+    fn head_is_the_longest_waiting()
+    {
+        let mut f = Fixture::new(2, 1);
+        // SAFETY: the fixture's queue, under no other thread.
+        assert!(unsafe { f.queues[0].head() }.is_null());
+        f.push(0, 1);
+        f.push(0, 0);
+        // SAFETY: as above.
+        assert_eq!(f.index_of(unsafe { f.queues[0].head() }), Some(1));
+        assert_eq!(f.pop(0), Some(1));
+        // SAFETY: as above.
+        assert_eq!(f.index_of(unsafe { f.queues[0].head() }), Some(0));
+    }
+
+    // Defect guarded: a drain that drops its source lock between batches
+    // must release each waiter still queued exactly once, in queue order,
+    // never one a canceller removed while the lock was dropped, and must
+    // open its windows only between full batches, none after the last.
+    #[test]
+    fn batched_drain_skips_waiters_removed_between_batches()
+    {
+        use core::cell::RefCell;
+        const WAITERS: usize = 70;
+        let batch = usize::try_from(super::DRAIN_BATCH_WAITERS).unwrap();
+        let f = RefCell::new(Fixture::new(WAITERS, 1));
+        for t in 0..WAITERS
+        {
+            f.borrow_mut().push(0, t);
+        }
+        let released = RefCell::new(Vec::new());
+        let mut cancelled = Vec::new();
+        let mut windows = 0;
+        super::run_batches(
+            || !f.borrow().is_empty(0),
+            || {
+                let t = f.borrow_mut().pop(0).expect("released from an empty queue");
+                released.borrow_mut().push(t);
+            },
+            || {
+                windows += 1;
+                assert_eq!(
+                    released.borrow().len(),
+                    windows * batch,
+                    "a window opened inside a batch"
+                );
+                // A canceller removes the next waiter and one further back
+                // while the lock is dropped.
+                let mut fx = f.borrow_mut();
+                let next = fx.pop(0).expect("a window with no waiter left");
+                assert!(fx.unlinked(next));
+                cancelled.push(next);
+                let back = next + 5;
+                if back < WAITERS && fx.remove(0, back)
+                {
+                    cancelled.push(back);
+                }
+            },
+        );
+        let released = released.into_inner();
+        let mut seen = [false; WAITERS];
+        for &t in &released
+        {
+            assert!(!seen[t], "waiter {t} released twice");
+            seen[t] = true;
+            assert!(
+                !cancelled.contains(&t),
+                "a cancelled waiter {t} was released"
+            );
+        }
+        assert!(
+            released.windows(2).all(|w| w[0] < w[1]),
+            "release out of queue order"
+        );
+        assert_eq!(released.len() + cancelled.len(), WAITERS);
+        assert!(f.borrow().is_empty(0));
+        assert!(windows > 0);
+    }
+
+    // Defect guarded: a drain of exactly one batch must open no window.
+    #[test]
+    fn one_full_batch_opens_no_window()
+    {
+        use core::cell::Cell;
+        let batch = usize::try_from(super::DRAIN_BATCH_WAITERS).unwrap();
+        let left = Cell::new(batch);
+        let mut windows = 0;
+        super::run_batches(
+            || left.get() > 0,
+            || left.set(left.get() - 1),
+            || windows += 1,
+        );
+        assert_eq!(windows, 0);
+        left.set(batch + 1);
+        super::run_batches(
+            || left.get() > 0,
+            || left.set(left.get() - 1),
+            || windows += 1,
+        );
+        assert_eq!(windows, 1);
     }
 }

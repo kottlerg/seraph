@@ -121,7 +121,8 @@ services/svctest/
         ├── memory_objects.rs  # memmgr memory objects: seal refusal and charge, attach refusals,
         │                      #   shared and private attachments in svctest and a child, a
         │                      #   private write seen by no other attacher, a shared write kills
-        │                      #   its writer, release, the zero object
+        │                      #   its writer, release, the zero object; early in the run, a
+        │                      #   32,768-page object sealed, read back and released
         ├── object_io.rs       # OBJECT_READ, FILL_REGION and MARK_CHECKPOINT: an object's pages
         │                      #   read into a grant and filled into a demand region, the
         │                      #   refusals, no mark from svctest
@@ -239,8 +240,11 @@ bootstrap rounds (a refused `DECLARE_NO_DEBUG` among them) logs `SOME TESTS FAIL
 `SHUTDOWN`, because the hooks get the pwrmgr cap only after the rounds return. A `SHUTDOWN` that
 pwrmgr answers, or whose call fails, is logged and leaves the system idle, as on the pass path. A
 fault in svctest's own process (a stray access, a stack overflow) kills it without running either
-hook, so it logs neither marker. The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the
-queried `pwrmgr.deny` cap) log the skip and return when their cap is zero; the devmgr class-deny
+hook, so it logs neither marker; svcmgr then logs `service died: svctest`, which `cargo xtask run`
+reads, before the pass marker, as a FAIL, and ends the boot at its fail grace window
+([xtask/README.md § `cargo xtask run`](../../xtask/README.md#cargo-xtask-run)). The `ns` phase
+(`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the skip and return
+when their cap is zero; the devmgr class-deny
 phase (`caps[2]` and `caps[3]`), the bind-deny phase (`caps[2]`), the input-ordinal phase
 (`caps[8]`), the device-location phase (`caps[7]` and `caps[8]`), the on-demand-bind phase
 (`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement
@@ -498,6 +502,13 @@ svcmgr started after routing that death answers, and the token gone. It then wri
 `PROBE_FAULT_WORKER`, and requires a different nonce and the token gone: the restart after the
 worker's fault took the token and died before its request, and a later restart answered. It writes
 the token again at its end, so a later boot of the same image repeats the first-launch case.
+
+The `svcmgr_one_shot_death` phase, which runs right after it, skips when the staged fixture set does
+not declare `crasher-once`; declared, it fails if `crasher.once` is not published within 10 s. It
+reads the instance's nonce with `PROBE_INSTANCE`, sends `PROBE_FAULT_WORKER` so a worker thread of
+the fixture faults, and requires svcmgr's `service died: crasher-once` line and then its `restart
+policy says no restart` line in logd's history ([restart
+protocol](../svcmgr/docs/restart-protocol.md)).
 
 The `svcmgr_stop_service` phase checks the stop authority ([svcmgr IPC
 Interface](../svcmgr/docs/ipc-interface.md) § Stop authority). Through the per-process

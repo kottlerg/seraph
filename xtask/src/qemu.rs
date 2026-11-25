@@ -615,13 +615,27 @@ pub enum Execution
     /// under TCG.
     Standard,
     /// Deterministic instruction counting: single-threaded TCG with
-    /// `-icount shift=0,sleep=off,align=off`, so the guest's clock, and the
-    /// cycle counters read from it, advance one tick per retired instruction
-    /// and never with the host's time. On `x86_64` the CPU model drops x2APIC,
-    /// since QEMU aborts with `Bad icount read` once the kernel arms its
-    /// x2APIC timer; the kernel then runs its xAPIC paths.
+    /// `-icount shift=0,sleep=on,align=off`. While a vCPU runs, the guest's
+    /// clock, and the cycle counters read from it, advance one tick per
+    /// retired instruction, so a window that does not idle counts the same
+    /// from run to run. While every vCPU idles, the clock follows the host's
+    /// time up to the next timer deadline (`sleep=on`), and a device
+    /// completion, which lands on the host's clock, ends the idle as it would
+    /// on hardware. Under `sleep=off` the clock would jump to the next
+    /// deadline at once, ahead of any host I/O in flight, so a guest waiting on
+    /// a device with a timeout would see the timeout expire first. A window
+    /// that idles, one waiting on a device for instance, counts host time and
+    /// so can only be reported, never gated. On `x86_64` the CPU model drops
+    /// x2APIC, since QEMU aborts with `Bad icount read` once the kernel arms
+    /// its x2APIC timer; the kernel then runs its xAPIC paths.
     Icount,
 }
+
+/// The `-icount` options of [`Execution::Icount`]: one tick of the guest's
+/// clock per retired instruction (`shift=0`), the clock following the host's
+/// time while every vCPU idles (`sleep=on`), and no pacing of a running vCPU
+/// to the host's time (`align=off`).
+const ICOUNT_OPTIONS: &str = "shift=0,sleep=on,align=off";
 
 impl Execution
 {
@@ -646,7 +660,7 @@ impl Execution
                 "-accel".into(),
                 "tcg,thread=single".into(),
                 "-icount".into(),
-                "shift=0,sleep=off,align=off".into(),
+                ICOUNT_OPTIONS.into(),
             ],
         }
     }
@@ -2830,7 +2844,7 @@ mod tests
             let argv = build_qemu_argv_for(&spec, Execution::Icount).unwrap();
             assert!(has_pair(&argv, "-accel", "tcg,thread=single"), "{argv:?}");
             assert!(
-                has_pair(&argv, "-icount", "shift=0,sleep=off,align=off"),
+                has_pair(&argv, "-icount", "shift=0,sleep=on,align=off"),
                 "{argv:?}"
             );
             assert!(
@@ -2845,6 +2859,26 @@ mod tests
                     .iter()
                     .any(|a| a == "-icount" || a == "tcg,thread=single")
             );
+        }
+    }
+
+    // Under `sleep=off` an idle guest's clock jumps to its next timer
+    // deadline ahead of the host I/O in flight, so a virtio-blk request's
+    // timeout expires before the write it bounds can complete, and the driver
+    // resets the device. The idle clock must follow the host's.
+    #[test]
+    fn an_icount_launch_lets_an_idle_guest_clock_follow_the_host()
+    {
+        for spec in [riscv_spec(1, 512), x86_spec(X86Paging::Four)]
+        {
+            let argv = build_qemu_argv_for(&spec, Execution::Icount).unwrap();
+            let options = argv
+                .iter()
+                .position(|a| a == "-icount")
+                .and_then(|i| argv.get(i + 1))
+                .expect("an icount launch passes -icount");
+            assert!(options.split(',').any(|o| o == "sleep=on"), "{options}");
+            assert!(!options.split(',').any(|o| o == "sleep=off"), "{options}");
         }
     }
 

@@ -9,7 +9,9 @@
 //! The sysroot is built for one architecture at a time. The active arch is
 //! recorded in `sysroot/.arch`. Switching architectures requires `cargo xtask
 //! clean` first to avoid mixing binaries. The harness whose bundle every pack
-//! composes is recorded in `sysroot/.harness` ([`record_harness`]).
+//! composes is recorded in `sysroot/.harness` ([`record_harness`]), and the
+//! harnesses the image of the last complete pack boots in
+//! `sysroot/.image-harness` ([`record_image_harnesses`]).
 
 use std::collections::HashSet;
 use std::fs;
@@ -64,6 +66,137 @@ pub fn recorded_harness(ctx: &BuildContext) -> Result<Harness>
             path.display()
         )
     })
+}
+
+/// The sysroot file that records the harnesses the image of the last complete
+/// pack boots ([`record_image_harnesses`]).
+const IMAGE_HARNESS_FILE: &str = ".image-harness";
+
+/// A harness an image boots: a test or benchmark program whose boot ends with
+/// its terminal marker, `[<name>] ALL TESTS PASSED` or
+/// `[<name>] SOME TESTS FAILED` (docs/testing.md § Reporting marker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageHarness
+{
+    /// The kernel-test harness, the ktest bundle's `init`.
+    Ktest,
+    /// The services harness, which svcmgr launches from its recipe.
+    Svctest,
+    /// The programs harness, which svcmgr launches from its recipe.
+    Usertest,
+    /// The userspace benchmark suite, which svcmgr launches from its recipe.
+    Ubench,
+}
+
+impl ImageHarness
+{
+    /// The harnesses svcmgr launches, each from the recipe of its name
+    /// ([`Self::recipe`]) staged in `config/svcmgr/services/`.
+    pub const SUPERVISED: [Self; 3] = [Self::Svctest, Self::Usertest, Self::Ubench];
+
+    /// The harness's name: the `<name>` of its terminal marker, and, for a
+    /// harness svcmgr launches, the service name svcmgr gives it, its
+    /// recipe's file stem.
+    #[must_use]
+    pub fn name(self) -> &'static str
+    {
+        match self
+        {
+            Self::Ktest => "ktest",
+            Self::Svctest => "svctest",
+            Self::Usertest => "usertest",
+            Self::Ubench => "ubench",
+        }
+    }
+
+    /// The file name of the recipe svcmgr launches the harness from, `None`
+    /// for ktest, which no supervisor launches.
+    #[must_use]
+    pub fn recipe(self) -> Option<String>
+    {
+        match self
+        {
+            Self::Ktest => None,
+            Self::Svctest | Self::Usertest | Self::Ubench => Some(format!("{}.svc", self.name())),
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self>
+    {
+        [Self::Ktest, Self::Svctest, Self::Usertest, Self::Ubench]
+            .into_iter()
+            .find(|harness| harness.name() == name)
+    }
+}
+
+/// Remove the record of the image's harnesses, so a pack that does not
+/// complete leaves none ([`recorded_image_harnesses`]).
+///
+/// # Errors
+///
+/// On an I/O failure other than the record's absence.
+pub fn forget_image_harnesses(sysroot: &Path) -> Result<()>
+{
+    let path = sysroot.join(IMAGE_HARNESS_FILE);
+    match fs::remove_file(&path)
+    {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound =>
+        {
+            Err(e).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Record `harnesses` as those the image a pack has just written boots, one
+/// name a line, none for an image that boots no harness.
+///
+/// # Errors
+///
+/// On an I/O failure.
+pub fn record_image_harnesses(sysroot: &Path, harnesses: &[ImageHarness]) -> Result<()>
+{
+    let path = sysroot.join(IMAGE_HARNESS_FILE);
+    let mut text = String::new();
+    for harness in harnesses
+    {
+        text.push_str(harness.name());
+        text.push('\n');
+    }
+    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The harnesses [`record_image_harnesses`] recorded for the image the last
+/// complete pack wrote.
+///
+/// # Errors
+///
+/// When the sysroot holds no record (no pack completed since the record
+/// was introduced, or the last one failed), the record cannot be read, or a
+/// line names no harness.
+pub fn recorded_image_harnesses(ctx: &BuildContext) -> Result<Vec<ImageHarness>>
+{
+    let path = ctx.sysroot.join(IMAGE_HARNESS_FILE);
+    let text = match fs::read_to_string(&path)
+    {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            bail!(
+                "{} records no harness the image boots: no pack of the image completed since \
+                 the record was introduced; repack it (`cargo xtask mkdisk`, with the staging \
+                 the boot needs)",
+                path.display()
+            )
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    text.lines()
+        .map(|line| {
+            ImageHarness::parse(line.trim())
+                .ok_or_else(|| crate::error::err!("{}: {line:?} names no harness", path.display()))
+        })
+        .collect()
 }
 
 /// A file of the repository that the sysroot installs at `install`, outside
@@ -154,7 +287,7 @@ pub fn record_arch(ctx: &BuildContext, arch: Arch) -> Result<()>
 /// files, the repository's data files ([`install_data_files`]) and the
 /// synthesised `data/svctest/` fixtures. The prune pass is
 /// authoritative over these and only these. Build-owned trees (`boot/`, `esp/`,
-/// `services/`, `programs/`, `tests/`) and metadata (`.arch`, `.harness`, `NvVars`) are
+/// `services/`, `programs/`, `tests/`) and metadata (`.arch`, `.harness`, `.image-harness`, `NvVars`) are
 /// deliberately absent, so a scoping mistake cannot delete a binary.
 const ROOTFS_MANAGED_ROOTS: &[&str] = &["config", "data"];
 
@@ -666,6 +799,41 @@ mod tests
         assert_eq!(recorded_harness(&ctx).unwrap(), Harness::Init);
         fs::write(ctx.sysroot.join(HARNESS_FILE), "svctest\n").unwrap();
         recorded_harness(&ctx).unwrap_err();
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // Defect caught: a record that reads back other harnesses than were
+    // written, an absent record (an image packed before it, or a pack that
+    // failed after forgetting it) read as an image with no harness, or a
+    // line naming no harness skipped.
+    #[test]
+    fn the_image_harness_record_reads_back_and_an_absent_one_is_refused()
+    {
+        let base = scratch("image-harness");
+        let ctx = BuildContext {
+            root: base.clone(),
+            sysroot: base.join("sysroot"),
+            target_dir: base.join("target"),
+        };
+        fs::create_dir_all(&ctx.sysroot).unwrap();
+        let absent = recorded_image_harnesses(&ctx).unwrap_err().to_string();
+        assert!(absent.contains("repack"), "{absent}");
+        for harnesses in [
+            vec![],
+            vec![ImageHarness::Ktest],
+            vec![ImageHarness::Svctest, ImageHarness::Ubench],
+            vec![ImageHarness::Usertest],
+        ]
+        {
+            record_image_harnesses(&ctx.sysroot, &harnesses).unwrap();
+            assert_eq!(recorded_image_harnesses(&ctx).unwrap(), harnesses);
+        }
+        forget_image_harnesses(&ctx.sysroot).unwrap();
+        recorded_image_harnesses(&ctx).unwrap_err();
+        // Forgetting an absent record is no error.
+        forget_image_harnesses(&ctx.sysroot).unwrap();
+        fs::write(ctx.sysroot.join(IMAGE_HARNESS_FILE), "init\n").unwrap();
+        recorded_image_harnesses(&ctx).unwrap_err();
         fs::remove_dir_all(&base).unwrap();
     }
 }

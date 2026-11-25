@@ -182,9 +182,10 @@ impl<'a> Iterator for Records<'a>
     fn next(&mut self) -> Option<Record<'a>>
     {
         self.remaining = self.remaining.checked_sub(1)?;
-        // split has parsed every record, so this parse cannot fail; a
+        // split has parsed every record, so these parses cannot fail; a
         // failure would end the iteration, never yield a record.
-        let (record, rest) = parse_record(self.rest).ok()?;
+        let (parts, rest) = record_parts(self.rest).ok()?;
+        let record = record_of(parts).ok()?;
         self.rest = rest;
         Some(record)
     }
@@ -201,6 +202,27 @@ impl<'a> Iterator for Records<'a>
 /// [`Attributes::parse`] and [`Certificate::parse`]), `RecordBlock` for
 /// bytes of the block no record uses, then `NestedTrailer`.
 pub fn split(object: &[u8]) -> Result<Signed<'_>, ParseError>
+{
+    let (body, block, count) = parse_footer(object)?;
+    let mut cursor = block;
+    for _ in 0..count
+    {
+        let (parts, tail) = record_parts(cursor)?;
+        record_of(parts)?;
+        cursor = tail;
+    }
+    close(body, cursor)?;
+    Ok(Signed { body, block, count })
+}
+
+/// Read the footer of `object`: returns the body, the record block and the
+/// number of records the footer gives.
+///
+/// # Errors
+///
+/// `TooShort`, `Magic`, `Version`, `RecordCount` or `RecordsLength`, as
+/// [`split`] orders them.
+pub(crate) fn parse_footer(object: &[u8]) -> Result<(&[u8], &[u8], u16), ParseError>
 {
     let (rest, footer) = object
         .split_last_chunk::<FOOTER_LEN>()
@@ -230,13 +252,19 @@ pub fn split(object: &[u8]) -> Result<Signed<'_>, ParseError>
     let (body, block) = rest
         .split_at_checked(body_len)
         .ok_or(ParseError::RecordsLength)?;
-    let mut cursor = block;
-    for _ in 0..count
-    {
-        let (_, tail) = parse_record(cursor)?;
-        cursor = tail;
-    }
-    if !cursor.is_empty()
+    Ok((body, block, count))
+}
+
+/// The checks after the walk of the records: `rest`, the bytes of the
+/// block after the last record, is empty, and `body` does not end in the
+/// footer magic.
+///
+/// # Errors
+///
+/// `RecordBlock`, then `NestedTrailer`.
+pub(crate) fn close(body: &[u8], rest: &[u8]) -> Result<(), ParseError>
+{
+    if !rest.is_empty()
     {
         return Err(ParseError::RecordBlock);
     }
@@ -244,12 +272,32 @@ pub fn split(object: &[u8]) -> Result<Signed<'_>, ParseError>
     {
         return Err(ParseError::NestedTrailer);
     }
-    Ok(Signed { body, block, count })
+    Ok(())
 }
 
-/// Parse the record at the start of `block`; returns it and the bytes after
-/// it.
-fn parse_record(block: &[u8]) -> Result<(Record<'_>, &[u8]), ParseError>
+/// The fields of a record, each at its place and of its length, not yet
+/// decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecordParts<'a>
+{
+    /// The key id of the key that made the signature.
+    pub(crate) signer_key_id: KeyId,
+    /// The encoded signed attributes.
+    pub(crate) signed: &'a [u8],
+    /// The certificate's bytes: none, or [`cert::LEN`].
+    pub(crate) certificate: &'a [u8],
+    /// The composite signature.
+    pub(crate) signature: &'a Signature,
+}
+
+/// Read the header of the record at the start of `block` and cut the
+/// record into its fields; returns them and the bytes after the record.
+///
+/// # Errors
+///
+/// `RecordBlock`, `Algorithm`, `CertificateCount` or `RecordLength`, as
+/// [`split`] orders them.
+pub(crate) fn record_parts(block: &[u8]) -> Result<(RecordParts<'_>, &[u8]), ParseError>
 {
     let mut reader = Reader::new(block);
     let short = ParseError::RecordBlock;
@@ -276,14 +324,31 @@ fn parse_record(block: &[u8]) -> Result<(Record<'_>, &[u8]), ParseError>
     let signed = reader.take(usize::from(attrs_len)).ok_or(short)?;
     let certificate = reader.take(cert_len).ok_or(short)?;
     let signature = reader.array_ref::<SIGNATURE_LEN>().ok_or(short)?;
-    let record = Record {
+    let parts = RecordParts {
         signer_key_id,
-        attrs: Attributes::parse(signed)?,
         signed,
-        certificate: parse_certificate(certificate)?,
+        certificate,
         signature,
     };
-    Ok((record, reader.rest()))
+    Ok((parts, reader.rest()))
+}
+
+/// Decode the fields of a record.
+///
+/// # Errors
+///
+/// The errors of [`Attributes::parse`], then those of
+/// [`Certificate::parse`], and `RecordBlock` for a certificate of neither
+/// length.
+pub(crate) fn record_of(parts: RecordParts<'_>) -> Result<Record<'_>, ParseError>
+{
+    Ok(Record {
+        signer_key_id: parts.signer_key_id,
+        attrs: Attributes::parse(parts.signed)?,
+        signed: parts.signed,
+        certificate: parse_certificate(parts.certificate)?,
+        signature: parts.signature,
+    })
 }
 
 /// The certificate a record holds in `bytes`: none in 0 bytes, one in
@@ -639,5 +704,125 @@ mod tests
             encode_trailer(BODY, &one, &mut out[..len - 1]),
             Err(EncodeError::BufferTooSmall)
         );
+    }
+}
+
+/// Bounded proofs of the signed object's parse (docs/testing.md § Bounded
+/// verification, Parser proofs), each on every input up to the bounds its
+/// comment states.
+///
+/// How they compose into the property's check of [`split`]
+/// (`property::split_holds`). The walk of the records is a loop whose step
+/// is [`record_parts`] then [`record_of`], its state the rest of the block,
+/// and it is proven by induction: the footer proof shows that the walk
+/// starts on the block the footer gives, the bytes between the body and the
+/// footer; the record-cut proof runs the step's cut on any block, so the rest
+/// it hands the next step is the block after the record, wherever the record
+/// ends; the record-decode proofs run its decode on any fields of each
+/// certificate length; and the close proof checks what the walk leaves. The
+/// attributes and the certificate the decode reads are proven on any input by
+/// the proofs of `attrs.rs` and `cert.rs`. What lies outside the proofs is
+/// the loop that drives the steps, `count` times in [`split`] and one step
+/// a call in [`Records::next`]; the fuzz target `objsig`, the replay of the
+/// checked-in inputs and the unit tests check it.
+#[cfg(kani)]
+mod proofs
+{
+    use super::RecordParts;
+    use crate::{cert, property};
+
+    /// Every object of at most 40 bytes holds the footer's contract: shorter
+    /// than the footer, each refusal of its fields, and a block of up to 24
+    /// bytes after a body of up to 24, a records length past them among them.
+    /// The footer's fields are read at fixed offsets from the end, so 40 bytes
+    /// reach each; the length check is one subtraction from the bytes before
+    /// the footer, of any count.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_footer_reads_as_its_fields()
+    {
+        let bytes: [u8; 40] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let _ = property::footer_holds(&bytes[..len]);
+    }
+
+    /// Every block of at most 8,908 bytes is cut into the fields of the
+    /// record at its start, or refused as the record's header and length
+    /// judge it: 8,908 bytes hold a record with a certificate whose
+    /// attributes are 100 bytes (the fixed part and a one-byte name), and one
+    /// byte after it, so each refusal, a record with and without a
+    /// certificate, a record overrunning the block and one leaving bytes
+    /// after it are reached. No loop: the fields are cut by length.
+    #[kani::proof]
+    fn every_block_cuts_into_its_record_fields()
+    {
+        let bytes: [u8; 8908] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let _ = property::parts_holds(&bytes[..len]);
+    }
+
+    /// A record's fields of any signer, any signature, any `certificate`, and
+    /// attributes of any of at most 103 bytes (the fixed part, a name of up
+    /// to 3 and one more: every refusal of `Attributes::parse` but the one of
+    /// a length past 65,535, a compare the unit tests check at the bound),
+    /// decode into the record of their decodes, or the first refusal.
+    fn record_decodes_its_fields<const N: usize>(certificate: &[u8])
+    {
+        let signed: [u8; N] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= signed.len());
+        let signature: crate::Signature = kani::any();
+        let parts = RecordParts {
+            signer_key_id: kani::any(),
+            signed: &signed[..len],
+            certificate,
+            signature: &signature,
+        };
+        let _ = property::record_of_holds(parts);
+    }
+
+    /// [`record_decodes_its_fields`] for a record without a certificate.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_record_without_a_certificate_decodes_its_fields()
+    {
+        record_decodes_its_fields::<103>(&[]);
+    }
+
+    /// [`record_decodes_its_fields`] for a record with any certificate.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_record_with_a_certificate_decodes_its_fields()
+    {
+        let certificate: [u8; cert::LEN] = kani::any();
+        record_decodes_its_fields::<103>(&certificate);
+    }
+
+    /// [`record_decodes_its_fields`] for a certificate of neither length,
+    /// which [`super::record_parts`] never cuts: one byte stands for any.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_certificate_of_another_length_is_refused()
+    {
+        let certificate: [u8; 1] = kani::any();
+        record_decodes_its_fields::<103>(&certificate);
+    }
+
+    /// Every body of at most 9 bytes and every rest of at most one holds the
+    /// close's contract: the magic is 8 bytes, so 9 hold a body ending in it
+    /// after another byte, and one byte stands for any rest left.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn every_close_holds()
+    {
+        let body: [u8; 9] = kani::any();
+        let body_len: usize = kani::any();
+        kani::assume(body_len <= body.len());
+        let rest: [u8; 1] = kani::any();
+        let rest_len: usize = kani::any();
+        kani::assume(rest_len <= rest.len());
+        let _ = property::close_holds(&body[..body_len], &rest[..rest_len]);
     }
 }

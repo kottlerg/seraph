@@ -238,7 +238,7 @@ The remaining constants are tuning values that bound no capacity:
 | `DEMAND_CHUNK_PAGES` | 16 | Pages one demand fault backs on an unfragmented pool; on a fragmented one, as many as the largest free run holds. Also the unit `SHRINK_REGION` and `DISCARD_RANGE` take, which clients read as `memmgr_labels::DEMAND_CHUNK_BYTES` |
 | `SCRUB_WINDOW_PAGES` | 512 pages | Pages one pass maps to zero a run before hand-out ([`docs/memory-pool.md`](docs/memory-pool.md) § Frame contents) |
 | `CSPACE_LOW_WATER`, `CSPACE_TOPUP_PAGES` | 256 slots, 16 pages | `CSpace` self-funding mark and step |
-| `ASPACE_TOPUP_PAGES`, `PT_FUND_ROUNDS` | 4 pages, 4 rounds | Page-table funding step and retries per map, for memmgr's own maps and a demand fault's map into a process |
+| `ASPACE_TOPUP_PAGES`, `PT_FUND_ROUNDS` | 4 pages, 4 rounds | Page-table funding step, and retries per leaf-table window of a map, for memmgr's own maps and a demand fault's map into a process |
 | `MAX_LOAD` | 2 | Mean index chain length before a bucket split |
 | `ARENA_RETURN_RESERVE` | 1 slot | Arena slot kept for last-resort returns of a run to the pool |
 | `DEFERRED_RECHECK_BATCH` | 64 runs | Deferred runs one recheck checks; a run not pooled goes to the back |

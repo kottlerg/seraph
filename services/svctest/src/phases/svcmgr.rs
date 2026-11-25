@@ -52,6 +52,10 @@ pub fn phases() -> &'static [Phase]
             run: svcmgr_boot_death_phase,
         },
         Phase {
+            name: "svcmgr_one_shot_death",
+            run: svcmgr_one_shot_death_phase,
+        },
+        Phase {
             name: "svcmgr_stop_service",
             run: svcmgr_stop_service_phase,
         },
@@ -192,6 +196,71 @@ fn svcmgr_boot_death_phase(_caps: &Caps)
     std::os::seraph::log!(
         "svcmgr boot-death phase passed (deaths before the bootstrap request routed on the \
          first launch and a restart)"
+    );
+}
+
+/// The name the one-shot fixture provides.
+const ONE_SHOT_NAME: &[u8] = b"crasher.once";
+
+/// svcmgr's lines about the one-shot fixture's death, in the order
+/// `services/svcmgr/src/restart.rs` `handle_death` writes them: the death,
+/// and the restart policy's decision.
+const ONE_SHOT_LINES: [&[u8]; 2] = [
+    b"service died: crasher-once",
+    b"restart policy says no restart",
+];
+
+/// End to end: svcmgr observes and logs the death of a service it launched
+/// under `restart = never`, and does not restart it
+/// (`services/svcmgr/docs/restart-protocol.md` § Supervision hierarchy). The
+/// `crasher` fixture's `worker-fault` role
+/// (`rootfs/config/svcmgr/tests/crasher-once.svc`, `restart = never`) serves
+/// `ipc::restart_probe_labels` on the name it provides: the phase reads the
+/// instance's nonce, has a worker thread fault, and requires, in logd's
+/// history and stamped after the fault, svcmgr's `service died:` line for the
+/// fixture and, stamped no earlier, its no-restart line. Were the death not
+/// observed, neither line would be written and the phase would fail at its
+/// wait bound.
+///
+/// The phase runs when the staged fixture set declares the fixture
+/// ([`super::fixtures`]) and is skipped otherwise.
+fn svcmgr_one_shot_death_phase(caps: &Caps)
+{
+    use ipc::restart_probe_labels as probe;
+
+    let phase = "svcmgr_one_shot_death";
+    if !fixtures::staged(Fixture::CrasherOnce)
+    {
+        fixtures::skip(phase, Fixture::CrasherOnce);
+        return;
+    }
+    assert_ne!(caps.logd_query, 0, "{phase}: no logd.query seed");
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let fixture = provided_endpoint(ONE_SHOT_NAME, phase);
+    let _ = probe_nonce(fixture, phase, "PROBE_INSTANCE before the fault");
+
+    let faulted_us = super::oom::elapsed_us();
+    let msg = ipc::IpcMessage::new(probe::PROBE_FAULT_WORKER);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(fixture, &msg, ipc_buf) }
+        .unwrap_or_else(|e| panic!("{phase}: PROBE_FAULT_WORKER call failed: {e:?}"));
+    assert_eq!(
+        reply.label,
+        probe::SUCCESS,
+        "{phase}: PROBE_FAULT_WORKER reply {:#x}",
+        reply.label
+    );
+    let _ = syscall::cap_delete(fixture);
+    let died_us = super::logd_restart::await_line_after(
+        caps.logd_query,
+        ONE_SHOT_LINES[0],
+        faulted_us,
+        phase,
+    );
+    let _ =
+        super::logd_restart::await_line_after(caps.logd_query, ONE_SHOT_LINES[1], died_us, phase);
+    std::os::seraph::log!(
+        "svcmgr one-shot-death phase passed (death of a restart = never service logged, no restart)"
     );
 }
 

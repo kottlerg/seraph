@@ -516,10 +516,10 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
     };
     let pages = u64::try_from(total).unwrap_or(u64::MAX).div_ceil(PAGE_SIZE);
     // SAFETY: the swap window is memmgr's own zone, which every use leaves
-    // unmapped; `pages` is at most a chunk's, the window's size.
+    // unmapped, a failed map included; `pages` is at most a chunk's, the
+    // window's size.
     if unsafe { map_self(l, cap, SWAP_WINDOW_VA, 0, pages) }.is_err()
     {
-        unmap_window(pages);
         return (memmgr_errors::INVALID_ARGUMENT, [0; 3]);
     }
     let Some(sealed) = buf.get(..total)
@@ -675,10 +675,10 @@ fn restore(l: &mut MemLedger, word: u64, cap: u64) -> (u64, u64)
     }
     let pages = bytes.div_ceil(PAGE_SIZE);
     // SAFETY: the swap window is memmgr's own zone, which every use leaves
-    // unmapped; `pages` is at most a chunk's, the window's size.
+    // unmapped, a failed map included; `pages` is at most a chunk's, the
+    // window's size.
     if unsafe { map_self_with(l, cap, SWAP_WINDOW_VA, 0, pages, MAP_READ) }.is_err()
     {
-        unmap_window(pages);
         return (memmgr_errors::INVALID_ARGUMENT, 0);
     }
     let buf = buf();

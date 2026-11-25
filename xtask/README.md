@@ -282,7 +282,7 @@ The launch options, the same in both modes:
 | `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
 | `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the store file of the process binary's build id (`symbols/<build-id>.elf`) for symbols when a staged recipe names it or it is installed in `programs/`, `services/`, `tests/fixtures/programs/` or `tests/fixtures/`, searched in that order; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
 | `--test-devices` | Attach the test devices (see Attached devices): `edu` and five `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
-| `--icount` | Count instructions: QEMU runs the machine on single-threaded TCG (`-accel tcg,thread=single`) with `-icount shift=0,sleep=off,align=off`, so the guest's clock, and the cycle counters the benchmarks read, advance one tick per retired instruction and never with the host's time, and a benchmark's count repeats from run to run. Always TCG, whatever `SERAPH_ACCEL` says. On x86_64 the `-cpu` model also takes `-x2apic`: QEMU's icount cannot serve the x2APIC timer (`Bad icount read` once the kernel arms it), so the kernel runs its xAPIC paths. The bench cell's boots ([§ `cargo xtask bench-check`](#cargo-xtask-bench-check)); a functional boot does not take it |
+| `--icount` | Count instructions: QEMU runs the machine on single-threaded TCG (`-accel tcg,thread=single`) with `-icount shift=0,sleep=on,align=off`, so while a vCPU runs, the guest's clock, and the cycle counters the benchmarks read, advance one tick per retired instruction, and a window that does not idle counts the same from run to run. While every vCPU idles, the clock follows the host's time up to the next timer deadline (`sleep=on`), so a device completion, which lands on the host's clock, ends the idle as it would on hardware; under `sleep=off` the clock would jump to that deadline ahead of the host's I/O, and a guest's I/O timeout would expire before the device answered. A window that idles therefore counts host time: a gated benchmark's window must not idle, and a benchmark that waits on a device is reported, not gated ([§ `cargo xtask bench-check`](#cargo-xtask-bench-check)). Always TCG, whatever `SERAPH_ACCEL` says. On x86_64 the `-cpu` model also takes `-x2apic`: QEMU's icount cannot serve the x2APIC timer (`Bad icount read` once the kernel arms it), so the kernel runs its xAPIC paths. The bench cell's boots ([§ `cargo xtask bench-check`](#cargo-xtask-bench-check)); a functional boot does not take it |
 | `--display` | What the guest presents for display (see Attached devices): `window`, QEMU std VGA in a display window; `framebuffer`, the adapter with no window (`-display none`), on a host with or without a graphical backend, so the bootloader hands the kernel a GOP framebuffer and devmgr spawns the framebuffer driver: the framebuffer device cell ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers); `headless`, no adapter, so devmgr spawns no framebuffer driver. Default: `window` for the interactive boot, `headless` with `--runs`, which refuses `window` |
 | `--debug-listen` | Expose the guest's gdbstub without pausing it (QEMU `-s`, tcp::1234), so a wedged guest can be attached to post hoc: `gdb -ex 'target remote :1234'`. With `--runs`, requires `--parallel 1` (one gdbstub port). Conflicts with `--gdb` |
 
@@ -428,12 +428,12 @@ before the runs copy them, and removes it after the last run.
 | `--runs` | (interactive boot) | Total runs, dispatched in waves of `--parallel`; selects the classified boot |
 | `--parallel` | `1` | Concurrency: QEMU instances in flight at once |
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
-| `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match, and every `--require` and `--crash-reports` check holding, the log is discarded and the run is classified `PASS` |
+| `--pass` | the marker of the image's harness | Regex marking a successful run. The default is `\[<harness>\] ALL TESTS PASSED`, the terminal marker ([docs/testing.md](../docs/testing.md) § Reporting marker) of the one harness the image boots, which its pack recorded in `sysroot/.image-harness`: `ktest` for the ktest bundle, otherwise each of `svctest`, `usertest` and `ubench` whose recipe was staged on a layer the image holds. An image that boots no harness, or several, has no default, and `--runs` refuses to start without `--pass`; an image with no record is refused until it is packed again (`cargo xtask mkdisk`). On match, and every `--require` and `--crash-reports` check holding, the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
 | `--require` | (none) | A regex a line of the log must match for the run to pass; repeatable, each must match a line. A run whose `--pass` matched but whose log has no line matching one of them is `FAIL`, its reason naming the pattern |
 | `--crash-reports` | (none) | Check the crash service's report blocks in each passing run's log: every block must be complete and hold the fields its kind, thread, and status require, read with `shared/crash-report`, the crate crashd emits them with ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)). `reports` also requires one `vm` and one `exception` block of the `crashme` fixture's main thread and one `exception` block of a `spawned` thread (its `worker` mode), found through the badge logd's `reclaim:` line names it by, each complete, its walk starting at its instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the block read the thread the kernel killed; the `vm` block's `addr` must also be the faulting address that dump prints (`cr2` on x86_64, `stval` on riscv64). `none` requires no block at all. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `reports`, its `crash-endpoint` svctest boot and its usertest boot `none`; the model is in [docs/testing.md](../docs/testing.md) § Crash reports |
-| `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
+| `--fail-grace-secs` | `10` | After the first `--fail` match, or the first death line of rule 2 below, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
 | `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> icount=<on\|off> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing`, `bench-check` and `bench-baseline` read |
 
@@ -446,14 +446,13 @@ failure ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Testin
 classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these.
 Override with a never-matching pattern (for example `'$.^'`) to disable.
 
-**Mode-agnostic**: xtask does not know about ktest, svctest, or any other
-rootfs configuration. Pass/fail markers come from the invoker. The default
-`--pass` works for both modes because they emit the same terminal marker
-([docs/testing.md](../docs/testing.md) § Reporting marker). Override for other
-configurations:
+**Harness-bound defaults**: the default `--pass` and the death line of rule 2 below are bound to
+the harnesses the image's pack recorded, so a line of another process, or of another harness,
+holding `ALL TESTS PASSED` is not a pass. The `--fail` markers are the invoker's. Override
+`--pass` for other configurations:
 
 ```sh
-# Default (works for ktest or svctest)
+# Default (the marker of the harness the image boots)
 cargo xtask run --arch x86_64 --parallel 4 --runs 100
 
 # Custom marker
@@ -475,25 +474,33 @@ an earlier one left under `target/xtask/run/`, so the preserved files are its ow
 **Outcome precedence**:
 1. `--fail` regex matches → `FAIL` (a live match also triggers early abort
    after `--fail-grace-secs`, bounded by `--timeout`; the verdict is unchanged)
-2. `--pass` regex matches → `PASS` (even if QEMU was watchdog-killed,
+2. svcmgr's `[svcmgr] service died: <harness>` line for a recorded harness that svcmgr launches
+   (`svctest`, `usertest`, `ubench`), before the first `--pass` match → `FAIL`, its reason
+   naming the line. A fault in the harness's own process logs no marker and leaves the system
+   idle; a live match arms the `--fail-grace-secs` kill as rule 1's does. A death line after the
+   pass marker, the harness's own exit after a `SHUTDOWN` that pwrmgr answered, changes nothing,
+   and a marker a restarted instance logs after the death does not make the run a `PASS`. ktest
+   has no supervisor to log its death: a fault of its own thread stays a `HANG`
+3. `--pass` regex matches → `PASS` (even if QEMU was watchdog-killed,
    which is the normal case for kernels that idle after success), unless a `--require` pattern
    matches no line of the log or the `--crash-reports` check fails → `FAIL`, its reason naming the
    pattern or the defect
-3. init-logd's last line, `handover complete; init-logd thread exiting`, with no userspace line
+4. init-logd's last line, `handover complete; init-logd thread exiting`, with no userspace line
    (`[<seconds>] [<name>] ...`) after it → `FAIL`, its reason naming the lost console: real-logd,
    which owns the console from the handover on, wrote nothing to it. A run with nothing at all
    after that line, as one the watchdog cut off there, is not judged by it, nor is a run killed by
-   SIGSEGV or SIGABRT (rule 6), nor a boot with no handover (ktest)
-4. Watchdog timeout → `HANG`
-5. Exit code 0 with no marker → `OK`
-6. Killed by SIGSEGV/SIGABRT with no marker → `QEMU-CRASH` — the host emulator
-   crashed, not the guest. Tallied in the summary and preserved as
-   `QEMU-CRASH-<run>.log`, but does **not** fail the run (infrastructure flake,
-   not a regression in the OS under test; the recurring case is the QEMU 8.2.x
+   SIGSEGV or SIGABRT (rule 7), nor a boot with no handover (ktest)
+5. Watchdog timeout → `HANG`
+6. Exit code 0 with no marker → `OK`
+7. Killed by SIGSEGV/SIGABRT with no marker → `QEMU-CRASH` — the host emulator
+   crashed. Tallied in the summary and preserved as `QEMU-CRASH-<run>.log`. Beside a `PASS` it
+   does not fail the set, as an infrastructure flake (the recurring case is the QEMU 8.2.x
    multi-threaded-TCG segfault,
-   [QEMU gitlab #2220](https://gitlab.com/qemu-project/qemu/-/issues/2220)).
+   [QEMU gitlab #2220](https://gitlab.com/qemu-project/qemu/-/issues/2220)); a set with no
+   `PASS` fails whatever its `QEMU-CRASH` count, so a `--runs 1` boot that crashes QEMU exits
+   non-zero, since QEMU also aborts on assertions in its device models that a guest can trigger.
    SIGKILL is excluded (the `--timeout` kill, or an OOM).
-7. Other exit code → `ERR rc=<n>` (a signal death is reported as `128 + signum`,
+8. Other exit code → `ERR rc=<n>` (a signal death is reported as `128 + signum`,
    e.g. `139` for SIGSEGV)
 
 ---
@@ -1936,15 +1943,16 @@ then a `WARNING:` line per key of the stored `ENV` whose value differs here.
 
 - **icount.** The band is the larger of 1% of the baseline (rounded up) and 8 instructions. A
   one-CPU measurement gates; a measurement at more CPUs is reported only, since the interleaving
-  of its CPUs moves its count. So is a benchmark of `ICOUNT_IO_BOUND` (`src/benchmark.rs`),
-  `fsbench.write`, whose count includes time blocked on a device completion: the completion
-  arrives at host time, and the guest's clock advances by timer deadlines while it waits, so the
-  count follows the host's I/O latency. `fsbench.read` gates, since its untimed warm-up fills the
-  filesystem's page cache and no timed read waits on the disk; a benchmark whose timed samples
-  wait on a device joins the set. The command fails when a gating measurement's verdict is not
-  `ok` (an `IMPROVED` count included: its stale baseline would pass a later regression of the
-  same size) or a benchmark logged a `FAIL` line: ktest's `ktest: bench <name> FAIL`, or a
-  userspace suite's `[<suite>] bench <name> FAIL`.
+  of its CPUs moves its count. So is a benchmark of `ICOUNT_IO_BOUND` (`src/benchmark.rs`), one
+  whose timed samples idle, since the guest's clock follows the host's time while every vCPU
+  idles (`--icount`): `fsbench.write`, whose count includes time blocked on a device
+  completion, which arrives at host time, so the count follows the host's I/O latency.
+  `fsbench.read` gates, since its untimed warm-up fills the filesystem's page cache and no timed
+  read waits on the disk; a benchmark whose timed samples idle, on a device, a timer or any other
+  event, joins the set. The command fails when a gating measurement's verdict is not `ok` (an
+  `IMPROVED` count included: its stale baseline would pass a later regression of the same size) or
+  a benchmark logged a `FAIL` line: ktest's `ktest: bench <name> FAIL`, or a userspace suite's
+  `[<suite>] bench <name> FAIL`.
 - **host.** Each measurement's band is its line in `BANDS`, a percentage of its baseline,
   calibrated on the reference host (`<suite>.<name> [<variant> ...] cpus=<k> band=<percent>`).
   Nothing gates: the command reports and succeeds.

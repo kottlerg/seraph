@@ -459,8 +459,8 @@ pub struct DriverDecl
 {
     pub name: DriverName,
     pub class: Option<ClassName>,
-    matches: [MatchKey; MAX_MATCHES],
-    match_count: usize,
+    pub(crate) matches: [MatchKey; MAX_MATCHES],
+    pub(crate) match_count: usize,
     pub instance_limit: Option<u16>,
     pub interrupt: Interrupt,
     pub dma: bool,
@@ -518,11 +518,28 @@ pub enum DeclError
 /// [`DeclError`] naming the first breach found.
 pub fn decode(desc: &[u8]) -> Result<DriverDecl, DeclError>
 {
+    let mut rest = fields(desc)?;
+    let mut builder = Builder::new();
+    while let Some((kind, payload, after)) = next_field(rest)?
+    {
+        builder.field(kind, payload)?;
+        rest = after;
+    }
+    builder.finish()
+}
+
+/// The fields of descriptor `desc`: the bytes after its header, once its
+/// length and its header are checked.
+///
+/// # Errors
+/// `TooLarge`, `BadHeader` or `UnknownVersion`, in that order.
+pub(crate) fn fields(desc: &[u8]) -> Result<&[u8], DeclError>
+{
     if desc.len() > MAX_DESC_BYTES
     {
         return Err(DeclError::TooLarge);
     }
-    let Some((&[v0, v1, r0, r1], mut rest)) = desc.split_first_chunk::<HEADER_BYTES>()
+    let Some((&[v0, v1, r0, r1], rest)) = desc.split_first_chunk::<HEADER_BYTES>()
     else
     {
         return Err(DeclError::BadHeader);
@@ -536,38 +553,52 @@ pub fn decode(desc: &[u8]) -> Result<DriverDecl, DeclError>
     {
         return Err(DeclError::UnknownVersion(version));
     }
-    let mut builder = Builder::new();
-    while let Some((&kind, after_kind)) = rest.split_first()
+    Ok(rest)
+}
+
+/// A field as cut from the fields of a descriptor: its kind, its payload,
+/// and the bytes after it.
+pub(crate) type Field<'a> = (u8, &'a [u8], &'a [u8]);
+
+/// The field at the start of `rest`: its kind, its payload, and the bytes
+/// after it; `None` when `rest` is empty.
+///
+/// # Errors
+/// `Truncated` when the field runs past the end of `rest`.
+pub(crate) fn next_field(rest: &[u8]) -> Result<Option<Field<'_>>, DeclError>
+{
+    let Some((&kind, after_kind)) = rest.split_first()
+    else
     {
-        let Some((&len, after_len)) = after_kind.split_first()
-        else
-        {
-            return Err(DeclError::Truncated);
-        };
-        let Some((payload, after_payload)) = after_len.split_at_checked(usize::from(len))
-        else
-        {
-            return Err(DeclError::Truncated);
-        };
-        builder.field(kind, payload)?;
-        rest = after_payload;
-    }
-    builder.finish()
+        return Ok(None);
+    };
+    let Some((&len, after_len)) = after_kind.split_first()
+    else
+    {
+        return Err(DeclError::Truncated);
+    };
+    let Some((payload, after)) = after_len.split_at_checked(usize::from(len))
+    else
+    {
+        return Err(DeclError::Truncated);
+    };
+    Ok(Some((kind, payload, after)))
 }
 
 /// A declaration being decoded: which singleton fields were seen, and the
 /// values so far.
-struct Builder
+#[cfg_attr(any(test, kani, fuzzing), derive(Clone, Debug, PartialEq, Eq))]
+pub(crate) struct Builder
 {
-    decl: DriverDecl,
-    name_seen: bool,
+    pub(crate) decl: DriverDecl,
+    pub(crate) name_seen: bool,
     /// One bit per singleton field kind seen, indexed by [`singleton_bit`].
-    seen: u32,
+    pub(crate) seen: u32,
 }
 
 impl Builder
 {
-    fn new() -> Self
+    pub(crate) fn new() -> Self
     {
         Self {
             decl: DriverDecl {
@@ -592,7 +623,7 @@ impl Builder
     }
 
     /// Absorb one field.
-    fn field(&mut self, kind: u8, payload: &[u8]) -> Result<(), DeclError>
+    pub(crate) fn field(&mut self, kind: u8, payload: &[u8]) -> Result<(), DeclError>
     {
         let bad = DeclError::BadField(kind);
         if let Some(key) = match_key(kind, payload)?
@@ -673,7 +704,8 @@ impl Builder
         Ok(())
     }
 
-    fn finish(self) -> Result<DriverDecl, DeclError>
+    /// The declaration decoded, once every field is absorbed.
+    pub(crate) fn finish(self) -> Result<DriverDecl, DeclError>
     {
         if !self.name_seen
         {
@@ -693,7 +725,7 @@ impl Builder
 
 /// The bit of singleton field `kind` in [`Builder::seen`]; `None` for a kind
 /// that is not a singleton field.
-fn singleton_bit(kind: u8) -> Option<u32>
+pub(crate) fn singleton_bit(kind: u8) -> Option<u32>
 {
     let index = match kind
     {
@@ -1409,5 +1441,110 @@ mod tests
     fn a_literal_class_breaking_the_rule_is_refused()
     {
         let _ = ClassName::literal_class("Block");
+    }
+}
+
+/// Bounded proofs of the declaration decoder (docs/testing.md § Bounded
+/// verification, Parser proofs), each on every input up to the bounds its
+/// comment states.
+///
+/// How they compose into the property's check of [`decode`]
+/// (`property::decl_holds`). The walk of the fields is a loop whose step is
+/// [`next_field`] then [`Builder::field`], its state the rest of the
+/// descriptor and the builder, and it is proven by induction: the header
+/// proof shows that the walk starts on the bytes after the header, from the
+/// new builder; the cut proof runs the step's cut on any rest, so the rest it
+/// hands the next step is the bytes after the field, wherever the field
+/// ends; the field proof runs the step's absorb on any builder its
+/// invariant admits and any field; and the finish proof judges any builder
+/// the walk ends on. What lies outside the proofs is the loop that drives the
+/// steps, and the round trip of a declaration through [`encode`]; the fuzz
+/// target `driver-binding`, the replay of the checked-in inputs and the unit
+/// tests check them.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{Builder, MAX_DESC_BYTES, MAX_MATCHES};
+    use crate::property;
+
+    /// A builder of any state its invariant admits: any set of the fields
+    /// that appear at most once seen, the name among them exactly when it
+    /// was seen, up to [`MAX_MATCHES`] match keys, and any instance limit,
+    /// DMA, DMA address width and physical access. A step writes one match
+    /// slot or one field and carries the rest, so the values of the others
+    /// stand for any.
+    fn any_builder() -> Builder
+    {
+        let mut builder = Builder::new();
+        builder.seen = kani::any::<u32>() & 0x1ff;
+        builder.name_seen = builder.seen & 1 != 0;
+        let count: usize = kani::any();
+        kani::assume(count <= MAX_MATCHES);
+        builder.decl.match_count = count;
+        builder.decl.instance_limit = kani::any();
+        builder.decl.dma = kani::any();
+        builder.decl.dma_width = kani::any();
+        builder.decl.phys_access = kani::any();
+        builder
+    }
+
+    /// Every descriptor of at most 513 bytes holds the header's contract:
+    /// 513 bytes reach the refusal of one past [`MAX_DESC_BYTES`], and every
+    /// shorter length each refusal of the header and its acceptance. No
+    /// loop: the header is read at fixed offsets.
+    #[kani::proof]
+    fn every_header_reads_as_its_fields()
+    {
+        let bytes: [u8; MAX_DESC_BYTES + 1] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let _ = property::fields_holds(&bytes[..len]);
+    }
+
+    /// Every rest of at most 258 bytes holds the cut's contract: 258 bytes
+    /// hold a kind, a length and a payload of the longest length (255) and
+    /// one byte after it, so a field of every length, one past the end and
+    /// none are reached. No loop: the field is cut by length.
+    #[kani::proof]
+    fn every_rest_cuts_into_its_first_field()
+    {
+        let bytes: [u8; 258] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let _ = property::next_field_holds(&bytes[..len]);
+    }
+
+    /// Every field of any kind and a payload of at most 33 bytes, absorbed
+    /// into any builder, holds the step's contract: 33 bytes are one past
+    /// the longest text a field holds (a platform key or a name, 32), and
+    /// every other payload's form is at most 6 bytes, so each refusal and
+    /// each value of every kind are reached. The loops are the text rules'
+    /// and the compare of a text, each at most 33 steps.
+    #[kani::proof]
+    #[kani::unwind(34)]
+    fn every_field_is_absorbed_into_any_builder()
+    {
+        let mut builder = any_builder();
+        let payload: [u8; 33] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= payload.len());
+        let _ = property::field_holds(&mut builder, kani::any(), &payload[..len]);
+    }
+
+    /// Every builder the walk can end on holds the finish's contract.
+    #[kani::proof]
+    fn every_builder_finishes_as_its_state_says()
+    {
+        let mut builder = any_builder();
+        builder.name_seen = kani::any();
+        let _ = property::finish_holds(builder);
+    }
+
+    /// The kinds of the fields that appear at most once have a bit each.
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn every_field_that_appears_once_has_a_bit_of_its_own()
+    {
+        property::singleton_bits_hold();
     }
 }

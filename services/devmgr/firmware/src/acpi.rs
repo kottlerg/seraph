@@ -553,6 +553,10 @@ pub fn sci_gsi(overrides: impl IntoIterator<Item = SourceOverride>, sci_int: u16
 #[must_use]
 pub fn sdt_oem_table_id(sdt_header: &[u8]) -> Option<[u8; 8]>
 {
+    if sdt_header.len() < SDT_HDR_LEN
+    {
+        return None;
+    }
     sdt_header
         .get(SDT_OFF_OEM_TABLE_ID..SDT_OFF_OEM_TABLE_ID + 8)?
         .try_into()
@@ -1955,6 +1959,7 @@ mod tests
         t[SDT_OFF_OEM_TABLE_ID..SDT_OFF_OEM_TABLE_ID + 8].copy_from_slice(b"BXPC    ");
         assert_eq!(sdt_oem_table_id(&t), Some(*b"BXPC    "));
         assert_eq!(sdt_oem_table_id(&t[..SDT_OFF_OEM_TABLE_ID + 7]), None);
+        assert_eq!(sdt_oem_table_id(&t[..SDT_HDR_LEN - 1]), None);
     }
 
     #[test]

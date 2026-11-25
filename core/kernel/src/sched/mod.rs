@@ -6581,7 +6581,8 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize, _rule: PullRule)
 /// against the `sched_lock` release on each arm.
 ///
 /// `target_cpu` is a placement hint (from `select_target_cpu`); exclusivity is
-/// decided by `state` under `sched_lock`, not by the CPU choice. Priority is
+/// decided by `state` under `sched_lock`, not by the CPU choice, and a hard
+/// affinity read under `sched_lock` overrides it ([`link_cpu`]). Priority is
 /// read under `sched_lock`, which `sys_thread_set_priority` also holds across
 /// its priority write, so the link serialises against a concurrent priority change.
 ///
@@ -6736,9 +6737,13 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         return;
     }
 
-    // Link path (state was Blocked|Created). Acquire the target run-queue lock
-    // UNDER sched_lock.
-    // SAFETY: caller guarantees target_cpu is initialized.
+    // Link path (state was Blocked|Created): the hard affinity, read under
+    // sched_lock, wins over the caller's target, chosen without it (link_cpu).
+    // SAFETY: tcb valid; its sched_lock is held.
+    let target_cpu = unsafe { locked_link_cpu(tcb, target_cpu) };
+    // Acquire the target run-queue lock UNDER sched_lock.
+    // SAFETY: caller guarantees target_cpu is initialized; link_cpu returns it
+    // or a CPU below CPU_COUNT.
     let sched = unsafe { scheduler_for(target_cpu) };
     // SAFETY: lock_raw paired with unlock_raw below.
     let saved = unsafe { sched.lock.lock_raw() };
@@ -6950,7 +6955,13 @@ pub unsafe fn enqueue_ready_thread(
         unsafe { tcb_lock.unlock_raw(sched_saved) };
         return refusal;
     }
-    // SAFETY: caller guarantees target_cpu is initialized.
+    // The hard affinity wins over the caller's target, as in enqueue_and_wake:
+    // a `sys_thread_set_affinity` since the caller's read finds the thread not
+    // linked, so its migration declines and the routing is this link's.
+    // SAFETY: tcb valid; cpu_affinity is written under sched_lock, held.
+    let target_cpu = unsafe { locked_link_cpu(tcb, target_cpu) };
+    // SAFETY: caller guarantees target_cpu is initialized; link_cpu returns it
+    // or a CPU below CPU_COUNT.
     let sched = unsafe { scheduler_for(target_cpu) };
     // SAFETY: run-queue lock (inner) paired with unlock below.
     let saved = unsafe { sched.lock.lock_raw() };
@@ -7029,6 +7040,40 @@ pub unsafe fn enqueue_ready_thread(
 ) -> ReadyLink
 {
     ReadyLink::Linked
+}
+
+/// The CPU a link of a thread goes to, given the hard `affinity` read under
+/// its `sched_lock` and the `target_cpu` its waker chose: the affinity's CPU
+/// when it names one below `cpu_count` other than the target, else the
+/// target. The waker's choice reads the affinity without that lock, so a
+/// `sys_thread_set_affinity` between the choice and the link would otherwise
+/// leave the thread linked on a CPU its affinity excludes
+/// (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership, the
+/// `cpu_affinity` enforcement invariant).
+fn link_cpu(affinity: u32, target_cpu: usize, cpu_count: usize) -> usize
+{
+    if affinity != AFFINITY_ANY && (affinity as usize) < cpu_count
+    {
+        affinity as usize
+    }
+    else
+    {
+        target_cpu
+    }
+}
+
+/// [`link_cpu`] for `tcb`, whose `sched_lock` the caller holds, over the
+/// `target_cpu` its waker chose.
+///
+/// # Safety
+/// `tcb` must be a valid [`ThreadControlBlock`] whose `sched_lock` the caller
+/// holds, which serialises its `cpu_affinity`.
+#[cfg(not(test))]
+unsafe fn locked_link_cpu(tcb: *mut ThreadControlBlock, target_cpu: usize) -> usize
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    // SAFETY: tcb valid; cpu_affinity is written under its sched_lock, held.
+    link_cpu(unsafe { (*tcb).cpu_affinity }, target_cpu, cpu_count)
 }
 
 /// What a wake tells [`select_target_cpu`] about its waker.
@@ -10253,7 +10298,26 @@ mod idle_pull_tests
 #[cfg(test)]
 mod placement_tests
 {
-    use super::{AFFINITY_ANY, RT_PRIORITY_MIN, WakeHint, WakeView, least_loaded_cpu, place_wake};
+    use super::{
+        AFFINITY_ANY, RT_PRIORITY_MIN, WakeHint, WakeView, least_loaded_cpu, link_cpu, place_wake,
+    };
+
+    // The defect caught: a link that keeps the waker's target after a
+    // `sys_thread_set_affinity` pinned the thread elsewhere between the
+    // waker's unlocked read and the link, leaving it linked on a CPU its
+    // affinity excludes.
+    #[test]
+    fn a_link_follows_the_affinity_read_under_the_lock()
+    {
+        // Pinned since the waker chose CPU 1: the link goes to the pin.
+        assert_eq!(link_cpu(3, 1, 4), 3);
+        // Pinned to the waker's choice, or unpinned: the target stands.
+        assert_eq!(link_cpu(1, 1, 4), 1);
+        assert_eq!(link_cpu(AFFINITY_ANY, 2, 4), 2);
+        // An affinity past the CPU count, which sys_thread_set_affinity
+        // refuses, never routes the link past the scheduler slab.
+        assert_eq!(link_cpu(4, 2, 4), 2);
+    }
 
     /// `least_loaded_cpu` over CPUs `0..loads.len()` with `loads` and
     /// `busy` (busy siblings per CPU), recording each sibling count asked for.

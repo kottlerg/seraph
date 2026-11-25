@@ -1114,8 +1114,8 @@ Otherwise, by target state:
   RT level, its level, at most 20, for one dispatched at a fair level; see
   § Time Slice Policy), not one tick.
 - **Blocked / Stopped / Created**: the new affinity takes effect on the
-  next enqueue (a wake, or `SYS_THREAD_START` on start or resume) via
-  `select_target_cpu`; no migration work is needed.
+  next enqueue (a wake, or `SYS_THREAD_START` on start or resume), whose link
+  re-reads it under the thread's `sched_lock`; no migration work is needed.
 
 The syscall writes `cpu_affinity`, reads `preferred_cpu` and `state`, and performs the
 migration under the target's `sched_lock`, and prods the acting CPU after releasing it.

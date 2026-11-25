@@ -834,11 +834,12 @@ set by the all-locks commit, or under the remote run-queue lock the stop protoco
 `CAP_INFO_THREAD_STATE` is a diagnostic snapshot that decides nothing in the kernel.
 `sys_thread_configure` does not precheck: it decides `Created` under the target's `sched_lock`,
 which `sys_thread_start`'s commit also takes, and holds it across its writes.
-`select_target_cpu`'s synchronous rule reads `priority`, of the woken thread and of the waker
-running on its own CPU, without `sched_lock`, as placement hints: a read that races a priority
-change misjudges one placement, which the rules after it and the idle pull bound
-(§ Wake Protocol Invariants, "Target CPU selection"), and `enqueue_and_wake` links the thread at
-the `priority` it reads under the lock.
+`select_target_cpu` reads `cpu_affinity` without `sched_lock`; the link re-reads it under the lock
+(the `cpu_affinity` enforcement invariant below). Its synchronous rule reads `priority`, of the
+woken thread and of the waker running on its own CPU, without `sched_lock`, as placement hints: a
+read that races a priority change misjudges one placement, which the rules after it and the idle
+pull bound (§ Wake Protocol Invariants, "Target CPU selection"), and `enqueue_and_wake` links the
+thread at the `priority` it reads under the lock.
 
 | Field group | Fields | Owning lock | Cross-CPU access rule |
 |---|---|---|---|
@@ -874,7 +875,10 @@ NOT be linked on CPU Y's run queue, nor dispatched out of `schedule()` on CPU Y,
 enforcement points are:
 
 - `select_target_cpu` + `enqueue_and_wake` (`core/kernel/src/sched/mod.rs`) honour `cpu_affinity` on
-  every placement.
+  every placement. `select_target_cpu` reads it without the thread's `sched_lock`; the link, in
+  `enqueue_and_wake` and in `enqueue_ready_thread` (`sys_thread_start`), re-reads it under that lock
+  and links on its CPU when it names one (`link_cpu`). A `sys_thread_set_affinity` between the
+  choice and the link finds the thread not linked, so moves nothing, and the link honours it.
 - `migrate_ready_thread` is the active-relocation primitive.
 - `schedule()`'s outgoing-thread re-enqueue branch (`core/kernel/src/sched/mod.rs`, the `cross_cpu`
   arm) routes the requeue cross-CPU when the *outgoing* thread's affinity no longer permits the

@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use super::bytes_at;
 use crate::EcamLocation;
-use crate::dtb::{self, Fdt, FdtEvent};
+use crate::dtb::{self, Fdt, FdtEvent, NodeRead, Scan, ScanStep};
 
 /// Check the header and, for a blob it accepts, the ECAM windows.
 pub(crate) fn dtb_holds(input: &[u8])
@@ -243,6 +243,63 @@ pub(crate) fn window_holds(reg: (u64, u64), bus: Option<(u32, u32)>, domain: Opt
     );
 }
 
+/// [`NodeRead::step`] takes `event` as the read of an ECAM node's own
+/// properties does, the node's `reg` read in `cells`: a node opening or
+/// closing inside it moves the depth, the node closes when the depth falls to
+/// 0, and at depth 1 the last `reg`, `bus-range` and `linux,pci-domain` are
+/// kept, one that does not read ending the node without a window. Returns
+/// the step's answer.
+pub(crate) fn node_step_holds(
+    node: &mut NodeRead,
+    event: &FdtEvent<'_>,
+    cells: (usize, usize),
+) -> Option<bool>
+{
+    let mut want = *node;
+    let answer = match *event
+    {
+        FdtEvent::BeginNode { .. } =>
+        {
+            want.depth = want.depth.saturating_add(1);
+            Some(true)
+        }
+        FdtEvent::EndNode =>
+        {
+            want.depth = want.depth.saturating_sub(1);
+            Some(want.depth > 0)
+        }
+        FdtEvent::Prop { name, data } if want.depth == 1 =>
+        {
+            properties_hold(data, cells.0, cells.1);
+            let mut read = || -> Option<()> {
+                match name
+                {
+                    b"reg" =>
+                    {
+                        let base = self::cells(data, 0, cells.0)?;
+                        want.reg =
+                            Some((base, self::cells(data, cells.0.checked_mul(4)?, cells.1)?));
+                    }
+                    b"bus-range" => want.bus = Some((be32(data, 0)?, be32(data, 4)?)),
+                    b"linux,pci-domain" => want.domain = Some(u16::try_from(be32(data, 0)?).ok()?),
+                    _ =>
+                    {}
+                }
+                Some(())
+            };
+            read().map(|()| true)
+        }
+        FdtEvent::Prop { .. } => Some(true),
+    };
+    assert_eq!(
+        node.step(event, cells.0, cells.1),
+        answer,
+        "an ECAM node's step judged against its event"
+    );
+    assert_eq!(*node, want, "an ECAM node's read judged against its event");
+    answer
+}
+
 /// The window of the node whose `FDT_BEGIN_NODE` is at `start`, its `reg`
 /// read in `cells`, and whether the node names its domain: the last `reg`,
 /// `bus-range` and `linux,pci-domain` the node itself holds, before its
@@ -256,68 +313,151 @@ fn node_window(
 ) -> Option<(Window, bool)>
 {
     let (_, mut off) = token_holds(fdt, start, end)?;
-    let mut depth = 1usize;
-    let (mut reg, mut bus, mut domain) = (None, None, None);
+    let mut node = NodeRead::new();
+    assert_eq!(
+        (node.depth, node.reg, node.bus, node.domain),
+        (1, None, None, None),
+        "an ECAM node's read starts empty"
+    );
     while let Some((event, next)) = token_holds(fdt, off, end)
     {
         off = next;
-        match event
+        if !node_step_holds(&mut node, &event, cells)?
         {
-            FdtEvent::BeginNode { .. } => depth = depth.saturating_add(1),
-            FdtEvent::EndNode =>
-            {
-                depth = depth.saturating_sub(1);
-                if depth == 0
-                {
-                    break;
-                }
-            }
-            FdtEvent::Prop { name, data } if depth == 1 =>
-            {
-                properties_hold(data, cells.0, cells.1);
-                match name
-                {
-                    b"reg" =>
-                    {
-                        let base = self::cells(data, 0, cells.0)?;
-                        reg = Some((base, self::cells(data, cells.0.checked_mul(4)?, cells.1)?));
-                    }
-                    b"bus-range" => bus = Some((be32(data, 0)?, be32(data, 4)?)),
-                    b"linux,pci-domain" => domain = Some(u16::try_from(be32(data, 0)?).ok()?),
-                    _ =>
-                    {}
-                }
-            }
-            FdtEvent::Prop { .. } =>
-            {}
+            break;
         }
     }
-    let reg = reg?;
-    window_holds(reg, bus, domain);
-    Some((window(reg, bus, domain)?, domain.is_some()))
+    let reg = node.reg?;
+    window_holds(reg, node.bus, node.domain);
+    Some((window(reg, node.bus, node.domain)?, node.domain.is_some()))
+}
+
+/// Whether `data`, a list of NUL-separated entries, holds the non-empty
+/// `entry`: it lies at the list's start or after a NUL, and ends at the
+/// list's end or before a NUL.
+fn holds_entry(data: &[u8], entry: &[u8]) -> bool
+{
+    (0..=data.len()).any(|at| {
+        let after = at.saturating_add(entry.len());
+        (at == 0 || byte_is_nul(data, at.wrapping_sub(1)))
+            && data.get(at..after) == Some(entry)
+            && (after == data.len() || byte_is_nul(data, after))
+    })
+}
+
+/// Whether the byte of `data` at `at` is a NUL.
+fn byte_is_nul(data: &[u8], at: usize) -> bool
+{
+    data.get(at) == Some(&0)
+}
+
+/// [`Scan::step`] takes `event` as the walk of the structure block does:
+/// a node opening deepens the walk and gives the node, when it is at most 16
+/// deep, its start and, under 16 deep, its children's default cells (2 and
+/// 1); a node closing at depth 0 stops the walk, else it rises; a property
+/// of an open node sets that node's `#address-cells` or `#size-cells`
+/// (under 16 deep; a value shorter than 4 bytes reads as 0), and a
+/// `compatible` that holds `pci-host-ecam-generic` asks, the first time
+/// in a node at most 16 deep, for the window of the node at its start and
+/// in its parent's cells. Returns the step's answer.
+pub(crate) fn scan_step_holds(scan: &mut Scan, event: &FdtEvent<'_>) -> ScanStep
+{
+    let mut want = *scan;
+    let depth = want.depth;
+    let mut answer = ScanStep::Next;
+    match *event
+    {
+        FdtEvent::BeginNode { start } =>
+        {
+            let d = depth.saturating_add(1);
+            want.depth = d;
+            if d < 16
+                && let Some(cells) = want.cells.get_mut(d)
+            {
+                *cells = (2, 1);
+            }
+            if d <= 16
+                && let Some(slot) = want.starts.get_mut(d)
+            {
+                *slot = Some(start);
+            }
+        }
+        FdtEvent::EndNode =>
+        {
+            if depth == 0
+            {
+                answer = ScanStep::Stop;
+            }
+            else
+            {
+                want.depth = depth.saturating_sub(1);
+            }
+        }
+        FdtEvent::Prop { name, data } if depth > 0 =>
+        {
+            let value = usize::try_from(be32(data, 0).unwrap_or(0)).unwrap_or(usize::MAX);
+            let parent = want.cells.get(depth.saturating_sub(1)).copied();
+            let own = want.cells.get_mut(depth).filter(|_| depth < 16);
+            match (name, own)
+            {
+                (b"#address-cells", Some(own)) => own.0 = value,
+                (b"#size-cells", Some(own)) => own.1 = value,
+                (b"compatible", _)
+                    if depth <= 16 && holds_entry(data, b"pci-host-ecam-generic") =>
+                {
+                    if let (Some(start), Some(cells)) =
+                        (want.starts.get_mut(depth).and_then(Option::take), parent)
+                    {
+                        answer = ScanStep::Ecam { start, cells };
+                    }
+                }
+                _ =>
+                {}
+            }
+        }
+        FdtEvent::Prop { .. } =>
+        {}
+    }
+    assert_eq!(
+        scan.step(event),
+        answer,
+        "a walk's step judged against its event"
+    );
+    assert_eq!(*scan, want, "a walk's state judged against its event");
+    answer
 }
 
 /// [`Fdt::find_pci_ecams`] finds, in block order, the window of every node
 /// at most 16 levels deep (the root node is level 1) whose `compatible`
-/// list holds `pci-host-ecam-generic`, its `reg` read in its parent's
+/// list holds `pci-host-ecam-generic`, read once, at the first such
+/// `compatible` of the node, its `reg` read in its parent's
 /// `#address-cells` and `#size-cells` (2 and 1 where the parent sets
 /// none; a value shorter than 4 bytes reads as 0); the walk ends at the
 /// block's end or where it closes more nodes than it opened. Each window
 /// without a domain then takes, in order, the lowest segment that no window
-/// with a domain and no earlier window holds.
+/// with a domain and no earlier window holds. Each step of the walk is
+/// judged by [`scan_step_holds`] on the way.
 fn windows_holds(fdt: &Fdt<'_>)
 {
     let end = fdt.dt_struct_off.saturating_add(fdt.dt_struct_len);
-    // Each open node's start and the cells its children read `reg` in.
-    let mut open: Vec<(usize, (usize, usize))> = Vec::new();
+    // Each open node's start, the cells its children read `reg` in, and
+    // whether its window has been read.
+    let mut open: Vec<(usize, (usize, usize), bool)> = Vec::new();
+    let mut scan = Scan::new();
+    assert_eq!(
+        (scan.depth, scan.cells, scan.starts),
+        (0, [(2, 1); 16], [None; 17]),
+        "a walk starts with no node open"
+    );
     let mut found = Vec::new();
     let mut off = fdt.dt_struct_off;
     while let Some((event, next)) = token_holds(fdt, off, end)
     {
         off = next;
+        scan_step_holds(&mut scan, &event);
         match event
         {
-            FdtEvent::BeginNode { start } => open.push((start, (2, 1))),
+            FdtEvent::BeginNode { start } => open.push((start, (2, 1), false)),
             FdtEvent::EndNode =>
             {
                 if open.pop().is_none()
@@ -341,13 +481,13 @@ fn windows_holds(fdt: &Fdt<'_>)
                 {
                     (b"#address-cells", Some(node)) => node.1.0 = value(),
                     (b"#size-cells", Some(node)) => node.1.1 = value(),
-                    (b"compatible", Some(&mut (start, _)))
+                    (b"compatible", Some(node))
                         if depth <= 16
-                            && data
-                                .split(|&b| b == 0)
-                                .any(|e| e == b"pci-host-ecam-generic") =>
+                            && !node.2
+                            && holds_entry(data, b"pci-host-ecam-generic") =>
                     {
-                        if let Some(w) = node_window(fdt, start, end, parent)
+                        node.2 = true;
+                        if let Some(w) = node_window(fdt, node.0, end, parent)
                         {
                             found.push(w);
                         }
@@ -358,7 +498,7 @@ fn windows_holds(fdt: &Fdt<'_>)
             }
         }
     }
-    let mut decoded: Vec<(EcamLocation, bool)> = found
+    let decoded: Vec<(EcamLocation, bool)> = found
         .iter()
         .map(
             |&((phys_base, size, segment, start_bus, end_bus), explicit)| {
@@ -373,7 +513,8 @@ fn windows_holds(fdt: &Fdt<'_>)
             },
         )
         .collect();
-    fallback_holds(&mut decoded);
+    let mut assigned = decoded.clone();
+    fallback_holds(&decoded, &mut assigned);
     let mut held: Vec<u16> = found.iter().filter(|w| w.1).map(|w| w.0.2).collect();
     for w in &mut found
     {
@@ -396,32 +537,40 @@ fn windows_holds(fdt: &Fdt<'_>)
     );
 }
 
-/// [`dtb::compatible_contains`] finds `needle` exactly when it is one of
-/// the NUL-separated entries of `data`.
+/// [`dtb::compatible_contains`] finds the non-empty `needle` exactly when
+/// it is one of the NUL-separated entries of `data` ([`holds_entry`]).
 pub(crate) fn compatible_holds(data: &[u8], needle: &[u8])
 {
+    if needle.is_empty()
+    {
+        return;
+    }
     assert_eq!(
         dtb::compatible_contains(data, needle),
-        data.split(|&b| b == 0).any(|entry| entry == needle),
+        holds_entry(data, needle),
         "a compatible list judged against its entries"
     );
 }
 
-/// [`dtb::assign_fallback_segments`] gives each window without a domain
-/// (flag clear), in order, the lowest segment that no window with a domain
-/// and no earlier window holds, else 0.
-pub(crate) fn fallback_holds(found: &mut [(EcamLocation, bool)])
+/// [`dtb::assign_fallback_segments`], run on `found`, a copy of `before`,
+/// gives each window without a domain (flag clear), in order, the lowest
+/// segment that no window with a domain and no earlier window holds, else 0,
+/// and changes nothing else.
+///
+/// # Panics
+///
+/// When `found` and `before` differ in length: a defect of the caller.
+pub(crate) fn fallback_holds(before: &[(EcamLocation, bool)], found: &mut [(EcamLocation, bool)])
 {
-    let before = found.to_vec();
+    found.copy_from_slice(before);
     dtb::assign_fallback_segments(found);
-    for (i, (window, explicit)) in found.iter().enumerate()
+    for (i, (&(window, explicit), &(was, was_explicit))) in found.iter().zip(before).enumerate()
     {
-        let (was, _) = before.get(i).copied().unwrap_or((*window, *explicit));
         let held = |segment: u16| {
             before.iter().any(|(w, e)| *e && w.segment == segment)
                 || found.iter().take(i).any(|(w, _)| w.segment == segment)
         };
-        let want = if *explicit
+        let want = if was_explicit
         {
             was.segment
         }
@@ -438,9 +587,16 @@ pub(crate) fn fallback_holds(found: &mut [(EcamLocation, bool)])
                 window.phys_base,
                 window.size,
                 window.start_bus,
-                window.end_bus
+                window.end_bus,
+                explicit
             ),
-            (was.phys_base, was.size, was.start_bus, was.end_bus),
+            (
+                was.phys_base,
+                was.size,
+                was.start_bus,
+                was.end_bus,
+                was_explicit
+            ),
             "a window changed by its segment"
         );
     }

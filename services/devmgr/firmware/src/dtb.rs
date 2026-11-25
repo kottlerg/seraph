@@ -109,7 +109,8 @@ impl<'a> Fdt<'a>
     }
 
     /// Collect the PCI ECAM window of every `pci-host-ecam-generic` node
-    /// (QEMU virt's PCI host), in structure-block order.
+    /// (QEMU virt's PCI host), in structure-block order. A node is read
+    /// once, at its first `compatible` property that holds that entry.
     ///
     /// A node's `reg` is one `(address, size)` pair in its parent's
     /// `#address-cells` / `#size-cells` units (1 or 2 cells each; the
@@ -136,79 +137,25 @@ impl<'a> Fdt<'a>
         // Each window with whether its segment came from `linux,pci-domain`.
         let mut found: Vec<(EcamLocation, bool)> = Vec::new();
         let mut walker = FdtWalker::new(self);
-        // `cells[d]`: the cell sizes the children of the node at depth `d`
-        // decode their `reg` in (the root node is depth 1). Tracked only for
-        // `d < MAX_DEPTH`; `depth` itself keeps counting past it.
-        let mut cells = [DEFAULT_CELLS; MAX_DEPTH];
-        // `starts[d]`: where the open node at depth `d` begins, for
-        // `d <= MAX_DEPTH`.
-        let mut starts = [0usize; MAX_DEPTH + 1];
-        let mut depth = 0usize;
-
+        let mut scan = Scan::new();
         while let Some(event) = walker.next_event()
         {
-            match event
+            match scan.step(&event)
             {
-                FdtEvent::BeginNode { start } =>
-                {
-                    depth = depth.saturating_add(1);
-                    if let Some(c) = cells.get_mut(depth)
-                    {
-                        *c = DEFAULT_CELLS;
-                    }
-                    if let Some(s) = starts.get_mut(depth)
-                    {
-                        *s = start;
-                    }
-                }
-                FdtEvent::EndNode =>
-                {
-                    let Some(d) = depth.checked_sub(1)
-                    else
-                    {
-                        break;
-                    };
-                    depth = d;
-                }
-                FdtEvent::Prop { name, data } if depth > 0 =>
-                {
-                    if name == b"#address-cells"
-                        && let Some(c) = cells.get_mut(depth)
-                    {
-                        c.0 = be_u32(data, 0) as usize;
-                    }
-                    else if name == b"#size-cells"
-                        && let Some(c) = cells.get_mut(depth)
-                    {
-                        c.1 = be_u32(data, 0) as usize;
-                    }
-                    else if depth <= MAX_DEPTH
-                        && name == b"compatible"
-                        && compatible_contains(data, b"pci-host-ecam-generic")
-                    {
-                        // Restart at this node and read its `reg` and
-                        // `bus-range` in the parent's cell sizes.
-                        let Some(&node_start) = starts.get(depth)
-                        else
-                        {
-                            continue;
-                        };
-                        let Some(&(addr_cells, size_cells)) =
-                            depth.checked_sub(1).and_then(|parent| cells.get(parent))
-                        else
-                        {
-                            continue;
-                        };
-                        if let Some((loc, domain)) =
-                            extract_ecam(self, node_start, addr_cells, size_cells)
-                        {
-                            found.try_reserve(1)?;
-                            found.push((loc, domain.is_some()));
-                        }
-                    }
-                }
-                FdtEvent::Prop { .. } =>
+                ScanStep::Next =>
                 {}
+                ScanStep::Stop => break,
+                ScanStep::Ecam {
+                    start,
+                    cells: (addr_cells, size_cells),
+                } =>
+                {
+                    if let Some((loc, domain)) = extract_ecam(self, start, addr_cells, size_cells)
+                    {
+                        found.try_reserve(1)?;
+                        found.push((loc, domain.is_some()));
+                    }
+                }
             }
         }
         assign_fallback_segments(&mut found);
@@ -216,6 +163,107 @@ impl<'a> Fdt<'a>
         windows.try_reserve(found.len())?;
         windows.extend(found.iter().map(|&(loc, _)| loc));
         Ok(windows)
+    }
+}
+
+/// The state of [`Fdt::find_pci_ecams`]'s walk of the structure block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Scan
+{
+    /// The nodes open; the root node is depth 1.
+    pub(crate) depth: usize,
+    /// `cells[d]`: the cell sizes the children of the node at depth `d`
+    /// decode their `reg` in, for `d < MAX_DEPTH`; `depth` itself keeps
+    /// counting past it.
+    pub(crate) cells: [(usize, usize); MAX_DEPTH],
+    /// `starts[d]`: the offset of the open node at depth `d`, for
+    /// `d <= MAX_DEPTH`, until its window is read.
+    pub(crate) starts: [Option<usize>; MAX_DEPTH + 1],
+}
+
+/// What one event of the walk asks of [`Fdt::find_pci_ecams`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanStep
+{
+    /// Go on to the next event.
+    Next,
+    /// The block closes more nodes than it opened: stop.
+    Stop,
+    /// Read the window of the ECAM node at `start`, its `reg` in `cells`.
+    Ecam
+    {
+        /// The node's `FDT_BEGIN_NODE` offset.
+        start: usize,
+        /// The parent's `#address-cells` and `#size-cells`.
+        cells: (usize, usize),
+    },
+}
+
+impl Scan
+{
+    /// The state before the block's first event.
+    pub(crate) const fn new() -> Self
+    {
+        Self {
+            depth: 0,
+            cells: [DEFAULT_CELLS; MAX_DEPTH],
+            starts: [None; MAX_DEPTH + 1],
+        }
+    }
+
+    /// Take `event`: a node opens or closes, a node's `#address-cells` or
+    /// `#size-cells` sets its children's cell sizes, and the first
+    /// `compatible` of a node at most [`MAX_DEPTH`] deep that holds
+    /// `pci-host-ecam-generic` asks for its window.
+    pub(crate) fn step(&mut self, event: &FdtEvent<'_>) -> ScanStep
+    {
+        match *event
+        {
+            FdtEvent::BeginNode { start } =>
+            {
+                self.depth = self.depth.saturating_add(1);
+                if let Some(c) = self.cells.get_mut(self.depth)
+                {
+                    *c = DEFAULT_CELLS;
+                }
+                if let Some(s) = self.starts.get_mut(self.depth)
+                {
+                    *s = Some(start);
+                }
+            }
+            FdtEvent::EndNode =>
+            {
+                let Some(d) = self.depth.checked_sub(1)
+                else
+                {
+                    return ScanStep::Stop;
+                };
+                self.depth = d;
+            }
+            FdtEvent::Prop { name, data } if self.depth > 0 =>
+            {
+                if name == b"#address-cells"
+                    && let Some(c) = self.cells.get_mut(self.depth)
+                {
+                    c.0 = be_u32(data, 0) as usize;
+                }
+                else if name == b"#size-cells"
+                    && let Some(c) = self.cells.get_mut(self.depth)
+                {
+                    c.1 = be_u32(data, 0) as usize;
+                }
+                else if name == b"compatible"
+                    && compatible_contains(data, b"pci-host-ecam-generic")
+                    && let Some(&cells) = self.cells.get(self.depth.saturating_sub(1))
+                    && let Some(start) = self.starts.get_mut(self.depth).and_then(Option::take)
+                {
+                    return ScanStep::Ecam { start, cells };
+                }
+            }
+            FdtEvent::Prop { .. } =>
+            {}
+        }
+        ScanStep::Next
     }
 }
 
@@ -296,40 +344,84 @@ fn extract_ecam(
     let mut walker = FdtWalker::at(fdt, node_start);
     // Consume the BEGIN_NODE for `node_start` itself.
     walker.next_event()?;
-    let mut depth = 1i32;
-    let mut reg: Option<(u64, u64)> = None;
-    let mut bus: Option<(u32, u32)> = None;
-    let mut domain: Option<u16> = None;
+    let mut node = NodeRead::new();
     while let Some(event) = walker.next_event()
     {
-        match event
+        if !node.step(&event, addr_cells, size_cells)?
         {
-            FdtEvent::BeginNode { .. } => depth = depth.saturating_add(1),
+            break;
+        }
+    }
+    Some((ecam_window(node.reg?, node.bus, node.domain)?, node.domain))
+}
+
+/// The read of an ECAM node's own properties, after its `FDT_BEGIN_NODE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NodeRead
+{
+    /// The nodes open, the ECAM node being depth 1.
+    pub(crate) depth: usize,
+    /// The last `reg` pair the node holds.
+    pub(crate) reg: Option<(u64, u64)>,
+    /// The last `bus-range` the node holds.
+    pub(crate) bus: Option<(u32, u32)>,
+    /// The last `linux,pci-domain` the node holds.
+    pub(crate) domain: Option<u16>,
+}
+
+impl NodeRead
+{
+    /// The read before the node's first event.
+    pub(crate) const fn new() -> Self
+    {
+        Self {
+            depth: 1,
+            reg: None,
+            bus: None,
+            domain: None,
+        }
+    }
+
+    /// Take `event`, the node's `reg` read in `addr_cells` and
+    /// `size_cells`: `Some(true)` to go on, `Some(false)` when the node
+    /// closes, and `None` when one of the node's own `reg`, `bus-range` and
+    /// `linux,pci-domain` does not read, which leaves the node without a
+    /// window.
+    pub(crate) fn step(
+        &mut self,
+        event: &FdtEvent<'_>,
+        addr_cells: usize,
+        size_cells: usize,
+    ) -> Option<bool>
+    {
+        match *event
+        {
+            FdtEvent::BeginNode { .. } => self.depth = self.depth.saturating_add(1),
             FdtEvent::EndNode =>
             {
-                depth = depth.saturating_sub(1);
-                if depth == 0
+                self.depth = self.depth.saturating_sub(1);
+                return Some(self.depth != 0);
+            }
+            FdtEvent::Prop { name, data } if self.depth == 1 =>
+            {
+                if name == b"reg"
                 {
-                    break;
+                    self.reg = Some(reg_pair(data, addr_cells, size_cells)?);
                 }
-            }
-            FdtEvent::Prop { name, data } if depth == 1 && name == b"reg" =>
-            {
-                reg = Some(reg_pair(data, addr_cells, size_cells)?);
-            }
-            FdtEvent::Prop { name, data } if depth == 1 && name == b"bus-range" =>
-            {
-                bus = Some(bus_range(data)?);
-            }
-            FdtEvent::Prop { name, data } if depth == 1 && name == b"linux,pci-domain" =>
-            {
-                domain = Some(pci_domain(data)?);
+                else if name == b"bus-range"
+                {
+                    self.bus = Some(bus_range(data)?);
+                }
+                else if name == b"linux,pci-domain"
+                {
+                    self.domain = Some(pci_domain(data)?);
+                }
             }
             FdtEvent::Prop { .. } =>
             {}
         }
+        Some(true)
     }
-    Some((ecam_window(reg?, bus, domain)?, domain))
 }
 
 /// A `reg` property's first `(address, size)` pair, in `addr_cells` and
@@ -758,6 +850,26 @@ mod tests
         found.iter().map(|l| (l.phys_base, l.segment)).collect()
     }
 
+    // Defect caught: a node holding a second `compatible` property that names
+    // the ECAM host read its window again, as a second window under another
+    // segment.
+    #[test]
+    fn ecam_node_with_two_compatible_properties_yields_one_window()
+    {
+        let blob = Builder::new()
+            .begin("")
+            .prop("#address-cells", &2u32.to_be_bytes())
+            .prop("#size-cells", &2u32.to_be_bytes())
+            .begin("pcie@30000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &reg(0x3000_0000, 16 << 20))
+            .prop("compatible", ECAM)
+            .end()
+            .end()
+            .finish();
+        assert_eq!(segments(&blob), vec![(0x3000_0000, 0)]);
+    }
+
     #[test]
     fn fallback_segments_avoid_every_explicit_domain()
     {
@@ -1163,15 +1275,18 @@ mod tests
 
 /// The proofs of the walk's steps (docs/testing.md § Bounded verification),
 /// on the checks of `crate::property::dtb`: the header whole, the token at
-/// any place, the reads of a node's `reg`, `bus-range` and
-/// `linux,pci-domain`, its window, the `compatible` match and the fallback
-/// segments. The walk's loop over the block and its depth tracking are left
-/// to the fuzz target `devmgr-firmware`, the replay of the checked-in inputs
-/// and the unit tests.
+/// any place, the walk's step over the block from any state, the step of an
+/// ECAM node's read from any state, the reads of a node's `reg`,
+/// `bus-range` and `linux,pci-domain`, its window, the `compatible` match
+/// and the fallback segments. What lies outside the proofs is the loops that
+/// drive the steps: `FdtWalker` from one token to the next, the walks of
+/// `find_pci_ecams` and `extract_ecam` over it, and the collection of the
+/// windows; the fuzz target `devmgr-firmware`, the replay of the checked-in
+/// inputs and the unit tests check them.
 #[cfg(kani)]
 mod proofs
 {
-    use super::Fdt;
+    use super::{Fdt, FdtEvent, NodeRead, Scan};
     use crate::EcamLocation;
     use crate::property::dtb as property;
 
@@ -1263,9 +1378,91 @@ mod proofs
                 kani::any(),
             )
         };
-        let mut found = [window(), window()];
+        let before = [window(), window()];
+        let mut found = before;
         let len: usize = kani::any();
-        kani::assume(len <= found.len());
-        property::fallback_holds(&mut found[..len]);
+        kani::assume(len <= before.len());
+        property::fallback_holds(&before[..len], &mut found[..len]);
+    }
+
+    /// Every step of the walk over the block, from any state, takes its event
+    /// as the walk does: a node opening at any offset, a node closing, a
+    /// `#address-cells` and a `#size-cells` of up to 4 bytes, a
+    /// `compatible` that holds the ECAM entry first, after another entry or
+    /// not at all, and any other property, at any depth. The loops are the
+    /// `compatible` entries' bytes and the property names'.
+    #[kani::proof]
+    #[kani::unwind(27)]
+    fn every_walk_step_takes_its_event()
+    {
+        let mut scan = Scan {
+            depth: kani::any(),
+            cells: kani::any(),
+            starts: kani::any(),
+        };
+        let bytes: [u8; 4] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let data = &bytes[..len];
+        let compatible: &[u8] = match kani::any::<u8>() % 3
+        {
+            0 => b"pci-host-ecam-generic\0",
+            1 => b"x\0pci-host-ecam-generic",
+            _ => b"pci-host-ecam-generi\0",
+        };
+        let event = match kani::any::<u8>() % 6
+        {
+            0 => FdtEvent::BeginNode { start: kani::any() },
+            1 => FdtEvent::EndNode,
+            2 => FdtEvent::Prop {
+                name: b"#address-cells",
+                data,
+            },
+            3 => FdtEvent::Prop {
+                name: b"#size-cells",
+                data,
+            },
+            4 => FdtEvent::Prop {
+                name: b"compatible",
+                data: compatible,
+            },
+            _ => FdtEvent::Prop { name: b"reg", data },
+        };
+        property::scan_step_holds(&mut scan, &event);
+    }
+
+    /// Every step of an ECAM node's read, from any state and in any cells,
+    /// takes its event as the read does: a node opening, a node closing, a
+    /// `reg`, a `bus-range` and a `linux,pci-domain` of up to 16 bytes, which
+    /// hold a `reg` of two cells each, and any other property. The loops are
+    /// the property names' bytes.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_ecam_node_step_takes_its_event()
+    {
+        let mut node = NodeRead {
+            depth: kani::any(),
+            reg: kani::any(),
+            bus: kani::any(),
+            domain: kani::any(),
+        };
+        let bytes: [u8; 16] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let data = &bytes[..len];
+        let name: &[u8] = match kani::any::<u8>() % 4
+        {
+            0 => b"reg",
+            1 => b"bus-range",
+            2 => b"linux,pci-domain",
+            _ => b"compatible",
+        };
+        let event = match kani::any::<u8>() % 3
+        {
+            0 => FdtEvent::BeginNode { start: kani::any() },
+            1 => FdtEvent::EndNode,
+            _ => FdtEvent::Prop { name, data },
+        };
+        property::node_step_holds(&mut node, &event, (kani::any(), kani::any()));
     }
 }

@@ -469,16 +469,14 @@ fn range_of(bytes: &[u8], part: &[u8]) -> (usize, usize)
     (start, start.wrapping_add(part.len()))
 }
 
-/// [`aml::record`] records `Name(name, value)`, its value the `size` bytes
-/// at `value` of `bytes`, into a device, as [`record`] does: into one that
-/// holds nothing yet, and into one whose every field already holds a value.
-pub(crate) fn record_holds(bytes: &[u8], name: [u8; 4], value: usize, size: usize)
+/// [`aml::collect`] takes the term `term` of the term list `bytes` into a
+/// device as the walk of a device's body does: a `Name` with a name, its
+/// value the `size` bytes at `value`, is recorded as [`record`] does; a
+/// `Method` called `_HID`, `_CID` or `_CRS` makes it dynamic; every other
+/// term leaves it as it is. Judged into a device that holds nothing yet, and
+/// into one whose every field already holds a value.
+pub(crate) fn collect_holds(bytes: &[u8], term: &Term)
 {
-    let Some(data) = value.checked_add(size).and_then(|end| bytes.get(..end))
-    else
-    {
-        return;
-    };
     let id = Id::new(b"PRIOR");
     let ident = Ident::new(b"PRIOR");
     let prior = (
@@ -501,9 +499,31 @@ pub(crate) fn record_holds(bytes: &[u8], name: [u8; 4], value: usize, size: usiz
     );
     for (mut c, mut d) in [(Collect::default(), Device::default()), prior]
     {
-        aml::record(&mut c, name, bytes, value, size);
-        record(data, &mut d, name, value);
-        assert!(same(bytes, &c, &d), "a Name recorded against its value");
+        aml::collect(&mut c, bytes, term);
+        match *term
+        {
+            Term::Name {
+                name: Some(name),
+                value,
+                size,
+            } =>
+            {
+                if let Some(data) = value.checked_add(size).and_then(|end| bytes.get(..end))
+                {
+                    record(data, &mut d, name, value);
+                }
+            }
+            Term::Method {
+                name: Some(name), ..
+            } if matches!(&name, b"_HID" | b"_CID" | b"_CRS") => d.dynamic = true,
+            Term::Scope { .. }
+            | Term::Device { .. }
+            | Term::Name { .. }
+            | Term::Method { .. }
+            | Term::Skip { .. } =>
+            {}
+        }
+        assert!(same(bytes, &c, &d), "a term taken into a device");
     }
 }
 
@@ -578,33 +598,29 @@ fn walk(
                     out.push(d);
                 }
             }
-            Term::Name {
-                name: Some(name),
-                value,
-                size,
-            } =>
-            {
-                if let (Some(d), Some(data)) = (
-                    dev.as_deref_mut(),
-                    value.checked_add(size).and_then(|e| bytes.get(..e)),
-                )
-                {
-                    record_holds(bytes, name, value, size);
-                    record(data, d, name, value);
-                }
-            }
-            Term::Method {
-                name: Some(name), ..
-            } =>
+            Term::Name { .. } | Term::Method { .. } | Term::Skip { .. } =>
             {
                 if let Some(d) = dev.as_deref_mut()
-                    && matches!(&name, b"_HID" | b"_CID" | b"_CRS")
                 {
-                    d.dynamic = true;
+                    collect_holds(bytes, &term);
+                    if let Term::Name {
+                        name: Some(name),
+                        value,
+                        size,
+                    } = term
+                        && let Some(data) = value.checked_add(size).and_then(|e| bytes.get(..e))
+                    {
+                        record(data, d, name, value);
+                    }
+                    else if let Term::Method {
+                        name: Some(name), ..
+                    } = term
+                        && matches!(&name, b"_HID" | b"_CID" | b"_CRS")
+                    {
+                        d.dynamic = true;
+                    }
                 }
             }
-            Term::Name { .. } | Term::Method { .. } | Term::Skip { .. } =>
-            {}
         }
         match term.end()
         {

@@ -374,23 +374,13 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
                     self.count = self.count.saturating_add(1);
                 }
             }
-            Term::Name { name, value, size } =>
-            {
-                if let (Some(c), Some(name)) = (dev.as_deref_mut(), name)
-                {
-                    record(c, name, buf, value, size);
-                }
-            }
-            Term::Method { name, .. } =>
+            Term::Name { .. } | Term::Method { .. } | Term::Skip { .. } =>
             {
                 if let Some(c) = dev.as_deref_mut()
-                    && matches!(name, Some(n) if is_dynamic_name(n))
                 {
-                    c.dynamic = true;
+                    collect(c, buf, &term);
                 }
             }
-            Term::Skip { .. } =>
-            {}
         }
         term.end()
     }
@@ -402,14 +392,33 @@ fn is_dynamic_name(name: [u8; 4]) -> bool
     matches!(&name, b"_HID" | b"_CID" | b"_CRS")
 }
 
+/// Take the term `term` of the term list `buf` that a device's body is into
+/// the device `c`: a `Name`'s value is recorded, and a `Method` called
+/// `_HID`, `_CID` or `_CRS` makes the device's identity dynamic. Every other
+/// term leaves the device as it is.
+pub(crate) fn collect<'a>(c: &mut Collect<'a>, buf: &'a [u8], term: &Term)
+{
+    match *term
+    {
+        Term::Name {
+            name: Some(name),
+            value,
+            size,
+        } => record(c, name, buf, value, size),
+        Term::Method {
+            name: Some(name), ..
+        } if is_dynamic_name(name) => c.dynamic = true,
+        Term::Scope { .. }
+        | Term::Device { .. }
+        | Term::Name { .. }
+        | Term::Method { .. }
+        | Term::Skip { .. } =>
+        {}
+    }
+}
+
 /// Record the value of `Name(name, <data at value..value+size>)` into `c`.
-pub(crate) fn record<'a>(
-    c: &mut Collect<'a>,
-    name: [u8; 4],
-    buf: &'a [u8],
-    value: usize,
-    size: usize,
-)
+fn record<'a>(c: &mut Collect<'a>, name: [u8; 4], buf: &'a [u8], value: usize, size: usize)
 {
     let Some(data) = value.checked_add(size).and_then(|end| buf.get(..end))
     else
@@ -1353,12 +1362,15 @@ mod tests
 
 /// The proofs of the walk's steps and of the adapter (docs/testing.md
 /// § Bounded verification), on the checks of `crate::property::aml`: the
-/// term at any place of a term list, the record of a `Name`'s value, the
-/// rule that reports a device, one descriptor of every kind and length
-/// through the adapter, and every short template whole. The term lists'
-/// loops and their recursion into a `Scope` or `Device` are left to the fuzz
-/// target `devmgr-firmware`, the replay of the checked-in inputs and the
-/// unit tests.
+/// term at any place of a term list, the take of a term into the device
+/// whose body holds it (a `Name`'s value of every kind, a `Method`, every
+/// other term), the rule that reports a device, one descriptor of every kind
+/// and length through the adapter, and every short template whole. What lies
+/// outside the proofs is the loops that drive the steps: `Walker::term_list`
+/// from one term to the next, its recursion into a `Scope` or `Device` under
+/// `MAX_DEPTH`, and the descriptor loop of `crs_resources` past the short
+/// templates; the fuzz target `devmgr-firmware`, the replay of the
+/// checked-in inputs and the unit tests check them.
 #[cfg(kani)]
 mod proofs
 {
@@ -1368,7 +1380,7 @@ mod proofs
         OP_EXT_PREFIX, OP_EXTERNAL, OP_IF, OP_METHOD, OP_NAME, OP_SCOPE, OP_WHILE,
     };
 
-    use super::{Collect, Id, MAX_CIDS};
+    use super::{Collect, Id, MAX_CIDS, Term};
     use crate::property::aml as property;
 
     /// Every term list of `N` bytes whose term at place 1 starts with
@@ -1514,7 +1526,12 @@ mod proofs
         let bytes: [u8; N] = kani::any();
         if let Some(size) = ::aml::encoding::data_object_len(&bytes, 1)
         {
-            property::record_holds(&bytes, name, 1, size);
+            let term = Term::Name {
+                name: Some(name),
+                value: 1,
+                size,
+            };
+            property::collect_holds(&bytes, &term);
         }
     }
 
@@ -1556,10 +1573,44 @@ mod proofs
         name_at_place_one_records::<9>(*b"_CRS");
     }
 
-    /// Every collected device is reported by its identity, its `_STA` and its
-    /// methods alone, with the fields it holds. The loop is the `_CID` slots.
+    /// Every term other than a named `Name` is taken into a device by its
+    /// kind and name alone: a `Method` of any name, a `Name` without one, and
+    /// a `Scope`, a `Device` and a skipped construct, at any offsets. The
+    /// loops are the `_CID` slots and the identifier's bytes.
     #[kani::proof]
-    #[kani::unwind(5)]
+    #[kani::unwind(8)]
+    fn every_other_term_is_taken_by_its_name()
+    {
+        let bytes = [0u8; 2];
+        let term = match kani::any::<u8>() % 5
+        {
+            0 => Term::Method {
+                name: kani::any(),
+                end: kani::any(),
+            },
+            1 => Term::Name {
+                name: None,
+                value: kani::any(),
+                size: kani::any(),
+            },
+            2 => Term::Scope {
+                body: kani::any(),
+                end: kani::any(),
+            },
+            3 => Term::Device {
+                body: kani::any(),
+                end: kani::any(),
+            },
+            _ => Term::Skip { end: kani::any() },
+        };
+        property::collect_holds(&bytes, &term);
+    }
+
+    /// Every collected device is reported by its identity, its `_STA` and its
+    /// methods alone, with the fields it holds. The loops are the `_CID` slots
+    /// and the identifier's bytes.
+    #[kani::proof]
+    #[kani::unwind(8)]
     fn every_device_reports_by_its_identity()
     {
         let id = |present: bool| if present { Id::new(b"PNP0501") } else { None };

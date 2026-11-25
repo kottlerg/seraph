@@ -546,8 +546,8 @@ A marker a tool matches is part of its line: a line of the kind the document tha
 marker names carries it, exactly as that document gives it, and the rules above on the prefix, on
 case and punctuation, and on the level do not apply to the marker itself. Two are the terminal
 pass markers ([testing.md](testing.md#reporting-marker) § Reporting marker) and the `FATAL:`
-marker on which `cargo xtask run` fails a boot
-([xtask/README.md](../xtask/README.md#cargo-xtask-run) § `cargo xtask run`).
+marker, which a line reporting the system halting carries, and on which `cargo xtask run` fails a
+boot ([xtask/README.md](../xtask/README.md#cargo-xtask-run) § `cargo xtask run`).
 
 Each example shows a line before and after these rules. The after line is in the console layout
 of the eight-level logging design (design intent; not yet implemented: today a line renders as

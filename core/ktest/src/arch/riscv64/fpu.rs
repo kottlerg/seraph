@@ -19,7 +19,8 @@
 //! the image `SYS_THREAD_READ_EXT_REGS` reads (`crate::integration::thread_ext_regs`).
 //! [`initial_state_check`], [`control_state_check`] and
 //! [`inexact_divide_check`] read the control state a thread starts with
-//! (`crate::unit::fpu::initial_state`).
+//! (`crate::unit::fpu::initial_state`). [`touch_vector_register`] is the vector-register
+//! touch of the `fpu=both` case of `crate::bench::ipc`.
 
 /// Load `pattern` into f0..f31 and lane 0 of v0..v31, spin `iters` iterations so the timer can
 /// preempt the thread, then capture the registers; returns the mismatched-lane
@@ -827,4 +828,27 @@ pub fn inexact_divide_check() -> Result<(), u64>
         );
     }
     if fcsr == FCSR_NX { Ok(()) } else { Err(fcsr) }
+}
+
+/// Write `value` into element 0 of `v1` and read it back: the vector-register touch each side
+/// of the `fpu=both` case of `crate::bench::ipc` makes once per round trip, as a std-built
+/// thread's vector copies do.
+pub fn touch_vector_register(value: u64)
+{
+    // SAFETY: the asm sets VL and VTYPE and moves between a general-purpose register and v1,
+    // state no compiler-generated code of this soft-float crate uses; no memory is accessed.
+    // `.option arch` enables V for these instructions only.
+    unsafe {
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +v",
+            "vsetivli zero, 1, e64, m1, ta, ma",
+            "vmv.s.x v1, {v}",
+            "vmv.x.s {o}, v1",
+            ".option pop",
+            v = in(reg) value,
+            o = lateout(reg) _,
+            options(nomem, nostack),
+        );
+    }
 }

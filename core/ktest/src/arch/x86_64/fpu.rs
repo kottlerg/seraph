@@ -18,7 +18,8 @@
 //! the image `SYS_THREAD_READ_EXT_REGS` reads (`crate::integration::thread_ext_regs`).
 //! [`initial_state_check`], [`control_state_check`] and
 //! [`inexact_divide_check`] read the control state a thread starts with
-//! (`crate::unit::fpu::initial_state`).
+//! (`crate::unit::fpu::initial_state`). [`touch_vector_register`] is the vector-register
+//! touch of the `fpu=both` case of `crate::bench::ipc`.
 
 /// Load `pattern` into xmm0..xmm15, spin `iters` iterations so the timer can
 /// preempt the thread, then capture the registers; returns the mismatched-lane
@@ -479,5 +480,24 @@ pub fn inexact_divide_check() -> Result<(), u64>
     else
     {
         Err(mxcsr)
+    }
+}
+
+/// Write `value` into `xmm0` and read it back: the vector-register touch each side of the
+/// `fpu=both` case of `crate::bench::ipc` makes once per round trip, as a std-built thread's SIMD
+/// copies do. SSE2 only, which every x86-64 CPU has.
+pub fn touch_vector_register(value: u64)
+{
+    // SAFETY: the two moves are between a general-purpose register and xmm0, which the asm
+    // declares clobbered; no memory is accessed.
+    unsafe {
+        core::arch::asm!(
+            "movq xmm0, {v}",
+            "movq {o}, xmm0",
+            v = in(reg) value,
+            o = lateout(reg) _,
+            out("xmm0") _,
+            options(nomem, nostack, preserves_flags),
+        );
     }
 }

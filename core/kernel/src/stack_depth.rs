@@ -304,7 +304,11 @@ fn idle_used_bytes(cpu: usize) -> u64
 /// class when the kernel could not locate the handoff stack (its base mark was
 /// absent at the derived bottom: an overflow, or a bootloader that does not
 /// mark the stack).
+// Kept out of line: inlined, its scans' loops widen the frame of
+// `sys_system_info`, whose every selector, the null-syscall benchmark's
+// among them, then pays the larger prologue.
 #[cfg(not(test))]
+#[inline(never)]
 pub fn high_water(class: u64) -> Result<u64, SyscallError>
 {
     match class

@@ -24,12 +24,14 @@
 //!   `Failed(Role)`, `Untrusted`) and svcmgr reports the refused launch. The kernel and
 //!   `/programs/terminal` each carry a record of that untrusted key before
 //!   their own, which the bootloader and procmgr skip, and the boot reaches
-//!   the terminal's READY line. Two drivers of `/services/drivers/`, of
-//!   devices the launch does not attach, are replaced: `virtio-console`
-//!   with a byte of its declaration note flipped, and `test-dma` unsigned;
-//!   procmgr refuses each at devmgr's verified read of its declaration
-//!   (`Failed(BodyHash)`, `Parse(Magic)`), before devmgr parses a byte of
-//!   it. On riscv64 the platform description table
+//!   the terminal's READY line. Two drivers of `/services/drivers/` that
+//!   devmgr creates from no file of the directory are replaced:
+//!   `virtio-console`, whose device the launch does not attach, with a byte
+//!   of its declaration note flipped, and the directory's copy of
+//!   `virtio-blk`, whose one device, the boot disk, the boot pass binds from
+//!   its boot module, unsigned; procmgr refuses each at devmgr's verified
+//!   read of its declaration (`Failed(BodyHash)`, `Parse(Magic)`), before
+//!   devmgr parses a byte of it. On riscv64 the platform description table
 //!   `/config/devmgr/platform/qemu-virt.platform` has a body byte flipped
 //!   too: procmgr refuses it at devmgr's verified read (`Failed(BodyHash)`),
 //!   and devmgr passes it over and adds no platform-table record.

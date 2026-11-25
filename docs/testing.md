@@ -881,12 +881,14 @@ sysroot itself is never changed:
    (`Failed(BodyHash)`, `Failed(Role)`, `Untrusted`) and svcmgr reports each refused launch.
    The kernel and `/programs/terminal` each carry a record of that key before their own, which
    the bootloader and procmgr skip, and the boot reaches the terminal's READY line. Two drivers of
-   `/services/drivers/`, of devices the launch does not attach, are replaced too:
-   `virtio-console` with a byte of its declaration note flipped and `test-dma` unsigned. procmgr
-   refuses each at devmgr's verified read (`Failed(BodyHash)`, `Parse(Magic)`). On riscv64
-   the platform description table `/config/devmgr/platform/qemu-virt.platform` also has a body
-   byte flipped: procmgr refuses devmgr's verified read of it, `Failed(BodyHash)`, and devmgr
-   passes it over and adds no platform-table record.
+   `/services/drivers/` that devmgr creates from no file of the directory are replaced too:
+   `virtio-console`, whose device the launch does not attach, with a byte of its declaration note
+   flipped, and the directory's copy of `virtio-blk`, whose one device, the boot disk, the boot
+   pass binds from its boot module, unsigned. procmgr refuses each at devmgr's verified read
+   (`Failed(BodyHash)`, `Parse(Magic)`). On riscv64 the platform description table
+   `/config/devmgr/platform/qemu-virt.platform` also has a body byte flipped: procmgr refuses
+   devmgr's verified read of it, `Failed(BodyHash)`, and devmgr passes it over and adds no
+   platform-table record.
 6. `configuration`: a bootloader built under the build's trust store with two more anchors, one
    trusted for every role but configuration and one for configuration alone, and, in
    `/config/svcmgr/services/`, `timed.svc` with a body byte flipped, `pwrmgr.svc` unsigned,

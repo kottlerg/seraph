@@ -961,8 +961,10 @@ retried is `read_retryable` in `services/devmgr/src/decls.rs`.
   throughout. A retry whose record was removed meanwhile (a hotplug removal) is not made, and its
   caps are released. Once the retries are given up the record stays bound with no driver. An entry
   whose read a pass could not complete is read again on the same delays, and its driver then binds
-  the records still unbound that its declaration matches, as the pass would have bound them; those
-  records stay unbound meanwhile, so another pass may bind them first.
+  the records still unbound that its declaration matches. The pass binds its other entries'
+  drivers without it, so a driver of the same pass that also matches one of those records (one the
+  unread entry would have outranked, or tied with) binds it first, for the boot, as can a driver
+  of a later pass.
 - **Which starts.** Every start from a drivers directory: the drivers-directory pass, a
   `BIND_DRIVERS` pass, a hot-added function's bind (the hotplug add job binds through the
   drivers-directory pass), and every restart. A boot-pass start is not retried: its binary is a

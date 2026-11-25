@@ -3,7 +3,8 @@
 
 // core/ktest/src/bench/ipc.rs
 
-//! Synchronous IPC round-trip benchmark, in three message sizes.
+//! Synchronous IPC round-trip benchmark, in three message sizes and one case
+//! that uses the vector registers.
 //!
 //! Each case spawns one child caller that loops `ipc_call`; the parent loops
 //! `ipc_recv` / `ipc_reply`, the request and the reply carrying the case's
@@ -11,7 +12,11 @@
 //! cases, the variant `words=` of the `ipc_round_trip` line, are an empty
 //! message, the largest message the message registers carry, and one word
 //! more, which travels in the IPC buffer page (docs/ipc-design.md § Message
-//! Format).
+//! Format). ktest is soft-float, so none of these touches the FPU. The fourth
+//! case, `words=0 fpu=both`, is the empty message with each side writing and
+//! reading one vector register per round trip, as every std-built thread does
+//! through its SIMD copies: the line without `fpu=` minus this one is the cost
+//! of the FPU and vector state on the IPC path.
 
 use bench::Value;
 use ipc::IpcMessage;
@@ -23,11 +28,47 @@ use syscall::{
 use super::Harness;
 use crate::{ChildStack, spawn};
 
-/// The benchmark's name; each case's line carries its `words=`.
+/// The benchmark's name; each case's line carries its `words=`, and the case
+/// that uses the vector registers its `fpu=both`.
 const NAME: &str = "ipc_round_trip";
 
-/// The cases: the data words of the request and the reply.
-const CASES: [usize; 3] = [0, REG_WORDS, REG_WORDS + 1];
+/// Whether the two sides of a case touch a vector register each round trip.
+#[derive(Clone, Copy)]
+enum Fpu
+{
+    /// Neither side does; the line carries no `fpu=`.
+    None,
+    /// Both sides do, once per round trip; the line carries `fpu=both`.
+    Both,
+}
+
+/// One case: the data words of the request and the reply, and the FPU use.
+#[derive(Clone, Copy)]
+struct Case
+{
+    words: usize,
+    fpu: Fpu,
+}
+
+/// The cases.
+const CASES: [Case; 4] = [
+    Case {
+        words: 0,
+        fpu: Fpu::None,
+    },
+    Case {
+        words: REG_WORDS,
+        fpu: Fpu::None,
+    },
+    Case {
+        words: REG_WORDS + 1,
+        fpu: Fpu::None,
+    },
+    Case {
+        words: 0,
+        fpu: Fpu::Both,
+    },
+];
 
 /// The largest message the message registers carry. A literal, so the bench
 /// builds unchanged at a head before `MSG_REGS_DATA_MAX` existed, for a
@@ -50,6 +91,8 @@ struct CallerArgs
     case: usize,
     /// Data words of each request.
     words: usize,
+    /// Whether the child touches a vector register before each call.
+    fpu: Fpu,
 }
 
 static CALLER_ARGS: spawn::ArgBlock<CallerArgs, { CASES.len() }> =
@@ -59,6 +102,7 @@ static CALLER_ARGS: spawn::ArgBlock<CallerArgs, { CASES.len() }> =
         n: 0,
         case: 0,
         words: 0,
+        fpu: Fpu::None,
     });
 
 /// IPC pages of the [`ipc_caller_entry`] children, one per case.
@@ -85,6 +129,7 @@ extern "C" fn ipc_caller_entry(arg: u64) -> !
         n,
         case,
         words,
+        fpu,
     } = unsafe { spawn::child_args(arg) };
 
     let Ok(buf_addr) = crate::IpcPage::addr_at(core::ptr::addr_of_mut!(IPC_CALLER_IPC_PAGES), case)
@@ -104,8 +149,9 @@ extern "C" fn ipc_caller_entry(arg: u64) -> !
     let ipc_buf = buf_addr as *mut u64;
     let msg = payload(0, words);
 
-    for _ in 0..n
+    for i in 0..n
     {
+        touch_fpu(fpu, i);
         // SAFETY: buf_addr was registered as this thread's IPC buffer above.
         if unsafe { ipc::ipc_call(ep_slot, &msg, ipc_buf) }.is_err()
         {
@@ -116,37 +162,61 @@ extern "C" fn ipc_caller_entry(arg: u64) -> !
     thread_exit()
 }
 
+/// Touch a vector register when the case asks for it.
+fn touch_fpu(fpu: Fpu, value: u64)
+{
+    match fpu
+    {
+        Fpu::None =>
+        {}
+        Fpu::Both => crate::arch::fpu::touch_vector_register(value),
+    }
+}
+
+/// A case's variant parameters as its line writes them, for a SKIP line.
+struct Label(Case);
+
+impl core::fmt::Display for Label
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match self.0.fpu
+        {
+            Fpu::None => write!(f, "words={}", self.0.words),
+            Fpu::Both => write!(f, "words={} fpu=both", self.0.words),
+        }
+    }
+}
+
 /// Run every case of [`CASES`] in turn. A case that does not complete every
 /// round trip ends the benchmark: each later case logs a SKIP line.
 pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, h: &mut Harness)
 {
     let mut failed = false;
-    for (case, &words) in CASES.iter().enumerate()
+    for (case, &c) in CASES.iter().enumerate()
     {
         if failed
         {
             h.skip(
                 NAME,
-                format_args!("words={words}: an earlier case did not complete"),
+                format_args!("{}: an earlier case did not complete", Label(c)),
             );
             continue;
         }
-        failed = !bench_case(ctx, h, case, words);
+        failed = !bench_case(ctx, h, case, c);
     }
 }
 
-/// Run case `case` of [`CASES`], `words` data words each way. Returns whether
-/// every round trip completed, which leaves its child on its way to exit,
-/// never parked in `ipc_call`.
-fn bench_case(ctx: &crate::TestContext, h: &mut Harness, case: usize, words: usize) -> bool
+/// Run case `case` of [`CASES`], `c`. Returns whether every round trip
+/// completed, which leaves its child on its way to exit, never parked in
+/// `ipc_call`.
+fn bench_case(ctx: &crate::TestContext, h: &mut Harness, case: usize, c: Case) -> bool
 {
+    let label = Label(c);
     let Ok(ep) = cap_create_endpoint(ctx.memory_base)
     else
     {
-        h.skip(
-            NAME,
-            format_args!("words={words}: cap_create_endpoint failed"),
-        );
+        h.skip(NAME, format_args!("{label}: cap_create_endpoint failed"));
         return false;
     };
     let Ok(done) = cap_create_notification(ctx.memory_base)
@@ -155,7 +225,7 @@ fn bench_case(ctx: &crate::TestContext, h: &mut Harness, case: usize, words: usi
         cap_delete(ep).ok();
         h.skip(
             NAME,
-            format_args!("words={words}: cap_create_notification failed"),
+            format_args!("{label}: cap_create_notification failed"),
         );
         return false;
     };
@@ -164,11 +234,11 @@ fn bench_case(ctx: &crate::TestContext, h: &mut Harness, case: usize, words: usi
     {
         cap_delete(done).ok();
         cap_delete(ep).ok();
-        h.skip(NAME, format_args!("words={words}: new_child failed"));
+        h.skip(NAME, format_args!("{label}: new_child failed"));
         return false;
     };
 
-    let completed = run_round_trips(ctx, ep, done, &child, h, case, words);
+    let completed = run_round_trips(ctx, ep, done, &child, h, case, c);
 
     // One cleanup path for every exit: deleting the child's Thread cap also
     // ends a child still parked in `ipc_call` after an early break.
@@ -180,7 +250,8 @@ fn bench_case(ctx: &crate::TestContext, h: &mut Harness, case: usize, words: usi
 }
 
 /// Start case `case`'s caller child on `ep`, serve [`Harness::iters`] round
-/// trips of `words` data words each way, and report the result. Returns
+/// trips of `c.words` data words each way, touching a vector register before
+/// each reply when `c.fpu` asks for it, and report the result. Returns
 /// whether every round trip completed; returns `false` early, leaving cleanup
 /// to the caller, when the child cannot be set up.
 fn run_round_trips(
@@ -190,19 +261,17 @@ fn run_round_trips(
     child: &spawn::SpawnedChild,
     h: &mut Harness,
     case: usize,
-    words: usize,
+    c: Case,
 ) -> bool
 {
     use syscall_abi::RIGHTS_EP_SEND_GRANT;
+    let label = Label(c);
     let n = u64::from(h.iters());
 
     let Ok(child_ep) = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
     else
     {
-        h.skip(
-            NAME,
-            format_args!("words={words}: cap_copy of endpoint failed"),
-        );
+        h.skip(NAME, format_args!("{label}: cap_copy of endpoint failed"));
         return false;
     };
     let Ok(child_done) = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -210,7 +279,7 @@ fn run_round_trips(
     {
         h.skip(
             NAME,
-            format_args!("words={words}: cap_copy of notification failed"),
+            format_args!("{label}: cap_copy of notification failed"),
         );
         return false;
     };
@@ -225,7 +294,8 @@ fn run_round_trips(
                 done: child_done,
                 n,
                 case,
-                words,
+                words: c.words,
+                fpu: c.fpu,
             },
         )
     };
@@ -234,7 +304,7 @@ fn run_round_trips(
         (unsafe { ChildStack::top_at(core::ptr::addr_of!(BENCH_IPC_STACKS), case) })
     else
     {
-        h.skip(NAME, format_args!("words={words}: no child stack"));
+        h.skip(NAME, format_args!("{label}: no child stack"));
         return false;
     };
 
@@ -242,15 +312,15 @@ fn run_round_trips(
     // `ChildStack`, on which no other live thread runs (`ChildStack`'s rule).
     if unsafe { spawn::configure_and_start(child, ipc_caller_entry, stack_top, arg) }.is_err()
     {
-        h.skip(NAME, format_args!("words={words}: child start failed"));
+        h.skip(NAME, format_args!("{label}: child start failed"));
         return false;
     }
 
-    let reply = payload(0, words);
+    let reply = payload(0, c.words);
     let start = super::Placement::read(ctx.thread_cap, child.th);
     let (mut samples, counters) = h.recorder();
     let mut completed: u64 = 0;
-    for _ in 0..n
+    for i in 0..n
     {
         let t0 = counters.read();
         // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -258,6 +328,7 @@ fn run_round_trips(
         {
             break;
         }
+        touch_fpu(c.fpu, i);
         // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
         if unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }.is_err()
         {
@@ -279,11 +350,17 @@ fn run_round_trips(
     }
 
     let extras = super::placement_extras(start.as_ref(), end.as_ref());
-    h.report(
-        NAME,
-        &[("words", Value::Num(words as u64))],
-        summary,
-        extras.as_ref().map_or(&[], |e| &e[..]),
-    );
+    let extras = extras.as_ref().map_or(&[][..], |e| &e[..]);
+    let words = ("words", Value::Num(c.words as u64));
+    match c.fpu
+    {
+        Fpu::None => h.report(NAME, &[words], summary, extras),
+        Fpu::Both => h.report(
+            NAME,
+            &[words, ("fpu", Value::Word("both"))],
+            summary,
+            extras,
+        ),
+    }
     completed == n
 }

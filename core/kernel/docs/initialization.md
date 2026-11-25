@@ -339,8 +339,7 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    and has no virtual interrupts, Key Locker, protection keys or user interrupts (each AP
    repeats this step in interrupts::init_ap)
 2. Enable XSAVE (x87 | SSE | AVX in XCR0), set CR0.MP and CR0.NE and clear CR0.EM and
-   CR0.AM (x87 errors as #MF, #NM for WAIT under TS, no ring-3 alignment checking), and
-   set CR0.TS for lazy FPU/SIMD save-restore
+   CR0.AM (x87 errors as #MF, no ring-3 alignment checking); CR0.TS stays clear
 3. Construct and install the permanent GDT and the BSP's TSS (the segment descriptors are
    loaded since Phase 1; this fills the TSS descriptor and loads the table again with it):
    - Null descriptor (index 0)
@@ -394,7 +393,7 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Clear SIE (interrupts stay disabled until timer::init sets SIE at the end of this phase)
    - Clear SPP (so sret returns to U-mode by default)
    - Clear SUM (no supervisor access to user pages)
-   - Set FS and VS Off for lazy FPU/vector save-restore
+   - Set FS and VS Off (a thread's first F/D/V instruction traps and makes its state live)
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Write scounteren whole with CY alone, whatever the firmware left, so U-mode reads the
    cycle counter and no other (each AP writes the same in interrupts::init_ap)

@@ -520,12 +520,14 @@ Registry).
    within the spin, so steps 8-20 are skipped inline and deferred off-CPU instead — see
    [Self-teardown](#self-teardown-the-caller-is-the-freed-thread).
 
-4. **No `fpu_owner` sweep is needed after eager save (#108).** The `#NM` handler only ever installs
-   the currently Running thread on its CPU as `fpu_owner`. `switch_out_save` clears the slot on
-   switch-out, after the thread is already requeued or committed to its next state and before the
-   `context_saved` Release that the switch publishes after it. By the
-   time steps 8 and 9 above have completed — the thread has switched out on every CPU and
-   `context_saved == 1` — no CPU's owner slot can name this TCB. Steps 8-9's
+4. **No `fpu_owner` sweep is needed.** `fpu_owner` is compared, never dereferenced, so a slot
+   that still names this TCB after its free is harmless: a TCB later built at the same address
+   starts with `fpu_cpu` naming no CPU, so no switch-in takes the registers for its state
+   ([scheduler.md](scheduler.md) § What Gets Saved and Restored). `switch_out_save` runs after the
+   thread is already requeued or committed to its next state and before the `context_saved`
+   Release that the switch publishes after it, so by the time steps 8 and 9 above have
+   completed — the thread has switched out on every CPU and `context_saved == 1` — its state is
+   saved. Steps 8-9's
    interrupt-enabled-while-spinning discipline is still required to prevent the spin from
    deadlocking against a peer CPU's TLB-shootdown IPI; without it, two CPUs in mutual TLB shootdown
    would deadlock.

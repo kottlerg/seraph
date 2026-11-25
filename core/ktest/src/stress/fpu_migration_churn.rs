@@ -17,9 +17,9 @@
 //!    asserts no mismatch.
 //!
 //! The single-cycle version of this test (`preempt_isolation_cross_cpu` in
-//! `core/ktest/src/unit/fpu.rs`) guards the eager-save migration fix for
+//! `core/ktest/src/unit/fpu.rs`) guards the switch-out save migration fix for
 //! #108 on cold caches; this stress version exercises ~100 cycles to widen
-//! the race window for any residual eager-save / lazy-restore inconsistency
+//! the race window for any residual save / load inconsistency
 //! under load.
 //!
 //! Skipped when `cpu_count < 2` (UP boot has nothing to migrate across).

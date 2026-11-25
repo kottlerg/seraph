@@ -5,24 +5,32 @@
 
 //! RISC-V extended-state (F / D / V) control primitives.
 //!
-//! Concentrates the unsafe surface for FP and Vector state management.
-//! The boot invariant is `sstatus.FS = sstatus.VS = 00 (Off)`. Any F/D or V
-//! instruction in U-mode raises an illegal-instruction trap (`scause = 2`);
-//! the trap handler, which takes such a trap with `FS` Off as the lazy trap
-//! ([`super::encoding::is_lazy_fp_v_trap`]), lazy-restores via
-//! [`lazy_restore_fp_v`]. An F/D/V instruction that traps with the units on
-//! is the thread's illegal-instruction fault.
+//! Concentrates the unsafe surface for FP and Vector state management. A user
+//! thread's state is live in the registers whenever it runs in user mode, and no
+//! other thread's is (`sched::fpu_switch`). `sstatus.FS` and `VS` are Off at
+//! boot ([`enable_fpu_vector`]) and after every switch-out; a trap from user
+//! mode leaves them as the thread had them, Clean or Dirty, until
+//! [`switch_out_save`] reads and turns them Off. A save, a load or a scrub
+//! here turns them on for its own instructions only. A user thread resumes with
+//! the values its trap frame holds, which [`switch_in_restore`] and
+//! [`first_use_trap`] write, since `trap_entry` restores `sstatus` from the
+//! frame before `sret`.
 //!
-//! The scheduler calls [`switch_out_save`] on switch-out of every user
-//! thread. When `sstatus.FS == 11 (Dirty)` the live F/D register file is
-//! saved to the thread's per-TCB area; when `sstatus.VS == 11 (Dirty)` the
-//! V register file (plus vstart/vl/vtype/vcsr) is likewise saved. Live
-//! `sstatus.FS/VS` are then forced back to `00 (Off)` to re-arm the lazy
-//! trap, **and** the thread's trap-frame `sstatus.FS/VS` bits are also
-//! cleared so the next `sret` for this thread leaves U-mode in `Off`. That
-//! second update is essential: `trap_entry` restores `sstatus` from the
-//! frame on exit, so any live-CSR change made during dispatch is otherwise
-//! discarded across `sret`.
+//! - [`switch_out_save`] saves the F/D file when `FS` is Dirty and the V file
+//!   when `VS` is Dirty, turns both Off, and clears them in the thread's frame.
+//!   This CPU's `fpu_owner` keeps naming the thread.
+//! - [`switch_in_restore`] gives a thread that uses its state (its
+//!   `ExtendedState::in_use`) that state: the registers already hold it when
+//!   `fpu_owner` names the thread and its `fpu_cpu` names this CPU, else it loads
+//!   the area and records both; the frame gets `FS`/`VS` Clean. A thread that
+//!   has not used F/D or V keeps them Off, and when `fpu_owner` names a thread
+//!   the registers are cleared first ([`scrub`]), so that no other thread's
+//!   values sit in them while it runs.
+//! - Such a thread's first F/D/V instruction raises an illegal-instruction trap
+//!   (`scause = 2`) with `FS` Off ([`super::encoding::is_first_use_trap`]).
+//!   [`first_use_trap`] marks it in use and gives it its state as switch-in
+//!   would, once per thread. An F/D/V instruction that traps with the units on
+//!   is the thread's illegal-instruction fault.
 
 use super::encoding::{SSTATUS_FS_MASK, SSTATUS_VS_MASK};
 
@@ -60,7 +68,7 @@ pub unsafe fn enable_fpu_vector()
 pub unsafe fn enable_fpu_vector() {}
 
 /// Write a new thread's initial extended state into its save area: the image
-/// its first F/D/V use restores ([`lazy_restore_fp_v`]), and the one
+/// its first load restores ([`first_use_trap`]), and the one
 /// `SYS_THREAD_READ_EXT_REGS` reads until the thread's first switch-out
 /// after that use.
 ///
@@ -84,37 +92,44 @@ pub unsafe fn init_save_area(area: *mut u8, bytes: usize)
     unsafe { core::ptr::write_bytes(area, 0, bytes) };
 }
 
-/// Promote `sstatus.FS` and `sstatus.VS` from 00 (Off) to 01 (Initial) so the
-/// next FP/V instruction executes without re-trapping.
-///
-/// Called by [`lazy_restore_fp_v`] on the illegal-instruction trap path at the
-/// first user F/D/V touch. csrs only sets bits; from the Off boot invariant the
-/// bit-13 and bit-9 sets move both fields to Initial. Once the user code writes
-/// an F or V register, the hardware advances the field to Dirty. The per-thread
-/// save-area restore happens in [`lazy_restore_fp_v`] after this returns.
+/// Turn `sstatus.FS` and `sstatus.VS` on (Dirty) on this hart, for a load or a
+/// scrub of the register files; [`units_off`] turns them back Off.
 ///
 /// # Safety
-/// Must execute in supervisor mode.
+/// Must execute in supervisor mode with interrupts disabled, and be paired with
+/// [`units_off`] before anything else runs on the hart.
 #[cfg(not(test))]
 #[inline]
-pub unsafe fn lazy_enable_fp_v_initial()
+unsafe fn units_on()
 {
-    // sstatus.FS[14:13] and sstatus.VS[10:9]: setting only bit 13 / bit 9
-    // turns each field from 00 (Off) into 01 (Initial).
-    let mask = (1u64 << 13) | (1u64 << 9);
-    // SAFETY: csrs sstatus is privileged S-mode; mask is architected.
+    // SAFETY: csrs sstatus is privileged S-mode; the mask is architected.
     unsafe {
         core::arch::asm!(
             "csrs sstatus, {mask}",
-            mask = in(reg) mask,
+            mask = in(reg) (SSTATUS_FS_MASK | SSTATUS_VS_MASK),
             options(nostack, nomem),
         );
     }
 }
 
-/// No-op test stub.
-#[cfg(test)]
-pub unsafe fn lazy_enable_fp_v_initial() {}
+/// Turn `sstatus.FS` and `sstatus.VS` Off on this hart: the state the kernel
+/// runs in.
+///
+/// # Safety
+/// Must execute in supervisor mode.
+#[cfg(not(test))]
+#[inline]
+unsafe fn units_off()
+{
+    // SAFETY: csrc sstatus is privileged S-mode; the mask is architected.
+    unsafe {
+        core::arch::asm!(
+            "csrc sstatus, {mask}",
+            mask = in(reg) (SSTATUS_FS_MASK | SSTATUS_VS_MASK),
+            options(nostack, nomem),
+        );
+    }
+}
 
 /// Save the live F/D register file to `area`.
 ///
@@ -182,8 +197,8 @@ unsafe fn save_fp_to(area: *mut u8)
 
 /// Restore the F/D register file from `area`.
 ///
-/// Precondition: `sstatus.FS` is not `Off`. Caller (`lazy_restore_fp_v`)
-/// has just promoted FS to Initial.
+/// Precondition: `sstatus.FS` is not `Off`. Caller ([`load_area`]) has just
+/// turned it on.
 ///
 /// # Safety
 /// Must execute in supervisor mode. `area` must point at a per-thread
@@ -241,20 +256,23 @@ unsafe fn restore_fp_from(area: *const u8)
     }
 }
 
-/// Context-switch hook: if `sstatus.FS == Dirty`, save the live F/D state
-/// to the TCB's per-thread save area. If `sstatus.VS == Dirty`, also save
-/// the V register file. Force live `sstatus.FS = sstatus.VS = 00 (Off)`
-/// **and** clear the FS/VS fields of the TCB's trap-frame `sstatus` so
-/// that the next `sret` for this thread leaves U-mode in Off and the
-/// first F/D/V instruction lazy-traps.
+/// Context-switch hook called on switch-out of any thread: if `sstatus.FS` is
+/// Dirty, save the live F/D state to the thread's save area, and if
+/// `sstatus.VS` is Dirty the V register file. Then turn live `FS`/`VS` Off, the
+/// state every switch leaves, and clear them in the thread's trap frame:
+/// [`switch_in_restore`] sets the frame's at the thread's next switch-in. This
+/// CPU's `fpu_owner` and the thread's `fpu_cpu` keep naming each other.
 ///
-/// Returns immediately if the TCB has no extended-state area (kernel-only
-/// / idle threads).
+/// Dirty means the thread wrote the registers in user mode since its state was
+/// made live, so they hold its state. Returns at once for a thread with no
+/// extended-state area (kernel-only and idle threads).
 ///
 /// # Safety
-/// Must execute in supervisor mode with interrupts disabled. `tcb` must
-/// be a valid TCB pointer; when its `extended.area` is non-null,
-/// `trap_frame` must point at the TCB's on-kernel-stack trap frame.
+/// Must execute in supervisor mode with interrupts disabled, before the
+/// outgoing thread's `switch()` publishes `context_saved = 1` (Release), which
+/// orders the save before any other CPU's Acquire of it. `tcb` must be a valid
+/// TCB pointer; when its `extended.area` is non-null, `trap_frame` must point
+/// at the TCB's on-kernel-stack trap frame.
 #[cfg(not(test))]
 #[inline]
 pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock)
@@ -274,9 +292,7 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
             options(nostack, nomem),
         );
     }
-    let fs = (sstatus >> 13) & 0x3;
-    let vs = (sstatus >> 9) & 0x3;
-    if fs == 0x3
+    if sstatus & SSTATUS_FS_MASK == SSTATUS_FS_MASK
     {
         // SAFETY: FS = Dirty, so the FP register file is live and fsd
         // executes without trapping.
@@ -284,7 +300,7 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
             save_fp_to(area);
         }
     }
-    if vs == 0x3
+    if sstatus & SSTATUS_VS_MASK == SSTATUS_VS_MASK
     {
         // SAFETY: VS = Dirty, so the V register file is live and vs8r.v
         // executes without trapping.
@@ -292,18 +308,35 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
             save_v_to(area);
         }
     }
-    // Force live FS = VS = Off to re-arm the lazy trap on this CPU.
-    // SAFETY: csrc sstatus is privileged S-mode; mask is architected.
+    // SAFETY: supervisor mode.
     unsafe {
-        core::arch::asm!(
-            "csrc sstatus, {mask}",
-            mask = in(reg) (SSTATUS_FS_MASK | SSTATUS_VS_MASK),
-            options(nostack, nomem),
-        );
+        units_off();
     }
-    // Also clear FS/VS in the trap frame so the next sret for this thread
-    // resumes U-mode with FS = VS = Off — without this, trap_entry would
-    // restore sstatus from the frame and undo the lazy-trap re-arm.
+    // SAFETY: tcb validated by caller and its area is non-null, so its frame is
+    // the user thread's (the caller's contract).
+    unsafe { set_frame_units(tcb, 0) };
+}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn switch_out_save(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
+
+/// `FS` and `VS` Clean (10 each): the units on, the registers equal to the
+/// area.
+const SSTATUS_UNITS_CLEAN: u64 = (0x2 << 13) | (0x2 << 9);
+
+/// Write `units` (`FS`/`VS` bits only) into the `sstatus` of `tcb`'s trap
+/// frame, the value the thread's next `sret` to user mode takes.
+///
+/// # Safety
+/// `tcb` must be a valid user TCB, switched out or this CPU's running thread,
+/// with no live reference to its trap frame: `trap_dispatch`,
+/// `redirect_user_fault` and the syscall dispatcher's `UserFrame` hold it as a
+/// raw pointer and derive a reference only for an access that cannot block
+/// (core/kernel/docs/arch-interface.md § `trap_frame`).
+#[cfg(not(test))]
+unsafe fn set_frame_units(tcb: *mut crate::sched::thread::ThreadControlBlock, units: u64)
+{
     // SAFETY: tcb validated by caller; trap_frame is an atomic field of it.
     let tf = unsafe {
         (*tcb)
@@ -312,101 +345,277 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
     };
     if !tf.is_null()
     {
-        // SAFETY: trap_frame points at the TCB's on-kernel-stack trap frame
-        // and is non-null whenever extended.area is non-null (user threads). A
-        // switch-out from a U-mode trap (syscall, preemption, or fault block)
-        // leaves no live reference to this frame: trap_dispatch,
-        // redirect_user_fault, and the syscall dispatcher's `UserFrame` hold it
-        // as a raw pointer and derive a reference only for an access that
-        // cannot block (core/kernel/docs/arch-interface.md § `trap_frame`).
-        unsafe { (*tf).sstatus &= !(SSTATUS_FS_MASK | SSTATUS_VS_MASK) };
+        let mask = SSTATUS_FS_MASK | SSTATUS_VS_MASK;
+        // SAFETY: tf is the TCB's on-kernel-stack trap frame, which the
+        // caller's contract leaves unreferenced.
+        let sstatus = unsafe { &mut (*tf).sstatus };
+        *sstatus = (*sstatus & !mask) | (units & mask);
     }
 }
 
-/// No-op test stub.
-#[cfg(test)]
-pub unsafe fn switch_out_save(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
-
-/// No-op on RISC-V: the trap path's `lazy_restore_fp_v` already restores
-/// extended state on the first U-mode FP/V instruction after switch-in.
-/// The function exists for arch-dispatch symmetry with x86-64, where
-/// the matching hook arms `CR0.TS=1` so the first FP op traps to `#NM`.
+/// Load the F/D and V register files from `area`, leaving the units Off.
 ///
-/// # Safety
-/// Accepts the unified arch-dispatch signature; ring discipline is
-/// enforced by the caller.
-#[cfg(not(test))]
-#[inline]
-pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
-
-/// No-op test stub.
-#[cfg(test)]
-pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
-
-/// Lazy-trap handler body: promote live `sstatus.FS` and `sstatus.VS` from
-/// Off to Initial, restore the F/D and V register files from `area` (when
-/// non-null), then mirror the resulting live FS/VS bits into `frame.sstatus`
-/// so the `sret` at the bottom of `trap_entry` resumes U-mode in the same
-/// state (otherwise the frame restore would clobber the promotion and the
-/// trapping instruction would re-trap forever).
-///
-/// The V restore is skipped when [`vlenb`] is zero, which holds only before
-/// [`cache_vlenb`] runs in Phase 5. Every hart is probed at boot: the boot
-/// hart in [`cache_vlenb`], each secondary hart in [`check_ap_vlenb`], whose
-/// `vlenb` read takes a fatal supervisor illegal-instruction trap on a hart
-/// without V and which halts on a `vlenb` other than the boot hart's
+/// The V load is skipped when [`vlenb`] is zero, which holds only before
+/// [`cache_vlenb`] runs in Phase 5. Every hart is probed at boot: the boot hart
+/// in [`cache_vlenb`], each secondary hart in [`check_ap_vlenb`], whose `vlenb`
+/// read takes a fatal supervisor illegal-instruction trap on a hart without V
+/// and which halts on a `vlenb` other than the boot hart's
 /// (docs/platform-requirements.md § Boot-Time Feature Gate).
 ///
 /// # Safety
-/// Must execute in supervisor mode from the illegal-instruction trap path.
+/// Must execute in supervisor mode with interrupts disabled. `area` must be a
+/// thread's save area, written by [`init_save_area`] or by its own switch-out
+/// saves, the last of them ordered before this call.
 #[cfg(not(test))]
-#[inline]
-pub unsafe fn lazy_restore_fp_v(area: *const u8, frame: &mut super::trap_frame::TrapFrame)
+unsafe fn load_area(area: *const u8)
 {
-    // SAFETY: csrs sstatus is privileged S-mode; this is the architected
-    // FS/VS promotion sequence.
-    unsafe {
-        lazy_enable_fp_v_initial();
-    }
-    if !area.is_null()
+    // SAFETY: supervisor mode with interrupts disabled; units_off follows.
+    unsafe { units_on() };
+    // SAFETY: FS is on; area is the thread's save area (caller's contract).
+    unsafe { restore_fp_from(area) };
+    if vlenb() != 0
     {
-        // SAFETY: area is the thread's save area, written at its creation
-        // (`init_save_area`) and by its own switch-outs since.
-        unsafe { restore_fp_from(area) };
-        if vlenb() != 0
-        {
-            // SAFETY: as for the F/D restore: the save area is the thread's;
-            // `lazy_enable_fp_v_initial` set VS non-Off.
-            unsafe { restore_v_from(area) };
-        }
+        // SAFETY: as for the F/D restore; VS is on.
+        unsafe { restore_v_from(area) };
     }
-    // Mirror live FS/VS into the trap frame: restore_fp_from / restore_v_from
-    // executed write-class instructions on F and V registers, advancing the
-    // live fields to Dirty. Reflect that in frame.sstatus so trap_entry's
-    // `csrw sstatus, frame.sstatus` on the way back to U-mode keeps the
-    // restored state (rather than wiping it back to Off and re-trapping).
-    let live: u64;
-    // SAFETY: csrr sstatus is a privileged S-mode read.
+    // SAFETY: supervisor mode.
+    unsafe { units_off() };
+}
+
+/// Zero the F/D and V register files and `fcsr`, leaving the units Off: the
+/// registers then hold no thread's state.
+///
+/// # Safety
+/// Must execute in supervisor mode with interrupts disabled.
+#[cfg(not(test))]
+unsafe fn scrub()
+{
+    // SAFETY: supervisor mode with interrupts disabled; units_off follows.
+    unsafe { units_on() };
+    // SAFETY: FS is on, so the F instructions execute; they write only the F
+    // registers and fcsr. `.option arch` enables D for them only.
     unsafe {
         core::arch::asm!(
-            "csrr {0}, sstatus",
-            out(reg) live,
+            ".option push",
+            ".option arch, +d",
+            "fmv.d.x f0, zero",
+            "fmv.d.x f1, zero",
+            "fmv.d.x f2, zero",
+            "fmv.d.x f3, zero",
+            "fmv.d.x f4, zero",
+            "fmv.d.x f5, zero",
+            "fmv.d.x f6, zero",
+            "fmv.d.x f7, zero",
+            "fmv.d.x f8, zero",
+            "fmv.d.x f9, zero",
+            "fmv.d.x f10, zero",
+            "fmv.d.x f11, zero",
+            "fmv.d.x f12, zero",
+            "fmv.d.x f13, zero",
+            "fmv.d.x f14, zero",
+            "fmv.d.x f15, zero",
+            "fmv.d.x f16, zero",
+            "fmv.d.x f17, zero",
+            "fmv.d.x f18, zero",
+            "fmv.d.x f19, zero",
+            "fmv.d.x f20, zero",
+            "fmv.d.x f21, zero",
+            "fmv.d.x f22, zero",
+            "fmv.d.x f23, zero",
+            "fmv.d.x f24, zero",
+            "fmv.d.x f25, zero",
+            "fmv.d.x f26, zero",
+            "fmv.d.x f27, zero",
+            "fmv.d.x f28, zero",
+            "fmv.d.x f29, zero",
+            "fmv.d.x f30, zero",
+            "fmv.d.x f31, zero",
+            "fscsr zero",
+            ".option pop",
             options(nostack, nomem),
         );
     }
-    let mask = SSTATUS_FS_MASK | SSTATUS_VS_MASK;
-    frame.sstatus = (frame.sstatus & !mask) | (live & mask);
+    if vlenb() != 0
+    {
+        // SAFETY: VS is on, so the V instructions execute. `vsetvli` with a
+        // destination register and rs1 = zero sets vl to VLMAX, so with SEW 8
+        // and LMUL 8 the four moves write every element of v0..v31; `vcsr`
+        // (`vxrm`, `vxsat`) is zeroed too. They change only the V registers,
+        // vl, vtype, vstart and vcsr.
+        unsafe {
+            core::arch::asm!(
+                ".option push",
+                ".option arch, +v",
+                "vsetvli {t}, zero, e8, m8, ta, ma",
+                "vmv.v.i v0, 0",
+                "vmv.v.i v8, 0",
+                "vmv.v.i v16, 0",
+                "vmv.v.i v24, 0",
+                "csrw vcsr, zero",
+                ".option pop",
+                t = out(reg) _,
+                options(nostack, nomem),
+            );
+        }
+    }
+    // SAFETY: supervisor mode.
+    unsafe { units_off() };
+}
+
+/// Make `tcb`'s state live on this CPU, for a thread in use: load its area
+/// unless this CPU's `fpu_owner` names it and its `fpu_cpu` names this CPU
+/// (`sched::fpu_switch::in_use_action`), then record both. The caller gives
+/// the thread's frame `FS`/`VS` Clean.
+///
+/// # Safety
+/// Supervisor mode with interrupts disabled, on the CPU `tcb` runs on next or
+/// runs on now, after the Acquire of its `context_saved` when it was switched
+/// in; `tcb` a valid user TCB with a non-null area.
+#[cfg(not(test))]
+unsafe fn make_live(tcb: *mut crate::sched::thread::ThreadControlBlock)
+{
+    use crate::sched::fpu_switch::{InUseAction, Owner, in_use_action};
+
+    // SAFETY: tcb is valid (caller); `extended` is a field of it.
+    let ext = unsafe { &(*tcb).extended };
+    let cpu = super::cpu::current_cpu();
+    // SAFETY: `cpu` is the executing CPU's logical index, below CPU_COUNT.
+    let owner_slot = unsafe { crate::percpu::fpu_owner_for(cpu as usize) };
+    let owner = Owner::of(
+        owner_slot
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .cast_const(),
+        tcb.cast_const(),
+    );
+    match in_use_action(
+        owner,
+        ext.fpu_cpu.load(core::sync::atomic::Ordering::Relaxed),
+        cpu,
+    )
+    {
+        InUseAction::Keep =>
+        {}
+        InUseAction::Load =>
+        {
+            // SAFETY: the caller's contract is load_area's.
+            unsafe { load_area(ext.area) };
+            owner_slot.store(tcb, core::sync::atomic::Ordering::Relaxed);
+            ext.fpu_cpu
+                .store(cpu, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Context-switch hook called on switch-in of any thread, after the Acquire of
+/// its `context_saved`.
+///
+/// A thread that uses its state gets it live ([`make_live`]). A thread that has
+/// not used F/D or V gets `FS`/`VS` Off in its frame, and when this CPU's
+/// `fpu_owner` names a thread the registers are scrubbed and no owner is named
+/// (`sched::fpu_switch::never_used_action`). A kernel thread or idle (null
+/// area) loads nothing and leaves the owner as it is.
+///
+/// # Safety
+/// Must execute in supervisor mode with interrupts disabled, after the outgoing
+/// thread's `switch_out_save` and after this CPU's Acquire of `tcb`'s
+/// `context_saved`, which orders the previous CPU's save of the area and its
+/// writes of `fpu_cpu` and `in_use` before the reads here. `tcb` must be a
+/// valid TCB pointer whose trap frame, when its area is non-null, is its
+/// on-kernel-stack frame.
+#[cfg(not(test))]
+pub unsafe fn switch_in_restore(tcb: *mut crate::sched::thread::ThreadControlBlock)
+{
+    use crate::sched::fpu_switch::{NeverUsedAction, Owner, never_used_action};
+
+    // SAFETY: tcb is valid (caller); `extended` is a field of it.
+    let ext = unsafe { &(*tcb).extended };
+    if ext.area.is_null()
+    {
+        return;
+    }
+    if ext.in_use.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        // SAFETY: this function's contract is make_live's.
+        unsafe { make_live(tcb) };
+        // SAFETY: this function's contract is set_frame_units'.
+        unsafe { set_frame_units(tcb, SSTATUS_UNITS_CLEAN) };
+        return;
+    }
+    let cpu = super::cpu::current_cpu() as usize;
+    // SAFETY: `cpu` is the executing CPU's logical index, below CPU_COUNT.
+    let owner_slot = unsafe { crate::percpu::fpu_owner_for(cpu) };
+    let owner = Owner::of(
+        owner_slot
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .cast_const(),
+        tcb.cast_const(),
+    );
+    match never_used_action(owner)
+    {
+        NeverUsedAction::Scrub =>
+        {
+            // SAFETY: supervisor mode with interrupts disabled (caller).
+            unsafe { scrub() };
+            owner_slot.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+        }
+        NeverUsedAction::Nothing =>
+        {}
+    }
+    // SAFETY: the caller's contract.
+    unsafe { set_frame_units(tcb, 0) };
 }
 
 /// No-op test stub.
 #[cfg(test)]
-pub unsafe fn lazy_restore_fp_v(_area: *const u8, _frame: &mut super::trap_frame::TrapFrame) {}
+pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
+
+/// The first-use trap: a user F/D/V instruction trapped with `FS` Off. Mark the
+/// running thread in use and make its state live as switch-in would
+/// ([`make_live`]), which writes `FS`/`VS` Clean into `frame`; the
+/// instruction re-executes on `sret`. It runs once per thread: every later
+/// switch-in gives the frame Clean, over the Off a register write
+/// (`sanitize_for_user_resume`) leaves in a switched-out thread's frame.
+///
+/// # Safety
+/// Must execute in supervisor mode with interrupts disabled, from the U-mode
+/// illegal-instruction trap path, with `frame` the live frame of that trap, to
+/// which no reference is held across this call.
+#[cfg(not(test))]
+pub unsafe fn first_use_trap(frame: *mut super::trap_frame::TrapFrame)
+{
+    // SAFETY: current_tcb returns this CPU's running thread, valid here because
+    // the trap came from U-mode.
+    let tcb = unsafe { crate::syscall::current_tcb() };
+    // SAFETY: as above.
+    let area = unsafe { (*tcb).extended.area };
+    debug_assert!(!area.is_null(), "a thread in user mode has a save area");
+    if area.is_null()
+    {
+        return;
+    }
+    // SAFETY: as above.
+    unsafe { &(*tcb).extended }
+        .in_use
+        .store(true, core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: supervisor mode with interrupts disabled, on the CPU tcb runs on;
+    // tcb is a user TCB with an area.
+    unsafe { make_live(tcb) };
+    let mask = SSTATUS_FS_MASK | SSTATUS_VS_MASK;
+    // SAFETY: frame is the live frame of this trap, unreferenced elsewhere
+    // (caller).
+    let sstatus = unsafe { &mut (*frame).sstatus };
+    *sstatus = (*sstatus & !mask) | SSTATUS_UNITS_CLEAN;
+}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn first_use_trap(_frame: *mut super::trap_frame::TrapFrame) {}
 
 // ── V (Vector) state save / restore ───────────────────────────────────────────
 
 /// Cached value of CSR `vlenb` (vector length in bytes), populated at boot
 /// by [`cache_vlenb`]. Zero only before that call, meaning not yet probed;
-/// the lazy-trap path then skips V save/restore.
+/// [`load_area`] and [`scrub`] then skip the V registers.
 static VLENB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Return the boot hart's cached `vlenb`, which every secondary hart shares
@@ -466,7 +675,7 @@ unsafe fn read_vlenb() -> u64
             options(nostack, nomem),
         );
     }
-    // Re-arm the lazy V trap: clear both bits of sstatus.VS.
+    // Back to VS = Off, the boot state enable_fpu_vector set.
     // SAFETY: csrc sstatus is privileged S-mode.
     unsafe {
         core::arch::asm!(
@@ -613,11 +822,10 @@ unsafe fn save_v_to(area: *mut u8)
 /// after which `vcsr` and `vstart` are written back (`vsetvl` clears
 /// `vstart`).
 ///
-/// Restoring `vl`/`vtype` is required for correctness, not optional: the
-/// kernel re-arms the lazy-trap on switch-out, so a thread that was
-/// preempted *between* its `vsetvli` and a dependent vector memory op
-/// (`vle*`/`vse*`) resumes — through this lazy-trap path — directly at that
-/// memory op, without re-executing the `vsetvli`. It must therefore observe
+/// Restoring `vl`/`vtype` is required for correctness, not optional: a
+/// thread that was preempted *between* its `vsetvli` and a dependent vector
+/// memory op (`vle*`/`vse*`) resumes, after this load at its switch-in,
+/// directly at that memory op, without re-executing the `vsetvli`. It must therefore observe
 /// the `vl`/`vtype` it had set, not whatever values another thread left in
 /// the live CSRs; otherwise the resumed `vle`/`vse` runs with the wrong
 /// element count and silently mis-sizes the transfer.

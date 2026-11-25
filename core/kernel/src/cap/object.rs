@@ -5495,12 +5495,12 @@ unsafe fn dealloc_thread(
             // (all-locks region above); not the running thread here.
             unsafe { crate::sched::wait_until_off_cpu(tcb) };
 
-            // After eager FPU save (#108), no fpu_owner sweep is
-            // needed: `nm_handler` only ever names the currently
-            // Running thread on its CPU, and `switch_out_save`
-            // clears the slot on switch-out — so by the time the
-            // not-`current`-anywhere and `context_saved` spins above
-            // have completed, no CPU's owner slot can name this TCB.
+            // No fpu_owner sweep is needed: a CPU's owner slot may
+            // still name this TCB, but it is only ever compared,
+            // never dereferenced, and a TCB later built at this
+            // address starts with `fpu_cpu` = `NO_CPU`, so no CPU
+            // takes its registers for that thread's state
+            // (`sched::fpu_switch`).
         }
 
         // Wake the captured reply-bound client outside the all-locks

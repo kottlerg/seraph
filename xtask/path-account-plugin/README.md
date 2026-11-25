@@ -57,9 +57,10 @@ is an attempt. An interrupt comes between two instructions, from the address of 
 except between two iterations of an x86 `rep` string instruction, which runs once per
 iteration: the plugin watches its memory accesses, which QEMU reports once each completed, and
 an iteration whose accesses all completed retired. (The discontinuity's kind does not tell them
-apart: x86_64 reports a page fault as an interrupt.) An instruction of a unit the kernel turns
-on lazily (x86_64's FPU and vector state, riscv64's floating-point and vector units) is the
-other exception: while the unit is off, QEMU's translator raises the trap when it decodes the
+apart: x86_64 reports a page fault as an interrupt.) An instruction of a unit that is off
+(x86_64's FPU and vector state while `CR0.TS` or `CR0.EM` is set, which the kernel never sets;
+riscv64's floating-point and vector units until a thread's first use of them) is the other
+exception: while the unit is off, QEMU's translator raises the trap when it decodes the
 instruction, and icount has counted it, so the counter counted it too. The plugin defers such
 an attempt to the next instruction and reads the unit's state register there (`CR0.TS` and
 `CR0.EM`, `sstatus.FS` and `sstatus.VS`): with the unit off the attempt is not one, with it

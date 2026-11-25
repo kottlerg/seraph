@@ -20,7 +20,7 @@
 //!   `NotSupported`
 //! - `sbi_call.rs` — `SYS_SBI_CALL` reaches the SBI firmware
 //! - `fp_refusal.rs` — an F/D instruction the hart refuses with the thread's
-//!   units on is the thread's illegal-instruction fault, not the lazy trap
+//!   units on is the thread's illegal-instruction fault, not the first-use trap
 //!
 //! Tier 2 scenarios:
 //! - `sbi_gating.rs` — `SYS_SBI_CALL` refuses kernel-reserved extensions and

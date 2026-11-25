@@ -17,6 +17,7 @@
 )]
 
 pub mod deadline_heap;
+pub mod fpu_switch;
 pub mod hold;
 pub mod registry_list;
 pub mod run_queue;
@@ -5429,11 +5430,12 @@ pub unsafe fn migrate_ready_thread(
         return false;
     }
 
-    // No pre-lock FPU flush: the source CPU's `switch_out_save` XSAVEs the live
+    // No pre-lock FPU flush: the source CPU's `switch_out_save` saves the live
     // regs into the TCB's extended-state area before its `switch()` publishes
     // `context_saved = 1` (Release), and `relocate_ready_thread` moves only a
-    // `context_saved == 1` thread, so the area is canonical and any destination
-    // CPU's `#NM` XRSTOR sees the correct bytes.
+    // `context_saved == 1` thread, so the area is canonical and the destination
+    // CPU's `switch_in_restore` loads the correct bytes (its `fpu_cpu` names
+    // the source CPU, so no destination CPU skips the load).
 
     let (lo, hi) = if src_cpu < dst_cpu
     {
@@ -6483,11 +6485,11 @@ unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -
         return PullOutcome::RuleFailed;
     }
 
-    // No skip-owner predicate is needed: `switch_out_save` clears this CPU's
-    // `fpu_owner` and XSAVEs the live regs before `switch()` publishes
-    // `context_saved = 1`, and the predicate below takes only
-    // `context_saved == 1` threads, so every candidate's XSAVE area is canonical
-    // and safe to pull.
+    // No skip-owner predicate is needed: `switch_out_save` saves the live regs
+    // before `switch()` publishes `context_saved = 1`, and the predicate below
+    // takes only `context_saved == 1` threads, so every candidate's
+    // extended-state area is canonical and safe to pull; the destination's
+    // switch-in loads it, since the thread's `fpu_cpu` names another CPU.
     // Only steal a FULLY-SAVED Ready thread (`context_saved == 1`). A
     // Ready-but-`context_saved == 0` candidate is mid-handoff: it was woken
     // (e.g. a fast IPC reply) while still `current`/live on `src_cpu` and has
@@ -6599,11 +6601,11 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         crate::kprintln!("enqueue_and_wake: target_cpu={target_cpu} >= MAX_CPUS, tid={tid}");
     }
 
-    // No pre-lock FPU flush: the woken thread's prior CPU XSAVEs any live regs in
+    // No pre-lock FPU flush: the woken thread's prior CPU saves any live regs in
     // `switch_out_save` before its `switch()` publishes `context_saved = 1`
     // (Release), and the dispatching CPU's `schedule()` spins on that flag
-    // (Acquire) before switching in, so the next `#NM` on the destination CPU
-    // XRSTORs the correct bytes.
+    // (Acquire) before `switch_in_restore`, so the destination CPU loads the
+    // correct bytes.
 
     // Acquire the per-TCB sched_lock FIRST: it is the authoritative serializer
     // for the Scheduling field group, so the live/not-live classification below
@@ -8143,21 +8145,12 @@ pub unsafe fn schedule(requeue: Requeue)
         unsafe { nxt_space.activate() };
     }
 
-    // FPU context-switch hooks. Both arches use eager save on switch-out,
-    // lazy restore on first FP use after switch-in:
-    // - x86-64: a per-CPU `fpu_owner` cache plus CR0.TS gating.
-    //   switch_out_save XSAVEs eagerly when this CPU still owns the
-    //   outgoing thread's live regs, clears `fpu_owner`, and arms
-    //   CR0.TS=1. switch_in_restore just arms CR0.TS=1; the next FP op
-    //   by the incoming thread traps to `#NM`, which XRSTORs its area
-    //   and installs it as `fpu_owner`. No migration-steal IPI exists —
-    //   the TCB's area is canonical at every Ready observation point.
-    // - RISC-V: lazy via `sstatus.FS/VS` dirty tracking. switch_out_save
-    //   reads FS/VS and saves to the area only on Dirty; switch_in_restore
-    //   is a no-op (the trap path's `lazy_restore_fp_v` reloads on first use).
-    // For kernel-only / idle threads (extended.area is null) nothing is saved
-    // or restored; on x86-64 both calls still arm CR0.TS, which such a thread
-    // never trips.
+    // Extended-state (FPU, SIMD, vector) switch-out (`sched::fpu_switch`): save
+    // the outgoing user thread's live registers into its area (x86-64 XSAVE when
+    // this CPU's `fpu_owner` names it; RISC-V the F/D and V files that are
+    // Dirty). `fpu_owner` keeps naming it. A kernel thread or idle (null area)
+    // saves nothing. The matching load is `switch_in_restore` below, after the
+    // `context_saved` Acquire.
     if !current.is_null()
     {
         // SAFETY: ring-0 with interrupts disabled (release_lock_only dropped the
@@ -8167,15 +8160,6 @@ pub unsafe fn schedule(requeue: Requeue)
         // CPU's Acquire of `context_saved`.
         unsafe {
             crate::arch::current::fpu::switch_out_save(current);
-        }
-    }
-    if !next.is_null()
-    {
-        // SAFETY: ring-0 with interrupts disabled (release_lock_only dropped the
-        // scheduler locks and left interrupts masked); arch fpu::switch_in_restore
-        // honours the per-arch lazy discipline.
-        unsafe {
-            crate::arch::current::fpu::switch_in_restore(next);
         }
     }
 
@@ -8246,6 +8230,23 @@ pub unsafe fn schedule(requeue: Requeue)
             }
         }
         spin_site_exit();
+    }
+
+    // Extended-state switch-in: make `next`'s state live unless this CPU's
+    // registers still hold it (`fpu_owner` and `next`'s `fpu_cpu` naming each
+    // other). It runs after the Acquire load of `next`'s `context_saved` above
+    // (the check or the spin; idle, never checked, has no area), which orders
+    // the previous CPU's save of `next`'s area and its writes of `fpu_cpu`
+    // before the reads here; and before `switch()`, on every path, the first
+    // switch of this CPU (no outgoing state) included.
+    if !next.is_null()
+    {
+        // SAFETY: ring-0 with interrupts disabled; the outgoing thread's
+        // switch_out_save ran above, and next's context_saved was observed
+        // published.
+        unsafe {
+            crate::arch::current::fpu::switch_in_restore(next);
+        }
     }
 
     if !current_state.is_null()
@@ -9093,6 +9094,14 @@ pub unsafe fn enter() -> !
     init_tcb
         .trap_frame
         .store(tf_ptr, core::sync::atomic::Ordering::Relaxed);
+
+    // Init's first run here is not a schedule() switch-in, so make its
+    // extended state live as one would: x86-64 loads its initial area, so init
+    // never runs on the registers firmware left; riscv64 leaves FS/VS Off for
+    // its first-use trap.
+    // SAFETY: ring 0 / S-mode with interrupts disabled, on the BSP; tcb is the
+    // init TCB, which no other CPU has run, and its trap_frame is set above.
+    unsafe { crate::arch::current::fpu::switch_in_restore(tcb) };
 
     // Mark init's address space as active on CPU 0 (BSP) before entering user
     // mode. Must precede `first_entry_to_user`, which tags the entry: the active

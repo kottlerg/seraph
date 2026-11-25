@@ -397,10 +397,33 @@ thread-switched, and the user-mode TLS pointer lives in the trap frame's `tp`.
 The full user register file (all 31 general-purpose registers on RISC-V, plus `sepc`
 and `sstatus`) is saved in the thread's trap frame, not in `SavedState`. `SavedState`
 holds only the kernel-mode callee-saved state. Floating-point, SIMD, and vector state
-is in neither: it lives in the TCB's extended-state area, saved eagerly by the arch
-`fpu::switch_out_save` on switch-out of a user thread and restored lazily on the
-thread's first FP/SIMD/vector instruction after it is switched back in (`#NM` on
-x86-64, the illegal-instruction trap with `sstatus.FS`/`VS` Off on RISC-V).
+is in neither: it lives in the TCB's extended-state area, and it is live in the registers
+whenever a user thread runs in user mode. The kernel is soft-float, so no kernel path, idle and
+kernel threads included, touches those registers; a build whose target enables them fails
+(`core/kernel/src/main.rs`).
+
+- On switch-out of a user thread, the arch `fpu::switch_out_save` saves the live registers
+  into its area: on x86-64 with `XSAVE` when this CPU's `fpu_owner` names the thread, on
+  RISC-V the F/D and V files whose `sstatus.FS`/`VS` is Dirty. `fpu_owner` keeps naming the
+  thread.
+- On switch-in, after the Acquire of the thread's `context_saved`, the arch
+  `fpu::switch_in_restore` loads the thread's area unless this CPU's `fpu_owner` names the
+  thread and the thread's `fpu_cpu` names this CPU: the two then still name each other, and the
+  registers hold the thread's state. A load records both. A thread that ran on another CPU since
+  has a `fpu_cpu` naming that CPU, so its return loads the area its last switch-out saved, and a
+  TCB built at a freed one's address starts with `fpu_cpu` naming no CPU. `fpu_owner` is
+  compared, never dereferenced. `sched::fpu_switch` holds the decision and its host test.
+- On x86-64 `CR0.TS` is never set. A user `#NM` is the thread's fault, delivered as an
+  unknown exception.
+- On RISC-V a user thread runs with `FS`/`VS` Off until its first F, D or V instruction, whose
+  trap marks the thread as using its extended state, makes that state live as a switch-in
+  would, and sets `FS`/`VS` Clean in its frame. Every later switch-in sets them Clean. The
+  switch-in of a thread that has not used them clears the registers when they hold a thread's
+  state, so no thread's values are present while it runs
+  ([transient-execution.md](transient-execution.md) § Excluded classes).
+
+Kernel threads and idle have no area: their switches save and load nothing and leave
+`fpu_owner` as it is.
 
 ### Switch Sequence
 
@@ -424,6 +447,12 @@ context_switch(current_tcb, next_tcb):
     if current_tcb.address_space != next_tcb.address_space:
         arch::current::paging::activate(next_tcb.address_space.root_phys)
         // Update active_cpus on both address spaces (for TLB shootdown tracking)
+
+    // 2b. Extended state (§ What Gets Saved and Restored): save current_tcb's
+    //     live registers, then, after the Acquire of next_tcb's context_saved,
+    //     load next_tcb's unless this CPU still holds them.
+    arch::current::fpu::switch_out_save(current_tcb)
+    arch::current::fpu::switch_in_restore(next_tcb)
 
     // 3. Perform the register-level switch.
     //    Saves current callee-saved registers, publishes context_saved = 1 once the
@@ -919,10 +948,8 @@ passes the interrupt delivery point when it is dispatched again, as a thread an 
 does (`sched::exception_return_work`;
 [fault-handling.md](../../../docs/fault-handling.md#delivery-points) § Delivery points).
 
-Two returns to user mode make no decision. The x86-64 `#NM` lazy FPU restore runs with interrupts
-masked and preemption disabled throughout and links nothing, so an IPI raised meanwhile is taken
-in user mode as it returns. A new thread's first entry to user mode follows the dispatch that
-chose it as its CPU's highest, with interrupts masked until it reaches user mode, where a later
+One return to user mode makes no decision: a new thread's first entry, which follows the dispatch
+that chose it as its CPU's highest, with interrupts masked until it reaches user mode, where a later
 link's IPI is taken. The decision is skipped during the BSP boot transient, while preemption is
 disabled, and for the idle thread, whose loop takes queued work itself (§ Idle Thread). Syscall
 context stays non-preemptible (§ Kernel-Mode Preemption Points): a wake made or absorbed inside a
@@ -1099,9 +1126,13 @@ optimisation.
 
 ## Summarized By
 
-[core/kernel/README.md](../README.md), [Kernel Initialization Sequence](initialization.md),
+[core/kernel/README.md](../README.md), [Architecture Abstraction Layer](arch-interface.md),
+[Kernel Initialization Sequence](initialization.md),
 [IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
+[Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),
+[Transient Execution](transient-execution.md),
 [Architecture Overview](../../../docs/architecture.md),
+[Build System](../../../docs/build-system.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md)

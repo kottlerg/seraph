@@ -18,7 +18,8 @@
 //! the image `SYS_THREAD_READ_EXT_REGS` reads (`crate::integration::thread_ext_regs`).
 //! [`initial_state_check`], [`control_state_check`] and
 //! [`inexact_divide_check`] read the control state a thread starts with
-//! (`crate::unit::fpu::initial_state`).
+//! (`crate::unit::fpu::initial_state`). [`touch_vector_register`] is the vector-register
+//! touch of the `fpu=both` case of `crate::bench::ipc`.
 
 /// Load `pattern` into xmm0..xmm15, spin `iters` iterations so the timer can
 /// preempt the thread, then capture the registers; returns the mismatched-lane
@@ -234,10 +235,9 @@ pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u64, msg_label: u64) -> u64
             "xor r8, r8",
             "xor r9, r9",
             "syscall",
-            // Resumed (possibly on CPU 1). The first FP op (the capture
-            // `vmovdqu`) traps to `#NM` because `switch_in_restore` set
-            // `CR0.TS=1`; the handler XRSTORs the saved area into CPU 1's
-            // hardware before the store executes.
+            // Resumed (possibly on CPU 1). `switch_in_restore` XRSTORed the
+            // saved area into CPU 1's hardware before the thread returned,
+            // so the capture `vmovdqu` stores the saved state.
             "vmovdqu [{b} + 0x000], xmm0",
             "vmovdqu [{b} + 0x010], xmm1",
             "vmovdqu [{b} + 0x020], xmm2",
@@ -382,8 +382,8 @@ const MXCSR_PE: u64 = 1 << 5;
 const FCW_INIT: u64 = 0x037F;
 
 /// Read `MXCSR` and the x87 control word, in that order. The `stmxcsr` is
-/// the thread's first use of the extended state when it has made none, so
-/// the `#NM` it takes restores the thread's saved state first.
+/// the thread's first use of the extended state when it has made none, and
+/// reads the state `switch_in_restore` loaded.
 fn read_control_words() -> [u64; 2]
 {
     let mut mxcsr = 0u32;
@@ -479,5 +479,24 @@ pub fn inexact_divide_check() -> Result<(), u64>
     else
     {
         Err(mxcsr)
+    }
+}
+
+/// Write `value` into `xmm0` and read it back: the vector-register touch each side of the
+/// `fpu=both` case of `crate::bench::ipc` makes once per round trip, as a std-built thread's SIMD
+/// copies do. SSE2 only, which every x86-64 CPU has.
+pub fn touch_vector_register(value: u64)
+{
+    // SAFETY: the two moves are between a general-purpose register and xmm0, which the asm
+    // declares clobbered; no memory is accessed.
+    unsafe {
+        core::arch::asm!(
+            "movq xmm0, {v}",
+            "movq {o}, xmm0",
+            v = in(reg) value,
+            o = lateout(reg) _,
+            out("xmm0") _,
+            options(nomem, nostack, preserves_flags),
+        );
     }
 }

@@ -82,6 +82,29 @@ const KERNEL_STACK_BYTES: u64 = (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE) as u
 
 use boot_protocol::BootInfo;
 
+// The kernel is soft-float: no kernel path touches the FPU, SIMD or vector
+// registers, which hold a user thread's state from its switch-out save to the
+// next switch-in (`sched::fpu_switch`), so a kernel or idle thread can run
+// between the two without saving them. The kernel targets disable those units
+// (`xtask/targets/`); a target that enabled them fails the build here. Host
+// builds (tests, proofs) run no kernel thread on the hardware.
+#[cfg(all(
+    not(any(test, kani)),
+    target_arch = "x86_64",
+    any(
+        target_feature = "sse",
+        target_feature = "sse2",
+        target_feature = "avx"
+    )
+))]
+compile_error!("the kernel must be built soft-float: its target enables SSE or AVX");
+#[cfg(all(
+    not(any(test, kani)),
+    target_arch = "riscv64",
+    any(target_feature = "f", target_feature = "d", target_feature = "v")
+))]
+compile_error!("the kernel must be built soft-float: its target enables F, D or V");
+
 mod arch;
 mod bounded_wait;
 mod cap;
@@ -2240,7 +2263,7 @@ static PANIC_DUMP_READY: core::sync::atomic::AtomicBool =
 /// panic reached from corrupted syscall register arguments from a deterministic
 /// kernel bug; for a panic in an interrupt or exception taken from user mode
 /// that publishes its frame it is that entry's frame. The x86-64 entries that
-/// publish none (`#NM`, the NMI, `#DF`, `#MC`;
+/// publish none (the NMI, `#DF`, `#MC`;
 /// core/kernel/docs/arch-interface.md § `trap_frame`) leave `trap_frame` naming
 /// the last publishing entry's frame, which may be stale or overwritten by the
 /// later entry's stack pushes. Serial-only / lock-bypassing, mirroring the panic
@@ -2301,7 +2324,7 @@ unsafe fn panic_context_dump()
         // (core/kernel/docs/arch-interface.md § `trap_frame`), so it is
         // reported as the user frame, with the registers a syscall would carry
         // its arguments in. A panic on an x86-64 entry that publishes none
-        // (`#NM`, the NMI, `#DF`, `#MC`) reads the last publishing entry's
+        // (the NMI, `#DF`, `#MC`) reads the last publishing entry's
         // frame, which may be stale or overwritten.
         // SAFETY: a non-null trap_frame names a frame on this thread's kernel
         // stack, and this is that thread's own CPU, so nothing writes the

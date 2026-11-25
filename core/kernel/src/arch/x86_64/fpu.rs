@@ -6,67 +6,39 @@
 //! x86-64 extended-state (x87 / SSE / AVX) control primitives.
 //!
 //! Concentrates the unsafe surface for FPU/SIMD state management:
-//! CR0.TS (lazy-trap discipline gate), XSETBV/XCR0 setup, per-CPU XSAVE
-//! enablement and CR0's user-visible x87 and alignment controls, set at boot,
-//! and the save/restore primitives consumed by the `#NM` handler and the
-//! context-switch path. The per-thread XSAVE area is
+//! XSETBV/XCR0 setup, per-CPU XSAVE enablement and CR0's user-visible x87 and
+//! alignment controls, set at boot, and the save/restore primitives the
+//! context-switch path runs. The per-thread XSAVE area is
 //! the pages after the TCB page of the thread's slot (`sched::thread_slot`),
 //! carved and given its initial state ([`init_save_area`]) by the
 //! thread-create path (`syscall::cap::sys_cap_create_thread`) and, for init's
 //! thread, by boot code (`kernel_entry_post_rebase`).
 //!
-//! ## Eager-save, lazy-restore discipline
+//! ## Switch-in restore
 //!
-//! On any CPU `C`, at every observation point external code can reach,
-//! exactly one of the following holds:
-//! - `(CR0.TS=1, fpu_owner=null)` — no live state; the next user FP
-//!   instruction raises `#NM`.
-//! - `(CR0.TS=0, fpu_owner=T)`    — T owns the live regs; FP runs
-//!   trap-free.
-//!
-//! The other two combinations are forbidden at rest; each appears only as a
-//! transient inside the code paths below and is unobservable from outside them:
-//!
-//! - `(CR0.TS=0, fpu_owner=null)` **inside `nm_handler`** (`idt::nm_handler`)
-//!   between the `cr0_clear_ts()` that arms the live registers for XSAVE /
-//!   XRSTOR and the final `fpu_owner.store(tcb, Release)`. Preemption is
-//!   disabled across the handler body, the CPU enters from a hardware
-//!   trap with `IF=0`, and the only architectural interrupt class that
-//!   can fire (NMI) does not touch FPU state — so no other code on this
-//!   CPU observes the transient. No other CPU writes this CPU's owner slot.
-//! - `(CR0.TS=1, fpu_owner=T)` **inside `switch_out_save`** between the
-//!   `cr0_set_ts()` that re-arms the lazy trap after XSAVE and the store that
-//!   clears `fpu_owner` (its defensive null-area path instead holds
-//!   `(CR0.TS=0, fpu_owner=null)` between clearing the slot and re-arming TS).
-//!   Called with `IF=0` after the scheduler locks are dropped; the outgoing
-//!   thread's `switch()` then publishes `context_saved = 1` (Release), which
-//!   is what publishes the area to peer CPUs.
-//!
-//! [`switch_out_save`] eagerly XSAVEs the live regs into T's TCB area
-//! and clears `fpu_owner` whenever this CPU still owns the outgoing
-//! thread, then arms `CR0.TS=1`. [`switch_in_restore`] just sets
-//! `CR0.TS=1`; the first FP op by the incoming thread traps to `#NM`
-//! (`idt::nm_handler`), which XRSTORs the thread's area and installs
-//! it as the new `fpu_owner`. The resulting migration guarantee (no cross-CPU
-//! FPU coordination) is specified in core/kernel/docs/scheduling-internals.md
-//! § IPI Taxonomy.
-//!
-//! Only save is eager; restore stays lazy via `#NM`. The cost is one XSAVE per
-//! switch-out of a thread that owns the live FP state; in exchange no cross-CPU
-//! FPU flush IPI is needed (core/kernel/docs/scheduling-internals.md § IPI
-//! Taxonomy).
+//! A user thread's state is live in the registers whenever it runs in user
+//! mode, and no other thread's is (`sched::fpu_switch`). [`switch_out_save`]
+//! XSAVEs the outgoing user thread's registers into its area and leaves this
+//! CPU's `fpu_owner` naming it. [`switch_in_restore`] XRSTORs the incoming
+//! user thread's area unless `fpu_owner` names it and its `fpu_cpu` names this
+//! CPU, which together mean the registers still hold its state, and records
+//! both. A kernel thread or idle loads nothing: the kernel is soft-float, so the
+//! registers keep the owner's state while it runs. CR0.TS stays clear, so no
+//! instruction traps to `#NM`; a `#NM` is an unexpected exception
+//! (`idt::exception_handler`). The migration guarantee (no cross-CPU FPU
+//! coordination) is in core/kernel/docs/scheduling-internals.md § IPI Taxonomy.
 
 // ── CR0 ───────────────────────────────────────────────────────────────────────
 
 /// CR0.TS bit (Task Switched).
 ///
-/// When set, any x87/SSE/AVX instruction raises `#NM` (vector 7). The kernel
-/// uses this for the lazy-restore discipline: TS=1 on context-switch-in,
-/// the first user FP/SIMD use traps and the handler restores extended state.
+/// When set, any x87/SSE/AVX instruction raises `#NM` (vector 7), and so do
+/// XSAVE and XRSTOR. [`enable_xsave`] clears it on every CPU at boot, and
+/// nothing sets it.
 const CR0_TS: u64 = 1 << 3;
 
-/// CR0.MP (bit 1): `WAIT`/`FWAIT` honour CR0.TS and raise `#NM`, so they do
-/// not run against another thread's live x87 state.
+/// CR0.MP (bit 1): `WAIT`/`FWAIT` honour CR0.TS, the setting the x87
+/// architecture expects with `NE`; TS stays clear, so they never raise `#NM`.
 const CR0_MP: u64 = 1 << 1;
 
 /// CR0.EM (bit 2): x87 emulation; makes every x87 instruction raise `#NM` and
@@ -104,40 +76,6 @@ pub unsafe fn write_cr0(val: u64)
     // SAFETY: caller's responsibility.
     unsafe {
         core::arch::asm!("mov cr0, {}", in(reg) val, options(nostack, nomem));
-    }
-}
-
-/// Set CR0.TS so the next x87/SSE/AVX instruction raises `#NM`.
-///
-/// # Safety
-/// Must execute at ring 0.
-#[cfg(not(test))]
-#[inline]
-pub unsafe fn cr0_set_ts()
-{
-    // SAFETY: setting TS is always safe at ring 0; trap on first FP use is the desired effect.
-    unsafe {
-        write_cr0(read_cr0() | CR0_TS);
-    }
-}
-
-/// Clear CR0.TS so x87/SSE/AVX instructions execute without trapping.
-///
-/// Called before XSAVE/XRSTOR, which raise `#NM` while CR0.TS=1: by the `#NM`
-/// handler before saving the previous owner and restoring the trapping
-/// thread's state, and by [`switch_out_save`] before saving the outgoing
-/// thread's state.
-///
-/// # Safety
-/// Must execute at ring 0. Caller is responsible for ensuring the live
-/// extended-state register file matches the thread that will run next.
-#[cfg(not(test))]
-#[inline]
-pub unsafe fn cr0_clear_ts()
-{
-    // SAFETY: clearing TS is safe at ring 0; effect documented above.
-    unsafe {
-        write_cr0(read_cr0() & !CR0_TS);
     }
 }
 
@@ -191,7 +129,7 @@ unsafe fn xsetbv(xcr: u32, val: u64)
 /// Enable XSAVE and the x87+SSE+AVX component set in XCR0.
 ///
 /// Also sets CR0's user-visible x87 and alignment controls (`MP`, `NE` set;
-/// `EM`, `AM` clear).
+/// `EM`, `AM` clear) and clears `TS`, which nothing sets after.
 ///
 /// Must be called once per CPU during early init. On the BSP it runs from
 /// `interrupts::init` before the IDT is loaded (a CR4/XCR0 fault there is not
@@ -199,8 +137,7 @@ unsafe fn xsetbv(xcr: u32, val: u64)
 /// Fatal if the CPU does not support XSAVE (CPUID.01H:ECX bit 26) — the kernel
 /// targets x86-64-v3 which requires it.
 ///
-/// After this returns, [`cr0_set_ts`] / [`cr0_clear_ts`] can be used to arm
-/// and disarm the `#NM` lazy-trap discipline.
+/// After this returns, XSAVE and XRSTOR run without trapping.
 ///
 /// # Safety
 /// Must execute at ring 0 during per-CPU early init.
@@ -235,16 +172,18 @@ pub unsafe fn enable_xsave()
         xsetbv(0, XCR0_V3);
     }
 
-    // CR0's user-visible x87 and alignment controls. The BSP runs on the CR0
-    // the firmware left and each AP on the one INIT leaves (NE, MP and AM
-    // clear), so set each explicitly: MP and NE set, EM and AM clear. Ring 3
-    // then gets x87 errors as `#MF`, `#NM` for `WAIT` under TS, and no
-    // alignment checking, on every CPU.
+    // CR0's user-visible x87 and alignment controls, and TS. The BSP runs on
+    // the CR0 the firmware left and each AP on the one INIT leaves (NE, MP and
+    // AM clear), so set each explicitly: MP and NE set, EM, AM and TS clear.
+    // Ring 3 then gets x87 errors as `#MF` and no alignment checking, and
+    // XSAVE, XRSTOR and every x87/SSE/AVX instruction run without `#NM`, on
+    // every CPU.
     // SAFETY: ring 0; MP and NE are architectural on every x86-64 CPU, and
     // clearing EM and AM changes no translation or protection the kernel
-    // relies on (the kernel runs soft-float and never sets RFLAGS.AC at CPL 3).
+    // relies on (the kernel runs soft-float and never sets RFLAGS.AC at CPL 3);
+    // clearing TS before any thread's state is loaded exposes no state.
     unsafe {
-        write_cr0((read_cr0() & !(CR0_EM | CR0_AM)) | CR0_MP | CR0_NE);
+        write_cr0((read_cr0() & !(CR0_EM | CR0_AM | CR0_TS)) | CR0_MP | CR0_NE);
     }
 }
 
@@ -365,8 +304,7 @@ pub unsafe fn report_save_area()
 /// Must execute at ring 0 with CR0.TS clear. `area` must satisfy the alignment
 /// and size requirements above. Called from `switch_out_save` (interrupts
 /// disabled, after the scheduler locks are dropped and before `switch()`
-/// publishes `context_saved`) and from the `#NM` handler (interrupts
-/// disabled, preemption disabled).
+/// publishes `context_saved`).
 #[cfg(not(test))]
 #[inline]
 pub unsafe fn save_to(area: *mut u8)
@@ -393,9 +331,9 @@ pub unsafe fn save_to(area: *mut u8)
 /// [`init_save_area`] writes its initial value there.
 ///
 /// # Safety
-/// Must execute at ring 0. `area` must point at an XSAVE buffer previously
-/// written by [`save_to`] or by [`init_save_area`]. Called from the `#NM`
-/// trap handler with CR0.TS already cleared.
+/// Must execute at ring 0 with CR0.TS clear. `area` must point at an XSAVE
+/// buffer previously written by [`save_to`] or by [`init_save_area`]. Called
+/// from `switch_in_restore` with interrupts disabled.
 #[cfg(not(test))]
 #[inline]
 pub unsafe fn restore_from(area: *const u8)
@@ -414,22 +352,15 @@ pub unsafe fn restore_from(area: *const u8)
 
 /// Context-switch hook called on switch-out of any thread.
 ///
-/// Eagerly persists the live extended-state register file: if this CPU's
-/// `fpu_owner` still names `tcb` and `tcb`'s extended-state area is
-/// allocated, XSAVE into the area, clear `fpu_owner`, and arm
-/// `CR0.TS=1`. Otherwise (no live state, or live state belongs to some
-/// other thread that took an `#NM` since `tcb` last switched out), just
-/// arm `CR0.TS=1`.
+/// Saves the live extended-state registers of a user thread: when this CPU's
+/// `fpu_owner` names `tcb`, which it does for every user thread that ran here
+/// since its switch-in, XSAVE into `tcb`'s area. `fpu_owner` and the thread's
+/// `fpu_cpu` are left naming each other, so a switch back to `tcb` on this CPU
+/// with no other user thread between loads nothing. A thread this CPU's owner
+/// does not name (kernel threads and idle, whose area is null) saves nothing.
 ///
-/// Postcondition: this CPU's `fpu_owner` does not name `tcb` on return.
-/// `tcb`'s extended-state area, if any, is canonical and safe for any
-/// other CPU to XRSTOR from on first FP use.
-///
-/// Hot-path cost: one Acquire load of `fpu_owner` and a CR0.TS re-arm for
-/// threads this CPU's owner slot does not name (kernel-only / idle threads, and
-/// threads that have not touched FP since their last switch-in). The
-/// XSAVE+TS+null-store path runs only when this CPU genuinely holds `tcb`'s
-/// live regs.
+/// Postcondition: `tcb`'s area holds its current state, for any CPU to XRSTOR
+/// at its next switch-in.
 ///
 /// # Safety
 /// Must execute at ring 0 with interrupts disabled, before the outgoing
@@ -441,73 +372,80 @@ pub unsafe fn restore_from(area: *const u8)
 #[inline]
 pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
-    if tcb.is_null()
+    // SAFETY: tcb is valid (caller); `extended.area` is immutable after construction.
+    let area = unsafe { (*tcb).extended.area };
+    if area.is_null()
     {
-        // SAFETY: ring 0; defensive arm of the lazy trap.
-        unsafe {
-            cr0_set_ts();
-        }
         return;
     }
     let cpu = super::cpu::current_cpu() as usize;
     // SAFETY: `cpu` is the executing CPU's logical index, below CPU_COUNT.
-    let owner_slot = unsafe { crate::percpu::fpu_owner_for(cpu) };
-    let owner = owner_slot.load(core::sync::atomic::Ordering::Acquire);
+    let owner =
+        unsafe { crate::percpu::fpu_owner_for(cpu) }.load(core::sync::atomic::Ordering::Relaxed);
     if owner == tcb
     {
-        // SAFETY: caller guarantees tcb is valid; area is page-resident
-        // for the TCB's lifetime when non-null.
-        let area = unsafe { (*tcb).extended.area };
-        if !area.is_null()
-        {
-            // SAFETY: ring 0; the live regs belong to this TCB (ownership
-            // observed), and TS is set again after the save below.
-            unsafe {
-                cr0_clear_ts();
-            }
-            // SAFETY: area satisfies XSAVE alignment and size; we observed
-            // ownership, so the live regs belong to this TCB.
-            unsafe {
-                save_to(area);
-            }
-            // SAFETY: ring 0; CR0.TS=1 re-arms the lazy trap.
-            unsafe {
-                cr0_set_ts();
-            }
-            owner_slot.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
-            return;
+        // SAFETY: CR0.TS is clear; area satisfies XSAVE alignment and size; this
+        // CPU's owner names tcb, so the live registers are tcb's.
+        unsafe {
+            save_to(area);
         }
-        // Defensive: owner names tcb but its area is null. A user thread
-        // that became owner must have a backing area (nm_handler refuses
-        // to install ownership without one); reaching here implies a
-        // kernel bug. Clear owner and re-arm TS so the invariant holds.
-        owner_slot.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
-    }
-    // SAFETY: ring 0; CR0.TS=1 is the architected lazy-trap arm.
-    unsafe {
-        cr0_set_ts();
     }
 }
 
-/// Context-switch hook called on switch-in of any thread.
+/// Context-switch hook called on switch-in of any thread, after the Acquire of
+/// its `context_saved`.
 ///
-/// Arms `CR0.TS=1` so the first user FP instruction by `tcb` traps to
-/// `#NM`, which XRSTORs `tcb`'s extended-state area and installs `tcb`
-/// as this CPU's `fpu_owner`. The eager-save discipline in
-/// [`switch_out_save`] guarantees that `fpu_owner` on this CPU does not
-/// transiently name some other thread whose live regs we would clobber.
+/// For a user thread, XRSTOR its area unless this CPU's `fpu_owner` names it
+/// and its `fpu_cpu` names this CPU (`sched::fpu_switch::in_use_action`), then
+/// name it the owner and this CPU its `fpu_cpu`. A kernel thread or idle (null
+/// area) loads nothing and leaves the owner as it is.
 ///
 /// # Safety
-/// Must execute at ring 0 with interrupts disabled, after the matching
-/// `switch_out_save` for the outgoing thread has completed. `_tcb` must
-/// be a valid TCB pointer.
+/// Must execute at ring 0 with interrupts disabled, after the outgoing thread's
+/// `switch_out_save` and after this CPU's Acquire of `tcb`'s `context_saved`,
+/// which orders the previous CPU's save of the area and its write of
+/// `fpu_cpu` before the reads here. `tcb` must be a valid TCB pointer.
 #[cfg(not(test))]
 #[inline]
-pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBlock)
+pub unsafe fn switch_in_restore(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
-    // SAFETY: ring 0; CR0.TS=1 is the architected lazy-trap arm.
-    unsafe {
-        cr0_set_ts();
+    use crate::sched::fpu_switch::{InUseAction, Owner, in_use_action};
+
+    // SAFETY: tcb is valid (caller); `extended` is a field of it.
+    let ext = unsafe { &(*tcb).extended };
+    if ext.area.is_null()
+    {
+        return;
+    }
+    let cpu = super::cpu::current_cpu();
+    // SAFETY: `cpu` is the executing CPU's logical index, below CPU_COUNT.
+    let owner_slot = unsafe { crate::percpu::fpu_owner_for(cpu as usize) };
+    let owner = Owner::of(
+        owner_slot
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .cast_const(),
+        tcb.cast_const(),
+    );
+    match in_use_action(
+        owner,
+        ext.fpu_cpu.load(core::sync::atomic::Ordering::Relaxed),
+        cpu,
+    )
+    {
+        InUseAction::Keep =>
+        {}
+        InUseAction::Load =>
+        {
+            // SAFETY: CR0.TS is clear; the area was written by init_save_area or
+            // by this thread's own switch-out saves, the last of them ordered
+            // before this read by the context_saved Acquire.
+            unsafe {
+                restore_from(ext.area);
+            }
+            owner_slot.store(tcb, core::sync::atomic::Ordering::Relaxed);
+            ext.fpu_cpu
+                .store(cpu, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

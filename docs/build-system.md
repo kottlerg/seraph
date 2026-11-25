@@ -189,7 +189,7 @@ modes check it), where x86-64, whose `call` pushes the return address, needs one
 
 - `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
   SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, CX16, LAHF/SAHF,
-  plus XSAVE/XSAVEOPT for the eager-save / lazy-restore discipline.
+  plus XSAVE/XSAVEOPT for the switch-out save.
 - `riscv64a23-seraph.json` — a subset of the **RVA23U64** userspace profile (RVA23 v1.0,
   ratified 2024-10-21): IMAFDCV plus the Zba/Zbb/Zbs bitmanip set,
   hard-float LP64D ABI.
@@ -199,10 +199,10 @@ These JSONs pin the *instruction baseline* (the psABI feature level the toolchai
 uses opportunistically, or does not support, and the boot-time feature-gate that enforces it — is in
 [platform-requirements.md](platform-requirements.md).
 
-Userspace correctness under preemption is provided by eager FP/SIMD/V save
-on switch-out and lazy restore on first FP/V use after switch-in (`#NM`
-trap on x86-64, illegal-instruction trap on RISC-V). The switch-out save discipline is
-specified in [scheduling-internals.md](../core/kernel/docs/scheduling-internals.md#ipi-taxonomy);
+Userspace correctness under preemption is provided by an FP/SIMD/V save on switch-out and a
+load on switch-in unless the registers still hold the thread's state; the state is live whenever
+a user thread runs. The discipline is specified in
+[scheduler.md](../core/kernel/docs/scheduler.md#what-gets-saved-and-restored);
 the per-arch primitives are in `core/kernel/src/arch/{x86_64,riscv64}/fpu.rs`.
 
 The x86-64 bootloader uses the built-in `x86_64-unknown-uefi` target, so no

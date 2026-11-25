@@ -24,7 +24,7 @@
 //! # Entry and exit discipline
 //! Every stub that runs kernel code clears DF and AC (`cld`, `clac`) on entry and
 //! runs that code on the kernel GS base; in debug builds the exception, `#PF`,
-//! `#NM`, and IRQ handler bodies assert AC, DF and TF clear first
+//! and IRQ handler bodies assert AC, DF and TF clear first
 //! (`cpu::debug_assert_kernel_entry_flags`). The normal stubs swap GS when the saved
 //! CS is ring 3 (`entry_swapgs_asm` / `exit_swapgs_asm`, and the ring-3 path of
 //! `common_irq_trampoline`). The paranoid stubs (NMI, `#DB`, `#DF`, `#MC`) can
@@ -655,8 +655,8 @@ pub(super) unsafe extern "C" fn common_exception_handler(
 
 /// Generic exception dispatch for vectors routed through
 /// [`common_exception_trampoline`] or [`paranoid_exception_trampoline`] (every
-/// ring-3-reachable vector except `#PF`, `#NM`, and NMI, which have dedicated
-/// stubs; `#DB`, `#DF`, and `#MC` take the paranoid trampoline).
+/// ring-3-reachable vector except `#PF` and NMI, which have dedicated stubs;
+/// `#DB`, `#DF`, and `#MC` take the paranoid trampoline).
 ///
 /// A userspace exception whose thread has a bound fault handler is redirected to
 /// it ([`redirect_user_exception`]); on a resume reply this returns and the
@@ -972,7 +972,9 @@ isr_stub!(isr3, 3, has_error_code = false);
 isr_stub!(isr4, 4, has_error_code = false);
 isr_stub!(isr5, 5, has_error_code = false);
 isr_stub!(isr6, 6, has_error_code = false);
-// Vector 7 (#NM) has a dedicated handler — see `isr_nm` below.
+// #NM: CR0.TS and CR0.EM stay clear, so no instruction raises it; one that
+// arrives anyway is an unexpected exception like any other.
+isr_stub!(isr7, 7, has_error_code = false);
 paranoid_isr_stub!(isr8, 8, has_error_code = true); // Double Fault — IST1
 isr_stub!(isr9, 9, has_error_code = false);
 isr_stub!(isr10, 10, has_error_code = true);
@@ -1252,162 +1254,6 @@ pub unsafe extern "custom" fn isr_timer()
 unsafe extern "custom" fn isr_spurious()
 {
     core::arch::naked_asm!("iretq");
-}
-
-/// `#NM` (Device Not Available, vector 7) handler stub.
-///
-/// `#NM` fires when CR0.TS = 1 and a user thread executes an x87/SSE/AVX
-/// instruction. The stub saves the caller-saved GPRs around a call to
-/// [`nm_handler`], which performs the lazy save/restore and ownership hand-off,
-/// and then `iretq`s, so hardware re-executes the trapping instruction.
-#[cfg(not(test))]
-#[unsafe(naked)]
-unsafe extern "custom" fn isr_nm()
-{
-    core::arch::naked_asm!(
-        // Hardware frame: [rsp] = rip, [rsp + 8] = cs.
-        entry_swapgs_asm!("8"),
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        // From ring 3, set IBRS, issue the IBPB and the fill after it, and
-        // clear the branch history where the selection asks for them, before
-        // the handler (see `tf_build_asm`); CS is at [rsp + 80].
-        "test byte ptr [rsp + 80], 0x3",
-        "jz 87f",
-        "call seraph_enter_from_user",
-        "87:",
-        "call {handler}",
-        // To ring 3, the user-mode IA32_SPEC_CTRL value where the selection
-        // asks for it, with interrupts off and before the registers it
-        // clobbers are restored (see `tf_resume_asm`).
-        "cli",
-        "test byte ptr [rsp + 80], 0x3",
-        "jz 88f",
-        super::mitigation::ibrs_exit_asm!(),
-        "88:",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        exit_swapgs_asm!("8"),
-        "iretq",
-        handler = sym nm_handler,
-    );
-}
-
-/// `#NM` handler body — FPU lazy-restore dispatch.
-///
-/// Saves the previous owner's live register file into its TCB XSAVE
-/// area (if any), clears CR0.TS, XRSTORs the trapping thread's area into
-/// the live registers, and installs the trapping thread as this CPU's
-/// new `fpu_owner`. The trapping x87/SSE/AVX instruction then proceeds
-/// on re-execution. The area is allocated as the pages after the wrapper page
-/// of the Thread retype slot (`sched::thread_slot::EXTENDED_OFFSET`), so user threads
-/// always have a non-null area; thread creation writes the initial state
-/// into it (`fpu::init_save_area`), which the first XRSTOR restores.
-///
-/// Preemption is disabled across the handler body so a timer tick mid-
-/// sequence cannot reschedule between the prev-owner save and the new-
-/// owner restore, which would leave the per-CPU `fpu_owner` invariant
-/// transiently violated.
-#[cfg(not(test))]
-extern "C" fn nm_handler()
-{
-    super::cpu::debug_assert_kernel_entry_flags();
-    crate::percpu::preempt_disable();
-
-    let cpu = super::cpu::current_cpu() as usize;
-    // SAFETY: `cpu` is the executing CPU's logical index, below CPU_COUNT.
-    let owner_slot = unsafe { crate::percpu::fpu_owner_for(cpu) };
-    // Read the prior owner (if any) so we can save its live regs
-    // before XRSTOR'ing this thread's area. The atomic swap is
-    // simpler than load-then-store but is not load-bearing for
-    // concurrency: after #108 the only writer is this same handler
-    // (and `switch_out_save` on this CPU), and both run with
-    // preemption disabled — no cross-CPU race on this slot.
-    let prev = owner_slot.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
-
-    // SAFETY: current_tcb returns this CPU's running thread; valid in
-    // exception context because we entered from a user FP instruction
-    // (the trap fires only on x87/SSE/AVX in U-mode given the kernel is
-    // soft-float).
-    let tcb = unsafe { crate::syscall::current_tcb() };
-    if tcb.is_null()
-    {
-        // No current thread — should not happen at #NM but be defensive.
-        // Re-establish the (TS=1, owner=null) state.
-        // SAFETY: ring 0.
-        unsafe {
-            super::fpu::cr0_set_ts();
-        }
-        crate::percpu::preempt_enable();
-        return;
-    }
-
-    if !prev.is_null() && prev != tcb
-    {
-        // SAFETY: prev was the live owner; its extended.area is page-
-        // resident for the TCB's lifetime when non-null. XSAVE requires
-        // TS=0; clear it before the save instruction.
-        let prev_area = unsafe { (*prev).extended.area };
-        if !prev_area.is_null()
-        {
-            // SAFETY: ring 0; the live regs belong to prev, saved below,
-            // and the restore below then loads tcb's.
-            unsafe {
-                super::fpu::cr0_clear_ts();
-            }
-            // SAFETY: prev_area satisfies XSAVE alignment and size, and the
-            // live regs belong to prev, their owner.
-            unsafe {
-                super::fpu::save_to(prev_area);
-            }
-        }
-    }
-
-    // SAFETY: tcb validated non-null. extended.area is page-resident in
-    // the Thread retype slot and lives for the TCB's lifetime.
-    let area = unsafe { (*tcb).extended.area };
-    if area.is_null()
-    {
-        // A user thread without a backing area cannot legitimately take
-        // an FP trap, but we observed one. Re-arm TS for safety and bail.
-        // SAFETY: ring 0.
-        unsafe {
-            super::fpu::cr0_set_ts();
-        }
-        crate::percpu::preempt_enable();
-        return;
-    }
-
-    // SAFETY: ring 0; the restore below loads tcb's state, the thread that
-    // runs next.
-    unsafe {
-        super::fpu::cr0_clear_ts();
-    }
-    // SAFETY: area is a valid XSAVE buffer; we hold logical ownership of the
-    // live regs (prev was swapped out atomically).
-    unsafe {
-        super::fpu::restore_from(area);
-    }
-    // Publish new ownership. Release pairs with the Acquire load in
-    // switch_out_save (the only other reader of this slot after eager
-    // save eliminated the cross-CPU flush IPI).
-    owner_slot.store(tcb, core::sync::atomic::Ordering::Release);
-
-    crate::percpu::preempt_enable();
 }
 
 /// Page-fault (`#PF`, vector 14) stub.
@@ -1716,7 +1562,8 @@ unsafe fn redirect_user_exception(
 /// Map an x86-64 exception vector to the architecture-neutral
 /// [`syscall::FAULT_EXC_UNKNOWN`]-family normalized code delivered in a
 /// `FAULT_KIND_EXCEPTION` message. Vectors with a dedicated path (`#PF` = 14,
-/// `#NM` = 7, NMI = 2) never reach here.
+/// NMI = 2) never reach here; `#NM` (7), which CR0.TS and CR0.EM clear keep
+/// from occurring, maps to `FAULT_EXC_UNKNOWN`.
 #[cfg(not(test))]
 fn normalize_x86_exception(vector: u64) -> u64
 {
@@ -2027,7 +1874,7 @@ pub unsafe fn init()
     set(4, isr4, 0);
     set(5, isr5, 0);
     set(6, isr6, 0);
-    set(7, isr_nm, 0); // #NM — lazy FPU enable, not fatal
+    set(7, isr7, 0);
     set(8, isr8, 1); // Double Fault — IST1
     set(9, isr9, 0);
     set(10, isr10, 0);

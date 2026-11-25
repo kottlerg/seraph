@@ -418,14 +418,14 @@ is.
   `services/devmgr/firmware/src/dtb.rs` prove the same property ([testing.md](testing.md)
   § Bounded verification); CI's `kani` job runs them. The RSDP, an SDT header, the XSDT up to two
   entries, the FADT, the SPCR and the device tree's header are proven whole on any input up to
-  their bounds, and so is a resource template of up to 4 bytes; the MCFG, the MADT, the DMAR, the
-  RIMT, the AML and the device tree by their steps: each table's end, an MCFG entry, a MADT
-  structure, a DMAR remapping structure and device scope, a RIMT node and ID mapping, an AML term,
-  the record of a `Name`'s value, the take of a `Method` and the rule that reports a device, one
-  resource descriptor, a device tree token, the walk's step over the structure block and the step
-  of an ECAM node's read from any state, the reads of the node's properties and its window, the
-  `compatible` match and the fallback segments, at any place. The loops that drive the steps are
-  left to the fuzz target.
+  their bounds; the MCFG, the MADT, the DMAR, the RIMT, the AML, a resource template and the device
+  tree by their steps: each table's end, an MCFG entry, a MADT structure, a DMAR remapping structure
+  and device scope, a RIMT node and ID mapping, an AML term, the record of a `Name`'s value, the
+  take of a `_CID` value and of each element of a `_CID` `Package`, the take of a `Method` and
+  the rule that reports a device, one resource descriptor after any count of resources, a device
+  tree token, the walk's step over the structure block and the step of an ECAM node's read from any
+  state, the reads of the node's properties and its window, the `compatible` match and the fallback
+  segments, at any place. The loops that drive the steps are left to the fuzz target.
 
 **Gaps.**
 

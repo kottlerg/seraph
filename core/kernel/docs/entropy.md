@@ -12,8 +12,9 @@ bytes to the pool.
 
 This subsystem is the kernel's sole source of randomness, for both
 kernel-internal consumers and the userspace `SYS_GETRANDOM` syscall (see
-[core/kernel/docs/syscalls.md](syscalls.md)). Kernel consumers call `fill_bytes` directly;
-userspace draws through the syscall, which fills the caller's buffer from the
+[core/kernel/docs/syscalls.md](syscalls.md)). Kernel consumers call `fill_bytes` or
+`next_u32` directly (§ Draw API and consumers); userspace draws through the
+syscall, which fills the caller's buffer from the
 same per-CPU generators. Userspace holds **no** generator state of its own — every
 draw advances the kernel generator — so the two surfaces share the per-CPU
 generators but no userspace-resident secret.

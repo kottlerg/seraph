@@ -45,7 +45,9 @@ const _: () = assert!(
 
 impl CpuRng
 {
-    /// A zero-initialized generator (matches a zeroed slab slot).
+    /// An unseeded generator with an empty, zeroed block. A zeroed slab slot
+    /// differs only in the block's index, which serves nothing before the
+    /// mandatory reseed an unseeded generator takes, and that reseed erases.
     pub const fn new() -> Self
     {
         Self {

@@ -2149,13 +2149,13 @@ cargo xtask run --arch <arch> --iommu absent --runs 1 --timeout 840 \
 ```
 
 **Large-memory cell.** One svctest boot, on each architecture, at 4 CPUs and 8192 MiB, staged as the
-canonical svctest cell stages it (`mkdisk --svctest ci`, crashd's test recipe included, with the
-test devices) on a debug-profile sysroot; the release host runs boot it once each, and no pull
-request owes it. svctest's phases size their work by the guest's RAM against margins that stay
-fixed, so a cost that grows with RAM overtakes such a margin only above some RAM size, and only a
-boot above that size finds the defect; the memory variation's 1024 MiB can lie below that size. No
-changed line identifies a sizing of that kind, so no surface could owe the cell to a pull request
-without a judgement call; the release host runs boot it whatever the release's pull requests
+canonical svctest cell stages it (`mkdisk --svctest ci`, its fixtures, crashd's test recipe and
+oomd's, with the test devices) on a debug-profile sysroot; the release host runs boot it once each,
+and no pull request owes it. svctest's phases size their work by the guest's RAM against margins
+that stay fixed, so a cost that grows with RAM overtakes such a margin only above some RAM size, and
+only a boot above that size finds the defect; the memory variation's 1024 MiB can lie below that
+size. No changed line identifies a sizing of that kind, so no surface could owe the cell to a pull
+request without a judgement call; the release host runs boot it whatever the release's pull requests
 touched, as they boot the boundary set. At 8192 MiB every byte count sized by RAM is past 2^32 as
 well, and real hardware has that much RAM. Its budget, 11340 s, is the larger of three times its
 riscv64 boot on the reference host (3777 s) and that boot plus 100 s, rounded up to a minute, the

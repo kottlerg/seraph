@@ -15,7 +15,7 @@
 //! `DMA_UNMAP`, and `DMA_FAULTS` (`ipc::devmgr_dma_labels`) on its own, at the boot drivers'
 //! level (`BOOT_DRIVER_PRIORITY`, above devmgr's), so a driver's mapping never
 //! waits for the control thread: that thread makes nested calls (a
-//! `CREATE_FROM_FILE` reads the driver binary through virtio-blk, which maps
+//! `READ_VERIFIED` of a driver image reads it through virtio-blk, which maps
 //! the read's buffer) and settles a batch whose drivers map their rings
 //! before they report ready.
 //!

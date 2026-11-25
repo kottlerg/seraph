@@ -14,8 +14,8 @@
 //! walk with the MSI and MSI-X capability fields, and the Function Level Reset
 //! fields, walks PCI configuration space through a caller-supplied accessor,
 //! chooses the driver declaration that binds each device record within the
-//! declaration bounds (`binding`), bounds the reads of a candidate driver
-//! binary (`image`), keeps the table of MMIO and interrupt range caps devmgr
+//! declaration bounds and records the entries a drivers-directory listing
+//! names (`binding`), keeps the table of MMIO and interrupt range caps devmgr
 //! carves per-device caps from, holds the interrupt lines it has carved so
 //! every device on a line gets its own derivation, tracks which spawned drivers
 //! reported their device ready, and keeps each class's served drivers, by class
@@ -39,8 +39,9 @@
 //! grant and their poller's actions, and places, programs and admits a
 //! hot-added function's BARs and record (`hotplug`), and names the requests
 //! refused while devmgr's `CSpace` is short of its headroom (`headroom`). The
-//! contract of the ACPI table decoders, the AML aside, is one property
-//! (`property`, built for host tests, proofs and fuzzing only). The
+//! contract of the firmware-table decoders, the ACPI tables, the AML walk
+//! with its resource templates and the flattened device tree, is one
+//! property (`property`, built for host tests, proofs and fuzzing only). The
 //! functions read caller-mapped byte slices or values, or reach the platform
 //! only through a caller-supplied accessor or split operation, and touch no
 //! syscall, IPC, or `std::os::seraph` surface, so the crate is host-reachable
@@ -61,7 +62,6 @@ pub mod dmar;
 pub mod dtb;
 pub mod headroom;
 pub mod hotplug;
-pub mod image;
 pub mod iommu_restart;
 pub mod lines;
 pub mod pci;
@@ -102,7 +102,7 @@ mod tests
 {
     use std::vec::Vec;
 
-    use crate::{acpi, acpid, dmar, platform, property, rimt};
+    use crate::{acpi, acpid, aml, dmar, dtb, platform, property, rimt};
 
     /// The checked-in fuzz inputs of the kinds given (`seeds`,
     /// `regressions`).
@@ -210,6 +210,62 @@ mod tests
         assert!(
             any(&|s| platform::spcr(s).is_some_and(|t| t.interrupt.is_some())),
             "an SPCR"
+        );
+    }
+
+    // Defect caught: seeds that no longer reach the AML walk's devices, every
+    // kind of resource the adapter reports, or the device tree's windows.
+    #[test]
+    fn the_seeds_reach_the_aml_and_device_tree_decoders()
+    {
+        /// A check of one reported resource.
+        type Kind = fn(&aml::CrsResource) -> bool;
+        let seeds = fuzz_inputs(&["seeds"]);
+        let any = |accepts: &dyn Fn(&[u8]) -> bool| seeds.iter().any(|s| accepts(s));
+        let devices = |s: &[u8], want: &dyn Fn(&aml::AmlDevice<'_>) -> bool| {
+            let mut hit = false;
+            aml::devices(s, |d| hit |= want(d));
+            hit
+        };
+        assert!(
+            any(&|s| devices(s, &|d| d.hid.is_some()
+                && d.uid.is_some()
+                && d.crs.is_some_and(|c| aml::crs_resources(c, |_| {}) > 1))),
+            "a device with a _UID and resources"
+        );
+        assert!(any(&|s| devices(s, &|d| d.cids[0].is_some())), "a _CID");
+        let resources = |s: &[u8], want: &dyn Fn(&aml::CrsResource) -> bool| {
+            let mut hit = false;
+            aml::crs_resources(s, |r| hit |= want(&r));
+            hit
+        };
+        let kinds: [(&str, Kind); 4] = [
+            ("an MMIO range", |r| {
+                matches!(r, aml::CrsResource::Mmio { .. })
+            }),
+            ("I/O ports", |r| {
+                matches!(r, aml::CrsResource::IoPort { .. })
+            }),
+            ("an ISA IRQ", |r| {
+                matches!(r, aml::CrsResource::Interrupt { isa: true, .. })
+            }),
+            ("a GSI", |r| {
+                matches!(r, aml::CrsResource::Interrupt { isa: false, .. })
+            }),
+        ];
+        for (what, want) in kinds
+        {
+            assert!(any(&|s| resources(s, &want)), "{what}");
+        }
+        assert!(
+            any(&|s| aml::crs_resources(s, |_| {}) == aml::MAX_CRS_RESOURCES),
+            "a template at the bound"
+        );
+        assert!(
+            any(&|s| dtb::Fdt::new(s)
+                .and_then(|f| f.find_pci_ecams().ok())
+                .is_some_and(|w| w.len() > 2 && w.iter().any(|l| l.start_bus > 0))),
+            "a device tree of ECAM windows"
         );
     }
 }

@@ -270,8 +270,9 @@ For each matched device, devmgr:
 5. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
    boot-module driver (in the boot pass, from a derived copy of the module
    cap per device; the original is released once the pass ends) or
-   `CREATE_FROM_FILE` for a drivers-directory one (in the drivers-directory
-   pass, once `SET_DRIVERS_DIR` delivers the drivers directory), a DMA
+   `CREATE_PROCESS` for a drivers-directory one (in the drivers-directory
+   pass, once `SET_DRIVERS_DIR` delivers the drivers directory), from a copy of the Memory cap
+   of the run procmgr verified for the file (`READ_VERIFIED`, driver role), a DMA
    declaration's with `CREATE_PINNED` and `CREATE_DMA_HOLD`, so procmgr
    holds the driver's memory after its death until devmgr releases it, at
    the priority of its declared tier as its source allows. Both

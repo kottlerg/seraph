@@ -70,8 +70,9 @@ procmgr/
   [docs/signing.md](../../docs/signing.md) § Signature Policy in procmgr.
 - **Verified data reads** — copy a data file a process asks for
   (`READ_VERIFIED`) once into frames on that process's account, verify the
-  copy in the data or the configuration role, as the request names it, under the name it gives, and
-  hand it the run read-only, so it parses only a verified body no other process can write. See
+  copy in the data, configuration or driver role, as the request names it, under the name it gives
+  (the driver role only for a sender whose signature policy loads drivers), and hand it the run
+  read-only, so it parses only a verified body no other process can write. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § Label 31: `READ_VERIFIED`.
 - **ELF loading** — parse the verified ELF image,
   request memory caps from memmgr, map LOAD segments with correct
@@ -309,9 +310,9 @@ The full procmgr IPC specification is in
   binary and names it by its install path; procmgr opens the supplied file cap
   (`FS_OPEN`) in a session charged to the child, copies the signed object
   through its own open and verifies it.
-- `READ_VERIFIED(file_cap, file_size, role, name)` → the verified body of a data
-  or configuration file, read-only, in frames on the sender's account; procmgr verifies the
-  copy in the role the request names (data or configuration) under `name`.
+- `READ_VERIFIED(file_cap, file_size, role, name)` → the verified body of a data,
+  configuration or driver file, read-only, in frames on the sender's account; procmgr verifies the
+  copy in the role the request names under `name`.
 - `START_PROCESS(process_handle)` — start a previously created process
 - `CONFIGURE_NAMESPACE(process_handle)` — install root and (optional)
   cwd caps on the child before start; the sole path that writes

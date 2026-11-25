@@ -311,6 +311,13 @@ loader reached only through such an image is a defect, not an attack.
   in `core/boot/src/main.rs`), procmgr every image it creates (`services/procmgr/src/image.rs`);
   init loads memmgr and procmgr only from boot modules the bootloader verified
   ([signing.md](signing.md) § Verifier Discipline).
+- devmgr parses no byte of a drivers-directory file before procmgr has verified it: procmgr reads
+  each entry once into a run only memmgr can write and verifies it in the driver role under its
+  install path (`procmgr_labels::READ_VERIFIED`, refused to a reader whose policy loads no driver);
+  devmgr runs `elf::validate_executable`, `elf::find_note_streaming` and the declaration decoder
+  over the verified body alone, and creates the driver from the same run, which procmgr verifies
+  again (`verified_decl` in `services/devmgr/src/decls.rs`;
+  [driver-binding.md](driver-binding.md) § Declaration Bounds).
 - The ELF parser, `shared/elf`, reads only inside the slice it is given: `validate_executable`
   checks the identification, the type, the machine and the program-header table's bounds;
   `load_segments` refuses a segment whose file bytes lie past the image; `validate_relative_relocs`
@@ -355,12 +362,11 @@ loader reached only through such an image is a defect, not an attack.
 
 **Gaps.**
 
-- devmgr reads the ELF header, the section headers and the driver-declaration note of every file in
-  `/services/drivers/` before any verification, to choose the driver a device binds (`file_decl`,
-  `read_decl` in `services/devmgr/src/decls.rs`), so the storage writer reaches
-  `elf::validate_executable`, `elf::find_note_streaming` and the declaration decoder with bytes no
-  key signed. procmgr still refuses to run such a file
-  ([#1533](https://github.com/kottlerg/seraph/issues/1533)).
+- The set of images in `/services/drivers/` is not signed: the storage writer can remove a driver,
+  add one signed for its install path that the deployer did not install, or put back an older
+  signed copy whose security version the floor admits, and so change or block which driver a
+  device binds, though every driver devmgr binds is signed
+  ([#1665](https://github.com/kottlerg/seraph/issues/1665)).
 
 ---
 
@@ -408,26 +414,33 @@ is.
   `abi/init-protocol/src/lib.rs` proves the trim of every name and, by induction, `find_module_slot`
   ([testing.md](testing.md) § Bounded verification). CI's `kani` job runs them.
 - `devmgr-firmware` (`xtask/fuzz/targets/src/bin/devmgr-firmware.rs`) drives
-  `devmgr_firmware::property::firmware_holds` over an input read as each ACPI table devmgr's
-  `firmware` crate decodes apart from the AML, from the seeds in
+  `devmgr_firmware::property::firmware_holds` over an input read as each firmware table devmgr's
+  `firmware` crate decodes, from the seeds in
   `services/devmgr/firmware/fuzz/devmgr-firmware/seeds/`: the RSDP, an SDT header, the XSDT, the
-  FADT, the MCFG, the MADT, the DMAR, the RIMT and the SPCR. CI's gating `fuzz` job runs it on a
-  pull request whose change can affect it and the campaign for 30 minutes.
-- The `proofs` modules of `services/devmgr/firmware/src/acpi.rs`, `dmar.rs`, `rimt.rs` and
-  `platform.rs` prove the same property ([testing.md](testing.md) § Bounded verification); CI's
-  `kani` job runs them. The RSDP, an SDT header, the XSDT up to two entries, the FADT and the SPCR
-  are proven whole on any input up to their bounds; the MCFG, the MADT, the DMAR and the RIMT by
-  their steps: each table's end, an
-  MCFG entry, a MADT structure, a DMAR remapping structure and device scope, and a RIMT node and
-  ID mapping, at any place. The loops that drive the steps are left to the fuzz target.
+  FADT, the MCFG, the MADT, the DMAR, the RIMT, the SPCR, a DSDT or SSDT's AML with each reported
+  device's resource template, a resource template, and a flattened device tree. CI's gating `fuzz`
+  job runs it on a pull request whose change can affect it and the campaign for 30 minutes.
+- The `proofs` modules of `services/devmgr/firmware/src/acpi.rs`,
+  `services/devmgr/firmware/src/dmar.rs`, `services/devmgr/firmware/src/rimt.rs`,
+  `services/devmgr/firmware/src/platform.rs`, `services/devmgr/firmware/src/aml.rs` and
+  `services/devmgr/firmware/src/dtb.rs` prove the same property ([testing.md](testing.md)
+  § Bounded verification); CI's `kani` job runs them. The RSDP, an SDT header, the XSDT up to two
+  entries, the FADT, the SPCR and the device tree's header are proven whole on any input up to
+  their bounds; the MCFG, the MADT, the DMAR, the RIMT, the AML, a resource template and the device
+  tree by their steps: each table's end, an MCFG entry, a MADT structure, a DMAR remapping structure
+  and device scope, a RIMT node and ID mapping, an AML term, the record of a `Name`'s value, the
+  take of a `_CID` value and of each element of a `_CID` `Package`, the take of a `Method` and
+  the rule that reports a device, one resource descriptor after any count of resources, a device
+  tree token, the walk's step over the structure block and the step of an ECAM node's read from any
+  state, the reads of the node's properties and its window, the `compatible` match and the fallback
+  segments, at any place. The loops that drive the steps are left to the fuzz target.
 
 **Gaps.**
 
 - The bundle header is unsigned, so the attacker can drop an entry, which fails the boot when it is
   needed ([signing.md](signing.md) § Which Stage Verifies What).
-- The bootloader's firmware-table parsers (`core/boot/src/acpi.rs` and `core/boot/src/dtb.rs`), and
-  the AML namespace walk and the Device Tree walk of devmgr's `firmware` crate (`aml.rs`,
-  `dtb.rs`), have no fuzz target or proof harness yet; they are planned
+- The bootloader's firmware-table parsers (`core/boot/src/acpi.rs` and `core/boot/src/dtb.rs`) have
+  no fuzz target or proof harness yet; they are planned
   ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---
@@ -470,12 +483,32 @@ describes the remapping units truly.
   Discovery and Programming, § Interrupt Delivery; `carve_pci_device` and `give_msix` in
   `services/devmgr/src/bind.rs`, `services/devmgr/src/intremap.rs`, `reach_interrupt_file` in
   `services/devmgr/src/dma.rs`).
+- A driver takes a used-ring element only for a chain it has outstanding, with its length clamped
+  to the chain's device-writable buffers, and refuses a used index past its outstanding chains,
+  freeing nothing on a refusal; it reads each device-written field once and never reads back the
+  descriptor table or the available index, and reads a 64-bit configuration field only whole under
+  one configuration generation (`Chains::take_used` in
+  `services/drivers/virtio/core/src/virtqueue.rs`, `settle` in
+  `services/drivers/virtio/core/src/pci.rs`).
 - A block driver that loses a request resets its device before it gives the client's memory back,
   and exits without replying when the device does not acknowledge the reset (`quiesce_device` in
   `services/drivers/virtio/blk/src/main.rs`).
 
-**Fuzz targets and proof harnesses.** None. The booted `dma-confinement` and `hotplug` cases test
-the confinement policy and hot-add ([testing.md](testing.md) § Gating).
+**Fuzz targets and proof harnesses.**
+
+- `virtio-core` (`xtask/fuzz/targets/src/bin/virtio-core.rs`) drives
+  `virtio_core::property::virtio_core_holds` over the life of a split virtqueue, in which the device
+  writes anything into its used ring, its descriptor table and its available index, and over the
+  reads of a configuration word and of a 64-bit configuration field, from the seeds in
+  `services/drivers/virtio/core/fuzz/virtio-core/seeds/`; CI's gating `fuzz` job runs it on a pull
+  request whose change can affect it and the campaign for 30 minutes.
+- The `proofs` modules of `services/drivers/virtio/core/src/virtqueue.rs` and `pci.rs` prove, by
+  induction over a queue's life, that every chain submitted and every used element taken keeps the
+  queue's bookkeeping consistent and frees only an outstanding chain, and the placement of a
+  configuration word and the settling of a 64-bit read ([testing.md](testing.md) § Bounded
+  verification); CI's `kani` job runs them.
+- The booted `dma-confinement` and `hotplug` cases test the confinement policy and hot-add
+  ([testing.md](testing.md) § Gating).
 
 **Gaps.**
 
@@ -490,9 +523,6 @@ the confinement policy and hot-add ([testing.md](testing.md) § Gating).
 - The approved DMA mapping strategy of [#772](https://github.com/kottlerg/seraph/issues/772) lets a
   block device reach a registered client region from its registration to its unregistration, not
   only during one request; design intent, not yet implemented.
-- No fuzz target or proof harness covers a driver's decoding of what its device writes (VirtIO used
-  rings, configuration space) yet; one is planned
-  ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---
 
@@ -514,11 +544,11 @@ binds the bootloader to the firmware's db ([signing.md](signing.md) § Secure Bo
 
 **Mitigations.** Every object carries a composite Ed25519 and ML-DSA-65 signature over its hash,
 roles, name, architecture and security version; the bootloader verifies the kernel and every bundle
-entry, and procmgr every image it creates and every data or configuration file a reader asks it to,
-each on a copy no other process can write, with one exit on failure and no fallback
-([signing.md](signing.md) § Which Stage Verifies What, § Verification, § Verifier Discipline). The
-machine's security floor is kept in firmware storage and raised, and the enrolled trust store
-changes only by a request signed in the enrolment role or confirmed at the console
+entry, and procmgr every image it creates and every data file, configuration file or driver image a
+reader asks it to, each on a copy no other process can write, with one exit on failure and no
+fallback ([signing.md](signing.md) § Which Stage Verifies What, § Verification, § Verifier
+Discipline). The machine's security floor is kept in firmware storage and raised, and the enrolled
+trust store changes only by a request signed in the enrolment role or confirmed at the console
 ([signing.md](signing.md) § Rollback Floor, § Trust Store). The code is `shared/objsig` (the formats
 and the verifier), `shared/crypto` (the primitives), `core/boot/src/main.rs`,
 `core/boot/src/rollback.rs`, `core/boot/src/enrolment.rs`, `core/boot/src/secure_boot.rs` and
@@ -556,8 +586,9 @@ and the verifier), `shared/crypto` (the primitives), `core/boot/src/main.rs`,
   floor included ([signing.md](signing.md) § Rollback Floor); and an older signed configuration
   directory at an admitted security version verifies
   ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
-- devmgr parses drivers-directory files before procmgr verifies them (§ ELF Loading,
-  [#1533](https://github.com/kottlerg/seraph/issues/1533)).
+- The set of drivers in `/services/drivers/` is not signed, so an attacker adds, removes or rolls
+  back signed drivers there (§ ELF Loading,
+  [#1665](https://github.com/kottlerg/seraph/issues/1665)).
 - Secure Boot and a TPM are not required by the platform floor
   ([#1420](https://github.com/kottlerg/seraph/issues/1420)), and no project root key signs releases
   yet ([#1073](https://github.com/kottlerg/seraph/issues/1073)).

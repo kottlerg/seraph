@@ -38,7 +38,9 @@ pub const MAP_FAILED: u64 = 11;
 pub const INSUFFICIENT_RIGHTS: u64 = 12;
 /// Caller's cap lacks the required authority badge for a gated
 /// label (`REGISTER_DEATH_EQ` requires `DEATH_EQ_AUTHORITY`,
-/// `RELEASE_HOLD` requires `HOLD_RELEASE_AUTHORITY`).
+/// `RELEASE_HOLD` requires `HOLD_RELEASE_AUTHORITY`), or the caller's
+/// signature policy does not load the role a `READ_VERIFIED` request names
+/// (`READ_VERIFIED_DRIVER` from a process that loads no driver).
 pub const UNAUTHORIZED: u64 = 13;
 /// A create with `procmgr_labels::CREATE_ARGV_ENV` failed because procmgr
 /// could not unmap a window it copied the argv and env through, so it may

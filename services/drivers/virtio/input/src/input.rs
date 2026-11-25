@@ -90,9 +90,9 @@ impl EventRing
     /// Pull one filled event off the used ring, re-posting its buffer. Returns
     /// `None` when the used ring is empty.
     ///
-    /// A used element `poll_used` refuses (an id heading no outstanding
-    /// chain) is skipped: it names no buffer this ring posted, and the free
-    /// list is untouched.
+    /// A used element or index `poll_used` refuses (an id heading no
+    /// outstanding chain, or an index past the outstanding chains) is
+    /// skipped: the refusal frees nothing, and the free list is untouched.
     pub fn drain(&mut self, vq: &mut SplitVirtqueue) -> Option<VirtioInputEvent>
     {
         loop

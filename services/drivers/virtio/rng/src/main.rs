@@ -478,9 +478,9 @@ impl RngRuntime
 
     /// Wait up to [`READ_WAIT`] for the posted buffer to complete. Returns the
     /// device's written length and the posted length, or `None` at the bound,
-    /// with the buffer still posted. A used element `poll_used` refuses (an id
-    /// heading no outstanding chain) names no buffer this driver posted and is
-    /// passed over.
+    /// with the buffer still posted. A used element or index `poll_used`
+    /// refuses (an id heading no outstanding chain, or an index past the
+    /// outstanding chains) frees nothing and is passed over.
     fn wait_completion(&mut self) -> Option<(u32, u32)>
     {
         let start = Instant::now();

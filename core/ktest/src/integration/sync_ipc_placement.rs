@@ -427,7 +427,7 @@ fn check(case: Case) -> TestResult
         }
     }
     crate::log_args(format_args!(
-        "ktest: sync_ipc_placement {}: {counted} of {ROUNDS} rounds reached the rule ({} excluded), {on_k} on the caller's CPU",
+        "ktest: sync_ipc_placement {}: rounds counted={counted} excluded={} on_caller_cpu={on_k}",
         case.name,
         ROUNDS.saturating_sub(counted)
     ));

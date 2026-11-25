@@ -106,7 +106,7 @@ The `crashme` fixture faults on purpose in both kinds, on its main thread and on
 phases run it, and `cargo xtask run --crash-reports` checks the blocks in that boot's log
 ([docs/testing.md](../../docs/testing.md) § Crash reports). That boot stages a crashd recipe whose
 `CORE_DUMP` names crashme, and the `crashd_cores` phase checks the core each faulting mode leaves in
-`/crash`. The recipe keeps the shipped stall of 10 000 ms, and the `crashd_oom_hold` phase has the
+`/crash`. The recipe sets a stall of 5000 ms, and the `crashd_oom_hold` phase has the
 fixture write a page while memory is critical, once resumed after the hold and once declined when
 the stall passes. svctest's recipe seeds `crashd.core`, and the `crashd_live_core` phase asks for a
 live core of the fixture running and checks the fixture ran on unchanged and the core holds its

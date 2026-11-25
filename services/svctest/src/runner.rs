@@ -6,9 +6,11 @@
 //! Phase registry and driver.
 //!
 //! Phases are ordered `fn(&Caps)` entries collected from each
-//! `phases::<surface>::phases()`. The runner logs a uniform envelope
-//! around each invocation so phase boundaries are visible in the boot
-//! log even when individual phases self-skip on missing caps. It also
+//! `phases::<surface>::phases()`. The runner runs them one after another,
+//! except the concurrent group's (`crate::phases::CONCURRENT`), which it runs
+//! at once. It logs a uniform envelope around each invocation so phase
+//! boundaries are visible in the boot log even when individual phases
+//! self-skip on missing caps. It also
 //! owns the run's terminal marker: `ALL TESTS PASSED` from `main` after
 //! the last phase, or `SOME TESTS FAILED` from a failure hook.
 
@@ -111,15 +113,54 @@ pub fn report_pass()
     }
 }
 
-/// Invoke every phase in order. A failing phase panics, and the panic
-/// hook that [`install_failure_hooks`] installs turns that into the fail
-/// marker and a shutdown request.
+/// Invoke every phase in order, but the members of the concurrent group
+/// (`crate::phases::CONCURRENT`) next to each other at once, each on a
+/// thread of its own, all joined before the next phase starts. A failing
+/// phase panics, on whichever thread runs it, and the panic hook that
+/// [`install_failure_hooks`] installs turns that into the fail marker and a
+/// shutdown request.
 pub fn run_all(phases: &[Phase], caps: &Caps)
 {
-    for p in phases
+    let mut rest = phases;
+    while !rest.is_empty()
     {
-        std::os::seraph::log!("phase={} starting", p.name);
-        (p.run)(caps);
-        std::os::seraph::log!("phase={} passed", p.name);
+        let together = rest
+            .iter()
+            .take_while(|p| crate::phases::concurrent(p.name))
+            .count()
+            .max(1);
+        let (step, after) = rest.split_at(together);
+        if let [phase] = step
+        {
+            run_one(phase, caps);
+        }
+        else
+        {
+            run_together(step, caps);
+        }
+        rest = after;
     }
+}
+
+/// Run `phase` inside its envelope.
+fn run_one(phase: &Phase, caps: &Caps)
+{
+    std::os::seraph::log!("phase={} starting", phase.name);
+    (phase.run)(caps);
+    std::os::seraph::log!("phase={} passed", phase.name);
+}
+
+/// Run each of `group` inside its envelope on a thread of its own, named
+/// for the phase, and return once every one has passed.
+fn run_together(group: &[Phase], caps: &Caps)
+{
+    std::thread::scope(|scope| {
+        for phase in group
+        {
+            std::thread::Builder::new()
+                .name(phase.name.into())
+                .spawn_scoped(scope, || run_one(phase, caps))
+                .unwrap_or_else(|e| panic!("phase={}: its thread's spawn failed: {e}", phase.name));
+        }
+    });
 }

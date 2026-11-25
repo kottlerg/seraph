@@ -289,6 +289,7 @@ rootfs/config/svcmgr/
 │   ├── reserve-creator.svc   # reserve-creator fixture; co-staged with svctest
 │   ├── stopsrc.svc           # stop-source fixture; co-staged with svctest
 │   ├── crashd.svc            # crashd naming crashme; co-staged with svctest
+│   ├── oomd.svc              # oomd with a 1000 ms cooldown; co-staged with svctest
 │   ├── debug-echo.svc        # debug-port fixture; staged by `debug-port` case
 │   ├── hotplug-check.svc     # hotplug fixture; staged by `hotplug` case
 │   ├── hotplug-check-disk.svc # hotplug fixture's disk mode; staged by `hotplug` case
@@ -362,15 +363,18 @@ oomd or sessiond, the default services its phases drive, are missing. A phase wh
 set does not declare skips, or skips the part the fixture drives, and logs
 `phase=<phase> skipped: <recipe> not staged`.
 
-The `ci`, `burn-in` and `none` sets stage crashd's test recipe, `tests/crashd.svc`, over the default
-one: the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death, and
-the default's `CRASHD_OOM_STALL_MS=10000`, which svctest's `crashd_oom_hold` phase reads as the
-least time a fault memmgr declined for want of memory is held before the hold times out; svctest's
-`crashd_*` phases check them ([Crash reports](#crash-reports)), and its `crashd.core` seed is the
-authority for the live cores. The `crash-endpoint` set stages no crashd, so procmgr's crash endpoint
-is free for svctest's `crash_endpoint` phase; the set records `SVCTEST_PHASES=crash_endpoint` in
-svctest's recipe, and `svctest_fixtures` fails an image with crashd staged when that record is set,
-and one without crashd when it is not.
+Every set stages oomd's test recipe, `tests/oomd.svc`, over the default one: the same service with
+`OOMD_COOLDOWN_MS=1000` in place of the default's 5000, the grace (2000 ms) and `OOMD_STOP=yes`
+unchanged. The `ci`, `burn-in` and `none` sets stage crashd's test recipe, `tests/crashd.svc`, over
+the default one: the same service with `CORE_DUMP=crashme`, so crashd writes a core of each
+`crashme` death, and `CRASHD_OOM_STALL_MS=5000`, which svctest's `crashd_oom_hold` phase reads as
+the least time a fault memmgr declined for want of memory is held before the hold times out, still
+longer than oomd's grace and cooldown together (3000 ms); svctest's `crashd_*` phases check them
+([Crash reports](#crash-reports)), and its `crashd.core` seed is the authority for the live cores.
+The `crash-endpoint` set stages no crashd, so procmgr's crash endpoint is free for svctest's
+`crash_endpoint` phase; the set records `SVCTEST_PHASES=crash_endpoint` in svctest's recipe, and
+`svctest_fixtures` fails an image with crashd staged when that record is set, and one without
+crashd when it is not.
 
 The usertest boot stages no crashd test recipe and runs no faulting fixture. Its testers, `hello`
 and `shell`, are the two under `/tests/programs/`; it is staged by hand and booted with
@@ -650,7 +654,7 @@ boot, not in the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The svctest boot's crashd also holds a page fault memmgr declined for want of memory, for up to
-10000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The
+5000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The
 `crashd_oom_hold` phase, which runs after `swap_commit`, fills memory down to memmgr's growth floor
 and has the fixture write a page it has not touched, reading the stall from the staged crashd
 recipe: once the filler gives the memory back within the stall, and the write completes after the
@@ -1390,7 +1394,7 @@ registry runs it on (its `md-test-cells` rule).
 
 | Cell | Tier | Architectures | Launch | Cases | Covers |
 |---|---|---|---|---|---|
-| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `crasher-once`, `memhog`, `reserve-creator`, `stopsrc`) and crashd's test recipe | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, the restart, out-of-memory, and stop-source paths its fixtures drive, and the crash reports of its boot ([Crash reports](#crash-reports)) |
+| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `crasher-once`, `memhog`, `reserve-creator`, `stopsrc`), crashd's test recipe and oomd's test recipe | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, the restart, out-of-memory, and stop-source paths its fixtures drive, and the crash reports of its boot ([Crash reports](#crash-reports)) |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `storage-roles`, `shutdown` | the programs surface, a boot with no crash report ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
 | `bench` | Canonical | x86_64, riscv64; release | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |

@@ -18,7 +18,8 @@
 //! named set ([`svctest_fixtures::Set`]) copied from `config/svcmgr/tests/`
 //! into `config/svcmgr/services/`, every other fixture's recipe removed from
 //! it; crashd's svctest recipe over the default one, or, for a set that
-//! stages no crashd, no crashd recipe; the test class files of
+//! stages no crashd, no crashd recipe; oomd's svctest recipe, whose cooldown
+//! is shorter than the default's, over the default one; the test class files of
 //! `config/devmgr/tests/` copied into `config/devmgr/classes/`; and the
 //! set's record, and its phase selection when it makes one, written into the
 //! staged recipe's `env` line, which svctest checks the image against
@@ -88,6 +89,8 @@ const SVCTEST_RECIPE: &str = "svctest.svc";
 const UBENCH_RECIPE: &str = "ubench.svc";
 /// sessiond's recipe's file name, the default's and the svctest one's.
 const SESSIOND_RECIPE: &str = "sessiond.svc";
+/// oomd's recipe's file name, the default's and the svctest one's.
+const OOMD_RECIPE: &str = "oomd.svc";
 /// The recipes of the services-layer harnesses, one of which, staged, makes
 /// a sysroot's image a services-layer image.
 const SERVICES_LAYER_HARNESSES: [&str; 2] = [SVCTEST_RECIPE, UBENCH_RECIPE];
@@ -231,6 +234,7 @@ pub fn stage(sysroot: &Path, set: Set) -> Result<()>
     {
         remove_recipe(sysroot, CRASHD_RECIPE)?;
     }
+    copy_recipe(sysroot, OOMD_RECIPE)?;
 
     let source = tests.join(SVCTEST_RECIPE);
     let object = fs::read(&source).with_context(|| format!("reading {}", source.display()))?;
@@ -368,9 +372,10 @@ mod tests
     }
 
     /// A sysroot holding every fixture's test recipe, svctest's, ubench's,
-    /// crashd's and sessiond's, one test class file, and the services and
-    /// classes directories; the services directory holds a default crashd
-    /// and sessiond, a program's recipe (the terminal's) and a service's.
+    /// crashd's, oomd's and sessiond's, one test class file, and the services
+    /// and classes directories; the services directory holds a default
+    /// crashd, oomd and sessiond, a program's recipe (the terminal's) and a
+    /// service's.
     fn sysroot(tag: &str) -> PathBuf
     {
         let root = scratch(tag);
@@ -388,9 +393,11 @@ mod tests
         fs::write(tests.join(UBENCH_RECIPE), "binary = /tests/ubench\n").unwrap();
         fs::write(tests.join(CRASHD_RECIPE), "test crashd").unwrap();
         fs::write(tests.join(SESSIOND_RECIPE), "test sessiond").unwrap();
+        fs::write(tests.join(OOMD_RECIPE), "test oomd").unwrap();
         let services = root.join(SERVICES_DIR);
         fs::create_dir_all(&services).unwrap();
         fs::write(services.join(CRASHD_RECIPE), "binary = /services/crashd\n").unwrap();
+        fs::write(services.join(OOMD_RECIPE), "binary = /services/oomd\n").unwrap();
         fs::write(
             services.join(SESSIOND_RECIPE),
             "binary = /services/sessiond\n",
@@ -428,7 +435,9 @@ mod tests
     // Defect caught: a staging that co-stages another set than it records, or
     // keeps a fixture an earlier staging of another set left, so svctest's
     // record and the image disagree; or one that stages crashd for the set
-    // that selects the crash_endpoint phase, or none for a set of every phase.
+    // that selects the crash_endpoint phase, or none for a set of every phase;
+    // or one that leaves oomd's default recipe, whose cooldown svctest's oomd
+    // phases would wait out.
     #[test]
     fn each_set_stages_exactly_its_fixtures_and_crashd_and_records_them()
     {
@@ -464,6 +473,11 @@ mod tests
             assert_eq!(
                 staged(&root, CRASHD_RECIPE).as_deref(),
                 set.stages_crashd().then_some("test crashd"),
+                "{set:?}"
+            );
+            assert_eq!(
+                staged(&root, OOMD_RECIPE).as_deref(),
+                Some("test oomd"),
                 "{set:?}"
             );
             assert_eq!(
@@ -625,8 +639,8 @@ mod tests
 
     // Defect caught: a set naming a fixture whose recipe the repository does
     // not ship, or svctest's repository recipe carrying a record of its own,
-    // which every staging would refuse; or a svctest recipe of crashd or
-    // sessiond drifted from the default it stands in for, so the services
+    // which every staging would refuse; or a svctest recipe of crashd, oomd
+    // or sessiond drifted from the default it stands in for, so the services
     // layer tests another service than the image ships.
     #[test]
     fn the_repository_ships_each_sets_recipes()
@@ -656,13 +670,19 @@ mod tests
         assert!(tests.join(UBENCH_RECIPE).is_file());
 
         // Each differs from its default in the one line that makes it the
-        // services layer's: crashd's names crashme for core dumps, sessiond's
-        // leads sessions with the leader fixture.
+        // services layer's: crashd's names crashme for core dumps and holds a
+        // fault for a shorter stall, oomd's acts after a shorter cooldown,
+        // sessiond's leads sessions with the leader fixture.
         for (name, default_line, test_line) in [
             (
                 CRASHD_RECIPE,
                 "env = CORE_DUMP=no CRASHD_OOM_STALL_MS=10000",
-                "env = CORE_DUMP=crashme CRASHD_OOM_STALL_MS=10000",
+                "env = CORE_DUMP=crashme CRASHD_OOM_STALL_MS=5000",
+            ),
+            (
+                OOMD_RECIPE,
+                "env = OOMD_GRACE_MS=2000 OOMD_COOLDOWN_MS=5000 OOMD_STOP=yes",
+                "env = OOMD_GRACE_MS=2000 OOMD_COOLDOWN_MS=1000 OOMD_STOP=yes",
             ),
             (
                 SESSIOND_RECIPE,
@@ -691,6 +711,39 @@ mod tests
                 })
                 .collect();
             assert_eq!(test, swapped, "{name}");
+        }
+    }
+
+    /// The milliseconds the `env` line of the repository's recipe `dir/name`
+    /// gives `key`.
+    fn env_ms(dir: &str, name: &str, key: &str) -> u64
+    {
+        let prefix = format!("{key}=");
+        settings(dir, name)
+            .iter()
+            .filter_map(|line| line.strip_prefix("env = "))
+            .flat_map(str::split_whitespace)
+            .find_map(|pair| pair.strip_prefix(prefix.as_str()))
+            .and_then(|ms| ms.parse().ok())
+            .unwrap_or_else(|| panic!("{dir}/{name}: no {key} in its env line"))
+    }
+
+    // Defect caught: crashd's stall, the default's or svctest's, no longer
+    // longer than oomd's grace and cooldown together in the same image, so a
+    // fault held from the level's rise times out before oomd's second stop
+    // can free memory, and svctest's oom phases see the held write die.
+    #[test]
+    fn crashds_stall_outlasts_oomds_grace_and_cooldown()
+    {
+        for dir in [SERVICES_DIR, TESTS_DIR]
+        {
+            let stall = env_ms(dir, CRASHD_RECIPE, "CRASHD_OOM_STALL_MS");
+            let grace = env_ms(dir, OOMD_RECIPE, "OOMD_GRACE_MS");
+            let cooldown = env_ms(dir, OOMD_RECIPE, "OOMD_COOLDOWN_MS");
+            assert!(
+                stall > grace.saturating_add(cooldown),
+                "{dir}: a {stall} ms stall against a {grace} ms grace and a {cooldown} ms cooldown"
+            );
         }
     }
 }

@@ -72,6 +72,29 @@
 //!     one contiguous grant of 32,768 pages, a run the pool holds at the
 //!     default memory size only before the later phases leave its free
 //!     memory in shorter runs.
+//! 18. The [`CONCURRENT`] group next to each other, after [`recv_guard`]'s
+//!     `recv_wedge` phase, which runs alone: its fixture reads memmgr's free
+//!     pool around its failed grants, which the group's spawns would move.
+//!
+//! ### Concurrent group
+//!
+//! The phases [`CONCURRENT`] names run at once, each on a thread of its own,
+//! and the runner joins them before the next phase starts
+//! ([`crate::runner::run_all`]): each member's time is a wait on a bound that
+//! is the behaviour under test, so the group takes the longest member's time
+//! instead of their sum. A phase is a member only when it:
+//!
+//! - waits on a bound that is the behaviour under test, and asserts on no
+//!   time that another member's load can stretch past its bound;
+//! - touches only objects it creates (its endpoints, threads, children and
+//!   queues), and asks a service nothing whose answer another member's
+//!   requests change;
+//! - reads no system-wide account (memmgr's pool, its levels or its `CSpace`,
+//!   logd's history or its slots) and puts memory under no pressure.
+//!
+//! A member that fails while it runs in the group leaves it, and runs alone at
+//! its place, until the failure is shown to be one it shows alone too. The
+//! members lie next to each other in [`all`]'s order, which it checks.
 //!
 //! ### Selection
 //!
@@ -81,6 +104,20 @@
 //! in this order; a name no phase has fails the run.
 
 use crate::runner::Phase;
+
+/// The concurrent group: the phases the runner runs at once (see the module
+/// documentation).
+pub(crate) const CONCURRENT: [&str; 3] = [
+    "recv_wedge_thread",
+    "procmgr_concurrent_spawn",
+    "log_wedged_receiver",
+];
+
+/// Whether the phase `name` is a member of the [`CONCURRENT`] group.
+pub(crate) fn concurrent(name: &str) -> bool
+{
+    CONCURRENT.contains(&name)
+}
 
 /// The shared program fixture the phases spawn in the mode its first argument
 /// names (services/fixtures/program-modes/README.md).
@@ -160,7 +197,8 @@ pub mod vfsd_caps;
 ///
 /// # Panics
 ///
-/// When the selection names a phase the list does not hold.
+/// When the selection names a phase the list does not hold, or the list does
+/// not hold the members of the [`CONCURRENT`] group next to each other.
 pub fn all() -> Vec<Phase>
 {
     let mut out: Vec<Phase> = Vec::new();
@@ -168,6 +206,20 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(fixtures::phases());
     let always = out.len();
     out.extend_from_slice(&ordered());
+    let members: Vec<usize> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| concurrent(p.name))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        members.len() == CONCURRENT.len()
+            && members
+                .windows(2)
+                .all(|pair| matches!(pair, [a, b] if a.checked_add(1) == Some(*b))),
+        "the concurrent group {CONCURRENT:?} lies at {members:?} of the phase list, not next to \
+         each other"
+    );
     let Ok(selection) = std::env::var(svctest_fixtures::PHASES_ENV)
     else
     {
@@ -208,6 +260,8 @@ fn ordered() -> Vec<Phase>
     out.extend_from_slice(random::phases());
     out.extend_from_slice(entropyd::phases());
     out.extend_from_slice(recv_guard::phases());
+    out.extend_from_slice(procmgr::concurrent_spawn());
+    out.extend_from_slice(log_client::phases());
     out.extend_from_slice(recv_pool::phases());
     out.extend_from_slice(no_receiver::phases());
     out.extend_from_slice(devmgr::phases());
@@ -248,7 +302,6 @@ fn ordered() -> Vec<Phase>
     out.extend_from_slice(sessiond::phases());
     out.extend_from_slice(oom::phases());
     out.extend_from_slice(timed::phases());
-    out.extend_from_slice(log_client::phases());
     out.extend_from_slice(logd_restart::phases());
     out.extend_from_slice(swap::phases());
     out.extend_from_slice(node_reclaim::phases());

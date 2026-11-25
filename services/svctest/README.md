@@ -12,7 +12,8 @@ set's `SVCTEST_FIXTURES` record into the recipe's environment, per
 unless the image stages exactly the fixtures the record declares, and oomd and sessiond; a phase
 whose fixture the set does not declare skips and logs `phase=<phase> skipped: <recipe> not staged`.
 The same phase fails an image that stages crashd when the record selects phases, and one that does
-not when it selects none. The `ci`, `burn-in` and `none` sets stage crashd's test recipe
+not when it selects none. Every set stages oomd's test recipe (`/config/svcmgr/tests/oomd.svc`) over
+the default one. The `ci`, `burn-in` and `none` sets stage crashd's test recipe
 (`/config/svcmgr/tests/crashd.svc`) over the default one; the `crash-endpoint` set stages no fixture
 and no crashd and records `SVCTEST_PHASES=crash_endpoint`, and svctest then runs only its startup
 phases, `svctest_fixtures` and `crash_endpoint`.
@@ -218,7 +219,9 @@ phase that uses `/data` or the cwd, the all-RAM-accounted identity last).
 installs the failure hooks, declares itself undebuggable to procmgr (`DECLARE_NO_DEBUG`, as
 a debug-authority holder; it asserts `SUCCESS`), requests the bootstrap rounds, hands the hooks
 the authority-badged pwrmgr cap, logs `starting`, and runs each registered phase in order inside
-the envelope `phase=<name> starting` / `phase=<name> passed`. After the last phase it logs
+the envelope `phase=<name> starting` / `phase=<name> passed`, except that the phases of the
+concurrent group run at once, each on a thread of its own, and are joined before the next phase
+([`phases/mod.rs`](src/phases/mod.rs) § Concurrent group). After the last phase it logs
 `ALL TESTS PASSED`, the marker defined in
 [docs/testing.md § Reporting marker](../../docs/testing.md#reporting-marker), and sends
 `SHUTDOWN` on the authority-badged pwrmgr cap. On success the platform powers off; a reply,

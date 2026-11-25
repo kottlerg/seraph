@@ -878,13 +878,18 @@ pub fn halt_loop() -> !;
 /// Copy `len` bytes between kernel and user memory across the SMAP/SUM access
 /// window with in-kernel fault recovery: a fault on an unmapped or read-only
 /// user span returns the count of bytes not copied (at least 1) instead of
-/// panicking, and 0 means the copy completed. The page-fault handler, after it
+/// panicking, counted from the start of the access that faulted, so the byte
+/// at offset `len - returned` lies in the page that faulted; 0 means the copy
+/// completed. The page-fault handler, after it
 /// retries a fault the live tables already satisfy
 /// (`paging::user_fault_is_spurious`), recovers the fault the arch's own way:
 /// x86-64 ends the copy in place, setting `rax` to the bytes left and `rcx` to 0
 /// and resuming the faulting `rep movsb`, so the return address is unchanged, as
-/// a shadow stack requires (`cpu::in_user_copy` names the instruction); riscv64
-/// resumes at a fixup (`cpu::user_copy_fixup`). The sole sanctioned path for
+/// a shadow stack requires (`cpu::in_user_copy` names the instruction); riscv64,
+/// which copies 8-byte words when both pointers are aligned, resumes at the
+/// address `cpu::user_copy_fixup` gives: a fault in its 64-byte block loop
+/// re-runs the block in single words, which fault again at the faulting word,
+/// and any other fault returns from a fixup. The sole sanctioned path for
 /// kernel access to user pointers; the typed `crate::uaccess::copy_to_user` /
 /// `copy_from_user` wrappers turn a fault into `SyscallError::InvalidAddress`,
 /// and the restartable ones into the faulting address (`len - returned` bytes

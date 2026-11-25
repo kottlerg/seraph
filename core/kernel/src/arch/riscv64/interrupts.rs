@@ -915,9 +915,10 @@ unsafe fn kernel_exception(
 
     // In-kernel user-copy fault recovery: an S-mode page fault (load=13,
     // store=15, instruction=12) whose sepc lies in the `copy_user` faultable
-    // region is an unmapped or read-only user buffer. Redirect to the fixup
-    // — which clears SUM and returns the bytes not copied — instead of
-    // panicking.
+    // region is an unmapped or read-only user buffer. Resume where
+    // `user_copy_fixup` says instead of panicking: at the fixup, which clears
+    // SUM and returns the bytes not copied, or, for a fault in the copy's
+    // block loop, at its word loop, which faults again at the faulting word.
     if let Some(access) = page_fault_access(cause_code)
         && let Some(fixup) = super::cpu::user_copy_fixup(live.sepc)
     {

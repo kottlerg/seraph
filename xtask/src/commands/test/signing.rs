@@ -24,7 +24,14 @@
 //!   `Failed(Role)`, `Untrusted`) and svcmgr reports the refused launch. The kernel and
 //!   `/programs/terminal` each carry a record of that untrusted key before
 //!   their own, which the bootloader and procmgr skip, and the boot reaches
-//!   the terminal's READY line. On riscv64 the platform description table
+//!   the terminal's READY line. Two drivers of `/services/drivers/` that
+//!   devmgr creates from no file of the directory are replaced:
+//!   `virtio-console`, whose device the launch does not attach, with a byte
+//!   of its declaration note flipped, and the directory's copy of
+//!   `virtio-blk`, whose one device, the boot disk, the boot pass binds from
+//!   its boot module, unsigned; procmgr refuses each at devmgr's verified
+//!   read of its declaration (`Failed(BodyHash)`, `Parse(Magic)`), before
+//!   devmgr parses a byte of it. On riscv64 the platform description table
 //!   `/config/devmgr/platform/qemu-virt.platform` has a body byte flipped
 //!   too: procmgr refuses it at devmgr's verified read (`Failed(BodyHash)`),
 //!   and devmgr passes it over and adds no platform-table record.
@@ -142,6 +149,19 @@ const TAMPERED: &str = "services/timed";
 const WRONG_ROLE: &str = "services/pwrmgr";
 const UNTRUSTED: &str = "services/crashd";
 const EXTRA_RECORD: &str = "programs/terminal";
+/// The drivers-directory driver the `rootfs` case gives a tampered
+/// declaration note, and the one it installs unsigned, each in every image:
+/// virtio-console, whose device no launch of the case attaches (only
+/// `--debug-port` does), and the drivers directory's copy of virtio-blk,
+/// whose one device in the case, the boot disk, the boot pass binds from its
+/// boot module. devmgr creates neither from the directory, so the only
+/// verifier that reaches either file is devmgr's verified read of its
+/// declaration.
+const TAMPERED_DECLARATION: &str = "services/drivers/virtio-console";
+const UNSIGNED_DRIVER: &str = "services/drivers/virtio-blk";
+/// The section of a driver's declaration note
+/// (`driver_binding::DRIVER_NOTE_SECTION`).
+const DRIVER_NOTE_SECTION: &[u8] = b".note.seraph.driver";
 /// The platform description table riscv64 installs, which the `rootfs` case
 /// tampers with there.
 const PLATFORM_TABLE: &str = "config/devmgr/platform/qemu-virt.platform";
@@ -675,9 +695,11 @@ fn index_case(ctx: &Context, dir: &Path) -> Result<Case>
 }
 
 /// The `rootfs` case: three services procmgr refuses, and the kernel and
-/// the terminal each with an untrusted record before their own; on riscv64
-/// also the platform description table, tampered, which procmgr refuses at
-/// devmgr's verified read.
+/// the terminal each with an untrusted record before their own; two drivers
+/// of the drivers directory, one with its declaration note tampered and one
+/// unsigned, which procmgr refuses at devmgr's verified read of the
+/// declaration; on riscv64 also the platform description table, tampered,
+/// which procmgr refuses at devmgr's verified read.
 fn rootfs_case(ctx: &Context, arch: Arch, dir: &Path, signer: &Signer) -> Result<Case>
 {
     let untrusted = untrusted_signer(ctx, arch)?;
@@ -718,6 +740,16 @@ fn rootfs_case(ctx: &Context, arch: Arch, dir: &Path, signer: &Signer) -> Result
             "create: {name:?} refused: its signature did not verify"
         ));
     }
+    let note_tampered = flip_note_byte(&read_sysroot(ctx, TAMPERED_DECLARATION)?)?;
+    let unsigned_driver = crate::signing::body_of(&read_sysroot(ctx, UNSIGNED_DRIVER)?)?.to_vec();
+    for (path, refusal) in [
+        (TAMPERED_DECLARATION, "Failed(BodyHash)"),
+        (UNSIGNED_DRIVER, "Parse(Magic)"),
+    ]
+    {
+        let name = install_name(path);
+        expect.push(format!("signature verification refused: {name}: {refusal}"));
+    }
     expect.push(TERMINAL_READY.to_owned());
     let mut substitutes = vec![
         sub(ESP_KERNEL, stage(dir, "kernel.two-records", &kernel)?),
@@ -725,6 +757,14 @@ fn rootfs_case(ctx: &Context, arch: Arch, dir: &Path, signer: &Signer) -> Result
         sub(WRONG_ROLE, stage(dir, "pwrmgr.data", &as_data)?),
         sub(UNTRUSTED, stage(dir, "crashd.untrusted", &foreign)?),
         sub(EXTRA_RECORD, stage(dir, "terminal.two-records", &terminal)?),
+        sub(
+            TAMPERED_DECLARATION,
+            stage(dir, "virtio-console.note-tampered", &note_tampered)?,
+        ),
+        sub(
+            UNSIGNED_DRIVER,
+            stage(dir, "virtio-blk.unsigned", &unsigned_driver)?,
+        ),
     ];
     if arch == Arch::Riscv64
     {
@@ -823,6 +863,68 @@ fn flip_body_byte(object: &[u8]) -> Result<Vec<u8>>
         *byte ^= 0xFF;
     }
     Ok(out)
+}
+
+/// `object`, a signed driver image, with the first byte of its declaration
+/// note's descriptor (in the [`DRIVER_NOTE_SECTION`] section) flipped: the
+/// declaration devmgr would read, tampered with after signing.
+///
+/// # Errors
+/// When the body is not a 64-bit little-endian ELF file whose section
+/// headers, section name table and declaration note lie within it.
+fn flip_note_byte(object: &[u8]) -> Result<Vec<u8>>
+{
+    let body = crate::signing::body_of(object)?;
+    let at = note_desc_offset(body).context("the driver image carries no declaration note")?;
+    let mut out = object.to_vec();
+    if let Some(byte) = out.get_mut(at)
+    {
+        *byte ^= 0xFF;
+    }
+    Ok(out)
+}
+
+/// The offset in the ELF image `elf` of the first descriptor byte of the
+/// first note in its [`DRIVER_NOTE_SECTION`] section; `None` when a header,
+/// the section, or the note lies outside `elf`, or the image has no such
+/// section or a note with an empty descriptor.
+fn note_desc_offset(elf: &[u8]) -> Option<usize>
+{
+    let bytes = |at: usize, len: usize| elf.get(at..at.checked_add(len)?);
+    let word = |at: usize| {
+        let b: [u8; 4] = bytes(at, 4)?.try_into().ok()?;
+        usize::try_from(u32::from_le_bytes(b)).ok()
+    };
+    let half = |at: usize| {
+        let b: [u8; 2] = bytes(at, 2)?.try_into().ok()?;
+        Some(usize::from(u16::from_le_bytes(b)))
+    };
+    let quad = |at: usize| {
+        let b: [u8; 8] = bytes(at, 8)?.try_into().ok()?;
+        usize::try_from(u64::from_le_bytes(b)).ok()
+    };
+    if bytes(0, 5)? != b"\x7fELF\x02"
+    {
+        return None;
+    }
+    let (shoff, shentsize, shnum, shstrndx) = (quad(0x28)?, half(0x3A)?, half(0x3C)?, half(0x3E)?);
+    let header = |index: usize| shoff.checked_add(index.checked_mul(shentsize)?);
+    let names = quad(header(shstrndx)?.checked_add(0x18)?)?;
+    (0..shnum).find_map(|index| {
+        let at = header(index)?;
+        let name = names.checked_add(word(at)?)?;
+        let section = bytes(name, DRIVER_NOTE_SECTION.len().checked_add(1)?)?;
+        if section.strip_suffix(b"\0")? != DRIVER_NOTE_SECTION
+        {
+            return None;
+        }
+        let (offset, size) = (quad(at.checked_add(0x18)?)?, quad(at.checked_add(0x20)?)?);
+        let (namesz, descsz) = (word(offset)?, word(offset.checked_add(4)?)?);
+        let desc = offset
+            .checked_add(12)?
+            .checked_add(namesz.checked_next_multiple_of(4)?)?;
+        (descsz > 0 && desc.checked_add(descsz)? <= offset.checked_add(size)?).then_some(desc)
+    })
 }
 
 /// `bundle` with the body of its entry `name`, a signed object, tampered as
@@ -1341,5 +1443,69 @@ mod tests
 
         bundle_with_policy(&root, "none", &dropped, None).unwrap_err();
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A 64-bit ELF image holding a section name table and, as its second
+    /// section, a note section named `section` with one note of the
+    /// `seraph` owner and the descriptor `desc`.
+    fn elf_with_note(section: &[u8], desc: &[u8]) -> Vec<u8>
+    {
+        let mut names = vec![0u8];
+        names.extend_from_slice(b".shstrtab\0");
+        let note_name = names.len();
+        names.extend_from_slice(section);
+        names.push(0);
+        let mut note = Vec::new();
+        for word in [7u32, u32::try_from(desc.len()).unwrap(), 2]
+        {
+            note.extend_from_slice(&word.to_le_bytes());
+        }
+        note.extend_from_slice(b"seraph\0\0");
+        note.extend_from_slice(desc);
+        let names_at = 64;
+        let note_at = names_at + names.len();
+        let shoff = note_at + note.len();
+        let mut elf = vec![0u8; 64];
+        elf[..5].copy_from_slice(b"\x7fELF\x02");
+        elf[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes());
+        elf[0x3A..0x3C].copy_from_slice(&64u16.to_le_bytes());
+        elf[0x3C..0x3E].copy_from_slice(&3u16.to_le_bytes());
+        elf[0x3E..0x40].copy_from_slice(&1u16.to_le_bytes());
+        elf.extend_from_slice(&names);
+        elf.extend_from_slice(&note);
+        let header = |name: usize, offset: usize, size: usize| {
+            let mut h = vec![0u8; 64];
+            h[..4].copy_from_slice(&u32::try_from(name).unwrap().to_le_bytes());
+            h[0x18..0x20].copy_from_slice(&(offset as u64).to_le_bytes());
+            h[0x20..0x28].copy_from_slice(&(size as u64).to_le_bytes());
+            h
+        };
+        elf.extend(header(0, 0, 0));
+        elf.extend(header(1, names_at, names.len()));
+        elf.extend(header(note_name, note_at, note.len()));
+        elf
+    }
+
+    // Defect caught: the `rootfs` case flipping a byte outside the
+    // declaration note's descriptor (its header, its owner, another
+    // section), so the boot no longer shows a tampered declaration refused;
+    // or a section whose name only starts with the note's taken for it.
+    #[test]
+    fn the_flipped_byte_is_the_declaration_notes_first_descriptor_byte()
+    {
+        let elf = elf_with_note(DRIVER_NOTE_SECTION, b"DECLARATION");
+        let at = note_desc_offset(&elf).unwrap();
+        assert_eq!(elf.get(at..at + 11), Some(&b"DECLARATION"[..]));
+        let flipped = flip_note_byte(&elf).unwrap();
+        let changed: Vec<usize> = (0..elf.len()).filter(|&i| elf[i] != flipped[i]).collect();
+        assert_eq!(changed, [at]);
+        let mut longer = DRIVER_NOTE_SECTION.to_vec();
+        longer.extend_from_slice(b".x");
+        assert_eq!(note_desc_offset(&elf_with_note(&longer, b"D")), None);
+        assert_eq!(
+            note_desc_offset(&elf_with_note(DRIVER_NOTE_SECTION, b"")),
+            None
+        );
+        assert_eq!(note_desc_offset(&elf[..elf.len() - 64]), None);
     }
 }

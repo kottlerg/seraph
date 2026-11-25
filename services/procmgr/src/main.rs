@@ -2353,8 +2353,9 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
 }
 
 /// Handle `READ_VERIFIED`: read the file `caps[0]` names once into one run of
-/// frames on the sender's memmgr account, verify the copy in the role (data
-/// or configuration) and under the name the request gives, and give the sender the run
+/// frames on the sender's memmgr account, verify the copy in the role (data,
+/// configuration, or driver for a sender whose signature policy loads
+/// drivers) and under the name the request gives, and give the sender the run
 /// read-only (docs/signing.md § Verifier Discipline). Wire layout:
 /// [`procmgr_labels::READ_VERIFIED`].
 ///
@@ -2378,9 +2379,11 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    // The sender's account and whether its node is a reserve node, which the
-    // read session's node then is too (image::read_file).
+    // The sender's account, whether its node is a reserve node, which the
+    // read session's node then is too (image::read_file), and whether its
+    // signature policy admits the read's role.
     let mut reserve = false;
+    let mut admitted = false;
     let memmgr = {
         let state = ctx.tables.lock();
         state
@@ -2388,6 +2391,7 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
             .find_by_badge(req.badge)
             .map(|entry| {
                 reserve = entry.reserve;
+                admitted = read.admitted_by(entry.sign_roles);
                 entry.memmgr_send_cap
             })
             .map(|cap| {
@@ -2403,6 +2407,13 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     };
     let memmgr = match memmgr
     {
+        Some(Some(cap)) if !admitted =>
+        {
+            let _ = syscall::cap_delete(cap);
+            release_caps(&[file_cap]);
+            reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+            return;
+        }
         Some(Some(cap)) => process::CapGuard::new(cap),
         Some(None) =>
         {

@@ -776,53 +776,52 @@ devmgr loads driver binaries from one of two places:
   `/services/drivers/` at the auxiliary tier ([driver-binding.md](driver-binding.md) § Declaration
   Bounds).
 - **On-disk rootfs** — non-essentials (the serial and framebuffer drivers of the consoles, the
-  per-arch RTC, bound to its platform record, the
-  [virtio-input keyboard driver](../services/drivers/virtio/input/README.md), the debug port's
-  virtio-console driver, the virtio-rng driver, the [TPM driver](../services/drivers/tpm/README.md),
-  and the test-only `test-dma`) live at
-  `/services/drivers/` and are loaded via `procmgr_labels::CREATE_FROM_FILE`. The test-only
+  per-arch RTC, bound to its platform record, the [virtio-input keyboard
+  driver](../services/drivers/virtio/input/README.md), the debug port's virtio-console driver, the
+  virtio-rng driver, the [TPM driver](../services/drivers/tpm/README.md), and the test-only
+  `test-dma`) live at `/services/drivers/` and are created by `procmgr_labels::CREATE_PROCESS` from
+  a copy of the run procmgr verified for the file (`READ_VERIFIED`, driver role). The test-only
   `test-fault` binary lives in `/tests/drivers/`, which no boot-time pass reads; devmgr binds it
   only on `devmgr_labels::BIND_DRIVERS` (gated on `BIND_AUTHORITY`, which only svctest's seed-only
   `devmgr.bind` cap carries), so a boot without svctest binds none. Every binary there carries its
   declaration in the ELF note section `.note.seraph.driver`; devmgr reads the declaration of each
-  entry once `SET_DRIVERS_DIR` arrives and binds the PCI devices still unbound: virtio-input,
-  virtio-console, virtio-rng, and test-dma, none of which is on the read-the-disk critical path,
-  ship only there and are bound there. A device whose declaration takes its interrupt as optional
-  and for which devmgr can give no wired line (for instance, its line lies outside the Interrupt
-  range devmgr holds) is delivered a resource list with no `Interrupt` resource, and its driver
-  polls its queue.
-  Post-handover, svcmgr walks its universal root to `/services/drivers/` and hands devmgr that
-  subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from
-  the devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ | READDIR` rights only
-  — devmgr lists the directory and cannot reach outside the drivers subtree), with the directory's
-  absolute path as a name block, under which devmgr names each driver it starts (`<path>/<entry>`),
-  and, when the walk finds it, the directory of the platform description tables as an optional
-  second cap at the same rights ([driver-binding.md](driver-binding.md#platform-description-tables)
-  § Platform Description Tables). The handshake is specified in
+  entry's verified body once `SET_DRIVERS_DIR` arrives and binds the PCI devices still unbound:
+  virtio-input, virtio-console, virtio-rng, and test-dma, none of which is on the read-the-disk
+  critical path, ship only there and are bound there. A device whose declaration takes its interrupt
+  as optional and for which devmgr can give no wired line (for instance, its line lies outside the
+  Interrupt range devmgr holds) is delivered a resource list with no `Interrupt` resource, and its
+  driver polls its queue. Post-handover, svcmgr walks its universal root to `/services/drivers/` and
+  hands devmgr that subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by
+  `DRIVERS_DIR_AUTHORITY`, minted from the devmgr-registry source init endows svcmgr with; sent at
+  `LOOKUP | READ | READDIR` rights only — devmgr lists the directory and cannot reach outside the
+  drivers subtree), with the directory's absolute path as a name block, under which devmgr names
+  each driver it starts (`<path>/<entry>`), and, when the walk finds it, the directory of the
+  platform description tables as an optional second cap at the same rights
+  ([driver-binding.md](driver-binding.md#platform-description-tables) § Platform Description
+  Tables). The handshake is specified in
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) and
   [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md). Devmgr
   replies SUCCESS before doing any spawn work so svcmgr never blocks on driver bring-up; the actual
-  walk + `CREATE_FROM_FILE` + bootstrap rounds, and the settle of those drivers, run on devmgr's
-  control thread after `ipc_reply`, while its registry workers go on serving; a query that would
-  find no driver waits until the settle has ended. The spawn is at-most-once per boot, apart from
-  the restart of a served driver that dies, which devmgr serves at the class's next ordinal
-  ([Driver Restart](../services/devmgr/docs/responsibilities.md#driver-restart)), and the retry of
-  a drivers-directory start or restart whose create procmgr refuses with `IO_ERROR` or
-  `OUT_OF_MEMORY`
-  ([Create retry](../services/devmgr/docs/responsibilities.md#create-retry)); on failure
-  (binary missing, ELF corrupt, hardware-carve failure, OOM, a driver that died or did not report
-  ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
-  `QUERY_DEVICE` calls on the rtc, input, hwrng, and debug-port classes and clients
-  ([timed](../services/timed/README.md) degrades to its no-RTC path; the terminal, today's only
-  input class consumer, keeps waiting, and [entropyd](../services/entropyd/README.md) waits on its
-  class watch). Before `SET_DRIVERS_DIR` arrives the reply is the same `NO_DEVICE`, so a client that
-  cannot proceed without the device waits on a `WATCH_CLASS` watch
-  ([driver-binding.md](driver-binding.md) § Device Classes; the terminal, entropyd, the GDB stub and
-  the debug-echo fixture do), while a client with a no-device path treats the first `NO_DEVICE` as
-  terminal (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the rule). Keeping non-essentials out of
-  the boot bundle keeps the ESP-loaded image to what the system needs before the rootfs is mounted,
-  so on-disk loading is preferred for anything not on the read-the-disk-in-the-first-place critical
-  path.
+  walk + verified reads + `CREATE_PROCESS` + bootstrap rounds, and the settle of those drivers, run
+  on devmgr's control thread after `ipc_reply`, while its registry workers go on serving; a query
+  that would find no driver waits until the settle has ended. The spawn is at-most-once per boot,
+  apart from the restart of a served driver that dies, which devmgr serves at the class's next
+  ordinal ([Driver Restart](../services/devmgr/docs/responsibilities.md#driver-restart)), and the
+  retry of a drivers-directory start or restart whose verified read or create procmgr refuses with
+  an error a later one can outlive ([Create
+  retry](../services/devmgr/docs/responsibilities.md#create-retry)); on failure (binary missing, ELF
+  corrupt, hardware-carve failure, OOM, a driver that died or did not report ready within the settle
+  bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` calls on the
+  rtc, input, hwrng, and debug-port classes and clients ([timed](../services/timed/README.md)
+  degrades to its no-RTC path; the terminal, today's only input class consumer, keeps waiting, and
+  [entropyd](../services/entropyd/README.md) waits on its class watch). Before `SET_DRIVERS_DIR`
+  arrives the reply is the same `NO_DEVICE`, so a client that cannot proceed without the device
+  waits on a `WATCH_CLASS` watch ([driver-binding.md](driver-binding.md) § Device Classes; the
+  terminal, entropyd, the GDB stub and the debug-echo fixture do), while a client with a no-device
+  path treats the first `NO_DEVICE` as terminal (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the
+  rule). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the system
+  needs before the rootfs is mounted, so on-disk loading is preferred for anything not on the
+  read-the-disk-in-the-first-place critical path.
 
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is

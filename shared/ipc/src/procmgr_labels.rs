@@ -985,9 +985,12 @@ pub const MAKE_RESIDENT: u64 = 30;
 /// process, is refused `INVALID_BADGE`, as is a badge no live process
 /// carries.
 ///
-/// `data[0]` is the file's length in bytes, 1 to [`READ_VERIFIED_MAX`];
-/// `data[1]` the role the file must be signed in, [`READ_VERIFIED_DATA`] or
-/// [`READ_VERIFIED_CONFIGURATION`]; from word [`READ_VERIFIED_NAME_WORD`]
+/// `data[0]` is the file's length in bytes, 1 to [`READ_VERIFIED_MAX`], or to
+/// [`READ_VERIFIED_IMAGE_MAX`] for a driver image; `data[1]` the role the
+/// file must be signed in, [`READ_VERIFIED_DATA`],
+/// [`READ_VERIFIED_CONFIGURATION`] or [`READ_VERIFIED_DRIVER`], the last
+/// only from a sender whose signature policy loads drivers; from word
+/// [`READ_VERIFIED_NAME_WORD`]
 /// the name block (`crate::with_name_block`, at most [`CREATE_NAME_MAX`]
 /// bytes): the install path the file must be signed under. `caps[0]` is the
 /// file cap, which procmgr opens, reads once (`FS_READ_MEMORY`) into one run
@@ -1003,8 +1006,9 @@ pub const MAKE_RESIDENT: u64 = 30;
 /// deletes the cap and releases the region (`memmgr_labels::RELEASE_MEMORY_CAPS`
 /// on its own memmgr cap) when done; its death releases it with its
 /// record. Refusals: `INVALID_ARGUMENT` for a missing cap, a length of zero
-/// or past the bound, a role other than the two, or a missing or
-/// non-canonical name, before any read;
+/// or past the role's bound, a role other than the three, or a missing or
+/// non-canonical name, and `UNAUTHORIZED` for the driver role from a sender
+/// whose policy does not load drivers, each before any read;
 /// `SIGNATURE_REFUSED` when the copy does not verify; `LIMIT` when the max of
 /// the sender's budget node or of an ancestor refuses the run; `IO_ERROR`,
 /// `OUT_OF_MEMORY` and `MAP_FAILED` as for [`CREATE_FROM_FILE`]'s read.
@@ -1100,8 +1104,17 @@ pub const CHECKPOINT: u64 = 35;
 /// The most bytes a [`READ_VERIFIED`] file may hold, its trailer included:
 /// 32 KiB, room for a platform description table
 /// (`MAX_TABLE_BYTES`, 8 KiB) and the other policy-bearing configuration
-/// files. procmgr refuses a longer request before it reads anything.
+/// files. procmgr refuses a longer request before it reads anything. A
+/// driver image has a bound of its own, [`READ_VERIFIED_IMAGE_MAX`].
 pub const READ_VERIFIED_MAX: u64 = 32 * 1024;
+
+/// The most bytes a [`READ_VERIFIED`] driver image
+/// ([`READ_VERIFIED_DRIVER`]) may hold, its trailer included: 16 MiB, room
+/// for a driver image many times the largest the tree builds (about 160 KiB
+/// in a debug build). procmgr reserves and maps the copy in its own address
+/// space while it reads and verifies it, so the bound caps what one request
+/// holds of it; procmgr refuses a longer request before it reads anything.
+pub const READ_VERIFIED_IMAGE_MAX: u64 = 16 * 1024 * 1024;
 
 /// The data word of a [`READ_VERIFIED`] request holding the role the file
 /// must be signed in.
@@ -1115,6 +1128,12 @@ pub const READ_VERIFIED_DATA: u64 = 7;
 /// configuration file or a directory's index: role 8, configuration, in the
 /// numbering of docs/signing.md § Signed Attributes.
 pub const READ_VERIFIED_CONFIGURATION: u64 = 8;
+
+/// The role word of a [`READ_VERIFIED`] request for a driver image whose
+/// declaration its reader parses before it creates the driver from the same
+/// run (docs/driver-binding.md § Driver Declarations): role 5, driver, in the
+/// numbering of docs/signing.md § Signed Attributes.
+pub const READ_VERIFIED_DRIVER: u64 = 5;
 
 /// The data word of a [`READ_VERIFIED`] request holding the name block's
 /// length, whose bytes follow.

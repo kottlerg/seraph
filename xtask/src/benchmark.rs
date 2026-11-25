@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 
-use bench::{Unit, parse_line};
+use bench::{IDLE_HALTS, Unit, parse_line};
 
 use crate::error::{Result, bail, ensure};
 use crate::timing::TRAILER_PREFIX;
@@ -100,8 +100,9 @@ pub struct RunLog
     pub icount: bool,
     /// The trailer's `outcome=`.
     pub outcome: String,
-    /// Each result line's measurement, unit and p50.
-    pub lines: Vec<(Key, Unit, u64)>,
+    /// Each result line's measurement, unit, p50 and `idle_halts=` extra,
+    /// `None` for a line without one.
+    pub lines: Vec<(Key, Unit, u64, Option<u64>)>,
     /// The benchmarks that logged a `FAIL` line.
     pub failed: Vec<String>,
 }
@@ -180,7 +181,11 @@ pub fn parse_run(text: &str) -> Result<RunLog>
             seen.insert(key.clone()),
             "{key} is reported twice in one run"
         );
-        run.lines.push((key, parsed.unit, parsed.summary.p50));
+        let idle_halts = parsed
+            .extras()
+            .find_map(|(k, v)| (k == IDLE_HALTS).then_some(v));
+        run.lines
+            .push((key, parsed.unit, parsed.summary.p50, idle_halts));
     }
     Ok(run)
 }
@@ -255,6 +260,11 @@ pub struct Measured
     /// the kernel test image, ubench's from the userspace one), so a run of
     /// the other boot is not expected to report them.
     pub expected: usize,
+    /// The halts of the measuring CPU's idle thread over the measured loops
+    /// of the runs that reported it, summed (`idle_halts=`,
+    /// shared/bench/README.md § Idle halts); `None` when a run's line did not
+    /// report the count.
+    pub idle_halts: Option<u64>,
 }
 
 /// A set of runs of one architecture and mode, measurement by measurement.
@@ -267,6 +277,9 @@ pub struct RunSet
     pub measured: BTreeMap<Key, Measured>,
     /// The `FAIL` lines' benchmarks, with the run that logged each.
     pub failed: Vec<String>,
+    /// The runs whose line of a measurement reported a halt, each by its
+    /// 1-based place among the logs given, by measurement.
+    pub idled: BTreeMap<Key, Vec<usize>>,
 }
 
 /// Gather `runs`, the logs of one mode, measurement by measurement.
@@ -319,7 +332,7 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
         let suites: BTreeSet<&str> = run
             .lines
             .iter()
-            .map(|(key, _, _)| suite_of(&key.bench))
+            .map(|(key, ..)| suite_of(&key.bench))
             .collect();
         for suite in suites
         {
@@ -329,6 +342,7 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
     }
     let mut measured: BTreeMap<Key, Measured> = BTreeMap::new();
     let mut failed = Vec::new();
+    let mut idled: BTreeMap<Key, Vec<usize>> = BTreeMap::new();
     for (i, run) in runs.iter().enumerate()
     {
         failed.extend(
@@ -336,7 +350,7 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
                 .iter()
                 .map(|b| format!("{b} (run {})", i.saturating_add(1))),
         );
-        for (key, unit, p50) in &run.lines
+        for (key, unit, p50, idle_halts) in &run.lines
         {
             let expected = runs_at
                 .get(&(key.cpus, suite_of(&key.bench)))
@@ -347,10 +361,22 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
                 lowest: *p50,
                 runs: 0,
                 expected,
+                idle_halts: Some(0),
             });
             ensure!(entry.unit == *unit, "{key} is reported in two units");
             entry.lowest = entry.lowest.min(*p50);
             entry.runs = entry.runs.saturating_add(1);
+            entry.idle_halts = entry
+                .idle_halts
+                .zip(*idle_halts)
+                .map(|(sum, halts)| sum.saturating_add(halts));
+            if idle_halts.is_some_and(|halts| halts > 0)
+            {
+                idled
+                    .entry(key.clone())
+                    .or_default()
+                    .push(i.saturating_add(1));
+            }
         }
     }
     ensure!(!measured.is_empty(), "no result line in any run");
@@ -358,6 +384,7 @@ pub fn gather(mode: BenchMode, runs: &[RunLog]) -> Result<RunSet>
         arch: first.arch.clone(),
         measured,
         failed,
+        idled,
     })
 }
 
@@ -706,10 +733,22 @@ pub fn compare(
         .collect()
 }
 
-/// Whether a row fails the gate: a gated row whose verdict is not `Within`.
+/// Whether a gated row's measured loops idled, or its lines did not say: a
+/// timed window that idles under icount counts host time
+/// (shared/bench/README.md § Idle halts), so a gated measurement is held to
+/// no halt of its CPU over its measured loop. An `ICOUNT_IO_BOUND`
+/// measurement and a multi-CPU one, which do not gate, report their count
+/// only.
+pub fn idled(row: &Row) -> bool
+{
+    row.gated && row.measured.is_some_and(|m| m.idle_halts != Some(0))
+}
+
+/// Whether a row fails the gate: a gated row whose verdict is not `Within`,
+/// or whose measured loops idled ([`idled`]).
 pub fn fails(row: &Row) -> bool
 {
-    row.gated && row.verdict != Verdict::Within
+    row.gated && (row.verdict != Verdict::Within || idled(row))
 }
 
 /// The comparison's table, then a line per failing row with its remedy.
@@ -724,8 +763,8 @@ pub fn report(mode: BenchMode, set: &RunSet, rows: &[Row]) -> String
     );
     let _ = writeln!(
         out,
-        "{:<10} {:<6} {:>12} {:>12} {:>9} {:>10}  measurement",
-        "verdict", "gate", "baseline", "lowest p50", "change", "band"
+        "{:<10} {:<6} {:>12} {:>12} {:>9} {:>10} {:>6}  measurement",
+        "verdict", "gate", "baseline", "lowest p50", "change", "band", "idle"
     );
     for row in rows
     {
@@ -737,17 +776,20 @@ pub fn report(mode: BenchMode, set: &RunSet, rows: &[Row]) -> String
         };
         let _ = writeln!(
             out,
-            "{:<10} {:<6} {:>12} {:>12} {:>9} {:>10}  {}",
+            "{:<10} {:<6} {:>12} {:>12} {:>9} {:>10} {:>6}  {}",
             row.verdict.label(),
             if row.gated { "gated" } else { "report" },
             num(row.base.map(|b| b.p50)),
             num(row.measured.map(|m| m.lowest)),
             change,
             num(row.band),
+            num(row.measured.and_then(|m| m.idle_halts)),
             row.key
         );
     }
-    for row in rows.iter().filter(|r| fails(r))
+    for row in rows
+        .iter()
+        .filter(|r| r.gated && r.verdict != Verdict::Within)
     {
         let why = match row.verdict
         {
@@ -768,6 +810,37 @@ pub fn report(mode: BenchMode, set: &RunSet, rows: &[Row]) -> String
             "rewrite its baseline with `cargo xtask bench-baseline` (xtask/README.md) and state why in the PR"
         };
         let _ = writeln!(out, "FAIL: {} {why}: {remedy}", row.key);
+    }
+    for row in rows.iter().filter(|r| idled(r))
+    {
+        let _ = match row
+            .measured
+            .as_ref()
+            .and_then(|m| m.idle_halts.map(|h| (h, m)))
+        {
+            Some((halts, m)) => writeln!(
+                out,
+                "FAIL: {} idled: its CPU halted {halts} time(s) in the measured loops of run(s) {} \
+                 of the {} that measured it, and a timed window that idles counts host time under \
+                 icount: keep the wait out of the timed window, or add the benchmark to \
+                 ICOUNT_IO_BOUND (xtask/src/benchmark.rs) if it waits by design",
+                row.key,
+                set.idled
+                    .get(&row.key)
+                    .into_iter()
+                    .flatten()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                m.runs
+            ),
+            None => writeln!(
+                out,
+                "FAIL: {} reports no {IDLE_HALTS}=: its harness does not read its CPU's \
+                 idle-halt count around the measured loop (shared/bench/README.md § Idle halts)",
+                row.key
+            ),
+        };
     }
     for bench in &set.failed
     {
@@ -813,7 +886,9 @@ pub enum Rewrite
 ///
 /// # Errors
 /// A run set with a measurement some run missed, or with a `FAIL` line: a
-/// baseline is regenerated from complete runs only.
+/// baseline is regenerated from complete runs only. A gated measurement whose
+/// measured loops idled, or whose lines did not say ([`idled`]): its count
+/// holds host time, which a baseline does not record.
 pub fn regenerate(
     mode: BenchMode,
     set: &RunSet,
@@ -838,6 +913,14 @@ pub fn regenerate(
         .map(|(key, s)| (key.clone(), *s))
         .collect();
     let rows = compare(mode, set, &stored, bands);
+    if let Some(row) = rows.iter().find(|r| idled(r))
+    {
+        bail!(
+            "{} idled in its measured loops, or does not report {IDLE_HALTS}=: a baseline \
+             records no host time",
+            row.key
+        );
+    }
     let benches: BTreeSet<&str> = rows.iter().map(|r| r.key.bench.as_str()).collect();
     let mut out = BTreeMap::new();
     for bench in benches
@@ -935,7 +1018,7 @@ mod tests
     {
         format!(
             "[1.000000] ktest: bench ktest.{name} arch=riscv64 cpus={cpus} unit=insns n=8 \
-             min={p50} p50={p50} p90={p50} p99={p50} max={p50}"
+             min={p50} p50={p50} p90={p50} p99={p50} max={p50} idle_halts=0"
         )
     }
 
@@ -989,7 +1072,7 @@ mod tests
             &[
                 line("null_syscall_roundtrip", 1, 500),
                 "[2.0] ktest: bench ktest.ipc_round_trip words=6 arch=riscv64 cpus=1 unit=insns \
-                 n=8 min=9 p50=9 p90=9 p99=9 max=9"
+                 n=8 min=9 p50=9 p90=9 p99=9 max=9 harness_cpu=0"
                     .to_string(),
                 "[3.0] ktest: bench ktest.cap_info_lookup FAIL (result line: unit)".to_string(),
             ],
@@ -1001,6 +1084,7 @@ mod tests
         assert_eq!(run.outcome, "PASS");
         assert_eq!(run.lines.len(), 2);
         assert_eq!(run.lines[1].0, key("ipc_round_trip", "words=6", 1));
+        assert_eq!((run.lines[0].3, run.lines[1].3), (Some(0), None));
         assert_eq!(run.failed, ["ktest.cap_info_lookup"]);
     }
 
@@ -1143,7 +1227,7 @@ mod tests
     {
         format!(
             "[1.000000] [{suite}] bench {suite}.{name} arch=riscv64 cpus={cpus} unit=cycles \
-             n=8 min={p50} p50={p50} p90={p50} p99={p50} max={p50}"
+             n=8 min={p50} p50={p50} p90={p50} p99={p50} max={p50} idle_halts=0"
         )
     }
 
@@ -1264,6 +1348,135 @@ mod tests
         assert_eq!(row(&write).verdict, Verdict::Regressed);
         assert!(!fails(row(&write)));
         assert!(fails(row(&read)));
+    }
+
+    /// A one-CPU line of `ktest.<name>` whose measured loop saw `halts` halts.
+    fn idle_line(name: &str, cpus: u32, p50: u64, halts: u64) -> String
+    {
+        line(name, cpus, p50).replace("idle_halts=0", &format!("idle_halts={halts}"))
+    }
+
+    #[test]
+    fn a_gated_measurement_whose_loop_idled_fails_naming_it_and_its_halts()
+    {
+        let base = stored(&[(key("a", "", 1), 500), (key("b", "", 1), 500)]);
+        let runs = [
+            log(1, "on", &[idle_line("a", 1, 500, 1), line("b", 1, 500)]),
+            log(1, "on", &[line("a", 1, 500), line("b", 1, 500)]),
+            log(1, "on", &[idle_line("a", 1, 500, 2), line("b", 1, 500)]),
+        ];
+        let set = gather(BenchMode::Icount, &runs).unwrap();
+        let rows = compare(BenchMode::Icount, &set, &base, &BTreeMap::new());
+        let row = |k: &Key| rows.iter().find(|r| &r.key == k).unwrap();
+        // Within its band, and failed for the idle alone.
+        assert_eq!(row(&key("a", "", 1)).verdict, Verdict::Within);
+        assert!(idled(row(&key("a", "", 1))) && fails(row(&key("a", "", 1))));
+        assert!(!fails(row(&key("b", "", 1))));
+        let text = report(BenchMode::Icount, &set, &rows);
+        assert!(text.contains(
+            "FAIL: ktest.a cpus=1 idled: its CPU halted 3 time(s) in the measured loops of run(s) \
+             1, 3 of the 3 that measured it"
+        ));
+        assert!(!text.contains("FAIL: ktest.b"));
+    }
+
+    #[test]
+    fn a_gated_line_without_the_idle_count_fails_and_names_the_missing_extra()
+    {
+        let base = stored(&[(key("a", "", 1), 500)]);
+        let uncounted = line("a", 1, 500).replace(" idle_halts=0", "");
+        let set = gather(BenchMode::Icount, &[log(1, "on", &[uncounted])]).unwrap();
+        let rows = compare(BenchMode::Icount, &set, &base, &BTreeMap::new());
+        assert_eq!(rows[0].measured.unwrap().idle_halts, None);
+        assert!(fails(&rows[0]));
+        assert!(
+            report(BenchMode::Icount, &set, &rows)
+                .contains("FAIL: ktest.a cpus=1 reports no idle_halts=")
+        );
+    }
+
+    #[test]
+    fn an_idle_io_bound_or_multi_cpu_measurement_shows_its_count_and_passes()
+    {
+        let write = Key {
+            bench: "fsbench.write".to_string(),
+            variant: "size=4096 path=frame".to_string(),
+            cpus: 1,
+        };
+        let base = BTreeMap::from([
+            (
+                write.clone(),
+                Stored {
+                    unit: Unit::Cycles,
+                    p50: 500,
+                },
+            ),
+            (
+                key("a", "", 4),
+                Stored {
+                    unit: Unit::Insns,
+                    p50: 500,
+                },
+            ),
+        ]);
+        let runs = [
+            log(
+                1,
+                "on",
+                &[
+                    "[1.0] [fsbench] bench fsbench.write size=4096 path=frame arch=riscv64 cpus=1 \
+                   unit=cycles n=8 min=1 p50=500 p90=500 p99=500 max=500 idle_halts=64"
+                        .to_string(),
+                ],
+            ),
+            log(4, "on", &[idle_line("a", 4, 500, 9)]),
+        ];
+        let set = gather(BenchMode::Icount, &runs).unwrap();
+        let rows = compare(BenchMode::Icount, &set, &base, &BTreeMap::new());
+        assert!(rows.iter().all(|r| !idled(r) && !fails(r)));
+        let text = report(BenchMode::Icount, &set, &rows);
+        assert!(!text.contains("FAIL"));
+        assert!(
+            text.lines()
+                .any(|l| l.contains(" 64  fsbench.write") && l.starts_with("ok"))
+        );
+        assert!(text.lines().any(|l| l.contains(" 9  ktest.a cpus=4")));
+    }
+
+    #[test]
+    fn regeneration_refuses_a_gated_measurement_that_idled_and_takes_an_io_bound_one()
+    {
+        let set = gather(
+            BenchMode::Icount,
+            &[log(1, "on", &[idle_line("a", 1, 500, 1)])],
+        )
+        .unwrap();
+        let refused = regenerate(
+            BenchMode::Icount,
+            &set,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Rewrite::All,
+        );
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("ktest.a cpus=1 idled in its measured loops")
+        );
+
+        let write = "[1.0] [fsbench] bench fsbench.write size=4096 path=frame arch=riscv64 cpus=1 \
+                     unit=cycles n=8 min=1 p50=500 p90=500 p99=500 max=500 idle_halts=64";
+        let set = gather(BenchMode::Icount, &[log(1, "on", &[write.to_string()])]).unwrap();
+        let files = regenerate(
+            BenchMode::Icount,
+            &set,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Rewrite::All,
+        )
+        .unwrap();
+        assert!(files["fsbench.write"].is_some());
     }
 
     #[test]

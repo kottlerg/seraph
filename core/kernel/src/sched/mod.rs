@@ -481,10 +481,12 @@ static mut OWED_WAKE_LAST: [(*mut ThreadControlBlock, u8); OWED_WAKE_MAX] =
 #[cfg(not(test))]
 static mut OWED_WAKE_LAST_COUNT: usize = 0;
 
-/// One CPU's softlockup-watchdog breadcrumbs, held in the `cpu_count`-sized
-/// `CPU_DIAG` slab. Each field is written by its own CPU only, which reaches
-/// its record through `PerCpuData::diag` ([`this_cpu_diag`]), and read by
-/// the watchdog on another ([`cpu_diag`]). Diagnostic-only: no field gates
+/// One CPU's diagnostic record, held in the `cpu_count`-sized `CPU_DIAG`
+/// slab: the softlockup watchdog's breadcrumbs and the CPU's idle-halt count.
+/// Each field is written by its own CPU only, which reaches its record through
+/// `PerCpuData::diag` ([`this_cpu_diag`]); the breadcrumbs are read by the
+/// watchdog on another CPU ([`cpu_diag`]), the idle-halt count by this CPU
+/// alone ([`idle_halts_since_mark`]). Diagnostic-only: no field gates the kernel's
 /// control flow.
 pub(crate) struct CpuDiag
 {
@@ -530,6 +532,15 @@ pub(crate) struct CpuDiag
     /// names the last syscall entered on a stalled CPU, which need not be the
     /// one it is executing, without reading another CPU's TCB or frame.
     syscall_nr: core::sync::atomic::AtomicU64,
+    /// The times this CPU's idle thread has halted it since boot, one per
+    /// halt of the idle loop ([`note_idle_halt`]): one per stretch in which
+    /// the CPU found no thread to run, and one more for each interrupt that
+    /// ends a halt and leaves it with none. Written by the idle thread only,
+    /// a Relaxed load and store; read by a syscall on this CPU only
+    /// (`SYS_SYSTEM_INFO`'s `IdleHalts`, [`idle_halts_since_mark`]), never by
+    /// another CPU, and never reported whole: a caller learns only its
+    /// difference between two of its own calls.
+    idle_halts: core::sync::atomic::AtomicU64,
 }
 
 /// Base of the `CPU_DIAG` slab: `CPU_COUNT` [`CpuDiag`] records, null until
@@ -540,12 +551,12 @@ pub(crate) struct CpuDiag
 static CPU_DIAG_PTR: core::sync::atomic::AtomicPtr<CpuDiag> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-/// This CPU's breadcrumb record, read through `PerCpuData::diag` with one
+/// This CPU's diagnostic record, read through `PerCpuData::diag` with one
 /// GS- or `tp`-relative load.
 ///
 /// Every stamp runs on a CPU whose per-CPU pointer is installed: the syscall
-/// entry, the timer tick, a protocol spin and a contended bare lock all run
-/// after Phase 5 (`percpu::init_bsp`, or `percpu::init_ap` before an AP runs
+/// entry, the timer tick, a protocol spin, a contended bare lock and the idle
+/// loop all run after Phase 5 (`percpu::init_bsp`, or `percpu::init_ap` before an AP runs
 /// kernel code), which follows Phase 4's write of the field, as every
 /// [`crate::arch::current::cpu::current_cpu`] read does.
 #[cfg(not(test))]
@@ -763,6 +774,57 @@ pub fn note_cpu_syscall(nr: u64)
     this_cpu_diag()
         .syscall_nr
         .store(nr, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one halt of this CPU's idle thread ([`CpuDiag::idle_halts`]).
+/// Called by the idle thread alone, the count's one writer, so a load and a
+/// store suffice. A `u64` counting at most one halt per interrupt does not
+/// wrap in the life of a machine; the add wraps rather than saturate so a
+/// reader's difference of two counts stays right.
+#[cfg(not(test))]
+fn note_idle_halt()
+{
+    let halts = &this_cpu_diag().idle_halts;
+    halts.store(
+        halts
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `SYS_SYSTEM_INFO`'s `IdleHalts`: the halts of this CPU's idle thread
+/// ([`CpuDiag::idle_halts`]) since the calling thread's previous call, when
+/// that call ran on this CPU, or `None` when the thread has made none or made
+/// it on another CPU. Either way the call moves the thread's mark
+/// ([`ThreadControlBlock::idle_halts_mark_cpu`]) to this CPU and its count,
+/// so a thread learns only the halts between two of its own calls on one
+/// CPU, never a count from boot.
+///
+/// The CPU is the one the caller's syscall entered on: syscall context is not
+/// preemptible and runs with interrupts masked here
+/// (core/kernel/docs/scheduler.md § Kernel-Mode Preemption Points), so the
+/// record chosen, the count loaded and the mark written are of one CPU, whose
+/// idle thread is not running while the caller is. The mark is the calling
+/// thread's own, which no other CPU reads or writes.
+#[cfg(not(test))]
+pub fn idle_halts_since_mark() -> Option<u64>
+{
+    use core::sync::atomic::Ordering::Relaxed;
+
+    let cpu = crate::arch::current::cpu::current_cpu();
+    let now = this_cpu_diag().idle_halts.load(Relaxed);
+    // SAFETY: the per-CPU pointer is installed on every CPU that takes a
+    // syscall.
+    let current = unsafe { crate::percpu::current_thread() };
+    // SAFETY: non-null, `current` names the caller's TCB, this CPU's current
+    // thread, which lives at least until the call returns.
+    let caller = unsafe { current.as_ref() }?;
+    let since = (caller.idle_halts_mark_cpu.load(Relaxed) == cpu)
+        .then(|| now.wrapping_sub(caller.idle_halts_mark.load(Relaxed)));
+    caller.idle_halts_mark_cpu.store(cpu, Relaxed);
+    caller.idle_halts_mark.store(now, Relaxed);
+    since
 }
 
 /// Record that the current CPU is spinning for the lock of kind `kind` whose
@@ -2748,7 +2810,10 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             // Step 3: no work → halt. Atomic on both arches: x86
             // `sti;hlt`, RISC-V `wfi; csrsi sstatus, SIE`.
             // Returns with interrupts enabled; any pending wake interrupt
-            // has been recognised.
+            // has been recognised. The halt is counted before it is
+            // taken: the interrupt that ends it can switch straight to the
+            // thread it woke, which must then read the halt in the count.
+            note_idle_halt();
             halt_until_interrupt();
         }
 
@@ -2910,6 +2975,10 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     // mark it. They are never deallocated or `Blocked`, and
                     // the watchdog's per-CPU `current` dump already shows them.
                     registry: crate::sched::registry_list::RegistryLinks::new(),
+                    idle_halts_mark_cpu: core::sync::atomic::AtomicU32::new(
+                        thread::NO_IDLE_HALTS_MARK,
+                    ),
+                    idle_halts_mark: core::sync::atomic::AtomicU64::new(0),
                     magic: thread::TCB_MAGIC,
                 },
             );
@@ -3002,7 +3071,7 @@ const _: () = assert!(
     "LAST_NON_IDLE_TICK slab overflows"
 );
 
-/// The watchdog breadcrumb slab: one [`CpuDiag`] per CPU.
+/// The diagnostic-record slab: one [`CpuDiag`] per CPU.
 const CPU_DIAG_SLAB: PerCpuSlab = PerCpuSlab::of::<CpuDiag>("CPU_DIAG");
 const _: () = assert!(
     CPU_DIAG_SLAB.sized_at_every_width(),
@@ -3140,8 +3209,9 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
         alloc_per_cpu_slab::<core::sync::atomic::AtomicU64>(LAST_NON_IDLE_TICK_SLAB, n, allocator);
     LAST_NON_IDLE_TICK_PTR.store(tick_ptr, core::sync::atomic::Ordering::Release);
 
-    // Per-CPU watchdog breadcrumbs. Zero is every field's idle value except
-    // the last-syscall stamp, whose "none yet" is `u64::MAX`.
+    // Per-CPU diagnostic records. Zero is every field's idle value, the
+    // idle-halt count's included, except the last-syscall stamp, whose "none
+    // yet" is `u64::MAX`.
     let diag_ptr = alloc_per_cpu_slab::<CpuDiag>(CPU_DIAG_SLAB, n, allocator);
     for cpu in 0..n
     {

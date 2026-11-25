@@ -1730,6 +1730,10 @@ unsafe fn kernel_entry_post_rebase(
                         sleep_expiry: crate::sched::thread::SleepExpiry::EMPTY,
                         extended: sched::thread::ExtendedState::from_raw(init_extended_area),
                         registry: crate::sched::registry_list::RegistryLinks::new(),
+                        idle_halts_mark_cpu: core::sync::atomic::AtomicU32::new(
+                            sched::thread::NO_IDLE_HALTS_MARK,
+                        ),
+                        idle_halts_mark: core::sync::atomic::AtomicU64::new(0),
                         magic: sched::thread::TCB_MAGIC,
                     },
                 );

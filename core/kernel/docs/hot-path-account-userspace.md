@@ -95,7 +95,7 @@ and the kernel's copy to and from user memory. A read through granted frames (`p
 12628 / 12530 in the kernel's Keccak permutation (`keccak_f1600`, a kernel entropy draw) per 4 KiB
 frame the grant names, 202048 / 200480 of 677677 / 1063190 at 64 KiB; #1550 serves such small draws
 from one squeezed block. `fsbench.open depth=3` is 66284 / 100885, one such draw (12628 / 12530) and
-fatfs's long-name parsing (`LfnAccum`, 8370 / 7071) among it.
+fatfs's long-name parsing (`LfnAccum`, 7670 / 6478) among it.
 
 ## Account
 

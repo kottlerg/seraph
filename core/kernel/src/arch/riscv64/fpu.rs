@@ -7,10 +7,12 @@
 //!
 //! Concentrates the unsafe surface for FP and Vector state management. A user
 //! thread's state is live in the registers whenever it runs in user mode, and no
-//! other thread's is (`sched::fpu_switch`). The kernel runs with `sstatus.FS`
-//! and `VS` Off (the boot invariant, [`enable_fpu_vector`]) and turns them on
-//! only for a save, a load or a scrub here; a user thread resumes with the
-//! values its trap frame holds, which [`switch_in_restore`] and
+//! other thread's is (`sched::fpu_switch`). `sstatus.FS` and `VS` are Off at
+//! boot ([`enable_fpu_vector`]) and after every switch-out; a trap from user
+//! mode leaves them as the thread had them, Clean or Dirty, until
+//! [`switch_out_save`] reads and turns them Off. A save, a load or a scrub
+//! here turns them on for its own instructions only. A user thread resumes with
+//! the values its trap frame holds, which [`switch_in_restore`] and
 //! [`first_use_trap`] write, since `trap_entry` restores `sstatus` from the
 //! frame before `sret`.
 //!
@@ -256,8 +258,8 @@ unsafe fn restore_fp_from(area: *const u8)
 
 /// Context-switch hook called on switch-out of any thread: if `sstatus.FS` is
 /// Dirty, save the live F/D state to the thread's save area, and if
-/// `sstatus.VS` is Dirty the V register file. Then turn live `FS`/`VS` Off,
-/// the state the kernel runs in, and clear them in the thread's trap frame:
+/// `sstatus.VS` is Dirty the V register file. Then turn live `FS`/`VS` Off, the
+/// state every switch leaves, and clear them in the thread's trap frame:
 /// [`switch_in_restore`] sets the frame's at the thread's next switch-in. This
 /// CPU's `fpu_owner` and the thread's `fpu_cpu` keep naming each other.
 ///
@@ -571,10 +573,8 @@ pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBl
 /// running thread in use and make its state live as switch-in would
 /// ([`make_live`]), which writes `FS`/`VS` Clean into `frame`; the
 /// instruction re-executes on `sret`. It runs once per thread: every later
-/// switch-in gives the frame Clean. A thread whose frame was given Off by
-/// another path (its first entry through `return_to_user`, a register write
-/// through `sanitize_for_user_resume`) takes it again and finds its state
-/// already live.
+/// switch-in gives the frame Clean, over the Off a register write
+/// (`sanitize_for_user_resume`) leaves in a switched-out thread's frame.
 ///
 /// # Safety
 /// Must execute in supervisor mode with interrupts disabled, from the U-mode
@@ -675,7 +675,7 @@ unsafe fn read_vlenb() -> u64
             options(nostack, nomem),
         );
     }
-    // Back to VS = Off, the state the kernel runs in.
+    // Back to VS = Off, the boot state enable_fpu_vector set.
     // SAFETY: csrc sstatus is privileged S-mode.
     unsafe {
         core::arch::asm!(

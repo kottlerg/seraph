@@ -18,7 +18,8 @@
 //! - Timer interrupt (scause = 5 | MSB) → `timer::handle_tick()`
 //! - External interrupt (scause = 9 | MSB) → IMSIC claim (`aia::claim`) →
 //!   `dispatch_external`
-//! - U-mode illegal instruction on an F/D/V opcode (scause = 2) → lazy FP/V restore
+//! - U-mode illegal instruction on an F/D/V opcode with FS Off (scause = 2) → the
+//!   first-use trap, `fpu::first_use_trap`
 //! - U-mode ecall (scause = 8) → `crate::syscall::dispatch`
 //! - Other U-mode exceptions → spurious-TLB retry, the bound fault handler, or thread
 //!   termination
@@ -1380,8 +1381,8 @@ pub unsafe fn init()
 
     // Force sstatus.FS = sstatus.VS = 00 (Off). Kernel is soft-float
     // (RV64IMAC); any F/D or V instruction in U-mode now raises an illegal-
-    // instruction trap, which the lazy save/restore path will use to
-    // demand-restore extended state. The boot hart's vlenb, which sizes
+    // instruction trap: a thread's first one is the first-use trap
+    // (`fpu::first_use_trap`), after which its switch-ins turn them on. The boot hart's vlenb, which sizes
     // every Thread's save area, is read later in Phase 5, once the per-CPU
     // pointer is installed (`fpu::report_save_area`); each AP checks its own
     // against it (`init_ap`) and halts the boot on a mismatch.

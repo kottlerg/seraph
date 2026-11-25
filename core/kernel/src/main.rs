@@ -2263,7 +2263,7 @@ static PANIC_DUMP_READY: core::sync::atomic::AtomicBool =
 /// panic reached from corrupted syscall register arguments from a deterministic
 /// kernel bug; for a panic in an interrupt or exception taken from user mode
 /// that publishes its frame it is that entry's frame. The x86-64 entries that
-/// publish none (`#NM`, the NMI, `#DF`, `#MC`;
+/// publish none (the NMI, `#DF`, `#MC`;
 /// core/kernel/docs/arch-interface.md § `trap_frame`) leave `trap_frame` naming
 /// the last publishing entry's frame, which may be stale or overwritten by the
 /// later entry's stack pushes. Serial-only / lock-bypassing, mirroring the panic
@@ -2324,7 +2324,7 @@ unsafe fn panic_context_dump()
         // (core/kernel/docs/arch-interface.md § `trap_frame`), so it is
         // reported as the user frame, with the registers a syscall would carry
         // its arguments in. A panic on an x86-64 entry that publishes none
-        // (`#NM`, the NMI, `#DF`, `#MC`) reads the last publishing entry's
+        // (the NMI, `#DF`, `#MC`) reads the last publishing entry's
         // frame, which may be stale or overwritten.
         // SAFETY: a non-null trap_frame names a frame on this thread's kernel
         // stack, and this is that thread's own CPU, so nothing writes the

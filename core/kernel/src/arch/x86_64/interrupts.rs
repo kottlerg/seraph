@@ -10,7 +10,7 @@
 //! (numbers match the inline step comments in [`init`]):
 //!
 //! 1. Enable SMEP + SMAP (fatal if CPU lacks support).
-//!    1a. Enable XSAVE and set CR0.TS for lazy FPU/SIMD restore.
+//!    1a. Enable XSAVE, with CR0.TS clear (the switch-in loads FPU/SIMD state).
 //! 2. Carve IST stacks (2 × [`IST_STACK_SIZE`]) out of the [`BSP_IST_STACKS`] BSS array.
 //! 3. Load GDT + TSS with the IST stack pointers.
 //! 4. Load IDT.

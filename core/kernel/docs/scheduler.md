@@ -948,14 +948,12 @@ passes the interrupt delivery point when it is dispatched again, as a thread an 
 does (`sched::exception_return_work`;
 [fault-handling.md](../../../docs/fault-handling.md#delivery-points) § Delivery points).
 
-Two returns to user mode make no decision. The RISC-V first-use F/D/V trap (`fpu::first_use_trap`)
-runs with interrupts masked and preemption disabled throughout and links nothing, so an IPI raised
-meanwhile is taken in user mode as it returns. A new thread's first entry to user mode follows the
-dispatch that chose it as its CPU's highest, with interrupts masked until it reaches user mode,
-where a later link's IPI is taken. The decision is skipped during the BSP boot transient, while
-preemption is disabled, and for the idle thread, whose loop takes queued work itself (§ Idle
-Thread). Syscall context stays non-preemptible (§ Kernel-Mode Preemption Points): a wake made or
-absorbed inside a syscall takes effect at its exit.
+One return to user mode makes no decision: a new thread's first entry, which follows the dispatch
+that chose it as its CPU's highest, with interrupts masked until it reaches user mode, where a later
+link's IPI is taken. The decision is skipped during the BSP boot transient, while preemption is
+disabled, and for the idle thread, whose loop takes queued work itself (§ Idle Thread). Syscall
+context stays non-preemptible (§ Kernel-Mode Preemption Points): a wake made or absorbed inside a
+syscall takes effect at its exit.
 
 `Requeue::Preempted` links the preempted thread at the head of its own queue, keeping its
 remaining slice, in both classes: it has not finished its turn, and at the tail every peer of its

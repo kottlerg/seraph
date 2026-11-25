@@ -2217,8 +2217,10 @@ the frame per architecture ([arch-interface.md](arch-interface.md) § `trap_fram
 `arch::current::trap_frame`): a non-user instruction pointer (on x86-64, also a non-user
 stack pointer) is rejected with `InvalidArgument`; x86-64 forces ring-3 selectors and
 clears privileged RFLAGS bits; RISC-V discards the supplied `sstatus` and resumes the thread
-with the value a first entry gets (SPIE set; SPP, SIE, SUM, and MXR clear; FS and VS Off, so
-the thread's first F/D/V instruction traps and makes its state live).
+with the value a first entry gets (SPIE set; SPP, SIE, SUM, and MXR clear; FS and VS Off). The
+thread's next switch-in sets FS and VS Clean when the thread uses F, D or V, so it resumes with its
+state live; a thread that has not used them resumes with them Off, and its first F/D/V
+instruction traps and makes its state live.
 
 A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
 until that CPU deschedules it, so the call refuses it with `InvalidState` until it is `current` on

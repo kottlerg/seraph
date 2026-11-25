@@ -113,6 +113,32 @@ pub enum Refusal
     },
 }
 
+/// A byte count in the largest binary unit that gives a whole number, the form
+/// a size takes in a log message (docs/coding-standards.md § Log Messages): the
+/// length of a range a [`Refusal`] refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteSize(pub u64);
+
+impl core::fmt::Display for ByteSize
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+        let mut value = self.0;
+        let mut unit = "B";
+        for next in UNITS.iter().skip(1)
+        {
+            if value == 0 || value % 1024 != 0
+            {
+                break;
+            }
+            value /= 1024;
+            unit = next;
+        }
+        write!(f, "{value} {unit}")
+    }
+}
+
 /// The number of descriptors a map of `map.len()` bytes holds at `stride`; 0
 /// for a stride shorter than [`DESCRIPTOR_LEN`].
 #[must_use]
@@ -236,7 +262,28 @@ pub fn advance(d: &Descriptor, at: u64) -> Option<u64>
 mod tests
 {
     use super::*;
+    use std::string::ToString;
     use std::vec::Vec;
+
+    #[test]
+    fn byte_size_takes_the_largest_whole_unit()
+    {
+        for (bytes, text) in [
+            (0, "0 B"),
+            (36, "36 B"),
+            (1023, "1023 B"),
+            (1024, "1 KiB"),
+            (1536, "1536 B"),
+            (4096, "4 KiB"),
+            (261 << 20, "261 MiB"),
+            (3 << 30, "3 GiB"),
+            (1 << 60, "1 EiB"),
+            (u64::MAX, "18446744073709551615 B"),
+        ]
+        {
+            assert_eq!(ByteSize(bytes).to_string(), text, "{bytes}");
+        }
+    }
 
     /// A map of `(type, base, pages)` descriptors at `stride`.
     fn map(stride: usize, descriptors: &[(u32, u64, u64)]) -> Vec<u8>

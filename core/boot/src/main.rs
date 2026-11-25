@@ -56,8 +56,8 @@ use boot_firmware::dtb::Tree;
 use boot_firmware::seeds::Seeds;
 use boot_protocol::{
     BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootDevice, BootInfo, BootModule, FramebufferInfo,
-    InitImage, KernelMmio, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice, MmioAperture,
-    MmioApertureSlice, ModuleSlice, RECLAIM_FLAG_LATE, ReclaimRange, ReclaimSlice,
+    InitImage, KernelMmio, MAX_CPUS, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice,
+    MmioAperture, MmioApertureSlice, ModuleSlice, RECLAIM_FLAG_LATE, ReclaimRange, ReclaimSlice,
     TRUST_STORE_MODULE, bundle,
 };
 use objsig::Role;
@@ -1531,7 +1531,7 @@ unsafe fn step5_discover_firmware(ctx: &UefiContext, snapshot: &Snapshot) -> Fir
     bprintln!("[--------] boot: step 5/10: firmware discovery and platform resources");
     if !snapshot.is_read()
     {
-        bprintln!("[--------] boot: memory map not read; firmware tables not read");
+        bprintln!("[--------] boot: tables: every table skipped without a memory map");
     }
     // SAFETY: st is a valid UEFI system table pointer.
     let firm = unsafe { discover_firmware(ctx.st) };
@@ -1593,10 +1593,7 @@ unsafe fn step5_discover_cpu_topology(
         let (count, truncated) = place_cpu_ids(bsp_id, cpu_ids(), ids);
         if truncated
         {
-            bprintln!(
-                "[--------] boot: ACPI: MADT reported more than MAX_CPUS enabled CPUs (BSP \
-                 included); surplus dropped"
-            );
+            bprintln!("[--------] boot: acpi: CPUs dropped past {MAX_CPUS}");
         }
         bprintln!("[--------] boot: ACPI: {count} CPU(s) found via MADT");
         return Ok(CpuTopology {
@@ -1617,10 +1614,7 @@ unsafe fn step5_discover_cpu_topology(
         let (count, truncated) = tree.place_hart_ids(bsp_id, ids);
         if truncated
         {
-            bprintln!(
-                "[--------] boot: DTB: more than MAX_CPUS distinct harts (boot hart included); \
-                 surplus dropped"
-            );
+            bprintln!("[--------] boot: dtb: CPUs dropped past {MAX_CPUS}");
         }
         tables::report_limits(tree);
         bprintln!("[--------] boot: DTB: {count} hart(s) found");
@@ -2747,7 +2741,11 @@ unsafe fn step9_populate_boot_info(
     unsafe { tables::aperture_seeds(firm, tables, &mut seeds) };
     if seeds.found != seeds.written
     {
-        bprintln!("[--------] boot: aperture seeds past the seed buffers dropped");
+        bprintln!(
+            "[--------] boot: seeds: aperture seeds dropped, named={} heuristic={}",
+            seeds.found.0.saturating_sub(seeds.written.0),
+            seeds.found.1.saturating_sub(seeds.written.1)
+        );
     }
     let (mut seed_count, heuristic_count) = seeds.written;
     // GOP linear framebuffer: UEFI typically reports it as

@@ -23,8 +23,8 @@
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use boot_firmware::dtb::{Limits, Tree};
-use boot_firmware::region::{Refusal, firmware_range};
+use boot_firmware::dtb::{Limits, MAX_DEPTH, MAX_REG_ENTRIES, Tree};
+use boot_firmware::region::{ByteSize, Refusal, firmware_range};
 use boot_firmware::seeds::{AcpiSeedProfile, Seeds, acpi_table_seeds};
 use firmware_tables::acpi::{
     RSDP_LEN, SDT_HDR_LEN, iter_xsdt_entries, rsdp_xsdt_phys, sdt_length, sdt_signature,
@@ -176,22 +176,23 @@ impl<'m> TableMap<'m>
             Refusal::Overflow =>
             {
                 bprintln!(
-                    "[--------] boot: {what} at {phys:#x}, {len:#x} bytes, not read: its end \
-                     overflows the address space"
+                    "[--------] boot: tables: {what} not read, base={phys:#x} size={} \
+                     end=overflow",
+                    ByteSize(len)
                 );
             }
             Refusal::Kind { kind, at } =>
             {
                 bprintln!(
-                    "[--------] boot: {what} at [{phys:#x}, {end:#x}) not read: UEFI memory type \
-                     {kind} at {at:#x} holds no firmware data"
+                    "[--------] boot: tables: {what} not read, base={phys:#x} end={end:#x} \
+                     type={kind} at={at:#x}"
                 );
             }
             Refusal::Hole { at } =>
             {
                 bprintln!(
-                    "[--------] boot: {what} at [{phys:#x}, {end:#x}) not read: no firmware-data \
-                     memory at {at:#x}"
+                    "[--------] boot: tables: {what} not read, base={phys:#x} end={end:#x} \
+                     hole={at:#x}"
                 );
             }
         }
@@ -439,13 +440,11 @@ pub fn report_limits(tree: &Tree<'_>)
     } = tree.limits();
     if too_deep && !REPORTED_TOO_DEEP.swap(true, Ordering::Relaxed)
     {
-        bprintln!("[--------] boot: DTB: nodes nested past MAX_DEPTH; their properties skipped");
+        bprintln!("[--------] boot: dtb: properties skipped past depth {MAX_DEPTH}");
     }
     if truncated && !REPORTED_TRUNCATED.swap(true, Ordering::Relaxed)
     {
-        bprintln!(
-            "[--------] boot: DTB: a reg property past its entry bound; surplus entries dropped"
-        );
+        bprintln!("[--------] boot: dtb: reg entries dropped past {MAX_REG_ENTRIES}");
     }
 }
 

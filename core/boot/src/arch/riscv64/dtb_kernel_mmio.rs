@@ -47,10 +47,7 @@ pub fn parse_kernel_mmio(tree: &Tree<'_>, km: &mut KernelMmio)
         let aia = tree.aia();
         if let Some(hart) = aia.off_layout_hart
         {
-            bprintln!(
-                "[--------] boot: DTB: IMSIC file of hart {hart} is not at its layout address; \
-                 IMSIC not reported"
-            );
+            bprintln!("[--------] boot: dtb: IMSIC not reported, off-layout hart={hart}");
         }
         if km.aplic.base == 0
         {

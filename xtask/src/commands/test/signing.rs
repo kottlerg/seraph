@@ -148,13 +148,15 @@ const WRONG_ROLE: &str = "services/pwrmgr";
 const UNTRUSTED: &str = "services/crashd";
 const EXTRA_RECORD: &str = "programs/terminal";
 /// The drivers-directory driver the `rootfs` case gives a tampered
-/// declaration note, and the one it installs unsigned: drivers of devices no
-/// launch of the case attaches (a virtio-console only with `--debug-port`,
-/// `edu` only with `--test-devices`), so devmgr creates neither, and the
-/// only verifier that reaches either file is devmgr's verified read of its
+/// declaration note, and the one it installs unsigned, each in every image:
+/// virtio-console, whose device no launch of the case attaches (only
+/// `--debug-port` does), and the drivers directory's copy of virtio-blk,
+/// whose one device in the case, the boot disk, the boot pass binds from its
+/// boot module. devmgr creates neither from the directory, so the only
+/// verifier that reaches either file is devmgr's verified read of its
 /// declaration.
 const TAMPERED_DECLARATION: &str = "services/drivers/virtio-console";
-const UNSIGNED_DRIVER: &str = "services/drivers/test-dma";
+const UNSIGNED_DRIVER: &str = "services/drivers/virtio-blk";
 /// The section of a driver's declaration note
 /// (`driver_binding::DRIVER_NOTE_SECTION`).
 const DRIVER_NOTE_SECTION: &[u8] = b".note.seraph.driver";
@@ -759,7 +761,7 @@ fn rootfs_case(ctx: &Context, arch: Arch, dir: &Path, signer: &Signer) -> Result
         ),
         sub(
             UNSIGNED_DRIVER,
-            stage(dir, "test-dma.unsigned", &unsigned_driver)?,
+            stage(dir, "virtio-blk.unsigned", &unsigned_driver)?,
         ),
     ];
     if arch == Arch::Riscv64

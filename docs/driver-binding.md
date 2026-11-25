@@ -406,9 +406,9 @@ at `BIND_DRIVERS`, and for a hot-added device:
 replies at once and its control thread runs a drivers-directory pass over it against the records
 still unbound, under the declaration bounds of the `SET_DRIVERS_DIR` pass, and settles the drivers
 it binds within the production settle bound. A pass binds a record at most once a boot, and none
-binds it again once its driver is withdrawn; only devmgr's restart of a served driver that died
-and its retry of a create procmgr refused start that driver again on the record, which stays bound
-([Create retry](../services/devmgr/docs/responsibilities.md#create-retry)).
+binds it again once its driver is withdrawn; only devmgr's restart of a served driver that died and
+its retry of a start whose read or create procmgr refused start that driver again on the record,
+which stays bound ([Create retry](../services/devmgr/docs/responsibilities.md#create-retry)).
 
 Each bind pass is one settle batch: the IOMMU pass, the boot pass over boot-module drivers,
 the pass at `SET_DRIVERS_DIR`, one pass per `BIND_DRIVERS`, and a hotplug pass. Withdrawing a

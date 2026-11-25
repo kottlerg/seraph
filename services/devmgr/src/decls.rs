@@ -34,7 +34,6 @@
 
 use std::io::ErrorKind;
 use std::os::seraph::{VerifiedData, VerifiedRole, reserve_pages};
-use std::sync::Arc;
 
 use driver_binding::DRIVER_NOTE_SECTION;
 use driver_binding::decl::DriverDecl;
@@ -67,19 +66,65 @@ const MAX_ENTRY_NAME: usize = 255;
 /// driver module rather than a platform description table.
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 
+/// A drivers-directory entry devmgr has not had verified: its cap on the
+/// entry's file, the file's size by the walk's size hint, and its install
+/// path, which procmgr verifies the driver's signature under. devmgr parses no
+/// byte of it: [`verified_decl`] has procmgr read and verify it. A retry of a
+/// start holds one until it is due (`crate::bind::Retry`).
+pub struct DriverFile
+{
+    cap: u64,
+    size: u64,
+    name: Box<[u8]>,
+}
+
+impl DriverFile
+{
+    /// The entry whose file `cap` names, `size` bytes long, installed at
+    /// `name`.
+    pub const fn new(cap: u64, size: u64, name: Box<[u8]>) -> Self
+    {
+        Self { cap, size, name }
+    }
+
+    /// The install path, as the log names the entry.
+    pub fn label(&self) -> &str
+    {
+        core::str::from_utf8(&self.name).unwrap_or("drivers-directory entry")
+    }
+
+    /// Delete devmgr's cap on the file, when it is not read.
+    pub fn release(&self)
+    {
+        if self.cap != 0
+        {
+            let _ = syscall::cap_delete(self.cap);
+        }
+    }
+}
+
 /// A drivers-directory entry procmgr read once and verified as a driver
 /// image under its install path (`procmgr_labels::READ_VERIFIED` in the
 /// driver role): the run that holds the file, which no process but memmgr can
-/// write, the file's size in bytes, and the install path. devmgr reads the
+/// write, and the entry, on devmgr's copy of its file cap. devmgr reads the
 /// declaration from the run's verified body and creates the driver from the
 /// same run, which procmgr copies and verifies again, so the bytes the
-/// binding chose on are the bytes that run. Dropping it unmaps the run and
-/// returns it to devmgr's account.
+/// binding chose on are the bytes that run. The cap copy is kept for a retry
+/// of a refused create, which has procmgr read and verify the entry again
+/// (`crate::bind::Retry`). Dropping it unmaps the run, returns it to devmgr's
+/// account, and deletes the cap copy.
 pub struct VerifiedImage
 {
     run: VerifiedData,
-    size: u64,
-    name: Box<[u8]>,
+    file: DriverFile,
+}
+
+impl Drop for VerifiedImage
+{
+    fn drop(&mut self)
+    {
+        self.file.release();
+    }
 }
 
 /// Where devmgr starts a driver from, with the exact size and the name
@@ -94,9 +139,8 @@ pub enum Binary
         size: u64,
         name: Box<[u8]>,
     },
-    /// A drivers-directory entry, verified: shared by the match table and a
-    /// queued create retry, and released when the last of them drops it.
-    Verified(Arc<VerifiedImage>),
+    /// A drivers-directory entry, verified; released when it is dropped.
+    Verified(Box<VerifiedImage>),
 }
 
 impl Binary
@@ -109,7 +153,7 @@ impl Binary
         let (cap, size, name) = match self
         {
             Self::Module { cap, size, name } => (*cap, *size, &**name),
-            Self::Verified(image) => (image.run.cap(), image.size, &*image.name),
+            Self::Verified(image) => (image.run.cap(), image.file.size, &*image.file.name),
         };
         syscall::cap_derive(cap, syscall::RIGHTS_ALL)
             .ok()
@@ -137,8 +181,35 @@ impl Binary
         match self
         {
             Self::Module { name, .. } => name,
-            Self::Verified(image) => &image.name,
+            Self::Verified(image) => &image.file.name,
         }
+    }
+
+    /// devmgr's own copy of the entry a verified image was read from, for a
+    /// retry of its refused create, which has procmgr read and verify the
+    /// entry again (`crate::bind::Retry`). `None` for a boot module, whose
+    /// create is not retried, and when the copy cannot be had.
+    pub fn retry_file(&self) -> Option<DriverFile>
+    {
+        let Self::Verified(image) = self
+        else
+        {
+            return None;
+        };
+        let file = &image.file;
+        if file.cap == 0
+        {
+            return None;
+        }
+        let mut name = Vec::new();
+        name.try_reserve_exact(file.name.len()).ok()?;
+        name.extend_from_slice(&file.name);
+        let cap = syscall::cap_derive(file.cap, syscall::RIGHTS_ALL).ok()?;
+        Some(DriverFile {
+            cap,
+            size: file.size,
+            name: name.into_boxed_slice(),
+        })
     }
 
     /// devmgr's cap on a boot module, which [`Self::release`] deletes; `0`
@@ -441,55 +512,107 @@ pub fn with_module<R>(
     Some(out)
 }
 
-/// Have procmgr read the drivers-directory entry `file_cap`, `size` bytes
-/// long (the walk's size hint), and verify it as a driver image under its
-/// install path `install` (`std::os::seraph::read_verified` in
+/// Why a drivers-directory entry gave no declaration ([`verified_decl`]).
+pub enum Unread
+{
+    /// The file does not verify, is past a driver image's bound, declares no
+    /// driver, or was not read for a reason any later read meets again;
+    /// logged, apart from a refused signature, which procmgr logs.
+    Final,
+    /// procmgr's read of the file, or devmgr's mapping of the run, was
+    /// refused for a reason a later read can outlive ([`read_retryable`]),
+    /// logged: the entry, on devmgr's copy of its cap, for a retry.
+    Transient(DriverFile),
+}
+
+/// Have procmgr read the drivers-directory entry `file` and verify it as a
+/// driver image under its install path (`std::os::seraph::read_verified` in
 /// [`VerifiedRole::Driver`]), then read its declaration from the verified
-/// body alone. The file cap moves to procmgr on every path. `label` names
-/// the entry in the log.
+/// body alone. The entry's cap moves to procmgr on every path; devmgr keeps a
+/// copy of it, with the image or in [`Unread::Transient`]. The install path
+/// names the entry in the log.
 ///
 /// Returns the declaration and the image as a [`Binary::Verified`] the
-/// driver is created from. `None` when the file does not verify, which
-/// procmgr logs, so devmgr adds no line of its own; when it is empty or past
-/// `READ_VERIFIED_IMAGE_MAX` by the size hint, or cannot be read, logged; or
-/// when its body declares no driver ([`read_decl`]), the run then released.
-pub fn verified_decl(
-    label: &str,
-    file_cap: u64,
-    size: u64,
-    install: Box<[u8]>,
-) -> Option<(DriverDecl, Binary)>
+/// driver is created from, or why the entry gave none ([`Unread`]).
+pub fn verified_decl(file: DriverFile) -> Result<(DriverDecl, Binary), Unread>
 {
-    if size == 0 || size > ipc::procmgr_labels::READ_VERIFIED_IMAGE_MAX
-    {
-        std::os::seraph::log!(warn: "{}: {} bytes, past a driver image's bound; skipped", label, size);
-        let _ = syscall::cap_delete(file_cap);
-        return None;
-    }
-    let Ok(path) = core::str::from_utf8(&install)
+    let DriverFile { cap, size, name } = file;
+    let Ok(path) = core::str::from_utf8(&name)
     else
     {
-        std::os::seraph::log!(warn: "{}: install path not UTF-8; skipped", label);
-        let _ = syscall::cap_delete(file_cap);
-        return None;
+        std::os::seraph::log!(warn: "drivers-directory entry: install path not UTF-8; skipped");
+        let _ = syscall::cap_delete(cap);
+        return Err(Unread::Final);
     };
-    let run = match std::os::seraph::read_verified(file_cap, size, path, VerifiedRole::Driver)
+    if size == 0 || size > ipc::procmgr_labels::READ_VERIFIED_IMAGE_MAX
+    {
+        std::os::seraph::log!(warn: "{}: {} bytes, past a driver image's bound; skipped", path, size);
+        let _ = syscall::cap_delete(cap);
+        return Err(Unread::Final);
+    }
+    // The read moves `cap` to procmgr: this copy is what a retry reads from.
+    let kept = syscall::cap_derive(cap, syscall::RIGHTS_ALL).unwrap_or(0);
+    let run = match std::os::seraph::read_verified(cap, size, path, VerifiedRole::Driver)
     {
         Ok(run) => run,
-        Err(e) if e.kind() == ErrorKind::InvalidData => return None,
         Err(e) =>
         {
-            std::os::seraph::log!(warn: "{}: driver image not read ({:?}); skipped", label, e.kind());
-            return None;
+            let kind = e.kind();
+            if kind != ErrorKind::InvalidData
+            {
+                std::os::seraph::log!(warn: "{}: driver image not read ({:?})", path, kind);
+            }
+            if kept != 0 && read_retryable(kind)
+            {
+                return Err(Unread::Transient(DriverFile {
+                    cap: kept,
+                    size,
+                    name,
+                }));
+            }
+            if kept != 0
+            {
+                let _ = syscall::cap_delete(kept);
+            }
+            return Err(Unread::Final);
         }
     };
-    let decl = read_decl(label, run.bytes())?;
+    let Some(decl) = read_decl(path, run.bytes())
+    else
+    {
+        if kept != 0
+        {
+            let _ = syscall::cap_delete(kept);
+        }
+        return Err(Unread::Final);
+    };
     let image = VerifiedImage {
         run,
-        size,
-        name: install,
+        file: DriverFile {
+            cap: kept,
+            size,
+            name,
+        },
     };
-    Some((decl, Binary::Verified(Arc::new(image))))
+    Ok((decl, Binary::Verified(Box::new(image))))
+}
+
+/// Whether a refusal of a driver image's verified read, of kind `kind`
+/// (`std::os::seraph::read_verified`), is one a later read can outlive, so
+/// devmgr retries the start (services/devmgr/docs/responsibilities.md
+/// § Create retry): the file not read, procmgr's `IO_ERROR` among it
+/// (`Other`), a call not answered in time (`TimedOut`), and memory short
+/// for the run or its mapping (`OutOfMemory`, `QuotaExceeded`). A signature
+/// refused (`InvalidData`), a request procmgr rejects (`InvalidInput`) or
+/// does not admit (`PermissionDenied`) holds for any later read of the same
+/// file, and is final. A read creates nothing, so a call that failed is
+/// retried as a refusal is.
+fn read_retryable(kind: ErrorKind) -> bool
+{
+    matches!(
+        kind,
+        ErrorKind::Other | ErrorKind::TimedOut | ErrorKind::OutOfMemory | ErrorKind::QuotaExceeded
+    )
 }
 
 /// Call `visit` with the name of each entry of the directory `dir_cap`

@@ -807,21 +807,21 @@ devmgr loads driver binaries from one of two places:
   that would find no driver waits until the settle has ended. The spawn is at-most-once per boot,
   apart from the restart of a served driver that dies, which devmgr serves at the class's next
   ordinal ([Driver Restart](../services/devmgr/docs/responsibilities.md#driver-restart)), and the
-  retry of a drivers-directory start or restart whose create procmgr refuses with `IO_ERROR` or
-  `OUT_OF_MEMORY` ([Create retry](../services/devmgr/docs/responsibilities.md#create-retry)); on
-  failure (binary missing, ELF corrupt, hardware-carve failure, OOM, a driver that died or did not
-  report ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on
-  subsequent `QUERY_DEVICE` calls on the rtc, input, hwrng, and debug-port classes and clients
-  ([timed](../services/timed/README.md) degrades to its no-RTC path; the terminal, today's only
-  input class consumer, keeps waiting, and [entropyd](../services/entropyd/README.md) waits on its
-  class watch). Before `SET_DRIVERS_DIR` arrives the reply is the same `NO_DEVICE`, so a client that
-  cannot proceed without the device waits on a `WATCH_CLASS` watch
-  ([driver-binding.md](driver-binding.md) § Device Classes; the terminal, entropyd, the GDB stub and
-  the debug-echo fixture do), while a client with a no-device path treats the first `NO_DEVICE` as
-  terminal (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the rule). Keeping non-essentials out of
-  the boot bundle keeps the ESP-loaded image to what the system needs before the rootfs is mounted,
-  so on-disk loading is preferred for anything not on the read-the-disk-in-the-first-place critical
-  path.
+  retry of a drivers-directory start or restart whose verified read or create procmgr refuses with
+  an error a later one can outlive ([Create
+  retry](../services/devmgr/docs/responsibilities.md#create-retry)); on failure (binary missing, ELF
+  corrupt, hardware-carve failure, OOM, a driver that died or did not report ready within the settle
+  bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` calls on the
+  rtc, input, hwrng, and debug-port classes and clients ([timed](../services/timed/README.md)
+  degrades to its no-RTC path; the terminal, today's only input class consumer, keeps waiting, and
+  [entropyd](../services/entropyd/README.md) waits on its class watch). Before `SET_DRIVERS_DIR`
+  arrives the reply is the same `NO_DEVICE`, so a client that cannot proceed without the device
+  waits on a `WATCH_CLASS` watch ([driver-binding.md](driver-binding.md) § Device Classes; the
+  terminal, entropyd, the GDB stub and the debug-echo fixture do), while a client with a no-device
+  path treats the first `NO_DEVICE` as terminal (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the
+  rule). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the system
+  needs before the rootfs is mounted, so on-disk loading is preferred for anything not on the
+  read-the-disk-in-the-first-place critical path.
 
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is

@@ -101,7 +101,7 @@ completion:
 [<harness>] SOME TESTS FAILED
 ```
 
-`<harness>` is the harness name (`ktest`, `svctest`, `usertest`).
+`<harness>` is the harness name (`ktest`, `svctest`, `usertest`, `ubench`).
 
 - For harnesses launched as a userspace service, `std::os::seraph::log!`
   with a name registered via `std::os::seraph::log::register_name(b"<name>")`
@@ -111,7 +111,14 @@ completion:
   available; the harness writes the full bracketed line directly to the
   serial port.
 
-CI scrapes the substring `ALL TESTS PASSED` from the boot log. Per-tier
+`cargo xtask run --runs`, which every CI boot uses, passes a run on the pass marker of the harness
+the image boots, with that harness's name, never on the bare substring `ALL TESTS PASSED`, so a
+line of another process holding it is not a pass. A harness launched as a service that dies before
+its marker, as a fault in its own process does, fails the run: svcmgr logs
+`service died: <harness>`, and `run` reads that line, before the harness's pass marker, as a
+failure within its fail grace window. ktest has no supervisor to log its death: a fault of its own
+thread logs no marker, and its boot stays a HANG at its budget
+([xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the verdicts). Per-tier
 breakdown and counter lines (`PASS <name>`, `passed=`, `failed=`) are
 harness-specific and MUST NOT include the bracketed summary substring.
 
@@ -1928,7 +1935,9 @@ nothing on that account.
 **When the runs are owed.** Each local host run a PR owes MUST pass at one
 head that covers the merge head. For every local and release host run, only a `PASS` outcome of
 `run --runs` ([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the
-host emulator, is run again and the re-run's outcome stands; a run that ran beside another QEMU and
+host emulator, is run again and the re-run's outcome stands (`run --runs` exits non-zero on a set
+with no `PASS`, whatever its `QEMU-CRASH` count, and tolerates a `QEMU-CRASH` only beside a
+`PASS`); a run that ran beside another QEMU and
 HANGs or fails a timing check is run again once with no other QEMU beside it (`--alone`), and the
 re-run's outcome stands; `OK` and `ERR` count as failures. The
 PR's own diff at a head is the diff from that head's merge base with the fetched `master` to the

@@ -414,26 +414,33 @@ is.
   `abi/init-protocol/src/lib.rs` proves the trim of every name and, by induction, `find_module_slot`
   ([testing.md](testing.md) § Bounded verification). CI's `kani` job runs them.
 - `devmgr-firmware` (`xtask/fuzz/targets/src/bin/devmgr-firmware.rs`) drives
-  `devmgr_firmware::property::firmware_holds` over an input read as each ACPI table devmgr's
-  `firmware` crate decodes apart from the AML, from the seeds in
+  `devmgr_firmware::property::firmware_holds` over an input read as each firmware table devmgr's
+  `firmware` crate decodes, from the seeds in
   `services/devmgr/firmware/fuzz/devmgr-firmware/seeds/`: the RSDP, an SDT header, the XSDT, the
-  FADT, the MCFG, the MADT, the DMAR, the RIMT and the SPCR. CI's gating `fuzz` job runs it on a
-  pull request whose change can affect it and the campaign for 30 minutes.
-- The `proofs` modules of `services/devmgr/firmware/src/acpi.rs`, `dmar.rs`, `rimt.rs` and
-  `platform.rs` prove the same property ([testing.md](testing.md) § Bounded verification); CI's
-  `kani` job runs them. The RSDP, an SDT header, the XSDT up to two entries, the FADT and the SPCR
-  are proven whole on any input up to their bounds; the MCFG, the MADT, the DMAR and the RIMT by
-  their steps: each table's end, an
-  MCFG entry, a MADT structure, a DMAR remapping structure and device scope, and a RIMT node and
-  ID mapping, at any place. The loops that drive the steps are left to the fuzz target.
+  FADT, the MCFG, the MADT, the DMAR, the RIMT, the SPCR, a DSDT or SSDT's AML with each reported
+  device's resource template, a resource template, and a flattened device tree. CI's gating `fuzz`
+  job runs it on a pull request whose change can affect it and the campaign for 30 minutes.
+- The `proofs` modules of `services/devmgr/firmware/src/acpi.rs`,
+  `services/devmgr/firmware/src/dmar.rs`, `services/devmgr/firmware/src/rimt.rs`,
+  `services/devmgr/firmware/src/platform.rs`, `services/devmgr/firmware/src/aml.rs` and
+  `services/devmgr/firmware/src/dtb.rs` prove the same property ([testing.md](testing.md)
+  § Bounded verification); CI's `kani` job runs them. The RSDP, an SDT header, the XSDT up to two
+  entries, the FADT, the SPCR and the device tree's header are proven whole on any input up to
+  their bounds; the MCFG, the MADT, the DMAR, the RIMT, the AML, a resource template and the device
+  tree by their steps: each table's end, an MCFG entry, a MADT structure, a DMAR remapping structure
+  and device scope, a RIMT node and ID mapping, an AML term, the record of a `Name`'s value, the
+  take of a `_CID` value and of each element of a `_CID` `Package`, the take of a `Method` and
+  the rule that reports a device, one resource descriptor after any count of resources, a device
+  tree token, the walk's step over the structure block and the step of an ECAM node's read from any
+  state, the reads of the node's properties and its window, the `compatible` match and the fallback
+  segments, at any place. The loops that drive the steps are left to the fuzz target.
 
 **Gaps.**
 
 - The bundle header is unsigned, so the attacker can drop an entry, which fails the boot when it is
   needed ([signing.md](signing.md) § Which Stage Verifies What).
-- The bootloader's firmware-table parsers (`core/boot/src/acpi.rs` and `core/boot/src/dtb.rs`), and
-  the AML namespace walk and the Device Tree walk of devmgr's `firmware` crate (`aml.rs`,
-  `dtb.rs`), have no fuzz target or proof harness yet; they are planned
+- The bootloader's firmware-table parsers (`core/boot/src/acpi.rs` and `core/boot/src/dtb.rs`) have
+  no fuzz target or proof harness yet; they are planned
   ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---

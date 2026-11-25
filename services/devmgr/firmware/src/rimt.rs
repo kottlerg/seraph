@@ -144,34 +144,51 @@ fn bdf_of(rid: u16) -> Bdf
 
 // ── Walkers ───────────────────────────────────────────────────────────
 
-/// The nodes of a RIMT as (offset, type, length), bounded by the node count
-/// the header reports, the table's reported length, and the slice. The walk
-/// ends at a node shorter than its header or running past the bound, so a
-/// truncated or malformed table yields the nodes before the bad one.
+/// The end of a RIMT's nodes: its reported length bounded by the slice; 0
+/// for a table that is not a RIMT or whose length is unreadable.
+pub(crate) fn nodes_end(rimt: &[u8]) -> usize
+{
+    if sdt_signature(rimt) != *b"RIMT"
+    {
+        return 0;
+    }
+    sdt_length(rimt).map_or(0, |len| (len as usize).min(rimt.len()))
+}
+
+/// The node at `off` of a RIMT whose nodes end at `end` ([`nodes_end`]):
+/// its type and its length. `None` where the walk ends: an offset inside
+/// the standard header, fewer than a node header's bytes before `end`, or a
+/// length under the node header's or running past `end`.
+pub(crate) fn node(rimt: &[u8], off: usize, end: usize) -> Option<(u8, usize)>
+{
+    if off < SDT_HDR_LEN || off.saturating_add(NODE_HDR_LEN) > end
+    {
+        return None;
+    }
+    let kind = read_u8(rimt, off);
+    let len = usize::from(read_u16(rimt, off.saturating_add(2)));
+    if len < NODE_HDR_LEN || off.saturating_add(len) > end
+    {
+        return None;
+    }
+    Some((kind, len))
+}
+
+/// The nodes of a RIMT as (offset, type, length): from the offset the header
+/// gives the node array, at most the node count it reports, each as [`node`]
+/// reads it, to where it ends the walk, so a truncated or malformed table
+/// yields the nodes before the bad one.
 fn nodes(rimt: &[u8]) -> impl Iterator<Item = (usize, u8, usize)> + '_
 {
-    let end = if sdt_signature(rimt) == *b"RIMT"
-    {
-        sdt_length(rimt).map_or(0, |len| (len as usize).min(rimt.len()))
-    }
-    else
-    {
-        0
-    };
+    let end = nodes_end(rimt);
     let mut remaining = read_u32(rimt, RIMT_OFF_NODE_COUNT);
     let mut off = read_u32(rimt, RIMT_OFF_NODE_ARRAY) as usize;
     core::iter::from_fn(move || {
-        if remaining == 0 || off < SDT_HDR_LEN || off.saturating_add(NODE_HDR_LEN) > end
+        if remaining == 0
         {
             return None;
         }
-        let kind = read_u8(rimt, off);
-        let len = usize::from(read_u16(rimt, off.saturating_add(2)));
-        if len < NODE_HDR_LEN || off.saturating_add(len) > end
-        {
-            remaining = 0;
-            return None;
-        }
+        let (kind, len) = node(rimt, off, end)?;
         let at = off;
         off = off.saturating_add(len);
         remaining = remaining.saturating_sub(1);
@@ -179,19 +196,60 @@ fn nodes(rimt: &[u8]) -> impl Iterator<Item = (usize, u8, usize)> + '_
     })
 }
 
-/// The RIMT's RISC-V IOMMUs that are PCI functions, in table order. An IOMMU
-/// node too short for its fixed fields is skipped, as is a platform IOMMU
-/// (one with a register base of its own rather than a BAR).
+/// The PCI IOMMU of the node of type `kind` and length `len` at `at`;
+/// `None` for a node of another type, an IOMMU node too short for its fixed
+/// fields, or a platform IOMMU (one with a register base of its own rather
+/// than a BAR).
+pub(crate) fn pci_iommu(rimt: &[u8], at: usize, kind: u8, len: usize) -> Option<PciIommu>
+{
+    let pcie = read_u32(rimt, at.saturating_add(24)) & IOMMU_FLAG_PCIE != 0;
+    (kind == TYPE_IOMMU && len >= IOMMU_NODE_FIXED_LEN && pcie).then(|| PciIommu {
+        node: u32::try_from(at).unwrap_or(u32::MAX),
+        segment: read_u16(rimt, at.saturating_add(32)),
+        function: bdf_of(read_u16(rimt, at.saturating_add(34))),
+    })
+}
+
+/// The RIMT's RISC-V IOMMUs that are PCI functions, in table order, as
+/// [`pci_iommu`] reads each node.
 pub fn pci_iommus(rimt: &[u8]) -> impl Iterator<Item = PciIommu> + '_
 {
-    nodes(rimt).filter_map(|(at, kind, len)| {
-        let pcie = read_u32(rimt, at.saturating_add(24)) & IOMMU_FLAG_PCIE != 0;
-        (kind == TYPE_IOMMU && len >= IOMMU_NODE_FIXED_LEN && pcie).then(|| PciIommu {
-            node: u32::try_from(at).unwrap_or(u32::MAX),
-            segment: read_u16(rimt, at.saturating_add(32)),
-            function: bdf_of(read_u16(rimt, at.saturating_add(34))),
-        })
-    })
+    nodes(rimt).filter_map(|(at, kind, len)| pci_iommu(rimt, at, kind, len))
+}
+
+/// The ID mapping array of the node of type `kind` and length `len` at
+/// `at`: its `PCIe` segment, the offset of its first mapping, and the
+/// mappings read, the count the node gives limited to those that end inside
+/// the node. `None` for a node of another type or a root complex node too
+/// short for its fixed fields.
+pub(crate) fn id_mapping_array(
+    rimt: &[u8],
+    at: usize,
+    kind: u8,
+    len: usize,
+) -> Option<(u16, usize, usize)>
+{
+    if kind != TYPE_PCIE_ROOT_COMPLEX || len < ROOT_COMPLEX_FIXED_LEN
+    {
+        return None;
+    }
+    let segment = read_u16(rimt, at.saturating_add(14));
+    let first = at.saturating_add(usize::from(read_u16(rimt, at.saturating_add(16))));
+    let count = usize::from(read_u16(rimt, at.saturating_add(18)));
+    let fit = at.saturating_add(len).saturating_sub(first) / ID_MAPPING_LEN;
+    Some((segment, first, count.min(fit)))
+}
+
+/// The ID mapping at `m`, of a root complex of segment `segment`.
+pub(crate) fn id_mapping(rimt: &[u8], segment: u16, m: usize) -> IdMapping
+{
+    IdMapping {
+        segment,
+        source_base: read_u32(rimt, m),
+        count: read_u32(rimt, m.saturating_add(4)),
+        device_base: read_u32(rimt, m.saturating_add(8)),
+        iommu: read_u32(rimt, m.saturating_add(12)),
+    }
 }
 
 /// Every ID mapping of every `PCIe` root complex node, in table order. A
@@ -200,21 +258,14 @@ pub fn pci_iommus(rimt: &[u8]) -> impl Iterator<Item = PciIommu> + '_
 pub fn pci_id_mappings(rimt: &[u8]) -> impl Iterator<Item = IdMapping> + '_
 {
     nodes(rimt)
-        .filter(|&(_, kind, len)| kind == TYPE_PCIE_ROOT_COMPLEX && len >= ROOT_COMPLEX_FIXED_LEN)
-        .flat_map(move |(at, _, len)| {
-            let segment = read_u16(rimt, at.saturating_add(14));
-            let first = at.saturating_add(usize::from(read_u16(rimt, at.saturating_add(16))));
-            let count = usize::from(read_u16(rimt, at.saturating_add(18)));
-            let fit = at.saturating_add(len).saturating_sub(first) / ID_MAPPING_LEN;
-            (0..count.min(fit)).map(move |i| {
-                let m = first.saturating_add(i.saturating_mul(ID_MAPPING_LEN));
-                IdMapping {
+        .filter_map(move |(at, kind, len)| id_mapping_array(rimt, at, kind, len))
+        .flat_map(move |(segment, first, count)| {
+            (0..count).map(move |i| {
+                id_mapping(
+                    rimt,
                     segment,
-                    source_base: read_u32(rimt, m),
-                    count: read_u32(rimt, m.saturating_add(4)),
-                    device_base: read_u32(rimt, m.saturating_add(8)),
-                    iommu: read_u32(rimt, m.saturating_add(12)),
-                }
+                    first.saturating_add(i.saturating_mul(ID_MAPPING_LEN)),
+                )
             })
         })
 }
@@ -640,5 +691,84 @@ mod tests
             root_complex(0, &[(0x9, 0x10, 0x9, 48)]),
         ]);
         assert_eq!(pci_id_mappings(&t).count(), 1);
+    }
+}
+
+/// The proofs of the property's checks of the RIMT decoders
+/// (docs/testing.md § Bounded verification), by step: the end of the nodes,
+/// the decode of a node's header at any place, the PCI IOMMU and the ID
+/// mapping array a node of any type and length gives, and the decode of an
+/// ID mapping with the functions it covers. What lies outside the proofs is
+/// the loops that drive the steps: the walk of `nodes` from one node to the
+/// next, the read of each mapping of an array, the iterator adapters over
+/// them, and the search of `mapping_for`; the fuzz target
+/// `devmgr-firmware`, the replay of the checked-in inputs and the unit tests
+/// check them.
+#[cfg(kani)]
+mod proofs
+{
+    use crate::property::rimt as property;
+
+    /// Every input of at most 45 bytes holds the end's contract: 45 bytes
+    /// reach an end before, at and past the node array's header fields, at
+    /// every length field. The loop is the compare of the 4-byte signature.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_rimt_ends_at_its_length()
+    {
+        let bytes: [u8; 45] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let _ = property::rimt_header_holds(&bytes[..len]);
+    }
+
+    /// Every node header, at any place of an input of at most 46 bytes and
+    /// any end within it, holds its contract: a node starts at 36 or later
+    /// and its header is 8 bytes, so 46 bytes reach a node inside the
+    /// standard header, one whose header is cut short, and nodes of every
+    /// length up to and past the end. No loop.
+    #[kani::proof]
+    fn every_node_reads_as_its_header()
+    {
+        let bytes: [u8; 46] = kani::any();
+        let len: usize = kani::any();
+        let end: usize = kani::any();
+        kani::assume(len <= bytes.len() && end <= len);
+        let _ = property::node_holds(&bytes[..len], kani::any(), end);
+    }
+
+    /// Every node of any type and of a length that lies in an input of at
+    /// most 41 bytes, at any place, holds the contract of its PCI IOMMU and
+    /// its ID mapping array: an IOMMU's fixed fields, the longer, end at 40,
+    /// so both kinds of every length from under their fixed fields to past
+    /// them, and a mapping array before, inside and past the node, are
+    /// reached. No loop.
+    #[kani::proof]
+    fn every_node_reads_as_its_fields()
+    {
+        let bytes: [u8; 41] = kani::any();
+        let len: usize = kani::any();
+        let at: usize = kani::any();
+        let node: usize = kani::any();
+        kani::assume(len <= bytes.len() && at <= len && node <= len - at);
+        let kind: u8 = kani::any();
+        let _ = property::pci_iommu_holds(&bytes[..len], at, kind, node);
+        let _ = property::id_mapping_array_holds(&bytes[..len], at, kind, node);
+    }
+
+    /// Every ID mapping, at any place of an input of at most 24 bytes, of any
+    /// segment, holds its contract: a mapping is 20 bytes read from its own
+    /// place, so any range and destination is reached, with the functions
+    /// at and around both ends of its range. The loops are the walks over
+    /// those 4 functions and 2 segments.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_id_mapping_reads_as_its_fields()
+    {
+        let bytes: [u8; 24] = kani::any();
+        let len: usize = kani::any();
+        let at: usize = kani::any();
+        kani::assume(len <= bytes.len() && at <= len && len - at >= 20);
+        let _ = property::id_mapping_holds(&bytes[..len], kani::any(), at);
     }
 }

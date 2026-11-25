@@ -150,7 +150,7 @@ pub struct DrhdUnit
     /// other unit's scope names.
     pub include_pci_all: bool,
     /// Byte range of the unit's device scopes inside the table.
-    scopes: (usize, usize),
+    pub(crate) scopes: (usize, usize),
 }
 
 /// One reserved memory region (RMRR) a set of functions keeps reaching after
@@ -163,12 +163,13 @@ pub struct Rmrr
     pub base: u64,
     /// Last byte of the region (inclusive).
     pub limit: u64,
-    scopes: (usize, usize),
+    /// Byte range of the region's device scopes inside the table.
+    pub(crate) scopes: (usize, usize),
 }
 
 /// A remapping structure of interest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Structure
+pub(crate) enum Structure
 {
     Drhd(DrhdUnit),
     Rmrr(Rmrr),
@@ -176,64 +177,92 @@ enum Structure
 
 // ── Walkers ───────────────────────────────────────────────────────────
 
-/// The remapping structures of a DMAR, bounded by its reported length and
-/// the slice. The walk ends at a structure shorter than its header or running
-/// past the bound, so a truncated or malformed table yields the structures
-/// before the bad one. A DRHD or RMRR too short for its fixed fields is
-/// skipped, as is a structure of another type.
+/// The end of a DMAR's remapping structures: its reported length bounded by
+/// the slice; 0 for a table that is not a DMAR or whose length is
+/// unreadable.
+pub(crate) fn structures_end(dmar: &[u8]) -> usize
+{
+    if sdt_signature(dmar) != *b"DMAR"
+    {
+        return 0;
+    }
+    sdt_length(dmar).map_or(0, |len| (len as usize).min(dmar.len()))
+}
+
+/// The remapping structure at `off` of a DMAR whose structures end at `end`
+/// ([`structures_end`]), with the offset after it: the DRHD or RMRR it is,
+/// or `None` for a DRHD or RMRR too short for its fixed fields or a
+/// structure of another type. `None` where the walk ends: fewer than a
+/// header's bytes before `end`, or a length under the header's or running
+/// past `end`.
+pub(crate) fn structure(dmar: &[u8], off: usize, end: usize) -> Option<(Option<Structure>, usize)>
+{
+    if off.saturating_add(STRUCTURE_HDR_LEN) > end
+    {
+        return None;
+    }
+    let kind = read_u16(dmar, off);
+    let len = usize::from(read_u16(dmar, off.saturating_add(2)));
+    if len < STRUCTURE_HDR_LEN || off.saturating_add(len) > end
+    {
+        return None;
+    }
+    let item = match kind
+    {
+        TYPE_DRHD if len >= DRHD_SCOPES_OFF =>
+        {
+            let size = read_u8(dmar, off.saturating_add(5)) & 0x0f;
+            Some(Structure::Drhd(DrhdUnit {
+                segment: read_u16(dmar, off.saturating_add(6)),
+                register_base: read_u64(dmar, off.saturating_add(8)),
+                register_pages: 1u64 << size,
+                include_pci_all: read_u8(dmar, off.saturating_add(4)) & DRHD_FLAG_INCLUDE_PCI_ALL
+                    != 0,
+                scopes: (off.saturating_add(DRHD_SCOPES_OFF), off.saturating_add(len)),
+            }))
+        }
+        TYPE_RMRR if len >= RMRR_SCOPES_OFF => Some(Structure::Rmrr(Rmrr {
+            segment: read_u16(dmar, off.saturating_add(6)),
+            base: read_u64(dmar, off.saturating_add(8)),
+            limit: read_u64(dmar, off.saturating_add(16)),
+            scopes: (off.saturating_add(RMRR_SCOPES_OFF), off.saturating_add(len)),
+        })),
+        _ => None,
+    };
+    Some((item, off.saturating_add(len)))
+}
+
+/// The remapping structures of interest of a DMAR, in table order, from the
+/// first to where [`structure`] ends the walk, so a truncated or malformed
+/// table yields the structures before the bad one.
 fn structures(dmar: &[u8]) -> impl Iterator<Item = Structure> + '_
 {
-    let end = if sdt_signature(dmar) == *b"DMAR"
-    {
-        sdt_length(dmar).map_or(0, |len| (len as usize).min(dmar.len()))
-    }
-    else
-    {
-        0
-    };
+    let end = structures_end(dmar);
     let mut off = DMAR_STRUCTURES_OFF;
     core::iter::from_fn(move || {
-        while off.saturating_add(STRUCTURE_HDR_LEN) <= end
+        while let Some((item, next)) = structure(dmar, off, end)
         {
-            let kind = read_u16(dmar, off);
-            let len = usize::from(read_u16(dmar, off.saturating_add(2)));
-            if len < STRUCTURE_HDR_LEN || off.saturating_add(len) > end
+            off = next;
+            if item.is_some()
             {
-                off = end;
-                return None;
-            }
-            let at = off;
-            off = off.saturating_add(len);
-            match kind
-            {
-                TYPE_DRHD if len >= DRHD_SCOPES_OFF =>
-                {
-                    let size = read_u8(dmar, at.saturating_add(5)) & 0x0f;
-                    return Some(Structure::Drhd(DrhdUnit {
-                        segment: read_u16(dmar, at.saturating_add(6)),
-                        register_base: read_u64(dmar, at.saturating_add(8)),
-                        register_pages: 1u64 << size,
-                        include_pci_all: read_u8(dmar, at.saturating_add(4))
-                            & DRHD_FLAG_INCLUDE_PCI_ALL
-                            != 0,
-                        scopes: (at.saturating_add(DRHD_SCOPES_OFF), at.saturating_add(len)),
-                    }));
-                }
-                TYPE_RMRR if len >= RMRR_SCOPES_OFF =>
-                {
-                    return Some(Structure::Rmrr(Rmrr {
-                        segment: read_u16(dmar, at.saturating_add(6)),
-                        base: read_u64(dmar, at.saturating_add(8)),
-                        limit: read_u64(dmar, at.saturating_add(16)),
-                        scopes: (at.saturating_add(RMRR_SCOPES_OFF), at.saturating_add(len)),
-                    }));
-                }
-                _ =>
-                {}
+                return item;
             }
         }
         None
     })
+}
+
+/// Whether a DRHD's unit is one [`drhd_units`] lists: its register base is
+/// non-zero and page-aligned.
+pub(crate) fn unit_usable(unit: &DrhdUnit) -> bool
+{
+    unit.register_base != 0 && unit.register_base.trailing_zeros() >= 12
+}
+
+/// Whether an RMRR is one [`rmrrs`] lists: its limit is not below its base.
+pub(crate) fn region_usable(region: &Rmrr) -> bool
+{
+    region.limit >= region.base
 }
 
 /// The DMAR's remapping hardware units, in table order. A unit whose register
@@ -242,10 +271,7 @@ pub fn drhd_units(dmar: &[u8]) -> impl Iterator<Item = DrhdUnit> + '_
 {
     structures(dmar).filter_map(|s| match s
     {
-        Structure::Drhd(u) if u.register_base != 0 && u.register_base.trailing_zeros() >= 12 =>
-        {
-            Some(u)
-        }
+        Structure::Drhd(u) if unit_usable(&u) => Some(u),
         Structure::Drhd(_) | Structure::Rmrr(_) => None,
     })
 }
@@ -256,15 +282,67 @@ pub fn rmrrs(dmar: &[u8]) -> impl Iterator<Item = Rmrr> + '_
 {
     structures(dmar).filter_map(|s| match s
     {
-        Structure::Rmrr(r) if r.limit >= r.base => Some(r),
+        Structure::Rmrr(r) if region_usable(&r) => Some(r),
         Structure::Rmrr(_) | Structure::Drhd(_) => None,
     })
 }
 
-/// The device scopes in the byte range `scopes` of `dmar`, each as its type,
-/// its enumeration ID, and its start bus and path, skipping ones whose path
-/// is empty, odd, or longer than [`MAX_SCOPE_PATH`]. The walk ends at a
-/// scope shorter than its header or running past the range.
+/// A device scope as [`device_scope`] reads it: its type, its enumeration
+/// ID, and its start bus and path.
+pub(crate) type DeviceScope = (u8, u8, PciScope);
+
+/// The device scope at `off` of a scope list ending at `end`, with the
+/// offset after it: its type, its enumeration ID, and its start bus and path,
+/// or `None` for a scope whose path is empty, odd, or longer than
+/// [`MAX_SCOPE_PATH`]. `None` where the walk ends: fewer than a scope
+/// header's bytes before `end`, or a length under the header's or running
+/// past `end`.
+pub(crate) fn device_scope(
+    dmar: &[u8],
+    off: usize,
+    end: usize,
+) -> Option<(Option<DeviceScope>, usize)>
+{
+    if off.saturating_add(SCOPE_PATH_OFF) > end
+    {
+        return None;
+    }
+    let kind = read_u8(dmar, off);
+    let len = usize::from(read_u8(dmar, off.saturating_add(1)));
+    if len < SCOPE_PATH_OFF || off.saturating_add(len) > end
+    {
+        return None;
+    }
+    let next = off.saturating_add(len);
+    let path_bytes = len.saturating_sub(SCOPE_PATH_OFF);
+    let hops = path_bytes / 2;
+    if !path_bytes.is_multiple_of(2) || hops == 0 || hops > MAX_SCOPE_PATH
+    {
+        return Some((None, next));
+    }
+    let mut path = [(0u8, 0u8); MAX_SCOPE_PATH];
+    for (i, hop) in path.iter_mut().take(hops).enumerate()
+    {
+        let p = off
+            .saturating_add(SCOPE_PATH_OFF)
+            .saturating_add(i.saturating_mul(2));
+        *hop = (read_u8(dmar, p), read_u8(dmar, p.saturating_add(1)));
+    }
+    let scope = PciScope {
+        sub_hierarchy: kind == SCOPE_PCI_SUB_HIERARCHY,
+        start_bus: read_u8(dmar, off.saturating_add(5)),
+        path,
+        path_len: hops,
+    };
+    Some((
+        Some((kind, read_u8(dmar, off.saturating_add(4)), scope)),
+        next,
+    ))
+}
+
+/// The device scopes in the byte range `scopes` of `dmar`, bounded by the
+/// slice, each as [`device_scope`] reads it, from the first to where it ends
+/// the walk, skipping the ones it refuses.
 fn device_scopes(
     dmar: &[u8],
     scopes: (usize, usize),
@@ -273,41 +351,29 @@ fn device_scopes(
     let (mut off, end) = scopes;
     let end = end.min(dmar.len());
     core::iter::from_fn(move || {
-        while off.saturating_add(SCOPE_PATH_OFF) <= end
+        while let Some((item, next)) = device_scope(dmar, off, end)
         {
-            let kind = read_u8(dmar, off);
-            let len = usize::from(read_u8(dmar, off.saturating_add(1)));
-            if len < SCOPE_PATH_OFF || off.saturating_add(len) > end
+            off = next;
+            if item.is_some()
             {
-                off = end;
-                return None;
+                return item;
             }
-            let at = off;
-            off = off.saturating_add(len);
-            let path_bytes = len.saturating_sub(SCOPE_PATH_OFF);
-            let hops = path_bytes / 2;
-            if !path_bytes.is_multiple_of(2) || hops == 0 || hops > MAX_SCOPE_PATH
-            {
-                continue;
-            }
-            let mut path = [(0u8, 0u8); MAX_SCOPE_PATH];
-            for (i, hop) in path.iter_mut().take(hops).enumerate()
-            {
-                let p = at
-                    .saturating_add(SCOPE_PATH_OFF)
-                    .saturating_add(i.saturating_mul(2));
-                *hop = (read_u8(dmar, p), read_u8(dmar, p.saturating_add(1)));
-            }
-            let scope = PciScope {
-                sub_hierarchy: kind == SCOPE_PCI_SUB_HIERARCHY,
-                start_bus: read_u8(dmar, at.saturating_add(5)),
-                path,
-                path_len: hops,
-            };
-            return Some((kind, read_u8(dmar, at.saturating_add(4)), scope));
         }
         None
     })
+}
+
+/// Whether a device scope of type `kind` names PCI functions: an endpoint
+/// or a sub-hierarchy.
+pub(crate) fn is_pci_scope(kind: u8) -> bool
+{
+    matches!(kind, SCOPE_PCI_ENDPOINT | SCOPE_PCI_SUB_HIERARCHY)
+}
+
+/// Whether a device scope of type `kind` names an I/O APIC.
+pub(crate) fn is_io_apic_scope(kind: u8) -> bool
+{
+    kind == SCOPE_IO_APIC
 }
 
 /// The PCI scopes in the byte range `scopes` of `dmar`, skipping scopes of
@@ -315,9 +381,7 @@ fn device_scopes(
 /// [`device_scopes`] reads them.
 fn pci_scopes(dmar: &[u8], scopes: (usize, usize)) -> impl Iterator<Item = PciScope> + '_
 {
-    device_scopes(dmar, scopes).filter_map(|(kind, _, scope)| {
-        matches!(kind, SCOPE_PCI_ENDPOINT | SCOPE_PCI_SUB_HIERARCHY).then_some(scope)
-    })
+    device_scopes(dmar, scopes).filter_map(|(kind, _, scope)| is_pci_scope(kind).then_some(scope))
 }
 
 /// One I/O APIC a remapping unit's scope names: the I/O APIC's ID, as the
@@ -351,7 +415,7 @@ pub fn io_apic_scopes(dmar: &[u8]) -> impl Iterator<Item = IoApicScope> + '_
 {
     drhd_units(dmar).flat_map(move |unit| {
         device_scopes(dmar, unit.scopes).filter_map(move |(kind, id, scope)| {
-            (kind == SCOPE_IO_APIC).then_some(IoApicScope {
+            is_io_apic_scope(kind).then_some(IoApicScope {
                 segment: unit.segment,
                 id,
                 scope,
@@ -1115,5 +1179,65 @@ mod tests
         );
         table[0..4].copy_from_slice(b"APIC");
         assert_eq!(drhd_units(&table).count(), 0);
+    }
+}
+
+/// The proofs of the property's checks of the DMAR decoders
+/// (docs/testing.md § Bounded verification), by step: the flags and the end
+/// of the structures, the decode of a remapping structure at any place, with
+/// the unit's and the region's acceptance, and the decode of a device scope
+/// at any place, with the scope types. What lies outside the proofs is the
+/// loops that drive the steps: the walks of `structures` and
+/// `device_scopes` from one structure or scope to the next, and the
+/// iterator adapters over them; the fuzz target `devmgr-firmware`, the
+/// replay of the checked-in inputs and the unit tests check them.
+#[cfg(kani)]
+mod proofs
+{
+    use crate::property::dmar as property;
+
+    /// Every input of at most 49 bytes holds the contract of the flags and
+    /// the end: 49 bytes hold the flags byte at 37 and reach an end before,
+    /// at and past the first structure, at 48, at every length field. The
+    /// loop is the compare of the 4-byte signature.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_dmar_header_reads_as_its_fields()
+    {
+        let bytes: [u8; 49] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let _ = property::dmar_header_holds(&bytes[..len]);
+    }
+
+    /// Every remapping structure, at any place of an input of at most 26
+    /// bytes and any end within it, holds its contract: an RMRR's fixed
+    /// fields, the longest, end at 24, so a DRHD and an RMRR of every length
+    /// from their header's to past their fixed fields, a structure of
+    /// another type, and one past the end are reached. No loop.
+    #[kani::proof]
+    fn every_remapping_structure_reads_as_its_fields()
+    {
+        let bytes: [u8; 26] = kani::any();
+        let len: usize = kani::any();
+        let end: usize = kani::any();
+        kani::assume(len <= bytes.len() && end <= len);
+        let _ = property::structure_holds(&bytes[..len], kani::any(), end);
+    }
+
+    /// Every device scope, at any place of an input of at most 25 bytes and
+    /// any end within it, holds its contract: 24 bytes hold a scope of 9
+    /// hops, one past [`super::MAX_SCOPE_PATH`], so every path length, odd
+    /// and empty paths, and a scope past the end are reached. The loops are
+    /// the reads of up to 8 hops.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn every_device_scope_reads_as_its_fields()
+    {
+        let bytes: [u8; 25] = kani::any();
+        let len: usize = kani::any();
+        let end: usize = kani::any();
+        kani::assume(len <= bytes.len() && end <= len);
+        let _ = property::device_scope_holds(&bytes[..len], kani::any(), end);
     }
 }

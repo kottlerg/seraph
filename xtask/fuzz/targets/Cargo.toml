@@ -11,6 +11,7 @@
 # one line; a root key, so it comes before the first table.
 bin = [
     { name = "boot-protocol", path = "src/bin/boot-protocol.rs", test = false },
+    { name = "devmgr-firmware", path = "src/bin/devmgr-firmware.rs", test = false },
     { name = "driver-binding", path = "src/bin/driver-binding.rs", test = false },
     { name = "elf", path = "src/bin/elf.rs", test = false },
     { name = "gpt", path = "src/bin/gpt.rs", test = false },
@@ -32,6 +33,7 @@ autobins = false
 
 [dependencies]
 boot-protocol = { path = "../../../abi/boot-protocol" }
+devmgr-firmware = { path = "../../../services/devmgr/firmware" }
 driver-binding = { path = "../../../shared/driver-binding" }
 elf = { path = "../../../shared/elf" }
 fuzz-engine = { path = "../engine" }

@@ -16,8 +16,9 @@
 //! blob, view each table that way; `boot_firmware` decodes the slices
 //! (`core/boot/docs/firmware-parsing.md` § Table Bounds).
 //!
-//! Before `ExitBootServices` the map is a [`Snapshot`] taken at entry; after
-//! it, step 7's final map.
+//! Every read of the boot, before and after `ExitBootServices`, is bounded
+//! by the one [`Snapshot`] taken at entry, so the count pass ahead of step 6
+//! and step 9's fill pass see the same tables.
 
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,7 +32,6 @@ use firmware_tables::acpi::{
 use firmware_tables::fdt::{FDT_MAGIC, HDR_TOTALSIZE};
 
 use crate::bprintln;
-use crate::error::BootError;
 use crate::firmware::FirmwareInfo;
 use crate::uefi::{self, EfiBootServices, MemoryMapResult};
 
@@ -63,7 +63,7 @@ impl<'m> TableMap<'m>
 {
     /// The map in `map`, its descriptors `stride` bytes apart. A view it
     /// refuses prints a diagnostic.
-    pub const fn new(map: &'m [u8], stride: usize) -> Self
+    const fn new(map: &'m [u8], stride: usize) -> Self
     {
         Self {
             map,
@@ -77,7 +77,7 @@ impl<'m> TableMap<'m>
     /// # Safety
     /// `result` describes a buffer `GetMemoryMap` filled, identity-mapped,
     /// which nothing writes while the map is in use.
-    pub unsafe fn of(result: &'m MemoryMapResult) -> Self
+    unsafe fn of(result: &'m MemoryMapResult) -> Self
     {
         // SAFETY: the caller guarantees `map_size` bytes at `buffer_phys` are
         // a filled map buffer, identity-mapped and unwritten for `'m`.
@@ -221,12 +221,13 @@ fn first_report(phys: u64) -> bool
     true
 }
 
-/// The memory map taken at entry, which bounds the table reads made before
-/// steps 6 and 7 take the final one.
+/// The memory map taken at entry, which bounds every firmware-table read of
+/// the boot.
 ///
-/// A table lies in memory of a type the boot never changes (allocations
-/// change only free memory to a loader type), so a map taken before the
-/// bootloader's own allocations bounds every table as well as a later one.
+/// It is the only map a [`TableMap`] is made from, so every reader gets the
+/// same verdict on each table: the count pass ahead of step 6 sizes the
+/// buffers that step 9's fill pass, after `ExitBootServices`, fills from the
+/// same tables, and with no map neither pass reads any.
 pub struct Snapshot
 {
     /// The map, or `None` when `GetMemoryMap` failed, which leaves every
@@ -264,27 +265,24 @@ impl Snapshot
         };
         // SAFETY: `take` filled the buffer through `GetMemoryMap`; it is the
         // bootloader's allocation, identity-mapped, and nothing writes it
-        // before `free` consumes the snapshot.
+        // before `retire` consumes the snapshot.
         unsafe { TableMap::of(result) }
     }
 
-    /// Free the map's buffer.
-    ///
-    /// # Errors
-    /// [`BootError`] when `FreePages` fails.
+    /// Zero the map's buffer after its last read and give it back as its
+    /// physical base and page count, for the kernel to reclaim; `None` when
+    /// no map was read. Consuming the snapshot ends every view of the map.
     ///
     /// # Safety
-    /// `bs` must be valid boot services, and no view of the map remains.
-    pub unsafe fn free(self, bs: *mut EfiBootServices) -> Result<(), BootError>
+    /// The buffer is still identity-mapped and writable: before the handoff.
+    pub unsafe fn retire(self) -> Option<(u64, usize)>
     {
-        let Some(result) = self.result
-        else
-        {
-            return Ok(());
-        };
+        let result = self.result?;
         // SAFETY: the buffer is `get_memory_map`'s allocation of
-        // `buffer_size` bytes, a whole number of pages; caller contract.
-        unsafe { uefi::free_pages(bs, result.buffer_phys, result.buffer_size / 4096) }
+        // `buffer_size` bytes, identity-mapped and writable (caller
+        // contract), and consuming the snapshot left no view of it.
+        unsafe { core::ptr::write_bytes(result.buffer_phys as *mut u8, 0, result.buffer_size) };
+        Some((result.buffer_phys, result.buffer_size / 4096))
     }
 }
 

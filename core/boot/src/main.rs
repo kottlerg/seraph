@@ -186,10 +186,11 @@ const MAX_IDENTITY_REGIONS: usize = 64;
 
 /// Most entries step 9 records in `BootInfo.reclaim_ranges`: the `BootInfo`,
 /// module, memory-map entry, aperture, named-seed, heuristic-seed, CPU-id and
-/// reclaim-array pages, the raw map buffer, the page-table pool, the x86-64
-/// LA57 toggle page and the AP trampoline page (twelve), and one bundle gap
-/// before, between and after the at most [`MAX_BUNDLE_MODULES`] module bodies.
-const MAX_RECLAIM_ENTRIES: usize = 12 + MAX_BUNDLE_MODULES + 1;
+/// reclaim-array pages, the raw map buffer, the entry map's buffer, the
+/// page-table pool, the x86-64 LA57 toggle page and the AP trampoline page
+/// (thirteen), and one bundle gap before, between and after the at most
+/// [`MAX_BUNDLE_MODULES`] module bodies.
+const MAX_RECLAIM_ENTRIES: usize = 13 + MAX_BUNDLE_MODULES + 1;
 
 // The reclaim array's page holds every entry step 9 can record, so the
 // overflow halt in step 9 is unreachable.
@@ -589,8 +590,8 @@ struct BootAllocations
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable) -> usize
 {
-    // The memory map that bounds every firmware-table read before steps 6
-    // and 7 (core/boot/docs/firmware-parsing.md § Table Bounds).
+    // The memory map that bounds every firmware-table read of the boot
+    // (core/boot/docs/firmware-parsing.md § Table Bounds).
     // SAFETY: st is the firmware's valid system table.
     let bs = unsafe { (*st).boot_services };
     // SAFETY: bs is the firmware's boot services, which have not exited.
@@ -676,8 +677,8 @@ unsafe fn boot_sequence(
     rollback::record_floor(&mut unsafe { FirmwareVariables::new(ctx.st) }, floor);
     // SAFETY: ctx.st is a valid UEFI system table.
     let firm = unsafe { step5_discover_firmware(&ctx, &snapshot) };
-    // Every firmware table read before steps 6 and 7 lies where this map
-    // gives it to firmware data (TableMap::view).
+    // Every firmware table read of the boot, here and in step 9, lies where
+    // this map gives it to firmware data (TableMap::view).
     let tables = snapshot.map();
     // SAFETY: ctx.st is valid; firmware tables are identity-mapped by UEFI
     // and nothing writes them.
@@ -708,17 +709,11 @@ unsafe fn boot_sequence(
     // ctx.esp_root is valid until ExitBootServices.
     let mut kaslr = unsafe { step5d_apply_kaslr_slide(&ctx, &mut kernel.info, &boot_entropy)? };
     // The aperture seeds the tables name, counted to size step 6's seed
-    // buffers; step 9 writes them into those buffers by the same walk.
+    // buffers; step 9 writes them into those buffers by the same walk through
+    // the same map.
     let mut counted = Seeds::counting();
     // SAFETY: as for the topology read.
     unsafe { tables::aperture_seeds(&firm, tables, &mut counted) };
-    // The snapshot's last reader was the count above; its pages go back to
-    // the firmware before step 6 sizes its allocations to the map.
-    // SAFETY: ctx.bs is valid pre-exit, and no view of the snapshot remains.
-    if unsafe { snapshot.free(ctx.bs) }.is_err()
-    {
-        bprintln!("[--------] boot: memory map snapshot not freed; it stays allocated");
-    }
     // SAFETY: all prior unsafe outputs remain valid; ctx.esp_root is valid
     // until ExitBootServices; steps 6 and 7 allocate via bs, and step 7 is the
     // last pre-exit allocation.
@@ -756,6 +751,7 @@ unsafe fn boot_sequence(
             &ctx.boot_device,
             &allocs,
             &uefi_map,
+            snapshot,
             &page_table,
         )?;
     }
@@ -2612,7 +2608,9 @@ unsafe fn step8_exit_boot_services(
 /// # Safety
 /// All physical allocations named in `allocs` and `bundle` must remain
 /// identity-mapped, and those in `allocs` writable. `uefi_map` must be the
-/// exited-boot memory map from step 7.
+/// exited-boot memory map from step 7. `snapshot` is the map `efi_main`
+/// took, its buffer identity-mapped and writable, and the firmware tables it
+/// gives to firmware data identity-mapped and unwritten.
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2636,6 +2634,7 @@ unsafe fn step9_populate_boot_info(
     boot_device: &BootDevice,
     allocs: &BootAllocations,
     uefi_map: &uefi::MemoryMapResult,
+    snapshot: Snapshot,
     page_table: &arch::current::BootPageTable,
 ) -> Result<(), BootError>
 {
@@ -2693,11 +2692,10 @@ unsafe fn step9_populate_boot_info(
     // kernel_mmio: arch-dispatched extractor. Per-field docs on `KernelMmio`
     // state whether a zero field falls back to a kernel compiled-in constant
     // or is fatal at the consuming subsystem's initialization.
-    // The step 7 map bounds the firmware-table reads from here on; its last
-    // reader is the VMGENID scan below, ahead of its scrub.
-    // SAFETY: uefi_map is step 7's map, its buffer identity-mapped, and
-    // nothing writes it until the scrub after the last read.
-    let tables = unsafe { TableMap::of(uefi_map) };
+    // The entry map bounds these reads as it bounded the count pass ahead of
+    // step 6, so both passes see the same tables; its last reader is the
+    // VMGENID scan below, ahead of its retirement.
+    let tables = snapshot.map();
     let mut kernel_mmio = KernelMmio::zero();
     // SAFETY: the tables are identity-mapped and nothing writes them.
     unsafe { arch::current::populate_kernel_mmio(firm, tables, &mut kernel_mmio) };
@@ -2818,13 +2816,18 @@ unsafe fn step9_populate_boot_info(
     // VMGENID GUID address: QEMU-specific SSDT scan (no AML evaluation: the
     // bootloader runs before acpid, the userspace service that evaluates AML).
     // Zero when absent; the kernel then has no snapshot-detection channel.
-    // Read here, the map's last read before its scrub.
+    // The entry map's last reader.
     // SAFETY: the tables are identity-mapped and nothing writes them.
     let vmgenid_paddr = unsafe { Acpi::new(tables, firm.acpi_rsdp) }
         .map_or(0, |acpi| vmgenid_guid(acpi.tables(&[*b"SSDT"])));
+    // The entry map is dead: zeroed, so the firmware's map does not reach the
+    // memory the kernel hands out, and recorded for reclaim below.
+    // SAFETY: before the handoff its buffer is still identity-mapped and
+    // writable.
+    let entry_map = unsafe { snapshot.retire() };
 
-    // The raw UEFI memory-map buffer is dead: the translation, the aperture
-    // derivation and the VMGENID scan above were its last readers. Zero it
+    // The raw UEFI memory-map buffer is dead: the translation and the aperture
+    // derivation above were its last readers. Zero it
     // before it is recorded below, so the firmware's map does not reach the
     // memory the kernel hands out.
     // SAFETY: buffer_phys is the step 7 allocation of buffer_size bytes, still
@@ -2878,7 +2881,7 @@ unsafe fn step9_populate_boot_info(
     }
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "the map buffer is a whole-page allocation far below u32::MAX pages"
+        reason = "the map buffers are whole-page allocations far below u32::MAX pages"
     )]
     {
         push_reclaim(
@@ -2886,6 +2889,10 @@ unsafe fn step9_populate_boot_info(
             (uefi_map.buffer_size / 4096) as u32,
             0,
         )?;
+        if let Some((base, pages)) = entry_map
+        {
+            push_reclaim(base, pages as u32, 0)?;
+        }
     }
     for &(base, pages) in page_table.reclaim_spans()
     {

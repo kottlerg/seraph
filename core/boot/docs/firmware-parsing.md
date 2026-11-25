@@ -97,11 +97,11 @@ they are given, which their property checks, fuzz targets and proof harnesses es
 ([core/boot/firmware/README.md](../firmware/README.md),
 [docs/testing.md](../../../docs/testing.md#bounded-verification)).
 
-The map is the one `efi_main` takes before the console is up, for every read up to the count
-pass ahead of step 6, after which it is freed; a table lies in memory whose type the boot never
-changes (allocations change only free memory to a loader type), so that map bounds each table as
-well as a later one. From step 9 on, after `ExitBootServices`, the reads use step 7's final map,
-the last of them ahead of that map's scrub. When the first `GetMemoryMap` fails, every view is
+The map is the one `efi_main` takes before the console is up, and it bounds every read of the
+boot: those of step 5, the count pass of the aperture seeds ahead of step 6, and step 9's after
+`ExitBootServices`, the last of which precedes the map's scrub and its record for the kernel to
+reclaim. One map gives every reader the same verdict on each table, so step 9's fill pass reads
+the tables the count pass counted and no others. When that `GetMemoryMap` fails, every view is
 refused and the boot proceeds as on a platform without firmware tables.
 
 The accepted types are those UEFI 2.10 lets a table or a device tree occupy:

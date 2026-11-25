@@ -18,41 +18,23 @@ use driver_binding::resources::{
 };
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 
-/// Source the child's ELF binary is loaded from: a boot module devmgr holds
-/// (the drivers the boot bundle carries) carries a procmgr Memory cap and
-/// uses [`CreateSource::Module`]; a driver loaded from the rootfs (walked by
-/// devmgr through the directory cap of `SET_DRIVERS_DIR` or `BIND_DRIVERS`)
-/// carries a vfsd file SEND cap and uses [`CreateSource::File`]. Each carries
-/// the object's exact size in bytes and the name procmgr verifies its
-/// signature under: a module's bundle entry name, a file's install path. The
-/// variant decides the procmgr request label; the rest of
-/// [`spawn_bound_driver`] — the request's words, service-endpoint
-/// derivation, `START_PROCESS`, bootstrap rounds — is identical across both
-/// sources.
+/// The image a driver is created from (`procmgr_labels::CREATE_PROCESS`): a
+/// Memory cap devmgr derived for this one create, on a boot module it holds,
+/// on its own copy of the IOMMU driver's module, or on the run procmgr read a
+/// drivers-directory file into and verified (`decls::VerifiedImage`); the
+/// object's exact size in bytes; and the name procmgr verifies its signature
+/// under, a module's bundle entry name or a file's install path. The create
+/// call transfers the cap to procmgr, which deletes it on success and
+/// failure; on any failure before that transfer, [`spawn_bound_driver`]
+/// deletes it on the caller's behalf: a retained boot-module cap is a live
+/// derivation child of init's donated pool-run source and pins that run
+/// unsplittable.
 #[derive(Clone, Copy)]
-pub enum CreateSource<'a>
+pub struct CreateSource<'a>
 {
-    /// Memory cap to an in-memory ELF image (`procmgr_labels::CREATE_PROCESS`).
-    /// A `CREATE_PROCESS` `ipc_call` transfers the cap to procmgr (which deletes
-    /// it on both success and failure). On any failure BEFORE that transfer,
-    /// [`spawn_bound_driver`] deletes the cap on the caller's behalf — a
-    /// retained boot-module cap is a live derivation child of init's donated
-    /// pool-run source and pins that run unsplittable.
-    Module
-    {
-        cap: u64, size: u64, name: &'a [u8]
-    },
-    /// vfsd file SEND cap (`procmgr_labels::CREATE_FROM_FILE`). `size` is
-    /// the file size reported by the resolving `NS_LOOKUP`. On any
-    /// pre-`ipc_call` failure inside [`spawn_bound_driver`], the function
-    /// deletes the file cap on the caller's behalf — the cap was just
-    /// derived by the namespace walk and has no retry value.
-    File
-    {
-        file_cap: u64,
-        size: u64,
-        name: &'a [u8],
-    },
+    pub cap: u64,
+    pub size: u64,
+    pub name: &'a [u8],
 }
 
 /// RAII guard for a boot-module Memory cap not yet consumed by a successful
@@ -361,9 +343,8 @@ pub struct BoundSpawnConfig<'a>
 {
     pub procmgr_ep: u64,
     pub bootstrap_ep: u64,
-    /// ELF source for the child: a copy of a boot module
-    /// ([`CreateSource::Module`]) or of a drivers-directory file node cap
-    /// ([`CreateSource::File`]), consumed by the spawn.
+    /// ELF source for the child ([`CreateSource`]), its cap consumed by the
+    /// spawn.
     pub source: CreateSource<'a>,
     /// The device's resources, each with the cap devmgr keeps for it, from
     /// which the driver's copy is derived; at most [`MAX_BOUND_RESOURCES`].
@@ -592,12 +573,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     // Release the source ELF cap on every exit before the create call
     // consumes it. Disarmed once the ipc_call returns, which transfers the
     // cap to procmgr.
-    let source_cap = match config.source
-    {
-        CreateSource::Module { cap, .. } => cap,
-        CreateSource::File { file_cap, .. } => file_cap,
-    };
-    let mut source_guard = ModuleCapGuard::new(source_cap);
+    let mut source_guard = ModuleCapGuard::new(config.source.cap);
     if !held
     {
         std::os::seraph::log!(warn: "driver spawn: CSpace short of its headroom");
@@ -657,25 +633,18 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     // Caps: [source, creator, argv_env?]. Data word 0 is the object's size,
     // the argv/env header (when present) follows at
     // `procmgr_labels::CREATE_FIRST_WORD`, and the name block follows the
-    // header (`procmgr_labels::with_create_name`); both labels are built alike.
-    let (base_label, size, source_cap, name) = match config.source
-    {
-        CreateSource::Module { cap, size, name } =>
-        {
-            (procmgr_labels::CREATE_PROCESS, size, cap, name)
-        }
-        CreateSource::File {
-            file_cap,
-            size,
-            name,
-        } => (procmgr_labels::CREATE_FROM_FILE, size, file_cap, name),
-    };
+    // header (`procmgr_labels::with_create_name`).
+    let CreateSource {
+        cap: source_cap,
+        size,
+        name,
+    } = config.source;
     let argv_env = driver_argv_env(name);
     if argv_env.is_some()
     {
         flags |= procmgr_labels::CREATE_ARGV_ENV;
     }
-    let label = base_label | flags | sched_bits;
+    let label = procmgr_labels::CREATE_PROCESS | flags | sched_bits;
     let builder = IpcMessage::builder(label)
         .word(0, size)
         .cap(source_cap)

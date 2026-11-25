@@ -1539,16 +1539,18 @@ before it parses a file it reads from the root filesystem as trusted input. Its 
 |---|---|
 | label | `procmgr_labels::READ_VERIFIED` (31) |
 | caller's cap | The sender's own procmgr cap (`ProcessInfo.procmgr_endpoint_cap`) |
-| `data[0]` | The file's length in bytes, from the caller's `NS_LOOKUP` size hint: 1 to `procmgr_labels::READ_VERIFIED_MAX` (32 KiB) |
-| `data[1]` | The role word (`procmgr_labels::READ_VERIFIED_ROLE_WORD`): `READ_VERIFIED_DATA` (7) or `READ_VERIFIED_CONFIGURATION` (8), the role the copy must verify in |
+| `data[0]` | The file's length in bytes, from the caller's `NS_LOOKUP` size hint: 1 to the role's bound: `procmgr_labels::READ_VERIFIED_MAX` (32 KiB) for data and configuration, `procmgr_labels::READ_VERIFIED_IMAGE_MAX` (16 MiB) for a driver image |
+| `data[1]` | The role word (`procmgr_labels::READ_VERIFIED_ROLE_WORD`): `READ_VERIFIED_DATA` (7), `READ_VERIFIED_CONFIGURATION` (8) or `READ_VERIFIED_DRIVER` (5), the role the copy must verify in |
 | from `data[2]` | The name block (`procmgr_labels::READ_VERIFIED_NAME_WORD`): the install path the file must be signed under, in the canonical form of § Image Verification |
 | cap[0] | File cap for the file, with Grant, as for `CREATE_FROM_FILE` (§ Label 13) |
 
 procmgr serves it as follows:
 
-1. **Checks.** A request with no file cap, a length of zero or past `READ_VERIFIED_MAX`, a role
-   word other than the two, or no name block or a name that is not a canonical install path is
-   refused with `INVALID_ARGUMENT` before procmgr opens the file. A request sent on a process
+1. **Checks.** A request with no file cap, a length of zero or past its role's bound, a role
+   word other than the three, or no name block or a name that is not a canonical install path is
+   refused with `INVALID_ARGUMENT` before procmgr opens the file. A request in the driver role from
+   a sender whose signature policy does not load drivers is refused with `UNAUTHORIZED` before any
+   read. A request sent on a process
    handle, which names another process, is refused with `INVALID_BADGE` (§ Messages), as is one
    whose badge names no live process. Every cap past cap[0] is deleted at once.
 2. **The account.** Under the table lock procmgr derives a copy of the sender's memmgr SEND from its
@@ -1562,7 +1564,7 @@ procmgr serves it as follows:
    `CREATE_FROM_FILE` reads an image (§ Label 13, its bounds on every call on the file cap
    included). The file cap is deleted on every path.
 4. **Verify.** procmgr verifies the copy against the trust store in the role the request names,
-   data or configuration, under the requested name, for this build's architecture. A refusal
+   data, configuration or driver, under the requested name, for this build's architecture. A refusal
    replies `SIGNATURE_REFUSED` and logs one warning naming the name and the verifier's reason, as
    an image's does; the run returns to the sender's account.
 5. **Hand over.** procmgr derives a Memory cap on the run carrying `RIGHTS_MEM_MAP` alone, unmaps
@@ -1571,11 +1573,12 @@ procmgr serves it as follows:
    or its `CSpace` is full) leaves the cap with procmgr, which deletes it and releases the run to
    the sender's account.
 
-**Reply (success):** `data[0]` the verified body's length, the body being the run's first
-`data[0]` bytes; `data[1]` the run's region id on the sender's account; `data[2]` its pages;
-cap[0] the map-only Memory cap. The sender maps it read-only and parses only the body. When it is
-done it unmaps the run, deletes the cap and names the region to memmgr's `RELEASE_MEMORY_CAPS` on
-its own memmgr cap; its death releases the run with its record.
+**Reply (success):** `data[0]` the verified body's length, the body being the run's first `data[0]`
+bytes; `data[1]` the run's region id on the sender's account; `data[2]` its pages; cap[0] the
+map-only Memory cap. The sender maps it read-only and parses only the body. A file read this way is
+never code to its reader: only a create runs a driver image, and verifies it again. When it is done
+it unmaps the run, deletes the cap and names the region to memmgr's `RELEASE_MEMORY_CAPS` on its own
+memmgr cap; its death releases the run with its record.
 
 **Error codes:**
 
@@ -1583,9 +1586,10 @@ its own memmgr cap; its death releases the run with its record.
 |---|---|---|
 | 2 | `OUT_OF_MEMORY` | The run could not be had on the sender's account for a reason other than a max (`LIMIT`), the file's server refused the read session's page for want of memory (§ Label 13, **Read session**), the sender has no memmgr SEND, or the map-only cap could not be derived |
 | 4 | `INVALID_BADGE` | Sent on a process handle, or no live process carries the badge |
-| 7 | `INVALID_ARGUMENT` | No file cap, a length of zero or past `READ_VERIFIED_MAX`, a role word other than the two, or no name block or a name not in the canonical form |
+| 7 | `INVALID_ARGUMENT` | No file cap, a length of zero or past the role's bound, a role word other than the three, or no name block or a name not in the canonical form |
 | 10 | `IO_ERROR` | As for `CREATE_FROM_FILE` (§ Label 13) |
 | 11 | `MAP_FAILED` | The run could not be mapped in procmgr, or its mapping would not come down |
+| 13 | `UNAUTHORIZED` | The role is the driver role and the sender's signature policy does not load drivers |
 | 18 | `SIGNATURE_REFUSED` | The copy does not verify in the requested role under the name |
 | 21 | `LIMIT` | The max of the sender's budget node or of an ancestor refused the run (`memmgr_errors::LIMIT`), or the read session or its open (§ Label 13, **Read session**) |
 

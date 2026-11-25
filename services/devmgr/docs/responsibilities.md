@@ -210,8 +210,8 @@ devmgr's responsibilities are:
   replies, and remove it (`UNMAP`) before it deletes the cap; a refused or
   failed IOMMU call replies `IOMMU_FAILED`. The thread serves it apart from the registry
   and the control thread (below) because the control thread makes nested calls and settles
-  batches during which drivers map their buffers: a `CREATE_FROM_FILE` reads a driver binary through
-  virtio-blk, which maps the read's buffer, and every `VirtIO` driver maps its
+  batches during which drivers map their buffers: procmgr's verified read of a driver binary goes
+  through virtio-blk, which maps the read's buffer, and every `VirtIO` driver maps its
   rings before it reports ready. The two threads share the device and mapping
   table (`devmgr_firmware::dma::DmaTable`) under one lock, taken only around
   table operations and never across IPC: a mapping is pending in the table
@@ -519,39 +519,38 @@ devmgr's responsibilities are:
     IOMMU family record in a pass of its own, and every other module by the declaration it
     carries, read from the module mapped read-only and bound in the boot pass (above). Every
     module cap is released once its pass ends.
-  - **On-disk rootfs** — the drivers at `/services/drivers/<driver>` (among
-    them the per-arch RTC, virtio-input, virtio-console, virtio-rng, test-dma, and a copy
-    of virtio-blk), loaded via `procmgr_labels::CREATE_FROM_FILE`. svcmgr
-    delivers a `LOOKUP | READ | READDIR`-attenuated `/services/drivers/`
-    subtree cap via `devmgr_labels::SET_DRIVERS_DIR` after handover (gated by
-    `DRIVERS_DIR_AUTHORITY`), with the directory's absolute path as a name block from data word
-    `DRIVERS_DIR_PATH_WORD`, so devmgr names each driver `<path>/<entry>` to procmgr (a request
-    with no path is refused `INVALID_REQUEST`), and, when its walk finds it, the directory of the
-    platform description tables (`devmgr_labels::PLATFORM_TABLES_PATH`) as an optional `caps[1]`
-    at the same rights; devmgr replies SUCCESS immediately (so svcmgr
-    never blocks on driver work), and its control thread runs the
-    drivers-directory pass, settling the on-disk batch (above). Before the pass, unless a boot
-    module's table matched, the job reads the platform description tables as
-    [docs/driver-binding.md](../../../docs/driver-binding.md#platform-description-tables)
-    § Platform Description Tables describes, and deletes the directory cap. The pass
-    lists the directory (`NS_READDIR`, at most 4096 entries) and reads each
-    entry's declaration through `FS_READ` on its file cap, bounded as
-    [docs/driver-binding.md](../../../docs/driver-binding.md#declaration-bounds)
-    § Declaration Bounds requires: the ELF header page, the section header
-    table, the section name table, and the note section up to 1 KiB. A
-    binary with no declaration note is passed over unlogged, one whose
-    declaration matches no unbound device is not loaded, and the pass is
-    skipped when every device is bound. Each spawn is
-    at-most-once per boot, apart from the restart of a served driver that
-    dies, which devmgr serves at the class's next ordinal
-    ([Driver Restart](#driver-restart)), and the retries of a create procmgr refuses with an
-    error a later create can outlive ([Create retry](#create-retry)); failure, including an on-disk
+  - **On-disk rootfs** — the drivers at `/services/drivers/<driver>` (among them the per-arch RTC,
+    virtio-input, virtio-console, virtio-rng, test-dma, and a copy of virtio-blk), created by
+    `procmgr_labels::CREATE_PROCESS` from a copy of the run procmgr verified. svcmgr delivers a
+    `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` subtree cap via
+    `devmgr_labels::SET_DRIVERS_DIR` after handover (gated by `DRIVERS_DIR_AUTHORITY`), with the
+    directory's absolute path as a name block from data word `DRIVERS_DIR_PATH_WORD`, so devmgr
+    names each driver `<path>/<entry>` to procmgr (a request with no path is refused
+    `INVALID_REQUEST`), and, when its walk finds it, the directory of the platform description
+    tables (`devmgr_labels::PLATFORM_TABLES_PATH`) as an optional `caps[1]` at the same rights;
+    devmgr replies SUCCESS immediately (so svcmgr never blocks on driver work), and its control
+    thread runs the drivers-directory pass, settling the on-disk batch (above). Before the pass,
+    unless a boot module's table matched, the job reads the platform description tables as
+    [docs/driver-binding.md](../../../docs/driver-binding.md#platform-description-tables) § Platform
+    Description Tables describes, and deletes the directory cap. The pass lists the directory
+    (`NS_READDIR`, at most 4096 entries; an entry name the listing repeats is read once per pass)
+    and has procmgr read and verify each file once (`procmgr_labels::READ_VERIFIED` in the driver
+    role, under the entry's install path), as
+    [docs/driver-binding.md](../../../docs/driver-binding.md) § Driver Declarations describes.
+    devmgr reads the declaration from the verified body alone and creates the driver from a copy of
+    the run's Memory cap, which procmgr verifies again. A read procmgr refuses with an error a later
+    read can outlive is retried ([Create retry](#create-retry)). A file that does not verify is
+    passed over, procmgr logging the refusal. A binary with no declaration note is passed over
+    unlogged, one whose declaration matches no unbound device is not loaded, and the pass is skipped
+    when every device is bound. Each spawn is at-most-once per boot, apart from the restart of a
+    served driver that dies, which devmgr serves at the class's next ordinal ([Driver
+    Restart](#driver-restart)), and the retries of a start whose read or create procmgr refuses with
+    an error a later one can outlive ([Create retry](#create-retry)); failure, including an on-disk
     driver's death, or its overrun of the settle bound, before it reports ready, is sticky and
-    surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
-    the rtc, input, hwrng, and debug-port classes, the same reply
-    as before `SET_DRIVERS_DIR` arrives, so a client that needs the class waits on a `WATCH_CLASS`
-    watch. See
-    [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
+    surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of the rtc, input,
+    hwrng, and debug-port classes, the same reply as before `SET_DRIVERS_DIR` arrives, so a client
+    that needs the class waits on a `WATCH_CLASS` watch. See [docs/device-management.md § Driver
+    binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
   every block device, logd the serial and framebuffer drivers,
@@ -906,51 +905,66 @@ once released, kept from the dead instance's withdrawal, every copy derived from
 delivered again. Each instance gets a new catalog entry, and so a new device badge, so a late death
 post of the dead instance names no live driver.
 
-The record stays bound throughout, so no drivers-directory, `BIND_DRIVERS` or hotplug pass takes
-it, and the new instance replaces the dead one in its driver's instance count. A restart whose entry
-is missing or unreadable, whose declaration differs, or whose bind fails is logged, and the record
-stays bound with no driver; a create procmgr refuses with an error a later create can outlive is
-retried first (§ Create retry), and the record stays bound with no driver once its retries are
-given up. A new instance that dies or does not report ready before its batch
-settles is withdrawn and not served, as any batch's driver is, and its death is not restarted.
+The record stays bound throughout, so no drivers-directory, `BIND_DRIVERS` or hotplug pass takes it,
+and the new instance replaces the dead one in its driver's instance count. A restart whose entry is
+missing or unreadable, whose declaration differs, or whose bind fails is logged, and the record
+stays bound with no driver; a read or a create procmgr refuses with an error a later one can outlive
+is retried first (§ Create retry), and the record stays bound with no driver once its retries are
+given up. A new instance that dies or does not report ready before its batch settles is withdrawn
+and not served, as any batch's driver is, and its death is not restarted.
 
 ### Create retry
 
-A driver's start, a restart's included, whose create procmgr refuses with an error a later create
-can outlive is retried within a bound, beside the restart rules above. The policy is
+A driver's start, a restart's included, whose create, or whose read of the driver's
+drivers-directory entry, procmgr refuses with an error a later attempt can outlive is retried
+within a bound, beside the restart rules above. The policy is
 `services/devmgr/firmware/src/restart.rs`, host-tested there: `create_retryable` and
-`retry_delay_ms`, and `Retries`, the list of pending retries.
+`retry_delay_ms`, and `Retries`, the list of pending retries. Which refusals of the read are
+retried is `read_retryable` in `services/devmgr/src/decls.rs`.
 
-- **What is retried.** A create procmgr answered with the reply label `IO_ERROR` (the file the
-  create reads from failed or did not answer in time, as a file server under load does) or
-  `OUT_OF_MEMORY` (memory pressure). Any other reply label is final: a refused signature, an image
-  that is no valid ELF, a malformed request. So is devmgr's own failure before the call, and a
-  driver that started and failed its bootstrap. A create call that fails, rather than being
-  answered, is never retried: the call can end after procmgr acted on it (a stop of devmgr's thread
-  interrupting it), so devmgr cannot tell whether a child exists, and a retry could create a second
-  one. Only a reply label proves that procmgr answered and created nothing.
+- **What is retried.** A create procmgr answered with the reply label `OUT_OF_MEMORY` (memory
+  pressure), and a verified read of the driver's entry (`procmgr_labels::READ_VERIFIED` in the
+  driver role) refused for want of memory or of room under a max, or because the file was not read
+  (procmgr's `IO_ERROR`: the file failed or did not answer in time, as a file server under load
+  does), or a read call not answered in time. devmgr creates every driver from a Memory cap
+  (`CREATE_PROCESS`), which reads no file, so a file server's stall reaches the read and not the
+  create. Any other refusal is final: a refused signature, an image that is no valid ELF, a
+  malformed request. So is devmgr's own failure before the call, and a driver that started and
+  failed its bootstrap. A create call that fails, rather than being answered, is never retried:
+  the call can end after procmgr acted on it (a stop of devmgr's thread interrupting it), so devmgr
+  cannot tell whether a child exists, and a retry could create a second one. Only a reply label
+  proves that procmgr answered and created nothing. A read creates nothing, so a read call that
+  fails is retried as a refused read is.
 - **The bound.** `CREATE_RETRY_LIMIT` retries, the first `CREATE_RETRY_FIRST_MS` after the
   refusal and each later one after twice the delay before it
-  ([docs/limits.md](../../../docs/limits.md)). The restart budget is charged nothing: it bounds a
-  driver's deaths, as svcmgr's memory wait charges a service's restart budget nothing for its
-  retries ([services/svcmgr/docs/restart-protocol.md](../../svcmgr/docs/restart-protocol.md)). A
+  ([docs/limits.md](../../../docs/limits.md)); the refused reads and the refused creates of one
+  start count against the same bound. The restart budget is charged nothing: it bounds a driver's
+  deaths, as svcmgr's memory wait charges a service's restart budget nothing for its retries
+  ([services/svcmgr/docs/restart-protocol.md](../../svcmgr/docs/restart-protocol.md)). A
   restart's retries carry its budget unchanged. Each retry is logged with its count and delay, and
   the last refusal with the retries given up.
 - **What delays it.** The control thread holds the pending retries and waits on its wait set no
   longer than the earliest is due. On every wake it runs each retry that is due, whatever woke it,
   so no stream of jobs or deaths holds one off. With none pending it waits untimed.
-- **What a retry repeats.** The same create, on the same record, from the same binary: at the
-  refusal devmgr keeps a copy of the file cap the create was made from, the driver's declaration,
-  and what the driver is restarted from. A platform record's caps, which devmgr cannot carve again
-  once released, are kept with it; a PCI record's are released and carved again by the retry's
-  bind, as a restart's are. The declaration is not read again: a retry repeats a start already
-  matched. Each retry runs as a restart runs, in a settle batch of its own on the control thread,
-  counted a registry job while it runs, so a `QUERY_DEVICE` that would find no driver waits for
-  its settle, and its instance is served at the class's next ordinal.
-- **The record.** A start's record is bound at its first refusal, so no drivers-directory,
+- **What a retry repeats.** The same start, on the same record, from the same drivers-directory
+  entry: at the refusal devmgr keeps a copy of the entry's file cap, its install path, and what the
+  driver is restarted from, which names the driver and its interrupt. A platform record's caps,
+  which devmgr cannot carve again once released, are kept with it; a PCI record's are released and
+  carved again by the retry's bind, as a restart's are. A retry holds no copy of the image: it has
+  procmgr read and verify the entry again, and starts the driver only when the declaration it reads
+  still names the same driver and matches the record, as a restart checks. Each retry runs as a
+  restart runs, in a settle batch of its own on the control thread, counted a registry job while
+  it runs, so a `QUERY_DEVICE` that would find no driver waits for its settle, and its instance is
+  served at the class's next ordinal.
+- **The record.** A start's record is bound at its first refused create, so no drivers-directory,
   `BIND_DRIVERS` or hotplug pass takes it while its retry is pending; a restart's is bound
   throughout. A retry whose record was removed meanwhile (a hotplug removal) is not made, and its
-  caps are released. Once the retries are given up the record stays bound with no driver.
+  caps are released. Once the retries are given up the record stays bound with no driver. An entry
+  whose read a pass could not complete is read again on the same delays, and its driver then binds
+  the records still unbound that its declaration matches. The pass binds its other entries'
+  drivers without it, so a driver of the same pass that also matches one of those records (one the
+  unread entry would have outranked, or tied with) binds it first, for the boot, as can a driver
+  of a later pass.
 - **Which starts.** Every start from a drivers directory: the drivers-directory pass, a
   `BIND_DRIVERS` pass, a hot-added function's bind (the hotplug add job binds through the
   drivers-directory pass), and every restart. A boot-pass start is not retried: its binary is a
@@ -966,7 +980,7 @@ the withdrawal revokes the endpoint, `QUERY_DEVICE` answers `WITHDRAWN` at the d
 ordinal, and its `WATCH_CLASS` watch is signalled at the withdrawal and again when the new
 instance is served. A `QUERY_DEVICE` at the next ordinal (`first_device_from`) then waits for the
 restart's settle and names the new instance, or answers `NO_DEVICE` when the restart was refused or
-failed, and between the retries of a refused create (§ Create retry), whose served instance
+failed, and between the retries of a refused start (§ Create retry), whose served instance
 signals the watch as any new instance does. A client re-registers with the new instance whatever
 it registered with the dead one. `ipc::refresh_device` is the look a client makes at its class on
 a signal. The `std` clients that follow a class for their run (the terminal, gdbstub and

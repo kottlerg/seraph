@@ -1124,6 +1124,17 @@ impl VerifiedData {
         // the slice borrows `self`, so it ends before `Drop` unmaps them.
         unsafe { crate::slice::from_raw_parts(range.va_start() as *const u8, self.len) }
     }
+
+    /// The slot of the Memory cap on the run, which carries `RIGHTS_MEM_MAP`
+    /// alone and holds the whole file procmgr verified, its trailer after the
+    /// body. The value keeps the slot and deletes it when dropped: a caller
+    /// that hands the run on, such as a `CREATE_PROCESS` of a verified
+    /// driver image, sends a copy it derives, never this slot.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[must_use]
+    pub fn cap(&self) -> u64 {
+        self.cap
+    }
 }
 
 #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -1170,6 +1181,12 @@ pub enum VerifiedRole {
     /// index.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     Configuration,
+    /// A driver image whose declaration the reader parses before it creates
+    /// the driver from the same run (docs/driver-binding.md § Driver
+    /// Declarations); procmgr admits it only from a process whose signature
+    /// policy loads drivers.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    Driver,
 }
 
 impl VerifiedRole {
@@ -1178,6 +1195,7 @@ impl VerifiedRole {
         match self {
             Self::Data => ipc::procmgr_labels::READ_VERIFIED_DATA,
             Self::Configuration => ipc::procmgr_labels::READ_VERIFIED_CONFIGURATION,
+            Self::Driver => ipc::procmgr_labels::READ_VERIFIED_DRIVER,
         }
     }
 }
@@ -1193,13 +1211,15 @@ impl VerifiedRole {
 /// value lives.
 ///
 /// # Errors
-/// `InvalidInput` for a length of zero or past
-/// `procmgr_labels::READ_VERIFIED_MAX`, or a name procmgr does not take;
+/// `InvalidInput` for a length of zero or past the role's bound
+/// (`procmgr_labels::READ_VERIFIED_MAX`, or `READ_VERIFIED_IMAGE_MAX` for a
+/// driver image), or a name procmgr does not take;
 /// `InvalidData` when the file does not verify; `QuotaExceeded` when the max
 /// of this process's budget node or of an ancestor refuses the copy;
 /// `OutOfMemory` when the copy or its mapping cannot be had otherwise;
 /// `PermissionDenied` when procmgr does not
-/// know this process; `Other` for a failed read or IPC.
+/// know this process, or its signature policy loads no driver and `role` is
+/// [`VerifiedRole::Driver`]; `Other` for a failed read or IPC.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn read_verified(
     file_cap: u64,
@@ -1248,7 +1268,9 @@ pub fn read_verified(
             ipc::procmgr_errors::OUT_OF_MEMORY | ipc::procmgr_errors::MAP_FAILED => {
                 ErrorKind::OutOfMemory
             }
-            ipc::procmgr_errors::INVALID_BADGE => ErrorKind::PermissionDenied,
+            ipc::procmgr_errors::INVALID_BADGE | ipc::procmgr_errors::UNAUTHORIZED => {
+                ErrorKind::PermissionDenied
+            }
             ipc::procmgr_errors::LIMIT => ErrorKind::QuotaExceeded,
             _ => ErrorKind::Other,
         };

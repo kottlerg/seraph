@@ -18,10 +18,11 @@
 //! record's restart budget, which only a restart that passes every other
 //! check is charged.
 //!
-//! A create procmgr refuses with an error a later create can outlive is
-//! retried, for a start and a restart alike ([`create_retryable`]): after
-//! the delays [`retry_delay_ms`] gives, at most [`CREATE_RETRY_LIMIT`]
-//! times, each pending retry held in [`Retries`] until it is due.
+//! A start whose create, or whose verified read of the driver's entry,
+//! procmgr refuses with an error a later one can outlive is retried, for a
+//! start and a restart alike ([`create_retryable`] for the create): after the
+//! delays [`retry_delay_ms`] gives, at most [`CREATE_RETRY_LIMIT`] times, each
+//! pending retry held in [`Retries`] until it is due.
 
 extern crate alloc;
 
@@ -220,8 +221,9 @@ pub fn same_driver(
         && decl_rank(decl, Source::DriversDir, record).is_some()
 }
 
-/// Retries devmgr makes of one driver start whose create procmgr refuses
-/// with an error a later create can outlive ([`create_retryable`]), before
+/// Retries devmgr makes of one driver start whose create, or whose verified
+/// read of the driver's entry, procmgr refuses with an error a later one can
+/// outlive ([`create_retryable`] for the create), before
 /// it gives the start up (services/devmgr/docs/responsibilities.md § Create
 /// retry). With the delays of [`retry_delay_ms`] the retries span 63 s, the
 /// order of svcmgr's memory wait (`MEMORY_RETRY_LIMIT` retries a second
@@ -234,9 +236,11 @@ pub const CREATE_RETRY_LIMIT: u32 = 6;
 pub const CREATE_RETRY_FIRST_MS: u64 = 1000;
 
 /// Whether procmgr's refusal `label` of a driver's create is one a later
-/// create can outlive, so devmgr retries it: `IO_ERROR`, the binary's
-/// file not opened or read (the file system stalled or refused), and
-/// `OUT_OF_MEMORY`, memory short for the child or procmgr. Every other
+/// create can outlive, so devmgr retries it: `OUT_OF_MEMORY`, memory short
+/// for the child or procmgr. devmgr creates every driver from a Memory cap
+/// (`CREATE_PROCESS`), which reads no file: a file system's stall or refusal
+/// reaches the verified read of the driver's entry before it, which devmgr
+/// retries in the same bound. Every other
 /// refusal (a signature refused, an ELF or argument rejected, a mapping or
 /// derivation failed, the argv and env still mapped) holds for any later
 /// create of the same binary, and is final. A label is a reply procmgr gave,
@@ -244,10 +248,7 @@ pub const CREATE_RETRY_FIRST_MS: u64 = 1000;
 #[must_use]
 pub fn create_retryable(label: u64) -> bool
 {
-    matches!(
-        label,
-        procmgr_errors::IO_ERROR | procmgr_errors::OUT_OF_MEMORY
-    )
+    label == procmgr_errors::OUT_OF_MEMORY
 }
 
 /// The delay before create retry `retry` of a start, counted from 1, in
@@ -733,9 +734,9 @@ mod tests
     fn only_a_refusal_a_later_create_can_outlive_is_retried()
     {
         use ipc::procmgr_errors as e;
-        assert!(create_retryable(e::IO_ERROR));
         assert!(create_retryable(e::OUT_OF_MEMORY));
         for label in [
+            e::IO_ERROR,
             e::SUCCESS,
             e::INVALID_ELF,
             e::THREAD_CONFIGURE_FAILED,

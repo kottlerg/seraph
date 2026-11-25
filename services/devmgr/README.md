@@ -20,7 +20,7 @@ devmgr/
 │                                   #   scopes, RMRRs), RISC-V IO Mapping Table (PCI
 │                                   #   IOMMUs, ID mappings), driver-declaration binding
 │                                   #   (PCI identity keys, match ranking, declaration
-│                                   #   bounds), the served-class table, bounded image reads,
+│                                   #   bounds), the served-class table,
 │                                   #   the AML `Device` walker (on `shared/aml`'s encodings
 │                                   #   and resource-template decoder), platform device
 │                                   #   records, the platform description table parser,

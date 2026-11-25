@@ -25,7 +25,8 @@
 //! devmgr binds the driver whose declaration (`rtc` class) matches the
 //! RTC's platform device record (`PNP0B00`, `PNP0B01` or `PNP0B02` on
 //! x86-64, the `google,goldfish-rtc` key on RISC-V), spawns it through
-//! [`procmgr_labels::CREATE_FROM_FILE`](crate::procmgr_labels::CREATE_FROM_FILE), and delivers the record's
+//! [`procmgr_labels::CREATE_PROCESS`](crate::procmgr_labels::CREATE_PROCESS) from the run procmgr
+//! read and verified for its file, and delivers the record's
 //! hardware authority cap (ISA `IoPort` for CMOS; MMIO aperture for
 //! goldfish-rtc) through the bootstrap protocol. An `rtc`
 //! [`devmgr_labels::QUERY_DEVICE`](crate::devmgr_labels::QUERY_DEVICE) that would find no driver waits until
@@ -33,9 +34,10 @@
 //! with two exceptions: devmgr's restart of a served driver that dies, which
 //! it serves at the class's next ordinal
 //! (`services/devmgr/docs/responsibilities.md` § Driver Restart), and its
-//! bounded retry of a create procmgr refused with `IO_ERROR` or
-//! `OUT_OF_MEMORY` (§ Create retry there), so the RTC at ordinal 0 need not
-//! last the boot, and a first create's failure need not be final. A client finds the RTC as it finds
+//! bounded retry of a start whose verified read or create procmgr refused
+//! with an error a later one can outlive (§ Create retry there), so the RTC
+//! at ordinal 0 need not last the boot, and a first start's failure need not
+//! be final. A client finds the RTC as it finds
 //! any driver of its class, by probing the ordinals
 //! ([`first_device`](crate::first_device)): the ordinal of a driver that died replies
 //! [`devmgr_errors::WITHDRAWN`](crate::devmgr_errors::WITHDRAWN), and an

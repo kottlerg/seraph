@@ -30,10 +30,12 @@ pub fn requested_name(req: &IpcMessage) -> Option<&[u8]>
 
 /// The role a `READ_VERIFIED` request's role word names
 /// (`ipc::procmgr_labels::READ_VERIFIED_ROLE_WORD`): data or configuration,
-/// the two roles of a file a reader takes as trusted input. `None` for any
-/// other value, so a process image (service, driver, program) or a
-/// bundle-only object is never handed to a reader as trusted input, and a
-/// file read this way is never code.
+/// the two roles of a file a reader takes as trusted input, or driver, an
+/// image whose declaration its reader parses before it creates the driver
+/// from the same run (docs/driver-binding.md § Driver Declarations). `None`
+/// for any other value, so a service or program image or a bundle-only
+/// object is never handed to a reader. A file read this way is never code to
+/// its reader: only a create runs a driver image, verified again.
 #[must_use]
 pub const fn readable_role(word: u64) -> Option<Role>
 {
@@ -41,7 +43,28 @@ pub const fn readable_role(word: u64) -> Option<Role>
     {
         ipc::procmgr_labels::READ_VERIFIED_DATA => Some(Role::Data),
         ipc::procmgr_labels::READ_VERIFIED_CONFIGURATION => Some(Role::Configuration),
+        ipc::procmgr_labels::READ_VERIFIED_DRIVER => Some(Role::Driver),
         _ => None,
+    }
+}
+
+/// The most bytes a `READ_VERIFIED` file in `role` may hold, its trailer
+/// included: `READ_VERIFIED_IMAGE_MAX` for a driver image,
+/// `READ_VERIFIED_MAX` for a data or configuration file.
+#[must_use]
+pub const fn read_bound(role: Role) -> u64
+{
+    match role
+    {
+        Role::Driver => ipc::procmgr_labels::READ_VERIFIED_IMAGE_MAX,
+        Role::Kernel
+        | Role::Init
+        | Role::BootModule
+        | Role::Service
+        | Role::Program
+        | Role::Data
+        | Role::Configuration
+        | Role::Enrolment => ipc::procmgr_labels::READ_VERIFIED_MAX,
     }
 }
 
@@ -49,7 +72,7 @@ pub const fn readable_role(word: u64) -> Option<Role>
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedRead<'a>
 {
-    /// The file's length in bytes, 1 to `READ_VERIFIED_MAX`.
+    /// The file's length in bytes, 1 to the role's [`read_bound`].
     pub len: u64,
     /// The role the file must be signed in ([`readable_role`]).
     pub role: Role,
@@ -65,10 +88,30 @@ impl VerifiedRead<'_>
     {
         RoleSet::of(&[self.role])
     }
+
+    /// Whether a sender whose signature policy is `policy` may make the
+    /// read: a data or configuration file any sender may; a driver image only
+    /// a sender whose policy loads drivers, for which the read is the first
+    /// half of a create it may make.
+    #[must_use]
+    pub const fn admitted_by(&self, policy: RoleSet) -> bool
+    {
+        match self.role
+        {
+            Role::Data | Role::Configuration => true,
+            role @ (Role::Kernel
+            | Role::Init
+            | Role::BootModule
+            | Role::Service
+            | Role::Driver
+            | Role::Program
+            | Role::Enrolment) => policy.contains(role),
+        }
+    }
 }
 
 /// The read a `READ_VERIFIED` request `req` asks for: its length,
-/// `data[0]`, when it is 1 to `ipc::procmgr_labels::READ_VERIFIED_MAX`;
+/// `data[0]`, when it is 1 to its role's [`read_bound`];
 /// its role word, when it names a [`readable_role`]; and its name block,
 /// when that is a canonical install path (`objsig::name_is_install_path`).
 /// `None`, which procmgr refuses `INVALID_ARGUMENT` before it opens the
@@ -77,13 +120,17 @@ impl VerifiedRead<'_>
 #[must_use]
 pub fn verified_read(req: &IpcMessage) -> Option<VerifiedRead<'_>>
 {
-    use ipc::procmgr_labels::{READ_VERIFIED_MAX, READ_VERIFIED_ROLE_WORD};
+    use ipc::procmgr_labels::READ_VERIFIED_ROLE_WORD;
     let len = req.word(0);
-    if req.word_count() <= READ_VERIFIED_ROLE_WORD || len == 0 || len > READ_VERIFIED_MAX
+    if req.word_count() <= READ_VERIFIED_ROLE_WORD || len == 0
     {
         return None;
     }
     let role = readable_role(req.word(READ_VERIFIED_ROLE_WORD))?;
+    if len > read_bound(role)
+    {
+        return None;
+    }
     let name = ipc::procmgr_labels::read_verified_name(req)
         .filter(|name| objsig::name_is_install_path(name))?;
     Some(VerifiedRead { len, role, name })
@@ -239,15 +286,15 @@ mod tests
         assert_eq!(verified_read(&IpcMessage::new(READ_VERIFIED)), None);
     }
 
-    // Defect guarded: a verified read accepting an image or bundle role, so
-    // a reader is handed a signed program as configuration it trusts; or a
+    // Defect guarded: a verified read accepting a service, program or bundle
+    // role, so a reader is handed a signed program as input it trusts; or a
     // role word read in another numbering than the signed one.
     #[test]
-    fn a_read_names_the_data_or_configuration_role_alone()
+    fn a_read_names_the_data_configuration_or_driver_role_alone()
     {
         for role in Role::ALL
         {
-            let readable = matches!(role, Role::Data | Role::Configuration);
+            let readable = matches!(role, Role::Data | Role::Configuration | Role::Driver);
             assert_eq!(
                 readable_role(role as u64),
                 readable.then_some(role),
@@ -260,6 +307,60 @@ mod tests
         {
             assert_eq!(readable_role(word), None, "{word}");
         }
+    }
+
+    // Defect guarded: a driver image refused at the data bound, so no
+    // driver larger than 32 KiB binds; or a data or configuration read
+    // admitted past its own bound, so procmgr maps a copy as large as an
+    // image for a file that holds a table.
+    #[test]
+    fn a_driver_read_takes_the_image_bound_and_the_others_the_data_bound()
+    {
+        use ipc::procmgr_labels::{
+            READ_VERIFIED_DRIVER, READ_VERIFIED_IMAGE_MAX, READ_VERIFIED_MAX,
+        };
+        let name = &b"/services/drivers/virtio-rng"[..];
+        for len in [READ_VERIFIED_MAX + 1, READ_VERIFIED_IMAGE_MAX]
+        {
+            let request = role_request(len, READ_VERIFIED_DRIVER, name);
+            let read = verified_read(&request);
+            assert_eq!(read.map(|read| read.role), Some(Role::Driver), "{len}");
+            assert_eq!(verified_read(&data_request(len, name)), None, "{len}");
+        }
+        let past = role_request(READ_VERIFIED_IMAGE_MAX + 1, READ_VERIFIED_DRIVER, name);
+        assert_eq!(verified_read(&past), None);
+        assert_eq!(read_bound(Role::Driver), READ_VERIFIED_IMAGE_MAX);
+        for role in [Role::Data, Role::Configuration]
+        {
+            assert_eq!(read_bound(role), READ_VERIFIED_MAX, "{role:?}");
+        }
+    }
+
+    // Defect guarded: a process whose policy loads no driver reading a
+    // driver image through procmgr, so a program is handed a signed driver's
+    // bytes it could never run; or a data or configuration read refused to a
+    // sender whose policy holds neither role, which every reader is.
+    #[test]
+    fn a_driver_read_is_admitted_only_to_a_policy_that_loads_drivers()
+    {
+        use ipc::procmgr_labels::READ_VERIFIED_DRIVER;
+        let driver = role_request(64, READ_VERIFIED_DRIVER, b"/services/drivers/x");
+        let driver = verified_read(&driver).unwrap();
+        assert!(driver.admitted_by(LOADABLE));
+        assert!(driver.admitted_by(RoleSet::of(&[Role::Driver])));
+        let program = RoleSet::of(&[Role::Program]);
+        for policy in [program, child_roles(LOADABLE, program), RoleSet::EMPTY]
+        {
+            assert!(!driver.admitted_by(policy), "{policy:?}");
+        }
+        let data = data_request(64, b"/data/x");
+        assert!(verified_read(&data).unwrap().admitted_by(RoleSet::EMPTY));
+        let configuration = role_request(
+            64,
+            ipc::procmgr_labels::READ_VERIFIED_CONFIGURATION,
+            b"/config/x",
+        );
+        assert!(verified_read(&configuration).unwrap().admitted_by(program));
     }
 
     // Defect guarded: a creator's set holding the boot-module role, so a

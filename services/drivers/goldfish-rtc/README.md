@@ -12,9 +12,10 @@ register reads.
 Installed to `/services/drivers/goldfish-rtc` on the rootfs. Bound
 by [devmgr](../../devmgr/README.md) on RISC-V QEMU virt to the platform record of the
 `qemu-virt` platform description table,
-`procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
-walks to from the `LOOKUP | READ | READDIR` `/services/drivers/` subtree cap
-svcmgr delivers post-handover via `devmgr_labels::SET_DRIVERS_DIR` (see
+and created by `procmgr_labels::CREATE_PROCESS` from the run procmgr read and verified
+(`procmgr_labels::READ_VERIFIED`, driver role) for the file devmgr walks to from the
+`LOOKUP | READ | READDIR` `/services/drivers/` subtree cap svcmgr delivers post-handover via
+`devmgr_labels::SET_DRIVERS_DIR` (see
 [Device Management](../../../docs/device-management.md#driver-binary-sources)). The driver
 carries a declaration in the ELF note section `.note.seraph.driver` (platform key
 `google,goldfish-rtc`), which the drivers-directory pass matches against that record.

@@ -34,50 +34,51 @@ platform's firmware baseline in [platform-requirements.md](platform-requirements
 
 The primitives exist: [`shared/crypto`](../shared/crypto/README.md) provides `ed25519_verify`,
 `ml_dsa::verify` and `Sha512`, tested against known-answer vectors, Wycheproof, and reference
-vectors computed with OpenSSL, and, behind its `sign` feature, the key generation and signing that
-§ Signing requires of it (`ed25519_public_key`, `ed25519_sign`, `ml_dsa::public_key`,
-`ml_dsa::sign`), tested against the same reference vectors and the verifiers. The composite
-signature of § Composite Signature, the formats of § Signed Object Format, § Certificate Format and
-§ Trust Store, and the verification of § Verification, are implemented and host-tested in
+vectors computed with OpenSSL, and, behind its `sign` feature, the key generation and signing that §
+Signing requires of it (`ed25519_public_key`, `ed25519_sign`, `ml_dsa::public_key`, `ml_dsa::sign`),
+tested against the same reference vectors and the verifiers. The composite signature of § Composite
+Signature, the formats of § Signed Object Format, § Certificate Format and § Trust Store, and the
+verification of § Verification, are implemented and host-tested in
 [`shared/objsig`](../shared/objsig/README.md), which xtask and the bootloader link; its `sign`
 feature, which enables `shared/crypto`'s, composes the signers. xtask, the host signer, enables the
 feature, and core/boot enables it as a dev-dependency only, since its host tests sign fixtures.
 xtask's keys and signing of § Signing are implemented: every build signs the kernel, every ELF image
 of the root filesystem, the files of its data trees and the data files the bundle lists name, each
 once, in the sysroot, under the role set and the name of § Signed Attributes, the configuration
-files of § Configuration with the index of each of their directories, composes the ESP by
-copying the installed files, builds the trust store at the path § Signing names, and embeds it in
-the bootloader. The bootloader verifies the kernel and every bundle entry against that store, each
-entry under `/config/` but a platform table in the configuration role, refuses a bundle without the
+files of § Configuration with the index of each of their directories, composes the ESP by copying
+the installed files, builds the trust store at the path § Signing names, and embeds it in the
+bootloader. The bootloader verifies the kernel and every bundle entry against that store, each entry
+under `/config/` but a platform table in the configuration role, refuses a bundle without the
 boot-time policy (§ Configuration), and hands the store to procmgr (§ Trust Store), which parses it
-and keeps it.
-procmgr verifies every
-image it creates against that store before it parses it (§ Verifier Discipline), under its creator's
-signature policy and the name the creator gives (§ Signature Policy in procmgr), and verifies a data
-file in the data role, or a configuration file in the configuration role, at its reader's request
-(`procmgr_labels::READ_VERIFIED`, § Verifier Discipline), which svctest's `procmgr_read_verified`
-phase exercises on both architectures, which devmgr uses for the platform description tables, and
-which svcmgr uses for its service recipes and device class files, read through each directory's
-signed index (§ Configuration). The override that § Signature Policy in
-procmgr describes is design intent, not yet implemented: no creator can hold it, so procmgr creates
-no process from an image that does not verify. `cargo xtask test signing` boots each refusal on both
-architectures: a tampered kernel, a tampered bundle entry, a revoked signing key, a bundle without
-its boot-time policy, and a policy signed by a key not trusted for the configuration role in the
-bootloader; a tampered service, one signed without a role its creator's policy admits and one
-signed by an untrusted key in procmgr, beside a kernel and a program whose untrusted record both
-verifiers skip; configuration files tampered with, unsigned, or signed by a key not trusted for the
-configuration role, a service signed by a key trusted for configuration alone, a recipe validly
-signed over a body other than its index line's, and a directory index that names a missing file and
-omits a present one; and both indexes tampered with
-([testing.md](testing.md) § Gating, Signature refusals). The bootloader keeps the machine's
-security floor in a boot-services-only UEFI variable, raises it, and refuses itself below it
-(§ Rollback Floor); `cargo xtask test rollback` boots the floor written, raised, and refusing an
-older bootloader on both architectures ([testing.md](testing.md) § Gating, Rollback floor). The
-bootloader keeps the enrolled trust store in firmware storage and applies trust requests to it
-(§ Trust Store); `cargo xtask test enrolment` boots a root enrolled by a signed request and by
+and keeps it. procmgr verifies every image it creates against that store before it parses it (§
+Verifier Discipline), under its creator's signature policy and the name the creator gives (§
+Signature Policy in procmgr), and verifies a data file in the data role, a configuration file in the
+configuration role, or a driver image in the driver role for a reader whose policy loads drivers, at
+its reader's request (`procmgr_labels::READ_VERIFIED`, § Verifier Discipline), which svctest's
+`procmgr_read_verified` phase exercises on both architectures, which devmgr uses for the platform
+description tables and for each driver image of the drivers directory, whose declaration it reads
+from the verified copy before it binds the driver, and which svcmgr uses for its service recipes and
+device class files, read through each directory's signed index (§ Configuration). The override that
+§ Signature Policy in procmgr describes is design intent, not yet implemented: no creator can hold
+it, so procmgr creates no process from an image that does not verify. `cargo xtask test signing`
+boots each refusal on both architectures: a tampered kernel, a tampered bundle entry, a revoked
+signing key, a bundle without its boot-time policy, and a policy signed by a key not trusted for the
+configuration role in the bootloader; a tampered service, one signed without a role its creator's
+policy admits and one signed by an untrusted key in procmgr, beside a kernel and a program whose
+untrusted record both verifiers skip; a drivers-directory driver whose declaration note is tampered
+with and one unsigned, each refused at devmgr's verified read of its declaration; configuration
+files tampered with, unsigned, or signed by a key not trusted for the configuration role, a service
+signed by a key trusted for configuration alone, a recipe validly signed over a body other than its
+index line's, and a directory index that names a missing file and omits a present one; and both
+indexes tampered with ([testing.md](testing.md) § Gating, Signature refusals). The bootloader keeps
+the machine's security floor in a boot-services-only UEFI variable, raises it, and refuses itself
+below it (§ Rollback Floor); `cargo xtask test rollback` boots the floor written, raised, and
+refusing an older bootloader on both architectures ([testing.md](testing.md) § Gating, Rollback
+floor). The bootloader keeps the enrolled trust store in firmware storage and applies trust requests
+to it (§ Trust Store); `cargo xtask test enrolment` boots a root enrolled by a signed request and by
 one confirmed at the console, a request refused at the timeout and by the commit rule, and the
-build's roots revoked, on both architectures ([testing.md](testing.md) § Gating, Root
-enrolment). The local signer of § Configuration is design intent, not yet implemented.
+build's roots revoked, on both architectures ([testing.md](testing.md) § Gating, Root enrolment).
+The local signer of § Configuration is design intent, not yet implemented.
 
 [boot-media.md](boot-media.md) states why one object carries one signature, and how the bundle
 lists in configuration choose the bundle's entries.
@@ -94,7 +95,8 @@ implemented (§ Signature Policy in procmgr).
   creates. procmgr is the only runtime loader
   ([process-lifecycle.md](process-lifecycle.md) § Steady-State Process Creation) and the only
   holder of the trust store at run time, so it is the only runtime verifier: a process that reads a
-  data file as trusted input has procmgr verify it and parses only the body procmgr returns.
+  data file as trusted input, or a driver image's declaration, has procmgr verify it and parses only
+  the body procmgr returns.
 - **The kernel verifies nothing.** The kernel provides mechanism only; it parses no signature and
   holds no key.
 - **The right to run an unverified image is a capability**, held on procmgr's record of the
@@ -124,6 +126,7 @@ trusted to execute as built.
 | **TOCTOU.** Change the bytes between verification and use. | The verifier reads the object once into memory no other process can write, verifies that copy, and the loader parses and loads only from it. | None. |
 | **Trust-store substitution.** Replace the roots the system trusts. | The built-in trust store is built into the bootloader; replacing it means replacing the bootloader. The enrolled store lies in a variable boot services alone reach, and changes only by a trust request that a key the store trusts signed in the enrolment role, or that someone at the console confirms after seeing each change (§ Trust Store). | Without Secure Boot, an attacker who can write the ESP replaces the bootloader and its roots: the chain is as strong as the ESP's integrity (§ Secure Boot). Someone at the console who confirms a request an attacker placed on the ESP enrols its roots. An attacker at the firmware's shell can delete the enrolled store, and its revocations with it. |
 | **Configuration tampering.** Change a policy-bearing configuration file (`/config/svcmgr/services/*.svc`) so a verified binary runs under altered policy. | Each policy-bearing file is signed in the configuration role, which no binary is accepted in, and its consumer has procmgr verify it before it parses it (§ Configuration). | None within the chain. |
+| **Driver removal, addition or mixing.** Delete a driver from `/services/drivers/`, add a signed one beside the drivers it holds, or put back an older signed copy of one. | devmgr reads a driver's declaration only from a copy procmgr verified in the driver role under the entry's install path, and creates the driver from that copy, so every driver it binds is signed for the path it is installed at (§ Verifier Discipline). | The directory has no signed index: an attacker can remove a driver, add one signed for its install path that the deployer did not install, or put back an older signed copy whose security version the floor admits, and a more specific or an equally specific declaration among them changes or blocks a device's binding ([driver-binding.md](driver-binding.md) § Matching). Binding the directory's contents to the deployer's consent is [#1665](https://github.com/kottlerg/seraph/issues/1665). |
 | **Configuration removal, addition or mixing.** Delete a recipe from a configuration directory, add one beside the files it holds, or put back an older signed copy of one. | The directory's signed index names each file it held at signing time with the SHA-512 of its body; the consumer reads only the files the index names, refuses a body whose hash is not its line's, and reports a named file that is missing and a file the index does not name (§ Configuration). | A whole older directory with its older index, all signed at a security version the machine's floor admits, verifies: the floor rises only with a revoking release (§ Rollback Floor), so the configuration of any release since the last raise is accepted. An index whose freshness a TPM counter attests is [#1416](https://github.com/kottlerg/seraph/issues/1416). |
 
 ---
@@ -142,6 +145,7 @@ trusted to execute as built.
 | Every image procmgr creates, from a file or a Memory cap | procmgr | The store the bootloader hands forward | The roles the creator's policy allows; the name the creator gives, an install path |
 | A data file a process reads from the root filesystem as trusted input (a platform description table devmgr reads) | procmgr, at the reader's request (`procmgr_labels::READ_VERIFIED`) | The same store | data, its install path |
 | A policy-bearing configuration file, and the index of its directory (§ Configuration) | procmgr, at its consumer's request (`procmgr_labels::READ_VERIFIED`) | The same store | configuration, its install path |
+| A driver image of the drivers directory, whose declaration devmgr reads before it binds the driver ([driver-binding.md](driver-binding.md) § Driver Declarations) | procmgr, at devmgr's request (`procmgr_labels::READ_VERIFIED`), and again when devmgr creates the driver from that copy | The same store | driver, its install path |
 
 The bundle container itself is not signed: the bootloader parses its header with the bounds-checking
 parser of [`abi/boot-protocol::bundle`](../abi/boot-protocol/src/bundle.rs) and verifies each entry
@@ -614,15 +618,20 @@ it does.
 
 ## Verifier Discipline
 
-The bootloader and procmgr follow it. procmgr follows it for a data file it verifies at its reader's
-request too (`procmgr_labels::READ_VERIFIED`): it refuses a file past
-`procmgr_labels::READ_VERIFIED_MAX` (32 KiB) before it reads any byte, copies the file once into
-one run of frames it requests on the reader's account and maps in its own address space alone,
-verifies that copy in the role the reader names, data or configuration, and under the name the
-reader gives, and gives the reader the run
-through a capability that maps it read-only, keeping none of its own, so the reader parses only the
-verified body, in bytes no process but memmgr can write
+The bootloader and procmgr follow it. procmgr follows it for a file it verifies at its reader's
+request too (`procmgr_labels::READ_VERIFIED`): before it reads any byte, it refuses a file past its
+role's bound (`procmgr_labels::READ_VERIFIED_MAX`, 32 KiB, for a data or configuration file;
+`READ_VERIFIED_IMAGE_MAX`, 16 MiB, for a driver image), and a driver image a reader whose signature
+policy loads no driver asks for. It copies the file once into one run of frames it requests on the
+reader's account and maps in its own address space alone, verifies that copy in the role the reader
+names, data, configuration or driver, and under the name the reader gives, and gives the reader the
+run through a capability that maps it read-only, keeping none of its own, so the reader parses only
+the verified body, in bytes no process but memmgr can write
 ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 31: `READ_VERIFIED`).
+A driver image read this way is never code to its reader; only a create runs it, verified again:
+devmgr reads the driver's declaration from the verified body and creates the driver from the same
+run, which procmgr copies and verifies as it does every image it creates, so the bytes devmgr bound
+on are the bytes that run ([driver-binding.md](driver-binding.md) § Driver Declarations).
 
 - **Verify before parse.** No stage parses an object's body (its ELF headers, its table text)
   before the verifier has accepted it.

@@ -150,12 +150,13 @@ pub const QUERY_DEVICE_INFO: u64 = 2;
 /// `<PLATFORM_TABLES_PATH>/<entry>`, takes the one whose OEM table ID is
 /// the XSDT's and adds its device records, then deletes the cap
 /// (docs/driver-binding.md § Platform Description Tables). The
-/// drivers-directory pass (the listing, the read of each entry's driver
-/// declaration, and the bind of every PCI device and platform device
-/// record still unbound that a declaration matches, the RTC's among
-/// them), the
-/// [`super::procmgr_labels::CREATE_FROM_FILE`] calls and bootstrap
-/// rounds they make, and the settle that waits for each driver to
+/// drivers-directory pass (the listing, procmgr's read and verification
+/// of each entry ([`super::procmgr_labels::READ_VERIFIED`] in the driver
+/// role) and devmgr's read of its declaration from the verified body, and
+/// the bind of every PCI device and platform device record still unbound
+/// that a declaration matches, the RTC's among them), the
+/// [`super::procmgr_labels::CREATE_PROCESS`] calls from the verified runs
+/// and the bootstrap rounds they make, and the settle that waits for each driver to
 /// report ready ([`DRIVER_READY`]), run on devmgr's control thread
 /// after the reply, while its registry workers go on serving. A
 /// [`QUERY_DEVICE`] whose answer would name no driver waits until that
@@ -164,9 +165,9 @@ pub const QUERY_DEVICE_INFO: u64 = 2;
 /// once.
 ///
 /// Each spawn is attempted once per boot, with two exceptions: a restart
-/// after a served driver's death, and a create procmgr refused with
-/// `IO_ERROR` or `OUT_OF_MEMORY`, which devmgr retries a bounded number
-/// of times (`services/devmgr/docs/responsibilities.md` § Create retry).
+/// after a served driver's death, and a start whose verified read or
+/// create procmgr refused with an error a later one can outlive, which
+/// devmgr retries a bounded number of times (`services/devmgr/docs/responsibilities.md` § Create retry).
 /// On a failure that is not retried (missing binary, ELF corrupt, carve
 /// failure, a refused signature, a driver that died or did not report
 /// ready within the settle bound, etc.), or once the retries are given

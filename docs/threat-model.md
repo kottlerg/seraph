@@ -311,6 +311,13 @@ loader reached only through such an image is a defect, not an attack.
   in `core/boot/src/main.rs`), procmgr every image it creates (`services/procmgr/src/image.rs`);
   init loads memmgr and procmgr only from boot modules the bootloader verified
   ([signing.md](signing.md) § Verifier Discipline).
+- devmgr parses no byte of a drivers-directory file before procmgr has verified it: procmgr reads
+  each entry once into a run only memmgr can write and verifies it in the driver role under its
+  install path (`procmgr_labels::READ_VERIFIED`, refused to a reader whose policy loads no driver);
+  devmgr runs `elf::validate_executable`, `elf::find_note_streaming` and the declaration decoder
+  over the verified body alone, and creates the driver from the same run, which procmgr verifies
+  again (`verified_decl` in `services/devmgr/src/decls.rs`;
+  [driver-binding.md](driver-binding.md) § Declaration Bounds).
 - The ELF parser, `shared/elf`, reads only inside the slice it is given: `validate_executable`
   checks the identification, the type, the machine and the program-header table's bounds;
   `load_segments` refuses a segment whose file bytes lie past the image; `validate_relative_relocs`
@@ -355,12 +362,11 @@ loader reached only through such an image is a defect, not an attack.
 
 **Gaps.**
 
-- devmgr reads the ELF header, the section headers and the driver-declaration note of every file in
-  `/services/drivers/` before any verification, to choose the driver a device binds (`file_decl`,
-  `read_decl` in `services/devmgr/src/decls.rs`), so the storage writer reaches
-  `elf::validate_executable`, `elf::find_note_streaming` and the declaration decoder with bytes no
-  key signed. procmgr still refuses to run such a file
-  ([#1533](https://github.com/kottlerg/seraph/issues/1533)).
+- The set of images in `/services/drivers/` is not signed: the storage writer can remove a driver,
+  add one signed for its install path that the deployer did not install, or put back an older
+  signed copy whose security version the floor admits, and so change or block which driver a
+  device binds, though every driver devmgr binds is signed
+  ([#1665](https://github.com/kottlerg/seraph/issues/1665)).
 
 ---
 
@@ -521,11 +527,11 @@ binds the bootloader to the firmware's db ([signing.md](signing.md) § Secure Bo
 
 **Mitigations.** Every object carries a composite Ed25519 and ML-DSA-65 signature over its hash,
 roles, name, architecture and security version; the bootloader verifies the kernel and every bundle
-entry, and procmgr every image it creates and every data or configuration file a reader asks it to,
-each on a copy no other process can write, with one exit on failure and no fallback
-([signing.md](signing.md) § Which Stage Verifies What, § Verification, § Verifier Discipline). The
-machine's security floor is kept in firmware storage and raised, and the enrolled trust store
-changes only by a request signed in the enrolment role or confirmed at the console
+entry, and procmgr every image it creates and every data file, configuration file or driver image a
+reader asks it to, each on a copy no other process can write, with one exit on failure and no
+fallback ([signing.md](signing.md) § Which Stage Verifies What, § Verification, § Verifier
+Discipline). The machine's security floor is kept in firmware storage and raised, and the enrolled
+trust store changes only by a request signed in the enrolment role or confirmed at the console
 ([signing.md](signing.md) § Rollback Floor, § Trust Store). The code is `shared/objsig` (the formats
 and the verifier), `shared/crypto` (the primitives), `core/boot/src/main.rs`,
 `core/boot/src/rollback.rs`, `core/boot/src/enrolment.rs`, `core/boot/src/secure_boot.rs` and
@@ -563,8 +569,9 @@ and the verifier), `shared/crypto` (the primitives), `core/boot/src/main.rs`,
   floor included ([signing.md](signing.md) § Rollback Floor); and an older signed configuration
   directory at an admitted security version verifies
   ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
-- devmgr parses drivers-directory files before procmgr verifies them (§ ELF Loading,
-  [#1533](https://github.com/kottlerg/seraph/issues/1533)).
+- The set of drivers in `/services/drivers/` is not signed, so an attacker adds, removes or rolls
+  back signed drivers there (§ ELF Loading,
+  [#1665](https://github.com/kottlerg/seraph/issues/1665)).
 - Secure Boot and a TPM are not required by the platform floor
   ([#1420](https://github.com/kottlerg/seraph/issues/1420)), and no project root key signs releases
   yet ([#1073](https://github.com/kottlerg/seraph/issues/1073)).

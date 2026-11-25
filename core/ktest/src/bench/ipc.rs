@@ -199,8 +199,10 @@ impl core::fmt::Display for Label
     }
 }
 
-/// Run every case of [`CASES`] in turn. A case that does not complete every
-/// round trip ends the benchmark: each later case logs a SKIP line.
+/// Run every case of [`CASES`] in turn, then the placement cases. A case of
+/// [`CASES`] that does not complete every round trip ends those cases: each
+/// later one logs a SKIP line. Each placement case runs on its own endpoint
+/// and children, so one that fails logs its own SKIP line and the next runs.
 pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, h: &mut Harness)
 {
     let mut failed = false;

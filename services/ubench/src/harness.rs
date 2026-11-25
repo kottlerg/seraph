@@ -4,12 +4,13 @@
 // services/ubench/src/harness.rs
 
 //! What every ubench benchmark shares: the pinning of a measuring thread, the
-//! result line it logs, and the SKIP line of a case it cannot run.
+//! span of its CPU's idle-halt count over a measured loop, the result line it
+//! logs, and the SKIP line of a case it cannot run.
 //!
 //! A benchmark returns `Err` with a reason when it fails; `main` logs that
 //! reason as the benchmark's FAIL line (services/ubench/README.md § Output).
 
-use bench::{Report, Unit, Value};
+use bench::{IDLE_HALTS, Report, Unit, Value};
 
 /// The suite of every result line ubench logs itself.
 pub const SUITE: &str = "ubench";
@@ -43,8 +44,33 @@ pub fn cpu_count() -> Result<u32, String>
     u32::try_from(count).map_err(|_| format!("CPU count {count} does not fit in u32"))
 }
 
+/// The idle-halt count of the CPU the calling thread runs on, read right
+/// before a measured loop, which [`IdleSpan::close`] reads again right after
+/// it (shared/bench/README.md § Idle halts). The thread is pinned to that CPU
+/// for the whole loop.
+pub struct IdleSpan(Option<u64>);
+
+impl IdleSpan
+{
+    /// Read the count where the measured loop begins.
+    pub fn open() -> Self
+    {
+        Self(syscall::idle_halts().ok())
+    }
+
+    /// The halts of the CPU since [`IdleSpan::open`], read where the
+    /// measured loop ends; `None` when a read failed, and the line then
+    /// carries no `idle_halts=`.
+    pub fn close(self) -> Option<u64>
+    {
+        let end = syscall::idle_halts().ok()?;
+        Some(end.wrapping_sub(self.0?))
+    }
+}
+
 /// Log the result line of `name` and `variant` over `samples`, cycles each,
-/// with `extras` after its summary.
+/// with `extras` after its summary and then `idle_halts`, the halts of the
+/// measuring CPU over the measured loop ([`IdleSpan`]), when it has them.
 ///
 /// # Errors
 /// No sample, or a report the line's rules refuse
@@ -55,9 +81,12 @@ pub fn report(
     cpus: u32,
     samples: &mut [u64],
     extras: &[(&str, u64)],
+    idle_halts: Option<u64>,
 ) -> Outcome
 {
     let summary = bench::summarize(samples).ok_or_else(|| "no sample recorded".to_string())?;
+    let mut extras = extras.to_vec();
+    extras.extend(idle_halts.map(|halts| (IDLE_HALTS, halts)));
     let report = Report {
         suite: SUITE,
         name,
@@ -65,7 +94,7 @@ pub fn report(
         cpus,
         unit: Unit::Cycles,
         summary,
-        extras,
+        extras: &extras,
     };
     let mut line = String::new();
     report

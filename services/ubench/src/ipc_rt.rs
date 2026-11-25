@@ -16,7 +16,7 @@ use bench::{Counters, Value};
 use ipc::IpcMessage;
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
-use crate::harness::{BENCH_CPU, Outcome, pin_to, report};
+use crate::harness::{BENCH_CPU, IdleSpan, Outcome, pin_to, report};
 
 /// The data-word counts measured: none, the most that may travel in
 /// registers (`MSG_REGS_DATA_MAX`, 6), the first count past it, and the
@@ -78,6 +78,7 @@ fn measure_all(ep: u64, counters: &Counters, cpus: u32) -> Outcome
             .ok_or_else(|| format!("words={words} exceeds the payload"))?;
         let msg = IpcMessage::builder(CALL).words(0, sent).build();
         samples.clear();
+        let idle = IdleSpan::open();
         for i in 0..WARMUP + ITERS
         {
             let start = counters.read();
@@ -97,12 +98,14 @@ fn measure_all(ep: u64, counters: &Counters, cpus: u32) -> Outcome
                 samples.push(cycles);
             }
         }
+        let idle_halts = idle.close();
         report(
             "ipc_rt",
             &[("words", Value::Num(words as u64))],
             cpus,
             &mut samples,
             &[],
+            idle_halts,
         )?;
     }
     Ok(())

@@ -89,10 +89,11 @@ logs one of:
 
   ```text
   bench ubench.<name> <variant> arch=<arch> cpus=<k> unit=cycles n=<n> min=<v> p50=<v>
-      p90=<v> p99=<v> max=<v> [faults=<n> backed_pages=<n>]
+      p90=<v> p99=<v> max=<v> [faults=<n> backed_pages=<n>] idle_halts=<n>
   ```
 
-  wrapped above for width only;
+  wrapped above for width only, `idle_halts=` being the halts of the measuring CPU over the
+  measured loop ([shared/bench/README.md § Idle halts](../../shared/bench/README.md#idle-halts));
 - `bench <name> SKIP (<why>)` for a case the boot cannot run (a thread count above the CPUs
   online, or no framebuffer), beside the lines of the cases it ran;
 - `bench <name> FAIL (<why>)` when the benchmark failed: a failed call, a reply of the wrong

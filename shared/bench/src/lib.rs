@@ -27,6 +27,6 @@ pub use arch::current::ARCH;
 #[cfg(feature = "counters")]
 pub use counters::{Counters, EVENT_SLOTS, Reading};
 pub use line::{
-    LineError, ParseError, Parsed, RESERVED_KEYS, Report, TAG, Unit, Value, parse_line,
+    IDLE_HALTS, LineError, ParseError, Parsed, RESERVED_KEYS, Report, TAG, Unit, Value, parse_line,
 };
 pub use stats::{Samples, Summary, summarize};

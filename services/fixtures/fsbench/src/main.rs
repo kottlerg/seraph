@@ -50,7 +50,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use bench::{Counters, Report, Unit, Value};
+use bench::{Counters, IDLE_HALTS, Report, Unit, Value};
 
 mod open;
 
@@ -195,6 +195,7 @@ fn measure(f: &mut File, size: u64, read_path: ReadPath, buf: &mut [u8], run: &B
     }
 
     let mut samples = Vec::with_capacity(run.read_iters as usize);
+    let idle = IdleSpan::open();
     for _ in 0..run.read_iters
     {
         let start = run.counters.read();
@@ -206,13 +207,45 @@ fn measure(f: &mut File, size: u64, read_path: ReadPath, buf: &mut [u8], run: &B
         );
         samples.push(elapsed);
     }
+    let idle_halts = idle.close();
     let summary = bench::summarize(&mut samples).expect("the iteration count is positive");
-    log_line("read", size, path, run, summary);
+    log_line("read", size, path, run, (summary, idle_halts));
 }
 
-/// Log the result line of `fsbench.<name> size=<size> path=<path>`.
-fn log_line(name: &str, size: u64, path: &str, run: &Bench, summary: bench::Summary)
+/// The idle-halt count of [`BENCH_CPU`], read right before a timed loop,
+/// which [`IdleSpan::close`] reads again right after it
+/// (shared/bench/README.md § Idle halts).
+struct IdleSpan(Option<u64>);
+
+impl IdleSpan
 {
+    /// Read the count where the timed loop begins.
+    fn open() -> Self
+    {
+        Self(syscall::idle_halts().ok())
+    }
+
+    /// The halts of the CPU since [`IdleSpan::open`]; `None` when a read
+    /// failed, and the line then carries no `idle_halts=`.
+    fn close(self) -> Option<u64>
+    {
+        let end = syscall::idle_halts().ok()?;
+        Some(end.wrapping_sub(self.0?))
+    }
+}
+
+/// The extras of a line whose timed loop saw `idle_halts`: `idle_halts=`
+/// alone, or none when the count was not read.
+fn idle_extras(idle_halts: Option<u64>) -> Vec<(&'static str, u64)>
+{
+    idle_halts.map(|h| (IDLE_HALTS, h)).into_iter().collect()
+}
+
+/// Log the result line of `fsbench.<name> size=<size> path=<path>`, its
+/// summary and the halts of its timed loop given in `measured`.
+fn log_line(name: &str, size: u64, path: &str, run: &Bench, measured: (bench::Summary, Option<u64>))
+{
+    let (summary, idle_halts) = measured;
     let report = Report {
         suite: "fsbench",
         name,
@@ -220,7 +253,7 @@ fn log_line(name: &str, size: u64, path: &str, run: &Bench, summary: bench::Summ
         cpus: run.cpus,
         unit: Unit::Cycles,
         summary,
-        extras: &[],
+        extras: &idle_extras(idle_halts),
     };
     let mut line = String::new();
     report
@@ -266,14 +299,16 @@ fn measure_writes(page: &[u8], run: &Bench)
             write_pages(&mut f, size, page);
         }
         let mut samples = Vec::with_capacity(run.write_iters as usize);
+        let idle = IdleSpan::open();
         for _ in 0..run.write_iters
         {
             let start = run.counters.read();
             write_pages(&mut f, size, page);
             samples.push(run.counters.read().since(&start).cycles);
         }
+        let idle_halts = idle.close();
         let summary = bench::summarize(&mut samples).expect("the iteration count is positive");
-        log_line("write", size, "frame", run, summary);
+        log_line("write", size, "frame", run, (summary, idle_halts));
     }
 
     verify_written(&mut f, largest, page);

@@ -16,7 +16,7 @@ use std::fs::File;
 
 use bench::{Report, Unit, Value};
 
-use crate::{Bench, WARMUP_ITERS};
+use crate::{Bench, IdleSpan, WARMUP_ITERS, idle_extras};
 
 /// The path the case opens: three components, every one on the root
 /// filesystem.
@@ -35,6 +35,7 @@ pub(crate) fn measure(run: &Bench)
     }
 
     let mut samples = Vec::with_capacity(run.read_iters as usize);
+    let idle = IdleSpan::open();
     for _ in 0..run.read_iters
     {
         let lookups = std::os::seraph::fs::ns_lookup_calls();
@@ -49,6 +50,7 @@ pub(crate) fn measure(run: &Bench)
         );
         samples.push(elapsed);
     }
+    let idle_halts = idle.close();
     let summary = bench::summarize(&mut samples).expect("measure_iters returns a positive count");
 
     let report = Report {
@@ -58,7 +60,7 @@ pub(crate) fn measure(run: &Bench)
         cpus: run.cpus,
         unit: Unit::Cycles,
         summary,
-        extras: &[],
+        extras: &idle_extras(idle_halts),
     };
     let mut line = String::new();
     report

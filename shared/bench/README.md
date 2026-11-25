@@ -84,7 +84,7 @@ The line is a single line of space-separated tokens, wrapped above for width onl
 | `cpus=` | CPUs the system runs |
 | `unit=` | The counter the samples were read from: `cycles` or `insns` (instructions retired) |
 | `n=` to `max=` | The summary of the samples |
-| Extras | Further measurements of the run (`tlb_elided=`, `workers=`); after `max=` |
+| Extras | Further measurements of the run (`tlb_elided=`, `workers=`, `idle_halts=` of § Idle halts); after `max=` |
 
 The suite, the name and the variant parameters identify a measurement: a comparison of two runs
 pairs their lines by them, and compares the columns from `arch=` on. The extras are measured
@@ -101,6 +101,38 @@ reads a line with any prefix before the `bench` token (a log timestamp, a proces
 whose `bench` token, standing as a word, is followed by a token with a `.` carries a result
 line, which parses or returns the first rule it breaks; any other line returns `Ok(None)`, so a
 whole log can be scanned. A program logs no other text of the form `bench <word>.<word>`.
+
+---
+
+## Idle halts
+
+Under QEMU's icount (`cargo xtask run --icount`) a timed window that idles counts host time: while
+every vCPU idles, the guest's clock follows the host's
+([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)). Every harness
+therefore reads the idle-halt count of the CPU it measures on (`SYS_SYSTEM_INFO(IdleHalts)`,
+`syscall::idle_halts`, which answers for the calling CPU alone) right before a measured loop and
+right after it, outside every timed window, with the thread pinned to that CPU across both reads,
+and reports the difference as the extra `idle_halts=` (`IDLE_HALTS`): the times the CPU found no
+thread to run while the loop ran.
+
+The span holds every timed window of the line and the untimed work of the loop between them (a
+warm-up iteration, a check, a step that readies the next sample). A count of zero says that no
+window idled; a count above zero says that a window, or the untimed work beside it, waited with
+the CPU idle. `cargo xtask bench-check` fails a gating measurement whose line reports a halt, or
+no count
+([xtask/README.md § `cargo xtask bench-check`](../../xtask/README.md#cargo-xtask-bench-check)),
+and reports the count of every other: a benchmark that idles by design (`ICOUNT_IO_BOUND`), a
+measurement at more than one CPU, where only the measuring CPU's halts are counted, and host mode,
+where a count says that the loop waited on an event.
+
+| Harness | Span | CPU |
+|---|---|---|
+| [ktest](../../core/ktest/README.md) Tier 3 | `Harness::recorder`, taken right before the loop, to its `Recorder::summary`, right after | CPU 0 |
+| [ubench](../../services/ubench/README.md) | `IdleSpan::open` and `close` around each loop, its warm-up iterations included; in `fault_scaling`, each worker around its own loop, the line summing them | `BENCH_CPU` (0); each worker's CPU |
+| [fsbench](../../services/fixtures/fsbench/README.md) | Around each timed loop, after its warm-up | CPU 0 |
+
+A line whose samples other threads took on their own CPUs (`ktest.tlb_shootdown_concurrent`)
+carries no count.
 
 ---
 

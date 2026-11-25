@@ -15,7 +15,7 @@
 use bench::{Counters, Value};
 use shmem::{SpscHeader, SpscReader, SpscWriter};
 
-use crate::harness::{Outcome, report};
+use crate::harness::{IdleSpan, Outcome, report};
 
 /// The ring's data capacity: the stdio pipe's (`RING_CAPACITY` in
 /// `runtime/ruststd/src/sys/pipe/seraph.rs`).
@@ -63,6 +63,7 @@ pub fn run(counters: &Counters, cpus: u32) -> Outcome
             return Err(format!("bytes={bytes} exceeds the buffers"));
         };
         samples.clear();
+        let idle = IdleSpan::open();
         for i in 0..WARMUP + ITERS
         {
             dst.fill(0);
@@ -80,12 +81,14 @@ pub fn run(counters: &Counters, cpus: u32) -> Outcome
                 samples.push(cycles);
             }
         }
+        let idle_halts = idle.close();
         report(
             "shmem_ring",
             &[("bytes", Value::Num(bytes as u64))],
             cpus,
             &mut samples,
             &[],
+            idle_halts,
         )?;
     }
     // The ring's writer and reader borrow `region` without a lifetime the

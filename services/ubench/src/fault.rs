@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use bench::{Counters, Value};
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
-use crate::harness::{Outcome, cpu_count, pin_to, report, skip};
+use crate::harness::{IdleSpan, Outcome, cpu_count, pin_to, report, skip};
 
 /// Pages in one chunk: `DEMAND_CHUNK_PAGES`.
 const CHUNK_PAGES: u64 = 16;
@@ -78,6 +78,7 @@ fn fill_by_fault(counters: &Counters, cpus: u32) -> Outcome
     let mut faults = 0u64;
     let mut backed_pages = 0u64;
     let mut charged = charged_pages();
+    let idle = IdleSpan::open();
     for chunk in 0..TOTAL_CHUNKS
     {
         let va = chunk_va(base, chunk);
@@ -100,6 +101,7 @@ fn fill_by_fault(counters: &Counters, cpus: u32) -> Outcome
             }
         }
     }
+    let idle_halts = idle.close();
     // SAFETY: no reference into the region outlives the stores above, and the
     // IPC buffer lies outside it.
     let released = unsafe { unregister_demand_paged(region) }
@@ -111,6 +113,7 @@ fn fill_by_fault(counters: &Counters, cpus: u32) -> Outcome
         cpus,
         &mut samples,
         &[("faults", faults), ("backed_pages", backed_pages)],
+        idle_halts,
     )?;
     released
 }
@@ -149,6 +152,7 @@ fn fill_by_grant(counters: &Counters, cpus: u32) -> Outcome
         .map_err(|e| format!("path=grant: reserve the chunks' pages: {e:?}"))?;
     let base = reservation.va_start();
     let mut samples = Vec::with_capacity(CHUNKS_LEN);
+    let idle = IdleSpan::open();
     for chunk in 0..TOTAL_CHUNKS
     {
         let va = chunk_va(base, chunk);
@@ -170,12 +174,14 @@ fn fill_by_grant(counters: &Counters, cpus: u32) -> Outcome
             samples.push(cycles);
         }
     }
+    let idle_halts = idle.close();
     report(
         "fault_fill",
         &[("path", Value::Word("grant")), PAGES],
         cpus,
         &mut samples,
         &[],
+        idle_halts,
     )
 }
 
@@ -202,8 +208,9 @@ fn request_contiguous(memmgr_ep: u64, pages: u64) -> Option<u64>
 /// `fault_scaling`: for each thread count k of [`SCALING_THREADS`] that the
 /// system has CPUs for, k threads, thread i pinned to CPU i with its own
 /// counters and its own demand region, fault their chunks at once. The line
-/// of k holds every thread's timed samples. A count above the CPUs online
-/// logs a SKIP line.
+/// of k holds every thread's timed samples, and as `idle_halts=` the halts of
+/// every thread's CPU over that thread's measured loop, summed. A count above
+/// the CPUs online logs a SKIP line.
 pub fn scaling(cpus: u32) -> Outcome
 {
     for threads in SCALING_THREADS
@@ -216,13 +223,15 @@ pub fn scaling(cpus: u32) -> Outcome
             );
             continue;
         }
-        let mut samples = scale(threads).map_err(|e| format!("threads={threads}: {e}"))?;
+        let (mut samples, idle_halts) =
+            scale(threads).map_err(|e| format!("threads={threads}: {e}"))?;
         report(
             "fault_scaling",
             &[("threads", Value::Num(u64::from(threads))), PAGES],
             cpus,
             &mut samples,
             &[],
+            idle_halts,
         )?;
     }
     Ok(())
@@ -282,8 +291,9 @@ impl Gate
 }
 
 /// Run one thread count: spawn its workers, start them together, and merge
-/// their samples.
-fn scale(threads: u32) -> Result<Vec<u64>, String>
+/// their samples and the idle halts of their CPUs over their measured loops,
+/// the halts `None` when a worker's read failed.
+fn scale(threads: u32) -> Result<(Vec<u64>, Option<u64>), String>
 {
     let gate = Arc::new(Gate {
         state: Mutex::new((0, Signal::Wait)),
@@ -321,12 +331,17 @@ fn scale(threads: u32) -> Result<Vec<u64>, String>
         },
     );
     let mut merged = Vec::with_capacity(workers.len().saturating_mul(CHUNKS_LEN));
+    let mut idle_halts = Some(0u64);
     let mut first_error = spawn_error;
     for worker in workers
     {
         match worker.join()
         {
-            Ok(Ok(samples)) => merged.extend(samples),
+            Ok(Ok((samples, halts))) =>
+            {
+                merged.extend(samples);
+                idle_halts = idle_halts.zip(halts).map(|(sum, h)| sum.saturating_add(h));
+            }
             Ok(Err(e)) => _ = first_error.get_or_insert(e),
             Err(_) => _ = first_error.get_or_insert_with(|| "a worker panicked".to_string()),
         }
@@ -334,17 +349,18 @@ fn scale(threads: u32) -> Result<Vec<u64>, String>
     match first_error
     {
         Some(e) => Err(e),
-        None => Ok(merged),
+        None => Ok((merged, idle_halts)),
     }
 }
 
 /// One worker of `fault_scaling`: pinned to `cpu`, with counters opened
 /// there and a demand region of its own, it faults its chunks once the gate
-/// opens and returns its timed samples.
+/// opens and returns its timed samples and the halts of its CPU over its
+/// measured loop ([`IdleSpan`]).
 ///
 /// It arrives at the gate whatever its set-up's outcome, so a failed set-up
 /// never holds the others back; it reports the failure after the gate.
-fn fault_worker(cpu: u32, gate: &Gate) -> Result<Vec<u64>, String>
+fn fault_worker(cpu: u32, gate: &Gate) -> Result<(Vec<u64>, Option<u64>), String>
 {
     let setup = pin_to(cpu).and_then(|()| {
         // The CPU count bounds `cpu`: a worker past it would not run there.
@@ -368,6 +384,7 @@ fn fault_worker(cpu: u32, gate: &Gate) -> Result<Vec<u64>, String>
     }
     let base = region.va_start();
     let mut samples = Vec::with_capacity(CHUNKS_LEN);
+    let idle = IdleSpan::open();
     for chunk in 0..TOTAL_CHUNKS
     {
         let va = chunk_va(base, chunk);
@@ -382,9 +399,10 @@ fn fault_worker(cpu: u32, gate: &Gate) -> Result<Vec<u64>, String>
             samples.push(cycles);
         }
     }
+    let idle_halts = idle.close();
     // SAFETY: no reference into the region outlives the stores above, and the
     // IPC buffer lies outside it.
     unsafe { unregister_demand_paged(region) }
         .map_err(|e| format!("CPU {cpu}: unregister the demand region: {e}"))?;
-    Ok(samples)
+    Ok((samples, idle_halts))
 }

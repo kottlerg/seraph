@@ -301,7 +301,8 @@ top is page-aligned, and the kernel is entered with the stack pointer at that to
 (step 10). The bootloader fills the stack with `STACK_PAINT` and writes
 `HANDOFF_STACK_BASE_MARK` at its lowest word. The kernel relies on both for its stack depth
 report: it rounds its entry stack pointer up to a page to find the stack's top, confirms the
-bottom by the mark, and measures the deepest use as the lowest word no longer painted
+bottom by the mark, and measures the deepest use from the lowest word no longer painted that
+its depth scan finds
 ([memory-internals.md](../../kernel/docs/memory-internals.md#kernel-stack-depth) § Kernel
 Stack Depth).
 

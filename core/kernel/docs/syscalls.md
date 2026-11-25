@@ -3703,7 +3703,8 @@ pub enum SystemInfoType
     UserVaTop           = 8,
 
     /// Deepest use, in bytes, of the kernel stack class in arg1, measured from
-    /// the paint the stack was filled with at allocation
+    /// the paint the stack was filled with at allocation, a lower bound on the
+    /// depth reached within the limit of the scan
     /// ([memory-internals.md](memory-internals.md) § Kernel Stack Depth):
     /// `STACK_CLASS_IDLE` — the deepest idle stack, scanned at the call;
     /// `STACK_CLASS_THREAD` — the deepest of every freed thread's kernel stack

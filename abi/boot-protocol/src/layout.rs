@@ -64,7 +64,7 @@ pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
 pub const HANDOFF_STACK_BYTES: usize = 64 * 1024;
 
 /// Word every idle, thread, and handoff stack is filled with when it is allocated, so the
-/// deepest use of a stack is the lowest word that no longer holds it. The
+/// deepest use of a stack is measured from the lowest word that no longer holds it. The
 /// bootloader paints the handoff stack with it, and the kernel paints its
 /// idle and thread stacks (core/kernel/docs/memory-internals.md § Kernel
 /// Stack Depth). A diagnostic convention, not a layout field.

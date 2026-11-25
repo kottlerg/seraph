@@ -52,6 +52,29 @@ pub fn halt_until_interrupt()
 
 // ── Stack and memory sampling ─────────────────────────────────────────────────
 
+/// Store `value` to each of the `words` 8-byte words from `p` up, eight
+/// stores to each 64-byte line, so the loop's own instructions are one
+/// increment and one branch per line. Used by the kernel stack paint
+/// (`crate::stack_depth::paint`).
+///
+/// # Safety
+/// `[p, p + words * 8)` is writable, 8-byte aligned, and the caller's alone.
+pub unsafe fn fill_words(p: *mut u64, words: usize, value: u64)
+{
+    // SAFETY: per the contract the span is valid for writes of `words`
+    // aligned words and no other reference reaches it during the call.
+    let span = unsafe { core::slice::from_raw_parts_mut(p, words) };
+    let (lines, rest) = span.as_chunks_mut::<8>();
+    for line in lines
+    {
+        *line = [value; 8];
+    }
+    for word in rest
+    {
+        *word = value;
+    }
+}
+
 /// Load one word that another CPU may be writing concurrently, as an opaque
 /// machine load the compiler neither elides nor reasons about.
 ///

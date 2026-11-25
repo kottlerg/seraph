@@ -1557,7 +1557,7 @@ Build the fuzz targets with coverage instrumentation and run them under the in-t
 ([docs/testing.md](../docs/testing.md#fuzzing) § Fuzzing gives the tier, its layout and its rules).
 
 ```
-cargo xtask fuzz <TARGET>|--all [--runs N | --time SECS] [--seed S]
+cargo xtask fuzz <TARGET>|--all [--runs N [--cap SECS] | --time SECS] [--seed S]
 cargo xtask fuzz <TARGET> --replay FILE
 cargo xtask fuzz <TARGET>|--all --minimize
 cargo xtask fuzz --list
@@ -1570,6 +1570,7 @@ cargo xtask fuzz --self-test
 | `--all` | Every target in turn, each whatever another's outcome; fails naming those that found a failing input |
 | `--runs N` | Stop after N executions (default 200,000, the gating CI job's count) |
 | `--time SECS` | Stop after SECS seconds instead |
+| `--cap SECS` | Stop a target whose run of an execution count takes more than SECS seconds of wall-clock time and fail it as over the cap (default 1200, `DEFAULT_CAP_SECS`, for a run of the default count; none for a run of `--runs`) |
 | `--seed S` | The seed of the engine's random choices (default 0) |
 | `--replay FILE` | Run the property once on FILE: 0 when it holds, non-zero when it fails |
 | `--minimize` | Reduce the target's working corpus to a subset of its inputs with the same coverage, the shorter inputs kept first |
@@ -1591,6 +1592,12 @@ failing input, minimized, beside its `.txt` report. A target binary runs the sea
 of itself and catches the endings no panic catch can: a signal, an AddressSanitizer report (exit
 73), the allocation cap of 2 GiB (exit 72), and an input that runs past 10 seconds (exit 71); it
 reports each, and minimizes all but a timeout by replaying candidates in fresh processes.
+
+A run of an execution count under a cap runs each target binary in a process group of its own.
+At the cap the command kills the group, the search the binary supervises with it, prints
+`fuzz: <target>: over the <SECS> s cap`, and goes on with the next target; it then fails naming
+every target over the cap beside those that found a failing input. The default count's cap is the
+gating CI job's per-target budget ([docs/testing.md](../docs/testing.md#fuzzing) § Fuzzing, Time).
 
 `--self-test` runs the planted targets `planted-magic`, `planted-length` and `planted-nested`
 from clean working directories, each from seed 0 within its budget in `src/commands/fuzz.rs`
@@ -1667,8 +1674,13 @@ unsuccessfully, when a harness's verdict is not `SUCCESSFUL`, when a harness has
 check or a `FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's
 verdict names), and when Kani's closing summary is missing, counts a failure or no harness, or
 counts other harnesses than reported a verdict; a harness that Kani starts and prints no verdict for
-fails too. Every selected crate runs, and the command then prints a table of every harness, by
-package and path, with its verdict and verification time, and fails naming each crate that failed.
+fails too. Kani stops each harness's CBMC after `HARNESS_TIME_LIMIT_SECS` (600 s) of
+wall-clock time, given as its unstable `--harness-timeout` (with `-Z unstable-options`), and goes
+on with the next harness; the command fails such a harness as over budget, naming it and the limit
+([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification). Every
+selected crate runs, and the command then prints a table of every harness, by package and path,
+with its verdict and verification time, then the same table of the ten slowest, slowest first, and
+fails naming each crate that failed.
 
 CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the base its `select` job
 found, with `cargo xtask cells --since-covered` on a pull request and `--since-green` on a push to

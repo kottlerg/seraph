@@ -2331,9 +2331,17 @@ fails as the search did, on any host. The run exits non-zero.
 
 | Tier | Where | When | Runs |
 |---|---|---|---|
-| Gating | CI, the `fuzz` job of `build-test.yml` | a change that can affect a crate it fuzzes, its engine, xtask or the workflows; skipped as not owed otherwise | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
-| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, from a seed that changes each run, over the checked-in inputs and the working corpus of an earlier run when the Actions cache still holds one; failing inputs upload as an artifact |
+| Gating | CI, the `fuzz` job of `build-test.yml` | a change that can affect a crate it fuzzes, its engine, xtask or the workflows; skipped as not owed otherwise | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone, each under a wall-clock cap of 20 minutes |
+| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, one job per target side by side, from a seed that changes each run, over the checked-in inputs and the target's working corpus of an earlier run when the Actions cache still holds one; failing inputs upload as an artifact |
 | Local | developer host | at will | `cargo xtask fuzz <target>` with `--runs` or `--time` |
+
+**Time.** The gating run's time is a stated budget. Each target's run of the default count is
+capped at 20 minutes of wall-clock time (`DEFAULT_CAP_SECS`), about two and a half times the
+slowest target's run in the gating job (about 8 minutes, of a job of about 17); a target past the
+cap is stopped and fails the job, named as over the cap, and is a defect of the target or of its
+property, made faster before it merges: a property whose checks grow faster than the input,
+over inputs of up to the target's longest, is the usual cause. The job's `timeout-minutes` is the
+backstop for the rest, and every fuzz job sets one.
 
 The self-test runs the engine on planted defects in `xtask/fuzz/targets` (an eight-byte magic
 compared as one integer, a length field whose add overflows, and a state reached only through
@@ -2370,8 +2378,9 @@ release ([build-system.md](build-system.md#toolchain) § Toolchain). It fails on
 undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a
 harness that lies in no package. It finds the crates from their harnesses, so a crate's first
 harness adds it to the run. It holds each process of the run to the address space CI's runner can
-give a harness, so a harness that needs more fails, named as out of memory, and it closes with
-every harness's verdict and verification time.
+give a harness, so a harness that needs more fails, named as out of memory; it stops each
+harness at a wall-clock time limit, so a harness that runs past it fails, named as over budget;
+and it closes with every harness's verdict and verification time, then the ten slowest.
 
 **Where the proofs run.** On a pull request, CI's `kani` job verifies only the crates the change can
 affect (`cargo xtask kani --since` against the base the `select` job found, the newest commit before
@@ -2400,15 +2409,27 @@ repository](https://docs.github.com/en/actions/reference/runners/github-hosted-r
 leaves 4 GB to the runner's own processes, so a harness that fits under it locally fits on the
 runner. A run that the limit ends (an allocation failure, or a process killed)
 or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
-still cover the property or by the induction form of the parser proofs below. A harness is
-also sized to finish well within CI's `kani` job, whose timeout, GitHub's default for a job, is
-the backstop, and is made to fit the same way when it does not. A failed,
+still cover the property or by the induction form of the parser proofs below. Beside the memory
+limit, each harness has a time limit: the command stops a harness's CBMC after 10 minutes of
+wall-clock time (`HARNESS_TIME_LIMIT_SECS`) and fails it as over budget. The limit is a backstop
+set from the measured full run on CI's runner below, not a bound a harness is sized to: a harness
+over it is a defect of the harness, made to fit the same way, by a narrower bound or a split into
+harnesses that together cover the property. Every `kani` job sets a `timeout-minutes`, the
+backstop for the rest. A failed,
 undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
 or the harness, fixed as such, and MUST NOT be bounded away. The PR body's `## Validation`
 section states, for each such harness, the verification time Kani reports, the peak resident
 memory of the run (the maximum resident set size of its largest process, as GNU `time -v`
 reports it), and the unwind bounds the harness carries. This run is owed whatever § Coverage
 tiers owes, since a harness change is inert there.
+
+**Measured time.** The whole set, 148 harnesses at `master` 3b95662c0, took 84 minutes in one
+`kani` job on CI's runner (run 45719550314), the harnesses' own verification times summing to 82
+minutes. Its slowest harness, devmgr-firmware's proof of the small AML resource descriptors, took
+29 minutes as one CBMC problem and is four harnesses, one per descriptor. The next slowest took
+235 s. The time limit of 10 minutes is about two and a half times that: room for a slower runner,
+and a harness past it costs the run no more than the limit. The `timeout-minutes` of 120 on each
+`kani` job holds the whole set with about 40 per cent to spare.
 
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
 tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches

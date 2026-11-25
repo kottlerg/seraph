@@ -295,3 +295,23 @@ mod tests
         }
     }
 }
+
+/// Bounded proofs of the certificate's parse (docs/testing.md § Bounded
+/// verification, Parser proofs). A certificate is of one length, read at
+/// fixed offsets, so one proof covers every input.
+#[cfg(kani)]
+mod proofs
+{
+    use super::LEN;
+    use crate::property;
+
+    /// Every certificate's 5,409 bytes hold the certificate's contract. No
+    /// loop but the compare of the 16-byte domain tag.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_certificate_holds_the_certificate_contract()
+    {
+        let bytes: [u8; LEN] = kani::any();
+        let _ = property::certificate_holds(&bytes);
+    }
+}

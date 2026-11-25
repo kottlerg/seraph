@@ -22,8 +22,8 @@
 use core::cmp::Ordering;
 
 use crate::store::{
-    ANCHOR_LEN, Anchor, AnchorSpec, TrustStore, anchor_key, decode_anchor, label_is_valid,
-    put_anchor,
+    ANCHOR_LEN, Anchor, AnchorSpec, TrustStore, anchor_checks, anchor_parts, ascending, decoded,
+    in_order, label_is_valid, put_anchor, raw_key_id,
 };
 use crate::wire::{Reader, Writer};
 use crate::{EncodeError, KEY_ID_LEN, KeyId, StoreError, key_id};
@@ -85,10 +85,10 @@ pub enum EnrolError
 
 /// The anchors and revoked key ids of a parsed blob.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Lists<'a>
+pub(crate) struct Lists<'a>
 {
-    anchors: &'a [[u8; ANCHOR_LEN]],
-    revoked: &'a [KeyId],
+    pub(crate) anchors: &'a [[u8; ANCHOR_LEN]],
+    pub(crate) revoked: &'a [KeyId],
 }
 
 impl<'a> Lists<'a>
@@ -96,49 +96,21 @@ impl<'a> Lists<'a>
     /// Parse and check a blob of either format, begun by `magic`.
     fn parse(bytes: &'a [u8], magic: [u8; 8]) -> Result<Self, EnrolError>
     {
-        let mut reader = Reader::new(bytes);
-        let found = reader.array::<8>().ok_or(EnrolError::Length)?;
-        let version = reader.u16().ok_or(EnrolError::Length)?;
-        let anchor_count = reader.u16().ok_or(EnrolError::Length)?;
-        let revoked_count = reader.u16().ok_or(EnrolError::Length)?;
-        if found != magic
-        {
-            return Err(EnrolError::Magic);
-        }
-        if version != VERSION
-        {
-            return Err(EnrolError::Version);
-        }
-        let anchors_len = usize::from(anchor_count)
-            .checked_mul(ANCHOR_LEN)
-            .ok_or(EnrolError::Length)?;
-        let anchors = reader.take(anchors_len).ok_or(EnrolError::Length)?;
-        let revoked = reader.rest();
-        if Some(revoked.len()) != usize::from(revoked_count).checked_mul(KEY_ID_LEN)
-        {
-            return Err(EnrolError::Length);
-        }
-        let (anchors, _) = anchors.as_chunks::<ANCHOR_LEN>();
-        let (revoked, _) = revoked.as_chunks::<KEY_ID_LEN>();
-
+        let lists = lists_layout(bytes, magic)?;
         let mut previous: Option<KeyId> = None;
-        for raw in anchors
+        for raw in lists.anchors
         {
-            let anchor = decode_anchor(raw).map_err(EnrolError::Anchor)?;
-            if previous.is_some_and(|id| id >= anchor.key_id)
-            {
-                return Err(EnrolError::AnchorOrder);
-            }
-            previous = Some(anchor.key_id);
+            let (_, usage, flags, label) = anchor_parts(raw)
+                .ok_or(StoreError::Length)
+                .map_err(anchor_error)?;
+            anchor_checks(usage, flags, label).map_err(anchor_error)?;
+            previous = Some(in_order(previous, raw_key_id(raw)).map_err(anchor_error)?);
         }
-        if revoked
-            .windows(2)
-            .any(|pair| matches!(pair, [a, b] if a >= b))
+        if !ascending(lists.revoked)
         {
             return Err(EnrolError::RevokedOrder);
         }
-        let lists = Self { anchors, revoked };
-        if keyed(anchors).any(|(id, _)| lists.is_revoked(&id))
+        if keyed(lists.anchors).any(|(id, _)| lists.is_revoked(&id))
         {
             return Err(EnrolError::RevokedAnchor);
         }
@@ -147,8 +119,7 @@ impl<'a> Lists<'a>
 
     fn anchors(&self) -> impl Iterator<Item = Anchor<'a>> + use<'a>
     {
-        let anchors: &'a [[u8; ANCHOR_LEN]] = self.anchors;
-        anchors.iter().filter_map(|raw| decode_anchor(raw).ok())
+        decoded(self.anchors)
     }
 
     fn anchor(&self, id: &KeyId) -> Option<Anchor<'a>>
@@ -156,16 +127,67 @@ impl<'a> Lists<'a>
         self.anchors().find(|anchor| anchor.key_id == *id)
     }
 
-    fn is_revoked(&self, id: &KeyId) -> bool
+    pub(crate) fn is_revoked(&self, id: &KeyId) -> bool
     {
         self.revoked.binary_search(id).is_ok()
     }
 }
 
-/// The key id of an anchor's encoding.
-fn raw_key_id(raw: &[u8; ANCHOR_LEN]) -> KeyId
+/// Read the header of a blob of either format, begun by `magic`, and cut
+/// it into its anchors and its revoked key ids.
+///
+/// # Errors
+///
+/// `Length`, `Magic` or `Version`, as [`EnrolledStore::parse`] orders
+/// them.
+pub(crate) fn lists_layout(bytes: &[u8], magic: [u8; 8]) -> Result<Lists<'_>, EnrolError>
 {
-    anchor_key(raw).map_or([0; KEY_ID_LEN], key_id)
+    let mut reader = Reader::new(bytes);
+    let found = reader.array::<8>().ok_or(EnrolError::Length)?;
+    let version = reader.u16().ok_or(EnrolError::Length)?;
+    let anchor_count = reader.u16().ok_or(EnrolError::Length)?;
+    let revoked_count = reader.u16().ok_or(EnrolError::Length)?;
+    if found != magic
+    {
+        return Err(EnrolError::Magic);
+    }
+    if version != VERSION
+    {
+        return Err(EnrolError::Version);
+    }
+    let anchors_len = usize::from(anchor_count)
+        .checked_mul(ANCHOR_LEN)
+        .ok_or(EnrolError::Length)?;
+    let anchors = reader.take(anchors_len).ok_or(EnrolError::Length)?;
+    let revoked = reader.rest();
+    if Some(revoked.len()) != usize::from(revoked_count).checked_mul(KEY_ID_LEN)
+    {
+        return Err(EnrolError::Length);
+    }
+    let (anchors, _) = anchors.as_chunks::<ANCHOR_LEN>();
+    let (revoked, _) = revoked.as_chunks::<KEY_ID_LEN>();
+    Ok(Lists { anchors, revoked })
+}
+
+/// The error of a blob of either format for the trust store's error of one
+/// of its anchors ([`anchor_parts`], [`anchor_checks`], [`in_order`]).
+pub(crate) fn anchor_error(error: StoreError) -> EnrolError
+{
+    if error == StoreError::AnchorOrder
+    {
+        EnrolError::AnchorOrder
+    }
+    else
+    {
+        EnrolError::Anchor(error)
+    }
+}
+
+/// Whether an enrolled store of these lists holds at most [`MAX_ANCHORS`]
+/// anchors and [`MAX_REVOKED`] revoked key ids.
+pub(crate) const fn within_bound(lists: &Lists<'_>) -> bool
+{
+    lists.anchors.len() <= MAX_ANCHORS && lists.revoked.len() <= MAX_REVOKED
 }
 
 /// The anchors of `raw` with their key ids.
@@ -281,7 +303,7 @@ impl<'a> EnrolledStore<'a>
     pub fn parse(bytes: &'a [u8]) -> Result<Self, EnrolError>
     {
         let lists = Lists::parse(bytes, STORE_MAGIC)?;
-        if lists.anchors.len() > MAX_ANCHORS || lists.revoked.len() > MAX_REVOKED
+        if !within_bound(&lists)
         {
             return Err(EnrolError::Bound);
         }
@@ -1110,5 +1132,115 @@ mod tests
         assert!(!RoleSet::of(&[Role::Enrolment, Role::Data]).is_signable());
         assert!(crate::name_is_canonical(REQUEST_NAME));
         assert!(!crate::name_is_install_path(REQUEST_NAME));
+    }
+}
+
+/// Bounded proofs of the enrolled store's and the trust request's parse
+/// (docs/testing.md § Bounded verification, Parser proofs), each on every
+/// input up to the bounds its comment states.
+///
+/// How they compose into the property's checks of [`EnrolledStore::parse`]
+/// and [`TrustRequest::parse`] (`property::enrolled_store_holds`,
+/// `property::trust_request_holds`). Both parse with `Lists::parse`, whose
+/// walk of the anchors takes the trust store's step ([`anchor_parts`],
+/// [`anchor_checks`], [`in_order`]), proven by induction in `store.rs`
+/// with the order of the revoked key ids; here
+/// the layout proof shows that the walk starts on the lists the header
+/// gives, the error proof that a step's refusal becomes the blob's, and the
+/// lookup and bound proofs check the revoked lookup the last check makes and
+/// the enrolled store's bound. What lies outside the proofs is
+/// `Lists::parse` and the two `parse` functions, which drive these checks
+/// in their order, the lookups' loop over the anchors (`decoded` in
+/// `store.rs`), and the SHA-512 key id each anchor is walked and looked up
+/// by, which no proof may stub (docs/coding-standards.md § Proof
+/// Harnesses); the fuzz target `objsig`, the replay of the checked-in
+/// inputs and the unit tests check them.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{ANCHOR_LEN, Lists, MAX_ANCHORS, MAX_REVOKED, REQUEST_MAGIC, STORE_MAGIC};
+    use crate::{KeyId, StoreError, property};
+
+    /// Every blob of at most 2,055 bytes, begun by either format's magic or
+    /// another, holds the layout's contract: 2,055 bytes hold the header (14
+    /// bytes), an anchor (2,024), a revoked key id (16) and one byte more,
+    /// so each refusal of the header, a length short of and past what the
+    /// counts give, and a blob laid out are reached. No loop: the lists are
+    /// cut by length.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_blob_lays_out_as_its_header_says()
+    {
+        let bytes: [u8; 2055] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let magic = if kani::any()
+        {
+            STORE_MAGIC
+        }
+        else
+        {
+            REQUEST_MAGIC
+        };
+        let _ = property::lists_layout_holds(&bytes[..len], magic);
+    }
+
+    /// Every error of an anchor's step maps to the error of a blob as the
+    /// reading does: `AnchorOrder` to the blob's own, any other within
+    /// `Anchor`.
+    #[kani::proof]
+    fn every_anchor_error_maps_to_the_blobs()
+    {
+        let errors = [
+            StoreError::Length,
+            StoreError::Magic,
+            StoreError::Version,
+            StoreError::NoAnchor,
+            StoreError::AnchorUsage,
+            StoreError::AnchorFlags,
+            StoreError::Label,
+            StoreError::AnchorOrder,
+            StoreError::RevokedOrder,
+        ];
+        let index: usize = kani::any();
+        kani::assume(index < errors.len());
+        let _ = property::anchor_error_holds(errors[index]);
+    }
+
+    /// Every key id is found among up to 3 ascending revoked key ids exactly
+    /// when it is one of them: 3 ids are two halvings of the binary search,
+    /// and the ids before, between and after each are reached.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_key_id_is_found_revoked_exactly_when_listed()
+    {
+        let ids: [KeyId; 3] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= ids.len());
+        let revoked = &ids[..len];
+        kani::assume(revoked.windows(2).all(|pair| pair[0] < pair[1]));
+        let lists = Lists {
+            anchors: &[],
+            revoked,
+        };
+        let _ = property::revoked_holds(&lists, &kani::any());
+    }
+
+    /// Lists of every count of anchors and revoked key ids up to one past the
+    /// bound are judged within it as the reading does. The counts alone are
+    /// read, so lists of zero bytes stand for any.
+    #[kani::proof]
+    fn every_count_is_judged_against_the_bound()
+    {
+        static ANCHORS: [[u8; ANCHOR_LEN]; MAX_ANCHORS + 1] = [[0; ANCHOR_LEN]; MAX_ANCHORS + 1];
+        static REVOKED: [KeyId; MAX_REVOKED + 1] = [[0; 16]; MAX_REVOKED + 1];
+        let anchors: usize = kani::any();
+        let revoked: usize = kani::any();
+        kani::assume(anchors <= ANCHORS.len() && revoked <= REVOKED.len());
+        let lists = Lists {
+            anchors: &ANCHORS[..anchors],
+            revoked: &REVOKED[..revoked],
+        };
+        let _ = property::bound_holds(&lists);
     }
 }

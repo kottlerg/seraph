@@ -618,10 +618,25 @@ const STAY_TARGET_MS: u64 = STAY_WINDOW_MS + STAY_MARGIN_US / 1000 + 2;
 /// measure well does not size the next pool past memory at once.
 const STAY_MAX_GROWTH: u64 = 16;
 
-/// Attempts of [`leftover_posts_while_their_cpu_stays_in_the_kernel`]; once a
-/// pool's delete outlasts the target, an attempt is inconclusive only when its
-/// observer ran late. The case fails when every attempt is inconclusive.
+/// Attempts of [`leftover_posts_while_their_cpu_stays_in_the_kernel`]; the
+/// case fails when they end before [`STAY_POSTED`] polls inside a delete
+/// found a leftover posted.
 const STAY_ATTEMPTS: u32 = 8;
+
+/// Polls inside a delete that must find a leftover posted for
+/// [`leftover_posts_while_their_cpu_stays_in_the_kernel`] to pass. More than
+/// one, since a kernel whose leftovers wait for their CPU still shows one now
+/// and then: a later mark of the same delete makes the fired list visible to
+/// any CPU's pass.
+const STAY_POSTED: u32 = 3;
+
+/// Polls inside a delete that find no post and fail
+/// [`leftover_posts_while_their_cpu_stays_in_the_kernel`]. More than one,
+/// since a correct kernel leaves one empty now and then: no CPU need take a
+/// timer tick in the window (a loaded host can hold QEMU's TCG timers off for
+/// 10 ms), and a CPU whose pass claimed the leftovers can be descheduled
+/// before it posts them, neither of which the case can see.
+const STAY_EMPTY: u32 = 2;
 
 /// Microseconds the observer's poll must precede the end of the case's delete
 /// by to count: more than the delete's own return drain and the reading after
@@ -705,11 +720,16 @@ extern "C" fn stay_observer_entry(queue: u64) -> !
 /// still runs. A probe delete that no observer watches first measures the rate
 /// at which the CPU clears a pool and warms the path, so that each counted
 /// attempt's pool is sized to outlast the window; a delete that still ends
-/// first is retried with a pool sized from the rate it measured. Memory that
-/// cannot fund that pool fails the case, as do [`STAY_ATTEMPTS`] attempts none
-/// of whose observers polled inside its delete. The case logs the attempt that
-/// concluded. Fails if the leftovers wait for the CPU that left them, or for an
-/// idle CPU.
+/// first is retried with a pool sized from the rate it measured. The case
+/// passes once [`STAY_POSTED`] observers polled inside a delete and found a
+/// leftover posted, and fails once [`STAY_EMPTY`] found none: a correct
+/// kernel leaves such a poll empty only now and then, when the platform held
+/// every CPU's timer tick off or a CPU stalled between its pass and its posts,
+/// and the defect leaves it posted only now and then. Memory that cannot fund
+/// that pool fails the case, as do [`STAY_ATTEMPTS`] attempts that reach
+/// neither count. The case logs the attempt that concluded and how many polls
+/// inside a delete found no post. Fails if the leftovers wait for the CPU that
+/// left them, or for an idle CPU.
 pub fn leftover_posts_while_their_cpu_stays_in_the_kernel(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -765,23 +785,33 @@ fn stay_attempts(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> T
     let probe = STAY_PROBE_PAGES.min(fundable);
     let took = stay_probe(ctx, probe)?;
     let mut pages = next_stay_pages(probe, took, target, 1).min(fundable);
+    let (mut posted, mut empty) = (0u32, 0u32);
     for attempt in 1..=STAY_ATTEMPTS
     {
         let (outcome, took) = stay_attempt(ctx, (first, rest), spinners, per_ms, pages)?;
         match outcome
         {
-            Some(true) =>
+            StayPoll::Posted =>
             {
-                crate::log_args(format_args!(
-                    "ktest: sole_reference::leftover_posts_while_their_cpu_stays_in_the_kernel conclusive at attempt {attempt} of {STAY_ATTEMPTS} ({pages} pages)"
-                ));
-                return Ok(());
+                posted = posted.saturating_add(1);
+                if posted >= STAY_POSTED
+                {
+                    crate::log_args(format_args!(
+                        "ktest: sole_reference::leftover_posts_while_their_cpu_stays_in_the_kernel conclusive at attempt {attempt} of {STAY_ATTEMPTS} ({pages} pages, {empty} empty)"
+                    ));
+                    return Ok(());
+                }
             }
-            Some(false) =>
+            // The delete outlasted the poll, so the pool stays as it is.
+            StayPoll::Empty =>
             {
-                return Err("stay: no leftover posted while their CPU stayed in the kernel");
+                empty = empty.saturating_add(1);
+                if empty >= STAY_EMPTY
+                {
+                    return Err(STAY_NO_POST);
+                }
             }
-            None =>
+            StayPoll::Late =>
             {
                 let next = next_stay_pages(pages, took, target, 2);
                 if next > pages && pages >= fundable
@@ -795,11 +825,31 @@ fn stay_attempts(ctx: &TestContext, first: u64, rest: u64, spinners: usize) -> T
     Err(STAY_INCONCLUSIVE)
 }
 
+/// Where the observer's poll of one attempt of
+/// [`leftover_posts_while_their_cpu_stays_in_the_kernel`] fell, and what it
+/// found.
+enum StayPoll
+{
+    /// Inside the case's delete, with a leftover posted: the case's subject.
+    Posted,
+    /// Inside the case's delete, with no post: the defect's sign, which a
+    /// correct kernel shows only now and then ([`STAY_EMPTY`]).
+    Empty,
+    /// After the case's delete returned: inconclusive.
+    Late,
+}
+
 /// The failure of [`leftover_posts_while_their_cpu_stays_in_the_kernel`] when
-/// every one of its [`STAY_ATTEMPTS`] attempts was inconclusive: the case did
-/// not reach its subject.
+/// [`STAY_EMPTY`] polls inside a delete found no leftover posted.
+const STAY_NO_POST: &str =
+    "stay: no leftover posted while their CPU stayed in the kernel, in two attempts";
+
+/// The failure of [`leftover_posts_while_their_cpu_stays_in_the_kernel`] when
+/// its [`STAY_ATTEMPTS`] attempts ended before [`STAY_POSTED`] polls inside
+/// a delete found a post or [`STAY_EMPTY`] found none: the case did not reach
+/// its subject often enough to judge it.
 const STAY_INCONCLUSIVE: &str =
-    "stay: inconclusive after every attempt (no observer poll ran inside a delete)";
+    "stay: inconclusive after every attempt (too few observer polls inside a delete)";
 
 /// The failure of [`leftover_posts_while_their_cpu_stays_in_the_kernel`] when
 /// the source Memory cannot fund a pool whose delete outlasts the observer's
@@ -809,10 +859,10 @@ const STAY_NO_MEMORY: &str = "stay: memory cannot fund a pool whose delete outla
 /// The pool of the attempt after a delete of `pages` that took `took` cycles:
 /// grown so that its delete, at the rate just measured, takes at least
 /// `target` cycles, by at least `least` and at most [`STAY_MAX_GROWTH`] times;
-/// unchanged when the delete already took that long, since an attempt was then
-/// inconclusive only because its observer ran late. After the probe `least` is
-/// 1; after an inconclusive attempt it is 2, so a rate the probe overstated
-/// still grows the pool.
+/// unchanged when the delete already took that long, since a late poll was then
+/// its observer's own delay. After the probe `least` is 1; after an attempt
+/// whose poll came late it is 2, so a rate the probe overstated still grows the
+/// pool.
 fn next_stay_pages(pages: u64, took: u64, target: u64, least: u64) -> u64
 {
     if took >= target
@@ -843,17 +893,16 @@ fn stay_probe(ctx: &TestContext, pages: u64) -> Result<u64, &'static str>
     Ok(took)
 }
 
-/// One attempt with a pool of `pages`: `Some(posted)` when the observer's
-/// poll ran while the case's delete did, `posted` saying whether it found a
-/// leftover; `None` when the delete ended first; and beside it the cycles the
-/// delete took. Every binding is checked to post once either way.
+/// One attempt with a pool of `pages`: where the observer's poll fell and what
+/// it found, and beside it the cycles the delete took. Every binding is checked
+/// to post once whatever the poll found.
 fn stay_attempt(
     ctx: &TestContext,
     queues: (u64, u64),
     spinners: usize,
     per_ms: u64,
     pages: u64,
-) -> Result<(Option<bool>, u64), &'static str>
+) -> Result<(StayPoll, u64), &'static str>
 {
     let pool =
         cap_create_cspace(ctx.memory_base, 0, 1).map_err(|_| "stay: cap_create_cspace failed")?;
@@ -1035,12 +1084,11 @@ fn start_stay_children(
 }
 
 /// Receive every post of [`stay_attempt`]'s bindings on the queues
-/// `(first, rest)`, the observer's included, each once; then
-/// `Some(posted)` when the observer's poll ran while the case's delete did,
-/// `posted` saying whether it found a leftover, and `None` otherwise. The
-/// delete's own return drains before `returned_us` is read, so a poll counts
-/// only when its reading comes [`STAY_MARGIN_US`] before that one.
-fn stay_collect((first, rest): (u64, u64), returned_us: u64) -> Result<Option<bool>, &'static str>
+/// `(first, rest)`, the observer's included, each once; then where the
+/// observer's poll fell and what it found. The delete's own return drains
+/// before `returned_us` is read, so a poll is inside the delete only when its
+/// reading comes [`STAY_MARGIN_US`] before that one.
+fn stay_collect((first, rest): (u64, u64), returned_us: u64) -> Result<StayPoll, &'static str>
 {
     let tag = OBSERVER_TAG.load(Ordering::Relaxed);
     let mut seen_rest = [false; LEFTOVER_NODES as usize];
@@ -1074,10 +1122,15 @@ fn stay_collect((first, rest): (u64, u64), returned_us: u64) -> Result<Option<bo
     expect_none(rest, "stay: a leftover binding posted twice")?;
     expect_none(first, "stay: a first-pass binding posted twice")?;
     let polled_us = OBSERVER_POLLED_US.load(Ordering::Relaxed);
-    let conclusive = polled_us
+    let inside = polled_us
         .checked_add(STAY_MARGIN_US)
         .is_some_and(|bound| bound < returned_us);
-    Ok(conclusive.then_some(tag != NO_ENTRY))
+    Ok(match (inside, tag != NO_ENTRY)
+    {
+        (true, true) => StayPoll::Posted,
+        (true, false) => StayPoll::Empty,
+        (false, _) => StayPoll::Late,
+    })
 }
 
 /// A copy moved into another `CSpace`, the move an IPC transfer makes at

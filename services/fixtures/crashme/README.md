@@ -96,10 +96,10 @@ thread's instruction pointer, in the binary's text, inside no `PT_LOAD` (so a de
 text from the binary), and every 8-byte word of the 4096 marked bytes inside a written `PT_LOAD` and
 equal to the mark word `0x4c49_5645_434f_5245`.
 
-For `crashme live-no-core`: the fixture prints `ready`; the `LIVE_CORE` reply is `NO_CORE`; the
-pages charged to the phase's account (`QUERY_MEMORY_USAGE`) are the same after the reply as before
-the request, so the refused capture was released; after the phase writes `exit` to its stdin the
-fixture exits with a success; and no core is new in `/crash`.
+For `crashme live-no-core`: the fixture prints `ready`; the `LIVE_CORE` reply is `NO_CORE` on an
+account that cannot fund a snapshot, an endpoint of the phase's own that refuses every call, and
+nothing called that account, so no snapshot was asked for; after the phase writes `exit` to its
+stdin the fixture exits with a success; and no core is new in `/crash`.
 
 ### `crashd_oom_hold`
 

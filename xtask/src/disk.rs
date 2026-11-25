@@ -38,6 +38,7 @@ use crate::fat;
 use crate::gpt::{self, Guid, guid};
 use crate::layers::{self, Image, Role};
 use crate::signing::sign_for_harness;
+use crate::sysroot::ImageHarness;
 use crate::util::step;
 
 /// ESP partition size. Holds the kernel, the boot bundle (init + modules),
@@ -357,6 +358,9 @@ fn pack(
         layout.block_size.bytes()
     ));
 
+    // The record of the image's harnesses is written once the image is
+    // complete, so a pack that fails leaves none for `run` to trust.
+    crate::sysroot::forget_image_harnesses(&ctx.sysroot)?;
     stage_statement(&ctx.sysroot, layout.data)?;
     // Every pack signs what it packs, so no path writes an unsigned image,
     // and composes the ESP from what it signed, so the ESP of every image is
@@ -369,6 +373,7 @@ fn pack(
     // a later `--repack-only` (the storage cells' `--split-data`) to the
     // composition the staging chose.
     let image = image_of(&ctx.sysroot, harness)?;
+    let harnesses = image_harnesses(&ctx.sysroot, harness, image)?;
     step(&format!("Composing a {}", image.label()));
     let sources = Sources {
         esp: ctx.sysroot_esp(),
@@ -402,6 +407,7 @@ fn pack(
         &ctx.sysroot,
         &ctx.target_dir.join("xtask").join("image-check"),
     )?;
+    crate::sysroot::record_image_harnesses(&ctx.sysroot, &harnesses)?;
 
     step("Disk image complete");
     Ok(())
@@ -457,6 +463,44 @@ fn image_of(sysroot: &Path, harness: Harness) -> Result<Image>
         }
     }
     Ok(Image::Default)
+}
+
+/// The harnesses an image of kind `image`, packed from the sysroot at
+/// `sysroot` with `harness`'s bundle, boots: ktest for the ktest bundle, and
+/// otherwise each harness svcmgr launches whose recipe is staged in
+/// `config/svcmgr/services/` and held by the image (a services-layer image
+/// leaves usertest's out).
+///
+/// # Errors
+/// When a staged harness recipe cannot be read, or no install row places it.
+fn image_harnesses(sysroot: &Path, harness: Harness, image: Image) -> Result<Vec<ImageHarness>>
+{
+    if matches!(harness, Harness::Ktest)
+    {
+        return Ok(vec![ImageHarness::Ktest]);
+    }
+    let mut booted = Vec::new();
+    for candidate in ImageHarness::SUPERVISED
+    {
+        let Some(recipe) = candidate.recipe()
+        else
+        {
+            continue;
+        };
+        let path = sysroot.join(STAGED_RECIPES).join(&recipe);
+        if !path.is_file()
+        {
+            continue;
+        }
+        let install = layers::installed(&format!("{STAGED_RECIPES}/{recipe}"), || {
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))
+        })?;
+        if image.holds(install)
+        {
+            booted.push(candidate);
+        }
+    }
+    Ok(booted)
 }
 
 /// Author `main_image`, and `data_image` when `layout` places the data
@@ -1077,7 +1121,7 @@ fn substitute(tree: &mut [fat::Entry], path: &Path, source: &Path) -> Result<()>
 
 /// The files and directories under `host_dir`, in name order, as a FAT volume holds them.
 ///
-/// Skips build metadata (`.arch`, `.harness`, `NvVars`), the `esp` directory, and
+/// Skips build metadata (`.arch`, `.harness`, `.image-harness`, `NvVars`), the `esp` directory, and
 /// at the top of `sysroot_root` the `data` directory: `esp` and `data` are mount
 /// points with their own partitions, and so not root content. Entries other than files and
 /// directories are skipped. With `keep`, so is each file the image's kind does not hold, by
@@ -1106,7 +1150,7 @@ fn host_tree(host_dir: &Path, sysroot_root: &Path, keep: Option<Keep>) -> Result
             .map_err(|_| crate::error::err!("{} has a name that is not UTF-8", path.display()))?;
 
         // Skip build metadata and the ESP mount point (populated separately).
-        if name == ".arch" || name == ".harness" || name == "NvVars" || name == "esp"
+        if [".arch", ".harness", ".image-harness", "NvVars", "esp"].contains(&name.as_str())
         {
             continue;
         }
@@ -1779,6 +1823,7 @@ mod tests
             ("esp/EFI/seraph/kernel", b"kernel"),
             (".arch", b"x86_64"),
             (".harness", b"init\n"),
+            (".image-harness", b"usertest\n"),
         ]
         {
             let full = sysroot.join(path);
@@ -1806,7 +1851,7 @@ mod tests
         let file = |bytes: &[u8]| Some(Node::File(bytes.to_vec()));
         assert_eq!(root.get("/boot/kernel"), file(b"kernel").as_ref());
         assert_eq!(root.get("/boot/boot.efi"), file(b"bootloader").as_ref());
-        for absent in ["/.arch", "/.harness", "/esp"]
+        for absent in ["/.arch", "/.harness", "/.image-harness", "/esp"]
         {
             assert!(
                 !root.keys().any(|path| path.starts_with(absent)),
@@ -2007,6 +2052,32 @@ mod tests
         fs::write(services.join("svctest.svc"), "binary = /tests/svctest\n").unwrap();
         assert_eq!(image_of(&sysroot, Harness::Init).unwrap(), Image::Services);
         assert_eq!(image_of(&sysroot, Harness::Ktest).unwrap(), Image::Kernel);
+    }
+
+    // Defect caught: a record naming a harness the image does not boot (a
+    // services-layer image's usertest recipe, which the pack leaves out, or
+    // svctest under the ktest bundle), or missing one it boots, so `run`
+    // binds its default pass marker and its death line to the wrong harness.
+    #[test]
+    fn the_image_harnesses_are_the_staged_harness_recipes_the_image_holds()
+    {
+        let scratch = Scratch::new("image-harnesses");
+        let sysroot = scratch.0.join("sysroot");
+        let services = sysroot.join(STAGED_RECIPES);
+        fs::create_dir_all(&services).unwrap();
+        fs::write(services.join("vfsd.svc"), "binary = /services/vfsd\n").unwrap();
+        let of = |harness| image_harnesses(&sysroot, harness, image_of(&sysroot, harness).unwrap());
+        assert_eq!(of(Harness::Init).unwrap(), []);
+        fs::write(services.join("usertest.svc"), "binary = /tests/usertest\n").unwrap();
+        assert_eq!(of(Harness::Init).unwrap(), [ImageHarness::Usertest]);
+        assert_eq!(of(Harness::Ktest).unwrap(), [ImageHarness::Ktest]);
+        fs::write(services.join("svctest.svc"), "binary = /tests/svctest\n").unwrap();
+        assert_eq!(of(Harness::Init).unwrap(), [ImageHarness::Svctest]);
+        fs::write(services.join("ubench.svc"), "binary = /tests/ubench\n").unwrap();
+        assert_eq!(
+            of(Harness::Init).unwrap(),
+            [ImageHarness::Svctest, ImageHarness::Ubench]
+        );
     }
 
     #[test]

@@ -38,6 +38,16 @@ it depends on `shared/ipc`, `shared/syscall`, `abi/process-abi`, and `abi/syscal
   `PlatformDelivery::from_list` reads the list a platform record's bind delivers: one register
   resource (`Mmio` or `IoPort`), an optional wired line, and the endpoints.
 
+devmgr decodes the declaration of every file in `/services/drivers/` before any signature over it
+is checked, so the decoder carries the parser rule's property and its three drivers
+([docs/testing.md](../../docs/testing.md#fuzzing) § Fuzzing, § Bounded verification). The
+property, `property::decl_holds`, holds `decode` to the wire format on any input, and a
+declaration it takes to the round trip through `encode`. Its drivers are the fuzz target
+`driver-binding` (`xtask/fuzz/targets`), which starts from the seeds under
+`fuzz/driver-binding/seeds/`; the replay of those seeds and any `fuzz/driver-binding/regressions/`
+in the crate's tests; and the Kani proofs in `decl.rs`, whose module comment states their bounds
+and how they compose into the property.
+
 The crate names standards and the system's own structure only: no driver, device, or device
 class appears in it, so it does not grow with the drivers a deployment ships
 ([docs/driver-binding.md](../../docs/driver-binding.md#principle) § Principle). No stability
@@ -51,10 +61,16 @@ obligation; internal code reuse only.
 shared/driver-binding/
 ├── Cargo.toml                  # Workspace member; no_std library
 ├── README.md
+├── fuzz/
+│   └── driver-binding/
+│       └── seeds/              # Checked-in inputs of the `driver-binding` fuzz target
 └── src/
     ├── lib.rs                  # Crate root; DRIVER_NOTE_SECTION
-    ├── decl.rs                 # Declaration source form, encoding, bounds, and decoding
+    ├── decl.rs                 # Declaration source form, encoding, bounds, and decoding;
+    │                           #   the proofs of the decoding
     ├── note.rs                 # The driver note and the driver_declaration! macro
+    ├── property.rs             # The decoder's contract as one property (host tests,
+    │                           #   proofs and fuzzing only)
     └── resources.rs            # The resource-list bootstrap: rounds, receive, decode
 ```
 

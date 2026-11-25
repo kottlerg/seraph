@@ -82,64 +82,25 @@ impl<'a> TrustStore<'a>
     /// key ids' order.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, StoreError>
     {
-        let mut reader = Reader::new(bytes);
-        let magic = reader.array::<8>().ok_or(StoreError::Length)?;
-        let version = reader.u16().ok_or(StoreError::Length)?;
-        let anchor_count = reader.u16().ok_or(StoreError::Length)?;
-        let revoked_count = reader.u16().ok_or(StoreError::Length)?;
-        let security_floor = reader.u32().ok_or(StoreError::Length)?;
-        if magic != MAGIC
-        {
-            return Err(StoreError::Magic);
-        }
-        if version != VERSION
-        {
-            return Err(StoreError::Version);
-        }
-        if anchor_count == 0
-        {
-            return Err(StoreError::NoAnchor);
-        }
-        let anchors_len = usize::from(anchor_count)
-            .checked_mul(ANCHOR_LEN)
-            .ok_or(StoreError::Length)?;
-        let anchors = reader.take(anchors_len).ok_or(StoreError::Length)?;
-        let revoked = reader.rest();
-        if Some(revoked.len()) != usize::from(revoked_count).checked_mul(KEY_ID_LEN)
-        {
-            return Err(StoreError::Length);
-        }
-        let (anchors, _) = anchors.as_chunks::<ANCHOR_LEN>();
-        let (revoked, _) = revoked.as_chunks::<KEY_ID_LEN>();
-
+        let store = store_layout(bytes)?;
         let mut previous: Option<KeyId> = None;
-        for raw in anchors
+        for raw in store.anchors
         {
-            let anchor = decode_anchor(raw)?;
-            if previous.is_some_and(|id| id >= anchor.key_id)
-            {
-                return Err(StoreError::AnchorOrder);
-            }
-            previous = Some(anchor.key_id);
+            let (_, usage, flags, label) = anchor_parts(raw).ok_or(StoreError::Length)?;
+            anchor_checks(usage, flags, label)?;
+            previous = Some(in_order(previous, raw_key_id(raw))?);
         }
-        if revoked
-            .windows(2)
-            .any(|pair| matches!(pair, [a, b] if a >= b))
+        if !ascending(store.revoked)
         {
             return Err(StoreError::RevokedOrder);
         }
-        Ok(Self {
-            anchors,
-            revoked,
-            security_floor,
-        })
+        Ok(store)
     }
 
     /// The anchors, in key-id order.
     pub fn anchors(&self) -> impl Iterator<Item = Anchor<'a>> + use<'a>
     {
-        let anchors: &'a [[u8; ANCHOR_LEN]] = self.anchors;
-        anchors.iter().filter_map(|raw| decode_anchor(raw).ok())
+        decoded(self.anchors)
     }
 
     /// The anchor whose key id is `id`.
@@ -152,7 +113,7 @@ impl<'a> TrustStore<'a>
                 anchor_key(raw).map_or(core::cmp::Ordering::Less, |key| key_id(key).cmp(id))
             })
             .ok()?;
-        decode_anchor(self.anchors.get(index)?).ok()
+        decoded(self.anchors.get(index..=index)?).next()
     }
 
     /// Whether `id` is revoked.
@@ -250,6 +211,79 @@ impl<'a> TrustStore<'a>
     }
 }
 
+/// Read a trust store's header and cut the blob into its anchors and its
+/// revoked key ids: the store as its header lays it out, the anchors and the
+/// revoked key ids not yet checked.
+///
+/// # Errors
+///
+/// `Length`, `Magic`, `Version` or `NoAnchor`, as [`TrustStore::parse`]
+/// orders them.
+pub(crate) fn store_layout(bytes: &[u8]) -> Result<TrustStore<'_>, StoreError>
+{
+    let mut reader = Reader::new(bytes);
+    let magic = reader.array::<8>().ok_or(StoreError::Length)?;
+    let version = reader.u16().ok_or(StoreError::Length)?;
+    let anchor_count = reader.u16().ok_or(StoreError::Length)?;
+    let revoked_count = reader.u16().ok_or(StoreError::Length)?;
+    let security_floor = reader.u32().ok_or(StoreError::Length)?;
+    if magic != MAGIC
+    {
+        return Err(StoreError::Magic);
+    }
+    if version != VERSION
+    {
+        return Err(StoreError::Version);
+    }
+    if anchor_count == 0
+    {
+        return Err(StoreError::NoAnchor);
+    }
+    let anchors_len = usize::from(anchor_count)
+        .checked_mul(ANCHOR_LEN)
+        .ok_or(StoreError::Length)?;
+    let anchors = reader.take(anchors_len).ok_or(StoreError::Length)?;
+    let revoked = reader.rest();
+    if Some(revoked.len()) != usize::from(revoked_count).checked_mul(KEY_ID_LEN)
+    {
+        return Err(StoreError::Length);
+    }
+    let (anchors, _) = anchors.as_chunks::<ANCHOR_LEN>();
+    let (revoked, _) = revoked.as_chunks::<KEY_ID_LEN>();
+    Ok(TrustStore {
+        anchors,
+        revoked,
+        security_floor,
+    })
+}
+
+/// `id`, when it follows `previous`, the key id of the anchor before it, in
+/// strictly ascending order.
+///
+/// # Errors
+///
+/// `AnchorOrder`.
+pub(crate) fn in_order(previous: Option<KeyId>, id: KeyId) -> Result<KeyId, StoreError>
+{
+    if previous.is_some_and(|before| before >= id)
+    {
+        return Err(StoreError::AnchorOrder);
+    }
+    Ok(id)
+}
+
+/// Whether `ids` are sorted strictly ascending.
+pub(crate) fn ascending(ids: &[KeyId]) -> bool
+{
+    !ids.windows(2).any(|pair| matches!(pair, [a, b] if a >= b))
+}
+
+/// The key id of an anchor's encoding.
+pub(crate) fn raw_key_id(raw: &[u8; ANCHOR_LEN]) -> KeyId
+{
+    anchor_key(raw).map_or([0; KEY_ID_LEN], key_id)
+}
+
 /// Write the 2,024-byte encoding of `anchor`.
 pub(crate) fn put_anchor(
     writer: &mut Writer<'_>,
@@ -277,17 +311,55 @@ pub(crate) fn anchor_key(raw: &[u8; ANCHOR_LEN]) -> Option<&PublicKey>
     raw.first_chunk::<PUBLIC_KEY_LEN>()
 }
 
-/// Decode and check one anchor.
-pub(crate) fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreError>
+/// The anchors of `raw` that decode, in order: each cut into its fields
+/// ([`anchor_parts`]) and checked ([`anchor_checks`]), the steps of the
+/// parse's walk, and keyed by the SHA-512 of its key. The lookups walk the
+/// anchors a parse took this way.
+pub(crate) fn decoded(raw: &[[u8; ANCHOR_LEN]]) -> impl Iterator<Item = Anchor<'_>>
+{
+    raw.iter().filter_map(|raw| {
+        let (key, usage, flags, label) = anchor_parts(raw)?;
+        let (usage, local, label) = anchor_checks(usage, flags, label).ok()?;
+        Some(Anchor {
+            key,
+            key_id: key_id(key),
+            usage,
+            local,
+            label,
+        })
+    })
+}
+
+/// The fields of an anchor's encoding, cut where they lie: its key, its
+/// usage and flags words, and its label field.
+pub(crate) type AnchorParts<'a> = (&'a PublicKey, u32, u32, &'a [u8; LABEL_LEN]);
+
+/// Cut an anchor's encoding into its fields. The reads cannot run short:
+/// their lengths add up to [`ANCHOR_LEN`], so this is never `None`.
+pub(crate) fn anchor_parts(raw: &[u8; ANCHOR_LEN]) -> Option<AnchorParts<'_>>
 {
     let mut reader = Reader::new(raw);
-    // The reads cannot run short: their lengths add up to ANCHOR_LEN.
-    let key = reader
-        .array_ref::<PUBLIC_KEY_LEN>()
-        .ok_or(StoreError::Length)?;
-    let usage = reader.u32().ok_or(StoreError::Length)?;
-    let flags = reader.u32().ok_or(StoreError::Length)?;
-    let label = reader.rest();
+    let key = reader.array_ref::<PUBLIC_KEY_LEN>()?;
+    let usage = reader.u32()?;
+    let flags = reader.u32()?;
+    let label = reader.array_ref::<LABEL_LEN>()?;
+    Some((key, usage, flags, label))
+}
+
+/// Check an anchor's usage and flags words and its label field
+/// ([`LABEL_LEN`] bytes in an anchor; the check holds for a field of any
+/// length); returns its usage, `LOCAL` flag and label: the text before the
+/// field's NUL padding, of at least one byte, in UTF-8.
+///
+/// # Errors
+///
+/// `AnchorUsage`, `AnchorFlags`, then `Label`.
+pub(crate) fn anchor_checks(
+    usage: u32,
+    flags: u32,
+    label: &[u8],
+) -> Result<(Usage, bool, &str), StoreError>
+{
     let usage = Usage::from_bits(usage).ok_or(StoreError::AnchorUsage)?;
     if flags & !FLAG_LOCAL != 0
     {
@@ -303,13 +375,7 @@ pub(crate) fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreE
         return Err(StoreError::Label);
     }
     let label = core::str::from_utf8(text).map_err(|_| StoreError::Label)?;
-    Ok(Anchor {
-        key,
-        key_id: key_id(key),
-        usage,
-        local: flags & FLAG_LOCAL != 0,
-        label,
-    })
+    Ok((usage, flags & FLAG_LOCAL != 0, label))
 }
 
 #[cfg(test)]
@@ -558,5 +624,100 @@ mod tests
             TrustStore::encoded_len(65_535, 65_535),
             Ok(18 + 2024 * 65_535 + 16 * 65_535)
         );
+    }
+}
+
+/// Bounded proofs of the trust store's parse (docs/testing.md § Bounded
+/// verification, Parser proofs), each on every input up to the bounds its
+/// comment states.
+///
+/// How they compose into the property's check of [`TrustStore::parse`]
+/// (`property::trust_store_holds`). The walk of the anchors is a loop whose
+/// step is three functions in turn, its state the key id of the anchor
+/// before: [`anchor_parts`] cuts an anchor into its fields, [`anchor_checks`]
+/// checks them, and [`in_order`] takes its key id after the one before. It
+/// is proven by induction: the layout proof shows that the walk starts on
+/// the anchors and the revoked key ids the header gives, cut where they lie;
+/// the cut, checks and order proofs run each part of the step on any input,
+/// so whatever state a step hands the next, the next judges its anchor as
+/// the reading does; and the ascending proof checks the revoked key ids the
+/// walk ends on. The lookups walk the anchors a parse took by the cut and
+/// the checks again ([`decoded`]). What lies outside the proofs is
+/// `parse`, the loop that drives the step and the check after it, the
+/// lookups' loop, and the key id each step is given and each anchor is
+/// keyed by, the SHA-512 of the anchor's key ([`raw_key_id`]), which no
+/// proof may stub (docs/coding-standards.md § Proof Harnesses); the fuzz
+/// target `objsig`, the replay of the checked-in inputs and the unit tests
+/// check them.
+#[cfg(kani)]
+mod proofs
+{
+    use super::ANCHOR_LEN;
+    use crate::{KeyId, property};
+
+    /// Every store of at most 2,059 bytes holds the layout's contract: 2,059
+    /// bytes hold the header (18 bytes), an anchor (2,024), a revoked key id
+    /// (16) and one byte more, so each refusal of the header, a length short
+    /// of and past what the counts give, and a store laid out are reached.
+    /// No loop: the lists are cut by length.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_store_lays_out_as_its_header_says()
+    {
+        let bytes: [u8; 2059] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let _ = property::store_layout_holds(&bytes[..len]);
+    }
+
+    /// Every anchor is cut into its fields where they lie. No loop.
+    #[kani::proof]
+    fn every_anchor_is_cut_into_its_fields()
+    {
+        let raw: [u8; ANCHOR_LEN] = kani::any();
+        let _ = property::anchor_parts_holds(&raw);
+    }
+
+    /// Every usage and flags word, and every label field of up to 4 bytes of
+    /// any value, hold the checks' contract: each refusal, the empty label, a
+    /// label filling its field and one before NUL padding, a NUL inside the
+    /// text or the padding, and every UTF-8 sequence (at most 4 bytes) whole,
+    /// cut by the field's end or broken, are reached. The checks read a
+    /// field of any length alike, and an anchor's field of 32 bytes adds no
+    /// case: each byte is judged alone or within its one sequence. The
+    /// validation of UTF-8 over a longer field of any value is past the
+    /// memory limit `cargo xtask kani` sets: 8 bytes ran out of it on CI's
+    /// runner. The loops are the label's: its bytes are walked from the end,
+    /// searched for a NUL and checked as UTF-8, each at most 4 steps.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn every_anchors_fields_are_checked_as_read()
+    {
+        let field: [u8; 4] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= field.len());
+        let _ = property::anchor_checks_holds(kani::any(), kani::any(), &field[..len]);
+    }
+
+    /// Every key id after any key id, or none, is judged in order as the
+    /// reading does. No loop.
+    #[kani::proof]
+    fn every_key_id_is_judged_in_order()
+    {
+        let previous: Option<KeyId> = kani::any();
+        let _ = property::in_order_holds(previous, kani::any());
+    }
+
+    /// Every list of up to 3 key ids is judged ascending as the reading
+    /// does: 3 ids hold two neighbouring pairs, so an order broken at either
+    /// pair, and by an equal pair, is reached.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_list_of_key_ids_is_judged_ascending()
+    {
+        let ids: [KeyId; 3] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= ids.len());
+        let _ = property::ascending_holds(&ids[..len]);
     }
 }

@@ -1970,6 +1970,20 @@ pub fn smt_sibling(cpu: u64) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
+/// The times the idle thread of the CPU this call runs on has halted that CPU
+/// since boot (`SystemInfoType::IdleHalts`). Two reads compare only when the
+/// calling thread is pinned to one CPU between them: an unpinned thread may
+/// read two CPUs' counts.
+///
+/// # Errors
+/// Returns a negative `i64` error code from a kernel that predates the
+/// query (`InvalidArgument`).
+#[inline]
+pub fn idle_halts() -> Result<u64, i64>
+{
+    system_info(syscall_abi::SystemInfoType::IdleHalts as u64)
+}
+
 /// Exclusive top of the user half of the caller's address space
 /// (`SystemInfoType::UserVaTop`): the first virtual address a mapping syscall
 /// refuses, fixed per architecture and boot paging mode.

@@ -12,11 +12,14 @@
 //! ktest's own image; its rise across each runtime call site is checked by
 //! `integration::thread_memory` and `unit::retype`'s code stub. `SmtSibling` is
 //! read here for its range; `integration::smt_siblings` checks each ring against
-//! the core each CPU reports.
+//! the core each CPU reports. `IdleHalts` is read here across a sleep of a
+//! thread pinned to CPU 0; the benchmark harnesses read it around their timed
+//! samples (shared/bench/README.md § Idle halts).
 
 use syscall::{
-    MAP_WRITABLE, cap_create_cspace, cap_create_thread, cap_delete, cap_info, mem_map, mem_unmap,
-    memory_merge, memory_split, smt_sibling, speculation_controls, system_info,
+    MAP_WRITABLE, cap_create_cspace, cap_create_thread, cap_delete, cap_info, idle_halts, mem_map,
+    mem_unmap, memory_merge, memory_split, smt_sibling, speculation_controls, system_info,
+    thread_set_affinity, thread_sleep, thread_yield,
 };
 use syscall_abi::{
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, KERNEL_VERSION, PAGE_SIZE,
@@ -434,6 +437,56 @@ pub fn smt_sibling_range(_ctx: &TestContext) -> TestResult
         }
     }
     Ok(())
+}
+
+/// `system_info(IdleHalts)` counts the halts of the calling CPU's idle
+/// thread: a thread pinned to CPU 0 that sleeps leaves that CPU nothing to
+/// run, so the count it reads after the sleep is above the one it read
+/// before.
+///
+/// Defect caught: a halt the idle loop does not count, or a query that reads
+/// another CPU's count, either of which lets a benchmark's timed window idle
+/// with no sign of it in the window's result line.
+pub fn idle_halts_rise_across_a_sleep(ctx: &TestContext) -> TestResult
+{
+    /// The sleep: one tick or more, so the CPU halts at least once.
+    const SLEEP_MS: u64 = 2;
+    /// Yields that let the scheduler move the thread to CPU 0, as the bench
+    /// harness's pin bounds them.
+    const MAX_YIELDS: u32 = 1000;
+    /// The affinity argument that clears a thread's hard affinity.
+    const AFFINITY_ANY: u32 = u32::MAX;
+
+    thread_set_affinity(ctx.thread_cap, 0).map_err(|_| "sysinfo::idle_halts: pin failed")?;
+    let on_cpu0 = || system_info(SystemInfoType::CurrentCpu as u64) == Ok(0);
+    for _ in 0..MAX_YIELDS
+    {
+        if on_cpu0()
+        {
+            break;
+        }
+        let _ = thread_yield();
+    }
+    let outcome = if on_cpu0()
+    {
+        // Pinned to CPU 0 and running there, the thread reads CPU 0's count
+        // both times.
+        let before = idle_halts();
+        let slept = thread_sleep(SLEEP_MS);
+        let after = idle_halts();
+        match (before, slept, after)
+        {
+            (Ok(before), Ok(()), Ok(after)) if after.wrapping_sub(before) > 0 => Ok(()),
+            (Ok(_), Ok(()), Ok(_)) => Err("system_info(IdleHalts) did not rise across a sleep"),
+            _ => Err("sysinfo::idle_halts: a read or the sleep failed"),
+        }
+    }
+    else
+    {
+        Err("sysinfo::idle_halts: the thread never ran on CPU 0")
+    };
+    let _ = thread_set_affinity(ctx.thread_cap, AFFINITY_ANY);
+    outcome
 }
 
 /// The kernel synchronised instruction fetch for ktest's own image before

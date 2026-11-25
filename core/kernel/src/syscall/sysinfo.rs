@@ -17,7 +17,7 @@ use syscall::SyscallError;
 
 /// One past the highest `SystemInfoType` discriminant `sys_system_info`
 /// answers. A discriminant at or past it is refused before the match.
-const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::SmtSibling as u64 + 1;
+const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::IdleHalts as u64 + 1;
 
 /// `SYS_SYSTEM_INFO` (43): query kernel/system information.
 ///
@@ -147,6 +147,14 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
                 .map_err(|_| SyscallError::InvalidArgument)?;
             Ok(crate::topology::sibling_after(cpu) as u64)
         }
+        15 =>
+        // IdleHalts — the halts of the idle thread of the CPU this syscall
+        // runs on (`sched::idle_halts`): an activity figure of the caller's
+        // own CPU, takes no argument, and indexes nothing the caller chooses
+        // (core/kernel/docs/cross-boundary-disclosure.md).
+        {
+            Ok(crate::sched::idle_halts())
+        }
         _ => Err(SyscallError::InvalidArgument),
     }
 }
@@ -244,6 +252,7 @@ mod tests
             SystemInfoType::InstructionCacheSyncs,
             SystemInfoType::SpeculationControls,
             SystemInfoType::SmtSibling,
+            SystemInfoType::IdleHalts,
         ];
         let max = kinds.iter().map(|&k| k as u64).max();
         assert!(kinds.iter().all(|&k| (k as u64) < SYSTEM_INFO_BOUND));

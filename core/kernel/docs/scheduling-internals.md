@@ -1320,8 +1320,14 @@ Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
        schedule(Requeue::Always);                  // pick up the work
        continue;
    }
-4. halt_until_interrupt()                          // x86: sti;hlt   riscv: wfi (atomic)
+4. note_idle_halt()                                // this CPU's idle-halt count
+5. halt_until_interrupt()                          // x86: sti;hlt   riscv: wfi (atomic)
 ```
+
+Step 4 counts the halt in the CPU's own diagnostic record before the halt is taken, so a thread
+that the interrupt ending it wakes, and switches to at once, reads the halt in the count
+(`SYS_SYSTEM_INFO(IdleHalts)`, [syscalls.md](syscalls.md) § `SYS_SYSTEM_INFO`). The idle thread
+is its one writer, a Relaxed load and store, and a syscall on the same CPU its one reader.
 
 Consumer side at a return to user mode (`sched::preempt_if_outranked`,
 `core/kernel/src/sched/mod.rs`; [scheduler.md](scheduler.md) § Wake Preemption):

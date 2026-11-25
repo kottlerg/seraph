@@ -1976,6 +1976,18 @@ pub enum SystemInfoType
     /// Awareness). On riscv64 every hart is its own core. `InvalidArgument`
     /// for an index at or past `CpuCount`.
     SmtSibling = 14,
+    /// Number of times the idle thread of the CPU the call runs on has halted
+    /// that CPU since boot: one per stretch in which the CPU found no thread
+    /// to run, and one more for each interrupt that ends a halt and leaves it
+    /// with none. Takes no argument, and answers for no other CPU. A
+    /// diagnostic count, readable by any process with no capability; a
+    /// benchmark pinned to one CPU reads it before its first timed sample and
+    /// after its last, so that its result line shows whether a timed window
+    /// waited with the CPU idle (shared/bench/README.md § Idle halts). Two
+    /// reads by a thread that is not pinned may be of two CPUs, and their
+    /// difference then means nothing (core/kernel/docs/syscalls.md
+    /// § `SYS_SYSTEM_INFO`).
+    IdleHalts = 15,
 }
 
 /// `SystemInfoType::SpeculationControls` view: the selection's inputs, a

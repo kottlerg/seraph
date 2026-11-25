@@ -1476,7 +1476,8 @@ mod proofs
 
     /// Every `Name` at place 1 of a term list of 12 bytes reads as its
     /// construct: 11 bytes hold a one-segment name with a value of any kind
-    /// up to a dword, and a dual name with a value of up to two bytes. The loops are the name's
+    /// up to a dword, and a dual name with a one-byte value (`ZeroOp`,
+    /// `OneOp` or `OnesOp`). The loops are the name's
     /// segments and a string's bytes.
     #[kani::proof]
     #[kani::unwind(11)]

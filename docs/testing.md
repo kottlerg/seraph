@@ -1377,7 +1377,7 @@ to the tiers below.
 | Canonical | `build-test.yml` | every push / PR: the cells its change owes ([conventions.md § CI Gating](conventions.md#ci-gating)) | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof (`cargo xtask kani`, [Bounded verification](#bounded-verification)) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation, the large-memory cell, and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
 
 **Cells.** A cell is one launch configuration and the boots made on it; each differs from every
 other cell in that configuration, which is why it stands alone. The table states every cell, its
@@ -1396,6 +1396,7 @@ registry runs it on (its `md-test-cells` rule).
 | `bench` | Canonical | x86_64, riscv64; release | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |
+| large-memory | Release host runs | x86_64, riscv64; debug | svctest staged as the canonical svctest cell stages it, at 4 CPUs and 8192 MiB | none | svctest's phases past the RAM sizes at which a RAM-proportional cost overtakes a fixed margin, and RAM-sized byte counts past 2^32 (Large-memory cell below) |
 | 4kn | Local and release host runs | x86_64, riscv64; debug | svctest from a 4Kn disk (`mkdisk --block-size 4096`) | none | 4096-byte logical blocks (Disk variations below) |
 | second-disk | Local and release host runs | x86_64, riscv64; debug | svctest with `/data` and swap on a second disk (`mkdisk --split-data`, `--second-disk`) | none | the data and swap partitions on their own disk, named by the storage statement |
 | shared-line | Local and release host runs | x86_64, riscv64; debug | as second-disk, both disks on one `INTx` line (`--second-disk-shared-line`) | none | two virtio-blk devices served on one interrupt line |
@@ -2114,17 +2115,19 @@ that contains the version bump when the change from it to the commit to be tagge
 or comments only as this section defines that: the whole boundary set (riscv64 16 and 128 harts,
 x86_64 16 and 128 vCPUs) once each (`--runs 1`) in the debug profile and once each in the release
 profile (`cargo xtask build --release`, then the same `run` command, per the boundary commands
-above), and the memory variation and every device cell (the disk variations, the no-IOMMU variant,
-the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once
-each, and every bounded proof (`cargo xtask kani` with no option, [Bounded
+above), and the memory variation, the large-memory cell, and every device cell (the disk
+variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the
+CET cell, and the TPM cell) once each, and every bounded proof (`cargo xtask kani` with no
+option, [Bounded
 verification](#bounded-verification)), and the fuzz campaign (§ Fuzzing): a manual dispatch of
 `fuzz.yml` on `master` while the commit to be tagged is its head (`gh workflow run fuzz.yml --ref
 master`), at the default time per target, whose run's head commit is that commit and whose
 conclusion is `success`, the report giving the run's URL as its command, `--runs 1`, and `PASS` as
 its outcome when the conclusion is `success`; so every tag boots at each boundary CPU count in both
 profiles (CI boots release builds only at 4 CPUs), from a 4Kn disk, from two disks, with no IOMMU,
-with a framebuffer, with a debug port, with a hot-added device, on CET shadow stacks, and with a
-TPM, carries every proof a pull request's selection may have left unverified and a campaign of every
+with a framebuffer, with a debug port, with a hot-added device, on CET shadow stacks, with a TPM,
+and with 8 GiB of RAM under svctest, carries every proof a pull request's selection may have left
+unverified and a campaign of every
 fuzz target, and runs the timing report on the boundary logs, which is reported and blocks nothing.
 A tag's repeated-run check is the burn-in tier, which the tag push starts. The no-IOMMU variant, the
 no-iommu device cell, boots svctest once on each architecture with the machine's IOMMU detached, so
@@ -2138,6 +2141,28 @@ and is bisected over the release's PRs.
 ```sh
 # No-IOMMU variant, each architecture (svctest staged, debug profile):
 cargo xtask run --arch <arch> --iommu absent --runs 1 --timeout 840 \
+    --test-devices
+```
+
+**Large-memory cell.** One svctest boot, on each architecture, at 4 CPUs and 8192 MiB, staged as the
+canonical svctest cell stages it (`mkdisk --svctest ci`, crashd's test recipe included, with the
+test devices) on a debug-profile sysroot; the release host runs boot it once each, and no pull
+request owes it. svctest's phases size their work by the guest's RAM against margins that stay
+fixed, so a cost that grows with RAM overtakes such a margin only above some RAM size, and only a
+boot above that size finds the defect; the memory variation's 1024 MiB can lie below that size. No
+changed line identifies a sizing of that kind, so no surface could owe the cell to a pull request
+without a judgement call; the release host runs boot it whatever the release's pull requests
+touched, as they boot the boundary set. At 8192 MiB every byte count sized by RAM is past 2^32 as
+well, and real hardware has that much RAM. Its budget, 11340 s, is the larger of three times its
+riscv64 boot on the reference host (3777 s) and that boot plus 100 s, rounded up to a minute, the
+rule the disk variations' budget follows; a change to that boot's time re-derives it. The x86_64
+boot, under KVM, takes 690 s on the reference host.
+
+```sh
+# Large-memory cell, per architecture (clean between architectures):
+cargo xtask build --arch <arch>
+cargo xtask mkdisk --arch <arch> --repack-only --svctest ci
+cargo xtask run --arch <arch> --cpus 4 --mem 8192 --runs 1 --timeout 11340 \
     --test-devices
 ```
 

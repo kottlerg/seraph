@@ -729,7 +729,8 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    release is cut only from a green `master`, § CI Gating): the whole
    boundary set (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) once
    each in the debug profile and once each in the release profile, and
-   the memory variation, the disk variations (a 4Kn disk and three
+   the memory variation, the large-memory cell (svctest at `--mem 8192`,
+   on both architectures), the disk variations (a 4Kn disk and three
    second-disk boots, on both architectures), the no-IOMMU variant
    (`--iommu absent`, svctest, on both architectures), the framebuffer
    cell (`--display framebuffer`, svctest, on both architectures), the

@@ -278,6 +278,20 @@ impl SlotStore for MappedSlots
             unsafe { core::ptr::write(va as *mut Slot, slot) };
         }
     }
+
+    unsafe fn replace(&mut self, idx: NodeIdx, slot: Slot) -> Slot
+    {
+        let Some(va) = self.layout.slot_va(idx)
+        else
+        {
+            return Slot {
+                node: Node::Free,
+                next: NODE_NULL,
+            };
+        };
+        // SAFETY: as in `read`.
+        unsafe { core::ptr::replace(va as *mut Slot, slot) }
+    }
 }
 
 /// Word storage mapped from `base`: the process index's bucket heads from

@@ -487,6 +487,13 @@ pub trait SlotStore
     /// # Safety
     /// As [`SlotStore::read`].
     unsafe fn write(&mut self, idx: NodeIdx, slot: Slot);
+
+    /// Write the slot at `idx` and return the slot it held, finding the
+    /// slot's storage once for both.
+    ///
+    /// # Safety
+    /// As [`SlotStore::read`].
+    unsafe fn replace(&mut self, idx: NodeIdx, slot: Slot) -> Slot;
 }
 
 /// The slot allocator: a free list over every carved slot.
@@ -678,15 +685,12 @@ impl<S: SlotStore> Arena<S>
         {
             return;
         }
-        let old = frame_pages_of(&self.get(idx).node);
+        let new = frame_pages_of(&slot.node);
+        // SAFETY: `idx < carved`, which `add_page`'s contract made valid.
+        let old = frame_pages_of(&unsafe { self.store.replace(idx, slot) }.node);
         // Every page counted is a frame record's, so the old record's pages
         // are in the count.
-        self.frame_pages = self
-            .frame_pages
-            .saturating_sub(old)
-            .saturating_add(frame_pages_of(&slot.node));
-        // SAFETY: `idx < carved`, which `add_page`'s contract made valid.
-        unsafe { self.store.write(idx, slot) };
+        self.frame_pages = self.frame_pages.saturating_sub(old).saturating_add(new);
     }
 
     /// Replace the `next` link of `idx`, keeping its payload.
@@ -782,6 +786,16 @@ pub(crate) mod test_store
                 self.0.resize(i + 1, VACANT);
             }
             self.0[i] = slot;
+        }
+
+        unsafe fn replace(&mut self, idx: NodeIdx, slot: Slot) -> Slot
+        {
+            let i = usize::try_from(idx).unwrap();
+            if self.0.len() <= i
+            {
+                self.0.resize(i + 1, VACANT);
+            }
+            core::mem::replace(&mut self.0[i], slot)
         }
     }
 }

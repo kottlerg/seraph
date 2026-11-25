@@ -5632,6 +5632,12 @@ mod tests
             // SAFETY: the caller's contract, passed on.
             unsafe { self.slots.write(idx, slot) };
         }
+
+        unsafe fn replace(&mut self, idx: NodeIdx, slot: Slot) -> Slot
+        {
+            // SAFETY: the caller's contract, passed on.
+            unsafe { self.slots.replace(idx, slot) }
+        }
     }
 
     #[test]

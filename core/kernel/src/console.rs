@@ -232,8 +232,11 @@ pub unsafe fn write_line(sink: Sink, us: Option<u64>, args: core::fmt::Arguments
 }
 
 /// Write one kernel line to the serial port only, never as a log record: the
-/// path of `kprintln_serial!`, as a function a register dump shared with
-/// userspace faults can take.
+/// path of `kprintln_serial!`, and a function a register dump shared with
+/// userspace faults can take. Kept out of line and cold, so a diagnostic on a
+/// hot path costs its caller one call.
+#[cold]
+#[inline(never)]
 pub fn print_serial(args: core::fmt::Arguments)
 {
     // SAFETY: the console is initialised before any line is printed.
@@ -431,17 +434,9 @@ macro_rules! kprintln_fault {
 /// `core/kernel/docs/cross-boundary-disclosure.md` § Kernel console diagnostics.
 #[macro_export]
 macro_rules! kprintln_serial {
-    ($($arg:tt)*) => {{
-        let _args = format_args!($($arg)*);
-        // SAFETY: console is initialized before any macro usage.
-        unsafe {
-            $crate::console::write_line(
-                $crate::console::Sink::Serial,
-                $crate::console::now_us(),
-                _args,
-            );
-        }
-    }};
+    ($($arg:tt)*) => {
+        $crate::console::print_serial(format_args!($($arg)*))
+    };
 }
 
 /// Print one line to the kernel console whether or not a reader is attached:

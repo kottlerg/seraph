@@ -17,7 +17,7 @@
 
 pub mod ring;
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use syscall::KLOG_LINE_MAX;
 
@@ -64,24 +64,13 @@ static PENDING: AtomicBool = AtomicBool::new(false);
 /// (core/kernel/docs/kernel-log.md § Lock order).
 static BINDING_LOCK: Spinlock = Spinlock::new();
 
-/// The notification the reader bound and the bits to signal, under
-/// [`BINDING_LOCK`]. Null when none is bound.
-struct Binding
-{
-    sig: *mut NotificationState,
-    bits: u64,
-}
+/// The notification the reader bound, null when none is bound. Written only
+/// under [`BINDING_LOCK`], with `Release`, so that [`forget_notification`] can
+/// read it without the lock (its comment says why that suffices).
+static BINDING_SIG: AtomicPtr<NotificationState> = AtomicPtr::new(core::ptr::null_mut());
 
-/// The binding, behind [`BINDING_LOCK`].
-struct BindingCell(core::cell::UnsafeCell<Binding>);
-
-// SAFETY: the cell is read and written only under BINDING_LOCK.
-unsafe impl Sync for BindingCell {}
-
-static BINDING: BindingCell = BindingCell(core::cell::UnsafeCell::new(Binding {
-    sig: core::ptr::null_mut(),
-    bits: 0,
-}));
+/// The bits to signal the bound notification with, under [`BINDING_LOCK`].
+static BINDING_BITS: AtomicU64 = AtomicU64::new(0);
 
 /// The cursor as the atomics hold it.
 fn load_cursor() -> Cursor
@@ -345,11 +334,8 @@ unsafe fn signal_reader()
     // lock; the caller holds no lock, and no holder of those takes
     // BINDING_LOCK.
     let saved = unsafe { BINDING_LOCK.lock_raw() };
-    // SAFETY: BINDING_LOCK held.
-    let (sig, bits) = unsafe {
-        let b = &*BINDING.0.get();
-        (b.sig, b.bits)
-    };
+    let sig = BINDING_SIG.load(Ordering::Relaxed);
+    let bits = BINDING_BITS.load(Ordering::Relaxed);
     let woken = if sig.is_null()
     {
         None
@@ -383,29 +369,63 @@ pub unsafe fn bind(sig: *mut NotificationState, bits: u64)
 {
     // SAFETY: released below; nothing here takes a lock.
     let saved = unsafe { BINDING_LOCK.lock_raw() };
-    // SAFETY: BINDING_LOCK held.
-    unsafe {
-        *BINDING.0.get() = Binding { sig, bits };
-    }
+    BINDING_BITS.store(bits, Ordering::Relaxed);
+    BINDING_SIG.store(sig, Ordering::Release);
     // SAFETY: paired with lock_raw above.
     unsafe { BINDING_LOCK.unlock_raw(saved) };
 }
 
 /// Clear the binding if it names `sig`, which is being deallocated. Called
-/// with no lock held, before the notification's state is freed.
+/// with no lock held, before the notification's state is freed, on every
+/// notification's deallocation, so it takes [`BINDING_LOCK`] only when the
+/// binding names `sig`.
+///
+/// The check without the lock is enough. `sig`'s last reference is gone, and
+/// with it every pin, so no bind can store `sig` after this load: a bind that
+/// stored it did so before releasing its pin, which happens before the
+/// deallocation. A load that finds another value reads a store made, under
+/// [`BINDING_LOCK`] and with `Release`, after every critical section that read
+/// `sig` from the binding, the tick's signal through `sig` among them; the
+/// `Acquire` load orders those sections before the state is freed.
 pub fn forget_notification(sig: *mut NotificationState)
 {
+    if BINDING_SIG.load(Ordering::Acquire) != sig
+    {
+        return;
+    }
     // SAFETY: released below; nothing here takes a lock.
     let saved = unsafe { BINDING_LOCK.lock_raw() };
-    // SAFETY: BINDING_LOCK held.
-    unsafe {
-        let b = &mut *BINDING.0.get();
-        if b.sig == sig
-        {
-            b.sig = core::ptr::null_mut();
-            b.bits = 0;
-        }
+    if BINDING_SIG.load(Ordering::Relaxed) == sig
+    {
+        BINDING_BITS.store(0, Ordering::Relaxed);
+        BINDING_SIG.store(core::ptr::null_mut(), Ordering::Release);
     }
     // SAFETY: paired with lock_raw above.
     unsafe { BINDING_LOCK.unlock_raw(saved) };
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    // Defect caught: the lock-free check in `forget_notification` clearing a
+    // binding that names another notification, or leaving the binding of the
+    // one being freed, which the tick would then signal after the free.
+    #[test]
+    fn forget_clears_only_the_binding_of_the_notification_it_names()
+    {
+        let mut a = core::mem::MaybeUninit::<NotificationState>::uninit();
+        let mut b = core::mem::MaybeUninit::<NotificationState>::uninit();
+        let (a, b) = (a.as_mut_ptr(), b.as_mut_ptr());
+        // SAFETY: neither pointer is dereferenced: bind and forget only store
+        // and compare them.
+        unsafe { bind(a, 0b10) };
+        forget_notification(b);
+        assert_eq!(BINDING_SIG.load(Ordering::Relaxed), a);
+        assert_eq!(BINDING_BITS.load(Ordering::Relaxed), 0b10);
+        forget_notification(a);
+        assert!(BINDING_SIG.load(Ordering::Relaxed).is_null());
+        assert_eq!(BINDING_BITS.load(Ordering::Relaxed), 0);
+    }
 }

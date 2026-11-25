@@ -121,7 +121,9 @@ costs one signal.
 - One binding exists. A bind replaces it, whoever made it; a bind of no notification clears it.
 - The binding holds no reference on the notification. The notification's deallocation clears
   the binding (`klog::forget_notification`) before it frees the state, under `BINDING_LOCK`, the
-  lock the tick's signal holds, so the tick never signals freed memory.
+  lock the tick's signal holds, so the tick never signals freed memory. It reads the binding
+  first without the lock and takes the lock only when the binding names this notification, so
+  the deallocation of any other notification costs one load.
 
 ---
 

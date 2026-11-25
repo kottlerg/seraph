@@ -120,7 +120,7 @@ Overall project design documents live in [`docs/`](docs/):
   serial-driver-mediated userspace output
 - [Build System](docs/build-system.md) — toolchain, workspace layout, sysroot, xtask commands
 - [Coding Standards](docs/coding-standards.md) — Rust conventions, safety contracts,
-  documentation rules
+  documentation rules, log message wording
 - [Documentation Standards](docs/documentation-standards.md) — document hierarchy,
   authority, backlinks, required structure
 - [Conventions](docs/conventions.md) — versioning, backlog tracking via GitHub Issues,

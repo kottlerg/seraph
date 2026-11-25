@@ -508,6 +508,54 @@ in the same change.
   shift; reserve it for review and chat. A bare file path (no line) is acceptable for
   cross-file navigation.
 
+### Log Messages
+
+A log message is the text a call site gives a log call (`seraph::log!`, a kernel print): the
+console line without the prefix its sink adds (the timestamp, the level and the sender's name).
+The levels, and which one a line takes, are in
+[services/logd/docs/ipc-interface.md § Levels](../services/logd/docs/ipc-interface.md#levels),
+including the lines an xtask check or a CI pattern matches, which change only with their check.
+These rules govern every new or changed message; existing messages are brought to them
+separately.
+
+- A message MUST report one event: what happened, to what, and the values needed to act on it,
+  and nothing else.
+- A message MUST NOT explain: no definition of a term, no reason a value is what it is, no list
+  of examples in parentheses, no "etc.", no advice. What a thing means belongs in the
+  documentation.
+- A message MUST NOT repeat what the line's prefix shows: the sender's name, the level as a word
+  (`error:`, `warning:`), or the time.
+- A message starts in lower case (an acronym, a unit or an identifier keeps its own case), ends
+  with no period and no exclamation mark, and is at most one clause. An optional topic comes
+  first, followed by a colon (`mmio: 261 MiB outside DRAM`).
+- A value MUST take its one form: a size in the largest binary unit that gives a whole number
+  (`4 KiB`, `261 MiB`); an address, a mask or an error code in hexadecimal with `0x`; a count or
+  an id in decimal; a duration with its unit (`12 ms`). A message that carries more than two
+  values gives each named value as `key=value`.
+- The same event MUST have the same words wherever it is logged, and no variable part splits
+  them, so that one search for those words finds every instance. The values follow them; only the
+  name of what the event happened to, or the size or count it concerns, comes before them.
+- The level says how much a line matters, and the wording MUST NOT: `failed` at ERROR, not
+  `FATAL: failed!!`. Each step of a sequence is at DEBUG; INFO is a state change an operator
+  wants in a boot log, logged once. A failure message names what failed and the error value, and
+  says what the system does about it only when that is not the default. A test harness's lines
+  take the level ipc-interface.md § Levels gives them.
+- A line that exists only to show that code was reached is at DEBUG, or is removed.
+
+Each example shows a line before and after these rules. The after line is in the console layout
+of the eight-level logging design (design intent; not yet implemented: today a line renders as
+`[sec.usfrac] [name] WARN <line>`, with no tag at info, as ipc-interface.md § Levels states). A
+line longer than the column limit continues on an indented line.
+
+```
+kernel: MMIO: 261 MiB address-space windows outside DRAM (PCIe MMCFG / LAPIC / APLIC / CLINT /
+    etc. — not RAM)
+[--------] INFO   [kernel] mmio: 261 MiB outside DRAM
+
+[svcmgr] WARN svcmgr: crasher-boot died during its bootstrap (exit reason 0x2000)
+[    6.308457] WARN   [svcmgr] crasher-boot died in bootstrap, exit reason 0x2000
+```
+
 ---
 
 ## C. Architecture Invariants

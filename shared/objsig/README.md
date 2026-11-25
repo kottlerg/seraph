@@ -36,8 +36,18 @@ A `Refusal` is a parse error, `Untrusted` when no record names an anchor of the 
 `RecordFailure` of the first record that names one and fails a check.
 
 Every parser is a total function over an arbitrary byte slice: it reads byte-wise and only inside
-the slice, never panics, and refuses anything the format does not define, so each is a fuzz entry
-point as it stands. Every encoder refuses what the parsers refuse, so what it writes parses.
+the slice, never panics, and refuses anything the format does not define. Every encoder refuses
+what the parsers refuse, so what it writes parses.
+
+The parsers read bytes before any signature over them is checked, so they carry the parser rule's
+property and its three drivers ([docs/testing.md](../../docs/testing.md#fuzzing) § Fuzzing,
+§ Bounded verification). The property, `property::objsig_holds`, holds `split`,
+`Attributes::parse`, `Certificate::parse`, `TrustStore::parse`, `EnrolledStore::parse` and
+`TrustRequest::parse` to their documented contracts on any input. Its drivers are the fuzz target
+`objsig` (`xtask/fuzz/targets`), which starts from the seeds under `fuzz/objsig/seeds/`; the
+replay of those seeds and any `fuzz/objsig/regressions/` in the crate's tests; and the Kani proofs
+in `trailer.rs`, `attrs.rs`, `cert.rs`, `store.rs` and `enrol.rs`, whose module comments state
+their bounds and how they compose into the property.
 
 `MAX_RECORDS` (8), `CERTIFICATE_CACHE_LEN` (4) and the enrolled store's `MAX_ANCHORS` (3) and
 `MAX_REVOKED` (120) are the crate's bounds beside the formats'
@@ -63,16 +73,23 @@ primitive's signature under the stated context.
 shared/objsig/
 ├── Cargo.toml                  # Workspace member; no_std library
 ├── README.md
+├── fuzz/
+│   └── objsig/
+│       └── seeds/              # Checked-in inputs of the `objsig` fuzz target
 └── src/
     ├── lib.rs                  # Kinds, architectures, usage masks, key ids, errors
-    ├── attrs.rs                # Signed attributes
-    ├── cert.rs                 # Certificate
+    ├── attrs.rs                # Signed attributes; the proofs of their parse
+    ├── cert.rs                 # Certificate; the proofs of its parse
     ├── composite.rs            # Composite signature: Ed25519 and ML-DSA-65
     ├── embed.rs                # Trust store embedded in a bootloader image: marker, find
-    ├── enrol.rs                # Enrolled trust store, trust request, merge and apply
+    ├── enrol.rs                # Enrolled trust store, trust request, merge and apply;
+    │                           #   the proofs of their parse
     ├── index.rs                # Signed index of a configuration directory
-    ├── store.rs                # Trust store
-    ├── trailer.rs              # Signed object: split, records, trailer encoder
+    ├── property.rs             # The parsers' contract as one property (host tests,
+    │                           #   proofs and fuzzing only)
+    ├── store.rs                # Trust store; the proofs of its parse
+    ├── trailer.rs              # Signed object: split, records, trailer encoder; the
+    │                           #   proofs of its parse
     ├── verify.rs               # Verifier and its policy
     ├── wire.rs                 # Byte-wise little-endian reader and writer
     └── testutil.rs             # Test keys and fixture builders (tests only)

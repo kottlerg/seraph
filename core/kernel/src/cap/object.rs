@@ -4973,8 +4973,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // no binding names this state.
 
                 // The kernel log's binding holds no reference: clear it here,
-                // under its lock, before the state is freed, so the timer
-                // tick's signal never reaches a freed notification.
+                // before the state is freed, so the timer tick's signal never
+                // reaches a freed notification. It takes the binding's lock
+                // only when the binding names this state.
                 crate::klog::forget_notification(state);
 
                 // Wait-set membership holds a +1 cap-level ref on the source

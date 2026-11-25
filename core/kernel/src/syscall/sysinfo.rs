@@ -31,7 +31,8 @@ const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::IdleHalts as u64 + 1;
 /// `StackHighWater` class, an unknown `SpeculationControls` view or an
 /// `SmtSibling` CPU index at or past the CPU count, and
 /// `NotSupported` for the handoff class when the kernel could not locate the
-/// handoff stack and for `SpeculationControls` on riscv64.
+/// handoff stack and for `SpeculationControls` on riscv64, and `InvalidState`
+/// for `IdleHalts` when the caller has no mark on its CPU.
 ///
 /// A discriminant at or past [`SYSTEM_INFO_BOUND`] is refused before the
 /// match, and the match reads it clamped as data (`nospec::mask_index_u64`),
@@ -149,12 +150,13 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         }
         15 =>
         // IdleHalts — the halts of the idle thread of the CPU this syscall
-        // runs on, from a random start (`sched::idle_halts`): only a
-        // difference of two reads on one CPU means anything. Takes no
-        // argument and indexes nothing the caller chooses
+        // runs on since the caller's previous IdleHalts call on it
+        // (`sched::idle_halts_since_mark`); `InvalidState` when the caller
+        // has made none, or made it on another CPU, which marks this CPU for
+        // the next. Takes no argument and indexes nothing the caller chooses
         // (core/kernel/docs/cross-boundary-disclosure.md).
         {
-            Ok(crate::sched::idle_halts())
+            crate::sched::idle_halts_since_mark().ok_or(SyscallError::InvalidState)
         }
         _ => Err(SyscallError::InvalidArgument),
     }

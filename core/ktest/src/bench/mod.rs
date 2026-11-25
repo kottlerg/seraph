@@ -14,9 +14,9 @@
 //! counter read is an unprivileged instruction, so no syscall sits on the
 //! measurement path: `rdtsc` on x86-64 (the kernel clears `CR4.TSD` on every
 //! CPU) and `csrr cycle` on riscv64 (the kernel sets `scounteren.CY` on every
-//! hart). The recorder reads CPU 0's idle-halt count when a benchmark takes
-//! it, before its measured loop, and again at its summary, after the loop, and
-//! the line reports the difference as `idle_halts=`
+//! hart). The recorder marks CPU 0's idle-halt count when a benchmark takes
+//! it, before its measured loop, and its summary, after the loop, reads the
+//! halts since the mark, which the line reports as `idle_halts=`
 //! (`shared/bench/README.md` § Idle halts).
 //!
 //! # Adding a new benchmark
@@ -77,14 +77,12 @@ pub(super) struct Harness
     buf: &'static mut [u64; MAX_SAMPLES],
 }
 
-/// A benchmark's samples over its measured loop, with CPU 0's idle-halt count
-/// read when the loop began, which [`Recorder::summary`] reads again where
-/// it ended.
+/// A benchmark's samples over its measured loop, taken with CPU 0's
+/// idle-halt count marked where the loop began, so that
+/// [`Recorder::summary`] reads the halts since where it ended.
 pub(super) struct Recorder<'a>
 {
     samples: Samples<'a>,
-    /// The count when the recorder was taken; `None` when the read failed.
-    idle_start: Option<u64>,
 }
 
 impl Recorder<'_>
@@ -98,15 +96,13 @@ impl Recorder<'_>
 
     /// End the measured loop: the halts of CPU 0 since the recorder was
     /// taken, read first, and the summary of the samples. Call it right after
-    /// the loop's last sample.
+    /// the loop's last sample, with no `IdleHalts` call of the thread
+    /// between, which would move the mark.
     pub(super) fn summary(&mut self) -> Measured
     {
-        let idle_end = syscall::idle_halts().ok();
+        let idle_halts = syscall::idle_halts().ok();
         Measured {
-            idle_halts: self
-                .idle_start
-                .zip(idle_end)
-                .map(|(start, end)| end.wrapping_sub(start)),
+            idle_halts,
             summary: self.samples.summary(),
         }
     }
@@ -120,8 +116,10 @@ pub(super) struct Measured
 {
     /// The summary; `None` when no sample was recorded.
     summary: Option<Summary>,
-    /// The halts; `None` when a read failed, or for samples taken on other
-    /// CPUs than CPU 0, of whose windows CPU 0's count says nothing.
+    /// The halts; `None` when the read failed (the thread had not marked
+    /// CPU 0 at the recorder, or ran it there on another CPU), or for samples
+    /// taken on other CPUs than CPU 0, of whose windows CPU 0's count says
+    /// nothing.
     idle_halts: Option<u64>,
 }
 
@@ -148,16 +146,15 @@ impl Harness
     }
 
     /// An empty recorder over the sample buffer, and the counters to time
-    /// each operation with. Taking it reads CPU 0's idle-halt count, so take
-    /// it right before the measured loop, and end the loop with
-    /// [`Recorder::summary`].
+    /// each operation with. Taking it marks CPU 0's idle-halt count (an
+    /// `IdleHalts` call whose value is not read), so take it right before the
+    /// measured loop, and end the loop with [`Recorder::summary`].
     pub(super) fn recorder(&mut self) -> (Recorder<'_>, &Counters)
     {
-        let idle_start = syscall::idle_halts().ok();
+        let _ = syscall::idle_halts();
         (
             Recorder {
                 samples: Samples::new(&mut self.buf[..]),
-                idle_start,
             },
             &self.counters,
         )

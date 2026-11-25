@@ -109,12 +109,14 @@ whole log can be scanned. A program logs no other text of the form `bench <word>
 Under QEMU's icount (`cargo xtask run --icount`) a timed window that idles counts host time: while
 every vCPU idles, the guest's clock follows the host's
 ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)). Every harness
-therefore reads the idle-halt count of the CPU it measures on (`SYS_SYSTEM_INFO(IdleHalts)`,
-`syscall::idle_halts`, which answers for the calling CPU alone) right before a measured loop and
-right after it, outside every timed window, with the thread pinned to that CPU across both reads,
-and reports the difference as the extra `idle_halts=` (`IDLE_HALTS`): the times the CPU found no
-thread to run while the loop ran. The count starts at a random value, arbitrary per boot and per
-CPU, so only such a difference means anything.
+therefore calls `SYS_SYSTEM_INFO(IdleHalts)` (`syscall::idle_halts`, which answers for the
+calling CPU alone) right before a measured loop, which marks that CPU's idle-halt count in the
+calling thread, and right after it, which returns the halts since the mark, both outside every
+timed window, with the thread pinned to that CPU across both calls and making no other such call
+between them. The line reports that count as the extra `idle_halts=` (`IDLE_HALTS`): the times
+the CPU found no thread to run while the loop ran. The kernel counts only from the mark: a call
+that has none on its CPU (the thread's first, or one after a move) returns an error, and the line
+then carries no count.
 
 The span holds every timed window of the line and the untimed work of the loop between them (a
 warm-up iteration, a check, a step that readies the next sample). A count of zero says that no

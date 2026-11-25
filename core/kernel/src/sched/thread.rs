@@ -1393,6 +1393,18 @@ pub struct ThreadControlBlock
     /// Owned by `THREAD_REGISTRY_LOCK` (the Registry row).
     pub registry: crate::sched::registry_list::RegistryLinks<ThreadControlBlock>,
 
+    // === Idle-halt mark ===
+    /// The CPU of this thread's previous `SYS_SYSTEM_INFO(IdleHalts)` call,
+    /// [`NO_IDLE_HALTS_MARK`] before its first. The call answers the halts of
+    /// its CPU since the mark when it runs on the mark's CPU, and moves the
+    /// mark to its own CPU and count ([`crate::sched::idle_halts_since_mark`]).
+    /// Owned by the thread itself: read and written only by its own call, on
+    /// the CPU it runs on, Relaxed (the Idle-halt mark row).
+    pub idle_halts_mark_cpu: core::sync::atomic::AtomicU32,
+    /// The idle-halt count of the mark's CPU at the mark
+    /// ([`idle_halts_mark_cpu`](Self::idle_halts_mark_cpu)); owned the same way.
+    pub idle_halts_mark: core::sync::atomic::AtomicU64,
+
     // === Use-after-free detection ===
     /// Magic cookie for use-after-free detection. Must be `TCB_MAGIC` when valid.
     /// Immutable from construction until the `dealloc_object(Thread)` poison
@@ -1402,6 +1414,12 @@ pub struct ThreadControlBlock
 
 /// Expected value of `ThreadControlBlock::magic` for a live TCB.
 pub const TCB_MAGIC: u64 = 0xDEAD_BEEF_CAFE_F00D;
+
+/// `ThreadControlBlock::idle_halts_mark_cpu` of a thread that has made no
+/// `SYS_SYSTEM_INFO(IdleHalts)` call: no CPU index, since a CPU index is
+/// below `CPU_COUNT`. Every TCB is constructed with it, so a new thread, and
+/// a TCB a retype reuses, starts unmarked.
+pub const NO_IDLE_HALTS_MARK: u32 = u32::MAX;
 
 #[expect(
     clippy::non_send_fields_in_send_ty,

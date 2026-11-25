@@ -212,25 +212,28 @@ fn measure(f: &mut File, size: u64, read_path: ReadPath, buf: &mut [u8], run: &B
     log_line("read", size, path, run, (summary, idle_halts));
 }
 
-/// The idle-halt count of [`BENCH_CPU`], read right before a timed loop,
-/// which [`IdleSpan::close`] reads again right after it
+/// The idle-halt count of [`BENCH_CPU`], marked right before a timed loop,
+/// whose halts since the mark [`IdleSpan::close`] reads right after it
 /// (shared/bench/README.md § Idle halts).
-struct IdleSpan(Option<u64>);
+struct IdleSpan(());
 
 impl IdleSpan
 {
-    /// Read the count where the timed loop begins.
+    /// Mark the count where the timed loop begins: an `IdleHalts` call
+    /// whose value is not read.
     fn open() -> Self
     {
-        Self(syscall::idle_halts().ok())
+        let _ = syscall::idle_halts();
+        Self(())
     }
 
-    /// The halts of the CPU since [`IdleSpan::open`]; `None` when a read
+    /// The halts of the CPU since [`IdleSpan::open`]; `None` when the read
     /// failed, and the line then carries no `idle_halts=`.
     fn close(self) -> Option<u64>
     {
-        let end = syscall::idle_halts().ok()?;
-        Some(end.wrapping_sub(self.0?))
+        // The span ends here: its marker is consumed, so a span is closed once.
+        let Self(()) = self;
+        syscall::idle_halts().ok()
     }
 }
 

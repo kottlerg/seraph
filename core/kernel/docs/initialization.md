@@ -660,9 +660,6 @@ The scratch pages and bundle layout are described in
    NUM_RUN_QUEUES (13) queues per CPU (one per RT level, one the fair levels share, one
    for the idle level), each an intrusive singly-linked FIFO of TCBs (head/tail, linked
    through run_queue_next)
-1a. Start each CPU's idle-halt count (CpuDiag.idle_halts) at its own random value below
-   2^62, one output of the BSP's generator each, which Phase 5's pool seeding opened
-   (sched::start_idle_halt_counts); no idle thread has run yet, so no halt precedes it
 2. For each CPU (including the BSP):
    a. Use the idle kernel stack pre-allocated at per-CPU storage init
       (Phase 4); read its top from the IDLE_STACK_TOPS slab

@@ -1970,15 +1970,17 @@ pub fn smt_sibling(cpu: u64) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
-/// The halts of the idle thread of the CPU this call runs on, from a random
-/// start arbitrary per boot and per CPU (`SystemInfoType::IdleHalts`): only
-/// the difference of two reads means anything, taken with `wrapping_sub`, and
-/// only when the calling thread is pinned to one CPU between them, since an
-/// unpinned thread may read two CPUs' counts.
+/// The times the idle thread of the CPU this call runs on has halted that CPU
+/// since the calling thread's previous call, when that call ran on the same
+/// CPU (`SystemInfoType::IdleHalts`). Each call marks its CPU and count in
+/// the calling thread, so a thread pinned to one CPU reads the halts between
+/// two of its calls; the kernel reports no count since boot.
 ///
 /// # Errors
-/// Returns a negative `i64` error code from a kernel that predates the
-/// query (`InvalidArgument`).
+/// Returns a negative `i64` error code: `InvalidState` when the calling
+/// thread has made no call, or made its previous one on another CPU (the call
+/// marks this CPU, and the next call on it answers), and `InvalidArgument`
+/// from a kernel that predates the query.
 #[inline]
 pub fn idle_halts() -> Result<u64, i64>
 {

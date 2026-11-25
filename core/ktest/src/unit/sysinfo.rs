@@ -13,22 +13,23 @@
 //! `integration::thread_memory` and `unit::retype`'s code stub. `SmtSibling` is
 //! read here for its range; `integration::smt_siblings` checks each ring against
 //! the core each CPU reports. `IdleHalts` is read here across a sleep of a
-//! thread pinned to CPU 0, and on two CPUs for their random starts; the
-//! benchmark harnesses read it around their timed samples
-//! (shared/bench/README.md § Idle halts).
+//! thread pinned to CPU 0, and for its per-thread, per-CPU mark: a new
+//! thread's first call and a moved thread's call; the benchmark harnesses read
+//! it around their timed samples (shared/bench/README.md § Idle halts).
 
 use syscall::{
-    MAP_WRITABLE, cap_create_cspace, cap_create_thread, cap_delete, cap_info, idle_halts, mem_map,
-    mem_unmap, memory_merge, memory_split, smt_sibling, speculation_controls, system_info,
-    thread_set_affinity, thread_sleep, thread_yield,
+    MAP_WRITABLE, cap_copy, cap_create_cspace, cap_create_notification, cap_create_thread,
+    cap_delete, cap_info, idle_halts, mem_map, mem_unmap, memory_merge, memory_split,
+    notification_send, notification_wait, smt_sibling, speculation_controls, system_info,
+    thread_exit, thread_set_affinity, thread_sleep, thread_yield,
 };
 use syscall_abi::{
-    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, KERNEL_VERSION, PAGE_SIZE,
+    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, KERNEL_VERSION, PAGE_SIZE, RIGHTS_NTF_NOTIFY,
     SPECULATION_VIEW_IN_EFFECT, SPECULATION_VIEW_INPUTS, SPECULATION_VIEW_SELECTED, SyscallError,
     SystemInfoType,
 };
 
-use crate::{TestContext, TestResult};
+use crate::{ChildStack, TestContext, TestResult};
 
 // ── SYS_SYSTEM_INFO ───────────────────────────────────────────────────────────
 
@@ -440,10 +441,33 @@ pub fn smt_sibling_range(_ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// Yields that let the scheduler move a pinned thread to its CPU, as the
+/// bench harness's pin bounds them.
+const MAX_YIELDS: u32 = 1000;
+/// The affinity argument that clears a thread's hard affinity.
+const AFFINITY_ANY: u32 = u32::MAX;
+
+/// Pin `thread`, the calling thread, to `cpu` and yield until it runs there;
+/// `false` when it never did.
+fn run_on(thread: u64, cpu: u32) -> Result<bool, &'static str>
+{
+    thread_set_affinity(thread, cpu).map_err(|_| "sysinfo::idle_halts: pin failed")?;
+    let on_cpu = || system_info(SystemInfoType::CurrentCpu as u64) == Ok(u64::from(cpu));
+    for _ in 0..MAX_YIELDS
+    {
+        if on_cpu()
+        {
+            return Ok(true);
+        }
+        let _ = thread_yield();
+    }
+    Ok(on_cpu())
+}
+
 /// `system_info(IdleHalts)` counts the halts of the calling CPU's idle
-/// thread: a thread pinned to CPU 0 that sleeps leaves that CPU nothing to
-/// run, so the count it reads after the sleep is above the one it read
-/// before.
+/// thread since the caller's previous call on that CPU: a thread pinned to
+/// CPU 0 that calls and then sleeps leaves the CPU nothing to run, so its
+/// next call returns a count above zero.
 ///
 /// Defect caught: a halt the idle loop does not count, or a query that reads
 /// another CPU's count, either of which lets a benchmark's timed window idle
@@ -452,34 +476,19 @@ pub fn idle_halts_rise_across_a_sleep(ctx: &TestContext) -> TestResult
 {
     /// The sleep: one tick or more, so the CPU halts at least once.
     const SLEEP_MS: u64 = 2;
-    /// Yields that let the scheduler move the thread to CPU 0, as the bench
-    /// harness's pin bounds them.
-    const MAX_YIELDS: u32 = 1000;
-    /// The affinity argument that clears a thread's hard affinity.
-    const AFFINITY_ANY: u32 = u32::MAX;
 
-    thread_set_affinity(ctx.thread_cap, 0).map_err(|_| "sysinfo::idle_halts: pin failed")?;
-    let on_cpu0 = || system_info(SystemInfoType::CurrentCpu as u64) == Ok(0);
-    for _ in 0..MAX_YIELDS
+    let outcome = if run_on(ctx.thread_cap, 0)?
     {
-        if on_cpu0()
-        {
-            break;
-        }
-        let _ = thread_yield();
-    }
-    let outcome = if on_cpu0()
-    {
-        // Pinned to CPU 0 and running there, the thread reads CPU 0's count
-        // both times.
-        let before = idle_halts();
+        // Pinned to CPU 0 and running there, the thread marks CPU 0; the
+        // call's value (`InvalidState` when the thread has not called on CPU
+        // 0 before) is not read.
+        let _ = idle_halts();
         let slept = thread_sleep(SLEEP_MS);
-        let after = idle_halts();
-        match (before, slept, after)
+        match (slept, idle_halts())
         {
-            (Ok(before), Ok(()), Ok(after)) if after.wrapping_sub(before) > 0 => Ok(()),
-            (Ok(_), Ok(()), Ok(_)) => Err("system_info(IdleHalts) did not rise across a sleep"),
-            _ => Err("sysinfo::idle_halts: a read or the sleep failed"),
+            (Ok(()), Ok(halts)) if halts > 0 => Ok(()),
+            (Ok(()), Ok(_)) => Err("system_info(IdleHalts) counted no halt across a sleep"),
+            _ => Err("sysinfo::idle_halts: the sleep, or the read after it, failed"),
         }
     }
     else
@@ -490,56 +499,123 @@ pub fn idle_halts_rise_across_a_sleep(ctx: &TestContext) -> TestResult
     outcome
 }
 
-/// Each CPU's `system_info(IdleHalts)` count starts at its own random value
-/// below 2^62: the counts of CPUs 0 and 1 differ above their low 32 bits,
-/// which no boot's halts reach. A shared or zero start would leave them
-/// equal there. Two independent random starts agree in those 30 bits with a
-/// chance of one in 2^30.
-///
-/// Defect caught: a start the kernel never applies, or one applied to a
-/// single CPU, which leaves each CPU's idle history since boot readable by
-/// any process (core/kernel/docs/cross-boundary-disclosure.md).
-pub fn idle_halts_start_apart_per_cpu(ctx: &TestContext) -> TestResult
+/// Bit the `idle_halts_mark_per_thread_and_cpu` child always sends, so that
+/// its notification is never empty.
+const MARK_CHILD_RAN: u64 = 1 << 0;
+/// Bit the child sends when its first call returned `InvalidState`.
+const MARK_CHILD_FIRST_UNMARKED: u64 = 1 << 1;
+/// Bit the child sends when its second call returned a count.
+const MARK_CHILD_SECOND_ANSWERED: u64 = 1 << 2;
+
+/// The child's stack; one child runs on it at a time, and it has exited when
+/// the test returns.
+static mut STACK_IDLE_HALTS_MARK: ChildStack = ChildStack::ZERO;
+
+/// `idle_halts_mark_per_thread_and_cpu`'s child, pinned to CPU 0: calls
+/// `IdleHalts` twice and reports both outcomes on `sig`.
+extern "C" fn idle_halts_mark_child(sig: u64) -> !
 {
-    /// Yields that let the scheduler move the thread to its pinned CPU.
-    const MAX_YIELDS: u32 = 1000;
-    /// The affinity argument that clears a thread's hard affinity.
-    const AFFINITY_ANY: u32 = u32::MAX;
-    /// The low bits a boot's halts can change.
-    const COUNT_BITS: u32 = 32;
+    let first = idle_halts();
+    let second = idle_halts();
+    let mut bits = MARK_CHILD_RAN;
+    if first == Err(SyscallError::InvalidState as i64)
+    {
+        bits |= MARK_CHILD_FIRST_UNMARKED;
+    }
+    if second.is_ok()
+    {
+        bits |= MARK_CHILD_SECOND_ANSWERED;
+    }
+    notification_send(sig, bits).ok();
+    thread_exit()
+}
+
+/// `system_info(IdleHalts)` answers only across two calls of one thread on
+/// one CPU: a new thread's first call, and a call after the thread's previous
+/// call ran on another CPU, return `InvalidState` and mark the CPU, and the
+/// next call there returns a count.
+///
+/// Defect caught: a TCB constructed with a mark (a new thread would read a
+/// difference from a count it never took, or from a count a dead thread
+/// took), or a mark not tied to its CPU (a moved thread would read the
+/// difference of two CPUs' counts).
+pub fn idle_halts_mark_per_thread_and_cpu(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "sysinfo::idle_halts_mark: create_notification failed")?;
+    let mut child = crate::spawn::new_child(ctx)
+        .map_err(|_| "sysinfo::idle_halts_mark: spawn::new_child failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "sysinfo::idle_halts_mark: cap_copy of the notification failed")?;
+    // SAFETY: `STACK_IDLE_HALTS_MARK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_IDLE_HALTS_MARK)) };
+    // SAFETY: the stack is `STACK_IDLE_HALTS_MARK`, this test's own
+    // `ChildStack`, on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start_pinned(
+            &child,
+            idle_halts_mark_child,
+            stack_top,
+            child_sig,
+            0,
+        )
+    }
+    .map_err(|_| "sysinfo::idle_halts_mark: configure_and_start_pinned failed")?;
+    let bits = notification_wait(sig);
+    child
+        .delete_thread()
+        .map_err(|_| "sysinfo::idle_halts_mark: cap_delete of the child failed")?;
+    cap_delete(sig)
+        .map_err(|_| "sysinfo::idle_halts_mark: cap_delete of the notification failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "sysinfo::idle_halts_mark: cap_delete of the child's CSpace failed")?;
+    let bits = bits.map_err(|_| "sysinfo::idle_halts_mark: notification_wait failed")?;
+    if bits & MARK_CHILD_FIRST_UNMARKED == 0
+    {
+        return Err("a new thread's first IdleHalts call did not return InvalidState");
+    }
+    if bits & MARK_CHILD_SECOND_ANSWERED == 0
+    {
+        return Err("a new thread's second IdleHalts call on one CPU returned no count");
+    }
 
     let cpus = system_info(SystemInfoType::CpuCount as u64)
-        .map_err(|_| "sysinfo::idle_halts_start: system_info(CpuCount) failed")?;
+        .map_err(|_| "sysinfo::idle_halts_mark: system_info(CpuCount) failed")?;
     if cpus < 2
     {
-        crate::log("ktest: sysinfo::idle_halts_start_apart_per_cpu SKIP (needs 2 CPUs)");
         return Ok(());
     }
-    // The count of `cpu`, read by this thread pinned there and running there.
-    let read_on = |cpu: u32| -> Result<u64, &'static str> {
-        thread_set_affinity(ctx.thread_cap, cpu)
-            .map_err(|_| "sysinfo::idle_halts_start: pin failed")?;
-        let on_cpu = || system_info(SystemInfoType::CurrentCpu as u64) == Ok(u64::from(cpu));
-        for _ in 0..MAX_YIELDS
-        {
-            if on_cpu()
-            {
-                break;
-            }
-            let _ = thread_yield();
-        }
-        if !on_cpu()
-        {
-            return Err("sysinfo::idle_halts_start: the thread never ran on its pinned CPU");
-        }
-        idle_halts().map_err(|_| "sysinfo::idle_halts_start: system_info(IdleHalts) failed")
-    };
-    let counts = read_on(0).and_then(|first| read_on(1).map(|second| (first, second)));
+    let outcome = idle_halts_mark_moves(ctx.thread_cap);
     let _ = thread_set_affinity(ctx.thread_cap, AFFINITY_ANY);
-    let (first, second) = counts?;
-    if first >> COUNT_BITS == second >> COUNT_BITS
+    outcome
+}
+
+/// The moved-thread half of `idle_halts_mark_per_thread_and_cpu`, on
+/// `thread`, the calling thread: a count on CPU 0, `InvalidState` on the
+/// first call after the move to CPU 1, and a count on the call after it.
+fn idle_halts_mark_moves(thread: u64) -> TestResult
+{
+    if !run_on(thread, 0)?
     {
-        return Err("system_info(IdleHalts) of CPUs 0 and 1 agree above their low 32 bits");
+        return Err("sysinfo::idle_halts_mark: the thread never ran on CPU 0");
+    }
+    let _ = idle_halts();
+    if idle_halts().is_err()
+    {
+        return Err("a second IdleHalts call on one CPU returned no count");
+    }
+    if !run_on(thread, 1)?
+    {
+        return Err("sysinfo::idle_halts_mark: the thread never ran on CPU 1");
+    }
+    if idle_halts() != Err(SyscallError::InvalidState as i64)
+    {
+        return Err("an IdleHalts call after a move to another CPU did not return InvalidState");
+    }
+    if idle_halts().is_err()
+    {
+        return Err("the IdleHalts call after the moved one returned no count");
     }
     Ok(())
 }

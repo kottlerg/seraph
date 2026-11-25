@@ -44,27 +44,31 @@ pub fn cpu_count() -> Result<u32, String>
     u32::try_from(count).map_err(|_| format!("CPU count {count} does not fit in u32"))
 }
 
-/// The idle-halt count of the CPU the calling thread runs on, read right
-/// before a measured loop, which [`IdleSpan::close`] reads again right after
-/// it (shared/bench/README.md § Idle halts). The thread is pinned to that CPU
-/// for the whole loop.
-pub struct IdleSpan(Option<u64>);
+/// The idle-halt count of the CPU the calling thread runs on, marked right
+/// before a measured loop, whose halts since the mark [`IdleSpan::close`]
+/// reads right after it (shared/bench/README.md § Idle halts). The thread is
+/// pinned to that CPU for the whole loop and makes no other `IdleHalts` call
+/// in it.
+pub struct IdleSpan(());
 
 impl IdleSpan
 {
-    /// Read the count where the measured loop begins.
+    /// Mark the count where the measured loop begins: an `IdleHalts` call
+    /// whose value is not read.
     pub fn open() -> Self
     {
-        Self(syscall::idle_halts().ok())
+        let _ = syscall::idle_halts();
+        Self(())
     }
 
     /// The halts of the CPU since [`IdleSpan::open`], read where the
-    /// measured loop ends; `None` when a read failed, and the line then
+    /// measured loop ends; `None` when the read failed, and the line then
     /// carries no `idle_halts=`.
     pub fn close(self) -> Option<u64>
     {
-        let end = syscall::idle_halts().ok()?;
-        Some(end.wrapping_sub(self.0?))
+        // The span ends here: its marker is consumed, so a span is closed once.
+        let Self(()) = self;
+        syscall::idle_halts().ok()
     }
 }
 

@@ -305,7 +305,8 @@ pub enum SyscallError
     QueueFull = -13,
     // -14 retired (`DmaUnsafe`, removed with `SYS_DMA_GRANT`); never reuse.
     /// The target object is not in the required state for this operation
-    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
+    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`), or the
+    /// calling thread has no `IdleHalts` mark on its CPU.
     InvalidState = -15,
     /// A blocking operation was cancelled: the thread was stopped or
     /// interrupted by an upcall, the notification, event queue, or wait set it
@@ -3650,7 +3651,8 @@ Query a scalar system value. Returns a single `u64` in `rax`/`a0` — no buffer 
 **Errors:** `InvalidArgument` (unknown `info_type`, unknown `class` for `StackHighWater`,
 unknown `view` for `SpeculationControls`, or a `SmtSibling` index at or past `CpuCount`);
 `NotSupported` (`StackHighWater` handoff class, when the kernel could not locate the handoff
-stack; `SpeculationControls` on riscv64).
+stack; `SpeculationControls` on riscv64); `InvalidState` (`IdleHalts`, when the calling
+thread has made no `IdleHalts` call, or made its previous one on another CPU).
 
 ### `SystemInfoType`
 
@@ -3765,19 +3767,21 @@ pub enum SystemInfoType
     /// secret. On riscv64 every hart is its own core.
     SmtSibling          = 14,
 
-    /// The halts of the idle thread of the CPU the call runs on, counted from
-    /// a random start below 2^62 that is arbitrary per boot and per CPU: one
-    /// per stretch in which the CPU found no thread to run, and one more for
-    /// each interrupt that ends a halt and leaves it with none. Only the
-    /// difference of two reads on one CPU means anything; the absolute says
-    /// nothing. Counted before the halt, so a thread the ending interrupt
-    /// wakes reads it. Takes no argument and answers for no other CPU. A
-    /// diagnostic count, readable by any process with no capability; a
-    /// benchmark pinned to one CPU reads it before and after its measured
+    /// Number of times the idle thread of the CPU the call runs on has halted
+    /// that CPU since the calling thread's previous IdleHalts call, when that
+    /// call ran on the same CPU: one per stretch in which the CPU found no
+    /// thread to run, and one more for each interrupt that ends a halt and
+    /// leaves it with none. Counted before the halt, so a thread the ending
+    /// interrupt wakes reads it. Each call marks its CPU and that CPU's count
+    /// in the calling thread's TCB, which a thread's creation leaves unmarked,
+    /// so a thread reads only the halts between two of its own calls on one
+    /// CPU, never a count since boot. InvalidState when the thread has made no
+    /// call, or made its previous one on another CPU: that call marks its CPU
+    /// too, and the next call there answers. Takes no argument and answers for
+    /// no other CPU. A diagnostic, readable by any process with no capability;
+    /// a benchmark pinned to one CPU calls it before and after its measured
     /// loop, so that its result line says whether a timed window waited with
-    /// the CPU idle (shared/bench/README.md § Idle halts). Two reads by a
-    /// thread that is not pinned may be of two CPUs, and their difference then
-    /// means nothing.
+    /// the CPU idle (shared/bench/README.md § Idle halts).
     IdleHalts           = 15,
 }
 ```

@@ -123,8 +123,8 @@ bench fsbench.open depth=3 arch=<arch> cpus=<k> unit=cycles
 
 Each `read` or `write` sample is one timed iteration, which covers all the `read` or
 `write_all` calls that one size needs, not a single call; each `open` sample is one
-`File::open`. `idle_halts=` is the halts of CPU 0 over the case's timed loop, read after its
-warm-up and after its last sample
+`File::open`. `idle_halts=` is the halts of CPU 0 over the case's timed loop, marked after its
+warm-up and read after its last sample
 ([shared/bench/README.md § Idle halts](../../../shared/bench/README.md#idle-halts)); a read that
 failed leaves it out.
 

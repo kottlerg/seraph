@@ -99,7 +99,9 @@ a sender that sets no level logs at info.
 - **Sender.** `seraph::log!("fmt", args…)` logs at info; a leading `error:`,
   `warn:`, `info:`, `debug:`, or `trace:` sets the level
   (`seraph::log!(warn: "fmt", args…)`). Each call site states the level
-  the rule below gives its line. std's panic, allocation-error,
+  the rule below gives its line, in a message worded as
+  [coding-standards.md](../../../docs/coding-standards.md#log-messages)
+  § Log Messages requires. std's panic, allocation-error,
   and precondition output, sent through the same cap, is at error. Bytes a
   sender writes with `log::write_bytes` carry the level it passes. A record
   (§ `stream_labels::STREAM_RECORD`) carries its level the same way.

@@ -503,16 +503,11 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
 /// access alone: the trap can block or be switched out (a syscall, a fault
 /// delivery, a timer-tick preemption), during which other paths access the
 /// same frame through the thread's published `trap_frame`
-/// (`SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS`, the FS/VS clear in
-/// `fpu::switch_out_save`), so no reference may live across those points
+/// (`SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS`, the FS/VS writes of
+/// `fpu::switch_out_save` and `fpu::switch_in_restore`), so no reference may
+/// live across those points
 /// (core/kernel/docs/arch-interface.md § `trap_frame`).
 #[cfg(not(test))]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the single scause dispatch (interrupt, syscall, and the hand-off of a user or \
-              kernel exception to `user_exception` or `kernel_exception`) stays one function so \
-              the trap-frame ownership and SIE discipline read in one place"
-)]
 #[expect(
     clippy::inline_always,
     reason = "trap_dispatch is the one caller; left out of line, every trap, each syscall \
@@ -570,38 +565,19 @@ fn handle_trap(frame: *mut TrapFrame)
     }
     else if cause_code == 2
         && (sstatus_at_entry & (1 << 8)) == 0
-        && super::encoding::is_lazy_fp_v_trap(sstatus_at_entry, stval)
+        && super::encoding::is_first_use_trap(sstatus_at_entry, stval)
     {
         // U-mode illegal-instruction trap on an F/D/V opcode with the units
         // Off (one refused with them on is the thread's fault, which the
-        // last arm takes): lazy enable
-        // by promoting sstatus.FS / sstatus.VS from Off to Initial, then
-        // restore the F/D (and V) register file from the thread's per-TCB
-        // area. lazy_restore_fp_v mirrors the resulting live FS/VS bits
-        // into frame.sstatus so the trap_entry restore on sret keeps the
-        // promotion — without that, sret would put FS = VS = Off back
-        // into the live CSR and the trapping instruction would re-trap
-        // forever. Returns without advancing sepc so the trapping
-        // instruction is re-executed.
-        // SAFETY: current_tcb returns this CPU's running thread.
-        let tcb = unsafe { crate::syscall::current_tcb() };
-        let area = if tcb.is_null()
-        {
-            core::ptr::null()
-        }
-        else
-        {
-            // SAFETY: a non-null tcb is this CPU's running thread, valid here
-            // because we entered from a U-mode FP/V instruction.
-            unsafe { (*tcb).extended.area.cast_const() }
-        };
-        // SAFETY: trap_entry passes this hart's live frame; the reference
-        // lives only for the call below, which cannot block.
-        let live = unsafe { &mut *frame };
-        // SAFETY: ring-0 trap context; lazy_restore_fp_v handles the null
-        // area branch internally (no restore, just FS/VS promotion).
+        // last arm takes): the first-use trap. It marks the thread as using
+        // its extended state and makes that state live, writing FS/VS Clean
+        // into the frame, which trap_entry restores before sret; sepc is not
+        // advanced, so the instruction re-executes.
+        // SAFETY: supervisor mode with SIE = 0, from a U-mode trap; frame is
+        // this hart's live frame, the running thread's, to which no reference
+        // is held across the call.
         unsafe {
-            super::fpu::lazy_restore_fp_v(area, live);
+            super::fpu::first_use_trap(frame);
         }
     }
     else if cause_code == 8

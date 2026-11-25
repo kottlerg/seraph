@@ -14,6 +14,10 @@
 //! verifies both captures match the pattern the child wrote. Any
 //! cross-thread bleed surfaces as a mismatch and fails the test.
 //!
+//! [`preempt_isolation_cross_cpu`] and [`migrate_round_trip`] move a thread
+//! between CPUs between its load and its capture, the second back to the CPU
+//! whose registers still hold its earlier state.
+//!
 //! [`initial_state`] checks the extended state a new thread starts with,
 //! which thread creation writes into its save area.
 
@@ -21,9 +25,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::system_info;
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_notification, cap_create_thread, cap_delete,
-    notification_send, notification_wait, thread_configure, thread_exit, thread_set_affinity,
-    thread_start,
+    cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_notification, cap_create_thread,
+    cap_delete, ipc_buffer_set, notification_send, notification_wait, thread_configure,
+    thread_exit, thread_set_affinity, thread_start,
 };
 use syscall_abi::SystemInfoType;
 
@@ -83,8 +87,8 @@ extern "C" fn child_b_entry(sig_slot: u64) -> !
 /// architecturally addressable extended-state register, spin long enough
 /// to be preempted many times, and capture the live registers afterward.
 /// Both captures must equal the child's own pattern — any mismatch
-/// indicates the eager-save / lazy-restore path leaked state across the context
-/// switch.
+/// indicates the switch-out save / switch-in load path leaked state across the
+/// context switch.
 pub fn preempt_isolation(ctx: &TestContext) -> TestResult
 {
     A_MISMATCHES.store(0, Ordering::Release);
@@ -229,8 +233,8 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
 /// `core/kernel/docs/scheduler.md` § What Gets Saved and Restored and
 /// `core/kernel/docs/scheduling-internals.md` § IPI Taxonomy.
 ///
-/// Requires SMP; skips on UP. Runs on both x86-64 (XSAVE/XRSTOR + `#NM`)
-/// and RISC-V (`sstatus.FS/VS` dirty-tracking + illegal-instruction trap).
+/// Requires SMP; skips on UP. Runs on both x86-64 (XSAVE/XRSTOR)
+/// and RISC-V (`sstatus.FS/VS` dirty-tracking).
 pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -297,7 +301,7 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
 
     // Wake the child. The wake path enqueues it on CPU 1's run queue; its
     // extended state was saved into its TCB area when it switched out on
-    // CPU 0 and is restored on its first FP op on CPU 1 (see
+    // CPU 0 and is loaded by its switch-in on CPU 1 (see
     // core/kernel/docs/scheduler.md § What Gets Saved and Restored).
     notification_send(sig_resume, 0x1)
         .map_err(|_| "notification_send resume for preempt_isolation_cross_cpu failed")?;
@@ -337,6 +341,207 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
     // observed CPU for diagnostics but do not gate the test on it — the
     // existing `thread::affinity_migrate_ready_queued` test already covers
     // strict affinity enforcement.
+    Ok(())
+}
+
+// ── A round trip across CPUs (A, B, A) ───────────────────────────────────────
+
+/// Stack of the round-trip child.
+static mut STACK_ROUND: ChildStack = ChildStack::ZERO;
+/// IPC page of the round-trip child.
+static mut ROUND_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+/// Handles, in the round-trip child's `CSpace`, of the endpoint it calls on
+/// each leg and of its done notification.
+static ROUND_EP: AtomicU64 = AtomicU64::new(0);
+static ROUND_DONE: AtomicU64 = AtomicU64::new(0);
+/// Mismatch counts of the round-trip child's two captures: the first after the
+/// move from CPU 0 to CPU 1, the second after the move back. The parent reads
+/// them only after the done notification.
+static ROUND_MISMATCHES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// The CPU the child ran on after each move, [`u32::MAX`] until it reports.
+static ROUND_CPUS: [AtomicU32; 2] = [AtomicU32::new(u32::MAX), AtomicU32::new(u32::MAX)];
+/// Label of the round-trip child's calls.
+const ROUND_LABEL: u64 = 0x0F0F;
+
+/// The CPU the calling thread runs on, or [`u32::MAX`] when the query fails.
+fn current_cpu() -> u32
+{
+    let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
+    u32::try_from(cpu).unwrap_or(u32::MAX)
+}
+
+/// Round-trip child entry: two legs of `crate::arch::fpu::ipc_call_capture`,
+/// each of which loads a pattern into every extended-state register, calls the
+/// harness and captures the registers back after the reply. The first leg loads
+/// [`PATTERN_A`] on CPU 0 and captures on CPU 1; the second loads
+/// [`PATTERN_B`] on CPU 1 and captures on CPU 0, where the registers may still
+/// hold [`PATTERN_A`].
+extern "C" fn round_trip_entry(_arg: u64) -> !
+{
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(ROUND_IPC_PAGE));
+    // SAFETY: `ROUND_IPC_PAGE` is this child's own IPC page, used by one thread
+    // at a time (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { ipc_buffer_set(buf_addr) }.is_err()
+    {
+        thread_exit();
+    }
+    let ep = ROUND_EP.load(Ordering::Acquire);
+    let legs = [PATTERN_A, PATTERN_B]
+        .into_iter()
+        .zip(&ROUND_MISMATCHES)
+        .zip(&ROUND_CPUS);
+    for ((pattern, mismatches), cpu) in legs
+    {
+        let found = crate::arch::fpu::ipc_call_capture(pattern, CROSS_SPIN_ITERS, ep, ROUND_LABEL);
+        mismatches.store(found, Ordering::Release);
+        cpu.store(current_cpu(), Ordering::Release);
+    }
+    let _ = notification_send(ROUND_DONE.load(Ordering::Acquire), 0x1);
+    thread_exit();
+}
+
+/// A thread's extended state survives a round trip across CPUs. The thread
+/// loads one pattern on CPU 0, moves to CPU 1 and loads another, and moves
+/// back to CPU 0, which has run no other user thread meanwhile, so its
+/// registers still hold the first pattern and its `fpu_owner` still names the
+/// thread. The thread must see the second pattern: its switch-in on CPU 0 loads
+/// its saved state because the thread's `fpu_cpu` names CPU 1
+/// (core/kernel/docs/scheduler.md § What Gets Saved and Restored). Each move is
+/// an affinity change made while the thread is blocked in an IPC call to the
+/// harness, so its reply's wake places it on the new CPU. The harness pins
+/// itself to CPU 1 for the test, so that it runs no user thread on CPU 0.
+///
+/// Requires SMP; skips otherwise.
+pub fn migrate_round_trip(ctx: &TestContext) -> TestResult
+{
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "system_info(CpuCount) for fpu::migrate_round_trip failed")?;
+    if cpus < 2
+    {
+        crate::log("ktest: fpu::migrate_round_trip SKIP (requires SMP)");
+        return Ok(());
+    }
+    // Land the harness on CPU 1: the affinity-recheck branch of `schedule()`
+    // moves the yielding thread there.
+    thread_set_affinity(ctx.thread_cap, 1)
+        .map_err(|_| "fpu::migrate_round_trip: thread_set_affinity(self, 1) failed")?;
+    syscall::thread_yield().map_err(|_| "fpu::migrate_round_trip: thread_yield failed")?;
+
+    let result = migrate_round_trip_body(ctx);
+
+    // Restore the harness's default placement whatever the outcome, keeping
+    // the body's error when both fail.
+    let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
+        .map_err(|_| "fpu::migrate_round_trip: restoring the harness's affinity failed");
+    result.and(restore)
+}
+
+fn migrate_round_trip_body(ctx: &TestContext) -> TestResult
+{
+    for m in &ROUND_MISMATCHES
+    {
+        m.store(0, Ordering::Relaxed);
+    }
+    for c in &ROUND_CPUS
+    {
+        c.store(u32::MAX, Ordering::Relaxed);
+    }
+
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "fpu::migrate_round_trip: cap_create_endpoint failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "fpu::migrate_round_trip: create_notification failed")?;
+    let mut child = crate::spawn::new_child(ctx)
+        .map_err(|_| "fpu::migrate_round_trip: spawn::new_child failed")?;
+
+    let legs = round_trip_legs(ctx, &child, ep, done);
+
+    if legs.is_ok()
+    {
+        let _ = notification_wait(done);
+    }
+    let released = child
+        .delete_thread()
+        .and_then(|()| child.delete_cspace())
+        .and_then(|()| cap_delete(ep))
+        .and_then(|()| cap_delete(done))
+        .map_err(|_| "fpu::migrate_round_trip: teardown failed");
+    legs?;
+    released?;
+
+    let cpus = [
+        ROUND_CPUS[0].load(Ordering::Acquire),
+        ROUND_CPUS[1].load(Ordering::Acquire),
+    ];
+    crate::log_u64(
+        "fpu::migrate_round_trip cpu after the first move=",
+        u64::from(cpus[0]),
+    );
+    crate::log_u64(
+        "fpu::migrate_round_trip cpu after the second move=",
+        u64::from(cpus[1]),
+    );
+    if cpus != [1, 0]
+    {
+        return Err("fpu::migrate_round_trip: the child did not run on CPU 1, then CPU 0");
+    }
+    if ROUND_MISMATCHES[0].load(Ordering::Acquire) != 0
+    {
+        return Err("fpu::migrate_round_trip: extended state corrupted moving to CPU 1");
+    }
+    if ROUND_MISMATCHES[1].load(Ordering::Acquire) != 0
+    {
+        return Err("fpu::migrate_round_trip: stale extended state after moving back to CPU 0");
+    }
+    Ok(())
+}
+
+/// Start the round-trip child on CPU 0 and drive its two legs: receive its
+/// call, move it to the other CPU while it is blocked on the reply, and reply.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `IpcMessage` and the reply's (568 B each) and the `Result` \
+              temporaries of `ipc_recv`; on init's 16 KiB stack"
+)]
+fn round_trip_legs(
+    ctx: &TestContext,
+    child: &crate::spawn::SpawnedChild,
+    ep: u64,
+    done: u64,
+) -> TestResult
+{
+    ROUND_EP.store(
+        cap_copy(ep, child.cs, syscall_abi::RIGHTS_EP_SEND_GRANT)
+            .map_err(|_| "fpu::migrate_round_trip: cap_copy ep failed")?,
+        Ordering::Release,
+    );
+    ROUND_DONE.store(
+        cap_copy(done, child.cs, RIGHTS_NOTIFY)
+            .map_err(|_| "fpu::migrate_round_trip: cap_copy done failed")?,
+        Ordering::Release,
+    );
+    // SAFETY: `STACK_ROUND` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_ROUND)) };
+    // SAFETY: the stack is `STACK_ROUND`, this test's own `ChildStack`, on which
+    // no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start_pinned(child, round_trip_entry, stack_top, 0, 0) }
+        .map_err(|_| "fpu::migrate_round_trip: configure_and_start_pinned failed")?;
+    for cpu in [1, 0]
+    {
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+        let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+            .map_err(|_| "fpu::migrate_round_trip: ipc_recv failed")?;
+        if msg.label != ROUND_LABEL
+        {
+            return Err("fpu::migrate_round_trip: ipc_recv returned a wrong label");
+        }
+        thread_set_affinity(child.th, cpu)
+            .map_err(|_| "fpu::migrate_round_trip: thread_set_affinity(child) failed")?;
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+        unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(ROUND_LABEL), ctx.ipc_buf) }
+            .map_err(|_| "fpu::migrate_round_trip: ipc_reply failed")?;
+    }
     Ok(())
 }
 

@@ -251,11 +251,11 @@ impl TrapFrame
     /// The `trap_entry` epilogue restores `sstatus` from the frame before
     /// `sret`, and no `sstatus` field is the user's to choose: a supplied SPP
     /// would `sret` to S-mode at a user `sepc`, SUM or MXR would widen the
-    /// kernel's own access to user pages, and an FS or VS other than Off would
-    /// skip the lazy-restore trap and run the thread on whatever F/V registers
-    /// the hart holds. A thread whose frame is written is switched out, so its
-    /// own FS/VS are already Off and its saved F/V state is restored on first
-    /// use.
+    /// kernel's own access to user pages, and an FS or VS chosen by the caller
+    /// could turn the units on for a thread whose state is not loaded. A
+    /// thread whose frame is written is switched out, so its own FS/VS are
+    /// already Off; its switch-in sets them from its extended state, and a
+    /// first entry left Off takes the first-use trap, which finds its state.
     ///
     /// Returns `Err(())` if `sepc` is not a user address; the caller maps this
     /// to `SyscallError::InvalidArgument`.

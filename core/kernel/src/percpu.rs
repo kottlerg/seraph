@@ -347,15 +347,13 @@ pub struct PerCpuData
     /// nesting depth is bounded by the kernel's call depth, far below 2^32.
     pub preempt_count: u32,
     _pad1: u32,
-    /// x86-64 per-CPU owner cache: the TCB whose extended-state register
-    /// file is currently live in this CPU's hardware XMM/YMM/x87
-    /// registers (null if none). Written by the `#NM` handler (installs
-    /// ownership on first FP use) and by `switch_out_save` (clears
-    /// ownership when this CPU's outgoing thread was the owner, after
-    /// eager XSAVE). The CR0.TS / owner discipline is specified in the
-    /// `core/kernel/src/arch/x86_64/fpu.rs` module docs. Unused on RISC-V, which
-    /// tracks F/D/V state through `sstatus.FS/VS` (saved on switch-out when Dirty,
-    /// restored lazily on the illegal-instruction trap).
+    /// The TCB whose extended-state (FPU, SIMD, vector) registers this CPU
+    /// holds, or null when they hold no thread's. Compared with a thread being
+    /// switched in, never dereferenced, so it may name a destroyed thread.
+    /// Written only by this CPU with interrupts disabled: by
+    /// `arch::*::fpu::switch_in_restore` when it loads a thread's area (and,
+    /// on riscv64, clears it when it scrubs the registers) and by the riscv64
+    /// first-use trap. The discipline is `sched::fpu_switch`'s.
     pub fpu_owner: AtomicPtr<ThreadControlBlock>,
     /// Count of context-switch activations on this CPU that loaded a tagged
     /// address space **without** flushing (the tagged-TLB optimization firing).
@@ -898,12 +896,12 @@ pub fn preemption_disabled() -> bool
     unsafe { (*this).preempt_count > 0 }
 }
 
-// ── FPU owner cache (x86-64) ─────────────────────────────────────────────────
+// ── FPU owner ─────────────────────────────────────────────────────────────────
 
 /// Return a reference to CPU `cpu`'s FPU owner slot.
 ///
-/// Called from the x86-64 `#NM` handler (`idt::nm_handler`) and
-/// `fpu::switch_out_save`; both pass `current_cpu()`.
+/// Called from the arch `fpu::switch_out_save`, `fpu::switch_in_restore` and
+/// the riscv64 first-use trap; each passes `current_cpu()`.
 ///
 /// The returned reference is `'static` because the per-CPU slab is never freed;
 /// concurrent access is safe via the [`AtomicPtr`] interior mutability.
@@ -911,15 +909,6 @@ pub fn preemption_disabled() -> bool
 /// # Safety
 /// `cpu` must be < `CPU_COUNT` (an online logical CPU index): the slab holds
 /// `CPU_COUNT` entries and the body does not check the bound.
-#[cfg_attr(
-    target_arch = "riscv64",
-    expect(
-        dead_code,
-        reason = "consumed only by arch/x86_64 (lazy-FPU owner cache + #NM handler); present \
-                  unconditionally so no architecture cfg-gate is needed here. RISC-V uses eager \
-                  FS/VS-dirty FPU tracking and never reads this slot"
-    )
-)]
 #[cfg(not(test))]
 pub unsafe fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock>
 {

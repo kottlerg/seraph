@@ -254,20 +254,15 @@ pub unsafe fn init()
         cpu::enable_smep_smap();
     }
 
-    // 1a. Enable XSAVE (x87 | SSE | AVX in XCR0) and arm CR0.TS for lazy
-    //     FPU/SIMD save-restore. Kernel never touches FP/SIMD (soft-float)
-    //     so TS=1 is harmless until a user thread first uses XMM/YMM, at
-    //     which point a #NM trap runs the lazy-restore path.
+    // 1a. Enable XSAVE (x87 | SSE | AVX in XCR0) and clear CR0.TS. The kernel
+    //     never touches FP/SIMD (soft-float); each user thread's state is
+    //     loaded at its switch-in (`fpu::switch_in_restore`).
     // SAFETY: ring-0 boot; IDT is loaded a few steps below — until then a
     // CR4/XCR0 fault would triple-fault the boot CPU. enable_xsave only
     // executes architected register writes that succeed when CPUID
     // advertises XSAVE; we fatal cleanly if the advertisement is absent.
     unsafe {
         fpu::enable_xsave();
-    }
-    // SAFETY: ring 0; no thread's state is live in the FP registers yet.
-    unsafe {
-        fpu::cr0_set_ts();
     }
 
     // 2. Carve the BSP IST stacks out of [`BSP_IST_STACKS`] (BSS).
@@ -768,7 +763,7 @@ pub unsafe fn start_ap(target_apic_id: u32, trampoline_phys: u64)
 pub unsafe fn init_ap()
 {
     // Per-CPU CR4/CR0/XCR0 setup. The AP trampoline only sets CR4.PAE (plus
-    // CR4.LA57 under 5-level paging); SMEP, SMAP, OSXSAVE, and TS are per-CPU
+    // CR4.LA57 under 5-level paging); SMEP, SMAP, OSXSAVE, and CR0 (TS clear) are per-CPU
     // state that must be re-established on each hart.
     // SAFETY: ring-0 AP boot; IDT loaded by caller (kernel_entry_ap); CPUID
     // gates the enable so a missing feature halts cleanly.
@@ -778,10 +773,6 @@ pub unsafe fn init_ap()
     // SAFETY: as for SMEP/SMAP: ring-0 AP boot, IDT loaded, CPUID-gated.
     unsafe {
         fpu::enable_xsave();
-    }
-    // SAFETY: ring 0; no thread's state is live in this CPU's FP registers yet.
-    unsafe {
-        fpu::cr0_set_ts();
     }
     // SAFETY: ring 0 on the AP's GDT, IDT loaded, interrupts off, before
     // `shadow_stack::enable` (`msr_recovering`'s contract).

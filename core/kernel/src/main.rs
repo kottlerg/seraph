@@ -82,6 +82,29 @@ const KERNEL_STACK_BYTES: u64 = (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE) as u
 
 use boot_protocol::BootInfo;
 
+// The kernel is soft-float: no kernel path touches the FPU, SIMD or vector
+// registers, which hold a user thread's state from its switch-out save to the
+// next switch-in (`sched::fpu_switch`), so a kernel or idle thread can run
+// between the two without saving them. The kernel targets disable those units
+// (`xtask/targets/`); a target that enabled them fails the build here. Host
+// builds (tests, proofs) run no kernel thread on the hardware.
+#[cfg(all(
+    not(any(test, kani)),
+    target_arch = "x86_64",
+    any(
+        target_feature = "sse",
+        target_feature = "sse2",
+        target_feature = "avx"
+    )
+))]
+compile_error!("the kernel must be built soft-float: its target enables SSE or AVX");
+#[cfg(all(
+    not(any(test, kani)),
+    target_arch = "riscv64",
+    any(target_feature = "f", target_feature = "d", target_feature = "v")
+))]
+compile_error!("the kernel must be built soft-float: its target enables F, D or V");
+
 mod arch;
 mod bounded_wait;
 mod cap;

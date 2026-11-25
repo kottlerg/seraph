@@ -2218,7 +2218,7 @@ the frame per architecture ([arch-interface.md](arch-interface.md) § `trap_fram
 stack pointer) is rejected with `InvalidArgument`; x86-64 forces ring-3 selectors and
 clears privileged RFLAGS bits; RISC-V discards the supplied `sstatus` and resumes the thread
 with the value a first entry gets (SPIE set; SPP, SIE, SUM, and MXR clear; FS and VS Off, so
-the thread's saved F/V state is restored lazily on first use).
+the thread's first F/D/V instruction traps and makes its state live).
 
 A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
 until that CPU deschedules it, so the call refuses it with `InvalidState` until it is `current` on
@@ -2425,7 +2425,7 @@ riscv64 it is `f0`..`f31` from `EXT_REGS_RISCV64_F0_OFFSET`, then `fcsr`, `vstar
 and `vcsr` as one `u64` each at their `EXT_REGS_RISCV64_*` offsets, then `v0`..`v31` from
 `EXT_REGS_RISCV64_V0_OFFSET`, `vlenb` bytes each, so `size` is that offset plus 32 `vlenb`, and
 `vlenb` is a 32nd of the bytes past it. Thread creation writes the initial state into the area, so
-a thread that has not used the state reads that state, which its first use starts from: on x86-64
+a thread that has not used the state reads that state, which its first load starts from: on x86-64
 `XSTATE_BV` 0 (every component initial), the x87 control word 0x037F, `MXCSR` 0x1F80 (every SIMD
 floating-point exception masked; XRSTOR loads `MXCSR` whatever `XSTATE_BV` holds), and every other
 byte zero; on riscv64 every byte zero (`fcsr` 0, `vl` 0 and `vtype` 0). The image holds nothing but

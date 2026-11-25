@@ -39,7 +39,7 @@ pub fn preempt_capture(pattern: u64, iters: u64) -> u64
     // preemption, then stores each register back to its slot in fbuf/vbuf.
     // .option arch directives locally enable D and V even though the
     // kernel target is RV64IMAC; these instructions only execute when
-    // sstatus.FS/VS != Off, which the U-mode lazy-trap path guarantees on
+    // sstatus.FS/VS != Off, which the kernel's first-use trap guarantees on
     // first touch.
     unsafe {
         core::arch::asm!(
@@ -431,10 +431,9 @@ pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u64, msg_label: u64) -> u64
             "li a4, 0",
             "li a5, 0",
             "ecall",
-            // Resumed (possibly on CPU 1). The first FP op triggers an
-            // illegal-instruction trap (FS=Off); `lazy_restore_fp_v`
-            // restores f0..f31 from the TCB save area before the store
-            // retires.
+            // Resumed (possibly on CPU 1). `switch_in_restore` loaded
+            // f0..f31 from the TCB save area before the thread returned, so
+            // the store captures the saved state.
             "fsd f0,    0({b})",
             "fsd f1,    8({b})",
             "fsd f2,   16({b})",
@@ -507,7 +506,7 @@ pub fn load_and_spin(pattern: u64, progress: &core::sync::atomic::AtomicU32) -> 
     // overwrite, and increments `progress`, a live atomic, with an AMO. The
     // scratch registers are named, not allocated, since the compiler may give
     // two operands of one value one register. The D and V instructions run
-    // with FS and VS enabled on first touch by the kernel's lazy trap, as for
+    // with FS and VS enabled on first touch by the kernel's first-use trap, as for
     // [`preempt_capture`].
     unsafe {
         core::arch::asm!(
@@ -710,15 +709,14 @@ const FCSR_NX: u64 = 1;
 /// Read `fcsr`, `vl`, `vtype`, `vstart` and `vcsr`, in that order, in one
 /// asm block, so no compiled code runs between the reads. The `fcsr` read
 /// is the thread's first use of the extended state when it has made none, so
-/// the illegal-instruction trap it takes restores the thread's saved F/D and
-/// V state first.
+/// the first-use trap it takes makes the thread's F/D and V state live first.
 fn read_control_words() -> [u64; 5]
 {
     let (fcsr, vl, vtype, vstart, vcsr): (u64, u64, u64, u64, u64);
     // SAFETY: the asm reads five CSRs into the five output registers and
     // writes nothing else. `.option arch, +d, +v` enables the CSR names
     // locally, since ktest's target is RV64IMAC; the reads execute once the
-    // U-mode lazy-trap path has turned sstatus.FS and VS on.
+    // kernel's first-use trap has turned sstatus.FS and VS on.
     unsafe {
         core::arch::asm!(
             ".option push",

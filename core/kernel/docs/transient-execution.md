@@ -105,6 +105,12 @@ These are not in the table, for the reason given:
   `bhi`. Restricted RSB alternate behaviour (RRSBA) keeps alternate return predictions within
   the current predictor mode while enhanced IBRS is on (Intel's RSBU guidance), and the table
   records it as the `rsb_alternate` behaviour (§ Predictor behaviours).
+- **Classes the kernel's design excludes.** Lazy FP state restore (CVE-2018-3665,
+  INTEL-SA-00145) reads, under speculation, the FPU, SIMD and vector registers of another thread
+  that a lazy switch left in place. No thread runs on registers that hold another thread's
+  state: on x86-64 the switch-in of a thread loads its own state, and on RISC-V the switch-in of
+  a thread that has not used F, D or V clears the registers before it runs with the units off
+  ([scheduler.md](scheduler.md) § What Gets Saved and Restored).
 
 ---
 
@@ -395,7 +401,7 @@ selects IBRS on entry. Enhanced IBRS covers the case where the part has it.
 The entry routine, `seraph_enter_from_user`, runs on every entry from user mode before any
 indirect branch and any `ret` its own `call` does not pair: in `syscall_entry` after the frame
 is saved, in every exception and interrupt trampoline that builds a `TrapFrame`
-(`enter_from_user_asm`, keyed on the saved CS), and in the `#NM` stub. Each runs it after the
+(`enter_from_user_asm`, keyed on the saved CS). Each runs it after the
 entry's `cld`, `clac` and swap to the kernel GS base, a paranoid stub after its
 `paranoid_entry_asm`. With IBRS on entry selected it first writes
 `IA32_SPEC_CTRL` with the kernel's value, `IBRS` set; with the IBPB on entry selected it then
@@ -403,7 +409,7 @@ issues the IBPB (§ IBPB on entry). It ends in `lfence`, so no later instruction
 writes complete. Every return to user mode writes the user-mode
 value, the same without `IBRS` (`mitigation::ibrs_exit_asm`), with interrupts off and after the
 last kernel `call`, `ret` and indirect branch: in `syscall_entry` before `sysretq`, in
-`tf_resume_asm` and the `#NM` stub when the frame's CS is ring 3, and in `return_to_user` and
+`tf_resume_asm` when the frame's CS is ring 3, and in `return_to_user` and
 `switch_and_enter_user`. The paranoid stubs (NMI, `#DB`, `#DF`, `#MC`) can arrive between a
 return's write and its `sysretq` or `iretq`, or before an entry's write, so they save the
 interrupted value and write the kernel's on entry, and on exit write the user-mode value when
@@ -448,8 +454,8 @@ review can check without the hardware:
 - **Before the first `ret`.** `seraph_enter_from_user` issues the IBPB (`mitigation::ibpb_asm`,
   a write of bit 0 to `IA32_PRED_CMD`) before its own `ret`, the first `ret` and indirect branch
   of every entry from user mode: `syscall_entry` calls it after the frame is saved,
-  `enter_from_user_asm` after the frame of every exception and interrupt from ring 3, and
-  the `#NM` stub likewise, none with a `call` or `ret` before it (§ Return predictions).
+  `enter_from_user_asm` after the frame of every exception and interrupt from ring 3, none
+  with a `call` or `ret` before it (§ Return predictions).
 - **NMI and machine check.** The paranoid stubs (NMI, `#DB`, `#DF`, `#MC`) run
   `enter_from_user_asm` after their `paranoid_entry_asm`, so from ring 3 they issue it there.
   From ring 0 they issue it in `paranoid_entry_asm`, after their `IA32_SPEC_CTRL` write: one can

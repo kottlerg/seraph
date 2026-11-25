@@ -5,15 +5,15 @@
 
 //! riscv64 Tier 1: an F/D/V instruction the hart refuses while the thread's
 //! F/D and V units are on is the thread's illegal-instruction fault, not the
-//! lazy extended-state trap, which is the illegal-instruction trap with
+//! first-use trap, which is the illegal-instruction trap with
 //! `sstatus.FS`/`VS` Off (core/kernel/docs/scheduler.md § What Gets Saved
 //! and Restored).
 //!
-//! A child writes an F register, so the lazy trap turns its units on, then
+//! A child writes an F register, so the first-use trap turns its units on, then
 //! executes `fadd.d` with the reserved rounding mode 101, which the hart
 //! refuses. With no fault handler bound, the kernel kills the child with the
 //! illegal-instruction cause. The parent's wait is bounded, so a kernel that
-//! took the refusal as the lazy trap, and re-executed the instruction for
+//! took the refusal as the first-use trap, and re-executed the instruction for
 //! ever, fails the test instead of hanging it.
 
 use syscall_abi::EXIT_FAULT_BASE;
@@ -50,8 +50,8 @@ pub fn refused_instruction_faults(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Child entry: write `ft0`, the thread's first F/D use, which takes the lazy
-/// trap and turns its units on; then execute `fadd.d f0, f0, f0` with the
+/// Child entry: write `ft0`, the thread's first F/D use, which takes the
+/// first-use trap and turns its units on; then execute `fadd.d f0, f0, f0` with the
 /// reserved rounding mode 101, which the kernel delivers as this thread's
 /// illegal-instruction fault, killing it. The trailing loop only satisfies the
 /// `-> !` signature.

@@ -5,8 +5,8 @@
 
 //! RISC-V register-map and instruction-encoding arithmetic: the SBI hart-mask
 //! window, page rounding, the timer's tick and microsecond conversions, the
-//! F/D/V opcode decode and the `sstatus` test the lazy extended-state trap
-//! uses, the Zkr `seed` CSR's
+//! F/D/V opcode decode and the `sstatus` test the extended-state first-use
+//! trap uses, the Zkr `seed` CSR's
 //! status decode and the word the hardware RNG builds from its samples, the
 //! `sstateen0` and `senvcfg` values and the check of their read back, the PTE
 //! permission bits and their test in the kernel's spurious-fault retry, and the
@@ -72,12 +72,12 @@ pub(super) fn ticks_to_us(ticks: u64, freq: u64) -> u64
 
 /// Return `true` if `insn` (a RISC-V instruction encoding from `stval` on an
 /// illegal-instruction trap) is an F, D, or V instruction — i.e. the trap was
-/// caused by FS=Off or VS=Off and is a candidate for lazy enable.
+/// caused by FS=Off or VS=Off and is a candidate for the first-use trap.
 ///
-/// The lazy mechanism re-arms the trap on every switch-out, so the trapping
-/// instruction is the *first* F/D/V op a thread executes after switch-in. To
-/// avoid spuriously killing the thread, every encoding that can be that first
-/// op must be recognised here. That is three classes, not just FP/V
+/// A thread runs with the units Off until its first F/D/V op, so the trapping
+/// instruction is the *first* F/D/V op a thread executes. To avoid spuriously
+/// killing the thread, every encoding that can be that first op must be
+/// recognised here. That is three classes, not just FP/V
 /// arithmetic:
 ///
 /// * 32-bit FP/V arith / load / store / fused-multiply (major opcodes below).
@@ -139,22 +139,21 @@ pub(super) const SSTATUS_FS_MASK: u64 = 0x3 << 13;
 /// `sstatus.VS` (bits 10:9), the V unit's state, in `FS`'s encoding.
 pub(super) const SSTATUS_VS_MASK: u64 = 0x3 << 9;
 
-/// Whether a U-mode illegal-instruction trap is the lazy extended-state
-/// trap, which turns the F/D and V units on and restores the thread's saved
-/// state: the thread ran with `sstatus.FS` Off (`sstatus`, the value the
-/// trap saved), and the trapping instruction (`stval`) is one
-/// [`is_fp_or_v_opcode`] matches. The lazy path turns `FS` and `VS` on
-/// together and off together (`fpu::lazy_enable_fp_v_initial`,
-/// `fpu::switch_out_save`), so `FS` Off is the state of both units.
+/// Whether a U-mode illegal-instruction trap is the extended-state first-use
+/// trap, which turns the F/D and V units on and makes the thread's state live:
+/// the thread ran with `sstatus.FS` Off (`sstatus`, the value the trap saved),
+/// and the trapping instruction (`stval`) is one [`is_fp_or_v_opcode`]
+/// matches. The kernel sets `FS` and `VS` in a thread's frame together
+/// (`fpu::switch_in_restore`, `fpu::first_use_trap`, `fpu::switch_out_save`),
+/// so `FS` Off is the state of both units.
 ///
 /// An F/D/V instruction that traps with the units on was refused for a
 /// reason of its own: a reserved rounding mode, in the instruction or in
 /// `frm`, a vector instruction that depends on `vtype` while `vtype.vill`
 /// is set, or an extension the hart lacks. That trap is the thread's
-/// illegal-instruction fault; restoring the saved state would instead
-/// re-execute the instruction for ever, each pass replacing the live
-/// registers with those of the thread's last switch-out.
-pub(super) fn is_lazy_fp_v_trap(sstatus: u64, stval: u64) -> bool
+/// illegal-instruction fault; treating it as the first-use trap would instead
+/// re-execute the instruction for ever.
+pub(super) fn is_first_use_trap(sstatus: u64, stval: u64) -> bool
 {
     sstatus & SSTATUS_FS_MASK == 0 && is_fp_or_v_opcode(stval)
 }
@@ -572,25 +571,25 @@ mod tests
         assert!(!is_fp_or_v_opcode(0x4002)); // C2 funct3=010 (c.lwsp)
     }
 
-    // Defect caught: a lazy-trap test that ignored the saved `sstatus.FS`
+    // Defect caught: a first-use trap test that ignored the saved `sstatus.FS`
     // would restore the saved state over the live one for an F/D/V
     // instruction refused with the units on, and re-execute it for ever,
     // instead of delivering the thread's illegal-instruction fault.
     #[test]
-    fn only_an_fp_v_trap_with_the_units_off_is_the_lazy_trap()
+    fn only_an_fp_v_trap_with_the_units_off_is_the_first_use_trap()
     {
         /// `fadd.d f0, f0, f0` with the reserved rounding mode 101.
         const FADD_RESERVED_RM: u64 = 0x0200_5053;
         /// `sstatus.SPIE` (bit 5), so the units' fields are not the only bits.
         const OTHER_BITS: u64 = 1 << 5;
-        assert!(is_lazy_fp_v_trap(OTHER_BITS, FADD_RESERVED_RM));
+        assert!(is_first_use_trap(OTHER_BITS, FADD_RESERVED_RM));
         for fs in [1u64, 2, 3]
         {
             let units_on = OTHER_BITS | (fs << 13) | (fs << 9);
-            assert!(!is_lazy_fp_v_trap(units_on, FADD_RESERVED_RM), "FS {fs}");
+            assert!(!is_first_use_trap(units_on, FADD_RESERVED_RM), "FS {fs}");
         }
-        assert!(!is_lazy_fp_v_trap(OTHER_BITS, 0x0000_0013)); // addi: not F/D/V
-        assert!(!is_lazy_fp_v_trap(OTHER_BITS, 0)); // stval 0: no encoding
+        assert!(!is_first_use_trap(OTHER_BITS, 0x0000_0013)); // addi: not F/D/V
+        assert!(!is_first_use_trap(OTHER_BITS, 0)); // stval 0: no encoding
     }
 
     // Defect caught: a predicate that swapped R and W, or ignored them, would

@@ -15,7 +15,7 @@
 //! exercises the `SYS_IPC_CALL` register ABI without going through
 //! `shared/ipc`'s wrappers.
 //!
-//! Coverage: the kernel's eager-save / lazy-restore path is already
+//! Coverage: the kernel's switch-out save / switch-in load path is already
 //! exercised by `core/ktest/src/unit/fpu.rs::preempt_isolation_cross_cpu`
 //! via the notification rendezvous. This file adds the IPC-dispatch path —
 //! `sys_ipc_call`'s endpoint-block branch into the scheduler, and
@@ -159,8 +159,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Reply. The kernel enqueues the child on CPU 1. CPU 0's
     // `switch_out_save` (when the child blocked at the call site) already
-    // persisted the live FP regs into the child's TCB area; the lazy
-    // restore on CPU 1's first FP op completes the migration.
+    // persisted the live FP regs into the child's TCB area; CPU 1's
+    // `switch_in_restore` loads them and completes the migration.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     unsafe { ipc::ipc_reply(&IpcMessage::new(REPLY_LABEL), ctx.ipc_buf) }
         .map_err(|_| "fpu_survives_ipc_call: ipc_reply failed")?;

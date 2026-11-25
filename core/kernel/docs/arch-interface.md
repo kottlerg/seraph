@@ -904,7 +904,7 @@ pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
 /// Debug-build check that the user-controlled privileged state a kernel entry
 /// must clear is clear; a no-op in release builds. x86-64 asserts RFLAGS AC,
 /// DF and TF clear (SFMASK and the IDT stubs' `cld` / `clac` establish it) and
-/// is called first in `syscall::dispatch` and the exception, `#PF`, `#NM`, and
+/// is called first in `syscall::dispatch` and the exception, `#PF`, and
 /// IRQ handler bodies. RISC-V asserts `sstatus.SUM` clear, the analogue (SUM,
 /// like AC, lifts the supervisor-access block on user pages), and is called at
 /// syscall dispatch only: a trap taken from S-mode inside a `copy_user` window
@@ -1104,7 +1104,7 @@ x86-64 entries that publish nothing deschedule nothing the thread resumes from: 
 (IST2; it returns when it takes a pending watchdog backtrace request and otherwise halts the
 faulting CPU from either ring, never a thread kill; see
 [scheduling-internals.md](scheduling-internals.md#ipi_nmi_backtrace_stub--ipi_nmi_backtrace_handler)),
-`#NM` (builds no frame), and the spurious vector 255 (`iretq` only).
+and the spurious vector 255 (`iretq` only).
 
 **Aliasing model.** While the thread is descheduled inside an entry (blocked in a syscall,
 fault-blocked, or preempted), other paths access its published frame: another thread's
@@ -1270,11 +1270,12 @@ pub fn gdt::bsp_tss_ptr() -> u64;
 /// IDT the BSP populated; RISC-V reinstalls `stvec`.
 pub unsafe fn idt::load();
 
-/// Context-switch FPU hooks. `switch_out_save` saves the outgoing thread's live
-/// extended state if this CPU holds it (x86-64 XSAVE when it owns the FPU;
-/// RISC-V when `sstatus.FS`/`VS` is Dirty) and arms the lazy trap.
-/// `switch_in_restore` arms the first-use trap for the incoming thread (x86-64
-/// sets `CR0.TS`; a no-op on RISC-V, where the trap path restores lazily).
+/// Context-switch FPU hooks (decision and ordering in
+/// [scheduler.md](scheduler.md) § What Gets Saved and Restored).
+/// `switch_out_save` saves the outgoing thread's live extended state (x86-64
+/// XSAVE when this CPU's `fpu_owner` names it; RISC-V when `sstatus.FS`/`VS` is
+/// Dirty). `switch_in_restore` loads the incoming thread's area unless the
+/// registers already hold its state.
 pub unsafe fn fpu::switch_out_save(tcb: *mut ThreadControlBlock);
 pub unsafe fn fpu::switch_in_restore(tcb: *mut ThreadControlBlock);
 /// Report the BSP's per-thread extended-state save-area size to
@@ -1285,7 +1286,7 @@ pub unsafe fn fpu::switch_in_restore(tcb: *mut ThreadControlBlock);
 /// after the per-CPU install, before any Thread exists.
 pub unsafe fn fpu::report_save_area();
 /// Write a new thread's initial extended state into its save area of `bytes`
-/// bytes, the image its first FP/SIMD/V use restores: x86-64 zeroes the XSAVE
+/// bytes, the image its first load restores: x86-64 zeroes the XSAVE
 /// area (`XSTATE_BV` 0, every component initial) and writes the x87 control
 /// word 0x037F and `MXCSR` 0x1F80, which XRSTOR loads whatever `XSTATE_BV`
 /// holds; RISC-V zeroes it, zero being every field's initial value. Called by

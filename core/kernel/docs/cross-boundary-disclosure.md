@@ -453,7 +453,7 @@ observe on every checked CPU.
 | x86-64 `CR4.PKS` | clear | `cpu::enable_smep_smap` | Supervisor keys are the kernel's to assign; the firmware's `IA32_PKRS` would govern the kernel's own key-0 pages |
 | x86-64 `CR4.UINTR` | clear | `cpu::enable_smep_smap` | User-interrupt instructions raise `#UD`; their state is not switched |
 | x86-64 `CR4.OSFXSR`, `OSXMMEXCPT`, `OSXSAVE`; `XCR0` | set; written whole with x87, SSE and AVX | `fpu::enable_xsave` | The v3 extended state, which the XSAVE switch saves and restores exactly |
-| x86-64 `CR0.MP`, `CR0.NE` | set | `fpu::enable_xsave` | `WAIT` under `CR0.TS` raises `#NM`, not running against another thread's x87 state; x87 errors arrive as `#MF` |
+| x86-64 `CR0.MP`, `CR0.NE` | set | `fpu::enable_xsave` | x87 errors arrive as `#MF` (`CR0.TS` is never set) |
 | x86-64 `CR0.EM`, `CR0.AM` | clear | `fpu::enable_xsave` | x87 and SSE execute; `RFLAGS.AC` does not enable alignment checking at CPL 3 |
 | x86-64 `EFER.LMSLE`, `EFER.UAIE` | clear | `syscall::init` | No 64-bit segment-limit checks and no ignored upper address bits on ring-3 accesses |
 | x86-64 `IA32_TSC_AUX` | 0 where CPUID reports `RDTSCP` or `RDPID` | `cpu::set_user_msr_controls` | `RDTSCP` and `RDPID` return 0, the same on every CPU, and nothing the firmware stored |

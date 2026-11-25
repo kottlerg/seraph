@@ -187,30 +187,37 @@ impl SleepExpiry
 
 // ── ExtendedState ─────────────────────────────────────────────────────────────
 
-/// Per-thread extended-state save-area pointer for the FPU/SIMD/V
-/// eager-save / lazy-restore discipline.
+/// Per-thread extended-state (FPU, SIMD, vector) save area and the record of
+/// where it was last loaded.
 ///
 /// `area` points at a page-aligned arch-specific save area (XSAVE layout
 /// on x86-64; F/D register file plus V state on RISC-V), carved from the
 /// Thread retype slot and reclaimed with it. Null on threads that never
-/// touch FP/SIMD/V (idle TCBs).
+/// touch FP/SIMD/V (idle TCBs). Thread creation writes the initial state into
+/// it (`arch::current::fpu::init_save_area`).
 ///
-/// Discipline: the context-switch path calls
-/// `arch::current::fpu::switch_out_save(tcb)` on every switch-out; on
-/// x86-64 it XSAVEs into `area` whenever this CPU is the live owner of
-/// `tcb`'s registers (`fpu_owner` matches), then clears `fpu_owner` and
-/// arms `CR0.TS=1`. On RISC-V it inspects `sstatus.FS/VS` and saves
-/// only on Dirty. After switch-in the first user FP/SIMD/V op traps
-/// (`#NM` on x86-64, illegal-instruction on RISC-V) and the trap handler
-/// restores from `area` (XRSTOR on x86-64, `lazy_restore_fp_v` on RISC-V).
-/// Thread creation writes the initial state into the area
-/// (`arch::current::fpu::init_save_area`), so the first restore starts the
-/// thread from it.
-#[derive(Clone, Copy)]
-#[repr(C)]
+/// Discipline (`sched::fpu_switch`): a user thread's state is live in the
+/// registers whenever it runs in user mode. On every switch-out
+/// `arch::current::fpu::switch_out_save` saves the live registers into `area`
+/// (XSAVE on x86-64; on RISC-V the F/D and V files that are Dirty), and the
+/// CPU's `fpu_owner` keeps naming the thread. On switch-in
+/// `arch::current::fpu::switch_in_restore` loads `area` unless the CPU's
+/// `fpu_owner` names the thread and `fpu_cpu` names the CPU, and records both.
 pub struct ExtendedState
 {
     pub area: *mut u8,
+    /// The CPU whose registers were last loaded from `area`;
+    /// [`fpu_switch::NO_CPU`](super::fpu_switch::NO_CPU) until the first load.
+    /// Written only together with that load, by the CPU switching the thread in
+    /// or by the thread's own riscv64 first-use trap; Relaxed, ordered across
+    /// CPUs by `context_saved` (Release at the switch-out, Acquire before the
+    /// switch-in).
+    pub fpu_cpu: core::sync::atomic::AtomicU32,
+    /// riscv64: the thread has used F/D or V (its first-use trap ran). Until
+    /// then it runs with `sstatus.FS`/`VS` Off and switch-in loads nothing.
+    /// Written once, by the thread's own trap; ordered as `fpu_cpu` is.
+    #[cfg(target_arch = "riscv64")]
+    pub in_use: core::sync::atomic::AtomicBool,
 }
 
 impl ExtendedState
@@ -218,30 +225,32 @@ impl ExtendedState
     /// No save area: for threads that never touch FP/SIMD/V state (idle TCBs).
     pub const fn empty() -> Self
     {
-        Self {
-            area: core::ptr::null_mut(),
-        }
+        Self::from_raw(core::ptr::null_mut())
     }
 
     /// Construct a populated `ExtendedState` from the per-thread save-area
     /// pages that thread creation carves from the Thread retype slot
     /// (`sys_cap_create_thread`; init's thread in `kernel_entry_post_rebase`).
+    /// No CPU has loaded it yet, whatever thread a CPU's `fpu_owner` names at
+    /// this TCB's address.
     pub const fn from_raw(area: *mut u8) -> Self
     {
-        Self { area }
+        Self {
+            area,
+            fpu_cpu: core::sync::atomic::AtomicU32::new(super::fpu_switch::NO_CPU),
+            #[cfg(target_arch = "riscv64")]
+            in_use: core::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
-// SAFETY: `area` is dereferenced only on the CPU that holds the owning
-// thread's live extended registers: the eager save in `switch_out_save`,
-// which `schedule()` calls with interrupts masked after dropping the
-// scheduler locks and before the `switch()` that publishes
-// `context_saved = 1` (Release); the `#NM` handler's save of a prior
-// `fpu_owner`; and the lazy restore in the owning thread's own FP trap
-// (`#NM` XRSTOR, or RISC-V `lazy_restore_fp_v`). The dispatching CPU's
-// Acquire of `context_saved` orders the save's writes before any other CPU
-// runs the thread; raw pointer ownership is tracked explicitly by the FPU
-// save/restore code.
+// SAFETY: `area` is dereferenced only on the CPU that runs or switches the
+// owning thread: the save in `switch_out_save`, which `schedule()` calls with
+// interrupts masked before the `switch()` that publishes `context_saved = 1`
+// (Release); the load in `switch_in_restore`, which runs after the dispatching
+// CPU's Acquire of the incoming thread's `context_saved`; and the load in the
+// thread's own riscv64 first-use trap. `SYS_THREAD_READ_EXT_REGS` reads it
+// only for a held thread, after that edge. The other fields are atomics.
 unsafe impl Send for ExtendedState {}
 
 // ── IpcThreadState ────────────────────────────────────────────────────────────
@@ -1374,10 +1383,10 @@ pub struct ThreadControlBlock
     pub sleep_expiry: SleepExpiry,
 
     // === FPU / SIMD / Vector extended state ===
-    /// Per-thread XSAVE area pointer for the FPU/SIMD/V eager-save /
-    /// lazy-restore discipline (see [`ExtendedState`]). The pointer is
-    /// immutable after construction (the Identity row); the area it names is
-    /// owned as [`ExtendedState`] describes.
+    /// Per-thread extended-state save area and the CPU that last loaded it
+    /// (see [`ExtendedState`]). The pointer is immutable after construction
+    /// (the Identity row); the area it names and the other fields are owned as
+    /// [`ExtendedState`] describes.
     pub extended: ExtendedState,
 
     // === Diagnostic thread registry ===

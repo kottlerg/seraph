@@ -47,6 +47,8 @@ use syscall_abi::PAGE_SIZE;
 
 use ipc::procmgr_labels;
 
+use std::sync::Arc;
+
 use crate::decls::{self, Binary};
 use crate::spawn::{self, MAX_BOUND_RESOURCES};
 use crate::{
@@ -287,13 +289,17 @@ pub fn boot_pass(
 }
 
 /// The drivers-directory pass: list `dir_cap`, the `/services/drivers/`
-/// directory svcmgr handed devmgr, read the declaration of each entry, and
-/// bind the records still unbound to them. Every file cap is released once
-/// the pass ends. `dir_path` is the absolute path of the
+/// directory svcmgr handed devmgr, have procmgr read and verify each entry as
+/// a driver image, read the declaration of each verified one
+/// ([`decls::verified_decl`]), and bind the records still unbound to them.
+/// Every verified image is released once the pass ends, apart from the copies
+/// a queued create retry holds. `dir_path` is the absolute path of the
 /// directory `dir_cap` names; each entry is named `dir_path/entry`, its install
 /// path, which procmgr verifies the driver's signature under. An entry whose
 /// name exceeds [`procmgr_labels::CREATE_NAME_MAX`] or cannot be allocated is
-/// logged and skipped, its file cap released.
+/// logged and skipped, its file cap released. An entry the listing names
+/// again is skipped unread, so a directory server that repeats a name costs
+/// no second read and offers no second candidate.
 pub fn drivers_dir_pass(
     records: &mut Records,
     dir_cap: u64,
@@ -308,8 +314,20 @@ pub fn drivers_dir_pass(
         return;
     }
     let mut table = MatchTable::new();
+    let mut seen = firmware::binding::EntryNames::default();
     let requested_rights = u64::from(namespace_protocol::rights::READ);
     decls::list_dir(dir_cap, ipc_buf, |name| {
+        match seen.first_sight(name)
+        {
+            Ok(true) =>
+            {}
+            Ok(false) => return,
+            Err(_) =>
+            {
+                std::os::seraph::log!(warn: "drivers-directory entry: no memory to list it; skipped");
+                return;
+            }
+        }
         // SAFETY: `ipc_buf` is devmgr's registered IPC buffer.
         let walked = unsafe { ns_client::walk_to_file(dir_cap, name, requested_rights, ipc_buf) };
         let Some(walked) = walked
@@ -326,19 +344,11 @@ pub fn drivers_dir_pass(
             let _ = syscall::cap_delete(walked.file_cap);
             return;
         };
-        let decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
-        let binary = Binary::File {
-            cap: walked.file_cap,
-            size: walked.size,
-            name: install,
-        };
-        collect(
-            &mut table,
-            records,
-            decl.as_ref(),
-            Source::DriversDir,
-            binary,
-        );
+        if let Some((decl, binary)) =
+            decls::verified_decl(label, walked.file_cap, walked.size, install)
+        {
+            collect(&mut table, records, Some(&decl), Source::DriversDir, binary);
+        }
     });
     bind_records(records, &mut table, carve, pass, ipc_buf);
     for binary in table.drain_binaries()
@@ -544,11 +554,10 @@ fn read_installed(
         std::os::seraph::log!(warn: "{}: its installed binary is not found", label);
         return None;
     };
-    let Some(decl) = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf)
+    let Some((decl, binary)) = decls::verified_decl(label, walked.file_cap, walked.size, path)
     else
     {
         std::os::seraph::log!(warn: "{}: its installed declaration is not read", label);
-        let _ = syscall::cap_delete(walked.file_cap);
         return None;
     };
     // `bound` reads only for a pass's instance limit; the record is the
@@ -557,11 +566,7 @@ fn read_installed(
         decl,
         source: Source::DriversDir,
         bound: 0,
-        binary: Binary::File {
-            cap: walked.file_cap,
-            size: walked.size,
-            name: path,
-        },
+        binary,
     })
 }
 
@@ -751,25 +756,16 @@ fn queue_retry(
     true
 }
 
-/// devmgr's own copy of the drivers-directory file `binary` names, for a
-/// create retry: a derivation of its cap and a copy of its install path.
-/// `None` for a boot module, or when the cap or the path cannot be copied.
+/// devmgr's own reference to the verified drivers-directory image `binary`
+/// holds, for a create retry, which then creates the driver from the bytes
+/// its declaration was read from. `None` for a boot module.
 fn retained_copy(binary: &Binary) -> Option<Binary>
 {
-    let Binary::File { cap, size, name } = binary
-    else
+    match binary
     {
-        return None;
-    };
-    let mut path = Vec::new();
-    path.try_reserve_exact(name.len()).ok()?;
-    path.extend_from_slice(name);
-    let cap = syscall::cap_derive(*cap, syscall::RIGHTS_ALL).ok()?;
-    Some(Binary::File {
-        cap,
-        size: *size,
-        name: path.into_boxed_slice(),
-    })
+        Binary::Verified(image) => Some(Binary::Verified(Arc::clone(image))),
+        Binary::Module { .. } => None,
+    }
 }
 
 fn collect(
@@ -787,7 +783,9 @@ fn collect(
         return;
     };
     let name = decl.name;
-    let cap = binary.cap();
+    // A verified image the failed add drops releases itself; a boot module's
+    // cap is deleted here.
+    let cap = binary.module_cap();
     let added = records
         .bound_counts
         .track(&decl)
@@ -798,7 +796,10 @@ fn collect(
             warn: "{}: no memory to consider the driver; not bound",
             name.as_str()
         );
-        let _ = syscall::cap_delete(cap);
+        if cap != 0
+        {
+            let _ = syscall::cap_delete(cap);
+        }
     }
 }
 

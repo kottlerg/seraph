@@ -210,8 +210,8 @@ devmgr's responsibilities are:
   replies, and remove it (`UNMAP`) before it deletes the cap; a refused or
   failed IOMMU call replies `IOMMU_FAILED`. The thread serves it apart from the registry
   and the control thread (below) because the control thread makes nested calls and settles
-  batches during which drivers map their buffers: a `CREATE_FROM_FILE` reads a driver binary through
-  virtio-blk, which maps the read's buffer, and every `VirtIO` driver maps its
+  batches during which drivers map their buffers: procmgr's verified read of a driver binary goes
+  through virtio-blk, which maps the read's buffer, and every `VirtIO` driver maps its
   rings before it reports ready. The two threads share the device and mapping
   table (`devmgr_firmware::dma::DmaTable`) under one lock, taken only around
   table operations and never across IPC: a mapping is pending in the table
@@ -519,38 +519,36 @@ devmgr's responsibilities are:
     IOMMU family record in a pass of its own, and every other module by the declaration it
     carries, read from the module mapped read-only and bound in the boot pass (above). Every
     module cap is released once its pass ends.
-  - **On-disk rootfs** — the drivers at `/services/drivers/<driver>` (among
-    them the per-arch RTC, virtio-input, virtio-console, virtio-rng, test-dma, and a copy
-    of virtio-blk), loaded via `procmgr_labels::CREATE_FROM_FILE`. svcmgr
-    delivers a `LOOKUP | READ | READDIR`-attenuated `/services/drivers/`
-    subtree cap via `devmgr_labels::SET_DRIVERS_DIR` after handover (gated by
-    `DRIVERS_DIR_AUTHORITY`), with the directory's absolute path as a name block from data word
-    `DRIVERS_DIR_PATH_WORD`, so devmgr names each driver `<path>/<entry>` to procmgr (a request
-    with no path is refused `INVALID_REQUEST`), and, when its walk finds it, the directory of the
-    platform description tables (`devmgr_labels::PLATFORM_TABLES_PATH`) as an optional `caps[1]`
-    at the same rights; devmgr replies SUCCESS immediately (so svcmgr
-    never blocks on driver work), and its control thread runs the
-    drivers-directory pass, settling the on-disk batch (above). Before the pass, unless a boot
-    module's table matched, the job reads the platform description tables as
-    [docs/driver-binding.md](../../../docs/driver-binding.md#platform-description-tables)
-    § Platform Description Tables describes, and deletes the directory cap. The pass
-    lists the directory (`NS_READDIR`, at most 4096 entries) and reads each
-    entry's declaration through `FS_READ` on its file cap, bounded as
-    [docs/driver-binding.md](../../../docs/driver-binding.md#declaration-bounds)
-    § Declaration Bounds requires: the ELF header page, the section header
-    table, the section name table, and the note section up to 1 KiB. A
-    binary with no declaration note is passed over unlogged, one whose
-    declaration matches no unbound device is not loaded, and the pass is
-    skipped when every device is bound. Each spawn is
-    at-most-once per boot, apart from the restart of a served driver that
-    dies, which devmgr serves at the class's next ordinal
-    ([Driver Restart](#driver-restart)), and the retries of a create procmgr refuses with an
-    error a later create can outlive ([Create retry](#create-retry)); failure, including an on-disk
-    driver's death, or its overrun of the settle bound, before it reports ready, is sticky and
-    surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
-    the rtc, input, hwrng, and debug-port classes, the same reply
-    as before `SET_DRIVERS_DIR` arrives, so a client that needs the class waits on a `WATCH_CLASS`
-    watch. See
+  - **On-disk rootfs** — the drivers at `/services/drivers/<driver>` (among them the per-arch RTC,
+    virtio-input, virtio-console, virtio-rng, test-dma, and a copy of virtio-blk), created by
+    `procmgr_labels::CREATE_PROCESS` from a copy of the run procmgr verified. svcmgr delivers a
+    `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` subtree cap via
+    `devmgr_labels::SET_DRIVERS_DIR` after handover (gated by `DRIVERS_DIR_AUTHORITY`), with the
+    directory's absolute path as a name block from data word `DRIVERS_DIR_PATH_WORD`, so devmgr
+    names each driver `<path>/<entry>` to procmgr (a request with no path is refused
+    `INVALID_REQUEST`), and, when its walk finds it, the directory of the platform description
+    tables (`devmgr_labels::PLATFORM_TABLES_PATH`) as an optional `caps[1]` at the same rights;
+    devmgr replies SUCCESS immediately (so svcmgr never blocks on driver work), and its control
+    thread runs the drivers-directory pass, settling the on-disk batch (above). Before the pass,
+    unless a boot module's table matched, the job reads the platform description tables as
+    [docs/driver-binding.md](../../../docs/driver-binding.md#platform-description-tables) § Platform
+    Description Tables describes, and deletes the directory cap. The pass lists the directory
+    (`NS_READDIR`, at most 4096 entries; an entry name the listing repeats is read once per pass)
+    and has procmgr read and verify each file once (`procmgr_labels::READ_VERIFIED` in the driver
+    role, under the entry's install path), as
+    [docs/driver-binding.md](../../../docs/driver-binding.md) § Driver Declarations describes.
+    devmgr reads the declaration from the verified body alone and creates the driver from a copy of
+    the run's Memory cap, which procmgr verifies again. A queued create retry shares the same
+    verified run. A file that does not verify is passed over, procmgr logging the refusal. A binary
+    with no declaration note is passed over unlogged, one whose declaration matches no unbound
+    device is not loaded, and the pass is skipped when every device is bound. Each spawn is
+    at-most-once per boot, apart from the restart of a served driver that dies, which devmgr serves
+    at the class's next ordinal ([Driver Restart](#driver-restart)), and the retries of a create
+    procmgr refuses with an error a later create can outlive ([Create retry](#create-retry));
+    failure, including an on-disk driver's death, or its overrun of the settle bound, before it
+    reports ready, is sticky and surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE`
+    queries of the rtc, input, hwrng, and debug-port classes, the same reply as before
+    `SET_DRIVERS_DIR` arrives, so a client that needs the class waits on a `WATCH_CLASS` watch. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves

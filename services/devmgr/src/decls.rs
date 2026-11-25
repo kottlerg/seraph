@@ -7,7 +7,12 @@
 //! ([docs/driver-binding.md](../../../docs/driver-binding.md) § Driver
 //! Declarations): the `.note.seraph.driver` note of a boot module devmgr
 //! holds, and of each entry of the `/services/drivers/` directory svcmgr
-//! hands it at `SET_DRIVERS_DIR`.
+//! hands it at `SET_DRIVERS_DIR`. devmgr parses no byte of a
+//! drivers-directory entry that a key did not sign
+//! ([docs/signing.md](../../../docs/signing.md) § Verifier Discipline):
+//! [`verified_decl`] has procmgr read the file once and verify it as a driver
+//! image under its install path, and reads the note from that verified run,
+//! which the driver is then created from ([`VerifiedImage`]).
 //!
 //! init forwards its boot modules untagged; [`classify_modules`] tells each
 //! by its content: an ELF executable is a driver module, and text named
@@ -21,17 +26,21 @@
 //!
 //! The reads are bounded, as § Declaration Bounds requires: the ELF header
 //! page, the section header table, the section name table, and the one note
-//! section, which is read only up to [`NOTE_SECTION_BYTES`]. A binary that is
-//! not an executable of this machine, or carries no declaration note, has no
-//! declaration and is passed over unlogged; a note whose descriptor does not
-//! decode is logged and the binary passed over.
+//! section, which is read only up to [`NOTE_SECTION_BYTES`], each within the
+//! module's bytes or the verified body. A binary that is not an executable of
+//! this machine, or carries no declaration note, has no declaration and is
+//! passed over unlogged; a note whose descriptor does not decode is logged
+//! and the binary passed over.
+
+use std::io::ErrorKind;
+use std::os::seraph::{VerifiedData, VerifiedRole, reserve_pages};
+use std::sync::Arc;
 
 use driver_binding::DRIVER_NOTE_SECTION;
 use driver_binding::decl::DriverDecl;
 use firmware::platform::{ModuleError, PlatformTable};
 use ipc::IpcMessage;
 use process_abi::{NT_SERAPH_DRIVER, SERAPH_NOTE_OWNER};
-use std::os::seraph::reserve_pages;
 use syscall_abi::PAGE_SIZE;
 
 use crate::{arch, caps, spawn};
@@ -46,10 +55,6 @@ const NOTE_SECTION_BYTES: usize = 1024;
 /// header and the program header table a valid executable starts with.
 const HEADER_BYTES: usize = 4096;
 
-/// Payload bytes one `FS_READ` reply carries: the IPC data words less the
-/// count word.
-const FS_READ_CHUNK: usize = 504;
-
 /// The most drivers-directory entries devmgr lists: a directory server that
 /// never answers `END_OF_DIR` ends the listing here.
 const MAX_DIR_ENTRIES: u32 = 4096;
@@ -62,26 +67,36 @@ const MAX_ENTRY_NAME: usize = 255;
 /// driver module rather than a platform description table.
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 
+/// A drivers-directory entry procmgr read once and verified as a driver
+/// image under its install path (`procmgr_labels::READ_VERIFIED` in the
+/// driver role): the run that holds the file, which no process but memmgr can
+/// write, the file's size in bytes, and the install path. devmgr reads the
+/// declaration from the run's verified body and creates the driver from the
+/// same run, which procmgr copies and verifies again, so the bytes the
+/// binding chose on are the bytes that run. Dropping it unmaps the run and
+/// returns it to devmgr's account.
+pub struct VerifiedImage
+{
+    run: VerifiedData,
+    size: u64,
+    name: Box<[u8]>,
+}
+
 /// Where devmgr starts a driver from, with the exact size and the name
 /// procmgr verifies its signature under.
 pub enum Binary
 {
-    /// A boot module: devmgr's Memory cap on it, its size in bytes, and its
-    /// bundle entry name.
+    /// A boot module, or devmgr's own copy of one: devmgr's Memory cap on it,
+    /// its size in bytes, and its bundle entry name.
     Module
     {
         cap: u64,
         size: u64,
         name: Box<[u8]>,
     },
-    /// A drivers-directory entry: the file node cap the walk returned, its
-    /// size, and its install path (the directory's path and the entry name).
-    File
-    {
-        cap: u64,
-        size: u64,
-        name: Box<[u8]>,
-    },
+    /// A drivers-directory entry, verified: shared by the match table and a
+    /// queued create retry, and released when the last of them drops it.
+    Verified(Arc<VerifiedImage>),
 }
 
 impl Binary
@@ -91,31 +106,27 @@ impl Binary
     /// derived.
     pub fn source_copy(&self) -> Option<spawn::CreateSource<'_>>
     {
-        match self
+        let (cap, size, name) = match self
         {
-            Self::Module { cap, size, name } => syscall::cap_derive(*cap, syscall::RIGHTS_ALL)
-                .ok()
-                .map(|cap| spawn::CreateSource::Module {
-                    cap,
-                    size: *size,
-                    name,
-                }),
-            Self::File { cap, size, name } => syscall::cap_derive(*cap, syscall::RIGHTS_ALL)
-                .ok()
-                .map(|file_cap| spawn::CreateSource::File {
-                    file_cap,
-                    size: *size,
-                    name,
-                }),
-        }
+            Self::Module { cap, size, name } => (*cap, *size, &**name),
+            Self::Verified(image) => (image.run.cap(), image.size, &*image.name),
+        };
+        syscall::cap_derive(cap, syscall::RIGHTS_ALL)
+            .ok()
+            .map(|cap| spawn::CreateSource { cap, size, name })
     }
 
-    /// Delete devmgr's cap on the binary. A retained module cap pins the
+    /// Delete devmgr's cap on a boot module. A retained module cap pins the
     /// donated pool run it was derived from, so every module cap is released
-    /// once the boot pass ends.
+    /// once the boot pass ends. A verified image is released when it is
+    /// dropped, so this does nothing for one.
     pub fn release(&self)
     {
-        let _ = syscall::cap_delete(self.cap());
+        let cap = self.module_cap();
+        if cap != 0
+        {
+            let _ = syscall::cap_delete(cap);
+        }
     }
 
     /// The binary's name: a boot module's bundle entry name, a file's
@@ -125,35 +136,41 @@ impl Binary
     {
         match self
         {
-            Self::Module { name, .. } | Self::File { name, .. } => name,
+            Self::Module { name, .. } => name,
+            Self::Verified(image) => &image.name,
         }
     }
 
-    /// devmgr's cap on the binary.
-    pub const fn cap(&self) -> u64
+    /// devmgr's cap on a boot module, which [`Self::release`] deletes; `0`
+    /// for a verified image, which holds no cap a caller deletes.
+    pub const fn module_cap(&self) -> u64
     {
         match self
         {
-            Self::Module { cap, .. } | Self::File { cap, .. } => *cap,
+            Self::Module { cap, .. } => *cap,
+            Self::Verified(_) => 0,
         }
     }
 }
 
-/// The declaration of a binary of `size` bytes that `read_at` reads,
-/// `read_at(offset, dst)` filling `dst` from byte `offset` and returning the
-/// bytes it copied. `name` labels the log line of a rejected declaration, and
-/// of one the heap has no room to read.
+/// The declaration of the binary `bytes`, a boot module's bytes or a
+/// verified image's body, read within § Declaration Bounds. `name` labels
+/// the log line of a rejected declaration, and of one the heap has no room to
+/// read.
 ///
 /// The header page and the note section are read into heap buffers, freed on
 /// return: on the stack, their 5 KiB would sit in the frame of every caller
 /// the function is inlined into, beside that caller's own spawn and listing
 /// locals, on devmgr's 32 KiB main-thread stack.
-fn read_decl(
-    name: &str,
-    size: u64,
-    mut read_at: impl FnMut(u64, &mut [u8]) -> Option<usize>,
-) -> Option<DriverDecl>
+fn read_decl(name: &str, bytes: &[u8]) -> Option<DriverDecl>
 {
+    let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let read_at = |offset: u64, dst: &mut [u8]| {
+        let start = usize::try_from(offset).ok()?;
+        let src = bytes.get(start..start.checked_add(dst.len())?)?;
+        dst.copy_from_slice(src);
+        Some(dst.len())
+    };
     let mut header = zeroed(name, HEADER_BYTES)?;
     let header_len = usize::try_from(size).map_or(HEADER_BYTES, |s| s.min(HEADER_BYTES));
     let read = read_at(0, header.get_mut(..header_len)?)?;
@@ -327,14 +344,7 @@ fn classify(name: &[u8], bytes: &[u8]) -> Classified
 {
     if bytes.starts_with(ELF_MAGIC)
     {
-        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let decl = read_decl("boot module", size, |offset, dst| {
-            let start = usize::try_from(offset).ok()?;
-            let src = bytes.get(start..start.checked_add(dst.len())?)?;
-            dst.copy_from_slice(src);
-            Some(dst.len())
-        });
-        if let Some(decl) = decl
+        if let Some(decl) = read_decl("boot module", bytes)
         {
             return Classified::Driver(decl);
         }
@@ -431,46 +441,55 @@ pub fn with_module<R>(
     Some(out)
 }
 
-/// The declaration of the drivers-directory entry `name`, whose file node
-/// cap `file_cap` (of `size` bytes) the walk returned; read through
-/// `FS_READ` on the node cap.
-pub fn file_decl(name: &str, file_cap: u64, size: u64, ipc_buf: *mut u64) -> Option<DriverDecl>
+/// Have procmgr read the drivers-directory entry `file_cap`, `size` bytes
+/// long (the walk's size hint), and verify it as a driver image under its
+/// install path `install` (`std::os::seraph::read_verified` in
+/// [`VerifiedRole::Driver`]), then read its declaration from the verified
+/// body alone. The file cap moves to procmgr on every path. `label` names
+/// the entry in the log.
+///
+/// Returns the declaration and the image as a [`Binary::Verified`] the
+/// driver is created from. `None` when the file does not verify, which
+/// procmgr logs, so devmgr adds no line of its own; when it is empty or past
+/// `READ_VERIFIED_IMAGE_MAX` by the size hint, or cannot be read, logged; or
+/// when its body declares no driver ([`read_decl`]), the run then released.
+pub fn verified_decl(
+    label: &str,
+    file_cap: u64,
+    size: u64,
+    install: Box<[u8]>,
+) -> Option<(DriverDecl, Binary)>
 {
-    read_decl(name, size, |offset, dst| {
-        firmware::image::fill(dst, offset, FS_READ_CHUNK, |at, window| {
-            fs_read(file_cap, at, window, ipc_buf)
-        })
-    })
-}
-
-/// One `FS_READ` of `dst.len()` bytes at `offset` on `file_cap`: copies at
-/// most `dst.len()` payload bytes into `dst` and returns the count the
-/// server reported. Any cap the untrusted reply carries is deleted.
-fn fs_read(file_cap: u64, offset: u64, dst: &mut [u8], ipc_buf: *mut u64) -> Option<usize>
-{
-    let msg = IpcMessage::builder(ipc::fs_labels::FS_READ)
-        .word(0, offset)
-        .word(1, u64::try_from(dst.len()).ok()?)
-        .build();
-    // SAFETY: `ipc_buf` is devmgr's registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
-    for &cap in reply.caps()
+    if size == 0 || size > ipc::procmgr_labels::READ_VERIFIED_IMAGE_MAX
     {
-        let _ = syscall::cap_delete(cap);
-    }
-    if reply.label != 0
-    {
+        std::os::seraph::log!(warn: "{}: {} bytes, past a driver image's bound; skipped", label, size);
+        let _ = syscall::cap_delete(file_cap);
         return None;
     }
-    let reported = usize::try_from(reply.word(0)).ok()?;
-    let data = reply.data_bytes();
-    let payload = data.get(core::mem::size_of::<u64>()..).unwrap_or(&[]);
-    let copied = reported.min(dst.len()).min(payload.len());
-    if let (Some(out), Some(src)) = (dst.get_mut(..copied), payload.get(..copied))
+    let Ok(path) = core::str::from_utf8(&install)
+    else
     {
-        out.copy_from_slice(src);
-    }
-    Some(reported)
+        std::os::seraph::log!(warn: "{}: install path not UTF-8; skipped", label);
+        let _ = syscall::cap_delete(file_cap);
+        return None;
+    };
+    let run = match std::os::seraph::read_verified(file_cap, size, path, VerifiedRole::Driver)
+    {
+        Ok(run) => run,
+        Err(e) if e.kind() == ErrorKind::InvalidData => return None,
+        Err(e) =>
+        {
+            std::os::seraph::log!(warn: "{}: driver image not read ({:?}); skipped", label, e.kind());
+            return None;
+        }
+    };
+    let decl = read_decl(label, run.bytes())?;
+    let image = VerifiedImage {
+        run,
+        size,
+        name: install,
+    };
+    Some((decl, Binary::Verified(Arc::new(image))))
 }
 
 /// Call `visit` with the name of each entry of the directory `dir_cap`

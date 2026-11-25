@@ -576,20 +576,7 @@ pub fn sdt_oem_table_id(sdt_header: &[u8]) -> Option<[u8; 8]>
 /// yielded.
 pub fn mcfg_ecams(mcfg_bytes: &[u8]) -> impl Iterator<Item = EcamLocation> + '_
 {
-    let entry_count = if sdt_signature(mcfg_bytes) == *b"MCFG"
-    {
-        sdt_length(mcfg_bytes).map_or(0, |len| {
-            (len as usize)
-                .min(mcfg_bytes.len())
-                .saturating_sub(MCFG_ENTRIES_OFF)
-                / MCFG_ENTRY_SIZE
-        })
-    }
-    else
-    {
-        0
-    };
-    (0..entry_count).filter_map(move |i| {
+    (0..mcfg_entry_count(mcfg_bytes)).filter_map(move |i| {
         mcfg_entry_ecam(
             mcfg_bytes,
             MCFG_ENTRIES_OFF.saturating_add(i.saturating_mul(MCFG_ENTRY_SIZE)),
@@ -597,10 +584,26 @@ pub fn mcfg_ecams(mcfg_bytes: &[u8]) -> impl Iterator<Item = EcamLocation> + '_
     })
 }
 
+/// The allocation entries of an MCFG, bounded by its reported length and the
+/// slice; 0 for a table that is not an MCFG.
+pub(crate) fn mcfg_entry_count(mcfg_bytes: &[u8]) -> usize
+{
+    if sdt_signature(mcfg_bytes) != *b"MCFG"
+    {
+        return 0;
+    }
+    sdt_length(mcfg_bytes).map_or(0, |len| {
+        (len as usize)
+            .min(mcfg_bytes.len())
+            .saturating_sub(MCFG_ENTRIES_OFF)
+            / MCFG_ENTRY_SIZE
+    })
+}
+
 /// Decode the MCFG allocation entry at `off`: base (u64), segment (u16),
 /// start bus (u8), end bus (u8), reserved (u32). `None` per [`mcfg_ecams`]'s
 /// skip conditions.
-fn mcfg_entry_ecam(mcfg_bytes: &[u8], off: usize) -> Option<EcamLocation>
+pub(crate) fn mcfg_entry_ecam(mcfg_bytes: &[u8], off: usize) -> Option<EcamLocation>
 {
     let base = read_u64(mcfg_bytes, off);
     let segment = read_u16(mcfg_bytes, off.saturating_add(8));
@@ -636,42 +639,130 @@ pub struct SourceOverride
     pub flags: u16,
 }
 
-/// The MADT's interrupt-controller structures, each as its type, its offset,
-/// and its length.
+/// The end of the MADT's interrupt-controller structures: the table's
+/// reported length bounded by the slice.
 ///
 /// Returns `None` if the signature isn't `APIC` or the header's length is
-/// unreadable or does not reach the first structure. The structures are
-/// bounded by the table's reported length and the slice; the walk ends at a
-/// structure whose length is under 2 or runs past that bound, so a truncated
-/// or malformed table yields the structures before the bad one.
-fn madt_structures(madt_bytes: &[u8]) -> Option<impl Iterator<Item = (u8, usize, usize)> + '_>
+/// unreadable or does not reach the first structure.
+pub(crate) fn madt_end(madt_bytes: &[u8]) -> Option<usize>
 {
     if sdt_signature(madt_bytes) != *b"APIC"
     {
         return None;
     }
     let end = (sdt_length(madt_bytes)? as usize).min(madt_bytes.len());
-    if end < MADT_ENTRIES_OFF
+    (end >= MADT_ENTRIES_OFF).then_some(end)
+}
+
+/// The interrupt-controller structure at `off` of a MADT whose structures
+/// end at `end` ([`madt_end`]): its type and its length. `None` where the
+/// walk ends: fewer than 2 bytes before `end`, or a length under 2 or
+/// running past `end`.
+pub(crate) fn madt_structure(madt_bytes: &[u8], off: usize, end: usize) -> Option<(u8, usize)>
+{
+    if off.saturating_add(2) > end
     {
         return None;
     }
+    let kind = read_u8(madt_bytes, off);
+    let len = usize::from(read_u8(madt_bytes, off.saturating_add(1)));
+    if len < 2 || off.saturating_add(len) > end
+    {
+        return None;
+    }
+    Some((kind, len))
+}
+
+/// The MADT's interrupt-controller structures, each as its type, its offset,
+/// and its length, from the first to where [`madt_structure`] ends the walk,
+/// so a truncated or malformed table yields the structures before the bad
+/// one. `None` where [`madt_end`] gives none.
+fn madt_structures(madt_bytes: &[u8]) -> Option<impl Iterator<Item = (u8, usize, usize)> + '_>
+{
+    let end = madt_end(madt_bytes)?;
     let mut off = MADT_ENTRIES_OFF;
     Some(core::iter::from_fn(move || {
-        if off.saturating_add(2) > end
-        {
-            return None;
-        }
-        let kind = read_u8(madt_bytes, off);
-        let len = usize::from(read_u8(madt_bytes, off.saturating_add(1)));
-        if len < 2 || off.saturating_add(len) > end
-        {
-            off = end;
-            return None;
-        }
+        let (kind, len) = madt_structure(madt_bytes, off, end)?;
         let at = off;
         off = off.saturating_add(len);
         Some((kind, at, len))
     }))
+}
+
+/// The Interrupt Source Override of the MADT structure of type `kind` and
+/// length `len` at `at`; `None` for a structure of another type or one
+/// shorter than an override's 10 bytes.
+pub(crate) fn madt_source_override(
+    madt_bytes: &[u8],
+    kind: u8,
+    at: usize,
+    len: usize,
+) -> Option<SourceOverride>
+{
+    (kind == MADT_TYPE_SOURCE_OVERRIDE && len >= MADT_SOURCE_OVERRIDE_LEN).then(|| SourceOverride {
+        source: read_u8(madt_bytes, at.saturating_add(3)),
+        gsi: read_u32(madt_bytes, at.saturating_add(4)),
+        flags: read_u16(madt_bytes, at.saturating_add(8)),
+    })
+}
+
+/// The I/O APIC of the MADT structure of type `kind` and length `len` at
+/// `at`; `None` for a structure of another type or one shorter than an I/O
+/// APIC's 12 bytes.
+pub(crate) fn madt_io_apic(madt_bytes: &[u8], kind: u8, at: usize, len: usize) -> Option<IoApic>
+{
+    (kind == MADT_TYPE_IO_APIC && len >= MADT_IO_APIC_LEN).then(|| IoApic {
+        id: read_u8(madt_bytes, at.saturating_add(2)),
+        gsi_base: read_u32(madt_bytes, at.saturating_add(8)),
+    })
+}
+
+/// The register window, `(base, length)`, of the interrupt controller the
+/// MADT structure of type `kind` and length `len` at `at` describes, as
+/// [`madt_interrupt_controllers`] lists them, a zero base or length
+/// included; `None` for a structure that describes none.
+pub(crate) fn madt_controller_window(
+    madt_bytes: &[u8],
+    kind: u8,
+    at: usize,
+    len: usize,
+) -> Option<(u64, u64)>
+{
+    let field = |off: usize| at.saturating_add(off);
+    match kind
+    {
+        MADT_TYPE_IO_APIC if len >= MADT_IO_APIC_LEN =>
+        {
+            Some((u64::from(read_u32(madt_bytes, field(4))), APIC_WINDOW_BYTES))
+        }
+        MADT_TYPE_LAPIC_OVERRIDE if len >= MADT_LAPIC_OVERRIDE_LEN =>
+        {
+            Some((read_u64(madt_bytes, field(4)), APIC_WINDOW_BYTES))
+        }
+        MADT_TYPE_RINTC
+            if len >= MADT_RISCV_WINDOW_LEN && read_u32(madt_bytes, field(4)) & 1 != 0 =>
+        {
+            Some((
+                read_u64(madt_bytes, field(24)),
+                u64::from(read_u32(madt_bytes, field(32))),
+            ))
+        }
+        MADT_TYPE_APLIC if len >= MADT_RISCV_WINDOW_LEN => Some((
+            read_u64(madt_bytes, field(24)),
+            u64::from(read_u32(madt_bytes, field(32))),
+        )),
+        _ => None,
+    }
+}
+
+/// The local APIC's register window the MADT header gives, `(address,
+/// length)`, its address possibly zero.
+pub(crate) fn madt_header_window(madt_bytes: &[u8]) -> (u64, u64)
+{
+    (
+        u64::from(read_u32(madt_bytes, SDT_HDR_LEN)),
+        APIC_WINDOW_BYTES,
+    )
 }
 
 /// Iterate the MADT's Interrupt Source Overrides.
@@ -685,14 +776,7 @@ pub fn madt_source_overrides(madt_bytes: &[u8])
 {
     Some(
         madt_structures(madt_bytes)?
-            .filter(|&(kind, _, len)| {
-                kind == MADT_TYPE_SOURCE_OVERRIDE && len >= MADT_SOURCE_OVERRIDE_LEN
-            })
-            .map(|(_, at, _)| SourceOverride {
-                source: read_u8(madt_bytes, at.saturating_add(3)),
-                gsi: read_u32(madt_bytes, at.saturating_add(4)),
-                flags: read_u16(madt_bytes, at.saturating_add(8)),
-            }),
+            .filter_map(|(kind, at, len)| madt_source_override(madt_bytes, kind, at, len)),
     )
 }
 
@@ -715,11 +799,7 @@ pub fn madt_io_apics(madt_bytes: &[u8]) -> Option<impl Iterator<Item = IoApic> +
 {
     Some(
         madt_structures(madt_bytes)?
-            .filter(|&(kind, _, len)| kind == MADT_TYPE_IO_APIC && len >= MADT_IO_APIC_LEN)
-            .map(|(_, at, _)| IoApic {
-                id: read_u8(madt_bytes, at.saturating_add(2)),
-                gsi_base: read_u32(madt_bytes, at.saturating_add(8)),
-            }),
+            .filter_map(|(kind, at, len)| madt_io_apic(madt_bytes, kind, at, len)),
     )
 }
 
@@ -735,36 +815,10 @@ pub fn madt_interrupt_controllers(
     madt_bytes: &[u8],
 ) -> Option<impl Iterator<Item = (u64, u64)> + '_>
 {
-    let header = u64::from(read_u32(madt_bytes, SDT_HDR_LEN));
-    let windows = madt_structures(madt_bytes)?.filter_map(|(kind, at, len)| {
-        let field = |off: usize| at.saturating_add(off);
-        match kind
-        {
-            MADT_TYPE_IO_APIC if len >= MADT_IO_APIC_LEN =>
-            {
-                Some((u64::from(read_u32(madt_bytes, field(4))), APIC_WINDOW_BYTES))
-            }
-            MADT_TYPE_LAPIC_OVERRIDE if len >= MADT_LAPIC_OVERRIDE_LEN =>
-            {
-                Some((read_u64(madt_bytes, field(4)), APIC_WINDOW_BYTES))
-            }
-            MADT_TYPE_RINTC
-                if len >= MADT_RISCV_WINDOW_LEN && read_u32(madt_bytes, field(4)) & 1 != 0 =>
-            {
-                Some((
-                    read_u64(madt_bytes, field(24)),
-                    u64::from(read_u32(madt_bytes, field(32))),
-                ))
-            }
-            MADT_TYPE_APLIC if len >= MADT_RISCV_WINDOW_LEN => Some((
-                read_u64(madt_bytes, field(24)),
-                u64::from(read_u32(madt_bytes, field(32))),
-            )),
-            _ => None,
-        }
-    });
+    let windows = madt_structures(madt_bytes)?
+        .filter_map(|(kind, at, len)| madt_controller_window(madt_bytes, kind, at, len));
     Some(
-        core::iter::once((header, APIC_WINDOW_BYTES))
+        core::iter::once(madt_header_window(madt_bytes))
             .chain(windows)
             .filter(|&(base, len)| base != 0 && len != 0),
     )
@@ -790,31 +844,17 @@ pub fn io_apic_for(io_apics: impl IntoIterator<Item = IoApic>, gsi: u32) -> Opti
 #[must_use]
 pub fn madt_well_formed(madt_bytes: &[u8]) -> bool
 {
-    if sdt_signature(madt_bytes) != *b"APIC"
-    {
-        return false;
-    }
-    let Some(len) = sdt_length(madt_bytes)
+    let Some(end) = madt_end(madt_bytes)
     else
     {
         return false;
     };
-    let end = (len as usize).min(madt_bytes.len());
-    if end < MADT_ENTRIES_OFF
-    {
-        return false;
-    }
     let mut off = MADT_ENTRIES_OFF;
-    while off < end
+    while let Some((_, len)) = madt_structure(madt_bytes, off, end)
     {
-        let len = usize::from(read_u8(madt_bytes, off.saturating_add(1)));
-        if off.saturating_add(2) > end || len < 2 || off.saturating_add(len) > end
-        {
-            return false;
-        }
         off = off.saturating_add(len);
     }
-    true
+    off == end
 }
 
 /// The `SYS_IRQ_REGISTER` mode of a PCI `INTx` line: level-triggered,
@@ -2015,5 +2055,134 @@ mod tests
             },
         ];
         assert_eq!(isa_line(two, 4, 0), (20, 0));
+    }
+}
+
+/// The proofs of the property's checks of the ACPI decoders
+/// (docs/testing.md § Bounded verification). The RSDP, an SDT header, the
+/// XSDT and the FADT are read at fixed offsets, so each is proven whole on
+/// every input up to its bound. The MCFG and the MADT are proven by their
+/// steps: the MCFG's entry count, the decode of an entry at any place, the
+/// MADT's end and the decode of a structure at any place, each of the
+/// override, the I/O APIC and the controller window it gives among them.
+/// What lies outside the proofs is the loops that drive the steps: the
+/// iteration of `mcfg_ecams` over the entries, the walks of
+/// `madt_structures` and `madt_well_formed` from one structure to the
+/// next, and the iterator adapters over them; the fuzz target
+/// `devmgr-firmware`, the replay of the checked-in inputs and the unit tests
+/// check them.
+#[cfg(kani)]
+mod proofs
+{
+    use crate::property::acpi as property;
+
+    /// Every input of at most 37 bytes holds the RSDP's contract: 37 bytes
+    /// reach each refusal and the acceptance of the 36 bytes it reads. The
+    /// loop is the compare of the 8-byte signature.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_rsdp_reads_as_its_fields()
+    {
+        let bytes: [u8; 37] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        property::rsdp_holds(&bytes[..len]);
+    }
+
+    /// Every input of at most 37 bytes holds the SDT header's contract: 37
+    /// bytes reach a header too short and a whole one of every length field.
+    /// The loops are the copies of the signature and the OEM table ID, at
+    /// most 8 bytes.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_header_reads_as_its_fields()
+    {
+        let bytes: [u8; 37] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        property::header_holds(&bytes[..len]);
+    }
+
+    /// Every input of at most 53 bytes holds the XSDT's contract: 53 bytes
+    /// hold the header, two entries and a partial third, so a table of no
+    /// entry, of entries after one another, and one cut short are reached
+    /// at every length field. The loop is the compare of up to 2 entries.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn every_xsdt_reads_as_its_entries()
+    {
+        let bytes: [u8; 53] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        property::xsdt_holds(&bytes[..len]);
+    }
+
+    /// Every input of at most 269 bytes holds the FADT decoders' contract:
+    /// 268 bytes reach `SLEEP_STATUS_REG`, the last field read, so every
+    /// field is reached, cut short and refused at every length field. The
+    /// loops are the compare of the 4-byte signature and the walks over the
+    /// 4 register blocks and the 2 sleep registers.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_fadt_reads_as_its_fields()
+    {
+        let bytes: [u8; 269] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        property::fadt_holds(&bytes[..len]);
+    }
+
+    /// Every input of at most 61 bytes holds the MCFG count's contract: 61
+    /// bytes hold the header, one entry and one byte past it. The loop is
+    /// the compare of the 4-byte signature.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_mcfg_counts_its_entries()
+    {
+        let bytes: [u8; 61] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let _ = property::mcfg_count_holds(&bytes[..len]);
+    }
+
+    /// Every MCFG entry, at any place of an input of at most 20 bytes, holds
+    /// its contract: an entry is 16 bytes, read from its own place, so any
+    /// base, segment and bus range is reached. No loop.
+    #[kani::proof]
+    fn every_mcfg_entry_reads_as_its_fields()
+    {
+        let bytes: [u8; 20] = kani::any();
+        let len: usize = kani::any();
+        let at: usize = kani::any();
+        kani::assume(len <= bytes.len() && at <= len && len - at >= 16);
+        let _ = property::mcfg_entry_holds(&bytes[..len], at);
+    }
+
+    /// Every input of at most 45 bytes holds the MADT end's contract: 45
+    /// bytes reach an end before, at and past the first structure, at 44, at
+    /// every length field. The loop is the compare of the 4-byte signature.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_madt_ends_at_its_length()
+    {
+        let bytes: [u8; 45] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let _ = property::madt_end_holds(&bytes[..len]);
+    }
+
+    /// Every MADT structure, at any place of an input of at most 38 bytes
+    /// and any end within it, holds its contract: the longest structure
+    /// decoded, a RINTC or an APLIC, is 36 bytes, so a structure of every
+    /// type and length, one past the end and one too short for its fields
+    /// are reached. No loop.
+    #[kani::proof]
+    fn every_madt_structure_reads_as_its_fields()
+    {
+        let bytes: [u8; 38] = kani::any();
+        let len: usize = kani::any();
+        let end: usize = kani::any();
+        kani::assume(len <= bytes.len() && end <= len);
+        let _ = property::madt_structure_holds(&bytes[..len], kani::any(), end);
     }
 }

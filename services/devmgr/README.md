@@ -28,7 +28,9 @@ devmgr/
 │                                   #   acpid's side (region policy, configuration access,
 │                                   #   per-bridge results), PCI Express hotplug (slots,
 │                                   #   control grant, poller decisions, BAR placement),
-│                                   #   the driver restart policy
+│                                   #   the driver restart policy, the firmware-table
+│                                   #   decoders' fuzz property (`src/property/`) and its
+│                                   #   checked-in inputs (`fuzz/devmgr-firmware/`)
 ├── platform/                       # Platform description tables, one `<machine>.platform` each
 ├── src/
 │   ├── main.rs                     # Bootstrap, the registry's workers and control thread,

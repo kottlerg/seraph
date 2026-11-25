@@ -39,6 +39,8 @@
 //! grant and their poller's actions, and places, programs and admits a
 //! hot-added function's BARs and record (`hotplug`), and names the requests
 //! refused while devmgr's `CSpace` is short of its headroom (`headroom`). The
+//! contract of the ACPI, DMAR and RIMT decoders is one property
+//! (`property`, built for host tests, proofs and fuzzing only). The
 //! functions read caller-mapped byte slices or values, or reach the platform
 //! only through a caller-supplied accessor or split operation, and touch no
 //! syscall, IPC, or `std::os::seraph` surface, so the crate is host-reachable
@@ -65,6 +67,8 @@ pub mod lines;
 pub mod pci;
 pub mod pci_records;
 pub mod platform;
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
 pub mod records;
 pub mod resource;
 pub mod restart;
@@ -91,4 +95,117 @@ pub struct EcamLocation
     pub start_bus: u8,
     /// Highest PCI bus number covered by the ECAM (inclusive).
     pub end_bus: u8,
+}
+
+#[cfg(test)]
+mod tests
+{
+    use std::vec::Vec;
+
+    use crate::{acpi, acpid, dmar, property, rimt};
+
+    /// The checked-in fuzz inputs of the kinds given (`seeds`,
+    /// `regressions`).
+    fn fuzz_inputs(kinds: &[&str]) -> Vec<Vec<u8>>
+    {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/devmgr-firmware");
+        let mut inputs = Vec::new();
+        for kind in kinds
+        {
+            let Ok(dir) = std::fs::read_dir(root.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in dir
+            {
+                inputs.push(std::fs::read(entry.unwrap().path()).unwrap());
+            }
+        }
+        inputs
+    }
+
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_decoders_contract()
+    {
+        let inputs = fuzz_inputs(&["seeds", "regressions"]);
+        assert!(!inputs.is_empty(), "no checked-in fuzz input found");
+        for input in &inputs
+        {
+            property::firmware_holds(input);
+        }
+    }
+
+    // Defect caught: seeds that no longer reach a decoder's acceptance, so
+    // the fuzz target starts from refusals alone for it.
+    #[test]
+    fn the_seeds_reach_the_acceptance_of_every_decoder()
+    {
+        let seeds = fuzz_inputs(&["seeds"]);
+        let any = |accepts: &dyn Fn(&[u8]) -> bool| seeds.iter().any(|s| accepts(s));
+        assert!(any(&|s| acpi::rsdp_xsdt_phys(s).is_some()), "an RSDP");
+        assert!(
+            any(&|s| acpi::sdt_oem_table_id(s).is_some()),
+            "an OEM table ID"
+        );
+        assert!(
+            any(&|s| &acpi::sdt_signature(s) == b"XSDT" && acpi::iter_xsdt_entries(s).count() > 1),
+            "an XSDT"
+        );
+        assert!(any(&|s| acpi::fadt_century_index(s).is_some()), "CENTURY");
+        assert!(any(&|s| acpi::fadt_dsdt_phys(s).is_some()), "the DSDT");
+        assert!(any(&|s| acpi::fadt_facs_phys(s).is_some()), "the FACS");
+        assert!(any(&|s| acpi::fadt_sci_int(s).is_some()), "SCI_INT");
+        for block in [
+            acpi::FadtBlock::Pm1aEvt,
+            acpi::FadtBlock::Pm1aCnt,
+            acpi::FadtBlock::Gpe0,
+            acpi::FadtBlock::SmiCmd,
+        ]
+        {
+            assert!(
+                any(&|s| acpi::fadt_io_block(s, block).is_some()),
+                "{block:?}"
+            );
+        }
+        for register in [acpi::SleepRegister::Control, acpi::SleepRegister::Status]
+        {
+            assert!(
+                any(&|s| acpi::fadt_sleep_register(s, register).is_some()),
+                "{register:?}"
+            );
+        }
+        for space in [acpid::Space::Io, acpid::Space::Memory]
+        {
+            assert!(
+                any(&|s| acpi::fadt_reset_register(s).is_some_and(|r| r.register.space == space)),
+                "RESET_REG in {space:?}"
+            );
+        }
+        assert!(any(&|s| acpi::mcfg_ecams(s).count() > 1), "MCFG windows");
+        assert!(
+            any(&|s| acpi::madt_well_formed(s)
+                && acpi::madt_source_overrides(s).is_some_and(|mut o| o.next().is_some())
+                && acpi::madt_io_apics(s).is_some_and(|mut a| a.next().is_some())),
+            "a MADT of overrides and I/O APICs"
+        );
+        assert!(
+            any(
+                &|s| acpi::madt_interrupt_controllers(s).is_some_and(|w| w.count() > 1)
+                    && acpi::madt_io_apics(s).is_some_and(|mut a| a.next().is_none())
+            ),
+            "a RISC-V MADT's controllers"
+        );
+        assert!(
+            any(&|s| dmar::drhd_units(s).any(|u| u.scopes(s).count() > 1)
+                && dmar::rmrrs(s).any(|r| r.scopes(s).count() > 0)
+                && dmar::io_apic_scopes(s).count() > 0
+                && dmar::flags(s).is_some_and(|f| f.interrupt_remapping)),
+            "a DMAR"
+        );
+        assert!(
+            any(&|s| rimt::pci_iommus(s).count() > 0 && rimt::pci_id_mappings(s).count() > 1),
+            "a RIMT"
+        );
+    }
 }

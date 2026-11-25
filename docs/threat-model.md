@@ -405,13 +405,27 @@ is.
   input of up to two entries, and, by induction, the walk of the entry headers; that of
   `abi/init-protocol/src/lib.rs` proves the trim of every name and, by induction, `find_module_slot`
   ([testing.md](testing.md) § Bounded verification). CI's `kani` job runs them.
+- `devmgr-firmware` (`xtask/fuzz/targets/src/bin/devmgr-firmware.rs`) drives
+  `devmgr_firmware::property::firmware_holds` over an input read as each ACPI table devmgr's
+  `firmware` crate decodes, from the seeds in
+  `services/devmgr/firmware/fuzz/devmgr-firmware/seeds/`: the RSDP, an SDT header, the XSDT, the
+  FADT, the MCFG, the MADT, the DMAR and the RIMT. CI's
+  gating `fuzz` job runs it on a pull request whose change can affect it and the campaign for 30
+  minutes.
+- The `proofs` modules of `services/devmgr/firmware/src/acpi.rs`, `dmar.rs` and `rimt.rs` prove
+  the same property ([testing.md](testing.md) § Bounded verification); CI's `kani` job runs them.
+  The RSDP, an SDT header, the XSDT up to two entries and the FADT are proven whole on any input up
+  to their bounds; the MCFG, the MADT, the DMAR and the RIMT by their steps: each table's end, an
+  MCFG entry, a MADT structure, a DMAR remapping structure and device scope, and a RIMT node and
+  ID mapping, at any place. The loops that drive the steps are left to the fuzz target.
 
 **Gaps.**
 
 - The bundle header is unsigned, so the attacker can drop an entry, which fails the boot when it is
   needed ([signing.md](signing.md) § Which Stage Verifies What).
-- The firmware-table parsers (the bootloader's `core/boot/src/acpi.rs` and `core/boot/src/dtb.rs`,
-  and devmgr's `firmware` crate) have no fuzz target or proof harness yet; they are planned
+- The bootloader's firmware-table parsers (`core/boot/src/acpi.rs` and `core/boot/src/dtb.rs`), and
+  the AML namespace walk and the Device Tree walk of devmgr's `firmware` crate (`aml.rs`,
+  `dtb.rs`), have no fuzz target or proof harness yet; they are planned
   ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---

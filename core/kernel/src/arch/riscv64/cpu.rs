@@ -633,8 +633,11 @@ pub unsafe fn set_kernel_trap_stack(stack_top: u64)
 // eight `sd`, so an in-order core overlaps the loads' latency), then single words while 8
 // bytes remain, then the tail in bytes; any other copy runs in bytes. No access is ever
 // misaligned, so no hart traps to firmware for one (Zicclsm is not assumed). There is no
-// byte head that aligns the pointers: every kernel-side buffer is 8-byte aligned, so the
-// pointers are aligned together exactly when the user one is, and a head would be empty.
+// byte head that aligns the pointers: a head helps only when both are misaligned by the
+// same amount, which no caller arranges. The kernel-side buffers of the bulk copies (the
+// IPC words, the register frames, and the per-CPU syscall scratch the thread-memory copies
+// stage in) are 8-byte aligned, so those take the word path whenever the user buffer is
+// aligned; a byte array on the kernel stack copies in bytes unless it happens to be aligned.
 //
 // `a0`/`a1`/`a2` advance only after a unit's store, so at a fault they name the start of
 // the faulting unit. A fault in a word or a byte resumes at `__copy_user_fixup`, which

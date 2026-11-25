@@ -10,10 +10,13 @@
 //! `no_std`, no allocation; its one dependency is `shared/crypto`. Every
 //! parser is a total function over an arbitrary byte slice: it reads only
 //! inside the slice, never panics, and refuses anything the format does not
-//! define, so each is a fuzz entry point as it stands ([`split`],
-//! [`TrustStore::parse`], [`Attributes::parse`], [`Certificate::parse`],
-//! [`verify`]). The encoders write into a caller's buffer and refuse what
-//! the parsers would refuse, so an encoded object always parses.
+//! define. The `property` module holds the parsers ([`split`], [`Attributes::parse`],
+//! [`Certificate::parse`], [`TrustStore::parse`],
+//! [`enrol::EnrolledStore::parse`], [`enrol::TrustRequest::parse`]) to their
+//! contracts, which the fuzz target `objsig` and the `proofs` modules of
+//! their files check (docs/testing.md § Fuzzing, § Bounded verification).
+//! The encoders write into a caller's buffer and refuse what the parsers
+//! would refuse, so an encoded object always parses.
 //!
 //! - [`trailer`]: the signed object, `body || records || footer`; [`split`]
 //!   parses it, [`encode_trailer`] writes a trailer.
@@ -38,6 +41,8 @@ pub mod embed;
 pub mod enrol;
 pub mod index;
 pub mod name;
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
 pub mod store;
 pub mod trailer;
 pub mod verify;
@@ -411,4 +416,93 @@ pub enum StoreError
     AnchorOrder,
     /// The revoked key ids are not sorted strictly ascending.
     RevokedOrder,
+}
+
+#[cfg(test)]
+mod tests
+{
+    extern crate std;
+    use std::vec::Vec;
+
+    use super::{Attributes, Certificate, TrustStore, cert, property, split};
+    use crate::enrol::{EnrolledStore, TrustRequest};
+
+    /// The checked-in fuzz inputs of the kinds given (`seeds`,
+    /// `regressions`).
+    fn fuzz_inputs(kinds: &[&str]) -> Vec<Vec<u8>>
+    {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/objsig");
+        let mut inputs = Vec::new();
+        for kind in kinds
+        {
+            let Ok(dir) = std::fs::read_dir(root.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in dir
+            {
+                inputs.push(std::fs::read(entry.unwrap().path()).unwrap());
+            }
+        }
+        inputs
+    }
+
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_parsers_contract()
+    {
+        let inputs = fuzz_inputs(&["seeds", "regressions"]);
+        assert!(!inputs.is_empty(), "no checked-in fuzz input found");
+        for bytes in &inputs
+        {
+            property::objsig_holds(bytes);
+        }
+    }
+
+    // Defect caught: seeds that no longer reach a parser's acceptance, so the
+    // fuzz target starts from refusals alone for that format.
+    #[test]
+    fn the_seeds_reach_each_parsers_acceptance()
+    {
+        let seeds = fuzz_inputs(&["seeds"]);
+        let taken = |parse: &dyn Fn(&[u8]) -> bool| seeds.iter().any(|bytes| parse(bytes));
+        assert!(
+            taken(&|bytes| split(bytes).is_ok_and(|signed| signed.records().count() == 2)),
+            "no seed is an object of two records"
+        );
+        assert!(
+            taken(&|bytes| {
+                split(bytes)
+                    .is_ok_and(|signed| signed.records().any(|record| record.certificate.is_some()))
+            }),
+            "no seed is an object of a certified record"
+        );
+        assert!(
+            taken(&|bytes| Attributes::parse(bytes).is_ok()),
+            "no seed is signed attributes"
+        );
+        assert!(
+            taken(&|bytes| {
+                bytes
+                    .first_chunk::<{ cert::LEN }>()
+                    .is_some_and(|raw| Certificate::parse(raw).is_ok())
+            }),
+            "no seed is a certificate"
+        );
+        assert!(
+            taken(&|bytes| TrustStore::parse(bytes).is_ok_and(|store| !store.revoked().is_empty())),
+            "no seed is a trust store with a revoked key id"
+        );
+        assert!(
+            taken(
+                &|bytes| EnrolledStore::parse(bytes).is_ok_and(|store| store.anchors().count() > 0)
+            ),
+            "no seed is an enrolled store with an anchor"
+        );
+        assert!(
+            taken(&|bytes| TrustRequest::parse(bytes)
+                .is_ok_and(|request| request.additions().count() > 0)),
+            "no seed is a trust request adding an anchor"
+        );
+    }
 }

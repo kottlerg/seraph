@@ -269,10 +269,12 @@ name = "fuzz-targets"
 version = "0.1.5"
 dependencies = [
  "boot-protocol",
+ "driver-binding",
  "elf",
  "fuzz-engine",
  "hwrng-protocol",
  "init-protocol",
+ "objsig",
  "storage-statement",
  "vfsd-gpt",
 ]

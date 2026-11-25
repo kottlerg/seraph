@@ -342,3 +342,27 @@ mod tests
         );
     }
 }
+
+/// Bounded proofs of the attributes' parse (docs/testing.md § Bounded
+/// verification, Parser proofs). No loop but the compares of the domain tag
+/// and of the 64-byte body hash.
+#[cfg(kani)]
+mod proofs
+{
+    use crate::property;
+
+    /// Every input of at most 103 bytes holds the attributes' contract: 103
+    /// bytes hold the fixed part (99 bytes), a name of up to 3 and one byte
+    /// more, so each refusal, a name of each length against `name_len`, and
+    /// attributes taken are reached. The refusal of a length past 65,535 is
+    /// one compare, which the unit tests check at the bound.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn every_input_holds_the_attributes_contract()
+    {
+        let bytes: [u8; 103] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let _ = property::attributes_holds(&bytes[..len]);
+    }
+}

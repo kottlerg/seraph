@@ -1176,7 +1176,7 @@ unsafe fn keep_wake(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: Ca
 unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: CancelMode)
 -> bool
 {
-    use crate::ipc::endpoint::{EndpointState, unlink_from_wait_queue};
+    use crate::ipc::endpoint::EndpointState;
     use crate::ipc::event_queue::EventQueueState;
     use crate::ipc::notification::NotificationState;
     use crate::ipc::wait_set::WaitSetState;
@@ -1313,18 +1313,12 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
                               guarantees alignment"
                 )]
                 let ep = blocked_on.cast::<EndpointState>();
-                #[expect(
-                    clippy::multiple_unsafe_ops_per_block,
-                    reason = "both places are send-queue ends of the endpoint whose ep.lock `held` \
-                              holds"
-                )]
                 // SAFETY: `held` holds ep.lock on the live endpoint the binding
                 // names, which serialises its send queue.
-                let (send_head, send_tail) =
-                    unsafe { (&mut (*ep).send_head, &mut (*ep).send_tail) };
+                let send = unsafe { &mut (*ep).send };
                 // SAFETY: `held` holds ep.lock, the queue's owning lock; tcb
-                // and the queue ends are valid.
-                let unlinked = unsafe { unlink_from_wait_queue(tcb, send_head, send_tail) };
+                // is valid.
+                let unlinked = unsafe { send.remove(tcb) };
                 // Republish send-queue level after the unlink (#285-adjacent).
                 // SAFETY: the endpoint the binding names is live while `held`
                 // holds its lock.
@@ -1408,15 +1402,9 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
                               guarantees alignment"
                 )]
                 let ep = blocked_on.cast::<EndpointState>();
-                #[expect(
-                    clippy::multiple_unsafe_ops_per_block,
-                    reason = "both places are recv-queue ends of the endpoint whose ep.lock `held` \
-                              holds"
-                )]
                 // SAFETY: `held` holds ep.lock on the live endpoint the binding
                 // names, which serialises its recv queue.
-                let (recv_head, recv_tail) =
-                    unsafe { (&mut (*ep).recv_head, &mut (*ep).recv_tail) };
+                let recv = unsafe { &mut (*ep).recv };
                 // Claim = the recv-queue unlink under ep.lock (endpoint_call
                 // dequeues receivers under the same lock, so winning it makes
                 // this the episode's sole depositor). A lost unlink means a
@@ -1426,8 +1414,8 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
                 // park, or the thread's own dealloc_object(Thread) unlinked
                 // it as it dies.
                 // SAFETY: `held` holds ep.lock, the queue's owning lock; tcb
-                // and the queue ends are valid.
-                let unlinked = unsafe { unlink_from_wait_queue(tcb, recv_head, recv_tail) };
+                // is valid.
+                let unlinked = unsafe { recv.remove(tcb) };
                 if unlinked
                 {
                     // A timed receive's entry goes with the waiter.

@@ -1381,20 +1381,17 @@ pub struct ThreadControlBlock
     pub extended: ExtendedState,
 
     // === Diagnostic thread registry ===
-    /// Intrusive forward link in the global live-thread registry
-    /// (`sched::thread_registry`); `null` when this TCB is not on the registry.
-    /// Spliced in at construction and removed at dealloc, both under
+    /// Intrusive links in the global live-thread registry
+    /// (`sched::thread_registry`); both null when this TCB is not on the
+    /// registry. Spliced in at construction and removed at dealloc, both under
     /// `THREAD_REGISTRY_LOCK`. Read by the softlockup watchdog, to enumerate
-    /// `Blocked` waiters the per-CPU `current` dump cannot reach (#351), and by
+    /// `Blocked` waiters the per-CPU `current` dump cannot reach (#351), by
     /// object teardown (`stop_threads_bound_to`), to find every thread bound to a
-    /// dying `CSpace` or `AddressSpace`, and by the address-space hold and
-    /// release, to find every thread of the held space. Never read on any
-    /// scheduling hot path.
+    /// dying `CSpace` or `AddressSpace`, by the `IoPort` binding walks, and by
+    /// the address-space hold and release, to find every thread of the held
+    /// space. Never read on any scheduling hot path.
     /// Owned by `THREAD_REGISTRY_LOCK` (the Registry row).
-    pub registry_next: *mut ThreadControlBlock,
-    /// Intrusive backward link; see [`registry_next`](Self::registry_next).
-    /// Owned by `THREAD_REGISTRY_LOCK`.
-    pub registry_prev: *mut ThreadControlBlock,
+    pub registry: crate::sched::registry_list::RegistryLinks<ThreadControlBlock>,
 
     // === Use-after-free detection ===
     /// Magic cookie for use-after-free detection. Must be `TCB_MAGIC` when valid.

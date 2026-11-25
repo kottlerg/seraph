@@ -760,11 +760,10 @@ impl Command {
                     exit_reason: exit_reason.clone(),
                     peer_dead: peer_dead.clone(),
                 };
-                let handle = crate::os::seraph::thread::runtime_spawn(|| {
-                    crate::thread::Builder::new()
-                        .name(crate::string::String::from("seraph-deathbridge"))
-                        .spawn(move || bridge_main(handles))
-                })
+                let handle = crate::os::seraph::thread::runtime_spawn(
+                    "seraph-deathbridge",
+                    move |started| bridge_main(handles, started),
+                )
                 .map_err(|e| io::Error::other(crate::format!(
                         "spawn death-bridge thread failed: {e}"
                     )))?;
@@ -1498,7 +1497,8 @@ struct BridgeHandles {
     peer_dead: Arc<AtomicBool>,
 }
 
-fn bridge_main(h: BridgeHandles) {
+fn bridge_main(h: BridgeHandles, started: crate::os::seraph::thread::StartSignal) {
+    started.at_wait();
     let payload = loop {
         match syscall::event_recv(h.death_eq) {
             Ok(p) => break p,

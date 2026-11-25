@@ -409,7 +409,12 @@ teardown orphans.
 The cascade is one stack per `dealloc_object` call (`CascadeStack`), linked through the queued
 objects' own headers: an object on it has a reference count of 0, so its `ref_count` and the
 header's three padding bytes hold the link to the next, while the type and `ancestor` fields its
-teardown reads stay intact, and the link is cleared when it is popped. An object reaches zero once,
+teardown reads stay intact, and the link is cleared when it is popped. An `AddressSpace` keeps its
+link in its wrapper's `deferred_next` instead, the deferred-reclaim stack's link, which no other
+stack uses while the cascade holds it: a thread still bound to a queued space reaches its count
+through `pin_thread_aspace` ([§ Kernel Object Reference
+Counting](#kernel-object-reference-counting), "Thread address-space pins"), and a link in the count
+would read there as a live count, which the pin would take and corrupt. An object reaches zero once,
 so only the call that took it there queues it, at most once at a time, and the stack holds any
 number of objects without allocating. The one object queued twice is a `CSpace` wrapper: its arm's
 first run, having popped it, pushes it back beneath the objects its slots held, so its second run,
@@ -425,15 +430,37 @@ arm runs inside another's lock scope (a nested `CSpace`'s derivation drain takes
 lock after the outer arm has released it; a wait set's sources are torn down after
 `wait_set_drop` has released every source lock).
 
+The call takes the interrupts pending on its CPU between every two teardowns (`interrupt_window`),
+so a fan-out masks interrupts for one teardown at a time, and the teardowns whose own walks the
+owner sizes take them between batches: a dying `CSpace`'s release pass after every
+`RELEASE_BATCH_LEAVES` slot leaves (4 leaves, 224 slots), the sort of its kept arena pages, their
+leases and the release of its holds on them ([§ Body Arena](#body-arena)), an owner's death-observer
+chain after every `OBSERVER_BATCH_NODES` (64) nodes, an address space's frame release after every
+page table ([memory-internals.md](memory-internals.md) § Frame Map Table), and an Mmio object's
+mapping withdrawal after every mapping and every `SPILL_BATCH_CHUNKS` (64) spill chunks ([§ Mmio
+Mappings](#mmio-mappings)). A registry walk (`thread_registry::for_each`) and an IPC source's
+release of its waiters (`ipc::drain_in_batches`) take them between their batches, each batch one
+hold of its lock. Every context that calls `dealloc_object` allows a window, holding no lock and
+running where an interrupt may be taken with preemption disabled: a syscall and its epilogue, fault
+delivery between its park commit and its `schedule()`
+([scheduling-internals.md](scheduling-internals.md) § `ThreadState` Transitions, "Voluntary-block
+window"), the end of an interrupt taken from user mode (§ Return Work there), and the idle thread's
+drain. A window between two teardowns exposes no partial state: the popped object is torn down whole
+before the window, the queued ones are reachable by nothing but their own links, a `CSpace`
+wrapper's arena pages' `owner` back-pointers, which the windows of its arena-page pass expose
+already, and a queued `AddressSpace`'s bound threads, whose pins its count of 0 refuses, and no
+interrupt handler releases a reference, so no cascade runs nested inside another on its CPU.
+
 The walk holds no lock across groups (each group's return takes only its Memory object's locks,
 its read lock and its retype-allocator lock), and takes the interrupts pending on its CPU after
 every group but the create-time slab's (`interrupt_window`, as seeding does, [§ Donation
 Records](#donation-records)). Between two windows it therefore masks interrupts for one group: at
 most `RECORDS_PER_PAGE` records of one Memory object, whose return costs one walk of that object's
 page free list (at most one node per page of the object, [docs/limits.md](../../../docs/limits.md)),
-an insertion per run, and the sort of the group and of its records' kept arena pages. The kept
-pages are a dimension of their own, bounded by the bodies that outlive the `CSpace`, one page per
-body at most. Before taking the locks, the return zeroes the group's runs
+an insertion per run, and the sort of the group. The kept arena pages are a dimension of their
+own, bounded by the bodies that outlive the `CSpace`, one page per body at most, and their sort and
+leases take windows of their own ([§ Body Arena](#body-arena)). Before taking the locks, the
+return zeroes the group's runs
 ([memory-internals.md](memory-internals.md) § Kernel Object Memory), taking the pending interrupts
 after every 16 pages it zeroes, so the zeroing adds at most one 16-page batch of stores to a window.
 Neither the donation count nor any `init_pages` lengthens the window; the walk's
@@ -520,7 +547,11 @@ with its kept pages, sorted once (`cap::arena::sort_list`), cut out of its span
 donation came from and records it as its `ancestor`, and the runs between kept pages go back, with
 the runs of the other donations of its group ([§ Teardown](#teardown)), through one walk of that
 Memory object's page free list (`cap::retype::retype_free_runs`). The
-teardown then releases its hold on each kept page, and the release of a page's last reference, its
+teardown then releases its hold on each kept page. Since the owner chose how many bodies outlive
+the `CSpace`, the sort takes the interrupts pending on its CPU after every `KEPT_SORT_BATCH_STEPS`
+(256) steps, each step taking one page off a list or placing one in a merged run, and the leases
+and the releases after every `KEPT_BATCH_PAGES` (64) pages (`interrupt_window`, with no lock
+held). The release of a page's last reference, its
 hold's or its last chunk's, returns the page to that Memory object (the `ArenaPage` arm of
 `dealloc_object`). A dead `CSpace` therefore holds, past its death, only the pages its surviving
 bodies sit on, each to its Memory object, the analogue of a retyped object pinning its Memory
@@ -708,8 +739,9 @@ pub struct KernelObjectHeader
     ref_count: AtomicU32,
     obj_type: ObjectType,
     /// The high 24 bits of the dealloc-cascade link while the object is
-    /// queued on one (its low 32 bits sit in `ref_count`, then 0); zero
-    /// at every other time.
+    /// queued on one (its low 32 bits sit in `ref_count`, then 0; an
+    /// `AddressSpace` keeps its link in its wrapper instead); zero at every
+    /// other time.
     cascade_link_hi: [u8; 3],
     /// The Memory object this object's bytes were retyped from.
     ancestor: AtomicPtr<KernelObjectHeader>,
@@ -851,8 +883,10 @@ The principal kernel-internal owners:
   thread's `sched_lock`, before it frees anything. `sched::pin_thread_aspace` reads the thread's
   state and space under that lock and, while the thread is not `Exited`, takes a reference with
   `KernelObjectHeader::inc_ref_if_live`, which refuses a count of zero rather than revive an
-  object whose teardown has begun. The reference is released through `release_ref` when the copy
-  or the listing ends, before the syscall returns, as a syscall pin's is.
+  object whose teardown has begun. A space queued on a dealloc cascade reads zero too, since the
+  cascade keeps its link outside the count ([§ Teardown](#teardown)). The reference is released
+  through `release_ref` when the copy or the listing ends, before the syscall returns, as a
+  syscall pin's is.
 - **Wait-set membership.** `sys_wait_set_add` `inc_ref`s the source's header under the
   source's lock together with the back-pointer publication; `sys_wait_set_remove` and
   `wait_set_drop` perform the matching `dec_ref`. The source's state therefore outlives
@@ -1004,7 +1038,10 @@ frames are never reallocated, so no frame reuse waits on the shootdown. The reco
 reference is then released through `release_ref`, so an address space it was the last reference to
 goes to this CPU's deferred reclaim, as for a syscall pin: an Mmio object can be freed in place
 inside IPC delivery, where an address-space teardown must not run. Each spill chunk then returns to
-the arena that funded it.
+the arena that funded it. The records and chunks are as many as the owners' mappings, so the
+withdrawal takes the interrupts pending on its CPU between two records and after every
+`SPILL_BATCH_CHUNKS` (64) chunks it returns (`interrupt_window`, with no lock held; [§
+Teardown](#teardown)).
 
 ### IoPort Bindings
 
@@ -1025,7 +1062,8 @@ port access. The bitmap is always the union of the recorded bindings.
 
 The IoPort dealloc arm runs `withdraw_everywhere` before the object's bytes go. It walks
 the thread registry and, under each thread's `sched_lock`, drops the records naming the
-object (compared by address, never dereferenced) and rebuilds the bitmap from the rest; a
+object (compared by address, never dereferenced) and rebuilds the bitmap from the rest; the walk
+holds the registry lock a batch at a time, with an interrupt window between batches; a
 bind through the object holds a pin on it, so none can record it once the teardown runs.
 `dealloc_object(Thread)` detaches a dying thread's table under the same lock before
 freeing it. If any bitmap changed, `gdt::invalidate_all_iopbs` stores an out-of-limit
@@ -1163,7 +1201,8 @@ the lock alone, so a call that finishes in one hold opens no window. The window 
 keeps preemption disabled, so the thread neither switches nor migrates; it exposes nothing that the
 release does not already expose to other CPUs, and every such loop revalidates what it works on
 when it takes the lock again. The dealloc cascade's fan-out and a dying `CSpace`'s release passes
-take no derivation lock and still mask interrupts for their whole length (#1623).
+take no derivation lock; they take `interrupt_window` between their batches themselves ([§
+Teardown](#teardown)).
 
 ### Revocation Algorithm
 
@@ -1727,4 +1766,3 @@ Path, and
 [Fault Handling](../../../docs/fault-handling.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [init Bootstrap Stages](../../../services/init/docs/bootstrap.md)
-

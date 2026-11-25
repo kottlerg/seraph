@@ -250,9 +250,12 @@ pub enum HoldOutcome
 /// [`HoldOutcome::Cancelled`] returned; two threads holding each other's
 /// space would otherwise wait for each other forever.
 ///
-/// The walk holds the registry lock across every live thread, with interrupts
-/// disabled on this CPU, and takes every CPU lock once per `Ready` thread of
-/// the space, as the object-teardown walk does.
+/// The walk takes every CPU lock once per `Ready` thread of the space, as the
+/// object-teardown walk does, and like it holds the registry lock, with
+/// interrupts disabled on this CPU, for one batch at a time
+/// ([`super::thread_registry::for_each`]), opening an interrupt window between
+/// batches. A thread created into the space after the walk began, which the
+/// walk may miss, has its start deferred, since the space is `Holding` first.
 ///
 /// # Safety
 /// `aspace` must be a valid address space that the caller keeps live for the
@@ -273,7 +276,7 @@ pub unsafe fn hold_space(
     let visit = |tcb| {
         // SAFETY: the registry walk passes a registered TCB and holds only
         // its own lock.
-        unsafe { hold_visit_thread(tcb, aspace) };
+        unsafe { hold_visit_thread(tcb, aspace) }
     };
     // SAFETY: no lock is held (contract); the visit registers no thread, takes
     // only a sched_lock and the run-queue locks, and waits on no CPU.
@@ -344,10 +347,21 @@ unsafe fn release_walk(aspace: *const AddressSpace)
 {
     let pass = || {
         let mut unsettled = false;
-        let visit = |tcb| {
+        let visit = |tcb: *mut ThreadControlBlock| {
+            // SAFETY: the registry walk passes a registered TCB; address_space
+            // is read-only after creation.
+            let in_space = core::ptr::eq(unsafe { (*tcb).address_space }, aspace);
             // SAFETY: the registry walk passes a registered TCB and holds
             // only its own lock.
             unsettled |= unsafe { release_visit_thread(tcb, aspace) };
+            if in_space
+            {
+                super::thread_registry::Visit::Acted
+            }
+            else
+            {
+                super::thread_registry::Visit::Passed
+            }
         };
         // SAFETY: no lock is held (contract); the visit registers no thread,
         // takes only a sched_lock and the run-queue locks, and waits on no
@@ -370,19 +384,23 @@ unsafe fn release_walk(aspace: *const AddressSpace)
     };
 }
 
-/// Apply [`hold_visit`] to `tcb` when it executes in `aspace`.
+/// Apply [`hold_visit`] to `tcb` when it executes in `aspace`; returns what
+/// the visit cost the walk.
 ///
 /// # Safety
 /// `tcb` must be a registered TCB (the registry walk's argument); the
 /// caller holds the registry lock and no other.
 #[cfg(not(test))]
-unsafe fn hold_visit_thread(tcb: *mut ThreadControlBlock, aspace: *const AddressSpace)
+unsafe fn hold_visit_thread(
+    tcb: *mut ThreadControlBlock,
+    aspace: *const AddressSpace,
+) -> super::thread_registry::Visit
 {
     // SAFETY: tcb is registered, so valid; address_space is read-only after
     // creation.
     if !core::ptr::eq(unsafe { (*tcb).address_space }, aspace)
     {
-        return;
+        return super::thread_registry::Visit::Passed;
     }
     // SAFETY: tcb valid, as above.
     let lock = unsafe { &(*tcb).sched_lock };
@@ -408,6 +426,7 @@ unsafe fn hold_visit_thread(tcb: *mut ThreadControlBlock, aspace: *const Address
     }
     // SAFETY: paired with the lock_raw above.
     unsafe { lock.unlock_raw(f) };
+    super::thread_registry::Visit::Acted
 }
 
 /// Commit the `Ready` thread `tcb` `Stopped` and marked
@@ -597,6 +616,7 @@ unsafe fn held_settled(aspace: *const AddressSpace) -> bool
         // SAFETY: as above; context_saved is atomic.
         let flag = unsafe { &(*tcb).context_saved };
         saved &= !bound || flag.load(core::sync::atomic::Ordering::Acquire) != 0;
+        super::thread_registry::Visit::Passed
     };
     // SAFETY: no lock is held; the closure only reads two fields of each
     // registered TCB.

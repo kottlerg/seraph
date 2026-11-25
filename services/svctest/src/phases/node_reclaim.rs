@@ -94,8 +94,8 @@ fn node_reclaim_phase(caps: &Caps)
     // An earlier phase that took the level to `LOW` may have had memmgr evict
     // chunks of any process: make them resident first, so the store starts
     // empty.
-    let _ = settle_resident(authority, None);
-    let baseline = baseline_totals();
+    let _ = settle_resident(authority, PHASE, None);
+    let baseline = baseline_totals(authority, PHASE);
 
     let light = sub_node(LIGHT_WEIGHT, "the light sub-node");
     let heavy = sub_node(HEAVY_WEIGHT, "the heavy sub-node");
@@ -121,12 +121,12 @@ fn node_reclaim_phase(caps: &Caps)
     destroy(heavy_child, "the heavy node's child");
     release_refused(light, "the light sub-node");
     release_refused(heavy, "the heavy sub-node");
-    let end = settle_resident(authority, Some(baseline));
+    let end = settle_resident(authority, PHASE, Some(&baseline));
     std::os::seraph::log!(
         "{PHASE} phase passed (evictable resident pages under pressure: weight {LIGHT_WEIGHT} \
          {light_start} to {light_end}, weight {HEAVY_WEIGHT} {heavy_start} to {heavy_end}; \
          free, deferred and svctest's own {} pages above the start)",
-        end.saturating_sub(baseline) / PAGE_SIZE
+        end.saturating_sub(baseline.totals) / PAGE_SIZE
     );
 }
 

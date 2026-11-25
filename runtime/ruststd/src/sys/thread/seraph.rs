@@ -118,6 +118,11 @@ struct SpawnArgs {
     /// The thread among the application's live threads, until it ends
     /// (`os::seraph::checkpoint::THREAD`); none for one of the runtime's own.
     held: Option<crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::THREAD }>>,
+    /// The spawner's call deadline, under which the thread makes its
+    /// registration with procmgr, for one of the runtime's own threads, whose
+    /// spawner waits for that registration (`os::seraph::thread::runtime_spawn`);
+    /// none for an application's thread, whose spawner does not.
+    registration_deadline: Option<crate::time::Instant>,
 }
 
 /// The reclaimable resources a spawned thread owns. Moved as a unit between the
@@ -496,6 +501,9 @@ impl Thread {
             done_notification,
             held: (!crate::os::seraph::thread::spawning_runtime_thread())
                 .then(crate::os::seraph::checkpoint::Held::new),
+            registration_deadline: crate::os::seraph::thread::spawning_runtime_thread()
+                .then(crate::os::seraph::call_deadline)
+                .flatten(),
         }));
 
         // Dedicated slab for the Thread retype slot, sized to the kernel's
@@ -1054,10 +1062,14 @@ static REGISTRY_REFUSED: crate::sync::atomic::AtomicBool =
 /// § `REGISTER_THREAD`): hand it a copy of `self_thread_cap` with
 /// `RIGHTS_THREAD`, so `ATTACH_PROCESS` lists the thread and procmgr can
 /// bind its exception class under a badge of its own. Runs on the new
-/// thread before its code, so the spawner never waits on procmgr; a thread
-/// that procmgr cannot serve yet waits here alone. Best-effort: a refusal or
+/// thread before its code, so the spawner never waits on procmgr, apart from
+/// `os::seraph::thread::runtime_spawn`'s, which waits for its thread to reach
+/// its wait, and whose call deadline the thread makes this call under
+/// (`SpawnArgs::registration_deadline`); a thread that procmgr cannot serve
+/// yet waits here alone. Best-effort: a refusal or
 /// a failed call leaves the thread unregistered, and it runs as before,
-/// apart from a call cancelled `Interrupted` after procmgr received it,
+/// apart from a call that failed after procmgr received it, cancelled
+/// `Interrupted` or timed out at the spawner's deadline (`WouldBlock`),
 /// which procmgr carried out. A failed call is not repeated, since a repeat
 /// of one procmgr carried out would register the thread twice. A process
 /// procmgr did not create (no procmgr endpoint) sends nothing.
@@ -1077,8 +1089,9 @@ fn register_with_procmgr(self_thread_cap: u64, ipc_buf: *mut u64) {
     };
     let msg = ipc::IpcMessage::builder(procmgr_labels::REGISTER_THREAD).cap(cap).build();
     // SAFETY: `ipc_buf` is this thread's IPC buffer page, registered by the
-    // caller just before; the cap moves to procmgr with the message. A new
-    // thread holds no call deadline, so the call waits for procmgr's answer.
+    // caller just before; the cap moves to procmgr with the message. The call
+    // carries the deadline the trampoline set for one of the runtime's own
+    // threads, its spawner's, and otherwise none, waiting for procmgr's answer.
     match unsafe { crate::os::seraph::deadline_call(procmgr, &msg, ipc_buf) } {
         Ok(reply) => {
             for &extra in reply.caps() {
@@ -1109,7 +1122,13 @@ extern "C" fn thread_entry(arg: u64) -> ! {
         // SAFETY: the page was registered for this thread just above; a
         // refused registration leaves the TLS pointer null.
         unsafe { crate::os::seraph::set_current_ipc_buf(args.ipc_buffer_vaddr as *mut u64) };
-        register_with_procmgr(args.self_thread_cap, args.ipc_buffer_vaddr as *mut u64);
+        let (cap, buf) = (args.self_thread_cap, args.ipc_buffer_vaddr as *mut u64);
+        match args.registration_deadline {
+            Some(deadline) => crate::os::seraph::with_call_deadline(deadline, || {
+                register_with_procmgr(cap, buf);
+            }),
+            None => register_with_procmgr(cap, buf),
+        }
     }
 
     // SAFETY: args.init was produced via `Box::into_raw(init)` in

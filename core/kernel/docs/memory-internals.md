@@ -206,7 +206,10 @@ code's comments refer here rather than restate it:
   maps (`AddressSpace::release_mapped_frames`, a read-only walk of its page tables). It runs only
   after every bound thread is stopped and `wait_until_aspace_inactive` confirms no CPU has the
   space loaded; the space's stale TLB entries are then unusable, since a reissued PCID/ASID is
-  flushed before the space that claims it runs.
+  flushed before the space that claims it runs. The tables are as many as the owner mapped, so the
+  walk takes the interrupts pending on its CPU before every table but the root
+  (`cap::object::interrupt_window`, with no lock held; capability-internals.md § Teardown): one
+  table's 512 entries at most between two windows.
 
 The count belongs to the frame, not to a Memory object, so it follows the frame through
 derivation, split, merge, and the free of the object that mapped it.

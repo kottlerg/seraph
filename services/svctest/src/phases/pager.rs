@@ -570,13 +570,7 @@ fn demand_fault_fragmented_phase(_: &Caps)
     let (target, hole_cap) = fragment_bounds(pool_growth_floor() / page);
     let region = std::os::seraph::register_demand_paged(FRAGMENTED_REGION_PAGES)
         .expect("demand_fault_fragmented: registering the region failed");
-    let mut held: Vec<(u64, u64)> = Vec::with_capacity(
-        FRAGMENT_MAX_DRAWS
-            .saturating_mul(2)
-            .saturating_add(hole_cap)
-            .saturating_add(1),
-    );
-    let mut holes: Vec<(u64, u64)> = Vec::with_capacity(hole_cap);
+    let (mut held, mut holes) = grant_lists(hole_cap, "demand_fault_fragmented");
     // The pool as the cut's last query read it: memmgr's eviction, which runs
     // while the level reads `LOW`, can free a chunk's runs at any moment
     // after, and a fault of the region may then be backed from such a run; the
@@ -588,7 +582,7 @@ fn demand_fault_fragmented_phase(_: &Caps)
         uncommitted,
         largest,
         floor,
-    } = fragment_pool(&mut held, &mut holes, target);
+    } = fragment_pool(&mut held, &mut holes, target, "demand_fault_fragmented");
     assert!(
         largest < chunk_bytes,
         "demand_fault_fragmented: the pool kept a run of {largest} bytes, a chunk or more"
@@ -659,13 +653,7 @@ fn cspace_topup_fragmented_phase(_: &Caps)
     let chunk_bytes = DEMAND_CHUNK_PAGES.saturating_mul(page);
     let cspace = startup_info().self_cspace;
     let (target, hole_cap) = fragment_bounds(pool_growth_floor() / page);
-    let mut held: Vec<(u64, u64)> = Vec::with_capacity(
-        FRAGMENT_MAX_DRAWS
-            .saturating_mul(2)
-            .saturating_add(hole_cap)
-            .saturating_add(1),
-    );
-    let mut holes: Vec<(u64, u64)> = Vec::with_capacity(hole_cap);
+    let (mut held, mut holes) = grant_lists(hole_cap, "cspace_topup_fragmented");
     let Fragmented {
         drawn_pages,
         hole_count,
@@ -673,7 +661,7 @@ fn cspace_topup_fragmented_phase(_: &Caps)
         uncommitted,
         largest,
         floor,
-    } = fragment_pool(&mut held, &mut holes, target);
+    } = fragment_pool(&mut held, &mut holes, target, "cspace_topup_fragmented");
     // Read after the draws, whose grants' caps take slots of the same `CSpace`.
     let before = cspace_slot_headroom(cspace);
     let want = before.saturating_add(FRAGMENTED_TOPUP_SLOTS);
@@ -766,17 +754,19 @@ fn fragment_bounds(floor: u64) -> (u64, usize)
 ///    and a hole merged with its run's remainder.
 ///
 /// Every grant kept goes onto `held` and every hole onto `holes`, which have
-/// room for every draw and the cut, so nothing here allocates. Returns what
-/// step 4 read last: the pool once no run of a chunk or more was left free,
-/// or with one memmgr would refuse at the floor, or at the draws' bound.
-fn fragment_pool(held: &mut Vec<(u64, u64)>, holes: &mut Vec<(u64, u64)>, target: u64)
--> Fragmented
+/// room for every draw and the cut, and svctest's `CSpace` a slot for each
+/// grant's cap ([`grant_lists`]), so nothing here allocates. Only the pool
+/// refuses a draw here (`OUT_OF_MEMORY_CONTIGUOUS`): any other refusal fails
+/// `phase` ([`pool_refused`]). Returns what step 4 read last: the pool once
+/// no run of a chunk or more was left free, or with one memmgr would refuse at
+/// the floor, or at the draws' bound.
+fn fragment_pool(held: &mut Grants, holes: &mut Grants, target: u64, phase: &str) -> Fragmented
 {
     use super::memmgr::{pool_admissible, release_grant, try_request_contiguous};
 
     let page = syscall_abi::PAGE_SIZE;
     let hole_pages = DEMAND_CHUNK_PAGES - 1;
-    let hole = u32::try_from(hole_pages).expect("demand_fault_fragmented: hole beyond u32 pages");
+    let hole = u32::try_from(hole_pages).expect("fragment_pool: hole beyond u32 pages");
     let mut drawn_pages = 0u64;
 
     let mut reached = false;
@@ -791,33 +781,45 @@ fn fragment_pool(held: &mut Vec<(u64, u64)>, holes: &mut Vec<(u64, u64)>, target
             reached = true;
             break;
         }
-        let take = u32::try_from(take).expect("demand_fault_fragmented: run beyond u32 pages");
+        let take = u32::try_from(take).expect("fragment_pool: run beyond u32 pages");
         // A request another process's draw beat to the run is refused; the
         // next query sees the pool as it is.
-        if let Ok(grant) = try_request_contiguous(take)
+        match try_request_contiguous(take)
         {
-            held.push(grant);
-            drawn_pages = drawn_pages.saturating_add(u64::from(take));
+            Ok(grant) =>
+            {
+                held.push(grant);
+                drawn_pages = drawn_pages.saturating_add(u64::from(take));
+            }
+            Err(label) => pool_refused(label, phase, "a draw to the target"),
         }
     }
     assert!(
         reached,
-        "demand_fault_fragmented: the draw to {target} free pages did not end within its bound"
+        "{phase}: the draw to {target} free pages did not end within its bound"
     );
 
     while holes.len() < holes.capacity()
     {
-        let Ok(piece) = try_request_contiguous(hole)
-        else
+        let piece = match try_request_contiguous(hole)
         {
-            break;
+            Ok(piece) => piece,
+            Err(label) =>
+            {
+                pool_refused(label, phase, "a piece of the cut");
+                break;
+            }
         };
         held.push(piece);
         drawn_pages = drawn_pages.saturating_add(hole_pages);
-        let Ok(gap) = try_request_contiguous(hole)
-        else
+        let gap = match try_request_contiguous(hole)
         {
-            break;
+            Ok(gap) => gap,
+            Err(label) =>
+            {
+                pool_refused(label, phase, "a hole of the cut");
+                break;
+            }
         };
         holes.push(gap);
     }
@@ -847,15 +849,60 @@ fn fragment_pool(held: &mut Vec<(u64, u64)>, holes: &mut Vec<(u64, u64)>, target
         {
             break;
         }
-        let take = u32::try_from(run).expect("demand_fault_fragmented: run beyond u32 pages");
-        if let Ok(grant) = try_request_contiguous(take)
+        let take = u32::try_from(run).expect("fragment_pool: run beyond u32 pages");
+        match try_request_contiguous(take)
         {
-            held.push(grant);
-            drawn_pages = drawn_pages.saturating_add(run);
-            seen.drawn_pages = drawn_pages;
+            Ok(grant) =>
+            {
+                held.push(grant);
+                drawn_pages = drawn_pages.saturating_add(run);
+                seen.drawn_pages = drawn_pages;
+            }
+            Err(label) => pool_refused(label, phase, "a draw of a run of a chunk or more"),
         }
     }
     seen
+}
+
+/// Grants [`fragment_pool`] holds, each as `(grant cap, region id)`
+/// ([`super::memmgr::try_request_contiguous`]).
+type Grants = Vec<(u64, u64)>;
+
+/// The grant lists [`fragment_pool`] fills, for a cut of at most `hole_cap`
+/// holes: `held`, with room for both draws' bound and the cut's pieces, and
+/// `holes`. svctest's `CSpace` is first funded with a slot for every grant
+/// they can hold. Each grant's cap arrives in a slot of that `CSpace`, and
+/// memmgr rolls back a grant whose reply finds no slot for its cap, so an
+/// unfunded `CSpace` would end the cut at its headroom, short of the floor,
+/// once the cut needs more caps than that holds: about
+/// `(target - floor) / (DEMAND_CHUNK_PAGES - 1)` caps, which grows with RAM.
+/// `phase` names the phase in a panic.
+fn grant_lists(hole_cap: usize, phase: &str) -> (Grants, Grants)
+{
+    let held_cap = FRAGMENT_MAX_DRAWS
+        .saturating_mul(2)
+        .saturating_add(hole_cap)
+        .saturating_add(1);
+    let slots = u64::try_from(held_cap.saturating_add(hole_cap))
+        .expect("grant_lists: slot count beyond u64");
+    assert!(
+        std::os::seraph::fund_cspace_slot_budget(startup_info().self_cspace, slots),
+        "{phase}: funding svctest's CSpace for {slots} grant caps failed"
+    );
+    (Vec::with_capacity(held_cap), Vec::with_capacity(hole_cap))
+}
+
+/// Check that `label`, the refusal of `what`, a grant request of
+/// [`fragment_pool`], is the pool's: `OUT_OF_MEMORY_CONTIGUOUS`, no free run
+/// fits or the grant would take the growth floor. Any other refusal fails
+/// `phase`: a refusal that is not the pool's says nothing of the runs left.
+fn pool_refused(label: u64, phase: &str, what: &str)
+{
+    assert_eq!(
+        label,
+        ipc::memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
+        "{phase}: {what} was refused with {label:#x}, not by the pool"
+    );
 }
 
 /// What [`fragment_pool`] drew, and the pool as its last query read it.

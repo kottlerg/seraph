@@ -22,8 +22,9 @@ pub const POLICY_ALWAYS: u8 = 0;
 /// Restart policy: restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`).
 pub const POLICY_ON_FAILURE: u8 = 1;
 
-/// Restart policy: never restart, even on fault. Used for one-shot
-/// integration-test fixtures whose exit is the success notification.
+/// Restart policy: never restart, even on fault; the death is still logged.
+/// Used for integration-test harnesses and fixtures whose run ends with
+/// their exit.
 pub const POLICY_NEVER: u8 = 2;
 
 // ── Service table ───────────────────────────────────────────────────────────

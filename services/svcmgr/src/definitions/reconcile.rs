@@ -19,10 +19,9 @@
 //!    restart replays ([`recipe_from`]) in the parallel `RestartRecipe`
 //!    table.
 //! 2. **Defined only** — call [`super::launch::launch`] to spawn the
-//!    service (it binds death-notification before `START_PROCESS` when
-//!    `restart != never`), then, for a supervised service, persist a
-//!    `ServiceEntry`. A supervised service that died during its bootstrap
-//!    rounds has its death routed at once, by its restart policy
+//!    service (it binds death-notification before `START_PROCESS`, whatever
+//!    the `restart` policy), then persist a `ServiceEntry`. A service that
+//!    died during its bootstrap rounds has its death routed at once, by its restart policy
 //!    (`restart::handle_death`), before the next recipe is launched.
 //! 3. **Registered without definition** — log a hard error and refuse
 //!    to bind. svcmgr cannot restart what it has no recipe for; this
@@ -410,8 +409,8 @@ fn record_shutdown_actuator(
 }
 
 /// Route one parsed `Definition` to the bind-only or launch path. Returns
-/// the service-table slot of the supervised entry it recorded, or `None`
-/// for a one-shot launch or one that did not land. `role` marks the
+/// the service-table slot of the entry it recorded, or `None` for one that
+/// did not land. `role` marks the
 /// recognised shutdown actuator: a supervised launch of it, and each restart,
 /// is created pinned and carries the receive-only derivation of the
 /// core-death queue (`launch::launch`).
@@ -423,8 +422,8 @@ fn record_shutdown_actuator(
 /// Routed here, not left to the death queues, so a log sink that died is
 /// restarted before svcmgr's next lines and a restart's instance runs before
 /// the services launched after it. The death posts of the dead instance carry
-/// an instance already routed, and are dropped. A service that died so,
-/// one-shot or supervised, is logged at once ([`log_boot_death`]).
+/// an instance already routed, and are dropped. A service that died so is
+/// logged at once ([`log_boot_death`]).
 fn handle_definition(
     def: &Definition,
     role: launch::Role,
@@ -453,36 +452,10 @@ fn handle_definition(
     // Not registered by init → svcmgr launches it.
     log!("svcmgr: launching: {}", def.name);
 
-    if matches!(def.restart, RestartPolicy::Never)
-    {
-        // One-shot launch: no supervision binding, no `ServiceEntry`.
-        // procmgr auto-reaps on exit.
-        let Some(launched) = launch::launch(def, ctx, registry, None, launch::Role::Ordinary)
-        else
-        {
-            log!(warn: "svcmgr: launch failed: {}", def.name);
-            return None;
-        };
-        match launched.died
-        {
-            None => log!("svcmgr: launched ephemeral: {}", def.name),
-            Some(exit_reason) => log_boot_death(def, exit_reason),
-        }
-        let _ = syscall::cap_delete(launched.thread_cap);
-        let _ = syscall::cap_delete(launched.process_handle);
-        for cap in [launched.provided_endpoint, launched.node_handle]
-        {
-            if cap != 0
-            {
-                let _ = syscall::cap_delete(cap);
-            }
-        }
-        return None;
-    }
-
-    // Supervised launch: reserve the service-table slot BEFORE
-    // calling launch so the death-notification binding can land on a
-    // committed correlator. Bind happens inside launch.rs between
+    // Every launch is supervised, a `restart = never` one included, whose
+    // death is observed and logged and never restarted (`handle_death`).
+    // Reserve the service-table slot BEFORE calling launch so the
+    // death-notification binding can land on a committed correlator. Bind happens inside launch.rs between
     // CONFIGURE_NAMESPACE and START_PROCESS (thread still suspended)
     // so any immediate post-start death is captured cleanly.
     // On launch failure the slot is "burned" (stays at default,
@@ -517,7 +490,7 @@ fn handle_definition(
     };
     recipe.shutdown_actuator = role == launch::Role::ShutdownActuator;
 
-    let Some(launched) = launch::launch(def, ctx, registry, Some(tag), role)
+    let Some(launched) = launch::launch(def, ctx, registry, tag, role)
     else
     {
         log!(warn: "svcmgr: launch failed: {}", def.name);

@@ -155,21 +155,31 @@ const SORT_BINS: usize = 64;
 /// sorted runs, `O(n log n)` with a fixed stack, which allocates nothing and
 /// does not recurse. `next` reads a node's link and `set_next` writes it.
 ///
+/// `step` runs before each node the sort takes off the list or places in a
+/// merged run, at most `n * (2 + floor(log2 n))` times for `n` nodes, with
+/// every node on the list or in a sorted run in between: the caller counts the
+/// sort's work there and may open an interrupt window
+/// (`cap::object::free_donation_group`).
+///
 /// # Safety
 /// Every node on the list is valid for `next`, `set_next`, and `key`, and
 /// the list ends in null and has no cycle.
-pub unsafe fn sort_list<N>(
+pub unsafe fn sort_list<N, S>(
     head: *mut N,
     next: &impl Fn(*mut N) -> *mut N,
     set_next: &impl Fn(*mut N, *mut N),
     key: &impl Fn(*mut N) -> u64,
+    step: &mut S,
 ) -> *mut N
+where
+    S: FnMut(),
 {
-    let merge = |mut a: *mut N, mut b: *mut N| -> *mut N {
+    let merge = |mut a: *mut N, mut b: *mut N, step: &mut S| -> *mut N {
         let mut merged: *mut N = core::ptr::null_mut();
         let mut tail: *mut N = core::ptr::null_mut();
         while !a.is_null() || !b.is_null()
         {
+            step();
             // `a` holds the earlier nodes, so ties keep their list order.
             let take_a = b.is_null() || (!a.is_null() && key(a) <= key(b));
             let node = if take_a { a } else { b };
@@ -198,6 +208,7 @@ pub unsafe fn sort_list<N>(
     let mut cur = head;
     while !cur.is_null()
     {
+        step();
         let after = next(cur);
         set_next(cur, core::ptr::null_mut());
         // Carry the one-node run up through the occupied bins, as a binary
@@ -211,7 +222,7 @@ pub unsafe fn sort_list<N>(
                 *bin = run;
                 break;
             }
-            run = merge(*bin, run);
+            run = merge(*bin, run, step);
             *bin = if i == SORT_BINS - 1
             {
                 run
@@ -229,7 +240,7 @@ pub unsafe fn sort_list<N>(
     {
         if !bin.is_null()
         {
-            sorted = merge(bin, sorted);
+            sorted = merge(bin, sorted, step);
         }
     }
     sorted
@@ -359,10 +370,17 @@ mod tests
 
     // The defect caught: a sort that drops or duplicates a node, leaves the
     // list out of order, or loops, which would leave a kept page out of the
-    // cut or cut a span twice.
+    // cut or cut a span twice; and a sort that runs work between two of its
+    // steps that grows with the list, or takes more steps than its bound,
+    // which would leave the caller's interrupt windows (`step`) unbounded
+    // apart.
     #[test]
     fn an_intrusive_list_sorts_ascending_keeping_every_node()
     {
+        use core::cell::Cell;
+        // Node accesses (link reads and writes, key reads) since the last step.
+        let since_step = Cell::new(0usize);
+        let touch = || since_step.set(since_step.get() + 1);
         for n in [0usize, 1, 2, 3, 7, 64, 257, 1030, 4096]
         {
             let mut nodes: Vec<Box<Node>> = (0..n)
@@ -380,19 +398,43 @@ mod tests
                 head = core::ptr::from_mut(&mut **node);
             }
             let next = |p: *mut Node| {
+                touch();
                 // SAFETY: every node is a live Box above.
                 unsafe { (*p).next }
             };
             let set_next = |p: *mut Node, q| {
+                touch();
                 // SAFETY: every node is a live Box above.
                 unsafe { (*p).next = q };
             };
             let key = |p: *mut Node| {
+                touch();
                 // SAFETY: every node is a live Box above.
                 unsafe { (*p).key }
             };
+            let (mut steps, mut longest) = (0usize, 0usize);
+            since_step.set(0);
+            let mut step = || {
+                steps += 1;
+                longest = longest.max(since_step.get());
+                since_step.set(0);
+            };
             // SAFETY: every node is a live Box above; the list ends in null.
-            let mut cur = unsafe { sort_list(head, &next, &set_next, &key) };
+            let mut cur = unsafe { sort_list(head, &next, &set_next, &key, &mut step) };
+            let longest = longest.max(since_step.get());
+            // A merge step reads two keys and a link and writes two links.
+            assert!(
+                longest <= 5,
+                "{n} nodes: {longest} node accesses between two steps"
+            );
+            // A node is taken once, merged once per bin it climbs, and once per
+            // final merge from its bin up: at most 2 + floor(log2 n) steps.
+            let log2 = n.checked_ilog2().unwrap_or(0) as usize;
+            assert!(steps >= n, "{n} nodes: {steps} steps");
+            assert!(
+                steps <= n * (2 + log2),
+                "{n} nodes: {steps} steps exceed n * (2 + floor(log2 n))"
+            );
             let mut got = Vec::new();
             while !cur.is_null()
             {

@@ -19,6 +19,8 @@
 //!
 //! Tier 1 tests:
 //! - `ioport_syscalls.rs` — `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT`
+//! - `ioport_withdraw_windows.rs` — the withdrawal of a freed `IoPort` object's bindings
+//!   takes interrupts between its registry walk's batches
 //! - `configure_wrapped_stack.rs` — `thread_configure` refuses a stack top the
 //!   entry alignment wraps below zero
 //! - `sbi_call.rs` — `SYS_SBI_CALL` returns `NotSupported`
@@ -51,6 +53,7 @@ mod ioport;
 mod ioport_revoke;
 mod ioport_switch;
 mod ioport_syscalls;
+mod ioport_withdraw_windows;
 mod page_fault_present_bit;
 mod sbi_call;
 pub mod serial;
@@ -328,6 +331,10 @@ pub fn run_unit(ctx: &TestContext)
         ioport_syscalls::bind_table_outlives_no_pool(ctx)
     );
     crate::run_test!("hw::ioport_split", ioport_syscalls::split(ctx));
+    crate::run_test!(
+        "locked_windows::ioport_withdraw_takes_interrupts",
+        ioport_withdraw_windows::withdraw_takes_interrupts(ctx)
+    );
     crate::run_test!(
         "thread::configure_wrapped_stack_err",
         configure_wrapped_stack::run(ctx)

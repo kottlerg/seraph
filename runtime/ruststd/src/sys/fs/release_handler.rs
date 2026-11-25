@@ -44,7 +44,6 @@ use crate::io;
 use crate::ptr;
 use crate::sync::atomic::{AtomicPtr, Ordering};
 use crate::sync::{Arc, Condvar, Mutex, PoisonError};
-use crate::thread;
 use crate::time::Duration;
 use crate::vec::Vec;
 
@@ -161,10 +160,8 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
         aspace,
     });
     let handler_state = Arc::clone(&state);
-    if crate::os::seraph::thread::runtime_spawn(|| {
-        thread::Builder::new()
-            .name("seraph-fs-release".into())
-            .spawn(move || handler_main(&handler_state))
+    if crate::os::seraph::thread::runtime_spawn("seraph-fs-release", move |started| {
+        handler_main(&handler_state, started);
     })
     .is_err()
     {
@@ -432,7 +429,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     crate::os::seraph::log::__emit(core::format_args!("fs-release recv loop {msg} (err={err})"));
 }
 
-fn handler_main(state: &ReleaseState)
+fn handler_main(state: &ReleaseState, started: crate::os::seraph::thread::StartSignal)
 {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
@@ -440,6 +437,7 @@ fn handler_main(state: &ReleaseState)
         // The thread trampoline failed to register an IPC buffer; we
         // cannot service receive-and-reply traffic. Park instead of
         // spinning.
+        started.at_wait();
         loop
         {
             let _ = syscall::thread_yield();
@@ -447,6 +445,7 @@ fn handler_main(state: &ReleaseState)
     }
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    started.at_wait();
     loop
     {
         // SAFETY: `ipc_buf` is the registered IPC buffer for this

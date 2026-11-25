@@ -535,10 +535,10 @@ extern "C" fn idle_halts_mark_child(sig: u64) -> !
 /// call ran on another CPU, return `InvalidState` and mark the CPU, and the
 /// next call there returns a count.
 ///
-/// Defect caught: a TCB constructed with a mark (a new thread would read a
-/// difference from a count it never took, or from a count a dead thread
-/// took), or a mark not tied to its CPU (a moved thread would read the
-/// difference of two CPUs' counts).
+/// Defect caught: a Thread retype that leaves a mark naming CPU 0, as zeroed
+/// memory or a dead thread's TCB would (the new thread would read a
+/// difference from a count it never took), or a mark not tied to its CPU (a
+/// moved thread would read the difference of two CPUs' counts).
 pub fn idle_halts_mark_per_thread_and_cpu(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -584,6 +584,9 @@ pub fn idle_halts_mark_per_thread_and_cpu(ctx: &TestContext) -> TestResult
         .map_err(|_| "sysinfo::idle_halts_mark: system_info(CpuCount) failed")?;
     if cpus < 2
     {
+        crate::log(
+            "ktest: sysinfo::idle_halts_mark_per_thread_and_cpu SKIP (the moved-thread half needs 2 CPUs)",
+        );
         return Ok(());
     }
     let outcome = idle_halts_mark_moves(ctx.thread_cap);

@@ -91,9 +91,9 @@ memory map gives wholly to firmware data:
 The memory map is the cap on a hostile length: whatever a length field says, a slice cannot reach
 memory the map types as memory-mapped I/O, a hole, or free memory. Reserved memory is accepted (the
 table below gives why), and on some platforms it also holds device registers the map does not type
-as memory-mapped I/O, which a length running into it could reach. No constant caps a table's size. The decoders in
-`core/boot/firmware` and `shared/firmware-tables` then read only inside the slice they are
-given, which their property checks, fuzz targets and proof harnesses establish
+as memory-mapped I/O, which a length running into it could reach. No constant caps a table's size.
+The decoders in `core/boot/firmware` and `shared/firmware-tables` then read only inside the slice
+they are given, which their property checks, fuzz targets and proof harnesses establish
 ([core/boot/firmware/README.md](../firmware/README.md),
 [docs/testing.md](../../../docs/testing.md#bounded-verification)).
 

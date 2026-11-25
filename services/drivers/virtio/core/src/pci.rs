@@ -34,6 +34,44 @@ pub const NO_VECTOR: u16 = 0xFFFF;
 const COMMON_CONFIG_MSIX_VECTOR: u32 = 0x10;
 /// Offset of `queue_msix_vector` in the common configuration region.
 const COMMON_QUEUE_MSIX_VECTOR: u32 = 0x1A;
+/// Offset of `config_generation` in the common configuration region
+/// (`VirtIO` 1.2 § 4.1.4.3).
+const COMMON_CONFIG_GENERATION: u32 = 0x15;
+
+/// Most reads [`PciTransport::config_read_u64`] makes of a field wider than
+/// 32 bits before it gives up on the device's configuration settling: each a
+/// read of `config_generation`, the field's two words, and
+/// `config_generation` again (`VirtIO` 1.2 § 2.5.1). A device changes its
+/// configuration on an event (a resize), not within one read, so a value
+/// that changes across this many reads is a device fault. A tuning value that
+/// bounds no capacity: it decides only when a read is given up on.
+pub const CONFIG_READ_ATTEMPTS: u32 = 8;
+
+/// Why a read of the device-specific configuration region returned no value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigError
+{
+    /// The read does not lie inside the region, or is not naturally aligned
+    /// there or in the window ([`config_word_addr`]).
+    OutsideRegion,
+    /// `config_generation` changed across every one of
+    /// [`CONFIG_READ_ATTEMPTS`] reads ([`settle`]).
+    Unsettled,
+}
+
+impl ConfigError
+{
+    /// What a driver logs for the error.
+    #[must_use]
+    pub const fn describe(self) -> &'static str
+    {
+        match self
+        {
+            Self::OutsideRegion => "read outside the device configuration region",
+            Self::Unsettled => "device configuration changed across every read",
+        }
+    }
+}
 
 /// Poll `done` until it holds or `elapsed` reaches `timeout`, returning
 /// whether it held.
@@ -143,6 +181,59 @@ pub fn config_fits(offset: u32, width: u32, device_len: u64) -> bool
         && u64::from(offset)
             .checked_add(u64::from(width))
             .is_some_and(|end| end <= device_len)
+}
+
+/// Window address of the 32-bit word at `offset` into the device-specific
+/// configuration region, which sits at window offset `device_off`, holds
+/// `device_len` bytes, and is mapped in the register window at `window_va`:
+/// `None` unless the word lies inside the region and is 4-byte aligned there
+/// ([`config_fits`]) and in the window.
+#[must_use]
+pub fn config_word_addr(
+    window_va: u64,
+    device_off: u64,
+    device_len: u64,
+    offset: u32,
+) -> Option<u64>
+{
+    // Wrapping: an offset that fits lies inside the mapped window, so its
+    // address wraps nothing; one that does not is refused, not dereferenced.
+    let addr = window_va.wrapping_add(device_off.wrapping_add(u64::from(offset)));
+    (config_fits(offset, 4, device_len) && addr.is_multiple_of(4)).then_some(addr)
+}
+
+/// The 64-bit configuration field whose low word `lo` and high word `hi`
+/// were read between the two reads of `config_generation`, `before` and
+/// `after`. `None` when the two differ: the device changed its
+/// configuration meanwhile, and the words may come from two configurations
+/// (`VirtIO` 1.2 § 2.5.1, § 4.1.4.3.1).
+#[must_use]
+pub fn config_u64(before: u8, lo: u32, hi: u32, after: u8) -> Option<u64>
+{
+    (before == after).then(|| u64::from(lo) | (u64::from(hi) << 32))
+}
+
+/// The first value [`config_u64`] takes from the reads `read` makes, each
+/// the `(before, lo, hi, after)` of one read of a 64-bit configuration
+/// field, of at most `attempts` reads.
+///
+/// # Errors
+///
+/// [`ConfigError::Unsettled`] when no read of the `attempts` is whole.
+pub fn settle(
+    attempts: u32,
+    mut read: impl FnMut() -> (u8, u32, u32, u8),
+) -> Result<u64, ConfigError>
+{
+    for _ in 0..attempts
+    {
+        let (before, lo, hi, after) = read();
+        if let Some(value) = config_u64(before, lo, hi, after)
+        {
+            return Ok(value);
+        }
+    }
+    Err(ConfigError::Unsettled)
 }
 
 impl PciTransport
@@ -396,33 +487,68 @@ impl PciTransport
 
     // ── Device-specific config (`VirtIO` 1.2 §4.1.4.6) ─────────────────
 
-    /// Read a u32 from device-specific configuration space. `None` when the
-    /// read does not lie inside the region or is not naturally aligned
-    /// ([`config_fits`]), or its address is not 4-byte aligned in the window.
-    #[must_use]
-    pub fn config_read_u32(&self, offset: u32) -> Option<u32>
+    /// Window address of the 32-bit configuration word at `offset`
+    /// ([`config_word_addr`]).
+    fn config_word(&self, offset: u32) -> Result<u64, ConfigError>
     {
-        let addr = self.window_addr(self.device_off.wrapping_add(u64::from(offset)));
-        if !config_fits(offset, 4, self.device_len) || !addr.is_multiple_of(4)
-        {
-            return None;
-        }
-        // SAFETY: the four bytes lie inside the device cfg region (checked
-        // above), which is within its BAR's mapping, and addr is 4-byte
-        // aligned (checked above).
-        let value = unsafe { core::ptr::read_volatile(addr as *const u32) };
-        Some(value)
+        config_word_addr(self.window_va, self.device_off, self.device_len, offset)
+            .ok_or(ConfigError::OutsideRegion)
+    }
+
+    /// Read a u32 from device-specific configuration space: one read, which
+    /// `VirtIO` 1.2 § 2.5.1 makes atomic for a field of at most 32 bits.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::OutsideRegion`] when the read does not lie inside the
+    /// region or is not naturally aligned ([`config_word_addr`]).
+    pub fn config_read_u32(&self, offset: u32) -> Result<u32, ConfigError>
+    {
+        let addr = self.config_word(offset)?;
+        // SAFETY: the four bytes lie inside the device cfg region, which is
+        // within its BAR's mapping, and addr is 4-byte aligned
+        // (config_word_addr).
+        Ok(unsafe { core::ptr::read_volatile(addr as *const u32) })
     }
 
     /// Read a u64 from device-specific configuration space, as two u32
-    /// reads, low half first. `None` when either read is
-    /// ([`config_read_u32`](Self::config_read_u32)).
-    #[must_use]
-    pub fn config_read_u64(&self, offset: u32) -> Option<u64>
+    /// reads, low half first, between two reads of `config_generation`,
+    /// repeated while the generation changes across them, at most
+    /// [`CONFIG_READ_ATTEMPTS`] times ([`settle`]): `VirtIO` 1.2 § 2.5.1 makes
+    /// no read wider than 32 bits atomic.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::OutsideRegion`] when either word's read is
+    /// ([`config_read_u32`](Self::config_read_u32)), and
+    /// [`ConfigError::Unsettled`] when no read is whole.
+    pub fn config_read_u64(&self, offset: u32) -> Result<u64, ConfigError>
     {
-        let lo = self.config_read_u32(offset)?;
-        let hi = self.config_read_u32(offset.checked_add(4)?)?;
-        Some(u64::from(lo) | (u64::from(hi) << 32))
+        let lo = self.config_word(offset)?;
+        let hi = self.config_word(offset.checked_add(4).ok_or(ConfigError::OutsideRegion)?)?;
+        settle(CONFIG_READ_ATTEMPTS, || {
+            let before = self.read_common_u8(COMMON_CONFIG_GENERATION);
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "both reads are of a word of the device configuration region that \
+                          config_word_addr checked"
+            )]
+            // SAFETY: each word's four bytes lie inside the device cfg region,
+            // which is within its BAR's mapping, and its address is 4-byte
+            // aligned (config_word_addr).
+            let (low, high) = unsafe {
+                (
+                    core::ptr::read_volatile(lo as *const u32),
+                    core::ptr::read_volatile(hi as *const u32),
+                )
+            };
+            (
+                before,
+                low,
+                high,
+                self.read_common_u8(COMMON_CONFIG_GENERATION),
+            )
+        })
     }
 
     // ── Device negotiation (`VirtIO` 1.2 §3.1.1) ───────────────────────
@@ -487,6 +613,14 @@ impl PciTransport
 
     // ── Internal helpers ────────────────────────────────────────────────
 
+    fn read_common_u8(&self, offset: u32) -> u8
+    {
+        let addr = self.common_addr(offset);
+        // SAFETY: the common region is mapped and holds COMMON_CFG_LEN bytes
+        // (RegisterLayout), past every register this file addresses in it.
+        unsafe { core::ptr::read_volatile(addr as *const u8) }
+    }
+
     fn read_common_u16(&self, offset: u32) -> u16
     {
         let addr = self.common_addr(offset);
@@ -531,6 +665,41 @@ impl PciTransport
             core::ptr::write_volatile(addr as *mut u32, val);
         }
         mmio::mmio_to_mmio_barrier();
+    }
+}
+
+/// Bounded proofs of the configuration decode (docs/testing.md § Bounded
+/// verification): the word's placement on any window, region and offset,
+/// and the settling of a 64-bit read on any sequence of reads the device can
+/// answer, one past [`CONFIG_READ_ATTEMPTS`] long, so both the value of
+/// every attempt and the refusal past the last are reached
+/// (`crate::property`'s `config_word_holds` and `settle_holds`). What lies
+/// outside the proofs is the shell's volatile reads; the fuzz target
+/// `virtio-core` and the unit tests check them.
+#[cfg(kani)]
+mod proofs
+{
+    use super::CONFIG_READ_ATTEMPTS;
+    use crate::property;
+
+    /// Every window address, region offset and length, and word offset: no
+    /// loop.
+    #[kani::proof]
+    fn every_config_word_is_placed_inside_its_region()
+    {
+        property::config_word_holds(kani::any(), kani::any(), kani::any(), kani::any());
+    }
+
+    /// Every sequence of [`CONFIG_READ_ATTEMPTS`] and one more reads, each
+    /// any generation pair and any words. The loops are the attempts and
+    /// the property's walks over the reads, each at most
+    /// `CONFIG_READ_ATTEMPTS + 1` (9) steps.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn every_64_bit_read_settles_on_its_first_whole_attempt()
+    {
+        let reads: [(u8, u32, u32, u8); CONFIG_READ_ATTEMPTS as usize + 1] = kani::any();
+        property::settle_holds(&reads);
     }
 }
 
@@ -734,12 +903,22 @@ mod tests
         window[0xA00 / 4..0xA00 / 4 + 4].copy_from_slice(&[1, 2, 3, 0xDEAD]);
         let transport = PciTransport::new(window.as_mut_ptr() as u64, &layout);
 
-        assert_eq!(transport.config_read_u32(8), Some(3));
-        assert_eq!(transport.config_read_u32(12), None);
-        assert_eq!(transport.config_read_u32(2), None);
-        assert_eq!(transport.config_read_u64(0), Some((2 << 32) | 1));
+        assert_eq!(transport.config_read_u32(8), Ok(3));
+        assert_eq!(
+            transport.config_read_u32(12),
+            Err(ConfigError::OutsideRegion)
+        );
+        assert_eq!(
+            transport.config_read_u32(2),
+            Err(ConfigError::OutsideRegion)
+        );
+        // The generation register (common 0x15) reads 0 before and after.
+        assert_eq!(transport.config_read_u64(0), Ok((2 << 32) | 1));
         // The high half would be the word past the region.
-        assert_eq!(transport.config_read_u64(8), None);
+        assert_eq!(
+            transport.config_read_u64(8),
+            Err(ConfigError::OutsideRegion)
+        );
     }
 
     #[test]
@@ -752,5 +931,40 @@ mod tests
         // A zero multiplier puts every doorbell at the region's start.
         assert!(doorbell_fits(0xFFFF, 0, 2));
         assert!(!doorbell_fits(0, 4, 1));
+    }
+
+    #[test]
+    fn a_64_bit_read_takes_the_first_whose_generation_held_and_gives_up_at_the_bound()
+    {
+        // The generation changes across the first two reads (a resize under
+        // way), then holds: the third read's words are the value.
+        let reads = [(1, 0x10, 0x11, 2), (2, 0x20, 0x21, 3), (3, 0x30, 0x31, 3)];
+        let mut next = reads.iter().copied();
+        let mut calls = 0;
+        let value = settle(CONFIG_READ_ATTEMPTS, || {
+            calls += 1;
+            next.next().unwrap_or((0, 0, 0, 1))
+        });
+        assert_eq!(value, Ok((0x31 << 32) | 0x30));
+        assert_eq!(calls, 3);
+        // A generation that never holds: every attempt is made, and no more.
+        let mut calls = 0u32;
+        let unsettled = settle(CONFIG_READ_ATTEMPTS, || {
+            calls += 1;
+            (0, 1, 2, 1)
+        });
+        assert_eq!(unsettled, Err(ConfigError::Unsettled));
+        assert_eq!(calls, CONFIG_READ_ATTEMPTS);
+    }
+
+    #[test]
+    fn a_config_word_address_is_given_only_inside_the_region_and_aligned()
+    {
+        // Region of 8 bytes at window offset 0x100 of a page-aligned window.
+        assert_eq!(config_word_addr(0x1000, 0x100, 8, 4), Some(0x1104));
+        assert_eq!(config_word_addr(0x1000, 0x100, 8, 8), None);
+        assert_eq!(config_word_addr(0x1000, 0x100, 8, 2), None);
+        // Aligned in the region, misaligned in the window.
+        assert_eq!(config_word_addr(0x1002, 0x100, 8, 4), None);
     }
 }

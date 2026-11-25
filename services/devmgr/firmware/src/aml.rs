@@ -449,49 +449,72 @@ pub(crate) fn record<'a>(
     }
 }
 
-/// Store the `_CID` value at `pos`: one ID, or the IDs of a Package.
+/// Store the `_CID` value at `pos` of `buf` into `c`'s slots from the
+/// first: one ID, or the IDs among a Package's elements.
 fn record_cids(c: &mut Collect<'_>, buf: &[u8], pos: usize)
 {
-    let mut n = 0;
-    let mut keep = |id: Option<Id>| {
-        if let Some(id) = id
-            && let Some(slot) = c.cids.get_mut(n)
-        {
-            *slot = Some(id);
-            n = n.saturating_add(1);
-        }
-    };
-    if buf.get(pos) != Some(&OP_PACKAGE)
-    {
-        keep(id_value(buf, pos));
-        return;
-    }
-    let Some((body, end)) = package(buf, pos.saturating_add(1))
+    let Some((count, first, end)) = cid_value(c, buf, pos)
     else
     {
         return;
     };
-    let Some(&count) = buf.get(body)
+    let Some(elements) = buf.get(..end)
     else
     {
         return;
     };
-    let Some(limited) = buf.get(..end)
-    else
-    {
-        return;
-    };
-    let mut p = body.saturating_add(1);
+    let (mut at, mut n) = (first, 0);
     for _ in 0..count
     {
-        let Some(size) = data_object_len(limited, p)
+        let Some((size, next)) = cid_element(c, n, elements, at)
         else
         {
             break;
         };
-        keep(id_value(limited, p));
-        p = p.saturating_add(size);
+        at = at.saturating_add(size);
+        n = next;
     }
+}
+
+/// Take the `_CID` value at `pos` of `buf` into `c`: a value that is not a
+/// Package is one ID, or none, for the first slot. For a Package, take
+/// nothing and return its element count, the offset of its first element,
+/// and its end.
+pub(crate) fn cid_value(c: &mut Collect<'_>, buf: &[u8], pos: usize) -> Option<(u8, usize, usize)>
+{
+    if buf.get(pos) != Some(&OP_PACKAGE)
+    {
+        if let Some(id) = id_value(buf, pos)
+            && let Some(slot) = c.cids.first_mut()
+        {
+            *slot = Some(id);
+        }
+        return None;
+    }
+    let (body, end) = package(buf, pos.saturating_add(1))?;
+    let count = *buf.get(body)?;
+    Some((count, body.saturating_add(1), end))
+}
+
+/// Take the element at `at` of a `_CID` Package's `elements` into slot `n`
+/// of `c` when it is an ID and the slot exists. Returns the element's size
+/// and the next free slot, or `None` when no data object is at `at`.
+pub(crate) fn cid_element(
+    c: &mut Collect<'_>,
+    n: usize,
+    elements: &[u8],
+    at: usize,
+) -> Option<(usize, usize)>
+{
+    let size = data_object_len(elements, at)?;
+    let mut next = n;
+    if let Some(id) = id_value(elements, at)
+        && let Some(slot) = c.cids.get_mut(n)
+    {
+        *slot = Some(id);
+        next = n.saturating_add(1);
+    }
+    Some((size, next))
 }
 
 /// The byte list of the Buffer at `pos`, truncated to its `BufferSize`.
@@ -574,10 +597,12 @@ pub enum CrsResource
 }
 
 /// Counts and bounds the resources reported.
-struct Emit<F>
+pub(crate) struct Emit<F>
 {
-    visit: F,
-    n: usize,
+    /// Called with each resource reported.
+    pub(crate) visit: F,
+    /// How many resources are reported so far.
+    pub(crate) n: usize,
 }
 
 impl<F: FnMut(CrsResource)> Emit<F>
@@ -646,18 +671,30 @@ pub fn crs_resources(crs: &[u8], visit: impl FnMut(CrsResource)) -> usize
     let mut em = Emit { visit, n: 0 };
     for descriptor in resource::descriptors(crs)
     {
-        let ok = match descriptor
-        {
-            Ok(r) => report(&mut em, &r),
-            Err(resource::Error::Malformed { .. }) => true,
-            Err(resource::Error::Truncated) => false,
-        };
-        if !ok
+        if !crs_step(&mut em, descriptor)
         {
             break;
         }
     }
     em.n
+}
+
+/// One step of [`crs_resources`]: report the resources of the descriptor
+/// the template yields next into `em`. Returns whether the walk goes on: it
+/// does past a descriptor whose length does not fit its kind and past one
+/// whose resources fit the bound, and stops at one that runs past the
+/// template or reaches the bound.
+pub(crate) fn crs_step<F: FnMut(CrsResource)>(
+    em: &mut Emit<F>,
+    descriptor: Result<Resource<'_>, resource::Error>,
+) -> bool
+{
+    match descriptor
+    {
+        Ok(r) => report(em, &r),
+        Err(resource::Error::Malformed { .. }) => true,
+        Err(resource::Error::Truncated) => false,
+    }
 }
 
 /// Report the resources of the descriptor `r`; false when the bound is
@@ -1360,17 +1397,22 @@ mod tests
     }
 }
 
-/// The proofs of the walk's steps and of the adapter (docs/testing.md
+/// The proofs of the walk's steps and of the adapter's (docs/testing.md
 /// § Bounded verification), on the checks of `crate::property::aml`: the
 /// term at any place of a term list, the record of a `Name`'s value of
-/// every kind and the take of a `Method` into the device whose body holds
-/// them, the rule that reports a device, one descriptor of every kind
-/// and length through the adapter, and every short template whole. What lies
-/// outside the proofs is the loops that drive the steps: `Walker::term_list`
-/// from one term to the next, its dispatch of each term to its step, its
-/// recursion into a `Scope` or `Device` under `MAX_DEPTH`, and the descriptor loop of `crs_resources` past the short
-/// templates; the fuzz target `devmgr-firmware`, the replay of the
-/// checked-in inputs and the unit tests check them.
+/// every kind, the take of a `_CID` value and of each element of a
+/// `_CID` `Package`, and the take of a `Method`, into the device whose
+/// body holds them, the rule that reports a device, and the adapter's step
+/// on one descriptor of every kind it reads after any count of resources
+/// and on every template of 2 bytes. What lies outside the proofs is the
+/// loops that drive the steps and the reads that feed them:
+/// `Walker::term_list` from one term to the next, its dispatch of each term
+/// to its step, its recursion into a `Scope` or `Device` under
+/// `MAX_DEPTH`, the element loop of `record_cids` and its read of the
+/// `Package`'s elements, and the descriptor loop of `crs_resources` with
+/// the `aml` crate's iterator that reads each descriptor from the next
+/// offset; the fuzz target `devmgr-firmware`, the replay of the checked-in
+/// inputs and the unit tests check them.
 #[cfg(kani)]
 mod proofs
 {
@@ -1380,7 +1422,7 @@ mod proofs
         OP_EXT_PREFIX, OP_EXTERNAL, OP_IF, OP_METHOD, OP_NAME, OP_PACKAGE, OP_SCOPE, OP_WHILE,
     };
 
-    use super::{Collect, Id, MAX_CIDS};
+    use super::{Collect, Id, MAX_CIDS, MAX_CRS_RESOURCES};
     use crate::property::aml as property;
 
     /// Every term list of `N` bytes whose term at place 1 starts with
@@ -1520,26 +1562,13 @@ mod proofs
     /// Every `Name` called `name` records its value of any kind at place 1
     /// of `N` bytes, a value longer than the place leaves being one cut
     /// short, into a device that holds nothing or one that holds every
-    /// field; with `package`, a value that is a `Package` exactly when it
-    /// says.
-    fn name_at_place_one_records<const N: usize>(name: [u8; 4], package: Option<bool>)
+    /// field.
+    fn name_at_place_one_records<const N: usize>(name: [u8; 4])
     {
         let bytes: [u8; N] = kani::any();
-        if let Some(package) = package
-        {
-            kani::assume((bytes[1] == OP_PACKAGE) == package);
-        }
         if let Some(size) = ::aml::encoding::data_object_len(&bytes, 1)
         {
-            let into = if kani::any()
-            {
-                property::Prior::Full
-            }
-            else
-            {
-                property::Prior::Empty
-            };
-            property::record_holds(&bytes, name, 1, size, into);
+            property::record_holds(&bytes, name, 1, size, any_prior());
         }
     }
 
@@ -1551,7 +1580,7 @@ mod proofs
     #[kani::unwind(9)]
     fn every_hid_records_as_its_id()
     {
-        name_at_place_one_records::<9>(*b"_HID", None);
+        name_at_place_one_records::<9>(*b"_HID");
     }
 
     /// Every `_UID` and `_STA`, and a `_ADR` the walk ignores, records its
@@ -1564,34 +1593,52 @@ mod proofs
     {
         match kani::any::<u8>() % 3
         {
-            0 => name_at_place_one_records::<9>(*b"_UID", None),
-            1 => name_at_place_one_records::<9>(*b"_STA", None),
-            _ => name_at_place_one_records::<9>(*b"_ADR", None),
+            0 => name_at_place_one_records::<9>(*b"_UID"),
+            1 => name_at_place_one_records::<9>(*b"_STA"),
+            _ => name_at_place_one_records::<9>(*b"_ADR"),
         }
     }
 
-    /// Every `_CID` that is not a `Package` records its value of any kind at
-    /// place 1 of 9 bytes, as a `_HID` does: 8 bytes hold a dword EISA ID, a
-    /// string ID of up to 6 characters, and every integer form up to a dword.
-    /// The loops are a string's bytes and an integer's.
-    #[kani::proof]
-    #[kani::unwind(9)]
-    fn every_cid_records_as_its_id()
+    /// The device a step takes its value into: one that holds nothing or
+    /// one whose every field holds a value.
+    fn any_prior() -> property::Prior
     {
-        name_at_place_one_records::<9>(*b"_CID", Some(false));
+        if kani::any()
+        {
+            property::Prior::Full
+        }
+        else
+        {
+            property::Prior::Empty
+        }
     }
 
-    /// Every `_CID` that is a `Package` records the IDs among its elements at
-    /// place 1 of 8 bytes: 7 bytes hold the package's opcode, length and
-    /// count and 4 bytes of elements, so a one-character string ID before or
-    /// after an element that is none, two elements that are none, a count
-    /// past the elements, and a package cut short. The loops are the
-    /// package's elements and a string's bytes.
+    /// Every `_CID` value at place 1 of 9 bytes is taken as one ID for the
+    /// first slot, or as a `Package`'s element count, first element and end:
+    /// 8 bytes hold a dword EISA ID, a string ID of up to 6 characters, every
+    /// integer form up to a dword, and a `Package` header of every
+    /// `PkgLength` form. The loops are a string's bytes and an integer's.
     #[kani::proof]
-    #[kani::unwind(8)]
-    fn every_cid_package_records_as_its_ids()
+    #[kani::unwind(9)]
+    fn every_cid_value_is_taken_as_an_id_or_a_package()
     {
-        name_at_place_one_records::<8>(*b"_CID", Some(true));
+        let bytes: [u8; 9] = kani::any();
+        property::cid_value_holds(&bytes, 1, any_prior());
+    }
+
+    /// Every element at place 1 of 9 bytes of a `_CID` `Package` is taken
+    /// into any slot, the last slot past the end among them, as an ID, or
+    /// passed by its size: 8 bytes hold a dword EISA ID, a string ID of up to
+    /// 6 characters, every integer form up to a dword, and a `Buffer` or
+    /// `Package` element. The loops are a string's bytes, an integer's, and
+    /// the comparison of the slots.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_cid_element_is_taken_into_its_slot()
+    {
+        let bytes: [u8; 9] = kani::any();
+        let n = kani::any_where(|n: &usize| *n <= MAX_CIDS);
+        property::cid_element_holds(&bytes, 1, n, any_prior());
     }
 
     /// Every `_CRS` records its value of any kind at place 1 of 9 bytes: 8
@@ -1601,7 +1648,7 @@ mod proofs
     #[kani::unwind(9)]
     fn every_crs_records_as_its_list()
     {
-        name_at_place_one_records::<9>(*b"_CRS", None);
+        name_at_place_one_records::<9>(*b"_CRS");
     }
 
     /// Every `Method` of any name is taken into a device that holds nothing
@@ -1611,22 +1658,14 @@ mod proofs
     #[kani::unwind(8)]
     fn every_method_is_taken_by_its_name()
     {
-        let into = if kani::any()
-        {
-            property::Prior::Full
-        }
-        else
-        {
-            property::Prior::Empty
-        };
-        property::method_holds(kani::any(), into);
+        property::method_holds(kani::any(), any_prior());
     }
 
     /// Every collected device is reported by its identity, its `_STA` and its
     /// methods alone, with the fields it holds. The loops are the `_CID` slots
-    /// and the identifier's bytes.
+    /// and the identifiers' 16 bytes.
     #[kani::proof]
-    #[kani::unwind(8)]
+    #[kani::unwind(17)]
     fn every_device_reports_by_its_identity()
     {
         let id = |present: bool| if present { Id::new(b"PNP0501") } else { None };
@@ -1647,18 +1686,42 @@ mod proofs
         property::qualify_holds(&c);
     }
 
+    /// Any count of resources reported before a descriptor, the bound
+    /// among them.
+    fn any_count() -> usize
+    {
+        kani::any_where(|n: &usize| *n <= MAX_CRS_RESOURCES)
+    }
+
+    /// Every template of 2 bytes goes on past its first descriptor, or
+    /// stops at it, as the template's walk does: at its end, at a descriptor
+    /// that runs past it, at the End Tag, past a descriptor whose length does
+    /// not fit its kind, and past one of one byte. No descriptor of 2 bytes
+    /// reports a resource, so the count reported before it is never read and
+    /// is none here. The loops are the comparison of the 8 resources the
+    /// bound holds and an IRQ's 16 lines, which no 2-byte descriptor holds.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_descriptor_step_goes_on_or_stops()
+    {
+        let bytes: [u8; 2] = kani::any();
+        property::descriptor_holds(&bytes, 0);
+    }
+
     /// Every template that is one large descriptor of kind `key` and a body
-    /// of `N` bytes less its 3-byte header reports as its fields.
+    /// of `N` bytes less its 3-byte header reports as its fields after any
+    /// count of resources.
     fn large_descriptor_holds<const N: usize>(key: u8)
     {
         let mut bytes: [u8; N] = kani::any();
         bytes[0] = key;
         let body = u16::try_from(N - 3).unwrap_or(0);
         bytes[1..3].copy_from_slice(&body.to_le_bytes());
-        property::crs_holds(&bytes);
+        property::descriptor_holds(&bytes, any_count());
     }
 
-    /// Every large descriptor the adapter reads reports as its fields: a
+    /// Every large descriptor the adapter reads reports as its fields, after
+    /// any count of resources, the bound among them: a
     /// 32-bit Fixed Memory range, a 32-bit Memory range, a `DWord` and a
     /// `QWord` address space at their least length, and an Extended
     /// Interrupt of up to two lines, its count of any value. The loops are
@@ -1679,7 +1742,8 @@ mod proofs
     }
 
     /// Every template that is one small descriptor the adapter reads reports
-    /// as its fields: an IRQ with and without its flags, an I/O Port and a
+    /// as its fields, after any count of resources, the bound among them: an
+    /// IRQ with and without its flags, an I/O Port and a
     /// Fixed I/O Port. The loops are an IRQ's 16 lines and the comparison of
     /// the 8 resources the bound holds.
     #[kani::proof]
@@ -1696,23 +1760,11 @@ mod proofs
     }
 
     /// Every template that is the small descriptor `tag` of `N` bytes
-    /// reports as its fields.
+    /// reports as its fields after any count of resources.
     fn small_descriptor_holds<const N: usize>(tag: u8)
     {
         let mut bytes: [u8; N] = kani::any();
         bytes[0] = tag;
-        property::crs_holds(&bytes);
-    }
-
-    /// Every template of 4 bytes reports as its descriptors whole: up to 4
-    /// descriptors of one byte, the End Tag, an IRQ before and after others,
-    /// a large descriptor's header, and a descriptor that runs past the end.
-    /// The loops are the descriptors and an IRQ's 16 lines.
-    #[kani::proof]
-    #[kani::unwind(17)]
-    fn every_short_template_reports_as_its_resources()
-    {
-        let bytes: [u8; 4] = kani::any();
-        property::crs_holds(&bytes);
+        property::descriptor_holds(&bytes, any_count());
     }
 }

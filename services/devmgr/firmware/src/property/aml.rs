@@ -24,8 +24,30 @@ pub(crate) fn aml_holds(input: &[u8])
     for crs in walk_holds(input)
     {
         crs_holds(crs);
+        descriptor_steps_hold(crs);
     }
     crs_holds(input);
+    descriptor_steps_hold(input);
+}
+
+/// Check the adapter's step on each descriptor the walk of the template
+/// `crs` reaches, after every count of resources.
+fn descriptor_steps_hold(crs: &[u8])
+{
+    let mut pos = 0usize;
+    while let Some(rest) = crs.get(pos..)
+    {
+        for prior in 0..=MAX_CRS_RESOURCES
+        {
+            descriptor_holds(rest, prior);
+        }
+        let Some(next) = template_step(crs, pos, &mut Reported::default())
+        else
+        {
+            break;
+        };
+        pos = next;
+    }
 }
 
 // ── Encodings ───────────────────────────────────────────────────────────────
@@ -538,6 +560,108 @@ pub(crate) fn method_holds(name: Option<[u8; 4]>, into: Prior)
     assert!(same(&[], &c, &d), "a Method taken against its name");
 }
 
+/// [`aml::cid_value`] takes the `_CID` value at `value` of `bytes` into the
+/// device `into` as [`record_cids`] does before the elements: a value that
+/// is not a `Package` (0x12) is one ID, or none, for the first slot; a
+/// `Package` takes nothing and yields its element count, the offset after
+/// the count, and its end.
+pub(crate) fn cid_value_holds(bytes: &[u8], value: usize, into: Prior)
+{
+    let (mut c, mut d) = device_of(bytes, into);
+    let got = aml::cid_value(&mut c, bytes, value);
+    let expected = if byte(bytes, value) == Some(0x12)
+    {
+        value
+            .checked_add(1)
+            .and_then(|lead| package(bytes, lead))
+            .and_then(|(count_at, end)| {
+                Some((byte(bytes, count_at)?, count_at.checked_add(1)?, end))
+            })
+    }
+    else
+    {
+        if let Some(id) = id_value(bytes, value)
+            && let Some(slot) = d.cids.first_mut()
+        {
+            *slot = Some(id);
+        }
+        None
+    };
+    assert_eq!(got, expected, "a _CID value's package against its header");
+    assert!(same(bytes, &c, &d), "a _CID value taken against its ID");
+}
+
+/// [`aml::cid_element`] takes the element at `at` of a `_CID` `Package`'s
+/// `elements` into slot `n` of the device `into` as [`record_cids`] does:
+/// an element that is an ID fills slot `n` when there is one, and the next
+/// free slot follows it; any data object is passed by its size; at no data
+/// object, nothing is taken.
+pub(crate) fn cid_element_holds(elements: &[u8], at: usize, n: usize, into: Prior)
+{
+    let (mut c, mut d) = device_of(elements, into);
+    let got = aml::cid_element(&mut c, n, elements, at);
+    let expected = data_object_len(elements, at).map(|size| {
+        let mut next = n;
+        if let Some(id) = id_value(elements, at)
+            && let Some(slot) = d.cids.get_mut(n)
+        {
+            *slot = Some(id);
+            next = n.saturating_add(1);
+        }
+        (size, next)
+    });
+    assert_eq!(
+        got, expected,
+        "a _CID element's size and slot against its object"
+    );
+    assert!(
+        same(elements, &c, &d),
+        "a _CID element taken against its ID"
+    );
+}
+
+/// Check the steps of the `_CID` value at `value` of `data`: the value, and
+/// each element of a `Package` that [`record_cids`] reads, into every
+/// slot, of a device that holds nothing and of one that holds every field.
+fn cid_steps_hold(data: &[u8], value: usize)
+{
+    for into in [Prior::Empty, Prior::Full]
+    {
+        cid_value_holds(data, value, into);
+    }
+    if byte(data, value) != Some(0x12)
+    {
+        return;
+    }
+    let Some((count_at, end)) = value.checked_add(1).and_then(|lead| package(data, lead))
+    else
+    {
+        return;
+    };
+    let (Some(count), Some(elements)) = (byte(data, count_at), data.get(..end))
+    else
+    {
+        return;
+    };
+    let mut at = count_at.saturating_add(1);
+    for _ in 0..count
+    {
+        for n in 0..=MAX_CIDS
+        {
+            for into in [Prior::Empty, Prior::Full]
+            {
+                cid_element_holds(elements, at, n, into);
+            }
+        }
+        let Some(size) = data_object_len(elements, at)
+        else
+        {
+            return;
+        };
+        at = at.saturating_add(size);
+    }
+}
+
 /// [`aml::qualify`] reports the device `c` when [`reported`] does, with its
 /// identity, `_UID` and `_CRS`.
 pub(crate) fn qualify_holds(c: &Collect<'_>)
@@ -623,6 +747,10 @@ fn walk(
                     for into in [Prior::Empty, Prior::Full]
                     {
                         record_holds(bytes, name, value, size, into);
+                    }
+                    if name == *b"_CID"
+                    {
+                        cid_steps_hold(data, value);
                     }
                     record(data, d, name, value);
                 }
@@ -848,46 +976,82 @@ fn template(crs: &[u8]) -> Reported
 {
     let mut out = Reported::default();
     let mut pos = 0usize;
-    while let Some(tag) = byte(crs, pos)
+    while let Some(next) = template_step(crs, pos, &mut out)
     {
-        let large = tag & 0x80 != 0;
-        let (kind, body, length) = if large
-        {
-            let Some(length) = pos.checked_add(1).and_then(|at| le16(crs, at))
-            else
-            {
-                break;
-            };
-            (tag & 0x7F, pos.saturating_add(3), usize::from(length))
-        }
-        else
-        {
-            (
-                (tag >> 3) & 0x0F,
-                pos.saturating_add(1),
-                usize::from(tag & 0x07),
-            )
-        };
-        let Some(next) = body.checked_add(length).filter(|&next| next <= crs.len())
-        else
-        {
-            break;
-        };
-        if !large && kind == 0x0F
-        {
-            break;
-        }
-        if !descriptor(
-            if large { tag } else { kind },
-            crs.get(body..next).unwrap_or(&[]),
-            &mut out,
-        )
-        {
-            break;
-        }
         pos = next;
     }
     out
+}
+
+/// Report the descriptor at `pos` of the template `crs` into `out`. Returns
+/// the offset after it, or `None` where the template ends: at its end, at a
+/// descriptor that runs past it, at the End Tag (small 0xF), or at a
+/// descriptor whose resources reach the bound.
+fn template_step(crs: &[u8], pos: usize, out: &mut Reported) -> Option<usize>
+{
+    let tag = byte(crs, pos)?;
+    let large = tag & 0x80 != 0;
+    let (kind, body, length) = if large
+    {
+        let length = pos.checked_add(1).and_then(|at| le16(crs, at))?;
+        (tag & 0x7F, pos.saturating_add(3), usize::from(length))
+    }
+    else
+    {
+        (
+            (tag >> 3) & 0x0F,
+            pos.saturating_add(1),
+            usize::from(tag & 0x07),
+        )
+    };
+    let next = body.checked_add(length).filter(|&next| next <= crs.len())?;
+    if !large && kind == 0x0F
+    {
+        return None;
+    }
+    descriptor(
+        if large { tag } else { kind },
+        crs.get(body..next).unwrap_or(&[]),
+        out,
+    )
+    .then_some(next)
+}
+
+/// [`aml::crs_step`] reports the first descriptor of the template `crs`,
+/// `prior` resources being reported before it, as [`template_step`] does:
+/// its resources up to the bound, and whether the walk goes on past it.
+pub(crate) fn descriptor_holds(crs: &[u8], prior: usize)
+{
+    let mut visited = Reported {
+        count: prior,
+        ..Reported::default()
+    };
+    let mut past_bound = false;
+    let (goes_on, count) = {
+        let mut em = aml::Emit {
+            visit: |r| past_bound |= !visited.push(r),
+            n: prior,
+        };
+        let goes_on = ::aml::resource::descriptors(crs)
+            .next()
+            .is_some_and(|d| aml::crs_step(&mut em, d));
+        (goes_on, em.n)
+    };
+    let mut expected = Reported {
+        count: prior,
+        ..Reported::default()
+    };
+    let expected_goes_on = template_step(crs, 0, &mut expected).is_some();
+    assert!(!past_bound, "a resource visited past the bound");
+    assert_eq!(count, visited.count, "a step's count against its visits");
+    assert_eq!(
+        goes_on, expected_goes_on,
+        "a step's stop against the template's"
+    );
+    assert_eq!(
+        visited, expected,
+        "a descriptor's resources against its fields"
+    );
 }
 
 /// [`aml::crs_resources`] visits the resources [`template`] reads from

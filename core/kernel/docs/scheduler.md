@@ -501,8 +501,12 @@ work is queued on the caller's CPU, whose threads the receiver would otherwise r
 its own CPU idles, and a receiver that outranks its caller, such as an RT server called by a fair
 client, which, serving a backlog without parking, would hold off the caller's reply wake past any
 slice (§ Time Slice Policy). A reply-and-receive call (#1482), whose server parks in the same
-syscall as it replies, may lift the second condition. Every other wake, the reply's included,
-passes `WakeHint::None`.
+syscall as it replies, may lift the second condition. A receiver at its caller's level that, after
+its reply, serves other callers' queued calls without parking leaves the caller's reply wake queued
+behind it on that CPU until it parks or its slice expires: with several callers, the one whose CPU
+it moved to waits up to one slice per round trip. #1482 closes that wait, at the receive that binds
+a queued sender while the replied caller is queued on the server's CPU. Every other wake, the
+reply's included, passes `WakeHint::None`.
 
 ### Load Balancing
 

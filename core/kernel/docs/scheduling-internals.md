@@ -1320,7 +1320,8 @@ placed on the waker's CPU k when k is eligible and the guard holds:
   would hold it off past any slice, since slice expiry never hands the CPU to a lower RT level or
   from an RT thread to a fair one ([scheduler.md](scheduler.md) § Time Slice Policy). At or below
   the waker, the recipient is preempted by the reply wake or shares k with the waker within one
-  slice.
+  slice; at the waker's level, a recipient serving a backlog without parking holds the reply wake
+  that long, which #1482 closes (scheduler.md § Thread Assignment).
 
 When the guard holds, the woken thread is the thread k's `schedule()` dispatches when the waker
 blocks, and `enqueue_and_wake` to k sends no IPI (it skips self-wakes). Between the link and that

@@ -635,9 +635,9 @@ threads ([services/fixtures/crashme/README.md](../services/fixtures/crashme/READ
 `crashd_live_core` phase asks crashd, through the `crashd.core` seed, for a live core of the
 running fixture and checks that the fixture ran on unchanged and that the core records its threads,
 their stacks and a page it marked, and none of the binary's text, and asks for one of a fixture on
-the core path and checks the refusal released the capture ([crashd Operation § Live
-Core](../services/crashd/docs/operation.md#live-core)). A core is checked in the boot, not in the
-log; `gdb` reading one is checked by hand
+the core path, on an account that cannot fund a snapshot, and checks the refusal asked for none
+([crashd Operation § Live Core](../services/crashd/docs/operation.md#live-core)). A core is checked
+in the boot, not in the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The svctest boot's crashd also holds a page fault memmgr declined for want of memory, for up to

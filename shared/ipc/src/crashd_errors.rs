@@ -36,5 +36,6 @@ pub const TIMED_OUT: u64 = 7;
 /// Unknown label on crashd's live-core endpoint.
 pub const UNKNOWN_OPCODE: u64 = 8;
 /// The process declared that no core of it is written (procmgr's
-/// `DECLARE_NO_CORE`); crashd released its snapshot before the reply.
+/// `DECLARE_NO_CORE`): before the request, and crashd asked for no snapshot,
+/// or during it, and crashd released its snapshot before the reply.
 pub const NO_CORE: u64 = 9;

@@ -282,30 +282,38 @@ Its steps, in order, under the dump's bound ([Bounds](#bounds)):
    while memmgr's level reads `CRITICAL` (`MEMORY_CRITICAL`).
 2. It finds the first live process, in badge order, that the name names (`LIST_PROCESSES`), or
    replies `NOT_FOUND`.
-3. It asks procmgr, through its debug authority, for a snapshot of the process charged to the
+3. It attaches the process (`ATTACH_PROCESS`), asking for no thread from an index past every
+   list, so procmgr derives no thread cap, and sending no debugger watch, so the attach leaves
+   nothing held in procmgr or in crashd. A process that declared itself on the core path
+   (`DECLARE_NO_CORE`) before the request gets no core: crashd replies `NO_CORE` at once, sends
+   no snapshot and charges nothing to the account, the declaration being one-way. Every other
+   answer of the attach, a refusal or a failed call, leaves the reply to step 4, whose refusal
+   procmgr gives as it would without this step; a request past its bound is `TIMED_OUT`.
+4. It asks procmgr, through its debug authority, for a snapshot of the process charged to the
    account ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Label 33: `SNAPSHOT`).
    procmgr holds the process for the capture alone and records each thread's registers as the
    hold left them; crashd stops no thread and copies none of the process's pages itself. A refusal
    is replied `SNAPSHOT_REFUSED`, with procmgr's label in `data[0]`, and `NOT_FOUND` when the
    process ended first.
-4. It attaches the object's layout pages read-only and checks the layout.
-5. It attaches the process (`ATTACH_PROCESS`) to read its declarations as they stand after the
-   capture, so a declaration the process made before the capture's hold is always seen. A process
-   that declared itself on the core path (`DECLARE_NO_CORE`) gets no core: crashd replies
-   `NO_CORE`. A process that ended before the attach gets `NOT_FOUND`, its declarations unknown.
-   One that declared itself undebuggable since the capture is refused as at step 3,
+5. It attaches the object's layout pages read-only and checks the layout.
+6. It attaches the process (`ATTACH_PROCESS`) again to read its declarations as they stand after
+   the capture, so a declaration the process made before the capture's hold is always seen, one
+   made since step 3 among them. A process that declared itself on the core path
+   (`DECLARE_NO_CORE`) gets no core: crashd replies `NO_CORE`. A process that ended before the
+   attach gets `NOT_FOUND`, its declarations unknown.
+   One that declared itself undebuggable since the capture is refused as at step 4,
    `SNAPSHOT_REFUSED` with procmgr's `NOT_ATTACHABLE` in `data[0]`, and any other refusal of the
    attach, with its label, the same way; a failed call is `NOT_WRITTEN`.
    Through the process's main thread crashd then reads the image's ELF header at the load bias the
    snapshot's header records, for the core's `NT_AUXV` (`ipc::read_mem_resident_bounded`); a
    read that fails, the process having ended since the attach among the causes, leaves the core
    without `NT_AUXV`, as it leaves a crash core.
-6. It lays the core out within the per-core budget from the snapshot's runs and thread records
+7. It lays the core out within the per-core budget from the snapshot's runs and thread records
    ([core-format.md](core-format.md) § Live cores), deletes the `.part` files and the oldest
    cores as step 6 of [Core Dump](#core-dump) does, and writes the core under its `.part` name
    from the object's pages, a window of 64 pages (`WINDOW_PAGES`) attached at a time, and renames
    it.
-7. It releases the object (`OBJECT_RELEASE`). Every path after a snapshot was taken releases it
+8. It releases the object (`OBJECT_RELEASE`). Every path after a snapshot was taken releases it
    before the reply, a refusal and a request past its bound included, the release not bounded by
    it, so no live core leaves the capture charged to the account.
 

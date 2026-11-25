@@ -110,10 +110,10 @@ phases run it, and `cargo xtask run --crash-reports` checks the blocks in that b
 fixture write a page while memory is critical, once resumed after the hold and once declined when
 the stall passes. svctest's recipe seeds `crashd.core`, and the `crashd_live_core` phase asks for a
 live core of the fixture running and checks the fixture ran on unchanged and the core holds its
-threads and a page it marked, then asks for one of a fixture that declared itself on the core path
-and checks the refusal released the capture. svctest's `crash_endpoint` phase drives procmgr's
-side, registration, handover, and take-back, and the thread list and crash badges an attach
-returns, with svctest as the crash service.
+threads and a page it marked, then asks for one of a fixture that declared itself on the core path,
+on an account that cannot fund a snapshot, and checks the refusal asked for none. svctest's
+`crash_endpoint` phase drives procmgr's side, registration, handover, and take-back, and the thread
+list and crash badges an attach returns, with svctest as the crash service.
 
 ---
 

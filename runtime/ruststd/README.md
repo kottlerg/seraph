@@ -864,9 +864,7 @@ before `Command::spawn`, or the first open, returns: its demand stack's top chun
 [memmgr's Memory Pool](../../services/memmgr/docs/memory-pool.md) § Demand faults). At its wait it
 touches nothing; it runs again only when it wakes, the death bridge on the child's end and the
 release handler on a driver's release. A process that reads its own account (`QUERY_MEMORY_USAGE`)
-after a spawn returns thus finds the spawn's whole charge, as svctest's `crashd_live_core` phase
-relies on when it compares the readings on either side of a refused live-core request
-(`check_live_no_core` in `services/svctest/src/phases/crashd.rs`).
+after a spawn returns thus finds the spawn's whole charge.
 
 The wait covers the thread's registration with procmgr (§ Thread registration), which the thread
 makes under its spawner's call deadline, if any (§ Call deadline), so a deadline that bounds the

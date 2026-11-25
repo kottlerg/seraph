@@ -1359,9 +1359,12 @@ mod proofs
         property::compatible_holds(&bytes, b"ab");
     }
 
-    /// Every list of at most 2 windows, each with or without a domain, takes
-    /// the lowest free segments. The loops are the windows and the segments
-    /// tried, at most one more than the windows.
+    /// Every list of 1 or 2 windows, each with or without a domain, takes the
+    /// lowest free segments; an empty list has no window to change. A window
+    /// of 2 takes segment 0 or 1, the other window holding at most one of
+    /// them, so the rule reads a held segment only by whether it is 0, 1 or
+    /// neither: segments 0 to 3 reach every case. The loops are the windows
+    /// and the segments tried, at most one more than the windows.
     #[kani::proof]
     #[kani::unwind(4)]
     fn every_fallback_segment_is_the_lowest_free()
@@ -1371,64 +1374,95 @@ mod proofs
                 EcamLocation {
                     phys_base: kani::any(),
                     size: kani::any(),
-                    segment: kani::any(),
+                    segment: u16::from(kani::any::<u8>() % 4),
                     start_bus: kani::any(),
                     end_bus: kani::any(),
                 },
                 kani::any(),
             )
         };
-        let before = [window(), window()];
-        let mut found = before;
-        let len: usize = kani::any();
-        kani::assume(len <= before.len());
-        property::fallback_holds(&before[..len], &mut found[..len]);
+        let one = [window()];
+        let mut found = one;
+        property::fallback_holds(&one, &mut found);
+        let two = [window(), window()];
+        let mut found = two;
+        property::fallback_holds(&two, &mut found);
     }
 
-    /// Every step of the walk over the block, from any state, takes its event
-    /// as the walk does: a node opening at any offset, a node closing, a
-    /// `#address-cells` and a `#size-cells` of up to 4 bytes, a
-    /// `compatible` that holds the ECAM entry first, after another entry or
-    /// not at all, and any other property, at any depth. The loops are the
-    /// `compatible` entries' bytes and the property names'.
-    #[kani::proof]
-    #[kani::unwind(27)]
-    fn every_walk_step_takes_its_event()
+    /// Every step of the walk over the block from any state, at any depth,
+    /// takes `event` as the walk does.
+    fn walk_step_holds(event: &FdtEvent<'_>)
     {
         let mut scan = Scan {
             depth: kani::any(),
             cells: kani::any(),
             starts: kani::any(),
         };
+        property::scan_step_holds(&mut scan, event);
+    }
+
+    /// Every step of the walk takes a node opening at any offset and a node
+    /// closing as the walk does. No loop.
+    #[kani::proof]
+    fn every_walk_step_takes_its_node()
+    {
+        if kani::any()
+        {
+            walk_step_holds(&FdtEvent::BeginNode { start: kani::any() });
+        }
+        else
+        {
+            walk_step_holds(&FdtEvent::EndNode);
+        }
+    }
+
+    /// Every step of the walk takes a `#address-cells`, a `#size-cells` and
+    /// any other property but `compatible`, of up to 4 bytes, as the walk
+    /// does: 4 bytes hold a cell. The loops are the names' bytes and the
+    /// state's 17 node starts.
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn every_walk_step_takes_its_cells()
+    {
         let bytes: [u8; 4] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= bytes.len());
-        let data = &bytes[..len];
-        let compatible: &[u8] = match kani::any::<u8>() % 3
+        let name: &[u8] = match kani::any::<u8>() % 3
         {
-            0 => b"pci-host-ecam-generic\0",
-            1 => b"x\0pci-host-ecam-generic",
-            _ => b"pci-host-ecam-generi\0",
+            0 => b"#address-cells",
+            1 => b"#size-cells",
+            _ => b"reg",
         };
-        let event = match kani::any::<u8>() % 6
-        {
-            0 => FdtEvent::BeginNode { start: kani::any() },
-            1 => FdtEvent::EndNode,
-            2 => FdtEvent::Prop {
-                name: b"#address-cells",
-                data,
-            },
-            3 => FdtEvent::Prop {
-                name: b"#size-cells",
-                data,
-            },
-            4 => FdtEvent::Prop {
-                name: b"compatible",
-                data: compatible,
-            },
-            _ => FdtEvent::Prop { name: b"reg", data },
-        };
-        property::scan_step_holds(&mut scan, &event);
+        walk_step_holds(&FdtEvent::Prop {
+            name,
+            data: &bytes[..len],
+        });
+    }
+
+    /// Every step of the walk takes a `compatible` that holds the ECAM entry
+    /// as the walk does, after another entry: whether a list holds the entry
+    /// is `every_compatible_list_matches_its_entries`'s. The loops are the
+    /// list's bytes.
+    #[kani::proof]
+    #[kani::unwind(27)]
+    fn every_walk_step_takes_an_ecam_compatible()
+    {
+        walk_step_holds(&FdtEvent::Prop {
+            name: b"compatible",
+            data: b"x\0pci-host-ecam-generic",
+        });
+    }
+
+    /// Every step of the walk takes a `compatible` that does not hold the
+    /// ECAM entry as the walk does. The loops are the list's bytes.
+    #[kani::proof]
+    #[kani::unwind(27)]
+    fn every_walk_step_takes_another_compatible()
+    {
+        walk_step_holds(&FdtEvent::Prop {
+            name: b"compatible",
+            data: b"pci-host-ecam-generi\0",
+        });
     }
 
     /// Every step of an ECAM node's read, from any state and in any cells,

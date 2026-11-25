@@ -1377,7 +1377,7 @@ mod proofs
     use ::aml::encoding::{
         EXT_BANK_FIELD, EXT_DEVICE, EXT_EVENT, EXT_FIELD, EXT_INDEX_FIELD, EXT_MUTEX,
         EXT_OP_REGION, EXT_POWER_RES, EXT_PROCESSOR, EXT_THERMAL_ZONE, OP_ALIAS, OP_ELSE,
-        OP_EXT_PREFIX, OP_EXTERNAL, OP_IF, OP_METHOD, OP_NAME, OP_SCOPE, OP_WHILE,
+        OP_EXT_PREFIX, OP_EXTERNAL, OP_IF, OP_METHOD, OP_NAME, OP_PACKAGE, OP_SCOPE, OP_WHILE,
     };
 
     use super::{Collect, Id, MAX_CIDS};
@@ -1520,10 +1520,15 @@ mod proofs
     /// Every `Name` called `name` records its value of any kind at place 1
     /// of `N` bytes, a value longer than the place leaves being one cut
     /// short, into a device that holds nothing or one that holds every
-    /// field.
-    fn name_at_place_one_records<const N: usize>(name: [u8; 4])
+    /// field; with `package`, a value that is a `Package` exactly when it
+    /// says.
+    fn name_at_place_one_records<const N: usize>(name: [u8; 4], package: Option<bool>)
     {
         let bytes: [u8; N] = kani::any();
+        if let Some(package) = package
+        {
+            kani::assume((bytes[1] == OP_PACKAGE) == package);
+        }
         if let Some(size) = ::aml::encoding::data_object_len(&bytes, 1)
         {
             let into = if kani::any()
@@ -1546,7 +1551,7 @@ mod proofs
     #[kani::unwind(9)]
     fn every_hid_records_as_its_id()
     {
-        name_at_place_one_records::<9>(*b"_HID");
+        name_at_place_one_records::<9>(*b"_HID", None);
     }
 
     /// Every `_UID` and `_STA`, and a `_ADR` the walk ignores, records its
@@ -1559,21 +1564,34 @@ mod proofs
     {
         match kani::any::<u8>() % 3
         {
-            0 => name_at_place_one_records::<9>(*b"_UID"),
-            1 => name_at_place_one_records::<9>(*b"_STA"),
-            _ => name_at_place_one_records::<9>(*b"_ADR"),
+            0 => name_at_place_one_records::<9>(*b"_UID", None),
+            1 => name_at_place_one_records::<9>(*b"_STA", None),
+            _ => name_at_place_one_records::<9>(*b"_ADR", None),
         }
     }
 
-    /// Every `_CID` records its value of any kind at place 1 of 9 bytes: 8
-    /// bytes hold one dword EISA ID or string ID, and a `Package` of two
-    /// one-character string IDs or of an ID and an element that is none. The
-    /// loops are a package's elements and a string's bytes.
+    /// Every `_CID` that is not a `Package` records its value of any kind at
+    /// place 1 of 9 bytes, as a `_HID` does: 8 bytes hold a dword EISA ID, a
+    /// string ID of up to 6 characters, and every integer form up to a dword.
+    /// The loops are a string's bytes and an integer's.
     #[kani::proof]
     #[kani::unwind(9)]
-    fn every_cid_records_as_its_ids()
+    fn every_cid_records_as_its_id()
     {
-        name_at_place_one_records::<9>(*b"_CID");
+        name_at_place_one_records::<9>(*b"_CID", Some(false));
+    }
+
+    /// Every `_CID` that is a `Package` records the IDs among its elements at
+    /// place 1 of 8 bytes: 7 bytes hold the package's opcode, length and
+    /// count and 4 bytes of elements, so a one-character string ID before or
+    /// after an element that is none, two elements that are none, a count
+    /// past the elements, and a package cut short. The loops are the
+    /// package's elements and a string's bytes.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn every_cid_package_records_as_its_ids()
+    {
+        name_at_place_one_records::<8>(*b"_CID", Some(true));
     }
 
     /// Every `_CRS` records its value of any kind at place 1 of 9 bytes: 8
@@ -1583,12 +1601,14 @@ mod proofs
     #[kani::unwind(9)]
     fn every_crs_records_as_its_list()
     {
-        name_at_place_one_records::<9>(*b"_CRS");
+        name_at_place_one_records::<9>(*b"_CRS", None);
     }
 
     /// Every `Method` of any name is taken into a device that holds nothing
-    /// or every field by its name alone. No loop.
+    /// or every field by its name alone. The loops are the `_CID` slots and
+    /// the identifiers' bytes.
     #[kani::proof]
+    #[kani::unwind(8)]
     fn every_method_is_taken_by_its_name()
     {
         let into = if kani::any()

@@ -10,8 +10,10 @@
 //! whole of it: the RSDP's 36 bytes, an SDT header, a table by the length its
 //! header reports, the device tree by its header's `totalsize`. A length is the
 //! table's own and therefore hostile; the memory map is the bound on it, so a
-//! corrupt length cannot reach device memory, a hole in the physical address
-//! space or free memory (`core/boot/docs/firmware-parsing.md` § Table Bounds).
+//! corrupt length cannot reach memory the map types as device memory, a hole
+//! in the physical address space or free memory. Reserved memory is accepted,
+//! and may hold device registers the map does not type as such
+//! (`core/boot/docs/firmware-parsing.md` § Table Bounds).
 
 /// The bytes of an `EFI_MEMORY_DESCRIPTOR` this check reads: `Type` (u32) at 0,
 /// `PhysicalStart` (u64) at 8, `VirtualStart` (u64) at 16, `NumberOfPages`

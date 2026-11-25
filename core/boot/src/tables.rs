@@ -9,7 +9,9 @@
 //! to the bytes there: it makes a slice only once the UEFI memory map gives
 //! every byte of it to firmware data (`boot_firmware::region::firmware_range`),
 //! so a length the firmware wrote, which is hostile input, cannot extend a
-//! slice into memory-mapped I/O, a hole or free memory. The walks here, from
+//! slice into memory the map types as memory-mapped I/O, a hole or free
+//! memory (reserved memory is accepted, for the reason the document below
+//! gives). The walks here, from
 //! the RSDP to each ACPI table and from the device tree's header to its whole
 //! blob, view each table that way; `boot_firmware` decodes the slices
 //! (`core/boot/docs/firmware-parsing.md` § Table Bounds).

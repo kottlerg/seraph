@@ -47,8 +47,8 @@ use ipc::{memmgr_errors, procmgr_errors};
 use syscall_abi::PAGE_SIZE;
 
 use super::swap::{
-    CHUNK_LEN, CHUNK_PAGES, Fill, Fixture, HOG_TICK, Hog, MAIN_XOR, Ready, attach, baseline_totals,
-    detach, main_pages, make_resident, page_present, pool, settle_resident, start_fixture,
+    CHUNK_LEN, CHUNK_PAGES, Fill, Fixture, HOG_TICK, Hog, MAIN_XOR, Ready, attach, detach,
+    main_pages, make_resident, page_present, phase_baseline, pool, settle_resident, start_fixture,
 };
 use super::swap_client::{
     Buffer, Slots, await_normal, disk_and_free, done, isolate, restore, stored, take,
@@ -266,7 +266,7 @@ fn swap_raw_phase(caps: &Caps)
 
     let mut hog = Hog::new();
     let _ = settle_resident(authority, PHASE, None);
-    let baseline = baseline_totals(authority, PHASE);
+    let baseline = phase_baseline(PHASE);
     let reserve = pool().reserve_pages();
     let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Noise);
     let threads = attach(authority, process, "the fixture");
@@ -410,13 +410,12 @@ fn swap_raw_phase(caps: &Caps)
     let status = fixture.exit_status();
     assert!(status.success(), "{PHASE}: the fixture exited {status:?}");
     buf.release();
-    let slot_map_pages = free0.div_ceil(free_pool::disk::SLOT_WORDS_PER_PAGE);
-    let floor = baseline.less(slot_map_pages.saturating_mul(PAGE_SIZE));
-    let end = settle_resident(authority, PHASE, Some(&floor));
+    let end = settle_resident(authority, PHASE, Some(&baseline));
     std::os::seraph::log!(
         "memmgr_swap_raw phase passed ({raw_count} chunks raw, one written and restored, one \
-         cancelled in flight, {written} written by swapd and faulted back, free, deferred and svctest's own {} pages above the start less the \
-         {slot_map_pages} slot-map pages)",
-        end.saturating_sub(floor.totals) / PAGE_SIZE
+         cancelled in flight, {written} written by swapd and faulted back, {} pages in no \
+         account against {} at the start)",
+        end / PAGE_SIZE,
+        baseline.unaccounted / PAGE_SIZE
     );
 }

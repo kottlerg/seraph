@@ -41,11 +41,13 @@
 //!   chunk and frees its slot, leaving no chunk on disk and every slot free;
 //! * the fixture's read of a page of the lost chunk declined by memmgr, and
 //!   the fixture killed;
-//! * and once the fixture is gone, the end of `memmgr_swap`: the store and
-//!   the swapped total empty, the identity holding, and memmgr's free and
-//!   deferred pages with svctest's own charged pages at least what they were
-//!   at the start, less the pages of the swap slot map, which memmgr keeps as
-//!   its metadata once swapd registered every slot.
+//! * the release of the buffer the swap labels moved to memmgr and back
+//!   lowering svctest's own charge by exactly the buffer's pages: the swap
+//!   path left no page of it charged to svctest twice;
+//! * and once the fixture is gone, the end of `memmgr_swap`
+//!   ([`settle_resident`]): the store and the swapped total empty, the
+//!   identity holding, the pool's pages in no account not above the start,
+//!   and the charge below svctest's node back to it.
 
 use std::collections::HashMap;
 use std::os::seraph::{current_ipc_buf, startup_info};
@@ -55,8 +57,8 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use syscall_abi::{MAP_READ, MAP_WRITABLE, PAGE_SIZE};
 
 use super::swap::{
-    CHUNK_LEN, CHUNK_PAGES, Fill, HOG_TICK, Hog, Ready, attach, await_swapped, baseline_totals,
-    detach, listed_badges, main_pages, make_resident, page_present, pool, settle_resident,
+    CHUNK_LEN, CHUNK_PAGES, Fill, HOG_TICK, Hog, Ready, attach, await_swapped, detach,
+    listed_badges, main_pages, make_resident, page_present, phase_baseline, pool, settle_resident,
     start_fixture,
 };
 use crate::bootstrap::Caps;
@@ -159,6 +161,30 @@ impl Buffer
         let _ = unsafe { syscall::mem_unmap(startup_info().self_aspace, self.va, BUF_PAGES) };
         crate::phases::memmgr::release_grant(self.cap, self.region_id);
     }
+}
+
+/// Release `buf` ([`Buffer::release`]) and require svctest's own charge to
+/// fall by exactly its [`BUF_PAGES`]: its grant, which the swap labels moved
+/// to memmgr and back, is charged to svctest once and leaves with the
+/// release. The two reads bracket the release alone, and no swap phase runs
+/// beside another ([`crate::phases::CONCURRENT`]), so nothing else of
+/// svctest's is charged or released between them.
+fn release_buffer(buf: Buffer)
+{
+    let usage = || {
+        crate::phases::budget::memory_usage()
+            .unwrap_or_else(|| panic!("{PHASE}: QUERY_MEMORY_USAGE of svctest's own node failed"))
+            .0
+    };
+    let before = usage();
+    buf.release();
+    let after = usage();
+    assert_eq!(
+        before.saturating_sub(after),
+        BUF_PAGES,
+        "{PHASE}: the release of the swap buffer lowered svctest's own charge from {before} to \
+         {after} pages, expected by its {BUF_PAGES} pages"
+    );
 }
 
 /// memmgr's reply to `msg` on the swap authority `swap`, panicking with
@@ -429,7 +455,7 @@ fn swap_client_phase(caps: &Caps)
 
     let mut hog = Hog::new();
     let _ = settle_resident(authority, PHASE, None);
-    let baseline = baseline_totals(authority, PHASE);
+    let baseline = phase_baseline(PHASE);
     let reserve = pool().reserve_pages();
     let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Page);
     let begun = pool().evictions;
@@ -592,15 +618,13 @@ fn swap_client_phase(caps: &Caps)
         "{PHASE}: the fixture survived its lost chunk ({status:?})"
     );
 
-    buf.release();
-    let slot_map_pages = free0.div_ceil(free_pool::disk::SLOT_WORDS_PER_PAGE);
-    let floor = baseline.less(slot_map_pages.saturating_mul(PAGE_SIZE));
-    let end = settle_resident(authority, PHASE, Some(&floor));
+    release_buffer(buf);
+    let end = settle_resident(authority, PHASE, Some(&baseline));
     std::os::seraph::log!(
         "memmgr_swap_client phase passed ({} bytes sealed, chi-square {chi}, t lost and its \
-         chunk's fault declined, free, deferred and svctest's own {} pages above the start less \
-         the {slot_map_pages} slot-map pages)",
+         chunk's fault declined, {} pages in no account against {} at the start)",
         sealed.len(),
-        end.saturating_sub(floor.totals) / PAGE_SIZE
+        end / PAGE_SIZE,
+        baseline.unaccounted / PAGE_SIZE
     );
 }

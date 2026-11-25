@@ -256,11 +256,22 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 /// * `data[19]` — `cspace_used_slots`: the used slots of memmgr's own
 ///   `CSpace`, a count, not bytes. memmgr funds its `CSpace` from its pool,
 ///   so a cap it kept by mistake raises this for good rather than wedge it.
+/// * `data[20]` — `metadata_bytes`: the pages memmgr holds as its own
+///   metadata, charged to no node: its arena's, its process index's and its
+///   swap slot map's pages, the zero frames it keeps, and the pages it
+///   retyped into its own page tables, `CSpace` growth and eviction worker.
+/// * `data[21]` — `held_bytes`: the pages the frame records of processes
+///   and memory objects hold, each charged to a budget node; a run on the
+///   deferred list or in the store is not counted.
+///
+/// The pages in no account are `data[2]` less `data[3]`, `data[4]`,
+/// `data[9]`, `data[20]` and `data[21]`. memmgr keeps each page it owns
+/// in one of those five accounts, so they rise only when memmgr loses a page.
 ///
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
 /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-/// "dark" memory. `data[3]` to `data[19]` are appended fields — readers
+/// "dark" memory. `data[3]` to `data[21]` are appended fields — readers
 /// needing only the identity may ignore them.
 pub const QUERY_POOL_STATUS: u64 = 6;
 /// Register a demand-paged anonymous region for the calling process.

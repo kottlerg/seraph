@@ -278,6 +278,20 @@ impl SlotStore for MappedSlots
             unsafe { core::ptr::write(va as *mut Slot, slot) };
         }
     }
+
+    unsafe fn replace(&mut self, idx: NodeIdx, slot: Slot) -> Slot
+    {
+        let Some(va) = self.layout.slot_va(idx)
+        else
+        {
+            return Slot {
+                node: Node::Free,
+                next: NODE_NULL,
+            };
+        };
+        // SAFETY: as in `read`.
+        unsafe { core::ptr::replace(va as *mut Slot, slot) }
+    }
 }
 
 /// Word storage mapped from `base`: the process index's bucket heads from
@@ -793,6 +807,7 @@ fn fund_self_page_tables(l: &mut MemLedger) -> bool
     let (outer, pages, phys) = grant.entries[0];
     if syscall::cap_create_aspace(outer, self_aspace(), u64::from(pages)).is_ok()
     {
+        l.add_own_pages(u64::from(pages));
         let _ = syscall::cap_delete(outer);
         return true;
     }
@@ -2055,9 +2070,10 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 /// pages, the growth floor, the pages on disk, the free swap slots, the
 /// evictions begun, the overcommit allowance, the draw room, the free pages
 /// outside `promised`, the part of `promised` the evicted chunks of
-/// committed regions hold, and the used slots of memmgr's own `CSpace`, a
-/// count, which a cap memmgr kept by mistake raises for good
-/// (services/memmgr/docs/ipc-interface.md § Label 6).
+/// committed regions hold, the used slots of memmgr's own `CSpace`, a
+/// count, which a cap memmgr kept by mistake raises for good, memmgr's
+/// metadata pages and the pages the frame records hold, one snapshot so the
+/// pool's accounts sum (services/memmgr/docs/ipc-interface.md § Label 6).
 /// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
 /// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
 /// the subset currently in free runs (lent to no process), which falls on
@@ -2096,6 +2112,8 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
         l.uncommitted_free().saturating_mul(PAGE_SIZE),
         l.committed_swapped().saturating_mul(PAGE_SIZE),
         syscall::cap_info(boot.self_cspace, syscall_abi::CAP_INFO_CSPACE_USED).unwrap_or(0),
+        l.metadata_pages().saturating_mul(PAGE_SIZE),
+        l.held_pages().saturating_mul(PAGE_SIZE),
     ];
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .words(0, &words)
@@ -4985,6 +5003,7 @@ fn hold_cspace_headroom(self_cspace: u64)
     let (outer, pages, phys) = grant.entries[0];
     if syscall::cap_create_cspace(outer, self_cspace, u64::from(pages)).is_ok()
     {
+        l.add_own_pages(u64::from(pages));
         // The donation holds its own reference on the frame's Memory object;
         // the outer cap's slot is returned.
         let _ = syscall::cap_delete(outer);

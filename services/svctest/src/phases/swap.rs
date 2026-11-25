@@ -53,10 +53,22 @@
 //!
 //! After the hog's grants are released and the child has exited, the phase
 //! makes every process resident, and requires the store and the swapped total
-//! to be empty, the all-RAM-accounted identity to hold, and memmgr's free and
-//! deferred pages, with those charged to svctest itself, to total at least
-//! what they did at the start: the pages the hog's `CSpace` top-ups take stay
-//! svctest's.
+//! to be empty, the all-RAM-accounted identity to hold, the pool's pages in no
+//! account of memmgr's (`QUERY_POOL_STATUS`: its total less the free,
+//! deferred, store, metadata and held pages) not above the start, and the
+//! pages charged below svctest's own node, which the fixture's node is, back
+//! to the start ([`settle_resident`]). A page memmgr lost on any path stays
+//! in no account; the fixture's node holds no page once it is released. Pages
+//! the phase's work leaves in an account for good, memmgr's metadata and
+//! procmgr's capture heap among them, move nothing the settle compares, at any
+//! RAM size and whatever oomd stops and svcmgr restarts during the phase.
+//!
+//! What the settle cannot see: a page memmgr leaves charged to a live process
+//! it should have left, svctest itself or a process outside svctest's subtree,
+//! stays in an account. svctest's own charge is not compared, since its heap,
+//! its `CSpace` top-ups for the hog's caps, its page tables and its kernel
+//! objects grow during the phase through the runtime, which counts none of
+//! them.
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
@@ -178,8 +190,9 @@ const HOG_CSPACE_LOW_WATER: u64 = 64;
 const HOG_CSPACE_TOPUP_SLOTS: u64 = 1024;
 /// The hold of svctest's `CSpace` above [`HOG_CSPACE_LOW_WATER`] general
 /// slots (runtime/ruststd/README.md § `CSpace` slot headroom): the hog's caps
-/// outgrow the slots procmgr seeded. Its top-ups stay with the `CSpace`, so
-/// the pages they take are svctest's own when the phase ends ([`phase_totals`]).
+/// outgrow the slots procmgr seeded. Its top-ups stay with the `CSpace`,
+/// charged to svctest's own node, which the settle does not compare
+/// ([`settle_resident`]).
 static HOG_HEADROOM: std::os::seraph::CSpaceHeadroom =
     std::os::seraph::CSpaceHeadroom::new(HOG_CSPACE_LOW_WATER, HOG_CSPACE_TOPUP_SLOTS);
 /// Caps one grant's reply carries at most: one message's worth, the size of
@@ -217,19 +230,16 @@ const LINE_BOUND: Duration = Duration::from_secs(120);
 /// How long the phase waits for the fixture to exit. A test wait bound.
 const EXIT_BOUND: Duration = Duration::from_secs(30);
 /// How long the phase waits, after it made everything resident, for memmgr's
-/// store to empty and its totals to return to their baseline. A test wait
+/// store to empty and its accounts to return to their baseline. A test wait
 /// bound.
 const SETTLE_BOUND: Duration = Duration::from_secs(30);
 /// How often the final wait looks again.
 const SETTLE_POLL: Duration = Duration::from_millis(50);
-/// How long the phase's totals and the processes `LIST_PROCESSES` lists must
-/// hold unchanged before the phase takes its baseline: twice the one-second
-/// retry with which svcmgr restarts a service oomd stopped in an earlier
-/// phase, once memory allows (`MEMORY_RETRY_MS` in
-/// services/svcmgr/svc-defs/src/memory_wait.rs). A process started after the
-/// baseline takes free pages the settle then misses.
+/// How long the pages in no account and the charge below svctest's node must
+/// hold unchanged before the phase takes its baseline: a child an earlier
+/// phase started may still be releasing its pages.
 const BASELINE_QUIET: Duration = Duration::from_secs(2);
-/// How long the phase waits for its totals and the processes to hold for
+/// How long the phase waits for its baseline to hold for
 /// [`BASELINE_QUIET`]. A test wait bound.
 const BASELINE_BOUND: Duration = Duration::from_secs(60);
 /// Times the phase asks for a chunk to be made resident and reads its page
@@ -289,6 +299,10 @@ pub(super) struct Pool
     uncommitted: u64,
     /// `data[18]`: pages of evicted chunks of committed regions.
     committed_swapped: u64,
+    /// `data[20]`: memmgr's metadata pages.
+    metadata: u64,
+    /// `data[21]`: the pages memmgr's frame records hold.
+    held: u64,
 }
 
 impl Pool
@@ -297,6 +311,20 @@ impl Pool
     fn identity(&self) -> bool
     {
         self.system_ram == self.kernel_reserved.saturating_add(self.total)
+    }
+
+    /// The pool's pages in no account of memmgr's, in bytes: its total less
+    /// the free, deferred, store, metadata and held pages
+    /// (services/memmgr/docs/ipc-interface.md § Label 6). `None` when the
+    /// accounts sum above the total, which counts a page twice.
+    fn unaccounted(&self) -> Option<u64>
+    {
+        self.total
+            .checked_sub(self.free)?
+            .checked_sub(self.deferred)?
+            .checked_sub(self.store)?
+            .checked_sub(self.metadata)?
+            .checked_sub(self.held)
     }
 
     /// The pages free outside what the committed regions can still take, the
@@ -404,6 +432,8 @@ pub(super) fn pool() -> Pool
         allowance: reply.word(15),
         uncommitted: reply.word(17),
         committed_swapped: reply.word(18),
+        metadata: reply.word(20),
+        held: reply.word(21),
     }
 }
 
@@ -1230,7 +1260,7 @@ fn swap_phase(caps: &Caps)
     // chunks of any process: make them resident first, so the store starts
     // empty.
     let _ = settle_resident(authority, PHASE, None);
-    let baseline = baseline_totals(authority, PHASE);
+    let baseline = phase_baseline(PHASE);
     let status = pool();
     let reserve = status.reserve_pages();
     // A restore from the headroom of at most the reserve takes nearly a chunk
@@ -1295,12 +1325,13 @@ fn swap_phase(caps: &Caps)
     let peaks = &hog.peaks;
     std::os::seraph::log!(
         "memmgr_swap phase passed (store peak {} pages, swapped peak {} pages, hogged {} pages, \
-         {from_headroom} chunks restored from the headroom at CRITICAL, free, deferred and \
-         svctest's own {} pages above the start)",
+         {from_headroom} chunks restored from the headroom at CRITICAL, {} pages in no account \
+         against {} at the start)",
         peaks.store,
         peaks.swapped,
         peaks.hogged,
-        end.saturating_sub(baseline.totals) / PAGE_SIZE
+        end / PAGE_SIZE,
+        baseline.unaccounted / PAGE_SIZE
     );
 }
 
@@ -1341,61 +1372,49 @@ fn require_swap_room(status: &Pool, want: u64)
     );
 }
 
-/// What a phase's final settle compares against ([`settle_resident`]).
+/// What a phase's final settle compares against ([`settle_resident`]), in
+/// bytes.
 pub(super) struct Baseline
 {
-    /// The phase's totals ([`phase_totals`]) at the start, in bytes.
-    pub(super) totals: u64,
-    /// The processes `LIST_PROCESSES` listed at the start.
-    badges: Vec<u64>,
+    /// The pool's pages in no account at the start ([`Pool::unaccounted`]).
+    pub(super) unaccounted: u64,
+    /// The pages charged below svctest's own node at the start
+    /// ([`children_charge`]).
+    children: u64,
 }
 
-impl Baseline
-{
-    /// This baseline less `bytes` of totals: what the settle must reach once
-    /// memmgr keeps `bytes` of the phase's pages for good.
-    pub(super) fn less(&self, bytes: u64) -> Self
-    {
-        Self {
-            totals: self.totals.saturating_sub(bytes),
-            badges: self.badges.clone(),
-        }
-    }
-}
-
-/// The phase's baseline, once the totals ([`phase_totals`]) and the processes
-/// `LIST_PROCESSES` lists (through the debug authority `authority`) held
-/// unchanged for [`BASELINE_QUIET`]: a process an earlier phase's pressure
-/// had stopped is replaced by then, not during the phase. At each read the
+/// The phase's baseline, once the pool's pages in no account and the charge
+/// below svctest's node held unchanged for [`BASELINE_QUIET`]. At each read the
 /// identity holds, the store and the swapped total are empty, and memmgr's
 /// deferred list has settled.
-pub(super) fn baseline_totals(authority: u64, phase: &str) -> Baseline
+pub(super) fn phase_baseline(phase: &str) -> Baseline
 {
     let start = Instant::now();
-    let mut last = baseline_read(authority, phase);
+    let mut last = baseline_read(phase);
     loop
     {
         std::thread::sleep(BASELINE_QUIET);
-        let now = baseline_read(authority, phase);
-        if now.totals == last.totals && now.badges == last.badges
+        let now = baseline_read(phase);
+        if now.unaccounted == last.unaccounted && now.children == last.children
         {
             return now;
         }
         assert!(
             start.elapsed() < BASELINE_BOUND,
-            "{phase}: baseline: the totals ({} then {} bytes) or the {} then {} processes listed \
-             changed in every {BASELINE_QUIET:?} for {BASELINE_BOUND:?}",
-            last.totals,
-            now.totals,
-            last.badges.len(),
-            now.badges.len()
+            "{phase}: baseline: the pages in no account ({} then {} bytes) or the charge below \
+             svctest's node ({} then {} bytes) changed in every {BASELINE_QUIET:?} for \
+             {BASELINE_BOUND:?}",
+            last.unaccounted,
+            now.unaccounted,
+            last.children,
+            now.children
         );
         last = now;
     }
 }
 
-/// One read of [`baseline_totals`].
-fn baseline_read(authority: u64, phase: &str) -> Baseline
+/// One read of [`phase_baseline`].
+fn baseline_read(phase: &str) -> Baseline
 {
     let _ = crate::phases::memmgr::settled_deferred_bytes();
     let base = pool();
@@ -1412,24 +1431,29 @@ fn baseline_read(authority: u64, phase: &str) -> Baseline
         base.store,
         base.swapped
     );
+    let unaccounted = base.unaccounted().unwrap_or_else(|| {
+        panic!(
+            "{phase}: baseline: free {} + deferred {} + store {} + metadata {} + held {} bytes \
+             above pool_total {}",
+            base.free, base.deferred, base.store, base.metadata, base.held, base.total
+        )
+    });
     Baseline {
-        totals: phase_totals(&base, phase),
-        badges: listed_badges(authority),
+        unaccounted,
+        children: children_charge(phase),
     }
 }
 
-/// memmgr's free and deferred bytes with the bytes charged to svctest's own
-/// node: what the phase's pages total once they are all back. The pages the
-/// hog's `CSpace` top-ups take stay with svctest's `CSpace`
-/// ([`HOG_HEADROOM`]) and charged to svctest, so they count as back.
-fn phase_totals(status: &Pool, phase: &str) -> u64
+/// The bytes charged to the nodes below svctest's own: its subtree's charge
+/// less its own (`QUERY_MEMORY_USAGE` `data[2]` and `data[0]`). Every child
+/// svctest starts is charged there (services/memmgr/docs/ipc-interface.md
+/// § Label 3), so the charge returns to its level once each child's node is
+/// released.
+fn children_charge(phase: &str) -> u64
 {
-    let (charged, _) = own_usage()
+    let (own, _, subtree) = crate::phases::budget::memory_usage()
         .unwrap_or_else(|| panic!("{phase}: QUERY_MEMORY_USAGE of svctest's own node failed"));
-    status
-        .free
-        .saturating_add(status.deferred)
-        .saturating_add(charged.saturating_mul(PAGE_SIZE))
+    subtree.saturating_sub(own).saturating_mul(PAGE_SIZE)
 }
 
 /// The pages of the fixture's main region for a system reserve of `reserve`
@@ -1755,11 +1779,11 @@ fn require_no_evict(thread: u64, ready: &Ready)
 
 /// Make every listed process resident, then wait until memmgr's store and
 /// swapped total are empty, the identity holds and, given a `baseline`, the
-/// phase's totals ([`phase_totals`]) reach at least the baseline's: the
-/// phase's pages are all back, while another process may have returned pages
-/// of its own meanwhile. A settle that runs out of time names the processes
-/// listed then that the baseline did not hold, whose pages the totals miss.
-/// `phase` names the phase in a panic. Returns the phase's totals then.
+/// pool's pages in no account ([`Pool::unaccounted`]) are not above the
+/// baseline's and the charge below svctest's node ([`children_charge`]) is
+/// back to it: no page the phase moved is lost, and the children it started
+/// hold none. `phase` names the phase in a panic. Returns the pages in no
+/// account then, in bytes.
 pub(super) fn settle_resident(authority: u64, phase: &str, baseline: Option<&Baseline>) -> u64
 {
     let top = syscall::user_va_top()
@@ -1777,51 +1801,41 @@ pub(super) fn settle_resident(authority: u64, phase: &str, baseline: Option<&Bas
     {
         crate::phases::memmgr::recheck_deferred();
         let status = pool();
-        let totals = phase_totals(&status, phase);
+        let unaccounted = status.unaccounted();
+        let children = children_charge(phase);
         if status.identity()
             && status.store == 0
             && status.swapped == 0
-            && baseline.is_none_or(|b| totals >= b.totals)
+            && let Some(unaccounted) = unaccounted
+            && baseline.is_none_or(|b| unaccounted <= b.unaccounted && children <= b.children)
         {
-            return totals;
+            return unaccounted;
         }
         if start.elapsed() >= SETTLE_BOUND
         {
-            let (expected, new) = baseline.map_or((None, String::new()), |b| {
-                (Some(b.totals), new_processes(authority, &b.badges))
-            });
+            let expected = baseline.map_or_else(
+                || String::from("no baseline"),
+                |b| format!("{} and {} bytes", b.unaccounted, b.children),
+            );
             panic!(
                 "{phase}: {SETTLE_BOUND:?} after everything was made resident: identity {} (ram \
-                 {} reserved {} total {}), store {} bytes, swapped {} bytes, free + deferred + \
-                 svctest's own {totals} bytes against {expected:?} at the start; processes \
-                 listed since the start: [{new}]",
+                 {} reserved {} total {}), store {} bytes, swapped {} bytes, bytes in no account \
+                 {unaccounted:?} (free {} deferred {} metadata {} held {}) and charged below \
+                 svctest's node {children}, against {expected} at the start",
                 status.identity(),
                 status.system_ram,
                 status.kernel_reserved,
                 status.total,
                 status.store,
-                status.swapped
+                status.swapped,
+                status.free,
+                status.deferred,
+                status.metadata,
+                status.held
             );
         }
         std::thread::sleep(SETTLE_POLL);
     }
-}
-
-/// The processes `LIST_PROCESSES` lists, through the debug authority
-/// `authority`, that `before` does not hold: each badge and name,
-/// comma-separated.
-fn new_processes(authority: u64, before: &[u64]) -> String
-{
-    let new = RefCell::new(Vec::new());
-    let _ = super::crash::find_listed(authority, |badge, name| {
-        if !before.contains(&badge)
-        {
-            new.borrow_mut()
-                .push(format!("{badge:#x} {}", String::from_utf8_lossy(name)));
-        }
-        false
-    });
-    new.into_inner().join(", ")
 }
 
 // ── The fixture child ────────────────────────────────────────────────────────

@@ -149,7 +149,10 @@ services/svctest/
         │                      #   held `LOW` level and restores them: debugger reads and
         │                      #   `MAKE_RESIDENT`; at `CRITICAL`, restores from the restore
         │                      #   headroom and by direct reclaim; a no-evict region, logd's
-        │                      #   reserve stack; all-RAM-accounted identity
+        │                      #   reserve stack; all-RAM-accounted identity; each swap phase
+        │                      #   ends with no page in no account past its start and the
+        │                      #   charge below svctest's node back to its start, not judging
+        │                      #   svctest's own charge or a process outside that subtree
         ├── swap_client.rs     # memmgr's disk tier with svctest as a second swap client beside
         │                      #   swapd, over a RAM slot store, registering nothing: take, done,
         │                      #   stale restores, a restore ahead, `ipc::make_resident` of a

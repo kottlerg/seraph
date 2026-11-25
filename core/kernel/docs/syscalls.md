@@ -3765,10 +3765,12 @@ pub enum SystemInfoType
     /// secret. On riscv64 every hart is its own core.
     SmtSibling          = 14,
 
-    /// Number of times the idle thread of the CPU the call runs on has halted
-    /// that CPU since boot: one per stretch in which the CPU found no thread
-    /// to run, and one more for each interrupt that ends a halt and leaves it
-    /// with none. Counted before the halt, so a thread the ending interrupt
+    /// The halts of the idle thread of the CPU the call runs on, counted from
+    /// a random start below 2^62 that is arbitrary per boot and per CPU: one
+    /// per stretch in which the CPU found no thread to run, and one more for
+    /// each interrupt that ends a halt and leaves it with none. Only the
+    /// difference of two reads on one CPU means anything; the absolute says
+    /// nothing. Counted before the halt, so a thread the ending interrupt
     /// wakes reads it. Takes no argument and answers for no other CPU. A
     /// diagnostic count, readable by any process with no capability; a
     /// benchmark pinned to one CPU reads it before and after its measured

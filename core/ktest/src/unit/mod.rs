@@ -1021,6 +1021,10 @@ pub fn run_all(ctx: &TestContext)
         "sysinfo::idle_halts_rise_across_a_sleep",
         sysinfo::idle_halts_rise_across_a_sleep(ctx)
     );
+    run_test!(
+        "sysinfo::idle_halts_start_apart_per_cpu",
+        sysinfo::idle_halts_start_apart_per_cpu(ctx)
+    );
 
     // ── Entropy syscalls ──────────────────────────────────────────────────────
     run_test!(

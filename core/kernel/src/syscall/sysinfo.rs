@@ -149,8 +149,9 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         }
         15 =>
         // IdleHalts — the halts of the idle thread of the CPU this syscall
-        // runs on (`sched::idle_halts`): an activity figure of the caller's
-        // own CPU, takes no argument, and indexes nothing the caller chooses
+        // runs on, from a random start (`sched::idle_halts`): only a
+        // difference of two reads on one CPU means anything. Takes no
+        // argument and indexes nothing the caller chooses
         // (core/kernel/docs/cross-boundary-disclosure.md).
         {
             Ok(crate::sched::idle_halts())

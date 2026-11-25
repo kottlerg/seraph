@@ -532,13 +532,14 @@ pub(crate) struct CpuDiag
     /// names the last syscall entered on a stalled CPU, which need not be the
     /// one it is executing, without reading another CPU's TCB or frame.
     syscall_nr: core::sync::atomic::AtomicU64,
-    /// The times this CPU's idle thread has halted it since boot, one per
-    /// halt of the idle loop ([`note_idle_halt`]): one per stretch in which
-    /// the CPU found no thread to run, and one more for each interrupt that
-    /// ends a halt and leaves it with none. Written by the idle thread only,
-    /// a Relaxed load and store; read by a syscall on this CPU only
-    /// (`SYS_SYSTEM_INFO`'s `IdleHalts`, [`idle_halts`]), never by another
-    /// CPU.
+    /// The halts of this CPU's idle thread, counted from a random start
+    /// ([`start_idle_halt_counts`]), one per halt of the idle loop
+    /// ([`note_idle_halt`]): one per stretch in which the CPU found no thread
+    /// to run, and one more for each interrupt that ends a halt and leaves it
+    /// with none. Only the difference of two reads means anything. Written by
+    /// the idle thread only, a Relaxed load and store, after its start;
+    /// read by a syscall on this CPU only (`SYS_SYSTEM_INFO`'s `IdleHalts`,
+    /// [`idle_halts`]), never by another CPU.
     idle_halts: core::sync::atomic::AtomicU64,
 }
 
@@ -793,7 +794,8 @@ fn note_idle_halt()
 }
 
 /// The idle-halt count of the CPU this runs on ([`CpuDiag::idle_halts`]),
-/// for `SYS_SYSTEM_INFO`'s `IdleHalts`.
+/// for `SYS_SYSTEM_INFO`'s `IdleHalts`: its random start plus its halts, so
+/// that only the difference of two reads on one CPU means anything.
 ///
 /// The CPU is the one the caller's syscall entered on: syscall context is not
 /// preemptible and runs with interrupts masked here
@@ -806,6 +808,47 @@ pub fn idle_halts() -> u64
     this_cpu_diag()
         .idle_halts
         .load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The bits of a CPU's random idle-halt start ([`start_idle_halt_counts`]):
+/// a start below 2^62 plus every count a machine reaches (one per halt, so
+/// fewer than 2^62 in any lifetime) stays below 2^63, past which a
+/// `SYS_SYSTEM_INFO` return value reads as an error code.
+#[cfg(not(test))]
+const IDLE_HALT_START_MASK: u64 = (1 << 62) - 1;
+
+/// Start every CPU's idle-halt count ([`CpuDiag::idle_halts`]) at its own
+/// random value below 2^62, so that the count's absolute, which would give
+/// the CPU's idle history since boot, is arbitrary per boot and per CPU, and
+/// only the difference of two reads on one CPU says anything
+/// (core/kernel/docs/cross-boundary-disclosure.md, the `IdleHalts` row).
+///
+/// Each start is one output of the boot CPU's forward-secure generator
+/// (`entropy::fill_bytes`), the kind of output `SYS_GETRANDOM` gives any
+/// process, so it reveals nothing of the pool or of the generator's state.
+///
+/// Called from [`init`] (Phase 8) on the boot CPU: after Phase 5 seeded the
+/// pool (`entropy::init`), and before any AP starts or any idle thread runs,
+/// so no halt is counted before its start, nothing else writes a record, and
+/// an AP reads its start through the same start handshake that orders the
+/// idle TCB writes of [`init`] before it.
+#[cfg(not(test))]
+fn start_idle_halt_counts(cpu_count: usize)
+{
+    for cpu in 0..cpu_count
+    {
+        let Some(diag) = cpu_diag(cpu)
+        else
+        {
+            continue;
+        };
+        let mut draw = [0u8; 8];
+        crate::entropy::fill_bytes(&mut draw);
+        diag.idle_halts.store(
+            u64::from_le_bytes(draw) & IDLE_HALT_START_MASK,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 /// Record that the current CPU is spinning for the lock of kind `kind` whose
@@ -2839,11 +2882,15 @@ fn idle_saved_state(cpu: usize, stack_top: u64) -> crate::arch::current::context
 ///    [`idle_thread_entry`].
 /// 2. Registers the TCB as both `idle` and `current` in the CPU's scheduler.
 ///
+/// Before the TCBs, it starts each CPU's idle-halt count at a random value
+/// ([`start_idle_halt_counts`]).
+///
 /// Returns `cpu_count` (for use in the Phase 8 startup log message).
 ///
 /// # Safety
 /// Must be called exactly once, from the single boot thread, after Phase 3
-/// (page tables active) and Phase 4 (per-CPU storage and idle stacks allocated),
+/// (page tables active), Phase 4 (per-CPU storage and idle stacks allocated)
+/// and Phase 5's seeding of the entropy pool (`entropy::init`),
 /// with the `cpu_count` [`init_storage`] sized the slabs for (`CPU_COUNT`): the
 /// body writes one idle TCB and scheduler entry per CPU into those slabs without
 /// a bounds check, and a second call would overwrite live idle TCBs.
@@ -2855,6 +2902,8 @@ pub unsafe fn init(cpu_count: u32) -> u32
         cpu_count,
         "sched::init: storage was not pre-initialised for this cpu_count"
     );
+
+    start_idle_halt_counts(cpu_count as usize);
 
     for cpu in 0..cpu_count as usize
     {
@@ -3186,9 +3235,10 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
         alloc_per_cpu_slab::<core::sync::atomic::AtomicU64>(LAST_NON_IDLE_TICK_SLAB, n, allocator);
     LAST_NON_IDLE_TICK_PTR.store(tick_ptr, core::sync::atomic::Ordering::Release);
 
-    // Per-CPU diagnostic records. Zero is every field's idle value, the
-    // idle-halt count's included, except the last-syscall stamp, whose "none
-    // yet" is `u64::MAX`.
+    // Per-CPU diagnostic records. Zero is every field's idle value, except the
+    // last-syscall stamp, whose "none yet" is `u64::MAX`, and the idle-halt
+    // count, which `init` starts at a random value once the entropy pool is
+    // seeded (Phase 8, `start_idle_halt_counts`).
     let diag_ptr = alloc_per_cpu_slab::<CpuDiag>(CPU_DIAG_SLAB, n, allocator);
     for cpu in 0..n
     {

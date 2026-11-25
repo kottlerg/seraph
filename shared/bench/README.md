@@ -113,7 +113,8 @@ therefore reads the idle-halt count of the CPU it measures on (`SYS_SYSTEM_INFO(
 `syscall::idle_halts`, which answers for the calling CPU alone) right before a measured loop and
 right after it, outside every timed window, with the thread pinned to that CPU across both reads,
 and reports the difference as the extra `idle_halts=` (`IDLE_HALTS`): the times the CPU found no
-thread to run while the loop ran.
+thread to run while the loop ran. The count starts at a random value, arbitrary per boot and per
+CPU, so only such a difference means anything.
 
 The span holds every timed window of the line and the untimed work of the loop between them (a
 warm-up iteration, a check, a step that readies the next sample). A count of zero says that no

@@ -1970,10 +1970,11 @@ pub fn smt_sibling(cpu: u64) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
-/// The times the idle thread of the CPU this call runs on has halted that CPU
-/// since boot (`SystemInfoType::IdleHalts`). Two reads compare only when the
-/// calling thread is pinned to one CPU between them: an unpinned thread may
-/// read two CPUs' counts.
+/// The halts of the idle thread of the CPU this call runs on, from a random
+/// start arbitrary per boot and per CPU (`SystemInfoType::IdleHalts`): only
+/// the difference of two reads means anything, taken with `wrapping_sub`, and
+/// only when the calling thread is pinned to one CPU between them, since an
+/// unpinned thread may read two CPUs' counts.
 ///
 /// # Errors
 /// Returns a negative `i64` error code from a kernel that predates the

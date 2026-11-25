@@ -13,8 +13,9 @@
 //! `integration::thread_memory` and `unit::retype`'s code stub. `SmtSibling` is
 //! read here for its range; `integration::smt_siblings` checks each ring against
 //! the core each CPU reports. `IdleHalts` is read here across a sleep of a
-//! thread pinned to CPU 0; the benchmark harnesses read it around their timed
-//! samples (shared/bench/README.md § Idle halts).
+//! thread pinned to CPU 0, and on two CPUs for their random starts; the
+//! benchmark harnesses read it around their timed samples
+//! (shared/bench/README.md § Idle halts).
 
 use syscall::{
     MAP_WRITABLE, cap_create_cspace, cap_create_thread, cap_delete, cap_info, idle_halts, mem_map,
@@ -487,6 +488,60 @@ pub fn idle_halts_rise_across_a_sleep(ctx: &TestContext) -> TestResult
     };
     let _ = thread_set_affinity(ctx.thread_cap, AFFINITY_ANY);
     outcome
+}
+
+/// Each CPU's `system_info(IdleHalts)` count starts at its own random value
+/// below 2^62: the counts of CPUs 0 and 1 differ above their low 32 bits,
+/// which no boot's halts reach. A shared or zero start would leave them
+/// equal there. Two independent random starts agree in those 30 bits with a
+/// chance of one in 2^30.
+///
+/// Defect caught: a start the kernel never applies, or one applied to a
+/// single CPU, which leaves each CPU's idle history since boot readable by
+/// any process (core/kernel/docs/cross-boundary-disclosure.md).
+pub fn idle_halts_start_apart_per_cpu(ctx: &TestContext) -> TestResult
+{
+    /// Yields that let the scheduler move the thread to its pinned CPU.
+    const MAX_YIELDS: u32 = 1000;
+    /// The affinity argument that clears a thread's hard affinity.
+    const AFFINITY_ANY: u32 = u32::MAX;
+    /// The low bits a boot's halts can change.
+    const COUNT_BITS: u32 = 32;
+
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "sysinfo::idle_halts_start: system_info(CpuCount) failed")?;
+    if cpus < 2
+    {
+        crate::log("ktest: sysinfo::idle_halts_start_apart_per_cpu SKIP (needs 2 CPUs)");
+        return Ok(());
+    }
+    // The count of `cpu`, read by this thread pinned there and running there.
+    let read_on = |cpu: u32| -> Result<u64, &'static str> {
+        thread_set_affinity(ctx.thread_cap, cpu)
+            .map_err(|_| "sysinfo::idle_halts_start: pin failed")?;
+        let on_cpu = || system_info(SystemInfoType::CurrentCpu as u64) == Ok(u64::from(cpu));
+        for _ in 0..MAX_YIELDS
+        {
+            if on_cpu()
+            {
+                break;
+            }
+            let _ = thread_yield();
+        }
+        if !on_cpu()
+        {
+            return Err("sysinfo::idle_halts_start: the thread never ran on its pinned CPU");
+        }
+        idle_halts().map_err(|_| "sysinfo::idle_halts_start: system_info(IdleHalts) failed")
+    };
+    let counts = read_on(0).and_then(|first| read_on(1).map(|second| (first, second)));
+    let _ = thread_set_affinity(ctx.thread_cap, AFFINITY_ANY);
+    let (first, second) = counts?;
+    if first >> COUNT_BITS == second >> COUNT_BITS
+    {
+        return Err("system_info(IdleHalts) of CPUs 0 and 1 agree above their low 32 bits");
+    }
+    Ok(())
 }
 
 /// The kernel synchronised instruction fetch for ktest's own image before

@@ -22,6 +22,7 @@ bin = [
     { name = "planted-magic", path = "src/bin/planted-magic.rs", test = false },
     { name = "planted-nested", path = "src/bin/planted-nested.rs", test = false },
     { name = "storage-statement", path = "src/bin/storage-statement.rs", test = false },
+    { name = "virtio-core", path = "src/bin/virtio-core.rs", test = false },
 ]
 
 [package]
@@ -42,6 +43,7 @@ init-protocol = { path = "../../../abi/init-protocol" }
 objsig = { path = "../../../shared/objsig" }
 storage-statement = { path = "../../../shared/storage-statement" }
 vfsd-gpt = { path = "../../../services/vfsd/gpt" }
+virtio-core = { path = "../../../services/drivers/virtio/core" }
 
 [lints]
 workspace = true

@@ -483,12 +483,32 @@ describes the remapping units truly.
   Discovery and Programming, § Interrupt Delivery; `carve_pci_device` and `give_msix` in
   `services/devmgr/src/bind.rs`, `services/devmgr/src/intremap.rs`, `reach_interrupt_file` in
   `services/devmgr/src/dma.rs`).
+- A driver takes a used-ring element only for a chain it has outstanding, with its length clamped
+  to the chain's device-writable buffers, and refuses a used index past its outstanding chains,
+  freeing nothing on a refusal; it reads each device-written field once and never reads back the
+  descriptor table or the available index, and reads a 64-bit configuration field only whole under
+  one configuration generation (`Chains::take_used` in
+  `services/drivers/virtio/core/src/virtqueue.rs`, `settle` in
+  `services/drivers/virtio/core/src/pci.rs`).
 - A block driver that loses a request resets its device before it gives the client's memory back,
   and exits without replying when the device does not acknowledge the reset (`quiesce_device` in
   `services/drivers/virtio/blk/src/main.rs`).
 
-**Fuzz targets and proof harnesses.** None. The booted `dma-confinement` and `hotplug` cases test
-the confinement policy and hot-add ([testing.md](testing.md) § Gating).
+**Fuzz targets and proof harnesses.**
+
+- `virtio-core` (`xtask/fuzz/targets/src/bin/virtio-core.rs`) drives
+  `virtio_core::property::virtio_core_holds` over the life of a split virtqueue, in which the device
+  writes anything into its used ring, its descriptor table and its available index, and over the
+  reads of a configuration word and of a 64-bit configuration field, from the seeds in
+  `services/drivers/virtio/core/fuzz/virtio-core/seeds/`; CI's gating `fuzz` job runs it on a pull
+  request whose change can affect it and the campaign for 30 minutes.
+- The `proofs` modules of `services/drivers/virtio/core/src/virtqueue.rs` and `pci.rs` prove, by
+  induction over a queue's life, that every chain submitted and every used element taken keeps the
+  queue's bookkeeping consistent and frees only an outstanding chain, and the placement of a
+  configuration word and the settling of a 64-bit read ([testing.md](testing.md) § Bounded
+  verification); CI's `kani` job runs them.
+- The booted `dma-confinement` and `hotplug` cases test the confinement policy and hot-add
+  ([testing.md](testing.md) § Gating).
 
 **Gaps.**
 
@@ -503,9 +523,6 @@ the confinement policy and hot-add ([testing.md](testing.md) § Gating).
 - The approved DMA mapping strategy of [#772](https://github.com/kottlerg/seraph/issues/772) lets a
   block device reach a registered client region from its registration to its unregistration, not
   only during one request; design intent, not yet implemented.
-- No fuzz target or proof harness covers a driver's decoding of what its device writes (VirtIO used
-  rings, configuration space) yet; one is planned
-  ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---
 

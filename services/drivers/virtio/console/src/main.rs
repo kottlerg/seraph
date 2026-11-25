@@ -485,8 +485,8 @@ impl Console
             {
                 Ok(Some(used)) => used,
                 Ok(None) => break,
-                // A used element naming no posted buffer: consumed, nothing
-                // to copy.
+                // A used element naming no posted buffer, or an index past
+                // the posted ones: consumed, nothing to copy.
                 Err(_) => continue,
             };
             // poll_used returns only outstanding heads, below the queue size

@@ -278,6 +278,7 @@ dependencies = [
  "objsig",
  "storage-statement",
  "vfsd-gpt",
+ "virtio-core",
 ]
 
 [[package]]

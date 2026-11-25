@@ -32,6 +32,10 @@ acknowledgement, it relays each delivery. The design is specified in
 virtio/core/
 ├── Cargo.toml
 ├── README.md
+├── fuzz/
+│   └── virtio-core/
+│       └── seeds/        # Checked-in inputs of the `virtio-core` fuzz target, replayed by
+│                         #   `cargo xtask test`
 └── src/
     ├── lib.rs            # Reserved feature bits, device status bits, VirtioPciStartupInfo
     │                     #   QUERY_DEVICE_INFO payload, RegisterLayout (per-BAR register
@@ -40,9 +44,20 @@ virtio/core/
     ├── dma.rs            # Map and unmap a driver's buffers for its device (DMA capability)
     ├── isr.rs            # Interrupt-service loop (wired: bounded wait, ISR read, acknowledge,
     │                     #   signal; MSI-X: wait, signal)
-    ├── pci.rs            # Modern PCI transport register access, MSI-X vector routing
-    └── virtqueue.rs      # Split virtqueue rings and descriptors
+    ├── pci.rs            # Modern PCI transport register access, MSI-X vector routing, the
+    │                     #   decode of a configuration read (config_word_addr, settle)
+    ├── property.rs       # The decoders' contract over any input (virtio_core_holds), for the
+    │                     #   fuzz target, the replay test and the proofs; test, Kani and fuzz
+    │                     #   builds only
+    └── virtqueue.rs      # Split virtqueue rings and descriptors: the shell over the driver's
+                          #   bookkeeping (Chains), which decodes the used ring
 ```
+
+The decoders of what a device writes for its driver, the used ring and a configuration read, are
+host-tested (`cargo xtask test`), fuzzed (target `virtio-core`,
+[docs/testing.md](../../../../docs/testing.md#fuzzing) § Fuzzing), and proved by the Kani harnesses
+of the `proofs` modules of `virtqueue.rs` and `pci.rs`
+([docs/testing.md](../../../../docs/testing.md#bounded-verification) § Bounded verification).
 
 ---
 

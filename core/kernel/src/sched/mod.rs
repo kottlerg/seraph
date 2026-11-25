@@ -6879,6 +6879,8 @@ pub unsafe fn placement_view(tcb: *mut ThreadControlBlock, view: u64) -> Option<
         syscall::THREAD_PLACEMENT_IDLE_WAKES => &counts.idle_wakes,
         syscall::THREAD_PLACEMENT_WAKE_MOVES => &counts.wake_moves,
         syscall::THREAD_PLACEMENT_PULLS => &counts.pulls,
+        syscall::THREAD_PLACEMENT_SYNC_WAKES => &counts.sync_wakes,
+        syscall::THREAD_PLACEMENT_SYNC_LOCAL => &counts.sync_local,
         _ => return None,
     };
     Some(u64::from(
@@ -7134,6 +7136,17 @@ pub unsafe fn select_target_cpu_excluding(
     place_wake(&KernelWake { tcb }, exclude, hint)
 }
 
+/// The synchronous wake rule's decision for one wake that reached it, which
+/// [`place_wake`] counts through [`WakeView::note_sync`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncDecision
+{
+    /// The guard held: the woken thread runs on the waker's CPU.
+    WakersCpu,
+    /// The guard failed: the later rules place the woken thread.
+    OtherRules,
+}
+
 /// The woken thread and the CPUs as [`place_wake`] reads them: the kernel's
 /// (`KernelWake`), or a host test's model. Each value is read when the rule
 /// that needs it is reached, so a pinned thread's wake reads its affinity
@@ -7158,6 +7171,10 @@ trait WakeView
     /// running on this CPU, the waker for a [`WakeHint::Sync`] wake
     /// (`run_queue::outranks`).
     fn outranks_waker(&self) -> bool;
+    /// Count the synchronous wake rule's decision in the woken thread's
+    /// placement counters: one wake that reached the rule, and one placed on
+    /// the waker's CPU when `decision` is [`SyncDecision::WakersCpu`].
+    fn note_sync(&self, decision: SyncDecision);
     /// The `current_load` of `cpu`.
     fn load(&self, cpu: usize) -> u32;
     /// How many SMT siblings of `cpu` are at work (`topology::busy_siblings`).
@@ -7203,7 +7220,16 @@ fn place_wake(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) -> u
     if hint == WakeHint::Sync
     {
         let this_cpu = view.this_cpu();
-        if eligible(this_cpu) && !view.this_cpu_queues() && !view.outranks_waker()
+        let decision = if eligible(this_cpu) && !view.this_cpu_queues() && !view.outranks_waker()
+        {
+            SyncDecision::WakersCpu
+        }
+        else
+        {
+            SyncDecision::OtherRules
+        };
+        view.note_sync(decision);
+        if decision == SyncDecision::WakersCpu
         {
             return this_cpu;
         }
@@ -7334,6 +7360,21 @@ impl WakeView for KernelWake
         // on, so it stays allocated across the read; read as for `level`.
         let waker_level = unsafe { (*waker).priority };
         run_queue::outranks(level, waker_level)
+    }
+
+    fn note_sync(&self, decision: SyncDecision)
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        // SAFETY: tcb is valid (select_target_cpu's contract); the counters are
+        // atomics.
+        let counts = unsafe { &(*self.tcb).placement };
+        // An atomic add, since the placement holds no lock of the thread
+        // (thread::PlacementCounts).
+        counts.sync_wakes.fetch_add(1, Relaxed);
+        if decision == SyncDecision::WakersCpu
+        {
+            counts.sync_local.fetch_add(1, Relaxed);
+        }
     }
 
     fn load(&self, cpu: usize) -> u32
@@ -10299,7 +10340,8 @@ mod idle_pull_tests
 mod placement_tests
 {
     use super::{
-        AFFINITY_ANY, RT_PRIORITY_MIN, WakeHint, WakeView, least_loaded_cpu, link_cpu, place_wake,
+        AFFINITY_ANY, RT_PRIORITY_MIN, SyncDecision, WakeHint, WakeView, least_loaded_cpu,
+        link_cpu, place_wake,
     };
 
     // The defect caught: a link that keeps the waker's target after a
@@ -10367,8 +10409,9 @@ mod placement_tests
         assert_eq!(least_loaded_cpu(0..0, |_| 0, |_| 0), None);
     }
 
-    /// A wake as a host test models it: the woken thread and the CPUs, and
-    /// how often the rule read the waker's CPU.
+    /// A wake as a host test models it: the woken thread and the CPUs, how
+    /// often the rule read the waker's CPU, and the synchronous wake rule's
+    /// counts (`note_sync`): decisions reached, and of those placed locally.
     struct Wake
     {
         affinity: u32,
@@ -10379,6 +10422,7 @@ mod placement_tests
         outranks_waker: bool,
         loads: Vec<u32>,
         waker_reads: core::cell::Cell<u32>,
+        syncs: core::cell::Cell<(u32, u32)>,
     }
 
     impl Wake
@@ -10397,6 +10441,7 @@ mod placement_tests
                 outranks_waker: false,
                 loads: vec![0; cpus],
                 waker_reads: core::cell::Cell::new(0),
+                syncs: core::cell::Cell::new((0, 0)),
             }
         }
 
@@ -10446,17 +10491,28 @@ mod placement_tests
         {
             0
         }
+        fn note_sync(&self, decision: SyncDecision)
+        {
+            let (reached, placed) = self.syncs.get();
+            let local = u32::from(decision == SyncDecision::WakersCpu);
+            self.syncs.set((reached + 1, placed + local));
+        }
     }
 
     // The defect caught: a synchronous wake left on the woken thread's sticky
     // CPU, so a pair that starts apart stays apart and every round trip pays
-    // a remote wake; or a plain wake moved to the waker's CPU.
+    // a remote wake; or a plain wake moved to the waker's CPU. In this and
+    // each test below, the rule's counts are checked too: a count of a wake
+    // that never reached the rule, or a local count of one it sent elsewhere,
+    // misleads the ktest cell that reads them.
     #[test]
     fn a_sync_wake_runs_on_the_wakers_cpu_and_a_plain_wake_stays_sticky()
     {
         let wake = Wake::new(4, 1, 2);
         assert_eq!(wake.place(None, WakeHint::Sync), 2);
+        assert_eq!(wake.syncs.get(), (1, 1));
         assert_eq!(wake.place(None, WakeHint::None), 1);
+        assert_eq!(wake.syncs.get(), (1, 1));
     }
 
     // The defect caught: the woken thread placed on the waker's CPU ahead of a
@@ -10469,11 +10525,14 @@ mod placement_tests
         let mut queued = Wake::new(4, 1, 2);
         queued.this_cpu_queues = true;
         assert_eq!(queued.place(None, WakeHint::Sync), 1);
+        assert_eq!(queued.syncs.get(), (1, 0));
         let mut outranking = Wake::new(4, 1, 2);
         outranking.outranks_waker = true;
         assert_eq!(outranking.place(None, WakeHint::Sync), 1);
+        assert_eq!(outranking.syncs.get(), (1, 0));
         outranking.loads = vec![0, 3, 1, 1];
         assert_eq!(outranking.place(None, WakeHint::Sync), 0);
+        assert_eq!(outranking.syncs.get(), (2, 0));
     }
 
     // The defect caught: a synchronous wake overriding hard affinity (a
@@ -10486,9 +10545,11 @@ mod placement_tests
         let mut pinned = Wake::new(4, 1, 2);
         pinned.affinity = 3;
         assert_eq!(pinned.place(None, WakeHint::Sync), 3);
+        assert_eq!(pinned.syncs.get(), (0, 0));
         let mut saving = Wake::new(4, 1, 2);
         saving.saving = true;
         assert_eq!(saving.place(None, WakeHint::Sync), 1);
+        assert_eq!(saving.syncs.get(), (0, 0));
     }
 
     // The defect caught: a synchronous wake placed on an excluded CPU (the
@@ -10498,8 +10559,10 @@ mod placement_tests
     {
         let wake = Wake::new(4, 1, 2);
         assert_eq!(wake.place(Some(2), WakeHint::Sync), 1);
+        assert_eq!(wake.syncs.get(), (1, 0));
         let past = Wake::new(2, 1, 2);
         assert_eq!(past.place(None, WakeHint::Sync), 1);
+        assert_eq!(past.syncs.get(), (1, 0));
     }
 
     // The defect caught: the waker's CPU read on every wake, a cost on the
@@ -10515,8 +10578,10 @@ mod placement_tests
         pinned.affinity = 0;
         pinned.place(None, WakeHint::Sync);
         assert_eq!(pinned.waker_reads.get(), 0);
+        assert_eq!(pinned.syncs.get(), (0, 0));
         wake.place(None, WakeHint::Sync);
         assert_eq!(wake.waker_reads.get(), 2);
+        assert_eq!(wake.syncs.get(), (1, 1));
     }
 
     // The defect caught: rank compared by raw priority, so one fair level

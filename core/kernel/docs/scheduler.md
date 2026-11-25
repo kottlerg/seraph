@@ -753,7 +753,7 @@ Hot-path cost per CPU per tick:
 
 ### Placement Counters
 
-Each thread carries four counters of how its wakes and the load balancer placed it
+Each thread carries six counters of how its wakes and the load balancer placed it
 (`thread::PlacementCounts`, the TCB's `placement`), which `SYS_CAP_INFO`'s
 `CAP_INFO_THREAD_PLACEMENT` reads with the thread's CPU
 ([syscalls.md](syscalls.md#sys_cap_info-36) § `SYS_CAP_INFO` (36)). They are diagnostics: no
@@ -767,14 +767,19 @@ of another ([core/ktest/README.md](../../ktest/README.md)).
 | `idle_wakes` | Of those, the wakes whose CPU ran its idle thread at the link, which halts while it has no work, so that the thread waited for the CPU to leave its halt |
 | `wake_moves` | Wakes that linked the thread on a CPU other than its `preferred_cpu` |
 | `pulls` | Load-balancer pulls that moved the thread (`pull_unpinned_ready`, § Load Balancing) |
+| `sync_wakes` | Synchronous-hint wakes that reached the synchronous wake rule (§ Thread Assignment) |
+| `sync_local` | Of those, the wakes the rule placed on the waker's CPU |
 
-A wake counts only when it links the thread: a wake that finds it running, already linked, stopped
-or exited counts nothing. A thread's start, an affinity migration and a requeue of the running
-thread are not wakes. Every increment holds the thread's `sched_lock`, so each counter has one
-writer at a time and a load and a store make the increment; a reader takes no lock and reads each
-counter `Relaxed`, a snapshot. Each counter is a free-running 32-bit count that wraps, so a reader
-takes the wrapping difference of two reads. The CPU the selector reports is `preferred_cpu`, read
-under the thread's `sched_lock`: the CPU the thread was last linked on or dispatched on.
+The first four count a wake only when it links the thread: a wake that finds it running, already
+linked, stopped or exited counts nothing. A thread's start, an affinity migration and a requeue of
+the running thread are not wakes. Each of their increments holds the thread's `sched_lock`, so
+each counter has one writer at a time and a load and a store make the increment. The synchronous
+wake rule's two count its decisions where it takes them (`place_wake`), from its own result,
+before the link and without the thread's lock, so each increment is a `Relaxed` atomic add. A
+reader takes no lock and reads each counter `Relaxed`, a snapshot. Each counter is a free-running
+32-bit count that wraps, so a reader takes the wrapping difference of two reads. The CPU the
+selector reports is `preferred_cpu`, read under the thread's `sched_lock`: the CPU the thread was
+last linked on or dispatched on.
 
 ---
 

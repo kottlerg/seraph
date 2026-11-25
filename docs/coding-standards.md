@@ -526,8 +526,8 @@ separately.
 - A message MUST NOT repeat what the line's prefix shows: the sender's name, the level as a word
   (`error:`, `warning:`), or the time.
 - A message starts in lower case (an acronym, a unit or an identifier keeps its own case), ends
-  with no period and no exclamation mark, and is at most one clause. An optional topic comes
-  first, followed by a colon (`mmio: 261 MiB outside DRAM`).
+  with no period and no exclamation mark, and is at most one clause. An optional topic, a
+  subsystem's name in lower case, comes first, followed by a colon (`mmio: 261 MiB outside DRAM`).
 - A value MUST take its one form: a size in the largest binary unit that gives a whole number
   (`4 KiB`, `261 MiB`); an address, a mask or an error code in hexadecimal with `0x`; a count or
   an id in decimal; a duration with its unit (`12 ms`). A message that carries more than two
@@ -536,10 +536,12 @@ separately.
   them, so that one search for those words finds every instance. The values follow them; only the
   name of what the event happened to, or the size or count it concerns, comes before them.
 - The level says how much a line matters, and the wording MUST NOT: `failed` at ERROR, not
-  `FATAL: failed!!`. Each step of a sequence is at DEBUG; INFO is a state change an operator
+  `error: failed!!`. Each step of a sequence is at DEBUG; INFO is a state change an operator
   wants in a boot log, logged once. A failure message names what failed and the error value, and
   says what the system does about it only when that is not the default. A test harness's lines
-  take the level ipc-interface.md § Levels gives them.
+  take the level ipc-interface.md § Levels gives them. A line that reports the system halting
+  carries the `FATAL:` marker on which `cargo xtask run` fails a boot
+  ([xtask/README.md](../xtask/README.md#cargo-xtask-run) § `cargo xtask run`).
 - A line that exists only to show that code was reached is at DEBUG, or is removed.
 
 Each example shows a line before and after these rules. The after line is in the console layout

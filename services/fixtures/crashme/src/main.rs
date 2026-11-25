@@ -28,7 +28,9 @@
 //! threads registered and known bytes in memory while the crash service writes
 //! a live core of it, and checks that it ran on unchanged; `crashme
 //! live-no-core` declares itself on the core path first, so the crash service
-//! refuses that core. See services/fixtures/crashme/README.md.
+//! refuses that core; `crashme live-declare` declares itself on a line on stdin,
+//! which svctest sends while the crash service's snapshot of it is under way.
+//! See services/fixtures/crashme/README.md.
 
 mod arch;
 mod oom;
@@ -86,6 +88,7 @@ fn main()
         "debugger-tag" => debugger_tag(),
         "live" => live(),
         "live-no-core" => live_no_core(),
+        "live-declare" => live_declare(),
         "oom-fill" => oom::fill(std::env::args().nth(2).as_deref()),
         "oom-touch" => oom::touch(std::env::args().nth(2).as_deref()),
         "oom-hold" => oom::hold(std::env::args().nth(2).as_deref()),
@@ -93,7 +96,7 @@ fn main()
         {
             println!(
                 "usage: crashme vm|exception|worker|registry-main|registry-worker|registry-declare\
-                 |debugger-tag|live|live-no-core|oom-fill <ms>|oom-touch <pages>|oom-hold <pages>"
+                 |debugger-tag|live|live-no-core|live-declare|oom-fill <ms>|oom-touch <pages>|oom-hold <pages>"
             );
             std::process::exit(2);
         }
@@ -398,6 +401,36 @@ fn live_no_core()
     }
     println!("ready");
     let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    std::process::exit(0);
+}
+
+/// Run while a crash service is asked for a live core of this process, and
+/// declare itself on the core path part way through: print `ready`, wait for
+/// a line on stdin, send `DECLARE_NO_CORE`, print `declared` once procmgr
+/// took it, then wait for another line and exit 0. Exits 1 when procmgr
+/// refused the declaration.
+fn live_declare()
+{
+    println!("ready");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    // SAFETY: the main thread's registered IPC buffer page.
+    let declared = unsafe {
+        ipc::ipc_call(
+            std::os::seraph::startup_info().procmgr_endpoint,
+            &IpcMessage::new(procmgr_labels::DECLARE_NO_CORE),
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .is_ok_and(|r| r.label == procmgr_errors::SUCCESS);
+    if !declared
+    {
+        println!("live-declare: FAIL (DECLARE_NO_CORE was refused)");
+        std::process::exit(1);
+    }
+    println!("declared");
+    line.clear();
     let _ = std::io::stdin().read_line(&mut line);
     std::process::exit(0);
 }

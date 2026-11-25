@@ -750,14 +750,15 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, h: &mut H
 
 /// Copy into `buf` the samples of `samples` that the first `spawned` workers
 /// whose bit is in `reported` completed, each from its stripe of
-/// `per_worker` entries, and summarise them.
+/// `per_worker` entries, and summarise them: samples of the workers' CPUs,
+/// with no idle-halt count of CPU 0's.
 fn gather(
     buf: &mut [u64],
     samples: &[AtomicU64; MAX_SAMPLES],
     reported: u64,
     spawned: usize,
     per_worker: usize,
-) -> Option<::bench::Summary>
+) -> super::Measured
 {
     let mut recorder = ::bench::Samples::new(buf);
     for (i, completed) in CONC_COMPLETED.iter().enumerate().take(spawned)
@@ -780,5 +781,5 @@ fn gather(
             recorder.record(sample.load(Ordering::Relaxed));
         }
     }
-    recorder.summary()
+    super::Measured::of_other_cpus(recorder.summary())
 }

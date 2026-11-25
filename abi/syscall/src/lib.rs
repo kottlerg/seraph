@@ -802,7 +802,8 @@ pub enum SyscallError
     QueueFull = -13,
     // -14 retired (`DmaUnsafe`, removed with `SYS_DMA_GRANT`); never reuse.
     /// The target object is not in the required state for this operation
-    /// (e.g. a running thread for `read_regs`/`write_regs`).
+    /// (e.g. a running thread for `read_regs`/`write_regs`), or the calling
+    /// thread has no `SystemInfoType::IdleHalts` mark on its CPU.
     InvalidState = -15,
     /// A blocking operation was cancelled: the thread was stopped or
     /// interrupted by an upcall, the notification, event queue, or wait set it
@@ -1976,6 +1977,22 @@ pub enum SystemInfoType
     /// Awareness). On riscv64 every hart is its own core. `InvalidArgument`
     /// for an index at or past `CpuCount`.
     SmtSibling = 14,
+    /// Number of times the idle thread of the CPU the call runs on has halted
+    /// that CPU since the calling thread's previous `IdleHalts` call, when
+    /// that call ran on the same CPU: one per stretch in which the CPU found
+    /// no thread to run, and one more for each interrupt that ends a halt and
+    /// leaves it with none. Each call marks its CPU and that CPU's count in
+    /// the calling thread, so a thread reads only the halts between two of
+    /// its own calls on one CPU, never a count since boot. `InvalidState`
+    /// when the thread has made no call, or made its previous one on another
+    /// CPU: that call marks its CPU too, and the next call there answers.
+    /// Takes no argument, and answers for no other CPU. A diagnostic,
+    /// readable by any process with no capability; a benchmark pinned to one
+    /// CPU calls it before its first timed sample and after its last, so that
+    /// its result line shows whether a timed window waited with the CPU idle
+    /// (shared/bench/README.md § Idle halts; core/kernel/docs/syscalls.md
+    /// § `SYS_SYSTEM_INFO`).
+    IdleHalts = 15,
 }
 
 /// `SystemInfoType::SpeculationControls` view: the selection's inputs, a

@@ -14,15 +14,19 @@
 //! counter read is an unprivileged instruction, so no syscall sits on the
 //! measurement path: `rdtsc` on x86-64 (the kernel clears `CR4.TSD` on every
 //! CPU) and `csrr cycle` on riscv64 (the kernel sets `scounteren.CY` on every
-//! hart).
+//! hart). The recorder marks CPU 0's idle-halt count when a benchmark takes
+//! it, before its measured loop, and its summary, after the loop, reads the
+//! halts since the mark, which the line reports as `idle_halts=`
+//! (`shared/bench/README.md` § Idle halts).
 //!
 //! # Adding a new benchmark
 //!
 //! 1. Add a `fn bench_<name>` taking `&mut Harness` to the surface's file
 //!    under `bench/`, placed as the README's § Tier 3 layout rule says.
-//! 2. Take the recorder and the counters with [`Harness::recorder`], run at
-//!    most [`Harness::iters`] iterations, and record each measured
-//!    operation's `Reading::since` cycles.
+//! 2. Take the recorder and the counters with [`Harness::recorder`] right
+//!    before the measured loop, run at most [`Harness::iters`] iterations,
+//!    record each measured operation's `Reading::since` cycles, and take the
+//!    recorder's [`Recorder::summary`] right after the loop.
 //! 3. Report the summary with [`Harness::report`], and call the benchmark
 //!    from [`run_all`] below.
 
@@ -36,7 +40,7 @@ mod thread;
 mod tlb;
 mod wait_set;
 
-use ::bench::{Counters, Report, Samples, Summary, Unit, Value};
+use ::bench::{Counters, IDLE_HALTS, Report, Samples, Summary, Unit, Value};
 
 /// Most samples one benchmark records, and so most iterations it runs. The
 /// bound limits only how many samples a summary covers, a p99 of 4096
@@ -46,6 +50,11 @@ pub const MAX_ITERS: u32 = 4096;
 
 /// [`MAX_ITERS`] as a buffer length.
 pub(super) const MAX_SAMPLES: usize = MAX_ITERS as usize;
+
+/// Most extras a benchmark passes to [`Harness::report`], which adds
+/// `idle_halts` after them: the round trips' placement extras are the most
+/// any passes.
+const MAX_EXTRAS: usize = 8;
 
 /// The `SYS_THREAD_SET_AFFINITY` argument that clears a thread's hard
 /// affinity.
@@ -68,6 +77,65 @@ pub(super) struct Harness
     buf: &'static mut [u64; MAX_SAMPLES],
 }
 
+/// A benchmark's samples over its measured loop, taken with CPU 0's
+/// idle-halt count marked where the loop began, so that
+/// [`Recorder::summary`] reads the halts since where it ended.
+pub(super) struct Recorder<'a>
+{
+    samples: Samples<'a>,
+}
+
+impl Recorder<'_>
+{
+    /// Record one sample; `false` when the buffer is full
+    /// (`Samples::record`).
+    pub(super) fn record(&mut self, sample: u64) -> bool
+    {
+        self.samples.record(sample)
+    }
+
+    /// End the measured loop: the halts of CPU 0 since the recorder was
+    /// taken, read first, and the summary of the samples. Call it right after
+    /// the loop's last sample, with no `IdleHalts` call of the thread
+    /// between, which would move the mark.
+    pub(super) fn summary(&mut self) -> Measured
+    {
+        let idle_halts = syscall::idle_halts().ok();
+        Measured {
+            idle_halts,
+            summary: self.samples.summary(),
+        }
+    }
+}
+
+/// What a benchmark reports of its measured loop: the summary of its samples,
+/// and the halts of the measuring CPU's idle thread over the loop, reported as
+/// `idle_halts=` (`shared/bench/README.md` § Idle halts).
+#[derive(Clone, Copy)]
+pub(super) struct Measured
+{
+    /// The summary; `None` when no sample was recorded.
+    summary: Option<Summary>,
+    /// The halts; `None` when the read failed (the thread had not marked
+    /// CPU 0 at the recorder, or ran it there on another CPU), or for samples
+    /// taken on other CPUs than CPU 0, of whose windows CPU 0's count says
+    /// nothing.
+    idle_halts: Option<u64>,
+}
+
+impl Measured
+{
+    /// The summary of samples that other threads recorded on their own CPUs
+    /// (`tlb::bench_tlb_shootdown_concurrent`): no idle-halt count.
+    pub(super) const fn of_other_cpus(summary: Option<Summary>) -> Self
+    {
+        Self {
+            summary,
+            idle_halts: None,
+        }
+    }
+}
+
 impl Harness
 {
     /// Iterations a benchmark runs: the configured count, cut to the samples
@@ -78,14 +146,23 @@ impl Harness
     }
 
     /// An empty recorder over the sample buffer, and the counters to time
-    /// each operation with.
-    pub(super) fn recorder(&mut self) -> (Samples<'_>, &Counters)
+    /// each operation with. Taking it marks CPU 0's idle-halt count (an
+    /// `IdleHalts` call whose value is not read), so take it right before the
+    /// measured loop, and end the loop with [`Recorder::summary`].
+    pub(super) fn recorder(&mut self) -> (Recorder<'_>, &Counters)
     {
-        (Samples::new(&mut self.buf[..]), &self.counters)
+        let _ = syscall::idle_halts();
+        (
+            Recorder {
+                samples: Samples::new(&mut self.buf[..]),
+            },
+            &self.counters,
+        )
     }
 
     /// The whole sample buffer, for a benchmark whose samples other threads
-    /// record (`tlb::bench_tlb_shootdown_concurrent`).
+    /// record on their own CPUs (`tlb::bench_tlb_shootdown_concurrent`),
+    /// which reports them as [`Measured::of_other_cpus`].
     pub(super) fn buffer(&mut self) -> &mut [u64]
     {
         &mut self.buf[..]
@@ -104,18 +181,44 @@ impl Harness
         crate::log_args(format_args!("ktest: bench {name} SKIP ({reason})"));
     }
 
-    /// Log the result line `bench ktest.<name> ...` of `summary`, with its
-    /// variant parameters and extras; a benchmark that recorded no sample
-    /// logs `ktest: bench <name> SKIP (no sample recorded)` instead. The line
-    /// is streamed to the output channels whole, with no length cut.
+    /// Log the result line `bench ktest.<name> ...` of `measured`, with its
+    /// variant parameters and extras, and then its `idle_halts=` when it has
+    /// the count; a benchmark that recorded no sample logs
+    /// `ktest: bench <name> SKIP (no sample recorded)` instead. The line is
+    /// streamed to the output channels whole, with no length cut.
     pub(super) fn report(
         &self,
         name: &str,
         variant: &[(&str, Value<'_>)],
-        summary: Option<Summary>,
+        measured: Measured,
         extras: &[(&str, u64)],
     )
     {
+        let Measured {
+            summary,
+            idle_halts,
+        } = measured;
+        let mut all = [("", 0u64); MAX_EXTRAS + 1];
+        // `all` holds one slot more than `MAX_EXTRAS`, for `idle_halts`, so the
+        // bound is checked here and not by the slice.
+        let Some(given) = all
+            .get_mut(..extras.len())
+            .filter(|_| extras.len() <= MAX_EXTRAS)
+        else
+        {
+            crate::log_args(format_args!(
+                "ktest: bench {name} FAIL (more than {MAX_EXTRAS} extras)"
+            ));
+            return;
+        };
+        given.copy_from_slice(extras);
+        let mut len = extras.len();
+        if let (Some(halts), Some(slot)) = (idle_halts, all.get_mut(len))
+        {
+            *slot = (IDLE_HALTS, halts);
+            len = len.saturating_add(1);
+        }
+        let extras = all.get(..len).unwrap_or_default();
         let Some(summary) = summary
         else
         {

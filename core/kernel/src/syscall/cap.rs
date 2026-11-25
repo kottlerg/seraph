@@ -1371,6 +1371,10 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 sleep_expiry: crate::sched::thread::SleepExpiry::EMPTY,
                 extended: crate::sched::thread::ExtendedState::from_raw(extended_area),
                 registry: crate::sched::registry_list::RegistryLinks::new(),
+                idle_halts_mark_cpu: core::sync::atomic::AtomicU32::new(
+                    crate::sched::thread::NO_IDLE_HALTS_MARK,
+                ),
+                idle_halts_mark: core::sync::atomic::AtomicU64::new(0),
                 magic: crate::sched::thread::TCB_MAGIC,
             },
         );

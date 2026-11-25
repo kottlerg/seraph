@@ -29,6 +29,7 @@ Fixtures](../../svctest/README.md#fixtures)). The fixture installs at
 | `registry-declare` | None: with a registered thread parked, it sends `DECLARE_NO_DEBUG` and checks that the thread's crash binding, under a badge other than the main thread's, is unbound with the main thread's; it prints `registry-declare: PASS` and exits 0 when so |
 | `live` | None: it parks two registered threads, fills 4096 bytes of its heap with a known word, prints `ready mark=<address>`, and waits for a line on stdin while the crash service writes a live core of it; it then checks that its threads are still parked and the bytes still hold the word, prints `live: PASS` or `live: FAIL`, and exits 0 when both hold |
 | `live-no-core` | None: it declares itself on the core path (`DECLARE_NO_CORE`), prints `ready`, waits for a line on stdin, and exits 0; it exits 1 when procmgr refuses the declaration |
+| `live-declare` | None: it prints `ready`, waits for a line on stdin, then declares itself on the core path (`DECLARE_NO_CORE`) and prints `declared` once procmgr took it, waits for another line, and exits 0; it exits 1 when procmgr refuses the declaration |
 
 In each faulting mode the fixture registers the log name `crashme` and logs a line first, so logd's
 `reclaim:` line at its death names it, and prints `faulting (<mode>)` to stdout. It reaches the
@@ -82,9 +83,20 @@ reader of its own, not crashd's code, and asserts that it is:
 
 ### `crashd_live_core`
 
-It asserts that svctest holds the `crashd.core` bootstrap capability, then asks the crash service
-for live cores ([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Live Core),
-each charged to a copy of its own memmgr account.
+It asserts that svctest holds the `crashd.core` bootstrap capability, checks a spawn's charge, then
+asks the crash service for live cores
+([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Live Core). Each request
+carries an account: for `crashme live`, a copy of svctest's own memmgr account; for the others, an
+endpoint of the phase's own, served on a thread of svctest's, that refuses each call with memmgr's
+`LIMIT` or forwards it, its words and caps, on svctest's memmgr endpoint, so procmgr's frames are
+charged to svctest as on a copy of its account.
+
+For the spawn: on a thread of the strict-priority class pinned to the highest CPU, while a thread
+at the same level spins on each other CPU, the phase spawns `crashme live-no-core` with piped stdin
+and stdout, which starts std's death bridge, a fair-class thread that can then first run only on
+the phase's CPU once the phase blocks; svctest's charge read as soon as the spawn returns equals the
+charge read once the fixture printed `ready`, so the bridge's pages were charged before the spawn
+returned ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Runtime threads).
 
 For `crashme live`: the fixture prints `ready mark=0x<address>` (otherwise it panics); the
 `LIVE_CORE` reply is `SUCCESS`; after the phase writes `check` to the fixture's stdin, the
@@ -100,6 +112,21 @@ For `crashme live-no-core`: the fixture prints `ready`; the `LIVE_CORE` reply is
 account that cannot fund a snapshot, an endpoint of the phase's own that refuses every call, and
 nothing called that account, so no snapshot was asked for; after the phase writes `exit` to its
 stdin the fixture exits with a success; and no core is new in `/crash`.
+
+For `crashme live` on an account that forwards the snapshot's first frame request and refuses each
+later one: the `LIVE_CORE` reply is `SNAPSHOT_REFUSED`; the account forwarded a call and refused
+one, so procmgr failed the capture after it took frames; svctest's charge after the reply equals its
+charge before the request, so the refused capture's frames went back to the account; the fixture
+then prints `live: PASS`; and no core is new in `/crash`.
+
+For `crashme live-declare`: the fixture prints `ready`; at the account's first call, the snapshot's
+first frame request, the account's thread writes `declare` to the fixture's stdin and reads its
+`declared`, procmgr taking the declaration on another of its workers, then forwards every call. The
+crash service's check before the snapshot read no declaration, and its check after the capture reads
+this one: the `LIVE_CORE` reply is `NO_CORE`; the account forwarded calls and refused none, so the
+snapshot was taken; svctest's charge after the reply equals its charge before the request, so the
+crash service released the refused snapshot; after the phase writes `exit` the fixture exits with a
+success; and no core is new in `/crash`.
 
 ### `crashd_oom_hold`
 

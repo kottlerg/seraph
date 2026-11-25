@@ -567,7 +567,8 @@ baseline under `xtask/baselines/bench/icount/`
 ([xtask/README.md § `cargo xtask bench-check`](../xtask/README.md#cargo-xtask-bench-check)).
 
 The one-CPU counts gate: a count further from its baseline than the larger of 1% of it and 8
-instructions, in either direction, fails the cell, as does a measurement with no baseline, a
+instructions, in either direction, fails the cell, as does a measurement whose measured loop idled
+(below), a measurement with no baseline, a
 baseline no run measured, and a benchmark's `FAIL` line. A run whose change owes no ktest cell
 skips the ktest boots and does not check the ktest suite's baselines (`bench-check --skip-suite
 ktest`), and a rewrite from that run leaves the ktest suite's files as they are. A count that fell
@@ -595,7 +596,12 @@ reported, not gated; a regression of the write path's instructions shows in the 
 in host mode, not as a failure. `fsbench.read` gates: its untimed open, fixture check and warm-up
 reads fill the filesystem's page cache with the file, so no timed read waits on the disk. A
 benchmark is classified by the same test: one whose timed samples idle, on a device, a timer or
-any other event, joins the set (`ICOUNT_IO_BOUND` in `xtask/src/benchmark.rs`).
+any other event, joins the set (`ICOUNT_IO_BOUND` in `xtask/src/benchmark.rs`). The cell checks
+the test: each result line reports, as `idle_halts=`, the halts of its measuring CPU over the
+measured loop
+([shared/bench/README.md § Idle halts](../shared/bench/README.md#idle-halts)), and `bench-check`
+fails a gating measurement whose line reports a halt or no count, naming the measurement and its
+halts.
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
@@ -634,10 +640,13 @@ pointer against the page runs it holds, the illegal instruction's bytes, and the
 threads ([services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md)). Its
 `crashd_live_core` phase asks crashd, through the `crashd.core` seed, for a live core of the
 running fixture and checks that the fixture ran on unchanged and that the core records its threads,
-their stacks and a page it marked, and none of the binary's text, and asks for one of a fixture on
-the core path, on an account that cannot fund a snapshot, and checks the refusal asked for none
-([crashd Operation § Live Core](../services/crashd/docs/operation.md#live-core)). A core is checked
-in the boot, not in the log; `gdb` reading one is checked by hand
+their stacks and a page it marked, and none of the binary's text; asks for one of a fixture on the
+core path, on an account that cannot fund a snapshot, and checks the refusal asked for none; and
+asks for one that procmgr refuses after it took frames and one that crashd refuses after the
+capture, for a declaration made during the request, and checks that each left svctest's charge as
+it was ([crashd Operation § Live Core](../services/crashd/docs/operation.md#live-core)). The phase
+also checks that a spawn returns with its death bridge's pages charged. A core is checked in the
+boot, not in the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The svctest boot's crashd also holds a page fault memmgr declined for want of memory, for up to

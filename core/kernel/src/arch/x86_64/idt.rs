@@ -536,13 +536,27 @@ pub(super) unsafe extern "C" fn common_exception_handler(
         };
 
         let cpu = super::cpu::current_cpu();
-        crate::kprintln_serial!(
+        // The line reaches the kernel log's reader, so it carries the error
+        // code the fault message carries: for a page fault at a kernel-half
+        // CR2 the present bit would tell which kernel VAs are mapped
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+        // diagnostics).
+        const ERR_PRESENT: u64 = 1 << 0;
+        let err = if vector == 14 && cr2 >= crate::mm::user_va_top()
+        {
+            error_code & !ERR_PRESENT
+        }
+        else
+        {
+            error_code
+        };
+        crate::kprintln_fault!(
             "USERSPACE FAULT: tid={} cpu={} cause={} (vec={} err={:#x})",
             tid,
             cpu,
             x86_exception_name(vector),
             vector,
-            error_code,
+            err,
         );
         // Include fs_base (IA32_FS_BASE) to aid TLS-plumbing diagnosis.
         // SAFETY: interrupts are disabled above; rdmsr on IA32_FS_BASE is
@@ -559,13 +573,13 @@ pub(super) unsafe extern "C" fn common_exception_handler(
             );
             (u64::from(high) << 32) | u64::from(low)
         };
-        crate::kprintln_serial!(
+        crate::kprintln_fault!(
             "  rip={:#018x}  cr2={:#018x}  fs_base={:#018x}",
             f.rip,
             cr2,
             fs_base
         );
-        dump_x86_regs(f);
+        dump_x86_regs(f, crate::klog::print_fault);
 
         if !tcb.is_null()
         {
@@ -626,7 +640,7 @@ pub(super) unsafe extern "C" fn common_exception_handler(
         crate::arch::current::cpu::halt_loop();
     }
     let cpu = super::cpu::current_cpu();
-    crate::kprintln!(
+    crate::kprintln_direct!(
         "KERNEL EXCEPTION: cpu={} cause={} (vec={} err={:#x})",
         cpu,
         x86_exception_name(vector),
@@ -638,8 +652,8 @@ pub(super) unsafe extern "C" fn common_exception_handler(
     // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
     // diagnostics).
     crate::kprintln_serial!("  rip={:#018x}  cr2={:#018x}", f.rip, cr2);
-    crate::kprintln!("  cs={:#x}  rflags={:#018x}", f.cs, f.rflags,);
-    dump_x86_regs(f);
+    crate::kprintln_direct!("  cs={:#x}  rflags={:#018x}", f.cs, f.rflags,);
+    dump_x86_regs(f, crate::console::print_serial);
     super::shadow_stack::report_registers();
     fatal(
         if (f.cs & 3) != 0
@@ -793,37 +807,29 @@ fn x86_exception_name(vector: u64) -> &'static str
     }
 }
 
-/// Dump all general-purpose registers from an x86-64 trap frame (serial only).
-fn dump_x86_regs(f: &TrapFrame)
+/// Dump all general-purpose registers from an x86-64 trap frame through
+/// `print`: `console::print_serial` for a kernel trap, whose registers can hold
+/// kernel VAs, and `klog::print_fault` for a user-mode trap, whose registers
+/// are the thread's own (core/kernel/docs/cross-boundary-disclosure.md
+/// § Kernel console diagnostics).
+fn dump_x86_regs(f: &TrapFrame, print: fn(core::fmt::Arguments))
 {
-    crate::kprintln_serial!(
+    print(format_args!(
         "  rax={:#018x}  rbx={:#018x}  rcx={:#018x}  rdx={:#018x}",
-        f.rax,
-        f.rbx,
-        f.rcx,
-        f.rdx
-    );
-    crate::kprintln_serial!(
+        f.rax, f.rbx, f.rcx, f.rdx
+    ));
+    print(format_args!(
         "  rsi={:#018x}  rdi={:#018x}  rbp={:#018x}  rsp={:#018x}",
-        f.rsi,
-        f.rdi,
-        f.rbp,
-        f.rsp
-    );
-    crate::kprintln_serial!(
+        f.rsi, f.rdi, f.rbp, f.rsp
+    ));
+    print(format_args!(
         "   r8={:#018x}   r9={:#018x}  r10={:#018x}  r11={:#018x}",
-        f.r8,
-        f.r9,
-        f.r10,
-        f.r11
-    );
-    crate::kprintln_serial!(
+        f.r8, f.r9, f.r10, f.r11
+    ));
+    print(format_args!(
         "  r12={:#018x}  r13={:#018x}  r14={:#018x}  r15={:#018x}",
-        f.r12,
-        f.r13,
-        f.r14,
-        f.r15
-    );
+        f.r12, f.r13, f.r14, f.r15
+    ));
 }
 
 // ── ISR stub macro ────────────────────────────────────────────────────────────

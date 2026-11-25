@@ -157,6 +157,8 @@ pub enum CapTag
     SbiControl = 13,
     /// Authority to mix bytes into the kernel entropy pool.
     EntropyControl = 14,
+    /// Authority to read the kernel log.
+    KernelLog = 15,
 }
 
 // ── Rights ────────────────────────────────────────────────────────────────────
@@ -574,6 +576,19 @@ define_typed_rights! {
     }
 }
 
+define_typed_rights! {
+    /// Rights-space marker for `KernelLog` capabilities.
+    ///
+    /// One right: `sys_kernel_log_read` and `sys_kernel_log_bind` require
+    /// `READ` (docs/capability-model.md § `KernelLog`).
+    KernelLogCap, KlogRights, KernelLog
+    {
+        /// May read and acknowledge the kernel's log records and bind their
+        /// notification.
+        READ = syscall::RIGHTS_KLOG_READ;
+    }
+}
+
 // ── CapabilitySlot ────────────────────────────────────────────────────────────
 
 /// A single capability slot in a `CSpace` page.
@@ -914,6 +929,7 @@ mod tests
         assert_eq!(CapTag::SchedControl as u8, CapType::SchedControl as u8);
         assert_eq!(CapTag::SbiControl as u8, CapType::SbiControl as u8);
         assert_eq!(CapTag::EntropyControl as u8, CapType::EntropyControl as u8);
+        assert_eq!(CapTag::KernelLog as u8, CapType::KernelLog as u8);
     }
 
     // Cross-boundary ABI contract: `cap_info(CAP_INFO_TAG_RIGHTS)` returns the

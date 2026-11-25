@@ -266,7 +266,7 @@ fn frames_of(phys: u64, len: u64) -> core::iter::StepBy<core::ops::Range<u64>>
 #[cfg(not(test))]
 fn report_underflow(phys: u64)
 {
-    crate::kprintln!(
+    crate::kprintln_serial!(
         "FRAME MAP UNDERFLOW: frame 0x{:x} unmapped with no recorded mapping",
         phys
     );

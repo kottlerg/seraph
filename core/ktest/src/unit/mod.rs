@@ -24,6 +24,7 @@ pub mod fpu;
 pub mod hw;
 pub mod init_layout;
 pub mod ipc;
+pub mod klog;
 pub mod locked_windows;
 pub mod mm;
 pub mod notification;
@@ -1059,6 +1060,26 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "entropy::entropy_contribute_arg_refusals",
         entropy::entropy_contribute_arg_refusals(ctx)
+    );
+
+    // ── Kernel log ────────────────────────────────────────────────────────────
+    run_test!("klog::read_refusals", klog::read_refusals(ctx));
+    run_test!("klog::bind_refusals", klog::bind_refusals(ctx));
+    run_test!(
+        "klog::fault_lines_are_records",
+        klog::fault_lines_are_records(ctx)
+    );
+    run_test!(
+        "klog::bound_notification_signalled",
+        klog::bound_notification_signalled(ctx)
+    );
+    run_test!(
+        "klog::bind_replaced_and_cleared",
+        klog::bind_replaced_and_cleared(ctx)
+    );
+    run_test!(
+        "klog::stalled_reader_falls_back",
+        klog::stalled_reader_falls_back(ctx)
     );
 
     // ── Init bootstrap layout (ASLR, #39) ─────────────────────────────────────

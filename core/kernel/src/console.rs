@@ -3,18 +3,20 @@
 
 // core/kernel/src/console.rs
 
-//! Kernel early console: dual serial + framebuffer output.
+//! Kernel direct console: serial and framebuffer output, and the print macros.
 //!
-//! Provides `init()` and the `kprint!`/`kprintln!` macros. Output goes to both
-//! the serial port and the framebuffer (when available). All state is static;
-//! the kernel is single-threaded during early boot and never runs concurrent
-//! code before SMP is initialized.
+//! Provides `init()` and the `kprintln!` family. A line written here goes
+//! straight to the serial port, and to the framebuffer when the line's sink
+//! includes it. While a reader is attached to the kernel log, `kprintln!` and
+//! `kprintln_fault!` lines become log records instead (`crate::klog`); the
+//! other macros always write here. Which macro a line takes is in
+//! `core/kernel/docs/kernel-log.md` § Print classes.
 //!
 //! The kernel is a native ELF, so `core::fmt` trait objects and vtable dispatch
 //! work on all architectures. The macros accept full format arguments.
 //!
-//! This is the early/panic console and is retained permanently; steady-state
-//! userspace serial output is owned by the userspace serial driver. See
+//! This console is retained permanently for early boot and failure windows;
+//! steady-state serial output is owned by the userspace serial driver. See
 //! `docs/console-model.md`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -24,15 +26,19 @@ use crate::framebuffer::FramebufferWriter;
 use crate::mm::paging::phys_to_virt;
 use boot_protocol::BootInfo;
 
-/// Spinlock protecting `CONSOLE`. Acquired by every `console_write_fmt` and
-/// `serial_write_fmt` call so concurrent writes from multiple CPUs (SMP) do not
+/// Spinlock protecting `CONSOLE`. Acquired by every [`write_line`]
+/// call so concurrent writes from multiple CPUs (SMP) do not
 /// race on the framebuffer cursor position. A plain `AtomicBool`
 /// (test-and-set) rather than the ticket `Spinlock`, so the crash and NMI paths
-/// below can claim it without queueing. Both acquiring writers disable
-/// interrupts before they spin and restore them only after the release, so the
+/// below can claim it without queueing. The acquiring writer disables
+/// interrupts before it spins and restores them only after the release, so the
 /// lock is never held with interrupts enabled: an interrupt-context print
 /// (`timer_tick`'s vmgenid log, BSP stall check, and softlockup watchdog dump)
 /// cannot interrupt a holder on its own CPU and spin on it forever.
+///
+/// The kernel log's lock (`klog::KLOG_LOCK`) is taken before it, never after:
+/// a line printed while no reader is attached is written under both. No holder
+/// of `CONSOLE_LOCK` takes the kernel log's lock.
 ///
 /// Two non-acquiring exceptions exist for crash and NMI paths where
 /// spin-waiting would deadlock against a halted or interrupted lock-
@@ -92,7 +98,7 @@ impl core::fmt::Write for Console
 ///
 /// Initializes the serial backend and, if a framebuffer is present in
 /// `boot_info`, the framebuffer backend. Must be called once during Phase 1
-/// before any `kprint!` usage.
+/// before any line is printed.
 ///
 /// # Safety
 /// Must be called at most once, from the single kernel boot thread, with a
@@ -152,27 +158,91 @@ pub unsafe fn rebase_framebuffer(fb_phys: u64)
     }
 }
 
-/// Write a formatted string to the kernel console.
-///
-/// Serialised via `CONSOLE_LOCK` so concurrent calls from multiple CPUs
-/// (after SMP bringup) do not race on the framebuffer cursor state.
-/// Each call disables interrupts, acquires the lock, writes, releases, and
-/// restores the caller's interrupt state (see `CONSOLE_LOCK`).
+/// Where a directly written line goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sink
+{
+    /// The serial port and the framebuffer.
+    Console,
+    /// The serial port only: a line no framebuffer reader may see
+    /// (`core/kernel/docs/cross-boundary-disclosure.md` § Kernel console
+    /// diagnostics).
+    Serial,
+}
+
+/// A line's timestamp, `[S.NNNNNN]`: whole seconds (variable width) and
+/// zero-padded microseconds since timer calibration, or `[--------]` before
+/// it (8 dashes, the width of `[0.000000]`).
+pub struct Stamp(pub Option<u64>);
+
+impl core::fmt::Display for Stamp
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match self.0
+        {
+            None => f.write_str("[--------]"),
+            Some(us) => write!(f, "[{}.{:06}]", us / 1_000_000, us % 1_000_000),
+        }
+    }
+}
+
+/// The kernel's time for a line written now: `None` before the timer is
+/// calibrated (pre-Phase 5), and in host tests.
+pub fn now_us() -> Option<u64>
+{
+    #[cfg(not(test))]
+    {
+        crate::arch::current::timer::elapsed_us()
+    }
+    #[cfg(test)]
+    {
+        None
+    }
+}
+
+/// Write one kernel line to `sink`: the timestamp, `kernel: `, the text and
+/// a newline, under one hold of `CONSOLE_LOCK`, so no other CPU's line falls
+/// inside it. Each call disables interrupts, acquires the lock, writes,
+/// releases, and restores the caller's interrupt state (see `CONSOLE_LOCK`).
 ///
 /// # Safety
 /// `console::init` must have been called before this function.
-pub unsafe fn console_write_fmt(args: core::fmt::Arguments)
+#[cfg(not(test))]
+pub unsafe fn write_line(sink: Sink, us: Option<u64>, args: core::fmt::Arguments)
 {
     use core::fmt::Write;
 
     let saved = console_lock_acquire();
-
-    // SAFETY: we hold CONSOLE_LOCK; no other CPU is in this block.
-    let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
-    let _ = console.write_fmt(args);
-
+    let line = format_args!("{} kernel: {}\n", Stamp(us), args);
+    match sink
+    {
+        Sink::Console =>
+        {
+            // SAFETY: we hold CONSOLE_LOCK; no other CPU is in this block.
+            let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
+            let _ = console.write_fmt(line);
+        }
+        Sink::Serial =>
+        {
+            let _ = SerialWriter.write_fmt(line);
+        }
+    }
     console_lock_release(saved);
 }
+
+/// Write one kernel line to the serial port only, never as a log record: the
+/// path of `kprintln_serial!`, as a function a register dump shared with
+/// userspace faults can take.
+pub fn print_serial(args: core::fmt::Arguments)
+{
+    // SAFETY: the console is initialised before any line is printed.
+    unsafe { write_line(Sink::Serial, now_us(), args) };
+}
+
+/// No-op stub for test builds.
+#[cfg(test)]
+pub unsafe fn write_line(_sink: Sink, _us: Option<u64>, _args: core::fmt::Arguments) {}
 
 /// Disable interrupts, then spin until `CONSOLE_LOCK` is claimed. Returns the
 /// saved interrupt state for [`console_lock_release`].
@@ -225,7 +295,7 @@ fn console_lock_release(_saved: u64)
 }
 
 /// A `fmt::Write` sink that writes bytes only to the serial port, inserting a
-/// CR before each LF. Shared by [`serial_write_fmt`], [`panic_write_fmt`], and
+/// CR before each LF. Shared by [`write_line`], [`panic_write_fmt`], and
 /// [`nmi_write_fmt`], which differ only in how they claim `CONSOLE_LOCK`.
 ///
 /// Construct it only after `console::init` has initialised the serial port
@@ -255,35 +325,9 @@ impl core::fmt::Write for SerialWriter
     }
 }
 
-/// Write a formatted string to the serial port only.
-///
-/// Acquires `CONSOLE_LOCK` as `console_write_fmt` does (interrupts disabled
-/// across the spin and the hold; see `CONSOLE_LOCK`) but writes only to serial,
-/// skipping the framebuffer. This is the serial-only sink behind `kprintln_serial!`, used
-/// for kernel virtual addresses, KASLR-derived values, and userspace fault diagnostics;
-/// see `core/kernel/docs/cross-boundary-disclosure.md` § Kernel console diagnostics.
-///
-/// # Safety
-/// `console::init` must have been called before this function.
-#[cfg(not(test))]
-pub unsafe fn serial_write_fmt(args: core::fmt::Arguments)
-{
-    use core::fmt::Write;
-
-    let saved = console_lock_acquire();
-
-    let _ = SerialWriter.write_fmt(args);
-
-    console_lock_release(saved);
-}
-
-/// No-op stub for test builds.
-#[cfg(test)]
-pub unsafe fn serial_write_fmt(_args: core::fmt::Arguments) {}
-
 /// Write a formatted string to the serial port only, for use inside panic handlers.
 ///
-/// Unlike `console_write_fmt`, this function:
+/// Unlike [`write_line`], this function:
 /// - Force-claims `CONSOLE_LOCK` with a store (no spin-wait, avoids deadlock if
 ///   this CPU already holds the lock or if the lock is stuck on a halted CPU).
 /// - Writes only to the serial port; skips the framebuffer to avoid touching
@@ -308,7 +352,7 @@ pub unsafe fn panic_write_fmt(args: core::fmt::Arguments)
 
 /// Write a formatted string to the serial port from an NMI handler.
 ///
-/// Unlike `serial_write_fmt`, this function does NOT spin-wait on
+/// Unlike [`write_line`], this function does NOT spin-wait on
 /// `CONSOLE_LOCK` — an NMI can interrupt a CPU that already holds the
 /// lock, and spinning would deadlock. Instead it swaps the lock,
 /// writes, and restores the prior lock state so the interrupted
@@ -355,156 +399,61 @@ pub unsafe fn nmi_write_fmt(_args: core::fmt::Arguments) {}
 #[cfg(test)]
 pub unsafe fn panic_write_fmt(_args: core::fmt::Arguments) {}
 
-/// Write a `[S.NNNNNN] ` timestamp prefix to the kernel console before each line.
+/// Print one line to the kernel console, or, while a reader is attached to
+/// the kernel log, append it as a log record (`crate::klog::print`).
 ///
-/// Format: `[S.NNNNNN] ` where S is whole seconds (variable width) and NNNNNN
-/// is zero-padded microseconds (6 digits). Source: TSC on x86-64,
-/// the `time` CSR on RISC-V — both are interrupt-independent and give
-/// sub-microsecond raw resolution.
-///
-/// Before the timer is calibrated (pre-Phase 5), prints `[--------] ` — 8
-/// dashes inside brackets to match the width of `[0.000000]`.
-///
-/// Called by `kprintln!` at the start of every line. The bare `kprint!` macro
-/// does not prepend a timestamp (it is for partial-line writes only).
-///
-/// No effect in test builds (no hardware timer available).
-///
-/// # Modification notes
-/// - To add nanosecond resolution: change the `elapsed_us` call to an
-///   `elapsed_ns` variant and update the format field to `{:09}`.
-/// - To change the width of the fallback: match the inner char count of the
-///   format string (currently 8: one digit + dot + six digits).
-#[cfg(not(test))]
-pub fn print_timestamp()
-{
-    use crate::arch::current::timer;
-
-    let Some(us) = timer::elapsed_us()
-    else
-    {
-        // Timer not yet calibrated (pre-Phase 5). Fixed-width placeholder so
-        // pre-boot lines are visually distinct from timed lines.
-        // Width matches "[0.000000]": 8 inner chars → 8 dashes.
-        // SAFETY: console is initialised before kprintln! is used.
-        unsafe {
-            console_write_fmt(format_args!("[--------] "));
-        }
-        return;
-    };
-
-    let sec = us / 1_000_000;
-    let us_frac = us % 1_000_000;
-
-    // `core::fmt` formats the integers in place: no heap, no float.
-    // SAFETY: console is initialised before kprintln! is used.
-    unsafe {
-        console_write_fmt(format_args!("[{sec}.{us_frac:06}] "));
-    }
-}
-
-/// No-op stub for test builds (no hardware timer).
-#[cfg(test)]
-pub fn print_timestamp() {}
-
-/// Serial-only variant of [`print_timestamp`].
-#[cfg(not(test))]
-pub fn print_serial_timestamp()
-{
-    use crate::arch::current::timer;
-
-    let Some(us) = timer::elapsed_us()
-    else
-    {
-        // SAFETY: console is initialised.
-        unsafe {
-            serial_write_fmt(format_args!("[--------] "));
-        }
-        return;
-    };
-
-    let sec = us / 1_000_000;
-    let us_frac = us % 1_000_000;
-
-    // SAFETY: console is initialised.
-    unsafe {
-        serial_write_fmt(format_args!("[{sec}.{us_frac:06}] "));
-    }
-}
-
-/// No-op stub for test builds.
-#[cfg(test)]
-pub fn print_serial_timestamp() {}
-
-/// Print a formatted string to the kernel console.
-///
-/// Accepts the same format arguments as `std::print!`. Requires
-/// `console::init()` to have been called.
+/// For an address-free kernel line: it carries no kernel virtual address, no
+/// KASLR-derived value and no physical address, since a log record reaches
+/// userspace (`core/kernel/docs/kernel-log.md` § Print classes). Accepts the
+/// same format arguments as `std::println!`. Written directly, the line is
+/// `[S.NNNNNN] kernel: <text>` on the serial port and the framebuffer.
 #[macro_export]
-macro_rules! kprint {
-    ($($arg:tt)*) => {{
-        // Capture format_args! outside the unsafe block to avoid expanding
-        // metavariables inside unsafe (clippy::macro_metavars_in_unsafe).
-        let _args = format_args!($($arg)*);
-        // SAFETY: console is initialized before any macro usage.
-        unsafe {
-            $crate::console::console_write_fmt(_args);
-        }
-    }};
+macro_rules! kprintln {
+    ($($arg:tt)*) => {
+        $crate::klog::print($crate::console::Sink::Console, format_args!($($arg)*))
+    };
 }
 
-/// Print a formatted string to serial only (no framebuffer).
-///
-/// The serial-only path for kernel virtual addresses and other KASLR-derived values,
-/// and for userspace fault diagnostics; see
-/// `core/kernel/docs/cross-boundary-disclosure.md` § Kernel console diagnostics.
+/// [`kprintln!`] for a diagnostic of a userspace thread's fault: what the
+/// kernel's fault message to a handler carries, and the thread's own user
+/// registers. Written directly, the line goes to the serial port only.
 #[macro_export]
-macro_rules! kprint_serial {
-    ($($arg:tt)*) => {{
-        let _args = format_args!($($arg)*);
-        // SAFETY: console is initialized before any macro usage.
-        unsafe {
-            $crate::console::serial_write_fmt(_args);
-        }
-    }};
+macro_rules! kprintln_fault {
+    ($($arg:tt)*) => {
+        $crate::klog::print($crate::console::Sink::Serial, format_args!($($arg)*))
+    };
 }
 
-/// Print a formatted string followed by `\n` to serial only.
+/// Print one line to the serial port only, never as a log record.
 ///
-/// Prepends a `[S.NNNNNN] kernel: ` timestamp prefix (via serial only).
-/// The serial-only path for kernel virtual addresses and other KASLR-derived values,
-/// and for userspace fault diagnostics; see
+/// The path for a line carrying a kernel virtual address, a KASLR-derived
+/// value or a physical address; see
 /// `core/kernel/docs/cross-boundary-disclosure.md` § Kernel console diagnostics.
 #[macro_export]
 macro_rules! kprintln_serial {
-    () => {
-        $crate::kprint_serial!("\n")
-    };
     ($($arg:tt)*) => {{
-        $crate::console::print_serial_timestamp();
-        $crate::kprint_serial!("kernel: {}\n", format_args!($($arg)*))
+        let _args = format_args!($($arg)*);
+        // SAFETY: console is initialized before any macro usage.
+        unsafe {
+            $crate::console::write_line(
+                $crate::console::Sink::Serial,
+                $crate::console::now_us(),
+                _args,
+            );
+        }
     }};
 }
 
-/// Print a formatted string followed by `\n` to the kernel console.
-///
-/// Prepends a `[S.NNNNNN] kernel: ` prefix before each line: timestamp
-/// (seconds elapsed since timer calibration) followed by the component
-/// identifier `kernel: `. Pre-Phase 5 lines show `[--------] kernel: ` instead.
-/// Accepts the same format arguments as `std::println!`. Requires
-/// `console::init()` to have been called.
-///
-/// Use `kprint!` (without the `ln`) for partial-line writes where the
-/// timestamp should not be inserted mid-line.
+/// Print one line to the kernel console whether or not a reader is attached:
+/// a report of a failure in which the reader may not run (the watchdog, a
+/// fatal error). First prints the log records no reader has acknowledged
+/// (`crate::klog::flush`), so the lines before the failure come out ahead of
+/// it.
 #[macro_export]
-macro_rules! kprintln {
-    () => {
-        $crate::kprint!("\n")
+macro_rules! kprintln_direct {
+    ($($arg:tt)*) => {
+        $crate::klog::print_direct(format_args!($($arg)*))
     };
-    ($($arg:tt)*) => {{
-        $crate::console::print_timestamp();
-        $crate::kprint!("kernel: {}\n", format_args!($($arg)*))
-    }};
 }
 
 /// NMI-safe variant of [`kprintln_serial!`]: swap-and-restore on

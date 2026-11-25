@@ -69,6 +69,7 @@ pub enum ObjectType
     /// capability slot.
     ArenaPage = 13,
     EntropyControl = 14,
+    KernelLog = 15,
 }
 
 // ── KernelObjectHeader ────────────────────────────────────────────────────────
@@ -901,6 +902,7 @@ unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
         | ObjectType::WaitSet
         | ObjectType::SbiControl
         | ObjectType::EntropyControl
+        | ObjectType::KernelLog
         | ObjectType::ArenaPage => crate::fatal("lineage_of: not a range-capability object"),
     }
 }
@@ -1377,6 +1379,19 @@ pub struct SbiControlObject
 /// `SYS_ENTROPY_CONTRIBUTE`; it carries no fields.
 #[repr(C)]
 pub struct EntropyControlObject
+{
+    pub header: KernelObjectHeader,
+}
+
+/// Kernel object for kernel-log read authority (`KernelLog` capability).
+///
+/// There is exactly one `KernelLog` object, created at boot. Grants the
+/// holder authority to read and acknowledge the kernel's log records with
+/// `SYS_KERNEL_LOG_READ` and bind their notification with
+/// `SYS_KERNEL_LOG_BIND`; it carries no fields, the log being the kernel's
+/// one `klog` ring.
+#[repr(C)]
+pub struct KernelLogObject
 {
     pub header: KernelObjectHeader,
 }
@@ -2223,6 +2238,7 @@ const _: () = {
     assert!(size_of::<SchedControlObject>() as u64 <= floor);
     assert!(size_of::<SbiControlObject>() as u64 <= floor);
     assert!(size_of::<EntropyControlObject>() as u64 <= floor);
+    assert!(size_of::<KernelLogObject>() as u64 <= floor);
     assert!(size_of::<ThreadObject>() as u64 <= floor);
     assert!(size_of::<AddressSpaceObject>() as u64 <= floor);
     assert!(size_of::<CSpaceKernelObject>() as u64 <= floor);
@@ -3094,6 +3110,7 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
         | ObjectType::WaitSet
         | ObjectType::SbiControl
         | ObjectType::EntropyControl
+        | ObjectType::KernelLog
         | ObjectType::ArenaPage => crate::fatal("deferred reclaim: object type carries no link"),
     }
 }
@@ -3182,6 +3199,7 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
         | ObjectType::WaitSet
         | ObjectType::SbiControl
         | ObjectType::EntropyControl
+        | ObjectType::KernelLog
         | ObjectType::ArenaPage =>
         {
             // SAFETY: refcount 0; no other references exist; no lock held
@@ -3997,7 +4015,8 @@ pub unsafe fn object_for_new_slot(
         | CapTag::WaitSet
         | CapTag::SchedControl
         | CapTag::SbiControl
-        | CapTag::EntropyControl =>
+        | CapTag::EntropyControl
+        | CapTag::KernelLog =>
         {
             // A new slot is the reference userspace can multiply, so it is
             // refused at the ceiling (`REF_COUNT_LIMIT`).
@@ -4434,6 +4453,12 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: refcount 0, exclusively owned EntropyControlObject
             // (dealloc_object's contract); no lock is held.
             unsafe { free_body::<EntropyControlObject>(ptr, stack) };
+        }
+        ObjectType::KernelLog =>
+        {
+            // SAFETY: refcount 0, exclusively owned KernelLogObject
+            // (dealloc_object's contract); no lock is held.
+            unsafe { free_body::<KernelLogObject>(ptr, stack) };
         }
 
         // ── Arena page kept past its CSpace ───────────────────────────────
@@ -4946,6 +4971,11 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // names, released only once no device-IRQ delivery can reach
                 // it (`irq` module doc § Notification references), so at zero
                 // no binding names this state.
+
+                // The kernel log's binding holds no reference: clear it here,
+                // under its lock, before the state is freed, so the timer
+                // tick's signal never reaches a freed notification.
+                crate::klog::forget_notification(state);
 
                 // Wait-set membership holds a +1 cap-level ref on the source
                 // (see `sys_wait_set_add` / `wait_set_drop`); reaching dealloc

@@ -29,12 +29,22 @@ version = "0.1.5"
 name = "boot"
 version = "0.1.5"
 dependencies = [
+ "boot-firmware",
  "boot-protocol",
  "crypto",
  "elf",
+ "firmware-tables",
  "font",
  "objsig",
  "text",
+]
+
+[[package]]
+name = "boot-firmware"
+version = "0.1.5"
+dependencies = [
+ "boot-protocol",
+ "firmware-tables",
 ]
 
 [[package]]
@@ -163,6 +173,7 @@ dependencies = [
  "devmgr-firmware",
  "driver-binding",
  "elf",
+ "firmware-tables",
  "ipc",
  "namespace-protocol",
  "ns-client",
@@ -181,6 +192,7 @@ dependencies = [
  "aml",
  "boot-policy",
  "driver-binding",
+ "firmware-tables",
  "ipc",
  "objsig",
  "svc-grammar",
@@ -235,6 +247,10 @@ name = "fb-charset"
 version = "0.1.5"
 
 [[package]]
+name = "firmware-tables"
+version = "0.1.5"
+
+[[package]]
 name = "font"
 version = "0.1.5"
 
@@ -268,10 +284,12 @@ version = "0.1.5"
 name = "fuzz-targets"
 version = "0.1.5"
 dependencies = [
+ "boot-firmware",
  "boot-protocol",
  "devmgr-firmware",
  "driver-binding",
  "elf",
+ "firmware-tables",
  "fuzz-engine",
  "hwrng-protocol",
  "init-protocol",

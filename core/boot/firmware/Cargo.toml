@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "boot-firmware"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The handoff types the decoders fill: MmioAperture, AplicDomain, ImsicLayout,
+# IoApicEntry, PagingMode and the HART_CAP_* bits.
+boot-protocol = { workspace = true }
+# The table formats both firmware readers share: the ACPI SDT, XSDT, MADT,
+# MCFG, DMAR and SPCR layers and the flattened device tree's token stream.
+firmware-tables = { path = "../../../shared/firmware-tables" }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true

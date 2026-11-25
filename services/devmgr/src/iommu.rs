@@ -93,6 +93,7 @@ use firmware::iommu_restart::{
     self, Domain, Domains, Holds, Outcome, Refusal, RemapEntry, RemapTable, Remaps, Replay,
 };
 use firmware::rimt;
+use firmware_tables::dmar::drhd_units;
 use ipc::{IpcMessage, iommu_errors, iommu_labels, memmgr_errors, memmgr_labels};
 use restart_budget::RestartBudget;
 use syscall_abi::{PAGE_SIZE, SyscallError};
@@ -1636,7 +1637,7 @@ fn vtd_units(
     let bridges = bridges(devices);
     let mut handed = Handed::default();
     let mut unit_index = Vec::new();
-    for unit in dmar::drhd_units(&dmar_bytes)
+    for unit in drhd_units(&dmar_bytes)
     {
         if unit_index.try_reserve(1).is_err() || !handed.reserve()
         {
@@ -1645,7 +1646,8 @@ fn vtd_units(
         let seg = unit.segment;
         let mut scopes = Vec::new();
         let range = |b: Bdf| bridge_range(&bridges, seg, b);
-        unit.resolve_scopes(
+        dmar::resolve_scopes(
+            &unit,
             &dmar_bytes,
             |b| range(b).map(|r| r.0),
             range,

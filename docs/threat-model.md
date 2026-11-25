@@ -409,33 +409,51 @@ is.
   ([testing.md](testing.md) § Bounded verification). CI's `kani` job runs them.
 - `devmgr-firmware` (`xtask/fuzz/targets/src/bin/devmgr-firmware.rs`) drives
   `devmgr_firmware::property::firmware_holds` over an input read as each firmware table devmgr's
-  `firmware` crate decodes, from the seeds in
-  `services/devmgr/firmware/fuzz/devmgr-firmware/seeds/`: the RSDP, an SDT header, the XSDT, the
-  FADT, the MCFG, the MADT, the DMAR, the RIMT, the SPCR, a DSDT or SSDT's AML with each reported
-  device's resource template, a resource template, and a flattened device tree. CI's gating `fuzz`
-  job runs it on a pull request whose change can affect it and the campaign for 30 minutes.
-- The `proofs` modules of `services/devmgr/firmware/src/acpi.rs`,
-  `services/devmgr/firmware/src/dmar.rs`, `services/devmgr/firmware/src/rimt.rs`,
-  `services/devmgr/firmware/src/platform.rs`, `services/devmgr/firmware/src/aml.rs` and
-  `services/devmgr/firmware/src/dtb.rs` prove the same property ([testing.md](testing.md)
-  § Bounded verification); CI's `kani` job runs them. The RSDP, an SDT header, the XSDT up to two
-  entries, the FADT, the SPCR and the device tree's header are proven whole on any input up to
-  their bounds; the MCFG, the MADT, the DMAR, the RIMT, the AML, a resource template and the device
-  tree by their steps: each table's end, an MCFG entry, a MADT structure, a DMAR remapping structure
-  and device scope, a RIMT node and ID mapping, an AML term, the record of a `Name`'s value, the
-  take of a `_CID` value and of each element of a `_CID` `Package`, the take of a `Method` and
-  the rule that reports a device, one resource descriptor after any count of resources, a device
-  tree token, the walk's step over the structure block and the step of an ECAM node's read from any
-  state, the reads of the node's properties and its window, the `compatible` match and the fallback
-  segments, at any place. The loops that drive the steps are left to the fuzz target.
+  `firmware` crate interprets, from the seeds in
+  `services/devmgr/firmware/fuzz/devmgr-firmware/seeds/`: the FADT, the MADT, the DMAR, the RIMT, a
+  DSDT or SSDT's AML with each reported device's resource template, a resource template, and a
+  flattened device tree. `firmware-tables` (`xtask/fuzz/targets/src/bin/firmware-tables.rs`)
+  drives `firmware_tables::property::tables_holds` over the formats both devmgr and the bootloader
+  read, from the seeds in `shared/firmware-tables/fuzz/firmware-tables/seeds/`: the RSDP, an SDT
+  header, the XSDT, the MCFG, the MADT, the DMAR, the SPCR, and a flattened device tree.
+  `boot-firmware` (`xtask/fuzz/targets/src/bin/boot-firmware.rs`) drives
+  `boot_firmware::property::boot_firmware_holds` over the bootloader's readings of them, from the
+  seeds in `core/boot/firmware/fuzz/boot-firmware/seeds/`: a memory map with the range a table
+  claims, the MADT, RHCT, SSDT, TPM2, SPCR and DMAR the bootloader reads, the aperture seeds of any
+  ACPI table, a flattened device tree, and a list of CPU IDs. CI's gating `fuzz` job runs them on
+  a pull request whose change can affect them and the campaign for 30 minutes each.
+- The `proofs` modules of `shared/firmware-tables/src/acpi.rs`,
+  `shared/firmware-tables/src/dmar.rs`, `shared/firmware-tables/src/spcr.rs` and
+  `shared/firmware-tables/src/fdt.rs` prove that crate's property ([testing.md](testing.md) §
+  Bounded verification): the RSDP, an SDT header, the XSDT up to two entries, the SPCR and the
+  device tree's header whole on any input up to their bounds; the MCFG, the MADT, the DMAR and the
+  device tree by their steps: each table's end, an MCFG entry, a MADT structure, a DMAR remapping
+  structure, a device tree token, a `reg` read and the `compatible` match, at any place. Those of
+  `services/devmgr/firmware/src/acpi.rs`, `services/devmgr/firmware/src/dmar.rs`,
+  `services/devmgr/firmware/src/rimt.rs`, `services/devmgr/firmware/src/aml.rs` and
+  `services/devmgr/firmware/src/dtb.rs` prove devmgr's interpretations: the FADT whole; the MADT's
+  interrupt-controller window and each structure's interpretations; the DMAR's flags and each device
+  scope; the RIMT by its end, each node and ID mapping; the AML by each term, the record of a
+  `Name`'s value, the take of a `_CID` value and of each element of a `_CID` `Package`, the take of
+  a `Method` and the rule that reports a device, and one resource descriptor after any count of
+  resources; and the device tree walk's step over the structure block and the step of an ECAM node's
+  read from any state, the reads of the node's properties and its window, and the fallback segments.
+  Those of `core/boot/firmware/src/region.rs`, `core/boot/firmware/src/acpi.rs`,
+  `core/boot/firmware/src/seeds.rs`, `core/boot/firmware/src/dtb.rs`,
+  `core/boot/firmware/src/cpus.rs` and `core/boot/firmware/src/isa.rs` prove the bootloader's: each
+  memory-map descriptor's reading and its refusal or advance, the check that bounds every table's
+  slice before any decode
+  ([core/boot/docs/firmware-parsing.md](../core/boot/docs/firmware-parsing.md) § Table Bounds); each
+  MADT structure's layout and the IMSIC layout, an RHCT node's header, the `VGIA` scan, the TPM2
+  window and the SPCR's MMIO base; each aperture seed; the record of a CPU ID and the sizing of the
+  CPU-ID array; and the steps of the compatible, CPU and interrupt-controller walks of the device
+  tree from any state, the `mmu-type` claim, the time base, the IMSIC files and the ISA string's
+  match. CI's `kani` job runs them. The loops that drive the steps are left to the fuzz targets.
 
 **Gaps.**
 
 - The bundle header is unsigned, so the attacker can drop an entry, which fails the boot when it is
   needed ([signing.md](signing.md) § Which Stage Verifies What).
-- The bootloader's firmware-table parsers (`core/boot/src/acpi.rs` and `core/boot/src/dtb.rs`) have
-  no fuzz target or proof harness yet; they are planned
-  ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---
 

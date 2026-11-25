@@ -1584,10 +1584,10 @@ or body):
   `PerCpuScheduler`, or `Prng` inside `CpuRng`), and so is a change to a constant that sizes a
   per-CPU allocation (`KERNEL_STACK_PAGES` for the idle stacks, and `TAG_STATE_BYTES`, the tag-state
   slab's element size);
-- CPU enumeration and bringup: in the bootloader, `parse_cpu_topology`, `parse_madt_topology`
-  and the MADT walk behind it (`madt_topology`, `madt_cpu_ids`, and the per-CPU
-  `record_cpu_id`), `place_cpu_ids`, `parse_cpu_count` and `place_hart_ids`, the sizing of the
-  CPU-id array (`cpu_topology_capacity`, `cpu_id_capacity`, and `allocate_cpu_ids`),
+- CPU enumeration and bringup: in the bootloader, the MADT walk (`madt_cpu_ids`), the device
+  tree's (`for_each_cpu`, `cpu_count` and `place_hart_ids`), the placement both feed
+  (`place_cpu_ids` and the per-CPU `record_cpu_id`), the sizing of the CPU-id array
+  (`cpu_id_capacity` and `allocate_cpu_ids`),
   `step5_discover_cpu_topology`, `CpuTopology`, `discover_boot_hart_id` and `bsp_hardware_id`
   (the source of the BSP id that becomes `cpu_ids[0]`), and the handoff of the count and the CPU
   ids into `BootInfo` (`cpus.count` and `cpus.ids_phys`); in the kernel, the boot CPU count and
@@ -1658,8 +1658,8 @@ S="$S|PerCpuSlab|alloc_per_cpu_slab"
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|VectorRow|CpuTopology"
 S="$S|SlotEntry|DeliveryGate|SyscallScratch|CoreSlot"
-S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
-S="$S|madt_cpu_ids|place_cpu_ids|place_hart_ids|cpu_topology_capacity|cpu_id_capacity"
+S="$S|madt_cpu_ids|for_each_cpu|cpu_count|record_cpu_id|place_cpu_ids|place_hart_ids"
+S="$S|cpu_id_capacity"
 S="$S|allocate_cpu_ids|cpus\.count|cpus\.ids_phys|info\.cpu_count|boot_cpu_ids"
 S="$S|step5_discover_cpu_topology|start_ap|discover_boot_hart_id|bsp_hardware_id"
 S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"
@@ -1852,7 +1852,7 @@ the cells of every surface a non-inert line of its own diff is on.
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay` and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | TPM 2.0, and the bootloader's seed of its registers | `services/drivers/tpm/`, its class protocol crate (`shared/hwrng-protocol/`), which the virtio-rng row lists too, the host test that drives it (`xtask/src/commands/test/tpm.rs`), and the launchers' TPM attachment (`Tpm`, `TpmInterface`, and `tpm_args`); and the bootloader's `TPM2` table seed, which only a boot with a TPM takes (`tpm2_register_window`, `tpm_register_window`, `TPM2_OFF_CONTROL_AREA`, `TPM2_OFF_START_METHOD`, `TPM2_MIN_LEN`, `TPM2_START_FIFO`, and `TPM2_START_CRB`) | tpm |
-| The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
+| The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `take_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
 | The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test/cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack` and `qemu_knows_cet_ss`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); the code that runs on the supervisor shadow stack at every entry from user mode, or decides whether shadow stacks are on (`seraph_enter_from_user`, `__x86_indirect_thunk_r11`, `rewrites_returns`, and `RETURN_REWRITING`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,

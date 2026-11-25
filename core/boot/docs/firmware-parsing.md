@@ -68,6 +68,64 @@ passthrough addresses the same way.
 
 ---
 
+## Table Bounds
+
+Every firmware table is hostile input: its own length field (an SDT header's `Length`, a device
+tree header's `totalsize`) is a value the firmware wrote, and a bootloader that made a slice of
+that many bytes from the table's address would read wherever the value points. The bootloader
+therefore makes a slice of firmware memory in one place,
+[`core/boot/src/tables.rs::TableMap::view`](../src/tables.rs), and only for a range the UEFI
+memory map gives wholly to firmware data:
+
+1. The RSDP is viewed at its fixed 36 bytes; each SDT, the XSDT included, first as its 36-byte
+   header, then at the length the header reports; the device tree first as its 40-byte header,
+   then at its `totalsize`.
+2. Each view is checked by `boot_firmware::region::firmware_range` against the memory map's
+   descriptors: every byte of the range must lie in a descriptor of an accepted type, abutting
+   descriptors joined, and no descriptor of a refused type may overlap it. A range whose end
+   overflows the address space is refused.
+3. A refused view makes no slice. The table reads as absent, as a malformed one does, and the
+   console reports the table, its address range, and the memory type or the hole that refused it
+   (once per address; the reads before the serial console is up report nothing).
+
+The memory map is the cap on a hostile length: whatever a length field says, a slice cannot reach
+memory-mapped I/O, a hole, or free memory. No constant caps a table's size. The decoders in
+`core/boot/firmware` and `shared/firmware-tables` then read only inside the slice they are
+given, which their property checks, fuzz targets and proof harnesses establish
+([core/boot/firmware/README.md](../firmware/README.md),
+[docs/testing.md](../../../docs/testing.md#bounded-verification)).
+
+The map is the one `efi_main` takes before the console is up, for every read up to the count
+pass ahead of step 6, after which it is freed; a table lies in memory whose type the boot never
+changes (allocations change only free memory to a loader type), so that map bounds each table as
+well as a later one. From step 9 on, after `ExitBootServices`, the reads use step 7's final map,
+the last of them ahead of that map's scrub. When the first `GetMemoryMap` fails, every view is
+refused and the boot proceeds as on a platform without firmware tables.
+
+The accepted types are those UEFI 2.10 lets a table or a device tree occupy:
+
+| Type | Accepted | Why |
+|---|---|---|
+| `EfiACPIReclaimMemory` | yes | ACPI tables loaded at boot may live here (recommended) (§ 2.3.2 and the per-architecture § 2.3.x lists); the device tree must (§ 4.6.1.3; EBBR § 2.4.2) |
+| `EfiACPIMemoryNVS` | yes | ACPI tables may live here, and the FACS must (§ 2.3.x) |
+| `EfiRuntimeServicesData` | yes | a configuration table loaded at boot may live here (recommended) (§ 2.3.x); the RSDP is one (§ 4.6) |
+| `EfiBootServicesData` | yes | a configuration table loaded at boot may live here (§ 2.3.x); EDK2's QEMU platforms leave the device tree here |
+| `EfiLoaderData` | yes | a UEFI application may modify or replace the device tree (§ 4.6.1.3), and its data is this type (Table 7.5) |
+| `EfiReservedMemoryType` | yes | § 2.3.2 states an intent that no configuration table lives here, not a requirement; accepted so firmware that leaves a table there still boots with it |
+| `EfiLoaderCode`, `EfiBootServicesCode`, `EfiRuntimeServicesCode` | no | code, which holds no table |
+| `EfiConventionalMemory` | no | free memory (Table 7.5), which no table occupies |
+| `EfiUnusableMemory` | no | memory with errors (Table 7.5) |
+| `EfiMemoryMappedIO`, `EfiMemoryMappedIOPortSpace` | no | device registers, whose reads have side effects |
+| `EfiPalCode` | no | Itanium firmware code |
+| `EfiPersistentMemory` | no | `AllocatePages` refuses the type (§ 7.2.1), so firmware cannot place a table there |
+| `EfiUnacceptedMemoryType` | no | memory not yet accepted by the guest, which faults on access |
+| any other value | no | undefined types, and the OEM and OS ranges, whose contents UEFI does not define |
+
+No real-hardware memory map has been checked against this list; QEMU's (q35 and virt, under EDK2)
+place every table the bootloader reads in an accepted type.
+
+---
+
 ## Per-parser invariants
 
 Table-walk details — RSDP/XSDT/MADT/MCFG validation, entry-type
@@ -77,8 +135,15 @@ with the parser each covers:
 - ACPI walk invariants: [acpi.md](acpi.md).
 - Device Tree walk invariants: [dtb.md](dtb.md).
 
+The decoders are slice-taking functions in two host-tested crates: the format layer both the
+bootloader and devmgr read (RSDP, SDT header, XSDT, MADT and DMAR structure steps, MCFG, SPCR,
+the flattened device tree's header and token walk) in
+[shared/firmware-tables](../../../shared/firmware-tables/README.md), and the bootloader's own
+readings of them (CPU IDs, AIA, hart capabilities, the TPM and VMGENID scans, the aperture
+seeds, the memory-map check) in [core/boot/firmware](../firmware/README.md).
+
 This document covers only the cross-parser coordination: dispatch
-(above), aperture construction (below), and parsing-depth policy.
+(above), table bounds (above), aperture construction (below), and parsing-depth policy.
 
 ---
 
@@ -91,12 +156,13 @@ after `ExitBootServices` by
 1. Collect `EfiMemoryMappedIO` and `EfiMemoryMappedIOPortSpace`
    descriptors from the raw UEFI memory map.
 2. Union with the seeds produced by
-   [`core/boot/src/acpi.rs::parse_aperture_seed`](../src/acpi.rs) and
-   [`core/boot/src/dtb.rs::parse_aperture_seed`](../src/dtb.rs) for every
-   firmware source that is present, and with the GOP framebuffer, which
+   [`core/boot/src/tables.rs::aperture_seeds`](../src/tables.rs) for every
+   firmware source that is present (`boot_firmware::seeds::acpi_table_seeds` over
+   each ACPI table, the arch defaults, then `boot_firmware::dtb::Tree::seeds`), and
+   with the GOP framebuffer, which
    UEFI typically reports as `EfiReservedMemoryType` and only the bootloader can
    carry past `ExitBootServices`. The seeds go to a buffer step 6 sized from a
-   count pass of the same seeders over the same tables (`count_aperture_seed`),
+   count pass of the same walk over the same tables, ahead of step 6,
    one slot more for the framebuffer, so every seed has a slot; the ACPI
    seeder's heuristic PCI windows go to a separate buffer, sized the same way. A
    seed past its buffer would be dropped with a diagnostic, which only a table

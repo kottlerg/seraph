@@ -22,11 +22,9 @@
 #[cfg(all(target_os = "none", target_arch = "riscv64"))]
 const _: &[u8] = include_bytes!("../linker/riscv64-uefi.ld");
 
-mod acpi;
 mod arch;
 mod boot_device;
 mod console;
-mod dtb;
 mod elf;
 mod enrolment;
 mod error;
@@ -37,6 +35,7 @@ mod paging;
 mod rollback;
 mod secure_boot;
 mod signing;
+mod tables;
 mod uefi;
 
 use crate::elf::{ElfKind, KernelInfo, load_init, load_kernel};
@@ -44,12 +43,17 @@ use crate::error::BootError;
 use crate::firmware::{FirmwareInfo, discover_firmware};
 use crate::paging::{PageTableBuilder, build_initial_tables};
 use crate::signing::{Verifier, parse_store};
+use crate::tables::{Acpi, Snapshot, TableMap};
 use crate::uefi::{
     EFI_RNG_PROTOCOL_GUID, EFI_SUCCESS, EfiBootServices, EfiFileProtocol, EfiGuid, EfiHandle,
     EfiRngProtocol, EfiSystemTable, FirmwareVariables, allocate_pages, connect_all_controllers,
     exit_boot_services, file_read, file_size, free_pages, get_loaded_image, get_memory_map,
     open_esp_volume, open_file, query_gop,
 };
+use boot_firmware::acpi::vmgenid_guid;
+use boot_firmware::cpus::{cpu_id_capacity, place_cpu_ids};
+use boot_firmware::dtb::Tree;
+use boot_firmware::seeds::Seeds;
 use boot_protocol::{
     BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootDevice, BootInfo, BootModule, FramebufferInfo,
     InitImage, KernelMmio, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice, MmioAperture,
@@ -585,10 +589,18 @@ struct BootAllocations
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable) -> usize
 {
+    // The memory map that bounds every firmware-table read before steps 6
+    // and 7 (core/boot/docs/firmware-parsing.md § Table Bounds).
+    // SAFETY: st is the firmware's valid system table.
+    let bs = unsafe { (*st).boot_services };
+    // SAFETY: bs is the firmware's boot services, which have not exited.
+    let snapshot = unsafe { Snapshot::take(bs) };
     // Discover the UART MMIO base from ACPI SPCR or DTB before initializing
     // the serial console. Falls back to the arch default if neither is present.
-    // SAFETY: st is valid; called exactly once before init_serial.
-    unsafe { arch::current::pre_serial_init(st) };
+    // SAFETY: st is valid; called exactly once before init_serial; the
+    // snapshot's map bounds the tables it reads, which the firmware
+    // identity-maps and nothing writes.
+    unsafe { arch::current::pre_serial_init(st, snapshot.map().silent()) };
 
     // SAFETY: serial_init called exactly once, before boot_sequence.
     unsafe {
@@ -596,7 +608,7 @@ pub extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable) -> us
     }
 
     // SAFETY: image and st are valid UEFI handles passed from firmware; boot_sequence called once.
-    match unsafe { boot_sequence(image, st) }
+    match unsafe { boot_sequence(image, st, snapshot) }
     {
         Ok(never) => match never {},
         Err(err) => error::fatal_error(&err),
@@ -613,8 +625,13 @@ pub extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable) -> us
 ///
 /// # Safety
 /// `image` must be the UEFI image handle passed to `efi_main`. `st` must be
-/// a valid pointer to the UEFI system table.
-unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, BootError>
+/// a valid pointer to the UEFI system table. `snapshot` is the memory map
+/// `efi_main` took, whose buffer nothing else references.
+unsafe fn boot_sequence(
+    image: EfiHandle,
+    st: *mut EfiSystemTable,
+    snapshot: Snapshot,
+) -> Result<!, BootError>
 {
     // SAFETY: caller guarantees image and st are the UEFI-provided handles.
     let ctx = unsafe { step1_locate_uefi_protocols(image, st)? };
@@ -658,30 +675,50 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // and the value is dropped at the end of the statement.
     rollback::record_floor(&mut unsafe { FirmwareVariables::new(ctx.st) }, floor);
     // SAFETY: ctx.st is a valid UEFI system table.
-    let firm = unsafe { step5_discover_firmware(&ctx) };
-    // SAFETY: ctx.st is valid; firmware addresses are identity-mapped by UEFI.
-    let cpus = unsafe { step5_discover_cpu_topology(&ctx, &firm)? };
+    let firm = unsafe { step5_discover_firmware(&ctx, &snapshot) };
+    // Every firmware table read before steps 6 and 7 lies where this map
+    // gives it to firmware data (TableMap::view).
+    let tables = snapshot.map();
+    // SAFETY: ctx.st is valid; firmware tables are identity-mapped by UEFI
+    // and nothing writes them.
+    let cpus = unsafe { step5_discover_cpu_topology(&ctx, &firm, tables)? };
     // Negotiate the paging mode before step 6 fixes the table hierarchy depth
     // and step 10 installs it: Sv39/Sv48/Sv57 on riscv64, 4- or 5-level on
     // x86-64, where a depth other than the firmware's also reserves the LA57
     // toggle page.
-    // SAFETY: ctx.bs valid pre-exit; firm.device_tree is zero or an
-    // identity-mapped FDT; the probe masks SIE and restores the live satp.
-    unsafe { arch::current::negotiate_paging(ctx.bs, firm.device_tree, cpus.boot_hart_id)? };
+    // SAFETY: ctx.bs valid pre-exit; the device tree, read through `tables`,
+    // is identity-mapped and unwritten; the probe masks SIE and restores the
+    // live satp.
+    unsafe {
+        arch::current::negotiate_paging(ctx.bs, firm.device_tree, tables, cpus.boot_hart_id)?;
+    };
     // SAFETY: ctx.bs valid pre-exit.
     let ap_trampoline_phys = unsafe { step5b_alloc_ap_trampoline(&ctx) };
     let mut boot_entropy = BootEntropy::NONE;
     // SAFETY: ctx.bs valid pre-exit; draws the boot entropy seed while boot
-    // services (and thus EFI_RNG_PROTOCOL) are still available; firm.device_tree
-    // is zero or an identity-mapped, writable (pre-ExitBootServices) FDT for the
-    // DTB rng-seed fallback's in-place scrub.
-    unsafe { step5c_fetch_boot_entropy(&ctx, &firm, &mut boot_entropy) };
+    // services (and thus EFI_RNG_PROTOCOL) are still available; the device
+    // tree, read through `tables`, is identity-mapped and writable
+    // (pre-ExitBootServices) for the DTB rng-seed fallback's in-place scrub,
+    // and nothing else references it.
+    unsafe { step5c_fetch_boot_entropy(&ctx, &firm, tables, &mut boot_entropy) };
     // Apply the KASLR slide before step 6 maps the segments at their
     // (biased) virtual addresses.
     // SAFETY: kernel.info comes from load_kernel with its span allocation
     // live and identity-mapped; virtual addresses are still unbiased link VAs;
     // ctx.esp_root is valid until ExitBootServices.
     let mut kaslr = unsafe { step5d_apply_kaslr_slide(&ctx, &mut kernel.info, &boot_entropy)? };
+    // The aperture seeds the tables name, counted to size step 6's seed
+    // buffers; step 9 writes them into those buffers by the same walk.
+    let mut counted = Seeds::counting();
+    // SAFETY: as for the topology read.
+    unsafe { tables::aperture_seeds(&firm, tables, &mut counted) };
+    // The snapshot's last reader was the count above; its pages go back to
+    // the firmware before step 6 sizes its allocations to the map.
+    // SAFETY: ctx.bs is valid pre-exit, and no view of the snapshot remains.
+    if unsafe { snapshot.free(ctx.bs) }.is_err()
+    {
+        bprintln!("[--------] boot: memory map snapshot not freed; it stays allocated");
+    }
     // SAFETY: all prior unsafe outputs remain valid; ctx.esp_root is valid
     // until ExitBootServices; steps 6 and 7 allocate via bs, and step 7 is the
     // last pre-exit allocation.
@@ -694,7 +731,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
             &kernel,
             &init,
             &cpus,
-            &firm,
+            counted.found,
             ap_trampoline_phys,
         )?
     };
@@ -1487,13 +1524,19 @@ fn verify_boot_set(
 
 // ── Step 5: Firmware discovery ───────────────────────────────────────────────
 
-/// Scan the UEFI configuration table for the ACPI RSDP and Device Tree GUIDs.
+/// Scan the UEFI configuration table for the ACPI RSDP and Device Tree GUIDs,
+/// and report whether `snapshot`, the map that bounds the table reads, was
+/// read.
 ///
 /// # Safety
 /// `ctx.st` must be a valid UEFI system table pointer.
-unsafe fn step5_discover_firmware(ctx: &UefiContext) -> FirmwareInfo
+unsafe fn step5_discover_firmware(ctx: &UefiContext, snapshot: &Snapshot) -> FirmwareInfo
 {
     bprintln!("[--------] boot: step 5/10: firmware discovery and platform resources");
+    if !snapshot.is_read()
+    {
+        bprintln!("[--------] boot: memory map not read; firmware tables not read");
+    }
     // SAFETY: st is a valid UEFI system table pointer.
     let firm = unsafe { discover_firmware(ctx.st) };
     if firm.acpi_rsdp != 0
@@ -1516,21 +1559,23 @@ unsafe fn step5_discover_firmware(ctx: &UefiContext) -> FirmwareInfo
 }
 
 /// Derive the CPU topology from ACPI MADT (primary on both arches) or DTB
-/// `/cpus` (fallback on RISC-V when ACPI is absent).
+/// `/cpus` (fallback on RISC-V when ACPI is absent), each read through
+/// `tables`.
 ///
 /// Each source is walked twice: once to count its enabled CPU entries, which
-/// sizes the `cpu_ids` allocation (`firmware::cpu_id_capacity`), and once to
-/// fill it.
+/// sizes the `cpu_ids` allocation (`boot_firmware::cpus::cpu_id_capacity`),
+/// and once to fill it (`boot_firmware::cpus::place_cpu_ids`).
 ///
 /// # Errors
 /// [`BootError::OutOfMemory`] when the `cpu_ids` pages cannot be allocated.
 ///
 /// # Safety
-/// `ctx.st` and `ctx.bs` must be valid. `firm.acpi_rsdp` / `firm.device_tree`
-/// must be zero or the physical address of an identity-mapped table.
+/// `ctx.st` and `ctx.bs` must be valid, and the tables `tables` bounds
+/// meet [`TableMap::view`]'s contract.
 unsafe fn step5_discover_cpu_topology(
     ctx: &UefiContext,
     firm: &FirmwareInfo,
+    tables: TableMap<'_>,
 ) -> Result<CpuTopology, BootError>
 {
     // SAFETY: ctx.st is valid.
@@ -1542,12 +1587,21 @@ unsafe fn step5_discover_cpu_topology(
     // Fallback on RISC-V: DTB /cpus if ACPI is absent.
     if firm.acpi_rsdp != 0
     {
-        // SAFETY: acpi_rsdp is identity-mapped; the walk validates the tables.
-        let capacity = unsafe { acpi::cpu_topology_capacity(firm.acpi_rsdp) };
+        // SAFETY: caller contract.
+        let madt = unsafe { Acpi::new(tables, firm.acpi_rsdp) }.and_then(|a| a.table(*b"APIC"));
+        let cpu_ids = || madt.into_iter().flat_map(boot_firmware::acpi::madt_cpu_ids);
+        let capacity = cpu_id_capacity(cpu_ids().count());
         // SAFETY: bs is valid.
         let (ids, ids_phys, ids_pages) = unsafe { allocate_cpu_ids(ctx.bs, capacity)? };
-        // SAFETY: as above.
-        let count = unsafe { acpi::parse_cpu_topology(firm.acpi_rsdp, bsp_id, ids) };
+        // Without a MADT the BSP alone, in slot 0.
+        let (count, truncated) = place_cpu_ids(bsp_id, cpu_ids(), ids);
+        if truncated
+        {
+            bprintln!(
+                "[--------] boot: ACPI: MADT reported more than MAX_CPUS enabled CPUs (BSP \
+                 included); surplus dropped"
+            );
+        }
         bprintln!("[--------] boot: ACPI: {count} CPU(s) found via MADT");
         return Ok(CpuTopology {
             boot_hart_id,
@@ -1557,22 +1611,22 @@ unsafe fn step5_discover_cpu_topology(
             ids_pages,
         });
     }
-    let entries = if firm.device_tree != 0
-    {
-        // SAFETY: device_tree is identity-mapped; parse_cpu_count validates the FDT.
-        unsafe { dtb::parse_cpu_count(firm.device_tree) }
-    }
-    else
-    {
-        0
-    };
+    // SAFETY: caller contract.
+    let tree = unsafe { tables::device_tree(tables, firm.device_tree) }.and_then(Tree::new);
+    let entries = tree.as_ref().map_or(0, Tree::cpu_count);
     // SAFETY: bs is valid.
-    let (ids, ids_phys, ids_pages) =
-        unsafe { allocate_cpu_ids(ctx.bs, firmware::cpu_id_capacity(entries))? };
-    let count = if entries > 0
+    let (ids, ids_phys, ids_pages) = unsafe { allocate_cpu_ids(ctx.bs, cpu_id_capacity(entries))? };
+    let count = if let Some(tree) = tree.as_ref().filter(|_| entries > 0)
     {
-        // SAFETY: device_tree is identity-mapped; the walk validates the FDT.
-        let count = unsafe { dtb::place_hart_ids(firm.device_tree, bsp_id, ids) };
+        let (count, truncated) = tree.place_hart_ids(bsp_id, ids);
+        if truncated
+        {
+            bprintln!(
+                "[--------] boot: DTB: more than MAX_CPUS distinct harts (boot hart included); \
+                 surplus dropped"
+            );
+        }
+        tables::report_limits(tree);
         bprintln!("[--------] boot: DTB: {count} hart(s) found");
         count
     }
@@ -1672,7 +1726,7 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 /// Draws the pool seed from UEFI `EFI_RNG_PROTOCOL` when the firmware exposes
 /// it and the draw succeeds; a failed KASLR draw after a successful pool draw
 /// leaves `len == 32` with `kaslr_available == false`. Otherwise draws from
-/// the DTB `/chosen/rng-seed` reader ([`dtb::parse_rng_seed`]); otherwise
+/// the DTB `/chosen/rng-seed` property ([`boot_firmware::dtb::take_rng_seed`]); otherwise
 /// leaves `len == 0` and `kaslr_available == false`, and the kernel seeds the
 /// pool from its remaining sources and the layout is deterministic (no
 /// regression). Which firmware exposes which source is documented in
@@ -1680,8 +1734,13 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 ///
 /// # Safety
 /// `ctx.bs` must be valid UEFI boot services (before `ExitBootServices`);
-/// `firm.device_tree` must be 0 or an identity-mapped writable FDT.
-unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out: &mut BootEntropy)
+/// the device tree `tables` bounds meets [`TableMap::view_mut`]'s contract.
+unsafe fn step5c_fetch_boot_entropy(
+    ctx: &UefiContext,
+    firm: &FirmwareInfo,
+    tables: TableMap<'_>,
+    out: &mut BootEntropy,
+)
 {
     let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
     // SAFETY: `ctx.bs` points to valid boot services (caller contract), so the `locate_protocol`
@@ -1745,8 +1804,11 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out:
     // seeds the entropy pool (non-overlapping so the pool seed never
     // reveals the KASLR words).
     let mut dtb_seed = [0u8; 32];
-    // SAFETY: firm.device_tree is 0 or an identity-mapped writable FDT.
-    let n = unsafe { dtb::parse_rng_seed(firm.device_tree, &mut dtb_seed) };
+    // SAFETY: caller contract: the tree is identity-mapped, writable before
+    // ExitBootServices, and referenced nowhere else.
+    let n = unsafe { tables::device_tree_mut(tables, firm.device_tree) }.map_or(0, |blob| {
+        boot_firmware::dtb::take_rng_seed(blob, &mut dtb_seed)
+    });
     let drawn = dtb_seed.get(..n).unwrap_or_default();
     let split = drawn.split_at_checked(16).filter(|_| drawn.len() >= 24);
     #[expect(
@@ -1951,8 +2013,8 @@ unsafe fn knob_present(ctx: &UefiContext, path: &[u16], name: &'static str) -> b
 #[expect(
     clippy::too_many_arguments,
     reason = "step 6 sizes its allocations from every earlier step's output (the boot modules' \
-              regions, the kernel and init loads, the CPU topology, the firmware tables for the seed counts), plus the \
-              retry's slack"
+              regions, the kernel and init loads, the CPU topology, the firmware tables' seed \
+              counts), plus the retry's slack"
 )]
 unsafe fn step6_allocate_and_build_page_tables(
     ctx: &UefiContext,
@@ -1961,7 +2023,7 @@ unsafe fn step6_allocate_and_build_page_tables(
     kernel: &KernelLoad,
     init: &InitLoad,
     cpus: &CpuTopology,
-    firm: &FirmwareInfo,
+    seed_counts: (usize, usize),
     ap_trampoline_phys: u64,
     slack: usize,
 ) -> Result<(BootAllocations, arch::current::BootPageTable), BootError>
@@ -1983,17 +2045,13 @@ unsafe fn step6_allocate_and_build_page_tables(
     // MemoryMapEntry output array.
     // SAFETY: bs is valid.
     let mem_entries_phys = unsafe { allocate_pages(ctx.bs, mem_entries_pages)? };
-    // Aperture seed buffers, sized by the seeders' count pass over the same
-    // firmware tables step 9 reads (one more named seed for the framebuffer).
-    // SAFETY: acpi_rsdp and device_tree are zero or identity-mapped firmware
-    // tables; the seeders validate them.
-    let (acpi_named, heuristic_capacity) = unsafe { acpi::count_aperture_seed(firm.acpi_rsdp) };
-    // SAFETY: as above.
-    let dtb_named = unsafe { dtb::count_aperture_seed(firm.device_tree) };
+    // Aperture seed buffers, sized by the count pass over the same firmware
+    // tables step 9 reads (`seed_counts`: named, heuristic), with one more
+    // named seed for the framebuffer.
+    let (named_capacity, heuristic_capacity) = seed_counts;
     // A count too large to size saturates, and the allocation below then fails.
-    let seeds_capacity = acpi_named
-        .saturating_add(dtb_named)
-        .saturating_add(usize::from(ctx.framebuffer.physical_base != 0));
+    let seeds_capacity =
+        named_capacity.saturating_add(usize::from(ctx.framebuffer.physical_base != 0));
     let seed_bytes = core::mem::size_of::<MmioAperture>();
     let seeds_pages = seeds_capacity
         .saturating_mul(seed_bytes)
@@ -2362,7 +2420,7 @@ unsafe fn steps6_and_7_sized_to_the_map(
     kernel: &KernelLoad,
     init: &InitLoad,
     cpus: &CpuTopology,
-    firm: &FirmwareInfo,
+    seed_counts: (usize, usize),
     ap_trampoline_phys: u64,
 ) -> Result<
     (
@@ -2398,7 +2456,7 @@ unsafe fn steps6_and_7_sized_to_the_map(
                 kernel,
                 init,
                 cpus,
-                firm,
+                seed_counts,
                 ap_trampoline_phys,
                 slack,
             )?
@@ -2635,9 +2693,14 @@ unsafe fn step9_populate_boot_info(
     // kernel_mmio: arch-dispatched extractor. Per-field docs on `KernelMmio`
     // state whether a zero field falls back to a kernel compiled-in constant
     // or is fatal at the consuming subsystem's initialization.
+    // The step 7 map bounds the firmware-table reads from here on; its last
+    // reader is the VMGENID scan below, ahead of its scrub.
+    // SAFETY: uefi_map is step 7's map, its buffer identity-mapped, and
+    // nothing writes it until the scrub after the last read.
+    let tables = unsafe { TableMap::of(uefi_map) };
     let mut kernel_mmio = KernelMmio::zero();
-    // SAFETY: firmware addresses are identity-mapped; each arch validates.
-    unsafe { arch::current::populate_kernel_mmio(firm, &mut kernel_mmio) };
+    // SAFETY: the tables are identity-mapped and nothing writes them.
+    unsafe { arch::current::populate_kernel_mmio(firm, tables, &mut kernel_mmio) };
 
     // mmio_apertures: merge firmware-table seeds with the raw UEFI MMIO
     // descriptors. Both ACPI and DTB parsers are tried on every architecture;
@@ -2681,14 +2744,14 @@ unsafe fn step9_populate_boot_info(
             allocs.heuristic_capacity,
         )
     };
-    // SAFETY: acpi_rsdp is zero or identity-mapped; parse_aperture_seed validates.
-    let (mut seed_count, heuristic_count) =
-        unsafe { acpi::parse_aperture_seed(firm.acpi_rsdp, aperture_seed, heuristic_seed) };
-    // `seed_count` is at most the seed buffer's length; past it the DTB seeder gets none.
-    let dtb_room = aperture_seed.get_mut(seed_count..).unwrap_or_default();
-    // SAFETY: device_tree is zero or identity-mapped; parse_aperture_seed validates.
-    let dtb_seeds = unsafe { dtb::parse_aperture_seed(firm.device_tree, dtb_room) };
-    seed_count = seed_count.saturating_add(dtb_seeds);
+    let mut seeds = Seeds::new(aperture_seed, heuristic_seed);
+    // SAFETY: the tables are identity-mapped and nothing writes them.
+    unsafe { tables::aperture_seeds(firm, tables, &mut seeds) };
+    if seeds.found != seeds.written
+    {
+        bprintln!("[--------] boot: aperture seeds past the seed buffers dropped");
+    }
+    let (mut seed_count, heuristic_count) = seeds.written;
     // GOP linear framebuffer: UEFI typically reports it as
     // `EfiReservedMemoryType` rather than `EfiMemoryMappedIO`, so
     // `derive_mmio_apertures` cannot recover it from the UEFI map alone.
@@ -2752,10 +2815,18 @@ unsafe fn step9_populate_boot_info(
     };
     bprintln!("[--------] boot: MMIO apertures: {aperture_count} derived");
 
-    // The raw UEFI memory-map buffer is dead: the translation and the
-    // aperture derivation above were its last readers. Zero it before it is
-    // recorded below, so the firmware's map does not reach the memory the
-    // kernel hands out.
+    // VMGENID GUID address: QEMU-specific SSDT scan (no AML evaluation: the
+    // bootloader runs before acpid, the userspace service that evaluates AML).
+    // Zero when absent; the kernel then has no snapshot-detection channel.
+    // Read here, the map's last read before its scrub.
+    // SAFETY: the tables are identity-mapped and nothing writes them.
+    let vmgenid_paddr = unsafe { Acpi::new(tables, firm.acpi_rsdp) }
+        .map_or(0, |acpi| vmgenid_guid(acpi.tables(&[*b"SSDT"])));
+
+    // The raw UEFI memory-map buffer is dead: the translation, the aperture
+    // derivation and the VMGENID scan above were its last readers. Zero it
+    // before it is recorded below, so the firmware's map does not reach the
+    // memory the kernel hands out.
     // SAFETY: buffer_phys is the step 7 allocation of buffer_size bytes, still
     // identity-mapped under the firmware's tables; nothing reads it again.
     unsafe { core::ptr::write_bytes(uefi_map.buffer_phys as *mut u8, 0, uefi_map.buffer_size) };
@@ -2907,11 +2978,6 @@ unsafe fn step9_populate_boot_info(
     push_reclaim(allocs.reclaim_array_phys, 1, 0)?;
     bprintln!("[--------] boot: reclaim_ranges: {reclaim_len} entries recorded");
 
-    // VMGENID GUID address: QEMU-specific SSDT scan (no AML evaluation: the
-    // bootloader runs before acpid, the userspace service that evaluates AML).
-    // Zero when absent; the kernel then has no snapshot-detection channel.
-    // SAFETY: acpi_rsdp is zero or identity-mapped; the parser validates.
-    let vmgenid_paddr = unsafe { acpi::parse_vmgenid_paddr(firm.acpi_rsdp) };
     if vmgenid_paddr != 0
     {
         bprintln!("[--------] boot: vmgenid guid at {vmgenid_paddr:#x}");

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/devmgr/firmware/src/bytes.rs
+// shared/firmware-tables/src/bytes.rs
 
 //! Fixed-width field reads from a firmware table's bytes.
 //!
 //! A field is read only when it lies wholly inside the buffer; a field that
-//! starts or ends past the buffer reads as zero. The table walkers bound every
-//! structure against its declared length before reading its fields, so a zero
-//! here is the value of a field the walker has already refused, never one it
-//! acts on.
+//! starts or ends past the buffer reads as zero. The table decoders bound
+//! every structure against its declared length before reading its fields, so
+//! a zero here is the value of a field the decoder has already refused, never
+//! one it acts on.
 
 /// The `N` bytes at `off`, or `None` when they do not lie wholly inside `buf`.
 fn field<const N: usize>(buf: &[u8], off: usize) -> Option<&[u8; N]>
@@ -18,37 +18,43 @@ fn field<const N: usize>(buf: &[u8], off: usize) -> Option<&[u8; N]>
 }
 
 /// The byte at `off`, or zero past the end of `buf`.
-pub(crate) fn read_u8(buf: &[u8], off: usize) -> u8
+#[must_use]
+pub fn read_u8(buf: &[u8], off: usize) -> u8
 {
     buf.get(off).copied().unwrap_or(0)
 }
 
 /// The little-endian `u16` at `off`, or zero unless it lies wholly inside `buf`.
-pub(crate) fn read_u16(buf: &[u8], off: usize) -> u16
+#[must_use]
+pub fn read_u16(buf: &[u8], off: usize) -> u16
 {
     field(buf, off).map_or(0, |b| u16::from_le_bytes(*b))
 }
 
 /// The little-endian `u32` at `off`, or zero unless it lies wholly inside `buf`.
-pub(crate) fn read_u32(buf: &[u8], off: usize) -> u32
+#[must_use]
+pub fn read_u32(buf: &[u8], off: usize) -> u32
 {
     field(buf, off).map_or(0, |b| u32::from_le_bytes(*b))
 }
 
 /// The little-endian `u64` at `off`, or zero unless it lies wholly inside `buf`.
-pub(crate) fn read_u64(buf: &[u8], off: usize) -> u64
+#[must_use]
+pub fn read_u64(buf: &[u8], off: usize) -> u64
 {
     field(buf, off).map_or(0, |b| u64::from_le_bytes(*b))
 }
 
 /// The big-endian `u32` at `off`, or zero unless it lies wholly inside `buf`.
-pub(crate) fn be_u32(buf: &[u8], off: usize) -> u32
+#[must_use]
+pub fn be_u32(buf: &[u8], off: usize) -> u32
 {
     field(buf, off).map_or(0, |b| u32::from_be_bytes(*b))
 }
 
 /// The big-endian `u64` at `off`, or zero unless it lies wholly inside `buf`.
-pub(crate) fn be_u64(buf: &[u8], off: usize) -> u64
+#[must_use]
+pub fn be_u64(buf: &[u8], off: usize) -> u64
 {
     field(buf, off).map_or(0, |b| u64::from_be_bytes(*b))
 }
@@ -78,6 +84,8 @@ mod tests
         assert_eq!(read_u16(&buf, 6), 0);
         assert_eq!(read_u32(&buf, 4), 0);
         assert_eq!(read_u64(&buf, 0), 0);
+        assert_eq!(read_u16(&buf, usize::MAX), 0);
+        assert_eq!(read_u32(&buf, usize::MAX - 1), 0);
         assert_eq!(be_u32(&buf, usize::MAX), 0);
         assert_eq!(be_u64(&buf, 3), 0);
     }

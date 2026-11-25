@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "core/kernel",
     "core/boot",
+    "core/boot/firmware",
     "core/ktest",
     "services/init",
     "services/init/log-levels",
@@ -76,6 +77,7 @@ members = [
     "shared/device-tracker",
     "shared/driver-binding",
     "shared/elf",
+    "shared/firmware-tables",
     "shared/objsig",
     "shared/font",
     "shared/mmio",

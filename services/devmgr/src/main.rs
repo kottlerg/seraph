@@ -1962,7 +1962,7 @@ fn handle_query_shutdown_device(
 /// stops after recording some keeps them and counts as scanned.
 fn enumerate_ecam(
     caps: &mut caps::DevmgrCaps,
-    loc: &firmware::EcamLocation,
+    loc: &firmware_tables::EcamLocation,
     devices: &mut Vec<pci::PciDevice>,
     slots: &mut Vec<Slot>,
 ) -> bool
@@ -2102,7 +2102,7 @@ pub(crate) unsafe fn unmap_window(aspace: u64, range: std::os::seraph::ReservedR
 /// devmgr binds is carved ([`bind::carve_function_config`]). A window the
 /// tables cannot hold is logged; its cap stays held, and its functions get
 /// no driver, since devmgr could not clear their Bus Master Enable.
-fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap: u64)
+fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware_tables::EcamLocation, ecam_cap: u64)
 {
     let kept = caps.ecam_windows.try_reserve(1).is_ok()
         && matches!(

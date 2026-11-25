@@ -7,17 +7,23 @@
 # fixture in /crash (services/fixtures/crashme/README.md). See
 # docs/testing.md § Gating.
 #
-# The same recipe as services/crashd.svc but for `CORE_DUMP`, which names
-# crashme; xtask's svctest_stage tests hold the two to that one difference.
-# It keeps the default's `CRASHD_OOM_STALL_MS` of 10000 ms, which svctest's
-# oom_policy phase requires to outlast oomd's cooldown, and which its
-# crashd_oom_hold phase reads to size the fill that outlasts the hold.
+# The same recipe as services/crashd.svc but for its `env` line:
+# `CORE_DUMP` names crashme, and `CRASHD_OOM_STALL_MS` is 5000 ms against the
+# default's 10000, beside oomd's svctest recipe (tests/oomd.svc), whose
+# cooldown is 1000 ms against the default's 5000. The stall keeps the
+# default's relation, longer than oomd's grace and cooldown together, by
+# 2000 ms: oomd acts within a few milliseconds of its grace and cooldown on
+# every CI cell. svctest's oom_policy phase requires the stall to outlast
+# oomd's cooldown, and its crashd_oom_hold phase reads it to size the fill
+# that outlasts the hold. xtask's svctest_stage tests hold the recipe to the
+# default but for that line, and the two recipes' stall to more than oomd's
+# grace and cooldown together.
 binary          = /services/crashd
 priority        = 20
 restart         = on_failure
 critical        = no
 provides        = crashd.core:grant
-env             = CORE_DUMP=crashme CRASHD_OOM_STALL_MS=10000
+env             = CORE_DUMP=crashme CRASHD_OOM_STALL_MS=5000
 namespace       = subtree:/crash:LOOKUP+READDIR+STAT+WRITE+MUTATE_DIR
 debug_authority = yes
 reserve         = yes

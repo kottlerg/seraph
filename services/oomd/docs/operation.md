@@ -59,7 +59,8 @@ acts and the time after the second in which its stop's memory comes back. An act
 due when the stops before it gave back too little to lift the level, finds the fault reported and
 declined: the stall bounds the hold, and does not grow with the ladder
 ([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Hold, The stall and oomd's
-ladder).
+ladder). svctest's boot stages a test recipe with `OOMD_COOLDOWN_MS=1000`, and crashd's test recipe
+a stall of 5000 ms, still longer than the grace and the cooldown together (3000 ms).
 
 ---
 

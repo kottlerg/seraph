@@ -80,7 +80,7 @@ how long crashd holds a page fault memmgr declined for want of memory before it 
 declines it. No entry, or `0`, holds none, and crashd handles every fault as
 [Per Fault](#per-fault) says. A value that is not decimal digits is logged as a warning and holds
 none; one past 600 000 ms (`STALL_MAX_MS`, ten minutes) is clamped to it, logged. The shipped
-recipe sets 10 000 ms, and svctest's test recipe keeps it
+recipe sets 10 000 ms, and svctest's test recipe sets 5000 ms
 ([docs/testing.md](../../../docs/testing.md) § Crash reports).
 
 **The stall and oomd's ladder.** oomd stops one candidate once the level has read `CRITICAL` for

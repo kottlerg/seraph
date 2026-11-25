@@ -934,10 +934,12 @@ const DECLINE_NOT_VM: u64 = 1;
 
 /// Stray caps a case leaves in memmgr's `CSpace` when memmgr keeps those of
 /// either deletion path: far more than the slots memmgr's other work takes
-/// and gives back during a case. memmgr funds its `CSpace` from its own pool
-/// before every receive, so such a leak does not wedge it; the phase reads it
-/// in memmgr's used slots instead.
-const STRAY_CAP_LEAK_BUDGET: usize = 9 * 1024;
+/// and gives back during a case, whose largest rise across a case the phase
+/// logs. memmgr funds its `CSpace` from its own pool before every receive,
+/// so such a leak does not wedge it; the phase reads it in memmgr's used
+/// slots instead, so the budget need only stand clear of that noise, and
+/// each case's calls, and the phase's time, scale with it.
+const STRAY_CAP_LEAK_BUDGET: usize = 1024;
 
 /// Used slots of memmgr's `CSpace` a case may leave above where it started:
 /// half of [`STRAY_CAP_LEAK_BUDGET`], so a leak on either path exceeds it and
@@ -983,6 +985,7 @@ pub fn stray_cap_flood_phase(_: &Caps)
 {
     let info = startup_info();
     let mut total_calls = 0usize;
+    let mut largest_rise = 0u64;
     for case in &STRAY_CAP_CASES
     {
         let label = case.label;
@@ -1021,6 +1024,7 @@ pub fn stray_cap_flood_phase(_: &Caps)
             kept < STRAY_CAP_SLACK,
             "memmgr kept {kept} more CSpace slots across the stray-cap calls with label {label:#x}"
         );
+        largest_rise = largest_rise.max(kept);
     }
 
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
@@ -1031,7 +1035,8 @@ pub fn stray_cap_flood_phase(_: &Caps)
         "QUERY_POOL_STATUS status after the flood"
     );
     std::os::seraph::log!(
-        "memmgr answered {total_calls} calls carrying {} stray caps",
+        "memmgr answered {total_calls} calls carrying {} stray caps; its used CSpace slots rose \
+         by at most {largest_rise} across a case, against a slack of {STRAY_CAP_SLACK}",
         total_calls
             .checked_mul(MSG_CAP_SLOTS_MAX)
             .expect("stray cap total overflowed")

@@ -52,6 +52,29 @@ pub fn halt_until_interrupt()
 
 // ── Stack and memory sampling ─────────────────────────────────────────────────
 
+/// Store `value` to each of the `words` 8-byte words from `p` up, eight
+/// stores to each 64-byte line, so the loop's own instructions are one
+/// increment and one branch per line. Used by the kernel stack paint
+/// (`crate::stack_depth::paint`).
+///
+/// # Safety
+/// `[p, p + words * 8)` is writable, 8-byte aligned, and the caller's alone.
+pub unsafe fn fill_words(p: *mut u64, words: usize, value: u64)
+{
+    // SAFETY: per the contract the span is valid for writes of `words`
+    // aligned words and no other reference reaches it during the call.
+    let span = unsafe { core::slice::from_raw_parts_mut(p, words) };
+    let (lines, rest) = span.as_chunks_mut::<8>();
+    for line in lines
+    {
+        *line = [value; 8];
+    }
+    for word in rest
+    {
+        *word = value;
+    }
+}
+
 /// Load one word that another CPU may be writing concurrently, as an opaque
 /// machine load the compiler neither elides nor reasons about.
 ///
@@ -625,39 +648,98 @@ pub unsafe fn set_kernel_trap_stack(stack_top: u64)
 // ── User-copy primitive (fault-recoverable) ───────────────────────────────────
 
 // `copy_user` implements the user-copy contract in core/kernel/docs/arch-interface.md
-// § cpu: it opens and closes the SUM window (sstatus.SUM, bit 18), and a fault inside
-// the copy redirects to `__copy_user_fixup` (which clears SUM and returns the count of
-// bytes not copied, the loop's `a2` at the fault). See `crate::uaccess` for the typed wrappers and
-// `interrupts::trap_dispatch` for the fixup hook.
+// § cpu: it opens and closes the SUM window (sstatus.SUM, bit 18), and a fault on a user
+// access is recovered through `user_copy_fixup`, which `interrupts::trap_dispatch`
+// consults. See `crate::uaccess` for the typed wrappers.
+//
+// When both pointers are 8-byte aligned the copy moves 64-byte blocks (eight `ld` ahead of
+// eight `sd`, so an in-order core overlaps the loads' latency), then single words while 8
+// bytes remain, then the tail in bytes; any other copy runs in bytes. No access is ever
+// misaligned, so no hart traps to firmware for one (Zicclsm is not assumed). There is no
+// byte head that aligns the pointers: a head helps only when both are misaligned by the
+// same amount, which no caller arranges. The kernel-side buffers of the bulk copies (the
+// IPC words, the register frames, and the per-CPU syscall scratch the thread-memory copies
+// stage in) are 8-byte aligned, so those take the word path whenever the user buffer is
+// aligned; a byte array on the kernel stack copies in bytes unless it happens to be aligned.
+//
+// `a0`/`a1`/`a2` advance only after a unit's store, so at a fault they name the start of
+// the faulting unit. A fault in a word or a byte resumes at `__copy_user_fixup`, which
+// closes SUM and returns `a2`: the bytes from that unit's start, at least 1, and since an
+// aligned word never straddles a page, the first byte not copied lies in the page that
+// faulted, which the restartable copies report (`uaccess::fault_va`). A fault in a block
+// resumes at `__copy_user_words` with the window still open: the word loop copies the
+// block again from its start and faults at the faulting word itself, whose fixup is exact.
 #[cfg(not(test))]
 core::arch::global_asm!(
     ".section .text.copy_user, \"ax\"",
     ".global __copy_user",
-    ".global __copy_user_fault_start",
+    ".global __copy_user_block_start",
+    ".global __copy_user_block_end",
+    ".global __copy_user_words",
     ".global __copy_user_fault_end",
     ".global __copy_user_fixup",
     // fn __copy_user(dst: a0, src: a1, len: a2) -> a0 (bytes not copied)
+    // Clobbers t0-t6 and a3-a6, all caller-saved.
     "__copy_user:",
     "    li    t0, 0x40000",       // SUM = bit 18
     "    csrrs zero, sstatus, t0", // open the access window
+    "    or    t1, a0, a1",
+    "    andi  t1, t1, 7",
+    "    bnez  t1, 3f", // a pointer is not 8-byte aligned: bytes only
+    "    li    t2, 64",
+    "    bltu  a2, t2, __copy_user_words",
+    "__copy_user_block_start:",
     "1:",
-    "    beqz  a2, 2f",
-    "__copy_user_fault_start:",
-    "    lb    t1, 0(a1)", // load from src (user side may fault)
-    "    sb    t1, 0(a0)", // store to dst (user side may fault)
-    "__copy_user_fault_end:",
+    "    ld    t3, 0(a1)", // loads from src (user side may fault)
+    "    ld    t4, 8(a1)",
+    "    ld    t5, 16(a1)",
+    "    ld    t6, 24(a1)",
+    "    ld    a3, 32(a1)",
+    "    ld    a4, 40(a1)",
+    "    ld    a5, 48(a1)",
+    "    ld    a6, 56(a1)",
+    "    sd    t3, 0(a0)", // stores to dst (user side may fault)
+    "    sd    t4, 8(a0)",
+    "    sd    t5, 16(a0)",
+    "    sd    t6, 24(a0)",
+    "    sd    a3, 32(a0)",
+    "    sd    a4, 40(a0)",
+    "    sd    a5, 48(a0)",
+    "    sd    a6, 56(a0)",
+    "    addi  a0, a0, 64",
+    "    addi  a1, a1, 64",
+    "    addi  a2, a2, -64",
+    "    bgeu  a2, t2, 1b",
+    "__copy_user_block_end:",
+    // Words, and the block fixup's resume point: a0/a1 are 8-byte aligned.
+    "__copy_user_words:",
+    "    li    t2, 8",
+    "    bltu  a2, t2, 3f",
+    "2:",
+    "    ld    t3, 0(a1)", // load from src (user side may fault)
+    "    sd    t3, 0(a0)", // store to dst (user side may fault)
+    "    addi  a0, a0, 8",
+    "    addi  a1, a1, 8",
+    "    addi  a2, a2, -8",
+    "    bgeu  a2, t2, 2b",
+    "3:",
+    "    beqz  a2, 4f",
+    "5:",
+    "    lb    t3, 0(a1)", // load from src (user side may fault)
+    "    sb    t3, 0(a0)", // store to dst (user side may fault)
     "    addi  a0, a0, 1",
     "    addi  a1, a1, 1",
     "    addi  a2, a2, -1",
-    "    j     1b",
-    "2:",
+    "    bnez  a2, 5b",
+    "4:",
+    "__copy_user_fault_end:",
     "    csrrc zero, sstatus, t0", // close the access window
     "    li    a0, 0",
     "    ret",
     "__copy_user_fixup:",
     "    li    t0, 0x40000",
     "    csrrc zero, sstatus, t0", // close the access window (recovery path)
-    "    mv    a0, a2",            // the faulting byte's remaining count: at least 1
+    "    mv    a0, a2",            // bytes from the faulting unit's start: at least 1
     "    ret",
 );
 
@@ -666,9 +748,14 @@ unsafe extern "C" {
     /// Raw user-copy routine (`dst=a0, src=a1, len=a2`); returns 0 on success or,
     /// if a fault on the user span was recovered, the bytes not copied.
     fn __copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
-    /// First byte of the faultable copy region (the `lb`/`sb` pair).
-    static __copy_user_fault_start: u8;
-    /// First byte past the faultable copy region.
+    /// First byte of the block loop, whose faults resume at [`__copy_user_words`].
+    static __copy_user_block_start: u8;
+    /// First byte past the block loop.
+    static __copy_user_block_end: u8;
+    /// The word loop's entry: the first byte of the region whose faults resume at
+    /// [`__copy_user_fixup`], and the block loop's recovery point.
+    static __copy_user_words: u8;
+    /// First byte past the word and byte loops.
     static __copy_user_fault_end: u8;
     /// Recovery landing pad: closes the SUM window, returns the bytes left.
     static __copy_user_fixup: u8;
@@ -676,8 +763,8 @@ unsafe extern "C" {
 
 /// Copy `len` bytes from `src` to `dst` across the SUM window with fault
 /// recovery. Returns 0 on success; when a user-span fault was recovered, the
-/// bytes not copied (at least 1), so the faulting byte is at offset
-/// `len - returned`.
+/// bytes not copied (at least 1), counted from the start of the faulting
+/// access, so the byte at offset `len - returned` lies in the page that faulted.
 ///
 /// # Safety
 /// Must execute in supervisor mode. The operands must be arranged so the user
@@ -688,7 +775,7 @@ unsafe extern "C" {
 pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize
 {
     // SAFETY: forwarded to the asm routine; a fault on the user span is recovered
-    // by the trap dispatcher via __copy_user_fixup.
+    // by the trap dispatcher via user_copy_fixup.
     unsafe { __copy_user(dst, src, len) }
 }
 
@@ -704,16 +791,24 @@ pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize
     0
 }
 
-/// If `pc` lies within `copy_user`'s faultable region, return the address of the
-/// recovery fixup; otherwise `None`. Consulted by the trap dispatcher on an
-/// S-mode page fault to convert an unmapped/read-only user access into an error
-/// return instead of a panic.
+/// If `pc` is a user access of `copy_user`, the address to resume at;
+/// otherwise `None`. Consulted by the trap dispatcher on an S-mode page fault to
+/// convert an unmapped/read-only user access into an error return instead of a
+/// panic: a fault in the block loop resumes at the word loop, which copies the
+/// block again and faults at the faulting word; any other fault resumes at the
+/// fixup, which returns the bytes not copied.
 #[cfg(not(test))]
 pub fn user_copy_fixup(pc: u64) -> Option<u64>
 {
-    let lo = core::ptr::addr_of!(__copy_user_fault_start) as u64;
+    let block_lo = core::ptr::addr_of!(__copy_user_block_start) as u64;
+    let block_hi = core::ptr::addr_of!(__copy_user_block_end) as u64;
+    let lo = core::ptr::addr_of!(__copy_user_words) as u64;
     let hi = core::ptr::addr_of!(__copy_user_fault_end) as u64;
-    if pc >= lo && pc < hi
+    if (block_lo..block_hi).contains(&pc)
+    {
+        Some(lo)
+    }
+    else if (lo..hi).contains(&pc)
     {
         Some(core::ptr::addr_of!(__copy_user_fixup) as u64)
     }

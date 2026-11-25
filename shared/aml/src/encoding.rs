@@ -255,10 +255,9 @@ pub fn name_str(buf: &[u8], pos: usize) -> Option<(NameStr<'_>, usize)>
     let first = p.checked_add(skip)?;
     let end = first.checked_add(count.checked_mul(4)?)?;
     let segs = buf.get(first..end)?;
-    for seg in segs.as_chunks::<4>().0
+    for &[lead, b1, b2, b3] in segs.as_chunks::<4>().0
     {
-        let [lead, rest @ ..] = seg;
-        if !is_lead_name_char(*lead) || !rest.iter().all(|b| is_name_char(*b))
+        if !is_lead_name_char(lead) || ![b1, b2, b3].iter().all(|b| is_name_char(*b))
         {
             return None;
         }

@@ -99,15 +99,21 @@ pub struct AmlDevice<'a>
 }
 
 /// The device being collected while its body is walked.
-#[derive(Default)]
-struct Collect<'a>
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Collect<'a>
 {
-    hid: Option<Id>,
-    cids: [Option<Id>; MAX_CIDS],
-    uid: Option<u64>,
-    crs: Option<&'a [u8]>,
-    sta: Option<u64>,
-    dynamic: bool,
+    /// The last static `_HID`.
+    pub(crate) hid: Option<Id>,
+    /// The static `_CID` entries.
+    pub(crate) cids: [Option<Id>; MAX_CIDS],
+    /// The last integer `_UID`.
+    pub(crate) uid: Option<u64>,
+    /// The `_CRS` Buffer's byte list.
+    pub(crate) crs: Option<&'a [u8]>,
+    /// The `_STA` integer.
+    pub(crate) sta: Option<u64>,
+    /// Whether `_HID`, `_CID` or `_CRS` is a Method.
+    pub(crate) dynamic: bool,
 }
 
 // ── Values ────────────────────────────────────────────────────────────
@@ -128,7 +134,192 @@ fn id_value(buf: &[u8], pos: usize) -> Option<Id>
     Id::new(encoding::string(buf, pos)?.0)
 }
 
-// ── Walk ──────────────────────────────────────────────────────────────
+// ── Walk ────────────────────────────────────────────────────────────
+
+/// One term of a term list, as the walk reads it (offsets into the list).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Term
+{
+    /// A `Scope` whose term list is `body..end`.
+    Scope
+    {
+        /// The first byte after the scope's name.
+        body: usize,
+        /// The scope's end.
+        end: usize,
+    },
+    /// A `Device` whose term list is `body..end`.
+    Device
+    {
+        /// The first byte after the device's name.
+        body: usize,
+        /// The device's end.
+        end: usize,
+    },
+    /// A `Name` whose value is the data object of `size` bytes at `value`.
+    Name
+    {
+        /// The name's last segment.
+        name: Option<[u8; 4]>,
+        /// The offset of the value.
+        value: usize,
+        /// The value's encoded size.
+        size: usize,
+    },
+    /// A `Method`, which is not entered.
+    Method
+    {
+        /// The method name's last segment.
+        name: Option<[u8; 4]>,
+        /// The method's end.
+        end: usize,
+    },
+    /// Any other construct the walk sizes and skips.
+    Skip
+    {
+        /// The construct's end.
+        end: usize,
+    },
+}
+
+impl Term
+{
+    /// The offset after the term.
+    pub(crate) const fn end(&self) -> Option<usize>
+    {
+        match *self
+        {
+            Self::Scope { end, .. }
+            | Self::Device { end, .. }
+            | Self::Method { end, .. }
+            | Self::Skip { end } => Some(end),
+            Self::Name { value, size, .. } => value.checked_add(size),
+        }
+    }
+}
+
+/// Read the term at `pos` of the term list `buf`; `None` for a construct the
+/// walk cannot size, which stops the list.
+pub(crate) fn term_step(buf: &[u8], pos: usize) -> Option<Term>
+{
+    match *buf.get(pos)?
+    {
+        OP_SCOPE =>
+        {
+            let (body, end, _) = named_package(buf, pos.saturating_add(1))?;
+            Some(Term::Scope { body, end })
+        }
+        OP_NAME =>
+        {
+            let (nl, name) = name_string(buf, pos.saturating_add(1))?;
+            let value = pos.checked_add(1)?.checked_add(nl)?;
+            let size = data_object_len(buf, value)?;
+            Some(Term::Name { name, value, size })
+        }
+        OP_METHOD =>
+        {
+            let (_, end, name) = named_package(buf, pos.saturating_add(1))?;
+            Some(Term::Method { name, end })
+        }
+        OP_IF | OP_ELSE | OP_WHILE =>
+        {
+            let (_, end) = package(buf, pos.saturating_add(1))?;
+            Some(Term::Skip { end })
+        }
+        OP_EXTERNAL =>
+        {
+            let (nl, _) = name_string(buf, pos.saturating_add(1))?;
+            let end = pos.checked_add(1)?.checked_add(nl)?.checked_add(2)?;
+            (end <= buf.len()).then_some(Term::Skip { end })
+        }
+        OP_ALIAS =>
+        {
+            let (a, _) = name_string(buf, pos.saturating_add(1))?;
+            let after_a = pos.checked_add(1)?.checked_add(a)?;
+            let (b, _) = name_string(buf, after_a)?;
+            Some(Term::Skip {
+                end: after_a.checked_add(b)?,
+            })
+        }
+        OP_EXT_PREFIX => ext_term_step(buf, pos),
+        _ => None,
+    }
+}
+
+/// Read the `0x5B`-prefixed term at `pos`.
+fn ext_term_step(buf: &[u8], pos: usize) -> Option<Term>
+{
+    let skip = |end| Some(Term::Skip { end });
+    match *buf.get(pos.saturating_add(1))?
+    {
+        EXT_DEVICE =>
+        {
+            let (body, end, _) = named_package(buf, pos.saturating_add(2))?;
+            Some(Term::Device { body, end })
+        }
+        EXT_FIELD | EXT_INDEX_FIELD | EXT_BANK_FIELD | EXT_PROCESSOR | EXT_POWER_RES
+        | EXT_THERMAL_ZONE =>
+        {
+            let (_, end) = package(buf, pos.saturating_add(2))?;
+            skip(end)
+        }
+        EXT_OP_REGION =>
+        {
+            let (nl, _) = name_string(buf, pos.saturating_add(2))?;
+            let mut p = pos.checked_add(2)?.checked_add(nl)?.checked_add(1)?;
+            for _ in 0..2
+            {
+                p = p.checked_add(integer(buf, p)?.1)?;
+            }
+            skip(p)
+        }
+        EXT_MUTEX =>
+        {
+            let (nl, _) = name_string(buf, pos.saturating_add(2))?;
+            let end = pos.checked_add(2)?.checked_add(nl)?.checked_add(1)?;
+            if end > buf.len()
+            {
+                return None;
+            }
+            skip(end)
+        }
+        EXT_EVENT =>
+        {
+            let (nl, _) = name_string(buf, pos.saturating_add(2))?;
+            skip(pos.checked_add(2)?.checked_add(nl)?)
+        }
+        _ => None,
+    }
+}
+
+/// For a package whose `PkgLength` is at `lead` and whose `NameString`
+/// follows it: the offset of the first byte after the name, the package's
+/// end, and the name's last segment.
+fn named_package(buf: &[u8], lead: usize) -> Option<(usize, usize, Option<[u8; 4]>)>
+{
+    let (name_at, end) = package(buf, lead)?;
+    let (nl, last) = name_string(buf.get(..end)?, name_at)?;
+    Some((name_at.checked_add(nl)?, end, last))
+}
+
+/// The device record of a finished device, if it qualifies: a static `_HID`
+/// or at least one static `_CID`, none of `_HID`/`_CID`/`_CRS` a Method,
+/// and no `_STA` Name with its present bit clear.
+pub(crate) fn qualify<'a>(c: &Collect<'a>) -> Option<AmlDevice<'a>>
+{
+    let static_id = c.hid.is_some() || c.cids.iter().any(Option::is_some);
+    let absent = c.sta.is_some_and(|sta| sta & 1 == 0);
+    if c.dynamic || absent || !static_id
+    {
+        return None;
+    }
+    Some(AmlDevice {
+        hid: c.hid,
+        cids: c.cids,
+        uid: c.uid,
+        crs: c.crs,
+    })
+}
 
 struct Walker<F>
 {
@@ -166,132 +357,42 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
         dev: &mut Option<&mut Collect<'a>>,
     ) -> Option<usize>
     {
-        match *buf.get(pos)?
+        let term = term_step(buf, pos)?;
+        match term
         {
-            OP_SCOPE =>
+            Term::Scope { body, end } =>
             {
-                let (body, end, _) = Self::named_package(buf, pos.saturating_add(1))?;
                 self.term_list(buf.get(body..end)?, depth.saturating_add(1), None);
-                Some(end)
             }
-            OP_NAME => Self::def_name(buf, pos, dev),
-            OP_METHOD =>
+            Term::Device { body, end } =>
             {
-                let (_, end, name) = Self::named_package(buf, pos.saturating_add(1))?;
+                let mut c = Collect::default();
+                self.term_list(buf.get(body..end)?, depth.saturating_add(1), Some(&mut c));
+                if let Some(device) = qualify(&c)
+                {
+                    (self.visit)(&device);
+                    self.count = self.count.saturating_add(1);
+                }
+            }
+            Term::Name { name, value, size } =>
+            {
+                if let (Some(c), Some(name)) = (dev.as_deref_mut(), name)
+                {
+                    record(c, name, buf, value, size);
+                }
+            }
+            Term::Method { name, .. } =>
+            {
                 if let Some(c) = dev.as_deref_mut()
                     && matches!(name, Some(n) if is_dynamic_name(n))
                 {
                     c.dynamic = true;
                 }
-                Some(end)
             }
-            OP_IF | OP_ELSE | OP_WHILE =>
-            {
-                let (_, end) = package(buf, pos.saturating_add(1))?;
-                Some(end)
-            }
-            OP_EXTERNAL =>
-            {
-                let (nl, _) = name_string(buf, pos.saturating_add(1))?;
-                let end = pos.checked_add(1)?.checked_add(nl)?.checked_add(2)?;
-                (end <= buf.len()).then_some(end)
-            }
-            OP_ALIAS =>
-            {
-                let (a, _) = name_string(buf, pos.saturating_add(1))?;
-                let after_a = pos.checked_add(1)?.checked_add(a)?;
-                let (b, _) = name_string(buf, after_a)?;
-                after_a.checked_add(b)
-            }
-            OP_EXT_PREFIX => self.ext_term(buf, pos, depth),
-            _ => None,
+            Term::Skip { .. } =>
+            {}
         }
-    }
-
-    /// Handle the `0x5B`-prefixed term at `pos`.
-    fn ext_term(&mut self, buf: &'a [u8], pos: usize, depth: usize) -> Option<usize>
-    {
-        match *buf.get(pos.saturating_add(1))?
-        {
-            EXT_DEVICE =>
-            {
-                let (body, end, _) = Self::named_package(buf, pos.saturating_add(2))?;
-                let mut c = Collect::default();
-                self.term_list(buf.get(body..end)?, depth.saturating_add(1), Some(&mut c));
-                self.report(&c);
-                Some(end)
-            }
-            EXT_FIELD | EXT_INDEX_FIELD | EXT_BANK_FIELD | EXT_PROCESSOR | EXT_POWER_RES
-            | EXT_THERMAL_ZONE =>
-            {
-                let (_, end) = package(buf, pos.saturating_add(2))?;
-                Some(end)
-            }
-            EXT_OP_REGION =>
-            {
-                let (nl, _) = name_string(buf, pos.saturating_add(2))?;
-                let mut p = pos.checked_add(2)?.checked_add(nl)?.checked_add(1)?;
-                for _ in 0..2
-                {
-                    p = p.checked_add(integer(buf, p)?.1)?;
-                }
-                Some(p)
-            }
-            EXT_MUTEX =>
-            {
-                let (nl, _) = name_string(buf, pos.saturating_add(2))?;
-                let end = pos.checked_add(2)?.checked_add(nl)?.checked_add(1)?;
-                (end <= buf.len()).then_some(end)
-            }
-            EXT_EVENT =>
-            {
-                let (nl, _) = name_string(buf, pos.saturating_add(2))?;
-                pos.checked_add(2)?.checked_add(nl)
-            }
-            _ => None,
-        }
-    }
-
-    /// For a package whose `PkgLength` is at `lead` and whose `NameString`
-    /// follows it: the offset of the first byte after the name, the package's
-    /// end, and the name's last segment.
-    fn named_package(buf: &[u8], lead: usize) -> Option<(usize, usize, Option<[u8; 4]>)>
-    {
-        let (name_at, end) = package(buf, lead)?;
-        let (nl, last) = name_string(buf.get(..end)?, name_at)?;
-        Some((name_at.checked_add(nl)?, end, last))
-    }
-
-    /// `DefName` at `pos`.
-    fn def_name(buf: &'a [u8], pos: usize, dev: &mut Option<&mut Collect<'a>>) -> Option<usize>
-    {
-        let (nl, last) = name_string(buf, pos.saturating_add(1))?;
-        let value = pos.checked_add(1)?.checked_add(nl)?;
-        let size = data_object_len(buf, value)?;
-        if let (Some(c), Some(name)) = (dev.as_deref_mut(), last)
-        {
-            record(c, name, buf, value, size);
-        }
-        value.checked_add(size)
-    }
-
-    /// Report a finished device if it qualifies.
-    fn report(&mut self, c: &Collect<'a>)
-    {
-        let static_id = c.hid.is_some() || c.cids.iter().any(Option::is_some);
-        let absent = c.sta.is_some_and(|sta| sta & 1 == 0);
-        if c.dynamic || absent || !static_id
-        {
-            return;
-        }
-        let device = AmlDevice {
-            hid: c.hid,
-            cids: c.cids,
-            uid: c.uid,
-            crs: c.crs,
-        };
-        (self.visit)(&device);
-        self.count = self.count.saturating_add(1);
+        term.end()
     }
 }
 
@@ -302,7 +403,13 @@ fn is_dynamic_name(name: [u8; 4]) -> bool
 }
 
 /// Record the value of `Name(name, <data at value..value+size>)` into `c`.
-fn record<'a>(c: &mut Collect<'a>, name: [u8; 4], buf: &'a [u8], value: usize, size: usize)
+pub(crate) fn record<'a>(
+    c: &mut Collect<'a>,
+    name: [u8; 4],
+    buf: &'a [u8],
+    value: usize,
+    size: usize,
+)
 {
     let Some(data) = value.checked_add(size).and_then(|end| buf.get(..end))
     else
@@ -1241,5 +1348,304 @@ mod tests
         // Extended interrupt count past its length.
         assert_eq!(crs_list(&[0x89, 6, 0, 1, 9, 0, 0, 0, 0, 0]).len(), 1);
         assert_eq!(crs_list(&[]), [] as [CrsResource; 0]);
+    }
+}
+
+/// The proofs of the walk's steps and of the adapter (docs/testing.md
+/// § Bounded verification), on the checks of `crate::property::aml`: the
+/// term at any place of a term list, the record of a `Name`'s value, the
+/// rule that reports a device, one descriptor of every kind and length
+/// through the adapter, and every short template whole. The term lists'
+/// loops and their recursion into a `Scope` or `Device` are left to the fuzz
+/// target `devmgr-firmware`, the replay of the checked-in inputs and the
+/// unit tests.
+#[cfg(kani)]
+mod proofs
+{
+    use ::aml::encoding::{
+        EXT_BANK_FIELD, EXT_DEVICE, EXT_EVENT, EXT_FIELD, EXT_INDEX_FIELD, EXT_MUTEX,
+        EXT_OP_REGION, EXT_POWER_RES, EXT_PROCESSOR, EXT_THERMAL_ZONE, OP_ALIAS, OP_ELSE,
+        OP_EXT_PREFIX, OP_EXTERNAL, OP_IF, OP_METHOD, OP_NAME, OP_SCOPE, OP_WHILE,
+    };
+
+    use super::{Collect, Id, MAX_CIDS};
+    use crate::property::aml as property;
+
+    /// Every term list of `N` bytes whose term at place 1 starts with
+    /// `lead` reads that term as the grammar's construct. A construct longer
+    /// than the place leaves is one cut short.
+    fn term_at_place_one_holds<const N: usize>(lead: &[u8])
+    {
+        let mut bytes: [u8; N] = kani::any();
+        bytes[1..=lead.len()].copy_from_slice(lead);
+        let _ = property::term_holds(&bytes, 1);
+    }
+
+    /// Every term at place 1 of a term list of 3 bytes, of any lead, reads
+    /// as the grammar's construct: a lead the walk does not size reads as
+    /// none, and every other is cut short. The loops are the parent prefixes.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn every_term_reads_as_its_construct()
+    {
+        term_at_place_one_holds::<3>(&[]);
+    }
+
+    /// Every `Scope` at place 1 of a term list of 11 bytes reads as its
+    /// construct: 10 bytes hold it with a one-segment or a dual name and a
+    /// body, and every `PkgLength` form. The loops are the parent prefixes
+    /// and the name's segments.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn every_scope_reads_as_its_construct()
+    {
+        term_at_place_one_holds::<11>(&[OP_SCOPE]);
+    }
+
+    /// Every `Method` at place 1 of a term list of 11 bytes reads as its
+    /// construct, as a `Scope` does.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn every_method_reads_as_its_construct()
+    {
+        term_at_place_one_holds::<11>(&[OP_METHOD]);
+    }
+
+    /// Every `Device` at place 1 of a term list of 12 bytes reads as its
+    /// construct, as a `Scope` does after its two-byte opcode.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn every_device_reads_as_its_construct()
+    {
+        term_at_place_one_holds::<12>(&[OP_EXT_PREFIX, EXT_DEVICE]);
+    }
+
+    /// Every `Name` at place 1 of a term list of 11 bytes reads as its
+    /// construct: 10 bytes hold a one-segment name with a value of any kind
+    /// up to a dword, and a dual name with a byte. The loops are the name's
+    /// segments and a string's bytes.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn every_name_reads_as_its_construct()
+    {
+        term_at_place_one_holds::<11>(&[OP_NAME]);
+    }
+
+    /// Every `If`, `Else` and `While` at place 1 of a term list of 8 bytes
+    /// reads as the construct it skips, every `PkgLength` form among them.
+    /// The loop is the `PkgLength` bytes.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_conditional_reads_as_its_skip()
+    {
+        match kani::any::<u8>() % 3
+        {
+            0 => term_at_place_one_holds::<8>(&[OP_IF]),
+            1 => term_at_place_one_holds::<8>(&[OP_ELSE]),
+            _ => term_at_place_one_holds::<8>(&[OP_WHILE]),
+        }
+    }
+
+    /// Every `External` and `Alias` at place 1 of a term list of 11 bytes
+    /// reads as the construct it skips: 10 bytes hold an `External` of a
+    /// one-segment or a dual name and an `Alias` of two one-segment names.
+    /// The loops are the names' segments.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn every_external_and_alias_reads_as_its_skip()
+    {
+        if kani::any()
+        {
+            term_at_place_one_holds::<11>(&[OP_EXTERNAL]);
+        }
+        else
+        {
+            term_at_place_one_holds::<11>(&[OP_ALIAS]);
+        }
+    }
+
+    /// Every `0x5B` construct the walk sizes by its `PkgLength`, at place 1
+    /// of a term list of 8 bytes, reads as the construct it skips: a
+    /// `Field`, `IndexField`, `BankField`, `Processor`, `PowerResource`
+    /// and `ThermalZone`, every `PkgLength` form among them. The loop is
+    /// the `PkgLength` bytes.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_extended_package_reads_as_its_skip()
+    {
+        let ext = [
+            EXT_FIELD,
+            EXT_INDEX_FIELD,
+            EXT_BANK_FIELD,
+            EXT_PROCESSOR,
+            EXT_POWER_RES,
+            EXT_THERMAL_ZONE,
+        ];
+        let which: usize = kani::any();
+        if let Some(&code) = ext.get(which)
+        {
+            term_at_place_one_holds::<8>(&[OP_EXT_PREFIX, code]);
+        }
+    }
+
+    /// Every `OperationRegion`, `Mutex` and `Event` at place 1 of a term
+    /// list of 12 bytes reads as the construct it skips: 12 bytes hold each
+    /// with a one-segment name, a region with a byte offset and length, and a
+    /// `Mutex` and an `Event` with a dual name. The loops are the name's
+    /// segments and an integer's bytes.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn every_extended_named_object_reads_as_its_skip()
+    {
+        match kani::any::<u8>() % 3
+        {
+            0 => term_at_place_one_holds::<12>(&[OP_EXT_PREFIX, EXT_OP_REGION]),
+            1 => term_at_place_one_holds::<12>(&[OP_EXT_PREFIX, EXT_MUTEX]),
+            _ => term_at_place_one_holds::<12>(&[OP_EXT_PREFIX, EXT_EVENT]),
+        }
+    }
+
+    /// Every `Name` called `name` records its value of any kind at place 1
+    /// of `N` bytes, a value longer than the place leaves being one cut
+    /// short, into a device that holds nothing and one that holds every
+    /// field.
+    fn name_at_place_one_records<const N: usize>(name: [u8; 4])
+    {
+        let bytes: [u8; N] = kani::any();
+        if let Some(size) = ::aml::encoding::data_object_len(&bytes, 1)
+        {
+            property::record_holds(&bytes, name, 1, size);
+        }
+    }
+
+    /// Every `_HID`, `_UID` and `_STA`, and a `_ADR` the walk ignores,
+    /// records its value of any kind at place 1 of 9 bytes: 8 bytes hold a
+    /// dword EISA ID, a string ID of up to 6 characters, and every integer
+    /// form up to a dword. The loops are a string's bytes and an integer's.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_identity_name_records_as_its_value()
+    {
+        match kani::any::<u8>() % 4
+        {
+            0 => name_at_place_one_records::<9>(*b"_HID"),
+            1 => name_at_place_one_records::<9>(*b"_UID"),
+            2 => name_at_place_one_records::<9>(*b"_STA"),
+            _ => name_at_place_one_records::<9>(*b"_ADR"),
+        }
+    }
+
+    /// Every `_CID` records its value of any kind at place 1 of 9 bytes: 8
+    /// bytes hold one dword EISA ID or string ID, and a `Package` of two
+    /// one-character string IDs or of an ID and an element that is none. The
+    /// loops are a package's elements and a string's bytes.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_cid_records_as_its_ids()
+    {
+        name_at_place_one_records::<9>(*b"_CID");
+    }
+
+    /// Every `_CRS` records its value of any kind at place 1 of 9 bytes: 8
+    /// bytes hold a `Buffer` with every size-integer form and a byte list
+    /// longer and shorter than its size. The loop is an integer's bytes.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_crs_records_as_its_list()
+    {
+        name_at_place_one_records::<9>(*b"_CRS");
+    }
+
+    /// Every collected device is reported by its identity, its `_STA` and its
+    /// methods alone, with the fields it holds. The loop is the `_CID` slots.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_device_reports_by_its_identity()
+    {
+        let id = |present: bool| if present { Id::new(b"PNP0501") } else { None };
+        let mut cids = [None; MAX_CIDS];
+        for cid in &mut cids
+        {
+            *cid = id(kani::any());
+        }
+        let list = [0u8; 2];
+        let c = Collect {
+            hid: id(kani::any()),
+            cids,
+            uid: kani::any(),
+            crs: if kani::any() { Some(&list[..]) } else { None },
+            sta: kani::any(),
+            dynamic: kani::any(),
+        };
+        property::qualify_holds(&c);
+    }
+
+    /// Every template that is one large descriptor of kind `key` and a body
+    /// of `N` bytes less its 3-byte header reports as its fields.
+    fn large_descriptor_holds<const N: usize>(key: u8)
+    {
+        let mut bytes: [u8; N] = kani::any();
+        bytes[0] = key;
+        let body = u16::try_from(N - 3).unwrap_or(0);
+        bytes[1..3].copy_from_slice(&body.to_le_bytes());
+        property::crs_holds(&bytes);
+    }
+
+    /// Every large descriptor the adapter reads reports as its fields: a
+    /// 32-bit Fixed Memory range, a 32-bit Memory range, a `DWord` and a
+    /// `QWord` address space at their least length, and an Extended
+    /// Interrupt of up to two lines, its count of any value. The loops are
+    /// the Extended Interrupt's lines and the comparison of the 8 resources
+    /// the bound holds.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_large_descriptor_reports_as_its_resources()
+    {
+        match kani::any::<u8>() % 5
+        {
+            0 => large_descriptor_holds::<12>(0x86),
+            1 => large_descriptor_holds::<20>(0x85),
+            2 => large_descriptor_holds::<26>(0x87),
+            3 => large_descriptor_holds::<46>(0x8A),
+            _ => large_descriptor_holds::<13>(0x89),
+        }
+    }
+
+    /// Every template that is one small descriptor the adapter reads reports
+    /// as its fields: an IRQ with and without its flags, an I/O Port and a
+    /// Fixed I/O Port. The loops are an IRQ's 16 lines and the comparison of
+    /// the 8 resources the bound holds.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_small_descriptor_reports_as_its_resources()
+    {
+        match kani::any::<u8>() % 4
+        {
+            0 => small_descriptor_holds::<3>(0x22),
+            1 => small_descriptor_holds::<4>(0x23),
+            2 => small_descriptor_holds::<8>(0x47),
+            _ => small_descriptor_holds::<4>(0x4B),
+        }
+    }
+
+    /// Every template that is the small descriptor `tag` of `N` bytes
+    /// reports as its fields.
+    fn small_descriptor_holds<const N: usize>(tag: u8)
+    {
+        let mut bytes: [u8; N] = kani::any();
+        bytes[0] = tag;
+        property::crs_holds(&bytes);
+    }
+
+    /// Every template of 4 bytes reports as its descriptors whole: up to 4
+    /// descriptors of one byte, the End Tag, an IRQ before and after others,
+    /// a large descriptor's header, and a descriptor that runs past the end.
+    /// The loops are the descriptors and an IRQ's 16 lines.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_short_template_reports_as_its_resources()
+    {
+        let bytes: [u8; 4] = kani::any();
+        property::crs_holds(&bytes);
     }
 }

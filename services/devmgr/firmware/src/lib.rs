@@ -102,7 +102,7 @@ mod tests
 {
     use std::vec::Vec;
 
-    use crate::{acpi, acpid, dmar, platform, property, rimt};
+    use crate::{acpi, acpid, aml, dmar, dtb, platform, property, rimt};
 
     /// The checked-in fuzz inputs of the kinds given (`seeds`,
     /// `regressions`).
@@ -210,6 +210,62 @@ mod tests
         assert!(
             any(&|s| platform::spcr(s).is_some_and(|t| t.interrupt.is_some())),
             "an SPCR"
+        );
+    }
+
+    // Defect caught: seeds that no longer reach the AML walk's devices, every
+    // kind of resource the adapter reports, or the device tree's windows.
+    #[test]
+    fn the_seeds_reach_the_aml_and_device_tree_decoders()
+    {
+        /// A check of one reported resource.
+        type Kind = fn(&aml::CrsResource) -> bool;
+        let seeds = fuzz_inputs(&["seeds"]);
+        let any = |accepts: &dyn Fn(&[u8]) -> bool| seeds.iter().any(|s| accepts(s));
+        let devices = |s: &[u8], want: &dyn Fn(&aml::AmlDevice<'_>) -> bool| {
+            let mut hit = false;
+            aml::devices(s, |d| hit |= want(d));
+            hit
+        };
+        assert!(
+            any(&|s| devices(s, &|d| d.hid.is_some()
+                && d.uid.is_some()
+                && d.crs.is_some_and(|c| aml::crs_resources(c, |_| {}) > 1))),
+            "a device with a _UID and resources"
+        );
+        assert!(any(&|s| devices(s, &|d| d.cids[0].is_some())), "a _CID");
+        let resources = |s: &[u8], want: &dyn Fn(&aml::CrsResource) -> bool| {
+            let mut hit = false;
+            aml::crs_resources(s, |r| hit |= want(&r));
+            hit
+        };
+        let kinds: [(&str, Kind); 4] = [
+            ("an MMIO range", |r| {
+                matches!(r, aml::CrsResource::Mmio { .. })
+            }),
+            ("I/O ports", |r| {
+                matches!(r, aml::CrsResource::IoPort { .. })
+            }),
+            ("an ISA IRQ", |r| {
+                matches!(r, aml::CrsResource::Interrupt { isa: true, .. })
+            }),
+            ("a GSI", |r| {
+                matches!(r, aml::CrsResource::Interrupt { isa: false, .. })
+            }),
+        ];
+        for (what, want) in kinds
+        {
+            assert!(any(&|s| resources(s, &want)), "{what}");
+        }
+        assert!(
+            any(&|s| aml::crs_resources(s, |_| {}) == aml::MAX_CRS_RESOURCES),
+            "a template at the bound"
+        );
+        assert!(
+            any(&|s| dtb::Fdt::new(s)
+                .and_then(|f| f.find_pci_ecams().ok())
+                .is_some_and(|w| w.len() > 2 && w.iter().any(|l| l.start_bus > 0))),
+            "a device tree of ECAM windows"
         );
     }
 }

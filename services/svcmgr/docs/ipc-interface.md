@@ -296,7 +296,7 @@ deletes any it carries. The reply labels are the stop labels' codes, not `svcmgr
 | label value | Meaning |
 |---|---|
 | `UNAUTHORIZED` (1) | Caller's badge lacks `STOP_AUTHORITY` |
-| `NO_CANDIDATE` (2) | The slot holds no service, the eligibility rule refuses the service (a `restart = never` service among them, which svcmgr does not supervise), no instance runs (it is restarting, waits for memory, or is permanently down; a death the kernel shows that svcmgr has not yet routed is routed after the reply), or the key's instance is not the one that runs |
+| `NO_CANDIDATE` (2) | The slot holds no service, the eligibility rule refuses the service (a `restart = never` service among them, which svcmgr never restarts), no instance runs (it is restarting, waits for memory, or is permanently down; a death the kernel shows that svcmgr has not yet routed is routed after the reply), or the key's instance is not the one that runs |
 | `UNAVAILABLE` (3) | memmgr or procmgr is dead, so a destroy would not be answered, or procmgr did not destroy the process |
 | `0` (`SUCCESS`) | The instance is destroyed; its death is routed after the reply |
 

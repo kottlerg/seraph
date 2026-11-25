@@ -9,14 +9,18 @@
 //! sysroot is judged: CI's cells, burn-in, and the local and release host
 //! runs.
 //!
-//! Mode-agnostic by design: xtask does not know about ktest, svctest, or
-//! any other rootfs configuration. The caller supplies success and failure
-//! regexes (`--pass`, `--fail`, `--fail-also`) and the lines a passing log
-//! must hold (`--require`); xtask classifies outcomes by matching those
-//! patterns against per-run logs, plus exit-code and watchdog state, one fact
-//! of every userspace boot: the console's output after init-logd's handover
-//! line (`console_lost_after_handover`), and, with `--crash-reports`, the
-//! crash service's report blocks ([`crate::crash_check`]).
+//! The caller supplies success and failure regexes (`--pass`, `--fail`,
+//! `--fail-also`) and the lines a passing log must hold (`--require`); xtask
+//! classifies outcomes by matching those patterns against per-run logs, plus
+//! exit-code and watchdog state, one fact of every userspace boot: the
+//! console's output after init-logd's handover line
+//! (`console_lost_after_handover`), and, with `--crash-reports`, the crash
+//! service's report blocks ([`crate::crash_check`]). What it knows of the
+//! image is the harnesses its last pack recorded
+//! ([`crate::sysroot::recorded_image_harnesses`]): the default `--pass` is the
+//! terminal marker of the one harness the image boots, and svcmgr's line for
+//! the death of a harness it launches, before the run's pass marker, fails
+//! the run ([`harness_death`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -40,6 +44,7 @@ use crate::qemu::{
     validate_sysroot_for_launch,
 };
 use crate::regex::Regex;
+use crate::sysroot::ImageHarness;
 use crate::term::filter::FilterWriter;
 use crate::util::{require_tool, step};
 
@@ -67,8 +72,9 @@ enum Status
     /// guest-side pass/fail marker — a *host-emulator* crash, not a guest
     /// failure. The recurring instance is the QEMU 8.2.x multi-threaded-TCG
     /// segfault (issue #350 / QEMU gitlab #2220), which is TCG-only and fixed
-    /// in newer QEMU. Tallied and preserved, but does NOT fail the classified
-    /// boot's gate (it is infrastructure flake, not a regression in the OS under test).
+    /// in newer QEMU. Tallied and preserved; it fails the classified boot only
+    /// when no run of the set passed ([`set_failure`]), since a guest can
+    /// also make QEMU abort, and a set with no PASS tested nothing.
     /// The `i32` is the `128 + signum` code.
     QemuCrash(i32),
 }
@@ -134,6 +140,8 @@ struct RunOutcome
 pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
 {
     let display = validate_args(args, runs)?;
+    validate_sysroot_for_launch(ctx, args.launch.arch)?;
+    let markers = Markers::for_image(args, &crate::sysroot::recorded_image_harnesses(ctx)?)?;
     // Held until the command returns, after the last wave's QEMUs have
     // exited; a wave runs `--parallel` QEMUs side by side.
     let _host =
@@ -141,18 +149,17 @@ pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
     let (Some(target), Some(port)) = (&args.launch.debug_target, args.launch.debug_port)
     else
     {
-        return run_waves(ctx, args, runs, display);
+        return run_waves(ctx, args, runs, display, &markers);
     };
     // The stub is staged into `disk.img` before the slots copy it, and
     // unstaged after the last run, whatever its outcome.
-    validate_sysroot_for_launch(ctx, args.launch.arch)?;
     let layout = crate::debug_stub::stage(ctx, args.launch.arch, target)?;
     let binary = crate::debug_stub::binary_for(ctx, target);
     step(&format!(
         "GDB stub staged for {target}; connect with:\n    {}",
         crate::debug_stub::gdb_command(args.launch.arch, port, binary.as_deref())
     ));
-    let ran = run_waves(ctx, args, runs, display);
+    let ran = run_waves(ctx, args, runs, display, &markers);
     crate::debug_stub::unstage(ctx, args.launch.arch, layout)?;
     ran
 }
@@ -164,14 +171,15 @@ pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
               summary). Splitting it would scatter the shared per-run state across helpers without \
               reducing complexity"
 )]
-fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay) -> Result<()>
+fn run_waves(
+    ctx: &BuildContext,
+    args: &RunArgs,
+    runs: u32,
+    display: QemuDisplay,
+    markers: &Markers,
+) -> Result<()>
 {
-    let pass_re =
-        Regex::new(&args.pass).with_context(|| format!("invalid --pass regex {:?}", args.pass))?;
-    let fail_re = fail_regex(&args.fail, args.fail_also.as_deref())?;
     let checks = Arc::new(PassChecks::new(&args.require, args.crash_reports)?);
-
-    validate_sysroot_for_launch(ctx, args.launch.arch)?;
 
     // Resolve qemu binary once, up front: missing-tool errors should
     // surface at startup, not N times mid-wave inside
@@ -260,8 +268,7 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
             };
             let timeout = Duration::from_secs(args.timeout);
             let fail_grace = Duration::from_secs(args.fail_grace_secs);
-            let pass_re = pass_re.clone();
-            let fail_re = fail_re.clone();
+            let markers = markers.clone();
             let checks = Arc::clone(&checks);
             let workdir = workdir.clone();
             let qemu_binary = qemu_binary.clone();
@@ -367,7 +374,7 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
                     &mut child.0,
                     timeout,
                     &log_path,
-                    &fail_re,
+                    &markers,
                     fail_grace,
                     on_hang,
                 )?;
@@ -378,7 +385,7 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
                 let elapsed = started.elapsed();
 
                 let log_text = read_log(&log_path).unwrap_or_default();
-                let (status, matched) = classify(exit_rc, hung, &log_text, &pass_re, &fail_re);
+                let (status, matched) = classify(exit_rc, hung, &log_text, &markers);
                 let (status, matched) = checks.judge(status, matched, &log_text);
 
                 let outcome = RunOutcome {
@@ -426,16 +433,7 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
 
     let summary = print_summary(args, runs, &workdir, &outcomes);
     print_failing_tails(&workdir, &outcomes);
-    // A QEMU host-emulator crash (Status::QemuCrash) is infrastructure flake,
-    // not a regression in the OS under test, so it does NOT fail the gate (it
-    // is still tallied and reported by print_summary). Everything else that is
-    // not a clean PASS does fail.
-    let real_failures = summary
-        .ok
-        .saturating_add(summary.fail)
-        .saturating_add(summary.hang)
-        .saturating_add(summary.err);
-    if real_failures > 0
+    if set_failure(&summary)
     {
         bail!(
             "run: {}/{} runs passed (ok={} fail={} hang={} err={} qemu_crash={})",
@@ -459,6 +457,21 @@ struct Summary
     hang: u32,
     err: u32,
     qemu_crash: u32,
+}
+
+/// Whether a set of runs with the outcomes `summary` counts fails: any run
+/// that is neither a PASS nor a QEMU-CRASH fails it, and so does a set with no
+/// PASS at all, whatever its QEMU-CRASH count. A QEMU-CRASH beside a PASS is
+/// tolerated as a host-emulator flake; alone it shows only that no test ran,
+/// and a guest can make QEMU abort, so it is not taken for a pass.
+fn set_failure(summary: &Summary) -> bool
+{
+    let failures = summary
+        .ok
+        .saturating_add(summary.fail)
+        .saturating_add(summary.hang)
+        .saturating_add(summary.err);
+    failures > 0 || summary.pass == 0
 }
 
 /// Check the classified boot's arguments; the display its guests present.
@@ -511,6 +524,129 @@ fn fail_regex(fail: &str, fail_also: Option<&str>) -> Result<Regex>
     // The groups keep each side's own alternations, and any flags it sets,
     // to that side.
     Ok(Regex::new(&format!("(?:{fail})|(?:{also})"))?)
+}
+
+/// What a run's log is judged by: the `--pass` and `--fail` patterns, and
+/// the harnesses of the image that svcmgr launches, whose death before the
+/// pass marker fails the run ([`harness_death`]).
+#[derive(Clone)]
+struct Markers
+{
+    pass: Regex,
+    fail: Regex,
+    /// The service name of each harness of the image that svcmgr launches.
+    supervised: Vec<&'static str>,
+}
+
+impl Markers
+{
+    /// The markers of `args` for an image that boots `harnesses`: `--pass`,
+    /// or by default the terminal pass marker of the image's one harness
+    /// ([`default_pass`]); `--fail` with `--fail-also`; and the harnesses
+    /// among `harnesses` that svcmgr launches.
+    fn for_image(args: &RunArgs, harnesses: &[ImageHarness]) -> Result<Self>
+    {
+        let pass = match &args.pass
+        {
+            Some(pass) => pass.clone(),
+            None => default_pass(harnesses)?,
+        };
+        Ok(Self {
+            pass: Regex::new(&pass).with_context(|| format!("invalid --pass regex {pass:?}"))?,
+            fail: fail_regex(&args.fail, args.fail_also.as_deref())?,
+            supervised: harnesses
+                .iter()
+                .filter(|harness| harness.recipe().is_some())
+                .map(|harness| harness.name())
+                .collect(),
+        })
+    }
+}
+
+/// The default `--pass` regex: the terminal pass marker
+/// `[<harness>] ALL TESTS PASSED` (docs/testing.md § Reporting marker) of
+/// the one harness in `harnesses`. Refused for an image that boots no
+/// harness or several, since no one marker then ends its boot.
+fn default_pass(harnesses: &[ImageHarness]) -> Result<String>
+{
+    match harnesses
+    {
+        [harness] => Ok(format!(r"\[{}\] ALL TESTS PASSED", harness.name())),
+        [] => bail!(
+            "the image boots no harness, so --pass has no default: name the run's pass marker \
+             with --pass, or stage a harness and repack"
+        ),
+        several => bail!(
+            "the image boots {} harnesses ({}), so --pass has no default: name the run's pass \
+             marker with --pass",
+            several.len(),
+            several
+                .iter()
+                .map(|harness| harness.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The text before the service name of svcmgr's line for a service's death,
+/// `[<seconds>] [svcmgr] service died: <name>`
+/// (`services/svcmgr/src/restart.rs` `log_death`), after its log name.
+const DEATH_LINE: &str = "service died: ";
+
+/// The line of `log` on which svcmgr reports the death of one of
+/// `markers.supervised` before any match of `markers.pass`, if there is one:
+/// a harness that dies before its pass marker failed, whatever follows, even
+/// a pass marker of an instance a restart started. A death after the pass
+/// marker is the harness's own exit once it has passed, and fails nothing.
+fn harness_death(log: &str, markers: &Markers) -> Option<String>
+{
+    if markers.supervised.is_empty()
+    {
+        return None;
+    }
+    let passed_at = markers.pass.find(log).map_or(log.len(), |m| m.start());
+    let mut at: usize = 0;
+    for line in log.split_inclusive('\n')
+    {
+        if at >= passed_at
+        {
+            return None;
+        }
+        if names_death(line, &markers.supervised)
+        {
+            return Some(line.trim_end_matches(['\r', '\n']).to_string());
+        }
+        at = at.saturating_add(line.len());
+    }
+    None
+}
+
+/// Whether `line` is svcmgr's line for the death of a service named in
+/// `names`: svcmgr's log name, then, after a level tag if the line has one,
+/// [`DEATH_LINE`] and the name, ended by the line's end or a character no
+/// service name holds.
+fn names_death(line: &str, names: &[&str]) -> bool
+{
+    let Some((_, rest)) = line.split_once("[svcmgr] ")
+    else
+    {
+        return false;
+    };
+    let Some((tag, died)) = rest.split_once(DEATH_LINE)
+    else
+    {
+        return false;
+    };
+    if !tag.bytes().all(|b| b.is_ascii_uppercase() || b == b' ')
+    {
+        return false;
+    }
+    names.iter().any(|name| {
+        died.strip_prefix(name).is_some_and(|after| {
+            !after.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+    })
 }
 
 /// The checks a run whose `--pass` pattern matched must also pass: each
@@ -726,17 +862,19 @@ enum OnHang
 ///
 /// Two deadlines apply, whichever comes first:
 /// - the hard `timeout` (a run still alive here is classified `HANG`);
-/// - a `fail_grace` window armed on the first `--fail` (`fail_re`) match in
-///   the live log. A crashed guest halts without shutting QEMU down, so
-///   without this it would idle to `timeout`; the grace window bounds that
-///   idle while still letting the multi-line fault dump finish landing in
-///   the log before the kill.
+/// - a `fail_grace` window armed on the first `--fail` match in the live
+///   log, or on svcmgr's line for a harness's death before its pass marker
+///   ([`harness_death`]). A crashed guest halts without shutting QEMU down,
+///   and a system whose harness died idles, so without this either would
+///   idle to `timeout`; the grace window bounds that idle while still
+///   letting the multi-line fault dump finish landing in the log before the
+///   kill.
 ///
 /// Returns `(exit_code, was_hung)`: `exit_code` is the process's reported
 /// status (or 137 on a watchdog kill, matching SIGKILL semantics);
 /// `was_hung` marks any watchdog kill (hard timeout or grace). `classify`
-/// disambiguates — a grace kill carries the `--fail` marker in the final
-/// log read, so it resolves to `FAIL`, not `HANG`.
+/// disambiguates — a grace kill carries the `--fail` marker or the death
+/// line in the final log read, so it resolves to `FAIL`, not `HANG`.
 ///
 /// With [`OnHang::Hold`], a hard-timeout expiry (no `--fail` marker seen)
 /// does not kill the instance: the attach instructions are printed and the
@@ -747,7 +885,7 @@ fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
     log_path: &Path,
-    fail_re: &Regex,
+    markers: &Markers,
     fail_grace: Duration,
     on_hang: OnHang,
 ) -> Result<(i32, bool)>
@@ -765,8 +903,9 @@ fn wait_with_timeout(
         {
             return Ok((exit_status_rc(status), false));
         }
-        // Arm the grace window on the first --fail match in the live log.
-        if grace_deadline.is_none() && fail_marker_present(log_path, &mut last_log_len, fail_re)
+        // Arm the grace window on the first --fail match, or a harness's
+        // death, in the live log.
+        if grace_deadline.is_none() && failure_present(log_path, &mut last_log_len, markers)
         {
             grace_deadline = Some(
                 Instant::now()
@@ -799,7 +938,8 @@ fn wait_with_timeout(
     }
 }
 
-/// Best-effort live scan of the per-run log for the `--fail` marker.
+/// Best-effort live scan of the per-run log for the `--fail` marker or a
+/// harness's death before its pass marker ([`harness_death`]).
 ///
 /// Reuses the whole-file `read_log` (the verdict authority in `classify`)
 /// rather than incremental tailing: the scan runs only until the first
@@ -810,7 +950,7 @@ fn wait_with_timeout(
 /// and a `metadata` failure falls back to length 0 (re-reading unless the
 /// log is still empty). The final `classify` read is authoritative, so a
 /// missed live match only forgoes the early abort, never the verdict.
-fn fail_marker_present(log_path: &Path, last_len: &mut u64, fail_re: &Regex) -> bool
+fn failure_present(log_path: &Path, last_len: &mut u64, markers: &Markers) -> bool
 {
     let len = std::fs::metadata(log_path).map_or(0, |m| m.len());
     if len == *last_len
@@ -820,7 +960,7 @@ fn fail_marker_present(log_path: &Path, last_len: &mut u64, fail_re: &Regex) -> 
     *last_len = len;
     match read_log(log_path)
     {
-        Ok(text) => fail_re.is_match(&text),
+        Ok(text) => markers.fail.is_match(&text) || harness_death(&text, markers).is_some(),
         Err(_) => false,
     }
 }
@@ -839,8 +979,9 @@ fn read_log(path: &Path) -> Result<String>
 /// a signal — `128 + signum` (shell convention), so a signal death is legible
 /// (e.g. `139` = SIGSEGV, `134` = SIGABRT, `137` = SIGKILL) instead of
 /// collapsing to `-1`. Legibility is separate from tolerance: only SIGSEGV /
-/// SIGABRT are later classified as a (non-gating) host-emulator crash
-/// (`classify` via `RC_SIGSEGV`/`RC_SIGABRT`); SIGKILL is reported but still
+/// SIGABRT are later classified as a host-emulator crash (`classify` via
+/// `RC_SIGSEGV`/`RC_SIGABRT`), tolerated only beside a passing run
+/// ([`set_failure`]); SIGKILL is reported but always
 /// gates (it is our own timeout kill, or an OOM — never a tolerated flake).
 /// This distinguishes a host-emulator crash (the QEMU 8.2.x mttcg segfault —
 /// issue #350 / QEMU gitlab #2220) from a guest fault, which is otherwise
@@ -873,19 +1014,22 @@ const RC_SIGABRT: i32 = 128 + 6;
     clippy::fn_params_excessive_bools,
     reason = "`hung` is whether the watchdog killed the run, an outcome the function classifies"
 )]
-fn classify(
-    exit_rc: i32,
-    hung: bool,
-    log: &str,
-    pass_re: &Regex,
-    fail_re: &Regex,
-) -> (Status, Option<String>)
+fn classify(exit_rc: i32, hung: bool, log: &str, markers: &Markers) -> (Status, Option<String>)
 {
     // Failure marker beats everything: a panic anywhere in the log invalidates
     // any PASS line. Use the first hit — earliest failure is the proximate cause.
-    if let Some(m) = fail_re.find(log)
+    if let Some(m) = markers.fail.find(log)
     {
         return (Status::Fail, Some(line_containing(log, m.start())));
+    }
+    // A harness svcmgr launches that died before its pass marker failed: the
+    // system idles on with no marker, which would otherwise read as a HANG.
+    if let Some(line) = harness_death(log, markers)
+    {
+        return (
+            Status::Fail,
+            Some(format!("the harness died before its pass marker: {line}")),
+        );
     }
     // Pass marker beats watchdog: a kernel that prints PASS and then idles
     // (no shutdown path) reaches the timeout but is functionally successful.
@@ -893,7 +1037,7 @@ fn classify(
     // unique terminal marker; a panic between sub-step PASS lines and the
     // final marker leaves the final marker absent, so a non-unique earlier
     // hit cannot be mistaken for completion.
-    if let Some(m) = pass_re.find(log)
+    if let Some(m) = markers.pass.find(log)
     {
         return (Status::Pass, Some(line_containing(log, m.start())));
     }
@@ -1190,14 +1334,15 @@ fn print_summary(args: &RunArgs, runs: u32, workdir: &Path, outcomes: &[RunOutco
     );
     if summary.qemu_crash > 0
     {
-        // Visible, never silent: the rate stays trackable even though it does
-        // not gate the run. This is the QEMU 8.2.x mttcg host-emulator crash
-        // (issue #350 / QEMU gitlab #2220), TCG-only and fixed in newer QEMU —
-        // a host flake, not a regression in the OS under test.
+        // Visible, never silent: the rate stays trackable even where it does
+        // not gate the run. The recurring case is the QEMU 8.2.x mttcg
+        // host-emulator crash (issue #350 / QEMU gitlab #2220), TCG-only and
+        // fixed in newer QEMU.
         println!(
             "note: {} run(s) crashed the QEMU emulator (SIGSEGV/SIGABRT) with no guest \
-             marker — host-emulator flake (#350 / QEMU gitlab #2220), not a guest failure; \
-             tolerated (does not fail the gate). Use a QEMU build newer than 8.2.x to avoid it.",
+             marker; tolerated beside a passing run, a failure of the set when no run passed \
+             (the recurring case is the QEMU 8.2.x flake, #350 / QEMU gitlab #2220: use a \
+             QEMU build newer than 8.2.x).",
             summary.qemu_crash,
         );
     }
@@ -1347,21 +1492,32 @@ mod tests
         assert_eq!(line_containing("abc\ndef", 5), "def");
     }
 
-    fn default_regexes() -> (Regex, Regex)
+    fn default_markers() -> Markers
     {
-        (
-            Regex::new("ALL TESTS PASSED").unwrap(),
-            Regex::new(DEFAULT_FAIL_REGEX).unwrap(),
-        )
+        markers(&[])
+    }
+
+    /// The default markers of an image that boots `harnesses`.
+    fn markers(harnesses: &[ImageHarness]) -> Markers
+    {
+        Markers {
+            pass: Regex::new("ALL TESTS PASSED").unwrap(),
+            fail: Regex::new(DEFAULT_FAIL_REGEX).unwrap(),
+            supervised: harnesses
+                .iter()
+                .filter(|harness| harness.recipe().is_some())
+                .map(|harness| harness.name())
+                .collect(),
+        }
     }
 
     fn classify_log(log: &str) -> Status
     {
-        let (pass, fail) = default_regexes();
+        let markers = default_markers();
         // exit_rc=0, hung=false: the kernel halts after a panic, so QEMU is
         // SIGKILLed by the watchdog in practice; pass `hung=true` only where a
         // test exercises the timeout path explicitly.
-        classify(0, false, log, &pass, &fail).0
+        classify(0, false, log, &markers).0
     }
 
     #[test]
@@ -1424,10 +1580,10 @@ mod tests
                    [46.540540] [init-logd] handover complete; init-logd thread exiting\n\
                    [47.331494] kernel: USERSPACE FAULT: tid=2589005658 cpu=0 cause=store/AMO page fault (scause=0xf)\n\
                    [47.332085] kernel:   sepc=0x0000003133369ef0  stval=0x0000000000000000\n";
-        let (pass, fail) = default_regexes();
+        let markers = default_markers();
         for hung in [false, true]
         {
-            let (status, reason) = classify(0, hung, log, &pass, &fail);
+            let (status, reason) = classify(0, hung, log, &markers);
             assert!(matches!(status, Status::Fail), "hung={hung}: {status:?}");
             assert!(reason.unwrap().contains("[init-logd] handover complete"));
         }
@@ -1441,11 +1597,11 @@ mod tests
     {
         let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n\
                    qemu-system-riscv64: ../tcg/tcg.c:1234: tcg_gen_code: Assertion failed.\n";
-        let (pass, fail) = default_regexes();
+        let markers = default_markers();
         for rc in [RC_SIGABRT, RC_SIGSEGV]
         {
             assert!(matches!(
-                classify(rc, false, log, &pass, &fail).0,
+                classify(rc, false, log, &markers).0,
                 Status::QemuCrash(code) if code == rc
             ));
         }
@@ -1464,14 +1620,11 @@ mod tests
     fn a_hang_right_at_the_handover_stays_a_hang()
     {
         let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n";
-        let (pass, fail) = default_regexes();
-        assert!(matches!(
-            classify(0, true, log, &pass, &fail).0,
-            Status::Hang
-        ));
+        let markers = default_markers();
+        assert!(matches!(classify(0, true, log, &markers).0, Status::Hang));
         // A boot with no handover (ktest) is not judged by it.
         assert!(matches!(
-            classify(0, true, "[1.0] kernel: ktest starting\n", &pass, &fail).0,
+            classify(0, true, "[1.0] kernel: ktest starting\n", &markers).0,
             Status::Hang
         ));
     }
@@ -1486,24 +1639,27 @@ mod tests
     }
 
     #[test]
-    fn fail_marker_present_guards_on_size_then_matches()
+    fn failure_present_guards_on_size_then_matches()
     {
         use std::io::Write;
 
         let path =
             std::env::temp_dir().join(format!("seraph-failmarker-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let re = Regex::new("PANIC").unwrap();
+        let markers = Markers {
+            fail: Regex::new("PANIC").unwrap(),
+            ..default_markers()
+        };
         let mut last_len = 0u64;
 
         // Written without the marker: no match, length is now tracked.
         std::fs::write(&path, b"booting\n").unwrap();
-        assert!(!fail_marker_present(&path, &mut last_len, &re));
+        assert!(!failure_present(&path, &mut last_len, &markers));
         let tracked = last_len;
         assert!(tracked > 0);
 
         // Unchanged size: the guard short-circuits before re-reading.
-        assert!(!fail_marker_present(&path, &mut last_len, &re));
+        assert!(!failure_present(&path, &mut last_len, &markers));
         assert_eq!(last_len, tracked);
 
         // The log grows with the marker: it now matches.
@@ -1512,9 +1668,180 @@ mod tests
             .open(&path)
             .unwrap();
         f.write_all(b"kernel PANIC at 0x0\n").unwrap();
-        assert!(fail_marker_present(&path, &mut last_len, &re));
+        assert!(failure_present(&path, &mut last_len, &markers));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // Defect caught: a harness's death that does not arm the grace window,
+    // so the idle system runs on to the cell's budget, or a death after the
+    // pass marker that arms it and cuts the passing boot's power-off short.
+    #[test]
+    fn a_harness_death_before_its_marker_arms_the_grace_window()
+    {
+        use std::io::Write;
+
+        let path =
+            std::env::temp_dir().join(format!("seraph-harness-death-{}.log", std::process::id()));
+        let markers = markers(&[ImageHarness::Svctest]);
+        let mut last_len = 0u64;
+        std::fs::write(&path, "[9.0] [svctest] phase=vfsd passed\n").unwrap();
+        assert!(!failure_present(&path, &mut last_len, &markers));
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"[9.1] [svcmgr] service died: svctest\n")
+            .unwrap();
+        assert!(failure_present(&path, &mut last_len, &markers));
+
+        std::fs::write(
+            &path,
+            "[9.0] [svctest] ALL TESTS PASSED\n[9.1] [svcmgr] service died: svctest\n",
+        )
+        .unwrap();
+        last_len = 0;
+        assert!(!failure_present(&path, &mut last_len, &markers));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Defect caught: a harness that faults before its marker read as the
+    // HANG its idle system reaches, or as a PASS when a restarted instance
+    // logs the marker after the death; a death after the marker (the
+    // harness's own exit once it passed) failing a passing run.
+    #[test]
+    fn a_harness_death_before_its_marker_fails_the_run_naming_the_death()
+    {
+        let markers = markers(&[ImageHarness::Svctest]);
+        let died = "[9.0] [svctest] phase=vfsd starting\n\
+                    [9.1] kernel: USERSPACE FAULT: tid=27 cpu=1\n\
+                    [9.2] [svcmgr] service died: svctest\n\
+                    [9.2] [svcmgr]   exit_reason=0x0000000000001001\n";
+        for hung in [false, true]
+        {
+            let (status, reason) = classify(0, hung, died, &markers);
+            assert!(matches!(status, Status::Fail), "hung={hung}: {status:?}");
+            let reason = reason.unwrap();
+            assert!(
+                reason.contains("[9.2] [svcmgr] service died: svctest"),
+                "{reason}"
+            );
+        }
+        let restarted = format!("{died}[20.0] [svctest] ALL TESTS PASSED\n");
+        assert!(matches!(
+            classify(0, false, &restarted, &markers).0,
+            Status::Fail
+        ));
+        // A level tag between the log name and the line is read through.
+        let tagged = "[9.2] [svcmgr] WARN service died: svctest\n";
+        assert!(matches!(
+            classify(0, true, tagged, &markers).0,
+            Status::Fail
+        ));
+        let passed = "[9.0] [svctest] ALL TESTS PASSED\n\
+                      [9.1] [svcmgr] service died: svctest\n";
+        assert!(matches!(
+            classify(0, true, passed, &markers).0,
+            Status::Pass
+        ));
+    }
+
+    // Defect caught: the death of another service read as the harness's (a
+    // fixture svctest kills, a service whose name the harness's begins), or
+    // a harness's death failing an image whose record does not name it.
+    #[test]
+    fn only_the_death_of_a_harness_of_the_image_fails_the_run()
+    {
+        // ktest has no supervisor: no death line is read for it.
+        assert!(matches!(
+            classify(
+                0,
+                true,
+                "[9.2] [svcmgr] service died: ktest\n",
+                &markers(&[ImageHarness::Ktest])
+            )
+            .0,
+            Status::Hang
+        ));
+        let markers = markers(&[ImageHarness::Usertest]);
+        for log in [
+            "[9.2] [svcmgr] service died: logd\n",
+            "[9.2] [svcmgr] service died: usertest-fixture\n",
+            "[9.2] [svcmgr] service died: svctest\n",
+            "[9.2] [crasher] service died: usertest\n",
+            "[9.2] [svcmgr] restart of usertest; service died: usertest\n",
+        ]
+        {
+            assert!(
+                matches!(classify(0, true, log, &markers).0, Status::Hang),
+                "{log}"
+            );
+        }
+        assert!(matches!(
+            classify(
+                0,
+                true,
+                "[9.2] [svcmgr] service died: usertest\r\n",
+                &markers
+            )
+            .0,
+            Status::Fail
+        ));
+    }
+
+    // Defect caught: a set whose only run crashed QEMU exiting 0, so a CI
+    // cell is green with no test run; or a crash beside a pass failing the
+    // set the tolerance exists for.
+    #[test]
+    fn a_set_fails_without_a_pass_whatever_its_qemu_crashes()
+    {
+        let summary = |pass, qemu_crash, hang| Summary {
+            pass,
+            ok: 0,
+            fail: 0,
+            hang,
+            err: 0,
+            qemu_crash,
+        };
+        assert!(set_failure(&summary(0, 1, 0)));
+        assert!(set_failure(&summary(0, 3, 0)));
+        assert!(!set_failure(&summary(1, 1, 0)));
+        assert!(!set_failure(&summary(1, 0, 0)));
+        assert!(set_failure(&summary(1, 1, 1)));
+    }
+
+    // Defect caught: a default pass marker that a line of another harness, or
+    // the bare substring, matches, so a stray line followed by a hang reads
+    // as a PASS; or a default for an image no one marker ends.
+    #[test]
+    fn the_default_pass_marker_is_the_one_harness_of_the_image()
+    {
+        let pass = Regex::new(&default_pass(&[ImageHarness::Svctest]).unwrap()).unwrap();
+        let markers = Markers {
+            pass,
+            ..markers(&[ImageHarness::Svctest])
+        };
+        assert!(matches!(
+            classify(0, true, "[30.1] [svctest] ALL TESTS PASSED\n", &markers).0,
+            Status::Pass
+        ));
+        for log in [
+            "[30.1] [usertest] ALL TESTS PASSED\n",
+            "[30.1] [vfsd] note: ALL TESTS PASSED\n",
+            "ALL TESTS PASSED\n",
+        ]
+        {
+            assert!(
+                matches!(classify(0, true, log, &markers).0, Status::Hang),
+                "{log}"
+            );
+        }
+        let none = default_pass(&[]).unwrap_err().to_string();
+        assert!(none.contains("no harness"), "{none}");
+        let several = default_pass(&[ImageHarness::Svctest, ImageHarness::Ubench])
+            .unwrap_err()
+            .to_string();
+        assert!(several.contains("svctest, ubench"), "{several}");
     }
 
     // The #350 signature: QEMU killed by SIGSEGV (rc=139) with the guest log
@@ -1523,10 +1850,10 @@ mod tests
     #[test]
     fn qemu_sigsegv_no_marker_classifies_qemu_crash()
     {
-        let (pass, fail) = default_regexes();
+        let markers = default_markers();
         let log = "[0.12] [init] requesting procmgr to create vfsd (with caps)\n\
                    [0.13] [devmgr] devmgr: ECAM phys=0xe0000000 size=0x10000000 buses 0..=255\n";
-        let (status, matched) = classify(RC_SIGSEGV, false, log, &pass, &fail);
+        let (status, matched) = classify(RC_SIGSEGV, false, log, &markers);
         assert!(matches!(status, Status::QemuCrash(c) if c == RC_SIGSEGV));
         assert!(matched.unwrap().contains("ECAM phys="));
     }
@@ -1536,10 +1863,10 @@ mod tests
     #[test]
     fn signal_with_fail_marker_classifies_fail()
     {
-        let (pass, fail) = default_regexes();
+        let markers = default_markers();
         let log = "[1.0] kernel: KERNEL EXCEPTION: cpu=0 cause=#PF page fault (vec=14 err=0x10)\n";
         assert!(matches!(
-            classify(RC_SIGSEGV, false, log, &pass, &fail).0,
+            classify(RC_SIGSEGV, false, log, &markers).0,
             Status::Fail
         ));
     }
@@ -1651,10 +1978,10 @@ mod tests
     #[test]
     fn sigkill_is_not_qemu_crash()
     {
-        let (pass, fail) = default_regexes();
+        let markers = default_markers();
         let log = "[0.13] [devmgr] devmgr: ECAM phys=0xe0000000 size=0x10000000 buses 0..=255\n";
         assert!(matches!(
-            classify(128 + 9, false, log, &pass, &fail).0,
+            classify(128 + 9, false, log, &markers).0,
             Status::Err(c) if c == 128 + 9
         ));
     }
@@ -1665,24 +1992,23 @@ mod tests
         // The framebuffer cell's pass condition: a passing svctest log that
         // shows the framebuffer case skipped is a failure, and a kernel death
         // marker still fails the run beside the extra pattern.
-        let pass = Regex::new("ALL TESTS PASSED").unwrap();
-        let fail = fail_regex(DEFAULT_FAIL_REGEX, Some("framebuffer case skipped")).unwrap();
+        let markers = Markers {
+            fail: fail_regex(DEFAULT_FAIL_REGEX, Some("framebuffer case skipped")).unwrap(),
+            ..default_markers()
+        };
         let skipped = "drivers deny: framebuffer case skipped: no framebuffer driver\n\
                        [svctest] ALL TESTS PASSED\n";
         assert!(matches!(
-            classify(0, false, skipped, &pass, &fail).0,
+            classify(0, false, skipped, &markers).0,
             Status::Fail
         ));
         let panicked = "\nPANIC: explicit halt\n";
         assert!(matches!(
-            classify(0, false, panicked, &pass, &fail).0,
+            classify(0, false, panicked, &markers).0,
             Status::Fail
         ));
         let ran = "[svctest] ALL TESTS PASSED\n";
-        assert!(matches!(
-            classify(0, false, ran, &pass, &fail).0,
-            Status::Pass
-        ));
+        assert!(matches!(classify(0, false, ran, &markers).0, Status::Pass));
     }
 
     // Defect caught: a passing run whose log lacks a line a --require pattern

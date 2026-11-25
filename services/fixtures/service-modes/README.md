@@ -16,6 +16,7 @@ first argument.
 | [`crasher`](#crasher) | `crasher.svc` | `service-modes crasher selftest` |
 | [`crasher`](#crasher) | `crasher-boot.svc` | `service-modes crasher boot-fault` |
 | [`crasher`](#crasher) | `crasher-worker.svc` | `service-modes crasher worker-fault` |
+| [`crasher`](#crasher) | `crasher-once.svc` | `service-modes crasher worker-fault` |
 | [`memhog`](#memhog) | `memhog.svc` | `service-modes memhog` |
 | [`stopsrc`](#stopsrc) | `stopsrc.svc` | `service-modes stopsrc`; its job `/tests/fixtures/service-modes stopsrc job <pages>` |
 
@@ -78,6 +79,12 @@ faults its main thread; when the token is not there it serves as the `worker-fau
 ships the token (`rootfs/data/crasher-boot/die-early`), so the first launch dies so, and svctest's
 `svcmgr_boot_death` phase writes it again before it faults a serving instance's worker, so a
 restart dies so too.
+
+The `worker-fault` role also runs under a second recipe,
+`rootfs/config/svcmgr/tests/crasher-once.svc` (`restart = never`, `critical = no`,
+`namespace = none`, `provides = crasher.once`), co-staged with `svctest` wherever `crasher.svc` is.
+svctest's `svcmgr_one_shot_death` phase faults its instance's worker and checks that svcmgr logs the
+death and the decision not to restart it.
 
 ---
 

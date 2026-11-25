@@ -124,8 +124,8 @@ the caps of the rounds it did not serve and routes the death at once through
   round, with the `HANDOVER_PULL` SEND, since init-logd may still wait for the handover
   (§ Supervision hierarchy). An unrecoverable outcome starts the graceful
   shutdown once reconciliation ends, when the shutdown actuator is recorded. svcmgr logs a death
-  on the first launch at once (`svcmgr: <name> died during its bootstrap`), a one-shot service's
-  (`restart = never`) and the log sink's included: no instance of the log sink has taken the
+  on the first launch at once (`svcmgr: <name> died during its bootstrap`), the log sink's
+  included: no instance of the log sink has taken the
   handover then, so init-logd still receives the line.
 - On a restart the dead new instance is a death of its own, decided by the same steps
   (§ Decision tree), its restart charged to the same budget, which bounds the repeats.
@@ -450,9 +450,18 @@ spawns are not in its table, and none of them flows through the handover endowme
 
 The table below lists the services svcmgr currently binds or launches
 (per the shipped and staged `.svc` files). A `restart = never` service
-svcmgr launches (`svctest`, `usertest`) is launched one-shot:
-svcmgr binds no death notification for it and records no `ServiceEntry`
-([service-definitions.md](service-definitions.md#reconciliation)).
+svcmgr launches (`svctest`, `usertest`, `ubench`) is supervised as any
+other: its two death observers are bound before it runs, and it holds a
+`ServiceEntry` ([service-definitions.md](service-definitions.md#reconciliation)).
+Its death, a clean exit included, is routed by `restart::handle_death`,
+whose first act is to log `service died: <name>` and its `exit_reason`,
+before the restart decision, which for `POLICY_NEVER` is no restart: the
+entry is marked inactive, its dead instance released, and the system
+continues degraded. A test harness's death, before its pass marker or
+after it, is thus on the boot log. The line goes to whichever logger
+serves the log endpoint, as every svcmgr line does: real logd once it has
+taken the handover, and init-logd before then; either writes it to the
+serial console.
 
 `svctest`, `usertest`, and `crasher` are test-tier fixtures: their recipes
 live in `/config/svcmgr/tests/` (svcmgr does not read it) and are staged

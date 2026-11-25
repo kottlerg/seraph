@@ -7,8 +7,8 @@ to the serial console before exiting.
 
 On completion ktest emits the cross-harness marker
 `[ktest] ALL TESTS PASSED` (or `[ktest] SOME TESTS FAILED`) per
-[docs/testing.md](../../docs/testing.md). CI scrapes the substring
-`ALL TESTS PASSED` from the boot log.
+[docs/testing.md](../../docs/testing.md). `cargo xtask run --runs`, which CI boots it with,
+passes the boot on that pass marker and on no other line.
 
 ---
 

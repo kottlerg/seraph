@@ -338,6 +338,18 @@ loader reached only through such an image is a defect, not an attack.
   note-step proofs stand behind for the stack note's. The program-header, section-header and
   file-range reads are proven at any place. The loops that drive the steps are left to the fuzz
   target.
+- `driver-binding` (`xtask/fuzz/targets/src/bin/driver-binding.rs`) drives
+  `driver_binding::property::decl_holds` over a declaration descriptor, from the seeds in
+  `shared/driver-binding/fuzz/driver-binding/seeds/`: the header, the field walk, each field's
+  form and bounds, the finish, and the round trip of a declaration taken through `encode`. CI's
+  gating `fuzz` job runs it on a pull request whose change can affect it and the campaign for 30
+  minutes.
+- The `proofs` module of `shared/driver-binding/src/decl.rs` proves the same property by
+  induction over the field walk ([testing.md](testing.md) § Bounded verification); CI's `kani` job
+  runs them. The header and the field cut are proven on any descriptor up to their bounds, the
+  step on any field of a payload up to 33 bytes into any builder its invariant admits, and the
+  finish on any builder. The loop that drives the steps, and the round trip of a declaration
+  taken through `encode`, are left to the fuzz target.
 
 **Gaps.**
 
@@ -347,8 +359,6 @@ loader reached only through such an image is a defect, not an attack.
   `elf::validate_executable`, `elf::find_note_streaming` and the declaration decoder with bytes no
   key signed. procmgr still refuses to run such a file
   ([#1533](https://github.com/kottlerg/seraph/issues/1533)).
-- No fuzz target or proof harness covers the declaration decoder yet; they are planned
-  ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---
 
@@ -498,9 +508,26 @@ and the verifier), `shared/crypto` (the primitives), `core/boot/src/main.rs`,
 `core/boot/src/rollback.rs`, `core/boot/src/enrolment.rs`, `core/boot/src/secure_boot.rs` and
 `services/procmgr/src/image.rs`.
 
-**Fuzz targets and proof harnesses.** None. The primitives are tested against known-answer and
-Wycheproof vectors, `shared/objsig` is host-tested, and the booted `signing`, `rollback`,
-`enrolment` and `secureboot` cases boot each refusal ([testing.md](testing.md) § Gating).
+**Fuzz targets and proof harnesses.**
+
+- `objsig` (`xtask/fuzz/targets/src/bin/objsig.rs`) drives `objsig::property::objsig_holds` over
+  an input read as a signed object, signed attributes, a certificate, a trust store, an enrolled
+  store and a trust request, from the seeds in `shared/objsig/fuzz/objsig/seeds/`: `split` and
+  its records, `Attributes::parse`, `Certificate::parse`, `TrustStore::parse`,
+  `EnrolledStore::parse` and `TrustRequest::parse`. CI's gating `fuzz` job runs it on a pull
+  request whose change can affect it and the campaign for 30 minutes.
+- The `proofs` modules of `shared/objsig/src/trailer.rs`, `attrs.rs`, `cert.rs`, `store.rs` and
+  `enrol.rs` prove the same property by induction over each walk ([testing.md](testing.md)
+  § Bounded verification); CI's `kani` job runs them. The footer, the record cut and the close are
+  proven on any input up to their bounds, a record's decode on any fields of each certificate
+  length, the attributes on any input of up to 103 bytes, the certificate on any input, each
+  store's header layout on any input up to one anchor and one revoked key id, an anchor's check on
+  any anchor, its checks on any usage and flags and on label fields of up to 4 bytes, the order of
+  its key id after any key id, and the order and lookup of revoked key ids on up to 3. The loops
+  that drive the steps, and the SHA-512 key id of each anchor, are left to the fuzz target.
+- The primitives are tested against known-answer and Wycheproof vectors, `shared/objsig` is
+  host-tested, and the booted `signing`, `rollback`, `enrolment` and `secureboot` cases boot each
+  refusal ([testing.md](testing.md) § Gating).
 
 **Gaps.**
 
@@ -513,9 +540,6 @@ Wycheproof vectors, `shared/objsig` is host-tested, and the booted `signing`, `r
   floor included ([signing.md](signing.md) § Rollback Floor); and an older signed configuration
   directory at an admitted security version verifies
   ([#1416](https://github.com/kottlerg/seraph/issues/1416)).
-- The parsers of the signature trailer, the certificate, the trust store and the trust request,
-  which read bytes before any signature over them is checked, have no fuzz target or proof harness
-  yet; they are planned ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 - devmgr parses drivers-directory files before procmgr verifies them (§ ELF Loading,
   [#1533](https://github.com/kottlerg/seraph/issues/1533)).
 - Secure Boot and a TPM are not required by the platform floor

@@ -101,7 +101,7 @@ completion:
 [<harness>] SOME TESTS FAILED
 ```
 
-`<harness>` is the harness name (`ktest`, `svctest`, `usertest`).
+`<harness>` is the harness name (`ktest`, `svctest`, `usertest`, `ubench`).
 
 - For harnesses launched as a userspace service, `std::os::seraph::log!`
   with a name registered via `std::os::seraph::log::register_name(b"<name>")`
@@ -111,7 +111,14 @@ completion:
   available; the harness writes the full bracketed line directly to the
   serial port.
 
-CI scrapes the substring `ALL TESTS PASSED` from the boot log. Per-tier
+`cargo xtask run --runs`, which every CI boot uses, passes a run on the pass marker of the harness
+the image boots, with that harness's name, never on the bare substring `ALL TESTS PASSED`, so a
+line of another process holding it is not a pass. A harness launched as a service that dies before
+its marker, as a fault in its own process does, fails the run: svcmgr logs
+`service died: <harness>`, and `run` reads that line, before the harness's pass marker, as a
+failure within its fail grace window. ktest has no supervisor to log its death: a fault of its own
+thread logs no marker, and its boot stays a HANG at its budget
+([xtask/README.md](../xtask/README.md#cargo-xtask-run) gives the verdicts). Per-tier
 breakdown and counter lines (`PASS <name>`, `passed=`, `failed=`) are
 harness-specific and MUST NOT include the bracketed summary substring.
 
@@ -277,6 +284,7 @@ rootfs/config/svcmgr/
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
 │   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
 │   ├── crasher-boot.svc      # death-before-bootstrap fixture; co-staged with svctest
+│   ├── crasher-once.svc      # one-shot death fixture; co-staged with svctest
 │   ├── memhog.svc            # out-of-memory policy fixture; co-staged with svctest
 │   ├── reserve-creator.svc   # reserve-creator fixture; co-staged with svctest
 │   ├── stopsrc.svc           # stop-source fixture; co-staged with svctest
@@ -341,7 +349,7 @@ recipe with the fixtures of one named set, removes every other fixture's recipe 
 
 | Set | Fixtures | Used by |
 |---|---|---|
-| `ci` | `crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc` | the canonical svctest cells, and the local host runs that stage svctest as they do |
+| `ci` | `crasher`, `crasher-worker`, `crasher-boot`, `crasher-once`, `memhog`, `reserve-creator`, `stopsrc` | the canonical svctest cells, and the local host runs that stage svctest as they do |
 | `burn-in` | `memhog`, `reserve-creator`, `stopsrc` | the burn-in svctest cell |
 | `none` | none | a boot of svctest alone |
 | `crash-endpoint` | none | the crash-endpoint boot: no crashd, and svctest runs only its startup phases, `svctest_fixtures` and `crash_endpoint` |
@@ -578,15 +586,16 @@ is therefore not gated: it costs nothing on hardware, and the functional cells s
 profiles. [core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md)
 § Profile gives the counts of both profiles per path.
 
-A one-CPU count gates only when it does not include time blocked on a device completion. The
-completion arrives at host time: a guest blocked on it retires no instructions, and its clock
-follows the host's time until QEMU completes the request, so the count follows the host's I/O
-latency. `fsbench.write`, which writes through the filesystem's page cache to the disk, is such a
-benchmark at every size, and is reported, not gated; a regression of the write path's
-instructions shows in the cell's report and in host mode, not as a failure. `fsbench.read` gates:
-its untimed open, fixture check and warm-up reads fill the filesystem's page cache with the file,
-so no timed read waits on the disk. A benchmark is classified by the same test: one whose timed
-samples wait on a device joins the set (`ICOUNT_IO_BOUND` in `xtask/src/benchmark.rs`).
+A one-CPU count gates only when its timed window does not idle. While every vCPU idles, the
+guest's clock follows the host's time, so a window that idles counts host time, which no band
+bounds: one blocked on a device completion, which arrives at host time, counts the host's I/O
+latency, and one waiting on a timer counts the host time its idle took. `fsbench.write`, which
+writes through the filesystem's page cache to the disk, is such a benchmark at every size, and is
+reported, not gated; a regression of the write path's instructions shows in the cell's report and
+in host mode, not as a failure. `fsbench.read` gates: its untimed open, fixture check and warm-up
+reads fill the filesystem's page cache with the file, so no timed read waits on the disk. A
+benchmark is classified by the same test: one whose timed samples idle, on a device, a timer or
+any other event, joins the set (`ICOUNT_IO_BOUND` in `xtask/src/benchmark.rs`).
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
@@ -1252,8 +1261,10 @@ exercised in the services-surface CI cell (svctest's `svcmgr_worker_fault_restar
 worker fault, and its `svcmgr_stop_service` phase stops and restarts the fixture through svcmgr's
 stop authority), as is its boot-fault role (`crasher-boot.svc`, `restart = on_failure`), whose
 instance that finds the token `/data/crasher-boot/die-early`, which the data partition ships,
-removes it and dies before its bootstrap request (svctest's `svcmgr_boot_death` phase); its bounded
-faults complete long before `svctest`'s terminal marker, so the kernel fault dump never clobbers it.
+removes it and dies before its bootstrap request (svctest's `svcmgr_boot_death` phase), and its
+one-shot role (`crasher-once.svc`, `restart = never`), whose death svcmgr logs and does not restart
+(svctest's `svcmgr_one_shot_death` phase); its bounded faults complete long before `svctest`'s
+terminal marker, so the kernel fault dump never clobbers it.
 The `memhog` fixture (`memhog.svc`, `restart = on_failure`, `oom_stop = yes`) is in the `ci` and
 `burn-in` sets: svctest's `oom_policy` phase has it fill memory until oomd stops it, and its
 `logd_reserve` phase has it fill memory while logd is killed and restarted. The `ci`, `burn-in` and
@@ -1370,7 +1381,7 @@ registry runs it on (its `md-test-cells` rule).
 
 | Cell | Tier | Architectures | Launch | Cases | Covers |
 |---|---|---|---|---|---|
-| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `reserve-creator`, `stopsrc`) and crashd's test recipe | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, the restart, out-of-memory, and stop-source paths its fixtures drive, and the crash reports of its boot ([Crash reports](#crash-reports)) |
+| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `crasher-once`, `memhog`, `reserve-creator`, `stopsrc`) and crashd's test recipe | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, the restart, out-of-memory, and stop-source paths its fixtures drive, and the crash reports of its boot ([Crash reports](#crash-reports)) |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `storage-roles`, `shutdown` | the programs surface, a boot with no crash report ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
 | `bench` | Canonical | x86_64, riscv64; release | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
@@ -1924,7 +1935,9 @@ nothing on that account.
 **When the runs are owed.** Each local host run a PR owes MUST pass at one
 head that covers the merge head. For every local and release host run, only a `PASS` outcome of
 `run --runs` ([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the
-host emulator, is run again and the re-run's outcome stands; a run that ran beside another QEMU and
+host emulator, is run again and the re-run's outcome stands (`run --runs` exits non-zero on a set
+with no `PASS`, whatever its `QEMU-CRASH` count, and tolerates a `QEMU-CRASH` only beside a
+`PASS`); a run that ran beside another QEMU and
 HANGs or fails a timing check is run again once with no other QEMU beside it (`--alone`), and the
 re-run's outcome stands; `OK` and `ERR` count as failures. The
 PR's own diff at a head is the diff from that head's merge base with the fetched `master` to the

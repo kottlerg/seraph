@@ -640,10 +640,13 @@ pointer against the page runs it holds, the illegal instruction's bytes, and the
 threads ([services/fixtures/crashme/README.md](../services/fixtures/crashme/README.md)). Its
 `crashd_live_core` phase asks crashd, through the `crashd.core` seed, for a live core of the
 running fixture and checks that the fixture ran on unchanged and that the core records its threads,
-their stacks and a page it marked, and none of the binary's text, and asks for one of a fixture on
-the core path, on an account that cannot fund a snapshot, and checks the refusal asked for none
-([crashd Operation § Live Core](../services/crashd/docs/operation.md#live-core)). A core is checked
-in the boot, not in the log; `gdb` reading one is checked by hand
+their stacks and a page it marked, and none of the binary's text; asks for one of a fixture on the
+core path, on an account that cannot fund a snapshot, and checks the refusal asked for none; and
+asks for one that procmgr refuses after it took frames and one that crashd refuses after the
+capture, for a declaration made during the request, and checks that each left svctest's charge as
+it was ([crashd Operation § Live Core](../services/crashd/docs/operation.md#live-core)). The phase
+also checks that a spawn returns with its death bridge's pages charged. A core is checked in the
+boot, not in the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The svctest boot's crashd also holds a page fault memmgr declined for want of memory, for up to

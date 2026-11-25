@@ -558,7 +558,7 @@ policy, which ktest does not read; ktest is monolithic and does not spawn usersp
 `disk.img` carries four GPT partitions: the EFI System Partition
 (from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
 excluding `esp/` and `data/`), an arch-neutral `SERAPH_DATA`
-partition (from `sysroot/data/`), and a 64 MiB raw swap partition of the arch-neutral
+partition (from `sysroot/data/`), and a 256 MiB raw swap partition of the arch-neutral
 `SERAPH_SWAP` type GUID (no filesystem, left zero), always the last partition of its image. The
 data partition is authored unconditionally; `mkdisk --split-data` authors it and the swap
 partition on a second image, `disk-data.img` beside `disk.img`, which then carries the ESP and

@@ -95,8 +95,8 @@ pub fn phases() -> &'static [Phase]
 /// The phase's name in its failure messages.
 const PHASE: &str = "swapd";
 
-/// The slots swapd registers: the swap partition is 64 MiB of 64 KiB slots.
-const SWAP_SLOTS: u64 = 1024;
+/// The slots swapd registers: the swap partition is 256 MiB of 64 KiB slots.
+const SWAP_SLOTS: u64 = 4096;
 /// swapd's name in `LIST_PROCESSES`, its recipe's `argv`.
 const SWAPD_NAME: &[u8] = b"swapd";
 /// swapd's image, which svcmgr's restart of it reads.

@@ -498,6 +498,26 @@ pub fn parse_table(contents: &str) -> Result<PlatformTable, TableError>
     })
 }
 
+/// The proof of the property's check of the SPCR decoder
+/// (docs/testing.md § Bounded verification): the decode is one read of
+/// fixed fields, proven whole; nothing lies outside the proof.
+#[cfg(kani)]
+mod proofs
+{
+    /// Every input of at most 81 bytes holds the SPCR's contract: 81 bytes
+    /// reach the length refusal and the acceptance of the 80 bytes it reads.
+    /// The loop is the compare of the 4-byte signature.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_spcr_reads_as_its_fields()
+    {
+        let bytes: [u8; 81] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        crate::property::spcr::spcr_holds(&bytes[..len]);
+    }
+}
+
 #[cfg(test)]
 mod tests
 {

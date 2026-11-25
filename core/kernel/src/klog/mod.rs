@@ -57,8 +57,11 @@ static LAST_READ_US: AtomicU64 = AtomicU64::new(0);
 static PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Serialises the binding: its change, its clearing when the notification
-/// is freed, and the tick's signal through it. A leaf above the
-/// notification's own lock.
+/// is freed, and the tick's signal through it. The signal's send takes, under
+/// it, the notification's lock and, for a notification in a wait set, the
+/// wait set's lock, then the woken waiter's `sched_lock` and a CPU's
+/// scheduler lock; so it is never taken while any of those is held
+/// (core/kernel/docs/kernel-log.md § Lock order).
 static BINDING_LOCK: Spinlock = Spinlock::new();
 
 /// The notification the reader bound and the bits to signal, under
@@ -336,8 +339,11 @@ fn stall_check()
 #[cfg(not(test))]
 unsafe fn signal_reader()
 {
-    // SAFETY: released below; the notification's lock, taken inside
-    // notification_send, is the only lock taken under it.
+    // SAFETY: released below. notification_send takes, under it, the
+    // notification's lock and, for a notification in a wait set, the wait
+    // set's lock and the woken waiter's sched_lock and a CPU's scheduler
+    // lock; the caller holds no lock, and no holder of those takes
+    // BINDING_LOCK.
     let saved = unsafe { BINDING_LOCK.lock_raw() };
     // SAFETY: BINDING_LOCK held.
     let (sig, bits) = unsafe {

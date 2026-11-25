@@ -150,9 +150,13 @@ that led to the failure then come out before its report.
   cursor. It is taken with interrupts disabled. The one lock taken under it is the console lock,
   by a line written directly while no reader is attached. No holder of the console lock takes
   `KLOG_LOCK`.
-- `BINDING_LOCK` serialises the binding's change, its clearing and the tick's signal. The one
-  lock taken under it is the notification's own, inside the send; the woken thread is enqueued
-  after `BINDING_LOCK` is released.
+- `BINDING_LOCK` serialises the binding's change, its clearing and the tick's signal. The send
+  takes, under it, the notification's own lock and, when the notification is a member of a wait
+  set, the wait set's lock and then, waking the wait set's waiter, that thread's `sched_lock` and
+  a CPU's scheduler lock; the waiter the send releases directly is enqueued after
+  `BINDING_LOCK` is released. `BINDING_LOCK` is never taken while any of those locks is held:
+  the bind syscall and a notification's deallocation take it holding none of them, and the tick
+  holding no lock.
 - `SYS_KERNEL_LOG_READ` copies to the caller's buffer with neither lock held: it copies records
   into a kernel buffer under `KLOG_LOCK`, releases it, then copies to the user buffer.
 

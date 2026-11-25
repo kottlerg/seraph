@@ -932,7 +932,7 @@ At any phase, if the kernel cannot continue:
 ```rust
 pub(crate) fn fatal(msg: &str) -> !
 {
-    kprintln!("FATAL: {}", msg);
+    kprintln_direct!("FATAL: {}", msg);
     arch::current::cpu::halt_loop();
 }
 ```

@@ -7,9 +7,11 @@
 //! `crypto::keccak`.
 //!
 //! [`Prng`] is a sponge in duplex mode: [`Prng::absorb`] injects entropy;
-//! [`Prng::fill`] squeezes output and then erases it (fast key erasure). The
-//! construction and its forward-secrecy argument are specified in
-//! [entropy.md](../../docs/entropy.md) § Keccak duplex construction.
+//! [`Prng::fill`] squeezes output and then erases it (fast key erasure).
+//! [`BufferedPrng`] adds an output buffer of one squeezed rate block, from which
+//! small draws take bytes and erase them. The construction and its
+//! forward-secrecy argument are specified in [entropy.md](../../docs/entropy.md)
+//! § Keccak duplex construction.
 
 use crypto::keccak::{LANES, keccak_f1600};
 
@@ -96,11 +98,109 @@ impl Prng
         keccak_f1600(&mut self.st);
     }
 
+    /// Squeeze one rate block into `block`, then ratchet from a rate that was
+    /// never output.
+    ///
+    /// The block outlives the call in [`BufferedPrng`], undrawn bytes and all,
+    /// so the ratchet cannot zero the rate the block was read from: with that
+    /// rate's undrawn bytes known, the state before the ratchet would be
+    /// recoverable through the inverse permutation by a search over only the
+    /// drawn bytes. One more permutation first makes the zeroed rate one no
+    /// caller ever saw (entropy.md § Keccak duplex construction).
+    fn squeeze_block(&mut self, block: &mut [u8; RATE])
+    {
+        keccak_f1600(&mut self.st);
+        squeeze_from(&self.st, block);
+        keccak_f1600(&mut self.st);
+        zero_rate(&mut self.st);
+        keccak_f1600(&mut self.st);
+    }
+
     /// Test-only view of the raw state, for the erasure property test.
     #[cfg(test)]
     fn raw_state(&self) -> [u64; LANES]
     {
         self.st
+    }
+}
+
+/// A [`Prng`] with an output buffer of one squeezed rate block.
+///
+/// [`BufferedPrng::draw`] serves bytes from the block, erasing each before it
+/// returns, and squeezes a new block when it runs out; [`BufferedPrng::fill`]
+/// squeezes fresh output and leaves the block alone. What the undrawn bytes
+/// expose is bounded in entropy.md § Scope and threat model.
+pub struct BufferedPrng
+{
+    prng: Prng,
+    /// One squeezed rate block: bytes before `next` were drawn and are zero,
+    /// bytes from `next` on are undrawn.
+    block: [u8; RATE],
+    /// Index of the first undrawn byte of `block`; [`RATE`] when it holds none.
+    next: usize,
+}
+
+impl BufferedPrng
+{
+    /// A zero-initialized generator with an empty block. Useless until seeded
+    /// via [`BufferedPrng::reseed`].
+    pub const fn new() -> Self
+    {
+        Self {
+            prng: Prng::new(),
+            block: [0; RATE],
+            next: RATE,
+        }
+    }
+
+    /// Erase the undrawn bytes, which the state before the seed produced, then
+    /// absorb `seed`.
+    pub fn reseed(&mut self, seed: &[u8])
+    {
+        self.erase();
+        self.prng.absorb(seed);
+    }
+
+    /// Erase the undrawn bytes of the block, leaving it empty.
+    pub fn erase(&mut self)
+    {
+        // Bytes before `next` are zero already.
+        if let Some(undrawn) = self.block.get_mut(self.next..)
+        {
+            super::wipe(undrawn);
+        }
+        self.next = RATE;
+    }
+
+    /// Fill `out` with fresh output, its own squeeze and ratchet
+    /// ([`Prng::fill`]); the block is not touched.
+    pub fn fill(&mut self, out: &mut [u8])
+    {
+        self.prng.fill(out);
+    }
+
+    /// Fill `out` from the block, squeezing a new block whenever it runs out.
+    /// Every byte served is erased from the block before this returns.
+    pub fn draw(&mut self, out: &mut [u8])
+    {
+        let mut rest = out;
+        while !rest.is_empty()
+        {
+            if self.next >= RATE
+            {
+                self.prng.squeeze_block(&mut self.block);
+                self.next = 0;
+            }
+            // `next < RATE` here, so the undrawn tail is not empty.
+            let undrawn = self.block.get_mut(self.next..).unwrap_or_default();
+            let take = undrawn.len().min(rest.len());
+            let (served, _) = undrawn.split_at_mut(take);
+            let (dst, tail) = core::mem::take(&mut rest).split_at_mut(take);
+            dst.copy_from_slice(served);
+            super::wipe(served);
+            self.next = self.next.saturating_add(take);
+            rest = tail;
+        }
     }
 }
 
@@ -200,6 +300,131 @@ mod tests
         p.fill(&mut x);
         p.fill(&mut y);
         assert_ne!(x, y);
+    }
+
+    /// A buffered generator and a plain twin, both seeded with `seed`.
+    fn seeded_pair(seed: &[u8]) -> (BufferedPrng, Prng)
+    {
+        let mut buffered = BufferedPrng::new();
+        buffered.reseed(seed);
+        let mut twin = Prng::new();
+        twin.absorb(seed);
+        (buffered, twin)
+    }
+
+    /// Draws of every size from 1 to 8 bytes, at every offset into the block and
+    /// across its end, serve the squeezed blocks byte for byte in order: no byte
+    /// is served twice and none is skipped.
+    #[test]
+    fn buffered_draws_serve_each_squeezed_byte_once_in_order()
+    {
+        for size in 1..=8
+        {
+            let (mut buffered, mut twin) = seeded_pair(b"seed");
+            let mut expected = Vec::new();
+            for _ in 0..3
+            {
+                let mut block = [0u8; RATE];
+                twin.squeeze_block(&mut block);
+                expected.extend_from_slice(&block);
+            }
+            let mut served = Vec::new();
+            while served.len() + size <= expected.len()
+            {
+                let mut out = [0u8; 8];
+                buffered.draw(&mut out[..size]);
+                served.extend_from_slice(&out[..size]);
+            }
+            assert!(served.len() > 2 * RATE, "size {size}");
+            assert_eq!(served[..], expected[..served.len()], "size {size}");
+        }
+    }
+
+    /// A drawn byte is zero in the block when the draw returns, and the undrawn
+    /// ones are still there to serve.
+    #[test]
+    fn drawn_bytes_are_erased_before_the_draw_returns()
+    {
+        let (mut buffered, _) = seeded_pair(b"seed");
+        let mut out = [0u8; 4];
+        buffered.draw(&mut out);
+        assert_eq!(buffered.next, 4);
+        assert!(buffered.block[..4].iter().all(|&b| b == 0));
+        assert!(buffered.block[4..].iter().any(|&b| b != 0));
+
+        let mut rest = [0u8; RATE - 4];
+        buffered.draw(&mut rest);
+        assert!(buffered.block.iter().all(|&b| b == 0));
+    }
+
+    /// A refill ratchets from a rate that was never output: the state after it is
+    /// P(0 || capacity of P(Y)), with the block the rate of Y. Zeroing Y's own
+    /// rate instead (the ratchet of `Prng::fill`) would let the undrawn bytes
+    /// and the state roll back to the drawn ones.
+    #[test]
+    fn a_refill_ratchets_from_a_rate_never_output()
+    {
+        let (mut buffered, _) = seeded_pair(b"seed");
+        let mut st = buffered.prng.raw_state();
+        let mut out = [0u8; 4];
+        buffered.draw(&mut out);
+
+        keccak_f1600(&mut st);
+        let mut block = [0u8; RATE];
+        squeeze_from(&st, &mut block);
+        keccak_f1600(&mut st);
+        zero_rate(&mut st);
+        keccak_f1600(&mut st);
+        assert_eq!(out[..], block[..4]);
+        assert_eq!(buffered.prng.raw_state(), st);
+    }
+
+    /// A reseed erases the undrawn bytes: the next draw comes from a block
+    /// squeezed after the seed, not from the block before it.
+    #[test]
+    fn reseed_erases_the_buffered_block()
+    {
+        let (mut buffered, mut twin) = seeded_pair(b"seed");
+        let mut out = [0u8; 4];
+        buffered.draw(&mut out);
+        let mut before = [0u8; RATE];
+        twin.squeeze_block(&mut before);
+
+        buffered.reseed(b"more");
+        assert_eq!(buffered.next, RATE);
+        assert!(buffered.block.iter().all(|&b| b == 0));
+
+        twin.absorb(b"more");
+        let mut after = [0u8; RATE];
+        twin.squeeze_block(&mut after);
+        buffered.draw(&mut out);
+        assert_eq!(out[..], after[..4]);
+        assert_ne!(out[..], before[4..8]);
+    }
+
+    /// A fresh fill leaves the block and its position alone, and its output is
+    /// the sponge's own; the next draw goes on with the block.
+    #[test]
+    fn fresh_fills_bypass_the_buffer()
+    {
+        let (mut buffered, mut twin) = seeded_pair(b"seed");
+        let mut out = [0u8; 4];
+        buffered.draw(&mut out);
+        let block = buffered.block;
+
+        let mut fresh = [0u8; 32];
+        buffered.fill(&mut fresh);
+        assert_eq!(buffered.block, block);
+        assert_eq!(buffered.next, 4);
+
+        let mut twin_block = [0u8; RATE];
+        twin.squeeze_block(&mut twin_block);
+        let mut twin_fresh = [0u8; 32];
+        twin.fill(&mut twin_fresh);
+        assert_eq!(fresh, twin_fresh);
+
+        buffered.draw(&mut out);
+        assert_eq!(out[..], twin_block[4..8]);
     }
 
     /// Forward-secrecy erasure: the rate region of the post-fill state does not

@@ -221,7 +221,8 @@ See [`docs/capability-internals.md`](docs/capability-internals.md).
 The kernel entropy subsystem: a multi-source pool feeding per-CPU forward-secure
 CSPRNGs, with hardware-source health gating, an interrupt-time jitter source, a
 kernel-internal draw API, and a boot-time power-on self-test. Kernel consumers
-call `fill_bytes`; userspace draws from the same generators through
+call `fill_bytes` for fresh output and `next_u32` for identifiers, served from a
+per-CPU buffered block; userspace draws from the same generators through
 `SYS_GETRANDOM`, and a holder of an `EntropyControl` capability contributes bytes through
 `SYS_ENTROPY_CONTRIBUTE`. See [`docs/entropy.md`](docs/entropy.md).
 

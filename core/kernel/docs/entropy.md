@@ -18,12 +18,13 @@ same per-CPU generators. Userspace holds **no** generator state of its own — e
 draw advances the kernel generator — so the two surfaces share the per-CPU
 generators but no userspace-resident secret.
 
-This shared sourcing is safe by construction. The sponge's per-fill fast key
-erasure (below) makes returned bytes unrecoverable from post-fill state and
-makes successive fills independent, so a userspace observer of `getrandom`
-output learns nothing about prior or subsequent kernel draws (ASLR offsets,
-nonces, keys): forward secrecy holds across the kernel/userspace boundary, not
-only within the kernel. The draw path adds no authority-bearing surface —
+This shared sourcing is safe by construction. The sponge's fast key erasure
+(below) makes returned bytes unrecoverable from the later state and makes
+successive outputs independent, so a userspace observer of `getrandom` output
+learns nothing about prior or subsequent kernel draws (ASLR offsets,
+identifiers, the bytes buffered for them): forward secrecy holds across the
+kernel/userspace boundary, not only within the kernel. The draw path adds no
+authority-bearing surface —
 `SYS_GETRANDOM` is ambient and draw-only; it injects no entropy — and per-call
 length is capped (`MAX_GETRANDOM_LEN`) so a draw never holds interrupts off for
 an unbounded window
@@ -51,6 +52,21 @@ not a general-purpose KDF; kernel consumers are hardening primitives
 (address-space layout randomization, handle/identifier randomization, key/nonce
 generation), and userspace consumers draw raw CSPRNG bytes through
 `SYS_GETRANDOM`.
+
+Forward secrecy is kept per byte. The kernel's small draws (`next_u32`) take
+their bytes from one rate block (136 bytes) squeezed ahead into the CPU's
+generator and erase each byte as it is drawn; every other draw takes fresh
+output, its own squeeze and ratchet (§ Draw API and consumers). A compromise of
+a CPU's generator state at time T therefore recovers no byte drawn on that CPU
+before T, through either path, and exposes:
+
+- that CPU's undrawn buffered bytes, at most 136 (34 draws of a `u32`), which a
+  disclosure of the buffer alone, without the sponge state, also exposes;
+- as without the buffer, every output of that CPU until its next reseed.
+
+The buffered bytes serve only `next_u32`, whose consumers are identifiers (thread
+ids and `CSpace` epochs). Keys, seeds and layouts (`SYS_GETRANDOM`, the ASLR
+draws) take fresh output, which no buffer holds.
 
 The hardware RNG is treated as untrusted until it passes startup health tests
 and is **never the sole input** regardless of those tests: its output is always
@@ -132,6 +148,16 @@ kernel and the crate's SHAKE share. `entropy::sponge::Prng` runs it as a sponge 
   more. Because the permutation is invertible, the extra permute alone would not
   hide the output; zeroing the rate first is what makes returned bytes
   unrecoverable from the post-fill state.
+- `BufferedPrng` adds an output buffer of one rate block for small draws. A
+  refill (`Prng::squeeze_block`) permutes, squeezes the rate into the buffer,
+  permutes again, zeroes the rate and permutes. The buffer keeps the block's
+  undrawn bytes, so the ratchet cannot zero the rate the block was read from:
+  with those bytes and the post-ratchet state, the inverse permutation would
+  recover the state the block was squeezed from by a search over the drawn bytes
+  alone. The permutation before the zeroing makes the zeroed rate one never
+  output. A draw (`BufferedPrng::draw`) copies its bytes out and zeroes them in
+  the buffer (`entropy::wipe`) before it returns; `BufferedPrng::fill` squeezes
+  fresh output and leaves the buffer alone.
 
 The absorb/squeeze plumbing is anchored against the NIST `SHAKE256("")` known
 answer, and the permutation against the FIPS-202 zero-state vector in `shared/crypto` (see
@@ -169,11 +195,14 @@ Pool storage is a buddy-allocated slab published through an `AtomicPtr`
 ## Per-CPU CSPRNG and reseed policy
 
 `entropy::cpurng::CpuRng` is one forward-secure generator per CPU, stored in a
-per-CPU slab. Each instance is touched only by its owning CPU under
-interrupt-disabled exclusivity, so it carries **no lock**.
+per-CPU slab: a `BufferedPrng`, whose block serves `next_u32` and whose sponge
+serves `fill_bytes`, and its reseed bookkeeping. Each instance is touched only
+by its owning CPU under interrupt-disabled exclusivity, so it carries **no
+lock**.
 
 The reseed policy is a pure, host-tested decision function
-(`entropy::reseed_policy::decide`), evaluated on every fill:
+(`entropy::reseed_policy::decide`), evaluated on every draw, buffered or fresh,
+before any byte is served:
 
 | Trigger | Action |
 |---|---|
@@ -189,19 +218,24 @@ The reseed policy is a pure, host-tested decision function
   instantaneous cycle counter, so every contribution carries fresh timing),
   draws `RESEED_BYTES` (32 — a 256-bit reseed) of fresh seed material, and
   absorbs it; the seed buffer on the kernel stack is then cleared with volatile
-  stores the compiler cannot drop (`entropy::wipe`). Whenever VMGENID detection is
+  stores the compiler cannot drop (`entropy::wipe`). Before the absorb, the reseed
+  erases the generator's undrawn buffered bytes (`BufferedPrng::reseed`), so no
+  byte squeezed before a reseed is served after it. A reseed deferred on
+  contention changes nothing, the buffer included. Whenever VMGENID detection is
   armed, every mandatory reseed additionally absorbs the live GUID into the pool
   after the jitter fold and before the seed draw.
-- The draw interval bounds how much output depends on any single seed without
-  making the reseed cost (a pool lock plus permutations) a per-draw expense;
+- The draw interval, which counts draws of both paths, bounds how much output
+  depends on any single seed without making the reseed cost (a pool lock plus
+  permutations) a per-draw expense;
   the time budget bounds it in wall-clock terms and is the riscv64
   snapshot-resume bound (below). The 2× escalation keeps the budget a hard
   bound even under sustained pool-lock contention.
 - The uncalibrated-timer case (`elapsed_us` not yet available) disables only
   the time-budget triggers; first-use and draw-interval policy still apply.
 
-Forward secrecy *across* draws is provided by the sponge's per-fill erasure;
-reseeding additionally bounds the blast radius of any single seed.
+Forward secrecy *across* draws is provided by the sponge's fast key erasure and,
+for buffered bytes, by the erasure of each byte as it is drawn; reseeding
+additionally bounds the blast radius of any single seed.
 
 ## Whole-VM-snapshot detection (VMGENID)
 
@@ -222,15 +256,16 @@ execution history forks.
   [`BootInfo.vmgenid_paddr`](../../../abi/boot-protocol/src/lib.rs) (boot
   protocol v13; zero = absent).
 - **Detection** is per-draw and per-CPU (`entropy::vmgenid`): each generator
-  records the GUID it last reseeded under, and every fill volatile-reads the
-  live GUID through the direct map and compares. Because the hypervisor
-  rewrites the GUID before any vCPU resumes, every post-resume draw on every
-  CPU sees the change *before producing output* and performs a mandatory
-  reseed that absorbs the new GUID — so clone streams diverge, even under
-  identical post-resume jitter. The one exception is a draw snapshotted
-  mid-fill, after its GUID compare: that single in-flight draw completes
-  from replayed state and can repeat across clones; the next draw on that
-  CPU re-reads the GUID and reseeds. There is no cross-CPU detection state:
+  records the GUID it last reseeded under, and every draw, buffered or fresh,
+  volatile-reads the live GUID through the direct map and compares. Because
+  the hypervisor rewrites the GUID before any vCPU resumes, every post-resume
+  draw on every CPU sees the change *before producing output* and performs a
+  mandatory reseed that absorbs the new GUID and erases the replayed buffered
+  block first — so clone streams diverge, even under identical post-resume
+  jitter. The one exception is a draw snapshotted mid-draw, after its GUID
+  compare: that single in-flight draw completes from replayed state and can
+  repeat across clones; the next draw on that CPU re-reads the GUID and
+  reseeds. There is no cross-CPU detection state:
   the GUID in guest RAM is the shared authority.
 - **Observability**: the BSP timer tick polls the same GUID and prints
   `entropy: VM generation change detected` once per change. The reseed
@@ -293,7 +328,8 @@ The first *consumer* draw is decoupled from the boot scrape: the Phase 5/8
 self-test capture is each generator's first draw and necessarily seeds from
 the boot-time pool (scrape-dominated on a jitter-only boot, such as riscv64
 with neither `virtio-rng` nor a readable `seed` CSR), so the capture is
-followed by marking the generator stale (`CpuRng::mark_stale`). On the BSP the
+followed by marking the generator stale (`CpuRng::mark_stale`, which also erases
+any buffered block). On the BSP the
 first real consumer draw is Phase 8 idle-thread creation (`sched::alloc_thread_id` via `next_u32`),
 milliseconds after Phase 5. Its mandatory reseed folds an accumulator that
 holds no tick samples yet (`timer_tick` returns before sampling while the BSP
@@ -344,19 +380,31 @@ fallback, so it is absorbed directly and is not subject to the raw-source tests.
 
 ## Draw API and consumers
 
-The kernel-internal draw API is `entropy::fill_bytes(out: &mut [u8])`: it fills
-`out` with CSPRNG bytes from the **calling CPU's** generator. `entropy::next_u32`
-is a convenience wrapper returning a random `u32`. Interrupts are disabled for the
-draw to pin the CPU and bar ISR reentry, giving exclusive, migration-free access
-to that generator. It MUST NOT be called from interrupt context (it takes
-non-reentrant per-CPU state) or before the pool is seeded.
+The kernel-internal draw API has two paths, both from the **calling CPU's**
+generator. `entropy::fill_bytes(out: &mut [u8])` fills `out` with fresh output,
+its own squeeze and ratchet: the path for keys, seeds and layouts.
+`entropy::next_u32` returns a random `u32` from the buffered block: the path for
+identifiers, which runs the block's three Keccak-f[1600] permutations once per 34
+draws where a fresh draw runs two every time.
+
+Interrupts are disabled for the whole draw, from before the CPU index is read to
+after the generator's last access (a reseed's pool lock restores the disabled
+state it saved), which pins the CPU and keeps every maskable interrupt out of the
+draw, and with it any other draw on that CPU. The non-maskable entries (NMI, `#DF`
+and `#MC` on x86-64; riscv64 S-mode takes none) go to the fatal path and draw
+nothing, and an exception raised inside a draw is a kernel-mode one, fatal too. So
+two draws on one CPU never overlap, and no byte is served twice. A draw MUST NOT
+be made from interrupt context (it takes non-reentrant per-CPU state) or before
+the pool is seeded.
 
 Kernel-internal production consumers are the structural-unguessability hardening
 (#248) — the CSpace recycling epoch (`cap::free_cspace_id`) and thread-id
-correlators (`sched::alloc_thread_id`) draw via `next_u32` — and ASLR (#39):
-`mm::address_space::choose_init_layout` draws init's `InitInfo` VA and stack
-placement via `fill_bytes` on its first call, and Phase 9's PIE rebase draws
-init's image load bias the same way (both Phase 9, boot thread; see
+correlators (`sched::alloc_thread_id`) draw via `next_u32`, identifiers whose
+exposure to a state compromise is the buffer bound of § Scope and threat model —
+and ASLR (#39): `mm::address_space::choose_init_layout` draws init's `InitInfo`
+VA and stack placement via `fill_bytes` on its first call, and Phase 9's PIE
+rebase draws init's image load bias the same way, fresh output because each
+keys the layout for the whole boot (both Phase 9, boot thread; see
 [initialization.md § Phase 9](initialization.md#phase-9-init-creation-and-scheduler-entry)).
 All run after
 Phase 5 seeding and never in interrupt context. Userspace ASLR (the
@@ -397,6 +445,10 @@ validates the API once per boot.
 - **Host known-answer and property tests** (`cargo xtask test`): the NIST
   `SHAKE256("")` FIPS-202 vector and a multi-block squeeze; sponge
   determinism, seed-sensitivity, fill advancement, and forward-secrecy erasure;
+  the buffered block: every byte served once and in order at every draw size up
+  to 8 and across block ends, each zeroed before its draw returns, the whole
+  block erased on reseed, the refill's ratchet from a rate never output, and
+  fresh fills leaving the block alone;
   health-test cutoffs and stuck/biased-source trips; the full reseed-policy
   decision matrix (boundaries included); the `SYS_ENTROPY_CONTRIBUTE` argument
   checks in their order (`WouldBlock` included, which no process can reach)

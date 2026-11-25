@@ -1922,7 +1922,8 @@ chunk rather than a single page keeps cap-slot consumption to one cap per chunk 
 pool, so a deep demand stack cannot exhaust memmgr's CSpace; stacks grow contiguously, so a chunk's
 pages are consumed as the stack descends. The page tables the map needs come from the process
 address space's own page-table pool. When the kernel reports that pool exhausted, memmgr funds it
-from its free pool, accounted to the process, and maps the chunk again, at most four times
+from its free pool, accounted to the process, and maps the chunk again, at most four times for
+each leaf-table window of the chunk
 ([`memory-pool.md`](memory-pool.md#client-page-table-funding) § Client page-table funding). So a
 fault in a region does not depend on the process having funded the pool beforehand. A non-VM fault
 replies `FAULT_REPLY_KILL`, and every other case — unknown process, address outside every region, a

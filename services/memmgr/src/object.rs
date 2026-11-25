@@ -349,16 +349,9 @@ fn copy_run(l: &mut MemLedger, obj: NodeIdx, first: u64, cap: u64, pages: u32) -
 {
     let pages = u64::from(pages);
     // SAFETY: the scrub window is memmgr's own zone, which every pass leaves
-    // unmapped, and a run of at most a chunk's pages lies in it.
-    if let Err(e) = unsafe { map_self(l, cap, SCRUB_VA, 0, pages) }
-    {
-        // A map that ran out of page tables part way left the pages before
-        // the failing one mapped: unmap them, so the run that returns to the
-        // pool is mapped nowhere and the window is left unmapped.
-        // SAFETY: as for the unmap below.
-        let _ = unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, pages) };
-        return Err(e);
-    }
+    // unmapped, a failed map included, and a run of at most a chunk's pages
+    // lies in it.
+    unsafe { map_self(l, cap, SCRUB_VA, 0, pages) }?;
     let len = usize::try_from(pages.saturating_mul(PAGE_SIZE)).unwrap_or(0);
     // SAFETY: the window's `pages` pages are mapped read-write above to the
     // run, which nothing else maps yet, and the slice is not used past the

@@ -1943,15 +1943,16 @@ then a `WARNING:` line per key of the stored `ENV` whose value differs here.
 
 - **icount.** The band is the larger of 1% of the baseline (rounded up) and 8 instructions. A
   one-CPU measurement gates; a measurement at more CPUs is reported only, since the interleaving
-  of its CPUs moves its count. So is a benchmark of `ICOUNT_IO_BOUND` (`src/benchmark.rs`),
-  `fsbench.write`, whose count includes time blocked on a device completion: the completion
-  arrives at host time, and the guest's clock follows the host's time while it waits, so the
-  count follows the host's I/O latency. `fsbench.read` gates, since its untimed warm-up fills the
-  filesystem's page cache and no timed read waits on the disk; a benchmark whose timed samples
-  wait on a device joins the set. The command fails when a gating measurement's verdict is not
-  `ok` (an `IMPROVED` count included: its stale baseline would pass a later regression of the
-  same size) or a benchmark logged a `FAIL` line: ktest's `ktest: bench <name> FAIL`, or a
-  userspace suite's `[<suite>] bench <name> FAIL`.
+  of its CPUs moves its count. So is a benchmark of `ICOUNT_IO_BOUND` (`src/benchmark.rs`), one
+  whose timed samples idle, since the guest's clock follows the host's time while every vCPU
+  idles (`--icount`): `fsbench.write`, whose count includes time blocked on a device
+  completion, which arrives at host time, so the count follows the host's I/O latency.
+  `fsbench.read` gates, since its untimed warm-up fills the filesystem's page cache and no timed
+  read waits on the disk; a benchmark whose timed samples idle, on a device, a timer or any other
+  event, joins the set. The command fails when a gating measurement's verdict is not `ok` (an
+  `IMPROVED` count included: its stale baseline would pass a later regression of the same size) or
+  a benchmark logged a `FAIL` line: ktest's `ktest: bench <name> FAIL`, or a userspace suite's
+  `[<suite>] bench <name> FAIL`.
 - **host.** Each measurement's band is its line in `BANDS`, a percentage of its baseline,
   calibrated on the reference host (`<suite>.<name> [<variant> ...] cpus=<k> band=<percent>`).
   Nothing gates: the command reports and succeeds.

@@ -203,7 +203,7 @@ pub unsafe fn unmap_user_region_pooled(
     virt_base: u64,
     page_count: usize,
     aso: &AddressSpaceObject,
-    on_leaf: &mut dyn FnMut(u64),
+    on_leaf: &mut impl FnMut(u64),
 ) -> usize;
 
 /// Pass the frame of every present 4 KiB leaf in the user half of the page
@@ -214,8 +214,8 @@ pub unsafe fn unmap_user_region_pooled(
 /// (core/kernel/docs/memory-internals.md § Frame Map Table).
 pub unsafe fn for_each_user_leaf(
     root_virt: u64,
-    on_table: &mut dyn FnMut(),
-    on_leaf: &mut dyn FnMut(u64),
+    on_table: &mut impl FnMut(),
+    on_leaf: &mut impl FnMut(u64),
 );
 
 /// Pass the VA of each present 4 KiB leaf in `[virt_base, virt_base +
@@ -227,7 +227,7 @@ pub unsafe fn read_user_accessed(
     root_virt: u64,
     virt_base: u64,
     page_count: usize,
-    on_accessed: &mut dyn FnMut(u64),
+    on_accessed: &mut impl FnMut(u64),
 );
 
 /// Clear the accessed bit of each present 4 KiB leaf in the span whose VA
@@ -237,7 +237,7 @@ pub unsafe fn clear_user_accessed(
     root_virt: u64,
     virt_base: u64,
     page_count: usize,
-    reported: &dyn Fn(u64) -> bool,
+    reported: &impl Fn(u64) -> bool,
 );
 
 /// Pass each present 4 KiB user leaf of `[start, hi)` (on RISC-V, each Svnapot
@@ -254,7 +254,7 @@ pub unsafe fn scan_user_leaves(
     start: u64,
     hi: u64,
     budget: usize,
-    on_leaf: &mut dyn FnMut(u64, u64, u64) -> bool,
+    on_leaf: &mut impl FnMut(u64, u64, u64) -> bool,
 ) -> u64;
 
 /// Walk the user tables and return `(phys, flags_word)` mapped at `virt`, or

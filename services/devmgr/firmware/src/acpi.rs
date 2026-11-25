@@ -719,8 +719,8 @@ pub(crate) fn madt_io_apic(madt_bytes: &[u8], kind: u8, at: usize, len: usize) -
 
 /// The register window, `(base, length)`, of the interrupt controller the
 /// MADT structure of type `kind` and length `len` at `at` describes, as
-/// [`madt_interrupt_controllers`] lists them, a zero base or length
-/// included; `None` for a structure that describes none.
+/// [`madt_interrupt_controllers`] lists them; `None` for a structure that
+/// describes none, or a window of a zero base or length.
 pub(crate) fn madt_controller_window(
     madt_bytes: &[u8],
     kind: u8,
@@ -753,16 +753,15 @@ pub(crate) fn madt_controller_window(
         )),
         _ => None,
     }
+    .filter(|&(base, length)| base != 0 && length != 0)
 }
 
 /// The local APIC's register window the MADT header gives, `(address,
-/// length)`, its address possibly zero.
-pub(crate) fn madt_header_window(madt_bytes: &[u8]) -> (u64, u64)
+/// length)`; `None` for a zero address.
+pub(crate) fn madt_header_window(madt_bytes: &[u8]) -> Option<(u64, u64)>
 {
-    (
-        u64::from(read_u32(madt_bytes, SDT_HDR_LEN)),
-        APIC_WINDOW_BYTES,
-    )
+    let address = u64::from(read_u32(madt_bytes, SDT_HDR_LEN));
+    (address != 0).then_some((address, APIC_WINDOW_BYTES))
 }
 
 /// Iterate the MADT's Interrupt Source Overrides.
@@ -817,11 +816,7 @@ pub fn madt_interrupt_controllers(
 {
     let windows = madt_structures(madt_bytes)?
         .filter_map(|(kind, at, len)| madt_controller_window(madt_bytes, kind, at, len));
-    Some(
-        core::iter::once(madt_header_window(madt_bytes))
-            .chain(windows)
-            .filter(|&(base, len)| base != 0 && len != 0),
-    )
+    Some(madt_header_window(madt_bytes).into_iter().chain(windows))
 }
 
 /// The I/O APIC of `io_apics` that delivers `gsi`: the one with the highest
@@ -1362,6 +1357,32 @@ mod tests
             ]
         );
         assert!(madt_interrupt_controllers(&sdt(*b"FACP", 64)).is_none());
+    }
+
+    // Defect caught: a window of a zero base or length handed to the
+    // kernel to program.
+    #[test]
+    fn madt_interrupt_controllers_leave_out_zero_windows()
+    {
+        let io_apic = [MADT_TYPE_IO_APIC, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let riscv = |base: u64, size: u32| {
+            let mut s = [0u8; MADT_RISCV_WINDOW_LEN];
+            s[0] = MADT_TYPE_APLIC;
+            s[1] = 36;
+            s[24..32].copy_from_slice(&base.to_le_bytes());
+            s[32..36].copy_from_slice(&size.to_le_bytes());
+            s
+        };
+        let no_size = riscv(0xD00_0000, 0);
+        let no_base = riscv(0, 0x8000);
+        let table = madt(&[&io_apic, &no_size, &no_base]);
+        assert_eq!(madt_header_window(&table), None);
+        assert_eq!(madt_interrupt_controllers(&table).unwrap().count(), 0);
+        let at = SDT_HDR_LEN + 8;
+        assert_eq!(
+            madt_controller_window(&table, MADT_TYPE_IO_APIC, at, 12),
+            None
+        );
     }
 
     #[test]

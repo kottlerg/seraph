@@ -7,23 +7,26 @@
 //! input, [`firmware_holds`], which the fuzz target `devmgr-firmware`
 //! (`xtask/fuzz/targets`) drives and the replay test of the checked-in
 //! inputs under `fuzz/devmgr-firmware/` runs on every `cargo xtask test`;
-//! the `proofs` modules of `acpi.rs`, `dmar.rs` and `rimt.rs` prove its
+//! the `proofs` modules of `acpi.rs`, `dmar.rs`, `rimt.rs` and `platform.rs` prove its
 //! checks of each step of the decode on every input up to their bounds
 //! (docs/testing.md § Fuzzing, § Bounded verification).
 //!
 //! The input is read as every table the crate decodes: an RSDP, an SDT
-//! header, an XSDT, a FADT, an MCFG, a MADT, a DMAR and a RIMT. Each decoder
+//! header, an XSDT, a FADT, an MCFG, a MADT, a DMAR, a RIMT and an SPCR,
+//! every ACPI table but the AML of the DSDT and SSDTs. Each decoder
 //! judges the signature itself, so one input drives the decoder its
 //! signature names and the refusal of every other. Each check judges a
 //! decoder against a reading of the table's layout written apart from the
 //! decoder's, from the specifications its module names (ACPI 6.5 § 5.2,
-//! Intel VT-d 4.1 chapter 8, the RISC-V IO Mapping Table 1.0), with the skip
+//! Intel VT-d 4.1 chapter 8, the RISC-V IO Mapping Table 1.0, the Serial
+//! Port Console Redirection Table), with the skip
 //! and end rules each decoder documents: the walk's steps one by one, and
 //! every iterator the decoder builds on the walk, in step with it.
 
 pub(crate) mod acpi;
 pub(crate) mod dmar;
 pub(crate) mod rimt;
+pub(crate) mod spcr;
 
 /// Check the contract of every firmware-table decoder on `input`.
 ///
@@ -35,6 +38,7 @@ pub fn firmware_holds(input: &[u8])
     acpi::acpi_holds(input);
     dmar::dmar_holds(input);
     rimt::rimt_holds(input);
+    spcr::spcr_holds(input);
 }
 
 // ── Readings ────────────────────────────────────────────────────────────────

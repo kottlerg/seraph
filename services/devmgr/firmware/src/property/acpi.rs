@@ -382,7 +382,8 @@ fn mcfg_holds(input: &[u8])
 /// [`acpi::madt_end`] ends a MADT's structures at its reported length
 /// bounded by the slice, and refuses another table or one whose end does not
 /// reach the first structure, at 44; [`acpi::madt_header_window`] gives the
-/// local APIC's 32-bit address at 36 and a page. Returns the end.
+/// local APIC's 32-bit address at 36 and a page, or nothing for a zero
+/// address. Returns the end.
 pub(crate) fn madt_end_holds(input: &[u8]) -> Option<usize>
 {
     let end = table(input, *b"APIC")
@@ -396,8 +397,10 @@ pub(crate) fn madt_end_holds(input: &[u8]) -> Option<usize>
     if end.is_some()
     {
         assert_eq!(
-            Some(acpi::madt_header_window(input)),
-            le32(input, 36).map(|address| (u64::from(address), 0x1000)),
+            acpi::madt_header_window(input),
+            le32(input, 36)
+                .filter(|&address| address != 0)
+                .map(|address| (u64::from(address), 0x1000)),
             "the local APIC's window judged against the header"
         );
     }
@@ -419,7 +422,8 @@ pub(crate) struct MadtStructure
 /// length, the bytes at `off` and after it; the walk ends where fewer than 2
 /// bytes are left, or at a length under 2 or past `end`. The override, the
 /// I/O APIC and the controller window of the structure read as ACPI 6.5
-/// § 5.2.12 lays them out. Returns them.
+/// § 5.2.12 lays them out, a window of a zero base or length none. Returns
+/// them.
 pub(crate) fn madt_structure_holds(input: &[u8], off: usize, end: usize) -> Option<MadtStructure>
 {
     let read = || {
@@ -473,7 +477,8 @@ pub(crate) fn madt_structure_holds(input: &[u8], off: usize, end: usize) -> Opti
         0x18 if len >= 36 && field32(4)? & 1 != 0 => riscv(),
         0x1A if len >= 36 => riscv(),
         _ => None,
-    };
+    }
+    .filter(|&(base, length)| base != 0 && length != 0);
     assert_eq!(
         acpi::madt_source_override(input, kind, off, len),
         source_override,
@@ -527,8 +532,7 @@ fn madt_holds(input: &[u8])
     {
         return;
     };
-    let present = |&(base, len): &(u64, u64)| base != 0 && len != 0;
-    let header = Some(acpi::madt_header_window(input)).filter(present);
+    let header = acpi::madt_header_window(input);
     if header.is_some()
     {
         assert_eq!(
@@ -552,7 +556,7 @@ fn madt_holds(input: &[u8])
         {
             assert_eq!(io_apics.next(), s.io_apic, "the I/O APICs out of step");
         }
-        if let Some(window) = s.window.filter(present)
+        if let Some(window) = s.window
         {
             assert_eq!(windows.next(), Some(window), "the windows out of step");
         }

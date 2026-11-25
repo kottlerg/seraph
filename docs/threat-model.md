@@ -407,15 +407,15 @@ is.
   ([testing.md](testing.md) § Bounded verification). CI's `kani` job runs them.
 - `devmgr-firmware` (`xtask/fuzz/targets/src/bin/devmgr-firmware.rs`) drives
   `devmgr_firmware::property::firmware_holds` over an input read as each ACPI table devmgr's
-  `firmware` crate decodes, from the seeds in
+  `firmware` crate decodes apart from the AML, from the seeds in
   `services/devmgr/firmware/fuzz/devmgr-firmware/seeds/`: the RSDP, an SDT header, the XSDT, the
-  FADT, the MCFG, the MADT, the DMAR and the RIMT. CI's
-  gating `fuzz` job runs it on a pull request whose change can affect it and the campaign for 30
-  minutes.
-- The `proofs` modules of `services/devmgr/firmware/src/acpi.rs`, `dmar.rs` and `rimt.rs` prove
-  the same property ([testing.md](testing.md) § Bounded verification); CI's `kani` job runs them.
-  The RSDP, an SDT header, the XSDT up to two entries and the FADT are proven whole on any input up
-  to their bounds; the MCFG, the MADT, the DMAR and the RIMT by their steps: each table's end, an
+  FADT, the MCFG, the MADT, the DMAR, the RIMT and the SPCR. CI's gating `fuzz` job runs it on a
+  pull request whose change can affect it and the campaign for 30 minutes.
+- The `proofs` modules of `services/devmgr/firmware/src/acpi.rs`, `dmar.rs`, `rimt.rs` and
+  `platform.rs` prove the same property ([testing.md](testing.md) § Bounded verification); CI's
+  `kani` job runs them. The RSDP, an SDT header, the XSDT up to two entries, the FADT and the SPCR
+  are proven whole on any input up to their bounds; the MCFG, the MADT, the DMAR and the RIMT by
+  their steps: each table's end, an
   MCFG entry, a MADT structure, a DMAR remapping structure and device scope, and a RIMT node and
   ID mapping, at any place. The loops that drive the steps are left to the fuzz target.
 

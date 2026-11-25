@@ -39,7 +39,7 @@
 //! grant and their poller's actions, and places, programs and admits a
 //! hot-added function's BARs and record (`hotplug`), and names the requests
 //! refused while devmgr's `CSpace` is short of its headroom (`headroom`). The
-//! contract of the ACPI, DMAR and RIMT decoders is one property
+//! contract of the ACPI table decoders, the AML aside, is one property
 //! (`property`, built for host tests, proofs and fuzzing only). The
 //! functions read caller-mapped byte slices or values, or reach the platform
 //! only through a caller-supplied accessor or split operation, and touch no
@@ -102,7 +102,7 @@ mod tests
 {
     use std::vec::Vec;
 
-    use crate::{acpi, acpid, dmar, property, rimt};
+    use crate::{acpi, acpid, dmar, platform, property, rimt};
 
     /// The checked-in fuzz inputs of the kinds given (`seeds`,
     /// `regressions`).
@@ -206,6 +206,10 @@ mod tests
         assert!(
             any(&|s| rimt::pci_iommus(s).count() > 0 && rimt::pci_id_mappings(s).count() > 1),
             "a RIMT"
+        );
+        assert!(
+            any(&|s| platform::spcr(s).is_some_and(|t| t.interrupt.is_some())),
+            "an SPCR"
         );
     }
 }

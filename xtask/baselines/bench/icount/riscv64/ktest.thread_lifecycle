@@ -1,4 +1,4 @@
 # bench baseline, written by `cargo xtask bench-baseline`
 # Format: xtask/README.md (`cargo xtask bench-check`).
-cpus=1 unit=cycles p50=82739
-cpus=4 unit=cycles p50=83539
+cpus=1 unit=cycles p50=46163
+cpus=4 unit=cycles p50=46963

@@ -475,8 +475,7 @@ pub fn init_cspace_released_phase(_: &Caps)
     panic!("init_cspace_released: init's reap did not run within the poll budget");
 }
 
-/// `command_*`, `stdio_file_unsupported`, `procmgr_refusals`, `procmgr_concurrent_spawn`,
-/// `crash_endpoint`,
+/// `command_*`, `stdio_file_unsupported`, `procmgr_refusals`, `crash_endpoint`,
 /// `procmgr_dma_hold`, `create_process_verifies_module`, and `death_queue_growth` run after the
 /// namespace cluster has established attenuation invariants.
 pub fn command_phases() -> &'static [Phase]
@@ -515,10 +514,6 @@ pub fn command_phases() -> &'static [Phase]
             run: procmgr_refusals_phase,
         },
         Phase {
-            name: "procmgr_concurrent_spawn",
-            run: procmgr_concurrent_spawn_phase,
-        },
-        Phase {
             name: "procmgr_program_narrowing",
             run: procmgr_program_narrowing_phase,
         },
@@ -543,6 +538,16 @@ pub fn command_phases() -> &'static [Phase]
             run: death_queue_growth_phase,
         },
     ]
+}
+
+/// `procmgr_concurrent_spawn`, a member of the concurrent group
+/// (`super::CONCURRENT`): its wait is procmgr's bound on the stalled creates.
+pub fn concurrent_spawn() -> &'static [Phase]
+{
+    &[Phase {
+        name: "procmgr_concurrent_spawn",
+        run: procmgr_concurrent_spawn_phase,
+    }]
 }
 
 /// Child-mode dispatch for argv tokens this module owns. Matching

@@ -125,18 +125,7 @@ mod imp
     /// § Boot-time entropy).
     fn mark_stale_current_cpu()
     {
-        // SAFETY: as in `fill_bytes` — disabling interrupts pins this CPU and
-        // bars ISR reentry, giving exclusive access to its generator.
-        let saved = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
-        let cpu = crate::arch::current::cpu::current_cpu() as usize;
-        // SAFETY: cpu < CPU_COUNT; exclusivity established above.
-        unsafe {
-            cpu_rng(cpu).mark_stale();
-        }
-        // SAFETY: `saved` came from the matching disable above.
-        unsafe {
-            crate::arch::current::cpu::restore_interrupts(saved);
-        }
+        with_this_cpu_rng(|rng, _| rng.mark_stale());
     }
 
     /// Mix every available entropy source into the pool: the firmware boot seed
@@ -244,38 +233,52 @@ mod imp
         unsafe { &mut *slot }
     }
 
-    /// Fill `out` with cryptographically-secure random bytes from the calling
-    /// CPU's generator.
+    /// Run `f` on the calling CPU's generator, with the CPU's index, with
+    /// interrupts disabled from before the CPU is read to after `f` returns.
     ///
-    /// Kernel-internal. MUST NOT be called from interrupt context (it takes
-    /// non-reentrant per-CPU generator state). Interrupts are disabled for the
-    /// draw to guarantee exclusive, migration-free access.
-    pub fn fill_bytes(out: &mut [u8])
+    /// The disable pins this CPU and bars every maskable interrupt, and with it
+    /// any other draw on this CPU, for the whole call; the non-maskable entries
+    /// draw nothing (`core/kernel/docs/entropy.md` § Draw API and consumers).
+    /// So no two draws on one CPU overlap, and two never serve the same bytes.
+    fn with_this_cpu_rng(f: impl FnOnce(&mut CpuRng, usize))
     {
-        debug_assert!(pool::is_seeded(), "entropy draw before pool seeded");
-        // SAFETY: kernel context; disabling interrupts pins this CPU and bars
-        // ISR reentry, giving exclusive access to its generator for the draw.
+        // SAFETY: kernel context; the matching restore is below.
         let saved = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
         let cpu = crate::arch::current::cpu::current_cpu() as usize;
-        // SAFETY: cpu < CPU_COUNT; exclusivity established above.
-        unsafe {
-            cpu_rng(cpu).fill(cpu, out);
-        }
+        // SAFETY: cpu < CPU_COUNT; interrupts are disabled until the restore
+        // below, which gives this call exclusive access to the CPU's generator.
+        f(unsafe { cpu_rng(cpu) }, cpu);
         // SAFETY: `saved` came from the matching disable above.
         unsafe {
             crate::arch::current::cpu::restore_interrupts(saved);
         }
     }
 
-    /// Draw a uniformly-random `u32` from the calling CPU's generator.
+    /// Fill `out` with fresh cryptographically-secure random bytes from the
+    /// calling CPU's generator: each call its own squeeze and ratchet, so no
+    /// byte of the output stays in the generator. The path for keys, seeds and
+    /// long-lived layout (`SYS_GETRANDOM`, ASLR).
     ///
-    /// Convenience over [`fill_bytes`]; shares its contract — kernel-internal,
-    /// MUST NOT be called from interrupt context, valid only after the pool is
-    /// seeded (Phase 5).
+    /// Kernel-internal. MUST NOT be called from an interrupt handler or a
+    /// non-maskable entry (it takes non-reentrant per-CPU generator state), nor
+    /// before the pool is seeded (Phase 5).
+    pub fn fill_bytes(out: &mut [u8])
+    {
+        debug_assert!(pool::is_seeded(), "entropy draw before pool seeded");
+        with_this_cpu_rng(|rng, cpu| rng.fill(cpu, out));
+    }
+
+    /// Draw a uniformly-random `u32` from the calling CPU's buffered block.
+    ///
+    /// The small-draw path, for identifiers: the bytes come from a block squeezed
+    /// ahead, whose undrawn bytes stay in memory until drawn or erased
+    /// (`core/kernel/docs/entropy.md` § Scope and threat model). Shares
+    /// [`fill_bytes`]'s contract.
     pub fn next_u32() -> u32
     {
+        debug_assert!(pool::is_seeded(), "entropy draw before pool seeded");
         let mut b = [0u8; 4];
-        fill_bytes(&mut b);
+        with_this_cpu_rng(|rng, cpu| rng.draw(cpu, &mut b));
         u32::from_le_bytes(b)
     }
 

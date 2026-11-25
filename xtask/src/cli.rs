@@ -840,8 +840,8 @@ args! {
         /// layer: every recipe that starts a program, or another
         /// services-layer harness, removed from `config/svcmgr/services/`;
         /// svctest's recipe, sessiond's test recipe, the set's fixture
-        /// recipes, and crashd's test recipe (no crashd for
-        /// `crash-endpoint`) copied into it from `config/svcmgr/tests/`, every
+        /// recipes, crashd's test recipe (no crashd for `crash-endpoint`),
+        /// and oomd's test recipe copied into it from `config/svcmgr/tests/`, every
         /// other fixture's recipe removed from it; the test class files of
         /// `config/devmgr/tests/` copied into `config/devmgr/classes/`; and
         /// the set's record written into the staged recipe's `env` line as

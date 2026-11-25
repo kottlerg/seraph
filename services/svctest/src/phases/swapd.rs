@@ -57,14 +57,10 @@
 //! * no page on disk once it is taken: the capture had swapd restore every chunk
 //!   on disk into the fixture.
 //!
-//! Once the fixture is gone, the phase requires the end of `memmgr_swap`: the
-//! store and the swapped total empty, the identity holding, and memmgr's free
-//! and deferred pages with svctest's own charged pages at least what they were
-//! at the start, less the pages of the swap slot map, which memmgr keeps as
-//! its metadata once swapd registered every slot. svcmgr's restart of swapd
-//! reads its image through fatfs's cache, which keeps it until a pressure
-//! episode, so the phase reads the image into that cache before it takes the
-//! start's totals.
+//! Once the fixture is gone, the phase requires the end of `memmgr_swap`
+//! ([`settle_resident`]): the store and the swapped total empty, the identity
+//! holding, the pool's pages in no account not above the start, and the
+//! charge below svctest's node back to it.
 
 use std::os::seraph::current_ipc_buf;
 use std::time::{Duration, Instant};
@@ -75,7 +71,7 @@ use syscall_abi::PAGE_SIZE;
 use super::process_kill::{IOMMU_NAME, kill};
 use super::swap::{
     CHUNK_LEN, CHUNK_PAGES, Fill, HOG_TICK, Hog, Ready, StackPages, attach, await_swapped,
-    baseline_totals, chunk_reads_pattern, detach, main_pages, make_resident, page_present, pool,
+    chunk_reads_pattern, detach, main_pages, make_resident, page_present, phase_baseline, pool,
     read_stack, require_snapshot, require_stack, settle_resident, start_fixture,
 };
 use super::swap_client::{
@@ -99,8 +95,6 @@ const PHASE: &str = "swapd";
 const SWAP_SLOTS: u64 = 4096;
 /// swapd's name in `LIST_PROCESSES`, its recipe's `argv`.
 const SWAPD_NAME: &[u8] = b"swapd";
-/// swapd's image, which svcmgr's restart of it reads.
-const SWAPD_IMAGE: &str = "/services/swapd";
 /// The processes of the storage path beside swapd, by their names in
 /// `LIST_PROCESSES`: devmgr, which init creates from its boot module, and
 /// the block driver, which devmgr creates from its install path.
@@ -458,16 +452,9 @@ fn swapd_phase(caps: &Caps)
     assert_ne!(authority, 0, "{PHASE}: no debug authority");
     assert_ne!(caps.memmgr_swap, 0, "{PHASE}: no memmgr.swap seed");
 
-    // swapd's restart reads its image through fatfs's cache, which keeps it
-    // until a pressure episode: read it into the cache before the baseline,
-    // so the end finds it there as the start did.
-    let image = std::fs::read(SWAPD_IMAGE)
-        .unwrap_or_else(|e| panic!("{PHASE}: reading {SWAPD_IMAGE} failed: {e}"));
-    drop(std::hint::black_box(image));
-
     let mut hog = Hog::new();
     let _ = settle_resident(authority, PHASE, None);
-    let baseline = baseline_totals(authority, PHASE);
+    let baseline = phase_baseline(PHASE);
     let reserve = pool().reserve_pages();
     let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Page);
 
@@ -499,13 +486,12 @@ fn swapd_phase(caps: &Caps)
     fixture.send("exit");
     let status = fixture.exit_status();
     assert!(status.success(), "{PHASE}: the fixture exited {status:?}");
-    let slot_map_pages = SWAP_SLOTS.div_ceil(free_pool::disk::SLOT_WORDS_PER_PAGE);
-    let floor = baseline.less(slot_map_pages.saturating_mul(PAGE_SIZE));
-    let end = settle_resident(authority, PHASE, Some(&floor));
+    let end = settle_resident(authority, PHASE, Some(&baseline));
     std::os::seraph::log!(
         "swapd phase passed ({free0} slots free at the start, {written} chunks on disk before \
-         the restart and every one faulted back through the next instance, free, deferred and \
-         svctest's own {} pages above the start less the {slot_map_pages} slot-map pages)",
-        end.saturating_sub(floor.totals) / PAGE_SIZE
+         the restart and every one faulted back through the next instance, {} pages in no \
+         account against {} at the start)",
+        end / PAGE_SIZE,
+        baseline.unaccounted / PAGE_SIZE
     );
 }

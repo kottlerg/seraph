@@ -106,7 +106,9 @@ controls below as specified.
 - `SYS_GETRANDOM` is draw-only and forward secret across the boundary, and the one path that adds to
   the entropy pool needs an `EntropyControl` capability carrying `Contribute`
   ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Scope and threat model;
-  `core/kernel/src/syscall/entropy.rs`).
+  `core/kernel/src/syscall/entropy.rs`). Its output is fresh, each call its own squeeze and ratchet;
+  the kernel's small draws for identifiers come from a per-CPU buffered block, whose undrawn bytes,
+  at most 136 per CPU, a compromise of the generator's state exposes, and nothing drawn before it.
 
 **Fuzz targets and proof harnesses.** None covers this boundary: no fuzz target drives a syscall,
 and no proof harness covers a syscall's argument checks or a capability lookup.

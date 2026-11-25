@@ -1952,7 +1952,7 @@ pub fn bring_up(
     };
     // Released on every exit: a retained module cap pins init's donated pool
     // run. A restart starts the driver from devmgr's copy.
-    let module_guard = spawn::ModuleCapGuard::new(module.cap());
+    let module_guard = spawn::ModuleCapGuard::new(module.module_cap());
     let grants = firmware::binding::grants(&decl, Source::BootModule, true);
     if !decl.dma || !grants.phys_access
     {
@@ -2250,7 +2250,7 @@ fn take_family_driver(
             continue;
         }
         let (decl, binary) = modules.remove(i);
-        let cap = binary.cap();
+        let cap = binary.module_cap();
         // The IOMMU pass is the boot's first: no driver is bound yet.
         if table.add(decl, Source::BootModule, binary, 0).is_err()
         {
@@ -2439,11 +2439,7 @@ fn spawn_and_settle(
 {
     let (service_ep, death_eq) = instance;
     // Deletes the source copy on the exits before the spawn takes it.
-    let mut source_guard = spawn::ModuleCapGuard::new(match source
-    {
-        spawn::CreateSource::Module { cap, .. } => cap,
-        spawn::CreateSource::File { file_cap, .. } => file_cap,
-    });
+    let mut source_guard = spawn::ModuleCapGuard::new(source.cap);
     let batch = settle::SettleBatch::new();
     let badge = catalog.add_without_info();
     let mut roster = firmware::roster::Roster::new();

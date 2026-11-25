@@ -17,8 +17,8 @@
 //! walk with the MSI and MSI-X capability fields, and the Function Level Reset
 //! fields, walks PCI configuration space through a caller-supplied accessor,
 //! chooses the driver declaration that binds each device record within the
-//! declaration bounds (`binding`), bounds the reads of a candidate driver
-//! binary (`image`), keeps the table of MMIO and interrupt range caps devmgr
+//! declaration bounds and records the entries a drivers-directory listing
+//! names (`binding`), keeps the table of MMIO and interrupt range caps devmgr
 //! carves per-device caps from, holds the interrupt lines it has carved so
 //! every device on a line gets its own derivation, tracks which spawned drivers
 //! reported their device ready, and keeps each class's served drivers, by class
@@ -63,7 +63,6 @@ pub mod dmar;
 pub mod dtb;
 pub mod headroom;
 pub mod hotplug;
-pub mod image;
 pub mod iommu_restart;
 pub mod lines;
 pub mod pci;

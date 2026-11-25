@@ -476,6 +476,42 @@ impl BoundCounts
     }
 }
 
+/// The entry names one drivers-directory listing has named, so a pass reads
+/// each entry once: a directory server that names an entry again would
+/// otherwise cost a second verified read of the image and offer a second
+/// candidate of the same declaration, which ties with the first
+/// ([`Choice::Conflict`]) and leaves its devices unbound.
+#[derive(Debug, Default)]
+pub struct EntryNames
+{
+    /// Sorted, each name once.
+    names: Vec<alloc::boxed::Box<[u8]>>,
+}
+
+impl EntryNames
+{
+    /// Record `name`: `Ok(true)` the first time the listing names it,
+    /// `Ok(false)` every later time.
+    ///
+    /// # Errors
+    /// Returns the allocation error when the set cannot hold `name`, which
+    /// is then not recorded; the caller skips the entry.
+    pub fn first_sight(&mut self, name: &[u8]) -> Result<bool, TryReserveError>
+    {
+        let Err(at) = self.names.binary_search_by(|seen| (**seen).cmp(name))
+        else
+        {
+            return Ok(false);
+        };
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(name.len())?;
+        copy.extend_from_slice(name);
+        self.names.try_reserve(1)?;
+        self.names.insert(at, copy.into_boxed_slice());
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -1057,5 +1093,31 @@ mod tests
                 reserve: false,
             }
         );
+    }
+
+    // Defect guarded: a listing that names an entry twice reading the image
+    // twice and offering two equal candidates, which conflict and leave the
+    // device unbound; or a name that differs only by length or a byte taken
+    // for one already seen.
+    #[test]
+    fn an_entry_name_is_new_once()
+    {
+        let mut seen = EntryNames::default();
+        for name in [
+            &b"virtio-rng"[..],
+            b"serial",
+            b"virtio-rn",
+            b"virtio-rngx",
+            b"Serial",
+        ]
+        {
+            assert_eq!(seen.first_sight(name), Ok(true), "{name:?}");
+        }
+        for name in [&b"serial"[..], b"virtio-rng", b"virtio-rn", b"Serial"]
+        {
+            assert_eq!(seen.first_sight(name), Ok(false), "{name:?}");
+        }
+        assert_eq!(seen.names.len(), 5);
+        assert!(seen.names.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }

@@ -648,11 +648,11 @@ struct RegistryState
     /// The drivers whose restart is admitted and charged, for the restart
     /// job to start, in death order.
     restarts: Vec<bind::RestartSource>,
-    /// The driver starts whose create procmgr refused with an error a later
-    /// create can outlive, each held until its retry is due
-    /// ([`bind::CreateRetry`]); the control thread runs each once due
+    /// The driver starts whose create, or read of the driver's entry, procmgr
+    /// refused with an error a later one can outlive, each held until its
+    /// retry is due ([`bind::Retry`]); the control thread runs each once due
     /// (`run_jobs`) and waits no longer than the earliest is due.
-    retries: firmware::restart::Retries<bind::CreateRetry>,
+    retries: firmware::restart::Retries<bind::Retry>,
 }
 
 // A class name a `MINT_CLASS_SEND` request can carry is one a declaration
@@ -843,7 +843,7 @@ impl Registry
 
     /// Hold the create retries a batch queued, `batch` left empty, until
     /// each is due; each is released, logged, when the list cannot hold them.
-    fn hold_retries(&self, batch: &mut firmware::restart::Retries<bind::CreateRetry>)
+    fn hold_retries(&self, batch: &mut firmware::restart::Retries<bind::Retry>)
     {
         if batch.is_empty()
         {
@@ -864,7 +864,7 @@ impl Registry
     }
 
     /// Take the create retry due earliest, when it is due at `now_ns`.
-    fn take_due_retry(&self, now_ns: u64) -> Option<bind::CreateRetry>
+    fn take_due_retry(&self, now_ns: u64) -> Option<bind::Retry>
     {
         self.lock().retries.take_due(now_ns)
     }
@@ -3111,14 +3111,15 @@ fn restart_driver(
 }
 
 /// Retry the start `retry` holds, once its delay has passed, in a settle
-/// batch of its own, on the control thread, as `run_jobs` runs it: its
-/// record bound to the same driver from the same binary ([`bind::retry`]),
-/// and the batch settled and served ([`settle_batch`]), the new instance at
+/// batch of its own, on the control thread, as `run_jobs` runs it: a
+/// start's record bound to the same driver, read and verified again from its
+/// entry, or the records still unbound bound to an entry's driver
+/// ([`bind::retry`]), and the batch settled and served ([`settle_batch`]), the new instance at
 /// its class's next ordinal. The retry is counted a job while it runs, so a
 /// query that would find no driver waits for its settle, as for a restart's.
 fn retry_driver(
-    retry: bind::CreateRetry,
-    records: &bind::Records,
+    retry: bind::Retry,
+    records: &mut bind::Records,
     carve: &mut bind::Carve,
     watch: &mut settle::DriverWatch,
     registry: &Registry,

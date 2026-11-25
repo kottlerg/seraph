@@ -13,7 +13,8 @@ not yet implemented.
 
 Implemented: every driver binary carries its declaration (§ Driver Declarations); init forwards
 every boot module outside its bootstrap set to devmgr untagged; devmgr reads the declarations of
-the boot modules and of the drivers-directory entries, within § Declaration Bounds; it
+the boot modules and of the drivers-directory entries, each entry's only from a copy procmgr
+verified in the driver role, within § Declaration Bounds; it
 enumerates every kind of device record of § Device Records (PCI, the ACPI namespace, the SPCR,
 the boot framebuffer, a platform description table, the IOMMU family), matches the declarations
 against the records (§ Matching), binds each matched PCI, platform, and IOMMU record through one
@@ -239,16 +240,25 @@ devmgr collects declarations from two places:
   none ([signing.md](signing.md) § Configuration). A driver image whose note is missing or does
   not decode, a table that is rejected, and any other module are logged and released.
 - **The drivers directory.** On `SET_DRIVERS_DIR` devmgr lists `/services/drivers/`
-  (`NS_READDIR`, so svcmgr sends the subtree cap with `READDIR` beside `LOOKUP | READ`) and
-  reads the note of each entry. A binary whose declaration matches no recorded device is not
-  loaded.
+  (`NS_READDIR`, so svcmgr sends the subtree cap with `READDIR` beside `LOOKUP | READ`), has
+  procmgr read each entry once and verify it as a driver image under its install path
+  (`procmgr_labels::READ_VERIFIED` in the driver role), and reads the note from that verified
+  copy alone, which it then creates the driver from ([signing.md](signing.md) § Verifier
+  Discipline). An entry that does not verify is passed over, procmgr logging the refusal, and an
+  entry the listing names again is not read again. A binary whose declaration matches no
+  recorded device is not loaded.
 
 ### Declaration Bounds
 
-A declaration is untrusted input to devmgr, and it is as trusted as the authority that
-installed its binary: whoever can write `/services/drivers/` or compose the boot bundle can
-already install a driver devmgr hands hardware to. The bounds below make sure a declaration
-never claims more than its device and the system's policy give it:
+A declaration is untrusted input to devmgr, and devmgr acts only on one a key the system trusts
+signed for its driver: a boot-bundle declaration from a module the bootloader verified, a
+drivers-directory one from a copy procmgr verified in the driver role under the entry's install
+path ([signing.md](signing.md) § Threat Model). Writing `/services/drivers/` therefore supplies
+no declaration, and runs no driver, that no trusted key signed. It can still remove a signed
+driver, add one signed for its install path that the deployer did not install, or put back an
+older signed copy, since the directory's contents are not signed as a set
+([#1665](https://github.com/kottlerg/seraph/issues/1665)). The bounds below make sure a
+declaration never claims more than its device and the system's policy give it, whoever signed it:
 
 - **Resources.** devmgr carves only from the device record. A declaration selects among the
   record's resources; it cannot name an address, a port, an interrupt, or a DMA right the
@@ -281,9 +291,8 @@ never claims more than its device and the system's policy give it:
   ([devmgr responsibilities § Root disk](../services/devmgr/docs/responsibilities.md#root-disk)),
   so the boot-bundle copy the boot pass binds serves that disk for the whole boot, and every
   later start of a `block` driver, a restart or a bind after a hot-add, is from its
-  drivers-directory entry (§ Source). Either way the authority that installs the driver's
-  binary, the bundle's composer or the writer of `/services/drivers/`, already decides the code
-  of the storage path in the reserve.
+  drivers-directory entry (§ Source). Either way the key that signed the driver's binary for
+  its install path already decides the code of the storage path in the reserve.
 - **DMA width.** The width limits the device's IOVA space and never widens it past what its
   remapping unit translates; devmgr knows no device's DMA width, so a driver declares its own.
   A width without DMA, outside 12 to 64 bits, or repeated rejects the declaration whole. A
@@ -291,8 +300,10 @@ never claims more than its device and the system's policy give it:
   a device whose width leaves it no IOVA there (20 bits or fewer).
 - **Form.** Every field has a fixed bound (the match entries, the name's length, the vector
   count). A declaration that exceeds one, carries an unknown field kind, or fails to decode is
-  rejected whole and logged. devmgr's reads of a candidate binary are bounded too: the ELF
-  header, the section header table, and the one note.
+  rejected whole and logged. devmgr's reads of a candidate binary are bounded too, and lie
+  within the boot module or the verified body: the ELF header, the section header table, and
+  the one note. procmgr bounds the verified read of a drivers-directory image
+  (`procmgr_labels::READ_VERIFIED_IMAGE_MAX`, 16 MiB, [limits.md](limits.md)).
 
 ---
 
@@ -375,9 +386,10 @@ at `BIND_DRIVERS`, and for a hot-added device:
    Interrupts), after the DMA grant, since on riscv64 a vector's interrupt file is mapped into the
    device's IOMMU domain before the function may signal it.
 4. Create the driver through procmgr with the flags and priority its declaration implies,
-   within § Declaration Bounds, from its boot module or its file. Only the IOMMU pass and the boot
-   pass start a driver from a boot module ([boot-media.md](boot-media.md) § Bootstrap-Only Boot
-   Copies).
+   within § Declaration Bounds, from its boot module, or from the copy of its file procmgr
+   verified when devmgr read its declaration, which procmgr verifies again. Only the IOMMU pass
+   and the boot pass start a driver from a boot module ([boot-media.md](boot-media.md)
+   § Bootstrap-Only Boot Copies).
 5. Deliver the capabilities over the bootstrap protocol as a self-describing resource list:
    each capability with its resource kind and its fields, then the service endpoint, the
    devmgr query capability, and the DMA capability. One delivery shape serves every driver.
@@ -394,9 +406,9 @@ at `BIND_DRIVERS`, and for a hot-added device:
 replies at once and its control thread runs a drivers-directory pass over it against the records
 still unbound, under the declaration bounds of the `SET_DRIVERS_DIR` pass, and settles the drivers
 it binds within the production settle bound. A pass binds a record at most once a boot, and none
-binds it again once its driver is withdrawn; only devmgr's restart of a served driver that died
-and its retry of a create procmgr refused start that driver again on the record, which stays bound
-([Create retry](../services/devmgr/docs/responsibilities.md#create-retry)).
+binds it again once its driver is withdrawn; only devmgr's restart of a served driver that died and
+its retry of a start whose read or create procmgr refused start that driver again on the record,
+which stays bound ([Create retry](../services/devmgr/docs/responsibilities.md#create-retry)).
 
 Each bind pass is one settle batch: the IOMMU pass, the boot pass over boot-module drivers,
 the pass at `SET_DRIVERS_DIR`, one pass per `BIND_DRIVERS`, and a hotplug pass. Withdrawing a

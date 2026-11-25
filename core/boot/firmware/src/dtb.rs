@@ -2075,13 +2075,17 @@ mod proofs
     /// begins, or neither, and a `ranges` and each AIA property of 5, a cell
     /// and one past it. Whether a list names an entry is the shared
     /// `compatible_contains`'s, proved in `firmware_tables`. The loops are
-    /// the list's bytes, the states' compare and the names' bytes.
+    /// the list's bytes, the states' compare and the names' bytes, so each
+    /// unwinds at least one past the longest of the property's value, its
+    /// name and the names of the step's other arms of the same length: 11
+    /// for `compatible`, whose arms of ten bytes include `msi-parent`, and 25,
+    /// one past `riscv,group-index-shift`, for the others.
     macro_rules! compatible_property_proofs {
-        ($($proof:ident: $name:literal, $len:literal;)*) => {$(
+        ($($proof:ident: $name:literal, $len:literal, $unwind:literal;)*) => {$(
             #[doc = concat!("Every step of the compatible walk takes a `", $name,
                 "` of up to ", stringify!($len), " bytes as its binding says.")]
             #[kani::proof]
-            #[kani::unwind(25)]
+            #[kani::unwind($unwind)]
             fn $proof()
             {
                 let data: [u8; $len] = kani::any();
@@ -2094,17 +2098,17 @@ mod proofs
     }
 
     compatible_property_proofs! {
-        every_compatible_walk_step_records_its_compatible: "compatible", 5;
-        every_compatible_walk_step_records_its_ranges: "ranges", 5;
-        every_compatible_walk_step_records_its_phandle: "phandle", 5;
-        every_compatible_walk_step_records_its_msi_parent: "msi-parent", 5;
-        every_compatible_walk_step_records_its_interrupts_extended: "interrupts-extended", 5;
-        every_compatible_walk_step_records_its_num_ids: "riscv,num-ids", 5;
-        every_compatible_walk_step_records_its_num_sources: "riscv,num-sources", 5;
-        every_compatible_walk_step_records_its_guest_index_bits: "riscv,guest-index-bits", 5;
-        every_compatible_walk_step_records_its_hart_index_bits: "riscv,hart-index-bits", 5;
-        every_compatible_walk_step_records_its_group_index_bits: "riscv,group-index-bits", 5;
-        every_compatible_walk_step_records_its_group_index_shift: "riscv,group-index-shift", 5;
+        every_compatible_walk_step_records_its_compatible: "compatible", 5, 11;
+        every_compatible_walk_step_records_its_ranges: "ranges", 5, 25;
+        every_compatible_walk_step_records_its_phandle: "phandle", 5, 25;
+        every_compatible_walk_step_records_its_msi_parent: "msi-parent", 5, 25;
+        every_compatible_walk_step_records_its_interrupts_extended: "interrupts-extended", 5, 25;
+        every_compatible_walk_step_records_its_num_ids: "riscv,num-ids", 5, 25;
+        every_compatible_walk_step_records_its_num_sources: "riscv,num-sources", 5, 25;
+        every_compatible_walk_step_records_its_guest_index_bits: "riscv,guest-index-bits", 5, 25;
+        every_compatible_walk_step_records_its_hart_index_bits: "riscv,hart-index-bits", 5, 25;
+        every_compatible_walk_step_records_its_group_index_bits: "riscv,group-index-bits", 5, 25;
+        every_compatible_walk_step_records_its_group_index_shift: "riscv,group-index-shift", 5, 25;
     }
 
     /// Every step of the CPU walk from any state opens and closes a node as
@@ -2127,20 +2131,21 @@ mod proofs
     /// value of up to the bytes given: a `compatible` of 8, which holds
     /// `riscv` at a list's second place (`a\0riscv\0`); a `reg` of 5, a cell
     /// and one past it; a `status` of 9, `disabled` and one past it; a
-    /// `riscv,isa-extensions` of 7, which holds `sstc` at a list's second
-    /// place; a `riscv,isa` of 7, which holds `sstc` as a segment after
-    /// another (`a_sstc\0`); and an `mmu-type` of 12, `riscv,sv57x` with its
-    /// NUL. Whether a list names an entry is the shared
-    /// `compatible_contains`'s, proved in `firmware_tables`, and an ISA
-    /// string's reading is `every_isa_string_names_its_whole_segments`'s. The
-    /// loops are the values' entries, the extension names, the states'
-    /// compare and the names' bytes.
+    /// `riscv,isa-extensions` and a `riscv,isa` of 5, which hold `sstc` with
+    /// its NUL; and an `mmu-type` of 12, `riscv,sv57x` with its NUL. Whether
+    /// a list names an entry is the shared `compatible_contains`'s, proved in
+    /// `firmware_tables`, and an ISA string's reading over longer strings is
+    /// `every_isa_string_names_its_whole_segments`'s, so these two harnesses
+    /// check that the step records the reading in the open node. The
+    /// loops are the values' entries, the extension names and the states'
+    /// compare, so each unwinds two past its value's bytes; the names are
+    /// constants, whose compares need no unwinding.
     macro_rules! cpu_property_proofs {
-        ($($proof:ident: $name:literal, $len:literal;)*) => {$(
+        ($($proof:ident: $name:literal, $len:literal, $unwind:literal;)*) => {$(
             #[doc = concat!("Every step of the CPU walk takes a `", $name,
                 "` of up to ", stringify!($len), " bytes as its binding says.")]
             #[kani::proof]
-            #[kani::unwind(22)]
+            #[kani::unwind($unwind)]
             fn $proof()
             {
                 let data: [u8; $len] = kani::any();
@@ -2155,12 +2160,12 @@ mod proofs
     }
 
     cpu_property_proofs! {
-        every_cpu_walk_step_records_its_compatible: "compatible", 8;
-        every_cpu_walk_step_records_its_reg: "reg", 5;
-        every_cpu_walk_step_records_its_status: "status", 9;
-        every_cpu_walk_step_records_its_isa_extensions: "riscv,isa-extensions", 7;
-        every_cpu_walk_step_records_its_isa: "riscv,isa", 7;
-        every_cpu_walk_step_records_its_mmu_type: "mmu-type", 12;
+        every_cpu_walk_step_records_its_compatible: "compatible", 8, 10;
+        every_cpu_walk_step_records_its_reg: "reg", 5, 7;
+        every_cpu_walk_step_records_its_status: "status", 9, 11;
+        every_cpu_walk_step_records_its_isa_extensions: "riscv,isa-extensions", 5, 7;
+        every_cpu_walk_step_records_its_isa: "riscv,isa", 5, 7;
+        every_cpu_walk_step_records_its_mmu_type: "mmu-type", 12, 14;
     }
 
     /// Every step of the interrupt-controller walk from any state opens and
@@ -2181,17 +2186,24 @@ mod proofs
 
     /// The interrupt-controller walk's property harnesses, one per property
     /// it reads, each a step from any state taking that property's value of
-    /// up to 16 bytes: 16 bytes hold `riscv,cpu-intc` with its NUL. The
-    /// loops are the list's bytes, the states' compare and the names' bytes.
+    /// up to the bytes given: a `compatible` of 6, `riscv` with its NUL; a
+    /// `reg` and a `phandle` of 5, a cell and one past it; and a `status` of
+    /// 9, `disabled` and one past it. A `compatible` that names
+    /// `riscv,cpu-intc` is `every_intc_walk_step_records_a_cpu_intc`'s.
+    /// Which entries a list names is the shared `compatible_contains`'s,
+    /// proved in `firmware_tables`. The loops are the list's bytes and the
+    /// states'
+    /// compare, so each unwinds two past its value's bytes; the names are
+    /// constants, whose compares need no unwinding.
     macro_rules! intc_property_proofs {
-        ($($proof:ident: $name:literal;)*) => {$(
+        ($($proof:ident: $name:literal, $len:literal, $unwind:literal;)*) => {$(
             #[doc = concat!("Every step of the interrupt-controller walk takes a `",
-                $name, "` of up to 16 bytes as its binding says.")]
+                $name, "` of up to ", stringify!($len), " bytes as its binding says.")]
             #[kani::proof]
-            #[kani::unwind(18)]
+            #[kani::unwind($unwind)]
             fn $proof()
             {
-                let data: [u8; 16] = kani::any();
+                let data: [u8; $len] = kani::any();
                 let mut walk = CpuIntcWalk::<D> {
                     states: [intc_state(), intc_state()],
                     depth: depth(),
@@ -2203,10 +2215,31 @@ mod proofs
     }
 
     intc_property_proofs! {
-        every_intc_walk_step_records_its_compatible: "compatible";
-        every_intc_walk_step_records_its_reg: "reg";
-        every_intc_walk_step_records_its_status: "status";
-        every_intc_walk_step_records_its_phandle: "phandle";
+        every_intc_walk_step_records_its_compatible: "compatible", 6, 8;
+        every_intc_walk_step_records_its_reg: "reg", 5, 7;
+        every_intc_walk_step_records_its_status: "status", 9, 11;
+        every_intc_walk_step_records_its_phandle: "phandle", 5, 7;
+    }
+
+    /// Every step of the interrupt-controller walk takes a `compatible` that
+    /// names `riscv,cpu-intc` as its binding says, from any state. The list
+    /// is that one whole entry, whose 15 bytes no symbolic list of a size the
+    /// memory limit admits reaches.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_intc_walk_step_records_a_cpu_intc()
+    {
+        let mut walk = CpuIntcWalk::<D> {
+            states: [intc_state(), intc_state()],
+            depth: depth(),
+            limits: limits(),
+        };
+        let event = FdtEvent::Prop {
+            name: b"compatible",
+            data: b"riscv,cpu-intc\0",
+            at: kani::any(),
+        };
+        let _ = property::intc_step_holds(&mut walk, event);
     }
 
     /// Every `mmu-type` of at most 12 bytes claims the mode it names, and a

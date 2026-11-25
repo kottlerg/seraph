@@ -27,10 +27,18 @@
 //!   - **Decline.** `SYS_GETRANDOM` on an unmapped page, then on a read-only one
 //!     (a present page, which x86-64 reports): the harness declines, the call
 //!     fails with `InvalidAddress`, and the child lives to report it.
+//!   - **Copy matrix.** `SYS_THREAD_READ_MEM` into, and `SYS_THREAD_WRITE_MEM`
+//!     out of, a buffer laid so that the user copy faults in each of its parts
+//!     ([`GEOMETRIES`]), declined: the fault must name the buffer's first
+//!     unmapped byte exactly, the address the copy derives from its count of
+//!     bytes not copied, so a count from the wrong byte fails the case.
 //!   - **Redirect.** The harness rewrites the child's instruction pointer to a
 //!     landing function and declines, or resumes without backing the page:
 //!     either way the child continues at the landing, not after or at the
 //!     syscall.
+//!
+//! Every case runs whatever an earlier one returned, and each failing case
+//! logs its name, its call and its reason.
 //!
 //! The harness waits on a wait set holding both the endpoint and the child's
 //! report notification, so a kernel that fails the copy instead of delivering
@@ -61,8 +69,9 @@ const FAULT_BADGE: u64 = 0xC0FF_EE05;
 /// Bytes the `SYS_GETRANDOM` cases ask for.
 const RANDOM_LEN: usize = 32;
 
-/// Bytes the thread-memory cases copy.
-const MEM_LEN: usize = 32;
+/// Bytes the thread-memory cases copy at most: two of riscv64 `copy_user`'s
+/// 64-byte blocks.
+const MEM_LEN: usize = 128;
 
 /// The byte the harness backs a `WriteMem` buffer with.
 const MEM_PATTERN: u8 = 0xA5;
@@ -120,6 +129,22 @@ enum Call
     /// `SYS_THREAD_WRITE_MEM` of the buffer, through the helper's cap, into
     /// [`MEM_TARGET`].
     WriteMem,
+}
+
+impl Call
+{
+    /// The syscall, for a failing case's log line.
+    fn name(self) -> &'static str
+    {
+        match self
+        {
+            Call::Getrandom => "fault_syscall_buffer: call SYS_GETRANDOM",
+            Call::ReadRegs => "fault_syscall_buffer: call SYS_THREAD_READ_REGS",
+            Call::WriteRegs => "fault_syscall_buffer: call SYS_THREAD_WRITE_REGS",
+            Call::ReadMem => "fault_syscall_buffer: call SYS_THREAD_READ_MEM",
+            Call::WriteMem => "fault_syscall_buffer: call SYS_THREAD_WRITE_MEM",
+        }
+    }
 }
 
 /// How the harness answers the fault.
@@ -240,6 +265,141 @@ const CASES: [Spec; 10] = [
     },
 ];
 
+/// A buffer of the copy matrix: its offset from its case's first page, its
+/// length, and how that page is mapped (`None`: unmapped, so the copy faults
+/// at the buffer's first byte; writable: at the second page's first byte).
+struct Geometry
+{
+    name: &'static str,
+    offset: u64,
+    len: usize,
+    premap: Option<u64>,
+}
+
+/// The copy matrix's buffers, each faulting in one part of riscv64's
+/// `copy_user` (core/kernel/src/arch/riscv64/cpu.rs): its first access, its
+/// 64-byte block loop at each of a block's eight words, its word loop, its byte
+/// tail after words, and its byte loop, which a buffer at any other offset of a
+/// word takes. The kernel stages the thread-memory syscalls' bytes in an
+/// 8-byte-aligned buffer, so a buffer at an aligned offset takes the word path.
+/// x86-64's `rep movsb` faults at the same bytes.
+const GEOMETRIES: [Geometry; 19] = [
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, first byte unmapped, aligned",
+        offset: 0,
+        len: MEM_LEN,
+        premap: None,
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, first byte unmapped, unaligned",
+        offset: 3,
+        len: MEM_LEN,
+        premap: None,
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, block word 0",
+        offset: PAGE_SIZE - 64,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, block word 1",
+        offset: PAGE_SIZE - 8,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, block word 2",
+        offset: PAGE_SIZE - 16,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, block word 3",
+        offset: PAGE_SIZE - 24,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, block word 4",
+        offset: PAGE_SIZE - 32,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, block word 5",
+        offset: PAGE_SIZE - 40,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, block word 6",
+        offset: PAGE_SIZE - 48,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, block word 7",
+        offset: PAGE_SIZE - 56,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, word loop",
+        offset: PAGE_SIZE - 8,
+        len: 40,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, byte tail after words",
+        offset: PAGE_SIZE - 16,
+        len: 21,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, unaligned offset 1",
+        offset: PAGE_SIZE - 63,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, unaligned offset 2",
+        offset: PAGE_SIZE - 62,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, unaligned offset 3",
+        offset: PAGE_SIZE - 61,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, unaligned offset 4",
+        offset: PAGE_SIZE - 60,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, unaligned offset 5",
+        offset: PAGE_SIZE - 59,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, unaligned offset 6",
+        offset: PAGE_SIZE - 58,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+    Geometry {
+        name: "fault_syscall_buffer: copy matrix, unaligned offset 7",
+        offset: PAGE_SIZE - 57,
+        len: MEM_LEN,
+        premap: Some(MAP_WRITABLE),
+    },
+];
+
 /// The child's arguments, by address.
 #[derive(Clone, Copy)]
 struct CallerArgs
@@ -274,15 +434,41 @@ static mut HELPER_STACK: ChildStack = ChildStack::ZERO;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    for (i, spec) in CASES.iter().enumerate()
+    let matrix = [Call::ReadMem, Call::WriteMem]
+        .into_iter()
+        .flat_map(|call| {
+            GEOMETRIES.iter().map(move |g| Spec {
+                name: g.name,
+                call,
+                answer: Answer::Decline,
+                offset: g.offset,
+                len: g.len,
+                premap: g.premap,
+            })
+        });
+    let mut failed = None;
+    for (i, spec) in CASES.iter().copied().chain(matrix).enumerate()
     {
-        let page = (i as u64)
-            .checked_mul(2 * PAGE_SIZE)
-            .and_then(|span| CASE_VA_BASE.checked_add(span))
-            .ok_or("fault_syscall_buffer: case page past the address space")?;
-        run_case(ctx, spec, page).inspect_err(|_| crate::log(spec.name))?;
+        // Every case runs, and each failure is logged, so a wrong count of
+        // bytes not copied shows every part of the copy it breaks.
+        if let Err(e) = run_case(ctx, &spec, case_page(i)?)
+        {
+            crate::log(spec.name);
+            crate::log(spec.call.name());
+            crate::log(e);
+            failed = failed.or(Some(e));
+        }
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
+}
+
+/// The first of the two scratch pages of the case numbered `i`.
+fn case_page(i: usize) -> Result<u64, &'static str>
+{
+    (i as u64)
+        .checked_mul(2 * PAGE_SIZE)
+        .and_then(|span| CASE_VA_BASE.checked_add(span))
+        .ok_or("fault_syscall_buffer: case page past the address space")
 }
 
 /// The caps, children and mapped pool frames one case holds, released on
@@ -690,7 +876,14 @@ extern "C" fn caller_entry(arg: u64) -> !
                     a.len,
                 )
             };
-            r == Ok(a.len as u64) && landed(a.buf, a.len)
+            if a.succeed
+            {
+                r == Ok(a.len as u64) && landed(a.buf, a.len)
+            }
+            else
+            {
+                r == Err(SyscallError::InvalidAddress as i64)
+            }
         }
         Call::WriteMem =>
         {
@@ -704,14 +897,21 @@ extern "C" fn caller_entry(arg: u64) -> !
             let r = unsafe {
                 syscall::thread_write_mem_raw(a.helper, target as u64, a.buf as *const u8, a.len, 0)
             };
-            r.is_ok()
-                && (0..a.len).all(|i| {
-                    // SAFETY: i < MEM_TARGET's length, so the byte lies inside it.
-                    let byte = unsafe { target.add(i) };
-                    // SAFETY: MEM_TARGET is read through a raw pointer, at a
-                    // byte inside it.
-                    unsafe { byte.read_volatile() == MEM_PATTERN }
-                })
+            if a.succeed
+            {
+                r.is_ok()
+                    && (0..a.len).all(|i| {
+                        // SAFETY: i < MEM_TARGET's length, so the byte lies inside it.
+                        let byte = unsafe { target.add(i) };
+                        // SAFETY: MEM_TARGET is read through a raw pointer, at a
+                        // byte inside it.
+                        unsafe { byte.read_volatile() == MEM_PATTERN }
+                    })
+            }
+            else
+            {
+                r == Err(SyscallError::InvalidAddress as i64)
+            }
         }
     };
     let ok = returned_ok && !a.redirected;

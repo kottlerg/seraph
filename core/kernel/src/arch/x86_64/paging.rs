@@ -1121,7 +1121,7 @@ pub unsafe fn unmap_user_region_pooled(
     virt_base: u64,
     page_count: usize,
     aso: &crate::cap::object::AddressSpaceObject,
-    on_leaf: &mut dyn FnMut(u64),
+    on_leaf: &mut impl FnMut(u64),
 ) -> usize
 {
     use crate::mm::PAGE_SIZE;
@@ -1168,7 +1168,7 @@ unsafe fn unmap_span(
     hi: u64,
     aso: &crate::cap::object::AddressSpaceObject,
     freed: &mut usize,
-    on_leaf: &mut dyn FnMut(u64),
+    on_leaf: &mut impl FnMut(u64),
 )
 {
     use crate::mm::PAGE_SIZE;
@@ -1241,8 +1241,8 @@ unsafe fn unmap_span(
 #[cfg(not(test))]
 pub unsafe fn for_each_user_leaf(
     root_virt: u64,
-    on_table: &mut dyn FnMut(),
-    on_leaf: &mut dyn FnMut(u64),
+    on_table: &mut impl FnMut(),
+    on_leaf: &mut impl FnMut(u64),
 )
 {
     let limit = USER_CANONICAL_LIMIT.load(Ordering::Relaxed);
@@ -1265,8 +1265,8 @@ unsafe fn walk_leaves(
     level: usize,
     lo: u64,
     hi: u64,
-    on_table: &mut dyn FnMut(),
-    on_leaf: &mut dyn FnMut(u64),
+    on_table: &mut impl FnMut(),
+    on_leaf: &mut impl FnMut(u64),
 )
 {
     use crate::mm::PAGE_SIZE;
@@ -1332,7 +1332,7 @@ pub unsafe fn read_user_accessed(
     root_virt: u64,
     virt_base: u64,
     page_count: usize,
-    on_accessed: &mut dyn FnMut(u64),
+    on_accessed: &mut impl FnMut(u64),
 )
 {
     // SAFETY: root_virt is the direct-map VA of a valid root, and pt_lock is
@@ -1363,7 +1363,7 @@ pub unsafe fn clear_user_accessed(
     root_virt: u64,
     virt_base: u64,
     page_count: usize,
-    reported: &dyn Fn(u64) -> bool,
+    reported: &impl Fn(u64) -> bool,
 )
 {
     // SAFETY: as for read_user_accessed (caller's contract).
@@ -1388,7 +1388,7 @@ unsafe fn for_each_leaf_slot(
     root_virt: u64,
     virt_base: u64,
     page_count: usize,
-    on_slot: &mut dyn FnMut(&mut PageTableEntry, u64),
+    on_slot: &mut impl FnMut(&mut PageTableEntry, u64),
 )
 {
     use crate::mm::PAGE_SIZE;
@@ -1415,7 +1415,7 @@ unsafe fn walk_leaf_slots(
     level: usize,
     lo: u64,
     hi: u64,
-    on_slot: &mut dyn FnMut(&mut PageTableEntry, u64),
+    on_slot: &mut impl FnMut(&mut PageTableEntry, u64),
 )
 {
     use crate::mm::PAGE_SIZE;
@@ -1473,7 +1473,7 @@ pub unsafe fn scan_user_leaves(
     start: u64,
     hi: u64,
     budget: usize,
-    on_leaf: &mut dyn FnMut(u64, u64, u64) -> bool,
+    on_leaf: &mut impl FnMut(u64, u64, u64) -> bool,
 ) -> u64
 {
     let mut scan = LeafScan {
@@ -1489,14 +1489,14 @@ pub unsafe fn scan_user_leaves(
 
 /// The state of one [`scan_user_leaves`]: the entries it may still examine,
 /// the translation that reaches a table from its frame, and the leaf sink.
-struct LeafScan<'a>
+struct LeafScan<'a, F, V>
 {
     budget: usize,
-    to_virt: fn(u64) -> u64,
-    on_leaf: &'a mut dyn FnMut(u64, u64, u64) -> bool,
+    to_virt: V,
+    on_leaf: &'a mut F,
 }
 
-impl LeafScan<'_>
+impl<F: FnMut(u64, u64, u64) -> bool, V: Fn(u64) -> u64> LeafScan<'_, F, V>
 {
     /// Scan `[lo, hi)` under the table at `table_va`, a table at `level`;
     /// `Some` of the VA the scan stopped at, or `None` once the span is

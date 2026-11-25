@@ -2046,9 +2046,10 @@ mod proofs
 
     /// Every step of the compatible walk from any state opens and closes a
     /// node as the structure block nests it, yielding a matched node. The
-    /// loops are the states' compare.
+    /// loops are the states' compare and, within it, the compare of a
+    /// state's `MAX_REG_ENTRIES` `reg` entries.
     #[kani::proof]
-    #[kani::unwind(3)]
+    #[kani::unwind(9)]
     fn every_compatible_walk_step_nests_its_nodes()
     {
         let _ = property::compatible_step_holds(&mut compatible_walk(b"ab"), node_event());

@@ -469,17 +469,27 @@ fn range_of(bytes: &[u8], part: &[u8]) -> (usize, usize)
     (start, start.wrapping_add(part.len()))
 }
 
-/// [`aml::collect`] takes the term `term` of the term list `bytes` into a
-/// device as the walk of a device's body does: a `Name` with a name, its
-/// value the `size` bytes at `value`, is recorded as [`record`] does; a
-/// `Method` called `_HID`, `_CID` or `_CRS` makes it dynamic; every other
-/// term leaves it as it is. Judged into a device that holds nothing yet, and
-/// into one whose every field already holds a value.
-pub(crate) fn collect_holds(bytes: &[u8], term: &Term)
+/// The device a `Name` or a `Method` is taken into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Prior
 {
+    /// One that holds nothing yet.
+    Empty,
+    /// One whose every field already holds a value.
+    Full,
+}
+
+/// The decoder's and the property's forms of the device `into`, its `_CRS`
+/// an empty range at the start of `bytes`.
+fn device_of(bytes: &[u8], into: Prior) -> (Collect<'_>, Device)
+{
+    if into == Prior::Empty
+    {
+        return (Collect::default(), Device::default());
+    }
     let id = Id::new(b"PRIOR");
     let ident = Ident::new(b"PRIOR");
-    let prior = (
+    (
         Collect {
             hid: id,
             cids: [id; MAX_CIDS],
@@ -496,35 +506,36 @@ pub(crate) fn collect_holds(bytes: &[u8], term: &Term)
             sta: Some(1),
             dynamic: false,
         },
-    );
-    for (mut c, mut d) in [(Collect::default(), Device::default()), prior]
+    )
+}
+
+/// [`aml::record`] records `Name(name, value)`, its value the `size` bytes
+/// at `value` of `bytes`, into the device `into` as [`record`] does.
+pub(crate) fn record_holds(bytes: &[u8], name: [u8; 4], value: usize, size: usize, into: Prior)
+{
+    let Some(data) = value.checked_add(size).and_then(|end| bytes.get(..end))
+    else
     {
-        aml::collect(&mut c, bytes, term);
-        match *term
-        {
-            Term::Name {
-                name: Some(name),
-                value,
-                size,
-            } =>
-            {
-                if let Some(data) = value.checked_add(size).and_then(|end| bytes.get(..end))
-                {
-                    record(data, &mut d, name, value);
-                }
-            }
-            Term::Method {
-                name: Some(name), ..
-            } if matches!(&name, b"_HID" | b"_CID" | b"_CRS") => d.dynamic = true,
-            Term::Scope { .. }
-            | Term::Device { .. }
-            | Term::Name { .. }
-            | Term::Method { .. }
-            | Term::Skip { .. } =>
-            {}
-        }
-        assert!(same(bytes, &c, &d), "a term taken into a device");
+        return;
+    };
+    let (mut c, mut d) = device_of(bytes, into);
+    aml::record(&mut c, name, bytes, value, size);
+    record(data, &mut d, name, value);
+    assert!(same(bytes, &c, &d), "a Name recorded against its value");
+}
+
+/// [`aml::method`] takes a `Method` called `name` into the device `into`:
+/// one called `_HID`, `_CID` or `_CRS` makes it dynamic, and nothing else
+/// changes.
+pub(crate) fn method_holds(name: Option<[u8; 4]>, into: Prior)
+{
+    let (mut c, mut d) = device_of(&[], into);
+    aml::method(&mut c, name);
+    if matches!(name.as_ref(), Some(b"_HID" | b"_CID" | b"_CRS"))
+    {
+        d.dynamic = true;
     }
+    assert!(same(&[], &c, &d), "a Method taken against its name");
 }
 
 /// [`aml::qualify`] reports the device `c` when [`reported`] does, with its
@@ -598,29 +609,40 @@ fn walk(
                     out.push(d);
                 }
             }
-            Term::Name { .. } | Term::Method { .. } | Term::Skip { .. } =>
+            Term::Name {
+                name: Some(name),
+                value,
+                size,
+            } =>
+            {
+                if let (Some(d), Some(data)) = (
+                    dev.as_deref_mut(),
+                    value.checked_add(size).and_then(|e| bytes.get(..e)),
+                )
+                {
+                    for into in [Prior::Empty, Prior::Full]
+                    {
+                        record_holds(bytes, name, value, size, into);
+                    }
+                    record(data, d, name, value);
+                }
+            }
+            Term::Method { name, .. } =>
             {
                 if let Some(d) = dev.as_deref_mut()
                 {
-                    collect_holds(bytes, &term);
-                    if let Term::Name {
-                        name: Some(name),
-                        value,
-                        size,
-                    } = term
-                        && let Some(data) = value.checked_add(size).and_then(|e| bytes.get(..e))
+                    for into in [Prior::Empty, Prior::Full]
                     {
-                        record(data, d, name, value);
+                        method_holds(name, into);
                     }
-                    else if let Term::Method {
-                        name: Some(name), ..
-                    } = term
-                        && matches!(&name, b"_HID" | b"_CID" | b"_CRS")
+                    if matches!(name.as_ref(), Some(b"_HID" | b"_CID" | b"_CRS"))
                     {
                         d.dynamic = true;
                     }
                 }
             }
+            Term::Name { .. } | Term::Skip { .. } =>
+            {}
         }
         match term.end()
         {

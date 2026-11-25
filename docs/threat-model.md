@@ -411,21 +411,23 @@ is.
   `services/devmgr/firmware/fuzz/devmgr-firmware/seeds/`: the RSDP, an SDT header, the XSDT, the
   FADT, the MCFG, the MADT, the DMAR, the RIMT and the SPCR. CI's gating `fuzz` job runs it on a
   pull request whose change can affect it and the campaign for 30 minutes.
-- The `proofs` modules of `services/devmgr/firmware/src/acpi.rs`, `dmar.rs`, `rimt.rs` and
-  `platform.rs` prove the same property ([testing.md](testing.md) § Bounded verification); CI's
-  `kani` job runs them. The RSDP, an SDT header, the XSDT up to two entries, the FADT and the SPCR
-  are proven whole on any input up to their bounds; the MCFG, the MADT, the DMAR and the RIMT by
-  their steps: each table's end, an
-  MCFG entry, a MADT structure, a DMAR remapping structure and device scope, and a RIMT node and
-  ID mapping, at any place. The loops that drive the steps are left to the fuzz target.
+- The `proofs` modules of `services/devmgr/firmware/src/acpi.rs`,
+  `services/devmgr/firmware/src/dmar.rs`, `services/devmgr/firmware/src/rimt.rs` and
+  `services/devmgr/firmware/src/platform.rs` prove the same property ([testing.md](testing.md) §
+  Bounded verification); CI's `kani` job runs them. The RSDP, an SDT header, the XSDT up to two
+  entries, the FADT and the SPCR are proven whole on any input up to their bounds; the MCFG, the
+  MADT, the DMAR and the RIMT by their steps: each table's end, an MCFG entry, a MADT structure, a
+  DMAR remapping structure and device scope, and a RIMT node and ID mapping, at any place. The loops
+  that drive the steps are left to the fuzz target.
 
 **Gaps.**
 
 - The bundle header is unsigned, so the attacker can drop an entry, which fails the boot when it is
   needed ([signing.md](signing.md) § Which Stage Verifies What).
 - The bootloader's firmware-table parsers (`core/boot/src/acpi.rs` and `core/boot/src/dtb.rs`), and
-  the AML namespace walk and the Device Tree walk of devmgr's `firmware` crate (`aml.rs`,
-  `dtb.rs`), have no fuzz target or proof harness yet; they are planned
+  the AML namespace walk and the Device Tree walk of devmgr's `firmware` crate
+  (`services/devmgr/firmware/src/aml.rs`, `services/devmgr/firmware/src/dtb.rs`), have no fuzz
+  target or proof harness yet; they are planned
   ([#1535](https://github.com/kottlerg/seraph/issues/1535)).
 
 ---

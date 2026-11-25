@@ -137,8 +137,9 @@ skipping levels, risks deadlock.
    under it only try-locks each walked thread's `sched_lock` and,
    under that, the lock of the source the thread is bound to; the one lock it
    waits for under the registry lock is the console's `CONSOLE_LOCK`
-   (`kprintln_direct!`, which first writes the unread kernel log records
-   without a lock), a leaf no holder keeps across another acquisition, so that
+   (`kprintln_direct!`, which under it first writes the unread kernel log
+   records, reading the ring without its lock), a leaf no holder keeps across
+   another acquisition, so that
    wait is on no CPU that needs the registry (§ Softlockup Watchdog). See
    § Thread Registry.
 

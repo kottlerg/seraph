@@ -522,6 +522,9 @@ pub(super) unsafe extern "C" fn common_exception_handler(
 
     if is_userspace
     {
+        /// `#PF` error code's present bit (Intel SDM Vol 3 §4.7).
+        const ERR_PRESENT: u64 = 1 << 0;
+
         // SAFETY: current_tcb() returns this CPU's running thread; valid in
         // exception context because we entered from a running user thread.
         let tcb = unsafe { crate::syscall::current_tcb() };
@@ -541,7 +544,6 @@ pub(super) unsafe extern "C" fn common_exception_handler(
         // CR2 the present bit would tell which kernel VAs are mapped
         // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
         // diagnostics).
-        const ERR_PRESENT: u64 = 1 << 0;
         let err = if vector == 14 && cr2 >= crate::mm::user_va_top()
         {
             error_code & !ERR_PRESENT

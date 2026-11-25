@@ -244,6 +244,7 @@ pub(crate) fn start_worker(l: &mut MemLedger, self_cspace: u64, sched: u64) -> b
     };
     // A failure from here leaves the run memmgr's, out of circulation: the
     // Notification holds a reference on it.
+    l.add_own_pages(u64::from(taken));
     let Ok(thread) = syscall::cap_create_thread(
         outer,
         self_aspace(),

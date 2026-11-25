@@ -458,6 +458,20 @@ const VACANT: Slot = Slot {
     next: NODE_NULL,
 };
 
+/// The pages a slot holding `node` adds to [`Arena::frame_pages`]: a frame
+/// record's, none for any other payload.
+fn frame_pages_of(node: &Node) -> u64
+{
+    if let Node::Frame(f) = node
+    {
+        u64::from(f.page_count)
+    }
+    else
+    {
+        0
+    }
+}
+
 /// Backing storage for arena slots.
 pub trait SlotStore
 {
@@ -481,6 +495,9 @@ pub trait SlotStore
 /// [`Arena::alloc_reserved`] takes them, so a caller can keep slots for a
 /// path that must not fail while every other path sees the arena as full.
 ///
+/// Every write goes through [`Arena::set`], which keeps the pages of the
+/// frame records the arena holds ([`Arena::frame_pages`]).
+///
 /// Holds no global state, so several arenas (one per pool shard) can coexist.
 pub struct Arena<S>
 {
@@ -489,6 +506,8 @@ pub struct Arena<S>
     free_count: u64,
     carved: u64,
     reserve: u64,
+    /// The pages of every [`Node::Frame`] slot.
+    frame_pages: u64,
 }
 
 impl<S: SlotStore> Arena<S>
@@ -502,6 +521,7 @@ impl<S: SlotStore> Arena<S>
             free_count: 0,
             carved: 0,
             reserve: 0,
+            frame_pages: 0,
         }
     }
 
@@ -530,6 +550,15 @@ impl<S: SlotStore> Arena<S>
     pub const fn pages(&self) -> u64
     {
         self.carved / SLOTS_PER_PAGE
+    }
+
+    /// The pages of every [`Node::Frame`] slot: the frames the records of
+    /// processes and memory objects hold. Kept by [`Arena::set`], so reading
+    /// it walks nothing.
+    #[must_use]
+    pub const fn frame_pages(&self) -> u64
+    {
+        self.frame_pages
     }
 
     /// Slots on the free list.
@@ -640,8 +669,8 @@ impl<S: SlotStore> Arena<S>
         unsafe { self.store.read(idx) }
     }
 
-    /// Overwrite the slot at `idx`. An index the arena never carved is
-    /// ignored.
+    /// Overwrite the slot at `idx`, keeping [`Arena::frame_pages`]. An index
+    /// the arena never carved is ignored.
     pub fn set(&mut self, idx: NodeIdx, slot: Slot)
     {
         debug_assert!(idx < self.carved);
@@ -649,6 +678,13 @@ impl<S: SlotStore> Arena<S>
         {
             return;
         }
+        let old = frame_pages_of(&self.get(idx).node);
+        // Every page counted is a frame record's, so the old record's pages
+        // are in the count.
+        self.frame_pages = self
+            .frame_pages
+            .saturating_sub(old)
+            .saturating_add(frame_pages_of(&slot.node));
         // SAFETY: `idx < carved`, which `add_page`'s contract made valid.
         unsafe { self.store.write(idx, slot) };
     }
@@ -789,6 +825,40 @@ mod tests
         assert_eq!(arena.free_count(), 0);
         arena.free(taken[3]);
         assert_eq!(arena.alloc(Node::Free, NODE_NULL), Some(taken[3]));
+    }
+
+    /// A frame record of `pages` pages.
+    fn frame(pages: u32) -> Node
+    {
+        Node::Frame(FrameDesc {
+            cap_slot: 1,
+            page_count: pages,
+            phys_base: 0x1000,
+            va: 0,
+            region_id: 0,
+            charge: NODE_NULL,
+        })
+    }
+
+    #[test]
+    fn frame_pages_follows_every_write_of_a_frame_record()
+    {
+        let mut arena = Arena::new(VecStore::default());
+        // SAFETY: VecStore grows on write.
+        unsafe { arena.add_page() };
+        let a = arena.alloc(frame(3), NODE_NULL).unwrap();
+        let b = arena.alloc_reserved(frame(5), NODE_NULL).unwrap();
+        assert_eq!(arena.frame_pages(), 8);
+        // A record rewritten in place, then replaced by another payload.
+        arena.set_node(a, frame(2));
+        assert_eq!(arena.frame_pages(), 7);
+        arena.set_node(b, Node::Free);
+        assert_eq!(arena.frame_pages(), 2);
+        // A link change keeps the record's pages; a free drops them.
+        arena.set_next(a, b);
+        assert_eq!(arena.frame_pages(), 2);
+        arena.free(a);
+        assert_eq!(arena.frame_pages(), 0);
     }
 
     #[test]

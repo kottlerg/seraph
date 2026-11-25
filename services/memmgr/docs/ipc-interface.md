@@ -615,6 +615,8 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[17] | `uncommitted_free_bytes` — the free pages outside `promised`, which every admission but a commitment's reads and the pressure level is computed from: the lesser of `data[3]` plus `data[15]` less `data[8]`, and `data[3]`; `data[3]` less `data[8]` while `data[15]` is `0` ([`memory-pool.md`](memory-pool.md#commit) § Commit, Promised) |
 | data[18] | `committed_swapped_bytes` — the part of `data[8]` the evicted chunks of committed regions hold for their restores: the subset of `data[10]` in committed regions, which `promised` holds again once a chunk holds no frame of its own ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit); the rest of `data[8]` is the commitments' pages never backed or discarded and their page-table and metadata bounds |
 | data[19] | `cspace_used_slots` — the used slots of memmgr's own `CSpace` (`CAP_INFO_CSPACE_USED`), a count, not bytes: the caps memmgr holds, its free runs' and grants' among them, so a cap it kept by mistake raises it for good ([`memory-pool.md`](memory-pool.md#cspace-headroom) § CSpace headroom; § Capability Transfer) |
+| data[20] | `metadata_bytes` — subset of `pool_total_bytes` memmgr holds as its own metadata, charged to no node: its arena's pages, its process index's and its swap slot map's, the zero frames it keeps, and the pages it retyped into its own page tables, `CSpace` growth and eviction worker ([`memory-pool.md`](memory-pool.md#metadata-arena) § Metadata Arena); none goes back to the free runs but a zero frame a refused request took |
+| data[21] | `held_bytes` — subset of `pool_total_bytes` the frame records of processes and memory objects hold, each charged to a budget node: grants and page-table donations, the runs backing regions, a copy a make-private drew, and an object's frames; a run on the deferred list or in the store is not counted ([`memory-pool.md`](memory-pool.md#per-process-tracking) § Per-Process Tracking) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -666,7 +668,16 @@ once it holds no frame of its own, and back at its restore, and `data[18]`
 with it, so a caller asserting that a commitment was released compares
 `data[8] - data[18]`, the promised total net of eviction, beside the free
 total net of eviction.
-`data[3]` to `data[19]` are appended after the identity terms;
+
+The pages in no account are `data[2]` less `data[3]`, `data[4]`, `data[9]`,
+`metadata_bytes` (`data[20]`) and `held_bytes` (`data[21]`): every page of the
+pool is free, deferred, in the store, memmgr's metadata, held by a frame record,
+or in no account. memmgr keeps each page it owns in one of the five accounts, so
+the pages in no account do not rise while it loses none; a reader that finds
+them above an earlier read once eviction has settled (`data[9]` and `data[10]`
+zero) has found pages memmgr lost. Each of the five accounts is kept as a
+running sum, so the reply costs no walk.
+`data[3]` to `data[21]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`

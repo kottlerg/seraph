@@ -350,6 +350,12 @@ pub struct Ledger<S, W>
     /// slot `next` link; each kept for memmgr's life unless the request that
     /// took it is refused ([`Self::remove_zero_frame`]).
     zero_frames: NodeIdx,
+    /// The zero frames on that list, a page each.
+    zero_frame_count: u64,
+    /// Pool pages memmgr retyped into kernel objects of its own, which it
+    /// keeps for its life: its page tables, its `CSpace` growth and its
+    /// eviction worker ([`Self::add_own_pages`]).
+    own_pages: u64,
     /// The free spans of the zone memmgr maps its own read-only view of each
     /// memory object's frames in ([`MemObject::runs`]).
     object_va: ObjectVa,
@@ -388,6 +394,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             short_draw: false,
             evictions: 0,
             zero_frames: NODE_NULL,
+            zero_frame_count: 0,
+            own_pages: 0,
             object_va: ObjectVa::new(),
             retiring: NODE_NULL,
             pass: 0,
@@ -401,6 +409,41 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     pub const fn disk_pages(&self) -> u64
     {
         self.disk_pages
+    }
+
+    /// Pool pages the frame records of processes and memory objects hold
+    /// ([`Node::Frame`]): a process's grants and page-table donations, the
+    /// runs backing its regions, a copy a make-private drew, and an object's
+    /// frames. Each is charged to a budget node. A run on the deferred list or
+    /// in the store is not counted.
+    #[must_use]
+    pub const fn held_pages(&self) -> u64
+    {
+        self.arena.frame_pages()
+    }
+
+    /// Pool pages memmgr holds as its own metadata, charged to no node: the
+    /// arena's pages, the process index's, the swap slot map's, the zero
+    /// frames, and the pages retyped into its own kernel objects
+    /// ([`Self::add_own_pages`]). None goes back to the pool but a zero
+    /// frame a refused request took ([`Self::remove_zero_frame`]).
+    #[must_use]
+    pub const fn metadata_pages(&self) -> u64
+    {
+        self.arena
+            .pages()
+            .saturating_add(self.index.pages())
+            .saturating_add(self.slots.pages())
+            .saturating_add(self.zero_frame_count)
+            .saturating_add(self.own_pages)
+    }
+
+    /// Count `pages` pool pages memmgr retyped into a kernel object of its
+    /// own in [`Self::metadata_pages`]: a page-table or `CSpace` donation to
+    /// itself, or its eviction worker's thread and Notification.
+    pub const fn add_own_pages(&mut self, pages: u64)
+    {
+        self.own_pages = self.own_pages.saturating_add(pages);
     }
 
     /// Pool pages the compressed store holds, which count in `pool_total`
@@ -2335,6 +2378,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             .alloc(node, self.zero_frames)
             .ok_or(RegionError::NoSlot)?;
         self.zero_frames = idx;
+        self.zero_frame_count = self.zero_frame_count.saturating_add(1);
         Ok(idx)
     }
 
@@ -2365,6 +2409,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             }
         }
         self.arena.free(idx);
+        self.zero_frame_count = self.zero_frame_count.saturating_sub(1);
         Some(zero)
     }
 
@@ -6110,7 +6155,10 @@ mod tests
 
     /// The pool's pages wherever they are: free, in the store, in a run a
     /// record or a chunk holds, or deferred. Every page the tests take comes
-    /// from the pool, so this stays the pool's total. Checks `store_pages`
+    /// from the pool, so this stays the pool's total. Checks `held_pages`
+    /// against the frame records and the deferred list's count against its
+    /// runs, so the accounts `QUERY_POOL_STATUS` reports sum to the pool's
+    /// total, and checks `store_pages`
     /// against the store runs of every compressed chunk, `swapped_pages`
     /// against the pages of every swapped chunk, `raw_chunks` against the
     /// raw chunks waiting for a slot, and every node's evictable resident
@@ -6118,7 +6166,8 @@ mod tests
     fn pool_pages(l: &Ledger<VecStore, VecWords>) -> u64
     {
         check_resident(l);
-        let mut held = 0;
+        let mut frames = 0;
+        let mut deferred = 0;
         let mut store = 0;
         let mut swapped = 0;
         let mut raw = 0;
@@ -6126,8 +6175,8 @@ mod tests
         {
             match l.arena.get(idx).node
             {
-                Node::Frame(f) => held += u64::from(f.page_count),
-                Node::Deferred(d) => held += d.run.page_count,
+                Node::Frame(f) => frames += u64::from(f.page_count),
+                Node::Deferred(d) => deferred += d.run.page_count,
                 Node::Region(have) =>
                 {
                     swapped += swapped_in(l, &have);
@@ -6161,7 +6210,9 @@ mod tests
         assert_eq!(l.store_pages(), store);
         assert_eq!(l.swapped_pages(), swapped);
         assert_eq!(l.raw_chunks(), raw);
-        l.pool.free_pages() + store + held
+        assert_eq!(l.held_pages(), frames);
+        assert_eq!(l.deferred.pages(), deferred);
+        l.pool.free_pages() + store + frames + deferred
     }
 
     /// A store run of `pages` pages taken from the pool.
@@ -8954,6 +9005,21 @@ mod tests
     {
         let (cap, _, phys) = take(l, 1, crate::Fit::Contiguous);
         l.add_zero_frame(cap, phys).unwrap()
+    }
+
+    // The defect caught: a zero frame or a page memmgr retyped for itself
+    // missing from the metadata `QUERY_POOL_STATUS` reports, or a removed
+    // zero frame left in it, which the pool's accounts would then not sum.
+    #[test]
+    fn metadata_counts_each_zero_frame_while_kept_and_every_own_page()
+    {
+        let mut l = ledger_with_pool(16);
+        let base = l.metadata_pages();
+        let zero = new_zero_frame(&mut l);
+        l.add_own_pages(3);
+        assert_eq!(l.metadata_pages(), base + 4);
+        assert!(l.remove_zero_frame(zero).is_some());
+        assert_eq!(l.metadata_pages(), base + 3);
     }
 
     // The defect caught: a seal that loses the order of the grants, leaves a

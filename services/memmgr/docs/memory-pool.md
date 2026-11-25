@@ -472,7 +472,9 @@ most one deferred recheck per turn of the receive loop when a selection fails;
 see [Reclamation](#reclamation)), with no recursion into per-process
 accounting, and never breaks the identity. For a fault in a committed region,
 the pages a growth takes are drawn from the region's metadata bound
-([Commit](#commit)).
+([Commit](#commit)). `QUERY_POOL_STATUS` reports the metadata's pages, the arena's, the index's,
+the swap slot map's, the zero frames and the pages retyped into memmgr's own kernel objects, as
+`metadata_bytes` ([`ipc-interface.md`](ipc-interface.md) § Label 6).
 
 ---
 
@@ -1447,13 +1449,15 @@ cannot start the worker at boot it evicts nothing.
 
 **Accounting.** The identity `system_ram == kernel_reserved + pool_total` holds across eviction and
 restore, with `pool_total = free + deferred + Σ records + metadata + store`, where `store` is the
-pages the compressed store holds. The worker's thread and Notification are memmgr's metadata. A
-budget node stays charged for its evicted pages: a charge counts logical pages, resident and
-swapped. A raw chunk's runs stay in its record's terms until its write ends. `QUERY_POOL_STATUS`
-reports the store's size and the swapped pages' size, and `QUERY_MEMORY_USAGE` a process's resident
-and swapped pages apart ([`ipc-interface.md`](ipc-interface.md)). The swapped pages count every
-evicted chunk that holds no frame of its own: compressed, writing, on disk and lost, a raw chunk
-once its write ends ([Disk tier](#disk-tier)).
+pages the compressed store holds. `QUERY_POOL_STATUS` reports each term, the records' pages as
+`held_bytes` and the metadata's as `metadata_bytes`, so a page in none of them shows
+([`ipc-interface.md`](ipc-interface.md) § Label 6). The worker's thread and Notification are
+memmgr's metadata. A budget node stays charged for its evicted pages: a charge counts logical pages,
+resident and swapped. A raw chunk's runs stay in its record's terms until its write ends.
+`QUERY_POOL_STATUS` reports the store's size and the swapped pages' size, and `QUERY_MEMORY_USAGE` a
+process's resident and swapped pages apart ([`ipc-interface.md`](ipc-interface.md)). The swapped
+pages count every evicted chunk that holds no frame of its own: compressed, writing, on disk and
+lost, a raw chunk once its write ends ([Disk tier](#disk-tier)).
 
 *Debugger reads.** `SYS_THREAD_READ_MEM` fails on a page that is not present and does not ask the
 pager

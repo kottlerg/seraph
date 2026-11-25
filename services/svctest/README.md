@@ -121,7 +121,8 @@ services/svctest/
         ├── memory_objects.rs  # memmgr memory objects: seal refusal and charge, attach refusals,
         │                      #   shared and private attachments in svctest and a child, a
         │                      #   private write seen by no other attacher, a shared write kills
-        │                      #   its writer, release, the zero object
+        │                      #   its writer, release, the zero object; early in the run, a
+        │                      #   32,768-page object sealed, read back and released
         ├── object_io.rs       # OBJECT_READ, FILL_REGION and MARK_CHECKPOINT: an object's pages
         │                      #   read into a grant and filled into a demand region, the
         │                      #   refusals, no mark from svctest

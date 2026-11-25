@@ -1017,6 +1017,14 @@ pub fn run_all(ctx: &TestContext)
         "sysinfo::smt_sibling_range",
         sysinfo::smt_sibling_range(ctx)
     );
+    run_test!(
+        "sysinfo::idle_halts_rise_across_a_sleep",
+        sysinfo::idle_halts_rise_across_a_sleep(ctx)
+    );
+    run_test!(
+        "sysinfo::idle_halts_mark_per_thread_and_cpu",
+        sysinfo::idle_halts_mark_per_thread_and_cpu(ctx)
+    );
 
     // ── Entropy syscalls ──────────────────────────────────────────────────────
     run_test!(

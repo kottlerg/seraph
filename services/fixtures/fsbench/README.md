@@ -108,9 +108,9 @@ has the form
 
 ```text
 bench fsbench.read size=<bytes> path=<path> arch=<arch> cpus=<k> unit=cycles
-    n=<n> min=<v> p50=<v> p90=<v> p99=<v> max=<v>
+    n=<n> min=<v> p50=<v> p90=<v> p99=<v> max=<v> idle_halts=<n>
 bench fsbench.write size=<bytes> path=frame arch=<arch> cpus=<k> unit=cycles
-    n=<n> min=<v> p50=<v> p90=<v> p99=<v> max=<v>
+    n=<n> min=<v> p50=<v> p90=<v> p99=<v> max=<v> idle_halts=<n>
 ```
 
 Each line is one line, wrapped above for width only. The `open` case's line has the same form,
@@ -118,12 +118,15 @@ with `depth=3`, the path's component count, in place of the size and path:
 
 ```text
 bench fsbench.open depth=3 arch=<arch> cpus=<k> unit=cycles
-    n=<n> min=<v> p50=<v> p90=<v> p99=<v> max=<v>
+    n=<n> min=<v> p50=<v> p90=<v> p99=<v> max=<v> idle_halts=<n>
 ```
 
 Each `read` or `write` sample is one timed iteration, which covers all the `read` or
 `write_all` calls that one size needs, not a single call; each `open` sample is one
-`File::open`.
+`File::open`. `idle_halts=` is the halts of CPU 0 over the case's timed loop, marked after its
+warm-up and read after its last sample
+([shared/bench/README.md § Idle halts](../../../shared/bench/README.md#idle-halts)); a read that
+failed leaves it out.
 
 A failed pin, CPU-count read, open, fixture check, seek, read, create, write, write read-back, or
 removal of the scratch file, an `open` case walk of other than one `NS_LOOKUP`, or an `ITERS`

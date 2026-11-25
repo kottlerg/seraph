@@ -17,6 +17,13 @@
 //! attaches the zero object ([`zero_object`]): a read takes no page, a write
 //! takes its own pages and leaves the zero frame zero, and a shared
 //! attachment larger than the free pages is admitted, since it takes none.
+//!
+//! A phase of its own, early in the run ([`early`]), seals one grant
+//! spanning more leaf page tables than one map's page-table funding covers
+//! into an object ([`large_object`]), reads every page back from memmgr's
+//! own view of it, and releases it. It runs before the later phases leave
+//! the pool's free memory in runs too short for a grant that large at the
+//! default memory size.
 
 use std::os::seraph::{current_ipc_buf, startup_info};
 use std::time::{Duration, Instant};
@@ -26,7 +33,7 @@ use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE};
 
 use crate::bootstrap::Caps;
 use crate::phases::heap_commit::{CHUNK_PAGES, expect_region_reply, own_usage, pool_totals};
-use crate::phases::memmgr::{recheck_deferred, try_request_contiguous};
+use crate::phases::memmgr::{recheck_deferred, release_grant, try_request_contiguous};
 use crate::runner::Phase;
 
 pub fn phases() -> &'static [Phase]
@@ -34,6 +41,16 @@ pub fn phases() -> &'static [Phase]
     &[Phase {
         name: "memmgr_memory_objects",
         run: memory_objects_phase,
+    }]
+}
+
+/// The phase that seals one large grant ([`large_object`]), registered
+/// right after memmgr's own phases (`phases::all`, ordering constraint 17).
+pub fn early() -> &'static [Phase]
+{
+    &[Phase {
+        name: "memmgr_large_object",
+        run: large_object_phase,
     }]
 }
 
@@ -107,6 +124,18 @@ const ZERO_PAGES: u64 = 16 * CHUNK_PAGES;
 /// child's mapping still reached waits on memmgr's deferred list until
 /// procmgr's teardown of the child ends.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Pages one leaf page table maps: 2 MiB of 4 KiB pages under every paging
+/// mode of both architectures.
+const LEAF_TABLE_PAGES: u32 = 512;
+/// Pages of the object [`large_object`] seals, one grant of 64 leaf tables
+/// (128 MiB). memmgr's own view of it needs a page table for each, more than
+/// the `PT_FUND_ROUNDS` top-ups of one map (16 pages at most) and what
+/// memmgr's page-table pool holds this early in the run fund together, so
+/// memmgr maps the view only because that bound holds per leaf-table window
+/// of the map, not per map (services/memmgr/docs/memory-pool.md § Metadata
+/// Arena).
+const LARGE_PAGES: u32 = 64 * LEAF_TABLE_PAGES;
 
 /// The last `u64` word of a page.
 pub(super) const LAST_WORD: u64 = PAGE_WORDS - 1;
@@ -261,6 +290,12 @@ fn memory_objects_phase(_: &Caps)
     zero_object();
     run_limited_child();
     std::os::seraph::log!("memmgr_memory_objects phase passed");
+}
+
+fn large_object_phase(_: &Caps)
+{
+    large_object();
+    std::os::seraph::log!("memmgr_large_object phase passed");
 }
 
 /// Fill a two-page and a one-page grant with the pattern of object pages 0
@@ -1000,4 +1035,192 @@ fn zero_object()
         pages,
         "UNREGISTER_REGION of the large zero-object attachment",
     );
+}
+
+/// Write the pattern of object pages `0..pages` at `va` in the first and the
+/// last word of each page, the words [`holds_pattern`] reads.
+fn mark(va: u64, pages: u64)
+{
+    for p in 0..pages
+    {
+        for w in [0, LAST_WORD]
+        {
+            let at = page_at(va, p).wrapping_add(w.wrapping_mul(8));
+            // SAFETY: the caller maps `pages` writable pages at `va`, which no
+            // Rust reference points into.
+            unsafe { std::ptr::write_volatile(at as *mut u64, pattern(p, w)) };
+        }
+    }
+}
+
+/// Request one contiguous grant of `pages` pages: `(grant cap, region id)`.
+/// A refusal panics with memmgr's error label and the pool's free total,
+/// free-run count and largest free run the reply carries, in pages.
+fn request_large(pages: u32) -> (u64, u64)
+{
+    let want = u64::from(pages) | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
+    let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
+        .word(0, want)
+        .build();
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(startup_info().memmgr_endpoint, &req, current_ipc_buf()) }
+        .unwrap_or_else(|e| panic!("memory_objects: REQUEST_MEMORY_CAPS ipc_call failed: {e:?}"));
+    assert!(
+        reply.label == memmgr_errors::SUCCESS,
+        "memory_objects: {pages}-page grant status {:#x} (free {}, runs {}, largest run {})",
+        reply.label,
+        reply.word(0),
+        reply.word(1),
+        reply.word(2),
+    );
+    let grant = *reply
+        .caps()
+        .first()
+        .expect("memory_objects: REQUEST_MEMORY_CAPS returned no cap");
+    // One cap: data[1] is its page count, data[2] its region id.
+    (grant, reply.word(2))
+}
+
+/// Seal one contiguous grant of [`LARGE_PAGES`], marked with the pattern,
+/// into an object: memmgr takes a span of its object zone 64 leaf tables long
+/// for its own view of the grant, most of them new this early in the run,
+/// and maps the view one leaf-table window at a time, funding each window's
+/// page tables. Every page
+/// of the object then reads back through `OBJECT_READ`, which copies from
+/// that view ([`read_back`]), and once the object is released its frames
+/// leave svctest's charge.
+fn large_object()
+{
+    let pages = u64::from(LARGE_PAGES);
+    let (grant, id) = request_large(LARGE_PAGES);
+    let aspace = startup_info().self_aspace;
+    let range = reserve(pages);
+    let va = range.va_start();
+    // SAFETY: `range` is a fresh reservation owned here, VA no Rust object
+    // occupies.
+    unsafe {
+        std::os::seraph::mem_map_funded(grant, aspace, va, 0, pages, MAP_READ | MAP_WRITABLE)
+    }
+    .expect("memory_objects: mapping the large grant failed");
+    mark(va, pages);
+    // SAFETY: the grant's pages, mapped above; no reference points into them.
+    unsafe { syscall::mem_unmap(aspace, va, pages) }
+        .expect("memory_objects: unmapping the large grant failed");
+    std::os::seraph::unreserve_pages(range);
+
+    let before = own_usage();
+    let seal = IpcMessage::builder(memmgr_labels::SEAL_OBJECT)
+        .word(0, 1)
+        .word(1, id)
+        .cap(grant)
+        .build();
+    let reply = call(
+        startup_info().memmgr_endpoint,
+        &seal,
+        "SEAL_OBJECT of the large grant",
+    );
+    assert_eq!(
+        (reply.label, reply.word(0)),
+        (memmgr_errors::SUCCESS, pages),
+        "memory_objects: SEAL_OBJECT of a {pages}-page grant replied {:#x}, {} pages",
+        reply.label,
+        reply.word(0)
+    );
+    let handle = *reply
+        .caps()
+        .first()
+        .expect("memory_objects: SEAL_OBJECT of the large grant replied no handle");
+    read_back(handle, pages);
+
+    let got = call(
+        handle,
+        &IpcMessage::new(memmgr_labels::OBJECT_RELEASE),
+        "OBJECT_RELEASE of the large object",
+    )
+    .label;
+    assert_eq!(
+        got,
+        memmgr_errors::SUCCESS,
+        "memory_objects: OBJECT_RELEASE of the large object replied {got:#x}"
+    );
+    let _ = syscall::cap_delete(handle);
+    let want = before.saturating_sub(pages);
+    let start = Instant::now();
+    loop
+    {
+        recheck_deferred();
+        let own = own_usage();
+        if own <= want
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < RELEASE_TIMEOUT,
+            "memory_objects: svctest's usage is {own} pages {RELEASE_TIMEOUT:?} after the large \
+             object's release, from {before}; its frames should have left {want}"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// Read each of the `pages` pages of the object `handle` names through
+/// `OBJECT_READ`, `OBJECT_READ_PAGES` at a time, into a grant svctest maps,
+/// and check that each holds the pattern [`mark`] wrote.
+fn read_back(handle: u64, pages: u64)
+{
+    let step = memmgr_labels::OBJECT_READ_PAGES;
+    let step_u32 = u32::try_from(step).expect("memory_objects: OBJECT_READ_PAGES fits a u32");
+    let (dst, id) = try_request_contiguous(step_u32)
+        .unwrap_or_else(|l| panic!("memory_objects: {step}-page grant status {l:#x}"));
+    let aspace = startup_info().self_aspace;
+    let range = reserve(step);
+    let va = range.va_start();
+    // SAFETY: `range` is a fresh reservation owned here, VA no Rust object
+    // occupies.
+    unsafe { std::os::seraph::mem_map_funded(dst, aspace, va, 0, step, MAP_READ) }
+        .expect("memory_objects: mapping the read-back grant failed");
+    let stride = usize::try_from(step).expect("memory_objects: OBJECT_READ_PAGES fits a usize");
+    for first in (0..pages).step_by(stride)
+    {
+        let copy = syscall::cap_derive(dst, syscall::RIGHTS_MEM_MAP_RW)
+            .expect("memory_objects: copying the read-back grant");
+        let msg = IpcMessage::builder(memmgr_labels::OBJECT_READ)
+            .word(0, first)
+            .word(1, 0)
+            .word(2, step)
+            .cap(handle_copy(handle))
+            .cap(copy)
+            .build();
+        let reply = call(
+            startup_info().memmgr_endpoint,
+            &msg,
+            "OBJECT_READ of the large object",
+        );
+        assert_eq!(
+            (reply.label, reply.word(0)),
+            (memmgr_errors::SUCCESS, step),
+            "memory_objects: OBJECT_READ of large-object pages from {first} replied {:#x}, {} \
+             pages copied",
+            reply.label,
+            reply.word(0)
+        );
+        // `OBJECT_READ` wrote page `p` of the grant from object page
+        // `first + p`.
+        let wrong = (0..step).find(|&p| {
+            let page = page_at(va, p);
+            let object_page = first.wrapping_add(p);
+            read_word(page, 0) != pattern(object_page, 0)
+                || read_word(page, LAST_WORD) != pattern(object_page, LAST_WORD)
+        });
+        assert!(
+            wrong.is_none(),
+            "memory_objects: large-object page {} read back other than the pattern",
+            first.wrapping_add(wrong.unwrap_or(0))
+        );
+    }
+    // SAFETY: the grant's pages, mapped above; no reference points into them.
+    unsafe { syscall::mem_unmap(aspace, va, step) }
+        .expect("memory_objects: unmapping the read-back grant failed");
+    std::os::seraph::unreserve_pages(range);
+    release_grant(dst, id);
 }

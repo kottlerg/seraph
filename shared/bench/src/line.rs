@@ -34,6 +34,11 @@ use crate::stats::Summary;
 /// The token every result line starts with.
 pub const TAG: &str = "bench";
 
+/// The extra that counts the halts of the measuring CPU's idle thread over a
+/// line's measured loop (README.md § Idle halts). A gated measurement whose
+/// line reports a halt, or none of this extra, fails `bench-check`.
+pub const IDLE_HALTS: &str = "idle_halts";
+
 /// The keys of the fixed columns, in line order. No variant parameter or
 /// extra may take one.
 pub const RESERVED_KEYS: [&str; 9] = [

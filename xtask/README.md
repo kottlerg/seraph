@@ -1936,10 +1936,16 @@ compared with its baseline's p50 and given a verdict: `ok` within its band, `REG
 `IMPROVED` past it, `NEW` with no baseline, `MISSING` with a baseline no log measured,
 `PARTIAL` when some of the logs at its CPU count that report its suite lack it (a log of another
 boot, which reports other suites, is not expected to carry it), `UNIT` when its unit is not its
-baseline's, `NO-BAND` in host mode when `BANDS` has no line for it. The report is a table of
-every measurement, its verdict, whether it gates, its baseline, its lowest p50, the change, and
-its band, then one `FAIL:` line per gating measurement whose verdict is not `ok`, with its remedy,
-then a `WARNING:` line per key of the stored `ENV` whose value differs here.
+baseline's, `NO-BAND` in host mode when `BANDS` has no line for it. Each is also given the halts
+of its measuring CPU over its measured loops, its lines' `idle_halts=` summed over the logs, or
+none when a line lacks the extra
+([shared/bench/README.md § Idle halts](../shared/bench/README.md#idle-halts)). The report is a
+table of every measurement, its verdict, whether it gates, its baseline, its lowest p50, the
+change, its band and its halts (`idle`, `-` for none), then one `FAIL:` line per gating
+measurement whose verdict is not `ok`, with its remedy, one per gating measurement whose loops
+idled, naming the halts and the runs that saw them (each by its place among the logs given), or
+whose lines lack the count, then a
+`WARNING:` line per key of the stored `ENV` whose value differs here.
 
 - **icount.** The band is the larger of 1% of the baseline (rounded up) and 8 instructions. A
   one-CPU measurement gates; a measurement at more CPUs is reported only, since the interleaving
@@ -1950,9 +1956,12 @@ then a `WARNING:` line per key of the stored `ENV` whose value differs here.
   `fsbench.read` gates, since its untimed warm-up fills the filesystem's page cache and no timed
   read waits on the disk; a benchmark whose timed samples idle, on a device, a timer or any other
   event, joins the set. The command fails when a gating measurement's verdict is not `ok` (an
-  `IMPROVED` count included: its stale baseline would pass a later regression of the same size) or
-  a benchmark logged a `FAIL` line: ktest's `ktest: bench <name> FAIL`, or a userspace suite's
-  `[<suite>] bench <name> FAIL`.
+  `IMPROVED` count included: its stale baseline would pass a later regression of the same size),
+  when a gating measurement's CPU halted in its measured loop in any log, or a line of it lacks
+  `idle_halts=`, whatever its verdict, since a window that idled counted host time, or when a
+  benchmark logged a `FAIL` line: ktest's `ktest: bench <name> FAIL`, or a userspace suite's
+  `[<suite>] bench <name> FAIL`. The halts of a measurement that does not gate are reported
+  only.
 - **host.** Each measurement's band is its line in `BANDS`, a percentage of its baseline,
   calibrated on the reference host (`<suite>.<name> [<variant> ...] cpus=<k> band=<percent>`).
   Nothing gates: the command reports and succeeds.
@@ -1985,10 +1994,11 @@ cargo xtask bench-baseline --host [--all] [--baselines DIR] LOG...
 | `--all` | off | Rewrite every baseline file of the mode and architecture, and its `ENV` |
 | `--baselines` | `xtask/baselines/bench` | The baselines root |
 
-The logs are read as `bench-check` reads them, and must be complete: a benchmark's `FAIL` line or a
-`PARTIAL` measurement refuses the rewrite. Without `--all`, a benchmark's file is rewritten when
-one of its measurements has no baseline or is no longer measured, or one of its gating
-measurements (in host mode, any of them) is past its band, and is removed when none of its
+The logs are read as `bench-check` reads them, and must be complete: a benchmark's `FAIL` line, a
+`PARTIAL` measurement, or a gating measurement whose loops idled or whose lines lack `idle_halts=`
+refuses the rewrite, since a baseline records no host time. Without `--all`, a benchmark's file
+is rewritten when one of its measurements has no baseline or is no longer measured, or one of its
+gating measurements (in host mode, any of them) is past its band, and is removed when none of its
 measurements remains; each rewritten file holds every measurement of its benchmark at its lowest
 p50. The files of a suite the logs measure nothing of are left as they are, with or without
 `--all`: that suite's boot did not run, as in a `bench` cell whose change owed no ktest boot.

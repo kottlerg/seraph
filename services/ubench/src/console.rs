@@ -16,7 +16,7 @@
 use bench::{Counters, Value};
 use ipc::{IpcMessage, fb_errors, fb_labels};
 
-use crate::harness::{Outcome, report, skip};
+use crate::harness::{IdleSpan, Outcome, report, skip};
 
 /// The most payload bytes one `FB_WRITE_BYTES` call carries (label bits
 /// 16 to 31).
@@ -73,6 +73,7 @@ pub fn run(fb_class: u64, counters: &Counters, cpus: u32) -> Outcome
             .get(..bytes)
             .ok_or_else(|| format!("bytes={bytes} exceeds the text"))?;
         samples.clear();
+        let idle = IdleSpan::open();
         for i in 0..WARMUP + ITERS
         {
             let start = counters.read();
@@ -84,12 +85,14 @@ pub fn run(fb_class: u64, counters: &Counters, cpus: u32) -> Outcome
                 samples.push(cycles);
             }
         }
+        let idle_halts = idle.close();
         report(
             "console_write",
             &[("bytes", Value::Num(bytes as u64))],
             cpus,
             &mut samples,
             &[],
+            idle_halts,
         )?;
     }
     Ok(())

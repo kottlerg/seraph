@@ -23,7 +23,7 @@ use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
 use virtio_blk::{Geometry, IoOutcome, PartitionTable, RequestTiming};
 use virtio_core::bootstrap::{DeliveredDevice, DeviceInterrupt};
-use virtio_core::pci::PciTransport;
+use virtio_core::pci::{ConfigError, PciTransport};
 use virtio_core::virtqueue::{self, SplitVirtqueue};
 use virtio_core::{
     RegisterLayout, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK,
@@ -319,7 +319,8 @@ fn init_device(transport: &PciTransport) -> Geometry
     };
 
     // Both fields lie in the device configuration region the device reports;
-    // a region too short for one is refused, never read past.
+    // a region too short for one is refused, never read past, and the 64-bit
+    // capacity is read whole or not at all.
     let config = || {
         let blk_size = if features & virtio_blk::VIRTIO_BLK_F_BLK_SIZE == 0
         {
@@ -329,13 +330,16 @@ fn init_device(transport: &PciTransport) -> Geometry
         {
             Some(transport.config_read_u32(virtio_blk::CONFIG_BLK_SIZE_OFFSET)?)
         };
-        Some((transport.config_read_u64(0)?, blk_size))
+        Ok::<_, ConfigError>((transport.config_read_u64(0)?, blk_size))
     };
-    let Some((capacity, blk_size)) = config()
-    else
+    let (capacity, blk_size) = match config()
     {
-        std::os::seraph::log!(error: "device configuration region too short for the geometry");
-        syscall::thread_exit();
+        Ok(fields) => fields,
+        Err(e) =>
+        {
+            std::os::seraph::log!(error: "device geometry unreadable: {}", e.describe());
+            syscall::thread_exit();
+        }
     };
     let Some(geometry) = Geometry::new(capacity, blk_size)
     else

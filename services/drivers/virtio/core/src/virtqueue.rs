@@ -20,12 +20,22 @@ pub const MAX_QUEUE_SIZE: u16 = 32768;
 
 /// A used-ring completion [`SplitVirtqueue::poll_used`] refused.
 ///
-/// The used ring is device-written memory, so its contents are external
-/// input. A refused element is consumed (the next poll moves past it) and
-/// frees no descriptor: the free list stays as the driver last left it.
+/// The used ring is device-written memory, so its index and its elements are
+/// external input. A refused element is consumed (the next poll moves past
+/// it) and frees no descriptor: the free list and every outstanding chain
+/// stay as the driver last left them, so a chain whose completion was refused
+/// is still outstanding and a later completion of it is taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VirtqueueError
 {
+    /// The used index publishes more elements than the driver has chains
+    /// outstanding: it jumped past what the device can have completed, or it
+    /// moved back. Every element it published is consumed unread.
+    IndexPastOutstanding
+    {
+        /// The `idx` field the device wrote.
+        used_idx: u16,
+    },
     /// The element's `id` names no chain the driver has outstanding: it is
     /// outside the descriptor table, or it indexes a free descriptor or a
     /// non-head descriptor of a chain.
@@ -95,10 +105,15 @@ pub struct VirtqUsed
 /// consumption. All ring memory is provided by the caller as raw pointers
 /// to DMA-capable pages.
 ///
-/// The bookkeeping (the free list, each chain's links and length) lives in
-/// driver memory. The device-visible descriptor table is only written, never
-/// read back, so nothing the device writes into it can steer which
-/// descriptors are allocated or freed.
+/// The queue is a shell over its bookkeeping, `Chains`, which lives in
+/// driver memory and makes every decision: which descriptors a chain takes,
+/// where it is published, and whether a used element completes it. The shell
+/// writes the descriptor table, the available ring and its index without
+/// reading them back, so nothing the device writes into them can steer which
+/// descriptors are allocated or freed or where a chain is published; and it
+/// reads each device-written field of the used ring once, handing the copy
+/// to the bookkeeping's decode (`Chains::take_used`), so the value checked is
+/// the value used.
 pub struct SplitVirtqueue
 {
     /// Virtual address of the descriptor table.
@@ -107,33 +122,8 @@ pub struct SplitVirtqueue
     avail_va: *mut VirtqAvail,
     /// Virtual address of the used ring.
     used_va: *mut VirtqUsed,
-    /// Queue size (number of descriptors).
-    queue_size: u16,
-    /// `queue_size - 1`: a ring index masked with it is the index modulo
-    /// the queue size, since a split ring's size is a power of two.
-    ring_mask: u16,
-    /// Next free descriptor index for allocation; below `queue_size`
-    /// whenever `num_free > 0`.
-    free_head: u16,
-    /// Number of free descriptors.
-    num_free: u16,
-    /// Last seen used ring index (for polling completions). A free-running
-    /// `u16` like the ring's own `idx` (`VirtIO` 1.2 §2.7.8); it wraps by spec,
-    /// and its ring slot (masked with `ring_mask`) stays exact because a split
-    /// ring's size is a power of two.
-    last_used_idx: u16,
-    /// Descriptor count of the chain each outstanding head starts, indexed
-    /// by head; 0 marks an index that heads no outstanding chain.
-    /// [`poll_used`](Self::poll_used) checks a device-written `id` against it.
-    chain_len: Vec<u16>,
-    /// Driver-private link of each descriptor, indexed by descriptor: the
-    /// next free descriptor while it is free, the next descriptor of its
-    /// chain while it is outstanding. Every value stored is below
-    /// `queue_size` except the free list's terminator (`queue_size`), which
-    /// is never followed: `num_free` stops `alloc_desc` at the free list's
-    /// end, and `chain_len` stops `free_chain` at a chain's tail, whose link
-    /// may still hold the terminator or a stale free-list link.
-    links: Vec<u16>,
+    /// The driver-private bookkeeping.
+    pub(crate) chains: Chains,
 }
 
 impl SplitVirtqueue
@@ -166,6 +156,233 @@ impl SplitVirtqueue
         queue_size: u16,
     ) -> Option<Self>
     {
+        Some(Self {
+            desc_va,
+            avail_va,
+            used_va,
+            chains: Chains::new(queue_size)?,
+        })
+    }
+
+    /// Submit a descriptor chain to the available ring.
+    ///
+    /// `bufs` is a slice of (`device_addr`, `length`, `device_writable`) tuples.
+    /// Returns the head descriptor index for tracking completion, or `None`
+    /// if `bufs` is empty or longer than the number of free descriptors;
+    /// a refused chain allocates nothing.
+    pub fn add_chain(&mut self, bufs: &[(u64, u32, bool)]) -> Option<u16>
+    {
+        // The bookkeeping records the chain before the shell publishes it, so
+        // no published chain is unrecorded.
+        let reserved = self.chains.reserve(bufs)?;
+        let mut descs = self.chains.chain(reserved.head).zip(bufs).peekable();
+        while let Some((idx, &(addr, len, writable))) = descs.next()
+        {
+            let next = descs.peek().map(|&(next, _)| next);
+            let write_flag = if writable { VRING_DESC_F_WRITE } else { 0 };
+            let next_flag = if next.is_some() { VRING_DESC_F_NEXT } else { 0 };
+            // SAFETY: idx is a descriptor of a chain the bookkeeping recorded,
+            // so below queue_size (the invariant `Chains` keeps), and the
+            // offset stays inside the descriptor table.
+            let desc = unsafe { self.desc_va.add(usize::from(idx)) };
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every write is to a field of descriptor `desc`, which lies inside the \
+                          descriptor table `new`'s contract keeps valid"
+            )]
+            // SAFETY: `desc` lies inside the DMA descriptor table, which `new`'s
+            // contract keeps valid, aligned and writable for the queue's
+            // lifetime. Volatile: prevents dead-store elimination and ensures
+            // the device sees writes in order.
+            unsafe {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).addr), addr);
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).len), len);
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!((*desc).flags),
+                    write_flag | next_flag,
+                );
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).next), next.unwrap_or(0));
+            }
+        }
+
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "VirtqAvail is 2-byte aligned; offset 4 from a 2-byte-aligned base \
+                      maintains u16 alignment"
+        )]
+        // SAFETY: the ring entries start 4 bytes past the available ring's
+        // header, inside the `4 + 2 * queue_size` bytes `new`'s contract names.
+        let ring_base = unsafe { self.avail_va.cast::<u8>().add(4) }.cast::<u16>();
+        // SAFETY: the slot is the published index masked with ring_mask, so
+        // below queue_size, and the entry lies inside the ring's `queue_size`
+        // entries.
+        let ring_entry = unsafe { ring_base.add(usize::from(reserved.slot)) };
+        // SAFETY: `ring_entry` lies inside the valid, writable available ring.
+        unsafe { core::ptr::write_volatile(ring_entry, reserved.head) };
+
+        // Memory barrier: ensure descriptor writes are visible before
+        // updating the available index.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+
+        // SAFETY: `idx` is a field of the available ring header, which `new`'s
+        // contract keeps valid and writable; no reference is formed.
+        let avail_idx_ptr = unsafe { core::ptr::addr_of_mut!((*self.avail_va).idx) };
+        // SAFETY: `avail_idx_ptr` points into the valid, aligned, writable
+        // available ring. The index is the bookkeeping's own: the shared copy
+        // is never read back.
+        unsafe { core::ptr::write_volatile(avail_idx_ptr, reserved.avail_idx) };
+
+        Some(reserved.head)
+    }
+
+    /// Consume the next completion from the used ring, if one is present,
+    /// and return its chain's descriptors to the free list.
+    ///
+    /// Returns `Ok(Some((head, bytes_written)))` for a completion of an
+    /// outstanding chain, `bytes_written` the element's `len` clamped to the
+    /// bytes its device-writable buffers hold, and `Ok(None)` when the device
+    /// has published no new used entry.
+    ///
+    /// The used ring's index is read once, and an element's `id` and `len`
+    /// once each, only when the element is consumed; the decode
+    /// (`Chains::take_used`) judges those copies, and they are what the call
+    /// returns.
+    ///
+    /// # Errors
+    ///
+    /// The used ring is device-written, so its index and each element are
+    /// validated before any descriptor is freed; a refusal frees nothing
+    /// ([`VirtqueueError`] names each).
+    pub fn poll_used(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError>
+    {
+        let used_va = self.used_va;
+        // SAFETY: `idx` is a field of the used ring header, which `new`'s
+        // contract keeps valid; no reference is formed.
+        let used_idx_ptr = unsafe { core::ptr::addr_of!((*used_va).idx) };
+        // SAFETY: `used_idx_ptr` points into the valid, aligned used ring.
+        let used_idx = unsafe { core::ptr::read_volatile(used_idx_ptr) };
+
+        self.chains.take_used(used_idx, |slot| {
+            // VirtIO 1.2 §2.7.13.2: device publishes data buffer, status, ring
+            // elem, then used.idx with release ordering. The acquire fence here
+            // gives the used.idx load above acquire semantics so subsequent
+            // loads of the elem and the caller-visible data/status cannot hoist
+            // above it on RVWMO.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "`new`'s contract aligns the used ring to `VirtqUsedElem`'s 4 bytes, and \
+                          offset 4 from a 4-byte-aligned base keeps that alignment"
+            )]
+            // SAFETY: the ring elements start 4 bytes past the used ring's header,
+            // inside the `4 + 8 * queue_size` bytes `new`'s contract names.
+            let ring_base = unsafe { used_va.cast::<u8>().add(4) }.cast::<VirtqUsedElem>();
+            // SAFETY: take_used passes a slot below queue_size, so the element
+            // lies inside the ring's `queue_size` elements.
+            let ring_elem = unsafe { ring_base.add(usize::from(slot)) };
+            // Each field is read on its own, at the 32-bit width `VirtIO` 1.2
+            // §2.7.8 gives it.
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every read is of a field of used element `ring_elem`, which lies inside \
+                          the used ring `new`'s contract keeps valid"
+            )]
+            // SAFETY: `ring_elem` lies inside the valid used ring, 4-byte aligned:
+            // `new`'s contract aligns the ring to 4 bytes, and the elements start
+            // 4 bytes past it, 8 bytes apart; each field is a 4-byte-aligned `u32`
+            // of it. No reference is formed.
+            unsafe {
+                VirtqUsedElem {
+                    id: core::ptr::read_volatile(&raw const (*ring_elem).id),
+                    len: core::ptr::read_volatile(&raw const (*ring_elem).len),
+                }
+            }
+        })
+    }
+
+    /// Return the queue size.
+    #[must_use]
+    pub fn queue_size(&self) -> u16
+    {
+        self.chains.queue_size
+    }
+}
+
+/// The driver-private bookkeeping of a split virtqueue, which makes every
+/// decision the queue makes: the free list, the outstanding chains, and the
+/// two ring indices. It reads no device-shared memory: the device-written
+/// values it decodes are handed to it ([`Chains::take_used`]).
+///
+/// Invariant, which every step keeps (the `proofs` module proves it, and the
+/// property checks it after each operation, `crate::property`): the free
+/// list (`num_free` descriptors from `free_head` along `links`) and the
+/// outstanding chains (from each head with a non-zero `chain_len`, that many
+/// descriptors along `links`) visit every descriptor below `queue_size`
+/// exactly once between them; `outstanding` counts the chains; and an index
+/// that heads no chain has `writable` 0.
+#[cfg_attr(any(test, kani, fuzzing), derive(Clone, Debug))]
+pub(crate) struct Chains
+{
+    /// Queue size (number of descriptors), a power of two.
+    pub(crate) queue_size: u16,
+    /// `queue_size - 1`: a ring index masked with it is the index modulo
+    /// the queue size, since a split ring's size is a power of two.
+    pub(crate) ring_mask: u16,
+    /// Next free descriptor index for allocation; below `queue_size`
+    /// whenever `num_free > 0`.
+    pub(crate) free_head: u16,
+    /// Number of free descriptors.
+    pub(crate) num_free: u16,
+    /// Number of outstanding chains: submitted and not yet freed by a
+    /// completion. At most `queue_size`, since each holds a descriptor.
+    pub(crate) outstanding: u16,
+    /// The available ring's index as the driver last published it. A
+    /// free-running `u16` like the ring's own (`VirtIO` 1.2 §2.7.6), kept
+    /// here so the driver never reads back the copy the device can write.
+    pub(crate) avail_idx: u16,
+    /// Last used ring index consumed. A free-running `u16` like the ring's
+    /// own `idx` (`VirtIO` 1.2 §2.7.8); it wraps by spec, and its ring slot
+    /// (masked with `ring_mask`) stays exact because a split ring's size is a
+    /// power of two.
+    pub(crate) last_used_idx: u16,
+    /// Descriptor count of the chain each outstanding head starts, indexed
+    /// by head; 0 marks an index that heads no outstanding chain.
+    pub(crate) chain_len: Vec<u16>,
+    /// Bytes the device-writable descriptors of the chain each outstanding
+    /// head starts hold, indexed by head, saturating at `u32::MAX`: a used
+    /// element's `len` is a `u32`, so a saturated total still bounds it.
+    pub(crate) writable: Vec<u32>,
+    /// Driver-private link of each descriptor, indexed by descriptor: the
+    /// next free descriptor while it is free, the next descriptor of its
+    /// chain while it is outstanding. Every value stored is below
+    /// `queue_size` except the free list's terminator (`queue_size`), which
+    /// is never followed: `num_free` stops `alloc_desc` at the free list's
+    /// end, and `chain_len` stops `free_chain` at a chain's tail, whose link
+    /// may still hold the terminator or a stale free-list link.
+    pub(crate) links: Vec<u16>,
+}
+
+/// A chain [`Chains::reserve`] recorded, and where the shell publishes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Reserved
+{
+    /// The chain's head descriptor.
+    pub(crate) head: u16,
+    /// The available-ring slot that takes the head.
+    pub(crate) slot: u16,
+    /// The available index that publishes it.
+    pub(crate) avail_idx: u16,
+}
+
+impl Chains
+{
+    /// The bookkeeping of a queue of `queue_size` descriptors, every one
+    /// free and both ring indices at 0. `None` when `queue_size` is 0, not
+    /// a power of two, or past [`MAX_QUEUE_SIZE`], or when the heap cannot
+    /// hold the bookkeeping.
+    pub(crate) fn new(queue_size: u16) -> Option<Self>
+    {
         if !queue_size.is_power_of_two() || queue_size > MAX_QUEUE_SIZE
         {
             return None;
@@ -178,21 +395,24 @@ impl SplitVirtqueue
         let size = usize::from(queue_size);
         let mut links: Vec<u16> = Vec::new();
         let mut chain_len: Vec<u16> = Vec::new();
+        let mut writable: Vec<u32> = Vec::new();
         links.try_reserve_exact(size).ok()?;
         chain_len.try_reserve_exact(size).ok()?;
+        writable.try_reserve_exact(size).ok()?;
         links.extend(1..=queue_size);
         chain_len.resize(size, 0);
+        writable.resize(size, 0);
 
         Some(Self {
-            desc_va,
-            avail_va,
-            used_va,
             queue_size,
             ring_mask,
             free_head: 0,
             num_free: queue_size,
+            outstanding: 0,
+            avail_idx: 0,
             last_used_idx: 0,
             chain_len,
+            writable,
             links,
         })
     }
@@ -226,13 +446,13 @@ impl SplitVirtqueue
         self.num_free = self.num_free.saturating_add(1);
     }
 
-    /// Submit a descriptor chain to the available ring.
-    ///
-    /// `bufs` is a slice of (`device_addr`, `length`, `device_writable`) tuples.
-    /// Returns the head descriptor index for tracking completion, or `None`
-    /// if `bufs` is empty or longer than the number of free descriptors;
-    /// a refused chain allocates nothing.
-    pub fn add_chain(&mut self, bufs: &[(u64, u32, bool)]) -> Option<u16>
+    /// Record a chain of one descriptor for each of `bufs`, the
+    /// (`device_addr`, `length`, `device_writable`) tuples
+    /// [`SplitVirtqueue::add_chain`] takes, as outstanding, with the bytes of
+    /// its device-writable buffers, and give the available-ring slot and
+    /// index that publish it. `None` when `bufs` is empty or longer than the
+    /// number of free descriptors; a refused chain allocates nothing.
+    pub(crate) fn reserve(&mut self, bufs: &[(u64, u32, bool)]) -> Option<Reserved>
     {
         // Compared in usize: `bufs.len() as u16` would wrap at 65536 entries
         // and pass the check with too few descriptors free.
@@ -242,181 +462,102 @@ impl SplitVirtqueue
         }
         // Fits: bufs.len() <= num_free <= queue_size <= MAX_QUEUE_SIZE.
         let chain_len = u16::try_from(bufs.len()).ok()?;
+        let writable = bufs
+            .iter()
+            .filter(|&&(_, _, device_writable)| device_writable)
+            .fold(0u32, |sum, &(_, len, _)| sum.saturating_add(len));
 
+        // Cannot fail past this point: the length check above reserved
+        // bufs.len() free descriptors, and each one alloc_desc returns is
+        // below queue_size.
         let head = self.alloc_desc()?;
         let mut prev = head;
-        // The flags the previous iteration wrote to `prev`, kept here so
-        // setting its NEXT bit does not read the device-visible table back.
-        let mut prev_flags = 0u16;
-
-        for (i, &(addr, len, writable)) in bufs.iter().enumerate()
+        for _ in 1..chain_len
         {
-            // Cannot fail: the length check above reserved bufs.len() free
-            // descriptors.
-            let idx = if i == 0 { head } else { self.alloc_desc()? };
-            if i > 0
-            {
-                // `prev` came from alloc_desc, so it is below queue_size.
-                *self.links.get_mut(usize::from(prev))? = idx;
-            }
-            let flags = if writable { VRING_DESC_F_WRITE } else { 0 };
-            // SAFETY: idx comes from alloc_desc, so it is below queue_size and
-            // the offset stays inside the descriptor table.
-            let desc = unsafe { self.desc_va.add(idx as usize) };
-            #[expect(
-                clippy::multiple_unsafe_ops_per_block,
-                reason = "every write is to a field of descriptor `desc`, which lies inside the \
-                          descriptor table `new`'s contract keeps valid"
-            )]
-            // SAFETY: `desc` lies inside the DMA descriptor table, which `new`'s
-            // contract keeps valid, aligned and writable for the queue's
-            // lifetime. Volatile: prevents dead-store elimination and ensures
-            // the device sees writes in order.
-            unsafe {
-                core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).addr), addr);
-                core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).len), len);
-                core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).flags), flags);
-            }
-
-            if i > 0
-            {
-                // SAFETY: prev comes from alloc_desc, so it is below queue_size
-                // and the offset stays inside the descriptor table.
-                let prev_desc = unsafe { self.desc_va.add(prev as usize) };
-                #[expect(
-                    clippy::multiple_unsafe_ops_per_block,
-                    reason = "every write is to a field of descriptor `prev_desc`, which lies \
-                              inside the descriptor table `new`'s contract keeps valid"
-                )]
-                // SAFETY: `prev_desc` lies inside the DMA descriptor table, which
-                // `new`'s contract keeps valid, aligned and writable.
-                unsafe {
-                    core::ptr::write_volatile(
-                        core::ptr::addr_of_mut!((*prev_desc).flags),
-                        prev_flags | VRING_DESC_F_NEXT,
-                    );
-                    core::ptr::write_volatile(core::ptr::addr_of_mut!((*prev_desc).next), idx);
-                }
-            }
+            let idx = self.alloc_desc()?;
+            *self.links.get_mut(usize::from(prev))? = idx;
             prev = idx;
-            prev_flags = flags;
         }
-
-        // Record the chain before publishing it, so no early return leaves a
-        // published chain unrecorded.
         *self.chain_len.get_mut(usize::from(head))? = chain_len;
+        *self.writable.get_mut(usize::from(head))? = writable;
+        // Each outstanding chain holds a descriptor, so the count stays at
+        // most queue_size: no saturation.
+        self.outstanding = self.outstanding.saturating_add(1);
 
-        // Add head to available ring.
-        #[expect(
-            clippy::cast_ptr_alignment,
-            reason = "VirtqAvail is 2-byte aligned; offset 4 from a 2-byte-aligned base \
-                      maintains u16 alignment"
-        )]
-        // SAFETY: the ring entries start 4 bytes past the available ring's
-        // header, inside the `4 + 2 * queue_size` bytes `new`'s contract names.
-        let ring_base = unsafe { self.avail_va.cast::<u8>().add(4) }.cast::<u16>();
-        // SAFETY: `idx` is a field of the available ring header, which `new`'s
-        // contract keeps valid; no reference is formed.
-        let avail_idx = unsafe { core::ptr::addr_of_mut!((*self.avail_va).idx) };
-
-        // Read avail.idx with read_volatile — the field is shared with the
-        // device and was last updated via write_volatile; a non-volatile
-        // read could return a stale cached value on repeated add_chain calls.
-        // SAFETY: `avail_idx` points into the valid, aligned available ring.
-        let cur_idx = unsafe { core::ptr::read_volatile(avail_idx) };
-        let ring_idx = cur_idx & self.ring_mask;
-        // SAFETY: ring_idx <= ring_mask < queue_size, so the entry lies inside
-        // the ring's `queue_size` entries.
-        let ring_entry = unsafe { ring_base.add(ring_idx as usize) };
-        // SAFETY: `ring_entry` lies inside the valid, writable available ring.
-        unsafe { core::ptr::write_volatile(ring_entry, head) };
-
-        // Memory barrier: ensure descriptor writes are visible before
-        // updating the available index.
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-
-        // SAFETY: `avail_idx` points into the valid, writable available ring.
-        unsafe { core::ptr::write_volatile(avail_idx, cur_idx.wrapping_add(1)) };
-
-        Some(head)
+        let slot = self.avail_idx & self.ring_mask;
+        self.avail_idx = self.avail_idx.wrapping_add(1);
+        Some(Reserved {
+            head,
+            slot,
+            avail_idx: self.avail_idx,
+        })
     }
 
-    /// Consume the next completion from the used ring, if one is present,
-    /// and return its chain's descriptors to the free list.
+    /// The descriptors of the outstanding chain at `head`, head first, along
+    /// the driver's links; none when `head` heads no outstanding chain.
+    pub(crate) fn chain(&self, head: u16) -> impl Iterator<Item = u16> + '_
+    {
+        let len = self.chain_len.get(usize::from(head)).copied().unwrap_or(0);
+        core::iter::successors(Some(head), |&idx| self.links.get(usize::from(idx)).copied())
+            .take(usize::from(len))
+    }
+
+    /// Decode the used ring as the device last wrote it: `used_idx`, the
+    /// ring's `idx` field, read once by the caller; and, through `read`,
+    /// the element at the ring slot `read` is given. `read` is called at
+    /// most once, with a slot below the queue size, and only when an element
+    /// is consumed: when the device has published one past the last consumed
+    /// and no more than the driver has chains outstanding.
     ///
-    /// Returns `Ok(Some((head, bytes_written)))` for a completion of an
-    /// outstanding chain, and `Ok(None)` when the device has published no
-    /// new used entry.
+    /// Returns `Ok(Some((head, len)))` for the completion of an outstanding
+    /// chain, whose descriptors it frees; and `Ok(None)` when the device has
+    /// published no element past the last one consumed. `len` is the
+    /// element's, clamped to the bytes of the chain's device-writable
+    /// buffers: `VirtIO` 1.2 §2.7.8 makes it the count of bytes the device
+    /// wrote into them, so no more can be valid, and the chain is the
+    /// device's to return whatever count it reports (§2.7.8.2 notes devices
+    /// that report it wrongly).
     ///
     /// # Errors
     ///
-    /// The used-ring element is device-written, so it is validated before
-    /// any descriptor is freed: [`VirtqueueError::UnknownHead`] when its `id`
-    /// heads no outstanding chain. The element is consumed and the free list
-    /// is left untouched.
-    pub fn poll_used(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError>
+    /// Each refusal frees nothing:
+    ///
+    /// - [`VirtqueueError::IndexPastOutstanding`] when `used_idx` is more
+    ///   elements past the last consumed (counted modulo 2^16, as the index
+    ///   wraps) than the driver has chains outstanding; every element it
+    ///   published is consumed, and none is read.
+    /// - [`VirtqueueError::UnknownHead`] when the element's `id` heads no
+    ///   outstanding chain; the element is consumed.
+    pub(crate) fn take_used(
+        &mut self,
+        used_idx: u16,
+        read: impl FnOnce(u16) -> VirtqUsedElem,
+    ) -> Result<Option<(u16, u32)>, VirtqueueError>
     {
-        // SAFETY: `idx` is a field of the used ring header, which `new`'s
-        // contract keeps valid; no reference is formed.
-        let used_idx_ptr = unsafe { core::ptr::addr_of!((*self.used_va).idx) };
-        // SAFETY: `used_idx_ptr` points into the valid, aligned used ring.
-        let used_idx = unsafe { core::ptr::read_volatile(used_idx_ptr) };
-
-        if self.last_used_idx == used_idx
+        let pending = used_idx.wrapping_sub(self.last_used_idx);
+        if pending == 0
         {
             return Ok(None);
         }
-
-        // VirtIO 1.2 §2.7.13.2: device publishes data buffer, status, ring
-        // elem, then used.idx with release ordering. The acquire fence here
-        // gives the used.idx load above acquire semantics so subsequent
-        // loads of the elem and the caller-visible data/status cannot hoist
-        // above it on RVWMO.
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-
-        #[expect(
-            clippy::cast_ptr_alignment,
-            reason = "`new`'s contract aligns the used ring to `VirtqUsedElem`'s 4 bytes, and \
-                      offset 4 from a 4-byte-aligned base keeps that alignment"
-        )]
-        // SAFETY: the ring elements start 4 bytes past the used ring's header,
-        // inside the `4 + 8 * queue_size` bytes `new`'s contract names.
-        let ring_base = unsafe { self.used_va.cast::<u8>().add(4) }.cast::<VirtqUsedElem>();
-        let ring_idx = self.last_used_idx & self.ring_mask;
-        // SAFETY: ring_idx <= ring_mask < queue_size, so the element lies
-        // inside the ring's `queue_size` elements.
-        let ring_elem = unsafe { ring_base.add(ring_idx as usize) };
-        // Each field is read on its own, at the 32-bit width `VirtIO` 1.2
-        // §2.7.8 gives it.
-        #[expect(
-            clippy::multiple_unsafe_ops_per_block,
-            reason = "every read is of a field of used element `ring_elem`, which lies inside the \
-                      used ring `new`'s contract keeps valid"
-        )]
-        // SAFETY: `ring_elem` lies inside the valid used ring, 4-byte aligned:
-        // `new`'s contract aligns the ring to 4 bytes, and the elements start
-        // 4 bytes past it, 8 bytes apart; each field is a 4-byte-aligned `u32`
-        // of it. No reference is formed.
-        let (id, len) = unsafe {
-            (
-                core::ptr::read_volatile(&raw const (*ring_elem).id),
-                core::ptr::read_volatile(&raw const (*ring_elem).len),
-            )
-        };
-
+        if pending > self.outstanding
+        {
+            self.last_used_idx = used_idx;
+            return Err(VirtqueueError::IndexPastOutstanding { used_idx });
+        }
+        let elem = read(self.last_used_idx & self.ring_mask);
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
         let head = self
-            .outstanding_head(id)
-            .ok_or(VirtqueueError::UnknownHead { id })?;
+            .outstanding_head(elem.id)
+            .ok_or(VirtqueueError::UnknownHead { id: elem.id })?;
+        let posted = self.writable.get(usize::from(head)).copied().unwrap_or(0);
         self.free_chain(head);
-
-        Ok(Some((head, len)))
+        Ok(Some((head, elem.len.min(posted))))
     }
 
     /// The head index a device-written used-element `id` names, when it
-    /// heads a chain [`add_chain`](Self::add_chain) submitted that no
-    /// completion has freed yet.
+    /// heads a chain [`reserve`](Self::reserve) recorded that no completion
+    /// has freed yet.
     fn outstanding_head(&self, id: u32) -> Option<u16>
     {
         let head = u16::try_from(id).ok().filter(|&h| h < self.queue_size)?;
@@ -428,7 +569,7 @@ impl SplitVirtqueue
 
     /// Free every descriptor of the outstanding chain starting at `head`.
     ///
-    /// Follows the driver-private links `add_chain` recorded, for exactly the
+    /// Follows the driver-private links `reserve` recorded, for exactly the
     /// recorded chain length, so the device-visible descriptor table (which
     /// the device could have overwritten) plays no part.
     fn free_chain(&mut self, head: u16)
@@ -439,6 +580,13 @@ impl SplitVirtqueue
             return;
         };
         let len = core::mem::take(slot);
+        if let Some(writable) = self.writable.get_mut(usize::from(head))
+        {
+            *writable = 0;
+        }
+        // `head` headed an outstanding chain, which the count includes: no
+        // saturation.
+        self.outstanding = self.outstanding.saturating_sub(1);
         let mut idx = head;
         for _ in 0..len
         {
@@ -453,13 +601,6 @@ impl SplitVirtqueue
             self.free_desc(idx);
             idx = next;
         }
-    }
-
-    /// Return the queue size.
-    #[must_use]
-    pub fn queue_size(&self) -> u16
-    {
-        self.queue_size
     }
 }
 
@@ -531,6 +672,155 @@ pub const fn ring_pages(queue_size: u16) -> usize
     // Each term is below 2^21 bytes: no saturation.
     let total = used_ring_offset(queue_size).saturating_add(used_ring_size(queue_size));
     total.div_ceil(4096)
+}
+
+/// Bounded proofs of the queue's bookkeeping (docs/testing.md § Bounded
+/// verification), by induction over its life: the base proofs show that
+/// [`Chains::new`] refuses every size that is not a power of two of at most
+/// [`MAX_QUEUE_SIZE`] and starts every queue of up to 8 descriptors in the
+/// invariant [`Chains`] states; each step proof runs one step from any
+/// bookkeeping of a queue of 1 or 4 descriptors that holds the invariant,
+/// on any operands, and checks its contract and that the invariant still
+/// holds (`crate::property`'s `reserve_holds` and `used_holds`). Every step
+/// the shell takes on the bookkeeping is one of these, so the invariant
+/// holds over any sequence of them, whatever the device writes. What lies
+/// outside the proofs is the shell's volatile access to the rings, and the
+/// steps of other queue sizes; the fuzz target `virtio-core`, the replay of
+/// the checked-in inputs and the unit tests check them.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{Chains, MAX_QUEUE_SIZE, VirtqUsedElem};
+    use crate::property;
+
+    /// Bookkeeping of a queue of `size` descriptors in any state the
+    /// invariant admits: any free list, links, chain lengths, writable
+    /// bytes, outstanding count and indices, assumed to hold the invariant.
+    /// `None` only when `new` refuses `size`, which the base proofs show it
+    /// does not for a power of two.
+    fn any_chains(size: u16) -> Option<Chains>
+    {
+        let mut chains = Chains::new(size)?;
+        chains.free_head = kani::any();
+        chains.num_free = kani::any();
+        chains.outstanding = kani::any();
+        chains.avail_idx = kani::any();
+        chains.last_used_idx = kani::any();
+        for link in &mut chains.links
+        {
+            *link = kani::any();
+        }
+        for len in &mut chains.chain_len
+        {
+            *len = kani::any();
+        }
+        for writable in &mut chains.writable
+        {
+            *writable = kani::any();
+        }
+        kani::assume(property::invariant(&chains));
+        Some(chains)
+    }
+
+    /// Every size of a `u16` that is not a power of two of at most
+    /// [`MAX_QUEUE_SIZE`] is refused, before any allocation. No loop is
+    /// reached: the refusal returns before the free list's build, and the
+    /// bound of 2 lets the unwinding check prove that build unreachable
+    /// rather than unroll it for a symbolic size.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn every_invalid_queue_size_is_refused()
+    {
+        let size: u16 = kani::any();
+        kani::assume(!(size.is_power_of_two() && size <= MAX_QUEUE_SIZE));
+        property::new_holds(size);
+    }
+
+    /// Every queue of 1, 2, 4 and 8 descriptors starts in the invariant,
+    /// empty. The loops are the free list's build and the invariant's
+    /// walks, each at most 8 steps.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn every_small_queue_starts_in_the_invariant()
+    {
+        for size in [1, 2, 4, 8]
+        {
+            property::new_holds(size);
+        }
+    }
+
+    /// Every chain of at most `size + 1` buffers, reserved on any
+    /// bookkeeping of a queue of `size` descriptors, holds the step's
+    /// contract: one past the queue, so a chain longer than the free
+    /// descriptors, a chain of every length that fits, and the empty chain
+    /// are reached.
+    fn reserve_step<const N: usize>(size: u16)
+    {
+        let Some(mut chains) = any_chains(size)
+        else
+        {
+            return;
+        };
+        let bufs: [(u64, u32, bool); N] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bufs.len());
+        let _ = property::reserve_holds(&mut chains, &bufs[..len]);
+    }
+
+    /// Every used index and element, taken on any bookkeeping of a queue of
+    /// `size` descriptors, holds the step's contract: any `idx`, so every
+    /// jump, a backwards move and the wrap; any `id` and `len`.
+    fn used_step(size: u16)
+    {
+        let Some(mut chains) = any_chains(size)
+        else
+        {
+            return;
+        };
+        let elem = VirtqUsedElem {
+            id: kani::any(),
+            len: kani::any(),
+        };
+        let _ = property::used_holds(&mut chains, kani::any(), elem);
+    }
+
+    /// [`reserve_step`] on a queue of 1 descriptor, whose ring mask is 0.
+    /// The loops are the bookkeeping's and the buffers', each at most 2
+    /// steps.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn every_chain_reserved_on_one_descriptor_keeps_the_invariant()
+    {
+        reserve_step::<2>(1);
+    }
+
+    /// [`reserve_step`] on a queue of 4 descriptors, which holds chains of
+    /// one to four descriptors beside one another. The loops are the
+    /// bookkeeping's and the buffers', each at most 5 steps.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn every_chain_reserved_on_four_descriptors_keeps_the_invariant()
+    {
+        reserve_step::<5>(4);
+    }
+
+    /// [`used_step`] on a queue of 1 descriptor. The loops are the
+    /// bookkeeping's walks, each at most 1 step.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn every_used_element_taken_on_one_descriptor_keeps_the_invariant()
+    {
+        used_step(1);
+    }
+
+    /// [`used_step`] on a queue of 4 descriptors. The loops are the
+    /// bookkeeping's walks, each at most 4 steps.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn every_used_element_taken_on_four_descriptors_keeps_the_invariant()
+    {
+        used_step(4);
+    }
 }
 
 #[cfg(test)]
@@ -641,6 +931,35 @@ mod tests
             unsafe { (*used).idx = used_idx };
         }
 
+        /// Simulate the device moving `used.idx` without writing an element.
+        fn set_used_idx(&mut self, used_idx: u16)
+        {
+            let used = self.used.as_mut_ptr().cast::<VirtqUsed>();
+            // SAFETY: `used` is the start of the used ring, a live, aligned
+            // `Vec<u64>` buffer. Single-threaded.
+            unsafe { (*used).idx = used_idx };
+        }
+
+        /// The available ring's `idx` field and its entry at `slot`.
+        fn avail(&self, slot: usize) -> (u16, u16)
+        {
+            // The ring as bytes: the 2-byte flags, the 2-byte index and the
+            // ring entries after them.
+            let bytes: Vec<u8> = self.avail.iter().flat_map(|w| w.to_ne_bytes()).collect();
+            let word = |at: usize| u16::from_ne_bytes([bytes[at], bytes[at + 1]]);
+            (word(2), word(4 + 2 * slot))
+        }
+
+        /// Simulate the device overwriting the available ring's `idx` (the
+        /// ring is device-visible DMA memory).
+        fn set_avail_idx(&mut self, avail_idx: u16)
+        {
+            let avail = self.avail.as_mut_ptr().cast::<VirtqAvail>();
+            // SAFETY: `avail` is the start of the available ring, a live,
+            // aligned `Vec<u64>` buffer. Single-threaded.
+            unsafe { (*avail).idx = avail_idx };
+        }
+
         fn desc(&self, idx: usize) -> VirtqDesc
         {
             self.desc[idx]
@@ -676,7 +995,7 @@ mod tests
         // every one again.
         let mut rings = Rings::new(MAX_QUEUE_SIZE);
         let mut vq = rings.queue(MAX_QUEUE_SIZE).expect("spec maximum");
-        let full: Vec<(u64, u32, bool)> = vec![(0x1000, 1, false); usize::from(MAX_QUEUE_SIZE)];
+        let full: Vec<(u64, u32, bool)> = vec![(0x1000, 1, true); usize::from(MAX_QUEUE_SIZE)];
         let head = vq.add_chain(&full).expect("every descriptor free");
         assert!(vq.add_chain(&[(0x2000, 1, false)]).is_none());
         rings.publish_used(0, u32::from(head), 1, 1);
@@ -741,10 +1060,11 @@ mod tests
         let mut rings = Rings::new(8);
         let mut vq = rings.queue(8).expect("valid queue size");
         let head = vq
-            .add_chain(&[(0xA000, 0x200, false), (0xB000, 0x200, false)])
+            .add_chain(&[(0xA000, 0x200, false), (0xB000, 0x200, true)])
             .expect("two free descriptors available");
 
-        // Device publishes the completion: ring[0] = {id: head, len: 0x200}.
+        // Device publishes the completion: ring[0] = {id: head, len: 0x200},
+        // the device-writable buffer filled.
         rings.publish_used(0, u32::from(head), 0x200, 1);
 
         assert_eq!(vq.poll_used(), Ok(Some((head, 0x200))));
@@ -808,9 +1128,9 @@ mod tests
         // first step.
         rings.set_next(1, 5, 0);
         rings.set_next(0, 200, VRING_DESC_F_NEXT);
-        rings.publish_used(0, u32::from(head), 1, 1);
+        rings.publish_used(0, u32::from(head), 0, 1);
 
-        assert_eq!(vq.poll_used(), Ok(Some((head, 1))));
+        assert_eq!(vq.poll_used(), Ok(Some((head, 0))));
         // Exactly the three submitted descriptors came back: the whole queue
         // is free again, with no descriptor counted twice.
         assert_eq!(free_count(&mut vq, 8), 8);
@@ -827,11 +1147,12 @@ mod tests
         let b = vq
             .add_chain(&[(0xC000, 1, false), (0xD000, 1, false)])
             .expect("two free descriptors available");
-        // Complete out of submission order.
-        rings.publish_used(0, u32::from(b), 1, 1);
-        rings.publish_used(1, u32::from(a), 1, 2);
-        assert_eq!(vq.poll_used(), Ok(Some((b, 1))));
-        assert_eq!(vq.poll_used(), Ok(Some((a, 1))));
+        // Complete out of submission order. No buffer is device-writable, so
+        // each completion writes no byte.
+        rings.publish_used(0, u32::from(b), 0, 1);
+        rings.publish_used(1, u32::from(a), 0, 2);
+        assert_eq!(vq.poll_used(), Ok(Some((b, 0))));
+        assert_eq!(vq.poll_used(), Ok(Some((a, 0))));
 
         // A full-width chain now takes all four descriptors, each once.
         let head = vq
@@ -848,5 +1169,101 @@ mod tests
                 idx = usize::from(rings.desc(idx).next);
             }
         }
+    }
+
+    #[test]
+    fn a_used_index_past_the_outstanding_chains_is_refused_whole_and_frees_nothing()
+    {
+        let mut rings = Rings::new(8);
+        let mut vq = rings.queue(8).expect("valid queue size");
+        let head = vq
+            .add_chain(&[(0xA000, 1, true)])
+            .expect("a free descriptor");
+        // One chain outstanding, two elements published: more than the device
+        // can have completed. The refusal consumes both and reads neither, so
+        // the next poll sees nothing new.
+        rings.publish_used(0, u32::from(head), 1, 1);
+        rings.set_used_idx(2);
+        assert_eq!(
+            vq.poll_used(),
+            Err(VirtqueueError::IndexPastOutstanding { used_idx: 2 })
+        );
+        assert_eq!(vq.poll_used(), Ok(None));
+        // An index moved back reads, modulo 2^16, as a jump of 65535.
+        rings.set_used_idx(1);
+        assert_eq!(
+            vq.poll_used(),
+            Err(VirtqueueError::IndexPastOutstanding { used_idx: 1 })
+        );
+        // The chain is still outstanding, and a completion of it is taken.
+        rings.publish_used(1, u32::from(head), 1, 2);
+        assert_eq!(vq.poll_used(), Ok(Some((head, 1))));
+        assert_eq!(free_count(&mut vq, 8), 8);
+    }
+
+    #[test]
+    fn a_completion_length_is_clamped_to_its_chains_writable_buffers()
+    {
+        let mut rings = Rings::new(8);
+        let mut vq = rings.queue(8).expect("valid queue size");
+        // 16 bytes the device reads, then 32 it writes: a len counts only the
+        // 32.
+        let a = vq
+            .add_chain(&[(0xA000, 16, false), (0xB000, 32, true)])
+            .expect("two free descriptors available");
+        let b = vq
+            .add_chain(&[(0xC000, 16, false)])
+            .expect("a free descriptor");
+        rings.publish_used(0, u32::from(a), 33, 1);
+        // A chain the device only reads holds no byte it can have written.
+        rings.publish_used(1, u32::from(b), 16, 2);
+        assert_eq!(vq.poll_used(), Ok(Some((a, 32))));
+        assert_eq!(vq.poll_used(), Ok(Some((b, 0))));
+        assert_eq!(free_count(&mut vq, 8), 8);
+    }
+
+    #[test]
+    fn the_ring_indices_wrap_at_65536_onto_the_next_slot()
+    {
+        let mut rings = Rings::new(4);
+        let mut vq = rings.queue(4).expect("valid queue size");
+        // Both indices one short of the wrap, as the device's are after
+        // 65535 completions.
+        vq.chains.avail_idx = u16::MAX;
+        vq.chains.last_used_idx = u16::MAX;
+        rings.set_used_idx(u16::MAX);
+        let a = vq
+            .add_chain(&[(0xA000, 4, true)])
+            .expect("a free descriptor");
+        let b = vq
+            .add_chain(&[(0xB000, 4, true)])
+            .expect("a free descriptor");
+        // Index 65535 is slot 3, and 0 slot 0.
+        assert_eq!(rings.avail(3).1, a);
+        assert_eq!(rings.avail(0), (1, b));
+        rings.publish_used(3, u32::from(a), 4, 0);
+        rings.publish_used(0, u32::from(b), 4, 1);
+        assert_eq!(vq.poll_used(), Ok(Some((a, 4))));
+        assert_eq!(vq.poll_used(), Ok(Some((b, 4))));
+        assert_eq!(vq.poll_used(), Ok(None));
+    }
+
+    #[test]
+    fn add_chain_publishes_at_its_own_index_whatever_the_device_wrote_there()
+    {
+        let mut rings = Rings::new(4);
+        let mut vq = rings.queue(4).expect("valid queue size");
+        let a = vq
+            .add_chain(&[(0xA000, 1, false)])
+            .expect("a free descriptor");
+        // The device rewrites the published index; the next chain still takes
+        // slot 1 and publishes index 2.
+        rings.set_avail_idx(3);
+        let b = vq
+            .add_chain(&[(0xB000, 1, false)])
+            .expect("a free descriptor");
+        assert_eq!(rings.avail(0).1, a);
+        assert_eq!(rings.avail(1), (2, b));
+        assert_eq!(rings.avail(3).1, 0);
     }
 }

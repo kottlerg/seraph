@@ -24,6 +24,8 @@ pub mod bootstrap;
 pub mod dma;
 pub mod isr;
 pub mod pci;
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
 pub mod virtqueue;
 
 // ── Reserved feature bits (VirtIO 1.2 §6) ──────────────────────────────────
@@ -596,6 +598,103 @@ pub fn structure_usable(cfg_type: u8, loc: &VirtioCapLocation, notify_off_multip
 mod tests
 {
     use super::*;
+
+    /// The checked-in fuzz inputs of the kinds given (`seeds`,
+    /// `regressions`).
+    fn fuzz_inputs(kinds: &[&str]) -> Vec<Vec<u8>>
+    {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/virtio-core");
+        let mut inputs = Vec::new();
+        for kind in kinds
+        {
+            let Ok(dir) = std::fs::read_dir(root.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in dir
+            {
+                inputs.push(std::fs::read(entry.unwrap().path()).unwrap());
+            }
+        }
+        inputs
+    }
+
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_decoders_contract()
+    {
+        let inputs = fuzz_inputs(&["seeds", "regressions"]);
+        assert!(!inputs.is_empty(), "no checked-in fuzz input found");
+        for input in &inputs
+        {
+            property::virtio_core_holds(input);
+        }
+    }
+
+    // Defect caught: seeds that no longer reach one of the decoders'
+    // outcomes, so the fuzz target starts without an input that reaches it.
+    #[test]
+    fn the_seeds_reach_every_outcome_of_the_decoders()
+    {
+        let seeds = fuzz_inputs(&["seeds"]);
+        let mut reached = property::Outcomes::default();
+        for seed in &seeds
+        {
+            let o = property::queue_script(seed);
+            reached.completed |= o.completed;
+            reached.wrapped |= o.wrapped;
+            reached.index_past |= o.index_past;
+            reached.unknown_head |= o.unknown_head;
+            reached.clamped |= o.clamped;
+            reached.add_refused |= o.add_refused;
+        }
+        assert!(reached.completed, "no seed completes a chain");
+        assert!(
+            reached.wrapped,
+            "no seed completes a chain at the index's wrap"
+        );
+        assert!(
+            reached.index_past,
+            "no seed publishes past the outstanding chains"
+        );
+        assert!(reached.unknown_head, "no seed completes an unknown head");
+        assert!(reached.clamped, "no seed completes past the writable bytes");
+        assert!(
+            reached.add_refused,
+            "no seed submits past the free descriptors"
+        );
+
+        let settled_after = |seed: &Vec<u8>| {
+            property::config_reads(seed)
+                .iter()
+                .take(pci::CONFIG_READ_ATTEMPTS as usize)
+                .position(|&(before, _, _, after)| before == after)
+        };
+        assert!(
+            seeds
+                .iter()
+                .any(|s| settled_after(s).is_some_and(|n| n > 0)),
+            "no seed settles a 64-bit read after a torn one"
+        );
+        assert!(
+            seeds.iter().any(|s| settled_after(s).is_none()),
+            "no seed leaves a 64-bit read unsettled"
+        );
+        assert!(
+            seeds.iter().any(|s| {
+                let field = |at: usize| u64::from_le_bytes(s[at..at + 8].try_into().unwrap());
+                s.len() >= 28
+                    && pci::config_word_addr(
+                        field(0),
+                        field(8),
+                        field(16),
+                        u32::from_le_bytes(s[24..28].try_into().unwrap()),
+                    )
+                    .is_some()
+            }),
+            "no seed places a configuration word"
+        );
+    }
 
     fn cap(bar: u8, offset: u32, length: u32) -> VirtioCapLocation
     {

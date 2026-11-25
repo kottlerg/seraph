@@ -487,6 +487,23 @@ and goes to the least-loaded CPU if not, a tie going to the CPU with the fewest 
 siblings (§ SMT Awareness). The placement is recorded in `tcb.preferred_cpu` and used for
 subsequent wakeups.
 
+A synchronous wake places its thread by its waker. A call that finds a receiver parked, and a
+fault delivery that finds a handler parked, wake it with `WakeHint::Sync` when the caller's park
+committed: the caller blocks in the same syscall, so one CPU serves both threads. The receiver then
+runs on the caller's CPU when that CPU queues no thread but its idle thread and the receiver does
+not outrank the caller (its run queue is not above the caller's), whatever CPU it last ran on; hard
+affinity and the save-window pin still come first
+([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). A pair that starts
+apart, or that a pull or an affinity change split, so comes together on its first round trip,
+which then wakes no other CPU: the reply's wake finds the caller's preferred CPU on that CPU, and
+the server's next receive blocks. Two cases stay with the other rules: a call made while other
+work is queued on the caller's CPU, whose threads the receiver would otherwise run ahead of while
+its own CPU idles, and a receiver that outranks its caller, such as an RT server called by a fair
+client, which, serving a backlog without parking, would hold off the caller's reply wake past any
+slice (§ Time Slice Policy). A reply-and-receive call (#1482), whose server parks in the same
+syscall as it replies, may lift the second condition. Every other wake, the reply's included,
+passes `WakeHint::None`.
+
 ### Load Balancing
 
 A pull-based balancer runs on every CPU's `timer_tick`: `sched::try_pull_idle` on a CPU
@@ -624,8 +641,9 @@ while another idles, and stay there while each wake keeps them there (the sticky
 `select_target_cpu` stays within the threshold of the least-loaded CPU). What the episode leaves
 is bounded by the threshold: a load above it is pulled at once, so a backlog the pull leaves to
 break and re-form is one at a load of at most `LOAD_BALANCE_IMBALANCE_THRESHOLD` (2), the
-running thread and one queued behind it. Whether a wake should place any of these by its waker,
-or away from it, is open (#1560).
+running thread and one queued behind it. A call or a fault delivery places its receiver by its
+waker (§ Thread Assignment); whether another wake should place by its waker, or away from it, is
+open (#1560).
 
 The loads that choose a pull are read without the CPUs' locks, and a CPU's `schedule()`
 raises its own load for a moment under its lock: it counts every requeue of the running
@@ -808,7 +826,8 @@ changes state under it costs one placement its tie-break, never correctness.
   the CPU with the fewest busy siblings, then to the lowest index. The rings are walked only for
   the CPUs that tie on the least load seen so far, and no more once a CPU of an idle core holds
   it. The sticky preferred CPU is still taken first when its load is within the threshold, since
-  the caches it holds outweigh the spread, and a hard affinity still wins.
+  the caches it holds outweigh the spread; a synchronous wake's waker CPU, when its guard holds,
+  comes before it, and a hard affinity still wins.
 - **Idle pull** (`try_pull_idle`, § Load Balancing): idle CPUs decide independently, each at
   its own tick, so the preference is a delay. An idle CPU that would pull from its confirmed
   candidate while one of its siblings is busy holds the candidate for one tick, once
@@ -973,7 +992,9 @@ deadline to CPU 0's next tick (at most one tick), CPU 0's own interval with inte
 and the sleep batch's claims ahead of it
 ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants) § Sleep List
 Invariants, invariant 6). The bound holds for the CPU the wake's placement chose. Placement does not
-weigh levels (§ Soft Affinity), so an RT wake can be placed behind a running thread of its own or a
+weigh levels beyond the synchronous wake's guard (§ Thread Assignment), which places a thread on
+its waker's CPU only when it does not outrank the waker, whose park has committed. So an RT wake
+can be placed behind a running thread of its own or a
 higher level and wait for it to block, yield or expire. Two wakes placed on one CPU at once can
 likewise leave the lower waiting until the higher blocks or expires; closing that residual needs an
 RT pull (a CPU running a lower level taking a waiting RT thread at its tick), which is not
@@ -1114,8 +1135,9 @@ hysteresis a busy CPU's pull uses to decide an imbalance is real, so
 soft affinity, wake placement, and the busy-CPU pull share one knob; an
 idle CPU pulls below it (§ Load Balancing).
 
-Hard affinity (`cpu_affinity != AFFINITY_ANY`) and save-window pinning
-(`context_saved == 0`) both short-circuit ahead of the soft-affinity
+Hard affinity (`cpu_affinity != AFFINITY_ANY`), save-window pinning
+(`context_saved == 0`) and a synchronous wake whose guard holds
+(§ Thread Assignment) short-circuit ahead of the soft-affinity
 check; see `select_target_cpu` in `core/kernel/src/sched/mod.rs` for
 the full policy.
 

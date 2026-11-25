@@ -834,6 +834,11 @@ set by the all-locks commit, or under the remote run-queue lock the stop protoco
 `CAP_INFO_THREAD_STATE` is a diagnostic snapshot that decides nothing in the kernel.
 `sys_thread_configure` does not precheck: it decides `Created` under the target's `sched_lock`,
 which `sys_thread_start`'s commit also takes, and holds it across its writes.
+`select_target_cpu`'s synchronous rule reads `priority`, of the woken thread and of the waker
+running on its own CPU, without `sched_lock`, as placement hints: a read that races a priority
+change misjudges one placement, which the rules after it and the idle pull bound
+(§ Wake Protocol Invariants, "Target CPU selection"), and `enqueue_and_wake` links the thread at
+the `priority` it reads under the lock.
 
 | Field group | Fields | Owning lock | Cross-CPU access rule |
 |---|---|---|---|
@@ -1265,13 +1270,14 @@ and `commit_blocked`'s `Running→Blocked` commit because all three contend for 
 
 ### Target CPU selection (`select_target_cpu`)
 
-`enqueue_and_wake` resolves `target_cpu` via `select_target_cpu`. The
-selection policy is, in priority order: (1) hard affinity
+`enqueue_and_wake` resolves `target_cpu` via `select_target_cpu(tcb, hint)`, whose rules
+`place_wake` decides. The selection policy is, in priority order: (1) hard affinity
 (`cpu_affinity != AFFINITY_ANY`), (2) save-window pinning to
 `preferred_cpu` while `context_saved == 0` (closes the cross-CPU
-`schedule()` spin against the source CPU's in-flight save), (3) sticky
+`schedule()` spin against the source CPU's in-flight save), (3) for a
+`WakeHint::Sync` wake, the waker's CPU, under the guard below, (4) sticky
 `preferred_cpu` when its load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD`
-of the global `min_load`, and (4) the least-loaded CPU, a tie going to
+of the global `min_load`, and (5) the least-loaded CPU, a tie going to
 the CPU with the fewest busy SMT siblings, then the lowest index
 (`least_loaded_cpu`; [scheduler.md](scheduler.md) § SMT Awareness). Hard
 affinity overrides the pin, so an in-window wake of a thread whose affinity
@@ -1284,15 +1290,56 @@ a busy CPU's pull ([scheduler.md](scheduler.md) § Load Balancing),
 so the wake-side stickiness and the busy-CPU pull's imbalance test
 agree on what counts as "real" load asymmetry. An idle CPU's pull
 (`try_pull_idle`) also takes a thread the stickiness left queued behind a
-running one, once that backlog has stood for a tick without a break. The sticky-CPU rule
+running one, once that backlog has stood for a tick without a break.
 originated from the #128 investigation as an independent
 cache-warmth alignment with the documented soft-affinity intent in
 [scheduler.md](scheduler.md) § Soft Affinity; #128's actual root cause turned out
 to be unrelated (`CSpaceId` namespace exhaustion, see commits on
 that issue).
 
-`select_target_cpu_excluding(tcb, exclude)` is the same policy with one CPU
-removed from the save-window-pin / sticky / min-load branches (hard affinity
+**The synchronous wake (rule 3).** A wake passes `WakeHint::Sync` only when its waker is the
+thread running on this CPU, its park committed in the same syscall, and its `schedule()` follows
+before any return to user mode: the call rendezvous (`sys_ipc_call` after `endpoint_call`) and
+the fault delivery (`ipc::fault`'s `deliver_once`), each when `CallRendezvous::Bound` carries
+`hint: Sync`, which `endpoint_call` sets only on `ParkCommit::Committed`. A refused park passes
+`WakeHint::None`: its waker runs on, and a recipient left queued behind it would wait out its
+slice while another CPU idles. Every other wake passes `None`. Under `Sync`, the woken thread is
+placed on the waker's CPU k when k is eligible and the guard holds:
+
+- **k queues no thread but its idle thread** (`PerCpuScheduler::has_queued_thread` is false), for
+  both classes. An RT recipient is not placed ahead of a lower RT or fair thread queued on k: that
+  thread would wait behind it while the recipient's own CPU idles, and one pinned to k has no pull
+  to bound the wait.
+- **The woken thread does not outrank the waker** (`run_queue::outranks` on the two `priority`
+  values: one run queue above the other). The waker's reply wake returns it to k, by its affinity
+  or its sticky `preferred_cpu`; a recipient that outranks it and serves a backlog without parking
+  would hold it off past any slice, since slice expiry never hands the CPU to a lower RT level or
+  from an RT thread to a fair one ([scheduler.md](scheduler.md) § Time Slice Policy). At or below
+  the waker, the recipient is preempted by the reply wake or shares k with the waker within one
+  slice.
+
+When the guard holds, the woken thread is the thread k's `schedule()` dispatches when the waker
+blocks, and `enqueue_and_wake` to k sends no IPI (it skips self-wakes). Between the link and that
+`schedule()` the woken thread may outrank the running waker, but k returns to user mode only
+after the `schedule()` (scheduler.md § Wake Preemption's invariant holds). When the guard fails,
+rules 4 and 5 place the wake as for `None`.
+
+The guard reads k's `non_empty` Relaxed, holding no lock: it only decides, and every link k made
+itself precedes the read in program order (the reader is k, in syscall or fault context with
+interrupts masked). A remote wake that links a thread on k between the guard and the link leaves
+the woken thread queued behind it when that thread is of its run queue or above; that is the
+placement rule 4 already makes (a CPU one queued thread ahead of an idle one is within the
+threshold), and the same bound clears it: the woken thread is unpinned (a pinned one returned at
+rule 1) and saved (a mid-save one returned at rule 2), so an idle CPU's pull takes it within the
+idle-pull bound of [scheduler.md](scheduler.md) § Load Balancing. The two `priority` reads are
+placement hints taken without `sched_lock` (§ Cross-CPU TCB Ownership); `enqueue_and_wake`
+re-reads the woken thread's under the lock for the link. A rule placing an RT wake on a CPU where
+it runs at once (#824's RT placement rule, not in the tree) goes between rules 3 and 4; it must not
+apply its open-CPU test to k on a `Sync` wake, whose waker's committed park leaves k open though
+k's `current_level` still names the waker.
+
+`select_target_cpu_excluding(tcb, exclude, hint)` is the same policy with one CPU
+removed from the save-window-pin / synchronous / sticky / min-load branches (hard affinity
 still wins, and the excluded CPU is returned only as a single-CPU fallback).
 `dealloc_object(Thread)`'s deferred reply-wake calls it with
 `exclude = Some(dealloc_cpu)`: the dealloc CPU is wedged in a preempt-disabled

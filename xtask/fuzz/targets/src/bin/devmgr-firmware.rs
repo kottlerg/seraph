@@ -5,8 +5,8 @@
 
 //! The fuzz target of devmgr's firmware-table decoders
 //! (`services/devmgr/firmware`): its property `firmware_holds` over inputs
-//! read as an RSDP, an SDT header, an XSDT, a FADT, an MCFG, a MADT, a DMAR
-//! and a RIMT.
+//! read as an RSDP, an SDT header, an XSDT, a FADT, an MCFG, a MADT, a DMAR,
+//! a RIMT and an SPCR.
 
 #[cfg(fuzzing)]
 fn main()

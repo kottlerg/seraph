@@ -28,7 +28,7 @@ use syscall_abi::PAGE_SIZE;
 use crate::bootstrap::Caps;
 use crate::phases::budget;
 use crate::phases::node_handle::{call, expect, handle_copy, handle_of, release_refused};
-use crate::phases::swap::{CHUNK_PAGES, HOG_TICK, Hog, baseline_totals, settle_resident};
+use crate::phases::swap::{CHUNK_PAGES, HOG_TICK, Hog, phase_baseline, settle_resident};
 use crate::runner::Phase;
 
 pub fn phases() -> &'static [Phase]
@@ -95,7 +95,7 @@ fn node_reclaim_phase(caps: &Caps)
     // chunks of any process: make them resident first, so the store starts
     // empty.
     let _ = settle_resident(authority, PHASE, None);
-    let baseline = baseline_totals(authority, PHASE);
+    let baseline = phase_baseline(PHASE);
 
     let light = sub_node(LIGHT_WEIGHT, "the light sub-node");
     let heavy = sub_node(HEAVY_WEIGHT, "the heavy sub-node");
@@ -125,8 +125,9 @@ fn node_reclaim_phase(caps: &Caps)
     std::os::seraph::log!(
         "{PHASE} phase passed (evictable resident pages under pressure: weight {LIGHT_WEIGHT} \
          {light_start} to {light_end}, weight {HEAVY_WEIGHT} {heavy_start} to {heavy_end}; \
-         free, deferred and svctest's own {} pages above the start)",
-        end.saturating_sub(baseline.totals) / PAGE_SIZE
+         {} pages in no account against {} at the start)",
+        end / PAGE_SIZE,
+        baseline.unaccounted / PAGE_SIZE
     );
 }
 

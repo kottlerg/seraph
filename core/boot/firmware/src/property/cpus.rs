@@ -101,6 +101,7 @@ pub(crate) fn record_holds(id: u32, ids: &mut [u32], count: usize) -> usize
 /// When the placement breaks its contract.
 pub(crate) fn place_holds(bsp: u32, list: &(impl Iterator<Item = u32> + Clone), out: &mut [u32])
 {
+    assert!(out.len() <= MAX_SLOTS, "the check's own bound");
     let (count, truncated) = place_cpu_ids(bsp, list.clone(), out);
     let count = count as usize;
     assert!(count <= out.len());
@@ -114,22 +115,32 @@ pub(crate) fn place_holds(bsp: u32, list: &(impl Iterator<Item = u32> + Clone), 
     {
         assert!(!placed.iter().skip(i.saturating_add(1)).any(|b| b == a));
     }
+    // The distinct IDs in order of first appearance, up to one past the
+    // slots: the first `out.len()` are the placed ones, and one more means the
+    // placement truncated. The order of the rest decides nothing, so the walk
+    // ends there, and the check stays linear in the list's length.
+    let mut seen = [0u32; MAX_SLOTS + 1];
     let mut distinct = 0usize;
-    for (i, id) in core::iter::once(bsp).chain(list.clone()).enumerate()
+    for id in core::iter::once(bsp).chain(list.clone())
     {
-        let first = !core::iter::once(bsp)
-            .chain(list.clone())
-            .take(i)
-            .any(|x| x == id);
-        if first
+        if distinct > out.len()
         {
-            match placed.get(distinct)
-            {
-                Some(&p) => assert_eq!(p, id),
-                None => assert!(truncated),
-            }
-            distinct = distinct.saturating_add(1);
+            break;
         }
+        if seen.get(..distinct).unwrap_or_default().contains(&id)
+        {
+            continue;
+        }
+        match placed.get(distinct)
+        {
+            Some(&p) => assert_eq!(p, id),
+            None => assert!(truncated),
+        }
+        if let Some(slot) = seen.get_mut(distinct)
+        {
+            *slot = id;
+        }
+        distinct = distinct.saturating_add(1);
     }
     assert_eq!(truncated, distinct > out.len());
     assert_eq!(count, distinct.min(out.len()));

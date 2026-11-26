@@ -2928,6 +2928,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     ipc_wait_next: None,
                     ipc_wait_prev: core::ptr::null_mut(),
                     ipc_wait_queue: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                    recv_park_slot: core::ptr::null(),
                     fault_handlers: [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) };
                         crate::ipc::fault::FAULT_CLASSES],
                     fault_badges: [const { core::sync::atomic::AtomicU64::new(0) };

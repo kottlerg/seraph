@@ -89,7 +89,7 @@ only when the CPU's TSS does not already hold it at its generation (`gdt::load_i
 [capability-internals.md](capability-internals.md) § IoPort Bindings). Once the TSS holds the
 bound bench thread's bitmap, a row that switches twice (`ktest.ipc_round_trip`,
 `ktest.notification_roundtrip`, `ktest.context_switch_pair`) spends 5 instructions in
-`load_iopb` and copies nothing, so x86_64's context-switch pair, 1013, is below riscv64's 1287,
+`load_iopb` and copies nothing, so x86_64's context-switch pair, 1013, is below riscv64's 1289,
 which has no bitmap.
 
 A switch-in of a user thread makes its floating-point and vector state live
@@ -99,7 +99,7 @@ x86_64 a switch between two user threads saves one and loads the other, the `fpu
 the registers zeroed at its switch-in when they hold another thread's state (`fpu::scrub`, 39).
 `ktest.context_switch_pair` and `ktest.notification_roundtrip` pair such a thread with one that
 has used them, so each round trip zeroes the registers for the one and loads the other's area
-(`restore_fp_from` 34, `restore_v_from` 17): the pair's `fpu` rows are 182 instructions.
+(`restore_fp_from` 34, `restore_v_from` 17): the pair's `fpu` rows are 184 instructions.
 
 An IPC message is built in place in each thread's `ipc_msg`, and a rendezvous, a reply or a
 fault delivery copies only its counted data words and capability slots, so no row zeroes or
@@ -118,7 +118,7 @@ words, the one whose payload passes the register words, copies it in 180.
   the per-slot visit is a direct call, or inlined, with no retpoline thunk; the walk and its
   visitors are most of the 2685 / 3140 with all 32 pages accessed and the 2013 / 2372 with
   none.
-- `ktest.thread_lifecycle`: 28411 / 46357. Its two kernel entropy draws (the TCB's random
+- `ktest.thread_lifecycle`: 28412 / 46363. Its two kernel entropy draws (the TCB's random
   field, and the CSpace-id epoch redraw on free) take their bytes from the CPU's squeezed block
   ([entropy.md](entropy.md) § Draw API and consumers), 334 / 286 for both; the block's refill,
   three Keccak-f[1600] permutations, falls in one iteration of 17 and so outside the p50
@@ -126,7 +126,7 @@ words, the one whose payload passes the register words, copies it in 180.
   the paint's `fill_words` 2051 / 2566 (`rep stosq` counts once per word under icount; riscv64
   stores a line per iteration), and the scan, which reads one word per 64-byte line of the
   untouched span ([memory-internals.md](memory-internals.md) § Kernel Stack Depth), 1616 / 1757;
-  and the zeroing of new and freed memory 7097 / 21306.
+  and the zeroing of new and freed memory 7097 / 21309.
 
 ## Profile
 
@@ -139,12 +139,12 @@ the release count and a cut ranked on dev is mis-ranked:
 | Path (x86_64) | Dev | Release | Dev / release |
 |---|---:|---:|---:|
 | `ktest.null_syscall_roundtrip` | 188 | 158 | 1.19 |
-| `ktest.ipc_round_trip words=0` | 3804 | 2336 | 1.63 |
+| `ktest.ipc_round_trip words=0` | 3877 | 2377 | 1.63 |
 | `ktest.notification_roundtrip` | 3292 | 2377 | 1.38 |
 | `ktest.cap_info_lookup` | 375 | 262 | 1.43 |
 | `ktest.mem_map_unmap` | 2229 | 1626 | 1.37 |
 | `ktest.aspace_harvest_all_accessed pages=32` | 2957 | 2685 | 1.10 |
-| `ktest.thread_lifecycle` | 38851 | 28411 | 1.37 |
+| `ktest.thread_lifecycle` | 37611 | 28412 | 1.32 |
 | `ktest.context_switch_pair` | 1452 | 1013 | 1.43 |
 | `ktest.tlb_shootdown_unmap` | 827 | 565 | 1.46 |
 
@@ -187,10 +187,10 @@ Not taken:
 
 | Configuration | Head | Taken | QEMU | Checked against |
 |---|---|---|---|---|
-| x86_64 dev | `43c1fc2a2c66` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| x86_64 release | `43c1fc2a2c66` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| riscv64 dev | `43c1fc2a2c66` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| riscv64 release | `43c1fc2a2c66` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| x86_64 dev | `1ee3e9e64d8c` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| x86_64 release | `1ee3e9e64d8c` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| riscv64 dev | `1ee3e9e64d8c` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| riscv64 release | `1ee3e9e64d8c` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
 
 #### Totals
 
@@ -199,21 +199,21 @@ Not taken:
 | `ktest.null_syscall_roundtrip cpus=1` | all | 188 | 158 | 253 | 217 |
 | `ktest.null_syscall_roundtrip cpus=1` | ktest | 14 | 7 | 9 | 3 |
 | `ktest.null_syscall_roundtrip cpus=1` | kernel | 174 | 151 | 244 | 214 |
-| `ktest.ipc_round_trip words=0 cpus=1` | all | 3804 | 2336 | 4953 | 2808 |
+| `ktest.ipc_round_trip words=0 cpus=1` | all | 3877 | 2377 | 5028 | 2839 |
 | `ktest.ipc_round_trip words=0 cpus=1` | ktest | 639 | 103 | 1420 | 80 |
-| `ktest.ipc_round_trip words=0 cpus=1` | kernel | 3165 | 2233 | 3533 | 2728 |
-| `ktest.ipc_round_trip words=6 cpus=1` | all | 4122 | 2537 | 5422 | 3179 |
+| `ktest.ipc_round_trip words=0 cpus=1` | kernel | 3238 | 2274 | 3608 | 2759 |
+| `ktest.ipc_round_trip words=6 cpus=1` | all | 4195 | 2578 | 5501 | 3210 |
 | `ktest.ipc_round_trip words=6 cpus=1` | ktest | 749 | 159 | 1620 | 209 |
-| `ktest.ipc_round_trip words=6 cpus=1` | kernel | 3373 | 2378 | 3802 | 2970 |
-| `ktest.ipc_round_trip words=7 cpus=1` | all | 4405 | 2817 | 5559 | 3279 |
+| `ktest.ipc_round_trip words=6 cpus=1` | kernel | 3446 | 2419 | 3881 | 3001 |
+| `ktest.ipc_round_trip words=7 cpus=1` | all | 4478 | 2858 | 5634 | 3310 |
 | `ktest.ipc_round_trip words=7 cpus=1` | ktest | 907 | 277 | 1672 | 236 |
-| `ktest.ipc_round_trip words=7 cpus=1` | kernel | 3498 | 2540 | 3887 | 3043 |
-| `ktest.ipc_round_trip words=0 fpu=both cpus=1` | all | 3809 | 2341 | 5143 | 2980 |
+| `ktest.ipc_round_trip words=7 cpus=1` | kernel | 3571 | 2581 | 3962 | 3074 |
+| `ktest.ipc_round_trip words=0 fpu=both cpus=1` | all | 3882 | 2382 | 5216 | 3011 |
 | `ktest.ipc_round_trip words=0 fpu=both cpus=1` | ktest | 644 | 108 | 1426 | 86 |
-| `ktest.ipc_round_trip words=0 fpu=both cpus=1` | kernel | 3165 | 2233 | 3717 | 2894 |
-| `ktest.notification_roundtrip cpus=1` | all | 3292 | 2377 | 3798 | 3012 |
+| `ktest.ipc_round_trip words=0 fpu=both cpus=1` | kernel | 3238 | 2274 | 3790 | 2925 |
+| `ktest.notification_roundtrip cpus=1` | all | 3292 | 2377 | 3786 | 3014 |
 | `ktest.notification_roundtrip cpus=1` | ktest | 43 | 42 | 34 | 32 |
-| `ktest.notification_roundtrip cpus=1` | kernel | 3249 | 2335 | 3764 | 2980 |
+| `ktest.notification_roundtrip cpus=1` | kernel | 3249 | 2335 | 3752 | 2982 |
 | `ktest.cap_create_delete cpus=1` | all | 1928 | 1461 | 2322 | 1944 |
 | `ktest.cap_create_delete cpus=1` | ktest | 20 | 18 | 15 | 13 |
 | `ktest.cap_create_delete cpus=1` | kernel | 1908 | 1443 | 2307 | 1931 |
@@ -232,21 +232,21 @@ Not taken:
 | `ktest.aspace_harvest_none_accessed pages=32 cpus=1` | all | 2285 | 2013 | 2628 | 2372 |
 | `ktest.aspace_harvest_none_accessed pages=32 cpus=1` | ktest | 17 | 10 | 11 | 7 |
 | `ktest.aspace_harvest_none_accessed pages=32 cpus=1` | kernel | 2268 | 2003 | 2617 | 2365 |
-| `ktest.thread_lifecycle cpus=1` | all | 38851 | 28411 | 54803 | 46357 |
+| `ktest.thread_lifecycle cpus=1` | all | 37611 | 28412 | 54799 | 46363 |
 | `ktest.thread_lifecycle cpus=1` | ktest | 81 | 79 | 69 | 67 |
-| `ktest.thread_lifecycle cpus=1` | kernel | 38770 | 28332 | 54734 | 46290 |
-| `ktest.context_switch_pair cpus=1` | all | 1452 | 1013 | 1675 | 1287 |
+| `ktest.thread_lifecycle cpus=1` | kernel | 37530 | 28333 | 54730 | 46296 |
+| `ktest.context_switch_pair cpus=1` | all | 1452 | 1013 | 1676 | 1289 |
 | `ktest.context_switch_pair cpus=1` | ktest | 20 | 13 | 13 | 7 |
-| `ktest.context_switch_pair cpus=1` | kernel | 1432 | 1000 | 1662 | 1280 |
-| `ktest.thread_read_mem_page cpus=1` | all | 5541 | 5271 | 4826 | 4659 |
+| `ktest.context_switch_pair cpus=1` | kernel | 1432 | 1000 | 1663 | 1282 |
+| `ktest.thread_read_mem_page cpus=1` | all | 5547 | 5271 | 4820 | 4659 |
 | `ktest.thread_read_mem_page cpus=1` | ktest | 20 | 15 | 11 | 8 |
-| `ktest.thread_read_mem_page cpus=1` | kernel | 5521 | 5256 | 4815 | 4651 |
-| `ktest.event_post_recv cpus=1` | all | 834 | 670 | 966 | 854 |
+| `ktest.thread_read_mem_page cpus=1` | kernel | 5527 | 5256 | 4809 | 4651 |
+| `ktest.event_post_recv cpus=1` | all | 834 | 670 | 968 | 854 |
 | `ktest.event_post_recv cpus=1` | ktest | 23 | 23 | 18 | 16 |
-| `ktest.event_post_recv cpus=1` | kernel | 811 | 647 | 948 | 838 |
-| `ktest.wait_set_cycle cpus=1` | all | 4366 | 3246 | 5129 | 4226 |
+| `ktest.event_post_recv cpus=1` | kernel | 811 | 647 | 950 | 838 |
+| `ktest.wait_set_cycle cpus=1` | all | 4366 | 3246 | 5127 | 4226 |
 | `ktest.wait_set_cycle cpus=1` | ktest | 35 | 33 | 34 | 29 |
-| `ktest.wait_set_cycle cpus=1` | kernel | 4331 | 3213 | 5095 | 4197 |
+| `ktest.wait_set_cycle cpus=1` | kernel | 4331 | 3213 | 5093 | 4197 |
 | `ktest.tlb_shootdown_unmap cpus=1` | all | 827 | 565 | 904 | 761 |
 | `ktest.tlb_shootdown_unmap cpus=1` | ktest | 17 | 10 | 10 | 7 |
 | `ktest.tlb_shootdown_unmap cpus=1` | kernel | 810 | 555 | 894 | 754 |
@@ -290,25 +290,25 @@ Not taken:
 | `<kernel::sched::run_queue::PerCpuScheduler>::dequeue_highest` | kernel | 52 | 32 | 114 | 92 |
 | `kernel::arch::current::interrupts::trap_dispatch` | kernel | | | 96 | 114 |
 | `kernel::syscall::pin_checked` | kernel | 84 | 84 | 104 | 90 |
-| `<kernel::sync::Spinlock>::lock_raw` | kernel | 102 | 99 | 68 | 68 |
 | `kernel::sched::enqueue_and_wake` | kernel | 76 | 46 | 102 | 70 |
+| `<kernel::sync::Spinlock>::lock_raw` | kernel | 101 | 100 | 68 | 68 |
 | `kernel::arch::current::context::switch` | kernel | 92 | 92 | 74 | 74 |
 | `kernel::syscall::ipc::sys_ipc_call` | kernel | 73 | 62 | 84 | 74 |
 | `<kernel::sched::run_queue::RunQueue>::enqueue` | kernel | 74 | 14 | 68 | 16 |
 | `<ipc::IpcMessage>::stage_send` | ktest | 74 | | 70 | |
 | `kernel::arch::current::interrupts::handle_trap` | kernel | | | 72 | 57 |
+| `kernel::ipc::endpoint::endpoint_call` | kernel | 63 | 28 | 72 | 56 |
 | `kernel::syscall::dispatch` | kernel | 54 | 69 | 52 | 21 |
-| `kernel::ipc::endpoint::endpoint_call` | kernel | 61 | 21 | 67 | 56 |
 | `kernel::syscall::ipc::sys_ipc_recv` | kernel | 52 | 26 | 65 | 48 |
 | `kernel::sched::commit_blocked_under_local_lock` | kernel | 60 | 31 | 64 | 40 |
 | `kernel::syscall::ipc::sys_ipc_reply` | kernel | 57 | 28 | 63 | 50 |
 | `kernel::sched::select_target_cpu_excluding` | kernel | 16 | 9 | 60 | 15 |
 | `kernel::arch::current::cpu::save_and_disable_interrupts` | kernel | 53 | 58 | 30 | 26 |
 | `kernel::syscall::dispatch_in_range` | kernel | 57 | 57 | 45 | 45 |
-| `kernel::arch::current::cpu::restore_interrupts` | kernel | 30 | 35 | 56 | 54 |
+| `kernel::arch::current::cpu::restore_interrupts` | kernel | 30 | 34 | 56 | 54 |
 | `kernel::arch::current::cpu::current_cpu` | kernel | 26 | 24 | 52 | 12 |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 40 | 24 | 50 | 50 |
-| `kernel::ipc::endpoint::endpoint_recv` | kernel | 41 | 11 | 49 | 18 |
+| `kernel::ipc::endpoint::endpoint_recv` | kernel | 42 | 11 | 49 | 18 |
 | `<kernel::sync::Spinlock>::unlock_raw` | kernel | 15 | 13 | 37 | 39 |
 | `kernel::arch::current::fpu::set_frame_units` | kernel | | | 36 | 28 |
 | `kernel::syscall::finish_syscall_work` | kernel | 17 | 20 | 18 | 36 |
@@ -322,21 +322,16 @@ Not taken:
 | `<kernel::arch::current::trap_frame::TrapFrame>::arg` | kernel | 9 | 30 | 6 | 6 |
 | `<kernel::ipc::message::Message>::data` | kernel | 30 | 18 | 19 | 20 |
 | `<kernel::sched::run_queue::RunQueue>::dequeue` | kernel | 30 | 22 | 26 | 20 |
-| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 30 | 28 |
+| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 30 | 30 |
 | `<kernel::sched::KernelWake as kernel::sched::WakeView>::affinity` | kernel | 28 | 6 | 12 | 6 |
+| `kernel::ipc::upcall::deliver` | kernel | 14 | | 28 | 22 |
 | `kernel::sched::mark_dispatched` | kernel | 28 | 14 | 26 | 16 |
 | `kernel::sched::run_return_work::<kernel::syscall::finish_syscall_work::{closure#0}, kernel::syscall::finish_syscall_work::{closure#1}>` | kernel | 20 | 5 | 28 | 1 |
 | `kernel::syscall::ipc::stage_reply_payload` | kernel | 27 | 22 | 28 | 22 |
 | `kernel::arch::current::cpu::read_rflags` | kernel | 27 | | | |
-| `kernel::ipc::upcall::deliver` | kernel | 14 | | 27 | 22 |
 | `kernel::sched::run_queue::queue_index` | kernel | 26 | 24 | 17 | 17 |
 | `ipc::ipc_call_timeout` | ktest | 18 | 26 | 20 | 18 |
-| `kernel::arch::current::timer::elapsed_us` | kernel | 24 | 24 | 18 | 18 |
-| `kernel::percpu::per_cpu_ptr` | kernel | 24 | 8 | 16 | |
-| `kernel::sched::last_non_idle_tick` | kernel | 24 | 12 | 22 | 10 |
-| `kernel::sched::scheduler_for` | kernel | 20 | 8 | 24 | 6 |
-| `seraph_enter_from_user` | kernel | 24 | 24 | | |
-| 150 functions below 24 each |  | 1023 | 674 | 933 | 666 |
+| 168 functions below 25 each |  | 1210 | 784 | 1082 | 729 |
 
 #### `ktest.ipc_round_trip words=6 cpus=1`
 
@@ -352,30 +347,30 @@ Not taken:
 | `<ipc::IpcMessage>::from_delivery` | ktest | 148 | | 156 | |
 | `<ipc::IpcMessage>::stage_send` | ktest | 120 | | 138 | |
 | `<kernel::sched::run_queue::PerCpuScheduler>::link` | kernel | 122 | 44 | 121 | 40 |
-| `kernel::syscall::ipc::read_data_words` | kernel | 92 | 13 | 116 | 14 |
+| `kernel::syscall::ipc::read_data_words` | kernel | 92 | 13 | 120 | 14 |
 | `<kernel::sched::run_queue::PerCpuScheduler>::dequeue_highest` | kernel | 52 | 32 | 114 | 92 |
 | `kernel::arch::current::interrupts::trap_dispatch` | kernel | | | 96 | 114 |
 | `kernel::syscall::pin_checked` | kernel | 84 | 84 | 104 | 90 |
-| `<kernel::sync::Spinlock>::lock_raw` | kernel | 102 | 99 | 68 | 68 |
 | `kernel::sched::enqueue_and_wake` | kernel | 76 | 46 | 102 | 70 |
+| `<kernel::sync::Spinlock>::lock_raw` | kernel | 101 | 100 | 68 | 68 |
 | `kernel::arch::current::context::switch` | kernel | 92 | 92 | 74 | 74 |
 | `kernel::syscall::ipc::sys_ipc_call` | kernel | 77 | 64 | 85 | 74 |
 | `memcpy` | kernel | 38 | 82 | 4 | 8 |
 | `<kernel::sched::run_queue::RunQueue>::enqueue` | kernel | 74 | 14 | 68 | 16 |
 | `kernel::arch::current::interrupts::handle_trap` | kernel | | | 72 | 57 |
+| `kernel::ipc::endpoint::endpoint_call` | kernel | 63 | 28 | 72 | 56 |
 | `kernel::syscall::dispatch` | kernel | 54 | 69 | 52 | 21 |
-| `kernel::ipc::endpoint::endpoint_call` | kernel | 61 | 21 | 67 | 56 |
 | `kernel::syscall::ipc::sys_ipc_recv` | kernel | 52 | 26 | 65 | 48 |
 | `kernel::sched::commit_blocked_under_local_lock` | kernel | 60 | 31 | 64 | 40 |
 | `kernel::syscall::ipc::sys_ipc_reply` | kernel | 57 | 28 | 63 | 50 |
 | `kernel::sched::select_target_cpu_excluding` | kernel | 16 | 9 | 60 | 15 |
 | `kernel::arch::current::cpu::save_and_disable_interrupts` | kernel | 53 | 58 | 30 | 26 |
 | `kernel::syscall::dispatch_in_range` | kernel | 57 | 57 | 45 | 45 |
-| `kernel::arch::current::cpu::restore_interrupts` | kernel | 30 | 35 | 56 | 54 |
+| `kernel::arch::current::cpu::restore_interrupts` | kernel | 30 | 34 | 56 | 54 |
 | `<kernel::arch::current::trap_frame::TrapFrame>::set_msg_regs` | kernel | 52 | 46 | 52 | 46 |
 | `kernel::arch::current::cpu::current_cpu` | kernel | 26 | 24 | 52 | 12 |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 40 | 24 | 50 | 50 |
-| `kernel::ipc::endpoint::endpoint_recv` | kernel | 41 | 11 | 49 | 18 |
+| `kernel::ipc::endpoint::endpoint_recv` | kernel | 42 | 11 | 49 | 18 |
 | `<kernel::sync::Spinlock>::unlock_raw` | kernel | 15 | 13 | 37 | 39 |
 | `ipc::ipc_reply` | ktest | 4 | 29 | 6 | 37 |
 | `kernel::arch::current::fpu::set_frame_units` | kernel | | | 36 | 28 |
@@ -390,14 +385,14 @@ Not taken:
 | `<kernel::arch::current::trap_frame::TrapFrame>::arg` | kernel | 9 | 30 | 6 | 6 |
 | `<kernel::ipc::message::Message>::data` | kernel | 30 | 18 | 19 | 20 |
 | `<kernel::sched::run_queue::RunQueue>::dequeue` | kernel | 30 | 22 | 26 | 20 |
-| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 30 | 28 |
+| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 30 | 30 |
 | `kernel::syscall::ipc::stage_reply_payload` | kernel | 28 | 25 | 29 | 25 |
 | `<kernel::sched::KernelWake as kernel::sched::WakeView>::affinity` | kernel | 28 | 6 | 12 | 6 |
+| `kernel::ipc::upcall::deliver` | kernel | 14 | | 28 | 22 |
 | `kernel::sched::mark_dispatched` | kernel | 28 | 14 | 26 | 16 |
 | `kernel::sched::run_return_work::<kernel::syscall::finish_syscall_work::{closure#0}, kernel::syscall::finish_syscall_work::{closure#1}>` | kernel | 20 | 5 | 28 | 1 |
 | `kernel::arch::current::cpu::read_rflags` | kernel | 27 | | | |
-| `kernel::ipc::upcall::deliver` | kernel | 14 | | 27 | 22 |
-| 162 functions below 27 each |  | 1214 | 782 | 1062 | 707 |
+| 175 functions below 27 each |  | 1285 | 816 | 1131 | 736 |
 
 #### `ktest.ipc_round_trip words=7 cpus=1`
 
@@ -418,15 +413,15 @@ Not taken:
 | `kernel::arch::current::interrupts::trap_dispatch` | kernel | | | 96 | 114 |
 | `ipc::ipc_call_timeout` | ktest | 18 | 106 | 20 | 91 |
 | `kernel::syscall::pin_checked` | kernel | 84 | 84 | 104 | 90 |
-| `<kernel::sync::Spinlock>::lock_raw` | kernel | 102 | 99 | 68 | 68 |
 | `kernel::sched::enqueue_and_wake` | kernel | 76 | 46 | 102 | 70 |
+| `<kernel::sync::Spinlock>::lock_raw` | kernel | 101 | 100 | 68 | 68 |
 | `kernel::arch::current::context::switch` | kernel | 92 | 92 | 74 | 74 |
 | `kernel::syscall::ipc::sys_ipc_call` | kernel | 77 | 64 | 85 | 74 |
 | `<kernel::sched::run_queue::RunQueue>::enqueue` | kernel | 74 | 14 | 68 | 16 |
 | `ipc::ipc_reply` | ktest | 4 | 69 | 6 | 74 |
 | `kernel::arch::current::interrupts::handle_trap` | kernel | | | 72 | 57 |
+| `kernel::ipc::endpoint::endpoint_call` | kernel | 63 | 28 | 72 | 56 |
 | `kernel::syscall::dispatch` | kernel | 54 | 69 | 52 | 21 |
-| `kernel::ipc::endpoint::endpoint_call` | kernel | 61 | 21 | 67 | 56 |
 | `compiler_builtins::mem::memcpy` | kernel | | | 66 | 65 |
 | `kernel::syscall::ipc::sys_ipc_recv` | kernel | 52 | 26 | 65 | 48 |
 | `kernel::sched::commit_blocked_under_local_lock` | kernel | 60 | 31 | 64 | 40 |
@@ -434,10 +429,10 @@ Not taken:
 | `kernel::sched::select_target_cpu_excluding` | kernel | 16 | 9 | 60 | 15 |
 | `kernel::arch::current::cpu::save_and_disable_interrupts` | kernel | 53 | 58 | 30 | 26 |
 | `kernel::syscall::dispatch_in_range` | kernel | 57 | 57 | 45 | 45 |
-| `kernel::arch::current::cpu::restore_interrupts` | kernel | 30 | 35 | 56 | 54 |
+| `kernel::arch::current::cpu::restore_interrupts` | kernel | 30 | 34 | 56 | 54 |
 | `kernel::arch::current::cpu::current_cpu` | kernel | 26 | 24 | 52 | 12 |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 40 | 24 | 50 | 50 |
-| `kernel::ipc::endpoint::endpoint_recv` | kernel | 41 | 11 | 49 | 18 |
+| `kernel::ipc::endpoint::endpoint_recv` | kernel | 42 | 11 | 49 | 18 |
 | `ipc::ipc_recv_timeout` | ktest | 14 | 49 | 15 | 31 |
 | `<kernel::sync::Spinlock>::unlock_raw` | kernel | 15 | 13 | 37 | 39 |
 | `memcpy` | kernel | 39 | 39 | 4 | 4 |
@@ -453,14 +448,13 @@ Not taken:
 | `<kernel::arch::current::trap_frame::TrapFrame>::arg` | kernel | 9 | 30 | 6 | 6 |
 | `<kernel::ipc::message::Message>::data` | kernel | 30 | 18 | 19 | 20 |
 | `<kernel::sched::run_queue::RunQueue>::dequeue` | kernel | 30 | 22 | 26 | 20 |
-| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 30 | 28 |
+| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 30 | 30 |
 | `kernel::syscall::ipc::stage_reply_payload` | kernel | 28 | 25 | 29 | 25 |
 | `<kernel::sched::KernelWake as kernel::sched::WakeView>::affinity` | kernel | 28 | 6 | 12 | 6 |
+| `kernel::ipc::upcall::deliver` | kernel | 14 | | 28 | 22 |
 | `kernel::sched::mark_dispatched` | kernel | 28 | 14 | 26 | 16 |
 | `kernel::sched::run_return_work::<kernel::syscall::finish_syscall_work::{closure#0}, kernel::syscall::finish_syscall_work::{closure#1}>` | kernel | 20 | 5 | 28 | 1 |
-| `kernel::arch::current::cpu::read_rflags` | kernel | 27 | | | |
-| `kernel::ipc::upcall::deliver` | kernel | 14 | | 27 | 22 |
-| 164 functions below 27 each |  | 1228 | 805 | 1083 | 730 |
+| 178 functions below 28 each |  | 1326 | 839 | 1152 | 759 |
 
 #### `ktest.ipc_round_trip words=0 fpu=both cpus=1`
 
@@ -477,33 +471,33 @@ Not taken:
 | `<kernel::sched::run_queue::PerCpuScheduler>::dequeue_highest` | kernel | 52 | 32 | 114 | 92 |
 | `kernel::arch::current::interrupts::trap_dispatch` | kernel | | | 96 | 114 |
 | `kernel::syscall::pin_checked` | kernel | 84 | 84 | 104 | 90 |
-| `<kernel::sync::Spinlock>::lock_raw` | kernel | 102 | 99 | 68 | 68 |
 | `kernel::sched::enqueue_and_wake` | kernel | 76 | 46 | 102 | 70 |
+| `<kernel::sync::Spinlock>::lock_raw` | kernel | 101 | 100 | 68 | 68 |
 | `kernel::arch::current::context::switch` | kernel | 92 | 92 | 74 | 74 |
 | `kernel::syscall::ipc::sys_ipc_call` | kernel | 73 | 62 | 84 | 74 |
 | `<kernel::sched::run_queue::RunQueue>::enqueue` | kernel | 74 | 14 | 68 | 16 |
 | `<ipc::IpcMessage>::stage_send` | ktest | 74 | | 70 | |
 | `kernel::arch::current::interrupts::handle_trap` | kernel | | | 72 | 57 |
+| `kernel::ipc::endpoint::endpoint_call` | kernel | 63 | 28 | 72 | 56 |
 | `kernel::syscall::dispatch` | kernel | 54 | 69 | 52 | 21 |
 | `kernel::arch::current::fpu::restore_fp_from` | kernel | | | 68 | 68 |
-| `kernel::ipc::endpoint::endpoint_call` | kernel | 61 | 21 | 67 | 56 |
 | `kernel::syscall::ipc::sys_ipc_recv` | kernel | 52 | 26 | 65 | 48 |
 | `kernel::sched::commit_blocked_under_local_lock` | kernel | 60 | 31 | 64 | 40 |
 | `kernel::syscall::ipc::sys_ipc_reply` | kernel | 57 | 28 | 63 | 50 |
 | `kernel::sched::select_target_cpu_excluding` | kernel | 16 | 9 | 60 | 15 |
 | `kernel::arch::current::cpu::save_and_disable_interrupts` | kernel | 53 | 58 | 30 | 26 |
 | `kernel::syscall::dispatch_in_range` | kernel | 57 | 57 | 45 | 45 |
-| `kernel::arch::current::cpu::restore_interrupts` | kernel | 30 | 35 | 56 | 54 |
+| `kernel::arch::current::cpu::restore_interrupts` | kernel | 30 | 34 | 56 | 54 |
 | `kernel::arch::current::cpu::current_cpu` | kernel | 26 | 24 | 52 | 12 |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 40 | 24 | 50 | 50 |
-| `kernel::ipc::endpoint::endpoint_recv` | kernel | 41 | 11 | 49 | 18 |
+| `kernel::ipc::endpoint::endpoint_recv` | kernel | 42 | 11 | 49 | 18 |
 | `kernel::arch::current::fpu::set_frame_units` | kernel | | | 44 | 34 |
 | `<kernel::sync::Spinlock>::unlock_raw` | kernel | 15 | 13 | 37 | 39 |
 | `kernel::arch::current::fpu::save_v_to` | kernel | | | 36 | 36 |
 | `kernel::syscall::finish_syscall_work` | kernel | 17 | 20 | 18 | 36 |
 | `kernel::arch::current::encoding::ticks_to_us` | kernel | | | 34 | 34 |
 | `kernel::arch::current::fpu::restore_v_from` | kernel | | | 34 | 34 |
-| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 34 | 28 |
+| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 34 | 30 |
 | `kernel::ipc::endpoint::bind_next_sender` | kernel | 21 | 18 | 33 | 34 |
 | `kernel::syscall::ipc::deliver_message` | kernel | 16 | 32 | 24 | 34 |
 | `kernel::syscall::pin_checked::{closure#0}` | kernel | 34 | 24 | 34 | 34 |
@@ -514,14 +508,14 @@ Not taken:
 | `<kernel::ipc::message::Message>::data` | kernel | 30 | 18 | 19 | 20 |
 | `<kernel::sched::run_queue::RunQueue>::dequeue` | kernel | 30 | 22 | 26 | 20 |
 | `<kernel::sched::KernelWake as kernel::sched::WakeView>::affinity` | kernel | 28 | 6 | 12 | 6 |
+| `kernel::ipc::upcall::deliver` | kernel | 14 | | 28 | 22 |
 | `kernel::sched::mark_dispatched` | kernel | 28 | 14 | 26 | 16 |
 | `kernel::sched::run_return_work::<kernel::syscall::finish_syscall_work::{closure#0}, kernel::syscall::finish_syscall_work::{closure#1}>` | kernel | 20 | 5 | 28 | 1 |
 | `kernel::syscall::ipc::stage_reply_payload` | kernel | 27 | 22 | 28 | 22 |
 | `kernel::arch::current::cpu::read_rflags` | kernel | 27 | | | |
-| `kernel::ipc::upcall::deliver` | kernel | 14 | | 27 | 22 |
 | `kernel::sched::run_queue::queue_index` | kernel | 26 | 24 | 17 | 17 |
 | `ipc::ipc_call_timeout` | ktest | 18 | 26 | 20 | 18 |
-| 160 functions below 25 each |  | 1144 | 755 | 1053 | 728 |
+| 173 functions below 26 each |  | 1215 | 789 | 1120 | 757 |
 
 #### `ktest.notification_roundtrip cpus=1`
 
@@ -543,11 +537,11 @@ Not taken:
 | `kernel::syscall::ipc::sys_notification_send` | kernel | 80 | 70 | 80 | 68 |
 | `kernel::syscall::dispatch_in_range` | kernel | 76 | 78 | 60 | 62 |
 | `kernel::syscall::finish_syscall_work` | kernel | 34 | 40 | 36 | 72 |
+| `kernel::ipc::notification::notification_send` | kernel | 60 | 43 | 68 | 52 |
 | `kernel::syscall::pin_checked::{closure#0}` | kernel | 68 | 48 | 68 | 68 |
-| `kernel::ipc::notification::notification_send` | kernel | 60 | 43 | 64 | 52 |
 | `kernel::sched::run_return_work::<kernel::syscall::finish_syscall_work::{closure#0}, kernel::syscall::finish_syscall_work::{closure#1}>` | kernel | 42 | 12 | 57 | 3 |
+| `kernel::ipc::upcall::deliver` | kernel | 28 | | 56 | 44 |
 | `kernel::arch::current::cpu::save_and_disable_interrupts` | kernel | 54 | 48 | 29 | 26 |
-| `kernel::ipc::upcall::deliver` | kernel | 28 | | 54 | 44 |
 | `kernel::sched::enqueue_and_wake` | kernel | 38 | 23 | 52 | 36 |
 | `kernel::arch::current::cpu::restore_interrupts` | kernel | 29 | 33 | 50 | 49 |
 | `kernel::ipc::notification::notification_wait` | kernel | 43 | 21 | 35 | 22 |
@@ -561,7 +555,7 @@ Not taken:
 | `<kernel::sync::Spinlock>::unlock_raw` | kernel | 18 | 12 | 34 | 35 |
 | `<kernel::ipc::WaitQueue>::unlink` | kernel | 34 | 20 | 26 | 16 |
 | `kernel::arch::current::fpu::restore_fp_from` | kernel | | | 34 | 34 |
-| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 33 | 29 |
+| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 33 | 31 |
 | `<kernel::cap::cspace::CSpace>::leaf_ptr` | kernel | 32 | 12 | 24 | 24 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 32 | 32 | 32 | 32 |
 | `kernel::sched::commit_blocked_under_local_lock` | kernel | 30 | 18 | 32 | 20 |
@@ -571,13 +565,13 @@ Not taken:
 | `kernel::sched::select_target_cpu_excluding` | kernel | 8 | 1 | 30 | 2 |
 | `kernel::cap::object::release_ref` | kernel | 28 | | 28 | |
 | `kernel::sched::mark_dispatched` | kernel | 28 | 14 | 26 | 16 |
+| `kernel::syscall::finish_syscall_work::{closure#1}` | kernel | 24 | 10 | 28 | 12 |
 | `kernel::sched::run_queue::queue_index` | kernel | 26 | 24 | 17 | 17 |
 | `kernel::arch::current::cpu::read_percpu_ptr::<kernel::sched::thread::ThreadControlBlock, 104>` | kernel | 24 | 24 | 24 | 24 |
 | `kernel::cap::object::reclaim_deferred_stack` | kernel | 14 | 6 | 24 | 6 |
 | `kernel::percpu::current_scheduler` | kernel | 24 | | 18 | |
-| `kernel::percpu::per_cpu_ptr` | kernel | 24 | 8 | 16 | |
+| `kernel::percpu::per_cpu_ptr` | kernel | 24 | 8 | 18 | |
 | `kernel::sched::last_non_idle_tick` | kernel | 24 | 12 | 22 | 10 |
-| `kernel::syscall::finish_syscall_work::{closure#1}` | kernel | 24 | 10 | 24 | 12 |
 | `kernel::syscall::stamp_syscall_entry` | kernel | 24 | 16 | 20 | 8 |
 | `kernel::arch::current::gdt::load_iopb` | kernel | 22 | 5 | | |
 | `kernel::syscall::lookup_cap::<kernel::cap::slot::NotificationCap>` | kernel | 14 | 14 | 22 | 22 |
@@ -587,14 +581,13 @@ Not taken:
 | `<kernel::cap::object::KernelObjectHeader>::inc_ref` | kernel | 20 | 4 | 8 | 12 |
 | `<kernel::cap::slot::Rights>::contains` | kernel | 20 | 20 | 12 | 12 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 16 | 16 | 20 | 20 |
-| `kernel::ipc::claim_waiter` | kernel | 2 | 2 | 20 | 4 |
-| `kernel::ipc::upcall::deliver_at_syscall` | kernel | 20 | 10 | 18 | 12 |
+| `kernel::ipc::upcall::deliver_at_syscall` | kernel | 20 | 10 | 16 | 12 |
 | `kernel::syscall::leave_syscall` | kernel | 20 | 14 | 20 | 12 |
 | `kernel::sched::requeue_local` | kernel | 3 | 19 | 3 | 13 |
 | `<kernel::arch::current::trap_frame::TrapFrame>::arg` | kernel | 8 | 18 | 8 | 4 |
 | `<kernel::syscall::PinnedCap as core::ops::drop::Drop>::drop` | kernel | 13 | | 18 | |
 | `kernel::arch::current::fpu::switch_out_save` | kernel | 14 | 14 | 18 | 18 |
-| 102 functions below 18 each |  | 560 | 369 | 555 | 401 |
+| 103 functions below 18 each |  | 562 | 371 | 553 | 405 |
 
 #### `ktest.cap_create_delete cpus=1`
 
@@ -954,38 +947,36 @@ Not taken:
 
 | Function | Image | x86_64 dev | x86_64 release | riscv64 dev | riscv64 release |
 |---|---|---:|---:|---:|---:|
-| `memset` | kernel | 7139 | 7097 | 21306 | 21306 |
+| `memset` | kernel | 7139 | 7097 | 21309 | 21309 |
 | `kernel::arch::current::cpu::fill_words` | kernel | 2051 | 2051 | 2584 | 2566 |
 | `<kernel::cap::cspace::CSpace>::grow` | kernel | 2280 | 1671 | 2350 | 1787 |
 | `kernel::stack_depth::lowest_written::<kernel::stack_depth::used_bytes::{closure#0}>` | kernel | 1827 | 1129 | 1218 | 1446 |
 | `<kernel::cap::cspace::CSpace>::slot_mut` | kernel | 1460 | 948 | 1826 | 1720 |
 | `kernel::stack_depth::used_bytes::{closure#0}` | kernel | 1624 | | 1567 | 304 |
 | `<kernel::cap::registry::CSpaceRegistry>::entry` | kernel | 1386 | 420 | 1232 | 457 |
-| `kernel::cap::derivation::resolve_slot_mut` | kernel | 966 | 665 | 1138 | 145 |
+| `kernel::cap::derivation::resolve_slot_mut` | kernel | 282 | 665 | 1138 | 145 |
 | `<kernel::cap::registry::CSpaceRegistry>::slot` | kernel | 924 | 495 | 847 | 478 |
-| `<kernel::cap::registry::CSpaceRegistry>::lookup` | kernel | 826 | 594 | 906 | 529 |
+| `<kernel::cap::registry::CSpaceRegistry>::lookup` | kernel | 883 | 594 | 906 | 529 |
 | `<kernel::cap::slot::CapabilitySlot>::set_next_free` | kernel | 460 | 460 | 845 | 845 |
 | `<kernel::cap::cspace::CSpace>::leaf_ptr` | kernel | 816 | 310 | 612 | 612 |
 | `kernel::arch::current::interrupts::entry::trap_entry` | kernel | | | 795 | 795 |
 | `kernel::syscall::pin_checked` | kernel | 546 | 350 | 676 | 585 |
-| `kernel::cap::drain::drain_batch` | kernel | 659 | 650 | 606 | 538 |
+| `kernel::cap::drain::drain_batch` | kernel | 661 | 650 | 606 | 538 |
 | `kernel::cap::cspace::fill_sentinel::<kernel::cap::cspace::CSpacePage, 128>` | kernel | 448 | 176 | 641 | 385 |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 443 | 264 | 566 | 477 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 530 | 530 | | |
+| `kernel::cap::drain::examine` | kernel | 513 | 344 | 455 | 399 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 408 | 407 | 510 | 510 |
-| `kernel::cap::drain::examine` | kernel | 456 | 344 | 455 | 399 |
-| `kernel::cap::drain::examine::{closure#0}` | kernel | 448 | | 224 | |
 | `kernel::cap::arena::sort_list::<kernel::cap::object::ArenaPage, kernel::cap::object::free_donation_group::{closure#1}, kernel::cap::object::free_donation_group::{closure#2}, kernel::cap::object::free_donation_group::{closure#3}, kernel::cap::object::free_donation_group::{closure#0}>` | kernel | 417 | 392 | 298 | 325 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 359 | 359 | 359 | 359 |
 | `kernel::arch::current::interrupts::trap_dispatch` | kernel | | | 272 | 321 |
-| `<kernel::cap::slot::CapTag as core::cmp::PartialEq>::eq` | kernel | 320 | 223 | 238 | 160 |
 | `kernel::cap::cspace::fill_sentinel::<kernel::cap::cspace::DirPage<kernel::cap::cspace::CSpacePage>, 64>` | kernel | 224 | 88 | 320 | 194 |
 | `kernel::cap::cspace::fill_sentinel::<kernel::cap::cspace::DirPage<kernel::cap::cspace::DirPage<kernel::cap::cspace::CSpacePage>>, 63>` | kernel | 256 | 90 | 315 | 191 |
 | `kernel::stack_depth::lowest_written::<kernel::stack_depth::used_bytes::{closure#0}>::{closure#0}` | kernel | 245 | 312 | | |
-| `<kernel::sync::Spinlock>::lock_raw` | kernel | 310 | 299 | 235 | 224 |
+| `<kernel::sync::Spinlock>::lock_raw` | kernel | 311 | 299 | 235 | 224 |
 | `kernel::cap::cspace::load_at::<kernel::cap::cspace::CSpacePage>` | kernel | | | 204 | 306 |
 | `<kernel::cap::cspace::CSpace>::for_each_object_by_leaf::<kernel::cap::object::dealloc_object_one::{closure#5}, kernel::cap::object::dealloc_object_one::{closure#4}>` | kernel | 271 | 263 | 295 | 284 |
-| 475 functions below 274 each |  | 10752 | 7824 | 11363 | 8109 |
+| 477 functions below 273 each |  | 10847 | 8048 | 11818 | 8272 |
 
 #### `ktest.context_switch_pair cpus=1`
 
@@ -1005,14 +996,14 @@ Not taken:
 | `kernel::arch::current::fpu::set_frame_units` | kernel | | | 40 | 31 |
 | `<kernel::sync::Spinlock>::lock_raw` | kernel | 36 | 36 | 24 | 24 |
 | `kernel::arch::current::fpu::restore_fp_from` | kernel | | | 34 | 34 |
-| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 33 | 29 |
+| `kernel::arch::current::fpu::switch_in_restore` | kernel | 16 | 18 | 33 | 31 |
 | `kernel::arch::current::cpu::current_cpu` | kernel | 22 | 20 | 32 | 4 |
 | `kernel::sched::run_queue::queue_index` | kernel | 32 | 30 | 22 | 22 |
 | `kernel::syscall::dispatch_in_range` | kernel | 30 | 32 | 20 | 22 |
 | `kernel::sched::requeue_local` | kernel | 6 | 30 | 6 | 14 |
 | `<kernel::sched::run_queue::RunQueue>::dequeue` | kernel | 28 | 20 | 24 | 18 |
 | `kernel::sched::mark_dispatched` | kernel | 28 | 14 | 26 | 16 |
-| `kernel::percpu::per_cpu_ptr` | kernel | 24 | 8 | 16 | |
+| `kernel::percpu::per_cpu_ptr` | kernel | 24 | 8 | 18 | |
 | `kernel::sched::last_non_idle_tick` | kernel | 24 | 12 | 22 | 10 |
 | `kernel::arch::current::gdt::load_iopb` | kernel | 22 | 5 | | |
 | `<kernel::sched::Outgoing>::owned_by_another_cpu` | kernel | 20 | 20 | 12 | 6 |
@@ -1034,8 +1025,8 @@ Not taken:
 | `__x86_indirect_thunk_r11` | kernel | 10 | 10 | | |
 | `kernel::percpu::set_current_thread` | kernel | 10 | 2 | 8 | 2 |
 | `kernel::sched::watchdog_mark_non_idle` | kernel | 6 | 4 | 6 | 10 |
-| `kernel::arch::current::fpu::make_live` | kernel | | | 9 | 4 |
 | `<kernel::sched::fpu_switch::Owner>::of::<kernel::sched::thread::ThreadControlBlock>` | kernel | 8 | 8 | 2 | 2 |
+| `kernel::arch::current::fpu::make_live` | kernel | | | 8 | 4 |
 | `kernel::arch::current::fpu::restore_from` | kernel | 8 | 6 | | |
 | `kernel::arch::current::fpu::save_to` | kernel | 8 | 6 | | |
 | `kernel::arch::current::fpu::units_off` | kernel | | | 8 | 8 |
@@ -1062,7 +1053,7 @@ Not taken:
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 62 | 62 | | |
 | `kernel::syscall::pin_checked` | kernel | 42 | 42 | 52 | 45 |
 | `boot_protocol::riscv_paging::level_shift` | kernel | | | 48 | 48 |
-| `kernel::syscall::thread::sys_thread_read_mem` | kernel | 29 | 33 | 44 | 42 |
+| `kernel::syscall::thread::sys_thread_read_mem` | kernel | 32 | 33 | 40 | 42 |
 | `kernel::arch::current::paging::descend_existing::<kernel::mm::paging::phys_to_virt>` | kernel | | | 40 | 23 |
 | `kernel::mm::address_space::page_spans::{closure#0}` | kernel | 25 | 38 | 37 | 39 |
 | `kernel::arch::current::interrupts::trap_dispatch` | kernel | | | 32 | 38 |
@@ -1073,7 +1064,7 @@ Not taken:
 | `kernel::arch::current::paging::names_table` | kernel | 12 | 30 | | |
 | `kernel::arch::current::paging::translate_user_page` | kernel | 30 | 12 | 12 | 2 |
 | `kernel::arch::current::paging::entry` | kernel | | | 28 | 26 |
-| 94 functions below 27 each |  | 440 | 307 | 468 | 349 |
+| 94 functions below 27 each |  | 443 | 307 | 466 | 349 |
 
 #### `ktest.event_post_recv cpus=1`
 
@@ -1084,8 +1075,8 @@ Not taken:
 | `kernel::syscall::pin_checked` | kernel | 84 | 84 | 104 | 90 |
 | `kernel::arch::current::interrupts::trap_dispatch` | kernel | | | 64 | 76 |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 40 | 24 | 50 | 50 |
+| `kernel::ipc::event_queue::event_queue_post` | kernel | 40 | 22 | 49 | 40 |
 | `kernel::arch::current::interrupts::handle_trap` | kernel | | | 48 | 38 |
-| `kernel::ipc::event_queue::event_queue_post` | kernel | 40 | 22 | 47 | 40 |
 | `kernel::syscall::dispatch` | kernel | 36 | 46 | 34 | 14 |
 | `kernel::syscall::ipc::sys_event_recv` | kernel | 45 | 31 | 44 | 42 |
 | `kernel::syscall::dispatch_in_range` | kernel | 38 | 38 | 30 | 30 |
@@ -1187,9 +1178,9 @@ Not taken:
 | `<kernel::cap::slot::CapTag as core::cmp::PartialEq>::eq` | kernel | 37 | 18 | 26 | 17 |
 | `<kernel::ipc::wait_set::WaitSetState>::pop_ready::<&kernel::ipc::wait_set::next_ready_member::{closure#0}>` | kernel | 36 | 21 | 37 | 23 |
 | `kernel::ipc::wait_set::waitset_remove` | kernel | 36 | 18 | 18 | 13 |
-| `kernel::ipc::wait_set::waitset_add` | kernel | 23 | 12 | 34 | 29 |
 | `<kernel::cap::cspace::CSpace>::insert_cap` | kernel | 30 | 3 | 33 | 4 |
 | `kernel::cap::cspace::load_at::<kernel::cap::cspace::CSpacePage>::{closure#0}` | kernel | 16 | 32 | 16 | |
+| `kernel::ipc::wait_set::waitset_add` | kernel | 23 | 12 | 32 | 29 |
 | `<kernel::cap::slot::Rights>::contains` | kernel | 31 | 24 | 19 | 19 |
 | `<kernel::ipc::wait_set::WaitSetState>::install::<kernel::ipc::wait_set::waitset_add::{closure#0}>` | kernel | 30 | 23 | 31 | 27 |
 | `kernel::cap::object::dealloc_object::{closure#0}` | kernel | 1 | 17 | 3 | 31 |

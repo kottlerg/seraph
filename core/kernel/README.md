@@ -124,6 +124,7 @@ core/kernel/
 │   │   ├── event_queue.rs      # Event queue: ring buffer
 │   │   ├── fault.rs            # Fault redirection to a thread's fault handler
 │   │   ├── message.rs          # IPC message type: label, data words, cap slots
+│   │   ├── recv_park.rs        # Endpoint receive queue, per-CPU parked-receiver table
 │   │   ├── upcall.rs           # Asynchronous upcalls: post, mask, delivery points
 │   │   └── wait_set.rs         # Wait set: multi-source aggregation
 │   ├── klog/                   # Kernel log
@@ -235,9 +236,11 @@ per-CPU buffered block; userspace draws from the same generators through
 
 IPC kernel objects: endpoints for synchronous call/reply, notifications for coalescing async
 notification, event queues for ordered async notification, and wait sets for
-multiplexed waiting. Notifications, event queues, and wait sets queue their blocked waiters
-through `ipc::WaitQueue` in `mod.rs`, which also holds the shared waiter claims and timed-park
-arming.
+multiplexed waiting. Notifications, event queues, wait sets and an endpoint's callers queue their
+blocked waiters through `ipc::WaitQueue` in `mod.rs`, which also holds the shared waiter claims and
+timed-park arming. An endpoint's receivers queue through `RecvQueue` in `recv_park.rs`, a
+`WaitQueue` whose parks are recorded in the parking CPU's parked-receiver table, through which a
+call prefers a receiver parked on its CPU.
 See [`docs/ipc-internals.md`](docs/ipc-internals.md).
 
 ### `klog/`

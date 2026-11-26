@@ -1946,7 +1946,7 @@ fn reply_dropping_caps(msg: &IpcMessage, opcode: u64, code: u64, reply: &mut Rep
             let _ = syscall::cap_delete(cap);
         }
     }
-    reply.set(builder.build());
+    reply.set_or_delete_caps(builder.build());
 }
 
 /// `FS_RELEASE_MEMORY` against an open cap: drop the open's outstanding

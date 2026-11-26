@@ -199,10 +199,10 @@ Not taken:
 
 | Configuration | Head | Taken | QEMU | Checked against |
 |---|---|---|---|---|
-| x86_64 dev | `cd7761f897e1` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| x86_64 release | `cd7761f897e1` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| riscv64 dev | `cd7761f897e1` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| riscv64 release | `cd7761f897e1` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| x86_64 dev | `4450ecbe9849` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| x86_64 release | `4450ecbe9849` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| riscv64 dev | `4450ecbe9849` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| riscv64 release | `4450ecbe9849` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
 
 #### Totals
 
@@ -594,10 +594,9 @@ Not taken:
 | `kernel::sched::run_return_work::<kernel::syscall::finish_syscall_work::{closure#0}, kernel::syscall::finish_syscall_work::{closure#1}>` | kernel | 20 | 5 | 28 | 1 |
 | `kernel::syscall::ipc::deposit_reply` | kernel | 28 | 21 | 28 | 18 |
 | `kernel::syscall::ipc::stage_reply_payload` | kernel | 27 | 22 | 28 | 22 |
-| `ipc::ipc_reply_recv` | ktest | 21 | 28 | 21 | 24 |
 | `kernel::ipc::upcall::deliver` | kernel | 14 | | 27 | 22 |
 | `ipc::ipc_call_timeout` | ktest | 18 | 26 | 20 | 18 |
-| 177 functions below 25 each |  | 1189 | 751 | 1096 | 723 |
+| 179 functions below 25 each |  | 1210 | 779 | 1117 | 747 |
 
 #### `ktest.notification_roundtrip cpus=1`
 

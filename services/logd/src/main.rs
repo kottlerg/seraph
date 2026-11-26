@@ -1817,14 +1817,15 @@ enum Wrote
     /// The driver took every byte and, with a barrier, saw them leave the
     /// device: the line is written.
     All,
-    /// The driver took every byte but the barrier was not answered with
-    /// success: the serial driver's `STALLED` on a transmitter that made no
-    /// progress, or a failed call. The bytes are the driver's, and leave the
-    /// device when its transmitter moves again.
+    /// The driver took every byte, but the barrier was answered with anything
+    /// but success (the serial driver's `STALLED` on a transmitter that made
+    /// no progress) or not answered within its bound. The bytes are the
+    /// driver's, and leave the device when its transmitter moves again.
     Held,
-    /// The driver did not take every byte: a call failed, its bound passed,
-    /// or the driver answered a chunk with anything but success. The line is
-    /// not written whole.
+    /// The driver did not take every byte: a chunk's call failed or was not
+    /// answered within its bound, or the driver answered it with anything but
+    /// success; or the barrier's call failed, so the driver is gone with the
+    /// bytes it took. The line is not written whole.
     Lost,
 }
 
@@ -1843,31 +1844,50 @@ fn write_line(cap: u64, op: u64, sent: u64, bytes: &[u8], ipc_buf: *mut u64, bou
     let taken = bytes.chunks(SERIAL_CHUNK).all(|chunk| {
         bound
             .next_ms()
-            .is_some_and(|ms| call_chunk(cap, op, chunk, ipc_buf, ms))
+            .is_some_and(|ms| call_chunk(cap, op, chunk, ipc_buf, ms) == Answer::Taken)
     });
     if !taken
     {
         return Wrote::Lost;
     }
     if sent == 0
-        || bound
-            .next_ms()
-            .is_some_and(|ms| call_chunk(cap, op | sent, &[], ipc_buf, ms))
     {
-        Wrote::All
+        return Wrote::All;
     }
+    let Some(ms) = bound.next_ms()
     else
     {
-        Wrote::Held
+        return Wrote::Held;
+    };
+    match call_chunk(cap, op | sent, &[], ipc_buf, ms)
+    {
+        Answer::Taken => Wrote::All,
+        Answer::Refused | Answer::Unanswered => Wrote::Held,
+        Answer::Failed => Wrote::Lost,
     }
 }
 
+/// How the driver answered one [`call_chunk`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answer
+{
+    /// Success: the driver took the call's bytes, and for a barrier saw them
+    /// leave.
+    Taken,
+    /// Any other answer, the serial driver's `STALLED` among them.
+    Refused,
+    /// No answer within the call's bound (`WouldBlock`): the driver may
+    /// still be serving the call.
+    Unanswered,
+    /// The call failed: the driver's endpoint is gone, which for a resolved
+    /// driver means devmgr withdrew it, or the driver dropped the call.
+    Failed,
+}
+
 /// One `op` call of `chunk` to the driver behind `cap`, bounded by
-/// `timeout_ms` (0: no bound); whether the driver took it: the call returned
-/// and its answer is success. Any other answer, the serial driver's
-/// `STALLED` among them, is a write the driver did not complete
-/// ([`write_line`] says what that means of the bytes).
-fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u32) -> bool
+/// `timeout_ms` (0: no bound), and how the driver answered it
+/// ([`write_line`] says what each answer means of the bytes).
+fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u32) -> Answer
 {
     let label = op | ((chunk.len() as u64) << 16);
     let msg = IpcMessage::builder(label).bytes(0, chunk).build();
@@ -1875,8 +1895,13 @@ fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u3
     // worker calls here (inline) while it serves a request, which was copied
     // out of the page as it was received, and its pending reply stays bound
     // across this call (`docs/ipc-design.md` § Multi-threaded servers).
-    unsafe { ipc::ipc_call_timeout(cap, &msg, ipc_buf, timeout_ms) }
-        .is_ok_and(|reply| reply.label == WRITE_SUCCESS)
+    match unsafe { ipc::ipc_call_timeout(cap, &msg, ipc_buf, timeout_ms) }
+    {
+        Ok(reply) if reply.label == WRITE_SUCCESS => Answer::Taken,
+        Ok(_) => Answer::Refused,
+        Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => Answer::Unanswered,
+        Err(_) => Answer::Failed,
+    }
 }
 
 /// The answer to a write that the driver took: `SUCCESS` of the serial and

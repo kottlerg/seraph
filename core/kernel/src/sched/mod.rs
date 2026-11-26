@@ -20,6 +20,7 @@ pub mod deadline_heap;
 pub mod fpu_switch;
 pub mod hold;
 pub mod registry_list;
+pub mod run_limit;
 pub mod run_queue;
 pub mod thread;
 #[cfg(not(test))]
@@ -2898,6 +2899,9 @@ fn idle_tcb(cpu: usize, stack_top: u64) -> ThreadControlBlock
         upcall_cookie: core::sync::atomic::AtomicU64::new(0),
         upcall_any_instruction: core::sync::atomic::AtomicBool::new(false),
         upcall_masked: core::sync::atomic::AtomicBool::new(false),
+        run_limit: core::sync::atomic::AtomicU32::new(0),
+        run_count: core::sync::atomic::AtomicU32::new(0),
+        run_limit_pending: core::sync::atomic::AtomicBool::new(false),
         is_user: false,
         saved_state: idle_saved_state(cpu, stack_top),
         kernel_stack_top: stack_top,
@@ -9100,6 +9104,14 @@ pub unsafe fn timer_tick()
         saved = unsafe { sched.lock.lock_raw() };
     }
 
+    // Count the tick toward the run limit of a non-idle current thread, under
+    // this CPU's scheduler lock and before the slice decision, so a tick that
+    // skips a switch still counts (core/kernel/docs/scheduler.md § Run Limit).
+    // The idle thread has no limit.
+    // SAFETY: current validated non-null above and is this CPU's current
+    // thread; interrupt context with this CPU's scheduler lock held.
+    let run_limit_fault = unsafe { run_limit::tick(current) };
+
     // SAFETY: current validated non-null above; slice_remaining is always valid.
     let remaining = unsafe { (*current).slice_remaining };
     let Some((slice, reschedule)) = sched.tick_outcome(remaining).slice_and_reschedule()
@@ -9147,9 +9159,17 @@ pub unsafe fn timer_tick()
     };
     if tick_switches(preemption)
     {
-        // SAFETY: schedule() re-acquires the lock and performs a context switch.
-        // Requeue::Always: the expired thread goes back to its queue's tail.
-        unsafe { schedule(Requeue::Always) };
+        // A run-limit fault pending on the thread is delivered at its return
+        // to user mode, which switches it away for the fault's handler or
+        // ends it; a switch here would leave the fault's return-work bit on
+        // this CPU to the next thread's return.
+        if !run_limit_fault
+        {
+            // SAFETY: schedule() re-acquires the lock and performs a context
+            // switch. Requeue::Always: the expired thread goes back to its
+            // queue's tail.
+            unsafe { schedule(Requeue::Always) };
+        }
     }
     else
     {
@@ -9250,8 +9270,9 @@ unsafe fn preempt_outranked(sched: &PerCpuScheduler) -> bool
 /// this CPU's return-work word ([`crate::percpu::return_work_pending`]) for
 /// the bits this return handles (`percpu::return_work::AT_INTERRUPT`), and,
 /// only when one is set, [`interrupt_return_slow`] with `deliver`, the
-/// interrupt delivery point of an upcall (docs/fault-handling.md § Delivery
-/// points; core/kernel/docs/scheduling-internals.md § Return Work).
+/// delivery of a pending run-limit fault ([`run_limit::deliver_at_interrupt`])
+/// and the interrupt delivery point of an upcall (docs/fault-handling.md
+/// § Delivery points; core/kernel/docs/scheduling-internals.md § Return Work).
 ///
 /// # Safety
 /// As for [`preempt_if_outranked`], at the end of an interrupt taken from user

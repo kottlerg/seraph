@@ -1124,16 +1124,16 @@ terminal when:
 
 On the first terminal end of the address space, a terminal fault or a `SYS_ASPACE_EXIT` by any
 thread in it, the kernel posts the end's reason (`EXIT_FAULT_BASE + vector` on x86-64,
-`EXIT_FAULT_BASE + cause` on riscv64, for a fault; the encoded exit code for an exit) to each bound
-observer. The address space dies once: a later terminal fault or exit of another of its threads
-posts nothing to them. Every terminal fault and every `SYS_ASPACE_EXIT` exits its calling thread,
-and the kernel stops no other thread. `SYS_THREAD_EXIT` ends only the caller and posts only its
-thread's observers. A stopped faulting thread is the exception in timing
-only: whether the stop cancelled the episode or a `KILL` reply had already claimed it, the
-terminal fault takes effect, and is posted, only if the thread is started again (see
-[Fault Handling](fault-handling.md#delivery-resume-and-kill)). The fault of a restartable syscall's
-copy of a user buffer is never terminal: in each of the cases above it fails that syscall with
-`InvalidAddress`, the thread runs on, and nothing is posted (see
+`EXIT_FAULT_BASE + cause` on riscv64, for a fault; `EXIT_RUN_LIMIT` for a run-limit fault; the
+encoded exit code for an exit) to each bound observer. The address space dies once: a later
+terminal fault or exit of another of its threads posts nothing to them. Every terminal fault and
+every `SYS_ASPACE_EXIT` exits its calling thread, and the kernel stops no other thread.
+`SYS_THREAD_EXIT` ends only the caller and posts only its thread's observers. A stopped faulting
+thread is the exception in timing only: whether the stop cancelled the episode or a `KILL` reply had
+already claimed it, the terminal fault takes effect, and is posted, only if the thread is started
+again (see [Fault Handling](fault-handling.md#delivery-resume-and-kill)). The fault of a restartable
+syscall's copy of a user buffer is never terminal: in each of the cases above it fails that syscall
+with `InvalidAddress`, the thread runs on, and nothing is posted (see
 [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)).
 
 procmgr binds such an observer at process creation, so a fatal fault or an exit on any thread — a

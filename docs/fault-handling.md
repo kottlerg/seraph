@@ -21,6 +21,8 @@ In scope:
 - The faults a syscall's copy of a caller-supplied buffer takes, and the restart of
   that syscall.
 - Liveness, recursion, and security rules.
+- The run-limit fault, an exception the kernel raises asynchronously
+  ([Run-Limit Faults](#run-limit-faults)).
 - The asynchronous upcall: its post, delivery points, mask, interaction with blocking syscalls,
   and nesting ([Asynchronous Upcalls](#asynchronous-upcalls)).
 - How a userspace debugger uses both: breakpoints, single-step, register and memory access, and
@@ -105,6 +107,11 @@ A handler's redirect of a fault to an endpoint its reply names (`FAULT_REPLY_RED
 [Reply](#reply)) is implemented on both architectures, for a fault of a user-mode access and for a
 kernel copy's fault, which a resume from the endpoint redirected to restarts.
 
+The run-limit fault ([Run-Limit Faults](#run-limit-faults)) is implemented on both architectures:
+`SYS_THREAD_SET_RUN_LIMIT`, the count in timer ticks, and the delivery of `FAULT_EXC_RUN_LIMIT`
+through the exception binding at a syscall's return and an interrupt's return to user mode, which
+ktest exercises.
+
 The asynchronous upcall ([Asynchronous Upcalls](#asynchronous-upcalls)) is implemented on both
 architectures: `SYS_THREAD_POST_UPCALL`, the third class `FAULT_CLASS_UPCALL`, delivery at a
 syscall's return and, for an `UPCALL_ANY_INSTRUCTION` post, at an interrupt's return to user mode,
@@ -138,7 +145,8 @@ own (e.g. an access to an unmapped page that is not a stale-TLB artifact), the k
    continues from a handler-modified instruction pointer).
 
 If the thread has **no** fault handler bound, the fault is terminal: the thread is killed with exit
-reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this mechanism. A fault
+reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this mechanism, or, for
+a run-limit fault, `EXIT_RUN_LIMIT` ([Run-Limit Faults](#run-limit-faults)). A fault
 of a restartable syscall's copy of a user buffer is the exception: it fails that syscall with
 `InvalidAddress` instead (see [Kernel Copies](#kernel-copies)). On x86-64, `#DF`, `#MC`, and a
 hardware NMI that finds no watchdog backtrace request pending are not the thread's faults: they
@@ -277,7 +285,9 @@ thread's behalf. Its format is a stable cross-boundary contract.
     `0` where the vector has none; RISC-V `stval`); the faulting instruction pointer. The
     kernel maps each architecture's raw vector/cause to a normalized class
     (`normalize_x86_exception` in `core/kernel/src/arch/x86_64/idt.rs`,
-    `normalize_riscv_exception` in `core/kernel/src/arch/riscv64/interrupts.rs`).
+    `normalize_riscv_exception` in `core/kernel/src/arch/riscv64/interrupts.rs`). One code is
+    no architecture's: `FAULT_EXC_RUN_LIMIT`, which the kernel raises itself, with auxiliary
+    code `0` ([Run-Limit Faults](#run-limit-faults)).
   - `FAULT_KIND_UPCALL`: the poster's cookie; the delivery point (`UPCALL_POINT_SYSCALL` or
     `UPCALL_POINT_INTERRUPT`); the thread's instruction pointer.
 - **Data word 4** — only on a fault a virtual-memory handler forwarded
@@ -525,6 +535,38 @@ kernel stack per hop, and only the handlers' replies extend it.
 
 A thread MUST NOT be bound to a fault-handler endpoint that only it receives on; such a
 thread would block on its own fault endpoint indefinitely.
+
+---
+
+## Run-Limit Faults
+
+A run-limit fault is an exception the kernel raises on a thread, not one the thread's instruction
+takes: the timer tick that brings the thread's run count to its run limit makes the fault pending
+([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md#run-limit) § Run Limit). The
+limit and the count are the scheduler's; their syscall is `SYS_THREAD_SET_RUN_LIMIT`
+([syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_THREAD_SET_RUN_LIMIT`).
+
+- **Delivery.** A pending run-limit fault is delivered at the thread's next return to user mode: a
+  syscall's return, with the syscall's result already in its registers, or the return from an
+  interrupt taken in user mode, or from an exception at whose end the kernel preempted the thread:
+  the returns of an upcall's two points ([Delivery points](#delivery-points)). An exception's
+  return with no preemption is none, and the fault stays pending to the thread's next such return.
+  It is delivered ahead of an upcall pending at the same return, which follows once a resume
+  resolves the fault ([Nesting](#nesting)). A restarted syscall ([Kernel Copies](#kernel-copies))
+  keeps the fault pending until its re-execution returns.
+- **Message.** It is a `FAULT_KIND_EXCEPTION` fault through the thread's exception binding, as
+  any exception is: the normalized code `FAULT_EXC_RUN_LIMIT`, auxiliary code `0`, and the
+  instruction pointer the thread returns to, as `SYS_THREAD_READ_REGS` reads it
+  ([Fault Message](#fault-message)).
+- **Outcome.** Every reply and cancellation of an exception applies
+  ([Delivery, Resume, and Kill](#delivery-resume-and-kill), [Reply](#reply)). A resume returns the
+  thread to its registers with its count at zero, so it runs a full limit again before its next
+  run-limit fault. With no handler bound, or a handler that declines the fault, the thread ends
+  with `EXIT_RUN_LIMIT`, `EXIT_FAULT_BASE + 0x100`: a fault exit reason that names no
+  architecture's vector or cause, and the kernel logs a `USERSPACE FAULT` line with
+  `cause=run-limit`. A crash report names the code `run-limit` ([Crash Reports](#crash-reports)).
+- **Ordering.** A run-limit fault pending when the limit is set again, to any value, is dropped,
+  and a fault the tick makes pending after a limit of 0 is set is not delivered.
 
 ---
 

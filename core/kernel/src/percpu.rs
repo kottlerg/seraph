@@ -299,14 +299,18 @@ pub mod return_work
     /// A thread queued on this CPU may outrank the running one
     /// (`sched::preempt_if_outranked`).
     pub const PREEMPT: u32 = 1 << 5;
+    /// The running thread may have a run-limit fault pending
+    /// (`sched::run_limit::tick`).
+    pub const RUN_LIMIT: u32 = 1 << 6;
 
     /// The bits a syscall's return handles: every kind.
     pub const AT_SYSCALL: u32 =
-        STOPPED | RECLAIM | SOLE_REF | UPCALL_SYSCALL | UPCALL_ANY | PREEMPT;
+        STOPPED | RECLAIM | SOLE_REF | UPCALL_SYSCALL | UPCALL_ANY | PREEMPT | RUN_LIMIT;
     /// The bits the return from an interrupt taken in user mode handles: the
-    /// sole-reference pass, the interrupt delivery point and the wake
-    /// preemption. The others wait for the thread's next syscall.
-    pub const AT_INTERRUPT: u32 = SOLE_REF | UPCALL_ANY | PREEMPT;
+    /// sole-reference pass, the delivery of a run-limit fault, the interrupt
+    /// delivery point and the wake preemption. The others wait for the
+    /// thread's next syscall.
+    pub const AT_INTERRUPT: u32 = SOLE_REF | RUN_LIMIT | UPCALL_ANY | PREEMPT;
     /// The bits the return from an exception taken in user mode handles: the
     /// wake preemption alone, which leads to the interrupt return's work when
     /// it reschedules.

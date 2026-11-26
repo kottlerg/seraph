@@ -57,9 +57,9 @@ use syscall::{
     SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES,
     SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS,
     SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
-    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
+    SYS_THREAD_SET_RUN_LIMIT, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
+    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
+    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
 };
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
@@ -460,9 +460,11 @@ unsafe fn leave_syscall()
 /// (docs/fault-handling.md § Asynchronous Upcalls); the store that marks the
 /// thread out of its syscall; and the wake preemption of a thread linked on
 /// this CPU above the caller (core/kernel/docs/scheduler.md § Wake
-/// Preemption). A restarted syscall is not a delivery point: its frame holds
-/// its arguments for the re-execution, whose own return delivers, so the
-/// upcall bits it took are posted again.
+/// Preemption). The delivery of a pending run-limit fault precedes the upcall
+/// delivery point (core/kernel/docs/scheduler.md § Run Limit). A restarted
+/// syscall is not a delivery point: its frame holds its arguments for the
+/// re-execution, whose own return delivers, so the run-limit and upcall bits
+/// it took are posted again.
 ///
 /// # Safety
 /// As for [`finish_syscall`].
@@ -471,14 +473,16 @@ unsafe fn leave_syscall()
 #[inline(never)]
 unsafe fn finish_syscall_work(exit: SyscallExit)
 {
-    use crate::percpu::return_work::{AT_SYSCALL, RECLAIM, SOLE_REF, UPCALL_ANY, UPCALL_SYSCALL};
-    let mut upcalls_taken = 0;
+    use crate::percpu::return_work::{
+        AT_SYSCALL, RECLAIM, RUN_LIMIT, SOLE_REF, UPCALL_ANY, UPCALL_SYSCALL,
+    };
+    let mut deliveries_taken = 0;
     crate::sched::run_return_work(
         // SAFETY: syscall context with interrupts disabled, on the CPU the
         // thread runs on at each take.
         || unsafe { crate::percpu::take_return_work(AT_SYSCALL) },
         |work| {
-            upcalls_taken |= work & (UPCALL_SYSCALL | UPCALL_ANY);
+            deliveries_taken |= work & (RUN_LIMIT | UPCALL_SYSCALL | UPCALL_ANY);
             // Interrupts are disabled (the drain re-enables them only with
             // preemption disabled), so this CPU and its `current` are stable
             // across both checks.
@@ -514,6 +518,8 @@ unsafe fn finish_syscall_work(exit: SyscallExit)
                 // SAFETY: syscall context on the caller's kernel stack, the
                 // frame holding the syscall's result, no lock held and
                 // interrupts disabled.
+                unsafe { crate::sched::run_limit::deliver_at_syscall() };
+                // SAFETY: as for the delivery above.
                 unsafe { crate::ipc::upcall::deliver_at_syscall() };
             }
             // SAFETY: syscall context; the caller is the running thread.
@@ -524,10 +530,10 @@ unsafe fn finish_syscall_work(exit: SyscallExit)
             unsafe { crate::sched::preempt_if_outranked() }
         },
     );
-    if exit != SyscallExit::Complete && upcalls_taken != 0
+    if exit != SyscallExit::Complete && deliveries_taken != 0
     {
         // SAFETY: syscall context with interrupts disabled.
-        unsafe { crate::percpu::post_return_work(upcalls_taken) };
+        unsafe { crate::percpu::post_return_work(deliveries_taken) };
     }
 }
 
@@ -546,7 +552,10 @@ macro_rules! handler_result {
 
 /// The syscall handlers, one `number => kind handler` line each, from which
 /// one list defines `dispatch_in_range` and the build-time check of its
-/// numbers ([`check_syscall_numbers`]).
+/// numbers ([`check_syscall_numbers`]). The arm of a syscall that
+/// [`resets_run_count`] names sets the caller's run-limit count to zero
+/// before its handler runs; the test is evaluated at build time, so no other
+/// arm carries it.
 #[cfg(not(test))]
 macro_rules! syscall_handlers {
     ($($nr:ident => $kind:ident $handler:path,)*) => {
@@ -559,7 +568,15 @@ macro_rules! syscall_handlers {
         {
             match nr
             {
-                $($nr => handler_result!($kind $handler(tf)),)*
+                $($nr => {
+                    if const { resets_run_count($nr) }
+                    {
+                        // SAFETY: syscall context on a CPU whose per-CPU
+                        // pointer is installed (dispatch's contract).
+                        unsafe { crate::sched::run_limit::reset_current() };
+                    }
+                    handler_result!($kind $handler(tf))
+                },)*
                 _ => Err(RestartableError::Failed(SyscallError::UnknownSyscall)),
             }
         }
@@ -648,6 +665,27 @@ syscall_handlers! {
     SYS_CAP_BIND_SOLE_REFERENCE => plain cap::sys_cap_bind_sole_reference,
     SYS_KERNEL_LOG_READ => restartable klog::sys_kernel_log_read,
     SYS_KERNEL_LOG_BIND => plain klog::sys_kernel_log_bind,
+    SYS_THREAD_SET_RUN_LIMIT => plain thread::sys_thread_set_run_limit,
+}
+
+/// Whether entry to syscall `nr` sets the caller's run-limit count to zero:
+/// every syscall that can block, whether or not it then blocks, and
+/// `SYS_THREAD_YIELD` (core/kernel/docs/scheduler.md § Run Limit). A new
+/// syscall that can block joins this list.
+#[must_use]
+pub const fn resets_run_count(nr: u64) -> bool
+{
+    matches!(
+        nr,
+        syscall::SYS_IPC_CALL
+            | syscall::SYS_IPC_RECV
+            | syscall::SYS_IPC_REPLY_RECV
+            | syscall::SYS_NOTIFICATION_WAIT
+            | syscall::SYS_EVENT_RECV
+            | syscall::SYS_WAIT_SET_WAIT
+            | syscall::SYS_THREAD_SLEEP
+            | syscall::SYS_THREAD_YIELD
+    )
 }
 
 /// Check the numbers of the syscall handler list against `bound`
@@ -1669,6 +1707,45 @@ mod check_syscall_numbers_tests
     fn a_number_below_the_bound_with_no_handler_is_refused()
     {
         check_syscall_numbers(&[0, 2], 3);
+    }
+}
+
+#[cfg(test)]
+mod resets_run_count_tests
+{
+    use super::resets_run_count;
+
+    #[test]
+    fn names_the_blocking_syscalls_and_yield()
+    {
+        let resetting = [
+            syscall::SYS_IPC_CALL,
+            syscall::SYS_IPC_RECV,
+            syscall::SYS_IPC_REPLY_RECV,
+            syscall::SYS_NOTIFICATION_WAIT,
+            syscall::SYS_EVENT_RECV,
+            syscall::SYS_WAIT_SET_WAIT,
+            syscall::SYS_THREAD_SLEEP,
+            syscall::SYS_THREAD_YIELD,
+        ];
+        for nr in 0..syscall::SYSCALL_NR_BOUND
+        {
+            assert_eq!(
+                resets_run_count(nr),
+                resetting.contains(&nr),
+                "syscall {nr}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_blocking_syscalls_do_not_reset()
+    {
+        assert!(!resets_run_count(syscall::SYS_IPC_REPLY));
+        assert!(!resets_run_count(syscall::SYS_NOTIFICATION_SEND));
+        assert!(!resets_run_count(syscall::SYS_GETRANDOM));
+        assert!(!resets_run_count(syscall::SYS_THREAD_SET_RUN_LIMIT));
+        assert!(!resets_run_count(syscall::SYSCALL_NR_BOUND));
     }
 }
 

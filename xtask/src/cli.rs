@@ -482,14 +482,14 @@ impl Leaf for BuildComponent
 
 plain_field!(BuildComponent);
 
-/// The value parser of a [`BuildComponent`]: `boot`, `all`, or the crate
-/// name of a spec-table entry.
 /// A `--ktest-only` value, checked as [`crate::sysroot::check_ktest_selection`] checks it.
 fn parse_ktest_selection(text: &str) -> Result<String, String>
 {
     crate::sysroot::check_ktest_selection(text).map(|()| text.to_string())
 }
 
+/// The value parser of a [`BuildComponent`]: `boot`, `all`, or the crate
+/// name of a spec-table entry.
 fn parse_build_component(text: &str) -> Result<BuildComponent, String>
 {
     match text

@@ -1950,7 +1950,7 @@ bootloader). The `FLAG` column comes first; the table ends with the count of fla
 |---|---|
 | `format` | `1`, the format version; a file of another version is refused |
 | `arch`, `cpus` | The log's architecture and width |
-| `marker` | ktest's terminal marker (`ALL TESTS PASSED`), or `-` |
+| `marker` | ktest's terminal marker (`ALL TESTS PASSED`, or `SELECTED TESTS PASSED` for a focused ktest), or `-` |
 | `commit` | The full hash of `--commit` |
 | `ktest-commit` | Present only when it is another commit: the newest commit at or before `commit` that changed anything outside Markdown, `.claude/`, `.github/`, and `xtask/baselines/` (conservatively: every change that could alter the boot image or its QEMU launch moves it, and so do some that cannot), so a baseline refreshed after a documentation-only change names the code it times |
 | `date` | The UTC date the file was written |

@@ -60,7 +60,7 @@ no change to the encoding.
 | slot 8 | `memmgr_labels::SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint (published seed-only, its seeds keeping `GRANT`, as `memmgr.swap`; absent if its derive fails) |
 | caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `16`) handshake, in every `CAPS` round |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `17`) handshake, in every `CAPS` round |
 | data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 

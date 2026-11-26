@@ -522,8 +522,9 @@ slice (§ Time Slice Policy). The second condition stays though a server can rep
 
 A reply's wake is placed by what its server does next. A `SYS_IPC_REPLY` passes
 `WakeHint::None`: the kernel cannot tell whether the server blocks next, so a receiver at its
-caller's level that, after its reply, serves other callers' queued calls without parking leaves
-the caller's reply wake queued behind it on that CPU until it parks or its slice expires. A
+fair caller's level that, after its reply, serves other callers' queued calls without parking
+leaves the caller's reply wake queued behind it on that CPU until it parks or its slice expires;
+an RT caller's reply wake goes to another CPU instead (below). A
 `SYS_IPC_REPLY_RECV` wakes its caller after its receive. When the receive parks, the server blocks
 in the same syscall, and the caller is woken with `WakeHint::Sync` onto the server's CPU, under the
 guard above with the server as the waker. Otherwise the server runs on, and the caller is woken
@@ -536,10 +537,12 @@ server yielding to the tail of its level
 passes `WakeHint::None`.
 
 An RT caller's plain `SYS_IPC_REPLY` wake therefore leaves its server's CPU when the server runs at
-the caller's level or above. The caller's preferred CPU is the server's after the call placed them
-together, and its rank is the server's level, since the server runs on past the reply, so the caller
-goes to the CPU of the lowest rank, often an idle one, and runs there at once: each plain reply of
-such a pair wakes another CPU, and the pair's next call brings them together again. Kept on the
+the caller's level or above: the server runs on past the reply, so that CPU ranks at the server's
+level, and the caller goes to the CPU of the lowest rank, often an idle one, and runs there at once.
+A pair of one level that a call placed together so splits at each plain reply, and its next call
+brings it together again. A pair whose server outranks its caller, which the synchronous wake's
+guard never places on the caller's CPU, stays apart: each call and each plain reply wakes another
+CPU. Kept on the
 server's CPU, the caller would wait behind a server that serves a backlog until it parks or its
 slice ends, the wait the rule exists to remove, and the kernel cannot tell at the reply whether the
 server blocks next. A `SYS_IPC_REPLY_RECV` tells it: when its receive parks, the server has blocked,

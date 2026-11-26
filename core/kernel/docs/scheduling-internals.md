@@ -1321,20 +1321,24 @@ placed on the waker's CPU k when k is eligible and the guard holds:
   thread would wait behind it while the recipient's own CPU idles, and one pinned to k has no pull
   to bound the wait.
 - **The woken thread does not outrank the waker** (`run_queue::outranks` on the two `priority`
-  values: one run queue above the other). The waker's reply wake returns it to k, by its affinity
-  or its sticky `preferred_cpu`; a recipient that outranks it and serves a backlog without parking
-  would hold it off past any slice, since slice expiry never hands the CPU to a lower RT level or
-  from an RT thread to a fair one ([scheduler.md](scheduler.md) § Time Slice Policy). At or below
-  the waker, the recipient is preempted by the reply wake or shares k with the waker within one
-  slice; at the waker's level, a recipient serving a backlog without parking holds a
-  `SYS_IPC_REPLY` wake that long, and a `SYS_IPC_REPLY_RECV` wake not at all (below).
+  values: one run queue above the other). A fair waker's reply wake returns it to k, by its
+  affinity or its sticky `preferred_cpu`; a recipient that outranks it and serves a backlog
+  without parking would hold it off past any slice, since slice expiry never hands the CPU to a
+  lower RT level or from an RT thread to a fair one ([scheduler.md](scheduler.md) § Time Slice
+  Policy). An RT waker's plain reply wake goes by rank (the RT rule, below): it leaves k when the
+  recipient runs there at the waker's level or above. At or below the waker, the recipient is
+  preempted by the reply wake or shares k with the waker within one slice; at the waker's level, a
+  recipient serving a backlog without parking holds a fair waker's `SYS_IPC_REPLY` wake that long,
+  sends an RT waker's to another CPU, and holds a `SYS_IPC_REPLY_RECV` wake not at all (below).
 
 **The waker that runs on (rule 4's exception).** The reply of a `SYS_IPC_REPLY_RECV` whose receive
 did not park (it bound a queued caller, a try-once found none, its park was refused, or it failed)
 passes `WakeHint::WakerRuns`: the server runs on, so its CPU k is busy whatever its load reads.
 Rule 4 then skips k when it is the caller's `preferred_cpu`, and the caller goes to its preferred
-CPU when that is another and within the threshold, and by least load otherwise. Rules 1, 2 and 5
-may still place it on k. When one does, and the server does not outrank the caller,
+CPU when that is another and within the threshold, and by least load otherwise. The RT rule skips
+k as a preferred pick the same way: an RT caller goes to its preferred CPU when that is another
+where it runs at once, and to the CPU of the lowest rank otherwise. Rules 1, 2 and 5, and the RT
+rule's scan, may still place it on k. When one does, and the server does not outrank the caller,
 `wake_replied` reports it and the server yields to the caller (`schedule(Requeue::Always)`, at
 the tail of its level) before it returns to user mode, after
 delivering a bound message or before returning an error; a refused park yields through its own
@@ -1346,7 +1350,8 @@ When the guard holds, the woken thread is the thread k's `schedule()` dispatches
 blocks, and `enqueue_and_wake` to k sends no IPI (it skips self-wakes). Between the link and that
 `schedule()` the woken thread may outrank the running waker, but k returns to user mode only
 after the `schedule()` (scheduler.md § Wake Preemption's invariant holds). When the guard fails,
-rules 4 and 5 place the wake as for `None`.
+the RT rule, for a thread at an RT level, and rules 4 and 5 place the wake as for `None`, save
+that the RT rule ranks k by its queued threads and can leave k out (below).
 
 The guard reads k's `non_empty` Relaxed, holding no lock: it only decides, and every link k made
 itself precedes the read in program order (the reader is k, in syscall or fault context with

@@ -998,6 +998,12 @@ enum Received
 /// `ep_state` must be a pinned Endpoint's state and `tcb` the running thread,
 /// with no scheduler lock and no `ep.lock` held.
 #[cfg(not(test))]
+#[expect(
+    clippy::inline_always,
+    reason = "SYS_IPC_RECV and SYS_IPC_REPLY_RECV share this receive; out of line, every \
+              plain round trip pays a frame and the callee-saved spills of its body"
+)]
+#[inline(always)]
 unsafe fn receive_on(
     ep_state: *mut crate::ipc::endpoint::EndpointState,
     tcb: *mut crate::sched::thread::ThreadControlBlock,
@@ -1163,6 +1169,12 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
 /// `tcb` must be the running thread and `cspace_ptr` its own `CSpace`, live
 /// while it runs; no lock may be held.
 #[cfg(not(test))]
+#[expect(
+    clippy::inline_always,
+    reason = "SYS_IPC_RECV and SYS_IPC_REPLY_RECV share this pre-allocation; out of line, \
+              every plain round trip pays a frame and the callee-saved spills of its body"
+)]
+#[inline(always)]
 unsafe fn preallocate_receive(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
     cspace_ptr: *mut CSpace,
@@ -1200,6 +1212,12 @@ unsafe fn preallocate_receive(
 /// running in its own address space, and `server_buf` its IPC buffer VA or 0;
 /// no lock may be held.
 #[cfg(not(test))]
+#[expect(
+    clippy::inline_always,
+    reason = "SYS_IPC_RECV and SYS_IPC_REPLY_RECV share this resume; out of line, every \
+              plain round trip pays a frame and the callee-saved spills of its body"
+)]
+#[inline(always)]
 unsafe fn deliver_after_park(
     tf: UserFrame,
     tcb: *mut crate::sched::thread::ThreadControlBlock,
@@ -1535,6 +1553,12 @@ enum ReplyDeposit
 /// be woken with `enqueue_and_wake` before the syscall returns: its
 /// `wake_in_flight` pin holds its teardown until then.
 #[cfg(not(test))]
+#[expect(
+    clippy::inline_always,
+    reason = "SYS_IPC_REPLY and SYS_IPC_REPLY_RECV share this reply; out of line, every \
+              plain round trip pays a frame and the callee-saved spills of its body"
+)]
+#[inline(always)]
 unsafe fn deposit_reply(
     tf: UserFrame,
     tcb: *mut crate::sched::thread::ThreadControlBlock,

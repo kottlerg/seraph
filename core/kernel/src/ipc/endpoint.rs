@@ -821,6 +821,12 @@ pub enum RecvMiss
 /// `ep` and `server` must be valid, and `server` must be the running thread.
 /// Call with no scheduler lock and no `ep.lock` held.
 #[cfg(not(test))]
+#[expect(
+    clippy::inline_always,
+    reason = "the receive of SYS_IPC_RECV and SYS_IPC_REPLY_RECV is the one caller; out of \
+              line, every round trip pays a frame and the callee-saved spills of this body"
+)]
+#[inline(always)]
 pub unsafe fn endpoint_recv(
     ep: *mut EndpointState,
     server: *mut ThreadControlBlock,

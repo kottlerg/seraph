@@ -6,7 +6,7 @@
 //! Tier 1 tests for IPC syscalls.
 //!
 //! Covers: `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`,
-//! `SYS_IPC_BUFFER_SET`.
+//! `SYS_IPC_REPLY_RECV`, `SYS_IPC_BUFFER_SET`.
 //!
 //! `SYS_IPC_BUFFER_SET`'s success path is tested implicitly: `run()` registers
 //! the harness thread's buffer before any test executes and each child entry
@@ -2900,4 +2900,402 @@ extern "C" fn fault_msg_entry(_arg: u64) -> !
     {
         core::hint::spin_loop();
     }
+}
+
+// ── SYS_IPC_REPLY_RECV and the words past a message's count ─────────────────
+
+/// Stack, IPC page and arguments of [`words_past_count_caller_entry`].
+static mut PAST_COUNT_STACK: ChildStack = ChildStack::ZERO;
+static mut PAST_COUNT_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+static PAST_COUNT_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
+
+/// Label of each call of [`words_past_count_caller_entry`], and of the reply
+/// to it.
+const PAST_CALL_REGS: u64 = 0x9A51;
+const PAST_CALL_BUF: u64 = 0x9A52;
+const PAST_CALL_PLAIN_REGS: u64 = 0x9A53;
+const PAST_CALL_PLAIN_BUF: u64 = 0x9A54;
+
+/// Fillers that tell a word's writer: the caller's and the server's words
+/// past a message's count, and each side's own sentinel, which only its own
+/// thread writes.
+const CALLER_JUNK: u64 = 0xC0DE_0000_0000_0000;
+const SERVER_JUNK: u64 = 0x5E7E_0000_0000_0000;
+const CALLER_SENTINEL: u64 = 0xCA11_5E47_0000_0000;
+const SERVER_SENTINEL: u64 = 0x5E4F_5E47_0000_0000;
+
+/// Data words of a message that travels in the IPC buffer: one past what the
+/// message registers carry.
+const PAST_BUF_WORDS: usize = syscall_abi::MSG_REGS_DATA_MAX + 1;
+
+/// `base` tagged with its word index `i`, so a word moved to another index
+/// is caught too.
+const fn tagged(base: u64, i: usize) -> u64
+{
+    base | i as u64
+}
+
+/// Write `value(i)` to data words `range` of the IPC buffer at `buf`.
+fn fill_words(buf: *mut u64, range: core::ops::Range<usize>, value: impl Fn(usize) -> u64)
+{
+    for i in range.filter(|&i| i < syscall_abi::MSG_DATA_WORDS_MAX)
+    {
+        // SAFETY: i < MSG_DATA_WORDS_MAX, within the 4 KiB page at `buf`.
+        let slot = unsafe { buf.add(i) };
+        // SAFETY: `slot` is a word of this thread's registered IPC buffer,
+        // which no Rust reference covers.
+        unsafe { core::ptr::write_volatile(slot, value(i)) };
+    }
+}
+
+/// Whether data words `range` of the IPC buffer at `buf` hold `value(i)`.
+fn words_hold(buf: *mut u64, range: core::ops::Range<usize>, value: impl Fn(usize) -> u64) -> bool
+{
+    range
+        .filter(|&i| i < syscall_abi::MSG_DATA_WORDS_MAX)
+        .all(|i| {
+            // SAFETY: as for `fill_words`.
+            let slot = unsafe { buf.add(i) };
+            // SAFETY: as for `fill_words`.
+            unsafe { core::ptr::read_volatile(slot) == value(i) }
+        })
+}
+
+/// The message registers `words` followed by `filler`'s tagged words.
+fn regs_of(words: &[u64], filler: u64) -> syscall::MsgRegs
+{
+    core::array::from_fn(|i| words.get(i).copied().unwrap_or(tagged(filler, i)))
+}
+
+/// Words past a message's data count never reach its recipient, in either
+/// direction, on the `SYS_IPC_REPLY_RECV` path as on `SYS_IPC_CALL`,
+/// `SYS_IPC_RECV` and `SYS_IPC_REPLY` (core/kernel/docs/syscalls.md § Calling
+/// Convention): a message of at most `MSG_REGS_DATA_MAX` words leaves the
+/// recipient's registers past its count as they were and its IPC buffer
+/// untouched, and a longer one leaves the buffer's words past its count as
+/// they were.
+///
+/// Each side fills the words past its message's count with its own junk and
+/// its receiving buffer with its own sentinel. The harness serves: a plain
+/// receive takes a two-word call, a reply-and-receive answers it with two
+/// words and takes a buffer call of seven, a second answers that with seven
+/// buffer words and takes a three-word call, a plain reply answers that with
+/// one word, and a plain receive and reply serve a last buffer call. Every
+/// delivery is checked on both sides: the delivered count, its words, the
+/// registers past them, and the buffer words past them. A last try-once
+/// reply-and-receive finds no caller and reports `WouldBlock` after its reply,
+/// which the caller's report confirms.
+pub fn words_past_count_never_reach_recipient(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "ipc::words_past_count: cap_create_endpoint failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "ipc::words_past_count: cap_create_notification failed")?;
+    let mut child = crate::spawn::new_child(ctx)
+        .map_err(|_| "ipc::words_past_count: spawn::new_child failed")?;
+    let result = past_count_rounds(ctx, ep, done, &child);
+    child.delete_thread().ok();
+    cap_delete(ep).ok();
+    cap_delete(done).ok();
+    child.delete_cspace().ok();
+    result
+}
+
+/// The harness's side of [`words_past_count_never_reach_recipient`].
+fn past_count_rounds(
+    ctx: &TestContext,
+    ep: u64,
+    done: u64,
+    child: &crate::spawn::SpawnedChild,
+) -> TestResult
+{
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
+        .map_err(|_| "ipc::words_past_count: cap_copy ep failed")?;
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "ipc::words_past_count: cap_copy done failed")?;
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        PAST_COUNT_ARGS.publish(
+            0,
+            EpDoneArgs {
+                ep: child_ep,
+                done: child_done,
+            },
+        )
+    };
+    // SAFETY: `PAST_COUNT_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(PAST_COUNT_STACK)) };
+    // SAFETY: the stack is `PAST_COUNT_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(
+            child,
+            words_past_count_caller_entry,
+            stack_top,
+            child_arg,
+        )
+    }
+    .map_err(|_| "ipc::words_past_count: configure_and_start failed")?;
+
+    serve_by_reply_recv(ctx.ipc_buf, ep)?;
+    serve_plainly(ctx.ipc_buf, ep)?;
+    match notification_wait(done)
+    {
+        Ok(0xDEAD) => Ok(()),
+        Ok(_) => Err("ipc::words_past_count: the caller saw words past a reply's count"),
+        Err(_) => Err("ipc::words_past_count: notification_wait failed"),
+    }
+}
+
+/// The first three deliveries of [`past_count_rounds`], through the IPC
+/// buffer `buf`: a plain receive of a two-word call, then two
+/// reply-and-receives.
+fn serve_by_reply_recv(buf: *mut u64, ep: u64) -> TestResult
+{
+    let all = 0..syscall_abi::MSG_DATA_WORDS_MAX;
+    let sentinel = |i| tagged(SERVER_SENTINEL, i);
+
+    // A two-word call by a plain receive: the buffer stays the server's.
+    fill_words(buf, all.clone(), sentinel);
+    let got = syscall::raw_ipc_recv(ep).map_err(|_| "ipc::words_past_count: recv failed")?;
+    if got.label != PAST_CALL_REGS || got.data_count != 2 || got.regs[..2] != [1, 2]
+    {
+        return Err("ipc::words_past_count: plain recv delivered a wrong two-word message");
+    }
+    if !words_hold(buf, all.clone(), sentinel)
+    {
+        return Err("ipc::words_past_count: a two-word receive wrote the IPC buffer");
+    }
+
+    // Reply with two words and receive a seven-word buffer call: the
+    // registers stay as they went in, and the buffer past the count stays.
+    let reply_regs = regs_of(&[0x11, 0x12], SERVER_JUNK);
+    let got = syscall::raw_ipc_reply_recv(ep, PAST_CALL_REGS, 2, 0, 0, &reply_regs)
+        .map_err(|_| "ipc::words_past_count: first reply_recv failed")?;
+    if got.label != PAST_CALL_BUF || got.data_count != PAST_BUF_WORDS
+    {
+        return Err("ipc::words_past_count: reply_recv delivered a wrong buffer message");
+    }
+    if !words_hold(buf, 0..PAST_BUF_WORDS, |i| tagged(0x20, i))
+    {
+        return Err("ipc::words_past_count: reply_recv delivered wrong buffer words");
+    }
+    if !words_hold(
+        buf,
+        PAST_BUF_WORDS..syscall_abi::MSG_DATA_WORDS_MAX,
+        sentinel,
+    )
+    {
+        return Err("ipc::words_past_count: reply_recv wrote buffer words past the count");
+    }
+    if got.regs != reply_regs
+    {
+        return Err("ipc::words_past_count: a buffer delivery rewrote the message registers");
+    }
+
+    // Reply with seven buffer words, junk past them, and receive a
+    // three-word call: its registers past the count stay the reply's, and
+    // the buffer stays as the reply left it.
+    fill_words(buf, 0..PAST_BUF_WORDS, |i| tagged(0x30, i));
+    fill_words(buf, PAST_BUF_WORDS..syscall_abi::MSG_DATA_WORDS_MAX, |i| {
+        tagged(SERVER_JUNK, i)
+    });
+    let junk_regs = regs_of(&[], SERVER_JUNK);
+    let got = syscall::raw_ipc_reply_recv(ep, PAST_CALL_BUF, PAST_BUF_WORDS, 0, 0, &junk_regs)
+        .map_err(|_| "ipc::words_past_count: second reply_recv failed")?;
+    if got.label != PAST_CALL_PLAIN_REGS
+        || got.data_count != 3
+        || got.regs[..3] != [0x41, 0x42, 0x43]
+    {
+        return Err("ipc::words_past_count: reply_recv delivered a wrong register message");
+    }
+    if got.regs[3..] != junk_regs[3..]
+    {
+        return Err("ipc::words_past_count: reply_recv delivered registers past the count");
+    }
+    if !words_hold(buf, 0..PAST_BUF_WORDS, |i| tagged(0x30, i))
+        || !words_hold(buf, PAST_BUF_WORDS..syscall_abi::MSG_DATA_WORDS_MAX, |i| {
+            tagged(SERVER_JUNK, i)
+        })
+    {
+        return Err("ipc::words_past_count: a register delivery wrote the IPC buffer");
+    }
+    Ok(())
+}
+
+/// The last delivery of [`past_count_rounds`], through the IPC buffer
+/// `buf`: a plain reply, a plain receive of a buffer call, and the try-once
+/// reply-and-receive that answers it.
+fn serve_plainly(buf: *mut u64, ep: u64) -> TestResult
+{
+    let sentinel = |i| tagged(SERVER_SENTINEL, i);
+
+    // A plain one-word reply, then a buffer call by a plain receive.
+    syscall::raw_ipc_reply(PAST_CALL_PLAIN_REGS, 1, 0, &regs_of(&[0x51], SERVER_JUNK))
+        .map_err(|_| "ipc::words_past_count: plain reply failed")?;
+    fill_words(buf, 0..syscall_abi::MSG_DATA_WORDS_MAX, sentinel);
+    let got = syscall::raw_ipc_recv(ep).map_err(|_| "ipc::words_past_count: last recv failed")?;
+    if got.label != PAST_CALL_PLAIN_BUF
+        || got.data_count != PAST_BUF_WORDS
+        || !words_hold(buf, 0..PAST_BUF_WORDS, |i| tagged(0x60, i))
+    {
+        return Err("ipc::words_past_count: plain recv delivered a wrong buffer message");
+    }
+    if !words_hold(
+        buf,
+        PAST_BUF_WORDS..syscall_abi::MSG_DATA_WORDS_MAX,
+        sentinel,
+    )
+    {
+        return Err("ipc::words_past_count: plain recv wrote buffer words past the count");
+    }
+
+    // The last reply, by a try-once reply-and-receive that finds no caller:
+    // the reply is made, then the receive reports WouldBlock.
+    let try_once = syscall::raw_ipc_reply_recv(
+        ep,
+        PAST_CALL_PLAIN_BUF,
+        0,
+        0,
+        syscall::WAIT_TRY_ONCE,
+        &regs_of(&[], SERVER_JUNK),
+    );
+    if try_once.err() != Some(syscall_abi::SyscallError::WouldBlock as i64)
+    {
+        return Err(
+            "ipc::words_past_count: an empty try-once reply_recv did not report WouldBlock",
+        );
+    }
+    Ok(())
+}
+
+/// The caller of [`words_past_count_never_reach_recipient`]: four calls, each
+/// with its own junk past the count, checking each reply's words, the
+/// registers past them and its buffer; reports `0xDEAD` when every check
+/// holds and `0xBAD` otherwise.
+extern "C" fn words_past_count_caller_entry(arg: u64) -> !
+{
+    // SAFETY: `arg` is the entry the test published for this child.
+    let EpDoneArgs { ep, done } = unsafe { child_args(arg) };
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(PAST_COUNT_CALLER_IPC_PAGE));
+    // SAFETY: `PAST_COUNT_CALLER_IPC_PAGE` is this child's own IPC page, used by
+    // one thread at a time (`IpcPage`'s rule); no Rust object lives in it, and
+    // the child reaches it only through the raw `buf` pointer.
+    let ok = unsafe { syscall::ipc_buffer_set(buf_addr) }.is_ok()
+        && past_count_calls(ep, buf_addr as *mut u64);
+    notification_send(done, if ok { 0xDEAD } else { 0xBAD }).ok();
+    thread_exit()
+}
+
+/// The calls of [`words_past_count_caller_entry`] through its IPC buffer
+/// `buf`; whether every check held.
+fn past_count_calls(ep: u64, buf: *mut u64) -> bool
+{
+    let all = 0..syscall_abi::MSG_DATA_WORDS_MAX;
+    let past = PAST_BUF_WORDS..syscall_abi::MSG_DATA_WORDS_MAX;
+    let sentinel = |i| tagged(CALLER_SENTINEL, i);
+    let junk = |i| tagged(CALLER_JUNK, i);
+
+    // Two register words out, two back by reply_recv.
+    fill_words(buf, all.clone(), sentinel);
+    let regs = regs_of(&[1, 2], CALLER_JUNK);
+    let Ok(got) = syscall::raw_ipc_call(ep, PAST_CALL_REGS, 2, 0, &regs)
+    else
+    {
+        return false;
+    };
+    if got.data_count != 2
+        || got.regs[..2] != [0x11, 0x12]
+        || got.regs[2..] != regs[2..]
+        || !words_hold(buf, all.clone(), sentinel)
+    {
+        return false;
+    }
+
+    // Seven buffer words out, seven back by reply_recv.
+    fill_words(buf, 0..PAST_BUF_WORDS, |i| tagged(0x20, i));
+    fill_words(buf, past.clone(), junk);
+    let Ok(got) = syscall::raw_ipc_call(
+        ep,
+        PAST_CALL_BUF,
+        PAST_BUF_WORDS,
+        0,
+        &regs_of(&[], CALLER_JUNK),
+    )
+    else
+    {
+        return false;
+    };
+    if got.data_count != PAST_BUF_WORDS
+        || !words_hold(buf, 0..PAST_BUF_WORDS, |i| tagged(0x30, i))
+        || !words_hold(buf, past.clone(), junk)
+    {
+        return false;
+    }
+
+    // Three register words out, one back by a plain reply.
+    fill_words(buf, all.clone(), sentinel);
+    let regs = regs_of(&[0x41, 0x42, 0x43], CALLER_JUNK);
+    let Ok(got) = syscall::raw_ipc_call(ep, PAST_CALL_PLAIN_REGS, 3, 0, &regs)
+    else
+    {
+        return false;
+    };
+    if got.data_count != 1
+        || got.regs[0] != 0x51
+        || got.regs[1..] != regs[1..]
+        || !words_hold(buf, all, sentinel)
+    {
+        return false;
+    }
+
+    // Seven buffer words out to a plain receive, none back by the try-once
+    // reply_recv.
+    fill_words(buf, 0..PAST_BUF_WORDS, |i| tagged(0x60, i));
+    fill_words(buf, past.clone(), junk);
+    let regs = regs_of(&[], CALLER_JUNK);
+    let Ok(got) = syscall::raw_ipc_call(ep, PAST_CALL_PLAIN_BUF, PAST_BUF_WORDS, 0, &regs)
+    else
+    {
+        return false;
+    };
+    got.label == PAST_CALL_PLAIN_BUF
+        && got.data_count == 0
+        && got.regs == regs
+        && words_hold(buf, 0..PAST_BUF_WORDS, |i| tagged(0x60, i))
+        && words_hold(buf, past, junk)
+}
+
+/// A reply-and-receive on an endpoint cap without the Receive right is
+/// refused with `InsufficientRights`, and one with no pending reply with
+/// `InvalidCapability` before it receives: a try-once receive that ran would
+/// report `WouldBlock` instead (core/kernel/docs/syscalls.md
+/// § `SYS_IPC_REPLY_RECV`).
+pub fn reply_recv_without_pending_reply_refused(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "ipc::reply_recv_refused: cap_create_endpoint failed")?;
+    let result = reply_recv_refusals(ep);
+    cap_delete(ep).ok();
+    result
+}
+
+/// The checks of [`reply_recv_without_pending_reply_refused`] on `ep`.
+fn reply_recv_refusals(ep: u64) -> TestResult
+{
+    let regs = regs_of(&[], SERVER_JUNK);
+    let send_only = cap_derive(ep, syscall_abi::RIGHTS_EP_SEND)
+        .map_err(|_| "ipc::reply_recv_refused: cap_derive failed")?;
+    let rights = syscall::raw_ipc_reply_recv(send_only, 0, 0, 0, syscall::WAIT_TRY_ONCE, &regs);
+    cap_delete(send_only).ok();
+    if rights.err() != Some(syscall_abi::SyscallError::InsufficientRights as i64)
+    {
+        return Err("ipc::reply_recv_refused: a send-only endpoint cap was not refused");
+    }
+    let unbound = syscall::raw_ipc_reply_recv(ep, 0, 0, 0, syscall::WAIT_TRY_ONCE, &regs);
+    if unbound.err() != Some(syscall_abi::SyscallError::InvalidCapability as i64)
+    {
+        return Err("ipc::reply_recv_refused: a reply_recv with no pending reply was not refused");
+    }
+    Ok(())
 }

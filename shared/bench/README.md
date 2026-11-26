@@ -47,6 +47,12 @@ programmable `events`. The cycle counter is the only one read; the others read `
 | x86-64 | `rdtsc`: reference cycles at a constant rate on a CPU with an invariant TSC | The kernel clears `CR4.TSD` on every CPU |
 | riscv64 | `csrr cycle`: the hart's cycles | The kernel sets `scounteren.CY` on every hart |
 
+A read bounds the region between two reads as
+[docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell) states. Its inline
+assembly declares that it may read and write memory, so the compiler keeps each load and store on
+the side of the read where the program puts it. On x86-64 the read is `lfence; rdtsc; lfence`, so
+that the CPU orders it too. On riscv64 the hart orders `csrr cycle` only with itself.
+
 ---
 
 ## Samples and summary

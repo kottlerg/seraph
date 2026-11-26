@@ -11,10 +11,10 @@
 //! happens in `shared/text::render_codepoint`; this module is purely a
 //! pixel back-end.
 //!
-//! The kernel renderer (`core/kernel/src/framebuffer.rs`) remains
-//! byte-indexed against `font::FONT_9X20` for the early-boot / panic
-//! console; this renderer takes bitmaps so the UTF-8 + font-extension
-//! path can land without forcing the kernel onto the same stack.
+//! The kernel renderer (`core/kernel/src/framebuffer.rs`) shares the same
+//! `render_codepoint` resolution and is retained for the kernel's direct
+//! console lines (the panic path is serial-only); this renderer only takes
+//! the bitmaps that resolution yields.
 //!
 //! The renderer writes the framebuffer with plain stores, a whole pixel at a
 //! time, and fills runs of pixels in bulk. Framebuffer memory is memory to

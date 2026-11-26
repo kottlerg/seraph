@@ -656,9 +656,10 @@ while another idles, and stay there while each wake keeps them there (the sticky
 is bounded by the threshold: a load above it is pulled at once, so a backlog the pull leaves to
 break and re-form is one at a load of at most `LOAD_BALANCE_IMBALANCE_THRESHOLD` (2), the
 running thread and one queued behind it. A call or a fault delivery places its receiver by its
-waker, and the reply of a `SYS_IPC_REPLY_RECV` places its caller by its waker when the receive
-parks and away from it when the receive binds a queued sender (§ Thread Assignment); whether
-another wake should place by its waker, or away from it, is open (#1560).
+waker, and the reply of a `SYS_IPC_REPLY_RECV` to a `SYS_IPC_CALL` caller places the caller by
+its waker when the receive parks and away from it when the receive binds a queued sender
+(§ Thread Assignment); whether another wake should place by its waker, or away from it, is open
+(#1560).
 
 The loads that choose a pull are read without the CPUs' locks, and a CPU's `schedule()`
 raises its own load for a moment under its lock: it counts every requeue of the running

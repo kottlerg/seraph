@@ -206,9 +206,10 @@ Notes on the non-obvious entries:
   often the thread was woken from another CPU and moved between CPUs, a coarse signal of its traffic
   with other threads. ktest's round-trip benchmarks need exactly that signal, to tell whether their
   two threads shared a CPU. The two counts of the synchronous wake rule add how often the thread
-  was woken by a synchronous call, a fault delivery, or the reply of a `SYS_IPC_REPLY_RECV` whose
-  receive parked, and how often it then ran on the waker's CPU: a rate of the thread's own
-  synchronous traffic, with no waker's identity and no address. ktest's `sync_ipc_placement` and
+  was woken by a synchronous call, a fault delivery, or the reply of a `SYS_IPC_REPLY_RECV` to a
+  `SYS_IPC_CALL` caller when its receive parked (a reply to a fault-blocked thread is not
+  counted), and how often it then ran on the waker's CPU: a rate of the thread's own synchronous
+  traffic, with no waker's identity and no address. ktest's `sync_ipc_placement` and
   `reply_recv_placement` read them to judge each wake the rule decided.
 
 ## Physical-address surfaces

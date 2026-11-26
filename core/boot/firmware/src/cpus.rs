@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// core/boot/firmware/src/cpus.rs
+
+//! The placement of the CPU hardware IDs a firmware table lists into the
+//! boot protocol's `cpu_ids` array, which the MADT and device-tree CPU walks
+//! share: [`cpu_id_capacity`] sizes the array, and [`place_cpu_ids`] and
+//! [`record_cpu_id`] apply the BSP-first placement rule.
+
+use boot_protocol::MAX_CPUS;
+
+/// Place the enabled CPU hardware IDs a firmware table lists into `out`, the
+/// `BootInfo.cpu_ids` layout: `bsp_id` at index 0, then each other distinct ID
+/// once, in table order.
+///
+/// Returns `(cpu_count, truncated)`. `cpu_count` is the number of slots of
+/// `out` filled, so the BSP counts once whether or not the table lists it, and
+/// `out[1..cpu_count]` holds exactly the APs. `truncated` is set when a
+/// distinct ID found no slot. The caller sizes `out` from the table's entry
+/// count, at least one slot and capped at [`MAX_CPUS`], so only a table listing
+/// more than [`MAX_CPUS`] CPUs truncates; an `out` with no slot places nothing
+/// and reports truncation.
+pub fn place_cpu_ids(
+    bsp_id: u32,
+    ids: impl IntoIterator<Item = u32>,
+    out: &mut [u32],
+) -> (u32, bool)
+{
+    let mut filled: usize = 0;
+    let mut truncated = false;
+    // The BSP goes first: `out` holds no ID yet, so it takes slot 0 when `out` has one.
+    record_cpu_id(bsp_id, out, &mut filled, &mut truncated);
+    for id in ids
+    {
+        record_cpu_id(id, out, &mut filled, &mut truncated);
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "filled is at most out.len(), at most MAX_CPUS, which fits in u32"
+    )]
+    let cpu_count = filled as u32;
+    (cpu_count, truncated)
+}
+
+/// Append one enabled CPU's hardware ID to `ids[..*count]`, skipping an ID
+/// already there (the BSP, or a CPU a firmware table lists twice, as a Local
+/// APIC and a Local x2APIC entry) so no CPU is counted or started twice. Sets
+/// `truncated` when `ids` is full.
+pub fn record_cpu_id(id: u32, ids: &mut [u32], count: &mut usize, truncated: &mut bool)
+{
+    if ids.get(..*count).is_some_and(|placed| placed.contains(&id))
+    {
+        return;
+    }
+    if let Some(slot) = ids.get_mut(*count)
+    {
+        *slot = id;
+        // `*count` indexed a slot of `ids`, so it is far below `usize::MAX`.
+        *count = count.saturating_add(1);
+    }
+    else
+    {
+        *truncated = true;
+    }
+}
+
+/// Slots the `cpu_ids` array needs for a table listing `entries` enabled CPUs:
+/// one more for a BSP the table may omit, capped at [`MAX_CPUS`] (the boot
+/// protocol's CPU ceiling) and never below one.
+#[must_use]
+pub fn cpu_id_capacity(entries: usize) -> usize
+{
+    entries.saturating_add(1).min(MAX_CPUS)
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn bsp_absent_from_the_list_still_counts_once()
+    {
+        let mut ids = [0u32; 4];
+        let (count, truncated) = place_cpu_ids(0, [1, 2, 3], &mut ids);
+        assert_eq!(count, 4);
+        assert_eq!(ids, [0, 1, 2, 3]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn listed_bsp_is_not_placed_again()
+    {
+        let mut ids = [0u32; 5];
+        let (count, _) = place_cpu_ids(2, [0, 1, 2, 3], &mut ids);
+        assert_eq!(count, 4);
+        assert_eq!(ids[..4], [2, 0, 1, 3]);
+    }
+
+    #[test]
+    fn duplicated_id_is_placed_once()
+    {
+        let mut ids = [0u32; 4];
+        let (count, _) = place_cpu_ids(0, [1, 2, 1], &mut ids);
+        assert_eq!(count, 3);
+        assert_eq!(ids[..3], [0, 1, 2]);
+    }
+
+    // Defect caught: an `out` with no slot panicking instead of reporting truncation.
+    #[test]
+    fn output_without_a_slot_places_nothing_and_truncates()
+    {
+        let mut ids: [u32; 0] = [];
+        let (count, truncated) = place_cpu_ids(7, [1], &mut ids);
+        assert_eq!((count, truncated), (0, true));
+    }
+
+    #[test]
+    fn empty_list_is_the_bsp_alone()
+    {
+        let mut ids = [0u32; 1];
+        let (count, truncated) = place_cpu_ids(7, [], &mut ids);
+        assert_eq!((count, ids[0], truncated), (1, 7, false));
+    }
+
+    #[test]
+    fn full_list_including_the_bsp_fits_exactly()
+    {
+        let mut out = vec![0u32; cpu_id_capacity(MAX_CPUS)];
+        let (count, truncated) = place_cpu_ids(0, 0..u32::try_from(MAX_CPUS).unwrap(), &mut out);
+        assert_eq!(count as usize, MAX_CPUS);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn full_list_omitting_the_bsp_drops_the_last_ap_and_says_so()
+    {
+        let mut placed = vec![0u32; cpu_id_capacity(MAX_CPUS)];
+        let (count, truncated) =
+            place_cpu_ids(0, 1..=u32::try_from(MAX_CPUS).unwrap(), &mut placed);
+        assert_eq!(count as usize, MAX_CPUS);
+        assert_eq!(placed[MAX_CPUS - 1], u32::try_from(MAX_CPUS).unwrap() - 1);
+        assert!(truncated);
+    }
+
+    // Defect caught: a capacity that leaves no slot for a BSP the table omits,
+    // or exceeds the boot protocol's CPU ceiling.
+    #[test]
+    fn capacity_adds_the_bsp_and_caps_at_max_cpus()
+    {
+        assert_eq!(cpu_id_capacity(0), 1);
+        assert_eq!(cpu_id_capacity(3), 4);
+        assert_eq!(cpu_id_capacity(MAX_CPUS - 1), MAX_CPUS);
+        assert_eq!(cpu_id_capacity(MAX_CPUS + 100), MAX_CPUS);
+    }
+}
+
+#[cfg(kani)]
+mod proofs
+{
+    use crate::property::cpus as property;
+
+    /// Every record of any ID into an array of up to 4 slots, at any count
+    /// up to one past the slots, places it once or reports the array full:
+    /// the step of `place_cpu_ids` and `Tree::place_hart_ids`, whose loops
+    /// the fuzz target drives against `place_holds`. The loops are the
+    /// search of the placed IDs and the check's copy and compare of the
+    /// slots.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn every_record_places_an_id_once()
+    {
+        let mut ids: [u32; 4] = kani::any();
+        let len: usize = kani::any();
+        let count: usize = kani::any();
+        kani::assume(len <= ids.len() && count <= len + 1);
+        let _ = property::record_holds(kani::any(), &mut ids[..len], count);
+    }
+
+    /// Every entry count sizes the array as the bootloader's table walks
+    /// need. No loop.
+    #[kani::proof]
+    fn every_entry_count_sizes_the_array()
+    {
+        property::capacity_holds(kani::any());
+    }
+}

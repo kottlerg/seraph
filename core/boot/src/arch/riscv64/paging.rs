@@ -23,7 +23,9 @@ use boot_protocol::riscv_paging::{PagingMode, level_stride, vpn_index};
 
 use crate::error::BootError;
 use crate::paging::{MapError, PageFlags, PageTableBuilder};
+use crate::tables::{TableMap, device_tree};
 use crate::{bprintln, uefi};
+use boot_firmware::dtb::Tree;
 
 // ── Mode negotiation ──────────────────────────────────────────────────────────
 
@@ -71,22 +73,19 @@ fn mode_name(mode: PagingMode) -> &'static str
 /// Must run in S-mode before `ExitBootServices` (`bs` valid for the probe-root
 /// frame allocation and its release) and before step 6 builds the boot page
 /// tables.
-/// `dtb_addr` must be zero or the physical address of an identity-mapped FDT.
+/// The device tree at `dtb_addr` (zero when there is none) is read through
+/// `tables`, under [`TableMap::view`]'s contract.
 pub unsafe fn negotiate_paging(
     bs: *mut uefi::EfiBootServices,
     dtb_addr: u64,
+    tables: TableMap<'_>,
     boot_hart_id: u64,
 ) -> Result<(), BootError>
 {
-    let advertised = if dtb_addr != 0
-    {
-        // SAFETY: dtb_addr is a valid identity-mapped FDT (caller contract).
-        unsafe { crate::dtb::parse_boot_cpu_mmu_type(dtb_addr, boot_hart_id) }
-    }
-    else
-    {
-        None
-    };
+    // SAFETY: caller contract.
+    let advertised = unsafe { device_tree(tables, dtb_addr) }
+        .and_then(Tree::new)
+        .and_then(|tree| tree.boot_cpu_mmu_type(boot_hart_id));
 
     // SAFETY: bs is valid pre-ExitBootServices (caller contract).
     let probe_root = unsafe { uefi::allocate_pages(bs, 1)? };

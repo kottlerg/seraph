@@ -93,10 +93,10 @@ referenced in place inside it), the kernel file buffer, the kernel image span on
 init image segments, the page-table frame pool on RISC-V (and the paging-mode probe root
 and the AP trampoline page), the `BootInfo` page, the module
 descriptor array, the `MemoryMapEntry` array, the `MmioAperture` array, the kernel stack,
-the reclaim-range array, and the memory map buffer. The kernel image is placed as one
-contiguous span and its base recorded in `BootInfo.kernel_physical_base`, so kernel
-placement does not depend on a fixed firmware layout; see [elf-loading.md](elf-loading.md)
-for the placement sequence.
+the reclaim-range array, and the memory map buffers (the one taken at entry and step 7's). The
+kernel image is placed as one contiguous span and its base recorded in
+`BootInfo.kernel_physical_base`, so kernel placement does not depend on a fixed firmware layout;
+see [elf-loading.md](elf-loading.md) for the placement sequence.
 
 **`AllocateMaxAddress`** — the firmware selects a free range whose uppermost address is at
 or below a bound. Used only on x86-64: for the AP-startup trampoline, whose SIPI vector must

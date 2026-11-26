@@ -27,14 +27,13 @@ core/boot/
 ├── clippy.toml                 # Boot's clippy thresholds (fn-params bools, stack frame size)
 ├── linker/
 │   └── riscv64-uefi.ld         # Linker script for RISC-V PE/COFF pipeline
-├── testdata/                   # QEMU virt AIA DTB, MADT and RHCT; the parsers' host-test input
+├── firmware/                   # boot-firmware: firmware-table decoders over slices (host-tested)
 └── src/
     ├── main.rs                 # efi_main — boot sequence orchestrator
     ├── uefi.rs                 # UEFI protocol wrappers and memory services
     ├── elf.rs                  # UEFI-allocation layer over `shared/elf` + InitImage construction
-    ├── firmware.rs             # ACPI RSDP / DTB discovery; MADT/DTB shared CPU-id placement
-    ├── acpi.rs                 # ACPI walker (CPUs, hart caps, AIA, apertures, VMGENID)
-    ├── dtb.rs                  # DTB walker (CPUs, hart caps, AIA, mmu-type, apertures, rng-seed)
+    ├── firmware.rs             # ACPI RSDP / DTB discovery
+    ├── tables.rs               # Firmware tables as slices, bounded by the memory map
     ├── memory_map.rs           # UEFI memory map → MemoryType; mmio_apertures derivation
     ├── framebuffer.rs          # Framebuffer text renderer (uses shared/font)
     ├── console.rs              # Early console: dual serial + framebuffer writer
@@ -58,8 +57,7 @@ core/boot/
             ├── paging.rs           # RISC-V page tables + paging-mode negotiation
             ├── handoff.rs          # satp write + sfence + kernel jump
             ├── serial.rs           # UART serial output for early debug
-            ├── acpi_kernel_mmio.rs # ACPI MADT/RHCT kernel_mmio extraction
-            ├── acpi_spcr.rs        # ACPI SPCR UART discovery
+            ├── acpi_kernel_mmio.rs # ACPI MADT/RHCT/SPCR kernel_mmio extraction
             ├── dtb_kernel_mmio.rs  # DTB kernel_mmio fill-in
             └── header.S            # Hand-crafted PE32+ header and entry trampoline
 ```
@@ -76,7 +74,16 @@ workspace member. The contract is specified in
 [abi/boot-protocol/README.md](../../abi/boot-protocol/README.md).
 
 **`boot`** (`core/boot/`) — the UEFI application. Depends on `boot-protocol` for the
-`BootInfo` type it populates. Architecture-specific code is isolated to
+`BootInfo` type it populates.
+
+**`boot-firmware`** ([`core/boot/firmware/`](firmware/README.md)) — a `no_std`, alloc-free,
+host-tested crate holding the bootloader's firmware-table decoders as functions over byte slices:
+the MADT, RHCT, SPCR, TPM2 and SSDT readings, the aperture seeds, the device tree walks, and the
+memory-map check that bounds every table before a slice of it is made. It reads the formats through
+[`shared/firmware-tables`](../../shared/firmware-tables/README.md), which devmgr reads too. The
+`boot` crate keeps the one step from a firmware address to a slice
+(`core/boot/src/tables.rs`; [core/boot/docs/firmware-parsing.md](docs/firmware-parsing.md)
+§ Table Bounds). Architecture-specific code is isolated to
 `core/boot/src/arch/<target>/`;
 `#[cfg(target_arch)]` appears only at the arch-module declaration site in
 `core/boot/src/arch/mod.rs`, per [docs/coding-standards.md](../../docs/coding-standards.md)

@@ -350,10 +350,13 @@ pub struct EnqueueBreadcrumb
 /// `CAP_INFO_THREAD_PLACEMENT` reads (core/kernel/docs/scheduler.md
 /// § Placement Counters). Diagnostics: no kernel path reads them to decide.
 ///
-/// Every increment holds the thread's `sched_lock` ([`Self::count`]), so each
-/// counter has one writer at a time and a load and a store make the increment;
-/// a reader takes no lock and reads each counter `Relaxed`, a snapshot. Each
-/// counter is free-running and wraps.
+/// Every increment of a link's counter holds the thread's `sched_lock`
+/// ([`Self::count`]), so each has one writer at a time and a load and a store
+/// make the increment. The two counters of the synchronous wake rule
+/// (`sync_wakes`, `sync_local`) are counted where the rule decides, which
+/// holds no lock of the thread, so each increment is one `Relaxed` atomic
+/// add. A reader takes no lock and reads each counter `Relaxed`, a snapshot.
+/// Each counter is free-running and wraps.
 pub struct PlacementCounts
 {
     /// Wakes that linked the thread on a CPU other than the waker's.
@@ -364,6 +367,12 @@ pub struct PlacementCounts
     pub wake_moves: core::sync::atomic::AtomicU32,
     /// Load-balancer pulls that moved the thread to another CPU.
     pub pulls: core::sync::atomic::AtomicU32,
+    /// Wakes with the synchronous hint whose placement reached the synchronous
+    /// wake rule: the thread had no hard affinity and no context save in
+    /// flight.
+    pub sync_wakes: core::sync::atomic::AtomicU32,
+    /// Of those, the wakes the rule placed on the waker's CPU.
+    pub sync_local: core::sync::atomic::AtomicU32,
 }
 
 impl PlacementCounts
@@ -376,6 +385,8 @@ impl PlacementCounts
             idle_wakes: core::sync::atomic::AtomicU32::new(0),
             wake_moves: core::sync::atomic::AtomicU32::new(0),
             pulls: core::sync::atomic::AtomicU32::new(0),
+            sync_wakes: core::sync::atomic::AtomicU32::new(0),
+            sync_local: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -807,8 +818,9 @@ pub struct ThreadControlBlock
     pub preferred_cpu: u32,
 
     /// How wakes and the load balancer placed this thread
-    /// ([`PlacementCounts`]). Each counter is written under
-    /// [`sched_lock`](Self::sched_lock), and read without it.
+    /// ([`PlacementCounts`]). Each counter of a link is written under
+    /// [`sched_lock`](Self::sched_lock), the synchronous wake rule's two by an
+    /// atomic add without it, and every one is read without it.
     pub placement: PlacementCounts,
 
     /// Intrusive run-queue link — next TCB in the same run queue.

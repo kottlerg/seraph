@@ -401,7 +401,13 @@ The kernel performs no direct thread switch on IPC. Every call rendezvous and
 every reply wakes the recipient through `enqueue_and_wake` on the CPU
 `select_target_cpu` chooses, after the endpoint lock is released (call) or the
 `reply_tcb` claim is won (reply, which takes no endpoint lock); the run queue
-decides when it runs. A receive first wakes any caller it releases from an
+decides when it runs. A call rendezvous whose caller's park committed
+(`CallRendezvous::Bound` with `hint: WakeHint::Sync`) asks for the caller's
+CPU, which the placement grants when that CPU queues no thread but its idle
+thread and the receiver does not outrank the caller
+([scheduling-internals.md](scheduling-internals.md) § Target CPU selection); a
+refused park and a reply pass `WakeHint::None`. A fault delivery to a parked
+handler wakes it the same way. A receive first wakes any caller it releases from an
 earlier unreplied binding (its call returns `Interrupted`, a faulter is
 killed, or, on its restartable syscall's user copy, has that syscall fail with
 `InvalidAddress`, and a caller blocked in an upcall delivery has the upcall

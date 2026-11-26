@@ -78,7 +78,8 @@ init hands those caps to procmgr, which donates them to memmgr when it reaps
 init (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init reap"):
 
 - The bootloader-scratch subset recorded in `BootInfo.reclaim_ranges` (the raw UEFI
-  memory-map buffer among it, zeroed after its last read in step 9), minted
+  memory-map buffers among it, the map taken at entry and step 7's, each zeroed after its last
+  read in step 9), minted
   in Phase 7 (the AP trampoline page is late-minted in Phase 8) and zeroed
   whole by the kernel in Phase 9, before init runs. See
   [initialization.md](../../kernel/docs/initialization.md) §"Phase 7: Capability System",
@@ -118,7 +119,8 @@ The `Loaded` allocations are:
 - `BootInfo.modules` descriptor page.
 - `MmioAperture` array pages (`mmio_apertures.entries`).
 - CPU-id pages (`BootInfo.cpu_ids`).
-- Raw UEFI memory-map buffer (the `GetMemoryMap` output).
+- Raw UEFI memory-map buffers (the `GetMemoryMap` outputs): the map `efi_main` takes at entry,
+  which bounds every firmware-table read, and step 7's.
 - Translated `MemoryMapEntry` array (`BootInfo.memory_map`).
 - Reclaim-array page (the `BootInfo.reclaim_ranges` backing).
 - AP trampoline page, when allocated.

@@ -5,85 +5,54 @@
 
 //! x86-64 `kernel_mmio` extraction from ACPI.
 //!
-//! Walks RSDP → XSDT → MADT to populate [`KernelMmio::lapic_base`] and
-//! [`KernelMmio::ioapics`]. The arch-neutral ACPI table-walk primitives
-//! (signature constants, byte readers, `phys_slice`) live in
-//! [`crate::acpi`]; only the x86-specific MADT-entry interpretation
-//! lives here.
+//! Reads the MADT into [`KernelMmio::lapic_base`] and [`KernelMmio::ioapics`].
+//! The MADT reaches it as a slice [`crate::tables::Acpi`] views through the
+//! memory map, and `boot_firmware::acpi` decodes it; only the copy into the
+//! x86-64 boot protocol's types lives here.
 
-use crate::acpi::{
-    MADT_TYPE_IOAPIC, MADT_TYPE_LAPIC_OVERRIDE, SDT_HDR_LEN, find_acpi_table, madt_entries,
-    read_u8, read_u32, read_u64,
-};
-use crate::bprintln;
+use boot_firmware::acpi::{madt_entries, madt_io_apic, madt_lapic_base};
 use boot_protocol::{IoApicEntry, KernelMmio};
 
-/// Populate the arch-specific `kernel_mmio` fields for x86-64 from ACPI.
-///
-/// Walks RSDP → XSDT → MADT. Extracts the Local APIC base (header field,
-/// potentially overridden by MADT type 5) and the I/O APIC register
-/// windows from MADT type-1 entries. Fields that cannot be sourced are
-/// left at their caller-provided default (typically zero, in which case
-/// the kernel falls back to its hardcoded constants).
-///
-/// # Safety
-/// `rsdp_addr` must be the physical address of a valid, identity-mapped
-/// ACPI RSDP.
-pub unsafe fn parse_kernel_mmio(rsdp_addr: u64, km: &mut KernelMmio)
+use crate::bprintln;
+use crate::tables::Acpi;
+
+/// Populate the arch-specific `kernel_mmio` fields for x86-64 from the MADT
+/// `acpi` lists: the Local APIC base (the header field, replaced by a type-5
+/// override) and the I/O APIC register windows of its type-1 structures.
+/// Fields that cannot be sourced are left at their caller-provided default
+/// (zero, in which case the kernel falls back to its compiled-in constants).
+pub fn parse_kernel_mmio(acpi: &Acpi<'_, '_>, km: &mut KernelMmio)
 {
-    // SAFETY: caller guarantees rsdp_addr is a valid, identity-mapped RSDP.
-    if let Some(madt) = unsafe { find_acpi_table(rsdp_addr, *b"APIC") }
+    if let Some(madt) = acpi.table(*b"APIC")
     {
         extract_madt_kernel_mmio(madt, km);
     }
 }
 
-/// Walk a validated MADT and populate `km.lapic_base` + `km.ioapics[..]`.
-///
-/// Oversize IOAPIC counts (> [`boot_protocol::MAX_IOAPICS`]) are truncated with a
-/// diagnostic.
+/// Write the MADT `table`'s Local APIC base and I/O APICs into
+/// `km.lapic_base` and `km.ioapics[..]`. I/O APICs past
+/// [`boot_protocol::MAX_IOAPICS`] are dropped with a diagnostic.
 fn extract_madt_kernel_mmio(table: &[u8], km: &mut KernelMmio)
 {
-    // LAPIC base from the MADT header (offset 36, u32).
-    km.lapic_base = u64::from(read_u32(table, SDT_HDR_LEN));
+    km.lapic_base = madt_lapic_base(table);
 
     let mut truncated = false;
-    for (entry_type, e) in madt_entries(table)
+    for io in madt_entries(table).filter_map(|(kind, entry)| madt_io_apic(kind, entry))
     {
-        match entry_type
+        let idx = km.ioapic_count as usize;
+        if let Some(slot) = km.ioapics.get_mut(idx)
         {
-            MADT_TYPE_IOAPIC if e.len() >= 12 =>
-            {
-                // Type 1 (I/O APIC), length 12:
-                //   off+2: id(u8)  off+3: reserved
-                //   off+4: address(u32)  off+8: gsi_base(u32)
-                let id = u32::from(read_u8(e, 2));
-                let phys_base = u64::from(read_u32(e, 4));
-                let gsi_base = read_u32(e, 8);
-                let idx = km.ioapic_count as usize;
-                if let Some(slot) = km.ioapics.get_mut(idx)
-                {
-                    *slot = IoApicEntry {
-                        id,
-                        phys_base,
-                        gsi_base,
-                    };
-                    // `idx` indexed a slot of `ioapics`, so the count is far below `u32::MAX`.
-                    km.ioapic_count = km.ioapic_count.saturating_add(1);
-                }
-                else
-                {
-                    truncated = true;
-                }
-            }
-            MADT_TYPE_LAPIC_OVERRIDE if e.len() >= 12 =>
-            {
-                // Type 5 (Local APIC Address Override):
-                //   off+2-3: reserved  off+4: address(u64)
-                km.lapic_base = read_u64(e, 4);
-            }
-            _ =>
-            {}
+            *slot = IoApicEntry {
+                id: io.id,
+                phys_base: io.phys_base,
+                gsi_base: io.gsi_base,
+            };
+            // `idx` indexed a slot of `ioapics`, so the count is far below `u32::MAX`.
+            km.ioapic_count = km.ioapic_count.saturating_add(1);
+        }
+        else
+        {
+            truncated = true;
         }
     }
 

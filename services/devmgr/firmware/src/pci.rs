@@ -23,7 +23,7 @@ pub const FUNCTION_CONFIG_BYTES: u64 = 0x1000;
 /// ([`config_offset`]).
 #[must_use]
 pub fn function_config_phys(
-    windows: &[crate::EcamLocation],
+    windows: &[firmware_tables::EcamLocation],
     segment: u16,
     bus: u8,
     dev: u8,
@@ -1101,9 +1101,14 @@ mod tests
         assert_eq!(config_offset(0, 0, 0, 0, 0x1000), None);
     }
 
-    fn window(segment: u16, phys_base: u64, start_bus: u8, end_bus: u8) -> crate::EcamLocation
+    fn window(
+        segment: u16,
+        phys_base: u64,
+        start_bus: u8,
+        end_bus: u8,
+    ) -> firmware_tables::EcamLocation
     {
-        crate::EcamLocation {
+        firmware_tables::EcamLocation {
             phys_base,
             size: (u64::from(end_bus - start_bus) + 1) << 20,
             segment,

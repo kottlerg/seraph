@@ -70,6 +70,7 @@ pub mod rt_wake_preempt;
 pub mod shared_memory_two_aspaces;
 pub mod smt_siblings;
 pub mod stop_read_regs_remote;
+pub mod sync_ipc_placement;
 pub mod thread_ext_regs;
 pub mod thread_lifecycle;
 pub mod thread_list_pages;
@@ -223,6 +224,10 @@ pub fn run_all(ctx: &TestContext)
         busy_cpu_placement::run(ctx)
     );
     run_integration_test!("integration::thread_placement", thread_placement::run(ctx));
+    run_integration_test!(
+        "integration::sync_ipc_placement",
+        sync_ipc_placement::run(ctx)
+    );
     run_integration_test!(
         "integration::shared_memory_two_aspaces",
         shared_memory_two_aspaces::run(ctx)

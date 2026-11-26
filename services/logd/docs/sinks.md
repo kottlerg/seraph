@@ -213,14 +213,24 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
 - **serial's "written" means sent** (built, #1497). The serial driver answers a plain
   `SERIAL_WRITE_BYTES` once the bytes are in its transmit ring, and a write with the flag
   `SERIAL_WRITE_SENT` (label bit 32) once they have left the UART. logd's serial sink writes with
-  the flag, so serial's cursor passes an entry only once its bytes are on the wire. A write that
-  waits on a transmitter making no progress is answered `STALLED` after the driver's `TX_STALL_MS`
-  (1000 ms), which the writer takes as it takes any answer. The virtio-console driver answers every
-  write once the device has taken it, and needs no flag. The `hold` pace,
-  the `SINK_STALL_MS` bound on a write, the kernel reader's acknowledgement (§ The kernel's lines)
-  and the pass marker and crash reports being on serial before power-off all rest on that. #928's
-  `LOG_FLUSH` waits for serial's cursor, which passes an entry only once it is sent, and needs no
-  barrier of its own.
+  the flag. The virtio-console driver answers every write once the device has taken it, and needs
+  no flag. The `hold` pace, the `SINK_STALL_MS` bound on a write, the kernel reader's
+  acknowledgement (§ The kernel's lines) and the pass marker and crash reports being on serial
+  before power-off all rest on serial's cursor passing an entry only once its bytes are on the wire.
+- **A `STALLED` answer.** The driver answers a write that waited on a transmitter making no
+  progress `STALLED` after its `TX_STALL_MS` (1000 ms). Today logd's writer takes it as it takes
+  any answer. In this design (#928) a `STALLED` answer does not move serial's cursor: the sink is
+  stalled (§ Pace) and its writer retries the entry until a write is answered without `STALLED`,
+  each retry bounded by the driver's stall bound. A write refused while it waited for room in the
+  ring appended nothing, so the entry is written again; one refused while it waited for its bytes
+  to leave the UART is in the ring, so the writer waits with a zero-length write with the flag, the
+  driver's barrier; a polled write that stopped part-way is written again whole, so its first part
+  shows twice. The entry is thus written once on the wire or evicted and counted as dropped, never
+  passed unsent.
+- **`LOG_FLUSH`** (#928) waits for serial's cursor, which passes an entry only once it is sent, and
+  needs no barrier of its own. It reports the log flushed once serial's cursor has passed the
+  newest entry at the call, or serial is stalled or unserved, as the kernel reader's
+  acknowledgement does.
 - **framebuffer.** For the person at the screen. Its level is critical, so a healthy boot shows no
   log line on it. When an emergency entry reaches it, the sink first writes the last `backlog`
   entries at info or more severe that precede the emergency entry in the history and that it has

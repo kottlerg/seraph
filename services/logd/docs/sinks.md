@@ -212,21 +212,28 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
   UART itself, and shows `previous` entries (§ pstore).
 - **serial's "written" means sent** (built, #1497). The serial driver answers a plain
   `SERIAL_WRITE_BYTES` once the bytes are in its transmit ring, and a write with the flag
-  `SERIAL_WRITE_SENT` (label bit 32) once they have left the UART. logd's serial sink writes with
-  the flag. The virtio-console driver answers every write once the device has taken it, and needs
-  no flag. The `hold` pace, the `SINK_STALL_MS` bound on a write, the kernel reader's
-  acknowledgement (§ The kernel's lines) and the pass marker and crash reports being on serial
-  before power-off all rest on serial's cursor passing an entry only once its bytes are on the wire.
+  `SERIAL_WRITE_SENT` (label bit 32) once they, and every byte written before them, have left the
+  UART; a zero-length write with the flag is a barrier for every write before it. Today logd's
+  serial sink writes each chunk of an entry with the flag. The virtio-console driver answers every
+  write once the device has taken it, and needs no flag. The `hold` pace, the `SINK_STALL_MS` bound
+  on a write, the kernel reader's acknowledgement (§ The kernel's lines) and the pass marker and
+  crash reports being on serial before power-off all rest on serial's cursor passing an entry only
+  once its bytes are on the wire.
 - **A `STALLED` answer.** The driver answers a write that waited on a transmitter making no
-  progress `STALLED` after its `TX_STALL_MS` (1000 ms). Today logd's writer takes it as it takes
-  any answer. In this design (#928) a `STALLED` answer does not move serial's cursor: the sink is
-  stalled (§ Pace) and its writer retries the entry until a write is answered without `STALLED`,
-  each retry bounded by the driver's stall bound. A write refused while it waited for room in the
-  ring appended nothing, so the entry is written again; one refused while it waited for its bytes
-  to leave the UART is in the ring, so the writer waits with a zero-length write with the flag, the
-  driver's barrier; a polled write that stopped part-way is written again whole, so its first part
-  shows twice. The entry is thus written once on the wire or evicted and counted as dropped, never
-  passed unsent.
+  progress `STALLED` after its `TX_STALL_MS` (1000 ms), the same answer whichever wait stalled.
+  Today logd's writer takes it as it takes any answer. In this design (#928) the writer writes an
+  entry in two steps whose `STALLED` answers each mean one thing, and a `STALLED` answer does not
+  move serial's cursor: the sink is stalled (§ Pace) and the writer repeats the step that stalled
+  until it is answered without `STALLED`, each attempt bounded by the driver's stall bound.
+  1. Each chunk of the entry as a plain write. `STALLED` here means the chunk was not appended to
+     the ring, so the writer writes that chunk again and goes on from it, not from the entry's
+     first chunk. Without the transmit interrupt the driver writes a chunk byte by byte and stops
+     at the byte the UART did not take, so the chunk's first part shows twice.
+  2. A zero-length write with the flag. `STALLED` here means the entry's bytes are in the ring
+     and not yet sent, so the writer writes the barrier again.
+
+  The cursor passes the entry only once the barrier is answered without `STALLED`, so it never
+  passes an entry unsent.
 - **`LOG_FLUSH`** (#928) waits for serial's cursor, which passes an entry only once it is sent, and
   needs no barrier of its own. It reports the log flushed once serial's cursor has passed the
   newest entry at the call, or serial is stalled or unserved, as the kernel reader's

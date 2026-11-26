@@ -16,7 +16,7 @@ direct console paths remain as fallbacks for the life of the system.
 1. **Bootloader early console** — `core/boot/src/console.rs` drives the UART
    and framebuffer directly during UEFI boot, before the kernel exists. On
    RISC-V the UART base is discovered via ACPI SPCR
-   (`core/boot/src/arch/riscv64/acpi_spcr.rs`), then the Device Tree, falling back to the QEMU
+   (`core/boot/src/arch/riscv64/serial.rs`), then the Device Tree, falling back to the QEMU
    `virt` default `0x10000000` (discovery order per
    [Early Console § Serial Backend](../core/boot/docs/console.md#serial-backend)); on x86-64 it
    is COM1 at I/O port `0x3F8`. The framebuffer base is discovered via UEFI GOP and captured

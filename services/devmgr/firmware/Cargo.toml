@@ -13,6 +13,9 @@ boot-policy = { path = "../../../shared/boot-policy" }
 # The AML encodings and the resource-template decoder the static namespace
 # walk and the `_CRS` adapter are built on (its alloc-free modules only).
 aml = { path = "../../../shared/aml" }
+# The firmware tables' format decoders (ACPI, DMAR, SPCR, flattened device
+# tree) this crate interprets.
+firmware-tables = { path = "../../../shared/firmware-tables" }
 # `VirtioPciStartupInfo`, filled in by the configuration-space walk.
 virtio-core = { path = "../../drivers/virtio/core" }
 # The decoded driver declaration the match table compares and the class

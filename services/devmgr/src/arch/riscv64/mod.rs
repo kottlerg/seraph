@@ -9,7 +9,7 @@ use ipc::IpcMessage;
 
 use crate::caps::{DevmgrCaps, Firmware};
 use crate::{IrqRangeAllocator, reply_status};
-use firmware::EcamLocation;
+use firmware_tables::EcamLocation;
 
 /// Arch-specific authority caps devmgr holds after bootstrap.
 pub struct ArchCaps

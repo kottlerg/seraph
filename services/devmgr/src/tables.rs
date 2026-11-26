@@ -15,7 +15,8 @@
 
 use crate::arch;
 use crate::caps::{AcpiRegion, Firmware};
-use firmware::EcamLocation;
+use firmware::dtb::PciEcams;
+use firmware_tables::EcamLocation;
 use std::os::seraph::reserve_pages;
 use syscall_abi::PAGE_SIZE;
 
@@ -110,8 +111,13 @@ pub fn with_acpi_table<R>(
     read: impl FnOnce(&[u8]) -> Option<R>,
 ) -> Option<R>
 {
-    let header_len = firmware::acpi::SDT_HDR_LEN as u64;
-    let len = with_acpi_bytes(firmware, tbl_phys, header_len, firmware::acpi::sdt_length)?;
+    let header_len = firmware_tables::acpi::SDT_HDR_LEN as u64;
+    let len = with_acpi_bytes(
+        firmware,
+        tbl_phys,
+        header_len,
+        firmware_tables::acpi::sdt_length,
+    )?;
     with_acpi_bytes(firmware, tbl_phys, u64::from(len), read)
 }
 
@@ -122,7 +128,7 @@ pub fn with_acpi_table<R>(
 fn read_table_sig(firmware: &Firmware, tbl_phys: u64) -> Option<[u8; 4]>
 {
     with_acpi_bytes(firmware, tbl_phys, 4, |table| {
-        (table.len() >= 4).then(|| firmware::acpi::sdt_signature(table))
+        (table.len() >= 4).then(|| firmware_tables::acpi::sdt_signature(table))
     })
 }
 
@@ -143,14 +149,14 @@ fn read_xsdt_phys(firmware: &Firmware) -> Option<u64>
     let rsdp_page_offset = usize::try_from(firmware.rsdp_page_base & (PAGE_SIZE - 1)).ok()?;
     let page_bytes = usize::try_from(PAGE_SIZE).ok()?;
     if rsdp_page_offset
-        .checked_add(firmware::acpi::RSDP_LEN)
+        .checked_add(firmware_tables::acpi::RSDP_LEN)
         .is_none_or(|end| end > page_bytes)
     {
         std::os::seraph::log!(warn: "RSDP straddles its page; ACPI unavailable");
         return None;
     }
     with_mapped(firmware, firmware.rsdp_memory_cap, 0, 1, |page| {
-        firmware::acpi::rsdp_xsdt_phys(page.get(rsdp_page_offset..)?)
+        firmware_tables::acpi::rsdp_xsdt_phys(page.get(rsdp_page_offset..)?)
     })
 }
 
@@ -166,7 +172,7 @@ fn read_xsdt_entries(firmware: &Firmware, xsdt_phys: u64) -> Option<Vec<u64>>
             std::os::seraph::log!(warn: "XSDT: no memory for its entry list; ACPI unavailable");
             return None;
         }
-        entries.extend(firmware::acpi::iter_xsdt_entries(xsdt));
+        entries.extend(firmware_tables::acpi::iter_xsdt_entries(xsdt));
         Some(entries)
     })
 }
@@ -226,8 +232,8 @@ pub fn platform_tables(firmware: &Firmware) -> PlatformTables
     out.oem_table_id = with_acpi_bytes(
         firmware,
         xsdt_phys,
-        firmware::acpi::SDT_HDR_LEN as u64,
-        firmware::acpi::sdt_oem_table_id,
+        firmware_tables::acpi::SDT_HDR_LEN as u64,
+        firmware_tables::acpi::sdt_oem_table_id,
     );
     let Some(entries) = read_xsdt_entries(firmware, xsdt_phys)
     else
@@ -354,7 +360,7 @@ fn discover_ecams_acpi(firmware: &Firmware) -> Vec<EcamLocation>
             continue;
         }
         let read = with_acpi_table(firmware, tbl_phys, |mcfg| {
-            for loc in firmware::acpi::mcfg_ecams(mcfg)
+            for loc in firmware_tables::acpi::mcfg_ecams(mcfg)
             {
                 if found.try_reserve(1).is_err()
                 {
@@ -391,7 +397,7 @@ fn discover_ecams_dtb(firmware: &Firmware) -> Vec<EcamLocation>
         return Vec::new();
     };
     let found = with_mapped(firmware, firmware.dtb_memory_cap, 0, pages, |blob| {
-        let fdt = firmware::dtb::Fdt::new(blob.get(in_page_off..)?)?;
+        let fdt = firmware_tables::fdt::Fdt::new(blob.get(in_page_off..)?)?;
         let found = fdt.find_pci_ecams().ok();
         if found.is_none()
         {

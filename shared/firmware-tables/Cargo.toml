@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "firmware-tables"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# `no_std`, no allocation, no dependency: the decoders of the firmware
+# tables' formats (ACPI's RSDP, XSDT, MCFG and MADT structures, the DMAR's
+# remapping structures, the SPCR, and the flattened device tree), shared by
+# devmgr, which interprets the tables, and the bootloader.
+# Host-tested over QEMU's tables (the checked-in fuzz seeds).
+[lib]
+test = true
+doctest = false
+
+[lints]
+workspace = true

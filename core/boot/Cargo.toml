@@ -5,8 +5,13 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The firmware-table decoders over slices (core/boot/firmware/README.md).
+boot-firmware = { path = "firmware" }
 boot-protocol = { workspace = true }
 elf = { path = "../../shared/elf" }
+# The table formats boot-firmware reads, for the walk from the RSDP and the
+# device tree header that core/boot/src/tables.rs makes.
+firmware-tables = { path = "../../shared/firmware-tables" }
 font = { workspace = true }
 # The signed-object verifier and the trust store's embedded layout
 # (docs/signing.md); verify-only, no `sign` feature.

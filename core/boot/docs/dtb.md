@@ -6,7 +6,13 @@ and DTB parsing plug into Step 5 of the boot sequence) is owned by
 [firmware-parsing.md](firmware-parsing.md); this document owns only the
 invariants internal to DTB parsing itself.
 
-The implementation lives in [`core/boot/src/dtb.rs`](../src/dtb.rs).
+The walks are slice-taking functions in
+[`core/boot/firmware/src/dtb.rs`](../firmware/src/dtb.rs) (`boot_firmware::dtb::Tree`), over the
+header check and token walk of
+[`shared/firmware-tables/src/fdt.rs`](../../../shared/firmware-tables/src/fdt.rs), which devmgr
+reads too. The blob reaches them as a slice
+[`core/boot/src/tables.rs`](../src/tables.rs) views through the memory map at the header's
+`totalsize` ([firmware-parsing.md](firmware-parsing.md) § Table Bounds).
 
 ---
 
@@ -24,7 +30,8 @@ property in place while the blob is still writable (before
 `ExitBootServices`), since the same blob is later handed to userspace;
 which firmware exposes which entropy source is documented in
 [boot-flow.md](boot-flow.md). The `rng-seed` reader is a flat scan that
-takes the first property of that name anywhere in the tree. The DTB's
+takes the first property of that name anywhere in the tree, and the scrub
+writes through the same memory-map view as every read. The DTB's
 physical address is passed through unchanged in `BootInfo.device_tree`
 because device-level discovery, IOMMU topology included, is a userspace
 concern; `devmgr`'s own firmware-table parsing is specified under
@@ -45,7 +52,10 @@ entries. Driver binding and property-evaluation logic belong to
 ## Header Validation
 
 The DTB header is validated before any parsing. A blob that fails
-validation yields no resources (the walkers return `None` or zero) and
+validation, or one the memory map refuses (its 40-byte header, or the
+`totalsize` bytes the header reports, outside the memory the map gives to
+firmware data; [firmware-parsing.md](firmware-parsing.md) § Table Bounds),
+yields no resources (the walkers return `None` or zero) and
 the bootloader proceeds without DTB-derived resources; the
 `BootInfo.device_tree` passthrough is unaffected. The bootloader never
 halts on a rejected blob. The kernel falls back to its compiled-in
@@ -63,8 +73,12 @@ Tables).
 
 Validation checks:
 - `magic == 0xD00DFEED` (big-endian per the FDT spec).
+- `totalsize` covers the 40-byte header and lies inside the memory-map view.
 - `off_dt_struct + size_dt_struct` and `off_dt_strings + size_dt_strings`
   (overflow-checked) do not exceed `totalsize`.
+
+A property name is read only inside the strings block, and a token only inside
+the structure block, at an offset from the blob's start that is a multiple of 4.
 
 All header fields and struct-block tokens are big-endian per the FDT
 specification, regardless of target CPU byte order.
@@ -73,9 +87,9 @@ specification, regardless of target CPU byte order.
 
 ## Cell-Size Assumptions
 
-The compatible-node walker (`Fdt::walk_compatible`) assumes
+The compatible-node walker (`Tree::for_each_compatible`) assumes
 `#address-cells = 2` and `#size-cells = 2`; the CPU-node walker
-(`Fdt::walk_cpu_nodes`) reads each `/cpus` child's `reg` as one
+(`Tree::for_each_cpu`) reads each `/cpus` child's `reg` as one
 big-endian u32 hart ID (`#address-cells = 1`, `#size-cells = 0`). The
 2/2 assumption is the standard for RISC-V QEMU virt and every production
 RISC-V platform targeted. Nodes that override these with different
@@ -93,12 +107,11 @@ and `#size-cells` (one or two cells each, the specification defaults when the
 parent sets none) and skips a node under any other size. It reads no other node
 kind and translates no `ranges`.
 
-Walker limits: `MAX_DEPTH = 32` for node nesting, `MAX_REG_ENTRIES = 8`
-for `reg` tuples per node, `MAX_IRQ_ENTRIES = 4` for `interrupts`
-values. A node's PCI `ranges` entries carry no bound: the walker records
-where the property lies and `Fdt::pci_ranges` reads every entry from the
-blob. A walk skips the properties of nodes nested past `MAX_DEPTH` and
-drops the entries past a `reg` or `interrupts` bound, and reports either
+Walker limits: `MAX_DEPTH = 32` for node nesting and `MAX_REG_ENTRIES = 8`
+for `reg` tuples per node. A node's PCI `ranges` entries carry no bound: the
+walker keeps the property's bytes and `boot_firmware::dtb::pci_ranges` reads
+every entry from them. A walk skips the properties of nodes nested past `MAX_DEPTH` and
+drops the entries past the `reg` bound, and reports either
 with one console line per boot — the
 bootloader does not need exhaustive coverage, because device-level
 discovery is a userspace concern (see Responsibilities in
@@ -118,11 +131,13 @@ without warning; `devmgr` is responsible for identifying every other
 device (see [`docs/device-management.md`](../../../docs/device-management.md)).
 
 PCI host bridges match `pci-host-ecam-generic`.
-A node's raw `interrupts` values are collected alongside its `reg`
-entries; the bootloader does not resolve `interrupt-parent`; associating
-lines with an interrupt controller belongs to `devmgr` (design intent, not yet
-implemented; see Parse firmware tables in
+The bootloader reads no node's `interrupts` and does not resolve
+`interrupt-parent`; associating lines with an interrupt controller belongs to
+`devmgr` (design intent, not yet implemented; see Parse firmware tables in
 [`services/devmgr/docs/responsibilities.md`](../../../services/devmgr/docs/responsibilities.md#responsibilities)).
+
+The UART (`kernel_mmio.uart_base` and `uart_size`, and the early console's
+base) is the first `ns16550a` node's first `reg` window with a non-zero base.
 
 ---
 
@@ -133,7 +148,7 @@ APLIC (`riscv,aplic`) for each privilege level the firmware sets up. The
 machine-level ones belong to the SBI firmware, which keeps them from the
 supervisor, so the bootloader reports only the supervisor-level pair, in
 `kernel_mmio.aplic` and `kernel_mmio.imsic` and as aperture seeds
-(`crate::dtb::parse_aia`):
+(`boot_firmware::dtb::Tree::aia`):
 
 - The supervisor-level IMSIC is the first `riscv,imsics` node whose
   `interrupts-extended` names at least one hart and only the supervisor
@@ -162,12 +177,12 @@ supervisor, so the bootloader reports only the supervisor-level pair, in
 
 ## Error Handling
 
-Malformed nodes are skipped; partial results are returned. An
-unreadable or unknown token ends the walk with the partial results
-collected so far. A bad header aborts DTB parsing entirely (see
-§Header Validation). Nothing is logged for skipped nodes, apart from
-the IMSIC check of § AIA Controllers, and the bootloader never halts on
-a DTB parse error.
+Malformed nodes are skipped; partial results are returned. An unreadable
+or unknown token, or a property whose length runs past the structure
+block, ends the walk with the partial results collected so far. A bad
+header aborts DTB parsing entirely (see §Header Validation). Nothing is
+logged for skipped nodes, apart from the IMSIC check of § AIA
+Controllers, and the bootloader never halts on a DTB parse error.
 
 ---
 

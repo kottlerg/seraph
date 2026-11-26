@@ -168,7 +168,7 @@ pub struct DevmgrCaps
 
     /// The ECAM windows `config_space` holds, to locate a function's
     /// configuration page (`firmware::pci::function_config_phys`).
-    pub ecam_windows: Vec<firmware::EcamLocation>,
+    pub ecam_windows: Vec<firmware_tables::EcamLocation>,
 
     /// The `(base, size)` of every extent of RAM memmgr pools, from init's
     /// [`kind::RAM_EXTENT`] rounds, against which a device's firmware-reserved

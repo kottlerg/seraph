@@ -98,6 +98,7 @@ use eviction::EvictionState;
 use fat::{chain_next, next_cluster, read_file_data};
 use fat_parse::sweep::SweepSchedule;
 use file::{Opens, OutstandingPage, SessionRefusal};
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{
     GateError, NamespaceRights, NodeId, NodeKind, OpenRef, gate, gate_open, is_open_instance,
@@ -573,6 +574,7 @@ fn service_loop(
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     let mut session_sweeps = SweepSchedule::new();
+    let mut reply = Reply::new();
     loop
     {
         // The last request found the block device capability revoked and
@@ -580,12 +582,18 @@ fn service_loop(
         // ends (fs-driver-protocol.md § Loss of the block device).
         if cache::device_gone()
         {
+            // The last turn's reply goes out before this work.
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { reply.flush(ipc_buf) };
             std::process::exit(fs_labels::EXIT_DEVICE_GONE.cast_signed());
         }
         // The last request may have met a full cache on a path that does
         // not hold the opens' lock (relieve_pressure).
         if cache.take_pressure()
         {
+            // The last turn's reply goes out before this work.
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { reply.flush(ipc_buf) };
             let req = opens
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -599,16 +607,22 @@ fn service_loop(
         // (module docs, Session end).
         if SESSION_SWEEP_PENDING.swap(false, Ordering::AcqRel)
         {
+            // The last turn's reply goes out before this work.
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { reply.flush(ipc_buf) };
             sweep_sessions(opens, &mut session_sweeps, cache);
         }
         // The pressure thread marked a release and woke the loop with a
         // call (module docs, Memory pressure).
         if RELEASE_PENDING.swap(false, Ordering::AcqRel)
         {
+            // The last turn's reply goes out before this work.
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { reply.flush(ipc_buf) };
             release_under_pressure(cache, ipc_buf);
         }
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(caps.service, ipc_buf) }
+        let msg = match unsafe { next_request(caps.service, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -620,8 +634,9 @@ fn service_loop(
         guard.on_success();
 
         let opcode = msg.label & 0xFFFF;
-        // Logs the request when the turn ends, after its reply, if it was
-        // held too long (`held` module).
+        // Logs the request when the turn ends, if it was held too long: ahead of
+        // the reply when the handler left it for the next receive (`held`
+        // module).
         let held = held::HeldRequest::start(opcode);
 
         // Unbadged service-level requests: FS_MOUNT and FS_UNMOUNT. Neither
@@ -660,7 +675,7 @@ fn service_loop(
             {
                 ipc::fs_errors::UNKNOWN_OPCODE
             };
-            reply_dropping_caps(&msg, opcode, code, ipc_buf);
+            reply_dropping_caps(&msg, opcode, code, &mut reply);
             continue;
         }
 
@@ -676,10 +691,7 @@ fn service_loop(
             // so a caller cannot fill fatfs's CSpace with them.
             drop_caps(msg.caps());
             let mut backend = FatfsBackend::new(state, cache, caps.block_dev, ipc_buf, nodes);
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            unsafe {
-                namespace_protocol::dispatch_request(&mut backend, &msg, caps.service, ipc_buf);
-            }
+            namespace_protocol::dispatch_request(&mut backend, &msg, caps.service, &mut reply);
             continue;
         }
 
@@ -702,7 +714,7 @@ fn service_loop(
         };
         if !label_accepts(opcode, kind)
         {
-            reply_dropping_caps(&msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
+            reply_dropping_caps(&msg, opcode, ipc::fs_errors::INVALID_BADGE, &mut reply);
             continue;
         }
         let gated = if kind == CapKind::Open
@@ -724,7 +736,7 @@ fn service_loop(
                 let Some(node) = node
                 else
                 {
-                    reply_dropping_caps(&msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
+                    reply_dropping_caps(&msg, opcode, ipc::fs_errors::INVALID_BADGE, &mut reply);
                     continue;
                 };
                 (node, rights, open)
@@ -737,7 +749,7 @@ fn service_loop(
                     GateError::PermissionDenied => ipc::fs_errors::PERMISSION_DENIED,
                     GateError::WrongKind => ipc::fs_errors::INVALID_BADGE,
                 };
-                reply_dropping_caps(&msg, opcode, code, ipc_buf);
+                reply_dropping_caps(&msg, opcode, code, &mut reply);
                 continue;
             }
         };
@@ -759,7 +771,16 @@ fn service_loop(
 
         if opcode == fs_labels::FS_READ
         {
-            handle_read(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+            handle_read(
+                node_id,
+                &msg,
+                state,
+                nodes,
+                cache,
+                caps.block_dev,
+                ipc_buf,
+                &mut reply,
+            );
             continue;
         }
 
@@ -782,6 +803,7 @@ fn service_loop(
                     caps,
                     cache,
                     ipc_buf,
+                    &mut reply,
                 );
                 continue;
             }
@@ -799,17 +821,36 @@ fn service_loop(
                     caps,
                     cache,
                     ipc_buf,
+                    &mut reply,
                 );
                 continue;
             }
             fs_labels::FS_WRITE =>
             {
-                handle_write(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                handle_write(
+                    node_id,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps.block_dev,
+                    ipc_buf,
+                    &mut reply,
+                );
                 continue;
             }
             fs_labels::FS_WRITE_MEMORY =>
             {
-                handle_write_memory(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                handle_write_memory(
+                    node_id,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps.block_dev,
+                    ipc_buf,
+                    &mut reply,
+                );
                 continue;
             }
             fs_labels::FS_CREATE =>
@@ -826,6 +867,7 @@ fn service_loop(
                     cache,
                     caps,
                     ipc_buf,
+                    &mut reply,
                 );
                 continue;
             }
@@ -846,6 +888,7 @@ fn service_loop(
                     cache,
                     caps,
                     ipc_buf,
+                    &mut reply,
                 );
                 continue;
             }
@@ -857,7 +900,16 @@ fn service_loop(
             }
             fs_labels::FS_TRUNCATE =>
             {
-                handle_truncate(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                handle_truncate(
+                    node_id,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps.block_dev,
+                    ipc_buf,
+                    &mut reply,
+                );
                 continue;
             }
             _ =>
@@ -872,7 +924,7 @@ fn service_loop(
         if opcode == fs_labels::FS_READ_MEMORY
             && !cache.fund_run_time_headroom(startup_info().self_cspace)
         {
-            reply_err(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
+            reply_err(ipc::fs_errors::TOO_MANY_OPEN, &mut reply);
             continue;
         }
         // A memory-cap read in a session first makes room for the record of
@@ -881,7 +933,7 @@ fn service_loop(
             && let Some(open) = open_ref
             && let Err(code) = fund_held_page(open, opens, ipc_buf)
         {
-            reply_err(code, ipc_buf);
+            reply_err(code, &mut reply);
             continue;
         }
         let mut opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
@@ -900,21 +952,20 @@ fn service_loop(
                     cache,
                     ipc_buf,
                     eviction,
+                    &mut reply,
                 );
             }
             (fs_labels::FS_RELEASE_MEMORY, Some(open)) =>
             {
-                handle_release_memory_open_cap(open, &msg, &mut opens_g, cache, ipc_buf);
+                handle_release_memory_open_cap(open, &msg, &mut opens_g, cache, &mut reply);
             }
             (fs_labels::FS_CLOSE, Some(open)) =>
             {
-                handle_close_open_cap(open, &mut opens_g, cache, ipc_buf);
+                handle_close_open_cap(open, &mut opens_g, cache, &mut reply);
             }
             _ =>
             {
-                let reply = IpcMessage::new(ipc::fs_errors::UNKNOWN_OPCODE);
-                // SAFETY: ipc_buf is the registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                reply.set_status(ipc::fs_errors::UNKNOWN_OPCODE);
             }
         }
     }
@@ -973,6 +1024,11 @@ fn drop_caps(caps: &[u64])
 /// either names. Resolves `node_id` against the `NodeTable` and reads from
 /// the FAT cluster chain. Inline reads touch no open: no outstanding pages,
 /// no release bookkeeping.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, its node, the driver state a read touches (FAT state, node table, cache, \
+              block device, IPC buffer), and the loop's reply slot"
+)]
 fn handle_read(
     node_id: NodeId,
     msg: &IpcMessage,
@@ -981,21 +1037,18 @@ fn handle_read(
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     let Some(node) = nodes.get(node_id)
     else
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set_status(ipc::fs_errors::INVALID_BADGE);
         return;
     };
     if node.kind != NodeKind::File
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set_status(ipc::fs_errors::INVALID_BADGE);
         return;
     }
 
@@ -1022,17 +1075,16 @@ fn handle_read(
         Ok(n) => n,
         Err(e) =>
         {
-            reply_err(fat_error_to_wire(e), ipc_buf);
+            reply_err(fat_error_to_wire(e), reply);
             return;
         }
     };
 
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+    let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, bytes_read as u64)
         .bytes(1, out.get(..bytes_read).unwrap_or_default())
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(answer);
 }
 
 /// `FS_READ_MEMORY` body, parameterised by the resolved node and the open
@@ -1066,6 +1118,7 @@ fn read_memory_for_open(
     block_dev: u64,
     ipc_buf: *mut u64,
     eviction: &EvictionState,
+    reply: &mut Reply,
 )
 {
     let offset = msg.word(0);
@@ -1074,9 +1127,7 @@ fn read_memory_for_open(
     if cookie == 0
     {
         // Cookie 0 collides with the OutstandingPage::None sentinel.
-        let reply = IpcMessage::new(ipc::fs_errors::BAD_MEMORY_OFFSET);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set_status(ipc::fs_errors::BAD_MEMORY_OFFSET);
         return;
     }
 
@@ -1084,12 +1135,11 @@ fn read_memory_for_open(
     else
     {
         // EOF: zero bytes valid, no cap.
-        let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+        let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
             .word(0, 0)
             .word(1, cookie)
             .build();
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set(answer);
         return;
     };
 
@@ -1100,7 +1150,7 @@ fn read_memory_for_open(
         .filter(|_| state.is_data_cluster(node.cluster))
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err(ipc::fs_errors::IO_ERROR, reply);
         return;
     };
     // Walk the cluster chain to find the sector at `offset`, from the open's
@@ -1123,7 +1173,7 @@ fn read_memory_for_open(
         {
             // A FAT sector read that met a full cache fails the walk.
             relieve_pressure(opens, cache, eviction);
-            reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+            reply_err(ipc::fs_errors::IO_ERROR, reply);
             return;
         }
     }
@@ -1153,7 +1203,7 @@ fn read_memory_for_open(
         .and_then(|off| Some((off, PAGE_SIZE.checked_sub(off).filter(|&n| n > 0)?)))
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err(ipc::fs_errors::IO_ERROR, reply);
         return;
     };
 
@@ -1186,18 +1236,14 @@ fn read_memory_for_open(
         // Cache pressure, when every slot is held by an outstanding page:
         // the client retries this read on IO_ERROR.
         relieve_pressure(opens, cache, eviction);
-        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set_status(ipc::fs_errors::IO_ERROR);
         return;
     };
     let slot_cap = cache.slot_memory_cap(slot_idx);
     if slot_cap == 0
     {
         cache.release_slot(slot_idx);
-        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set_status(ipc::fs_errors::IO_ERROR);
         return;
     }
 
@@ -1205,9 +1251,7 @@ fn read_memory_for_open(
     else
     {
         cache.release_slot(slot_idx);
-        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set_status(ipc::fs_errors::IO_ERROR);
         return;
     };
     let Ok(child) = syscall::cap_derive(ancestor, RIGHTS_MEM_MAP)
@@ -1215,9 +1259,7 @@ fn read_memory_for_open(
     {
         let _ = syscall::cap_delete(ancestor);
         cache.release_slot(slot_idx);
-        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set_status(ipc::fs_errors::IO_ERROR);
         return;
     };
 
@@ -1248,20 +1290,17 @@ fn read_memory_for_open(
         let _ = syscall::cap_delete(child);
         let _ = syscall::cap_delete(ancestor);
         cache.release_slot(slot_idx);
-        let reply = IpcMessage::new(ipc::fs_errors::TOO_MANY_OPEN);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set_status(ipc::fs_errors::TOO_MANY_OPEN);
         return;
     }
 
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+    let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, bytes_valid)
         .word(1, cookie)
         .word(2, memory_data_offset)
         .cap(child)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(answer);
 }
 
 /// Where a memory-cap read's sector lies, for sizing its run fill
@@ -1359,6 +1398,7 @@ fn handle_session_node_cap(
     caps: &FatCaps,
     cache: &PageCache,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     let opcode = fs_labels::FS_SESSION;
@@ -1366,19 +1406,19 @@ fn handle_session_node_cap(
     // holds; any other id names a node the table must still hold.
     if node_id.raw() != 0 && nodes.get(node_id).is_none()
     {
-        reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, reply);
         return;
     }
     let Some((&handle, rest)) = msg.caps().split_first()
     else
     {
-        reply_err(ipc::fs_errors::INVALID_ARGUMENT, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_ARGUMENT, reply);
         return;
     };
     drop_caps(rest);
-    let refuse = |code: u64| {
+    let mut refuse = |code: u64| {
         let _ = syscall::cap_delete(handle);
-        reply_err(code, ipc_buf);
+        reply_err(code, reply);
     };
     if session_sweeps.note_new()
     {
@@ -1440,15 +1480,15 @@ fn handle_session_node_cap(
     {
         // Ending the session revokes the liveness child with its parent.
         end();
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err(ipc::fs_errors::IO_ERROR, reply);
         return;
     };
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+    let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .cap(session_cap)
         .cap(liveness.child)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    if unsafe { ipc::ipc_reply(&answer, ipc_buf) }.is_err()
     {
         let _ = syscall::cap_delete(session_cap);
         end();
@@ -1484,12 +1524,13 @@ fn handle_open_node_cap(
     caps: &FatCaps,
     cache: &PageCache,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     let opcode = fs_labels::FS_OPEN;
     if nodes.get(node_id).is_none_or(|n| n.kind != NodeKind::File)
     {
-        reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, reply);
         return;
     }
     let (id, release_send) = match request_session(msg, caps.service)
@@ -1497,7 +1538,7 @@ fn handle_open_node_cap(
         Ok(session) => session,
         Err(code) =>
         {
-            reply_dropping_caps(msg, opcode, code, ipc_buf);
+            reply_dropping_caps(msg, opcode, code, reply);
             return;
         }
     };
@@ -1512,6 +1553,7 @@ fn handle_open_node_cap(
         opens,
         cache,
         ipc_buf,
+        reply,
     );
 }
 
@@ -1564,13 +1606,13 @@ impl OpenRequest
 {
     /// Delete the release SEND and reply `code`: a refusal before the open
     /// keeps the SEND.
-    fn refuse(self, code: u64, ipc_buf: *mut u64)
+    fn refuse(self, code: u64, reply: &mut Reply)
     {
         if self.release_send != 0
         {
             let _ = syscall::cap_delete(self.release_send);
         }
-        reply_err(code, ipc_buf);
+        reply_err(code, reply);
     }
 
     /// Mint the open cap of the open `id`: a badged `SEND_GRANT` whose badge
@@ -1594,9 +1636,10 @@ fn open_in_session(
     opens: &Mutex<Opens>,
     cache: &PageCache,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
-    let Some(id) = record_open(session, open, opens, cache, ipc_buf)
+    let Some(id) = record_open(session, open, opens, cache, ipc_buf, reply)
     else
     {
         return;
@@ -1612,14 +1655,14 @@ fn open_in_session(
     {
         // Closing the open deletes its release SEND.
         close();
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err(ipc::fs_errors::IO_ERROR, reply);
         return;
     };
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+    let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .cap(open_cap)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    if unsafe { ipc::ipc_reply(&answer, ipc_buf) }.is_err()
     {
         let _ = syscall::cap_delete(open_cap);
         close();
@@ -1642,11 +1685,12 @@ fn record_open(
     opens: &Mutex<Opens>,
     cache: &PageCache,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 ) -> Option<u64>
 {
     if !cache.fund_run_time_headroom(startup_info().self_cspace)
     {
-        open.refuse(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
+        open.refuse(ipc::fs_errors::TOO_MANY_OPEN, reply);
         return None;
     }
     let room = opens
@@ -1655,7 +1699,7 @@ fn record_open(
         .room_for_open(session);
     if let Err(refusal) = room.or_else(|r| take_page(session, r, opens, ipc_buf))
     {
-        open.refuse(refusal_code(refusal), ipc_buf);
+        open.refuse(refusal_code(refusal), reply);
         return None;
     }
     let recorded = opens
@@ -1667,7 +1711,7 @@ fn record_open(
         Ok(id) => Some(id),
         Err(refusal) =>
         {
-            open.refuse(refusal_code(refusal), ipc_buf);
+            open.refuse(refusal_code(refusal), reply);
             None
         }
     }
@@ -1799,7 +1843,13 @@ fn handle_unmount(
 {
     if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
     {
-        reply_err(ipc::fs_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe {
+            ipc::ipc_reply(
+                &IpcMessage::new(ipc::fs_errors::LABEL_VERSION_MISMATCH),
+                ipc_buf,
+            )
+        };
         return false;
     }
     let mut opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1846,17 +1896,18 @@ fn handle_read_memory_open_cap(
     cache: &PageCache,
     ipc_buf: *mut u64,
     eviction: &EvictionState,
+    reply: &mut Reply,
 )
 {
     let Some(node) = nodes.get(node_id)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, reply);
         return;
     };
     if node.kind != NodeKind::File || opens.node(open).is_none()
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, reply);
         return;
     }
     read_memory_for_open(
@@ -1869,6 +1920,7 @@ fn handle_read_memory_open_cap(
         caps.block_dev,
         ipc_buf,
         eviction,
+        reply,
     );
 }
 
@@ -1880,7 +1932,7 @@ fn handle_read_memory_open_cap(
 /// unknown or unbadged label refusals, the cap-kind refusal, and the
 /// `FS_OPEN` handler's refusals before it records the SEND) and for
 /// `FS_MOUNT`, which carries no caps.
-fn reply_dropping_caps(msg: &IpcMessage, opcode: u64, code: u64, ipc_buf: *mut u64)
+fn reply_dropping_caps(msg: &IpcMessage, opcode: u64, code: u64, reply: &mut Reply)
 {
     let mut builder = IpcMessage::builder(code);
     for &cap in msg.caps()
@@ -1894,9 +1946,7 @@ fn reply_dropping_caps(msg: &IpcMessage, opcode: u64, code: u64, ipc_buf: *mut u
             let _ = syscall::cap_delete(cap);
         }
     }
-    let reply = builder.build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set_or_delete_caps(builder.build());
 }
 
 /// `FS_RELEASE_MEMORY` against an open cap: drop the open's outstanding
@@ -1907,7 +1957,7 @@ fn handle_release_memory_open_cap(
     msg: &IpcMessage,
     opens: &mut Opens,
     cache: &PageCache,
-    ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     let code = if opens.release_held(open, msg.word(0), cache)
@@ -1918,7 +1968,7 @@ fn handle_release_memory_open_cap(
     {
         ipc::fs_errors::INVALID_BADGE
     };
-    reply_err(code, ipc_buf);
+    reply_err(code, reply);
 }
 
 /// `FS_CLOSE` against an open cap: remove the open, which retires its
@@ -1926,7 +1976,7 @@ fn handle_release_memory_open_cap(
 /// node are untouched, and the node lives until its entry is removed
 /// ([`NodeTable`]); a session lives on with its other opens. The kernel-side
 /// cap reference is dropped by the caller's paired `cap_delete`.
-fn handle_close_open_cap(open: OpenRef, opens: &mut Opens, cache: &PageCache, ipc_buf: *mut u64)
+fn handle_close_open_cap(open: OpenRef, opens: &mut Opens, cache: &PageCache, reply: &mut Reply)
 {
     let code = if opens.close(open, cache)
     {
@@ -1936,7 +1986,7 @@ fn handle_close_open_cap(open: OpenRef, opens: &mut Opens, cache: &PageCache, ip
     {
         ipc::fs_errors::INVALID_BADGE
     };
-    reply_err(code, ipc_buf);
+    reply_err(code, reply);
 }
 
 /// Release every open of the node an `FS_REMOVE` or
@@ -1972,7 +2022,14 @@ fn fat_error_to_wire(err: FatError) -> u64
     }
 }
 
-fn reply_err(code: u64, ipc_buf: *mut u64)
+/// Leave the refusal `code` in `reply`, sent with the loop's next receive.
+fn reply_err(code: u64, reply: &mut Reply)
+{
+    reply.set_status(code);
+}
+
+/// Reply `code` at once: for the handlers whose dispatch turn does more after the reply.
+fn reply_err_now(code: u64, ipc_buf: *mut u64)
 {
     let reply = IpcMessage::new(code);
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -2211,6 +2268,11 @@ impl fat_parse::file_write::SectorIo for CacheIo<'_>
 /// `WRITE`), `node_id` the node either names.
 /// `label[16..32]` = byte length (≤504), `data[0]` = offset, payload
 /// bytes packed from word 1 onward.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, its node, the driver state a write writes through (FAT state, node table, cache, \
+              block device, IPC buffer), and the loop's reply slot"
+)]
 fn handle_write(
     node_id: NodeId,
     msg: &IpcMessage,
@@ -2219,17 +2281,18 @@ fn handle_write(
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     let Some(node) = nodes.get(node_id)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, reply);
         return;
     };
     if node.kind != NodeKind::File
     {
-        reply_err(ipc::fs_errors::IS_A_DIRECTORY, ipc_buf);
+        reply_err(ipc::fs_errors::IS_A_DIRECTORY, reply);
         return;
     }
     let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
@@ -2242,7 +2305,7 @@ fn handle_write(
         .filter(|_| byte_len != 0)
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err(ipc::fs_errors::IO_ERROR, reply);
         return;
     };
 
@@ -2260,7 +2323,7 @@ fn handle_write(
         Ok(r) => r,
         Err(e) =>
         {
-            reply_err(fat_error_to_wire(e), ipc_buf);
+            reply_err(fat_error_to_wire(e), reply);
             return;
         }
     };
@@ -2270,17 +2333,16 @@ fn handle_write(
         if let Err(e) =
             update_entry_metadata(node.loc, new_cluster, new_size, cache, block_dev, ipc_buf)
         {
-            reply_err(fat_error_to_wire(e), ipc_buf);
+            reply_err(fat_error_to_wire(e), reply);
             return;
         }
         nodes.update_size_and_cluster(node_id, new_cluster, new_size);
     }
 
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+    let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, byte_len as u64)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(answer);
 }
 
 /// `FS_WRITE_MEMORY`: caller supplies a source Memory cap; data lives
@@ -2296,6 +2358,16 @@ fn handle_write(
               it, copy, unmap, write, patch the entry, reply) whose every exit returns the carried \
               cap to the caller in its reply"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, its node, the driver state a write writes through (FAT state, node table, cache, \
+              block device, IPC buffer), and the loop's reply slot"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the source page's 4 KiB copy before it is boxed and the `IpcMessage`s (568 B each) \
+              of its reply paths, counted apart; on the 32 KiB main-thread stack of fatfs"
+)]
 fn handle_write_memory(
     node_id: NodeId,
     msg: &IpcMessage,
@@ -2304,6 +2376,7 @@ fn handle_write_memory(
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     let src_cap = msg.caps().first().copied().unwrap_or(0);
@@ -2311,31 +2384,29 @@ fn handle_write_memory(
     // deleted rather than kept.
     drop_caps(msg.caps().get(1..).unwrap_or(&[]));
 
-    let reply_with = |code: u64, ipc_buf: *mut u64| {
+    let reply_with = |code: u64, reply: &mut Reply| {
         let mut builder = IpcMessage::builder(code);
         if src_cap != 0
         {
             builder = builder.cap(src_cap);
         }
-        let reply = builder.build();
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set_or_delete_caps(builder.build());
     };
 
     if src_cap == 0
     {
-        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_with(ipc::fs_errors::IO_ERROR, reply);
         return;
     }
     let Some(node) = nodes.get(node_id)
     else
     {
-        reply_with(ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        reply_with(ipc::fs_errors::INVALID_BADGE, reply);
         return;
     };
     if node.kind != NodeKind::File
     {
-        reply_with(ipc::fs_errors::IS_A_DIRECTORY, ipc_buf);
+        reply_with(ipc::fs_errors::IS_A_DIRECTORY, reply);
         return;
     }
 
@@ -2351,7 +2422,7 @@ fn handle_write_memory(
             .checked_sub(memory_data_offset)
             .is_none_or(|page_left| byte_count > page_left)
     {
-        reply_with(ipc::fs_errors::BAD_MEMORY_OFFSET, ipc_buf);
+        reply_with(ipc::fs_errors::BAD_MEMORY_OFFSET, reply);
         return;
     }
 
@@ -2359,7 +2430,7 @@ fn handle_write_memory(
     let Ok(tag_rights) = syscall::cap_info(src_cap, syscall::CAP_INFO_TAG_RIGHTS)
     else
     {
-        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_with(ipc::fs_errors::IO_ERROR, reply);
         return;
     };
     #[expect(
@@ -2372,20 +2443,20 @@ fn handle_write_memory(
     if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY)
         || (cap_rights & RIGHTS_MEM_MAP) != RIGHTS_MEM_MAP
     {
-        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_with(ipc::fs_errors::IO_ERROR, reply);
         return;
     }
 
     let va = write_memory_va();
     if va == 0
     {
-        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_with(ipc::fs_errors::IO_ERROR, reply);
         return;
     }
     let Some(self_aspace) = self_aspace_cap()
     else
     {
-        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_with(ipc::fs_errors::IO_ERROR, reply);
         return;
     };
     // memmgr-issued memory caps carry RIGHTS_ALL (both WRITE and EXECUTE);
@@ -2396,7 +2467,7 @@ fn handle_write_memory(
     let Ok(restricted_cap) = syscall::cap_derive(src_cap, RIGHTS_MEM_MAP)
     else
     {
-        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_with(ipc::fs_errors::IO_ERROR, reply);
         return;
     };
     // SAFETY: `va` is the page `write_memory_va` reserved from the
@@ -2415,7 +2486,7 @@ fn handle_write_memory(
     if mapped.is_err()
     {
         let _ = syscall::cap_delete(restricted_cap);
-        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_with(ipc::fs_errors::IO_ERROR, reply);
         return;
     }
 
@@ -2454,7 +2525,7 @@ fn handle_write_memory(
         Ok(r) => r,
         Err(e) =>
         {
-            reply_with(fat_error_to_wire(e), ipc_buf);
+            reply_with(fat_error_to_wire(e), reply);
             return;
         }
     };
@@ -2464,18 +2535,17 @@ fn handle_write_memory(
         if let Err(e) =
             update_entry_metadata(node.loc, new_cluster, new_size, cache, block_dev, ipc_buf)
         {
-            reply_with(fat_error_to_wire(e), ipc_buf);
+            reply_with(fat_error_to_wire(e), reply);
             return;
         }
         nodes.update_size_and_cluster(node_id, new_cluster, new_size);
     }
 
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+    let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, byte_count as u64)
         .cap(src_cap)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set_or_delete_caps(answer);
 }
 
 /// Lazy process-local VA reservation for `FS_WRITE_MEMORY` source-memory-cap
@@ -2538,6 +2608,7 @@ fn handle_create_node_cap(
     cache: &PageCache,
     caps: &FatCaps,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     let open = msg.label & fs_labels::CREATE_OPEN != 0;
@@ -2554,11 +2625,12 @@ fn handle_create_node_cap(
             cache,
             caps,
             ipc_buf,
+            reply,
         );
     }
     else if existing
     {
-        reply_err(ipc::fs_errors::INVALID_ARGUMENT, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_ARGUMENT, reply);
     }
     else
     {
@@ -2572,6 +2644,7 @@ fn handle_create_node_cap(
             cache,
             caps,
             ipc_buf,
+            reply,
         );
     }
 }
@@ -2592,11 +2665,12 @@ fn handle_mkdir_node_cap(
     cache: &PageCache,
     caps: &FatCaps,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     if msg.label & (fs_labels::CREATE_OPEN | fs_labels::CREATE_OPEN_EXISTING) != 0
     {
-        reply_err(ipc::fs_errors::INVALID_ARGUMENT, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_ARGUMENT, reply);
         return;
     }
     create_entry_common(
@@ -2609,6 +2683,7 @@ fn handle_mkdir_node_cap(
         cache,
         caps,
         ipc_buf,
+        reply,
     );
 }
 
@@ -2719,6 +2794,7 @@ fn create_entry_common(
     cache: &PageCache,
     caps: &FatCaps,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     // Cap-monotonic attenuation: the child cap carries at most the
@@ -2731,7 +2807,7 @@ fn create_entry_common(
     let child_rights = parent_rights.intersect(new_entry_rights_ceiling(kind));
     if child_rights.is_empty()
     {
-        reply_err(ipc::fs_errors::PERMISSION_DENIED, ipc_buf);
+        reply_err(ipc::fs_errors::PERMISSION_DENIED, reply);
         return;
     }
     let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
@@ -2739,21 +2815,21 @@ fn create_entry_common(
         Ok(cluster) => cluster,
         Err(code) =>
         {
-            reply_err(code, ipc_buf);
+            reply_err(code, reply);
             return;
         }
     };
     let Some(name) = create_name(msg)
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err(ipc::fs_errors::IO_ERROR, reply);
         return;
     };
     // The node's slot is taken before the entry is written, so a full node
     // table refuses the create with no entry made.
     if !nodes.reserve()
     {
-        reply_err(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
+        reply_err(ipc::fs_errors::TOO_MANY_OPEN, reply);
         return;
     }
     let (start_cluster, loc) =
@@ -2762,7 +2838,7 @@ fn create_entry_common(
             Ok(made) => made,
             Err(code) =>
             {
-                reply_err(code, ipc_buf);
+                reply_err(code, reply);
                 return;
             }
         };
@@ -2780,23 +2856,22 @@ fn create_entry_common(
     })
     else
     {
-        reply_err(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
+        reply_err(ipc::fs_errors::TOO_MANY_OPEN, reply);
         return;
     };
     let badge = pack_badge(new_node_id, child_rights);
     let Ok(new_cap) = syscall::cap_derive_badge(caps.service, syscall::RIGHTS_EP_SEND_GRANT, badge)
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err(ipc::fs_errors::IO_ERROR, reply);
         return;
     };
 
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+    let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, kind_for_node as u64)
         .cap(new_cap)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set_or_delete_caps(answer);
 }
 
 /// `FS_CREATE` with `CREATE_OPEN` (services/fs/docs/fs-driver-protocol.md
@@ -2823,6 +2898,7 @@ fn create_and_open(
     cache: &PageCache,
     caps: &FatCaps,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     let Some(prepared) = prepare_create_open(
@@ -2835,19 +2911,20 @@ fn create_and_open(
         cache,
         caps,
         ipc_buf,
+        reply,
     )
     else
     {
         return;
     };
     // Closing the open deletes its release SEND.
-    let refuse = |code: u64| {
+    let mut refuse = |code: u64| {
         let _ = syscall::cap_delete(prepared.open_cap);
         opens
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .close(OpenRef(prepared.id), cache);
-        reply_err(code, ipc_buf);
+        reply_err(code, reply);
     };
     let open_existing = (msg.label & fs_labels::CREATE_OPEN_EXISTING != 0).then_some(parent_rights);
     let node = match file_to_open(
@@ -2881,13 +2958,13 @@ fn create_and_open(
     // A file the table already held keeps its node, whose size is the
     // current one; the entry's may predate a write.
     let size = nodes.get(file_node).map_or(node.size, |held| held.size);
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+    let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, NodeKind::File as u64)
         .word(1, u64::from(size))
         .cap(prepared.open_cap)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    if unsafe { ipc::ipc_reply(&answer, ipc_buf) }.is_err()
     {
         let _ = syscall::cap_delete(prepared.open_cap);
         opens
@@ -2930,6 +3007,7 @@ fn prepare_create_open<'a>(
     cache: &PageCache,
     caps: &FatCaps,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 ) -> Option<PreparedCreateOpen<'a>>
 {
     let opcode = fs_labels::FS_CREATE;
@@ -2937,7 +3015,7 @@ fn prepare_create_open<'a>(
     let rights = parent_rights.intersect(new_entry_rights_ceiling(NewEntryKind::File));
     if rights.is_empty()
     {
-        reply_dropping_caps(msg, opcode, ipc::fs_errors::PERMISSION_DENIED, ipc_buf);
+        reply_dropping_caps(msg, opcode, ipc::fs_errors::PERMISSION_DENIED, reply);
         return None;
     }
     let (session, release_send) = match request_session(msg, caps.service)
@@ -2945,7 +3023,7 @@ fn prepare_create_open<'a>(
         Ok(session) => session,
         Err(code) =>
         {
-            reply_dropping_caps(msg, opcode, code, ipc_buf);
+            reply_dropping_caps(msg, opcode, code, reply);
             return None;
         }
     };
@@ -2962,17 +3040,17 @@ fn prepare_create_open<'a>(
         Ok(cluster) => cluster,
         Err(code) =>
         {
-            open.refuse(code, ipc_buf);
+            open.refuse(code, reply);
             return None;
         }
     };
     let Some(name) = create_name(msg)
     else
     {
-        open.refuse(ipc::fs_errors::IO_ERROR, ipc_buf);
+        open.refuse(ipc::fs_errors::IO_ERROR, reply);
         return None;
     };
-    let id = record_open(session, open, opens, cache, ipc_buf)?;
+    let id = record_open(session, open, opens, cache, ipc_buf, reply)?;
     let refused = if nodes.reserve()
     {
         open.mint(id).ok_or(ipc::fs_errors::IO_ERROR)
@@ -2996,7 +3074,7 @@ fn prepare_create_open<'a>(
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .close(OpenRef(id), cache);
-            reply_err(code, ipc_buf);
+            reply_err(code, reply);
             None
         }
     }
@@ -3078,7 +3156,7 @@ fn handle_remove_node_cap(
         Ok(cluster) => cluster,
         Err(code) =>
         {
-            reply_err(code, ipc_buf);
+            reply_err_now(code, ipc_buf);
             return;
         }
     };
@@ -3086,7 +3164,7 @@ fn handle_remove_node_cap(
     let Some(name) = msg.data_bytes().get(..name_len).filter(|_| name_len != 0)
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err_now(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
 
@@ -3100,7 +3178,7 @@ fn handle_remove_node_cap(
     )
     else
     {
-        reply_err(ipc::fs_errors::NOT_FOUND, ipc_buf);
+        reply_err_now(ipc::fs_errors::NOT_FOUND, ipc_buf);
         return;
     };
     let is_dir = entry.attr & 0x10 != 0;
@@ -3112,12 +3190,12 @@ fn handle_remove_node_cap(
             {}
             Ok(false) =>
             {
-                reply_err(ipc::fs_errors::NOT_EMPTY, ipc_buf);
+                reply_err_now(ipc::fs_errors::NOT_EMPTY, ipc_buf);
                 return;
             }
             Err(e) =>
             {
-                reply_err(fat_error_to_wire(e), ipc_buf);
+                reply_err_now(fat_error_to_wire(e), ipc_buf);
                 return;
             }
         }
@@ -3135,7 +3213,7 @@ fn handle_remove_node_cap(
                 DeviceSlotState::Live =>
                 {
                     restore_lfn_slots(&failure, removed_loc, cache, block_dev, ipc_buf);
-                    reply_err(fat_error_to_wire(failure.error), ipc_buf);
+                    reply_err_now(fat_error_to_wire(failure.error), ipc_buf);
                     return;
                 }
                 DeviceSlotState::Deleted => RemovedEntry {
@@ -3144,7 +3222,7 @@ fn handle_remove_node_cap(
                 DeviceSlotState::Unreadable =>
                 {
                     nodes.invalidate_for_loc(removed_loc);
-                    reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+                    reply_err_now(ipc::fs_errors::IO_ERROR, ipc_buf);
                     return;
                 }
             }
@@ -3154,7 +3232,7 @@ fn handle_remove_node_cap(
     if let Err(e) = free_entry_data(state, &removed, cache, block_dev, ipc_buf)
     {
         nodes.invalidate_for_loc(removed_loc);
-        reply_err(fat_error_to_wire(e), ipc_buf);
+        reply_err_now(fat_error_to_wire(e), ipc_buf);
         return;
     }
 
@@ -3237,7 +3315,7 @@ fn handle_rename_node_cap(
         Ok(cluster) => cluster,
         Err(code) =>
         {
-            reply_err(code, ipc_buf);
+            reply_err_now(code, ipc_buf);
             return;
         }
     };
@@ -3255,14 +3333,14 @@ fn handle_rename_node_cap(
     })
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err_now(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
 
     if namespace_protocol::validate_name(src_name).is_err()
         || namespace_protocol::validate_name(dst_name).is_err()
     {
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err_now(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     }
 
@@ -3276,7 +3354,7 @@ fn handle_rename_node_cap(
     )
     else
     {
-        reply_err(ipc::fs_errors::NOT_FOUND, ipc_buf);
+        reply_err_now(ipc::fs_errors::NOT_FOUND, ipc_buf);
         return;
     };
 
@@ -3303,7 +3381,7 @@ fn handle_rename_node_cap(
         ipc_buf,
     )
     {
-        reply_err(fat_error_to_wire(e), ipc_buf);
+        reply_err_now(fat_error_to_wire(e), ipc_buf);
         return;
     }
     if let Err(failure) = remove_entry(state, parent_cluster, src_name, cache, block_dev, ipc_buf)
@@ -3322,7 +3400,7 @@ fn handle_rename_node_cap(
                     std::os::seraph::log!(warn: "could not undo a failed rename's destination");
                 }
                 restore_lfn_slots(&failure, src_loc, cache, block_dev, ipc_buf);
-                reply_err(fat_error_to_wire(failure.error), ipc_buf);
+                reply_err_now(fat_error_to_wire(failure.error), ipc_buf);
                 return;
             }
             DeviceSlotState::Deleted =>
@@ -3330,7 +3408,7 @@ fn handle_rename_node_cap(
             DeviceSlotState::Unreadable =>
             {
                 nodes.invalidate_for_loc(src_loc);
-                reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+                reply_err_now(ipc::fs_errors::IO_ERROR, ipc_buf);
                 return;
             }
         }
@@ -3354,6 +3432,11 @@ fn handle_rename_node_cap(
 /// the wire shape is forward-compatible with later extend-with-
 /// zero-fill semantics tracked by the `ruststd::fs` completeness-gaps
 /// Issue.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, its node, the driver state a truncate writes through (FAT state, node table, cache, \
+              block device, IPC buffer), and the loop's reply slot"
+)]
 fn handle_truncate(
     node_id: NodeId,
     msg: &IpcMessage,
@@ -3362,17 +3445,18 @@ fn handle_truncate(
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     let Some(node) = nodes.get(node_id)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, reply);
         return;
     };
     if node.kind != NodeKind::File
     {
-        reply_err(ipc::fs_errors::IS_A_DIRECTORY, ipc_buf);
+        reply_err(ipc::fs_errors::IS_A_DIRECTORY, reply);
         return;
     }
     let new_len = msg.word(0);
@@ -3380,7 +3464,7 @@ fn handle_truncate(
     {
         // v1: only size=0 is supported. Non-zero is the extend-with-
         // zero-fill case which needs new allocator work.
-        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err(ipc::fs_errors::IO_ERROR, reply);
         return;
     }
 
@@ -3395,7 +3479,7 @@ fn handle_truncate(
     if entry_loc.sector_lba != 0
         && let Err(e) = update_entry_metadata(entry_loc, 0, 0, cache, block_dev, ipc_buf)
     {
-        reply_err(fat_error_to_wire(e), ipc_buf);
+        reply_err(fat_error_to_wire(e), reply);
         return;
     }
     nodes.update_size_and_cluster(node_id, 0, 0);
@@ -3403,11 +3487,9 @@ fn handle_truncate(
     if old_cluster >= 2
         && let Err(e) = alloc::free_cluster_chain(state, old_cluster, cache, block_dev, ipc_buf)
     {
-        reply_err(fat_error_to_wire(e), ipc_buf);
+        reply_err(fat_error_to_wire(e), reply);
         return;
     }
 
-    let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set_status(ipc::fs_errors::SUCCESS);
 }

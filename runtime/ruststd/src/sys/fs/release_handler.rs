@@ -47,6 +47,7 @@ use crate::sync::{Arc, Condvar, Mutex, PoisonError};
 use crate::time::Duration;
 use crate::vec::Vec;
 
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, fs_errors, fs_labels};
 
 use crate::sys::reserve as pal_reserve;
@@ -445,12 +446,13 @@ fn handler_main(state: &ReleaseState, started: crate::os::seraph::thread::StartS
     }
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut slot = Reply::new();
     started.at_wait();
     loop
     {
         // SAFETY: `ipc_buf` is the registered IPC buffer for this
         // thread (set by the std::thread trampoline before invoking us).
-        let msg = match unsafe { ipc::ipc_recv(state.release_ep, ipc_buf) }
+        let msg = match unsafe { next_request(state.release_ep, &mut slot, ipc_buf) }
         {
             Ok(m) => m,
             Err(e) =>
@@ -466,9 +468,7 @@ fn handler_main(state: &ReleaseState, started: crate::os::seraph::thread::StartS
             // Unknown opcode — reply with label zero (cheap empty ack)
             // so the sender's blocking ipc_call returns and we don't
             // wedge the endpoint queue.
-            let reply = IpcMessage::new(0);
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            slot.set_status(0);
             continue;
         }
 
@@ -489,8 +489,6 @@ fn handler_main(state: &ReleaseState, started: crate::os::seraph::thread::StartS
             Taken::Busy => false,
         };
         let label = if released { fs_labels::FS_RELEASE_ACK } else { fs_errors::IO_ERROR };
-        let reply = IpcMessage::new(label);
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        slot.set_status(label);
     }
 }

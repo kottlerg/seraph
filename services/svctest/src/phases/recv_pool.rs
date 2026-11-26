@@ -24,6 +24,7 @@ use ipc::log_query::{
 };
 use ipc::log_record::Record;
 use ipc::recv_guard::RecvFailureStage;
+use ipc::serve::Reply;
 use recv_pool::{IpcBuf, RecvPool};
 
 use crate::bootstrap::Caps;
@@ -306,11 +307,13 @@ fn recv_pool_phase(_: &Caps)
     std::thread::Builder::new()
         .name("svctest-rp-serve".into())
         .spawn(move || {
-            let pool = RecvPool::new(served, diag, move |msg: &IpcMessage, buf: IpcBuf| {
-                let reply = serve(msg, buf, echo_send);
-                // SAFETY: `buf` is this worker's registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&reply, buf.as_ptr()) };
-            });
+            let pool = RecvPool::new(
+                served,
+                diag,
+                move |msg: &IpcMessage, buf: IpcBuf, reply: &mut Reply| {
+                    reply.set(serve(msg, buf, echo_send));
+                },
+            );
             match pool.spawn("svctest-rp", WORKERS - 1)
             {
                 Ok(n) if n == WORKERS - 1 =>

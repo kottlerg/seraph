@@ -59,7 +59,11 @@ replies to the bound caller and then receives on the endpoint, in one syscall. T
 waits for that receive, so the kernel places it knowing whether the server blocks (it parked) or
 runs on (it took a queued call)
 ([syscalls.md § `SYS_IPC_REPLY_RECV`](../core/kernel/docs/syscalls.md#sys_ipc_reply_recv-77);
-[scheduler.md](../core/kernel/docs/scheduler.md) § Thread Assignment).
+[scheduler.md](../core/kernel/docs/scheduler.md) § Thread Assignment). Seraph's server loops join
+them through `ipc::serve` ([shared/ipc/README.md](../shared/ipc/README.md) § Serving): a handler
+whose turn ends with its reply leaves the reply for the loop's next receive to send this way, and a
+handler with work after its reply, or a loop with work before its next receive, sends the reply
+alone first, so no reply waits behind work.
 
 A server that needs to delegate work may make a downstream call before replying: the pending reply
 stays bound to the receiving thread until that thread replies, and the downstream call does not
@@ -158,7 +162,8 @@ server keeps them in its own code.
   MAY make a nested call on its own page while it serves the request. Words read from the page
   itself after a nested call are the nested reply's, not the request's.
 - A thread MUST reply, or deliberately leave the caller unanswered, before it receives again: a
-  receive while a reply is pending releases the pending caller (§ The Call/Reply Model).
+  receive while a reply is pending releases the pending caller (§ The Call/Reply Model). A reply
+  sent with the receive (`reply_recv`) is made before it.
 - A thread MUST NOT hold a lock across a nested call whose callee can call back into the server,
   directly or through other services: the call back is received by another thread, which may need
   the lock while its holder waits on the callee. A lock held across a call to a service that never
@@ -301,8 +306,11 @@ Two mechanisms make the condition diagnosable:
   `ipc::recv_guard::RecvGuard`: bounded exponential backoff between failed receives, a diagnostic
   hook at the first failure of a streak, and process death with `EXIT_RECV_WEDGE`
   (`SYS_ASPACE_EXIT`, from whichever thread's loop wedged) once a streak of identical failures
-  proves the condition persistent. A blocking notification-wait loop may route its waits through it
-  too, as the VirtIO drivers' interrupt-service loop, `virtio_core::isr::serve_interrupts`, does, so
+  proves the condition persistent. A loop that receives through `ipc::serve::next_request`, with
+  its reply, routes the outcomes it returns the same way: they are the receive's alone, since a
+  failure of the reply itself is never returned as one. A blocking notification-wait loop may
+  route its waits through it too, as the VirtIO drivers' interrupt-service loop,
+  `virtio_core::isr::serve_interrupts`, does, so
   `EXIT_RECV_WEDGE` also ends a driver whose interrupt wait wedged. `Interrupted` receives are
   exempt — expected during thread stop/start, they neither extend nor reset the streak. Non-blocking
   drain loops (`event_try_recv`) do not use the guard, nor do loops over the other try-once or

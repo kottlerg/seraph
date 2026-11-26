@@ -94,6 +94,7 @@ use firmware::iommu_restart::{
 };
 use firmware::rimt;
 use firmware_tables::dmar::drhd_units;
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, iommu_errors, iommu_labels, memmgr_errors, memmgr_labels};
 use restart_budget::RestartBudget;
 use syscall_abi::{PAGE_SIZE, SyscallError};
@@ -843,12 +844,12 @@ fn remap_set_msg(entry: &RemapEntry) -> IpcMessage
 fn drain(ep: u64)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    let reply = IpcMessage::new(iommu_errors::HARDWARE_TIMEOUT);
     let mut guard = ipc::recv_guard::RecvGuard::new(crate::recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: `ipc_buf` is this thread's registered IPC buffer.
-        let msg = match unsafe { ipc::ipc_recv(ep, ipc_buf) }
+        let msg = match unsafe { next_request(ep, &mut reply, ipc_buf) }
         {
             Ok(msg) =>
             {
@@ -871,8 +872,7 @@ fn drain(ep: u64)
         {
             let _ = syscall::cap_delete(c);
         }
-        // SAFETY: as above.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set_status(iommu_errors::HARDWARE_TIMEOUT);
     }
 }
 

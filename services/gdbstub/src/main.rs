@@ -43,6 +43,7 @@ use gdbstub::breakpoints;
 use gdbstub::control::{self, Plan, ResumeSelect};
 use gdbstub::session::{self, Idle, Kernel, Page, RegisterAccess, Resumed, Session, Stop};
 use gdbstub::{regs, signal, stop_signal};
+use ipc::serve::{Reply, next_request};
 use ipc::{
     IpcMessage, procmgr_errors, procmgr_labels, serial_errors, serial_labels, svcmgr_labels,
 };
@@ -309,10 +310,11 @@ fn start_receiver(id: usize, endpoint: u64, events: Sender<Stop>) -> Option<Send
     std::thread::Builder::new()
         .spawn(move || {
             let ipc_buf = std::os::seraph::current_ipc_buf();
+            let mut slot = Reply::new();
             loop
             {
                 // SAFETY: ipc_buf is this thread's registered IPC buffer.
-                let Ok(msg) = (unsafe { ipc::ipc_recv(endpoint, ipc_buf) })
+                let Ok(msg) = (unsafe { next_request(endpoint, &mut slot, ipc_buf) })
                 else
                 {
                     std::thread::sleep(Duration::from_millis(POLL_MS));
@@ -334,8 +336,7 @@ fn start_receiver(id: usize, endpoint: u64, events: Sender<Stop>) -> Option<Send
                 {
                     return;
                 };
-                // SAFETY: ipc_buf is this thread's registered IPC buffer.
-                let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(label), ipc_buf) };
+                slot.set_status(label);
             }
         })
         .ok()?;

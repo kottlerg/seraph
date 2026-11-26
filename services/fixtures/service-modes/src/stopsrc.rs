@@ -22,6 +22,7 @@
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, stop_labels as stop, stopsrc_labels as src};
 
 /// The mode of this fixture in its binary (`crate::PATH`), the first argument
@@ -114,10 +115,11 @@ fn serve(service: u64, nonce: u64, ipc_buf: *mut u64) -> !
     // (`ipc::stop_labels`).
     let mut next_key = nonce;
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service, ipc_buf) }
+        let msg = match unsafe { next_request(service, &mut reply, ipc_buf) }
         {
             Ok(msg) =>
             {
@@ -135,7 +137,7 @@ fn serve(service: u64, nonce: u64, ipc_buf: *mut u64) -> !
             let _ = syscall::cap_delete(cap);
         }
         let authorized = msg.badge & stop::STOP_AUTHORITY != 0;
-        let reply = match msg.label
+        let answer = match msg.label
         {
             stop::LIST_CANDIDATES | stop::STOP_CANDIDATE if !authorized =>
             {
@@ -160,8 +162,7 @@ fn serve(service: u64, nonce: u64, ipc_buf: *mut u64) -> !
             }
             _ => IpcMessage::new(src::UNKNOWN_OPCODE),
         };
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set(answer);
     }
 }
 

@@ -566,8 +566,10 @@ pub const THREAD_PLACEMENT_WAKE_MOVES: u64 = 3;
 /// thread, queued, to another CPU.
 pub const THREAD_PLACEMENT_PULLS: u64 = 4;
 /// [`CAP_INFO_THREAD_PLACEMENT`] view: wakes of the thread by a synchronous
-/// IPC call or fault delivery whose placement reached the synchronous wake
-/// rule, the thread having no hard affinity and no context save in flight.
+/// IPC call, a fault delivery, or the reply of a `SYS_IPC_REPLY_RECV` to a
+/// `SYS_IPC_CALL` caller when its receive parked, whose placement reached
+/// the synchronous wake rule, the thread having no hard affinity and no
+/// context save in flight. A reply to a fault-blocked thread is not counted.
 pub const THREAD_PLACEMENT_SYNC_WAKES: u64 = 5;
 /// [`CAP_INFO_THREAD_PLACEMENT`] view: of those, the wakes the rule placed on
 /// the waker's CPU, which queued no other thread and ran a waker the thread

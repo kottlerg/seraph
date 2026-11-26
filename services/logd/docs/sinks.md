@@ -80,7 +80,8 @@ logd's history entry is the record. Every sink renders from it, and the query in
   slot, and its name, at the moment it is read.
 - **Name.** An entry carries no name. A device sink renders the name of the entry's slot, with the
   instance number of § Display names, at the moment it renders. An external sink renders a name
-  at least as new as the one the slot had when the entry was retained (§ External sinks).
+  at least as new as the one the slot had when the entry was retained, or the unnamed sender `?`
+  when the slot is no longer in the table (§ External sinks).
 - **Name generation.** logd counts each slot's name registrations, a 32-bit count from 0 that only
   rises, and an entry carries its slot's count at the moment the entry was retained, so a reader
   that keeps a slot's name knows when the name it keeps is older than the entry it renders. The

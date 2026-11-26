@@ -7088,11 +7088,18 @@ pub enum WakeHint
     None,
     /// The waker is the thread running on this CPU, its park committed in the
     /// same syscall, and its `schedule()` follows before any return to user
-    /// mode: the call rendezvous and the fault delivery. The woken thread then
-    /// runs on this CPU when nothing else waits there and it does not outrank
-    /// the waker (core/kernel/docs/scheduling-internals.md § Wake Protocol
+    /// mode: the call rendezvous, the fault delivery, and the reply of a
+    /// `SYS_IPC_REPLY_RECV` whose receive parked. The woken thread then runs
+    /// on this CPU when nothing else waits there and it does not outrank the
+    /// waker (core/kernel/docs/scheduling-internals.md § Wake Protocol
     /// Invariants, "Target CPU selection").
     Sync,
+    /// The waker is the thread running on this CPU and runs on past the wake:
+    /// the reply of a `SYS_IPC_REPLY_RECV` whose receive did not park. The
+    /// sticky preferred-CPU rule then skips this CPU, so the woken thread goes
+    /// to its preferred CPU only when that is another, and otherwise by least
+    /// load.
+    WakerRuns,
 }
 
 /// Select target CPU for enqueueing a thread based on affinity, the wake's
@@ -7108,7 +7115,8 @@ pub enum WakeHint
 /// `tcb` must be a valid pointer to an initialized [`ThreadControlBlock`].
 /// With [`WakeHint::Sync`], the caller is the waker, running on this CPU
 /// with its park committed and its `schedule()` to follow before any return
-/// to user mode.
+/// to user mode; with [`WakeHint::WakerRuns`], the waker, running on this
+/// CPU.
 #[cfg(not(test))]
 pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock, hint: WakeHint) -> usize
 {
@@ -7163,7 +7171,8 @@ trait WakeView
     fn preferred(&self) -> usize;
     /// The CPU count.
     fn cpu_count(&self) -> usize;
-    /// The CPU the wake runs on: the waker's, for a [`WakeHint::Sync`] wake.
+    /// The CPU the wake runs on: the waker's, for a [`WakeHint::Sync`] or a
+    /// [`WakeHint::WakerRuns`] wake.
     fn this_cpu(&self) -> usize;
     /// Whether this CPU queues a thread other than its idle thread
     /// (`PerCpuScheduler::has_queued_thread`).
@@ -7250,8 +7259,11 @@ fn place_wake(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) -> u
     // Sticky preferred CPU (eligible only): stay if within the pull-balancer's
     // imbalance threshold of the global minimum (cache-warmth bias, #128). The
     // eligibility guard makes a stale value fall through to the min-load path.
+    // A waker that runs on keeps its CPU busy, so the rule skips that CPU for
+    // its wake; the min-load path can still pick it.
     let pref = view.preferred();
-    if eligible(pref) && !exceeds_imbalance(view.load(pref), min_load)
+    let waker_keeps_pref = hint == WakeHint::WakerRuns && pref == view.this_cpu();
+    if eligible(pref) && !waker_keeps_pref && !exceeds_imbalance(view.load(pref), min_load)
     {
         return pref;
     }
@@ -10589,6 +10601,47 @@ mod placement_tests
         wake.place(None, WakeHint::Sync);
         assert_eq!(wake.waker_reads.get(), 2);
         assert_eq!(wake.syncs.get(), (1, 1));
+    }
+
+    // The defect caught: a reply-and-receive whose server runs on sending its
+    // caller back to the server's CPU by the sticky rule, behind a server
+    // that keeps that CPU, while another CPU idles; or the rule's skip
+    // applied to a preferred CPU that is not the waker's, or ahead of hard
+    // affinity. The wake never reaches the synchronous rule, so neither its
+    // counts nor the waker's queue and rank are read.
+    #[test]
+    fn a_waker_that_runs_on_is_skipped_by_the_sticky_rule()
+    {
+        let wake = Wake::new(4, 2, 2);
+        assert_eq!(wake.place(None, WakeHint::None), 2);
+        assert_eq!(wake.place(None, WakeHint::WakerRuns), 0);
+        let mut loaded = Wake::new(4, 2, 2);
+        loaded.loads = vec![1, 0, 0, 1];
+        assert_eq!(loaded.place(None, WakeHint::WakerRuns), 1);
+        let elsewhere = Wake::new(4, 1, 2);
+        assert_eq!(elsewhere.place(None, WakeHint::WakerRuns), 1);
+        let mut pinned = Wake::new(4, 2, 2);
+        pinned.affinity = 2;
+        assert_eq!(pinned.place(None, WakeHint::WakerRuns), 2);
+        for placed in [&wake, &loaded, &elsewhere, &pinned]
+        {
+            assert_eq!(placed.syncs.get(), (0, 0));
+            assert_eq!(placed.waker_reads.get(), 0);
+        }
+    }
+
+    // The defect caught: the waker's CPU refused outright to a wake whose
+    // waker runs on, so a thread is sent to a busier CPU, or nowhere on one
+    // CPU. The least-load rule still picks the waker's CPU when it is the
+    // least loaded; the reply-and-receive then yields to the woken thread.
+    #[test]
+    fn a_waker_that_runs_on_keeps_its_cpu_when_it_is_the_least_loaded()
+    {
+        let mut busy = Wake::new(4, 2, 2);
+        busy.loads = vec![2, 2, 0, 2];
+        assert_eq!(busy.place(None, WakeHint::WakerRuns), 2);
+        let alone = Wake::new(1, 0, 0);
+        assert_eq!(alone.place(None, WakeHint::WakerRuns), 0);
     }
 
     // The defect caught: rank compared by raw priority, so one fair level

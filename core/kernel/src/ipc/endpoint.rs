@@ -788,8 +788,12 @@ unsafe fn bind_next_sender(
 #[cfg(not(test))]
 pub enum RecvMiss
 {
-    /// No sender was waiting.
+    /// No sender was waiting. From [`endpoint_recv`], the server's park
+    /// committed: it blocks at its `schedule()`.
     NoSender,
+    /// No sender was waiting and [`endpoint_recv`]'s park was refused: the
+    /// server is off the recv queue and runs on past its `schedule()`.
+    ParkRefused,
     /// The endpoint has no receiver left ([`EndpointState::receivers`]): the
     /// receive's own capability was freed after its lookup. Nothing of the
     /// server changed under `ep.lock`.
@@ -803,10 +807,11 @@ pub enum RecvMiss
 /// (server continues running with the sender's message in its `ipc_msg`;
 /// sender remains blocked on reply, and [`BoundSender`] holds what the
 /// receive keeps of it).
-/// Returns [`RecvMiss::NoSender`] if no sender was available (the server is
-/// committed `BlockedOnRecv` on the recv queue, unless the park is refused, in
-/// which case it is unlinked and, on a stop-won or upcall refusal, its park is
-/// stamped INTERRUPTED). Returns [`RecvMiss::NoReceiver`], without parking,
+/// Returns [`RecvMiss::NoSender`] if no sender was available and the server is
+/// committed `BlockedOnRecv` on the recv queue, and [`RecvMiss::ParkRefused`]
+/// if none was and the park was refused, in which case the server is unlinked
+/// and, on a stop-won or upcall refusal, its park is stamped INTERRUPTED.
+/// Returns [`RecvMiss::NoReceiver`], without parking,
 /// when no capability with the Receive right on the endpoint is left.
 ///
 /// `deadline` is the tick at which a timed receive's park expires, or `0` for
@@ -880,7 +885,8 @@ pub unsafe fn endpoint_recv(
             blocked_on,
         )
     };
-    if committed != crate::sched::ParkCommit::Committed
+    let parked = committed == crate::sched::ParkCommit::Committed;
+    if !parked
     {
         // Refused park; unlink from the recv queue. ep.lock has been held
         // across enqueue/commit/rollback, so the rollback owns the episode.
@@ -917,7 +923,16 @@ pub unsafe fn endpoint_recv(
     }
     // SAFETY: paired with lock_raw above.
     unsafe { ep.lock.unlock_raw(saved) };
-    Err(RecvMiss::NoSender)
+    Err(
+        if parked
+        {
+            RecvMiss::NoSender
+        }
+        else
+        {
+            RecvMiss::ParkRefused
+        },
+    )
 }
 
 /// Receive on `ep` as `server` without parking (`SYS_IPC_RECV` try-once).

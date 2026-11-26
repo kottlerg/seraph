@@ -413,6 +413,61 @@ pub unsafe fn syscall_ipc_reply(nr: u64, a0: u64, a1: u64, a2: u64, mr: [u64; 6]
     ret
 }
 
+/// Issue `SYS_IPC_REPLY_RECV`: `a0` to `a3` in `a0` to `a3`, and the reply's
+/// message registers MR0..MR5 (`a4`, `a5`, `a6`, `t0`, `t1`, `t2`) from
+/// `mr`. Returns as [`syscall_ipc_recv`] does: `(primary, label from a1,
+/// badge from a2, delivered count word from a3, the message registers on
+/// return)`.
+///
+/// # Safety
+///
+/// The raw-wrapper contract in [`crate::arch`] § Safety.
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 arg \
+              is reinterpreted as an i64 register value with its bit pattern preserved"
+)]
+#[inline(always)]
+pub unsafe fn syscall_ipc_reply_recv(
+    nr: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    mr: [u64; 6],
+) -> (i64, u64, u64, u64, [u64; 6])
+{
+    let ret: i64;
+    let label: u64;
+    let badge: u64;
+    let counts: u64;
+    let [mut m0, mut m1, mut m2, mut m3, mut m4, mut m5] = mr;
+    let a0 = a0 as i64;
+    // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
+    // args in a0-a3 (inout): the reply label, its counts and the timeout in, the received
+    // label, the badge and the count word out in a1-a3. The message registers are inout:
+    // the reply's words in, the received message's out.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inout("a0") a0 => ret,
+            inout("a1") a1 => label,
+            inout("a2") a2 => badge,
+            inout("a3") a3 => counts,
+            inout("a4") m0,
+            inout("a5") m1,
+            inout("a6") m2,
+            inout("t0") m3,
+            inout("t1") m4,
+            inout("t2") m5,
+            in("a7") nr,
+            options(nostack),
+        );
+    }
+    (ret, label, badge, counts, [m0, m1, m2, m3, m4, m5])
+}
+
 /// Issue a syscall with 6 arguments. Returns the primary return value.
 ///
 /// # Safety

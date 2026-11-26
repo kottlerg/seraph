@@ -10,10 +10,10 @@
 //! `#[cfg(target_arch)]` guards (`docs/coding-standards.md` § C. Architecture
 //! Invariants). Every architecture defines the same wrappers: `syscall2` to
 //! `syscall6` (primary return only), `syscall5_ret2`, `syscall2_ret3`, the IPC
-//! wrappers `syscall_ipc_call`, `syscall_ipc_recv` and `syscall_ipc_reply`
-//! (which carry the message registers MR0..MR5), and `syscall4_any` (every
-//! register the kernel can write declared clobbered, behind the untyped
-//! `raw_syscall3` and `raw_syscall4`).
+//! wrappers `syscall_ipc_call`, `syscall_ipc_recv`, `syscall_ipc_reply` and
+//! `syscall_ipc_reply_recv` (which carry the message registers MR0..MR5), and
+//! `syscall4_any` (every register the kernel can write declared clobbered,
+//! behind the untyped `raw_syscall3` and `raw_syscall4`).
 //!
 //! # Safety
 //!
@@ -25,10 +25,11 @@
 //! - a pointer argument must be valid for the access the call's contract specifies;
 //! - a call that reads or writes the calling thread's registered IPC buffer page
 //!   (`SYS_IPC_CALL` reads it for the request and writes it with the reply,
-//!   `SYS_IPC_RECV` writes it, `SYS_IPC_REPLY` reads it, each for a message of
-//!   more than `MSG_REGS_DATA_MAX` data words or with capabilities) must hold no
-//!   Rust reference into that page across the call; the page is the one
-//!   `crate::ipc_buffer_set` registered under its own `# Safety`;
+//!   `SYS_IPC_RECV` writes it, `SYS_IPC_REPLY` reads it, `SYS_IPC_REPLY_RECV`
+//!   reads it for the reply and writes it with the received message, each for a
+//!   message of more than `MSG_REGS_DATA_MAX` data words or with capabilities)
+//!   must hold no Rust reference into that page across the call; the page is
+//!   the one `crate::ipc_buffer_set` registered under its own `# Safety`;
 //! - a call that changes mappings of the caller's own address space
 //!   (`SYS_MEM_MAP`, `SYS_MEM_UNMAP`, `SYS_MEM_PROTECT`, `SYS_MMIO_MAP`) must
 //!   change none that a live Rust object or the registered IPC buffer page

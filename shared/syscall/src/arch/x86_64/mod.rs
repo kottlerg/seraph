@@ -453,6 +453,65 @@ pub unsafe fn syscall_ipc_reply(nr: u64, a0: u64, a1: u64, a2: u64, mr: [u64; 6]
     ret
 }
 
+/// Issue `SYS_IPC_REPLY_RECV`: `a0` to `a3` in `rdi`, `rsi`, `rdx`, `r10`, and
+/// the reply's message registers MR0..MR5 (`r8`, `r9`, `r12` to `r15`) from
+/// `mr`. Returns as [`syscall_ipc_recv`] does: `(primary, label from rdx,
+/// badge from rsi, delivered count word from r10, the message registers on
+/// return)`.
+///
+/// # Safety
+///
+/// The raw-wrapper contract in [`crate::arch`] § Safety.
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
+#[inline(always)]
+pub unsafe fn syscall_ipc_reply_recv(
+    nr: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    mr: [u64; 6],
+) -> (i64, u64, u64, u64, [u64; 6])
+{
+    let ret: i64;
+    let label: u64;
+    let badge: u64;
+    let counts: u64;
+    let [mut m0, mut m1, mut m2, mut m3, mut m4, mut m5] = mr;
+    let nr = nr as i64;
+    // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
+    // args in rdi/rsi/rdx/r10; clobbers rcx/r11. rsi, rdx and r10 are inout: the reply label,
+    // its counts and the timeout in, the badge, the received label and the count word out.
+    // The message registers are inout: the reply's words in, the received message's out (the
+    // kernel writes only the delivered words and leaves the rest as they were).
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rax") nr => ret,
+            in("rdi") a0,
+            inout("rsi") a1 => badge,
+            inout("rdx") a2 => label,
+            inout("r10") a3 => counts,
+            inout("r8") m0,
+            inout("r9") m1,
+            inout("r12") m2,
+            inout("r13") m3,
+            inout("r14") m4,
+            inout("r15") m5,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    (ret, label, badge, counts, [m0, m1, m2, m3, m4, m5])
+}
+
 /// Issue a syscall with 6 arguments. Returns the primary return value.
 ///
 /// # Safety

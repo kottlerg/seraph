@@ -1137,6 +1137,54 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
     syscall::raw_ipc_reply(msg.label, msg.word_count(), msg.caps().len(), &regs)
 }
 
+/// Reply to the current thread's pending caller with `reply`, then receive
+/// the next message on `ep`, in one `SYS_IPC_REPLY_RECV`: the server loop's
+/// [`ipc_reply`] followed by [`ipc_recv_timeout`] (`timeout_ms` takes its
+/// policy, so `0` waits without bound and `syscall::WAIT_TRY_ONCE` never
+/// waits).
+///
+/// The kernel defers the caller's wake until the receive has decided, so a
+/// caller woken onto this thread's CPU runs there when this thread blocks,
+/// and goes to another CPU when it runs on (`docs/ipc-design.md` § The
+/// Call/Reply Model).
+///
+/// # Safety
+/// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer
+/// page as registered via `syscall::ipc_buffer_set`.
+///
+/// # Errors
+/// Returns a negative `i64` error code, in the order the kernel checks them:
+/// - `InvalidCapability`, `InsufficientRights`, `QuotaExceeded` and
+///   `OutOfMemory` for `ep`, as [`ipc_recv`] reports them, before the
+///   reply: a pending caller stays bound.
+/// - [`ipc_reply`]'s errors, without receiving; the pending reply is
+///   consumed, as there.
+/// - `NoReceiver`, `Interrupted` and `WouldBlock` from the receive, after
+///   the reply was made.
+#[inline]
+pub unsafe fn ipc_reply_recv(
+    ep: u64,
+    reply: &IpcMessage,
+    ipc_buf: *mut u64,
+    timeout_ms: u64,
+) -> Result<IpcMessage, i64>
+{
+    // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
+    let regs = unsafe { reply.stage_send(ipc_buf) };
+    let delivery = syscall::raw_ipc_reply_recv(
+        ep,
+        reply.label,
+        reply.word_count(),
+        reply.caps().len(),
+        timeout_ms,
+        &regs,
+    )?;
+    // SAFETY: `ipc_buf` is the registered IPC buffer; the kernel wrote a
+    // message beyond MSG_REGS_DATA_MAX words and any delivered cap handles
+    // there before return.
+    Ok(unsafe { IpcMessage::from_delivery(ipc_buf, &delivery) })
+}
+
 #[cfg(test)]
 mod tests
 {

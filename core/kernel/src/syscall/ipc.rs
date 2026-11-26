@@ -280,7 +280,7 @@ unsafe fn write_cap_results(buf: u64, handles: &[u64])
 /// reference-ceiling check
 /// ([`check_transfer_ref_limits`](crate::cap::transfer::check_transfer_ref_limits)),
 /// the predicate for every cap-transfer direction — `sys_ipc_call`'s and
-/// `sys_ipc_reply`'s fail-fast rejects on the running thread's own `CSpace`
+/// `deposit_reply`'s fail-fast rejects on the running thread's own `CSpace`
 /// ([`prevalidate_sender_caps`]), and `transfer_caps`' validation under the
 /// locks it moves under. A refusal detected only after a caller has blocked
 /// degrades to zero-cap delivery without notifying the sender, which is why
@@ -975,11 +975,24 @@ fn log_recv_preallocate_failure(
     );
 }
 
-/// The receive step of `SYS_IPC_RECV` on `ep_state`: `Ok(Some(bound))` when a
-/// caller was waiting, `Ok(None)` when `tcb` parked on the recv queue (or
-/// its park was refused), `Err(WouldBlock)` for an empty try-once, and
-/// `Err(NoReceiver)` when no capability with the Receive right on the
-/// endpoint is left.
+/// What the receive step of `SYS_IPC_RECV` and `SYS_IPC_REPLY_RECV` did.
+#[cfg(not(test))]
+enum Received
+{
+    /// A caller was waiting and is bound to the receiver.
+    Bound(crate::ipc::endpoint::BoundSender),
+    /// No caller was waiting and the receiver's park committed: its
+    /// `schedule()` blocks it.
+    Parked,
+    /// No caller was waiting and the receiver's park was refused: its
+    /// `schedule()` does not block it.
+    ParkRefused,
+}
+
+/// The receive step of `SYS_IPC_RECV` on `ep_state`: [`Received`] when a
+/// caller was waiting or `tcb` parked on the recv queue (or its park was
+/// refused), `Err(WouldBlock)` for an empty try-once, and `Err(NoReceiver)`
+/// when no capability with the Receive right on the endpoint is left.
 ///
 /// # Safety
 /// `ep_state` must be a pinned Endpoint's state and `tcb` the running thread,
@@ -989,7 +1002,7 @@ unsafe fn receive_on(
     ep_state: *mut crate::ipc::endpoint::EndpointState,
     tcb: *mut crate::sched::thread::ThreadControlBlock,
     timeout_ms: u64,
-) -> Result<Option<crate::ipc::endpoint::BoundSender>, SyscallError>
+) -> Result<Received, SyscallError>
 {
     let try_once = timeout_ms == syscall::WAIT_TRY_ONCE;
     let received = if try_once
@@ -1012,9 +1025,10 @@ unsafe fn receive_on(
     };
     match received
     {
-        Ok(bound) => Ok(Some(bound)),
+        Ok(bound) => Ok(Received::Bound(bound)),
         Err(crate::ipc::endpoint::RecvMiss::NoSender) if try_once => Err(SyscallError::WouldBlock),
-        Err(crate::ipc::endpoint::RecvMiss::NoSender) => Ok(None),
+        Err(crate::ipc::endpoint::RecvMiss::NoSender) => Ok(Received::Parked),
+        Err(crate::ipc::endpoint::RecvMiss::ParkRefused) => Ok(Received::ParkRefused),
         Err(crate::ipc::endpoint::RecvMiss::NoReceiver) => Err(SyscallError::NoReceiver),
     }
 }
@@ -1065,37 +1079,9 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
         (*ep_obj).state
     };
 
-    // Pre-allocate server's CSpace for the worst-case incoming cap_count
-    // (`MSG_CAP_SLOTS_MAX`) before either delivery path can transition any
-    // IPC state. A cap-transfer failure on either path degrades to zero-cap
-    // delivery (the sender keeps its caps), so pre-growing the destination
-    // here makes OOM unlikely on both the immediate-delivery path and the
-    // resumed-recv path (`deliver_call_caps`). General allocations never
-    // take the last `IPC_RECV_RESERVE` (= `MSG_CAP_SLOTS_MAX`) free slots
-    // (core/kernel/docs/capability-internals.md § IPC Receive Reserve), so
-    // this succeeds without growth on a CSpace whose general slots are
-    // exhausted; it fails only once received caps have taken the reserve
-    // and the pool cannot grow. The CSpace lock is dropped before
-    // `endpoint_recv`, so a sibling thread's transfer into this CSpace can
-    // take reserved slots meanwhile; `transfer_caps`'s locked
-    // `pre_allocate` then grows again, and a failure of that grow fails the
-    // transfer, which degrades to zero-cap delivery.
     // SAFETY: cspace_ptr validated above: the running thread's own CSpace,
-    // live while it runs.
-    let lock = unsafe { &(*cspace_ptr).lock };
-    // SAFETY: lock_raw pairs with the unlock_raw below.
-    let saved = unsafe { lock.lock_raw() };
-    // SAFETY: cspace_ptr is live (as above), and its held lock serialises its
-    // slots.
-    let r = unsafe { (*cspace_ptr).pre_allocate(MSG_CAP_SLOTS_MAX) };
-    // SAFETY: cspace_ptr is live (as above).
-    let lock = unsafe { &(*cspace_ptr).lock };
-    // SAFETY: paired with the lock_raw above.
-    unsafe { lock.unlock_raw(saved) };
-    r.map_err(|e| {
-        log_recv_preallocate_failure(tcb, &e);
-        SyscallError::from(e)
-    })?;
+    // live while it runs; tcb is the running thread; no lock is held.
+    unsafe { preallocate_receive(tcb, cspace_ptr) }?;
 
     // Open the park episode before the recv-queue link can publish.
     // SAFETY: tcb is the running caller, not yet claimable.
@@ -1111,7 +1097,7 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // own SYS_IPC_BUFFER_SET, so it cannot change during this syscall.
     let server_buf = unsafe { (*tcb).ipc_buffer };
 
-    if let Some(bound) = result
+    if let Received::Bound(bound) = result
     {
         // A caller was waiting; deliver message immediately. The caller's TCB
         // is not read from here on: once the endpoint lock dropped, a
@@ -1145,6 +1131,81 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // queue once no capability with the Receive right is left.
     drop(slot);
 
+    // SAFETY: tcb is the running receiver, whose receive parked it (or had its
+    // park refused) in this syscall; tf is its own frame and server_buf its
+    // IPC buffer; no lock is held.
+    unsafe { deliver_after_park(tf, tcb, server_buf) }
+}
+
+/// Pre-allocate the receiving thread `tcb`'s `CSpace`, at `cspace_ptr`, for a
+/// message's worst-case incoming capability count (`MSG_CAP_SLOTS_MAX`)
+/// before either delivery path of a receive can transition any IPC state.
+///
+/// A cap-transfer failure on either path degrades to zero-cap delivery (the
+/// sender keeps its caps), so pre-growing the destination here makes OOM
+/// unlikely on both the immediate-delivery path and the resumed-recv path
+/// (`deliver_call_caps`). General allocations never take the last
+/// `IPC_RECV_RESERVE` (= `MSG_CAP_SLOTS_MAX`) free slots
+/// (core/kernel/docs/capability-internals.md § IPC Receive Reserve), so this
+/// succeeds without growth on a `CSpace` whose general slots are exhausted;
+/// it fails only once received caps have taken the reserve and the pool
+/// cannot grow. The `CSpace` lock is dropped before `endpoint_recv`, so a
+/// sibling thread's transfer into this `CSpace` can take reserved slots
+/// meanwhile; `transfer_caps`'s locked `pre_allocate` then grows again, and
+/// a failure of that grow fails the transfer, which degrades to zero-cap
+/// delivery.
+///
+/// # Errors
+/// `QuotaExceeded` when the `CSpace` directory is structurally full, and
+/// `OutOfMemory` when its slot-page pool is exhausted.
+///
+/// # Safety
+/// `tcb` must be the running thread and `cspace_ptr` its own `CSpace`, live
+/// while it runs; no lock may be held.
+#[cfg(not(test))]
+unsafe fn preallocate_receive(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    cspace_ptr: *mut CSpace,
+) -> Result<(), SyscallError>
+{
+    // SAFETY: cspace_ptr is the running thread's own CSpace (contract).
+    let lock = unsafe { &(*cspace_ptr).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: cspace_ptr is live (as above), and its held lock serialises its
+    // slots.
+    let r = unsafe { (*cspace_ptr).pre_allocate(MSG_CAP_SLOTS_MAX) };
+    // SAFETY: cspace_ptr is live (as above).
+    let lock = unsafe { &(*cspace_ptr).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
+    r.map_err(|e| {
+        log_recv_preallocate_failure(tcb, &e);
+        SyscallError::from(e)
+    })
+}
+
+/// The end of a receive that bound no caller: block at `schedule()` (which
+/// returns at once when the park was refused or already woken), then report
+/// the park's cancellation or deliver the message a waking caller deposited.
+///
+/// # Errors
+/// `Interrupted` (a stop or upcall cancelled the park), `WouldBlock` (a
+/// timed receive expired), and `NoReceiver` (the endpoint's last capability
+/// with the Receive right went).
+///
+/// # Safety
+/// `tcb` must be the running thread, whose receive in this syscall opened a
+/// park episode and parked it (or had the park refused); `tf` its own frame,
+/// running in its own address space, and `server_buf` its IPC buffer VA or 0;
+/// no lock may be held.
+#[cfg(not(test))]
+unsafe fn deliver_after_park(
+    tf: UserFrame,
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    server_buf: u64,
+) -> Result<u64, SyscallError>
+{
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
         crate::sched::schedule(crate::sched::Requeue::IfRunnable);
@@ -1272,47 +1333,48 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
     unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
 }
 
-/// `SYS_IPC_REPLY` (1): reply to a blocked caller.
+/// `SYS_IPC_REPLY_RECV` (77): reply to the pending caller as `SYS_IPC_REPLY`
+/// does, then receive on an endpoint as `SYS_IPC_RECV` does, with the reply's
+/// caller wake deferred until the receive has decided.
 ///
-/// arg0 = label, arg1 = `data_count`,
-/// arg2 = `cap_count` (0-4); the data words are read from the server's
-/// message registers MR0..MR5 when `data_count` is at most
-/// `MSG_REGS_DATA_MAX` and from its IPC buffer otherwise
-/// ([`read_data_words`]), and the `cap_count` cap handles from the
-/// server's IPC buffer at word `MSG_CAP_HANDLES_WORD`.
+/// arg0 = endpoint cap index, arg1 = reply label, arg2 = the reply's
+/// `data_count` and `cap_count` ([`syscall::ipc_reply_recv_count_arg`]),
+/// arg3 = the receive's `timeout_ms` (`SYS_IPC_RECV`'s policy). The reply's
+/// data words are read from the message registers or the IPC buffer by their
+/// count, and its cap handles from the IPC buffer, as for `SYS_IPC_REPLY`;
+/// the received message returns as `SYS_IPC_RECV` returns it.
 ///
-/// Capabilities move from the server's `CSpace` to the caller's `CSpace`
-/// all-or-nothing with the reply; a transfer refused after the caller was
-/// claimed (a reply slot stale, repeated, or pinned by an in-flight revoke,
-/// move, IPC capability transfer, or range split) wakes the caller with the synthetic
-/// `IPC_REPLY_TRANSFER_FAILED` label and returns the error to the server. No
-/// GRANT right check: the server is trusted by virtue of holding RECEIVE on the
-/// endpoint. A reply to a fault-blocked caller moves no capability: its label
-/// is the disposition, and a [`syscall::FAULT_REPLY_REDIRECT`] reply's one
-/// capability names, in the server's `CSpace`, the endpoint the fault goes to
-/// next ([`stage_redirect`]).
+/// The endpoint lookup and the receive's cap-slot pre-allocation come first,
+/// and their errors reply nothing and leave the binding. Then the reply runs
+/// ([`deposit_reply`]); its errors return without receiving, and leave no
+/// binding (a claimed caller is woken with the failure sentinel). Then the
+/// receive runs, and only then is the caller woken: with [`WakeHint::Sync`]
+/// when the receive parked, since the server then blocks, and with
+/// [`WakeHint::WakerRuns`] otherwise, since the server runs on. A caller
+/// placed on the server's CPU at the server's rank or above runs before the
+/// server returns to user mode. A reply to a fault-blocked thread wakes it
+/// at once, as `SYS_IPC_REPLY` does (core/kernel/docs/syscalls.md
+/// § `SYS_IPC_REPLY_RECV`).
 ///
-/// The reply binding is claimed before anything reads the caller: the won
-/// claim is what keeps the caller's TCB live (its `wake_in_flight` pin waits
-/// for this reply's wake), so every payload, capability, or destination
-/// failure after it consumes the binding and wakes the caller with the
-/// failure sentinel. With no caller bound, the payload and capability checks
-/// still run, so their errors keep precedence over `InvalidCapability`
-/// (core/kernel/docs/syscalls.md § `SYS_IPC_REPLY`).
+/// [`WakeHint::Sync`]: crate::sched::WakeHint::Sync
+/// [`WakeHint::WakerRuns`]: crate::sched::WakeHint::WakerRuns
 #[cfg(not(test))]
-pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
+pub fn sys_ipc_reply_recv(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    let label = tf.arg(0);
+    let ep_idx = tf.arg(0);
+    let label = tf.arg(1);
+    let counts = tf.arg(2);
+    let timeout_ms = tf.arg(3);
     #[expect(
         clippy::cast_possible_truncation,
         reason = "Seraph targets 64-bit only; usize == u64 on all supported targets"
     )]
-    let data_count = (tf.arg(1) as usize).min(MSG_DATA_WORDS_MAX);
+    let data_count = (syscall::ipc_reply_recv_data_count(counts) as usize).min(MSG_DATA_WORDS_MAX);
     #[expect(
         clippy::cast_possible_truncation,
         reason = "Seraph targets 64-bit only; usize == u64 on all supported targets"
     )]
-    let cap_count = (tf.arg(2) as usize).min(MSG_CAP_SLOTS_MAX);
+    let cap_count = (syscall::ipc_reply_recv_cap_count(counts) as usize).min(MSG_CAP_SLOTS_MAX);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1320,6 +1382,167 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidCapability);
     }
+    // SAFETY: tcb validated non-null above.
+    let cspace_ptr = unsafe { (*tcb).cspace };
+    // SAFETY: cspace_ptr validated above.
+    let slot = unsafe { lookup_cap(cspace_ptr, ep_idx, EpRights::RECEIVE) }?;
+    // SAFETY: slot validated; object pointer is valid Endpoint.
+    let ep_state = unsafe {
+        let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
+        let ep_obj = obj_ptr.cast::<crate::cap::object::EndpointObject>();
+        (*ep_obj).state
+    };
+    // SAFETY: cspace_ptr is the running thread's own CSpace, live while it
+    // runs; tcb is the running thread; no lock is held.
+    unsafe { preallocate_receive(tcb, cspace_ptr) }?;
+
+    // SAFETY: tcb is the calling thread's valid TCB and tf its frame; no lock
+    // is held. An owed caller is woken below, on every path.
+    let caller = match unsafe { deposit_reply(tf, tcb, label, data_count, cap_count) }?
+    {
+        ReplyDeposit::Owed(caller) => Some(caller),
+        ReplyDeposit::Woken => None,
+    };
+
+    // Open the park episode before the recv-queue link can publish.
+    // SAFETY: tcb is the running caller, not yet claimable.
+    unsafe { crate::sched::thread::open_park_episode(tcb) };
+    // SAFETY: ep_state is the state of the Endpoint `slot` pins until the drop
+    // below; tcb is the running thread; no scheduler lock and no ep.lock held.
+    let received = unsafe { receive_on(ep_state, tcb, timeout_ms) };
+    drop(slot);
+
+    // The deferred wake. The claim pinned the caller until now, so its level
+    // is read before the wake, after which it may run and exit elsewhere.
+    let runs_first = caller.is_some_and(|caller| {
+        let hint = if matches!(received, Ok(Received::Parked))
+        {
+            crate::sched::WakeHint::Sync
+        }
+        else
+        {
+            crate::sched::WakeHint::WakerRuns
+        };
+        // SAFETY: caller is pinned by the claim; its deposit is stamped, and
+        // this is its wake. tcb is the running thread, the waker; with Sync,
+        // its park committed in this syscall and its schedule() follows in
+        // deliver_after_park.
+        unsafe { wake_replied(caller, tcb, hint) }
+    });
+
+    // SAFETY: tcb validated above; ipc_buffer is written only by this thread's
+    // own SYS_IPC_BUFFER_SET, so it cannot change during this syscall.
+    let server_buf = unsafe { (*tcb).ipc_buffer };
+    let result = match received
+    {
+        Ok(Received::Bound(bound)) =>
+        {
+            // SAFETY: as in sys_ipc_recv's immediate delivery: tcb is the
+            // running receiver, whose ipc_msg holds the bound message; no
+            // lock is held.
+            unsafe { take_bound_caps(tcb, bound.cspace) };
+            // SAFETY: tcb is the running receiver; tf is its own frame and
+            // server_buf its IPC buffer, in its own address space.
+            unsafe { deliver_received(tf, tcb, server_buf) };
+            Ok(0)
+        }
+        Ok(Received::Parked | Received::ParkRefused) =>
+        {
+            // SAFETY: tcb is the running receiver, whose receive parked it (or
+            // had its park refused) in this syscall; tf is its own frame and
+            // server_buf its IPC buffer; no lock is held.
+            return unsafe { deliver_after_park(tf, tcb, server_buf) };
+        }
+        Err(e) => Err(e),
+    };
+    if runs_first
+    {
+        // The server runs on and the caller waits on this CPU at its rank or
+        // above: yield to it, at the tail of the server's level.
+        // SAFETY: scheduler initialized; called from syscall context with no
+        // lock held.
+        unsafe { crate::sched::schedule(crate::sched::Requeue::Always) };
+    }
+    result
+}
+
+/// Wake `caller`, whose reply deposit the running server `server` has
+/// stamped, placed by `hint`. Returns whether the server must yield to it
+/// before returning to user mode: the wake is [`WakeHint::WakerRuns`], it
+/// placed the caller on this CPU, and the server does not outrank the caller
+/// (core/kernel/docs/ipc-internals.md § Reply Path). A caller above the
+/// server's rank would preempt it at that return anyway; one at the same
+/// rank would otherwise wait behind it until it blocks or its slice ends.
+///
+/// # Safety
+/// `caller` must be pinned by `server`'s won reply claim, its deposit
+/// stamped, and this its only wake; `server` the running thread. The hint's
+/// contract ([`select_target_cpu`](crate::sched::select_target_cpu)) holds.
+///
+/// [`WakeHint::WakerRuns`]: crate::sched::WakeHint::WakerRuns
+#[cfg(not(test))]
+unsafe fn wake_replied(
+    caller: *mut crate::sched::thread::ThreadControlBlock,
+    server: *mut crate::sched::thread::ThreadControlBlock,
+    hint: crate::sched::WakeHint,
+) -> bool
+{
+    // SAFETY: caller is pinned by the claim (contract); priority is read as a
+    // hint, as the placement reads it.
+    let caller_level = unsafe { (*caller).priority };
+    // SAFETY: server is the running thread (contract).
+    let server_level = unsafe { (*server).priority };
+    // SAFETY: the contract, which is select_target_cpu's.
+    let target_cpu = unsafe { crate::sched::select_target_cpu(caller, hint) };
+    // SAFETY: caller is pinned by the claim; target_cpu came from
+    // select_target_cpu.
+    unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
+    hint == crate::sched::WakeHint::WakerRuns
+        && target_cpu == crate::arch::current::cpu::current_cpu() as usize
+        && !crate::sched::run_queue::outranks(server_level, caller_level)
+}
+
+/// What [`deposit_reply`] leaves owed.
+#[cfg(not(test))]
+enum ReplyDeposit
+{
+    /// The reply is deposited in the `SYS_IPC_CALL` caller, which the won
+    /// reply claim pins, and its disposition stamped; its wake is owed.
+    Owed(*mut crate::sched::thread::ThreadControlBlock),
+    /// The reply went to a fault-blocked thread, already woken
+    /// ([`reply_to_fault`]).
+    Woken,
+}
+
+/// The reply of `SYS_IPC_REPLY` and `SYS_IPC_REPLY_RECV` as the running
+/// server `tcb`: claim the binding, stage the reply's `label`, its
+/// `data_count` data words and its `cap_count` capabilities into the
+/// claimed caller, move the capabilities, and stamp the deposit
+/// ([`sys_ipc_reply`] describes the protocol). The caller's wake is left to
+/// the syscall, which places it by what the server does next; a reply to a
+/// fault-blocked thread wakes it here.
+///
+/// # Errors
+/// `InvalidCapability` when no caller is bound, after the payload and
+/// capability checks, whose errors take precedence; and every staging,
+/// capability or destination error after the claim, which wakes the claimed
+/// caller with the `IPC_REPLY_TRANSFER_FAILED` sentinel (or a fault-blocked
+/// thread with the unhandled outcome) first, so no binding is left.
+///
+/// # Safety
+/// `tcb` must be the calling thread's valid TCB and `tf` its frame, in
+/// syscall context with no lock held. An [`ReplyDeposit::Owed`] caller must
+/// be woken with `enqueue_and_wake` before the syscall returns: its
+/// `wake_in_flight` pin holds its teardown until then.
+#[cfg(not(test))]
+unsafe fn deposit_reply(
+    tf: UserFrame,
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    label: u64,
+    data_count: usize,
+    cap_count: usize,
+) -> Result<ReplyDeposit, SyscallError>
+{
     // Claim the binding first. `endpoint_reply` CASes `reply_tcb` from the
     // bound caller to null; a canceller or a dealloc of either thread that
     // loses to it leaves the caller to this reply, and the caller's
@@ -1348,7 +1571,8 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     {
         // SAFETY: tcb is the calling thread's valid TCB; caller is the
         // fault-blocked thread whose reply claim it won; no lock is held.
-        return unsafe { reply_to_fault(tf, tcb, caller, label, data_count, cap_count) };
+        return unsafe { reply_to_fault(tf, tcb, caller, label, data_count, cap_count) }
+            .map(|_| ReplyDeposit::Woken);
     }
 
     // A SYS_IPC_CALL caller: read the reply's data words and the reply cap
@@ -1441,7 +1665,8 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Deposit complete (label and data words for the caller's return and
     // message registers or its own IPC buffer write on resume, sys_ipc_call;
-    // cap results for its cap-handle write): stamp REPLY and wake. Claim =
+    // cap results for its cap-handle write): stamp REPLY; the wake is owed
+    // to the caller of this fn. Claim =
     // the reply_tcb CAS won inside endpoint_reply, so this is the episode's
     // only depositor; the stamp's Release orders the ipc_msg writes before
     // the resume's reads.
@@ -1453,6 +1678,65 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
             crate::sched::thread::PARK_DISPOSITION_REPLY,
         );
     }
+    Ok(ReplyDeposit::Owed(caller))
+}
+
+/// `SYS_IPC_REPLY` (1): reply to a blocked caller.
+///
+/// arg0 = label, arg1 = `data_count`,
+/// arg2 = `cap_count` (0-4); the data words are read from the server's
+/// message registers MR0..MR5 when `data_count` is at most
+/// `MSG_REGS_DATA_MAX` and from its IPC buffer otherwise
+/// ([`read_data_words`]), and the `cap_count` cap handles from the
+/// server's IPC buffer at word `MSG_CAP_HANDLES_WORD`.
+///
+/// Capabilities move from the server's `CSpace` to the caller's `CSpace`
+/// all-or-nothing with the reply; a transfer refused after the caller was
+/// claimed (a reply slot stale, repeated, or pinned by an in-flight revoke,
+/// move, IPC capability transfer, or range split) wakes the caller with the synthetic
+/// `IPC_REPLY_TRANSFER_FAILED` label and returns the error to the server. No
+/// GRANT right check: the server is trusted by virtue of holding RECEIVE on the
+/// endpoint. A reply to a fault-blocked caller moves no capability: its label
+/// is the disposition, and a [`syscall::FAULT_REPLY_REDIRECT`] reply's one
+/// capability names, in the server's `CSpace`, the endpoint the fault goes to
+/// next ([`stage_redirect`]).
+///
+/// The reply binding is claimed before anything reads the caller: the won
+/// claim is what keeps the caller's TCB live (its `wake_in_flight` pin waits
+/// for this reply's wake), so every payload, capability, or destination
+/// failure after it consumes the binding and wakes the caller with the
+/// failure sentinel. With no caller bound, the payload and capability checks
+/// still run, so their errors keep precedence over `InvalidCapability`
+/// (core/kernel/docs/syscalls.md § `SYS_IPC_REPLY`).
+#[cfg(not(test))]
+pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    let label = tf.arg(0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Seraph targets 64-bit only; usize == u64 on all supported targets"
+    )]
+    let data_count = (tf.arg(1) as usize).min(MSG_DATA_WORDS_MAX);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Seraph targets 64-bit only; usize == u64 on all supported targets"
+    )]
+    let cap_count = (tf.arg(2) as usize).min(MSG_CAP_SLOTS_MAX);
+
+    // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb is the calling thread's valid TCB and tf its frame; no lock
+    // is held. An owed caller is woken below.
+    let caller = match unsafe { deposit_reply(tf, tcb, label, data_count, cap_count) }?
+    {
+        ReplyDeposit::Owed(caller) => caller,
+        ReplyDeposit::Woken => return Ok(0),
+    };
+
     // SAFETY: caller is pinned by the claim.
     debug_assert_eq!(unsafe { (*caller).magic }, crate::sched::thread::TCB_MAGIC);
     // SAFETY: caller is pinned by the claim.
@@ -1465,7 +1749,7 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-/// The fault-reply path of [`sys_ipc_reply`]: `caller` is a thread the
+/// The fault-reply path of [`deposit_reply`]: `caller` is a thread the
 /// kernel parked `BlockedOnFault` by fault redirection, not a `SYS_IPC_CALL`
 /// caller, and `server` won its reply claim.
 ///

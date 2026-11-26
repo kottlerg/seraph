@@ -745,11 +745,15 @@ pub const SYS_KERNEL_LOG_READ: u64 = 75;
 /// records, through a `KernelLog` capability carrying [`RIGHTS_KLOG_READ`].
 /// See `core/kernel/docs/syscalls.md` § `SYS_KERNEL_LOG_BIND` (76).
 pub const SYS_KERNEL_LOG_BIND: u64 = 76;
+/// IPC: reply to the pending call as `SYS_IPC_REPLY` does, then receive on an
+/// endpoint as `SYS_IPC_RECV` does, in one syscall. See
+/// `core/kernel/docs/syscalls.md` § `SYS_IPC_REPLY_RECV` (77).
+pub const SYS_IPC_REPLY_RECV: u64 = 77;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_KERNEL_LOG_BIND + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_IPC_REPLY_RECV + 1;
 
 // ── Kernel log records ──────────────────────────────────────────────────────
 
@@ -1100,6 +1104,37 @@ pub const fn ipc_call_data_count(arg2: u64) -> u64
 pub const fn ipc_call_timeout_ms(arg2: u64) -> u32
 {
     (arg2 >> IPC_CALL_TIMEOUT_SHIFT) as u32
+}
+
+/// Bit position of the reply's capability count in `SYS_IPC_REPLY_RECV`'s
+/// `arg2`: the low 32 bits carry the reply's `data_count`, the high 32 bits
+/// its `cap_count`.
+pub const IPC_REPLY_RECV_CAPS_SHIFT: u32 = 32;
+
+/// `SYS_IPC_REPLY_RECV`'s `arg2`: the reply's `data_count` in the low 32
+/// bits, its `cap_count` in the high 32. A count wider than 32 bits is cut to
+/// its low 32 bits, which the kernel then clamps to [`MSG_DATA_WORDS_MAX`] or
+/// [`MSG_CAP_SLOTS_MAX`] as it clamps any larger count.
+#[must_use]
+pub const fn ipc_reply_recv_count_arg(data_count: u64, cap_count: u64) -> u64
+{
+    (data_count & 0xFFFF_FFFF) | ((cap_count & 0xFFFF_FFFF) << IPC_REPLY_RECV_CAPS_SHIFT)
+}
+
+/// The reply's `data_count` field of a `SYS_IPC_REPLY_RECV` `arg2`
+/// ([`ipc_reply_recv_count_arg`]), before the kernel's clamp.
+#[must_use]
+pub const fn ipc_reply_recv_data_count(arg2: u64) -> u64
+{
+    arg2 & 0xFFFF_FFFF
+}
+
+/// The reply's `cap_count` field of a `SYS_IPC_REPLY_RECV` `arg2`
+/// ([`ipc_reply_recv_count_arg`]), before the kernel's clamp.
+#[must_use]
+pub const fn ipc_reply_recv_cap_count(arg2: u64) -> u64
+{
+    arg2 >> IPC_REPLY_RECV_CAPS_SHIFT
 }
 
 /// Free slots every `CSpace` keeps back from general allocations for IPC
@@ -2242,6 +2277,42 @@ mod tests
             ipc_call_timeout_ms(wide),
             9,
             "count bits never reach the timeout"
+        );
+    }
+
+    // Defects guarded: a packing that lets the capability count leak into the
+    // data count (a reply then sends a wrong word count, or moves caps it never
+    // named), one that drops bits of either count, or a capless reply whose
+    // arg2 is not its bare data count.
+    #[test]
+    fn ipc_reply_recv_count_arg_round_trips_both_counts()
+    {
+        assert_eq!(
+            ipc_reply_recv_count_arg(7, 0),
+            7,
+            "capless arg2 is the count"
+        );
+        for (data, caps) in [
+            (0, 1),
+            (64, 4),
+            (0xFFFF_FFFF, 0xFFFF_FFFF),
+            (3, 0x8000_0000),
+        ]
+        {
+            let arg = ipc_reply_recv_count_arg(data, caps);
+            assert_eq!(ipc_reply_recv_data_count(arg), data);
+            assert_eq!(ipc_reply_recv_cap_count(arg), caps);
+        }
+        let wide = ipc_reply_recv_count_arg(0x1_0000_0005, 0x2_0000_0002);
+        assert_eq!(
+            ipc_reply_recv_data_count(wide),
+            5,
+            "data count cut to 32 bits"
+        );
+        assert_eq!(
+            ipc_reply_recv_cap_count(wide),
+            2,
+            "cap count cut to 32 bits"
         );
     }
 

@@ -42,7 +42,7 @@
 //! [`init_entry_storage`]), and [`mask`] and [`unmask`] write that word with the
 //! mask bit set or clear: one select and one write each, with no read of the entry.
 //! An entry's registers are written whole, 32 bits at a time, so a change to one
-//! field writes every other field of its dword too (82093AA datasheet § 3.1), which
+//! field writes every other field of its dword too (82093AA datasheet § 3.0), which
 //! the kept word supplies; only the kernel writes them. The I/O APIC updates two
 //! fields itself, which a kept word holds as zero:
 //! - Delivery Status (bit 12) is read-only, and a write leaves it as it is (82093AA
@@ -371,8 +371,10 @@ const REDIR_LEVEL: u32 = 1 << 15;
 /// active-low line.
 const REDIR_ACTIVE_LOW: u32 = 1 << 13;
 
-/// Remote IRR bit in the low dword of a redirection entry (bit 14, read-only):
-/// set while a level-triggered delivery awaits the EOI of the entry's vector.
+/// Remote IRR bit in the low dword of a redirection entry (bit 14): set while a
+/// level-triggered delivery awaits the EOI of the entry's vector. Read-only on the
+/// 82093AA; the ICH9 lists it read/write, and there a written 0 clears it, as
+/// [`mask`] and [`unmask`] write it (module doc § Kept entries).
 const REDIR_REMOTE_IRR: u32 = 1 << 14;
 
 /// The low dword [`route`] writes first, before the entry it programs, when the

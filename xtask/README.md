@@ -424,7 +424,8 @@ from its log by patterns in the syntax of § Pattern syntax. Each run boots its 
 disk images (and of the riscv64 firmware variables), so the runs of a wave never share a writable
 drive. The options below require `--runs`; `--debug-port` requires `--parallel 1` (one host
 port), and `--debug-target` stages the GDB stub, repacking the images in the layout they have,
-before the runs copy them, and removes it after the last run.
+before the runs copy them, and removes it after the last run; it is refused for an image that
+boots ktest, which runs no svcmgr to launch the stub.
 
 | Option | Default | Description |
 |---|---|---|

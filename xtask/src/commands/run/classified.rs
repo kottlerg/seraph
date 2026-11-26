@@ -146,6 +146,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
     validate_sysroot_for_launch(ctx, args.launch.arch)?;
     let harnesses = crate::sysroot::recorded_image_harnesses(ctx)?;
     let recorded = crate::sysroot::recorded_image_ktest_selection(ctx)?;
+    check_stub_image(args.launch.debug_target.as_deref(), &harnesses)?;
     let accepted = if args.ktest_only_ok
     {
         KtestFocus::Selected
@@ -600,6 +601,20 @@ const KTEST_SELECTED_PASS: &str = r"\[ktest\] SELECTED TESTS PASSED";
 fn image_selection<'a>(harnesses: &[ImageHarness], recorded: Option<&'a str>) -> Option<&'a str>
 {
     recorded.filter(|_| harnesses.contains(&ImageHarness::Ktest))
+}
+
+/// Refuse `--debug-target` on an image that boots ktest: svcmgr launches the
+/// stub, and a ktest image runs none, while the stage's repack would pack the
+/// installed ktest, not the one the image's record names.
+fn check_stub_image(debug_target: Option<&str>, harnesses: &[ImageHarness]) -> Result<()>
+{
+    if debug_target.is_some() && harnesses.contains(&ImageHarness::Ktest)
+    {
+        bail!(
+            "--debug-target stages a stub svcmgr launches, and the image boots ktest, which runs none"
+        );
+    }
+    Ok(())
 }
 
 /// The focus of the image's ktest, refused unless it is the one the run
@@ -1930,6 +1945,19 @@ mod tests
         .unwrap_err()
         .to_string();
         assert!(several.contains("svctest, ubench"), "{several}");
+    }
+
+    // Defect caught: `--debug-target` accepted on a ktest image, whose stage
+    // repacks the installed ktest under the image record's selection.
+    #[test]
+    fn the_gdb_stub_is_refused_on_a_ktest_image()
+    {
+        let error = check_stub_image(Some("vfsd"), &[ImageHarness::Ktest])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ktest"), "{error}");
+        check_stub_image(Some("vfsd"), &[ImageHarness::Svctest]).unwrap();
+        check_stub_image(None, &[ImageHarness::Ktest]).unwrap();
     }
 
     // Defect caught: a plain `--runs` accepting an image of a focused ktest,

@@ -240,9 +240,9 @@ pub fn forget_image_harnesses(sysroot: &Path) -> Result<()>
 /// Record `harnesses` as those the image a pack has just written boots, one
 /// name a line, none for an image that boots no harness. The ktest line
 /// carries, after a space, the selection of the installed ktest
-/// ([`recorded_ktest_selection`]) when a focused build made it: the pack has
-/// just signed that ktest into the image, so the record names what the image
-/// runs whatever ktest a later build installs.
+/// ([`recorded_ktest_selection`]), or [`FULL_KTEST`] for one that runs every
+/// test: the pack has just signed that ktest into the image, so the record
+/// names what the image runs whatever ktest a later build installs.
 ///
 /// # Errors
 ///
@@ -256,10 +256,13 @@ pub fn record_image_harnesses(sysroot: &Path, harnesses: &[ImageHarness]) -> Res
     {
         text.push_str(harness.name());
         if *harness == ImageHarness::Ktest
-            && let Some(selection) = recorded_ktest_selection(sysroot)?
         {
             text.push(' ');
-            text.push_str(&selection);
+            text.push_str(
+                recorded_ktest_selection(sysroot)?
+                    .as_deref()
+                    .unwrap_or(FULL_KTEST),
+            );
         }
         text.push('\n');
     }
@@ -292,6 +295,10 @@ pub fn recorded_image_ktest_selection(ctx: &BuildContext) -> Result<Option<Strin
     Ok(recorded_image(ctx)?.1)
 }
 
+/// The word an image record's ktest line carries for a ktest that runs every
+/// test; no selection holds `*` ([`check_ktest_selection`]).
+const FULL_KTEST: &str = "*";
+
 /// The image record [`record_image_harnesses`] wrote: its harnesses, and the
 /// selection its ktest line carries.
 fn recorded_image(ctx: &BuildContext) -> Result<(Vec<ImageHarness>, Option<String>)>
@@ -322,18 +329,25 @@ fn recorded_image(ctx: &BuildContext) -> Result<(Vec<ImageHarness>, Option<Strin
         };
         let harness = ImageHarness::parse(name)
             .ok_or_else(|| crate::error::err!("{}: {line:?} names no harness", path.display()))?;
-        if let Some(focus) = focus
+        match (harness, focus)
         {
-            if harness != ImageHarness::Ktest
+            (ImageHarness::Ktest, None) => bail!(
+                "{}: its ktest line names no selection, so a pack from before the record carried \
+                 one wrote it; repack the image (`cargo xtask mkdisk`)",
+                path.display()
+            ),
+            (ImageHarness::Ktest, Some(FULL_KTEST)) | (_, None) =>
+            {}
+            (ImageHarness::Ktest, Some(focus)) =>
             {
-                bail!(
-                    "{}: {line:?}: only ktest carries a selection",
-                    path.display()
-                );
+                check_ktest_selection(focus)
+                    .map_err(|e| crate::error::err!("{}: {e}", path.display()))?;
+                selection = Some(focus.to_string());
             }
-            check_ktest_selection(focus)
-                .map_err(|e| crate::error::err!("{}: {e}", path.display()))?;
-            selection = Some(focus.to_string());
+            (_, Some(_)) => bail!(
+                "{}: {line:?}: only ktest carries a selection",
+                path.display()
+            ),
         }
         harnesses.push(harness);
     }
@@ -1050,6 +1064,26 @@ mod tests
         fs::remove_dir_all(&base).unwrap();
     }
 
+    // Defect caught: a record from before the ktest line carried its
+    // selection, which a focused image's pack wrote as a bare `ktest` too,
+    // read as an image of the full ktest rather than refused for a repack.
+    #[test]
+    fn a_ktest_line_without_a_selection_is_refused_for_a_repack()
+    {
+        let base = scratch("image-bare-ktest");
+        let ctx = BuildContext {
+            root: base.clone(),
+            sysroot: base.join("sysroot"),
+            target_dir: base.join("target"),
+        };
+        fs::create_dir_all(&ctx.sysroot).unwrap();
+        fs::write(ctx.sysroot.join(IMAGE_HARNESS_FILE), "ktest\n").unwrap();
+        let error = recorded_image_harnesses(&ctx).unwrap_err().to_string();
+        assert!(error.contains("repack"), "{error}");
+        recorded_image_ktest_selection(&ctx).unwrap_err();
+        fs::remove_dir_all(&base).unwrap();
+    }
+
     // Defect caught: a selection recorded on a harness other than ktest, or
     // an invalid one, read as the image's focus.
     #[test]
@@ -1067,7 +1101,12 @@ mod tests
         record_ktest_selection(&ctx.sysroot, Some("cap::")).unwrap();
         record_image_harnesses(&ctx.sysroot, &[ImageHarness::Svctest]).unwrap();
         assert_eq!(recorded_image_ktest_selection(&ctx).unwrap(), None);
-        for bad in ["svctest cap::\n", "ktest cap::,\n", "ktest cap:: x\n"]
+        for bad in [
+            "svctest cap::\n",
+            "ktest cap::,\n",
+            "ktest cap:: x\n",
+            "ktest *x\n",
+        ]
         {
             fs::write(ctx.sysroot.join(IMAGE_HARNESS_FILE), bad).unwrap();
             recorded_image_harnesses(&ctx).unwrap_err();

@@ -548,12 +548,13 @@ derivation it revokes when it withdraws the driver (devmgr's
   ([services/drivers/docs/driver-model.md](../services/drivers/docs/driver-model.md)
   rule 5) and also reads its device's interrupt status on a bounded timeout, which recovers an
   edge-triggered line's lost edge (below). A driver that does not acknowledge promptly needs its
-  line kept exclusive: the serial driver acknowledges only when its client reads
+  line kept exclusive; devmgr keeps the line of every record but a PCI function's exclusive
+  ([driver-binding.md](driver-binding.md) § Declaration Bounds), the UART's among them, whose
+  serial driver acknowledges after each pass over the UART
   ([services/drivers/serial/README.md](../services/drivers/serial/README.md#interrupts)
-  § Interrupts), so devmgr keeps the UART line exclusive and shares no other device onto it. The
-  UART line is never a PCI `INTx` line on either machine (x86-64 COM1 is ISA IRQ 4; the riscv64
-  `virt` NS16550 is APLIC source 10, against `INTx` sources 32 to 35), so the exclusivity costs no
-  device a cap in practice.
+  § Interrupts). The UART line is never a PCI `INTx` line on either machine (x86-64 COM1 is ISA
+  IRQ 4; the riscv64 `virt` NS16550 is APLIC source 10, against `INTx` sources 32 to 35), so the
+  exclusivity costs no device a cap in practice.
 - **Acknowledge.** `SYS_IRQ_ACK` clears its own binding's debt and unmasks the line only when no
   binding owes one; a repeated acknowledgement changes nothing.
 - **Unbind.** A binding goes when its Interrupt object is freed (its capability deleted, revoked,

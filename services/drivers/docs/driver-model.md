@@ -46,10 +46,11 @@ when it exits on its own.
    an x86-64 line programmed edge-triggered is still seen (`virtio_core::isr::serve_interrupts`,
    at most `ISR_POLL_MS` late). Every driver on a line passes `SYS_IRQ_REGISTER` the line's mode
    devmgr delivers with the IRQ (docs/device-management.md § Interrupt Delivery). A
-   driver that does not acknowledge promptly needs its line kept exclusive: the serial driver
-   acknowledges only when its client reads
-   ([services/drivers/serial/README.md](../serial/README.md#interrupts) § Interrupts), so devmgr
-   keeps the UART line exclusive. The UART line is never a PCI `INTx` line on either machine
+   driver that does not acknowledge promptly needs its line kept exclusive; devmgr keeps the line
+   of every record but a PCI function's exclusive (docs/driver-binding.md § Declaration Bounds),
+   the UART's among them, whose serial driver acknowledges after each pass over the UART
+   ([services/drivers/serial/README.md](../serial/README.md#interrupts) § Interrupts). The UART
+   line is never a PCI `INTx` line on either machine
    (x86-64 COM1 is ISA IRQ 4, the riscv64 `virt` NS16550 is APLIC source 10 against `INTx` sources
    32 to 35), so the exclusivity costs no device a cap in practice. A message-signaled vector
    (MSI or MSI-X) is its device's alone: the kernel never masks it, so it owes no

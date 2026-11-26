@@ -1825,7 +1825,7 @@ enum Wrote
     /// The driver did not take every byte: a chunk's call failed or was not
     /// answered within its bound, or the driver answered it with anything but
     /// success; or the barrier's call failed, so the driver is gone with the
-    /// bytes it took. The line is not written whole.
+    /// bytes it took ([`Answer::Failed`]). The line is not written whole.
     Lost,
 }
 
@@ -1854,16 +1854,23 @@ fn write_line(cap: u64, op: u64, sent: u64, bytes: &[u8], ipc_buf: *mut u64, bou
     {
         return Wrote::All;
     }
-    let Some(ms) = bound.next_ms()
-    else
+    loop
     {
-        return Wrote::Held;
-    };
-    match call_chunk(cap, op | sent, &[], ipc_buf, ms)
-    {
-        Answer::Taken => Wrote::All,
-        Answer::Refused | Answer::Unanswered => Wrote::Held,
-        Answer::Failed => Wrote::Lost,
+        let Some(ms) = bound.next_ms()
+        else
+        {
+            return Wrote::Held;
+        };
+        match call_chunk(cap, op | sent, &[], ipc_buf, ms)
+        {
+            Answer::Taken => return Wrote::All,
+            Answer::Refused | Answer::Unanswered => return Wrote::Held,
+            // The barrier only waits, so it is asked again: a live driver
+            // answers it, and a dead one's endpoint fails it.
+            Answer::Interrupted =>
+            {}
+            Answer::Failed => return Wrote::Lost,
+        }
     }
 }
 
@@ -1879,8 +1886,14 @@ enum Answer
     /// No answer within the call's bound (`WouldBlock`): the driver may
     /// still be serving the call.
     Unanswered,
-    /// The call failed: the driver's endpoint is gone, which for a resolved
-    /// driver means devmgr withdrew it, or the driver dropped the call.
+    /// The call was cancelled before its answer (`Interrupted`): the calling
+    /// thread was stopped or took an upcall, or the driver's serving thread
+    /// was freed. The driver may have taken the call's bytes, so a chunk
+    /// interrupted is not written again, and its line is counted rather than
+    /// repeated.
+    Interrupted,
+    /// The call failed otherwise: the driver's endpoint is gone, which for a
+    /// resolved driver means devmgr withdrew it.
     Failed,
 }
 
@@ -1900,6 +1913,7 @@ fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u3
         Ok(reply) if reply.label == WRITE_SUCCESS => Answer::Taken,
         Ok(_) => Answer::Refused,
         Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => Answer::Unanswered,
+        Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => Answer::Interrupted,
         Err(_) => Answer::Failed,
     }
 }

@@ -627,7 +627,7 @@ Usage: xtask kani [OPTIONS]
 
 Options:
       --component <CRATE>     Verify the harnesses of this crate only, by its package name (one that holds a harness)
-      --since <COMMIT>        Verify only the crates the change from COMMIT to the working tree can affect: each crate whose package, a package in its dependency closure, or a file one of them reads, the change touches; every crate when it touches an input of every build
+      --since <COMMIT>        Verify only the crates the change from the merge base of COMMIT and HEAD to the working tree can affect: each crate whose package, a package in its dependency closure, or a file one of them reads, the change touches; every crate when it touches an input of every build; and, when it selects no crate otherwise but touches `.github/workflows/kani.yml` or `build-test.yml`, the crate with the fewest harnesses
       --list                  Print the package of each crate the run would verify and exit, verifying nothing
       --harness <NAME>        Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it
       --shard <K/N>           Verify the K-th of N parts of the crate's harnesses: of Kani's list of them, sorted by path, every N-th from the K-th, so the N parts take each harness once
@@ -644,7 +644,7 @@ Usage: xtask kani [OPTIONS]
 
 Options:
       --component <CRATE>     Verify the harnesses of this crate only, by its package name (one that holds a harness)
-      --since <COMMIT>        Verify only the crates the change from COMMIT to the working tree can affect: each crate whose package, a package in its dependency closure, or a file one of them reads, the change touches; every crate when it touches an input of every build
+      --since <COMMIT>        Verify only the crates the change from the merge base of COMMIT and HEAD to the working tree can affect: each crate whose package, a package in its dependency closure, or a file one of them reads, the change touches; every crate when it touches an input of every build; and, when it selects no crate otherwise but touches `.github/workflows/kani.yml` or `build-test.yml`, the crate with the fewest harnesses
       --list                  Print the package of each crate the run would verify and exit, verifying nothing
       --harness <NAME>        Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it
       --shard <K/N>           Verify the K-th of N parts of the crate's harnesses: of Kani's list of them, sorted by path, every N-th from the K-th, so the N parts take each harness once

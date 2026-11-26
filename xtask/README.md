@@ -1627,7 +1627,7 @@ cargo xtask kani --pin
 |---|---|---|
 | `--component <CRATE>` | every crate that holds a harness | Verify the harnesses of this crate only, by its package name |
 | `--harness <NAME>` | every harness | Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`); needs `--component` |
-| `--since <COMMIT>` | every crate that holds a harness | Verify the crates the change from this commit to the working tree can affect (below); takes no `--component` |
+| `--since <COMMIT>` | every crate that holds a harness | Verify the crates the change from the merge base of this commit and `HEAD` to the working tree can affect (below); takes no `--component` |
 | `--shard <K/N>` | every harness | Verify the K-th of N parts of the crate's harnesses (below); needs `--component`, takes no `--harness` |
 | `--list` | `false` | Print the package of each crate the run would verify, one a line, and exit, verifying nothing; needs no Kani |
 | `--plan` | `false` | Print the jobs CI's matrix runs for the crates the run would verify (below), one `<package> <K/N>` a line, and exit, verifying nothing; needs no Kani; takes `--since` only |
@@ -1696,7 +1696,8 @@ on with the next harness; the command fails such a harness as over budget, namin
 ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification). Every
 selected crate runs, and the command then prints a table of every harness, by package and path,
 with its verdict and verification time, then the same table of the ten slowest, slowest first, then
-each crate's harness count and the sum of its harnesses' verification times, which size `SHARDS`,
+each crate's harness count and the sum of its harnesses' verification times, which size `SHARDS`
+(a `--shard` run labels the crate with its shard, `<package> K/N`, the sum being that shard's),
 and fails naming each crate that failed.
 
 CI's `kani` jobs (`.github/workflows/kani.yml`) run the command. Their `plan` job runs `--plan`

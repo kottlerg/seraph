@@ -1103,10 +1103,13 @@ args! {
         #[arg(long, value_name = "CRATE")]
         pub component: Option<String>,
 
-        /// Verify only the crates the change from COMMIT to the working tree
-        /// can affect: each crate whose package, a package in its dependency
-        /// closure, or a file one of them reads, the change touches; every
-        /// crate when it touches an input of every build.
+        /// Verify only the crates the change from the merge base of COMMIT and
+        /// HEAD to the working tree can affect: each crate whose package, a
+        /// package in its dependency closure, or a file one of them reads, the
+        /// change touches; every crate when it touches an input of every
+        /// build; and, when it selects no crate otherwise but touches
+        /// `.github/workflows/kani.yml` or `build-test.yml`, the crate with the
+        /// fewest harnesses.
         #[arg(long, value_name = "COMMIT", conflicts_with_all = ["component", "harness"])]
         pub since: Option<String>,
 

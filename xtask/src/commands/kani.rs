@@ -83,11 +83,12 @@ const SLOWEST: usize = 10;
 
 /// The crates CI verifies in more than one job, each with its number of
 /// shards; every other crate is one job. A crate whose harnesses' times sum
-/// to more than about 10 minutes on CI's runner is split into that sum over
-/// 600 s, rounded up, so that no job's proofs take much longer than the rest
-/// of a run (docs/testing.md § Bounded verification); the closing report's
-/// time per crate gives the sums. `--plan` fails on an entry that names no
-/// crate holding a harness.
+/// to more than about 10 minutes on CI's runner is split into the fewest
+/// shards that keep each shard's sum under about 600 s, so that no job's
+/// proofs take much longer than the rest of a run (docs/testing.md § Bounded
+/// verification); the closing report's time per crate gives the sums, a
+/// shard run's labelled with its shard. `--plan` fails on an entry that
+/// names no crate holding a harness.
 const SHARDS: &[(&str, usize)] = &[("boot-firmware", 3), ("devmgr-firmware", 4), ("elf", 2)];
 
 /// A crate whose proof harnesses the command runs.
@@ -153,7 +154,7 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
     step(&format!("Kani: the {SLOWEST} slowest harnesses"));
     print!("{}", outcome_table(&slowest(&outcomes)));
     step("Kani: time per crate");
-    print!("{}", crate_times(&outcomes));
+    print!("{}", crate_times(&outcomes, shard));
     if !failed.is_empty()
     {
         bail!("{}", failed.join("\n"));
@@ -928,9 +929,12 @@ fn outcome_table(outcomes: &[(String, Outcome)]) -> String
 }
 
 /// Each crate's harnesses and the sum of their verification times, in the
-/// order the crates ran: the sums that size [`SHARDS`].
-fn crate_times(outcomes: &[(String, Outcome)]) -> String
+/// order the crates ran: the sums that size [`SHARDS`]. A run of one shard
+/// labels its crate with the shard (`<package> K/N`), since the sum is that
+/// shard's alone; a split crate's sum is the total over its shards' runs.
+fn crate_times(outcomes: &[(String, Outcome)], shard: Option<Shard>) -> String
 {
+    let label = shard.map_or_else(String::new, |shard| format!(" {shard}"));
     let mut crates: Vec<(&str, usize, f64)> = Vec::new();
     for (package, outcome) in outcomes
     {
@@ -948,7 +952,7 @@ fn crate_times(outcomes: &[(String, Outcome)]) -> String
     let mut table = String::new();
     for (package, count, sum) in crates
     {
-        let _ = writeln!(table, "{sum:>9.1}s  {package}: {count} harness(es)");
+        let _ = writeln!(table, "{sum:>9.1}s  {package}{label}: {count} harness(es)");
     }
     table
 }
@@ -1934,7 +1938,8 @@ CBMC timed out. You may want to rerun your proof with a larger timeout or       
     }
 
     // Defect caught: the per-crate sums that size the shards counting a
-    // crate twice, mixing crates, or dropping a harness without a time.
+    // crate twice, mixing crates, or dropping a harness without a time; or a
+    // shard run's sum reported as its whole crate's.
     #[test]
     fn the_time_per_crate_sums_each_crates_harnesses()
     {
@@ -1951,8 +1956,13 @@ CBMC timed out. You may want to rerun your proof with a larger timeout or       
             ("a".to_owned(), outcome(Some(3.0))),
         ];
         assert_eq!(
-            crate_times(&outcomes),
+            crate_times(&outcomes, None),
             "      4.5s  a: 3 harness(es)\n      2.0s  b: 1 harness(es)\n"
+        );
+        let shard = Some(Shard { index: 2, count: 3 });
+        assert_eq!(
+            crate_times(&outcomes[..1], shard),
+            "      1.5s  a 2/3: 1 harness(es)\n"
         );
     }
 }

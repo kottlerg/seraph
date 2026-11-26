@@ -116,9 +116,10 @@ svcmgr/
   `SEND|GRANT` on memmgr's endpoint, one
   `(name, thread_cap, observer)` round per substrate service init bootstrapped before svcmgr
   existed (the observer is a Control-only address-space cap or a process handle), and a terminal
-  `LOGD_SOURCES` round carrying the two log-sink source caps svcmgr holds
-  for the system's lifetime (the master-log source and a badge-0
-  `SEND|GRANT` death-auth source on procmgr's service endpoint). Recipes
+  `LOGD_SOURCES` round carrying the log-sink source caps svcmgr holds
+  for the system's lifetime (the master-log source, a badge-0
+  `SEND|GRANT` death-auth source on procmgr's service endpoint, and an optional `KernelLog`
+  source carrying `Read`). Recipes
   (binary, argv, env, restart policy, criticality, namespace shape, seed
   names) live on disk, not on the wire — see
   [docs/service-definitions.md](docs/service-definitions.md). The round

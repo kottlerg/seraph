@@ -383,7 +383,8 @@ impl<const W: usize> core::fmt::Write for LineWriter<'_, W>
 }
 
 /// The reader's side of the log: whether a reader is attached, what it has
-/// acknowledged, and when it last read. Changed under the ring's lock.
+/// acknowledged and read, and when its stall bound started. Changed under the
+/// ring's lock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor
 {
@@ -393,12 +394,24 @@ pub struct Cursor
     pub committed: u64,
     /// The highest sequence number a read has returned.
     pub last_read_seq: u64,
-    /// The kernel's time of the last read, in microseconds.
-    pub last_read_us: u64,
+    /// The kernel's time the stall bound runs from, in microseconds: the
+    /// later of the last read that attached the reader or returned a record
+    /// past `last_read_seq`, and the append of the oldest unread record
+    /// ([`Self::seen`]).
+    pub since_us: u64,
 }
 
 impl Cursor
 {
+    /// The highest sequence number no longer unread: the later of the last
+    /// record a read returned and the committed mark, which a flush raises
+    /// past records it printed that no read returned. The records past it are
+    /// the unread ones the stall bound is about.
+    pub fn seen(&self) -> u64
+    {
+        self.last_read_seq.max(self.committed)
+    }
+
     /// The sequence number a read with `from_seq` starts at: the record after
     /// the committed one for 0, else `from_seq`.
     pub fn start_seq(&self, from_seq: u64) -> u64
@@ -423,22 +436,37 @@ impl Cursor
     /// Record a read that completed at `now_us`, which acknowledged `ack_seq`
     /// and returned records up to `returned_last` (0 for none), with `newest`
     /// the ring's newest sequence number. Attaches the reader; the committed
-    /// mark only grows, and never past `newest`.
+    /// mark only grows, and never past `newest`. The stall bound starts again
+    /// only when the read attached the reader or returned a record it had not
+    /// read: a read that returns nothing new leaves it running.
     pub fn on_read(&mut self, ack_seq: u64, returned_last: u64, newest: u64, now_us: u64)
     {
+        if !self.attached || returned_last > self.last_read_seq
+        {
+            self.since_us = now_us;
+        }
         self.attached = true;
         self.acknowledge(ack_seq, newest);
         self.last_read_seq = self.last_read_seq.max(returned_last);
-        self.last_read_us = now_us;
     }
 
-    /// Whether the attached reader has stalled at `now_us`: records it has not
-    /// read exist, and it has not read for more than `stall_us`.
+    /// Record the append of record `seq` at `us`: when no record was unread
+    /// before it, the stall bound starts at its append.
+    pub fn on_append(&mut self, seq: u64, us: u64)
+    {
+        if seq == self.seen().saturating_add(1)
+        {
+            self.since_us = self.since_us.max(us);
+        }
+    }
+
+    /// Whether the attached reader has stalled at `now_us`: unread records
+    /// exist ([`Self::seen`]), and more than `stall_us` has passed since the
+    /// oldest of them was appended and since the reader last attached or read
+    /// a new record.
     pub fn stalled(&self, newest: u64, now_us: u64, stall_us: u64) -> bool
     {
-        self.attached
-            && newest > self.last_read_seq
-            && now_us.saturating_sub(self.last_read_us) > stall_us
+        self.attached && newest > self.seen() && now_us.saturating_sub(self.since_us) > stall_us
     }
 }
 
@@ -716,7 +744,88 @@ mod tests
         assert!(!c.stalled(5, 10_000_000, 1_000_000), "not attached");
         c.on_read(0, 5, 5, 1_000_000);
         assert!(!c.stalled(5, 9_000_000, 1_000_000), "nothing unread");
-        assert!(!c.stalled(6, 2_000_000, 1_000_000), "within the bound");
-        assert!(c.stalled(6, 2_000_001, 1_000_000));
+        c.on_append(6, 1_500_000);
+        assert!(!c.stalled(6, 2_500_000, 1_000_000), "within the bound");
+        assert!(c.stalled(6, 2_500_001, 1_000_000));
+    }
+
+    // Defect guarded: the bound measured from the reader's last read, so the
+    // first record after a quiet period longer than the bound is taken as a
+    // stall on the tick that signals the reader, before it could read.
+    #[test]
+    fn the_first_record_after_a_quiet_period_is_not_a_stall()
+    {
+        let mut c = Cursor::default();
+        c.on_read(0, 5, 5, 1_000_000);
+        c.on_append(6, 11_000_000);
+        c.on_append(7, 11_200_000);
+        assert!(!c.stalled(7, 11_010_000, 1_000_000), "the next tick");
+        assert!(!c.stalled(7, 12_000_000, 1_000_000), "at the bound");
+        assert!(
+            c.stalled(7, 12_000_001, 1_000_000),
+            "the oldest unread is past it"
+        );
+    }
+
+    // Defect guarded: a read that returns nothing new (an acknowledgement
+    // alone, or a read that starts past the unread records) taken as progress,
+    // so a reader that never reads its records again is never detached.
+    #[test]
+    fn a_read_that_returns_nothing_new_leaves_the_bound_running()
+    {
+        let mut c = Cursor::default();
+        c.on_read(0, 5, 5, 1_000_000);
+        c.on_append(6, 2_000_000);
+        c.on_read(5, 0, 6, 2_800_000);
+        c.on_read(5, 5, 6, 2_900_000);
+        assert!(c.stalled(6, 3_000_001, 1_000_000));
+        // A read that returns a new record starts the bound again, though
+        // records stay unread after it.
+        c.on_append(7, 3_100_000);
+        c.on_read(5, 6, 7, 3_200_000);
+        assert!(!c.stalled(7, 4_200_000, 1_000_000), "a new record read");
+        assert!(c.stalled(7, 4_200_001, 1_000_000));
+    }
+
+    // Defect guarded: a reader that attaches again after a stall, with the
+    // records of the gap still unread, detached again on the next tick.
+    #[test]
+    fn an_attach_starts_the_bound_again()
+    {
+        let mut c = Cursor::default();
+        c.on_read(0, 5, 5, 1_000_000);
+        c.on_append(6, 2_000_000);
+        assert!(c.stalled(6, 3_000_001, 1_000_000));
+        c.attached = false;
+        c.on_read(5, 0, 6, 9_000_000);
+        assert!(c.attached);
+        assert!(
+            !c.stalled(6, 10_000_000, 1_000_000),
+            "within the bound of the attach"
+        );
+        assert!(c.stalled(6, 10_000_001, 1_000_000));
+    }
+
+    // Defect guarded: records a flush printed (a non-fatal watchdog dump)
+    // counted as unread, so a reader whose read after the flush returns
+    // nothing is detached a bound later and, its lines going direct, never
+    // signalled again.
+    #[test]
+    fn records_a_flush_printed_are_not_unread()
+    {
+        let mut c = Cursor::default();
+        c.on_read(0, 5, 5, 1_000_000);
+        c.on_append(6, 2_000_000);
+        c.on_append(7, 2_100_000);
+        // The flush raises the committed mark past them; the reader's read
+        // from 0 then starts after it and returns nothing.
+        c.acknowledge(7, 7);
+        c.on_read(0, 0, 7, 2_200_000);
+        assert!(!c.stalled(7, 9_000_000, 1_000_000), "nothing unread");
+        // The next record starts the bound at its append, as after a quiet
+        // period.
+        c.on_append(8, 20_000_000);
+        assert!(!c.stalled(8, 21_000_000, 1_000_000), "at the bound");
+        assert!(c.stalled(8, 21_000_001, 1_000_000));
     }
 }

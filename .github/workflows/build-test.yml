@@ -592,6 +592,10 @@ jobs:
             svctest)  crash_reports="--crash-reports reports" ;;
             usertest) crash_reports="--crash-reports none" ;;
           esac
+          # The svctest boot also checks that its console stayed whole while
+          # its senders, crashd and the kernel wrote at once: svctest's
+          # `console_whole_lines` phase brackets its lines with
+          # `whole-lines begin` and `whole-lines end` (`--whole-lines`).
           # The usertest boot also checks the log-level configuration its
           # staging packed: a debug line of vfsd and of the fatfs vfsd spawns,
           # and none of devmgr or procmgr. The ktest boot also checks the
@@ -600,6 +604,8 @@ jobs:
           # test's skip condition holds (docs/testing.md § Gating).
           checks=()
           case "${{ matrix.tester }}" in
+            svctest)
+              checks=(--whole-lines whole-lines) ;;
             usertest)
               checks=(--require '\[vfsd\] DEBUG ' --require '\[fatfs\] DEBUG '
                       --fail-also '\[(devmgr|procmgr)\] DEBUG ') ;;

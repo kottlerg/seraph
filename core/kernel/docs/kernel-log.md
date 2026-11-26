@@ -99,11 +99,18 @@ keeps one reader cursor, not one per capability: whoever reads is the reader.
   before it chooses where the read starts, so a read with `from_seq` 0 returns the records after
   the mark. A reader acknowledges what it has written on its next read; an empty buffer only
   acknowledges.
-- **Stall.** On each timer tick the bootstrap CPU checks whether records exist past the last one
-  a read returned and no read came for more than `KLOG_STALL_MS` (1000 ms). If so, the reader
-  is detached and the kernel writes its lines directly again, after one R line naming the record
-  the reader stalled at. The records already in the ring stay there: the next read attaches the
-  reader again and returns them.
+- **Stall.** On each timer tick the bootstrap CPU checks whether unread records exist and the bound
+  of `KLOG_STALL_MS` (1000 ms) has passed (`ring::Cursor::stalled`). A record is unread when it
+  is past both the last one a read returned and the committed mark: a flush raises the mark past
+  the records it prints, which no read then waits on (`ring::Cursor::seen`). The bound is
+  measured from the append of the oldest unread record, or from the reader's last read that
+  attached it or returned a record it had not read, whichever came later: a read that returns no
+  new record, an acknowledgement alone among them, does not restart it, and a quiet period with
+  nothing unread does not count against the next record. The check is a few loads, and takes the
+  lock only when they find a stall. A stalled reader is detached and the kernel
+  writes its lines directly again, after one R line naming the record the reader stalled at. The
+  records already in the ring stay there: the next read attaches the reader again and returns
+  them.
 - **ktest.** ktest, loaded as init, holds the root capability and is a reader: it attaches at its
   start and drains the log before each line it writes and in its waits
   ([core/ktest/README.md](../../ktest/README.md)).

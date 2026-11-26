@@ -61,6 +61,10 @@ services/svctest/
         ├── logd_sinks.rs      # logd's sinks: serial and framebuffer drivers attachable; lines
         │                      #   answered with either stopped, and with the framebuffer killed
         │                      #   and restarted
+        ├── console_whole_lines.rs # Four threads log numbered lines for up to 3 s between
+        │                      #   `whole-lines begin` and `whole-lines end senders=4 lines=N` while
+        │                      #   `relrofault` faults in a loop and `capexhaust` wedges its CSpace;
+        │                      #   `run --whole-lines` checks the log
         ├── thread_exits.rs    # Another process ended through an attach from a worker thread,
         │                      #   then its main thread, each by an exit syscall it is pointed at
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
@@ -650,7 +654,8 @@ spawning phases: whatever its arguments it prints `spawn-target ran` and exits 0
 ([services/fixtures/program-modes/README.md](../fixtures/program-modes/README.md)), one image run
 in a mode per phase: `narrow` (procmgr: it tries to start `/tests/fixtures/service-modes` and
 exits 0 only when refused `PermissionDenied`), `pipefault` (pipes), `stackoverflow` and
-`relrofault` (process faults), `capexhaust` (recv guard), `demandpaged` (pager), `threadchurn`,
+`relrofault` (process faults and console whole lines), `capexhaust` (recv guard and console whole
+lines), `demandpaged` (pager), `threadchurn`,
 `threadstack`, `deadline` and `pipestress` (their own phases), `fsbench` (FS IPC), and `crashme`
 (`oom-hold <pages>`, run by its path through a session's leader by the `sessiond_operator` and
 `oom_policy` phases: it touches that many heap pages, prints `holding <pages>` and waits to be

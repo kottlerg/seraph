@@ -486,6 +486,9 @@ pub struct RestartCtx
     /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it, and a
     /// `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND|GRANT` cap.
     pub procmgr_death_auth_source: u64,
+    /// `KernelLog` source carrying `Read`. svcmgr derives real-logd's copy
+    /// from it on every (re)launch. `0` when init endowed none.
+    pub kernel_log_source: u64,
     /// `EntropyControl` source carrying `Contribute`, from which svcmgr
     /// derives the `entropy_authority = yes` service's copy on every launch
     /// ([`mint_entropy_authority`]). `0` when init endowed none.

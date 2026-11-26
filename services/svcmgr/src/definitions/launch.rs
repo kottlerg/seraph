@@ -152,7 +152,7 @@ pub(crate) enum LaunchKind
     Restart,
 }
 
-/// Mint the five bootstrap caps real-logd expects, from the reserved
+/// Mint the six bootstrap caps real-logd expects, from the reserved
 /// log-sink sources svcmgr holds for the system's life and from the
 /// `devmgr.class.*` publications ([`crate::classes`]):
 ///   * `[0]` master-log endpoint RECV (svcmgr's source stays valid, so a
@@ -167,7 +167,9 @@ pub(crate) enum LaunchKind
 ///   * `[3]` the `serial` class SEND (`devmgr.class.serial`), through which
 ///     logd resolves the serial driver with `QUERY_DEVICE`;
 ///   * `[4]` the `framebuffer` class SEND (`devmgr.class.framebuffer`), the
-///     same for the framebuffer driver.
+///     same for the framebuffer driver;
+///   * `[5]` a `KernelLog` cap carrying `Read`, through which logd reads the
+///     kernel's console lines (`services/logd/README.md` § Bootstrap caps).
 ///
 /// A publication is named by its class file's stem, not by the class the
 /// file configures; these two carry the `serial` and `framebuffer` classes
@@ -223,7 +225,22 @@ pub(crate) fn mint_logd_boot_caps(
     };
     let serial = class_send(b"serial");
     let framebuffer = class_send(b"framebuffer");
-    std::vec![recv, handover_send, death_auth, serial, framebuffer]
+    let kernel_log = if ctx.kernel_log_source != 0
+    {
+        syscall::cap_derive(ctx.kernel_log_source, syscall::RIGHTS_KLOG_READ).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    std::vec![
+        recv,
+        handover_send,
+        death_auth,
+        serial,
+        framebuffer,
+        kernel_log
+    ]
 }
 
 /// Publish each name in a provider's `provides` list under the discovery

@@ -776,10 +776,12 @@ fn run(info_ptr: u64) -> !
     // death-EQ on both init threads and reclaims the init-logd TCB once init
     // is threadless (init-logd outlives main until real-logd's handover).
     let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPort).unwrap_or(0);
+    let kernel_log_cap = find_cap_by_type(info, init_protocol::CapType::KernelLog).unwrap_or(0);
     // SAFETY: `run` executes once, on init's main thread, and this is its only
     // `spawn_log_thread` call.
-    let init_logd_thread_cap =
-        unsafe { logging::spawn_log_thread(info, &mut init_arena, log_ep, ioport_cap) };
+    let init_logd_thread_cap = unsafe {
+        logging::spawn_log_thread(info, &mut init_arena, log_ep, ioport_cap, kernel_log_cap)
+    };
 
     // Badged SEND on the log endpoint for init's own `log()` lines so
     // they appear under `[init]`. `LOG_BADGE_INIT` (= 1) is reserved

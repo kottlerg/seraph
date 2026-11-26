@@ -101,8 +101,9 @@ pub struct SinkQueue<const N: usize>
     queued: u64,
     /// Lines the writer has taken ([`Self::pop`]).
     taken: u64,
-    /// Lines the writer has written: every line taken before its last
-    /// completed write ([`Self::written`]).
+    /// Lines the writer is done with: every line taken before its last
+    /// completed write ([`Self::written`]) or its last write it gave up
+    /// ([`Self::not_written`]).
     done: u64,
 }
 
@@ -252,7 +253,20 @@ impl<const N: usize> SinkQueue<N>
         self.stalled = false;
     }
 
-    /// Whether line number `line` ([`Offer::Queued`]) is written.
+    /// The writer gave up a write: the driver answered it with anything but
+    /// success, or the call failed. No producer waits any longer for a line
+    /// the writer has taken, and `lost` lines, those of the write that were
+    /// not written, are counted as dropped, for the writer to report as it
+    /// reports any. The sink's stall stays as it is: only a completed write
+    /// ([`Self::written`]) shows that the driver takes lines again.
+    pub fn not_written(&mut self, lost: u32)
+    {
+        self.done = self.taken;
+        self.dropped = self.dropped.saturating_add(lost);
+    }
+
+    /// Whether line number `line` ([`Offer::Queued`]) is written, or given
+    /// up ([`Self::not_written`]).
     #[must_use]
     pub const fn is_written(&self, line: u64) -> bool
     {
@@ -345,6 +359,40 @@ mod tests
         }
         assert!(q.is_empty());
         assert_eq!(q.pop(&mut buf), None);
+    }
+
+    // Defect caught: a write the driver refused (the serial driver's
+    // `STALLED` on a wedged UART) taken as written, which loses the line
+    // uncounted and ends the stall, so every later line holds its producer
+    // for the bound again.
+    #[test]
+    fn a_write_given_up_counts_its_line_and_leaves_the_stall()
+    {
+        let mut q: SinkQueue<64> = SinkQueue::new();
+        let Offer::Queued(first) = q.offer(b"line", false)
+        else
+        {
+            panic!("an empty queue takes a line");
+        };
+        let mut buf = [0u8; 8];
+        q.pop(&mut buf).unwrap();
+        // The producer waited out the bound while the driver held the write.
+        q.stall();
+        q.not_written(1);
+        assert!(q.is_written(first), "no producer waits on a write given up");
+        assert!(q.is_stalled());
+        assert_eq!(q.take_tail_drops(), 1);
+        // A line queued after a write given up carries its count instead.
+        q.not_written(1);
+        assert!(matches!(q.offer(b"next", false), Offer::Queued(_)));
+        assert_eq!(drain(&mut q), [(b"next".to_vec(), 1)]);
+        // A write given up with nothing of its own lost counts nothing.
+        q.not_written(0);
+        assert_eq!(q.take_tail_drops(), 0);
+        assert!(q.is_stalled());
+        // The next completed write ends the stall.
+        q.written();
+        assert!(!q.is_stalled());
     }
 
     // Defect caught: a full queue that drops a line while the writer still

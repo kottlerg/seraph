@@ -535,8 +535,10 @@ logd's waits on it for longer than `SINK_STALL_MS` (1000 ms,
   never has a driver, and drops its lines uncounted.
 - **Writer.** The writer takes the lines in order and writes each with `SERIAL_CHUNK`-byte calls
   that have no bound, so a line queued for a stopped driver is written once, when the driver
-  answers again. A call that fails ends the line, and the next line goes to the driver resolved
-  then, or to the next one resolved while none is. A call to a dead driver fails
+  answers again. A call that fails, or that the driver answers with anything but success, ends
+  the line: the line is counted as dropped, a stall stays in place (only a completed write ends
+  it), and the next line goes to the driver resolved then, or to the next one resolved while none
+  is. A drop line the driver does not take is not counted again. A call to a dead driver fails
   only once devmgr withdraws the driver and revokes its endpoint
   ([devmgr responsibilities](../../devmgr/docs/responsibilities.md)); until then the writer waits
   in it and the sink stalls as for a stopped driver. The writers are spawned beside the receive
@@ -546,7 +548,8 @@ logd's waits on it for longer than `SINK_STALL_MS` (1000 ms,
   line counts as written when it is on the wire
   ([serial driver](../../drivers/serial/README.md#label-1-serial_write_bytes)
   § Label 1). The driver answers a call that waited on a transmitter making no progress for its
-  `TX_STALL_MS` (1000 ms) with `STALLED`, which the writer takes as it takes any answer.
+  `TX_STALL_MS` (1000 ms) with `STALLED`, which ends the line as any refused write does
+  (§ Writer above).
 - **Inline.** Until a sink's writer runs, or when it cannot be spawned, a line's producer writes
   the line itself, one producer at a time so a line stays whole. Its wait for its turn and its
   calls end `SINK_STALL_MS` after it took the line, so no producer waits on the sink for longer;

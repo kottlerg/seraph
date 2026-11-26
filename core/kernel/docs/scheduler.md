@@ -527,8 +527,9 @@ runs on, on another CPU than the server's (below), so an RT server serving unpin
 that way runs on each caller's CPU that queues nothing else. A caller that cannot leave its CPU is
 never made to share it with a receiver that outranks it: one pinned there by hard affinity, which
 its reply wake must return to that CPU whatever the server does, and a thread in a fault delivery,
-whose resume reply wakes it before the handler's receive. Their receivers go by the other rules, so
-such a pair stays apart, each call and each reply waking another CPU. At the call the kernel
+whose resume reply wakes it before the handler's receive. Their receivers go by the other rules with
+that CPU left out, even when it is the receiver's preferred CPU, so such a pair stays apart, each
+call and each reply waking another CPU. At the call the kernel
 cannot tell how the receiver will reply; it takes the syscall of the receiver's latest receive as
 the prediction. A
 server that received through `SYS_IPC_REPLY_RECV` and answers the call with a `SYS_IPC_REPLY` after

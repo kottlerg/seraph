@@ -27,8 +27,8 @@
 //! Needs 3 CPUs and the `SchedControl` cap (skips otherwise). The harness
 //! pins itself to CPU 0. For each [`Case`], a caller is pinned to K (CPU 2),
 //! with a fair spinner pinned beside it when the case asks, and an unpinned
-//! server runs on P (CPU 1), clears its affinity there, and parks in its
-//! receive. The caller waits for the park, lets the server's switch-out
+//! server runs on its home CPU, P (CPU 1) or, in one case, K, clears its
+//! affinity there, and parks in its receive. The caller waits for the park, lets the server's switch-out
 //! finish, and calls; in a case whose caller is unpinned, it clears its
 //! affinity on K right before the call and pins itself to K again before the
 //! next round's wait. Around each receive the server reads its own placement
@@ -37,7 +37,7 @@
 //! records them with the CPU the receive returned on. [`ROUNDS`] rounds per
 //! case. A server that replies with `SYS_IPC_REPLY_RECV` takes its first call
 //! with a plain receive (no reply is owed yet), and holds each later reply
-//! while it returns to P, then replies and parks in one
+//! while it returns to its home CPU, then replies and parks in one
 //! `SYS_IPC_REPLY_RECV`; its first round is judged as a plain receive's.
 //!
 //! ## Pass criterion
@@ -101,7 +101,9 @@ const SETTLE_MS: u64 = 2;
 /// One case: the levels of the server and the caller, whether a fair spinner
 /// is queued on K, whether the server replies with `SYS_IPC_REPLY_RECV`,
 /// whether the caller stays pinned to K for its call (or clears its affinity
-/// once on K), and whether the rule runs the server on K (in a
+/// once on K), the CPU the server parks on each round (P, or K, where a
+/// server that served an unpinned caller last ran), and whether the rule
+/// runs the server on K (in a
 /// `SYS_IPC_REPLY_RECV` case, from its second round, the first receive being
 /// a plain one).
 #[derive(Clone, Copy)]
@@ -117,10 +119,11 @@ struct Case
     spinner: bool,
     reply_recv: bool,
     caller_pinned: bool,
+    server_home: u32,
     on_k: bool,
 }
 
-const CASES: [Case; 7] = [
+const CASES: [Case; 8] = [
     Case {
         name: "fair",
         server: FAIR,
@@ -128,6 +131,7 @@ const CASES: [Case; 7] = [
         spinner: false,
         reply_recv: false,
         caller_pinned: true,
+        server_home: P,
         on_k: true,
     },
     Case {
@@ -137,6 +141,7 @@ const CASES: [Case; 7] = [
         spinner: true,
         reply_recv: false,
         caller_pinned: true,
+        server_home: P,
         on_k: false,
     },
     Case {
@@ -146,6 +151,7 @@ const CASES: [Case; 7] = [
         spinner: false,
         reply_recv: false,
         caller_pinned: true,
+        server_home: P,
         on_k: true,
     },
     Case {
@@ -155,6 +161,7 @@ const CASES: [Case; 7] = [
         spinner: true,
         reply_recv: false,
         caller_pinned: true,
+        server_home: P,
         on_k: false,
     },
     Case {
@@ -164,6 +171,7 @@ const CASES: [Case; 7] = [
         spinner: false,
         reply_recv: false,
         caller_pinned: true,
+        server_home: P,
         on_k: false,
     },
     Case {
@@ -173,6 +181,7 @@ const CASES: [Case; 7] = [
         spinner: false,
         reply_recv: true,
         caller_pinned: false,
+        server_home: P,
         on_k: true,
     },
     Case {
@@ -182,12 +191,26 @@ const CASES: [Case; 7] = [
         spinner: false,
         reply_recv: true,
         caller_pinned: true,
+        server_home: P,
+        on_k: false,
+    },
+    Case {
+        name: "RT server last run on K replying with reply_recv, pinned fair caller",
+        server: RT,
+        caller: FAIR,
+        spinner: false,
+        reply_recv: true,
+        caller_pinned: true,
+        server_home: K,
         on_k: false,
     },
 ];
 
 /// Whether the current case's server replies with `SYS_IPC_REPLY_RECV`.
 static REPLY_RECV: AtomicBool = AtomicBool::new(false);
+
+/// The CPU the current case's server returns to before each receive.
+static SERVER_HOME: AtomicU32 = AtomicU32::new(P);
 
 /// The round the server is about to park for (1-based; 0 before the first).
 static PARKING: AtomicU32 = AtomicU32::new(0);
@@ -350,6 +373,7 @@ fn rounds(
 {
     PARKING.store(0, Ordering::Release);
     REPLY_RECV.store(case.reply_recv, Ordering::Release);
+    SERVER_HOME.store(case.server_home, Ordering::Release);
     CHILD_ERRORS.store(0, Ordering::Release);
     for ran_on in &RAN_ON
     {
@@ -538,8 +562,8 @@ fn ipc_buffer(slot: usize) -> Option<*mut u64>
     Some(addr as *mut u64)
 }
 
-/// Each round: pin to P and run there, clear the affinity (the server stays on
-/// P until it parks), read its placement counts, publish the round, receive,
+/// Each round: pin to its home CPU ([`SERVER_HOME`]) and run there, clear the
+/// affinity (the server stays there until it parks), read its placement counts, publish the round, receive,
 /// record the counts' differences across the receive, and reply with the CPU
 /// the receive returned on: at once with `SYS_IPC_REPLY`, or, in a
 /// `SYS_IPC_REPLY_RECV` case, in the next round's receive. Runs until a
@@ -560,13 +584,14 @@ extern "C" fn server_entry(arg: u64) -> !
         thread_exit()
     };
     let reply_recv = REPLY_RECV.load(Ordering::Acquire);
+    let home = SERVER_HOME.load(Ordering::Acquire);
     // The label of the reply the next receive owes, in a SYS_IPC_REPLY_RECV case.
     let mut owed: Option<u64> = None;
     let mut round = 0u32;
     loop
     {
         round = round.saturating_add(1);
-        if thread_set_affinity(me, P).is_err() || !reach(P)
+        if thread_set_affinity(me, home).is_err() || !reach(home)
         {
             fail();
         }

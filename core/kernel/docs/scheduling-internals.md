@@ -1341,11 +1341,14 @@ placed on the waker's CPU k when k is eligible and the guard holds:
   `SYS_IPC_REPLY_RECV` wakes its caller after its receive, with `Sync` when the receive parks, onto
   k with the server gone, and with `WakerRuns` when it runs on, which `wake_replied` places with k
   excluded when the server outranks the caller (below), so an unpinned caller goes to another CPU.
-  A waker that cannot leave k is not admitted, and its recipient goes by the other rules: one with
-  hard affinity, which rule 1 returns to k ahead of any exclusion, so that it would wait behind a
-  recipient serving a backlog there, and a thread in a fault delivery, whose resume reply wakes it
-  at once (`reply_to_fault`, `WakeHint::None`), before the handler's receive, and so by rule 4
-  to k behind the handler. The waker's two fields are read without a lock: `in_fault_delivery` is
+  A waker that cannot leave k is not admitted: one with hard affinity, which rule 1 returns to k
+  ahead of any exclusion, so that it would wait behind a recipient serving a backlog there, and a
+  thread in a fault delivery, whose resume reply wakes it at once (`reply_to_fault`,
+  `WakeHint::None`), before the handler's receive, and so by rule 4 to k behind the handler. When
+  the recipient outranks such a waker, the other rules place it with k excluded, as
+  `select_target_cpu_excluding` excludes a CPU, the RT rule's preferred pick included, so the
+  recipient's preferred CPU being k (where it last ran beside an unpinned caller) does not return it
+  there. The waker's two fields are read without a lock: `in_fault_delivery` is
   its own, written by the waker before its delivery and read on its own CPU in the syscall that
   wakes the recipient, and `cpu_affinity` is a placement hint, as the woken thread's is; an
   affinity change racing the call misjudges one placement, which the pull bounds. The bit is the
@@ -1425,8 +1428,9 @@ waker, whose park has committed, so the rule ranks k by its queued threads alone
 thread, or the thread's latest receive was a plain one), the lowest-rank scan leaves k out, so the
 rule does not place on k a thread the guard kept off it; the first branch still returns k when it is
 the thread's preferred CPU and the thread runs there at once, as rule 4 returns it within the
-threshold. On a `WakerRuns` wake the server runs on, so k ranks by the server's recorded level, and
-a caller the scan places on k still has `wake_replied`'s yield (above).
+threshold, except for a waker that cannot leave k, for which every rule leaves k out (above). On a
+`WakerRuns` wake the server runs on, so k ranks by the server's recorded level, and a caller the
+scan places on k still has `wake_replied`'s yield (above).
 
 The rule reads every eligible CPU's `current_level` and `non_empty` Relaxed, holding no lock
 (§ Lock-free readers of a CPU's run queues). The sample is a hint that no locked step re-reads: a

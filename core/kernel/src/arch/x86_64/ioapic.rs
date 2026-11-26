@@ -26,14 +26,39 @@
 //!
 //! # Locking
 //! Every register access is an `IOREGSEL` store followed by an `IOWIN` access,
-//! and [`mask`] and [`unmask`] read-modify-write an entry. [`route`], [`mask`]
-//! and [`unmask`] run on any CPU (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`, the
+//! and [`route`] keeps the low dword it programs, which [`mask`] and [`unmask`]
+//! write (§ Kept entries). [`route`], [`mask`] and [`unmask`] run on any CPU (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`, the
 //! device-IRQ dispatch in interrupt context, and the Interrupt dealloc path, which
 //! masks a line), so each holds `IOAPIC_LOCK`, a
 //! leaf lock taken with interrupts disabled, across its whole access sequence;
 //! otherwise another CPU's select could land between a select and its window
-//! access and redirect the value to another entry. [`init`] runs single-threaded
-//! before any IRQ is routed and takes no lock.
+//! access and redirect the value to another entry, and so that the entry and its kept
+//! low dword change together. [`init`] runs single-threaded before any IRQ is routed
+//! and takes no lock.
+//!
+//! # Kept entries
+//! [`route`] keeps the low dword it programs for each GSI, masked ([`ENTRY_LOWS`],
+//! one word per GSI below [`gsi_limit`], allocated at Phase 5 by
+//! [`init_entry_storage`]), and [`mask`] and [`unmask`] write that word with the
+//! mask bit set or clear: one select and one write each, with no read of the entry.
+//! An entry's registers are written whole, 32 bits at a time, so a change to one
+//! field writes every other field of its dword too (82093AA datasheet § 3.1), which
+//! the kept word supplies; only the kernel writes them. The I/O APIC updates two
+//! fields itself, which a kept word holds as zero:
+//! - Delivery Status (bit 12) is read-only, and a write leaves it as it is (82093AA
+//!   § 3.2.4; ICH9 datasheet § 13.5.7).
+//! - Remote IRR (bit 14) is set when a CPU accepts a level-triggered delivery and
+//!   cleared by an EOI of the entry's vector; the 82093AA makes it read-only. The
+//!   ICH9 lists it read/write, and there a kept word's zero clears it: at a
+//!   delivery's mask, which precedes that delivery's EOI, the same write masks the
+//!   line, so the line ends as the EOI would leave it; at an unmask on one CPU while
+//!   another has accepted a level delivery its line still asserts, the line is
+//!   delivered once more, as an interrupt forwarded before a delivery's own mask is
+//!   (`irq` module doc § Thread safety).
+//!
+//! The mask's write is not read back to make sure it has reached the I/O APIC: a
+//! delivery the I/O APIC sends before the write lands is one its line forwarded
+//! before the mask.
 //!
 //! # Vector assignment
 //! Each CPU has its own device vectors, `DEVICE_VECTOR_BASE..=DEVICE_VECTOR_LAST` (33-249,
@@ -68,8 +93,10 @@
 //! level-triggered entry's Remote IRR, set at delivery, is cleared by the local APIC's EOI,
 //! which the local APIC broadcasts to the I/O APICs (the kernel clears the SVR's EOI-broadcast
 //! suppression bit on every CPU, `interrupts::init` and `init_ap`). A device IRQ masks its entry
-//! before that EOI (`irq::dispatch_device_irq`), so an assertion still held at the unmask is
-//! delivered again. A delivery a CPU accepted while its line was being released leaves Remote
+//! before that EOI (`irq::dispatch_device_irq`). A masked entry ignores its line, a level
+//! entry's asserts and negates and an edge entry's edges alike, holding none pending (82093AA
+//! § 3.2.4), so an assertion still held at the unmask is delivered then, and an edge that
+//! arrived while the entry was masked is lost. A delivery a CPU accepted while its line was being released leaves Remote
 //! IRR set, which stays set when the line is routed again, on another vector, before that
 //! delivery's EOI; [`route`] clears it before it programs the entry again
 //! ([`remote_irr_clear`]).
@@ -79,6 +106,9 @@
 //!   `irq::route`), released by `interrupts::unroute_device_irq` once neither a route
 //!   holder nor a binding remains, and unmasked by `interrupts::unmask` (from
 //!   `SYS_IRQ_ACK`).
+//! - After [`init`], an entry's low dword is written only by [`route`], which keeps
+//!   it, and by [`mask`] and [`unmask`], which write the kept word: a new writer of
+//!   the low dword keeps the word in step under `IOAPIC_LOCK` (§ Kept entries).
 
 #![expect(
     clippy::cast_possible_truncation,
@@ -414,9 +444,96 @@ static mut IOAPICS: [IoApicState; MAX_IOAPICS] = [EMPTY_STATE; MAX_IOAPICS];
 static mut IOAPIC_COUNT: usize = 0;
 
 /// Serialises the `IOREGSEL`/`IOWIN` access sequences of [`route`], [`mask`]
-/// and [`unmask`] across CPUs (module doc § Locking). A leaf lock: nothing is
-/// acquired while it is held.
+/// and [`unmask`] across CPUs, and their accesses to the kept low dwords
+/// (module doc § Locking). A leaf lock: nothing is acquired while it is held.
 static IOAPIC_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
+
+// ── Kept entries ──────────────────────────────────────────────────────────────
+
+/// Base of the kept low dwords (module doc § Kept entries), one `AtomicU32` per
+/// GSI below [`ENTRY_LOW_COUNT`]; null before [`init_entry_storage`]. A word is
+/// written by [`route`] and read by [`mask`] and [`unmask`], each under
+/// `IOAPIC_LOCK`, which orders them; zero (the allocation's fill) is the word of a
+/// GSI never routed.
+#[cfg(not(test))]
+static ENTRY_LOWS: core::sync::atomic::AtomicPtr<AtomicU32> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Number of words at [`ENTRY_LOWS`], stored before its base is published.
+#[cfg(not(test))]
+static ENTRY_LOW_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate the kept low dwords for the GSIs the discovered I/O APICs cover
+/// ([`gsi_limit`]), zero-filled, from the boot allocator: a table sized by the
+/// discovered hardware, so no ceiling is paid for in BSS. Halts the boot when no
+/// run of pages is long enough (`sched::alloc_zeroed_slab`). Called once on the BSP
+/// at Phase 5, right after [`init`] and before any GSI is routed; the table lives
+/// for the kernel's lifetime.
+#[cfg(not(test))]
+pub fn init_entry_storage(allocator: &mut crate::mm::BuddyAllocator)
+{
+    let count = gsi_limit();
+    // At most ROOT_IRQ_COUNT (32768) words, so the byte count does not saturate; a
+    // table of no GSIs still takes one word, which no GSI reaches.
+    let bytes = (count as usize)
+        .max(1)
+        .saturating_mul(core::mem::size_of::<AtomicU32>());
+    let base = crate::sched::alloc_zeroed_slab::<AtomicU32>(bytes, allocator, "IOAPIC_ENTRY_LOWS");
+    ENTRY_LOW_COUNT.store(count, Ordering::Relaxed);
+    ENTRY_LOWS.store(base, Ordering::Release);
+}
+
+/// The kept low dwords, empty before [`init_entry_storage`].
+#[cfg(not(test))]
+fn entry_lows() -> &'static [AtomicU32]
+{
+    let base = ENTRY_LOWS.load(Ordering::Acquire);
+    if base.is_null()
+    {
+        return &[];
+    }
+    let count = ENTRY_LOW_COUNT.load(Ordering::Relaxed) as usize;
+    // SAFETY: init_entry_storage allocated at least `count` zero-filled words at
+    // `base` and stored `count` before publishing `base` (Release, paired with the
+    // Acquire above); zero is a valid AtomicU32, and the table is never freed.
+    unsafe { core::slice::from_raw_parts(base, count) }
+}
+
+/// GSI `gsi`'s kept low dword in `table`, or `None` for a GSI past it.
+fn kept_low(table: &[AtomicU32], gsi: u32) -> Option<&AtomicU32>
+{
+    table.get(usize::try_from(gsi).ok()?)
+}
+
+/// Whether [`kept_write`] writes an entry masked or unmasked.
+#[derive(Clone, Copy)]
+enum Masking
+{
+    Masked,
+    Unmasked,
+}
+
+/// The low dword written for an entry whose kept low dword is `kept`: the kept
+/// word with the mask bit set or clear, every other field as [`route`] programmed
+/// it.
+const fn kept_write(kept: u32, masking: Masking) -> u32
+{
+    match masking
+    {
+        Masking::Masked => kept | REDIR_MASK,
+        Masking::Unmasked => kept & !REDIR_MASK,
+    }
+}
+
+/// The I/O APIC base, the pin and the kept low dword of `gsi`, or `None` for a GSI
+/// no discovered I/O APIC owns or one past the kept table (above the Interrupt id
+/// space, which no route reaches).
+#[cfg(not(test))]
+fn entry_of(gsi: u32) -> Option<(u64, u32, &'static AtomicU32)>
+{
+    let (base, pin) = lookup_ioapic_for_gsi(gsi)?;
+    Some((base, pin, kept_low(entry_lows(), gsi)?))
+}
 
 /// One past the highest GSI the I/O APICs in `states` cover, capped at `ceiling`: the
 /// routing table's line count.
@@ -636,19 +753,20 @@ const fn redirection_entry(vector: u8, mode: u32, destination: Destination) -> (
 
 /// Program a redirection entry for `gsi` to deliver `vector` to `destination`.
 ///
-/// The entry is programmed masked; call [`unmask`] when ready to receive.
+/// The entry is programmed masked, and its low dword kept for [`mask`] and
+/// [`unmask`] (module doc § Kept entries); call [`unmask`] when ready to receive.
 /// Uses fixed delivery, with the trigger mode and polarity `mode` names
 /// ([`redirection_entry`]). An entry whose Remote IRR a stale level delivery
 /// left set is first rewritten masked and edge-triggered, which clears it
-/// ([`remote_irr_clear`]). A GSI no discovered I/O APIC owns is left alone
-/// (`interrupts::route_device_irq` checks [`owns`] first).
+/// ([`remote_irr_clear`]). A GSI no discovered I/O APIC owns, or one past the kept
+/// table, is left alone (`interrupts::route_device_irq` checks [`owns`] first).
 ///
 /// # Safety
 /// Must only be called after [`init`].
 #[cfg(not(test))]
 pub unsafe fn route(gsi: u32, vector: u8, destination: Destination, mode: u32)
 {
-    let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
+    let Some((base, pin, kept)) = entry_of(gsi)
     else
     {
         return;
@@ -673,57 +791,58 @@ pub unsafe fn route(gsi: u32, vector: u8, destination: Destination, mode: u32)
         ioapic_write(base, low_reg, low);
         ioapic_write(base, high_reg, high);
     }
+    kept.store(low, Ordering::Relaxed);
     // SAFETY: paired with the lock_raw above.
     unsafe { IOAPIC_LOCK.unlock_raw(saved) };
 }
 
-/// Mask (suppress delivery of) the redirection entry for `gsi`.
+/// Write `gsi`'s redirection entry from its kept low dword, masked or unmasked
+/// ([`kept_write`]); a GSI with no kept word ([`entry_of`]) is left alone.
+///
+/// # Safety
+/// Must only be called after [`init`].
+#[cfg(not(test))]
+unsafe fn write_kept(gsi: u32, masking: Masking)
+{
+    let Some((base, pin, kept)) = entry_of(gsi)
+    else
+    {
+        return;
+    };
+    let (reg, _) = redirection_regs(pin);
+    // SAFETY: the flags go to the unlock_raw below.
+    let saved = unsafe { IOAPIC_LOCK.lock_raw() };
+    let low = kept_write(kept.load(Ordering::Relaxed), masking);
+    // SAFETY: caller ensures init() has completed; IOAPIC_LOCK, held, covers the
+    // select/window pair and keeps `low` the word route last kept.
+    unsafe { ioapic_write(base, reg, low) };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { IOAPIC_LOCK.unlock_raw(saved) };
+}
+
+/// Mask (suppress delivery of) the redirection entry for `gsi`: write its kept low
+/// dword with the mask bit set (module doc § Kept entries). A GSI never routed is
+/// written masked as [`init`] left it.
 ///
 /// # Safety
 /// Must only be called after [`init`].
 #[cfg(not(test))]
 pub unsafe fn mask(gsi: u32)
 {
-    let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
-    else
-    {
-        return;
-    };
-    let (reg, _) = redirection_regs(pin);
-    // SAFETY: the flags go to the unlock_raw below.
-    let saved = unsafe { IOAPIC_LOCK.lock_raw() };
-    // SAFETY: caller ensures init() has completed; IOAPIC_LOCK, held, covers
-    // the whole read-modify-write.
-    let current = unsafe { ioapic_read(base, reg) };
-    // SAFETY: as for the read; setting the mask bit is architecture-defined.
-    unsafe { ioapic_write(base, reg, current | REDIR_MASK) };
-    // SAFETY: paired with the lock_raw above.
-    unsafe { IOAPIC_LOCK.unlock_raw(saved) };
+    // SAFETY: the caller's contract is write_kept's.
+    unsafe { write_kept(gsi, Masking::Masked) };
 }
 
-/// Unmask (enable delivery of) the redirection entry for `gsi`.
+/// Unmask (enable delivery of) the redirection entry for `gsi`: write its kept low
+/// dword with the mask bit clear (module doc § Kept entries).
 ///
 /// # Safety
 /// Must only be called after [`init`] and after [`route`] has programmed the entry.
 #[cfg(not(test))]
 pub unsafe fn unmask(gsi: u32)
 {
-    let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
-    else
-    {
-        return;
-    };
-    let (reg, _) = redirection_regs(pin);
-    // SAFETY: the flags go to the unlock_raw below.
-    let saved = unsafe { IOAPIC_LOCK.lock_raw() };
-    // SAFETY: caller ensures init() and route() have completed; IOAPIC_LOCK,
-    // held, covers the whole read-modify-write.
-    let current = unsafe { ioapic_read(base, reg) };
-    // SAFETY: as for the read; clearing the mask bit enables IRQ delivery for a
-    // registered handler.
-    unsafe { ioapic_write(base, reg, current & !REDIR_MASK) };
-    // SAFETY: paired with the lock_raw above.
-    unsafe { IOAPIC_LOCK.unlock_raw(saved) };
+    // SAFETY: the caller's contract covers write_kept's.
+    unsafe { write_kept(gsi, Masking::Unmasked) };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -903,6 +1022,68 @@ mod tests
     {
         assert_eq!(remote_irr_clear(REDIR_LEVEL | REDIR_MASK | 0x45), None);
         assert_eq!(remote_irr_clear(REDIR_MASK), None);
+    }
+
+    /// The kept low dword `route` keeps for an entry delivering `vector` in `mode`
+    /// to `destination`.
+    fn routed_low(vector: u8, mode: u32, destination: Destination) -> u32
+    {
+        redirection_entry(vector, mode, destination).0
+    }
+
+    #[test]
+    fn an_edge_entry_is_masked_and_unmasked_with_only_its_mask_bit_changed()
+    {
+        // Defect caught: a mask or unmask that drops the vector or sets the trigger
+        // bit, which would deliver on another vector or as a level line.
+        let kept = routed_low(0x30, 0, Destination::Physical(1));
+        assert_eq!(kept_write(kept, Masking::Unmasked), 0x30);
+        assert_eq!(kept_write(kept, Masking::Masked), REDIR_MASK | 0x30);
+    }
+
+    #[test]
+    fn a_level_entry_keeps_its_trigger_and_polarity_through_mask_and_unmask()
+    {
+        // Defect caught: an unmask that writes a level line back edge-triggered or
+        // active-high, which would lose its held assertion or invert it.
+        let mode = (syscall::IRQ_MODE_LEVEL | syscall::IRQ_MODE_ACTIVE_LOW) as u32;
+        let kept = routed_low(0x31, mode, Destination::Physical(2));
+        let unmasked = REDIR_LEVEL | REDIR_ACTIVE_LOW | 0x31;
+        assert_eq!(kept_write(kept, Masking::Unmasked), unmasked);
+        assert_eq!(kept_write(kept, Masking::Masked), unmasked | REDIR_MASK);
+    }
+
+    #[test]
+    fn a_remapped_entry_keeps_its_handle_bit_through_mask_and_unmask()
+    {
+        // Defect caught: an unmask that clears bit 11, which in the remappable
+        // format names another interrupt remapping entry.
+        let mode = syscall::IRQ_MODE_LEVEL as u32;
+        let kept = routed_low(0x32, mode, Destination::Remapped(0x8001));
+        let unmasked = REDIR_LEVEL | (1 << 11) | 0x32;
+        assert_eq!(kept_write(kept, Masking::Unmasked), unmasked);
+        assert_eq!(kept_write(kept, Masking::Masked), unmasked | REDIR_MASK);
+    }
+
+    #[test]
+    fn a_gsi_never_routed_is_masked_as_init_left_it()
+    {
+        let table = [const { AtomicU32::new(0) }; 4];
+        let kept = kept_low(&table, 3)
+            .expect("kept word")
+            .load(Ordering::Relaxed);
+        assert_eq!(kept_write(kept, Masking::Masked), REDIR_MASK);
+    }
+
+    #[test]
+    fn a_gsi_past_the_kept_table_has_no_kept_word()
+    {
+        // Defect caught: a GSI past the table indexing out of bounds, which halts
+        // the kernel, instead of leaving the entry alone.
+        let table = [const { AtomicU32::new(0) }; 24];
+        assert!(kept_low(&table, 23).is_some());
+        assert!(kept_low(&table, 24).is_none());
+        assert!(kept_low(&[], 0).is_none());
     }
 
     #[test]

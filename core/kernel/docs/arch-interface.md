@@ -587,7 +587,10 @@ pub fn are_enabled() -> bool;
 
 /// Initialise interrupt-controller hardware and register exception handlers
 /// (IDT on x86-64; `stvec` on RISC-V). `init_ap` does the per-AP equivalent.
-pub unsafe fn init();
+/// `allocator` is the boot allocator: x86-64 allocates from it the kept low dword
+/// of each discovered GSI's I/O APIC redirection entry, which its `mask` and
+/// `unmask` write; RISC-V allocates nothing.
+pub unsafe fn init(allocator: &mut mm::BuddyAllocator);
 pub unsafe fn init_ap();
 /// Initialise the BSP's own interrupt-controller state that needs its per-CPU
 /// pointer, once, after `init` and `percpu::init_bsp`: RISC-V's BSP IMSIC file,
@@ -613,7 +616,8 @@ pub unsafe fn init_bsp_local();
 /// the exit of its delivery gate), so an unmask that follows them cannot reach
 /// the controller first. On RISC-V every APLIC write is preceded by `fence w,o`,
 /// `mask` ends with `fence o,w`, and `unmask` ends with `fence o,r`. On x86-64,
-/// `mask` and `unmask` both hold `IOAPIC_LOCK`.
+/// `mask` and `unmask` both hold `IOAPIC_LOCK`, and each writes the line's kept
+/// low dword with no read of the entry.
 pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);

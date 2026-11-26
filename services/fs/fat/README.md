@@ -13,7 +13,7 @@ fat/
 ├── fat-parse/                  # `fatfs-parse`: BPB/dir decoders, slot scans, cluster bounds,
 │                               #   FAT entries, file positions, name encoding, LFN slots
 │                               #   and tails, node slab, cache bounds and victim pick,
-│                               #   session pool (records in client-paid pages),
+│                               #   page index, session pool (records in client-paid pages),
 │                               #   session sweep schedule, a file write's sector runs
 ├── docs/
 │   ├── crash-safety.md         # Per-op write ordering and post-crash visible states

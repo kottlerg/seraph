@@ -34,6 +34,7 @@ mod restore;
 mod snapshot;
 mod trust_store;
 
+use ipc::serve::Reply;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 // Brings `configure_pipe` / `configure_namespace` into method-call scope; their
 // pipe/namespace logic moved onto an extension trait when `ProcessTable` was
@@ -184,8 +185,8 @@ fn main() -> !
         syscall::thread_exit();
     }
 
-    let pool = recv_pool::RecvPool::new(boot.service_ep, recv_diag, move |req, buf| {
-        dispatch_ipc(req, buf.as_ptr(), ctx);
+    let pool = recv_pool::RecvPool::new(boot.service_ep, recv_diag, move |req, buf, reply| {
+        dispatch_ipc(req, buf.as_ptr(), ctx, reply);
     });
     // The main thread is the last worker, so a failed spawn leaves at least
     // one serving.
@@ -662,7 +663,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     reason = "one match arm per procmgr label, each a few lines that hand the request to its \
               handler; splitting the match would scatter the dispatch table"
 )]
-fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
+fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, reply: &mut Reply)
 {
     let headroom = hold_cspace_headroom(ctx.self_cspace);
     // A crash service or a debugger watch that is a thread other than its
@@ -681,14 +682,14 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     if let Some(code) = process_table::sender_refusal(label & 0xFFFF, req.badge)
     {
         release_caps(req.caps());
-        reply_empty(ipc_buf, code);
+        reply.set_status(code);
         return;
     }
     if headroom == process_table::Headroom::Short
         && let Some(code) = process_table::headroom_refusal(label & 0xFFFF)
     {
         release_caps(req.caps());
-        reply_empty(ipc_buf, code);
+        reply.set_status(code);
         return;
     }
     let (badge, _) = process_table::request_badge(req.badge);
@@ -703,7 +704,7 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     {
         procmgr_labels::CREATE_PROCESS =>
         {
-            handle_create(&req, ipc_buf, ctx, ObjectSource::Module);
+            handle_create(&req, ipc_buf, ctx, ObjectSource::Module, reply);
         }
 
         procmgr_labels::START_PROCESS =>
@@ -718,7 +719,7 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
                 Ok(()) => procmgr_errors::SUCCESS,
                 Err(code) => code,
             };
-            reply_empty(ipc_buf, code);
+            reply.set_status(code);
         }
 
         procmgr_labels::DESTROY_PROCESS =>
@@ -756,14 +757,13 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         procmgr_labels::LIST_CHILDREN =>
         {
             release_caps(req.caps());
-            handle_list_children(&req, ipc_buf, ctx);
+            handle_list_children(&req, ipc_buf, ctx, reply);
         }
 
         procmgr_labels::REGISTER_END_QUEUE =>
         {
-            // A registration makes no syscall but the reply, under the table
-            // lock.
-            handle_register_end_queue(&req, ipc_buf, &mut ctx.tables.lock().table);
+            // A registration makes no syscall; it runs under the table lock.
+            handle_register_end_queue(&req, &mut ctx.tables.lock().table, reply);
         }
 
         procmgr_labels::RELEASE_HOLD =>
@@ -777,7 +777,7 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
                 Err(process_table::ReleaseRefusal::Unauthorized) => procmgr_errors::UNAUTHORIZED,
                 Err(process_table::ReleaseRefusal::NotHeld) => procmgr_errors::INVALID_BADGE,
             };
-            reply_empty(ipc_buf, code);
+            reply.set_status(code);
         }
 
         procmgr_labels::QUERY_PROCESS =>
@@ -787,28 +787,27 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
             //   word 0 = state code (see `procmgr_process_state`)
             //   word 1 = exit_reason (only meaningful for `EXITED`)
             let (state, exit_reason) = resolve_query_state(badge, &mut ctx.tables.lock());
-            let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
+            let msg = IpcMessage::builder(procmgr_errors::SUCCESS)
                 .word(0, state)
                 .word(1, exit_reason)
                 .build();
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            reply.set(msg);
         }
 
         procmgr_labels::BIND_DEATH_OBSERVER =>
         {
             // A bind makes syscalls only, under the table lock.
-            handle_bind_death_observer(&req, ipc_buf, &ctx.tables.lock().table);
+            handle_bind_death_observer(&req, &ctx.tables.lock().table, reply);
         }
 
         procmgr_labels::CREATE_FROM_FILE =>
         {
-            handle_create(&req, ipc_buf, ctx, ObjectSource::File);
+            handle_create(&req, ipc_buf, ctx, ObjectSource::File, reply);
         }
 
         procmgr_labels::READ_VERIFIED =>
         {
-            handle_read_verified(&req, ipc_buf, ctx);
+            handle_read_verified(&req, ipc_buf, ctx, reply);
         }
 
         procmgr_labels::SNAPSHOT =>
@@ -831,42 +830,42 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
             // Maps the child's ProcessInfo page and copies caps into its
             // CSpace: syscalls, and a failed copy's log line, under the
             // table lock (services/procmgr/README.md § Concurrency).
-            handle_configure_pipe(&req, ipc_buf, ctx.self_aspace, &mut ctx.tables.lock().table);
+            handle_configure_pipe(&req, ctx.self_aspace, &mut ctx.tables.lock().table, reply);
         }
 
         procmgr_labels::CONFIGURE_NAMESPACE =>
         {
-            handle_configure_namespace(&req, ipc_buf, &mut ctx.tables.lock().table);
+            handle_configure_namespace(&req, &mut ctx.tables.lock().table, reply);
         }
 
         procmgr_labels::REGISTER_DEATH_EQ =>
         {
-            handle_register_death_eq(&req, ipc_buf);
+            handle_register_death_eq(&req, reply);
         }
 
         procmgr_labels::QUERY_LIVE_PROCESSES =>
         {
             release_caps(req.caps());
-            handle_query_live_processes(&req, ipc_buf, &ctx.tables.lock().table);
+            handle_query_live_processes(&req, &ctx.tables.lock().table, reply);
         }
 
         procmgr_labels::REGISTER_INIT_TEARDOWN =>
         {
-            init_reap::handle_register(&req, ipc_buf, &ctx.deaths);
+            init_reap::handle_register(&req, ipc_buf, &ctx.deaths, reply);
         }
 
         procmgr_labels::INIT_TEARDOWN_DONE =>
         {
-            init_reap::handle_done(&req, ipc_buf);
+            init_reap::handle_done(&req, ipc_buf, reply);
         }
 
         procmgr_labels::QUERY_INIT_REAP =>
         {
-            init_reap::handle_query(&req, ipc_buf);
+            init_reap::handle_query(&req, reply);
         }
 
         // The debug-authority and thread-registry labels, and unknown opcodes.
-        _ => dispatch_debug(&req, ipc_buf, &ctx.tables, ctx.memmgr_ep, headroom),
+        _ => dispatch_debug(&req, ipc_buf, &ctx.tables, ctx.memmgr_ep, headroom, reply),
     }
 }
 
@@ -903,25 +902,25 @@ pub(crate) fn release_caps(caps: &[u64])
 ///
 /// It writes no log line: the registering logd waits on this reply before its
 /// receive workers take the log endpoint.
-fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
+fn handle_register_death_eq(req: &IpcMessage, reply: &mut Reply)
 {
     let caps = req.caps();
     if req.badge != procmgr_labels::DEATH_EQ_AUTHORITY
     {
         release_caps(caps);
-        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+        reply.set_status(procmgr_errors::UNAUTHORIZED);
         return;
     }
     let Some((&logd_eq, extra)) = caps.split_first()
     else
     {
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        reply.set_status(procmgr_errors::INVALID_ARGUMENT);
         return;
     };
     release_caps(extra);
     if logd_eq == 0
     {
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        reply.set_status(procmgr_errors::INVALID_ARGUMENT);
         return;
     }
     // Every teardown from here on forwards its death to the new queue. The
@@ -931,7 +930,7 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
     {
         let _ = syscall::cap_delete(replaced);
     }
-    reply_empty(ipc_buf, procmgr_errors::SUCCESS);
+    reply.set_status(procmgr_errors::SUCCESS);
 }
 
 /// Dispatch the debug-authority labels, `REGISTER_CRASH_SERVICE`,
@@ -941,8 +940,8 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 /// the caps it carried. Every label but `REGISTER_CRASH_SERVICE`, which reads
 /// no table and calls the crash decliner, and `MAKE_RESIDENT` and
 /// `MAKE_PRIVATE`, which call memmgr at `memmgr_ep` after the lock, is served
-/// under the table lock: each makes syscalls, its
-/// reply among them, and a failed rebind's log line
+/// under the table lock: each makes syscalls (`ATTACH_PROCESS`'s reply among
+/// them), and a failed rebind's log line
 /// (services/procmgr/README.md § Concurrency). `headroom` is the request's
 /// hold of procmgr's `CSpace`, which `REGISTER_THREAD` reads.
 fn dispatch_debug(
@@ -951,24 +950,25 @@ fn dispatch_debug(
     tables: &process::Tables,
     memmgr_ep: u64,
     headroom: process_table::Headroom,
+    reply: &mut Reply,
 )
 {
     let label = req.label & 0xFFFF;
     if label == procmgr_labels::REGISTER_CRASH_SERVICE
     {
-        handle_register_crash_service(req, ipc_buf);
+        handle_register_crash_service(req, ipc_buf, reply);
         return;
     }
     if label == procmgr_labels::MAKE_RESIDENT
     {
         release_caps(req.caps());
-        handle_make_resident(req, ipc_buf, tables, memmgr_ep);
+        handle_make_resident(req, ipc_buf, tables, memmgr_ep, reply);
         return;
     }
     if label == procmgr_labels::MAKE_PRIVATE
     {
         release_caps(req.caps());
-        handle_make_private(req, ipc_buf, tables, memmgr_ep);
+        handle_make_private(req, ipc_buf, tables, memmgr_ep, reply);
         return;
     }
     let table = &mut tables.lock().table;
@@ -981,23 +981,23 @@ fn dispatch_debug(
                 .split_first()
                 .map_or((0, &[][..]), |(&c, rest)| (c, rest));
             release_caps(extra);
-            handle_attach_process(req, ipc_buf, table, watch);
+            handle_attach_process(req, ipc_buf, table, watch, reply);
         }
         procmgr_labels::LIST_PROCESSES =>
         {
             release_caps(req.caps());
-            handle_list_processes(req, ipc_buf, table);
+            handle_list_processes(req, table, reply);
         }
         procmgr_labels::DETACH_PROCESS =>
         {
             release_caps(req.caps());
-            handle_detach_process(req, ipc_buf, table);
+            handle_detach_process(req, table, reply);
         }
-        procmgr_labels::REGISTER_THREAD => handle_register_thread(req, ipc_buf, table, headroom),
+        procmgr_labels::REGISTER_THREAD => handle_register_thread(req, table, headroom, reply),
         procmgr_labels::DECLARE_NO_DEBUG =>
         {
             release_caps(req.caps());
-            handle_declare_no_debug(req.badge, ipc_buf, table);
+            handle_declare_no_debug(req.badge, table, reply);
         }
         procmgr_labels::DECLARE_NO_CORE =>
         {
@@ -1012,13 +1012,13 @@ fn dispatch_debug(
             {
                 procmgr_errors::INVALID_BADGE
             };
-            reply_empty(ipc_buf, code);
+            reply.set_status(code);
         }
         // `REGISTER_CRASH_SERVICE` is served above.
         _ =>
         {
             release_caps(req.caps());
-            reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
+            reply.set_status(procmgr_errors::UNKNOWN_OPCODE);
         }
     }
 }
@@ -1031,9 +1031,9 @@ fn dispatch_debug(
 /// `OUT_OF_MEMORY` at its reservation.
 fn handle_register_thread(
     req: &IpcMessage,
-    ipc_buf: *mut u64,
     table: &mut process::ProcessTable,
     headroom: process_table::Headroom,
+    reply: &mut Reply,
 )
 {
     let (thread, extra) = req
@@ -1050,7 +1050,7 @@ fn handle_register_thread(
             code
         }
     };
-    reply_empty(ipc_buf, code);
+    reply.set_status(code);
 }
 
 /// Handle `REGISTER_CRASH_SERVICE` — hand the crash endpoint's receive side
@@ -1065,13 +1065,13 @@ fn handle_register_thread(
 /// `OUT_OF_MEMORY` when the `RECV` cap cannot be derived or the decliner
 /// cannot be parked. Caps past `caps[0]`, and every cap of a refused
 /// request, are deleted.
-fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
+fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64, reply: &mut Reply)
 {
     let caps = req.caps();
     if !process_table::debug_authorized(req.badge)
     {
         release_caps(caps);
-        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+        reply.set_status(procmgr_errors::UNAUTHORIZED);
         return;
     }
     let (thread, extra) = caps
@@ -1082,11 +1082,11 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
     {
         Ok(registered) =>
         {
-            let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
+            let answer = IpcMessage::builder(procmgr_errors::SUCCESS)
                 .cap(registered.recv)
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+            if unsafe { ipc::ipc_reply(&answer, ipc_buf) }.is_err()
             {
                 // The caller holds no RECV cap, so the registration is
                 // undone and the decliner receives again.
@@ -1105,7 +1105,7 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
                 crash::RegisterRefusal::Present => procmgr_errors::CRASH_SERVICE_PRESENT,
                 crash::RegisterRefusal::OutOfSlots => procmgr_errors::OUT_OF_MEMORY,
             };
-            reply_empty(ipc_buf, code);
+            reply.set_status(code);
         }
     }
 }
@@ -1126,6 +1126,7 @@ fn handle_attach_process(
     ipc_buf: *mut u64,
     table: &mut process::ProcessTable,
     watch: u64,
+    reply: &mut Reply,
 )
 {
     let (entry, named) = match process_table::attach_target(table, req.badge, req.word(0))
@@ -1140,7 +1141,7 @@ fn handle_attach_process(
                 process_table::AttachRefusal::NotAttachable => procmgr_errors::NOT_ATTACHABLE,
             };
             release_caps(&[watch]);
-            reply_empty(ipc_buf, code);
+            reply.set_status(code);
             return;
         }
     };
@@ -1162,17 +1163,17 @@ fn handle_attach_process(
     else
     {
         release_caps(&[watch]);
-        reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+        reply.set_status(procmgr_errors::OUT_OF_MEMORY);
         return;
     };
-    let reply = attach_reply(
+    let answer = attach_reply(
         entry,
         named.index_in(entry),
         derived.get(..n).unwrap_or_default(),
     );
     let send = || {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_ok()
+        unsafe { ipc::ipc_reply(&answer, ipc_buf) }.is_ok()
     };
     if !process::watch_debugger(entry, watch, send)
     {
@@ -1210,11 +1211,11 @@ fn attach_reply(entry: &process::ProcessEntry, named: u64, caps: &[u64]) -> IpcM
 /// name (`services/procmgr/docs/ipc-interface.md` § `LIST_PROCESSES`).
 /// Refused `UNAUTHORIZED` without `DEBUG_AUTHORITY`; `INVALID_ARGUMENT` for a
 /// `data[0]` other than 0 or 1.
-fn handle_list_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &process::ProcessTable)
+fn handle_list_processes(req: &IpcMessage, table: &process::ProcessTable, reply: &mut Reply)
 {
     if !process_table::debug_authorized(req.badge)
     {
-        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+        reply.set_status(procmgr_errors::UNAUTHORIZED);
         return;
     }
     let after = match req.word(0)
@@ -1223,7 +1224,7 @@ fn handle_list_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &process::P
         1 => Some(req.word(1)),
         _ =>
         {
-            reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+            reply.set_status(procmgr_errors::INVALID_ARGUMENT);
             return;
         }
     };
@@ -1243,20 +1244,19 @@ fn handle_list_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &process::P
     let used = count
         .saturating_mul(procmgr_labels::LIST_PROCESSES_WORDS_PER_ENTRY)
         .saturating_add(1);
-    let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS);
+    let mut msg = IpcMessage::builder(procmgr_errors::SUCCESS);
     // `pack_list_entry` counted only the entries it fitted, so `used` is within `words`.
     for (i, &w) in words.get(..used).unwrap_or_default().iter().enumerate()
     {
-        reply = reply.word(i, w);
+        msg = msg.word(i, w);
     }
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) };
+    reply.set(msg.build());
 }
 
 /// Handle `DETACH_PROCESS` — bind the process `data[0]` names back to the
 /// crash endpoint (`process::restore_crash_bindings`;
 /// `services/procmgr/docs/ipc-interface.md` § `DETACH_PROCESS`).
-fn handle_detach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+fn handle_detach_process(req: &IpcMessage, table: &mut process::ProcessTable, reply: &mut Reply)
 {
     let code = match process_table::detach_target(table, req.badge, req.word(0))
     {
@@ -1270,7 +1270,7 @@ fn handle_detach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut proces
         Err(process_table::AttachRefusal::Unknown) => procmgr_errors::INVALID_BADGE,
         Err(process_table::AttachRefusal::NotAttachable) => procmgr_errors::NOT_ATTACHABLE,
     };
-    reply_empty(ipc_buf, code);
+    reply.set_status(code);
 }
 
 /// Handle `MAKE_RESIDENT` — have memmgr make the range `data[1]`, `data[2]`
@@ -1289,11 +1289,12 @@ fn handle_make_resident(
     ipc_buf: *mut u64,
     tables: &process::Tables,
     memmgr_ep: u64,
+    reply: &mut Reply,
 )
 {
     if !process_table::debug_authorized(req.badge)
     {
-        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+        reply.set_status(procmgr_errors::UNAUTHORIZED);
         return;
     }
     let target = tables
@@ -1308,16 +1309,15 @@ fn handle_make_resident(
     };
     if code != procmgr_errors::SUCCESS
     {
-        reply_empty(ipc_buf, code);
+        reply.set_status(code);
         return;
     }
-    let reply = IpcMessage::builder(code)
+    let msg = IpcMessage::builder(code)
         .word(0, words[0])
         .word(1, words[1])
         .word(2, words[2])
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(msg);
 }
 
 /// Handle `MAKE_PRIVATE` — have memmgr give each page of the range
@@ -1335,11 +1335,12 @@ fn handle_make_private(
     ipc_buf: *mut u64,
     tables: &process::Tables,
     memmgr_ep: u64,
+    reply: &mut Reply,
 )
 {
     if !process_table::debug_authorized(req.badge)
     {
-        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+        reply.set_status(procmgr_errors::UNAUTHORIZED);
         return;
     }
     let target = tables
@@ -1358,12 +1359,11 @@ fn handle_make_private(
     };
     if code != procmgr_errors::SUCCESS
     {
-        reply_empty(ipc_buf, code);
+        reply.set_status(code);
         return;
     }
-    let reply = IpcMessage::builder(code).word(0, reached).build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    let msg = IpcMessage::builder(code).word(0, reached).build();
+    reply.set(msg);
 }
 
 /// Times an attach sweeps and derives its page again when a registered
@@ -1438,7 +1438,7 @@ fn derive_attach_page(
 /// onto the threads it spawns after. Reply `SUCCESS`, or `INVALID_BADGE`
 /// when the badge names no live process
 /// (`services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_DEBUG`).
-fn handle_declare_no_debug(badge: u64, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+fn handle_declare_no_debug(badge: u64, table: &mut process::ProcessTable, reply: &mut Reply)
 {
     let code = match table.declare_no_debug(badge)
     {
@@ -1464,7 +1464,7 @@ fn handle_declare_no_debug(badge: u64, ipc_buf: *mut u64, table: &mut process::P
         }
         None => procmgr_errors::INVALID_BADGE,
     };
-    reply_empty(ipc_buf, code);
+    reply.set_status(code);
 }
 
 /// Handle `BIND_DEATH_OBSERVER` — bind the queue of `caps[0]` as a
@@ -1476,7 +1476,7 @@ fn handle_declare_no_debug(badge: u64, ipc_buf: *mut u64, table: &mut process::P
 /// the child's address space keeps its `Control` right. The queue cap is
 /// deleted on every path: the kernel binding holds its own reference to the
 /// queue.
-fn handle_bind_death_observer(req: &IpcMessage, ipc_buf: *mut u64, table: &process::ProcessTable)
+fn handle_bind_death_observer(req: &IpcMessage, table: &process::ProcessTable, reply: &mut Reply)
 {
     let caps = req.caps();
     let queue = caps.first().copied().unwrap_or(0);
@@ -1508,7 +1508,7 @@ fn handle_bind_death_observer(req: &IpcMessage, ipc_buf: *mut u64, table: &proce
     {
         let _ = syscall::cap_delete(queue);
     }
-    reply_empty(ipc_buf, code);
+    reply.set_status(code);
 }
 
 /// Handle `LIST_CHILDREN` — reply with one page of the children of the
@@ -1524,7 +1524,7 @@ fn handle_bind_death_observer(req: &IpcMessage, ipc_buf: *mut u64, table: &proce
 /// leaves its copy valid, which memmgr then answers for an unknown badge,
 /// listed as `0`. `INVALID_BADGE` when the handle names no live process;
 /// `INVALID_ARGUMENT` for a `data[0]` other than 0 or 1.
-fn handle_list_children(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
+fn handle_list_children(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, reply: &mut Reply)
 {
     let after = match req.word(0)
     {
@@ -1532,7 +1532,7 @@ fn handle_list_children(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         1 => Some(req.word(1)),
         _ =>
         {
-            reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+            reply.set_status(procmgr_errors::INVALID_ARGUMENT);
             return;
         }
     };
@@ -1544,7 +1544,7 @@ fn handle_list_children(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         if state.table.find_by_badge(req.badge).is_none()
         {
             drop(state);
-            reply_empty(ipc_buf, procmgr_errors::INVALID_BADGE);
+            reply.set_status(procmgr_errors::INVALID_BADGE);
             return;
         }
         for (slot, child) in page
@@ -1579,13 +1579,12 @@ fn handle_list_children(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     let used = count
         .saturating_mul(procmgr_labels::LIST_CHILDREN_WORDS_PER_ENTRY)
         .saturating_add(1);
-    let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS);
+    let mut msg = IpcMessage::builder(procmgr_errors::SUCCESS);
     for (i, &w) in words.get(..used).unwrap_or_default().iter().enumerate()
     {
-        reply = reply.word(i, w);
+        msg = msg.word(i, w);
     }
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) };
+    reply.set(msg.build());
 }
 
 /// The pages charged to the budget node, and every node below it, of the
@@ -1616,7 +1615,7 @@ fn subtree_pages(usage: u64, ipc_buf: *mut u64) -> u64
 /// names no live process (the un-badged creator's); `END_QUEUE_PRESENT` when
 /// the sender registered one before. Caps past `caps[0]`, and the queue of a
 /// refused request, are deleted.
-fn handle_register_end_queue(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+fn handle_register_end_queue(req: &IpcMessage, table: &mut process::ProcessTable, reply: &mut Reply)
 {
     let caps = req.caps();
     let queue = caps.first().copied().unwrap_or(0);
@@ -1638,7 +1637,7 @@ fn handle_register_end_queue(req: &IpcMessage, ipc_buf: *mut u64, table: &mut pr
     {
         let _ = syscall::cap_delete(queue);
     }
-    reply_empty(ipc_buf, code);
+    reply.set_status(code);
 }
 
 /// Handle `QUERY_LIVE_PROCESSES` — reply with one page of live process
@@ -1647,11 +1646,11 @@ fn handle_register_end_queue(req: &IpcMessage, ipc_buf: *mut u64, table: &mut pr
 /// Refused `UNAUTHORIZED` unless the caller holds `DEATH_EQ_AUTHORITY`, since
 /// a badge names a process handle; `INVALID_ARGUMENT` for a `data[0]` other
 /// than 0 or 1.
-fn handle_query_live_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &process::ProcessTable)
+fn handle_query_live_processes(req: &IpcMessage, table: &process::ProcessTable, reply: &mut Reply)
 {
     if req.badge != procmgr_labels::DEATH_EQ_AUTHORITY
     {
-        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+        reply.set_status(procmgr_errors::UNAUTHORIZED);
         return;
     }
     let after = match req.word(0)
@@ -1660,21 +1659,20 @@ fn handle_query_live_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &proc
         1 => Some(req.word(1)),
         _ =>
         {
-            reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+            reply.set_status(procmgr_errors::INVALID_ARGUMENT);
             return;
         }
     };
     let mut page = [0u64; procmgr_labels::LIVE_PROCESSES_PAGE];
     let count = table.live_badges_after(after, &mut page);
-    let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS).word(0, count as u64);
+    let mut msg = IpcMessage::builder(procmgr_errors::SUCCESS).word(0, count as u64);
     // `live_badges_after` fills at most `page.len()` slots and returns that count.
     for (i, &badge) in page.get(..count).unwrap_or_default().iter().enumerate()
     {
         // `i` is below `count`, so the sum is bounded by the page length.
-        reply = reply.word(i.saturating_add(1), badge);
+        msg = msg.word(i.saturating_add(1), badge);
     }
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) };
+    reply.set(msg.build());
 }
 
 /// Answer `QUERY_PROCESS` for the addressed entry, from `state`, the table
@@ -1841,9 +1839,9 @@ fn reply_empty(ipc_buf: *mut u64, code: u64)
 /// * `caps[2]` = space-available notification cap
 fn handle_configure_pipe(
     req: &IpcMessage,
-    ipc_buf: *mut u64,
     self_aspace: u64,
     table: &mut process::ProcessTable,
+    reply: &mut Reply,
 )
 {
     let badge = req.badge;
@@ -1858,7 +1856,7 @@ fn handle_configure_pipe(
     else
     {
         release_caps(caps);
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        reply.set_status(procmgr_errors::INVALID_ARGUMENT);
         return;
     };
     release_caps(extra);
@@ -1881,7 +1879,7 @@ fn handle_configure_pipe(
     // dropped, so refcounts hit zero when both peers later release.
     release_caps(&[memory_cap, data_notification, space_notification]);
 
-    reply_empty(ipc_buf, code);
+    reply.set_status(code);
 }
 
 /// Handle `CONFIGURE_NAMESPACE` — install per-process root and
@@ -1897,8 +1895,8 @@ fn handle_configure_pipe(
 /// Caps past `caps[1]` are deleted.
 fn handle_configure_namespace(
     req: &IpcMessage,
-    ipc_buf: *mut u64,
     table: &mut process::ProcessTable,
+    reply: &mut Reply,
 )
 {
     let badge = req.badge;
@@ -1906,7 +1904,7 @@ fn handle_configure_namespace(
     let Some(&root_cap) = caps.first()
     else
     {
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        reply.set_status(procmgr_errors::INVALID_ARGUMENT);
         return;
     };
     let cwd_cap = caps.get(1).copied().unwrap_or(0);
@@ -1916,7 +1914,7 @@ fn handle_configure_namespace(
         Ok(()) => procmgr_errors::SUCCESS,
         Err(code) => code,
     };
-    reply_empty(ipc_buf, code);
+    reply.set_status(code);
 }
 
 /// A create request that passed [`check_create_request`].
@@ -2274,7 +2272,13 @@ enum ObjectSource
 /// deleted here. Stdio pipe
 /// wiring is installed by separate `CONFIGURE_PIPE` IPCs on the returned
 /// `process_handle` between create and `START_PROCESS`.
-fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: ObjectSource)
+fn handle_create(
+    req: &IpcMessage,
+    ipc_buf: *mut u64,
+    ctx: &ProcmgrCtx,
+    source: ObjectSource,
+    reply: &mut Reply,
+)
 {
     let label = req.label;
     let all_caps = req.caps();
@@ -2287,7 +2291,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
     else
     {
         release_caps(all_caps);
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        reply.set_status(procmgr_errors::INVALID_ARGUMENT);
         return;
     };
     release_caps(caps.extra);
@@ -2308,7 +2312,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
             caps.relay,
             caps.charge,
         ]);
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        reply.set_status(procmgr_errors::INVALID_ARGUMENT);
         return;
     };
     checked.sched.budget.charge = caps.charge;
@@ -2347,7 +2351,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
             // entry only once that entry exists, which every error return
             // precedes; procmgr's copy is dropped here.
             release_caps(&[caps.relay]);
-            reply_empty(ipc_buf, code);
+            reply.set_status(code);
         }
     }
 }
@@ -2366,7 +2370,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
 /// cap is deleted on every path (opened, read and closed first once the
 /// request is admitted), and every cap past it at once. A run the reply
 /// cannot deliver is released to the sender's account here.
-fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
+fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, reply: &mut Reply)
 {
     let caps = req.caps();
     let file_cap = caps.first().copied().unwrap_or(0);
@@ -2376,7 +2380,7 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     else
     {
         release_caps(&[file_cap]);
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        reply.set_status(procmgr_errors::INVALID_ARGUMENT);
         return;
     };
     // The sender's account, whether its node is a reserve node, which the
@@ -2411,20 +2415,20 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         {
             let _ = syscall::cap_delete(cap);
             release_caps(&[file_cap]);
-            reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+            reply.set_status(procmgr_errors::UNAUTHORIZED);
             return;
         }
         Some(Some(cap)) => process::CapGuard::new(cap),
         Some(None) =>
         {
             release_caps(&[file_cap]);
-            reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+            reply.set_status(procmgr_errors::OUT_OF_MEMORY);
             return;
         }
         None =>
         {
             release_caps(&[file_cap]);
-            reply_empty(ipc_buf, procmgr_errors::INVALID_BADGE);
+            reply.set_status(procmgr_errors::INVALID_BADGE);
             return;
         }
     };
@@ -2451,14 +2455,14 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     {
         Ok((body_len, run)) =>
         {
-            let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
+            let answer = IpcMessage::builder(procmgr_errors::SUCCESS)
                 .word(0, body_len as u64)
                 .word(1, run.region)
                 .word(2, run.pages)
                 .cap(run.cap)
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+            if unsafe { ipc::ipc_reply(&answer, ipc_buf) }.is_err()
             {
                 // The cap stayed in procmgr's CSpace: the sender is gone or
                 // could not take it, so the run goes back to its account.
@@ -2471,7 +2475,7 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
                 let _ = unsafe { ipc::ipc_call(memmgr.cap(), &msg, ipc_buf) };
             }
         }
-        Err(code) => reply_empty(ipc_buf, code),
+        Err(code) => reply.set_status(code),
     }
 }
 

@@ -46,6 +46,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use death_set::DeathSet;
+use ipc::serve::Reply;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use process_table::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, MSG_CAP_SLOTS_MAX};
@@ -160,15 +161,14 @@ fn release_page(memmgr_ep: u64, page: u64, region_id: u64, ipc_buf: *mut u64)
 /// Handle `QUERY_INIT_REAP`: reply with whether the reap has run and the
 /// release probe's outcome. The message names no caps, so procmgr deletes
 /// any it moved.
-pub fn handle_query(req: &IpcMessage, ipc_buf: *mut u64)
+pub fn handle_query(req: &IpcMessage, reply: &mut Reply)
 {
     crate::release_caps(req.caps());
     let msg = IpcMessage::builder(procmgr_errors::SUCCESS)
         .word(0, u64::from(REAPED.load(Ordering::Relaxed)))
         .word(1, PROBE_OUTCOME.load(Ordering::Relaxed))
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&msg, ipc_buf) };
+    reply.set(msg);
 }
 
 /// Init's kernel-object and reclaim-Memory caps, accumulated across
@@ -244,7 +244,12 @@ fn refuse(refusal: Refusal, caps: &[u64], ipc_buf: *mut u64)
 /// the init-reap lock: the one order the two are held in, since the reaper
 /// handles the init deaths it drained ([`run_reap`]) after it releases the
 /// death-set lock.
-pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &Mutex<DeathSet>)
+pub fn handle_register(
+    req: &IpcMessage,
+    ipc_buf: *mut u64,
+    deaths: &Mutex<DeathSet>,
+    reply: &mut Reply,
+)
 {
     let caps = req.caps();
     let is_first = req.word(0) != 0;
@@ -257,7 +262,7 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &Mutex<Death
             Ok(state) =>
             {
                 state.donate_caps.extend_from_slice(caps);
-                reply(ipc_buf, procmgr_errors::SUCCESS);
+                reply.set_status(procmgr_errors::SUCCESS);
             }
             Err(refusal) => refuse(refusal, caps, ipc_buf),
         }
@@ -306,14 +311,14 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &Mutex<Death
         donate_caps: Vec::with_capacity(32),
     });
     drop(guard);
-    reply(ipc_buf, procmgr_errors::SUCCESS);
+    reply.set_status(procmgr_errors::SUCCESS);
 }
 
 /// Handle `INIT_TEARDOWN_DONE`: mark the handoff armed. Only an un-badged
 /// cap (init's, or svcmgr's mint source) is accepted, once, while the
 /// handoff is open. The message names no caps, so procmgr deletes any it
 /// moved, accepted or refused.
-pub fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
+pub fn handle_done(req: &IpcMessage, ipc_buf: *mut u64, reply: &mut Reply)
 {
     let mut guard = STATE.lock().expect("init-reap state poisoned");
     match guard.done(req.badge)
@@ -321,7 +326,7 @@ pub fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
         Ok(()) =>
         {
             crate::release_caps(req.caps());
-            reply(ipc_buf, procmgr_errors::SUCCESS);
+            reply.set_status(procmgr_errors::SUCCESS);
         }
         Err(refusal) => refuse(refusal, req.caps(), ipc_buf),
     }

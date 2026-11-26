@@ -38,7 +38,7 @@ use ipc::devmgr_labels as labels;
 
 use crate::caps::{DevmgrCaps, Firmware};
 use crate::hotplug::{Event, Hotplug};
-use crate::{IrqRangeAllocator, arch, bind, reply_status, tables};
+use crate::{IrqRangeAllocator, arch, bind, tables};
 
 /// The data words of the longest reply, `QUERY_HOST_BRIDGE`'s.
 const REPLY_WORDS: usize = 9;
@@ -311,11 +311,16 @@ fn unpack_function(word: u64) -> Option<Address>
 }
 
 /// Post `request` to the control thread through `jobs`, wake it with
-/// `signal`, wait for its reply, and send that on this worker's IPC buffer
-/// `ipc_buf`. A reply that fails deletes the cap it carried, a copy of
-/// what devmgr keeps. Replies `INVALID_REQUEST` when the control thread
+/// `signal`, wait for its reply, and leave that in `reply`. A reply that
+/// is not delivered deletes the cap it carried, a copy of what devmgr
+/// keeps. Replies `INVALID_REQUEST` when the control thread
 /// cannot take the job.
-pub fn run_on_control(jobs: &Jobs, signal: impl FnOnce(), request: Request, ipc_buf: *mut u64)
+pub fn run_on_control(
+    jobs: &Jobs,
+    signal: impl FnOnce(),
+    request: Request,
+    reply: &mut ipc::serve::Reply,
+)
 {
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     if jobs
@@ -325,31 +330,26 @@ pub fn run_on_control(jobs: &Jobs, signal: impl FnOnce(), request: Request, ipc_
         })
         .is_err()
     {
-        reply_status(errors::INVALID_REQUEST, ipc_buf);
+        reply.set_status(errors::INVALID_REQUEST);
         return;
     }
     signal();
-    let Ok(reply) = reply_rx.recv()
+    let Ok(answer) = reply_rx.recv()
     else
     {
-        reply_status(errors::INVALID_REQUEST, ipc_buf);
+        reply.set_status(errors::INVALID_REQUEST);
         return;
     };
-    let mut message = IpcMessage::builder(reply.label);
-    for (i, &word) in reply.words.iter().take(reply.count).enumerate()
+    let mut message = IpcMessage::builder(answer.label);
+    for (i, &word) in answer.words.iter().take(answer.count).enumerate()
     {
         message = message.word(i, word);
     }
-    if let Some(cap) = reply.cap
+    if let Some(cap) = answer.cap
     {
         message = message.cap(cap);
     }
-    // SAFETY: ipc_buf is this worker's registered IPC buffer.
-    if unsafe { ipc::ipc_reply(&message.build(), ipc_buf) }.is_err()
-        && let Some(cap) = reply.cap
-    {
-        let _ = syscall::cap_delete(cap);
-    }
+    reply.set_or_delete_caps(message.build());
 }
 
 /// Whether `QUERY_ACPI_RESOURCES` of `block` runs on the control thread: the
@@ -373,7 +373,7 @@ pub const fn on_control(block: u64) -> bool
 /// narrow `IoPort` over the FADT's fixed register block `msg` names, its
 /// first port, its port count, the value the FADT gives with it and its
 /// space, the I/O space.
-pub fn query_resources(firmware: &Firmware, msg: &IpcMessage, ipc_buf: *mut u64)
+pub fn query_resources(firmware: &Firmware, msg: &IpcMessage, reply: &mut ipc::serve::Reply)
 {
     use firmware::acpi::FadtBlock;
     let block = match msg.word(1)
@@ -384,28 +384,24 @@ pub fn query_resources(firmware: &Firmware, msg: &IpcMessage, ipc_buf: *mut u64)
         labels::ACPI_SMI_CMD => FadtBlock::SmiCmd,
         _ =>
         {
-            reply_status(errors::INVALID_REQUEST, ipc_buf);
+            reply.set_status(errors::INVALID_REQUEST);
             return;
         }
     };
     let Some((cap, io)) = arch::current::acpi_io_block(firmware, block)
     else
     {
-        reply_status(errors::NO_DEVICE, ipc_buf);
+        reply.set_status(errors::NO_DEVICE);
         return;
     };
-    let reply = IpcMessage::builder(errors::SUCCESS)
+    let answer = IpcMessage::builder(errors::SUCCESS)
         .word(0, u64::from(io.port))
         .word(1, u64::from(io.count))
         .word(2, u64::from(io.value))
         .word(3, labels::ACPI_SPACE_IO)
         .cap(cap)
         .build();
-    // SAFETY: ipc_buf is this worker's registered IPC buffer.
-    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-    {
-        let _ = syscall::cap_delete(cap);
-    }
+    reply.set_or_delete_caps(answer);
 }
 
 /// The ranges the kernel owns: the register window of each interrupt

@@ -15,7 +15,8 @@
 //! ([`resync`]); the line logd logs when it evicts a slot ([`reclaim`]);
 //! which entries a query page carries ([`query`]); logd's output-sink queue
 //! and its stall rule ([`sink`]);
-//! the level tag both log receivers render ([`level`]); and the line and
+//! the level tag both log receivers render ([`level`]); how both write and
+//! keep the kernel's log records ([`kernel`]); and the line and
 //! name widths both log receivers use ([`LINE_BUF_SIZE`], [`MAX_NAME_LEN`]).
 //! Also holds [`BoundedStr`], the fixed-capacity formatter logd uses for its
 //! own diagnostics. None of this touches a syscall, IPC, or `std::os::seraph`
@@ -30,6 +31,7 @@
 pub mod handover;
 pub mod history;
 pub mod hold;
+pub mod kernel;
 pub mod level;
 pub mod query;
 pub mod reclaim;

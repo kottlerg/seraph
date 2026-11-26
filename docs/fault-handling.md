@@ -547,14 +547,15 @@ takes: the timer tick that brings the thread's run count to its run limit makes 
 limit and the count are the scheduler's; their syscall is `SYS_THREAD_SET_RUN_LIMIT`
 ([syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_THREAD_SET_RUN_LIMIT`).
 
-- **Delivery.** A pending run-limit fault is delivered at the thread's next return to user mode: a
-  syscall's return, with the syscall's result already in its registers, or the return from an
-  interrupt taken in user mode, or from an exception at whose end the kernel preempted the thread:
-  the returns of an upcall's two points ([Delivery points](#delivery-points)). An exception's
-  return with no preemption is none, and the fault stays pending to the thread's next such return.
-  It is delivered ahead of an upcall pending at the same return, which follows once a resume
-  resolves the fault ([Nesting](#nesting)). A restarted syscall ([Kernel Copies](#kernel-copies))
-  keeps the fault pending until its re-execution returns.
+- **Delivery.** A pending run-limit fault is delivered at the thread's next return to user mode on
+  the CPU it runs on; when it leaves the CPU first, its next dispatch posts the fault again, as for
+  a pending upcall. The returns are a syscall's return, with the syscall's result already in its
+  registers, or the return from an interrupt taken in user mode, or from an exception at whose end
+  the kernel preempted the thread: the returns of an upcall's two points ([Delivery
+  points](#delivery-points)). An exception's return with no preemption is none, and the fault stays
+  pending to the thread's next such return. It is delivered ahead of an upcall pending at the same
+  return, which follows once a resume resolves the fault ([Nesting](#nesting)). A restarted syscall
+  ([Kernel Copies](#kernel-copies)) keeps the fault pending until its re-execution returns.
 - **Message.** It is a `FAULT_KIND_EXCEPTION` fault through the thread's exception binding, as
   any exception is: the normalized code `FAULT_EXC_RUN_LIMIT`, auxiliary code `0`, and the
   thread's instruction pointer as `SYS_THREAD_READ_REGS` reads it ([Fault Message](#fault-message)).

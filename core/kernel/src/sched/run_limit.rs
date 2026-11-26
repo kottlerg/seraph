@@ -12,8 +12,9 @@
 //! a syscall that resets the count sets it to zero
 //! (`syscall::resets_run_count`). The tick that reaches the limit sets the
 //! count to zero, marks the fault pending and posts this CPU's
-//! `percpu::return_work::RUN_LIMIT` bit, so the thread's next return to user
-//! mode delivers it ([`deliver_at_syscall`], [`deliver_at_interrupt`]) as a
+//! `percpu::return_work::RUN_LIMIT` bit, and the dispatch of a thread with a
+//! fault pending posts that bit on the CPU it is dispatched to
+//! ([`return_work_of`]), so the thread's next return to user mode delivers it ([`deliver_at_syscall`], [`deliver_at_interrupt`]) as a
 //! `FAULT_EXC_RUN_LIMIT` exception through its exception binding, or ends the
 //! thread with `EXIT_RUN_LIMIT` when none is bound or the handler declines.
 
@@ -29,11 +30,10 @@ use crate::sched::thread::{ThreadControlBlock, ThreadState};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TickAction
 {
-    /// The thread has no limit: the tick neither counts nor posts.
+    /// The thread has no limit, or a run-limit fault is already pending on it
+    /// (its delivery is owed, and the dispatch posts its bit again wherever the
+    /// thread next runs): the tick neither counts nor posts.
     Skip,
-    /// A run-limit fault is already pending, its return-work bit taken by a
-    /// return that did not deliver it: post the bit again and count nothing.
-    Repost,
     /// Count the tick.
     Count,
 }
@@ -47,13 +47,9 @@ pub enum TickAction
 #[must_use]
 pub const fn tick_action(limit: u32, pending: bool) -> TickAction
 {
-    if limit == 0
+    if limit == 0 || pending
     {
         TickAction::Skip
-    }
-    else if pending
-    {
-        TickAction::Repost
     }
     else
     {
@@ -70,11 +66,10 @@ pub const fn reaches_limit(count: u32, limit: u32) -> bool
 
 /// Count a timer tick for `tcb`, this CPU's current thread
 /// (core/kernel/docs/scheduler.md § Run Limit), and post this CPU's
-/// `RUN_LIMIT` return-work bit when the tick reaches the limit or finds a
-/// fault pending whose bit a return took without delivering it. The tick's
+/// `RUN_LIMIT` return-work bit when the tick reaches the limit. The tick's
 /// slice decision is left as it is: a switch at the slice's expiry leaves the
-/// fault pending on the thread, and the first tick after it next runs posts
-/// the bit again.
+/// fault pending on the thread, and its next dispatch posts the bit again
+/// ([`return_work_of`]).
 ///
 /// # Safety
 /// The timer tick, on this CPU with interrupts disabled and its scheduler
@@ -92,31 +87,51 @@ pub unsafe fn tick(tcb: *mut ThreadControlBlock)
     }
     // SAFETY: as for the load above.
     let pending = unsafe { &(*tcb).run_limit_pending };
-    match tick_action(limit, pending.load(Ordering::Relaxed))
+    if tick_action(limit, pending.load(Ordering::Relaxed)) == TickAction::Skip
     {
-        TickAction::Skip => return,
-        TickAction::Repost =>
-        {}
-        TickAction::Count =>
-        {
-            // SAFETY: as for the load above.
-            let count = unsafe { &(*tcb).run_count };
-            // An add, not a store of a value read before it, so a concurrent
-            // set's zero is never lost.
-            let counted = count.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-            if !reaches_limit(counted, limit)
-            {
-                return;
-            }
-            count.store(0, Ordering::Relaxed);
-            pending.store(true, Ordering::Relaxed);
-        }
+        return;
     }
+    // SAFETY: as for the load above.
+    let count = unsafe { &(*tcb).run_count };
+    // An add, not a store of a value read before it, so a concurrent set's
+    // zero is never lost.
+    let counted = count.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if !reaches_limit(counted, limit)
+    {
+        return;
+    }
+    count.store(0, Ordering::Relaxed);
+    pending.store(true, Ordering::Relaxed);
     // The post is a Release and the return's take an Acquire, so the return
     // that takes the bit reads the pending flag
     // (core/kernel/docs/scheduling-internals.md § Return Work, rule 1).
     // SAFETY: an interrupt on a CPU whose per-CPU pointer is installed.
     unsafe { crate::percpu::post_return_work(crate::percpu::return_work::RUN_LIMIT) };
+}
+
+/// The return-work bit the dispatch of `tcb` posts for its run limit:
+/// `RUN_LIMIT` while a run-limit fault is pending on it, else 0. A fault
+/// whose bit a return on another thread took, after a switch at the slice's
+/// expiry, or a thread that parked or was stopped before its delivery, is so
+/// delivered at the thread's first return to user mode after it next runs.
+///
+/// # Safety
+/// `tcb` must be a valid TCB whose `sched_lock` the caller holds, the lock
+/// the set and the take clear the pending flag under.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn return_work_of(tcb: *mut ThreadControlBlock) -> u32
+{
+    // SAFETY: tcb valid and its sched_lock held (contract); an atomic.
+    let pending = unsafe { (*tcb).run_limit_pending.load(Ordering::Relaxed) };
+    if pending
+    {
+        crate::percpu::return_work::RUN_LIMIT
+    }
+    else
+    {
+        0
+    }
 }
 
 /// Set the run limit of `tcb` to `limit` ticks (0 for none), with its count
@@ -379,10 +394,10 @@ mod tests
     }
 
     #[test]
-    fn pending_fault_reposts_without_counting()
+    fn pending_fault_counts_nothing()
     {
-        assert_eq!(tick_action(50, true), TickAction::Repost);
-        assert_eq!(tick_action(1, true), TickAction::Repost);
+        assert_eq!(tick_action(50, true), TickAction::Skip);
+        assert_eq!(tick_action(1, true), TickAction::Skip);
     }
 
     #[test]

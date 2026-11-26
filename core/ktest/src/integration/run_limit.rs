@@ -8,8 +8,9 @@
 //! Each case runs its own child, set up with its limit before it starts:
 //!
 //!   1. A spinning child with limit 50 and an exception handler bound raises
-//!      `FAULT_EXC_RUN_LIMIT` (kind, badge, `d1`, `d2`) no sooner than 50 ms
-//!      after its start; a KILL reply ends it with `EXIT_RUN_LIMIT`.
+//!      `FAULT_EXC_RUN_LIMIT` (kind, badge, `d1`, `d2`) no sooner than 49 ms
+//!      after its start (its first counted tick may come at once); a KILL
+//!      reply ends it with `EXIT_RUN_LIMIT`.
 //!   2. A child with limit 20 and no handler that spins briefly and calls
 //!      `thread_yield` in a loop keeps running: the yield zeroes the count.
 //!   3. A child with limit 20 and no handler blocked in `ipc_recv` is not
@@ -19,9 +20,14 @@
 //!      syscall still raises the fault: such a syscall does not zero the count.
 //!   5. A limit set and then cleared with 0 never ends a spinning child.
 //!   6. A RESUME reply restarts the count at zero: the second fault comes no
-//!      sooner than one limit after the first; a KILL reply ends the child.
+//!      sooner than one limit, less a period, after the first; a KILL reply
+//!      ends the child.
 //!   7. `thread_set_run_limit` refuses a Thread cap without Control rights
 //!      (`InsufficientRights`) and a non-`SchedControl` cap (`InvalidCapability`).
+//!   8. A spinning child with limit 50 and no handler, pinned to CPU 0 at the
+//!      floor priority beside a spinning child with no limit, is ended with
+//!      `EXIT_RUN_LIMIT`: at the floor's one-tick quantum the tick that reaches
+//!      the limit also switches it out, and its next dispatch posts the fault.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -60,6 +66,8 @@ static mut STACK_3: ChildStack = ChildStack::ZERO;
 static mut STACK_4: ChildStack = ChildStack::ZERO;
 static mut STACK_5: ChildStack = ChildStack::ZERO;
 static mut STACK_6: ChildStack = ChildStack::ZERO;
+static mut STACK_7: ChildStack = ChildStack::ZERO;
+static mut STACK_8: ChildStack = ChildStack::ZERO;
 
 /// IPC page of the case 3 child.
 static mut CHILD_IPC: IpcPage = IpcPage::ZERO;
@@ -75,7 +83,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     nonblocking_syscall_loop_faults(ctx)?;
     cleared_limit_never_fires(ctx)?;
     resume_restarts_count(ctx)?;
-    refuses_without_rights(ctx)
+    refuses_without_rights(ctx)?;
+    switched_out_fault_follows_thread(ctx)
 }
 
 /// Microseconds since boot.
@@ -307,9 +316,11 @@ fn resume_restarts_count(ctx: &TestContext) -> TestResult
     let t1 = now_us()?;
     reply_fault(ctx, FAULT_REPLY_RESUME)?;
     expect_run_limit_fault(ctx, ep)?;
-    let t2 = now_us()?;
-    if t2.saturating_sub(t1) < u64::from(LIMIT_FAULT) * 1000
+    let between = now_us()?.saturating_sub(t1);
+    // As in case 1, the first counted tick may come at once after the resume.
+    if between < u64::from(LIMIT_FAULT - 1) * 1000
     {
+        crate::log_u64("run_limit: case 6: us between the faults: ", between);
         return Err("run_limit: case 6: the second fault came before a full limit");
     }
     reply_fault(ctx, FAULT_REPLY_KILL)?;
@@ -343,6 +354,53 @@ fn refuses_without_rights(ctx: &TestContext) -> TestResult
         return Err("run_limit: case 7: a non-SchedControl cap was not refused");
     }
     Ok(())
+}
+
+fn switched_out_fault_follows_thread(ctx: &TestContext) -> TestResult
+{
+    // The competitor: no limit, the floor priority, CPU 0.
+    let mut rival =
+        crate::spawn::new_child(ctx).map_err(|_| "run_limit: case 8: new_child failed")?;
+    // SAFETY: `STACK_7` is a static stack reached only through `addr_of!`.
+    let rival_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_7)) };
+    // SAFETY: `STACK_7` is this case's own stack, used by no other live thread.
+    let started =
+        unsafe { crate::spawn::configure_and_start_pinned(&rival, spin_child, rival_top, 0, 0) };
+    if let Err(e) = started
+    {
+        rival.delete_thread().ok();
+        rival.delete_cspace().ok();
+        return Err(e);
+    }
+    let result = limited_beside(ctx);
+    reap(rival);
+    result
+}
+
+/// Case 8's limited child, beside the running competitor: no handler, so the
+/// fault ends it.
+fn limited_beside(ctx: &TestContext) -> TestResult
+{
+    let mut child =
+        crate::spawn::new_child(ctx).map_err(|_| "run_limit: case 8: new_child failed")?;
+    let started = thread_set_run_limit(child.th, ctx.sched_control_cap, LIMIT_FAULT)
+        .map_err(|_| "run_limit: case 8: thread_set_run_limit failed")
+        .and_then(|()| {
+            // SAFETY: `STACK_8` is a static stack reached only through
+            // `addr_of!`.
+            let top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_8)) };
+            // SAFETY: `STACK_8` is this case's own stack, used by no other
+            // live thread.
+            unsafe { crate::spawn::configure_and_start_pinned(&child, spin_child, top, 0, 0) }
+        });
+    let result = started.and_then(|()| expect_exit(&child, EXIT_RUN_LIMIT));
+    if result.is_err()
+    {
+        thread_stop(child.th).ok();
+    }
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
+    result.map_err(|_| "run_limit: case 8: the limited child beside a rival was not ended")
 }
 
 /// Spin in user mode, counting, with no syscall.

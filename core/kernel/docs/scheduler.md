@@ -1139,11 +1139,12 @@ which § Scheduling Classes lists as not implemented. The code is `sched::run_li
   ([scheduling-internals.md](scheduling-internals.md#return-work) § Return Work). The thread's next
   return to user mode on that CPU delivers it: at once when the tick interrupted user mode, and at
   the syscall's end when the tick landed in an interrupt-enabled window of a syscall. The tick's
-  slice decision is unchanged, so a switch at the slice's expiry, or a park in the syscall, can
-  take the thread off the CPU first; the bit's return is then another thread's, which finds no
-  fault of its own. A later tick that finds the thread current with the fault still pending posts
-  the bit again and counts nothing, so the fault is delivered within a tick of the thread's next
-  running. The fault is `FAULT_EXC_RUN_LIMIT`, delivered through the thread's exception binding
+  slice decision is unchanged, so a switch at the slice's expiry, a park in the syscall, or a stop
+  can take the thread off the CPU first; the bit's return is then another thread's, which finds no
+  fault of its own. The fault follows the thread as a pending upcall does: its next dispatch posts
+  `RUN_LIMIT` on the CPU it is dispatched to, so its first return to user mode there delivers it.
+  While the fault is pending the tick counts nothing. The fault is `FAULT_EXC_RUN_LIMIT`, delivered
+  through the thread's exception binding
   ([fault-handling.md](../../../docs/fault-handling.md#run-limit-faults) § Run-Limit Faults). A
   handler that resumes the thread gives it a fresh limit; with no handler bound, or a handler that
   declines it, the thread ends with `EXIT_RUN_LIMIT`.

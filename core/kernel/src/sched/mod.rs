@@ -7881,13 +7881,17 @@ unsafe fn mark_dispatched(
         (*tcb).wake_pending = false;
         (was_pending, (*tcb).thread_id)
     };
+    // A pending upcall or run-limit fault follows the thread to this CPU,
+    // one test of the two bits together.
     // SAFETY: tcb is a valid TCB whose sched_lock is held (contract).
     let upcall = unsafe { crate::ipc::upcall::return_work_of(tcb) };
-    if upcall != 0
+    // SAFETY: as for the read above.
+    let work = upcall | unsafe { run_limit::return_work_of(tcb) };
+    if work != 0
     {
         // SAFETY: this CPU's per-CPU pointer is installed and interrupts are
         // disabled (contract).
-        unsafe { crate::percpu::post_return_work(upcall) };
+        unsafe { crate::percpu::post_return_work(work) };
     }
     marked
 }

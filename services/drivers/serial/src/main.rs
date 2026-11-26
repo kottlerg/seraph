@@ -287,11 +287,11 @@ struct Shared
     /// transmitter, else 0; the transmitter signals each one set when it
     /// makes progress.
     waiting: [AtomicU64; SERVICE_THREADS],
-    /// The highest transmit-ring mark a write waits to see leave the UART
-    /// (`SERIAL_WRITE_SENT`): the transmitter looks for the
-    /// transmitter-empty status only while this is ahead of the drained
-    /// count.
-    drain_wanted: AtomicU64,
+    /// Each service thread's transmit-ring mark while its write waits to see
+    /// it leave the UART (`SERIAL_WRITE_SENT`), else 0. The transmitter
+    /// holds its loads at the lowest one ahead of the drained count
+    /// ([`ring::next_drain_mark`]).
+    drain_marks: [AtomicU64; SERVICE_THREADS],
     /// The client's RX notification, 0 until one is registered. Signalled
     /// under the lock, so a registration never deletes the cap between the
     /// read of the slot and the signal.
@@ -433,7 +433,7 @@ impl Transmitter
     }
 
     /// Load the transmit FIFO from the ring when LSR reports it empty. Once
-    /// every byte up to a waiting write's mark is loaded
+    /// every byte up to the lowest waiting write's mark is loaded
     /// ([`ring::hold_for_drain`]), load nothing more: wait the shift
     /// register's last character out ([`DRAIN_SPIN`]), settle the drained
     /// count once the transmitter is empty, and load again. A transmitter not
@@ -445,8 +445,7 @@ impl Transmitter
         {
             return;
         }
-        let wanted = self.shared.drain_wanted.load(Ordering::Acquire);
-        if !ring::hold_for_drain(TX_RING.sent(), TX_RING.drained(), wanted)
+        if !ring::hold_for_drain(TX_RING.sent(), TX_RING.drained(), self.next_drain_mark())
         {
             self.load_fifo();
             return;
@@ -476,11 +475,24 @@ impl Transmitter
         self.tx.take(self.load, |byte| uart.write(uart::DATA, byte));
     }
 
+    /// The lowest mark a write waits to see leave the UART that has not been
+    /// seen to, else 0.
+    fn next_drain_mark(&self) -> u64
+    {
+        ring::next_drain_mark(
+            self.shared
+                .drain_marks
+                .iter()
+                .map(|mark| mark.load(Ordering::Acquire)),
+            TX_RING.drained(),
+        )
+    }
+
     /// Whether a write waits for bytes to leave the UART that have not been
     /// seen to.
     fn draining(&self) -> bool
     {
-        self.shared.drain_wanted.load(Ordering::Acquire) > TX_RING.drained()
+        self.next_drain_mark() != 0
     }
 
     /// Whether the transmitter has work the UART's transmit side will end:
@@ -529,6 +541,8 @@ struct Server
     shared: &'static Shared,
     /// This thread's slot of [`Shared::waiting`].
     slot: &'static AtomicU64,
+    /// This thread's slot of [`Shared::drain_marks`].
+    drain_mark: &'static AtomicU64,
     /// This thread's notification, which the transmitter signals through
     /// [`Self::slot`].
     wake: u64,
@@ -596,6 +610,13 @@ impl Server
             {
                 if let Some(mark) = tx.push(bytes)
                 {
+                    // Published before a later write can append behind it,
+                    // so the transmitter holds at it however far the ring
+                    // moves on.
+                    if sent
+                    {
+                        self.drain_mark.store(mark, Ordering::Release);
+                    }
                     break mark;
                 }
                 self.kick();
@@ -613,9 +634,10 @@ impl Server
         {
             return serial_errors::SUCCESS;
         }
-        self.shared.drain_wanted.fetch_max(mark, Ordering::AcqRel);
         self.kick();
-        if self.wait_for(|| TX_RING.drained() >= mark)
+        let drained = self.wait_for(|| TX_RING.drained() >= mark);
+        self.drain_mark.store(0, Ordering::Release);
+        if drained
         {
             serial_errors::SUCCESS
         }
@@ -747,18 +769,23 @@ fn start_interrupt_driven(uart: Uart, irq: Irq, service_ep: u64) -> Option<Trans
         rx: Mutex::new(rx_consumer),
         transmitter,
         waiting: [const { AtomicU64::new(0) }; SERVICE_THREADS],
-        drain_wanted: AtomicU64::new(0),
+        drain_marks: [const { AtomicU64::new(0) }; SERVICE_THREADS],
         rx_notify: Mutex::new(0),
     }));
     let mut started = 0usize;
-    for slot in &shared.waiting
+    for (slot, drain_mark) in shared.waiting.iter().zip(&shared.drain_marks)
     {
         let Some(wake) = create_notification()
         else
         {
             break;
         };
-        let server = Server { shared, slot, wake };
+        let server = Server {
+            shared,
+            slot,
+            drain_mark,
+            wake,
+        };
         if std::thread::Builder::new()
             .spawn(move || {
                 server.run(service_ep);

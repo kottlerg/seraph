@@ -201,13 +201,28 @@ impl<const N: usize> Consumer<'_, N>
     }
 }
 
+/// The mark the consumer holds its takes at next ([`hold_for_drain`]): the
+/// lowest of the waiting writes' `marks` past `drained`, or 0 when none
+/// is. A mark of 0 is a slot with no waiting write, and is drained in any
+/// case.
+#[must_use]
+pub fn next_drain_mark(marks: impl IntoIterator<Item = u64>, drained: u64) -> u64
+{
+    marks
+        .into_iter()
+        .filter(|&mark| mark > drained)
+        .min()
+        .unwrap_or(0)
+}
+
 /// Whether the consumer holds its next take for a write that waits for its
-/// bytes to leave the transmitter: such a write waits (`wanted`, the highest
-/// waiting write's mark, is past `drained`) and every byte up to its mark is
-/// taken (`sent` has reached it). The consumer then waits for the UART's
-/// transmitter to empty and settles ([`Consumer::settle`]) before it takes
-/// more, so the write waits for the bytes ahead of its mark and the last take
-/// past it, however many bytes later writes append behind it.
+/// bytes to leave the transmitter: such a write waits (`wanted`, the lowest
+/// waiting mark ([`next_drain_mark`]), is past `drained`) and every byte
+/// up to its mark is taken (`sent` has reached it). The consumer then waits
+/// for the UART's transmitter to empty and settles ([`Consumer::settle`])
+/// before it takes more, so each waiting write waits for the bytes ahead of
+/// its mark and the rest of the take that reaches it, however many bytes
+/// later writes append behind it.
 #[must_use]
 pub const fn hold_for_drain(sent: u64, drained: u64, wanted: u64) -> bool
 {
@@ -253,10 +268,38 @@ mod tests
         assert!(!hold_for_drain(ring.sent(), ring.drained(), mark));
     }
 
+    // Defect caught: a hold only at the highest waiting mark, which keeps a
+    // write with a lower mark waiting for every byte up to the higher one.
+    #[test]
+    fn the_take_holds_at_each_waiting_mark_lowest_first()
+    {
+        let ring = Ring::<64>::new();
+        let (mut producer, mut consumer) = ring.split().unwrap();
+        let low = producer.push(&[b'a'; 6]).unwrap();
+        let high = producer.push(&[b'b'; 20]).unwrap();
+        let marks = [high, 0, low];
+        assert_eq!(next_drain_mark(marks, ring.drained()), low);
+        assert_eq!(taken(&mut consumer, 8).len(), 8);
+        let wanted = next_drain_mark(marks, ring.drained());
+        assert!(hold_for_drain(ring.sent(), ring.drained(), wanted));
+        consumer.settle();
+        // The low write is drained, with most of the high one still queued.
+        assert!(ring.drained() >= low && ring.drained() < high);
+        let wanted = next_drain_mark(marks, ring.drained());
+        assert_eq!(wanted, high);
+        assert!(!hold_for_drain(ring.sent(), ring.drained(), wanted));
+        assert_eq!(taken(&mut consumer, 32).len(), 18);
+        assert!(hold_for_drain(ring.sent(), ring.drained(), wanted));
+        consumer.settle();
+        assert_eq!(next_drain_mark(marks, ring.drained()), 0);
+    }
+
     #[test]
     fn no_hold_without_a_waiting_write()
     {
         assert!(!hold_for_drain(0, 0, 0));
+        assert_eq!(next_drain_mark([0, 0, 0], 0), 0);
+        assert_eq!(next_drain_mark([4, 9, 0], 4), 9);
         assert!(!hold_for_drain(30, 10, 10));
         assert!(!hold_for_drain(9, 0, 10));
         assert!(hold_for_drain(10, 0, 10));

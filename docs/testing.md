@@ -566,13 +566,15 @@ lines and fsbench's.
 CI's `bench` cell, one per architecture, takes both in the release profile from its architecture's
 release build job (`cargo xtask build --release --ktest-bench-only`) and boots them under QEMU's
 icount (`cargo xtask run --icount`): one guest clock tick per retired instruction while a vCPU runs.
-At one CPU the count of a window that does not idle is therefore the same in every run of one
-build, whatever the runner's load, unless the path's cost depends on the order in which earlier
-host-timed events (a device completion, the end of an idle) left the system's state, such as the
-order of a page cache's slots. At more than one CPU the vCPUs share the clock, so a window also
-counts the other vCPUs' instructions. While every vCPU idles, the guest's clock follows the host's
-time up to its next timer deadline (QEMU's `sleep=on`), so a device completion ends the idle as it
-would on hardware, and a window that idles counts host time. It boots each three times
+At one CPU the count of a window that does not idle, and that no interrupt or other thread enters,
+is therefore the same in every run of one build, whatever the runner's load, unless the path's cost
+depends on the order in which earlier host-timed events (a device completion, the end of an idle)
+left the system's state, such as the order of a page cache's slots. The timer tick's phase follows
+the end of each earlier idle, which is at host time, so the ticks a long window takes, and any
+switch they cause, can differ from run to run. At more than one CPU the vCPUs share the clock, so a
+window also counts the other vCPUs' instructions. While every vCPU idles, the guest's clock follows
+the host's time up to its next timer deadline (QEMU's `sleep=on`), so a device completion ends the
+idle as it would on hardware, and a window that idles counts host time. It boots each three times
 at one CPU and once at four, the ubench boots with a framebuffer (`--display framebuffer`) and their
 logs saved in `ubench/` beside the ktest boots', and one `cargo xtask bench-check --mode icount`
 over both sets compares each measurement's lowest p50 over the runs that reported its suite with its

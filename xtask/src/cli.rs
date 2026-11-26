@@ -410,8 +410,8 @@ args! {
         /// the active profile, as `<package>=<level>`, the level one of 0, 1,
         /// 2, 3, s or z. Comma-separated, e.g. `--opt-level shmem=3,framebuffer=3`.
         /// A package is any of the workspace, a library included: it applies
-        /// wherever the build compiles it. Refused for a package `--debug`
-        /// names, which sets its opt-level to 1.
+        /// wherever the build compiles it. Refused for a component `--debug`
+        /// names (`all` names every component), which sets its opt-level to 1.
         #[arg(long, value_name = "PKG=LEVEL", value_delimiter = ',', value_parser = parse_opt_level)]
         pub opt_level: Vec<OptLevelOverride>,
 

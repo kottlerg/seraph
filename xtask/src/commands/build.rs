@@ -1567,8 +1567,10 @@ fn check_opt_levels(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 /// Why the `--opt-level` overrides of `args` cannot be honoured, `known`
 /// telling the workspace's package names: an override of a package the
 /// workspace does not have, which Cargo would pass over with a warning; of a
-/// package `--debug` selects, which it builds at opt-level 1; or a second
-/// override of one package. `None` when every override can be.
+/// component `--debug` selects, which it builds at opt-level 1 (`--debug`
+/// sets the level of components alone, so `--debug all` leaves a library's
+/// to its override); or a second override of one package. `None` when every
+/// override can be.
 fn opt_level_refusal(args: &BuildArgs, known: impl Fn(&str) -> bool) -> Option<String>
 {
     for (i, o) in args.opt_level.iter().enumerate()
@@ -1581,7 +1583,8 @@ fn opt_level_refusal(args: &BuildArgs, known: impl Fn(&str) -> bool) -> Option<S
                 o.package
             ));
         }
-        if selects(&args.debug, &o.package)
+        let component = o.package == "boot" || spec_name(&o.package).is_some();
+        if component && selects(&args.debug, &o.package)
         {
             return Some(format!(
                 "{given}: --debug also names {}, and builds it at opt-level 1",
@@ -1728,7 +1731,8 @@ mod tests
     // `--debug` that sets the same package to opt-level 1, so the build's
     // level depends on the order of Cargo's `--config` flags; one of a
     // package the workspace lacks, which Cargo passes over with a warning; or
-    // two of one package.
+    // two of one package; or a library's override refused beside `--debug
+    // all`, which sets the level of components alone.
     #[test]
     fn an_opt_level_override_is_refused_where_the_build_cannot_honour_it()
     {
@@ -1749,8 +1753,9 @@ mod tests
             &[("framebuffer", "3")],
         );
         assert!(reason.is_some_and(|r| r.contains("--debug also names framebuffer")));
-        let reason = refused(vec![BuildComponent::All], &[("shmem", "3")]);
-        assert!(reason.is_some_and(|r| r.contains("--debug also names shmem")));
+        let reason = refused(vec![BuildComponent::All], &[("framebuffer", "3")]);
+        assert!(reason.is_some_and(|r| r.contains("--debug also names framebuffer")));
+        assert_eq!(refused(vec![BuildComponent::All], &[("shmem", "3")]), None);
         let reason = refused(vec![BuildComponent::Boot], &[("boot", "1")]);
         assert!(reason.is_some_and(|r| r.contains("--debug also names boot")));
         let reason = refused(Vec::new(), &[("shmem", "3"), ("shmem", "2")]);

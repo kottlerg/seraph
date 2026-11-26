@@ -347,13 +347,15 @@ A component `--debug` also names takes `--debug`.
 
 `cargo xtask build --opt-level <package>=<level>[,...]` builds the named workspace packages at
 another opt-level within the active profile
-([xtask/README.md](../xtask/README.md#cargo-xtask-build)); a package `--debug` also names is
+([xtask/README.md](../xtask/README.md#cargo-xtask-build)); a component `--debug` also names is
 refused, since `--debug` builds it at `opt-level = 1`. A package is any of the workspace, a
 library included, and the override reaches it wherever the build compiles it, in the `-Z
 build-std` crates too: an override of `shmem` changes every image that links the standard
 library, whose stdio pipe is `shmem`'s ring. Under `--release` the merged module of a binary is
-optimized again at that binary's level, so whether a library's override survives into an image is
-read with `cargo xtask compare-images`.
+optimized again at that binary's level, so a library's override may not survive into an image.
+`cargo xtask compare-images` builds each commit without `--opt-level`, so whether one survives is
+read by committing it as a `[profile.<p>.package."<pkg>"]` table in a scratch commit and
+comparing that commit with its parent, as the measurement below did.
 
 No package carries an override: the root `Cargo.toml` has no `[profile.<p>.package.<crate>]`
 table, and every package builds at the profiles' `opt-level = 2`. A package earns an override

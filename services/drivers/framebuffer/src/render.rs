@@ -19,12 +19,18 @@
 //! The renderer writes the framebuffer with plain stores, a whole pixel at a
 //! time, and fills runs of pixels in bulk. Framebuffer memory is memory to
 //! the CPU, not a device register: no read or write of it has a side
-//! effect, and the display scans out whatever it holds. This thread is its
-//! only writer, so ordering within one CPU is all the renderer needs. The
-//! compiler may merge stores, vectorise a fill, or drop a store that a later
-//! one overwrites before the call returns, and none of that changes the
-//! image the call leaves. `volatile` would forbid exactly those merges, and
-//! keep nothing correct here. Every pixel is a naturally aligned 32-bit word
+//! effect, and the display scans out whatever it holds. The driver's one
+//! thread is its only userspace writer, so ordering within one CPU is all the
+//! renderer needs; the kernel's retained renderer
+//! (`core/kernel/src/framebuffer.rs`, docs/console-model.md) may also draw
+//! into the same memory at any time, unsynchronised with the driver, and
+//! neither `volatile` nor plain stores order the two. The renderer reads
+//! nothing back but its scroll's own row copy, so a line the kernel draws is
+//! at worst overdrawn or scrolled as any other pixels are. The compiler may
+//! merge stores, vectorise a fill, or drop a store that a later one
+//! overwrites before the call returns, and none of that changes the image
+//! the call leaves. `volatile` would forbid exactly those merges, and keep
+//! nothing correct here. Every pixel is a naturally aligned 32-bit word
 //! (`new` refuses a geometry where it is not), written as one `u32`.
 
 use boot_protocol::{FramebufferInfo, PixelFormat};

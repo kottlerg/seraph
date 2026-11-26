@@ -2337,7 +2337,7 @@ fails as the search did, on any host. The run exits non-zero.
 
 **Time.** The gating run's time is a stated budget. Each target's run of the default count is
 capped at 20 minutes of wall-clock time (`DEFAULT_CAP_SECS`), about two and a half times the
-slowest target's run in the gating job (about 8 minutes, of a job of about 17); a target past the
+slowest target's run in the gating job (about 8 minutes, of a job of about 19); a target past the
 cap is stopped and fails the job, named as over the cap, and is a defect of the target or of its
 property, made faster before it merges: a property whose checks grow faster than the input,
 over inputs of up to the target's longest, is the usual cause. The job's `timeout-minutes` is the
@@ -2425,13 +2425,13 @@ memory of the run (the maximum resident set size of its largest process, as GNU 
 reports it), and the unwind bounds the harness carries. This run is owed whatever § Coverage
 tiers owes, since a harness change is inert there.
 
-**Measured time.** The whole set, 148 harnesses at `master` 3b95662c0, took 84 minutes in one
-`kani` job on CI's runner (run 45719550314), the harnesses' own verification times summing to 82
-minutes. Its slowest harness, devmgr-firmware's proof of the small AML resource descriptors, took
-29 minutes as one CBMC problem and is four harnesses, one per descriptor. The next slowest took
-235 s. The time limit of 10 minutes is about two and a half times that: room for a slower runner,
-and a harness past it costs the run no more than the limit. The `timeout-minutes` of 120 on each
-`kani` job holds the whole set with about 40 per cent to spare.
+**Measured time.** The whole set, 204 harnesses, took 86 minutes in one `kani` job on CI's runner
+(run 45738265526), the harnesses' own verification times summing to 82 minutes. The slowest,
+devmgr-firmware's proof of the AML IRQ descriptor with its flags byte, took 306 s, and the next
+slowest 234 s. The small AML descriptors are proved one per harness, since all four in one CBMC
+problem took 29 minutes. The time limit of 10 minutes is about twice the slowest harness: room
+for a slower runner, and a harness past it costs the run no more than the limit. The
+`timeout-minutes` of 120 on each `kani` job holds the whole set with about 40 per cent to spare.
 
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
 tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches

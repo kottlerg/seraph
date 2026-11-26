@@ -627,11 +627,13 @@ Usage: xtask kani [OPTIONS]
 
 Options:
       --component <CRATE>     Verify the harnesses of this crate only, by its package name (one that holds a harness)
-      --since <COMMIT>        Verify only the crates the change from the merge base of COMMIT and HEAD to the working tree can affect: each crate whose package, a package in its dependency closure, or a file one of them reads, the change touches; every crate when it touches an input of every build; and, when it selects no crate otherwise but touches `.github/workflows/kani.yml` or `build-test.yml`, the crate with the fewest harnesses
+      --since <COMMIT>        Verify only the crates the change from the merge base of COMMIT and HEAD to the working tree can affect: each crate whose package, a package in its dependency closure, or a file one of them reads, the change touches; every crate when it touches an input of every proof (an input of every build, this command's source, or `.github/workflows/kani.yml`); and, when it touches `.github/workflows/build-test.yml`, the crate with the fewest harnesses, whose jobs run whatever passes are stored
       --list                  Print the package of each crate the run would verify and exit, verifying nothing
       --harness <NAME>        Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it
       --shard <K/N>           Verify the K-th of N parts of the crate's harnesses: of Kani's list of them, sorted by path, every N-th from the K-th, so the N parts take each harness once
       --plan                  Print the jobs CI's matrix runs, one per crate the run would verify or per shard of a crate split into shards, and exit, verifying nothing
+      --skip-passed           With --plan, leave out each job whose pass a run of this repository stored (an artifact named by the job's key, read with gh), printing the run that proved it
+      --pass-record <DIR>     With --shard, when the harnesses judged are exactly the shard's and all passed, write the record of the job's pass to DIR, as the file CI stores it as: kani-pass-<key>.txt
       --github-output <FILE>  With --plan, append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): the matrix and whether it holds a job
       --pin                   Print the pinned Kani release and exit, verifying nothing
       --wait-host <SECS>      When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
@@ -644,11 +646,13 @@ Usage: xtask kani [OPTIONS]
 
 Options:
       --component <CRATE>     Verify the harnesses of this crate only, by its package name (one that holds a harness)
-      --since <COMMIT>        Verify only the crates the change from the merge base of COMMIT and HEAD to the working tree can affect: each crate whose package, a package in its dependency closure, or a file one of them reads, the change touches; every crate when it touches an input of every build; and, when it selects no crate otherwise but touches `.github/workflows/kani.yml` or `build-test.yml`, the crate with the fewest harnesses
+      --since <COMMIT>        Verify only the crates the change from the merge base of COMMIT and HEAD to the working tree can affect: each crate whose package, a package in its dependency closure, or a file one of them reads, the change touches; every crate when it touches an input of every proof (an input of every build, this command's source, or `.github/workflows/kani.yml`); and, when it touches `.github/workflows/build-test.yml`, the crate with the fewest harnesses, whose jobs run whatever passes are stored
       --list                  Print the package of each crate the run would verify and exit, verifying nothing
       --harness <NAME>        Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`), as Kani's `--harness` filter takes it
       --shard <K/N>           Verify the K-th of N parts of the crate's harnesses: of Kani's list of them, sorted by path, every N-th from the K-th, so the N parts take each harness once
       --plan                  Print the jobs CI's matrix runs, one per crate the run would verify or per shard of a crate split into shards, and exit, verifying nothing
+      --skip-passed           With --plan, leave out each job whose pass a run of this repository stored (an artifact named by the job's key, read with gh), printing the run that proved it
+      --pass-record <DIR>     With --shard, when the harnesses judged are exactly the shard's and all passed, write the record of the job's pass to DIR, as the file CI stores it as: kani-pass-<key>.txt
       --github-output <FILE>  With --plan, append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): the matrix and whether it holds a job
       --pin                   Print the pinned Kani release and exit, verifying nothing
       --wait-host <SECS>      When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal

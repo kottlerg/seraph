@@ -27031,7 +27031,7 @@ ok trust-request clear
 ok trust-request arch=["riscv64"] add=["s"] revoke=["00"] sign out=["f"]
 
 ["kani"]
-ok-all kani list=default plan=default pin=default host_override=default
+ok-all kani list=default plan=default skip_passed=default pin=default host_override=default
 
 ["kani","-h"]
 help xtask kani -h

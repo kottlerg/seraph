@@ -684,11 +684,13 @@ CPU; an asynchronous producer and consumer whose every handoff drains within a t
 there too, since the pull does not spread them either. Two unpinned threads that each wait on a
 thread of another CPU, such as the clients of two servers, can likewise come to share one CPU
 while another idles, and stay there while each wake keeps them there (the sticky preferred CPU of
-`select_target_cpu` stays within the threshold of the least-loaded CPU). Threads at an RT level do
-not stay so. An RT wake leaves a CPU that runs or queues a thread of its level or above for one of a
-lower rank, an idle CPU among them (§ Thread Assignment), unless a synchronous wake's guard keeps
-it by its waker. What the episode leaves
-is bounded by the threshold: a load above it is pulled at once, so a backlog the pull leaves to
+`select_target_cpu` stays within the threshold of the least-loaded CPU). Two threads of one RT
+level do not stay so: an RT wake leaves a CPU that runs or queues a thread of its level or above
+for one of a lower rank, an idle CPU among them (§ Thread Assignment), unless the save-window pin
+or a synchronous wake's guard keeps it there. An RT thread that outranks the thread it shares a CPU
+with does stay, since it runs there at once, and the lower thread waits behind it until it blocks
+or the idle pull takes the lower one. What the episode leaves is bounded by the threshold: a load
+above it is pulled at once, so a backlog the pull leaves to
 break and re-form is one at a load of at most `LOAD_BALANCE_IMBALANCE_THRESHOLD` (2), the
 running thread and one queued behind it. A call or a fault delivery places its receiver by its
 waker, and the reply of a `SYS_IPC_REPLY_RECV` to a `SYS_IPC_CALL` caller places the caller by
@@ -884,8 +886,8 @@ changes state under it costs one placement its tie-break, never correctness.
   that tie on the least key seen so far, and no more once a CPU of an idle core holds it. A fair
   thread's sticky preferred CPU is still taken first when its load is within the threshold, since
   the caches it holds outweigh the spread. An RT thread keeps its preferred CPU only when it runs
-  there at once. A synchronous wake's waker CPU, when its guard holds, comes before both, and a
-  hard affinity still wins.
+  there at once. The save-window pin and a synchronous wake's waker CPU, when its guard holds, come
+  before both, and a hard affinity still wins.
 - **Idle pull** (`try_pull_idle`, § Load Balancing): idle CPUs decide independently, each at
   its own tick, so the preference is a delay. An idle CPU that would pull from its confirmed
   candidate while one of its siblings is busy holds the candidate for one tick, once

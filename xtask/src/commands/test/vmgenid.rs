@@ -39,8 +39,8 @@ use crate::context::Context;
 use crate::guest::Guest;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    Firmware, GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
-    build_qemu_argv, validate_sysroot_for_launch,
+    Firmware, GdbMode, InterruptRemapping, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging,
+    X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qmp;
 use crate::socket_dir::SocketDir;
@@ -119,6 +119,7 @@ fn launch(
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,
+        interrupt_remapping: InterruptRemapping::for_sysroot(ctx),
         debug_port: None,
         test_devices: false,
         hotplug_port: None,

@@ -51,8 +51,8 @@ use crate::context::Context;
 use crate::disk::{DataDisk, DataPlacement, DiskLayout};
 use crate::guest::Guest;
 use crate::qemu::{
-    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, SecondDisk, SecondSlot, build_qemu_argv,
-    validate_sysroot_for_launch,
+    Firmware, GdbMode, InterruptRemapping, Iommu, QemuDisplay, QemuLaunchSpec, SecondDisk,
+    SecondSlot, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::util::{require_tool, step};
 
@@ -239,6 +239,7 @@ fn launch(
         x86_paging: args.x86_paging,
         x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
         iommu: Iommu::Attached,
+        interrupt_remapping: InterruptRemapping::for_sysroot(ctx),
         debug_port: None,
         test_devices: false,
         hotplug_port: None,

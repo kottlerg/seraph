@@ -44,8 +44,8 @@ use crate::debug_stub;
 use crate::disk::DiskLayout;
 use crate::guest::{QemuStderr, explain_exit};
 use crate::qemu::{
-    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
-    X86Paging, X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
+    Firmware, GdbMode, InterruptRemapping, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr,
+    SecondDisk, X86Paging, X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::Stub;
 use crate::socket_dir::SocketDir;
@@ -233,6 +233,7 @@ fn boot(ctx: &Context, args: &CaseArgs, gdb: &Path, layout: DiskLayout) -> Resul
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,
+        interrupt_remapping: InterruptRemapping::for_sysroot(ctx),
         debug_port: Some(port),
         test_devices: false,
         hotplug_port: None,

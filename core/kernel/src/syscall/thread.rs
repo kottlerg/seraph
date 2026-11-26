@@ -967,13 +967,13 @@ pub(crate) unsafe fn cancel_for_upcall(tcb: *mut crate::sched::thread::ThreadCon
 /// returns `WouldBlock`.
 ///
 /// `popped` and `park_seq` are the pop's snapshot of the park. Only that park
-/// is claimed: for a `SYS_IPC_RECV` or `SYS_WAIT_SET_WAIT` park, while
-/// `ipc_state` and `park_seq` still equal the snapshot; for a `SYS_IPC_CALL`,
-/// while the thread is still in the call's send or reply park of the same
-/// [`call_episode`], since the timeout bounds both. Nothing is claimed for a
-/// thread no longer `Blocked` in that park, or in a fault delivery (no fault
-/// park is timed). A lost claim leaves the episode to its claimant, which
-/// removed the entry or found it popped
+/// is claimed: for a `SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV` or
+/// `SYS_WAIT_SET_WAIT` park, while `ipc_state` and `park_seq` still equal the
+/// snapshot; for a `SYS_IPC_CALL`, while the thread is still in the call's send
+/// or reply park of the same [`call_episode`], since the timeout bounds both.
+/// Nothing is claimed for a thread no longer `Blocked` in that park, or in a
+/// fault delivery (no fault park is timed). A lost claim leaves the episode to
+/// its claimant, which removed the entry or found it popped
 /// (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants).
 ///
 /// [`PARK_DISPOSITION_TIMED_OUT`]: crate::sched::thread::PARK_DISPOSITION_TIMED_OUT

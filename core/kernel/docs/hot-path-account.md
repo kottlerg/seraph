@@ -68,7 +68,7 @@ the kernel:
 |---|---:|---:|---|
 | Entry and exit stubs | 70 | 150 | `syscall_entry`, `seraph_enter_from_user`; `trap_entry`, `trap_dispatch`, `handle_trap` |
 | Finding this CPU's thread and diagnostic record | 3 | 3 | `read_percpu_ptr` of `PerCpuData::current` and `PerCpuData::diag` |
-| Dispatch and result | 52 | 33 | `dispatch`, `dispatch_in_range`, `index_mask`, `mask_index`, `finish_syscall` |
+| Dispatch and result | 54 | 33 | `dispatch`, `dispatch_in_range`, `index_mask`, `mask_index`, `finish_syscall` |
 | Return-to-user work test | 4 | 4 | `leave_syscall`, `read_percpu_u32` of `PerCpuData::return_work` |
 | Diagnostic stamps | 4 | 2 | `stamp_syscall_entry` |
 | The handler | 15 | 18 | `sys_system_info`, `TrapFrame::arg` |
@@ -136,7 +136,7 @@ words, the one whose payload passes the register words, copies it in 180.
 The benchmark cell gates the release profile (opt-level 2, LTO, one codegen
 unit), for its ktest rows, ubench and fsbench alike, so one rule states what the cell measures:
 the build that runs on hardware. Dev (opt-level 2 with debug assertions and overflow checks,
-without LTO) adds 10 % to 61 % to a path on x86_64, unevenly, so a dev count does not predict
+without LTO) adds 5 % to 62 % to a path on x86_64, unevenly, so a dev count does not predict
 the release count and a cut ranked on dev is mis-ranked:
 
 | Path (x86_64) | Dev | Release | Dev / release |

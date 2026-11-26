@@ -1590,10 +1590,12 @@ or body):
   per-CPU allocation (`KERNEL_STACK_PAGES` for the idle stacks, and `TAG_STATE_BYTES`, the tag-state
   slab's element size);
 - CPU enumeration and bringup: in the bootloader, the MADT walk (`madt_cpu_ids`, and `madt_cpu_id`,
-  which reads each structure's CPU id), the device tree's (`for_each_cpu`, `cpu_count` and
-  `place_hart_ids`, and the CPU-node walk they run, `CpuWalk` and `record_cpu_prop`), the
-  placement both feed (`place_cpu_ids` and the per-CPU `record_cpu_id`), the sizing of the CPU-id
-  array (`cpu_id_capacity` and `allocate_cpu_ids`),
+  which reads each structure's CPU id, with the structure types and lengths it tests,
+  `madt_type::LAPIC`, `madt_type::LOCAL_X2APIC`, `madt_type::RINTC`, `madt_len::LAPIC`,
+  `madt_len::LOCAL_X2APIC`, and `madt_len::RINTC_ID`), the device tree's (`for_each_cpu`,
+  `cpu_count` and `place_hart_ids`, and the CPU-node walk they run, `CpuWalk`, its node state
+  `CpuState`, and `record_cpu_prop`), the placement both feed (`place_cpu_ids` and the per-CPU
+  `record_cpu_id`), the sizing of the CPU-id array (`cpu_id_capacity` and `allocate_cpu_ids`),
   `step5_discover_cpu_topology`, `CpuTopology`, `discover_boot_hart_id` and `bsp_hardware_id`
   (the source of the BSP id that becomes `cpu_ids[0]`), and the handoff of the count and the CPU
   ids into `BootInfo` (`cpus.count` and `cpus.ids_phys`); in the kernel, the boot CPU count and
@@ -1665,7 +1667,9 @@ S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadContr
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|VectorRow|CpuTopology"
 S="$S|SlotEntry|DeliveryGate|SyscallScratch|CoreSlot"
 S="$S|madt_cpu_ids|for_each_cpu|cpu_count|record_cpu_id|place_cpu_ids|place_hart_ids"
-S="$S|cpu_id_capacity|madt_cpu_id|CpuWalk|record_cpu_prop"
+S="$S|cpu_id_capacity|madt_cpu_id|CpuWalk|CpuState|record_cpu_prop"
+S="$S|madt_type::(LAPIC|LOCAL_X2APIC|RINTC)|madt_len::(LAPIC|LOCAL_X2APIC|RINTC_ID)"
+S="$S|const (LAPIC|LOCAL_X2APIC|RINTC): u8|const (LAPIC|LOCAL_X2APIC|RINTC_ID): usize"
 S="$S|allocate_cpu_ids|cpus\.count|cpus\.ids_phys|info\.cpu_count|boot_cpu_ids"
 S="$S|step5_discover_cpu_topology|start_ap|discover_boot_hart_id|bsp_hardware_id"
 S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"

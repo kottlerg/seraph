@@ -701,7 +701,7 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
         let elapsed_ms = timer.elapsed(super::timer::elapsed_us()) / 1_000;
         if elapsed_ms >= 5_000
         {
-            crate::kprintln!(
+            crate::kprintln_direct!(
                 "IPI WATCHDOG: target_cpu={} op={} elapsed_ms={} — never acked",
                 ctx.target_cpu,
                 ctx.op_name,

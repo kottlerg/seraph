@@ -26,7 +26,7 @@ use boot_protocol::{BootInfo, BootModule, MemoryMapEntry, MemoryType};
 use super::buddy::{BuddyAllocator, PAGE_SIZE};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::kprintln;
+use crate::{kprintln, kprintln_serial};
 
 /// Whether a memory-map entry of type `ty` is DRAM (`Usable`, `Loaded`,
 /// `AcpiReclaimable`, `Persistent`), as opposed to a `Reserved` window.
@@ -88,7 +88,7 @@ fn compute_dram_bounds(entries: &[boot_protocol::MemoryMapEntry]) -> (u64, u64)
 fn print_memory_line(idx: usize, start: u64, end: u64, ty: MemoryType)
 {
     let size_kib = end.saturating_sub(start) / 1024;
-    kprintln!(
+    kprintln_serial!(
         "  [{:3}]  {:#018x} - {:#018x}  {:8} KiB  {}",
         idx,
         start,
@@ -788,19 +788,23 @@ fn dtb_fatal(phys: u64, err: &DtbError) -> !
     {
         DtbError::HeaderPastSpan =>
         {
-            kprintln!("Phase 3: device tree at {phys:#x}: header past the direct map end {top:#x}");
+            kprintln_serial!(
+                "Phase 3: device tree at {phys:#x}: header past the direct map end {top:#x}"
+            );
         }
         DtbError::BadMagic(magic) =>
         {
-            kprintln!("Phase 3: device tree at {phys:#x}: bad FDT magic {magic:#010x}");
+            kprintln_serial!("Phase 3: device tree at {phys:#x}: bad FDT magic {magic:#010x}");
         }
         DtbError::TooSmall(size) =>
         {
-            kprintln!("Phase 3: device tree at {phys:#x}: totalsize {size} below the FDT header");
+            kprintln_serial!(
+                "Phase 3: device tree at {phys:#x}: totalsize {size} below the FDT header"
+            );
         }
         DtbError::PastSpan(size) =>
         {
-            kprintln!(
+            kprintln_serial!(
                 "Phase 3: device tree at {phys:#x}: totalsize {size:#x} runs past the direct \
                  map end {top:#x}"
             );

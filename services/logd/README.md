@@ -100,6 +100,15 @@ under its sender's name, the first after the restart included
   evicted slot is retired with its name and entries, a bounded number of them kept (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Retired slots).
 
+* **Kernel log reader.** From the handover's release on, and at each restart, a thread of logd
+  reads the kernel's console records and writes each as a `[<t>] [kernel] <text>` line through the
+  sinks. The lines are kept in the kernel's slot, badge `LOG_BADGE_KERNEL` (3), named `kernel`,
+  which `QUERY_SLOTS` and `QUERY_HISTORY` return like any sender's slot and which no eviction
+  takes. A sender that registers the name `kernel` is stored as `kernel_`
+  (`logd_codec::kernel::stored_name`). A gap in the record sequence is named in a warning line of
+  logd's (see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Kernel log and
+  [docs/console-model.md](../../docs/console-model.md) item 4).
+
 * **Query API.** `QUERY_SLOTS` reads the sender slots, live and retired,
   with each one's name and how it was evicted, and `QUERY_HISTORY` reads the
   history of every slot or of one badge, newest first, a reply's worth per
@@ -202,10 +211,10 @@ logd/
 
 ## Bootstrap caps
 
-svcmgr's bootstrap rounds (four slots fit a round, the last marked `done`) fill five positional
+svcmgr's bootstrap rounds (four slots fit a round, the last marked `done`) fill six positional
 slots, carrying only the present caps and a presence word naming the slot each fills (an absent slot
 reads as `0`), minted from the reserved log-sink sources svcmgr holds (master-log endpoint, procmgr
-`SEND|GRANT`, `devmgr.class.serial` and `devmgr.class.framebuffer` publications; see
+`SEND|GRANT`, `KernelLog`, `devmgr.class.serial` and `devmgr.class.framebuffer` publications; see
 [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md) and
 [`docs/ipc-interface.md`](docs/ipc-interface.md)):
 
@@ -216,6 +225,7 @@ reads as `0`), minted from the reserved log-sink sources svcmgr holds (master-lo
 | 2 | Badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | The `serial` class SEND, derived from the `devmgr.class.serial` publication (to resolve the serial driver via `QUERY_DEVICE`) |
 | 4 | The `framebuffer` class SEND, derived from the `devmgr.class.framebuffer` publication (to resolve the framebuffer driver via `QUERY_DEVICE`) |
+| 5 | A `KernelLog` cap carrying `Read`, derived with `RIGHTS_KLOG_READ` from the `KernelLog` source svcmgr holds (to read the kernel's console lines; see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Kernel log). Absent when svcmgr holds none |
 
 logd registers its death-EQ with procmgr before the handover pull and keeps
 the two class SENDs for its lifetime (see

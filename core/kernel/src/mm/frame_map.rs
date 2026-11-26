@@ -263,10 +263,14 @@ fn frames_of(phys: u64, len: u64) -> core::iter::StepBy<core::ops::Range<u64>>
     (phys & !OFFSET_MASK..phys.saturating_add(len)).step_by(PAGE_SIZE)
 }
 
+/// Report a count that was already zero. Kept out of line and cold: inlined,
+/// its console write would swell [`FrameMap::lower`], on every unmap's path.
 #[cfg(not(test))]
+#[cold]
+#[inline(never)]
 fn report_underflow(phys: u64)
 {
-    crate::kprintln!(
+    crate::kprintln_serial!(
         "FRAME MAP UNDERFLOW: frame 0x{:x} unmapped with no recorded mapping",
         phys
     );

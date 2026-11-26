@@ -28,8 +28,10 @@ pub struct EndpointState
     /// check reads without the lock.
     send_nonempty: AtomicU32,
 
-    /// Threads waiting to receive (servers blocked in SYS_IPC_RECV), FIFO.
-    recv: WaitQueue,
+    /// Threads waiting to receive (servers blocked in SYS_IPC_RECV): a
+    /// WaitQueue in arrival order whose parks are recorded in the parking
+    /// CPU's parked-receiver table (§ Wait Queues).
+    recv: RecvQueue,
 
     /// Wait-set back-pointer (null if not in any wait set) and this
     /// endpoint's member index in that set.
@@ -64,7 +66,8 @@ receiver is a non-empty receive queue, a waiting sender a non-empty send queue).
 
 Every blocked thread is linked into its object's queue through intrusive link fields in the TCB,
 used only while the thread is blocked on an IPC object (a blocked thread waits on one object, so
-one set of links suffices). No separate allocation. Threads are served in arrival order.
+one set of links suffices). No separate allocation. Threads are served in arrival order, except an
+endpoint's receivers (below).
 
 - Every IPC source keeps `ipc::WaitQueue`s (an endpoint two, `send` and `recv`; a notification,
   event queue, or wait set one): a circular doubly linked list through `tcb.ipc_wait_next` and
@@ -72,6 +75,40 @@ one set of links suffices). No separate allocation. Threads are served in arriva
   pointer-sized. Each queued TCB's `ipc_wait_queue` tag names the
   queue, so push, pop, removal of any waiter, and the membership test are O(1) and touch only the
   TCBs they link or unlink.
+- An endpoint's `recv` queue is a `RecvQueue` (`ipc/recv_park.rs`): a `WaitQueue` whose every park
+  is recorded in the parking CPU's parked-receiver table, `PerCpuData::recv_parked`.
+
+**Receiver order.** Callers on an endpoint's send queue are bound in arrival order. A call takes
+the receiver most recently parked on the endpoint from the caller's CPU when that CPU queues no
+thread but its idle thread and its table records one, and otherwise the longest-waiting receiver.
+The occupancy condition is the one under which the synchronous wake rule runs the receiver on the
+caller's CPU (scheduling-internals.md
+[§ Target CPU selection](scheduling-internals.md#target-cpu-selection-select_target_cpu)), so a
+receiver parked on the caller's CPU, or one hard-pinned there, is woken there with no wake IPI; a
+call from a CPU with other work queued keeps the arrival order. A fault delivery takes its handler
+through the same call path, and a receive binds callers in arrival order.
+
+**Parked-receiver table.** Each CPU's table holds `RECV_PARK_SLOTS` (4) slots, each a receive
+queue's address (compared, never dereferenced), the receiver last parked on it from this CPU, and
+the stamp of that park. A receiver's park (§ Receive Path, step 5a) records it in the slot naming
+the queue when one does, so the latest park on a CPU wins and an earlier receiver stays queued
+unrecorded; else in a slot holding no receiver; else in the slot recorded longest ago, whose
+receiver stays queued unrecorded. The TCB keeps the address of its slot's receiver word in
+`recv_park_slot`. Every removal from a receive queue (a call's take, a refused park's unlink, the
+`release_waiters` drain, a stop, an upcall or a timed receive's expiry through `cancel_park`, and
+the Thread dealloc unlink) clears that word by a compare-and-swap from the removed TCB to null,
+which leaves alone a slot a later park has since taken. `RecvQueue` is the only way to the inner
+queue, so no removal skips the clear, and a slot's receiver, read under the endpoint's lock, is a
+thread still parked on that queue. A lookup compares at most four queue words and loads one
+receiver word, and reads no TCB. A table with no record for the endpoint, full or not, leaves
+the call to the longest-waiting receiver: no call is refused for want of a slot.
+
+The table has no lock of its own, and its words are `Relaxed` atomics. A CPU records and looks up
+in its own table only, under the lock of the endpoint it parks on or calls, with interrupts off;
+a remover on any CPU clears a slot only under the lock of the endpoint it removes the receiver
+from, and only from that receiver to null. An access that decides an outcome therefore holds the
+lock of the endpoint the slot names, which orders it (scheduling-internals.md
+[§ Atomic Ordering Invariants](scheduling-internals.md#atomic-ordering-invariants)).
 
 **Release when no receiver is left.** `release_if_unreceivable` runs where a slot's reference is
 released after the slot was uncounted: `sys_cap_delete`, a revoke's `dealloc_revoked`
@@ -105,9 +142,11 @@ release returns with both queues empty.
    either queue)
 4. if the recv queue is non-empty:
    // Fast path: receiver is already waiting
-   a. recv_tcb = head of the endpoint's recv queue (dequeued); the dequeue
-      claims its receive, so a timed receive's sleep-list entry is removed
-      (cancel_timed_entry)
+   a. recv_tcb = the receiver the caller's CPU's parked-receiver table
+      records for this endpoint when that CPU queues no thread but its idle
+      thread, else the head of the recv queue (dequeued, its slot cleared:
+      § Wait Queues); the dequeue claims its receive, so a timed receive's
+      sleep-list entry is removed (cancel_timed_entry)
    b. Pin current_tcb for its eventual reply wake (wake_in_flight = 1),
       store a timed call's sleep_deadline, publish the caller binding (the
       server's reply capability): recv_tcb.reply_tcb = current_tcb (Release
@@ -226,9 +265,10 @@ no syscall on either side. Nothing is allocated on the path.
 
 5. else (no sender yet):
    // Slow path, all under the endpoint lock until step c
-   a. Append current_tcb to the endpoint's recv queue
+   a. Append current_tcb to the endpoint's recv queue and record the park in
+      this CPU's parked-receiver table (§ Wait Queues)
    b. commit_blocked_under_local_lock(current_tcb, BlockedOnRecv, ep); on a
-      refusal, unlink current_tcb from the recv queue, and stamp INTERRUPTED
+      refusal, unlink current_tcb from the recv queue (clearing its slot), and stamp INTERRUPTED
       if the refusal was a stop or a pending upcall (RefusedStop); on a
       commit of a bounded receive, arm its sleep-list entry (arm_timed_park)
    c. Release endpoint lock
@@ -1073,6 +1113,9 @@ authoritative for all cross-cutting concurrency rules touched by IPC.
 
 The capability-revocation deferred-cleanup pattern remains specified in
 [capability-internals.md](capability-internals.md).
+
+The per-CPU parked-receiver table (§ Wait Queues) adds no lock: its slots are atomics accessed
+under the endpoint lock that already serialises the receive queue.
 
 ### Cross-CPU Wakeup
 

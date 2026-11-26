@@ -12,13 +12,13 @@ first argument.
 
 | Mode | Argv | svctest phase |
 |---|---|---|
-| [`capexhaust`](#capexhaust) | `program-modes capexhaust` | `recv_wedge` |
+| [`capexhaust`](#capexhaust) | `program-modes capexhaust` | `recv_wedge`, `console_whole_lines` |
 | [`deadline`](#deadline) | `program-modes deadline`; `program-modes deadline idle` for its idle child | `deadline` |
 | [`demandpaged`](#demandpaged) | `program-modes demandpaged [oor\|ptdrain\|teardown]` | `demand_paging`, `demand_paging_segfault`, `demand_paging_pinned`, `demand_paging_pt_drain`, `demand_paging_teardown` |
 | [`narrow`](#narrow) | `program-modes narrow` | `procmgr_program_narrowing` |
 | [`pipefault`](#pipefault) | `program-modes pipefault` | `pipe_fault_eof` |
 | [`pipestress`](#pipestress) | `program-modes pipestress <token>`; `program-modes pipestress sink` | `pipestress` |
-| [`relrofault`](#relrofault) | `program-modes relrofault` | `relro_write` |
+| [`relrofault`](#relrofault) | `program-modes relrofault` | `relro_write`, `console_whole_lines` |
 | [`stackoverflow`](#stackoverflow) | `program-modes stackoverflow` | `stack_overflow` |
 | [`threadchurn`](#threadchurn) | `program-modes threadchurn` | `threadchurn` |
 | [`threadstack`](#threadstack) | `program-modes threadstack <mode>` | `threadstack` |

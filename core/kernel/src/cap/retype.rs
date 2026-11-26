@@ -460,7 +460,7 @@ unsafe fn try_pop_subpage(
     // `try_alloc_page_block`, never dereferencing the bad pointer.
     if !subpage_link_ok(head, memory.size)
     {
-        crate::kprintln!(
+        crate::kprintln_serial!(
             "RETYPE SUBPAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} bin={:?} head=0x{:x}",
             memory.base,
             memory.size,
@@ -477,7 +477,7 @@ unsafe fn try_pop_subpage(
     // link cannot be dereferenced by the next pop.
     if !subpage_link_ok(next, memory.size)
     {
-        crate::kprintln!(
+        crate::kprintln_serial!(
             "RETYPE SUBPAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} bin={:?} next=0x{:x}",
             memory.base,
             memory.size,
@@ -538,7 +538,7 @@ fn report_page_list_corrupt(memory: &MemoryObject, cur: u64, prev_end: u64)
 {
     if !PAGE_LIST_CORRUPT_REPORTED.swap(true, Ordering::Relaxed)
     {
-        crate::kprintln!(
+        crate::kprintln_serial!(
             "RETYPE PAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} cur=0x{:x} prev_end=0x{:x}",
             memory.base,
             memory.size,
@@ -1529,6 +1529,7 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
         | ObjectType::SchedControl
         | ObjectType::SbiControl
         | ObjectType::EntropyControl
+        | ObjectType::KernelLog
         | ObjectType::ArenaPage => None,
     }
 }

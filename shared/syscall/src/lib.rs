@@ -61,16 +61,17 @@ use syscall_abi::{
     SYS_ENDPOINT_IDENTIFY, SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM,
     SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV,
     SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE,
-    SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT,
-    SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
-    SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
-    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
-    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL,
-    SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
-    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK,
-    SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
-    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
-    SYS_WAIT_SET_WAIT, SyscallError, ipc_delivered_cap_count, ipc_delivered_data_count,
+    SYS_IRQ_SPLIT, SYS_KERNEL_LOG_BIND, SYS_KERNEL_LOG_READ, SYS_MEM_MAP, SYS_MEM_PROTECT,
+    SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_MERGE,
+    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
+    SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
+    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES,
+    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS,
+    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
+    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
+    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError, ipc_delivered_cap_count,
+    ipc_delivered_data_count,
 };
 
 pub use syscall_abi::{
@@ -81,23 +82,25 @@ pub use syscall_abi::{
     CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_PLACEMENT,
     CAP_TAG_ENDPOINT, CAP_TAG_MEMORY, CAP_TAG_NOTIFICATION, EXIT_FAULT_BASE, EXIT_KILLED,
     EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED, IRQ_MODE_ACTIVE_LOW, IRQ_MODE_LEVEL, IRQ_MODE_MASK,
-    MAP_EXECUTABLE, MAP_FROM_CAP, MAP_READ, MAP_WRITABLE, MAX_ENTROPY_CONTRIBUTE_LEN,
-    MAX_GETRANDOM_LEN, MAX_HARVEST_PAGES, MSG_REGS_DATA_MAX, RIGHTS_ALL, RIGHTS_AS_CONTROL,
-    RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_ALL, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE,
-    RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE, RIGHTS_ENTROPY_CONTRIBUTE, RIGHTS_EP_GRANT,
-    RIGHTS_EP_IDENTIFY, RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST,
-    RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE, RIGHTS_IRQ_MINT, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE,
-    RIGHTS_MEM_MAP, RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_PHYS, RIGHTS_MEM_RETYPE,
-    RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT,
-    RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET,
-    RIGHTS_SBI_SUSPEND, RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE,
-    RIGHTS_THREAD_UPCALL, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT, WAIT_TRY_ONCE,
+    KLOG_FLAG_TRUNCATED, KLOG_HEADER_BYTES, KLOG_LINE_MAX, KLOG_READ_MAX, KLOG_RECORD_MAX,
+    KLOG_STALL_MS, KernelLogRecord, KernelLogRecords, MAP_EXECUTABLE, MAP_FROM_CAP, MAP_READ,
+    MAP_WRITABLE, MAX_ENTROPY_CONTRIBUTE_LEN, MAX_GETRANDOM_LEN, MAX_HARVEST_PAGES,
+    MSG_REGS_DATA_MAX, RIGHTS_ALL, RIGHTS_AS_CONTROL, RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_ALL,
+    RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE,
+    RIGHTS_ENTROPY_CONTRIBUTE, RIGHTS_EP_GRANT, RIGHTS_EP_IDENTIFY, RIGHTS_EP_RECEIVE,
+    RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE,
+    RIGHTS_IRQ_MINT, RIGHTS_IRQ_NOTIFY, RIGHTS_KLOG_READ, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP,
+    RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_PHYS, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE,
+    RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE,
+    RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND,
+    RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL,
+    RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT, WAIT_TRY_ONCE,
 };
 pub use syscall_abi::{
     EXT_REGS_RISCV64_F0_OFFSET, EXT_REGS_RISCV64_FCSR_OFFSET, EXT_REGS_RISCV64_V0_OFFSET,
     EXT_REGS_RISCV64_VCSR_OFFSET, EXT_REGS_RISCV64_VL_OFFSET, EXT_REGS_RISCV64_VSTART_OFFSET,
     EXT_REGS_RISCV64_VTYPE_OFFSET, EXT_REGS_X86_64_XCR0, MAX_PAGE_RUNS, PAGE_RUN_EXECUTE,
-    PAGE_RUN_NO_COPY, PAGE_RUN_READ, PAGE_RUN_WRITE, PageRun,
+    PAGE_RUN_NO_COPY, PAGE_RUN_READ, PAGE_RUN_WRITE, PageRun, kernel_log_records,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -3588,6 +3591,113 @@ pub unsafe fn entropy_contribute_raw(
     // `buf`, and the caller's contract makes the span valid or one the kernel
     // refuses; the call changes no mapping, IPC page, or thread entry state.
     let ret = unsafe { syscall3(SYS_ENTROPY_CONTRIBUTE, entropy_cap, buf as u64, len as u64) };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+// ── Kernel log ───────────────────────────────────────────────────────────────
+
+/// Read kernel log records into `buf` and acknowledge the reader's progress
+/// (`SYS_KERNEL_LOG_READ`), through `klog_cap`, a `KernelLog` capability
+/// carrying `RIGHTS_KLOG_READ`.
+///
+/// `from_seq` is the first record wanted, or `0` for the one after the
+/// committed mark; `ack_seq` is the last record the reader has written or
+/// given up, which raises the committed mark. The call attaches the caller as
+/// the log's reader: from then on the kernel's routine lines are records
+/// rather than console output, until the reader stalls
+/// (`core/kernel/docs/kernel-log.md`).
+///
+/// Returns the bytes written: whole records, oldest first, which
+/// [`kernel_log_records`] walks. An empty `buf` only acknowledges. A record
+/// older than the ring holds is gone: the first sequence number returned can
+/// be past `from_seq`.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` if `klog_cap`
+/// names no `KernelLog` capability, `InsufficientRights` if it lacks
+/// `RIGHTS_KLOG_READ`, or `InvalidArgument` if `buf` is non-empty and
+/// shorter than `KLOG_RECORD_MAX` or longer than `KLOG_READ_MAX`.
+#[inline]
+pub fn kernel_log_read(
+    klog_cap: u64,
+    from_seq: u64,
+    ack_seq: u64,
+    buf: &mut [u8],
+) -> Result<usize, i64>
+{
+    // SAFETY: `buf` is a live, writable slice valid for `buf.len()` bytes.
+    unsafe { kernel_log_read_raw(klog_cap, from_seq, ack_seq, buf.as_mut_ptr(), buf.len()) }
+}
+
+/// Raw `SYS_KERNEL_LOG_READ`: the kernel writes up to `len` bytes through
+/// `buf`.
+///
+/// For harness tests of the kernel's own buffer validation, which must hand
+/// it a pointer no slice can name (a null or kernel-half address).
+/// Everything else uses [`kernel_log_read`].
+///
+/// # Safety
+/// The span `[buf, buf + len)` must be valid for `len` bytes of writes, or
+/// the kernel must refuse the call (see [`kernel_log_read`]; a span not
+/// wholly in the user half is refused with nothing written). The call is
+/// restartable (`core/kernel/docs/syscalls.md` § Restartable Syscalls).
+///
+/// # Errors
+/// As [`kernel_log_read`]; `InvalidAddress` also if `len > 0` and `buf` is
+/// null, the span is not wholly in the user half, or a fault on it is
+/// unhandled.
+#[inline]
+pub unsafe fn kernel_log_read_raw(
+    klog_cap: u64,
+    from_seq: u64,
+    ack_seq: u64,
+    buf: *mut u8,
+    len: usize,
+) -> Result<usize, i64>
+{
+    // SAFETY: syscall5 issues the raw syscall; the kernel writes only within
+    // the span the caller's contract makes valid or one it refuses, and the
+    // call changes no mapping, IPC page, or thread entry state.
+    let ret = unsafe {
+        syscall5(
+            SYS_KERNEL_LOG_READ,
+            klog_cap,
+            from_seq,
+            ack_seq,
+            buf as u64,
+            len as u64,
+        )
+    };
+    if ret < 0
+    {
+        Err(ret)
+    }
+    else
+    {
+        Ok(usize::try_from(ret).unwrap_or(0))
+    }
+}
+
+/// Name the notification the kernel signals with `bits` when it appends
+/// log records (`SYS_KERNEL_LOG_BIND`), through `klog_cap`, a `KernelLog`
+/// capability carrying `RIGHTS_KLOG_READ`; `ntf_cap` `0` unbinds.
+///
+/// The binding replaces any earlier one and holds no reference on the
+/// notification: deleting the notification's last capability ends it.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` if `klog_cap`
+/// names no `KernelLog` capability or a non-zero `ntf_cap` no Notification,
+/// `InsufficientRights` if either lacks its right (`RIGHTS_KLOG_READ`,
+/// `RIGHTS_NTF_NOTIFY`), or `InvalidArgument` for a Notification with
+/// `bits == 0`.
+#[inline]
+pub fn kernel_log_bind(klog_cap: u64, ntf_cap: u64, bits: u64) -> Result<(), i64>
+{
+    // SAFETY: syscall3 issues the raw syscall; it passes only capability
+    // handles and a bit mask, and changes no mapping, IPC page, or thread
+    // entry state.
+    let ret = unsafe { syscall3(SYS_KERNEL_LOG_BIND, klog_cap, ntf_cap, bits) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 

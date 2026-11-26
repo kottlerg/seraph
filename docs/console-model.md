@@ -25,24 +25,34 @@ direct console paths remain as fallbacks for the life of the system.
    geometry forward.
 
 2. **Kernel early console** — `core/kernel/src/console.rs` (plus
-   `core/kernel/src/framebuffer.rs`) owns `kprint!`/`kprintln!` and the panic
+   `core/kernel/src/framebuffer.rs`) owns the kernel's print macros and the panic
    path. It writes the UART directly and **retains** that direct access for the
-   life of the system: panics and pre-userspace diagnostics must not depend on
-   userspace IPC. The kernel framebuffer renderer is similarly **retained**: it carries the
-   mirrored `kprintln!` console, including the address-free header line of a fatal
-   `KERNEL EXCEPTION` dump, while the panic path itself is serial-only
-   (`console::panic_write_fmt`). The dump's kernel-address lines are serial-only.
+   life of the system: panics, the softlockup watchdog's reports and pre-userspace diagnostics
+   must not depend on userspace IPC. While a userspace reader is attached to the kernel log, the
+   kernel's address-free lines (`kprintln!`) and userspace-fault diagnostics
+   (`kprintln_fault!`) are records that reader writes on its console instead, so a kernel line
+   does not land inside one of the reader's; with no reader attached, or after one leaves a record
+   unread (neither read nor printed by a flush) for `KLOG_STALL_MS`, measured from the record's
+   append, the kernel writes them directly again, and before a failure report it writes the
+   records no reader has written
+   ([core/kernel/docs/kernel-log.md](../core/kernel/docs/kernel-log.md)). In a normally-composed
+   boot the reader is init-logd and then real-logd (items 3 and 4), which write each record as a
+   `[kernel]` line between whole userspace lines; in a ktest boot it is ktest. The kernel
+   framebuffer renderer is similarly **retained**: it carries the console lines the kernel writes
+   directly (`kprintln!` with no reader attached, and `kprintln_direct!`), including the
+   address-free header line of a fatal `KERNEL EXCEPTION` dump, while the panic path itself is
+   serial-only (`console::panic_write_fmt`). The dump's kernel-address lines are serial-only.
    The kernel never becomes a client of the userspace serial or framebuffer driver.
 
    A **serial-only class** of kernel output writes the UART but skips the
-   framebuffer: the spin-locking `kprintln_serial!` / `console::serial_write_fmt`
-   and the lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` /
-   `console::nmi_write_fmt` for the panic and NMI paths. It
+   framebuffer and is never a kernel log record: the spin-locking `kprintln_serial!` /
+   `console::print_serial` and the lock-bypassing `console::panic_write_fmt` and
+   `kprintln_nmi!` / `console::nmi_write_fmt` for the panic and NMI paths. It
    exists because `kprintln!` *mirrors* to the framebuffer, and although the
    kernel writes that framebuffer directly rather than as a driver client, the
    framebuffer memory is later handed to the userspace framebuffer driver — so
-   anything `kprintln!` draws can be read back by userspace. Which kernel output must use the
-   serial-only class is specified in
+   anything `kprintln!` draws can be read back by userspace, as can anything that is a kernel
+   log record. Which kernel output must use the serial-only class is specified in
    [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
    § Kernel console diagnostics.
 
@@ -62,7 +72,18 @@ direct console paths remain as fallbacks for the life of the system.
    has acknowledged the release, since the two writers share no lock and their lines would
    interleave on the UART byte by byte; init-logd writes its last line before that
    acknowledgement ([logd handover protocol](../services/logd/docs/handover-protocol.md)
-   § Startup ordering). The handover is unconditional: while devmgr serves no serial driver
+   § Startup ordering).
+
+   init-logd is also the kernel log's first reader. It binds a notification the kernel signals
+   when it appends a line, waits on it and the master log endpoint together, writes each record
+   to the UART as a `[<t>] [kernel] <text>` line between the senders' lines, stamped with the
+   record's own time, and keeps it in its history under the kernel's slot (`LOG_BADGE_KERNEL`).
+   It stops reading at real-logd's first `HANDOVER_PULL`, once it has written and acknowledged
+   what the kernel holds, so the history that pull drains holds every kernel line it wrote; the
+   kernel's later lines wait as records for real-logd (item 4). Before init-logd is spawned no
+   reader is attached, and the kernel writes its lines directly beside init's main thread's.
+
+   The handover is unconditional: while devmgr serves no serial driver
    (its start has not finished, or failed), real-logd's serial sink queues the lines after the
    handover, up to the sink's queue (`SINK_QUEUE_BYTES`), and counts those past it, and writes
    both once the driver comes up; if it never does, that output never reaches the UART
@@ -97,7 +118,17 @@ direct console paths remain as fallbacks for the life of the system.
    a stopped driver then costs every line up to that bound. The panic sink's direct calls are
    bounded the same way
    ([services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md#output-sinks)
-   § Output sinks). Outside the serial driver, UART hardware authority is held only
+   § Output sinks).
+
+   real-logd reads the kernel log from the release on, through the `KernelLog` capability svcmgr
+   gives it ([logd handover protocol](../services/logd/docs/handover-protocol.md) § Kernel log): a
+   thread of its own waits on a notification the kernel signals, writes each record through the
+   sinks as the kernel's `[kernel]` line, as a sender's line is written, and keeps it in the
+   kernel's slot, which every `logd.query` holder can read. A record is acknowledged on the
+   reader's next read once its line is written or its sink stalled, so a record a failure report
+   flushes is one no sink took.
+
+   Outside the serial driver, UART hardware authority is held only
    by init, whose init-logd thread uses it (on riscv64 until init-logd exits after the handover and
    deletes init's UART Mmio capability), and by devmgr, whose I/O-port and MMIO caps it carves the
    driver's cap from.
@@ -112,7 +143,9 @@ direct console paths remain as fallbacks for the life of the system.
    `STREAM_BYTES` call waits at the kernel endpoint for at most its bound (`LOG_CALL_TIMEOUT_MS`,
    then `LOG_CALL_UNANSWERED_TIMEOUT_MS` once one of the process's calls has gone unanswered, per
    [shared/log](../shared/log/README.md)), and a line no logd takes within it is dropped; the kernel
-   panic console remains the guaranteed output path for any fault in that window. svcmgr writes no
+   panic console remains the guaranteed output path for any fault in that window, and the
+   kernel's own lines wait as records only until one has gone unread for `KLOG_STALL_MS`, after
+   which the kernel writes them directly until the restarted logd reads again. svcmgr writes no
    line of logd's death before the respawn, so none of its own waits on those bounds (but for a
    first launch's death before its bootstrap request, which init-logd, still serving, receives),
    and procmgr
@@ -231,7 +264,12 @@ framebuffer) and init-logd's direct-UART path are fixed parts of the boot design
 drivers only within their windows, which end at the kernel handoff and the real-logd handover
 respectively; they carry output before the drivers are reachable. All of these paths share the
 hardware with the drivers — an accepted physical aliasing, since the drivers are the
-steady-state writers and the direct paths fire only in early boot and failure windows.
+steady-state writers and the direct paths fire only in early boot and failure windows. The
+kernel's routine lines are not among them while a reader is attached: init-logd and then
+real-logd write them as whole lines among the userspace lines (items 2 to 4), so a kernel line
+can still meet a userspace line on the UART only before init-logd attaches, in a failure window
+(a panic, a fatal exception, an NMI or watchdog report, and the flush before each), for the
+serial-only class, and while the reader is stalled.
 
 ## Test-harness output
 
@@ -266,6 +304,7 @@ surface prints the identical glyph set.
 ## Summarized By
 
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
+[Kernel Log](../core/kernel/docs/kernel-log.md),
 [Coding Standards](coding-standards.md),
 [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md),
 [services/drivers/serial/README.md](../services/drivers/serial/README.md),

@@ -70,6 +70,7 @@ mod frame_pool;
 mod framebuffer;
 mod init_info;
 mod integration;
+mod klog;
 mod latency;
 mod serial;
 mod spawn;
@@ -262,6 +263,13 @@ pub struct TestContext
     /// cap set on both architectures and named by its descriptor alone; zero
     /// when no descriptor names one. Tests of `SYS_ENTROPY_CONTRIBUTE` use it.
     pub entropy_control_cap: u64,
+
+    /// Root `KernelLog` cap (Read), kernel-minted in init's initial cap set
+    /// on both architectures and named by its descriptor alone; zero when no
+    /// descriptor names one. ktest reads the kernel log through it
+    /// (`klog`), and the tests of `SYS_KERNEL_LOG_READ` and
+    /// `SYS_KERNEL_LOG_BIND` use it.
+    pub kernel_log_cap: u64,
 
     /// VA of the read-only `InitInfo` page, as delivered in the entry
     /// register — the kernel's per-boot `choose_init_layout` draw (ASLR,
@@ -715,8 +723,16 @@ extern "C" fn run(info_ptr: u64) -> !
             .iter()
             .find(|d| d.cap_type == init_protocol::CapType::EntropyControl)
             .map_or(0, |d| d.slot),
+        kernel_log_cap: init_info::descriptors(info)
+            .iter()
+            .find(|d| d.cap_type == init_protocol::CapType::KernelLog)
+            .map_or(0, |d| d.slot),
         init_info_va: info_ptr,
     };
+
+    // From here the kernel's routine lines are records ktest writes before
+    // each of its own (`klog`).
+    klog::attach(ctx.kernel_log_cap);
 
     let config = cmdline::KtestConfig::BUILT;
 
@@ -874,11 +890,11 @@ impl core::fmt::Write for Line
 /// Write a `[S.NNNNNN] ` timestamp prefix to all output channels.
 ///
 /// Format matches the kernel console: `[S.NNNNNN] ` where S is whole seconds
-/// (variable width) and NNNNNN is zero-padded microseconds (6 digits).
-/// Source: `SYS_SYSTEM_INFO(ElapsedUs)` — microseconds since kernel timer init.
-fn write_timestamp()
+/// (variable width) and NNNNNN is zero-padded microseconds (6 digits). `us`
+/// is microseconds since kernel timer init: `SYS_SYSTEM_INFO(ElapsedUs)` for
+/// ktest's own line, the record's time for a kernel log record.
+fn write_timestamp(us: u64)
 {
-    let us = elapsed_us();
     let mut line = Line::new();
     // `Line` cuts rather than fails, so the write cannot fail.
     let _ = core::fmt::Write::write_fmt(
@@ -893,11 +909,12 @@ fn write_timestamp()
 ///
 /// Each line is prefixed with a `[S.NNNNNN] ` timestamp matching the kernel
 /// console format. Each channel is best-effort: no-op if its initialisation
-/// failed.
+/// failed. The kernel log's records are written first ([`klog::drain`]).
 #[inline]
 pub fn log(msg: &str)
 {
-    write_timestamp();
+    klog::drain();
+    write_timestamp(elapsed_us());
     serial::write_str(msg);
     serial::write_byte(b'\n');
     framebuffer::write_str(msg);
@@ -933,11 +950,29 @@ impl core::fmt::Write for Channels
 /// The line takes the timestamp prefix and the line end [`log`] gives it.
 pub fn log_with<R>(write: impl FnOnce(&mut dyn core::fmt::Write) -> R) -> R
 {
-    write_timestamp();
+    klog::drain();
+    write_timestamp(elapsed_us());
     let result = write(&mut Channels);
     serial::write_byte(b'\n');
     framebuffer::newline();
     result
+}
+
+/// Write the line `args` formats with the timestamp `us`, streamed to the
+/// output channels, and without draining the kernel log: the writer of
+/// [`klog::drain`] itself.
+pub fn log_line_at(us: u64, args: core::fmt::Arguments<'_>)
+{
+    write_timestamp(us);
+    let _ = core::fmt::Write::write_fmt(&mut Channels, args);
+    serial::write_byte(b'\n');
+    framebuffer::newline();
+}
+
+/// [`log_line_at`] with the current time.
+pub fn log_line_raw(args: core::fmt::Arguments<'_>)
+{
+    log_line_at(elapsed_us(), args);
 }
 
 /// Log a decimal `u64` value prefixed by a static string.
@@ -990,6 +1025,7 @@ fn wait_us(target_us: u64)
         {
             break;
         }
+        klog::drain();
         let _ = syscall::thread_sleep(1);
     }
 }

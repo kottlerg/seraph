@@ -114,6 +114,7 @@ mod entropy;
 mod framebuffer;
 mod ipc;
 pub mod irq;
+mod klog;
 mod mm;
 mod percpu;
 mod platform;
@@ -1708,6 +1709,7 @@ unsafe fn kernel_entry_post_rebase(
                         ipc_wait_next: None,
                         ipc_wait_prev: core::ptr::null_mut(),
                         ipc_wait_queue: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                        recv_park_slot: core::ptr::null(),
                         fault_handlers: [const {
                             core::sync::atomic::AtomicPtr::new(core::ptr::null_mut())
                         };
@@ -2133,7 +2135,7 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
 /// permanently. Never returns.
 pub(crate) fn fatal(msg: &str) -> !
 {
-    kprintln!("FATAL: {}", msg);
+    kprintln_direct!("FATAL: {}", msg);
     arch::current::cpu::halt_loop();
 }
 
@@ -2449,10 +2451,14 @@ unsafe fn backtrace_scan(stack_top: u64)
 fn panic(info: &PanicInfo) -> !
 {
     // Use panic_write_fmt (serial-only, lock-bypassing) instead of kprintln!.
-    // kprintln! goes through CONSOLE_LOCK; if the panic occurred inside
-    // console_write_fmt (or anywhere else that holds the lock), using kprintln!
-    // here would deadlock. panic_write_fmt force-stores the lock and writes
+    // kprintln! goes through the kernel log's lock and CONSOLE_LOCK; if the
+    // panic occurred inside a print (or anywhere else that holds either),
+    // using kprintln! here would deadlock. panic_write_fmt force-stores the lock and writes
     // directly to serial, which is always safe.
+    //
+    // The kernel log records no reader has acknowledged come first, read
+    // without the log's lock, so the lines before the panic precede it.
+    klog::flush(klog::FlushOut::Panic);
     if let Some(loc) = info.location()
     {
         // SAFETY: panic handler runs once per panic; panic_write_fmt bypasses

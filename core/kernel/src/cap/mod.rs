@@ -23,6 +23,8 @@
 //! - One [`CapTag::SbiControl`] cap on RISC-V (all sanctioned SBI rights)
 //! - One [`CapTag::EntropyControl`] cap (CONTRIBUTE), the authority to mix
 //!   bytes into the entropy pool
+//! - One [`CapTag::KernelLog`] cap (READ), the authority to read the kernel
+//!   log
 //!
 //! The populated `CSpace` is stored in [`ROOT_CSPACE`] until Phase 9 hands it
 //! to the init process. Boot module ELF images get their own full-rights, reclaimable
@@ -76,8 +78,8 @@ pub use object::{
 )]
 pub use slot::{
     AsRights, CSpaceId, CapKind, CapTag, CapabilitySlot, CsRights, EntropyRights, EpRights,
-    EqRights, IoPortRights, IrqRights, MemRights, MmioRights, NtfRights, Rights, SbiRights,
-    SchedRights, SlotId, ThreadRights, TypedRights, WsRights,
+    EqRights, IoPortRights, IrqRights, KlogRights, MemRights, MmioRights, NtfRights, Rights,
+    SbiRights, SchedRights, SlotId, ThreadRights, TypedRights, WsRights,
 };
 
 use boot_protocol::{BootInfo, MemoryMapEntry, MemoryType};
@@ -527,10 +529,10 @@ const fn init_info_pages(descriptors: usize, modules: usize) -> usize
 
 /// Descriptors Phases 7 and 8 write besides one per RAM extent, ACPI
 /// region, MMIO aperture, boot module and reclaim range: the console UART
-/// `Mmio` cap, the `SchedControl`, root `Interrupt` and `EntropyControl` caps,
-/// the RSDP and DTB `Memory` caps, the root `IoPort` or `SbiControl` cap, and
-/// two to spare.
-const FIXED_BOOT_DESCRIPTORS: usize = 9;
+/// `Mmio` cap, the `SchedControl`, root `Interrupt`, `EntropyControl` and
+/// `KernelLog` caps, the RSDP and DTB `Memory` caps, the root `IoPort` or
+/// `SbiControl` cap, and two to spare.
+const FIXED_BOOT_DESCRIPTORS: usize = 10;
 
 /// The most descriptors this boot's Phases 7 and 8 can write into the
 /// `InitInfo` block: one per drained RAM extent (at most `ram_extents`), per
@@ -649,7 +651,8 @@ const _: () = assert!(
         && core::mem::size_of::<object::IoPortObject>() <= BOOT_BODY_BYTES
         && core::mem::size_of::<object::SchedControlObject>() <= BOOT_BODY_BYTES
         && core::mem::size_of::<object::SbiControlObject>() <= BOOT_BODY_BYTES
-        && core::mem::size_of::<object::EntropyControlObject>() <= BOOT_BODY_BYTES,
+        && core::mem::size_of::<object::EntropyControlObject>() <= BOOT_BODY_BYTES
+        && core::mem::size_of::<object::KernelLogObject>() <= BOOT_BODY_BYTES,
     "a boot-minted body exceeds the size class the seed reserve budgets"
 );
 
@@ -674,7 +677,7 @@ const SEED_ALIGNMENT_SLACK_PAGES: u64 = 4;
 /// - the boot-minted capability bodies, at most [`boot_body_bound`] of
 ///   [`BOOT_BODY_BYTES`] each: one RAM `MemoryObject`
 ///   per coalesced drained extent, the `Mmio`, `Interrupt`, `IoPort`,
-///   `SchedControl`, `SbiControl` and `EntropyControl` roots, the
+///   `SchedControl`, `SbiControl`, `EntropyControl` and `KernelLog` roots, the
 ///   firmware-table, boot-module, init-segment, `InitInfo`/stack and reclaim
 ///   Memory caps;
 /// - [`SEED_ALIGNMENT_SLACK_PAGES`] (4).
@@ -719,7 +722,7 @@ fn seed_reserve_bytes() -> u64
 ///
 /// Phase 7 mints every initial cap identity (`MemoryObject` for every
 /// drained RAM extent, `Mmio` / `Interrupt` / `IoPort` /
-/// `SchedControl` / `SbiControl` / `EntropyControl` wrappers, plus
+/// `SchedControl` / `SbiControl` / `EntropyControl` / `KernelLog` wrappers, plus
 /// firmware-table and boot-module `MemoryObject`s, plus init's ELF-segment
 /// `MemoryObject`s, plus the seed-tail `MemoryObject` exposing the rest of the
 /// largest drained extent) from this seed via [`crate::cap::retype::boot_retype_body`].
@@ -2057,8 +2060,8 @@ fn complete_extent_descriptors(
 /// Core `CSpace` population logic, separated for testability.
 ///
 /// Creates one capability per usable memory region, one `Mmio`
-/// capability per MMIO aperture, one `SchedControl` and one `EntropyControl`
-/// capability (plus the arch-specific root `IoPort` on x86-64 and
+/// capability per MMIO aperture, one `SchedControl`, one `EntropyControl` and
+/// one `KernelLog` capability (plus the arch-specific root `IoPort` on x86-64 and
 /// `SbiControl` on RISC-V). Returns a [`CSpaceLayout`] describing the slot ranges and
 /// per-cap descriptors.
 #[expect(
@@ -2507,6 +2510,29 @@ fn populate_cspace(
         CapDescriptor {
             slot: u64::from(entropy_control_slot),
             cap_type: CapType::EntropyControl,
+            pad: [0; 7],
+            aux0: 0,
+            aux1: 0,
+        },
+    );
+
+    // One KernelLog capability, on every architecture: the authority to read
+    // the kernel log (`SYS_KERNEL_LOG_READ`, `SYS_KERNEL_LOG_BIND`). Init
+    // finds it by its descriptor; no `InitInfo` field names it.
+    let ptr = mint_phase7_body(object::KernelLogObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::KernelLog, seed_header_nn()),
+    });
+    let kernel_log_slot = insert_or_fatal(
+        cspace,
+        KlogRights::READ,
+        ptr,
+        "Phase 7: cannot allocate KernelLog capability",
+    );
+    push_descriptor(
+        &mut desc_count,
+        CapDescriptor {
+            slot: u64::from(kernel_log_slot),
+            cap_type: CapType::KernelLog,
             pad: [0; 7],
             aux0: 0,
             aux1: 0,
@@ -3305,7 +3331,7 @@ pub(crate) fn extend_slot_run_or_fatal(base: &mut u32, count: u32, slot: u32, ms
     {
         #[cfg(not(test))]
         {
-            crate::kprintln!(
+            crate::kprintln_direct!(
                 "{}: slot {} where the run expected {}",
                 msg,
                 slot,
@@ -3653,6 +3679,7 @@ mod tests
             crate::arch::current::HAS_IO_PORTS,
             crate::arch::current::HAS_SBI,
             true, // EntropyControl
+            true, // KernelLog
         ];
         let fixed_here = fixed.iter().filter(|&&f| f).count();
         assert_eq!(non_ram - counts.acpi_regions, fixed_here);
@@ -3693,6 +3720,37 @@ mod tests
         let slot = cspace.slot(d.slot as u32).expect("the descriptor's slot");
         assert_eq!(slot.tag, slot::CapTag::EntropyControl);
         assert_eq!(slot.rights, EntropyRights::CONTRIBUTE.erase());
+    }
+
+    // Defect caught: the `KernelLog` root minted without its descriptor,
+    // under another tag, or without READ, so init cannot find the one
+    // capability the kernel log's syscalls accept.
+    #[test]
+    fn phase_7_mints_one_read_kernel_log_cap_with_its_descriptor()
+    {
+        // SAFETY: as in the EntropyControl test above: the all-zero
+        // `BootInfo` is a valid value.
+        let info: BootInfo = unsafe { core::mem::zeroed() };
+        let mut cspace = CSpace::new(0);
+        let layout = populate_cspace(
+            &mut cspace,
+            0,
+            &[],
+            crate::platform::ValidatedApertures::empty(),
+            &info,
+        );
+        // SAFETY: `layout` is the one the `populate_cspace` above returned, on
+        // this test thread's own descriptor array.
+        let descs = unsafe { descriptors(&layout) };
+        let mut klog = descs
+            .iter()
+            .filter(|d| d.cap_type == init_protocol::CapType::KernelLog);
+        let d = klog.next().expect("a KernelLog descriptor");
+        assert!(klog.next().is_none(), "one KernelLog descriptor");
+        assert_eq!((d.aux0, d.aux1), (0, 0));
+        let slot = cspace.slot(d.slot as u32).expect("the descriptor's slot");
+        assert_eq!(slot.tag, slot::CapTag::KernelLog);
+        assert_eq!(slot.rights, KlogRights::READ.erase());
     }
 
     // ── split_around_span (reclaim scrub) ─────────────────────────────────────

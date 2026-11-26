@@ -56,7 +56,7 @@ pub fn init(paddr: u64)
     LAST_SEEN[0].store(lo, Ordering::Relaxed);
     LAST_SEEN[1].store(hi, Ordering::Relaxed);
     GUID_VA.store(va, Ordering::Release);
-    crate::kprintln!("entropy: vmgenid armed @ {paddr:#x}");
+    crate::kprintln_serial!("entropy: vmgenid armed @ {paddr:#x}");
 }
 
 /// The live GUID, or `None` when detection is disarmed.

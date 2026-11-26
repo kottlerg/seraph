@@ -86,7 +86,7 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    one `(name, thread_cap, observer)` round per init-bootstrapped substrate
    service (the observer is an address-space cap or a process handle), and a terminal round
    carrying the reserved log-sink sources
-   (master-log endpoint + procmgr `SEND|GRANT`) svcmgr keeps to launch and
+   (master-log endpoint + procmgr `SEND|GRANT` + `KernelLog`) svcmgr keeps to launch and
    supervise real-logd. Move init's own kernel objects to procmgr in the
    first `REGISTER_INIT_TEARDOWN` round, which binds
    [procmgr](../procmgr/README.md)'s death-EQ on both init threads (main +

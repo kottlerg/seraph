@@ -24,8 +24,8 @@ behalf — and referenced by capability. Holding a send capability to an endpoin
 a process to call the server; only the process holding the receive capability can accept
 calls on it.
 
-Endpoints are rendezvous points: they buffer no messages, only FIFO queues of blocked callers
-and blocked receivers.
+Endpoints are rendezvous points: they buffer no messages, only queues of blocked callers
+(served in arrival order) and blocked receivers.
 
 An endpoint counts the capabilities that carry its Receive right, in every CSpace; a wait-set
 membership and a fault-handler binding are not among them. Receive is derived only from a

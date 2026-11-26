@@ -10,6 +10,10 @@ On completion ktest emits the cross-harness marker
 [docs/testing.md](../../docs/testing.md). `cargo xtask run --runs`, which CI boots it with,
 passes the boot on that pass marker and on no other line.
 
+ktest holds the root `KernelLog` capability and is the kernel log's reader: it attaches at its start
+and writes the kernel's records, in the kernel's own line form, before each line of its own and in
+its waits ([core/kernel/docs/kernel-log.md](../kernel/docs/kernel-log.md) § Readers).
+
 ---
 
 ## Activating ktest
@@ -50,6 +54,7 @@ core/ktest/
     ├── tally.rs            # Failure tallies and receive-guard diagnostics for stress cells
     ├── latency.rs          # Interrupt-latency rig: a call probed by TLB shootdowns from
     │                       # another CPU
+    ├── klog.rs             # The kernel log reader: attach, drain and write the records
     ├── arch/               # Arch-dispatch surface (see Test structure)
     │   ├── mod.rs          # Selects the active arch module by target_arch
     │   ├── x86_64/         # x86-64 entry points, constants, I/O ports, COM1 serial,
@@ -134,6 +139,7 @@ respectively. Files are grouped by kernel subsystem, mirroring the kernel's own 
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, sole reference, type-specific fields); the `InitInfo` RAM Memory descriptors against their caps; the `Phys` gate on the physical base and on an address space's `Read` right |
 | `retype.rs` | Retype primitive: augmentation and donation spill, `CSpace` growth into the indirect and double-indirect directory regions by explicit placement, PT walk budget, kernel PT pool, and the page-pool latency cases: a TLB shootdown of a CPU deleting a pool of ten thousand donations, or seeding one large donation, is acknowledged within a bound while the call runs; and the machine-code stubs the address-space stop cases run, each written through a data mapping and then mapped executable, with `SYS_SYSTEM_INFO(InstructionCacheSyncs)` rising across that map (the instruction-fetch synchronisation of [docs/memory-model.md § Instruction-Fetch Coherence](../../docs/memory-model.md#instruction-fetch-coherence), which QEMU does not need to pass) |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, `SYS_ASPACE_QUERY`; `SYS_ASPACE_HARVEST`: the bitmap of a range reports exactly the pages touched since the last harvest (an unmapped page reads 0), a cap without `Map`, an unaligned or kernel-half range, and a count of 0 or past `MAX_HARVEST_PAGES` are refused, a bitmap the copy-out cannot write clears no accessed bit, and a kernel copy (`SYS_GETRANDOM`) into a page whose accessed bit a harvest cleared succeeds and sets it again |
+| `klog.rs` | `SYS_KERNEL_LOG_READ` / `SYS_KERNEL_LOG_BIND` refusals, fault lines as records, the bound notification's signal, binding replacement and clearing, the stall fallback |
 | `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` and an over-maximum length refused with `InvalidArgument`; `SYS_ENTROPY_CONTRIBUTE` (`entropy_contribute_then_draw`, `entropy_contribute_cap_refusals`, `entropy_contribute_arg_refusals`) |
 | `notification.rs` | `SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT` (blocking and `notification_wait_timeout`) |
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
@@ -216,6 +222,7 @@ concurrent notification and queue events.
 | `busy_cpu_placement.rs` | A worker on the last CPU, whose load floor-level spinners pinned there keep past the imbalance threshold, parks and is woken 32 times, each wake placed by least load, while a yielding spinner keeps CPU 0 busy with nothing queued: no wake lands on CPU 0, whose linked idle thread counts in its load ([core/kernel/docs/scheduler.md § Load Balancing](../kernel/docs/scheduler.md#load-balancing)), and, when a core holds neither CPU 0 nor the last CPU, none lands beside them (§ SMT Awareness); logs `ktest: busy_cpu_placement placed=..` (≥ 3 CPUs) |
 | `thread_placement.rs` | `SYS_CAP_INFO` `CAP_INFO_THREAD_PLACEMENT` refuses a non-Thread cap and an unknown view past `THREAD_PLACEMENT_SYNC_LOCAL` (`InvalidArgument`) and reads the calling thread's CPU below the CPU count; a child pinned to CPU 1 parked in an `ipc_call` and replied to by the harness on CPU 0 counts one remote wake, no wake move and no pull, at most one idle wake, and reads CPU 1 ([core/kernel/docs/scheduler.md § Placement Counters](../kernel/docs/scheduler.md#placement-counters)) (remote-wake check needs ≥ 2 CPUs) |
 | `sync_ipc_placement.rs` | A call that finds its server parked places the server on the caller's CPU K when K queues no thread but its idle thread and the server does not outrank the caller, and leaves it to the other rules otherwise ([core/kernel/docs/scheduler.md § Thread Assignment](../kernel/docs/scheduler.md#thread-assignment)): the harness on CPU 0 starts a caller pinned to K = 2 and an unpinned server last run on CPU 1, and over 8 round trips per case the server reads its own `CAP_INFO_THREAD_PLACEMENT` counts around each receive. Every round whose wake reached the rule is judged: it is placed on K and runs there (unless pulled) for two fair threads and for two RT threads of one level; it is not placed on K with a fair spinner pinned to K queued behind the caller (fair and RT pairs) or with an RT server called by a fair caller. No round of those cases runs on K unless a pull moved the server there, and a case the rule allows fails with no round counted (needs ≥ 3 CPUs and `SchedControl`) |
+| `ipc_receiver_order.rs` | A call takes the receiver its CPU's four-slot parked-receiver table records for the endpoint when that CPU queues no thread but its idle thread, and the longest-waiting receiver otherwise, and never fails for a full table or a missing record ([core/kernel/docs/ipc-internals.md § Wait Queues](../kernel/docs/ipc-internals.md#wait-queues)): the harness on CPU 0 waits for one caller report per phase and checks the receiver id each reply recorded. `pinned_pool`: one pinned receiver per CPU 0 to 3 on one endpoint, four calls from each of CPUs 3, 2, 1 and 0 reach that CPU's receiver, which replies on it, and no receiver counts a remote wake. `unpinned_pool`: receivers parked from CPUs 2, 1 and 2 are reached from CPUs 1, 2 and 3 in the order U1, U3 (the later park from CPU 2), U2 (the queue head). `fifo_fallback`: four calls from CPU 2 reach its receiver, one from CPU 3 the queue head, and a call from CPU 2 while its receiver holds a reply reaches the head. `full_table`: with CPU 3's table filled by four other endpoints, a call from CPU 3 reaches the head, never a refusal, then the evicted receiver. `stress`: a receiver parked on CPU 1 is removed by thread deletion, endpoint destruction or an expired timed receive (3 rounds each), and a call from CPU 1 then reaches the receiver parked on CPU 2 (needs 4 CPUs and `SchedControl`) |
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
 | `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
 | `cross_cspace_revoke_no_alias.rs` | A cross-`CSpace` `cap_revoke` does not let a recipient's stale handle alias a recycled slot (#349) |
@@ -668,6 +675,7 @@ before recompiling is how a narrower-scope run is produced.
 | [core/kernel/docs/thread-lifecycle-and-sleep.md](../kernel/docs/thread-lifecycle-and-sleep.md) | The stop protocol and park semantics the stop and sleep stress cells race |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics and the receive-failure policy the cells' `RecvGuard`s follow |
 | [docs/fault-handling.md](../../docs/fault-handling.md) | The pager protocol the fault integration tests and `stop_fault_sender` drive |
+| [core/kernel/docs/kernel-log.md](../kernel/docs/kernel-log.md) | The kernel log ring and the reader protocol ktest follows (§ Readers) |
 | [docs/console-model.md](../../docs/console-model.md) | ktest's direct serial and framebuffer output across boot |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety, and testing rules |
 

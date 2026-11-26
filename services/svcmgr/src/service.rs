@@ -297,6 +297,9 @@ pub struct SvcmgrCaps
     /// and a `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND|GRANT`
     /// cap per launch. Zero if absent.
     pub procmgr_death_auth_source: u64,
+    /// `KernelLog` source carrying `Read`. svcmgr derives real-logd's copy
+    /// from it on every (re)launch, and never publishes it. Zero if absent.
+    pub kernel_log_source: u64,
 }
 
 /// Acquire svcmgr's initial cap set and substrate registrations from its
@@ -349,6 +352,7 @@ pub fn bootstrap_caps(
                             memmgr_swap: c.memmgr_swap,
                             master_log_source: 0,
                             procmgr_death_auth_source: 0,
+                            kernel_log_source: 0,
                         });
                     }
                     Err(DecodeError::VersionMismatch) =>
@@ -380,6 +384,7 @@ pub fn bootstrap_caps(
                     {
                         c.master_log_source = sources.master_log_source;
                         c.procmgr_death_auth_source = sources.procmgr_death_auth_source;
+                        c.kernel_log_source = sources.kernel_log_source;
                     }
                     (_, decoded) =>
                     {

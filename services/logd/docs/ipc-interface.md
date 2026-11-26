@@ -17,7 +17,7 @@ once during its own startup; see that document for the wire format.
 ## Bootstrap caps
 
 svcmgr launches and supervises real-logd, minting its bootstrap round —
-rounds for its five positional slots, the last `done = true`, of which only the present
+rounds for its six positional slots, the last `done = true`, of which only the present
 caps ride, named by a presence word (an absent slot reads as `0`) — from the reserved
 log-sink sources init endows it and the `devmgr.class.*` publications (see
 [`services/svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md)).
@@ -30,6 +30,7 @@ The shape mirrors the README's "Bootstrap caps" table:
 | 2 | badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | the `serial` class `SEND`, derived from the `devmgr.class.serial` publication (resolves the serial driver via `QUERY_DEVICE`) |
 | 4 | the `framebuffer` class `SEND`, derived from the `devmgr.class.framebuffer` publication (resolves the framebuffer driver via `QUERY_DEVICE`) |
+| 5 | a `KernelLog` cap carrying `Read`, derived with `RIGHTS_KLOG_READ` from the `KernelLog` source svcmgr holds (reads the kernel's console lines; [`handover-protocol.md`](handover-protocol.md) § Kernel log); absent when svcmgr holds none |
 
 Every (re)launch mints `cap[0]` fresh from svcmgr's persistent master-log
 source, so a restarted logd re-attaches its RECV to the same endpoint
@@ -44,7 +45,8 @@ logd keeps `cap[0]`, the procmgr `cap[2]` (retained after `REGISTER_DEATH_EQ`), 
 `cap[3]` and `cap[4]` for its lifetime, using `cap[3]` to register a `WATCH_CLASS` watch and resolve
 the serial driver's write endpoint and, when a framebuffer driver is present, `cap[4]` the
 framebuffer driver's, on its main thread, which resolves a driver again only when devmgr signals
-that class's watch; `cap[1]` is deleted after the handover release.
+that class's watch; `cap[1]` is deleted after the handover release. logd keeps `cap[5]` for its
+lifetime and reads the kernel log through it.
 
 ## Endpoint
 
@@ -239,6 +241,11 @@ two processes intentionally pick the same string. logd allows
 that.
 
 Reply: `label = 0`. Sender unblocks.
+
+The name `kernel` belongs to the kernel's slot (`LOG_BADGE_KERNEL`, 3;
+[`handover-protocol.md`](handover-protocol.md) § Kernel log): a sender that registers it is stored
+as `kernel_` (`logd_codec::kernel::stored_name`), as init-logd stores it. `QUERY_SLOTS` and
+`QUERY_HISTORY` return the kernel's slot like any sender's, and no eviction takes it.
 
 A sender registers its name once, at startup, but logd's table can lose it: a
 restarted logd serves a fresh table ([`handover-protocol.md`](handover-protocol.md),

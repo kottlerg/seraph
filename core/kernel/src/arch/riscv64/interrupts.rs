@@ -370,7 +370,7 @@ static OVERFLOW_CLAIMED: core::sync::atomic::AtomicU32 = core::sync::atomic::Ato
 #[cfg(not(test))]
 extern "C" fn kernel_stack_overflow(sepc: u64, stval: u64, sp: u64, floor: u64) -> !
 {
-    crate::kprintln!("KERNEL STACK OVERFLOW: cpu={}", super::cpu::current_cpu());
+    crate::kprintln_direct!("KERNEL STACK OVERFLOW: cpu={}", super::cpu::current_cpu());
     // Kernel addresses; `fatal` halts: serial only
     // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
     // diagnostics).
@@ -555,7 +555,7 @@ fn handle_trap(frame: *mut TrapFrame)
                 // `fatal` halts only this hart: serial only
                 // (core/kernel/docs/cross-boundary-disclosure.md § Kernel
                 // console diagnostics).
-                crate::kprintln!("unknown interrupt: scause={:#x}", scause);
+                crate::kprintln_direct!("unknown interrupt: scause={:#x}", scause);
                 crate::kprintln_serial!("  sepc={:#x}", sepc);
                 crate::fatal("unhandled interrupt");
             }
@@ -673,7 +673,7 @@ fn handle_trap(frame: *mut TrapFrame)
         // `fatal` halts only this hart: serial only
         // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
         // diagnostics).
-        crate::kprintln!(
+        crate::kprintln_direct!(
             "BUG: ecall return sepc in kernel range on cpu {}",
             super::cpu::current_cpu()
         );
@@ -764,7 +764,7 @@ unsafe fn terminate_faulted_thread(
 
     // The hart printing, re-read: a declined delivery blocked above and
     // may have resumed this thread on another hart than the trap's.
-    crate::kprintln_serial!(
+    crate::kprintln_fault!(
         "USERSPACE FAULT: tid={} cpu={} cause={} (scause={:#x})",
         tid,
         super::cpu::current_cpu(),
@@ -775,8 +775,8 @@ unsafe fn terminate_faulted_thread(
     // dump, none of which can block; a declined fault delivery that
     // blocked has already returned.
     let live = unsafe { &*frame };
-    crate::kprintln_serial!("  sepc={:#018x}  stval={:#018x}", live.sepc, live.stval);
-    dump_riscv_regs(live);
+    crate::kprintln_fault!("  sepc={:#018x}  stval={:#018x}", live.sepc, live.stval);
+    dump_riscv_regs(live, crate::klog::print_fault);
 
     if !tcb.is_null()
     {
@@ -941,7 +941,7 @@ unsafe fn kernel_exception(
         return;
     }
 
-    crate::kprintln!(
+    crate::kprintln_direct!(
         "KERNEL EXCEPTION: cpu={} cause={} (scause={:#x})",
         cpu,
         riscv_exception_name(cause_code),
@@ -952,9 +952,9 @@ unsafe fn kernel_exception(
     // serial only (core/kernel/docs/cross-boundary-disclosure.md
     // § Kernel console diagnostics).
     crate::kprintln_serial!("  sepc={:#x}  stval={:#x}", live.sepc, live.stval);
-    crate::kprintln!("  sstatus={:#x}", sstatus_val);
+    crate::kprintln_direct!("  sstatus={:#x}", sstatus_val);
     crate::kprintln_serial!("  satp={:#x}", satp_val);
-    dump_riscv_regs(live);
+    dump_riscv_regs(live, crate::console::print_serial);
     crate::fatal("unhandled kernel exception");
 }
 
@@ -1735,7 +1735,7 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
         let elapsed_ms = timer.elapsed(super::timer::elapsed_us()) / 1_000;
         if elapsed_ms >= 5_000
         {
-            crate::kprintln!(
+            crate::kprintln_direct!(
                 "IPI WATCHDOG: target_cpu={} op={} elapsed_ms={} — never acked",
                 ctx.target_cpu,
                 ctx.op_name,
@@ -1807,13 +1807,16 @@ fn riscv_exception_name(cause: u64) -> &'static str
     }
 }
 
-/// Dump all general-purpose registers from a RISC-V trap frame (serial only:
-/// the registers of a kernel trap can hold kernel VAs).
-fn dump_riscv_regs(f: &super::trap_frame::TrapFrame)
+/// Dump all general-purpose registers from a RISC-V trap frame through
+/// `print`: `console::print_serial` for a kernel trap, whose registers can hold
+/// kernel VAs, and `klog::print_fault` for a user-mode trap, whose registers
+/// are the thread's own (core/kernel/docs/cross-boundary-disclosure.md
+/// § Kernel console diagnostics).
+fn dump_riscv_regs(f: &super::trap_frame::TrapFrame, print: fn(core::fmt::Arguments))
 {
     macro_rules! out {
         ($($arg:tt)*) => {
-            crate::kprintln_serial!($($arg)*)
+            print(format_args!($($arg)*))
         };
     }
     out!(

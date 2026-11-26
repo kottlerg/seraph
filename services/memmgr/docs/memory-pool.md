@@ -81,17 +81,20 @@ constant: no run is turned away for want of a slot, short of the arena being
 unable to grow with its reserve spent. The pool keeps running totals of its
 free pages and runs. Selection reads the size classes, never the whole pool:
 
-- **Size-class fit.** A run covering at least `N` pages from the smallest
-  size class that holds one serves a `REQUIRE_CONTIGUOUS` request and the
-  single-run case of best-effort allocation: the first run of `N`'s own
-  class when it covers `N`, else the first run of the lowest non-empty class
-  above it, which the bitmaps find and every run of which covers `N`. The
-  steps are the same however many runs the pool holds and in whatever order
-  they came back, so a grant's cost does not follow the history of the pool's
-  frees. Below 16 pages the fit is exact, and above it the run taken is
-  within one class width (an eighth of its power of two) of the smallest
-  covering run. Only when no class above `N`'s holds a run is `N`'s own
-  class walked for a covering run, so a request a run covers never fails.
+- **Size-class fit.** A run covering at least `N` pages serves a
+  `REQUIRE_CONTIGUOUS` request and the single-run case of best-effort
+  allocation: the first run of `N`'s own class when it covers `N`, else the
+  first run of the lowest non-empty class above it, which the bitmaps find
+  and every run of which covers `N`, even when a run behind the first of
+  `N`'s class would cover `N` too. The steps are the same however many runs
+  the pool holds and in whatever order they came back, so a grant's cost
+  does not follow the history of the pool's frees. Below 16 pages every run
+  of `N`'s class has `N` pages, so the fit is exact. Above it, the first run
+  of `N`'s class exceeds `N` by less than one class width (an eighth of its
+  power of two), and a run from a class above by less than the width of that
+  class plus its distance from `N`. Only when no class above `N`'s holds a
+  run is `N`'s own class walked for a covering run, so a request a run
+  covers never fails.
 - **Largest run.** Best-effort allocation falls back to repeatedly taking the
   largest run when no single run is large enough, and a demand fault to
   taking it once, whole (see [Demand faults](#demand-faults)): the largest run
@@ -129,12 +132,12 @@ node outside the reserve, or than none, fails with the out-of-memory code of its
 run leaves the pool. An admitted request then selects:
 
 1. **`REQUIRE_CONTIGUOUS` set.** Select a run that covers `want_pages`
-   from the smallest size class that holds one (§ Free-Pool Data
-   Structure). On hit: detach the run, split off exactly `want_pages` via
-   `memory_split` if the run is larger than requested, return one Memory
-   cap. On miss, or if the split fails: return `OUT_OF_MEMORY_CONTIGUOUS`.
-   memmgr does not migrate live pages to produce a contiguous run;
-   coalescing is the only mechanism that restores contiguity.
+   by the size-class fit (§ Free-Pool Data Structure). On hit: detach
+   the run, split off exactly `want_pages` via `memory_split` if the run
+   is larger than requested, return one Memory cap. On miss, or if the
+   split fails: return `OUT_OF_MEMORY_CONTIGUOUS`. memmgr does not
+   migrate live pages to produce a contiguous run; coalescing is the
+   only mechanism that restores contiguity.
 2. **Best-effort.** First try a single run that covers `want_pages`
    whole, chosen as for `REQUIRE_CONTIGUOUS`. One run is the fewest possible
    caps, and the size-class fit reuses a freed run of the requested size
@@ -1120,8 +1123,8 @@ read-only into its own address space, at a span of its object zone that holds th
 their order, and records each page's address there in the frame's descriptor. The object zone is 64
 GiB of memmgr's address space just below the lowest bootstrap window `shared/process-layout` draws,
 so it exists under every paging mode, Sv39 included ([Metadata Arena](#metadata-arena)). Its spans
-come from a free pool of their own, which takes a span from the smallest size class that holds an
-object's pages and merges a span given back with its free neighbours. A seal that finds no span is
+come from a free pool of their own, which takes a span that holds an object's pages by the same
+size-class fit and merges a span given back with its free neighbours. A seal that finds no span is
 refused with `QUOTA`, and one whose map fails with `OUT_OF_MEMORY_BEST_EFFORT`, the part already
 mapped unmapped and its span given back. The view serves two ends. memmgr copies an object page for
 a private write, or for `MAKE_PRIVATE`, from it (Faults). And it is a leaf of each object frame that

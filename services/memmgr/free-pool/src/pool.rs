@@ -496,11 +496,11 @@ impl FreePool
         (in_row != 0 || rows != 0).then_some(found)
     }
 
-    /// A run covering at least `want` pages, from the smallest size class
-    /// that holds one: the first run of `want`'s own class when it covers
-    /// `want`, else the first run of the lowest non-empty class above it,
-    /// every run of which does. Neither step depends on the runs the pool
-    /// holds. Only when no class above holds a run does it walk `want`'s own
+    /// A run covering at least `want` pages: the first run of `want`'s own
+    /// class when it covers `want`, else the first run of the lowest
+    /// non-empty class above it, every run of which does, even when a later
+    /// run of `want`'s class covers `want` too. Neither step depends on the
+    /// runs the pool holds. Only when no class above holds a run does it walk `want`'s own
     /// class for a covering run. `None` when no run covers `want`.
     #[must_use]
     pub fn covering<S: SlotStore>(&self, arena: &Arena<S>, want: u64) -> Option<NodeIdx>

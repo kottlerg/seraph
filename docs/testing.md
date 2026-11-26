@@ -2436,7 +2436,6 @@ run that shows a shard or a whole crate past the 10 minutes, or a split crate wh
 fewer would hold under them, moves its count. Each `prove` job has a `timeout-minutes` of 40, the
 backstop beside the time limit below.
 
-
 **Local sizing.** A harness is sized on the development host before CI runs it. The author of a
 change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
 with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries it,
@@ -2459,7 +2458,6 @@ bounded away. The PR body's `## Validation` section states, for each such harnes
 time Kani reports, the peak resident memory of the run (the maximum resident set size of its largest
 process, as GNU `time -v` reports it), and the unwind bounds the harness carries. This run is owed
 whatever § Coverage tiers owes, since a harness change is inert there.
-
 
 **Measured time.** The whole set, 204 harnesses, took 86 minutes run serially on GitHub's standard
 Linux runner (4 vCPUs, 16 GB; `build-test` run 45738265526), the harnesses' own verification

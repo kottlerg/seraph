@@ -483,9 +483,9 @@ jobs:
         # its boot carries); the worst passes are beside the values. The
         # svctest worsts are of the 47 passing master runs from 2026-11-24
         # 12:13 to 2026-11-26 07:34 UTC whose head stages the svctest boot
-        # with no program (33 to 35 passes a cell; the latest attempt of
-        # each). The usertest and ktest worsts are of the 174 build-test runs
-        # from 2026-11-17 22:44 to 2026-11-18 15:28 UTC (the latest attempt of
+        # with no program (42 passes a cell; the latest attempt of each). The
+        # usertest and ktest worsts are of the 174 build-test runs from
+        # 2026-11-17 22:44 to 2026-11-18 15:28 UTC (the latest attempt of
         # each); the usertest budgets keep the worst of a boot that still ran
         # the seven testers whose checks svctest's phases took over (crashme,
         # deadline, debugger, pipestress, stdiotest, threadchurn,

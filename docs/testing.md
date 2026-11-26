@@ -103,6 +103,11 @@ completion:
 
 `<harness>` is the harness name (`ktest`, `svctest`, `usertest`, `ubench`).
 
+A focused ktest, which runs only the tests a build's selection names
+([core/ktest/README.md](../core/ktest/README.md#test-selection) § Test selection), ends a passing
+run with `[ktest] SELECTED TESTS PASSED` in place of `[ktest] ALL TESTS PASSED`, so a focused
+boot can never print the full run's pass marker; a failing one ends `[ktest] SOME TESTS FAILED`.
+
 - For harnesses launched as a userspace service, `std::os::seraph::log!`
   with a name registered via `std::os::seraph::log::register_name(b"<name>")`
   produces the `[<name>]` prefix automatically; the harness payload is just
@@ -401,7 +406,8 @@ cargo xtask run
 Reset to the default-init bundle by re-running `cargo xtask build` or
 `mkdisk --harness init`. ktest's runtime options bake in as
 compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`, or
-`KtestConfig::BENCH` in a `cargo xtask build --ktest-bench-only` build
+`KtestConfig::BENCH` in a `cargo xtask build --ktest-bench-only` build, or
+`KtestConfig::SELECTED` in a focused `cargo xtask build --ktest-only` build, which no CI cell makes
 (see [xtask/README.md](../xtask/README.md#cargo-xtask-mkdisk)).
 
 CI's ktest boots, the `ktest` cells' own boot and the burn-in's ktest boots, run at the fixed 4
@@ -2586,7 +2592,13 @@ A failing boot is diagnosed with the tool that fits its class of defect:
 race is chased with log lines placed around the suspect window and with repeated boots, which turn
 a rare failure into a rate: `cargo xtask run --runs N --parallel P --save-logs DIR`
 ([xtask/README.md](../xtask/README.md#classified-boots---runs)) keeps the log of every failing
-run, and the CPU counts of [Coverage tiers](#coverage-tiers) are where SMP races show first.
+run, and the CPU counts of [Coverage tiers](#coverage-tiers) are where SMP races show first. A race
+in one ktest test is repeated without the rest of the boot by a focused build,
+`cargo xtask build --ktest-only <prefix>[,<prefix>...]`, which runs only the tests whose names
+start with a prefix, then `cargo xtask mkdisk --harness ktest` and
+`cargo xtask run --runs N --ktest-only-ok`
+([core/ktest/README.md](../core/ktest/README.md#test-selection) § Test selection); a focused image
+is no validation boot, so `run --runs` refuses it without that option.
 
 **Failures only CI shows.** A defect whose effect depends on where the linker placed a static,
 such as a stack overflow into a neighbouring object, reproduces only in a build with the same

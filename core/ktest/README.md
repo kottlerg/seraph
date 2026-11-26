@@ -42,7 +42,7 @@ core/ktest/
 └── src/
     ├── main.rs             # _start, InitInfo intake, TestContext, run_test!, tier dispatch,
     │                       # summary, shutdown
-    ├── cmdline.rs          # Compile-time configuration (KtestConfig::DEFAULT)
+    ├── cmdline.rs          # Compile-time configuration (KtestConfig::DEFAULT, BENCH, SELECTED)
     ├── cspace_geometry.rs  # Mirrors of the kernel's CSpace directory geometry
     ├── serial.rs           # Direct serial output
     ├── framebuffer.rs      # Direct framebuffer output
@@ -521,7 +521,8 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
 
 - `TestResult` — `Result<(), &'static str>` — no heap, no allocation.
 - `run_test!(name, body)` — macro that logs the test name, runs `body`,
-  records PASS or FAIL (with reason), and never panics. `body` runs in a
+  records PASS or FAIL (with reason), and never panics; in a focused build it skips a test the
+  selection does not select ([§ Test selection](#test-selection)). `body` runs in a
   frame of its own (`run_isolated`, never inlined), so the stack a tier
   needs is that of its deepest test, not one `run_all` frame holding the
   locals of every test it registers.
@@ -618,7 +619,9 @@ The boot protocol carries no kernel command line
 knobs live in `KtestConfig::DEFAULT` in [`src/cmdline.rs`](src/cmdline.rs) and are baked in at
 compile time. A build with the `bench-only` cargo feature, which
 `cargo xtask build --ktest-bench-only` sets, bakes in `KtestConfig::BENCH` instead: `DEFAULT`
-with Tier 3 alone, at 4096 iterations per benchmark, for a run whose result lines are compared.
+with Tier 3 alone, at 4096 iterations per benchmark, for a run whose result lines are compared. A
+build with a selection, which `cargo xtask build --ktest-only` makes, bakes in
+`KtestConfig::SELECTED` ([§ Test selection](#test-selection)).
 To flip them, edit the constant, rebuild ktest
 (`cargo xtask build --component ktest`), then re-compose the bundle
 (`cargo xtask mkdisk --harness ktest`, per [§ Activating ktest](#activating-ktest))
@@ -635,6 +638,7 @@ until it is re-composed.
 | `run_integration` | `bool` | `true` | Run Tier 2 (`src/integration/`) |
 | `run_stress` | `bool` | `true` | Run Tier S (`src/stress/`) |
 | `run_bench` | `bool` | `true` | Run Tier 3 (`src/bench/`) |
+| `selection` | `Option<&str>` | `None` | The test-name prefixes of a focused build, set only through the build environment ([§ Test selection](#test-selection)) |
 | `bench_iters` | `u32` | `8` | Number of iterations per benchmark, cut to `MAX_ITERS` (4096, [`src/bench/mod.rs`](src/bench/mod.rs)): a functional boot's Tier 3 is a smoke run that no check compares; `KtestConfig::BENCH` sets `MAX_ITERS` |
 
 The defaults are picked for CI: every tier runs, the VM exits cleanly
@@ -660,7 +664,35 @@ On RISC-V shutdown uses SBI SRST via the `SYS_SBI_CALL` syscall.
 
 Each tier has its own flag (`run_unit`, `run_integration`, `run_stress`,
 `run_bench`), all `true` by default, so every tier runs. Clearing flags
-before recompiling is how a narrower-scope run is produced.
+before recompiling is how a run of fewer tiers is produced; a run of named tests is a focused
+build ([§ Test selection](#test-selection)).
+
+### Test selection
+
+`cargo xtask build --ktest-only <prefix>[,<prefix>...]`
+([xtask/README.md](../../xtask/README.md#cargo-xtask-build) § `cargo xtask build`) builds a
+ktest that runs only the tests whose names start with one of the prefixes, so a race in one test
+is chased by repeating a boot of a few seconds (`cargo xtask run --runs N --ktest-only-ok`)
+rather than a boot of every tier. `--ktest-only stress::stop_` selects every Tier S cell whose
+name starts `stress::stop_`, and `--ktest-only stress::mutual_stop` that one cell. A test run
+alone is a meaningful run: each test reaps what it creates, and the frame-pool check after every
+test (`frame_pool::check_slots`, [§ Test infrastructure](#test-infrastructure)) holds it to that.
+
+- The build passes the prefixes to ktest's compile in the environment variable
+  `SERAPH_KTEST_ONLY`, which `KtestConfig::SELECTED` reads; `cargo xtask build` clears the
+  variable for every other build, so a full build cannot be focused by the caller's environment.
+- `run_test!` and `run_integration_test!` skip a test the selection does not select, with no
+  log line and no count, so `passed=` and `failed=` count the selected tests alone. Tier 3 does
+  not run: a benchmark is not a named test.
+- ktest logs `ktest: selection <prefixes>` before Tier 1. A selection that matches no test logs
+  `ktest: selection matched no test` and ends the run `[ktest] SOME TESTS FAILED`, so a mistyped
+  prefix cannot pass.
+- A focused run that passes ends `[ktest] SELECTED TESTS PASSED`, never
+  `[ktest] ALL TESTS PASSED` ([docs/testing.md](../../docs/testing.md#reporting-marker)
+  § Reporting marker), so no focused boot can pass as a full one.
+- The build records the selection in `sysroot/.ktest-selection`, and `cargo xtask run --runs`
+  refuses an image of a focused ktest without `--ktest-only-ok`, with which it passes on the
+  focused marker. A build of the full ktest removes the record. CI never builds with a selection.
 
 ---
 

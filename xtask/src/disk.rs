@@ -1124,7 +1124,8 @@ fn substitute(tree: &mut [fat::Entry], path: &Path, source: &Path) -> Result<()>
 
 /// The files and directories under `host_dir`, in name order, as a FAT volume holds them.
 ///
-/// Skips build metadata (`.arch`, `.harness`, `.image-harness`, `NvVars`), the `esp` directory, and
+/// Skips build metadata (`.arch`, `.harness`, `.image-harness`, `.ktest-selection`, `NvVars`), the
+/// `esp` directory, and
 /// at the top of `sysroot_root` the `data` directory: `esp` and `data` are mount
 /// points with their own partitions, and so not root content. Entries other than files and
 /// directories are skipped. With `keep`, so is each file the image's kind does not hold, by
@@ -1153,7 +1154,15 @@ fn host_tree(host_dir: &Path, sysroot_root: &Path, keep: Option<Keep>) -> Result
             .map_err(|_| crate::error::err!("{} has a name that is not UTF-8", path.display()))?;
 
         // Skip build metadata and the ESP mount point (populated separately).
-        if [".arch", ".harness", ".image-harness", "NvVars", "esp"].contains(&name.as_str())
+        if [
+            ".arch",
+            ".harness",
+            ".image-harness",
+            crate::sysroot::KTEST_SELECTION_FILE,
+            "NvVars",
+            "esp",
+        ]
+        .contains(&name.as_str())
         {
             continue;
         }
@@ -1827,6 +1836,7 @@ mod tests
             (".arch", b"x86_64"),
             (".harness", b"init\n"),
             (".image-harness", b"usertest\n"),
+            (".ktest-selection", b"stress::stop_\n"),
         ]
         {
             let full = sysroot.join(path);
@@ -1854,7 +1864,13 @@ mod tests
         let file = |bytes: &[u8]| Some(Node::File(bytes.to_vec()));
         assert_eq!(root.get("/boot/kernel"), file(b"kernel").as_ref());
         assert_eq!(root.get("/boot/boot.efi"), file(b"bootloader").as_ref());
-        for absent in ["/.arch", "/.harness", "/.image-harness", "/esp"]
+        for absent in [
+            "/.arch",
+            "/.harness",
+            "/.image-harness",
+            "/.ktest-selection",
+            "/esp",
+        ]
         {
             assert!(
                 !root.keys().any(|path| path.starts_with(absent)),

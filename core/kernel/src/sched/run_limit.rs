@@ -69,30 +69,32 @@ pub const fn reaches_limit(count: u32, limit: u32) -> bool
 }
 
 /// Count a timer tick for `tcb`, this CPU's current thread
-/// (core/kernel/docs/scheduler.md § Run Limit). Returns whether a run-limit
-/// fault is pending on it, its return-work bit posted on this CPU: the tick
-/// reached the limit, or found a fault pending whose bit a return took without
-/// delivering it.
+/// (core/kernel/docs/scheduler.md § Run Limit), and post this CPU's
+/// `RUN_LIMIT` return-work bit when the tick reaches the limit or finds a
+/// fault pending whose bit a return took without delivering it. The tick's
+/// slice decision is left as it is: a switch at the slice's expiry leaves the
+/// fault pending on the thread, and the first tick after it next runs posts
+/// the bit again.
 ///
 /// # Safety
 /// The timer tick, on this CPU with interrupts disabled and its scheduler
 /// lock held; `tcb` is this CPU's current thread.
 #[cfg(not(test))]
 #[inline]
-pub unsafe fn tick(tcb: *mut ThreadControlBlock) -> bool
+pub unsafe fn tick(tcb: *mut ThreadControlBlock)
 {
     // SAFETY: tcb is this CPU's current thread (contract); the field is an
     // atomic.
     let limit = unsafe { (*tcb).run_limit.load(Ordering::Relaxed) };
     if limit == 0
     {
-        return false;
+        return;
     }
     // SAFETY: as for the load above.
     let pending = unsafe { &(*tcb).run_limit_pending };
     match tick_action(limit, pending.load(Ordering::Relaxed))
     {
-        TickAction::Skip => return false,
+        TickAction::Skip => return,
         TickAction::Repost =>
         {}
         TickAction::Count =>
@@ -104,7 +106,7 @@ pub unsafe fn tick(tcb: *mut ThreadControlBlock) -> bool
             let counted = count.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             if !reaches_limit(counted, limit)
             {
-                return false;
+                return;
             }
             count.store(0, Ordering::Relaxed);
             pending.store(true, Ordering::Relaxed);
@@ -115,7 +117,6 @@ pub unsafe fn tick(tcb: *mut ThreadControlBlock) -> bool
     // (core/kernel/docs/scheduling-internals.md § Return Work, rule 1).
     // SAFETY: an interrupt on a CPU whose per-CPU pointer is installed.
     unsafe { crate::percpu::post_return_work(crate::percpu::return_work::RUN_LIMIT) };
-    true
 }
 
 /// Set the run limit of `tcb` to `limit` ticks (0 for none), with its count

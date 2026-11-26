@@ -1750,7 +1750,9 @@ pub const FAULT_EXC_FP: u64 = 10;
 /// Normalized exception: the thread ran past its run limit
 /// ([`SYS_THREAD_SET_RUN_LIMIT`]). Raised by the kernel's timer tick, not by
 /// the CPU, on both architectures: `arch_aux_code` is 0, and the instruction
-/// pointer is where the thread returns to user mode (`docs/fault-handling.md`
+/// pointer is where the thread returns to user mode, except on RISC-V at a
+/// syscall's return, where it names the `ecall`, which the kernel steps past on
+/// resume unless the handler wrote another `pc` (`docs/fault-handling.md`
 /// § Run-Limit Faults). A handler that resumes the thread gives it a fresh limit.
 pub const FAULT_EXC_RUN_LIMIT: u64 = 11;
 

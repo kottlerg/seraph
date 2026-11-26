@@ -310,7 +310,8 @@ it resumes at its reported instruction pointer, not by returning a value. For a 
 is the faulting instruction, which re-executes; for a trap-type exception (x86-64 `#BP` and
 `#DB`) it is the instruction after the trapping one ([Debugging](#debugging)). An upcall, which
 is no fault, resumes as [Asynchronous Upcalls](#asynchronous-upcalls) states: on RISC-V at the
-syscall point, past the `ecall` its reported pointer names.
+syscall point, past the `ecall` its reported pointer names. A run-limit fault delivered at a
+syscall's return on RISC-V resumes the same way ([Run-Limit Faults](#run-limit-faults)).
 
 - **Resume (genuine reply).** The handler replies (default disposition
   [`FAULT_REPLY_RESUME`](#reply)). The kernel resumes the faulting thread with its register
@@ -556,8 +557,10 @@ limit and the count are the scheduler's; their syscall is `SYS_THREAD_SET_RUN_LI
   keeps the fault pending until its re-execution returns.
 - **Message.** It is a `FAULT_KIND_EXCEPTION` fault through the thread's exception binding, as
   any exception is: the normalized code `FAULT_EXC_RUN_LIMIT`, auxiliary code `0`, and the
-  instruction pointer the thread returns to, as `SYS_THREAD_READ_REGS` reads it
-  ([Fault Message](#fault-message)).
+  thread's instruction pointer as `SYS_THREAD_READ_REGS` reads it ([Fault Message](#fault-message)).
+  That is the address the thread returns to, except on RISC-V at a syscall's return, where it
+  names the `ecall`, as for an upcall at the syscall point: the kernel steps past it on resume
+  unless the handler wrote another `pc`.
 - **Outcome.** Every reply and cancellation of an exception applies
   ([Delivery, Resume, and Kill](#delivery-resume-and-kill), [Reply](#reply)). A resume returns the
   thread to its registers with its count at zero, so it runs a full limit again before its next

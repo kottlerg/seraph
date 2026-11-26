@@ -950,7 +950,7 @@ timer_tick():
         post_return_work(SOLE_REF)            // this CPU's next return makes a pass
     if cpu == 0:                              // BSP only
         sleep_check_wakeups(); watchdog_tick_and_check()
-    run_limit_fault = run_limit::tick(current)    // count toward the run limit (§ Run Limit)
+    run_limit::tick(current)                  // count toward the run limit (§ Run Limit)
     match tick_outcome(current.slice_remaining):   // PerCpuScheduler::tick_outcome
         Idle:                                 // zero slice: the idle thread
             try_pull_idle(cpu); return
@@ -961,7 +961,6 @@ timer_tick():
     try_pull_balance(cpu)
     if !reschedule: return
     if preemption_disabled(): return          // see § Kernel-Mode Preemption Points
-    if run_limit_fault: return                // the fault's delivery switches it (§ Run Limit)
     schedule(Requeue::Always)                 // requeue at its queue's tail, then dequeue_highest
 ```
 
@@ -1138,12 +1137,13 @@ which § Scheduling Classes lists as not implemented. The code is `sched::run_li
 - **Fault.** The tick that brings the count to the limit sets the count to zero, makes a run-limit
   fault pending on the thread, and posts its CPU's `RUN_LIMIT` return-work bit
   ([scheduling-internals.md](scheduling-internals.md#return-work) § Return Work). The thread's next
-  return to user mode delivers it: at once when the tick interrupted user mode, and at the
-  syscall's end when the tick landed in an interrupt-enabled window of a syscall. That tick does not
-  switch the thread out at its slice's expiry, since the delivery switches it away. A later tick
-  that finds the thread current with the fault still pending (its bit taken by a return that did
-  not deliver it, such as a syscall that parked after the tick) posts the bit again and counts
-  nothing. The fault is `FAULT_EXC_RUN_LIMIT`, delivered through the thread's exception binding
+  return to user mode on that CPU delivers it: at once when the tick interrupted user mode, and at
+  the syscall's end when the tick landed in an interrupt-enabled window of a syscall. The tick's
+  slice decision is unchanged, so a switch at the slice's expiry, or a park in the syscall, can
+  take the thread off the CPU first; the bit's return is then another thread's, which finds no
+  fault of its own. A later tick that finds the thread current with the fault still pending posts
+  the bit again and counts nothing, so the fault is delivered within a tick of the thread's next
+  running. The fault is `FAULT_EXC_RUN_LIMIT`, delivered through the thread's exception binding
   ([fault-handling.md](../../../docs/fault-handling.md#run-limit-faults) § Run-Limit Faults). A
   handler that resumes the thread gives it a fresh limit; with no handler bound, or a handler that
   declines it, the thread ends with `EXIT_RUN_LIMIT`.

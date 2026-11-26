@@ -186,9 +186,12 @@ fn spin_faults_after_limit(ctx: &TestContext) -> TestResult
     // SAFETY: `STACK_1` is this case's own stack, used by no other live thread.
     let mut child = unsafe { start(ctx, spin_child, top, 0, LIMIT_FAULT, Some(ep)) }?;
     expect_run_limit_fault(ctx, ep)?;
-    let t1 = now_us()?;
-    if t1.saturating_sub(t0) < u64::from(LIMIT_FAULT) * 1000
+    let elapsed = now_us()?.saturating_sub(t0);
+    // The first counted tick may come at once after the start, so the limit's
+    // ticks span at least `LIMIT_FAULT - 1` whole periods.
+    if elapsed < u64::from(LIMIT_FAULT - 1) * 1000
     {
+        crate::log_u64("run_limit: case 1: elapsed us: ", elapsed);
         return Err("run_limit: case 1: the fault came before the limit elapsed");
     }
     reply_fault(ctx, FAULT_REPLY_KILL)?;

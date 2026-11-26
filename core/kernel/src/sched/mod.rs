@@ -9110,7 +9110,7 @@ pub unsafe fn timer_tick()
     // The idle thread has no limit.
     // SAFETY: current validated non-null above and is this CPU's current
     // thread; interrupt context with this CPU's scheduler lock held.
-    let run_limit_fault = unsafe { run_limit::tick(current) };
+    unsafe { run_limit::tick(current) };
 
     // SAFETY: current validated non-null above; slice_remaining is always valid.
     let remaining = unsafe { (*current).slice_remaining };
@@ -9159,17 +9159,9 @@ pub unsafe fn timer_tick()
     };
     if tick_switches(preemption)
     {
-        // A run-limit fault pending on the thread is delivered at its return
-        // to user mode, which switches it away for the fault's handler or
-        // ends it; a switch here would leave the fault's return-work bit on
-        // this CPU to the next thread's return.
-        if !run_limit_fault
-        {
-            // SAFETY: schedule() re-acquires the lock and performs a context
-            // switch. Requeue::Always: the expired thread goes back to its
-            // queue's tail.
-            unsafe { schedule(Requeue::Always) };
-        }
+        // SAFETY: schedule() re-acquires the lock and performs a context switch.
+        // Requeue::Always: the expired thread goes back to its queue's tail.
+        unsafe { schedule(Requeue::Always) };
     }
     else
     {

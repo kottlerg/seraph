@@ -34,7 +34,11 @@ use crate::IpcMessage;
 /// to the caller the thread's last receive bound.
 pub struct Reply
 {
-    msg: Option<IpcMessage>,
+    /// The reply, valid while [`Self::pending`] and only up to its counts. It
+    /// stays in place from its set to its send, so no turn copies the message.
+    msg: IpcMessage,
+    /// A reply is set and not yet sent.
+    pending: bool,
     /// Delete the reply's caps from this thread's `CSpace` when the reply is
     /// not delivered ([`Self::set_or_delete_caps`]).
     delete_caps: bool,
@@ -47,7 +51,8 @@ impl Reply
     pub const fn new() -> Self
     {
         Self {
-            msg: None,
+            msg: IpcMessage::new(0),
+            pending: false,
             delete_caps: false,
         }
     }
@@ -57,8 +62,9 @@ impl Reply
     /// sets at most one reply.
     pub fn set(&mut self, msg: IpcMessage)
     {
-        debug_assert!(self.msg.is_none(), "a turn sets at most one reply");
-        self.msg = Some(msg);
+        debug_assert!(!self.pending, "a turn sets at most one reply");
+        self.store(&msg);
+        self.pending = true;
         self.delete_caps = false;
     }
 
@@ -67,7 +73,12 @@ impl Reply
     /// so a handler with many such replies holds none of them in its frame.
     pub fn set_status(&mut self, status: u64)
     {
-        self.set(IpcMessage::new(status));
+        debug_assert!(!self.pending, "a turn sets at most one reply");
+        self.msg.label = status;
+        self.msg.data_len = 0;
+        self.msg.cap_count = 0;
+        self.pending = true;
+        self.delete_caps = false;
     }
 
     /// [`Self::set`], for a reply that moves caps this thread keeps no use
@@ -76,9 +87,36 @@ impl Reply
     /// and the send deletes them there.
     pub fn set_or_delete_caps(&mut self, msg: IpcMessage)
     {
-        debug_assert!(self.msg.is_none(), "a turn sets at most one reply");
-        self.msg = Some(msg);
+        debug_assert!(!self.pending, "a turn sets at most one reply");
+        self.store(&msg);
+        self.pending = true;
         self.delete_caps = true;
+    }
+
+    /// Copy into the slot what a send of `msg` reads: its label, its counts,
+    /// and its data words and cap slots within them. The words past the count
+    /// are neither copied nor cleared, since no send reads them; a whole copy,
+    /// or the zeroing of the words a built message does not write, costs more
+    /// than the receive the reply rides saves.
+    #[inline]
+    fn store(&mut self, msg: &IpcMessage)
+    {
+        let words = usize::from(msg.data_len);
+        let caps = usize::from(msg.cap_count);
+        self.msg.label = msg.label;
+        self.msg.data_len = msg.data_len;
+        self.msg.cap_count = msg.cap_count;
+        if let (Some(to), Some(from)) = (self.msg.data.get_mut(..words), msg.data.get(..words))
+        {
+            to.copy_from_slice(from);
+        }
+        if let (Some(to), Some(from)) = (
+            self.msg.cap_slots.get_mut(..caps),
+            msg.cap_slots.get(..caps),
+        )
+        {
+            to.copy_from_slice(from);
+        }
     }
 
     /// Send the reply now, alone (`SYS_IPC_REPLY`), when one is set, and
@@ -100,26 +138,26 @@ impl Reply
 
     fn flush_with<T: Transport>(&mut self, kernel: &mut T) -> Result<(), i64>
     {
-        let Some(msg) = self.msg.take()
-        else
+        if !self.pending
         {
             return Ok(());
-        };
-        let sent = kernel.reply(&msg);
+        }
+        self.pending = false;
+        let sent = kernel.reply(&self.msg);
         if sent.is_err()
         {
-            self.undelivered(kernel, &msg);
+            self.undelivered(kernel);
         }
         sent
     }
 
-    /// The reply `msg`, taken from the slot, was not delivered: delete its
-    /// caps when it was set to.
-    fn undelivered<T: Transport>(&self, kernel: &mut T, msg: &IpcMessage)
+    /// The reply last set, now sent, was not delivered: delete its caps when
+    /// it was set to.
+    fn undelivered<T: Transport>(&self, kernel: &mut T)
     {
         if self.delete_caps
         {
-            for &cap in msg.caps()
+            for &cap in self.msg.caps()
             {
                 kernel.delete_cap(cap);
             }
@@ -158,19 +196,28 @@ impl Default for Reply
 /// cap-slot pre-allocation (`InvalidCapability`, `InsufficientRights`,
 /// `QuotaExceeded`, `OutOfMemory`), after which the reply has been made
 /// all the same, and `NoReceiver` and `Interrupted` from the wait.
+#[inline]
 pub unsafe fn next_request(ep: u64, reply: &mut Reply, ipc_buf: *mut u64)
 -> Result<IpcMessage, i64>
 {
-    next_with(&mut Kernel { ipc_buf }, ep, reply)
+    let delivery = next_with(&mut Kernel { ipc_buf }, ep, reply)?;
+    // The message is read once, here, whichever syscall received it, so no
+    // path moves it again.
+    // SAFETY: ipc_buf is the registered IPC buffer page (this fn's contract);
+    // the kernel wrote the delivered words and cap handles there before return.
+    Ok(unsafe { IpcMessage::from_delivery(ipc_buf, &delivery) })
 }
 
 /// The syscalls of a turn of [`next_request`], behind a trait so that its
 /// order and fallbacks are host-tested.
 trait Transport
 {
-    fn recv(&mut self, ep: u64) -> Result<IpcMessage, i64>;
+    /// What a receive returns: the kernel's delivery, from which the message
+    /// is read.
+    type Got;
+    fn recv(&mut self, ep: u64) -> Result<Self::Got, i64>;
     fn reply(&mut self, msg: &IpcMessage) -> Result<(), i64>;
-    fn reply_recv(&mut self, ep: u64, msg: &IpcMessage) -> Result<IpcMessage, i64>;
+    fn reply_recv(&mut self, ep: u64, msg: &IpcMessage) -> Result<Self::Got, i64>;
     fn delete_cap(&mut self, cap: u64);
 }
 
@@ -184,23 +231,27 @@ struct Kernel
 
 impl Transport for Kernel
 {
-    fn recv(&mut self, ep: u64) -> Result<IpcMessage, i64>
+    type Got = syscall::IpcDelivery;
+
+    #[inline]
+    fn recv(&mut self, ep: u64) -> Result<syscall::IpcDelivery, i64>
+    {
+        syscall::raw_ipc_recv_timeout(ep, 0)
+    }
+
+    #[inline]
+    fn reply(&mut self, msg: &IpcMessage) -> Result<(), i64>
     {
         // SAFETY: ipc_buf is the registered IPC buffer page (next_request's
         // contract).
-        unsafe { crate::ipc_recv(ep, self.ipc_buf) }
-    }
-
-    fn reply(&mut self, msg: &IpcMessage) -> Result<(), i64>
-    {
-        // SAFETY: as in recv.
         unsafe { crate::ipc_reply(msg, self.ipc_buf) }
     }
 
-    fn reply_recv(&mut self, ep: u64, msg: &IpcMessage) -> Result<IpcMessage, i64>
+    #[inline]
+    fn reply_recv(&mut self, ep: u64, msg: &IpcMessage) -> Result<syscall::IpcDelivery, i64>
     {
-        // SAFETY: as in recv.
-        unsafe { crate::ipc_reply_recv(ep, msg, self.ipc_buf, 0) }
+        // SAFETY: as in reply.
+        unsafe { crate::reply_recv_delivery(ep, msg, self.ipc_buf, 0) }
     }
 
     fn delete_cap(&mut self, cap: u64)
@@ -209,28 +260,31 @@ impl Transport for Kernel
     }
 }
 
-fn next_with<T: Transport>(kernel: &mut T, ep: u64, reply: &mut Reply) -> Result<IpcMessage, i64>
+#[inline]
+fn next_with<T: Transport>(kernel: &mut T, ep: u64, reply: &mut Reply) -> Result<T::Got, i64>
 {
-    let Some(msg) = reply.msg.take()
-    else
+    if !reply.pending
     {
         return kernel.recv(ep);
-    };
-    match kernel.reply_recv(ep, &msg)
+    }
+    // The reply is sent from the slot and only the flag is cleared: no turn
+    // copies the message.
+    reply.pending = false;
+    let got = kernel.reply_recv(ep, &reply.msg);
+    match got
     {
-        Ok(next) => Ok(next),
-        Err(e) if failed_after_reply(e) => Err(e),
-        Err(e) =>
+        Err(e) if !failed_after_reply(e) =>
         {
-            if kernel.reply(&msg).is_ok()
+            if kernel.reply(&reply.msg).is_ok()
             {
                 // The binding survived a refusal before the reply.
                 return Err(e);
             }
             // The reply failed and consumed the binding: nothing is owed.
-            reply.undelivered(kernel, &msg);
+            reply.undelivered(kernel);
             kernel.recv(ep)
         }
+        _ => got,
     }
 }
 
@@ -253,9 +307,9 @@ mod tests
     /// records each call it takes, in order.
     struct Script
     {
-        recv: Result<IpcMessage, i64>,
+        recv: Result<u64, i64>,
         reply: Result<(), i64>,
-        reply_recv: Result<IpcMessage, i64>,
+        reply_recv: Result<u64, i64>,
         calls: [Option<Call>; 8],
         count: usize,
     }
@@ -285,9 +339,9 @@ mod tests
         fn new() -> Self
         {
             Self {
-                recv: Ok(IpcMessage::new(NEXT)),
+                recv: Ok(NEXT),
                 reply: Ok(()),
-                reply_recv: Ok(IpcMessage::new(NEXT)),
+                reply_recv: Ok(NEXT),
                 calls: [None; 8],
                 count: 0,
             }
@@ -307,7 +361,10 @@ mod tests
 
     impl Transport for Script
     {
-        fn recv(&mut self, ep: u64) -> Result<IpcMessage, i64>
+        /// The label of the request received.
+        type Got = u64;
+
+        fn recv(&mut self, ep: u64) -> Result<u64, i64>
         {
             assert_eq!(ep, EP);
             self.log(Call::Recv);
@@ -320,7 +377,7 @@ mod tests
             self.reply
         }
 
-        fn reply_recv(&mut self, ep: u64, msg: &IpcMessage) -> Result<IpcMessage, i64>
+        fn reply_recv(&mut self, ep: u64, msg: &IpcMessage) -> Result<u64, i64>
         {
             assert_eq!(ep, EP);
             self.log(Call::ReplyRecv(msg.label));
@@ -352,11 +409,6 @@ mod tests
         reply
     }
 
-    fn label(r: &Result<IpcMessage, i64>) -> Result<u64, i64>
-    {
-        r.as_ref().map(|m| m.label).map_err(|&e| e)
-    }
-
     // The defect caught: an empty slot that still makes a reply (to a caller
     // already answered, or to none), or a receive that is not the plain one.
     #[test]
@@ -364,7 +416,7 @@ mod tests
     {
         let mut kernel = Script::new();
         let got = next_with(&mut kernel, EP, &mut Reply::new());
-        assert_eq!(label(&got), Ok(NEXT));
+        assert_eq!(got, Ok(NEXT));
         assert_eq!(kernel.calls(), &[Some(Call::Recv)]);
     }
 
@@ -375,13 +427,42 @@ mod tests
     {
         let mut kernel = Script::new();
         let mut reply = with_reply();
-        assert_eq!(label(&next_with(&mut kernel, EP, &mut reply)), Ok(NEXT));
+        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
         assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))]);
-        assert_eq!(label(&next_with(&mut kernel, EP, &mut reply)), Ok(NEXT));
+        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
         assert_eq!(
             kernel.calls(),
             &[Some(Call::ReplyRecv(REPLY)), Some(Call::Recv)]
         );
+    }
+
+    // The defect caught: a slot, reused without being cleared, that sends an
+    // earlier reply's words or caps with a later reply that has fewer.
+    #[test]
+    fn a_reused_slot_sends_only_the_later_reply()
+    {
+        let mut kernel = Script::new();
+        let mut reply = Reply::new();
+        reply.set(
+            IpcMessage::builder(REPLY)
+                .word(0, 1)
+                .word(1, 2)
+                .cap(CAP)
+                .build(),
+        );
+        assert_eq!(reply.flush_with(&mut kernel), Ok(()));
+
+        reply.set(IpcMessage::builder(NEXT).word(0, 9).build());
+        assert_eq!(reply.msg.label, NEXT);
+        assert_eq!(reply.msg.word_count(), 1);
+        assert_eq!(reply.msg.word(0), 9);
+        assert_eq!(reply.msg.caps(), &[] as &[u64]);
+        assert_eq!(reply.flush_with(&mut kernel), Ok(()));
+
+        reply.set_status(REPLY);
+        assert_eq!(reply.msg.label, REPLY);
+        assert_eq!(reply.msg.word_count(), 0);
+        assert_eq!(reply.msg.caps(), &[] as &[u64]);
     }
 
     // The defect caught: a flush that sends no reply, sends an empty slot's, or
@@ -393,7 +474,7 @@ mod tests
         let mut reply = with_reply();
         assert_eq!(reply.flush_with(&mut kernel), Ok(()));
         assert_eq!(reply.flush_with(&mut kernel), Ok(()));
-        assert_eq!(label(&next_with(&mut kernel, EP, &mut reply)), Ok(NEXT));
+        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
         assert_eq!(
             kernel.calls(),
             &[Some(Call::Reply(REPLY)), Some(Call::Recv)]
@@ -410,7 +491,7 @@ mod tests
         kernel.reply_recv = Err(err(SyscallError::InvalidCapability));
         kernel.reply = Err(err(SyscallError::InvalidCapability));
         let got = next_with(&mut kernel, EP, &mut with_owned_reply());
-        assert_eq!(label(&got), Ok(NEXT));
+        assert_eq!(got, Ok(NEXT));
         assert_eq!(
             kernel.calls(),
             &[
@@ -442,7 +523,7 @@ mod tests
     {
         let mut kernel = Script::new();
         assert_eq!(
-            label(&next_with(&mut kernel, EP, &mut with_owned_reply())),
+            next_with(&mut kernel, EP, &mut with_owned_reply()),
             Ok(NEXT)
         );
         assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))]);
@@ -450,7 +531,7 @@ mod tests
         let mut kernel = Script::new();
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         let got = next_with(&mut kernel, EP, &mut with_owned_reply());
-        assert_eq!(label(&got), Err(err(SyscallError::QuotaExceeded)));
+        assert_eq!(got, Err(err(SyscallError::QuotaExceeded)));
         assert_eq!(
             kernel.calls(),
             &[Some(Call::ReplyRecv(REPLY)), Some(Call::Reply(REPLY))]
@@ -470,10 +551,7 @@ mod tests
         {
             let mut kernel = Script::new();
             kernel.reply_recv = Err(err(e));
-            assert_eq!(
-                label(&next_with(&mut kernel, EP, &mut with_reply())),
-                Err(err(e))
-            );
+            assert_eq!(next_with(&mut kernel, EP, &mut with_reply()), Err(err(e)));
             assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))], "{e:?}");
         }
     }
@@ -487,7 +565,7 @@ mod tests
         let mut kernel = Script::new();
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         let got = next_with(&mut kernel, EP, &mut with_reply());
-        assert_eq!(label(&got), Err(err(SyscallError::QuotaExceeded)));
+        assert_eq!(got, Err(err(SyscallError::QuotaExceeded)));
         assert_eq!(
             kernel.calls(),
             &[Some(Call::ReplyRecv(REPLY)), Some(Call::Reply(REPLY))]
@@ -504,7 +582,7 @@ mod tests
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         kernel.reply = Err(err(SyscallError::InvalidCapability));
         let got = next_with(&mut kernel, EP, &mut with_reply());
-        assert_eq!(label(&got), Ok(NEXT));
+        assert_eq!(got, Ok(NEXT));
         assert_eq!(
             kernel.calls(),
             &[

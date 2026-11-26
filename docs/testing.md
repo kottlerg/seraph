@@ -668,10 +668,11 @@ first or the second check on its boot's own log
 
 ### Console whole lines
 
-svctest's `console_whole_lines` phase, after the `logd_sinks` phases, has four threads log numbered
+svctest's `console_whole_lines` phase, before the `logd_sinks` phases (whose stopped serial driver
+leaves logd's serial sink dropping lines until it writes again), has four threads log numbered
 lines between `whole-lines begin` and `whole-lines end senders=4 lines=N` for up to 3 s, while the
-`program-modes relrofault` fixture faults in a loop and `capexhaust` wedges its CSpace. No harness
-reads the log from inside the guest, so `cargo xtask run --whole-lines <TAG>` checks a passing run's
+`program-modes relrofault` fixture faults in a loop and `capexhaust` wedges its CSpace. The guest
+cannot read its own serial output, so `cargo xtask run --whole-lines <TAG>` checks a passing run's
 log: between `<TAG> begin` and `<TAG> end ...` every line is one console line and each sender's
 numbered lines arrive whole, in order, none missing. A run whose check fails is `FAIL`; a
 `QEMU-CRASH` run is not checked. The svctest cell's CI boot passes `--whole-lines whole-lines`

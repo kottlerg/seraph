@@ -312,8 +312,12 @@ fn ordered() -> Vec<Phase>
     out.extend_from_slice(swap_commit::phases());
     out.extend_from_slice(crashd::oom_hold());
     out.extend_from_slice(drivers::phases());
-    out.extend_from_slice(logd_sinks::phases());
+    // Before logd_sinks, whose stopped serial driver leaves logd's serial sink
+    // stalled until its writer next completes a write: lines sent meanwhile
+    // past the sink's queue are dropped by design, which the whole-lines
+    // check would read as lines lost.
     out.extend_from_slice(console_whole_lines::phases());
+    out.extend_from_slice(logd_sinks::phases());
     out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());
     out.extend_from_slice(unmount::phases());

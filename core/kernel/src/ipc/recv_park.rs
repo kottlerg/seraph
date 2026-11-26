@@ -142,21 +142,28 @@ impl RecvParkTable
     /// The caller is this table's CPU, with interrupts off.
     fn named(&self, queue: *const RecvQueue) -> &RecvParkSlot
     {
-        let mut found = &NO_SLOT;
-        for slot in &self.slots
+        // One more than the index of the slot naming `queue`, or 0: each
+        // slot ORs in its own number masked by whether it matches, and at most
+        // one matches. The compiler makes each step a select of the number or
+        // zero, which both targets build without a branch (a conditional move
+        // on x86_64, a negated set-if-equal and an AND on riscv64), so every
+        // slot runs the same instructions. A select between two slots instead
+        // becomes branches on riscv64, which has no conditional move, and its
+        // instruction count then follows the slot that matched.
+        let mut number: usize = 0;
+        for (slot, index) in self.slots.iter().zip(1usize..)
         {
             // SAFETY: only this table's CPU writes a queue word (`record`),
             // and the caller is that CPU with interrupts off, so no write runs
             // beside this read. A plain read lets the compiler fold it into
             // the comparison, which an atomic load does not.
             let named = unsafe { slot.queue.as_ptr().read() };
-            // A select the compiler is told not to predict: a conditional move
-            // where the target has one, and otherwise a select of the same
-            // instructions for every slot, so only whether some slot matched,
-            // never which, changes what the search runs.
-            found = core::hint::select_unpredictable(core::ptr::eq(named, queue), slot, found);
+            let matches = usize::from(core::ptr::eq(named, queue)).wrapping_neg();
+            number |= index & matches;
         }
-        found
+        // A miss wraps to `usize::MAX`, which no slot has: whether some slot
+        // matched, never which, decides this one branch.
+        self.slots.get(number.wrapping_sub(1)).unwrap_or(&NO_SLOT)
     }
 
     /// The slot a record for `queue` takes ([`Self::record`]).
